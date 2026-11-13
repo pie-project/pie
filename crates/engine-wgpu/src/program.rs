@@ -3,7 +3,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel, Ticket};
-use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
+use engine::program::{
+    BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, ProgramRegistration,
+    Rebind, RingFacts,
+};
+use engine_gpu::program::Place;
+use engine_gpu::store::Pools;
 use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, Value};
 #[cfg(feature = "wgpu")]
 use eta_exec::{PassInputs, StepOutcome};
@@ -345,6 +350,14 @@ impl Plane {
                 registration.id
             )));
         }
+        if !registration.slots.is_empty() {
+            return Err(Refusal::Program(format!(
+                "channel {} names {} channel slot(s), and this engine keeps every cell of a \
+                 ring on the host",
+                registration.id,
+                registration.slots.len()
+            )));
+        }
         let numel = numel_of(&registration.shape);
         let ring = Arc::new(ChannelState::host(
             eta_exec::concrete_dtype(registration.dtype),
@@ -382,8 +395,15 @@ impl Plane {
     pub fn bind(
         &mut self,
         binding: &InstanceBinding,
-        #[cfg(feature = "wgpu")] device: Option<&crate::device::Context>,
+        place: Option<&Place<'_, crate::device::Api>>,
     ) -> Result<BoundInstance, Refusal> {
+        if !binding.ring_slots.is_empty() {
+            return Err(Refusal::Program(format!(
+                "program {} binds channel slots, and this engine keeps every cell of a ring on \
+                 the host",
+                binding.program
+            )));
+        }
         let plan = self
             .programs
             .get(&binding.program)
@@ -431,8 +451,10 @@ impl Plane {
         }
         let inst = eta_exec::make_host_instance(&plan, &externs, &seeds);
 
+        #[cfg(not(feature = "wgpu"))]
+        let _ = place;
         #[cfg(feature = "wgpu")]
-        let session = self.build_session(device, binding, &plan).map_err(|why| {
+        let session = self.build_session(place, binding, &plan).map_err(|why| {
             Refusal::Program(format!("program {} does not bind: {why}", binding.program))
         })?;
         self.next_instance += 1;
@@ -970,13 +992,14 @@ impl Plane {
     #[cfg(feature = "wgpu")]
     fn build_session(
         &mut self,
-        device: Option<&crate::device::Context>,
+        place: Option<&Place<'_, crate::device::Api>>,
         binding: &InstanceBinding,
         plan: &ExecPlan,
     ) -> Result<crate::guest::session::Session, String> {
-        let device = device.ok_or_else(|| {
+        let place = place.ok_or_else(|| {
             "this engine bound no device, so a guest pass has nowhere to run".to_owned()
         })?;
+        let device = place.device;
         let compiled = self
             .forms
             .get(binding.program)
@@ -1017,13 +1040,120 @@ impl Plane {
                 code
             }
         };
-        crate::guest::session::Session::new(device, &plan.package.plans, code, &extents)
-            .map_err(|why| format!("its device half did not build: {why}"))
+        crate::guest::session::Session::new(
+            device,
+            &plan.package.plans,
+            code,
+            &extents,
+            &crate::guest::session::Tables {
+                pools: place.pools,
+                slots: &binding.instance_slots,
+                align: place.align,
+            },
+        )
+        .map_err(|why| format!("its device half did not build: {why}"))
     }
 
     #[must_use]
     pub fn tally(&self) -> u64 {
         self.tally.device.load(Ordering::Acquire)
+    }
+
+    /// What an instance of `program` holds in the pool: its stages' tables
+    /// in `Instance` slots. Its rings lie on the host.
+    pub fn facts(
+        &self,
+        program: ProgramId,
+        place: &Place<'_, crate::device::Api>,
+    ) -> Result<ProgramFacts, Refusal> {
+        let plan = self.programs.get(&program).ok_or(Refusal::Closed {
+            what: "program",
+            id: program.0,
+        })?;
+        if self.forms.get(program).is_none() {
+            // No device half: the bind refuses it.
+            return Ok(ProgramFacts::default());
+        }
+        let sizes = engine_gpu::guest::session::program_table_sizes(&plan.package.plans);
+        let instance = engine_gpu::guest::held::table_footprint(
+            place.pools,
+            engine_gpu::store::layout::INSTANCE,
+            &sizes,
+            place.align,
+        )
+        .map_err(|fault| Refusal::Program(fault.to_string()))?;
+        Ok(ProgramFacts {
+            instance,
+            rings: Vec::new(),
+        })
+    }
+
+    /// Every pass a landed step left to run is on the queue.
+    pub fn quiesce(&mut self) -> Result<(), Refusal> {
+        #[cfg(feature = "wgpu")]
+        for (&id, seat) in &self.instances {
+            seat.gate.settle(id)?;
+        }
+        Ok(())
+    }
+
+    /// Points every instance's tables at the chunks their slots sit in now.
+    pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<(), Refusal> {
+        #[cfg(feature = "wgpu")]
+        for seat in self.instances.values() {
+            seat.half
+                .lock()
+                .expect("half lock poisoned")
+                .session
+                .rebind(pools)
+                .map_err(|fault| Refusal::Program(fault.to_string()))?;
+        }
+        #[cfg(not(feature = "wgpu"))]
+        let _ = pools;
+        Ok(())
+    }
+
+    /// Moves an instance's tables to the slots `rebind` names.
+    pub fn rebind_slots(
+        &mut self,
+        pools: &Pools<crate::device::Api>,
+        rebind: &Rebind,
+    ) -> Result<(), Refusal> {
+        match rebind {
+            Rebind::Instance {
+                id,
+                instance,
+                rings,
+            } => {
+                if !rings.is_empty() {
+                    return Err(Refusal::Program(format!(
+                        "instance {id} rebinds channel slots, and this engine keeps every cell \
+                         of a ring on the host"
+                    )));
+                }
+                let seat = self.instances.get(id).ok_or(Refusal::Closed {
+                    what: "instance",
+                    id: id.0,
+                })?;
+                #[cfg(feature = "wgpu")]
+                {
+                    seat.gate.settle(*id)?;
+                    seat.half
+                        .lock()
+                        .expect("half lock poisoned")
+                        .session
+                        .retarget(pools, instance)
+                        .map_err(|fault| Refusal::Program(fault.to_string()))?;
+                }
+                #[cfg(not(feature = "wgpu"))]
+                let _ = (seat, pools, instance);
+                Ok(())
+            }
+            Rebind::Channel { id, .. } => Err(Refusal::Program(format!(
+                "channel {id} rebinds channel slots, and this engine keeps every cell of a ring \
+                 on the host"
+            ))),
+        }
     }
 
     fn instance_mut(&mut self, id: InstanceId) -> Result<&mut Instance, Refusal> {
@@ -1067,11 +1197,45 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         Plane::package(self, program)
     }
 
+    fn facts(
+        &self,
+        program: ProgramId,
+        place: &Place<'_, crate::device::Api>,
+    ) -> Result<ProgramFacts, Refusal> {
+        Plane::facts(self, program, place)
+    }
+
+    /// No channel keeps a cell on the device here.
+    fn ring_facts(
+        &self,
+        _registration: &ChannelRegistration,
+        _place: &Place<'_, crate::device::Api>,
+    ) -> Result<Option<RingFacts>, Refusal> {
+        Ok(None)
+    }
+
     fn register_channel(
         &mut self,
         registration: &ChannelRegistration,
+        _place: Option<&Place<'_, crate::device::Api>>,
     ) -> Result<RegisteredChannel, Refusal> {
         Plane::register_channel(self, registration)
+    }
+
+    fn quiesce(&mut self) -> Result<(), Refusal> {
+        Plane::quiesce(self)
+    }
+
+    fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<(), Refusal> {
+        Plane::rebind(self, pools)
+    }
+
+    fn rebind_slots(
+        &mut self,
+        pools: &Pools<crate::device::Api>,
+        rebind: &Rebind,
+    ) -> Result<(), Refusal> {
+        Plane::rebind_slots(self, pools, rebind)
     }
 
     fn close_channel(&mut self, id: ChannelId) -> Result<(), Refusal> {
@@ -1081,16 +1245,9 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
     fn bind(
         &mut self,
         binding: &InstanceBinding,
-        device: Option<&crate::device::Context>,
+        place: Option<&Place<'_, crate::device::Api>>,
     ) -> Result<BoundInstance, Refusal> {
-        #[cfg(not(feature = "wgpu"))]
-        let _ = device;
-        Plane::bind(
-            self,
-            binding,
-            #[cfg(feature = "wgpu")]
-            device,
-        )
+        Plane::bind(self, binding, place)
     }
 
     fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {

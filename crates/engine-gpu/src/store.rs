@@ -695,6 +695,23 @@ impl<B: Backend> Pools<B> {
         self.pool.locate(at)
     }
 
+    /// The bytes one slot of shape `id` holds.
+    pub fn slot_bytes(&self, id: ShapeId) -> Result<u64> {
+        Ok(self.shape(id)?.slot_bytes)
+    }
+
+    /// The slots of shape `id` one chunk holds.
+    pub fn slots_per_chunk(&self, id: ShapeId) -> Result<u32> {
+        Ok(self.shape(id)?.per_chunk)
+    }
+
+    /// Slot ref `slot` of shape `id` as a guest's table or cell lies
+    /// (`guest::held`): the segment buffer its chunk sits in now and its
+    /// first byte there.
+    pub fn slot_place(&self, id: ShapeId, slot: u32) -> Result<(&B::Buffer, u64)> {
+        self.pool.locate(self.slot_offset(id, slot)?)
+    }
+
     /// What one id of shape `id` counts as kernels address it: the slot
     /// where a chunk holds whole slots, else `gcd(chunk, slot)` bytes.
     fn unit(&self, id: ShapeId) -> Result<u64> {

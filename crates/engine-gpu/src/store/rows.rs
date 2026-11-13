@@ -39,7 +39,7 @@ pub type Uses = (Vec<(WeightAtom, u32)>, Vec<WeightHeld>);
 pub const NOT_HELD: u32 = u32::MAX;
 
 /// The first weight shape's id; the shapes after it follow.
-pub const WEIGHTS: u32 = 8;
+pub const WEIGHTS: u32 = 9;
 
 /// Bytes one fill moves through its host-visible upload at most.
 const UPLOAD: u64 = 64 << 20;

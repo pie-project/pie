@@ -22,13 +22,13 @@ use poem_ir::InputAxis;
 
 use crate::backend;
 
-const NAME: &str = "outputs-mini";
-const WIDTH: u32 = 16;
-const VOCAB: u32 = 16;
-const LAYERS: u32 = 2;
+pub(super) const NAME: &str = "outputs-mini";
+pub(super) const WIDTH: u32 = 16;
+pub(super) const VOCAB: u32 = 16;
+pub(super) const LAYERS: u32 = 2;
 const THETA: f32 = 10_000.0;
 
-struct Outputs;
+pub(super) struct Outputs;
 
 impl ForwardHybrid for Outputs {
     fn states(&self) -> StateRows {
@@ -54,7 +54,7 @@ fn bf(x: f32) -> f32 {
     f32::from_bits((bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) << 16)
 }
 
-fn planes() -> BTreeMap<String, (Vec<u64>, Vec<f32>)> {
+pub(super) fn planes() -> BTreeMap<String, (Vec<u64>, Vec<f32>)> {
     let mut state = 0x5eed_u64;
     let mut unit = move || {
         state = state
@@ -71,7 +71,7 @@ fn planes() -> BTreeMap<String, (Vec<u64>, Vec<f32>)> {
     planes
 }
 
-fn write(path: &Path, planes: &BTreeMap<String, (Vec<u64>, Vec<f32>)>) {
+pub(super) fn write(path: &Path, planes: &BTreeMap<String, (Vec<u64>, Vec<f32>)>) {
     let bytes: Vec<(String, Vec<u64>, Vec<u8>)> = planes
         .iter()
         .map(|(name, (shape, values))| {
@@ -97,7 +97,7 @@ fn write(path: &Path, planes: &BTreeMap<String, (Vec<u64>, Vec<f32>)>) {
     .expect("the artifact writes");
 }
 
-fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, String> {
+pub(super) fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, String> {
     let source = ztensor::Source::open(path).map_err(|why| why.to_string())?;
     poem::import::own_contract(&source, &trace.params, 1, backend::PLATFORM)
         .map_err(|why| why.to_string())
@@ -228,6 +228,9 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
             ..Default::default()
         })
         .expect("the program registers");
+    let chunks = &loaded.caps.chunks;
+    let mut slots =
+        super::slots::Slots::of(chunks, chunks.segment_chunks - 1, chunks.segment_chunks - 2);
     let channels: Vec<ChannelId> = [
         (vec![1, 1], EtaDtype::I32, HostRole::Reader),
         (vec![LAYERS, WIDTH], EtaDtype::F32, HostRole::Reader),
@@ -237,8 +240,9 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
     .enumerate()
     .map(|(at, (shape, dtype, host_role))| {
         let id = ChannelId(at as u64 + 1);
-        engine
-            .register_channel(&ChannelRegistration {
+        slots.register(
+            &mut engine,
+            ChannelRegistration {
                 id,
                 shape,
                 dtype: ChanDType::Concrete(dtype),
@@ -248,14 +252,15 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
                 capacity: 2,
                 extern_name: Vec::new(),
                 slots: Vec::new(),
-            })
-            .expect("the channel registers");
+            },
+        );
         id
     })
     .collect();
     let rows = 3u32;
-    let instance = engine
-        .bind_instance(&InstanceBinding {
+    let binding = slots.binding(
+        &engine,
+        InstanceBinding {
             program,
             channels: channels.clone(),
             seeds: Vec::new(),
@@ -270,7 +275,11 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
             device_resolved: Default::default(),
             instance_slots: Vec::new(),
             ring_slots: Vec::new(),
-        })
+        },
+        &channels,
+    );
+    let instance = engine
+        .bind_instance(&binding)
         .expect("the instance binds")
         .id;
     let t = 0.375f32;

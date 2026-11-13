@@ -20,6 +20,13 @@
 //!   layer-major, a page table of its own; a slot trimmed behind the window
 //!   is ref 0 (the null chunk), which the window kernels never read.
 //!
+//! - [`INSTANCE`], [`CHANNEL`]: a guest instance's bind-time launch tables
+//!   and the cells a channel keeps on the device (`SlotRole::Instance`,
+//!   `SlotRole::Channel`; REDESIGN step 4, `new-memory/STATE-ROLES.md`),
+//!   `Fixed { pieces: 1 }` shapes no working set holds: the runtime takes
+//!   them per instance and channel. An item past a slot lies in a run of
+//!   adjacent slots of one chunk.
+//!
 //! A lane the runtime does not address by slot refs (a direct
 //! [`crate::Shell::fire`]) is *seat-addressed*: seat `s` takes the list slots
 //! `s * pages_per_slot ..` of a run kept for seats, and the record of fixed
@@ -37,6 +44,18 @@ pub const FIXED: ShapeId = ShapeId(1);
 /// The first (narrowest) window list.
 pub const WINDOW: ShapeId = ShapeId(2);
 pub const RS: ShapeId = ShapeId(3);
+
+/// A guest instance's bind-time launch tables (`SlotRole::Instance`). The
+/// weight shapes follow the guest shapes (`store::rows::WEIGHTS`).
+pub const INSTANCE: ShapeId = ShapeId(7);
+/// The cells a channel keeps on the device (`SlotRole::Channel`).
+pub const CHANNEL: ShapeId = ShapeId(8);
+
+/// An `Instance` slot's bytes: a measured instance's tables in one
+/// (`new-memory/STATE-ROLES.md` section 3). Structural, not config.
+pub const INSTANCE_SLOT: u64 = 4 << 10;
+/// A `Channel` slot's bytes.
+pub const CHANNEL_SLOT: u64 = 1 << 10;
 
 /// The most window lists a load holds (`ChunkFacts::validate`'s bound).
 pub const WINDOWS: usize = 4;
@@ -143,6 +162,12 @@ pub struct Layout {
     pub rs_tokens: u32,
     /// The seats seat-addressed lanes take.
     pub seats: u32,
+    /// Guest instances' tables and the cells channels keep on the device
+    /// (REDESIGN step 4): shapes no working set holds, taken per instance
+    /// and channel. No channel shape where the backend keeps every cell on
+    /// the host.
+    pub instance: Option<Slots>,
+    pub channel: Option<Slots>,
 }
 
 impl Layout {
@@ -172,6 +197,8 @@ impl Layout {
             rs: None,
             rs_tokens: 0,
             seats,
+            instance: None,
+            channel: None,
         };
         if let Some(shape) = layout.shapes().find(|s| s.per_chunk == 0) {
             return Err(Fault::Ceiling {
@@ -233,6 +260,31 @@ impl Layout {
         Ok(self)
     }
 
+    /// This layout with the guest shapes: [`INSTANCE`], and [`CHANNEL`]
+    /// where `channel_cells` (the backend keeps channel cells on the
+    /// device).
+    pub fn with_guests(mut self, channel_cells: bool) -> Result<Layout> {
+        for (id, bytes) in [(INSTANCE, INSTANCE_SLOT), (CHANNEL, CHANNEL_SLOT)] {
+            if id == CHANNEL && !channel_cells {
+                continue;
+            }
+            let slots = Slots::of(id, bytes, self.chunk_bytes).filter(|s| s.per_chunk > 0);
+            let Some(slots) = slots else {
+                return Err(Fault::Ceiling {
+                    what: "bytes of a pool chunk",
+                    need: bytes,
+                    have: self.chunk_bytes,
+                });
+            };
+            if id == INSTANCE {
+                self.instance = Some(slots);
+            } else {
+                self.channel = Some(slots);
+            }
+        }
+        Ok(self)
+    }
+
     /// Window list `k`, where the load holds one.
     #[must_use]
     pub fn window(&self, k: usize) -> Option<&WindowList> {
@@ -265,6 +317,8 @@ impl Layout {
             .chain(&self.fixed)
             .chain(self.windows.iter().flatten().map(|w| &w.slots))
             .chain(&self.rs)
+            .chain(&self.instance)
+            .chain(&self.channel)
     }
 
     #[must_use]
@@ -370,6 +424,19 @@ impl Layout {
                 },
                 rows.get(1).unwrap_or(&Vec::new()),
             ));
+        }
+        for (slots, role) in [
+            (&self.instance, SlotRole::Instance),
+            (&self.channel, SlotRole::Channel),
+        ] {
+            if let Some(slots) = slots {
+                // The role, not the count, keeps these out of a working
+                // set: the runtime takes them per instance and channel.
+                shapes.push(SlotShape {
+                    role,
+                    ..shape(slots, SlotKind::Fixed { pieces: 1 }, &Vec::new())
+                });
+            }
         }
         ChunkFacts {
             chunk_bytes: self.chunk_bytes,

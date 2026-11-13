@@ -60,6 +60,14 @@ impl Serve for Api {
 
     const RECORDS: bool = true;
 
+    /// A pass keeps the cells only the device reads in `Channel` slots
+    /// (`guest::session::Kept`).
+    const CHANNEL_CELLS: bool = true;
+
+    fn table_align(device: &Context) -> u64 {
+        device.table_align()
+    }
+
     fn open(
         boot: &crate::api::DeviceBoot,
         allowance: engine::Allowance,

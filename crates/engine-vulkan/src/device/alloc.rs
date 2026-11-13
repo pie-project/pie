@@ -64,12 +64,20 @@ impl Raw {
         note_reservation();
         let size = bytes.max(4).next_multiple_of(4);
         let d = &core.device;
+        // The pool's segments hold guest configs a stage binds as a uniform
+        // (`guest::session`), beside everything bound as storage.
+        let uniform = if owner == engine_gpu::books::owners::POOL {
+            vk::BufferUsageFlags::UNIFORM_BUFFER
+        } else {
+            vk::BufferUsageFlags::empty()
+        };
         let info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_SRC
-                    | vk::BufferUsageFlags::TRANSFER_DST,
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | uniform,
             )
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: `d` is the live device `core` owns, and `info` is a valid

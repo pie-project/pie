@@ -2,7 +2,7 @@
 //! config, and how wide it dispatches.
 
 use eta_compiler::codegen::launch::LaunchStagePlan;
-use eta_exec::ValueDesc;
+use eta_exec::{Extents, OpParams, ValueDesc, describe, layout};
 
 pub const DESC_WORDS: usize = 9;
 
@@ -65,4 +65,92 @@ pub fn groups_for(descriptors: &[ValueDesc], cores: u32) -> u32 {
     let wanted = widest.div_ceil(WORKGROUP);
     let cap = cores.max(1).saturating_mul(GROUPS_PER_CORE);
     wanted.clamp(1, cap)
+}
+
+/// A stage's bind-time launch tables, in the order they lie in the
+/// instance's `Instance` slots: descriptors, op params, value offsets and
+/// the config, bound at these bindings.
+pub const TABLE_BINDINGS: [u32; 4] = [1, 2, 3, CFG_BINDING];
+
+/// The bytes of a stage's tables ([`TABLE_BINDINGS`] order): what its
+/// value and op counts fix, whatever the extents a bind resolves.
+#[must_use]
+pub fn table_sizes(plan: &LaunchStagePlan) -> [u64; 4] {
+    [
+        (plan.value_types.len() * DESC_WORDS * 4).max(DESC_WORDS * 4) as u64,
+        (plan.ops.len().max(1) * size_of::<OpParams>()) as u64,
+        (plan.value_types.len().max(1) * 4) as u64,
+        size_of::<Cfg>() as u64,
+    ]
+}
+
+/// Every stage's tables, stage by stage, as an instance of `plans` lays
+/// them in its slots.
+#[must_use]
+pub fn program_table_sizes(plans: &[LaunchStagePlan]) -> Vec<u64> {
+    plans.iter().flat_map(table_sizes).collect()
+}
+
+/// What a stage resolves at a bind: its values' descriptors and scratch
+/// offsets, the scratch's bytes, and its tables' bytes ([`table_sizes`]
+/// each, [`TABLE_BINDINGS`] order).
+pub struct StageTables {
+    pub descriptors: Vec<ValueDesc>,
+    pub offsets: Vec<u64>,
+    pub scratch: u64,
+    pub tables: [Vec<u8>; 4],
+}
+
+/// Resolves `plan` against `extents`.
+pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTables, String> {
+    let descriptors = plan
+        .value_types
+        .iter()
+        .map(|value| {
+            describe(value, extents).map_err(|why| {
+                format!("a guest value's shape does not resolve against this fire: {why:?}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut scratch = layout(&descriptors)
+        .map_err(|why| format!("a guest pass's scratch does not fit: {why:?}"))?;
+    alias_reshapes(plan, &mut scratch.values);
+
+    let sizes = table_sizes(plan);
+    let sized = |mut bytes: Vec<u8>, at: usize| {
+        bytes.resize(usize::try_from(sizes[at]).unwrap_or(usize::MAX), 0);
+        bytes
+    };
+    let descs: Vec<u8> = descriptors
+        .iter()
+        .flat_map(|d| words_le(&desc_words(d)))
+        .collect();
+    let mut params = Vec::with_capacity(plan.ops.len() * size_of::<OpParams>());
+    let mut result_base = 0u32;
+    for op in &plan.ops {
+        params.extend_from_slice(&OpParams::of(op, result_base, plan.output_slots).to_le_bytes());
+        result_base += u32::from(op.result_count);
+    }
+    let offsets: Vec<u32> = scratch
+        .values
+        .iter()
+        .map(|&at| u32::try_from(at).unwrap_or(u32::MAX))
+        .collect();
+    let config = Cfg {
+        value_count: u32::try_from(plan.value_types.len()).unwrap_or(u32::MAX),
+        temporary: u32::try_from(scratch.temporary / 4).unwrap_or(u32::MAX),
+        op_count: u32::try_from(plan.ops.len()).unwrap_or(u32::MAX),
+        lane: 0,
+    };
+    Ok(StageTables {
+        descriptors,
+        tables: [
+            sized(descs, 0),
+            sized(params, 1),
+            sized(words_le(&offsets), 2),
+            sized(config.to_le_bytes(), 3),
+        ],
+        offsets: scratch.values,
+        scratch: scratch.total.max(256),
+    })
 }

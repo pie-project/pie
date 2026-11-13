@@ -997,6 +997,17 @@ impl Context {
         self.core.cores.unwrap_or(crate::chip::UNREPORTED_CORES)
     }
 
+    /// The alignment a guest table takes in its pool slot: 16 at least, and
+    /// what a storage or uniform descriptor's offset asks.
+    #[must_use]
+    pub fn table_align(&self) -> u64 {
+        let limits = &self.core.limits;
+        limits
+            .min_storage_buffer_offset_alignment
+            .max(limits.min_uniform_buffer_offset_alignment)
+            .max(engine_gpu::guest::held::TABLE_ALIGN)
+    }
+
     #[must_use]
     pub fn subgroup_size(&self) -> u32 {
         self.core.subgroup_size

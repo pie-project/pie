@@ -3,16 +3,20 @@ use std::sync::Arc;
 
 use ash::vk;
 use eta_compiler::codegen::launch::LaunchStagePlan;
-use eta_exec::{Extents, OpParams, ValueDesc, describe, layout};
+use eta_exec::{Extents, ValueDesc};
 
 use crate::device::Context;
 use crate::device::alloc::{Buffer, Memory};
 use crate::device::ctx::{Core, Frame, Pending};
 use engine_gpu::error::{Fault, Result};
+use engine_gpu::store::Pools;
+use engine_gpu::store::layout::{CHANNEL, INSTANCE};
 
-use engine_gpu::guest::session::{
-    BINDINGS, Cfg, DESC_WORDS, alias_reshapes, desc_words, groups_for, words_le,
-};
+use engine_gpu::guest::held::{self, consecutive};
+use engine_gpu::guest::session::{BINDINGS, StageTables, groups_for, stage_tables};
+
+/// A span of a pool slot (or run) a guest holds.
+pub type Held = held::Held<crate::device::Api>;
 
 /// A stage's pipelines, which follow from its SPIR-V alone: built once per
 /// distinct stage and shared by every session that runs it, since a mobile
@@ -60,10 +64,9 @@ struct Stage {
     offsets: Vec<u64>,
 
     descriptors: Vec<ValueDesc>,
-    descs: Buffer,
-    params: Buffer,
-    offs: Buffer,
-    cfg: Buffer,
+    /// The stage's bind-time tables in the instance's `Instance` slots,
+    /// in `TABLE_BINDINGS` order.
+    tables: [Held; 4],
 
     heap: Buffer,
 
@@ -76,8 +79,120 @@ struct Stage {
 
 /// The cells of channels the device keeps between fires, by channel: one
 /// set for the engine, so a pass reads what another program's pass kept.
-pub type Kept =
-    Arc<std::sync::Mutex<std::collections::HashMap<engine::channel::ChannelId, Buffer>>>;
+/// A channel's cell lies in the `Channel` slots the runtime took for it
+/// when it was registered (or its instance bound), whether or not a pass
+/// keeps a cell in it now.
+pub type Kept = Arc<std::sync::Mutex<std::collections::HashMap<engine::channel::ChannelId, Cell>>>;
+
+/// Where a channel keeps a cell on the device.
+#[derive(Debug)]
+pub struct Cell {
+    place: CellPlace,
+    bytes: u64,
+    /// A pass kept a cell here the host has not superseded.
+    live: bool,
+}
+
+#[derive(Debug)]
+enum CellPlace {
+    /// In the channel's `Channel` slots (one run where the cell is past a
+    /// slot).
+    Pooled(Held),
+    /// A cell past a chunk, which the contract states no slots for: a
+    /// buffer of the engine's own.
+    Own(Buffer),
+}
+
+impl Cell {
+    /// A cell of `bytes` in `slots` (`Channel` slot refs, one run where
+    /// `bytes` is past a slot).
+    pub fn pooled(pools: &Pools<crate::device::Api>, slots: &[u32], bytes: u64) -> Result<Cell> {
+        let count = u32::try_from(slots.len()).unwrap_or(u32::MAX);
+        let first = *slots.first().ok_or_else(|| Fault::Program {
+            at: "guest::session",
+            why: "a channel cell placed in no Channel slots".into(),
+        })?;
+        if !consecutive(slots) {
+            return Err(Fault::Program {
+                at: "guest::session",
+                why: format!("a channel cell of {bytes} bytes in slots {slots:?}, not one run"),
+            });
+        }
+        Ok(Cell {
+            place: CellPlace::Pooled(Held::in_run(pools, CHANNEL, first, count, 0, bytes)?),
+            bytes,
+            live: false,
+        })
+    }
+
+    /// A cell past a chunk, in a buffer of its own.
+    pub fn own(device: &Context, bytes: u64) -> Result<Cell> {
+        Ok(Cell {
+            place: CellPlace::Own(Buffer::zeroed(
+                device,
+                bytes,
+                engine_gpu::books::owners::GUEST_STATE,
+            )?),
+            bytes,
+            live: false,
+        })
+    }
+
+    fn span(&self) -> (&Buffer, u64) {
+        match &self.place {
+            CellPlace::Pooled(held) => (held.buffer(), held.offset()),
+            CellPlace::Own(buffer) => (buffer, 0),
+        }
+    }
+
+    /// The cell as the forward reads it.
+    #[must_use]
+    pub fn device_cell(&self) -> engine_gpu::serve::DeviceCell<crate::device::Api> {
+        let (buffer, at) = self.span();
+        engine_gpu::serve::DeviceCell {
+            buffer: buffer.clone(),
+            at,
+            bytes: self.bytes,
+        }
+    }
+
+    pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<()> {
+        match &mut self.place {
+            CellPlace::Pooled(held) => held.rebind(pools),
+            CellPlace::Own(_) => Ok(()),
+        }
+    }
+
+    /// Moves a pooled cell to `slots`, whose bytes the runtime copied there.
+    pub fn retarget(&mut self, pools: &Pools<crate::device::Api>, slots: &[u32]) -> Result<()> {
+        let need = held::item_slots(
+            self.bytes,
+            pools.slot_bytes(CHANNEL)?,
+            pools.slots_per_chunk(CHANNEL)?,
+        )
+        .map_or(0, |(slots, _)| slots);
+        match &mut self.place {
+            CellPlace::Pooled(held) if slots.len() == need as usize && consecutive(slots) => {
+                held.retarget(pools, slots[0])
+            }
+            _ => Err(Fault::Program {
+                at: "guest::session",
+                why: format!(
+                    "a channel cell of {} bytes rebound to {slots:?}, which is not a run of the                      {need} slot(s) it holds",
+                    self.bytes
+                ),
+            }),
+        }
+    }
+}
+
+/// Where an instance's tables go: the `Instance` slots the runtime took
+/// for them, and a table's alignment there.
+pub struct Tables<'a> {
+    pub pools: &'a Pools<crate::device::Api>,
+    pub slots: &'a [u32],
+    pub align: u64,
+}
 
 pub struct Session {
     core: Arc<Core>,
@@ -85,6 +200,10 @@ pub struct Session {
     status: Buffer,
     stages: Vec<Stage>,
     pool: vk::DescriptorPool,
+    /// The `Instance` slots the stages' tables lie in, in binding order,
+    /// and whether they are one run.
+    slots: Vec<u32>,
+    run: bool,
 
     kept: Kept,
     /// The engine's channel behind each of the program's.
@@ -110,6 +229,7 @@ impl std::fmt::Debug for Session {
 }
 
 impl Session {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &Context,
         plans: &[LaunchStagePlan],
@@ -118,6 +238,7 @@ impl Session {
         built: &mut BuiltStages,
         kept: Kept,
         channels: Vec<engine::channel::ChannelId>,
+        tables: &Tables<'_>,
     ) -> Result<Session> {
         if code.len() != plans.len() {
             return Err(Fault::Program {
@@ -139,8 +260,25 @@ impl Session {
         status.write(0, &[0u8; eta_exec::STATUS_BYTES])?;
 
         let core = device.core().clone();
+        let resolved = plans
+            .iter()
+            .map(|plan| {
+                stage_tables(plan, extents).map_err(|why| Fault::Program {
+                    at: "guest::session",
+                    why,
+                })
+            })
+            .collect::<Result<Vec<StageTables>>>()?;
+        // Every stage's tables, in the instance's slots, written at once.
+        let bytes: Vec<Vec<u8>> = resolved
+            .iter()
+            .flat_map(|stage| stage.tables.iter().cloned())
+            .collect();
+        let (placed, run) =
+            held::place_tables(tables.pools, INSTANCE, tables.slots, &bytes, tables.align)?;
+        let mut placed = placed.into_iter();
         let mut stages = Vec::with_capacity(plans.len());
-        for (plan, lowered) in plans.iter().zip(code) {
+        for ((plan, lowered), resolved) in plans.iter().zip(code).zip(resolved) {
             let pipelines = match built.get(&stage_key(lowered)) {
                 Some(pipelines) => Arc::clone(pipelines),
                 None => {
@@ -149,7 +287,10 @@ impl Session {
                     pipelines
                 }
             };
-            stages.push(build_stage(device, plan, lowered, extents, pipelines)?);
+            let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
+            stages.push(build_stage(
+                device, plan, lowered, resolved, tables, pipelines,
+            )?);
         }
 
         let sizes = [
@@ -183,6 +324,8 @@ impl Session {
             status,
             stages,
             pool,
+            slots: tables.slots.to_vec(),
+            run,
             kept,
             channels,
             airborne: std::collections::VecDeque::new(),
@@ -207,22 +350,35 @@ impl Session {
                 )
                 .map_err(|e| self.core.fault("vkAllocateDescriptorSets", e))?[0]
             };
-            let stage = &self.stages[at];
+            self.stages[at].set = set;
+        }
+        self.write_sets()
+    }
+
+    /// Points each stage's set at its buffers: the status word, its tables
+    /// where their slots lie now, and its heap. Nothing on the queue uses
+    /// the sets: at construction none has run, and a rebind settles first.
+    fn write_sets(&self) -> Result<()> {
+        let d = &self.core.device;
+        for stage in &self.stages {
+            let [descs, params, offs, cfg] = &stage.tables;
+            let whole = |buffer: &Buffer| (buffer.slab().buffer, 0, buffer.bytes());
+            let held = |held: &Held| (held.buffer().slab().buffer, held.offset(), held.bytes());
             let buffers = [
-                (&self.status, vk::DescriptorType::STORAGE_BUFFER),
-                (&stage.descs, vk::DescriptorType::STORAGE_BUFFER),
-                (&stage.params, vk::DescriptorType::STORAGE_BUFFER),
-                (&stage.offs, vk::DescriptorType::STORAGE_BUFFER),
-                (&stage.heap, vk::DescriptorType::STORAGE_BUFFER),
-                (&stage.cfg, vk::DescriptorType::UNIFORM_BUFFER),
+                (whole(&self.status), vk::DescriptorType::STORAGE_BUFFER),
+                (held(descs), vk::DescriptorType::STORAGE_BUFFER),
+                (held(params), vk::DescriptorType::STORAGE_BUFFER),
+                (held(offs), vk::DescriptorType::STORAGE_BUFFER),
+                (whole(&stage.heap), vk::DescriptorType::STORAGE_BUFFER),
+                (held(cfg), vk::DescriptorType::UNIFORM_BUFFER),
             ];
             let infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
                 .iter()
-                .map(|(buffer, _)| {
+                .map(|&((buffer, offset, range), _)| {
                     [vk::DescriptorBufferInfo::default()
-                        .buffer(buffer.slab().buffer)
-                        .offset(0)
-                        .range(buffer.bytes())]
+                        .buffer(buffer)
+                        .offset(offset)
+                        .range(range)]
                 })
                 .collect();
             let writes: Vec<vk::WriteDescriptorSet> = buffers
@@ -231,20 +387,66 @@ impl Session {
                 .enumerate()
                 .map(|(binding, ((_, kind), info))| {
                     vk::WriteDescriptorSet::default()
-                        .dst_set(set)
+                        .dst_set(stage.set)
                         .dst_binding(binding as u32)
                         .descriptor_type(*kind)
                         .buffer_info(info)
                 })
                 .collect();
-            // SAFETY: `set` was just allocated and no command uses it yet; each
-            // write names a live buffer of this session over its whole length,
-            // with the descriptor type its layout binding declares, and the
-            // `infos` it points into outlive the call.
+            // SAFETY: no command on the queue uses `stage.set` (see above);
+            // each write names a live buffer (a pool segment at a table's
+            // offset, aligned to the device's descriptor offset alignment by
+            // the table layout, or this session's own) with the descriptor
+            // type its layout binding declares, and the `infos` it points
+            // into outlive the call.
             unsafe { d.update_descriptor_sets(&writes, &[]) };
-            self.stages[at].set = set;
         }
         Ok(())
+    }
+
+    /// Points the stages' sets at the chunks their tables' slots sit in
+    /// now, after an evacuation; the passes on the queue land first.
+    pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<()> {
+        self.settle()?;
+        for stage in &mut self.stages {
+            for table in &mut stage.tables {
+                table.rebind(pools)?;
+            }
+        }
+        self.write_sets()
+    }
+
+    /// Moves the tables to `slots` (`Instance` slot refs, as many as they
+    /// lie in, in order), whose bytes the runtime copied there.
+    pub fn retarget(&mut self, pools: &Pools<crate::device::Api>, slots: &[u32]) -> Result<()> {
+        if slots.len() != self.slots.len() {
+            return Err(Fault::Program {
+                at: "guest::session",
+                why: format!(
+                    "tables in {} instance slot(s) rebound to {slots:?}",
+                    self.slots.len()
+                ),
+            });
+        }
+        if self.run && !consecutive(slots) {
+            return Err(Fault::Program {
+                at: "guest::session",
+                why: format!("tables in one run rebound to {slots:?}, not a run"),
+            });
+        }
+        self.settle()?;
+        for stage in &mut self.stages {
+            for table in &mut stage.tables {
+                let at = self
+                    .slots
+                    .iter()
+                    .position(|&slot| slot == table.slot())
+                    .expect("a table lies in one of the session's slots");
+                table.retarget(pools, slots[at])?;
+            }
+        }
+        self.slots = slots.to_vec();
+        self.write_sets()
     }
 
     #[must_use]
@@ -323,15 +525,29 @@ impl Session {
             at: "guest::session",
             why: format!("value {value} is not stage {stage}'s"),
         })?;
+        let _ = device;
         let id = self.channel(channel)?;
         let mut kept = self.kept.lock().expect("kept cells lock poisoned");
-        if kept.get(&id).is_none_or(|cell| cell.bytes() < len) {
-            kept.insert(
-                id,
-                Buffer::zeroed(device, len, engine_gpu::books::owners::GUEST)?,
-            );
+        let cell = kept.get_mut(&id).ok_or_else(|| Fault::Program {
+            at: "guest::session",
+            why: format!(
+                "channel {id} keeps a cell on the device and holds no place for one: its \
+                 registration took no Channel slots"
+            ),
+        })?;
+        if cell.bytes < len {
+            return Err(Fault::Program {
+                at: "guest::session",
+                why: format!(
+                    "channel {id} keeps a {len}-byte value in a {}-byte cell",
+                    cell.bytes
+                ),
+            });
         }
-        frame.copy(&self.stages[stage].heap, at, &kept[&id], 0, len)
+        let (into, into_at) = cell.span();
+        frame.copy(&self.stages[stage].heap, at, into, into_at, len)?;
+        cell.live = true;
+        Ok(())
     }
 
     /// A read-back buffer of its own for a pass that lands after the next
@@ -392,13 +608,17 @@ impl Session {
 
     /// The device cell a kept channel holds.
     #[must_use]
-    pub fn kept_cell(&self, channel: u32) -> Option<Buffer> {
+    pub fn kept_cell(
+        &self,
+        channel: u32,
+    ) -> Option<engine_gpu::serve::DeviceCell<crate::device::Api>> {
         let id = self.channels.get(channel as usize)?;
         self.kept
             .lock()
             .expect("kept cells lock poisoned")
             .get(id)
-            .cloned()
+            .filter(|cell| cell.live)
+            .map(Cell::device_cell)
     }
 
     pub fn depart(&mut self, pending: Pending) {
@@ -424,11 +644,14 @@ impl Session {
     /// Drops the device's cell for `channel`, so the next take reads the
     /// ring, which the host has written.
     pub fn forget(&mut self, channel: u32) {
-        if let Some(id) = self.channels.get(channel as usize) {
-            self.kept
+        if let Some(id) = self.channels.get(channel as usize)
+            && let Some(cell) = self
+                .kept
                 .lock()
                 .expect("kept cells lock poisoned")
-                .remove(id);
+                .get_mut(id)
+        {
+            cell.live = false;
         }
     }
 
@@ -449,11 +672,11 @@ impl Session {
             why: format!("value {value} is not stage {stage}'s"),
         })?;
         frame.copy(
-            &cell,
-            0,
+            &cell.buffer,
+            cell.at,
             &self.stages[stage].heap,
             at,
-            len.min(cell.bytes()),
+            len.min(cell.bytes),
         )?;
         Ok(true)
     }
@@ -572,88 +795,27 @@ fn build_stage(
     device: &Context,
     plan: &LaunchStagePlan,
     lowered: &engine_gpu::guest::Lowered<Vec<u32>>,
-    extents: &Extents,
+    resolved: StageTables,
+    tables: [Held; 4],
     built: Arc<Built>,
 ) -> Result<Stage> {
-    let descriptors = plan
-        .value_types
-        .iter()
-        .map(|value| {
-            describe(value, extents).map_err(|why| Fault::Program {
-                at: "guest::session",
-                why: format!("a guest value's shape does not resolve against this fire: {why:?}"),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut scratch = layout(&descriptors).map_err(|why| Fault::Program {
-        at: "guest::session",
-        why: format!("a guest pass's scratch does not fit: {why:?}"),
-    })?;
-    alias_reshapes(plan, &mut scratch.values);
-
-    let desc_bytes: Vec<u8> = descriptors
-        .iter()
-        .flat_map(|d| words_le(&desc_words(d)))
-        .collect();
-    let offset_words: Vec<u32> = scratch
-        .values
-        .iter()
-        .map(|&at| u32::try_from(at).unwrap_or(u32::MAX))
-        .collect();
-
-    let mut records = Vec::with_capacity(plan.ops.len());
-    let mut result_base = 0u32;
-    for op in &plan.ops {
-        records.push(OpParams::of(op, result_base, plan.output_slots));
-        result_base += u32::from(op.result_count);
-    }
-    let config = Cfg {
-        value_count: u32::try_from(plan.value_types.len()).unwrap_or(u32::MAX),
-        temporary: u32::try_from(scratch.temporary / 4).unwrap_or(u32::MAX),
-        op_count: u32::try_from(plan.ops.len()).unwrap_or(u32::MAX),
-        lane: 0,
-    };
-
-    let mut descs = Buffer::zeroed(
-        device,
-        desc_bytes.len().max(DESC_WORDS * 4) as u64,
-        engine_gpu::books::owners::GUEST,
-    )?;
-    descs.write(0, &desc_bytes)?;
-    let mut offs = Buffer::zeroed(
-        device,
-        (offset_words.len().max(1) * 4) as u64,
-        engine_gpu::books::owners::GUEST,
-    )?;
-    offs.write(0, &words_le(&offset_words))?;
-    let mut params = Buffer::zeroed(
-        device,
-        (records.len().max(1) * size_of::<OpParams>()) as u64,
-        engine_gpu::books::owners::GUEST,
-    )?;
-    if !records.is_empty() {
-        let record_bytes: Vec<u8> = records.iter().flat_map(OpParams::to_le_bytes).collect();
-        params.write(0, &record_bytes)?;
-    }
-    let mut cfg = Buffer::with(
-        device,
-        size_of::<Cfg>() as u64,
-        Memory::Host,
-        engine_gpu::books::owners::GUEST,
-    )?;
-    cfg.write(0, &config.to_le_bytes())?;
-
-    let bytes = scratch.total.max(256);
-    let heap = Buffer::zeroed(device, bytes, engine_gpu::books::owners::GUEST_STATE)?;
+    let _ = plan;
+    let StageTables {
+        descriptors,
+        offsets,
+        scratch,
+        ..
+    } = resolved;
+    let heap = Buffer::zeroed(device, scratch, engine_gpu::books::owners::GUEST_STATE)?;
     let staging = Buffer::with(
         device,
-        bytes,
+        scratch,
         Memory::Host,
         engine_gpu::books::owners::GUEST,
     )?;
     let landing = Buffer::with(
         device,
-        bytes,
+        scratch,
         Memory::Host,
         engine_gpu::books::owners::GUEST,
     )?;
@@ -666,12 +828,9 @@ fn build_stage(
             1
         },
         set: vk::DescriptorSet::null(),
-        offsets: scratch.values,
+        offsets,
         descriptors,
-        descs,
-        params,
-        offs,
-        cfg,
+        tables,
         heap,
         staging,
         landing,

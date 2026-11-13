@@ -3,10 +3,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
-use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
+use engine::program::{
+    BoundInstance, Footprint, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
+    ProgramRegistration, Rebind, RingFacts,
+};
+use engine_gpu::program::Place;
+use engine_gpu::store::Pools;
+use engine_gpu::store::layout::{CHANNEL, INSTANCE};
 #[cfg(feature = "vulkan")]
 use eta_exec::StepOutcome;
 use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, Value};
+use eta_ir::container::{ChanDType, HostRole};
 use eta_ir::registry::{GeometryClass, Port, Stage};
 
 use engine_gpu::program::Refusal;
@@ -22,6 +29,11 @@ struct Instance {
 
     #[cfg(feature = "vulkan")]
     session: crate::guest::session::Session,
+
+    /// The channels whose device cells this instance holds itself (none
+    /// registered covers them), in its `ring_slots`.
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+    own_cells: Vec<ChannelId>,
 
     /// Ring cells a pass on the queue has yet to land, as (channel, sequence).
     landing: Arc<Mutex<Vec<(u32, u64)>>>,
@@ -91,11 +103,39 @@ impl Plane {
     pub fn register_channel(
         &mut self,
         registration: &ChannelRegistration,
+        place: Option<&Place<'_, crate::device::Api>>,
     ) -> Result<RegisteredChannel, Refusal> {
         if self.channels.contains_key(&registration.id) {
             return Err(Refusal::Program(format!(
                 "channel {} is already registered",
                 registration.id
+            )));
+        }
+        // The cell a pass may keep on the device for the channel, in the
+        // slots its registration names.
+        if let Some(place) = place
+            && let Some(bytes) = device_cell_bytes(
+                &registration.shape,
+                registration.dtype,
+                registration.host_role,
+            )
+        {
+            #[cfg(feature = "vulkan")]
+            {
+                let cell = self.cell(place, registration.id, bytes, &registration.slots)?;
+                self.kept
+                    .lock()
+                    .expect("kept cells lock poisoned")
+                    .insert(registration.id, cell);
+            }
+            #[cfg(not(feature = "vulkan"))]
+            let _ = (place, bytes);
+        } else if !registration.slots.is_empty() {
+            return Err(Refusal::Program(format!(
+                "channel {} keeps no cell on the device and its registration names {} channel \
+                 slot(s)",
+                registration.id,
+                registration.slots.len()
             )));
         }
         let numel = numel_of(&registration.shape);
@@ -132,7 +172,7 @@ impl Plane {
     pub fn bind(
         &mut self,
         binding: &InstanceBinding,
-        #[cfg(feature = "vulkan")] device: Option<&crate::device::Context>,
+        place: Option<&Place<'_, crate::device::Api>>,
     ) -> Result<BoundInstance, Refusal> {
         let plan = self
             .programs
@@ -182,9 +222,38 @@ impl Plane {
         let inst = eta_exec::make_host_instance(&plan, &externs, &seeds);
 
         #[cfg(feature = "vulkan")]
-        let session = self.build_session(device, binding, &plan).map_err(|why| {
+        let session = self.build_session(place, binding, &plan).map_err(|why| {
             Refusal::Program(format!("program {} does not bind: {why}", binding.program))
         })?;
+        // The device cells of the channels this instance holds itself.
+        #[cfg_attr(not(feature = "vulkan"), allow(unused_mut))]
+        let mut own_cells = Vec::new();
+        #[cfg(feature = "vulkan")]
+        if let Some(place) = place {
+            let mut cells = Vec::new();
+            for (dense, decl) in plan.package.channels.iter().enumerate() {
+                let id = binding.channels[dense];
+                if self.channels.contains_key(&id) || !puts_into(&plan, dense as u32) {
+                    continue;
+                }
+                let Some(bytes) = device_cell_bytes(&decl.shape, decl.dtype, decl.host_role) else {
+                    continue;
+                };
+                let slots = binding
+                    .ring_slots
+                    .iter()
+                    .find(|ring| ring.channel == dense as u32)
+                    .map_or(&[][..], |ring| ring.slots.as_slice());
+                cells.push((id, self.cell(place, id, bytes, slots)?));
+            }
+            let mut kept = self.kept.lock().expect("kept cells lock poisoned");
+            for (id, cell) in cells {
+                own_cells.push(id);
+                kept.insert(id, cell);
+            }
+        }
+        #[cfg(not(feature = "vulkan"))]
+        let _ = place;
         self.next_instance += 1;
         let id = InstanceId(self.next_instance);
         self.instances.insert(
@@ -197,6 +266,7 @@ impl Plane {
                 geometry: binding.geometry,
                 #[cfg(feature = "vulkan")]
                 session,
+                own_cells,
                 landing: Arc::default(),
                 faulted: Arc::default(),
             },
@@ -217,13 +287,195 @@ impl Plane {
     }
 
     pub fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {
-        self.instances
-            .remove(&id)
-            .map(|_| ())
-            .ok_or(Refusal::Closed {
-                what: "instance",
-                id: id.0,
-            })
+        let seat = self.instances.remove(&id).ok_or(Refusal::Closed {
+            what: "instance",
+            id: id.0,
+        })?;
+        // Its session settles its passes as it drops, before the slots go
+        // back to the runtime.
+        #[cfg(feature = "vulkan")]
+        {
+            let mut kept = self.kept.lock().expect("kept cells lock poisoned");
+            for channel in &seat.own_cells {
+                kept.remove(channel);
+            }
+        }
+        #[cfg(not(feature = "vulkan"))]
+        drop(seat);
+        Ok(())
+    }
+
+    /// What an instance of `program` holds in the pool: its stages' tables
+    /// in `Instance` slots, and a `Channel` cell for each channel it holds
+    /// itself that a pass may keep on the device.
+    pub fn facts(
+        &self,
+        program: ProgramId,
+        place: &Place<'_, crate::device::Api>,
+    ) -> Result<ProgramFacts, Refusal> {
+        let plan = self.programs.get(&program).ok_or(Refusal::Closed {
+            what: "program",
+            id: program.0,
+        })?;
+        if self.forms.get(program).is_none() {
+            // No device half: the bind refuses it.
+            return Ok(ProgramFacts::default());
+        }
+        let sizes = engine_gpu::guest::session::program_table_sizes(&plan.package.plans);
+        let instance =
+            engine_gpu::guest::held::table_footprint(place.pools, INSTANCE, &sizes, place.align)
+                .map_err(|fault| Refusal::Program(fault.to_string()))?;
+        let mut rings = Vec::new();
+        for (dense, decl) in plan.package.channels.iter().enumerate() {
+            let channel = dense as u32;
+            if !puts_into(plan, channel) {
+                continue;
+            }
+            if let Some(facts) = cell_facts(
+                channel,
+                &decl.shape,
+                decl.dtype,
+                decl.capacity,
+                decl.host_role,
+                place.pools,
+            )? {
+                rings.push(facts);
+            }
+        }
+        Ok(ProgramFacts { instance, rings })
+    }
+
+    /// The `Channel` slots a registered channel's device cell takes.
+    pub fn ring_facts(
+        &self,
+        registration: &ChannelRegistration,
+        place: &Place<'_, crate::device::Api>,
+    ) -> Result<Option<RingFacts>, Refusal> {
+        cell_facts(
+            0,
+            &registration.shape,
+            registration.dtype,
+            registration.capacity,
+            registration.host_role,
+            place.pools,
+        )
+    }
+
+    /// Points every table and cell at the chunk its slot sits in now.
+    pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<(), Refusal> {
+        #[cfg(feature = "vulkan")]
+        {
+            let program = |fault: engine_gpu::error::Fault| Refusal::Program(fault.to_string());
+            for seat in self.instances.values_mut() {
+                seat.session.rebind(pools).map_err(program)?;
+            }
+            for cell in self
+                .kept
+                .lock()
+                .expect("kept cells lock poisoned")
+                .values_mut()
+            {
+                cell.rebind(pools).map_err(program)?;
+            }
+        }
+        #[cfg(not(feature = "vulkan"))]
+        let _ = pools;
+        Ok(())
+    }
+
+    /// Moves an instance's tables and own cells, or a channel's cell, to
+    /// the slots `rebind` names.
+    pub fn rebind_slots(
+        &mut self,
+        pools: &Pools<crate::device::Api>,
+        rebind: &Rebind,
+    ) -> Result<(), Refusal> {
+        #[cfg(feature = "vulkan")]
+        {
+            let program = |fault: engine_gpu::error::Fault| Refusal::Program(fault.to_string());
+            match rebind {
+                Rebind::Instance {
+                    id,
+                    instance,
+                    rings,
+                } => {
+                    let seat = self.instances.get_mut(id).ok_or(Refusal::Closed {
+                        what: "instance",
+                        id: id.0,
+                    })?;
+                    seat.session.retarget(pools, instance).map_err(program)?;
+                    let mut kept = self.kept.lock().expect("kept cells lock poisoned");
+                    for ring in rings {
+                        let channel = seat.ids.get(ring.channel as usize).ok_or_else(|| {
+                            Refusal::Program(format!(
+                                "instance {id} rebinds ring {}, past its channels",
+                                ring.channel
+                            ))
+                        })?;
+                        kept.get_mut(channel)
+                            .ok_or_else(|| {
+                                Refusal::Program(format!(
+                                    "instance {id} holds no device cell for channel {channel}"
+                                ))
+                            })?
+                            .retarget(pools, &ring.slots)
+                            .map_err(program)?;
+                    }
+                }
+                Rebind::Channel { id, slots } => {
+                    // The passes reading it land first.
+                    for seat in self.instances.values_mut() {
+                        if seat.ids.contains(id) {
+                            seat.session.settle().map_err(program)?;
+                        }
+                    }
+                    self.kept
+                        .lock()
+                        .expect("kept cells lock poisoned")
+                        .get_mut(id)
+                        .ok_or_else(|| {
+                            Refusal::Program(format!("channel {id} holds no device cell"))
+                        })?
+                        .retarget(pools, slots)
+                        .map_err(program)?;
+                }
+            }
+        }
+        #[cfg(not(feature = "vulkan"))]
+        let _ = (pools, rebind);
+        Ok(())
+    }
+
+    /// A device cell of `bytes` for channel `id` in `slots`: a run of
+    /// `Channel` slots, or, past a chunk, a buffer of the engine's own.
+    #[cfg(feature = "vulkan")]
+    fn cell(
+        &self,
+        place: &Place<'_, crate::device::Api>,
+        id: ChannelId,
+        bytes: u64,
+        slots: &[u32],
+    ) -> Result<crate::guest::session::Cell, Refusal> {
+        let program = |fault: engine_gpu::error::Fault| Refusal::Program(fault.to_string());
+        let slot_bytes = place.pools.slot_bytes(CHANNEL).map_err(program)?;
+        let per_chunk = place.pools.slots_per_chunk(CHANNEL).map_err(program)?;
+        match engine_gpu::guest::held::item_slots(bytes, slot_bytes, per_chunk) {
+            Some((need, _)) if slots.len() == need as usize => {
+                crate::guest::session::Cell::pooled(place.pools, slots, bytes).map_err(program)
+            }
+            Some((need, _)) => Err(Refusal::Program(format!(
+                "channel {id}'s device cell of {bytes} bytes takes {need} channel slot(s) and \
+                 the binding names {slots:?}"
+            ))),
+            None if slots.is_empty() => {
+                crate::guest::session::Cell::own(place.device, bytes).map_err(program)
+            }
+            None => Err(Refusal::Program(format!(
+                "channel {id}'s device cell of {bytes} bytes is past a chunk, the engine's to \
+                 keep, and the binding names {} channel slot(s) for it",
+                slots.len()
+            ))),
+        }
     }
 
     pub fn input_cell(
@@ -529,7 +781,10 @@ impl Plane {
     /// queue wrote it there rather than to the ring.
     #[cfg(feature = "vulkan")]
     #[must_use]
-    pub fn token_feed(&self, instance: InstanceId) -> Option<crate::device::Buffer> {
+    pub fn token_feed(
+        &self,
+        instance: InstanceId,
+    ) -> Option<engine_gpu::serve::DeviceCell<crate::device::Api>> {
         let seat = self.instances.get(&instance)?;
         if !seat.geometry.ports().contains(Port::EmbedTokens) {
             return None;
@@ -699,13 +954,14 @@ impl Plane {
     #[cfg(feature = "vulkan")]
     fn build_session(
         &mut self,
-        device: Option<&crate::device::Context>,
+        place: Option<&Place<'_, crate::device::Api>>,
         binding: &InstanceBinding,
         plan: &ExecPlan,
     ) -> Result<crate::guest::session::Session, String> {
-        let device = device.ok_or_else(|| {
+        let place = place.ok_or_else(|| {
             "this engine bound no device, so a guest pass has nowhere to run".to_owned()
         })?;
+        let device = place.device;
         let compiled = self
             .forms
             .get(binding.program)
@@ -743,6 +999,11 @@ impl Plane {
             &mut self.built,
             Arc::clone(&self.kept),
             binding.channels.clone(),
+            &crate::guest::session::Tables {
+                pools: place.pools,
+                slots: &binding.instance_slots,
+                align: place.align,
+            },
         )
         .map_err(|why| format!("its device half did not build: {why}"))
     }
@@ -769,11 +1030,40 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         Plane::package(self, program)
     }
 
+    fn facts(
+        &self,
+        program: ProgramId,
+        place: &Place<'_, crate::device::Api>,
+    ) -> Result<ProgramFacts, Refusal> {
+        Plane::facts(self, program, place)
+    }
+
+    fn ring_facts(
+        &self,
+        registration: &ChannelRegistration,
+        place: &Place<'_, crate::device::Api>,
+    ) -> Result<Option<RingFacts>, Refusal> {
+        Plane::ring_facts(self, registration, place)
+    }
+
     fn register_channel(
         &mut self,
         registration: &ChannelRegistration,
+        place: Option<&Place<'_, crate::device::Api>>,
     ) -> Result<RegisteredChannel, Refusal> {
-        Plane::register_channel(self, registration)
+        Plane::register_channel(self, registration, place)
+    }
+
+    fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<(), Refusal> {
+        Plane::rebind(self, pools)
+    }
+
+    fn rebind_slots(
+        &mut self,
+        pools: &Pools<crate::device::Api>,
+        rebind: &Rebind,
+    ) -> Result<(), Refusal> {
+        Plane::rebind_slots(self, pools, rebind)
     }
 
     fn close_channel(&mut self, id: ChannelId) -> Result<(), Refusal> {
@@ -783,16 +1073,9 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
     fn bind(
         &mut self,
         binding: &InstanceBinding,
-        device: Option<&crate::device::Context>,
+        place: Option<&Place<'_, crate::device::Api>>,
     ) -> Result<BoundInstance, Refusal> {
-        #[cfg(not(feature = "vulkan"))]
-        let _ = device;
-        Plane::bind(
-            self,
-            binding,
-            #[cfg(feature = "vulkan")]
-            device,
-        )
+        Plane::bind(self, binding, place)
     }
 
     fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {
@@ -827,4 +1110,65 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
     fn reads(&self, instance: InstanceId) -> Vec<(String, u32)> {
         Plane::reads(self, instance)
     }
+}
+
+/// Whether a stage of `plan` puts into its channel `channel`.
+fn puts_into(plan: &ExecPlan, channel: u32) -> bool {
+    plan.package
+        .stages
+        .iter()
+        .any(|stage| stage.puts.iter().any(|put| put.channel == channel))
+}
+
+/// The bytes a channel's cell takes on the device, where a pass may keep one
+/// there: a channel the host does not read (`guest::run`). A value lies in a
+/// guest heap a word an element, a byte a bool (`ValueDesc::device_bytes`).
+fn device_cell_bytes(shape: &[u32], dtype: ChanDType, host_role: HostRole) -> Option<u64> {
+    if host_role == HostRole::Reader {
+        return None;
+    }
+    let numel = numel_of(shape) as u64;
+    let bytes = if eta_exec::concrete_dtype(dtype) == eta_ir::Dtype::Bool {
+        numel
+    } else {
+        numel * 4
+    };
+    Some(bytes.max(4))
+}
+
+/// A channel's device cell as `Channel` slots: a slot where the cell fits
+/// one, else a run of adjacent slots (`Footprint::contiguous`); none where
+/// the host reads the channel, or the cell is past a chunk (the engine
+/// keeps that one).
+fn cell_facts(
+    channel: u32,
+    shape: &[u32],
+    dtype: ChanDType,
+    capacity: u32,
+    host_role: HostRole,
+    pools: &Pools<crate::device::Api>,
+) -> Result<Option<RingFacts>, Refusal> {
+    let Some(bytes) = device_cell_bytes(shape, dtype, host_role) else {
+        return Ok(None);
+    };
+    let program = |fault: engine_gpu::error::Fault| Refusal::Program(fault.to_string());
+    let slot_bytes = pools.slot_bytes(CHANNEL).map_err(program)?;
+    let per_chunk = pools.slots_per_chunk(CHANNEL).map_err(program)?;
+    Ok(
+        engine_gpu::guest::held::item_slots(bytes, slot_bytes, per_chunk).map(
+            |(slots, contiguous)| RingFacts {
+                channel,
+                cell_bytes: eta_exec::wire_cell_bytes(
+                    eta_exec::concrete_dtype(dtype),
+                    numel_of(shape),
+                ) as u64,
+                capacity,
+                footprint: Footprint {
+                    bytes,
+                    slots,
+                    contiguous,
+                },
+            },
+        ),
+    )
 }

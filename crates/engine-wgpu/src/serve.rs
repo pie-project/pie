@@ -38,6 +38,14 @@ impl Serve for Api {
 
     const RECORDS: bool = false;
 
+    /// Every cell of a guest's rings lies on the host: a pass reads its
+    /// takes from there and lands its puts there.
+    const CHANNEL_CELLS: bool = false;
+
+    fn table_align(device: &Context) -> u64 {
+        device.table_align()
+    }
+
     fn open(
         boot: &crate::api::DeviceBoot,
         allowance: engine::Allowance,

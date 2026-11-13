@@ -78,6 +78,11 @@ impl Context {
     }
 
     #[must_use]
+    pub fn table_align(&self) -> u64 {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn subgroup_size(&self) -> u32 {
         match self.never {}
     }

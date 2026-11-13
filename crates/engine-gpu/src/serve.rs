@@ -74,6 +74,16 @@ pub trait Serve: Backend {
     /// reads are prestaged in the arm's ring rather than handed from the host.
     const RECORDS: bool;
 
+    /// Whether a guest channel keeps cells on the device between passes
+    /// (the pool then states a `Channel` shape for them); else every cell
+    /// of a ring lies on the host.
+    const CHANNEL_CELLS: bool;
+
+    /// The bytes a guest's launch table is aligned to in its `Instance`
+    /// slot: 16 at least, and whatever the device asks of a buffer
+    /// binding's offset.
+    fn table_align(device: &Self::Context) -> u64;
+
     /// Opens the device (adopting `handed` where the host handed one) and
     /// its tuning.
     /// Opens the device (adopting `handed` where the host handed one), of
@@ -200,9 +210,18 @@ pub enum InputCell<B: Backend> {
         dtype: eta_ir::types::Dtype,
     },
     Device {
-        cell: B::Buffer,
+        cell: DeviceCell<B>,
         dtype: eta_ir::types::Dtype,
     },
+}
+
+/// A cell a guest channel keeps on the device: `bytes` at `at` of `buffer`
+/// (a pool segment, where the channel's `Channel` slots lie).
+#[derive(Debug, Clone)]
+pub struct DeviceCell<B: Backend> {
+    pub buffer: B::Buffer,
+    pub at: u64,
+    pub bytes: u64,
 }
 
 /// What a readout plane holds: the lane's readout rows, a row or voxel
@@ -387,7 +406,7 @@ pub struct Seated<'a, B: Serve> {
 
     /// A device cell holding the lane's one token, written by a pass still
     /// on the queue; the fire copies it in behind that pass.
-    pub feed: Option<&'a B::Buffer>,
+    pub feed: Option<&'a DeviceCell<B>>,
 
     pub group: Option<u32>,
     pub inputs: &'a [(engine::fire::InputFeed, InputCell<B>)],
@@ -1122,7 +1141,8 @@ impl<B: Serve> Shell<B> {
             boot.slots,
             asked.pages_per_slot,
         )?
-        .with_rs(rs_bytes, rs_tokens, asked.pages_per_slot)?;
+        .with_rs(rs_bytes, rs_tokens, asked.pages_per_slot)?
+        .with_guests(B::CHANNEL_CELLS)?;
         let layout = rows
             .windows
             .iter()
@@ -1995,10 +2015,10 @@ impl<B: Serve> Shell<B> {
         let (store, tokens) = self.inputs[p.arm].token_seat();
         let mut frame = self.device.frame()?;
         for &(row, cell) in &p.feeds {
-            frame.copy(cell, 0, store, tokens + u64::from(row) * 4, 4)?;
+            frame.copy(&cell.buffer, cell.at, store, tokens + u64::from(row) * 4, 4)?;
         }
         for copy in p.input_copies.iter().filter(|copy| !copy.cast) {
-            frame.copy(copy.cell, 0, store, copy.at, copy.bytes)?;
+            frame.copy(&copy.cell.buffer, copy.cell.at, store, copy.at, copy.bytes)?;
         }
         let casts: Vec<&InputCopy<'_, B>> =
             p.input_copies.iter().filter(|copy| copy.cast).collect();
@@ -2016,7 +2036,9 @@ impl<B: Serve> Shell<B> {
             let into = kernels_slang::Tensor::new(whole, 1, elements, Dtype::Bf16);
             for copy in casts {
                 let values = u32::try_from(copy.bytes / 2).unwrap_or(u32::MAX);
-                let source = self.handles.bind(copy.cell, 0, u64::from(values) * 4)?;
+                let source =
+                    self.handles
+                        .bind(&copy.cell.buffer, copy.cell.at, u64::from(values) * 4)?;
                 let at = u32::try_from(copy.at / 2).unwrap_or(u32::MAX);
                 kernels_slang::runtime::port::cast(
                     &sink,
@@ -2280,17 +2302,14 @@ impl<B: Serve> Shell<B> {
                             (eta_ir::types::Dtype::F32, Dtype::Bf16)
                         );
                         let needs = if cast { bytes * 2 } else { bytes };
-                        if !(same || cast) || cell.bytes() < needs {
+                        if !(same || cast) || cell.bytes < needs {
                             return Err(program(
                                 "serve::feed_inputs",
                                 format!(
                                     "lane {} feeds a {:?} guest input of {bytes} bytes off a {:?} device \
                                      cell of {} bytes; a kept cell lands at its own element, or \
                                      arrives f32 and is cast",
-                                    row.source,
-                                    seat.dtype,
-                                    dtype,
-                                    cell.bytes()
+                                    row.source, seat.dtype, dtype, cell.bytes
                                 ),
                             ));
                         }
@@ -2310,6 +2329,12 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn device(&self) -> &B::Context {
         &self.device
+    }
+
+    /// The state pool, where guests' tables and cells lie.
+    #[must_use]
+    pub fn pools(&self) -> &Pools<B> {
+        &self.pools
     }
 
     pub fn reap(&mut self) -> Result<()> {
@@ -2551,7 +2576,7 @@ impl<B: Serve> Shell<B> {
         let mut snap_units = 0u32;
 
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
-        let mut feeds: Vec<(u32, &'a B::Buffer)> = Vec::new();
+        let mut feeds: Vec<(u32, &'a DeviceCell<B>)> = Vec::new();
         for row in composition.lanes() {
             let source = row.source as usize;
             let seated = &lanes[source];
@@ -3547,7 +3572,7 @@ pub struct StepView<'a, B: Serve> {
 pub struct Prepared<'a, B: Serve> {
     pub lanes: &'a [Seated<'a, B>],
     pub done: Option<Done>,
-    feeds: Vec<(u32, &'a B::Buffer)>,
+    feeds: Vec<(u32, &'a DeviceCell<B>)>,
     input_copies: Vec<InputCopy<'a, B>>,
     merge_lands: Vec<MergeLand>,
     classes: Vec<usize>,
@@ -3750,7 +3775,7 @@ struct MergeLand {
 }
 
 struct InputCopy<'a, B: Backend> {
-    cell: &'a B::Buffer,
+    cell: &'a DeviceCell<B>,
     at: u64,
     bytes: u64,
     cast: bool,
@@ -4003,7 +4028,9 @@ fn price_pipelines<B: Serve>(device: &B::Context, pipelines: &B::Pipelines) -> u
     if !B::measures_outside(device) {
         return 0;
     }
-    let _alone = PRICING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _alone = PRICING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let census: Vec<(&'static str, &'static str)> = kernels_slang::CENSUS
         .iter()
         .filter(|(key, _, tier, _)| B::builds(device, key, tier))
