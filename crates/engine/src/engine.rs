@@ -175,8 +175,11 @@ pub trait Engine: Send {
         Err(self.unsupported("weight_residency"))
     }
 
-    /// How often fires read each streamable atom since the last call,
-    /// resident or not: the record the runtime orders the weight cache by.
+    /// How often fires read each streamable atom, resident or not: the
+    /// record the runtime orders the weight cache by. An engine may answer
+    /// a call behind (the reads between the two calls before, its use
+    /// counters read without waiting for the device), every read counted
+    /// once.
     fn weight_uses(&mut self) -> Result<WeightUses> {
         Err(self.unsupported("weight_uses"))
     }

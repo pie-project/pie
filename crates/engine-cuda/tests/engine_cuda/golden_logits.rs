@@ -1658,6 +1658,15 @@ enum Rows {
     Mixed,
 }
 
+/// The reads since the use record was last asked, as the engine answers
+/// them a call behind: the call that snapshots them, the device drained,
+/// and the call that answers them.
+fn uses_since(shell: &mut Shell) -> engine::chunk::WeightUses {
+    let _ = shell.weight_uses().expect("the use record reads");
+    shell.drain().expect("the device drains");
+    shell.weight_uses().expect("the use record reads")
+}
+
 /// [`served`] with the model's row-streamed table (a token-id-gathered
 /// table the weight cache streams) laid as `rows` says: the logits are the
 /// dense table's whichever way. Also returns the blocks the fires read, as
@@ -1724,7 +1733,7 @@ fn served_rows(fixture: &Fixture, cache: &Path, rows: Rows) -> (Vec<(u64, u32)>,
         last = Some(top);
         steps.push((hash_logits(&logits), top));
     }
-    let uses = shell.weight_uses().expect("the use record reads");
+    let uses = uses_since(&mut shell);
     // The table's reads and its blocks, apart from any other weight shape's
     // (a model's routed experts).
     let of_table: Vec<_> = uses
@@ -1927,7 +1936,7 @@ fn served_experts_as(fixture: &Fixture, cache: &Path, rows: Rows, told: bool) ->
         last = Some(argmax(&logits));
         steps.push(logits);
     }
-    let uses = shell.weight_uses().expect("the use record reads");
+    let uses = uses_since(&mut shell);
     let held: Vec<_> = uses
         .held
         .iter()

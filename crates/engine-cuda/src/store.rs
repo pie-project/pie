@@ -564,6 +564,9 @@ pub struct Pools {
     row_caches: Vec<RowCache>,
     /// The routed experts' caches, a shape each ([`Pools::seat_experts`]).
     expert_caches: Vec<ExpertCache>,
+    /// Where the caches' read counters are snapshotted for
+    /// [`Pools::weight_uses`].
+    use_record: Option<UseRecord>,
     /// Each window a windowed kv row is declared with, and the list its
     /// pages are slots of.
     windows_of: Vec<(u32, u8)>,
@@ -980,6 +983,7 @@ impl Pools {
             chunks,
             row_caches: Vec::new(),
             expert_caches: Vec::new(),
+            use_record: None,
             windows_of,
             weights_held: false,
             hosts_dropped: false,
@@ -2985,39 +2989,79 @@ impl Pools {
 
     /// Zeroes the use record on `stream`, behind the fires that counted:
     /// what the shell's own synthetic fires read (arming the lattice) is
-    /// no use the runtime orders its weight cache by.
+    /// no use the runtime orders its weight cache by. Waits for the
+    /// stream, so no snapshot taken before lands after the record restarts.
     pub fn forget_weight_uses(&mut self, stream: *mut core::ffi::c_void) -> Result<()> {
-        for cache in &mut self.row_caches {
-            let blocks = cache.slots.len();
-            cache.hits.zero_span_on(stream, 0, blocks * 4)?;
+        for (at, bytes) in self.counters() {
+            crate::device::zero_span_on(stream, at, bytes)?;
         }
-        for cache in &mut self.expert_caches {
-            let experts = cache.shape.experts as usize;
-            for hits in cache
-                .planes
-                .iter_mut()
-                .filter_map(|bank| bank.hits.as_mut())
-            {
-                hits.zero_span_on(stream, 0, experts * 4)?;
-            }
+        crate::device::ctx::sync(stream)?;
+        if let Some(record) = &mut self.use_record {
+            record.host.zero();
+            record.base.fill(0);
         }
         Ok(())
     }
 
-    /// See `Engine::weight_uses`: each block's reads since the last call,
-    /// read on `stream` behind the fires that counted them, and zeroed.
+    /// Every read counter of the caches as `(device address, bytes)`: a
+    /// row cache's a block, an expert bank's an expert, in the order
+    /// [`Pools::weight_uses`] reads them.
+    fn counters(&self) -> Vec<(u64, usize)> {
+        self.row_caches
+            .iter()
+            .map(|cache| (cache.hits.ptr(), cache.slots.len() * 4))
+            .chain(self.expert_caches.iter().flat_map(|cache| {
+                let experts = cache.shape.experts as usize;
+                cache
+                    .planes
+                    .iter()
+                    .filter_map(move |bank| bank.hits.as_ref().map(|hits| (hits.ptr(), experts * 4)))
+            }))
+            .collect()
+    }
+
+    /// See `Engine::weight_uses`: each block's reads since the last call.
+    /// The counters run on (never zeroed but by
+    /// [`Pools::forget_weight_uses`]); each call enqueues a snapshot of them
+    /// into mapped host memory on `stream` behind the fires that counted,
+    /// and answers with what the previous call's snapshot holds past the
+    /// one before it. No call waits for the stream, so the record lags a
+    /// call behind the fires, which the runtime's windows of several calls
+    /// absorb.
     pub fn weight_uses(
         &mut self,
         stream: *mut core::ffi::c_void,
     ) -> Result<engine::chunk::WeightUses> {
+        let counters = self.counters();
+        if self.use_record.is_none() {
+            let bytes: usize = counters.iter().map(|&(_, bytes)| bytes).sum();
+            let host = crate::device::Pinned::mapped(bytes.max(4))?;
+            host.zero();
+            self.use_record = Some(UseRecord {
+                host,
+                base: vec![0; bytes / 4],
+            });
+        }
+        let record = self.use_record.as_mut().expect("the use record was just made");
+        let mut reads = Vec::with_capacity(record.base.len());
+        for (at, base) in record.base.iter_mut().enumerate() {
+            // SAFETY: inside the record's mapped host span; a snapshot copy
+            // may land meanwhile, and an aligned u32 is read whole.
+            let now = unsafe { record.host.host().cast::<u32>().add(at).read_volatile() };
+            reads.push(now.wrapping_sub(*base));
+            *base = now;
+        }
+        let mut spans = Vec::with_capacity(counters.len());
+        let mut into = record.host.host() as u64;
+        for &(at, bytes) in &counters {
+            spans.push((into, at, bytes));
+            into += bytes as u64;
+        }
+        crate::device::copy_batch(stream, true, &spans)?;
         let mut uses = Vec::new();
-        for cache in &mut self.row_caches {
-            let blocks = cache.slots.len();
-            let mut counted = vec![0u8; blocks * 4];
-            cache.hits.read_on(stream, 0, &mut counted)?;
-            cache.hits.zero_span_on(stream, 0, blocks * 4)?;
-            for (atom, reads) in counted.as_chunks::<4>().0.iter().enumerate() {
-                let reads = u32::from_le_bytes(*reads);
+        let mut reads = reads.into_iter();
+        for cache in &self.row_caches {
+            for (atom, reads) in reads.by_ref().take(cache.slots.len()).enumerate() {
                 if reads > 0 {
                     uses.push((
                         engine::chunk::WeightAtom {
@@ -3029,17 +3073,10 @@ impl Pools {
                 }
             }
         }
-        for cache in &mut self.expert_caches {
+        for cache in &self.expert_caches {
             let experts = cache.shape.experts as usize;
-            for bank in &mut cache.planes {
-                let Some(hits) = bank.hits.as_mut() else {
-                    continue;
-                };
-                let mut counted = vec![0u8; experts * 4];
-                hits.read_on(stream, 0, &mut counted)?;
-                hits.zero_span_on(stream, 0, experts * 4)?;
-                for (expert, reads) in counted.as_chunks::<4>().0.iter().enumerate() {
-                    let reads = u32::from_le_bytes(*reads);
+            for bank in cache.planes.iter().filter(|bank| bank.hits.is_some()) {
+                for (expert, reads) in reads.by_ref().take(experts).enumerate() {
                     if reads > 0 {
                         uses.push((
                             engine::chunk::WeightAtom {
@@ -4215,6 +4252,15 @@ struct RowCache {
     hits: crate::device::Buffer,
     /// The slot ref each block is cached in.
     slots: Vec<Option<u32>>,
+}
+
+/// The caches' read counters as last snapshotted: mapped host memory a
+/// snapshot copy lands in, every counter in [`Pools::counters`] order, and
+/// each counter's value as the last answer read it.
+#[derive(Debug)]
+struct UseRecord {
+    host: crate::device::Pinned,
+    base: Vec<u32>,
 }
 
 /// One bank of an expert shape's cache: its plane in an expert's slot, the
