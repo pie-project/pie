@@ -24,6 +24,7 @@ pub mod cost;
 pub mod emit;
 pub mod fabric;
 pub mod floor;
+pub mod floorplan;
 pub mod kernels;
 pub mod layers;
 pub mod npy;

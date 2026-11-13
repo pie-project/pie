@@ -1,22 +1,15 @@
 //! Units whose weight rows come in runs of different dims and roles (the plan's `row_dims`:
 //! Gemma 4 12B's attention rows `0 .. RA` and plain rows past them). The units' floor and chains
 //! are the standard ones ([`super::units`]); the scores segments run along the attention runs'
-//! rows only; a weight / CX PE's `Hc` is its run's dims and a weight PE's `AROW` its run's role.
-//! Copies each unit run by run.
+//! rows only ([`super::segments::Scores`]); a weight / CX PE's `Hc` is its run's dims and a
+//! weight PE's `AROW` its run's role ([`overrides`]). [`RunCopies`] copies each unit run by run.
 
 use crate::abi::{Overrides, Param};
-use crate::floor::{Coord, Floor, FloorBuilder, Rect, Unit, UnitGrid, skip};
+use crate::floor::{Rect, Unit, skip};
 use crate::plan::{Plan, RowRun};
 use crate::program::Program;
 use crate::role::Place;
 use crate::weights::{Copies, From, Slice, chunks};
-use crate::wiring::{Class, Wiring, segments};
-
-use super::Block;
-use super::segments::{SCORE_CAST, SCORE_L1, SEGMENT};
-use super::units::{self, unit_chains};
-
-type R<T> = Result<T, String>;
 
 /// A weight / CX PE's dims a row, a weight PE's row role.
 pub const HC: Param = Param("Hc");
@@ -24,12 +17,6 @@ pub const AROW: Param = Param("AROW");
 /// [`AROW`]'s codes: an attention row, a plain row.
 pub const ATT_ROW: u32 = 1;
 pub const PLAIN_ROW: u32 = 2;
-
-/// The units with row runs.
-pub struct RowRuns {
-    pub grid: UnitGrid,
-    pub copies: RunCopies,
-}
 
 /// The run holding weight row `r` (`None` with a single run: nothing to override).
 fn run_of(plan: &Plan, r: u32) -> Option<&RowRun> {
@@ -65,56 +52,24 @@ pub fn dims_of(plan: &Plan, r: u32) -> u32 {
         .map_or(0, |x| x.dims)
 }
 
-impl Block for RowRuns {
-    fn floor(&self, _plan: &Plan, b: &mut FloorBuilder) -> R<()> {
-        b.add_units(&self.grid, (0, 0))
-    }
-
-    fn wire(&self, plan: &Plan, floor: &Floor, w: &mut Wiring) -> R<()> {
-        unit_chains(plan, floor, w)?;
-        let width = plan.partition.segments.scores;
-        for u in &floor.units {
-            for run in plan.partition.row_dims.iter().filter(|r| r.attention) {
-                for r in run.rows.0..run.rows.1 {
-                    let pts: Vec<Coord> = (0..u.cols())
-                        .map(|c| Coord::new(u.col_x(c), u.row_y(r)))
-                        .collect();
-                    segments(&pts, width, true, (SCORE_L1, SCORE_CAST, SEGMENT), w)?;
+/// A weight / CX PE's `Hc` its run's dims, a weight PE's `AROW` its run's role (with a single
+/// run: nothing).
+pub fn overrides(prog: &Program, o: &mut Overrides) {
+    for (at, role) in prog.floor.roles.iter() {
+        match role.place {
+            Place::Weight { row, .. } => {
+                if let Some(run) = run_of(&prog.plan, row) {
+                    o.set(at, HC, run.dims);
+                    o.set(at, AROW, if run.attention { ATT_ROW } else { PLAIN_ROW });
                 }
             }
-        }
-        Ok(())
-    }
-
-    fn colours(&self) -> Vec<(Class, u8)> {
-        [units::COLOURS, super::segments::COLOURS].concat()
-    }
-
-    fn overrides(&self, prog: &Program, o: &mut Overrides) -> R<()> {
-        for (at, role) in prog.floor.roles.iter() {
-            match role.place {
-                Place::Weight { row, .. } => {
-                    if let Some(run) = run_of(&prog.plan, row) {
-                        o.set(at, HC, run.dims);
-                        o.set(at, AROW, if run.attention { ATT_ROW } else { PLAIN_ROW });
-                    }
+            Place::Cx { row, .. } => {
+                if let Some(run) = run_of(&prog.plan, row) {
+                    o.set(at, HC, run.dims);
                 }
-                Place::Cx { row, .. } => {
-                    if let Some(run) = run_of(&prog.plan, row) {
-                        o.set(at, HC, run.dims);
-                    }
-                }
-                _ => {}
             }
+            _ => {}
         }
-        Ok(())
-    }
-
-    fn bindings(&self, prog: &Program, out: &mut Copies) -> R<()> {
-        for unit in &prog.floor.units {
-            self.copies.put(&prog.plan, out, unit);
-        }
-        Ok(())
     }
 }
 

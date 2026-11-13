@@ -4,12 +4,16 @@
 //! plan's reduce groups), every root's loop-back, and the x handoff from each unit to the next;
 //! gap slots relay the vertical handoff. Copies each unit's weights, CX gammas and CY tables.
 
+use crate::abi::Overrides;
 use crate::floor::{Coord, Floor, FloorBuilder, Rect, Unit, UnitGrid, skip};
 use crate::plan::Plan;
+use crate::program::Program;
 use crate::weights::{Copies, From, Slice, chunks};
 use crate::wiring::{Chain, Class, LOOPBACK, Path, Slot, Wiring, level2, loopback, steps};
 
 use super::Block;
+use super::moe::{self, MoeCopies};
+use super::row_runs::{self, RunCopies};
 
 type R<T> = Result<T, String>;
 
@@ -58,16 +62,30 @@ pub const COLOURS: &[(Class, u8)] = &[
     (COL_L2[1], 16),
 ];
 
-/// The units block.
+/// What each unit's PEs hold, by the role kernels that run them: plain units', units by row
+/// runs', or attention | MoE halves'.
+pub enum UnitsCopies {
+    Plain(UnitCopies),
+    Runs(RunCopies),
+    Halves(MoeCopies),
+}
+
+/// The units block: the units per `grid`, their weight / CY kinds refined by half where a MoE
+/// column run halves them (`halves`: [`moe::halves`]), each PE's run dims and role where the rows
+/// come in runs ([`row_runs::overrides`]).
 pub struct Units {
     pub grid: UnitGrid,
-    /// What each unit's PEs hold.
-    pub copies: UnitCopies,
+    pub halves: bool,
+    pub copies: UnitsCopies,
 }
 
 impl Block for Units {
     fn floor(&self, _plan: &Plan, b: &mut FloorBuilder) -> R<()> {
-        b.add_units(&self.grid, (0, 0))
+        b.add_units(&self.grid, (0, 0))?;
+        if self.halves {
+            moe::halves(b, self.grid.cx);
+        }
+        Ok(())
     }
 
     fn wire(&self, plan: &Plan, floor: &Floor, w: &mut Wiring) -> R<()> {
@@ -78,9 +96,18 @@ impl Block for Units {
         COLOURS.to_vec()
     }
 
-    fn bindings(&self, prog: &crate::program::Program, out: &mut Copies) -> R<()> {
+    fn overrides(&self, prog: &Program, o: &mut Overrides) -> R<()> {
+        row_runs::overrides(prog, o);
+        Ok(())
+    }
+
+    fn bindings(&self, prog: &Program, out: &mut Copies) -> R<()> {
         for unit in &prog.floor.units {
-            self.copies.put(out, unit);
+            match &self.copies {
+                UnitsCopies::Plain(c) => c.put(out, unit),
+                UnitsCopies::Runs(c) => c.put(&prog.plan, out, unit),
+                UnitsCopies::Halves(c) => c.put(out, unit),
+            }
         }
         for r in &prog.floor.relays {
             out.rcfg(*r);

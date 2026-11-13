@@ -27,14 +27,14 @@ use crate::block::band::{Band, BandLoop};
 use crate::block::gdn::Gdn;
 use crate::block::head::{HeadCopies, HeadEast};
 use crate::block::head_groups::HeadGroups;
-use crate::block::moe::{AttnScores, MoeCopies, MoeUnits, Router};
-use crate::block::ple::{Ple, PleColumn};
-use crate::block::row_runs::{RowRuns, RunCopies};
+use crate::block::moe::{MoeCopies, Router};
+use crate::block::ple::Ple;
+use crate::block::row_runs::RunCopies;
 use crate::block::segments::{Onorm, Scores};
 use crate::block::shared_kv::SharedKv;
 use crate::block::token_loop::TokenLoop;
-use crate::block::units::{UnitCopies, Units};
-use crate::floor::{UnitGrid, UnitLayout};
+use crate::block::units::{UnitCopies, Units, UnitsCopies};
+use crate::floorplan::{Aux, Floorplan, HeadAt, Segment};
 use crate::plan::{Act, Plan, Shape};
 
 type R<T> = Result<T, String>;
@@ -365,199 +365,73 @@ fn take<T>(c: Option<T>, what: &str) -> R<T> {
     c.ok_or_else(|| format!("compose: the kernels place no {what}"))
 }
 
-/// The unit grid of `plan` laid as `layout`, its control column and row through the middle.
-fn grid(plan: &Plan, layout: UnitLayout) -> UnitGrid {
-    let p = &plan.partition;
-    UnitGrid {
-        cols: p.cols,
-        rows: p.rows,
-        cx: p.cols / 2,
-        cy: p.rows / 2,
-        layout,
-        layers_per_unit: p.layers_per_unit,
-    }
-}
-
-/// A unit snake: the units in the plan's slots (UNX x UNY), every segment within a half of a
-/// unit's columns, the head's columns half the rows.
-fn snake(plan: &Plan) -> R<UnitGrid> {
-    let p = &plan.partition;
-    let ug = p
-        .unit_grid
-        .ok_or("snake: the plan has no unit grid (UNX, UNY)")?;
-    // a segment within a half of the unit's columns (none spans the control column)
-    for (n, sw) in [
-        ("SWA", p.segments.scores),
-        ("SWG", p.segments.gdn),
-        ("SWV", p.segments.onorm),
-    ] {
-        if sw == 0 || !(p.cols / 2).is_multiple_of(sw) {
-            return Err(format!(
-                "snake: {n} {sw} does not divide XC {} (a segment would span the control column)",
-                p.cols / 2
-            ));
-        }
-    }
-    if p.head.cols * 2 != p.rows {
-        return Err("snake: head columns = CX rows / 2".into());
-    }
-    Ok(grid(
-        plan,
-        UnitLayout::Snake {
-            unx: ug.0,
-            uny: ug.1,
-            up_first: false,
-            gaps: snake_gap(p.units, ug)?.into_iter().collect(),
-        },
-    ))
-}
-
-/// Two unit columns, the first visited down, the second up: unit 0 and the last side by side on
-/// row 0 (the token loop's return).
-fn u_columns(plan: &Plan) -> R<UnitGrid> {
-    let p = &plan.partition;
-    let n = p.units;
-    if n == 0 || !n.is_multiple_of(2) {
-        return Err(format!(
-            "runs: {n} units (two unit columns, unit 0 and the last on row 0)"
-        ));
-    }
-    let (uw, uh, uny) = (p.cols + 1, p.rows + 1, n / 2);
-    let origins = (0..n)
-        .map(|u| {
-            if u < uny {
-                (0, uh * u)
-            } else {
-                (uw, uh * (n - 1 - u))
-            }
-        })
-        .collect();
-    Ok(grid(plan, UnitLayout::Explicit { origins }))
-}
-
-/// Attention | MoE halves (CX after the attention columns) in a snake of two unit columns that
-/// starts upward, so the first and the last unit sit on the band.
-fn split_snake(plan: &Plan) -> R<UnitGrid> {
-    let p = &plan.partition;
-    let ax = p.attn_cols.ok_or("split plan: no attention columns")?;
-    if ax >= p.cols {
-        return Err("split plan: no MoE columns".into());
-    }
-    if !p.units.is_multiple_of(2) {
-        return Err("split: an even unit count (the last unit next to the band)".into());
-    }
-    Ok(UnitGrid {
-        cx: ax,
-        ..grid(
-            plan,
-            UnitLayout::Snake {
-                unx: 2,
-                uny: p.units / 2,
-                up_first: true,
-                gaps: Vec::new(),
-            },
-        )
-    })
-}
-
-/// The blocks of `plan` for layers that need `needs`, in order (the units first, then what is
-/// placed against them), each block's copies the layout's kernels' ([`copies::of`]).
-pub fn blocks(plan: &Plan, needs: &Needs) -> R<Vec<Box<dyn Block>>> {
-    let p = &plan.partition;
-    let token_loop = plan.contract.token_loop;
-    let layout = Layout::of(needs);
-    let copies = copies::of(plan, layout)?;
+/// The blocks of `plan`'s floorplan, in order: the units first, then the segments laid over
+/// them, the blocks placed beside them for a feature (a side input's storage, the shared caches'
+/// line), the head, the token loop; each block's copies the role kernels' ([`copies::of`]).
+pub fn blocks(plan: &Plan, needs: &Needs, fp: &Floorplan) -> R<Vec<Box<dyn Block>>> {
+    let copies = copies::of(plan, Layout::of(needs))?;
+    let shape = &fp.units.shape;
     let mut out: Vec<Box<dyn Block>> = Vec::new();
-    if layout == Layout::Split {
-        out.push(Box::new(MoeUnits {
-            grid: split_snake(plan)?,
-            copies: take(copies.moe, "MoE units")?,
-        }));
-        out.push(Box::new(AttnScores {
-            width: p.segments.scores,
-        }));
-        out.push(Box::new(Router {
-            width: p.segments.router.ok_or("split plan: no router segments")?,
-        }));
-        out.push(Box::new(Band {
-            cols: p.head.cols,
-            rows: p.head.rows,
-            vocab_rows: p.head.vocab_rows,
-        }));
-        if token_loop {
-            out.push(Box::new(BandLoop));
-        }
-        return Ok(out);
-    }
-    if layout == Layout::Stacked {
-        let arr = crate::plan::Arrangement::of(plan)?;
-        out.push(Box::new(Units {
-            grid: grid(
-                plan,
-                UnitLayout::Explicit {
-                    origins: arr.origins(p.cols + 1, p.rows + 1)?,
-                },
-            ),
-            copies: take(copies.units, "units")?,
-        }));
-        out.push(Box::new(Scores {
-            width: p.segments.scores,
-        }));
-        if needs.side_in {
-            out.push(Box::new(Ple {
-                columns: arr
-                    .columns(p.cols + 1)
-                    .into_iter()
-                    .map(|(_, units, st)| PleColumn {
-                        units,
-                        rows: st.rows,
-                        tokens: st.tokens,
-                        bus: st.bus,
-                    })
-                    .collect(),
-            }));
-        }
-        if needs.shared_cache {
-            out.push(Box::new(SharedKv));
-        }
-    } else if layout == Layout::Runs {
-        out.push(Box::new(RowRuns {
-            grid: u_columns(plan)?,
-            copies: take(copies.runs, "row runs")?,
-        }));
-        out.push(Box::new(HeadGroups {
-            cols: p.head.cols,
-            rows: p.head.rows,
-            copies: take(copies.head, "head")?,
-        }));
-        return Ok(out);
-    } else {
-        out.push(Box::new(Units {
-            grid: snake(plan)?,
-            copies: take(copies.units, "units")?,
-        }));
-        if needs.attention {
-            out.push(Box::new(Scores {
-                width: p.segments.scores,
-            }));
-        }
-        if needs.gdn
-            && let Some(g) = Gdn::of(plan)
-        {
-            out.push(Box::new(g));
-            out.push(Box::new(Onorm {
-                width: p.segments.onorm,
-            }));
-        }
-    }
-    out.push(Box::new(HeadEast {
-        cols: p.head.cols,
-        rows: p.head.rows,
-        token_loop,
-        copies: take(copies.head, "head")?,
+    let unit_copies = match (copies.units, copies.runs, copies.moe) {
+        (_, _, Some(c)) => UnitsCopies::Halves(c),
+        (_, Some(c), None) => UnitsCopies::Runs(c),
+        (c, None, None) => UnitsCopies::Plain(take(c, "units")?),
+    };
+    out.push(Box::new(Units {
+        grid: fp.units.grid(),
+        halves: shape.halves(),
+        copies: unit_copies,
     }));
-    if token_loop {
-        out.push(Box::new(TokenLoop));
+    for s in &fp.segments {
+        match *s {
+            Segment::Scores { width } => out.push(Box::new(Scores {
+                width,
+                rows: shape.attn_rows().collect(),
+                cols: shape.attn_cols(),
+            })),
+            Segment::Router { width } => out.push(Box::new(Router { width })),
+            Segment::Gdn => out.push(Box::new(
+                Gdn::of(plan).ok_or("compose: GDN segments with no GDN layer")?,
+            )),
+            Segment::Onorm { width } => out.push(Box::new(Onorm { width })),
+        }
+    }
+    for a in &fp.aux {
+        match a {
+            Aux::Store(columns) => out.push(Box::new(Ple {
+                columns: columns.clone(),
+            })),
+            Aux::KvLine => out.push(Box::new(SharedKv)),
+        }
+    }
+    let h = fp.head;
+    match h.at {
+        HeadAt::East => {
+            out.push(Box::new(HeadEast {
+                cols: h.cols,
+                rows: h.rows,
+                token_loop: fp.token_loop,
+                copies: take(copies.head, "head")?,
+            }));
+            if fp.token_loop {
+                out.push(Box::new(TokenLoop));
+            }
+        }
+        HeadAt::Groups => out.push(Box::new(HeadGroups {
+            cols: h.cols,
+            rows: h.rows,
+            copies: take(copies.head, "head")?,
+        })),
+        HeadAt::Band => {
+            out.push(Box::new(Band {
+                cols: h.cols,
+                rows: h.rows,
+                vocab_rows: h.vocab_rows,
+            }));
+            if fp.token_loop {
+                out.push(Box::new(BandLoop));
+            }
+        }
     }
     Ok(out)
 }

@@ -1,6 +1,9 @@
 //! Segments: short reduction chains inside a unit row, each rooted at its middle and
-//! multicasting back (no loop-back). The attention scores' segments run along every weight row
-//! (one KV head's columns a segment); the o-norm's along the CY row (one value head's columns).
+//! multicasting back (no loop-back). The attention scores' segments run along every attention
+//! row's attention columns (one KV head's columns a segment); the o-norm's along the CY row (one
+//! value head's columns).
+
+use std::ops::Range;
 
 use crate::floor::{Coord, Floor};
 use crate::plan::Plan;
@@ -31,17 +34,22 @@ pub const COLOURS: &[(Class, u8)] = &[
     (ONORM_CAST, 12),
 ];
 
-/// Every weight row of every unit cut into scores segments of `width` columns (single-PE
-/// segments too).
+/// Every unit's attention rows (`rows`, the weight rows of its attention row runs) over its
+/// attention columns (`cols`: the attention column run's, else every column) cut into scores
+/// segments of `width` columns (single-PE segments too).
 pub struct Scores {
     pub width: u32,
+    pub rows: Vec<u32>,
+    pub cols: Range<u32>,
 }
 
 impl Block for Scores {
     fn wire(&self, _plan: &Plan, floor: &Floor, w: &mut Wiring) -> R<()> {
         for u in &floor.units {
-            for r in 0..u.rows() {
-                let pts: Vec<Coord> = (0..u.cols())
+            for &r in &self.rows {
+                let pts: Vec<Coord> = self
+                    .cols
+                    .clone()
                     .map(|c| Coord::new(u.col_x(c), u.row_y(r)))
                     .collect();
                 segments(&pts, self.width, true, (SCORE_L1, SCORE_CAST, SEGMENT), w)?;

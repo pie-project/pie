@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::abi::{Overrides, Param};
 use crate::floor::{Coord, CtlLine, Dir, Floor, FloorBuilder, Rect, StoreBlock, Unit, skip};
+use crate::floorplan::StoreColumn;
 use crate::plan::Plan;
 use crate::program::Program;
 use crate::role::{Kind, PeRole, Place};
@@ -44,18 +45,9 @@ pub const PASS_PE: Place = Place::Store {
 /// The largest PLE file a cut stages (a file is staged whole, under the 2 GiB a stage takes).
 pub const FILE_MAX: u64 = 1900 * 1024 * 1024;
 
-/// One unit column's storage: its units top to bottom, the storage rows above the top one, the
-/// tokens a storage PE holds, its bus's colour.
-pub struct PleColumn {
-    pub units: Vec<u32>,
-    pub rows: u32,
-    pub tokens: u32,
-    pub bus: u8,
-}
-
 /// The PLE storage of every unit column.
 pub struct Ple {
-    pub columns: Vec<PleColumn>,
+    pub columns: Vec<StoreColumn>,
 }
 
 /// The bus words of a column of `units` units (every layer's PLE row).

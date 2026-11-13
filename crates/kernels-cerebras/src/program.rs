@@ -7,6 +7,7 @@ use super::block::Block;
 use super::compose::{self, Layout, Needs, Schedule};
 use super::fabric::{Fabric, Palette};
 use super::floor::{Floor, FloorBuilder};
+use super::floorplan::{Floorplan, Requests};
 use super::layers;
 use super::plan::Plan;
 use super::toolchain::{Arch, memcpy_fabric};
@@ -22,6 +23,8 @@ pub struct Program {
     pub fabric: Fabric,
     pub kernels: Kernels,
     pub overrides: Overrides,
+    /// The plan's elements: what the blocks place.
+    pub floorplan: Floorplan,
     /// How the plan's units lie: the blocks' and the role kernels' one choice.
     pub layout: Layout,
     /// The role kernels' layer phases, from what the plan's layers need.
@@ -44,12 +47,17 @@ impl Program {
         plan.validate()?;
         compose::refuse(&plan.shape)?;
         let needs = Needs::of(&layers::of(&plan.shape));
-        let blocks = compose::blocks(&plan, &needs)?;
-        Program::build_with(blocks, plan)
+        let floorplan = Floorplan::of(&plan, &Requests::of(&needs))?;
+        let blocks = compose::blocks(&plan, &needs, &floorplan)?;
+        Program::build_with(blocks, floorplan, plan)
     }
 
     /// The physical build of a plan over `blocks` ([`Program::build`]).
-    pub fn build_with(blocks: Vec<Box<dyn Block>>, plan: Plan) -> Result<Program, String> {
+    pub fn build_with(
+        blocks: Vec<Box<dyn Block>>,
+        floorplan: Floorplan,
+        plan: Plan,
+    ) -> Result<Program, String> {
         plan.validate()?;
         let mut fb = FloorBuilder::default();
         for b in &blocks {
@@ -87,6 +95,7 @@ impl Program {
             fabric,
             kernels: Kernels::new(),
             overrides: Overrides::default(),
+            floorplan,
             layout,
             schedule,
         };
