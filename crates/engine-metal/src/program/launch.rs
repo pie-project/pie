@@ -16,7 +16,10 @@ use crate::device::{Buffer, Context};
 use crate::error::{Fault, Result};
 
 use super::compile::{Form, Region, StreamedStep};
+use super::held::{self, Cells, Held, Tables};
 use super::shared::SharedRing;
+use crate::store::Pools;
+use crate::store::layout::CHANNEL;
 use eta_compiler::codegen::metal::{StepKind, reduce_dispatch_levels};
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
@@ -82,34 +85,60 @@ impl ChannelShape {
             .next_multiple_of(CELL_ALIGN)
             .max(CELL_ALIGN)
     }
+
+    /// The ring's cells: `capacity + 1` of them.
+    #[must_use]
+    pub fn cell_count(&self) -> u64 {
+        u64::from(self.capacity) + 1
+    }
+
+    /// The `Channel` slots this ring takes, or `None` where its cell is
+    /// larger than a slot and the engine keeps it.
+    #[must_use]
+    pub fn ring_slots(&self, slot_bytes: u64) -> Option<u32> {
+        held::ring_slots(self.cell_count(), self.cell_stride() as u64, slot_bytes)
+    }
+
+    /// Zeroed cells for this ring: in `slots` (`Channel` slot refs of the
+    /// pool), or in a buffer of their own.
+    pub fn cells(&self, device: &Context, slots: Option<(&Pools, &[u32])>) -> Result<Cells> {
+        let stride = self.cell_stride() as u64;
+        match slots {
+            Some((pools, slots)) if !slots.is_empty() => {
+                Cells::pooled(pools, CHANNEL, slots, self.cell_count(), stride)
+            }
+            _ => Cells::own(device, self.cell_count(), stride),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct Rings {
-    slabs: Vec<Buffer>,
+    /// Each channel's cells this instance holds itself; `None` for an
+    /// adopted shared ring, whose cells are the ring's.
+    own: Vec<Option<Cells>>,
     shapes: Vec<ChannelShape>,
     shared: Vec<Option<Arc<SharedRing>>>,
 }
 
 impl Rings {
-    /// The rings this instance holds itself (adopted shared rings are the
-    /// plane's).
+    /// The rings this instance holds itself apart from the pool (adopted
+    /// shared rings are the plane's; pooled rings are the pool's).
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.slabs
-            .iter()
-            .zip(&self.shared)
-            .filter(|(_, shared)| shared.is_none())
-            .map(|(slab, _)| slab.bytes())
-            .sum()
+        self.own.iter().flatten().map(Cells::own_bytes).sum()
     }
 
+    /// `pooled`: the pool and the `Channel` slots the runtime took for each
+    /// ring this instance holds itself, by channel; a ring it names no
+    /// slots for is the engine's.
     pub fn allocate(
         device: &Context,
         shapes: &[ChannelShape],
         adopted: &[Option<Arc<SharedRing>>],
+        pooled: Option<(&Pools, &[engine::program::RingSlots])>,
     ) -> Result<Rings> {
-        let mut slabs = Vec::with_capacity(shapes.len());
+        let mut own = Vec::with_capacity(shapes.len());
         let mut shared = Vec::with_capacity(shapes.len());
         for (channel, shape) in shapes.iter().enumerate() {
             if let Some(ring) = adopted.get(channel).and_then(Option::as_ref) {
@@ -130,24 +159,54 @@ impl Rings {
                         ),
                     ));
                 }
-                slabs.push(ring.slab());
+                own.push(None);
                 shared.push(Some(Arc::clone(ring)));
                 continue;
             }
-            let cells = u64::from(shape.capacity) + 1;
-            let bytes = cells
-                .checked_mul(shape.cell_stride() as u64)
-                .ok_or_else(|| {
-                    Fault::program("program::launch", "a ring past what a u64 counts")
-                })?;
-            slabs.push(Buffer::zeroed(device, bytes.max(1))?);
+            let slots = pooled.and_then(|(pools, rings)| {
+                rings
+                    .iter()
+                    .find(|ring| ring.channel as usize == channel)
+                    .map(|ring| (pools, ring.slots.as_slice()))
+            });
+            own.push(Some(shape.cells(device, slots)?));
             shared.push(None);
         }
         Ok(Rings {
-            slabs,
+            own,
             shapes: shapes.to_vec(),
             shared,
         })
+    }
+
+    /// Points every pooled ring this instance holds at the chunks its
+    /// slots sit in now.
+    pub fn rebind(&mut self, pools: &Pools) -> Result<()> {
+        self.own
+            .iter_mut()
+            .flatten()
+            .try_for_each(|cells| cells.rebind(pools))
+    }
+
+    /// Moves the pooled rings `rings` names to their new slots.
+    pub fn retarget(&mut self, pools: &Pools, rings: &[engine::program::RingSlots]) -> Result<()> {
+        for ring in rings {
+            let cells = self
+                .own
+                .get_mut(ring.channel as usize)
+                .and_then(Option::as_mut)
+                .ok_or_else(|| {
+                    Fault::program(
+                        "program::launch",
+                        format!(
+                            "channel {} is not a ring this instance holds itself",
+                            ring.channel
+                        ),
+                    )
+                })?;
+            cells.retarget(pools, &ring.slots)?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -157,12 +216,12 @@ impl Rings {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.slabs.len()
+        self.shapes.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.slabs.is_empty()
+        self.shapes.is_empty()
     }
 
     #[must_use]
@@ -170,28 +229,43 @@ impl Rings {
         self.shapes.get(channel).copied()
     }
 
-    pub fn cell_offset(&self, channel: usize, sequence: u64) -> Result<u64> {
+    fn index(&self, channel: usize, sequence: u64) -> Result<u64> {
         let shape = self.shape(channel).ok_or_else(|| {
             Fault::program(
                 "program::launch",
                 format!("channel {channel} is not one this instance carries"),
             )
         })?;
-        let cells = u64::from(shape.capacity) + 1;
-        Ok((sequence % cells) * shape.cell_stride() as u64)
+        Ok(sequence % (u64::from(shape.capacity) + 1))
     }
 
-    pub(crate) fn slab(&self, channel: usize) -> Result<&Buffer> {
-        self.slabs.get(channel).ok_or_else(|| {
-            Fault::program(
+    /// Runs `with` on channel `channel`'s cells, its own or its shared
+    /// ring's.
+    fn with_cells<T>(&self, channel: usize, with: impl FnOnce(&Cells) -> Result<T>) -> Result<T> {
+        if let Some(ring) = self.shared(channel) {
+            return ring.with_cells(with);
+        }
+        match self.own.get(channel).and_then(Option::as_ref) {
+            Some(cells) => with(cells),
+            None => Err(Fault::program(
                 "program::launch",
                 format!("channel {channel} is not one this instance carries"),
-            )
+            )),
+        }
+    }
+
+    /// The buffer and byte the cell of `sequence` lies at, as a kernel
+    /// binds it.
+    pub fn cell_at(&self, channel: usize, sequence: u64) -> Result<(Buffer, u64)> {
+        let index = self.index(channel, sequence)?;
+        self.with_cells(channel, |cells| {
+            let (held, at) = cells.locate(index)?;
+            Ok((held.buffer().clone(), held.offset() + at))
         })
     }
 
     pub fn write_cell(&mut self, channel: usize, sequence: u64, bytes: &[u8]) -> Result<()> {
-        let at = self.cell_offset(channel, sequence)?;
+        let index = self.index(channel, sequence)?;
         let width = self.shape(channel).map_or(0, |shape| shape.cell_bytes());
         if bytes.len() != width {
             return Err(Fault::program(
@@ -202,14 +276,23 @@ impl Rings {
                 ),
             ));
         }
-        self.slabs[channel].write(at, bytes)
+        if let Some(ring) = self.shared(channel) {
+            return ring.write_cell(index, bytes);
+        }
+        match self.own.get_mut(channel).and_then(Option::as_mut) {
+            Some(cells) => cells.write(index, bytes),
+            None => Err(Fault::program(
+                "program::launch",
+                format!("channel {channel} is not one this instance carries"),
+            )),
+        }
     }
 
     pub fn read_cell(&self, channel: usize, sequence: u64) -> Result<Vec<u8>> {
-        let at = self.cell_offset(channel, sequence)?;
+        let index = self.index(channel, sequence)?;
         let width = self.shape(channel).map_or(0, |shape| shape.cell_bytes());
         let mut cell = vec![0u8; width];
-        self.slabs[channel].read(at, &mut cell)?;
+        self.with_cells(channel, |cells| cells.read(index, &mut cell))?;
         Ok(cell)
     }
 }
@@ -284,7 +367,7 @@ struct Grouped {
     table: Buffer,
     shape: LaneShape,
     layouts: Vec<Buffer>,
-    bindings: Buffer,
+    bindings: Held,
     pending_flags: Buffer,
     lane_indices: Buffer,
     row_meta: Buffer,
@@ -302,7 +385,6 @@ impl Grouped {
     fn bytes(&self) -> u64 {
         [
             &self.table,
-            &self.bindings,
             &self.pending_flags,
             &self.lane_indices,
             &self.row_meta,
@@ -311,7 +393,8 @@ impl Grouped {
         .into_iter()
         .chain(&self.layouts)
         .map(Buffer::bytes)
-        .sum()
+        .sum::<u64>()
+            + self.bindings.own_bytes()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -323,6 +406,7 @@ impl Grouped {
         status: &Buffer,
         extents: Extents,
         readout_rows: u32,
+        tables: &mut Tables<'_>,
     ) -> Result<Option<Grouped>> {
         if !plan.needs.grouped_valid {
             return Ok(None);
@@ -372,7 +456,7 @@ impl Grouped {
             .flat_map(|_| plan.channel_bindings.iter().copied())
             .flat_map(u32::to_le_bytes)
             .collect();
-        let mut bindings = Buffer::zeroed(device, binding_bytes.len().max(4) as u64)?;
+        let mut bindings = tables.take(binding_bytes.len().max(4) as u64)?;
         bindings.write(0, &binding_bytes)?;
 
         let flags = u64::from(GROUPED_LANES) * u64::from(shape.channel_slots_per_lane);
@@ -505,9 +589,11 @@ impl Grouped {
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub struct Prepared {
     status: Buffer,
-    descriptors: Buffer,
-    params: Buffer,
-    offsets: Buffer,
+    /// The bind-time tables (the instance's state, REDESIGN step 4): in
+    /// `Instance` slots where the runtime took them.
+    descriptors: Held,
+    params: Held,
+    offsets: Held,
     scratch: DeferredZeroBuffer,
     /// By output slot ([`eta_ir::op::output_slot`]): how the stage reads it,
     /// what is bound there and its table entry.
@@ -731,21 +817,65 @@ pub struct BatchKey {
 }
 
 impl Prepared {
+    /// Moves each pooled table to the ref `to` maps its slot to.
+    pub fn retarget(&mut self, pools: &Pools, to: &impl Fn(u32) -> Result<u32>) -> Result<()> {
+        let grouped = self.grouped.as_mut().map(|grouped| &mut grouped.bindings);
+        for held in [&mut self.descriptors, &mut self.params, &mut self.offsets]
+            .into_iter()
+            .chain(grouped)
+        {
+            if let Some(slot) = held.slot() {
+                held.retarget(pools, to(slot)?)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Points the pooled bind-time tables at the chunks their slots sit in
+    /// now.
+    pub fn rebind(&mut self, pools: &Pools) -> Result<()> {
+        self.descriptors.rebind(pools)?;
+        self.params.rebind(pools)?;
+        self.offsets.rebind(pools)?;
+        if let Some(grouped) = self.grouped.as_mut() {
+            grouped.bindings.rebind(pools)?;
+        }
+        Ok(())
+    }
+
     /// The device bytes this stage's launch holds for its instance.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        [
-            &self.status,
-            &self.descriptors,
-            &self.params,
-            &self.offsets,
-            &self.addresses,
-        ]
-        .into_iter()
-        .map(Buffer::bytes)
-        .sum::<u64>()
+        [&self.status, &self.addresses]
+            .into_iter()
+            .map(Buffer::bytes)
+            .sum::<u64>()
+            + [&self.descriptors, &self.params, &self.offsets]
+                .into_iter()
+                .map(Held::own_bytes)
+                .sum::<u64>()
             + self.scratch.bytes()
             + self.grouped.as_ref().map_or(0, Grouped::bytes)
+    }
+
+    /// The bind-time tables a stage of `plan` takes, in the order `build`
+    /// takes them from its [`Tables`]: params, descriptors, offsets and,
+    /// for a grouped stage, the channel bindings. Counts alone size them,
+    /// so a program states them at registration.
+    #[must_use]
+    pub fn table_sizes(plan: &LaunchStagePlan) -> Vec<u64> {
+        let mut sizes = vec![
+            (plan.ops.len() * size_of::<OpParams>()).max(size_of::<OpParams>()) as u64,
+            (plan.value_types.len() * size_of::<ValueDesc>()).max(1) as u64,
+            (plan.value_types.len() * size_of::<u32>()).max(size_of::<u32>()) as u64,
+        ];
+        if plan.needs.grouped_valid {
+            sizes.push(
+                (GROUPED_LANES as usize * plan.channel_bindings.len() * size_of::<u32>()).max(4)
+                    as u64,
+            );
+        }
+        sizes
     }
 
     pub fn build(
@@ -753,6 +883,7 @@ impl Prepared {
         plan: &LaunchStagePlan,
         shapes: &[ChannelShape],
         extents: Extents,
+        tables: &mut Tables<'_>,
     ) -> Result<Prepared> {
         let channel_count = u32::try_from(plan.channel_bindings.len())
             .map_err(|_| Fault::program("program::launch", "more channels than a u32 can count"))?;
@@ -854,14 +985,12 @@ impl Prepared {
         }
 
         let param_bytes = records_bytes(&records);
-        let mut params = Buffer::zeroed(
-            device,
-            (records.len() * size_of::<OpParams>()).max(size_of::<OpParams>()) as u64,
-        )?;
+        let mut params = tables
+            .take((records.len() * size_of::<OpParams>()).max(size_of::<OpParams>()) as u64)?;
         params.write(0, &param_bytes)?;
 
         let descriptor_bytes: Vec<u8> = descriptors.iter().flat_map(record_bytes).collect();
-        let mut descriptor_buffer = Buffer::zeroed(device, descriptor_bytes.len().max(1) as u64)?;
+        let mut descriptor_buffer = tables.take(descriptor_bytes.len().max(1) as u64)?;
         descriptor_buffer.write(0, &descriptor_bytes)?;
 
         let offset_bytes: Vec<u8> = scratch_layout
@@ -870,7 +999,7 @@ impl Prepared {
             .map(|&at| u32::try_from(at).unwrap_or(u32::MAX))
             .flat_map(u32::to_le_bytes)
             .collect();
-        let mut offsets = Buffer::zeroed(device, offset_bytes.len().max(size_of::<u32>()) as u64)?;
+        let mut offsets = tables.take(offset_bytes.len().max(size_of::<u32>()) as u64)?;
         offsets.write(0, &offset_bytes)?;
 
         let scratch_bytes = u64::from(scratch_stride).max(SCRATCH_ALIGN);
@@ -891,6 +1020,7 @@ impl Prepared {
             &status,
             extents,
             readout_rows,
+            tables,
         )?;
 
         Ok(Prepared {
@@ -977,10 +1107,13 @@ impl Prepared {
                     ),
                 )
             })?;
+            // A ring's cells lie in one buffer: its own, or the pool's view.
+            let (slab, committed) = rings.cell_at(channel, cursor.head)?;
+            let (_, pending) = rings.cell_at(channel, cursor.tail)?;
             self.bound.push(Bound {
-                slab: rings.slab(channel)?.clone(),
-                committed: rings.cell_offset(channel, cursor.head)?,
-                pending: rings.cell_offset(channel, cursor.tail)?,
+                slab,
+                committed,
+                pending,
             });
         }
         let ready = Status {
@@ -1110,12 +1243,28 @@ impl Prepared {
             // SAFETY: every reservation is retained by `self`; every offset is zero.
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(grouped.table.raw()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.descriptors.raw()),
+                    self.descriptors.offset() as usize,
+                    1,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.params.raw()),
+                    self.params.offset() as usize,
+                    2,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.offsets.raw()),
+                    self.offsets.offset() as usize,
+                    3,
+                );
                 encoder.setBuffer_offset_atIndex(Some(self.scratch.get()?.raw()), 0, 4);
                 encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
-                encoder.setBuffer_offset_atIndex(Some(grouped.bindings.raw()), 0, 6);
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.bindings.raw()),
+                    grouped.bindings.offset() as usize,
+                    6,
+                );
                 encoder.setBuffer_offset_atIndex(Some(grouped.pending_flags.raw()), 0, 7);
                 encoder.setBuffer_offset_atIndex(Some(grouped.lane_indices.raw()), 0, 8);
                 encoder.setBuffer_offset_atIndex(Some(grouped.row_meta.raw()), 0, 9);
@@ -1187,9 +1336,21 @@ impl Prepared {
             // SAFETY: every buffer is retained by `self`/`region`/the batch; every offset was bounds-checked.
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(self.status.raw()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.descriptors.raw()),
+                    self.descriptors.offset() as usize,
+                    1,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.params.raw()),
+                    self.params.offset() as usize,
+                    2,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.offsets.raw()),
+                    self.offsets.offset() as usize,
+                    3,
+                );
                 encoder.setBuffer_offset_atIndex(Some(scratch.raw()), scratch_at, 4);
                 encoder.setBuffer_offset_atIndex(
                     Some(scratch.raw()),
@@ -1277,12 +1438,28 @@ impl Prepared {
             // SAFETY: every reservation is retained by `self`; every offset is zero (the kernel strides off `layout`).
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(grouped.table.raw()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.descriptors.raw()),
+                    self.descriptors.offset() as usize,
+                    1,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.params.raw()),
+                    self.params.offset() as usize,
+                    2,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.offsets.raw()),
+                    self.offsets.offset() as usize,
+                    3,
+                );
                 encoder.setBuffer_offset_atIndex(Some(self.scratch.get()?.raw()), 0, 4);
                 encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
-                encoder.setBuffer_offset_atIndex(Some(grouped.bindings.raw()), 0, 6);
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.bindings.raw()),
+                    grouped.bindings.offset() as usize,
+                    6,
+                );
                 encoder.setBuffer_offset_atIndex(Some(grouped.pending_flags.raw()), 0, 7);
                 encoder.setBuffer_offset_atIndex(Some(grouped.lane_indices.raw()), 0, 8);
                 encoder.setBuffer_offset_atIndex(Some(grouped.row_meta.raw()), 0, 9);
@@ -1970,12 +2147,12 @@ mod tests {
 
     fn a_channel_this_instance_does_not_carry_is_refused_by_number() {
         let rings = Rings {
-            slabs: Vec::new(),
+            own: Vec::new(),
             shapes: Vec::new(),
             shared: Vec::new(),
         };
         let said = rings
-            .cell_offset(2, 0)
+            .cell_at(2, 0)
             .expect_err("no such channel")
             .to_string();
         assert!(said.contains('2'), "the refusal names the channel: {said}");

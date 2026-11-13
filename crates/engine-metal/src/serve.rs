@@ -1344,7 +1344,10 @@ impl Shell {
         self.drain()?;
         let mut frame = self.device.frame()?;
         self.pools.evacuate(&mut frame, evacuation)?;
-        frame.commit()
+        frame.commit()?;
+        // Guest tables and rings in moved chunks: the refs stand, their
+        // addresses do not.
+        self.programs.rebind(&self.pools)
     }
 
     /// Whole-slot copies a fire states (`Lane::slot_copies`), each
@@ -1738,6 +1741,7 @@ impl Shell {
         self.programs.register(&self.device, registration)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_program(
         &mut self,
         program_id: engine::ProgramId,
@@ -1746,7 +1750,16 @@ impl Shell {
         geometry: eta_ir::registry::GeometryClass,
         device: eta_ir::registry::PortMask,
         channels: &[engine::ChannelId],
+        instance_slots: &[u32],
+        ring_slots: &[engine::RingSlots],
     ) -> Result<engine::InstanceId> {
+        let pooled = (!instance_slots.is_empty() || !ring_slots.is_empty()).then_some(
+            crate::program::session::Pooled {
+                pools: &self.pools,
+                instance: instance_slots,
+                rings: ring_slots,
+            },
+        );
         self.programs.bind(
             &self.device,
             program_id,
@@ -1755,15 +1768,46 @@ impl Shell {
             geometry,
             device,
             channels,
+            pooled,
         )
+    }
+
+    /// See `Engine::rebind_slots`: every frame lands first, so no fire in
+    /// flight reads the old refs' addresses.
+    pub fn rebind_slots(&mut self, rebind: &engine::Rebind) -> Result<()> {
+        self.drain()?;
+        self.programs.rebind_slots(&self.pools, rebind)
+    }
+
+    /// What an instance of `program_id` holds in pool slots
+    /// (`Engine::program_facts`).
+    pub fn program_facts(&self, program_id: engine::ProgramId) -> Result<engine::ProgramFacts> {
+        let layout = self.pools.layout();
+        match (layout.instance, layout.channel) {
+            (Some(instance), Some(channel)) => {
+                self.programs
+                    .facts(program_id, instance.slot_bytes, channel.slot_bytes)
+            }
+            _ => Ok(engine::ProgramFacts::default()),
+        }
+    }
+
+    /// The `Channel` slots a registered channel's ring of `shape` takes.
+    #[must_use]
+    pub fn ring_facts(&self, shape: crate::program::ChannelShape) -> Option<engine::RingFacts> {
+        let channel = self.pools.layout().channel?;
+        crate::program::ring_facts(0, shape, channel.slot_bytes)
     }
 
     pub fn register_shared_channel(
         &mut self,
         id: engine::ChannelId,
         shape: crate::program::ChannelShape,
+        slots: &[u32],
     ) -> Result<()> {
-        self.programs.register_channel(&self.device, id, shape)
+        let pooled = (!slots.is_empty()).then_some((&self.pools, slots));
+        self.programs
+            .register_channel(&self.device, id, shape, pooled)
     }
 
     pub fn close_shared_channel(&mut self, id: engine::ChannelId) -> bool {
@@ -3886,7 +3930,7 @@ impl Shell {
                 });
             }
             casts.push((
-                self.handles.bind(ring, committed, values * 4)?,
+                self.handles.bind(&ring, committed, values * 4)?,
                 self.handles.bind(store, at + feed.at, feed.bytes)?,
                 u32::try_from(values).unwrap_or(u32::MAX),
             ));

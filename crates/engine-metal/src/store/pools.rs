@@ -618,6 +618,32 @@ fn slot_at(layout: &Layout, shape: &Slots, slot: u32) -> u64 {
 }
 
 impl Pools {
+    /// A pool of `chunks` chunks of `chunk_bytes` holding no state rows:
+    /// only the guest shapes (`INSTANCE`, `CHANNEL`), every segment
+    /// committed. For tests of what guests place in slots.
+    #[cfg(test)]
+    pub(crate) fn guests_only(device: &Context, chunk_bytes: u64, chunks: u32) -> Result<Pools> {
+        let layout = Layout::new(chunk_bytes, chunks, chunks, 16, [0, 0], 1, 0, 0)?;
+        let rows = Rows {
+            rows: Vec::new(),
+            chunk_bytes,
+            list_bytes: 0,
+            tokens: 16,
+            fixed_bytes: 0,
+            pieces: 1,
+            windows: Vec::new(),
+            tables: Vec::new(),
+            bands: Vec::new(),
+            rs: None,
+            kv_rows: Vec::new(),
+            state_rows: Vec::new(),
+        };
+        let paging = super::kv::Paging::of(16, 256, 1, 1)?;
+        let mut pools = Pools::reserve(device, rows, layout, paging)?;
+        pools.commit_segments(1)?;
+        Ok(pools)
+    }
+
     /// The pool `layout` sizes over `rows`, kv pages of `paging`'s size.
     pub fn reserve(device: &Context, rows: Rows, layout: Layout, paging: Paging) -> Result<Pools> {
         let pool = Pool::reserve(
@@ -914,6 +940,30 @@ impl Pools {
         let shape = *self.shape(id)?;
         let (chunk, index) = self.place(&shape, slot)?;
         Ok(chunk * shape.per_chunk + index)
+    }
+
+    /// Slot ref `slot` of shape `id` as a guest's table or ring holds it
+    /// (`program::held`): its byte offset in the view, the host address of
+    /// its first byte (through the heap under it), and its bytes.
+    pub fn slot_place(&self, id: ShapeId, slot: u32) -> Result<(u64, std::ptr::NonNull<u8>, u64)> {
+        let shape = *self.shape(id)?;
+        let (chunk, index) = self.place(&shape, slot)?;
+        let inner = u64::from(index) * shape.slot_bytes;
+        let host = self.pool.chunk_host(chunk)?;
+        // SAFETY: `index < per_chunk`, so the slot lies inside the chunk the
+        // host address names.
+        #[allow(unsafe_code)]
+        let host = unsafe { host.add(usize::try_from(inner).unwrap_or(usize::MAX)) };
+        Ok((
+            u64::from(chunk) * self.layout.chunk_bytes + inner,
+            host,
+            shape.slot_bytes,
+        ))
+    }
+
+    /// The bytes of one slot of shape `id`.
+    pub fn slot_bytes(&self, id: ShapeId) -> Result<u64> {
+        Ok(self.shape(id)?.slot_bytes)
     }
 
     /// The byte offset of slot ref `slot` of shape `id`.
