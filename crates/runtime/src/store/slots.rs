@@ -918,8 +918,8 @@ impl SlotPool {
         Some(chunks)
     }
 
-    /// Commits the lowest uncommitted segments below the activation, a
-    /// prefix, until `needs` fit the committed chunks and every chunk below
+    /// Commits the lowest uncommitted segments below the activation and
+    /// the ceiling, a prefix, until `needs` fit the committed chunks and every chunk below
     /// physical chunk `through` lies in a committed segment. The segments
     /// committed, lowest first: the engine backs them (`commit_segments`
     /// of the prefix they end) before anything lands in them. Stops short
@@ -933,11 +933,12 @@ impl SlotPool {
             if covered && self.fits(needs) {
                 return committed;
             }
-            let Some(segment) = self
-                .segments
-                .uncommitted()
-                .find(|&segment| segment < self.top_segment)
-            else {
+            // Never into what the engine holds back (the ceiling): a
+            // segment there is no room the engine binds, and backing it
+            // takes the memory the engine keeps for its bodies.
+            let Some(segment) = self.segments.uncommitted().find(|&segment| {
+                segment < self.top_segment && self.segments.range(segment).start < self.ceiling
+            }) else {
                 return committed;
             };
             self.commit_segment(segment)
@@ -1543,7 +1544,11 @@ impl SlotPool {
         let want = bytes.div_ceil(self.chunk_bytes.max(1));
         let mut room = u64::from(self.headroom());
         let mut segments = Vec::new();
-        for segment in self.segments.uncommitted() {
+        for segment in self
+            .segments
+            .uncommitted()
+            .filter(|&segment| self.segments.range(segment).start < self.ceiling)
+        {
             if room >= want {
                 break;
             }

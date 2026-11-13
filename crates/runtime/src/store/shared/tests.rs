@@ -1016,3 +1016,28 @@ fn room_past_the_ceiling_is_not_headroom_and_its_lift_is_said() {
     assert!(pool.hold_back(0), "lifted: the caller wakes the waiters");
     assert_eq!(pool.pool().headroom(), all);
 }
+
+/// The first commit (the weights' at boot, the walker's ahead of a
+/// waiter) never maps a segment into what the engine holds back: however
+/// much it is asked for, it stops at the ceiling, so the range less what the
+/// engine holds is all that is ever backed below the activation.
+#[test]
+fn no_commit_reaches_into_what_the_engine_holds_back() {
+    let mut pool = pool();
+    let top = pool.pool().top_segment() * SEGMENT;
+    // All but the lowest two segments below the activation held back.
+    let ceiling = 2 * SEGMENT;
+    pool.hold_back(u64::from(top - ceiling) * CHUNK);
+    assert_eq!(pool.pool().ceiling(), ceiling);
+    let list = pool.list().expect("a kv list").pool;
+    let committed = pool.pool_mut().commit_for(&[(list, u64::MAX / 2)], 0);
+    assert!(
+        committed.iter().all(|&segment| segment * SEGMENT < ceiling),
+        "committed {committed:?} past the ceiling at chunk {ceiling}"
+    );
+    assert!(
+        pool.pool().commit_ahead(u64::MAX / 2).is_empty(),
+        "nothing ahead past the ceiling"
+    );
+    assert!(pool.mapped_segments() <= 2 + (8 - pool.pool().top_segment()));
+}
