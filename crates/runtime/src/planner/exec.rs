@@ -617,12 +617,12 @@ const MOVE_WAIT: Duration = Duration::from_secs(10);
 /// again on the next restore.
 async fn rebind(engine: usize, roles: &RolesHandle, pid: ProcessId) -> Result<(), String> {
     let stale = roles.lock().unwrap().stale(pid);
+    // The lane marks each rebound and replays the host writes held for it.
     for rebind in stale {
         let owner = Owner::of(&rebind);
         crate::scheduler::rebind_slots(engine, rebind)
             .await
             .map_err(|error| format!("rebind {owner:?}: {error:#}"))?;
-        roles.lock().unwrap().rebound(owner);
     }
     Ok(())
 }

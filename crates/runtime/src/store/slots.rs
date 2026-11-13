@@ -181,6 +181,13 @@ pub enum SlotError {
     /// A claim named a chunk that cannot be taken whole as it stands.
     #[error("chunk {chunk} cannot be claimed: {why}")]
     Unclaimable { chunk: u32, why: &'static str },
+    /// A run of adjacent slots longer than a chunk holds.
+    #[error("a run of {slots} slots of shape {shape} is past a chunk's {per_chunk}")]
+    RunPastChunk {
+        shape: ShapeId,
+        slots: u64,
+        per_chunk: u32,
+    },
 }
 
 /// The state chunks in the way of a rung's activation, each moved to a free
@@ -364,6 +371,32 @@ impl ShapeState {
             words[self.words - 1] = (1 << (spc % WORD)) - 1;
         }
         frame
+    }
+
+    /// The lowest slot of frame `frame` that starts `n` free slots in a
+    /// row, if one does.
+    fn free_run(&self, frame: u32, n: u32) -> Option<u32> {
+        let base = frame as usize * self.words;
+        let free = |index: u32| {
+            let (word, bit) = Bits::locate(index);
+            self.free[base + word] & bit != 0
+        };
+        let mut start = 0;
+        let mut length = 0;
+        for index in 0..self.spc() {
+            if free(index) {
+                if length == 0 {
+                    start = index;
+                }
+                length += 1;
+                if length == n {
+                    return Some(start);
+                }
+            } else {
+                length = 0;
+            }
+        }
+        None
     }
 
     fn ref_at(&mut self, frame: u32, index: u32) -> &mut SlotRefs {
@@ -969,6 +1002,59 @@ impl SlotPool {
         Ok(taken)
     }
 
+    /// `n` adjacent slots of `shape` for `holder`, in index order, in one
+    /// chunk: the lowest run of `n` free slots in the fullest partly filled
+    /// chunk that has one, else the first `n` slots of a chunk opened for
+    /// the shape. A run is never split across chunks: where no chunk has
+    /// room for it whole, nothing is taken.
+    ///
+    /// # Errors
+    ///
+    /// [`SlotError::RunPastChunk`] where `n` is past a chunk's slots;
+    /// [`SlotError::Short`] where no chunk has room for the run.
+    pub fn acquire_run(
+        &mut self,
+        holder: Holder,
+        shape: ShapeId,
+        n: u64,
+    ) -> Result<Vec<Slot>, SlotError> {
+        let state = self
+            .shapes
+            .get(shape as usize)
+            .ok_or(SlotError::UnknownShape(shape))?;
+        let per_chunk = state.spc();
+        if n > u64::from(per_chunk) {
+            return Err(SlotError::RunPastChunk {
+                shape,
+                slots: n,
+                per_chunk,
+            });
+        }
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let n = n as u32;
+        let found = state.partial.iter().find_map(|&(_, _, logical)| {
+            let frame = self.chunks[logical as usize].frame;
+            state.free_run(frame, n).map(|first| (logical, first))
+        });
+        let (chunk, first) = match found {
+            Some(found) => found,
+            None if self.free_chunks() > 0 => (self.open_chunk(shape), 0),
+            None => {
+                return Err(SlotError::Short {
+                    shape,
+                    slots: u64::from(n),
+                    chunks: 1,
+                });
+            }
+        };
+        let mut taken = Vec::with_capacity(n as usize);
+        self.fill_run(chunk, holder.is_live(), first, n, &mut taken);
+        *self.holders.entry(holder).or_default() += u64::from(n);
+        Ok(taken)
+    }
+
     /// Exactly slot refs `first .. first + n` of `shape` for `holder`, in
     /// ref order: the chunks they lie in, `first` its chunk's slot 0, each
     /// opened for the shape where it is named rather than lowest first (a
@@ -1265,6 +1351,33 @@ impl SlotPool {
             }
         }
         let now = meta.used + got;
+        state.reposition(physical, chunk, meta.used, now);
+        self.chunks[chunk as usize].used = now;
+    }
+
+    /// Takes slots `first .. first + n` of `chunk`, every one free.
+    fn fill_run(&mut self, chunk: u32, live: bool, first: u32, n: u32, taken: &mut Vec<Slot>) {
+        let meta = self.chunks[chunk as usize];
+        let physical = self.logical_to_physical[chunk as usize];
+        let state = &mut self.shapes[meta.shape as usize];
+        let base = meta.frame as usize * state.words;
+        for index in first..first + n {
+            let (word, bit) = Bits::locate(index);
+            let bits = &mut state.free[base + word];
+            debug_assert_ne!(*bits & bit, 0, "slot {index} of chunk {chunk} is taken");
+            *bits &= !bit;
+            let refs = state.ref_at(meta.frame, index);
+            let was = *refs;
+            *refs = SlotRefs {
+                live: u32::from(live),
+                cache: u32::from(!live),
+                touched: 0,
+            };
+            let now = *refs;
+            state.reclassify(was, now);
+            taken.push(Slot { chunk, index });
+        }
+        let now = meta.used + n;
         state.reposition(physical, chunk, meta.used, now);
         self.chunks[chunk as usize].used = now;
     }

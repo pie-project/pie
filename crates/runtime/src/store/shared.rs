@@ -984,6 +984,13 @@ impl SharedPool {
         Some(slots.iter().map(|&slot| self.pool.slot_ref(slot)).collect())
     }
 
+    /// `n` adjacent slots of `shape` in one chunk for the store, as slot
+    /// refs in order ([`SlotPool::acquire_run`]).
+    pub fn take_run(&mut self, shape: ShapeId, n: u64) -> Result<Vec<u32>, SlotError> {
+        let slots = self.pool.acquire_run(STORE, shape, n)?;
+        Ok(slots.iter().map(|&slot| self.pool.slot_ref(slot)).collect())
+    }
+
     /// The store lets `refs` of `shape` go; no fire reads them any more.
     pub fn give_refs(&mut self, shape: ShapeId, refs: &[u32]) {
         let slots: Vec<Slot> = refs.iter().map(|&r| self.slot(shape, r)).collect();
