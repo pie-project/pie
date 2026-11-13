@@ -162,7 +162,9 @@ pub(crate) struct OnPlanner(pub std::sync::Arc<crate::planner::ResidencyPlanner>
 impl Lender for OnPlanner {
     fn lend(&mut self, engine: usize, room: ArmingRoom, idle: bool) -> Option<Lent> {
         let _ = (engine, idle);
-        self.0.try_free(demand(room)).map(|grant| Lent::of(grant, None))
+        self.0
+            .try_free(demand(room))
+            .map(|grant| Lent::of(grant, None))
     }
 }
 

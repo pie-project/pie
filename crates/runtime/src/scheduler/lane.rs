@@ -393,9 +393,12 @@ impl Lane {
             // fires than the step costs the others; a step short of room
             // ends the run until the raise funds it.
             if arming.raise_waits() {
-                while arming.raise_waits()
-                    && arming.step(&mut engine, false) == super::arming::Step::Stepped
-                {}
+                loop {
+                    let stepped = arming.step(&mut engine, false);
+                    if stepped != super::arming::Step::Stepped || !arming.raise_waits() {
+                        break;
+                    }
+                }
             } else {
                 arming.unfund();
             }
