@@ -207,6 +207,11 @@ impl Chunks {
     /// inside it. The runtime's span starts where its state chunks end
     /// ([`Chunks::stated`]).
     pub fn hold_boundary(&mut self, pool: &mut PhysicalPool) -> Result<Commit> {
+        // A size-only walk backs nothing, and zeroes no null chunk it would
+        // then count zeroed (`crate::sizing`).
+        if crate::sizing::active() {
+            return Ok(Commit::Committed);
+        }
         let chunk = self.layout.chunk_bytes;
         let start = self.stated();
         let segment = self.layout.segment_chunks.max(1);
@@ -351,6 +356,10 @@ impl Chunks {
     /// it is backed: every page behind a window reads it, and a masked
     /// column still multiplies its value, so it must hold no NaN.
     pub fn commit_segments(&mut self, pool: &mut PhysicalPool, segments: u32) -> Result<Commit> {
+        // As [`Chunks::hold_boundary`]: a walk counts no chunk zeroed.
+        if crate::sizing::active() {
+            return Ok(Commit::Committed);
+        }
         let outcome = self.range.commit_segments(pool, segments)?;
         if outcome == Commit::Committed && !self.null_zeroed && self.range.committed_segments() > 0
         {

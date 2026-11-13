@@ -482,6 +482,16 @@ pub unsafe fn memcpy_async(
     kind: Direction,
     stream: sys::Stream,
 ) -> Result<(), sys::HipError> {
+    // A size-only walk (`crate::sizing`) copies nothing to or from a
+    // stand-in; a read of one back to the host has no answer there.
+    if crate::sizing::active()
+        && (crate::sizing::stands_in(dst.addr()) || crate::sizing::stands_in(src.addr()))
+    {
+        return match kind {
+            Direction::DeviceToHost => Err(801),
+            _ => Ok(()),
+        };
+    }
     let api = sys::api().map_err(|_| -1)?;
     let kind = match kind {
         Direction::HostToDevice => sys::MEMCPY_HOST_TO_DEVICE,

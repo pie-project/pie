@@ -299,16 +299,21 @@ fn copy_rows(
     // SAFETY: both spans are live device memory the fire owns, `rows`
     // rows of their pitches, on its stream.
     let code = unsafe {
-        rt::cudaMemcpy2DAsync(
-            dst as usize as *mut core::ffi::c_void,
-            dst_pitch as usize * 2,
-            src as usize as *const core::ffi::c_void,
-            src_pitch as usize * 2,
-            width as usize * 2,
-            rows as usize,
-            rt::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
-            ctx.stream().cast(),
-        )
+        if crate::sizing::active() {
+            // A size-only walk (`crate::sizing`) moves nothing.
+            rt::cudaError::cudaSuccess
+        } else {
+            rt::cudaMemcpy2DAsync(
+                dst as usize as *mut core::ffi::c_void,
+                dst_pitch as usize * 2,
+                src as usize as *const core::ffi::c_void,
+                src_pitch as usize * 2,
+                width as usize * 2,
+                rows as usize,
+                rt::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                ctx.stream().cast(),
+            )
+        }
     };
     if code != rt::cudaError::cudaSuccess {
         return Err(crate::jit::refuse(

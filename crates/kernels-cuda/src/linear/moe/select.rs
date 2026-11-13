@@ -463,29 +463,34 @@ pub(super) fn select_grouped(
     // SAFETY: `handle` is this context's live cuBLAS handle bound to its
     // stream; the pointer arrays hold `blocks` entries in slabs this context
     // owns for the fire's life.
-    let status = unsafe {
-        cublasGemmBatchedEx(
-            handle,
-            cublasOperation_t::CUBLAS_OP_T,
-            cublasOperation_t::CUBLAS_OP_N,
-            n,
-            block_size,
-            k,
-            std::ptr::from_ref(&alpha).cast(),
-            w_ptrs as usize as *const *const std::ffi::c_void,
-            scalar,
-            k,
-            act_ptrs as usize as *const *const std::ffi::c_void,
-            scalar,
-            k,
-            std::ptr::from_ref(&beta).cast(),
-            out_ptrs as usize as *const *mut std::ffi::c_void,
-            scalar,
-            n,
-            max_blocks,
-            cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-        )
+    let status = if crate::sizing::active() {
+        // A size-only walk (`crate::sizing`) runs no product.
+        cublasStatus_t::CUBLAS_STATUS_SUCCESS
+    } else {
+        unsafe {
+            cublasGemmBatchedEx(
+                handle,
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+                n,
+                block_size,
+                k,
+                std::ptr::from_ref(&alpha).cast(),
+                w_ptrs as usize as *const *const std::ffi::c_void,
+                scalar,
+                k,
+                act_ptrs as usize as *const *const std::ffi::c_void,
+                scalar,
+                k,
+                std::ptr::from_ref(&beta).cast(),
+                out_ptrs as usize as *const *mut std::ffi::c_void,
+                scalar,
+                n,
+                max_blocks,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+        }
     };
     if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
         return Err(refuse(

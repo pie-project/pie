@@ -686,6 +686,11 @@ impl Arena {
                 || ((offset / self.map_unit)..=((end - 1) / self.map_unit))
                     .all(|u| !self.unbacked(u as usize)));
         if !backed {
+            // A size-only walk names unbacked spans by a stand-in base:
+            // nothing reads or writes through it (`crate::sizing`).
+            if crate::sizing::active() && end <= self.virtual_bytes {
+                return Ok(crate::sizing::STAND_IN + offset);
+            }
             return Err(Fault::Ceiling {
                 what: self.label,
                 need: end,
@@ -970,6 +975,10 @@ impl Range {
         bytes: u64,
         beside: bool,
     ) -> Result<Commit> {
+        // A size-only walk backs nothing and holds nothing (`crate::sizing`).
+        if crate::sizing::active() {
+            return Ok(Commit::Committed);
+        }
         let mut held = self.held.clone();
         match held.iter_mut().find(|span| span.0 == from) {
             Some(span) => span.1 = span.1.max(bytes),
@@ -993,6 +1002,10 @@ impl Range {
 
     /// Backs the first `segments` segments; those already backed stay.
     pub fn commit_segments(&mut self, pool: &mut PhysicalPool, segments: u32) -> Result<Commit> {
+        // A size-only walk backs nothing (`crate::sizing`).
+        if crate::sizing::active() {
+            return Ok(Commit::Committed);
+        }
         let segments = segments.min(self.segments());
         if segments <= self.committed {
             return Ok(Commit::Committed);

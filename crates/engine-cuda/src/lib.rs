@@ -32,6 +32,7 @@ pub mod replay;
 pub mod run;
 pub mod serve;
 pub mod settle;
+pub mod sizing;
 #[cfg(feature = "rocm")]
 pub mod split_arm;
 pub mod staged_h2d;

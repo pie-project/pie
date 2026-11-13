@@ -19,6 +19,10 @@ pub(crate) unsafe fn issue(
     slots: &mut [*mut c_void],
     stream: *mut c_void,
 ) -> Result<(), Fault> {
+    // A size-only walk (`crate::sizing`) launches nothing.
+    if crate::sizing::active() {
+        return Ok(());
+    }
     let api = sys::api().map_err(|_| Fault::Device {
         call: "hipModuleLaunchKernel",
         code: -1,

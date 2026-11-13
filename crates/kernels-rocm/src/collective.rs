@@ -47,15 +47,20 @@ pub fn all_reduce(ctx: &Ctx, buf: &mut Tensor) -> Result<(), Error> {
         // stream `Ctx::with_comm` and `Ctx::on` promise; `send` is `buf`'s own
         // device storage, `count` elements, reduced in place.
         let code = unsafe {
-            (nccl.ncclAllReduce)(
-                send,
-                send.cast_mut(),
-                count,
-                dtype,
-                sys::NCCL_SUM,
-                comm,
-                ctx.stream(),
-            )
+            if crate::sizing::active() {
+                // A size-only walk (`crate::sizing`) runs no collective.
+                sys::NCCL_SUCCESS
+            } else {
+                (nccl.ncclAllReduce)(
+                    send,
+                    send.cast_mut(),
+                    count,
+                    dtype,
+                    sys::NCCL_SUM,
+                    comm,
+                    ctx.stream(),
+                )
+            }
         };
         answered(OP, "ncclAllReduce", code)
     }
@@ -89,14 +94,19 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
             // `comm` and the stream are live per `Ctx::with_comm` and
             // `Ctx::on`.
             let code = unsafe {
-                (nccl.ncclAllGather)(
-                    send,
-                    y.ptr as usize as *mut core::ffi::c_void,
-                    count,
-                    dtype,
-                    comm,
-                    ctx.stream(),
-                )
+                if crate::sizing::active() {
+                    // A size-only walk (`crate::sizing`) runs no collective.
+                    sys::NCCL_SUCCESS
+                } else {
+                    (nccl.ncclAllGather)(
+                        send,
+                        y.ptr as usize as *mut core::ffi::c_void,
+                        count,
+                        dtype,
+                        comm,
+                        ctx.stream(),
+                    )
+                }
             };
             return answered(OP, "ncclAllGather", code);
         }
@@ -112,7 +122,14 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         let stage = ctx.scratch(OP, "all_gather_stage", bytes)?;
         // SAFETY: `stage` is a slab of `bytes`, the whole gathered rectangle;
         // `send`, `comm` and the stream as in the one-row case.
-        let code = unsafe { (nccl.ncclAllGather)(send, stage, count, dtype, comm, ctx.stream()) };
+        let code = unsafe {
+            if crate::sizing::active() {
+                // A size-only walk (`crate::sizing`) runs no collective.
+                sys::NCCL_SUCCESS
+            } else {
+                (nccl.ncclAllGather)(send, stage, count, dtype, comm, ctx.stream())
+            }
+        };
         answered(OP, "ncclAllGather", code)?;
         crate::gather::rows::gather_width_concat(ctx, stage as usize as u64, y, x.width, world)
     }
@@ -131,11 +148,25 @@ pub fn grouped<R>(op: &'static str, body: impl FnOnce() -> Result<R, Error>) -> 
         let nccl = rccl(op)?;
         // SAFETY: `ncclGroupStart` takes no arguments; it opens a group on this
         // thread.
-        answered(op, "ncclGroupStart", unsafe { (nccl.ncclGroupStart)() })?;
+        answered(op, "ncclGroupStart", unsafe {
+            if crate::sizing::active() {
+                // A size-only walk (`crate::sizing`) runs no collective.
+                sys::NCCL_SUCCESS
+            } else {
+                (nccl.ncclGroupStart)()
+            }
+        })?;
         let ran = body();
         // SAFETY: closes the group opened above, on the same thread, whatever
         // `body` answered.
-        let ended = answered(op, "ncclGroupEnd", unsafe { (nccl.ncclGroupEnd)() });
+        let ended = answered(op, "ncclGroupEnd", unsafe {
+            if crate::sizing::active() {
+                // A size-only walk (`crate::sizing`) runs no collective.
+                sys::NCCL_SUCCESS
+            } else {
+                (nccl.ncclGroupEnd)()
+            }
+        });
         let out = ran?;
         ended?;
         Ok(out)
@@ -180,15 +211,20 @@ pub fn reduce_scatter(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error>
         // of `y`, this rank's shard; `comm` and the stream are live per
         // `Ctx::with_comm` and `Ctx::on`.
         let code = unsafe {
-            (nccl.ncclReduceScatter)(
-                x.ptr as usize as *const core::ffi::c_void,
-                recv.cast_mut(),
-                count,
-                dtype,
-                sys::NCCL_SUM,
-                comm,
-                ctx.stream(),
-            )
+            if crate::sizing::active() {
+                // A size-only walk (`crate::sizing`) runs no collective.
+                sys::NCCL_SUCCESS
+            } else {
+                (nccl.ncclReduceScatter)(
+                    x.ptr as usize as *const core::ffi::c_void,
+                    recv.cast_mut(),
+                    count,
+                    dtype,
+                    sys::NCCL_SUM,
+                    comm,
+                    ctx.stream(),
+                )
+            }
         };
         answered(OP, "ncclReduceScatter", code)
     }

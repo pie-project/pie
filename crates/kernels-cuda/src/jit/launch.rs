@@ -70,6 +70,10 @@ pub(crate) unsafe fn issue(
         numAttrs: n as core::ffi::c_uint,
     };
 
+    // A size-only walk (`crate::sizing`) launches nothing.
+    if crate::sizing::active() {
+        return Ok(());
+    }
     // SAFETY: `config` and the `n` attributes it points at are locals that
     // outlive the call. `function`, `stream` and `slots` are as this fn's
     // contract states; `extra` is null, so the driver takes the arguments

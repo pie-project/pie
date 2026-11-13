@@ -1429,13 +1429,62 @@ impl Shell {
         } else {
             0
         };
-        let fitted = shell.pools.fit_the_card(
+        let mut fitted = shell.pools.fit_the_card(
             bodies,
             held_for_fires.saturating_add(scratch_growth),
             false,
             !shell.bodies_stated,
             &resident,
         )?;
+        // What arming will grow the kernels' scratch slabs by, walked
+        // size-only through the compositions it arms before the range is
+        // first backed: the fit holds that, not a stretch or an arena's
+        // worth guessed for it, and the cache rows take the rest.
+        if shell.records_bodies() && shell.pools.fresh() {
+            let began = std::time::Instant::now();
+            let walked = shell.size_arming()?;
+            let walk_ms = began.elapsed().as_secs_f64() * 1000.0;
+            let margin = (walked.bytes as u64 / 50).max(SIZED_MARGIN);
+            if boot.knobs.diagnostics.arm_trace {
+                eprintln!(
+                    "[arm-trace] size-only walk ({walk_ms:.0} ms): arming grows the scratch slabs \
+                     {} MiB (held {} MiB with its margin, against {} MiB guessed): {}",
+                    walked.bytes >> 20,
+                    (walked.bytes as u64 + margin) >> 20,
+                    (scratch_growth + fitted.stretch) >> 20,
+                    walked
+                        .slabs
+                        .iter()
+                        .take(8)
+                        .map(|(name, bytes)| format!("{name}={}", bytes >> 20))
+                        .collect::<Vec<String>>()
+                        .join(" ")
+                );
+            }
+            let first = (fitted.fit, fitted.chunks, fitted.room >> 20);
+            fitted = shell.pools.fit_the_card(
+                bodies,
+                held_for_fires
+                    .saturating_add(walked.bytes as u64)
+                    .saturating_add(margin),
+                false,
+                false,
+                &resident,
+            )?;
+            if boot.knobs.diagnostics.arm_trace {
+                eprintln!(
+                    "[arm-trace] fit before arming: {} pages, {} chunks, room {} MiB guessed; \
+                     {} pages, {} chunks, room {} MiB walked (fresh {})",
+                    first.0,
+                    first.1,
+                    first.2,
+                    fitted.fit,
+                    fitted.chunks,
+                    fitted.room >> 20,
+                    shell.pools.fresh()
+                );
+            }
+        }
         // The most a profile's allowance may stretch to while arming.
         shell.bodies_ceiling = usize::try_from(fitted.bodies).unwrap_or(usize::MAX);
         // The carves laid at the activation's end, backed where the range
@@ -1466,6 +1515,11 @@ impl Shell {
         })
     }
 }
+
+/// The least the fit holds past a size-only walk's slabs: the slabs grow
+/// as the walk grew them, but arming also takes a few allocations of its
+/// own beside them (graph bodies' upload staging, events).
+const SIZED_MARGIN: u64 = 64 << 20;
 
 /// A shell whose load stopped short of arming its bodies ([`Shell::stage`]).
 pub struct Staged {
