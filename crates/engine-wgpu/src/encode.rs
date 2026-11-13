@@ -5,8 +5,8 @@ use crate::device::handles::NIL;
 use crate::device::{Context, Handles, Pipelines};
 use crate::error::Fault;
 
-static KERNEL_PROFILE: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static KERNEL_PROFILE: engine_gpu::kernel_profile::KernelProfile =
+    engine_gpu::kernel_profile::KernelProfile::new();
 
 static TIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -173,27 +173,16 @@ fn label(name: &'static str, fire: Fire, args: &[ArgValue]) -> std::borrow::Cow<
 
 #[must_use]
 pub fn kernel_profile() -> Vec<(String, u64, u64)> {
-    let mut rows: Vec<(String, u64, u64)> = KERNEL_PROFILE
-        .lock()
-        .expect("kernel profile lock poisoned")
-        .iter()
-        .map(|(name, &(ns, n))| (name.clone(), ns, n))
-        .collect();
-    rows.sort_by_key(|row| std::cmp::Reverse((row.1, row.2)));
-    rows
+    KERNEL_PROFILE.rows()
 }
 
 #[cfg(feature = "wgpu")]
 pub(crate) fn record_timing(name: &str, ns: u64) {
-    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
-    table.entry(name.to_string()).or_insert((0, 0)).0 += ns;
+    KERNEL_PROFILE.time(name, ns);
 }
 
 pub fn reset_kernel_profile() {
-    KERNEL_PROFILE
-        .lock()
-        .expect("kernel profile lock poisoned")
-        .clear();
+    KERNEL_PROFILE.clear();
     HOST_NS.store(0, std::sync::atomic::Ordering::Relaxed);
     SUBMIT_NS.store(0, std::sync::atomic::Ordering::Relaxed);
     WAIT_NS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -212,8 +201,7 @@ pub fn reset_kernel_profile() {
 
 #[cfg(feature = "wgpu")]
 fn record_kernel(name: &str) {
-    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
-    table.entry(name.to_string()).or_insert((0, 0)).1 += 1;
+    KERNEL_PROFILE.fire(name);
 }
 
 #[cfg(feature = "wgpu")]

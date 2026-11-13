@@ -6,8 +6,8 @@ use crate::device::handles::NIL;
 use crate::device::{Context, Handles, Pipelines};
 use crate::error::Fault;
 
-static KERNEL_PROFILE: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static KERNEL_PROFILE: engine_gpu::kernel_profile::KernelProfile =
+    engine_gpu::kernel_profile::KernelProfile::new();
 
 static PROFILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static HOST_ENCODE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -79,27 +79,16 @@ pub fn profiling() -> bool {
 
 #[must_use]
 pub fn kernel_profile() -> Vec<(String, u64, u64)> {
-    let mut rows: Vec<(String, u64, u64)> = KERNEL_PROFILE
-        .lock()
-        .expect("kernel profile lock poisoned")
-        .iter()
-        .map(|(name, &(ns, n))| (name.clone(), ns, n))
-        .collect();
-    rows.sort_by_key(|row| std::cmp::Reverse((row.1, row.2)));
-    rows
+    KERNEL_PROFILE.rows()
 }
 
 #[cfg(feature = "vulkan")]
 pub(crate) fn credit(name: &str, ns: u64) {
-    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
-    table.entry(name.to_string()).or_insert((0, 0)).0 += ns;
+    KERNEL_PROFILE.time(name, ns);
 }
 
 pub fn reset_kernel_profile() {
-    KERNEL_PROFILE
-        .lock()
-        .expect("kernel profile lock poisoned")
-        .clear();
+    KERNEL_PROFILE.clear();
     HOST_ENCODE_NS.store(0, std::sync::atomic::Ordering::Relaxed);
     BARRIERS.store(0, std::sync::atomic::Ordering::Relaxed);
     BETWEEN_NS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -111,8 +100,7 @@ pub fn reset_kernel_profile() {
 
 #[cfg(feature = "vulkan")]
 fn record_kernel(name: &str) {
-    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
-    table.entry(name.to_string()).or_insert((0, 0)).1 += 1;
+    KERNEL_PROFILE.fire(name);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
