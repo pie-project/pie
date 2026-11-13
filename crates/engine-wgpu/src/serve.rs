@@ -2,22 +2,10 @@
 //! land through a readback mirror into a mailbox, never by a blocking wait
 //! on the browser's thread.
 
-use engine_gpu::serve::{Launch, Plan, Serve};
+use engine_gpu::serve::{Launch, Plan, Prepared, Serve, Shell};
 
 use crate::device::{Api, Buffer, Context, Frame, Pending, Pipelines};
-use crate::error::Result;
-
-pub use engine_gpu::serve::{
-    Attached, Clips, Landed, Lane, Media, PixelSpans, READOUT_ROWS_PER_LANE, ReadSpan, rows_from,
-};
-
-pub type Shell = engine_gpu::serve::Shell<Api>;
-pub type Boot<'a> = engine_gpu::serve::Boot<'a, Api>;
-pub type Seated<'a> = engine_gpu::serve::Seated<'a, Api>;
-pub type StepView<'a> = engine_gpu::serve::StepView<'a, Api>;
-pub type Prepared<'a> = engine_gpu::serve::Prepared<'a, Api>;
-pub type Enqueued<'a> = engine_gpu::serve::Enqueued<'a, Api>;
-pub type InputCell = engine_gpu::serve::InputCell<Api>;
+use engine_gpu::error::Result;
 
 /// What the shell keeps of WebGPU's own: each arm's readback mirror, the
 /// mailbox landed steps post to, and the worker that lands them.
@@ -86,7 +74,7 @@ impl Serve for Api {
         device: &'f Context,
         frame: &'f Frame,
         pipelines: &'f Pipelines,
-        handles: &'f crate::device::Handles,
+        handles: &'f engine_gpu::Handles<Api>,
     ) -> crate::encode::Sink<'f> {
         crate::encode::Sink::new(device, frame, pipelines, handles)
     }
@@ -108,13 +96,13 @@ impl Serve for Api {
 
     fn forget(_shelf: &mut Shelf) {}
 
-    fn grown(shell: &mut Shell, arm: usize, bytes: u64) -> Result<()> {
+    fn grown(shell: &mut Shell<Api>, arm: usize, bytes: u64) -> Result<()> {
         shell.shelf.mirror[arm] =
             Buffer::with(&shell.device, bytes, crate::device::Memory::Readback)?;
         Ok(())
     }
 
-    fn plan(_shell: &mut Shell, _prepared: &mut Prepared<'_>) -> Result<Plan<Api>> {
+    fn plan(_shell: &mut Shell<Api>, _prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
         Ok(Plan::Walk {
             keep: None,
             split: false,
@@ -122,9 +110,9 @@ impl Serve for Api {
     }
 
     fn submit(
-        shell: &mut Shell,
+        shell: &mut Shell<Api>,
         mut frame: Frame,
-        prepared: &mut Prepared<'_>,
+        prepared: &mut Prepared<'_, Api>,
         launch: Launch<'_, Api>,
     ) -> Result<Pending> {
         let Launch {
@@ -174,12 +162,12 @@ impl Serve for Api {
         drop(pending);
     }
 
-    fn reap(shell: &mut Shell) -> Result<()> {
+    fn reap(shell: &mut Shell<Api>) -> Result<()> {
         collect(shell);
         Ok(())
     }
 
-    fn harvest_one(shell: &mut Shell) -> Result<()> {
+    fn harvest_one(shell: &mut Shell<Api>) -> Result<()> {
         loop {
             collect(shell);
             let Some(flight) = shell.inflight.front() else {
@@ -201,7 +189,7 @@ impl Serve for Api {
 }
 
 /// Takes every step the mailbox holds.
-fn collect(shell: &mut Shell) {
+fn collect(shell: &mut Shell<Api>) {
     let landed = std::mem::take(
         &mut shell
             .shelf

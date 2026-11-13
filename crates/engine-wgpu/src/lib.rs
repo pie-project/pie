@@ -1,62 +1,17 @@
-pub use engine_gpu::adapter;
 pub mod api;
-pub use engine_gpu::arena;
-
-pub use engine_gpu::blob;
 pub mod boot;
 pub mod chip;
-pub use engine_gpu::chunks;
-pub use engine_gpu::decoded;
 pub mod device;
 pub mod encode;
-use engine_gpu::error;
-pub mod experts;
-
 pub mod guest;
-pub mod inputs;
 mod landing;
-pub use engine_gpu::mask;
-pub use engine_gpu::probe;
 pub mod program;
-pub use engine_gpu::rs;
-pub mod run;
-
-mod scratch;
 pub mod serve;
-pub use engine_gpu::settle;
-pub mod store;
 pub mod tuning;
-pub use engine_gpu::weight_store;
-pub mod weights;
-pub use engine_gpu::window;
 
-pub use adapter::{
-    Binding as AdapterBinding, Key as AdapterKey, Role as AdapterRole, Site,
-    Source as AdapterSource,
-};
-pub use api::{ContractFor, DeviceBoot, Wgpu};
-pub use arena::Arena;
-pub use blob::{Layout as AdapterLayout, Manifest as AdapterManifest, Stamp as AdapterStamp};
 pub use boot::open;
 #[cfg(feature = "wgpu")]
 pub use boot::{open_with_device, request_device};
-pub use device::{Buffer, Context, Handed, Handles, Pipelines};
-pub use encode::{
-    Sink, host_copies, host_encode_ns, host_io, host_read_phases, host_submit_ns, host_wait_calls,
-    kernel_profile, profile_shapes, profile_timing, reset_kernel_profile,
-};
-pub use error::{Fault, Result, kernel};
-pub use inputs::Inputs;
-pub use run::{
-    CacheGeometry, CachePool, CacheTable, FireBindings, FireTables, PoolSlabs, Run, SlotTable,
-    StructSlot, WeightRow, WeightTable,
-};
-pub use scratch::Scratch;
-pub use serve::{Attached, Boot, Enqueued, Landed, Lane, Prepared, Seated, Shell, StepView};
-pub use settle::{Airborne, Arms, Done};
-pub use store::Pools;
-pub use weights::{AdapterPlane, BankSeat, Weights};
-pub use window::{Copies, Gathered, GatheredTable, Window, Windows};
 
 /// The fusions this backend implements: none, so the compiler forms no
 /// fused op here.

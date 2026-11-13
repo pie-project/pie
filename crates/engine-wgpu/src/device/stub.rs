@@ -1,5 +1,5 @@
 use crate::api::DeviceBoot;
-use crate::error::{Fault, Result};
+use engine_gpu::error::{Fault, Result};
 
 #[must_use]
 pub fn reservations() -> u64 {

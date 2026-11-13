@@ -11,7 +11,7 @@ use eta_exec::{PassInputs, StepOutcome};
 use eta_ir::registry::Stage;
 use eta_ir::registry::{GeometryClass, Port};
 
-pub use engine_gpu::program::Refusal;
+use engine_gpu::program::Refusal;
 use engine_gpu::program::{decode, numel_of};
 
 struct Instance {
@@ -44,7 +44,7 @@ pub(crate) struct Tally {
     device: AtomicU64,
 }
 
-pub use crate::serve::InputCell;
+use engine_gpu::serve::InputCell;
 
 #[cfg(feature = "wgpu")]
 pub(crate) struct Half {
@@ -194,7 +194,7 @@ impl Guests {
     pub(crate) fn jobs(
         self,
         seat: &crate::device::Buffer,
-        layout: &[crate::serve::ReadSpan],
+        layout: &[engine_gpu::serve::ReadSpan],
         pixels: Option<&crate::landing::Pixels>,
     ) -> Vec<Job> {
         let Guests {
@@ -213,7 +213,7 @@ impl Guests {
                      half,
                      held,
                  }| {
-                    let spans: Vec<Vec<crate::serve::ReadSpan>> = (lane..lane + lanes as u32)
+                    let spans: Vec<Vec<engine_gpu::serve::ReadSpan>> = (lane..lane + lanes as u32)
                         .map(|lane| {
                             (layout.iter())
                                 .filter(|span| span.lane == lane && span.rows > 0)
@@ -286,7 +286,7 @@ impl Guests {
 pub struct Plane {
     programs: BTreeMap<ProgramId, Arc<ExecPlan>>,
 
-    forms: crate::guest::Forms,
+    forms: engine_gpu::guest::Forms<crate::device::Api>,
 
     channels: BTreeMap<ChannelId, Arc<ChannelState>>,
     instances: BTreeMap<InstanceId, Instance>,
@@ -543,7 +543,11 @@ impl Plane {
     }
 
     /// The oldest cell guest input channel `id` of `instance` holds, in wire bytes.
-    pub fn input_cell(&self, instance: InstanceId, id: ChannelId) -> Result<InputCell, Refusal> {
+    pub fn input_cell(
+        &self,
+        instance: InstanceId,
+        id: ChannelId,
+    ) -> Result<InputCell<crate::device::Api>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
             id: instance.0,
@@ -1093,7 +1097,11 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         Plane::close_instance(self, id)
     }
 
-    fn input_cell(&self, instance: InstanceId, id: ChannelId) -> Result<InputCell, Refusal> {
+    fn input_cell(
+        &self,
+        instance: InstanceId,
+        id: ChannelId,
+    ) -> Result<InputCell<crate::device::Api>, Refusal> {
         Plane::input_cell(self, instance, id)
     }
 

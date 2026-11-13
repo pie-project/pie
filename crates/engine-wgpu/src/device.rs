@@ -46,12 +46,3 @@ pub use stub::{
 pub struct Api;
 
 mod gpu;
-
-pub type Handles = engine_gpu::Handles<Api>;
-pub type Binding = engine_gpu::Binding<Api>;
-pub use engine_gpu::NIL;
-
-pub mod handles {
-    pub use super::{Binding, Handles};
-    pub use engine_gpu::NIL;
-}

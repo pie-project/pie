@@ -1,9 +1,9 @@
 use std::sync::{Arc, Mutex};
 
 use crate::device::{Buffer, OnDone};
-use crate::error::Fault;
-use crate::serve::ReadSpan;
-use crate::settle::{Airborne, Done};
+use engine_gpu::error::Fault;
+use engine_gpu::serve::ReadSpan;
+use engine_gpu::settle::{Airborne, Done};
 
 #[cfg(feature = "wgpu")]
 pub type Guests = crate::program::Guests;
@@ -53,7 +53,7 @@ fn read_seat(
         .max()
         .unwrap_or(0);
     seat.read_async(0, end, move |raw| {
-        on_read(raw.map(|raw| crate::serve::rows_from(&raw, &layout)));
+        on_read(raw.map(|raw| engine_gpu::serve::rows_from(&raw, &layout)));
     });
 }
 
@@ -162,7 +162,10 @@ struct WorkerState {
 
 impl Worker {
     #[cfg(feature = "wgpu")]
-    fn run_all(&self, mut jobs: Vec<crate::program::Job>) -> Result<(), crate::program::Refusal> {
+    fn run_all(
+        &self,
+        mut jobs: Vec<crate::program::Job>,
+    ) -> Result<(), engine_gpu::program::Refusal> {
         if jobs.len() == 1 {
             return jobs.pop().expect("one job")();
         }

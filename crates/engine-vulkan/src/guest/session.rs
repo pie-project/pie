@@ -8,7 +8,7 @@ use eta_exec::{Extents, OpParams, ValueDesc, describe, layout};
 use crate::device::Context;
 use crate::device::alloc::{Buffer, Memory};
 use crate::device::ctx::{Core, Frame, Pending};
-use crate::error::{Fault, Result};
+use engine_gpu::error::{Fault, Result};
 
 use engine_gpu::guest::session::{
     BINDINGS, Cfg, DESC_WORDS, alias_reshapes, desc_words, groups_for, words_le,
@@ -43,7 +43,7 @@ impl Drop for Built {
 /// Built stages by the hash of their SPIR-V and entry points.
 pub type BuiltStages = std::collections::HashMap<u64, Arc<Built>>;
 
-fn stage_key(lowered: &crate::guest::Lowered) -> u64 {
+fn stage_key(lowered: &engine_gpu::guest::Lowered<Vec<u32>>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     lowered.code.hash(&mut hasher);
@@ -113,7 +113,7 @@ impl Session {
     pub fn new(
         device: &Context,
         plans: &[LaunchStagePlan],
-        code: &[crate::guest::Lowered],
+        code: &[engine_gpu::guest::Lowered<Vec<u32>>],
         extents: &Extents,
         built: &mut BuiltStages,
         kept: Kept,
@@ -558,7 +558,7 @@ impl Drop for Session {
 fn build_stage(
     device: &Context,
     plan: &LaunchStagePlan,
-    lowered: &crate::guest::Lowered,
+    lowered: &engine_gpu::guest::Lowered<Vec<u32>>,
     extents: &Extents,
     built: Arc<Built>,
 ) -> Result<Stage> {
@@ -642,7 +642,10 @@ fn build_stage(
     })
 }
 
-fn build_pipelines(device: &Context, lowered: &crate::guest::Lowered) -> Result<Built> {
+fn build_pipelines(
+    device: &Context,
+    lowered: &engine_gpu::guest::Lowered<Vec<u32>>,
+) -> Result<Built> {
     let core = device.core();
     // The layout the stage's SPIR-V was checked against when it lowered.
     let bindings: Vec<vk::DescriptorSetLayoutBinding> = crate::guest::stage_layout()

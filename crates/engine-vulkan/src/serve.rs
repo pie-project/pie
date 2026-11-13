@@ -3,23 +3,11 @@
 
 use std::collections::BTreeMap;
 
-use engine_gpu::serve::{Launch, Plan, Serve};
+use engine_gpu::serve::{Landed, Launch, Plan, Prepared, ReadSpan, Serve, Shell, rows_from};
 use poem_ir::Dtype;
 
 use crate::device::{Api, Buffer, Context, Frame, Pending, Pipelines};
-use crate::error::{Fault, Result};
-
-pub use engine_gpu::serve::{
-    Attached, Clips, Landed, Lane, Media, PixelSpans, READOUT_ROWS_PER_LANE, ReadSpan, rows_from,
-};
-
-pub type Shell = engine_gpu::serve::Shell<Api>;
-pub type Boot<'a> = engine_gpu::serve::Boot<'a, Api>;
-pub type Seated<'a> = engine_gpu::serve::Seated<'a, Api>;
-pub type StepView<'a> = engine_gpu::serve::StepView<'a, Api>;
-pub type Prepared<'a> = engine_gpu::serve::Prepared<'a, Api>;
-pub type Enqueued<'a> = engine_gpu::serve::Enqueued<'a, Api>;
-pub type InputCell = engine_gpu::serve::InputCell<Api>;
+use engine_gpu::error::{Fault, Result};
 
 /// What the shell keeps of Vulkan's own: the frames kept to replay, and
 /// what each harvested step read out, for readers behind it on the queue.
@@ -105,7 +93,7 @@ impl Serve for Api {
         device: &'f Context,
         frame: &'f Frame,
         pipelines: &'f Pipelines,
-        handles: &'f crate::device::Handles,
+        handles: &'f engine_gpu::Handles<Api>,
     ) -> crate::encode::Sink<'f> {
         crate::encode::Sink::new(device, frame, pipelines, handles)
     }
@@ -143,11 +131,11 @@ impl Serve for Api {
         shelf.recorder.forget();
     }
 
-    fn grown(_shell: &mut Shell, _arm: usize, _bytes: u64) -> Result<()> {
+    fn grown(_shell: &mut Shell<Api>, _arm: usize, _bytes: u64) -> Result<()> {
         Ok(())
     }
 
-    fn plan(shell: &mut Shell, prepared: &mut Prepared<'_>) -> Result<Plan<Api>> {
+    fn plan(shell: &mut Shell<Api>, prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
         // The custom-mask buffer grows: a recording would keep the one it outgrew.
         // A fire landing snapshots binds a table of its own: not recorded.
         let key = (shell.shelf.recorder.records()
@@ -241,9 +229,9 @@ impl Serve for Api {
     }
 
     fn submit(
-        shell: &mut Shell,
+        shell: &mut Shell<Api>,
         frame: Frame,
-        _prepared: &mut Prepared<'_>,
+        _prepared: &mut Prepared<'_, Api>,
         launch: Launch<'_, Api>,
     ) -> Result<Pending> {
         let Launch {
@@ -296,7 +284,7 @@ impl Serve for Api {
         }
     }
 
-    fn reap(shell: &mut Shell) -> Result<()> {
+    fn reap(shell: &mut Shell<Api>) -> Result<()> {
         while shell
             .inflight
             .front()
@@ -307,7 +295,7 @@ impl Serve for Api {
         Ok(())
     }
 
-    fn harvest_one(shell: &mut Shell) -> Result<()> {
+    fn harvest_one(shell: &mut Shell<Api>) -> Result<()> {
         let Some(flight) = shell.inflight.pop_front() else {
             return Ok(());
         };
@@ -349,7 +337,7 @@ impl Serve for Api {
     }
 }
 
-fn record_key(shell: &Shell, p: &Prepared<'_>) -> crate::record::Key {
+fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
     let mut key = crate::record::KeyBuilder::new();
     key.bytes(&p.descriptor.pack());
     key.shown(&p.arm);
@@ -387,7 +375,7 @@ pub trait Seats {
     fn leave_unread(&mut self, landed: &Landed);
 }
 
-impl Seats for Shell {
+impl Seats for Shell<Api> {
     fn readout_seats(&self, landed: &Landed, lane: u32) -> Option<Vec<ReadSeat<'_>>> {
         let (arm, rows) = match self.shelf.landed_seats.get(&landed.seq) {
             Some(seat) if seat.generation == self.shelf.generation => (seat.arm, &seat.rows),

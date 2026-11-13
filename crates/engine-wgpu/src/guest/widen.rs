@@ -5,7 +5,7 @@ use crate::device::alloc::Buffer;
 use crate::device::ctx::{Core, Frame};
 use engine_gpu::guest::widen::{Cfg, UNIFORM_SOURCE, WG, config_bytes};
 
-use crate::error::{Fault, Result};
+use engine_gpu::error::{Fault, Result};
 
 pub struct Widen {
     core: Arc<Core>,

@@ -5,12 +5,17 @@
 
 /// What the suite takes from this backend.
 mod backend {
+    pub use engine_gpu::serve::{Clips, Lane};
     pub use engine_wgpu::api::DeviceBoot;
-    pub use engine_wgpu::serve::{Clips, Seated};
-    pub use engine_wgpu::{Boot, Buffer, Context, Handles, Lane, Pipelines, Shell, Sink};
+    pub use engine_wgpu::device::{Api, Buffer, Context, Pipelines};
+    pub use engine_wgpu::encode::Sink;
 
+    pub type Handles = engine_gpu::Handles<Api>;
+    pub type Shell = engine_gpu::serve::Shell<Api>;
+    pub type Boot<'a> = engine_gpu::serve::Boot<'a, Api>;
+    pub type Seated<'a> = engine_gpu::serve::Seated<'a, Api>;
     /// The backend's engine.
-    pub type Engine = engine_wgpu::Wgpu;
+    pub type Engine = engine_gpu::api::Gpu<Api>;
 
     pub const NAME: &str = "wgpu";
     pub const PLATFORM: poem::Platform = poem::Platform::Wgpu;

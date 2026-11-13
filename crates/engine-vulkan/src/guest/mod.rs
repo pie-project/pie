@@ -1,11 +1,7 @@
 //! The shared guest forms ([`engine_gpu::guest`]) bound to Vulkan: a
 //! stage's WGSL lowers to SPIR-V.
 
-pub use engine_gpu::guest::{ENTRY, Refused, step_source};
-
-pub type Compiled = engine_gpu::guest::Compiled<crate::device::Api>;
-pub type Lowered = engine_gpu::guest::Lowered<Vec<u32>>;
-pub type Forms = engine_gpu::guest::Forms<crate::device::Api>;
+use engine_gpu::guest::Refused;
 
 impl engine_gpu::guest::Lower for crate::device::Api {
     type Code = Vec<u32>;

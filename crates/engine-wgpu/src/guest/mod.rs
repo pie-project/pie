@@ -2,11 +2,7 @@
 //! stage's WGSL is what the pipeline takes, its constant infinities read
 //! from private cells.
 
-pub use engine_gpu::guest::{ENTRY, Refused, step_source};
-
-pub type Compiled = engine_gpu::guest::Compiled<crate::device::Api>;
-pub type Lowered = engine_gpu::guest::Lowered<String>;
-pub type Forms = engine_gpu::guest::Forms<crate::device::Api>;
+use engine_gpu::guest::Refused;
 
 impl engine_gpu::guest::Lower for crate::device::Api {
     type Code = String;

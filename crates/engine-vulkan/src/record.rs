@@ -8,19 +8,19 @@ pub(crate) struct Recording {
 
     used: std::cell::Cell<u64>,
 
-    pub(crate) layout: Vec<crate::serve::ReadSpan>,
+    pub(crate) layout: Vec<engine_gpu::serve::ReadSpan>,
     pub(crate) launches: u32,
 
     /// The host step after each segment but the last, in order.
-    pub(crate) cuts: Vec<crate::store::experts::Cut>,
+    pub(crate) cuts: Vec<engine_gpu::store::experts::Cut<crate::device::Api>>,
 }
 
 impl Recording {
     pub(crate) fn new(
         kept: Kept,
-        layout: Vec<crate::serve::ReadSpan>,
+        layout: Vec<engine_gpu::serve::ReadSpan>,
         launches: u32,
-        cuts: Vec<crate::store::experts::Cut>,
+        cuts: Vec<engine_gpu::store::experts::Cut<crate::device::Api>>,
     ) -> Recording {
         Recording {
             kept,

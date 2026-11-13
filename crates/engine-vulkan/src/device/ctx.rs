@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use ash::vk;
 
 use crate::api::DeviceBoot;
-use crate::error::{Fault, Result};
+use engine_gpu::error::{Fault, Result};
 
 use super::alloc::{Buffer, Memory, Raw, Slab};
 

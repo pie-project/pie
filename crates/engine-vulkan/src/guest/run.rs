@@ -7,7 +7,7 @@ use super::widen::Widen;
 use crate::device::Context;
 use crate::device::alloc::Buffer;
 use crate::device::ctx::Frame;
-use crate::error::{Fault, Result};
+use engine_gpu::error::{Fault, Result};
 
 pub use engine_gpu::guest::run::{from_heap, local_of, root_bytes, to_heap};
 

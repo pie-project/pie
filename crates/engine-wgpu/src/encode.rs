@@ -1,9 +1,9 @@
+use engine_gpu::{Handles, NIL};
 use kernels_slang::{ArgValue, Encode, Error, Fire, Target};
 
 use crate::device::ctx::Frame;
-use crate::device::handles::NIL;
-use crate::device::{Context, Handles, Pipelines};
-use crate::error::Fault;
+use crate::device::{Api, Context, Pipelines};
+use engine_gpu::error::Fault;
 
 static KERNEL_PROFILE: engine_gpu::kernel_profile::KernelProfile =
     engine_gpu::kernel_profile::KernelProfile::new();
@@ -209,7 +209,7 @@ pub struct Sink<'a> {
     device: &'a Context,
     frame: &'a Frame,
     pipelines: &'a Pipelines,
-    handles: &'a Handles,
+    handles: &'a Handles<Api>,
     outer: engine_gpu::probe::Recording,
 }
 
@@ -227,7 +227,7 @@ impl<'a> Sink<'a> {
         device: &'a Context,
         frame: &'a Frame,
         pipelines: &'a Pipelines,
-        handles: &'a Handles,
+        handles: &'a Handles<Api>,
     ) -> Sink<'a> {
         let outer = engine_gpu::probe::set_frame(frame);
         Sink {
@@ -561,7 +561,7 @@ pub struct Sink<'a> {
     _device: &'a Context,
     _frame: &'a Frame,
     _pipelines: &'a Pipelines,
-    _handles: &'a Handles,
+    _handles: &'a Handles<Api>,
 }
 
 #[cfg(not(feature = "wgpu"))]
@@ -571,7 +571,7 @@ impl<'a> Sink<'a> {
         device: &'a Context,
         frame: &'a Frame,
         pipelines: &'a Pipelines,
-        handles: &'a Handles,
+        handles: &'a Handles<Api>,
     ) -> Sink<'a> {
         Sink {
             _device: device,
