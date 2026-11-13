@@ -27,6 +27,9 @@ struct Record {
     armed: AtomicU32,
     /// Bytes the driver allocated beside the engine's span since load.
     outside: AtomicU64,
+    /// Bytes the engine holds outside the pool's cache rows for fires and
+    /// bodies (arming's scratch among them), lowered after the last step.
+    held: AtomicU64,
 }
 
 impl Live {
@@ -48,6 +51,7 @@ impl Live {
         Live(Arc::new(Record {
             armed: AtomicU32::new(armed),
             outside: AtomicU64::new(0),
+            held: AtomicU64::new(0),
         }))
     }
 
@@ -73,6 +77,19 @@ impl Live {
     #[must_use]
     pub fn outside(&self) -> u64 {
         self.0.outside.load(Ordering::Acquire)
+    }
+
+    /// The engine holds `bytes` outside the pool's cache rows for its fires
+    /// and bodies now; the runtime's pool takes no more than what is left
+    /// beside it and [`Live::outside`].
+    pub fn set_held(&self, bytes: u64) {
+        self.0.held.store(bytes, Ordering::Release);
+    }
+
+    /// What the engine holds outside the cache rows, as last stated.
+    #[must_use]
+    pub fn held(&self) -> u64 {
+        self.0.held.load(Ordering::Acquire)
     }
 }
 
@@ -120,5 +137,7 @@ mod tests {
         assert_eq!(Live::armed().armed_through(), u32::MAX);
         live.set_outside(845 << 20);
         assert_eq!(read.outside(), 845 << 20);
+        live.set_held(64 << 20);
+        assert_eq!(read.held(), 64 << 20);
     }
 }
