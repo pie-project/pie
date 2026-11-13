@@ -44,6 +44,20 @@ pub(super) struct View {
     pub order: Option<Order>,
 }
 
+/// Where a bank view's experts lie: expert `e`'s `[n, k]` bf16 weights at
+/// pool row `table[e] + offset`, as `k / 128` column panels of `n / 2` pool
+/// rows each (`crate::linear::moe_gmm::Pooled`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BankAt {
+    pub pool: Val,
+    /// i32 `[experts]`: each expert's pool row.
+    pub table: Val,
+    pub offset: i64,
+    pub experts: i64,
+    pub n: i64,
+    pub k: i64,
+}
+
 /// A permuted row order of a view's pool rows: in each block of `tokens ·
 /// rpt` pool rows (`tokens` view rows of `rpt` pool rows each, a kv page),
 /// the pool row `j · tokens + t` holds part `j` of view row `t` (row-pair
@@ -157,6 +171,85 @@ impl Func {
         let v = self.fresh(format!("%view{id}"), ty);
         self.views.insert(v.0, View { pool, elem, order });
         Ok(v)
+    }
+
+    /// A bf16 bank `[experts·n, k]` whose experts lie in `pool` where
+    /// `table` puts them ([`BankAt`]): a value with no text. The grouped
+    /// matmul reads it in place ([`Func::bank_parts`]); an expert's slice
+    /// reads that expert's rows ([`Func::bank_expert`]); anything else
+    /// materializes it ([`Func::bank_solid`], logged).
+    pub fn bank_view(&mut self, at: BankAt) -> Built<Val> {
+        let pool = match self.views.get(&at.pool.0) {
+            Some(v) => v.pool,
+            None => at.pool,
+        };
+        let pt = self.ty(pool).clone();
+        if pt.elem != Elem::U32 || pt.rank() != 2 || pt.dims[1] != LANES {
+            return malformed("bank_view", format!("a bank in {pt}"));
+        }
+        if at.k % LANES != 0 || at.n % 16 != 0 || self.dims(at.table) != [at.experts] {
+            return malformed("bank_view", format!("{at:?}"));
+        }
+        let id = self.next;
+        self.next += 1;
+        let v = self.fresh(
+            format!("%bank{id}"),
+            Ty::new(Elem::Bf16, &[at.experts * at.n, at.k]),
+        );
+        self.banks.insert(v.0, BankAt { pool, ..at });
+        Ok(v)
+    }
+
+    /// Where a bank view's experts lie (`None`: not a bank view).
+    #[must_use]
+    pub fn bank_parts(&self, v: Val) -> Option<BankAt> {
+        self.banks.get(&v.0).copied()
+    }
+
+    /// Expert `e`'s (i32 scalar) `[n, k]` weights of a bank view, read from
+    /// its panels.
+    pub fn bank_expert(&mut self, v: Val, e: Val) -> Built<Val> {
+        let Some(at) = self.bank_parts(v) else {
+            return malformed("bank_expert", "not a bank view".to_string());
+        };
+        let e0 = self.reshape(e, &[])?;
+        let row = self.dynamic_slice(at.table, &[e0], &[1])?;
+        let row = self.reshape(row, &[])?;
+        let off = self.const_i(Elem::I32, at.offset, &[]);
+        let row = self.add(row, off)?;
+        let half = at.n / 2;
+        let zero = self.const_i(Elem::I32, 0, &[]);
+        let mut panels = Vec::with_capacity((at.k / LANES) as usize);
+        for j in 0..at.k / LANES {
+            let step = self.const_i(Elem::I32, j * half, &[]);
+            let r = self.add(row, step)?;
+            let rows = self.dynamic_slice(at.pool, &[r, zero], &[half, LANES])?;
+            let x = self.unpack(rows, Elem::Bf16)?;
+            panels.push(self.reshape(x, &[at.n, LANES])?);
+        }
+        if panels.len() == 1 {
+            return Ok(panels[0]);
+        }
+        self.concat(&panels, 1)
+    }
+
+    /// A bank view as a value: every expert read (a copy of the bank,
+    /// logged in [`Func::materialized`]).
+    pub fn bank_solid(&mut self, v: Val, why: &str) -> Built<Val> {
+        let Some(at) = self.bank_parts(v) else {
+            return Ok(v);
+        };
+        self.materialized
+            .push(format!("{why}: bank [{}, {}]", at.experts * at.n, at.k));
+        let mut experts = Vec::with_capacity(at.experts as usize);
+        for e in 0..at.experts {
+            let ev = self.const_i(Elem::I32, e, &[]);
+            experts.push(self.bank_expert(v, ev)?);
+        }
+        if experts.len() == 1 {
+            return Ok(experts[0]);
+        }
+        self.concat(&experts, 0)
     }
 
     /// A view's row order (`None`: the packed rows order, or not a view).

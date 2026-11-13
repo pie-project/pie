@@ -955,8 +955,14 @@ fn read_bank(f: &mut Func, form: Form, fan: Fan) -> Result<Read, Error> {
     Ok(match form {
         Form::Dense(bank) => {
             let w = bank.val;
+            // A bank view is `[rows, k]` already (and has no text to reshape).
+            let w = if f.bank_parts(w).is_some() && f.dims(w) == [rows, fan.k] {
+                w
+            } else {
+                f.reshape(w, &[rows, fan.k])?
+            };
             Read {
-                codes: Codes::Weights(f.reshape(w, &[rows, fan.k])?),
+                codes: Codes::Weights(w),
                 factor: None,
                 bias: None,
             }
@@ -1154,6 +1160,7 @@ fn gmm_spec(
         sums: None,
         run: 1,
         glu: None,
+        pooled: None,
     };
     spec.out_width().ok().map(|_| spec)
 }
@@ -1204,6 +1211,7 @@ pub(crate) fn tile_projection(
         sums,
         run: 1,
         glu: None,
+        pooled: None,
     };
     if spec.out_width().ok() != Some(n) {
         return Ok(None);
@@ -1866,12 +1874,62 @@ fn tiles_of(
     let kernel = spec.kernel()?;
     if spec.stepping() {
         let st = steps(f, spec, sorted)?;
-        return Ok(kernel.call(f, &[st[0], st[1], st[2], st[3], st[4], st[5], xs, w])?[0]);
+        let args = pooled_args(
+            f,
+            spec,
+            w,
+            vec![st[0], st[1], st[2], st[3], st[4], st[5]],
+            vec![xs, w],
+        )?;
+        return Ok(kernel.call(f, &args)?[0]);
     }
     if spec.prefetching() {
-        return Ok(kernel.call(f, &[sorted.se, sorted.nt, sorted.run, sorted.nxt, xs, w])?[0]);
+        let pre = vec![sorted.se, sorted.nt, sorted.run, sorted.nxt];
+        let args = pooled_args(f, spec, w, pre, vec![xs, w])?;
+        return Ok(kernel.call(f, &args)?[0]);
     }
     Ok(kernel.call(f, &[sorted.se, sorted.nt, xs, w])?[0])
+}
+
+/// A pooled kernel's operands: the bank's table after the scalar-prefetched
+/// ones, and the pool in the bank's place.
+fn pooled_args(
+    f: &mut Func,
+    spec: crate::linear::moe_gmm::Gmm,
+    bank: Val,
+    mut pre: Vec<Val>,
+    ins: Vec<Val>,
+) -> Result<Vec<Val>, Error> {
+    let Some(at) = f.bank_parts(bank).filter(|_| spec.pooled.is_some()) else {
+        pre.extend(ins);
+        return Ok(pre);
+    };
+    pre.push(at.table);
+    pre.extend(ins.into_iter().map(|v| if v == bank { at.pool } else { v }));
+    Ok(pre)
+}
+
+/// `spec` reading a bank view in place, where its kernel takes a pooled
+/// bank (one expert fetched whole, a run at a time); `None` where it does
+/// not (the bank's experts are then sliced or the bank read whole).
+fn pooled_spec(
+    f: &Func,
+    spec: Option<crate::linear::moe_gmm::Gmm>,
+    bank: &Read,
+) -> Option<crate::linear::moe_gmm::Gmm> {
+    let Some(at) = f.bank_parts(bank.codes.val()) else {
+        return spec;
+    };
+    let rows = f.dims(at.pool)[0];
+    let spec = crate::linear::moe_gmm::Gmm {
+        pooled: Some(crate::linear::moe_gmm::Pooled {
+            rows,
+            offset: at.offset,
+        }),
+        run: 1,
+        ..spec?
+    };
+    (spec.prefetching() && spec.kernel().is_ok()).then_some(spec)
 }
 
 /// The routed matmul every select entry lowers to: `y[t*k + s] = W[routes[t,
@@ -1925,7 +1983,15 @@ fn routed(
     // A forced `gmm` falls back to `all` for a bank the kernel does not read.
     let mxfp4 = matches!(form, Form::Mxfp4 { .. });
     let grouped = gmm_spec(fan, &bank, f.elem(bank.codes.val()), mxfp4, tuning);
+    // A bank view (experts in the pool): the kernel reads it in place, or
+    // each pair's expert is sliced out of it; any other path reads it whole.
+    let viewed = f.bank_parts(bank.codes.val()).is_some();
+    let grouped = pooled_spec(f, grouped, &bank);
     let path = match tuning.moe_path {
+        _ if viewed && grouped.is_some() && !(p <= c.slice_pairs && fan.tokens == 1) => {
+            MoePath::Gmm
+        }
+        _ if viewed && grouped.is_none() && p <= c.slice_pairs => MoePath::Slice,
         MoePath::Gmm if grouped.is_none() => MoePath::All,
         // One token's pairs route to as many experts: sliced out, they read
         // what the grouped matmul would, without its sort (v6e,
@@ -1948,6 +2014,15 @@ fn routed(
         MoePath::Auto { .. } if worth >= p => MoePath::Loop,
         MoePath::Auto { .. } => MoePath::Active,
         forced => forced,
+    };
+    let bank = if viewed && !matches!(path, MoePath::Gmm | MoePath::Slice) {
+        let w = f.bank_solid(bank.codes.val(), "a routed select off the kernel")?;
+        Read {
+            codes: bank.codes.with(w),
+            ..bank
+        }
+    } else {
+        bank
     };
     let y = match path {
         MoePath::Slice => {
@@ -2072,6 +2147,14 @@ fn routed(
 
 /// Expert `e`'s (an i32 scalar) rows of a read bank: `[N, ..]` of each plane.
 fn expert(f: &mut Func, bank: &Read, e: Val, n: i64) -> Result<Read, Error> {
+    if f.bank_parts(bank.codes.val()).is_some() {
+        let w = f.bank_expert(bank.codes.val(), e)?;
+        return Ok(Read {
+            codes: bank.codes.with(w),
+            factor: None,
+            bias: None,
+        });
+    }
     let nn = f.const_i(Elem::I32, n, &[]);
     let at = f.mul(e, nn)?;
     let zero = f.const_i(Elem::I32, 0, &[]);
@@ -2456,6 +2539,11 @@ pub fn experts(
     }
     let up_bank = read_bank(f, Form::Dense(gate_up), up_fan)?;
     let down_bank = read_bank(f, Form::Dense(down), down_fan)?;
+    // Banks in the pool run as two selects (`pooled_spec`).
+    if f.bank_parts(up_bank.codes.val()).is_some() || f.bank_parts(down_bank.codes.val()).is_some()
+    {
+        return Ok(None);
+    }
     let elem = |f: &mut Func, b: &Read| f.elem(b.codes.val());
     let (ue, de) = (elem(f, &up_bank), elem(f, &down_bank));
     let (Some(up), Some(dn)) = (
