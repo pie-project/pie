@@ -104,8 +104,8 @@ const timestamp = @import_module("<time>");
 const NTD: u16 = if (MIXK == 2) 1 + 6 * K else if (MIXK == 3) 1 + 4 * K else 1 + 9 * K;
 var tdbg = @zeros([if (TSTAMP == 1) NTD else 1]u32);   // TSC stamps of the last pass, by phase (host-read, diagnostics)
 var tdbg_ptr: [*]u32 = &tdbg;
-var tsc = @zeros([3]u16);
-fn stamp(i: u16) void { if (TSTAMP == 0) { return; } timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
+const tcfg = @import_module("<tile_config>");   // a stamp: the TSC's two low words into tdbg[i]'s halves (no third word, no shift and or: each site inlines)
+fn stamp(i: u16) void { if (TSTAMP == 0) { return; } const a = @get_int(tcfg.addresses.TIMESTAMP_COUNTER) / tcfg.word_size; const h = @ptrcast([*]u16, &tdbg[i]); h[0] = @get_config(a); h[1] = @get_config(a + 1); }
 fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
 fn isk(l: u16) bool { return ((KM >> l) & 1) == 1; }
 
