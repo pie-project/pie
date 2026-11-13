@@ -1444,3 +1444,7 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   Open: FP8 prefill 2048 121.6 vs main 91.4 ms (fit now serves 1024 rows x 128 lanes).
 - `sc/oversub-3` (62d689db5): Held::park gives the state set's owner hold back like the kv set (handles holding a
   hybrid's state kept a finished process's pages counted as returning -> no eviction ever planned). t_evict 4/4.
+- M116 follow-up (`sc/engine-gpu-2`, 6 commits, -10.3k lines): every Vulkan / wgpu integration test body lives once in
+  crates/engine-gpu/suite/ (thin per-backend main.rs); identical KernelProfile / program decode / tuning defaults
+  into engine-gpu; alias modules removed (public: open, chip, tune, api, device, encode, guest, program, serve,
+  FUSIONS); kernel-lint paths fixed. engine_vulkan 65/0/1, engine_wgpu 65/0/1; seats dumps byte-identical.
