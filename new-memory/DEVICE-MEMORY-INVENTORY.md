@@ -143,6 +143,14 @@ Metal, M1 Max 32 GB (Mac session, 2026-11-13; code read, measurement to follow).
 - Corrected: guest batches are replaced when they grow; the leak is that removing a program never removes its batches (`batches` is keyed by program id and never retained). The sparse buffers are Private, the 16 MiB placement heaps under them Shared.
 - Added: `held_elsewhere()` is always 0 where sparse exists, so the Metal budget has no measured term at all; the pool is capped at `maxBufferLength / chunk`; Metal has the "half the remainder" rule too (voxel and frame-slot fit); the arena never unmaps, so lowering a rung frees nothing today; ANE surfaces and staging are allocated before the second fit and priced by neither pass.
 
+Metal, measured (Mac session, 2026-11-13; memory-redesign 0b5b42a7f, release, Qwen3-0.6B bf16, a temporary probe of `MTLDevice.currentAllocatedSize`):
+- After load the device holds 1,684 MB: weights 1,218 MB, one pool segment 67 MB, inputs + readout for two arms 398 MB, arena 0 mapped, residual 1.0 MB. The owners explain it to 0.06%.
+- Accounting priced weights 1.22 GB + arena 2.89 GB + kv 19.88 GB + floor 0.13 GB = 24.12 GB of a 26.80 GB working set. The 398 MB of inputs + readout is priced nowhere and is three times the 128 MiB floor that is supposed to cover it, on a 0.6B model.
+- Mapped bytes are a small part of what is reserved: 106 MB of the 2.89 GB arena, 200 MB of the 19.88 GB pool after 256 fires. The arena stayed at its first, widest carve (106 MB) when later fires carved 88.8 MB: it never shrinks.
+- After the first fires about 26 MiB is held by owners the probe did not name (pipelines, argument tables, group masks, guest tables); flat through fire 128.
+- The driver's own IOAccelerator total is about 225 MiB above `currentAllocatedSize`: `outside`, visible only in the process footprint.
+- For the ledger check on Metal: assert against `currentAllocatedSize` at load; count chunks handed out and `fire(rung)`, never reserved virtual size.
+
 ## 7. Not traced
 
 The compiler side that sets chunk and segment sizes and the arena map; runtime-crate callers of commit / release; device bytes of compiled objects on every backend; whether kernel modules are ever unloaded; XLA executable temporaries; Cerebras non-dense families; adapter bank placement on CUDA and ROCm; where compressor side planes live on CUDA, ROCm and Metal.
