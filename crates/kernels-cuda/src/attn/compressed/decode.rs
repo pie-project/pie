@@ -222,10 +222,14 @@ fn ranks(ctx: &Ctx, rows: u32) -> u32 {
 fn smem(rows: Option<(Rows, Rows)>) -> u32 {
     let ld = HEAD_DIM + 8;
     let tile = KEYS * ld * 2;
-    // Tiles in flight: six of quantized rows (five below sm_90, as
-    // `attn/compressed/decode.cu` lays them) and the one they widen into, four of
-    // bf16. A raw key holds the wider format's data and scales.
-    let stages = if crate::jit::compute_capability_major().is_some_and(|major| major < 9) {
+    // Tiles in flight, as `attn/compressed/decode.cu` lays them: two of
+    // either where a block holds 99 KiB (sm_86, sm_89, sm_120); else six
+    // of quantized rows (five below sm_90) and the one they widen into,
+    // four of bf16. A raw key holds the wider format's data and scales.
+    let small = crate::jit::max_shared_memory_per_block_optin().is_some_and(|bytes| bytes < 128 << 10);
+    let stages = if small {
+        2
+    } else if crate::jit::compute_capability_major().is_some_and(|major| major < 9) {
         5
     } else {
         6
@@ -238,10 +242,7 @@ fn smem(rows: Option<(Rows, Rows)>) -> u32 {
         };
         let ((wd, ws), (pd, ps)) = (split(w), split(p));
         stages * KEYS * (wd.max(pd) + ws.max(ps)) + tile
-    } else if crate::jit::compute_capability_major() == Some(8)
-        && crate::jit::max_shared_memory_per_block_optin().is_some_and(|bytes| bytes < 128 << 10)
-    {
-        // Two bf16 tiles where a block holds 99 KiB (sm_86, sm_89).
+    } else if small {
         2 * tile
     } else {
         4 * tile
