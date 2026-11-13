@@ -1635,7 +1635,18 @@ impl FrameShell for Shell {
                 } else {
                     "it has more lanes than a body's window table holds"
                 };
-                format!("{key}: {why}")
+                if bodied && !readouts_fit {
+                    format!(
+                        "{key}: {why} ({} rows read out over {} lanes; the body carries {}: \
+                         {last_rows} last rows under {max_lanes} lanes, {every_row} every row, \
+                         lane ceiling {lane_ceiling})",
+                        readout_rows.len(),
+                        composition.lane_count(),
+                        readout_ceiling,
+                    )
+                } else {
+                    format!("{key}: {why}")
+                }
             });
         let bodied = bodied && readouts_fit && lanes_fit;
         let readout_live = readout_rows.len() as u32;
