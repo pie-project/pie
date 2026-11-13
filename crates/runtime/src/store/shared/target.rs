@@ -160,6 +160,12 @@ impl SharedGrow {
                 }
                 RungStep::Raise { rung, evacuation } => {
                     if !evacuation.moves.is_empty() {
+                        tracing::info!(
+                            engine = self.engine,
+                            rung,
+                            moves = evacuation.moves.len(),
+                            "a raise moves state out of the span; fires wait on its copy"
+                        );
                         let moves = SharedPool::rung_moves(&evacuation);
                         let copied =
                             crate::scheduler::pool(self.engine, PoolOp::Evacuate(moves)).await;
