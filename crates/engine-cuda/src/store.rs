@@ -1124,7 +1124,27 @@ impl Pools {
                 .saturating_add(more)
                 .min(self.chunks.total()),
         );
+        self.paging.pages = self.paging.pages.max(self.pages_within(self.stated.unwrap_or(0)));
         self.pledge();
+    }
+
+    /// The kv pages `chunks` chunks hold beside the weights they seat
+    /// whole, as the fit counts them.
+    fn pages_within(&self, chunks: u32) -> u64 {
+        let layout = self.chunks.layout();
+        let weights =
+            u32::try_from(self.weight_pool_bytes() / layout.chunk_bytes.max(1)).unwrap_or(u32::MAX);
+        let kv_chunks = chunks.saturating_sub(if weights <= chunks { weights } else { 0 });
+        let (mut fits, mut over) = (1, self.ceiling.saturating_add(1));
+        while over - fits > 1 {
+            let mid = fits + (over - fits) / 2;
+            if chunks_at(layout, &self.paging, mid, 0) <= kv_chunks {
+                fits = mid;
+            } else {
+                over = mid;
+            }
+        }
+        fits
     }
 
     /// Pledges the pool the chunks the runtime is stated, beside what its
@@ -1365,7 +1385,12 @@ impl Pools {
                 over = mid;
             }
         }
-        self.paging.pages = fits;
+        // A pool stated for more than this fit holds keeps the pages of
+        // what it stated: the runtime names them, and a count that moved
+        // under live tables would not be the one they were laid by.
+        if self.stated.is_none() {
+            self.paging.pages = fits;
+        }
         // A flat range is one allocation made on its first commit: of the
         // fitted chunks, not of every chunk the asked count reserved.
         // A range mapped on demand reserved anew before the activation is
@@ -1375,7 +1400,9 @@ impl Pools {
         // settled one could never grow past it.
         let flat = !elastic::mapped_on_demand();
         let reshape = flat || (self.whole_fit && fitted < self.chunks.total());
-        if reshape && self.chunks.fresh() {
+        // Never once a body names the range ([`Pools::pin`]): reshaped, its
+        // planes would lie where the bodies captured over it no longer look.
+        if reshape && !self.pinned && self.chunks.fresh() {
             let reserved = if flat || settled {
                 fitted
             } else {
@@ -3288,8 +3315,12 @@ impl Pools {
         // Every segment the fitted pool's chunks lie in, the last as far
         // as they reach: the range is reserved for more than the fit left
         // the cache rows.
+        // Backed as far as the fit holds; limited to what the runtime is
+        // stated, where that is more: what the fit keeps back is backed
+        // when the runtime comes to take it.
         let fitted = self.fitted_chunks();
-        self.chunks.limit(fitted);
+        self.chunks
+            .limit(self.stated.map_or(fitted, |stated| stated.max(fitted)));
         match self
             .chunks
             .commit_segments(&mut self.pool, self.chunks.segments_for(u64::from(fitted)))?

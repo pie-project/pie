@@ -1318,12 +1318,15 @@ impl Shell {
     /// fired once, size-only (`crate::sizing`), in arming's order, so each
     /// slab grows as arming will grow it. Nothing launches, copies or
     /// commits; the fit holds this for arming in place of a guess.
-    pub(super) fn size_arming(&mut self) -> Result<crate::sizing::Footprint> {
+    pub(super) fn size_arming(&mut self) -> Result<Option<crate::sizing::Footprint>> {
+        // A load that records no body walks every fire it serves, and a
+        // walked fire's slabs are sized by what it routes: only a recorded
+        // body's are the ceilings this walk states.
         if !(self.records_bodies() && Self::keyable_units(&self.compiled)) {
-            return Ok(crate::sizing::Footprint::default());
+            return Ok(None);
         }
         let Some(LatticeTargets { targets, .. }) = self.lattice_targets() else {
-            return Ok(crate::sizing::Footprint::default());
+            return Ok(None);
         };
         crate::sizing::begin();
         let mut walked = Ok(());
@@ -1347,7 +1350,7 @@ impl Shell {
         }
         let footprint = crate::sizing::end();
         self.arm_rs = record::RsBody::Folds;
-        walked.map(|()| footprint)
+        walked.map(|()| Some(footprint))
     }
 
     /// What arming the lattice starts from, in arming's order; `None`
@@ -1462,6 +1465,7 @@ impl Shell {
     /// whether more are left. A rung is stated armed ([`engine::live`]) once
     /// its last composition is.
     pub fn arm_step(&mut self, lent: &engine::live::ArmingLease) -> Result<bool> {
+        let room = self.arming_room();
         let Some(mut st) = self.stepping.take() else {
             return Ok(false);
         };
@@ -1469,12 +1473,15 @@ impl Shell {
         // pieces: by ref once lanes name refs, else by the state slot those
         // slots are.
         let pieces = self.pools.record_pieces() as usize;
-        if lent.records.len() < pieces {
+        if lent.records.len() < pieces || lent.pages.len() < room.pages as usize {
             return Err(Fault::program(
                 "serve::arming",
                 format!(
-                    "a step lent {} record slots, and a record takes {pieces}",
-                    lent.records.len()
+                    "a step lent {} kv pages and {} record slots, and it writes {} and {}",
+                    lent.pages.len(),
+                    lent.records.len(),
+                    room.pages,
+                    room.records
                 ),
             ));
         }

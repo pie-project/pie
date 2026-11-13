@@ -1411,50 +1411,27 @@ impl Shell {
             !shell.bodies_stated,
             &resident,
         )?;
-        // What arming will grow the kernels' scratch slabs by, walked
-        // size-only through the compositions it arms before the range is
-        // first backed: the fit holds that, not a stretch or an arena's
-        // worth guessed for it, and the cache rows take the rest.
-        if shell.records_bodies() && shell.pools.fresh() {
-            let began = std::time::Instant::now();
-            let walked = shell.size_arming()?;
-            let walk_ms = began.elapsed().as_secs_f64() * 1000.0;
-            // The slabs this shell's contexts take are laid in the
-            // activation's span, past its arenas, at the size the walk asked
-            // of each: a take answers its place, and nothing grows. What is
-            // left to grow by allocation is the slabs of other arenas.
-            let arena = shell.device.ctx().slabs().id();
+        // What the kernels' scratch slabs take, walked size-only through
+        // the compositions the lattice fires before the range is first
+        // backed: every slab is laid in the activation's span, past its
+        // arenas, at the size the walk asked of it. A take answers its
+        // place, and nothing grows by allocation.
+        if shell.pools.fresh()
+            && let Some(walked) = shell.size_arming()?
+        {
             let placed: Vec<(kernels_cuda::jit::SlabKey, usize)> = walked
                 .keys
                 .iter()
-                .filter(|slab| slab.key.arena == arena)
                 .map(|slab| (slab.key, slab.asked))
                 .collect();
-            let grows = walked
-                .keys
-                .iter()
-                .filter(|slab| slab.key.arena != arena)
-                .fold(0u64, |sum, slab| sum.saturating_add(slab.grown as u64));
             let workspace = kernels_cuda::jit::Slabs::placed_bytes(&placed) as u64;
-            if workspace > 0 {
-                let at = shell.pools.widen_activation(workspace)?;
-                shell.workspace = Some(Workspace {
-                    at,
-                    bytes: workspace,
-                    slabs: placed,
-                });
-            }
-            let margin = (grows / 50).max(SIZED_MARGIN);
+            let at = shell.pools.widen_activation(workspace)?;
             if boot.knobs.diagnostics.arm_trace {
                 eprintln!(
-                    "[arm-trace] size-only walk ({walk_ms:.0} ms): {} slabs of {} MiB laid in the \
-                     activation's span; {} MiB of other slabs grow (held {} MiB with its margin, \
-                     against {} MiB guessed): {}",
-                    shell.workspace.as_ref().map_or(0, |w| w.slabs.len()),
+                    "[arm-trace] size-only walk: {} slabs of {} MiB laid in the activation's \
+                     span: {}",
+                    placed.len(),
                     workspace >> 20,
-                    grows >> 20,
-                    (grows + margin) >> 20,
-                    (scratch_growth + fitted.stretch) >> 20,
                     walked
                         .slabs
                         .iter()
@@ -1464,14 +1441,15 @@ impl Shell {
                         .join(" ")
                 );
             }
+            shell.workspace = Some(Workspace {
+                at,
+                bytes: workspace,
+                slabs: placed,
+            });
             let first = (fitted.fit, fitted.chunks, fitted.room >> 20);
-            fitted = shell.pools.fit_the_card(
-                bodies,
-                held_for_fires.saturating_add(grows).saturating_add(margin),
-                false,
-                false,
-                &resident,
-            )?;
+            fitted = shell
+                .pools
+                .fit_the_card(bodies, held_for_fires, false, false, &resident)?;
             if boot.knobs.diagnostics.arm_trace {
                 eprintln!(
                     "[arm-trace] fit before arming: {} pages, {} chunks, room {} MiB guessed; \
@@ -1549,14 +1527,14 @@ impl Shell {
         unsafe {
             kernels_cuda::jit::Slabs::place(base as *mut core::ffi::c_void, &workspace.slabs);
         }
+        // Every slab this shell's fires take is laid: none grows.
+        self.device.ctx().slabs().seal();
+        for ctx in self.device.conditional_ctx().into_iter().chain(self.device.side_ctx()) {
+            ctx.slabs().seal();
+        }
         Ok(())
     }
 }
-
-/// The least the fit holds past a size-only walk's slabs: the slabs grow
-/// as the walk grew them, but arming also takes a few allocations of its
-/// own beside them (graph bodies' upload staging, events).
-const SIZED_MARGIN: u64 = 64 << 20;
 
 /// A shell whose load stopped short of arming its bodies ([`Shell::stage`]).
 pub struct Staged {

@@ -468,8 +468,10 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
             before.1 >> 20,
             shell.live().outside() >> 20
         );
-        assert_eq!(shell.live().held(), 0, "the settled fit holds nothing back");
-        let _ = before;
+        assert!(
+            shell.live().held() < before.0,
+            "the settled fit gives back what arming did not take"
+        );
         assert_eq!(shell.live().armed_through(), u32::MAX);
     }
     shell
