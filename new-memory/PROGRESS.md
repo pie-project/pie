@@ -1468,3 +1468,13 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   (current was 1480-2183); c256 (m2=160) 6861-6881 vs main 6659-6701 (current 5890); c64 2648 vs 2651; gpt-oss
   24 x 31.4k 61.3 s vs 63.2; boot 6.2 s vs ~19.3. runtime 156 pass; rung.py plain 5/5, hold-40 8/8 (raise
   evacuated, no held set discarded).
+
+### M119 — 2026-11-13: ROCm hand row fusions restored (A5); MI300X re-verify
+- `sc/rocm-parity` (f3ed6598, AMD): main's seven hand row rules ahead of the synthesized regions + UNCHAINED as on
+  main; GOLDEN-LOGITS-ROCM re-baselined (qwen3 / gemma / qwen35 / mimo back to main's hashes; nemotron / minimax /
+  dots3 differ by kernel arm since regions still fold other chains). gemma-4-E4B vs main: c1 213.7 vs 214.1, c8
+  1366 vs 1360, c64 8397 vs 8372, pf2048 38011 vs 38015.
+- MI300X tip re-verify (30d1d87a): all bodies armed (30B 89, Qwen3-8B 113, Qwen3.5-9B 161, gemma 89); 9 ROCm goldens
+  equal; 30B pages 66312 (held-weight fix); Qwen3-8B speed = main; boot faster than main (8B 19.6 vs 26.4 s, gemma
+  18.8 vs 20.6). Open: capacity -4.6% vs main (Qwen3-8B 60352 vs 63232 pages; ~11.5 GiB of room outside the pool vs
+  ~4 GiB at M93). c256 ~510 tok/s stall reproduces on main too.

@@ -9,7 +9,7 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A2 | CUDA held load with a pool too small: illegal address at boot (IT r9) | L40S | done M75 |
 | A3 | Runtime boot fit counts only committed segments (Metal) | RT3 | done M73 (Metal device run pending) |
 | A4 | ROCm quantized expert banks (after A1) | AMD | queued |
-| A5 | ROCm generated region kernels: flip + delete hand rules (b8/b64 in-process numbers pending) | AMD | in progress |
+| A5 | ROCm generated region kernels vs hand rules | AMD | done M119 (main's 7 hand rules ahead of regions; parity on gemma) |
 | A6 | XLA: Mosaic page copy / flash / kv append on the pool; speed vs main; MoE result varies with pool chunk count (CUDA plugin) | TPU | in progress |
 | A7 | XLA weight streaming + snapshots (sc/xla2, partial) | TPU | queued |
 | A8 | Cerebras: main's new wafer-program backend (#1435, merged M87) states degenerate facts; pool / tiers / record copies / weight streaming need its owner + hardware | — | OUT OF SCOPE for this PR (user); listed as a known limitation |
