@@ -61,3 +61,12 @@ medians. Known gaps to close:
 - C3: PR description: design summary, contract, per-backend matrix, verification evidence, behaviour changes
   (device_weight_budget semantics, host tier lazily pinned, held weights, etc.), known follow-ups (FOLLOWUPS.md).
 - C4: No AI co-author lines anywhere in commits / PR body.
+
+## Known residuals (draft PR text)
+- NVFP4 (Qwen3-30B-A3B, L40S) decode c64/c256 ~4-5% under main, not attributed to a defect: same kernel order,
+  plan and graph gaps; same-buffer select A/B +1.2% gate_up / +0.6% down; expert table ~1.8% per call; select time
+  is context-dependent; greedy outputs diverge in 17/64 c64 sequences (a different select pick at one decode
+  bucket, ksplit 2 vs nb 2), so routing and per-layer work differ. Weight-use readback made async (a6ccbefe9).
+  (Final check pending: force main's pick.)
+- Metal c1: gemma -0.3%, Qwen3.5 -0.5% (accepted by user 2026-11-11).
+- sm_90 / sm_100 speed of the A1 TMA paths unverified (A25, needs H100 / B200).
