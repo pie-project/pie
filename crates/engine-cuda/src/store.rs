@@ -579,6 +579,10 @@ pub struct Pools {
     /// The caches' host copies are the serving file's mapping, which no
     /// fire may read in place ([`Pools::file_weights`]).
     weights_filed: bool,
+    /// The MXFP4 banks ROCm lays in the matrix core's lane order
+    /// ([`Pools::lane_banks`]): a slot filled from the serving file, or a
+    /// copy pinned from it, is laid in that order once filled.
+    lanes: Vec<LaneBank>,
     /// The pinned copy misses are read from, where the load left the
     /// weights in the file and the runtime streams them after all.
     miss_copy: Option<crate::device::Pinned>,
@@ -988,6 +992,7 @@ impl Pools {
             weights_held: false,
             hosts_dropped: false,
             weights_filed: false,
+            lanes: Vec::new(),
             miss_copy: None,
             preseated: false,
             stand_in: false,
@@ -2619,6 +2624,9 @@ impl Pools {
                 *seat = Some(resident.slot);
             }
             let mut fills = Vec::new();
+            // The lane-order banks' slots filled from the serving file, as
+            // it lies: laid once filled.
+            let mut laid = Vec::new();
             for (atom, slot) in named.iter().enumerate() {
                 let Some(slot) = *slot else { continue };
                 if self.expert_caches[at].slots[atom] == Some(slot) {
@@ -2631,19 +2639,32 @@ impl Pools {
                 let to = self
                     .chunks
                     .weight_slot(shape.per_chunk, shape.slot_bytes, slot)?;
-                for bank in self.expert_caches[at]
-                    .planes
-                    .iter()
-                    .filter(|bank| bank.layer == layer)
-                {
+                let banks = || {
+                    self.expert_caches[at]
+                        .planes
+                        .iter()
+                        .filter(move |bank| bank.layer == layer)
+                };
+                for bank in banks() {
                     fills.push((
                         to + bank.plane.offset,
                         bank.host + expert * bank.plane.bytes,
                         usize::try_from(bank.plane.bytes).unwrap_or(0),
                     ));
                 }
+                if self.weights_filed {
+                    for lane in &self.lanes {
+                        let at_of = |param: u32| {
+                            banks().find(|bank| bank.plane.param == param).map(|b| to + b.plane.offset)
+                        };
+                        if let (Some(codes), Some(exps)) = (at_of(lane.codes), at_of(lane.scales)) {
+                            laid.push((codes, exps, lane.rows, lane.k));
+                        }
+                    }
+                }
             }
             self.fill_weights(stream, &fills)?;
+            self.lay_lanes(stream, &laid)?;
             self.expert_caches[at].slots = named;
         }
         self.stage_row_tables(stream)?;
@@ -2722,6 +2743,58 @@ impl Pools {
     /// ([`Pools::pin_weight_hosts`]).
     pub fn file_weights(&mut self) {
         self.weights_filed = true;
+    }
+
+    /// The MXFP4 banks the load lays in lane order
+    /// (`store::layout::lane_ordered`): their codes and exponents' params,
+    /// rows and K.
+    pub fn lane_banks(&mut self, lanes: Vec<LaneBank>) {
+        self.lanes = lanes;
+    }
+
+    /// Each `(codes, exponents)` span of `rows` rows of K `k` laid in lane
+    /// order where it lies, host or device, through the device.
+    fn lay_lanes(&self, stream: *mut core::ffi::c_void, spans: &[(u64, u64, u64, u64)]) -> Result<()> {
+        #[cfg(feature = "rocm")]
+        {
+            let Some(widest) = spans.iter().map(|&(_, _, rows, k)| rows * k).max() else {
+                return Ok(());
+            };
+            let codes_span = (widest / 2).next_multiple_of(16);
+            let span = codes_span + widest / 32;
+            let staging = crate::device::Buffer::zeroed(usize::try_from(2 * span).unwrap_or(usize::MAX))?;
+            // SAFETY: `stream` is the caller's live stream.
+            let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
+            let (in_c, in_e) = (staging.ptr() + span, staging.ptr() + span + codes_span);
+            let (out_c, out_e) = (staging.ptr(), staging.ptr() + codes_span);
+            for &(codes, exps, rows, k) in spans {
+                let (cb, eb) = (
+                    usize::try_from(rows * k / 2).unwrap_or(usize::MAX),
+                    usize::try_from(rows * k / 32).unwrap_or(usize::MAX),
+                );
+                crate::device::copy_any(stream, in_c, codes, cb)?;
+                crate::device::copy_any(stream, in_e, exps, eb)?;
+                kernels_cuda::linear::moe::mxfp4_lanes(
+                    &ctx,
+                    "linear.moe_select",
+                    in_c,
+                    out_c,
+                    in_e,
+                    out_e,
+                    rows,
+                    k,
+                )?;
+                crate::device::copy_any(stream, codes, out_c, cb)?;
+                crate::device::copy_any(stream, exps, out_e, eb)?;
+                crate::device::ctx::sync(stream)?;
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            let _ = (stream, spans);
+            Ok(())
+        }
     }
 
     /// Whether a span of the serving file's mapping was copied out since
@@ -2902,6 +2975,29 @@ impl Pools {
                 bank.host = copies.next().unwrap_or(bank.host);
             }
         }
+        // The file holds a lane-order bank as it lies: its pinned copy, what
+        // misses read and slots are filled from, is laid in lane order.
+        let mut laid = Vec::new();
+        for cache in &self.expert_caches {
+            for lane in &self.lanes {
+                for codes in cache.planes.iter().filter(|bank| bank.plane.param == lane.codes) {
+                    let Some(exps) = cache.planes.iter().find(|bank| {
+                        bank.plane.param == lane.scales && bank.layer == codes.layer
+                    }) else {
+                        continue;
+                    };
+                    for expert in 0..u64::from(cache.shape.experts) {
+                        laid.push((
+                            codes.host + expert * codes.plane.bytes,
+                            exps.host + expert * exps.plane.bytes,
+                            lane.rows,
+                            lane.k,
+                        ));
+                    }
+                }
+            }
+        }
+        self.lay_lanes(core::ptr::null_mut(), &laid)?;
         eprintln!(
             "engine-cuda: the runtime streams weights this load was told it would hold; {} \
              MiB of them pinned on the host from the serving file, for misses",
@@ -4286,6 +4382,16 @@ struct ExpertBank {
     /// whole number of its plane's rows past the pool's base: what a TMA map
     /// of the window indexes it by.
     whole_rows: bool,
+}
+
+/// An MXFP4 bank ROCm lays in the matrix core's lane order: its codes' and
+/// exponents' params, an expert's rows and K.
+#[derive(Debug, Clone, Copy)]
+pub struct LaneBank {
+    pub codes: u32,
+    pub scales: u32,
+    pub rows: u64,
+    pub k: u64,
 }
 
 /// An expert shape's cache: where each expert of each layer lies (a pool

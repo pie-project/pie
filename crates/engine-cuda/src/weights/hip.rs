@@ -397,6 +397,16 @@ pub(super) fn order_mxfp4_banks(
     // copied into first (the lane-order kernel reads device memory).
     let staging = Buffer::zeroed(usize::try_from(2 * span).unwrap_or(usize::MAX))?;
     for &(at, scales, experts, n, k) in &banks {
+        // A bank left in the serving file (a load told its weights are
+        // held) is laid in its slots once they are filled
+        // (`store::Pools::weight_residency`); its row reads lane order all
+        // the same.
+        if tier.is_some_and(|tier| tier.filed(at) || tier.filed(scales)) {
+            if let Some(Some(WeightRow::Planes { lanes, .. })) = table.get_mut(at) {
+                *lanes = true;
+            }
+            continue;
+        }
         let codes = address(tier, store, places[at].offset, at)?;
         let exps = address(tier, store, places[scales].offset, scales)?;
         let (staged_codes, staged_exps) = (staging.ptr(), staging.ptr() + codes_span);

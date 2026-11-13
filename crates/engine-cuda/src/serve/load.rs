@@ -509,9 +509,12 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
     let bytes = crate::weights::laid_bytes(&boot.trace)?;
     let laid = crate::weights::laid_planes(&boot.trace);
     // So is a bank ROCm lays in the matrix core's lane order, codes and
-    // exponents (`store::layout::lane_ordered`).
+    // exponents (`store::layout::lane_ordered`), where a copy is read: a
+    // load told its weights are held reads the file as it lies, and its
+    // slots are laid in lane order on the device once filled.
     let lanes: Vec<usize> = params
         .iter()
+        .filter(|_| !boot.knobs.weights_held)
         .filter(|&&codes| crate::store::layout::lane_ordered(&boot.trace, codes))
         .flat_map(|&codes| crate::store::layout::packed_planes(&boot.trace, codes))
         .flatten()
@@ -1069,6 +1072,26 @@ impl Shell {
             })
             .collect();
         pools.seat_experts(&hosts, &groups)?;
+        // The banks laid in lane order, which a slot filled from the file
+        // (or a copy pinned from it) is laid in once filled.
+        pools.lane_banks(
+            pools
+                .expert_params()
+                .into_iter()
+                .filter(|&param| crate::store::layout::lane_ordered(&boot.trace, param as usize))
+                .filter_map(|param| {
+                    let planes = crate::store::layout::packed_planes(&boot.trace, param as usize);
+                    let scales = (*planes.get(1)?)?;
+                    let shape = &boot.trace.params[param as usize].shape;
+                    Some(crate::store::LaneBank {
+                        codes: param,
+                        scales,
+                        rows: shape[1],
+                        k: 2 * shape[2..].iter().product::<u64>(),
+                    })
+                })
+                .collect(),
+        );
         // Committed whole: a fire reading out past one row a lane (a verify
         // reads every row) would otherwise grow it outside the fit.
         let unscored = compiled.arena.scores_from(&boot.trace).max(
