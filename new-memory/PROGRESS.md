@@ -1491,3 +1491,10 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   parked / wide-decode / epilogue bitwise vs pre-merge; hybrids differ only by main's own #1627 / #1612 arithmetic
   (bitwise with those arms forced). Workspace --all-targets, engine-cuda cuda/rocm, pie cuda/xla/vulkan+wgpu check
   clean; runtime / XLA lib tests pass.
+
+### Post-merge (memory-followups, from main 050ad9545 = PR #1638)
+- MI300X speed table (AMD), main 30abc9d5 vs tip+parity (= M119), all bodies armed: Qwen3-8B / gemma-4-E4B /
+  Qwen3-30B-A3B / Qwen3.5-9B decode c1..c256 and prefill 512 / 2048 at parity or better; boot faster on every model
+  (8B 19.5 vs 26.4 s, gemma 18.8 vs 20.6, 30B 21.2 vs 24.8, Qwen3.5 21.3 vs 36.5). c256 ~510 tok/s stall is
+  intermittent on main too. Open: ROCm capacity -4.6% (M118's bodies stretch is held out of a flat range for good;
+  fix sc/rocm-flat-fit in test).
