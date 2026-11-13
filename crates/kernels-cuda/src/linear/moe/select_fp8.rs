@@ -1168,32 +1168,37 @@ pub fn matmul_grouped_strided(
     // Column-major: Y_g^T = W_g (op T) x X_g^T.
     // SAFETY: `handle` is this context's live cuBLAS handle bound to its stream;
     // the planes hold what the extents say.
-    let status = unsafe {
-        cublasGemmStridedBatchedEx(
-            handle,
-            cublasOperation_t::CUBLAS_OP_T,
-            cublasOperation_t::CUBLAS_OP_N,
-            int(n)?,
-            int(y.rows)?,
-            int(k)?,
-            core::ptr::from_ref(&alpha).cast(),
-            w.ptr as usize as *const core::ffi::c_void,
-            cudaDataType::CUDA_R_16BF,
-            int(k)?,
-            i64::from(n) * i64::from(k),
-            x.ptr as usize as *const core::ffi::c_void,
-            cudaDataType::CUDA_R_16BF,
-            int(x.width)?,
-            i64::from(k),
-            core::ptr::from_ref(&beta).cast(),
-            y.ptr as usize as *mut core::ffi::c_void,
-            cudaDataType::CUDA_R_16BF,
-            int(y.width)?,
-            i64::from(n),
-            int(groups)?,
-            cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
-        )
+    let status = if crate::sizing::active() {
+        // A size-only walk (`crate::sizing`) runs no product.
+        cublasStatus_t::CUBLAS_STATUS_SUCCESS
+    } else {
+        unsafe {
+            cublasGemmStridedBatchedEx(
+                handle,
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+                int(n)?,
+                int(y.rows)?,
+                int(k)?,
+                core::ptr::from_ref(&alpha).cast(),
+                w.ptr as usize as *const core::ffi::c_void,
+                cudaDataType::CUDA_R_16BF,
+                int(k)?,
+                i64::from(n) * i64::from(k),
+                x.ptr as usize as *const core::ffi::c_void,
+                cudaDataType::CUDA_R_16BF,
+                int(x.width)?,
+                i64::from(k),
+                core::ptr::from_ref(&beta).cast(),
+                y.ptr as usize as *mut core::ffi::c_void,
+                cudaDataType::CUDA_R_16BF,
+                int(y.width)?,
+                i64::from(n),
+                int(groups)?,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            )
+        }
     };
     if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
         Ok(())

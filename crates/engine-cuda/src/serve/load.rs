@@ -769,6 +769,7 @@ impl Shell {
         let regions =
             crate::synth::Regions::load(&boot.trace, &folded, &anchored, &device.ctx().tuning())?;
         let (free_before, device_total) = crate::store::device_memory()?;
+        crate::device::held::heap_mark();
         // The pool's address space is reserved for every page its bytes
         // could hold, the stated budget or the share of the card before the
         // weights land; `Pools::fit_the_card` sizes it within that.
@@ -1277,6 +1278,7 @@ impl Shell {
             // is a hard cap; a profile's default may stretch while arming.
             bodies_stated,
             bodies_ceiling: 0,
+            workspace: None,
             decoded_tiles: Vec::new(),
             arming: false,
             armed_body: None,
@@ -1339,57 +1341,20 @@ impl Shell {
             shell.exports.readout_row_bytes(),
         );
         // A plane stored as codes and scales is decoded to bf16 before a
-        // prefill's dense gemm, into one tile a stream. The tile is taken
-        // now, at the widest plane the lane fit left each stream, so the
-        // fit sees it resident and no fire — a capture least of all — has to
-        // grow it: a load whose bodies are held to nothing arms no body at
-        // load, and its first fire is a capture.
+        // prefill's dense gemm, into one tile a stream: a scratch slab like
+        // any other, laid with the kernels' workspaces once the lattice is
+        // walked.
         shell.decoded_tiles = tiles
             .iter()
             .map(|plane| crate::store::decoded_weight_reserve(*plane, 1))
             .collect();
-        let mut decoded = 0u64;
-        for (stream, plane) in tiles.iter().enumerate() {
-            let tile = crate::store::decoded_weight_reserve(*plane, 1);
-            let ctx = match stream {
-                0 => Some(shell.device.ctx()),
-                n => shell.device.side_ctx().get(n - 1).copied(),
-            };
-            let Some(ctx) = ctx else {
-                continue;
-            };
-            kernels_cuda::linear::dequant::warm_decoded_weight(ctx, tile).map_err(|why| {
-                Fault::Residency(format!(
-                    "the card does not hold this deployment: the decoded-weight tile stream \
-                     {stream} decodes its widest plane into, {tile} bytes, would not allocate \
-                     beside the weights, activations and inputs ({why}). Raise `[engine.memory] \
-                     budget_device`, serve a quantized deployment of the model, or free \
-                     what else holds the device."
-                ))
-            })?;
-            decoded = decoded.saturating_add(tile);
-        }
-        // The tickets the fused launches draw, taken on every stream now:
-        // the bodies armed at load capture before any eager fire.
-        #[cfg(feature = "rocm")]
-        for ctx in core::iter::once(shell.device.ctx())
-            .chain(shell.device.side_ctx())
-            .chain(shell.device.conditional_ctx())
-        {
-            ctx.warm_tickets().map_err(|why| {
-                Fault::Residency(format!(
-                    "the fused launches' tickets would not allocate ({why})"
-                ))
-            })?;
-        }
         let held_for_fires = programs;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] held for fires: guest programs {} MiB at {} lanes; decoded-weight \
-                 tiles taken at load: {} MiB over {} stream(s) ({})",
+                 tiles over {} stream(s) ({})",
                 programs >> 20,
                 boot.budget.max_lanes,
-                decoded >> 20,
                 tiles.len(),
                 tiles
                     .iter()
@@ -1427,18 +1392,95 @@ impl Shell {
         } else {
             0
         };
-        let fitted = shell.pools.fit_the_card(
+        let mut fitted = shell.pools.fit_the_card(
             bodies,
             held_for_fires.saturating_add(scratch_growth),
             false,
             !shell.bodies_stated,
             &resident,
         )?;
+        // What arming will grow the kernels' scratch slabs by, walked
+        // size-only through the compositions it arms before the range is
+        // first backed: the fit holds that, not a stretch or an arena's
+        // worth guessed for it, and the cache rows take the rest.
+        if shell.records_bodies() && shell.pools.fresh() {
+            let began = std::time::Instant::now();
+            let walked = shell.size_arming()?;
+            let walk_ms = began.elapsed().as_secs_f64() * 1000.0;
+            // The slabs this shell's contexts take are laid in the
+            // activation's span, past its arenas, at the size the walk asked
+            // of each: a take answers its place, and nothing grows. What is
+            // left to grow by allocation is the slabs of other arenas.
+            let arena = shell.device.ctx().slabs().id();
+            let placed: Vec<(kernels_cuda::jit::SlabKey, usize)> = walked
+                .keys
+                .iter()
+                .filter(|slab| slab.key.arena == arena)
+                .map(|slab| (slab.key, slab.asked))
+                .collect();
+            let grows = walked
+                .keys
+                .iter()
+                .filter(|slab| slab.key.arena != arena)
+                .fold(0u64, |sum, slab| sum.saturating_add(slab.grown as u64));
+            let workspace = kernels_cuda::jit::Slabs::placed_bytes(&placed) as u64;
+            if workspace > 0 {
+                let at = shell.pools.activation_bytes();
+                shell.pools.widen_activation(workspace)?;
+                shell.workspace = Some(Workspace {
+                    at,
+                    bytes: workspace,
+                    slabs: placed,
+                });
+            }
+            let margin = (grows / 50).max(SIZED_MARGIN);
+            if boot.knobs.diagnostics.arm_trace {
+                eprintln!(
+                    "[arm-trace] size-only walk ({walk_ms:.0} ms): {} slabs of {} MiB laid in the \
+                     activation's span; {} MiB of other slabs grow (held {} MiB with its margin, \
+                     against {} MiB guessed): {}",
+                    shell.workspace.as_ref().map_or(0, |w| w.slabs.len()),
+                    workspace >> 20,
+                    grows >> 20,
+                    (grows + margin) >> 20,
+                    (scratch_growth + fitted.stretch) >> 20,
+                    walked
+                        .slabs
+                        .iter()
+                        .take(8)
+                        .map(|(name, bytes)| format!("{name}={}", bytes >> 20))
+                        .collect::<Vec<String>>()
+                        .join(" ")
+                );
+            }
+            let first = (fitted.fit, fitted.chunks, fitted.room >> 20);
+            fitted = shell.pools.fit_the_card(
+                bodies,
+                held_for_fires.saturating_add(grows).saturating_add(margin),
+                false,
+                false,
+                &resident,
+            )?;
+            if boot.knobs.diagnostics.arm_trace {
+                eprintln!(
+                    "[arm-trace] fit before arming: {} pages, {} chunks, room {} MiB guessed; \
+                     {} pages, {} chunks, room {} MiB walked (fresh {})",
+                    first.0,
+                    first.1,
+                    first.2,
+                    fitted.fit,
+                    fitted.chunks,
+                    fitted.room >> 20,
+                    shell.pools.fresh()
+                );
+            }
+        }
         // The most a profile's allowance may stretch to while arming.
         shell.bodies_ceiling = usize::try_from(fitted.bodies).unwrap_or(usize::MAX);
         // The carves laid at the activation's end, backed where the range
         // now lies (the fit may have reserved it anew).
         shell.arena.ensure_rungs(&mut shell.pools)?;
+        shell.lay_workspace()?;
         let afforded = fitted.bodies - fitted.stretch;
         if afforded < bodies {
             eprintln!(
@@ -1464,6 +1506,43 @@ impl Shell {
         })
     }
 }
+
+/// The kernels' workspaces, laid in the activation's span past its arenas:
+/// the slabs a size-only walk of the lattice asked for, each at the most it
+/// asked.
+#[derive(Debug)]
+pub(crate) struct Workspace {
+    /// Where it starts in the activation's span.
+    at: u64,
+    bytes: u64,
+    slabs: Vec<(kernels_cuda::jit::SlabKey, usize)>,
+}
+
+impl Shell {
+    /// Backs the workspaces where the range now lies, zeroes them, and has
+    /// every take of their slabs answer its place there.
+    fn lay_workspace(&mut self) -> Result<()> {
+        let Some(workspace) = &self.workspace else {
+            return Ok(());
+        };
+        self.pools
+            .hold_activation_at(workspace.at, workspace.bytes, false)?;
+        let base = self.pools.activation_base() + workspace.at;
+        crate::device::zero_span(base, usize::try_from(workspace.bytes).unwrap_or(0))?;
+        // SAFETY: `base` starts the span just held backed and zeroed, of the
+        // bytes these slabs take; it stays held as long as the pools do, and
+        // the shell drops its contexts' slabs with them.
+        unsafe {
+            kernels_cuda::jit::Slabs::place(base as *mut core::ffi::c_void, &workspace.slabs);
+        }
+        Ok(())
+    }
+}
+
+/// The least the fit holds past a size-only walk's slabs: the slabs grow
+/// as the walk grew them, but arming also takes a few allocations of its
+/// own beside them (graph bodies' upload staging, events).
+const SIZED_MARGIN: u64 = 64 << 20;
 
 /// A shell whose load stopped short of arming its bodies ([`Shell::stage`]).
 pub struct Staged {
@@ -1537,6 +1616,9 @@ impl Staged {
         let fitted = shell
             .pools
             .fit_the_card(bodies, held_for_fires, settled, false, &resident)?;
+        // A load that arms later may have had its range reserved anew by
+        // this fit: the workspaces are laid where it now lies.
+        shell.lay_workspace()?;
         if arm_trace {
             eprintln!(
                 "[arm-trace] cache rows sized to {} pages ({} MiB, {} sequences at the declared \
@@ -1545,6 +1627,26 @@ impl Staged {
                 shell.pools.declared_bytes() >> 20,
                 fitted.fit / u64::from(shell.pools.paging().pages_per_slot),
                 fitted.room >> 20,
+            );
+            if let Some(free) = crate::device::alloc::free_bytes() {
+                let ledger = ledger(&shell, device_total, free_before);
+                let audit = ledger.audit(device_total.saturating_sub(free));
+                eprintln!(
+                    "[arm-trace] ledger: {ledger}; the device reports {} MiB in use: {} MiB no \
+                     owner entered",
+                    audit.device >> 20,
+                    audit.gap() >> 20,
+                );
+            }
+            eprintln!(
+                "[arm-trace] after arming: {} MiB asked past the laid workspaces; slabs grown by \
+                 allocation: {}",
+                kernels_cuda::jit::Slabs::unplaced_bytes() >> 20,
+                kernels_cuda::jit::Slabs::census()
+                    .iter()
+                    .map(|(name, bytes)| format!("{name}={}K", bytes >> 10))
+                    .collect::<Vec<String>>()
+                    .join(" ")
             );
         }
         if rank != 0 {
@@ -1612,6 +1714,44 @@ fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
             .map(|(_, bytes)| *bytes as u64)
             .sum(),
     }
+}
+
+/// The device's memory as this load holds it ([`engine::memory`]): each
+/// owner under its class, over what the device has for this process (all of
+/// it but what others held before the load began).
+fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory::Ledger {
+    use engine::memory::{Class, Ledger};
+    let held = footprint(shell, device_total, free_before);
+    let mut ledger = Ledger::new(shell.pools.chunk_bytes(1), device_total);
+    ledger.enter(Class::Model, "weights", held.weights);
+    ledger.enter(Class::State, "cache rows", held.cache_rows);
+    ledger.enter(Class::Fire, "activation", held.arena);
+    ledger.enter(
+        Class::Fire,
+        "workspaces",
+        shell.workspace.as_ref().map_or(0, |workspace| workspace.bytes),
+    );
+    ledger.enter(Class::Fire, "inputs", held.inputs);
+    ledger.enter(Class::Fire, "readout rows", held.readout);
+    ledger.enter(Class::Fire, "grown slabs", held.scratch);
+    ledger.enter(
+        Class::Fire,
+        "rs scratch",
+        shell.buffers.as_ref().map_or(0, |buffers| buffers.scratch_bytes()),
+    );
+    ledger.enter(
+        Class::Outside,
+        "heap chunks",
+        crate::device::held::heap_bytes_since() as u64,
+    );
+    ledger.enter(
+        Class::Outside,
+        "idle shelf",
+        crate::device::held::kept_bytes() as u64,
+    );
+    ledger.enter(Class::Outside, "graph bodies", held.bodies);
+    ledger.enter(Class::Outside, "before the load", held.before);
+    ledger
 }
 
 /// What holds the device when the cache rows come to be declared, in bytes:

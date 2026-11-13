@@ -32,7 +32,10 @@ pub type GraphExec = *mut c_void;
 pub type GraphNode = *mut c_void;
 pub type HostFn = unsafe extern "C" fn(*mut c_void);
 
+pub const hipSuccess: HipError = sys::HIP_SUCCESS;
 pub const hipErrorNotInitialized: HipError = 3;
+/// `hipErrorNotSupported`: what a size-only walk answers a read back.
+pub const hipErrorNotSupported: HipError = 801;
 pub const hipMemcpyHostToDevice: c_int = 1;
 pub const hipEventDisableTiming: c_uint = 2;
 pub const hipHostMallocPortable: c_uint = 1;
@@ -203,6 +206,10 @@ pub unsafe fn hipFree(ptr: *mut c_void) -> HipError {
 }
 
 pub unsafe fn hipMemset(dst: *mut c_void, value: c_int, bytes: usize) -> HipError {
+    // A size-only walk (`crate::sizing`) writes no stand-in.
+    if crate::sizing::active() && crate::sizing::stands_in(dst.addr()) {
+        return hipSuccess;
+    }
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
         Ok(api) => unsafe { (api.hip.hipMemset)(dst, value, bytes) },
@@ -216,6 +223,10 @@ pub unsafe fn hipMemsetAsync(
     bytes: usize,
     stream: Stream,
 ) -> HipError {
+    // A size-only walk (`crate::sizing`) writes no stand-in.
+    if crate::sizing::active() && crate::sizing::stands_in(dst.addr()) {
+        return hipSuccess;
+    }
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
         Ok(api) => unsafe { (api.hip.hipMemsetAsync)(dst, value, bytes, stream) },
@@ -232,6 +243,10 @@ pub unsafe fn hipMemset2DAsync(
     height: usize,
     stream: Stream,
 ) -> HipError {
+    // A size-only walk (`crate::sizing`) writes no stand-in.
+    if crate::sizing::active() && crate::sizing::stands_in(dst.addr()) {
+        return hipSuccess;
+    }
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
         Ok(api) => unsafe { (api.hip.hipMemset2DAsync)(dst, pitch, value, width, height, stream) },
@@ -245,6 +260,17 @@ pub unsafe fn hipMemcpy(
     bytes: usize,
     kind: c_int,
 ) -> HipError {
+    // A size-only walk (`crate::sizing`) copies nothing to or from a
+    // stand-in: a read of one back to the host has no answer, so it refuses.
+    if crate::sizing::active()
+        && (crate::sizing::stands_in(dst.addr()) || crate::sizing::stands_in(src.addr()))
+    {
+        return if kind == sys::MEMCPY_DEVICE_TO_HOST {
+            hipErrorNotSupported
+        } else {
+            hipSuccess
+        };
+    }
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
         Ok(api) => unsafe { (api.hip.hipMemcpy)(dst, src, bytes, kind) },
@@ -259,6 +285,17 @@ pub unsafe fn hipMemcpyAsync(
     kind: c_int,
     stream: Stream,
 ) -> HipError {
+    // A size-only walk (`crate::sizing`) copies nothing to or from a
+    // stand-in: a read of one back to the host has no answer, so it refuses.
+    if crate::sizing::active()
+        && (crate::sizing::stands_in(dst.addr()) || crate::sizing::stands_in(src.addr()))
+    {
+        return if kind == sys::MEMCPY_DEVICE_TO_HOST {
+            hipErrorNotSupported
+        } else {
+            hipSuccess
+        };
+    }
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
         Ok(api) => unsafe { (api.hip.hipMemcpyAsync)(dst, src, bytes, kind, stream) },
@@ -277,6 +314,17 @@ pub unsafe fn hipMemcpyBatchAsync(
     fail_idx: *mut usize,
     stream: Stream,
 ) -> HipError {
+    // A size-only walk (`crate::sizing`) copies no batch that touches a
+    // stand-in.
+    if crate::sizing::active()
+        && (0..count).any(|at| {
+            // SAFETY: the caller's arrays hold `count` entries.
+            let (dst, src) = unsafe { (*dsts.add(at), *srcs.add(at)) };
+            crate::sizing::stands_in(dst.addr()) || crate::sizing::stands_in(src.addr())
+        })
+    {
+        return hipSuccess;
+    }
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
         Ok(api) => unsafe {
@@ -476,6 +524,10 @@ pub unsafe fn hipGraphInstantiateWithFlags(
 }
 
 pub unsafe fn hipGraphUpload(exec: GraphExec, stream: Stream) -> HipError {
+    // A size-only walk (`crate::sizing`) launches nothing.
+    if crate::sizing::active() {
+        return hipSuccess;
+    }
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
         Ok(api) => unsafe { (api.hip.hipGraphUpload)(exec, stream) },
@@ -484,6 +536,10 @@ pub unsafe fn hipGraphUpload(exec: GraphExec, stream: Stream) -> HipError {
 }
 
 pub unsafe fn hipGraphLaunch(exec: GraphExec, stream: Stream) -> HipError {
+    // A size-only walk (`crate::sizing`) launches nothing.
+    if crate::sizing::active() {
+        return hipSuccess;
+    }
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
         Ok(api) => unsafe { (api.hip.hipGraphLaunch)(exec, stream) },
@@ -675,6 +731,10 @@ pub unsafe fn hipModuleLaunchKernel(
     params: *mut *mut c_void,
     extra: *mut *mut c_void,
 ) -> HipError {
+    // A size-only walk (`crate::sizing`) launches nothing.
+    if crate::sizing::active() {
+        return hipSuccess;
+    }
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
         Ok(api) => unsafe {

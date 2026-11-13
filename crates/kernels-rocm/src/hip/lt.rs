@@ -282,6 +282,10 @@ pub unsafe fn matmul(
             )
         })?;
     }
+    // A size-only walk (`crate::sizing`) plans the product and runs none.
+    if crate::sizing::active() {
+        return Ok(true);
+    }
     let (alpha, beta) = (1f32, 0f32);
     // SAFETY: the caller's ranges match the plan's shape; alpha and beta are
     // host f32 as the f32 scale type reads them.

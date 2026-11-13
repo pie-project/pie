@@ -819,7 +819,33 @@ impl FireCtx<'_> {
         }
         super::btrace::mark("run_new");
         let records = self.graphs.records();
-        let walked = if records {
+        // A size-only walk (`crate::sizing`) walks what arming would capture,
+        // eagerly: nothing launches, and a capture would record nothing. It
+        // walks across the side streams where the capture would, so each
+        // scratch slab is asked for under the stream and lane the body's
+        // regions take it on.
+        let walked = if records && crate::sizing::active() {
+            if self.arming && !p.bodied {
+                Ok(())
+            } else {
+                let lanes = forked.filter(|_| {
+                    p.bodied && record::forks(self.compiled, p.composition.bucket(), &p.islands)
+                });
+                let mut cursor = match lanes {
+                    Some(lanes) => Cursor::across(&place, lanes),
+                    None => Cursor::new(&place),
+                };
+                walk(
+                    self.trace,
+                    self.compiled,
+                    &p.descriptor,
+                    &mut run,
+                    &mut cursor,
+                    Filter::default(),
+                )
+                .map_err(Fault::from)
+            }
+        } else if records {
             if self.arming && !p.bodied {
                 Ok(())
             } else if p.bodied {

@@ -302,6 +302,10 @@ impl Library {
             (&raw mut size).cast(),
             core::ptr::without_provenance_mut(3), // HIP_LAUNCH_PARAM_END
         ];
+        // A size-only walk (`crate::sizing`) launches nothing.
+        if crate::sizing::active() {
+            return Ok(());
+        }
         let api = sys::api()?;
         // SAFETY: HIP copies the kernarg block at the launch; the caller
         // keeps the buffers it names live.

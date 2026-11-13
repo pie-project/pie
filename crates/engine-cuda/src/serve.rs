@@ -132,6 +132,9 @@ pub struct Shell {
     /// The most the allowance may stretch to while arming: what the fit
     /// before arming held the bodies ([`crate::store::Pools::fit_the_card`]).
     bodies_ceiling: usize,
+    /// The kernels' workspaces in the activation's span, once a load has
+    /// walked what its fires take.
+    workspace: Option<load::Workspace>,
     decoded_tiles: Vec<u64>,
     arming: bool,
     golden_arm: Golden,

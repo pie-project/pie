@@ -174,10 +174,14 @@ IOSurfaces cannot be placed in our heaps, so ANE memory stays outside the span, 
 
 ### 2.10 XLA
 
-Same ledger, different realisation:
-- `state` and `model` are counted exactly as elsewhere.
-- `fire(r)` cannot be laid out by us. It is **measured**: run rung `r`'s executable once at load or on first raise and read the device's peak (`PJRT_Device_MemoryStats` is already used at open). The measurement replaces `headroom`.
-- Open risk, already in XLA-TPU-CHECKLIST 3.2: whether donating the pool updates in place. If it copies, `fire(r)` includes a pool-sized term and the ledger will show it.
+Same ledger, different realisation (measured on a v6e by the TPU session, 2026-11-13):
+- `state` and `model` are counted exactly as elsewhere. Pool donation updates in place: `alias_size` is the pool's size and `bytes_in_use` moves only by code and non-aliased outputs, so there is no transient pool-sized copy (XLA-TPU-CHECKLIST 3.2 closed).
+- `fire` is known exactly **at compile time**, from `PJRT_Executable_GetCompiledMemoryStats`, before any run:
+  - executable temporaries live in one scratch region the runtime reserves at the bottom of memory, sized to the largest `temp_size` over loaded programs; it only grows, and it is invisible to `bytes_in_use` and its peak (reported as `bytes_reserved`). So `fire = max over loaded programs of temp_size` + the non-aliased outputs (`output − alias`: readout planes, gather results, carried guest cells).
+  - generated code joins `bytes_in_use` at a program's first execute and stays: Σ `generated_code_size` over loaded programs is a model-class cost, like bodies.
+  - predicted against measured change in `bytes_in_use`, four programs: within 0.1 MiB.
+- This replaces `headroom` (HBM/16, 2 GiB on v6e, where the largest temp on the two models measured was 140 MiB). An earlier draft proposed sampling the peak around one execute; that cannot work (the peak is a lifetime high-water mark and does not see temps).
+- What cannot hold on XLA: the pool tensor's size is in the program text, so the state / fire boundary is decided at load (moving it means a new pool and recompiling every program); the scratch region never shrinks, so lowering a rung frees nothing and the ledger charges `fire` at the largest rung loaded; a rung must be compiled off the fire path and offered only once ready (which the background arming of 2.5 already does).
 
 ## 3. Configuration
 

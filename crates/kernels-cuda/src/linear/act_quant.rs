@@ -403,7 +403,14 @@ pub fn scales_to_atoms(
 
 fn zero(ctx: &Ctx, op: &'static str, ptr: u64, bytes: usize) -> Result<(), Error> {
     // SAFETY: a slab of `bytes` the caller owns, on this context's stream.
-    let code = unsafe { rt::cudaMemsetAsync(ptr as *mut _, 0, bytes, ctx.stream().cast()) };
+    let code = unsafe {
+        if crate::sizing::active() {
+            // A size-only walk (`crate::sizing`) moves nothing.
+            rt::cudaError::cudaSuccess
+        } else {
+            rt::cudaMemsetAsync(ptr as *mut _, 0, bytes, ctx.stream().cast())
+        }
+    };
     if code != rt::cudaError::cudaSuccess {
         return Err(refuse(op, format!("cudaMemsetAsync answered {code:?}")));
     }

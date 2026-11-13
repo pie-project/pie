@@ -1044,29 +1044,13 @@ impl Shell {
         armed
     }
 
-    fn arm_lattice_fenced(&mut self, verify: bool) -> Result<()> {
-        // An expert-parallel rank fires the lattice whether or not it
-        // records bodies: past arming its group serves every composition it
-        // does not replay eagerly and unfenced, beside peers spinning in
-        // their collectives, so what those walks first use (a module, a
-        // tune, a pinned slot) must already have been made here, fenced.
-        let group = self.ep.is_some();
-        let records = self.records_bodies() && Self::keyable_units(&self.compiled);
-        if !records && !group {
-            return Ok(());
-        }
-        if !records && !verify {
-            self.cache.seal_bodies();
-        }
-
+    /// Every composition the lattice arms, in arming's order (the top
+    /// bucket's first, then by kind and bucket), each with its recurrent
+    /// rows' treatment; `None` where there is nothing to arm.
+    fn lattice_targets(&self) -> Option<LatticeTargets> {
         let ceiling = self.lane_ceiling();
         if ceiling == 0 {
-            return Ok(());
-        }
-        if super::diag::on().arm_trace {
-            for (class, requests) in self.landing.iter().enumerate() {
-                eprintln!("[arm-trace] class c{class}: {requests:?}");
-            }
+            return None;
         }
         let points: Vec<LatticePoint> = if self.budget.buckets.is_empty() {
             (1..=ceiling)
@@ -1176,7 +1160,7 @@ impl Shell {
         targets
             .sort_by_key(|(bucket, target)| (Some(*bucket) != top, rank(target.kind()), *bucket));
         if targets.is_empty() {
-            return Ok(());
+            return None;
         }
         // A load that buffers recurrent rows serves a spec-decoding fire
         // from a body too: each one-class composition (a verify's lanes, the
@@ -1217,6 +1201,81 @@ impl Shell {
                     .collect::<Vec<_>>()
             })
             .collect();
+        Some(LatticeTargets {
+            targets,
+            top,
+            unfireable,
+        })
+    }
+
+    /// What arming the lattice will grow its kernels' scratch slabs by,
+    /// past what they hold now: each composition arming would capture,
+    /// fired once, size-only (`crate::sizing`), in arming's order, so each
+    /// slab grows as arming will grow it. Nothing launches, copies or
+    /// commits; the fit holds this for arming in place of a guess.
+    pub(super) fn size_arming(&mut self) -> Result<crate::sizing::Footprint> {
+        if !(self.records_bodies() && Self::keyable_units(&self.compiled)) {
+            return Ok(crate::sizing::Footprint::default());
+        }
+        let Some(LatticeTargets { targets, .. }) = self.lattice_targets() else {
+            return Ok(crate::sizing::Footprint::default());
+        };
+        crate::sizing::begin();
+        let mut walked = Ok(());
+        for (bucket, target, rs) in &targets {
+            self.arm_rs = *rs;
+            let (lanes, media) = target.lanes();
+            let owned = self.synthetic_lanes_with(&lanes, &media);
+            if matches!(target, BodySynth::Idle) {
+                self.at_bucket(*bucket);
+            }
+            // Landed as arming lands each fire: its staging slots come back.
+            if let Err(why) = self
+                .fire_synthetic(&owned)
+                .and_then(|()| self.device.synchronize())
+            {
+                walked = Err(Fault::Unbound {
+                    what: format!("the size-only walk of bucket {bucket}, {target}: {why}"),
+                });
+                break;
+            }
+        }
+        let footprint = crate::sizing::end();
+        self.arm_rs = record::RsBody::Folds;
+        walked.map(|()| footprint)
+    }
+
+    fn arm_lattice_fenced(&mut self, verify: bool) -> Result<()> {
+        // An expert-parallel rank fires the lattice whether or not it
+        // records bodies: past arming its group serves every composition it
+        // does not replay eagerly and unfenced, beside peers spinning in
+        // their collectives, so what those walks first use (a module, a
+        // tune, a pinned slot) must already have been made here, fenced.
+        let group = self.ep.is_some();
+        let records = self.records_bodies() && Self::keyable_units(&self.compiled);
+        if !records && !group {
+            return Ok(());
+        }
+        if !records && !verify {
+            self.cache.seal_bodies();
+        }
+
+        if self.lane_ceiling() == 0 {
+            return Ok(());
+        }
+        if super::diag::on().arm_trace {
+            for (class, requests) in self.landing.iter().enumerate() {
+                eprintln!("[arm-trace] class c{class}: {requests:?}");
+            }
+        }
+        let Some(LatticeTargets {
+            targets,
+            top,
+            unfireable,
+        }) = self.lattice_targets()
+        else {
+            return Ok(());
+        };
         // The top bucket's bodies and every decode body arm first; the
         // narrower prefill, mixed and wide ones after them are what the
         // lattice coarsens to fit the allowance, each priced at what its
@@ -1805,4 +1864,13 @@ impl core::fmt::Display for Armed {
         }
         Ok(())
     }
+}
+
+/// What [`Shell::lattice_targets`] enumerates: each composition with its
+/// bucket and recurrent rows' treatment, the top bucket, and the keys no
+/// synthetic fire reaches.
+struct LatticeTargets {
+    targets: Vec<(u32, BodySynth, record::RsBody)>,
+    top: Option<u32>,
+    unfireable: Vec<String>,
 }

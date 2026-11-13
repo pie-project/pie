@@ -39,6 +39,13 @@ pub mod held {
         0
     }
 
+    pub fn heap_mark() {}
+
+    #[must_use]
+    pub fn heap_bytes_since() -> usize {
+        0
+    }
+
     #[must_use]
     pub fn kept_bytes() -> usize {
         0

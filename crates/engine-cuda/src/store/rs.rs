@@ -70,6 +70,17 @@ pub struct Buffers {
 }
 
 impl Buffers {
+    /// The device bytes the extended run's scratch has backed, outgrown
+    /// scratches included.
+    #[must_use]
+    pub fn scratch_bytes(&self) -> u64 {
+        self.outgrown
+            .iter()
+            .fold(self.scratch.committed_bytes(), |sum, arena| {
+                sum.saturating_add(arena.committed_bytes())
+            })
+    }
+
     /// The buffered planes of `trace`, laid as the pool's rs list lays its
     /// pages, and the scratch's range for fires of up to `max_rows` rows
     /// beside every seated lane's buffered rows replayed once. A flat arena

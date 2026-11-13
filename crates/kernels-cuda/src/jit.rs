@@ -15,6 +15,13 @@ pub(crate) mod device {
     pub(crate) fn compute_capability_major() -> Option<u32> {
         None
     }
+
+    /// No slab is ever taken: a walk sizes nothing.
+    pub(crate) fn sizing_reset() {}
+
+    pub(crate) fn sizing_take() -> crate::sizing::Footprint {
+        crate::sizing::Footprint::default()
+    }
 }
 #[cfg(all(test, feature = "cuda"))]
 mod launches;
@@ -24,7 +31,7 @@ mod root;
 
 pub use abi::{Arg, ArgValue};
 pub use ctx::{
-    Ctx, Fire, Launch, Pad, Slabs, count_fires, fire_counts, fires, kernels_strict, strict_kernels,
+    Ctx, Fire, Launch, PLACED_ALIGN, Pad, SlabKey, Slabs, count_fires, fire_counts, fires, kernels_strict, strict_kernels,
 };
 pub(crate) use kernel::generated;
 pub use kernel::{Kernel, kernel};
