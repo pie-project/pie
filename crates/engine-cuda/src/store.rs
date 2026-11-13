@@ -9,7 +9,7 @@ use engine::transfer::KvRun;
 use kernels_cuda::{KvPool, RecurrentPool, Tensor};
 use poem_ir::{CacheRow, Def, Dtype, Operands, Trace};
 
-use crate::device::elastic::{self, Arena, Commit, PhysicalPool};
+use crate::device::elastic::{self, Commit, PhysicalPool};
 use crate::error::{Fault, Result};
 use crate::run::{CachePool, CacheTable, PoolSlabs};
 use crate::settle::Airborne;
@@ -1400,16 +1400,6 @@ impl Pools {
             Commit::Committed => Ok(()),
             refusal => Err(refuse(&self.pool, refusal)),
         }
-    }
-
-    pub(crate) fn reserve_arena(&self, max_bytes: u64, label: &'static str) -> Result<Arena> {
-        Arena::reserve(&self.pool, max_bytes, label)
-    }
-
-    /// Backs a prefix of `bytes` of an arena beside the pool's budget
-    /// (`elastic::commit_beside`).
-    pub(crate) fn commit_beside(&self, arena: &mut Arena, bytes: u64) -> Result<()> {
-        elastic::commit_beside(&self.pool, arena, &elastic::Want::Prefix(bytes))
     }
 
     #[must_use]

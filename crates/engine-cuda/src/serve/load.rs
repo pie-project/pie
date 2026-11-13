@@ -1023,8 +1023,9 @@ impl Shell {
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
-        let buffers = Buffers::reserve(&boot.trace, paging, budgets.tokens.max_tokens, &pools)?;
         let mut pools = pools;
+        let buffers =
+            Buffers::reserve(&boot.trace, paging, budgets.tokens.max_tokens, &mut pools)?;
         // Each row-streamed table's cache opens over its host copy.
         let hosts: Vec<(u32, u64)> = pools
             .row_params()
@@ -1522,6 +1523,9 @@ impl Shell {
     /// Backs the workspaces where the range now lies, zeroes them, and has
     /// every take of their slabs answer its place there.
     fn lay_workspace(&mut self) -> Result<()> {
+        if let Some(buffers) = &self.buffers {
+            buffers.lay_scratch(&mut self.pools)?;
+        }
         let Some(workspace) = &self.workspace else {
             return Ok(());
         };

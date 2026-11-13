@@ -1614,7 +1614,7 @@ impl Shell {
                 self.readout_rows.bytes() >> 20,
                 self.buffers
                     .as_ref()
-                    .map_or(0, |buffers| buffers.scratch().1)
+                    .map_or(0, |buffers| buffers.scratch_bytes())
                     >> 20,
                 self.pools.committed_bytes() >> 20,
             );
