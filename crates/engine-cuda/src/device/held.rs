@@ -491,6 +491,13 @@ pub fn release_idle() -> usize {
     recycle::trim()
 }
 
+/// The device bytes the heaps' chunks take, whatever of them is in cells:
+/// chunks are kept for the life of the process.
+#[must_use]
+pub fn heap_bytes() -> usize {
+    heap::DEVICE_CHUNKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The device bytes the process keeps from dropped buffers, for the next
 /// of their size ([`recycle`]).
 #[must_use]
@@ -620,6 +627,7 @@ pub(crate) mod heap {
                         )
                     };
                     made.map_err(|fault| crate::device::alloc::out_of_room(fault, bytes))?;
+                    DEVICE_CHUNKS.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
                     Ok(Cell {
                         host: 0,
                         device: device as u64,
@@ -662,6 +670,9 @@ pub(crate) mod heap {
         cell: Cell,
         fence: Fence,
     }
+
+    pub(super) static DEVICE_CHUNKS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
     #[derive(Default)]
     struct Heap {

@@ -1735,6 +1735,21 @@ fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory:
     ledger.enter(Class::Fire, "inputs", held.inputs);
     ledger.enter(Class::Fire, "readout rows", held.readout);
     ledger.enter(Class::Fire, "grown slabs", held.scratch);
+    ledger.enter(
+        Class::Fire,
+        "rs scratch",
+        shell.buffers.as_ref().map_or(0, |buffers| buffers.scratch_bytes()),
+    );
+    ledger.enter(
+        Class::Outside,
+        "heap chunks",
+        crate::device::held::heap_bytes() as u64,
+    );
+    ledger.enter(
+        Class::Outside,
+        "idle shelf",
+        crate::device::held::kept_bytes() as u64,
+    );
     ledger.enter(Class::Outside, "graph bodies", held.bodies);
     ledger.enter(Class::Outside, "before the load", held.before);
     ledger
