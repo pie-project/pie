@@ -99,6 +99,26 @@ pub(super) struct Arming {
 }
 
 impl Arming {
+    /// Whether every composition the lattice planned holds a body: those
+    /// it fired for one (`wanted`) and those the allowance stopped before
+    /// their fire (`never`) alike. A bucket the lattice coarsened away is
+    /// not planned: its fires pad to a wider bucket's body.
+    fn whole(&self) -> Result<()> {
+        let planned = self.wanted + self.never;
+        if self.armed < planned {
+            return Err(Fault::Residency(format!(
+                "arming ended with {} of {planned} compositions holding a body ({} the \
+                 allowance stopped{}): the rungs past the last armed stay unarmed",
+                self.armed,
+                self.never,
+                self.refused
+                    .as_ref()
+                    .map_or_else(String::new, |why| format!("; last refusal: {why}")),
+            )));
+        }
+        Ok(())
+    }
+
     fn narrower(&self, bucket: u32, target: &BodySynth) -> bool {
         Some(bucket) != self.top && target.kind() != Kind::Decode
     }
@@ -1495,14 +1515,9 @@ impl Shell {
                 // Every rung is stated armed only where every composition
                 // the lattice planned holds a body: a fire past that would
                 // walk eagerly.
-                let (armed, planned) = (st.armed, st.wanted + st.never);
+                let whole = st.whole();
                 self.arm_end(st)?;
-                if armed < planned {
-                    return Err(Fault::Residency(format!(
-                        "arming ended with {armed} of {planned} compositions holding a body: \
-                         the rungs past the last armed stay unarmed"
-                    )));
-                }
+                whole?;
                 self.settle()?;
                 self.live.arm(u32::MAX);
                 Ok(false)
@@ -2127,4 +2142,48 @@ struct LatticeTargets {
     targets: Vec<(u32, BodySynth, record::RsBody)>,
     top: Option<u32>,
     unfireable: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lattice(armed: usize, wanted: usize, never: usize) -> Arming {
+        Arming {
+            targets: std::collections::VecDeque::new(),
+            rung: u32::MAX,
+            top: None,
+            topped: true,
+            unfireable: Vec::new(),
+            verify: false,
+            group: false,
+            records: true,
+            priced: true,
+            dropped: std::collections::BTreeSet::new(),
+            weighed: [(0, 0); Kind::COUNT],
+            armed,
+            wanted,
+            tally: [(0, 0); Kind::COUNT],
+            refused: None,
+            never,
+            warmed_only: 0,
+            never_from: 0,
+            belted: false,
+            starved: None,
+            peer_stopped: false,
+            unit_margin: 0,
+            ballot: Ballot { slip: None },
+        }
+    }
+
+    #[test]
+    fn a_lattice_is_whole_only_where_every_planned_composition_holds_a_body() {
+        assert!(lattice(178, 178, 0).whole().is_ok());
+        // A composition fired and refused its body.
+        assert!(lattice(177, 178, 0).whole().is_err());
+        // Compositions the allowance stopped before their fire are planned
+        // too: a fire at one would walk eagerly.
+        let short = lattice(41, 41, 137).whole().unwrap_err().to_string();
+        assert!(short.contains("41 of 178"), "{short}");
+    }
 }
