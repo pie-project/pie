@@ -12,6 +12,7 @@ use eta_ir::registry::Stage;
 use eta_ir::registry::{GeometryClass, Port};
 
 pub use engine_gpu::program::Refusal;
+use engine_gpu::program::{decode, numel_of};
 
 struct Instance {
     plan: Arc<ExecPlan>,
@@ -1027,33 +1028,6 @@ impl Plane {
             id: id.0,
         })
     }
-}
-
-fn numel_of(shape: &[u32]) -> usize {
-    shape.iter().map(|&d| d as usize).product::<usize>().max(1)
-}
-
-fn decode(bytes: &[u8], dtype: eta_ir::container::ChanDType, shape: &[u32]) -> Option<Value> {
-    use eta_ir::types::Dtype;
-    let dtype = eta_exec::concrete_dtype(dtype);
-    let numel = numel_of(shape);
-    if bytes.len() != eta_exec::wire_cell_bytes(dtype, numel) {
-        return None;
-    }
-    let words = || {
-        bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| [c[0], c[1], c[2], c[3]])
-    };
-    Some(match dtype {
-        Dtype::Bool => Value::Bool((0..numel).map(|j| (bytes[j / 8] >> (j % 8)) & 1).collect()),
-        Dtype::I32 => Value::I32(words().map(i32::from_le_bytes).collect()),
-        Dtype::U32 => Value::U32(words().map(u32::from_le_bytes).collect()),
-        Dtype::F32 => Value::F32(words().map(f32::from_le_bytes).collect()),
-        _ => return None,
-    })
 }
 
 fn runs_of(row: &[u8]) -> Vec<u32> {
