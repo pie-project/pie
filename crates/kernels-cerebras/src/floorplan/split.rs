@@ -1,12 +1,12 @@
-//! Attention | MoE halves: gpt-oss and Qwen3 MoE as they plan: units of AX attention + MX MoE
+//! The attention | MoE halves constructor ([`super::KernelSet::Experts`]'s pinned plans and the
+//! search's moves): gpt-oss and Qwen3 MoE as they plan: units of AX attention + MX MoE
 //! columns (CX after the attention columns), PY rows, a snake of two unit columns that starts
 //! upward (so the first and the last unit sit on the band), the scores segments on the attention
 //! columns, the router's on the CY row's MoE columns, the head as a band below the units with its
-//! control row, the token loop over the band. Blocks (by [`crate::compose`]): `MoeUnits`,
-//! `AttnScores`, `Router`, `Band`, `BandLoop`; kernels: [`crate::kernels::split`]; cut:
+//! control row, the token loop over the band. Kernels: [`crate::kernels::split`]; cut:
 //! [`crate::tiles::split`].
 
-use crate::partition::ceil_to;
+use crate::floorplan::ceil_to;
 use crate::plan::{
     Contract, HeadPartition, KvEntries, Partition, Plan, Preset, ReduceGroups, RowRun, Segments,
     Shape,

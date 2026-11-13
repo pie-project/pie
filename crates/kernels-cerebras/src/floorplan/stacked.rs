@@ -1,4 +1,5 @@
-//! Stacked unit columns: Gemma 4 E2B / E4B as they plan: units at the explicit origins of the
+//! The stacked columns constructor ([`super::KernelSet::Shared`]'s pinned plans and the
+//! search's moves): Gemma 4 E2B / E4B as they plan: units at the explicit origins of the
 //! plan's arrangement in two unit columns, the scores segments a half row, the PLE storage above
 //! each unit column ([`crate::block::ple::Ple`]), the shared-KV line from the KV source unit to
 //! its sharers ([`crate::block::shared_kv::SharedKv`]), the head east of the units and the token
@@ -6,10 +7,12 @@
 //! 128 of 160 rows so the 512 window is an exact ring) are in the plan. Kernels:
 //! [`crate::kernels::stacked`]; cut: [`crate::tiles::stacked`].
 
-use crate::partition::ceil_to;
+use std::collections::BTreeMap;
+
+use crate::floorplan::ceil_to;
 use crate::plan::{
-    Contract, HeadPartition, KvEntries, LayerKind, Partition, Plan, Preset, ReduceGroups, RowRun,
-    Segments, Shape,
+    Arrangement, Contract, HeadPartition, KvEntries, LayerKind, Partition, Plan, Preset,
+    ReduceGroups, RowRun, Segments, Shape, StoreSpec,
 };
 
 type R<T> = Result<T, String>;
@@ -105,4 +108,55 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
         contract,
         levers: pr.levers.clone(),
     })
+}
+
+impl Arrangement {
+    /// The plan's arrangement, made for its unit shape (weight columns, rows, units).
+    pub fn of(plan: &Plan) -> R<&Arrangement> {
+        let p = &plan.partition;
+        let key = (p.cols, p.rows, p.units);
+        p.arrangement
+            .as_ref()
+            .filter(|a| a.unit == key)
+            .ok_or_else(|| {
+                format!(
+                    "compose: no stacked arrangement for {} x {} units x {}",
+                    p.cols, p.rows, p.units
+                )
+            })
+    }
+
+    /// Unit origins in unit order, for units of `uw` x `uh` PEs.
+    pub fn origins(&self, uw: u32, uh: u32) -> R<Vec<(u32, u32)>> {
+        let n = self.a_units.len() + self.b_units.len();
+        let mut o = vec![None; n];
+        let mut ya = BTreeMap::new();
+        for (i, &u) in self.a_units.iter().enumerate() {
+            let y = self.a_top + i as u32 * uh;
+            ya.insert(u, y);
+            o[u as usize] = Some((0, y));
+        }
+        for &(u, level) in &self.b_units {
+            let y = *ya
+                .get(&level)
+                .ok_or_else(|| format!("compose: unit {u} level with {level}, not in A"))?;
+            o[u as usize] = Some((uw, y));
+        }
+        o.into_iter()
+            .enumerate()
+            .map(|(u, v)| v.ok_or_else(|| format!("compose: unit {u} unplaced")))
+            .collect()
+    }
+
+    /// The unit columns: (x, units top to bottom, storage).
+    pub fn columns(&self, uw: u32) -> [(u32, Vec<u32>, &StoreSpec); 2] {
+        [
+            (0, self.a_units.clone(), &self.stores[0]),
+            (
+                uw,
+                self.b_units.iter().map(|&(u, _)| u).collect(),
+                &self.stores[1],
+            ),
+        ]
+    }
 }

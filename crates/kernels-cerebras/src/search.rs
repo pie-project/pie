@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::build::STACK_ROOM;
 use crate::cost::memory::{self, Anchor};
 use crate::cost::time;
-use crate::partition;
+use crate::floorplan;
 use crate::plan::{Plan, Preset, Shape};
 use crate::program::Program;
 use crate::target::Planned;
@@ -62,7 +62,7 @@ pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
     let reference = seeds
         .first()
         .filter(|p| p.made_for == Some(sig))
-        .and_then(|p| partition::plan(shape, p).ok());
+        .and_then(|p| floorplan::plan(shape, p).ok());
     let positions = ask
         .positions
         .or(reference.as_ref().map(|p| p.contract.positions))
@@ -137,7 +137,7 @@ struct Search<'a> {
 impl Search<'_> {
     /// `p`'s plan, step and room, if it plans, serves the positions and fits.
     fn score(&self, p: &Preset) -> Option<Scored> {
-        let mut plan = partition::plan(self.shape, p).ok()?;
+        let mut plan = floorplan::plan(self.shape, p).ok()?;
         if plan.contract.positions < self.positions {
             return None;
         }
@@ -198,7 +198,7 @@ impl Search<'_> {
                     let pa = with(&at, a, va);
                     consider(pa.clone(), &mut next);
                     // a move another key must follow (the positions, the units' grid)
-                    if partition::plan(self.shape, &pa).is_err() || self.score(&pa).is_none() {
+                    if floorplan::plan(self.shape, &pa).is_err() || self.score(&pa).is_none() {
                         for b in keys.iter().filter(|b| *b > a) {
                             for vb in ladder(at.keys[b]) {
                                 consider(with(&pa, b, vb), &mut next);
@@ -243,7 +243,7 @@ impl Search<'_> {
     /// from the partitions that plan but do not fit, the moves that bring them nearest a fit
     /// ([`Search::short`]) are followed.
     fn repair(&self, seed: &Preset, keys: &[String]) -> Option<(Preset, Scored)> {
-        let why = |p: &Preset| match partition::plan(self.shape, p) {
+        let why = |p: &Preset| match floorplan::plan(self.shape, p) {
             Ok(_) => "fit".to_string(),
             Err(e) => e,
         };
@@ -293,7 +293,7 @@ impl Search<'_> {
     /// and bring them nearest a fit, a step at a time, until one fits and builds.
     fn climb(&self, mut from: Vec<Preset>, keys: &[String]) -> Option<(Preset, Scored)> {
         let near = |p: &Preset| {
-            partition::plan(self.shape, p)
+            floorplan::plan(self.shape, p)
                 .ok()
                 .map(|pl| self.short(&pl))
         };

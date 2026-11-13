@@ -1,7 +1,7 @@
 //! The logical plan: what the model is ([`Shape`]), how it is cut ([`Partition`]) and what the
 //! build promises at run time ([`Contract`]). No colours or kernel names: the spatial pass reads
 //! the [`Shape`] off the model's trace ([`super::target`]), and the partition of the layout its
-//! layers take turns it and a [`Preset`] into the plan ([`super::partition::plan`]).
+//! layers take turns it and a [`Preset`] into the plan ([`super::floorplan::plan`]).
 
 use std::collections::BTreeMap;
 
@@ -270,7 +270,7 @@ pub struct Partition {
 /// a column-A unit; above each column's top unit its side input's storage block. Unit index
 /// order is the handoff order (unit 0 takes the embedding); the head sits east of column B. An
 /// arrangement is made for one unit shape (`unit`: weight columns, rows, units) and refused for
-/// any other ([`super::compose::stacked`]).
+/// any other ([`super::floorplan::stacked`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Arrangement {
     pub unit: (u32, u32, u32),
@@ -378,7 +378,7 @@ impl Plan {
     /// reach.
     ///
     /// Only facts every layout states the same way are checked; a layout's own rules stay in its
-    /// partition ([`super::partition`]) and its blocks.
+    /// constructor ([`super::floorplan`]) and its blocks.
     pub fn validate(&self) -> Result<(), String> {
         let (sh, pa, co) = (&self.shape, &self.partition, &self.contract);
         let bad = |m: String| Err(format!("plan: {m}"));

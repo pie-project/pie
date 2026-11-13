@@ -1,13 +1,13 @@
-//! Row runs: Gemma 4 12B as it plans: units of PY + 1 rows by PX + 1 columns at explicit
-//! origins in two unit columns (the first visited down, the second up: unit 0 and the last unit
-//! side by side on row 0), their rows in two runs (attention rows `r < RA` with `Hc A` dims and
-//! the scores segments, 128 of them so the 1024 window is an exact ring; plain rows with `Hc W`
-//! dims), and the head east of them fed by groups of CX rows, the token loop's winner coming back
-//! the same way. Blocks (by [`crate::compose`]): `RowRuns`, `HeadGroups`. Kernels:
+//! The row runs constructor ([`super::KernelSet::Windows`]'s pinned plans and the search's
+//! moves): Gemma 4 12B as it plans: units of PY + 1 rows by PX + 1 columns in two unit columns
+//! (the first visited down, the second up: unit 0 and the last unit side by side on row 0), their
+//! rows in two runs (attention rows `r < RA` with `Hc A` dims and the scores segments, 128 of them
+//! so the 1024 window is an exact ring; plain rows with `Hc W` dims), and the head east of them
+//! fed by groups of CX rows, the token loop's winner coming back the same way. Kernels:
 //! [`crate::kernels::runs`]; cut: [`crate::tiles::runs`].
 
+use crate::floorplan::ceil_to;
 use crate::kernels::runs::Dims;
-use crate::partition::ceil_to;
 use crate::plan::{
     Contract, HeadPartition, KvEntries, LayerKind, Partition, Plan, Preset, ReduceGroups, RowRun,
     Segments, Shape,

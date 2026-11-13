@@ -1,11 +1,11 @@
-//! The snake: Qwen3.5 (GDN layers + gated full attention: 9B / 4B / 0.8B), Qwen3 and Llama 3
+//! The snake constructor ([`super::KernelSet::Own`]'s pinned plans and the search's moves):
+//! Qwen3.5 (GDN layers + gated full attention: 9B / 4B / 0.8B), Qwen3 and Llama 3
 //! (dense attention, no output gate: Qwen3-8B, Llama 3.1 8B) as they plan: a snake of PX x PY
 //! units (at most one gap slot, whose PEs relay), the scores segments on every weight row, GDN's
 //! (k, q) multicast and the o-norm segments where there are GDN layers, the head east of the
 //! units, the token loop. Kernels: [`crate::kernels::snake`]; cut: [`crate::tiles::snake`].
 
-use crate::compose::snake_gap;
-use crate::partition::units_of;
+use crate::floorplan::units_of;
 use crate::plan::{
     Contract, HeadPartition, KvEntries, LayerKind, Partition, Plan, Preset, ReduceGroups, RowRun,
     Segments, Shape,
@@ -130,4 +130,17 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
         contract,
         levers: pr.levers.clone(),
     })
+}
+
+/// The unit slots' gap: none when the units fill the grid; one slot short, the last column's
+/// row-1 slot stays out of the snake (the last unit still ends on row 0, the token loop's
+/// return), on an even number of unit columns below the turn row.
+pub fn snake_gap(units: u32, (unx, uny): (u32, u32)) -> R<Option<(u32, u32)>> {
+    match (unx * uny).checked_sub(units) {
+        Some(0) => Ok(None),
+        Some(1) if unx % 2 == 0 && uny >= 3 => Ok(Some((unx - 1, 1))),
+        _ => Err(format!(
+            "snake: {units} units on {unx} x {uny} slots (at most one gap slot, on an even number of unit columns, below the turn row)"
+        )),
+    }
 }

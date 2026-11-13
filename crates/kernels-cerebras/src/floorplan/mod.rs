@@ -15,10 +15,19 @@
 //! The units are one [`UnitShape`] (column runs by role, row runs by dims and role, the control
 //! lines, K layers) visited along a [`UnitLayout`] (a snake of slots with gap slots, or explicit
 //! origins); the head is one [`Head`] (east of the units, a band below them, or fed by groups of
-//! rows). A [`Floorplan`] is the general partition: the four layouts the compiler had (the snake,
-//! the stacked columns, the row runs, the attention | MoE halves) are points of it, which
-//! [`super::partition`]'s constructors make from a preset's keys. The composer
-//! ([`super::compose::blocks`]) reads the elements, not a layout name.
+//! rows). A [`Floorplan`] is the general partition: the four layouts the compiler had are points
+//! of it, each made from a preset's keys by its constructor ([`plan`]):
+//!
+//! | constructor | units | path | head | beside the units |
+//! |---|---|---|---|---|
+//! | [`snake`] | one plain column run, one row run | a snake of UNX x UNY slots, at most one gap slot | east | — |
+//! | [`stacked`] | one plain column run, KV on PYW rows | explicit origins in two unit columns ([`crate::plan::Arrangement`]) | east, token bus on | storage, KV line |
+//! | [`runs`] | one plain column run, attention / plain row runs | two unit columns, down then up | east, by row groups | — |
+//! | [`split`] | attention / MoE column runs | two unit columns from the band, up then down | a band below | — |
+//!
+//! The kernel set the layer program's mixers take ([`KernelSet`]) picks the constructor its pinned
+//! plans and the search's moves are keyed for; the composer ([`super::compose::blocks`]) and the
+//! role kernels ([`super::kernels::of`]) read the elements, never the constructor.
 //!
 //! What a later regime adds plugs in here: a row stream through units laid one a layer (a
 //! [`UnitLayout`] and a token stream link in [`super::wiring`]), replicas of a unit shape, a K / V
@@ -29,11 +38,47 @@ use std::ops::Range;
 use serde::Serialize;
 
 use super::block::gdn::Gdn;
-use super::compose::{Needs, snake_gap};
+use super::compose::Needs;
 use super::floor::{UnitGrid, UnitLayout};
-use super::plan::{Arrangement, Plan, RowRun};
+use super::kernels::KernelSet;
+use super::plan::{Arrangement, LayerKind, Plan, Preset, RowRun, Shape};
+
+pub mod runs;
+pub mod snake;
+pub mod split;
+pub mod stacked;
+
+pub use snake::snake_gap;
 
 type R<T> = Result<T, String>;
+
+/// The plan of `shape` under `preset`: the partition and contract the preset's keys make for the
+/// model, by the constructor of the kernel set its layers take. Each constructor reads its own
+/// keys (the snake's unit slots, the stacked columns' arrangement, the row runs' dims and head
+/// groups, the split's attention / MoE columns) and refuses the shapes its cut and kernels cannot
+/// take by name. Nothing physical is decided here.
+pub fn plan(shape: &Shape, preset: &Preset) -> R<Plan> {
+    match KernelSet::of_shape(shape) {
+        KernelSet::Own => snake::plan(shape, preset),
+        KernelSet::Shared => stacked::plan(shape, preset),
+        KernelSet::Windows => runs::plan(shape, preset),
+        KernelSet::Experts => split::plan(shape, preset),
+    }
+}
+
+/// Layers `layers` in units of `k`, every unit the same kinds; the unit count.
+pub fn units_of(layers: &[LayerKind], k: u32, what: &str) -> R<u32> {
+    let n = layers.len() as u32;
+    if k == 0 || !n.is_multiple_of(k) {
+        return Err(format!("{what}: {n} layers in units of {k}"));
+    }
+    Ok(n / k)
+}
+
+/// `n / d` rounded up to a multiple of `m`.
+pub fn ceil_to(n: u32, d: u32, m: u32) -> u32 {
+    n.div_ceil(d).div_ceil(m) * m
+}
 
 /// The structural elements a layer program's features ask for, each on its own (see the module
 /// doc).

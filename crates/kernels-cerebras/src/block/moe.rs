@@ -1,5 +1,5 @@
 //! Units split into an attention half and a MoE half (a MoE column run: gpt-oss): the attention
-//! columns west of CX, the MoE columns east of it. The units are the standard ones ([`units`])
+//! columns west of CX, the MoE columns east of it. The units are the standard ones ([`super::units`])
 //! with their weight / CY kinds refined by half ([`halves`]); the scores segments run on the
 //! attention columns only ([`super::segments::Scores`]), the router's segments on the CY row's
 //! MoE columns ([`Router`]). [`MoeCopies`] copies each unit's staged blocks by half.

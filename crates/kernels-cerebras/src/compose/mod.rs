@@ -18,7 +18,6 @@
 //! ([`refuse`]).
 
 pub mod copies;
-pub mod stacked;
 
 use poem_compiler::spatial::layer::{LayerProgram, Mixer, Phase};
 use poem_ir::GluAct;
@@ -287,19 +286,6 @@ impl Schedule {
     #[must_use]
     pub fn moe(&self) -> u32 {
         self.mixk + 1
-    }
-}
-
-/// The unit slots' gap: none when the units fill the grid; one slot short, the last column's
-/// row-1 slot stays out of the snake (the last unit still ends on row 0, the token loop's
-/// return), on an even number of unit columns below the turn row.
-pub fn snake_gap(units: u32, (unx, uny): (u32, u32)) -> R<Option<(u32, u32)>> {
-    match (unx * uny).checked_sub(units) {
-        Some(0) => Ok(None),
-        Some(1) if unx % 2 == 0 && uny >= 3 => Ok(Some((unx - 1, 1))),
-        _ => Err(format!(
-            "snake: {units} units on {unx} x {uny} slots (at most one gap slot, on an even number of unit columns, below the turn row)"
-        )),
     }
 }
 

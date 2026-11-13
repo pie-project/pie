@@ -5,7 +5,7 @@
 //!
 //! The wafer program's compiler (`programs/wafer`: one sequence on the wafer, the layers in units
 //! of weight PEs, the head and the token loop beside them): poem's spatial pass over the model's
-//! trace ([`target`]) makes a [`plan`] (the model and how it is cut: [`partition`], [`pins`],
+//! trace ([`target`]) makes a [`plan`] (the model and how it is cut: [`floorplan`], [`pins`],
 //! [`search`]), which goes through the [`block`]s its layers need ([`compose`]) to the [`floor`],
 //! [`wiring`] and laid [`fabric`], every
 //! kernel's [`abi`] ([`kernels`]), the build's outputs ([`emit`]) and the weight [`weights`]
@@ -28,7 +28,6 @@ pub mod floorplan;
 pub mod kernels;
 pub mod layers;
 pub mod npy;
-pub mod partition;
 pub mod pins;
 pub mod plan;
 pub mod program;

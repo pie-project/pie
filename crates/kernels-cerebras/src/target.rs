@@ -458,7 +458,7 @@ impl Wafer {
 
     /// The plan `c` makes of the shape, serving exactly the positions asked for (if any).
     pub fn plan_of(&self, c: &Candidate) -> R<Plan> {
-        let mut plan = super::partition::plan(&self.shape, &c.preset)?;
+        let mut plan = super::floorplan::plan(&self.shape, &c.preset)?;
         if let Some(n) = self.positions {
             let held = plan.contract.positions;
             if n > held {
