@@ -127,11 +127,6 @@ pub struct Shell {
     pad: bool,
     bodies: bool,
     bodies_mem: usize,
-    /// The bodies' allowance is the operator's: a hard cap, never stretched.
-    bodies_stated: bool,
-    /// The most the allowance may stretch to while arming: what the fit
-    /// before arming held the bodies ([`crate::store::Pools::fit_the_card`]).
-    bodies_ceiling: usize,
     /// The kernels' workspaces in the activation's span, once a load has
     /// walked what its fires take.
     workspace: Option<load::Workspace>,

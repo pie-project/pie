@@ -1047,28 +1047,6 @@ impl Shell {
                 .sum::<usize>()
                 + kept * average
         };
-        // A profile's allowance stretches to the profile's lattice, as far
-        // as the fit before arming held the bodies and the device has free;
-        // an operator's stays as stated.
-        let left = self.bodies_mem.saturating_sub(spent.bytes);
-        let short = need(&buckets).saturating_sub(left);
-        if short > 0 && !self.bodies_stated {
-            let spare = self.pools.spare_bytes_for_bodies(0).unwrap_or(0);
-            let spare = usize::try_from(spare).unwrap_or(usize::MAX);
-            let more = short
-                .min(self.bodies_ceiling.saturating_sub(self.bodies_mem))
-                .min(spare.saturating_sub(left));
-            if more > 0 {
-                eprintln!(
-                    "engine-cuda: the bodies' allowance stretches {} -> {} MiB to arm the \
-                     profile's lattice ({} MiB of the cache rows' room held for it)",
-                    self.bodies_mem >> 20,
-                    (self.bodies_mem + more) >> 20,
-                    self.bodies_ceiling.saturating_sub(self.bodies_mem) >> 20,
-                );
-                self.bodies_mem += more;
-            }
-        }
         // What the allowance has left, or the card where it has less: the
         // ceiling's spare stops arming as the allowance does.
         let allowance = self.bodies_mem.saturating_sub(spent.bytes);
@@ -1878,7 +1856,9 @@ impl Shell {
                 "the card does not hold this deployment's graph bodies: {} of {attempted} \
                  compositions armed{}. A load that records bodies serves every composition \
                  from one rather than eagerly. Lower `[engine] max_context`, raise \
-                 `[engine.memory] budget_device`, or free what else holds the device. \
+                 `[engine.memory] budget_device`, or free what else holds the device; on a \
+                 device another process shares, state `[engine.memory] budget_device` as this \
+                 engine's part of it, so the fit leaves the other process its room. \
                  ({report})",
                 st.armed,
                 match st.starved {
