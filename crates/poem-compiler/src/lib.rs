@@ -276,10 +276,6 @@ pub fn arena_ladder(
     Ok(ladder)
 }
 
-/// The activation rungs a pool may drop to (SPEC decision 6): fires of at
-/// most these many tokens, beside the largest.
-pub const ACTIVATION_RUNGS: [u32; 3] = [256, 1024, 4096];
-
 /// The carve of `compiled`'s arena for fires of at most `tokens` tokens
 /// (and as many lanes), every other ceiling as `budgets` states it: what
 /// one activation rung lays out. As the arena for every fire was carved.

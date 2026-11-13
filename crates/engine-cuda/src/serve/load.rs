@@ -1025,7 +1025,13 @@ impl Shell {
         }
         let mut pools = pools;
         let buffers =
-            Buffers::reserve(&boot.trace, paging, budgets.tokens.max_tokens, &mut pools)?;
+            Buffers::reserve(
+                &boot.trace,
+                paging,
+                budgets.tokens.max_tokens,
+                budgets.tokens.max_lanes,
+                &mut pools,
+            )?;
         // Each row-streamed table's cache opens over its host copy.
         let hosts: Vec<(u32, u64)> = pools
             .row_params()
@@ -1431,8 +1437,7 @@ impl Shell {
                 .fold(0u64, |sum, slab| sum.saturating_add(slab.grown as u64));
             let workspace = kernels_cuda::jit::Slabs::placed_bytes(&placed) as u64;
             if workspace > 0 {
-                let at = shell.pools.activation_bytes();
-                shell.pools.widen_activation(workspace)?;
+                let at = shell.pools.widen_activation(workspace)?;
                 shell.workspace = Some(Workspace {
                     at,
                     bytes: workspace,
@@ -2138,19 +2143,19 @@ fn walk_fire_fit(trace: &poem_ir::Trace, rows: u32, sms: u32) -> Option<u32> {
     Some((sms / heads.max(1)).max(1) * rows)
 }
 
-/// The activation rungs below the largest (SPEC decision 6): for each of
-/// [`poem_compiler::ACTIVATION_RUNGS`], the largest bucket at most that
-/// many tokens and its carve, where that carve is smaller than the arena
-/// for every fire. Smallest first.
+/// The activation rungs below the largest (SPEC decision 6): for every
+/// power of two of tokens, the largest bucket at most that many tokens and
+/// its carve, where that carve is smaller than the arena for every fire.
+/// Smallest first.
 fn activation_rungs(
     trace: &poem_ir::Trace,
     budgets: &Budgets,
     compiled: &CompiledModel,
 ) -> Result<Vec<(u32, poem_compiler::ArenaMap)>> {
     let max = budgets.tokens.max_tokens;
-    let mut tokens: Vec<u32> = poem_compiler::ACTIVATION_RUNGS
-        .iter()
-        .filter_map(|&rung| {
+    let mut tokens: Vec<u32> = engine::memory::rungs(1, max)
+        .into_iter()
+        .filter_map(|rung| {
             budgets
                 .tokens
                 .buckets
