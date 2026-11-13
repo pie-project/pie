@@ -29,8 +29,8 @@ pub const BAND_VERT: Class = Class::new("HV2");
 pub const BAND_V1: Class = Class::new("V1");
 pub const BAND_W2: Class = Class::new("W2");
 
-/// The band bus's colour (the token loop's `EMB_WEST`, recoloured): the band's head and control
-/// PEs never park on it and count it as final.
+/// The band bus's preferred colour (the token loop's `EMB_WEST`, recoloured): the band's head
+/// and control PEs never park on the bus's colour and count it as final.
 pub const BUS_COLOUR: u8 = 10;
 
 /// The x leaving its MoE row for the band (the turning weight PE's in / out); the dims-row

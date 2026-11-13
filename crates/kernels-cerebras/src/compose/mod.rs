@@ -468,11 +468,14 @@ mod tests {
     }
 
     /// Every shipping model's preset and every tiny one composes and builds (the capture pins
-    /// what each makes).
+    /// what each makes), each class in its block's preferred colour.
     #[test]
     fn every_preset_composes() {
+        // ... and keeps every class's preferred colour: the colouring changes no shipping palette
         let check = |p: crate::plan::Plan, what: &str| {
-            Program::of(p).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let prog = Program::of(p).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let declared = crate::fabric::Palette::of(prog.blocks.iter().flat_map(|b| b.colours()));
+            assert_eq!(prog.palette.map, declared.map, "{what}");
         };
         for (name, preset) in [
             ("qwen35-d9b-bf16-kv-bf16", "9b"),

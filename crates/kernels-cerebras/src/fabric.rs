@@ -1,7 +1,8 @@
 //! The fabric: physical colours, every PE's route table and queue bindings, and the hardware
-//! invariants checked on them. [`Fabric::lay`] turns a [`Wiring`] into routes through the
-//! program's [`Palette`] (its blocks' colour declarations); [`Fabric::validate`] refuses a
-//! program the CS-3 would hang or miscompute on.
+//! invariants checked on them. [`Palette::allocate`] colours the wiring's classes (an
+//! interference colouring of their footprints, each class its block's preferred colour where it
+//! is free); [`Fabric::lay`] turns a [`Wiring`] into routes through that [`Palette`];
+//! [`Fabric::validate`] refuses a program the CS-3 would hang or miscompute on.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -52,9 +53,8 @@ impl RouteWord {
     }
 }
 
-/// The logical -> physical colour map: every block's declarations ([`super::block::Block::colours`])
-/// in block order, a later declaration of a class replacing an earlier one (a block recolouring a
-/// class it shares). A future allocator may assign them instead ([`Palette::allocate`]).
+/// The logical -> physical colour map ([`Palette::allocate`]: every class the blocks declare or
+/// the links lay, coloured apart from every class it meets).
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Palette {
     pub map: BTreeMap<Class, Colour>,
@@ -66,6 +66,89 @@ impl Palette {
         Palette {
             map: decls.into_iter().map(|(k, c)| (k, Colour(c))).collect(),
         }
+    }
+
+    /// The colours of `w`'s classes on `floor`: an interference colouring of their footprints.
+    /// Two classes meet where both route at one PE, unless their words there are one and the same
+    /// pass-through (what [`Fabric::lay`] merges); classes that never meet share colours freely.
+    /// `prefs` are the blocks' preferred colours ([`super::block::Block::colours`], a later
+    /// declaration of a class replacing an earlier one): a class keeps its preferred colour where
+    /// no class it meets kept it first (classes in their order), so a program whose preferences
+    /// never clash is coloured as its blocks declare. Every other class (a preference taken, or
+    /// none: a class the links lay that no block colours) takes the lowest colour no class it
+    /// meets holds, the most constrained first. A class that meets every colour is refused by
+    /// name, with the classes it meets.
+    pub fn allocate(
+        prefs: impl IntoIterator<Item = (Class, u8)>,
+        floor: &Floor,
+        w: &Wiring,
+    ) -> Result<Palette, String> {
+        let prefs: BTreeMap<Class, u8> = prefs.into_iter().collect();
+        let mut classes: BTreeSet<Class> = prefs.keys().copied().collect();
+        for l in &w.links {
+            classes.extend(l.classes());
+        }
+        let ids: Vec<Class> = classes.into_iter().collect();
+        if ids.len() > usize::from(u8::MAX) {
+            return Err(format!("colouring: {} classes", ids.len()));
+        }
+        // each class a colour of its own, to read its footprint off the laid routes
+        let own = Palette {
+            map: ids
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| (c, Colour(i as u8)))
+                .collect(),
+        };
+        let routes = Lay::routes(floor, w, &own, u8::MAX)?;
+        let n = ids.len();
+        let mut meets = vec![BTreeSet::<usize>::new(); n];
+        let pass = |r: &Route| !r.word.to_ramp() && r.word.0 & 0x80 == 0;
+        for (_, rs) in routes.iter() {
+            for (i, a) in rs.iter().enumerate() {
+                for b in &rs[i + 1..] {
+                    if a.word == b.word && pass(a) {
+                        continue;
+                    }
+                    let (x, y) = (usize::from(a.colour.0), usize::from(b.colour.0));
+                    meets[x].insert(y);
+                    meets[y].insert(x);
+                }
+            }
+        }
+        let mut colour: Vec<Option<u8>> = vec![None; n];
+        let held = |colour: &[Option<u8>], i: usize| -> BTreeSet<u8> {
+            meets[i].iter().filter_map(|&j| colour[j]).collect()
+        };
+        for (i, c) in ids.iter().enumerate() {
+            if let Some(&p) = prefs.get(c)
+                && p < COLOURS
+                && !held(&colour, i).contains(&p)
+            {
+                colour[i] = Some(p);
+            }
+        }
+        while let Some(i) = (0..n)
+            .filter(|&i| colour[i].is_none())
+            .max_by_key(|&i| (held(&colour, i).len(), meets[i].len(), std::cmp::Reverse(i)))
+        {
+            let h = held(&colour, i);
+            let c = (0..COLOURS).find(|c| !h.contains(c)).ok_or_else(|| {
+                format!(
+                    "colouring: {:?} meets classes holding all {COLOURS} colours: {:?}",
+                    ids[i],
+                    meets[i].iter().map(|&j| ids[j]).collect::<Vec<_>>()
+                )
+            })?;
+            colour[i] = Some(c);
+        }
+        Ok(Palette {
+            map: ids
+                .into_iter()
+                .zip(colour)
+                .map(|(k, c)| (k, Colour(c.unwrap_or(0))))
+                .collect(),
+        })
     }
 
     pub fn get(&self, c: Class) -> Result<Colour, String> {
@@ -166,14 +249,46 @@ impl Endpoint {
 /// [`Fabric::lay`]'s working state.
 struct Lay<'a> {
     palette: &'a Palette,
+    /// The colours the palette may use ([`COLOURS`]; every `u8` when a footprint is read).
+    limit: u8,
     routes: Grid<Vec<Route>>,
     io: Grid<PeIo>,
 }
 
 impl Lay<'_> {
+    /// Every link of `w` laid through `palette` (colours under `limit`): the routes only.
+    fn routes(
+        floor: &Floor,
+        w: &Wiring,
+        palette: &Palette,
+        limit: u8,
+    ) -> Result<Grid<Vec<Route>>, String> {
+        let mut l = Lay {
+            palette,
+            limit,
+            routes: Grid::filled(floor.w, floor.h, Vec::new()),
+            io: Grid::filled(floor.w, floor.h, PeIo::default()),
+        };
+        l.links(w)?;
+        Ok(l.routes)
+    }
+
+    fn links(&mut self, w: &Wiring) -> Result<(), String> {
+        for link in &w.links {
+            match link {
+                Link::Chain(c) => self.chain(c)?,
+                Link::Tree(t) => self.tree(t)?,
+                Link::Multicast(m) => self.multicast(m)?,
+                Link::Path(p) => self.path(p)?,
+                Link::Turn(t) => self.turn(t)?,
+            }
+        }
+        Ok(())
+    }
+
     fn colour(&self, c: Class) -> Result<Colour, String> {
         let col = self.palette.get(c)?;
-        if col.0 >= COLOURS {
+        if col.0 >= self.limit {
             return Err(format!("palette: {c:?} -> colour {} >= {COLOURS}", col.0));
         }
         Ok(col)
@@ -624,18 +739,11 @@ impl Fabric {
     pub fn lay(floor: &Floor, w: &Wiring, palette: &Palette) -> Result<Fabric, String> {
         let mut l = Lay {
             palette,
+            limit: COLOURS,
             routes: Grid::filled(floor.w, floor.h, Vec::new()),
             io: Grid::filled(floor.w, floor.h, PeIo::default()),
         };
-        for link in &w.links {
-            match link {
-                Link::Chain(c) => l.chain(c)?,
-                Link::Tree(t) => l.tree(t)?,
-                Link::Multicast(m) => l.multicast(m)?,
-                Link::Path(p) => l.path(p)?,
-                Link::Turn(t) => l.turn(t)?,
-            }
-        }
+        l.links(w)?;
         for n in &w.notes {
             l.at(n.at)?;
             *l.io.get_mut(n.at).notes.entry(n.key).or_insert(0) |= n.value;
@@ -840,5 +948,94 @@ impl Fabric {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::floor::{CtlLine, HeadBlock, Rect};
+    use crate::role::PeRole;
+    use crate::wiring::PASS;
+
+    fn floor(w: u32, h: u32) -> Floor {
+        Floor {
+            w,
+            h,
+            units: Vec::new(),
+            relays: Vec::new(),
+            head: HeadBlock {
+                rect: Rect::new(0, 0, 0, 0),
+                ctl: CtlLine::Column(0),
+                root: Coord::new(0, 0),
+            },
+            stores: Vec::new(),
+            roles: Grid::filled(w, h, PeRole::IDLE),
+        }
+    }
+
+    fn path(class: Class, pts: &[(u32, u32)]) -> Link {
+        Link::Path(Path {
+            pts: pts.iter().map(|&(x, y)| Coord::new(x, y)).collect(),
+            class,
+            send: PASS,
+            recv: PASS,
+        })
+    }
+
+    /// Classes that meet at a PE take different colours, the first in class order its preferred
+    /// one; classes that never meet share colours; a class no block colours takes the lowest one
+    /// free; the result lays with no clash.
+    #[test]
+    fn the_colouring_keeps_preferences_that_do_not_clash() {
+        let (a, b, c, d) = (
+            Class::new("A"),
+            Class::new("B"),
+            Class::new("C"),
+            Class::new("D"),
+        );
+        let w = Wiring {
+            links: vec![
+                // A along row 0, B down column 1: they meet at (1, 0)
+                path(a, &[(0, 0), (1, 0), (2, 0), (3, 0)]),
+                path(b, &[(1, 0), (1, 1), (1, 2)]),
+                // C and D far from both
+                path(c, &[(3, 2), (3, 3)]),
+                path(d, &[(0, 3), (1, 3)]),
+            ],
+            notes: Vec::new(),
+        };
+        let fl = floor(4, 4);
+        let p = Palette::allocate([(a, 5), (b, 5), (d, 5)], &fl, &w).unwrap();
+        assert_eq!(p.get(a).unwrap(), Colour(5));
+        assert_ne!(p.get(b).unwrap(), Colour(5));
+        assert_eq!(p.get(b).unwrap(), Colour(0));
+        assert_eq!(p.get(c).unwrap(), Colour(0));
+        assert_eq!(p.get(d).unwrap(), Colour(5));
+        Fabric::lay(&fl, &w, &p).unwrap();
+        // the declared palette clashes
+        assert!(Fabric::lay(&fl, &w, &Palette::of([(a, 5), (b, 5), (c, 0), (d, 5)])).is_err());
+    }
+
+    /// A class that meets more classes than there are colours is refused by name.
+    #[test]
+    fn a_class_past_every_colour_is_refused() {
+        const NAMES: [&str; 22] = [
+            "K0", "K1", "K2", "K3", "K4", "K5", "K6", "K7", "K8", "K9", "K10", "K11", "K12", "K13",
+            "K14", "K15", "K16", "K17", "K18", "K19", "K20", "K21",
+        ];
+        let links = NAMES
+            .iter()
+            .map(|&n| path(Class::new(n), &[(0, 0), (1, 0)]))
+            .collect();
+        let w = Wiring {
+            links,
+            notes: Vec::new(),
+        };
+        let e = Palette::allocate([], &floor(2, 1), &w).unwrap_err();
+        assert!(
+            e.contains("colouring:") && e.contains("all 21 colours"),
+            "{e}"
+        );
     }
 }

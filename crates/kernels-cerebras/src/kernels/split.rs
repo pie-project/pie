@@ -10,7 +10,7 @@ use crate::block::band::{BAND_IN, BAND_OUT, BAND_V1, BAND_VERT, BUS, BUS_COLOUR,
 use crate::block::head::{HEAD_COL_CAST, HEAD_IN, HEAD_ROW_REDUCE, HEAD_ROW_WORD};
 use crate::block::moe::{CYA, CYM, ROUTER, WA, WM};
 use crate::block::segments::ONORM_CAST;
-use crate::block::token_loop::EMB_IN;
+use crate::block::token_loop::{EMB_IN, EMB_WEST};
 use crate::block::units::{RELAY_POST, RELAY_PRE, ROW_CAST, X_IN, X_OUT};
 use crate::plan::{LayerKind, Plan};
 use crate::program::Program;
@@ -344,13 +344,19 @@ pub fn band(prog: &Program) -> R<Kernels> {
     Ok(out)
 }
 
+/// The band bus's colour: the palette's for the token loop's return west (the band bus), else the
+/// one the band prefers for it.
+fn bus_colour(pe: &Pe) -> u8 {
+    pe.prog.palette.get(EMB_WEST).map_or(BUS_COLOUR, |c| c.0)
+}
+
 /// `pe` as a band PE sees it: the bus colour reserved.
 fn banded<'a>(pe: &Pe<'a>) -> Pe<'a> {
     Pe {
         prog: pe.prog,
         at: pe.at,
         io: pe.io,
-        reserved: Some(BUS_COLOUR),
+        reserved: Some(bus_colour(pe)),
     }
 }
 
@@ -464,7 +470,7 @@ fn head(pe: &Pe) -> R<Vec<u32>> {
     let src = pe.colour(HEAD_IN).is_some();
     let bus = wl && pe.colour(BUS).is_some();
     let (hv2, hm, hr3) = (pe.c(BAND_VERT)?, pe.c(HEAD_COL_CAST)?, pe.c(HEAD_ROW_WORD)?);
-    let he = u32::from(BUS_COLOUR);
+    let he = u32::from(bus_colour(pe));
     let q = [
         ro.recv1.map_or(pk[0], word),
         ro.recv2.map_or(pk[1], word),

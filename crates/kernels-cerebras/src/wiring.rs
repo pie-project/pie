@@ -232,6 +232,30 @@ pub enum Link {
     Turn(Turn),
 }
 
+impl Link {
+    /// The classes the link lays.
+    #[must_use]
+    pub fn classes(&self) -> Vec<Class> {
+        match self {
+            Link::Chain(c) => {
+                let mut v = vec![c.l1[0], c.l1[1], c.cast];
+                if let Some(l2) = c.l2.filter(|l| l.group > 0) {
+                    v.extend(l2.colours);
+                }
+                v
+            }
+            Link::Tree(t) => {
+                let mut v = t.colours.to_vec();
+                v.push(t.cast);
+                v
+            }
+            Link::Multicast(m) => vec![m.class],
+            Link::Path(p) => vec![p.class],
+            Link::Turn(t) => vec![t.class],
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Note {
     pub at: Coord,

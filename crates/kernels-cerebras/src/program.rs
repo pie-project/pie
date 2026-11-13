@@ -81,7 +81,7 @@ impl Program {
         for b in &blocks {
             b.settle(&plan, &wiring, &mut floor)?;
         }
-        let palette = Palette::of(blocks.iter().flat_map(|b| b.colours()));
+        let palette = Palette::allocate(blocks.iter().flat_map(|b| b.colours()), &floor, &wiring)?;
         let fabric = Fabric::lay(&floor, &wiring, &palette)?;
         fabric.validate(&floor)?;
         let program = layers::of(&plan.shape);
