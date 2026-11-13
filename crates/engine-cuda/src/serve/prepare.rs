@@ -1706,9 +1706,16 @@ impl FrameShell for Shell {
             // `REPLAYED` more.
             let own = launched.max(rows);
             let regions = u32::try_from(windows.len()).unwrap_or(u32::MAX).max(1);
+            // A body's windows are laid at those ceilings whatever its
+            // lanes replay; a walked fire's hold what they replay beside.
+            let replayed = if bodied {
+                0
+            } else {
+                rs_replays.iter().sum::<u32>()
+            };
             own.saturating_mul(2)
                 .saturating_add(regions.saturating_mul(crate::store::rs::REPLAYED))
-                .saturating_add(rs_replays.iter().sum::<u32>())
+                .saturating_add(replayed)
         } else {
             0
         };

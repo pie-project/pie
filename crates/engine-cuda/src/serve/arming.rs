@@ -95,6 +95,9 @@ pub(super) struct Arming {
     starved: Option<u64>,
     peer_stopped: bool,
     unit_margin: u64,
+    /// The buckets of the profile's lattice, before arming coarsened any
+    /// away.
+    profiled: usize,
     ballot: Ballot,
 }
 
@@ -1416,6 +1419,7 @@ impl Shell {
             starved: None,
             peer_stopped: false,
             unit_margin: self.pools.map_unit_bytes().saturating_mul(16),
+            profiled: self.budget.buckets.len(),
             ballot: Ballot::open(&self.device),
         })
     }
@@ -1853,6 +1857,13 @@ impl Shell {
             seal,
         };
         eprintln!("engine-cuda: {report}");
+        // The lattice the bodies armed over against the profile's: fewer
+        // buckets is the allowance binding, each fire padded further.
+        eprintln!(
+            "engine-cuda: lattice armed over {} of the profile's {} buckets",
+            self.budget.buckets.len(),
+            st.profiled
+        );
         // A load that records bodies serves every composition it fires from
         // one: one that armed none, or stopped arming for want of room, would
         // serve eagerly, which is never what a deployment asked for.
@@ -2181,6 +2192,7 @@ mod tests {
             starved: None,
             peer_stopped: false,
             unit_margin: 0,
+            profiled: 0,
             ballot: Ballot { slip: None },
         }
     }

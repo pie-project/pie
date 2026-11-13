@@ -46,8 +46,9 @@ pub const REPLAYED: u32 = 16;
 
 /// The extended run's scratch: a run of the activation's span, a fire's
 /// rows and the buffered slots its lanes replay ahead of them, a row each
-/// at the widest recurrence's width. Its reach is the most a fire asks; a
-/// prefix of it is backed as fires reach further.
+/// at the widest recurrence's width. Its reach is the most a fire asks
+/// ([`Buffers::lay_reach`]); a prefix of it is backed as fires reach
+/// further.
 #[derive(Debug, Clone, Copy)]
 struct Scratch {
     /// Where it starts in the activation's span.
@@ -89,7 +90,7 @@ impl Buffers {
         paging: Paging,
         max_rows: u32,
         max_lanes: u32,
-        pools: &mut Pools,
+        pools: &Pools,
     ) -> Result<Option<Buffers>> {
         let layout = pools.rs_layout();
         let tokens = layout.as_ref().map_or(1, |(tokens, _)| (*tokens).max(1));
@@ -123,10 +124,9 @@ impl Buffers {
                 .saturating_add(max_lanes.min(paging.slots).saturating_mul(2 * REPLAYED)),
             ext_row_bytes,
         );
-        let at = pools.widen_activation(reach)?;
         Ok(Some(Buffers {
             scratch: Scratch {
-                at,
+                at: 0,
                 reach,
                 held: 0,
             },
@@ -468,10 +468,27 @@ impl Buffers {
                 have: self.scratch.reach,
             });
         }
-        // A size-only walk backs nothing (`crate::sizing`): what it asked
-        // is backed when the load lays the span ([`Buffers::lay_scratch`]).
-        pools.hold_activation_at(self.scratch.at, bytes, true)?;
+        // A size-only walk backs nothing (`crate::sizing`), and walks
+        // before the scratch has its run: what it asked is the reach, laid
+        // and backed with the span ([`Buffers::lay_reach`]).
+        if !crate::sizing::active() {
+            pools.hold_activation_at(self.scratch.at, bytes, true)?;
+        }
         self.scratch.held = bytes;
+        Ok(())
+    }
+
+    /// Gives the scratch its run of the activation's span, widened by its
+    /// reach: where a size-only walk fired the load's compositions
+    /// (`walked`), the most one of them asked, a recorded body's windows
+    /// being laid at their ceilings whatever its lanes replay; else the
+    /// most any fire may ask. A fire that walks its plan and replays past
+    /// that is refused.
+    pub fn lay_reach(&mut self, pools: &mut Pools, walked: bool) -> Result<()> {
+        if walked {
+            self.scratch.reach = self.scratch.held;
+        }
+        self.scratch.at = pools.widen_activation(self.scratch.reach)?;
         Ok(())
     }
 
