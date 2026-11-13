@@ -384,11 +384,12 @@ __global__ void moe_sum_add(T* __restrict__ out, const T* __restrict__ src, cons
 }
 
 // y[n][h] = x[n][h] + Σ_k weights[n][k] · bias[routes[n][k]][h]; a dead
-// route (expert < 0) adds nothing.
+// route (expert < 0) adds nothing. The bias is a one-plane bank, read
+// through `expert_table` where the weight cache places it.
 template <class T>
 __global__ void moe_bias_sum(T* __restrict__ out, const T* __restrict__ x, const T* __restrict__ bias,
                              const i32* __restrict__ topk_idx, const float* __restrict__ weights, int top_k,
-                             int hidden, const u32* __restrict__ win) {
+                             int hidden, const u32* __restrict__ win, const u64* __restrict__ expert_table) {
     const Window window{win};
     if (!window.live(blockIdx.x)) return;
     const long long n = window.plane(blockIdx.x);
@@ -399,7 +400,7 @@ __global__ void moe_bias_sum(T* __restrict__ out, const T* __restrict__ x, const
     for (int k = 0; k < top_k; ++k) {
         const int e = topk_idx[base + k];
         if (e < 0) continue;
-        acc += weights[base + k] * to_f32(bias[static_cast<long long>(e) * hidden + h]);
+        acc += weights[base + k] * to_f32(expert_plane(bias, hidden, expert_table, 1, 0, e)[h]);
     }
     out[i] = from_f32<T>(acc);
 }

@@ -479,10 +479,9 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
                 }
                 // An expert bias summed into the routed rows (gpt-oss's
                 // down leg): a one-plane bank the sum reads through its
-                // table (the HIP sum reads none: the bias stays whole).
+                // table.
                 Operation::Linear(Linear::MoeBiasSum { bias, .. })
                     if packs
-                        && !cfg!(feature = "rocm")
                         && planes.is_empty()
                         && matches!(trace.values.get(bias.0 as usize).map(|d| &d.def),
                             Some(Def::Weight(w)) if *w as usize == at) =>

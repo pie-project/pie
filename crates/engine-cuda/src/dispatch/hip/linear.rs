@@ -980,6 +980,9 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*weights),
                 &mut self.tensor(*y),
+                // A bias the weight cache streams is a one-plane bank read
+                // through its table.
+                self.bank_table(*bias),
             ),
             Linear::LoraCorrect {
                 x,
