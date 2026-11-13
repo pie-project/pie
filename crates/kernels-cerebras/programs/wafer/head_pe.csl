@@ -19,13 +19,25 @@
 // The VA route goes back only after oq4 has drained and the next step's x is in (restoring it
 // right after the send stranded the slice's tail and hung the next winner's column on the CS-3).
 //
-// Interface. Exports hw (u16 lm_head tile), hg (f32 1 + w), hemb (u16 embedding tile), rcfg, tdbg
-// (always on: start, x in, matvec done, partial sent, loop phase done), init, compute.
+// Interface. Exports hw (u16 lm_head tile), hg (f32 1 + w, or the band's w), hemb (u16 embedding
+// tile), rcfg, tdbg (always on: start, x in, matvec done, partial sent, loop phase done), init,
+// compute.
 // rcfg: from RQ: [0..5) iq2..iq6, [5] oq2, [6] oq3, [7] the row role, [8] the x
 // role, [9] the spare colour, [10] iq7, [11] loop flags (bit 0 on, 1 the VA sink, 2 te, 3 to),
-// [12] the head row, [13..17) oq4..oq7.
+// [12] the head row, [13..17) oq4..oq7 (the band: [0..5) iq2 / iq3 the column reduction's, iq4 x from
+// the north, iq5 the bus end's input, iq6 the dims-row multicast; [12] -, [13..15) oq4 the bus, oq5 V1).
 // Queues: iq2 / iq3 the row reduction's inputs (level 1 / FIFO end), iq4 HX, iq5 HN, iq6 HM, iq7 the
 // row word; oq2 the row reduction's send, oq3 HN / HM, oq4 VA, oq5 VS, oq6 HE, oq7 HS.
+//
+// The band (BAND 1; the split layout's head): HDR dims-rows (HDc = the units' Hc dims each, fed by the
+// last unit's CX row of the same index) by HVC vocabulary columns, with the control row in the middle of
+// the band: the logits reduce along a column (the row reduction's queues) into its control PE. x roles: 0
+// take the dims-row multicast (iq6); 2 take x's HDc words from the north (iq4: the last unit's relay
+// column) and multicast them along the dims-row (oq3) both ways. The token loop's word is the column's;
+// the winner column's PEs send row j west along their dims-row on the bus (oq4, their own route switched
+// to their ramp, as VA above) to column 0 (flags bit 1, the bus end), which sends it on oq5 (V1, to unit
+// 0's MoE relay PE of its row); the bus end itself sends straight on oq5 when it is the winner, and takes
+// the bus on iq5 otherwise. No turns (flags bits 2, 3), no oq6 / oq7 (rcfg [15], [16]).
 //
 // Head groups (GRP 1): a head column takes x's dims of a group of consecutive CX rows (NX <= HDc
 // words, rcfg [17]; the rest of its HDc dims are padding with zero weights): the group's root CX
@@ -35,7 +47,10 @@
 // token loop sends its NX dims north on VA to row 0, south on VS to the group's root row (te),
 // west on HE into unit 0's CX (the group's root; the chain spreads them).
 //
-// Params. VR, HDc (shape). GRP (head groups). NPX: x in NPX f16 parts (x = p0 + p1 + ...) with f32 accumulation (1:
+// Params. VR, HDc (shape). GRP (head groups). BAND (the band, above). XSC (1: the tile is 2^15 lm_head,
+// the bf16 weights out of f16's subnormals, and x the raw residual: x hg is scaled by 2^-S, S the
+// exponent of its largest |value| less 7, into f16 and the f32-accumulated partials back by 2^S; a
+// dims-row's PEs have the same x, so the same S). NPX: x in NPX f16 parts (x = p0 + p1 + ...) with f32 accumulation (1:
 // the shipped build; 2 the exact-x form). HACC16 (measurement, default off): the partials
 // accumulate in f16 (@fmach) and widen once (-1.7k cycles a token on the 9B, but it halves the
 // golden's tightest margin).
@@ -45,6 +60,8 @@ param HDc: u16;
 param NPX: u16 = 1;    // x's f16 parts
 param HACC16: u16 = 0; // 1 (measurement): the logit partials accumulate in f16 (y16), then widen once
 param GRP: u16 = 0;    // 1: head groups and the tied embedding (see the header)
+param BAND: u16 = 0;   // 1: the band head (see the header)
+param XSC: u16 = 0;    // 1: x scaled by a power of two into f16, the partials back
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
@@ -87,7 +104,7 @@ const ut_b = @get_ut_id(5);
 const rr = @import_module("ops/red.csl", .{ .fab = fab, .IN1 = q_ra, .IN2 = q_rb, .OUT = q_ro, .UT1 = ut_a, .UT2 = ut_b, .FIFOW = 32 });
 const NR: u16 = 12;
 const RQ: u16 = 1 + 2 * NR;
-var rcfg = @zeros([RQ + 17 + GRP]u32);   // (see the header)
+var rcfg = @zeros([RQ + 17 - 2 * BAND + GRP]u32);   // (see the header)
 var rcfg_ptr: [*]u32 = &rcfg;
 var role_x: u16 = 0;
 var nx: u16 = 0;   // (GRP 1) the group's x words
@@ -101,7 +118,8 @@ fn init() void {
   var fq = [6]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), @as(u16, rcfg[RQ + 4]), @as(u16, rcfg[RQ + 10]) };
   fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 9]));
   fab.oqc(2, rcfg[RQ + 5]); fab.oqc(3, rcfg[RQ + 6]);
-  fab.oqc(4, rcfg[RQ + 13]); fab.oqc(5, rcfg[RQ + 14]); fab.oqc(6, rcfg[RQ + 15]); fab.oqc(7, rcfg[RQ + 16]);
+  fab.oqc(4, rcfg[RQ + 13]); fab.oqc(5, rcfg[RQ + 14]);
+  if (BAND == 0) { fab.oqc(6, rcfg[RQ + 15]); fab.oqc(7, rcfg[RQ + 16]); }
   wfl = @as(u16, rcfg[RQ + 11]);
   va_addr = color_config.get_color_config_addr(@get_color(0)) + @as(u16, rcfg[RQ + 13]);
   va_orig = @get_config(va_addr, tgt.color_addr_range) & 0xff;
@@ -119,12 +137,14 @@ fn recv_x() void {
   const H2: u16 = HDc / 2;
   if (role_x == 0) {
     @fmovs(x_d, fab.fin(q_hm, HDc));
-  } else if (GRP == 0 and role_x == 1) {
+  } else if (GRP == 0 and BAND == 0 and role_x == 1) {
     @fmovs(fab.fout(q_xo, H2), fab.fin(q_hx, H2));
     @fmovs(x_d, fab.fin(q_hm, HDc));   // B's multicast passes this PE too
   } else {
     if (GRP == 1) {
       @fmovs(@set_dsd_length(x_d, nx), fab.fin(q_hx, nx));
+    } else if (BAND == 1) {
+      @fmovs(x_d, fab.fin(q_hx, HDc));
     } else {
       @fmovs(@set_dsd_length(x_d, H2), fab.fin(q_hx, H2));
       @fmovs(@set_dsd_length(@increment_dsd_offset(x_d, @as(i16, H2), f32), H2), fab.fin(q_hn, H2));
@@ -155,6 +175,28 @@ fn va_restore() void {
   const r = @get_config(va_addr, tgt.color_addr_range) & 0xff00;
   @set_config(va_addr, r | va_orig, tgt.color_addr_range);
   va_dirty = false;
+}
+// The band's loop: the bus end (sink) sends the winner's row on oq5, its own or the bus's (iq5).
+fn hloop_band() void {
+  @fmovs(ww_d, fab.fin(q_w, 1));
+  const w = ww[0];
+  if (w < -1.0e8) { return; }
+  const sink = (wfl & 2) != 0;
+  if (w >= 0.0) {
+    const j = @as(u16, w);
+    @fmovs(eb_d, 0.0);
+    @mov16(ebw_d, @increment_dsd_offset(ebh_d, @as(i16, j * HDc), u16));
+    if (sink) {
+      @fmovs(fab.fout(q_vs, HDc), eb_d);
+    } else {
+      const r = @get_config(va_addr, tgt.color_addr_range) & 0xff00;
+      @set_config(va_addr, r | 0x80 | (va_orig & 0x1f), tgt.color_addr_range);
+      va_dirty = true;
+      @fmovs(fab.fout(q_va, HDc), eb_d);
+    }
+  } else if (sink) {
+    @fmovs(fab.fout(q_vs, HDc), fab.fin(q_hn, HDc));
+  }
 }
 fn hloop() void {
   const H2: u16 = HDc / 2;
@@ -223,27 +265,43 @@ task pass_task() void {
     stamp(1);
     va_restore();
     @fmuls(xr_d, x_d, hg_d);
-    @fmovs(y_d, 0.0);
-    if (HACC16 == 1) { @fmovh(yh_d, @as(@fp16(), 0.0)); }
-    var k: u16 = 0;
-    while (k < NPX) : (k += 1) {
+    if (XSC == 1) {   // x hg by 2^-S into f16, the partials back by 2^S
+      var mb: u32 = 0;
+      var i: u16 = 0;
+      while (i < HDc) : (i += 1) { const b = @bitcast(u32, xr[i]) & 0x7fffffff; if (b > mb) { mb = b; } }
+      var e: i16 = if (mb == 0) 0 else @as(i16, @as(u16, mb >> 23)) - 127 - 7;
+      if (e < -100) { e = -100; }
+      @fmuls(xr_d, xr_d, @bitcast(f32, @as(u32, @as(u16, 127 - e)) << 23));
       @fs2h(xp_d, xr_d);
-      if (k + 1 < NPX) {
-        @fh2s(x_d, xp_d);
-        @fsubs(xr_d, xr_d, x_d);
-      }
+      @fmovs(y_d, 0.0);
       const a = @set_dsd_base_addr(a_d, @ptrcast([*]@fp16(), &hw[0]));
-      if (HACC16 == 1) {   // f16 accumulation (@fmach, the weight PEs' F16 path): the 32-dim partial in f16
-        matvec.mac16(yh_d, a, xp_d);
-      } else {
-        matvec.mac32(y_d, a, xp_d);
+      matvec.mac32(y_d, a, xp_d);
+      @fmuls(y_d, y_d, @bitcast(f32, @as(u32, @as(u16, 127 + e)) << 23));
+    } else {
+      @fmovs(y_d, 0.0);
+      if (HACC16 == 1) { @fmovh(yh_d, @as(@fp16(), 0.0)); }
+      var k: u16 = 0;
+      while (k < NPX) : (k += 1) {
+        @fs2h(xp_d, xr_d);
+        if (k + 1 < NPX) {
+          @fh2s(x_d, xp_d);
+          @fsubs(xr_d, xr_d, x_d);
+        }
+        const a = @set_dsd_base_addr(a_d, @ptrcast([*]@fp16(), &hw[0]));
+        if (HACC16 == 1) {   // f16 accumulation (@fmach, the weight PEs' F16 path): the 32-dim partial in f16
+          matvec.mac16(yh_d, a, xp_d);
+        } else {
+          matvec.mac32(y_d, a, xp_d);
+        }
       }
+      if (HACC16 == 1) { @fh2s(y_d, yh_d); }
     }
-    if (HACC16 == 1) { @fh2s(y_d, yh_d); }
     stamp(2);
     send_r();
     stamp(3);
-    if ((wfl & 1) != 0) { hloop(); }
+    if ((wfl & 1) != 0) {
+      if (BAND == 1) { hloop_band(); } else { hloop(); }
+    }
     stamp(4);
   }
   sys_mod.unblock_cmd_stream();
@@ -254,6 +312,8 @@ fn compute(steps: u32, start_pos: u32) void {
 }
 
 comptime {
+  @comptime_assert(BAND == 0 or GRP == 0);
+  @comptime_assert(XSC == 0 or (NPX == 1 and HACC16 == 0));
   @bind_local_task(pass_task, pass_id);
   @initialize_queue(q_ra, .{ .color = @get_color(13) });
   @initialize_queue(q_rb, .{ .color = @get_color(14) });
@@ -265,8 +325,10 @@ comptime {
   @initialize_queue(q_w, .{ .color = @get_color(20) });
   @initialize_queue(q_va, .{ .color = C_PARK });
   @initialize_queue(q_vs, .{ .color = C_PARK });
-  @initialize_queue(q_he, .{ .color = C_PARK });
-  @initialize_queue(q_hs, .{ .color = C_PARK });
+  if (BAND == 0) {
+    @initialize_queue(q_he, .{ .color = C_PARK });
+    @initialize_queue(q_hs, .{ .color = C_PARK });
+  }
   @export_symbol(hemb_ptr, "hemb");
   @export_symbol(tdbg_ptr, "tdbg");
   @export_symbol(hw_ptr, "hw");

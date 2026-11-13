@@ -24,6 +24,13 @@ params! {
 }
 
 params! {
+    /// [`HeadPe`]'s on the split layout's band (`BAND` 1: x one CX row's dims a dims-row, the
+    /// logits reduced along a vocabulary column, the loop's row sent along the bus) with x scaled
+    /// into f16 by a power of two (`XSC` 1: the 2^15 lm_head tile, the raw residual).
+    pub struct HeadPeBand { VR: u32, HDc: u32, BAND: u32, XSC: u32 }
+}
+
+params! {
     /// `head_ctl.csl`'s params: vocabulary rows a PE, the FIFO depth, forced tokens, the head
     /// rows the forced token is multicast over.
     pub struct HeadCtl { VR: u32, FIFOW: u32, WFORCE: u32, WFN: u32 }

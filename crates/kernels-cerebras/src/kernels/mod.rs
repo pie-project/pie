@@ -13,7 +13,7 @@
 //! - [`runs`]: the row runs' (`weight.csl` with row roles, `cx.csl`, `cy.csl`, `head_pe.csl`
 //!   with head groups, `head_ctl.csl`);
 //! - [`split`]: the attention / MoE halves' (`weight.csl`, `cx.csl`, `cy.csl`'s halves,
-//!   `head_pe_gptoss.csl` on the band, `head_ctl.csl`).
+//!   `head_pe.csl` on the band, `head_ctl.csl`).
 
 use super::abi::Kernels;
 use super::compose::Layout;

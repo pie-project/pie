@@ -10,7 +10,7 @@
 //! - `cx.csl` (always on): `K + 2`, the pass start, each layer's end and the send (NRM 2: `5 K + 2`);
 //! - `head_ctl.csl` (always on): 70, the pass start, the argmax, the root's winner of each step
 //!   (`2 + s`, s < 64) and four phase ends (66 ..= 69);
-//! - `head_pe.csl`, `head_pe_gptoss.csl` (always on): 6, a step's phase ends.
+//! - `head_pe.csl` (always on): 6, a step's phase ends.
 
 use std::path::Path;
 
@@ -88,7 +88,7 @@ pub fn words(source: &str, p: &Params) -> Option<u32> {
             k + 2
         }),
         "head_ctl.csl" => Some(70),
-        "head_pe.csl" | "head_pe_gptoss.csl" => Some(6),
+        "head_pe.csl" => Some(6),
         _ => None,
     }
 }

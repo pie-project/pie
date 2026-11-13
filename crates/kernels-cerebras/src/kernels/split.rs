@@ -1,6 +1,6 @@
 //! The attention / MoE halves' role kernels (gpt-oss, Qwen3 MoE): the attention / MoE weight halves (`weight.csl`, its entry-major attention and routed experts),
 //! CX (`cx.csl`, NRM 2), the CY halves (`cy.csl` (MIXK 2, MIXK 3)), the
-//! band's head (`head_pe_gptoss.csl`) and control row ([`super::head::HEAD_CTL`]'s source). Their
+//! band's head ([`super::head::HEAD_PE`]'s source, BAND 1) and control row ([`super::head::HEAD_CTL`]'s source). Their
 //! params from the plan ([`kernels`]) and their rcfg writers.
 
 use crate::abi::{FILLER, Kernel, KernelBuild, Kernels, Lit, Params, params};
@@ -16,7 +16,7 @@ use crate::role::{Kind, Place};
 use crate::wiring::{LOOPBACK, Slot};
 
 use super::common::{self, CT5, CT6};
-use super::head::{HEAD_CTL, HeadCtl};
+use super::head::{HEAD_CTL, HEAD_PE, HeadCtl, HeadPeBand};
 use super::{Pe, word};
 
 type R<T> = Result<T, String>;
@@ -95,11 +95,6 @@ params! {
     }
 }
 
-params! {
-    /// `head_pe_gptoss.csl`: vocabulary rows a PE, x's dims a dims-row.
-    pub struct HeadPe { VR: u32, HDc: u32 }
-}
-
 pub const WEIGHT_ATT: Kernel = Kernel {
     source: "weight.csl",
     owns: &["w", "rcfg", "tdbg"],
@@ -140,12 +135,11 @@ pub const CY_MOE: Kernel = Kernel {
     rcfg: Some(cy),
 };
 
-pub const HEAD_PE: Kernel = Kernel {
-    source: "head_pe_gptoss.csl",
-    owns: &["hw", "hg", "rcfg", "hemb", "tdbg"],
-    params: HeadPe::NAMES,
-    route_slots: 12,
+/// `head_pe.csl` on the band (BAND 1, XSC 1).
+pub const HEAD_PE_BAND: Kernel = Kernel {
+    params: HeadPeBand::NAMES,
     rcfg: Some(head),
+    ..HEAD_PE
 };
 
 /// `head_ctl.csl` on the band's control row: never parked on the bus.
@@ -320,8 +314,13 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         SWA: Lit::f64(if sc.glu == 1 { 1.0 } else { 1.702 }),
     };
     out.insert(CYM, KernelBuild::of(&CY_MOE, cym)?);
-    let hp = HeadPe { VR: vr, HDc: d.hcc };
-    out.insert(Kind::HEAD, KernelBuild::of(&HEAD_PE, hp)?);
+    let hp = HeadPeBand {
+        VR: vr,
+        HDc: d.hcc,
+        BAND: 1,
+        XSC: 1,
+    };
+    out.insert(Kind::HEAD, KernelBuild::of(&HEAD_PE_BAND, hp)?);
     let hc = HeadCtl {
         VR: vr,
         FIFOW: 32,
@@ -441,9 +440,10 @@ fn cy(pe: &Pe) -> R<Vec<u32>> {
     Ok(w)
 }
 
-/// A band head PE: its band column's queues, the band's x in ([`BAND_VERT`], at its source),
-/// the bus, the dims-row multicast, the row word, the send, the role, the source flag, a spare
-/// colour, the flags (the loop runs, on the bus), the embedding's queues.
+/// A band head PE, in `head_pe.csl`'s word order: its band column's queues, the band's x in
+/// ([`BAND_VERT`], at its source), the bus, the dims-row multicast, the send, the role, the
+/// source flag, a spare colour, the row word, the flags (the loop runs, on the bus), the
+/// embedding's queues.
 fn head(pe: &Pe) -> R<Vec<u32>> {
     let pe = &banded(pe);
     let wl = pe.prog.plan.contract.token_loop;
@@ -463,13 +463,14 @@ fn head(pe: &Pe) -> R<Vec<u32>> {
     ];
     distinct(pe, "head", &q)?;
     let mut w = pe.routes(12)?;
-    w.extend_from_slice(&q);
+    w.extend_from_slice(&q[..5]);
     w.extend_from_slice(&[
         word(ro.send),
         hm,
         if ro.role == 3 { 1 } else { ro.role },
         if src { 2 } else { 0 },
         pe.spare(&q, &CT6)?,
+        q[5],
         u32::from(wl) | if bus { 2 } else { 0 },
         0,
         if wl { he } else { pk[5] },
