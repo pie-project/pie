@@ -22,7 +22,7 @@ pub fn build(
             user.model.name,
         );
     }
-    let model = build_model(&user.model, &user.runtime, engines, metadata)?;
+    let model = build_model(user, engines, metadata)?;
     runtime_config(user, home, builtins, model)
 }
 
@@ -36,8 +36,7 @@ pub fn build_without_engine(
     metadata: runtime::model::ModelMetadata,
 ) -> Result<runtime::bootstrap::Config> {
     let model = runtime::bootstrap::ModelConfig {
-        memory_tolerance: user.model.memory_tolerance,
-        weight_streaming: user.model.weight_streaming,
+        memory_tolerance: user.engine.memory.tolerance(),
         name: user.model.name.clone(),
         model_id: deployment.to_string(),
         kv_page_size: ENGINELESS_PAGE_SIZE as usize,
@@ -124,11 +123,11 @@ fn scheduler(runtime: &config::RuntimeConfig) -> runtime::bootstrap::SchedulerCo
 }
 
 fn build_model(
-    m: &config::ModelConfig,
-    runtime: &config::RuntimeConfig,
+    user: &config::Config,
     engines: ModelEngines,
     metadata: runtime::model::ModelMetadata,
 ) -> Result<runtime::bootstrap::ModelConfig> {
+    let (m, runtime) = (&user.model, &user.runtime);
     let group0_caps = engines.groups[0].caps.clone();
     let snapshot_dir = engines.groups[0].snapshot_dir.clone();
     let engines_facts = engines.groups[0].facts.trace_name.clone();
@@ -148,9 +147,8 @@ fn build_model(
         .into_iter()
         .enumerate()
         .map(|(group, g)| {
-            let disk_kept = kept_disk(m, group, &g);
+            let disk_kept = kept_disk(&user.engine.memory, group, &g);
             runtime::bootstrap::EngineConfig {
-                weights_fit: g.facts.weights_resident,
                 total_pages: g.caps.pools.kv_pages as usize,
                 chunks: g.caps.chunks.clone(),
                 window_tokens: g.caps.pools.window_tokens,
@@ -187,8 +185,7 @@ fn build_model(
         .collect();
 
     Ok(runtime::bootstrap::ModelConfig {
-        memory_tolerance: m.memory_tolerance,
-        weight_streaming: m.weight_streaming,
+        memory_tolerance: user.engine.memory.tolerance(),
         name: m.name.clone(),
         model_id: engines_facts,
         kv_page_size: group0_caps.pools.kv_page_size as usize,
@@ -200,9 +197,10 @@ fn build_model(
 }
 
 /// The disk tier `g` keeps for the next run, its journal beside its slot
-/// files, when `disk_kv_persistent` asked for one and the engine kept it.
+/// files, when `[engine.memory] disk_persistent` asked for one and the
+/// engine kept it.
 fn kept_disk(
-    m: &config::ModelConfig,
+    memory: &config::MemoryConfig,
     group: usize,
     g: &crate::backend::GroupEngine,
 ) -> Option<runtime::bootstrap::KeptDisk> {
@@ -213,11 +211,11 @@ fn kept_disk(
             kept: pools.disk_kv_kept,
         }),
         _ => {
-            if m.disk_kv_persistent {
+            if memory.disk_persistent {
                 tracing::warn!(
                     engine = %g.backend.kind(),
                     disk_pages = pools.disk_kv_pages,
-                    "disk_kv_persistent: this engine keeps no disk tier across runs; it is scratch"
+                    "disk_persistent: this engine keeps no disk tier across runs; it is scratch"
                 );
             }
             None

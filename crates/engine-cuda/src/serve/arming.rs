@@ -1529,9 +1529,9 @@ impl Shell {
             return Err(Fault::Residency(format!(
                 "the card does not hold this deployment's graph bodies: {} of {attempted} \
                  compositions armed{}. A load that records bodies serves every composition \
-                 from one rather than eagerly. Lower `[engine] max_model_len` or the fire \
-                 rows, state a smaller `[model] device_kv_budget`, raise `[model] \
-                 device_memory_share`, or free what else holds the device. ({report})",
+                 from one rather than eagerly. Lower `[engine] max_context`, raise \
+                 `[engine.memory] budget_device`, or free what else holds the device. \
+                 ({report})",
                 armed,
                 match starved {
                     Some(spare) => format!(

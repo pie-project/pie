@@ -1,3 +1,4 @@
+use engine::Allowance;
 use engine::fit::pages_within;
 use engine_cuda::device::elastic::map_unit_for;
 use engine_cuda::device::elastic::{budget_bytes, safety_floor_bytes};
@@ -14,8 +15,8 @@ const WEIGHTS: u64 = 13_761_281_792;
 
 #[test]
 fn the_operators_fraction_sizes_the_pool_every_case() {
-    the_whole_card_is_the_arithmetic_the_pool_had_before();
-    the_fraction_is_of_the_card_and_charges_what_is_already_on_it();
+    the_share_is_of_the_card_and_charges_what_is_already_on_it();
+    a_stated_budget_caps_what_the_load_takes();
     the_card_does_not_hold_a_deployment_whose_weights_leave_no_context();
     the_pool_leaves_room_for_the_programs_guests_register();
     the_reservations_scale_to_a_twenty_four_gigabyte_card();
@@ -55,7 +56,7 @@ fn a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes() {
     // here so the boot stays the one the issue saw.
     let issue_reserve =
         |lanes: u32| program_scratch_reserve(lanes, VOCAB * 4) * 6 / PROGRAM_ROWS_A_LANE;
-    let live = budget_bytes(CARD - BEFORE, CARD, 0.90) - WEIGHTS;
+    let live = budget_bytes(CARD - BEFORE, CARD, Allowance::WHOLE) - WEIGHTS;
     let lm_head = decoded_weight_reserve(VOCAB * HIDDEN * 2, 1);
     let mlp = decoded_weight_reserve(INTERMEDIATE * HIDDEN * 2, 1);
     let working = |lanes: u32, tile: u64| {
@@ -244,7 +245,7 @@ fn the_reservations_scale_to_a_twenty_four_gigabyte_card() {
     const PROGRAMS: u64 = 64 * 4 * (262_144 * 4);
 
     let floor = safety_floor_bytes(CARD);
-    let after_weights = budget_bytes(CARD, CARD, 0.90) - WEIGHTS;
+    let after_weights = budget_bytes(CARD, CARD, Allowance::WHOLE) - WEIGHTS;
     assert_eq!(after_weights, (CARD as f64 * 0.90) as u64 - floor - WEIGHTS);
     assert!(after_weights > 8 << 30 && after_weights < 9 << 30);
 
@@ -403,18 +404,7 @@ fn the_pool_leaves_room_for_the_programs_guests_register() {
     );
 }
 
-fn the_whole_card_is_the_arithmetic_the_pool_had_before() {
-    let floor = safety_floor_bytes(CARD);
-    for free in [CARD, CARD - WEIGHTS, 1 << 30, floor + 1] {
-        assert_eq!(
-            budget_bytes(free, CARD, 1.0),
-            free - floor,
-            "at 1.0 the fraction is not in the arithmetic at all"
-        );
-    }
-}
-
-fn the_fraction_is_of_the_card_and_charges_what_is_already_on_it() {
+fn the_share_is_of_the_card_and_charges_what_is_already_on_it() {
     let floor = safety_floor_bytes(CARD);
     assert_eq!(
         floor,
@@ -423,25 +413,37 @@ fn the_fraction_is_of_the_card_and_charges_what_is_already_on_it() {
     );
 
     let free = CARD - WEIGHTS;
-
-    let uncapped = budget_bytes(free, CARD, 1.0);
-    assert_eq!(uncapped, 34_410_299_648);
-
-    let asked = budget_bytes(free, CARD, 0.90);
+    let asked = budget_bytes(free, CARD, Allowance::WHOLE);
     assert_eq!(asked, 29_579_719_731);
-    assert_eq!(asked + WEIGHTS + floor, (CARD as f64 * 0.90) as u64);
-    assert!(
-        uncapped - asked > 4 * (1 << 30),
-        "the gap this wave closes is nearly five gigabytes: {uncapped} vs {asked}"
+    assert_eq!(
+        asked + WEIGHTS + floor,
+        (CARD as f64 * engine::load::DEVICE_SHARE) as u64
     );
+    assert_eq!(budget_bytes(1 << 30, CARD, Allowance::WHOLE), 0);
+}
 
-    assert_eq!(budget_bytes(free, CARD, 0.10), 0);
+fn a_stated_budget_caps_what_the_load_takes() {
+    let floor = safety_floor_bytes(CARD);
+    let free = CARD - WEIGHTS;
+    let budget = |bytes: u64| Allowance {
+        budget: Some(bytes),
+    };
+    assert_eq!(
+        budget_bytes(free, CARD, budget(8 << 30)),
+        (8 << 30) - floor,
+        "under the share, the budget is what the load takes"
+    );
+    assert_eq!(
+        budget_bytes(free, CARD, budget(u64::MAX)),
+        budget_bytes(free, CARD, Allowance::WHOLE),
+        "past it, the share stands"
+    );
 }
 
 fn the_card_does_not_hold_a_deployment_whose_weights_leave_no_context() {
     let floor = safety_floor_bytes(CARD);
 
-    let roomy = Accounting::of(CARD, 0.90, WEIGHTS, 2 << 30);
+    let roomy = Accounting::of(CARD, Allowance::WHOLE, WEIGHTS, 2 << 30);
     assert_eq!(roomy.card, CARD);
     assert_eq!(roomy.weights, WEIGHTS);
     assert_eq!(roomy.floor, floor);
@@ -455,8 +457,8 @@ fn the_card_does_not_hold_a_deployment_whose_weights_leave_no_context() {
 
     // Weights that fit the share, leaving the pool 2 GiB under a 4 GiB
     // sequence.
-    let share = (CARD as f64 * 0.90) as u64;
-    let tight = Accounting::of(CARD, 0.90, share - floor - (2 << 30), 4 << 30);
+    let share = (CARD as f64 * engine::load::DEVICE_SHARE) as u64;
+    let tight = Accounting::of(CARD, Allowance::WHOLE, share - floor - (2 << 30), 4 << 30);
     let refusal = tight
         .admit()
         .expect_err("a pool under one slot at the declared context is not a deployment")
@@ -475,12 +477,12 @@ fn the_card_does_not_hold_a_deployment_whose_weights_leave_no_context() {
         );
     }
     assert!(
-        refusal.contains("device_memory_share") && refusal.contains("quantized"),
+        refusal.contains("budget_device") && refusal.contains("quantized"),
         "and it names what changes the answer: {refusal}"
     );
 
     // Dense weights past the share: no pool would make room for them.
-    let over = Accounting::of(CARD, 0.90, 42 << 30, 4 << 30);
+    let over = Accounting::of(CARD, Allowance::WHOLE, 42 << 30, 4 << 30);
     let refusal = over
         .admit()
         .expect_err("weights past the share are not a deployment")
@@ -495,11 +497,26 @@ fn the_card_does_not_hold_a_deployment_whose_weights_leave_no_context() {
     );
 
     let demand = 32 << 30;
-    Accounting::of(CARD, 1.0, WEIGHTS, demand)
+    Accounting::of(CARD, Allowance::WHOLE, WEIGHTS, demand / 2)
         .admit()
-        .expect("the whole card holds it");
+        .expect("the card holds half of it");
     assert!(
-        Accounting::of(CARD, 0.90, WEIGHTS, demand).admit().is_err(),
-        "nine tenths of the same card does not"
+        Accounting::of(CARD, Allowance::WHOLE, WEIGHTS, demand)
+            .admit()
+            .is_err(),
+        "the share of the same card does not hold it all"
+    );
+    assert!(
+        Accounting::of(
+            CARD,
+            Allowance {
+                budget: Some(WEIGHTS + (8 << 30))
+            },
+            WEIGHTS,
+            demand / 2
+        )
+        .admit()
+        .is_err(),
+        "nor does a budget under it"
     );
 }

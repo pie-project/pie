@@ -110,12 +110,11 @@ pub struct Boot<'a> {
     pub page_size: u32,
     pub context: u32,
     pub slots: u32,
-    /// `[model] device_kv_budget`: the bytes the cache rows take; `None`
-    /// fills what `memory_share` leaves.
+    /// The bytes the cache rows take, as a test or bench states them
+    /// (`Residency::device_kv_budget`); `None` fills what `allowance` leaves.
     pub kv_budget: Option<u64>,
-    /// `[model] device_memory_share`: the share of the card this load may
-    /// hold, less what was in use when it began.
-    pub memory_share: f64,
+    /// What this load may take of the card (`[engine.memory] budget_device`).
+    pub allowance: engine::Allowance,
     pub ordinal: i32,
     pub knobs: Knobs,
     pub cache_dir: Option<&'a Path>,

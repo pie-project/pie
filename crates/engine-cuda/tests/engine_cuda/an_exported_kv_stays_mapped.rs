@@ -44,7 +44,9 @@ fn an_exported_kv_stays_mapped() {
         .expect("a pool of four full sequences");
     let mut pools = Pools::reserve(
         0,
-        0.5,
+        engine::Allowance {
+            budget: Some(4 << 30),
+        },
         &trace,
         paging,
         None,

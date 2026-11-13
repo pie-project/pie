@@ -516,7 +516,7 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         context: CONTEXT,
         slots,
         kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        allowance: engine::Allowance::WHOLE,
         runahead: engine::runahead::Runahead::F1,
         profiles: Some(dir.clone()),
         residency: crate::ResidencyPlan::default(),

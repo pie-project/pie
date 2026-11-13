@@ -241,7 +241,7 @@ fn logits(
         context: CEILING,
         slots: 1,
         kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        allowance: engine::Allowance::WHOLE,
         ordinal: 0,
         knobs,
         cache_dir: None,

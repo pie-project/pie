@@ -3,34 +3,34 @@
 //!
 //! A streamable weight's atoms live in the pool as read-only slots of a
 //! weight shape ([`::engine::chunk::WeightShape`]), held by
-//! [`Holder::Weights`]. Two kinds of hold:
+//! [`Holder::Weights`]. A weight atom is a clean page: read-only, with a
+//! copy on the host, so dropping one loses no work, only future misses.
+//! Residency is the runtime's, by three rules with no mode and no threshold
+//! (REDESIGN 2.7a; rules 1 and 3 here, rule 2 waits on measurement):
 //!
-//! - the **floor**: each shape's staging slots, what a fire cannot run
-//!   without (the top-k experts of this layer and the next; this fire's
-//!   rows). Pinned: live demand, never evicted. Streaming only: a held set
-//!   (every atom resident) misses nothing and takes none.
-//! - the **cache**: resident atoms above the floor. Wanted demand, the
-//!   first thing to go when the pool is short.
-//!
-//! Residency is the runtime's, not PLEX's:
-//!
-//! - LRU order, kept from the engine's use record ([`WeightPort::uses`]):
-//!   the atoms read in the latest window first, the most read first among
-//!   them.
-//! - Membership changes only at a governor tick, and only as each window
-//!   of [`WINDOW_TICKS`] closes. A miss never inserts: the engine streams
-//!   the atom through a staging slot and drops it; the use is only recorded.
-//!   This keeps the per-token layer cycle from thrashing the cache.
-//!
-//! Deployment mode ([`WeightStreaming`]): `off` holds every atom pinned and
-//! never evicts one, so pool pressure goes to kv and state through
-//! `tier-pressure` as before. `on` sheds the cache to its floor before
-//! anything else gives way: [`WeightFirst`] does it ahead of the inner
-//! pool's tier-pressure, with no PLEX involvement, since weights are
-//! read-only and come back from the host copy. Recovery runs the other way:
-//! kv and state waiters are served first, and the cache refills only into
-//! room left once none is short. Weights the pool cannot seat fail an `off`
-//! load; `auto` streams them instead ([`boot_cache`]).
+//! 1. **Live demand before cache.** When every atom fits the pool at load,
+//!    every atom is resident and pinned (a *held* set: nothing misses,
+//!    nothing streams through a staging slot). When live demand needs the
+//!    chunks (a kv or state waiter short, or a governor cut with no room),
+//!    the cache leaves held: each shape keeps its staging slots (the
+//!    **floor**: the top-k experts of this layer and the next, this fire's
+//!    rows; pinned, live demand, never evicted) and gives the rest up. The
+//!    engine is asked first and the slots move only once it took the
+//!    streaming set ([`WeightPort::propose`]); one that refuses keeps the
+//!    set held, and the pressure goes to kv and state as it always did.
+//!    Weights that do not fit at load stream from the start.
+//! 2. (Not yet: among cache entries, the lowest value per byte goes first.
+//!    Until it is measured, the cache goes to its floor before kv or state
+//!    gives way, [`WeightFirst`].)
+//! 3. **An atom comes back at break-even**: once the bytes its misses have
+//!    streamed since it left reach the bytes loading it takes (the
+//!    ski-rental rule; with a miss streaming the whole atom, as every
+//!    engine's does, that is its first miss). The atoms that have cost most
+//!    come back first, into
+//!    room no waiter is short of, else in place of a resident atom no fire
+//!    read for a whole governor tick. A miss never inserts on the fire
+//!    path: the engine streams the atom through a staging slot and the use
+//!    is only recorded ([`WeightPort::uses`]).
 //!
 //! The engine hears the resident set it starts with at load, before any
 //! fire ([`WeightFirst::boot`]), and each change after at a governor tick
@@ -39,82 +39,26 @@
 //! starting set names them there, so no atom moves; seated slots something
 //! else holds fail the load.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::RwLock;
-
-use ::engine::chunk::{
-    ChunkFacts, ResidentWeight, WeightAtom, WeightResidency, WeightShape, WeightUses,
-};
-use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 
 use super::slots::{
     Holder, ShapeId, ShapeKind, Slot, SlotError, SlotPool, SlotPoolFacts, SlotShape,
 };
 use crate::governor::{Demand, Growth, PoolTarget, Retarget};
-
-/// Whether streamable weights may be evicted from the device
-/// (`[model] weight_streaming`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WeightStreaming {
-    /// Off when the model's weights fit the device at load, else on.
-    #[default]
-    Auto,
-    /// Under pressure the weight cache shrinks to its floor first.
-    On,
-    /// Every weight stays resident; pressure goes to kv and state.
-    Off,
-}
-
-impl WeightStreaming {
-    /// Whether this mode streams, for a load whose weights did or did not
-    /// fit the device budget.
-    #[must_use]
-    pub const fn streams(self, weights_fit: bool) -> bool {
-        match self {
-            WeightStreaming::Auto => !weights_fit,
-            WeightStreaming::On => true,
-            WeightStreaming::Off => false,
-        }
-    }
-}
-
-static STREAMING: RwLock<BTreeMap<usize, bool>> = RwLock::new(BTreeMap::new());
-
-/// Records the mode resolved at load for engine `engine`.
-pub fn set_streaming(engine: usize, on: bool) {
-    STREAMING
-        .write()
-        .expect("the weight streaming modes are poisoned")
-        .insert(engine, on);
-}
-
-/// Whether engine `engine` streams its weights; off when never told.
-#[must_use]
-pub fn streaming(engine: usize) -> bool {
-    STREAMING
-        .read()
-        .expect("the weight streaming modes are poisoned")
-        .get(&engine)
-        .copied()
-        .unwrap_or(false)
-}
+use ::engine::chunk::{
+    ChunkFacts, ResidentWeight, WeightAtom, WeightResidency, WeightShape, WeightUses,
+};
 
 /// The weight cache engine `engine` loads with, its shapes from `first` in
-/// `pool` ([`pool_shapes`] of `weights`), in the mode resolved for it
-/// ([`set_streaming`]): not streaming, every atom pinned; streaming, the
-/// floor.
-///
-/// Weights that do not fit the pool: `auto` streams them instead (and
-/// records it for the engine), `off` fails the load. A floor that does not
-/// fit fails it in any mode: no fire could run.
+/// `pool` ([`pool_shapes`] of `weights`): every atom pinned where the pool
+/// seats them all (rule 1), else the floor, streaming.
 ///
 /// # Errors
 ///
-/// As above, naming the bytes the weights need and the pool has free.
+/// A floor that does not fit fails the load: no fire could run. The error
+/// names the bytes the weights need and the pool has free.
 pub fn boot_cache(
     engine: usize,
-    mode: WeightStreaming,
     weights: &[WeightShape],
     first: ShapeId,
     pool: &mut SlotPool,
@@ -136,18 +80,8 @@ pub fn boot_cache(
     // What the pool can grow to, not what the load committed: the weights
     // commit the segments they take (`WeightCache::new`).
     let free = u64::from(pool.growable_chunks()) * pool.chunk_bytes();
-    let mut streams = streaming(engine);
-    if !streams && !pool.fits_grown(&needs(true)) {
-        anyhow::ensure!(
-            mode != WeightStreaming::Off,
-            "weight_streaming = \"off\": engine {engine}'s weights do not fit its pool: \
-             every weight resident needs {all} bytes over {} shapes, the pool has {free} \
-             bytes free ({} chunks of {} bytes); set weight_streaming = \"auto\" or \"on\" \
-             to stream them",
-            weights.len(),
-            pool.growable_chunks(),
-            pool.chunk_bytes(),
-        );
+    let streams = !pool.fits_grown(&needs(true));
+    if streams && !weights.is_empty() {
         tracing::info!(
             engine,
             need_bytes = all,
@@ -155,8 +89,6 @@ pub fn boot_cache(
             floor_bytes = floor,
             "the weights do not fit the pool: they stream, the cache at its floor"
         );
-        set_streaming(engine, true);
-        streams = true;
     }
     anyhow::ensure!(
         pool.fits_grown(&needs(!streams)),
@@ -251,15 +183,24 @@ impl SeatError {
     }
 }
 
-/// Window length in governor ticks: membership changes once a window.
-pub const WINDOW_TICKS: u32 = 4;
-
 /// The engine side of the cache: reads the use record, takes the resident
 /// set. Every engine answers; one that does not stream answers unsupported,
 /// which the cache reads as nothing used.
 pub trait WeightPort {
     fn uses(&mut self) -> ::engine::Result<WeightUses>;
     fn set_residency(&mut self, residency: &WeightResidency) -> ::engine::Result<()>;
+    /// Offers a resident set the engine may refuse without harm: the one a
+    /// held set leaves for (rule 1). Nothing it names moves until the
+    /// engine took it.
+    fn propose(&mut self, residency: &WeightResidency) -> Proposal;
+}
+
+/// What became of a [`WeightPort::propose`].
+pub enum Proposal {
+    Taken,
+    Refused,
+    /// Queued on the engine's lane; its answer comes later.
+    Pending(port::Answer),
 }
 
 impl<E: ::engine::Engine + ?Sized> WeightPort for E {
@@ -270,13 +211,22 @@ impl<E: ::engine::Engine + ?Sized> WeightPort for E {
     fn set_residency(&mut self, residency: &WeightResidency) -> ::engine::Result<()> {
         self.weight_residency(residency)
     }
+
+    fn propose(&mut self, residency: &WeightResidency) -> Proposal {
+        match self.weight_residency(residency) {
+            Ok(()) => Proposal::Taken,
+            Err(_) => Proposal::Refused,
+        }
+    }
 }
 
-/// When an atom was last read, and how often in that window.
+/// What the use record says of one atom.
 #[derive(Debug, Clone, Copy, Default)]
 struct Seen {
-    window: u64,
-    uses: u64,
+    /// The tick it was last read in.
+    tick: u64,
+    /// Not resident: the bytes its misses have streamed since it left.
+    owed: u64,
 }
 
 /// One weight shape's slots.
@@ -285,8 +235,24 @@ struct Kept {
     facts: WeightShape,
     pool: ShapeId,
     staging: Vec<Slot>,
-    /// Resident atoms above the floor (or, not streaming, every atom).
+    /// Resident atoms above the floor (or, held, every atom).
     resident: BTreeMap<u32, Slot>,
+}
+
+/// A held set leaving for a streaming one (rule 1): the engine was offered
+/// the set in which each shape's `staging` slots, taken from resident
+/// atoms, stage what misses, and holds its answer.
+struct Leaving {
+    staging: Vec<Vec<u32>>,
+    answer: port::Answer,
+}
+
+impl std::fmt::Debug for Leaving {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Leaving")
+            .field("staging", &self.staging)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Kept {
@@ -302,10 +268,13 @@ impl Kept {
 #[derive(Debug)]
 pub struct WeightCache {
     streaming: bool,
+    /// Held, the streaming set the engine was offered and has not answered.
+    leaving: Option<Leaving>,
+    /// Held, the engine refused to leave: the set stays held for the load.
+    stays_held: bool,
     shapes: Vec<Kept>,
-    /// The window being recorded.
-    window: u64,
-    ticks: u32,
+    /// The governor ticks seen.
+    tick: u64,
     record: HashMap<WeightAtom, Seen>,
     changed: bool,
     /// The committed prefix the engine must back before the weights land:
@@ -446,9 +415,10 @@ impl WeightCache {
         }
         Ok(Self {
             streaming,
+            leaving: None,
+            stays_held: false,
             shapes,
-            window: 1,
-            ticks: 0,
+            tick: 1,
             record: HashMap::new(),
             changed: true,
             backing,
@@ -512,18 +482,33 @@ impl WeightCache {
         self.kept(atom.shape)?.resident.get(&atom.atom).copied()
     }
 
-    /// The bytes of atoms read in the latest whole window and not resident:
-    /// what the cache would take with room, wanted demand.
+    /// The bytes of atoms past break-even and not resident: what the cache
+    /// would take with room, wanted demand.
     #[must_use]
     pub fn unmet_bytes(&self) -> u64 {
         if !self.streaming {
             return 0;
         }
-        let last = self.window.saturating_sub(1);
         self.record
             .iter()
-            .filter(|(atom, seen)| seen.window >= last && self.resident(**atom).is_none())
-            .filter_map(|(atom, _)| self.kept(atom.shape).map(|kept| kept.facts.slot_bytes))
+            .filter(|(atom, _)| self.resident(**atom).is_none())
+            .filter_map(|(atom, seen)| {
+                let bytes = self.kept(atom.shape)?.facts.slot_bytes;
+                (seen.owed >= bytes).then_some(bytes)
+            })
+            .sum()
+    }
+
+    /// The bytes of resident atoms above the floor: the model cache, what
+    /// live demand may take.
+    #[must_use]
+    pub fn cache_bytes(&self) -> u64 {
+        if !self.streaming {
+            return 0;
+        }
+        self.shapes
+            .iter()
+            .map(|kept| kept.facts.slot_bytes * kept.resident.len() as u64)
             .sum()
     }
 
@@ -531,23 +516,37 @@ impl WeightCache {
         self.shapes.iter().find(|kept| kept.facts.id == shape)
     }
 
-    /// Adds the engine's reads to the record. Membership does not change.
+    /// Adds the engine's reads to the record: a resident atom's last read,
+    /// and what a missed one has streamed since it left. Membership does
+    /// not change.
     pub fn record(&mut self, uses: &WeightUses) {
         for &(atom, reads) in &uses.uses {
-            let known = self
-                .kept(atom.shape)
-                .is_some_and(|kept| atom.atom < kept.facts.count);
-            if !known || reads == 0 {
+            let Some(kept) = self.kept(atom.shape) else {
+                continue;
+            };
+            if atom.atom >= kept.facts.count || reads == 0 {
                 continue;
             }
+            let bytes = kept.facts.slot_bytes;
+            let missed = !kept.resident.contains_key(&atom.atom);
             let seen = self.record.entry(atom).or_default();
-            if seen.window != self.window {
-                *seen = Seen {
-                    window: self.window,
-                    uses: 0,
-                };
+            seen.tick = self.tick;
+            if missed {
+                seen.owed = seen
+                    .owed
+                    .saturating_add(u64::from(reads).saturating_mul(bytes));
             }
-            seen.uses = seen.uses.saturating_add(u64::from(reads));
+        }
+    }
+
+    /// `atoms` of the shape at `at` left the cache: what they owe starts
+    /// again from nothing.
+    fn left(&mut self, at: usize, atoms: impl IntoIterator<Item = u32>) {
+        let shape = self.shapes[at].facts.id;
+        for atom in atoms {
+            if let Some(seen) = self.record.get_mut(&WeightAtom { shape, atom }) {
+                seen.owed = 0;
+            }
         }
     }
 
@@ -559,99 +558,161 @@ impl WeightCache {
             return 0;
         }
         let mut shed = 0;
-        for kept in &mut self.shapes {
+        for at in 0..self.shapes.len() {
+            let kept = &mut self.shapes[at];
             if kept.resident.is_empty() {
                 continue;
             }
-            let slots: Vec<Slot> = std::mem::take(&mut kept.resident).into_values().collect();
+            let gone = std::mem::take(&mut kept.resident);
+            let slots: Vec<Slot> = gone.values().copied().collect();
             pool.release(kept.holder(false), &slots, epoch);
             shed += slots.len() as u64;
+            self.left(at, gone.into_keys());
         }
         self.changed |= shed > 0;
         shed
     }
 
-    /// One governor tick. When it closes a window, each shape keeps the
-    /// atoms the record ranks first, as many as it holds now, plus, when
-    /// `refill`, as many more as the pool has room for; atoms are taken in
-    /// only from the window just closed. A swapped-out atom's slot goes to
-    /// the atom that displaces it.
-    pub fn tick(&mut self, pool: &mut SlotPool, epoch: u64, refill: bool) {
-        self.ticks += 1;
-        if self.ticks < WINDOW_TICKS {
-            return;
+    /// Held, the streaming set live demand asks for (rule 1): each shape
+    /// stages through `floor_slots` of the slots its highest atoms hold,
+    /// and every other atom stays resident until a shed lets it go. `None`
+    /// once it streams, while an offer waits, or once the engine refused.
+    fn leaving_set(&self, pool: &SlotPool) -> Option<(Vec<Vec<u32>>, WeightResidency)> {
+        if self.streaming || self.leaving.is_some() || self.stays_held || self.shapes.is_empty() {
+            return None;
         }
-        self.ticks = 0;
+        let staging: Vec<Vec<u32>> = self
+            .shapes
+            .iter()
+            .map(|kept| {
+                kept.resident
+                    .keys()
+                    .rev()
+                    .take(kept.facts.floor_slots as usize)
+                    .copied()
+                    .collect()
+            })
+            .collect();
+        let mut residency = WeightResidency::default();
+        for (kept, staged) in self.shapes.iter().zip(&staging) {
+            residency.staging.push((
+                kept.facts.id,
+                staged
+                    .iter()
+                    .map(|atom| pool.slot_ref(kept.resident[atom]))
+                    .collect(),
+            ));
+            residency.resident.extend(
+                kept.resident
+                    .iter()
+                    .filter(|(atom, _)| !staged.contains(atom))
+                    .map(|(&atom, &slot)| ResidentWeight {
+                        atom: WeightAtom {
+                            shape: kept.facts.id,
+                            atom,
+                        },
+                        slot: pool.slot_ref(slot),
+                    }),
+            );
+        }
+        Some((staging, residency))
+    }
+
+    /// The engine took the streaming set offered: the staging slots stay
+    /// pinned (the floor), every other atom becomes cache above it.
+    fn left_held(&mut self, staging: &[Vec<u32>], pool: &mut SlotPool) {
+        for (at, staged) in staging.iter().enumerate() {
+            let kept = &mut self.shapes[at];
+            kept.staging = staged
+                .iter()
+                .filter_map(|atom| kept.resident.remove(atom))
+                .collect();
+            let cached: Vec<Slot> = kept.resident.values().copied().collect();
+            pool.share(kept.holder(false), &cached);
+            pool.release(kept.holder(true), &cached, 0);
+            let gone: Vec<u32> = staged.clone();
+            self.left(at, gone);
+        }
+        self.streaming = true;
+    }
+
+    /// One governor tick: each shape takes back the atoms past break-even
+    /// (rule 3), most owed first, into free room when `refill`, else in
+    /// place of resident atoms no fire read for a whole tick.
+    pub fn tick(&mut self, pool: &mut SlotPool, epoch: u64, refill: bool) {
         if self.streaming {
             for at in 0..self.shapes.len() {
                 self.settle(at, pool, epoch, refill);
             }
         }
-        self.window += 1;
+        self.tick += 1;
     }
 
     fn settle(&mut self, at: usize, pool: &mut SlotPool, epoch: u64, refill: bool) {
-        let window = self.window;
         let kept = &self.shapes[at];
-        let id = kept.facts.id;
-        let mut ranked: Vec<(u32, Seen)> = self
+        let (id, bytes) = (kept.facts.id, kept.facts.slot_bytes);
+        // Past break-even and not resident, most owed first.
+        let mut back: Vec<(u32, u64)> = self
             .record
             .iter()
             .filter(|(atom, seen)| {
-                atom.shape == id
-                    && (seen.window == window || kept.resident.contains_key(&atom.atom))
+                atom.shape == id && seen.owed >= bytes && !kept.resident.contains_key(&atom.atom)
             })
-            .map(|(atom, seen)| (atom.atom, *seen))
+            .map(|(atom, seen)| (atom.atom, seen.owed))
             .collect();
-        // Most recent window first, the most read first within it.
-        ranked
-            .sort_unstable_by(|a, b| (b.1.window, b.1.uses, a.0).cmp(&(a.1.window, a.1.uses, b.0)));
+        if back.is_empty() {
+            return;
+        }
+        back.sort_unstable_by(|a, b| (b.1, a.0).cmp(&(a.1, b.0)));
+        // Resident atoms no fire read in the tick now closing, longest
+        // unread first: what a returning atom may take the place of.
+        let last = self.tick;
+        let mut idle: Vec<(u32, u64)> = kept
+            .resident
+            .keys()
+            .map(|&atom| {
+                let read = self
+                    .record
+                    .get(&WeightAtom { shape: id, atom })
+                    .map_or(0, |seen| seen.tick);
+                (atom, read)
+            })
+            .filter(|&(_, read)| read < last)
+            .collect();
+        idle.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
         let room = if refill {
             usize::try_from(pool.available(kept.pool)).unwrap_or(usize::MAX)
         } else {
             0
         };
-        let capacity = kept.resident.len().saturating_add(room);
-        let keep: BTreeSet<u32> = ranked
-            .iter()
-            .take(capacity)
-            .map(|&(atom, _)| atom)
-            .collect();
-        let kept = &mut self.shapes[at];
-        let out: Vec<u32> = kept
-            .resident
-            .keys()
-            .filter(|atom| !keep.contains(atom))
-            .copied()
-            .collect();
-        let incoming: Vec<u32> = keep
-            .iter()
-            .filter(|atom| !kept.resident.contains_key(atom))
-            .copied()
-            .collect();
-        let mut freed: Vec<Slot> = out
-            .iter()
-            .filter_map(|atom| kept.resident.remove(atom))
-            .collect();
+        let fresh_n = back.len().min(room);
+        let swapped = (back.len() - fresh_n).min(idle.len());
         let mut fresh = Vec::new();
-        let reused = freed.len().min(incoming.len());
-        let more = incoming.len() - reused;
-        if more > 0 {
-            let more = (more as u64).min(pool.available(kept.pool));
-            if let Ok(slots) = pool.acquire(kept.holder(false), kept.pool, more) {
-                fresh = slots;
-            }
+        if fresh_n > 0
+            && let Ok(slots) = pool.acquire(kept.holder(false), kept.pool, fresh_n as u64)
+        {
+            fresh = slots;
         }
-        let mut slots = freed.drain(..reused).chain(fresh);
-        for &atom in &incoming {
-            let Some(slot) = slots.next() else { break };
+        let kept = &mut self.shapes[at];
+        let out: Vec<u32> = idle[..swapped].iter().map(|&(atom, _)| atom).collect();
+        let mut slots: Vec<Slot> = fresh
+            .into_iter()
+            .chain(out.iter().filter_map(|atom| kept.resident.remove(atom)))
+            .collect();
+        let mut incoming = Vec::new();
+        for &(atom, _) in &back {
+            let Some(slot) = slots.pop() else { break };
             kept.resident.insert(atom, slot);
+            incoming.push(atom);
         }
-        drop(slots);
-        if !freed.is_empty() {
-            pool.release(kept.holder(false), &freed, epoch);
+        // A slot nothing came back into (an acquire short of what it
+        // asked) goes back.
+        if !slots.is_empty() {
+            pool.release(kept.holder(false), &slots, epoch);
         }
         self.changed |= !out.is_empty() || !incoming.is_empty();
+        self.left(at, out);
+        self.left(at, incoming);
     }
 
     /// The whole resident set, as the engine takes it.
@@ -715,10 +776,12 @@ pub trait SlotAccess {
 ///   and tries again; only with the cache at its floor does a shortfall
 ///   come back as [`Retarget::NoRoom`], the governor's `tier-pressure`.
 /// - At each tick: a kv or state waiter short sheds the cache; with none
-///   short the cache settles its window and may refill into what room is
-///   left. The engine hears the resident set whenever it changed.
+///   short the atoms past break-even come back into what room is left. The
+///   engine hears the resident set whenever it changed.
 ///
-/// Not streaming, it is the inner pool with its weights pinned.
+/// Held, it is the inner pool with its weights pinned, until live demand
+/// asks for their chunks: a shed then offers the engine the streaming set
+/// (rule 1), and sheds for real once the engine took it.
 pub struct WeightFirst<P, W> {
     inner: P,
     cache: WeightCache,
@@ -760,8 +823,13 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> WeightFirst<P, W> {
 
     /// Sheds the cache to its floor; the slots given back. What a planner
     /// calls before it raises `tier-pressure` for a waiter, so weights go
-    /// before any kv or state does.
+    /// before any kv or state does. Held, it offers the engine the
+    /// streaming set and gives nothing back until the engine took it.
     pub fn shed(&mut self) -> u64 {
+        if !self.cache.streaming() {
+            self.leave_held();
+            return 0;
+        }
         let mut shed = 0;
         let cache = &mut self.cache;
         self.inner.with_slots(&mut |pool, epoch| {
@@ -769,11 +837,63 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> WeightFirst<P, W> {
         });
         // Asked at all, a waiter is short: the next tick does not refill,
         // whether or not anything was above the floor.
-        self.shed |= self.cache.streaming();
+        self.shed = true;
         if shed > 0 {
             self.publish();
         }
         shed
+    }
+
+    /// Held, offers the engine the streaming set live demand asks for
+    /// (rule 1); an engine that answers at once is heard at once.
+    fn leave_held(&mut self) {
+        let mut offer = None;
+        let cache = &self.cache;
+        self.inner.with_slots(&mut |pool, _| {
+            offer = cache.leaving_set(pool);
+        });
+        let Some((staging, residency)) = offer else {
+            return;
+        };
+        match self.port.propose(&residency) {
+            Proposal::Taken => self.left_held(&staging),
+            Proposal::Refused => self.stay_held(),
+            Proposal::Pending(answer) => {
+                self.cache.leaving = Some(Leaving { staging, answer });
+            }
+        }
+    }
+
+    /// Reads the engine's answer to the streaming set offered, once it
+    /// came.
+    fn heard(&mut self) {
+        let Some(mut leaving) = self.cache.leaving.take() else {
+            return;
+        };
+        match leaving.answer.try_recv() {
+            Ok(Ok(_)) => self.left_held(&leaving.staging),
+            Ok(Err(error)) => {
+                tracing::info!(%error, "the engine keeps its weights held");
+                self.stay_held();
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                self.cache.leaving = Some(leaving);
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => self.stay_held(),
+        }
+    }
+
+    fn left_held(&mut self, staging: &[Vec<u32>]) {
+        let cache = &mut self.cache;
+        self.inner
+            .with_slots(&mut |pool, _| cache.left_held(staging, pool));
+        tracing::info!("live demand took the weight cache off held: the weights stream");
+        // The cache goes to its floor now that it may.
+        self.shed();
+    }
+
+    fn stay_held(&mut self) {
+        self.cache.stays_held = true;
     }
 
     /// Tells the engine the resident set it starts with: what the load
@@ -846,7 +966,11 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> PoolTarget for WeightFirst<P, W>
 
     fn retarget(&mut self, segments: u64) -> Retarget {
         let first = self.inner.retarget(segments);
-        if !matches!(first, Retarget::NoRoom { .. }) || !self.cache.streaming() {
+        if !matches!(first, Retarget::NoRoom { .. }) {
+            return first;
+        }
+        if !self.cache.streaming() {
+            self.leave_held();
             return first;
         }
         if self.shed() == 0 {
@@ -866,6 +990,7 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> PoolTarget for WeightFirst<P, W>
     }
 
     fn ticked(&mut self) {
+        self.heard();
         match self.port.uses() {
             Ok(uses) => self.cache.record(&uses),
             Err(error) => tracing::trace!(%error, "no weight use record"),
@@ -880,6 +1005,9 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> PoolTarget for WeightFirst<P, W>
             }
             cache.tick(pool, epoch, !short && !shed);
         });
+        if short && !self.cache.streaming() {
+            self.leave_held();
+        }
         self.shed = false;
         self.publish();
         self.inner.ticked();

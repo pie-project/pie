@@ -283,7 +283,12 @@ pub fn load_with(
     // The device is shared: a driver that fails to come up is asked again
     // before the test is skipped.
     let mut tries = 0;
-    while let Err(why) = Context::bind(&device, 0.25) {
+    while let Err(why) = Context::bind(
+        &device,
+        engine::Allowance {
+            budget: Some(2 << 30),
+        },
+    ) {
         tries += 1;
         if tries == 5 {
             eprintln!("skipping: no {} device ({why})", backend::NAME);

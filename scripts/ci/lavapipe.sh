@@ -43,11 +43,10 @@ listen = "127.0.0.1:$port"
 [model]
 name = "default"
 source = "snapshot"
-device_kv_budget = "256MiB"
 [engine]
 $engine_toml
-max_forward_tokens = 1024
-max_forward_requests = 8
+[engine.memory]
+budget_device = "1GiB"
 [sandbox]
 allow_fs = false
 allow_network = true

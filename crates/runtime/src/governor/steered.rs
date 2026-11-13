@@ -204,16 +204,11 @@ impl<P> Shared<P> {
 }
 
 impl<P: PoolTarget + SlotAccess, W: crate::store::weights::WeightPort> Shared<WeightFirst<P, W>> {
-    /// The planner's hook: sheds the weight cache to its floor (nothing
-    /// while it does not stream); the slots given back.
+    /// The planner's hook: sheds the weight cache to its floor (held, it
+    /// offers the engine the streaming set first, and gives nothing back
+    /// until the engine took it); the slots given back.
     pub fn shed(&self) -> u64 {
-        self.with(|pool| {
-            if pool.cache().streaming() {
-                pool.shed()
-            } else {
-                0
-            }
-        })
+        self.with(WeightFirst::shed)
     }
 
     /// [`Self::shed`] as the planner takes it.

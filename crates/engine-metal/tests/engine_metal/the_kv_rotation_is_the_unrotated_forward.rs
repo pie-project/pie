@@ -230,7 +230,7 @@ pub(crate) fn try_load(dir: &Path, w: Dtype, rotate: bool) -> Result<Shell, Stri
         slots: 4,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_metal::ResidencyPlan::default(),
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        allowance: engine::Allowance::WHOLE,
         profiles: None,
     })
     .map_err(|e| e.to_string())

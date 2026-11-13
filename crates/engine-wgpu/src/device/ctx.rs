@@ -443,17 +443,24 @@ pub async fn request(boot: &DeviceBoot) -> Result<Handed> {
 }
 
 impl Context {
-    /// The device `boot` names, of whose memory a load takes `share`.
-    pub fn bind(boot: &DeviceBoot, share: f64) -> Result<Context> {
+    /// The device `boot` names, of whose memory a load takes what
+    /// `allowance` gives.
+    pub fn bind(boot: &DeviceBoot, allowance: engine::Allowance) -> Result<Context> {
         let _gate = gate();
         let handed = host::block_on("request_device", request(boot))??;
-        Context::adopt(boot, share, handed)
+        Context::adopt(boot, allowance, handed)
     }
 
-    /// A device the host already holds, of whose memory a load takes
-    /// `share`. wgpu reports no free memory, so the share is of the whole:
-    /// `[wgpu] device_memory`, else the Vulkan device-local heap, else 8 GiB.
-    pub fn adopt(boot: &DeviceBoot, share: f64, handed: Handed) -> Result<Context> {
+    /// A device the host already holds, of whose memory a load takes what
+    /// `allowance` gives. wgpu reports no free memory, so the allowance is
+    /// of the whole: what the host states (a browser tab's
+    /// `device_memory`), else the Vulkan device-local heap, else
+    /// `[engine.memory] budget_device`, else 8 GiB.
+    pub fn adopt(
+        boot: &DeviceBoot,
+        allowance: engine::Allowance,
+        handed: Handed,
+    ) -> Result<Context> {
         let Handed {
             adapter,
             device,
@@ -475,6 +482,7 @@ impl Context {
         let device_local = boot
             .device_memory
             .or(heap)
+            .or(allowance.budget)
             .unwrap_or(crate::boot::DEFAULT_DEVICE_MEMORY);
         let enabled = Enabled {
             subgroups: features.contains(wgpu::Features::SUBGROUP),
@@ -509,7 +517,7 @@ impl Context {
         });
         let dummy = Raw::new(&core, DUMMY_BYTES, Memory::Device)?;
         let context = Context {
-            working_set: (device_local as f64 * share.clamp(0.0, 1.0)) as u64,
+            working_set: allowance.ceiling(device_local),
             max_buffer,
             core,
             dummy,
@@ -1000,7 +1008,13 @@ mod tests {
         if !present() {
             return;
         }
-        let device = Context::bind(&DeviceBoot::default(), 0.1).unwrap();
+        let device = Context::bind(
+            &DeviceBoot::default(),
+            engine::Allowance {
+                budget: Some(1 << 30),
+            },
+        )
+        .unwrap();
         let mut buffer = Buffer::zeroed(&device, 64).unwrap();
         let ramp: Vec<u8> = (1..=24).collect();
         buffer.write(0, &ramp).unwrap();

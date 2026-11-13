@@ -43,7 +43,7 @@ fn load_as(fixture: &Fixture, whole: bool, held: bool, checkpoint: &std::path::P
         context: CONTEXT,
         slots: SEATS,
         kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        allowance: engine::Allowance::WHOLE,
         runahead: engine::runahead::Runahead::F1,
         residency: if whole {
             residency.with_whole_weights()

@@ -43,12 +43,13 @@ pub struct Boot<'a> {
     pub page_size: u32,
     pub context: u32,
     pub slots: u32,
-    /// `[model] device_kv_budget`: the bytes the kv pool and the state slots
-    /// beside it take; `None` fills what `memory_share` leaves.
+    /// The bytes the kv pool and the state slots beside it take, as a test
+    /// states them (`Residency::device_kv_budget`); `None` fills what
+    /// `allowance` leaves.
     pub kv_budget: Option<u64>,
-    /// `[model] device_memory_share`: the share of the device's working set
-    /// this load may wire.
-    pub memory_share: f64,
+    /// What this load may wire of the device's working set
+    /// (`[engine.memory] budget_device`).
+    pub allowance: engine::Allowance,
     pub runahead: Runahead,
     pub residency: Plan,
     /// `$PIE_HOME/profiles`, where a user's device profiles live; `None`
@@ -769,7 +770,7 @@ impl PreparedLoad<'_> {
         handles.seal();
 
         // The kv pool and the recurrent-state buffers beside it: both are
-        // wired for the life of the load, in what `memory_share` leaves of the
+        // wired for the life of the load, in what `allowance` leaves of the
         // room the device had when the load began, once the weights, the arena
         // scratch and the driver's floor are placed. A stated `kv_budget` is
         // its bytes; none takes all of the room.
@@ -785,7 +786,7 @@ impl PreparedLoad<'_> {
             crate::store::accounting::Accounting::with_scratch(
                 device.working_set(),
                 elsewhere,
-                boot.memory_share,
+                boot.allowance,
                 weights.bytes(),
                 compiled.arena.bytes,
                 pool,
@@ -861,7 +862,7 @@ impl PreparedLoad<'_> {
 
         {
             let acct = accounting(pool_bytes);
-            acct.admit(boot.memory_share)?;
+            acct.admit()?;
             if crate::diag::on().tier_trace {
                 eprintln!(
                     "residency: weights {} scratch {} kv {} floor {}, working set {}",

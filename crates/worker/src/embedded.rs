@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 pub use crate::boot::{Embedded, Engine, Loaded, Summary};
+use crate::config::removed::{self, Removed};
 use crate::config::{ByteSize, Config, EngineKind};
 
 /// The knobs an app sets (`PieServer.Configuration` in Swift and Kotlin, the
@@ -19,44 +20,62 @@ pub struct Settings {
     /// False boots the runtime with no engine, for programs that never run a
     /// forward pass.
     pub engine: bool,
-    pub max_forward_tokens: u32,
-    pub max_forward_requests: u32,
-    #[serde(default)]
-    pub max_state_slots: crate::config::Removed<crate::config::removed::MaxStateSlots>,
-    pub max_model_len: u32,
-    /// Device bytes for the kv pages and state slots (`"1GiB"`); omitted,
-    /// the pool fills what `device_memory_share` leaves.
-    pub device_kv_budget: Option<ByteSize>,
-    pub device_memory_share: f64,
-    /// See [`crate::config::ModelConfig::memory_tolerance`].
-    pub memory_tolerance: runtime::governor::Tolerance,
+    /// See [`crate::config::EngineConfig::max_context`].
+    pub max_context: u32,
+    /// See [`crate::config::MemoryConfig::budget_device`]: on a phone, what
+    /// the app leaves the model of the memory it may wire.
+    pub budget_device: Option<ByteSize>,
+    /// See [`crate::config::MemoryConfig::governor_backoff`].
+    pub governor_backoff: f64,
+    /// See [`crate::config::MemoryConfig::governor_release_idle`].
+    pub governor_release_idle: bool,
     pub sandbox_memory_mb: u64,
     pub max_concurrent_processes: Option<usize>,
     pub frame_size: u32,
     pub frame_dispatch_depth: u32,
     pub verbose: bool,
-    pub max_voxels: Option<u32>,
-    pub max_clips: Option<u32>,
+    #[serde(skip_serializing)]
+    pub max_forward_tokens: Removed<removed::MaxForwardTokens>,
+    #[serde(skip_serializing)]
+    pub max_forward_requests: Removed<removed::MaxForwardRequests>,
+    #[serde(skip_serializing)]
+    pub max_state_slots: Removed<removed::MaxStateSlots>,
+    #[serde(skip_serializing)]
+    pub max_model_len: Removed<removed::MaxModelLen>,
+    #[serde(skip_serializing)]
+    pub device_kv_budget: Removed<removed::DeviceKvBudget>,
+    #[serde(skip_serializing)]
+    pub device_memory_share: Removed<removed::DeviceMemoryShare>,
+    #[serde(skip_serializing)]
+    pub memory_tolerance: Removed<removed::MemoryTolerance>,
+    #[serde(skip_serializing)]
+    pub max_voxels: Removed<removed::MaxVoxels>,
+    #[serde(skip_serializing)]
+    pub max_clips: Removed<removed::MaxClips>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             engine: true,
-            max_forward_tokens: 512,
-            max_forward_requests: 8,
-            max_state_slots: crate::config::Removed::default(),
-            max_model_len: 4096,
-            device_kv_budget: None,
-            device_memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-            memory_tolerance: runtime::governor::Tolerance::Dedicated,
+            max_context: 4096,
+            budget_device: None,
+            governor_backoff: 1.0,
+            governor_release_idle: false,
             sandbox_memory_mb: 512,
             max_concurrent_processes: None,
             frame_size: 8,
             frame_dispatch_depth: 2,
             verbose: false,
-            max_voxels: None,
-            max_clips: None,
+            max_forward_tokens: Removed::default(),
+            max_forward_requests: Removed::default(),
+            max_state_slots: Removed::default(),
+            max_model_len: Removed::default(),
+            device_kv_budget: Removed::default(),
+            device_memory_share: Removed::default(),
+            memory_tolerance: Removed::default(),
+            max_voxels: Removed::default(),
+            max_clips: Removed::default(),
         }
     }
 }
@@ -96,15 +115,10 @@ impl Settings {
         let mut config = Config::parse(&document.to_string())?;
 
         config.engine.options = self.engine_options(kind, home);
-        config.model.device_kv_budget = self.device_kv_budget;
-        config.model.memory_tolerance = self.memory_tolerance;
-        config.model.device_memory_share = self.device_memory_share;
-        if self.max_voxels.is_some() {
-            config.model.max_voxels = self.max_voxels;
-        }
-        if self.max_clips.is_some() {
-            config.model.max_clips = self.max_clips;
-        }
+        config.engine.max_context = Some(self.max_context);
+        config.engine.memory.budget_device = self.budget_device;
+        config.engine.memory.governor_backoff = self.governor_backoff;
+        config.engine.memory.governor_release_idle = self.governor_release_idle;
         config.server.worker_threads = 2;
         config.server.verbose = self.verbose;
         config.server.max_upload = ByteSize::from_mib(256);
@@ -120,6 +134,7 @@ impl Settings {
         sandbox.scratch_dir = home.join("scratch");
         sandbox.allow_network = false;
         sandbox.network_allowed_hosts.clear();
+        config.validate()?;
         Ok(config)
     }
 
@@ -128,17 +143,7 @@ impl Settings {
         let mut set = |key: &str, value: toml::Value| {
             options.insert(key.into(), value);
         };
-        set(
-            "max_forward_tokens",
-            i64::from(self.max_forward_tokens).into(),
-        );
-        set(
-            "max_forward_requests",
-            i64::from(self.max_forward_requests).into(),
-        );
-        set("max_model_len", i64::from(self.max_model_len).into());
         match kind {
-            EngineKind::Metal => set("kv_page_size", 16.into()),
             EngineKind::Vulkan => {
                 let cache = home.join("vulkan-pipelines.bin");
                 set(

@@ -34,24 +34,31 @@ pub const fn safety_floor_bytes(total: u64) -> u64 {
     }
 }
 
+/// What a load may still take of a card with `free` of `total` bytes free
+/// under `allowance`, past the driver's safety floor.
 #[must_use]
-pub fn budget_bytes(free: u64, total: u64, utilization: f64) -> u64 {
-    let fraction = if utilization.is_finite() {
-        utilization.clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
-    #[expect(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "a byte count of a GPU card is far inside f64's exact integer \
-                  range, and the product is floored back into u64 deliberately"
-    )]
-    let ceiling = (total as f64 * fraction) as u64;
-    let already = total.saturating_sub(free);
+pub fn budget_bytes(free: u64, total: u64, allowance: engine::Allowance) -> u64 {
+    allowance
+        .room(total, total.saturating_sub(free))
+        .saturating_sub(safety_floor_bytes(total))
+}
+
+/// What may be held on a card of `total` bytes in all, once `allowance` is
+/// resolved against the `held` bytes it had when the pool opened: a later
+/// reading's room is this less what the card then holds, so a stated budget
+/// counts what the load has taken since.
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+fn ceiling_of(total: u64, held: u64, allowance: engine::Allowance) -> u64 {
+    held.saturating_add(allowance.room(total, held))
+}
+
+/// What may still be taken under `ceiling` of a card with `free` of
+/// `total` bytes free, past the driver's safety floor.
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+fn room_under(ceiling: u64, free: u64, total: u64) -> u64 {
     ceiling
-        .saturating_sub(already)
+        .min(total)
+        .saturating_sub(total.saturating_sub(free))
         .saturating_sub(safety_floor_bytes(total))
 }
 
@@ -78,12 +85,14 @@ pub struct PhysicalPool {
     pledged_pages: u64,
     held_pages: u64,
     committed_pages: u64,
+    /// What the card may hold in all under the load's allowance, resolved
+    /// when the pool opened ([`ceiling_of`]).
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
-    utilization: f64,
+    ceiling: u64,
 }
 
 impl PhysicalPool {
-    pub fn open(device: i32, utilization: f64) -> Result<PhysicalPool> {
+    pub fn open(device: i32, allowance: engine::Allowance) -> Result<PhysicalPool> {
         #[cfg(feature = "device")]
         {
             use crate::device::rt;
@@ -93,7 +102,8 @@ impl PhysicalPool {
             // SAFETY: two live locals; the call only writes them.
             let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
             crate::device::ctx::check("cudaMemGetInfo", asked)?;
-            let budget = budget_bytes(free as u64, total as u64, utilization);
+            let ceiling = ceiling_of(total as u64, (total - free) as u64, allowance);
+            let budget = room_under(ceiling, free as u64, total as u64);
             let handle_bytes = align_up(MAP_UNIT_BYTES.max(granularity), granularity);
             let pages = budget / LOGICAL_PAGE_BYTES;
             Ok(PhysicalPool {
@@ -105,12 +115,12 @@ impl PhysicalPool {
                 pledged_pages: 0,
                 held_pages: 0,
                 committed_pages: 0,
-                utilization,
+                ceiling,
             })
         }
         #[cfg(not(feature = "device"))]
         {
-            let _ = (device, utilization);
+            let _ = (device, allowance);
             Err(Fault::Runtimeless)
         }
     }
@@ -127,7 +137,7 @@ impl PhysicalPool {
             pledged_pages: 0,
             held_pages: 0,
             committed_pages: 0,
-            utilization: 1.0,
+            ceiling: u64::MAX,
         }
     }
 
@@ -165,7 +175,7 @@ impl PhysicalPool {
             // SAFETY: two live locals; the call only writes them.
             let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
             crate::device::ctx::check("cudaMemGetInfo", asked)?;
-            Ok(budget_bytes(free as u64, total as u64, self.utilization).saturating_sub(reserve))
+            Ok(room_under(self.ceiling, free as u64, total as u64).saturating_sub(reserve))
         }
         #[cfg(not(feature = "device"))]
         {
@@ -234,7 +244,7 @@ impl PhysicalPool {
             let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
             crate::device::ctx::check("cudaMemGetInfo", asked)?;
             let available =
-                budget_bytes(free as u64, total as u64, self.utilization) / LOGICAL_PAGE_BYTES;
+                room_under(self.ceiling, free as u64, total as u64) / LOGICAL_PAGE_BYTES;
             self.recalibrate_to(available);
         }
         Ok(())

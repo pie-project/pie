@@ -193,6 +193,16 @@ pub fn cap_for(shared: &Shared, rows: u32) -> u32 {
     }
 }
 
+/// The rung fires of `rows` take on `engine` now: the narrowest that holds
+/// them, and no wider than the widest rung the engine has armed
+/// ([`::engine::live`]). Every serving fire replays a captured body, so a
+/// raise to a rung whose bodies are still being captured waits on them,
+/// and fires serve at the rungs armed meanwhile.
+#[must_use]
+pub fn rung_goal(pool: &SharedPool, engine: usize, rows: u32) -> u32 {
+    pool.armed_rung_for(rows, crate::engine::live(engine).armed_through())
+}
+
 /// Raises `shared`'s rung at once to the one fires of `rows` take, where
 /// nothing lies in the larger span and the room is there (a raise that must
 /// move state is the walker's, through the engine's copy): the pass asking
@@ -201,7 +211,7 @@ pub fn cap_for(shared: &Shared, rows: u32) -> u32 {
 pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
     let mut pool = shared.lock().unwrap();
     let rungs = pool.rungs();
-    let goal = pool.rung_for(rows);
+    let goal = rung_goal(&pool, engine, rows);
     let lifted = |rung: u32| {
         if rungs.last() == Some(&rung) {
             u32::MAX
@@ -216,7 +226,12 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
         if !evacuation.moves.is_empty() || pool.apply_rung(&evacuation, 0).is_err() {
             return;
         }
-        tracing::info!(engine, rung = goal, moved = 0, "the activation rung is raised");
+        tracing::info!(
+            engine,
+            rung = goal,
+            moved = 0,
+            "the activation rung is raised"
+        );
     }
     // The rung holds `goal` now: fires may take its width.
     let cap = lifted(goal);
@@ -379,8 +394,8 @@ impl PoolRoom {
             "the device pool holds {} MiB ({} chunks of {} MiB): weights pinned on it take \
              {} MiB, activation {} MiB, reserved {} MiB, which leaves {} MiB ({} kv pages, \
              {} tokens) for kv and state; this ask needs {need} kv pages ({} tokens), so no \
-             eviction can make room — raise device_kv_budget by at least {short_mib} MiB, or \
-             let the weights stream (weight_streaming = \"auto\" or \"on\")",
+             eviction can make room — give the device at least {short_mib} MiB more \
+             (`[engine.memory] budget_device`, or what else holds it)",
             mib(self.total_chunks),
             self.total_chunks,
             self.chunk_bytes / MIB,
@@ -1203,6 +1218,24 @@ impl SharedPool {
         let free = self.pool.available(list.pool);
         let pages = u64::from(chunks) * u64::from(spc) + free;
         (chunks, u32::try_from(pages).unwrap_or(u32::MAX))
+    }
+
+    /// [`Self::rung_for`], no wider than `armed` (a rung's tokens): the
+    /// widest rung armed at or under it, else the smallest.
+    #[must_use]
+    pub fn armed_rung_for(&self, rows: u32, armed: u32) -> u32 {
+        let goal = self.rung_for(rows);
+        if goal <= armed {
+            return goal;
+        }
+        let rungs = self.pool.rungs();
+        rungs
+            .iter()
+            .copied()
+            .filter(|&rung| rung <= armed)
+            .max()
+            .or_else(|| rungs.first().copied())
+            .unwrap_or(goal)
     }
 
     /// The smallest rung whose fires carry `rows`, the largest past every

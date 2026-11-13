@@ -57,11 +57,9 @@ fn uses(reads: &[(u32, u32)]) -> WeightUses {
     }
 }
 
-/// Ticks to the end of the window being recorded.
-fn close_window(cache: &mut WeightCache, pool: &mut SlotPool, refill: bool) {
-    for _ in 0..WINDOW_TICKS {
-        cache.tick(pool, 0, refill);
-    }
+/// One governor tick.
+fn tick(cache: &mut WeightCache, pool: &mut SlotPool, refill: bool) {
+    cache.tick(pool, 0, refill);
 }
 
 fn resident(cache: &WeightCache, of: u32) -> Vec<u32> {
@@ -71,21 +69,29 @@ fn resident(cache: &WeightCache, of: u32) -> Vec<u32> {
 }
 
 #[test]
-fn the_least_recently_used_atom_makes_way_for_one_read_in_the_last_window() {
+fn a_missed_atom_comes_back_at_break_even_in_place_of_one_no_fire_read() {
     // Room for the floor and three atoms.
     let shape = experts(16, 2);
     let mut slots = pool(8, &shape);
     let kv = slots.acquire(Holder::WorkingSet(1), KV, 2).unwrap();
     let mut cache = WeightCache::new(&[shape], WEIGHTS, true, &mut slots).unwrap();
-    cache.record(&uses(&[(1, 5), (2, 5), (3, 5)]));
-    close_window(&mut cache, &mut slots, true);
+    assert_eq!(cache.unmet_bytes(), 0, "nothing missed yet");
+    cache.record(&uses(&[(1, 5), (2, 5), (3, 1)]));
+    assert_eq!(
+        cache.unmet_bytes(),
+        3 * MIB,
+        "a miss streams the whole atom: each is past break-even"
+    );
+    tick(&mut cache, &mut slots, true);
     assert_eq!(resident(&cache, 16), [1, 2, 3]);
     assert_eq!(slots.available(WEIGHTS), 0);
+    assert_eq!(cache.unmet_bytes(), 0, "what came back owes nothing");
 
-    // 2 and 3 are read again, 4 for the first time and the most; 1 not.
+    // With no room, a missed atom takes the place of one no fire read in
+    // the tick: 2 and 3 are read again, 1 is not.
     let slot_of_1 = cache.resident(atom(1)).unwrap();
     cache.record(&uses(&[(2, 1), (3, 1), (4, 9)]));
-    close_window(&mut cache, &mut slots, true);
+    tick(&mut cache, &mut slots, true);
     assert_eq!(resident(&cache, 16), [2, 3, 4]);
     assert_eq!(
         cache.resident(atom(4)),
@@ -93,12 +99,52 @@ fn the_least_recently_used_atom_makes_way_for_one_read_in_the_last_window() {
         "the displaced atom's slot goes to the one displacing it"
     );
 
-    // A window in which only 5 is read: of the rest, the most read in the
-    // window they were last read in stay, the lower atom on a tie.
-    cache.record(&uses(&[(5, 1)]));
-    close_window(&mut cache, &mut slots, true);
-    assert_eq!(resident(&cache, 16), [2, 4, 5]);
+    // Every resident atom read in the tick: a miss displaces none.
+    cache.record(&uses(&[(2, 1), (3, 1), (4, 1), (5, 1)]));
+    tick(&mut cache, &mut slots, true);
+    assert_eq!(resident(&cache, 16), [2, 3, 4]);
+    assert_eq!(cache.unmet_bytes(), MIB, "5 waits, wanted");
+
+    // A tick in which only 5 and 6 are read, 6 the most: what has cost
+    // most comes back first, each in place of the longest unread.
+    cache.record(&uses(&[(5, 1), (6, 3)]));
+    tick(&mut cache, &mut slots, true);
+    assert_eq!(resident(&cache, 16), [4, 5, 6]);
     slots.release(Holder::WorkingSet(1), &kv, 0);
+}
+
+#[test]
+fn a_held_set_leaves_for_the_floor_only_once_the_engine_took_it() {
+    // Room for every atom.
+    let shape = experts(4, 2);
+    let mut slots = pool(12, &shape);
+    let mut cache = WeightCache::new(&[shape], WEIGHTS, false, &mut slots).unwrap();
+    assert!(!cache.streaming());
+    assert_eq!(resident(&cache, 4), [0, 1, 2, 3]);
+    let (staging, residency) = cache.leaving_set(&slots).expect("held, it may leave");
+    assert!(!residency.held);
+    assert_eq!(residency.staging[0].1.len(), 2, "the floor stages");
+    assert_eq!(residency.resident.len(), 2, "the rest stays resident");
+    assert_eq!(resident(&cache, 4), [0, 1, 2, 3], "nothing moved yet");
+
+    cache.left_held(&staging, &mut slots);
+    assert!(cache.streaming());
+    assert_eq!(
+        resident(&cache, 4),
+        [0, 1],
+        "the floor took the highest atoms"
+    );
+    assert_eq!(cache.cache_bytes(), 2 * MIB);
+    assert_eq!(
+        cache.shed(&mut slots, 0),
+        2,
+        "the rest is cache above the floor"
+    );
+    assert_eq!(cache.cache_bytes(), 0);
+    assert!(
+        cache.leaving_set(&slots).is_none(),
+        "streaming, it has left"
+    );
 }
 
 // ---- the governor's view ----
