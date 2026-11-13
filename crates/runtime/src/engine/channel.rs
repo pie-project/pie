@@ -119,6 +119,11 @@ pub struct RegisteredChannel {
     pub reader_wait_id: u64,
     pub writer_wait_id: u64,
     pub ring: Arc<HostRing>,
+    /// The engine registered the channel itself: an instance bound to it
+    /// reads the engine's ring. `false` where the engine answered
+    /// `Unsupported` and the runtime keeps the channel alone; a ring of it
+    /// is then the instance's own.
+    pub engine_registered: bool,
 }
 
 impl RegisteredChannel {
@@ -154,6 +159,7 @@ impl RegisteredChannel {
             reader_wait_id,
             writer_wait_id,
             ring,
+            engine_registered: true,
         }
     }
 
@@ -200,6 +206,15 @@ impl ChannelJoin {
     #[must_use]
     pub fn contains(&self, id: ChannelId) -> bool {
         self.channels.contains_key(&id)
+    }
+
+    /// Whether the engine registered channel `id` itself, so a ring of it
+    /// is the channel's and not an instance's own.
+    #[must_use]
+    pub fn engine_registered(&self, id: ChannelId) -> bool {
+        self.channels
+            .get(&id)
+            .is_some_and(|joined| joined.registered.engine_registered)
     }
 
     #[must_use]

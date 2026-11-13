@@ -145,6 +145,9 @@ struct FakeEngine {
     ring: Option<RingFacts>,
     /// The instance's tables must be one run.
     contiguous_tables: bool,
+    /// Answers `register_channel` with `Unsupported`, stating no ring for
+    /// it: the runtime keeps such a channel alone.
+    no_channels: bool,
 }
 
 impl Engine for FakeEngine {
@@ -197,6 +200,9 @@ impl Engine for FakeEngine {
         &self,
         _registration: &ChannelRegistration,
     ) -> ::engine::Result<Option<RingFacts>> {
+        if self.no_channels {
+            return Ok(None);
+        }
         if let Some(ring) = self.ring {
             return Ok(Some(ring));
         }
@@ -216,6 +222,12 @@ impl Engine for FakeEngine {
         &mut self,
         registration: &ChannelRegistration,
     ) -> ::engine::Result<RegisteredChannel> {
+        if self.no_channels {
+            return Err(::engine::Error::unsupported(
+                self.kind(),
+                "register_channel",
+            ));
+        }
         self.registrations.push(registration.clone());
         Ok(RegisteredChannel {
             id: registration.id,
@@ -741,4 +753,65 @@ fn instance_tables_past_a_slot_take_one_run() {
     // 4 KiB slots, 256 to a 1 MiB chunk.
     assert!(adjacent(tables, 256), "{tables:?}");
     roles.lock().unwrap().close_instance(id);
+}
+
+/// Binds an instance on channel 0 joined as the lane joins it, the ring
+/// counted as the channel's only where the engine registered it.
+fn bind_joined(engine: &mut FakeEngine) -> InstanceBinding {
+    let Pools { roles, .. } = pools();
+    let plan = ChannelRegistration {
+        id: ChannelId(1),
+        capacity: 20,
+        ..ChannelRegistration::default()
+    };
+    let mut join = crate::engine::ChannelJoin::new();
+    let channel = register_channel(
+        Some(&roles),
+        engine,
+        &plan,
+        Some(holder(1)),
+        |engine, plan| crate::engine::verbs::register_channel(engine, 0, plan),
+    )
+    .unwrap();
+    join.insert(channel, eta_ir::container::HostRole::Writer);
+    assert!(join.contains(plan.id), "joined either way");
+    learn_program(&roles, engine, PROGRAM).unwrap();
+    let binding = InstanceBinding {
+        program: PROGRAM,
+        channels: vec![plan.id],
+        ..InstanceBinding::default()
+    };
+    bind_instance(Some(&roles), engine, &binding, Some(holder(1)), |id| {
+        join.engine_registered(id)
+    })
+    .unwrap();
+    engine.bindings.last().unwrap().clone()
+}
+
+#[test]
+fn a_channel_the_engine_did_not_register_leaves_its_ring_to_the_instance() {
+    // The engine registers the channel: ring 0 is the channel's.
+    let mut engine = FakeEngine::default();
+    let bound = bind_joined(&mut engine);
+    assert_eq!(
+        bound
+            .ring_slots
+            .iter()
+            .map(|ring| ring.channel)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    // It answers Unsupported: the runtime still joins the channel, and
+    // ring 0 takes slots of the instance's own.
+    let mut engine = FakeEngine {
+        no_channels: true,
+        ..FakeEngine::default()
+    };
+    let bound = bind_joined(&mut engine);
+    let rings: Vec<(u32, usize)> = bound
+        .ring_slots
+        .iter()
+        .map(|ring| (ring.channel, ring.slots.len()))
+        .collect();
+    assert_eq!(rings, vec![(0, 1), (1, 3)]);
 }

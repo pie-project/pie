@@ -952,7 +952,7 @@ impl Lane {
             &mut **engine,
             &plan.binding,
             holder,
-            |id| channels.contains(id),
+            |id| channels.engine_registered(id),
         )?;
         let bound = BoundInstance::new(&bound, plan.pacing_wait_id);
         channels.bind(bound.instance_id, plan.binding.channels.clone());
