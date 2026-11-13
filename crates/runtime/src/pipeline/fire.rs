@@ -653,9 +653,37 @@ impl RaiseFunding {
                         .1
                 };
                 if pages == 0 {
+                    // The rung is not armed yet: the lane arms it between
+                    // fires, each step lent room this pass funds as a
+                    // waiter (PLEX frees it), handed to the lane's next
+                    // step and free again after it.
+                    if let Some(room) = crate::scheduler::arming::unfunded(engine, rows) {
+                        let demand = crate::scheduler::arming::demand(room);
+                        tracing::debug!(engine, rows, ?room, "a raise funds a rung's arming");
+                        let asked = tokio::select! {
+                            asked = planner.acquire(pid, quorum, demand) => asked,
+                            () = stop.notified() => return,
+                        };
+                        match asked {
+                            Ok(crate::planner::Acquired::Granted(grant)) => {
+                                crate::scheduler::arming::fund(engine, grant);
+                            }
+                            Ok(
+                                crate::planner::Acquired::Requote | crate::planner::Acquired::Yield,
+                            ) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                            }
+                            Err(error) => {
+                                tracing::debug!(engine, %error, "a rung's arming room is refused");
+                                *failed.lock().unwrap() = Some(error.to_string());
+                                return;
+                            }
+                        }
+                        continue;
+                    }
                     // The room is there and state lies in the span: the
                     // walker moves it out, the engine copying it. Or the
-                    // rung is not armed yet: its capture lifts the goal.
+                    // rung is being armed with room already funded.
                     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                     continue;
                 }

@@ -1114,6 +1114,12 @@ impl ResidencyPlanner {
         }
     }
 
+    /// `demand` from what stands free now, freeing nothing for it: no
+    /// sequence's slot, no eviction. `None` when it is not all free.
+    pub fn try_free(&self, demand: Demand) -> Option<AllocationGrant> {
+        self.try_reserve(demand)
+    }
+
     pub(super) fn try_reserve(&self, demand: Demand) -> Option<AllocationGrant> {
         let kv = if demand.kv_pages > 0 {
             let pages = self.port.reserve_device(demand.kv_pages)?;

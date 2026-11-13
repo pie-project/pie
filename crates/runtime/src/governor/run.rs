@@ -68,7 +68,18 @@ impl Steer {
         read: Option<Pressure>,
         signal: &mut impl FnMut(Signal),
     ) -> Turn {
+        // What the engine holds beside the pool moves the limit: the pool
+        // follows it down (and back up) in whole segments.
+        let hard_limit = pool.hard_limit();
+        let limits = *self.governor.limits();
+        let moved = limits.segments(hard_limit) != limits.segments(limits.hard_limit);
+        if moved {
+            self.governor.set_hard_limit(hard_limit);
+        }
         if self.governor.tolerance().dedicated() {
+            if moved && pool.growth() != Growth::Fixed {
+                let _ = pool.retarget(self.governor.limits().segments(self.governor.target()));
+            }
             if read.is_some() {
                 pool.ticked();
             }

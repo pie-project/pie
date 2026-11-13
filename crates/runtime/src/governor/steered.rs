@@ -112,8 +112,18 @@ impl PoolTarget for EnginePool {
         self.target().map_or(0, PoolTarget::floor)
     }
 
+    /// The pool's range, less what the engine and its driver hold beside
+    /// it now ([`::engine::live::Live`]: `outside`, `held`), never under
+    /// the floor.
     fn hard_limit(&self) -> u64 {
-        self.target().map_or(0, PoolTarget::hard_limit)
+        self.target().map_or(0, |target| {
+            let live = crate::engine::live(self.engine);
+            let beside = live.outside().saturating_add(live.held());
+            target
+                .hard_limit()
+                .saturating_sub(beside)
+                .max(target.floor())
+        })
     }
 
     fn held(&self) -> u64 {
