@@ -2468,7 +2468,11 @@ pub fn experts(
     if up.tm != dn.tm || up.tiles != dn.tiles || !flat(up)? || !flat(dn)? {
         return Ok(None);
     }
-    let run = tuning.moe_gmm_run;
+    let run = if up_fan.tokens >= tuning.moe_gmm_run_from {
+        tuning.moe_gmm_run
+    } else {
+        1
+    };
     let stepped = |s: crate::linear::moe_gmm::Gmm| crate::linear::moe_gmm::Gmm { run, ..s };
     let (up, dn) = if run > 1 && stepped(up).stepping() && stepped(dn).stepping() {
         let slack = |s: crate::linear::moe_gmm::Gmm| crate::linear::moe_gmm::Gmm {
@@ -2502,49 +2506,80 @@ pub fn experts(
     // where an expert's tile holds 64 rows or more (at 16, a 64-lane decode
     // of Qwen3.6-35B-A3B's cut: 323 -> 340 us; at 64, 256 lanes: 359 -> 337)
     // and each half is whole lane tiles (Gemma-4-26B-A4B's 704: c64 3136 ->
-    // 3096 tok/s).
+    // 3096 tok/s), or the tile holds 128 rows (a prompt's: Gemma-4-26B-A4B's
+    // 2176-row fire: 854 -> 776 us, its GLU's own pass gone).
     let inside = crate::linear::moe_gmm::Gmm {
         glu: Some(glu),
         ..up
     };
-    let hidden = if tuning.moe_gmm_glu
+    let glu_inside = tuning.moe_gmm_glu
         && up.tm >= 64
-        && intermediate % 128 == 0
+        && (intermediate % 128 == 0 || up.tm >= 128)
         && up.stepping()
         && up.orient == crate::linear::moe_gmm::Orient::NMajor
-        && inside.kernel().is_ok()
+        && inside.kernel().is_ok();
+    // Both legs in one kernel, the GLU rows staying in VMEM between them.
+    let fused = if glu_inside
+        && tuning.moe_gmm_fuse_from > 0
+        && t >= tuning.moe_gmm_fuse_from
+        && let Ok(kernel) = inside.mlp_kernel(&dn)
     {
         let wl = f.broadcast(ws, &[rows, 128], &[0])?;
         let st = steps(f, inside, &sorted)?;
-        let w = up_bank.codes.val();
-        inside.kernel()?.call(
-            f,
-            &[st[0], st[1], st[2], st[3], st[4], st[5], sorted.xs, w, wl],
-        )?[0]
+        let wu = up_bank.codes.val();
+        let wd = down_bank.codes.val();
+        let wd = match dn.orient {
+            crate::linear::moe_gmm::Orient::KMajor => f.transpose(wd, &[1, 0])?,
+            crate::linear::moe_gmm::Orient::NMajor => wd,
+        };
+        Some(
+            kernel.call(
+                f,
+                &[
+                    st[0], st[1], st[2], st[3], st[4], st[5], sorted.xs, wu, wl, wd,
+                ],
+            )?[0],
+        )
     } else {
-        let up_rows = tiles_of(f, up, &up_bank, &sorted, sorted.xs)?;
-        let held = Operand {
-            val: up_rows,
-            rows: rows as u32,
-            width: packed.width,
-            dtype: Dtype::Bf16,
-        };
-        let into = Landing {
-            rows: rows as u32,
-            width: intermediate,
-            dtype: Dtype::Bf16,
-        };
-        let hidden = match glu {
-            ExpertGlu::Swiglu => crate::linear::mlp::swiglu(f, held, intermediate, into)?,
-            ExpertGlu::GegluTanh => {
-                crate::linear::mlp::geglu_tanh_packed(f, held, intermediate, into)?
-            }
-        };
-        let wb = f.broadcast(ws, &[rows, i64::from(intermediate)], &[0])?;
-        let hidden = f.mul(hidden, wb)?;
-        f.convert(hidden, Elem::Bf16)
+        None
     };
-    let down_rows = tiles_of(f, dn, &down_bank, &sorted, hidden)?;
+    let down_rows = match fused {
+        Some(rows) => rows,
+        None => {
+            let hidden = if glu_inside {
+                let wl = f.broadcast(ws, &[rows, 128], &[0])?;
+                let st = steps(f, inside, &sorted)?;
+                let w = up_bank.codes.val();
+                inside.kernel()?.call(
+                    f,
+                    &[st[0], st[1], st[2], st[3], st[4], st[5], sorted.xs, w, wl],
+                )?[0]
+            } else {
+                let up_rows = tiles_of(f, up, &up_bank, &sorted, sorted.xs)?;
+                let held = Operand {
+                    val: up_rows,
+                    rows: rows as u32,
+                    width: packed.width,
+                    dtype: Dtype::Bf16,
+                };
+                let into = Landing {
+                    rows: rows as u32,
+                    width: intermediate,
+                    dtype: Dtype::Bf16,
+                };
+                let hidden = match glu {
+                    ExpertGlu::Swiglu => crate::linear::mlp::swiglu(f, held, intermediate, into)?,
+                    ExpertGlu::GegluTanh => {
+                        crate::linear::mlp::geglu_tanh_packed(f, held, intermediate, into)?
+                    }
+                };
+                let wb = f.broadcast(ws, &[rows, i64::from(intermediate)], &[0])?;
+                let hidden = f.mul(hidden, wb)?;
+                f.convert(hidden, Elem::Bf16)
+            };
+            tiles_of(f, dn, &down_bank, &sorted, hidden)?
+        }
+    };
     let n = i64::from(routed.width);
     // (A wide prompt's fire: a decode's lanes, and a fire of 640 rows, sum
     // by the one-hot dot, whose cells grow as the square of its tokens:
@@ -2552,7 +2587,21 @@ pub fn experts(
     // blocks.)
     if tuning.moe_segment_tokens > 0
         && t >= tuning.moe_segment_from
-        && let Some(y) = segment_sum(f, &sorted, up, up_fan, down_rows, r, valid, tuning)?
+        && let Some(y) = segment_sum(
+            f,
+            &sorted,
+            up,
+            up_fan,
+            down_rows,
+            r,
+            valid,
+            tuning,
+            if y.dtype == Dtype::Bf16 {
+                Elem::Bf16
+            } else {
+                Elem::F32
+            },
+        )?
     {
         return Ok(Some(y));
     }
@@ -2614,6 +2663,7 @@ fn segment_sum(
     r: Val,
     valid: Val,
     tuning: Tuning,
+    out: Elem,
 ) -> Result<Option<Val>, Error> {
     use crate::linear::moe_gmm::SegmentSum;
     let (p, e, t, k, tm) = (fan.pairs(), fan.experts, fan.tokens, fan.top_k, spec.tm);
@@ -2629,6 +2679,7 @@ fn segment_sum(
         chunk,
         depth: SegmentSum::depth_of(tb, k, e, chunk),
         vmem_cap: tuning.vmem_cap(),
+        out,
     };
     // (The cuts it is measured on: 32 experts, rows 2048 and 2816 wide.)
     if !seg.fits() || n % 128 != 0 || n > 4096 || e > 32 || tm % chunk != 0 {

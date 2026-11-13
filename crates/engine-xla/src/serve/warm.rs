@@ -78,7 +78,10 @@ impl Shell {
         while pages <= cap {
             // A lane at this bound holds more than half of it.
             let seats = u32::try_from(pool / u64::from(pages / 2).max(1)).unwrap_or(u32::MAX);
-            let most = lanes_cap.min(pad.rung(seats.max(1)));
+            // and the rung the most lanes it seats pad to (Qwen3.6-35B-A3B's
+            // v5e pool seats 126: its c256 decodes ran 128 lanes, compiled
+            // mid-run)
+            let most = poem_exec::fire::rung_of(&buckets, lanes_cap.min(seats.max(1)));
             for &n in buckets.iter().filter(|&&n| n <= most) {
                 let lane = Want {
                     word: decode,
@@ -136,6 +139,23 @@ impl Shell {
                 }
             }
         }
+        // A hybrid's prompts filling the widest rows at every lane rung: `n - 1`
+        // lanes above fall a rung short of it (7 of 288 rows land 2048 rows,
+        // not 2304), and at a `max_forward_tokens` between the powers of two
+        // the prompts that fill it fire there (v6e Qwen3.6-35B-A3B pf256 at
+        // 2304: four 555-row prompts and their pads, 8 lanes, traced 812 ms a
+        // round, compiled 33 s on a fresh cache).
+        if hybrid {
+            for n in [4u32, 8, 16, 32, 64] {
+                let k = n - 1;
+                if n <= lanes_cap && widest / n >= 2 {
+                    let rows = widest - 1;
+                    let mut lanes = vec![fresh(prefill, rows / k); k as usize];
+                    lanes[0].rows += rows % k;
+                    shapes.push(lanes);
+                }
+            }
+        }
         // A hybrid's full fire: its prompts fill the widest rows and the lanes
         // they pad to push it onto the top rung (v6e Qwen3.8-27B mini20 c32:
         // 12 prompts of 2045 rows compiled mid-run, 12.7 s).
@@ -161,7 +181,7 @@ impl Shell {
         // the ladder is a decode-only fire's.)
         for &d in buckets
             .iter()
-            .filter(|&&d| d <= lanes_cap && pad.rung(d) == d)
+            .filter(|&&d| d <= pad.rung(lanes_cap) && pad.rung(d) == d)
         {
             for &b in buckets.iter().filter(|&&b| b >= least && b >= 2 * d) {
                 let rows = if b == top {
@@ -289,14 +309,14 @@ impl Shell {
         // 35B-A3B's 9 MiB pf256 programs: 5 GB each; eight v6e ones 108 GB
         // at once): one is admitted while the host's free memory holds 0.75
         // GiB a MiB for it and for every compile still running (one that
-        // started may not have taken its memory yet). A v5e host's 47 GB
-        // stopped answering at four started together.
-        let longest = texts
-            .iter()
-            .map(|(t, _)| hold_bytes(t) >> 6)
-            .max()
-            .unwrap_or(0);
-        let need = (longest * 3) << 8;
+        // started may not have taken its memory yet), each at its own text,
+        // not the ladder's longest (at that a v5e host ran Qwen3.6-35B-A3B's
+        // 168-program ladder one compile at a time, 73 compile-minutes past
+        // the hour a round has). A v5e host's 47 GB stopped answering at four
+        // started together.
+        let need_of = |text: &str| ((hold_bytes(text) >> 6) * 3) << 8;
+        let need = texts.iter().map(|(t, _)| need_of(t)).max().unwrap_or(0);
+        let least = texts.iter().map(|(t, _)| need_of(t)).min().unwrap_or(0);
         // A compiled program held in host memory costs ~64 bytes a byte of its
         // text (0.5 GB a 9 MiB program; 65 of them 42 GB of a v5e host's 47),
         // and libtpu's allocator keeps what a dropped one freed for its own
@@ -304,13 +324,18 @@ impl Shell {
         // budgeted up front, the free memory less two compiles' room, in
         // ladder order. The rest are parked: compiled onto the disk cache (not
         // held) where they are not there yet, loaded (~1 s, never compiled) by
-        // the first fire that takes their shape.
+        // the first fire that takes their shape. With a disk cache the ladder
+        // holds none it compiles while it compiles: a held program's memory is
+        // a compile's room (Qwen3.6-35B-A3B's v5e ladder held 25 GB of a 47 GB
+        // host by its end, its last compiles one at a time); those the free
+        // memory holds load once the compiles are done.
+        let parks = self.device.parks();
         let budget = available_memory().map_or(u64::MAX, |b| b.saturating_sub(2 * need));
         let held = std::sync::atomic::AtomicU64::new(0);
         let parked = std::sync::atomic::AtomicUsize::new(0);
-        let running = std::sync::atomic::AtomicUsize::new(0);
+        let running = std::sync::atomic::AtomicU64::new(0);
         let admit = std::sync::Mutex::new(());
-        let room = available_memory().map_or(8, |b| b / need.max(1)) as usize;
+        let room = available_memory().map_or(8, |b| b / least.max(1)) as usize;
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .min(8)
@@ -334,11 +359,12 @@ impl Shell {
                             break;
                         };
                         let hold = hold_bytes(text);
-                        let kept = held
-                            .fetch_update(SeqCst, SeqCst, |h| {
-                                (h + hold <= budget).then_some(h + hold)
-                            })
-                            .is_ok();
+                        let kept = (!parks || device.on_disk(text))
+                            && held
+                                .fetch_update(SeqCst, SeqCst, |h| {
+                                    (h + hold <= budget).then_some(h + hold)
+                                })
+                                .is_ok();
                         if !kept {
                             parked.fetch_add(1, SeqCst);
                             if device.on_disk(text) {
@@ -348,21 +374,20 @@ impl Shell {
                         // Admitted one at a time: a compile in flight may
                         // not have taken its memory yet, so each counts as
                         // still to come.
+                        let own = need_of(text);
                         loop {
                             let turn = admit.lock().expect("the warm admission lock poisoned");
-                            let busy = running.load(SeqCst) as u64;
-                            if busy == 0
-                                || available_memory().is_none_or(|b| b >= need * (busy + 1))
-                            {
-                                running.fetch_add(1, SeqCst);
+                            let busy = running.load(SeqCst);
+                            if busy == 0 || available_memory().is_none_or(|b| b >= busy + own) {
+                                running.fetch_add(own, SeqCst);
                                 break;
                             }
                             drop(turn);
                             std::thread::sleep(std::time::Duration::from_millis(200));
                         }
                         let program = device.program(text, (*sig).clone());
-                        running.fetch_sub(1, SeqCst);
-                        if kept {
+                        running.fetch_sub(own, SeqCst);
+                        if kept || program.is_err() {
                             if let Ok(mut slot) = slots[at].lock() {
                                 *slot = Some(program);
                             }
@@ -385,20 +410,60 @@ impl Shell {
         // A parked program the host's free memory holds once the compiles are
         // done (two compiles' room kept) loads from the disk cache here, at
         // load, not in the first fire that takes its shape (v5e Qwen3-0.6B
-        // c256: 13 parked loads stalled a 43 s round 3-5 s).
+        // c256: 13 parked loads stalled a 43 s round 3-5 s), side by side in
+        // ladder order, each admitted while the free memory holds it beside
+        // those still loading (one at a time a v6e reloaded Qwen3.6-35B-A3B's
+        // freshly compiled ladder in 150 s).
         let mut parked = parked.load(SeqCst);
-        for (at, (text, sig)) in texts.iter().enumerate() {
-            if parked == 0 {
-                break;
+        if parked > 0 {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let full = std::sync::atomic::AtomicBool::new(false);
+            let loading = std::sync::atomic::AtomicU64::new(0);
+            let loads: Vec<
+                std::sync::Mutex<Option<Result<std::sync::Arc<crate::device::Program>>>>,
+            > = (0..texts.len())
+                .map(|_| std::sync::Mutex::new(None))
+                .collect();
+            let held = &programs;
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|| {
+                        loop {
+                            let at = next.fetch_add(1, SeqCst);
+                            let Some((text, sig)) = texts.get(at) else {
+                                break;
+                            };
+                            if full.load(SeqCst) {
+                                break;
+                            }
+                            if held[at].is_some() || !device.on_disk(text) {
+                                continue;
+                            }
+                            let hold = hold_bytes(text);
+                            {
+                                let _turn = admit.lock().expect("the warm admission lock poisoned");
+                                let busy = loading.load(SeqCst);
+                                if available_memory().is_none_or(|b| b < hold + busy + 2 * need) {
+                                    full.store(true, SeqCst);
+                                    break;
+                                }
+                                loading.fetch_add(hold, SeqCst);
+                            }
+                            let program = device.program(text, (*sig).clone());
+                            loading.fetch_sub(hold, SeqCst);
+                            if let Ok(mut slot) = loads[at].lock() {
+                                *slot = Some(program);
+                            }
+                        }
+                    });
+                }
+            });
+            for (at, slot) in loads.into_iter().enumerate() {
+                if let Some(program) = slot.into_inner().ok().flatten() {
+                    programs[at] = Some(program);
+                    parked -= 1;
+                }
             }
-            if programs[at].is_some() || !device.on_disk(text) {
-                continue;
-            }
-            if available_memory().is_none_or(|b| b < hold_bytes(text) + 2 * need) {
-                break;
-            }
-            programs[at] = Some(device.program(text, (*sig).clone()));
-            parked -= 1;
         }
         if parked > 0 {
             tracing::warn!(

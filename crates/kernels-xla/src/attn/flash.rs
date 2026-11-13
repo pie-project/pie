@@ -153,13 +153,19 @@ impl Shape {
 /// The shape the kernel takes for `r` rows of these heads within
 /// `vmem_cap`, if any: heads a whole number of lane tiles wide, the
 /// rectangle at least a key block tall and tile-aligned at its end.
-fn shape(r: i64, h: &Heads, scale: f64, vmem_cap: i64) -> Option<Shape> {
+fn shape(r: i64, h: &Heads, scale: f64, vmem_cap: i64, narrow_rows: i64) -> Option<Shape> {
     if h.d % 128 != 0 || h.dv % 128 != 0 || r < BK || r % 16 != 0 || h.g < 1 {
         return None;
     }
+    // Narrow heads take the chip's rows first (`kernel.attn.flash_narrow_rows`).
+    let first = if h.d <= 128 && h.dv <= 128 {
+        narrow_rows
+    } else {
+        BQ
+    };
     // Whole row blocks only: a partial last block's copies reach past the
     // fire's rows (gemma-4-31B's 640-row fires faulted the chip).
-    [BQ, BQ / 2]
+    [first, BQ / 2]
         .into_iter()
         .filter(|&bq| r % bq == 0)
         .map(|bq| Shape::of(r, h, scale, bq))
@@ -168,7 +174,14 @@ fn shape(r: i64, h: &Heads, scale: f64, vmem_cap: i64) -> Option<Shape> {
 
 /// Whether the kernel takes this fire: the static side of the decision
 /// (`PIE_XLA_FLASH_PREFILL=0` turns it off).
-pub(crate) fn fits(f: &Func, ap: &Appended, r: i64, h: &Heads, vmem_cap: i64) -> bool {
+pub(crate) fn fits(
+    f: &Func,
+    ap: &Appended,
+    r: i64,
+    h: &Heads,
+    vmem_cap: i64,
+    narrow_rows: i64,
+) -> bool {
     if std::env::var("PIE_XLA_FLASH_PREFILL").is_ok_and(|v| v == "0") {
         return false;
     }
@@ -182,7 +195,7 @@ pub(crate) fn fits(f: &Func, ap: &Appended, r: i64, h: &Heads, vmem_cap: i64) ->
         && f.elem(ap.v) == Elem::Bf16
         && f.dims(ap.page) == [r]
         && f.dims(ap.off) == [r]
-        && shape(r, h, 1.0, vmem_cap).is_some()
+        && shape(r, h, 1.0, vmem_cap, narrow_rows).is_some()
 }
 
 /// The kernel over a fire's own key rows and an older-keys rectangle of
@@ -572,11 +585,12 @@ pub(crate) fn attend(
     enabled: Option<Val>,
     scale: f64,
     vmem_cap: i64,
+    narrow_rows: i64,
     walk: Walk<'_>,
     maps: [PageMap; 2],
 ) -> Built<Flashed> {
     let r = f.dims(q4)[0];
-    let Some(s) = shape(r, h, scale, vmem_cap) else {
+    let Some(s) = shape(r, h, scale, vmem_cap, narrow_rows) else {
         return bad(format!("{r} rows of {h:?} do not fit"));
     };
     let (start, p0) = segments(f, lane, qpos)?;
@@ -649,6 +663,119 @@ pub(crate) fn attend(
         m: out[1],
         l: out[2],
     })
+}
+
+/// A fire's readout rows `q4` (`[R, kvh, g, d]` bf16, at fire rows `at`)
+/// over their lanes' keys, read as the kernel's rows read theirs: the rows
+/// the fire appended (`ap`, one a fire row, `lane` and `qpos` the fire's
+/// tables) and the older keys their lanes hold, a rectangle of `OLD_PAGES`
+/// pool pages, each a blocked walk over its rectangle, merged by their
+/// log-sum-exps. Where the older keys overflow the rectangle, `walk`.
+/// `o` is `[R, kvh, g, dv]` f32.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn readouts(
+    f: &mut Func,
+    ap: &Appended,
+    h: &Heads,
+    geom: &Geom,
+    slots: i64,
+    planes: (Val, Val),
+    q4: Val,
+    at: Val,
+    lane: Val,
+    qpos: Val,
+    window: i64,
+    scale: f64,
+    ch: crate::tuning::Chunks,
+    walk: Branch<'_>,
+    maps: [PageMap; 2],
+) -> Built<Val> {
+    let n = f.dims(lane)[0];
+    let r = f.dims(q4)[0];
+    let (start, p0) = segments(f, lane, qpos)?;
+    let live = cmp_i(f, Cmp::Ge, qpos, 0)?;
+    let lo = if window > 0 {
+        let s = with_i(f, qpos, window - 1, Func::sub)?;
+        let z = f.like_i(s, 0);
+        f.max(s, z)?
+    } else {
+        f.like_i(qpos, 0)
+    };
+    let hi = with_i(f, qpos, 1, Func::add)?;
+    let old = older(
+        f, geom, slots, planes, lane, qpos, lo, p0, start, live, window, maps,
+    )?;
+    // Each row's fresh key rows, as `attend` reads them.
+    let klo = f.max(lo, p0)?;
+    let klo = f.sub(klo, p0)?;
+    let klo = f.add(klo, start)?;
+    let khi = f.sub(hi, p0)?;
+    let khi = f.add(khi, start)?;
+    let dead = f.like_i(klo, 0);
+    let klo = f.select(live, klo, dead)?;
+    let khi = f.select(live, khi, dead)?;
+    let pick = |f: &mut Func, v: Val| super::paged::take(f, v, at);
+    let (klo, khi) = (pick(f, klo)?, pick(f, khi)?);
+    let (olo, ohi) = (pick(f, old.klo)?, pick(f, old.khi)?);
+    let fits = cmp_i(f, Cmp::Le, old.total, OLD_PAGES)?;
+    let one = f.const_i(Elem::I32, 1, &[]);
+    let zero = f.const_i(Elem::I32, 0, &[]);
+    let which = f.select(fits, zero, one)?;
+    let h = *h;
+    let k = ap.k;
+    let v = ap.v;
+    let dense: Branch<'_> = Box::new(move |f: &mut Func| {
+        use super::paged::{Planes, Rows, Rule, blocked};
+        let (ok, ov) = old.gather(f)?;
+        let a = blocked(
+            f,
+            &Planes::Plain { k: ok, v: ov },
+            &h,
+            &Rule::default(),
+            &Rows::new(q4, olo, ohi),
+            OLD_PAGES * old.ps,
+            scale,
+            ch,
+        )?;
+        let b = blocked(
+            f,
+            &Planes::Plain { k, v },
+            &h,
+            &Rule::default(),
+            &Rows::new(q4, klo, khi),
+            n,
+            scale,
+            ch,
+        )?;
+        // The two parts' softmaxes as one: each weighs its sum at the
+        // larger max (a part that admitted nothing weighs none).
+        let m = f.max(a.m, b.m)?;
+        let weigh = |f: &mut Func, part: &Flashed| -> Built<Val> {
+            let d = f.sub(part.m, m)?;
+            let e = f.exp(d);
+            let w = f.mul(e, part.l)?;
+            let z = f.like_f(part.l, 0.0);
+            let any = f.compare(Cmp::Gt, part.l, z)?;
+            f.select(any, w, z)
+        };
+        let (wa, wb) = (weigh(f, &a)?, weigh(f, &b)?);
+        let den = f.add(wa, wb)?;
+        let z = f.like_f(den, 0.0);
+        let pos = f.compare(Cmp::Gt, den, z)?;
+        let one = f.like_f(den, 1.0);
+        let inv = f.div(one, den)?;
+        let inv = f.select(pos, inv, z)?;
+        let od = f.dims(a.o).to_vec();
+        let fa = f.mul(wa, inv)?;
+        let fb = f.mul(wb, inv)?;
+        let fa = f.broadcast(fa, &od, &[0, 1, 2])?;
+        let fb = f.broadcast(fb, &od, &[0, 1, 2])?;
+        let oa = f.mul(a.o, fa)?;
+        let ob = f.mul(b.o, fb)?;
+        Ok(vec![f.add(oa, ob)?])
+    });
+    let out = Ty::new(Elem::F32, &[r, h.kvh, h.g, h.dv]);
+    Ok(f.case(which, &[out], vec![dense, walk])?[0])
 }
 
 /// The older keys a fire's rows read (their lanes' cached prefixes): the
@@ -947,7 +1074,7 @@ mod tests {
             d: 128,
             dv: 128,
         };
-        let s = shape(1792, &h, 0.1, 110 << 20).unwrap();
+        let s = shape(1792, &h, 0.1, 110 << 20, BQ).unwrap();
         assert_eq!((s.rp, s.bq, s.bk, s.gf, s.gc), (1792, 256, 256, 2, 1));
         let c = kernel(&s, 110 << 20, 256).unwrap();
         assert!(c.module.contains("iteration_bounds = array<i64: 7>"));
@@ -976,9 +1103,9 @@ mod tests {
             d: 256,
             dv: 256,
         };
-        let s = shape(2048, &h, 0.1, 110 << 20).unwrap();
+        let s = shape(2048, &h, 0.1, 110 << 20, BQ).unwrap();
         assert_eq!((s.bq, s.gf, s.gc), (256, 4, 2));
-        assert!(shape(200, &h, 0.1, 110 << 20).is_none());
-        assert!(shape(1000, &h, 0.1, 110 << 20).is_none());
+        assert!(shape(200, &h, 0.1, 110 << 20, BQ).is_none());
+        assert!(shape(1000, &h, 0.1, 110 << 20, BQ).is_none());
     }
 }

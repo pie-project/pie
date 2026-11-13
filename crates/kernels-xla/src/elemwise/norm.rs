@@ -87,6 +87,263 @@ fn inv_rms_tall(
     f.mul(x, inv)
 }
 
+/// Rows a per-head norm kernel takes a step (`heads_kernel`).
+pub(super) const KERNEL_ROWS: i64 = 256;
+
+/// The least rows a fire's per-head norm takes the kernel from: a prompt's
+/// fire; a batch's mixed fires (a few hundred rows) keep XLA's norm (v5e
+/// gemma-4-31B c32: 1.98k -> 1.95k tok/s through the kernel).
+pub(super) const KERNEL_FROM: i64 = 640;
+
+/// The narrowest rows the kernel takes (8 heads of 256), or 8 heads of any
+/// width (128-wide ones from 1024): narrower ones cost XLA little (v6e
+/// gemma-4-26B-A4B's 8 kv heads of 256 through the kernel: pf256-512 42.6k
+/// -> 45.0k tok/s; v5e Qwen3.5-0.8B c256 equal).
+pub(super) const KERNEL_WIDTH: i64 = 2048;
+
+/// `x`'s bf16 `[rows, width]` rows normed per `axis`-wide head by one Mosaic
+/// kernel, a block of rows a step and each head in place, times `gain` (an
+/// f32 `[axis]` row, none for a scale of one): the mean square and the
+/// products in f32, the rows read and written once in bf16. XLA lays a
+/// `[rows, heads, axis]` f32 view of them out and back (v5e gemma-4-31B's
+/// 1792-row fires: q, k and v ~0.9 ms a sliding layer of copies, broadcasts
+/// and sums; Qwen3-0.6B's 16 q and 8 k heads of 128, pf256-512: v6e 236k ->
+/// 272k tok/s, v5e 106k -> 113k). `None` where it does not apply: heads
+/// narrower than 128, rows narrower than `KERNEL_WIDTH` and 8 heads, fires
+/// under `KERNEL_FROM` rows (`PIE_XLA_NORM_KERNEL=0` turns it off).
+fn heads_kernel(
+    f: &mut Func,
+    x: Val,
+    axis: i64,
+    eps: f32,
+    gain: Option<Val>,
+) -> Result<Option<Val>, Error> {
+    use crate::mosaic::{Body, Grid, Kernel, Operand as Block, Sem, Window};
+    let dims = f.dims(x).to_vec();
+    let (rows, width) = (dims[0], dims[1]);
+    if std::env::var("PIE_XLA_NORM_KERNEL").is_ok_and(|v| v == "0")
+        || f.elem(x) != Elem::Bf16
+        || rows < KERNEL_FROM
+        || axis < 128
+        || axis % 128 != 0
+        || width % axis != 0
+        || (width < KERNEL_WIDTH && width / axis < 8)
+    {
+        return Ok(None);
+    }
+    let heads = width / axis;
+    // Two buffers of the rows in and out: 8 bytes a cell of a block; whole
+    // blocks only (`rope::whole_rows`).
+    let most = if width > 8192 {
+        KERNEL_ROWS / 2
+    } else {
+        KERNEL_ROWS
+    };
+    let Some(r) = super::rope::whole_rows(rows, most) else {
+        return Ok(None);
+    };
+    let nb = rows / r;
+    let rowed = |w: i64| Block {
+        array: vec![rows, w],
+        elem: Elem::Bf16,
+        block: vec![r, w],
+        window: Window::Blocked,
+        index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
+    };
+    let mut ins = vec![rowed(width)];
+    let mut operands = vec![x];
+    if let Some(g) = gain {
+        ins.push(Block {
+            array: vec![1, axis],
+            elem: Elem::F32,
+            block: vec![1, axis],
+            window: Window::Blocked,
+            index: Box::new(|b: &mut Body, _: &Grid| {
+                let z = b.i32(0);
+                Ok(vec![z, z])
+            }),
+        });
+        operands.push(f.reshape(g, &[1, axis])?);
+    }
+    let gained = gain.is_some();
+    let k = Kernel {
+        name: "norm_heads".into(),
+        grid: vec![nb],
+        semantics: vec![Sem::Parallel],
+        prefetch: vec![],
+        ins,
+        outs: vec![rowed(width)],
+        vmem_limit: Some(u64::try_from(8 * r * width + 16 * r * axis + (4 << 20)).unwrap_or(0)),
+        scratch: vec![],
+    };
+    let c = k
+        .build(|b, blk| {
+            let i0 = b.index(0);
+            let g = if gained {
+                let g = b.vload_all(blk.ins[1])?;
+                Some(b.broadcast(g, &[r, axis])?)
+            } else {
+                None
+            };
+            let inv_n = b.splat_f(&[r, 1], Elem::F32, 1.0 / axis as f64)?;
+            let eps = b.splat_f(&[r, 1], Elem::F32, f64::from(eps))?;
+            for h in 0..heads {
+                let col = b.index(h * axis);
+                let xh = b.vload(blk.ins[0], &[i0, col], &[r, axis])?;
+                let xh = b.convert_f(xh, Elem::F32)?;
+                let sq = b.mulf(xh, xh)?;
+                let s = b.sum_lanes(sq)?;
+                let m = b.mulf(s, inv_n)?;
+                let m = b.addf(m, eps)?;
+                let inv = b.rsqrt(m)?;
+                let inv = b.broadcast(inv, &[r, axis])?;
+                let mut y = b.mulf(xh, inv)?;
+                if let Some(g) = g {
+                    y = b.mulf(y, g)?;
+                }
+                let y = b.convert_f(y, Elem::Bf16)?;
+                b.vstore(y, blk.outs[0], &[i0, col])?;
+            }
+            Ok(())
+        })
+        .map_err(Error::from)?;
+    Ok(Some(c.call(f, &operands).map_err(Error::from)?[0]))
+}
+
+/// The least rows a gated norm takes its kernel from: a v6e Qwen3.5-0.8B
+/// c256 through it from 640 rows lost 2.3%, and v5e Qwen3.8-27B mini8's
+/// 2816-row prompt fires gain (pf32-512 23.9k -> 24.4k tok/s).
+const GATED_FROM: i64 = 2304;
+
+/// [`gated_rms`] by one Mosaic kernel: `x`'s `[rows, width]` rows (f32 or
+/// bf16) normed per `axis`-wide head, times `gain` and the gate of `z`'s
+/// bf16 rows, landed bf16, a block of rows a step. XLA lays an f32 `[rows,
+/// heads, axis]` view of the rows out for the sums and back (v5e
+/// Qwen3.8-27B's GDN output, 48 heads of 128, 2816-row fires: ~0.6 ms a
+/// layer). `None` where it does not apply: from `GATED_FROM` rows in whole
+/// blocks (`PIE_XLA_NORM_KERNEL=0` turns it off).
+fn gated_kernel(
+    f: &mut Func,
+    x: Val,
+    z: Val,
+    gain: Option<Val>,
+    axis: i64,
+    eps: f32,
+    sigmoid: bool,
+) -> Result<Option<Val>, Error> {
+    use crate::mosaic::{Body, Grid, Kernel, Operand as Block, Sem, Window};
+    let dims = f.dims(x).to_vec();
+    let (rows, width) = (dims[0], dims[1]);
+    let xe = f.elem(x);
+    if std::env::var("PIE_XLA_NORM_KERNEL").is_ok_and(|v| v == "0")
+        || !matches!(xe, Elem::F32 | Elem::Bf16)
+        || f.elem(z) != Elem::Bf16
+        || f.dims(z) != dims.as_slice()
+        || rows < GATED_FROM
+        || axis < 128
+        || axis % 128 != 0
+        || width % axis != 0
+    {
+        return Ok(None);
+    }
+    let heads = width / axis;
+    // Two buffers of the rows in (x, z) and out: 16 bytes a cell of a block
+    // for f32 rows; whole blocks only (`rope::whole_rows`).
+    let most = if width > 4096 {
+        KERNEL_ROWS / 2
+    } else {
+        KERNEL_ROWS
+    };
+    let Some(r) = super::rope::whole_rows(rows, most) else {
+        return Ok(None);
+    };
+    let nb = rows / r;
+    let rowed = |w: i64, elem: Elem| Block {
+        array: vec![rows, w],
+        elem,
+        block: vec![r, w],
+        window: Window::Blocked,
+        index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
+    };
+    let mut ins = vec![rowed(width, xe), rowed(width, Elem::Bf16)];
+    let mut operands = vec![x, z];
+    if let Some(g) = gain {
+        ins.push(Block {
+            array: vec![1, axis],
+            elem: Elem::F32,
+            block: vec![1, axis],
+            window: Window::Blocked,
+            index: Box::new(|b: &mut Body, _: &Grid| {
+                let z = b.i32(0);
+                Ok(vec![z, z])
+            }),
+        });
+        let g = f.convert(g, Elem::F32);
+        operands.push(f.reshape(g, &[1, axis])?);
+    }
+    let gained = gain.is_some();
+    let xb = i64::from(xe.bits()) / 8;
+    let k = Kernel {
+        name: "norm_gated".into(),
+        grid: vec![nb],
+        semantics: vec![Sem::Parallel],
+        prefetch: vec![],
+        ins,
+        outs: vec![rowed(width, Elem::Bf16)],
+        vmem_limit: Some(
+            u64::try_from(2 * r * width * (xb + 4) + 32 * r * axis + (4 << 20)).unwrap_or(0),
+        ),
+        scratch: vec![],
+    };
+    let c = k
+        .build(|b, blk| {
+            let i0 = b.index(0);
+            let g = if gained {
+                let g = b.vload_all(blk.ins[2])?;
+                Some(b.broadcast(g, &[r, axis])?)
+            } else {
+                None
+            };
+            let inv_n = b.splat_f(&[r, 1], Elem::F32, 1.0 / axis as f64)?;
+            let eps = b.splat_f(&[r, 1], Elem::F32, f64::from(eps))?;
+            let one = b.splat_f(&[r, axis], Elem::F32, 1.0)?;
+            let zero = b.splat_f(&[r, axis], Elem::F32, 0.0)?;
+            for h in 0..heads {
+                let col = b.index(h * axis);
+                let xh = b.vload(blk.ins[0], &[i0, col], &[r, axis])?;
+                let xh = if xe == Elem::F32 {
+                    xh
+                } else {
+                    b.convert_f(xh, Elem::F32)?
+                };
+                let sq = b.mulf(xh, xh)?;
+                let s = b.sum_lanes(sq)?;
+                let m = b.mulf(s, inv_n)?;
+                let m = b.addf(m, eps)?;
+                let inv = b.rsqrt(m)?;
+                let inv = b.broadcast(inv, &[r, axis])?;
+                let mut y = b.mulf(xh, inv)?;
+                if let Some(g) = g {
+                    y = b.mulf(y, g)?;
+                }
+                // σ(z) = 1 / (1 + e^-z); the gate is σ(z) or z·σ(z).
+                let zh = b.vload(blk.ins[1], &[i0, col], &[r, axis])?;
+                let zh = b.convert_f(zh, Elem::F32)?;
+                let nz = b.subf(zero, zh)?;
+                let e = b.exp(nz)?;
+                let d = b.addf(one, e)?;
+                let s = b.divf(one, d)?;
+                let gate = if sigmoid { s } else { b.mulf(zh, s)? };
+                let y = b.mulf(y, gate)?;
+                let y = b.convert_f(y, Elem::Bf16)?;
+                b.vstore(y, blk.outs[0], &[i0, col])?;
+            }
+            Ok(())
+        })
+        .map_err(Error::from)?;
+    Ok(Some(c.call(f, &operands).map_err(Error::from)?[0]))
+}
+
 /// `x3 / rms` for `[rows, heads, axis]` under each head's f32 sum of squares
 /// (`sum`, `[rows, heads]`), back as `[rows, width]`.
 fn rows_by_sums(f: &mut Func, x3: Val, sum: Val, eps: f32) -> Result<Val, Error> {
@@ -167,6 +424,14 @@ fn rms_row(
             ),
         ));
     }
+    if axis < x.width {
+        let w = f.convert(weight.val, Elem::F32);
+        let w = f.reshape(w, &[i64::from(axis)])?;
+        let w = if plus_one { f.offset(w, 1.0)? } else { w };
+        if let Some(y) = heads_kernel(f, x.val, i64::from(axis), eps, Some(w))? {
+            return Ok(y);
+        }
+    }
     let xv = x.f32(f);
     let n = inv_rms_rows(f, op, xv, axis, eps)?;
     let g = gain(
@@ -237,6 +502,9 @@ pub fn rmsnorm_grouped_plus_one(
 pub fn rmsnorm_no_scale(f: &mut Func, x: Operand, head_dim: u32, eps: f32) -> Result<Val, Error> {
     const OP: &str = "elemwise.rmsnorm";
     expect(OP, x, &[Dtype::Bf16])?;
+    if let Some(y) = heads_kernel(f, x.val, i64::from(head_dim), eps, None)? {
+        return Ok(y);
+    }
     let xv = x.f32(f);
     inv_rms_rows(f, OP, xv, head_dim, eps)
 }
@@ -253,6 +521,7 @@ fn gated_rms(
     eps: f32,
     sigmoid: bool,
     y: Landing,
+    kernel: bool,
 ) -> Result<Val, Error> {
     expect(op, gate, &[Dtype::Bf16])?;
     if gate.rows != x.rows || gate.width != x.width || y.rows != x.rows || y.width != x.width {
@@ -260,6 +529,16 @@ fn gated_rms(
             op,
             "the gate and the landing ride the normed rectangle",
         ));
+    }
+    let per_head = weight.is_none_or(|w| u64::from(w.rows) * u64::from(w.width) == u64::from(vd));
+    if kernel && y.dtype == Dtype::Bf16 && per_head {
+        let shape = [i64::from(x.rows), i64::from(x.width)];
+        let xv = f.reshape(x.val, &shape)?;
+        let zv = f.reshape(gate.val, &shape)?;
+        let w = weight.map(|w| w.val);
+        if let Some(out) = gated_kernel(f, xv, zv, w, i64::from(vd), eps, sigmoid)? {
+            return Ok(out);
+        }
     }
     let xv = x.f32(f);
     let n = inv_rms_rows(f, op, xv, vd, eps)?;
@@ -288,7 +567,7 @@ pub fn rmsnorm_gated(
 ) -> Result<Val, Error> {
     const OP: &str = "elemwise.rmsnorm_gated";
     let vd = nonzero(OP, "the stated value-head width", head_dim)?;
-    gated_rms(f, OP, x, gate, Some(weight), vd, eps, sigmoid_gate, y)
+    gated_rms(f, OP, x, gate, Some(weight), vd, eps, sigmoid_gate, y, true)
 }
 
 /// [`rmsnorm_gated`] with no learned scale (Muse Spark's).
@@ -303,7 +582,7 @@ pub fn rmsnorm_gated_unscaled(
 ) -> Result<Val, Error> {
     const OP: &str = "elemwise.rmsnorm_gated";
     let vd = nonzero(OP, "the stated value-head width", head_dim)?;
-    gated_rms(f, OP, x, gate, None, vd, eps, sigmoid_gate, y)
+    gated_rms(f, OP, x, gate, None, vd, eps, sigmoid_gate, y, false)
 }
 
 pub fn rmsnorm_gated_by(
@@ -326,7 +605,18 @@ pub fn rmsnorm_gated_by(
             ),
         ));
     }
-    gated_rms(f, OP, x, gate, Some(weight), x.width / heads, eps, true, y)
+    gated_rms(
+        f,
+        OP,
+        x,
+        gate,
+        Some(weight),
+        x.width / heads,
+        eps,
+        true,
+        y,
+        false,
+    )
 }
 
 /// Muse Spark's post-norm and residual gate (`elemwise.norm_gate`): `u = x *

@@ -342,6 +342,28 @@ fn moe_route_tables() {
         }
     }
 
+    // A route past the bank's 16 experts (or none) lands its row zero, the
+    // rest as they were; windowed, only the live tokens' rows.
+    let routes = gpu.ints_shaped(&[3, 40, -1, 15, 16, 0, 20, 1, 2], 3, 3);
+    let held = bf16s(9 * 8, 5, 1.0);
+    for (win, live) in [(None, 0..9), (Some([1, 1, 0, 0]), 3..6)] {
+        let mut y = gpu.tensor(&held, 9, 8, Dtype::Bf16);
+        let win = win.map(|w| gpu.ints(&w));
+        if let Some(w) = &win {
+            ctx.arm_stage(w.ptr);
+        }
+        moe_route::zero_dropped(&ctx, routes, 16, &mut y).unwrap();
+        ctx.disarm_stage();
+        let got = gpu.read(&y);
+        for r in 0..9 {
+            let dropped = live.contains(&r) && [1, 2, 4, 6].contains(&r);
+            for h in 0..8 {
+                let want = if dropped { 0.0 } else { held[r * 8 + h] };
+                assert_eq!(got[r * 8 + h], want, "dropped route row {r} column {h}");
+            }
+        }
+    }
+
     // The group fan-out, whole and windowed.
     let mut routes = gpu.upload(&[-1; 4 * 6], 4, 6, Dtype::I32);
     moe_route::group_routes(&ctx, 6, &mut routes).unwrap();

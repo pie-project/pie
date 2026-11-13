@@ -494,8 +494,57 @@ pub(crate) fn rotate_all(
     Ok(out)
 }
 
-/// Rows a prompt-tall rotation takes a block (`turn_tall`).
+/// Rows a prompt-tall rotation takes a block at most (`turn_tall`).
 const TALL_ROWS: i64 = 256;
+
+/// The rows a row-blocked kernel takes a step for `rows` rows: the most of
+/// `most`, 128, 64, 32 and 16 that divides them, so no block reaches past
+/// the last row (a partial last block's copies read and write past the
+/// array: a v5e gemma-4-E2B c256 hung on the shared tail's 272 readout rows
+/// turned as two blocks of 256). `None` when no such block divides them.
+pub(crate) fn whole_rows(rows: i64, most: i64) -> Option<i64> {
+    [most, 128, 64, 32, 16]
+        .into_iter()
+        .filter(|&r| r <= most)
+        .find(|&r| rows % r == 0)
+}
+
+/// Whether each lane of `t` and its partner half a head on turn together, or
+/// both pass through (a partial rotation's rest: no angle, so the table's
+/// cosine is one and its sine zero there).
+fn halves(t: &Turn) -> bool {
+    let half = t.unit / 2;
+    (0..half).all(|i| {
+        let paired = t.partner[i] == (i + half) as i64
+            && t.partner[i + half] == i as i64
+            && t.sign[i] == -1.0
+            && t.sign[i + half] == 1.0
+            && t.freq.iter().all(|fq| fq[i] == fq[i + half]);
+        let still = t.partner[i] == i as i64
+            && t.partner[i + half] == (i + half) as i64
+            && t.freq.iter().all(|fq| fq[i] == 0.0 && fq[i + half] == 0.0);
+        paired || still
+    })
+}
+
+/// The table's cosines, and its sines signed, `[rows, d]` in f32 (one
+/// position axis).
+fn tables(f: &mut Func, pos: Val, rows: i64, t: &Turn) -> Result<(Val, Val), Error> {
+    let u = t.unit as i64;
+    let p = f.reshape(pos, &[rows])?;
+    let p = f.broadcast(p, &[rows, u], &[0])?;
+    let fs: Vec<f64> = t.freq[0].iter().map(|&x| f64::from(x)).collect();
+    let fq = f.const_floats(Elem::F32, &fs, &[u])?;
+    let fq = f.broadcast(fq, &[rows, u], &[1])?;
+    let ang = f.mul(p, fq)?;
+    let c = f.cos(ang);
+    let s = f.sin(ang);
+    let sign: Vec<f64> = t.sign.iter().map(|&g| f64::from(g)).collect();
+    let sign = f.const_floats(Elem::F32, &sign, &[u])?;
+    let sign = f.broadcast(sign, &[rows, u], &[1])?;
+    let s = f.mul(s, sign)?;
+    Ok((c, s))
+}
 
 /// A prompt's bf16 rows turned by one Mosaic kernel, a block of rows a step
 /// and each head in place, when `t` turns whole heads a lane tile wide or
@@ -509,14 +558,6 @@ fn turn_tall(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Er
     let dims = f.dims(x).to_vec();
     let (rows, width) = (dims[0], dims[1]);
     let unit = t.unit;
-    let half = unit / 2;
-    let halves = (0..half).all(|i| {
-        t.partner[i] == (i + half) as i64
-            && t.partner[i + half] == i as i64
-            && t.sign[i] == -1.0
-            && t.sign[i + half] == 1.0
-            && t.freq.iter().all(|fq| fq[i] == fq[i + half])
-    });
     if std::env::var("PIE_XLA_ROPE_KERNEL").is_ok_and(|v| v == "0")
         || f.elem(x) != Elem::Bf16
         || rows < TALL_ROWS
@@ -524,30 +565,21 @@ fn turn_tall(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Er
         || width % unit as i64 != 0
         || t.freq.len() != 1
         || t.mscale != 1.0
-        || !halves
+        || !halves(t)
     {
         return Ok(None);
     }
     let u = unit as i64;
-    // The table's cosines, and its sines signed, `[rows, d]` in f32.
-    let p = f.reshape(pos, &[rows])?;
-    let p = f.broadcast(p, &[rows, u], &[0])?;
-    let fs: Vec<f64> = t.freq[0].iter().map(|&x| f64::from(x)).collect();
-    let fq = f.const_floats(Elem::F32, &fs, &[u])?;
-    let fq = f.broadcast(fq, &[rows, u], &[1])?;
-    let ang = f.mul(p, fq)?;
-    let c = f.cos(ang);
-    let s = f.sin(ang);
-    let sign: Vec<f64> = t.sign.iter().map(|&g| f64::from(g)).collect();
-    let sign = f.const_floats(Elem::F32, &sign, &[u])?;
-    let sign = f.broadcast(sign, &[rows, u], &[1])?;
-    let s = f.mul(s, sign)?;
+    let (c, s) = tables(f, pos, rows, t)?;
     let heads = width / u;
-    let nb = (rows + TALL_ROWS - 1) / TALL_ROWS;
+    let Some(tr) = whole_rows(rows, TALL_ROWS) else {
+        return Ok(None);
+    };
+    let nb = rows / tr;
     let block = |w: i64, elem: Elem| Block {
         array: vec![rows, w],
         elem,
-        block: vec![TALL_ROWS, w],
+        block: vec![tr, w],
         window: Window::Blocked,
         index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
     };
@@ -564,9 +596,7 @@ fn turn_tall(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Er
         outs: vec![block(width, Elem::Bf16)],
         // Two buffers of each block, with room: 32 heads of 256 (gemma-4-31B's
         // `q`) hold 17.8 MB, past a v5e's 16 MB default.
-        vmem_limit: Some(
-            u64::try_from(8 * TALL_ROWS * width + 16 * TALL_ROWS * u + (4 << 20)).unwrap_or(0),
-        ),
+        vmem_limit: Some(u64::try_from(8 * tr * width + 16 * tr * u + (4 << 20)).unwrap_or(0)),
         scratch: vec![],
     };
     let c_ = k
@@ -577,7 +607,7 @@ fn turn_tall(f: &mut Func, x: Val, pos: Val, t: &Turn) -> Result<Option<Val>, Er
             let by = b.i32(u / 2);
             for h in 0..heads {
                 let col = b.index(h * u);
-                let xh = b.vload(blk.ins[0], &[i0, col], &[TALL_ROWS, u])?;
+                let xh = b.vload(blk.ins[0], &[i0, col], &[tr, u])?;
                 let xh = b.convert_f(xh, Elem::F32)?;
                 let xp = b.rotate(xh, by, 1)?;
                 let a = b.mulf(xh, cs)?;
@@ -668,6 +698,172 @@ pub fn partial_q(
     heads(OP, q.width, head_dim)?;
     let t = neox(head_dim, rotary_dim, theta, span, false);
     Ok(rotate_all(f, OP, &[q], positions, 1, &t)?[0])
+}
+
+/// A per-head rms norm (`norm::rmsnorm_per_head`, or its `_plus_one` form)
+/// whose rows a rotation turns next ([`normed`]): the rows it reads, its
+/// `[d]` gain and its epsilon.
+#[derive(Clone, Copy, Debug)]
+pub struct Normed {
+    pub x: Operand,
+    pub weight: Operand,
+    pub plus_one: bool,
+    pub eps: f32,
+}
+
+/// [`partial`] (and, `rotary_dim` the head and `span` half of it, [`full`]
+/// by halves) of the rows each of `xs` norms to, each head normed and
+/// turned by one Mosaic kernel (`turn_normed`): the rows read and written
+/// once, not landed by the norm's kernel for the rope's to read. `None`,
+/// nothing emitted, unless the kernel takes every one of `xs`.
+pub fn normed(
+    f: &mut Func,
+    xs: &[Normed],
+    positions: Operand,
+    rotary_dim: u32,
+    head_dim: u32,
+    theta: f32,
+    span: u32,
+) -> Result<Option<Vec<Val>>, Error> {
+    const OP: &str = "elemwise.rope";
+    int_positions(OP, positions)?;
+    rotary_within(OP, rotary_dim, head_dim)?;
+    let t = neox(head_dim, rotary_dim, theta, span, false);
+    let Some(rows) = xs.first().map(|n| n.x.rows) else {
+        return Ok(None);
+    };
+    let mut blocks = Vec::with_capacity(xs.len());
+    for n in xs {
+        heads(OP, n.x.width, head_dim)?;
+        match normed_rows(f, n, &t) {
+            Some(r) if n.x.rows == rows => blocks.push(r),
+            _ => return Ok(None),
+        }
+    }
+    let pos = positions_f32(f, OP, positions, rows, 1)?;
+    let (c, s) = tables(f, pos, i64::from(rows), &t)?;
+    let mut out = Vec::with_capacity(xs.len());
+    for (n, r) in xs.iter().zip(blocks) {
+        out.push(turn_normed(f, n, c, s, r)?);
+    }
+    Ok(Some(out))
+}
+
+/// The narrowest heads the fused kernel takes: Qwen3-0.6B's 128-wide heads
+/// lost 1.9% (v5e pf256-512) where Gemma-4's 256 and 512 gain.
+const LEAST_HEAD: i64 = 256;
+
+/// The rows a block of `turn_normed` takes of `n`'s under `t`, where the
+/// norm's kernel (`norm::heads_kernel`) and the rope's (`turn_tall`) would
+/// each take them: the norm's blocks.
+fn normed_rows(f: &Func, n: &Normed, t: &Turn) -> Option<i64> {
+    use super::norm::{KERNEL_FROM, KERNEL_ROWS, KERNEL_WIDTH};
+    let (rows, width, u) = (i64::from(n.x.rows), i64::from(n.x.width), t.unit as i64);
+    let off = |var: &str| std::env::var(var).is_ok_and(|v| v == "0");
+    if off("PIE_XLA_NORM_KERNEL")
+        || off("PIE_XLA_ROPE_KERNEL")
+        || f.elem(n.x.val) != Elem::Bf16
+        || i64::from(n.weight.rows) * i64::from(n.weight.width) != u
+        || rows < KERNEL_FROM
+        || u < LEAST_HEAD
+        || u % 128 != 0
+        || width % u != 0
+        || (width < KERNEL_WIDTH && width / u < 8)
+        || t.freq.len() != 1
+        || t.mscale != 1.0
+        || !halves(t)
+    {
+        return None;
+    }
+    let most = if width > 8192 {
+        KERNEL_ROWS / 2
+    } else {
+        KERNEL_ROWS
+    };
+    whole_rows(rows, most)
+}
+
+/// `n`'s bf16 rows, `r` a step, each head normed as `norm::heads_kernel`
+/// norms it (rounded to bf16 as that kernel lands it) and turned as
+/// `turn_tall` turns it, by the tables `c` and `s`.
+fn turn_normed(f: &mut Func, n: &Normed, c: Val, s: Val, r: i64) -> Result<Val, Error> {
+    use crate::mosaic::{Body, Grid, Kernel, Operand as Block, Sem, Window};
+    let (rows, width, u) = (i64::from(n.x.rows), i64::from(n.x.width), f.dims(c)[1]);
+    let heads = width / u;
+    let g = f.convert(n.weight.val, Elem::F32);
+    let g = f.reshape(g, &[u])?;
+    let g = if n.plus_one { f.offset(g, 1.0)? } else { g };
+    let g = f.reshape(g, &[1, u])?;
+    let block = |w: i64, elem: Elem| Block {
+        array: vec![rows, w],
+        elem,
+        block: vec![r, w],
+        window: Window::Blocked,
+        index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
+    };
+    let gain = Block {
+        array: vec![1, u],
+        elem: Elem::F32,
+        block: vec![1, u],
+        window: Window::Blocked,
+        index: Box::new(|b: &mut Body, _: &Grid| {
+            let z = b.i32(0);
+            Ok(vec![z, z])
+        }),
+    };
+    let k = Kernel {
+        name: "norm_rope".into(),
+        grid: vec![rows / r],
+        semantics: vec![Sem::Parallel],
+        prefetch: vec![],
+        ins: vec![
+            block(width, Elem::Bf16),
+            gain,
+            block(u, Elem::F32),
+            block(u, Elem::F32),
+        ],
+        outs: vec![block(width, Elem::Bf16)],
+        // Two buffers of the rows in and out and of the tables, and a head's
+        // f32 temporaries.
+        vmem_limit: Some(u64::try_from(8 * r * width + 32 * r * u + (4 << 20)).unwrap_or(0)),
+        scratch: vec![],
+    };
+    let eps = n.eps;
+    let kc = k
+        .build(|b, blk| {
+            let i0 = b.index(0);
+            let g = b.vload_all(blk.ins[1])?;
+            let g = b.broadcast(g, &[r, u])?;
+            let cs = b.vload_all(blk.ins[2])?;
+            let sn = b.vload_all(blk.ins[3])?;
+            let inv_n = b.splat_f(&[r, 1], Elem::F32, 1.0 / u as f64)?;
+            let eps = b.splat_f(&[r, 1], Elem::F32, f64::from(eps))?;
+            let by = b.i32(u / 2);
+            for h in 0..heads {
+                let col = b.index(h * u);
+                let xh = b.vload(blk.ins[0], &[i0, col], &[r, u])?;
+                let xh = b.convert_f(xh, Elem::F32)?;
+                let sq = b.mulf(xh, xh)?;
+                let sum = b.sum_lanes(sq)?;
+                let m = b.mulf(sum, inv_n)?;
+                let m = b.addf(m, eps)?;
+                let inv = b.rsqrt(m)?;
+                let inv = b.broadcast(inv, &[r, u])?;
+                let y = b.mulf(xh, inv)?;
+                let y = b.mulf(y, g)?;
+                let y = b.convert_f(y, Elem::Bf16)?;
+                let y = b.convert_f(y, Elem::F32)?;
+                let yp = b.rotate(y, by, 1)?;
+                let a = b.mulf(y, cs)?;
+                let c2 = b.mulf(yp, sn)?;
+                let o = b.addf(a, c2)?;
+                let o = b.convert_f(o, Elem::Bf16)?;
+                b.vstore(o, blk.outs[0], &[i0, col])?;
+            }
+            Ok(())
+        })
+        .map_err(Error::from)?;
+    Ok(kc.call(f, &[n.x.val, g, c, s]).map_err(Error::from)?[0])
 }
 
 /// YaRN ramp bounds over a `head_dim`-wide rotation, as kernels-cuda
@@ -801,4 +997,16 @@ pub fn yarn(
     let t = t.scaled(attention_factor);
     let v = rotate_all(f, OP, &[q, k], positions, 1, &t)?;
     Ok([v[0], v[1]])
+}
+
+#[cfg(test)]
+mod row_block_tests {
+    #[test]
+    fn row_blocks_are_whole() {
+        assert_eq!(super::whole_rows(1792, 256), Some(256));
+        assert_eq!(super::whole_rows(640, 256), Some(128));
+        assert_eq!(super::whole_rows(272, 256), Some(16));
+        assert_eq!(super::whole_rows(2176, 256), Some(128));
+        assert_eq!(super::whole_rows(600, 256), None);
+    }
 }
