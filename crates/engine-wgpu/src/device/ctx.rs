@@ -215,6 +215,13 @@ impl Core {
             })
     }
 
+    /// Whether the driver reports the heap's usage, so [`Core::outside`]
+    /// measures what it holds.
+    fn measures_outside(&self) -> bool {
+        self.heap
+            .is_some_and(|heap| vulkan_budget(&self.adapter, heap).is_some())
+    }
+
     pub(crate) fn fault(&self, what: &'static str, why: impl ToString) -> Fault {
         Fault::Wgpu {
             what,
@@ -697,6 +704,13 @@ impl Context {
     #[must_use]
     pub fn outside(&self) -> u64 {
         self.core.outside()
+    }
+
+    /// Whether [`Context::outside`] is measured: the driver reports the
+    /// heap's usage.
+    #[must_use]
+    pub fn measures_outside(&self) -> bool {
+        self.core.measures_outside()
     }
 
     #[must_use]

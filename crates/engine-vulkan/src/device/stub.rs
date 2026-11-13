@@ -21,6 +21,7 @@ pub struct Enabled {
     pub memory_model: bool,
     pub subgroup_size_control: bool,
     pub memory_budget: bool,
+    pub coopmat: bool,
 }
 
 #[derive(Debug)]
@@ -401,14 +402,11 @@ impl Pipelines {
         self.compiles.get()
     }
 
-    pub fn warm(&self, _device: &Context, _fire: kernels_slang::Fire) -> Result<()> {
-        Err(Fault::Deviceless)
-    }
-
     pub fn get(
         &self,
         _device: &Context,
-        _fire: kernels_slang::Fire,
+        _file: &'static str,
+        _key: &'static str,
     ) -> Result<std::sync::Arc<Pipeline>> {
         Err(Fault::Deviceless)
     }

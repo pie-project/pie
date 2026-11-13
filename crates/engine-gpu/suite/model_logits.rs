@@ -268,8 +268,30 @@ pub fn load_paged(fixture: &Fixture, page: u32, context: u32, chunk: Option<u64>
     )
 }
 
+/// Held over a load: a driver reports what it holds a process, so a load
+/// prices what its pipelines take while no other test's load allocates.
+static LOADING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn loading() -> std::sync::MutexGuard<'static, ()> {
+    LOADING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// [`load_paged`] under `residency` (a host tier's budget, say).
 pub fn load_with(
+    fixture: &Fixture,
+    page: u32,
+    context: u32,
+    chunk: Option<u64>,
+    residency: engine::load::Residency,
+) -> Option<Shell> {
+    let _alone = loading();
+    load_alone(fixture, page, context, chunk, residency)
+}
+
+/// [`load_with`], [`LOADING`] held by the caller.
+fn load_alone(
     fixture: &Fixture,
     page: u32,
     context: u32,
@@ -429,14 +451,37 @@ fn a_windowed_miniature_serves_two_lanes() {
 fn a_served_miniature_is_in_the_ledger_whole() {
     use engine::memory::Class;
     let fixture = fixture("qwen3-micro-text", None);
-    let Some(mut shell) = load(&fixture, CONTEXT) else {
+    // No other test loads while this one reads what the driver holds.
+    let _alone = loading();
+    let Some(mut shell) = load_alone(
+        &fixture,
+        PAGE,
+        CONTEXT,
+        None,
+        engine::load::Residency::default(),
+    ) else {
         return;
     };
+    let loaded = shell.device().outside();
+    let unbuilt = shell.device().books().ledger().of(Class::Outside, "unbuilt pipelines");
     serve_seats(&mut shell, &fixture.trace, 2);
     let books = shell.device().books();
     let ledger = books.ledger();
     assert_eq!(ledger.check(), Ok(()), "{ledger}");
     assert_eq!(books.audit().gap(), 0, "{ledger}");
+    // What serving made the driver allocate beside the reservations (the
+    // pipelines its fires built) is within what the load priced for it.
+    let served = shell.device().outside();
+    eprintln!(
+        "outside: {loaded} at load, {served} after serving, {unbuilt} priced for the \
+         pipelines unbuilt at load, {} built",
+        shell.compiled()
+    );
+    assert!(
+        served <= loaded + unbuilt,
+        "the driver holds {served} bytes beside the reservations after serving, {loaded} \
+         after the load, which priced {unbuilt} for the pipelines still to build: {ledger}"
+    );
     for class in [Class::Model, Class::State, Class::Fire] {
         assert!(
             ledger.bytes(class) > 0,

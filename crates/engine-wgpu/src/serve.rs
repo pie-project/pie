@@ -70,6 +70,28 @@ impl Serve for Api {
         pipelines.compiled()
     }
 
+    fn measures_outside(device: &Context) -> bool {
+        device.measures_outside()
+    }
+
+    fn builds(device: &Context, key: &str, tier: &str) -> bool {
+        let runs = match tier {
+            "baseline" => true,
+            "subgroup" => Self::tier(device) == kernels_slang::Tier::Subgroup,
+            _ => false,
+        };
+        runs && kernels_slang::wgsl(key).is_some()
+    }
+
+    fn build(
+        device: &Context,
+        pipelines: &Pipelines,
+        unit: &'static str,
+        key: &'static str,
+    ) -> Result<()> {
+        pipelines.get(device, unit, key).map(drop)
+    }
+
     fn sink<'f>(
         device: &'f Context,
         frame: &'f Frame,
