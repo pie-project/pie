@@ -97,6 +97,40 @@ impl Lower<'_, '_> {
         })
     }
 
+    /// A streamed bank (`crate::store::streamed`) as the dense
+    /// `[experts · rows, width]` value the base build reads: a bank view of
+    /// the pool (`kernels_xla::hlo::BankAt`), expert `e`'s panels at pool
+    /// row `loc[e]`, which the grouped matmul reads in place.
+    pub fn streamed_bank(
+        &mut self,
+        bank: crate::store::streamed::Bank,
+        width: u32,
+    ) -> Result<Operand, Error> {
+        let view = self.read(bank.view)?;
+        let loc = self.read(bank.loc)?;
+        let f = self.cx.func();
+        let (pool, _) = f.view_parts(view.val).ok_or_else(|| Error::Backend {
+            op: "linear.moe_select",
+            detail: "a streamed bank whose view is not of the pool".to_string(),
+        })?;
+        let e = i64::from(bank.experts);
+        let table = f.reshape(loc.val, &[e])?;
+        let val = f.bank_view(kernels_xla::hlo::BankAt {
+            pool,
+            table,
+            offset: 0,
+            experts: e,
+            n: i64::from(bank.rows),
+            k: i64::from(width),
+        })?;
+        Ok(Operand {
+            val,
+            rows: bank.experts * bank.rows,
+            width,
+            dtype: dtype::Dtype::Bf16,
+        })
+    }
+
     /// A ragged tensor's data, then its indptr.
     pub fn ragged(
         &mut self,

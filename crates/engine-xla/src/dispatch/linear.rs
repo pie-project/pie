@@ -706,16 +706,26 @@ impl Run<'_> {
                 quantized: false,
                 quant: None,
                 ..
-            } => crate::lower::lower(self.ctx(), |l| {
-                let x_v = l.read(self.tensor(*x))?;
-                let routes_v = l.read(self.tensor(*routes))?;
-                let y_v = l.read(self.tensor(*y))?;
-                let bank_v = l.read(self.tensor(*bank))?;
-                let o_y = self.tensor(*y);
-                let tuning = l.tuning();
-                let v = linear::moe::matmul_select(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
-                l.land(o_y, v)
-            }),
+            } => {
+                let streamed = self.streamed_bank(*bank);
+                if let Some(b) = streamed {
+                    self.cut_for(b, *routes)?;
+                }
+                let bank_t = self.tensor(*bank);
+                crate::lower::lower(self.ctx(), |l| {
+                    let x_v = l.read(self.tensor(*x))?;
+                    let routes_v = l.read(self.tensor(*routes))?;
+                    let y_v = l.read(self.tensor(*y))?;
+                    let bank_v = match streamed {
+                        Some(b) => l.streamed_bank(b, bank_t.width)?,
+                        None => l.read(bank_t)?,
+                    };
+                    let o_y = self.tensor(*y);
+                    let tuning = l.tuning();
+                    let v = linear::moe::matmul_select(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
+                    l.land(o_y, v)
+                })
+            }
             Linear::MoeSelect {
                 x,
                 bank,
