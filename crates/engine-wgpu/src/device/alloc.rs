@@ -56,6 +56,11 @@ impl Raw {
         if mappable && kind != Memory::Readback {
             usage |= wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE;
         }
+        // The pool's segments hold guest configs a stage binds as a uniform
+        // (`guest::session`), beside everything bound as storage.
+        if owner == engine_gpu::books::owners::POOL && kind == Memory::Device {
+            usage |= wgpu::BufferUsages::UNIFORM;
+        }
         let buffer = core.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size,

@@ -21,7 +21,7 @@ use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
 
 use crate::error::Fault;
-use crate::program::{Programs, Refusal};
+use crate::program::{Place, Programs, Refusal};
 use crate::serve::{Boot, Clips, Landed, Lane, Media, Seated, Serve, Shell, StepView};
 use crate::settle::Done;
 
@@ -90,7 +90,7 @@ pub struct Envelope<B: Serve> {
     pub masks: Vec<Option<engine::fire::Masking>>,
 
     /// A device cell holding the lane's one token ([`Seated::feed`]).
-    pub feeds: Vec<Option<B::Buffer>>,
+    pub feeds: Vec<Option<crate::serve::DeviceCell<B>>>,
 }
 
 /// The runtime's engine over a backend's device: one shell, its program
@@ -175,6 +175,15 @@ impl<B: Host> Gpu<B> {
 
     pub fn loaded_mut(&mut self) -> EngineResult<&mut Shell<B>> {
         self.shell.as_mut().ok_or_else(unloaded::<B>)
+    }
+}
+
+/// Where `shell`'s guests place their tables and cells.
+fn place<B: Host>(shell: &Shell<B>) -> Place<'_, B> {
+    Place {
+        device: shell.device(),
+        pools: shell.pools(),
+        align: B::table_align(shell.device()),
     }
 }
 
@@ -556,7 +565,40 @@ where
     }
 
     fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
-        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+        let Gpu {
+            shell, programs, ..
+        } = self;
+        let shell = shell.as_mut().ok_or_else(unloaded::<B>)?;
+        programs.quiesce().map_err(refusal)?;
+        shell.evacuate(evacuation).map_err(fault)?;
+        // Guest tables and cells bind their slots' chunks by place.
+        programs.rebind(shell.pools()).map_err(refusal)
+    }
+
+    fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
+        let Some(shell) = self.shell.as_ref() else {
+            return Ok(engine::program::ProgramFacts::default());
+        };
+        self.programs.facts(program, &place(shell)).map_err(refusal)
+    }
+
+    fn ring_facts(
+        &self,
+        registration: &ChannelRegistration,
+    ) -> EngineResult<Option<engine::program::RingFacts>> {
+        let Some(shell) = self.shell.as_ref() else {
+            return Ok(None);
+        };
+        self.programs
+            .ring_facts(registration, &place(shell))
+            .map_err(refusal)
+    }
+
+    fn rebind_slots(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
+        let shell = self.shell.as_ref().ok_or_else(unloaded::<B>)?;
+        self.programs
+            .rebind_slots(shell.pools(), &rebind)
+            .map_err(refusal)
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
@@ -648,8 +690,9 @@ where
         &mut self,
         registration: &ChannelRegistration,
     ) -> EngineResult<RegisteredChannel> {
+        let place = self.shell.as_ref().map(place);
         self.programs
-            .register_channel(registration)
+            .register_channel(registration, place.as_ref())
             .map_err(refusal)
     }
 
@@ -665,8 +708,11 @@ where
             )));
         }
 
-        let device = self.shell.as_ref().map(Shell::device);
-        let bound = self.programs.bind(binding, device).map_err(refusal)?;
+        let place = self.shell.as_ref().map(place);
+        let bound = self
+            .programs
+            .bind(binding, place.as_ref())
+            .map_err(refusal)?;
 
         let seeds: Vec<(u32, Vec<u8>)> = binding
             .seeds

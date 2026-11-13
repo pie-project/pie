@@ -4,10 +4,23 @@
 //! way.
 
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
-use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
+use engine::program::{
+    BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, ProgramRegistration,
+    Rebind, RingFacts,
+};
 use eta_compiler::codegen::launch::LaunchPackage;
 
 use crate::serve::{InputCell, Serve};
+use crate::store::Pools;
+
+/// Where a plane places what an instance or channel holds on the device:
+/// the device, the state pool whose `Instance` and `Channel` slots the
+/// runtime took for it, and the alignment of a table in its slot.
+pub struct Place<'a, B: Serve> {
+    pub device: &'a B::Context,
+    pub pools: &'a Pools<B>,
+    pub align: u64,
+}
 
 #[derive(Debug)]
 pub enum Refusal {
@@ -37,19 +50,51 @@ pub trait Programs<B: Serve>: Default {
 
     fn package(&self, program: ProgramId) -> Option<&LaunchPackage>;
 
+    /// What an instance of `program` holds in the pool's `Instance` and
+    /// `Channel` slots (`Engine::program_facts`).
+    fn facts(&self, program: ProgramId, place: &Place<'_, B>) -> Result<ProgramFacts, Refusal>;
+
+    /// The `Channel` slots a registered channel takes, if any
+    /// (`Engine::ring_facts`).
+    fn ring_facts(
+        &self,
+        registration: &ChannelRegistration,
+        place: &Place<'_, B>,
+    ) -> Result<Option<RingFacts>, Refusal>;
+
+    /// Registers a channel; what it keeps on the device in the slots its
+    /// registration names, where a model is loaded.
     fn register_channel(
         &mut self,
         registration: &ChannelRegistration,
+        place: Option<&Place<'_, B>>,
     ) -> Result<RegisteredChannel, Refusal>;
 
     fn close_channel(&mut self, id: ChannelId) -> Result<(), Refusal>;
 
-    /// Binds an instance; its device half on `device`, where one is loaded.
+    /// Binds an instance; its device half in the slots its binding names,
+    /// where a model is loaded.
     fn bind(
         &mut self,
         binding: &InstanceBinding,
-        device: Option<&B::Context>,
+        place: Option<&Place<'_, B>>,
     ) -> Result<BoundInstance, Refusal>;
+
+    /// Before an evacuation moves chunks: every guest pass the plane has
+    /// yet to put on the queue is on it, so none binds a chunk's old place
+    /// after the move.
+    fn quiesce(&mut self) -> Result<(), Refusal> {
+        Ok(())
+    }
+
+    /// Points every table and cell the plane holds in the pool at the
+    /// chunk its slot ref sits in now, after an evacuation moved chunks.
+    fn rebind(&mut self, pools: &Pools<B>) -> Result<(), Refusal>;
+
+    /// Moves an instance's or a channel's tables and cells to the slot
+    /// refs `rebind` names, whose bytes the runtime copied there
+    /// (`Engine::rebind_slots`).
+    fn rebind_slots(&mut self, pools: &Pools<B>, rebind: &Rebind) -> Result<(), Refusal>;
 
     fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal>;
 

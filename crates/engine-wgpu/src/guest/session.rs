@@ -1,16 +1,28 @@
 use std::sync::Arc;
 
 use eta_compiler::codegen::launch::LaunchStagePlan;
-use eta_exec::{Extents, OpParams, ValueDesc, describe, layout};
+use eta_exec::{Extents, ValueDesc};
 
 use crate::device::Context;
 use crate::device::alloc::{Buffer, Memory};
 use crate::device::ctx::{Core, Frame};
 use engine_gpu::error::{Fault, Result};
+use engine_gpu::store::Pools;
+use engine_gpu::store::layout::INSTANCE;
 
-use engine_gpu::guest::session::{
-    BINDINGS, CFG_BINDING, Cfg, DESC_WORDS, alias_reshapes, desc_words, groups_for, words_le,
-};
+use engine_gpu::guest::held::{self, consecutive};
+use engine_gpu::guest::session::{BINDINGS, CFG_BINDING, StageTables, groups_for, stage_tables};
+
+/// A span of a pool slot (or run) a guest holds.
+pub type Held = held::Held<crate::device::Api>;
+
+/// Where an instance's tables go: the `Instance` slots the runtime took
+/// for them, and a table's alignment there.
+pub struct Tables<'a> {
+    pub pools: &'a Pools<crate::device::Api>,
+    pub slots: &'a [u32],
+    pub align: u64,
+}
 
 const READ_ONLY: [bool; BINDINGS as usize] = [false, true, true, true, false, false];
 
@@ -82,11 +94,9 @@ struct Stage {
 
     descriptors: Vec<ValueDesc>,
 
-    _descs: Buffer,
-    _params: Buffer,
-    _offs: Buffer,
-
-    _cfg: crate::device::ctx::Held,
+    /// The stage's bind-time tables in the instance's `Instance` slots,
+    /// in `TABLE_BINDINGS` order.
+    tables: [Held; 4],
 
     heap: Buffer,
 
@@ -98,8 +108,13 @@ struct Stage {
 }
 
 pub struct Session {
+    core: Arc<Core>,
     status: Buffer,
     stages: Vec<Stage>,
+    /// The `Instance` slots the stages' tables lie in, in binding order,
+    /// and whether they are one run.
+    slots: Vec<u32>,
+    run: bool,
 
     code: Arc<Code>,
 }
@@ -122,6 +137,7 @@ impl Session {
         plans: &[LaunchStagePlan],
         code: Arc<Code>,
         extents: &Extents,
+        tables: &Tables<'_>,
     ) -> Result<Session> {
         if code.stages() != plans.len() {
             return Err(Fault::Program {
@@ -143,24 +159,96 @@ impl Session {
         status.write(0, &[0u8; eta_exec::STATUS_BYTES])?;
 
         let core = device.core().clone();
+        let resolved = plans
+            .iter()
+            .map(|plan| {
+                stage_tables(plan, extents).map_err(|why| Fault::Program {
+                    at: "guest::session",
+                    why,
+                })
+            })
+            .collect::<Result<Vec<StageTables>>>()?;
+        // Every stage's tables, in the instance's slots, written at once.
+        let bytes: Vec<Vec<u8>> = resolved
+            .iter()
+            .flat_map(|stage| stage.tables.iter().cloned())
+            .collect();
+        let (placed, run) =
+            held::place_tables(tables.pools, INSTANCE, tables.slots, &bytes, tables.align)?;
+        let mut placed = placed.into_iter();
         let mut stages = Vec::with_capacity(plans.len());
-        for (at, plan) in plans.iter().enumerate() {
+        for (at, resolved) in resolved.into_iter().enumerate() {
+            let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
             stages.push(build_stage(
                 device,
                 &core,
                 &code.binds,
                 &status,
-                plan,
-                extents,
+                resolved,
+                tables,
                 code.strides[at],
             )?);
         }
 
         Ok(Session {
+            core,
             status,
             stages,
+            slots: tables.slots.to_vec(),
+            run,
             code,
         })
+    }
+
+    /// Points the stages' bind groups at the chunks their tables' slots
+    /// sit in now, after an evacuation.
+    pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<()> {
+        for stage in &mut self.stages {
+            for table in &mut stage.tables {
+                table.rebind(pools)?;
+            }
+        }
+        self.regroup()
+    }
+
+    /// Moves the tables to `slots` (`Instance` slot refs, as many as they
+    /// lie in, in order), whose bytes the runtime copied there.
+    pub fn retarget(&mut self, pools: &Pools<crate::device::Api>, slots: &[u32]) -> Result<()> {
+        if slots.len() != self.slots.len() || (self.run && !consecutive(slots)) {
+            return Err(Fault::Program {
+                at: "guest::session",
+                why: format!(
+                    "tables in {} instance slot(s){} rebound to {slots:?}",
+                    self.slots.len(),
+                    if self.run { " of one run" } else { "" }
+                ),
+            });
+        }
+        for stage in &mut self.stages {
+            for table in &mut stage.tables {
+                let at = self
+                    .slots
+                    .iter()
+                    .position(|&slot| slot == table.slot())
+                    .expect("a table lies in one of the session's slots");
+                table.retarget(pools, slots[at])?;
+            }
+        }
+        self.slots = slots.to_vec();
+        self.regroup()
+    }
+
+    fn regroup(&mut self) -> Result<()> {
+        for stage in &mut self.stages {
+            stage.group = group(
+                &self.core,
+                &self.code.binds,
+                &self.status,
+                &stage.tables,
+                &stage.heap,
+            )?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -412,97 +500,25 @@ fn build_pipelines(
     built
 }
 
-fn build_stage(
-    device: &Context,
+fn span(held: &Held) -> wgpu::BindingResource<'_> {
+    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer: &held.buffer().slab().buffer,
+        offset: held.offset(),
+        size: std::num::NonZeroU64::new(held.bytes()),
+    })
+}
+
+/// A stage's bind group: the status word, its tables where their slots lie
+/// now (each at an offset the table layout aligned to the device's binding
+/// alignment), its heap.
+fn group(
     core: &Arc<Core>,
     binds: &wgpu::BindGroupLayout,
     status: &Buffer,
-    plan: &LaunchStagePlan,
-    extents: &Extents,
-    strides_the_grid: bool,
-) -> Result<Stage> {
-    let descriptors = plan
-        .value_types
-        .iter()
-        .map(|value| {
-            describe(value, extents).map_err(|why| Fault::Program {
-                at: "guest::session",
-                why: format!("a guest value's shape does not resolve against this fire: {why:?}"),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut scratch = layout(&descriptors).map_err(|why| Fault::Program {
-        at: "guest::session",
-        why: format!("a guest pass's scratch does not fit: {why:?}"),
-    })?;
-    alias_reshapes(plan, &mut scratch.values);
-
-    let desc_bytes: Vec<u8> = descriptors
-        .iter()
-        .flat_map(|d| words_le(&desc_words(d)))
-        .collect();
-    let offset_words: Vec<u32> = scratch
-        .values
-        .iter()
-        .map(|&at| u32::try_from(at).unwrap_or(u32::MAX))
-        .collect();
-
-    let mut records = Vec::with_capacity(plan.ops.len());
-    let mut result_base = 0u32;
-    for op in &plan.ops {
-        records.push(OpParams::of(op, result_base, plan.output_slots));
-        result_base += u32::from(op.result_count);
-    }
-    let config = Cfg {
-        value_count: u32::try_from(plan.value_types.len()).unwrap_or(u32::MAX),
-        temporary: u32::try_from(scratch.temporary / 4).unwrap_or(u32::MAX),
-        op_count: u32::try_from(plan.ops.len()).unwrap_or(u32::MAX),
-        lane: 0,
-    };
-
-    let mut descs = Buffer::zeroed(
-        device,
-        desc_bytes.len().max(DESC_WORDS * 4) as u64,
-        engine_gpu::books::owners::GUEST,
-    )?;
-    descs.write(0, &desc_bytes)?;
-    let mut offs = Buffer::zeroed(
-        device,
-        (offset_words.len().max(1) * 4) as u64,
-        engine_gpu::books::owners::GUEST,
-    )?;
-    offs.write(0, &words_le(&offset_words))?;
-    let mut params = Buffer::zeroed(
-        device,
-        (records.len().max(1) * size_of::<OpParams>()) as u64,
-        engine_gpu::books::owners::GUEST,
-    )?;
-    if !records.is_empty() {
-        let record_bytes: Vec<u8> = records.iter().flat_map(OpParams::to_le_bytes).collect();
-        params.write(0, &record_bytes)?;
-    }
-
-    let cfg = core.held(
-        &wgpu::BufferDescriptor {
-            label: Some("pie guest cfg"),
-            size: size_of::<Cfg>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        },
-        engine_gpu::books::owners::GUEST,
-    );
-    core.take_error("create_buffer")?;
-    core.queue.write_buffer(&cfg, 0, &config.to_le_bytes());
-
-    let bytes = scratch.total.max(256);
-    let heap = Buffer::zeroed(device, bytes, engine_gpu::books::owners::GUEST_STATE)?;
-    let outbox = Buffer::with(
-        device,
-        OUTBOX_FLOOR,
-        OUTBOX_KIND,
-        engine_gpu::books::owners::GUEST,
-    )?;
-
+    tables: &[Held; 4],
+    heap: &Buffer,
+) -> Result<wgpu::BindGroup> {
+    let [descs, params, offs, cfg] = tables;
     let group = core.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("pie guest"),
         layout: binds,
@@ -513,27 +529,53 @@ fn build_stage(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: whole(&descs),
+                resource: span(descs),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: whole(&params),
+                resource: span(params),
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: whole(&offs),
+                resource: span(offs),
             },
             wgpu::BindGroupEntry {
                 binding: 4,
-                resource: whole(&heap),
+                resource: whole(heap),
             },
             wgpu::BindGroupEntry {
                 binding: CFG_BINDING,
-                resource: cfg.as_entire_binding(),
+                resource: span(cfg),
             },
         ],
     });
     core.take_error("create_bind_group")?;
+    Ok(group)
+}
+
+fn build_stage(
+    device: &Context,
+    core: &Arc<Core>,
+    binds: &wgpu::BindGroupLayout,
+    status: &Buffer,
+    resolved: StageTables,
+    tables: [Held; 4],
+    strides_the_grid: bool,
+) -> Result<Stage> {
+    let StageTables {
+        descriptors,
+        offsets,
+        scratch,
+        ..
+    } = resolved;
+    let heap = Buffer::zeroed(device, scratch, engine_gpu::books::owners::GUEST_STATE)?;
+    let outbox = Buffer::with(
+        device,
+        OUTBOX_FLOOR,
+        OUTBOX_KIND,
+        engine_gpu::books::owners::GUEST,
+    )?;
+    let group = group(core, binds, status, &tables, &heap)?;
 
     Ok(Stage {
         group,
@@ -542,12 +584,9 @@ fn build_stage(
         } else {
             1
         },
-        offsets: scratch.values,
+        offsets,
         descriptors,
-        _descs: descs,
-        _params: params,
-        _offs: offs,
-        _cfg: cfg,
+        tables,
         heap,
         outbox,
         outbox_layout: Vec::new(),

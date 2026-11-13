@@ -65,8 +65,8 @@ Rings are written by the host per message (`write_cell`), and the bind-time tabl
 | Metal | Private placement-sparse buffer over Shared heaps | Through the heap's Shared alias (`Elastic::host_span` / `write_from`): a plain store, no copy. Same path kv staging uses. |
 | CUDA | Device memory in the elastic range | `cuMemcpyHtoDAsync` on the instance's stream from pinned staging, as rings are staged today (`registry.stage(stream, ..)`). Per-message writes stay small async copies. |
 | ROCm | One flat `hipMalloc` range | As CUDA (`hipMemcpyAsync`). |
-| Vulkan | Pool segment buffers | Copy from the staging slab with `vkCmdCopyBuffer` in the next submission (unverified: whether today's guest buffers are host-visible, in which case this adds a copy per message). |
-| wgpu | Pool segment buffers | `queue.write_buffer` into the slot range (unverified, as Vulkan). |
+| Vulkan | Pool segment buffers (device-local, not host-visible) | Done (sc/gpu-roles). A ring lies on the host (the interpreter's `ChannelState`), so a message writes no device memory. Only the bind-time tables are host-written: one staged copy (synchronous `vkCmdCopyBuffer` + fence) per `Instance` slot, about 27-36 us on an RTX PRO 4500 against 3 such copies per stage before. The device's channel state is the kept cell (capacity-1 cells only the device reads), now in `Channel` slots, written by the device only. |
+| wgpu | Pool segment buffers | Done (sc/gpu-roles): tables by `queue.write_buffer`, one per `Instance` slot, about 5 us. Rings lie on the host and wgpu keeps no cell on the device, so it states no `Channel` shape. |
 | XLA | Pool tensor donated to the executable | `Store::write_slots` exists for slot bytes. But rings today are carried cells mirrored on the host and passed through executable outputs. Moving them into the pool changes the executable's inputs. **Proposal: XLA states no `Instance` / `Channel` shapes at first and keeps today's path, priced in the ledger.** Revisit with the XLA session. |
 
 ## 6. Order

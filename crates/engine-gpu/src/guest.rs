@@ -10,6 +10,7 @@ use std::sync::Arc;
 use eta_compiler::codegen::launch::{LaunchPackage, LaunchStagePlan};
 use eta_compiler::codegen::wgsl;
 
+pub mod held;
 pub mod run;
 pub mod session;
 pub mod widen;
