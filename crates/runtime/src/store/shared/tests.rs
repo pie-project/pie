@@ -762,3 +762,66 @@ fn a_raise_by_demand_says_what_it_lacks_and_moves_the_rest() {
     assert_eq!(pool.rung(), 2048);
     assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
 }
+
+/// Twelve rungs, every power of two from 1, the small ones sharing their
+/// activation's chunk count: an idle pool lowered to the smallest stays
+/// there, the walk never lowering again within the class it is in.
+#[test]
+fn rungs_sharing_their_chunks_are_one_class_the_walk_never_moves_within() {
+    let facts = ChunkFacts {
+        act_chunks: vec![
+            (1, 1),
+            (2, 1),
+            (4, 1),
+            (8, 1),
+            (16, 1),
+            (32, 2),
+            (64, 2),
+            (128, 2),
+            (256, 4),
+            (512, 4),
+            (1024, 8),
+            (2048, 12),
+        ],
+        ..facts()
+    };
+    facts.validate().unwrap();
+    let mut pool = SharedPool::new(&facts, 256).unwrap();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    let mut walk = RungWalk::default();
+    assert_eq!(pool.rung(), 2048);
+    assert_eq!(
+        walk.step(&pool, 1, u32::MAX, u32::MAX, 5, 5).unwrap(),
+        RungStep::Cap(1)
+    );
+    assert_eq!(walk.step(&pool, 1, 1, 1, 7, 5).unwrap(), RungStep::Wait);
+    assert_eq!(walk.step(&pool, 1, 1, 1, 9, 7).unwrap(), RungStep::Lower(1));
+    pool.lower_rung(1).unwrap();
+    assert_eq!(pool.rung(), 16, "the pool reports its class's widest rung");
+    // Idle at the smallest rung: no repeated lower, ever.
+    for epoch in 10..40 {
+        assert_eq!(
+            walk.step(&pool, 1, 1, 1, epoch, epoch).unwrap(),
+            RungStep::Wait,
+            "a lower within the class the pool is in"
+        );
+    }
+    // A goal inside the class only caps fires; none raises the rung.
+    assert_eq!(
+        walk.step(&pool, 16, 1, 1, 40, 40).unwrap(),
+        RungStep::Cap(16)
+    );
+    assert_eq!(
+        walk.step(&pool, 8, 16, 16, 41, 41).unwrap(),
+        RungStep::Cap(8)
+    );
+    // The next class raises.
+    assert!(matches!(
+        walk.step(&pool, 32, 8, 8, 42, 42).unwrap(),
+        RungStep::Raise { rung: 32, .. }
+    ));
+}
