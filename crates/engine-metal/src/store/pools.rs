@@ -961,6 +961,11 @@ impl Pools {
         ))
     }
 
+    /// The slots of shape `id` one chunk holds.
+    pub fn slots_per_chunk(&self, id: ShapeId) -> Result<u32> {
+        Ok(self.shape(id)?.per_chunk)
+    }
+
     /// The bytes of one slot of shape `id`.
     pub fn slot_bytes(&self, id: ShapeId) -> Result<u64> {
         Ok(self.shape(id)?.slot_bytes)

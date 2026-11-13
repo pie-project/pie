@@ -11,7 +11,7 @@ use crate::store::Pools;
 use crate::store::layout::INSTANCE;
 
 use super::compile::Compiled;
-use super::held::Tables;
+use super::held::{self, TableLayout, Tables};
 use super::launch::{ChannelShape, Cursor, Prepared, Rings};
 use super::ports;
 use super::shared::SharedRing;
@@ -85,6 +85,8 @@ pub struct Pooled<'a> {
 pub struct Session {
     /// The `Instance` slot refs the tables lie in, in order.
     instance_slots: Vec<u32>,
+    /// Whether they are one run (a table larger than a slot).
+    tables_run: bool,
     rings: Rings,
     shapes: Vec<ChannelShape>,
     cursors: Vec<Cursor>,
@@ -123,8 +125,7 @@ impl Session {
             .collect()
     }
 
-    /// The instance's bind-time tables and rings go in `pooled`'s slots
-    /// where it names them, else in buffers of their own.
+    /// The instance's bind-time tables and rings go in `pooled`'s slots.
     pub fn bind(
         device: &Context,
         compiled: &Compiled,
@@ -132,7 +133,7 @@ impl Session {
         seeds: &[(u32, Vec<u8>)],
         extents: Extents,
         adopted: &[Option<std::sync::Arc<SharedRing>>],
-        pooled: Option<Pooled<'_>>,
+        pooled: Pooled<'_>,
     ) -> Result<Session> {
         stages_and_plans_agree(compiled)?;
         if plan.package.channels.is_empty() {
@@ -145,21 +146,10 @@ impl Session {
 
         let shapes: Vec<ChannelShape> =
             plan.package.channels.iter().map(ChannelShape::of).collect();
-        let rings = Rings::allocate(
-            device,
-            &shapes,
-            adopted,
-            pooled.map(|pooled| (pooled.pools, pooled.rings)),
-        )?;
-        let mut tables = match pooled {
-            Some(pooled) if !pooled.instance.is_empty() => Tables::pooled(
-                pooled.pools,
-                INSTANCE,
-                pooled.instance,
-                &Session::table_sizes(compiled),
-            )?,
-            _ => Tables::Own(device),
-        };
+        let rings = Rings::allocate(device, &shapes, adopted, pooled.pools, pooled.rings)?;
+        let sizes = Session::table_sizes(compiled);
+        let tables_run = TableLayout::of(&sizes, pooled.pools.slot_bytes(INSTANCE)?).run;
+        let mut tables = Tables::pooled(pooled.pools, INSTANCE, pooled.instance, &sizes)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
 
         let mut prepared = Vec::with_capacity(compiled.plans.len());
@@ -179,7 +169,8 @@ impl Session {
         tables.finish()?;
 
         let mut session = Session {
-            instance_slots: pooled.map_or_else(Vec::new, |pooled| pooled.instance.to_vec()),
+            instance_slots: pooled.instance.to_vec(),
+            tables_run,
             rings,
             shapes,
             cursors,
@@ -227,7 +218,9 @@ impl Session {
         instance: &[u32],
         rings: &[engine::program::RingSlots],
     ) -> Result<()> {
-        if instance.len() != self.instance_slots.len() {
+        if instance.len() != self.instance_slots.len()
+            || (self.tables_run && !held::consecutive(instance))
+        {
             return Err(Fault::program(
                 "program::session",
                 format!(

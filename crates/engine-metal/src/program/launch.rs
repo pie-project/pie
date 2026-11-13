@@ -92,23 +92,38 @@ impl ChannelShape {
         u64::from(self.capacity) + 1
     }
 
-    /// The `Channel` slots this ring takes, or `None` where its cell is
-    /// larger than a slot and the engine keeps it.
+    /// The `Channel` slots this ring takes with its cells packed a slot, or
+    /// `None` where its cell is larger than a slot (it then takes a run).
     #[must_use]
     pub fn ring_slots(&self, slot_bytes: u64) -> Option<u32> {
         held::ring_slots(self.cell_count(), self.cell_stride() as u64, slot_bytes)
     }
 
-    /// Zeroed cells for this ring: in `slots` (`Channel` slot refs of the
-    /// pool), or in a buffer of their own.
-    pub fn cells(&self, device: &Context, slots: Option<(&Pools, &[u32])>) -> Result<Cells> {
+    /// Zeroed cells for this ring in `slots`, the `Channel` slot refs the
+    /// runtime took for it. A ring larger than a chunk is the one the
+    /// engine keeps (the contract states no slots for it): a buffer of its
+    /// own.
+    pub fn cells(&self, device: &Context, pools: &Pools, slots: &[u32]) -> Result<Cells> {
         let stride = self.cell_stride() as u64;
-        match slots {
-            Some((pools, slots)) if !slots.is_empty() => {
-                Cells::pooled(pools, CHANNEL, slots, self.cell_count(), stride)
-            }
-            _ => Cells::own(device, self.cell_count(), stride),
+        let slot = pools.slot_bytes(CHANNEL)?;
+        let per_chunk = pools.slots_per_chunk(CHANNEL)?;
+        let fits = self.ring_slots(slot).is_some()
+            || held::ring_run(self.cell_count(), stride, slot, per_chunk).is_some();
+        if fits {
+            return Cells::pooled(pools, CHANNEL, slots, self.cell_count(), stride);
         }
+        if !slots.is_empty() {
+            return Err(Fault::program(
+                "program::launch",
+                format!(
+                    "a ring of {} bytes is larger than a chunk, the engine's to keep, and the \
+                     binding names {} channel slot(s) for it",
+                    self.cell_count() * stride,
+                    slots.len()
+                ),
+            ));
+        }
+        Cells::own(device, self.cell_count(), stride)
     }
 }
 
@@ -129,14 +144,15 @@ impl Rings {
         self.own.iter().flatten().map(Cells::own_bytes).sum()
     }
 
-    /// `pooled`: the pool and the `Channel` slots the runtime took for each
-    /// ring this instance holds itself, by channel; a ring it names no
-    /// slots for is the engine's.
+    /// `rings`: the `Channel` slots the runtime took for each ring this
+    /// instance holds itself, by channel (none for a ring larger than a
+    /// chunk, which the engine keeps).
     pub fn allocate(
         device: &Context,
         shapes: &[ChannelShape],
         adopted: &[Option<Arc<SharedRing>>],
-        pooled: Option<(&Pools, &[engine::program::RingSlots])>,
+        pools: &Pools,
+        rings: &[engine::program::RingSlots],
     ) -> Result<Rings> {
         let mut own = Vec::with_capacity(shapes.len());
         let mut shared = Vec::with_capacity(shapes.len());
@@ -163,13 +179,11 @@ impl Rings {
                 shared.push(Some(Arc::clone(ring)));
                 continue;
             }
-            let slots = pooled.and_then(|(pools, rings)| {
-                rings
-                    .iter()
-                    .find(|ring| ring.channel as usize == channel)
-                    .map(|ring| (pools, ring.slots.as_slice()))
-            });
-            own.push(Some(shape.cells(device, slots)?));
+            let slots = rings
+                .iter()
+                .find(|ring| ring.channel as usize == channel)
+                .map_or(&[][..], |ring| ring.slots.as_slice());
+            own.push(Some(shape.cells(device, pools, slots)?));
             shared.push(None);
         }
         Ok(Rings {
