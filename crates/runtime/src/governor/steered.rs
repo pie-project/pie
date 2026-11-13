@@ -116,13 +116,19 @@ impl PoolTarget for EnginePool {
     /// bodies now ([`::engine::live::Live::held`]), never under the floor.
     /// The range stated at load already leaves out what the driver holds
     /// (`outside`, a ledger term the policy reads, not subtracted here).
+    ///
+    /// While the engine holds any, the limit is whole segments: the segment
+    /// it only partly leaves is one whose top chunks the engine may still
+    /// use, so no sequence may be handed them.
     fn hard_limit(&self) -> u64 {
         self.target().map_or(0, |target| {
             let held = crate::engine::live(self.engine).held();
-            target
-                .hard_limit()
-                .saturating_sub(held)
-                .max(target.floor())
+            if held == 0 {
+                return target.hard_limit();
+            }
+            let segment = target.segment_bytes().max(1);
+            let left = target.hard_limit().saturating_sub(held);
+            (left - left % segment).max(target.floor())
         })
     }
 

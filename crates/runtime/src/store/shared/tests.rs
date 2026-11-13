@@ -825,3 +825,59 @@ fn rungs_sharing_their_chunks_are_one_class_the_walk_never_moves_within() {
         RungStep::Raise { rung: 32, .. }
     ));
 }
+
+/// What an arming step is lent comes from the allocators sequences take
+/// from, named as a lane names them: a record by its pieces' slot refs, a
+/// kv page by its list slot ref; none lies in the null chunk, which the
+/// engine refuses a ref into.
+#[test]
+fn a_lent_record_and_lent_pages_name_no_slot_in_the_null_chunk() {
+    let mut facts = facts();
+    facts.shapes.retain(|shape| shape.id != RING);
+    facts.validate().unwrap();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let mut rs = crate::store::rs::RsStore::shared(&shared, None);
+    let grant = rs
+        .reserve(crate::store::rs::RsUnits::of(1, 0))
+        .expect("a record");
+    assert_eq!(grant.slots, [crate::store::rs::RsSlotId(0)], "store id 0");
+    let refs = rs.device_refs(&grant.slots);
+    let pool = shared.lock().unwrap();
+    let reserved = pool.pool().reserved_chunks();
+    assert!(reserved >= 1, "chunk 0 is the null chunk");
+    let mut at = 0;
+    for fixed in pool.fixed() {
+        let spc = pool.pool().shape(fixed.pool).unwrap().slots_per_chunk;
+        for _ in 0..fixed.pieces {
+            let chunk = refs[at] / spc;
+            assert!(
+                chunk >= reserved,
+                "piece ref {} lies in chunk {chunk}",
+                refs[at]
+            );
+            at += 1;
+        }
+    }
+    assert_eq!(at, refs.len(), "one record, every piece");
+    let list = pool.list().expect("a kv list");
+    drop(pool);
+    let mut pages =
+        crate::store::chunks::ShapePool::<crate::store::kv::page_table::PhysicalKvPageId>::shared(
+            &shared, list,
+        );
+    let spc = shared
+        .lock()
+        .unwrap()
+        .pool()
+        .shape(list.pool)
+        .unwrap()
+        .slots_per_chunk;
+    for page in pages.try_alloc_n(64).expect("pages") {
+        assert!(
+            page.0 / spc >= reserved,
+            "page {} lies in the null chunk",
+            page.0
+        );
+    }
+    rs.release_reservation(grant);
+}

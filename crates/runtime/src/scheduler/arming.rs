@@ -35,7 +35,8 @@ static ENGINES: LazyLock<Mutex<HashMap<usize, Engine>>> =
 pub fn demand(room: ArmingRoom) -> Demand {
     Demand {
         kv_pages: room.pages,
-        rs: crate::store::rs::RsUnits::of(room.records, 0),
+        // `records` counts one record's pieces: one record lends them all.
+        rs: crate::store::rs::RsUnits::of(u32::from(room.records > 0), 0),
     }
 }
 
@@ -91,13 +92,31 @@ pub(crate) struct Lent {
 }
 
 impl Lent {
-    fn of(grant: AllocationGrant) -> Self {
+    /// `grant`'s slots as the engine names them: kv pages are list slot
+    /// refs as a lane's are; a record is named by its pieces' refs, through
+    /// the store that handed it out (`rs`), never by its store id.
+    fn of(grant: AllocationGrant, rs: Option<&crate::store::rs::RsStore>) -> Self {
+        let records = match rs {
+            Some(rs) => rs.device_refs(grant.rs_slots()),
+            None => grant.rs_slots().iter().map(|slot| slot.0).collect(),
+        };
         Self {
             lease: ArmingLease {
                 pages: grant.kv_pages().iter().map(|page| page.0).collect(),
-                records: grant.rs_slots().iter().map(|slot| slot.0).collect(),
+                records,
             },
             _held: Some(grant),
+        }
+    }
+
+    /// [`Self::of`] through engine `engine`'s registered stores.
+    fn on_engine(grant: AllocationGrant, engine: usize) -> Self {
+        match crate::store::registry::try_get(0, engine) {
+            Some(stores) => {
+                let rs = stores.rs.lock().unwrap();
+                Self::of(grant, Some(&rs))
+            }
+            None => Self::of(grant, None),
         }
     }
 
@@ -126,10 +145,12 @@ impl Lender for PlannerLender {
             return Some(Lent::empty());
         }
         if let Some(grant) = take_funded(engine) {
-            return Some(Lent::of(grant));
+            return Some(Lent::on_engine(grant, engine));
         }
         let planner = crate::planner::planner_for(0, engine)?;
-        planner.try_free(demand(room)).map(Lent::of)
+        planner
+            .try_free(demand(room))
+            .map(|grant| Lent::on_engine(grant, engine))
     }
 }
 
@@ -141,7 +162,7 @@ pub(crate) struct OnPlanner(pub std::sync::Arc<crate::planner::ResidencyPlanner>
 impl Lender for OnPlanner {
     fn lend(&mut self, engine: usize, room: ArmingRoom, idle: bool) -> Option<Lent> {
         let _ = (engine, idle);
-        self.0.try_free(demand(room)).map(Lent::of)
+        self.0.try_free(demand(room)).map(|grant| Lent::of(grant, None))
     }
 }
 

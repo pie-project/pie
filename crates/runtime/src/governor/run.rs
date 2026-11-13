@@ -83,7 +83,7 @@ impl Steer {
         }
         if self.governor.tolerance().dedicated() {
             if moved && pool.growth() != Growth::Fixed {
-                let _ = pool.retarget(self.governor.limits().segments(self.governor.target()));
+                let _ = pool.retarget(within(self.governor.limits(), self.governor.target()));
             }
             if read.is_some() {
                 pool.ticked();
@@ -107,7 +107,7 @@ impl Steer {
             }
         };
         let limits = *self.governor.limits();
-        let segments = limits.segments(target);
+        let segments = within(&limits, target);
         match pool.retarget(segments) {
             Retarget::Reached => {
                 if self.short.take().is_some() {
@@ -144,6 +144,11 @@ impl Steer {
     }
 }
 
+/// The segments `target` comes to, the floor's at least.
+fn within(limits: &Limits, target: u64) -> u64 {
+    limits.segments(target.min(limits.hard_limit))
+}
+
 async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
     let mut steer = Steer::new(&pool, tolerance, GROWTH_STEP);
     let (shared, engine) = pool.with(|pool| (pool.inner().is_shared(), pool.inner().locus().1));
@@ -166,12 +171,11 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
     // path, and never gives them back.
     if shared && steer.governor().tolerance().dedicated() {
         use crate::governor::PoolTarget;
-        let segment = pool.segment_bytes().max(1);
-        let all = pool.hard_limit().div_ceil(segment);
-        let _ = pool.retarget(all);
+        let _ = pool.retarget(within(steer.governor().limits(), pool.hard_limit()));
     }
     // A dedicated pool's size stands, and a pool that is not shared never
     // moves: the loop only ticks, reading nothing and answering no waiter.
+    let mut warned = false;
     loop {
         interval.tick().await;
         steer.turn(&mut pool, Some(Pressure::Calm), &mut |_| {});
@@ -180,9 +184,11 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
         // past its limit is what lets a sequence or a lease onto chunks the
         // engine still holds.
         let (held, hard_limit) = (pool.held(), steer.governor().limits().hard_limit);
-        if shared && held > hard_limit {
+        let past = shared && held > hard_limit;
+        if past && !warned {
             tracing::warn!(held, hard_limit, "the pool is mapped past its hard limit");
         }
+        warned = past;
     }
 }
 

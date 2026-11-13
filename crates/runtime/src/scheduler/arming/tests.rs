@@ -424,8 +424,8 @@ fn a_raise_under_continuous_fires_is_armed_between_them() {
     );
     assert_eq!(seen.steps.load(Ordering::SeqCst), 0);
 
-    // A pass asks 2048 rows: its rung is armed between fires, and the pass
-    // fires at the rungs armed meanwhile, then at its own.
+    // A pass asks 2048 rows: its rung is armed in the next gap between
+    // fires, one step after another, and the pass then fires at it.
     let want = crate::store::shared::want_rows(ENGINE, 2048);
     let mut fires = 0;
     let mut widths = Vec::new();
@@ -443,8 +443,15 @@ fn a_raise_under_continuous_fires_is_armed_between_them() {
     }
     drop(want);
     assert!(
-        widths.windows(2).all(|w| w[0] <= w[1]) && widths.contains(&512),
-        "the pass widens rung by rung as they arm: {widths:?}"
+        fires <= 2,
+        "the raise's rung arms within one gap, not a step a gap: {widths:?}"
+    );
+    let steps = seen.steps.load(Ordering::SeqCst);
+    let rungs = (RUNGS.len() - 1) * COMPOSITIONS as usize;
+    assert!(
+        (rungs..=rungs + 1).contains(&steps),
+        "every step of the raise's rungs (and the last, answering false, once \
+         the lane idles): {steps}"
     );
     assert_eq!(
         seen.unarmed_fires.load(Ordering::SeqCst),
