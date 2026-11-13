@@ -250,7 +250,12 @@ impl SharedGrow {
     pub fn can_grow(&self) -> bool {
         let pool = self.shared.lock().unwrap();
         let top = pool.pool().top_segment();
-        pool.pool().prefix_segments() < top
+        let next = pool.pool().prefix_segments();
+        // The next segment must be one the engine binds: one at or past
+        // what it holds back never commits, and a waiter told the pool
+        // grows would wait on it for good.
+        next < top
+            && pool.pool().backs(next)
             && pool.mapped_segments() < self.target.load(Ordering::Acquire)
     }
 
@@ -430,6 +435,26 @@ impl PoolTarget for SharedGrow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pool says it can grow only where the next segment is one it
+    /// may commit: a waiter told it grows into what the engine holds back
+    /// would wait on a commit that never comes.
+    #[test]
+    fn the_pool_grows_only_into_a_segment_the_engine_binds() {
+        let mut pool = super::super::tests::pool();
+        let top = pool.pool().top_segment() * pool.pool().segments().segment_chunks();
+        let next = pool.pool().prefix_segments();
+        let next_end = pool.pool().segments().range(next).end;
+        // The ceiling one chunk short of the next segment's end.
+        let held = top - (next_end - 1);
+        pool.hold_back(u64::from(held) * pool.pool().chunk_bytes());
+        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+        let mut grow = SharedGrow::new(0, 58, shared.clone());
+        let _ = grow.retarget(u64::from(u32::MAX));
+        assert!(!grow.can_grow(), "the next segment straddles the ceiling");
+        shared.lock().unwrap().hold_back(0);
+        assert!(grow.can_grow(), "held back no more: it grows");
+    }
 
     /// A pool that stands past what is asked comes down only once it has
     /// for the governor's patience: a pause shorter than that moves no rung.
