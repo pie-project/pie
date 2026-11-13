@@ -1432,11 +1432,13 @@ impl Shell {
         let Some(mut st) = self.arm_begin(verify) else {
             return Ok(());
         };
-        // At load: everything, or the smallest rung's targets where the
-        // rest arm while the shell serves ([`Shell::arm_step`]).
-        let first = st.rung;
+        // At load: everything, or the rungs through the widest decode
+        // fire's (a row a lane) where the rest arm while the shell serves
+        // ([`Shell::arm_step`]): a load that is ready decodes at full
+        // width, and only a prefill wider than that waits on a step.
+        let first = self.rung_of(self.lane_ceiling());
         while let Some(&(bucket, _, _)) = st.targets.front() {
-            if self.arm_stepped && self.rung_of(bucket) != first {
+            if self.arm_stepped && self.rung_of(bucket) > first {
                 break;
             }
             self.arm_next(&mut st)?;

@@ -518,7 +518,9 @@ impl Engine for Cuda {
     }
 
     fn arm_step(&mut self, lent: &engine::live::ArmingLease, want: u32) -> EngineResult<bool> {
-        // The lattice arms smallest first whatever is asked, for now.
+        // The rungs arm smallest first, and a rung is stated armed only
+        // with every narrower one: that order already arms the rungs up to
+        // the one a pass asks for before any other, whatever it asks.
         let _ = want;
         match self.shell.as_mut() {
             Some(shell) => shell.arm_step(lent).map_err(fault),
