@@ -135,6 +135,15 @@ impl Slabs {
         }
     }
 
+    /// From here on this arena's takes answer only the slabs laid for it
+    /// ([`Slabs::place`]): one past them faults rather than allocate.
+    pub fn seal(&self) {
+        #[cfg(feature = "rocm")]
+        {
+            crate::jit::device::seal(self.id());
+        }
+    }
+
     /// The bytes takes asked past what was placed for them (a slab not
     /// placed, or placed smaller) since the process began: what still grows
     /// by allocation.

@@ -18,6 +18,9 @@ struct Arena {
     /// Slabs laid in memory the engine holds ([`place`]): never grown,
     /// never freed here.
     placed: HashMap<(&'static str, u32, usize), Slab>,
+    /// The engine laid every slab its fires take ([`seal`]): a take past
+    /// them is a fire it did not walk, and nothing grows.
+    sealed: bool,
 }
 
 use super::ctx::{PLACED_ALIGN, SlabKey};
@@ -38,6 +41,11 @@ pub(crate) fn place(base: *mut c_void, slabs: &[(SlabKey, usize)]) {
         );
         at += bytes;
     }
+}
+
+/// [`super::Slabs::seal`].
+pub(crate) fn seal(arena: u32) {
+    locked().entry(arena).or_default().sealed = true;
 }
 
 /// [`super::Slabs::unplaced_bytes`].
@@ -248,7 +256,7 @@ fn take_as(
     }
     // An arena whose slabs are laid grows none: every fire it serves was
     // walked, so a take past what is laid is a fire the walk did not see.
-    if !held.placed.is_empty() {
+    if held.sealed {
         UNPLACED.fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
         return Err(Fault::Unwarmed {
             name,
