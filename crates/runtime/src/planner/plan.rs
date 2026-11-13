@@ -135,7 +135,7 @@ impl ResidencyPlanner {
                     }
                     // Idle cache a policy keys above the floor moves down
                     // a tier before any is dropped; the rest is dropped.
-                    if self.demote_idle() {
+                    if self.demote_idle(count) {
                         return;
                     }
                     if self.reclaim_idle_once() {
@@ -174,7 +174,7 @@ impl ResidencyPlanner {
                     // state too: what is keyed above the floor moves down a
                     // tier before any is dropped.
                     let as_pages = self.port.rs_as_pages(need);
-                    if as_pages > 0 && self.demote_idle() {
+                    if as_pages > 0 && self.demote_idle(as_pages) {
                         return;
                     }
                     if self.reclaim_idle_once() || self.reclaim_head_sharing() {

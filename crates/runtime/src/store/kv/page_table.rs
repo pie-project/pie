@@ -975,7 +975,6 @@ impl KvPageTable {
         self.remove_anchor(node)
     }
 
-    #[cfg(test)]
     pub fn terminal(&self, ws: WorkingSetId) -> Result<Option<NodeId>, KvTableError> {
         Ok(self.entry(ws)?.terminal)
     }

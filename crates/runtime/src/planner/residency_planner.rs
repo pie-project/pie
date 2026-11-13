@@ -338,7 +338,11 @@ impl ResidencyPlanner {
     /// a waiter's want, never while pages stand free; what keeps back a
     /// share of the host for suspends ([`HOST_RESERVE_DIVISOR`]) is not
     /// spent on cache.
-    pub(super) fn demote_idle(self: &Arc<Self>) -> bool {
+    ///
+    /// `wanted`: the pages the head lacks. No more than that moves: a head
+    /// short of one prompt's pages waited behind the copy of every idle page
+    /// on the device.
+    pub(super) fn demote_idle(self: &Arc<Self>, wanted: u32) -> bool {
         if !self.port.suspend_capable() {
             return false;
         }
@@ -365,7 +369,7 @@ impl ResidencyPlanner {
             host_free = self.port.host_stats().0;
         }
         let (disk_free, _) = self.port.disk_stats();
-        let room = host_free.saturating_sub(reserve) + disk_free;
+        let room = (host_free.saturating_sub(reserve) + disk_free).min(wanted.max(1));
         let txn = (room > 0)
             .then(|| self.port.prepare_demote(room as usize))
             .flatten();
@@ -1118,7 +1122,7 @@ impl ResidencyPlanner {
             self.report_short();
             return;
         }
-        if self.reclaim_idle_once() || self.demote_idle() {
+        if self.reclaim_idle_once() || self.demote_idle(pages) {
             return;
         }
         let bytes = self.bytes_of(Reclaim {
