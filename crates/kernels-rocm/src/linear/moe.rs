@@ -2614,11 +2614,11 @@ fn matmul_select_mlxu4(
 
     let experts = codes.rows.clamp(1, ORDER_EXPERT_CAP);
     // The batch legs read four-bit codes, and a lane's factors of a stage
-    // (an even count of groups) as one read.
-    // A table that may name mapped host memory takes the per-route stream.
+    // (an even count of groups) as one read. A table that may name mapped
+    // host memory takes them too: a bank streamed or held lands the same
+    // bits.
     if bits == 4
         && x.dtype == Dtype::Bf16
-        && !table.streams()
         && codes.rows <= ORDER_EXPERT_CAP
         && x.width.is_multiple_of(2 * group)
         && let Some(mt) = batch_items(ctx, &fan, experts, 32, ctx.tuning().moe_batch_until)
@@ -2643,7 +2643,7 @@ fn matmul_select_mlxu4(
         );
     }
     let tuning = ctx.tuning();
-    if tuning.affine_grouped && fan.route_count >= tuning.affine_grouped_from && !table.streams() {
+    if tuning.affine_grouped && fan.route_count >= tuning.affine_grouped_from {
         let ordered = route_order(ctx, op, routes, &fan, experts, group_routes(&fan, experts))?;
         let wmma = x.dtype == Dtype::Bf16 && tuning.affine_wmma;
         let entry = if wmma {
