@@ -432,8 +432,8 @@ def csl_units():
 # (`"linear_kquant{}_{}_bf16"`), and names a unit in a `const` (`"linear/kquant.slang"`).
 SLANG_TREE = "crates/kernels-slang/kernels"
 SLANG_SRC = "crates/kernels-slang/src"
-SLANG_HOSTS = [SLANG_SRC, "crates/engine-vulkan/src/dispatch", "crates/engine-wgpu/src/dispatch"]
-SLANG_TESTS = ["crates/engine-vulkan/tests/engine_vulkan", "crates/engine-wgpu/tests/engine_wgpu"]
+SLANG_HOSTS = [SLANG_SRC, "crates/engine-gpu/src/dispatch"]
+SLANG_TESTS = ["crates/engine-gpu/suite"]
 SLANG_INSTANTIATE = re.compile(r"(?m)^\s*// pie:instantiate (\w+)")
 SLANG_UNIT = re.compile(r'"([a-z_0-9/]+\.slang)"')
 SLANG_ENTRY = re.compile(
