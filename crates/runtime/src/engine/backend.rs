@@ -15,6 +15,10 @@ pub struct SchedulerLimits {
     pub max_context: usize,
     /// The rows one prefill fire takes best (0: up to `max_forward_tokens`).
     pub prefill_rows: usize,
+    /// The most lanes a step of prompts only (no lane decoding) carries
+    /// (0: as many as `max_forward_requests`), what the engine holds a body
+    /// for ([`::engine::FireLimits::prefill_lanes`]).
+    pub prefill_lanes: usize,
     /// 0: up to `max_forward_tokens`.
     pub max_readouts: usize,
 }

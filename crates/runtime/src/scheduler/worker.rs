@@ -2704,6 +2704,7 @@ mod tests {
                 max_page_refs: 64,
                 max_context: 0,
                 prefill_rows: 0,
+                prefill_lanes: 0,
                 max_readouts: 0,
             },
             &stats,
