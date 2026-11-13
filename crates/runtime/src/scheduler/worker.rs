@@ -477,8 +477,15 @@ impl BatchWant {
         if rows == 0 || self.0.as_ref().is_some_and(|(held, _)| *held >= rows) {
             return;
         }
-        let want = crate::store::shared::want_rows(engine, u32::try_from(rows).unwrap_or(u32::MAX));
+        let rows32 = u32::try_from(rows).unwrap_or(u32::MAX);
+        let want = crate::store::shared::want_rows(engine, rows32);
         self.0 = Some((rows, want));
+        // As a pass's ask does: the rung is raised at once where nothing
+        // moves, and a cap the walker lowered behind a rung still up is
+        // lifted back, so the batch is not cut while the walk catches up.
+        if let Some(shared) = crate::store::registry::try_get(0, engine).and_then(|s| s.shared) {
+            crate::store::shared::raise_now(&shared, engine, rows32);
+        }
     }
 
     fn release(&mut self) {
