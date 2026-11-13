@@ -1335,19 +1335,43 @@ impl SharedPool {
     /// Whether the ceiling rose: room opened that a planner waiter may be
     /// short of, so the caller wakes them.
     pub fn hold_back(&mut self, bytes: u64) -> bool {
-        let ceiling = if bytes == 0 {
-            self.pool.total_chunks()
-        } else {
-            let top = self.pool.top_segment() * self.pool.segments().segment_chunks();
-            let held =
-                u32::try_from(bytes.div_ceil(self.pool.chunk_bytes().max(1))).unwrap_or(u32::MAX);
-            top.saturating_sub(held).max(self.pool.reserved_chunks())
-        };
+        let ceiling = self.ceiling_for(bytes);
         let rose = ceiling > self.pool.ceiling();
         if ceiling != self.pool.ceiling() {
             self.pool.set_ceiling(ceiling);
         }
         rose
+    }
+
+    /// The chunk the engine binds state below while it holds `bytes` back:
+    /// the held span lies directly under the activation span
+    /// ([fitted, stated)); the whole range when it holds none.
+    fn ceiling_for(&self, bytes: u64) -> u32 {
+        if bytes == 0 {
+            return self.pool.total_chunks();
+        }
+        let act_start = self.pool.total_chunks() - self.pool.act_max();
+        let held =
+            u32::try_from(bytes.div_ceil(self.pool.chunk_bytes().max(1))).unwrap_or(u32::MAX);
+        act_start
+            .saturating_sub(held)
+            .max(self.pool.reserved_chunks())
+    }
+
+    /// The most the pool may map while the engine holds `bytes` back: the
+    /// prefix segments wholly under what it binds
+    /// ([`crate::store::slots::SlotPool::backs`]) and the top span,
+    /// committed from the load; the whole range when it holds none.
+    #[must_use]
+    pub fn bound_bytes(&self, bytes: u64) -> u64 {
+        let total = self.pool.total_chunks();
+        if bytes == 0 {
+            return u64::from(total) * self.pool.chunk_bytes();
+        }
+        let seg = self.pool.segments().segment_chunks().max(1);
+        let top_start = self.pool.top_segment() * seg;
+        let prefix_end = (self.ceiling_for(bytes) / seg * seg).min(top_start);
+        u64::from(prefix_end + (total - top_start)) * self.pool.chunk_bytes()
     }
 
     /// [`Self::rung_for`], no wider than `armed` (a rung's tokens): the

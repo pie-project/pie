@@ -915,7 +915,7 @@ fn no_slot_is_handed_out_past_what_the_engine_binds() {
             walk_segments(&mut pool, 8, 0, &mut engine),
             Retarget::Reached
         );
-        let top = pool.pool().top_segment() * SEGMENT;
+        let top = TOTAL - pool.pool().act_max();
         pool.hold_back(u64::from(top - 8) * CHUNK);
         assert_eq!(pool.pool().ceiling(), 8);
     }
@@ -1006,7 +1006,7 @@ fn room_past_the_ceiling_is_not_headroom_and_its_lift_is_said() {
         Retarget::Reached
     );
     let all = pool.pool().headroom();
-    let top = pool.pool().top_segment() * SEGMENT;
+    let top = TOTAL - pool.pool().act_max();
     assert!(!pool.hold_back(u64::from(top - 8) * CHUNK), "lowered");
     let held_back = pool.pool().headroom();
     assert!(
@@ -1024,7 +1024,7 @@ fn room_past_the_ceiling_is_not_headroom_and_its_lift_is_said() {
 #[test]
 fn no_commit_reaches_into_what_the_engine_holds_back() {
     let mut pool = pool();
-    let top = pool.pool().top_segment() * SEGMENT;
+    let top = TOTAL - pool.pool().act_max();
     // All but the lowest two segments below the activation held back.
     let ceiling = 2 * SEGMENT;
     pool.hold_back(u64::from(top - ceiling) * CHUNK);
@@ -1049,10 +1049,10 @@ fn no_commit_reaches_into_what_the_engine_holds_back() {
 #[test]
 fn a_segment_straddling_the_ceiling_is_never_mapped() {
     let mut pool = pool();
-    let top = pool.pool().top_segment() * SEGMENT;
-    // Held back: 20 chunks under the activation, so the ceiling (at 28)
-    // falls inside segment 3.
-    let held = 20;
+    let top = TOTAL - pool.pool().act_max();
+    // Held back: 19 chunks under the activation, so the ceiling (at 33)
+    // falls inside segment 4.
+    let held = 19;
     assert!(!pool.hold_back(u64::from(held) * CHUNK));
     let ceiling = pool.pool().ceiling();
     assert_eq!(ceiling, top - held);
@@ -1072,11 +1072,10 @@ fn a_segment_straddling_the_ceiling_is_never_mapped() {
         grows += 1;
         assert!(grows < 16, "the walk keeps committing");
     }
-    let range = u64::from(TOTAL) * CHUNK;
+    let bound = pool.bound_bytes(u64::from(held) * CHUNK);
     assert!(
-        pool.held() <= range - u64::from(held) * CHUNK,
-        "mapped {} past the range less what is held {}",
-        pool.held(),
-        range - u64::from(held) * CHUNK
+        pool.held() <= bound,
+        "mapped {} past what the engine binds {bound}",
+        pool.held()
     );
 }

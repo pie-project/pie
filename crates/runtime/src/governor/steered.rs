@@ -126,17 +126,18 @@ impl PoolTarget for EnginePool {
         self.target().map_or(0, PoolTarget::floor)
     }
 
-    /// The pool's range, less what the engine holds beside it for fires and
-    /// bodies now ([`::engine::live::Live::held`]), never under the floor.
-    /// The range stated at load already leaves out what the driver holds
-    /// (`outside`, a ledger term the policy reads, not subtracted here). No
-    /// segment that reaches into what is held is committed
-    /// ([`crate::store::slots::SlotPool::backs`]), so what is mapped stays
-    /// under it.
+    /// What the pool may map while the engine holds part of its range back
+    /// for fires and bodies ([`::engine::live::Live::held`], the span
+    /// directly under the activation): the prefix segments wholly under it
+    /// and the top span ([`crate::store::shared::SharedPool::bound_bytes`]),
+    /// the segments the walker commits ([`crate::store::slots::SlotPool::backs`]);
+    /// never under the floor. The range stated at load already leaves out
+    /// what the driver holds (`outside`, a ledger term the policy reads).
     fn hard_limit(&self) -> u64 {
-        self.target().map_or(0, |target| {
+        self.shared.as_ref().map_or(0, |shared| {
             let held = crate::engine::live(self.engine).held();
-            target.hard_limit().saturating_sub(held).max(target.floor())
+            let bound = shared.shared().lock().unwrap().bound_bytes(held);
+            bound.max(shared.floor())
         })
     }
 

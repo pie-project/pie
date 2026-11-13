@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn the_pool_grows_only_into_a_segment_the_engine_binds() {
         let mut pool = super::super::tests::pool();
-        let top = pool.pool().top_segment() * pool.pool().segments().segment_chunks();
+        let top = pool.pool().total_chunks() - pool.pool().act_max();
         let next = pool.pool().prefix_segments();
         let next_end = pool.pool().segments().range(next).end;
         // The ceiling one chunk short of the next segment's end.
