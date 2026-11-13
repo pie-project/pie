@@ -1426,21 +1426,12 @@ impl Shell {
             // of each: a take answers its place, and nothing grows. What is
             // left to grow by allocation is the slabs of other arenas.
             let arena = shell.device.ctx().slabs().id();
-            // Laid under every key a fire may name it by: the walk fires
-            // on the context's own stream and lane, and a fire's regions
-            // run on its side streams as well, each taking the like.
-            let streams: Vec<usize> = std::iter::once(shell.device.stream())
-                .chain(shell.device.side_streams())
-                .map(|stream| stream.addr())
+            let placed: Vec<(kernels_cuda::jit::SlabKey, usize)> = walked
+                .keys
+                .iter()
+                .filter(|slab| slab.key.arena == arena)
+                .map(|slab| (slab.key, slab.asked))
                 .collect();
-            let mut laid = std::collections::BTreeMap::new();
-            for slab in walked.keys.iter().filter(|slab| slab.key.arena == arena) {
-                for key in slab.key.over(&streams) {
-                    let bytes: &mut usize = laid.entry(key).or_default();
-                    *bytes = (*bytes).max(slab.asked);
-                }
-            }
-            let placed: Vec<(kernels_cuda::jit::SlabKey, usize)> = laid.into_iter().collect();
             let grows = walked
                 .keys
                 .iter()
