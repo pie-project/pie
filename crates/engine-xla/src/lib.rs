@@ -25,6 +25,7 @@ pub mod rs;
 pub mod run;
 pub mod serve;
 pub mod settle;
+pub mod snapshot;
 pub mod store;
 pub mod trace;
 pub mod weights;
