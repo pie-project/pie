@@ -1432,3 +1432,15 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
 - Gates vs a7aae7764: 3 logit dumps byte-identical on both backends; engine_vulkan 64 / engine_wgpu 63 tests pass;
   Vulkan c1 315.1 vs 313.9. Measured one commit earlier: c64 -2% (noise +-10%), prefill 2048 -0.9% (all 3 rounds),
   boot within noise — re-measure on the tip pending. Workspace --all-targets + pie vulkan,wgpu check clean.
+
+### M117 — 2026-11-13: fire lane cap (M104 c1); t_evict hang; capture fallback
+- `sc/l40s-quant-experts` (d17d7833e, 3a5650cbb, L40S): chip decision engine.fire_lanes (default 256) caps a fire's
+  lanes apart from the slots (= max_lanes); wider waves fire as several recorded <=256-lane fires; decode bodies 17
+  -> 9. Cause: decode bodies wider than 256 lanes made every replayed node launch ~290 ns slower (driver resource,
+  unidentified). L40S NVFP4 c1 195.2 -> 202.7 (main 203.9); gpt-oss / Qwen3-8B unchanged. A key whose cold capture
+  was refused now walks before capturing (affine 138 -> 154/154 armed).
+- M115 re-measures on L40S: affine Qwen3.6 with the bodies stretch 154/154 at the full lattice, prefill +2.1% / +0.5%
+  (was +10 / +4%), c256 +21%, boot 16 s vs 64; FP8 30B pages 3600 / seated 7 = main's admission (c64 407 vs 403).
+  Open: FP8 prefill 2048 121.6 vs main 91.4 ms (fit now serves 1024 rows x 128 lanes).
+- `sc/oversub-3` (62d689db5): Held::park gives the state set's owner hold back like the kv set (handles holding a
+  hybrid's state kept a finished process's pages counted as returning -> no eviction ever planned). t_evict 4/4.
