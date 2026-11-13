@@ -4,8 +4,11 @@
 //! The rates are the chip's. The weight and head elements' are read off the phase stamps of a
 //! `TSTAMP:1` run (requests 1179a/c/d): a weight PE's matvec phases (Llama 3.1 8B: 1,524 cycles a
 //! layer for 3,328 elements) and the head PE's (0.537 cycles an element, Llama, E4B and Gemma 12B
-//! alike). The KV elements', the group hops' and the rows' spans are fitted to what moving the
-//! keys did to the bare step (`ARCHITECTURE.md`, "Cost": requests 1151-1195). A layer's own cost is what the
+//! alike). The reductions' chains are timed by their critical path ([`super::chain_cycles`], whose
+//! per-hop cycles are the fabric simulator's), at a rate a cycle fitted to what moving the keys
+//! did to the bare step (requests 1151-1306); the KV elements' and the rows' span are the earlier
+//! fits' (requests 1151-1195), which these moves cannot tell apart from the chains' rate
+//! (`ARCHITECTURE.md`, "Cost"). A layer's own cost is what the
 //! chip measured of the model's shipping program past those terms (`MEASURED`); a model the chip
 //! has not run takes the median.
 
@@ -18,12 +21,11 @@ const CYCLE: f64 = 1e3 / 875e6;
 pub const MATVEC: f64 = 1524.0 / 3328.0 * CYCLE;
 /// ms a KV element a row PE reads (fitted: the scores' and the values' passes on the CY column).
 pub const KV: f64 = 6.436e-6;
-/// ms a reduction hop within a group (fitted).
-pub const GROUP_HOP: f64 = 9.613e-6;
-/// ms a hop between group roots: held at the six-move fit's, which the G2 sweeps leave
-/// unresolved (any rate from 0 to 4e-6 fits them alike); 0 would send the search below the
-/// smallest group the chip ran (G2=8).
-pub const ROOT_HOP: f64 = 3.179e-6;
+/// ms a cycle of the reductions' chains ([`Features::chain`], fitted with KV and the span held):
+/// 0.96 of a cycle at 875 MHz, so the simulator's hop cycles price the chip's chains. Fitted with
+/// KV free it takes 2.2 cycles and the G2 gains' full size, but KV then costs 15 cycles an element
+/// and gpt-oss's layer less than nothing: the 4B's PY / NE move is the only one that moves both.
+pub const CHAIN: f64 = 1.093e-6;
 /// ms a row a layer's collectives cross down the columns (fitted).
 pub const SPAN_ROW: f64 = 1.267e-5;
 /// ms a column they cross along the rows: none the chip resolves (fitted to 0; halving the
@@ -52,8 +54,7 @@ pub const MEASURED: &[([u32; 3], f64)] = &[
 pub fn partition(f: &Features) -> f64 {
     MATVEC * f.matvec
         + KV * f.kv
-        + GROUP_HOP * f.group_hops
-        + ROOT_HOP * f.root_hops
+        + CHAIN * f.chain
         + SPAN_ROW * f.span_rows
         + SPAN_COL * f.span_cols
         + HEAD * f.head
@@ -74,7 +75,7 @@ pub fn layer(shape: &Shape, reference: Option<&Plan>) -> f64 {
 }
 
 /// The median layer cost of the measured models (their `layer`s), ms.
-pub const MEDIAN_LAYER: f64 = 0.0093;
+pub const MEDIAN_LAYER: f64 = 0.0078;
 
 /// A step of `plan`, in ms, with each layer costing `layer`.
 #[must_use]
@@ -87,13 +88,31 @@ pub fn step(plan: &Plan, layer: f64) -> f64 {
 mod tests {
     use crate::target::{Ask, plan};
 
-    /// What moving a pinned plan's keys did to the bare step on the chip (requests 1151-1279),
-    /// from the keys the chip ran first, and what the model predicts it does: within 6 µs of each,
-    /// and the same way where the chip moved past its noise (5 µs: Llama's VR=216 and VR=180 ran
-    /// in different sessions), except the G2 moves the hops' count does not explain, held only in
-    /// size (15-18 µs): E4B's G2=12 gains 2.3% where the hops give 0.4%, and G2 below 12 costs the
-    /// Qwen3-8B and the 12B 1% where the hops give about nothing (the chip's G2 has an optimum the
-    /// hops miss: 12 on the Qwen3.5s, E4B and Qwen3-8B, 16 on the 12B, 8 on E2B).
+    /// The chain model against the fabric simulator: a row chain of 128 members a half (a unit
+    /// 256 columns wide and 8 rows, 16 dims a row: `scratch/genG2`) took 4,374 cycles a layer at
+    /// G2=8 and at G2=16, 4,304 at 12 and 4,398 at 24, two row chains a layer.
+    #[test]
+    fn the_chain_follows_the_simulator() {
+        let t = |g| super::super::chain_cycles(128, g) - super::super::chain_cycles(128, 12);
+        for (g, sim) in [(8, 35.0), (16, 35.0), (24, 47.0)] {
+            assert!(
+                (t(g) - sim).abs() <= 2.0,
+                "G2={g}: {} cycles vs {sim}",
+                t(g)
+            );
+        }
+    }
+
+    /// What moving a pinned plan's keys did to the bare step on the chip (requests 1151-1306),
+    /// from the keys the chip ran first, and what the model predicts it does: the same way where
+    /// the chip moved past its noise (5 µs: Llama's VR=216 and VR=180 ran in different sessions),
+    /// and within 6 µs of each but where the chains' cycles alone come short. The chains' critical
+    /// path gives each swept model the chip's best G2 (12 on the Qwen3.5s, E4B and Qwen3-8B, 16 on
+    /// the 12B, 8 of E2B's 8 / 16 / 24) but gpt-oss's (its row chains' halves are 64 attention and
+    /// 288 MoE columns, and the long half makes G2=8 cost 2.6 µs where the chip gained 2.5). It
+    /// gives the G2 moves about half their size on the chip (E4B's G2=12: 7 µs of 21, held at
+    /// 15), and the 0.8B's PX move and the 4B's PY move, which moved the chains with the KV and
+    /// the span, 12 and 7 µs short.
     #[test]
     fn the_model_follows_the_chip_moves() {
         let l = "llama31-8b-bf16-kv-bf16";
@@ -111,26 +130,26 @@ mod tests {
             (l, "l3-8b", "VR=216", "VR=144", 0.488, 0.4865, 6.0),
             (l, "l3-8b", "VR=216", "VR=180", 0.488, 0.4915, 6.0),
             (l, "l3-8b", "", "G2=8", 0.485, 0.486, 6.0),
-            (q08, "0.8b", "G2=16", "PX=128,G2=10,G2Y=10", 0.296, 0.321, 6.0),
+            (q08, "0.8b", "G2=16", "PX=128,G2=10,G2Y=10", 0.296, 0.321, 12.5),
             (q08, "0.8b", "G2=16", "G2=8", 0.297, 0.2965, 6.0),
             (q08, "0.8b", "G2=16", "", 0.297, 0.292, 6.0),
             (g12, "g12", "", "G2=15,GA=4,PY=282", 0.950, 0.9505, 6.0),
-            (q4, "4b", "PY=256,NE=64,G2=16,G2Y=16", "G2=16", 0.4935, 0.4855, 6.0),
+            (q4, "4b", "PY=256,NE=64,G2=16,G2Y=16", "G2=16", 0.4935, 0.4855, 8.0),
             (q4, "4b", "G2=16", "G2=8", 0.4855, 0.4845, 6.0),
             (q4, "4b", "G2=16", "", 0.4855, 0.480, 6.0),
-            (q8, "q3-8b", "", "G2=8", 0.5505, 0.559, 15.0),
-            (q8, "q3-8b", "", "G2=16", 0.5505, 0.560, 15.0),
-            (g12, "g12", "", "G2=8", 0.9495, 0.960, 15.0),
+            (q8, "q3-8b", "", "G2=8", 0.5505, 0.559, 6.0),
+            (q8, "q3-8b", "", "G2=16", 0.5505, 0.560, 6.0),
+            (g12, "g12", "", "G2=8", 0.9495, 0.960, 7.5),
             (g12, "g12", "", "G2=12", 0.9495, 0.9515, 6.0),
             (o, "full", "", "G2=8", 0.6525, 0.650, 6.0),
             (o, "full", "", "G2=24", 0.6525, 0.6555, 6.0),
             (q9, "9b", "G2=16", "G2=8", 0.5185, 0.5175, 6.0),
-            (q9, "9b", "G2=16", "G2=12", 0.5185, 0.510, 6.5),
+            (q9, "9b", "G2=16", "G2=12", 0.5185, 0.510, 6.0),
             (q9, "9b", "G2=16", "G2=24", 0.5185, 0.5225, 6.0),
-            (e4, "e4b", "G2=16", "G2=8", 0.8975, 0.890, 6.0),
-            (e4, "e4b", "G2=16", "G2=12", 0.8975, 0.8765, 18.0),
-            (e4, "e4b", "G2=16", "G2=24", 0.8975, 0.907, 6.0),
-            (e2, "e2b", "G2=16", "G2=8", 0.6915, 0.683, 6.0),
+            (e4, "e4b", "G2=16", "G2=8", 0.8975, 0.890, 6.5),
+            (e4, "e4b", "G2=16", "G2=12", 0.8975, 0.8765, 15.0),
+            (e4, "e4b", "G2=16", "G2=24", 0.8975, 0.907, 7.5),
+            (e2, "e2b", "G2=16", "G2=8", 0.6915, 0.683, 7.0),
             (e2, "e2b", "G2=16", "G2=24", 0.6915, 0.695, 6.0),
         ];
         for (model, preset, from_set, to_set, from, to, tol_us) in moves {
@@ -152,7 +171,7 @@ mod tests {
                 "{model} {to_set}: {got} ms vs {want} ms"
             );
             assert!(
-                want.abs() < 5e-3 || tol_us > 6.5 || got.signum() == want.signum(),
+                want.abs() < 5e-3 || got.signum() == want.signum(),
                 "{model} {to_set}: {got} ms the other way from {want} ms"
             );
         }

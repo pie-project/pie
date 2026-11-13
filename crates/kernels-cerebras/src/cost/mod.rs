@@ -18,11 +18,9 @@ pub struct Features {
     /// The weight elements one PE multiplies a step, summed over the layers (the busiest PE of
     /// each phase: a phase's matrix over the PEs that hold it; routed experts: the top-k).
     pub matvec: f64,
-    /// Reduction hops a step within the groups: each layer's two column and two row reductions,
-    /// a two-level chain (`group` members, then `span / group` group roots).
-    pub group_hops: f64,
-    /// The reductions' hops between the group roots.
-    pub root_hops: f64,
+    /// Cycles a step the reductions' chains take end to end ([`chain_cycles`]): each layer's two
+    /// row chains into CX and two column chains into CY, a chain the slower of its two halves.
+    pub chain: f64,
     /// The fabric distance a step's collectives cross down the columns: each layer's multicasts
     /// and reductions span the unit's rows.
     pub span_rows: f64,
@@ -78,25 +76,64 @@ impl Features {
         }
         let layers = s.layers.len() as f64;
         let span_c = att_cols.min(mlp_cols).max(1.0);
-        let (gc, gr) = (
-            f64::from(p.reduce.col.max(1)).min(rows),
-            f64::from(p.reduce.row.max(1)).min(span_c),
-        );
-        let group_hops = layers * 2.0 * (gc + gr);
         let (span_rows, span_cols) = (layers * rows, layers * span_c);
-        let root_hops = layers * 2.0 * ((rows / gc).ceil() + (span_c / gr).ceil());
+        // a unit's halves either side of its roots: CX after the first cols / 2 columns (gpt-oss:
+        // after the attention half's), CY after the first rows / 2 rows
+        let (cl, ch) = match p.attn_cols {
+            Some(a) => (a, p.cols - a),
+            None => (p.cols / 2, p.cols - p.cols / 2),
+        };
+        let (rl, rh) = (p.rows / 2, p.rows - p.rows / 2);
+        let half = |a: u32, b: u32, g: u32| chain_cycles(a, g).max(chain_cycles(b, g));
+        let chain = layers * 2.0 * (half(cl, ch, p.reduce.row) + half(rl, rh, p.reduce.col));
         let head = f64::from(p.head.vocab_rows) * (h / f64::from(p.head.cols.max(1))).ceil();
         Features {
             layers,
             matvec,
-            group_hops,
-            root_hops,
+            chain,
             span_rows,
             span_cols,
             kv,
             head,
         }
     }
+}
+
+/// A member's add-and-forward a level-1 hop, in cycles (the fabric simulator: a row chain of 128
+/// members a half, `scratch/genG2`).
+const CHAIN_ADD: f64 = 7.0;
+/// A group end's merge of its group's sum with the level-2 sum from beyond, in cycles.
+const CHAIN_MERGE: f64 = 7.0;
+/// A router hop the sums pass on their way, in cycles.
+const CHAIN_WIRE: f64 = 3.0;
+
+/// The cycles a two-level chain's half of `members` takes in groups of `group` (0: one group),
+/// from every member's partial to the sum leaving the half's nearest member for the root. The
+/// groups count from the root out, the farthest the remainder. Every group's members add and
+/// forward toward their end at once (level 1); the level-2 sum starts at the farthest end and
+/// each end merges its group's sum into it once both are in, so an end waits for whichever is
+/// later. A short far group starts the level-2 sum early, which is why a group that leaves a
+/// remainder (12 over 128) beats the divisors either side of it (8, 16).
+#[must_use]
+pub fn chain_cycles(members: u32, group: u32) -> f64 {
+    if members == 0 {
+        return 0.0;
+    }
+    let g = if group == 0 {
+        members
+    } else {
+        group.min(members)
+    };
+    let n = members.div_ceil(g);
+    let mut end: Option<f64> = None;
+    for j in 0..n {
+        // far first: the remainder, then full groups
+        let size = if j == 0 { members - (n - 1) * g } else { g };
+        let level1 = f64::from(size - 1) * (CHAIN_ADD + CHAIN_WIRE) + CHAIN_WIRE;
+        let level2 = end.map_or(f64::NEG_INFINITY, |e| e + f64::from(size) * CHAIN_WIRE);
+        end = Some(level1.max(level2) + CHAIN_MERGE);
+    }
+    end.unwrap_or(0.0)
 }
 
 /// A layer's mixer: its projections' weight elements, and whether it keeps a cache of its own.

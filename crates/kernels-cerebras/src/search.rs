@@ -24,8 +24,8 @@ pub const MARGIN: f64 = 512.0;
 const BEAM: usize = 96;
 
 /// The least gain (a fraction of the made-for plan's step) a candidate must predict to rank
-/// ahead of that plan: the G2 tweaks under it (gpt-oss G2=8, 0.4% on the chip) are within the
-/// time model's error, which reaches 2% on the one move it does not follow (E4B G2=12).
+/// ahead of that plan: the moves under it are within the time model's error (gpt-oss G2=8, 0.4%
+/// on the chip, is the one it gets the wrong way: 0.8% of its step).
 pub const RESOLUTION: f64 = 0.003;
 
 /// Keys that are not the partition's (the contract's levels and loop, the head's scale).

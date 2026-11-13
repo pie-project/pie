@@ -262,20 +262,38 @@ named) plans by the search (`search`, below): there is no table of presets to tr
 ## Cost and search (`cost`, `search`)
 
 `cost::Features` reads what a decode step does off a plan: the weight elements the busiest PE of
-each phase multiplies, the reductions' hops within and between groups, the fabric distance the
+each phase multiplies, the cycles the reductions' chains take end to end, the fabric distance the
 collectives cross down the columns (the rows) and along the rows (the columns), the KV elements a
 row reads, the head PE's elements. `cost::time` prices them at the chip's rates. The weight and head
 elements' are read off the phase stamps of `TSTAMP:1` runs (requests 1179a/c/d: a weight PE's
 matvec phases, 0.46 cycles an element; the head PE's, 0.537, alike on Llama, E4B and Gemma 12B).
-The KV elements', the group hops' and the rows' spans are fitted to what moving a pinned plan's
-keys did to the bare step (requests 1151-1195, 16 moves: Llama VR=112 / 144 / 180, 0.8B PX=128,
-Gemma 12B's pick, 4B PY=192, G2=8 / 12 / 24 on the 9B, E4B, E2B and gpt-oss). The fit predicts
-each move within 6 µs and the same way the chip moved (`time::tests`) but one: G2=12 gains 2.3% on
-E4B and 1.6% on the 9B where the hops' count gives 0.4%, so G2=12's gain is past what the hops
-explain and the model ranks G2=8 level with it. Fitted with one move held out it misses the
-held-out one by 10 µs RMS, 26 µs at most (the 4B's). The root hops' rate is held at the six-move
-fit's: the G2 sweeps fit any from 0 to 4e-6 ms alike, and 0 would send the search below the
-smallest group the chip ran. The columns cost nothing the chip resolves (`SPAN_COL` 0): halving
+
+A chain (`cost::chain_cycles`) is timed by its critical path: each half either side of the root
+in groups of G2 counted from the root out, the farthest the remainder; every group's members add
+and forward to their end at once, and the level-2 sum starts at the farthest end, each end merging
+its group's sum into it once both are in. A short far group starts the level-2 sum early, so a G2
+that leaves a remainder beats the divisors either side of it: on the fabric simulator, a row
+chain of 128 members a half (a unit 256 columns wide, 8 rows, the 9B's 16 dims a row:
+`scratch/genG2`) takes 70 cycles a layer more at G2=8 and at G2=16 than at 12, and 94 more at 24,
+which 7 cycles an add-forward, 7 a merge and 3 a router hop reproduce. That is the chip's shape:
+the best G2 is 12 where the halves are 128 (the Qwen3.5s, E4B, Qwen3-8B), 16 on the 12B (172 and
+141), 8 of E2B's 8 / 16 / 24.
+
+The chip's rate a chain cycle is fitted to what moving a pinned plan's keys did to the bare step
+(requests 1151-1306, 25 moves: Llama VR=112 / 144 / 180 and G2=8, 0.8B PX=128 and G2=8 / 12, Gemma
+12B's pick and G2=8 / 12, 4B PY=192 and G2=8 / 12, Qwen3-8B G2=8 / 16, G2=8 / 12 / 24 on the 9B,
+E4B, E2B and gpt-oss), with the KV elements' and the rows' span held at the earlier fit's: it comes
+to 0.96 of a cycle at 875 MHz, so the simulator's hop cycles price the chip's chains. The model
+then gives every swept model the chip's best G2 but gpt-oss's (`time::tests`): its row chains'
+halves are the 64 attention and 288 MoE columns, the long half makes G2=8 cost 2.6 µs, and the chip
+gained 2.5. It gives the G2 moves about half their size on the chip (E4B's G2=12: 7 µs of 21), and
+the 0.8B's PX move and the 4B's PY move, which moved the chains with the KV and the span, 12 and 7
+µs short. Fitted with one move held out it misses the held-out one by 6.6 µs RMS, 21 µs at most
+(E4B's G2=12); the hop model it replaces missed by 5.9 µs RMS on these moves, ranked G2=8 ahead of
+12 on E4B and put G2=12's gain at a third of the chip's. Freed, the KV rate takes the rest of the G2
+gains (the chain at 2.2 cycles, 3.9 µs RMS held out) but costs 15 cycles an element and leaves
+gpt-oss's layer less than nothing: only the 4B's PY / NE move moves both, so the moves cannot tell
+the chains' rate from the KV's. The columns cost nothing the chip resolves (`SPAN_COL` 0): halving
 the 0.8B's cost what its doubled matvec and KV elements do. Each layer's own cost is read off the
 measured step of the model's pinned plan (`time::MEASURED`: the bare step where the chip ran it,
 else Pie decode; a model the chip has not run takes the median).
@@ -295,7 +313,7 @@ seed that does not plan is repaired a key at a time, following each move that ge
 check it failed. A candidate plans, serves the positions asked for (the made-for plan's, else
 4096), keeps its head over the vocabulary, leaves every image `STACK_ROOM` plus a 512 B margin
 and builds (`Program::build`); it ranks ahead of the made-for plan only where it predicts a step
-0.3% faster (`search::RESOLUTION`: the G2 tweaks under it are within the time model's error). `wafer-compile search --model <m>` prints the ranking with the keys
+0.3% faster (`search::RESOLUTION`: the moves under it are within the time model's error). `wafer-compile search --model <m>` prints the ranking with the keys
 each candidate moved from the made-for plan.
 
 ## Weights
