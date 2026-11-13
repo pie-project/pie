@@ -3319,12 +3319,17 @@ impl Pools {
         // stated, where that is more: what the fit keeps back is backed
         // when the runtime comes to take it.
         let fitted = self.fitted_chunks();
-        self.chunks
-            .limit(self.stated.map_or(fitted, |stated| stated.max(fitted)));
-        match self
-            .chunks
-            .commit_segments(&mut self.pool, self.chunks.segments_for(u64::from(fitted)))?
-        {
+        let stated = self.stated.map_or(fitted, |stated| stated.max(fitted));
+        self.chunks.limit(stated);
+        // Where the fit keeps chunks back, only the segments wholly under
+        // them: the last the fitted chunks reach into would back some of
+        // what is kept.
+        let segments = if stated > fitted {
+            self.chunks.segments_under(u64::from(fitted))
+        } else {
+            self.chunks.segments_for(u64::from(fitted))
+        };
+        match self.chunks.commit_segments(&mut self.pool, segments)? {
             Commit::Committed => {}
             refusal => return Err(refuse(&self.pool, refusal)),
         }
