@@ -38,11 +38,25 @@ fn an_exported_kv_stays_mapped() {
         Dtype::Bf16,
         Platform::Cuda,
     );
+    let budgets = poem_compiler::Budgets::of(poem_compiler::Budget::new(SLOTS, 64));
     let facts = kv::probe(&trace).expect("the micro trace's cache rows probe");
     let paging = Paging::of(PAGE, CONTEXT, SLOTS, u64::from(SLOTS * CONTEXT / PAGE))
         .expect("a pool of four full sequences");
-    let mut pools =
-        Pools::reserve(0, 0.5, &trace, paging, None, &facts).expect("the pool reserves");
+    let mut pools = Pools::reserve(
+        0,
+        0.5,
+        &trace,
+        paging,
+        None,
+        &facts,
+        &budgets,
+        0,
+        None,
+        &[],
+        true,
+        false,
+    )
+    .expect("the pool reserves");
     let exported = pools
         .export_kv(0)
         .expect("a full-attention trace exports its kv");
@@ -58,20 +72,28 @@ fn an_exported_kv_stays_mapped() {
         2 * planes,
         "a region per key and per value plane"
     );
+    // A plane's region is the state pool from the plane's place in a page's
+    // slot on: a page is read a stride past the one before it, by its slot
+    // ref, and holds the plane's own bytes there.
     for region in &exported.regions {
-        assert_eq!(
-            region.len,
-            pages * region.page_stride,
+        assert!(
+            region.len >= pages * region.page_stride,
             "every declared page"
         );
         assert_eq!(region.domain, engine::MemoryDomain::CudaDevice(0));
     }
+    let offsets: std::collections::BTreeSet<u64> =
+        exported.regions.iter().map(|region| region.base).collect();
+    assert_eq!(offsets.len(), exported.regions.len(), "each plane apart");
+    const PROBE: usize = 64;
 
-    // The last page of every plane holds what is put there: every declared
-    // page is backed.
-    let last = |region: &engine::KvRegion| region.base + (pages - 1) * region.page_stride;
+    // The last slot of every plane holds what is put there: every chunk of
+    // the pool is backed.
+    let last = |region: &engine::KvRegion| {
+        region.base + (region.len / region.page_stride - 1) * region.page_stride
+    };
     for (at, region) in exported.regions.iter().enumerate() {
-        let pattern = vec![at as u8 + 1; region.page_stride as usize];
+        let pattern = [at as u8 + 1; PROBE];
         copy(
             last(region),
             pattern.as_ptr() as u64,
@@ -80,7 +102,7 @@ fn an_exported_kv_stays_mapped() {
         );
     }
     for (at, region) in exported.regions.iter().enumerate() {
-        let mut read = vec![0u8; region.page_stride as usize];
+        let mut read = [0u8; PROBE];
         copy(
             read.as_mut_ptr() as u64,
             last(region),

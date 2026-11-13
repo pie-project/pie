@@ -134,7 +134,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// The loaded SDK libraries and their resolved entry points.
 pub struct Sdk {
     api: sys::Api,
-    lib_dir: PathBuf,
     // Order matters on drop: the runtime library goes first.
     _runtime: Library,
     _artifacts: Library,
@@ -172,15 +171,10 @@ impl Sdk {
         prepend_path(&lib_dir.join("../bin"));
         Ok(Arc::new(Sdk {
             api,
-            lib_dir: lib_dir.to_path_buf(),
             _runtime: runtime,
             _artifacts: artifacts,
             _platform: platform,
         }))
-    }
-
-    pub fn lib_dir(&self) -> &Path {
-        &self.lib_dir
     }
 }
 

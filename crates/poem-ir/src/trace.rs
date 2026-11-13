@@ -100,7 +100,9 @@ pub enum ParamLayout {
 
 /// Where a plane may be served from. `Host`: read only by row gathers (a
 /// hashed table), so a card whose profile asks serves it from pinned,
-/// device-mapped host memory; otherwise it lives in device memory.
+/// device-mapped host memory; otherwise it lives in device memory. Inferred
+/// from the ops that read the plane ([`crate::residency::placement`]), never
+/// declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ParamPlacement {
     #[default]
@@ -199,7 +201,8 @@ pub enum CacheRow {
         name: String,
         planes: Vec<u64>,
         dtype: Dtype,
-        space: u32,
+        /// The rows the reading attention keeps: `None` every row of the
+        /// sequence; `Some(w)` its last `w`, the row's own window list.
         #[serde(default)]
         window: Option<u32>,
         /// The attention head_dim this cache stores. It is the packing block of

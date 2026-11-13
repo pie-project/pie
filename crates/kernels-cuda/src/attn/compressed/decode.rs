@@ -18,6 +18,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
+use crate::attn::kv;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, kernel, refuse};
 use crate::tensor::{KvPool, Tensor};
 const DECODE: &str = "attn/compressed/decode.cu";
@@ -221,10 +222,14 @@ fn ranks(ctx: &Ctx, rows: u32) -> u32 {
 fn smem(rows: Option<(Rows, Rows)>) -> u32 {
     let ld = HEAD_DIM + 8;
     let tile = KEYS * ld * 2;
-    // Tiles in flight: six of quantized rows (five below sm_90, as
-    // `attn/compressed/decode.cu` lays them) and the one they widen into, four of
-    // bf16. A raw key holds the wider format's data and scales.
-    let stages = if crate::jit::compute_capability_major().is_some_and(|major| major < 9) {
+    // Tiles in flight, as `attn/compressed/decode.cu` lays them: two of
+    // either where a block holds 99 KiB (sm_86, sm_89, sm_120); else six
+    // of quantized rows (five below sm_90) and the one they widen into,
+    // four of bf16. A raw key holds the wider format's data and scales.
+    let small = crate::jit::max_shared_memory_per_block_optin().is_some_and(|bytes| bytes < 128 << 10);
+    let stages = if small {
+        2
+    } else if crate::jit::compute_capability_major().is_some_and(|major| major < 9) {
         5
     } else {
         6
@@ -237,10 +242,7 @@ fn smem(rows: Option<(Rows, Rows)>) -> u32 {
         };
         let ((wd, ws), (pd, ps)) = (split(w), split(p));
         stages * KEYS * (wd.max(pd) + ws.max(ps)) + tile
-    } else if crate::jit::compute_capability_major() == Some(8)
-        && crate::jit::max_shared_memory_per_block_optin().is_some_and(|bytes| bytes < 128 << 10)
-    {
-        // Two bf16 tiles where a block holds 99 KiB (sm_86, sm_89).
+    } else if small {
         2 * tile
     } else {
         4 * tile
@@ -351,6 +353,14 @@ pub fn decode(
     if rows == 0 {
         return Ok(());
     }
+    // Its key slots keep a row's offset in its page in 16 bits.
+    if window_pool.page_size >= 1 << 16
+        || pooled
+            .as_ref()
+            .is_some_and(|p| p.entries.page_size >= 1 << 16)
+    {
+        return Err(refuse(OP, "a page of 65536 positions or more"));
+    }
     // A compact pool read through its view: an entry a row, `page_size /
     // ratio` a page.
     let (view, pool_compact) = pooled.as_ref().map_or((None, false), |p| {
@@ -407,12 +417,14 @@ pub fn decode(
             window_pool.page_indptr.arg(),
             window_pool.seq_stride.arg(),
             window_pool.page_size.arg(),
+            kv::page_elems(OP, window_pool, 0)?.arg(),
             window.arg(),
             entries.map_or(ArgValue::ABSENT, |e| e.keys.arg()),
             entries.map_or(ArgValue::ABSENT, |e| e.page_indices.arg()),
             entries.map_or(ArgValue::ABSENT, |e| e.page_indptr.arg()),
             entries.map_or(0, |e| e.seq_stride).arg(),
             entries.map_or(1, |e| e.page_size).arg(),
+            entries.map_or(Ok(0), |e| kv::page_elems(OP, e, 0))?.arg(),
             ratio.arg(),
             selection,
             top_k.arg(),

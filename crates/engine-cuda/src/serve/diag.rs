@@ -19,6 +19,29 @@ pub struct Diagnostics {
     pub gumbel_direct: bool,
     /// What a fire that waits for the device does (`crate::device::guard`).
     pub sync_guard: Option<SyncGuard>,
+    /// The chunk size the state pool's recipe aims near, in place of the
+    /// device profile's: a small one cuts a miniature's records into the
+    /// pieces only a full model's take.
+    pub chunk_bytes: Option<u64>,
+    /// States no weight shape: every table and routed bank the weight cache
+    /// would stream stays dense on the device, as a load that predates the
+    /// cache seats it.
+    pub dense_weights: bool,
+    /// States no expert shape: the routed banks stay dense on the device,
+    /// while the tables streamed by their rows are stated.
+    pub dense_experts: bool,
+    /// Lays every windowed kv row in one window list, of the widest window:
+    /// a row of a narrower window then keeps pages its kernels no longer
+    /// read. The same logits as a list a window.
+    pub one_window: bool,
+    /// Copies between the device and the host tier ride the compute stream,
+    /// ahead of every fire after them, not the swap stream beside those
+    /// fires: to weigh the overlap.
+    pub tier_inline: bool,
+    /// Arms every class's compositions for lanes that buffer recurrent rows,
+    /// not only a drafter's: speculative decoding an inferlet drafts itself
+    /// (no drafts output read) replays a body too.
+    pub rs_bodies: bool,
 }
 
 /// The sync guard's answer to a fire that waited for the device.
@@ -49,6 +72,12 @@ impl Default for Diagnostics {
             fuse_chains: true,
             gumbel_direct: true,
             sync_guard: None,
+            chunk_bytes: None,
+            dense_weights: false,
+            dense_experts: false,
+            one_window: false,
+            tier_inline: false,
+            rs_bodies: false,
         }
     }
 }
@@ -70,6 +99,7 @@ impl Diagnostics {
             ("reap-trace", self.reap_trace),
             ("trace-census", self.trace_census),
             ("nan-check", self.nan_check),
+            ("rs-bodies", self.rs_bodies),
         ] {
             if on {
                 words.push(word.to_string());
@@ -100,6 +130,21 @@ impl Diagnostics {
             Some(SyncGuard::Panic) => words.push("sync-guard=panic".to_string()),
             None => {}
         }
+        if let Some(bytes) = self.chunk_bytes {
+            words.push(format!("chunk-bytes={bytes}"));
+        }
+        if self.dense_weights {
+            words.push("dense-weights".to_string());
+        }
+        if self.dense_experts {
+            words.push("dense-experts".to_string());
+        }
+        if self.one_window {
+            words.push("one-window".to_string());
+        }
+        if self.tier_inline {
+            words.push("tier-inline".to_string());
+        }
         (!words.is_empty()).then(|| words.join(","))
     }
 }
@@ -118,7 +163,8 @@ const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `ptr-trace=<key substring>`, `graph-dot=<dir>`, `grid-trace=<key substring>`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, `gumbel-direct=off`, \
-     `sync-guard[=panic]`";
+     `sync-guard[=panic]`, `chunk-bytes=<bytes>`, `dense-weights`, \
+     `dense-experts`, `one-window`, `tier-inline`, `rs-bodies`";
 
 impl std::str::FromStr for Diagnostics {
     type Err = String;
@@ -142,6 +188,11 @@ impl std::str::FromStr for Diagnostics {
                 "reap-trace" => diag.reap_trace = switch(word, value)?,
                 "trace-census" => diag.trace_census = switch(word, value)?,
                 "nan-check" => diag.nan_check = switch(word, value)?,
+                "dense-weights" => diag.dense_weights = switch(word, value)?,
+                "dense-experts" => diag.dense_experts = switch(word, value)?,
+                "one-window" => diag.one_window = switch(word, value)?,
+                "tier-inline" => diag.tier_inline = switch(word, value)?,
+                "rs-bodies" => diag.rs_bodies = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,
                 "gumbel-direct" => diag.gumbel_direct = switch(word, value)?,
                 "sync-guard" => {
@@ -149,6 +200,13 @@ impl std::str::FromStr for Diagnostics {
                         "panic" => Some(SyncGuard::Panic),
                         _ => switch(word, value)?.then_some(SyncGuard::Report),
                     }
+                }
+                "chunk-bytes" => {
+                    diag.chunk_bytes = Some(value.parse().map_err(|_| {
+                        format!(
+                            "`chunk-bytes` takes a byte count: `chunk-bytes=<bytes>`, not `{value}`"
+                        )
+                    })?);
                 }
                 "ptr-trace" | "grid-trace" | "plan-trace" | "graph-dot" | "arm-bench" => {
                     if value.is_empty() {

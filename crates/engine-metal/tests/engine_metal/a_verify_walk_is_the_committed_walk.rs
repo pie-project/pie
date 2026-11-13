@@ -8,9 +8,9 @@
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
-use kernels_metal::Tensor;
 use kernels_metal::ssm::{self, Committed, Paged, RS_SNAPSHOTS, Snapshots, VerifyGates};
 use kernels_metal::tensor::RecurrentPool;
+use kernels_metal::{StateMap, Tensor};
 use poem_ir::Dtype;
 
 const K_HEADS: u32 = 16;
@@ -137,6 +137,12 @@ impl Bench {
         self.upload(&ints(v), v.len() as u32, 1, Dtype::I32)
     }
 
+    /// A bank's segment table with slots `stride` elements apart.
+    fn map(&self, stride: u64) -> Tensor {
+        let map = StateMap::whole(stride);
+        self.upload(&map.bytes(), 1, map.words().len() as u32, Dtype::U64)
+    }
+
     /// `bytes` bytes of `t` from byte `at`.
     fn read(&self, t: Tensor, at: u64, bytes: u64) -> Vec<u8> {
         let handle = self.handles.cut(t.buf, at, bytes).expect("a cut");
@@ -167,6 +173,8 @@ struct Inputs {
     a_log: Tensor,
     state: Tensor,
     conv: Tensor,
+    state_map: Tensor,
+    conv_map: Tensor,
 }
 
 fn inputs(bench: &Bench, ext: u32) -> Inputs {
@@ -214,6 +222,8 @@ fn inputs(bench: &Bench, ext: u32) -> Inputs {
         ),
         state: bench.upload(&state, SLOTS * V_HEADS * DIM, DIM, Dtype::F32),
         conv: bench.upload(&conv, SLOTS * TAPS, QKV_WIDTH, Dtype::F32),
+        state_map: bench.map(u64::from(V_HEADS) * u64::from(DIM) * u64::from(DIM)),
+        conv_map: bench.map(u64::from(TAPS) * u64::from(QKV_WIDTH)),
     }
 }
 
@@ -223,6 +233,14 @@ fn pool(x: &Inputs, slots: Tensor) -> RecurrentPool {
         slots,
         conv_state: x.conv,
         new_conv_state: x.conv,
+        segments: x.state_map,
+    }
+}
+
+fn conv_pool(x: &Inputs, slots: Tensor) -> RecurrentPool {
+    RecurrentPool {
+        segments: x.conv_map,
+        ..pool(x, slots)
     }
 }
 
@@ -483,7 +501,7 @@ fn convs_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
             indptr,
             &old,
             x.weight,
-            &pool(&x, old.slots),
+            &conv_pool(&x, old.slots),
             TAPS,
             1,
             old_y,
@@ -499,7 +517,7 @@ fn convs_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
             indptr,
             &new,
             x.weight,
-            &pool(&x, new.slots),
+            &conv_pool(&x, new.slots),
             TAPS,
             1,
             new_y,
@@ -523,7 +541,7 @@ fn convs_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
             indptr,
             &paged,
             x.weight,
-            &pool(&x, paged.slots),
+            &conv_pool(&x, paged.slots),
             TAPS,
             1,
             paged_y,

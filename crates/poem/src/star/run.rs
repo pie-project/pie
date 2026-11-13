@@ -1,19 +1,19 @@
 //! A deployment of a package traced and read: its layout evaluated, then the
-//! caches and forward it runs recorded into a trace, or the formats
+//! forward it runs recorded into a trace over its states' rows, or the formats
 //! of `formats(m)` read into a contract.
 
 use std::cell::RefCell;
 
 use checkpoint::contract::ModelContract;
 
-use crate::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Precision, Trace};
+use crate::{Dtype, ForwardHybrid, Input, Platform, Precision, StateRows, Trace};
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
 use starlark::values::ValueLike;
 use starlark::values::structs::AllocStruct;
 use starlark::values::{Heap, Value as Star};
 
-use crate::star::forward::{SpecHandle, TRAIL, Trail, hold_input};
+use crate::star::forward::{TRAIL, Trail, hold_input};
 use crate::star::package::Package;
 use crate::star::values::{DtypeValue, alloc_precision};
 
@@ -259,6 +259,10 @@ impl Package {
     }
 
     /// The trace of `id`'s deployment `deploy`, named `name`, on `platform`.
+    ///
+    /// A layout holding its state as `state(...)` handles is traced twice:
+    /// once over its states' rows as the layout alone declares them, to read
+    /// what the ops reading each say of it, then over the rows they lower to.
     pub fn trace(
         &self,
         id: &str,
@@ -269,42 +273,26 @@ impl Package {
         Module::with_temp_heap(|module| {
             let mut eval = Evaluator::new(&module);
             let m = self.layout(id, deploy, &module, &mut eval)?;
-            let caches = module
-                .heap()
-                .access_owned_frozen_value(&self.required("caches")?);
             let run = module
                 .heap()
                 .access_owned_frozen_value(&self.required("forward")?);
+            let states = crate::star::state::declared(m);
 
-            TRAIL.with(|t| *t.borrow_mut() = Trail::default());
-            let declared = eval
-                .eval_function(caches, &[m, module.heap().alloc(SpecHandle)], &[])
-                .map_err(error);
-            let spec = TRAIL
-                .with(|t| t.borrow_mut().spec.take())
-                .unwrap_or_default();
-            declared?;
-
-            let model = Model {
-                spec,
-                eval: RefCell::new(&mut eval),
-                run,
-                m,
-                failed: RefCell::new(None),
-            };
-            let traced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::trace_hybrid(name, &model, platform)
-            }));
-            TRAIL.with(|t| *t.borrow_mut() = Trail::default());
-            if let Some(why) = model.failed.borrow_mut().take() {
-                return Err(why);
+            if self.entry("caches")?.is_some() {
+                anyhow::bail!(
+                    "`{id}`'s package defines `caches()`, which poem no longer reads: declare \
+                     each row as a `state(shape, dtype)` handle in the layout and pass the \
+                     handle where the forward reads or writes it"
+                );
             }
-            let trace = traced.map_err(|panic| {
-                anyhow::anyhow!(
-                    "`{name}` does not trace: {}",
-                    crate::star::forward::panic_message(&*panic)
-                )
-            })?;
+            let trace = if states.is_empty() {
+                traced(name, StateRows::default(), &mut eval, run, m, platform)?
+            } else {
+                let first = crate::star::state::provisional(&states)?;
+                let first = traced(name, first, &mut eval, run, m, platform)?;
+                let spec = crate::star::state::lowered(&states, &first)?;
+                traced(name, spec, &mut eval, run, m, platform)?
+            };
             if let Some(factor) = deploy.yarn
                 && !stretched(&trace)
             {
@@ -316,6 +304,39 @@ impl Package {
             Ok(trace)
         })
     }
+}
+
+/// The trace `run`, a package's forward over the layout `m`, records over
+/// the cache rows `spec` declares.
+fn traced<'v, 'e>(
+    name: &str,
+    spec: StateRows,
+    eval: &mut Evaluator<'v, 'e, 'e>,
+    run: Star<'v>,
+    m: Star<'v>,
+    platform: Platform,
+) -> anyhow::Result<Trace> {
+    TRAIL.with(|t| *t.borrow_mut() = Trail::default());
+    let model = Model {
+        spec,
+        eval: RefCell::new(eval),
+        run,
+        m,
+        failed: RefCell::new(None),
+    };
+    let traced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::trace_hybrid(name, &model, platform)
+    }));
+    TRAIL.with(|t| *t.borrow_mut() = Trail::default());
+    if let Some(why) = model.failed.borrow_mut().take() {
+        return Err(why);
+    }
+    traced.map_err(|panic| {
+        anyhow::anyhow!(
+            "`{name}` does not trace: {}",
+            crate::star::forward::panic_message(&*panic)
+        )
+    })
 }
 
 /// Whether some rotation of `trace` turns at stated frequencies.
@@ -331,7 +352,7 @@ fn stretched(trace: &Trace) -> bool {
 
 /// A package's forward, as the DSL traces a model.
 struct Model<'a, 'v, 'e> {
-    spec: HybridSpec,
+    spec: StateRows,
     eval: RefCell<&'a mut Evaluator<'v, 'e, 'e>>,
     run: Star<'v>,
     m: Star<'v>,
@@ -339,7 +360,7 @@ struct Model<'a, 'v, 'e> {
 }
 
 impl ForwardHybrid for Model<'_, '_, '_> {
-    fn caches(&self) -> HybridSpec {
+    fn states(&self) -> StateRows {
         self.spec.clone()
     }
 

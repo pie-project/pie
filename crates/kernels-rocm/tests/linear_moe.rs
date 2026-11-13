@@ -644,6 +644,7 @@ fn moe_matmul_dense() {
     let streamed = moe::ExpertTable {
         table: table_t.ptr,
         hits: hits.ptr,
+        ..moe::ExpertTable::RESIDENT
     };
     moe::matmul_select(&ctx, xt, bt, rt, &mut y, streamed).unwrap();
     close_dot("expert table", &gpu.read(&y), &want, &mag, 1e-5);
@@ -752,7 +753,7 @@ fn moe_matmul_mxfp4() {
                     bias_t,
                     rt,
                     &mut y,
-                    moe::GroupSeat::RESIDENT,
+                    moe::ExpertTable::RESIDENT,
                 )
                 .unwrap();
             } else {
@@ -764,7 +765,7 @@ fn moe_matmul_mxfp4() {
                     None,
                     rt,
                     &mut y,
-                    moe::GroupSeat::RESIDENT,
+                    moe::ExpertTable::RESIDENT,
                 )
                 .unwrap();
             }
@@ -825,7 +826,16 @@ fn moe_matmul_mxfp4_lanes() {
             let xt = gpu.tensor(&x, x_rows as u32, k, Dtype::Bf16);
             let rt = gpu.upload(&routes, tokens, top_k, Dtype::I32);
             let mut y = gpu.zeros(tokens * top_k, n, Dtype::Bf16);
-            moe::matmul_select_mxfp4_lanes(&ctx, xt, lc, ls, rt, &mut y).unwrap();
+            moe::matmul_select_mxfp4_lanes(
+                &ctx,
+                xt,
+                lc,
+                ls,
+                rt,
+                &mut y,
+                moe::ExpertTable::RESIDENT,
+            )
+            .unwrap();
             let (want, mag) = reference(&bank, &x, &routes, kk, by_token, None);
             close_dot(
                 &format!("mxfp4 lanes {experts}e {tokens}x{top_k} {n}x{k} by_token={by_token}"),
@@ -862,7 +872,8 @@ fn mxfp4_lanes_guard() {
         const GUARD: u32 = 64;
         let full = gpu.zeros(tokens * top_k + GUARD, n, Dtype::Bf16);
         let mut y = Tensor::new(full.ptr, tokens * top_k, n, Dtype::Bf16);
-        moe::matmul_select_mxfp4_lanes(&ctx, xt, ct, st, rt, &mut y).unwrap();
+        moe::matmul_select_mxfp4_lanes(&ctx, xt, ct, st, rt, &mut y, moe::ExpertTable::RESIDENT)
+            .unwrap();
         let got = gpu.read(&full);
         let live = (tokens * top_k * n) as usize;
         let past = got[live..].iter().filter(|v| **v != 0.0).count();
@@ -967,7 +978,7 @@ fn moe_matmul_affine() {
                     Some(bt),
                     rt,
                     &mut y,
-                    moe::GroupSeat::RESIDENT,
+                    moe::ExpertTable::RESIDENT,
                 )
                 .unwrap();
                 let bank = if leg == "wmma" { &rounded } else { &exact };
@@ -1049,8 +1060,17 @@ fn moe_matmul_f16() {
         let xt = gpu.tensor(&x, tokens, k, Dtype::F16);
         let rt = gpu.upload(&routes, tokens, top_k, Dtype::I32);
         let mut y = gpu.zeros(tokens * top_k, n, Dtype::F16);
-        moe::matmul_select_quant(&ctx, xt, ct, st, None, rt, &mut y, moe::GroupSeat::RESIDENT)
-            .unwrap();
+        moe::matmul_select_quant(
+            &ctx,
+            xt,
+            ct,
+            st,
+            None,
+            rt,
+            &mut y,
+            moe::ExpertTable::RESIDENT,
+        )
+        .unwrap();
         let (want, mag) = reference(&bank, &x, &routes, kk, true, None);
         close_dot(
             &format!("f16 mxfp4 {leg} {n}x{k}"),
@@ -1086,7 +1106,7 @@ fn moe_matmul_f16() {
             Some(bt),
             rt,
             &mut y,
-            moe::GroupSeat::RESIDENT,
+            moe::ExpertTable::RESIDENT,
         )
         .unwrap();
         let (want, mag) = reference(&exact, &x, &routes, kk, true, None);
@@ -1171,8 +1191,17 @@ fn moe_matmul_windowed_grouped() {
         });
         let win = gpu.ints(&[2, 1, 0, 0]);
         ctx.arm_stage(win.ptr);
-        moe::matmul_select_quant(&ctx, xt, ct, st, None, rt, &mut y, moe::GroupSeat::RESIDENT)
-            .unwrap();
+        moe::matmul_select_quant(
+            &ctx,
+            xt,
+            ct,
+            st,
+            None,
+            rt,
+            &mut y,
+            moe::ExpertTable::RESIDENT,
+        )
+        .unwrap();
         ctx.disarm_stage();
         let (want, mag) = reference(&bank, &x, &routes, 4, true, None);
         let have = gpu.read(&y);

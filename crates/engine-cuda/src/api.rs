@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use checkpoint::contract::ModelContract;
 use engine::Engine;
-use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
+use engine::caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
@@ -15,7 +15,7 @@ use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, L
 use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
+use engine::transfer::{KvCopy, MemoryDomain};
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -174,23 +174,23 @@ impl Cuda {
         let contract = (self.contract_for)(trace, path).map_err(Error::Load)?;
         let prospect =
             crate::weights::prospect(trace, &contract, path, self.target()).map_err(fault)?;
-        let plan = crate::experts::Plan::cut(
-            &prospect.ranking,
-            crate::experts::Budgets {
-                device: residency.device_weight_budget,
-                host: residency.host_weight_budget,
-            },
-        )
-        .map_err(fault)?;
-        let sourced = plan.spill_demand() > 0
-            && crate::checkpoint_serving::Serving::open(path, trace).is_some();
-        residency.admit_tiers(engine::load::Tiers {
-            device: plan.device_demand(),
-            host: plan.host_demand(),
-            spilled: plan.spill_demand(),
-            sourced,
-        })?;
-        Ok((contract, plan))
+        // Dense weights always live on the device. The weight cache streams
+        // the routed banks it takes an expert at a time: the plan seats none
+        // itself. (The HIP build states no expert shape yet: its banks stay
+        // whole on the device.)
+        let diagnostics = &self.boot.knobs.diagnostics;
+        let cached = if diagnostics.dense_weights || diagnostics.dense_experts {
+            Vec::new()
+        } else {
+            crate::store::layout::streamed_experts(trace)
+        };
+        let ranking = if cfg!(feature = "rocm") {
+            prospect.ranking.clone()
+        } else {
+            prospect.ranking.clone().caching(&cached)
+        };
+        let _ = residency;
+        Ok((contract, crate::experts::Plan::cut(&ranking)))
     }
 
     fn target(&self) -> checkpoint::plan::StorageTarget {
@@ -608,11 +608,13 @@ impl Engine for Cuda {
             } else {
                 self.boot.ordinal
             },
-            knobs: self.boot.knobs.clone(),
+            knobs: crate::Knobs {
+                weights_held: residency.weights_held,
+                ..self.boot.knobs.clone()
+            },
             cache_dir: self.boot.cache_dir.as_deref(),
             runahead: engine::runahead::Runahead::of(frames_in_flight),
             residency: plan,
-            deferred_tier: residency.deferred_tier,
             world: self.boot.world,
             expert: self.expert,
             comm: self
@@ -656,10 +658,16 @@ impl Engine for Cuda {
             )
             .map_err(fault)?;
 
+        // Expert parallelism seats its buffers in the arena laid at the
+        // span's start: no smaller rung.
+        if self.expert.size > 1 {
+            shell.drop_rungs();
+        }
+        let mut chunk_facts = shell.chunk_facts().map_err(fault)?;
+        chunk_facts.disk_persistent = residency.disk_kv_persistent && chunk_facts.disk_chunks > 0;
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
-        let (pool_committed_bytes, pool_high_water_bytes, elastic_page_bytes, elastic_budget_pages) =
-            shell.elastic();
+        let (pool_committed_bytes, pool_high_water_bytes) = shell.elastic();
         let weights_from_cache = shell.weights_from_cache();
         let weights_resident = shell.weights_resident();
         let paging = shell.paging();
@@ -695,28 +703,18 @@ impl Engine for Cuda {
                     .map(|&(_, adapters, _)| adapters)
                     .min()
                     .unwrap_or(0),
-                elastic_page_bytes,
-                elastic_budget_pages,
-                slab_kv_page_bytes: 0,
-                elastic_state_slot_bytes: 0,
-                window_pages: paging.window.map_or(0, |_| {
-                    u32::try_from(paging.window_pages()).unwrap_or(u32::MAX)
-                }),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
                 host_kv_pages,
-                host_window_pages: shell.host_window_pages(),
-                host_state_slots: shell.host_state_slots(),
-                host_buffer_pages: shell.host_buffer_pages(),
                 disk_kv_pages,
                 disk_kv_persistent: residency.disk_kv_persistent && disk_kv_pages > 0,
                 disk_kv_kept: shell.disk_kv_kept(),
-                one_frame_when_short: shell.one_frame_when_short(),
                 seated_first: shell.seated_first(),
                 seat_to_end: shell.seat_to_end(),
                 seat_spread: shell.seat_spread(),
             },
+            chunks: chunk_facts,
             limits: FireLimits {
-                max_lanes: shell.budget().max_lanes,
+                max_lanes: shell.fire_lanes(),
                 max_tokens: shell.budget().max_tokens,
                 max_page_refs: paging
                     .pages_per_slot
@@ -735,12 +733,6 @@ impl Engine for Cuda {
                 .with(Port::AttnMask)
                 .with(Port::Fold),
             geometry: GeometryClass::DeviceGeometry,
-            kv_copy: KvCopyDomains {
-                device_to_device: true,
-                device_to_host: host_kv_pages > 0,
-                host_to_device: host_kv_pages > 0,
-                host_to_host: false,
-            },
             kv_handle,
             media_encode: false,
             device_channel_commit: true,
@@ -802,8 +794,101 @@ impl Engine for Cuda {
             .map_err(fault)
     }
 
-    fn commit_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
-        self.loaded_mut()?.commit_pool(kv_pages).map_err(fault)
+    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_segments(segments).map_err(fault)
+    }
+
+    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_segments(segments).map_err(fault)
+    }
+
+    fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
+        self.loaded_mut()?
+            .weight_residency(residency)
+            .map_err(fault)
+    }
+
+    fn weight_uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        self.loaded_mut()?.weight_uses().map_err(fault)
+    }
+
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+    }
+
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        use crate::store::Tier;
+        use crate::store::layout::{FIXED, LIST, WINDOW};
+        let tier = |domain| match domain {
+            MemoryDomain::CudaDevice(_) => Some(Tier::Device),
+            MemoryDomain::HostPinned => Some(Tier::Host),
+            MemoryDomain::LocalDisk => Some(Tier::Disk),
+            _ => None,
+        };
+        let (Some(from), Some(to)) = (tier(copy.src), tier(copy.dst)) else {
+            return Err(Error::Unsupported {
+                verb: "copy_slots to or from a domain other than the device, the host tier \
+                       and the slot file",
+                engine: "cuda",
+            });
+        };
+        let shell = self.loaded_mut()?;
+        shell.take_refs();
+        if from != Tier::Device || to != Tier::Device {
+            // Between tiers (CONTRACT-BC 22): whole slots, each laid alike.
+            if !copy.runs.is_empty() {
+                return Err(Error::Invalid(
+                    "token runs move within the device; between tiers a slot moves whole".into(),
+                ));
+            }
+            return shell
+                .copy_tier_slots(copy.shape, from, to, &copy.slots)
+                .map_err(fault);
+        }
+        if copy.shape == FIXED {
+            if !copy.runs.is_empty() {
+                return Err(Error::Invalid(
+                    "a fixed record is copied whole, not a run of its tokens".into(),
+                ));
+            }
+            for &(src, dst) in &copy.slots {
+                shell.fork_state(src, dst).map_err(fault)?;
+            }
+            return Ok(());
+        }
+        if copy.shape != LIST && copy.shape != WINDOW {
+            // Any other shape this load states (the rs list): whole slots.
+            if !copy.runs.is_empty() {
+                return Err(Error::Invalid(format!(
+                    "copy_slots names token runs of shape {}, whose slots are copied whole",
+                    copy.shape
+                )));
+            }
+            let pairs: Vec<[u32; 2]> = copy.slots.iter().map(|&(src, dst)| [src, dst]).collect();
+            return shell.copy_whole_slots(copy.shape, &pairs).map_err(fault);
+        }
+        let page = shell.paging().page_size;
+        let runs: Vec<engine::transfer::KvRun> = copy
+            .slots
+            .iter()
+            .map(|&(src, dst)| engine::transfer::KvRun {
+                src_page: src,
+                src_token: 0,
+                dst_page: dst,
+                dst_token: 0,
+                tokens: page,
+            })
+            .chain(copy.runs.iter().map(|run| engine::transfer::KvRun {
+                src_page: run.src,
+                src_token: run.src_token,
+                dst_page: run.dst,
+                dst_token: run.dst_token,
+                tokens: run.tokens,
+            }))
+            .collect();
+        shell
+            .copy_token_slots(copy.shape == WINDOW, &runs)
+            .map_err(fault)
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
@@ -1057,52 +1142,6 @@ impl Engine for Cuda {
         self.instance(instance)?.take(channel).map_err(fault)
     }
 
-    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        for (at, move_) in copy.moves.iter().enumerate() {
-            if move_.src_token_offset != 0 || move_.dst_token_offset != 0 {
-                return Err(Error::Invalid(format!(
-                    "state move {at} names a token offset, and a recurrent bank is a folded \
-                     summary of a prefix rather than an array of per-token entries — this \
-                     engine moves whole slots"
-                )));
-            }
-        }
-        let shell = self.loaded_mut()?;
-        let pairs = |moves: &[engine::transfer::StateMove]| -> Vec<(u32, u32)> {
-            moves
-                .iter()
-                .map(|m| (m.src_slot_id, m.dst_slot_id))
-                .collect()
-        };
-        let (states, pages) = (pairs(&copy.moves), pairs(&copy.pages));
-        let to_host = match copy.direction {
-            StateDirection::DeviceToDevice => {
-                for &(src, dst) in &states {
-                    shell.copy_state(src, dst).map_err(fault)?;
-                }
-                return shell.copy_pages(&pages).map_err(fault);
-            }
-            StateDirection::DeviceToHost => true,
-            StateDirection::HostToDevice => false,
-        };
-        let device_host = |pairs: Vec<(u32, u32)>| -> Vec<(u32, u32)> {
-            if to_host {
-                pairs
-            } else {
-                pairs
-                    .into_iter()
-                    .map(|(host, device)| (device, host))
-                    .collect()
-            }
-        };
-        shell
-            .copy_state_host(to_host, &device_host(states))
-            .map_err(fault)?;
-        shell
-            .copy_pages_host(to_host, &device_host(pages))
-            .map_err(fault)
-    }
-
     fn host_kv_layout(&self) -> Option<state::PageLayout> {
         self.shell.as_ref()?.host_kv_layout(1)
     }
@@ -1117,61 +1156,28 @@ impl Engine for Cuda {
             .map_err(fault)
     }
 
-    fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> EngineResult<Vec<u8>> {
-        self.loaded_mut()?
-            .read_host_state(slots, pages)
-            .map_err(fault)
+    fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> EngineResult<Vec<u8>> {
+        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
     }
 
-    fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> EngineResult<()> {
+    fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
         self.loaded_mut()?
-            .write_host_state(slots, pages, bytes)
+            .write_tier_slots(slots, bytes)
             .map_err(fault)
     }
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
+        // The host and disk tiers move through `copy_slots` (CONTRACT-BC
+        // 22): a kv copy is within the device.
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
-        // A tensor-parallel group names its device by its first rank's
-        // ordinal; to each rank, a move between "the device" and a host or
-        // disk tier is a move out of or into its own.
-        let tier = |domain| matches!(domain, MemoryDomain::HostPinned | MemoryDomain::LocalDisk);
-        let own = |domain| match (domain, device) {
-            (MemoryDomain::CudaDevice(_), Some(device)) => device,
-            _ => domain,
-        };
-        let copy = &match (copy.src, copy.dst) {
-            (src, dst) if tier(dst) && !tier(src) => KvCopy {
-                src: own(src),
-                ..copy.clone()
-            },
-            (src, dst) if tier(src) && !tier(dst) => KvCopy {
-                dst: own(dst),
-                ..copy.clone()
-            },
-            _ => copy.clone(),
-        };
-        if let Some((tier, out, pages, slots)) = device.and_then(|device| copy.tier_move(device)) {
-            // The windowed pairs are stated in the copy's direction; the pool
-            // takes them as (device, host).
-            let windowed: Vec<(u32, u32)> = copy
-                .windowed
-                .iter()
-                .map(|&(src, dst)| if out { (src, dst) } else { (dst, src) })
-                .collect();
-            if tier == MemoryDomain::LocalDisk && !windowed.is_empty() {
-                return Err(Error::Unsupported {
-                    verb: "windowed kv pages to or from disk",
-                    engine: "cuda",
-                });
-            }
-            let shell = self.loaded_mut()?;
-            return match tier {
-                MemoryDomain::LocalDisk => shell.spill_kv(out, pages, slots),
-                _ => shell.swap_kv(out, pages, slots, &windowed),
-            }
-            .map_err(fault);
-        }
         if device.is_none_or(|device| copy.src != device || copy.dst != device) {
             return Err(Error::Unsupported {
                 verb: kv_copy_direction(copy.src, copy.dst),
@@ -1180,8 +1186,21 @@ impl Engine for Cuda {
         }
         let page_size = self.loaded_mut()?.paging().page_size;
         let moves = copy.runs(page_size)?;
+        // Windowed pages a write into a shared one copies first ride the
+        // pre-launch copy beside the kv list's (CONTRACT-BC 19).
+        let windowed: Vec<engine::transfer::KvRun> = copy
+            .windowed
+            .iter()
+            .map(|&(src, dst)| engine::transfer::KvRun {
+                src_page: src,
+                src_token: 0,
+                dst_page: dst,
+                dst_token: 0,
+                tokens: page_size,
+            })
+            .collect();
         self.loaded_mut()?
-            .copy_kv(&moves, !copy.moves.is_empty())
+            .copy_kv_with(&moves, &windowed, !copy.moves.is_empty())
             .map_err(fault)
     }
 }
@@ -1237,6 +1256,84 @@ impl Cuda {
                 ))
             })?;
         }
+        // A lane that names slot refs (`Lane::tables`, `Lane::fixed`) is the
+        // runtime's shared pool speaking: its kv and window list tables are its
+        // kv refs, and its recurrent record is the pairs `fixed` names, a
+        // piece each, copied onto the slots the fire writes where the two
+        // differ.
+        use crate::store::layout::{FIXED, LIST, WINDOW};
+        let by_refs = submission.lanes.iter().any(|lane| {
+            !lane.tables.is_empty() || !lane.fixed.is_empty() || !lane.slot_copies.is_empty()
+        });
+        if by_refs {
+            shell.take_refs();
+        }
+        // Every lane's slot copies land before any lane of the fire reads
+        // or writes: a shared tail slot's rows onto the slot it then writes.
+        for lane in &submission.lanes {
+            for (shape, pairs) in &lane.slot_copies {
+                shell.copy_whole_slots(*shape, pairs).map_err(fault)?;
+            }
+        }
+        // Each lane's record: the one it reads and the one its fire writes.
+        let mut records: Vec<Option<(u32, u32)>> = Vec::with_capacity(submission.lanes.len());
+        let mut forked: Vec<(u32, u32)> = Vec::new();
+        for lane in &submission.lanes {
+            let record = match lane.fixed.as_slice() {
+                [] => None,
+                [(shape, pieces)] if *shape == FIXED => {
+                    let runs: Vec<u32> = pieces.iter().map(|[run, _]| *run).collect();
+                    let written: Vec<u32> = pieces.iter().map(|[_, written]| *written).collect();
+                    let run = shell.name_record(&runs).map_err(fault)?;
+                    let written = shell.name_record(&written).map_err(fault)?;
+                    // The lanes of one working set name one pair: copied once.
+                    if run != written && !forked.contains(&(run, written)) {
+                        shell.fork_state(run, written).map_err(fault)?;
+                        forked.push((run, written));
+                    }
+                    Some((run, written))
+                }
+                _ => {
+                    return Err(Error::Invalid(format!(
+                        "lane in slot {} names fixed shapes this load does not state",
+                        lane.slot
+                    )));
+                }
+            };
+            for snap in lane
+                .rs_snapshots
+                .iter()
+                .filter(|snap| !snap.pieces.is_empty())
+            {
+                let named = shell.name_record(&snap.pieces).map_err(fault)?;
+                if named != snap.slot {
+                    return Err(Error::Invalid(format!(
+                        "lane in slot {} snapshots into the record at slot ref {}, whose \
+                         first piece it names {named}",
+                        lane.slot, snap.slot
+                    )));
+                }
+            }
+            records.push(record);
+        }
+        // The lane's list refs are its table of pages, or, where a program
+        // places its rows, the table that translates the program's pages.
+        fn table(lane: &engine::fire::Lane, shape: engine::chunk::ShapeId) -> Option<&[u32]> {
+            lane.tables
+                .iter()
+                .find(|(id, _)| *id == shape)
+                .map(|(_, refs)| refs.as_slice())
+        }
+        // Each lane's refs of the window lists past the first, a list each.
+        let more_windows: Vec<Vec<&[u32]>> = submission
+            .lanes
+            .iter()
+            .map(|lane| {
+                (1..crate::store::layout::MOST_WINDOWS)
+                    .map_while(|at| table(lane, crate::store::layout::window_id(at)))
+                    .collect()
+            })
+            .collect();
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()
@@ -1249,17 +1346,27 @@ impl Cuda {
                         tokens: &lane.tokens,
                     },
                     positions: &lane.positions,
-                    pages: &lane.kv.pages,
+                    pages: match table(lane, LIST) {
+                        Some(refs) if by_refs && lane.kv.translation.is_empty() => refs,
+                        _ => &lane.kv.pages,
+                    },
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                     kv_less: lane.kv_less,
-                    translation: &lane.kv.translation,
-                    window: &lane.kv.window,
-                    window_copies: &lane.kv.window_copies,
+                    translation: match table(lane, LIST) {
+                        Some(refs) if by_refs && !lane.kv.translation.is_empty() => refs,
+                        _ => &lane.kv.translation,
+                    },
+                    window: match table(lane, WINDOW) {
+                        Some(refs) if by_refs => refs,
+                        _ => &lane.kv.window,
+                    },
+                    more_windows: if by_refs { &more_windows[at] } else { &[] },
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
-                    rs_slot: lane.rs_slot,
+                    rs_slot: records[at].map(|(_, written)| written).or(lane.rs_slot),
+                    rs_read: records[at].map(|(run, _)| run),
                     rs_snapshots: &lane.rs_snapshots,
                     readout: match &lane.readout {
                         Readout::Rows(rows) => Some(rows.as_slice()),

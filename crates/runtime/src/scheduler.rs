@@ -183,17 +183,32 @@ pub(crate) async fn write_host_state(
         .map(drop)
 }
 
+/// The bytes of host tier slots, shape by shape, in order (CONTRACT-BC 22).
+pub(crate) async fn read_tier_slots(
+    engine_id: usize,
+    slots: Vec<(::engine::chunk::ShapeId, Vec<u32>)>,
+) -> Result<Vec<u8>> {
+    scheduler_handle(engine_id)?
+        .host_kv(worker::HostKvOp::ReadTier(slots))
+        .await
+}
+
+pub(crate) async fn write_tier_slots(
+    engine_id: usize,
+    slots: Vec<(::engine::chunk::ShapeId, Vec<u32>)>,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    scheduler_handle(engine_id)?
+        .host_kv(worker::HostKvOp::WriteTier(slots, bytes))
+        .await
+        .map(drop)
+}
+
 pub(crate) async fn write_host_kv(engine_id: usize, slots: Vec<u32>, bytes: Vec<u8>) -> Result<()> {
     scheduler_handle(engine_id)?
         .host_kv(worker::HostKvOp::Write(slots, bytes))
         .await
         .map(drop)
-}
-
-pub(crate) fn narrow(engine_id: usize, on: bool) {
-    if let Ok(scheduler) = scheduler_handle(engine_id) {
-        scheduler.narrow(on);
-    }
 }
 
 pub(crate) async fn pool(engine_id: usize, op: worker::PoolOp) -> Result<()> {
@@ -388,18 +403,23 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     completion: crate::engine::WorkItemCompletion,
     copy_src: Vec<u32>,
     copy_dst: Vec<u32>,
+    windowed: Vec<(u32, u32)>,
     rs_copy: Option<::engine::StateCopy>,
     frame: Option<FrameStamp>,
     lora_program: bool,
 ) -> Result<()> {
-    let prelaunch_copy = (!copy_src.is_empty()).then_some(::engine::KvCopy {
-        src: handle.device_domain(),
-        dst: handle.device_domain(),
-        src_page_ids: copy_src,
-        dst_page_ids: copy_dst,
-        moves: Vec::new(),
-        windowed: Vec::new(),
-    });
+    // The windowed pages a write into a shared window page copies first ride
+    // the kv list's pre-launch copy, on an engine on today's pools
+    // (CONTRACT-BC 19's tail rule); a shared pool states them per lane.
+    let prelaunch_copy =
+        (!copy_src.is_empty() || !windowed.is_empty()).then_some(::engine::KvCopy {
+            src: handle.device_domain(),
+            dst: handle.device_domain(),
+            src_page_ids: copy_src,
+            dst_page_ids: copy_dst,
+            moves: Vec::new(),
+            windowed,
+        });
     handle.submit_prebuilt_tracked_with_copy(
         request,
         instance_id,

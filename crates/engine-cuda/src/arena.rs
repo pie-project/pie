@@ -4,26 +4,108 @@ use poem_compiler::ArenaMap;
 use poem_exec::store::arena::rect;
 use poem_ir::ValueId;
 
-use crate::device::elastic;
 use crate::error::{Fault, Result};
 use crate::run::SlotTable;
 use crate::store::Pools;
 
+/// A fire's activation: the span under the state pool's end
+/// ([`Pools::activation_base`]), backed as far as the load's fires reach.
 #[derive(Debug)]
 pub struct Arena {
-    store: elastic::Arena,
     committed: u64,
     reserved: u64,
+    /// The activation rungs (SPEC decision 6): for fires of at most so many
+    /// tokens (and lanes), the carve laid out for them, smallest first.
+    /// Each lies at the reservation's end, so a rung's fires touch only the
+    /// top of the span and state may take what lies under it.
+    rungs: Vec<(u32, ArenaMap)>,
+    /// For every carve laid at the reservation's end, its bytes and the
+    /// bytes before its `attn.scores` planes ([`Arena::ensure_rungs`]).
+    prefixes: Vec<(u64, u64)>,
 }
 
 impl Arena {
-    /// Reserves `bytes`, the most any arena map this load carves asks for.
-    pub fn reserve(bytes: u64, pools: &Pools) -> Result<Arena> {
-        Ok(Arena {
-            store: pools.reserve_arena(bytes, "activation arena")?,
+    /// `bytes`, the most any arena map this load carves asks for: what the
+    /// pool was reserved its activation chunks for.
+    #[must_use]
+    pub fn reserve(bytes: u64) -> Arena {
+        Arena {
             committed: 0,
             reserved: bytes,
-        })
+            rungs: Vec::new(),
+            prefixes: Vec::new(),
+        }
+    }
+
+    /// With `rungs`, each a carve no larger than the reservation, smallest
+    /// first: a fire carves the smallest that holds it, at the
+    /// reservation's end ([`Arena::fire_slots`]).
+    ///
+    /// `prefixes`: each carve that may be laid at the end, its bytes and
+    /// the bytes before its `attn.scores` planes.
+    #[must_use]
+    pub fn with_rungs(
+        mut self,
+        mut rungs: Vec<(u32, ArenaMap)>,
+        prefixes: Vec<(u64, u64)>,
+    ) -> Arena {
+        rungs.retain(|(_, map)| map.bytes <= self.reserved);
+        rungs.sort_by_key(|&(tokens, _)| tokens);
+        self.rungs = rungs;
+        self.prefixes = prefixes;
+        self
+    }
+
+    /// Whether this load lays carves at the reservation's end.
+    #[must_use]
+    pub fn has_rungs(&self) -> bool {
+        !self.rungs.is_empty()
+    }
+
+    /// Each rung's tokens and the bytes of the span under what a fire of
+    /// it takes at the top (its carve, or `forked`'s where a fire that forks
+    /// is wider) that state may take at that rung: no more than the prefix
+    /// backed from the span's start ([`Arena::ensure`]), so state never
+    /// lands where nothing is backed.
+    #[must_use]
+    pub fn rungs(&self, forked: Option<&ArenaMap>) -> Vec<(u32, u64)> {
+        self.rungs
+            .iter()
+            .map(|(tokens, map)| {
+                let bytes = map.bytes.max(forked.map_or(0, |forked| forked.bytes));
+                (
+                    *tokens,
+                    self.reserved.saturating_sub(bytes).min(self.committed),
+                )
+            })
+            .collect()
+    }
+
+    /// Backs, for every carve laid at the reservation's end, the part a
+    /// fire reads before its scores. Nothing where no rung is stated: every
+    /// carve then lies at the span's start, under [`Arena::ensure`]'s
+    /// prefix. After the fit: a range reserved anew backs again only the
+    /// prefix from the span's start.
+    pub fn ensure_rungs(&self, pools: &mut Pools) -> Result<()> {
+        if self.rungs.is_empty() {
+            return Ok(());
+        }
+        for &(bytes, unscored) in &self.prefixes {
+            let at = self.reserved.saturating_sub(bytes);
+            pools.hold_activation_at(at, unscored.min(bytes), false)?;
+        }
+        Ok(())
+    }
+
+    /// No smaller rung: every fire's arena at the span's start.
+    pub fn drop_rungs(&mut self) {
+        self.rungs.clear();
+    }
+
+    /// The reservation's bytes: the most any carve this load lays asks for.
+    #[must_use]
+    pub fn reserved(&self) -> u64 {
+        self.reserved
     }
 
     /// Backs the whole reservation: the `attn.scores` planes over the prefix
@@ -32,9 +114,7 @@ impl Arena {
         if self.committed >= self.reserved {
             return Ok(());
         }
-        if pools.commit_arena(&mut self.store, self.reserved).is_err() {
-            pools.commit_beside(&mut self.store, self.reserved)?;
-        }
+        pools.hold_activation(self.reserved, true)?;
         self.committed = self.reserved;
         Ok(())
     }
@@ -43,14 +123,9 @@ impl Arena {
         if bytes <= self.committed {
             return Ok(());
         }
-        pools.commit_arena(&mut self.store, bytes)?;
+        pools.hold_activation(bytes, false)?;
         self.committed = bytes;
         Ok(())
-    }
-
-    #[must_use]
-    pub fn base(&self) -> u64 {
-        self.store.base()
     }
 
     #[must_use]
@@ -59,8 +134,39 @@ impl Arena {
     }
 
     #[must_use]
-    pub fn slots(&self, map: &ArenaMap, rows: poem_compiler::FireRows) -> SlotTable {
-        carve(self.base(), map, rows)
+    pub fn slots(&self, pools: &Pools, map: &ArenaMap, rows: poem_compiler::FireRows) -> SlotTable {
+        carve(pools.activation_base(), map, rows)
+    }
+
+    /// A fire's slots: `map` (the arena in order, or the forked one) as
+    /// laid at the span's start, or, where this load states rungs, the
+    /// smallest rung's carve that holds `rows` (a fire that forks keeps its
+    /// own) at the reservation's end. The place each carve takes is fixed,
+    /// so a body recorded at any rung stays good at every rung its fire
+    /// fits.
+    #[must_use]
+    pub fn fire_slots(
+        &self,
+        pools: &Pools,
+        map: &ArenaMap,
+        forked: bool,
+        rows: poem_compiler::FireRows,
+    ) -> SlotTable {
+        if self.rungs.is_empty() {
+            return self.slots(pools, map, rows);
+        }
+        let chosen = if forked {
+            map
+        } else {
+            self.rungs
+                .iter()
+                .find(|(tokens, _)| {
+                    u64::from(*tokens) >= rows.tokens && u64::from(*tokens) >= rows.lanes
+                })
+                .map_or(map, |(_, rung)| rung)
+        };
+        let base = pools.activation_base() + self.reserved.saturating_sub(chosen.bytes);
+        carve(base, chosen, rows)
     }
 
     /// Reads `into.len()` bytes at `at` on `stream` (the shell's own), and
@@ -68,18 +174,31 @@ impl Arena {
     /// stream of the context, a peer rank's on the same device too, and a
     /// peer spinning in its next step's collective waits on this rank's
     /// launch, which queues behind the legacy copy.
-    pub fn read(&self, stream: *mut core::ffi::c_void, at: u64, into: &mut [u8]) -> Result<()> {
-        let base = self.base();
+    pub fn read(
+        &self,
+        pools: &Pools,
+        stream: *mut core::ffi::c_void,
+        at: u64,
+        into: &mut [u8],
+    ) -> Result<()> {
+        let base = pools.activation_base();
         let offset = at.checked_sub(base).ok_or(Fault::Ceiling {
             what: "bytes into the arena",
             need: at,
             have: base,
         })?;
-        if offset.saturating_add(into.len() as u64) > self.committed {
+        // A carve laid at the reservation's end reads out past the prefix
+        // backed from the start, inside what `ensure_rungs` backed for it.
+        let backed = if self.rungs.is_empty() {
+            self.committed
+        } else {
+            self.reserved
+        };
+        if offset.saturating_add(into.len() as u64) > backed {
             return Err(Fault::Ceiling {
                 what: "bytes into the arena's committed prefix",
                 need: offset.saturating_add(into.len() as u64),
-                have: self.committed,
+                have: backed,
             });
         }
         #[cfg(feature = "device")]

@@ -67,6 +67,17 @@ PARAMS = {
     # A ranking a package may leave out: the indexer's own.
     "IndexScore": ("Option<IndexScore>", "{}.unwrap_or_default()"),
 }
+# Parameters naming a row by text in Rust, by op: a package passes the
+# `state(...)` handle the layout holds, never the name.
+ROW_NAMED = {
+    "attn::attend": "kv",
+    "attn::attend_mla": "kv",
+    "attn::score_capture": "kv",
+    "inputs::kv": "name",
+    "inputs::state": "name",
+    "inputs::write_offset": "row",
+    "inputs::write_page": "row",
+}
 # Parameters a package may leave out, by name, and what they then pass.
 DEFAULTED = {"per_head": ("bool", "false"), "prefill_only": ("bool", "false"), "mask": ("bool", "false"), "scores": ("bool", "false"), "whole": ("bool", "false"), "lse": ("bool", "false"), "causal": ("bool", "true")}
 RESULTS = {"Value", "(Value, Value)", "(Value, Option<Value>)", "(Value, Value, Value)", "()", "RaggedMask", "ValueId"}
@@ -75,6 +86,7 @@ RESULTS = {"Value", "(Value, Value)", "(Value, Option<Value>)", "(Value, Value, 
 # results are of types this does not spell, or their packages' spelling keeps
 # an order or a default the op's own signature does not.
 BY_HAND = {
+    "attn::kv_append",
     "conv::conv3d",
     "conv::upsample_nearest",
     "elemwise::norm_gate",
@@ -137,12 +149,18 @@ def entry(module, name, params, call, receiver):
     """The table row binding `call`, a template whose `{passes}` the row's
     unpacked parameters fill, but for a receiver the call names itself."""
     names = ", ".join(f'"{p}"' for p, _ in params)
+    row = ROW_NAMED.get(f"{module}::{name}")
+
     def unpacked(p, t):
+        if p == row:
+            return "StateName"
         if p in DEFAULTED and DEFAULTED[p][0] == t:
             return f"Option<{t}>"
         return PARAMS[t][0]
 
     def passed(p, t):
+        if p == row:
+            return f"&{p}.0"
         if p in DEFAULTED and DEFAULTED[p][0] == t:
             return f"{p}.unwrap_or({DEFAULTED[p][1]})"
         return PARAMS[t][1].format(p)

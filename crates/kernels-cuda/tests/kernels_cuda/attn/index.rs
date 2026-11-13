@@ -7,6 +7,7 @@
 
 use crate::common::attn_ref::{Quant, YARN, attend, col, dot, keyed, landed, offsets};
 use crate::common::attn_ref::{owners, pool, quantized, ten, tuned, turn};
+use crate::common::spread::agrees;
 use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype::{Bf16, I32, U8};
 use kernels_cuda::attn::index::{self, FP4_ROW, QueryTurn};
@@ -105,19 +106,22 @@ fn rank(
         &mut ten(sel_at, rows, top_k, I32),
     );
     let (h, d, kk, yarn) = (heads as u32, DIM as u32, top_k as u32, Some(YARN));
-    if turned {
-        let turn = QueryTurn {
-            positions,
-            dim: 64,
-            theta: 1e4,
-            yarn,
-        };
-        let fired = index::topk_turned(&ctx, qt, weights, &keys, h, d, kk, 4, turn, sel);
-        assert!(fired.expect("the turned ranking fires"), "the scorer turns");
-    } else {
-        let fired = index::topk(&ctx, qt, weights, &keys, h, d, kk, 4, sel);
-        fired.expect("the ranking fires");
-    }
+    let mut fire = |keys: &KvPool| {
+        if turned {
+            let turn = QueryTurn {
+                positions,
+                dim: 64,
+                theta: 1e4,
+                yarn,
+            };
+            let fired = index::topk_turned(&ctx, qt, weights, keys, h, d, kk, 4, turn, sel);
+            assert!(fired.expect("the turned ranking fires"), "the scorer turns");
+        } else {
+            let fired = index::topk(&ctx, qt, weights, keys, h, d, kk, 4, sel);
+            fired.expect("the ranking fires");
+        }
+    };
+    fire(&keys);
     gpu.sync();
     let (got, mut differ): (Vec<i32>, usize) = (gpu.down(sel_at, rows * top_k), 0);
     for (t, &(r, p)) in owner.iter().enumerate() {
@@ -139,6 +143,12 @@ fn rank(
     // The tcgen05 scorer's sums tie to f32 rounding now and then.
     let what = format!("{heads} heads, fp4 {fp4}, turned {turned}");
     assert!(differ * 2000 <= rows * top_k, "{what}: {differ} picks off");
+    // The same ranking over the keys' pages spread apart, byte for byte.
+    let what = format!("{what}, page {page}");
+    let outs = [(sel_at, rows * top_k * 4)];
+    agrees(&mut gpu, &what, &[keys], &[], &outs, |_, pools, _| {
+        fire(&pools[0])
+    });
 }
 
 #[test]
@@ -262,13 +272,30 @@ fn the_block_max_ranking_answers_the_reference() {
     };
     let sel = &mut ten(sel_at, rows, ih * top_k, I32);
     let (ih32, k32, b32) = (ih as u32, top_k as u32, block as u32);
-    let fired = index::topk_block_max(&gpu.ctx(), iq_t, &ikeys, ih32, 128, k32, b32, sel);
-    fired.expect("the ranking fires");
+    let ctx = gpu.ctx();
+    let mut fire = |keys: &KvPool| {
+        let fired = index::topk_block_max(&ctx, iq_t, keys, ih32, 128, k32, b32, sel);
+        fired.expect("the ranking fires");
+    };
+    fire(&ikeys);
     gpu.sync();
     assert!(
         gpu.down::<i32>(sel_at, rows * ih * top_k) == want,
         "the ranking"
     );
+    // The same ranking over the keys' pages spread apart, byte for byte.
+    let outs = [(sel_at, rows * ih * top_k * 4)];
+    agrees(
+        &mut gpu,
+        "block max ranking",
+        &[ikeys],
+        &[],
+        &outs,
+        |_, pools, _| fire(&pools[0]),
+    );
+    // The selection the attention below reads, landed again off the packed keys.
+    fire(&ikeys);
+    gpu.sync();
     let scale = 1.0 / (hd as f32).sqrt();
     let (want_o, _) = attend([&q, &k, &v], [qh, kvh, hd, hd], scale, None, |t, h| {
         let (run, (r, p)) = (&want[(t * kvh + h / 2) * top_k..][..top_k], owner[t]);

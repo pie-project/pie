@@ -4,7 +4,7 @@ use kernels_cuda::attn::plan::{
     DecodePlan, Device, Live, MlaPlan, PrefillPlan, Shape, Toggles, Workspace,
 };
 use kernels_cuda::linear::lora::Segments;
-use kernels_cuda::linear::moe::{ExpertTable, GroupSeat};
+use kernels_cuda::linear::moe::ExpertTable;
 use kernels_cuda::{Ctx, KvPool, Pad, RaggedTensor, RecurrentPool, Tensor};
 use poem_exec::fire::MaskSpan;
 use poem_ir::{Def, Dim, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
@@ -21,7 +21,6 @@ pub enum WeightRow {
         codes: Tensor,
         scales: Tensor,
         biases: Option<Tensor>,
-        seat: GroupSeat,
         repacked: bool,
         /// The scales lie in the tcgen05 GEMM's atoms, laid there at load
         /// for a low-precision product, not row-major.
@@ -29,12 +28,6 @@ pub enum WeightRow {
         /// An mxfp4 bank in the matrix core's lane order (ROCm:
         /// `linear::moe::mxfp4_lanes`), which only routed selects read.
         lanes: bool,
-    },
-
-    Streamed {
-        slab: Tensor,
-        table: u64,
-        counts: u64,
     },
 
     /// A resident plane in the matrix core's order, which only the products
@@ -66,7 +59,11 @@ pub struct SlotTable(pub Vec<Option<Tensor>>);
 
 #[derive(Clone, Copy, Debug)]
 pub enum CachePool {
-    Kv { space: u32, pool: KvPool },
+    /// `table`: the fire's page table the row's pages are named in.
+    Kv {
+        table: u32,
+        pool: KvPool,
+    },
     Recurrent(RecurrentPool),
 }
 
@@ -132,6 +129,8 @@ pub struct PoolSlabs {
     pub state_score: Tensor,
 
     pub ape: Tensor,
+    /// The state's elements from one page's rows to the next page's.
+    pub stride: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -139,11 +138,19 @@ pub struct FireTables {
     pub mask_indptr: Option<Tensor>,
 
     pub pool_state: Vec<(u32, PoolSlabs)>,
+
+    /// The row table of each table streamed by its rows, by its param.
+    pub row_tables: Vec<(u32, kernels_cuda::linear::moe::RowTable)>,
+
+    /// The expert table of each bank streamed by its experts, by its param.
+    pub expert_tables: Vec<(u32, ExpertTable)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RsMove<'a> {
     None,
+    /// The lane's rows land in its rs buffer pages `pages`, from token `at`
+    /// of them.
     Scatter {
         pages: &'a [u32],
         at: u32,
@@ -155,161 +162,140 @@ pub(crate) fn replayed(reads: &[std::ops::Range<u32>]) -> u32 {
     reads.iter().map(|span| span.end - span.start).sum()
 }
 
+/// The extended runs' scratch of a fire: a region a window, laid as the
+/// window first asks and reused by every layer after. The windows of a
+/// fire may run on side streams of one another, so no two share bytes.
 #[derive(Debug)]
 pub struct RsScratch {
     ptr: u64,
     bytes: u64,
-    cursor: Cell<u64>,
-    csr: Cell<Option<(u32, Tensor)>>,
-    ext: std::cell::RefCell<std::collections::HashMap<u32, Tensor>>,
+    ext_row_bytes: u64,
+    next: Cell<u64>,
+    /// Each window's region (by its first lane): base, bytes, and how much
+    /// of it this layer has taken.
+    regions: std::cell::RefCell<std::collections::HashMap<u32, (u64, u64, u64)>>,
+    layouts: std::cell::RefCell<std::collections::HashMap<u32, RsLayout>>,
+    ext: std::cell::RefCell<std::collections::HashMap<(u32, u32), Tensor>>,
+}
+
+/// A window's extended rows, as `channel.rs_ext_csr` lays them on the
+/// device: lane r's replayed rows then its own from `csr[r]`, and the live
+/// words the recurrent kernels read them by. Each extended op lays its own
+/// on the stream it launches on ([`Run::rs_begin`]): the ops of a layer may
+/// run on side streams of one another, and a layout one laid would be read
+/// by another before the fork joins. `rows` is the window's ceiling of
+/// them: its own rows twice, and at least [`crate::store::rs::REPLAYED`]
+/// replayed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RsLayout {
+    csr: Tensor,
+    ext_win: u64,
+    rows: u32,
+    /// Whether a launch of the op has laid it on the device yet: its first
+    /// gather does (`channel.rs_ext_gather`), else `channel.rs_ext_csr`.
+    laid: bool,
 }
 
 impl RsScratch {
-    const CSR_HEADROOM: u64 = 256;
-
     #[must_use]
-    pub fn new(ptr: u64, bytes: u64) -> Self {
+    pub fn new(ptr: u64, bytes: u64, ext_row_bytes: u64) -> Self {
         Self {
             ptr,
             bytes,
-            cursor: Cell::new(Self::CSR_HEADROOM.min(bytes)),
-            csr: Cell::new(None),
+            ext_row_bytes,
+            next: Cell::new(0),
+            regions: std::cell::RefCell::new(std::collections::HashMap::new()),
+            layouts: std::cell::RefCell::new(std::collections::HashMap::new()),
             ext: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
+    /// The bytes the extended runs of a fire reaching `rows_ext` rows (its
+    /// windows' ceilings together) take.
     #[must_use]
     pub fn need(rows_ext: u32, ext_row_bytes: u64) -> u64 {
         u64::from(rows_ext.max(1) + 64) * ext_row_bytes + 4 * 1024 * 1024
     }
 
-    fn take(&self, bytes: u64) -> crate::error::Result<u64> {
-        let at = self.cursor.get();
-        let end = at + bytes.max(4).next_multiple_of(256);
-        if end > self.bytes {
+    /// Lays window `lane0`'s region for a layer of `rows` extended rows
+    /// over `lanes` lanes, where it has none.
+    fn region(&self, lane0: u32, rows: u32, lanes: u32) -> crate::error::Result<()> {
+        if self.regions.borrow().contains_key(&lane0) {
+            return Ok(());
+        }
+        let layouts = 4 * (16 + u64::from(lanes + 1) * 4).next_multiple_of(256);
+        let bytes = u64::from(rows) * self.ext_row_bytes + layouts + 32 * 256;
+        let base = self.next.get();
+        if base + bytes > self.bytes {
             return Err(crate::error::Fault::Ceiling {
                 what: "recurrent extended-run scratch bytes",
-                need: end,
+                need: base + bytes,
                 have: self.bytes,
             });
         }
-        self.cursor.set(end);
-        Ok(self.ptr + at)
+        self.next.set(base + bytes);
+        self.regions.borrow_mut().insert(lane0, (base, bytes, 0));
+        Ok(())
+    }
+
+    fn take(&self, lane0: u32, bytes: u64) -> crate::error::Result<u64> {
+        let mut regions = self.regions.borrow_mut();
+        let Some((base, held, cursor)) = regions.get_mut(&lane0) else {
+            return Err(crate::error::Fault::Unbound {
+                what: format!("the extended-run scratch region of the window from lane {lane0}"),
+            });
+        };
+        let end = *cursor + bytes.max(4).next_multiple_of(256);
+        if end > *held {
+            return Err(crate::error::Fault::Ceiling {
+                what: "recurrent extended-run scratch bytes of a window",
+                need: end,
+                have: *held,
+            });
+        }
+        let at = self.ptr + *base + *cursor;
+        *cursor = end;
+        Ok(at)
+    }
+
+    /// Window `lane0`'s layer is done: the next one takes its region anew.
+    fn layer_done(&self, lane0: u32) {
+        if let Some((_, _, cursor)) = self.regions.borrow_mut().get_mut(&lane0) {
+            *cursor = 0;
+        }
+        self.layouts.borrow_mut().remove(&lane0);
+        self.ext.borrow_mut().retain(|(_, lane), _| *lane != lane0);
     }
 
     fn reset(&self) {
-        self.cursor.set(Self::CSR_HEADROOM.min(self.bytes));
+        self.next.set(0);
+        self.regions.borrow_mut().clear();
+        self.layouts.borrow_mut().clear();
         self.ext.borrow_mut().clear();
     }
 }
 
+/// A buffering fire's recurrent rows: the staged tables its kernels address
+/// them through, whether its recurrences run extended (a lane of it
+/// replays buffered rows), and each lane's replayed rows (an unbodied fire
+/// sizes its extended rows by them).
 #[derive(Debug, Clone, Copy)]
 pub struct RsSeat<'a> {
     pub buffers: &'a crate::store::rs::Buffers,
-    pub lanes: &'a [RsMove<'a>],
-    pub reads: &'a [Vec<std::ops::Range<u32>>],
+    pub tables: kernels_cuda::runtime::channel::RsTables,
+    pub extended: bool,
+    pub replays: &'a [u32],
     pub scratch: Option<&'a RsScratch>,
 }
 
-impl RsSeat<'_> {
-    fn scatter(
-        &self,
-        stream: *mut core::ffi::c_void,
-        plane: crate::store::rs::Plane,
-        lane_offset: u32,
-        bounds: &[i32],
-        rows: Tensor,
-    ) -> crate::error::Result<()> {
-        let page_tokens = self.buffers.page_tokens();
-        let elem = poem_compiler::arena::elem_bytes(crate::store::rs::PLANE_DTYPE)
-            .expect("the buffered planes are bf16, which has an element size");
-        if u64::from(rows.width) != plane.width {
-            return Err(crate::error::Fault::Unbound {
-                what: format!(
-                    "a buffered plane reserved at {} elements a token is bound {} wide this \
-                     fire",
-                    plane.width, rows.width
-                ),
-            });
-        }
-        for (at, pair) in bounds.windows(2).enumerate() {
-            let Some(&RsMove::Scatter {
-                pages, at: from, ..
-            }) = self.lanes.get(lane_offset as usize + at)
-            else {
-                continue;
-            };
-            let count = (pair[1] - pair[0]) as u32;
-            if count == 0 {
-                continue;
-            }
-            let capacity = pages.len() as u64 * u64::from(page_tokens);
-            if u64::from(from) + u64::from(count) > capacity {
-                return Err(crate::error::Fault::Ceiling {
-                    what: "rs buffer tokens",
-                    need: u64::from(from) + u64::from(count),
-                    have: capacity,
-                });
-            }
-            let mut done = 0u32;
-            while done < count {
-                let token = from + done;
-                let page = token / page_tokens;
-                let in_page = token % page_tokens;
-                let take = (page_tokens - in_page).min(count - done);
-                let page_slot = *pages
-                    .get(page as usize)
-                    .ok_or(crate::error::Fault::Ceiling {
-                        what: "rs buffer pages",
-                        need: u64::from(page) + 1,
-                        have: pages.len() as u64,
-                    })?;
-                let slab = self.buffers.row(plane, page_slot, in_page)?;
-                let rows_at =
-                    rows.ptr + (u64::from(pair[0] as u32) + u64::from(done)) * plane.width * elem;
-                let bytes =
-                    usize::try_from(u64::from(take) * plane.width * elem).unwrap_or(usize::MAX);
-                crate::device::copy_d2d(stream, slab, rows_at, bytes)?;
-                done += take;
-            }
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn push_page_runs(
-        &self,
-        plane: crate::store::rs::Plane,
-        pages: &[u32],
-        from: u32,
-        count: u32,
-        dst_word_base: u32,
-        row_words: u32,
-        runs: &mut Vec<kernels_cuda::runtime::channel::WordRun>,
-    ) -> crate::error::Result<()> {
-        let page_tokens = self.buffers.page_tokens();
-        let mut done = 0u32;
-        while done < count {
-            let token = from + done;
-            let page = token / page_tokens;
-            let in_page = token % page_tokens;
-            let take = (page_tokens - in_page).min(count - done);
-            let page_slot = *pages
-                .get(page as usize)
-                .ok_or(crate::error::Fault::Ceiling {
-                    what: "rs buffer pages",
-                    need: u64::from(page) + 1,
-                    have: pages.len() as u64,
-                })?;
-            let slab = self.buffers.row(plane, page_slot, in_page)?;
-            runs.push(kernels_cuda::runtime::channel::WordRun {
-                src: slab,
-                dst_word: dst_word_base + done * row_words,
-                words: take * row_words,
-            });
-            done += take;
-        }
-        Ok(())
+/// A recurrent pool as a one-token arm reads it: a lane of one row folds it
+/// or not (the predicate), never part of it, so the arm takes no commit
+/// length or segment origin a buffering fire's other lanes carry.
+pub(crate) fn one_token(pool: RecurrentPool) -> RecurrentPool {
+    RecurrentPool {
+        commit_len: Tensor::ABSENT,
+        begin_at: Tensor::ABSENT,
+        ..pool
     }
 }
 
@@ -344,7 +330,13 @@ pub struct FireBindings {
     pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
     pub inputs: Vec<InputBinding>,
 
+    /// The fire's page tables, one a kv shape.
     pub geometry: Vec<CacheGeometry>,
+    /// The page table the kv rows retained through each window read, by
+    /// the window's tokens: its window list's. A window not named here is
+    /// paged in full, in the kv list's (the first, which the All axis
+    /// reads).
+    pub window_tables: Vec<(u32, u32)>,
 
     pub schedules: Vec<Option<ScheduleSeat>>,
     pub plan_values: usize,
@@ -906,6 +898,74 @@ impl<'c> Run<'c> {
         self
     }
 
+    fn rs_fault(op: &'static str, fault: crate::error::Fault) -> kernels_cuda::Error {
+        kernels_cuda::Error::Backend {
+            op,
+            detail: fault.to_string(),
+        }
+    }
+
+    /// The rs tables as this window's kernels index them: whole under an
+    /// armed window (its live words carry its first lane), from the
+    /// window's first lane otherwise.
+    fn rs_tables(&self, seat: &RsSeat<'_>) -> kernels_cuda::runtime::channel::RsTables {
+        let mut tables = seat.tables;
+        if self.live_at() == 0 {
+            tables.lanes += u64::from(self.window().span().lane_offset)
+                * size_of::<kernels_cuda::runtime::channel::RsLane>() as u64;
+        }
+        tables
+    }
+
+    /// The window's qo boundaries as its recurrent kernels read them: to
+    /// the carved lanes under a body.
+    fn rs_indptr(&self) -> (Tensor, u32) {
+        let indptr = self.qo_indptr();
+        let indptr = match self.carve_lanes() {
+            Some(lanes) if lanes + 1 > indptr.rows => {
+                Tensor::new(indptr.ptr, lanes + 1, indptr.width, indptr.dtype)
+            }
+            _ => indptr,
+        };
+        (indptr, indptr.rows.saturating_sub(1))
+    }
+
+    /// A row of `rows` in bytes, checked against the buffered plane it lands
+    /// in.
+    fn rs_row_bytes(
+        op: &'static str,
+        rows: Tensor,
+        plane: Option<crate::store::rs::Plane>,
+    ) -> Result<u32, kernels_cuda::Error> {
+        if let Some(plane) = plane
+            && plane.width != u64::from(rows.width)
+        {
+            return Err(kernels_cuda::Error::Backend {
+                op,
+                detail: format!(
+                    "a buffered plane reserved at {} elements a token is bound {} wide this fire",
+                    plane.width, rows.width
+                ),
+            });
+        }
+        let elem = poem_compiler::arena::elem_bytes(rows.dtype).ok_or_else(|| {
+            kernels_cuda::Error::Backend {
+                op,
+                detail: format!("{:?} has no element size", rows.dtype),
+            }
+        })?;
+        let bytes = u64::from(rows.width) * elem;
+        u32::try_from(bytes)
+            .ok()
+            .filter(|bytes| bytes % 2 == 0)
+            .ok_or_else(|| kernels_cuda::Error::Backend {
+                op,
+                detail: format!("a recurrent row of {bytes} bytes the rs copies cannot move"),
+            })
+    }
+
+    /// Lands this window's rows of value `id` (`rows`) at its lanes' rs
+    /// buffer tokens, where it is a buffered plane.
     pub(crate) fn rs_move(
         &self,
         op: &'static str,
@@ -918,71 +978,31 @@ impl<'c> Run<'c> {
         let Some(plane) = seat.buffers.planes().of(id) else {
             return Ok(());
         };
-        let span = self.window().span();
-        let bounds = self.qo_indptr_host();
-        let rows = self.windowed(rows);
-        seat.scatter(self.ctx.stream(), plane, span.lane_offset, bounds, rows)
-            .map_err(|fault| kernels_cuda::Error::Backend {
-                op,
-                detail: fault.to_string(),
-            })
+        let place = seat
+            .buffers
+            .place(plane)
+            .map_err(|fault| Self::rs_fault(op, fault))?;
+        let row_bytes = Self::rs_row_bytes(op, rows, Some(plane))?;
+        let (indptr, lanes) = self.rs_indptr();
+        let tables = self.rs_tables(seat);
+        kernels_cuda::runtime::channel::rs_scatter(
+            self.ctx(),
+            rows.ptr,
+            row_bytes,
+            indptr.ptr,
+            lanes,
+            tables,
+            place,
+        )
     }
 
+    /// Whether the fire's recurrences run over extended rows: a lane of it
+    /// replays buffered rows. One answer a fire, so a body keyed by it
+    /// replays the kernels it recorded.
     pub(crate) fn rs_extended(&self) -> bool {
-        let Some(seat) = self.rs.as_ref() else {
-            return false;
-        };
-        if seat.scratch.is_none() {
-            return false;
-        }
-        let lane0 = self.window().span().lane_offset as usize;
-        let lanes = self.qo_indptr_host().len().saturating_sub(1);
-        seat.reads
-            .iter()
-            .skip(lane0)
-            .take(lanes)
-            .any(|reads| !reads.is_empty())
-    }
-
-    /// Whether every lane of this window folds its rows whole: none of them
-    /// buffers, so a commit length the fire carries for another class's
-    /// lanes says nothing about these, and a one-token arm (which has no
-    /// seat for one) can run them.
-    fn rs_window_folds_whole(&self) -> bool {
-        let Some(seat) = self.rs.as_ref() else {
-            return false;
-        };
-        let lane0 = self.window().span().lane_offset as usize;
-        let lanes = self.qo_indptr_host().len().saturating_sub(1);
-        seat.lanes
-            .iter()
-            .skip(lane0)
-            .take(lanes)
-            .all(|lane| *lane == RsMove::None)
-    }
-
-    fn rs_ext_layout(&self, seat: &RsSeat<'_>) -> (Vec<(u32, u32, u32)>, Vec<i32>) {
-        let lane0 = self.window().span().lane_offset as usize;
-        let bounds = self.qo_indptr_host();
-        let mut lanes = Vec::with_capacity(bounds.len().saturating_sub(1));
-        let mut csr = Vec::with_capacity(bounds.len());
-        let mut begin = 0u32;
-        csr.push(0i32);
-        for (r, pair) in bounds.windows(2).enumerate() {
-            let rows = (pair[1] - pair[0]).max(0) as u32;
-            let replay = seat.reads.get(lane0 + r).map_or(0, |reads| replayed(reads));
-            lanes.push((begin, replay, rows));
-            begin += replay + rows;
-            csr.push(i32::try_from(begin).unwrap_or(i32::MAX));
-        }
-        (lanes, csr)
-    }
-
-    fn rs_fault(op: &'static str, fault: crate::error::Fault) -> kernels_cuda::Error {
-        kernels_cuda::Error::Backend {
-            op,
-            detail: fault.to_string(),
-        }
+        self.rs
+            .as_ref()
+            .is_some_and(|seat| seat.extended && seat.scratch.is_some())
     }
 
     fn rs_seat_and_scratch(
@@ -1004,34 +1024,98 @@ impl<'c> Run<'c> {
         Ok((seat, scratch))
     }
 
-    pub(crate) fn rs_ext_csr(&self, op: &'static str) -> Result<Tensor, kernels_cuda::Error> {
+    /// This window's extended layout, laid on the device by the extended op
+    /// that first asks and read by the rest of it.
+    fn rs_layout(&self, op: &'static str) -> Result<RsLayout, kernels_cuda::Error> {
         let (seat, scratch) = self.rs_seat_and_scratch(op)?;
-        let lane0 = self.window().span().lane_offset;
-        if let Some((cached_lane0, tensor)) = scratch.csr.get()
-            && cached_lane0 == lane0
-        {
-            return Ok(tensor);
+        let span = self.window().span();
+        if let Some(layout) = scratch.layouts.borrow().get(&span.lane_offset) {
+            return Ok(*layout);
         }
-        let (_, csr) = self.rs_ext_layout(seat);
-        let bytes: Vec<u8> = csr.iter().flat_map(|n| n.to_le_bytes()).collect();
-        let can_cache = (bytes.len() as u64) <= RsScratch::CSR_HEADROOM
-            && scratch.bytes >= RsScratch::CSR_HEADROOM;
-        let at = if can_cache {
-            scratch.ptr
-        } else {
-            scratch
-                .take(bytes.len() as u64)
-                .map_err(|f| Self::rs_fault(op, f))?
+        let (_, lanes) = self.rs_indptr();
+        // A bodied fire replays no more rows in a window than the window's
+        // own or `REPLAYED` (`serve::prepare`), so the ceiling is the key's.
+        let replayed: u32 = seat
+            .replays
+            .iter()
+            .skip(span.lane_offset as usize)
+            .take(span.lanes as usize)
+            .sum();
+        let own = self.carve_rows().unwrap_or(span.rows);
+        let rows = own + own.max(crate::store::rs::REPLAYED).max(replayed);
+        scratch
+            .region(span.lane_offset, rows, lanes)
+            .map_err(|fault| Self::rs_fault(op, fault))?;
+        let at = scratch
+            .take(span.lane_offset, 16 + u64::from(lanes + 1) * 4)
+            .map_err(|fault| Self::rs_fault(op, fault))?;
+        let layout = RsLayout {
+            csr: Tensor::new(at + 16, lanes + 1, 1, poem_ir::Dtype::I32),
+            ext_win: at,
+            rows,
+            laid: false,
         };
-        crate::device::stage_raw(self.ctx.stream(), at, &bytes)
-            .map_err(|f| Self::rs_fault(op, f))?;
-        let tensor = Tensor::new(at, csr.len() as u32, 1, poem_ir::Dtype::I32);
-        if can_cache {
-            scratch.csr.set(Some((lane0, tensor)));
-        }
-        Ok(tensor)
+        scratch
+            .layouts
+            .borrow_mut()
+            .insert(span.lane_offset, layout);
+        Ok(layout)
     }
 
+    /// The window's layout, laid on the device: by `channel.rs_ext_csr` where
+    /// no gather of the op has laid it.
+    fn rs_laid(&self, op: &'static str) -> Result<RsLayout, kernels_cuda::Error> {
+        let layout = self.rs_layout(op)?;
+        if layout.laid {
+            return Ok(layout);
+        }
+        let (seat, scratch) = self.rs_seat_and_scratch(op)?;
+        let (indptr, lanes) = self.rs_indptr();
+        let tables = self.rs_tables(seat);
+        kernels_cuda::runtime::channel::rs_ext_csr(
+            self.ctx(),
+            indptr.ptr,
+            lanes,
+            lanes,
+            tables.lanes,
+            layout.csr.ptr,
+            layout.ext_win,
+        )?;
+        self.rs_mark_laid(scratch);
+        Ok(RsLayout {
+            laid: true,
+            ..layout
+        })
+    }
+
+    fn rs_mark_laid(&self, scratch: &RsScratch) {
+        if let Some(layout) = scratch
+            .layouts
+            .borrow_mut()
+            .get_mut(&self.window().span().lane_offset)
+        {
+            layout.laid = true;
+        }
+    }
+
+    /// The extended rows' boundaries: what an extended op reads its lanes by.
+    pub(crate) fn rs_ext_csr(&self, op: &'static str) -> Result<Tensor, kernels_cuda::Error> {
+        Ok(self.rs_laid(op)?.csr)
+    }
+
+    /// The stream context an extended op launches on: armed with the
+    /// extended rows' live words where the window is armed.
+    pub(crate) fn rs_ext_ctx(&self, op: &'static str) -> Result<&'c Ctx, kernels_cuda::Error> {
+        let layout = self.rs_laid(op)?;
+        let ctx = self.ctx();
+        if self.live_at() != 0 {
+            ctx.arm_stage(layout.ext_win);
+        }
+        Ok(ctx)
+    }
+
+    /// Value `id`'s extended rows: each lane's replayed buffer rows (when
+    /// `buffered`) ahead of its own, which land in its buffer first.
     pub(crate) fn rs_extend(
         &self,
         op: &'static str,
@@ -1040,8 +1124,6 @@ impl<'c> Run<'c> {
     ) -> Result<Tensor, kernels_cuda::Error> {
         let (seat, scratch) = self.rs_seat_and_scratch(op)?;
         let own = self.tensor(id);
-        self.rs_move(op, id, own)?;
-        let own = self.windowed(own);
         let plane = seat.buffers.planes().of(id);
         if buffered && plane.is_none() {
             return Err(kernels_cuda::Error::Backend {
@@ -1053,98 +1135,46 @@ impl<'c> Run<'c> {
                 ),
             });
         }
-        let (lanes, csr) = self.rs_ext_layout(seat);
-        let rows_ext = u32::try_from(csr.last().copied().unwrap_or(0)).unwrap_or(0);
-        let elem = poem_compiler::arena::elem_bytes(own.dtype).ok_or_else(|| {
-            kernels_cuda::Error::Backend {
-                op,
-                detail: format!("{:?} has no element size", own.dtype),
-            }
-        })?;
-        let row_bytes = u64::from(own.width) * elem;
+        let layout = self.rs_layout(op)?;
+        let row_bytes = Self::rs_row_bytes(op, own, plane)?;
         let at = scratch
-            .take(u64::from(rows_ext) * row_bytes)
-            .map_err(|f| Self::rs_fault(op, f))?;
-        let ext = Tensor::new(at, rows_ext, own.width, own.dtype);
-        let lane0 = self.window().span().lane_offset as usize;
-        let bounds = self.qo_indptr_host();
-        let stream = self.ctx.stream();
-        let row_words = u32::try_from(row_bytes / 4).unwrap_or(0);
-        let mut runs: Vec<kernels_cuda::runtime::channel::WordRun> = Vec::new();
-        for (r, &(begin, replay, rows)) in lanes.iter().enumerate() {
-            if replay > 0
-                && let Some(plane) = plane
-                && let Some(RsMove::Scatter { pages, .. }) = seat.lanes.get(lane0 + r)
-            {
-                if plane.width != u64::from(own.width) {
-                    return Err(kernels_cuda::Error::Backend {
-                        op,
-                        detail: format!(
-                            "a buffered plane reserved at {} elements a token is bound {} wide this fire",
-                            plane.width, own.width
-                        ),
-                    });
-                }
-                let mut done = 0u32;
-                for span in seat.reads.get(lane0 + r).map_or(&[][..], Vec::as_slice) {
-                    let count = span.end - span.start;
-                    seat.push_page_runs(
-                        plane,
-                        pages,
-                        span.start,
-                        count,
-                        (begin + done) * row_words,
-                        row_words,
-                        &mut runs,
-                    )
-                    .map_err(|f| Self::rs_fault(op, f))?;
-                    done += count;
-                }
-            }
-            if rows > 0 {
-                let src = own.ptr + u64::from(bounds[r].max(0) as u32) * row_bytes;
-                runs.push(kernels_cuda::runtime::channel::WordRun {
-                    src,
-                    dst_word: (begin + replay) * row_words,
-                    words: rows * row_words,
-                });
-            }
-        }
-        if runs.len() <= 4 || row_bytes % 4 != 0 {
-            for run in &runs {
-                crate::device::copy_d2d(
-                    stream,
-                    at + u64::from(run.dst_word) * 4,
-                    run.src,
-                    run.words as usize * 4,
-                )
-                .map_err(|f| Self::rs_fault(op, f))?;
-            }
-        } else {
-            let mut raw = Vec::with_capacity(runs.len() * 16);
-            for run in &runs {
-                raw.extend_from_slice(&run.src.to_ne_bytes());
-                raw.extend_from_slice(&run.dst_word.to_ne_bytes());
-                raw.extend_from_slice(&run.words.to_ne_bytes());
-            }
-            let runs_at = scratch
-                .take(raw.len() as u64)
-                .map_err(|f| Self::rs_fault(op, f))?;
-            crate::device::stage_raw(stream, runs_at, &raw).map_err(|f| Self::rs_fault(op, f))?;
-            kernels_cuda::runtime::channel::gather_words(self.ctx, runs_at, at, runs.len() as u32)?;
-        }
+            .take(
+                self.window().span().lane_offset,
+                u64::from(layout.rows) * u64::from(row_bytes),
+            )
+            .map_err(|fault| Self::rs_fault(op, fault))?;
+        let ext = Tensor::new(at, layout.rows, own.width, own.dtype);
+        let place = plane
+            .map(|plane| seat.buffers.place(plane))
+            .transpose()
+            .map_err(|fault| Self::rs_fault(op, fault))?;
+        let (indptr, lanes) = self.rs_indptr();
+        let tables = self.rs_tables(seat);
+        kernels_cuda::runtime::channel::rs_ext_gather(
+            self.ctx(),
+            own.ptr,
+            ext.ptr,
+            row_bytes,
+            indptr.ptr,
+            (!layout.laid).then_some((layout.csr.ptr, layout.ext_win)),
+            lanes,
+            tables,
+            place,
+        )?;
+        self.rs_mark_laid(scratch);
         Ok(ext)
     }
 
+    /// Room for value `id`'s extended rows, an extended op's output, which a
+    /// later op of the layer reads ([`Run::rs_ext_of`]).
     pub(crate) fn rs_out(
         &self,
         op: &'static str,
         id: ValueId,
     ) -> Result<Tensor, kernels_cuda::Error> {
-        let (seat, scratch) = self.rs_seat_and_scratch(op)?;
-        let own = self.windowed(self.tensor(id));
-        let (_, csr) = self.rs_ext_layout(seat);
-        let rows_ext = u32::try_from(csr.last().copied().unwrap_or(0)).unwrap_or(0);
+        let (_, scratch) = self.rs_seat_and_scratch(op)?;
+        let own = self.tensor(id);
+        let layout = self.rs_layout(op)?;
         let elem = poem_compiler::arena::elem_bytes(own.dtype).ok_or_else(|| {
             kernels_cuda::Error::Backend {
                 op,
@@ -1152,10 +1182,14 @@ impl<'c> Run<'c> {
             }
         })?;
         let at = scratch
-            .take(u64::from(rows_ext) * u64::from(own.width) * elem)
-            .map_err(|f| Self::rs_fault(op, f))?;
-        let ext = Tensor::new(at, rows_ext, own.width, own.dtype);
-        scratch.ext.borrow_mut().insert(id.0, ext);
+            .take(
+                self.window().span().lane_offset,
+                u64::from(layout.rows) * u64::from(own.width) * elem,
+            )
+            .map_err(|fault| Self::rs_fault(op, fault))?;
+        let ext = Tensor::new(at, layout.rows, own.width, own.dtype);
+        let lane0 = self.window().span().lane_offset;
+        scratch.ext.borrow_mut().insert((id.0, lane0), ext);
         Ok(ext)
     }
 
@@ -1165,10 +1199,11 @@ impl<'c> Run<'c> {
         id: ValueId,
     ) -> Result<Tensor, kernels_cuda::Error> {
         let (_, scratch) = self.rs_seat_and_scratch(op)?;
+        let lane0 = self.window().span().lane_offset;
         scratch
             .ext
             .borrow()
-            .get(&id.0)
+            .get(&(id.0, lane0))
             .copied()
             .ok_or_else(|| kernels_cuda::Error::Backend {
                 op,
@@ -1179,6 +1214,7 @@ impl<'c> Run<'c> {
             })
     }
 
+    /// Each lane's own rows of the extended `ext` back onto value `id`.
     pub(crate) fn rs_land(
         &self,
         op: &'static str,
@@ -1186,37 +1222,45 @@ impl<'c> Run<'c> {
         id: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         let (seat, _) = self.rs_seat_and_scratch(op)?;
-        let target = self.windowed(self.tensor(id));
-        let elem = poem_compiler::arena::elem_bytes(ext.dtype).ok_or_else(|| {
-            kernels_cuda::Error::Backend {
-                op,
-                detail: format!("{:?} has no element size", ext.dtype),
-            }
-        })?;
-        let row_bytes = u64::from(ext.width) * elem;
-        let (lanes, _) = self.rs_ext_layout(seat);
-        let bounds = self.qo_indptr_host();
-        let stream = self.ctx.stream();
-        for (r, &(begin, replay, rows)) in lanes.iter().enumerate() {
-            if rows == 0 {
-                continue;
-            }
-            let src = ext.ptr + u64::from(begin + replay) * row_bytes;
-            let dst = target.ptr + u64::from(bounds[r].max(0) as u32) * row_bytes;
-            crate::device::copy_d2d(
-                stream,
-                dst,
-                src,
-                usize::try_from(u64::from(rows) * row_bytes).unwrap_or(usize::MAX),
-            )
-            .map_err(|f| Self::rs_fault(op, f))?;
+        let target = self.tensor(id);
+        let row_bytes = Self::rs_row_bytes(op, ext, None)?;
+        let layout = self.rs_laid(op)?;
+        let (indptr, lanes) = self.rs_indptr();
+        let tables = self.rs_tables(seat);
+        kernels_cuda::runtime::channel::rs_ext_land(
+            self.ctx(),
+            ext.ptr,
+            target.ptr,
+            row_bytes,
+            indptr.ptr,
+            layout.csr.ptr,
+            lanes,
+            tables.lanes,
+        )
+    }
+
+    /// Forgets what an earlier walk of this fire laid in the scratch: a
+    /// capture after the warm walk records every extended layout it reads.
+    pub(crate) fn rs_rewind(&self) {
+        if let Some(scratch) = self.rs.as_ref().and_then(|seat| seat.scratch) {
+            scratch.reset();
         }
-        Ok(())
+    }
+
+    /// An extended op begins: it lays the window's layout anew, on its own
+    /// stream ([`RsLayout`]).
+    pub(crate) fn rs_begin(&self) {
+        if let Some(scratch) = self.rs.as_ref().and_then(|seat| seat.scratch) {
+            scratch
+                .layouts
+                .borrow_mut()
+                .remove(&self.window().span().lane_offset);
+        }
     }
 
     pub(crate) fn rs_layer_done(&self) {
         if let Some(scratch) = self.rs.as_ref().and_then(|seat| seat.scratch) {
-            scratch.reset();
+            scratch.layer_done(self.window().span().lane_offset);
         }
     }
 
@@ -1360,6 +1404,18 @@ impl<'c> Run<'c> {
     /// them per token) one token takes. An expert region's value is laid
     /// over every rank's tokens at the bucket.
     pub(crate) fn plane_fan(&self, plane: ValueId) -> u32 {
+        // A plane over selected rows (a readout's, a lane's) is no packing of
+        // the token rows, however many rows its carve gives it: a readout
+        // ceiling may pass a narrow fire's tokens.
+        if let Some(Ty::Tensor { shape, .. }) =
+            self.values.get(plane.0 as usize).map(|decl| &decl.ty)
+            && matches!(
+                shape.first(),
+                Some(Dim::Readouts | Dim::Lanes | Dim::LanesPlus(_))
+            )
+        {
+            return 1;
+        }
         let plane_rows = self.tensor(plane).rows;
         let tokens = if self.expert.get(plane.0 as usize).copied().unwrap_or(false) {
             self.bucket() * self.ep_rank().map_or(1, |ep| ep.wires.len() as u32)
@@ -1374,7 +1430,10 @@ impl<'c> Run<'c> {
         assert_eq!(
             plane_rows % tokens,
             0,
-            "a {plane_rows}-row packed plane does not divide into {tokens} token rows, so              no fan-out scales the staged seat onto its row axis",
+            "a {plane_rows}-row packed plane (value {}, {:?}) does not divide into {tokens} \
+             token rows, so no fan-out scales the staged seat onto its row axis",
+            plane.0,
+            self.values.get(plane.0 as usize).map(|decl| &decl.ty),
         );
         (plane_rows / tokens).max(1)
     }
@@ -1484,7 +1543,7 @@ impl<'c> Run<'c> {
         }
         if matches!(
             self.values[at].def,
-            Def::Input(RuntimeInput::Mask { .. })
+            Def::Input(RuntimeInput::Mask)
                 | Def::Input(RuntimeInput::Geometry {
                     kind: GeomKind::Indices,
                     ..
@@ -1581,15 +1640,15 @@ impl<'c> Run<'c> {
             .gathered
             .as_ref()
             .expect("`compacted` is reached only through a gathered window");
-        if let Def::Input(RuntimeInput::Geometry { space, kind }) = &self.values[at].def {
-            let Some(space) = gathered.spaces.get(*space as usize) else {
+        if let Def::Input(RuntimeInput::Geometry { kind }) = &self.values[at].def {
+            let Some(table) = gathered.page_tables.get(self.table_of(*kind)) else {
                 return handle;
             };
             return match kind {
-                GeomKind::Indptr => space.page_indptr,
-                GeomKind::Indices => space.page_indices,
-                GeomKind::LastPageLen => space.last_page_lens,
-                GeomKind::KvLen => space.kv_len,
+                GeomKind::Indptr => table.page_indptr,
+                GeomKind::Indices => table.page_indices,
+                GeomKind::LastPageLen => table.last_page_lens,
+                GeomKind::KvLen => table.kv_len,
                 _ => handle,
             };
         }
@@ -1672,7 +1731,6 @@ impl<'c> Run<'c> {
 
     /// The kernel the load generated for the region of `body` over rows
     /// `width` wide.
-    #[cfg(not(feature = "rocm"))]
     pub(crate) fn region_kernel(
         &self,
         body: u64,
@@ -1712,7 +1770,7 @@ impl<'c> Run<'c> {
             Some(Def::Op(_) | Def::Merge(_)) => self.arena.0.get(at).copied().flatten().is_some(),
             Some(Def::Weight(w)) => matches!(
                 self.weights.0.get(*w as usize).copied().flatten(),
-                Some(WeightRow::Dense(_) | WeightRow::Streamed { .. } | WeightRow::Ordered(_))
+                Some(WeightRow::Dense(_) | WeightRow::Ordered(_))
             ),
             _ => false,
         }
@@ -1758,13 +1816,10 @@ impl<'c> Run<'c> {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
             Def::Input(RuntimeInput::ReadoutRows) => self.fire.readout_rows,
             Def::Input(RuntimeInput::Positions) => self.fire.positions,
-            Def::Input(RuntimeInput::Mask { space }) => {
-                let seat = self.geometry(at, *space);
+            Def::Input(RuntimeInput::Mask) => {
+                let seat = self.geometry(at, 0);
                 seat.mask.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads the mask bits of cache space {space}, which \
-                         this fire left unbound"
-                    )
+                    panic!("value {at} reads the mask bits, which this fire left unbound")
                 })
             }
             Def::Input(RuntimeInput::AdapterRoutes) => {
@@ -1839,7 +1894,7 @@ impl<'c> Run<'c> {
                 self.packing(at, *select).permutation
             }
             Def::Input(RuntimeInput::Guest { id, .. }) => self.guest(at, *id),
-            Def::Input(RuntimeInput::Geometry { space, kind }) => {
+            Def::Input(RuntimeInput::Geometry { kind }) => {
                 match kind {
                     GeomKind::RequestOfToken => return self.fire.lane_of_row,
                     GeomKind::GroupOfLane => {
@@ -1857,7 +1912,8 @@ impl<'c> Run<'c> {
                     }
                     _ => {}
                 }
-                let seat = self.geometry(at, *space);
+                let table = self.table_of(*kind);
+                let seat = self.geometry(at, table);
                 let bound = match kind {
                     GeomKind::Indptr => seat.indptr,
                     GeomKind::Indices => seat.indices,
@@ -1866,15 +1922,15 @@ impl<'c> Run<'c> {
                     GeomKind::KvLen => seat.kv_len,
                     GeomKind::RowValid => seat.row_valid,
                     GeomKind::RequestOfToken => unreachable!("the row-to-lane map returns early"),
-                    GeomKind::WritePage => seat.write_page,
-                    GeomKind::WriteOffset => seat.write_offset,
+                    GeomKind::WritePage { .. } => seat.write_page,
+                    GeomKind::WriteOffset { .. } => seat.write_offset,
                     GeomKind::GroupOfLane
                     | GeomKind::GroupIndptr { .. }
                     | GeomKind::LaneIndptr { .. } => unreachable!("the D2 tables return early"),
                 };
                 bound.unwrap_or_else(|| {
                     panic!(
-                        "value {at} reads {kind:?} of cache space {space}, which this \
+                        "value {at} reads {kind:?} of page table {table}, which this \
                          fire left unbound"
                     )
                 })
@@ -1882,11 +1938,7 @@ impl<'c> Run<'c> {
             Def::Weight(w) => {
                 let row = *w as usize;
                 match self.weights.0.get(row).copied().flatten() {
-                    Some(
-                        WeightRow::Dense(handle)
-                        | WeightRow::Streamed { slab: handle, .. }
-                        | WeightRow::Ordered(handle),
-                    ) => handle,
+                    Some(WeightRow::Dense(handle) | WeightRow::Ordered(handle)) => handle,
                     Some(WeightRow::Planes { .. }) => panic!(
                         "value {at} is weight {row}, a split-plane bank; it resolves \
                          through `Run::planes`, never as one dense handle"
@@ -1900,7 +1952,7 @@ impl<'c> Run<'c> {
                 })
             }
             Def::Cache(_) => panic!(
-                "value {at} is a cache space; it resolves to a pool through `Run::pool`, \
+                "value {at} is a cache row; it resolves to a pool through `Run::pool`, \
                  never to a tensor"
             ),
         }
@@ -1940,10 +1992,25 @@ impl<'c> Run<'c> {
         }
     }
 
-    pub(crate) fn maybe_planes(
-        &self,
-        id: ValueId,
-    ) -> Option<(Tensor, Tensor, Option<Tensor>, GroupSeat)> {
+    /// The row table weight `id`'s gather reads its rows through: the
+    /// weight cache's where the table streams by its rows, else none (the
+    /// contiguous table).
+    pub(crate) fn row_table(&self, id: ValueId) -> kernels_cuda::linear::moe::RowTable {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return kernels_cuda::linear::moe::RowTable::RESIDENT;
+        };
+        self.fire
+            .tables
+            .row_tables
+            .iter()
+            .find(|(param, _)| param == w)
+            .map_or(
+                kernels_cuda::linear::moe::RowTable::RESIDENT,
+                |(_, rows)| *rows,
+            )
+    }
+
+    pub(crate) fn maybe_planes(&self, id: ValueId) -> Option<(Tensor, Tensor, Option<Tensor>)> {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
             return None;
@@ -1953,11 +2020,10 @@ impl<'c> Run<'c> {
                 codes,
                 scales,
                 biases,
-                seat,
                 repacked: false,
                 atoms: false,
                 lanes: false,
-            }) => Some((codes, scales, biases, seat)),
+            }) => Some((codes, scales, biases)),
             _ => None,
         }
     }
@@ -2016,10 +2082,7 @@ impl<'c> Run<'c> {
             .filter(|c| c.dtype == poem_ir::Dtype::Bf16)
     }
 
-    pub(crate) fn maybe_tiled_planes(
-        &self,
-        id: ValueId,
-    ) -> Option<(Tensor, Tensor, Tensor, GroupSeat)> {
+    pub(crate) fn maybe_tiled_planes(&self, id: ValueId) -> Option<(Tensor, Tensor, Tensor)> {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
             return None;
@@ -2029,11 +2092,10 @@ impl<'c> Run<'c> {
                 codes,
                 scales,
                 biases: Some(biases),
-                seat,
                 repacked: true,
                 atoms: false,
                 lanes: _,
-            }) => Some((codes, scales, biases, seat)),
+            }) => Some((codes, scales, biases)),
             _ => None,
         }
     }
@@ -2067,7 +2129,7 @@ impl<'c> Run<'c> {
         ))
     }
 
-    pub(crate) fn planes(&self, id: ValueId) -> (Tensor, Tensor, Option<Tensor>, GroupSeat) {
+    pub(crate) fn planes(&self, id: ValueId) -> (Tensor, Tensor, Option<Tensor>) {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
             panic!("value {at} is not a weight, and split-plane banks live in the weight table");
@@ -2078,12 +2140,11 @@ impl<'c> Run<'c> {
                 codes,
                 scales,
                 biases,
-                seat,
                 repacked: _,
                 atoms: _,
                 lanes: _,
-            }) => (codes, scales, biases, seat),
-            Some(WeightRow::Dense(_) | WeightRow::Streamed { .. } | WeightRow::Ordered(_)) => {
+            }) => (codes, scales, biases),
+            Some(WeightRow::Dense(_) | WeightRow::Ordered(_)) => {
                 panic!(
                     "value {at} is weight {row}, bound as one dense handle, and this op reads \
                  a split-plane bank"
@@ -2144,6 +2205,23 @@ impl<'c> Run<'c> {
         }
     }
 
+    /// The table a packed bank's select reads its experts through, where
+    /// the weight cache streams the bank (an entry an expert its codes,
+    /// scales and third plane); the contiguous bank's otherwise.
+    // Read by the CUDA dispatch, built featureless too; the HIP one reads none.
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn bank_table(&self, id: ValueId) -> ExpertTable {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return ExpertTable::RESIDENT;
+        };
+        self.fire
+            .tables
+            .expert_tables
+            .iter()
+            .find(|(param, _)| *param == *w)
+            .map_or(ExpertTable::RESIDENT, |(_, table)| *table)
+    }
+
     pub(crate) fn expert_bank(&self, id: ValueId) -> (Tensor, ExpertTable) {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
@@ -2151,17 +2229,16 @@ impl<'c> Run<'c> {
         };
         let row = *w as usize;
         match self.weights.0.get(row).copied().flatten() {
-            Some(WeightRow::Dense(handle)) => (self.cut(id, handle), ExpertTable::RESIDENT),
-            Some(WeightRow::Streamed {
-                slab,
-                table,
-                counts,
-            }) => (
-                self.cut(id, slab),
-                ExpertTable {
-                    table,
-                    hits: counts,
-                },
+            // A bank the weight cache streams reads its experts through the
+            // cache's table; any other is the contiguous bank.
+            Some(WeightRow::Dense(handle)) => (
+                self.cut(id, handle),
+                self.fire
+                    .tables
+                    .expert_tables
+                    .iter()
+                    .find(|(param, _)| *param == *w)
+                    .map_or(ExpertTable::RESIDENT, |(_, table)| *table),
             ),
             Some(WeightRow::Planes { .. }) => panic!(
                 "value {at} is weight {row}, a split-plane bank; a dense routed select \
@@ -2177,10 +2254,10 @@ impl<'c> Run<'c> {
 
     pub(crate) fn pool(&self, id: ValueId) -> KvPool {
         match self.cache(id) {
-            CachePool::Kv { space, pool } => {
+            CachePool::Kv { table, pool } => {
                 let window = self.window().span();
                 if let Some(gathered) = &self.window().gathered {
-                    let seat = gathered.spaces.get(*space as usize);
+                    let seat = gathered.page_tables.get(*table as usize);
                     return KvPool {
                         page_indptr: seat.map_or(pool.page_indptr, |seat| seat.page_indptr),
                         page_indices: seat.map_or(pool.page_indices, |seat| seat.page_indices),
@@ -2202,7 +2279,7 @@ impl<'c> Run<'c> {
                 }
             }
             CachePool::Recurrent(_) => panic!(
-                "value {} is a recurrent state space, and this op walks a paged kv pool",
+                "value {} is a recurrent state row, and this op walks a paged kv pool",
                 id.0
             ),
         }
@@ -2218,10 +2295,10 @@ impl<'c> Run<'c> {
         let window = self.window();
         let span = window.span();
         let at = |lane: u32| -> Option<u32> {
-            let CachePool::Kv { space, .. } = self.cache(id) else {
+            let CachePool::Kv { table, .. } = self.cache(id) else {
                 return None;
             };
-            let seat = self.fire.geometry.get(*space as usize)?.planning.as_ref()?;
+            let seat = self.fire.geometry.get(*table as usize)?.planning.as_ref()?;
             u32::try_from(*seat.kv_indptr.get(lane as usize)?).ok()
         };
         let pages = window
@@ -2339,11 +2416,7 @@ impl<'c> Run<'c> {
                 RecurrentPool {
                     slot_ids: lanes(pool.slot_ids),
                     write_state_mask: lanes(pool.write_state_mask),
-                    commit_len: if self.rs_window_folds_whole() {
-                        Tensor::ABSENT
-                    } else {
-                        lanes(pool.commit_len)
-                    },
+                    commit_len: lanes(pool.commit_len),
                     begin_at: lanes(pool.begin_at),
                     snapshots: kernels_cuda::Snapshots {
                         indptr: lanes(pool.snapshots.indptr),
@@ -2353,7 +2426,7 @@ impl<'c> Run<'c> {
                 }
             }
             CachePool::Kv { .. } => panic!(
-                "value {} is a paged kv space, and this op scans a recurrent state pool",
+                "value {} is a paged kv row, and this op scans a recurrent state pool",
                 id.0
             ),
         }
@@ -2366,20 +2439,32 @@ impl<'c> Run<'c> {
                 let row = *c as usize;
                 self.caches.0.get(row).unwrap_or_else(|| {
                     panic!(
-                        "value {at} is cache space {row}, and the shell binds {} pools",
+                        "value {at} is cache row {row}, and the shell binds {} pools",
                         self.caches.0.len()
                     )
                 })
             }
-            _ => panic!("value {at} is not a cache space; tensors resolve through `Run::tensor`"),
+            _ => panic!("value {at} is not a cache row; tensors resolve through `Run::tensor`"),
         }
     }
 
-    fn geometry(&self, at: usize, space: u32) -> &CacheGeometry {
-        let space = space as usize;
-        self.fire.geometry.get(space).unwrap_or_else(|| {
+    /// The page table of the fire's that geometry input `kind` reads: the
+    /// All axis's (the first), or a write descriptor's row's list's.
+    fn table_of(&self, kind: GeomKind) -> usize {
+        poem_exec::store::kv::geometry_window(kind)
+            .and_then(|window| {
+                self.fire
+                    .window_tables
+                    .iter()
+                    .find(|(tokens, _)| *tokens == window)
+            })
+            .map_or(0, |(_, table)| *table as usize)
+    }
+
+    fn geometry(&self, at: usize, table: usize) -> &CacheGeometry {
+        self.fire.geometry.get(table).unwrap_or_else(|| {
             panic!(
-                "value {at} names cache space {space}, and this fire binds {} geometry spaces",
+                "value {at} reads page table {table}, and this fire binds {} page tables",
                 self.fire.geometry.len()
             )
         })
@@ -2387,16 +2472,17 @@ impl<'c> Run<'c> {
 
     pub(crate) fn planning(&self, geom: ValueId, plan: ValueId) -> Planning<'_> {
         let at = geom.0 as usize;
-        let Def::Input(RuntimeInput::Geometry { space, .. }) = &self.values[at].def else {
+        let Def::Input(RuntimeInput::Geometry { kind }) = &self.values[at].def else {
             panic!(
                 "value {at} is not declared cache geometry, and a plan op routes to its \
-                 cache space through its geometry input"
+                 page table through its geometry input"
             );
         };
-        let seat = self.geometry(at, *space);
+        let table = self.table_of(*kind);
+        let seat = self.geometry(at, table);
         let seat = seat.planning.as_ref().unwrap_or_else(|| {
             panic!(
-                "cache space {space} carries no planning seat; the shell binds the host \
+                "page table {table} carries no planning seat; the shell binds the host \
                  geometry twins before a plan op can fire"
             )
         });
@@ -2448,7 +2534,7 @@ impl<'c> Run<'c> {
         let (kv_indptr, kv_len) = match window
             .gathered
             .as_ref()
-            .and_then(|g| g.spaces.get(*space as usize))
+            .and_then(|g| g.page_tables.get(table))
         {
             Some(gathered) => (
                 gathered.page_indptr_host.as_slice(),
@@ -2523,18 +2609,18 @@ impl<'c> Run<'c> {
 
     pub(crate) fn slabs(&self, pages: ValueId) -> PoolSlabs {
         let at = pages.0 as usize;
-        let Some(Def::Cache(space)) = self.values.get(at).map(|v| &v.def) else {
-            panic!("value {at} is not a cache space; the pooled state is keyed by one")
+        let Some(Def::Cache(row)) = self.values.get(at).map(|v| &v.def) else {
+            panic!("value {at} is not a cache row; the pooled state is keyed by one")
         };
         self.fire
             .tables
             .pool_state
             .iter()
-            .find(|(held, _)| held == space)
+            .find(|(held, _)| held == row)
             .map(|(_, slabs)| *slabs)
             .unwrap_or_else(|| {
                 panic!(
-                    "this fire binds no dsv4 compressor slabs for cache space {space}, which \
+                    "this fire binds no dsv4 compressor slabs for cache row {row}, which \
                      `attention.pool_gather` reads beside the pool"
                 )
             })

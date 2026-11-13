@@ -24,6 +24,7 @@
 
 #include <metal_simdgroup>
 #include <metal_stdlib>
+#include "moe/expert_at.h"
 using namespace metal;
 
 #define PIE_CONST static constant constexpr const
@@ -396,6 +397,12 @@ METAL_FUNC void qmv_codec_impl(
     int x_slot_stride,
     int x_row_stride,
     int slots_per_row,
+    const device ExpertPlaneAt* codes_at,
+    const device ExpertPlaneAt* scales_at,
+    const device ExpertPlaneAt* biases_at,
+    const device ExpertPlaneAt* bias_at,
+    int pieces,
+    int piece_rows,
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
@@ -428,11 +435,23 @@ METAL_FUNC void qmv_codec_impl(
     if (expert_ids[sel] < 0) {
       return;
     }
-    const size_t e = size_t(expert_ids[sel]);
-    ws += e * size_t(out_vec_size) * size_t(in_vec_size_w);
-    scales += e * size_t(out_vec_size) * size_t(in_vec_size_g);
+    // Each expert's planes where the bank lays them, or where the weight
+    // cache's tables put the piece of this simdgroup's rows (a piece holds
+    // whole threadgroups' rows: `piece_rows` is a multiple of 8).
+    const uint e = uint(expert_ids[sel]);
+    const ulong rows = ulong(out_vec_size);
+    const ulong scale_row = ulong(in_vec_size_g) * sizeof(typename Codec::scale_t);
+    ws = (const device uint8_t*)expert_plane(
+        (const device char*)ws, codes_at, pieces, piece_rows,
+        rows * ulong(in_vec_size_w), ulong(in_vec_size_w), e, uint(out_row));
+    scales = (const device typename Codec::scale_t*)expert_plane(
+        (const device char*)scales, scales_at, pieces, piece_rows, rows * scale_row,
+        scale_row, e, uint(out_row));
     if (Codec::zero_point) {
-      biases += e * size_t(out_vec_size) * size_t(in_vec_size_g);
+      const ulong bias_row = ulong(in_vec_size_g) * sizeof(T);
+      biases = (const device T*)expert_plane(
+          (const device char*)biases, biases_at, pieces, piece_rows, rows * bias_row,
+          bias_row, e, uint(out_row));
     }
   }
 
@@ -462,7 +481,9 @@ METAL_FUNC void qmv_codec_impl(
   device T* y_row = y + (ROUTED ? sel : row) * out_vec_size + out_row;
   const device T* bias_row = bias;
   if (BIASED && ROUTED) {
-    bias_row += size_t(expert_ids[sel]) * size_t(out_vec_size);
+    bias_row = (const device T*)expert_plane(
+        (const device char*)bias, bias_at, pieces, piece_rows,
+        ulong(out_vec_size) * sizeof(T), sizeof(T), uint(expert_ids[sel]), uint(out_row));
   }
   for (int row = 0; row < results_per_simdgroup; row++) {
     U v = simd_sum(result[row]);
@@ -488,12 +509,20 @@ METAL_FUNC void qmv_codec_impl(
       const constant int& x_slot_stride [[buffer(9)]],                         \
       const constant int& x_row_stride  [[buffer(10)]],                        \
       const constant int& slots_per_row [[buffer(11)]],                        \
+      const device ExpertPlaneAt* codes_at  [[buffer(12)]],                    \
+      const device ExpertPlaneAt* scales_at [[buffer(13)]],                    \
+      const device ExpertPlaneAt* biases_at [[buffer(14)]],                    \
+      const device ExpertPlaneAt* bias_at   [[buffer(15)]],                    \
+      const constant int& pieces     [[buffer(16)]],                           \
+      const constant int& piece_rows [[buffer(17)]],                           \
       uint3 tid       [[threadgroup_position_in_grid]],                        \
       uint simd_gid   [[simdgroup_index_in_threadgroup]],                      \
       uint simd_lid   [[thread_index_in_simdgroup]]) {                         \
     qmv_codec_impl<T, Codec<T>, BIASED, ROUTED, PPT>(                              \
         w, scales, biases, x, y, bias, expert_ids, in_vec_size, out_vec_size,  \
-        x_slot_stride, x_row_stride, slots_per_row, tid, simd_gid, simd_lid);  \
+        x_slot_stride, x_row_stride, slots_per_row, codes_at, scales_at,       \
+        biases_at, bias_at, ROUTED ? pieces : 0, ROUTED ? piece_rows : 0, tid,  \
+        simd_gid, simd_lid);                                                   \
   }
 
 qmv_codec_kernel(qmv_tail, false, false, 2)
@@ -513,7 +542,9 @@ qmv_codec_kernel(qmv_routed_p2, false, true, 2)
       const device itype*, device itype*, const constant int&,                \
       const constant int&, const device itype*, const device int*,            \
       const constant int&, const constant int&, const constant int&,          \
-      uint3, uint, uint);
+      const device ExpertPlaneAt*, const device ExpertPlaneAt*,               \
+      const device ExpertPlaneAt*, const device ExpertPlaneAt*,               \
+      const constant int&, const constant int&, uint3, uint, uint);
 
 instantiate_qmv_codec(affine_qmv_tail, qmv_tail, AffineU4, bfloat16, bfloat, 64, 4)
 instantiate_qmv_codec(affine_qmv_tail_bias, qmv_tail_bias, AffineU4, bfloat16, bfloat, 64, 4)

@@ -296,6 +296,90 @@ impl Body {
         self.int_binary("arith.andi", a, b, false)
     }
 
+    pub fn ori(&mut self, a: V, b: V) -> Built<V> {
+        self.int_binary("arith.ori", a, b, false)
+    }
+    /// Logical right shift.
+    pub fn shrui(&mut self, a: V, b: V) -> Built<V> {
+        self.int_binary("arith.shrui", a, b, false)
+    }
+    /// Left shift.
+    pub fn shli(&mut self, a: V, b: V) -> Built<V> {
+        self.int_binary("arith.shli", a, b, false)
+    }
+
+    /// A vector's bits read as `elem` of the same width (`arith.bitcast`).
+    pub fn bitcast_v(&mut self, v: V, elem: Elem) -> Built<V> {
+        let (d, e) = self.vec_of(v)?;
+        if e.bits() != elem.bits() {
+            return bad(format!("a bitcast of {e:?} to {elem:?}"));
+        }
+        Ok(self.op1("arith.bitcast", &[v], "", MTy::Vector(d, elem)))
+    }
+
+    /// `dims` of VMEM ref `r` from `at`, every `strides[i]`-th along axis
+    /// `i` (`tpu.strided_load`).
+    pub fn strided_load(&mut self, r: V, at: &[V], strides: &[i64], dims: &[i64]) -> Built<V> {
+        let MTy::Ref(rd, elem, Space::Vmem) = self.ty(r).clone() else {
+            return bad(format!("a strided load from {}", self.ty(r)));
+        };
+        if rd.len() != at.len() || strides.len() != rd.len() || dims.len() != rd.len() {
+            return bad(format!("strided load of {dims:?} from {}", self.ty(r)));
+        }
+        let mut ops = vec![r];
+        for &i in at {
+            ops.push(self.as_index(i)?);
+        }
+        let st = strides
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(self.op1(
+            "tpu.strided_load",
+            &ops,
+            &format!("strides = array<i32: {st}>"),
+            MTy::Vector(dims.to_vec(), elem),
+        ))
+    }
+
+    /// `v` into VMEM ref `r` from `at`, every `strides[i]`-th along axis
+    /// `i` (`tpu.strided_store`).
+    pub fn strided_store(&mut self, v: V, r: V, at: &[V], strides: &[i64]) -> Built<()> {
+        let (MTy::Vector(vd, ve), MTy::Ref(rd, re, Space::Vmem)) =
+            (self.ty(v).clone(), self.ty(r).clone())
+        else {
+            return bad(format!(
+                "strided store of {} into {}",
+                self.ty(v),
+                self.ty(r)
+            ));
+        };
+        if ve != re || vd.len() != rd.len() || at.len() != rd.len() || strides.len() != rd.len() {
+            return bad(format!(
+                "strided store of {} into {}",
+                self.ty(v),
+                self.ty(r)
+            ));
+        }
+        let mut ops = vec![v, r];
+        for &i in at {
+            ops.push(self.as_index(i)?);
+        }
+        let st = strides
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.op(
+            "tpu.strided_store",
+            &ops,
+            &format!("strides = array<i32: {st}>"),
+            &[],
+        );
+        Ok(())
+    }
+
     pub fn cmpi(&mut self, p: ICmp, a: V, b: V) -> Built<V> {
         if self.ty(a) != self.ty(b) {
             return bad(format!("cmpi over {} and {}", self.ty(a), self.ty(b)));
@@ -604,6 +688,33 @@ impl Body {
     }
 
     /// `r` without its leading unit axis.
+    /// `r` (a 2-D reference, any memory) read as `elem`: the second-minor
+    /// axis scales by the width ratio, a tile of `u32 [8, 128]` becoming
+    /// `bf16 [16, 128]` (the chunk pool's packed rows order). How a kernel
+    /// reads a pool plane straight out of the `u32` pool.
+    pub fn ref_bitcast(&mut self, r: V, elem: Elem) -> Built<V> {
+        let out = match self.ty(r).clone() {
+            MTy::Ref(rd, e, sp) if rd.len() == 2 && e.bits() >= elem.bits() => {
+                let k = i64::from(e.bits() / elem.bits());
+                MTy::Ref(vec![rd[0] * k, rd[1]], elem, sp)
+            }
+            t => return bad(format!("a {} bitcast of {t}", elem.mlir())),
+        };
+        Ok(self.op1("tpu.memref_bitcast", &[r], "", out))
+    }
+
+    /// `r` as `dims` (`tpu.memref_reshape`): the same elements in order,
+    /// where the tiled layout lets the reshape move nothing.
+    pub fn ref_reshape(&mut self, r: V, dims: &[i64]) -> Built<V> {
+        let out = match self.ty(r).clone() {
+            MTy::Ref(rd, e, sp) if rd.iter().product::<i64>() == dims.iter().product::<i64>() => {
+                MTy::Ref(dims.to_vec(), e, sp)
+            }
+            t => return bad(format!("a reshape of {t} to {dims:?}")),
+        };
+        Ok(self.op1("tpu.memref_reshape", &[r], "", out))
+    }
+
     pub fn ref_squeeze(&mut self, r: V) -> Built<V> {
         let out = match self.ty(r).clone() {
             MTy::Ref(rd, e, sp) if rd.first() == Some(&1) => MTy::Ref(rd[1..].to_vec(), e, sp),
@@ -1343,10 +1454,43 @@ impl Compiled {
                 ));
             }
         }
+        // An output written in place over its operand (a pool) stays in
+        // HBM: XLA's memory-space assignment otherwise may move a pool that
+        // fits into VMEM between kernels and copy it back at the program's
+        // end (v6e MoE mini decode of 8 lanes: its 48 MB pool, 52 us a step).
+        let config = if aliases.is_empty() {
+            self.config.clone()
+        } else {
+            let tuple = self.results.len() > 1;
+            let colors: Vec<String> = aliases
+                .iter()
+                .map(|&(out, _)| {
+                    if tuple {
+                        format!("{{\"color\":0,\"shape_index\":[{out}]}}")
+                    } else {
+                        "{\"color\":0}".to_string()
+                    }
+                })
+                .collect();
+            let ins: Vec<String> = aliases
+                .iter()
+                .map(|&(_, operand)| format!("{{\"operand_index\":{operand},\"color\":0}}"))
+                .collect();
+            self.config.replacen(
+                "\"needs_layout_passes\": true",
+                &format!(
+                    "\"needs_layout_passes\": true, \"output_memory_space_colors\": [{}], \
+                     \"input_memory_space_colors\": [{}]",
+                    colors.join(","),
+                    ins.join(",")
+                ),
+                1,
+            )
+        };
         Ok(f.custom_call_aliased(
             "tpu_custom_call",
             operands,
-            &self.config,
+            &config,
             self.results.clone(),
             aliases,
         ))

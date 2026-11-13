@@ -8,6 +8,7 @@ mod select;
 mod select_bf16;
 mod select_fp4;
 mod select_fp8;
+mod table;
 
 pub use combine::*;
 pub use experts::*;
@@ -19,6 +20,7 @@ pub use select::*;
 pub use select_bf16::*;
 pub use select_fp4::*;
 pub use select_fp8::*;
+pub use table::*;
 
 #[cfg(feature = "cuda")]
 const ACT_QUANT: &str = "linear/act_quant.cu";

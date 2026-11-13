@@ -29,7 +29,6 @@ pub mod narrow;
 pub mod program;
 pub mod record;
 pub mod replay;
-pub mod rotate;
 pub mod run;
 pub mod serve;
 pub mod settle;
@@ -127,9 +126,11 @@ pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
     ]
 }
 
-/// The fused kernels left on with `fuse-chains=off`: none on CUDA.
+/// The fused kernels left on with `fuse-chains=off`: none on CUDA, the
+/// residual norms being generated row kernels.
 #[cfg(not(feature = "rocm"))]
 pub const UNCHAINED: &[&str] = &[];
+/// On ROCm the hand residual norm stays on with `fuse-chains=off` (as on main).
 #[cfg(feature = "rocm")]
 pub const UNCHAINED: &[&str] = &["fused.residual_add_rmsnorm"];
 
@@ -184,8 +185,8 @@ pub use run::{
     PoolSlabs, Run, SlotTable, StructSlot, WeightRow, WeightTable,
 };
 pub use serve::{
-    Armed, Boot, DEFAULT_BODIES_MEGABYTES, Diagnostics, FireCost, Golden, Graphs, Knobs, Lane,
-    Media, Recording, Seal, Seated, Shell,
+    Armed, Boot, DEFAULT_BODIES_MEGABYTES, Diagnostics, Golden, Graphs, Knobs, Lane, Media,
+    Recording, Seal, Seated, Shell,
 };
 
 pub use blob::{

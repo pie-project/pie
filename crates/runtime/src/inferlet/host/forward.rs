@@ -1770,7 +1770,6 @@ mod tests {
             let (fires, completion, ws, stores, failure) = pending_fire_fixture(vec![cell.clone()]);
             let mut context = ProcessCtx::new(
                 uuid::Uuid::new_v4(),
-                "test".into(),
                 crate::inferlet::process::OutputMode::Discard,
                 &crate::inferlet::sandbox::InstancePolicy::deny_all(),
                 None,

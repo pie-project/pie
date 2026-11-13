@@ -1731,6 +1731,7 @@ dependencies = [
  "pie-poem-ir",
  "rustix",
  "serde",
+ "serde_json",
  "state",
  "thiserror 2.0.21",
  "web-std",
@@ -1805,6 +1806,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-gpu"
+version = "0.6.0"
+dependencies = [
+ "checkpoint",
+ "engine",
+ "eta-compiler",
+ "eta-exec",
+ "kernels-slang",
+ "libc",
+ "memmap2",
+ "pie-eta-ir",
+ "pie-poem-compiler",
+ "pie-poem-exec",
+ "pie-poem-ir",
+ "pie-profile",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "engine-metal"
 version = "0.6.0"
 dependencies = [
@@ -1828,6 +1849,7 @@ dependencies = [
  "pie-profile",
  "serde_json",
  "toml",
+ "tracing",
  "ztensor",
  "ztensor-compat",
 ]
@@ -1839,6 +1861,7 @@ dependencies = [
  "ash",
  "checkpoint",
  "engine",
+ "engine-gpu",
  "eta-compiler",
  "eta-exec",
  "kernels-slang",
@@ -1864,6 +1887,7 @@ dependencies = [
  "ash",
  "checkpoint",
  "engine",
+ "engine-gpu",
  "eta-compiler",
  "eta-exec",
  "kernels-slang",

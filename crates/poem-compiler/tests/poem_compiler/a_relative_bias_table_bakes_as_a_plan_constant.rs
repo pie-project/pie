@@ -1,6 +1,6 @@
 use crate::common;
 
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Weight, ops, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, Input, StateRows, Weight, ops, trace_hybrid};
 use poem_compiler::Placement;
 use poem_ir::{Attn, Elemwise, Operation, RaggedMask};
 
@@ -14,8 +14,8 @@ const NUM_BUCKETS: u32 = 32;
 struct Encoder;
 
 impl ForwardHybrid for Encoder {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         let w = |name: &str, out: u32, inner: u32| {

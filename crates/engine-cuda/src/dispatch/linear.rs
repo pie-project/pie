@@ -503,6 +503,7 @@ impl Run<'_> {
         let paging = pool.as_ref().map(|pool| linear::skeleton::Paging {
             valid: pool.row_valid.ptr,
             page_size: u32::try_from(pool.page_size).unwrap_or(0),
+            page_stride: pool.page_stride,
         });
         Ok((planes, landed, paging))
     }
@@ -561,7 +562,7 @@ impl Run<'_> {
                 logits: false,
                 ..
             } => match self.maybe_tiled_planes(*w) {
-                Some((codes, scales, biases, seat)) => {
+                Some((codes, scales, biases)) => {
                     let act = self.tensor(*act);
                     let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
                         linear::affine::tiled::matmul
@@ -575,7 +576,7 @@ impl Run<'_> {
                         scales,
                         biases,
                         &mut self.tensor(*y),
-                        seat,
+                        GroupSeat::RESIDENT,
                     )
                 }
                 None => self.row_major_matmul(act, w, y),
@@ -588,7 +589,7 @@ impl Run<'_> {
                 logits: true,
                 ..
             } => match self.maybe_tiled_planes(*w) {
-                Some((codes, scales, biases, seat)) => {
+                Some((codes, scales, biases)) => {
                     let act = self.tensor(*act);
                     let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
                         linear::affine::tiled::lm_head
@@ -602,7 +603,7 @@ impl Run<'_> {
                         scales,
                         biases,
                         &mut self.tensor(*y),
-                        seat,
+                        GroupSeat::RESIDENT,
                     )
                 }
                 None => self.row_major_lm_head(act, w, y),
@@ -1138,9 +1139,17 @@ impl Run<'_> {
                         poem_ir::Operation::Linear(Linear::GroupRoutes { groups: g, .. }) if *g == groups_nz
                     )
                 );
+                // A split-plane (affine, NVFP4) projection is read as its bf16,
+                // decoded into a scratch a fire; a dense one where it lies.
+                let bank_of = |run: &Self| match run.maybe_planes(*w) {
+                    Some((codes, ..)) => run
+                        .dense_or_decoded(OP, *w, codes.rows, x.width / groups_nz)
+                        .map(|bank| (bank, linear::moe::ExpertTable::RESIDENT)),
+                    None => Ok(run.expert_bank(*w)),
+                };
                 #[cfg(feature = "cuda")]
                 if trivial {
-                    let (bank, _) = self.expert_bank(*w);
+                    let (bank, _) = bank_of(self)?;
                     if bank.dtype == Dtype::Bf16 && x.dtype == Dtype::Bf16 && y.dtype == Dtype::Bf16
                     {
                         let mut y = y;
@@ -1158,7 +1167,7 @@ impl Run<'_> {
                     kernels_cuda::tensor::Tensor::new(x.ptr, rows, x.width / groups_nz, x.dtype);
                 let mut y =
                     kernels_cuda::tensor::Tensor::new(y.ptr, rows, y.width / groups_nz, y.dtype);
-                let (bank, experts) = self.expert_bank(*w);
+                let (bank, experts) = bank_of(self)?;
                 // One "expert" a group: the plane viewed `[groups, n * k]`, so
                 // a select that lays routes out by expert (the grouped and
                 // tcgen05 legs) counts groups, not the plane's rows.
@@ -1208,7 +1217,34 @@ impl Run<'_> {
                 quant: None,
                 ..
             } => {
-                let (codes, scales, affine, seat) = self.planes(*bank);
+                let (codes, scales, affine) = self.planes(*bank);
+                // A bank the weight cache streams: each expert's codes, scales
+                // and bias where its table says, and no bf16 copy.
+                #[cfg(feature = "cuda")]
+                if let table = self.bank_table(*bank)
+                    && table.tabled()
+                {
+                    if table.streams() {
+                        linear::moe::note_routes(
+                            self.ctx(),
+                            "linear.moe_select",
+                            self.tensor(*routes),
+                            codes.rows,
+                            table.hits,
+                        )?;
+                    }
+                    return linear::moe::matmul_select_bias(
+                        self.ctx(),
+                        self.tensor(*x),
+                        codes,
+                        scales,
+                        self.tensor(*bias),
+                        self.tensor(*routes),
+                        &mut self.tensor(*y),
+                        GroupSeat::RESIDENT,
+                        table,
+                    );
+                }
                 // A wide fire on the bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`).
                 #[cfg(feature = "cuda")]
                 if let Some(copy) = self.mxfp4_bf16_bank(*bank)
@@ -1222,6 +1258,7 @@ impl Run<'_> {
                         self.tensor(*routes),
                         &mut self.tensor(*y),
                         None,
+                        linear::moe::ExpertTable::RESIDENT,
                     )?
                 {
                     return Ok(());
@@ -1247,7 +1284,8 @@ impl Run<'_> {
                     self.tensor(*bias),
                     self.tensor(*routes),
                     &mut self.tensor(*y),
-                    seat,
+                    GroupSeat::RESIDENT,
+                    linear::moe::ExpertTable::RESIDENT,
                 )
             }
             Linear::MoeSelect {
@@ -1296,14 +1334,19 @@ impl Run<'_> {
                 routes,
                 weights,
                 y,
-            } => linear::moe::bias_sum(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*bias),
-                self.tensor(*routes),
-                self.tensor(*weights),
-                &mut self.tensor(*y),
-            ),
+            } => {
+                // An expert's bias row where the weight cache's table says.
+                let (bias, table) = self.expert_bank(*bias);
+                linear::moe::bias_sum(
+                    self.ctx(),
+                    self.tensor(*x),
+                    bias,
+                    self.tensor(*routes),
+                    self.tensor(*weights),
+                    &mut self.tensor(*y),
+                    table,
+                )
+            }
             Linear::LoraCorrect {
                 x,
                 bank_a,
@@ -1382,6 +1425,7 @@ impl Run<'_> {
                     route_t,
                     &mut out,
                     Glu::Swiglu,
+                    linear::moe::ExpertTable::RESIDENT,
                 );
             }
         }
@@ -1404,6 +1448,7 @@ impl Run<'_> {
                 routes,
                 &mut out,
                 Some(Glu::Relu2),
+                experts,
             );
         }
         // The profile first: a tcgen05 device with its grouped GEMM off resolves nothing.
@@ -1491,6 +1536,7 @@ impl Run<'_> {
                 routes,
                 &mut out,
                 Some(glu),
+                linear::moe::ExpertTable::RESIDENT,
             )? {
                 return Ok(true);
             }
@@ -1546,12 +1592,13 @@ impl Run<'_> {
                 quant: None,
                 ..
             } => {
-                let (codes, scales, affine, seat) = self.planes(bank);
-                if codes.dtype == Dtype::Nvfp4
-                    || affine.is_some()
-                    || seat.streams()
-                    || self.scales_in_atoms(bank)
-                {
+                let (codes, scales, affine) = self.planes(bank);
+                if codes.dtype == Dtype::Nvfp4 || affine.is_some() || self.scales_in_atoms(bank) {
+                    return None;
+                }
+                // A bank the weight cache streams is read through its table.
+                let table = self.bank_table(bank);
+                if !table.tabled() && crate::device::alloc::is_host_pointer(codes.ptr) {
                     return None;
                 }
                 let bias = Some(self.tensor(bias));
@@ -1564,7 +1611,7 @@ impl Run<'_> {
                         scales,
                         bias,
                     },
-                    ExpertTable::RESIDENT,
+                    table,
                 )
             }
             Linear::MoeSelect {
@@ -1577,10 +1624,14 @@ impl Run<'_> {
                 quant: None,
                 ..
             } => {
-                let (codes, scales, biases, seat) = self.planes(bank);
-                if seat.streams()
-                    || self.scales_in_atoms(bank)
-                    || crate::device::alloc::is_host_pointer(codes.ptr)
+                let (codes, scales, biases) = self.planes(bank);
+                // A bank the weight cache streams is read through its table,
+                // by the selects that take one whose every expert is seated.
+                // A streamed table too: `select_glu` keeps it off the TMA and
+                // tcgen05 kernels, and declines it where only they take it.
+                let table = self.bank_table(bank);
+                if self.scales_in_atoms(bank)
+                    || (!table.tabled() && crate::device::alloc::is_host_pointer(codes.ptr))
                 {
                     return None;
                 }
@@ -1604,7 +1655,7 @@ impl Run<'_> {
                         bias: None,
                     },
                 };
-                (x, routes, sy, bank, ExpertTable::RESIDENT)
+                (x, routes, sy, bank, table)
             }
             // An NVFP4 bank against NVFP4 activations (W4A4), its scales laid
             // in atoms and its input scales stated.
@@ -1618,9 +1669,8 @@ impl Run<'_> {
                 bias: None,
                 quantized: true,
             } => {
-                let (codes, atoms, biases, seat) = self.planes(bank);
+                let (codes, atoms, biases) = self.planes(bank);
                 if codes.dtype != Dtype::Nvfp4
-                    || seat.streams()
                     || !self.scales_in_atoms(bank)
                     || crate::device::alloc::is_host_pointer(codes.ptr)
                 {
@@ -1652,10 +1702,9 @@ impl Run<'_> {
                 bias: None,
                 quantized: true,
             } => {
-                let (codes, atoms, biases, seat) = self.planes(bank);
+                let (codes, atoms, biases) = self.planes(bank);
                 if !matches!(codes.dtype, Dtype::Mxfp4 | Dtype::U8 | Dtype::E4m3)
                     || biases.is_some()
-                    || seat.streams()
                     || !self.scales_in_atoms(bank)
                     || crate::device::alloc::is_host_pointer(codes.ptr)
                 {
@@ -1734,8 +1783,10 @@ impl Run<'_> {
             if gate_add.is_some() || normed.is_some() {
                 return Ok(false);
             }
-            let (Some((x, routes, up_y, up, _)), Some((down_x, down_routes, down_y, down, _))) =
-                (self.routed_bank(select), self.routed_bank(down))
+            let (
+                Some((x, routes, up_y, up, up_experts)),
+                Some((down_x, down_routes, down_y, down, down_experts)),
+            ) = (self.routed_bank(select), self.routed_bank(down))
             else {
                 return Ok(false);
             };
@@ -1750,7 +1801,8 @@ impl Run<'_> {
             let glu = Glu::SwigluClamp { limit };
             #[rustfmt::skip]
             let m = linear::moe::RoutedMlp { x, up, glu, down, routes, weights, inter: intermediate };
-            return linear::moe::experts_weighted_first(self.ctx(), m, shared, &mut out);
+            let tables = [up_experts, down_experts];
+            return linear::moe::experts_weighted_first(self.ctx(), m, shared, &mut out, tables);
         }
         let (packed, hidden, intermediate, glu) = match *glu {
             Linear::Glu {
@@ -1951,7 +2003,7 @@ impl Run<'_> {
         let mut out = self.tensor(y);
         #[rustfmt::skip]
         let m = linear::moe::RoutedMlp { x, up, glu, down, routes, weights, inter: intermediate };
-        linear::moe::mega(self.ctx(), m, fold, &mut out)
+        linear::moe::mega(self.ctx(), m, fold, &mut out, [up_experts, down_experts])
     }
 
     /// A quantized bank's select of `x`.
@@ -1962,7 +2014,7 @@ impl Run<'_> {
         routes: ValueId,
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
-        let (codes, scales, biases, seat) = self.planes(bank);
+        let (codes, scales, biases) = self.planes(bank);
         let routes = self.tensor(routes);
         // A wide fire on an MXFP4 bank's bf16 copy (`kernel.moe.mxfp4_bf16_from`).
         #[cfg(feature = "cuda")]
@@ -1978,19 +2030,62 @@ impl Run<'_> {
                 routes,
                 &mut self.tensor(y),
                 None,
+                linear::moe::ExpertTable::RESIDENT,
             )?
         {
             return Ok(());
         }
         per_tensor_e4m3_is_a_table("linear.moe_select", codes)?;
+        // A bank the weight cache streams: each expert where its table says,
+        // none staged by this fire.
+        let table = self.bank_table(bank);
+        if table.tabled() {
+            // Its selects count no expert's reads; a set the runtime may
+            // change is counted here.
+            #[cfg(feature = "cuda")]
+            if table.streams() {
+                linear::moe::note_routes(
+                    self.ctx(),
+                    "linear.moe_select",
+                    routes,
+                    codes.rows,
+                    table.hits,
+                )?;
+            }
+            if codes.dtype == Dtype::Nvfp4 {
+                let tensor_scales = tensor_scales("linear.moe_select", biases)?;
+                return linear::moe::select_nvfp4(
+                    self.ctx(),
+                    x,
+                    codes,
+                    scales,
+                    tensor_scales,
+                    routes,
+                    &mut self.tensor(y),
+                    GroupSeat::RESIDENT,
+                    table,
+                );
+            }
+            return linear::moe::matmul_select_quant(
+                self.ctx(),
+                x,
+                codes,
+                scales,
+                biases,
+                routes,
+                &mut self.tensor(y),
+                GroupSeat::RESIDENT,
+                table,
+            );
+        }
         if codes.dtype == Dtype::Nvfp4 {
             let tensor_scales = tensor_scales("linear.moe_select", biases)?;
-            let (codes, scales, tensor_scales, routes, seat) =
+            let (codes, scales, tensor_scales, routes) =
                 match self.staged_experts(codes, scales, Some(tensor_scales), routes) {
                     Some((codes, scales, Some(tensor_scales), routes)) => {
-                        (codes, scales, tensor_scales, routes, GroupSeat::RESIDENT)
+                        (codes, scales, tensor_scales, routes)
                     }
-                    _ => (codes, scales, tensor_scales, routes, seat),
+                    _ => (codes, scales, tensor_scales, routes),
                 };
             return linear::moe::select_nvfp4(
                 self.ctx(),
@@ -2000,16 +2095,13 @@ impl Run<'_> {
                 tensor_scales,
                 routes,
                 &mut self.tensor(y),
-                seat,
+                GroupSeat::RESIDENT,
+                linear::moe::ExpertTable::RESIDENT,
             );
         }
-        let (codes, scales, biases, routes, seat) =
-            match self.staged_experts(codes, scales, biases, routes) {
-                Some((codes, scales, biases, routes)) => {
-                    (codes, scales, biases, routes, GroupSeat::RESIDENT)
-                }
-                None => (codes, scales, biases, routes, seat),
-            };
+        let (codes, scales, biases, routes) = self
+            .staged_experts(codes, scales, biases, routes)
+            .unwrap_or((codes, scales, biases, routes));
         linear::moe::matmul_select_quant(
             self.ctx(),
             x,
@@ -2018,7 +2110,8 @@ impl Run<'_> {
             biases,
             routes,
             &mut self.tensor(y),
-            seat,
+            GroupSeat::RESIDENT,
+            linear::moe::ExpertTable::RESIDENT,
         )
     }
 
@@ -2064,12 +2157,23 @@ impl Run<'_> {
         if !linear::gemm_sm100::supported() {
             // An MXFP4 bank against e4m3 rows, as the release asks, on the
             // consumer Blackwells' block-scaled mma.sync (`kernel.moe.mxfp4_w4a8_from`).
-            let (codes, scales, biases, seat) = self.planes(bank);
+            let (codes, scales, biases) = self.planes(bank);
+            // A bank the weight cache takes is read through its table, held or
+            // streamed (a streamed one's routes counted once a kernel takes
+            // it); else the bank where it lies, on the device.
+            let table = self.bank_table(bank);
+            let takes = table.tabled() || !crate::device::alloc::is_host_pointer(codes.ptr);
+            let counted = |this: &mut Self| -> Result<(), kernels_cuda::Error> {
+                if table.streams() {
+                    let routes = this.tensor(routes);
+                    linear::moe::note_routes(this.ctx(), OP, routes, codes.rows, table.hits)?;
+                }
+                Ok(())
+            };
             if let ActQuant::E4m3 { gran } = quant
                 && matches!(codes.dtype, Dtype::Mxfp4 | Dtype::U8)
                 && biases.is_none()
-                && !seat.streams()
-                && !crate::device::alloc::is_host_pointer(codes.ptr)
+                && takes
                 && linear::moe::select_mxfp4_w4a8(
                     self.ctx(),
                     self.tensor(x),
@@ -2078,17 +2182,17 @@ impl Run<'_> {
                     self.tensor(routes),
                     &mut self.tensor(y),
                     gran,
+                    table,
                 )?
             {
-                return Ok(());
+                return counted(self);
             }
             // An NVFP4 bank against NVFP4 rows (W4A4), as the release asks,
             // on the block-scaled mma.sync (`kernel.moe.nvfp4_w4a4_from`).
             if let ActQuant::Nvfp4 = quant
                 && codes.dtype == Dtype::Nvfp4
                 && let (Some(tensor_scales), Some(input_scales)) = (biases, input_scales)
-                && !seat.streams()
-                && !crate::device::alloc::is_host_pointer(codes.ptr)
+                && takes
                 && linear::moe::select_nvfp4_w4a4(
                     self.ctx(),
                     self.tensor(x),
@@ -2098,15 +2202,16 @@ impl Run<'_> {
                     self.tensor(input_scales),
                     self.tensor(routes),
                     &mut self.tensor(y),
+                    table,
                 )?
             {
-                return Ok(());
+                return counted(self);
             }
             return self.select_a16(OP, x, bank, routes, y);
         }
-        let (codes, scales, biases, seat) = self.planes(bank);
+        let (codes, scales, biases) = self.planes(bank);
         per_tensor_e4m3_is_a_table(OP, codes)?;
-        if seat.streams() || crate::device::alloc::is_host_pointer(codes.ptr) {
+        if crate::device::alloc::is_host_pointer(codes.ptr) {
             return Err(kernels_cuda::Error::Backend {
                 op: OP,
                 detail: "a low-precision select reads a resident bank, and this one is \
@@ -2214,6 +2319,7 @@ impl Run<'_> {
                 atoms,
                 route_t,
                 &mut out,
+                linear::moe::ExpertTable::RESIDENT,
             )? {
                 return Ok(());
             }
@@ -2305,15 +2411,7 @@ impl Run<'_> {
         if let Some(block_scales) = block_scales {
             return self.fp8_block_matmul(act, w, quant, block_scales, y);
         }
-        let (codes, scales, _, seat) = self.planes(w);
-        if seat.streams() {
-            return Err(kernels_cuda::Error::Backend {
-                op: OP,
-                detail: "a low-precision projection reads resident planes, and these are \
-                         seated by a streaming tier"
-                    .to_string(),
-            });
-        }
+        let (codes, scales, _) = self.planes(w);
         if !self.scales_in_atoms(w) {
             return Err(unlaid(OP));
         }
@@ -2378,7 +2476,7 @@ impl Run<'_> {
         routes: ValueId,
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
-        let (codes, scales, _, seat) = self.planes(bank);
+        let (codes, scales, _) = self.planes(bank);
         match codes.dtype {
             Dtype::Nvfp4 | Dtype::Mxfp4 | Dtype::U8 => {
                 let x = self.tensor(x);
@@ -2394,6 +2492,7 @@ impl Run<'_> {
                         self.tensor(routes),
                         &mut self.tensor(y),
                         None,
+                        linear::moe::ExpertTable::RESIDENT,
                     )?
                 {
                     return Ok(());
@@ -2413,6 +2512,7 @@ impl Run<'_> {
                             codes.rows,
                             route_t,
                             &mut out,
+                            linear::moe::ExpertTable::RESIDENT,
                         );
                     }
                 }
@@ -2428,7 +2528,10 @@ impl Run<'_> {
                 let Some(gran) = fp8_bank_gran(scales, self.tensor(x).width) else {
                     return Err(unlaid(op));
                 };
-                if seat.streams() || crate::device::alloc::is_host_pointer(codes.ptr) {
+                // A bank the weight cache takes is read through its table
+                // (one that streams counts its routes here).
+                let table = self.bank_table(bank);
+                if !table.tabled() && crate::device::alloc::is_host_pointer(codes.ptr) {
                     return Err(kernels_cuda::Error::Backend {
                         op,
                         detail: "a W8A16 select reads a resident bank, and this one is seated \
@@ -2438,9 +2541,14 @@ impl Run<'_> {
                 }
                 let x = self.tensor(x);
                 let routes = self.tensor(routes);
+                if table.streams() {
+                    linear::moe::note_routes(self.ctx(), op, routes, codes.rows, table.hits)?;
+                }
                 // A batch's routes quantized as the deployment says, on the
-                // FP8 MMA where there is one (W8A8).
-                if linear::moe::fp8_w8a8_capable()
+                // FP8 MMA where there is one (W8A8), whose kernels read an
+                // exponent a 128 of K: an MXFP8 bank's (one a 32) stays W8A16.
+                if gran == 128
+                    && linear::moe::fp8_w8a8_capable()
                     && routes.rows * routes.width >= linear::moe::FP8_W8A8_FROM
                     && linear::moe::fp8_select_takes(x, self.tensor(y).width)
                 {
@@ -2452,6 +2560,7 @@ impl Run<'_> {
                         codes.rows,
                         routes,
                         &mut self.tensor(y),
+                        table,
                     );
                 }
                 linear::moe::select_fp8_w8a16(
@@ -2465,6 +2574,7 @@ impl Run<'_> {
                     routes,
                     &mut self.tensor(y),
                     None,
+                    table,
                 )
             }
             stored => Err(kernels_cuda::Error::Backend {
@@ -2692,7 +2802,7 @@ impl Run<'_> {
             per_tensor_e4m3_is_a_table("linear.matmul", codes)?;
         }
         match self.maybe_planes(*w) {
-            Some((codes, scales, biases, seat)) if codes.dtype == Dtype::Nvfp4 => {
+            Some((codes, scales, biases)) if codes.dtype == Dtype::Nvfp4 => {
                 linear::dequant::nvfp4_matmul(
                     self.ctx(),
                     "linear.matmul",
@@ -2701,18 +2811,17 @@ impl Run<'_> {
                     scales,
                     tensor_scales("linear.matmul", biases)?,
                     &mut self.tensor(*y),
-                    seat,
+                    GroupSeat::RESIDENT,
                 )
             }
-            Some((codes, scales, biases, seat)) => {
+            Some((codes, scales, biases)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry =
-                    if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
-                        linear::dequant::matmul_via_dense
-                    } else {
-                        linear::affine::matmul
-                    };
+                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && held {
+                    linear::dequant::matmul_via_dense
+                } else {
+                    linear::affine::matmul
+                };
                 entry(
                     self.ctx(),
                     act,
@@ -2722,7 +2831,7 @@ impl Run<'_> {
                     biases,
                     Dtype::Bf16,
                     &mut self.tensor(*y),
-                    seat,
+                    GroupSeat::RESIDENT,
                 )
             }
             None => match self.maybe_stored(*w) {
@@ -2752,7 +2861,7 @@ impl Run<'_> {
             per_tensor_e4m3_is_a_table("linear.matmul", codes)?;
         }
         match self.maybe_planes(*w) {
-            Some((codes, scales, biases, seat)) if codes.dtype == Dtype::Nvfp4 => {
+            Some((codes, scales, biases)) if codes.dtype == Dtype::Nvfp4 => {
                 linear::dequant::nvfp4_matmul(
                     self.ctx(),
                     "linear.matmul",
@@ -2761,18 +2870,17 @@ impl Run<'_> {
                     scales,
                     tensor_scales("linear.matmul", biases)?,
                     &mut self.tensor(*y),
-                    seat,
+                    GroupSeat::RESIDENT,
                 )
             }
-            Some((codes, scales, biases, seat)) => {
+            Some((codes, scales, biases)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry =
-                    if act.rows >= self.ctx().tuning().qmm_gemm_from && !seat.streams() && held {
-                        linear::dequant::lm_head_via_dense
-                    } else {
-                        linear::affine::lm_head
-                    };
+                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && held {
+                    linear::dequant::lm_head_via_dense
+                } else {
+                    linear::affine::lm_head
+                };
                 entry(
                     self.ctx(),
                     act,
@@ -2782,7 +2890,7 @@ impl Run<'_> {
                     biases,
                     Dtype::Bf16,
                     &mut self.tensor(*y),
-                    seat,
+                    GroupSeat::RESIDENT,
                 )
             }
             None => match self.maybe_stored(*w) {

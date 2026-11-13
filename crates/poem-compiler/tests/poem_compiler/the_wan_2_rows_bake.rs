@@ -167,7 +167,7 @@ fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
                 .filter(|row| matches!(row, CacheRow::State { .. }))
                 .count();
             let kvs = plan.caches.len() - states;
-            assert_eq!(kvs, 0, "{deployment} {platform:?}: no kv space anywhere");
+            assert_eq!(kvs, 0, "{deployment} {platform:?}: no kv row anywhere");
             let want = if is_flagship(deployment) { 32 + 24 } else { 0 };
             assert_eq!(
                 states, want,
@@ -482,7 +482,6 @@ fn the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk() {
             assert_eq!(
                 plan.values[lanes.0 as usize].def,
                 Def::Input(RuntimeInput::Geometry {
-                    space: 0,
                     kind: GeomKind::RequestOfToken
                 }),
                 "{deployment}: the broadcast is the fire's token→lane table"

@@ -18,12 +18,19 @@ pub struct Seated<'a> {
     pub kv_less: bool,
     pub translation: &'a [u32],
     pub window: &'a [u32],
-    pub window_copies: &'a [(u32, u32)],
+    /// The lane's slot refs of the window lists past the first, narrowest
+    /// first: a list each, where lanes name slot refs.
+    pub more_windows: &'a [&'a [u32]],
     pub mask: Option<&'a Masking>,
     pub adapter: Option<u32>,
     pub rs: RsVerb,
     pub rs_reset: RsReset,
     pub rs_slot: Option<u32>,
+    /// The record the lane's state is read from where its fire folds
+    /// nothing into it (a lane beside the one that folds, in one fire of one
+    /// working set): the record as it stood before the fire, while the
+    /// lane's rows land in `rs_slot`'s. `None`: `rs_slot`'s.
+    pub rs_read: Option<u32>,
     pub rs_snapshots: &'a [RsSnapshot],
     pub readout: Option<&'a [u32]>,
     pub group: Option<u32>,
@@ -43,12 +50,13 @@ impl<'a> Seated<'a> {
             kv_less: false,
             translation: &[],
             window: &[],
-            window_copies: &[],
+            more_windows: &[],
             mask: None,
             adapter: None,
             rs: RsVerb::Fold,
             rs_reset: RsReset::Inferred,
             rs_slot: None,
+            rs_read: None,
             rs_snapshots: &[],
             readout: None,
             group: None,

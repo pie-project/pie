@@ -132,6 +132,7 @@ fn check_on(case: &Case, fused: Arm) {
             commit_len,
             begin_at,
             fused_decay: false,
+            segments: kernels_cuda::Segments::ONE,
             snapshots: kernels_cuda::Snapshots::NONE,
         };
         let narrow = !serial && matches!(fused, Arm::ScanBf16 | Arm::Tc5Bf16);

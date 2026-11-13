@@ -18,6 +18,8 @@ enum Step {
     ShortRs {
         need: RsUnits,
         fund_by_eviction: bool,
+        /// Pages gathered past the head's own kv need.
+        surplus: u32,
     },
     ServeAllocation {
         key: EntryKey,
@@ -46,6 +48,12 @@ enum Board {
 
 impl ResidencyPlanner {
     pub fn plan(self: &Arc<Self>) {
+        self.plan_once();
+        // A waiter served or gone lacks nothing now.
+        self.report_short();
+    }
+
+    fn plan_once(self: &Arc<Self>) {
         if self.pause_due.swap(false, Ordering::AcqRel) {
             self.pause_held();
         }
@@ -53,6 +61,9 @@ impl ResidencyPlanner {
         loop {
             let (rs_free, rs_total) = self.port.rs_stats();
             let rs_growth = self.rs_growth();
+            // What the device has free past the pages the head gathered:
+            // room a restore may take.
+            let spare = self.port.device_stats().0;
             let step = self.with_inner(|inner| {
                 let Some((key, waiter)) = inner.unmet_head() else {
                     if inner.accum.len() > 0 && inner.queue.is_empty() {
@@ -82,6 +93,7 @@ impl ResidencyPlanner {
                     return Step::ShortRs {
                         need: seated.sub(rs_free),
                         fund_by_eviction: !is_restore || inner.fleet_stalled(),
+                        surplus: (inner.accum.len() as u32).saturating_sub(waiter.kv_need()),
                     };
                 }
                 match demand {
@@ -90,10 +102,17 @@ impl ResidencyPlanner {
                         extra: inner.burst_shortfall(),
                     },
                     None => {
-                        if inner.completion_credit == 0 && !inner.fleet_stalled() {
+                        // A restore goes back once a resident process has
+                        // finished (its credit), or the fleet can do nothing
+                        // else, or the device has room for it and still a
+                        // page for each resident lane's next one: suspended
+                        // processes come back as soon as room appears, every
+                        // one it holds at once, not one a completion.
+                        if inner.completion_credit > 0 {
+                            inner.completion_credit -= 1;
+                        } else if spare < inner.growth_reserve() && !inner.fleet_stalled() {
                             return Step::Done;
                         }
-                        inner.completion_credit = inner.completion_credit.saturating_sub(1);
                         Step::ServeRestore { key, pid }
                     }
                 }
@@ -111,13 +130,18 @@ impl ResidencyPlanner {
                     if self.absorb_free(count) {
                         continue;
                     }
-                    if self.port.grow(count) {
+                    if self.port.grow_pages(count) {
+                        return;
+                    }
+                    // Idle cache a policy keys above the floor moves down
+                    // a tier before any is dropped; the rest is dropped.
+                    if self.demote_idle(count) {
                         return;
                     }
                     if self.reclaim_idle_once() {
                         continue;
                     }
-                    if self.sweep_stranded(count) {
+                    if self.sweep_stranded(count, false) {
                         return;
                     }
                     fund_by_eviction
@@ -125,12 +149,42 @@ impl ResidencyPlanner {
                 Step::ShortRs {
                     need,
                     fund_by_eviction,
+                    surplus,
                 } => {
+                    // On a shared pool the pages gathered for an earlier head
+                    // (one that left, or a restart's) hold chunks this head's
+                    // state could take: they go back before anything moves.
+                    // Kept, they starved every replay of a restarted process
+                    // of the state slot its lanes asked for.
+                    if surplus > 0 && self.port.rs_as_pages(need) > 0 {
+                        let spare = self.with_inner(|inner| {
+                            let keep = inner.unmet_head().map_or(0, |(_, head)| head.kv_need());
+                            let spare = (inner.accum.len() as u32).saturating_sub(keep);
+                            inner.accum.donate(spare)
+                        });
+                        if spare.len() > 0 {
+                            drop(spare);
+                            continue;
+                        }
+                    }
                     if self.port.grow_rs(need) {
                         return;
                     }
-                    if self.reclaim_idle_once() || self.yield_head_checkpoints() {
+                    // On a shared pool the chunks idle cache holds open for
+                    // state too: what is keyed above the floor moves down a
+                    // tier before any is dropped.
+                    let as_pages = self.port.rs_as_pages(need);
+                    if as_pages > 0 && self.demote_idle(as_pages) {
+                        return;
+                    }
+                    if self.reclaim_idle_once() || self.reclaim_head_sharing() {
                         continue;
+                    }
+                    // And the tails of sets at rest past what their keys
+                    // keep, lowest key first, before any set moves whole
+                    // (its state with it).
+                    if as_pages > 0 && self.sweep_stranded(as_pages, true) {
+                        return;
                     }
                     fund_by_eviction
                 }
@@ -158,7 +212,7 @@ impl ResidencyPlanner {
                             unreachable!("ServeAllocation only targets allocation entries");
                         };
                         debug_assert!(outcome.is_none(), "unserved head carries no outcome");
-                        *outcome = Some(Ok(AllocationGrant::new(demand, kv, rs)));
+                        *outcome = Some(Ok(AllocationGrant::new(kv, rs)));
                         ServeOutcome::Served(notify.clone())
                     });
                     match outcome {

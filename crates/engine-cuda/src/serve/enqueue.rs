@@ -103,21 +103,6 @@ impl Shell {
         p: &mut Prepared<'_>,
         slot: &SlotGuard,
     ) -> Result<(u32, Option<Readback>)> {
-        let page_size = self.pools.paging().page_size;
-        let window_copies: Vec<engine::transfer::KvRun> = p
-            .lanes
-            .iter()
-            .flat_map(|lane| lane.window_copies)
-            .map(|&(src, dst)| engine::transfer::KvRun {
-                src_page: src,
-                src_token: 0,
-                dst_page: dst,
-                dst_token: 0,
-                tokens: page_size,
-            })
-            .collect();
-        self.pools
-            .copy_kv(self.device.stream(), &[], &window_copies)?;
         let seq = self.airborne.next_seq();
         self.cache.at_step(seq);
         if p.rs.rows_ext > 0 {
@@ -151,6 +136,7 @@ impl Shell {
             graphs: self.graphs,
             pad: self.pad,
             arming: self.arming,
+            arm_cold: self.arm_cold,
             golden_arm: self.golden_arm,
             cache: &mut self.cache,
             programs: &mut self.programs,
@@ -213,6 +199,7 @@ struct FireCtx<'a> {
     graphs: Graphs,
     pad: bool,
     arming: bool,
+    arm_cold: bool,
     golden_arm: Golden,
     cache: &'a mut GraphCache,
     programs: &'a mut ProgramPlane,
@@ -528,8 +515,10 @@ impl FireCtx<'_> {
             Some(forked) if forks => (forked, true),
             _ => (&self.compiled.arena, false),
         };
-        let mut slots = self.arena.slots(
+        let mut slots = self.arena.fire_slots(
+            self.pools,
             map,
+            forked,
             poem_compiler::FireRows {
                 tokens: carve_rows,
                 lanes: carve_lanes,
@@ -621,8 +610,8 @@ impl FireCtx<'_> {
         let handles = &staged.handles;
 
         let mut geometry = Vec::with_capacity(p.geometries.len());
-        for (space, host) in p.geometries.iter().enumerate() {
-            let seat = handles.spaces[space];
+        for (table, host) in p.geometries.iter().enumerate() {
+            let seat = handles.page_tables[table];
             geometry.push(CacheGeometry {
                 indptr: Some(seat.indptr),
                 indices: Some(seat.indices),
@@ -699,11 +688,14 @@ impl FireCtx<'_> {
                 .collect(),
             inputs: staged.inputs.clone(),
             geometry,
+            window_tables: self.pools.window_tables(),
             schedules,
             plan_values: facts.plans.len(),
             tables: FireTables {
                 mask_indptr: handles.mask_indptr,
                 pool_state: self.pools.pool_slabs(),
+                row_tables: self.pools.row_tables(),
+                expert_tables: self.pools.expert_tables(),
             },
             device: self.device.device(),
             toggles: self.device.toggles(),
@@ -798,30 +790,43 @@ impl FireCtx<'_> {
         let rs_scratch = (p.rs.rows_ext > 0)
             .then(|| {
                 self.rs_scratch
-                    .map(|(ptr, bytes)| crate::run::RsScratch::new(ptr, bytes))
+                    .zip(self.buffers)
+                    .map(|((ptr, bytes), buffers)| {
+                        crate::run::RsScratch::new(ptr, bytes, buffers.ext_row_bytes())
+                    })
             })
             .flatten();
-        if p.rs.buffered
-            && let Some(pool) = self.buffers
+        if p.rs.body.buffers()
+            && let Some(buffers) = self.buffers
         {
+            let tables = staged.handles.rs.ok_or_else(|| Fault::Unbound {
+                what: "the rs tables of a fire whose lanes buffer recurrent rows, which it \
+                       staged none of"
+                    .to_string(),
+            })?;
             run = run.buffered(RsSeat {
-                buffers: pool,
-                lanes: &p.rs.moves,
-                reads: &p.rs.reads,
+                buffers,
+                tables: kernels_cuda::runtime::channel::RsTables {
+                    lanes: tables.lanes,
+                    pages: tables.pages,
+                    replay_tok: tables.replay_tok,
+                    page_tokens: buffers.page_tokens(),
+                },
+                extended: p.rs.body == record::RsBody::Replays,
+                replays: &p.rs.replays,
                 scratch: rs_scratch.as_ref(),
             });
         }
         super::btrace::mark("run_new");
-        let records = self.graphs.records()
-            && !p.rs.buffered
-            && !self.weights.rotating()
-            && !self.weights.hosts_experts();
+        let records = self.graphs.records();
         let walked = if records {
             if self.arming && !p.bodied {
                 Ok(())
             } else if p.bodied {
                 let fire = record::Fire {
                     eager_twin: self.golden_arm == Golden::Eager,
+                    arming: self.arming && self.golden_arm == Golden::Off,
+                    cold: self.arm_cold,
                     trace: self.trace,
                     compiled: self.compiled,
                     descriptor: &p.descriptor,
@@ -838,10 +843,14 @@ impl FireCtx<'_> {
                     towered: p.towered,
                     ceilings,
                     islands: &p.islands,
+                    rs: p.rs.body,
                 };
 
                 self.cache.fire_body(&fire, &mut run, &place)
             } else {
+                self.cache.eager_walk(p.rs.body.buffers());
+                self.cache
+                    .eager_unbodied("its composition is one a body does not carry");
                 let mut cursor = Cursor::new(&place);
                 walk(
                     self.trace,
@@ -854,19 +863,7 @@ impl FireCtx<'_> {
                 .map_err(Fault::from)
             }
         } else {
-            if self.graphs.records() {
-                self.cache.eager_walk(
-                    self.weights.rotating() || self.weights.hosts_experts(),
-                    p.rs.buffered,
-                );
-            }
             let mut cursor = Cursor::new(&place);
-            if let Some(rotor) = self.weights.rotor() {
-                cursor = cursor.pumping(crate::window::Pump {
-                    rotor,
-                    compute: self.device.stream(),
-                });
-            }
             walk(
                 self.trace,
                 self.compiled,

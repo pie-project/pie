@@ -1,6 +1,7 @@
 #include <metal_stdlib>
 #include "../register_mma.h"
 #include "../../prim/register_table.h"
+#include "expert_at.h"
 using namespace metal;
 
 // Up to eight tokens' routed experts on the register tile
@@ -28,11 +29,14 @@ inline ulong table_width(uint width) { return 8 * ulong(width) + width / 2; }
 // sums: the register tile's chains (`affine_qmm_sg`), each fragment its own
 // column, two groups a step with the next two's words, scales and biases in
 // flight.
+// Column `f`'s codes, scales and biases are `codes[f]`, `scales[f]` and
+// `biases[f]` (see `Columns`).
 template <int NF>
-__attribute__((always_inline)) inline void chains(thread float2 (&acc)[NF], const device uint *codes,
-                                                  const device bfloat *scales, const device bfloat *biases,
-                                                  thread const ulong (&column)[NF], uint c, ulong words,
-                                                  ulong groups, const device vec<bfloat, 16> *xt,
+__attribute__((always_inline)) inline void chains(thread float2 (&acc)[NF],
+                                                  thread const device uint *const (&codes)[NF],
+                                                  thread const device bfloat *const (&scales)[NF],
+                                                  thread const device bfloat *const (&biases)[NF],
+                                                  uint c, ulong groups, const device vec<bfloat, 16> *xt,
                                                   const device float *sums, uint fn) {
   using namespace register_mma;
   constexpr int U = 2;
@@ -40,9 +44,9 @@ __attribute__((always_inline)) inline void chains(thread float2 (&acc)[NF], cons
   const device bfloat *s[NF], *b[NF];
 #pragma unroll
   for (int f = 0; f < NF; ++f) {
-    w[f] = reinterpret_cast<const device uint2 *>(codes + column[f] * words) + c;
-    s[f] = scales + column[f] * groups;
-    b[f] = biases + column[f] * groups;
+    w[f] = reinterpret_cast<const device uint2 *>(codes[f]) + c;
+    s[f] = scales[f];
+    b[f] = biases[f];
     acc[f] = float2(0.0f);
   }
   uint2 q[U][NF];
@@ -102,6 +106,45 @@ __attribute__((always_inline)) inline void chains(thread float2 (&acc)[NF], cons
     }
   }
 }
+
+// Where row `r` of a tile's expert `expert` lies in each plane of a 4-bit,
+// 64-group affine bank of `width` inputs and `rows` output rows an expert:
+// the shared expert's (`own`) in its own planes, a routed expert's where
+// the bank lays it, or where its expert table puts the row's piece.
+struct Columns {
+  const device uint *codes;
+  const device bfloat *scales, *biases;
+  const device uint *shared_codes;
+  const device bfloat *shared_scales, *shared_biases;
+  const device ExpertPlaneAt *codes_at, *scales_at, *biases_at;
+  int pieces, piece_rows;
+  ulong words, groups, rows;
+
+  template <typename P>
+  const device P *at(const device P *bank, const device ExpertPlaneAt *table, ulong row_bytes,
+                     uint expert, uint r) const {
+    if (pieces <= 0) {
+      return reinterpret_cast<const device P *>(reinterpret_cast<const device char *>(bank) +
+                                                (ulong(expert) * rows + r) * row_bytes);
+    }
+    const uint piece = r / uint(piece_rows);
+    return reinterpret_cast<const device P *>(table[expert * uint(pieces) + piece].at +
+                                              ulong(r % uint(piece_rows)) * row_bytes);
+  }
+
+  void row(bool own, uint expert, uint r, thread const device uint *&w,
+           thread const device bfloat *&s, thread const device bfloat *&b) const {
+    if (own) {
+      w = shared_codes + ulong(r) * words;
+      s = shared_scales + ulong(r) * groups;
+      b = shared_biases + ulong(r) * groups;
+      return;
+    }
+    w = at(codes, codes_at, words * 4, expert, r);
+    s = at(scales, scales_at, groups * 2, expert, r);
+    b = at(biases, biases_at, groups * 2, expert, r);
+  }
+};
 
 // A lane's (fm, fn) and the word pair c it reads, as `affine_qmm_sg` maps them.
 struct Lane {
@@ -353,6 +396,7 @@ template <int HF, int SG>
     const device bfloat *tables [[buffer(6)]], device bfloat *hidden [[buffer(7)]],
     const device int *tiles [[buffer(8)]], constant int &width [[buffer(9)]],
     constant int &inter [[buffer(10)]], constant int &experts [[buffer(11)]],
+    PIE_EXPERT_TABLE_ARGS,
     uint2 position [[threadgroup_position_in_grid]], uint2 grid [[threadgroups_per_grid]],
     uint lid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
     uint simd [[simdgroup_index_in_threadgroup]]) {
@@ -364,21 +408,23 @@ template <int HF, int SG>
   const uint local = simd * 8 * HF + l.fm;
   const uint at = position.x * COLUMNS + local;
   const ulong words = ulong(width) / 8, groups = ulong(width) / 64;
+  const moe_sg::Columns planes{codes,     scales,    biases,     shared_codes, shared_scales,
+                               shared_biases, codes_at, scales_at, biases_at,  pieces,
+                               piece_rows, words,    groups,    2 * ulong(inter)};
   const int count = tiles[0];
   for (uint tile = position.y; int(tile) < count; tile += grid.y) {
     const int expert = tiles[1 + tile];
     const bool own = expert == experts;
-    const ulong first = own ? 0 : ulong(expert) * 2 * ulong(inter);
-    ulong column[NF];
+    const device uint *cw[NF];
+    const device bfloat *cs[NF], *cb[NF];
 #pragma unroll
     for (int f = 0; f < HF; ++f) {
-      column[f] = first + at + 8 * f;
-      column[HF + f] = first + inter + at + 8 * f;
+      planes.row(own, uint(expert), at + 8 * f, cw[f], cs[f], cb[f]);
+      planes.row(own, uint(expert), uint(inter) + at + 8 * f, cw[HF + f], cs[HF + f], cb[HF + f]);
     }
     const device bfloat *table = tables + tile * moe_sg::table_width(width);
     float2 acc[NF];
-    moe_sg::chains<NF>(acc, own ? shared_codes : codes, own ? shared_scales : scales,
-                       own ? shared_biases : biases, column, l.c, words, groups,
+    moe_sg::chains<NF>(acc, cw, cs, cb, l.c, groups,
                        reinterpret_cast<const device vec<bfloat, 16> *>(table) + l.fm * 4 + l.c,
                        register_table::sums(const_cast<device bfloat *>(table), width), l.fn);
     device bfloat *out = hidden + tile * moe_sg::table_width(inter);
@@ -412,8 +458,8 @@ template <int HF, int SG>
   affine_qmm_sg_glu_routed<hf, sg>(                                                                \
       const device uint *, const device bfloat *, const device bfloat *, const device uint *,      \
       const device bfloat *, const device bfloat *, const device bfloat *, device bfloat *,        \
-      const device int *, constant int &, constant int &, constant int &, uint2, uint2, uint,      \
-      uint, uint);
+      const device int *, constant int &, constant int &, constant int &, PIE_EXPERT_TABLE_TYPES,  \
+      uint2, uint2, uint, uint, uint);
 PIE_MOE_SG_GLU(1, 4)
 PIE_MOE_SG_GLU(1, 8)
 PIE_MOE_SG_GLU(1, 16)
@@ -433,26 +479,29 @@ template <int SG>
     const device bfloat *tables [[buffer(6)]], device bfloat *out [[buffer(7)]],
     const device int *tiles [[buffer(8)]], constant int &width [[buffer(9)]],
     constant int &columns [[buffer(10)]], constant int &experts [[buffer(11)]],
-    const device int *rows [[buffer(12)]], uint2 position [[threadgroup_position_in_grid]],
+    const device int *rows [[buffer(12)]], PIE_EXPERT_TABLE_ARGS,
+    uint2 position [[threadgroup_position_in_grid]],
     uint2 grid [[threadgroups_per_grid]], uint lane [[thread_index_in_simdgroup]],
     uint simd [[simdgroup_index_in_threadgroup]]) {
   constexpr int NF = 2;
   const moe_sg::Lane l = moe_sg::lane_of(lane);
   const uint at = position.x * 8 * NF * SG + simd * 8 * NF + l.fm;
   const ulong words = ulong(width) / 8, groups = ulong(width) / 64;
+  const moe_sg::Columns planes{codes,     scales,    biases,     shared_codes, shared_scales,
+                               shared_biases, codes_at, scales_at, biases_at,  pieces,
+                               piece_rows, words,    groups,    ulong(columns)};
   const int count = tiles[0];
   for (uint tile = position.y; int(tile) < count; tile += grid.y) {
     const int expert = tiles[1 + tile];
     const bool own = expert == experts;
-    const ulong first = own ? 0 : ulong(expert) * ulong(columns);
-    ulong column[NF];
+    const device uint *cw[NF];
+    const device bfloat *cs[NF], *cb[NF];
 #pragma unroll
     for (int f = 0; f < NF; ++f)
-      column[f] = first + at + 8 * f;
+      planes.row(own, uint(expert), at + 8 * f, cw[f], cs[f], cb[f]);
     const device bfloat *table = tables + tile * moe_sg::table_width(width);
     float2 acc[NF];
-    moe_sg::chains<NF>(acc, own ? shared_codes : codes, own ? shared_scales : scales,
-                       own ? shared_biases : biases, column, l.c, words, groups,
+    moe_sg::chains<NF>(acc, cw, cs, cb, l.c, groups,
                        reinterpret_cast<const device vec<bfloat, 16> *>(table) + l.fm * 4 + l.c,
                        register_table::sums(const_cast<device bfloat *>(table), width), l.fn);
 #pragma unroll
@@ -472,7 +521,7 @@ template <int SG>
       const device uint *, const device bfloat *, const device bfloat *, const device uint *,      \
       const device bfloat *, const device bfloat *, const device bfloat *, device bfloat *,        \
       const device int *, constant int &, constant int &, constant int &, const device int *,      \
-      uint2, uint2, uint, uint);
+      PIE_EXPERT_TABLE_TYPES, uint2, uint2, uint, uint);
 PIE_MOE_SG_DOWN(4)
 PIE_MOE_SG_DOWN(8)
 PIE_MOE_SG_DOWN(16)

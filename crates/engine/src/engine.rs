@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::AdapterRegistration;
 use crate::caps::DeviceFacts;
 use crate::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
+use crate::chunk::{Evacuation, SlotCopy, WeightResidency, WeightUses};
 use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
@@ -115,42 +116,72 @@ pub trait Engine: Send {
 
     fn submit(&mut self, frame: &FrameSubmission) -> Result<FrameTicket>;
 
-    /// Puts memory under every kv page below `kv_pages` and every state
-    /// slot, ahead of the runtime handing any of them out, so no frame finds
-    /// its pages unbacked. A refusal leaves what was committed standing. A
-    /// pool that is whole from its load has nothing to do.
-    fn commit_pool(&mut self, kv_pages: u32) -> Result<()> {
-        let _ = kv_pages;
-        Ok(())
+    /// Backs the pool's first `segments` segments
+    /// ([`crate::chunk::ChunkFacts::segments`]), ahead of the runtime
+    /// handing out any of their chunks; never on a fire's path. A refusal
+    /// leaves what was committed standing.
+    fn commit_segments(&mut self, segments: u32) -> Result<()> {
+        let _ = segments;
+        Err(self.unsupported("commit_segments"))
     }
 
-    /// Gives back the memory under every kv page at and past `kv_pages`. No
-    /// frame reads those pages: the runtime has moved what they held and
-    /// waited out every frame that named them, so nothing here drains.
-    fn release_pool(&mut self, kv_pages: u32) -> Result<()> {
-        let _ = kv_pages;
-        Ok(())
+    /// Gives back every segment at and past `segments`. The runtime has
+    /// evacuated their chunks and waited out every frame that named them.
+    fn release_segments(&mut self, segments: u32) -> Result<()> {
+        let _ = segments;
+        Err(self.unsupported("release_segments"))
     }
 
-    /// Puts memory under every state slot and buffer page below `slots`,
-    /// where `PoolFacts::elastic_state_slot_bytes` says it does not stand
-    /// from the load.
-    fn commit_state(&mut self, slots: u32) -> Result<()> {
-        let _ = slots;
-        Ok(())
+    /// Copies each moved chunk's bytes onto its new physical chunk and
+    /// updates the engine's [`crate::chunk::ChunkTable`], stream-ordered
+    /// before the next fire; the slot refs the runtime holds stand.
+    fn evacuate(&mut self, evacuation: &Evacuation) -> Result<()> {
+        let _ = evacuation;
+        Err(self.unsupported("evacuate"))
     }
 
-    /// Gives back the memory under every state slot and buffer page at and
-    /// past `slots`; as [`Engine::release_pool`], no frame reads them.
-    fn release_state(&mut self, slots: u32) -> Result<()> {
-        let _ = slots;
-        Ok(())
+    /// Copies slots of one shape between tiers or within one; replaces
+    /// [`Engine::copy_kv`] and [`Engine::copy_state`] once every backend
+    /// serves it.
+    ///
+    /// Tiers (CONTRACT-BC 22): an engine that states
+    /// [`crate::chunk::ChunkFacts::host_chunks`] moves whole slots of every
+    /// state shape between its device domain and
+    /// [`crate::transfer::MemoryDomain::HostPinned`], a host ref `r` of
+    /// shape `s` at [`crate::chunk::SlotShape::tier_offset`] of its host
+    /// chunks, laid out as the device slot (one span a slot); one that
+    /// states [`crate::chunk::ChunkFacts::disk_chunks`] moves kv list slots
+    /// between the device (or the host tier) and
+    /// [`crate::transfer::MemoryDomain::LocalDisk`], disk ref `r` slot `r`
+    /// of its kv slot file. Token runs are device to device only. Each copy
+    /// is ordered after every fire submitted before it and before every one
+    /// after (a stream-ordered copy, or a drain), and copies in submission
+    /// order: the runtime reuses a source slot and names a destination
+    /// again as soon as the call returns.
+    fn copy_slots(&mut self, copy: &SlotCopy) -> Result<()> {
+        let _ = copy;
+        Err(self.unsupported("copy_slots"))
     }
 
-    /// Gives back what fires have touched of the scratch, waiting out the
-    /// frames in flight; the next fires pay for what they touch again.
-    fn release_scratch(&mut self) -> Result<()> {
-        Ok(())
+    /// Which atoms of the streamable weights
+    /// ([`crate::chunk::ChunkFacts::weights`]) are resident from the next
+    /// fire on, and in which pool slots; the whole set each time. The
+    /// runtime calls it once a governor tick at most, ordered before the
+    /// next fire; the engine fills slots newly named (from its host copy)
+    /// before a fire reads them. A use of an atom not named is the
+    /// engine's: it streams through a staging slot and is not kept.
+    fn weight_residency(&mut self, residency: &WeightResidency) -> Result<()> {
+        let _ = residency;
+        Err(self.unsupported("weight_residency"))
+    }
+
+    /// How often fires read each streamable atom, resident or not: the
+    /// record the runtime orders the weight cache by. An engine may answer
+    /// a call behind (the reads between the two calls before, its use
+    /// counters read without waiting for the device), every read counted
+    /// once.
+    fn weight_uses(&mut self) -> Result<WeightUses> {
+        Err(self.unsupported("weight_uses"))
     }
 
     fn settles_asynchronously(&self) -> bool {
@@ -238,6 +269,31 @@ pub trait Engine: Send {
     fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> Result<()> {
         let _ = (slots, pages, bytes);
         Err(self.unsupported("write_host_state"))
+    }
+
+    /// The bytes of host tier slots (CONTRACT-BC 22): for each `(shape,
+    /// refs)` in order, each ref's slot of that shape at
+    /// [`crate::chunk::SlotShape::tier_offset`] of the host chunks, laid out
+    /// as the device slot (what [`Engine::copy_slots`] moves whole), one
+    /// slot after another; once every copy into them has landed (the
+    /// runtime waits on that copy's completion first). What a shared pool's
+    /// snapshot reads of a set's state: its record's pieces and its rs list
+    /// or window slots, parked on the host.
+    fn read_tier_slots(&mut self, slots: &[(crate::chunk::ShapeId, Vec<u32>)]) -> Result<Vec<u8>> {
+        let _ = slots;
+        Err(self.unsupported("read_tier_slots"))
+    }
+
+    /// Writes `bytes`, laid out as [`Engine::read_tier_slots`] returns
+    /// them, into host tier slots `slots`; a later [`Engine::copy_slots`]
+    /// from the host tier reads them.
+    fn write_tier_slots(
+        &mut self,
+        slots: &[(crate::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let _ = (slots, bytes);
+        Err(self.unsupported("write_tier_slots"))
     }
 
     fn disconnect(&self, message: &str) {

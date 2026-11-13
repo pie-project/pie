@@ -93,7 +93,6 @@ impl Replay {
 
             lane.tokens.drain(..skipped);
             lane.kv.held += skipped as u32;
-            lane.kv.window_copies.clear();
             if lane.rs_reset == RsReset::Fresh {
                 lane.rs_reset = RsReset::Held;
             }
@@ -145,7 +144,6 @@ mod tests {
             kv: KvDelta {
                 held,
                 pages: (0..(held + rows).div_ceil(64)).collect(),
-                window_copies: vec![(1, 2)],
                 ..KvDelta::default()
             },
             rs_reset: RsReset::Fresh,
@@ -180,7 +178,6 @@ mod tests {
         assert_eq!(lead.tokens, (0..872).collect::<Vec<u32>>());
         assert_eq!(lead.kv.held, 64);
         assert_eq!(lead.readout, Readout::None);
-        assert_eq!(lead.kv.window_copies, vec![(1, 2)]);
         assert_eq!(head.lanes[1].tokens.len(), 172);
 
         assert_eq!(tail.lanes.len(), 4);
@@ -193,7 +190,6 @@ mod tests {
         assert_eq!(cut.tokens, (872..1000).collect::<Vec<u32>>());
         assert_eq!(cut.kv.held, 64 + 872);
         assert_eq!(cut.word, 0b1);
-        assert!(cut.kv.window_copies.is_empty());
         assert_eq!(
             cut.rs_reset,
             RsReset::Held,

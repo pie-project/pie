@@ -195,6 +195,11 @@ struct Deployment {
     patch_points: Vec<u32>,
     decoders: Vec<usize>,
     prefilling: Vec<usize>,
+    /// The classes keyed only for a speculative decoder's fires (plain but
+    /// for reading the drafts): armed alone, never beside another class.
+    drafting: Vec<usize>,
+    /// The buckets a drafter's class is armed at (`Shell::rs_rungs`).
+    rs_rungs: Vec<u32>,
     media: Vec<usize>,
     wide: Vec<usize>,
     decoding: poem_ir::ClassSet,
@@ -238,6 +243,9 @@ fn decode_keys(deployment: &Deployment, into: &mut Targets) {
 fn prefill_keys(deployment: &Deployment, into: &mut Targets) {
     for point in deployment.buckets.iter().copied() {
         for class in deployment.prefilling.iter().copied() {
+            if deployment.drafting.contains(&class) && !deployment.rs_rungs.contains(&point) {
+                continue;
+            }
             match Shell::spread(
                 point,
                 deployment.seats.min(match deployment.prefill_lanes {
@@ -261,9 +269,10 @@ fn prefill_keys(deployment: &Deployment, into: &mut Targets) {
 }
 
 fn mixed_keys(deployment: &Deployment, into: &mut Targets) {
+    let alone = |class: &usize| !deployment.drafting.contains(class);
     for point in deployment.buckets.iter().copied() {
-        for decode in deployment.decoders.iter().copied() {
-            for class in deployment.prefilling.iter().copied() {
+        for decode in deployment.decoders.iter().copied().filter(alone) {
+            for class in deployment.prefilling.iter().copied().filter(alone) {
                 let rows = (point >= 2 && deployment.seats >= 2)
                     .then(|| {
                         Shell::spread(
@@ -330,6 +339,7 @@ fn wide_keys(deployment: &Deployment, into: &mut Targets) {
             .wide
             .iter()
             .copied()
+            .filter(|class| !deployment.drafting.contains(class))
             .filter(|class| deployment.decoding.contains(*class))
             .take(seats)
             .collect();
@@ -337,6 +347,7 @@ fn wide_keys(deployment: &Deployment, into: &mut Targets) {
             .wide
             .iter()
             .copied()
+            .filter(|class| !deployment.drafting.contains(class))
             .filter(|class| !deployment.decoding.contains(*class))
             .take(seats.saturating_sub(decoders.len()))
             .collect();
@@ -429,8 +440,18 @@ impl Shell {
     }
 
     fn synthetic_lanes_with(&self, lanes: &[LaneRows], media: &[LaneMedia]) -> Vec<Synthetic> {
-        let slots = self.held.len().max(1) as u32;
         let page_size = u64::from(self.pools.paging().page_size).max(1);
+        // What the lanes name, inside the chunks the fit left the pool: a
+        // stated kv budget may hold fewer records and pages than the
+        // lattice's widest fire names, and a synthetic lane's rows are never
+        // read back, so its lanes share them there. The pool seats what a
+        // fire names for good, so every fire of the lattice folds into one
+        // room: the widest fire's.
+        let lanes_most = self.fire_lanes().max(1);
+        let (slots, room, windowed) = self.pools.synthetic_room(
+            (self.held.len().max(1) as u32).min(lanes_most),
+            u64::from(self.budget.max_tokens).div_ceil(page_size) + u64::from(lanes_most),
+        );
         let mut next_page = 0u64;
         let row_bytes = self.patch_seat.map_or(0, |seat| seat.row_bytes) as usize;
         let fold = (self.patch_fold as usize).max(1);
@@ -452,7 +473,7 @@ impl Shell {
                     pages: {
                         let pages = u64::from(rows).div_ceil(page_size).max(1);
                         let table: Vec<u32> = (next_page..next_page + pages)
-                            .map(|page| u32::try_from(page).unwrap_or(u32::MAX))
+                            .map(|page| u32::try_from(page % room).unwrap_or(u32::MAX))
                             .collect();
                         next_page += pages;
                         table
@@ -496,7 +517,13 @@ impl Shell {
             .map(|mut lane| {
                 // A synthetic lane's content is never read back, so its
                 // pages fold into the windowed pool past the null page.
-                let windowed = self.pools.paging().window_pages().saturating_sub(1).max(1);
+                let windowed = self
+                    .pools
+                    .paging()
+                    .window_pages()
+                    .min(windowed)
+                    .saturating_sub(1)
+                    .max(1);
                 if self.pools.has_windowed() {
                     lane.window = lane
                         .pages
@@ -552,13 +579,14 @@ impl Shell {
                 kv_less: false,
                 translation: &[],
                 window: &lane.window,
-                window_copies: &[],
+                more_windows: &[],
                 mask: lane.mask.as_ref(),
                 adapter: lane.adapter,
                 readout: None,
                 rs: RsVerb::Fold,
                 rs_reset: RsReset::Inferred,
                 rs_slot: None,
+                rs_read: None,
                 rs_snapshots: &[],
                 group: None,
                 inputs: &[],
@@ -867,13 +895,129 @@ impl Shell {
         }
     }
 
-    pub(super) fn arm_bodies(&mut self) -> Result<()> {
-        self.arm_lattice(false)
+    /// Arms the lattice over synthetic lanes. Their reads of the streamed
+    /// weights are the shell's, not a fire the runtime asked for: the use
+    /// record forgets them, so the runtime's first window orders the cache
+    /// by served tokens alone (a load arming at its starting residency arms
+    /// after the runtime last read the record).
+    /// The lattice's buckets a doubling past `engine.prefill_lattice_from`,
+    /// halved until the bodies of `rest` (the narrower prefill, mixed and
+    /// wide targets' buckets, still to arm) fit what the allowance has left
+    /// each at what the bodies of its kind armed so far weigh (`weighed`,
+    /// bytes and bodies a kind; the top bucket arms one of each first, and a
+    /// kind's bodies hold about as many nodes at any bucket, where kinds
+    /// differ: Qwen3.6-35B-A3B's mixed bodies 8.9 MiB, its lattice's 5.5 MiB
+    /// on average): a load whose
+    /// allowance arms every key keeps the profile's lattice, and one that
+    /// would leave keys to walk eagerly pads its fires to fewer buckets
+    /// instead. A coarser default lattice's buckets are the finer one's
+    /// every other past the fine rows, so nothing compiled changes. Returns
+    /// the buckets dropped; says so, and loudly where even the coarsest
+    /// lattice does not fit.
+    fn fit_lattice(
+        &mut self,
+        rest: &[(u32, Kind)],
+        weighed: &[(usize, usize); Kind::COUNT],
+    ) -> std::collections::BTreeSet<u32> {
+        let Some((steps, from, mut fine)) = self.lattice else {
+            return std::collections::BTreeSet::new();
+        };
+        let spent = self.cache.body_stats().census;
+        if spent.bodies == 0 {
+            return std::collections::BTreeSet::new();
+        }
+        let average = spent.bytes / spent.bodies;
+        let price = |kind: Kind| match weighed[kind.at()] {
+            (bytes, bodies) if bodies > 0 => bytes / bodies,
+            _ => average,
+        };
+        let was = self.budget.buckets.clone();
+        let mut buckets = was.clone();
+        let need = |buckets: &[u32]| {
+            rest.iter()
+                .filter(|(b, _)| buckets.contains(b))
+                .map(|&(_, kind)| price(kind))
+                .sum::<usize>()
+        };
+        // A profile's allowance stretches to the profile's lattice, as far
+        // as the fit before arming held the bodies and the device has free;
+        // an operator's stays as stated.
+        let left = self.bodies_mem.saturating_sub(spent.bytes);
+        let short = need(&buckets).saturating_sub(left);
+        if short > 0 && !self.bodies_stated {
+            let spare = self.pools.spare_bytes_for_bodies(0).unwrap_or(0);
+            let spare = usize::try_from(spare).unwrap_or(usize::MAX);
+            let more = short
+                .min(self.bodies_ceiling.saturating_sub(self.bodies_mem))
+                .min(spare.saturating_sub(left));
+            if more > 0 {
+                eprintln!(
+                    "engine-cuda: the bodies' allowance stretches {} -> {} MiB to arm the \
+                     profile's lattice ({} MiB of the cache rows' room held for it)",
+                    self.bodies_mem >> 20,
+                    (self.bodies_mem + more) >> 20,
+                    self.bodies_ceiling.saturating_sub(self.bodies_mem) >> 20,
+                );
+                self.bodies_mem += more;
+            }
+        }
+        // What the allowance has left, or the card where it has less: the
+        // ceiling's spare stops arming as the allowance does.
+        let allowance = self.bodies_mem.saturating_sub(spent.bytes);
+        let spare = self
+            .pools
+            .spare_bytes_for_bodies(allowance as u64)
+            .map_or(allowance, |spare| {
+                usize::try_from(spare).unwrap_or(usize::MAX)
+            });
+        let room = allowance.min(spare);
+        while need(&buckets) > room {
+            if fine <= steps.max(1) {
+                eprintln!(
+                    "engine-cuda: WARNING: [engine] bodies_mem {} MiB (or the card) arms no \
+                     lattice's every key: at {fine} bucket(s) a doubling past {from} rows the {} \
+                     narrower bodies still to arm weigh some {} MiB of the {} MiB left. Raise \
+                     bodies_mem or free the card.",
+                    self.bodies_mem >> 20,
+                    rest.iter().filter(|(b, _)| buckets.contains(b)).count(),
+                    need(&buckets) >> 20,
+                    room >> 20,
+                );
+                break;
+            }
+            fine /= 2;
+            buckets = crate::api::default_lattice(self.budget.max_tokens, steps, from, fine);
+            buckets.retain(|bucket| was.contains(bucket));
+        }
+        if buckets.len() < was.len() {
+            eprintln!(
+                "engine-cuda: [engine] bodies_mem {} MiB (or the card) arms every key at {fine} \
+                 bucket(s) a doubling past {from} rows, not the profile's {}: {} bucket(s), not \
+                 {} ({} bodies armed at {} KiB on average, {} still to arm at the profile's \
+                 lattice, {} MiB left).",
+                self.bodies_mem >> 20,
+                self.lattice.map_or(0, |(_, _, fine)| fine),
+                buckets.len(),
+                was.len(),
+                spent.bodies,
+                average >> 10,
+                rest.iter().filter(|(b, _)| was.contains(b)).count(),
+                room >> 20,
+            );
+        }
+        let dropped = was
+            .iter()
+            .filter(|b| !buckets.contains(b))
+            .copied()
+            .collect();
+        self.budget.buckets = buckets;
+        dropped
     }
 
-    pub fn verify_bodies(&mut self) -> Result<usize> {
-        self.arm_lattice(true)?;
-        Ok(self.armed.as_ref().map_or(0, |armed| armed.armed))
+    pub(super) fn arm_bodies(&mut self) -> Result<()> {
+        let armed = self.arm_lattice(false);
+        self.pools.forget_weight_uses(self.device.stream())?;
+        armed
     }
 
     /// Arms the lattice, an expert-parallel rank with its collectives
@@ -952,12 +1096,12 @@ impl Shell {
             points
         };
         let seats = self.held.len() as u32;
-        let context = if self.spaces == 0 {
+        let context = if self.page_tables == 0 {
             self.budget.max_tokens
         } else {
             self.pools.paging().context()
         };
-        let max_lanes = self.budget.max_lanes;
+        let max_lanes = self.fire_lanes();
         let classes = self.compiled.classes.classes.len();
         let textual = |class: usize| !self.media.contains(class);
         let staged = self
@@ -1000,6 +1144,10 @@ impl Shell {
                         && self.tiers.plain.contains(*class)
                 })
                 .collect(),
+            drafting: (0..classes)
+                .filter(|class| !self.landing[*class].iter().any(poem_ir::Request::plain))
+                .collect(),
+            rs_rungs: self.rs_rungs(),
             decoding: self.decoding.clone(),
             seats,
             context,
@@ -1030,6 +1178,59 @@ impl Shell {
         if targets.is_empty() {
             return Ok(());
         }
+        // A load that buffers recurrent rows serves a spec-decoding fire
+        // from a body too: each one-class composition (a verify's lanes, the
+        // prompts beside them) is recorded once more for lanes that buffer
+        // rows, and once more for lanes that replay them (`record::RsBody`),
+        // right after its folding body.
+        // Only a load that buffers recurrent rows and serves a drafter's
+        // fires (classes that read the drafts) takes them, for the drafter's
+        // classes; `rs-bodies` takes them for every class.
+        let buffering = self.buffers.is_some();
+        let every_class = super::diag::on().rs_bodies;
+        let drafting = deployment.drafting.clone();
+        let rungs = self.rs_rungs();
+        let targets: Vec<(u32, BodySynth, record::RsBody)> = targets
+            .into_iter()
+            .flat_map(|(bucket, target)| {
+                let class = match &target {
+                    BodySynth::Decode { class, .. } | BodySynth::Prefill { class, .. } => {
+                        Some(*class)
+                    }
+                    _ => None,
+                };
+                let buffers = buffering
+                    && rungs.contains(&bucket)
+                    && class.is_some_and(|class| every_class || drafting.contains(&class));
+                let treatments: &[record::RsBody] = if buffers {
+                    &[
+                        record::RsBody::Folds,
+                        record::RsBody::Buffers,
+                        record::RsBody::Replays,
+                    ]
+                } else {
+                    &[record::RsBody::Folds]
+                };
+                treatments
+                    .iter()
+                    .map(move |rs| (bucket, target.clone(), *rs))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        // The top bucket's bodies and every decode body arm first; the
+        // narrower prefill, mixed and wide ones after them are what the
+        // lattice coarsens to fit the allowance, each priced at what its
+        // kind's bodies armed so far weigh.
+        let narrower =
+            |bucket: u32, target: &BodySynth| Some(bucket) != top && target.kind() != Kind::Decode;
+        let rest: Vec<(u32, Kind)> = targets
+            .iter()
+            .filter(|(bucket, target, _)| narrower(*bucket, target))
+            .map(|(bucket, target, _)| (*bucket, target.kind()))
+            .collect();
+        let mut priced = verify || group || self.lattice.is_none();
+        let mut dropped = std::collections::BTreeSet::new();
+        let mut weighed = [(0usize, 0usize); Kind::COUNT];
 
         let mut armed = 0usize;
         let mut wanted = 0usize;
@@ -1044,12 +1245,27 @@ impl Shell {
         let mut peer_stopped = false;
         let unit_margin = self.pools.map_unit_bytes().saturating_mul(16);
         let mut ballot = Ballot::open(&self.device);
-        for (bucket, target) in targets {
+        for (bucket, target, rs) in targets {
+            if !priced && narrower(bucket, &target) {
+                priced = true;
+                dropped = self.fit_lattice(&rest, &weighed);
+            }
+            let weighed_before = self.cache.body_stats().census;
+            if dropped.contains(&bucket) {
+                continue;
+            }
+            self.arm_rs = rs;
+            // Past its kind's widest bucket a target captures cold: the top
+            // bucket's fires made what its warm fire would.
+            self.arm_cold = narrower(bucket, &target) && !verify;
             let spent = self.cache.body_stats();
             let room = (self.bodies_mem as u64).saturating_sub(spent.census.bytes as u64);
             let spare = self.pools.spare_bytes_for_bodies(room).unwrap_or(u64::MAX);
             let price = (2 * spent.census.bytes / spent.census.bodies.max(1)) as u64;
-            let margin = price.max(unit_margin);
+            // A map unit's margin never past a quarter of the allowance: an
+            // allowance the fit held under the margin would otherwise stop
+            // arming before its first body.
+            let margin = price.max(unit_margin.min(self.bodies_mem as u64 / 4));
             let headroom = spare < margin;
             let mine = !verify
                 && (spent.census.bodies >= record::MAX_BODIES
@@ -1102,7 +1318,17 @@ impl Shell {
                     refused = Some(format!("bucket {bucket}, {target}: {why}"));
                     break;
                 }
+                // Armed on its first fire (a cold capture): a second would
+                // only replay it.
+                if self
+                    .armed_body
+                    .as_ref()
+                    .is_some_and(|key| self.cache.holds_body(key))
+                {
+                    break;
+                }
             }
+            self.arm_cold = false;
             let key = self.armed_body.take();
             let warmed_ms = began.elapsed().as_secs_f64() * 1000.0;
             let mut golden_ms = (0f64, 0f64);
@@ -1121,6 +1347,11 @@ impl Shell {
             if key.as_ref().is_some_and(|key| self.cache.body_armed(key)) {
                 armed += 1;
                 tally[at].0 += 1;
+                let now = self.cache.body_stats().census;
+                if now.bodies > weighed_before.bodies {
+                    weighed[at].0 += now.bytes.saturating_sub(weighed_before.bytes);
+                    weighed[at].1 += now.bodies - weighed_before.bodies;
+                }
                 if let Some(wanted) = super::diag::on().arm_bench.as_deref()
                     && let Some(key) = key.as_ref()
                     && key.to_string().contains(wanted)
@@ -1197,12 +1428,8 @@ impl Shell {
                                 layout.join(" "),
                                 after.misses - before.misses,
                                 after.sealed_declines - before.sealed_declines,
-                                (after.eager_rotating
-                                    + after.eager_buffered
-                                    + after.eager_copy_world)
-                                    - (before.eager_rotating
-                                        + before.eager_buffered
-                                        + before.eager_copy_world)
+                                (after.eager_buffered + after.eager_copy_world)
+                                    - (before.eager_buffered + before.eager_copy_world)
                             ),
                             Err(why) => eprintln!("[arm-bench] {key} {what} refused: {why}"),
                         }
@@ -1250,6 +1477,7 @@ impl Shell {
             }
         }
 
+        self.arm_rs = record::RsBody::Folds;
         let stats = self.cache.body_stats();
         // An expert-parallel rank never captures past arming, whatever armed:
         // its peers fire other steps beside its, and an instantiation (a
@@ -1293,6 +1521,27 @@ impl Shell {
             seal,
         };
         eprintln!("engine-cuda: {report}");
+        // A load that records bodies serves every composition it fires from
+        // one: one that armed none, or stopped arming for want of room, would
+        // serve eagerly, which is never what a deployment asked for.
+        let attempted = wanted + never;
+        if records && !verify && !group && attempted > 0 && (armed == 0 || starved.is_some()) {
+            return Err(Fault::Residency(format!(
+                "the card does not hold this deployment's graph bodies: {} of {attempted} \
+                 compositions armed{}. A load that records bodies serves every composition \
+                 from one rather than eagerly. Lower `[engine] max_model_len` or the fire \
+                 rows, state a smaller `[model] device_kv_budget`, raise `[model] \
+                 device_memory_share`, or free what else holds the device. ({report})",
+                armed,
+                match starved {
+                    Some(spare) => format!(
+                        ", arming stopped with {} MiB spare under the ceiling",
+                        spare >> 20
+                    ),
+                    None => String::new(),
+                },
+            )));
+        }
         if super::diag::on().arm_trace {
             let slabs = kernels_cuda::jit::Slabs::census();
             let total: usize = slabs.iter().map(|(_, bytes)| *bytes).sum();

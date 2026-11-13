@@ -116,3 +116,40 @@ fn layout_rows() {
         );
     }
 }
+
+/// The column concat over unaligned widths (a byte a thread) and 16-byte
+/// runs lands each input's rows after the one before's.
+#[test]
+fn the_column_concat_lands_what_the_host_lands() {
+    let Some(gpu) = Gpu::open() else { return };
+    let rows = 37u32;
+    for widths in [[8u32, 3, 16], [8, 16, 64]] {
+        let parts: Vec<Vec<u16>> = widths
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| {
+                (0..rows * w)
+                    .map(|j| (j.wrapping_mul(2_654_435_761) >> 7) as u16 ^ (i as u16) << 12)
+                    .collect()
+            })
+            .collect();
+        let total: u32 = widths.iter().sum();
+        let xs: Vec<_> = parts
+            .iter()
+            .zip(widths)
+            .map(|(p, w)| gpu.upload(p, rows, w, Dtype::Bf16))
+            .collect();
+        let mut y = gpu.zeros(rows, total, Dtype::Bf16);
+        gather::concat_cols(&gpu.ctx(), &xs, &mut y).expect("the concat fires");
+        let got: Vec<u16> = gpu.read_as(&y);
+        let want: Vec<u16> = (0..rows as usize)
+            .flat_map(|r| {
+                parts
+                    .iter()
+                    .zip(widths)
+                    .flat_map(move |(p, w)| p[r * w as usize..(r + 1) * w as usize].to_vec())
+            })
+            .collect();
+        assert_eq!(got, want, "{widths:?}");
+    }
+}

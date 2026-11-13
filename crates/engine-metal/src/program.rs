@@ -20,7 +20,7 @@ use crate::error::{Fault, Result};
 
 pub use compile::{Cache, Compiled, Module, Region, Stage, Target};
 pub use launch::{ChannelShape, Cursor, Prepared, Rings};
-pub use session::{Blocked, Fired, Launched, Session, seeds_of};
+pub use session::{Blocked, Fired, Launched, Session};
 pub use shared::{MAX_ATTACHMENTS, SharedRing};
 
 #[derive(Debug)]
@@ -375,25 +375,6 @@ impl Plane {
         )
     }
 
-    pub fn stage_into(&mut self, frame: &Frame, id: InstanceId) -> Result<Launched> {
-        let bound = self
-            .instances
-            .get_mut(&id)
-            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
-        let program = self.programs.get(&bound.program_id).ok_or_else(|| {
-            Fault::program(
-                "program::plane",
-                format!(
-                    "instance {id} names program {}, which is gone",
-                    bound.program_id
-                ),
-            )
-        })?;
-        bound
-            .session
-            .stage_into(frame, &program.compiled, &program.plan)
-    }
-
     pub fn stage_batched(
         &mut self,
         device: &Context,
@@ -519,13 +500,6 @@ impl Plane {
         if let Some(bound) = self.instances.get_mut(&id) {
             bound.session.abandon_launched();
         }
-    }
-
-    #[must_use]
-    pub fn is_airborne(&self, id: InstanceId) -> bool {
-        self.instances
-            .get(&id)
-            .is_some_and(|bound| bound.session.is_airborne())
     }
 
     /// The outputs instance `id`'s program reads, by name and lane.

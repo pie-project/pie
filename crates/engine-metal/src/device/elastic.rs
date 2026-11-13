@@ -415,12 +415,6 @@ impl Arena {
         }
     }
 
-    /// What is available for one ask, without taking it.
-    #[must_use]
-    pub fn headroom(&self) -> u64 {
-        self.lock().budget.headroom()
-    }
-
     /// Release every heap the GPU has been observed past.
     #[cfg(target_vendor = "apple")]
     pub(crate) fn collect(&self, signalled: u64, residency: &ProtocolObject<dyn MTLResidencySet>) {

@@ -9,6 +9,10 @@
 
 use std::fmt::{self, Write as _};
 
+mod view;
+pub use view::LANES as POOL_LANES;
+pub use view::Order as PoolOrder;
+
 /// Element types a StableHLO tensor holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Elem {
@@ -244,6 +248,10 @@ pub enum Combine {
     Set,
     Add,
     Max,
+    /// Bitwise and / or (integer elements): what lands a block narrower than
+    /// a pool row ([`Func::pool_view`]).
+    And,
+    Or,
 }
 
 /// One function under construction. Values are numbered across the whole
@@ -268,6 +276,13 @@ pub struct Func {
     /// From this many rows a narrow-head rope turns the row as it lies
     /// (`tuning::RopeFlatRows`; 0 never).
     rope_flat_rows: i64,
+    /// Views of the chunk pool ([`Func::pool_view`]): values with no text.
+    views: std::collections::HashMap<u32, view::View>,
+    /// What views were materialized for (each a copy of the pool).
+    materialized: Vec<String>,
+    /// Pool view reads by XLA's gather, not a DMA kernel call (see
+    /// [`Func::with_xla_reads`]).
+    xla_reads: bool,
     /// From this many rows a dot's wide activation is laid out before it
     /// (`tuning::DotBarrierRows`; 0 never).
     dot_barrier_rows: i64,
@@ -358,6 +373,16 @@ pub fn f16_bits(x: f32) -> u16 {
 pub type Branch<'a> = Box<dyn FnOnce(&mut Func) -> Built<Vec<Val>> + 'a>;
 
 impl Func {
+    /// `build` with pool view reads by XLA's gather rather than a DMA
+    /// kernel: a kernel call is a boundary XLA evicts fast-memory buffers
+    /// around, where the read sits between a producer and its consumer.
+    pub fn with_xla_reads<T>(&mut self, build: impl FnOnce(&mut Func) -> T) -> T {
+        let was = std::mem::replace(&mut self.xla_reads, true);
+        let out = build(self);
+        self.xla_reads = was;
+        out
+    }
+
     #[must_use]
     pub fn new(name: &str) -> Self {
         Self {
@@ -372,6 +397,9 @@ impl Func {
             row_major: Vec::new(),
             row_major_results: false,
             rope_flat_rows: 0,
+            views: std::collections::HashMap::new(),
+            materialized: Vec::new(),
+            xla_reads: false,
             dot_barrier_rows: 0,
         }
     }
@@ -508,6 +536,7 @@ impl Func {
 
     /// Emits `op` with generic syntax; one result.
     fn op(&mut self, op: &str, operands: &[Val], attrs: &str, out: Ty) -> Val {
+        let operands = &self.solid(operands, op);
         let id = self.next;
         self.next += 1;
         let name = format!("%{id}");
@@ -534,6 +563,7 @@ impl Func {
         attrs: &str,
         outs: Vec<Ty>,
     ) -> Vec<Val> {
+        let operands = &self.solid(operands, name);
         let id = self.next;
         self.next += 1;
         let attrs = if attrs.is_empty() {
@@ -649,6 +679,7 @@ impl Func {
                 .unwrap_or_else(|| Ty::scalar(Elem::F32));
             return vec![self.op(op, operands, attrs, out)];
         }
+        let operands = &self.solid(operands, op);
         let id = self.next;
         self.next += 1;
         let attrs = if attrs.is_empty() {
@@ -681,6 +712,7 @@ impl Func {
         attrs: &str,
         outs: Vec<Ty>,
     ) -> Built<Vec<Val>> {
+        let operands = &self.solid(operands, op);
         let id = self.next;
         self.next += 1;
         let head = if outs.len() == 1 {
@@ -743,6 +775,7 @@ impl Func {
         self.line(&head);
         self.depth += 1;
         let yields = region(self, &args)?;
+        let yields = self.solid(&yields, "a region's yield");
         let text = format!(
             "\"stablehlo.return\"({}) : ({}) -> ()",
             self.names_of(&yields),
@@ -973,21 +1006,12 @@ impl Func {
     pub fn shr(&mut self, a: Val, b: Val) -> Built<Val> {
         self.binary("shift_right_logical", a, b)
     }
-    pub fn sar(&mut self, a: Val, b: Val) -> Built<Val> {
-        self.binary("shift_right_arithmetic", a, b)
-    }
-    pub fn atan2(&mut self, a: Val, b: Val) -> Built<Val> {
-        self.binary("atan2", a, b)
-    }
 
     pub fn neg(&mut self, x: Val) -> Val {
         self.unary("negate", x)
     }
     pub fn exp(&mut self, x: Val) -> Val {
         self.unary("exponential", x)
-    }
-    pub fn expm1(&mut self, x: Val) -> Val {
-        self.unary("exponential_minus_one", x)
     }
     pub fn log(&mut self, x: Val) -> Val {
         self.unary("log", x)
@@ -1019,9 +1043,6 @@ impl Func {
     pub fn ceil(&mut self, x: Val) -> Val {
         self.unary("ceil", x)
     }
-    pub fn round_even(&mut self, x: Val) -> Val {
-        self.unary("round_nearest_even", x)
-    }
     pub fn sin(&mut self, x: Val) -> Val {
         self.unary("sine", x)
     }
@@ -1030,9 +1051,6 @@ impl Func {
     }
     pub fn not(&mut self, x: Val) -> Val {
         self.unary("not", x)
-    }
-    pub fn popcnt(&mut self, x: Val) -> Val {
-        self.unary("popcnt", x)
     }
     pub fn is_finite(&mut self, x: Val) -> Val {
         let ty = self.ty(x).with_elem(Elem::Pred);
@@ -1134,6 +1152,9 @@ impl Func {
         if from.dims == to.dims {
             return Ok(x);
         }
+        if let Some(view) = self.views.get(&x.0).copied() {
+            return self.pool_view_ordered(view.pool, view.elem, dims, view.order);
+        }
         Ok(self.op("reshape", &[x], "", to))
     }
 
@@ -1186,18 +1207,6 @@ impl Func {
         self.broadcast(x, dims, &[])
     }
 
-    /// Broadcasts `x` to `dims` by matching its axes to the trailing ones
-    /// (numpy rule), for a same-rank or lower-rank `x`.
-    pub fn broadcast_to(&mut self, x: Val, dims: &[i64]) -> Built<Val> {
-        let r = self.ty(x).rank();
-        if r > dims.len() {
-            return malformed("broadcast_in_dim", format!("{} onto {dims:?}", self.ty(x)));
-        }
-        let off = (dims.len() - r) as i64;
-        let map: Vec<i64> = (0..r as i64).map(|i| i + off).collect();
-        self.broadcast(x, dims, &map)
-    }
-
     pub fn slice(&mut self, x: Val, start: &[i64], limit: &[i64], strides: &[i64]) -> Built<Val> {
         let from = self.ty(x).clone();
         if start.len() != from.rank() || limit.len() != from.rank() || strides.len() != from.rank()
@@ -1216,6 +1225,15 @@ impl Func {
         }
         if dims == from.dims {
             return Ok(x);
+        }
+        if self.is_view(x) && strides.iter().all(|&s| s == 1) {
+            let starts: Vec<Val> = start
+                .iter()
+                .map(|&s| self.const_i(Elem::I32, s, &[]))
+                .collect();
+            if let Some(v) = self.view_slice_at(x, &starts, &dims)? {
+                return Ok(v);
+            }
         }
         Ok(self.op(
             "slice",
@@ -1246,6 +1264,13 @@ impl Func {
         if starts.len() != from.rank() || sizes.len() != from.rank() {
             return malformed("dynamic_slice", format!("{sizes:?} of {from}"));
         }
+        if self.is_view(x) {
+            if let Some(v) = self.view_slice_at(x, starts, sizes)? {
+                return Ok(v);
+            }
+            let note = format!("declined dynamic_slice {sizes:?} of {from}");
+            self.materialized.push(note);
+        }
         let mut operands = vec![x];
         operands.extend_from_slice(starts);
         Ok(self.op(
@@ -1261,6 +1286,13 @@ impl Func {
         let up = self.ty(update).clone();
         if starts.len() != from.rank() || up.rank() != from.rank() || up.elem != from.elem {
             return malformed("dynamic_update_slice", format!("{up} into {from}"));
+        }
+        if self.is_view(x) {
+            if let Some(v) = self.view_update_at(x, update, starts)? {
+                return Ok(v);
+            }
+            let note = format!("declined update {up} of {from}");
+            self.materialized.push(note);
         }
         let mut operands = vec![x, update];
         operands.extend_from_slice(starts);
@@ -1625,6 +1657,13 @@ impl Func {
         dims: &GatherDims,
         slice_sizes: &[i64],
     ) -> Built<Val> {
+        if self.is_view(operand) {
+            if let Some(v) = self.view_gather(operand, indices, dims, slice_sizes)? {
+                return Ok(v);
+            }
+            let note = format!("declined gather {slice_sizes:?} of {}", self.ty(operand));
+            self.materialized.push(note);
+        }
         let op = self.ty(operand).clone();
         let idx = self.ty(indices).clone();
         // Result shape: batch dims of indices (all but index_vector_dim) with
@@ -1725,6 +1764,20 @@ impl Func {
         combine: Combine,
         unique: bool,
     ) -> Built<Val> {
+        if self.is_view(operand) {
+            if combine == Combine::Set
+                && let Some(v) = self.view_scatter(operand, indices, updates, dims, unique)?
+            {
+                return Ok(v);
+            }
+            let note = format!(
+                "declined scatter {:?} of {} by {}",
+                combine,
+                self.ty(updates),
+                self.ty(operand)
+            );
+            self.materialized.push(note);
+        }
         let ty = self.ty(operand).clone();
         let s = Ty::scalar(ty.elem);
         let attrs = format!(
@@ -1749,6 +1802,8 @@ impl Func {
                     Combine::Set => b[1],
                     Combine::Add => f.add(b[0], b[1])?,
                     Combine::Max => f.max(b[0], b[1])?,
+                    Combine::And => f.and(b[0], b[1])?,
+                    Combine::Or => f.or(b[0], b[1])?,
                 }])
             },
             &attrs,
@@ -1832,6 +1887,36 @@ impl Func {
         cond: impl FnOnce(&mut Self, &[Val]) -> Built<Val>,
         body: impl FnOnce(&mut Self, &[Val]) -> Built<Vec<Val>>,
     ) -> Built<Vec<Val>> {
+        // A carried view rides as its pool.
+        let (carried, kinds) = self.unview_carried(inits);
+        if kinds.iter().all(Option::is_none) {
+            return self.emit_while(inits, Box::new(cond), Box::new(body));
+        }
+        let k1 = kinds.clone();
+        let k2 = kinds.clone();
+        let out = self.emit_while(
+            &carried,
+            Box::new(move |f: &mut Self, a: &[Val]| {
+                let a = f.review(a, &k1)?;
+                cond(f, &a)
+            }),
+            Box::new(move |f: &mut Self, a: &[Val]| {
+                let a = f.review(a, &k2)?;
+                let ys = body(f, &a)?;
+                f.pools_of(&ys, &k2)
+            }),
+        )?;
+        self.review(&out, &kinds)
+    }
+
+    /// The `while` itself (no carried views).
+    #[allow(clippy::type_complexity)]
+    fn emit_while(
+        &mut self,
+        inits: &[Val],
+        cond: Box<dyn FnOnce(&mut Self, &[Val]) -> Built<Val> + '_>,
+        body: Box<dyn FnOnce(&mut Self, &[Val]) -> Built<Vec<Val>> + '_>,
+    ) -> Built<Vec<Val>> {
         let tys: Vec<Ty> = inits.iter().map(|&v| self.ty(v).clone()).collect();
         let id = self.next;
         self.next += 1;
@@ -1902,11 +1987,26 @@ impl Func {
         let text = format!("{head} = \"stablehlo.case\"({}) ({{", self.name(index));
         self.line(&text);
         let count = branches.len();
+        // An output the first arm yields as a view of the pool rides as the
+        // pool; every arm then yields its pool.
+        let mut kinds: view::Kinds = vec![None; outs.len()];
+        let mut outs = outs.to_vec();
         for (i, branch) in branches.into_iter().enumerate() {
             self.depth += 1;
             self.line("^bb0:");
             self.depth += 1;
             let ys = branch(self)?;
+            if i == 0 {
+                let (pools, k) = self.unview_carried(&ys);
+                for (at, kind) in k.iter().enumerate() {
+                    if kind.is_some() {
+                        outs[at] = self.ty(pools[at]).clone();
+                    }
+                }
+                kinds = k;
+            }
+            let ys = self.pools_of(&ys, &kinds)?;
+            let ys = self.solid(&ys, "a case arm's yield");
             let text = format!(
                 "\"stablehlo.return\"({}) : ({}) -> ()",
                 self.names_of(&ys),
@@ -1918,10 +2018,10 @@ impl Func {
                 self.line("}, {");
             }
         }
-        let text = format!("}}) : ({}) -> ({})", self.ty(index), list(outs));
+        let text = format!("}}) : ({}) -> ({})", self.ty(index), list(&outs));
         self.line(&text);
         let single = outs.len() == 1;
-        Ok(outs
+        let out: Vec<Val> = outs
             .iter()
             .enumerate()
             .map(|(i, ty)| {
@@ -1932,7 +2032,8 @@ impl Func {
                 };
                 self.fresh(name, ty.clone())
             })
-            .collect())
+            .collect();
+        self.review(&out, &kinds)
     }
 
     // ------------------------------------------------------------- composites

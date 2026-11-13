@@ -48,7 +48,6 @@ device_kv_budget = "256MiB"
 $engine_toml
 max_forward_tokens = 1024
 max_forward_requests = 8
-max_state_slots = 16
 [sandbox]
 allow_fs = false
 allow_network = true

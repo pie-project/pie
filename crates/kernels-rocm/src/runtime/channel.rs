@@ -381,6 +381,200 @@ pub fn gather_words(
     )
 }
 
+/// A lane of the staged rs tables (`channel.cu`'s `RsLane`): where its rows
+/// land in its rs buffer pages and which buffered rows it replays first.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RsLane {
+    /// The buffer token its first row lands at; [`RsLane::NONE`]: none.
+    pub at: u32,
+    /// The buffered rows it replays ahead of its own.
+    pub replay: u32,
+    /// Where its replayed tokens start in the replay table.
+    pub replay_off: u32,
+    /// Where its pages' slot addresses start in the page table.
+    pub page_off: u32,
+}
+
+const _: () = assert!(size_of::<RsLane>() == 16);
+
+impl RsLane {
+    pub const NONE: u32 = u32::MAX;
+
+    /// A lane that lands no rows and replays none.
+    pub const INERT: RsLane = RsLane {
+        at: RsLane::NONE,
+        replay: 0,
+        replay_off: 0,
+        page_off: 0,
+    };
+}
+
+/// The staged rs tables a fire's buffered rows are addressed through: a
+/// [`RsLane`] a lane, the slot address of each lane's pages, and each
+/// replayed row's buffer token.
+#[derive(Clone, Copy, Debug)]
+pub struct RsTables {
+    pub lanes: DevicePtr,
+    pub pages: DevicePtr,
+    pub replay_tok: DevicePtr,
+    /// The rows a page holds.
+    pub page_tokens: u32,
+}
+
+/// Where a buffered plane's rows lie in a page's slot: `off` bytes in, a
+/// token's row every `stride` bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct RsPlane {
+    pub off: u64,
+    pub stride: u64,
+}
+
+const RS_BLOCK: u32 = 128;
+
+/// Lands each lane's rows of `src` at its buffer tokens (a block a lane, up
+/// to `lanes_stated`; the armed window's live words say how many are live).
+pub fn rs_scatter(
+    ctx: &Ctx,
+    src: DevicePtr,
+    row_bytes: u32,
+    qo_indptr: DevicePtr,
+    lanes_stated: u32,
+    tables: RsTables,
+    plane: RsPlane,
+) -> Result<(), Error> {
+    const OP: &str = "channel.rs_scatter";
+    if lanes_stated == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::channel::rs_scatter"))
+            .apply(Launch::grid([lanes_stated, 1, 1], [RS_BLOCK, 1, 1])),
+        &[
+            ArgValue::Ptr(src),
+            ArgValue::U32(row_bytes),
+            ArgValue::Ptr(qo_indptr),
+            ctx.stage(),
+            ArgValue::U32(lanes_stated),
+            ArgValue::Ptr(tables.lanes),
+            ArgValue::Ptr(tables.pages),
+            ArgValue::U32(tables.page_tokens),
+            ArgValue::Usize(plane.off),
+            ArgValue::Usize(plane.stride),
+        ],
+    )
+}
+
+/// The window's extended layout into `csr` (`lanes_cap + 1` words) and the
+/// live words the recurrent kernels read the extended rows by (`ext_win`).
+pub fn rs_ext_csr(
+    ctx: &Ctx,
+    qo_indptr: DevicePtr,
+    lanes_stated: u32,
+    lanes_cap: u32,
+    lanes: DevicePtr,
+    csr: DevicePtr,
+    ext_win: DevicePtr,
+) -> Result<(), Error> {
+    const OP: &str = "channel.rs_ext_csr";
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::channel::rs_ext_csr"))
+            .apply(Launch::grid([1, 1, 1], [1, 1, 1])),
+        &[
+            ArgValue::Ptr(qo_indptr),
+            ctx.stage(),
+            ArgValue::U32(lanes_stated),
+            ArgValue::U32(lanes_cap),
+            ArgValue::Ptr(lanes),
+            ArgValue::Ptr(csr),
+            ArgValue::Ptr(ext_win),
+        ],
+    )
+}
+
+/// Each lane's extended rows into `ext`: its replayed buffer rows (of
+/// `plane`, when the value is one) then its own rows of `own`, which land in
+/// its buffer too. With `layout` (`csr`, `ext_win`), it lays the window's
+/// extended layout as `rs_ext_csr` does, for the op's later launches.
+#[allow(clippy::too_many_arguments)]
+pub fn rs_ext_gather(
+    ctx: &Ctx,
+    own: DevicePtr,
+    ext: DevicePtr,
+    row_bytes: u32,
+    qo_indptr: DevicePtr,
+    layout: Option<(DevicePtr, DevicePtr)>,
+    lanes_stated: u32,
+    tables: RsTables,
+    plane: Option<RsPlane>,
+) -> Result<(), Error> {
+    const OP: &str = "channel.rs_ext_gather";
+    if lanes_stated == 0 {
+        return Ok(());
+    }
+    let (pages, at) = match plane {
+        Some(plane) => (tables.pages, plane),
+        None => (0, RsPlane { off: 0, stride: 0 }),
+    };
+    let (csr, ext_win) = layout.unwrap_or((0, 0));
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::channel::rs_ext_gather"))
+            .apply(Launch::grid([lanes_stated, 1, 1], [RS_BLOCK, 1, 1])),
+        &[
+            ArgValue::Ptr(own),
+            ArgValue::Ptr(ext),
+            ArgValue::U32(row_bytes),
+            ArgValue::Ptr(qo_indptr),
+            ArgValue::Ptr(csr),
+            ArgValue::Ptr(ext_win),
+            ctx.stage(),
+            ArgValue::U32(lanes_stated),
+            ArgValue::Ptr(tables.lanes),
+            ArgValue::Ptr(pages),
+            ArgValue::Ptr(tables.replay_tok),
+            ArgValue::U32(tables.page_tokens.max(1)),
+            ArgValue::Usize(at.off),
+            ArgValue::Usize(at.stride),
+        ],
+    )
+}
+
+/// Each lane's own rows of the extended `ext` back onto `target`.
+#[allow(clippy::too_many_arguments)]
+pub fn rs_ext_land(
+    ctx: &Ctx,
+    ext: DevicePtr,
+    target: DevicePtr,
+    row_bytes: u32,
+    qo_indptr: DevicePtr,
+    csr: DevicePtr,
+    lanes_stated: u32,
+    lanes: DevicePtr,
+) -> Result<(), Error> {
+    const OP: &str = "channel.rs_ext_land";
+    if lanes_stated == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::channel::rs_ext_land"))
+            .apply(Launch::grid([lanes_stated, 1, 1], [RS_BLOCK, 1, 1])),
+        &[
+            ArgValue::Ptr(ext),
+            ArgValue::Ptr(target),
+            ArgValue::U32(row_bytes),
+            ArgValue::Ptr(qo_indptr),
+            ArgValue::Ptr(csr),
+            ctx.stage(),
+            ArgValue::U32(lanes_stated),
+            ArgValue::Ptr(lanes),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

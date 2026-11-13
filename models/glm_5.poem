@@ -5,7 +5,7 @@
 
 load("//pie/codec.poem", "bank", "dequantized", "kept", "land", read_weight = "weight")
 load("//lib/adapters.poem", "banks", "corrected")
-load("//lib/mla.poem", "attend", "fp8_rows", "cache")
+load("//lib/mla.poem", "attend")
 load("//lib/mtp.poem", "draft")
 
 STOP = ["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"]
@@ -74,7 +74,7 @@ DEPLOYMENTS = [
 
 def attention(n, d, hidden, weights, norms, eps, kv, theta = None, interleaved = False, gated = False, latent = None, **extra):
     """The latent attention named by `n`, its projections in `weights` and
-    its norms in `norms`, caching under `kv`. Its rope part is rotated at
+    its norms in `norms`, its latent rows the state `kv`. Its rope part is rotated at
     `theta` (its pairs adjacent under `interleaved`), or left as it is with
     none; `gated` adds a sigmoid gate on its output. `latent` is the dtype
     of `kv_b_proj`, which the absorbs read as it is (`weights` by default).
@@ -216,6 +216,13 @@ def layout(id, deploy):
     hidden = d.hidden
     index_width = d.index_heads * d.index_head_dim
     index_in = d.q_lora_rank if d.index_weights_from == "q_a" else hidden
+    # An attention's latent rows: the latent and its rotated dims a token, as
+    # vLLM's standard fp8 rows (a byte a dim, one plane) on an e4m3 kv. The
+    # index keys stay at bf16 there.
+    fp8 = deploy.kv == dtype.e4m3
+    latent = lambda: (state([tokens, d.kv_lora_rank + d.qk_rope_head_dim], kv_rows.fp8) if fp8
+                      else state([tokens, [d.kv_lora_rank, d.qk_rope_head_dim]], deploy.kv))
+    index_keys = lambda: state([tokens, d.index_head_dim], dtype.bf16 if fp8 else deploy.kv)
 
     def indexer(n, keys):
         return struct(
@@ -276,8 +283,8 @@ def layout(id, deploy):
     def layer(l):
         norm = lambda s, width: weight([width], w)
         lora_a, lora_b = banks(hidden)
-        keys = "index.{}".format(l) if ranks(d, l) else None
-        attn = mla_at("layer.{}".format(l), "kv.{}".format(l), keys)
+        keys = index_keys() if ranks(d, l) else None
+        attn = mla_at("layer.{}".format(l), latent(), keys)
         if l < d.dense_layers:
             iw = d.dense_inter
             mlp = struct(
@@ -308,7 +315,7 @@ def layout(id, deploy):
             e_proj = weight([hidden, hidden], w),
             h_proj = weight([hidden, hidden], w),
             attn_norm = weight([hidden], w),
-            attn = mla_at("mtp", "kv.mtp", "index.mtp"),
+            attn = mla_at("mtp", latent(), index_keys()),
             mlp_norm = weight([hidden], w),
             mlp = routed_at(draft),
             norm = weight([hidden], w),
@@ -320,7 +327,6 @@ def layout(id, deploy):
         vocab = d.vocab,
         heads = d.heads,
         kv_lora_rank = d.kv_lora_rank,
-        kv = deploy.kv,
         embed = weight([d.vocab, hidden], w),
         head = weight([d.vocab, hidden], w),
         layers = [layer(l) for l in range(d.layers)],
@@ -476,18 +482,6 @@ def run_attention(x, inputs, a, positions = None, select = None, prefill_only = 
             rotary.partial(a.qk_rope_head_dim),
         )
     return attend(x, inputs, q_nope, q_pe, a, selection, prefill_only), selection
-
-def caches(m, c):
-    fp8 = fp8_rows(m)
-    kv = c.kv_space(dtype.u8 if fp8 else m.kv)
-    index = c.kv_space(dtype.bf16 if fp8 else m.kv)
-    attns = [w.attn for w in m.layers]
-    if m.mtp != None:
-        attns.append(m.mtp.attn)
-    for a in attns:
-        cache(c, kv, a, fp8)
-        if a.indexer != None:
-            c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
 
 def forward(m, inputs):
     positions = inputs.positions()

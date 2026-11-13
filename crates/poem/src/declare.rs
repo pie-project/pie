@@ -1,6 +1,6 @@
 use poem_ir::{
-    ActQuant, BIASES, Dtype, GLOBAL_SCALES, INPUT_SCALES, Param, ParamLayout, ParamPlacement,
-    ParamSource, Platform, SCALES, Shard, TILED_BAND, TILED_STEP,
+    ActQuant, BIASES, Dtype, GLOBAL_SCALES, INPUT_SCALES, Param, ParamLayout, ParamSource,
+    Platform, SCALES, Shard, TILED_BAND, TILED_STEP,
 };
 
 #[derive(Clone, Debug)]
@@ -14,9 +14,6 @@ pub struct Weight {
     pub shard: Shard,
     pub source: ParamSource,
     pub layout: ParamLayout,
-    /// Where the weight's leading plane (its codes) may be served from; its
-    /// companions (a scale) stay on the device.
-    pub placement: ParamPlacement,
     /// The values, row-major, the layout states this weight holds: the
     /// importer lands them, whatever the checkpoint holds, and no format
     /// reads it.
@@ -148,7 +145,6 @@ impl Weight {
             shard: Shard::Replicated,
             source: ParamSource::Checkpoint,
             layout: ParamLayout::Natural,
-            placement: ParamPlacement::Device,
             values: None,
             turn: None,
         }
@@ -194,7 +190,6 @@ impl Weight {
                     && leg.act == first.act
                     && leg.source == first.source
                     && leg.layout == first.layout
-                    && leg.placement == first.placement
                     && leg.values.is_none()
                     && leg.shape.len() == first.shape.len()
                     && at < leg.shape.len()
@@ -226,7 +221,6 @@ impl Weight {
                 && leg.act == first.act
                 && leg.source == first.source
                 && leg.layout == first.layout
-                && leg.placement == first.placement
                 && leg.values.is_none()
                 && leg.shape.len() == first.shape.len()
                 && (0..leg.shape.len()).all(|i| i == at || leg.shape[i] == first.shape[i]);
@@ -288,14 +282,6 @@ impl Weight {
             u64::from(c_in) * u64::from(taps)
         );
         self.layout = ParamLayout::ConvTapsMajor { c_in, taps };
-        self
-    }
-
-    /// The weight is read only by row gathers, so a card whose profile asks
-    /// may serve it from pinned host memory the device reads through.
-    #[must_use]
-    pub fn host(mut self) -> Weight {
-        self.placement = ParamPlacement::Host;
         self
     }
 
@@ -795,7 +781,6 @@ impl Weight {
             shard,
             source: p.source,
             layout: p.layout,
-            placement: p.placement,
             values: None,
             turn: None,
         }

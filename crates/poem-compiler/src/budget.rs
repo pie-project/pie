@@ -240,6 +240,10 @@ pub struct DeviceProfile {
     pub exclusive: Vec<String>,
 
     pub grouped: Vec<String>,
+
+    /// What the chunk plan ([`crate::chunk::plan`]) reads of the device:
+    /// segment and binding limits, alignment, expected load.
+    pub chunk: crate::chunk::ChunkProfile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -351,6 +355,7 @@ impl Default for DeviceProfile {
             family_us: FamilyCosts::default(),
             exclusive: Vec::new(),
             grouped: Vec::new(),
+            chunk: crate::chunk::ChunkProfile::default(),
         }
     }
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ssm/state.cuh"
+#include "prim/state_rows.cuh"
 
 namespace pie::ssm {
 
@@ -10,13 +11,14 @@ struct GdnLane {
     int t0;
     int T;
     int rl;
+    // The lane's first chunk id: negative where it holds no state.
     int slot;
 };
 
 __device__ __forceinline__ GdnLane gdn_lane(
     int r,
     const u32* __restrict__ qo_indptr,
-    const int* __restrict__ slot_ids,
+    const StateRows& rows,
     const int* __restrict__ commit_len,
     const int* __restrict__ begin_at,
     const u32* __restrict__ win)
@@ -34,7 +36,7 @@ __device__ __forceinline__ GdnLane gdn_lane(
         const int c = commit_len[lane.rl];
         if (c < lane.T) lane.T = c;
     }
-    lane.slot = lane.T > 0 ? slot_ids[lane.rl] : -1;
+    lane.slot = lane.T > 0 ? rows.first(lane.rl) : -1;
     return lane;
 }
 

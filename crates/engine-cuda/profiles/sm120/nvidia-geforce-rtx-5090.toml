@@ -68,7 +68,6 @@ fire_rows = 5120
 # one recurrent-state slot a lane, as the RTX PRO 4500 (the PRO 6000 asks two): on 32 GB the doubled KDA slab seated
 # Kimi-K3 mini4 229 sequences, c256 8.22k -> 9.09k tok/s, Qwen3.8-27B mini20 c128 3.48k -> 4.16k; unstated, a fixed
 # 256 slots left Qwen3.8-27B's kv pages one sequence at c128 (505 tok/s); Nemotron-3-Super, Qwen3.8-Flash-Next unchanged
-state_slots_per_lane = 1
 prefill_lanes = 64
 # a process starts only while the pools hold the started ones to the end, as vLLM queues (pie #1332):
 # gemma-4-26b-a4b mini c128 3.02k -> 4.17k, gemma-4-e4b c512 8.55k -> 9.49k, qwen3-0.6b c512 22.0k -> 30.3k tok/s
@@ -166,7 +165,6 @@ measured = [
   "engine.graphs",
   "engine.host_planes",
   "engine.lattice_steps",
-  "engine.one_frame_when_short",
   "engine.prefill_lattice_from",
   "engine.prefill_lattice_steps",
   "engine.recording",

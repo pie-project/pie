@@ -104,7 +104,6 @@ fn stage(
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
-        deferred_tier: false,
         world: engine_cuda::World::default(),
         expert,
         comm: core::ptr::null_mut(),

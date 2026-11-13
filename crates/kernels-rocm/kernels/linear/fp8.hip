@@ -213,7 +213,10 @@ __device__ __forceinline__ void fp8_tile(const u8* __restrict__ act, const float
         constexpr int S = decltype(slot)::value;
 #pragma unroll
         for (int mb = 0; mb < MB; ++mb) {
-            if (mb >= live_mb) continue;
+            if (mb >= live_mb) {
+                __builtin_amdgcn_sched_barrier(0);
+                continue;
+            }
             moe_u2 xb[4];
 #pragma unroll
             for (int kk = 0; kk < 4; ++kk)
@@ -970,11 +973,14 @@ template <int NW, int TN, int NB>
 __global__ __launch_bounds__(NW * 64) void moe_mxfp4_route(const bf16* __restrict__ act, const i32* __restrict__ routes,
                                                            const u8* __restrict__ codes, const u8* __restrict__ scales,
                                                            bf16* __restrict__ out, int act_div, int n, int k,
-                                                           int num_experts) {
+                                                           int num_experts, const u64* __restrict__ expert_table,
+                                                    unsigned int* __restrict__ expert_hits) {
     const int r = static_cast<int>(blockIdx.x), e = routes[r];
     if (e < 0 || e >= num_experts) return;
-    fp4_group_tile<NW, TN, 1, NB>(act, nullptr, r, 1, codes + static_cast<long long>(e) * n * (k / 2),
-                                 scales + static_cast<long long>(e) * n * (k / 32), out, act_div, n, k, blockIdx.y);
+    if (blockIdx.y == 0 && threadIdx.x == 0) expert_note(expert_hits, e, 1u);
+    fp4_group_tile<NW, TN, 1, NB>(act, nullptr, r, 1, expert_plane(codes, 1LL * n * (k / 2), expert_table, 2, 0, e),
+                                 expert_plane(scales, 1LL * n * (k / 32), expert_table, 2, 1, e), out, act_div, n, k,
+                                 blockIdx.y);
 }
 
 // An MXFP4 bank's routed select on the bf16 matrix core: one work item of up
@@ -986,7 +992,8 @@ __global__ __launch_bounds__(NW * 64) void moe_mxfp4_group(const bf16* __restric
                                                            const i32* __restrict__ offsets, const i32* __restrict__ work,
                                                            const u8* __restrict__ codes, const u8* __restrict__ scales,
                                                            bf16* __restrict__ out, int act_div, int n, int k,
-                                                           int num_experts) {
+                                                           int num_experts, const u64* __restrict__ expert_table,
+                                                    unsigned int* __restrict__ expert_hits) {
     const int items = offsets[num_experts + 1];
     const int live = items * static_cast<int>(gridDim.y);
     const int b = static_cast<int>(blockIdx.x + gridDim.x * blockIdx.y);
@@ -995,9 +1002,12 @@ __global__ __launch_bounds__(NW * 64) void moe_mxfp4_group(const bf16* __restric
     const int at = xcd * slots + min(xcd, extra) + b / 8;
     GroupItem item;
     if (!group_item(offsets, work, num_experts, 16 * TM, item, at % items)) return;
-    const long long e = item.expert;
-    fp4_group_tile<NW, TN, TM, NB>(act, order, item.begin, item.count, codes + e * n * (k / 2), scales + e * n * (k / 32), out,
-                              act_div, n, k, at / items);
+    const int e = item.expert;
+    if (at / items == 0 && threadIdx.x == 0) expert_note(expert_hits, e, item.count);
+    fp4_group_tile<NW, TN, TM, NB>(act, order, item.begin, item.count,
+                                   expert_plane(codes, 1LL * n * (k / 2), expert_table, 2, 0, e),
+                                   expert_plane(scales, 1LL * n * (k / 32), expert_table, 2, 1, e), out, act_div, n, k,
+                                   at / items);
 }
 
 // A bf16 bank's routed select past 64 routes an expert: one work item of up
@@ -1009,12 +1019,15 @@ __global__ __launch_bounds__(512) void moe_bf16_gemm8(const bf16* __restrict__ a
                                                       const i32* __restrict__ offsets, const i32* __restrict__ work,
                                                       const bf16* __restrict__ bank, bf16* __restrict__ out,
                                                       float* __restrict__ part, int act_div, int n, int k,
-                                                      int num_experts, int routes, int per) {
+                                                      int num_experts, int routes, int per,
+                                                      const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
     GroupItem item;
     if (!group_item(offsets, work, num_experts, 128, item)) return;
     const int split = static_cast<int>(blockIdx.z);
+    if (blockIdx.y == 0 && split == 0 && threadIdx.x == 0) expert_note(expert_hits, item.expert, item.count);
     bf16_gemm_tile8(reinterpret_cast<const u8*>(act), order, item.begin, item.count,
-                    reinterpret_cast<const u8*>(bank + static_cast<long long>(item.expert) * n * k), out, act_div, n,
+                    reinterpret_cast<const u8*>(expert_plane(bank, 1LL * n * k, expert_table, 1, 0, item.expert)),
+                    out, act_div, n,
                     k, blockIdx.y, split * per, (split + 1) * per,
                     gridDim.z > 1 ? part + static_cast<long long>(split) * routes * n : nullptr);
 }
@@ -1027,17 +1040,15 @@ __global__ __launch_bounds__(64 * WN * WM) __attribute__((amdgpu_waves_per_eu(OC
     const u8* __restrict__ act, const float* __restrict__ act_scales, const i32* __restrict__ order,
     const i32* __restrict__ offsets, const i32* __restrict__ work, const u8* __restrict__ codes,
     const u8* __restrict__ factors, bf16* __restrict__ out, int act_div, int n, int k, int num_experts,
-    const MoeGroupBases* __restrict__ bases, unsigned int* __restrict__ group_hits) {
+    const u64* __restrict__ expert_table, unsigned int* __restrict__ expert_hits) {
     GroupItem item;
     if (!group_item(offsets, work, num_experts, WM * MS * 16, item)) return;
-    if (group_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0)
-        atomicAdd(group_hits, static_cast<unsigned>(item.count));
-    const u8* c = bases != nullptr ? bases->codes : codes;
-    const u8* f = bases != nullptr ? bases->scales : factors;
+    if (blockIdx.y == 0 && threadIdx.x == 0) expert_note(expert_hits, item.expert, item.count);
     const long long blocks = static_cast<long long>((n + 127) / 128) * (k / 128);
     fp8_prefill_tile<0, NB, WN, WM, NS, MS>(
-        act, reinterpret_cast<const u8*>(act_scales), c + static_cast<long long>(item.expert) * n * k,
-        reinterpret_cast<const u8*>(reinterpret_cast<const float*>(f) + static_cast<long long>(item.expert) * blocks),
+        act, reinterpret_cast<const u8*>(act_scales), expert_plane(codes, 1LL * n * k, expert_table, 2, 0, item.expert),
+        reinterpret_cast<const u8*>(
+            expert_plane(reinterpret_cast<const float*>(factors), blocks, expert_table, 2, 1, item.expert)),
         out, item.count, n, k, 0, static_cast<int>(blockIdx.y), 0, k / 128, nullptr, order, item.begin, act_div);
 }
 
@@ -1081,17 +1092,16 @@ __global__ __launch_bounds__(256) void moe_fp8_mfma(const u8* __restrict__ act, 
                                                     const i32* __restrict__ offsets, const i32* __restrict__ work,
                                                     const u8* __restrict__ codes, const u8* __restrict__ factors,
                                                     bf16* __restrict__ out, int act_div, int n, int k,
-                                                    int num_experts, const MoeGroupBases* __restrict__ bases,
-                                                    unsigned int* __restrict__ group_hits) {
+                                                    int num_experts, const u64* __restrict__ expert_table,
+                                                    unsigned int* __restrict__ expert_hits) {
     GroupItem item;
     if (!group_item(offsets, work, num_experts, MT, item)) return;
-    if (group_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0)
-        atomicAdd(group_hits, static_cast<unsigned>(item.count));
-    const u8* c = bases != nullptr ? bases->codes : codes;
-    const u8* f = bases != nullptr ? bases->scales : factors;
+    if (blockIdx.y == 0 && threadIdx.x == 0) expert_note(expert_hits, item.expert, item.count);
     const long long blocks = static_cast<long long>((n + 127) / 128) * (k / 128);
-    fp8_tile<MT, kFp8MfmaDepth, NB>(act, act_scales, order, item.begin, item.count, c + static_cast<long long>(item.expert) * n * k,
-                                reinterpret_cast<const float*>(f) + static_cast<long long>(item.expert) * blocks, out,
+    fp8_tile<MT, kFp8MfmaDepth, NB>(act, act_scales, order, item.begin, item.count,
+                                expert_plane(codes, 1LL * n * k, expert_table, 2, 0, item.expert),
+                                expert_plane(reinterpret_cast<const float*>(factors), blocks, expert_table, 2, 1, item.expert),
+                                out,
                                 nullptr, act_div, n, k, blockIdx.y, 0, k / 128);
 }
 

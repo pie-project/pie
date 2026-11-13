@@ -1,7 +1,7 @@
 use std::sync::{Arc, Barrier};
 
 use crate::device::{Buffer, Context};
-use crate::error::{Fault, Result};
+use engine_gpu::error::{Fault, Result};
 
 const SLOT_ALIGN: u64 = 256;
 

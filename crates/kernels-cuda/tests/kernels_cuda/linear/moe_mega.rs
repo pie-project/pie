@@ -9,7 +9,9 @@ use dtype::Dtype::{Bf16, F32, I32, U8};
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::linear::act_quant::{self, Bank, Format, Source};
 use kernels_cuda::linear::gemm_sm100::{Elem, Glu, atom_bytes, supported};
-use kernels_cuda::linear::moe;
+use kernels_cuda::linear::moe::{self, ExpertTable};
+
+const RES: ExpertTable = ExpertTable::RESIDENT;
 use kernels_cuda::tensor::Tensor;
 
 /// A routed MLP's shape: hidden, inter, experts, top-k.
@@ -141,7 +143,9 @@ fn select_w4a8(
             act_quant::read_back(ctx, "test", fmt, Source::rows(x, None), back).expect("reads")
         };
         let c = Tensor::new(codes, experts, n * k / 2, U8);
-        let took = moe::select_mxfp4_atoms(ctx, back, c, atoms, routes, y).expect("fires");
+        let took =
+            moe::select_mxfp4_atoms(ctx, back, c, atoms, routes, y, moe::ExpertTable::RESIDENT)
+                .expect("fires");
         assert!(took, "the register-dequant select takes the fire");
         return;
     }
@@ -281,7 +285,8 @@ fn the_w4a8_mega_moe_answers_the_composition_apart() {
             let want = b.read(f.y.ptr, tokens * s.hidden);
             let mut y = b.out(tokens, s.hidden);
             let m = mlp_of(s, &w, &f);
-            let took = moe::mega(&ctx, m, moe::Fold::First(Some(f.shared)), &mut y).expect("fires");
+            let took = moe::mega(&ctx, m, moe::Fold::First(Some(f.shared)), &mut y, [RES; 2])
+                .expect("fires");
             assert!(took, "{tokens}: the mega-MoE takes the fire");
             let got = b.read(y.ptr, tokens * s.hidden);
             let (mean, max) = spread(&got, &want);
@@ -393,7 +398,7 @@ fn the_bf16_mega_moe_answers_the_composition_apart() {
             } else {
                 moe::Fold::Weighted
             };
-            let took = moe::mega(&ctx, m, fold, &mut y).expect("fires");
+            let took = moe::mega(&ctx, m, fold, &mut y, [RES; 2]).expect("fires");
             assert!(took, "{what}: the mega-MoE takes the fire");
             let got = b.read(y.ptr, tokens * s.hidden);
             let (mean, max) = spread(&got, &want);
@@ -432,7 +437,7 @@ fn the_mega_moe_lands_its_live_window_alone() {
     let m = mlp_of(s, &w, &f);
     let fold = moe::Fold::First(Some(f.shared));
     assert!(
-        moe::mega(&ctx, m, fold, &mut whole).expect("fires"),
+        moe::mega(&ctx, m, fold, &mut whole, [RES; 2]).expect("fires"),
         "takes the fire"
     );
     let want = b.read(whole.ptr, tokens * s.hidden);
@@ -443,7 +448,7 @@ fn the_mega_moe_lands_its_live_window_alone() {
         Bf16,
     );
     ctx.arm_stage(b.up(&[live as u32, first as u32]));
-    let took = moe::mega(&ctx, m, fold, &mut y).expect("fires");
+    let took = moe::mega(&ctx, m, fold, &mut y, [RES; 2]).expect("fires");
     ctx.disarm_stage();
     assert!(took, "the windowed fire is taken");
     let got = b.read(y.ptr, tokens * s.hidden);
@@ -602,7 +607,7 @@ fn the_mega_moe_lands_beside_another_streams_long_kernel() {
         let fold = moe::Fold::First(Some(f.shared));
         let mut alone = b.out(tokens, s.hidden);
         assert!(
-            moe::mega(&ctx, m, fold, &mut alone).expect("fires"),
+            moe::mega(&ctx, m, fold, &mut alone, [RES; 2]).expect("fires"),
             "takes the fire"
         );
         let want = b.read(alone.ptr, tokens * s.hidden);
@@ -634,7 +639,7 @@ fn the_mega_moe_lands_beside_another_streams_long_kernel() {
             assert_eq!(code, dr::CUresult::CUDA_SUCCESS, "the hog launches");
             std::thread::sleep(std::time::Duration::from_millis(20));
             assert!(
-                moe::mega(&ctx, m, fold, &mut y).expect("fires"),
+                moe::mega(&ctx, m, fold, &mut y, [RES; 2]).expect("fires"),
                 "takes the fire"
             );
             rt::cudaEventRecord(done, ctx.stream().cast());

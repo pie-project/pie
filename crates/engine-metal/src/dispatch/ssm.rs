@@ -10,15 +10,22 @@ impl DispatchSsm for Run<'_> {
 }
 
 impl Run<'_> {
+    /// Whether this fire buffers `x`, a recurrence input, in the rs list:
+    /// a conv whose output no deferred recurrence reads commits as it runs.
+    fn rs_buffers(&self, x: poem_ir::ValueId) -> bool {
+        self.rs_seat()
+            .is_some_and(|seat| seat.layout.in_of.contains_key(&x.0))
+    }
+
     fn ssm(&mut self, op: &Ssm) -> Result<(), kernels_metal::Error> {
         match op {
             // The committed walk's conv takes no bias.
-            Ssm::CausalConv1d { bias: Some(_), .. }
-            | Ssm::CausalConv1dChunked { bias: Some(_), .. }
-                if self.rs_seat().is_some() =>
-            {
-                Err(kernels_metal::Error::Unsupported { op: op.name() })
+            Ssm::CausalConv1d {
+                bias: Some(_), x, ..
             }
+            | Ssm::CausalConv1dChunked {
+                bias: Some(_), x, ..
+            } if self.rs_buffers(*x) => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Ssm::Mamba2 { .. } | Ssm::Mamba2Chunked { .. } if self.rs_seat().is_some() => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
@@ -83,7 +90,7 @@ impl Run<'_> {
                     &self.recurrent(*state),
                     *state_dim,
                     y,
-                    self.rs_snapshots(),
+                    self.rs_snapshots(*state),
                 )
             }
             Ssm::CausalConv1d {
@@ -103,7 +110,7 @@ impl Run<'_> {
                 dilation,
                 y,
                 ..
-            } if self.rs_seat().is_some() => {
+            } if self.rs_buffers(*x) => {
                 let seat = self.rs_seat().expect("guarded");
                 let conv = crate::rs::Convolved {
                     x: *x,
@@ -168,7 +175,7 @@ impl Run<'_> {
                         self.ctx(),
                         ext_qkv,
                         self.qo_indptr(),
-                        &self.rs_committed(&seat),
+                        &self.rs_committed(&seat, *state),
                         &ssm::VerifyGates {
                             ba,
                             dt_bias,
@@ -182,7 +189,7 @@ impl Run<'_> {
                         *k_dim,
                         *v_dim,
                         self.tensor(*y),
-                        self.rs_snapshots(),
+                        self.rs_snapshots(*state),
                     );
                 }
                 // Heads the verify scan does not stage take the gate prep
@@ -197,7 +204,7 @@ impl Run<'_> {
                     self.tuning(),
                     ext_qkv,
                     self.qo_indptr(),
-                    &self.rs_committed(&seat),
+                    &self.rs_committed(&seat, *state),
                     ext_gates,
                     &self.recurrent(*state),
                     seat.work,
@@ -206,7 +213,7 @@ impl Run<'_> {
                     *k_dim,
                     *v_dim,
                     ext_y,
-                    self.rs_snapshots(),
+                    self.rs_snapshots(*state),
                 )?;
                 self.rs_land(OP, &seat, ext_y, *y)
             }
@@ -245,7 +252,7 @@ impl Run<'_> {
                 *conv_width,
                 *dilation,
                 self.tensor(*y),
-                self.rs_snapshots(),
+                self.rs_snapshots(*state),
             ),
             Ssm::ShortConv { .. } | Ssm::ShortConvChunked { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
@@ -349,7 +356,7 @@ impl Run<'_> {
                 *k_dim,
                 *v_dim,
                 self.tensor(*y),
-                self.rs_snapshots(),
+                self.rs_snapshots(*state),
             ),
             Ssm::Kda {
                 mixed,
@@ -387,7 +394,7 @@ impl Run<'_> {
                     self.ctx(),
                     ext_mixed,
                     self.qo_indptr(),
-                    &self.rs_committed(&seat),
+                    &self.rs_committed(&seat, *state),
                     ext_f,
                     ext_b,
                     self.tensor(*dt_bias),

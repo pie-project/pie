@@ -8,7 +8,7 @@ use super::{ProcessId, ResidencyPlanner};
 use crate::scheduler::{TierKind, TierMove};
 use crate::store::kv::page_table::WorkingSetId;
 use crate::store::kv::working_set::KvSuspendHandle;
-use crate::store::kv::{KvResidencyTxn, KvStoreError};
+use crate::store::kv::{KvResidencyTxn, KvSpillTxn, KvStoreError};
 use crate::store::rs::RsResidencyTxn;
 use ::engine::transfer::MemoryDomain;
 
@@ -70,6 +70,128 @@ pub(super) fn spawn_move_out(
     );
     if !spawned {
         done(&planner, false);
+    }
+}
+
+/// Idle cache on the host goes on down to disk; a failure only leaves it
+/// on the host.
+pub(super) fn spawn_spill(
+    planner: Arc<ResidencyPlanner>,
+    txn: KvSpillTxn,
+    done: fn(&Arc<ResidencyPlanner>, bool),
+) {
+    let (model, engine) = planner.locus();
+    // The guard owns the move from here: a task that never runs drops it,
+    // and that gives back what the move took.
+    let guard = SpillGuard {
+        model,
+        engine,
+        txn: Some(txn),
+        in_flight: None,
+    };
+    let task = {
+        let planner = planner.clone();
+        async move {
+            let moved = spill(&planner, guard).await;
+            if let Err(error) = &moved {
+                tracing::warn!(%error, "planner: host to disk spill failed");
+            }
+            done(&planner, moved.is_ok());
+        }
+    };
+    let spawned = spawn_watched(
+        planner.clone(),
+        ProcessId::nil(),
+        "spill",
+        task,
+        move |planner, _| done(planner, false),
+    );
+    if !spawned {
+        done(&planner, false);
+    }
+}
+
+/// Copies a spill's host slots to its disk slots (`copy_slots`, HostPinned
+/// -> LocalDisk) and commits it: answers the pages moved.
+pub(super) async fn spill(
+    planner: &ResidencyPlanner,
+    mut guard: SpillGuard,
+) -> Result<usize, String> {
+    let txn = guard.txn.as_ref().expect("spill present");
+    let (host, disk) = txn.copy_plan();
+    let copy = TierMove {
+        kind: TierKind::KvSlots(txn.shape()),
+        tier: MemoryDomain::LocalDisk,
+        out: true,
+        device: host,
+        slots: disk,
+        source: Some(MemoryDomain::HostPinned),
+    };
+    tracing::debug!(copy = %copy.label(), count = copy.device.len(), "planner: spill copy");
+    let started = Instant::now();
+    let completion = crate::scheduler::copy_tier_tracked(guard.engine, &copy)
+        .map_err(|error| format!("{} submit: {error:#}", copy.label()))?;
+    guard.in_flight = Some(completion.clone());
+    let copied = completion.wait().await;
+    guard.in_flight = None;
+    planner.record_tier_copy(&copy, started.elapsed());
+    copied.map_err(|error| format!("{} copy: {error}", copy.label()))?;
+    let txn = guard.txn.take().expect("spill present");
+    let stores = crate::store::registry::get(guard.model, guard.engine);
+    Ok(crate::store::registry::with_kv_lock(
+        &stores.kv,
+        "planner-spill",
+        |kv| kv.commit_spill(txn),
+    ))
+}
+
+/// Gives back a spill's disk slots when it is dropped before it commits,
+/// after any copy in flight.
+pub(super) struct SpillGuard {
+    model: usize,
+    engine: usize,
+    txn: Option<KvSpillTxn>,
+    in_flight: Option<crate::scheduler::ControlCompletion>,
+}
+
+impl SpillGuard {
+    pub(super) fn new(model: usize, engine: usize, txn: KvSpillTxn) -> Self {
+        Self {
+            model,
+            engine,
+            txn: Some(txn),
+            in_flight: None,
+        }
+    }
+}
+
+impl Drop for SpillGuard {
+    fn drop(&mut self) {
+        let Some(txn) = self.txn.take() else {
+            return;
+        };
+        let (model, engine) = (self.model, self.engine);
+        let abort = move || {
+            let stores = crate::store::registry::get(model, engine);
+            crate::store::registry::with_kv_lock(&stores.kv, "spill-abort", |kv| {
+                kv.abort_spill(txn)
+            });
+        };
+        match self.in_flight.take() {
+            None => abort(),
+            Some(completion) if crate::rt::has_runtime() => {
+                crate::rt::spawn(async move {
+                    let _ = completion.wait().await;
+                    abort();
+                });
+            }
+            Some(_) => tracing::error!(
+                model,
+                engine,
+                "spill dropped with an engine copy in flight and no runtime; \
+                 keeping its slots to avoid reuse during the copy"
+            ),
+        }
     }
 }
 
@@ -160,33 +282,32 @@ impl Move {
         };
         let mut copies: Vec<TierMove> = kv
             .iter()
-            .flat_map(KvResidencyTxn::copy_plans)
-            .map(|(tier, device, slots)| TierMove {
-                kind: TierKind::Kv,
-                tier,
-                out,
-                device,
-                slots,
+            .flat_map(|txn| {
+                let kind = TierKind::kv(txn.shape());
+                txn.copy_plans()
+                    .into_iter()
+                    .map(move |(tier, device, slots)| TierMove {
+                        kind,
+                        tier,
+                        out,
+                        device,
+                        slots,
+                        source: None,
+                    })
             })
             .collect();
         if let Some(rs) = rs.as_ref() {
             let plan = rs.copy_plan();
-            let pages = if rs.is_ring() {
-                TierKind::Window
-            } else {
-                TierKind::RsPages
-            };
-            for (kind, pairs) in [(TierKind::Rs, &plan.slots), (pages, &plan.pages)] {
-                if pairs.is_empty() {
-                    continue;
-                }
+            // A shared pool's state moves shape by shape (CONTRACT-BC 22).
+            for (shape, pairs) in &plan.shared {
                 let (device, slots) = pairs.iter().copied().unzip();
                 copies.push(TierMove {
-                    kind,
+                    kind: TierKind::RsSlots(*shape),
                     tier: MemoryDomain::HostPinned,
                     out,
                     device,
                     slots,
+                    source: None,
                 });
             }
         }
@@ -251,6 +372,12 @@ impl MoveGuard {
         }
         for (copy, started, completion) in waits {
             let copied = completion.wait().await;
+            ptrace!(
+                "tier-copy {} slots={} ms={}",
+                copy.label(),
+                copy.device.len(),
+                started.elapsed().as_millis()
+            );
             planner.record_tier_copy(&copy, started.elapsed());
             copied.map_err(|error| format!("{} copy: {error}", copy.label()))?;
         }
@@ -334,13 +461,26 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         planner.eviction_failed(pid);
         return;
     }
+    let began = Instant::now();
     let mut fence = FenceGuard::raise(handles);
     crate::scheduler::worker::notify_process_suspend(pid);
     drain_detachable(pid).await;
+    let drained = began.elapsed();
     for handle in fence.handles.iter() {
         handle.quiesce().await;
     }
+    let quiesced = began.elapsed();
     let stores = crate::store::registry::get(model, engine);
+    // Host room is for what is paused before what is cached: idle cache on
+    // a host short of room goes on down to disk first, not dropped.
+    let spilling = crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
+        kv.prepare_suspend_spill(&working_sets, crate::policy::retention::Installed)
+    });
+    if let Some(txn) = spilling
+        && let Err(error) = spill(&planner, SpillGuard::new(model, engine, txn)).await
+    {
+        tracing::warn!(pid = %pid, %error, "planner: host to disk spill failed");
+    }
     let prepared = crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
         kv.prepare_suspend(&working_sets)
     });
@@ -357,18 +497,37 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
             return;
         }
     };
-    let rs = stores.rs.lock().unwrap().prepare_suspend(&rs_working_sets);
+    let (rs, rs_short) = {
+        let mut store = stores.rs.lock().unwrap();
+        let rs = store.prepare_suspend(&rs_working_sets);
+        let short = if rs.is_none() {
+            store.suspend_short(&rs_working_sets)
+        } else {
+            Default::default()
+        };
+        (rs, short)
+    };
     if kv.is_none() && rs.is_none() {
+        if !rs_short.is_zero() {
+            // The host lacks rows for its state: nothing moves and nothing
+            // is dropped; the head stays parked and the host is short.
+            tracing::debug!(pid = %pid, %rs_short, "planner: eviction short of host rows");
+            planner.note_host_short(rs_short);
+            planner.eviction_failed_host_swap_full(pid);
+            return;
+        }
         tracing::debug!(pid = %pid, "planner: eviction found nothing reclaimable");
         planner.eviction_found_nothing(pid);
         return;
     }
+    let prepared_at = began.elapsed();
     let mut guard = MoveGuard::new(model, engine, Move::Suspend { kv, rs });
     if let Err(error) = guard.copy(&planner, pid).await {
         tracing::warn!(pid = %pid, %error, "planner: eviction copy failed");
         planner.eviction_failed(pid);
         return;
     }
+    let copied = began.elapsed();
     let Move::Suspend { kv, rs } = guard.take() else {
         unreachable!("an eviction carries a suspend")
     };
@@ -398,6 +557,16 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         stores.rs.lock().unwrap().commit_suspend(txn)
     });
     fence.keep_raised();
+    ptrace!(
+        "evict-phases pid={} drained_ms={} quiesced_ms={} prepared_ms={} copied_ms={} done_ms={} freed={}",
+        pid,
+        drained.as_millis(),
+        quiesced.as_millis(),
+        prepared_at.as_millis(),
+        copied.as_millis(),
+        began.elapsed().as_millis(),
+        freed
+    );
     planner.report_evicted(pid, freed as u32, rs_freed);
 }
 
@@ -441,6 +610,7 @@ async fn restore(
     let rs_working_sets =
         crate::inferlet::process::residency::rs_working_set_ids(pid, model, engine);
     let stores = crate::store::registry::get(model, engine);
+    let began = Instant::now();
     let mut kv = None;
     if !working_sets.is_empty() {
         // Another move may hold pages this process shares: it lands soon,
@@ -518,6 +688,7 @@ async fn restore(
     if let Some(txn) = rs {
         stores.rs.lock().unwrap().commit_restore(txn);
     }
+    ptrace!("restore-done pid={} ms={}", pid, began.elapsed().as_millis());
     planner.report_restored(pid);
     crate::scheduler::nudge(engine);
 }
@@ -541,11 +712,12 @@ pub(super) async fn persist(
     };
     let (device, slots) = txn.copy_plan();
     let copy = TierMove {
-        kind: TierKind::Kv,
+        kind: TierKind::kv(txn.shape()),
         tier: MemoryDomain::LocalDisk,
         out: true,
         device,
         slots,
+        source: None,
     };
     let mut guard = PersistGuard {
         model,

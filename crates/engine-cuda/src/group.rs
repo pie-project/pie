@@ -10,7 +10,7 @@ use engine::fire::MediaEncode;
 use engine::fire::{FrameSubmission, FrameTicket, Step};
 use engine::load::{LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine::transfer::{KvCopy, KvHandle, StateCopy};
+use engine::transfer::{KvCopy, KvHandle};
 use eta_ir::container::HostRole;
 
 use crate::api::{ContractFor, Cuda, DeviceBoot, World};
@@ -378,14 +378,22 @@ impl Engine for Group {
         for loaded in &mut answers {
             let pools = &mut loaded.caps.pools;
             pools.host_kv_pages = tiers.host_kv_pages;
-            pools.host_window_pages = tiers.host_window_pages;
-            pools.host_state_slots = tiers.host_state_slots;
-            pools.host_buffer_pages = tiers.host_buffer_pages;
             pools.disk_kv_pages = tiers.disk_kv_pages;
             pools.disk_kv_persistent = tiers.disk_kv_persistent;
             pools.disk_kv_kept = tiers.disk_kv_kept;
-            loaded.caps.kv_copy.device_to_host &= tiers.host_kv_pages > 0;
-            loaded.caps.kv_copy.host_to_device &= tiers.host_kv_pages > 0;
+        }
+        // The shared pool's tiers (CONTRACT-BC 22): what every rank holds.
+        let least = |of: fn(&engine::chunk::ChunkFacts) -> u32| {
+            answers
+                .iter()
+                .map(|loaded| of(&loaded.caps.chunks))
+                .min()
+                .unwrap_or(0)
+        };
+        let (host_chunks, disk_chunks) = (least(|c| c.host_chunks), least(|c| c.disk_chunks));
+        for loaded in &mut answers {
+            loaded.caps.chunks.host_chunks = host_chunks;
+            loaded.caps.chunks.disk_chunks = disk_chunks;
         }
         // a rank's facts (codegen backend, pools) exist only once it has loaded;
         // the snapshot taken at open was empty, and a group that keeps it says
@@ -520,9 +528,11 @@ impl Engine for Group {
         self.lead(move |rank| rank.copy_kv(&copy))
     }
 
-    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
+    /// Each rank moves its band of every slot to and from its own tiers
+    /// (CONTRACT-BC 22).
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         let copy = copy.clone();
-        self.lead(move |rank| rank.copy_state(&copy))
+        self.lead(move |rank| rank.copy_slots(&copy))
     }
 
     fn host_kv_layout(&self) -> Option<state::PageLayout> {
@@ -541,30 +551,6 @@ impl Engine for Group {
                 })
                 .collect(),
         })
-    }
-
-    /// Rank after rank, as kv is.
-    fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> EngineResult<Vec<u8>> {
-        let mut out = Vec::new();
-        for rank in 0..self.ranks.len() {
-            out.extend(self.on(rank, |shell| shell.read_host_state(slots, pages))?);
-        }
-        Ok(out)
-    }
-
-    fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> EngineResult<()> {
-        let ranks = self.ranks.len();
-        if ranks == 0 || !bytes.len().is_multiple_of(ranks) {
-            return Err(Error::Device(format!(
-                "{} bytes of host state do not split across {ranks} ranks",
-                bytes.len()
-            )));
-        }
-        let share = bytes.len() / ranks;
-        for (rank, bytes) in bytes.chunks(share).enumerate() {
-            self.on(rank, |shell| shell.write_host_state(slots, pages, bytes))?;
-        }
-        Ok(())
     }
 
     /// Rank after rank: each holds its own heads of every slot.
@@ -587,6 +573,37 @@ impl Engine for Group {
         let share = bytes.len() / ranks;
         for (rank, bytes) in bytes.chunks(share).enumerate() {
             self.on(rank, |shell| shell.write_host_kv(slots, bytes))?;
+        }
+        Ok(())
+    }
+
+    /// Rank after rank: each holds its own share of every slot.
+    fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> EngineResult<Vec<u8>> {
+        let mut out = Vec::new();
+        for rank in 0..self.ranks.len() {
+            out.extend(self.on(rank, |shell| shell.read_tier_slots(slots))?);
+        }
+        Ok(out)
+    }
+
+    fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        let ranks = self.ranks.len();
+        if ranks == 0 || !bytes.len().is_multiple_of(ranks) {
+            return Err(Error::Device(format!(
+                "{} bytes of host tier slots do not split across {ranks} ranks",
+                bytes.len()
+            )));
+        }
+        let share = bytes.len() / ranks;
+        for (rank, bytes) in bytes.chunks(share).enumerate() {
+            self.on(rank, |shell| shell.write_tier_slots(slots, bytes))?;
         }
         Ok(())
     }

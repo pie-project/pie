@@ -23,6 +23,10 @@ pub struct Program {
 /// owns them.
 pub struct Device {
     cache: Mutex<HashMap<[u8; 32], Arc<Program>>>,
+    /// Set once the warm ladder ran (`seal`): a program wanted after that is
+    /// a serving fire missing the ladder.
+    sealed: std::sync::atomic::AtomicBool,
+    misses: std::sync::atomic::AtomicU64,
     ordinal: usize,
     kind: String,
     limit: Option<u64>,
@@ -86,6 +90,8 @@ impl Device {
             limit,
             held,
             cache: Mutex::new(HashMap::new()),
+            sealed: std::sync::atomic::AtomicBool::new(false),
+            misses: std::sync::atomic::AtomicU64::new(0),
             dump: std::env::var_os("PIE_XLA_DUMP").map(PathBuf::from),
             disk: disk_cache(),
             _lock: lock,
@@ -120,6 +126,8 @@ impl Device {
             limit: None,
             held: 0,
             cache: Mutex::new(HashMap::new()),
+            sealed: std::sync::atomic::AtomicBool::new(false),
+            misses: std::sync::atomic::AtomicU64::new(0),
             dump: std::env::var_os("PIE_XLA_DUMP").map(PathBuf::from),
             disk: None,
             _lock: lock,
@@ -234,6 +242,24 @@ impl Device {
         if let Some(hit) = self.cache.lock().expect("cache lock poisoned").get(&key) {
             return Ok(Arc::clone(hit));
         }
+        if self.sealed.load(std::sync::atomic::Ordering::Relaxed) {
+            // Serving fires run programs the warm ladder prepared: one built
+            // now is a fire the ladder missed.
+            let n = self
+                .misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            tracing::warn!(
+                bytes = text.len(),
+                misses = n,
+                "xla program outside the warm ladder"
+            );
+            assert!(
+                std::env::var("PIE_XLA_WARM_STRICT").as_deref() != Ok("1"),
+                "xla program outside the warm ladder ({} bytes)",
+                text.len()
+            );
+        }
         if let Some(dir) = &self.dump {
             let name = format!("{}.mlir", blake3::hash(text.as_bytes()).to_hex());
             let _ = std::fs::create_dir_all(dir);
@@ -325,6 +351,12 @@ impl Device {
         h.update(client.api().path().to_string_lossy().as_bytes());
         let (major, minor) = client.api().version();
         h.update(format!("{major}.{minor}|{}", self.kind).as_bytes());
+        // The compiler's own flags shape the program as much as its text.
+        for var in COMPILER_ENV {
+            h.update(b"|");
+            h.update(std::env::var_os(var).unwrap_or_default().as_encoded_bytes());
+        }
+        h.update(format!("|{:?}", crate::pjrt::options::TPU_FLAGS).as_bytes());
         Some(dir.join(format!("{}.pjrt", h.finalize().to_hex())))
     }
 
@@ -349,6 +381,19 @@ impl Device {
     pub fn forget(&self, text: &str) {
         let key = *blake3::hash(text.as_bytes()).as_bytes();
         self.cache.lock().expect("cache lock poisoned").remove(&key);
+    }
+
+    /// Marks the warm ladder done: every program wanted from now on is
+    /// counted (and logged) as a miss.
+    pub fn seal(&self) {
+        self.sealed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Programs wanted after [`Device::seal`] that the ladder had not built.
+    #[must_use]
+    pub fn misses(&self) -> u64 {
+        self.misses.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether the program of `text` is held compiled.
@@ -564,6 +609,11 @@ pub fn element_type(elem: kernels_xla::hlo::Elem) -> ElementType {
         Elem::U4 => ElementType::U4,
     }
 }
+
+/// The environment the plugin's compiler reads its flags from: part of a
+/// cached program's key, so a program compiled under other flags is not
+/// loaded in its place.
+const COMPILER_ENV: [&str; 2] = ["LIBTPU_INIT_ARGS", "XLA_FLAGS"];
 
 fn disk_cache() -> Option<PathBuf> {
     match std::env::var_os("PIE_XLA_CACHE") {

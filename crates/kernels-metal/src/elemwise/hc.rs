@@ -439,16 +439,6 @@ pub fn ple_gate(
 
 pub mod reference {
     #[must_use]
-    pub fn pre_gate(mix: f32, scale: f32, base: f32, eps: f32) -> f32 {
-        1.0 / (1.0 + (-(mix * scale + base)).exp()) + eps
-    }
-
-    #[must_use]
-    pub fn post_gate(mix: f32, scale: f32, base: f32, alpha: f32) -> f32 {
-        alpha / (1.0 + (-(mix * scale + base)).exp())
-    }
-
-    #[must_use]
     pub fn sinkhorn(logits: &[f32], m: usize, iters: u32, eps: f32) -> Vec<f32> {
         let mut comb = vec![0.0f32; m * m];
         for i in 0..m {

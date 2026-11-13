@@ -127,14 +127,7 @@ impl Run<'_> {
                     usize::try_from(bytes).unwrap_or(usize::MAX),
                 )? as u64;
                 let mut frame_cache = Tensor::new(scratch, rows, x.width, x.dtype);
-                conv::cache_gather(
-                    self.ctx(),
-                    pool.slab,
-                    slot_ids,
-                    grid,
-                    frames,
-                    &mut frame_cache,
-                )?;
+                conv::cache_gather(self.ctx(), &pool, slot_ids, grid, frames, &mut frame_cache)?;
                 conv::conv3d(
                     self.ctx(),
                     x,
@@ -147,15 +140,14 @@ impl Run<'_> {
                     self.tensor(*y_grid),
                     bases,
                 )?;
-                let mut slab = pool.slab;
                 conv::cache_store(
                     self.ctx(),
                     x,
                     frame_cache,
+                    &pool,
                     slot_ids,
                     grid,
                     frames,
-                    &mut slab,
                     bases[0],
                 )
             }
@@ -265,8 +257,7 @@ impl Run<'_> {
                             "a frame-cache store needs the fire's clip slot table, which no lane                              of it staged"
                                 .to_string(),
                     })?;
-                let mut slab = pool.slab;
-                conv::cache_store(self.ctx(), x, x, slot_ids, grid, *frames, &mut slab, base)
+                conv::cache_store(self.ctx(), x, x, &pool, slot_ids, grid, *frames, base)
             }
             Conv::Patchify {
                 x,

@@ -58,6 +58,76 @@ pub fn embed(
     )
 }
 
+/// A table the weight cache streams by its rows, as [`embed_tabled`] reads
+/// it: block `b` (`block_rows` rows) lies in pool unit `blocks[b]` (a slot,
+/// `unit_words` words a unit) or, `u32::MAX`, is not held, its rows this
+/// fire's `stage` rows (`staged[first + n]` row `n`'s, `u32::MAX` none: a
+/// stage laid by the fire's rows, read by a gather of rows from `first`).
+/// In a slot the table's row of id `i` starts `origin + (i % block_rows) *
+/// atom_words` words in. `hits` counts a read a row of its block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowTable {
+    pub blocks: Tensor,
+    pub staged: Tensor,
+    pub stage: Tensor,
+    pub hits: Tensor,
+    pub pool: crate::tensor::Segments,
+    pub block_rows: u32,
+    pub unit_words: u32,
+    pub origin: u32,
+    pub atom_words: u32,
+    pub first: u32,
+}
+
+/// `y[n] = table[ids[n]]` through a row table: each row from the pool slot
+/// its block lies in, or from the rows staged for this fire; an id outside
+/// `vocab` reads row 0. Lands the bits [`embed`] lands from the whole table.
+pub fn embed_tabled(
+    ctx: &Ctx<'_>,
+    ids: Tensor,
+    table: &RowTable,
+    vocab: u32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.embed";
+    debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
+    nonzero(OP, "the row count this embedding table states", vocab)?;
+    nonzero(OP, "the rows a block of this table holds", table.block_rows)?;
+    debug_assert_eq!(
+        ids.rows, y.rows,
+        "the token ids handed over are the rows this gather lands"
+    );
+    let words = words(OP, "embedding row", y.width)?;
+    ctx.fire(
+        Fire::at(EMBED, "gather_embed_tabled_bf16").apply(Grid::of(
+            elementwise_rows(OP, words, y.rows)?,
+            [GROUP, 1, 1],
+        )),
+        &[
+            &[
+                ids.arg(),
+                table.blocks.arg(),
+                table.staged.arg(),
+                table.stage.arg(),
+                table.hits.arg_mut(),
+                y.arg_mut(),
+            ][..],
+            &table.pool.args(false),
+            &[
+                stated(OP, y.width)?.arg(),
+                stated(OP, vocab)?.arg(),
+                table.block_rows.arg(),
+                table.pool.words.arg(),
+                table.unit_words.arg(),
+                table.origin.arg(),
+                table.atom_words.arg(),
+                table.first.arg(),
+            ],
+        ]
+        .concat(),
+    )
+}
+
 /// The ids of each row and the width of one table row, for `ids.width`
 /// table rows side by side in each landed row.
 fn concat_slices(op: &'static str, ids: Tensor, y: Tensor) -> Result<(u32, u32), Error> {

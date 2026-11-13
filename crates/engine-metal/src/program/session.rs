@@ -5,7 +5,6 @@ use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::name_or_unknown;
 use eta_ir::validate::Direction;
 
-use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context, Pipelines};
 use crate::error::{Fault, Result};
 
@@ -327,45 +326,6 @@ impl Session {
         self.verdict(plan, &launched, at)
     }
 
-    pub fn stage_into(
-        &mut self,
-        frame: &Frame,
-        compiled: &Compiled,
-        plan: &ExecPlan,
-    ) -> Result<Launched> {
-        if self.airborne.is_some() {
-            return Err(Fault::program(
-                "program::session",
-                "this instance already has a pass airborne: a second staging would \
-                 refresh the scratch and the status word of stages whose first pass \
-                 has not been read, so both fires would report the second's verdict \
-                 and the first's commit would be lost",
-            ));
-        }
-        if let Some(refused) = self.gate(compiled, plan, Stage::Epilogue)? {
-            return Ok(Launched::Refused(refused));
-        }
-
-        let cursors = self.cursors_now();
-        let mut launched = Vec::with_capacity(compiled.stages.len());
-        for (index, stage) in compiled.stages.iter().enumerate() {
-            if !plan.runs_at(index, Stage::Epilogue) {
-                continue;
-            }
-            let Some(prepared) = self.prepared.get_mut(index).and_then(Option::as_mut) else {
-                continue;
-            };
-            prepared.refresh(&self.rings, &cursors)?;
-            for region in stage.regions.iter() {
-                prepared.encode_into(frame, region)?;
-            }
-            launched.push(index);
-        }
-
-        self.airborne = Some(launched);
-        Ok(Launched::Airborne)
-    }
-
     pub fn prepare_airborne(
         &mut self,
         compiled: &Compiled,
@@ -415,11 +375,6 @@ impl Session {
 
     pub fn abandon_launched(&mut self) {
         self.airborne = None;
-    }
-
-    #[must_use]
-    pub const fn is_airborne(&self) -> bool {
-        self.airborne.is_some()
     }
 
     fn gate(&mut self, compiled: &Compiled, plan: &ExecPlan, at: Stage) -> Result<Option<Fired>> {
@@ -620,30 +575,6 @@ fn verdict_of(
             eta_exec::report_status(package, status, true, max_channel)
         )),
     }
-}
-
-#[must_use]
-pub fn seeds_of(interp: &eta_exec::InterpInstance, plan: &ExecPlan) -> Vec<(u32, Vec<u8>)> {
-    let mut seeds = Vec::new();
-    for (channel, ring) in interp.channels.iter().enumerate() {
-        let declared = match plan.package.channels.get(channel) {
-            Some(declared) => declared,
-            None => continue,
-        };
-        let dtype = eta_exec::concrete_dtype(declared.dtype);
-        let numel = declared
-            .shape
-            .iter()
-            .map(|&d| d as usize)
-            .product::<usize>()
-            .max(1);
-        for sequence in ring.head()..ring.tail() {
-            let mut wire = vec![0u8; eta_exec::wire_cell_bytes(dtype, numel)];
-            eta_exec::encode_wire(&ring.decode_sequence(sequence), &mut wire);
-            seeds.push((channel as u32, wire));
-        }
-    }
-    seeds
 }
 
 fn stages_and_plans_agree(compiled: &Compiled) -> Result<()> {

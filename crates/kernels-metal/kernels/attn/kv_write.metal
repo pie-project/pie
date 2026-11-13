@@ -2,6 +2,8 @@
 
 using namespace metal;
 
+#include "../prim/kv_page.h"
+
 template <typename T>
 [[kernel]] void kv_append_paged(
     const device T* k_new   [[buffer(0)]],
@@ -16,6 +18,10 @@ template <typename T>
     const device uint* w_off             [[buffer(14)]],
 
     const constant int& src_row_stride   [[buffer(15)]],
+    const constant ulong& k_page_stride [[buffer(16)]],
+    const constant ulong& v_page_stride [[buffer(17)]],
+    const constant ulong& k_offset [[buffer(18)]],
+    const constant ulong& v_offset [[buffer(19)]],
     uint3 tid [[thread_position_in_grid]]) {
   const int d = int(tid.x);
   const int h = int(tid.y);
@@ -23,15 +29,17 @@ template <typename T>
   if (d >= head_dim) return;
 
   const uint page = w_page[i];
-  const size_t slot = size_t(page) * size_t(page_size) + size_t(w_off[i]);
-
   const size_t row_stride = size_t(n_kv_heads) * size_t(head_dim);
-  const size_t dst = slot * row_stride + size_t(h) * size_t(head_dim) + size_t(d);
+  const size_t in_row = size_t(w_off[i]) * row_stride + size_t(h) * size_t(head_dim) + size_t(d);
+  const size_t k_dst = size_t(page) * size_t(k_page_stride / sizeof(T)) + in_row;
+  const size_t v_dst = size_t(page) * size_t(v_page_stride / sizeof(T)) + in_row;
+  k_pages = pie_kv_plane(k_pages, k_offset);
+  v_pages = pie_kv_plane(v_pages, v_offset);
   const size_t src_row = src_row_stride > 0 ? size_t(src_row_stride) : row_stride;
   const size_t src = size_t(i) * src_row + size_t(h) * size_t(head_dim) + size_t(d);
 
-  k_pages[dst] = k_new[src];
-  v_pages[dst] = v_new[src];
+  k_pages[k_dst] = k_new[src];
+  v_pages[v_dst] = v_new[src];
 }
 
 #define instantiate_kv_append_paged(name, itype)                  \
@@ -40,7 +48,8 @@ template <typename T>
       const device itype*, const device itype*, device itype*,    \
       device itype*, const constant int&, const constant int&,    \
       const constant int&, const device uint*,                    \
-      const device uint*, const constant int&, uint3);
+      const device uint*, const constant int&,      \
+      PIE_KV_LAYOUT_TYPES uint3);
 
 instantiate_kv_append_paged(bfloat16, bfloat)
 
@@ -79,6 +88,10 @@ template <typename T, uint N>
     const device uint* w_off             [[buffer(14)]],
 
     const constant int& src_row_stride   [[buffer(15)]],
+    const constant ulong& k_page_stride [[buffer(16)]],
+    const constant ulong& v_page_stride [[buffer(17)]],
+    const constant ulong& k_offset [[buffer(18)]],
+    const constant ulong& v_offset [[buffer(19)]],
     uint3 tid [[thread_position_in_grid]]) {
   constexpr uint NIB_BYTES = N / 2u;      // packed nibble bytes per block
   constexpr uint BYTES = NIB_BYTES + 2u;  // + one inline fp16 scale
@@ -125,19 +138,20 @@ template <typename T, uint N>
 
   // Destination: one N/2+2-byte block per (slot, head); a slot's heads are
   // contiguous, so the whole slot is n_kv_heads * (N/2+2) bytes.
-  const uint slot = w_page[i] * uint(page_size) + w_off[i];
-  const uint base = (slot * uint(n_kv_heads) + h) * BYTES;
+  const size_t in_page = (size_t(w_off[i]) * uint(n_kv_heads) + h) * BYTES;
+  device uchar* kb = pie_kv_plane(k_pages, k_offset) + size_t(w_page[i]) * k_page_stride + in_page;
+  device uchar* vb = pie_kv_plane(v_pages, v_offset) + size_t(w_page[i]) * v_page_stride + in_page;
   if (d < NIB_BYTES) {
-    k_pages[base + d] = uchar((uint(nk[2 * d + 1]) << 4) | uint(nk[2 * d]));
-    v_pages[base + d] = uchar((uint(nv[2 * d + 1]) << 4) | uint(nv[2 * d]));
+    kb[d] = uchar((uint(nk[2 * d + 1]) << 4) | uint(nk[2 * d]));
+    vb[d] = uchar((uint(nv[2 * d + 1]) << 4) | uint(nv[2 * d]));
   }
   if (d == 0) {
     const ushort bk = as_type<ushort>(hsk);
     const ushort bv = as_type<ushort>(hsv);
-    k_pages[base + NIB_BYTES] = uchar(bk & 0xff);
-    k_pages[base + NIB_BYTES + 1] = uchar((bk >> 8) & 0xff);
-    v_pages[base + NIB_BYTES] = uchar(bv & 0xff);
-    v_pages[base + NIB_BYTES + 1] = uchar((bv >> 8) & 0xff);
+    kb[NIB_BYTES] = uchar(bk & 0xff);
+    kb[NIB_BYTES + 1] = uchar((bk >> 8) & 0xff);
+    vb[NIB_BYTES] = uchar(bv & 0xff);
+    vb[NIB_BYTES + 1] = uchar((bv >> 8) & 0xff);
   }
 }
 
@@ -147,7 +161,8 @@ template <typename T, uint N>
       const device itype*, const device itype*, device uchar*,       \
       device uchar*, const constant int&, const constant int&,       \
       const constant int&, const device uint*,                       \
-      const device uint*, const constant int&, uint3);
+      const device uint*, const constant int&,      \
+      PIE_KV_LAYOUT_TYPES uint3);
 
 instantiate_kv_append_paged_pack(bfloat16, bfloat, 128)
 instantiate_kv_append_paged_pack(bfloat16, bfloat, 256)

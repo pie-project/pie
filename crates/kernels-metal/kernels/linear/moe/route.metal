@@ -734,3 +734,20 @@ constant constexpr uint kMaxExperts = 1024;
   const uint at = row * width + c;
   out[at] = static_cast<bfloat>(float(routed[at]) + g * float(shared[at]));
 }
+
+// One added to `hits[e]` for each of the `n` routes naming expert `e` (a
+// dropped route, `e < 0`, and one past `experts` count nothing): the weight
+// cache's use record of a routed bank read through its expert table.
+[[kernel]] void moe_count_routes(const device int *routes [[buffer(0)]],
+                                 device atomic_uint *hits [[buffer(1)]],
+                                 constant uint &n [[buffer(2)]],
+                                 constant uint &experts [[buffer(3)]],
+                                 uint at [[thread_position_in_grid]]) {
+  if (at >= n) {
+    return;
+  }
+  const int e = routes[at];
+  if (e >= 0 && uint(e) < experts) {
+    atomic_fetch_add_explicit(&hits[e], 1u, memory_order_relaxed);
+  }
+}

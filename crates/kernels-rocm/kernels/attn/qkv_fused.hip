@@ -17,15 +17,16 @@ __device__ __forceinline__ float norm_weight(const bf16* __restrict__ w, int i) 
     return w != nullptr ? to_f32(w[i]) : 1.f;
 }
 
-// Where head `kv_head` of row `row` lands in the pages; `r` is the launch's
-// own row, which the page tables are indexed by.
+// Where head `kv_head` of row `row` lands in the pages, whose rows lie
+// `stride` elements from the page before's (keys and values alike); `r` is
+// the launch's own row, which the page tables are indexed by.
 __device__ __forceinline__ long long kv_slot_row(const u32* __restrict__ page_indices,
                                                  const u32* __restrict__ page_indptr,
                                                  const u32* __restrict__ last_page_lens,
                                                  const u32* __restrict__ w_page,
                                                  const u32* __restrict__ w_off, long long row, int r,
                                                  int kv_head, int num_kv_heads, int head_dim,
-                                                 int page_size, bool hnd) {
+                                                 int page_size, bool hnd, long long stride) {
     long long page;
     int slot;
     if (w_page != nullptr && w_off != nullptr) {
@@ -38,8 +39,8 @@ __device__ __forceinline__ long long kv_slot_row(const u32* __restrict__ page_in
         page = page_indices[first + at / page_size];
         slot = at % page_size;
     }
-    return hnd ? ((page * num_kv_heads + kv_head) * page_size + slot) * head_dim
-               : (page * page_size + slot) * num_kv_heads * head_dim + kv_head * head_dim;
+    return page * stride + (hnd ? (static_cast<long long>(kv_head) * page_size + slot) * head_dim
+                                : static_cast<long long>(slot) * num_kv_heads * head_dim + kv_head * head_dim);
 }
 
 // The rotation of pair i at `pos`: identity past the rotated width.
@@ -65,7 +66,7 @@ __global__ __launch_bounds__(BLOCK) void qkv_decode_qk_norm_rope_vnorm_write_kv(
     const u32* __restrict__ last_page_lens, const u32* __restrict__ w_page,
     const u32* __restrict__ w_off, const u8* __restrict__ row_valid, const u32* __restrict__ win,
     int num_q_heads, int num_kv_heads, int head_dim, int page_size, bool hnd_layout, float theta,
-    float eps, bool v_norm, int rotary_dim) {
+    float eps, bool v_norm, int rotary_dim, long long stride) {
     __shared__ float red[BLOCK / kWave];
     const Window window{win};
     const int r = static_cast<int>(blockIdx.x);
@@ -99,7 +100,7 @@ __global__ __launch_bounds__(BLOCK) void qkv_decode_qk_norm_rope_vnorm_write_kv(
         dst = q_out + (row * num_q_heads + local) * head_dim;
     } else {
         const long long at = kv_slot_row(page_indices, page_indptr, last_page_lens, w_page, w_off, row, r,
-                                         local, num_kv_heads, head_dim, page_size, hnd_layout);
+                                         local, num_kv_heads, head_dim, page_size, hnd_layout, stride);
         dst = k_pages + at;
         const float inv_v = v_norm ? rsqrtf(ss_v / static_cast<float>(head_dim) + eps) : 1.f;
         for (int i = threadIdx.x; i < head_dim; i += BLOCK) v_pages[at + i] = from_f32<bf16>(to_f32(v_src[i]) * inv_v);
@@ -161,7 +162,8 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     const u32* __restrict__ last_page_lens, const u32* __restrict__ w_page,
     const u32* __restrict__ w_off, const u8* __restrict__ row_valid, const u32* __restrict__ win,
     int num_q_heads, int num_kv_heads, int page_size, bool hnd_layout, float theta, float eps,
-    bool v_norm, int rotary_dim, int span, bool qk_norm, float v_scale, int qk_width, int v_width) {
+    bool v_norm, int rotary_dim, int span, bool qk_norm, float v_scale, int qk_width, int v_width,
+    long long stride) {
     constexpr int LPH = HEAD_DIM / E;
     static_assert(HEAD_DIM % E == 0 && LPH <= kWave && kWave % LPH == 0, "a head's lanes share a wavefront");
     constexpr int kPairs = HEAD_DIM / 2;
@@ -250,7 +252,7 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
         dst = q_out + (row * num_q_heads + local) * HEAD_DIM;
     } else {
         const long long at = kv_slot_row(page_indices, page_indptr, last_page_lens, w_page, w_off, row, r,
-                                         local, num_kv_heads, HEAD_DIM, page_size, hnd_layout);
+                                         local, num_kv_heads, HEAD_DIM, page_size, hnd_layout, stride);
         dst = k_pages + at;
         const float inv_v = v_norm ? rsqrtf(ss_v / static_cast<float>(HEAD_DIM) + eps) : 1.f;
         Run vq;
@@ -278,7 +280,7 @@ __global__ __launch_bounds__(WAVES* kWave) void q_gate_k_norm_rope_append(
     bf16* __restrict__ q_out, bf16* __restrict__ gate_out, bf16* __restrict__ q_split, bf16* __restrict__ k_pages,
     bf16* __restrict__ v_pages, const u32* __restrict__ w_page, const u32* __restrict__ w_off,
     const u8* __restrict__ row_valid, const u32* __restrict__ win, int num_q_heads, int num_kv_heads,
-    int page_size, float q_eps, float k_eps, int rotary_dim, int span, float theta) {
+    int page_size, float q_eps, float k_eps, int rotary_dim, int span, float theta, long long stride) {
     static_assert(HEAD_DIM % 8 == 0 && HEAD_DIM / 8 <= kWave, "a lane holds one pack of a head");
     constexpr int PACKS = HEAD_DIM / 8;
     using P8 = Pack8<bf16>;
@@ -322,7 +324,7 @@ __global__ __launch_bounds__(WAVES* kWave) void q_gate_k_norm_rope_append(
         reinterpret_cast<P8*>(q_split + at)[ln] = x;
     }
     if (!is_q && lands && in_page && ln < PACKS) {
-        const long long dst = attn::kv_at<HND>(page, slot, local, 8 * ln, page_size, num_kv_heads, HEAD_DIM);
+        const long long dst = attn::kv_at<HND>(page, slot, local, 8 * ln, page_size, num_kv_heads, HEAD_DIM, stride);
         *reinterpret_cast<P8*>(v_pages + dst) = reinterpret_cast<const P8*>(v + (row * num_kv_heads + local) * HEAD_DIM)[ln];
     }
     float local_ss = 0.f;
@@ -363,7 +365,7 @@ __global__ __launch_bounds__(WAVES* kWave) void q_gate_k_norm_rope_append(
     if (is_q) {
         reinterpret_cast<P8*>(q_out + (row * num_q_heads + local) * HEAD_DIM)[ln] = o;
     } else if (lands && in_page) {
-        const long long dst = attn::kv_at<HND>(page, slot, local, 8 * ln, page_size, num_kv_heads, HEAD_DIM);
+        const long long dst = attn::kv_at<HND>(page, slot, local, 8 * ln, page_size, num_kv_heads, HEAD_DIM, stride);
         *reinterpret_cast<P8*>(k_pages + dst) = o;
     }
 }

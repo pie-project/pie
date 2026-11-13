@@ -18,6 +18,7 @@
 
 use crate::hlo::{Built, Elem, Func, Malformed, Val};
 use crate::mosaic::{Body, Compiled, Grid, ICmp, Kernel, MTy, Operand, Sem, Space, V, Window};
+use crate::tensor::PageMap;
 
 use super::paged::{Flashed, Heads};
 
@@ -52,6 +53,14 @@ struct Shape {
     slots: i64,
     h: Heads,
     scale: f64,
+    /// The chunk pool's rows where both planes are views of it (`u32 [R,
+    /// 128]`), their pages in the row-pair order (`crate::hlo::PoolOrder`):
+    /// a page's bf16 rows run pair by pair, a pair's 16 rows of two 128-lane
+    /// blocks each, read by the kernel as the pool's own u32 rows.
+    pooled: Option<i64>,
+    /// Where the keys and values planes' pages lie (`PageMap`): table page
+    /// `p` is plane page `p · stride + offset` of each.
+    maps: [PageMap; 2],
 }
 
 impl Shape {
@@ -86,9 +95,24 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         slots,
         h,
         scale,
+        pooled,
+        maps,
     } = *s;
+    let ordered = pooled.is_some();
     let (qh, gq, d, dv, kvh) = (h.qh(), h.g, h.d, h.dv, h.kvh);
     let (w, wv) = (kvh * d, kvh * dv);
+    // a buffer's row: a key row, or (pooled) a bf16 row of 128 of it (two
+    // to a pool row)
+    let (kk, kv_) = if pooled.is_some() {
+        (w / 128, wv / 128)
+    } else {
+        (1, 1)
+    };
+    let (lw, lwv) = if pooled.is_some() {
+        (128, 128)
+    } else {
+        (w, wv)
+    };
     let steps = rp / G;
     let rows = |b: &mut Body, gr: &Grid| -> Built<Vec<V>> {
         let zero = b.i32(0);
@@ -113,11 +137,23 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         grid: vec![steps],
         semantics: vec![Sem::Arbitrary],
         prefetch: vec![vec![table], vec![rp], vec![rp], vec![rp]],
-        ins: vec![
-            block(vec![rp * qh, d], Elem::F32, vec![G * qh, d]),
-            whole(vec![slots, w]),
-            whole(vec![slots, wv]),
-        ],
+        ins: match pooled {
+            None => vec![
+                block(vec![rp * qh, d], Elem::F32, vec![G * qh, d]),
+                whole(vec![slots, w]),
+                whole(vec![slots, wv]),
+            ],
+            Some(r) => vec![
+                block(vec![rp * qh, d], Elem::F32, vec![G * qh, d]),
+                Operand {
+                    array: vec![r, 128],
+                    elem: Elem::U32,
+                    block: vec![],
+                    window: Window::Any,
+                    index: Box::new(|_: &mut Body, _: &Grid| Ok(vec![])),
+                },
+            ],
+        },
         outs: vec![
             block(vec![rp * dv, QP], Elem::F32, vec![G * dv, QP]),
             block(vec![rp, QP], Elem::F32, vec![G, QP]),
@@ -125,8 +161,21 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         ],
         vmem_limit: Some(u64::try_from(vmem_cap).unwrap_or(0)),
         scratch: vec![
-            MTy::Ref(vec![2, span, w], Elem::Bf16, Space::Vmem),
-            MTy::Ref(vec![2, span, wv], Elem::Bf16, Space::Vmem),
+            // ordered: a page apiece, its rows as they lie
+            if ordered {
+                MTy::Ref(vec![2, span / ps, ps * kk / 2, lw], Elem::U32, Space::Vmem)
+            } else {
+                MTy::Ref(vec![2, span * kk, lw], Elem::Bf16, Space::Vmem)
+            },
+            if ordered {
+                MTy::Ref(
+                    vec![2, span / ps, ps * kv_ / 2, lwv],
+                    Elem::U32,
+                    Space::Vmem,
+                )
+            } else {
+                MTy::Ref(vec![2, span * kv_, lwv], Elem::Bf16, Space::Vmem)
+            },
             MTy::Sem(vec![2, 2]),
             MTy::Ref(vec![1, QP], Elem::F32, Space::Vmem),
             MTy::Ref(vec![1, QP], Elem::F32, Space::Vmem),
@@ -141,7 +190,12 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
             blk.grid.prefetch[2],
             blk.grid.prefetch[3],
         );
-        let (q_ref, kp, vp) = (blk.ins[0], blk.ins[1], blk.ins[2]);
+        let q_ref = blk.ins[0];
+        let (kp, vp) = if ordered {
+            (blk.ins[1], blk.ins[1])
+        } else {
+            (blk.ins[1], blk.ins[2])
+        };
         let (o_ref, m_ref, l_ref) = (blk.outs[0], blk.outs[1], blk.outs[2]);
         let (kbuf, vbuf, sems) = (blk.scratch[0], blk.scratch[1], blk.scratch[2]);
         let (m_sc, l_sc, a_sc) = (blk.scratch[3], blk.scratch[4], blk.scratch[5]);
@@ -165,13 +219,43 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
                 let page = b.load(pt, &[at])?;
                 let psv = b.i32(ps);
                 let src_row = b.muli(page, psv)?;
+                // each plane's own row of the page (its map; the identity
+                // reads `page · ps` for both)
+                let mut src_rows = [src_row; 2];
+                if pooled.is_some() || maps.iter().any(|m| !m.is_identity()) {
+                    for (at, m) in maps.iter().enumerate() {
+                        // a plane's page in its buffer rows (pooled: bf16
+                        // rows of 128, `ps · w / 128` a page)
+                        let per = ps * [kk, kv_][at];
+                        let by = b.i32(m.stride * per);
+                        let from = b.i32(m.offset * per);
+                        let row = b.muli(page, by)?;
+                        src_rows[at] = b.addi(row, from)?;
+                    }
+                }
                 let dp = b.subi(p, p0)?;
-                let dst_row = b.muli(dp, psv)?;
                 let z = b.i32(0);
-                for (plane, buf, width, which) in [(kp, kbuf, w, 0), (vp, vbuf, wv, 1)] {
-                    let src = b.ref_slice(plane, &[src_row, z], &[ps, width])?;
-                    let dst = b.ref_slice(buf, &[slot, dst_row, z], &[1, ps, width])?;
-                    let dst = b.ref_squeeze(dst)?;
+                for (plane, buf, width, which, per) in
+                    [(kp, kbuf, lw, 0, ps * kk), (vp, vbuf, lwv, 1, ps * kv_)]
+                {
+                    let (src_row, per) = if ordered {
+                        // the pool's own u32 rows: two bf16 rows apiece
+                        let two = b.i32(2);
+                        (b.divsi(src_rows[which as usize], two)?, per / 2)
+                    } else {
+                        (src_rows[which as usize], per)
+                    };
+                    let src = b.ref_slice(plane, &[src_row, z], &[per, width])?;
+                    let dst = if ordered {
+                        let dst = b.ref_slice(buf, &[slot, dp, z, z], &[1, 1, per, width])?;
+                        let dst = b.ref_squeeze(dst)?;
+                        b.ref_squeeze(dst)?
+                    } else {
+                        let pv = b.i32(per);
+                        let dst_row = b.muli(dp, pv)?;
+                        let dst = b.ref_slice(buf, &[slot, dst_row, z], &[1, per, width])?;
+                        b.ref_squeeze(dst)?
+                    };
                     let wh = b.i32(which);
                     let sem = b.ref_slice(sems, &[wh, slot], &[1, 1])?;
                     let sem = b.ref_squeeze(sem)?;
@@ -224,6 +308,8 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
         let zo = b.splat_f(&[dv, QP], Elem::F32, 0.0)?;
         let zv = b.splat_f(&[CHUNK, wv], Elem::Bf16, 0.0)?;
         let sc = b.splat_f(&[CHUNK, QP], Elem::F32, scale)?;
+        let sixteen_v = b.splat_i(&[CHUNK, 128], 16)?;
+        let high_v = b.splat_i(&[CHUNK, 128], i64::from(0xFFFF_0000u32 as i32))?;
 
         let (z, gn, step1) = (b.i32(0), b.i32(G), b.i32(1));
         b.for_range(z, gn, step1, |b, r| {
@@ -281,10 +367,40 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
                 let cv = b.i32(CHUNK);
                 let kb = b.muli(c, cv)?;
                 let kb = b.assume_multiple(kb, CHUNK)?;
-                let bidx = b.as_index(kb)?;
                 let i0 = b.index(0);
-                let kc = b.vload(kbuf, &[sidx, bidx, i0], &[1, CHUNK, w])?;
-                let kc = b.shape_cast(kc, &[CHUNK, w])?;
+                // a chunk's rows `[CHUNK, width]` of a buffer: ordered, a
+                // pair at a time (its pages' 16 rows of two lane blocks
+                // each), the pairs side by side
+                let chunk = |b: &mut Body, buf: V, per: i64, width: i64, lanes: i64| -> Built<V> {
+                    if ordered {
+                        let psv = b.i32(ps);
+                        let cp = b.divsi(kb, psv)?;
+                        let cidx = b.as_index(cp)?;
+                        let mut pieces = Vec::new();
+                        for j in 0..per / 2 {
+                            let jr = b.index(j * ps);
+                            let x =
+                                b.vload(buf, &[sidx, cidx, jr, i0], &[1, CHUNK / ps, ps, 128])?;
+                            let x = b.shape_cast(x, &[CHUNK, 128])?;
+                            let x = b.bitcast_v(x, Elem::I32)?;
+                            // a word's low half is the even 128-lane block,
+                            // as a float's high bits; its high half the odd
+                            let lo = b.shli(x, sixteen_v)?;
+                            let hi = b.andi(x, high_v)?;
+                            for half in [lo, hi] {
+                                let f = b.bitcast_v(half, Elem::F32)?;
+                                pieces.push(b.convert_f(f, Elem::Bf16)?);
+                            }
+                        }
+                        return b.concat(&pieces, 1);
+                    }
+                    let kkv = b.i32(per);
+                    let kbr = b.muli(kb, kkv)?;
+                    let bidx = b.as_index(kbr)?;
+                    let x = b.vload(buf, &[sidx, bidx, i0], &[1, CHUNK * per, lanes])?;
+                    b.shape_cast(x, &[CHUNK, width])
+                };
+                let kc = chunk(b, kbuf, kk, w, lw)?;
                 let s = b.matmul(kc, qbd, zs, true)?;
                 let s = b.mulf(s, sc)?;
                 // keys in `[lo_k, hi_k)` only
@@ -312,8 +428,7 @@ fn kernel(s: &Shape, vmem_cap: i64) -> Built<Compiled> {
                 let l = b.addf(l, ps_)?;
                 b.vstore(l, l_sc, &[i0, i0])?;
                 b.vstore(mn, m_sc, &[i0, i0])?;
-                let vc = b.vload(vbuf, &[sidx, bidx, i0], &[1, CHUNK, wv])?;
-                let vc = b.shape_cast(vc, &[CHUNK, wv])?;
+                let vc = chunk(b, vbuf, kv_, wv, lwv)?;
                 // a buffer row past the range may hold anything
                 let offv = b.broadcast_i(kb, &[CHUNK, wv])?;
                 let vj = b.addi(key_v, offv)?;
@@ -377,6 +492,7 @@ pub(crate) fn attend(
     h: &Heads,
     scale: f64,
     vmem_cap: i64,
+    maps: [PageMap; 2],
 ) -> Built<Flashed> {
     let r = f.dims(q)[0];
     let span = pages * ps;
@@ -393,6 +509,18 @@ pub(crate) fn attend(
         slots: f.dims(keys)[0],
         h: *h,
         scale,
+        pooled: match (f.view_parts(keys), f.view_parts(values)) {
+            (Some((pk, Elem::Bf16)), Some((pv, Elem::Bf16)))
+                if pk == pv
+                    && f.view_order(keys).is_some_and(|o| o.tokens == ps)
+                    && f.view_order(keys) == f.view_order(values) =>
+            {
+                Some(f.dims(pk)[0])
+            }
+            (None, None) => None,
+            _ => return bad("pool planes not both in the pool's row-pair order"),
+        },
+        maps,
     };
     let qh = h.qh();
     let pad_i = |f: &mut Func, x: Val| -> Built<Val> {
@@ -415,10 +543,16 @@ pub(crate) fn attend(
         let z = f.const_f(Elem::F32, 0.0, &[]);
         f.pad(q, z, &[0, 0], &[(rp - r) * qh, 0], &[0, 0])?
     };
-    let keys = f.convert(keys, Elem::Bf16);
-    let values = f.convert(values, Elem::Bf16);
     let kern = kernel(&s, vmem_cap)?;
-    let out = kern.call(f, &[pt, lane, lo, hi, q, keys, values])?;
+    let out = match (s.pooled, f.view_parts(keys)) {
+        // both planes out of the pool itself
+        (Some(_), Some((pool, _))) => kern.call(f, &[pt, lane, lo, hi, q, pool])?,
+        _ => {
+            let keys = f.convert(keys, Elem::Bf16);
+            let values = f.convert(values, Elem::Bf16);
+            kern.call(f, &[pt, lane, lo, hi, q, keys, values])?
+        }
+    };
     // `[rp·dv, QP]` as `[r, kvh, g, dv]`
     let o = f.reshape(out[0], &[rp, h.dv, QP])?;
     let o = f.slice_axis(o, 2, 0, qh)?;
@@ -458,6 +592,8 @@ mod tests {
             slots: 20000 * 16,
             h,
             scale: 0.1,
+            maps: [PageMap::IDENTITY; 2],
+            pooled: None,
         };
         let c = kernel(&s, 100 << 20).unwrap();
         assert!(c.module.contains("tpu.enqueue_dma"));
@@ -466,5 +602,50 @@ mod tests {
         if let Some(p) = std::env::var_os("PAGES_DUMP") {
             std::fs::write(p, &c.module).unwrap();
         }
+    }
+
+    /// The keys and values planes' pages by maps of their own: the copies
+    /// read each plane at `page · stride + offset` pages, and the identity
+    /// emits the kernel it always did. (Module text only: the kernel runs on
+    /// a TPU, where `kernels_attn::a_mapped_pool_reads_what_the_identity_
+    /// pool_reads` exercises it; unverified off a TPU.)
+    #[test]
+    fn the_kernel_copies_each_planes_pages_by_its_map() {
+        let h = Heads {
+            kvh: 8,
+            g: 2,
+            d: 128,
+            dv: 128,
+        };
+        let shape = |maps| Shape {
+            rp: 256,
+            span: 512,
+            ps: 16,
+            table: 256 * 32,
+            pages: 32,
+            slots: 20000 * 16,
+            h,
+            scale: 0.1,
+            maps,
+            pooled: None,
+        };
+        let plain = kernel(&shape([PageMap::IDENTITY; 2]), 100 << 20).unwrap();
+        let mapped = [
+            PageMap {
+                stride: 3,
+                offset: 1,
+            },
+            PageMap {
+                stride: 3,
+                offset: 2,
+            },
+        ];
+        let laid = kernel(&shape(mapped), 100 << 20).unwrap();
+        assert_ne!(plain.module, laid.module);
+        // `3 · 16` rows a table page, then `16` and `32` rows past it
+        for c in ["48 : i32", "16 : i32", "32 : i32"] {
+            assert!(laid.module.contains(c), "{c}");
+        }
+        assert_eq!(laid.operands.len(), plain.operands.len());
     }
 }

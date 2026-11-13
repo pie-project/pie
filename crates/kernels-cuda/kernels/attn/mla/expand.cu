@@ -30,7 +30,9 @@ __global__ void gather(
     __nv_bfloat16* __restrict__ kpe,
     int* __restrict__ ident,
     int* __restrict__ live,
-    int requests)
+    int requests,
+    long long ckv_stride,
+    long long kpe_stride)
 {
     const long long at = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (at == 0) {
@@ -45,14 +47,14 @@ __global__ void gather(
     const int run = static_cast<int>(at % runs);
     const int c = static_cast<int>(cell / page);
     const int t = static_cast<int>(cell % page);
-    const long long src = static_cast<long long>(page_indices[c]) * page + t;
+    const long long src = page_indices[c];
     if (run * 8 < rank) {
         *reinterpret_cast<uint4*>(lat + cell * rank + run * 8) =
-            *reinterpret_cast<const uint4*>(ckv_pages + src * rank + run * 8);
+            *reinterpret_cast<const uint4*>(ckv_pages + src * ckv_stride + static_cast<long long>(t) * rank + run * 8);
     } else {
         const int r = run * 8 - rank;
         *reinterpret_cast<uint4*>(kpe + cell * rope + r) =
-            *reinterpret_cast<const uint4*>(kpe_pages + src * rope + r);
+            *reinterpret_cast<const uint4*>(kpe_pages + src * kpe_stride + static_cast<long long>(t) * rope + r);
     }
 }
 

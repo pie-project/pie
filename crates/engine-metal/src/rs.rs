@@ -6,9 +6,7 @@ use engine::rs::{LanePlan, Run};
 use kernels_metal::Tensor;
 use poem_ir::{Def, Dim, Dtype, Gather, Operation, Ssm, Trace, Ty, ValueId};
 
-#[cfg(target_vendor = "apple")]
-use crate::device::elastic;
-use crate::device::{Buffer, Context, Handles};
+use crate::device::{Buffer, Handles};
 use crate::error::{Fault, Result};
 use crate::store::kv::Paging;
 
@@ -193,12 +191,29 @@ impl Layout {
                 Ok(())
             };
 
+        // A conv is buffered only where its output feeds a recurrence whose
+        // commit is deferred (a gated-delta scan's `qkv`, a KDA scan's
+        // `mixed`), as the compiler's rs rows read it: any other conv (a
+        // Mamba2 layer's) commits its state as it runs.
+        let deferred: std::collections::HashSet<u32> = trace
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Operation::Ssm(
+                    Ssm::GatedDelta { qkv, .. } | Ssm::GatedDeltaChunked { qkv, .. },
+                ) => Some(qkv.0),
+                Operation::Ssm(Ssm::Kda { mixed, .. } | Ssm::KdaChunked { mixed, .. }) => {
+                    Some(mixed.0)
+                }
+                _ => None,
+            })
+            .collect();
         for node in &trace.nodes {
             match &node.op {
                 Operation::Ssm(
                     Ssm::CausalConv1d { x, state, y, .. }
                     | Ssm::CausalConv1dChunked { x, state, y, .. },
-                ) => {
+                ) if deferred.contains(&y.0) => {
                     let cache = cache_of(trace, *state)?;
                     plane(&mut layout, cache, Role::ConvX, *x)?;
                     region(&mut layout, cache, "conv", *y)?;
@@ -306,18 +321,34 @@ impl Layout {
 #[derive(Debug)]
 pub struct Buffers {
     slab: Buffer,
-    /// The memory under `slab` where it gains it as pages are handed out.
-    #[cfg(target_vendor = "apple")]
-    store: Option<(elastic::Arena, elastic::Elastic)>,
     page_tokens: u32,
+    /// The page ids the slab holds: units of `stride` across the state
+    /// pool it lives in.
     slots: u32,
     page_bytes: u64,
+    /// What a page id steps by: `gcd(chunk, page)` in the state pool.
+    stride: u64,
     plane_at: Vec<u64>,
 }
 
 impl Buffers {
-    /// The bytes `reserve` takes for `layout` at `paging`: the load's memory
-    /// check counts them before anything is allocated.
+    /// The rs buffer as the state pool's rs list (`slab`): each plane's
+    /// `page_tokens` rows at `plane_at` in an rs-list slot, a lane's page ids
+    /// counting `stride` bytes from the pool's base.
+    #[must_use]
+    pub fn in_pool(plane_at: Vec<u64>, page_tokens: u32, slab: Buffer, stride: u64) -> Buffers {
+        Buffers {
+            slots: u32::try_from(slab.bytes() / stride.max(1)).unwrap_or(u32::MAX),
+            slab,
+            page_tokens: page_tokens.max(1),
+            page_bytes: stride,
+            stride,
+            plane_at,
+        }
+    }
+
+    /// The bytes per-page rs buffers would take for `layout` at `paging`:
+    /// the load's estimate before any pool.
     #[must_use]
     pub fn demand(layout: &Layout, paging: Paging) -> u64 {
         Self::geometry(layout, paging).2.max(256)
@@ -337,88 +368,9 @@ impl Buffers {
         (plane_at, page_bytes, bytes)
     }
 
-    pub fn reserve(device: &Context, layout: &Layout, paging: Paging) -> Result<Buffers> {
-        let page_tokens = paging.page_size.max(1);
-        let (plane_at, page_bytes, bytes) = Self::geometry(layout, paging);
-        let slots = paging.slots.max(1);
-        #[cfg(target_vendor = "apple")]
-        let store = device
-            .sparse()?
-            .map(|sparse| {
-                let arena = elastic::Arena::new(elastic::pages_up(bytes.max(256)));
-                let store = elastic::create(&sparse, &arena, bytes.max(256))?;
-                Ok::<_, Fault>((arena, store))
-            })
-            .transpose()?;
-        Ok(Buffers {
-            #[cfg(target_vendor = "apple")]
-            slab: match &store {
-                Some((_, store)) => store.view(),
-                None => Buffer::zeroed(device, bytes.max(256))?,
-            },
-            #[cfg(not(target_vendor = "apple"))]
-            slab: Buffer::zeroed(device, bytes.max(256))?,
-            #[cfg(target_vendor = "apple")]
-            store,
-            page_tokens,
-            slots,
-            page_bytes,
-            plane_at,
-        })
-    }
-
-    #[must_use]
-    pub fn bytes(&self) -> u64 {
-        self.slab.bytes()
-    }
-
-    /// Whether the slab gains memory as pages are handed out.
-    #[must_use]
-    pub fn elastic(&self) -> bool {
-        #[cfg(target_vendor = "apple")]
-        {
-            self.store.is_some()
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            false
-        }
-    }
-
-    /// Maps the slab under its first `pages` pages.
-    pub fn commit(&mut self, pages: u32) -> Result<()> {
-        #[cfg(target_vendor = "apple")]
-        if let Some((_, buffer)) = &mut self.store {
-            let bytes = elastic::pages_up(u64::from(pages) * self.page_bytes);
-            elastic::grow_all(&mut [elastic::Target { buffer, bytes }])?;
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        let _ = pages;
-        Ok(())
-    }
-
-    /// Gives back the slab past its first `pages` pages.
-    #[allow(unsafe_code)]
-    pub fn release(&mut self, pages: u32) -> Result<()> {
-        #[cfg(target_vendor = "apple")]
-        if let Some((_, buffer)) = &mut self.store {
-            let bytes = elastic::pages_up(u64::from(pages) * self.page_bytes);
-            // SAFETY: the caller's contract, `Engine::release_state`: no
-            // frame reads the pages released.
-            unsafe { elastic::shrink_all(&mut [elastic::Target { buffer, bytes }])? };
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        let _ = pages;
-        Ok(())
-    }
-
     #[must_use]
     pub fn page_tokens(&self) -> u32 {
         self.page_tokens
-    }
-
-    pub fn pages(&mut self) -> (&mut Buffer, u64) {
-        (&mut self.slab, self.page_bytes)
     }
 
     #[must_use]
@@ -598,7 +550,7 @@ impl Seat {
             layout: Arc::clone(layout),
             plane_at: buffers.plane_at.clone(),
             page_tokens: buffers.page_tokens,
-            page_bytes: buffers.page_bytes,
+            page_bytes: buffers.stride,
             pool_slots: buffers.slots,
             ext_in,
             ext_out,

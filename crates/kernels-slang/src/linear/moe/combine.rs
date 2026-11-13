@@ -149,3 +149,29 @@ pub fn sigmoid_gate_add(
         ],
     )
 }
+
+/// [`bias_sum`] with the bias bank read through `table` (its origin the
+/// table's fourth).
+pub fn bias_sum_tabled(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    table: &super::select::ExpertTable,
+    routes: Tensor,
+    weights: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_bias_sum";
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "linear_moe_combine_bias_sum_tabled_bf16" });
+    debug_assert_eq!(routes.dtype, Dtype::I32, "`{OP}` walks i32 routes");
+    debug_assert_eq!(weights.dtype, Dtype::F32, "`{OP}` reads f32 route weights");
+    let top_k = nonzero(OP, "the routed fan-out", routes.width)?;
+    let grid = route_rows(OP, y.width, y.rows)?;
+    let mut args = vec![x.arg(), routes.arg(), weights.arg(), y.arg_mut()];
+    args.extend(table.buffers());
+    args.push(stated(OP, y.width)?.arg());
+    args.push(stated(OP, y.rows)?.arg());
+    args.push(stated(OP, top_k)?.arg());
+    args.extend(table.place());
+    args.push(table.origins[3].arg());
+    ctx.fire(Fire::at(COMBINE, entry).apply(grid), &args)
+}

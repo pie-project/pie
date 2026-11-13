@@ -152,6 +152,27 @@ fn linear_glu_flat() {
             &land,
         );
 
+        // The split SwiGLU over routed legs: a token's `fan` rows all land
+        // under a seat that counts tokens.
+        let mut y = gpu.zeros(rows, width, Dtype::Bf16);
+        if let Some(s) = &stage {
+            ctx.arm_stage(s.ptr);
+        }
+        glu::swiglu_clamp_split(&ctx, gate, up, fan, f32::MAX, &mut y).unwrap();
+        ctx.disarm_stage();
+        let want: Vec<f32> = gs
+            .iter()
+            .zip(&us)
+            .map(|(&g, &u)| g * sigmoid(g) * u)
+            .collect();
+        check_rows(
+            &format!("swiglu_clamp_split {what}"),
+            &gpu.read(&y),
+            &want,
+            width as usize,
+            &land,
+        );
+
         let mut y = gpu.zeros(rows, width, Dtype::Bf16);
         if let Some(s) = &stage {
             ctx.arm_stage(s.ptr);
@@ -274,7 +295,7 @@ fn linear_swiglu_clamp_split() {
     let gt = gpu.tensor(&g, rows, width, Dtype::Bf16);
     let ut = gpu.tensor(&u, rows, width, Dtype::Bf16);
     let mut y = gpu.zeros(rows, width, Dtype::Bf16);
-    glu::swiglu_clamp_split(&ctx, gt, ut, limit, &mut y).unwrap();
+    glu::swiglu_clamp_split(&ctx, gt, ut, 1, limit, &mut y).unwrap();
     let want: Vec<f32> = g
         .iter()
         .zip(&u)
@@ -323,8 +344,8 @@ fn linear_glu_apart_lands_what_packed_lands() {
         let mut joined = gpu.zeros(rows, width, Dtype::Bf16);
         let (a, j) = (&mut apart, &mut joined);
         match k {
-            0 => glu::swiglu_clamp_split(&ctx, gate, up, max, a),
-            1 => glu::swiglu_clamp_split(&ctx, gate, up, limit, a),
+            0 => glu::swiglu_clamp_split(&ctx, gate, up, 1, max, a),
+            1 => glu::swiglu_clamp_split(&ctx, gate, up, 1, limit, a),
             2 => glu::swiglu_clamp_split_routed(&ctx, gate, up, weights, 1, limit, a),
             3 => glu::swiglu_clamp_split_routed(&ctx, gate, up, weights, 1, max, a),
             4 => glu::swiglu_clamp_alpha_split(&ctx, gate, up, 1, limit, alpha, a),

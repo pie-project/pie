@@ -216,10 +216,13 @@ pub fn avg_down(
     )
 }
 
+/// `segments`: the slab's segment table ([`crate::StateMap`]); a slot is
+/// `[frames][plane][channels]` and its pieces are whole frames.
 pub fn cache_gather(
     ctx: &Ctx<'_>,
     slab: Tensor,
     slot_ids: Tensor,
+    segments: Tensor,
     grid: Tensor,
     frames: u32,
     cache: Tensor,
@@ -272,17 +275,20 @@ pub fn cache_gather(
             frames.arg(),
             channels.arg(),
             stride.arg(),
+            segments.arg(),
         ],
     )
 }
 
-/// `x_base`: `x`'s row 0 in `grid`'s fire-wide rows, nonzero in a segmented fire's window.
+/// `x_base`: `x`'s row 0 in `grid`'s fire-wide rows, nonzero in a segmented fire's window;
+/// `segments` as [`cache_gather`]'s.
 #[allow(clippy::too_many_arguments)]
 pub fn cache_store(
     ctx: &Ctx<'_>,
     x: Tensor,
     cache: Tensor,
     slot_ids: Tensor,
+    segments: Tensor,
     grid: Tensor,
     frames: u32,
     slab: Tensor,
@@ -338,6 +344,7 @@ pub fn cache_store(
             channels.arg(),
             stride.arg(),
             x_base.arg(),
+            segments.arg(),
         ],
     )
 }

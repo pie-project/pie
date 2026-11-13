@@ -6,6 +6,7 @@
 
 mod common;
 
+use common::spread::{agrees, out};
 use common::{Gpu, KV, e4m3_code, e4m3_value, round_bf16, values};
 use dtype::Dtype;
 use kernels_rocm::attn::{self, plan};
@@ -135,7 +136,8 @@ fn cache(gpu: &Gpu, c: &Case, kv_lens: &[u32], seed: u64) -> Cache {
         pages_in_batch: page_indices.len() as i32,
         live: [0, 0],
         ..KV
-    };
+    }
+    .with_packed_stride();
     Cache {
         pool,
         keys,
@@ -297,6 +299,24 @@ fn run_decode(gpu: &Gpu, c: &Case, kv_lens: &[u32], window: Option<u32>, max_gri
             1e-3,
         );
     }
+    let tag = format!(
+        "decode d{} hnd={} fp8={} window={window:?} split={}",
+        c.head_dim, c.hnd, c.fp8, built.info.split_kv
+    );
+    agrees(
+        gpu,
+        &tag,
+        &[cache.pool],
+        &[],
+        &[out(&o), out(&lse)],
+        |_, pools, _| {
+            let (mut o, mut lse) = (o, lse);
+            attn::decode_lse(
+                &ctx, q, &built, &pools[0], window, c.head_dim, 0.0, &mut o, &mut lse,
+            )
+            .unwrap();
+        },
+    );
 }
 
 fn run_prefill(gpu: &Gpu, c: &Case, qo_lens: &[u32], prefix: &[u32], stride: usize) {
@@ -408,6 +428,17 @@ fn run_prefill_window(
             close(&tag, &got[at * row..(at + 1) * row], &want, 1.5e-2);
         }
     }
+    let tag = format!(
+        "prefill d{} hnd={} fp8={} window={window:?} graph={graph} split={}",
+        c.head_dim, c.hnd, c.fp8, built.info.split_kv
+    );
+    agrees(gpu, &tag, &[cache.pool], &[], &[out(&o)], |_, pools, _| {
+        let mut o = o;
+        attn::prefill(
+            &ctx, q, &built, &pools[0], window, c.head_dim, c.kv_heads, 0.0, &mut o,
+        )
+        .unwrap();
+    });
 }
 
 /// A windowed run: the case, its query and cached lengths, its splits, its
@@ -707,7 +738,8 @@ fn attn_paged_e4m3() {
         head_stride: 64,
         live: [0, 0],
         ..KV
-    };
+    }
+    .with_packed_stride();
     let slots = [(3u32, 1u32), (0, 15), (2, 0), (3, 2), (1, 7)];
     let k = RaggedTensor {
         data: gpu.tensor(&x, rows, width, Dtype::Bf16),

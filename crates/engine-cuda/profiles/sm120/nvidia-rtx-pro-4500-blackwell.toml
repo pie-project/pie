@@ -72,7 +72,6 @@ dag_streams_until = 256
 fire_rows = 5120
 # one recurrent-state slot a lane (the PRO 6000 asks two): on 32 GB the doubled slab left the Qwen3.8-27B
 # mini20 kv pages for 3 sequences, c128 453 -> 2,410 tok/s; Nemotron, Qwen3.6-35B, Qwen3.8-Flash-Next unchanged
-state_slots_per_lane = 1
 # prompt fires pad to 64 lanes, not the 512 decoding lanes two slots seat: Qwen3.8-Flash-Next mini
 # raw prefill 58.9k -> 68.7k, pf16-512 150.1k -> 160.5k tok/s, c512 unchanged, greedy parity unchanged
 prefill_lanes = 64
@@ -163,7 +162,6 @@ measured = [
   "engine.graphs",
   "engine.host_planes",
   "engine.lattice_steps",
-  "engine.one_frame_when_short",
   "engine.prefill_lattice_from",
   "engine.prefill_lattice_steps",
   "engine.recording",

@@ -110,12 +110,14 @@ fn conv1d_update(
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     let (channels, c, k) = conv_extents(op, x, y, conv_width)?;
     let dil = stated(op, nonzero(op, "the conv's dilation", dilation)?)?;
-    let rows = nonzero(op, "rows", x.rows)?;
+    let n = nonzero(op, "rows", x.rows)?;
     seated(op, state, "conv1d_update", true, false, false)?;
+    let rows = state.rows(op, state.conv_slab, state.conv_stride, channels)?;
     let vectors = channels % CONV_VEC == 0
         && conv_width <= CONV_K_MAX
         && dilation == 1
-        && state.conv_stride % i64::from(CONV_VEC) == 0
+        && rows.keeps(i64::from(CONV_VEC))
+        && rows.atoms().is_multiple_of(CONV_VEC)
         && aligned16(x.ptr)
         && aligned16(y.ptr)
         && aligned16(weight.ptr)
@@ -125,11 +127,9 @@ fn conv1d_update(
         x.arg(),
         weight.arg(),
         bias.map_or(ArgValue::ABSENT, |b| b.arg()),
-        state.conv_slab.arg(),
-        state.slot_ids.arg(),
-        state.conv_stride.arg(),
+        rows.arg(),
         y.arg(),
-        stated(op, rows)?.arg(),
+        stated(op, n)?.arg(),
         c.arg(),
         k.arg(),
     ];
@@ -137,7 +137,7 @@ fn conv1d_update(
         (
             format!("::pie::ssm::conv1d_update_vec8{}", out.args()),
             Launch::grid(
-                [(channels / CONV_VEC).div_ceil(CONV_BLOCK), rows, 1],
+                [(channels / CONV_VEC).div_ceil(CONV_BLOCK), n, 1],
                 [CONV_BLOCK, 1, 1],
             )
             .programmatic(ctx.tuning().pdl),
@@ -146,7 +146,7 @@ fn conv1d_update(
         args.push(dil.arg());
         (
             format!("::pie::ssm::conv1d_update{}", out.args()),
-            Launch::grid([channels.div_ceil(BLOCK), rows, 1], [BLOCK, 1, 1]),
+            Launch::grid([channels.div_ceil(BLOCK), n, 1], [BLOCK, 1, 1]),
         )
     };
     args.extend([
@@ -235,12 +235,14 @@ fn conv1d_chunked(
     let dil = stated(op, nonzero(op, "the conv's dilation", dilation)?)?;
     let lanes = requests(op, x)?;
     seated(op, state, "conv1d_chunked", true, true, true)?;
+    let rows = state.rows(op, state.conv_slab, state.conv_stride, channels)?;
     let reach = (conv_width.saturating_sub(1)).saturating_mul(dilation);
     let row_tiled = reach <= CONV_TT;
     let vec8 = conv_width == 4
         && dilation == 1
         && channels.is_multiple_of(8)
-        && state.conv_stride % 8 == 0
+        && rows.keeps(8)
+        && rows.atoms().is_multiple_of(8)
         && [x.data.ptr, y.ptr, weight.ptr, state.conv_slab.ptr]
             .iter()
             .all(|&at| aligned16(at));
@@ -302,10 +304,8 @@ fn conv1d_chunked(
             weight.arg(),
             bias.map_or(ArgValue::ABSENT, |b| b.arg()),
             y.arg(),
-            state.conv_slab.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             x.indptr.arg(),
-            state.conv_stride.arg(),
             c.arg(),
             k.arg(),
             dil.arg(),
@@ -342,10 +342,8 @@ fn conv1d_chunked(
         )),
         &[
             x.data.arg(),
-            state.conv_slab.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             x.indptr.arg(),
-            state.conv_stride.arg(),
             c.arg(),
             k.arg(),
             dil.arg(),

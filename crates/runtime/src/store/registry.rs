@@ -1,9 +1,11 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
+use super::chunks::{Seats, ShapePool, StorePools};
 use super::kv::KvStore;
 use super::rs::RsStore;
-use super::seat::SeatBook;
+use super::shared::{Shared, Tiers};
+use super::slots::ShapeKind;
 
 static KV_TAINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -39,10 +41,15 @@ pub fn with_kv_lock<T>(
 pub struct Stores {
     pub kv: Arc<parking_lot::Mutex<KvStore>>,
     pub rs: Arc<Mutex<RsStore>>,
-    pub seats: Arc<Mutex<SeatBook>>,
-    pub seats_freed: Arc<tokio::sync::Notify>,
+    pub seats: Arc<Mutex<Seats>>,
     pub kv_page_size: u32,
     pub context_pages: u64,
+    /// The engine's shared chunk pool, where it states one: the stores
+    /// draw their ids from it, and lanes name their slots by its shapes.
+    pub shared: Option<Shared>,
+    /// The shared pool's host tier, where the engine states one
+    /// (CONTRACT-BC 22): what suspended and demoted state parks in.
+    pub host: Option<Shared>,
 }
 
 fn context_pages(max_context: usize, kv_page_size: u32) -> u64 {
@@ -70,19 +77,15 @@ pub fn register_model(kv_page_size: u32, num_kv_pages: &[usize], num_slots: &[us
     )
 }
 
-/// For a model with a window: the window and its ring's device and host pages
-/// instead.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StatePool {
     pub slots: u32,
-    pub host_slots: u32,
     pub pages: u32,
-    pub host_pages: u32,
-    pub window_tokens: u32,
-    pub window_pages: u32,
-    pub host_window_pages: u32,
 }
 
+/// Today's pool counts as the pinned shapes the degenerate mode states.
+#[cfg(test)]
 pub fn register_model_with_swap(
     kv_page_size: u32,
     num_kv_pages: &[usize],
@@ -91,47 +94,140 @@ pub fn register_model_with_swap(
     state: &[StatePool],
     max_context: &[usize],
 ) -> usize {
-    let stores: Vec<Option<Stores>> = (0..num_kv_pages.len())
+    use super::chunks::ShapeRun;
+    let engines: Vec<EngineStores> = (0..num_kv_pages.len())
         .map(|d| {
-            let mut kv = KvStore::new_with_swap(
-                num_kv_pages[d] as u32,
-                num_host_pages.get(d).copied().unwrap_or(0) as u32,
-                num_disk_pages.get(d).copied().unwrap_or(0),
+            let pool = state.get(d).copied().unwrap_or_default();
+            let run = |device: u32, host: u32| ShapeRun {
+                device,
+                host,
+                ..ShapeRun::default()
+            };
+            EngineStores {
+                pools: StorePools {
+                    shared: false,
+                    page_size: kv_page_size,
+                    kv: ShapeRun {
+                        disk: num_disk_pages.get(d).copied().unwrap_or(0),
+                        ..run(
+                            num_kv_pages[d] as u32,
+                            num_host_pages.get(d).copied().unwrap_or(0) as u32,
+                        )
+                    },
+                    window_tokens: 0,
+                    state: run(pool.slots, 0),
+                    buffer: run(pool.pages, 0),
+                },
+                max_context: max_context.get(d).copied().unwrap_or(0),
+                shared: None,
+                tiers: Tiers::default(),
+            }
+        })
+        .collect();
+    register_model_with_chunks(kv_page_size, &engines)
+}
+
+/// One engine's stores: its pools as chunks, its longest context, and the
+/// shared pool the stores draw from where it states one.
+#[derive(Clone, Debug, Default)]
+pub struct EngineStores {
+    pub pools: StorePools,
+    pub max_context: usize,
+    pub shared: Option<Shared>,
+    /// The tiers below the shared pool.
+    pub tiers: Tiers,
+}
+
+/// Registers a model whose engines state their pools as `engines` say.
+pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -> usize {
+    let stores: Vec<Option<Stores>> = engines
+        .iter()
+        .map(|engine| {
+            let pools = &engine.pools;
+            if let Some(shared) = &engine.shared {
+                return Some(shared_stores(
+                    shared,
+                    &engine.tiers,
+                    kv_page_size,
+                    engine.max_context,
+                ));
+            }
+            let mut kv = KvStore::with_pages(
+                pools.kv,
+                pools.kv.host,
+                pools.kv.disk,
                 rand::random::<[u8; 32]>(),
             );
             if let Some(identity) = crate::model::identity() {
                 kv.set_domain(identity.domain());
             }
-            let pool = state.get(d).copied().unwrap_or_default();
             // KV alone resumes a model only when it has no recurrent state.
-            kv.set_keeps(kv_sharing() && pool.slots == 0 && pool.window_tokens == 0);
+            kv.set_keeps(kv_sharing() && pools.state.device == 0 && pools.window_tokens == 0);
             kv.set_page_size(kv_page_size);
             let kv = Arc::new(parking_lot::Mutex::new(kv));
-            let slots = pool.slots;
-            let max_context = max_context.get(d).copied().unwrap_or(0);
-            let rs = if pool.window_tokens > 0 {
-                RsStore::new_ring(
-                    crate::store::rs::RingGeometry {
-                        tokens: pool.window_tokens,
-                        page_size: kv_page_size,
-                    },
-                    pool.window_pages,
-                    pool.host_window_pages,
-                )
-            } else {
-                RsStore::new(slots, pool.pages, pool.host_slots, pool.host_pages)
-            };
+            let slots = pools.state.device;
+            let max_context = engine.max_context;
+            let rs = RsStore::of(&StorePools {
+                page_size: kv_page_size,
+                ..*pools
+            });
             Some(Stores {
                 kv,
                 rs: Arc::new(Mutex::new(rs)),
-                seats: Arc::new(Mutex::new(SeatBook::new(slots))),
-                seats_freed: Arc::new(tokio::sync::Notify::new()),
+                seats: Arc::new(Mutex::new(Seats::new(slots))),
                 kv_page_size,
                 context_pages: context_pages(max_context, kv_page_size),
+                shared: None,
+                host: None,
             })
         })
         .collect();
     REGISTRY.push(RwLock::new(stores))
+}
+
+/// The stores of an engine whose pool is `shared`: kv pages are the list
+/// shape's slot refs, the rs store's state slots its records (or its
+/// window lists' pages each list's refs), as many seats as records. Below
+/// it `tiers`: the host tier's slots of the same shapes, and kv list slots
+/// on disk, every move between them the engine's `copy_slots`
+/// (CONTRACT-BC 22).
+pub fn shared_stores(
+    shared: &Shared,
+    tiers: &Tiers,
+    kv_page_size: u32,
+    max_context: usize,
+) -> Stores {
+    let (list, records) = {
+        let pool = shared.lock().unwrap();
+        (pool.list(), pool.records_most())
+    };
+    let pages = list.map_or_else(
+        || ShapePool::new(ShapeKind::List, 0, 0, 0),
+        |list| ShapePool::shared(shared, list),
+    );
+    let mut kv = KvStore::with_pool(pages, 0, 0, rand::random::<[u8; 32]>());
+    if let Some(list) = list {
+        let host = tiers
+            .host
+            .as_ref()
+            .map(|host| ShapePool::shared(host, list));
+        kv.set_tiers(list.id, host, tiers.disk_slots);
+    }
+    if let Some(identity) = crate::model::identity() {
+        kv.set_domain(identity.domain());
+    }
+    let rs = RsStore::shared(shared, tiers.host.as_ref());
+    kv.set_keeps(kv_sharing() && records == 0 && !rs.is_window());
+    kv.set_page_size(kv_page_size);
+    Stores {
+        kv: Arc::new(parking_lot::Mutex::new(kv)),
+        rs: Arc::new(Mutex::new(rs)),
+        seats: Arc::new(Mutex::new(Seats::new(records))),
+        kv_page_size,
+        context_pages: context_pages(max_context, kv_page_size),
+        shared: Some(Arc::clone(shared)),
+        host: tiers.host.clone(),
+    }
 }
 
 /// `PIE_KV_SHARE`, on unless `0`.
@@ -202,16 +298,12 @@ mod tests {
         )));
         stores[engine_idx] = Some(Stores {
             kv,
-            rs: Arc::new(Mutex::new(RsStore::new(
-                num_slots as u32,
-                num_slots as u32,
-                0,
-                0,
-            ))),
-            seats: Arc::new(Mutex::new(SeatBook::new(num_slots as u32))),
-            seats_freed: Arc::new(tokio::sync::Notify::new()),
+            rs: Arc::new(Mutex::new(RsStore::new(num_slots as u32, num_slots as u32))),
+            seats: Arc::new(Mutex::new(Seats::new(num_slots as u32))),
             kv_page_size,
             context_pages: context_pages(max_context, kv_page_size),
+            shared: None,
+            host: None,
         });
         Ok(())
     }

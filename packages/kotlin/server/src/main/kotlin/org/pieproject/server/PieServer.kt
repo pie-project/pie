@@ -42,7 +42,6 @@ public class PieServer private constructor(private val handle: Long) : AutoClose
         @SerialName("device_kv_budget") public var deviceKvBudget: String? = null
         @SerialName("max_forward_tokens") public var maxForwardTokens: Int = 512
         @SerialName("max_forward_requests") public var maxForwardRequests: Int = 4
-        @SerialName("max_state_slots") public var maxStateSlots: Int = 16
         @SerialName("max_model_len") public var maxModelLength: Int = 4096
 
         /** The cap on each inferlet's linear memory. */

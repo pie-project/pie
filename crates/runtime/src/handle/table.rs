@@ -17,7 +17,6 @@ use crate::inferlet::host::frames::{Frames, Pcm};
 use crate::inferlet::host::grammar::Matcher;
 use crate::policy::{self, By, Event, Resting};
 use crate::server::ClientId;
-use crate::store::registry as store_registry;
 
 #[derive(Debug)]
 pub(crate) enum Slot {
@@ -388,7 +387,6 @@ impl Table {
         handles: Handles,
         returns: Handles,
         launch_session: Option<&str>,
-        state_room: impl FnOnce(Option<usize>) -> Option<u32>,
     ) -> Result<Option<Lease>, HandleError> {
         if handles.is_empty() && returns.is_empty() {
             return Ok(None);
@@ -415,26 +413,6 @@ impl Table {
             && engines.any(|engine| engine != first)
         {
             return Err(HandleError::invalid("its handles are on different engines"));
-        }
-        let growing = handles
-            .values()
-            .filter(|name| match self.slots.get(name) {
-                Some(Slot::Unborn(HandleKind::WorkingSet)) => true,
-                Some(Slot::Parked(held)) => held.shares_state(),
-                _ => false,
-            })
-            .count();
-        let engine = handles
-            .values()
-            .find_map(|name| match self.slots.get(name) {
-                Some(Slot::Parked(held)) => Some(held.parts().kv.engine),
-                _ => None,
-            });
-        if state_room(engine).is_some_and(|room| (room as usize) < growing) {
-            return Err(HandleError::quota(format!(
-                "{growing} working set(s) taking new state would leave more recurrent state at \
-                 rest than the host holds; close a handle, or raise `[engine] max_state_slots`"
-            )));
         }
         let mut landing = HashSet::new();
         for (slot, &name) in &returns {
@@ -490,29 +468,6 @@ impl Table {
             self.rested(name);
         }
     }
-}
-
-/// How many more sets can come to rest on `engine`, or on the most open one
-/// where none is known yet, where it has recurrent state to hold. That state
-/// has no disk tier, so what rests must fit the host: past that a fire would
-/// starve on state nothing can move. A lane's own state is not resting, so it
-/// is not counted; a ring's pages are not sized here, so it has no limit yet.
-pub(crate) fn state_room(engine: Option<usize>) -> Option<u32> {
-    let stores = store_registry::all_for_model(0);
-    let engines: Vec<usize> = match engine {
-        Some(engine) => vec![engine],
-        None => (0..stores.len()).collect(),
-    };
-    engines
-        .into_iter()
-        .filter_map(|engine| {
-            let stores = stores.get(engine)?;
-            let resting = crate::planner::planner_for(0, engine)
-                .map_or(0, |planner| planner.resting_rs_slots());
-            let rs = stores.rs.lock().unwrap();
-            (rs.capacity().slots > 0).then(|| rs.host_available().slots.saturating_sub(resting))
-        })
-        .max()
 }
 
 fn refusal(name: HandleName, slot: Option<&Slot>) -> HandleError {
@@ -686,30 +641,15 @@ mod tests {
     async fn a_launch_moves_all_it_names_or_none() {
         let mut table = Table::default();
         answer(&mut table, new(1)).await;
-        let refused = table.lend(
-            7,
-            names(&[("a", 1), ("b", 2)]),
-            Handles::new(),
-            None,
-            |_| None,
-        );
+        let refused = table.lend(7, names(&[("a", 1), ("b", 2)]), Handles::new(), None);
         assert!(refused.unwrap_err().to_string().starts_with("unknown"));
         assert!(!table.lent(1), "the known one stays");
-        let twice = table.lend(
-            7,
-            names(&[("a", 1), ("b", 1)]),
-            Handles::new(),
-            None,
-            |_| None,
-        );
+        let twice = table.lend(7, names(&[("a", 1), ("b", 1)]), Handles::new(), None);
         assert!(twice.unwrap_err().to_string().contains("bound twice"));
         assert!(!table.lent(1));
-        let full = table.lend(7, names(&[("a", 1)]), Handles::new(), None, |_| Some(0));
-        assert!(full.unwrap_err().to_string().starts_with("quota"));
-        assert!(!table.lent(1), "a full host moves nothing");
         assert!(
             table
-                .lend(7, Handles::new(), Handles::new(), None, |_| None)
+                .lend(7, Handles::new(), Handles::new(), None)
                 .unwrap()
                 .is_none()
         );
@@ -724,13 +664,12 @@ mod tests {
                 names(&[("ws", 1)]),
                 names(&[("ws", 1), ("child", 2)]),
                 None,
-                |_| None,
             )
             .unwrap()
             .unwrap();
         assert!(table.lent(1) && table.lent(2));
         assert_eq!(lease.engine(), None, "an unborn handle is on no engine");
-        let in_use = table.lend(7, names(&[("ws", 1)]), Handles::new(), None, |_| None);
+        let in_use = table.lend(7, names(&[("ws", 1)]), Handles::new(), None);
         assert!(in_use.unwrap_err().to_string().contains("in a process"));
         spent(lease);
     }
@@ -750,7 +689,7 @@ mod tests {
         assert!(gone["error"].as_str().unwrap().starts_with("unknown"));
         let dead = answer(&mut table, HandleOp::Stat { name: 2 }).await;
         assert!(dead["error"].as_str().unwrap().contains("did not give"));
-        let refused = table.lend(7, names(&[("ws", 2)]), Handles::new(), None, |_| None);
+        let refused = table.lend(7, names(&[("ws", 2)]), Handles::new(), None);
         assert!(
             refused.unwrap_err().to_string().starts_with("dead"),
             "the reason stays"
@@ -758,7 +697,7 @@ mod tests {
         answer(&mut table, new(2)).await;
         assert!(
             table
-                .lend(7, names(&[("ws", 2)]), Handles::new(), None, |_| None)
+                .lend(7, names(&[("ws", 2)]), Handles::new(), None)
                 .is_ok(),
             "a dead name is free"
         );

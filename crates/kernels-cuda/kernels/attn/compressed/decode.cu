@@ -55,10 +55,11 @@ struct Shape {
     static constexpr int kSLd = kKeys + 8;         // a partial score row, padded
     static constexpr int kOLd = D + 8;             // the fold's f32 row, padded
     // Tiles in flight: fp8 rows are smaller, so more of them (five below
-    // sm_90, whose 163 KiB a block six overrun by 256 bytes); two bf16
-    // tiles on sm_86 and sm_89, whose opt-in tops at 99 KiB.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890)
-    static constexpr int kStages = kFp8 ? 5 : 2;
+    // sm_90, whose 163 KiB a block six overrun by 256 bytes); two of either
+    // where a block's opt-in tops at 99 KiB (sm_86, sm_89, sm_120, sm_121),
+    // the ring double-buffered.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || __CUDA_ARCH__ >= 1200)
+    static constexpr int kStages = 2;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
     static constexpr int kStages = kFp8 ? 5 : 4;
 #else
@@ -128,10 +129,10 @@ __device__ __forceinline__ unsigned rank_in_cluster() {
 // Key `slot`'s raw bytes in format F into a ring key's data and scale
 // bytes: `part` of the key's kPer threads.
 template <int F, int kPer>
-__device__ __forceinline__ void stage_raw(std::uint8_t* plane, long long slot, int ps, int part,
-                                          std::uint8_t* data, std::uint8_t* sc) {
+__device__ __forceinline__ void stage_raw(std::uint8_t* plane, long long slot, int ps, long long page_stride,
+                                          int part, std::uint8_t* data, std::uint8_t* sc) {
     using T = Rows<F>;
-    const DsRow r = rows_at<F>(plane, slot / ps, static_cast<int>(slot % ps), ps);
+    const DsRow r = rows_at<F>(plane, slot >> 16, static_cast<int>(slot & 0xffff), ps, page_stride);
     for (int i = part; i < T::kData / 16; i += kPer) __pipeline_memcpy_async(data + i * 16, r.data + i * 16, 16);
     if (part == 0) {
         if constexpr (T::kScale % 16 == 0) {
@@ -150,12 +151,14 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
     const u32* __restrict__ win_indptr,
     long long win_stride,
     int win_page_size,
+    long long win_page_stride,
     int window,
     const void* __restrict__ pool_keys,
     const u32* __restrict__ pool_indices,
     const u32* __restrict__ pool_indptr,
     long long pool_stride,
     int pool_page_size,
+    long long pool_page_stride,
     int ratio,
     const i32* __restrict__ selection,
     int top_k,
@@ -200,7 +203,8 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
     char* sRing = smem_raw + S::kQBytes;
     float* sS = reinterpret_cast<float*>(smem_raw + S::kQBytes + S::kRingBytes);
     constexpr int kStages = S::kStages;
-    // A chunk's key slots (page * page size + offset; -1 reads nothing).
+    // A chunk's key slots (the page above 16 bits, the offset in it below;
+    // -1 reads nothing).
     __shared__ long long s_slot[kChunkTiles * kKeys];
     __shared__ int s_end;
     __shared__ float s_ml[2][kGroup];
@@ -241,9 +245,8 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
     auto slot_of_key = [&](int n) -> long long {
         if (n < n_win) {
             const int pos = qpos - n_win + 1 + n;
-            return static_cast<long long>(win_indices[win_indptr[req] + pos / win_page_size]) *
-                       win_page_size +
-                   pos % win_page_size;
+            return (static_cast<long long>(win_indices[win_indptr[req] + pos / win_page_size]) << 16) |
+                   (pos % win_page_size);
         }
         if (n >= total) return -1;
         const int j = n - n_win;
@@ -252,9 +255,8 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
         // A compact pool's page holds its entries a row each (`pool_page_size`
         // of them); else entry c sits at its group's last position.
         const int pos = pool_compact ? c : (c + 1) * ratio - 1;
-        return static_cast<long long>(pool_indices[pool_indptr[req] + pos / pool_page_size]) *
-                   pool_page_size +
-               pos % pool_page_size;
+        return (static_cast<long long>(pool_indices[pool_indptr[req] + pos / pool_page_size]) << 16) |
+               (pos % pool_page_size);
     };
 
     // Tile t's keys into ring slot `buf`: a key row per kPerKey threads.
@@ -273,16 +275,17 @@ __global__ __launch_bounds__(kThreads, 1) void decode(
                 std::uint8_t* plane = const_cast<std::uint8_t*>(
                     static_cast<const std::uint8_t*>(win_key ? win_keys : pool_keys));
                 if (win_key) {
-                    stage_raw<WF, kPerKey>(plane, slot, ps, part, data, sc);
+                    stage_raw<WF, kPerKey>(plane, slot, ps, win_page_stride, part, data, sc);
                 } else {
-                    stage_raw<PF, kPerKey>(plane, slot, ps, part, data, sc);
+                    stage_raw<PF, kPerKey>(plane, slot, ps, pool_page_stride, part, data, sc);
                 }
             }
         } else {
             bf16* dst = reinterpret_cast<bf16*>(sRing) + buf * kKeys * kLd + key * kLd;
             const bf16* src =
                 slot >= 0 ? static_cast<const bf16*>(win_key ? win_keys : pool_keys) +
-                                slot * (win_key ? win_stride : pool_stride)
+                                (slot >> 16) * (win_key ? win_page_stride : pool_page_stride) +
+                                (slot & 0xffff) * (win_key ? win_stride : pool_stride)
                           : nullptr;
 #pragma unroll
             for (int i = 0; i < kChunks / kPerKey; ++i) {

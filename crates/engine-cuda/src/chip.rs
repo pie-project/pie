@@ -78,19 +78,6 @@ pub struct WorkingSetPercent(pub u32);
 #[decision(id = "engine.lattice_steps", constant(set(1, 2)), default = 1, tune = engine)]
 pub struct LatticeSteps(pub u32);
 
-/// Recurrent-state slots a lane gets when `[engine] max_state_slots` is unset,
-/// so a hybrid trunk seats every lane it batches; 0 keeps the fixed 256.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.state_slots_per_lane", constant(range(0..=8)), default = 0, tune = engine)]
-pub struct StateSlotsPerLane(pub u32);
-
-/// Whether a hybrid trunk whose state slots cannot seat every lane at the
-/// configured dispatch depth (two frames a lane) asks the runtime to post one
-/// frame a lane instead, seating up to twice the lanes. Off keeps the depth.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.one_frame_when_short", flag, default = false, tune = engine)]
-pub struct OneFrameWhenShort;
-
 /// Whether a decoding lane's next pages come before seating a waiting prompt,
 /// and a prompt waits rather than suspending a lane
 /// (`PoolFacts::seated_first`). Off keeps arrival order.
@@ -148,6 +135,16 @@ pub struct FireRows(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.prefill_lanes", constant(range(0..=65536)), default = 0, tune = engine)]
 pub struct PrefillLanes(pub u32);
+
+/// The most lanes one fire carries, whatever the load seats: the runtime
+/// fires a wave of more as fires of this many, each a recorded body. Wider
+/// decode bodies armed beside the rest slowed every graph's launches (an
+/// L40S's Qwen3-30B-A3B-NVFP4 at c1: some 290 ns a node, 3.6% of its
+/// decode, with decode bodies past 256 lanes armed). 0: every lane the load
+/// seats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.fire_lanes", constant(range(0..=65536)), default = 256, tune = engine)]
+pub struct FireLanes(pub u32);
 /// Whether a plane declared `host` (read only by row gathers) lives in pinned,
 /// device-mapped host memory, leaving device bytes to KV pages and state slots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -179,8 +176,6 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<Grouped>()
         .add::<WorkingSetPercent>()
         .add::<LatticeSteps>()
-        .add::<StateSlotsPerLane>()
-        .add::<OneFrameWhenShort>()
         .add::<SeatedFirst>()
         .add::<SeatToEnd>()
         .add::<SeatSpread>()
@@ -191,16 +186,24 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<PrefillLanes>()
         .add::<HostPlanes>()
         .add::<PrefillLatticeFrom>()
-        .add::<PrefillLatticeSteps>();
+        .add::<PrefillLatticeSteps>()
+        .add::<FireLanes>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     // The residual norms run as generated row kernels (`FUSIONS` holds no
     // rule for them).
     #[cfg(not(feature = "rocm"))]
     poem_compiler::costs::register_regions(&mut r, 2);
     // HIP graphs have no conditional node: one is priced past any launch it
-    // could skip, so the compiler lowers every region to `AlwaysLaunch`.
+    // could skip, so the compiler lowers every region to `AlwaysLaunch`. The
+    // residual norms run as generated row kernels there too; the products'
+    // epilogues keep their hand rules until ROCm holds contraction skeletons.
     #[cfg(feature = "rocm")]
-    poem_compiler::costs::register_for(&mut r, 2, poem_compiler::costs::Conditionals::Absent);
+    poem_compiler::costs::register_regions_for(
+        &mut r,
+        2,
+        poem_compiler::costs::Conditionals::Absent,
+        false,
+    );
     r
 });
 
@@ -276,8 +279,6 @@ pub struct Engine {
     pub grouped: bool,
     pub working_set_percent: u32,
     pub lattice_steps: u32,
-    pub state_slots_per_lane: u32,
-    pub one_frame_when_short: bool,
     pub seated_first: bool,
     pub seat_to_end: bool,
     pub seat_spread: bool,
@@ -289,6 +290,7 @@ pub struct Engine {
     pub host_planes: bool,
     pub prefill_lattice_from: u32,
     pub prefill_lattice_steps: u32,
+    pub fire_lanes: u32,
 }
 
 impl Engine {
@@ -311,8 +313,6 @@ impl Engine {
             grouped: profile.on::<Grouped>(&Anywhere),
             working_set_percent: profile.get::<WorkingSetPercent>().0,
             lattice_steps: profile.get::<LatticeSteps>().0,
-            state_slots_per_lane: profile.get::<StateSlotsPerLane>().0,
-            one_frame_when_short: profile.on::<OneFrameWhenShort>(&Anywhere),
             seated_first: profile.on::<SeatedFirst>(&Anywhere),
             seat_to_end: profile.on::<SeatToEnd>(&Anywhere),
             seat_spread: profile.on::<SeatSpread>(&Anywhere),
@@ -324,6 +324,7 @@ impl Engine {
             host_planes: profile.on::<HostPlanes>(&Anywhere),
             prefill_lattice_from: profile.get::<PrefillLatticeFrom>().0,
             prefill_lattice_steps: profile.get::<PrefillLatticeSteps>().0,
+            fire_lanes: profile.get::<FireLanes>().0,
         }
     }
 }
@@ -420,6 +421,22 @@ pub fn pinned(graphs: Graphs, recording: Option<Recording>) -> Profile {
         )),
     }
     profile(&text)
+}
+
+/// Whether the user's profile for `device` states `[engine] recording`: an
+/// operator's bodies allowance, a hard cap, where a checked-in profile's is
+/// a default the fit may stretch.
+#[must_use]
+pub fn states_recording(device: &str, profiles: Option<&Path>) -> bool {
+    let Some(profiles) = profiles else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(SHELF.user_path(profiles, device)) else {
+        return false;
+    };
+    registry()
+        .parse(&text, "user", profile::Strict::User)
+        .is_ok_and(|file| file.entries.contains_key("engine.recording"))
 }
 
 /// Resolve the profile one load runs under: its compute capability's
@@ -793,8 +810,6 @@ mod tests {
                 grouped: true,
                 working_set_percent: 50,
                 lattice_steps: 1,
-                state_slots_per_lane: 0,
-                one_frame_when_short: false,
                 seated_first: false,
                 seat_to_end: false,
                 seat_spread: false,
@@ -806,6 +821,7 @@ mod tests {
                 host_planes: false,
                 prefill_lattice_from: 256,
                 prefill_lattice_steps: 4,
+                fire_lanes: 256,
             }
         );
         // The compiler's prices, but that CUDA folds each chain
@@ -815,7 +831,7 @@ mod tests {
         assert_eq!(
             poem_compiler::DeviceProfile::of(&registry().defaults(), 132, &[], &[]),
             poem_compiler::DeviceProfile {
-                synth_regions: cfg!(not(feature = "rocm")),
+                synth_regions: true,
                 synth_anchors: cfg!(not(feature = "rocm")),
                 ..poem_compiler::DeviceProfile::default()
             }
@@ -864,8 +880,6 @@ mod tests {
             tuning.selected_mma,
             "a B200 walks a selection on the tensor cores"
         );
-        assert_eq!(Engine::of(&b200).state_slots_per_lane, 2);
-        assert!(Engine::of(&b200).one_frame_when_short);
         assert!(Engine::of(&b200).seated_first);
         assert_eq!(Engine::of(&b200).forward_tokens, 16384);
         assert_eq!(Engine::of(&b200).walk_fire_rows, 4096);
@@ -876,8 +890,6 @@ mod tests {
             Engine {
                 lattice_steps: 1,
                 prefill_lattice_from: Engine::of(&family).prefill_lattice_from,
-                state_slots_per_lane: 0,
-                one_frame_when_short: false,
                 seated_first: false,
                 seat_to_end: false,
                 seat_spread: false,
@@ -893,8 +905,6 @@ mod tests {
             "only the row lattice, the state seating, the planner's order, the fire width and \
              the host planes differ from the family's engine"
         );
-        assert_eq!(Engine::of(&family).state_slots_per_lane, 0);
-        assert!(!Engine::of(&family).one_frame_when_short);
         assert!(!Engine::of(&family).seated_first);
         assert!(!Engine::of(&family).host_planes);
         assert_eq!(Engine::of(&family).lattice_steps, 1);
@@ -1260,10 +1270,12 @@ mod hip {
     fn the_defaults_price_conditionals_past_any_launch() {
         // HIP graphs have no conditional node: one is priced past any launch
         // it could skip, so the compiler lowers every region to AlwaysLaunch.
+        // Chains fold into generated row kernels; no contraction skeleton yet.
         assert_eq!(
             poem_compiler::DeviceProfile::of(&registry().defaults(), 132, &[], &[]),
             poem_compiler::DeviceProfile {
                 cond_fixed_us: 1_000_000.0,
+                synth_regions: true,
                 ..poem_compiler::DeviceProfile::default()
             }
         );

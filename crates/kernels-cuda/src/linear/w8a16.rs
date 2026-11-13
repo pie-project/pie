@@ -124,8 +124,21 @@ pub fn matmul(
     } else {
         1
     };
-    if m > GEMM_UNTIL && !wgmma {
-        // A prefill's rows against the plane widened once, on cuBLAS.
+    // The tiled GEMM: 64-row CTAs while that keeps the grid wide, 128 past
+    // it; the deepest ring the block's shared memory holds beside the CTA's
+    // block exponents (a long K's exponents crowd it), down to two stages.
+    let sm80 = (tiled && !wgmma)
+        .then(|| {
+            let (bm, most) = if m <= 128 { (64u32, 4u32) } else { (128, 3) };
+            (2..=most)
+                .rev()
+                .map(|stages| (bm, stages, stages * (bm * 64 * 2 + 128 * 64) + 128 * (k / gran)))
+                .find(|&(.., smem)| ctx.smem_fits(smem))
+        })
+        .flatten();
+    if (m > GEMM_UNTIL || (tiled && sm80.is_none())) && !wgmma {
+        // A prefill's rows against the plane widened once, on cuBLAS; and
+        // a tiled shape no ring of the block's fits.
         let bytes = (n as usize).saturating_mul(k as usize).saturating_mul(2);
         let tile = ctx.scratch_stream(op, DECODED_WEIGHT, bytes)? as usize as u64;
         widen(ctx, op, codes, atoms, gran, n, k, tile)?;
@@ -145,10 +158,6 @@ pub fn matmul(
         ctx.stage(),
     ];
     if tiled {
-        // The tiled GEMM: 64-row CTAs while that keeps the grid wide, 128 past it.
-        let (bm, stages) = if m <= 128 { (64u32, 4u32) } else { (128, 3) };
-        // The stages, and the CTA's block exponents laid beside them.
-        let smem = stages * (bm * 64 * 2 + 128 * 64) + 128 * (k / gran);
         let part = if splits > 1 {
             let bytes = u64::from(splits) * u64::from(m) * u64::from(n) * 4;
             ctx.scratch_stream(
@@ -173,12 +182,14 @@ pub fn matmul(
                 Launch::grid([n.div_ceil(128), 1, splits], [128, 1, 1])
                     .smem(WG_STAGES * stage + 1024),
             )
-        } else {
+        } else if let Some((bm, stages, smem)) = sm80 {
             Fire::at(kernel(
                 W8A16_SM80,
                 &format!("::pie::linear::fp8_w8a16_gemm<{bm}, {stages}, {gran}>"),
             ))
             .apply(Launch::grid([n.div_ceil(128), m.div_ceil(bm), splits], [256, 1, 1]).smem(smem))
+        } else {
+            unreachable!("a tiled shape no ring fits took the widened plane above")
         };
         ctx.fire(op, fire, &args)?;
         if splits > 1 {

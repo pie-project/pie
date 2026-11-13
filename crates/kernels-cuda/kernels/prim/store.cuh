@@ -10,9 +10,11 @@ namespace pie {
 // the row's columns `from` up to `to` (every one where `to` is 0), at its
 // plane's row from the row's first element, or `head` of every `stride` of
 // them landed one head after another; or, where `page` is set, at the paged
-// cache row `page[r] * page_size + slot[r]` (none where the slot lies past
-// the page or `valid[r]` is 0). Its elements are bf16, or e4m3 where `e4m3`,
-// each `e4m3(x / scale)`.
+// cache row `slot[r]` of page `page[r]` (none where the slot lies past the
+// page or `valid[r]` is 0): a page's rows start `page_stride` of the plane's
+// elements after the page before's, or, where that is 0, right after its
+// `page_size` rows. Its elements are bf16, or e4m3 where `e4m3`, each
+// `e4m3(x / scale)`.
 struct Store {
     const int* page;
     const int* slot;
@@ -24,7 +26,7 @@ struct Store {
     float scale;
     int head;
     int stride;
-    int unused;
+    int page_stride;
 };
 
 // The landed column of the row's column `c`, or -1 past the window (`to`
@@ -37,12 +39,15 @@ __device__ __forceinline__ long long store_at(const Store& s, long long c, long 
     return j < s.head ? at / s.stride * s.head + j : -1;
 }
 
-// The cache row row `r` lands at, or -1 where it lands none.
-__device__ __forceinline__ long long store_cell(const Store& s, long long r) {
+// The plane element the cache row row `r` lands at starts on, its plane's
+// rows `row_stride` elements apart, or -1 where it lands none.
+__device__ __forceinline__ long long store_row(const Store& s, long long r, long long row_stride) {
     const int page = s.page[r];
     const int slot = s.slot[r];
     if (slot < 0 || slot >= s.page_size || page < 0 || (s.valid != nullptr && s.valid[r] == 0)) return -1;
-    return static_cast<long long>(page) * s.page_size + slot;
+    const long long pages = s.page_stride != 0 ? static_cast<long long>(s.page_stride)
+                                               : static_cast<long long>(s.page_size) * row_stride;
+    return static_cast<long long>(page) * pages + slot * row_stride;
 }
 
 // Eight bf16 (one vector) to `plane`'s element `at` and on, as the store

@@ -7,6 +7,7 @@
 // last `ngram − 1` ids, stored + 1 so 0 reads as none).
 
 #include "prim/device.hip"
+#include "prim/state_rows.hip"
 
 namespace pie::attn {
 
@@ -57,18 +58,18 @@ __device__ __forceinline__ int ple_cell(const PleHash& h, int cell) { return cel
 // A thread per (token, head), each token from its own slot (decode: a
 // request is one row): a block holds whole rows, `blockDim.x / heads` of
 // them, so each row's state moves once its heads have all read it.
-__global__ void ple_ngram_ids_update(const int* __restrict__ ids, int* __restrict__ state_base,
-                                     const int* __restrict__ slot_ids, long long slot_stride_elems,
-                                     int* __restrict__ ngram_ids, int rows, PleHash h,
+__global__ void ple_ngram_ids_update(const int* __restrict__ ids, StateRows rows,
+                                     int* __restrict__ ngram_ids, int n_rows, PleHash h,
                                      const i64* __restrict__ map, const u32* __restrict__ win) {
     const Window window_{win};
     const int per_block = static_cast<int>(blockDim.x) / h.heads;
     const int local = static_cast<int>(threadIdx.x) / h.heads, head = static_cast<int>(threadIdx.x) % h.heads;
     const int r = static_cast<int>(blockIdx.x) * per_block + local;
-    const bool live = local < per_block && r < rows && window_.live(r);
+    const bool live = local < per_block && r < n_rows && window_.live(r);
     const long long r_row = live ? window_.plane(r) : 0;
-    const int slot = live ? slot_ids[r] : -1;
-    int* state = state_base + static_cast<long long>(max(slot, 0)) * slot_stride_elems;
+    // The id window is uncuttable: the row is its first piece.
+    const int slot = live ? rows.first(r) : -1;
+    int* state = slot >= 0 ? rows.piece<int>(rows.row(r), 0) : nullptr;
     const int span = h.ngram - 1;
     int token = 0;
     if (slot >= 0) {
@@ -95,9 +96,8 @@ __global__ void ple_ngram_ids_update(const int* __restrict__ ids, int* __restric
 // One block per request over its (begin-offset, commit-capped) span of rows,
 // a thread per token; then one thread folds the span's last ids into the
 // state when the request commits it.
-__global__ void ple_ngram_ids_chunked(const int* __restrict__ ids, int* __restrict__ state_base,
-                                      const int* __restrict__ slot_ids, const u32* __restrict__ qo_indptr,
-                                      long long slot_stride_elems, int* __restrict__ ngram_ids,
+__global__ void ple_ngram_ids_chunked(const int* __restrict__ ids, StateRows rows,
+                                      const u32* __restrict__ qo_indptr, int* __restrict__ ngram_ids,
                                       bool write_state, const u8* __restrict__ write_state_mask,
                                       const int* __restrict__ commit_len, const int* __restrict__ begin_at,
                                       PleHash h, const i64* __restrict__ map, const int* __restrict__ snap,
@@ -119,9 +119,9 @@ __global__ void ple_ngram_ids_chunked(const int* __restrict__ ids, int* __restri
     }
     if (commit_len != nullptr) n = min(n, commit_len[rl]);
     if (n <= 0) return;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
-    int* state = state_base + static_cast<long long>(slot) * slot_stride_elems;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    int* state = rows.piece<int>(rid, 0);
     const int span = h.ngram - 1;
 
     for (int t = threadIdx.x; t < n; t += blockDim.x) {
@@ -139,7 +139,7 @@ __global__ void ple_ngram_ids_chunked(const int* __restrict__ ids, int* __restri
         // lane's own overwrites the cells it reads.
         for (int e = snap != nullptr ? snap[rl] : 0, end = snap != nullptr ? snap[rl + 1] : 0;
              e < end && snap_rows[e] < n; ++e) {
-            int* at = state_base + static_cast<long long>(snap_slots[e]) * slot_stride_elems;
+            int* at = rows.piece<int>(snap_slots + static_cast<long long>(e) * rows.pieces, 0);
             for (int p = 0; p < span; ++p) {
                 const int src = snap_rows[e] - span + p;
                 at[p] = src >= 0 ? ids[t0 + src] + 1 : state[p + snap_rows[e]];

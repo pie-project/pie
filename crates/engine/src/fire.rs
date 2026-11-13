@@ -3,6 +3,7 @@ use std::ops::Range;
 use serde::{Deserialize, Serialize};
 
 use crate::channel::{ChannelId, Ticket};
+use crate::chunk::{ChunkFacts, ShapeId, SlotKind};
 use crate::error::{Error, Result};
 use crate::program::InstanceId;
 
@@ -171,15 +172,11 @@ pub struct KvDelta {
     pub pages: Vec<u32>,
     #[serde(default)]
     pub translation: Vec<u32>,
-    /// The ids of the lane's pages in the windowed kv spaces, aligned with
+    /// The ids of the lane's pages in the window list, aligned with
     /// `translation` when it is stated and with `pages` otherwise; 0 is the
     /// null page a page wholly behind the window reads.
     #[serde(default)]
     pub window: Vec<u32>,
-    /// Windowed pages copied `(src, dst)` before the fire runs, beside the
-    /// full pages the fire's pre-launch copy moves.
-    #[serde(default)]
-    pub window_copies: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +232,33 @@ pub struct Lane {
     /// an engine that taps ([`crate::Engine::tap_groups`]).
     #[serde(default)]
     pub tap: Option<Tap>,
+    /// The lane's slot refs of the kv list and of each window list, in
+    /// token order (an engine that states [`crate::chunk::ChunkFacts`]);
+    /// empty during the migration, when `kv` and `rs` still say. A window
+    /// list's table is in its own token order, entry `i` its rows
+    /// `[i * T_w, (i + 1) * T_w)` (`T_w` its shape's tokens), a slot trimmed
+    /// behind its window ref 0 (CONTRACT-BC 19, 21).
+    #[serde(default)]
+    pub tables: Vec<(ShapeId, Vec<u32>)>,
+    /// The lane's slot refs of each fixed shape, one `[run, cow]` a piece,
+    /// in piece order. `cow == run` writes the record in place (the normal
+    /// case); `cow != run` has the engine copy `run` onto `cow` on the
+    /// stream before the fire, which then reads and writes `cow` (a fork, or
+    /// a snapshot restored, within the fire).
+    #[serde(default)]
+    pub fixed: Vec<(ShapeId, Vec<[u32; 2]>)>,
+    /// Whole-slot copies `[src, dst]` (logical slot refs) of each list
+    /// shape, made on the stream before the fire runs, after the fires
+    /// before it: the rs list, where a lane writes buffered rows into a
+    /// slot it shared with a fork (CONTRACT-BC 18; its
+    /// `RsVerb::Buffer::pages` already name `dst`), and a window list,
+    /// where a lane writes rows into a slot it shares with a fork or a
+    /// prefix-cache entry (CONTRACT-BC 19; its table already names `dst`).
+    /// Every lane's copies of
+    /// a fire land before any lane of it reads or writes; no two name the
+    /// same `dst`.
+    #[serde(default)]
+    pub slot_copies: Vec<(ShapeId, Vec<[u32; 2]>)>,
 }
 
 /// Pool pages `pages[i]` read into host kv slots `slots[i]` as the fire
@@ -343,9 +367,125 @@ impl Lane {
                 )));
             }
         }
+        self.validate_chunk_refs(serves)
+    }
+
+    fn validate_chunk_refs(&self, serves: Serves) -> Result<()> {
+        if self.tables.is_empty() && self.fixed.is_empty() && self.slot_copies.is_empty() {
+            return Ok(());
+        }
+        if !serves.chunks {
+            return Err(Error::unsupported("engine", CHUNK_REFS_WITHOUT_CHUNKS));
+        }
+        let shapes = self
+            .tables
+            .iter()
+            .map(|(shape, _)| *shape)
+            .chain(self.fixed.iter().map(|(shape, _)| *shape));
+        let mut seen: Vec<ShapeId> = Vec::new();
+        for shape in shapes {
+            if seen.contains(&shape) {
+                return Err(Error::Invalid(format!(
+                    "lane in slot {} names shape {shape} twice in its slot tables",
+                    self.slot
+                )));
+            }
+            seen.push(shape);
+        }
+        if let Some((shape, _)) = self.fixed.iter().find(|(_, pieces)| pieces.is_empty()) {
+            return Err(Error::Invalid(format!(
+                "lane in slot {} names fixed shape {shape} with no piece",
+                self.slot
+            )));
+        }
+        Ok(())
+    }
+
+    /// Checks the lane's slot refs against the engine's chunks: each shape
+    /// stated, of the kind its table says, each piece of a fixed shape
+    /// named, every ref inside the pool (or the shape's pinned run) and off
+    /// the reserved chunks, but a window list's null ref 0 in its table.
+    pub fn validate_chunks(&self, facts: &ChunkFacts) -> Result<()> {
+        for (id, pieces) in &self.fixed {
+            if let Some(SlotKind::Fixed { pieces: stated }) = facts.shape(*id).map(|s| s.kind)
+                && pieces.len() != stated as usize
+            {
+                return Err(Error::Invalid(format!(
+                    "lane in slot {} names {} piece(s) of fixed shape {id}, which has {stated}",
+                    self.slot,
+                    pieces.len()
+                )));
+            }
+        }
+        let fixed: Vec<(ShapeId, Vec<u32>)> = self
+            .fixed
+            .iter()
+            .map(|(shape, pieces)| (*shape, pieces.iter().flatten().copied().collect()))
+            .collect();
+        let copies: Vec<(ShapeId, Vec<u32>)> = self
+            .slot_copies
+            .iter()
+            .map(|(shape, pairs)| (*shape, pairs.iter().flatten().copied().collect()))
+            .collect();
+        // Each shape's refs, whether they are fixed pieces, and whether a
+        // null ref 0 may stand among them (a window list's table).
+        let refs = self
+            .tables
+            .iter()
+            .map(|(shape, refs)| (*shape, refs.as_slice(), false, true))
+            .chain(
+                copies
+                    .iter()
+                    .map(|(shape, refs)| (*shape, refs.as_slice(), false, false)),
+            )
+            .chain(
+                fixed
+                    .iter()
+                    .map(|(shape, refs)| (*shape, refs.as_slice(), true, false)),
+            );
+        for (id, refs, fixed, table) in refs {
+            let Some(shape) = facts.shape(id) else {
+                return Err(Error::Invalid(format!(
+                    "lane in slot {} names shape {id}, which the engine does not state",
+                    self.slot
+                )));
+            };
+            let trims = table && shape.kind.window().is_some();
+            if fixed == shape.kind.per_token() {
+                return Err(Error::Invalid(format!(
+                    "lane in slot {} names {:?} shape {id} as {}",
+                    self.slot,
+                    shape.kind,
+                    if fixed { "fixed" } else { "a table" }
+                )));
+            }
+            let pool = shape.pinned.map_or(
+                crate::chunk::ChunkRun {
+                    first: 0,
+                    chunks: facts.total_chunks,
+                },
+                |pinned| pinned.device,
+            );
+            for &slot in refs {
+                if trims && slot == 0 {
+                    continue;
+                }
+                let chunk = shape.chunk_of(slot);
+                if !pool.contains(chunk) || facts.is_reserved(chunk) {
+                    return Err(Error::Invalid(format!(
+                        "lane in slot {} names slot {slot} of shape {id}, in chunk {chunk}, \
+                         which holds none of its slots",
+                        self.slot
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }
+
+const CHUNK_REFS_WITHOUT_CHUNKS: &str =
+    "Lane::tables and Lane::fixed against an engine that states no chunks";
 
 const F3_CHANNEL_TICKETS: &str =
     "Lane::channels against an engine without the pull-validate and commit-bump kernels";
@@ -359,6 +499,9 @@ pub struct Serves {
     pub rs_verbs: bool,
     pub adapter_attachments: bool,
     pub rs_snapshots: u32,
+    /// The engine has loaded: it states [`crate::chunk::ChunkFacts`] and
+    /// reads a lane's slot tables.
+    pub chunks: bool,
 }
 
 impl Serves {
@@ -367,6 +510,7 @@ impl Serves {
         rs_verbs: false,
         adapter_attachments: false,
         rs_snapshots: 0,
+        chunks: false,
     };
 
     #[must_use]
@@ -376,15 +520,22 @@ impl Serves {
             rs_verbs: caps.rs_verbs,
             adapter_attachments: caps.adapter_attachments,
             rs_snapshots: caps.rs_snapshots,
+            chunks: true,
         }
     }
 }
 
-/// The state after the lane's first `row` rows, landed in state slot `slot`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The state after the lane's first `row` rows, landed in a record of its
+/// own: state slot `slot`, or, to an engine that states chunks, the fixed
+/// shape's slot ref of the record's first piece. `pieces` names every piece
+/// of that record, in piece order, where it takes more than one; empty, the
+/// record is `slot` alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RsSnapshot {
     pub row: u32,
     pub slot: u32,
+    #[serde(default)]
+    pub pieces: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

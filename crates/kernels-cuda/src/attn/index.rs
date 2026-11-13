@@ -204,6 +204,7 @@ pub fn store_fp4(
             stated(OP, entries.rows)?.arg(),
             keys.page_size.arg(),
             div.arg(),
+            kv::page_elems(OP, keys, 0)?.arg(),
         ],
     )
 }
@@ -266,11 +267,13 @@ fn stage_fp4(ctx: &Ctx, op: &'static str, keys: &KvPool) -> Result<KvPool, Error
                 ArgValue::Ptr(table),
                 ArgValue::I32(i32::try_from(pages).unwrap_or(i32::MAX)),
                 ArgValue::I32(i32::try_from(page).unwrap_or(i32::MAX)),
+                kv::page_elems(op, keys, 0)?.arg(),
             ],
         )?;
     }
     let width = u32::try_from(128 / div).unwrap_or(128);
     let positions = cells.saturating_mul(div.unsigned_abs());
+    // The staged plane lies page after page.
     Ok(KvPool {
         keys: Tensor::new(plane, positions, width, Dtype::Bf16),
         values: Tensor::new(plane, positions, width, Dtype::Bf16),
@@ -278,7 +281,8 @@ fn stage_fp4(ctx: &Ctx, op: &'static str, keys: &KvPool) -> Result<KvPool, Error
         seq_stride: i64::from(width),
         head_stride: i64::from(width),
         ..*keys
-    })
+    }
+    .with_packed_stride())
 }
 
 pub fn kv_append(
@@ -636,7 +640,8 @@ fn ranked(
     // than forty bisection passes.
     let radix = ctx.tuning().index_radix;
     let (entry, smem) = match heads {
-        h if ctx.tuning().index_mma && head_dim == 128 && h <= 64 => {
+        // Its slots keep a key's row in a page in 16 bits.
+        h if ctx.tuning().index_mma && head_dim == 128 && h <= 64 && keys.page_size < 1 << 16 => {
             let tiles: u32 = match h.unsigned_abs().div_ceil(16) {
                 1 => 1,
                 2 => 2,
@@ -709,6 +714,7 @@ fn ranked(
             heads.arg(),
             head_dim.arg(),
             keys.page_size.arg(),
+            kv::page_elems(OP, keys, 0)?.arg(),
             score_stride.arg(),
             top_k.arg(),
             ratio.arg(),
@@ -825,6 +831,7 @@ pub fn topk_block_max(
             heads.arg(),
             head_dim.arg(),
             keys.page_size.arg(),
+            kv::page_elems(OP, keys, 0)?.arg(),
             max_blocks.arg(),
             top_k.arg(),
             block.arg(),

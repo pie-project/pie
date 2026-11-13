@@ -569,6 +569,8 @@ enum Origin {
     /// A cell of the pinned heap, of this class (`device::held::heap`).
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     Carved(usize),
+    /// Pageable memory no fire reads ([`Pinned::pageable`]).
+    Pageable,
 }
 
 // SAFETY: concurrent-access soundness comes from the channel's SPSC discipline above this type (guest and engine each own one control word), not from anything here; moving the allocation is as sound as a `Box<[u8]>`.
@@ -590,6 +592,44 @@ impl Pinned {
 
     pub fn mapped(bytes: usize) -> Result<Pinned> {
         Pinned::alloc(bytes, true)
+    }
+
+    /// `bytes` of pageable host memory, zeroed (a private anonymous mapping
+    /// whose pages are made up front across the machine's cores,
+    /// [`prefault`]): a copy
+    /// no fire reads in place, the device copying out of it alone, whose
+    /// address it takes as any host address (`device` is the host address).
+    /// Nothing is pinned, so a span of gigabytes costs no page-locking.
+    #[cfg(unix)]
+    pub fn pageable(bytes: usize) -> Result<Pinned> {
+        if bytes == 0 {
+            return Ok(Pinned::empty());
+        }
+        // SAFETY: a fresh private anonymous mapping of a stated length; no
+        // fd, no offset, owned by this structure and unmapped once in `Drop`.
+        let at = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if at == libc::MAP_FAILED {
+            return Err(Fault::Residency(format!(
+                "this machine would not map {bytes} bytes of host memory for the weights' copy"
+            )));
+        }
+        prefault(at.cast(), bytes);
+        pageable_spans().push((at as usize, bytes));
+        Ok(Pinned {
+            host: at.cast(),
+            device: at as u64,
+            bytes,
+            origin: Origin::Pageable,
+        })
     }
 
     pub fn mapped_uninit(bytes: usize) -> Result<Pinned> {
@@ -758,28 +798,11 @@ impl Drop for Pinned {
             }
             #[cfg(not(feature = "device"))]
             Origin::Allocated => {}
+            Origin::Pageable => {
+                pageable_spans().retain(|&(at, _)| at != self.host as usize);
+                unmap_anon(self.host, self.bytes);
+            }
         }
-    }
-}
-
-#[cfg(unix)]
-fn map_anon(bytes: usize) -> Option<*mut u8> {
-    // SAFETY: a fresh private anonymous mapping of a stated length; no fd and
-    // no offset are involved, and the pages belong to nobody else.
-    let at = unsafe {
-        libc::mmap(
-            core::ptr::null_mut(),
-            bytes.max(1),
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    if at == libc::MAP_FAILED {
-        None
-    } else {
-        Some(at.cast())
     }
 }
 
@@ -789,23 +812,6 @@ fn unmap_anon(at: *mut u8, bytes: usize) {
     unsafe {
         libc::munmap(at.cast(), bytes.max(1));
     }
-}
-
-#[cfg(windows)]
-fn map_anon(bytes: usize) -> Option<*mut u8> {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
-    };
-    // SAFETY: a fresh committed reservation of a stated length, owned by nobody else.
-    let at = unsafe {
-        VirtualAlloc(
-            core::ptr::null_mut(),
-            bytes.max(1),
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE,
-        )
-    };
-    if at.is_null() { None } else { Some(at.cast()) }
 }
 
 #[cfg(windows)]
@@ -855,25 +861,57 @@ impl Pinning {
         })
     }
 
-    pub fn uninit(bytes: usize) -> Result<Pinning> {
-        let Some(at) = map_anon(bytes) else {
-            return Err(Fault::Device {
-                call: "mmap",
-                code: -1,
-            });
-        };
-        #[cfg(target_os = "linux")]
-        // SAFETY: `at` is the mapping `map_anon` just made of at least
-        // `bytes` bytes; MADV_HUGEPAGE is only a hint and changes no contents.
-        unsafe {
-            libc::madvise(at.cast(), bytes.max(1), libc::MADV_HUGEPAGE)
-        };
-        Ok(Pinning { host: at, bytes })
-    }
-
+    /// `bytes` (rounded up to whole 2 MiB pages) of anonymous memory in
+    /// transparent huge pages where the kernel has them, every page already
+    /// faulted in by `threads` threads: locking it then only pins pages
+    /// that are there. 4 GiB this way takes ~0.4 s to fault, outside the
+    /// driver, and ~0.2 s to lock; `cudaHostAlloc` takes ~6 s for it,
+    /// holding the driver's lock throughout, and ~2.5 s to free.
+    #[cfg(target_os = "linux")]
     #[must_use]
-    pub fn host(&self) -> *mut u8 {
-        self.host
+    pub fn faulted(bytes: usize, threads: usize) -> Option<Pinning> {
+        const HUGE_PAGE: usize = 2 << 20;
+        const PAGE: usize = 4 << 10;
+        let bytes = bytes.max(1).next_multiple_of(HUGE_PAGE);
+        // SAFETY: a fresh private anonymous mapping of a stated length; no
+        // fd, no offset, owned by nobody else.
+        let at = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if at == libc::MAP_FAILED {
+            return None;
+        }
+        // SAFETY: advice on this mapping alone; a kernel without
+        // transparent huge pages ignores it.
+        unsafe {
+            libc::madvise(at, bytes, libc::MADV_HUGEPAGE);
+        }
+        let base = at as usize;
+        let share = (bytes / threads.max(1)).next_multiple_of(HUGE_PAGE);
+        let touch = |from: usize, to: usize| {
+            for page in (from..to).step_by(PAGE) {
+                // SAFETY: inside the mapping made above, which no one else
+                // reads or writes yet.
+                unsafe { core::ptr::write_volatile((base + page) as *mut u8, 0) };
+            }
+        };
+        std::thread::scope(|scope| {
+            for from in (share..bytes).step_by(share.max(HUGE_PAGE)) {
+                scope.spawn(move || touch(from, (from + share).min(bytes)));
+            }
+            touch(0, share.min(bytes));
+        });
+        Some(Pinning {
+            host: at.cast(),
+            bytes,
+        })
     }
 
     pub fn lock(self) -> Result<Pinned> {
@@ -1080,6 +1118,21 @@ pub fn copy_batch(
     to_host: bool,
     spans: &[(u64, u64, usize)],
 ) -> Result<()> {
+    batch(stream, !to_host, to_host, spans)
+}
+
+/// Copies every `(dst, src, bytes)` span within the device in one call, in
+/// the stream's order: what moves a pool's chunks out of a segment.
+pub fn copy_batch_d2d(stream: *mut core::ffi::c_void, spans: &[(u64, u64, usize)]) -> Result<()> {
+    batch(stream, false, false, spans)
+}
+
+fn batch(
+    stream: *mut core::ffi::c_void,
+    src_host: bool,
+    dst_host: bool,
+    spans: &[(u64, u64, usize)],
+) -> Result<()> {
     let live: Vec<(u64, u64, usize)> = spans.iter().copied().filter(|s| s.2 > 0).collect();
     #[cfg(all(feature = "cuda", not(feature = "rocm")))]
     if live.len() > 1 {
@@ -1104,11 +1157,8 @@ pub fn copy_batch(
                 type_: rt::cudaMemLocationType::cudaMemLocationTypeDevice,
                 id: device,
             };
-            let (src_hint, dst_hint) = if to_host {
-                (on_device, host)
-            } else {
-                (host, on_device)
-            };
+            let hint = |on_host: bool| if on_host { host } else { on_device };
+            let (src_hint, dst_hint) = (hint(src_host), hint(dst_host));
             let mut attrs = [rt::cudaMemcpyAttributes {
                 srcAccessOrder: rt::cudaMemcpySrcAccessOrder::cudaMemcpySrcAccessOrderStream,
                 srcLocHint: src_hint,
@@ -1139,7 +1189,7 @@ pub fn copy_batch(
         }
     }
     #[cfg(not(all(feature = "cuda", not(feature = "rocm"))))]
-    let _ = to_host;
+    let _ = (src_host, dst_host);
     for (dst, src, bytes) in live {
         copy_any(stream, dst, src, bytes)?;
     }
@@ -1279,6 +1329,56 @@ pub fn free_bytes() -> Option<u64> {
     }
 }
 
+/// Makes every page of the fresh anonymous mapping `at` (`bytes`) at once,
+/// a stripe of pages a thread: a copy of tens of gigabytes first touched a
+/// page at a time by one writer faults millions of times in a row (20 s of
+/// a held Qwen3-30B-A3B-FP8's 27.9 GB on an L40S host), populated by the
+/// kernel alone it takes 10 s, and huge pages asked for instead stall on
+/// compaction where the page cache has fragmented memory, a boot slower
+/// each run.
+#[cfg(unix)]
+fn prefault(at: *mut u8, bytes: usize) {
+    const PAGE: usize = 4096;
+    let pages = bytes.div_ceil(PAGE);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, 32)
+        .min(pages.max(1));
+    let base = at as usize;
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            scope.spawn(move || {
+                let mut page = t;
+                while page < pages {
+                    // SAFETY: a page of the private mapping just made, which
+                    // nothing else holds yet; writing its first byte zero
+                    // leaves it as mapped (zero) and makes the page.
+                    unsafe { core::ptr::write_volatile((base + page * PAGE) as *mut u8, 0) };
+                    page += threads;
+                }
+            });
+        }
+    });
+}
+
+/// The spans [`Pinned::pageable`] mapped and holds: anonymous memory, which
+/// advice that lets a file's pages go would zero.
+fn pageable_spans() -> std::sync::MutexGuard<'static, Vec<(usize, usize)>> {
+    static SPANS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+    SPANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether `at` lies in a pageable copy [`Pinned::pageable`] made.
+#[must_use]
+pub fn in_pageable_copy(at: u64) -> bool {
+    let at = at as usize;
+    pageable_spans()
+        .iter()
+        .any(|&(start, bytes)| at >= start && at < start + bytes)
+}
+
 #[must_use]
 pub fn is_host_pointer(at: u64) -> bool {
     #[cfg(feature = "device")]
@@ -1290,7 +1390,16 @@ pub fn is_host_pointer(at: u64) -> bool {
         // looked up, never dereferenced, so any value is a valid query.
         let asked =
             unsafe { rt::cudaPointerGetAttributes(&raw mut attrs, at as *const core::ffi::c_void) };
-        asked == rt::cudaError::cudaSuccess && attrs.type_ == rt::cudaMemoryType::cudaMemoryTypeHost
+        // Pinned host memory, or pageable memory CUDA never registered (a
+        // pageable weights copy, `Pinned::pageable`), which it reports as
+        // unregistered: host memory either way.
+        at != 0
+            && asked == rt::cudaError::cudaSuccess
+            && matches!(
+                attrs.type_,
+                rt::cudaMemoryType::cudaMemoryTypeHost
+                    | rt::cudaMemoryType::cudaMemoryTypeUnregistered
+            )
     }
     #[cfg(not(feature = "device"))]
     {

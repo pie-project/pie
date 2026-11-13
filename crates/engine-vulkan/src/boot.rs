@@ -1,4 +1,5 @@
-use crate::api::{ContractFor, DeviceBoot, Vulkan};
+use crate::api::{DeviceBoot, Vulkan};
+use engine_gpu::api::ContractFor;
 
 pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Vulkan, String> {
     let doc: toml::Table = std::str::from_utf8(config_bytes)
@@ -12,6 +13,7 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Vulkan, St
             validation: validation(&doc),
             pipeline_cache: pipeline_cache(&doc),
             profiles,
+            chunk_bytes: None,
         },
         contract_for,
     ))

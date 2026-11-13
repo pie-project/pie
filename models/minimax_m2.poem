@@ -98,7 +98,8 @@ def layout(id, deploy):
             gate = weight([d.experts, d.inter, hidden], experts),
             up = weight([d.experts, d.inter, hidden], experts),
             down = weight([d.experts, hidden, d.inter], experts),
-            kv = "kv.{}".format(l),
+            # Its keys and values, two planes of its kv heads a token.
+            kv = state([tokens, 2, d.kv_heads, hd], deploy.kv),
         )
 
     return struct(
@@ -109,7 +110,6 @@ def layout(id, deploy):
         head_dim = hd,
         rotary_dim = d.rotary_dim,
         q_width = q_width,
-        kv_width = kv_width,
         experts = d.experts,
         top_k = d.top_k,
         inter = d.inter,
@@ -117,7 +117,6 @@ def layout(id, deploy):
         max_position = d.max_position,
         eps = d.norm_eps,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
-        kv = deploy.kv,
         embed = weight([d.vocab, hidden]),
         head = weight([d.vocab, hidden]),
         layers = [layer(l) for l in range(d.layers)],
@@ -183,11 +182,6 @@ def read(m, reads):
 # and k RMS-normed across all their heads, the first quarter of each head
 # rotated (neox halves); then the routed experts a biased sigmoid picks,
 # their weights renormalized over the pick.
-
-def caches(m, c):
-    kv = c.kv_space(m.kv)
-    for w in m.layers:
-        c.kv(kv, w.kv, [m.kv_width, m.kv_width], m.head_dim, heads = True)
 
 def forward(m, inputs):
     positions = inputs.positions()

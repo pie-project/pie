@@ -1,6 +1,7 @@
 #include "linear/codec.cuh"
 #include "linear/act_quant.cuh"
 #include "linear/moe_w4.cuh"
+#include "linear/moe/table.cuh"
 
 namespace pie::linear {
 
@@ -90,7 +91,8 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_mxfp4_w4a8(
     int num_experts,
     int inter,
     float limit,
-    float galpha)
+    float galpha,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kNb = 8;
     constexpr int kTiles = 2;
@@ -133,8 +135,8 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_mxfp4_w4a8(
     const int chunks = k >> 7;
     const long long row_bytes = k >> 1;
     const int sf_row = k >> 5;
-    const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
-    const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+    const u8* w_e = expert_plane(codes, 1LL * n * row_bytes, expert_table, 3, 0, expert);
+    const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 3, 1, expert);
 
     // The stage row this thread copies: warp tid / 32's tile (tid / 16) % 2,
     // half (tid / 8) % 2, row tid % 8, as the warp's lanes read it.
@@ -243,7 +245,7 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_mxfp4_w4a8(
     asm volatile("cp.async.wait_group 0;\n" ::);
     if (!rows_live || count <= 64 * group) return;
 
-    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+    const bf16* b_e = bias != nullptr ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert) : nullptr;
     auto factor = [](int) { return 1.f; };
     w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin + 64 * group, count - 64 * group, out, n, inter,
                                       row_base, g, c, limit, galpha);
@@ -338,6 +340,29 @@ __device__ __forceinline__ void tma_2d(void* dst, unsigned long long* bar, const
         : "memory");
 }
 
+// A stage's 256 code rows as `map_w`'s two 128-row boxes land them (64B
+// rows, 16B chunk q of row r at `q ^ ((r >> 1) & 3)`), by cp.async from an
+// expert's codes `w_e` (`row_bytes` a row) where a table names them,
+// mapped host memory included: box rows from `y0` and `y1`, each past the
+// expert's `last` row read as its last (a row past the bank is no output's),
+// the K bytes from `col`; thread `t` of `threads`. `arrive_async` then
+// arrives on the stage's barrier as the thread's copies land.
+__device__ __forceinline__ void rows_async(unsigned char* dst, const u8* w_e, long long row_bytes, int col,
+                                           int y0, int y1, int last, int t, int threads) {
+    for (int i = t; i < 256 * 4; i += threads) {
+        const int r = i >> 2;
+        const int q = i & 3;
+        const long long row = min(r < 128 ? y0 + r : y1 + r - 128, last);
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(saddr(dst + r * 64 + ((q ^ ((r >> 1) & 3)) << 4))),
+                     "l"(w_e + row * row_bytes + col + q * 16)
+                     : "memory");
+    }
+}
+
+__device__ __forceinline__ void arrive_async(unsigned long long* bar) {
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(saddr(bar)) : "memory");
+}
+
 }  // namespace w4a8
 
 /// `moe_select_mxfp4_w4a8` with each stage landed by TMA: the slice's routes
@@ -345,8 +370,13 @@ __device__ __forceinline__ void tma_2d(void* dst, unsigned long long* bar, const
 /// `quantize_rows_mxfp8_routed`, 128B-swizzled), the CTA's 256 rows (or a
 /// GLU's 128 gate and 128 up) as two 128-row boxes of `map_w` (the bank's
 /// codes, 64B-swizzled), one thread issuing them a stage ahead onto that
-/// stage's mbarrier; the reads are `moe_select_mxfp4_w4a8`'s.
-template <int kGlu, int kStages>
+/// stage's mbarrier; the reads are `moe_select_mxfp4_w4a8`'s. `kTabled`: a
+/// table no map indexes (an entry may name mapped host memory, which no map
+/// spans, or lie off whole code rows past the window), the codes rows by
+/// every thread's cp.async into the stage as the boxes lay them
+/// (`w4a8::rows_async`), the routes' still by TMA: the same stages, so the
+/// same reads and bits.
+template <int kGlu, int kStages, bool kTabled>
 __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
     const __grid_constant__ w4a8::TmaMap map_x,
     const __grid_constant__ w4a8::TmaMap map_w,
@@ -363,7 +393,10 @@ __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
     int num_experts,
     int inter,
     float limit,
-    float galpha)
+    float galpha,
+    const u64* __restrict__ expert_table,
+    u64 expert_window,
+    const u8* __restrict__ codes)
 {
     constexpr int kNb = 8;
     constexpr int kTiles = 2;
@@ -399,10 +432,13 @@ __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
 
     const int chunks = k >> 7;
     const int sf_row = k >> 5;
-    const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+    const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 3, 1, expert);
     // The bank rows of the two boxes: 256 in order, or the GLU's gate and up.
-    const int w_y0 = expert * n + cta_row;
-    const int w_y1 = kGlu != 0 ? expert * n + inter + cta_row : w_y0 + 128;
+    // `map_w` spans the bank, or a located table's window: the expert's first row in it.
+    const int w_e = static_cast<int>(expert_row(expert_table, 3, 0, expert, n, expert_window, k >> 1));
+    const int w_y0 = w_e + cta_row;
+    const int w_y1 = kGlu != 0 ? w_e + inter + cta_row : w_y0 + 128;
+    const u8* w_codes = kTabled ? expert_plane(codes, 1LL * n * (k >> 1), expert_table, 3, 0, expert) : nullptr;
 
     // Stages 1024-aligned for the 128B swizzle; the barriers past them.
     extern __shared__ __align__(1024) unsigned char w4a8_tma_smem[];
@@ -413,21 +449,29 @@ __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
     if (tid == 0) {
 #pragma unroll
         for (int s = 0; s < kStages; ++s) {
-            w4a8::bar_init(full + s, 1);
+            w4a8::bar_init(full + s, kTabled ? 1 + 512 : 1);
             w4a8::bar_init(empty + s, kWarps * kGroups);
         }
         asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
     }
     __syncthreads();
     auto stage = [&](int ch) {
-        if (tid == 0 && ch < chunks) {
-            const int s = ch % kStages;
-            unsigned char* st = ring + s * kStage;
+        if (ch >= chunks) return;
+        const int s = ch % kStages;
+        unsigned char* st = ring + s * kStage;
+        if (tid == 0) {
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-            w4a8::bar_expect(full + s, kStage);
+            w4a8::bar_expect(full + s, kTabled ? kX : kStage);
             w4a8::tma_2d(st, full + s, &map_x, ch * 128, begin);
-            w4a8::tma_2d(st + kX, full + s, &map_w, ch * 64, w_y0);
-            w4a8::tma_2d(st + kX + kW / 2, full + s, &map_w, ch * 64, w_y1);
+            if (!kTabled) {
+                w4a8::tma_2d(st + kX, full + s, &map_w, ch * 64, w_y0);
+                w4a8::tma_2d(st + kX + kW / 2, full + s, &map_w, ch * 64, w_y1);
+            }
+        }
+        if (kTabled) {
+            w4a8::rows_async(st + kX, w_codes, k >> 1, ch * 64, cta_row, kGlu != 0 ? inter + cta_row : cta_row + 128,
+                             n - 1, tid, 512);
+            w4a8::arrive_async(full + s);
         }
     };
 
@@ -471,7 +515,7 @@ __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
     for (int ch = 0; ch < chunks; ++ch) {
         if (ch + 1 < chunks) load_s(ch + 1, na, nb);
         // Every warp past the chunk before: its stage takes the next fill.
-        if (tid == 0 && ch > 0 && ch + kStages - 1 < chunks)
+        if ((kTabled || tid == 0) && ch > 0 && ch + kStages - 1 < chunks)
             w4a8::bar_wait(empty + (ch - 1) % kStages, ((ch - 1) / kStages) & 1);
         stage(ch + kStages - 1);
         w4a8::bar_wait(full + ch % kStages, (ch / kStages) & 1);
@@ -511,7 +555,7 @@ __global__ void __launch_bounds__(512, 1) moe_select_mxfp4_w4a8_tma(
     }
     if (!rows_live || count <= 8 * kNb * group) return;
 
-    const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+    const bf16* b_e = bias != nullptr ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert) : nullptr;
     auto factor = [](int) { return 1.f; };
     w4mma::w4_land<kGlu, kTiles, kNb>(acc, factor, b_e, order, begin + 8 * kNb * group,
                                       count - 8 * kNb * group, out, n, inter, row_base, g, c, limit, galpha);
@@ -567,7 +611,9 @@ struct Const {
 /// codes as `quantize_rows_mxfp8_routed<kGran, true>` lays them (a 32's
 /// codes 8c..8c+3 at 4c, 8c+4..8c+7 at 16 + 4c), each 8-route block's B
 /// words one matrix row; the scales a byte of a chunk's word to each MMA.
-template <int kStages>
+/// `kTabled`: a table no map indexes, warpgroup 2's 128 threads landing each
+/// stage's codes rows by cp.async (`moe_select_mxfp4_w4a8_tma`'s).
+template <int kStages, bool kTabled>
 __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
     const __grid_constant__ w4a8::TmaMap map_x,
     const __grid_constant__ w4a8::TmaMap map_w,
@@ -584,7 +630,10 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
     int num_experts,
     int inter,
     float limit,
-    float galpha)
+    float galpha,
+    const u64* __restrict__ expert_table,
+    u64 expert_window,
+    const u8* __restrict__ codes)
 {
     constexpr int kNb = 8;
     constexpr int kTiles = 4;
@@ -607,7 +656,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
     if (tid == 0) {
 #pragma unroll
         for (int s = 0; s < kStages; ++s) {
-            w4a8::bar_init(full + s, 1);
+            w4a8::bar_init(full + s, kTabled ? 1 + 128 : 1);
             w4a8::bar_init(empty + s, 8);
         }
         asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
@@ -617,7 +666,8 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
     // Warpgroup 2 the producer, its registers to the MMA warpgroups.
     if (warp >= 8) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;\n" ::: "memory");
-        if (warp != 8 || lane != 0) return;
+        const int pt = tid - 256;
+        if (!kTabled && pt != 0) return;
         int s = 0;
         unsigned ph = 0;
         for (int job = static_cast<int>(blockIdx.x); job < jobs; job += static_cast<int>(gridDim.x)) {
@@ -625,14 +675,24 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
             const int expert = item >> 16;
             const int begin = offsets[expert] + (item & 0xFFFF) * 128;
             if (offsets[expert + 1] - begin <= 0) continue;
-            const int w_y = expert * n + (job % tiles) * 256;
+            const int row0 = (job % tiles) * 256;
+            const int w_y = kTabled ? 0 : static_cast<int>(expert_row(expert_table, 3, 0, expert, n, expert_window, k >> 1)) + row0;
+            const u8* w_e = kTabled ? expert_plane(codes, 1LL * n * (k >> 1), expert_table, 3, 0, expert) : nullptr;
             for (int ch = 0; ch < chunks; ++ch) {
                 w4a8::bar_wait(empty + s, ph ^ 1);
                 unsigned char* st = ring + s * kStage;
-                w4a8::bar_expect(full + s, kStage);
-                w4a8::tma_2d_cta(st, full + s, &map_x, ch * 128, begin);
-                w4a8::tma_2d_cta(st + kX, full + s, &map_w, ch * 64, w_y);
-                w4a8::tma_2d_cta(st + kX + kW / 2, full + s, &map_w, ch * 64, w_y + 128);
+                if (pt == 0) {
+                    w4a8::bar_expect(full + s, kTabled ? kX : kStage);
+                    w4a8::tma_2d_cta(st, full + s, &map_x, ch * 128, begin);
+                    if (!kTabled) {
+                        w4a8::tma_2d_cta(st + kX, full + s, &map_w, ch * 64, w_y);
+                        w4a8::tma_2d_cta(st + kX + kW / 2, full + s, &map_w, ch * 64, w_y + 128);
+                    }
+                }
+                if (kTabled) {
+                    w4a8::rows_async(st + kX, w_e, k >> 1, ch * 64, row0, row0 + 128, n - 1, pt, 128);
+                    w4a8::arrive_async(full + s);
+                }
                 if (++s == kStages) {
                     s = 0;
                     ph ^= 1;
@@ -674,7 +734,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
         const int cta_row = (job % tiles) * 256;
         const int row_base = cta_row + wr * 64;
         const int live = row_base < n ? min(max(count - wc * 64, 0), 64) : 0;
-        const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+        const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 3, 1, expert);
         // The rows' scales four chunks a load: lane c's row (g, or g + 8 at
         // odd c) at chunks 4q + 2 (c / 2).., a chunk's word shuffled from
         // its lane; the routes' a chunk (chunk-major, a block one sector).
@@ -772,7 +832,7 @@ __global__ void __launch_bounds__(384, 1) moe_select_mxfp4_w4a8_ws(
         // Land each 8-route block's routes 2c, 2c + 1 (a bf16 pair a row
         // 8m + g) transposed over the quad's eight g: lane g then holds
         // rows 8g..8g+7 of both, a 16-byte store each.
-        const bf16* b_e = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+        const bf16* b_e = bias != nullptr ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert) : nullptr;
         const int rows8 = row_base + 8 * g;
 #pragma unroll
         for (int b = 0; b < kNb; ++b) {
@@ -888,7 +948,8 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_nvfp4_w4a4(
     int act_div,
     int n,
     int k,
-    int num_experts)
+    int num_experts,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kNb = 8;
     constexpr int kTiles = 2;
@@ -929,8 +990,8 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_nvfp4_w4a4(
     const int chunks = k >> 7;
     const long long row_bytes = k >> 1;
     const int sf_row = k >> 4;
-    const u8* w_e = codes + static_cast<long long>(expert) * n * row_bytes;
-    const u8* s_e = scales + static_cast<long long>(expert) * n * sf_row;
+    const u8* w_e = expert_plane(codes, 1LL * n * row_bytes, expert_table, 3, 0, expert);
+    const u8* s_e = expert_plane(scales, 1LL * n * sf_row, expert_table, 3, 1, expert);
 
     const int own = tid % 256;
     const int own_half = tid / 256;
@@ -1032,7 +1093,9 @@ __global__ void __launch_bounds__(256 * kGroups, 1) moe_select_nvfp4_w4a4(
     asm volatile("cp.async.wait_group 0;\n" ::);
     if (!rows_live || count <= 64 * group) return;
 
-    const float* ts_e = tensor_scales + static_cast<long long>(expert) * n;
+    // The bank's NVFP4 table (`[codes, scales, tensor_scales]`, its W4A16
+    // arm's); the input scales lie on the device beside it, one an expert.
+    const float* ts_e = expert_plane(tensor_scales, 1LL * n, expert_table, 3, 2, expert);
     const float in_scale = input_scales[expert];
     auto factor = [&](int row) { return ts_e[row] * in_scale; };
     w4mma::w4_land<0, kTiles, kNb>(acc, factor, nullptr, order, begin + 64 * group, count - 64 * group, out, n, n,

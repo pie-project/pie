@@ -139,6 +139,7 @@ pub fn keyed(p: &KvPool, keys: Tensor, values: Tensor) -> KvPool {
         seq_stride: i64::from(keys.width),
         ..*p
     }
+    .with_packed_stride()
 }
 
 /// [`Tuning::DEFAULT`] with `set` applied.
@@ -198,7 +199,9 @@ pub fn pool(keys: Tensor, pages: Tensor, indptr: Tensor, page: usize) -> KvPool 
         max_pages_per_request: pages.rows as i32,
         pages_in_batch: pages.rows as i32,
         live: [0, 0],
+        page_stride: [0; 2],
     }
+    .with_packed_stride()
 }
 
 /// The smallest power of two at least `v` (a ue8m0 scale).

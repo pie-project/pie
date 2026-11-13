@@ -162,6 +162,11 @@ pub enum StructKind {
     MlaPlan,
 }
 
+/// A fire's page geometry. Every kind but the write descriptor reads the
+/// All axis: the lanes' rows over the whole sequence, one table for the
+/// fire whatever kv rows the model keeps. A write descriptor places the
+/// rows of a kv row retained through `window` (`None`: every row), so an
+/// engine reads it off the list that window's rows lie in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GeomKind {
     Indptr,
@@ -171,8 +176,8 @@ pub enum GeomKind {
     KvLen,
     RowValid,
     RequestOfToken,
-    WritePage,
-    WriteOffset,
+    WritePage { window: Option<u32> },
+    WriteOffset { window: Option<u32> },
     GroupOfLane,
     GroupIndptr { select: Selection },
     LaneIndptr { select: Selection },
@@ -231,11 +236,9 @@ pub enum RuntimeInput {
     Tokens,
     Positions,
     MropePositions,
-    Mask {
-        space: u32,
-    },
+    /// Each lane's mask bits over the All axis.
+    Mask,
     Geometry {
-        space: u32,
         kind: GeomKind,
     },
     ReadoutRows,

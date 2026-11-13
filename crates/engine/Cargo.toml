@@ -33,6 +33,7 @@ rustix = { version = "1", features = ["fs"] }
 web-std = { path = "../web-std" }
 
 [dev-dependencies]
+serde_json = "1.0"
 
 [lints]
 workspace = true

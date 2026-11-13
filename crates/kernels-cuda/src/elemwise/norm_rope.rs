@@ -182,13 +182,14 @@ fn one_pass(
     }
     let weighted = weight.is_some();
     let appends = append.is_some();
-    let (pages, write_page, write_offset, row_valid, page_size) = match &append {
+    let (pages, write_page, write_offset, row_valid, page_size, stride) = match &append {
         Some(a) => (
             a.pool.keys.arg(),
             a.write_page.arg(),
             a.write_offset.arg(),
             a.pool.row_valid.arg(),
             a.pool.page_size.arg(),
+            crate::attn::kv::page_elems(op, a.pool, 0)?.arg(),
         ),
         None => (
             Tensor::ABSENT.arg(),
@@ -196,6 +197,7 @@ fn one_pass(
             Tensor::ABSENT.arg(),
             Tensor::ABSENT.arg(),
             0_i32.arg(),
+            0_i64.arg(),
         ),
     };
     ctx.fire(
@@ -227,6 +229,7 @@ fn one_pass(
             write_offset,
             row_valid,
             page_size,
+            stride,
             ctx.stage(),
         ],
     )?;
@@ -314,13 +317,14 @@ pub fn norm_rope_pair(
         return Ok(true);
     }
     let appends = append.is_some();
-    let (pages, write_page, write_offset, row_valid, page_size) = match &append {
+    let (pages, write_page, write_offset, row_valid, page_size, stride) = match &append {
         Some(a) => (
             a.pool.keys.arg(),
             a.write_page.arg(),
             a.write_offset.arg(),
             a.pool.row_valid.arg(),
             a.pool.page_size.arg(),
+            crate::attn::kv::page_elems(OP, a.pool, 0)?.arg(),
         ),
         None => (
             Tensor::ABSENT.arg(),
@@ -328,6 +332,7 @@ pub fn norm_rope_pair(
             Tensor::ABSENT.arg(),
             Tensor::ABSENT.arg(),
             0_i32.arg(),
+            0_i64.arg(),
         ),
     };
     ctx.fire(
@@ -362,6 +367,7 @@ pub fn norm_rope_pair(
             write_offset,
             row_valid,
             page_size,
+            stride,
             ctx.stage(),
         ],
     )?;

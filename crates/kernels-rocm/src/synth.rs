@@ -1,33 +1,157 @@
 //! Generated row kernels, HIP's: a fused region (kernels-ir's [`Region`]),
-//! scheduled ([`kernels_ir::schedule`]) and printed as HIP C++ ([`print`])
-//! in the row skeleton's hooks (`elemwise/skeleton.hip`): the unit a generated
-//! kernel compiles from. Its own copy of kernels-cuda's printer and skeleton.
+//! scheduled ([`kernels_ir::schedule`]) and printed as HIP C++ ([`print`],
+//! a [`Body`]), compiled with the row skeleton (`elemwise/skeleton.hip`)
+//! into a unit of its own and fired over the region's planes. The same
+//! contract, API and bodies as kernels-cuda's; the skeleton's reductions
+//! are a wavefront's.
+//!
+//! - **What the skeleton takes** ([`supports`]): a region of pure math that
+//!   the row core schedules (`kernels_ir::schedule`), over one or more
+//!   parameters and to one or more results, every result a bf16 row and
+//!   every parameter a bf16 or f32 row (its own, one every row reads, or
+//!   one picked by id) or one element a row (bf16, f32 or i32), the row
+//!   whole vectors of 8 and at most [`MAX_WIDTH`] wide, each head it
+//!   reduces over a power-of-two run of a row's threads.
+//! - **Identity.** One generated unit a body, `synth/<hash>.hip`: the
+//!   skeleton's header and the body's source. One kernel a shape of it: the
+//!   vectors a thread holds (from the width) and the plane counts. The disk
+//!   cache keys the unit's text, the headers and the instantiation, as it
+//!   does a carried unit's, so a warm start compiles nothing.
+//! - **Loading.** [`synth`] names the kernel; [`Synthesized::load`] compiles
+//!   and loads it, and a fire of one not loaded on its device is refused: a
+//!   module load mid-fire waits on whatever the device runs, an
+//!   expert-parallel peer's barrier included, so every generated kernel is
+//!   loaded with the model, before a body is armed or captured.
 
-pub mod print;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
+use dtype::Dtype;
+
+pub use crate::elemwise::skeleton::{MAX_WIDTH, Plane, lanes};
 pub use kernels_ir::Region;
-
-/// The struct every generated body defines, in the namespace its unit puts
-/// it in.
-pub const BODY: &str = "::pie::synth::Body";
-
-/// The threads of a row skeleton's block.
-pub const BLOCK: u32 = 256;
+use kernels_ir::{Op, Shape};
 
 /// A region's body printed in the row skeleton's hook form ([`print`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Body {
-    /// The struct's HIP C++ source.
+    /// The struct's C++ source.
     pub source: String,
     /// FNV-1a over `source`: the body's part of a generated kernel's key.
     pub hash: u64,
     /// The passes the body makes over the row.
     pub passes: u32,
+    /// The floats it tables what a column alone computes in.
+    pub table: u32,
+    /// Whether it shares its row (a gather within the row).
+    pub shares: bool,
+    /// The parameters (by bit) it loads where it first wants them
+    /// ([`print::late`]), not up front.
+    pub late: u32,
+    /// The body packed rows run where it is not this one: a pair-packed
+    /// turn ([`print::packing`]), which many rows' wavefronts of no turned
+    /// pair skip and a decode's few would wait on.
+    pub packed: Option<Box<Body>>,
 }
 
-/// Why the skeleton does not take a region.
+impl Body {
+    /// `region` scheduled and printed, or why the row core or the printer
+    /// does not take it.
+    pub fn of(region: &Region) -> Result<Body, Refusal> {
+        let kernel = kernels_ir::schedule(region)
+            .map_err(|why| refusal(format!("the row core does not schedule the region: {why}")))?;
+        let printed = |packing: Option<&print::Packing>| {
+            let source =
+                print::body_with(&kernel, packing).map_err(|print::Unprinted(dtype)| {
+                    refusal(format!(
+                        "a value rounds to {dtype:?}, which no hook rounds to"
+                    ))
+                })?;
+            Ok::<Body, Refusal>(Body {
+                hash: kernels_ir::fnv1a64(source.as_bytes()),
+                source,
+                passes: kernel.passes(),
+                table: kernel.table,
+                shares: kernel.shares,
+                late: print::late(&kernel),
+                packed: None,
+            })
+        };
+        let packed = print::packing(&kernel, region.width)
+            .map(|packing| printed(Some(&packing)).map(Box::new))
+            .transpose()?;
+        Ok(Body {
+            packed,
+            ..printed(None)?
+        })
+    }
+}
+
+pub use crate::elemwise::skeleton::Schedule;
+use crate::elemwise::skeleton::{self, Shared, Stored};
+use crate::error::Error;
+use crate::jit::{ArgValue, Ctx, Kernel, Root, refuse};
+
+pub mod print;
+
+const OP: &str = "fused.region";
+
+/// The struct every generated body defines (`Body`'s contract), in the
+/// namespace its unit puts it in.
+const BODY: &str = "::pie::synth::Body";
+
+/// A generated body holds no fields; C++ gives the empty struct one byte.
+const NO_FIELDS: u8 = 0;
+
+/// How a region's parameter is stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum In {
+    /// Each row its own.
+    Rows(Dtype),
+    /// One row every row reads (a norm's weight; a head's, repeated across
+    /// the row's heads, where it is one head wide).
+    Shared(Dtype),
+    /// Each row a row of a table, picked by id ([`Plane::gathered`]): an
+    /// embedding's rows, a lane's modulation.
+    Gathered(Dtype),
+    /// One element every row reads (a layer's scale): a scalar parameter.
+    One(Dtype),
+    /// One element a row, its own (a position): a scalar parameter.
+    Each(Dtype),
+}
+
+impl In {
+    const fn dtype(self) -> Dtype {
+        match self {
+            In::Rows(d) | In::Shared(d) | In::Gathered(d) | In::One(d) | In::Each(d) => d,
+        }
+    }
+
+    const fn scalar(self) -> bool {
+        matches!(self, In::One(_) | In::Each(_))
+    }
+
+    /// How the skeleton reads it.
+    fn stored(self) -> Option<Stored> {
+        match (self.scalar(), self.dtype()) {
+            (_, Dtype::Bf16) => Some(Stored::Bf16),
+            (_, Dtype::F32) => Some(Stored::F32),
+            (true, Dtype::I32) => Some(Stored::I32),
+            _ => None,
+        }
+    }
+}
+
+/// How a region's result is stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Out {
+    /// Each row its own.
+    Rows(Dtype),
+}
+
+/// Why the skeleton does not take a region: the condition it breaks.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Refusal(pub String);
+pub struct Refusal(String);
 
 impl core::fmt::Display for Refusal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -37,49 +161,376 @@ impl core::fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
-impl Body {
-    /// `region` scheduled and printed, or why the row core or the printer
-    /// does not take it.
-    pub fn of(region: &Region) -> Result<Body, Refusal> {
-        let kernel = kernels_ir::schedule(region)
-            .map_err(|why| Refusal(format!("the row core does not schedule the region: {why}")))?;
-        // HIP's skeleton holds a row's elements and reductions; a head's
-        // values, a table and a shared row are kernels-cuda's alone so far.
-        if !kernel.heads.is_empty() || !kernel.tables.is_empty() || kernel.shares {
-            return Err(Refusal(
-                "a kernel over heads, a table or a gather within the row, which HIP's skeleton \
-                 does not hold"
-                    .into(),
-            ));
-        }
-        let source = print::body(&kernel).map_err(|print::Unprinted(dtype)| {
-            Refusal(format!(
-                "a value rounds to {dtype:?}, which no hook rounds to"
-            ))
-        })?;
-        Ok(Body {
-            hash: kernels_ir::fnv1a64(source.as_bytes()),
-            source,
-            passes: kernel.passes(),
-        })
-    }
-
-    /// The unit the kernel compiles from: the skeleton's header and the body.
-    #[must_use]
-    pub fn unit(&self) -> String {
-        format!(
-            "// A generated row kernel: region body {:016x}.\n\
-             #include \"elemwise/skeleton.hip\"\n\n\
-             namespace pie::synth {{\n\n{}\n}}\n",
-            self.hash, self.source
-        )
-    }
+fn refusal(why: impl Into<String>) -> Refusal {
+    Refusal(why.into())
 }
 
-/// The skeleton's kernel around the body for `ins` parameters and `outs`
-/// results, `per` vectors of 8 a thread, the parameters `ones` sets (by bit)
-/// read as one element.
-#[must_use]
-pub fn entrypoint(per: u32, ins: usize, outs: usize, ones: u32) -> String {
-    format!("::pie::elemwise::row_skeleton<{BODY}, {BLOCK}, {per}, {ins}, {outs}, {ones}u>")
+/// Whether the row skeleton takes `region`, its parameters stored as `ins`
+/// and its results as `outs`; the condition it breaks where it does not.
+pub fn supports(region: &Region, ins: &[In], outs: &[Out]) -> Result<(), Refusal> {
+    if ins.len() != region.params.len() || outs.len() != region.results.len() {
+        return Err(refusal(format!(
+            "the region has {} parameter(s) and {} result(s), and {} and {} planes were given",
+            region.params.len(),
+            region.results.len(),
+            ins.len(),
+            outs.len()
+        )));
+    }
+    if ins.is_empty() || outs.is_empty() {
+        return Err(refusal(
+            "a region of no parameter or no result: the skeleton reads and writes planes",
+        ));
+    }
+    if ins.len() > MAX_PARAMS {
+        return Err(refusal(format!(
+            "a region of {} parameters, past the {MAX_PARAMS} one kernel reads",
+            ins.len()
+        )));
+    }
+    for (k, form) in ins.iter().enumerate() {
+        if form.stored().is_none() {
+            return Err(refusal(format!(
+                "parameter {k} is stored {:?}, and the skeleton's rows are bf16 or f32 (a scalar's \
+                 also i32)",
+                form.dtype()
+            )));
+        }
+        let scalar = region.params[k] == Shape::Scalar;
+        if form.scalar() != scalar {
+            return Err(refusal(format!(
+                "parameter {k} is stored as {form:?}, and the region's is {}",
+                if scalar { "a scalar" } else { "a row" }
+            )));
+        }
+    }
+    for (k, Out::Rows(dtype)) in outs.iter().enumerate() {
+        if *dtype != Dtype::Bf16 {
+            return Err(refusal(format!(
+                "result {k} is stored {dtype:?}, and the skeleton's results are bf16"
+            )));
+        }
+    }
+    if let Err(why) = region.types() {
+        return Err(refusal(format!("the region is not one row: {why}")));
+    }
+    skeleton::per(OP, region.width).map_err(|why| refusal(why.to_string()))?;
+    heads(region)?;
+    Body::of(region).map(|_| ())
+}
+
+/// Whether each head `region` reduces over is a power-of-two run of the
+/// threads a row of its width takes (`reduce_sum_heads`): its vectors of 8
+/// divide the row's lanes.
+fn heads(region: &Region) -> Result<(), Refusal> {
+    let lanes = skeleton::lanes(region.width);
+    for (at, op) in region.ops.iter().enumerate() {
+        let Op::ReduceHeads(_, _, head) = *op else {
+            continue;
+        };
+        let seg = head / 8;
+        if !seg.is_power_of_two() || !lanes.is_multiple_of(seg) {
+            return Err(refusal(format!(
+                "op {at} reduces heads {head} wide, which the {lanes} threads of a {}-wide row \
+                 do not split evenly",
+                region.width
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A generated kernel: `body` in the row skeleton over `ins` parameters and
+/// `outs` results, rows `width` wide, packed in blocks and (where a row is
+/// narrower than a block, or a later pass reads a parameter of its own)
+/// spread a row a block, each fire taking the one its rows want
+/// ([`Schedule::of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Synthesized {
+    kernel: &'static Kernel,
+    spread: Option<&'static Kernel>,
+    ins: usize,
+    outs: usize,
+    width: u32,
+    /// The parameters (by bit) the skeleton reads one element of.
+    ones: u32,
+    /// How the skeleton reads each parameter.
+    stored: [Stored; MAX_PARAMS],
+    /// The shared memory its body takes beside the skeleton.
+    shared: Shared,
+}
+
+/// The most parameters one generated kernel reads.
+const MAX_PARAMS: usize = 32;
+
+/// The kernel for `region` (one [`supports`] takes) over parameters stored
+/// as `ins` and `outs` results: its body printed ([`Body::of`]), then
+/// [`synth_body`]. Nothing compiles here; [`Synthesized::load`] does.
+pub fn synth(region: &Region, ins: &[In], outs: usize) -> Result<Synthesized, Error> {
+    let body = Body::of(region).map_err(|why| refuse(OP, why.to_string()))?;
+    synth_body(&body, ins, outs, region.width)
+}
+
+/// The kernel for `body` (a body in the row skeleton's hook form) over
+/// parameters stored as `ins` and `outs` results, rows `width` wide: the
+/// same one for every call with the same body and shape. Nothing compiles
+/// here; [`Synthesized::load`] does.
+pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Synthesized, Error> {
+    if ins.is_empty() || outs == 0 {
+        return Err(refuse(OP, "a region of no parameter or no result"));
+    }
+    if ins.len() > MAX_PARAMS {
+        return Err(refuse(OP, "a region of more than 32 parameters"));
+    }
+    let ones = (0u32..)
+        .zip(ins)
+        .filter(|(_, form)| form.scalar())
+        .fold(0u32, |mask, (k, _)| mask | 1 << k);
+    let mut stored = [Stored::Bf16; MAX_PARAMS];
+    for (k, form) in ins.iter().enumerate() {
+        stored[k] = form.stored().ok_or_else(|| {
+            refuse(
+                OP,
+                format!(
+                    "parameter {k} is stored {:?}, which the skeleton does not read",
+                    form.dtype()
+                ),
+            )
+        })?;
+    }
+    let per = skeleton::per(OP, width)?;
+    let root = unit(body)?;
+    // Packed rows run the packed body where there is one.
+    let packed_root = body
+        .packed
+        .as_deref()
+        .map(unit)
+        .transpose()?
+        .unwrap_or(root);
+    // A row whose planes overflow the registers (a blend's candidates)
+    // streams its row parameters through its passes; packed rows otherwise
+    // issue a later pass's parameters late, and spread ones load every
+    // parameter up front.
+    let streamed = |per| {
+        if fits(&stored[..ins.len()], ones, outs, per) {
+            0
+        } else {
+            (0u32..)
+                .zip(ins)
+                .filter(|(_, form)| !form.scalar())
+                .fold(0u32, |mask, (k, _)| mask | 1 << k)
+        }
+    };
+    let stream = streamed(per);
+    let late = body.late & !ones & !stream;
+    let laid = |schedule| {
+        let per = (width / skeleton::VEC_WIDTH).div_ceil(skeleton::laned(width, schedule));
+        let stream = streamed(per);
+        crate::jit::generated(
+            if schedule == Schedule::Packed {
+                packed_root
+            } else {
+                root
+            },
+            &skeleton::entrypoint(
+                BODY,
+                width,
+                per,
+                &stored[..ins.len()],
+                outs,
+                (
+                    ones,
+                    if schedule == Schedule::Packed {
+                        late
+                    } else {
+                        0
+                    },
+                    stream,
+                ),
+                true,
+                schedule,
+            ),
+        )
+    };
+    let spread = (skeleton::block(width, Schedule::Spread)
+        != skeleton::block(width, Schedule::Packed)
+        || late != 0
+        || body.packed.is_some())
+    .then(|| laid(Schedule::Spread));
+    Ok(Synthesized {
+        kernel: laid(Schedule::Packed),
+        spread,
+        ins: ins.len(),
+        outs,
+        width,
+        ones,
+        stored,
+        shared: Shared {
+            table: body.table,
+            shares: body.shares,
+        },
+    })
+}
+
+/// The vectors of 8 a thread holds of every plane at most: past them a row
+/// no longer stays in its registers (five planes at the widest row, more
+/// as the row narrows), and the skeleton streams its row parameters.
+const RESIDENT: u32 = 5 * skeleton::MAX_PER;
+
+/// Whether the planes of a kernel (its row parameters as stored, an f32 row
+/// two planes' worth, and its results), `per` vectors of 8 a thread each,
+/// stay in a thread's registers.
+fn fits(stored: &[Stored], ones: u32, outs: usize, per: u32) -> bool {
+    let planes: u32 = (0u32..)
+        .zip(stored)
+        .filter(|(k, _)| (ones >> k) & 1 == 0)
+        .map(|(_, form)| if *form == Stored::F32 { 2 } else { 1 })
+        .sum::<u32>()
+        + u32::try_from(outs).unwrap_or(u32::MAX);
+    planes.saturating_mul(per) <= RESIDENT
+}
+
+/// The generated unit of `body`: one a body hash, for the life of the
+/// process.
+fn unit(body: &Body) -> Result<Root, Error> {
+    static UNITS: OnceLock<Mutex<HashMap<u64, Root>>> = OnceLock::new();
+    let text = format!(
+        "// A generated row kernel: region body {:016x}.\n\
+         #include \"elemwise/skeleton.hip\"\n\n\
+         namespace pie::synth {{\n\n{}\n}}\n",
+        body.hash, body.source
+    );
+    let mut units = UNITS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("generated unit table lock poisoned");
+    if let Some(root) = units.get(&body.hash) {
+        return if root.text == text {
+            Ok(*root)
+        } else {
+            Err(refuse(
+                OP,
+                format!(
+                    "two bodies of different source share the hash {:016x}",
+                    body.hash
+                ),
+            ))
+        };
+    }
+    let file: &'static str = Box::leak(format!("synth/{:016x}.hip", body.hash).into_boxed_str());
+    let root = Root::generated(file, Box::leak(text.into_boxed_str()));
+    units.insert(body.hash, root);
+    Ok(root)
+}
+
+impl Synthesized {
+    #[must_use]
+    pub const fn kernel(self) -> &'static Kernel {
+        self.kernel
+    }
+
+    /// Compiles the kernel (or reads it from the disk cache) and loads it on
+    /// the current device: what a fire of it needs done first.
+    pub fn load(self) -> Result<(), Error> {
+        if let Some(spread) = self.spread {
+            spread.load()?;
+        }
+        self.kernel.load()
+    }
+
+    /// Fires the kernel over `rows` rows, the stage window's live ones
+    /// (`ctx.stage()`) where one is armed: `ins[k]` is the region's
+    /// parameter `k` and `outs[k]` its result `k`, each a 16-byte aligned
+    /// plane of the dtype the kernel was made for (a scalar parameter's,
+    /// [`In::One`] or [`In::Each`], its element, any alignment), no result
+    /// over a parameter. Refused unless [`Synthesized::load`] loaded it on
+    /// this device.
+    pub fn fire(self, ctx: &Ctx, ins: &[Plane], outs: &[Plane], rows: u32) -> Result<(), Error> {
+        self.fire_parts(ctx, ins, outs, rows, 1)
+    }
+
+    /// [`Synthesized::fire`] over `rows` rows of planes each `parts` of the
+    /// kernel's rows wide (a row of heads, the kernel's row one head): a
+    /// row's planes cut into `parts` rows of the kernel's, a scalar
+    /// parameter's element (a position) read by every part of its row.
+    pub fn fire_parts(
+        self,
+        ctx: &Ctx,
+        ins: &[Plane],
+        outs: &[Plane],
+        rows: u32,
+        parts: u32,
+    ) -> Result<(), Error> {
+        let schedule = Schedule::of(
+            self.width,
+            rows.saturating_mul(parts),
+            ctx.multiprocessors().unwrap_or(1),
+        );
+        self.fire_laid(ctx, ins, outs, (rows, parts), schedule)
+    }
+
+    /// [`Synthesized::fire_parts`] under `schedule` (packed where the
+    /// kernel has no spread form): what a bench sets each against.
+    pub fn fire_laid(
+        self,
+        ctx: &Ctx,
+        ins: &[Plane],
+        outs: &[Plane],
+        (rows, parts): (u32, u32),
+        schedule: Schedule,
+    ) -> Result<(), Error> {
+        let (kernel, schedule) = match (schedule, self.spread) {
+            (Schedule::Spread, Some(spread)) => (spread, Schedule::Spread),
+            _ => (self.kernel, Schedule::Packed),
+        };
+        if ins.len() != self.ins || outs.len() != self.outs {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the kernel takes {} parameter and {} result planes and the fire passes \
+                     {} and {}",
+                    self.ins,
+                    self.outs,
+                    ins.len(),
+                    outs.len()
+                ),
+            ));
+        }
+        // The skeleton reads every parameter up front (or late, or streamed)
+        // and lands its results after, a row at a time, so no result may land
+        // over one.
+        if outs
+            .iter()
+            .any(|out| ins.iter().any(|input| input.base() == out.base()))
+        {
+            return Err(refuse(
+                OP,
+                "a result lands over a parameter, and a generated kernel reads its parameters \
+                 read-only",
+            ));
+        }
+        if !kernel.is_loaded() {
+            return Err(refuse(
+                OP,
+                format!(
+                    "`{}` is not loaded on this device: a generated kernel is loaded with its \
+                     model, never by a fire",
+                    kernel.file
+                ),
+            ));
+        }
+        skeleton::fire(
+            ctx,
+            OP,
+            kernel,
+            ArgValue::of(&NO_FIELDS),
+            (ins, &self.stored[..self.ins]),
+            outs,
+            (rows, parts),
+            self.width,
+            self.ones,
+            self.shared,
+            schedule,
+        )
+    }
 }

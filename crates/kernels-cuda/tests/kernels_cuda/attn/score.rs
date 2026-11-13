@@ -5,6 +5,7 @@
 //! head, written at the lane's row of a `[lanes, heads * kv_max]` plane.
 
 use crate::common::attn_ref::{col, pool, ten};
+use crate::common::spread::agrees;
 use crate::common::{Gpu, Lcg};
 use dtype::Dtype::{Bf16, F32, I32};
 use kernels_cuda::attn::plan::{self, Device, Live, Shape, Toggles, Workspace};
@@ -142,4 +143,29 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
         assert!((g - w).abs() <= 2e-3, "at {i}: got {g}, want {w}");
     }
+    // The same capture over the pool's pages spread apart, byte for byte.
+    let outs = [(at, want.len() * 4)];
+    agrees(
+        &mut gpu,
+        "score capture",
+        &[kvp],
+        &[],
+        &outs,
+        |_, pools, _| {
+            kernels_cuda::attn::score::capture(
+                &ctx,
+                qt,
+                &plan,
+                &pools[0],
+                d as u32,
+                kvh as u32,
+                scale,
+                observe as u32,
+                lane_offset as u32,
+                kv_max as u32,
+                &mut scores,
+            )
+            .expect("the capture fires");
+        },
+    );
 }

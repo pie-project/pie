@@ -469,11 +469,14 @@ fn vector(
         lse_plane(op, lse, &shape);
         args.push(lse.arg_mut());
     }
+    args.extend(pool.page_args());
     ctx.fire(
-        Fire::at(FILE, entry).apply(Grid::of(
-            vector_grid(op, shape.q_heads, shape.rows)?,
-            [SDPA_THREADS, 1, 1],
-        )),
+        Fire::at(FILE, entry)
+            .page_strides(pool.page_stride)
+            .apply(Grid::of(
+                vector_grid(op, shape.q_heads, shape.rows)?,
+                [SDPA_THREADS, 1, 1],
+            )),
         &args,
     )
 }
@@ -570,6 +573,10 @@ fn selected(
             stated(op, top_k)?.arg(),
             stated(op, ratio)?.arg(),
             i32::from(per_head).arg(),
+            pool.page_stride[0].arg(),
+            pool.page_stride[1].arg(),
+            crate::tensor::PLANE_AT_BINDING.arg(),
+            crate::tensor::PLANE_AT_BINDING.arg(),
         ],
     )
 }
@@ -735,6 +742,7 @@ fn tiled(
         lse_plane(op, lse, &shape);
         args.push(lse.arg_mut());
     }
+    args.extend(pool.page_args());
     ctx.fire(
         Fire::at(FILE, entry).apply(Grid::of(
             tiled_grid(op, shape.q_heads, shape.rows)?,
@@ -1061,6 +1069,10 @@ fn append_paged(
             write_page.arg(),
             write_offset.arg(),
             0_i32.arg(),
+            pool.page_stride[0].arg(),
+            pool.page_stride[1].arg(),
+            crate::tensor::PLANE_AT_BINDING.arg(),
+            crate::tensor::PLANE_AT_BINDING.arg(),
         ],
     )
 }
@@ -1127,7 +1139,9 @@ mod tests {
             seq_stride: u64::from(plane),
             head_stride: u64::from(HEAD_DIM),
             q8: false,
+            page_stride: [0; 2],
         }
+        .paged_densely()
     }
 
     fn decode_plan() -> DecodePlan {
@@ -1565,6 +1579,10 @@ pub mod mla {
                 pool.page_size.arg(),
                 stated(OP, kv_c.width)?.arg(),
                 stated(OP, k_pe.width)?.arg(),
+                pool.page_stride[0].arg(),
+                pool.page_stride[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }
@@ -1665,6 +1683,7 @@ pub mod mla {
             );
             args.push(lse.arg_mut());
         }
+        args.extend(pool.page_args());
         ctx.fire(
             Fire::at(FILE, entry).apply(Grid::of(
                 [heads * SIMD * MLA_SPLIT, rows, 1],
@@ -1813,40 +1832,6 @@ pub mod mla {
         )
     }
 
-    #[must_use]
-    pub fn selected_sweep(selection: &[i32], j_end: i32) -> Vec<i32> {
-        let mut keys = Vec::with_capacity(selection.len());
-        for &j in selection {
-            if j < 0 || j >= j_end {
-                continue;
-            }
-            keys.push(j);
-        }
-        keys
-    }
-
-    #[must_use]
-    pub fn flash_reading(scores: &[f32], values: &[f32], width: usize) -> Vec<f32> {
-        let mut acc = vec![0.0f32; width];
-        let mut m = -3.0e38f32;
-        let mut lsum = 0.0f32;
-        for (n, &score) in scores.iter().enumerate() {
-            let m_new = m.max(score);
-            let corr = (m - m_new).exp();
-            let p = (score - m_new).exp();
-            lsum = lsum * corr + p;
-            for (i, a) in acc.iter_mut().enumerate() {
-                *a = *a * corr + p * values[n * width + i];
-            }
-            m = m_new;
-        }
-        let inv = if lsum > 0.0 { 1.0 / lsum } else { 0.0 };
-        for a in &mut acc {
-            *a *= inv;
-        }
-        acc
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1880,7 +1865,9 @@ pub mod mla {
                 seq_stride: u64::from(RANK),
                 head_stride: u64::from(RANK),
                 q8: false,
+                page_stride: [0; 2],
             }
+            .paged_densely()
         }
 
         #[test]
@@ -2162,6 +2149,10 @@ pub mod index {
                 stated(OP, head_dim)?.arg(),
                 stated(OP, ratio)?.arg(),
                 keys.page_size.arg(),
+                keys.page_stride[0].arg(),
+                keys.page_stride[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }
@@ -2348,6 +2339,10 @@ pub mod index {
                 stated(OP, blocks)?.arg(),
                 stated(OP, top_k)?.arg(),
                 stated(OP, block)?.arg(),
+                keys.page_stride[0].arg(),
+                keys.page_stride[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }
@@ -2442,6 +2437,10 @@ pub mod index {
                 i32::from(weights.is_some()).arg(),
                 stated(OP, row_stride)?.arg(),
                 pitch.arg(),
+                keys.page_stride[0].arg(),
+                keys.page_stride[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }
@@ -2534,7 +2533,9 @@ pub mod index {
                 seq_stride: u64::from(DIM),
                 head_stride: u64::from(DIM),
                 q8: false,
+                page_stride: [0; 2],
             }
+            .paged_densely()
         }
 
         #[test]
@@ -2790,6 +2791,32 @@ pub mod pool {
 
     const META_BLOCK: u32 = 128;
 
+    /// A compressor's state for the kv row its gather keys by: a projection
+    /// plane and a score plane, a token a cell, paged as that row is (its
+    /// page table, its page size), each plane bound at its rows of page 0
+    /// and `page_stride` bytes a page.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct PoolState {
+        pub kv: Tensor,
+        pub score: Tensor,
+        pub page_stride: [u64; 2],
+    }
+
+    impl PoolState {
+        /// Two slabs of their own, each a run of `page_size`-token pages.
+        #[must_use]
+        pub fn dense(kv: Tensor, score: Tensor, page_size: i32) -> PoolState {
+            PoolState {
+                kv,
+                score,
+                page_stride: [
+                    KvPool::dense_page_stride(kv, page_size, 0),
+                    KvPool::dense_page_stride(score, page_size, 0),
+                ],
+            }
+        }
+    }
+
     /// The pool's width a position: `row` itself, or a compact pool's
     /// `row / div` (`div` positions to an entry, whole within a page).
     pub(crate) fn pitch(op: &'static str, pool: &KvPool, row: u32) -> Result<i32, Error> {
@@ -2854,6 +2881,7 @@ pub mod pool {
                 stated(OP, rows)?.arg(),
                 stated(OP, lanes)?.arg(),
                 i32::from(mark).arg(),
+                state.segments.arg(),
             ],
         )
     }
@@ -2969,10 +2997,10 @@ pub mod pool {
         write_offset: Tensor,
         head_dim: u32,
         ratio: u32,
-        state_kv: Tensor,
-        state_score: Tensor,
+        state: PoolState,
     ) -> Result<(), Error> {
         const OP: &str = "attn.pool_state_write";
+        let (state_kv, state_score) = (state.kv, state.score);
         let entry = dtype_dispatch!(OP, kv.dtype, { Bf16 => "pool_state_write_bfloat16" });
         debug_assert_eq!(
             score.dtype, kv.dtype,
@@ -3040,6 +3068,11 @@ pub mod pool {
                 stated(OP, width)?.arg(),
                 pages.page_size.arg(),
                 stated(OP, pitch)?.arg(),
+                // The compressor's two planes page with the row they key by.
+                state.page_stride[0].arg(),
+                state.page_stride[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }
@@ -3052,12 +3085,12 @@ pub mod pool {
         pages: &KvPool,
         head_dim: u32,
         ratio: u32,
-        state_kv: Tensor,
-        state_score: Tensor,
+        state: PoolState,
         ape: Option<Tensor>,
         entries: Tensor,
     ) -> Result<(), Error> {
         const OP: &str = "attn.pool_gather";
+        let (state_kv, state_score) = (state.kv, state.score);
         let entry = dtype_dispatch!(OP, entries.dtype, { Bf16 => "pool_gather_paged_bfloat16" });
         boundary_tables(OP, &boundary_pos, &boundary_req);
         debug_assert_eq!(
@@ -3159,6 +3192,11 @@ pub mod pool {
                 pages.page_size.arg(),
                 i32::from(ape.is_some()).arg(),
                 stated(OP, pitch)?.arg(),
+                // The compressor's two planes page with the row they key by.
+                state.page_stride[0].arg(),
+                state.page_stride[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }
@@ -3202,6 +3240,10 @@ pub mod pool {
                 stated(OP, head_dim)?.arg(),
                 pool.page_size.arg(),
                 pitch(OP, pool, head_dim)?.arg(),
+                pool.page_stride[0].arg(),
+                pool.page_stride[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }
@@ -3267,6 +3309,10 @@ pub mod pool {
                 entries.page_size.arg(),
                 sm_scale.arg(),
                 pitch(OP, entries, head_dim)?.arg(),
+                entries.page_stride[0].arg(),
+                entries.page_stride[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
     }
@@ -3360,21 +3406,11 @@ pub mod pool {
                 entries.page_size.arg(),
                 sm_scale.arg(),
                 pitch(OP, entries, head_dim)?.arg(),
+                entries.page_stride[0].arg(),
+                entries.page_stride[1].arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
+                crate::tensor::PLANE_AT_BINDING.arg(),
             ],
         )
-    }
-
-    #[must_use]
-    pub fn selected_cells(selection: &[i32], num_visible: i32, ratio: i32) -> Vec<i32> {
-        selection
-            .iter()
-            .filter(|c| **c >= 0 && **c < num_visible)
-            .map(|c| (c + 1) * ratio - 1)
-            .collect()
-    }
-
-    #[must_use]
-    pub fn compressed_rope_pos(closing_pos: i32, ratio: i32) -> i32 {
-        (closing_pos / ratio) * ratio
     }
 }

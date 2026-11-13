@@ -113,3 +113,62 @@ pub(crate) fn lanes_of(op: &'static str, indptr: Tensor) -> Result<i32, Error> {
     }
     stated(op, lanes)
 }
+
+/// Plane `plane`'s page stride (0 keys, 1 values) in its own elements, as
+/// the kernels step a typed pointer from page to page.
+pub(crate) fn page_elems(op: &'static str, pool: &KvPool, plane: usize) -> Result<i64, Error> {
+    let (bytes, dtype) = match plane {
+        0 => (pool.page_stride[0], pool.keys.dtype),
+        _ => (pool.page_stride[1], pool.values.dtype),
+    };
+    let bits = dtype.bits();
+    if bits % 8 != 0 || bytes % (bits / 8) != 0 {
+        return Err(refuse(
+            op,
+            format!("a {bytes}-byte page stride is no whole number of {dtype:?} elements"),
+        ));
+    }
+    i64::try_from(bytes / (bits / 8))
+        .map_err(|_| refuse(op, format!("a {bytes}-byte page stride passes an i64")))
+}
+
+/// [`page_elems`] as the u32 a kernel argument carries.
+pub(crate) fn page_elems_u32(op: &'static str, pool: &KvPool, plane: usize) -> Result<u32, Error> {
+    let elems = page_elems(op, pool, plane)?;
+    u32::try_from(elems).map_err(|_| {
+        refuse(
+            op,
+            format!("a {elems}-element page stride passes this kernel's u32"),
+        )
+    })
+}
+
+/// The page stride the key and value planes share, in their elements, for
+/// a kernel stepping both by one stride.
+pub(crate) fn shared_page_elems(op: &'static str, pool: &KvPool) -> Result<u32, Error> {
+    let keys = page_elems_u32(op, pool, 0)?;
+    let values = page_elems_u32(op, pool, 1)?;
+    if keys != values {
+        return Err(refuse(
+            op,
+            format!(
+                "this kernel steps keys and values by one page stride; the pool's are {keys} and \
+                 {values} elements"
+            ),
+        ));
+    }
+    Ok(keys)
+}
+
+/// Refuses a pool whose planes do not lie page after page, for a path that
+/// still reads planes or side planes (scales, envelopes, a bf16 shadow) at
+/// their packed offsets.
+pub(crate) fn packed_only(op: &'static str, pool: &KvPool, what: &str) -> Result<(), Error> {
+    if pool.packed() {
+        return Ok(());
+    }
+    Err(refuse(
+        op,
+        format!("{what} reads its pages packed, and this pool's page stride is not"),
+    ))
+}

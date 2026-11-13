@@ -89,6 +89,8 @@ fn tests_every_case() {
     a_suspend_short_of_host_room_drops_host_cache_first();
     a_tail_past_its_step_goes_before_another_head();
     a_demote_leaves_what_a_higher_key_covers();
+    floor_keyed_idle_cache_is_dropped_not_demoted();
+    idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
     pages_another_worker_sealed_are_found_in_the_host_tier();
 }
@@ -1093,7 +1095,7 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
     let owner = ProcessId::from_u128(21);
     let tokens = kept_and_gone(&mut store, 12, 3, owner);
     let txn = store
-        .prepare_demote(8, |_| 0)
+        .prepare_demote(8, |_| 1)
         .unwrap()
         .expect("three cache-only pages");
     assert_eq!(txn.page_count(), 3);
@@ -1136,7 +1138,7 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
 fn a_suspend_short_of_host_room_drops_host_cache_first() {
     let mut store = KvStore::new_with_swap(8, 3, 4, h(32));
     kept_and_gone(&mut store, 13, 3, ProcessId::from_u128(22));
-    let txn = store.prepare_demote(8, |_| 0).unwrap().unwrap();
+    let txn = store.prepare_demote(8, |_| 1).unwrap().unwrap();
     store.commit_suspend(txn).unwrap();
     assert_eq!(store.host_swap_available(), 0);
     let running = store.create_working_set();
@@ -1191,9 +1193,10 @@ fn a_demote_leaves_what_a_higher_key_covers() {
     let a = ProcessId::from_u128(43);
     let tokens = prompt(17, 4);
     sealed_and_gone(&mut store, &tokens, a);
-    // KVFlow: the fixed prompt (two pages) above the suffix.
+    // KVFlow: the fixed prompt (two pages) above the suffix, both above the
+    // floor (the suffix below it would be dropped, not demoted).
     let keys = Steps {
-        entries: vec![(a, None, -1), (a, Some(32), 10)],
+        entries: vec![(a, None, 1), (a, Some(32), 10)],
     };
     let txn = store
         .prepare_demote(8, keys.clone())
@@ -1206,6 +1209,55 @@ fn a_demote_leaves_what_a_higher_key_covers() {
     );
     store.commit_suspend(txn).unwrap();
     assert_eq!(on_device(&mut store, &tokens), 2, "the head stays");
+}
+
+/// Idle cache no policy keys above the floor is not copied down a tier
+/// when the device wants its room: it is dropped, as without tiers. Keyed
+/// above the floor, the same cache goes to the host.
+fn floor_keyed_idle_cache_is_dropped_not_demoted() {
+    use crate::policy::retention::FLOOR;
+    let mut store = KvStore::new_with_swap(8, 8, 8, h(37));
+    let owner = ProcessId::from_u128(45);
+    let tokens = kept_and_gone(&mut store, 18, 3, owner);
+    assert!(
+        store.prepare_demote(8, |_| FLOOR).unwrap().is_none(),
+        "nothing moves at the floor"
+    );
+    assert!(
+        store.prepare_demote(8, |_| FLOOR - 1).unwrap().is_none(),
+        "nor below it"
+    );
+    assert_eq!(store.host_swap_available(), 8, "the host is untouched");
+    assert_eq!(
+        store.reclaim_droppable(store.current_epoch(), |_| FLOOR),
+        3,
+        "it is dropped"
+    );
+    assert_eq!(on_device(&mut store, &tokens), 0);
+    assert!(store.cached_working_sets().is_empty());
+
+    let tokens = kept_and_gone(&mut store, 19, 3, owner);
+    let txn = store
+        .prepare_demote(8, |_| FLOOR + 1)
+        .unwrap()
+        .expect("keyed above the floor, it moves");
+    use ::engine::transfer::MemoryDomain::HostPinned;
+    let tiers: Vec<_> = txn
+        .copy_plans()
+        .iter()
+        .map(|(tier, gpu, _)| (*tier, gpu.len()))
+        .collect();
+    assert_eq!(tiers, [(HostPinned, 3)], "host first");
+    store.commit_suspend(txn).unwrap();
+    store.retire_idle();
+    assert_eq!(on_device(&mut store, &tokens), 0);
+    let reader = store.create_working_set();
+    let keys = keys_ahead(&store, reader, 0, &tokens);
+    assert_eq!(
+        store.cached_run_any_tier(&keys).len(),
+        3,
+        "kept on the host"
+    );
 }
 
 fn an_answer_goes_before_an_older_prompt() {
@@ -1619,71 +1671,42 @@ fn a_parked_set_wakes_with_the_pages_its_peers_moved() {
     );
 }
 
-#[test]
-fn commit_keeps_a_step_in_hand_and_stops_at_the_target() {
-    let mut store = KvStore::new(100, [0; 32]);
-    store.commit_on_demand();
-    assert_eq!(store.available_pages(), 100, "room reads as free");
-    assert_eq!(store.reserve_device_pages(1), None, "nothing is committed");
-
-    assert_eq!(store.next_extent(8), Some(8));
-    store.set_committed(8);
-    assert_eq!(store.next_extent(8), None, "a step stands free");
-    let held = store.reserve_device_pages(6).unwrap();
-    assert!(store.commit_due(8));
-    assert_eq!(store.next_extent(8), Some(16));
-
-    store.note_short(40);
+/// Idle cache dropped while fires are in flight goes back once the fires
+/// that could read it have retired, not after every fire handed out since:
+/// what a set last read before the fires in flight began is free at once,
+/// and what a reader read in one of them waits for that one.
+fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
+    use crate::policy::retention::FLOOR;
+    let mut store = KvStore::new(8, h(41));
+    let owner = ProcessId::from_u128(46);
+    kept_and_gone(&mut store, 20, 3, owner);
+    assert_eq!(store.available_pages(), 5);
+    // Fires of others in flight, none reading the cache.
+    let busy = store.begin_fire();
+    let other = store.begin_fire();
     assert_eq!(
-        store.next_extent(8),
-        Some(48),
-        "a waiter is covered at once"
+        store.reclaim_droppable(store.current_epoch(), |_| FLOOR),
+        3,
+        "dropped"
     );
-    store.hold_extent();
-    assert_eq!(store.next_extent(8), None, "a refusal stops there");
-    assert_eq!(store.available_pages(), 2);
-    drop(held);
-}
+    assert_eq!(store.available_pages(), 8, "back at once: no fire in flight read it");
+    store.settle(busy);
+    store.settle(other);
 
-#[test]
-fn a_low_target_is_room_and_not_pages_out() {
-    let mut store = KvStore::new(16, [0; 32]);
-    let held = store.reserve_device_pages(16).unwrap();
-    store.set_target(4);
-    assert_eq!(store.pages_out(), 16, "the tail is out until it comes home");
-    store.release_device_reservation(held);
-    assert_eq!(store.pages_out(), 0, "an empty pool reads as empty");
-}
-
-#[test]
-fn a_lowered_target_holds_back_the_tail_until_its_pages_come_home() {
-    let mut store = KvStore::new(16, [0; 32]);
-    let held = store.reserve_device_pages(16).unwrap();
-    store.set_target(4);
-    assert_eq!(store.committed_pages(), 4);
-    assert_eq!(store.mapped_pages(), 16, "the memory is still there");
-    assert_eq!(store.tail_held(), 12);
-
-    store.release_device_reservation(held);
-    assert_eq!(store.tail_held(), 0);
-    assert_eq!(store.available_pages(), 4);
-    store.note_released(4);
-    assert_eq!(store.mapped_pages(), 4);
-
-    store.set_target(10);
-    assert_eq!(store.next_extent(2), None, "the four free cover the step");
-    assert_eq!(store.next_extent(8), None, "too little gathered to commit");
-    store.note_short(10);
-    assert_eq!(store.next_extent(2), Some(10));
-}
-
-#[test]
-fn a_commit_that_lands_after_a_cut_leaves_the_cut_standing() {
-    let mut store = KvStore::new(64, h(3));
-    store.commit_on_demand();
-    store.set_target(64);
-    store.set_target(8);
-    store.set_committed(32);
-    assert_eq!(store.committed_pages(), 8);
-    assert_eq!(store.mapped_pages(), 32, "the tail gives it back");
+    // A reader holds it in a fire now in flight, and lets go.
+    let tokens = kept_and_gone(&mut store, 21, 3, owner);
+    let ws = reader(&mut store, &tokens, 3);
+    let read = store.begin_fire();
+    store.release_working_set(ws, read);
+    store.retire_idle();
+    assert_eq!(
+        store.reclaim_droppable(store.current_epoch(), |_| FLOOR),
+        3,
+        "dropped"
+    );
+    store.retire_idle();
+    assert_eq!(store.available_pages(), 5, "the fire that read it is in flight");
+    store.settle(read);
+    store.retire_idle();
+    assert_eq!(store.available_pages(), 8, "and back once it retires");
 }

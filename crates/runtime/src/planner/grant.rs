@@ -132,26 +132,20 @@ impl Drop for RsSlotReservation {
 
 #[derive(Debug)]
 pub struct AllocationGrant {
-    demand: Demand,
     kv: DevicePageReservation,
     rs: RsSlotReservation,
 }
 
 impl AllocationGrant {
-    pub(super) fn new(demand: Demand, kv: DevicePageReservation, rs: RsSlotReservation) -> Self {
-        Self { demand, kv, rs }
+    pub(super) fn new(kv: DevicePageReservation, rs: RsSlotReservation) -> Self {
+        Self { kv, rs }
     }
 
     pub fn empty() -> Self {
         Self {
-            demand: Demand::default(),
             kv: DevicePageReservation::empty(),
             rs: RsSlotReservation::empty(),
         }
-    }
-
-    pub fn demand(&self) -> Demand {
-        self.demand
     }
 
     pub fn remaining_kv(&self) -> usize {

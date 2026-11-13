@@ -64,6 +64,10 @@ impl Recording {
 #[derive(Debug, Clone, Default)]
 pub struct Knobs {
     pub diagnostics: Diagnostics,
+    /// Whether the weights this load states as weight shapes are held for
+    /// its life (`engine::load::Residency::weights_held`): no host copy of
+    /// them is kept, and the lattice is armed at the first weight residency.
+    pub weights_held: bool,
     pub nccl_transport: crate::comm::Transport,
     /// The user's profile directory; `None` reads only the checked-in ones.
     pub profiles: Option<std::path::PathBuf>,
@@ -117,7 +121,6 @@ pub struct Boot<'a> {
     pub cache_dir: Option<&'a Path>,
     pub runahead: engine::runahead::Runahead,
     pub residency: crate::experts::Plan,
-    pub deferred_tier: bool,
     pub world: crate::api::World,
     /// The rank's place in its expert-parallel group: which slots of each
     /// routed bank its checkpoint read keeps.

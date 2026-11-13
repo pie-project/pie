@@ -4,7 +4,6 @@ use dtype::Dtype;
 use crate::jit::{
     Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
-use crate::linear::moe::GroupSeat;
 use crate::tensor::Tensor;
 
 pub mod tiled;
@@ -60,7 +59,6 @@ pub fn matmul(
     biases: Option<Tensor>,
     factor: Dtype,
     y: &mut Tensor,
-    seat: GroupSeat,
 ) -> Result<(), Error> {
     dense_affine(
         ctx,
@@ -72,7 +70,6 @@ pub fn matmul(
         biases,
         factor,
         y,
-        seat,
     )
 }
 
@@ -86,7 +83,6 @@ pub fn lm_head(
     biases: Option<Tensor>,
     factor: Dtype,
     y: &mut Tensor,
-    seat: GroupSeat,
 ) -> Result<(), Error> {
     dense_affine(
         ctx,
@@ -98,7 +94,6 @@ pub fn lm_head(
         biases,
         factor,
         y,
-        seat,
     )
 }
 
@@ -223,7 +218,6 @@ fn dense_affine(
     biases: Option<Tensor>,
     factor: Dtype,
     y: &mut Tensor,
-    seat: GroupSeat,
 ) -> Result<(), Error> {
     let t = dtype_dispatch!(op, act.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let f = dtype_dispatch!(op, factor, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -268,7 +262,6 @@ fn dense_affine(
                 stated(op, y.rows)?.arg(),
                 stated(op, n)?.arg(),
                 stated(op, k)?.arg(),
-                ArgValue::Ptr(seat.cell),
                 ctx.stage(),
             ],
         )?;
@@ -308,7 +301,6 @@ fn dense_affine(
                 stated(op, y.rows)?.arg(),
                 stated(op, n)?.arg(),
                 stated(op, k)?.arg(),
-                ArgValue::Ptr(seat.cell),
                 ctx.stage(),
             ],
         )?;
@@ -341,7 +333,6 @@ fn dense_affine(
                 stated(op, y.rows)?.arg(),
                 stated(op, n)?.arg(),
                 stated(op, k)?.arg(),
-                ArgValue::Ptr(seat.cell),
                 ctx.stage(),
             ],
         )?;
@@ -376,7 +367,6 @@ fn dense_affine(
             stated(op, y.rows)?.arg(),
             stated(op, n)?.arg(),
             stated(op, k)?.arg(),
-            ArgValue::Ptr(seat.cell),
             ctx.stage(),
         ],
     )

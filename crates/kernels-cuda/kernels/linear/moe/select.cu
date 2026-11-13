@@ -9,6 +9,7 @@
 #include <mma.h>
 #endif
 #include "linear/moe_w4.cuh"
+#include "linear/moe/table.cuh"
 #include "linear/w8a16.cuh"
 #include "linear/quant.cuh"
 
@@ -17,18 +18,6 @@ namespace pie::linear {
 [[maybe_unused]] constexpr int kMoeVecWidth = 8;
 
 constexpr int kGemvWarps = 4;
-
-template <class T>
-__device__ __forceinline__ const T* moe_expert_base(
-    const T* __restrict__ weight_base,
-    const T* const* __restrict__ expert_table,
-    int expert,
-    long long expert_stride)
-{
-    return expert_table != nullptr
-        ? expert_table[expert]
-        : weight_base + static_cast<long long>(expert) * expert_stride;
-}
 
 __device__ __forceinline__ void moe_note_expert(
     unsigned int* __restrict__ expert_hits, int expert)
@@ -49,7 +38,7 @@ __device__ __forceinline__ void moe_matmul_select_gemv_body(
     const T* __restrict__ weight_base,
     T* __restrict__ out,
     int top_k, int K, int N, long long expert_stride,
-    const T* const* __restrict__ expert_table,
+    const u64* __restrict__ expert_table,
     unsigned int* __restrict__ expert_hits,
     const u32* __restrict__ win,
     int route_count)
@@ -76,7 +65,8 @@ __device__ __forceinline__ void moe_matmul_select_gemv_body(
     if (blockIdx.x == 0 && threadIdx.y == 0 && lane == 0) {
         moe_note_expert(expert_hits, expert);
     }
-    const T* w = moe_expert_base(weight_base, expert_table, expert, expert_stride);
+    // The expert table (one plane an expert), resolved once a route.
+    const T* w = expert_plane(weight_base, expert_stride, expert_table, 1, 0, expert);
     const float4* w4[kRows];
 #pragma unroll
     for (int r = 0; r < kRows; ++r)
@@ -122,7 +112,7 @@ __global__ void moe_matmul_select_gemv_by_token(
     const T* __restrict__ weight_base,
     T* __restrict__ out,
     int top_k, int K, int N, long long expert_stride,
-    const T* const* __restrict__ expert_table,
+    const u64* __restrict__ expert_table,
     unsigned int* __restrict__ expert_hits,
     int route_count,
     const u32* __restrict__ win)
@@ -143,7 +133,7 @@ __global__ void moe_matmul_select_gemv_by_route(
     const T* __restrict__ weight_base,
     T* __restrict__ out,
     int top_k, int K, int N, long long expert_stride,
-    const T* const* __restrict__ expert_table,
+    const u64* __restrict__ expert_table,
     unsigned int* __restrict__ expert_hits,
     int route_count,
     const u32* __restrict__ win)
@@ -178,7 +168,8 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_bf16_held(
     int num_experts,
     int inter,
     float limit,
-    float galpha)
+    float galpha,
+    const u64* __restrict__ expert_table)
 {
     static_assert(kGlu == 0 || kTiles == 2, "a GLU warp is a gate tile and its up tile");
     constexpr int kRowsWarp = kGlu != 0 ? 16 : kTiles * 16;
@@ -205,7 +196,8 @@ __global__ void __launch_bounds__(128 * kKSplit) moe_select_bf16_held(
     const bool rows_live = row_base < span;
 
     const int chunks = k >> 5;
-    const bf16* w_e = codes + static_cast<long long>(expert) * n * k;
+    // The expert table (one plane an expert), resolved once a tile.
+    const bf16* w_e = expert_plane(codes, static_cast<long long>(n) * k, expert_table, 1, 0, expert);
     const bf16* wrow[kTiles][2];
 #pragma unroll
     for (int t = 0; t < kTiles; ++t)
@@ -299,7 +291,8 @@ __global__ void moe_matmul_select_nvfp4(
     int k,
     const MoeGroupBases* __restrict__ bases,
     unsigned int* __restrict__ group_hits,
-    const u32* __restrict__ win)
+    const u32* __restrict__ win,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kRows = kRowsT;
     const int route = blockIdx.x;
@@ -339,10 +332,10 @@ __global__ void moe_matmul_select_nvfp4(
     }
 
     const uint4* wq = reinterpret_cast<const uint4*>(
-        codes_at + static_cast<long long>(expert) * n * (k / 2));
+        expert_plane(codes_at, 1LL * n * (k / 2), expert_table, 3, 0, expert));
     const unsigned short* s2 = reinterpret_cast<const unsigned short*>(
-        scales_at + static_cast<long long>(expert) * n * groups);
-    const float* g = tensor_at + static_cast<long long>(expert) * n;
+        expert_plane(scales_at, 1LL * n * groups, expert_table, 3, 1, expert));
+    const float* g = expert_plane(tensor_at, 1LL * n, expert_table, 3, 2, expert);
 
     const T* x = act + static_cast<long long>(plane_route / act_div) * k;
     const uint4* x4 = reinterpret_cast<const uint4*>(x);
@@ -444,7 +437,8 @@ __global__ void moe_matmul_select_mxfp4(
     int k,
     const MoeGroupBases* __restrict__ bases,
     unsigned int* __restrict__ group_hits,
-    const u32* __restrict__ win)
+    const u32* __restrict__ win,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kRows = kRowsT;
     const int route = blockIdx.x;
@@ -470,8 +464,8 @@ __global__ void moe_matmul_select_mxfp4(
         scales_at = seat.scales;
     }
 
-    const u8* w = codes_at + static_cast<long long>(expert) * n * (k / 2);
-    const u8* s = scales_at + static_cast<long long>(expert) * n * groups_per_row;
+    const u8* w = expert_plane(codes_at, 1LL * n * (k / 2), expert_table, 3, 0, expert);
+    const u8* s = expert_plane(scales_at, 1LL * n * groups_per_row, expert_table, 3, 1, expert);
 
     const T* x = act + static_cast<long long>(plane_route / act_div) * k;
 
@@ -548,7 +542,7 @@ __global__ void moe_matmul_select_mxfp4(
     }
     if (lane_id == 0) {
         const T* b = bias != nullptr
-            ? bias + static_cast<long long>(expert) * n
+            ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert)
             : nullptr;
 #pragma unroll
         for (int r = 0; r < kRows; ++r) {
@@ -575,7 +569,8 @@ __global__ void moe_matmul_select_mlxu4_grouped(
     int k,
     int num_experts,
     const MoeGroupBases* __restrict__ bases,
-    unsigned int* __restrict__ group_hits)
+    unsigned int* __restrict__ group_hits,
+    const u64* __restrict__ expert_table)
 {
 
     // 64 of K a tile: the widened tile and the routes' fit the 48 KiB of
@@ -615,11 +610,11 @@ __global__ void moe_matmul_select_mlxu4_grouped(
         biases_at = seat.biases;
     }
     const unsigned* w32 = reinterpret_cast<const unsigned*>(
-        codes_at + static_cast<long long>(expert) * n * words_per_row * 4);
+        expert_plane(codes_at, 1LL * n * words_per_row * 4, expert_table, 3, 0, expert));
     const bf16* s16 = reinterpret_cast<const bf16*>(
-        scales_at + static_cast<long long>(expert) * n * groups_per_row * 2);
+        expert_plane(scales_at, 1LL * n * groups_per_row * 2, expert_table, 3, 1, expert));
     const bf16* b16 = reinterpret_cast<const bf16*>(
-        biases_at + static_cast<long long>(expert) * n * groups_per_row * 2);
+        expert_plane(biases_at, 1LL * n * groups_per_row * 2, expert_table, 3, 2, expert));
 
     __shared__ float w_tile[kTileN][kTileK + 1];
     __shared__ float x_tile[kBatch][kTileK];
@@ -710,7 +705,8 @@ __global__ void moe_matmul_select_mxfp4_grouped(
     int k,
     int num_experts,
     const MoeGroupBases* __restrict__ bases,
-    unsigned int* __restrict__ group_hits)
+    unsigned int* __restrict__ group_hits,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kTileN = 128;
 
@@ -747,8 +743,8 @@ __global__ void moe_matmul_select_mxfp4_grouped(
         scales_at = seat.scales;
     }
     const unsigned* w32 = reinterpret_cast<const unsigned*>(
-        codes_at + static_cast<long long>(expert) * n * (k / 2));
-    const u8* s8 = scales_at + static_cast<long long>(expert) * n * groups_per_row;
+        expert_plane(codes_at, 1LL * n * (k / 2), expert_table, 3, 0, expert));
+    const u8* s8 = expert_plane(scales_at, 1LL * n * groups_per_row, expert_table, 3, 1, expert);
 
     __shared__ float w_tile[kTileN][kTileK + 1];
     __shared__ float x_tile[kBatch][kTileK];
@@ -758,7 +754,7 @@ __global__ void moe_matmul_select_mxfp4_grouped(
     const int row_a = pair * kRowsPerThread;
     const int row_b = row_a + 1;
 
-    const T* b = bias != nullptr ? bias + static_cast<long long>(expert) * n : nullptr;
+    const T* b = bias != nullptr ? expert_plane(bias, 1LL * n, expert_table, 3, 2, expert) : nullptr;
     float bias_a = 0.f;
     float bias_b = 0.f;
     if (b != nullptr) {
@@ -867,7 +863,8 @@ __global__ void moe_matmul_select_mlxu4(
     int k,
     const MoeGroupBases* __restrict__ bases,
     unsigned int* __restrict__ group_hits,
-    const u32* __restrict__ win)
+    const u32* __restrict__ win,
+    const u64* __restrict__ expert_table)
 {
     constexpr int kRows = kRowsT;
     constexpr int kPerWord = 32 / kBits;
@@ -908,11 +905,11 @@ __global__ void moe_matmul_select_mlxu4(
     }
 
     const unsigned* w32 = reinterpret_cast<const unsigned*>(
-        codes_at + static_cast<long long>(expert) * n * words_per_row * 4);
+        expert_plane(codes_at, 1LL * n * words_per_row * 4, expert_table, 3, 0, expert));
     const bf16* s16 = reinterpret_cast<const bf16*>(
-        scales_at + static_cast<long long>(expert) * n * groups_per_row * 2);
+        expert_plane(scales_at, 1LL * n * groups_per_row * 2, expert_table, 3, 1, expert));
     const bf16* b16 = reinterpret_cast<const bf16*>(
-        biases_at + static_cast<long long>(expert) * n * groups_per_row * 2);
+        expert_plane(biases_at, 1LL * n * groups_per_row * 2, expert_table, 3, 2, expert));
 
     const T* x = act + static_cast<long long>(plane_route / act_div) * k;
     const uint4* x4 = reinterpret_cast<const uint4*>(x);

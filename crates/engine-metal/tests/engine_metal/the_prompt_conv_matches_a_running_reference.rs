@@ -2,9 +2,9 @@
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
-use kernels_metal::Tensor;
 use kernels_metal::ssm;
 use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
+use kernels_metal::{StateMap, Tensor};
 use poem_ir::Dtype;
 
 const WIDTH: u32 = 4;
@@ -141,11 +141,14 @@ fn every_prompt_row_and_carried_state_answers_a_running_reference() {
         let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
         let bank = Tensor::new(bind(&s_b), lanes, hist * channels, Dtype::F32);
         // The pool's state and new state name one bank, as the engine binds them.
+        let map = StateMap::whole(u64::from(hist) * u64::from(channels));
+        let map_b = upload(&map.bytes());
         let pool = RecurrentPool {
             state: bank,
             slots: Tensor::new(bind(&slot_b), rows, 1, Dtype::U32),
             conv_state: bank,
             new_conv_state: bank,
+            segments: Tensor::new(bind(&map_b), 1, map.words().len() as u32, Dtype::U64),
         };
         let yh = bind(&y_b);
         let frame = device.frame().expect("frame");

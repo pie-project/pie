@@ -49,6 +49,9 @@ struct Paged {
     i32 rel_log_floor;
     float rel_log_alpha;
     i32 rel_pad;
+    // Elements from a page's rows to the next page's, keys and values alike
+    // (`page_size * num_kv_heads * D` packed).
+    i64 stride_page;
 };
 
 // The relative bias of one query row and head: `sc` scales a raw dot into
@@ -86,7 +89,7 @@ __device__ __forceinline__ int kv_length(const Paged& p, int req) {
 template <bool HND, int D>
 __device__ __forceinline__ long long kv_token(const Paged& p, int req, int t, int h, int j) {
     const long long page = p.page_indices[p.page_indptr[req] + t / p.page_size];
-    return kv_at<HND>(page, t % p.page_size, h, j, p.page_size, p.num_kv_heads, D);
+    return kv_at<HND>(page, t % p.page_size, h, j, p.page_size, p.num_kv_heads, D, p.stride_page);
 }
 
 // ---------------------------------------------------------------- decode --
@@ -342,7 +345,7 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
     for (int i = threadIdx.x; i < TABLE && page0 + i <= (wend - 1) / ps_; i += blockDim.x) table[i] = pages[page0 + i];
     __syncthreads();
     auto at = [&](int t, int j) {
-        return kv_at<HND>(static_cast<long long>(table[t / ps_ - page0]), t % ps_, kv_head, j, ps_, p.num_kv_heads, D);
+        return kv_at<HND>(static_cast<long long>(table[t / ps_ - page0]), t % ps_, kv_head, j, ps_, p.num_kv_heads, D, p.stride_page);
     };
     for (int t0 = w0 + wave * SUB; t0 < wend; t0 += WAVES * SUB) {
         // The round's key and value reads, all issued before any is used
@@ -618,7 +621,7 @@ __global__ __launch_bounds__(256) void paged_decode_cols(const Paged p) {
     for (int i = threadIdx.x; i < TABLE && page0 + i <= (wend - 1) / ps_; i += blockDim.x) table[i] = pages[page0 + i];
     __syncthreads();
     auto at = [&](int t, int j) {
-        return kv_at<HND>(static_cast<long long>(table[t / ps_ - page0]), t % ps_, kv_head, j, ps_, p.num_kv_heads, D);
+        return kv_at<HND>(static_cast<long long>(table[t / ps_ - page0]), t % ps_, kv_head, j, ps_, p.num_kv_heads, D, p.stride_page);
     };
     for (int t0 = w0; t0 < wend; t0 += SUB) {
         // The round's key and value reads, all issued before any is used
@@ -1080,7 +1083,7 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
     auto fetch = [&](int kv0) {
         auto at = [&](int t, int j) {
             t = min(t, wend - 1);
-            return kv_at<HND>(static_cast<long long>(table[t / ps - page0]), t % ps, kv_head, j, ps, p.num_kv_heads, D);
+            return kv_at<HND>(static_cast<long long>(table[t / ps - page0]), t % ps, kv_head, j, ps, p.num_kv_heads, D, p.stride_page);
         };
 #pragma unroll
         for (int r = 0; r < KR; ++r)

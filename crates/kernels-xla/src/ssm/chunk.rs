@@ -143,12 +143,28 @@ pub(super) fn gdn_chunks(
     let gcum = f.scan_steps(g3, 1, Fold::Sum)?;
     let gcum = f.reshape(gcum, &[sr, hv])?;
 
-    let compiled = kernel(hk, hv, dk, dv, c, nc, rows, stored, None)?;
+    // A bank in the chunk pool is read and written as the pool itself.
+    let pool = f.view_parts(slab).map(|(pool, _)| pool);
+    let compiled = kernel(hk, hv, dk, dv, c, nc, rows, stored, None, pool.is_some())?;
     let out = compiled.call_aliased(
         f,
-        &[first_i, last_i, slot_n, nvalid, qkv, gcum, beta, slab],
+        &[
+            first_i,
+            last_i,
+            slot_n,
+            nvalid,
+            qkv,
+            gcum,
+            beta,
+            pool.unwrap_or(slab),
+        ],
         &[(1, 7)],
     )?;
+    let bank = if pool.is_some() {
+        f.pool_view(out[1], Elem::Bf16, &[rows, dv])?
+    } else {
+        out[1]
+    };
     let o = out[0];
 
     // Token `ti` sits in its segment's chunk `cstart + local / c`.
@@ -169,7 +185,7 @@ pub(super) fn gdn_chunks(
     let pos = clamp_i(f, pos, 0, sr - 1)?;
     let y = f.take_rows(o, pos)?;
     let y = f.reshape(y, &[t, hv, dv])?;
-    Ok(Some((y, out[1])))
+    Ok(Some((y, bank)))
 }
 
 /// [`gdn_chunks`] over the fire's rows where they lie, for a fire of whole
@@ -290,16 +306,35 @@ fn gdn_blocks(
     let qkv = raw.rows[0];
     let stored = f.elem(qkv);
 
-    let compiled = kernel(hk, hv, dk, dv, c, nc, rows, stored, Some(t))?;
+    // A bank in the chunk pool is read and written as the pool itself.
+    let pool = f.view_parts(slab).map(|(pool, _)| pool);
+    let compiled = kernel(hk, hv, dk, dv, c, nc, rows, stored, Some(t), pool.is_some())?;
     let out = compiled.call_aliased(
         f,
         &[
-            first_i, last_i, slot_n, nvalid, lo, hi, pstart, pcount, full, qkv, gsum, beta, slab,
+            first_i,
+            last_i,
+            slot_n,
+            nvalid,
+            lo,
+            hi,
+            pstart,
+            pcount,
+            full,
+            qkv,
+            gsum,
+            beta,
+            pool.unwrap_or(slab),
         ],
         &[(1, 12)],
     )?;
+    let bank = if pool.is_some() {
+        f.pool_view(out[1], Elem::Bf16, &[rows, dv])?
+    } else {
+        out[1]
+    };
     let y = f.reshape(out[0], &[t, hv, dv])?;
-    Ok((y, out[1]))
+    Ok((y, bank))
 }
 
 /// The most bytes of `q | k | v` rows one gather takes whole: past it, XLA's
@@ -338,6 +373,7 @@ fn kernel(
     rows: i64,
     stored: Elem,
     blocked: Option<i64>,
+    pooled: bool,
 ) -> Built<crate::mosaic::Compiled> {
     // `blocked`: the fire's rows, read and written where they lie, a step
     // a block of `c` of them (`gdn_blocks`); else the chunks' gathered rows.
@@ -351,10 +387,16 @@ fn kernel(
         window: Window::Blocked,
         index: Box::new(|b, g: &Grid| Ok(vec![g.ids[0], b.i32(0)])),
     };
+    // pooled: the u32 pool, two bf16 rows a pool row
+    let (bank_dims, bank_elem) = if pooled {
+        (vec![rows / 2, dv], Elem::U32)
+    } else {
+        (vec![rows, dv], Elem::Bf16)
+    };
     let bank = || Operand {
-        array: vec![rows, dv],
-        elem: Elem::Bf16,
-        block: vec![rows, dv],
+        array: bank_dims.clone(),
+        elem: bank_elem,
+        block: bank_dims.clone(),
         window: Window::Any,
         index: Box::new(|b, _g: &Grid| Ok(vec![b.i32(0), b.i32(0)])),
     };
@@ -398,6 +440,14 @@ fn kernel(
     kernel.build(|b, blk| {
         let (x_r, g_r, b_r, bank_r) = (blk.ins[0], blk.ins[1], blk.ins[2], blk.ins[3]);
         let (o_r, bank_o) = (blk.outs[0], blk.outs[1]);
+        let (bank_r, bank_o) = if pooled {
+            (
+                b.ref_bitcast(bank_r, Elem::Bf16)?,
+                b.ref_bitcast(bank_o, Elem::Bf16)?,
+            )
+        } else {
+            (bank_r, bank_o)
+        };
         let (st, sb, sems) = (blk.scratch[0], blk.scratch[1], blk.scratch[2]);
         let z = b.i32(0);
         let sem = b.ref_slice(sems, &[z], &[1])?;

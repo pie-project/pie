@@ -2,16 +2,15 @@
 
 //! C2d belt — a packed `KvU4` page MIGRATES correctly through `store::copy_kv`.
 //!
-//! `copy_kv` (page defrag / fork) was taught in C2b to size a packed page's cell
-//! stride from the head_dim (`head_dim/2 + 2` bytes per head, NOT `width *
-//! element`), so a whole-slot byte-blit moves the codes and their inline scales
-//! together. That path was never exercised end to end. This drives the REAL
-//! store: reserve a packed `KvU4` pool, quantize K/V into physical page 0 with
-//! the production `attention.kv_append`, migrate page 0 -> page 1 with
-//! `Pools::copy_kv`, and assert the destination page is byte-for-byte the source
-//! page — for BOTH the key and value planes. A stride computed as `width *
-//! element` (512 B/head at head_dim 256, not 130) would blit the wrong ranges
-//! and the two pages would differ.
+//! `copy_kv` (page defrag / fork) sizes a packed page's cell stride from the
+//! head_dim (`head_dim/2 + 2` bytes per head, NOT `width * element`), so a
+//! token-run blit moves the codes and their inline scales together. This
+//! drives the REAL store: reserve a packed `KvU4` chunk pool, quantize K/V into
+//! one list slot with the production `attention.kv_append`, migrate that slot's
+//! tokens into another with `Pools::copy_kv`, and assert the destination slot
+//! is byte-for-byte the source — its key run and its value run. A stride
+//! computed as `width * element` (512 B/head at head_dim 256, not 130) would
+//! blit the wrong ranges and the two slots would differ.
 //!
 //! We run it at head_dim 256 AND 128 — the two blocks the packed codec ships.
 
@@ -20,8 +19,10 @@ use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use engine_metal::run::CachePool;
 use engine_metal::store::kv::{Facts, Paging, SpaceFacts};
-use engine_metal::store::{Pools, Seats, SpaceSeat};
+use engine_metal::store::layout::{LIST, Layout};
+use engine_metal::store::{Pools, Rows, Seats, TableSeat};
 use kernels_metal::Tensor;
+use poem_compiler::chunk::{ChunkProfile, ChunkRecipe, RowId, SlotLayout, TokenRun};
 use poem_ir::{CacheRow, Dtype, Platform, Trace};
 
 const HEADS: usize = 2; // kv_heads
@@ -126,10 +127,9 @@ impl Rig {
     }
 }
 
-/// A minimal `Seats` whose page tables cover `PAGES` physical pages. `copy_kv`
-/// never reads it (it walks the pool's slabs by physical page), and the append
-/// path ignores the pool's own page tables — so dummy-but-valid tensors suffice
-/// for `Pools::table` to hand back the plane handles.
+/// A minimal `Seats` whose page tables cover `PAGES` pages. `copy_kv` never
+/// reads it, and the append path ignores the pool's own page tables — so
+/// dummy-but-valid tensors suffice for `Pools::table` to hand back the pool.
 fn seats(rig: &mut Rig) -> Seats {
     let page_indices = rig.u32s(&(0..PAGES as u32).collect::<Vec<_>>());
     let page_indptr = rig.u32s(&[0u32, PAGES as u32]);
@@ -141,7 +141,7 @@ fn seats(rig: &mut Rig) -> Seats {
         lanes: 1,
         rows: 1,
         pages: PAGES as u32,
-        spaces: vec![SpaceSeat {
+        page_tables: vec![TableSeat {
             page_indptr,
             page_indices,
             last_page_lens,
@@ -149,6 +149,8 @@ fn seats(rig: &mut Rig) -> Seats {
         }],
         slot_ids,
         slot_of_row,
+        lane_bands: Vec::new(),
+        row_bands: Vec::new(),
     }
 }
 
@@ -183,7 +185,6 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
             name: String::from("kv"),
             planes: vec![width, width],
             dtype: Dtype::KvU4,
-            space: 0,
             window: None,
             head_dim: head_dim as u32,
             live: None,
@@ -206,13 +207,50 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
         plans: Vec::new(),
     };
 
-    let mut pools = Pools::reserve(&rig.device, &trace, paging, &facts).expect("reserve packed KV");
-    pools
-        .commit(engine::frame::Demand {
-            kv_pages: PAGES as u32,
-            ..engine::frame::Demand::ZERO
-        })
-        .expect("map the pages");
+    // A pool of two chunks of four list slots: the null chunk, and chunk 1
+    // whose first two slots the migration names.
+    // The compiler's recipe sizes no packed row (KvU4 has no element), so
+    // the test states the list slot a recipe would: one row, key run then
+    // value run.
+    let run = (PAGE_SIZE as usize * HEADS * per) as u64;
+    let slot = (2 * run).next_multiple_of(256);
+    let recipe = ChunkRecipe {
+        chunk_bytes: 4 * slot,
+        slots: vec![SlotLayout::List {
+            tokens: PAGE_SIZE,
+            bytes: slot,
+            window: None,
+            rows: vec![TokenRun {
+                row: RowId::Cache(0),
+                layer: None,
+                offset: 0,
+                per_token: 2 * (HEADS * per) as u64,
+            }],
+        }],
+        atoms: Default::default(),
+        shards: Default::default(),
+        short_runs: Vec::new(),
+        cow_sets: 1,
+        waste: Default::default(),
+        profile: ChunkProfile::ON_DEVICE_METAL,
+        weights: Vec::new(),
+        rs: Default::default(),
+    };
+    let rows = Rows::plan(&trace, &recipe, &facts, None).expect("plan packed KV");
+    let layout = Layout::new(
+        4 * slot,
+        2,
+        engine_metal::store::pool::segment_chunks(4 * slot),
+        PAGE_SIZE,
+        [slot, 0],
+        1,
+        0,
+        0,
+    )
+    .expect("a layout");
+    let mut pools = Pools::reserve(&rig.device, rows, layout, paging).expect("reserve packed KV");
+    pools.commit_segments(1).expect("map the pool");
+    let (src, dst) = (4u32, 5u32);
     let seats = seats(rig);
     let table = pools
         .table(&rig.handles, &seats, false)
@@ -229,8 +267,9 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
     let hv = rig.bf16(&v_data);
     let kt = Tensor::new(hk, tokens as u32, width as u32, Dtype::Bf16);
     let vt = Tensor::new(hv, tokens as u32, width as u32, Dtype::Bf16);
-    // token i -> physical page 0, in-page offset i.
-    let wpt = rig.u32s(&vec![0u32; tokens]);
+    // token i -> the source slot, in-page offset i (the identity table: a
+    // slot ref is its physical page).
+    let wpt = rig.u32s(&vec![src; tokens]);
     let wot = rig.u32s(&(0..tokens as u32).collect::<Vec<_>>());
 
     {
@@ -241,36 +280,31 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
         frame.commit().expect("commit append");
     }
 
-    // Bytes per physical page, per plane: PAGE_SIZE cells x HEADS heads x per.
+    // A packed run: PAGE_SIZE cells x HEADS heads x per, a key run and a
+    // value run in a slot.
     let page_bytes = tokens * HEADS * per;
-
-    // The packed row's two planes, keys then values, read through the pool:
-    // an elastic plane's sparse view is private, with no host address.
-    let read_page = |pools: &Pools, plane: usize, page: usize| -> Vec<u8> {
-        let mut bytes = vec![0u8; page_bytes];
-        pools
-            .read_plane(plane, (page * page_bytes) as u64, &mut bytes)
-            .expect("read plane");
-        bytes
+    let read_slot = |pools: &Pools, page: u32| -> Vec<u8> {
+        pools.read_slot_bytes(LIST, page).expect("read a slot")
     };
-
-    // Page 0 must be non-trivial (the append wrote real codes), page 1 zeroed.
-    let src_keys_before = read_page(&pools, 0, 0);
-    let src_values_before = read_page(&pools, 1, 0);
+    let before = read_slot(&pools, src);
+    assert_eq!(before.len() as u64, slot);
     assert!(
-        src_keys_before.iter().any(|&b| b != 0),
-        "head_dim {head_dim}: page 0 keys should hold the quantized codes"
+        slot >= 2 * page_bytes as u64,
+        "head_dim {head_dim}: a slot holds a packed key run and value run"
     );
     assert!(
-        read_page(&pools, 0, 1).iter().all(|&b| b == 0),
-        "head_dim {head_dim}: page 1 should start zeroed"
+        before.iter().any(|&b| b != 0),
+        "head_dim {head_dim}: the source slot should hold the quantized codes"
+    );
+    assert!(
+        read_slot(&pools, dst).iter().all(|&b| b == 0),
+        "head_dim {head_dim}: the destination slot should start zeroed"
     );
 
-    // Migrate the whole physical page 0 -> page 1, both planes, via the store.
     let moves = [KvRun {
-        src_page: 0,
+        src_page: src,
         src_token: 0,
-        dst_page: 1,
+        dst_page: dst,
         dst_token: 0,
         tokens: PAGE_SIZE,
     }];
@@ -280,27 +314,21 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
         frame.commit().expect("commit migrate");
     }
 
-    // The destination page is byte-for-byte the source page — codes AND the
-    // inline fp16 scales moved together, at the packed stride.
-    let dst_keys = read_page(&pools, 0, 1);
-    let dst_values = read_page(&pools, 1, 1);
+    // The destination is byte-for-byte the source — codes AND the inline
+    // fp16 scales moved together, at the packed stride.
     assert_eq!(
-        dst_keys, src_keys_before,
-        "head_dim {head_dim}: migrated key page differs from the source — packed stride is wrong"
+        read_slot(&pools, dst),
+        before,
+        "head_dim {head_dim}: the migrated slot differs from the source — packed stride is wrong"
     );
     assert_eq!(
-        dst_values, src_values_before,
-        "head_dim {head_dim}: migrated value page differs from the source — packed stride is wrong"
-    );
-    // The source page is untouched by the blit.
-    assert_eq!(
-        read_page(&pools, 0, 0),
-        src_keys_before,
-        "head_dim {head_dim}: the source key page was disturbed by the migration"
+        read_slot(&pools, src),
+        before,
+        "head_dim {head_dim}: the source slot was disturbed by the migration"
     );
 
     eprintln!(
         "[migrate] head_dim={head_dim:>3} | page = {page_bytes} B/plane ({HEADS} heads x {per} B) | \
-         page 0 -> page 1 byte-exact for K and V"
+         slot {src} -> slot {dst} byte-exact for K and V"
     );
 }

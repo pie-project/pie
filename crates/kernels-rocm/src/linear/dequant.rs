@@ -7,7 +7,6 @@ use crate::linear::affine::OffsetKind;
 use crate::linear::affine::affine;
 use crate::linear::affine::extent;
 use crate::linear::gemm;
-use crate::linear::moe::GroupSeat;
 use crate::tensor::Tensor;
 
 const FILE: &str = "linear/quant.hip";
@@ -46,16 +45,8 @@ pub fn decoded_plane(
     factor: Dtype,
     n: u32,
     k: u32,
-    seat: GroupSeat,
 ) -> Result<Tensor, Error> {
     let f = dtype_dispatch!(op, factor, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    if seat.streams() {
-        return Err(refuse(
-            op,
-            "a decoded plane serves resident projections only, and these planes are \
-             seated by a streaming tier",
-        ));
-    }
     if codes.rows != n {
         return Err(refuse(
             op,
@@ -194,7 +185,6 @@ pub fn matmul_via_dense(
     biases: Option<Tensor>,
     factor: Dtype,
     y: &mut Tensor,
-    seat: GroupSeat,
 ) -> Result<(), Error> {
     dense_affine_via_dense(
         ctx,
@@ -206,7 +196,6 @@ pub fn matmul_via_dense(
         biases,
         factor,
         y,
-        seat,
     )
 }
 
@@ -220,7 +209,6 @@ pub fn lm_head_via_dense(
     biases: Option<Tensor>,
     factor: Dtype,
     y: &mut Tensor,
-    seat: GroupSeat,
 ) -> Result<(), Error> {
     dense_affine_via_dense(
         ctx,
@@ -232,7 +220,6 @@ pub fn lm_head_via_dense(
         biases,
         factor,
         y,
-        seat,
     )
 }
 
@@ -247,17 +234,9 @@ fn dense_affine_via_dense(
     biases: Option<Tensor>,
     factor: Dtype,
     y: &mut Tensor,
-    seat: GroupSeat,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
     let f = dtype_dispatch!(op, factor, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    if seat.streams() {
-        return Err(refuse(
-            op,
-            "the decoded-tile arm serves resident dense projections only, and these \
-             planes are seated by a streaming tier",
-        ));
-    }
     let Affine { bits, group, n, k } = affine(op, act, codes, scales, offset, biases, y)?;
     if y.rows == 0 {
         return Ok(());

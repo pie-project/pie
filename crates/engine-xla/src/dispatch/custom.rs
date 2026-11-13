@@ -410,12 +410,13 @@ impl Run<'_> {
                 // stood in front of frame 0, then this fire's tail written
                 // back over them.
                 let frames = conv.pad[0];
-                let slab = self.recurrent(*state).state;
+                let slab_pool = self.recurrent(*state);
+                let slab = slab_pool.state;
                 let slot_ids = self.clip_slot_table("conv.conv3d")?;
                 let frame_cache = self.temp(x.rows.saturating_mul(frames), x.width, x.dtype);
                 crate::lower::lower(self.ctx(), |l| {
                     let grid_v = l.read(grid)?;
-                    let slot_ids_v = l.read(slot_ids)?;
+                    let slot_ids_v = l.read_slots(slot_ids, slab_pool.map)?;
                     let slab_v = l.read(slab)?;
                     let o_cache = frame_cache;
                     let v = conv::cache::cache_gather(
@@ -452,7 +453,7 @@ impl Run<'_> {
                 })?;
                 crate::lower::lower(self.ctx(), |l| {
                     let grid_v = l.read(grid)?;
-                    let slot_ids_v = l.read(slot_ids)?;
+                    let slot_ids_v = l.read_slots(slot_ids, slab_pool.map)?;
                     let x_v = l.read(x)?;
                     let cache_v = l.read(frame_cache)?;
                     let slab_v = l.read(slab)?;
@@ -602,11 +603,12 @@ impl Run<'_> {
             } => {
                 let base = self.grid_base(*grid, *x);
                 let x = self.tensor(*x);
-                let slab = self.recurrent(*cache).state;
+                let slab_pool = self.recurrent(*cache);
+                let slab = slab_pool.state;
                 let slot_ids = self.clip_slot_table("conv.cache_store")?;
                 crate::lower::lower(self.ctx(), |l| {
                     let grid_v = l.read(self.tensor(*grid))?;
-                    let slot_ids_v = l.read(slot_ids)?;
+                    let slot_ids_v = l.read_slots(slot_ids, slab_pool.map)?;
                     let x_v = l.read(x)?;
                     let cache_v = l.read(x)?;
                     let slab_v = l.read(slab)?;

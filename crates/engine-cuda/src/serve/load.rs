@@ -18,7 +18,7 @@ use crate::store::kv::{self, Paging};
 use crate::store::rs::Buffers;
 use crate::weights::Weights;
 
-use super::{Boot, FireCost, Golden, Graphs, Released, Shell};
+use super::{Boot, Golden, Graphs, Released, Shell};
 
 /// The least `max_forward_tokens` is served at when the card is short: one
 /// prefill chunk a frame, which serves, and under it the halving stops.
@@ -29,10 +29,6 @@ const TOKENS_FLOOR: u32 = 1024;
 const CODE_DIR: &str = kernels_cuda::disk::CUBINS;
 #[cfg(feature = "rocm")]
 const CODE_DIR: &str = kernels_cuda::disk::CODE_OBJECTS;
-
-/// The recurrent-state slots a load holds when neither the config nor the
-/// chip's profile states them.
-const DEFAULT_STATE_SLOTS: u32 = 256;
 
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     super::diag::publish(&boot.knobs.diagnostics);
@@ -62,6 +58,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     };
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
+    let bodies_stated = boot.knobs.chip.is_some()
+        || crate::chip::states_recording(device.name(), boot.knobs.profiles.as_deref());
     if boot.budget.max_tokens == 0 {
         let params: u64 = boot
             .trace
@@ -97,10 +95,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     if engine.host_planes {
         let freed = boot.residency.host_declared(&boot.trace)?;
         if freed > 0 {
-            // The deferred fill republishes routed seats only; a dense row
-            // read through the artifact's mapping would stay there, so the
-            // host image is built at boot.
-            boot.deferred_tier = false;
             eprintln!(
                 "engine-cuda: {:.1} GiB of planes the package declares `host` serve from \
                  pinned host memory (engine.host_planes)",
@@ -108,22 +102,27 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             );
         }
     }
-    let stated_slots = boot.slots;
-    boot.slots = poem_compiler::state_slots(
-        boot.slots,
-        &boot.trace,
-        match engine.state_slots_per_lane {
-            0 => DEFAULT_STATE_SLOTS,
-            per_lane => per_lane.saturating_mul(boot.budget.max_lanes).max(1),
-        },
-    );
-    // Slots the config states or the profile derives a lane each are kept at
-    // the fit up to the lanes a fire batches; the fixed default is fitted.
-    let kept_slots = if stated_slots > 0 || engine.state_slots_per_lane > 0 {
-        boot.slots
-    } else {
-        0
-    };
+    // So do the routed banks it streams an expert at a time.
+    if !boot.knobs.diagnostics.dense_weights && !boot.knobs.diagnostics.dense_experts {
+        let banks = crate::store::layout::streamed_experts(&boot.trace);
+        match host_copy(boot, &banks)? {
+            HostCopy::Filed => {
+                boot.residency
+                    .file_weights(&boot.trace, &banks, true, false)?;
+            }
+            HostCopy::Mapped => {
+                boot.residency
+                    .file_weights(&boot.trace, &banks, true, true)?;
+            }
+            HostCopy::Pinned => {
+                boot.residency.host_experts(&boot.trace, &banks)?;
+            }
+        }
+    }
+    // Unstated, a seat a lane: every lane a fire batches has a slot to land
+    // in, so the lattice's widest decode is the fire limit's, not a fixed
+    // count's.
+    boot.slots = poem_compiler::state_slots(boot.slots, &boot.trace, boot.budget.max_lanes.max(1));
 
     kernels_cuda::disk::install(boot.cache_dir);
 
@@ -193,6 +192,26 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     } else {
         std::collections::BTreeMap::new()
     };
+    // The tables the weight cache streams by their rows keep their copy on
+    // the pinned host tier: a row not cached is read from it in place. Told
+    // of the trace as the load runs it: a table whose gather a rewrite
+    // above folded into another op is read whole, and stays on the device.
+    if !boot.knobs.diagnostics.dense_weights {
+        let streamed = crate::store::layout::streamed_rows(&boot.trace);
+        match host_copy(boot, &streamed)? {
+            HostCopy::Filed => {
+                boot.residency
+                    .file_weights(&boot.trace, &streamed, false, false)?;
+            }
+            HostCopy::Mapped => {
+                boot.residency
+                    .file_weights(&boot.trace, &streamed, false, true)?;
+            }
+            HostCopy::Pinned => {
+                boot.residency.host_rows(&boot.trace, &streamed)?;
+            }
+        }
+    }
     if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();
@@ -219,6 +238,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         crate::device::elastic::budget_bytes(free, total, boot.memory_share).saturating_sub(
             crate::store::weight_tier_bytes(&boot.trace, boot.residency.device_demand(), 0)?,
         );
+    let after_weights = held_beside(boot, after_weights)?;
     let facts = kv::probe(&boot.trace)?;
     let derive_voxels = boot
         .voxels
@@ -431,13 +451,14 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     Ok(Baked {
         device,
         engine,
+        bodies_stated,
         compiled,
         budgets,
         profile,
         regions,
         anchored,
-        kept_slots,
         asked,
+        stated_buckets: !stated_buckets.is_empty(),
     })
 }
 
@@ -454,6 +475,96 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
 /// token budget back toward `asked`'s, the budget before `bake` cut it at the
 /// asked lanes; `Pools::fit_the_card` still refuses past that.
 #[allow(clippy::too_many_arguments)]
+/// Where the weight cache's copy of a streamable weight lies off the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostCopy {
+    /// In the serving file's mapping, copied into pool slots at the first
+    /// weight residency and never read where it lies.
+    Filed,
+    /// In the serving file's mapping, a miss read where it lies.
+    Mapped,
+    /// On the host tier: pinned, a miss read where it lies; or, for a load
+    /// told its weights are held, pageable, seated in the pool before any
+    /// fire and read by none (`Tier::open`).
+    Pinned,
+}
+
+/// Where the weights `params` the weight cache takes are kept off the
+/// device.
+///
+/// A load whose weights the runtime holds whole in the pool for its life
+/// (`Knobs::weights_held`) leaves them in the model's serving file, where
+/// the file holds each as the trace reads it; no fire reads a host copy.
+/// A load that streams reads its misses from a copy: the file's mapping
+/// where the device faults mapped pages in, else pinned host memory, which
+/// is refused where the machine does not have it rather than left to the
+/// kernel to kill.
+fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
+    if params.is_empty() {
+        return Ok(HostCopy::Pinned);
+    }
+    // A plane the load lays in another form (its codes requantized, its
+    // scales laid in atoms) is not in the file as a slot holds it, whatever
+    // its size: its copy is laid in place at load.
+    let bytes = crate::weights::laid_bytes(&boot.trace)?;
+    let laid = crate::weights::laid_planes(&boot.trace);
+    let in_file = !params.iter().any(|&param| {
+        laid.iter()
+            .any(|laid| laid.codes == param || laid.scales == param)
+    }) && crate::checkpoint_serving::Serving::open(boot.checkpoint, &boot.trace)
+        .is_some_and(|serving| serving.holds(params, &bytes));
+    let pinned: u64 = params.iter().map(|&param| bytes[param]).sum();
+    if boot.knobs.weights_held {
+        if in_file {
+            return Ok(HostCopy::Filed);
+        }
+        eprintln!(
+            "engine-cuda: {} MiB of weights the pool will hold are copied to the host at \
+             load (pageable, freed once seated): {} does not hold their planes as this plan \
+             reads them (a plane decoded at load), so their slots cannot be filled from the \
+             file",
+            pinned >> 20,
+            boot.checkpoint.display()
+        );
+    } else if in_file && crate::experts::pageable_access() {
+        return Ok(HostCopy::Mapped);
+    }
+    let have = crate::weights::available_memory();
+    if pinned > have {
+        return Err(Fault::Residency(format!(
+            "this load keeps a host copy of the weights its cache takes, {:.1} GiB, \
+             and this machine has {:.1} GiB of memory left for it. {}",
+            pinned as f64 / f64::from(1u32 << 30),
+            have as f64 / f64::from(1u32 << 30),
+            if boot.knobs.weights_held {
+                "Its checkpoint's planes need decoding at load, so they cannot be read \
+                 from the file; give the host more memory."
+            } else {
+                "Set `weight_streaming = \"off\"` (the weights are then held on the \
+                 device and read from the file), or use a device with pageable memory \
+                 access (HMM)."
+            }
+        )));
+    }
+    Ok(HostCopy::Pinned)
+}
+
+/// `room` less the banks the weight cache takes, where the card holds them
+/// beside it: they are not on the device yet, and once seated they are the
+/// pool's for the load's life, as a resident bank's bytes are, so no fire's
+/// working set is sized into them. A deployment whose banks exceed the room
+/// streams them, and its fires are sized in the room as it is.
+fn held_beside(boot: &Boot<'_>, room: u64) -> Result<u64> {
+    let bytes = crate::weights::laid_bytes(&boot.trace)?;
+    let cached: u64 = boot
+        .residency
+        .cached_experts()
+        .iter()
+        .map(|&param| bytes[param].next_multiple_of(crate::weights::ALIGN))
+        .sum();
+    Ok(if cached < room { room - cached } else { room })
+}
+
 fn refit(
     boot: &mut Boot<'_>,
     device: &Context,
@@ -467,6 +578,7 @@ fn refit(
 ) -> Result<(CompiledModel, Budgets, Vec<u64>)> {
     let (free, total) = crate::store::device_memory()?;
     let live = crate::device::elastic::budget_bytes(free, total, boot.memory_share);
+    let live = held_beside(boot, live)?;
     let facts = kv::probe(&boot.trace)?;
     let window = crate::store::window_of(&boot.trace)?;
     let out_row = Exports::of(&boot.trace, &compiled)?.readout_row_bytes();
@@ -645,13 +757,14 @@ impl Shell {
         let Baked {
             mut device,
             engine,
+            bodies_stated,
             compiled,
             budgets,
             profile,
             regions: folded,
             anchored,
-            kept_slots,
             asked,
+            stated_buckets,
         } = bake(&mut boot)?;
         // Every generated kernel compiled and loaded now, before a fire can
         // ask for one.
@@ -704,6 +817,8 @@ impl Shell {
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
+        // Rewritten in place by the CUDA build's load-time copies.
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
         let mut weights = Weights::resident(
             &boot.trace,
             boot.contract,
@@ -719,7 +834,9 @@ impl Shell {
                 )
             },
             decode_dense,
-            boot.deferred_tier,
+            // A load told its weights are held seats every bank before a
+            // fire: its banks' host copy is pageable (`Tier::open`).
+            boot.knobs.weights_held,
         )?;
         // `kernel.gemm.fp8_o_down`: grouped projections on fp8b128, as vLLM
         // reads DeepSeek-V4's `wo_a` (the wide fires on tcgen05).
@@ -855,27 +972,38 @@ impl Shell {
         facts.mark_rows_a_lane(&read_only_by_decoders(&boot.trace, &compiled, &decoding));
         let feeds = Feeds::of(&boot.trace, &compiled);
         let tiers = crate::record::Tiers {
-            plain: plain_of(&landing),
+            plain: plain_of(&landing, &Exports::of(&boot.trace, &compiled)?.outputs),
         };
+        let drafting_words: std::collections::HashSet<u64> = compiled
+            .classes
+            .classes
+            .iter()
+            .enumerate()
+            .filter(|(class, _)| {
+                tiers.plain.contains(*class) && !landing[*class].iter().any(poem_ir::Request::plain)
+            })
+            .flat_map(|(_, class)| class.words.iter().copied())
+            .collect();
         let media = media_classes(&boot.trace, &compiled);
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
         let staging = crate::exports::regions_staging(&boot.trace, &compiled);
         let schedule_readers = regions_launching_schedules(&boot.trace, &compiled);
         crate::voxels::relabel_conv_weights(&device, &boot.trace, weights.table())?;
-        weights.rotate(&boot.trace, &compiled)?;
-        if boot.knobs.diagnostics.arm_trace {
-            eprintln!(
-                "[arm-trace] device free {} MiB after rotate",
-                crate::device::free_bytes().unwrap_or(0) >> 20
-            );
-        }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB after weights",
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
+        // The fires that run the side streams carve their own arena
+        // (`CompiledModel::arena_forked`): the larger of the two is what the
+        // pool keeps under its end for a fire's activation.
+        let forked_bytes = compiled
+            .arena_forked
+            .as_ref()
+            .map_or(0, |forked| forked.bytes);
+        let arena_bytes = compiled.arena.bytes.max(forked_bytes);
         let pools = Pools::reserve(
             device.ordinal(),
             boot.memory_share,
@@ -883,6 +1011,12 @@ impl Shell {
             paging,
             boot.kv_budget,
             &facts,
+            &budgets,
+            arena_bytes,
+            boot.knobs.diagnostics.chunk_bytes,
+            boot.residency.cached_experts(),
+            !boot.knobs.diagnostics.dense_weights,
+            boot.knobs.diagnostics.one_window,
         )?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
@@ -892,27 +1026,65 @@ impl Shell {
         }
         let buffers = Buffers::reserve(&boot.trace, paging, budgets.tokens.max_tokens, &pools)?;
         let mut pools = pools;
-        pools.keep_slots(kept_slots.min(boot.budget.max_lanes));
-        if let Some(buffers) = &buffers {
-            pools.seat_buffered(buffers.slot_bytes(), buffers.map_unit());
-        }
-        // The fires that run the side streams carve their own arena
-        // (`CompiledModel::arena_forked`): the larger of the two is reserved
-        // and held. Committed whole: a fire reading out past one row a lane
-        // (a verify reads every row) would otherwise grow it outside the fit.
-        let forked_bytes = compiled
-            .arena_forked
-            .as_ref()
-            .map_or(0, |forked| forked.bytes);
-        let arena_bytes = compiled.arena.bytes.max(forked_bytes);
-        let mut arena = Arena::reserve(arena_bytes, &pools)?;
+        // Each row-streamed table's cache opens over its host copy.
+        let hosts: Vec<(u32, u64)> = pools
+            .row_params()
+            .into_iter()
+            .filter_map(|param| match weights.table().0.get(param as usize) {
+                Some(Some(crate::run::WeightRow::Dense(table))) => Some((param, table.ptr)),
+                _ => None,
+            })
+            .collect();
+        pools.seat_rows(&hosts)?;
+        // And each expert shape's, over its banks' host copies.
+        let hosts: Vec<(u32, u64)> = pools
+            .expert_params()
+            .into_iter()
+            .filter_map(|param| match weights.table().0.get(param as usize) {
+                Some(Some(crate::run::WeightRow::Dense(bank))) => Some((param, bank.ptr)),
+                Some(Some(crate::run::WeightRow::Planes { codes, .. })) => Some((param, codes.ptr)),
+                _ => None,
+            })
+            .collect();
+        // A packed bank's planes share its codes' table.
+        let groups: Vec<(u32, Vec<Option<u32>>)> = pools
+            .expert_params()
+            .into_iter()
+            .filter_map(|param| {
+                let planes = crate::store::layout::packed_planes(&boot.trace, param as usize);
+                (!planes.is_empty()).then_some((param, planes))
+            })
+            .collect();
+        pools.seat_experts(&hosts, &groups)?;
+        // Committed whole: a fire reading out past one row a lane (a verify
+        // reads every row) would otherwise grow it outside the fit.
         let unscored = compiled.arena.scores_from(&boot.trace).max(
             compiled
                 .arena_forked
                 .as_ref()
                 .map_or(0, |forked| forked.scores_from(&boot.trace)),
         );
+        // The activation rungs a pool may drop to (SPEC decision 6), each a
+        // bucket's carve laid at the reservation's end.
+        let rungs = activation_rungs(&boot.trace, &budgets, &compiled)?;
+        eprintln!(
+            "engine-cuda: activation rungs {:?} under an arena of {arena_bytes} bytes",
+            rungs
+                .iter()
+                .map(|(tokens, map)| (*tokens, map.bytes))
+                .collect::<Vec<_>>(),
+        );
+        // What each carve laid at the end reads before its scores.
+        let prefixes: Vec<(u64, u64)> = std::iter::once(&compiled.arena)
+            .chain(compiled.arena_forked.as_ref())
+            .chain(rungs.iter().map(|(_, map)| map))
+            .map(|map| (map.bytes, map.scores_from(&boot.trace)))
+            .collect();
+        let mut arena = Arena::reserve(arena_bytes).with_rungs(rungs, prefixes);
         arena.ensure(&mut pools, unscored)?;
+        if arena.has_rungs() {
+            pools.fit_range_whole();
+        }
         let predicate = crate::store::rs::Predicate::reserve(
             boot.budget.max_lanes,
             crate::store::rs::snapshots(&boot.trace, |k_dim| {
@@ -926,17 +1098,16 @@ impl Shell {
                     true
                 }
             }) > 0,
+            pools.ids_a_lane(),
         )?;
-        let spaces = boot
-            .trace
-            .caches
-            .iter()
-            .filter_map(|row| match row {
-                poem_ir::CacheRow::Kv { space, .. } => Some(*space as usize + 1),
-                poem_ir::CacheRow::State { .. } => None,
-            })
-            .max()
-            .unwrap_or(0);
+        pools.seat_tables(
+            crate::window::lane_capacity(boot.budget.max_lanes),
+            boot.budget
+                .max_lanes
+                .saturating_mul(crate::store::rs::SNAPSHOTS),
+        );
+        // A page table a kv shape: the full rows' and the windowed rows'.
+        let page_tables = pools.geometries();
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
             boot.trace.values.iter().find_map(|decl| {
                 let (
@@ -1001,7 +1172,7 @@ impl Shell {
         let inputs = Inputs::reserve(
             &boot.budget,
             paging,
-            spaces,
+            page_tables,
             &facts,
             compiled.classes.classes.len(),
             compiled.template().len(),
@@ -1016,6 +1187,8 @@ impl Shell {
             feeds.selections.len(),
             !masked.is_empty() || !wide.is_empty(),
             &schedule_streams(&boot.trace, &compiled),
+            pools.ids_a_lane(),
+            buffers.as_ref().map(crate::store::rs::Buffers::page_tokens),
         )?;
 
         let exports = Exports::of(&boot.trace, &compiled)?;
@@ -1066,13 +1239,14 @@ impl Shell {
             predicate,
             inputs,
             facts,
-            spaces,
+            page_tables,
             masked,
             wide,
             feeds,
             adapter_fact,
             corrected,
             decoding,
+            drafting_words,
             tiers,
             landing,
             armed: None,
@@ -1087,21 +1261,32 @@ impl Shell {
             exports,
             graphs: engine.graphs,
             copies: engine.copies,
-            one_frame_when_short: engine.one_frame_when_short,
             seated_first: engine.seated_first,
             seat_to_end: engine.seat_to_end,
             seat_spread: engine.seat_spread,
             prefill_lanes: engine.prefill_lanes,
+            fire_lanes: engine.fire_lanes,
+            lattice: (!stated_buckets && engine.prefill_lattice_from > 0).then_some((
+                engine.lattice_steps,
+                engine.prefill_lattice_from,
+                engine.prefill_lattice_steps,
+            )),
             pad: engine.recording.pad(),
             golden_arm: Golden::Off,
             bodies: engine.recording.bodies(),
             bodies_mem: (engine.recording.bodies_mem() as usize).saturating_mul(1 << 20),
+            // An operator's allowance (the user's profile, or a pinned one)
+            // is a hard cap; a profile's default may stretch while arming.
+            bodies_stated,
+            bodies_ceiling: 0,
             decoded_tiles: Vec::new(),
             arming: false,
             armed_body: None,
+            arm_cold: false,
+            arm_rs: crate::record::RsBody::Folds,
+            arm_deferred: false,
             segments: std::collections::HashMap::new(),
             windows_memo: Vec::new(),
-            last: FireCost::default(),
             cache: {
                 let mut cache = GraphCache::new();
                 cache.watch(airborne.clone());
@@ -1120,20 +1305,6 @@ impl Shell {
             rs_ahead: std::collections::HashMap::new(),
             _released: Released,
         };
-        if shell.weights.rotating() && shell.graphs.records() {
-            eprintln!(
-                "engine-cuda: engine.graphs is on but this load armed a dense rotor, \
-                 so every fire walks eagerly and nothing is recorded — a rotation's \
-                 backpressure is a host cursor and a replayed graph has no walk{}",
-                if shell.bodies {
-                    "; the bodies path's load-time arming is skipped for the same reason, \
-                     since every rung it climbed would execute its warm fires and capture \
-                     nothing"
-                } else {
-                    ""
-                }
-            );
-        }
         if !shell.graphs.records() {
             eprintln!(
                 "engine-cuda: engine.graphs is {}, a diagnostic mode — every fire \
@@ -1193,9 +1364,9 @@ impl Shell {
                 Fault::Residency(format!(
                     "the card does not hold this deployment: the decoded-weight tile stream \
                      {stream} decodes its widest plane into, {tile} bytes, would not allocate \
-                     beside the weights, activations and inputs ({why}). Lower `[model] \
-                     device_weight_budget`, raise `[model] device_memory_share`, or free what \
-                     else holds the device."
+                     beside the weights, activations and inputs ({why}). Raise `[model] \
+                     device_memory_share`, serve a quantized deployment of the model, or free \
+                     what else holds the device."
                 ))
             })?;
             decoded = decoded.saturating_add(tile);
@@ -1261,9 +1432,17 @@ impl Shell {
         let fitted = shell.pools.fit_the_card(
             bodies,
             held_for_fires.saturating_add(scratch_growth),
+            false,
+            !shell.bodies_stated,
             &resident,
         )?;
-        if fitted.bodies < bodies {
+        // The most a profile's allowance may stretch to while arming.
+        shell.bodies_ceiling = usize::try_from(fitted.bodies).unwrap_or(usize::MAX);
+        // The carves laid at the activation's end, backed where the range
+        // now lies (the fit may have reserved it anew).
+        shell.arena.ensure_rungs(&mut shell.pools)?;
+        let afforded = fitted.bodies - fitted.stretch;
+        if afforded < bodies {
             eprintln!(
                 "engine-cuda: [engine] bodies_mem {} MiB is held down to {} MiB on this card: \
                  with the weights, activations and inputs resident, one sequence at the declared \
@@ -1271,31 +1450,17 @@ impl Shell {
                  and the cache rows together, and the bodies take at most a quarter of it. \
                  State a smaller bodies_mem to choose it.",
                 bodies >> 20,
-                fitted.bodies >> 20,
+                afforded >> 20,
                 fitted.spare >> 20,
             );
-            shell.bodies_mem = usize::try_from(fitted.bodies).unwrap_or(usize::MAX);
-        }
-        if (fitted.slots as usize) < shell.held.len() {
-            eprintln!(
-                "engine-cuda: [engine] max_state_slots {} is served at {} on this card: the \
-                 recurrent slab is declared for every slot, and at {} the kv pages beside it \
-                 seated fewer sequences than there were slots, so the slots were cut to where \
-                 the two seat alike, or to half of the room past one sequence where that is \
-                 more; the pool seats {} sequences at the declared context. State a smaller \
-                 max_state_slots to choose it.",
-                shell.held.len(),
-                fitted.slots,
-                shell.held.len(),
-                fitted.fit / u64::from(shell.pools.paging().pages_per_slot),
-            );
-            shell.held.truncate(fitted.slots as usize);
+            shell.bodies_mem = usize::try_from(afforded).unwrap_or(usize::MAX);
         }
         Ok(Staged {
             shell,
             held_for_fires,
             rank: boot.world.rank,
             arm_trace: boot.knobs.diagnostics.arm_trace,
+            weights_held: boot.knobs.weights_held,
             device_total,
             free_before,
         })
@@ -1308,6 +1473,8 @@ pub struct Staged {
     held_for_fires: u64,
     rank: u32,
     arm_trace: bool,
+    /// The load was told its weights are held (`Knobs::weights_held`).
+    weights_held: bool,
     device_total: u64,
     free_before: u64,
 }
@@ -1320,6 +1487,7 @@ impl Staged {
             held_for_fires,
             rank,
             arm_trace,
+            weights_held,
             device_total,
             free_before,
         } = self;
@@ -1329,9 +1497,48 @@ impl Staged {
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
-        shell.arm_bodies()?;
+        // Weights left in the serving file are on no tier a fire can read:
+        // they are seated in the pool before the lattice is armed over them.
+        // So are those a load told they are held keeps a host copy of
+        // (planes laid at load, which the file does not hold as served).
+        let filed = shell
+            .weights
+            .experts()
+            .is_some_and(|tier| tier.plan().files());
+        let held_copied = weights_held
+            && shell
+                .weights
+                .experts()
+                .is_some_and(|tier| !tier.plan().cached_experts().is_empty());
+        if filed || held_copied {
+            shell.preseat_weights(filed, held_copied)?;
+        }
+        // A load whose weights the pool does not hold whole streams them:
+        // armed now, its bodies would read every expert from the host copy,
+        // over the bus, fire after fire. It arms at the starting weight
+        // residency instead, over the slots the cache then holds, and the
+        // fit keeps the bodies' allowance out of the cache rows till then.
+        let deferred =
+            shell.ep.is_none() && shell.records_bodies() && !shell.pools.weights_seated_whole();
+        if deferred {
+            shell.arm_deferred = true;
+            eprintln!(
+                "engine-cuda: this load streams its weights; its bodies arm at the starting \
+                 weight residency, over the slots the cache holds then"
+            );
+        } else {
+            shell.arm_bodies()?;
+        }
         let resident = footprint(&shell, device_total, free_before);
-        let fitted = shell.pools.fit_the_card(0, held_for_fires, &resident)?;
+        // Arming fired every composition, so the activation is at its high
+        // water; a load that records no bodies, or arms at its starting
+        // weight residency, has fired none yet, and keeps the bodies'
+        // allowance out of the cache rows till it arms.
+        let settled = shell.records_bodies() && !deferred;
+        let bodies = if deferred { shell.bodies_mem as u64 } else { 0 };
+        let fitted = shell
+            .pools
+            .fit_the_card(bodies, held_for_fires, settled, false, &resident)?;
         if arm_trace {
             eprintln!(
                 "[arm-trace] cache rows sized to {} pages ({} MiB, {} sequences at the declared \
@@ -1686,6 +1893,9 @@ fn adapter_fact(classes: &poem_ir::ClassTable, corrected: &poem_ir::ClassSet) ->
 pub(super) struct Baked {
     pub(super) device: Context,
     pub(super) engine: crate::chip::Engine,
+    /// The bodies' allowance is the operator's (a user or pinned profile
+    /// states `[engine] recording`): a hard cap.
+    pub(super) bodies_stated: bool,
     pub(super) compiled: CompiledModel,
     pub(super) budgets: Budgets,
     pub(super) profile: DeviceProfile,
@@ -1693,10 +1903,10 @@ pub(super) struct Baked {
     pub(super) regions: std::collections::BTreeMap<u64, kernels_ir::Region>,
     /// The anchored region each `fused.anchored` of the trace names, by key.
     pub(super) anchored: std::collections::BTreeMap<u64, kernels_ir::Anchored>,
-    /// The state slots `Pools::keep_slots` keeps, before the lanes cap them.
-    pub(super) kept_slots: u32,
     /// The budget asked before the card cut its tokens at the asked lanes.
     pub(super) asked: Budget,
+    /// Whether the load stated its buckets (no default lattice to coarsen).
+    pub(super) stated_buckets: bool,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,
@@ -1717,4 +1927,37 @@ fn walk_fire_fit(trace: &poem_ir::Trace, rows: u32, sms: u32) -> Option<u32> {
         })
         .max()?;
     Some((sms / heads.max(1)).max(1) * rows)
+}
+
+/// The activation rungs below the largest (SPEC decision 6): for each of
+/// [`poem_compiler::ACTIVATION_RUNGS`], the largest bucket at most that
+/// many tokens and its carve, where that carve is smaller than the arena
+/// for every fire. Smallest first.
+fn activation_rungs(
+    trace: &poem_ir::Trace,
+    budgets: &Budgets,
+    compiled: &CompiledModel,
+) -> Result<Vec<(u32, poem_compiler::ArenaMap)>> {
+    let max = budgets.tokens.max_tokens;
+    let mut tokens: Vec<u32> = poem_compiler::ACTIVATION_RUNGS
+        .iter()
+        .filter_map(|&rung| {
+            budgets
+                .tokens
+                .buckets
+                .iter()
+                .copied()
+                .filter(|&bucket| bucket <= rung && bucket < max)
+                .max()
+        })
+        .collect();
+    tokens.dedup();
+    let mut rungs = Vec::new();
+    for rung in tokens {
+        let map = poem_compiler::arena_rung(trace, budgets, compiled, rung)?;
+        if map.bytes < compiled.arena.bytes {
+            rungs.push((rung, map));
+        }
+    }
+    Ok(rungs)
 }

@@ -49,9 +49,11 @@ struct Args {
     rel_log_floor: i32,
     rel_log_alpha: f32,
     rel_pad: i32,
+    /// Elements from a page's rows to the next page's, keys and values alike.
+    stride_page: i64,
 }
 
-const _: () = assert!(core::mem::size_of::<Args>() == 176);
+const _: () = assert!(core::mem::size_of::<Args>() == 184);
 
 /// A learned relative-position bias and Inkling's logit growth, as the
 /// matrix-core walks read it: `bias` f32 `[rows, heads · extent]`.
@@ -136,6 +138,7 @@ fn pool_args(
         page_size: pool.page_size,
         q_stride_n: (num_qo_heads * head_dim) as i32,
         q_stride_h: head_dim as i32,
+        stride_page: kv::shared_page_elems(op, pool)?,
         ..Args::default()
     })
 }

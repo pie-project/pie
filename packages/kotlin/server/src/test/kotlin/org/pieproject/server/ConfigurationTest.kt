@@ -14,7 +14,7 @@ class ConfigurationTest {
         assertEquals(
             setOf(
                 "device_memory_share", "max_forward_tokens", "max_forward_requests",
-                "max_state_slots", "max_model_len", "sandbox_memory_mb", "max_concurrent_processes",
+                "max_model_len", "sandbox_memory_mb", "max_concurrent_processes",
             ),
             encoded(PieServer.Configuration()).keys,
         )

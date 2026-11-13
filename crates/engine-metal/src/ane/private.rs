@@ -85,7 +85,6 @@ pub struct Private {
     /// How many MLPs have been handed to the Neural Engine.
     splits: AtomicU64,
     /// How many projections have.
-    column_splits: AtomicU64,
     /// The fewest rows handed over (`kernel.ane.min_rows`).
     min_rows: u32,
     _buffers: Vec<Buffer>,
@@ -348,25 +347,53 @@ enum Job {
     Linear(Compiled<linear::Linear>, Arc<linear::Memory>, linear::Shape),
 }
 
+/// How often a compile is tried: the compiler service can drop its
+/// connection. A program it never compiles fails the load
+/// (`Shell::settle_ane`): served, the GPU would keep that work, which lands
+/// other bits.
+const COMPILE_TRIES: u32 = 8;
+
+/// `compile`'s answer, tried again after a refusal up to [`COMPILE_TRIES`].
+fn tried<T>(
+    what: &str,
+    compile: impl Fn() -> std::result::Result<T, String>,
+) -> std::result::Result<T, String> {
+    let mut attempt = 1;
+    loop {
+        match compile() {
+            Err(why) if attempt < COMPILE_TRIES => {
+                eprintln!(
+                    "ane: the Neural Engine {what} program did not compile ({why}); trying again"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)));
+                attempt += 1;
+            }
+            answer => return answer,
+        }
+    }
+}
+
 impl Job {
     fn run(self, cache: &std::path::Path) {
         let started = std::time::Instant::now();
         match self {
             Job::Mlp(slot, memory, shape) => {
-                let result = Ffn::compile(&shape, &memory, cache);
+                let result = tried("MLP", || Ffn::compile(&shape, &memory, cache));
                 match &result {
                     Ok(_) => eprintln!(
                         "ane: Neural Engine MLP program ready in {:.1}s",
                         started.elapsed().as_secs_f64()
                     ),
                     Err(why) => eprintln!(
-                        "ane: the Neural Engine MLP program did not compile ({why}); the GPU runs the MLP alone"
+                        "ane: the Neural Engine MLP program did not compile ({why}); the load is refused"
                     ),
                 }
                 let _ = slot.set(result);
             }
             Job::Linear(slot, memory, shape) => {
-                let result = linear::Linear::compile(&shape, &memory, cache);
+                let result = tried(&format!("{} -> {}", shape.k, shape.n), || {
+                    linear::Linear::compile(&shape, &memory, cache)
+                });
                 match &result {
                     Ok(_) => eprintln!(
                         "ane: Neural Engine {} -> {} program ready in {:.1}s",
@@ -375,7 +402,7 @@ impl Job {
                         started.elapsed().as_secs_f64()
                     ),
                     Err(why) => eprintln!(
-                        "ane: the Neural Engine {} -> {} program did not compile ({why}); the GPU runs it alone",
+                        "ane: the Neural Engine {} -> {} program did not compile ({why}); the load is refused",
                         shape.k, shape.n
                     ),
                 }
@@ -495,7 +522,6 @@ pub fn load(
         keys,
         status: status_host,
         splits: AtomicU64::new(0),
-        column_splits: AtomicU64::new(0),
         _buffers: keep,
     }))
 }
@@ -540,12 +566,6 @@ impl Private {
         self.splits.load(Ordering::Acquire)
     }
 
-    /// How many projections it has.
-    #[must_use]
-    pub fn column_splits(&self) -> u64 {
-        self.column_splits.load(Ordering::Acquire)
-    }
-
     /// The leading rows of a fire the Neural Engine takes an MLP's share of:
     /// all of them, or, when a few rows past a whole procedure would pad it to
     /// the next one, only the rows of that procedure, the GPU running the
@@ -576,7 +596,9 @@ impl Private {
             return None;
         }
         let site = self.mlp.as_ref()?;
-        let evaluation = site.ffn.get()?.as_ref().ok()?.evaluation(rows)?;
+        // A fire the Neural Engine could share waits for its program, so
+        // which fires split does not hang on how fast the compile ran.
+        let evaluation = site.ffn.wait().as_ref().ok()?.evaluation(rows)?;
         let split = site.layers.get(&layer)?.split;
         Some(Plan {
             split,
@@ -601,7 +623,7 @@ impl Private {
             return None;
         }
         let site = self.projections.get(index)?;
-        let evaluation = site.program.get()?.as_ref().ok()?.evaluation(rows)?;
+        let evaluation = site.program.wait().as_ref().ok()?.evaluation(rows)?;
         let view = site.layers.get(&layer)?.view;
         Some(Columns {
             view,
@@ -693,7 +715,6 @@ impl Private {
             let binding = &program.evaluations[plan.evaluation].1[(plan.layer & 1) as usize];
             self.handoff
                 .start(ctx, &program.program, binding, plan.at)?;
-            self.column_splits.fetch_add(1, Ordering::AcqRel);
         }
         Ok(())
     }

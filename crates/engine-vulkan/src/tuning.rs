@@ -1,6 +1,7 @@
 //! The hardware-dependent decisions engine-vulkan reads when it fires
 //! kernels-slang's entries, and [`Tuning`], the values one load runs under.
 
+use engine_gpu::tuning::{DecodeSplitMinKeys, MoeTileRows, SdpaTileRowsPerRequest};
 use profile::{Decision, Domain, Profile, Registry, Var};
 
 pub const FACTS: &[Var] = &[
@@ -10,6 +11,8 @@ pub const FACTS: &[Var] = &[
     // Multiprocessors or compute units; absent where no extension says.
     Var::fixed("cores", Domain::COUNT),
     Var::fixed("coopmat", Domain::Bool),
+    // A discrete GPU (`VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU`).
+    Var::fixed("discrete", Domain::Bool),
 ];
 
 pub const AXES: &[&str] = &["rows"];
@@ -113,23 +116,6 @@ pub enum MoePath {
     Coopmat,
 }
 
-/// The row tile a routed matmul sorts its pairs into, by pairs per expert;
-/// 1 leaves the pairs unsorted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(
-    id = "kernel.moe.tile_rows",
-    shape(per_expert: derived),
-    constant(set(1, 16, 32, 64)),
-    default = r#"[{ when = "per_expert < 2", value = 1 }, { when = "per_expert >= 32", value = 32 }, { value = 16 }]"#,
-    tune = search
-)]
-pub struct MoeTileRows(pub u32);
-
-/// The fewest rows per request that take the tiled attention kernel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.tile_rows_per_request", constant(range(1..=4096)), default = 32, tune = search)]
-pub struct SdpaTileRowsPerRequest(pub u32);
-
 /// How many workgroups a decode row's keys may split across.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(
@@ -150,11 +136,6 @@ pub enum DecodeSplit {
         per: u32,
     },
 }
-
-/// The fewest keys a split slice holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.split_min_keys", constant(range(1..=65_536)), default = 256, tune = search)]
-pub struct DecodeSplitMinKeys(pub u32);
 
 /// Invocations a decode attention workgroup walks a row's keys with: more
 /// walk more keys at once and merge more partial sums. The device's
@@ -265,36 +246,6 @@ impl Tuning {
         *self.profile.get::<MoePath>() == MoePath::Coopmat
     }
 
-    #[must_use]
-    pub fn moe_tile_rows(&self, pairs: u32, experts: u32) -> u32 {
-        if experts == 0 {
-            return 1;
-        }
-        let at = MoeTileRowsAt {
-            per_expert: i64::from(pairs / experts),
-        };
-        self.profile.pick::<MoeTileRows>(&at).0
-    }
-
-    /// The rows a batched route sorts into: every touched expert's run
-    /// padded to whole `kernel.moe.tile_rows` tiles; the pairs themselves
-    /// where the route stays unsorted.
-    #[must_use]
-    pub fn moe_sorted_rows(&self, pairs: u32, experts: u32) -> u32 {
-        let tile = self.moe_tile_rows(pairs, experts);
-        if tile <= 1 {
-            return pairs;
-        }
-        let touched = pairs.min(experts);
-        let bound = pairs.saturating_add(touched.saturating_mul(tile - 1));
-        bound.div_ceil(tile) * tile
-    }
-
-    #[must_use]
-    pub fn sdpa_tile_rows_per_request(&self) -> u32 {
-        self.profile.get::<SdpaTileRowsPerRequest>().0
-    }
-
     /// The profile's, halved until 32 lanes a row fit the invocation limit.
     #[must_use]
     pub fn sdpa_tile_rows(&self) -> u32 {
@@ -328,17 +279,107 @@ impl Tuning {
     }
 
     #[must_use]
-    pub fn sdpa_split_min_keys(&self) -> u32 {
-        self.profile.get::<DecodeSplitMinKeys>().0
-    }
-
-    #[must_use]
     pub fn sort_lanes(&self) -> u32 {
         if self.limits.invocations >= 1024 {
             1024
         } else {
             256
         }
+    }
+}
+
+impl engine_gpu::backend::Tactics for Tuning {
+    fn profile(&self) -> &profile::Profile {
+        Tuning::profile(self)
+    }
+
+    fn qmm_ladder(
+        &self,
+        rows: u32,
+        columns: u32,
+        contraction: u32,
+        bank: kernels_slang::Bank,
+    ) -> Vec<kernels_slang::linear::qmm::Qmm> {
+        crate::encode::qmm_ladder(self, rows, columns, contraction, bank)
+    }
+
+    /// The subgroup tier where every subgroup holds a 32-lane strip; four
+    /// strips a workgroup, the 4090's best at every scheme and row count
+    /// measured (kernels-slang.md §15).
+    fn kquant(&self) -> kernels_slang::linear::kquant::Tactic {
+        kernels_slang::linear::kquant::Tactic {
+            tier: if self.limits.lanes >= 32 {
+                kernels_slang::Tier::Subgroup
+            } else {
+                kernels_slang::Tier::Baseline
+            },
+            slices: 4,
+        }
+    }
+
+    /// Cooperative-matrix tiles where the profile takes them.
+    fn gemm(&self, _tier: kernels_slang::Tier) -> kernels_slang::linear::gemm::Tactic {
+        kernels_slang::linear::gemm::Tactic {
+            tier: if self.gemm_coopmat() {
+                kernels_slang::Tier::Coopmat
+            } else {
+                kernels_slang::Tier::Baseline
+            },
+        }
+    }
+
+    fn batch(&self, pairs: u32, experts: u32) -> kernels_slang::linear::moe::select::Batch {
+        kernels_slang::linear::moe::select::Batch {
+            tile: self.moe_tile_rows(pairs, experts),
+            padded: self.moe_sorted_rows(pairs, experts),
+            tier: if self.moe_coopmat() {
+                kernels_slang::Tier::Coopmat
+            } else {
+                kernels_slang::Tier::Baseline
+            },
+            sort_lanes: self.sort_lanes(),
+        }
+    }
+
+    fn routed_tier(&self, _tier: kernels_slang::Tier) -> kernels_slang::Tier {
+        kernels_slang::Tier::Baseline
+    }
+
+    fn lora_tier(&self) -> kernels_slang::Tier {
+        kernels_slang::Tier::Subgroup
+    }
+
+    /// Prefill tiles 16 rows of 16 lanes folding by shuffles where every
+    /// subgroup holds a row and the workgroup its 256 invocations (3.5x the
+    /// 32-lane tile on an RTX 4090), else 32 lanes a row through workgroup
+    /// memory.
+    fn sdpa(&self, _tier: kernels_slang::Tier, head_dim: u32) -> kernels_slang::attn::sdpa::Tactic {
+        let limits = self.limits;
+        let shuffles = limits.lanes >= 16 && limits.invocations >= 256;
+        kernels_slang::attn::sdpa::Tactic {
+            tier: kernels_slang::Tier::Subgroup,
+            narrow: limits.lanes < 32,
+            decode_threads: self.sdpa_decode_threads(head_dim),
+            tile_rows: if shuffles { 16 } else { self.sdpa_tile_rows() },
+            tile_lanes: if shuffles { 16 } else { 32 },
+            split_groups: self.sdpa_split_groups(),
+            split_min_keys: self.sdpa_split_min_keys(),
+            prefill_work: 0,
+        }
+    }
+
+    /// The recurrences fold their norms through subgroups, which every
+    /// Vulkan device this engine runs on has, any width; a register-state
+    /// recurrence runs at every row count.
+    fn recurrent(&self) -> kernels_slang::ssm::gdn_recurrent::Tactic {
+        kernels_slang::ssm::gdn_recurrent::Tactic {
+            tier: kernels_slang::Tier::Subgroup,
+            register_min_rows: 0,
+        }
+    }
+
+    fn sdpa_split_groups(&self) -> u32 {
+        Tuning::sdpa_split_groups(self)
     }
 }
 

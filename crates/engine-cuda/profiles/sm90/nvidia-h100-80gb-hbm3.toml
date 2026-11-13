@@ -66,7 +66,6 @@ seat_to_end = true
 # two recurrent-state slots a lane, so a hybrid trunk seats past the fixed 256, as the H200:
 # GLM-5.3-Flash mini8 c512 18.6k -> 22.3k, c1024 14.5k -> 23.1k (with the decode groups above);
 # Qwen3.8-27B c256 2.29k -> 2.32k, DeepSeek-V4 mini c512 45.0k -> 46.0k tok/s
-state_slots_per_lane = 2
 
 [compiler]
 synth_regions = false  # 1.2% faster end to end
@@ -166,7 +165,6 @@ measured = [
   "engine.graphs",
   "engine.host_planes",
   "engine.lattice_steps",
-  "engine.one_frame_when_short",
   "engine.prefill_lattice_from",
   "engine.prefill_lattice_steps",
   "engine.recording",

@@ -38,6 +38,16 @@ impl Shape {
                 format!("{channels} channels are odd, and this conv lands a bf16 pair a lane"),
             ));
         }
+        if state.piece_atoms < channels && !state.piece_atoms.is_multiple_of(2) {
+            return Err(refuse(
+                op,
+                format!(
+                    "the history is cut {} channels a piece, which splits the channel pair a \
+                     lane lands",
+                    state.piece_atoms
+                ),
+            ));
+        }
         nonzero(op, "the conv width this statement states", conv_width)?;
         nonzero(op, "the dilation this statement states", dilation)?;
         let hist = (conv_width - 1)
@@ -97,15 +107,11 @@ pub fn conv1d(
     ctx.fire(
         Fire::at(CONV1D, entry).apply(shape.grid(rows(OP, x)?)),
         &[
-            x.arg(),
-            weight.arg(),
-            state.bank.arg_mut(),
-            state.slots.arg(),
-            y.arg_mut(),
-            shape.channels.arg(),
-            shape.taps.arg(),
-            shape.dilation.arg(),
-        ],
+            &[x.arg(), weight.arg(), state.slots.arg(), y.arg_mut()][..],
+            &state.piece_args(true),
+            &[shape.channels.arg(), shape.taps.arg(), shape.dilation.arg()],
+        ]
+        .concat(),
     )
 }
 
@@ -125,18 +131,21 @@ pub fn conv1d_chunked(
     let shape = Shape::of(OP, x.data, weight, state, conv_width, dilation, y)?;
     rows(OP, x.data)?;
     ctx.fire(
-        Fire::at(CONV1D, entry).apply(shape.grid(requests(OP, x)?)),
+        Fire::at(CONV1D, state.entry(OP, entry)?).apply(shape.grid(requests(OP, x)?)),
         &[
-            x.data.arg(),
-            x.indptr.arg(),
-            weight.arg(),
-            state.bank.arg_mut(),
-            state.slots.arg(),
-            y.arg_mut(),
-            shape.channels.arg(),
-            shape.taps.arg(),
-            shape.dilation.arg(),
-        ],
+            &[
+                x.data.arg(),
+                x.indptr.arg(),
+                weight.arg(),
+                state.slots.arg(),
+                y.arg_mut(),
+            ][..],
+            &state.snap_table(),
+            &state.piece_args(true),
+            &[shape.channels.arg(), shape.taps.arg(), shape.dilation.arg()],
+            &state.snap_lane0(OP)?,
+        ]
+        .concat(),
     )
 }
 
@@ -159,20 +168,27 @@ pub fn conv1d_committed(
     let shape = Shape::of(OP, x, weight, state, conv_width, dilation, y)?;
     nonzero(OP, "extended rows", x.rows)?;
     ctx.fire(
-        Fire::at(CONV1D, entry).apply(shape.grid(window_lanes(OP, indptr)?)),
+        Fire::at(CONV1D, state.entry(OP, entry)?).apply(shape.grid(window_lanes(OP, indptr)?)),
         &[
-            x.arg(),
-            indptr.arg(),
-            committed.replay.arg(),
-            committed.commit.arg(),
-            committed.slots.arg(),
-            weight.arg(),
-            state.bank.arg_mut(),
-            y.arg_mut(),
-            stated(OP, committed.lane0)?.arg(),
-            shape.channels.arg(),
-            shape.taps.arg(),
-            shape.dilation.arg(),
-        ],
+            &[
+                x.arg(),
+                indptr.arg(),
+                committed.replay.arg(),
+                committed.commit.arg(),
+                committed.slots.arg(),
+                weight.arg(),
+                y.arg_mut(),
+            ][..],
+            &state.snap_table(),
+            &state.piece_args(true),
+            &[
+                stated(OP, committed.lane0)?.arg(),
+                shape.channels.arg(),
+                shape.taps.arg(),
+                shape.dilation.arg(),
+            ],
+            &state.snap_lane0(OP)?,
+        ]
+        .concat(),
     )
 }

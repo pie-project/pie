@@ -139,14 +139,14 @@ __global__ void pool_state_write(
     const u32* __restrict__ w_off,
     int width,
     int page_size,
-    int state_pitch) {
+    int state_pitch,
+    long long state_stride) {
     const int i = blockIdx.x;
 
     const int page = static_cast<int>(w_page[i]);
     const int off = static_cast<int>(w_off[i]);
     if (page < 0 || off < 0 || off >= page_size) return;
-    const long long slot = static_cast<long long>(page) * page_size + off;
-    const long long dst = slot * static_cast<long long>(state_pitch);
+    const long long dst = state_at(page, off, page_size, state_pitch, state_stride);
     const long long src = static_cast<long long>(i) * width;
     for (int d = threadIdx.x; d < width; d += blockDim.x) {
         state_kv[dst + d] = kv[src + d];
@@ -165,6 +165,7 @@ __global__ void index_block_mean_paged(
     int head_dim,
     int ratio,
     int page_size,
+    long long page_stride,
     const u32* __restrict__ win) {
     const int cb = blockIdx.x;
     if (win != nullptr && cb >= static_cast<int>(win[0])) return;
@@ -185,9 +186,9 @@ __global__ void index_block_mean_paged(
         for (int i = 0; i < ratio; ++i) {
             const int pos = bpos + i - (ratio - 1);
             if (pos < 0) continue;
-            const long long slot =
-                paged_slot(kv_page_indices, kv_page_indptr, req, pos, page_size);
-            acc += Elem<T>::to_f32(key_pages[slot * head_dim + d]);
+            const long long at =
+                paged_row(kv_page_indices, kv_page_indptr, req, pos, page_size, page_stride, head_dim);
+            acc += Elem<T>::to_f32(key_pages[at + d]);
         }
         orow[d] = Elem<T>::from_f32(acc / static_cast<float>(ratio));
     }
@@ -208,6 +209,7 @@ __global__ void pool_gather_paged(
     int coff,
     int page_size,
     int state_pitch,
+    long long state_stride,
     const u32* __restrict__ win) {
     // A staged fire seats more rows than it fills, and the boundary rows
     // past the live ones were never written this fire: only the window's
@@ -236,8 +238,8 @@ __global__ void pool_gather_paged(
             if (pos < 0) continue;
             const int col = ((i >= ratio) ? head_dim : 0) + d;
             const long long slot =
-                paged_slot(kv_page_indices, kv_page_indptr, req, pos, page_size);
-            float sc = Elem<T>::to_f32(state_score[slot * pitch + col]);
+                state_row(kv_page_indices, kv_page_indptr, req, pos, page_size, state_pitch, state_stride);
+            float sc = Elem<T>::to_f32(state_score[slot + col]);
             if (ape != nullptr) {
                 sc += ape[static_cast<long long>(pos % ratio) * width + col];
             }
@@ -254,14 +256,14 @@ __global__ void pool_gather_paged(
             if (pos < 0) continue;
             const int col = ((i >= ratio) ? head_dim : 0) + d;
             const long long slot =
-                paged_slot(kv_page_indices, kv_page_indptr, req, pos, page_size);
-            float sc = Elem<T>::to_f32(state_score[slot * pitch + col]);
+                state_row(kv_page_indices, kv_page_indptr, req, pos, page_size, state_pitch, state_stride);
+            float sc = Elem<T>::to_f32(state_score[slot + col]);
             if (ape != nullptr) {
                 sc += ape[static_cast<long long>(pos % ratio) * width + col];
             }
             const float e = __expf(sc - max_s);
             sum_e += e;
-            acc += e * Elem<T>::to_f32(state_kv[slot * pitch + col]);
+            acc += e * Elem<T>::to_f32(state_kv[slot + col]);
         }
         out[static_cast<long long>(c) * head_dim + d] =
             Elem<T>::from_f32(sum_e > 0.0f ? acc / sum_e : 0.0f);
@@ -289,6 +291,7 @@ __global__ void __launch_bounds__(256) pool_gather_vec(
     int coff,
     int page_size,
     int state_pitch,
+    long long state_stride,
     const u32* __restrict__ win) {
     const int cb = blockIdx.x;
     if (win != nullptr && cb >= static_cast<int>(win[0])) return;
@@ -314,7 +317,7 @@ __global__ void __launch_bounds__(256) pool_gather_vec(
     float* part = reinterpret_cast<float*>(pg_smem + ((window * 8 + 15) & ~15));
     for (int i = threadIdx.x; i < window; i += blockDim.x) {
         const int pos = bpos + i - (window - 1);
-        slots[i] = pos < 0 ? -1 : paged_slot(kv_page_indices, kv_page_indptr, req, pos, page_size);
+        slots[i] = pos < 0 ? -1 : state_row(kv_page_indices, kv_page_indptr, req, pos, page_size, state_pitch, state_stride);
     }
     __syncthreads();
 
@@ -331,8 +334,8 @@ __global__ void __launch_bounds__(256) pool_gather_vec(
         const int pos = bpos + i - (window - 1);
         const int col = ((i >= ratio) ? head_dim : 0) + lane * 8;
         T sc[8], kv[8];
-        *reinterpret_cast<uint4*>(sc) = *reinterpret_cast<const uint4*>(state_score + slot * pitch + col);
-        *reinterpret_cast<uint4*>(kv) = *reinterpret_cast<const uint4*>(state_kv + slot * pitch + col);
+        *reinterpret_cast<uint4*>(sc) = *reinterpret_cast<const uint4*>(state_score + slot + col);
+        *reinterpret_cast<uint4*>(kv) = *reinterpret_cast<const uint4*>(state_kv + slot + col);
         float bias[8];
         if (ape != nullptr) {
             const float4* a = reinterpret_cast<const float4*>(ape + static_cast<long long>(pos % ratio) * width + col);
@@ -417,11 +420,13 @@ __global__ void __launch_bounds__(256) pool_compress(
     const u32* __restrict__ out_indptr,
     int out_page_size,
     int out_div,
+    long long out_stride,
     int head_dim,
     int ratio,
     int coff,
     int page_size,
     int state_pitch,
+    long long state_stride,
     const bf16* __restrict__ s_kv,
     const bf16* __restrict__ s_score,
     const u32* __restrict__ s_page,
@@ -438,7 +443,7 @@ __global__ void __launch_bounds__(256) pool_compress(
         const int page = static_cast<int>(s_page[c]);
         const int off = static_cast<int>(s_off[c]);
         if (page >= 0 && off >= 0 && off < page_size) {
-            const long long dst = (static_cast<long long>(page) * page_size + off) * static_cast<long long>(state_pitch);
+            const long long dst = state_at(page, off, page_size, state_pitch, state_stride);
             const long long src = static_cast<long long>(c) * s_width;
             for (int d = threadIdx.x; d < s_width; d += blockDim.x) {
                 state_kv[dst + d] = s_kv[src + d];
@@ -467,7 +472,7 @@ __global__ void __launch_bounds__(256) pool_compress(
     __shared__ float red[8];
     for (int i = threadIdx.x; i < window; i += blockDim.x) {
         const int pos = bpos + i - (window - 1);
-        slots[i] = (pos < 0 || !held) ? -1 : paged_slot(kv_page_indices, kv_page_indptr, req, pos, page_size);
+        slots[i] = (pos < 0 || !held) ? -1 : state_row(kv_page_indices, kv_page_indptr, req, pos, page_size, state_pitch, state_stride);
     }
     __syncthreads();
 
@@ -484,8 +489,8 @@ __global__ void __launch_bounds__(256) pool_compress(
         const int pos = bpos + i - (window - 1);
         const int col = ((i >= ratio) ? head_dim : 0) + lane * 8;
         bf16 sc[8], kv[8];
-        *reinterpret_cast<uint4*>(sc) = *reinterpret_cast<const uint4*>(state_score + slot * pitch + col);
-        *reinterpret_cast<uint4*>(kv) = *reinterpret_cast<const uint4*>(state_kv + slot * pitch + col);
+        *reinterpret_cast<uint4*>(sc) = *reinterpret_cast<const uint4*>(state_score + slot + col);
+        *reinterpret_cast<uint4*>(kv) = *reinterpret_cast<const uint4*>(state_kv + slot + col);
         float bias[8];
         if (ape != nullptr) {
             const float4* a = reinterpret_cast<const float4*>(ape + static_cast<long long>(pos % ratio) * width + col);
@@ -578,12 +583,12 @@ __global__ void __launch_bounds__(256) pool_compress(
     if constexpr (FP8) {
         if (threadIdx.x < 32) {
             ::pie::kv_rows::ds_store_warp(
-                row, ::pie::kv_rows::ds_row(static_cast<std::uint8_t*>(out_pages), page, off, out_rows),
+                row, ::pie::kv_rows::ds_row(static_cast<std::uint8_t*>(out_pages), page, off, out_rows, out_stride),
                 static_cast<int>(threadIdx.x));
         }
     } else {
         bf16* dst = static_cast<bf16*>(out_pages) +
-                    (static_cast<long long>(page) * out_rows + off) * head_dim;
+                    static_cast<long long>(page) * out_stride + static_cast<long long>(off) * head_dim;
         for (int i = threadIdx.x; i < head_dim / 8; i += blockDim.x) {
             *reinterpret_cast<uint4*>(dst + 8 * i) = *reinterpret_cast<const uint4*>(row + 8 * i);
         }
@@ -601,6 +606,7 @@ __global__ void pool_store_entries(
     int head_dim,
     int page_size,
     int div,
+    long long page_stride,
     const u32* __restrict__ win) {
     const int cb = blockIdx.x;
     if (win != nullptr && cb >= static_cast<int>(win[0])) return;
@@ -610,10 +616,10 @@ __global__ void pool_store_entries(
         return;
     // A compact pool (`div` its ratio): the entry at its index, `page_size /
     // div` a page; else at the boundary's position.
-    const long long slot = paged_slot(kv_page_indices, kv_page_indptr,
-                                      boundary_req[c], boundary_pos[c] / div, page_size / div);
+    const long long at = paged_row(kv_page_indices, kv_page_indptr, boundary_req[c], boundary_pos[c] / div,
+                                   page_size / div, page_stride, head_dim);
     const T* src = entries + static_cast<long long>(c) * head_dim;
-    T* dst = comp_kv_pages + slot * head_dim;
+    T* dst = comp_kv_pages + at;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) dst[d] = src[d];
 }
 
@@ -638,6 +644,7 @@ __global__ void pool_lse_paged(
     int page_size,
     float scale,
     int compact,
+    long long page_stride,
     const u32* __restrict__ win) {
     const int qi = blockIdx.x;
 
@@ -673,9 +680,8 @@ __global__ void pool_lse_paged(
         const int c = kSel ? srow[n] : n;
         if (c < 0) break;
         if (c >= num_visible) continue;
-        const long long slot = entry_slot(kv_page_indices, kv_page_indptr, req, c, ratio,
-                                          page_size, compact);
-        const bf16* k_row = comp_kv_pages + slot * head_dim;
+        const bf16* k_row = comp_kv_pages + entry_row(kv_page_indices, kv_page_indptr, req, c, ratio,
+                                                      page_size, compact, page_stride, head_dim);
         float dot = 0.f;
         for (int d = 0; d < head_dim; ++d) {
             dot += q_smem[d] * bf16_to_f32(k_row[d]);
@@ -709,9 +715,8 @@ __global__ void pool_lse_paged(
         const int c = kSel ? srow[n] : n;
         if (c < 0) break;
         if (c >= num_visible) continue;
-        const long long slot = entry_slot(kv_page_indices, kv_page_indptr, req, c, ratio,
-                                          page_size, compact);
-        const bf16* k_row = comp_kv_pages + slot * head_dim;
+        const bf16* k_row = comp_kv_pages + entry_row(kv_page_indices, kv_page_indptr, req, c, ratio,
+                                                      page_size, compact, page_stride, head_dim);
         float dot = 0.f;
         for (int d = tid; d < head_dim; d += ATTN_BLOCK) {
             dot += q_smem[d] * bf16_to_f32(k_row[d]);

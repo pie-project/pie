@@ -32,7 +32,7 @@ use engine::fire::{FireTicket, FrameSubmission, FrameTicket, Step};
 use engine::load::{LoadRequest, Loaded};
 use engine::placement::Limits;
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine::transfer::{KvCopy, KvHandle, StateCopy};
+use engine::transfer::{KvCopy, KvHandle};
 
 /// What a rank brings to a step: its frame and the token bucket it asks.
 pub struct Arrival<F> {
@@ -817,8 +817,8 @@ impl Engine for Rank {
         self.with(|cuda| cuda.copy_kv(copy))
     }
 
-    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        self.with(|cuda| cuda.copy_state(copy))
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        self.with(|cuda| cuda.copy_slots(copy))
     }
 
     fn host_kv_layout(&self) -> Option<state::PageLayout> {
@@ -836,12 +836,19 @@ impl Engine for Rank {
         self.with(|cuda| cuda.write_host_kv(slots, bytes))
     }
 
-    fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> EngineResult<Vec<u8>> {
-        self.with(|cuda| cuda.read_host_state(slots, pages))
+    fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> EngineResult<Vec<u8>> {
+        self.with(|cuda| cuda.read_tier_slots(slots))
     }
 
-    fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> EngineResult<()> {
-        self.with(|cuda| cuda.write_host_state(slots, pages, bytes))
+    fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        self.with(|cuda| cuda.write_tier_slots(slots, bytes))
     }
 
     fn disconnect(&self, message: &str) {

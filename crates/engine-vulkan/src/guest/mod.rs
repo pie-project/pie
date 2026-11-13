@@ -1,97 +1,80 @@
-use engine::program::ProgramId;
-use std::collections::HashMap;
-use std::sync::Arc;
+//! The shared guest forms ([`engine_gpu::guest`]) bound to Vulkan: a
+//! stage's WGSL lowers to SPIR-V.
 
-use eta_compiler::codegen::launch::{LaunchPackage, LaunchStagePlan};
-use eta_compiler::codegen::wgsl;
+use engine_gpu::guest::Refused;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Refused {
-    Ops {
-        stage: usize,
+impl engine_gpu::guest::Lower for crate::device::Api {
+    type Code = Vec<u32>;
 
-        missing: Vec<(u8, &'static str)>,
-    },
-
-    Emitting {
-        stage: usize,
-
-        why: String,
-    },
-
-    Lowering {
-        stage: usize,
-
-        why: String,
-    },
-}
-
-impl std::fmt::Display for Refused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Ops { stage, missing } => {
-                let named = missing
-                    .iter()
-                    .map(|(tag, name)| format!("`{name}` ({tag:#04x})"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                write!(
-                    f,
-                    "stage {stage} runs {named}, which this backend emits no WGSL for, and a \
-                     guest pass runs on the device whole or not at all"
-                )
-            }
-            Self::Emitting { stage, why } => {
-                write!(f, "stage {stage} has no emitted WGSL: {why}")
-            }
-            Self::Lowering { stage, why } => write!(
-                f,
-                "stage {stage}'s emitted WGSL did not lower to SPIR-V: {why}"
-            ),
-        }
+    fn lower(stage: usize, source: String) -> Result<Vec<u32>, Refused> {
+        lower(stage, &source, &stage_layout())
     }
 }
 
-const ENTRY: &str = "main";
-
-pub fn entry_source(stage: usize, plan: &LaunchStagePlan) -> Result<String, Refused> {
-    every_op_emits(stage, plan)?;
-    wgsl::emit_launch_stage(ENTRY, plan).map_err(|why| Refused::Emitting {
-        stage,
-        why: why.to_string(),
-    })
+/// How a pipeline layout binds a buffer, which the shader's declaration of
+/// that binding must match: a mismatch is invalid usage a driver may run
+/// anyway, slowly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    Storage,
+    Uniform,
 }
 
-fn every_op_emits(stage: usize, plan: &LaunchStagePlan) -> Result<(), Refused> {
-    let mut missing: Vec<(u8, &'static str)> = Vec::new();
-    for op in &plan.ops {
-        if wgsl::is_boundary(op.tag) || wgsl::emits(op.tag) {
-            continue;
-        }
-        if !missing.iter().any(|&(tag, _)| tag == op.tag) {
-            missing.push((op.tag, eta_ir::op::spec(op.tag).map_or("?", |row| row.name)));
-        }
-    }
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(Refused::Ops { stage, missing })
-    }
+/// The layout every guest stage's pipelines bind (group 0): storage
+/// buffers, the config a uniform.
+#[must_use]
+pub fn stage_layout() -> Vec<(u32, Slot)> {
+    use engine_gpu::guest::session::{BINDINGS, CFG_BINDING};
+    (0..BINDINGS)
+        .map(|at| {
+            let slot = if at == CFG_BINDING {
+                Slot::Uniform
+            } else {
+                Slot::Storage
+            };
+            (at, slot)
+        })
+        .collect()
 }
 
-pub fn step_source(stage: usize, plan: &LaunchStagePlan) -> Result<wgsl::Stepwise, Refused> {
-    every_op_emits(stage, plan)?;
-    wgsl::emit_launch_steps(ENTRY, plan).map_err(|why| Refused::Emitting {
-        stage,
-        why: why.to_string(),
-    })
-}
-
+/// The descriptor type a layout binds `slot` as.
 #[cfg(feature = "vulkan")]
-pub fn lower(stage: usize, source: &str) -> Result<Vec<u32>, Refused> {
+#[must_use]
+pub fn descriptor_type(slot: Slot) -> ash::vk::DescriptorType {
+    match slot {
+        Slot::Storage => ash::vk::DescriptorType::STORAGE_BUFFER,
+        Slot::Uniform => ash::vk::DescriptorType::UNIFORM_BUFFER,
+    }
+}
+
+/// Lowers `source` to SPIR-V for a pipeline whose layout binds `layout`
+/// (group 0); refused where a buffer the shader declares is not bound as it
+/// declares it.
+#[cfg(feature = "vulkan")]
+pub fn lower(stage: usize, source: &str, layout: &[(u32, Slot)]) -> Result<Vec<u32>, Refused> {
     let refuse = |why: String| Refused::Lowering { stage, why };
     let module =
         naga::front::wgsl::parse_str(source).map_err(|e| refuse(e.emit_to_string(source)))?;
+    for (_, global) in module.global_variables.iter() {
+        let Some(binding) = &global.binding else {
+            continue;
+        };
+        let declared = match global.space {
+            naga::AddressSpace::Storage { .. } => Slot::Storage,
+            naga::AddressSpace::Uniform => Slot::Uniform,
+            _ => continue,
+        };
+        let bound = (binding.group == 0)
+            .then(|| layout.iter().find(|(at, _)| *at == binding.binding))
+            .flatten()
+            .map(|&(_, slot)| slot);
+        if bound != Some(declared) {
+            return Err(refuse(format!(
+                "binding {}.{} is declared {declared:?} and the pipeline layout binds {bound:?}",
+                binding.group, binding.binding
+            )));
+        }
+    }
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::all(),
@@ -102,116 +85,12 @@ pub fn lower(stage: usize, source: &str) -> Result<Vec<u32>, Refused> {
         .map_err(|e| refuse(e.to_string()))
 }
 
-pub struct Compiled {
-    stages: Vec<Lowered>,
-}
-
-pub struct Lowered {
-    pub words: Vec<u32>,
-
-    pub entries: Vec<String>,
-
-    pub strides_the_grid: bool,
-}
-
-impl std::fmt::Debug for Compiled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Compiled")
-            .field("stages", &self.stages.len())
-            .field(
-                "words",
-                &self.stages.iter().map(|s| s.words.len()).sum::<usize>(),
-            )
-            .field(
-                "dispatches",
-                &self.stages.iter().map(|s| s.entries.len()).sum::<usize>(),
-            )
-            .finish()
-    }
-}
-
-impl Compiled {
-    #[cfg(feature = "vulkan")]
-    pub fn of(package: &LaunchPackage) -> Result<Compiled, Refused> {
-        let mut stages = Vec::with_capacity(package.plans.len());
-        for (at, plan) in package.plans.iter().enumerate() {
-            let stepwise = step_source(at, plan)?;
-            stages.push(Lowered {
-                words: lower(at, &stepwise.source)?,
-                entries: stepwise.steps.into_iter().map(|step| step.entry).collect(),
-                strides_the_grid: true,
-            });
-        }
-        Ok(Compiled { stages })
-    }
-
-    #[must_use]
-    pub fn stage(&self, at: usize) -> Option<&Lowered> {
-        self.stages.get(at)
-    }
-
-    #[must_use]
-    pub fn all(&self) -> &[Lowered] {
-        &self.stages
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.stages.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.stages.is_empty()
-    }
-}
-
-#[derive(Default)]
-pub struct Forms {
-    compiled: HashMap<ProgramId, Arc<Compiled>>,
-
-    refused: HashMap<ProgramId, Refused>,
-}
-
-impl Forms {
-    #[cfg(feature = "vulkan")]
-    pub fn admit(&mut self, program: ProgramId, package: &LaunchPackage) -> bool {
-        match Compiled::of(package) {
-            Ok(compiled) => {
-                self.compiled.insert(program, Arc::new(compiled));
-                true
-            }
-            Err(why) => {
-                self.refused.insert(program, why);
-                false
-            }
-        }
-    }
-
-    #[cfg(not(feature = "vulkan"))]
-    pub fn admit(&mut self, _program: ProgramId, _package: &LaunchPackage) -> bool {
-        false
-    }
-
-    #[must_use]
-    pub fn get(&self, program: ProgramId) -> Option<&Arc<Compiled>> {
-        self.compiled.get(&program)
-    }
-
-    #[must_use]
-    pub fn refusal(&self, program: ProgramId) -> Option<&Refused> {
-        self.refused.get(&program)
-    }
-
-    pub fn forget(&mut self, program: ProgramId) {
-        self.compiled.remove(&program);
-        self.refused.remove(&program);
-    }
-
-    #[must_use]
-    pub fn tally(&self) -> (usize, usize) {
-        (self.compiled.len(), self.refused.len())
-    }
+#[cfg(not(feature = "vulkan"))]
+pub fn lower(stage: usize, _source: &str, _layout: &[(u32, Slot)]) -> Result<Vec<u32>, Refused> {
+    Err(Refused::Lowering {
+        stage,
+        why: "this build carries no Vulkan device".to_string(),
+    })
 }
 
 #[cfg(feature = "vulkan")]
@@ -220,3 +99,17 @@ pub mod run;
 pub mod session;
 #[cfg(feature = "vulkan")]
 pub mod widen;
+
+#[cfg(all(test, feature = "vulkan"))]
+mod tests {
+    use super::*;
+    use engine_gpu::guest::widen::{STORAGE_SOURCE, UNIFORM_SOURCE};
+
+    #[test]
+    fn a_binding_declared_unlike_its_layout_refuses_to_lower() {
+        let storage = [(0, Slot::Storage), (1, Slot::Storage), (2, Slot::Storage)];
+        assert!(lower(0, STORAGE_SOURCE, &storage).is_ok());
+        let refused = lower(0, UNIFORM_SOURCE, &storage).expect_err("binding 2 is a uniform");
+        assert!(refused.to_string().contains("binding 0.2"), "{refused}");
+    }
+}

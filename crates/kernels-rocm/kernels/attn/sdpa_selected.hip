@@ -21,7 +21,8 @@ __global__ __launch_bounds__(kBlock) void sdpa_paged_selected_kernel(
     const u32* __restrict__ qo_indptr, const u32* __restrict__ page_indices,
     const u32* __restrict__ page_indptr, const u32* __restrict__ last_page_lens,
     const i32* __restrict__ selection, bf16* __restrict__ o, i32 R, i32 H, i32 KVH, i32 D,
-    i32 page_size, float sm_scale, i32 top_k, i32 ratio, i32 G, i32 per_head, const u32* __restrict__ win) {
+    i32 page_size, i64 stride_page, float sm_scale, i32 top_k, i32 ratio, i32 G, i32 per_head,
+    const u32* __restrict__ win) {
     const Window window{win};
     const int t = static_cast<int>(blockIdx.x);
     if (!window.live(t)) return;
@@ -81,9 +82,10 @@ __global__ __launch_bounds__(kBlock) void sdpa_paged_selected_kernel(
             j = nblocks * ratio + (n - blocks * ratio);
             if (j >= j_end) continue;
         }
-        const long long slot = static_cast<long long>(page_indices[pages_first + j / page_size]) * page_size + j % page_size;
-        const bf16* kj = k_pages + (slot * KVH + kv_head) * D;
-        const bf16* vj = v_pages + (slot * KVH + kv_head) * D;
+        const long long slot = static_cast<long long>(page_indices[pages_first + j / page_size]) * stride_page +
+                               static_cast<long long>(j % page_size) * KVH * D;
+        const bf16* kj = k_pages + slot + kv_head * D;
+        const bf16* vj = v_pages + slot + kv_head * D;
 
         float pd = 0.f;
 #pragma unroll
@@ -183,7 +185,7 @@ __global__ __launch_bounds__(kSelThreads) void sdpa_selected_mfma(
     const u32* __restrict__ page_indices, const u32* __restrict__ page_indptr,
     const u32* __restrict__ last_page_lens, const i32* __restrict__ selection,
     bf16* __restrict__ o, float* __restrict__ part, i32 R, i32 H, i32 KVH, i32 page_size,
-    float scale_log2, i32 top_k, i32 ratio, i32 per_head, const u32* __restrict__ win) {
+    i64 stride_page, float scale_log2, i32 top_k, i32 ratio, i32 per_head, const u32* __restrict__ win) {
     constexpr int WAVES = kSelWaves, SUB = 16, KP = D / 32;
     // Columns a lane accumulates: four in a wide group, whose eight would not
     // fit the registers beside the round's reads.
@@ -197,7 +199,9 @@ __global__ __launch_bounds__(kSelThreads) void sdpa_selected_mfma(
     __shared__ float alph[WAVES][G];
     __shared__ float part_m[WAVES][G], part_l[WAVES][G];
     __shared__ float part_o[WAVES][HG][D];
-    __shared__ i32 table[kSelTable];
+    // A window key's row, an element offset of both planes (its page's
+    // `stride_page` apart, its row within the page).
+    __shared__ i64 table[kSelTable];
     __shared__ int wsum[WAVES];
 
     const Window window{win};
@@ -273,12 +277,10 @@ __global__ __launch_bounds__(kSelThreads) void sdpa_selected_mfma(
         const int at0 = block_exclusive_scan(count, wsum, n);
         for (int r = 0; r < count; ++r) {
             const int j = j0 + r;
-            table[at0 + r] = static_cast<i32>(pidx[j / page_size]) * page_size + j % page_size;
+            table[at0 + r] = static_cast<i64>(pidx[j / page_size]) * stride_page + static_cast<i64>(j % page_size) * pitch;
         }
         __syncthreads();
-        auto kv_row = [&](int key) {
-            return static_cast<long long>(table[min(key, n - 1)]) * pitch + head_off;
-        };
+        auto kv_row = [&](int key) { return table[min(key, n - 1)] + head_off; };
 
         for (int t0 = wave * SUB; t0 < n; t0 += WAVES * SUB) {
             // The round's key and value reads, all issued before any is used

@@ -297,25 +297,25 @@ pub fn kv_append(
     }
     let width = width.div_ceil(2);
 
-    let values = if k_pe.width == 0 {
-        pool.keys
-    } else {
-        pool.values
-    };
+    let values = usize::from(k_pe.width != 0);
     ctx.fire(
         Fire::at(MLA, entry).apply(Grid::of([width, rows, 1], [256, 1, 1])),
         &[
-            kv_c.arg(),
-            k_pe.arg(),
-            pool.keys.arg_mut(),
-            values.arg_mut(),
-            write_page.arg(),
-            write_offset.arg(),
-            pool.page_size.arg(),
-            stated(OP, kv_c.width)?.arg(),
-            stated(OP, k_pe.width)?.arg(),
-            stated(OP, rows)?.arg(),
-        ],
+            &[kv_c.arg(), k_pe.arg(), write_page.arg(), write_offset.arg()][..],
+            &pool.pool.args(true),
+            &[
+                pool.pool.words.arg(),
+                pool.origin[0].arg(),
+                pool.origin[values].arg(),
+                pool.page_stride[0].arg(),
+                pool.page_stride[values].arg(),
+                pool.page_size.arg(),
+                stated(OP, kv_c.width)?.arg(),
+                stated(OP, k_pe.width)?.arg(),
+                stated(OP, rows)?.arg(),
+            ],
+        ]
+        .concat(),
     )
 }
 
@@ -354,12 +354,12 @@ fn flash(
     }
 
     let (kpe, q_pe, values) = if q_pe.width == 0 {
-        (0, q, pool.keys)
+        (0, q, 0)
     } else {
         (
             latent_strip(op, "rope width", q_pe.width / heads, MAX_KPE)?,
             q_pe,
-            pool.values,
+            1,
         )
     };
     debug_assert!(
@@ -373,13 +373,16 @@ fn flash(
     let mut args = vec![
         q.arg(),
         q_pe.arg(),
-        pool.keys.arg(),
-        values.arg(),
         o.arg_mut(),
         positions.arg(),
         request_of_token.arg(),
         pool.page_indices.arg(),
         pool.page_indptr.arg(),
+        pool.pool.words.arg(),
+        pool.origin[0].arg(),
+        pool.origin[values].arg(),
+        pool.page_stride[0].arg(),
+        pool.page_stride[values].arg(),
         pool.page_size.arg(),
         stated(op, heads)?.arg(),
         ckv.arg(),
@@ -400,6 +403,8 @@ fn flash(
         args.push(selection.arg());
         args.push(stated(op, nonzero(op, "the selection budget", selection.width)?)?.arg());
     }
+    // The segments bind after every other buffer.
+    args.extend(pool.pool.args(false));
     ctx.fire(
         Fire::at(MLA, entry).apply(Grid::of([heads * LANES, rows, 1], [LANES, 1, 1])),
         &args,

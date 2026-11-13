@@ -36,15 +36,13 @@ constexpr int CH = 64;
 
 struct Params {
     const float* gates;
-    __nv_bfloat16* state;
-    const int* slot_ids;
+    StateRows rows;
     const u32* qo_indptr;
     const int* commit_len;
     const int* begin_at;
     const u8* write_state_mask;
     float* out;
     const u32* win;
-    long long slot_stride;
     int lanes;
     int K_h;
     int V_h;
@@ -180,7 +178,7 @@ __device__ __forceinline__ bool next_tile(const Params& p, int lanes, Walk& w) {
     for (; w.tile < lanes * p.V_h; w.tile += static_cast<int>(gridDim.x)) {
         w.r = w.tile / p.V_h;
         w.h = w.tile % p.V_h;
-        w.lane = gdn_lane(w.r, p.qo_indptr, p.slot_ids, p.commit_len, p.begin_at, p.win);
+        w.lane = gdn_lane(w.r, p.qo_indptr, p.rows, p.commit_len, p.begin_at, p.win);
         if (w.lane.T <= 0 || w.lane.slot < 0) continue;
         w.nch = (w.lane.T + CH - 1) / CH;
         w.j = 0;
@@ -661,8 +659,8 @@ __global__ void __launch_bounds__(384, 1) gdn_chunked(
                 const float* FD = G + 6 * CH;
                 const int ta = w.lane.t0 + w.j * CH;
                 const int L = min(CH, w.lane.t0 + w.lane.T - ta);
-                __nv_bfloat16* st = p.state + static_cast<long long>(w.lane.slot) * p.slot_stride +
-                                    static_cast<long long>(w.h) * 128 * 128;
+                __nv_bfloat16* st =
+                    p.rows.atom<__nv_bfloat16>(p.rows.row(w.lane.rl), w.h, 128 * 128);
                 bar_wait(kv_done, (c & 1) ^ 1);
                 tc_fence_after();
                 if (v == 0 && c >= 1 && lmore) {

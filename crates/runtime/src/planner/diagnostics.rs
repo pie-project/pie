@@ -9,10 +9,6 @@ use super::{ProcessId, ResidencyPlanner};
 
 #[derive(Debug, Clone)]
 pub struct PlannerQueueEntry {
-    pub process_id: String,
-    pub spawn_seq: u64,
-    pub kind: &'static str,
-    pub pages: u32,
     pub rs: RsUnits,
 }
 
@@ -46,12 +42,10 @@ pub struct PlannerDiagnostics {
     pub restores_total: u64,
     pub restore_failures_total: u64,
     pub gate_parks_total: u64,
-    pub cancelled_waits_total: u64,
     pub hog_failures_total: u64,
     pub starvations_total: u64,
     pub starvation_restarts_total: u64,
     pub salvages_total: u64,
-    pub hoard_bypasses_total: u64,
     pub e6_relaxations_total: u64,
     pub restore_absorb_short_total: u64,
     pub host_swap_exhaustions_total: u64,
@@ -59,6 +53,7 @@ pub struct PlannerDiagnostics {
     pub d2h_pages_total: u64,
     pub h2d_pages_total: u64,
     pub disk_write_pages_total: u64,
+    pub host_disk_pages_total: u64,
     pub disk_read_pages_total: u64,
     pub disk_write_us_total: u64,
     pub disk_read_us_total: u64,
@@ -78,11 +73,7 @@ impl ResidencyPlanner {
         let queue = inner
             .queue
             .iter()
-            .map(|(key, waiter)| PlannerQueueEntry {
-                process_id: waiter.pid.to_string(),
-                spawn_seq: key.0.seq,
-                kind: waiter.kind_name(),
-                pages: waiter.kv_need(),
+            .map(|(_, waiter)| PlannerQueueEntry {
                 rs: waiter.rs_need(),
             })
             .collect();
@@ -173,12 +164,10 @@ impl ResidencyPlanner {
             restores_total: self.stats.restores.load(Relaxed),
             restore_failures_total: self.stats.restore_failures.load(Relaxed),
             gate_parks_total: self.stats.gate_parks.load(Relaxed),
-            cancelled_waits_total: self.stats.cancelled_waits.load(Relaxed),
             hog_failures_total: self.stats.hog_failures.load(Relaxed),
             starvations_total: self.stats.starvations.load(Relaxed),
             starvation_restarts_total: self.stats.starvation_restarts.load(Relaxed),
             salvages_total: self.stats.salvages.load(Relaxed),
-            hoard_bypasses_total: self.stats.hoard_bypasses.load(Relaxed),
             e6_relaxations_total: self.stats.e6_relaxations.load(Relaxed),
             restore_absorb_short_total: self.stats.restore_absorb_short.load(Relaxed),
             host_swap_exhaustions_total: self.stats.host_swap_exhaustions.load(Relaxed),
@@ -186,6 +175,7 @@ impl ResidencyPlanner {
             d2h_pages_total: self.stats.d2h_pages.load(Relaxed),
             h2d_pages_total: self.stats.h2d_pages.load(Relaxed),
             disk_write_pages_total: self.stats.disk_write_pages.load(Relaxed),
+            host_disk_pages_total: self.stats.host_disk_pages.load(Relaxed),
             disk_read_pages_total: self.stats.disk_read_pages.load(Relaxed),
             disk_write_us_total: self.stats.disk_write_us.load(Relaxed),
             disk_read_us_total: self.stats.disk_read_us.load(Relaxed),

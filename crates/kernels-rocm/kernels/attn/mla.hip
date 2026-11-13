@@ -211,14 +211,16 @@ __device__ __forceinline__ void copy_row(const T* __restrict__ src, T* __restric
 // The step's new latent (and rope) rows into their cache slots: row t of
 // request r lands at kv position (kv_len_r − new_r) + (t − qo_lo_r). One
 // block per row; `kpe` null appends the latent plane alone. FP8 lands both
-// as one fp8 row of `ckv_pages` (eight codes a thread).
+// as one fp8 row of `ckv_pages` (eight codes a thread). The planes' pages
+// lie `ckv_stride` and `kpe_stride` elements apart.
 template <bool FP8>
 __global__ void mla_kv_append(const bf16* __restrict__ ckv, const bf16* __restrict__ kpe,
                               bf16* __restrict__ ckv_pages, bf16* __restrict__ kpe_pages,
                               const i32* __restrict__ qo_indptr, const i32* __restrict__ page_indices,
                               const i32* __restrict__ page_indptr, const i32* __restrict__ last_page_lens,
                               const u8* __restrict__ row_valid, int requests, int page_size, int rank,
-                              int rope, const u32* __restrict__ win) {
+                              int rope, long long ckv_stride, long long kpe_stride,
+                              const u32* __restrict__ win) {
     const Window window{win};
     const int t = blockIdx.x;
     if (!window.live(t)) return;
@@ -230,11 +232,11 @@ __global__ void mla_kv_append(const bf16* __restrict__ ckv, const bf16* __restri
     const int kv_len = paged_len(page_indptr, last_page_lens, r, page_size);
     const int pos = kv_len - (qo_indptr[r + 1] - qo_indptr[r]) + (t - qo_indptr[r]);
     if (pos < 0) return;
-    const long long slot =
-        static_cast<long long>(page_indices[page_indptr[r] + pos / page_size]) * page_size + pos % page_size;
+    const long long page = page_indices[page_indptr[r] + pos / page_size];
+    const long long off = pos % page_size;
     if constexpr (FP8) {
         const int w = rank + (kpe != nullptr ? rope : 0);
-        u8* dst = reinterpret_cast<u8*>(ckv_pages) + slot * w;
+        u8* dst = reinterpret_cast<u8*>(ckv_pages) + page * ckv_stride + off * w;
         for (int i = 8 * threadIdx.x; i < w; i += 8 * blockDim.x) {
             const bf16* src = i < rank ? ckv + row * rank + i : kpe + row * rope + (i - rank);
             const Pack8<bf16> x = *reinterpret_cast<const Pack8<bf16>*>(src);
@@ -244,8 +246,8 @@ __global__ void mla_kv_append(const bf16* __restrict__ ckv, const bf16* __restri
         }
         return;
     }
-    copy_row(ckv + row * rank, ckv_pages + slot * rank, rank);
-    if (kpe != nullptr && rope > 0) copy_row(kpe + row * rope, kpe_pages + slot * rope, rope);
+    copy_row(ckv + row * rank, ckv_pages + page * ckv_stride + off * rank, rank);
+    if (kpe != nullptr && rope > 0) copy_row(kpe + row * rope, kpe_pages + page * kpe_stride + off * rope, rope);
 }
 
 // ---------------------------------------------------------------- keys --
@@ -253,11 +255,13 @@ __global__ void mla_kv_append(const bf16* __restrict__ ckv, const bf16* __restri
 // The keys a query row walks: list entry n names key position
 // p = sel ? sel[n] : n, visible when 0 <= p <= limit; key p's row is cell
 // (p + 1)·ratio − 1 of the request's pages (ratio 1: the token itself; a
-// compressed pool keeps its entry at the last cell of each block).
+// compressed pool keeps its entry at the last cell of each block). The
+// latent (rope) plane's pages lie `ckv_stride` (`kpe_stride`) elements apart.
 struct LatentKeys {
     const i32* sel;
     const i32* pages;
     int page_size;
+    long long ckv_stride, kpe_stride;
     int ratio;
     int n0, n1;
     int limit;
@@ -268,8 +272,15 @@ struct LatentKeys {
     __device__ __forceinline__ bool visible(int p) const { return p >= floor && p <= limit; }
     __device__ __forceinline__ int cell(int p) const { return (p + 1) * ratio - 1; }
     __device__ __forceinline__ int page(int p) const { return pages[cell(p) / page_size]; }
-    __device__ __forceinline__ long long slot(int p, int page_id) const {
-        return static_cast<long long>(page_id) * page_size + cell(p) % page_size;
+    // Key p's row in its page.
+    __device__ __forceinline__ int row(int p) const { return cell(p) % page_size; }
+    // The element offsets of row `row` of page `page_id`: in the latent plane
+    // (`w` elements a row) and in the rope plane (`r` a row).
+    __device__ __forceinline__ long long ckv_at(int page_id, int row, int w) const {
+        return static_cast<long long>(page_id) * ckv_stride + static_cast<long long>(row) * w;
+    }
+    __device__ __forceinline__ long long kpe_at(int page_id, int row, int r) const {
+        return static_cast<long long>(page_id) * kpe_stride + static_cast<long long>(row) * r;
     }
 };
 
@@ -313,9 +324,9 @@ __device__ void attend(const bf16* __restrict__ qn, const bf16* __restrict__ qp,
     for (int n = keys.n0 + sub; n < keys.n1; n += K) {
         const int p = keys.pos(n);
         if (!keys.visible(p)) continue;
-        const long long slot = keys.slot(p, keys.page(p));
-        const bf16* kr = ckv_pages + slot * ckv;
-        const bf16* pr = kpe_pages + slot * kpe;
+        const int page = keys.page(p), row = keys.row(p);
+        const bf16* kr = ckv_pages + keys.ckv_at(page, row, ckv);
+        const bf16* pr = kpe_pages + keys.kpe_at(page, row, kpe);
         float kv[kMaxPer];
         float dot = 0.f;
 #pragma unroll
@@ -380,7 +391,8 @@ __global__ __launch_bounds__(kBlock) void mla_naive_paged_kernel(
     const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
     const i32* __restrict__ last_page_lens, bf16* __restrict__ o, float* __restrict__ lse,
     const i32* __restrict__ selection, int top_k, int requests, int heads, int ckv, int kpe,
-    int page_size, float sm_scale, bool causal, int G, int band, const u32* __restrict__ win) {
+    int page_size, long long ckv_stride, long long kpe_stride, float sm_scale, bool causal, int G, int band,
+    const u32* __restrict__ win) {
     extern __shared__ float naive_smem[];
     const Window window{win};
     const int t = blockIdx.x;
@@ -398,6 +410,8 @@ __global__ __launch_bounds__(kBlock) void mla_naive_paged_kernel(
     LatentKeys keys{selection != nullptr ? selection + t_row * top_k : nullptr,
                     page_indices + page_indptr[r],
                     page_size,
+                    ckv_stride,
+                    kpe_stride,
                     1,
                     selection != nullptr ? 0 : floor,
                     selection != nullptr ? min(top_k, max(j_end, 0)) : j_end,
@@ -451,7 +465,8 @@ struct Smem {
     bf16 kv[BK][LD];
     bf16 p[kBM][LP];
     mfma_cd part[kWaves][2][kWave];
-    i32 slot[2][TABLE];
+    i32 page[2][TABLE];  // a key's page,
+    i32 row[2][TABLE];   // and its row in it
     i32 kpos[2][TABLE];
     float rm[kBM];
     float rl[kBM];
@@ -519,23 +534,26 @@ __device__ void attend(Smem<R, RK, BK>& sm, const Rows& rows, const LatentKeys& 
             const bool vis = n < keys.n1 && keys.visible(p);
             const int at = vis ? p : 0;
             sm.kpos[h][e] = vis ? p : kNoKey;
-            sm.slot[h][e] = static_cast<i32>(keys.slot(at, keys.page(at)));
+            sm.page[h][e] = keys.page(at);
+            sm.row[h][e] = keys.row(at);
         }
     };
     const int key = threadIdx.x / TPK, part = threadIdx.x % TPK;
     auto issue = [&](Buf& s, int tile) {
         tile = min(tile, tiles - 1);  // past the walk: the last tile again, from L2
-        const long long slot = sm.slot[(tile / kTableTiles) % 2][(tile % kTableTiles) * BK + key];
+        const int h = (tile / kTableTiles) % 2, e = (tile % kTableTiles) * BK + key;
+        const int page = sm.page[h][e], row = sm.row[h][e];
         if constexpr (FP8) {
-            const u8* src = reinterpret_cast<const u8*>(ckv) + slot * SM::W;
+            const u8* src = reinterpret_cast<const u8*>(ckv) + keys.ckv_at(page, row, SM::W);
 #pragma unroll
             for (int i = 0; i < 2; ++i) s.lat[i] = *reinterpret_cast<const chunk*>(src + 16 * (part + TPK * i));
             if constexpr (R > 0) s.rp = *reinterpret_cast<const u64*>(src + RK + 8 * (part % 8));
         } else {
-            const bf16* src = ckv + slot * RK;
+            const bf16* src = ckv + keys.ckv_at(page, row, RK);
 #pragma unroll
             for (int i = 0; i < 4; ++i) s.lat[i] = *reinterpret_cast<const chunk*>(src + 8 * (part + TPK * i));
-            if constexpr (R > 0) s.rp = *reinterpret_cast<const chunk*>(kpe + slot * R + 8 * (part % 8));
+            if constexpr (R > 0)
+                s.rp = *reinterpret_cast<const chunk*>(kpe + keys.kpe_at(page, row, R) + 8 * (part % 8));
         }
     };
     auto store = [&](const Buf& s) {
@@ -730,6 +748,9 @@ struct Work {
     i32 page_size;
     float scale_log2;
     i32 causal;
+    // Elements from a page's latent (rope) rows to the next page's.
+    i64 ckv_stride;
+    i64 kpe_stride;
 };
 
 // Packed row r of a work item is (token (base + r) / H, head (base + r) % H)
@@ -794,8 +815,8 @@ __global__ __launch_bounds__(kThreads) void mla_paged(const Work p) {
                          kv_len,
                          p.q_indptr[item],
                          p.causal != 0};
-        const LatentKeys keys{nullptr, p.kv_indices + p.kv_indptr[item], p.page_size, 1,
-                              kv_start, max(kv_end, kv_start), max(kv_end, kv_start) - 1};
+        const LatentKeys keys{nullptr, p.kv_indices + p.kv_indptr[item], p.page_size, p.ckv_stride, p.kpe_stride,
+                              1, kv_start, max(kv_end, kv_start), max(kv_end, kv_start) - 1};
         attend<R, PlanRows<R>, kRank, kBK, FP8>(sm, rows, keys, p.ckv, p.kpe, p.scale_log2);
     }
 }
@@ -961,6 +982,9 @@ struct Gather {
     i32 window;
     // A compressed pool keeps its entries compact, a row each.
     i32 compact;
+    // Elements from a page's latent (rope) rows to the next page's.
+    i64 ckv_stride;
+    i64 kpe_stride;
 };
 
 template <int R, int RK = kRank>
@@ -1044,8 +1068,16 @@ __global__ __launch_bounds__(kThreads) void latent_gather(const Gather p) {
         return;
     }
     const bool compact = p.positions != nullptr && p.compact;
-    const LatentKeys keys{sel,     pages, compact ? p.page_size / ratio : p.page_size, compact ? 1 : ratio,
-                          first + n0, first + min(count, n0 + share), limit, floor};
+    const LatentKeys keys{sel,
+                          pages,
+                          compact ? p.page_size / ratio : p.page_size,
+                          p.ckv_stride,
+                          p.kpe_stride,
+                          compact ? 1 : ratio,
+                          first + n0,
+                          first + min(count, n0 + share),
+                          limit,
+                          floor};
     const GatherRows<R, RK> rows{p.q_nope, p.q_pe, p.o, p.lse, p.part_o, p.part_lse, t_row, t,
                                  p.num_heads, static_cast<int>(blockIdx.x) * kBM, limit, p.splits, split};
     attend<R, GatherRows<R, RK>, RK, BK, FP8>(sm, rows, keys, p.ckv, p.kpe, p.scale_log2, voff);

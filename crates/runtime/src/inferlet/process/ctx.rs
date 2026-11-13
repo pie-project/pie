@@ -21,12 +21,10 @@ use crate::store::rs::RsWorkingSetId;
 pub enum OutputMode {
     Discard,
     Stream,
-    Log { program: String },
 }
 
 pub struct ProcessCtx {
     id: ProcessId,
-    username: String,
 
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
@@ -126,7 +124,6 @@ impl ProcessCtx {
 
     pub async fn new(
         id: ProcessId,
-        username: String,
         output: OutputMode,
         policy: &InstancePolicy,
         script: Option<Arc<Script>>,
@@ -138,16 +135,6 @@ impl ProcessCtx {
                 OutputMode::Discard => {}
                 OutputMode::Stream => {
                     let (out, err) = (LogStream::new_stdout(id), LogStream::new_stderr(id));
-                    builder = builder
-                        .stdout(move |bytes| out.write_bytes(bytes))
-                        .stderr(move |bytes| err.write_bytes(bytes));
-                }
-                OutputMode::Log { program } => {
-                    let program: Arc<str> = Arc::from(program);
-                    let (out, err) = (
-                        LogStream::new_server_stdout(program.clone()),
-                        LogStream::new_server_stderr(program),
-                    );
                     builder = builder
                         .stdout(move |bytes| out.write_bytes(bytes))
                         .stderr(move |bytes| err.write_bytes(bytes));
@@ -180,11 +167,6 @@ impl ProcessCtx {
                 builder.stdout(LogStream::new_stdout(id));
                 builder.stderr(LogStream::new_stderr(id));
             }
-            OutputMode::Log { program } => {
-                let program: Arc<str> = Arc::from(program);
-                builder.stdout(LogStream::new_server_stdout(program.clone()));
-                builder.stderr(LogStream::new_server_stderr(program));
-            }
         }
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -205,7 +187,6 @@ impl ProcessCtx {
 
         Ok(ProcessCtx {
             id,
-            username,
             wasi_ctx,
             resource_table: ResourceTable::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -330,10 +311,6 @@ impl ProcessCtx {
         self.admission_wait_us
     }
 
-    pub fn get_username(&self) -> String {
-        self.username.clone()
-    }
-
     pub(crate) fn residency_pipelines(&self) -> Vec<crate::pipeline::fire::PendingFires> {
         self.residency.lock().unwrap().pipelines()
     }
@@ -369,17 +346,15 @@ impl ProcessCtx {
             .remove(&(model, engine, id));
     }
 
-    pub(crate) fn register_rs_working_set(
-        &self,
-        model: usize,
-        engine: crate::engine::EngineId,
-        id: RsWorkingSetId,
-    ) {
+    pub(crate) fn register_rs_working_set(&self, ws: &crate::store::rs::working_set::RsWorkingSet) {
         self.residency
             .lock()
             .unwrap()
             .rs_working_sets
-            .insert((model, engine, id));
+            .insert((ws.model, ws.engine, ws.id));
+        if let Some(departure) = &self.departure {
+            ws.hold_departure(departure.clone());
+        }
     }
 
     pub(crate) fn unregister_rs_working_set(

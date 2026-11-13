@@ -72,17 +72,21 @@ fn append(
     ctx.fire(
         Fire::at(KV_APPEND, entry).apply(Grid::of(lanes, [64, 1, 1])),
         &[
-            k.arg(),
-            v.arg(),
-            pool.keys.arg_mut(),
-            pool.values.arg_mut(),
-            write_page.arg(),
-            write_offset.arg(),
-            stated(op, head_dim)?.arg(),
-            pool.page_size.arg(),
-            stated(op, heads)?.arg(),
-            0_i32.arg(),
-        ],
+            &[k.arg(), v.arg(), write_page.arg(), write_offset.arg()][..],
+            &pool.pool.args(true),
+            &[
+                stated(op, head_dim)?.arg(),
+                pool.page_size.arg(),
+                stated(op, heads)?.arg(),
+                0_i32.arg(),
+                pool.pool.words.arg(),
+                pool.origin[0].arg(),
+                pool.origin[1].arg(),
+                pool.page_stride[0].arg(),
+                pool.page_stride[1].arg(),
+            ],
+        ]
+        .concat(),
     )
 }
 

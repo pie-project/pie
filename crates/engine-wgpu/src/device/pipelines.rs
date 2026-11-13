@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::error::{Fault, Result};
+use engine_gpu::error::{Fault, Result};
 
 use super::ctx::{Context, Core};
 

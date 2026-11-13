@@ -137,6 +137,19 @@ pub fn boundary_prefill(
     )
 }
 
+/// A compressor state slab's page stride as the kernels take it: the
+/// elements between two pages' rows (0: a page's rows right after the page
+/// before's).
+fn state_stride_of(op: &'static str, stride: i64) -> Result<i64, Error> {
+    if stride < 0 {
+        return Err(refuse(
+            op,
+            format!("compressor state pages {stride} elements apart"),
+        ));
+    }
+    Ok(stride)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn state_write(
     ctx: &Ctx,
@@ -149,9 +162,11 @@ pub fn state_write(
     ratio: u32,
     state_kv: Tensor,
     state_score: Tensor,
+    state_stride: i64,
 ) -> Result<(), Error> {
     const OP: &str = "attn.pool_state_write";
     dtype_dispatch!(OP, kv.dtype, { Bf16 => () });
+    let state_stride = state_stride_of(OP, state_stride)?;
     let ratio = pooling_ratio(OP, ratio)?;
     let head_dim = count(OP, "the head width this compressor states", head_dim)?;
     let width = count(OP, "the compressor's row width", kv.width)?;
@@ -186,6 +201,7 @@ pub fn state_write(
             width.arg(),
             pages.page_size.arg(),
             pitch.arg(),
+            state_stride.arg(),
         ],
     )
 }
@@ -200,11 +216,13 @@ pub fn gather(
     ratio: u32,
     state_kv: Tensor,
     state_score: Tensor,
+    state_stride: i64,
     ape: Tensor,
     entries: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attn.pool_gather";
     dtype_dispatch!(OP, entries.dtype, { Bf16 => () });
+    let state_stride = state_stride_of(OP, state_stride)?;
     boundary_tables(OP, &boundary_pos, &boundary_req);
     if entries.width != head_dim {
         return Err(refuse(
@@ -249,6 +267,7 @@ pub fn gather(
             coff.arg(),
             pages.page_size.arg(),
             count(OP, "the state plane's row pitch", state_kv.width)?.arg(),
+            state_stride.arg(),
             ctx.stage(),
         ],
     )
@@ -320,6 +339,7 @@ pub fn kv_append(
             head_dim.arg(),
             pool.page_size.arg(),
             div.arg(),
+            kv::page_elems(OP, pool, 0)?.arg(),
             ctx.stage(),
         ],
     )
@@ -399,6 +419,7 @@ fn attend_pool(
             latent::Gather {
                 q_nope: read.q.ptr,
                 ckv: entries.keys.ptr,
+                ckv_stride: kv::page_elems(op, entries, 0)?,
                 page_indices: entries.page_indices.ptr,
                 page_indptr: entries.page_indptr.ptr,
                 positions: read.positions.ptr,
@@ -452,6 +473,7 @@ fn attend_pool(
             head_dim.arg(),
             ratio.arg(),
             entries.page_size.arg(),
+            kv::page_elems(op, entries, 0)?.arg(),
             read.sm_scale.arg(),
             g.arg(),
             i32::from(compact).arg(),
@@ -594,6 +616,7 @@ pub fn block_mean(
             head_dim.arg(),
             ratio.arg(),
             keys.page_size.arg(),
+            kv::page_elems(OP, keys, 0)?.arg(),
             ctx.stage(),
         ],
     )?;

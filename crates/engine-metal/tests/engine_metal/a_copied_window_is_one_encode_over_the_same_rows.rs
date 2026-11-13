@@ -93,7 +93,7 @@ fn windows(trace: &Trace, compiled: &CompiledModel, enabled: bool) -> Windows {
     let no_patches = WindowTable::new(vec![ClassWindow::default(); compiled.classes.classes.len()]);
     let lanes = compiled.classes.classes.len();
     let (positions, request_of_token) = ambient(lanes);
-    let spaces = [geometry(lanes)];
+    let page_tables = [geometry(lanes)];
     Windows::of(
         trace,
         compiled,
@@ -104,12 +104,10 @@ fn windows(trace: &Trace, compiled: &CompiledModel, enabled: bool) -> Windows {
         Copies {
             bucket: 0,
             enabled,
-            spaces: &spaces,
+            page_tables: &page_tables,
             positions: &positions,
             request_of_token: &request_of_token,
         },
-        &[],
-        &[],
     )
     .expect("a fire over every class is a fire the artifact promised")
 }
@@ -340,18 +338,22 @@ fn the_page_tables_are_re_cut_lane_by_lane_and_not_sliced() {
 
     let window = copy.at(at, 0);
     let gathered = window.gathered.as_ref().expect("a row map");
-    assert_eq!(gathered.spaces.len(), 1, "one kv space was handed in");
-    let space = &gathered.spaces[0];
+    assert_eq!(
+        gathered.page_tables.len(),
+        1,
+        "one page table was handed in"
+    );
+    let table = &gathered.page_tables[0];
 
     let lanes_of: Vec<usize> = gathered.rows_host.iter().map(|&row| row as usize).collect();
 
     assert_eq!(
-        space.page_indptr_host.len(),
+        table.page_indptr_host.len(),
         lanes_of.len() + 1,
         "one bound per gathered lane, plus the terminator"
     );
     assert_eq!(
-        space.page_indptr_host[0], 0,
+        table.page_indptr_host[0], 0,
         "a fresh prefix sum starts at 0"
     );
 
@@ -362,26 +364,26 @@ fn the_page_tables_are_re_cut_lane_by_lane_and_not_sliced() {
         expected.extend_from_slice(&fire.indices[start..end]);
     }
     assert_eq!(
-        space.page_indices_host, expected,
+        table.page_indices_host, expected,
         "the page-id LIST is compacted with the lanes: gathered lanes own spans \
          of it with other lanes' pages standing between them, and no bounds \
          vector over the whole list can name two such spans as requests 0 and 1"
     );
     assert_eq!(
-        space.page_indptr_host.last().copied(),
-        Some(space.page_indices_host.len() as i32),
+        table.page_indptr_host.last().copied(),
+        Some(table.page_indices_host.len() as i32),
         "and the bounds cut the compacted list, not the fire's"
     );
 
     assert_eq!(
-        space.last_page_lens_host,
+        table.last_page_lens_host,
         lanes_of
             .iter()
             .map(|&lane| fire.last_page_len[lane])
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        space.kv_len_host,
+        table.kv_len_host,
         lanes_of
             .iter()
             .map(|&lane| fire.kv_len[lane])
@@ -498,11 +500,11 @@ fn the_packed_blob_and_the_bind_walk_it_in_one_order() {
             want += gathered.rows_host.len()
                 + gathered.positions_host.len()
                 + gathered.request_of_token_host.len();
-            for space in &gathered.spaces {
-                want += space.page_indptr_host.len()
-                    + space.page_indices_host.len()
-                    + space.last_page_lens_host.len()
-                    + space.kv_len_host.len();
+            for table in &gathered.page_tables {
+                want += table.page_indptr_host.len()
+                    + table.page_indices_host.len()
+                    + table.last_page_lens_host.len()
+                    + table.kv_len_host.len();
             }
         }
     }

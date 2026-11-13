@@ -84,11 +84,12 @@ pub fn mamba2(
     m.check(OP, xbc, dt, z, y, state_dim)?;
     f32_state(OP, state)?;
     seated(OP, state, "mamba2_step", true, false, false)?;
-    let rows = nonzero(OP, "rows", xbc.rows)?;
+    let n = nonzero(OP, "rows", xbc.rows)?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, m.heads)?;
     ctx.fire(
         OP,
         Fire::at(kernel(MAMBA2, "::pie::ssm::mamba2_step"))
-            .apply(Launch::grid([rows, m.heads, 1], [BLOCK, 1, 1])),
+            .apply(Launch::grid([n, m.heads, 1], [BLOCK, 1, 1])),
         &[
             xbc.arg(),
             dt.arg(),
@@ -96,9 +97,7 @@ pub fn mamba2(
             m.a_log.arg(),
             m.dt_bias.arg(),
             m.d.arg(),
-            state.slab.arg(),
-            state.slot_ids.arg(),
-            state.slot_stride_elems.arg(),
+            rows.arg(),
             y.arg(),
             stated(OP, m.heads)?.arg(),
             stated(OP, m.groups)?.arg(),
@@ -112,8 +111,30 @@ pub fn mamba2(
 
 /// A prompt's Mamba-2 walk in sixteen-token chunks: a block a (request,
 /// head) lands `(C S + D x) * silu(z)` for each row, then the group norm.
+/// A `tail` pass (rows past a lane's commit, from the state its first pass
+/// folded) walks before the norm, which every row then takes once.
 #[allow(clippy::too_many_arguments)]
 pub fn mamba2_chunked(
+    ctx: &Ctx,
+    xbc: RaggedTensor,
+    dt: Tensor,
+    z: Tensor,
+    m: Mamba2,
+    state: &RecurrentPool,
+    tail: Option<&RecurrentPool>,
+    state_dim: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.mamba2_chunked";
+    for pass in core::iter::once(state).chain(tail) {
+        mamba2_scan(ctx, xbc, dt, z, m, pass, state_dim, y)?;
+    }
+    m.norm(ctx, OP, y)
+}
+
+/// One pass of [`mamba2_chunked`]'s walk, the norm not taken.
+#[allow(clippy::too_many_arguments)]
+fn mamba2_scan(
     ctx: &Ctx,
     xbc: RaggedTensor,
     dt: Tensor,
@@ -134,6 +155,7 @@ pub fn mamba2_chunked(
     let lanes = requests(OP, xbc)?;
     f32_state(OP, state)?;
     seated(OP, state, "mamba2_scan", true, true, true)?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, m.heads)?;
     ctx.fire(
         OP,
         Fire::at(kernel(MAMBA2, "::pie::ssm::mamba2_scan"))
@@ -145,10 +167,8 @@ pub fn mamba2_chunked(
             m.a_log.arg(),
             m.dt_bias.arg(),
             m.d.arg(),
-            state.slab.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             xbc.indptr.arg(),
-            state.slot_stride_elems.arg(),
             state.commit_len.arg(),
             state.begin_at.arg(),
             state.write_state.arg(),
@@ -159,6 +179,5 @@ pub fn mamba2_chunked(
             stated(OP, m.groups)?.arg(),
             ctx.stage(),
         ],
-    )?;
-    m.norm(ctx, OP, y)
+    )
 }

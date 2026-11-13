@@ -21,7 +21,8 @@ pub struct Settings {
     pub engine: bool,
     pub max_forward_tokens: u32,
     pub max_forward_requests: u32,
-    pub max_state_slots: u32,
+    #[serde(default)]
+    pub max_state_slots: crate::config::Removed<crate::config::removed::MaxStateSlots>,
     pub max_model_len: u32,
     /// Device bytes for the kv pages and state slots (`"1GiB"`); omitted,
     /// the pool fills what `device_memory_share` leaves.
@@ -44,7 +45,7 @@ impl Default for Settings {
             engine: true,
             max_forward_tokens: 512,
             max_forward_requests: 8,
-            max_state_slots: 64,
+            max_state_slots: crate::config::Removed::default(),
             max_model_len: 4096,
             device_kv_budget: None,
             device_memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
@@ -135,7 +136,6 @@ impl Settings {
             "max_forward_requests",
             i64::from(self.max_forward_requests).into(),
         );
-        set("max_state_slots", i64::from(self.max_state_slots).into());
         set("max_model_len", i64::from(self.max_model_len).into());
         match kind {
             EngineKind::Metal => set("kv_page_size", 16.into()),

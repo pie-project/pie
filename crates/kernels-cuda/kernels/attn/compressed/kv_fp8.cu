@@ -83,6 +83,7 @@ __global__ __launch_bounds__(128) void rows_append(
     const u8* __restrict__ row_valid,
     int B,
     int page_size,
+    long long page_stride,
     const u32* __restrict__ win)
 {
     const int b = static_cast<int>(blockIdx.x) * 4 + static_cast<int>(threadIdx.x >> 5);
@@ -95,7 +96,7 @@ __global__ __launch_bounds__(128) void rows_append(
     const int off = static_cast<int>(w_off[b_row]);
     if (off < 0 || off >= page_size) return;
     rows_store_warp<F>(plane_rows + static_cast<long long>(b_row) * kDsDim,
-                       rows_at<F>(pages, page, off, page_size), lane);
+                       rows_at<F>(pages, page, off, page_size, page_stride), lane);
 }
 
 // The compressed rows in format F: entry c at its boundary's position in its
@@ -110,7 +111,8 @@ __global__ __launch_bounds__(128) void rows_store_entries(
     const u32* __restrict__ page_indptr,
     int n,
     int page_size,
-    int div)
+    int div,
+    long long page_stride)
 {
     const int c = static_cast<int>(blockIdx.x) * 4 + static_cast<int>(threadIdx.x >> 5);
     const int lane = static_cast<int>(threadIdx.x & 31);
@@ -119,7 +121,7 @@ __global__ __launch_bounds__(128) void rows_store_entries(
     if (pos < 0) return;
     const int cell = pos / div, rows = page_size / div;
     const u32 page = page_indices[page_indptr[boundary_req[c]] + cell / rows];
-    rows_store_warp<F>(entries + static_cast<long long>(c) * kDsDim, rows_at<F>(pages, page, cell % rows, rows),
+    rows_store_warp<F>(entries + static_cast<long long>(c) * kDsDim, rows_at<F>(pages, page, cell % rows, rows, page_stride),
                        lane);
 }
 

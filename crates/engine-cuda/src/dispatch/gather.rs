@@ -96,14 +96,25 @@ impl Run<'_> {
                             .to_string(),
                     })
                 }
-                Some((codes, scales, biases, seat)) => kernels_cuda::gather::embed_mlx_affine(
+                #[cfg(not(feature = "rocm"))]
+                Some((codes, scales, biases)) => kernels_cuda::gather::embed_mlx_affine(
                     self.ctx(),
                     self.tensor(*ids),
                     codes,
                     scales,
                     biases,
                     *vocab,
-                    seat,
+                    kernels_cuda::linear::moe::GroupSeat::RESIDENT,
+                    &mut self.tensor(*y),
+                ),
+                #[cfg(feature = "rocm")]
+                Some((codes, scales, biases)) => kernels_cuda::gather::embed_mlx_affine(
+                    self.ctx(),
+                    self.tensor(*ids),
+                    codes,
+                    scales,
+                    biases,
+                    *vocab,
                     &mut self.tensor(*y),
                 ),
                 None if self.tensor(*table).rows < *vocab => gather::embed_vocab_shard(
@@ -112,10 +123,11 @@ impl Run<'_> {
                     self.tensor(*table),
                     &mut self.tensor(*y),
                 ),
-                None => gather::embed(
+                None => gather::embed_tabled(
                     self.ctx(),
                     self.tensor(*ids),
                     self.tensor(*table),
+                    self.row_table(*table),
                     *vocab,
                     &mut self.tensor(*y),
                 ),
@@ -155,7 +167,7 @@ impl Run<'_> {
                     })
                 }
                 #[cfg(not(feature = "rocm"))]
-                Some((codes, scales, _, _)) if codes.dtype == poem_ir::Dtype::E4m3tensor => {
+                Some((codes, scales, _)) if codes.dtype == poem_ir::Dtype::E4m3tensor => {
                     kernels_cuda::gather::embed_concat_e4m3(
                         self.ctx(),
                         self.tensor(*ids),
@@ -165,14 +177,25 @@ impl Run<'_> {
                         &mut self.tensor(*y),
                     )
                 }
-                Some((codes, scales, biases, seat)) => kernels_cuda::gather::embed_concat_mlxu4(
+                #[cfg(not(feature = "rocm"))]
+                Some((codes, scales, biases)) => kernels_cuda::gather::embed_concat_mlxu4(
                     self.ctx(),
                     self.tensor(*ids),
                     codes,
                     scales,
                     biases,
                     *vocab,
-                    seat,
+                    kernels_cuda::linear::moe::GroupSeat::RESIDENT,
+                    &mut self.tensor(*y),
+                ),
+                #[cfg(feature = "rocm")]
+                Some((codes, scales, biases)) => kernels_cuda::gather::embed_concat_mlxu4(
+                    self.ctx(),
+                    self.tensor(*ids),
+                    codes,
+                    scales,
+                    biases,
+                    *vocab,
                     &mut self.tensor(*y),
                 ),
                 None => kernels_cuda::gather::embed_concat(

@@ -51,6 +51,9 @@ impl Held {
         cursor: Cursor,
     ) -> Self {
         kv.leave_owner();
+        if let Some(rs) = &rs {
+            rs.leave_owner();
+        }
         let residency = Arc::new(Mutex::new(ProcessResidency::default()));
         {
             let mut held = residency.lock().unwrap();
@@ -136,14 +139,6 @@ impl Held {
                 Err(why)
             }
         }
-    }
-
-    /// Whether its next write takes state it does not hold yet.
-    pub(super) fn shares_state(&self) -> bool {
-        self.parts().rs.as_ref().is_some_and(|rs| {
-            let stores = store_registry::get(rs.model, rs.engine);
-            stores.rs.lock().unwrap().shares_state(rs.id)
-        })
     }
 
     fn leave_planner(&self) {

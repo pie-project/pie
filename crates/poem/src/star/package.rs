@@ -1,7 +1,7 @@
 //! A model package: its files, each evaluated with the DSL's globals and
 //! frozen, so a deployment's layout, forward and formats are functions a
 //! trace or an import calls. A file's name says nothing of what it holds: the
-//! package's entries (`MODELS`, `layout`, `caches`, `forward`, `formats`, …)
+//! package's entries (`MODELS`, `layout`, `forward`, `formats`, …)
 //! are found in whichever one file defines each, so a package may be one file
 //! or several. What a stage's builtins read (the trace being recorded, the
 //! checkpoint being read) is there only while the runtime calls that stage's
@@ -24,6 +24,7 @@ fn globals() -> &'static Globals {
         base()
             .with(crate::star::manifest::manifest)
             .with(crate::star::layout::layout)
+            .with(crate::star::state::globals)
             .with(crate::star::generative::generative)
             .with(crate::star::forward::forward)
             .with(crate::star::forward::ops)

@@ -644,6 +644,7 @@ impl Lane {
                     crate::engine::verbs::settled(match plan {
                         PreLaunchCopy::Kv(plan) => engine.copy_kv(&plan),
                         PreLaunchCopy::State(plan) => engine.copy_state(&plan),
+                        PreLaunchCopy::Slots(plan) => engine.copy_slots(&plan),
                     })
                 });
                 match submitted {
@@ -781,6 +782,7 @@ impl Lane {
                     crate::engine::verbs::settled(match plan {
                         PreLaunchCopy::Kv(plan) => engine.copy_kv(&plan),
                         PreLaunchCopy::State(plan) => engine.copy_state(&plan),
+                        PreLaunchCopy::Slots(plan) => engine.copy_slots(&plan),
                     })
                 }) {
                     Ok(native_completion) => LaneCommit::AsyncControl {
@@ -796,11 +798,9 @@ impl Lane {
             QueuedItem::Pool { op, response } => {
                 let result = backend(engine).and_then(|engine| {
                     match op {
-                        PoolOp::Commit(pages) => engine.commit_pool(pages),
-                        PoolOp::Release(pages) => engine.release_pool(pages),
-                        PoolOp::CommitState(slots) => engine.commit_state(slots),
-                        PoolOp::ReleaseState(slots) => engine.release_state(slots),
-                        PoolOp::ReleaseScratch => engine.release_scratch(),
+                        PoolOp::CommitSegments(segments) => engine.commit_segments(segments),
+                        PoolOp::ReleaseSegments(segments) => engine.release_segments(segments),
+                        PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),
                     }
                     .map_err(anyhow::Error::from)
                 });
@@ -825,9 +825,22 @@ impl Lane {
                         .write_host_state(&slots, &pages, &bytes)
                         .map(|()| Vec::new())
                         .map_err(Into::into),
+                    HostKvOp::ReadTier(slots) => engine.read_tier_slots(&slots).map_err(Into::into),
+                    HostKvOp::WriteTier(slots, bytes) => engine
+                        .write_tier_slots(&slots, &bytes)
+                        .map(|()| Vec::new())
+                        .map_err(Into::into),
                     HostKvOp::TapGroups => {
                         Ok(serde_json::to_vec(&engine.tap_groups()).unwrap_or_default())
                     }
+                    HostKvOp::WeightResidency(residency) => engine
+                        .weight_residency(&residency)
+                        .map(|()| Vec::new())
+                        .map_err(Into::into),
+                    HostKvOp::WeightUses => engine
+                        .weight_uses()
+                        .map(|uses| serde_json::to_vec(&uses).unwrap_or_default())
+                        .map_err(Into::into),
                     HostKvOp::Layout => Ok(engine
                         .host_kv_layout()
                         .and_then(|layout| serde_json::to_vec(&layout).ok())
@@ -876,7 +889,7 @@ impl Lane {
         plan: &crate::engine::InstanceBindingPlan,
     ) -> Result<BoundInstance> {
         let bound = engine.bind_instance(&plan.binding)?;
-        let bound = BoundInstance::new(plan.engine_id, &bound, plan.pacing_wait_id);
+        let bound = BoundInstance::new(&bound, plan.pacing_wait_id);
         channels.bind(bound.instance_id, plan.binding.channels.clone());
         Ok(bound)
     }

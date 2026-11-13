@@ -2,7 +2,7 @@
 # sixteen-expert miniature, and 120B.
 
 load("//lib/adapters.poem", "banks", "corrected")
-load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches", dflash_declare = "declare", dflash_head = "head")
+load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", dflash_declare = "declare", dflash_head = "head")
 
 HARMONY = template("harmony")
 TOKENIZER = tokenizer(markers = [["<|endoftext|>", "<|return|>", "<|call|>"]])
@@ -130,7 +130,7 @@ def layout(id, deploy):
                 o_proj = weight([hidden, q_w], weights),
                 o_bias = weight([hidden]),
                 sinks = weight([d.q_heads]),
-                kv = "kv.{}".format(l),
+                kv = state([tokens, 2, d.kv_heads, hd], deploy.kv),
             ),
             attn_norm = norm("attn_norm", hidden),
             attn_norm_eps = d.norm_eps,
@@ -172,13 +172,12 @@ def layout(id, deploy):
             attention_factor = d.yarn_attention_factor,
             original_max_position = d.yarn_original_max_position,
         ),
-        kv = deploy.kv,
         embed = weight([d.vocab, hidden], weights),
         head = head,
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
         final_norm_eps = d.norm_eps,
-        dflash = dflash_declare(DFLASH_20B, "aux", hidden, d.vocab, d.norm_eps, weights, dense)
+        dflash = dflash_declare(DFLASH_20B, "aux", hidden, d.vocab, d.norm_eps, weights, dense, kv = deploy.kv)
             if deploy.drafter == "dflash" else None,
     )
 
@@ -323,14 +322,6 @@ def deinterleaved(e, rows):
 # The forward of gpt-oss: biased attention with sinks over YaRN rope, every
 # other layer windowed, then experts with clamped SwiGLU; and with a DFlash
 # drafter, the block it drafts.
-
-def caches(m, c):
-    kv = c.kv_space(m.kv)
-    plane = m.kv_heads * m.head_dim
-    for w in m.layers:
-        c.kv(kv, w.attn.kv, [plane, plane], m.head_dim, heads = True)
-    if m.dflash != None:
-        dflash_caches(m.dflash, c, kv)
 
 def forward(m, inputs):
     dr = m.dflash

@@ -326,6 +326,7 @@ pub fn causal_conv1d(
             stated(OP, dilation)?.arg(),
             conv_bias(ctx, bias)?,
             i32::from(bias.is_some()).arg(),
+            state.segments.arg(),
         ],
     )
 }
@@ -437,6 +438,7 @@ pub fn causal_conv1d_chunked_landing(
             lane0,
             conv_bias(ctx, bias)?,
             i32::from(bias.is_some()).arg(),
+            state.segments.arg(),
         ],
     )
 }
@@ -519,6 +521,7 @@ pub fn gated_delta(
                 stated(OP, shape.v_heads)?.arg(),
                 stated(OP, shape.k_dim)?.arg(),
                 stated(OP, shape.v_dim)?.arg(),
+                state.segments.arg(),
             ],
         );
     }
@@ -540,6 +543,7 @@ pub fn gated_delta(
             stated(OP, shape.k_dim)?.arg(),
             stated(OP, shape.v_dim)?.arg(),
             stated(OP, splits)?.arg(),
+            state.segments.arg(),
         ],
     )
 }
@@ -601,6 +605,7 @@ pub fn gated_delta_chunked_landing(
         stated(OP, shape.v_dim)?.arg(),
         snaps,
         lane0,
+        state.segments.arg(),
     ];
     if let Some(grid) = gdn_staged_launch_at(&shape, lanes, qkv.data.rows, tuning.gdn_scan()) {
         return ctx.fire(
@@ -661,6 +666,7 @@ pub fn kda_step(
             stated(OP, shape.head_dim)?.arg(),
             norm_eps.arg(),
             gate_floor.arg(),
+            state.segments.arg(),
         ],
     )
 }
@@ -703,6 +709,7 @@ pub fn kda_chunked(
             stated(OP, shape.head_dim)?.arg(),
             norm_eps.arg(),
             gate_floor.arg(),
+            state.segments.arg(),
         ],
     )
 }
@@ -752,6 +759,7 @@ pub fn kda_committed(
             stated(OP, shape.head_dim)?.arg(),
             norm_eps.arg(),
             gate_floor.arg(),
+            state.segments.arg(),
         ],
     )
 }
@@ -860,6 +868,7 @@ pub fn mamba2(
             y.arg_mut(),
             stated(OP, m.heads)?.arg(),
             stated(OP, m.groups)?.arg(),
+            state.segments.arg(),
         ],
     )?;
     m.norm(ctx, y)
@@ -901,6 +910,7 @@ pub fn mamba2_chunked(
             stated(OP, m.groups)?.arg(),
             snaps,
             lane0,
+            state.segments.arg(),
         ],
     )?;
     m.norm(ctx, y)
@@ -1066,6 +1076,7 @@ pub fn causal_conv1d_committed_landing(
             stated(OP, dilation)?.arg(),
             snaps,
             lane0,
+            state.segments.arg(),
         ],
     )
 }
@@ -1142,6 +1153,7 @@ pub fn gated_delta_committed_landing(
                 stated(OP, shape.v_dim)?.arg(),
                 snaps,
                 lane0,
+                state.segments.arg(),
             ],
         );
     }
@@ -1171,6 +1183,7 @@ pub fn gated_delta_committed_landing(
             stated(OP, splits)?.arg(),
             snaps,
             lane0,
+            state.segments.arg(),
         ],
     )
 }
@@ -1396,6 +1409,7 @@ fn gated_delta_verify_at(
             page_bytes,
             row_bytes,
             is_paged,
+            state.segments.arg(),
         ],
     )
 }
@@ -1491,6 +1505,7 @@ pub fn causal_conv1d_verify(
             page_bytes,
             row_bytes,
             is_paged,
+            state.segments.arg(),
         ],
     )
 }

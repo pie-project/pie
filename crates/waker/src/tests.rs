@@ -23,6 +23,71 @@ fn tests_every_case() {
     stale_generation_is_noop_b10();
     spurious_wakes_are_harmless();
     sweep_on_abort_resolves_blocked_take_to_err_b12();
+    every_task_waiting_on_a_slot_is_woken();
+    one_future_done_leaves_its_task_woken_for_the_others();
+    a_dropped_future_leaves_its_task_woken_for_the_others();
+}
+
+fn ready_when(flag: &AtomicBool) -> impl FnMut() -> Readiness<()> + Unpin + '_ {
+    move || {
+        if flag.load(std::sync::atomic::Ordering::SeqCst) {
+            Readiness::Ready(())
+        } else {
+            Readiness::Pending { observed_epoch: 0 }
+        }
+    }
+}
+
+/// Two futures of one task wait on one slot (a host may poll its lanes
+/// under one waker): their registrations are one entry. The condition turns
+/// true and one future, polled before the wake comes, takes the entry back
+/// as it finishes: the other still has to be polled again, so the task is
+/// woken rather than left asleep with nothing registered.
+fn one_future_done_leaves_its_task_woken_for_the_others() {
+    use std::future::Future;
+    let t = WakerTable::new();
+    let id = t.alloc();
+    let done = AtomicBool::new(false);
+    let (task, waker) = flag_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut a = WaitFuture::new(&t, id, ready_when(&done));
+    let mut b = WaitFuture::new(&t, id, ready_when(&done));
+    assert!(std::pin::Pin::new(&mut b).poll(&mut cx).is_pending());
+    assert!(std::pin::Pin::new(&mut a).poll(&mut cx).is_pending());
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(std::pin::Pin::new(&mut a).poll(&mut cx).is_ready());
+    t.wake(id);
+    assert!(
+        task.0.load(std::sync::atomic::Ordering::SeqCst),
+        "b's task is woken to see the slot ready"
+    );
+    assert!(std::pin::Pin::new(&mut b).poll(&mut cx).is_ready());
+}
+
+/// As above, the first future dropped while pending (a `select!` another
+/// branch won).
+fn a_dropped_future_leaves_its_task_woken_for_the_others() {
+    use std::future::Future;
+    let t = WakerTable::new();
+    let id = t.alloc();
+    let done = AtomicBool::new(false);
+    let (task, waker) = flag_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    let a = {
+        let mut a = WaitFuture::new(&t, id, ready_when(&done));
+        assert!(std::pin::Pin::new(&mut a).poll(&mut cx).is_pending());
+        a
+    };
+    let mut b = WaitFuture::new(&t, id, ready_when(&done));
+    assert!(std::pin::Pin::new(&mut b).poll(&mut cx).is_pending());
+    drop(a);
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    t.wake(id);
+    assert!(
+        task.0.load(std::sync::atomic::Ordering::SeqCst),
+        "b's task is woken to see the slot ready"
+    );
+    assert!(std::pin::Pin::new(&mut b).poll(&mut cx).is_ready());
 }
 
 fn alloc_register_wake_roundtrip() {
@@ -170,4 +235,40 @@ fn sweep_on_abort_resolves_blocked_take_to_err_b12() {
     assert_eq!(res, Err("poisoned"));
     let m = t.metrics();
     assert_eq!(m.swept, 2, "both endpoints swept");
+}
+
+/// Two tasks waiting on one slot (a pipeline's lanes on its front fire): a
+/// wake reaches both, and one task taking its registration back leaves the
+/// other's in place.
+fn every_task_waiting_on_a_slot_is_woken() {
+    let t = WakerTable::new();
+    let id = t.alloc();
+    let (a, wa) = flag_waker();
+    let (b, wb) = flag_waker();
+    assert!(t.register(id, &wa, 0));
+    assert!(t.register(id, &wb, 0));
+    assert_eq!(t.wake(id), WakeOutcome::Woken);
+    assert!(
+        a.0.load(std::sync::atomic::Ordering::SeqCst),
+        "the first waiter is woken"
+    );
+    assert!(
+        b.0.load(std::sync::atomic::Ordering::SeqCst),
+        "the second waiter is woken"
+    );
+
+    let (c, wc) = flag_waker();
+    let (d, wd) = flag_waker();
+    assert!(t.register(id, &wc, 0));
+    assert!(t.register(id, &wd, 0));
+    assert!(t.deregister_waker(id, &wc), "c was registered");
+    assert_eq!(t.wake(id), WakeOutcome::Woken);
+    assert!(
+        !c.0.load(std::sync::atomic::Ordering::SeqCst),
+        "a withdrawn waiter is not woken"
+    );
+    assert!(
+        d.0.load(std::sync::atomic::Ordering::SeqCst),
+        "the waiter left registered is"
+    );
 }

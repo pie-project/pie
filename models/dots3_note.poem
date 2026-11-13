@@ -32,7 +32,7 @@ DEPLOYMENTS = [
 
 def attention(n, a, hidden, weights, norms, eps, kv, window = None, indexer = None):
     """The latent attention named by `n` at the dims `a`, its projections in
-    `weights` and its norms in `norms`, caching under `kv`. The q and kv
+    `weights` and its norms in `norms`, its latent rows the state `kv`. The q and kv
     latents' norms carry the checkpoint's `sqrt(hidden / rank)` rescale;
     each head's output is gated by a sigmoid of the layer input."""
     qk_head_dim = a.qk_nope_head_dim + a.qk_rope_head_dim
@@ -134,7 +134,7 @@ def layout(id, deploy):
                 weights = weights,
                 norms = dense,
                 eps = d.norm_eps,
-                kv = "kv.{}".format(l),
+                kv = state([tokens, [a.kv_lora_rank, a.qk_rope_head_dim]], deploy.kv),
                 indexer = struct(
                     heads = d.index_heads,
                     head_dim = d.index_head_dim,
@@ -147,7 +147,7 @@ def layout(id, deploy):
                     k_norm = norm("index_k_norm", d.index_head_dim),
                     k_norm_bias = norm("index_k_norm_bias", d.index_head_dim),
                     k_norm_eps = d.index_norm_eps,
-                    keys = "index.{}".format(l),
+                    keys = state([tokens, d.index_head_dim], deploy.kv),
                 ),
             )
         else:
@@ -158,7 +158,7 @@ def layout(id, deploy):
                 weights = weights,
                 norms = dense,
                 eps = d.norm_eps,
-                kv = "swa.{}".format(l),
+                kv = state([tokens, [d.sliding.kv_lora_rank, d.sliding.qk_rope_head_dim]], deploy.kv),
                 window = d.window,
             )
         if l < d.dense_layers:
@@ -208,7 +208,6 @@ def layout(id, deploy):
         full = d.full,
         sliding = d.sliding,
         window = d.window,
-        kv = deploy.kv,
         embed = weight([d.vocab, hidden], weights),
         head = weight([d.vocab, hidden], weights),
         layers = [layer(l) for l in range(d.layers)],
@@ -307,16 +306,6 @@ def run_attention(x, inputs, a, select = None):
     o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
     o = ops.elemwise.gate_sigmoid_mul_heads(o, ops.linear.matmul(x, a.gate), a.v_head_dim, 1.0)
     return ops.linear.matmul(o, a.o_proj)
-
-def caches(m, c):
-    full = c.kv_space(m.kv)
-    sliding = c.kv_space(m.kv, m.window)
-    index = c.kv_space(m.kv)
-    for w in m.layers:
-        a = w.attn
-        c.kv(full if a.window == None else sliding, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
-        if a.indexer != None:
-            c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
 
 def forward(m, inputs):
     y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)

@@ -3,6 +3,7 @@ use crate::error::Error;
 use crate::jit::{
     Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
+use crate::linear::moe::RowTable;
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
@@ -18,6 +19,20 @@ pub fn embed(
     ctx: &Ctx,
     ids: Tensor,
     table: Tensor,
+    vocab: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    embed_tabled(ctx, ids, table, RowTable::RESIDENT, vocab, y)
+}
+
+/// [`embed`] over a table whose row blocks lie where `rows` says (the weight
+/// cache's: a block in a pool slot, or in the mapped host copy), each read a
+/// plain load. A null row table is the contiguous `table`.
+pub fn embed_tabled(
+    ctx: &Ctx,
+    ids: Tensor,
+    table: Tensor,
+    rows_at: RowTable,
     vocab: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
@@ -54,6 +69,13 @@ pub fn embed(
             rows.arg(),
             stated(OP, per_row)?.arg(),
             ctx.stage(),
+            crate::jit::ArgValue::Ptr(rows_at.table),
+            stated(
+                OP,
+                nonzero(OP, "a row table's rows a block", rows_at.block_rows)?,
+            )?
+            .arg(),
+            crate::jit::ArgValue::Ptr(rows_at.hits),
         ],
     )
 }

@@ -30,6 +30,7 @@ mod an_elementwise_chain_lowers_to_one_region;
 mod an_expert_parallel_rank_dispatches_its_tokens_to_the_experts;
 mod attend_is_the_dispatch_a_model_wrote_by_hand;
 mod every_catalog_row_bakes;
+mod every_deployment_packs_into_chunks;
 mod every_deployment_resolves_its_request_classes;
 mod every_deployment_ships_whole;
 mod every_fused_trace_keeps_its_order;

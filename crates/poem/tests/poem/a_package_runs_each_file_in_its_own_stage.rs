@@ -13,11 +13,6 @@ def layout(id, deploy):
     )
 "#;
 
-const CACHES: &str = r#"
-def caches(m, c):
-    pass
-"#;
-
 fn deploy() -> Deploy {
     Deploy {
         weights: vec![Dtype::Bf16.into()],
@@ -39,14 +34,12 @@ fn package(model: &str, forward: &str) -> anyhow::Result<Package> {
 
 #[test]
 fn a_forward_traces_the_ops_it_calls() {
-    let forward = format!(
-        "{CACHES}
+    let forward = r#"
 def forward(m, inputs):
     x = ops.gather.embed(inputs.tokens(), m.embed, 16)
     return ops.linear.lm_head(x, m.head)
-"
-    );
-    let trace = package(MODEL, &forward)
+"#;
+    let trace = package(MODEL, forward)
         .unwrap()
         .trace("toy", &deploy(), "toy-bf16", Platform::Cuda)
         .unwrap_or_else(|e| panic!("{e:#}"));
@@ -68,7 +61,7 @@ fn an_op_called_by_a_layout_is_an_error_at_its_line() {
 def layout(id, deploy):
     return ops.linear.matmul(None, None)
 "#;
-    let forward = format!("{CACHES}\ndef forward(m, inputs):\n    return None\n");
+    let forward = "def forward(m, inputs):\n    return None\n".to_string();
     let why = package(model, &forward)
         .expect("every file sees every builtin, so the package loads")
         .trace("toy", &deploy(), "toy-bf16", Platform::Cuda)
@@ -83,15 +76,13 @@ def layout(id, deploy):
 
 #[test]
 fn a_misused_op_is_an_error_at_the_scripts_line() {
-    let forward = format!(
-        "{CACHES}
+    let forward = r#"
 def forward(m, inputs):
     x = ops.gather.embed(inputs.tokens(), m.embed, 16)
     y = ops.elemwise.residual_add(x.on(fact.drafts()), x.on(~fact.drafts()))
     return ops.linear.lm_head(y, m.head)
-"
-    );
-    let why = package(MODEL, &forward)
+"#;
+    let why = package(MODEL, forward)
         .unwrap()
         .trace("toy", &deploy(), "toy-bf16", Platform::Cuda)
         .expect_err("two arms do not add");
@@ -109,7 +100,7 @@ def forward(m, inputs):
 #[test]
 fn a_package_may_be_one_file() {
     let whole = format!(
-        "{MODEL}\n{CACHES}\ndef forward(m, inputs):\n    return ops.linear.lm_head(ops.gather.embed(inputs.tokens(), m.embed, 16), m.head)\n"
+        "{MODEL}\ndef forward(m, inputs):\n    return ops.linear.lm_head(ops.gather.embed(inputs.tokens(), m.embed, 16), m.head)\n"
     );
     let package = Package::new("toy", &[("toy.poem", &whole)]).expect("one file, every entry");
     package
@@ -119,7 +110,7 @@ fn a_package_may_be_one_file() {
 
 #[test]
 fn an_entry_is_defined_once() {
-    let forward = format!("{MODEL}\n{CACHES}\ndef forward(m, inputs):\n    return None\n");
+    let forward = format!("{MODEL}\ndef forward(m, inputs):\n    return None\n");
     let why = package(MODEL, &forward)
         .expect("a package loads whatever its files define")
         .trace("toy", &deploy(), "toy-bf16", Platform::Cuda)
@@ -135,9 +126,6 @@ fn an_entry_is_defined_once() {
 fn a_library_is_loaded_by_any_file_that_needs_it() {
     let forward = r#"
 load("//lib/head/forward.poem", "read_out")
-
-def caches(m, c):
-    pass
 
 def forward(m, inputs):
     return read_out(m, ops.gather.embed(inputs.tokens(), m.embed, 16))

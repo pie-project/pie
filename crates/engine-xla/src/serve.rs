@@ -10,7 +10,6 @@
 //! too; one lane holding the rest otherwise). A padding lane reads and writes
 //! only the sink page and the sink slot.
 
-pub mod dry;
 mod warm;
 
 use std::collections::BTreeMap;
@@ -19,7 +18,6 @@ use std::path::Path;
 use crate::handle::Tensor;
 use checkpoint::contract::ModelContract;
 use engine::fire::Masking;
-use engine::frame::Demand;
 use poem_compiler::{Budget, Budgets, CompiledModel, FireRows, compile_axes};
 use poem_exec::feeds::classes_running;
 use poem_exec::fire::{At, Cursor, Filter, FireDescriptor, Lane as FireLane, compose_axes, walk};
@@ -30,7 +28,7 @@ use crate::error::{Fault, Result};
 use crate::inputs::Inputs;
 use crate::run::{CacheGeometry, FireBindings, FireTables, Run, SlotTable};
 use crate::store::kv::{self, Paging, Seat};
-use crate::store::{Pools, SpaceSeat};
+use crate::store::{Pools, TableSeat};
 use crate::trace::{Handles, Root, Source, Tracer};
 use crate::weights::Weights;
 use crate::window::Windows;
@@ -124,6 +122,7 @@ const PATCH_ROUTE_DROP: i32 = -1;
 pub struct Seated<'a> {
     pub lane: Lane<'a>,
 
+    /// The lane's slot refs of the kv list, in token order.
     pub pages: &'a [u32],
 
     pub held: Option<u32>,
@@ -135,6 +134,10 @@ pub struct Seated<'a> {
     pub positions: &'a [u32],
 
     pub readout: Option<&'a [u32]>,
+
+    /// The lane reads nothing back to the host (`Readout::None`): its
+    /// readout rows stay on the device for whatever reads them there.
+    pub quiet: bool,
 
     pub rs_reset: engine::fire::RsReset,
 
@@ -159,12 +162,18 @@ pub struct Seated<'a> {
 
     pub first: Option<u32>,
 
-    /// The lane's pages in the windowed pool, aligned with `pages` (0 the
-    /// null page); empty for a lane handed none.
+    /// The lane's slot refs of the window list, in its token order (its
+    /// slots hold the kv page's tokens), 0 where trimmed; empty for a lane
+    /// handed none.
     pub window: &'a [u32],
 
-    /// Windowed pages copied `(src, dst)` before the fire runs.
-    pub window_copies: &'a [(u32, u32)],
+    /// The lane's record: one `[run, cow]` slot ref a piece of each fixed
+    /// shape (`engine::fire::Lane::fixed`).
+    pub fixed: &'a [(engine::chunk::ShapeId, Vec<[u32; 2]>)],
+
+    /// Whole-slot copies `[src, dst]` of list shapes made before the fire
+    /// (`engine::fire::Lane::slot_copies`).
+    pub copies: &'a [(engine::chunk::ShapeId, Vec<[u32; 2]>)],
 }
 
 const FOLD: engine::fire::RsVerb = engine::fire::RsVerb::Fold;
@@ -180,6 +189,7 @@ impl<'a> Seated<'a> {
             adapter: None,
             positions: &[],
             readout: None,
+            quiet: false,
             rs_reset: engine::fire::RsReset::Inferred,
             rs_slot: None,
             rs: &FOLD,
@@ -190,8 +200,23 @@ impl<'a> Seated<'a> {
             writes: None,
             first: None,
             window: &[],
-            window_copies: &[],
+            fixed: &[],
+            copies: &[],
         }
+    }
+}
+
+/// Where a slot of the pool's shapes lies (CONTRACT-BC 22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Device,
+    Host,
+    Disk,
+}
+
+fn no_disk() -> Fault {
+    Fault::Unbound {
+        what: "the slot file, which this load seated none of".to_string(),
     }
 }
 
@@ -202,14 +227,6 @@ pub(crate) struct Deferred {
     text: String,
     sig: crate::trace::Signature,
     probed: Vec<ValueId>,
-}
-
-/// What one fire cost the host, for the bench.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct FireCost {
-    pub nodes: u32,
-    pub compiled: bool,
-    pub text_bytes: usize,
 }
 
 /// Fields drop in order: every buffer (weights, pools) goes before the
@@ -226,7 +243,10 @@ pub struct Shell {
     budgets: Budgets,
     weights: Weights,
     pools: Pools,
-    spaces: usize,
+    /// The host tier (CONTRACT-BC 22): chunks of the pool's size.
+    host: crate::store::tier::Host,
+    /// The slot file below it, kv list slots.
+    disk: Option<crate::store::tier::Disk>,
     /// The outputs the plan's classes write, and per class the one its
     /// lanes read back to the host: the last float row or voxel output.
     exports: Vec<poem_exec::feeds::ClassOutput>,
@@ -253,7 +273,6 @@ pub struct Shell {
     /// program which of them its trailing outputs hold.
     probes: Vec<ValueId>,
     probed: std::collections::HashMap<[u8; 32], Vec<ValueId>>,
-    last: FireCost,
     /// Programs by the fire shape that traced them: a fire whose shape was
     /// seen skips the walk and runs what the first one compiled.
     traced: std::collections::HashMap<[u8; 32], std::sync::Arc<crate::device::Program>>,
@@ -267,6 +286,10 @@ pub struct Shell {
     /// The readout rows of every fire shape traced, the rows a guest stage's
     /// readout plane comes in (`Shell::readouts`).
     readouts: std::collections::BTreeSet<u32>,
+    /// The programs that gather a readout plane's host-read rows apart, by
+    /// the plane's rows and width, and every such plane the ladder traced.
+    gathers: std::collections::HashMap<(u32, u32), std::sync::Arc<crate::device::Program>>,
+    gather_shapes: std::collections::BTreeSet<(u32, u32)>,
     /// Token-declared values on a readout-rowed path (`crate::rows`), and
     /// a readout-rowed value that tells their rows.
     readout_rowed: (std::sync::Arc<Vec<bool>>, Option<ValueId>),
@@ -510,6 +533,28 @@ impl Shell {
                 .windowed(window, boot.budget.max_tokens)
                 .seated(boot.budget.max_lanes))
         };
+        let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
+        // The chunk the compiler picks for this trace on a TPU, where it
+        // packs one; the store lays its own runs around it.
+        let target = poem_compiler::chunk::plan(
+            &boot.trace,
+            &budgets,
+            &poem_compiler::DeviceProfile {
+                chunk: poem_compiler::chunk::ChunkProfile::TPU.paged(boot.page_size, boot.context),
+                ..poem_compiler::DeviceProfile::default()
+            },
+        )
+        .map_or(crate::store::layout::TARGET_CHUNK, |recipe| {
+            recipe.chunk_bytes
+        });
+        // The null and sink chunks the pool lays past its pages, which a
+        // budget of kv pages and state slots does not pay for: off the room.
+        let reserved = crate::store::reserved_bytes(
+            &boot.trace,
+            paging_at(u64::from(boot.context.div_ceil(boot.page_size.max(1))), boot.slots)?,
+            rs_layout.as_deref(),
+            target,
+        )?;
         // The pool buffers are program parameters, so the pages are fixed
         // before anything traces: what the budget buys, or with none what
         // the share leaves past what others held at open, the weights (at
@@ -529,7 +574,10 @@ impl Shell {
         };
         let room_at = |floor: u64| {
             working.map_or(u64::MAX, |working| {
-                working.saturating_sub(floor).saturating_sub(headroom)
+                working
+                    .saturating_sub(floor)
+                    .saturating_sub(headroom)
+                    .saturating_sub(reserved)
             })
         };
         let room = room_at(weight_floor);
@@ -601,6 +649,7 @@ impl Shell {
         let device_cap = working.map_or(u64::MAX, |working| {
             working
                 .saturating_sub(demand(fit, slots))
+                .saturating_sub(reserved)
                 .saturating_sub(headroom)
         });
         let weights = if device.is_dry() {
@@ -624,7 +673,6 @@ impl Shell {
                 &engine,
             )?
         };
-        let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
         let pools = Pools::reserve(
             &device,
             &handles,
@@ -632,19 +680,10 @@ impl Shell {
             paging,
             &facts,
             rs_layout.as_deref(),
+            demand(fit, slots),
+            target,
         )?;
         handles.seal();
-
-        let spaces = boot
-            .trace
-            .caches
-            .iter()
-            .filter_map(|row| match row {
-                poem_ir::CacheRow::Kv { space, .. } => Some(*space as usize + 1),
-                poem_ir::CacheRow::State { .. } => None,
-            })
-            .max()
-            .unwrap_or(0);
 
         let exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled)
             .map_err(|why| Fault::Unbound { what: why })?;
@@ -734,7 +773,8 @@ impl Shell {
             budgets,
             weights,
             pools,
-            spaces,
+            host: crate::store::tier::Host::default(),
+            disk: None,
             exports,
             readback,
             dit,
@@ -755,11 +795,12 @@ impl Shell {
             token_feeds: Vec::new(),
             probes: Vec::new(),
             probed: std::collections::HashMap::new(),
-            last: FireCost::default(),
             traced: std::collections::HashMap::new(),
             shaped: std::collections::HashMap::new(),
             deferred: None,
             readouts: std::collections::BTreeSet::new(),
+            gathers: std::collections::HashMap::new(),
+            gather_shapes: std::collections::BTreeSet::new(),
             readout_rowed,
         })
     }
@@ -787,15 +828,6 @@ impl Shell {
     #[must_use]
     pub fn device(&self) -> &Device {
         &self.device
-    }
-
-    /// The width of the float output read at the readout rows, when the plan
-    /// reads one.
-    #[must_use]
-    pub fn readout_width(&self) -> Option<u32> {
-        (self.exports.iter())
-            .find(|out| out.decl.readout && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32))
-            .map(|out| out.decl.width)
     }
 
     /// The patch element the plan's image tower reads, if it has one.
@@ -851,11 +883,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn last_fire(&self) -> FireCost {
-        self.last
-    }
-
-    #[must_use]
     pub fn footprint(&self) -> (u64, u64) {
         (self.weights.bytes(), self.pools.bytes())
     }
@@ -870,8 +897,9 @@ impl Shell {
         self.pools.has_state()
     }
 
+    /// Seats `slot` afresh: it holds no rows. (Its record is zeroed by the
+    /// first fire that names it fresh.)
     pub fn open(&mut self, slot: u32) -> Result<()> {
-        self.pools.clear(&self.device, &self.handles, slot)?;
         let seats = self.held.len() as u64;
         let held = self.held.get_mut(slot as usize).ok_or(Fault::Ceiling {
             what: "slots",
@@ -882,25 +910,199 @@ impl Shell {
         Ok(())
     }
 
+    /// Copies kv runs between slot refs of the kv list.
     pub fn copy_kv(&mut self, moves: &[engine::transfer::KvRun]) -> Result<()> {
-        self.pools.copy_kv(&self.device, &self.handles, moves, &[])
+        self.pools.copy_kv(&self.device, &self.handles, moves)
     }
 
-    pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
-        self.pools.copy_slot(&self.device, &self.handles, src, dst)
+    /// Copies whole slots `(shape, src ref, dst ref)`, in order.
+    pub fn copy_slots(&mut self, copies: &[(engine::chunk::ShapeId, u32, u32)]) -> Result<()> {
+        self.pools.copy(&self.device, &self.handles, copies)
+    }
+
+    /// Moves chunks as the runtime asks, then places them by the table.
+    pub fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> Result<()> {
+        self.pools.evacuate(&self.device, &self.handles, evacuation)
+    }
+
+    /// The bytes of slots `(shape, ref)`, in order.
+    pub fn slot_bytes(&self, slots: &[(engine::chunk::ShapeId, u32)]) -> Result<Vec<u8>> {
+        self.pools.read(slots)
     }
 
     #[must_use]
-    pub fn buffer_pages(&self) -> u32 {
-        self.pools.buffer_pages()
+    pub fn pools(&self) -> &Pools {
+        &self.pools
     }
 
-    pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
-        self.pools.copy_pages(&self.device, &self.handles, moves)
+    /// Seats the host tier, `host` bytes of whole chunks (`None`: as many as
+    /// the device pool holds), and the slot file `disk` names
+    /// (`(dir, bytes, persistent)`), kv list slots.
+    pub fn seat_tiers(
+        &mut self,
+        host: Option<u64>,
+        disk: Option<(&Path, u64, bool)>,
+    ) -> Result<()> {
+        let chunk = self.pools.layout().chunk_bytes;
+        let chunks = match host {
+            Some(bytes) => u32::try_from(bytes / chunk.max(1)).unwrap_or(u32::MAX),
+            None => self.pools.chunks().saturating_sub(2),
+        };
+        self.host = crate::store::tier::Host::new(chunks, chunk);
+        self.disk = match (disk, self.pools.layout().kv()) {
+            (Some((dir, bytes, persistent)), Some(kv)) if bytes > 0 => Some(
+                crate::store::tier::Disk::open(dir, bytes, kv.slot_bytes, persistent)?,
+            ),
+            _ => None,
+        };
+        Ok(())
     }
 
-    pub fn state_bytes(&self, slot: u32) -> Result<Vec<u8>> {
-        self.pools.read_slot(slot)
+    /// The pool's facts with its tiers.
+    #[must_use]
+    pub fn tiered_facts(&self) -> engine::chunk::ChunkFacts {
+        let mut facts = self.pools.facts();
+        facts.host_chunks = self.host.chunks();
+        if let (Some(disk), Some(kv)) = (&self.disk, self.pools.layout().kv()) {
+            let spc = self.pools.layout().slots_per_chunk(kv).max(1);
+            facts.disk_chunks = disk.slots() / spc;
+            facts.disk_persistent = disk.persistent();
+            facts.disk_kept = disk.kept();
+        }
+        facts
+    }
+
+    /// Moves whole slots of shape `id` between the device, the host tier and
+    /// the slot file (CONTRACT-BC 22): `(src, dst)` refs of each side's own
+    /// space, in order.
+    pub fn copy_tier(
+        &mut self,
+        id: engine::chunk::ShapeId,
+        from: Tier,
+        to: Tier,
+        pairs: &[(u32, u32)],
+    ) -> Result<()> {
+        let facts = self.pools.facts();
+        let shape = facts.shape(id).cloned().ok_or_else(|| Fault::Unbound {
+            what: format!("slot shape {id}, which this load does not state"),
+        })?;
+        let disk_ok = self.pools.kv_shape() == Some(id);
+        if (from == Tier::Disk || to == Tier::Disk) && !disk_ok {
+            return Err(Fault::Unbound {
+                what: format!("shape {id} on the slot file, which holds kv list slots only"),
+            });
+        }
+        if from == Tier::Device && to == Tier::Device {
+            let copies: Vec<_> = pairs.iter().map(|&(a, b)| (id, a, b)).collect();
+            return self.pools.copy(&self.device, &self.handles, &copies);
+        }
+        let len = shape.slot_bytes;
+        let chunk = facts.chunk_bytes;
+        // Every source slot's bytes, in order.
+        let srcs: Vec<u32> = pairs.iter().map(|p| p.0).collect();
+        let mut data: Vec<u8> = match from {
+            Tier::Device => self
+                .pools
+                .read_slots(&self.device, &self.handles, id, &srcs)?,
+            Tier::Host => {
+                let mut out = Vec::with_capacity(srcs.len() * len as usize);
+                for &slot in &srcs {
+                    out.extend_from_slice(self.host.read(shape.tier_offset(chunk, slot), len)?);
+                }
+                out
+            }
+            Tier::Disk => {
+                let disk = self.disk.as_mut().ok_or_else(no_disk)?;
+                let mut out = Vec::with_capacity(srcs.len() * len as usize);
+                for &slot in &srcs {
+                    out.extend(disk.read(slot)?);
+                }
+                out
+            }
+        };
+        if data.len() as u64 != srcs.len() as u64 * len {
+            data.resize((srcs.len() as u64 * len) as usize, 0);
+        }
+        let dsts: Vec<u32> = pairs.iter().map(|p| p.1).collect();
+        match to {
+            Tier::Device => {
+                self.pools
+                    .write_slots(&self.device, &self.handles, id, &dsts, &data)?
+            }
+            Tier::Host => {
+                for (at, &slot) in dsts.iter().enumerate() {
+                    let bytes = &data[at * len as usize..(at + 1) * len as usize];
+                    self.host.write(shape.tier_offset(chunk, slot), bytes)?;
+                }
+            }
+            Tier::Disk => {
+                let disk = self.disk.as_mut().ok_or_else(no_disk)?;
+                for (at, &slot) in dsts.iter().enumerate() {
+                    disk.write(slot, &data[at * len as usize..(at + 1) * len as usize])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Where each of `slots` (host tier refs, shape by shape) lies in the
+    /// host chunks, and its bytes, in order.
+    fn tier_spans(&self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> Result<Vec<(u64, u64)>> {
+        let facts = self.pools.facts();
+        let chunk = facts.chunk_bytes;
+        let mut spans = Vec::new();
+        for (id, refs) in slots {
+            let shape = facts.shape(*id).ok_or_else(|| Fault::Unbound {
+                what: format!("slot shape {id}, which this load does not state"),
+            })?;
+            for &slot in refs {
+                spans.push((shape.tier_offset(chunk, slot), shape.slot_bytes));
+            }
+        }
+        Ok(spans)
+    }
+
+    /// See `Engine::read_tier_slots`: host tier slots' bytes, shape by
+    /// shape, each as `copy_tier` lays it (the device slot's bytes). Copies
+    /// into the host tier land before `copy_tier` returns.
+    pub fn read_tier_slots(&self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> Result<Vec<u8>> {
+        let spans = self.tier_spans(slots)?;
+        let total: u64 = spans.iter().map(|&(_, len)| len).sum();
+        let mut out = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
+        for (offset, len) in spans {
+            out.extend_from_slice(self.host.read(offset, len)?);
+        }
+        Ok(out)
+    }
+
+    /// See `Engine::write_tier_slots`: `bytes`, laid out as
+    /// [`Self::read_tier_slots`] returns them, into host tier slots; refused
+    /// whole when the byte count differs.
+    pub fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let spans = self.tier_spans(slots)?;
+        let need: u64 = spans.iter().map(|&(_, len)| len).sum();
+        if bytes.len() as u64 != need {
+            return Err(Fault::Ceiling {
+                what: "bytes of host tier slots",
+                need,
+                have: bytes.len() as u64,
+            });
+        }
+        // every span inside the tier before any lands
+        for &(offset, len) in &spans {
+            self.host.read(offset, len)?;
+        }
+        let mut at = 0usize;
+        for (offset, len) in spans {
+            let len = usize::try_from(len).unwrap_or(usize::MAX);
+            self.host.write(offset, &bytes[at..at + len])?;
+            at += len;
+        }
+        Ok(())
     }
 
     pub fn register_adapter(
@@ -1004,12 +1206,6 @@ impl Shell {
     /// rows its readout asked for.
     pub fn fire_seated(&mut self, lanes: &[Seated<'_>]) -> Result<Vec<Vec<f32>>> {
         self.fire_full(lanes).map(|fired| fired.rows)
-    }
-
-    /// Like `fire_full`, with the outputs left on the device: `rows` comes
-    /// back empty and `kept` holds the planes.
-    pub fn fire_kept(&mut self, lanes: &[Seated<'_>]) -> Result<Fired> {
-        self.fire_kept_with(lanes, &[])
     }
 
     /// Makes the next fire read these lanes' tokens off the device: lane
@@ -1280,42 +1476,157 @@ impl Shell {
         let rows = composition.rows();
         let lane_count = composition.lane_count();
         let paging = self.pools.paging();
-        let sink_page = self.pools.sink_page();
-        let window_sink = self.pools.window_sink_page();
+        let kv_shape = self.pools.kv_shape();
+        let window_shape = self.pools.window_shape();
+        let rs_shape = self.pools.rs_shape();
+        let sink_page = kv_shape.map_or(0, |id| self.pools.sink(id));
+        let window_sink = window_shape.map_or(0, |id| self.pools.sink(id));
         let windowed = self.pools.has_windowed();
-        let sink_slot = self.pools.sink_slot();
+        let records: Vec<(engine::chunk::ShapeId, u32)> = self.pools.records().to_vec();
+        let record_sinks: Vec<u32> = records.iter().map(|&(id, _)| self.pools.sink(id)).collect();
+        // Before the fire, on the stream: every lane's list slot copies,
+        // then each record's run onto its copy-on-write slot, then the
+        // records a fresh state starts zeroed; a group names its copies on
+        // every lane, made once.
+        let mut copies: Vec<(engine::chunk::ShapeId, u32, u32)> = Vec::new();
+        let mut fresh: Vec<(engine::chunk::ShapeId, u32)> = Vec::new();
+        for seated in lanes {
+            for (id, pairs) in seated.copies {
+                for &[src, dst] in pairs {
+                    if !copies.iter().any(|c| (c.0, c.2) == (*id, dst)) {
+                        copies.push((*id, src, dst));
+                    }
+                }
+            }
+        }
+        // Each lane's grain indices: kv table, window table, a slot a
+        // record piece, its rs verb's pages.
+        let mut lane_records: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
+        let mut lane_verbs: Vec<engine::fire::RsVerb> = Vec::with_capacity(lanes.len());
+        let mut lane_pages: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
+        let mut lane_windows: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
+        for (at, seated) in lanes.iter().enumerate() {
+            let pages = match kv_shape {
+                Some(id) if !seated.kv_less => self.pools.grains(id, seated.pages)?,
+                _ => seated.pages.to_vec(),
+            };
+            let window = match window_shape {
+                Some(id) if !seated.kv_less && !seated.window.is_empty() => {
+                    self.pools.grains(id, seated.window)?
+                }
+                Some(_) if !seated.kv_less && !seated.pages.is_empty() => {
+                    return Err(Fault::Program {
+                        at: "serve::prepare",
+                        why: format!(
+                            "lane {at} names kv slots and no window list table, which this \
+                             load's windowed rows read"
+                        ),
+                    });
+                }
+                _ => Vec::new(),
+            };
+            lane_pages.push(pages);
+            lane_windows.push(window);
+            let mut slots = Vec::with_capacity(records.len());
+            let have = match seated.held {
+                _ if seated.kv_less => 0,
+                Some(held) => held,
+                None => self
+                    .held
+                    .get(seated.lane.slot as usize)
+                    .copied()
+                    .unwrap_or(0),
+            };
+            let is_fresh = match seated.rs_reset {
+                engine::fire::RsReset::Inferred => have == 0,
+                engine::fire::RsReset::Fresh => true,
+                engine::fire::RsReset::Held => false,
+            };
+            for &(id, piece) in &records {
+                let pair = seated
+                    .fixed
+                    .iter()
+                    .find(|(held, _)| *held == id)
+                    .and_then(|(_, pairs)| pairs.get(piece as usize))
+                    .copied();
+                let Some([run, cow]) = pair else {
+                    return Err(Fault::Program {
+                        at: "serve::prepare",
+                        why: format!(
+                            "lane {at} names no piece {piece} of fixed shape {id}, the record \
+                             this load's recurrent rows read and write"
+                        ),
+                    });
+                };
+                if run != cow && !copies.iter().any(|c| (c.0, c.2) == (id, cow)) {
+                    copies.push((id, run, cow));
+                }
+                if is_fresh && !fresh.contains(&(id, cow)) {
+                    fresh.push((id, cow));
+                }
+                slots.push(self.pools.grain(id, cow)?);
+            }
+            lane_records.push(slots);
+            lane_verbs.push(match seated.rs {
+                engine::fire::RsVerb::Buffer {
+                    pages,
+                    base,
+                    folded,
+                    fold,
+                } => {
+                    let id = rs_shape.ok_or_else(|| Fault::Program {
+                        at: "serve::rs",
+                        why: format!("lane {at} buffers rs rows and this load states no rs list"),
+                    })?;
+                    engine::fire::RsVerb::Buffer {
+                        pages: self.pools.grains(id, pages)?,
+                        base: *base,
+                        folded: *folded,
+                        fold: *fold,
+                    }
+                }
+                engine::fire::RsVerb::Fold => engine::fire::RsVerb::Fold,
+            });
+        }
+        if !copies.is_empty() {
+            self.pools.copy(&self.device, &self.handles, &copies)?;
+        }
+        if !fresh.is_empty() {
+            self.pools.zero(&self.device, &self.handles, &fresh)?;
+        }
 
         let mut seats: Vec<Seat> = Vec::with_capacity(submitted.len());
         let mut tables: Vec<Vec<u32>> = Vec::with_capacity(submitted.len());
-        // Each lane's table in the windowed spaces, as long as `tables`.
+        // Each lane's table in the windowed pool, as long as `tables`.
         let mut window_tables: Vec<Vec<u32>> = Vec::with_capacity(submitted.len());
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         // Each row's index in its lane's cache: the attention plans' causal
         // bound (see `cache_rows_t`).
         let mut cache_rows: Vec<i32> = Vec::with_capacity(rows as usize);
-        let mut slot_ids: Vec<i32> = Vec::with_capacity(submitted.len());
+        // Per lane its index, and per record piece each lane's and each
+        // row's slot (grain index).
+        let mut lane_at: Vec<i32> = Vec::with_capacity(submitted.len());
+        let mut record_ids: Vec<Vec<i32>> =
+            vec![Vec::with_capacity(submitted.len()); records.len()];
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
-        let mut slot_of_row: Vec<i32> = Vec::with_capacity(rows as usize);
+        let mut record_rows: Vec<Vec<i32>> = vec![Vec::with_capacity(rows as usize); records.len()];
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(submitted.len());
         let any_adapter = lanes.iter().any(|s| s.adapter.is_some());
         let mut adapter_routes: Vec<i32> = Vec::new();
-        let mut beginning: Vec<u32> = Vec::new();
-        let mut demand_pages = 0u64;
-        let mut demand_slots = 0u32;
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(submitted.len());
         let mut rs_active = false;
 
         for row in composition.lanes() {
             let source = row.source as usize;
-            let at_lane = slot_ids.len() as i32;
+            let at_lane = lane_at.len() as i32;
             if source >= real {
                 // A padding lane: the sink page and the sink slot, nothing else.
                 let pages = u64::from(row.rows)
                     .div_ceil(u64::from(paging.page_size))
                     .max(1);
                 seats.push(Seat {
-                    slot: sink_slot,
+                    slot: 0,
                     have: 0,
                     rows: row.rows,
                 });
@@ -1329,21 +1640,20 @@ impl Shell {
                     rows: row.rows,
                     wide: false,
                 });
-                slot_ids.push(sink_slot as i32);
-                let pad_slot = if row.rows == 1
-                    && real > 0
-                    && lanes.iter().all(|s| s.lane.tokens.len() == 1)
-                {
-                    sink_slot as i32
-                } else {
-                    -(sink_slot as i32) - 1
-                };
+                lane_at.push(at_lane);
+                let read_only =
+                    !(row.rows == 1 && real > 0 && lanes.iter().all(|s| s.lane.tokens.len() == 1));
+                for (r, &sink) in record_sinks.iter().enumerate() {
+                    let sink = sink as i32;
+                    record_ids[r].push(sink);
+                    let pad_slot = if read_only { -sink - 1 } else { sink };
+                    record_rows[r].extend(std::iter::repeat_n(pad_slot, row.rows as usize));
+                }
                 for at in 0..row.rows {
                     tokens.push(0);
                     positions.push(at as i32);
                     cache_rows.push(-1);
                     request_of_token.push(at_lane);
-                    slot_of_row.push(pad_slot);
                 }
                 if any_adapter {
                     adapter_routes.extend(std::iter::repeat_n(-1, row.rows as usize));
@@ -1369,45 +1679,20 @@ impl Shell {
                         have: self.held.len() as u64,
                     })?,
             };
-            let fresh = match seated.rs_reset {
-                engine::fire::RsReset::Inferred => have == 0,
-                engine::fire::RsReset::Fresh => true,
-                engine::fire::RsReset::Held => false,
-            };
-            let state_slot = seated.rs_slot.unwrap_or(lane.slot);
-            if fresh {
-                beginning.push(state_slot);
-            }
             let seat = Seat {
                 slot: lane.slot,
                 have,
                 rows: row.rows,
             };
             seats.push(seat);
-            tables.push(seated.pages.to_vec());
+            tables.push(lane_pages[source].clone());
             if windowed {
                 window_tables.push(if seated.kv_less {
-                    seated.pages.to_vec()
+                    lane_pages[source].clone()
                 } else {
-                    kv::window_table(&paging, &seat, seated.pages, seated.window)?
+                    lane_windows[source].clone()
                 });
             }
-            let after = u64::from(have) + u64::from(row.rows);
-            let pages = after.div_ceil(u64::from(paging.page_size)).max(1);
-            demand_pages = demand_pages.max(if self.spaces == 0 || seated.kv_less {
-                0
-            } else if seated.pages.is_empty() {
-                paging.base(lane.slot).saturating_add(pages)
-            } else {
-                seated
-                    .pages
-                    .iter()
-                    .take(pages as usize)
-                    .copied()
-                    .max()
-                    .map_or(0, |page| u64::from(page) + 1)
-            });
-            demand_slots = demand_slots.max(state_slot + 1);
 
             // A kv-less lane's mask is over its attention group's rows, for the group-packed attention.
             let kv_mask = seated.mask.filter(|_| !seated.kv_less);
@@ -1453,7 +1738,7 @@ impl Shell {
                 rs_active = true;
             }
             let mut rs_plan = engine::rs::LanePlan::of(
-                seated.rs,
+                &lane_verbs[source],
                 row.rows,
                 seated.first.unwrap_or(have),
                 kv_mask,
@@ -1485,7 +1770,11 @@ impl Shell {
                 rs_plan.gathers = trimmed;
             }
             rs_plans.push(rs_plan);
-            slot_ids.push(state_slot as i32);
+            lane_at.push(at_lane);
+            for (r, &slot) in lane_records[source].iter().enumerate() {
+                record_ids[r].push(slot as i32);
+                record_rows[r].extend(std::iter::repeat_n(slot as i32, row.rows as usize));
+            }
             if !seated.positions.is_empty() && seated.positions.len() != lane.tokens.len() {
                 return Err(Fault::Positions {
                     lane: row.source,
@@ -1501,42 +1790,14 @@ impl Shell {
                 });
                 cache_rows.push(narrow(u64::from(have) + at as u64));
                 request_of_token.push(at_lane);
-                slot_of_row.push(state_slot as i32);
             }
-        }
-
-        self.pools.admit(Demand {
-            kv_pages: u32::try_from(demand_pages).unwrap_or(u32::MAX),
-            state_slots: demand_slots,
-            workspace: 0,
-        })?;
-        self.pools
-            .clear_slots(&self.device, &self.handles, &beginning)?;
-        // The windowed pages the runtime copies before this fire (a fork's
-        // window), whole pages in the windowed pool's own ids.
-        let window_copies: Vec<engine::transfer::KvRun> = lanes
-            .iter()
-            .flat_map(|seated| seated.window_copies)
-            .map(|&(src, dst)| engine::transfer::KvRun {
-                src_page: src,
-                src_token: 0,
-                dst_page: dst,
-                dst_token: 0,
-                tokens: paging.page_size,
-            })
-            .collect();
-        if !window_copies.is_empty() {
-            self.pools
-                .copy_kv(&self.device, &self.handles, &[], &window_copies)?;
         }
 
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(Vec::as_slice).collect();
         let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();
-        let space_windowed: Vec<bool> = (0..self.spaces)
-            .map(|space| self.pools.windowed_space(space as u32))
-            .collect();
-        let mut geometries = space_windowed
+        let table_windowed = self.pools.tables();
+        let mut geometries = table_windowed
             .iter()
             .map(|&in_window| {
                 kv::geometry_with(
@@ -1566,10 +1827,14 @@ impl Shell {
                     ),
                 });
             }
-            for (g, &in_window) in geometries.iter_mut().zip(&space_windowed) {
+            let pages = match kv_shape {
+                Some(id) => self.pools.grains(id, pages)?,
+                None => pages.to_vec(),
+            };
+            for (g, &in_window) in geometries.iter_mut().zip(&table_windowed) {
                 for (i, (&page, &offset)) in pages.iter().zip(offsets).enumerate() {
                     let at = row.row_offset as usize + i;
-                    // A windowed space writes the windowed id of the page
+                    // A windowed table writes the windowed id of the page
                     // the lane holds at the same table position.
                     let page = if in_window {
                         let held = tables[lane_at].iter().position(|&held| held == page);
@@ -1704,7 +1969,10 @@ impl Shell {
         let cache_rows_t = inputs.i32s(handles, &cache_rows, 1);
         let readout_t = inputs.i32s(handles, &readout_rows, 1);
         let request_t = inputs.i32s(handles, &request_of_token, 1);
-        let slot_of_row_t = inputs.i32s(handles, &slot_of_row, 1);
+        let record_rows_t: Vec<Tensor> = record_rows
+            .iter()
+            .map(|rows| inputs.i32s(handles, rows, 1))
+            .collect();
         let adapter_t = any_adapter.then(|| inputs.i32s(handles, &adapter_routes, 1));
         let mrope_t = self.states_mrope.then(|| {
             let mut triples = vec![0i32; rows as usize * 3];
@@ -1731,8 +1999,9 @@ impl Shell {
         let feeds: Vec<crate::dit::Feed<'_>> = lanes
             .iter()
             .zip(&clips_of)
-            .map(|(s, shot)| crate::dit::Feed {
-                slot: s.rs_slot.unwrap_or(s.lane.slot),
+            .enumerate()
+            .map(|(at, (s, shot))| crate::dit::Feed {
+                slot: lane_records[at].first().copied().unwrap_or(0),
                 group: s.group,
                 inputs: s.inputs,
                 clips: *shot,
@@ -1749,16 +2018,16 @@ impl Shell {
         let row_valid: Vec<i32> = (0..rows).map(|_| 1).collect();
         let row_valid_t = inputs.i32s(handles, &row_valid, 1);
 
-        let mut space_seats = Vec::with_capacity(self.spaces);
-        let mut geometry = Vec::with_capacity(self.spaces);
-        for (g, &in_window) in geometries.iter().zip(&space_windowed) {
+        let mut table_seats = Vec::with_capacity(table_windowed.len());
+        let mut geometry = Vec::with_capacity(table_windowed.len());
+        for (g, &in_window) in geometries.iter().zip(&table_windowed) {
             let mut indices = g.indices.clone();
             let padded = (lane_count as usize) * (max_pages as usize);
             let sink = if in_window { window_sink } else { sink_page };
             indices.resize(padded.max(indices.len()), sink as i32);
             let indptr = inputs.i32s(handles, &g.indptr, 1);
             let indices = inputs.i32s(handles, &indices, 1);
-            space_seats.push(SpaceSeat {
+            table_seats.push(TableSeat {
                 page_indptr: indptr,
                 page_indices: indices,
                 max_pages,
@@ -1776,15 +2045,15 @@ impl Shell {
             });
         }
         if geometry.is_empty() {
-            // A plan with no KV space still reads the token space's tables
-            // (`request_of_token`, `row_valid`): space 0 binds them alone.
+            // A plan with no kv row still reads the All axis's token tables
+            // (`request_of_token`, `row_valid`): table 0 binds them alone.
             geometry.push(CacheGeometry {
                 row_valid: Some(row_valid_t),
                 request_of_token: Some(request_t),
                 ..CacheGeometry::default()
             });
         }
-        let caches = self.pools.table(&space_seats, slot_of_row_t)?;
+        let caches = self.pools.table(&table_seats, &record_rows_t)?;
 
         let rs_seat = match (&self.rs_layout, rs_active) {
             (Some(layout), true) => {
@@ -1805,7 +2074,6 @@ impl Shell {
                         &window.indptr_host,
                         span.lane_offset,
                         paging.page_size.max(1),
-                        paging.slots.max(1),
                     )?;
                     maps.insert(
                         key,
@@ -1823,9 +2091,13 @@ impl Shell {
                     plans: rs_plans.clone(),
                     replay: inputs.i32s(handles, &replay, 1),
                     commit: inputs.i32s(handles, &commit, 1),
-                    slots: inputs.i32s(handles, &slot_ids, 1),
+                    slots: record_ids
+                        .iter()
+                        .map(|ids| inputs.i32s(handles, ids, 1))
+                        .collect(),
                     layout: std::sync::Arc::clone(layout),
                     buffers: self.pools.rs_buffers(),
+                    page_tokens: paging.page_size.max(1),
                     maps,
                     ext: std::cell::RefCell::new(std::collections::HashMap::new()),
                 }))
@@ -1845,6 +2117,12 @@ impl Shell {
         };
         let slots = self.slots(fire_rows);
         let planes = self.planes(&composition, &slots, readout_rows.len() as u32)?;
+        // The host readers' readout rows, gathered apart after the fire.
+        let host = self.host_table(&composition, &planes, &readout_layout, lanes, real);
+        if let Some(table) = &host {
+            let plane = &planes[table.plane];
+            self.gather_shapes.insert((plane.rows, plane.width));
+        }
 
         // Each window's readouts (its lanes'): a window short of every lane
         // cuts its readout-rowed values to them, so they reach the text.
@@ -1876,6 +2154,7 @@ impl Shell {
             patches: patch_bindings,
             clip_slots,
             geometry,
+            window_table: self.pools.table_of(true),
             tables: FireTables {
                 request_of_token: request_t,
                 mask,
@@ -1888,17 +2167,22 @@ impl Shell {
         let t1 = std::time::Instant::now();
         // Everything the program text depends on: the walk's windows and
         // descriptor, every input's shape, the page bound and the readout.
-        let key = *blake3::hash(
-            format!(
-                "{descriptor:?}|{windows:?}|{}|{max_pages}|{}|{}|{rs_active}|{dit_key}|{:?}|{readout_spans:?}",
-                inputs.shapes(),
-                readout_rows.len(),
-                self.gathers_readout,
-                self.probes
+        // Formatted only where the shape key misses: at 256 lanes the
+        // descriptor's text is a tenth of a decode's host time.
+        let gathers_readout = self.gathers_readout;
+        let full_key = |probes: &[ValueId]| -> [u8; 32] {
+            *blake3::hash(
+                format!(
+                    "{descriptor:?}|{windows:?}|{}|{max_pages}|{}|{}|{rs_active}|{dit_key}|{:?}|{readout_spans:?}",
+                    inputs.shapes(),
+                    readout_rows.len(),
+                    gathers_readout,
+                    probes
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        )
-        .as_bytes();
+            .as_bytes()
+        };
         // A plain fire (no recurrent-state maps, media, clips or probes) is
         // also keyed by its shape alone, so lanes cut differently skip the
         // walk too.
@@ -1928,7 +2212,17 @@ impl Shell {
             .and_then(|k| self.shaped.get(&k))
             .map(std::sync::Arc::clone)
             .filter(|_| !shape_check());
-        let found = hit.or_else(|| self.traced.get(&key).map(std::sync::Arc::clone));
+        let mut key = None;
+        let found = match hit {
+            Some(program) => Some(program),
+            None => {
+                let k = full_key(&self.probes);
+                key = Some(k);
+                self.traced.get(&k).map(std::sync::Arc::clone)
+            }
+        };
+        // a miss, which every path below that reads it is, keyed it
+        let missed = |key: Option<[u8; 32]>| key.expect("a missed fire's key");
         if found.is_none() && self.deferred.is_some() {
             let (text, sig, probed) = self.trace_text(
                 &slots,
@@ -1946,7 +2240,7 @@ impl Shell {
             )?;
             if let Some(deferred) = self.deferred.as_mut() {
                 deferred.push(Deferred {
-                    key,
+                    key: missed(key),
                     shape_key,
                     text,
                     sig,
@@ -1976,6 +2270,7 @@ impl Shell {
                     pixels_seat.as_ref(),
                 )?;
                 let (program, probed) = program;
+                let key = missed(key);
                 self.probed.insert(key, probed);
                 self.traced.insert(key, std::sync::Arc::clone(&program));
                 program
@@ -2016,7 +2311,10 @@ impl Shell {
         // write, then a decoder's pixel plane and its grid, then the probes.
         let keep = self.keep_readout;
         let mut outs = outs;
-        let probed_ids = self.probed.get(&key).cloned().unwrap_or_default();
+        // A shape-key hit is a plain fire's, which probes nothing.
+        let probed_ids = key
+            .and_then(|key| self.probed.get(&key).cloned())
+            .unwrap_or_default();
         let mut probes = Vec::with_capacity(probed_ids.len());
         for value in probed_ids.iter().rev() {
             let Some(buffer) = outs.pop() else {
@@ -2089,6 +2387,10 @@ impl Shell {
                 *slot = seat.have + seat.rows;
             }
         }
+        let host = match host.filter(|table| table.at.iter().any(Option::is_some)) {
+            Some(table) => Some(self.host_rows(table, &planes, &outs)?),
+            None => None,
+        };
         let kept = self.kept(
             &composition,
             &planes,
@@ -2096,10 +2398,14 @@ impl Shell {
             (&readout_rows, &readout_layout),
             &pixels,
             real,
+            host,
         );
         let rows_out = match &kept {
             Some(kept) if !keep => (0..real)
                 .map(|lane| {
+                    if lanes.get(lane).is_some_and(|seated| seated.quiet) {
+                        return Ok(Vec::new());
+                    }
                     kept.lane_rows(lane)
                         .map(|read| read.map(|(_, _, values)| values).unwrap_or_default())
                         .map_err(|why| Fault::Program {
@@ -2164,7 +2470,125 @@ impl Shell {
         Ok(planes)
     }
 
+    /// The readout rows this fire's host-reading lanes read, when its planes
+    /// hold one readout plane of one layer deeper than the short plane
+    /// (`HOST_ROWS`): every lane's start there, all `None` when the readers'
+    /// rows do not fit.
+    fn host_table(
+        &self,
+        composition: &poem_exec::fire::Composition,
+        planes: &[PlaneShape],
+        readout_layout: &[(u32, u32)],
+        lanes: &[Seated<'_>],
+        real: usize,
+    ) -> Option<HostTable> {
+        let mut readout = planes.iter().enumerate().filter(|(_, plane)| {
+            let decl = &self.exports[plane.export].decl;
+            decl.readout && decl.layers <= 1 && plane.dtype == Dtype::F32
+        });
+        let (plane, shape) = readout.next()?;
+        if readout.next().is_some() || i64::from(shape.rows) <= HOST_ROWS {
+            return None;
+        }
+        let mut table: Vec<i32> = Vec::new();
+        let mut at = vec![None; real];
+        for row in composition.lanes() {
+            let source = row.source as usize;
+            if source >= real || lanes.get(source).is_none_or(|seated| seated.quiet) {
+                continue;
+            }
+            let class = row.class as usize;
+            let reads = self.readback.get(class).copied().flatten() == Some(shape.export)
+                && self.exports[shape.export].classes.contains(class);
+            if !reads || at[source].is_some() {
+                continue;
+            }
+            let (first, count) = readout_layout[source];
+            at[source] = Some(table.len() as u32);
+            table.extend((first..first + count).map(|r| r as i32));
+        }
+        if table.len() as i64 > HOST_ROWS {
+            table.clear();
+            at.iter_mut().for_each(|a| *a = None);
+        }
+        table.resize(HOST_ROWS as usize, 0);
+        Some(HostTable { plane, table, at })
+    }
+
+    /// The program that gathers `HOST_ROWS` rows of a `[rows, width]` f32
+    /// plane: built while the warm ladder runs (`gather_shapes`), else
+    /// where a fire first needs it.
+    pub(crate) fn gather_program(
+        &mut self,
+        rows: u32,
+        width: u32,
+    ) -> Result<std::sync::Arc<crate::device::Program>> {
+        if let Some(program) = self.gathers.get(&(rows, width)) {
+            return Ok(std::sync::Arc::clone(program));
+        }
+        use kernels_xla::hlo::{Elem, Func, Ty};
+        let mut f = Func::new("main");
+        let plane = f.param(
+            Ty::new(Elem::F32, &[i64::from(rows), i64::from(width)]),
+            None,
+        );
+        let ids = f.param(Ty::new(Elem::I32, &[HOST_ROWS]), None);
+        let picked = f.take_rows(plane, ids).map_err(|e| Fault::Program {
+            at: "serve::gather_program",
+            why: e.to_string(),
+        })?;
+        let program = self.device.program(
+            &f.module("gather", &[picked]),
+            crate::trace::Signature {
+                params: Vec::new(),
+                results: vec![None],
+            },
+        )?;
+        self.gathers
+            .insert((rows, width), std::sync::Arc::clone(&program));
+        Ok(program)
+    }
+
+    /// Compiles the gather program of every readout plane the ladder traced.
+    pub(crate) fn warm_gathers(&mut self) -> Result<()> {
+        let shapes: Vec<(u32, u32)> = self.gather_shapes.iter().copied().collect();
+        for (rows, width) in shapes {
+            self.gather_program(rows, width)?;
+        }
+        Ok(())
+    }
+
+    /// The host readers' rows of the fire's readout plane gathered into a
+    /// short plane of their own, enqueued behind the fire (bit for bit its
+    /// rows; the fire's program is the one it is without them).
+    fn host_rows(
+        &mut self,
+        table: HostTable,
+        planes: &[PlaneShape],
+        outs: &[crate::pjrt::Buffer],
+    ) -> Result<(HostTable, crate::pjrt::Buffer)> {
+        let shape = &planes[table.plane];
+        let program = self.gather_program(shape.rows, shape.width)?;
+        let bytes: Vec<u8> = table.table.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let ids = self
+            .device
+            .upload_flat(crate::pjrt::ElementType::S32, &bytes, HOST_ROWS)?;
+        let plane = outs.get(table.plane).ok_or_else(|| Fault::Unbound {
+            what: "the readout plane, which the program did not return".to_string(),
+        })?;
+        let mut got = self.device.run(
+            &program,
+            vec![crate::pjrt::Arg::Keep(plane), crate::pjrt::Arg::Keep(&ids)],
+            false,
+        )?;
+        let buffer = got.pop().ok_or_else(|| Fault::Unbound {
+            what: "the gathered readout rows".to_string(),
+        })?;
+        Ok((table, buffer))
+    }
+
     /// The fire's returned planes as each real lane reads them.
+    #[allow(clippy::too_many_arguments)]
     fn kept(
         &self,
         composition: &poem_exec::fire::Composition,
@@ -2173,6 +2597,7 @@ impl Shell {
         (readout_rows, readout_layout): (&[i32], &[(u32, u32)]),
         pixels: &[Pixels],
         real: usize,
+        host: Option<(HostTable, crate::pjrt::Buffer)>,
     ) -> Option<std::sync::Arc<crate::readout::Kept>> {
         use crate::readout::{Plane, Seat};
         use poem_ir::InputAxis;
@@ -2249,6 +2674,9 @@ impl Shell {
                 self.pixels_name(),
                 pixels.iter().map(|(values, _)| values.clone()).collect(),
             ),
+            host: host.map(|(table, buffer)| {
+                crate::readout::HostRows::new(table.plane, buffer, table.at)
+            }),
         }))
     }
 
@@ -2583,6 +3011,19 @@ struct PlaneShape {
 }
 
 type ReadoutTable = (Vec<i32>, Vec<(u32, u32)>, Vec<u32>);
+
+/// The most readout rows a fire's host readers have gathered apart, into a
+/// plane of their own (past them, the whole readout plane comes back).
+const HOST_ROWS: i64 = 8;
+
+/// A fire's host readers' readout rows: the readout plane's index among its
+/// planes, the plane's rows they read (padded with row 0) and per real lane
+/// where its rows start among them.
+struct HostTable {
+    plane: usize,
+    table: Vec<i32>,
+    at: Vec<Option<u32>>,
+}
 
 /// The token rows whose logits come back, per real lane where its rows
 /// sit in that list, and where each of the fire's lanes' rows start in it

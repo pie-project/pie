@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::device::{Buffer, Pinned};
 use crate::error::Result;
-use crate::store::SpaceSeat;
+use crate::store::TableSeat;
 use crate::store::kv::{Facts, Geometry, Paging, SpaceFacts};
 
 const GRANT_INT_BYTES: u64 = 1 << 20;
@@ -149,7 +149,7 @@ struct Grant {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SpaceAt {
+struct TableAt {
     indptr: u64,
     indices: u64,
     last_page_len: u64,
@@ -165,7 +165,7 @@ pub struct Handles {
     pub windows: u64,
     pub qo_absolute: Option<u64>,
     pub live_rows: Option<u64>,
-    pub spaces: Vec<SpaceHandles>,
+    pub page_tables: Vec<TableHandles>,
     pub slot_ids: Tensor,
     pub row_valid: Tensor,
     pub adapter_routes: Option<Tensor>,
@@ -177,6 +177,38 @@ pub struct Handles {
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
     pub lane_of_row: Tensor,
+    /// The fire's rs tables, when it buffers recurrent rows.
+    pub rs: Option<RsHandles>,
+}
+
+/// Where a fire's staged rs tables lie on the device: a
+/// [`kernels_cuda::runtime::channel::RsLane`] a lane (padded lanes inert),
+/// the slot address of each lane's rs buffer pages, and each replayed row's
+/// buffer token. Fixed for the load, so a recorded body reads whatever slots
+/// the fire it serves names.
+#[derive(Debug, Clone, Copy)]
+pub struct RsHandles {
+    pub lanes: u64,
+    pub pages: u64,
+    pub replay_tok: u64,
+}
+
+/// A buffering fire's rs tables, as `write_host` stages them.
+#[derive(Debug, Clone, Copy)]
+pub struct RsFire<'a> {
+    pub lanes: &'a [kernels_cuda::runtime::channel::RsLane],
+    pub pages: &'a [u64],
+    pub replay_tok: &'a [u32],
+}
+
+/// The rs section's offsets and capacities.
+#[derive(Debug, Clone, Copy)]
+struct RsAt {
+    lanes: u64,
+    pages: u64,
+    pages_cap: u64,
+    replay_tok: u64,
+    replay_cap: u64,
 }
 
 const AXES: u64 = 3;
@@ -239,7 +271,7 @@ struct PackingAt {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SpaceHandles {
+pub struct TableHandles {
     pub indptr: Tensor,
     pub indices: Tensor,
     pub last_page_len: Tensor,
@@ -255,17 +287,24 @@ pub struct Fire<'a> {
     pub windows: &'a [i32],
     pub qo_absolute: &'a [i32],
     pub live: &'a [u32],
+    /// The record each lane names (under zero: none), a lane each.
     pub slot_ids: &'a [i32],
+    /// The ids the recurrent kernels read the records by: `slot_ids`
+    /// rewritten a lane each, or a block of lanes a table of pieces
+    /// (`Pools::state_tables`).
+    pub state_ids: &'a [i32],
     pub adapter_routes: Option<&'a [i32]>,
     pub readout_rows: &'a [i32],
     pub readout_live: u32,
-    pub spaces: &'a [Geometry],
+    pub page_tables: &'a [Geometry],
     pub mask: Option<&'a crate::mask::Staged>,
     pub live_rows: u32,
     pub lane_of_row: &'a [i32],
     pub lane_reach: u32,
     pub group_of_lane: &'a [i32],
     pub packings: &'a [PackingFire<'a>],
+    /// The rs tables of a fire whose lanes buffer recurrent rows.
+    pub rs: Option<RsFire<'a>>,
 }
 
 #[derive(Debug)]
@@ -348,9 +387,13 @@ pub struct Staged {
     adapter_rows: Option<u32>,
     readouts: u32,
     mask_bytes: Option<u32>,
-    space_indices: Vec<u32>,
-    space_lanes: u32,
+    table_indices: Vec<u32>,
+    table_lanes: u32,
+    /// The ids staged for the recurrent rows.
+    state_ids: u32,
     packed: bool,
+    /// The rs tables' pages and replayed rows staged, when it buffers.
+    rs: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -514,7 +557,8 @@ pub struct Inputs {
     lane_of_row: u64,
     group_of_lane: u64,
     packings: Vec<PackingAt>,
-    spaces: Vec<SpaceAt>,
+    page_tables: Vec<TableAt>,
+    rs: Option<RsAt>,
     max_lanes: u32,
     max_rows: u32,
     plans: Vec<Option<Workspace>>,
@@ -542,7 +586,7 @@ impl Inputs {
     pub fn reserve(
         budget: &Budget,
         paging: Paging,
-        spaces: usize,
+        page_tables: usize,
         facts: &Facts,
         classes: usize,
         regions: usize,
@@ -557,12 +601,14 @@ impl Inputs {
         selections: usize,
         masked: bool,
         schedule_streams: &[Option<u32>],
+        state_ids: u32,
+        rs_page_tokens: Option<u32>,
     ) -> Result<Inputs> {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(crate::window::lane_capacity(budget.max_lanes));
         let pages = lanes * u64::from(paging.pages_per_slot);
         let window_slots =
-            crate::window::Slots::new(classes, lanes, runs, gathered, rows, spaces, pages);
+            crate::window::Slots::new(classes, lanes, runs, gathered, rows, page_tables, pages);
         let window_ints = window_slots.words();
 
         let mut at = 0u64;
@@ -580,7 +626,7 @@ impl Inputs {
         let live_ints = live_seat.words();
         let live_rows = take(live_ints * 4);
         let row_valid = take(rows);
-        let slot_ids = take(lanes * 4);
+        let slot_ids = take(lanes * 4 * u64::from(state_ids.max(1)));
         let adapter_routes = take(rows * 4);
         let readout_rows = take(rows * 4);
         let readout_live = take(4);
@@ -592,8 +638,8 @@ impl Inputs {
         };
         let mask_bits = take(mask_bytes);
         let mask_indptr = take((lanes + 1) * 4);
-        let spaces: Vec<SpaceAt> = (0..spaces)
-            .map(|_| SpaceAt {
+        let page_tables: Vec<TableAt> = (0..page_tables)
+            .map(|_| TableAt {
                 indptr: take((lanes + 1) * 4),
                 indices: take(pages * 4),
                 last_page_len: take(lanes * 4),
@@ -611,6 +657,20 @@ impl Inputs {
                 permutation: take(rows * 4),
             })
             .collect();
+        // A lane's replayed rows past `REPLAYED` widen no body and are rare:
+        // the tables hold every staged row replayed once more and that many
+        // a lane beside, and the pages they lie in.
+        let rs = rs_page_tokens.map(|tokens| {
+            let replay_cap = rows + lanes * u64::from(crate::store::rs::REPLAYED);
+            let pages_cap = (replay_cap + rows).div_ceil(u64::from(tokens.max(1))) + 2 * lanes;
+            RsAt {
+                lanes: take(lanes * 16),
+                pages: take(pages_cap * 8),
+                pages_cap,
+                replay_tok: take(replay_cap * 4),
+                replay_cap,
+            }
+        });
         let stage_bytes = take(0);
         let seats: Vec<SeatAt> = seats
             .iter()
@@ -701,7 +761,8 @@ impl Inputs {
             lane_of_row,
             group_of_lane,
             packings,
-            spaces,
+            page_tables,
+            rs,
             max_lanes: crate::window::lane_capacity(budget.max_lanes),
             max_rows: budget.max_tokens,
             inject_runs: None,
@@ -804,7 +865,7 @@ impl Inputs {
             });
         }
         let mut spelled: Option<usize> = None;
-        for geometry in fire.spaces {
+        for geometry in fire.page_tables {
             let count = geometry.indptr.len().saturating_sub(1);
             if count != geometry.last_page_len.len()
                 || count != geometry.kv_len.len()
@@ -813,8 +874,8 @@ impl Inputs {
                 return Err(crate::error::Fault::program(
                     "inputs::write_host",
                     format!(
-                        "this fire's kv spaces state {count} lane(s) of page bounds, {} \
-                         last-page length(s) and {} kv length(s), and every space of one fire \
+                        "this fire's kv page_tables state {count} lane(s) of page bounds, {} \
+                         last-page length(s) and {} kv length(s), and every table of one fire \
                          is built over one lane vector",
                         geometry.last_page_len.len(),
                         geometry.kv_len.len()
@@ -823,14 +884,14 @@ impl Inputs {
             }
             spelled = Some(count);
         }
-        let space_lanes = spelled
+        let table_lanes = spelled
             .map_or(lanes, |count| count as u32)
             .max(lanes)
             .max(fire.lane_reach);
-        if u64::from(space_lanes) > u64::from(self.max_lanes) {
+        if u64::from(table_lanes) > u64::from(self.max_lanes) {
             return Err(crate::error::Fault::Ceiling {
                 what: "staged kv lanes",
-                need: u64::from(space_lanes),
+                need: u64::from(table_lanes),
                 have: u64::from(self.max_lanes),
             });
         }
@@ -885,9 +946,15 @@ impl Inputs {
             bytes_of(fire.lane_of_row),
             "staged lane of row",
         )?;
-        put(self.slot_ids, bytes_of(fire.slot_ids), "staged slot ids")?;
-        if space_lanes > lanes {
-            let inert = vec![-1i32; (space_lanes - lanes) as usize];
+        put(self.slot_ids, bytes_of(fire.state_ids), "staged slot ids")?;
+        let tabled = fire.state_ids.len() != fire.slot_ids.len();
+        let state_ids = if tabled {
+            fire.state_ids.len() as u32
+        } else {
+            table_lanes
+        };
+        if table_lanes > lanes && !tabled {
+            let inert = vec![-1i32; (table_lanes - lanes) as usize];
             put(
                 self.slot_ids + u64::from(lanes) * 4,
                 bytes_of(&inert),
@@ -962,9 +1029,9 @@ impl Inputs {
                 ));
             }
             let mut groups = fire.group_of_lane.to_vec();
-            groups.resize(space_lanes as usize, -1);
+            groups.resize(table_lanes as usize, -1);
             put(self.group_of_lane, bytes_of(&groups), "staged group ids")?;
-            let mut lane_table: Vec<i32> = Vec::with_capacity(space_lanes as usize + 1);
+            let mut lane_table: Vec<i32> = Vec::with_capacity(table_lanes as usize + 1);
             let mut row_table: Vec<i32> = Vec::with_capacity(rows as usize);
             for (at, packing) in self.packings.iter().zip(fire.packings) {
                 for (offset, table, what) in [
@@ -978,7 +1045,7 @@ impl Inputs {
                     lane_table.clear();
                     lane_table.extend_from_slice(table);
                     let last = table.last().copied().unwrap_or(0);
-                    lane_table.resize(space_lanes as usize + 1, last);
+                    lane_table.resize(table_lanes as usize + 1, last);
                     put(offset, bytes_of(&lane_table), what)?;
                 }
                 row_table.clear();
@@ -992,8 +1059,56 @@ impl Inputs {
             }
         }
 
-        let mut space_indices = Vec::with_capacity(self.spaces.len());
-        for (at, geometry) in self.spaces.iter().zip(fire.spaces) {
+        let rs = match (fire.rs, self.rs) {
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(crate::error::Fault::program(
+                    "inputs::write_host",
+                    "a fire buffers recurrent rows on a load that carved no rs tables",
+                ));
+            }
+            (Some(tables), Some(at)) => {
+                if tables.pages.len() as u64 > at.pages_cap
+                    || tables.replay_tok.len() as u64 > at.replay_cap
+                {
+                    return Err(crate::error::Fault::Ceiling {
+                        what: "rs buffer pages and replayed rows staged",
+                        need: (tables.pages.len() as u64).max(tables.replay_tok.len() as u64),
+                        have: at.pages_cap.min(at.replay_cap),
+                    });
+                }
+                let mut lanes_tab = tables.lanes.to_vec();
+                lanes_tab.resize(
+                    (table_lanes as usize).max(tables.lanes.len()),
+                    kernels_cuda::runtime::channel::RsLane::INERT,
+                );
+                // SAFETY: `RsLane` is plain `repr(C)` data, read as its bytes.
+                let raw = unsafe {
+                    core::slice::from_raw_parts(
+                        lanes_tab.as_ptr().cast::<u8>(),
+                        lanes_tab.len() * 16,
+                    )
+                };
+                put(at.lanes, raw, "staged rs lanes")?;
+                // SAFETY: plain integers, read as their bytes.
+                let pages = unsafe {
+                    core::slice::from_raw_parts(
+                        tables.pages.as_ptr().cast::<u8>(),
+                        tables.pages.len() * 8,
+                    )
+                };
+                put(at.pages, pages, "staged rs pages")?;
+                put(
+                    at.replay_tok,
+                    u32_bytes_of(tables.replay_tok),
+                    "staged rs replay rows",
+                )?;
+                Some((tables.pages.len() as u32, tables.replay_tok.len() as u32))
+            }
+        };
+
+        let mut table_indices = Vec::with_capacity(self.page_tables.len());
+        for (at, geometry) in self.page_tables.iter().zip(fire.page_tables) {
             put(at.indptr, bytes_of(&geometry.indptr), "staged kv indptr")?;
             put(
                 at.indices,
@@ -1016,7 +1131,7 @@ impl Inputs {
                 bytes_of(&geometry.write_offset),
                 "staged write offset",
             )?;
-            space_indices.push(geometry.indices.len() as u32);
+            table_indices.push(geometry.indices.len() as u32);
         }
 
         Ok(Staged {
@@ -1028,9 +1143,11 @@ impl Inputs {
             adapter_rows,
             readouts: fire.readout_rows.len() as u32,
             mask_bytes,
-            space_indices,
-            space_lanes,
+            table_indices,
+            table_lanes,
+            state_ids,
             packed,
+            rs,
         })
     }
 
@@ -1173,14 +1290,16 @@ impl Inputs {
             adapter_rows,
             readouts,
             mask_bytes,
-            space_indices,
-            space_lanes,
+            table_indices,
+            table_lanes,
+            state_ids,
             packed,
+            rs,
         } = staged;
         let readouts = *readouts;
         let (rows, lanes) = (*rows, *lanes);
         let packed = *packed;
-        let space_lanes = *space_lanes;
+        let table_lanes = *table_lanes;
         let base = self.store.ptr();
         let (at_tokens, at_positions, at_windows) = (self.tokens, self.positions, self.windows);
         let at_qo_absolute = self.qo_absolute;
@@ -1190,10 +1309,11 @@ impl Inputs {
             (self.adapter_routes, self.mask_bits, self.mask_indptr);
         let at_readouts = self.readout_rows;
         let at_readout_live = self.readout_live;
-        let places: Vec<SpaceAt> = self.spaces.clone();
+        let places: Vec<TableAt> = self.page_tables.clone();
         let at_lane_of_row = self.lane_of_row;
         let at_group_of_lane = self.group_of_lane;
         let packing_places: Vec<PackingAt> = self.packings.clone();
+        let rs_at = self.rs;
         let stream = device.stream();
         let Inputs {
             store,
@@ -1234,7 +1354,7 @@ impl Inputs {
         copy(at_lane_of_row, rows as usize * 4)?;
         copy(at_readouts, readouts as usize * 4)?;
         copy(at_readout_live, 4)?;
-        copy(at_slot_ids, space_lanes as usize * 4)?;
+        copy(at_slot_ids, *state_ids as usize * 4)?;
         if let Some(routes) = adapter_rows {
             copy(at_routes, *routes as usize * 4)?;
         }
@@ -1244,35 +1364,49 @@ impl Inputs {
         }
         let mut packings = Vec::with_capacity(packing_places.len());
         if packed {
-            copy(at_group_of_lane, space_lanes as usize * 4)?;
+            copy(at_group_of_lane, table_lanes as usize * 4)?;
             for at in &packing_places {
-                copy(at.group_indptr, (space_lanes as usize + 1) * 4)?;
-                copy(at.lane_indptr, (space_lanes as usize + 1) * 4)?;
+                copy(at.group_indptr, (table_lanes as usize + 1) * 4)?;
+                copy(at.lane_indptr, (table_lanes as usize + 1) * 4)?;
                 copy(at.permutation, rows as usize * 4)?;
                 packings.push(PackingHandles {
-                    group_indptr: i32s(base + at.group_indptr, space_lanes + 1),
-                    lane_indptr: i32s(base + at.lane_indptr, space_lanes + 1),
+                    group_indptr: i32s(base + at.group_indptr, table_lanes + 1),
+                    lane_indptr: i32s(base + at.lane_indptr, table_lanes + 1),
                     permutation: i32s(base + at.permutation, rows),
                 });
             }
         }
-        let mut spaces = Vec::with_capacity(places.len());
-        for (at, indices) in places.iter().zip(space_indices) {
-            copy(at.indptr, (space_lanes as usize + 1) * 4)?;
+        let mut page_tables = Vec::with_capacity(places.len());
+        for (at, indices) in places.iter().zip(table_indices) {
+            copy(at.indptr, (table_lanes as usize + 1) * 4)?;
             copy(at.indices, *indices as usize * 4)?;
-            copy(at.last_page_len, space_lanes as usize * 4)?;
-            copy(at.kv_len, space_lanes as usize * 4)?;
+            copy(at.last_page_len, table_lanes as usize * 4)?;
+            copy(at.kv_len, table_lanes as usize * 4)?;
             copy(at.write_page, rows as usize * 4)?;
             copy(at.write_offset, rows as usize * 4)?;
-            spaces.push(SpaceHandles {
-                indptr: i32s(base + at.indptr, space_lanes + 1),
+            page_tables.push(TableHandles {
+                indptr: i32s(base + at.indptr, table_lanes + 1),
                 indices: i32s(base + at.indices, *indices),
-                last_page_len: i32s(base + at.last_page_len, space_lanes),
-                kv_len: i32s(base + at.kv_len, space_lanes),
+                last_page_len: i32s(base + at.last_page_len, table_lanes),
+                kv_len: i32s(base + at.kv_len, table_lanes),
                 write_page: i32s(base + at.write_page, rows),
                 write_offset: i32s(base + at.write_offset, rows),
             });
         }
+
+        let rs = match (rs, rs_at) {
+            (Some((pages, toks)), Some(at)) => {
+                copy(at.lanes, table_lanes.max(lanes) as usize * 16)?;
+                copy(at.pages, *pages as usize * 8)?;
+                copy(at.replay_tok, *toks as usize * 4)?;
+                Some(RsHandles {
+                    lanes: base + at.lanes,
+                    pages: base + at.pages,
+                    replay_tok: base + at.replay_tok,
+                })
+            }
+            _ => None,
+        };
 
         // SAFETY: the sources are the slot's pinned bytes, held until the `SlotGuard` drops.
         unsafe { store.stage_batch_from(stream, &spans)? };
@@ -1294,17 +1428,18 @@ impl Inputs {
             windows: base + at_windows,
             qo_absolute: qo_absolute.map(|_| base + at_qo_absolute),
             live_rows: live.map(|_| base + at_live),
-            spaces,
-            slot_ids: i32s(base + at_slot_ids, space_lanes),
+            page_tables,
+            slot_ids: i32s(base + at_slot_ids, table_lanes),
             adapter_routes: adapter_rows.map(|rows| i32s(base + at_routes, rows)),
             readout_rows: i32s(base + at_readouts, readouts),
             readout_live: base + at_readout_live,
             row_valid: Tensor::new(base + at_row_valid, rows, 1, Dtype::U8),
             mask: mask_bytes.map(|bytes| Tensor::new(base + at_mask, bytes, 1, Dtype::U8)),
             mask_indptr: mask_bytes.map(|_| i32s(base + at_mask_indptr, lanes + 1)),
-            group_of_lane: packed.then(|| i32s(base + at_group_of_lane, space_lanes)),
+            group_of_lane: packed.then(|| i32s(base + at_group_of_lane, table_lanes)),
             packings,
             lane_of_row: i32s(base + at_lane_of_row, rows),
+            rs,
         })
     }
 
@@ -1379,13 +1514,13 @@ impl Inputs {
             lanes,
             rows,
             pages,
-            spaces: handles
-                .spaces
+            page_tables: handles
+                .page_tables
                 .iter()
-                .map(|space| SpaceSeat {
-                    page_indptr: space.indptr,
-                    page_indices: space.indices,
-                    last_page_lens: space.last_page_len,
+                .map(|table| TableSeat {
+                    page_indptr: table.indptr,
+                    page_indices: table.indices,
+                    last_page_lens: table.last_page_len,
                     row_valid: handles.row_valid,
                 })
                 .collect(),

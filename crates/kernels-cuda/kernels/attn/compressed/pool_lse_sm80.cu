@@ -54,6 +54,7 @@ __global__ __launch_bounds__(kPoolThreads) void pool_lse_mma(
     int page_size,
     float scale,
     int compact,
+    long long page_stride,
     const bf16* __restrict__ win_o,
     const float* __restrict__ win_lse,
     const SinkT* __restrict__ sinks,
@@ -125,7 +126,7 @@ __global__ __launch_bounds__(kPoolThreads) void pool_lse_mma(
                 if (c < 0 || c >= num_visible) c = -1;
             }
             s_slot[buf][tid] = c < 0 ? -1
-                : entry_slot(kv_page_indices, kv_page_indptr, req, c, ratio, page_size, compact);
+                : entry_row(kv_page_indices, kv_page_indptr, req, c, ratio, page_size, compact, page_stride, D);
         }
         __syncthreads();
         bf16* sK = sK0 + buf * kPoolKeys * kLd;
@@ -135,7 +136,7 @@ __global__ __launch_bounds__(kPoolThreads) void pool_lse_mma(
             const long long slot = s_slot[buf][key];
             bf16* kd = sK + key * kLd + d;
             if (slot >= 0) {
-                __pipeline_memcpy_async(kd, comp_kv_pages + slot * D + d, 16);
+                __pipeline_memcpy_async(kd, comp_kv_pages + slot + d, 16);
             } else {
                 *reinterpret_cast<int4*>(kd) = make_int4(0, 0, 0, 0);
             }

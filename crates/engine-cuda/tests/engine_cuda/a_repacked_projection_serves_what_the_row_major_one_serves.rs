@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, ops, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, Weight, ops, trace_hybrid};
 use poem_ir::{TILED_BAND, TILED_STEP, Trace};
 
 const VOCAB: u32 = 1000;
@@ -50,8 +50,8 @@ impl Micro {
 }
 
 impl ForwardHybrid for Micro {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
 
     fn forward(&self, inputs: Input) {
@@ -328,7 +328,6 @@ fn logits(arm: Arm, prompt: &[u32]) -> Vec<f32> {
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
-        deferred_tier: false,
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),

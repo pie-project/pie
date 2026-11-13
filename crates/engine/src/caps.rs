@@ -1,6 +1,7 @@
 use eta_ir::registry::{GeometryClass, PortMask};
 use serde::{Deserialize, Serialize};
 
+use crate::chunk::ChunkFacts;
 use crate::transfer::{KvHandle, MemoryDomain};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,14 +15,6 @@ pub struct DeviceFacts {
     pub storage_alignment: u32,
     pub storage_max_tile_bytes: u64,
     pub codegen_backend: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KvCopyDomains {
-    pub device_to_device: bool,
-    pub device_to_host: bool,
-    pub host_to_device: bool,
-    pub host_to_host: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,38 +45,16 @@ pub struct PoolFacts {
     #[serde(default)]
     pub buffer_pages: u32,
     pub adapter_banks: u32,
-    pub elastic_page_bytes: u64,
-    pub elastic_budget_pages: u64,
-    /// A kv page's bytes in a pool whole from its load that can move to
-    /// slabs of another size between frames; zero where it cannot.
-    #[serde(default)]
-    pub slab_kv_page_bytes: u64,
-    /// What a state slot and its buffer page take where they gain memory as
-    /// they are handed out; zero where the load holds them whole.
-    #[serde(default)]
-    pub elastic_state_slot_bytes: u64,
-    /// The windowed kv pool, page 0 its null page; zero when the model
-    /// declares no windowed space or the engine pages its sliding rows in
-    /// full. `window_tokens` is the model's fact: the window its sliding
-    /// rows are read through, whether or not a pool backs them.
-    #[serde(default)]
-    pub window_pages: u32,
+    /// The window the model's sliding rows are read through; zero when it
+    /// declares no windowed row.
     #[serde(default)]
     pub window_tokens: u32,
     /// The tiers below the device: host pages kv can be suspended into by
-    /// `kv_copy`, host windowed pages for a ring's pages, the state slots and
-    /// buffer pages a `StateCopy` may park in (host memory, or slot files on
-    /// an engine with no host tier), and slot-file pages `kv_copy` serves to
-    /// and from `MemoryDomain::LocalDisk`. Zero means the engine serves no
-    /// such copies.
+    /// `kv_copy`, and slot-file pages `kv_copy` serves to and from
+    /// `MemoryDomain::LocalDisk`. Zero means the engine serves no such
+    /// copies.
     #[serde(default)]
     pub host_kv_pages: u32,
-    #[serde(default)]
-    pub host_window_pages: u32,
-    #[serde(default)]
-    pub host_state_slots: u32,
-    #[serde(default)]
-    pub host_buffer_pages: u32,
     #[serde(default)]
     pub disk_kv_pages: u32,
     /// The slot files are kept across runs (`disk_kv_persistent`).
@@ -93,12 +64,6 @@ pub struct PoolFacts {
     /// found with the meta this load would write.
     #[serde(default)]
     pub disk_kv_kept: bool,
-    /// The engine would rather post one frame a lane than seat fewer lanes
-    /// than it batches when its state slots are short: the runtime then
-    /// dispatches one frame deep, so a lane holds one slot. False keeps the
-    /// configured depth whatever the slots seat.
-    #[serde(default)]
-    pub one_frame_when_short: bool,
     /// The engine would rather a lane already decoding claim its next pages
     /// before a prompt waiting to be seated does, and a prompt wait for a
     /// lane to finish rather than suspend one. False keeps the runtime's
@@ -123,9 +88,6 @@ impl PoolFacts {
     pub fn least_tiers(&mut self, ranks: impl Iterator<Item = PoolFacts>) {
         for rank in ranks {
             self.host_kv_pages = self.host_kv_pages.min(rank.host_kv_pages);
-            self.host_window_pages = self.host_window_pages.min(rank.host_window_pages);
-            self.host_state_slots = self.host_state_slots.min(rank.host_state_slots);
-            self.host_buffer_pages = self.host_buffer_pages.min(rank.host_buffer_pages);
             self.disk_kv_pages = self.disk_kv_pages.min(rank.disk_kv_pages);
             self.disk_kv_persistent &= rank.disk_kv_persistent;
             self.disk_kv_kept &= rank.disk_kv_kept;
@@ -137,10 +99,12 @@ impl PoolFacts {
 pub struct Capabilities {
     pub device: DeviceFacts,
     pub pools: PoolFacts,
+    /// The pools as chunks.
+    #[serde(default)]
+    pub chunks: ChunkFacts,
     pub limits: FireLimits,
     pub ports: PortMask,
     pub geometry: GeometryClass,
-    pub kv_copy: KvCopyDomains,
     pub kv_handle: Option<KvHandle>,
     pub media_encode: bool,
     #[serde(default)]

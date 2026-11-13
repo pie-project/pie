@@ -395,21 +395,22 @@ fn candidates(regions: &[Region], ordered: &Ordered, a: usize, b: usize) -> bool
 struct Touches {
     reads: Vec<Vec<ValueId>>,
     writes: Vec<Vec<ValueId>>,
-    spaces: Vec<Vec<u32>>,
+    /// The cache rows (`Def::Cache`) each region reads or writes.
+    rows: Vec<Vec<u32>>,
     barrier: Vec<bool>,
     exclusive: Vec<bool>,
 }
 
 impl Touches {
     fn of(trace: &Trace, regions: &[Region], profile: &DeviceProfile) -> Touches {
-        let spaces_of: Vec<Option<u32>> = trace
+        // A cache or state row is ordered by its own bytes: two regions meet
+        // there only where they touch the same row. Its page table and write
+        // positions are read-only fire inputs, so rows sharing them never wait.
+        let rows_of: Vec<Option<u32>> = trace
             .values
             .iter()
             .map(|value| match value.def {
-                Def::Cache(row) => Some(match trace.caches.get(row as usize) {
-                    Some(poem_ir::CacheRow::Kv { space, .. }) => *space,
-                    _ => u32::MAX - row,
-                }),
+                Def::Cache(row) => Some(row),
                 _ => None,
             })
             .collect();
@@ -422,13 +423,13 @@ impl Touches {
         let mut touches = Touches {
             reads: Vec::with_capacity(regions.len()),
             writes: Vec::with_capacity(regions.len()),
-            spaces: Vec::with_capacity(regions.len()),
+            rows: Vec::with_capacity(regions.len()),
             barrier: Vec::with_capacity(regions.len()),
             exclusive: Vec::with_capacity(regions.len()),
         };
         let mut scratch = Vec::new();
         for region in regions {
-            let (mut reads, mut writes, mut spaces) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut reads, mut writes, mut rows) = (Vec::new(), Vec::new(), Vec::new());
             let mut barrier = false;
             let mut exclusive = false;
             for node in region.nodes.clone() {
@@ -444,8 +445,8 @@ impl Touches {
                 node.op.inputs(&mut scratch);
                 for &named in &scratch {
                     for &value in arms(&through, named) {
-                        match spaces_of.get(value.0 as usize).copied().flatten() {
-                            Some(space) => spaces.push(space),
+                        match rows_of.get(value.0 as usize).copied().flatten() {
+                            Some(row) => rows.push(row),
                             None => reads.push(value),
                         }
                     }
@@ -453,8 +454,8 @@ impl Touches {
                 scratch.clear();
                 node.op.outputs(&mut scratch);
                 for &value in &scratch {
-                    match spaces_of.get(value.0 as usize).copied().flatten() {
-                        Some(space) => spaces.push(space),
+                    match rows_of.get(value.0 as usize).copied().flatten() {
+                        Some(row) => rows.push(row),
                         None => writes.push(value),
                     }
                 }
@@ -463,11 +464,11 @@ impl Touches {
             reads.dedup();
             writes.sort_unstable();
             writes.dedup();
-            spaces.sort_unstable();
-            spaces.dedup();
+            rows.sort_unstable();
+            rows.dedup();
             touches.reads.push(reads);
             touches.writes.push(writes);
-            touches.spaces.push(spaces);
+            touches.rows.push(rows);
             touches.barrier.push(barrier);
             touches.exclusive.push(exclusive);
         }
@@ -487,7 +488,7 @@ impl Touches {
         {
             return true;
         }
-        meets(&self.spaces[a], &self.spaces[b]) && !regions[a].mask.disjoint(&regions[b].mask)
+        meets(&self.rows[a], &self.rows[b]) && !regions[a].mask.disjoint(&regions[b].mask)
     }
 }
 

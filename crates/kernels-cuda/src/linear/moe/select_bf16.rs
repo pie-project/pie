@@ -16,6 +16,7 @@ pub(super) fn select_bf16_wgmma(
     y: &mut Tensor,
     fan: &Selected,
     experts: u32,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
@@ -67,6 +68,7 @@ pub(super) fn select_bf16_wgmma(
             n.arg(),
             stated(op, x.width)?.arg(),
             stated(op, experts)?.arg(),
+            ArgValue::Ptr(table.at()),
         ],
     )
 }
@@ -91,6 +93,7 @@ pub(super) fn select_bf16_mma(
     y: &mut Tensor,
     fan: &Selected,
     experts: u32,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     const THREADS: u32 = 128;
     const COLS: u32 = 128;
@@ -148,6 +151,7 @@ pub(super) fn select_bf16_mma(
             n.arg(),
             k.arg(),
             stated(op, experts)?.arg(),
+            ArgValue::Ptr(table.at()),
         ],
     )
 }
@@ -185,6 +189,7 @@ pub fn select_bf16_held(
     routes: Tensor,
     y: &mut Tensor,
     glu: Option<crate::linear::gemm_sm100::Glu>,
+    table: ExpertTable,
 ) -> Result<bool, Error> {
     const THREADS: u32 = 128;
     const DEPTH: u32 = 2;
@@ -218,8 +223,10 @@ pub fn select_bf16_held(
     let act_div = if fan.by_token { fan.top_k } else { 1 };
     // A prefill's routes on Hopper's warp-specialized wgmma GEMM, an
     // expert's slice 128 of them by 256 weight rows (128 gate and their up
-    // rows with a GLU), the GLU in its epilogue.
+    // rows with a GLU), the GLU in its epilogue. A streamed table stays on
+    // the mma.sync kernels below, whose loads go through it.
     if hopper_wgmma()
+        && !table.streams()
         && fan.route_count >= BF16_GEMM_FROM
         && fan.route_count.div_ceil(experts) >= BF16_WSGEMM_FROM
         && x.width.is_multiple_of(64)
@@ -266,6 +273,7 @@ pub fn select_bf16_held(
                 inter.arg(),
                 limit.arg(),
                 alpha.arg(),
+                ArgValue::Ptr(table.at()),
             ],
         )?;
         return Ok(true);
@@ -353,6 +361,7 @@ pub fn select_bf16_held(
             inter.arg(),
             limit.arg(),
             alpha.arg(),
+            ArgValue::Ptr(table.at()),
         ],
     )?;
     Ok(true)
@@ -375,6 +384,7 @@ pub fn select_bf16_copy(
     routes: Tensor,
     y: &mut Tensor,
     glu: Option<crate::linear::gemm_sm100::Glu>,
+    table: ExpertTable,
 ) -> Result<bool, Error> {
     const STAGES: u32 = 4;
     let fan = selected(op, x, routes, y)?;
@@ -436,6 +446,7 @@ pub fn select_bf16_copy(
             inter.arg(),
             limit.arg(),
             alpha.arg(),
+            ArgValue::Ptr(table.at()),
         ],
     )?;
     Ok(true)

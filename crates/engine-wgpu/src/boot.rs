@@ -1,4 +1,5 @@
-use crate::api::{ContractFor, DeviceBoot, Wgpu};
+use crate::api::{DeviceBoot, Wgpu};
+use engine_gpu::api::ContractFor;
 
 pub const DEFAULT_POWER_PREFERENCE: &str = "high-performance";
 
@@ -55,6 +56,7 @@ fn device_boot(doc: &toml::Table) -> Result<DeviceBoot, String> {
         pipeline_cache: pipeline_cache(doc),
         device_memory: device_memory(doc),
         profiles: profiles(doc)?,
+        chunk_bytes: None,
     })
 }
 

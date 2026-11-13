@@ -8,14 +8,23 @@ pub(crate) struct Recording {
 
     used: std::cell::Cell<u64>,
 
-    pub(crate) layout: Vec<crate::serve::ReadSpan>,
+    pub(crate) layout: Vec<engine_gpu::serve::ReadSpan>,
     pub(crate) launches: u32,
+
+    /// The host step after each segment but the last, in order.
+    pub(crate) cuts: Vec<engine_gpu::store::experts::Cut<crate::device::Api>>,
 }
 
 impl Recording {
-    pub(crate) fn new(kept: Kept, layout: Vec<crate::serve::ReadSpan>, launches: u32) -> Recording {
+    pub(crate) fn new(
+        kept: Kept,
+        layout: Vec<engine_gpu::serve::ReadSpan>,
+        launches: u32,
+        cuts: Vec<engine_gpu::store::experts::Cut<crate::device::Api>>,
+    ) -> Recording {
         Recording {
             kept,
+            cuts,
             used: std::cell::Cell::new(0),
             layout,
             launches,
@@ -24,7 +33,7 @@ impl Recording {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct Key(u64);
+pub struct Key(u64);
 
 pub(crate) struct KeyBuilder(std::collections::hash_map::DefaultHasher);
 

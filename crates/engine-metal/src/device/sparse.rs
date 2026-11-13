@@ -16,7 +16,7 @@
 //!   never has to encode a wait;
 //! * a rule, not a mechanism, for the unmap direction: tiles are taken
 //!   away only when the caller has drained every frame that could read
-//!   them. `Pools::release` states that precondition; nothing here can
+//!   them. `Pool::release_segments` states that precondition; nothing here can
 //!   check it, because the legacy queue signals nothing.
 //!
 //! Absent on a device without `MTLGPUFamilyMetal4` — [`Sparse::open`]
@@ -128,6 +128,24 @@ impl Sparse {
 
     pub(crate) fn residency(&self) -> &ProtocolObject<dyn MTLResidencySet> {
         &self.residency
+    }
+
+    /// Keeps `slabs` resident for every frame (memory a kernel reaches only
+    /// through addresses: the weight cache's tables), or lets them go.
+    pub(crate) fn hold<'a>(
+        &self,
+        slabs: impl IntoIterator<Item = &'a crate::device::alloc::Slab>,
+        keep: bool,
+    ) {
+        for slab in slabs {
+            let allocation = ProtocolObject::from_ref(&**slab);
+            if keep {
+                self.residency.addAllocation(allocation);
+            } else {
+                self.residency.removeAllocation(allocation);
+            }
+        }
+        self.residency.commit();
     }
 
     pub(crate) fn event(&self) -> &Retained<ProtocolObject<dyn MTLSharedEvent>> {

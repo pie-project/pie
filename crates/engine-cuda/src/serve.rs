@@ -56,12 +56,6 @@ use crate::window::Windows;
 use enqueue::{GuestBatch, Owed, Reap, reap_guest_fires};
 use segments::Segmented;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FireCost {
-    pub launches: u32,
-    pub copied: u32,
-}
-
 pub struct Shell {
     device: Context,
     accounting: crate::store::Accounting,
@@ -90,13 +84,16 @@ pub struct Shell {
     predicate: crate::store::rs::Predicate,
     inputs: Inputs,
     facts: kv::Facts,
-    spaces: usize,
+    page_tables: usize,
     masked: poem_ir::ClassSet,
     wide: poem_ir::ClassSet,
     feeds: crate::exports::Feeds,
     corrected: poem_ir::ClassSet,
     decoding: poem_ir::ClassSet,
     tiers: record::Tiers,
+    /// The class words of a drafter's classes (`Shell::drafts_only`); none
+    /// on a model without a drafter.
+    drafting_words: std::collections::HashSet<u64>,
     landing: Vec<Vec<poem_ir::Request>>,
     armed: Option<Armed>,
     media: poem_ir::ClassSet,
@@ -113,8 +110,6 @@ pub struct Shell {
     exports: Exports,
     graphs: Graphs,
     copies: bool,
-    /// `engine.one_frame_when_short`.
-    one_frame_when_short: bool,
     /// `engine.seated_first`.
     seated_first: bool,
     /// `engine.seat_to_end`.
@@ -123,16 +118,36 @@ pub struct Shell {
     seat_spread: bool,
     /// `engine.prefill_lanes`.
     prefill_lanes: u32,
+    /// `engine.fire_lanes` (`Shell::fire_lanes`).
+    fire_lanes: u32,
+    /// The default lattice's `(steps, prefill_from, prefill_steps)` where no
+    /// buckets were stated: what arming coarsens to fit the bodies' allowance
+    /// (`Shell::fit_lattice`).
+    lattice: Option<(u32, u32, u32)>,
     pad: bool,
     bodies: bool,
     bodies_mem: usize,
+    /// The bodies' allowance is the operator's: a hard cap, never stretched.
+    bodies_stated: bool,
+    /// The most the allowance may stretch to while arming: what the fit
+    /// before arming held the bodies ([`crate::store::Pools::fit_the_card`]).
+    bodies_ceiling: usize,
     decoded_tiles: Vec<u64>,
     arming: bool,
     golden_arm: Golden,
     armed_body: Option<record::BodyKey>,
+    /// The target arming fires is past its kind's widest bucket
+    /// (`record::Fire::cold`).
+    arm_cold: bool,
+    /// How the arming fire's lanes treat their recurrent rows: a buffering
+    /// treatment is recorded with lanes that land and replay nothing.
+    arm_rs: record::RsBody,
+    /// The lattice waits for the starting weight residency: the load
+    /// streams its weights, and bodies armed over the host copy would read
+    /// every expert over the bus (`Staged::finish`).
+    arm_deferred: bool,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
     windows_memo: Vec<prepare::WindowsMemo>,
-    last: FireCost,
     cache: GraphCache,
     runahead: engine::runahead::Runahead,
     programs: ProgramPlane,
@@ -230,9 +245,6 @@ impl Shell {
                     "`{}` is laid out for its product, not slot by slot",
                     param.name
                 )),
-                Some(WeightRow::Streamed { .. }) => {
-                    Err(format!("`{}` streams through the expert tier", param.name))
-                }
                 None => Err(format!("`{}` is not bound", param.name)),
             }
             .and_then(|tensors| {
@@ -369,22 +381,6 @@ impl Shell {
         self.tap_sink = Some(sink);
     }
 
-    pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
-        match self.rs_ahead.get(&src).copied() {
-            Some(at) => self.rs_ahead.insert(dst, at),
-            None => self.rs_ahead.remove(&dst),
-        };
-        self.pools.copy_slot(self.device.stream(), src, dst)?;
-        self.device.synchronize()
-    }
-
-    /// Whether this load would post one frame a lane rather than seat fewer
-    /// lanes than it batches (`engine.one_frame_when_short`).
-    #[must_use]
-    pub fn one_frame_when_short(&self) -> bool {
-        self.one_frame_when_short
-    }
-
     /// Whether this load asks the planner to serve a decoding lane's pages
     /// before a prompt waiting to be seated (`engine.seated_first`).
     #[must_use]
@@ -406,115 +402,29 @@ impl Shell {
         self.seat_spread
     }
 
-    /// Host rs rows: a state slot and a buffer page each, parked apart.
-    #[must_use]
-    pub fn host_state_slots(&self) -> u32 {
-        self.pools.host_rows().0
-    }
-
-    #[must_use]
-    pub fn host_buffer_pages(&self) -> u32 {
-        self.buffers
-            .as_ref()
-            .map_or(0, |_| self.pools.host_rows().0)
-    }
-
     #[must_use]
     pub fn buffer_pages(&self) -> u32 {
-        self.buffers.as_ref().map_or(0, Buffers::pages)
+        0
     }
 
     fn state_row_bytes(&self) -> u64 {
-        self.pools.state_slot_bytes() + self.buffers.as_ref().map_or(0, Buffers::slot_bytes)
+        self.pools.state_slot_bytes()
     }
 
-    pub fn copy_state_host(&mut self, to_host: bool, moves: &[(u32, u32)]) -> Result<()> {
-        let stream = self.device.stream();
-        for &(slot, host) in moves {
-            let mut at = self.pools.host_row(host)?;
-            for (span, bytes) in self.pools.state_spans(slot)? {
-                let (dst, src) = if to_host { (at, span) } else { (span, at) };
-                crate::device::copy_any(stream, dst, src, bytes as usize)?;
-                at += bytes;
-            }
-        }
-        self.device.synchronize()
-    }
-
-    /// Where in the host rows `slots`' state, then `pages`' buffers, lie.
-    fn state_spans(&self, slots: &[u32], pages: &[u32]) -> Vec<(u32, u64, u64)> {
-        let state = self.pools.state_slot_bytes();
-        let page = self.buffers.as_ref().map_or(0, Buffers::slot_bytes);
-        let slots = slots.iter().map(|&slot| (slot, 0, state));
-        let pages = pages.iter().map(|&row| (row, state, page));
-        slots.chain(pages).collect()
-    }
-
-    /// The state is a window: its pages are host windowed pages, and it
-    /// holds no slots.
-    fn ring(&self) -> bool {
-        self.pools.paging().window.is_some()
-    }
-
-    pub fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> Result<Vec<u8>> {
-        self.device.synchronize()?;
-        if self.ring() && slots.is_empty() {
-            return self.pools.read_host_window(pages);
-        }
-        let spans = self.state_spans(slots, pages);
-        self.pools.read_host_rows(&spans)
-    }
-
-    pub fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> Result<()> {
-        self.device.synchronize()?;
-        if self.ring() && slots.is_empty() {
-            return self.pools.write_host_window(pages, bytes);
-        }
-        let spans = self.state_spans(slots, pages);
-        self.pools.write_host_rows(&spans, bytes)
-    }
-
-    pub fn copy_pages_host(&mut self, to_host: bool, moves: &[(u32, u32)]) -> Result<()> {
-        let stream = self.device.stream();
-        let state_bytes = self.pools.state_slot_bytes();
-        for &(page, host) in moves {
-            let (span, bytes) = self.page_span(page)?;
-            let at = self.pools.host_row(host)? + state_bytes;
-            let (dst, src) = if to_host { (at, span) } else { (span, at) };
-            crate::device::copy_any(stream, dst, src, bytes as usize)?;
-        }
-        self.device.synchronize()
-    }
-
-    pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
-        let stream = self.device.stream();
-        for &(src, dst) in moves {
-            let (from, bytes) = self.page_span(src)?;
-            let (to, _) = self.page_span(dst)?;
-            crate::device::copy_any(stream, to, from, bytes as usize)?;
-        }
-        self.device.synchronize()
-    }
-
-    fn page_span(&mut self, page: u32) -> Result<(u64, u64)> {
-        let Some(buffers) = self.buffers.as_mut() else {
-            return Err(Fault::Ceiling {
-                what: "rs buffer pages",
-                need: u64::from(page) + 1,
-                have: 0,
-            });
-        };
-        buffers.ensure(&mut self.pools, page + 1)?;
-        buffers.page_span(page).ok_or(Fault::Ceiling {
-            what: "rs buffer pages",
-            need: u64::from(page) + 1,
-            have: u64::from(buffers.pages()),
-        })
-    }
     /// Copies full pages and token cells in the full kv rows. A windowed
     /// row's pages are named by the fire that reads them, so cells moved
     /// between pages here would leave its copy behind.
     pub fn copy_kv(&mut self, moves: &[engine::transfer::KvRun], cells: bool) -> Result<()> {
+        self.copy_kv_with(moves, &[], cells)
+    }
+
+    /// [`Self::copy_kv`] with whole windowed pages beside the full ones.
+    pub fn copy_kv_with(
+        &mut self,
+        moves: &[engine::transfer::KvRun],
+        windowed: &[engine::transfer::KvRun],
+        cells: bool,
+    ) -> Result<()> {
         if cells && self.pools.has_windowed() {
             return Err(Fault::Unbound {
                 what: "a token-cell kv copy on a load with windowed kv rows, whose pages this \
@@ -523,7 +433,13 @@ impl Shell {
             });
         }
         self.pools.fence_all_swaps(self.device.stream())?;
-        self.pools.copy_kv(self.device.stream(), moves, &[])
+        self.pools.copy_kv(self.device.stream(), moves, windowed)
+    }
+
+    /// Lays every fire's arena at the span's start, no smaller rung stated:
+    /// what expert parallelism seats its buffers by.
+    pub fn drop_rungs(&mut self) {
+        self.arena.drop_rungs();
     }
 
     /// Backs every page the pools declare ([`crate::store::Pools::back_whole`]).
@@ -571,11 +487,13 @@ impl Shell {
     /// ([`Self::seat_host_kv`]).
     pub const HOST_POOLS: u64 = 4;
 
-    /// Seats this rank's host pool, pinned as it is first used: one rs row
-    /// per device slot, then kv pages, then windowed pages, from `stated`
-    /// bytes shared by `ranks`, within the host memory the load left.
-    /// Unstated, it holds `seats` sequences at `context` tokens, and at least
-    /// one device pool's worth of each.
+    /// Seats this rank's host tier (CONTRACT-BC 22), pinned as it is first
+    /// used, from `stated` bytes shared by `ranks`, within the host memory
+    /// the load left: whole chunks of the state pool's size, every shape's
+    /// slots parking in them, and as many host kv slots for byte reads
+    /// ([`Self::read_host_kv`], a tap's read-out). Unstated, it holds `seats`
+    /// sequences at `context` tokens beside every state row, and at least
+    /// one device pool's worth.
     pub fn seat_host_kv(
         &mut self,
         stated: Option<u64>,
@@ -617,15 +535,12 @@ impl Shell {
                 .max(seated.min(whole.saturating_mul(Self::HOST_POOLS)))
                 .min(free / 2),
         };
-        let (rows, pages, window_pages) =
-            crate::store::host_pool(budget, rows, row, pages, page, window_pages, window_page);
-        self.pools.seat_host(pages, window_pages, rows, row)?;
+        // Both from the one budget, pinned as they are first touched: the
+        // shelf a load does not move through costs nothing.
+        self.pools
+            .seat_host(u32::try_from(budget.checked_div(page).unwrap_or(0)).unwrap_or(u32::MAX));
+        self.pools.seat_tier(budget, whole)?;
         Ok(self.pools.host_pages())
-    }
-
-    #[must_use]
-    pub fn host_window_pages(&self) -> u32 {
-        self.pools.host_window_pages()
     }
     /// Opens this rank's share of `budget` disk kv bytes under `dir`.
     /// Seats this rank's disk tier; `persistent` keeps its slot file for the
@@ -673,12 +588,6 @@ impl Shell {
         self.pools.disk_kept()
     }
 
-    pub fn spill_kv(&mut self, to_disk: bool, device: &[u32], disk: &[u32]) -> Result<()> {
-        self.pools.fence_all_swaps(self.device.stream())?;
-        self.pools
-            .spill_kv(self.device.stream(), to_disk, device, disk)
-    }
-
     #[must_use]
     pub fn host_kv_layout(&self, ranks: u32) -> Option<state::PageLayout> {
         self.pools.host_kv_layout(ranks)
@@ -692,6 +601,29 @@ impl Shell {
         self.pools.read_host_kv(slots)
     }
 
+    /// Once every copy into the host tier has landed (the swap stream's and
+    /// the stream's own): see `Engine::read_tier_slots`.
+    pub fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> Result<Vec<u8>> {
+        self.pools.settle_all_swaps()?;
+        crate::device::ctx::sync(self.device.stream())?;
+        self.pools.read_tier_slots(slots)
+    }
+
+    /// Behind every copy that touches the host tier: see
+    /// `Engine::write_tier_slots`.
+    pub fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.pools.settle_all_swaps()?;
+        crate::device::ctx::sync(self.device.stream())?;
+        self.pools.write_tier_slots(slots, bytes)
+    }
+
     /// Behind the moves and read-outs that touch `slots`, so none still
     /// reads or writes them; the fires beside them go on.
     pub fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> Result<()> {
@@ -699,20 +631,13 @@ impl Shell {
         self.pools.write_host_kv(slots, bytes)
     }
 
-    pub fn swap_kv(
-        &mut self,
-        to_host: bool,
-        device: &[u32],
-        host: &[u32],
-        windowed: &[(u32, u32)],
-    ) -> Result<()> {
+    pub fn swap_kv(&mut self, to_host: bool, device: &[u32], host: &[u32]) -> Result<()> {
         self.pools.swap_kv(
             self.device.stream(),
             self.device.swap_stream(),
             to_host,
             device,
             host,
-            windowed,
         )
     }
 
@@ -729,10 +654,6 @@ impl Shell {
     #[must_use]
     pub fn lands_snapshots(&self) -> bool {
         self.predicate.lands_snapshots()
-    }
-
-    pub fn fold_predicate(&self, lanes: u32) -> Result<Vec<u8>> {
-        self.predicate.read_mask(self.device.stream(), lanes)
     }
 
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
@@ -910,10 +831,46 @@ impl Shell {
             .is_some_and(|class| self.wide.contains(class))
     }
 
+    /// The token buckets a fire whose lanes buffer recurrent rows, or land
+    /// in a drafter's class, composes at: each one up to the lane ceiling
+    /// (every decode width), past it the powers of two and the widest. The
+    /// lattice records those at these alone.
+    /// Whether a lane of `word` lands in a class keyed only for a drafter's
+    /// fires (plain but for reading the drafts): it composes at
+    /// [`Shell::rs_rungs`] too, a verify's lanes being narrow.
+    fn drafts_only(&self, word: u64) -> bool {
+        !self.drafting_words.is_empty()
+            && self
+                .drafting_words
+                .contains(&(word & self.compiled.classes.mask))
+    }
+
+    fn rs_rungs(&self) -> Vec<u32> {
+        let ceiling = self.lane_ceiling();
+        let top = self.budget.buckets.last().copied();
+        self.budget
+            .buckets
+            .iter()
+            .copied()
+            .filter(|&bucket| bucket <= ceiling || bucket.is_power_of_two() || Some(bucket) == top)
+            .collect()
+    }
+
     fn lane_ceiling(&self) -> u32 {
         (self.held.len() as u32)
-            .min(self.budget.max_lanes)
+            .min(self.fire_lanes())
             .min(self.budget.max_tokens)
+    }
+
+    /// The most lanes one fire carries: the load's lanes, or fewer where
+    /// `engine.fire_lanes` says so (the runtime fires a wider wave as fires
+    /// of this many). The load seats `budget.max_lanes` all the same.
+    #[must_use]
+    pub fn fire_lanes(&self) -> u32 {
+        match self.fire_lanes {
+            0 => self.budget.max_lanes,
+            cap => self.budget.max_lanes.min(cap),
+        }
     }
 
     pub fn fire(&mut self, lanes: &[Lane<'_>]) -> Result<Vec<Vec<f32>>> {
@@ -1026,11 +983,7 @@ impl Shell {
     }
 
     pub(crate) fn records_bodies(&self) -> bool {
-        self.bodies
-            && self.pad
-            && self.graphs.records()
-            && !self.weights.rotating()
-            && !self.weights.hosts_experts()
+        self.bodies && self.pad && self.graphs.records()
     }
 
     #[must_use]
@@ -1077,8 +1030,10 @@ struct RsFire<'a> {
     write_state: bool,
     predicated: bool,
     truncates: bool,
-    buffered: bool,
-    reads: Vec<Vec<std::ops::Range<u32>>>,
+    /// How its lanes treat their recurrent rows.
+    body: record::RsBody,
+    /// Each lane's replayed buffer rows.
+    replays: Vec<u32>,
     rows_ext: u32,
     snapshots: crate::store::rs::SnapTable,
 }

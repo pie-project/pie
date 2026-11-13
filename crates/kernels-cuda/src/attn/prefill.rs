@@ -161,6 +161,9 @@ pub(crate) fn try_prefill(
         && matches!(head_dim, 64 | 128 | 256 | 512)
         && requests > 0
         && (kv::native_bf16(pool) || kv::native_e4m3(pool))
+        // Its tensor maps read a plane's cells as one run, page after page;
+        // an e4m3 pool widens to a packed shadow first.
+        && (pool.packed() || kv::native_e4m3(pool))
         && pool.layout == NHD
         && page >= 16
         && page.is_multiple_of(16)

@@ -2,9 +2,9 @@
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
-use kernels_metal::Tensor;
 use kernels_metal::attn::voxel;
 use kernels_metal::conv::{conv3d, group_norm, resample, rule};
+use kernels_metal::{StateMap, Tensor};
 use poem_ir::Dtype;
 
 type Case = (
@@ -726,12 +726,16 @@ fn the_frame_cache_stores_the_frames_its_next_chunk_pads_with() {
     let (_sb, hs) = rig.i32s(&slots);
     let (_gb, hg) = rig.i32s(&grid);
     let (_lb, hslab) = rig.empty((slots.len() * stride * C) as u64 * 2);
+    let map = StateMap::whole((stride * C) as u64);
+    let (_mb, hmap) = rig.raw(&map.bytes());
+    let segments = Tensor::new(hmap, 1, map.words().len() as u32, Dtype::U64);
     rig.fire(|s| {
         resample::cache_store(
             s,
             Tensor::new(hx, rows as u32, C as u32, Dtype::Bf16),
             Tensor::new(hc, cache_rows as u32, C as u32, Dtype::Bf16),
             Tensor::new(hs, slots.len() as u32, 1, Dtype::I32),
+            segments,
             Tensor::new(hg, CLIPS.len() as u32, 4, Dtype::I32),
             FRAMES as u32,
             Tensor::new(hslab, stride as u32, C as u32, Dtype::Bf16),
@@ -774,6 +778,7 @@ fn the_frame_cache_stores_the_frames_its_next_chunk_pads_with() {
             s,
             Tensor::new(hslab, stride as u32, C as u32, Dtype::Bf16),
             Tensor::new(hs, slots.len() as u32, 1, Dtype::I32),
+            segments,
             Tensor::new(hg, CLIPS.len() as u32, 4, Dtype::I32),
             FRAMES as u32,
             Tensor::new(hround, cache_rows as u32, C as u32, Dtype::Bf16),

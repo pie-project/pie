@@ -2,8 +2,6 @@
 pub mod alloc;
 #[cfg(feature = "wgpu")]
 pub mod ctx;
-#[cfg(feature = "wgpu")]
-pub mod handles;
 #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
 pub mod host;
 #[cfg(feature = "wgpu")]
@@ -17,8 +15,6 @@ pub use ctx::{
     reservations, wanted_features,
 };
 #[cfg(feature = "wgpu")]
-pub use handles::{Binding, Handles, NIL};
-#[cfg(feature = "wgpu")]
 pub use pipelines::{Pipeline, Pipelines, bind_traffic};
 
 #[cfg(not(feature = "wgpu"))]
@@ -31,10 +27,6 @@ pub mod ctx {
     };
 }
 #[cfg(not(feature = "wgpu"))]
-pub mod handles {
-    pub use super::stub::{Binding, Handles, NIL};
-}
-#[cfg(not(feature = "wgpu"))]
 pub mod alloc {
     pub use super::stub::{Buffer, FileWriter, Memory};
 }
@@ -45,6 +37,12 @@ pub mod pipelines {
 
 #[cfg(not(feature = "wgpu"))]
 pub use stub::{
-    Binding, Buffer, Context, Enabled, FileWriter, Frame, Handed, Handles, Memory, NIL, OnDone,
-    Pending, Pipeline, Pipelines, bind_traffic, present, reservations,
+    Buffer, Context, Enabled, FileWriter, Frame, Handed, Memory, OnDone, Pending, Pipeline,
+    Pipelines, bind_traffic, present, reservations,
 };
+
+/// The shared engine's view of this API.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Api;
+
+mod gpu;

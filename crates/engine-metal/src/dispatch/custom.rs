@@ -239,6 +239,7 @@ impl Run<'_> {
                     x,
                     x,
                     slots,
+                    pool.segments,
                     grid,
                     *frames,
                     pool.state,

@@ -1,12 +1,13 @@
-# Kimi Delta Attention: a KDA mixer's weights, their checkpoint names, its
-# cached convolution window and delta-rule state, and its forward.
+# Kimi Delta Attention: a KDA mixer's weights and states, their checkpoint
+# names, and its forward.
 
 load("//lib/reads.poem", "squeezed")
 
-def kda(n, l, k, hidden, weights, conv, eps, gate_floor, gate_rank = None, **extra):
-    """The KDA mixer of layer `l` named by `n`, its projections in `weights`
-    and its convolution bank in `conv`. Its output gate is one projection,
-    or a pair through `gate_rank`. `extra` rides along."""
+def kda(n, k, hidden, weights, conv, eps, gate_floor, gate_rank = None, **extra):
+    """The KDA mixer named by `n`, its projections in `weights` and its
+    convolution bank in `conv`. Its output gate is one projection, or a pair
+    through `gate_rank`. It holds its convolution window over q, k and v
+    and its f32 delta-rule state a head. `extra` rides along."""
     width = k.heads * k.head_dim
     if gate_rank == None:
         gate = [weight([width, hidden], weights)]
@@ -34,8 +35,8 @@ def kda(n, l, k, hidden, weights, conv, eps, gate_floor, gate_rank = None, **ext
         o_norm = weight([k.head_dim], dtype.f32),
         o_norm_eps = eps,
         o_proj = weight([hidden, width], weights),
-        conv_state = "conv.{}".format(l),
-        delta_state = "delta.{}".format(l),
+        conv_state = state([k.conv_kernel, 3 * width], dtype.bf16),
+        delta_state = state([k.heads, k.head_dim, k.head_dim], dtype.f32),
         **extra
     )
 
@@ -52,12 +53,6 @@ def kda_gate(k, at):
     if len(k.gate) == 1:
         return [(k.gate[0], at("self_attn.g_proj.weight"))]
     return [(k.gate[0], at("self_attn.g_a_proj.weight")), (k.gate[1], at("self_attn.g_b_proj.weight"))]
-
-def kda_caches(c, k):
-    """`k`'s convolution window and its f32 delta-rule state."""
-    width = k.heads * k.head_dim
-    c.state(k.conv_state, [k.conv_kernel, 3 * width], dtype.bf16, split = 1)
-    c.state(k.delta_state, [k.heads, k.head_dim, k.head_dim], dtype.f32, split = 0)
 
 def run_kda(x, inputs, k):
     conv = inputs.state(k.conv_state)

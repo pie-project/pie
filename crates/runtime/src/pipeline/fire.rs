@@ -138,19 +138,46 @@ fn stale_demand_error() -> String {
 
 const STALE_DEMAND_ATTEMPTS: usize = 3;
 
+/// A kv epoch a fire holds: settled by whoever finishes the fire, or, let go
+/// unsettled, when dropped — at once while the fire was never submitted,
+/// else once the engine has run it ([`Self::retire_on`]). A pending fire
+/// dropped unfinalized (its process gone) would otherwise hold the epoch
+/// open for good, and every id freed after it would wait on it.
 struct KvTxnGuard {
     model: usize,
     engine: usize,
     txn: Option<kv::KvTxn>,
+    submitted: Option<crate::engine::WorkItemCompletion>,
 }
 
 impl KvTxnGuard {
     fn new(model: usize, engine: usize, txn: Option<kv::KvTxn>) -> Self {
-        Self { model, engine, txn }
+        Self {
+            model,
+            engine,
+            txn,
+            submitted: None,
+        }
     }
 
     fn into_inner(mut self) -> Option<kv::KvTxn> {
         self.txn.take()
+    }
+
+    /// The fire is submitted: dropped unsettled, it settles once
+    /// `completion` resolves, not sooner.
+    fn retire_on(&mut self, completion: &crate::engine::WorkItemCompletion) {
+        self.submitted = Some(completion.clone());
+    }
+
+    fn settle(model: usize, engine: usize, txn: kv::KvTxn) {
+        let stores = crate::store::registry::get(model, engine);
+        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
+            kv::settle(store, txn);
+        });
+        if let Some(planner) = crate::planner::planner_for(model, engine) {
+            planner.pages_freed();
+        }
     }
 }
 
@@ -159,13 +186,51 @@ impl Drop for KvTxnGuard {
         let Some(txn) = self.txn.take() else {
             return;
         };
-        let stores = crate::store::registry::get(self.model, self.engine);
-        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
-            kv::settle(store, txn);
-        });
-        if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
-            planner.pages_freed();
+        let (model, engine) = (self.model, self.engine);
+        match self.submitted.take() {
+            Some(completion) => completion.on_settled(move || Self::settle(model, engine, txn)),
+            None => Self::settle(model, engine, txn),
         }
+    }
+}
+
+/// A fire's own epoch in its engine's kv store (CONTRACT-BC 17): opened
+/// once its slots are bound, closed when the engine retires it, or, never
+/// submitted, when it is dropped. Every fire holds one, so the kv epoch
+/// that fences freed pages, the shared pool's freed slots and an evacuated
+/// segment's drain moves with every fire, not only with a copy-on-write.
+/// It counts the fire in flight for its process, too, until it closes: the
+/// count drops after the epoch's settling, so the planner never reads a
+/// fire in flight that has settled.
+struct FireEpoch {
+    _txn: KvTxnGuard,
+    _in_flight: Option<crate::planner::FireInFlight>,
+}
+
+impl FireEpoch {
+    fn begin(
+        model: usize,
+        engine: usize,
+        stores: &crate::store::registry::Stores,
+        pid: crate::planner::ProcessId,
+    ) -> Self {
+        let txn = crate::store::registry::with_kv_lock(&stores.kv, "fire-epoch", kv::begin_fire);
+        Self {
+            _txn: KvTxnGuard::new(model, engine, Some(txn)),
+            _in_flight: crate::planner::planner_for(model, engine)
+                .map(|planner| planner.fire_in_flight(pid)),
+        }
+    }
+
+    /// Closes the epoch once the engine has run the fire `completion`
+    /// waits on: no sooner, since what it frees may still be read, and no
+    /// later than that, since a pass may not settle its fires for long.
+    /// By a hook, not a task awaiting it: nothing is spawned a fire, and the
+    /// epoch closes where the completion resolves. (Awaiting it once lost
+    /// the wakeup to the pass that finalizes the fire, when a completion
+    /// woke one waiter, and held the epoch open until shutdown.)
+    fn retire_on(self, completion: &crate::engine::WorkItemCompletion) {
+        completion.on_settled(move || drop(self));
     }
 }
 
@@ -236,7 +301,7 @@ fn kv_demand(
     .map_err(|error| format!("pipeline: KV demand: {error}"))
 }
 
-/// `windowed`: the fire reads ring pages, which come back only once every
+/// `windowed`: the fire reads window slots, which come back only once every
 /// fire that read them settles, so a fire that would park settles its own
 /// tail first rather than hold back the pages parked fires wait on.
 async fn acquire_grant<C: FireContext>(
@@ -326,44 +391,38 @@ fn bound_rs_working_sets<C: FireContext>(
     Ok(Ok(ids))
 }
 
-/// The ring plan of a host fire on a model whose state is a window: each
-/// lane writes the pages its tokens land on from `held`, which every
-/// earlier token of its sequence precedes, and reads through its own pages.
-fn host_ring_plan(
+/// The window plan of a host fire on a model whose state is window lists:
+/// each lane lands its rows from `held`, which every earlier token of its
+/// sequence precedes, and reads its tables through them.
+/// `keep`: the position a checkpoint inside the fire lands at, whose slots
+/// stay past it.
+fn host_window_plan(
     req: &crate::engine::FireRequest,
-    page_size: u32,
     fold: &geometry::Fold,
     ids: &[crate::store::rs::RsWorkingSetId],
+    keep: Option<u32>,
 ) -> Result<rs::RsPlan, String> {
     if ids.is_empty() {
         return Ok(rs::RsPlan::Groups(Vec::new()));
     }
-    let page_size = page_size.max(1);
-    Ok(rs::RsPlan::Ring(
+    Ok(rs::RsPlan::Window(
         req.lanes
             .iter()
             .enumerate()
             .map(|(row, lane)| {
                 let rows = u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
                 let end = lane.kv.held.saturating_add(rows);
-                let pages = if rows == 0 {
-                    Vec::new()
-                } else {
-                    let first = (lane.kv.held / page_size) as usize;
-                    let last = ((end - 1) / page_size) as usize;
-                    let held = lane.kv.pages.len();
-                    lane.kv.pages[first.min(held)..(last + 1).min(held)].to_vec()
-                };
-                rs::RingRow {
-                    pages,
-                    translate: lane.kv.pages.clone(),
-                    advance: crate::store::rs::RingAdvance {
+                rs::WindowRow {
+                    writes: lane.kv.held..end,
+                    reads: end,
+                    advance: crate::store::rs::WindowAdvance {
                         positioned: true,
                         settled: lane.kv.held,
                         reach: lane.kv.held,
                         fold: fold.of(row),
                         commit_end: end,
                         head: (rows > 0).then_some(end),
+                        keep,
                     },
                 }
             })
@@ -512,11 +571,191 @@ fn prefill_share(page: u32, engine: usize) -> u32 {
     }
     crate::engine::get_spec(engine).map_or(u32::MAX, |spec| {
         crate::inferlet::host::model::prefill_share(
-            crate::inferlet::host::model::prefill_budget(spec.limits),
+            // Within the pool's activation rung (SPEC decision 6).
+            crate::inferlet::host::model::prefill_budget(spec.limits)
+                .min(crate::store::shared::fire_cap(engine) as usize)
+                .max(1),
             crate::inferlet::process::live_count(),
             page as usize,
         )
     })
+}
+
+/// The rows a piece of a prompt on `engine` would take were the pool at its
+/// largest activation rung: what a pass asks the rung for
+/// ([`crate::store::shared::want_rows`]).
+fn prefill_want(page: u32, engine: usize) -> u32 {
+    if let Some(rows) = fire_rows() {
+        return rows;
+    }
+    crate::engine::get_spec(engine).map_or(u32::MAX, |spec| {
+        crate::inferlet::host::model::prefill_share(
+            crate::inferlet::host::model::prefill_budget(spec.limits).max(1),
+            crate::inferlet::process::live_count(),
+            page as usize,
+        )
+    })
+}
+
+/// The rows past which a pass asks the activation rung for wider fires: a
+/// decode's few rows never do.
+const RUNG_WANT_FROM: usize = 16;
+
+/// How many of a pass's pieces run ahead of the one being cut while its
+/// rung's raise is pending: the device stays fed, and the rest is cut wider
+/// once the raise lands.
+const PIECES_AHEAD: usize = 2;
+
+/// A pass's ask for the activation rung funded as a planner waiter: the
+/// room the raise lacks is asked of the planner under the pass's process,
+/// so it is freed as any waiter's pages are (idle cache, processes moved to
+/// the host, the policy's victims); once granted the room is given back and
+/// the rung raised. Runs beside the pass, which keeps firing at the rung it
+/// has, until the raise lands, the pass is through (dropped) or the planner
+/// refuses (`failed`).
+struct RaiseFunding {
+    stop: Arc<tokio::sync::Notify>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+    failed: Arc<Mutex<Option<String>>>,
+}
+
+impl RaiseFunding {
+    fn start(
+        shared: crate::store::shared::Shared,
+        engine: usize,
+        pid: uuid::Uuid,
+        quorum: uuid::Uuid,
+        rows: u32,
+        epoch_now: impl Fn() -> u64 + Send + 'static,
+    ) -> Self {
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failed = Arc::new(Mutex::new(None));
+        let funding = Self {
+            stop: stop.clone(),
+            stopped: stopped.clone(),
+            failed: failed.clone(),
+        };
+        crate::rt::spawn(async move {
+            let Some(planner) = crate::planner::planner_of(pid) else {
+                tracing::debug!(%pid, "a raise's funding finds no planner");
+                return;
+            };
+            let target = crate::store::shared::cap_for(&shared, rows);
+            while !stopped.load(std::sync::atomic::Ordering::Acquire) {
+                crate::store::shared::raise_now(&shared, engine, rows);
+                if crate::store::shared::fire_cap(engine) >= target {
+                    return;
+                }
+                let pages = {
+                    let pool = shared.lock().unwrap();
+                    pool.raise_short(pool.rung_for(rows)).1
+                };
+                if pages == 0 {
+                    // The room is there and state lies in the span: the
+                    // walker moves it out, the engine copying it.
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    continue;
+                }
+                let demand = crate::planner::Demand {
+                    kv_pages: pages,
+                    rs: crate::store::rs::RsUnits::default(),
+                };
+                tracing::debug!(engine, rows, pages, "a raise asks the planner for room");
+                let asked = tokio::select! {
+                    asked = planner.acquire(pid, quorum, demand) => asked,
+                    () = stop.notified() => return,
+                };
+                match asked {
+                    Ok(crate::planner::Acquired::Granted(grant)) => {
+                        // The room is given back and the rung takes it at
+                        // once, the state in its span moved down first,
+                        // before the pass's own pieces open it again.
+                        // Given back first: its pages go back through the
+                        // pool's own lock.
+                        drop(grant);
+                        let evacuation = {
+                            let pool = shared.lock().unwrap();
+                            let goal = pool.rung_for(rows);
+                            (goal > pool.rung()).then(|| pool.plan_raise(goal)).and_then(Result::ok)
+                        };
+                        if let Some(evacuation) = evacuation {
+                            let copied = evacuation.moves.is_empty()
+                                || crate::scheduler::pool(
+                                    engine,
+                                    crate::scheduler::worker::PoolOp::Evacuate(
+                                        crate::store::shared::SharedPool::rung_moves(&evacuation),
+                                    ),
+                                )
+                                .await
+                                .is_ok();
+                            if copied {
+                                let next = epoch_now().saturating_add(1);
+                                let applied = shared.lock().unwrap().apply_rung(&evacuation, next);
+                                if applied.is_ok() {
+                                    tracing::info!(
+                                        engine,
+                                        rung = evacuation.rung,
+                                        moved = evacuation.moves.len(),
+                                        "the activation rung is raised"
+                                    );
+                                }
+                            }
+                        }
+                        crate::store::shared::raise_now(&shared, engine, rows);
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
+                    Ok(crate::planner::Acquired::Requote) => {
+                        tracing::debug!(engine, "a raise's room is quoted again");
+                    }
+                    Ok(crate::planner::Acquired::Yield) => {
+                        tracing::debug!(engine, "a raise's process yields");
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(error) => {
+                        tracing::debug!(engine, %error, "a raise's room is refused");
+                        *failed.lock().unwrap() = Some(error.to_string());
+                        return;
+                    }
+                }
+            }
+        });
+        funding
+    }
+
+    fn failed(&self) -> Option<String> {
+        self.failed.lock().unwrap().clone()
+    }
+}
+
+/// Waits until fires on `engine` may take `width` rows, while `failed`
+/// (the pass's raise funding) has not said the room was refused; at once
+/// where nothing funds a raise (no shared pool: the cap never moves).
+async fn wait_for_rung(
+    engine: usize,
+    width: u32,
+    failed: Option<impl Fn() -> Option<String>>,
+) -> Result<(), String> {
+    let Some(failed) = failed else {
+        return Ok(());
+    };
+    while crate::store::shared::fire_cap(engine) < width {
+        if let Some(why) = failed() {
+            return Err(format!(
+                "pipeline: a fire of {width} rows needs a wider activation rung, and its room \
+                 was refused: {why}"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    Ok(())
+}
+
+impl Drop for RaiseFunding {
+    fn drop(&mut self) {
+        self.stopped.store(true, std::sync::atomic::Ordering::Release);
+        self.stop.notify_one();
+    }
 }
 
 fn fire_rows() -> Option<u32> {
@@ -541,6 +780,20 @@ fn host_cuts(
     forced: &[u32],
     tail: u32,
 ) -> Vec<(u32, u32)> {
+    host_cuts_from(req, cuttable, share, page, forced, tail, 0)
+}
+
+/// [`host_cuts`] of the rows from `start` on: the rest of a pass cut again
+/// once its rung was raised.
+fn host_cuts_from(
+    req: &crate::engine::FireRequest,
+    cuttable: bool,
+    share: u32,
+    page: u32,
+    forced: &[u32],
+    tail: u32,
+    start: u32,
+) -> Vec<(u32, u32)> {
     let rows = |lane: &::engine::Lane| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
     let [lane] = req.lanes.as_slice() else {
         return vec![(0, req.lanes.first().map_or(0, rows))];
@@ -556,10 +809,10 @@ fn host_cuts(
         .iter()
         .copied()
         .chain(media.map(|row| ((held + row) / page * page).saturating_sub(held)))
-        .filter(|&end| 0 < end && end < rows)
+        .filter(|&end| start < end && end < rows)
         .collect();
     if share > 0 {
-        let mut from = 0;
+        let mut from = start;
         while rows - from > share {
             let mut to = ((held + from + share) / page * page).saturating_sub(held);
             if to <= from {
@@ -573,7 +826,7 @@ fn host_cuts(
     ends.push(rows);
     ends.sort_unstable();
     ends.dedup();
-    let mut from = 0;
+    let mut from = start;
     ends.into_iter()
         .map(|to| {
             let cut = (from, to);
@@ -775,6 +1028,28 @@ fn keyed_rows(req: &crate::engine::FireRequest) -> u32 {
     first_media_row(req).unwrap_or(rows).min(rows)
 }
 
+/// The rows a pass over `rows` keeps its state at: those the inferlet asks
+/// for (`asked`), and with `auto` the pass's end, each floored to whole pages
+/// and within the `keyed` pages the pass keys.
+pub(crate) fn checkpoint_rows(
+    asked: &[u32],
+    rows: std::ops::Range<u64>,
+    page_size: u32,
+    keyed: usize,
+    auto: bool,
+) -> Vec<u64> {
+    let page = u64::from(page_size.max(1));
+    let mut at: Vec<u64> = asked
+        .iter()
+        .map(|&row| u64::from(row) / page * page)
+        .chain(auto.then_some(rows.end / page * page))
+        .filter(|&row| rows.start < row && row <= rows.end && row / page <= keyed as u64)
+        .collect();
+    at.sort_unstable();
+    at.dedup();
+    at
+}
+
 static SEALED_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct SupplyCounts {
@@ -955,17 +1230,23 @@ async fn promote<C: FireContext>(
         txn: Some(txn),
         in_flight: Vec::new(),
     };
-    let plans = guard
-        .txn
-        .as_ref()
-        .map_or_else(Vec::new, |txn| txn.copy_plans());
+    let (kind, plans) = guard.txn.as_ref().map_or_else(
+        || (crate::scheduler::TierKind::Kv, Vec::new()),
+        |txn| {
+            (
+                crate::scheduler::TierKind::kv(txn.shape()),
+                txn.copy_plans(),
+            )
+        },
+    );
     for (tier, device, slots) in plans {
         let copy = crate::scheduler::TierMove {
-            kind: crate::scheduler::TierKind::Kv,
+            kind,
             tier,
             out: false,
             device,
             slots,
+            source: None,
         };
         let completion = crate::scheduler::copy_tier_tracked(engine, &copy)
             .map_err(|error| format!("{error:#}"))?;
@@ -1038,7 +1319,7 @@ impl Drop for Promoted {
 
 /// Resumes a hybrid pass from its furthest checkpoint; none when either half is
 /// gone by then, and `rs` holds no state again.
-fn resume(
+pub(crate) fn resume(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
     rs: crate::store::rs::RsWorkingSetId,
@@ -1155,11 +1436,15 @@ struct Reserved {
     copies: kv::PageCopies,
     kvtxns: Vec<KvTxnGuard>,
     rs: rs::PreparedRs,
+    epoch: FireEpoch,
 }
 
-/// A demand that drifted from its grant is quoted again.
+/// A demand that drifted from its grant is quoted again. What it binds
+/// opens the fire's epoch on engine `engine` of model `model`.
+#[allow(clippy::too_many_arguments)]
 async fn reserve<C: FireContext>(
     ctx: &mut C,
+    (model, engine): (usize, usize),
     stores: &crate::store::registry::Stores,
     pipeline_id: uuid::Uuid,
     sets: &[(&KvWorkingSet, Written)],
@@ -1202,6 +1487,7 @@ async fn reserve<C: FireContext>(
                     copies,
                     kvtxns,
                     rs,
+                    epoch: FireEpoch::begin(model, engine, stores, ctx.process_id()),
                 });
             }
             Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => attempts += 1,
@@ -1318,7 +1604,7 @@ pub(crate) fn test_pending_op_stub() -> PendingOp {
 
 struct FireWs {
     ws: crate::store::kv::page_table::WorkingSetId,
-    kvtxn: Option<kv::KvTxn>,
+    kvtxn: KvTxnGuard,
     log: Option<LogFire>,
     lease: KvFireLease,
     fold: Option<FoldAt>,
@@ -1409,7 +1695,7 @@ impl Drop for ReportTag {
 }
 
 /// A snapshot no checkpoint takes is released.
-fn take_checkpoint(
+pub(crate) fn take_checkpoint(
     stores: &crate::store::registry::Stores,
     checkpoint: &TakeCheckpoint,
     success: bool,
@@ -1433,11 +1719,11 @@ fn take_checkpoint(
             .keep(checkpoint.rs, checkpoint.key, owner);
         Ok(true)
     } else {
-        stores
-            .rs
-            .lock()
-            .unwrap()
-            .checkpoint(checkpoint.rs, checkpoint.key, owner)
+        let mut rs = stores.rs.lock().unwrap();
+        match checkpoint.window_at {
+            Some(at) => rs.checkpoint_at(checkpoint.rs, checkpoint.key, owner, at),
+            None => rs.checkpoint(checkpoint.rs, checkpoint.key, owner),
+        }
     };
     match taken {
         Ok(true) => {
@@ -1481,12 +1767,14 @@ fn reported_rows(
 
 /// `rs` is the pass's working set, forked once the fire settles, or with
 /// `snapshot` the hidden one the fire landed its state as of `pages` in.
-struct TakeCheckpoint {
-    kv: crate::store::kv::page_table::WorkingSetId,
-    rs: crate::store::rs::RsWorkingSetId,
-    snapshot: bool,
-    pages: u64,
-    key: crate::store::kv::hash::Hash256,
+pub(crate) struct TakeCheckpoint {
+    pub(crate) kv: crate::store::kv::page_table::WorkingSetId,
+    pub(crate) rs: crate::store::rs::RsWorkingSetId,
+    pub(crate) snapshot: bool,
+    pub(crate) pages: u64,
+    pub(crate) key: crate::store::kv::hash::Hash256,
+    /// A window's, as of this position, at or behind the fire's end.
+    pub(crate) window_at: Option<u32>,
 }
 
 pub struct PendingFire {
@@ -1707,11 +1995,13 @@ pub(crate) fn lane_groups(ids: &[crate::store::kv::page_table::WorkingSetId]) ->
     groups
 }
 
+/// Each lane rides a seat its working set holds: lane `i` of a group its
+/// working set's `i`th.
 pub(crate) fn stamp_lane_slots(
     req: &mut crate::engine::FireRequest,
     stores: &crate::store::registry::Stores,
     groups: &LaneGroups,
-) -> Result<(), crate::store::seat::SeatError> {
+) -> Result<(), crate::store::chunks::SeatsShort> {
     for (ws, lanes) in groups {
         let seats = stores.seats.lock().unwrap().seats(*ws, lanes.len())?;
         for (&lane, &seat) in lanes.iter().zip(&seats) {
@@ -1723,26 +2013,25 @@ pub(crate) fn stamp_lane_slots(
     Ok(())
 }
 
-const SEAT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Also how long a planner waiter stands short of room only the policy can
+/// make before it fails.
+pub(crate) const SEAT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(crate) async fn seat_lane_slots(
     req: &mut crate::engine::FireRequest,
     stores: &crate::store::registry::Stores,
     groups: &LaneGroups,
 ) -> Result<(), String> {
-    use crate::store::seat::SeatError;
     let deadline = crate::rt::time::Instant::now() + SEAT_WAIT;
+    let freed = stores.seats.lock().unwrap().freed();
     loop {
-        let mut freed = Box::pin(stores.seats_freed.notified());
+        let mut freed = Box::pin(freed.notified());
         freed.as_mut().enable();
         let refusal = match stamp_lane_slots(req, stores, groups) {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
-        let fits = match refusal {
-            SeatError::Exhausted { need, capacity, .. } => capacity != 0 && need <= capacity,
-        };
-        if !fits {
+        if !stores.seats.lock().unwrap().could_seat(refusal.need) {
             return Err(format!(
                 "pipeline: seating this fire's lanes: {refusal}; no release can seat it"
             ));
@@ -1824,13 +2113,14 @@ fn stamp_lane_translation(
     Ok(())
 }
 
-/// The ring plan of a device-geometry fire: every row writes the pages
-/// the fire's write indexes name and reads through the working set's mapped
-/// pages. The device decides where its tokens land, so the ring keeps every
-/// page it writes and commits nothing; what it retires is behind the first
+/// The window plan of a device-geometry fire: every row lands its rows in
+/// the kv pages the fire's write indexes name (each window list's slots
+/// over them) and reads its tables through the working set's mapped pages.
+/// The device decides where its tokens land, so the windows keep every slot
+/// it writes and commit nothing; what each list retires is behind the first
 /// page it writes, where every row lands past, so a decode loop that never
-/// states its positions still holds a window and not its whole sequence.
-fn device_ring_plan(
+/// states its positions still holds its windows and not its whole sequence.
+fn device_window_plan(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
     write_indexes: &[u64],
@@ -1842,32 +2132,33 @@ fn device_ring_plan(
     let mapped =
         crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| kv.mapped_len(ws))
             .map_err(|error| error.to_string())?;
-    let written: Vec<u32> = write_indexes
-        .iter()
-        .map(|&index| u32::try_from(index).unwrap_or(u32::MAX))
-        .collect();
-    let last = written.iter().copied().max();
-    let reach = written
-        .iter()
-        .copied()
-        .min()
-        .map_or(0, |first| first.saturating_mul(stores.kv_page_size));
+    let page = stores.kv_page_size.max(1);
+    let index = |at: u64| u32::try_from(at).unwrap_or(u32::MAX);
+    let first = write_indexes.iter().copied().min().map(index);
+    let last = write_indexes.iter().copied().max().map(index);
+    let reach = first.map_or(0, |first| first.saturating_mul(page));
+    let writes = match (first, last) {
+        (Some(first), Some(last)) => {
+            first.saturating_mul(page)..last.saturating_add(1).saturating_mul(page)
+        }
+        _ => 0..0,
+    };
     let extent = u32::try_from(mapped)
         .unwrap_or(u32::MAX)
         .max(last.map_or(0, |last| last.saturating_add(1)));
-    let translate: Vec<u32> = (0..extent).collect();
-    Ok(rs::RsPlan::Ring(
+    Ok(rs::RsPlan::Window(
         (0..ids.len())
-            .map(|_| rs::RingRow {
-                pages: written.clone(),
-                translate: translate.clone(),
-                advance: crate::store::rs::RingAdvance {
+            .map(|_| rs::WindowRow {
+                writes: writes.clone(),
+                reads: extent.saturating_mul(page),
+                advance: crate::store::rs::WindowAdvance {
                     positioned: false,
                     settled: 0,
                     reach,
                     fold: None,
                     commit_end: 0,
                     head: None,
+                    keep: None,
                 },
             })
             .collect(),
@@ -2472,7 +2763,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Ok(ids) => ids,
                 Err(error) => return Ok(Err(error)),
             };
-        let ring = crate::model::model().rs_caps().window_tokens > 0;
+        let windowed = crate::model::model().rs_caps().window_tokens > 0;
         // A long host pass runs as several fires; all but the last run the
         // model's forward alone. A recurrent state folding all its rows, or
         // none, folds each fire's rows in turn.
@@ -2491,13 +2782,15 @@ pub async fn submit_pass_stamped<C: FireContext>(
             && groups.len() == 1
             && !adapted
             && !fire_wide_mask;
+        // A pass that may start from a prefix the cache holds may be cut, a
+        // window's too: each piece lands its rows in the window lists and
+        // trims behind them as a fire of its own.
         let cuttable = decode_envelope.is_none()
             && !wide
             && plain
             && !prologue_moves
             && (!adapted || crate::model::model().eta_caps().adapter_attachments)
             && !fire_wide_mask
-            && !ring
             && folds_all;
         let mut full = req;
         let keyed = if keyable { keyed_rows(&full) } else { 0 };
@@ -2518,8 +2811,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 ))
             })
             .flatten();
+        // A window's pages are checkpointed like a folded state: a fork
+        // the prefix cache keeps, sharing them by refcount (CONTRACT-BC 19).
         let state = match rs_ws_ids.as_slice() {
-            [rs] if !ring => Some(*rs),
+            [rs] => Some(*rs),
             _ => None,
         };
         let attach = if !cuttable || !keyable || !plain_rows(&full) {
@@ -2598,35 +2893,63 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // floored to whole pages it keys, each the end of a fire of its own.
         let held = u64::from(full.lanes[0].kv.held);
         let reach = held + full.lanes[0].tokens.len() as u64;
+        // A model whose only state beside its kv is window lists keeps one at
+        // the pass's last page boundary unasked: the refs to its lists' last slots are all a
+        // later prompt sharing the prefix needs, where kv alone resumed it
+        // before windows were trimmed. A recurrent state's would hold its
+        // record, which the pass's next write copies whole: it keeps one
+        // only where the inferlet asks.
+        let auto = windowed && state.is_some() && stores.rs.lock().unwrap().is_window();
         let checkpoints: Vec<u64> = match state {
-            Some(_) if !keys.is_empty() => {
-                let page = u64::from(page_size.max(1));
-                let mut rows: Vec<u64> = ctx
-                    .resources()
-                    .get(&fwd)?
-                    .bindings
-                    .checkpoints
-                    .iter()
-                    .map(|&row| u64::from(row) / page * page)
-                    .filter(|&row| held < row && row <= reach && row / page <= keys.len() as u64)
-                    .collect();
-                rows.dedup();
-                rows
-            }
-            _ => Vec::new(),
+            Some(_) => checkpoint_rows(
+                &ctx.resources().get(&fwd)?.bindings.checkpoints,
+                held..reach,
+                page_size,
+                keys.len(),
+                auto,
+            ),
+            None => Vec::new(),
         };
         // An engine that lands a lane's state at rows inside a fire is cut only
-        // past as many as it lands at once.
-        let snapshots = crate::model::model().eta_caps().rs_snapshots as usize;
+        // past as many as it lands at once. A window's piece keeps the
+        // furthest row inside it as of that row (checkpoint_at), so it forces
+        // no cut.
+        let snapshots = if windowed {
+            0
+        } else {
+            crate::model::model().eta_caps().rs_snapshots as usize
+        };
         let forced: Vec<u32> = checkpoints
             .iter()
+            .filter(|_| !windowed)
             .skip(snapshots)
             .step_by(snapshots + 1)
             .map(|&row| (row - held) as u32)
             .collect();
         // Several lanes run in pieces only where none carries recurrent
         // state, which is bound lane by lane.
-        let cuts = pass_pieces(
+        let rows_total = full
+            .lanes
+            .iter()
+            .map(|lane| lane.tokens.len())
+            .sum::<usize>();
+        // A prompt asks the activation rung for the rows its pieces take at
+        // the largest rung (SPEC decision 6, by demand), from before it is
+        // cut until its last piece settles: the pool raises toward it where
+        // room allows, and lowers once no pass asks past its smallest rung,
+        // so no piece cut wider waits on a lowered rung.
+        let wanted = u32::try_from(rows_total)
+            .unwrap_or(u32::MAX)
+            .min(prefill_want(page_size, engine));
+        let rung_want = (rows_total > RUNG_WANT_FROM).then(|| {
+            let want = crate::store::shared::want_rows(engine, wanted);
+            if let Some(shared) = stores.shared.as_ref() {
+                crate::store::shared::raise_now(shared, engine, wanted);
+            }
+            want
+        });
+        let mut cut_at = crate::store::shared::fire_cap(engine);
+        let mut cuts = pass_pieces(
             &full,
             cuttable,
             rs_ws_ids.is_empty(),
@@ -2635,11 +2958,54 @@ pub async fn submit_pass_stamped<C: FireContext>(
             &forced,
             &switched.tails,
         );
-        let rows_total = full
-            .lanes
+        // Only a lone lane's rest is cut again once a raise lands.
+        let recuttable = full.lanes.len() == 1 && cuts.len() > 1;
+        // A piece that would not cut to the rung asks for its own width.
+        let widest = cuts
             .iter()
-            .map(|lane| lane.tokens.len())
-            .sum::<usize>();
+            .map(|piece| piece.iter().flatten().map(|&(from, to)| to - from).sum::<u32>())
+            .max()
+            .unwrap_or(0);
+        let (wanted, rung_want) = if widest > wanted && rows_total > RUNG_WANT_FROM {
+            let want = crate::store::shared::want_rows(engine, widest);
+            if let Some(shared) = stores.shared.as_ref() {
+                crate::store::shared::raise_now(shared, engine, widest);
+            }
+            (widest, Some(want))
+        } else {
+            (wanted, rung_want)
+        };
+        // The process holds the ask past this pass (an inferlet feeding a
+        // prompt in several passes lowers nothing between them); a pass of a
+        // few rows says its process asks nothing.
+        crate::store::shared::hold_for_process(
+            pid,
+            engine,
+            (rows_total > RUNG_WANT_FROM).then_some(wanted),
+        );
+        // What the rung lacks for it is funded beside the pass.
+        let funding = match stores.shared.as_ref() {
+            Some(shared)
+                if rung_want.is_some()
+                    && crate::store::shared::fire_cap(engine)
+                        < crate::store::shared::cap_for(shared, wanted) =>
+            {
+                let kv = stores.kv.clone();
+                Some(RaiseFunding::start(
+                    shared.clone(),
+                    engine,
+                    pid,
+                    quorum_pipeline_id,
+                    wanted,
+                    move || {
+                        crate::store::registry::with_kv_lock(&kv, "raise-funding", |kv| {
+                            kv.current_epoch()
+                        })
+                    },
+                ))
+            }
+            _ => None,
+        };
         // What one fire would run past what a fire holds is refused here, by
         // name, rather than by the scheduler's row count.
         let capacity = crate::engine::get_spec(engine)
@@ -2668,9 +3034,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
             if switched.rows_read {
                 why.push("it reads out an output of rows a cut fire would not hold");
             }
-            if ring {
-                why.push("its model keeps a window ring");
-            }
             if !folds_all {
                 why.push("it states where its recurrent state folds");
             }
@@ -2688,17 +3051,76 @@ pub async fn submit_pass_stamped<C: FireContext>(
         }
         // The pieces in frames of their own, in the order they are cut, so
         // the pieces of concurrent prompts seal together.
-        let piece_frames = {
+        let frame_size = crate::scheduler::configured_frame_size().max(1);
+        let mut frames = {
             let pipeline = ctx.resources().get(&this)?;
-            piece_frames(
-                frame,
-                cuts.len(),
-                crate::scheduler::configured_frame_size(),
-                || pipeline.next_frame_seq(),
-            )
+            piece_frames(frame, cuts.len(), frame_size, || pipeline.next_frame_seq())
         };
+        let framed = matches!(frame, Some(stamp) if stamp.fires == 1);
+        let mut submitted: Vec<crate::engine::completion::WorkItemCompletion> = Vec::new();
         let mut settles = Vec::new();
-        for (at, piece) in cuts.iter().enumerate() {
+        let mut at = 0;
+        while at < cuts.len() {
+            if recuttable && at > 0 && at + 1 < cuts.len() {
+                // While the raise is pending the pass runs no further ahead
+                // of the device than a few pieces, so what is left is cut at
+                // the raised rung once it lands.
+                // A framed piece waits only on a frame already whole.
+                let ahead = PIECES_AHEAD.max(frame_size);
+                if at >= ahead && wanted > cut_at {
+                    let behind = submitted[at - ahead].clone();
+                    while !behind.is_settled() && crate::store::shared::fire_cap(engine) <= cut_at
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                }
+                let cap = crate::store::shared::fire_cap(engine);
+                if cap > cut_at && (!framed || at % frame_size == 0) {
+                    cut_at = cap;
+                    let start = cuts[at - 1][0].map_or(0, |(_, to)| to);
+                    let rest = host_cuts_from(
+                        &full,
+                        cuttable,
+                        prefill_share(page_size, engine),
+                        page_size,
+                        &forced,
+                        switched.tails.first().copied().unwrap_or(0),
+                        start,
+                    );
+                    cuts.truncate(at);
+                    cuts.extend(rest.into_iter().map(|cut| vec![Some(cut)]));
+                    let stamp = if framed {
+                        let pipeline = ctx.resources().get(&this)?;
+                        frame.map(|stamp| crate::scheduler::FrameStamp {
+                            seq: pipeline.next_frame_seq(),
+                            ..stamp
+                        })
+                    } else {
+                        frame
+                    };
+                    let pipeline = ctx.resources().get(&this)?;
+                    frames.truncate(at);
+                    frames.extend(piece_frames(
+                        stamp,
+                        cuts.len() - at,
+                        frame_size,
+                        || pipeline.next_frame_seq(),
+                    ));
+                }
+            }
+            let piece = cuts[at].clone();
+            let piece = &piece;
+            // A piece wider than the rung (one no cut brings under it) waits
+            // for the raise its pass funds, or fails with what the planner
+            // said: it never waits on a rung that does not come.
+            let width: u32 = piece.iter().flatten().map(|&(from, to)| to - from).sum();
+            if let Err(refusal) = wait_for_rung(engine, width, funding.as_ref().map(|funding| {
+                move || funding.failed()
+            }))
+            .await
+            {
+                return Ok(Err(refusal));
+            }
             let last = at + 1 == cuts.len();
             let mut req = if cuts.len() == 1 {
                 full.clone()
@@ -2752,13 +3174,30 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     snapshot,
                     pages,
                     key: keys[pages as usize - 1],
+                    window_at: None,
                 }
             };
-            let mut checkpoints_here: Vec<TakeCheckpoint> = state
-                .filter(|_| checkpoints.contains(&slots.end))
-                .map(|rs| at_row(rs, slots.end, false))
-                .into_iter()
-                .collect();
+            // A window's piece keeps the furthest of its rows, which its
+            // windows stand at once it lands, or reach back to from its end
+            // (the slots that window touches retire no earlier).
+            let window_at = checkpoints
+                .iter()
+                .copied()
+                .filter(|&row| windowed && slots.start < row && row <= slots.end)
+                .max();
+            let mut checkpoints_here: Vec<TakeCheckpoint> = match (state, window_at) {
+                (Some(rs), Some(row)) => vec![TakeCheckpoint {
+                    window_at: u32::try_from(row).ok(),
+                    ..at_row(rs, row, false)
+                }],
+                (Some(rs), None) if checkpoints.contains(&slots.end) => {
+                    vec![at_row(rs, slots.end, false)]
+                }
+                _ => Vec::new(),
+            };
+            let keep = window_at
+                .filter(|&row| row < slots.end)
+                .and_then(|row| u32::try_from(row).ok());
             // The furthest the engine lands of those inside the fire.
             let mut inside: Vec<u32> = checkpoints
                 .iter()
@@ -2772,20 +3211,21 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 .map(|&group| (&group_sets[group], Written::Span(spans[group].1.clone())))
                 .collect();
             let rs_plan = || {
-                if ring {
-                    host_ring_plan(&req, page_size, &fold, &rs_ws_ids)
+                if windowed {
+                    host_window_plan(&req, &fold, &rs_ws_ids, keep)
                 } else {
                     host_rs_plan(&stores, &rs_ws_ids, &groups, &req, &fold, &inside)
                 }
             };
             let reserved = reserve(
                 ctx,
+                (model, engine),
                 &stores,
                 quorum_pipeline_id,
                 &sets,
                 &rs_ws_ids,
                 rs_plan,
-                ring,
+                windowed,
             )
             .await;
             let Reserved {
@@ -2793,6 +3233,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 copies: (copy_src, copy_dst),
                 kvtxns,
                 rs: rs_prepared,
+                epoch,
             } = match reserved {
                 Ok(reserved) => reserved,
                 Err(error) => return Ok(Err(error)),
@@ -2856,7 +3297,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 };
                 let lanes = &groups[group].1;
                 let reach = Some(u64::from(landings[lanes[0]].end()));
-                let rs = rs_ws_ids.get(lanes[0]).copied().filter(|_| !ring);
+                let rs = rs_ws_ids.get(lanes[0]).copied().filter(|_| !windowed);
                 let by = fold_at(
                     &pass_lanes,
                     lanes,
@@ -2870,7 +3311,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 );
                 parts.push(FireWs {
                     ws: set.id,
-                    kvtxn: kvtxn.into_inner(),
+                    kvtxn,
                     log: Some(LogFire { seq, rows }),
                     lease,
                     fold: by.map(|by| FoldAt {
@@ -2886,6 +3327,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
             crate::offload::stream::tap(pid, &stores, &mut req);
             rs_prepared.apply_to(&mut req);
+            rs::apply_shared(&mut req, stores.shared.as_ref(), Some(&rs_prepared));
             checkpoints_here.extend(
                 rs_prepared
                     .snapshots
@@ -2893,6 +3335,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     .map(|snap| at_row(snap.snapshot, slots.start + u64::from(snap.row), true)),
             );
             let rs_copy = rs_prepared.state_copy();
+            let window_copies = rs_prepared.windowed_copies();
             let rstxns = RsTxnsGuard::new(model, engine, rs_prepared.txn);
             let completion = ctx
                 .resources()
@@ -2917,8 +3360,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     completion.clone(),
                     copy_src,
                     copy_dst,
+                    window_copies,
                     rs_copy,
-                    piece_frames[at],
+                    frames[at],
                     adapted,
                 )
                 .err()
@@ -2929,6 +3373,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
                 return Ok(Err(reason));
             }
+            epoch.retire_on(&completion);
+            for part in &mut parts {
+                part.kvtxn.retire_on(&completion);
+            }
+            submitted.push(completion.clone());
             if let Some(reservation) = ticket_reservation {
                 reservation.commit();
             }
@@ -2958,6 +3407,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // The next piece reads the KV this one writes: they run in
             // order on the device, so it is submitted now, as a decode's
             // next pass is, rather than once this one retires.
+            at += 1;
+        }
+        if let (Some(want), Some(last)) = (rung_want, submitted.last()) {
+            last.on_settled(move || drop(want));
         }
         advance_cursors(&pass_lanes, Some(&landings), &matched, &fold, &settles);
         crate::probe_fire_record!(submit_probe.total_us, submit_clock.elapsed());
@@ -3464,7 +3917,7 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
         let mut folds = Vec::with_capacity(kv.len());
         let mut reported = std::collections::HashMap::new();
         for part in kv {
-            if let Some(kvtxn) = part.kvtxn {
+            if let Some(kvtxn) = part.kvtxn.into_inner() {
                 crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
                     kv::settle(kv_store, kvtxn);
                 });
@@ -3709,10 +4162,10 @@ async fn fire_device_geometry<C: FireContext>(
         Ok(ids) => ids,
         Err(error) => return Ok(Err(error)),
     };
-    let ring = crate::model::model().rs_caps().window_tokens > 0;
-    if ring && groups.len() > 1 {
+    let windowed = crate::model::model().rs_caps().window_tokens > 0;
+    if windowed && groups.len() > 1 {
         return Ok(Err(
-            "pipeline: on a model with a window ring, a pass whose rows land where the device \
+            "pipeline: on a model with window lists, a pass whose rows land where the device \
              says writes one working set"
                 .to_string(),
         ));
@@ -3723,20 +4176,21 @@ async fn fire_device_geometry<C: FireContext>(
         .map(|(set, indexes)| (set, Written::Pages(indexes.clone())))
         .collect();
     let rs_plan = || {
-        if ring {
-            device_ring_plan(&stores, ws.id, &write_indexes[0], &rs_ws_ids)
+        if windowed {
+            device_window_plan(&stores, ws.id, &write_indexes[0], &rs_ws_ids)
         } else {
             device_rs_plan(&stores, &rs_ws_ids, &groups, &pass_lanes, &fold)
         }
     };
     let reserved = reserve(
         ctx,
+        (ws.model, ws.engine),
         &stores,
         quorum_pipeline_id,
         &sets,
         &rs_ws_ids,
         rs_plan,
-        ring,
+        windowed,
     )
     .await;
     let Reserved {
@@ -3744,6 +4198,7 @@ async fn fire_device_geometry<C: FireContext>(
         copies: (copy_src, copy_dst),
         kvtxns,
         rs: mut rs_prepared,
+        epoch,
     } = match reserved {
         Ok(reserved) => reserved,
         Err(error) => return Ok(Err(error)),
@@ -3916,7 +4371,7 @@ async fn fire_device_geometry<C: FireContext>(
         };
         // Where the rows land is the device's: the fold is placed when the
         // fire settles.
-        let rs = rs_ws_ids.get(lanes[0]).copied().filter(|_| !ring);
+        let rs = rs_ws_ids.get(lanes[0]).copied().filter(|_| !windowed);
         let by = fold_at(
             &pass_lanes,
             lanes,
@@ -3930,7 +4385,7 @@ async fn fire_device_geometry<C: FireContext>(
         );
         parts.push(FireWs {
             ws: set.id,
-            kvtxn: kvtxn.into_inner(),
+            kvtxn,
             log: Some(LogFire { seq: log_seq, rows }),
             lease,
             fold: by.map(|by| FoldAt {
@@ -3941,6 +4396,7 @@ async fn fire_device_geometry<C: FireContext>(
         });
     }
     let settles = settling(&parts);
+    rs::apply_shared(&mut req, stores.shared.as_ref(), Some(&rs_prepared));
     let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         &scheduler,
         req,
@@ -3950,6 +4406,7 @@ async fn fire_device_geometry<C: FireContext>(
         completion.clone(),
         copy_src,
         copy_dst,
+        rs_prepared.windowed_copies(),
         rs_copy,
         frame,
         lora_program,
@@ -3960,6 +4417,10 @@ async fn fire_device_geometry<C: FireContext>(
         let reason = format!("pipeline: device-geometry submit failed: {error}");
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
+    }
+    epoch.retire_on(&completion);
+    for part in &mut parts {
+        part.kvtxn.retire_on(&completion);
     }
     ticket_reservation.commit();
     advance_shadow(ctx, &fwd)?;
@@ -4069,7 +4530,7 @@ pub(crate) mod lifecycle_tests {
                 checkpoints: Vec::new(),
                 kv: vec![FireWs {
                     ws: id,
-                    kvtxn: Some(txn),
+                    kvtxn: KvTxnGuard::new(model, 0, Some(txn)),
                     log: None,
                     lease: ws.fire_lease().expect("lease the submitted working set"),
                     fold: None,
@@ -4144,6 +4605,68 @@ pub(crate) mod lifecycle_tests {
             );
             assert_eq!(failure.lock().expect("test failure").is_some(), failed);
         }
+        Ok(())
+    }
+
+    struct Flag(std::sync::atomic::AtomicBool);
+
+    impl std::task::Wake for Flag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Lanes that all wait on one front fire register their wakers on its
+    /// completion before it settles: settling it wakes every one of them,
+    /// not only the last to register (MI300X: 5-7 of 8 lanes slept for good
+    /// on a settled fire while the eighth decoded alone).
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_lane_waiting_on_the_front_fire_wakes_when_it_settles() -> anyhow::Result<()> {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (fires, completion, ws, _stores, _failure) = pending_fire_fixture(Vec::new());
+        let mut context = TestContext {
+            id: uuid::Uuid::new_v4(),
+            resources: ResourceTable::new(),
+        };
+        context.resources.push(ws)?;
+        let flag = || Arc::new(Flag(AtomicBool::new(false)));
+        // Three lanes at the front fire, and a drain awaiting its completion.
+        let flags: Vec<Arc<Flag>> = (0..4).map(|_| flag()).collect();
+        let mut woken = Vec::new();
+        {
+            let mut lanes: Vec<_> = flags[..3]
+                .iter()
+                .map(|flag| {
+                    (
+                        Box::pin(fires.await_front_completion()),
+                        std::task::Waker::from(flag.clone()),
+                    )
+                })
+                .collect();
+            let mut drain = completion.clone();
+            let drain_waker = std::task::Waker::from(flags[3].clone());
+            for (wait, waker) in &mut lanes {
+                let mut cx = std::task::Context::from_waker(waker);
+                assert!(wait.as_mut().poll(&mut cx).is_pending(), "nothing settled yet");
+            }
+            let mut cx = std::task::Context::from_waker(&drain_waker);
+            assert!(std::pin::Pin::new(&mut drain).poll(&mut cx).is_pending());
+
+            resolve_test_completion(&completion, false);
+            woken.extend(flags.iter().map(|flag| flag.0.load(Ordering::Acquire)));
+            for (wait, waker) in &mut lanes {
+                let mut cx = std::task::Context::from_waker(waker);
+                assert!(wait.as_mut().poll(&mut cx).is_ready(), "the fire settled");
+            }
+        }
+        finalize_all(&mut context, &fires, true).await?;
+        assert_eq!(
+            woken,
+            vec![true; 4],
+            "every waiter registered before the settle is woken by it (three lanes, then the \
+             drain)"
+        );
         Ok(())
     }
 
@@ -4302,6 +4825,63 @@ mod static_admission_tests {
     }
 }
 
+/// A piece wider than the rung never waits on a rung that does not come:
+/// it fires once the raise lands, and fails with what the planner said once
+/// the raise's room is refused.
+#[cfg(test)]
+mod rung_wait_tests {
+    use super::wait_for_rung;
+    use std::sync::{Arc, Mutex};
+
+    /// Engines no other test drives, so the caps set here are theirs alone.
+    const RAISED: usize = 61;
+    const REFUSED: usize = 62;
+    const UNFUNDED: usize = 63;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_wide_piece_fires_once_the_raise_lands() {
+        crate::store::shared::set_fire_cap_for_test(RAISED, 256);
+        let raise = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            crate::store::shared::set_fire_cap_for_test(RAISED, u32::MAX);
+        });
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_rung(RAISED, 1600, Some(|| None)),
+        )
+        .await;
+        assert_eq!(waited, Ok(Ok(())));
+        raise.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_wide_piece_fails_once_its_room_is_refused() {
+        crate::store::shared::set_fire_cap_for_test(REFUSED, 256);
+        let refused: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let says = refused.clone();
+        let refuse = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            *says.lock().unwrap() = Some("the device is short".into());
+        });
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_rung(REFUSED, 1600, Some(|| refused.lock().unwrap().clone())),
+        )
+        .await
+        .expect("no indefinite wait");
+        assert!(waited.unwrap_err().contains("the device is short"));
+        refuse.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_piece_nothing_funds_does_not_wait() {
+        crate::store::shared::set_fire_cap_for_test(UNFUNDED, 256);
+        let unfunded: Option<fn() -> Option<String>> = None;
+        assert_eq!(wait_for_rung(UNFUNDED, 1600, unfunded).await, Ok(()));
+        assert_eq!(wait_for_rung(UNFUNDED, 200, Some(|| None)).await, Ok(()));
+    }
+}
+
 #[cfg(test)]
 mod cut_tests {
     use super::*;
@@ -4316,6 +4896,24 @@ mod cut_tests {
         a_lane_only_in_the_last_piece_is_not_written_before_it();
         a_pass_with_media_is_cut_before_its_first_span();
         a_pass_with_media_keys_the_rows_before_it();
+        the_rest_of_a_pass_is_cut_again_wider();
+    }
+
+    /// A raise landing mid-pass: what is left from the last cut is cut at
+    /// the wider share, on the same page boundaries and checkpoint rows.
+    fn the_rest_of_a_pass_is_cut_again_wider() {
+        let req = prefill_lane(5, 200, 16);
+        let narrow = host_cuts(&req, true, 32, 16, &[123], 0);
+        assert_eq!(narrow[..2], [(0, 27), (27, 59)]);
+        assert_eq!(
+            host_cuts_from(&req, true, 160, 16, &[123], 0, 59),
+            [(59, 123), (123, 200)],
+            "the checkpoint row still cuts"
+        );
+        assert_eq!(
+            host_cuts_from(&req, true, 64, 16, &[], 0, 59),
+            [(59, 123), (123, 187), (187, 200)]
+        );
     }
 
     fn prefill_lane(held: u32, rows: u32, page: u32) -> crate::engine::FireRequest {

@@ -15,6 +15,14 @@ pub const WARM_FIRES: u32 = 2;
 
 pub struct Fire<'a> {
     pub eager_twin: bool,
+    /// A synthetic fire of arming whose rows no one reads (no golden arm
+    /// beside it): the fire that captures its body need not walk it first.
+    pub arming: bool,
+    /// An arming fire past its kind's widest bucket: the fires before it
+    /// made what a warm fire would (modules, tunes, the streams' slabs at
+    /// their widest), so it captures on its first fire, warming only where
+    /// that capture is refused.
+    pub cold: bool,
     pub trace: &'a Trace,
     pub compiled: &'a CompiledModel,
     pub descriptor: &'a FireDescriptor,
@@ -28,6 +36,8 @@ pub struct Fire<'a> {
     pub ceilings: Ceilings<'a>,
     /// [`BodyKey::islands`] as prepared for this fire.
     pub islands: &'a [u8],
+    /// [`BodyKey::rs`] as prepared for this fire.
+    pub rs: RsBody,
 }
 #[derive(Default)]
 pub struct Bodies {
@@ -40,6 +50,8 @@ pub struct BodyMap {
     bodies: HashMap<BodyKey, Body>,
     body_order: Vec<BodyKey>,
     body_warm: HashMap<BodyKey, u32>,
+    /// Keys whose cold capture was refused: they warm before capturing.
+    cold_refused: HashSet<BodyKey>,
     bodies_refused: HashSet<BodyKey>,
     sealed: bool,
 }
@@ -86,12 +98,28 @@ impl Bodies {
         self.recorder.at_step(seq);
     }
 
-    pub fn eager_walk(&mut self, rotating: bool, buffered: bool) {
-        self.recorder.eager_walk(rotating, buffered);
+    pub fn eager_walk(&mut self, buffered: bool) {
+        self.recorder.eager_walk(buffered);
     }
 
     pub fn eager_copy_world(&mut self) {
         self.recorder.eager_copy_world();
+    }
+
+    /// A serving fire of a load that records bodies walked with none:
+    /// counted, and warned of at the first and every power of two after,
+    /// so an unrecorded serving path cannot hide.
+    pub fn eager_unbodied(&mut self, why: &str) {
+        let tally = &mut self.recorder.bstats;
+        tally.eager_unbodied += 1;
+        let count = tally.eager_unbodied;
+        if count.is_power_of_two() {
+            eprintln!(
+                "engine-cuda: WARNING: a serving fire ran with no recorded body ({why}); \
+                 {count} such fire(s) so far (BodyTally::eager_unbodied). Every serving \
+                 composition of a load that records bodies should replay one"
+            );
+        }
     }
 }
 
@@ -104,10 +132,7 @@ impl Recorder {
         self.at_seq = seq;
     }
 
-    pub fn eager_walk(&mut self, rotating: bool, buffered: bool) {
-        if rotating {
-            self.bstats.eager_rotating += 1;
-        }
+    pub fn eager_walk(&mut self, buffered: bool) {
         if buffered {
             self.bstats.eager_buffered += 1;
         }
@@ -381,6 +406,28 @@ pub struct Tiers {
     pub plain: poem_ir::ClassSet,
 }
 
+/// How a fire's lanes treat their recurrent rows, which picks the kernels a
+/// body launches: a fire whose lanes fold all they land, one whose lanes
+/// buffer rows past their state but replay none, and one where a lane
+/// replays buffered rows ahead of its own (every recurrence then runs over
+/// the extended rows). Where a lane's rows land and which it replays are
+/// data the body reads (`inputs::RsHandles`), not part of the key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum RsBody {
+    #[default]
+    Folds,
+    Buffers,
+    Replays,
+}
+
+impl RsBody {
+    /// Whether a lane of the fire buffers rows.
+    #[must_use]
+    pub fn buffers(self) -> bool {
+        self != RsBody::Folds
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BodyKey {
     pub bucket: u32,
@@ -391,6 +438,8 @@ pub struct BodyKey {
     /// a whole one at the same bucket and classes, and a body is only
     /// replayable for the admissibility it was recorded under.
     pub islands: Box<[u8]>,
+    /// How the fire's lanes treat their recurrent rows.
+    pub rs: RsBody,
 }
 
 impl BodyKey {
@@ -408,6 +457,7 @@ impl BodyKey {
             classes: Ladder::of(classes, bucket, decoding, lane_ceiling, tiers),
             patch: None,
             islands: Box::default(),
+            rs: RsBody::Folds,
         }
     }
 
@@ -425,7 +475,15 @@ impl BodyKey {
             classes: Ladder::of(classes, bucket, decoding, lane_ceiling, tiers),
             patch: patch.map(|(classes, bucket)| AxisKey::of(classes, bucket)),
             islands: Box::default(),
+            rs: RsBody::Folds,
         }
+    }
+
+    /// The same key, for a fire whose lanes treat their recurrent rows so.
+    #[must_use]
+    pub fn with_rs(mut self, rs: RsBody) -> BodyKey {
+        self.rs = rs;
+        self
     }
 
     /// The same key, carrying which regions `admits` keeps out of a graph.
@@ -544,6 +602,11 @@ impl core::fmt::Display for BodyKey {
             for byte in self.islands.iter().rev() {
                 write!(f, "{byte:02x}")?;
             }
+        }
+        match self.rs {
+            RsBody::Folds => {}
+            RsBody::Buffers => f.write_str("~rs")?,
+            RsBody::Replays => f.write_str("~rsx")?,
         }
         Ok(())
     }
@@ -701,9 +764,12 @@ pub struct BodyTally {
     pub armed_at_load: u64,
     pub sealed_declines: u64,
     pub sealed_short: u64,
-    pub eager_rotating: u64,
     pub eager_buffered: u64,
     pub eager_copy_world: u64,
+    /// Serving fires walked with no body under a load that records them:
+    /// their composition was never armed (and not captured as it served)
+    /// or is one a body cannot carry. Each is warned of at a power of two.
+    pub eager_unbodied: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -737,7 +803,7 @@ impl core::fmt::Display for BodyStats {
             f,
             "[body-stats] hits={} misses={} reshapes={} captures={} \
              declines={} refusals={} evictions={} armed_at_load={} \
-             sealed_declines={} sealed_short={} eager_rotating={} eager_buffered={} \
+             sealed_declines={} sealed_short={} eager_buffered={} \
              eager_copy_world={} | last-capture: nodes={} edges={} islands={} \
              | resident: bodies={} segmented={} bytes={}",
             tally.hits,
@@ -750,7 +816,6 @@ impl core::fmt::Display for BodyStats {
             tally.armed_at_load,
             tally.sealed_declines,
             tally.sealed_short,
-            tally.eager_rotating,
             tally.eager_buffered,
             tally.eager_copy_world,
             last.nodes,
@@ -807,6 +872,14 @@ impl Bodies {
         self.map.seal();
     }
 
+    /// Drops every recorded body and what was refused, unsealed: what the
+    /// bodies captured (a kernel chosen for where a weight lay) no longer
+    /// holds, and the lattice is armed again.
+    pub fn forget_bodies(&mut self) {
+        self.map = BodyMap::default();
+        self.recorder.sealed_seen.clear();
+    }
+
     #[must_use]
     pub fn body_refused(&self, key: &BodyKey) -> bool {
         self.map.refused(key)
@@ -843,6 +916,7 @@ impl Bodies {
             )),
         );
         key.islands = at.islands.into();
+        key.rs = at.rs;
 
         crate::serve::btrace::mark("key");
         let at_seq = self.recorder.at_seq;
@@ -923,8 +997,20 @@ impl Bodies {
         // The warm fires walk the streams the capture will: a side stream's
         // regions take their own slabs (`scratch_stream` scopes by stream),
         // which a capture cannot grow. Nothing is capturing, so no region
-        // opens a conditional node.
-        walk_capture(at, run, place, Streams::Warm)?;
+        // opens a conditional node. An arming fire about to be captured
+        // skips its walk: nothing reads a synthetic fire's rows, and the warm
+        // fire before it made what the walk would (modules, tunes, slabs).
+        // A key whose cold capture was refused warms on its next fire: that
+        // fire walks before it captures, its first having walked nothing.
+        let refused = self.map.cold_refused.contains(&key);
+        let cold = at.arming && at.cold && !refused;
+        let captures = at.arming
+            && !self.map.sealed()
+            && run.capturable()
+            && (cold || (!refused && self.map.warmed(&key) + 1 >= WARM_FIRES));
+        if !captures {
+            walk_capture(at, run, place, Streams::Warm)?;
+        }
 
         if self.sealed_decline() {
             let declines = self.recorder.bstats.sealed_declines;
@@ -939,7 +1025,7 @@ impl Bodies {
                     "the resident body is empty"
                 };
                 eprintln!(
-                    "engine-cuda: the sealed map holds no body for {key} ({why}) — \
+                    "engine-cuda: WARNING: the sealed map holds no body for {key} ({why}) — \
                      this shape walks eagerly for the life of the load \
                      (BodyTally::sealed_declines counts each such fire; {declines} so far) {}",
                     self.body_stats()
@@ -950,7 +1036,7 @@ impl Bodies {
         self.recorder.bstats.misses += 1;
 
         let warmed = self.map.warm(&key);
-        if warmed < WARM_FIRES {
+        if warmed < WARM_FIRES && !cold {
             return Ok(());
         }
         if !run.capturable() {
@@ -978,6 +1064,9 @@ impl Bodies {
         // device would wait on the launch that holds back.
         let fence = |run: &Run<'_>| run.ep_rank().map_or(Ok(()), |ep| ep.fence(at.stream));
         fence(run)?;
+        // The capture walks the fire again: what the warm walk laid in the
+        // rs scratch (each window's extended layout) is laid again inside it.
+        run.rs_rewind();
         let mut steps: Vec<Step> = Vec::with_capacity(script.len());
         let mut nodes = 0;
         let mut edges = 0;
@@ -997,7 +1086,15 @@ impl Bodies {
                     walk_capture_cut(at, run, place, Streams::Forked, cut)
                 });
                 PTR_TAG.store(0, std::sync::atomic::Ordering::Relaxed);
-                captured?
+                // A cold capture refused (something it walks wants making
+                // first): the key warms on its next fire and captures after.
+                match captured {
+                    Err(_) if cold && warmed < WARM_FIRES => {
+                        self.map.cold_refused.insert(key);
+                        return Ok(());
+                    }
+                    captured => captured?,
+                }
             };
             if let Some(dir) = crate::serve::diag::on().graph_dot.as_deref()
                 && ptr_traced(&key)
@@ -1074,8 +1171,12 @@ impl Bodies {
                 }
             }
         }
-        let seated = self.insert_body(
-            key.clone(),
+        // The warm walk above served this fire; a capture launches nothing.
+        // The body is not launched again here: a fire that folds rows into
+        // a recurrent state (or appends to anything in place) would fold
+        // them twice.
+        self.insert_body(
+            key,
             Body {
                 script: steps.into_boxed_slice(),
                 grids,
@@ -1085,17 +1186,6 @@ impl Bodies {
                 pinned: false,
             },
         );
-        if seated && let Some(body) = self.map.bodies.get_mut(&key) {
-            for step in body.script.iter() {
-                match step {
-                    Step::Exec { exec, .. } => exec.launch(at.stream)?,
-                    Step::Island(cut) => {
-                        walk_capture_cut(at, run, place, Streams::Serial, *cut)?;
-                    }
-                }
-            }
-            body.launched_at = at_seq;
-        }
         Ok(())
     }
 
@@ -1184,6 +1274,11 @@ impl BodyMap {
             let key = self.body_order.remove(at);
             self.body_order.push(key);
         }
+    }
+
+    /// The fires `key` has warmed so far.
+    fn warmed(&self, key: &BodyKey) -> u32 {
+        self.body_warm.get(key).copied().unwrap_or(0)
     }
 
     fn warm(&mut self, key: &BodyKey) -> u32 {
@@ -1450,6 +1545,7 @@ mod tests {
             classes: Ladder::single(0, Ladder::rung(0, 8, &decoding, LANES)),
             patch: None,
             islands: Box::default(),
+            rs: RsBody::Folds,
         };
         assert_eq!(armed, fired, "the armed key must be the fired key");
     }
@@ -1460,6 +1556,7 @@ mod tests {
             classes: Ladder::single(0, bucket),
             patch: None,
             islands: Box::default(),
+            rs: RsBody::Folds,
         }
     }
 

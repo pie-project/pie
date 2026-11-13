@@ -111,6 +111,7 @@ fn fire(gpu: &mut Gpu, arm: Arm, inputs: &Inputs, slab_at: u64, f: &Fire) -> Vec
         commit_len: Tensor::ABSENT,
         begin_at: Tensor::ABSENT,
         fused_decay: false,
+        segments: kernels_cuda::Segments::ONE,
         snapshots,
     };
     let (r0, r1) = (f.rows.start as usize, f.rows.end as usize);

@@ -227,7 +227,6 @@ fn the_kv_write_round_trips() {
                 name: String::from("kv"),
                 planes: vec![width, width],
                 dtype,
-                space: 0,
                 window: None,
                 head_dim: HEAD_DIM as u32,
                 live: None,
@@ -309,7 +308,9 @@ fn write_case(rig: &mut Rig, head_dim: usize) {
         seq_stride: width,
         head_stride: head_dim as u64,
         q8: false,
-    };
+        page_stride: [0; 2],
+    }
+    .paged_densely();
     let kt = Tensor::new(hk, TOKENS as u32, width as u32, Dtype::Bf16);
     let vt = Tensor::new(hv, TOKENS as u32, width as u32, Dtype::Bf16);
     let wpt = Tensor::new(w_page, TOKENS as u32, 1, Dtype::U32);
@@ -401,7 +402,7 @@ fn write_case(rig: &mut Rig, head_dim: usize) {
 /// outright refused) loads correctly.
 #[test]
 fn the_pre_estimate_sizes_packed_kv_exactly_at_any_head_dim() {
-    use engine_metal::store::Pools;
+    use engine_metal::store::Rows;
     use engine_metal::store::kv::{Facts, SpaceFacts};
 
     eprintln!("=== C2b(C): pool_demand sizes packed KvU4 exactly at any head_dim ===");
@@ -422,7 +423,6 @@ fn the_pre_estimate_sizes_packed_kv_exactly_at_any_head_dim() {
                 name: String::from("kv"),
                 planes: vec![width, width],
                 dtype,
-                space: 0,
                 window: None,
                 head_dim,
                 live: None,
@@ -479,12 +479,13 @@ fn the_pre_estimate_sizes_packed_kv_exactly_at_any_head_dim() {
             })],
             plans: Vec::new(),
         };
-        let actual = Pools::reserve(&device, &trace, paging, &facts)
-            .expect("reserve")
-            .bytes();
+        let _ = &device;
+        let _ = &facts;
+        let actual =
+            Rows::estimate(&trace, PAGE_SIZE).expect("plan").0 * u64::from(PAGE_SIZE) * PAGES;
         eprintln!(
             "[match ] {dtype:?} kv_heads={kv_heads} head_dim={head_dim:>3}: \
-             pool_demand={est} B  reserve={actual} B"
+             pool_demand={est} B  laid={actual} B"
         );
         assert_eq!(
             est, actual,

@@ -2,6 +2,15 @@ api = 1
 
 [target]
 
+# A desktop GPU (discrete, or NVIDIA / AMD / Intel) has no submit watchdog a
+# step outlasts, so it submits each step whole and records it; a mobile one
+# (Adreno with coopmat lands here) keeps the split.
+[engine]
+submit.split_rows = [
+  { when = "discrete or vendor in (nvidia, amd, intel)", value = 0 },
+  { value = 32 },
+]
+
 [kernel]
 gemm.path = [{ when = "coopmat", use = "coopmat" }, { use = "tiled" }]
 moe.path = [{ when = "coopmat", use = "coopmat" }, { use = "tiled" }]

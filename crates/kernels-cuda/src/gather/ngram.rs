@@ -92,17 +92,17 @@ pub fn ngram_ids(
         primes.len() as u32,
         "one output column per hashed head"
     );
-    let rows = nonzero(OP, "rows", ids.rows)?;
+    let n = nonzero(OP, "rows", ids.rows)?;
+    // The id window is uncuttable: a piece is the whole row.
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, 1)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::gather::ngram_ids_update")).apply(Launch::flat(rows, BLOCK)),
+        Fire::at(kernel(FILE, "::pie::gather::ngram_ids_update")).apply(Launch::flat(n, BLOCK)),
         &[
             ids.arg(),
-            state.slab.arg(),
-            state.slot_ids.arg(),
-            state.slot_stride_elems.arg(),
+            rows.arg(),
             ngram_ids.arg(),
-            stated(OP, rows)?.arg(),
+            stated(OP, n)?.arg(),
             ArgValue::of(&h),
             ArgValue::Ptr(map.map_or(0, |t| t.ptr)),
             ctx.stage(),
@@ -146,16 +146,15 @@ pub fn ngram_ids_chunked(
     debug_assert_eq!(ngram_ids.dtype, Dtype::I32, "`{OP}` lands i32 table rows");
     let h = hash_arg(OP, eos, mults, primes, offsets, heads_per_ngram)?;
     let lanes = nonzero(OP, "request lanes", ids.indptr.rows.saturating_sub(1))?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, 1)?;
     ctx.fire(
         OP,
         Fire::at(kernel(FILE, "::pie::gather::ngram_ids_chunked"))
             .apply(Launch::grid([lanes, 1, 1], [BLOCK, 1, 1])),
         &[
             ids.data.arg(),
-            state.slab.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             ids.indptr.arg(),
-            state.slot_stride_elems.arg(),
             ngram_ids.arg(),
             state.write_state.arg(),
             state.write_state_mask.arg(),

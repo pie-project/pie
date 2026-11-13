@@ -54,7 +54,7 @@ pub struct Outcome {
 }
 
 fn patches(trace: &poem_ir::Trace, slots: u32) -> Option<poem_compiler::PatchLadder> {
-    crate::api::patch_ladder(
+    engine_gpu::api::patch_ladder(
         trace,
         &engine::load::Budgets {
             max_lanes: slots,
@@ -85,7 +85,7 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         profiles: Some(dir.clone()),
         ..crate::api::DeviceBoot::default()
     };
-    let mut shell = crate::serve::Shell::load(crate::serve::Boot {
+    let mut shell = engine_gpu::serve::Shell::load(engine_gpu::serve::Boot {
         trace: trace.clone(),
         contract: &contract,
         checkpoint: artifact,
@@ -99,16 +99,17 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         runahead: engine::runahead::Runahead::F1,
         device: &boot,
         residency: engine::load::Residency::default(),
+        handed: None,
     })
     .map_err(|e| e.to_string())?;
     let token = |i: u32| 100 + (i * 7919) % 5000;
     let prompt: Vec<u32> = (0..PROMPT).map(token).collect();
-    let fire = |shell: &mut crate::serve::Shell,
+    let fire = |shell: &mut engine_gpu::serve::Shell<crate::device::Api>,
                 lanes: &[(u32, &[u32])]|
      -> Result<(f64, Vec<f32>), String> {
-        let lanes: Vec<crate::serve::Lane> = lanes
+        let lanes: Vec<engine_gpu::serve::Lane> = lanes
             .iter()
-            .map(|&(slot, tokens)| crate::serve::Lane {
+            .map(|&(slot, tokens)| engine_gpu::serve::Lane {
                 slot,
                 word: trace.facts.word(&Request::new(tokens.len() as u32, false)),
                 tokens,

@@ -365,33 +365,177 @@ fn selected(op: &'static str, x: Tensor, routes: Tensor, y: &Tensor) -> Result<S
     })
 }
 
+/// The planes of a routed bank's kind, in the order an expert's table
+/// entries list them (`linear/table.hip`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Planes {
+    /// One plane: bf16 / f16 weights, `[experts, n, k]`.
+    Dense,
+    /// `[codes, scales, bias]`: MXFP4 (bias 0 where the bank has none).
+    Mxfp4,
+    /// `[codes, scales, tensor_scales]`: NVFP4 (no ROCm select reads one).
+    Nvfp4,
+    /// `[codes, scales, zeros]`: affine (mlx: `[codes, scales, biases]`).
+    Affine,
+    /// `[codes, scales]`: a block-scaled bank whose scales are their own
+    /// plane (`e4m3tile128`'s f32 factors, an MXFP4 bank in lane order).
+    Scaled,
+    /// `[codes, atoms, tensor_scales, input_scales]`: NVFP4 against NVFP4
+    /// activations (no ROCm select reads one).
+    Nvfp4A4,
+}
+
+impl Planes {
+    /// Entries an expert.
+    #[must_use]
+    pub const fn count(self) -> u32 {
+        match self {
+            Planes::Dense => 1,
+            Planes::Scaled => 2,
+            Planes::Mxfp4 | Planes::Nvfp4 | Planes::Affine => 3,
+            Planes::Nvfp4A4 => 4,
+        }
+    }
+}
+
+/// Where a routed bank's experts lie: the weight cache's expert table.
+///
+/// A routed bank is one or more planes, each `[experts, ...]` when
+/// contiguous. The table names, for every expert, the address of each of its
+/// planes, `table[e * planes + p]` in the plane order of the bank's
+/// [`Planes`]. A null table is the contiguous bank (expert `e`'s plane at
+/// `base + e * stride`): the degenerate table, which a kernel computes
+/// rather than reads. A table equal to the contiguous bank's addresses lands
+/// the same bits as no table.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExpertTable {
+    /// A device array of [`Planes::count`] u64 addresses an expert; 0 for
+    /// the contiguous bank.
     pub table: u64,
+    /// A u32 counter an expert of the routes that read it, or 0.
     pub hits: u64,
+    /// Whether every entry names device memory (the weight cache's chunks or
+    /// staging slots): any select takes such a table. Otherwise an entry may
+    /// name mapped host memory (the expert tier's), and only the per-route
+    /// stream selects (one plain read of an expert's rows a route) take it.
+    pub located: bool,
+    /// `(base, bytes)`: the span every entry falls in, for a reader that
+    /// maps it. No HIP kernel maps a bank (there is no TMA), so this rides
+    /// along for the CUDA twin's sake.
+    pub window: (u64, u64),
 }
 
 impl ExpertTable {
-    pub const RESIDENT: ExpertTable = ExpertTable { table: 0, hits: 0 };
+    pub const RESIDENT: ExpertTable = ExpertTable {
+        table: 0,
+        hits: 0,
+        located: false,
+        window: (0, 0),
+    };
+
+    /// A table of device addresses within `window`.
+    #[must_use]
+    pub const fn located(table: u64, window: (u64, u64)) -> ExpertTable {
+        ExpertTable {
+            table,
+            hits: 0,
+            located: true,
+            window,
+        }
+    }
+
+    /// The table counting each expert's routes in `hits`.
+    #[must_use]
+    pub const fn counting(mut self, hits: u64) -> ExpertTable {
+        self.hits = hits;
+        self
+    }
+
+    /// Whether the table may name mapped host memory: the batch, grouped
+    /// and matrix-core selects leave such a bank to the per-route stream.
+    #[must_use]
+    pub const fn streams(&self) -> bool {
+        self.table != 0 && !self.located
+    }
+
+    /// Whether there is a table at all.
+    #[must_use]
+    pub const fn tabled(&self) -> bool {
+        self.table != 0
+    }
+
+    /// The table pointer a kernel takes, 0 for the contiguous bank.
+    #[must_use]
+    pub const fn at(&self) -> u64 {
+        self.table
+    }
+
+    /// The table and the counter, as a kernel's last two arguments take them.
+    fn args(&self) -> [ArgValue<'static>; 2] {
+        [ArgValue::Ptr(self.table), ArgValue::Ptr(self.hits)]
+    }
+}
+
+/// The contiguous bank's table: `planes` given as `(base, stride)` in bytes,
+/// expert `e`'s entry `p` at `base_p + e * stride_p` (a plane the bank lacks
+/// as `(0, 0)`). Uploaded, it lands what no table does.
+#[must_use]
+pub fn contiguous_entries(experts: u32, planes: &[(u64, u64)]) -> Vec<u64> {
+    (0..u64::from(experts))
+        .flat_map(|e| planes.iter().map(move |&(base, stride)| base + e * stride))
+        .collect()
+}
+
+/// Refuses a table that may name mapped host memory for a select with no
+/// per-route stream arm to read it.
+fn located_only(op: &'static str, experts: ExpertTable, what: &str) -> Result<(), Error> {
+    if experts.streams() {
+        return Err(refuse(
+            op,
+            format!(
+                "{what} reads its experts through the batch or matrix-core tiles only; an expert table \
+                 that may name mapped host memory (not located) is the per-route stream selects'"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Where a token-id-gathered table's row blocks lie, as the CUDA kernels
+/// take it: a u64 address a block of `block_rows` rows (null: the
+/// contiguous table), and a u32 read counter a block (`hits`, or 0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowTable {
+    pub table: u64,
+    pub block_rows: u32,
+    pub hits: u64,
+}
+
+impl RowTable {
+    pub const RESIDENT: RowTable = RowTable {
+        table: 0,
+        block_rows: 1,
+        hits: 0,
+    };
+
+    #[must_use]
+    pub const fn located(table: u64, block_rows: u32) -> RowTable {
+        RowTable {
+            table,
+            block_rows,
+            hits: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn counting(mut self, hits: u64) -> RowTable {
+        self.hits = hits;
+        self
+    }
 
     #[must_use]
     pub const fn streams(&self) -> bool {
         self.table != 0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct GroupSeat {
-    pub cell: u64,
-    pub hits: u64,
-}
-
-impl GroupSeat {
-    pub const RESIDENT: GroupSeat = GroupSeat { cell: 0, hits: 0 };
-
-    #[must_use]
-    pub const fn streams(&self) -> bool {
-        self.cell != 0
     }
 }
 
@@ -414,16 +558,16 @@ pub fn matmul_select(
         && count <= ORDER_EXPERT_CAP
         && (65..=ctx.tuning().moe_dense_batch_until).contains(&fan.route_count.div_ceil(count))
     {
-        return select_gemm(ctx, OP, x, bank, routes, y, &fan, count);
+        return select_gemm(ctx, OP, x, bank, routes, y, &fan, count, experts);
     }
-    // A wide decode batch over a resident bank: an item an expert's routes,
+    // A wide decode batch over a located bank: an item an expert's routes,
     // its weight read once.
     if let Some(count) = dense_experts(x, bank, y, experts)
         && let Some(mw) = wide_items(ctx, &fan, count, x)
     {
-        return select_wide(ctx, OP, x, bank, routes, y, &fan, count, mw);
+        return select_wide(ctx, OP, x, bank, routes, y, &fan, count, mw, experts);
     }
-    // A decode batch over a resident bank: each expert read once for all its
+    // A decode batch over a located bank: each expert read once for all its
     // routes.
     if let Some(count) = dense_experts(x, bank, y, experts)
         && x.width.is_multiple_of(8)
@@ -446,25 +590,26 @@ pub fn matmul_select(
             count,
             mt,
             nbw,
-            None,
             &[
                 ArgValue::Ptr(0),
                 ArgValue::Ptr(0),
                 ArgValue::Ptr(0),
                 0i32.arg(),
+                ArgValue::Ptr(experts.table),
+                ArgValue::Ptr(experts.hits),
             ],
         );
     }
     if let Some(count) = grouped_worth(ctx, x, bank, y, &fan, experts) {
         if x.width.is_multiple_of(8) {
-            return select_grouped(ctx, OP, x, bank, routes, y, count, &fan);
+            return select_grouped(ctx, OP, x, bank, routes, y, count, &fan, experts);
         }
         // A row the native legs cannot read in 16-byte pieces: rocBLAS's
         // batched GEMM, eagerly. Where both run the native leg is several
         // times the faster.
         #[cfg(feature = "rocm")]
         if ctx.stage() == ArgValue::Ptr(0) && blas_worth(x, y, &fan, count) {
-            return select_grouped_blas(ctx, OP, x, bank, routes, y, count);
+            return select_grouped_blas(ctx, OP, x, bank, routes, y, count, experts);
         }
     }
     select_gemv(ctx, OP, x, bank, routes, y, experts)
@@ -493,6 +638,8 @@ pub fn matmul_grouped(
         && x.dtype == Dtype::Bf16
         && bank.dtype == Dtype::Bf16
         && y.dtype == Dtype::Bf16
+        // The strided launch reads the contiguous bank only.
+        && !experts.tabled()
         && dense_experts(x, bank, y, experts) == Some(groups)
         && routes.rows > ctx.tuning().moe_batch_until
         && x.rows == routes.rows * groups
@@ -565,8 +712,8 @@ fn grouped_lt(
 /// The most experts `moe_route_order` buckets in its LDS.
 const ORDER_EXPERT_CAP: u32 = 4096;
 
-/// The experts of a resident 16-bit bank the expert-ordered legs can
-/// bucket, if it is one.
+/// The experts of a 16-bit bank the expert-ordered legs can bucket, if it is
+/// one and lies in device memory (contiguous, or a located table).
 fn dense_experts(x: Tensor, bank: Tensor, y: &Tensor, experts: ExpertTable) -> Option<u32> {
     if experts.streams() {
         return None;
@@ -639,8 +786,8 @@ fn batch_items(ctx: &Ctx, fan: &Selected, experts: u32, widest: u32, until: u32)
 
 /// A batch fire: routes ordered by expert into `mt`-route items, then one
 /// item a block row against 64·nbw weight rows a block. `planes` are
-/// the bank's arguments, between the work list and the result; a packed
-/// bank's seat follows the extents.
+/// the bank's arguments, between the work list and the result, and `tail`
+/// (ending in the expert table and its counter) follows the extents.
 #[allow(clippy::too_many_arguments)]
 fn select_batch(
     ctx: &Ctx,
@@ -655,7 +802,6 @@ fn select_batch(
     experts: u32,
     mt: u32,
     nbw: u32,
-    seat: Option<GroupSeat>,
     tail: &[ArgValue],
 ) -> Result<(), Error> {
     let k = stated(op, x.width)?;
@@ -676,9 +822,6 @@ fn select_batch(
         k.arg(),
         stated(op, experts)?.arg(),
     ]);
-    if let Some(seat) = seat {
-        args.extend([ArgValue::Ptr(seat.cell), ArgValue::Ptr(seat.hits)]);
-    }
     args.extend_from_slice(tail);
     ctx.fire(
         op,
@@ -753,6 +896,7 @@ fn select_gemm(
     y: &mut Tensor,
     fan: &Selected,
     experts: u32,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
@@ -779,6 +923,8 @@ fn select_gemm(
             stated(op, experts)?.arg(),
             stated(op, y.rows)?.arg(),
             stated(op, 2 * x.width / 128)?.arg(),
+            ArgValue::Ptr(table.table),
+            ArgValue::Ptr(table.hits),
         ],
     )
 }
@@ -796,6 +942,7 @@ fn select_wide(
     fan: &Selected,
     experts: u32,
     mw: u32,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let k = stated(op, x.width)?;
@@ -842,6 +989,8 @@ fn select_wide(
             stated(op, experts)?.arg(),
             act_bytes.arg(),
             per_xcd.arg(),
+            ArgValue::Ptr(table.table),
+            ArgValue::Ptr(table.hits),
         ],
     )
 }
@@ -988,10 +1137,11 @@ fn select_grouped(
     y: &mut Tensor,
     experts: u32,
     fan: &Selected,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     let ordered = route_order(ctx, op, routes, fan, experts, group_routes(fan, experts))?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
-    select_grouped_launch(ctx, op, x, bank, y, experts, &ordered, act_div, 0)
+    select_grouped_launch(ctx, op, x, bank, y, experts, &ordered, act_div, 0, table)
 }
 
 /// The grouped legs' row layouts (`SORTED` of the kernels): the activation's
@@ -1014,8 +1164,11 @@ fn select_grouped_launch(
     ordered: &RouteOrder,
     act_div: i32,
     sorted: u32,
+    table: ExpertTable,
 ) -> Result<(), Error> {
-    grouped_launch(ctx, op, x, bank, y, experts, ordered, act_div, sorted, None)
+    grouped_launch(
+        ctx, op, x, bank, y, experts, ordered, act_div, sorted, None, table,
+    )
 }
 
 /// [`select_grouped_launch`]; with `glu` (the swiglu's clamp, if any) over a
@@ -1033,6 +1186,7 @@ fn grouped_launch(
     act_div: i32,
     sorted: u32,
     glu: Option<Option<f32>>,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let k = stated(op, x.width)?;
@@ -1077,6 +1231,8 @@ fn grouped_launch(
             n.arg(),
             k.arg(),
             stated(op, experts)?.arg(),
+            ArgValue::Ptr(table.table),
+            ArgValue::Ptr(table.hits),
         ]
         .into_iter()
         .chain(tall.then(|| limit.arg()))
@@ -1175,6 +1331,7 @@ mod ordered {
                 act_div,
                 SORT_OUT,
                 Some(p.limit),
+                p.gate_up_experts,
             )?;
         } else {
             let packed = ctx.scratch_stream(
@@ -1193,6 +1350,7 @@ mod ordered {
                 &ordered,
                 act_div,
                 SORT_OUT,
+                p.gate_up_experts,
             )?;
             let clamp = if p.limit.is_some() { "true" } else { "false" };
             ctx.fire(
@@ -1227,6 +1385,7 @@ mod ordered {
             &ordered,
             1,
             SORT_ACT,
+            p.down_experts,
         )?;
         weighted_sum(ctx, p.routed, p.weights, y)
     }
@@ -1297,6 +1456,7 @@ fn stage_lt(
     experts: u32,
     fan: &Selected,
     pos: u64,
+    table: ExpertTable,
 ) -> Result<LtStage, Error> {
     use crate::hip::lt_grouped::USER_ARGS_BYTES;
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -1329,6 +1489,8 @@ fn stage_lt(
             stated(op, n)?.arg(),
             stated(op, k)?.arg(),
             stated(op, experts)?.arg(),
+            ArgValue::Ptr(table.table),
+            ArgValue::Ptr(table.hits),
         ],
     )?;
     Ok(LtStage {
@@ -1446,7 +1608,18 @@ fn mlp_lt(ctx: &Ctx, op: &'static str, p: &RoutedMlp, y: &mut Tensor) -> Result<
     };
     let stream = ctx.stream();
     let pos = ctx.scratch(op, "linear.moe_lt_pos", rows as usize * 4)? as usize as u64;
-    let stage = stage_lt(ctx, op, x, p.gate_up, p.routes, 2 * i, experts, &fan, pos)?;
+    let stage = stage_lt(
+        ctx,
+        op,
+        x,
+        p.gate_up,
+        p.routes,
+        2 * i,
+        experts,
+        &fan,
+        pos,
+        p.gate_up_experts,
+    )?;
     gemm_lt(op, lib, up_at, &stage, 2 * i, rows, experts, stream)?;
 
     // The swiglu over the rows in expert order.
@@ -1491,6 +1664,8 @@ fn mlp_lt(ctx: &Ctx, op: &'static str, p: &RoutedMlp, y: &mut Tensor) -> Result<
             stated(op, out)?.arg(),
             stated(op, i)?.arg(),
             stated(op, experts)?.arg(),
+            ArgValue::Ptr(p.down_experts.table),
+            ArgValue::Ptr(p.down_experts.hits),
         ],
     )?;
     lt_launch(op, lib, down_at, args, out, rows, experts, stream)?;
@@ -1555,6 +1730,7 @@ fn select_grouped_blas(
     routes: Tensor,
     y: &mut Tensor,
     experts: u32,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     use crate::hip::blas::{self, Operand};
     use crate::hip::sys;
@@ -1677,6 +1853,10 @@ fn select_grouped_blas(
             block_size.arg(),
             k.arg(),
             n.arg(),
+            ArgValue::Ptr(table.table),
+            ArgValue::Ptr(table.hits),
+            ArgValue::Ptr(sorted),
+            route_count.arg(),
         ],
     )?;
 
@@ -1865,7 +2045,7 @@ pub(crate) fn select_gemv(
             k.arg(),
             n.arg(),
             (i64::from(n) * i64::from(k)).arg(), // the bank's expert stride
-            ArgValue::Ptr(experts.table),
+            ArgValue::Ptr(experts.table),        // any table: one plain read a route
             ArgValue::Ptr(experts.hits),
             rows.arg(),
             ctx.stage(),
@@ -1883,7 +2063,7 @@ fn matmul_select_mxfp4(
     bias: Option<Tensor>,
     routes: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     const MXFP4_BLOCK: u32 = 32;
 
@@ -1913,7 +2093,9 @@ fn matmul_select_mxfp4(
     // pays only once an expert serves more than `kernel.moe.mxfp4_grouped_reuse`
     // routes on average; routes over experts is a floor on that average.
     let experts = codes.rows.clamp(1, ORDER_EXPERT_CAP);
+    // A table that may name mapped host memory takes the per-route stream.
     if x.dtype == Dtype::Bf16
+        && !table.streams()
         && codes.rows <= ORDER_EXPERT_CAP
         && let Some(mt) = batch_items(ctx, &fan, experts, 32, ctx.tuning().moe_batch_until)
         // Short of 32 routes a lane reads its two scale bytes as one.
@@ -1938,11 +2120,13 @@ fn matmul_select_mxfp4(
             experts,
             mt,
             BATCH_NBW,
-            Some(seat),
-            &[],
+            &table.args(),
         );
     }
-    if fan.route_count > ctx.tuning().mxfp4_grouped_reuse * experts && ctx.tuning().mxfp4_grouped {
+    if fan.route_count > ctx.tuning().mxfp4_grouped_reuse * experts
+        && ctx.tuning().mxfp4_grouped
+        && !table.streams()
+    {
         let ordered = route_order(ctx, op, routes, &fan, experts, group_routes(&fan, experts))?;
         let wmma = x.dtype == Dtype::Bf16 && ctx.tuning().mxfp4_wmma;
         let entry = if wmma {
@@ -1970,8 +2154,8 @@ fn matmul_select_mxfp4(
             n.arg(),
             k.arg(),
             stated(op, experts)?.arg(),
-            ArgValue::Ptr(seat.cell),
-            ArgValue::Ptr(seat.hits),
+            ArgValue::Ptr(table.table),
+            ArgValue::Ptr(table.hits),
         ]);
         return ctx.fire(
             op,
@@ -2015,10 +2199,10 @@ fn matmul_select_mxfp4(
             act_div.arg(),
             n.arg(),
             k.arg(),
-            ArgValue::Ptr(seat.cell),
-            ArgValue::Ptr(seat.hits),
             rows.arg(),
             ctx.stage(),
+            ArgValue::Ptr(table.table),
+            ArgValue::Ptr(table.hits),
         ],
     )
 }
@@ -2088,10 +2272,12 @@ pub fn matmul_select_mxfp4_lanes(
     scales: Tensor,
     routes: Tensor,
     y: &mut Tensor,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_select";
     let op = OP;
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
+    located_only(op, table, "a bank in lane order")?;
     let fan = selected(op, x, routes, y)?;
     let experts = codes.rows;
     if !x.width.is_multiple_of(128)
@@ -2131,6 +2317,8 @@ pub fn matmul_select_mxfp4_lanes(
                 n.arg(),
                 k.arg(),
                 stated(op, experts)?.arg(),
+                ArgValue::Ptr(table.table),
+                ArgValue::Ptr(table.hits),
             ],
         );
     }
@@ -2154,6 +2342,8 @@ pub fn matmul_select_mxfp4_lanes(
             n.arg(),
             k.arg(),
             stated(op, experts)?.arg(),
+            ArgValue::Ptr(table.table),
+            ArgValue::Ptr(table.hits),
         ],
     )
 }
@@ -2181,10 +2371,10 @@ pub fn matmul_select_bias(
     bias: Tensor,
     routes: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_select";
-    matmul_select_mxfp4(ctx, OP, x, codes, scales, Some(bias), routes, y, seat)
+    matmul_select_mxfp4(ctx, OP, x, codes, scales, Some(bias), routes, y, table)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2196,7 +2386,7 @@ pub fn matmul_select_quant(
     biases: Option<Tensor>,
     routes: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_select";
     // A byte a code beside four a 128x128 block: an fp8 bank (`e4m3tile128`).
@@ -2208,8 +2398,8 @@ pub fn matmul_select_quant(
         ));
     }
     match biases {
-        None => matmul_select_mxfp4(ctx, OP, x, codes, scales, None, routes, y, seat),
-        Some(biases) => matmul_select_mlxu4(ctx, OP, x, codes, scales, biases, routes, y, seat),
+        None => matmul_select_mxfp4(ctx, OP, x, codes, scales, None, routes, y, table),
+        Some(biases) => matmul_select_mlxu4(ctx, OP, x, codes, scales, biases, routes, y, table),
     }
 }
 
@@ -2229,7 +2419,6 @@ pub fn fp8_tiles(x: Tensor, codes: Tensor, scales: Tensor, y: &Tensor) -> bool {
 /// batches items of the least of 16, 32 and 64 routes holding what an expert
 /// averages; past 64 routes an expert the prefill tile, items of 128 against
 /// 256 weight rows. An expert past its item takes another.
-#[allow(clippy::too_many_arguments)]
 pub fn matmul_select_fp8_mfma(
     ctx: &Ctx,
     x: Tensor,
@@ -2237,12 +2426,13 @@ pub fn matmul_select_fp8_mfma(
     scales: Tensor,
     routes: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_select";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     let (q, act_scales) = crate::linear::act_quant::quantized_codes(ctx, OP, x, 128, false, 1)?;
-    matmul_select_fp8_quantized(ctx, x, q, act_scales, codes, scales, routes, y, seat)
+    located_only(OP, table, "an fp8 bank's select")?;
+    matmul_select_fp8_quantized(ctx, x, q, act_scales, codes, scales, routes, y, table)
 }
 
 /// `matmul_select_fp8_mfma` over rows already quantized (`q`, `act_scales`
@@ -2257,7 +2447,7 @@ pub fn matmul_select_fp8_quantized(
     scales: Tensor,
     routes: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_select";
     let op = OP;
@@ -2272,6 +2462,7 @@ pub fn matmul_select_fp8_quantized(
             "the quantized rows are not x's codes beside a scale a 128-wide block",
         ));
     }
+    located_only(op, table, "an fp8 bank's select")?;
     let fan = selected(op, x, routes, y)?;
     if !x.width.is_multiple_of(128) || !fp8_tiles(x, codes, scales, y) {
         return Err(refuse(
@@ -2336,8 +2527,8 @@ pub fn matmul_select_fp8_quantized(
         nn.arg(),
         kk.arg(),
         stated(op, experts)?.arg(),
-        ArgValue::Ptr(seat.cell),
-        ArgValue::Ptr(seat.hits),
+        ArgValue::Ptr(table.table),
+        ArgValue::Ptr(table.hits),
     ]);
     ctx.fire(
         op,
@@ -2359,7 +2550,7 @@ fn matmul_select_mlxu4(
     biases: Tensor,
     routes: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     const UNIT: u32 = 32;
 
@@ -2424,8 +2615,10 @@ fn matmul_select_mlxu4(
     let experts = codes.rows.clamp(1, ORDER_EXPERT_CAP);
     // The batch legs read four-bit codes, and a lane's factors of a stage
     // (an even count of groups) as one read.
+    // A table that may name mapped host memory takes the per-route stream.
     if bits == 4
         && x.dtype == Dtype::Bf16
+        && !table.streams()
         && codes.rows <= ORDER_EXPERT_CAP
         && x.width.is_multiple_of(2 * group)
         && let Some(mt) = batch_items(ctx, &fan, experts, 32, ctx.tuning().moe_batch_until)
@@ -2446,12 +2639,11 @@ fn matmul_select_mlxu4(
             experts,
             mt,
             BATCH_NBW,
-            Some(seat),
-            &[],
+            &table.args(),
         );
     }
     let tuning = ctx.tuning();
-    if tuning.affine_grouped && fan.route_count >= tuning.affine_grouped_from {
+    if tuning.affine_grouped && fan.route_count >= tuning.affine_grouped_from && !table.streams() {
         let ordered = route_order(ctx, op, routes, &fan, experts, group_routes(&fan, experts))?;
         let wmma = x.dtype == Dtype::Bf16 && tuning.affine_wmma;
         let entry = if wmma {
@@ -2483,8 +2675,8 @@ fn matmul_select_mlxu4(
             n.arg(),
             k.arg(),
             stated(op, experts)?.arg(),
-            ArgValue::Ptr(seat.cell),
-            ArgValue::Ptr(seat.hits),
+            ArgValue::Ptr(table.table),
+            ArgValue::Ptr(table.hits),
         ]);
         return ctx.fire(
             op,
@@ -2527,10 +2719,10 @@ fn matmul_select_mlxu4(
             act_div.arg(),
             n.arg(),
             k.arg(),
-            ArgValue::Ptr(seat.cell),
-            ArgValue::Ptr(seat.hits),
             rows.arg(),
             ctx.stage(),
+            ArgValue::Ptr(table.table),
+            ArgValue::Ptr(table.hits),
         ],
     )
 }
@@ -2689,9 +2881,10 @@ const DECODE_BLOCK: u32 = 256;
 
 /// A decode fire's routed MLP with the swiglu in the gate-up launch and the
 /// fold (and `shared`'s gated add, landing in its `y`) at the end, over
-/// resident 16-bit banks. One token takes two launches: fewer tokens than
-/// `kernel.moe.batch_from`, rows of whole 512s. A batch takes the batch legs
-/// over one route ordering where both legs would. Whether it ran.
+/// 16-bit banks in device memory (contiguous, or a located table). One token
+/// takes two launches: fewer tokens than `kernel.moe.batch_from`, rows of
+/// whole 512s. A batch takes the batch legs over one route ordering where
+/// both legs would. Whether it ran.
 pub fn decode_mlp(
     ctx: &Ctx,
     p: &RoutedMlp,
@@ -2739,6 +2932,8 @@ pub fn decode_mlp(
             stated(OP, i)?.arg(),
             (2 * i64::from(i) * i64::from(x.width)).arg(),
             ctx.stage(),
+            ArgValue::Ptr(p.gate_up_experts.table),
+            ArgValue::Ptr(p.gate_up_experts.hits),
         ],
     )?;
     let (out, shared_at, gate_at, gate_stride) = match shared {
@@ -2770,6 +2965,8 @@ pub fn decode_mlp(
             stated(OP, hidden)?.arg(),
             (i64::from(hidden) * i64::from(i)).arg(),
             ctx.stage(),
+            ArgValue::Ptr(p.down_experts.table),
+            ArgValue::Ptr(p.down_experts.hits),
         ],
     )?;
     Ok(true)
@@ -2856,6 +3053,8 @@ fn batch_mlp(
                 ArgValue::Ptr(banks.map_or(0, |b| b.gate_up.ptr)),
                 ArgValue::Ptr(shared_h),
                 shared_rows.arg(),
+                ArgValue::Ptr(p.gate_up_experts.table),
+                ArgValue::Ptr(p.gate_up_experts.hits),
             ],
         ]
         .concat(),
@@ -2887,6 +3086,8 @@ fn batch_mlp(
                     _ => 0,
                 }),
                 shared_rows.arg(),
+                ArgValue::Ptr(p.down_experts.table),
+                ArgValue::Ptr(p.down_experts.hits),
             ],
         ]
         .concat(),

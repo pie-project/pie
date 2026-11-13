@@ -44,17 +44,18 @@ __device__ __forceinline__ KvSlot kv_slot_for_token(
     return s;
 }
 
+// Element `i` of a row's `h_kv * d` at slot `s`, in a plane whose pages lie
+// `stride_page` elements apart (`page_size * h_kv * d` packed).
 template <bool HND_LAYOUT>
 __device__ __forceinline__ long long kv_dst_index(
-    const KvSlot& s, int i, int page_size, int h_kv, int d) {
+    const KvSlot& s, int i, int page_size, int h_kv, int d, long long stride_page) {
+    const long long page = static_cast<long long>(s.page) * stride_page;
     if constexpr (HND_LAYOUT) {
         const int h = i / d;
         const int j = i - h * d;
-        return ((static_cast<long long>(s.page) * h_kv + h) * page_size +
-                s.offset_in_page) * d + j;
+        return page + (static_cast<long long>(h) * page_size + s.offset_in_page) * d + j;
     } else {
-        return ((static_cast<long long>(s.page) * page_size) +
-                s.offset_in_page) * (static_cast<long long>(h_kv) * d) + i;
+        return page + static_cast<long long>(s.offset_in_page) * (static_cast<long long>(h_kv) * d) + i;
     }
 }
 

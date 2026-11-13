@@ -11,6 +11,9 @@ struct RsLifecycle {
     engine: EngineId,
     id: RsWorkingSetId,
     pipeline_scope: Mutex<Option<crate::store::PipelineScope>>,
+    /// Its owner's hold on the planner past its exit, given back once the
+    /// state is, as a kv set's is with its pages.
+    departure: Mutex<Option<Arc<crate::planner::Departure>>>,
 }
 
 impl RsLifecycle {
@@ -25,6 +28,8 @@ impl RsLifecycle {
             rs.retire_idle();
             freed
         };
+        let departure = self.departure.lock().unwrap().take();
+        drop(departure);
         if freed > 0
             && let Some(planner) = crate::planner::planner_for(self.model, self.engine)
         {
@@ -61,12 +66,31 @@ impl RsWorkingSet {
                 engine,
                 id,
                 pipeline_scope: Mutex::new(None),
+                departure: Mutex::new(None),
             }),
+        }
+    }
+
+    /// Holds `departure` until this set is released: its owner's state is
+    /// not back before then. A set released already holds nothing.
+    pub fn hold_departure(&self, departure: Arc<crate::planner::Departure>) {
+        let mut held = self.lifecycle.departure.lock().unwrap();
+        if !self.lifecycle.released.load(Ordering::Acquire) {
+            *held = Some(departure);
         }
     }
 
     pub fn release(&self) {
         self.lifecycle.release();
+    }
+
+    /// This set leaves its owner alive (a handle takes it): the owner's hold
+    /// on the planner goes back, as a kv set's does. Kept, it held the
+    /// departed owner's reclaim "on its way back" for as long as the handle
+    /// lived, the planner counted pages and a state slot that never came as
+    /// supply, and a head short of a slot planned no eviction again.
+    pub fn leave_owner(&self) {
+        drop(self.lifecycle.departure.lock().unwrap().take());
     }
 
     pub fn claim_pipeline_scope(

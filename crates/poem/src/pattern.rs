@@ -121,7 +121,6 @@ impl Pattern {
             name: row.clone(),
             planes: Vec::new(),
             dtype: Dtype::Bf16,
-            space: 0,
             window: None,
             head_dim: 0,
             live: None,

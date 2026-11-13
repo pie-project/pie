@@ -11,6 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use client_api::Props;
 use client_api::props::{PROMPT_BLOCK_BYTES, PromptIndex, TOKENS_PER_BYTE};
 
+use super::manifest::Manifest;
+use super::pressure::{self, Band, Reading, Tier};
 use super::program::{self, Commit, Fault, LoadError, Plane, Program, Retention, Table};
 use super::retention;
 use super::schedule;
@@ -29,7 +31,7 @@ static EVENTS: OnceLock<Sender<Event>> = OnceLock::new();
 pub fn start(name: &str, component: &[u8]) -> Result<(), LoadError> {
     let (tx, rx) = channel();
     program::spawn(name, component, capability, "pie-policy", move |program| {
-        run(program, rx)
+        run(Some(program), rx)
     })?;
     // A second one's thread ends with its channel.
     if EVENTS.set(tx).is_err() {
@@ -38,6 +40,22 @@ pub fn start(name: &str, component: &[u8]) -> Result<(), LoadError> {
         ));
     }
     tracing::info!(policy = name, "worker policy started");
+    Ok(())
+}
+
+/// Runs the policy thread with no policy, as a worker started without one:
+/// it keeps the record a reload's policy starts from, and the default
+/// tier-pressure responder answers waiters short of room.
+/// One already running stands.
+pub fn start_default() -> Result<(), LoadError> {
+    let (tx, rx) = channel();
+    if EVENTS.set(tx).is_err() {
+        return Ok(());
+    }
+    std::thread::Builder::new()
+        .name("pie-policy".into())
+        .spawn(move || run(None, rx))
+        .map_err(|e| LoadError::Instantiate(format!("spawning its thread: {e}")))?;
     Ok(())
 }
 
@@ -133,14 +151,14 @@ impl Activity {
     }
 }
 
-fn run(program: Program, events: Receiver<Event>) {
+fn run(program: Option<Program>, events: Receiver<Event>) {
     let mut registry = Registry::new(STORES);
     let mut activity = Activity {
         since_ms: now_ms(),
         ..Activity::default()
     };
     // None once it died, or a reload named none, until a reload names one.
-    let mut current = Some(program);
+    let mut current = program;
     loop {
         let first = match current.as_ref().and_then(Program::alarm) {
             Some(at_ms) => {
@@ -189,6 +207,13 @@ fn run(program: Program, events: Receiver<Event>) {
                 }
             }
         }
+        // Tiers whose waiters are short: the policy's to answer if it
+        // listens, else the default responder's.
+        let (left, _) = pressure_round(
+            &mut registry,
+            current.as_ref().map(Program::manifest),
+            &retention::Installed,
+        );
         let Some(program) = current.as_mut() else {
             continue;
         };
@@ -228,11 +253,14 @@ fn run(program: Program, events: Receiver<Event>) {
                 tracing::error!(policy = program.name(), %error, "worker policy is dead; its tables are withdrawn");
                 withdraw();
                 current = None;
+                respond(&registry, &left, &retention::Installed);
                 continue;
             }
             Err(fault) => {
                 activity.discarded += 1;
                 tracing::warn!(policy = program.name(), %fault, "worker policy call discarded");
+                // Its answer to the pressure went with it.
+                respond(&registry, &left, &retention::Installed);
             }
         }
         activity.log(program.name(), now);
@@ -300,20 +328,94 @@ fn enact(registry: &mut Registry, commit: Commit, policy: &str) {
         }
     }
     for id in commit.discard {
-        let Ok(owner) = ProcessId::from_str(&id) else {
-            continue;
-        };
-        match registry.handles.get(&owner) {
-            Some(handle) => {
-                let why = format!("the worker policy `{policy}` discarded it");
-                crate::server::discard_handle(handle.resting.client, owner, why);
-            }
-            None => (registry.cache.discard)(owner),
+        if let Ok(owner) = ProcessId::from_str(&id) {
+            discard(registry, owner, || {
+                format!("the worker policy `{policy}` discarded it")
+            });
         }
     }
     for (name, value) in commit.publish {
         super::publish(name, value.and_then(|v| wit_json(&v)));
     }
+}
+
+/// The `discard` verb: a resting handle goes through its client, a cached
+/// working set from the stores.
+fn discard(registry: &Registry, owner: ProcessId, why: impl FnOnce() -> String) {
+    match registry.handles.get(&owner) {
+        Some(handle) => crate::server::discard_handle(handle.resting.client, owner, why()),
+        None => (registry.cache.discard)(owner),
+    }
+}
+
+/// Whether the policy in `manifest` answers `tier-pressure` itself. One that
+/// listens owns the answer, even an answer of nothing; with none, the
+/// default responder answers.
+fn answers_pressure(manifest: Option<&Manifest>) -> bool {
+    manifest.is_some_and(|manifest| manifest.subscribes("tier-pressure"))
+}
+
+/// A round's tier pressure: answered here by default when the policy in
+/// `manifest` does not listen for it, else left to that policy. Answers the
+/// pressed tiers left to the policy, which fall back to the default if its
+/// call fails, and what the default discarded.
+fn pressure_round(
+    registry: &mut Registry,
+    manifest: Option<&Manifest>,
+    keys: &dyn retention::Keys,
+) -> (Vec<Tier>, Vec<ProcessId>) {
+    let pressed = registry.take_pressed();
+    if pressed.is_empty() || answers_pressure(manifest) {
+        return (pressed, Vec::new());
+    }
+    let discarded = respond(registry, &pressed, keys);
+    (Vec::new(), discarded)
+}
+
+/// The default tier-pressure responder (see [`pressure::choose`]): for each
+/// pressed tier, discards working sets lowest retention key first until what
+/// they free covers the shortfall. Policy-layer code with the policy's own
+/// verb; the stores only carry the discards out. Answers what it discarded.
+fn respond(registry: &Registry, pressed: &[Tier], keys: &dyn retention::Keys) -> Vec<ProcessId> {
+    let mut discarded = Vec::new();
+    for &tier in pressed {
+        let short = registry.pressure[tier.index()].short;
+        if short == 0 {
+            continue;
+        }
+        let candidates = registry
+            .snapshot()
+            .candidates_for(tier, keys)
+            .into_iter()
+            .filter(|c| ProcessId::from_str(&c.id).is_ok_and(|id| !discarded.contains(&id)))
+            .collect();
+        let chosen = pressure::choose(candidates, short);
+        if chosen.is_empty() {
+            tracing::warn!(
+                tier = tier.name(),
+                short,
+                "tier pressure: nothing is left to discard; the waiters wait on the governor"
+            );
+        }
+        for id in chosen {
+            let Ok(owner) = ProcessId::from_str(&id) else {
+                continue;
+            };
+            tracing::info!(
+                tier = tier.name(),
+                short,
+                working_set = %owner,
+                key = keys.key_at(Some(owner), 0),
+                "tier pressure: the default responder discards a working set"
+            );
+            discard(registry, owner, || {
+                "no worker policy answers tier pressure: the default responder discarded it"
+                    .to_string()
+            });
+            discarded.push(owner);
+        }
+    }
+    discarded
 }
 
 #[derive(Clone, Copy)]
@@ -329,6 +431,10 @@ struct Cache {
     state_swap: fn() -> (u64, u64),
     /// Whether a resting handle's state is on the device now.
     resident: fn(ProcessId) -> Option<bool>,
+    /// A tier's bytes, as [`pressure::meter_bytes`] has them.
+    bytes: fn(Tier) -> Option<pressure::Bytes>,
+    /// What a kv page and a state slot take.
+    scale: fn() -> Option<pressure::Scale>,
 }
 
 const STORES: Cache = Cache {
@@ -398,12 +504,15 @@ const STORES: Cache = Cache {
             .iter()
             .map(|stores| stores.rs.lock().unwrap().host_capacity().slots)
             .sum();
-        let room: u32 = (0..stores.len())
-            .filter_map(|engine| crate::handle::state_room(Some(engine)))
+        let room: u32 = stores
+            .iter()
+            .map(|stores| stores.rs.lock().unwrap().host_available().slots)
             .sum();
         (u64::from(capacity), u64::from(room))
     },
     resident: |holder| crate::planner::planner_of(holder)?.holder_resident(holder),
+    bytes: pressure::meter_bytes,
+    scale: pressure::common_scale,
     discard: |owner| {
         let mut freed = 0;
         for stores in store_registry::all_for_model(0) {
@@ -537,6 +646,12 @@ struct Registry {
     prompts: HashMap<ProcessId, (Arc<[u64]>, usize)>,
     /// `cached-tokens` before a process has run.
     held: Arc<PromptIndex>,
+    /// Where each tier stands, by [`Tier::index`].
+    pressure: [Reading; 2],
+    /// The band each tier's last edge told of.
+    told: [Band; 2],
+    /// Tiers whose waiters were short in the events a round applied.
+    pressed: [bool; 2],
 }
 
 impl Registry {
@@ -551,7 +666,20 @@ impl Registry {
             cache,
             prompts: HashMap::new(),
             held: Arc::new(PromptIndex::default()),
+            pressure: [Reading::default(); 2],
+            told: [Band::Clear; 2],
+            pressed: [false; 2],
         }
+    }
+
+    /// The tiers pressed since the last round asked, and still short.
+    fn take_pressed(&mut self) -> Vec<Tier> {
+        let pressed = Tier::ALL
+            .into_iter()
+            .filter(|tier| self.pressed[tier.index()] && self.pressure[tier.index()].short > 0)
+            .collect();
+        self.pressed = [false; 2];
+        pressed
     }
 
     fn apply(&mut self, event: Event) -> Vec<Edge> {
@@ -740,6 +868,15 @@ impl Registry {
                 }
                 None
             }
+            // One edge per band crossing: a shortfall that moves within its
+            // band is the default responder's to hear, not the policy's.
+            Event::TierPressure(tier, reading) => {
+                let at = tier.index();
+                self.pressure[at] = reading;
+                self.pressed[at] |= reading.short > 0;
+                let told = std::mem::replace(&mut self.told[at], reading.band);
+                (told != reading.band).then(|| Edge::TierPressure(WORKER.to_string()))
+            }
             Event::CacheEmptied(owner, by) => {
                 Arc::make_mut(&mut self.held).remove(&owner.to_string());
                 if self.procs.contains_key(&owner) {
@@ -795,6 +932,8 @@ impl Registry {
             held: self.held.clone(),
             cache: self.cache,
             cached: OnceCell::new(),
+            pressure: self.pressure,
+            bytes: [OnceCell::new(), OnceCell::new()],
         }
     }
 }
@@ -817,6 +956,9 @@ struct Snapshot {
     cache: Cache,
     /// Read once, when the call first asks.
     cached: OnceCell<(HashMap<String, CachedWorkingSet>, u32)>,
+    pressure: [Reading; 2],
+    /// Each tier's bytes, read once when the call first asks.
+    bytes: [OnceCell<Option<pressure::Bytes>>; 2],
 }
 
 impl Snapshot {
@@ -843,6 +985,106 @@ impl Snapshot {
                 .collect();
             (sets, page_size)
         })
+    }
+
+    fn bytes(&self, tier: Tier) -> Option<pressure::Bytes> {
+        *self.bytes[tier.index()].get_or_init(|| (self.cache.bytes)(tier))
+    }
+
+    /// A worker attr `{tier}-{what}`: the tier's bytes and where its
+    /// waiters stand.
+    fn tier_attr(&self, name: &str) -> Option<Value> {
+        let (tier, what) = Tier::ALL.into_iter().find_map(|tier| {
+            let what = name.strip_prefix(tier.name())?.strip_prefix('-')?;
+            Some((tier, what))
+        })?;
+        let reading = self.pressure[tier.index()];
+        let int = |n: u64| Some(Value::Int(i64::try_from(n).unwrap_or(i64::MAX)));
+        match what {
+            "band" => Some(Value::Text(reading.band.name().into())),
+            "short-bytes" => int(reading.short),
+            _ => {
+                let bytes = self.bytes(tier)?;
+                match what {
+                    "total-bytes" => int(bytes.total),
+                    "state-bytes" => int(bytes.state),
+                    "live-bytes" => int(bytes.live),
+                    // At least what is live and what the waiters are short
+                    // of, whether or not the meter counts the waiters.
+                    "wanted-bytes" => {
+                        int(bytes.wanted.max(bytes.live.saturating_add(reading.short)))
+                    }
+                    "act-bytes" => int(bytes.act),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// What a working set holds: kv bytes, then state bytes, where known.
+    fn held_bytes(&self, id: &str) -> (Option<u64>, Option<u64>) {
+        let Some(scale) = (self.cache.scale)() else {
+            return (None, None);
+        };
+        let known = |n: u64| (n > 0).then_some(n);
+        if let Some(Rest { resting, .. }) = self.handles.get(id) {
+            let page_tokens = u64::from(self.cached().1.max(1));
+            let pages = resting.tokens.div_ceil(page_tokens);
+            let state = u64::from(resting.slots).saturating_mul(scale.state_slot_bytes);
+            return (
+                known(scale.kv_page_bytes).map(|b| b.saturating_mul(pages)),
+                (resting.slots == 0 || scale.state_slot_bytes > 0).then_some(state),
+            );
+        }
+        let pages = self.cached().0.get(id).map(|set| set.pages);
+        (
+            pages
+                .zip(known(scale.kv_page_bytes))
+                .map(|(p, b)| p.saturating_mul(b)),
+            None,
+        )
+    }
+
+    /// The working sets the default responder may discard to make room on
+    /// `tier`, with their keys and what discarding each frees there.
+    fn candidates_for(&self, tier: Tier, keys: &dyn retention::Keys) -> Vec<pressure::Candidate> {
+        let now = now_ms();
+        self.candidates(SubjectKind::WorkingSet)
+            .into_iter()
+            .filter(|id| self.discardable(id))
+            .filter_map(|id| {
+                let owner = ProcessId::from_str(&id).ok()?;
+                let (kv, state) = self.held_bytes(&id);
+                let whole = kv.map(|kv| kv.saturating_add(state.unwrap_or(0)));
+                let (bytes, last_use_ms) = match self.handles.get(&id) {
+                    Some(rest) => {
+                        // A handle frees room only on the tier it rests on.
+                        let here = match (tier, (self.cache.resident)(owner)) {
+                            (Tier::Device, Some(false)) | (Tier::Host, Some(true)) => Some(0),
+                            _ => whole,
+                        };
+                        (here, rest.since_ms)
+                    }
+                    None => {
+                        let set = &self.cached().0[&id];
+                        let ago = set.last_use.elapsed().as_millis() as u64;
+                        // Cached kv may sit on either tier: how much on the
+                        // host is not told.
+                        let here = match tier {
+                            Tier::Device => whole,
+                            Tier::Host => None,
+                        };
+                        (here, now.saturating_sub(ago))
+                    }
+                };
+                Some(pressure::Candidate {
+                    key: keys.key_at(Some(owner), 0),
+                    id,
+                    last_use_ms,
+                    bytes,
+                })
+            })
+            .collect()
     }
 
     fn whose(&self, id: &str) -> (Option<&String>, Option<&String>) {
@@ -938,6 +1180,8 @@ impl Plane for Snapshot {
                     "tokens" => Some(Value::Int(resting.tokens as i64)),
                     "folded-tokens" => Some(Value::Int(resting.folded as i64)),
                     "recurrent-slots" => Some(Value::Int(i64::from(resting.slots))),
+                    "kv-bytes" => self.held_bytes(id).0.map(|n| Value::Int(n as i64)),
+                    "state-bytes" => self.held_bytes(id).1.map(|n| Value::Int(n as i64)),
                     "resident" => ProcessId::from_str(id)
                         .ok()
                         .and_then(self.cache.resident)
@@ -957,6 +1201,7 @@ impl Plane for Snapshot {
                     "tenant" => text(tenant),
                     "session" => text(session),
                     "tokens" => Some(Value::Int((set.pages * u64::from(*page_size)) as i64)),
+                    "kv-bytes" => self.held_bytes(id).0.map(|n| Value::Int(n as i64)),
                     "last-use-ms" => {
                         let ago = set.last_use.elapsed().as_millis() as u64;
                         Some(Value::Int(now_ms().saturating_sub(ago) as i64))
@@ -1014,7 +1259,7 @@ impl Plane for Snapshot {
                         _ => capacity.saturating_sub(available),
                     } as i64))
                 }
-                _ => None,
+                _ => self.tier_attr(name),
             },
             _ => None,
         }
@@ -1073,6 +1318,8 @@ mod tests {
         state: || (4, 1),
         state_swap: || (8, 3),
         resident: |_| None,
+        bytes: |_| None,
+        scale: || None,
     };
 
     fn arrive(registry: &mut Registry, tenant: &str, session: Option<&str>) -> ProcessId {
@@ -1187,6 +1434,8 @@ mod tests {
         state: || (4, 1),
         state_swap: || (8, 3),
         resident: |_| None,
+        bytes: |_| None,
+        scale: || None,
     };
 
     #[test]

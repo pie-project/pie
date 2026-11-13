@@ -1,5 +1,5 @@
 # The Qwen3 text encoder the image and video models condition on: its
-# layout, its read, its caches and its forward.
+# layout (its keys and values held as state), its read and its forward.
 
 QWEN3_4B = struct(
     hidden = 2560,
@@ -12,8 +12,9 @@ QWEN3_4B = struct(
     eps = 1e-6,
 )
 
-def encoder(c, layers, banks):
-    """The encoder of config `c` through its first `layers` layers."""
+def encoder(c, layers, banks, kv):
+    """The encoder of config `c` through its first `layers` layers, each
+    layer's keys and values the state of its kv heads in `kv`."""
     hidden, hd, inter = c.hidden, c.head_dim, c.inter
 
     def layer(l):
@@ -29,7 +30,7 @@ def encoder(c, layers, banks):
             gate = weight([inter, hidden], banks),
             up = weight([inter, hidden], banks),
             down = weight([hidden, inter], banks),
-            kv = "te.kv.{}".format(l),
+            kv = state([tokens, 2, c.kv_heads, hd], kv),
         )
 
     return struct(
@@ -61,12 +62,6 @@ def te_read(reads, te, prefix):
         reads.read(w.gate, n("mlp.gate_proj.weight"))
         reads.read(w.up, n("mlp.up_proj.weight"))
         reads.read(w.down, n("mlp.down_proj.weight"))
-
-def qwen3_caches(te, c, kv):
-    space = c.kv_space(kv)
-    plane = te.kv_heads * te.head_dim
-    for layer in te.layers:
-        c.kv(space, layer.kv, [plane, plane], te.head_dim, heads = True)
 
 def qwen3_encode(arm, te, tap = None):
     """The encoder over `arm`'s tokens. `tap(l, y)` sees each layer's output

@@ -83,6 +83,7 @@ mod every_diagnostic_is_a_word_the_boot_states;
 mod every_op_agrees_with_the_host_interpreter;
 #[cfg(feature = "device")]
 mod every_suite_step_agrees_with_the_host_interpreter;
+mod golden_logits;
 mod masked_axis;
 mod no_shell_reads_the_environment;
 mod routed_experts_stream;

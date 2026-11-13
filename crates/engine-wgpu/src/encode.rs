@@ -1,12 +1,12 @@
+use engine_gpu::{Handles, NIL};
 use kernels_slang::{ArgValue, Encode, Error, Fire, Target};
 
 use crate::device::ctx::Frame;
-use crate::device::handles::NIL;
-use crate::device::{Context, Handles, Pipelines};
-use crate::error::Fault;
+use crate::device::{Api, Context, Pipelines};
+use engine_gpu::error::Fault;
 
-static KERNEL_PROFILE: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static KERNEL_PROFILE: engine_gpu::kernel_profile::KernelProfile =
+    engine_gpu::kernel_profile::KernelProfile::new();
 
 static TIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -173,27 +173,16 @@ fn label(name: &'static str, fire: Fire, args: &[ArgValue]) -> std::borrow::Cow<
 
 #[must_use]
 pub fn kernel_profile() -> Vec<(String, u64, u64)> {
-    let mut rows: Vec<(String, u64, u64)> = KERNEL_PROFILE
-        .lock()
-        .expect("kernel profile lock poisoned")
-        .iter()
-        .map(|(name, &(ns, n))| (name.clone(), ns, n))
-        .collect();
-    rows.sort_by_key(|row| std::cmp::Reverse((row.1, row.2)));
-    rows
+    KERNEL_PROFILE.rows()
 }
 
 #[cfg(feature = "wgpu")]
 pub(crate) fn record_timing(name: &str, ns: u64) {
-    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
-    table.entry(name.to_string()).or_insert((0, 0)).0 += ns;
+    KERNEL_PROFILE.time(name, ns);
 }
 
 pub fn reset_kernel_profile() {
-    KERNEL_PROFILE
-        .lock()
-        .expect("kernel profile lock poisoned")
-        .clear();
+    KERNEL_PROFILE.clear();
     HOST_NS.store(0, std::sync::atomic::Ordering::Relaxed);
     SUBMIT_NS.store(0, std::sync::atomic::Ordering::Relaxed);
     WAIT_NS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -212,8 +201,7 @@ pub fn reset_kernel_profile() {
 
 #[cfg(feature = "wgpu")]
 fn record_kernel(name: &str) {
-    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
-    table.entry(name.to_string()).or_insert((0, 0)).1 += 1;
+    KERNEL_PROFILE.fire(name);
 }
 
 #[cfg(feature = "wgpu")]
@@ -221,14 +209,14 @@ pub struct Sink<'a> {
     device: &'a Context,
     frame: &'a Frame,
     pipelines: &'a Pipelines,
-    handles: &'a Handles,
-    outer: *const Frame,
+    handles: &'a Handles<Api>,
+    outer: engine_gpu::probe::Recording,
 }
 
 #[cfg(feature = "wgpu")]
 impl Drop for Sink<'_> {
     fn drop(&mut self) {
-        crate::probe::set_frame(self.outer);
+        engine_gpu::probe::restore(self.outer);
     }
 }
 
@@ -239,9 +227,9 @@ impl<'a> Sink<'a> {
         device: &'a Context,
         frame: &'a Frame,
         pipelines: &'a Pipelines,
-        handles: &'a Handles,
+        handles: &'a Handles<Api>,
     ) -> Sink<'a> {
-        let outer = crate::probe::set_frame(frame);
+        let outer = engine_gpu::probe::set_frame(frame);
         Sink {
             device,
             frame,
@@ -249,11 +237,6 @@ impl<'a> Sink<'a> {
             handles,
             outer,
         }
-    }
-
-    #[must_use]
-    pub fn into_frame(self) -> Option<Frame> {
-        None
     }
 
     fn refuse(fire: Fire, fault: Fault) -> Error {
@@ -334,7 +317,7 @@ impl Sink<'_> {
                             },
                         )
                     })?;
-                    let remaining = binding.remaining();
+                    let remaining = binding.extent().min(binding.remaining());
                     if remaining == 0 {
                         if mutable {
                             return Err(Sink::backend(
@@ -346,21 +329,26 @@ impl Sink<'_> {
                         views.push((dummy.buffer.clone(), 0, dummy.size, false));
                         continue;
                     }
+                    let view = remaining.next_multiple_of(4).min(
+                        binding
+                            .buffer()
+                            .slab()
+                            .size
+                            .saturating_sub(binding.offset()),
+                    );
+                    storage_view_fits(views.len(), view, max_binding)
+                        .map_err(|detail| Sink::backend(fire, detail))?;
                     if binding.offset().is_multiple_of(storage_align) {
-                        let size = remaining
-                            .next_multiple_of(4)
-                            .min(binding.slab().size.saturating_sub(binding.offset()))
-                            .min(max_binding);
                         views.push((
-                            binding.slab().buffer.clone(),
+                            binding.buffer().slab().buffer.clone(),
                             binding.offset(),
-                            size,
+                            view,
                             mutable,
                         ));
                         continue;
                     }
 
-                    let source = binding.slab().buffer.clone();
+                    let source = binding.buffer().slab().buffer.clone();
                     let at = binding.offset();
                     if !at.is_multiple_of(4) {
                         if mutable {
@@ -374,9 +362,11 @@ impl Sink<'_> {
                             ));
                         }
                         {
-                            let len = remaining.min(binding.slab().size.saturating_sub(at));
+                            let len =
+                                remaining.min(binding.buffer().slab().size.saturating_sub(at));
                             let mut bytes = vec![0u8; len.next_multiple_of(4) as usize];
                             binding
+                                .buffer()
                                 .slab()
                                 .read(at, &mut bytes[..len as usize])
                                 .map_err(|fault| Sink::refuse(fire, fault))?;
@@ -391,7 +381,7 @@ impl Sink<'_> {
                     }
                     let len = remaining
                         .next_multiple_of(4)
-                        .min(binding.slab().size.saturating_sub(at) & !3);
+                        .min(binding.buffer().slab().size.saturating_sub(at) & !3);
                     let (chunk, slot) = self.frame.scratch_slot(len);
                     self.frame
                         .encode(|encoder| {
@@ -571,7 +561,7 @@ pub struct Sink<'a> {
     _device: &'a Context,
     _frame: &'a Frame,
     _pipelines: &'a Pipelines,
-    _handles: &'a Handles,
+    _handles: &'a Handles<Api>,
 }
 
 #[cfg(not(feature = "wgpu"))]
@@ -581,7 +571,7 @@ impl<'a> Sink<'a> {
         device: &'a Context,
         frame: &'a Frame,
         pipelines: &'a Pipelines,
-        handles: &'a Handles,
+        handles: &'a Handles<Api>,
     ) -> Sink<'a> {
         Sink {
             _device: device,
@@ -589,11 +579,6 @@ impl<'a> Sink<'a> {
             _pipelines: pipelines,
             _handles: handles,
         }
-    }
-
-    #[must_use]
-    pub fn into_frame(self) -> Option<Frame> {
-        None
     }
 }
 
@@ -613,4 +598,20 @@ impl Encode for Sink<'_> {
     fn target(&self) -> Target {
         Target::Wgsl
     }
+}
+
+/// Whether argument `at`'s view of `bytes` fits the device's largest storage
+/// binding. A view past it is refused rather than clamped: a clamped view
+/// binds a truncated slab, and the kernel's reads past the cut come back as
+/// whatever robust access answers.
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
+fn storage_view_fits(at: usize, bytes: u64, limit: u64) -> Result<(), String> {
+    if bytes <= limit {
+        return Ok(());
+    }
+    Err(format!(
+        "argument {at} binds a {bytes}-byte view, past this device's \
+         max_storage_buffer_binding_size of {limit} bytes; a view is never \
+         clamped, so the slab must be split to fit the binding"
+    ))
 }

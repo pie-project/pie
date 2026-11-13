@@ -8,6 +8,9 @@
 #if !defined(PIE_WGSL)
 #include "prim/slot16.slang"
 #endif
+#if defined(PIE_TABLED)
+#include "prim/experts.slang"
+#endif
 
 // Routed matmuls over sorted expert tiles (the batched form of
 // `linear.moe_select` and `_bias`): `route_sort` lays the
@@ -18,11 +21,43 @@
 // tile, or 64 at the cooperative-matrix tier, a value a 16-bit slot. WGSL:
 // kernels-wgpu's, four columns of four rows an invocation in k-major
 // float4 tiles, a column pair a word, so its host refuses an odd width.
+// `PIE_TABLED`: the tile's expert is read through the weight cache's
+// expert table (`prim/experts.slang`), each plane `origin_*` words into its
+// slot, the same elements as the contiguous bank's; a tile counts a use.
+
+#if defined(PIE_TABLED)
+#define TW(i) pie_xt_word(params.origin_w + (i))
+#define TS_BYTE(i) pie_xt_byte(params.origin_s, (i))
+#define TS_BF16(i) pie_xt_bf16(params.origin_s, (i))
+#define TB_BF16(i) pie_xt_bf16(params.origin_b, (i))
+#define TBIAS(i) pie_xt_bf16(params.origin_bias, (i))
+#endif
 
 #if !defined(PIE_WGSL)
 
 #define CM_BK 32u
 
+#if defined(PIE_TABLED)
+PIE_SLOTS_RO(0, x);
+PIE_SLOTS_RW(1, y);
+[[vk::binding(2)]] StructuredBuffer<int> tile_expert;
+PIE_EXPERT_TABLE(3)
+
+struct Params {
+    int k;
+    int n;
+    uint seg_words;
+    uint unit_words;
+    uint atom_words;
+    uint atom_first;
+    uint origin_w;
+    uint origin_s;
+    uint origin_b;
+    uint origin_bias;
+    uint count;
+};
+PIE_PARAMS(11, Params, params);
+#else
 [[vk::binding(0)]] StructuredBuffer<uint> w;
 #if defined(PIE_MXFP4)
 [[vk::binding(1)]] StructuredBuffer<uint8_t> scales;
@@ -42,6 +77,7 @@ struct Params {
     int n;
 };
 PIE_PARAMS(7, Params, params);
+#endif
 
 #if defined(PIE_COOPMAT)
 using namespace linalg;
@@ -71,6 +107,12 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     int expert = tile_expert[tile];
     if (expert < 0) return;
     uint e = uint(expert);
+#if defined(PIE_TABLED)
+    pie_xt_at(e, params.atom_first, params.seg_words, params.unit_words, params.atom_words);
+    if (params.count != 0u && group.x == 0u && local.x == 0u && local.y == 0u) {
+        pie_xt_count(e, params.atom_first);
+    }
+#endif
     uint row0 = tile * uint(PIE_BM);
     uint col0 = group.x * PIE_BN;
     uint k = uint(params.k);
@@ -115,9 +157,14 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             uint wi = i & 3u;
             uint col = col0 + c;
             if (col < n) {
+#if defined(PIE_TABLED)
+                uint word = TW(col * (k / 8u) + k0 / 8u + wi);
+                float scale = mxfp4_block_scale(TS_BYTE(col * (k / 32u) + k0 / 32u));
+#else
                 uint row = e * n + col;
                 uint word = w[row * (k / 8u) + k0 / 8u + wi];
                 float scale = mxfp4_block_scale(uint(scales[row * (k / 32u) + k0 / 32u]));
+#endif
                 [ForceUnroll] for (uint j = 0u; j < 8u; j++) {
                     sb[c * CM_BK + wi * 8u + j] = half(mxfp4_code((word >> (4u * j)) & 0xfu) * scale);
                 }
@@ -136,10 +183,16 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             uint wi = i - c * words_per_block;
             uint col = col0 + c;
             if (col < n) {
+#if defined(PIE_TABLED)
+                uint word = TW(col * wpr + k0 / cpw + wi);
+                float s = TS_BF16(col * gpr + g);
+                float b = TB_BF16(col * gpr + g);
+#else
                 uint row = e * n + col;
                 uint word = w[row * wpr + k0 / cpw + wi];
                 float s = slot_at(scales, row * gpr + g);
                 float b = slot_at(biases, row * gpr + g);
+#endif
                 [ForceUnroll] for (uint q = 0u; q < cpw; q++) {
                     sb[c * CM_BK + wi * cpw + q] = half(affine_code(word, q) * s + b);
                 }
@@ -172,7 +225,11 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             if (col < n) {
                 float v = sc[sg * 256u + el] / row_scale[sg_r * 16u + r];
 #if defined(PIE_BIASED)
+#if defined(PIE_TABLED)
+                v += TBIAS(col);
+#else
                 v += slot_at(bias, e * n + col);
+#endif
 #endif
                 slot_put(y, row * n + col, v);
             }
@@ -196,6 +253,12 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     int expert = tile_expert[tile];
     if (expert < 0) return;
     uint e = uint(expert);
+#if defined(PIE_TABLED)
+    pie_xt_at(e, params.atom_first, params.seg_words, params.unit_words, params.atom_words);
+    if (params.count != 0u && group.x == 0u && local.x == 0u && local.y == 0u) {
+        pie_xt_count(e, params.atom_first);
+    }
+#endif
     uint row0 = tile * uint(PIE_BM);
     uint col0 = group.x * PIE_BN;
     uint k = uint(params.k);
@@ -217,9 +280,14 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             uint wi = i & 3u;
             uint col = col0 + c;
             if (col < n) {
+#if defined(PIE_TABLED)
+                uint word = TW(col * (k / 8u) + k0 / 8u + wi);
+                float scale = mxfp4_block_scale(TS_BYTE(col * (k / 32u) + k0 / 32u));
+#else
                 uint row = e * n + col;
                 uint word = w[row * (k / 8u) + k0 / 8u + wi];
                 float scale = mxfp4_block_scale(uint(scales[row * (k / 32u) + k0 / 32u]));
+#endif
                 [ForceUnroll] for (uint j = 0u; j < 8u; j++) {
                     ws[c * CM_BK + wi * 8u + j] = mxfp4_code((word >> (4u * j)) & 0xfu) * scale;
                 }
@@ -238,10 +306,16 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             uint wi = i - c * words_per_block;
             uint col = col0 + c;
             if (col < n) {
+#if defined(PIE_TABLED)
+                uint word = TW(col * wpr + k0 / cpw + wi);
+                float s = TS_BF16(col * gpr + g);
+                float b = TB_BF16(col * gpr + g);
+#else
                 uint row = e * n + col;
                 uint word = w[row * wpr + k0 / cpw + wi];
                 float s = slot_at(scales, row * gpr + g);
                 float b = slot_at(biases, row * gpr + g);
+#endif
                 [ForceUnroll] for (uint q = 0u; q < cpw; q++) {
                     ws[c * CM_BK + wi * cpw + q] = affine_code(word, q) * s + b;
                 }
@@ -271,7 +345,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         uint col = col0 + c;
         if (col < n) {
             float v = acc[p];
-#if defined(PIE_BIASED)
+#if defined(PIE_BIASED) && defined(PIE_TABLED)
+            v += TBIAS(col);
+#elif defined(PIE_BIASED)
             v += slot_at(bias, e * n + col);
 #endif
             slot_put(y, row * n + col, v);
@@ -288,6 +364,27 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #define PIE_ROWS4 (uint(PIE_BM) / 4u)
 #define PIE_THREADS (PIE_ROWS4 * PIE_QUADS)
 
+#if defined(PIE_TABLED)
+[[vk::binding(0)]] StructuredBuffer<uint> x;
+[[vk::binding(1)]] RWStructuredBuffer<uint> y;
+[[vk::binding(2)]] StructuredBuffer<int> tile_expert;
+PIE_EXPERT_TABLE(3)
+
+struct Params {
+    int k;
+    int n;
+    uint seg_words;
+    uint unit_words;
+    uint atom_words;
+    uint atom_first;
+    uint origin_w;
+    uint origin_s;
+    uint origin_b;
+    uint origin_bias;
+    uint count;
+};
+PIE_PARAMS(11, Params, params);
+#else
 [[vk::binding(0)]] StructuredBuffer<uint> w;
 [[vk::binding(1)]] StructuredBuffer<uint> scales;
 [[vk::binding(2)]] StructuredBuffer<uint> biases;
@@ -301,6 +398,7 @@ struct Params {
     int n;
 };
 PIE_PARAMS(7, Params, params);
+#endif
 
 groupshared float4 xs[PIE_BK * PIE_ROWS4];
 groupshared float4 ws[PIE_BK * PIE_QUADS];
@@ -320,6 +418,12 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         return;
     }
     uint e = uint(expert);
+#if defined(PIE_TABLED)
+    pie_xt_at(e, params.atom_first, params.seg_words, params.unit_words, params.atom_words);
+    if (params.count != 0u && group.x == 0u && flat == 0u) {
+        pie_xt_count(e, params.atom_first);
+    }
+#endif
     uint row0 = tile * uint(PIE_BM);
     uint col0 = group.x * PIE_BN;
     uint k = uint(params.k);
@@ -357,10 +461,15 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             [ForceUnroll] for (uint j = 0u; j < 4u; j++) {
                 uint c = col + j;
                 if (c < n) {
+#if defined(PIE_TABLED)
+                    word[j] = TW(c * (k >> 3) + (k0 >> 3) + wi);
+                    sc[j] = mxfp4_block_scale(TS_BYTE(c * (k >> 5) + (k0 >> 5)));
+#else
                     uint row = e * n + c;
                     word[j] = w[row * (k >> 3) + (k0 >> 3) + wi];
                     uint sb = row * (k >> 5) + (k0 >> 5);
                     sc[j] = mxfp4_block_scale((scales[sb >> 2] >> ((sb & 3u) * 8u)) & 0xffu);
+#endif
                 }
             }
             for (uint j = 0u; j < 8u; j++) {
@@ -385,11 +494,17 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             [ForceUnroll] for (uint j = 0u; j < 4u; j++) {
                 uint c = col + j;
                 if (c < n) {
+#if defined(PIE_TABLED)
+                    word[j] = TW(c * wpr + k0 / cpw + wi);
+                    sc[j] = TS_BF16(c * gpr + g);
+                    bi[j] = TB_BF16(c * gpr + g);
+#else
                     uint row = e * n + c;
                     word[j] = w[row * wpr + k0 / cpw + wi];
                     uint si = row * gpr + g;
                     sc[j] = bf16_at(scales, si);
                     bi[j] = bf16_at(biases, si);
+#endif
                 }
             }
             for (uint q = 0u; q < cpw; q++) {
@@ -415,9 +530,13 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         uint row = row0 + r0 + i;
         float4 v = acc[i];
 #if defined(PIE_BIASED)
+#if defined(PIE_TABLED)
+        v += float4(TBIAS(col), TBIAS(col + 1u), TBIAS(col + 2u), TBIAS(col + 3u));
+#else
         uint b0 = e * n + col;
         v += float4(bf16_at(bias, b0), bf16_at(bias, b0 + 1u), bf16_at(bias, b0 + 2u),
                     bf16_at(bias, b0 + 3u));
+#endif
 #endif
         uint at = row * n + col;
         if (col < n) {
@@ -491,3 +610,63 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate linear_moe_select_tiled_affine_bias_bf16_gs_128_b_2_bm_32_bn_64 PIE_BM=32 PIE_GROUP=128 PIE_BITS=2 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv
 // pie:instantiate linear_moe_select_tiled_affine_bias_bf16_gs_128_b_2_bm_64_bn_32 PIE_BM=64 PIE_GROUP=128 PIE_BITS=2 PIE_BIASED=1
 // pie:instantiate linear_moe_select_tiled_affine_bias_bf16_gs_128_b_2_bm_64_bn_64 PIE_BM=64 PIE_GROUP=128 PIE_BITS=2 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_mxfp4_bf16_gs_32_b_4_bm_16_bn_32 PIE_BM=16 PIE_TABLED=1 PIE_MXFP4=1
+// pie:instantiate linear_moe_select_tiled_tabled_mxfp4_bf16_gs_32_b_4_bm_16_bn_64 PIE_BM=16 PIE_TABLED=1 PIE_MXFP4=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_mxfp4_bf16_gs_32_b_4_bm_32_bn_32 PIE_BM=32 PIE_TABLED=1 PIE_MXFP4=1
+// pie:instantiate linear_moe_select_tiled_tabled_mxfp4_bf16_gs_32_b_4_bm_32_bn_64 PIE_BM=32 PIE_TABLED=1 PIE_MXFP4=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_mxfp4_bf16_gs_32_b_4_bm_64_bn_32 PIE_BM=64 PIE_TABLED=1 PIE_MXFP4=1
+// pie:instantiate linear_moe_select_tiled_tabled_mxfp4_bf16_gs_32_b_4_bm_64_bn_64 PIE_BM=64 PIE_TABLED=1 PIE_MXFP4=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_mxfp4_bias_bf16_gs_32_b_4_bm_16_bn_32 PIE_BM=16 PIE_TABLED=1 PIE_MXFP4=1 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tiled_tabled_mxfp4_bias_bf16_gs_32_b_4_bm_16_bn_64 PIE_BM=16 PIE_TABLED=1 PIE_MXFP4=1 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_mxfp4_bias_bf16_gs_32_b_4_bm_32_bn_32 PIE_BM=32 PIE_TABLED=1 PIE_MXFP4=1 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tiled_tabled_mxfp4_bias_bf16_gs_32_b_4_bm_32_bn_64 PIE_BM=32 PIE_TABLED=1 PIE_MXFP4=1 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_mxfp4_bias_bf16_gs_32_b_4_bm_64_bn_32 PIE_BM=64 PIE_TABLED=1 PIE_MXFP4=1 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tiled_tabled_mxfp4_bias_bf16_gs_32_b_4_bm_64_bn_64 PIE_BM=64 PIE_TABLED=1 PIE_MXFP4=1 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_64_b_4_bm_16_bn_32 PIE_BM=16 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=4
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_64_b_4_bm_16_bn_64 PIE_BM=16 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=4 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_64_b_4_bm_32_bn_32 PIE_BM=32 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=4
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_64_b_4_bm_32_bn_64 PIE_BM=32 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=4 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_64_b_4_bm_64_bn_32 PIE_BM=64 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=4
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_64_b_4_bm_64_bn_64 PIE_BM=64 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=4 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_64_b_4_bm_16_bn_32 PIE_BM=16 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=4 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_64_b_4_bm_16_bn_64 PIE_BM=16 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=4 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_64_b_4_bm_32_bn_32 PIE_BM=32 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=4 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_64_b_4_bm_32_bn_64 PIE_BM=32 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=4 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_64_b_4_bm_64_bn_32 PIE_BM=64 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=4 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_64_b_4_bm_64_bn_64 PIE_BM=64 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=4 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_64_b_2_bm_16_bn_32 PIE_BM=16 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=2
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_64_b_2_bm_16_bn_64 PIE_BM=16 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=2 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_64_b_2_bm_32_bn_32 PIE_BM=32 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=2
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_64_b_2_bm_32_bn_64 PIE_BM=32 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=2 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_64_b_2_bm_64_bn_32 PIE_BM=64 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=2
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_64_b_2_bm_64_bn_64 PIE_BM=64 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=2 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_64_b_2_bm_16_bn_32 PIE_BM=16 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=2 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_64_b_2_bm_16_bn_64 PIE_BM=16 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=2 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_64_b_2_bm_32_bn_32 PIE_BM=32 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=2 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_64_b_2_bm_32_bn_64 PIE_BM=32 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=2 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_64_b_2_bm_64_bn_32 PIE_BM=64 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=2 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_64_b_2_bm_64_bn_64 PIE_BM=64 PIE_TABLED=1 PIE_GROUP=64 PIE_BITS=2 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_32_b_2_bm_16_bn_32 PIE_BM=16 PIE_TABLED=1 PIE_GROUP=32 PIE_BITS=2
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_32_b_2_bm_16_bn_64 PIE_BM=16 PIE_TABLED=1 PIE_GROUP=32 PIE_BITS=2 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_32_b_2_bm_32_bn_32 PIE_BM=32 PIE_TABLED=1 PIE_GROUP=32 PIE_BITS=2
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_32_b_2_bm_32_bn_64 PIE_BM=32 PIE_TABLED=1 PIE_GROUP=32 PIE_BITS=2 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_32_b_2_bm_64_bn_32 PIE_BM=64 PIE_TABLED=1 PIE_GROUP=32 PIE_BITS=2
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_32_b_2_bm_64_bn_64 PIE_BM=64 PIE_TABLED=1 PIE_GROUP=32 PIE_BITS=2 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_32_b_2_bm_16_bn_32 PIE_BM=16 PIE_TABLED=1 PIE_GROUP=32 PIE_BITS=2 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_32_b_2_bm_16_bn_64 PIE_BM=16 PIE_TABLED=1 PIE_GROUP=32 PIE_BITS=2 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_32_b_2_bm_32_bn_32 PIE_BM=32 PIE_TABLED=1 PIE_GROUP=32 PIE_BITS=2 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_32_b_2_bm_32_bn_64 PIE_BM=32 PIE_TABLED=1 PIE_GROUP=32 PIE_BITS=2 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_32_b_2_bm_64_bn_32 PIE_BM=64 PIE_TABLED=1 PIE_GROUP=32 PIE_BITS=2 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_32_b_2_bm_64_bn_64 PIE_BM=64 PIE_TABLED=1 PIE_GROUP=32 PIE_BITS=2 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_128_b_2_bm_16_bn_32 PIE_BM=16 PIE_TABLED=1 PIE_GROUP=128 PIE_BITS=2
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_128_b_2_bm_16_bn_64 PIE_BM=16 PIE_TABLED=1 PIE_GROUP=128 PIE_BITS=2 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_128_b_2_bm_32_bn_32 PIE_BM=32 PIE_TABLED=1 PIE_GROUP=128 PIE_BITS=2
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_128_b_2_bm_32_bn_64 PIE_BM=32 PIE_TABLED=1 PIE_GROUP=128 PIE_BITS=2 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_128_b_2_bm_64_bn_32 PIE_BM=64 PIE_TABLED=1 PIE_GROUP=128 PIE_BITS=2
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bf16_gs_128_b_2_bm_64_bn_64 PIE_BM=64 PIE_TABLED=1 PIE_GROUP=128 PIE_BITS=2 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_128_b_2_bm_16_bn_32 PIE_BM=16 PIE_TABLED=1 PIE_GROUP=128 PIE_BITS=2 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_128_b_2_bm_16_bn_64 PIE_BM=16 PIE_TABLED=1 PIE_GROUP=128 PIE_BITS=2 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_128_b_2_bm_32_bn_32 PIE_BM=32 PIE_TABLED=1 PIE_GROUP=128 PIE_BITS=2 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_128_b_2_bm_32_bn_64 PIE_BM=32 PIE_TABLED=1 PIE_GROUP=128 PIE_BITS=2 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_128_b_2_bm_64_bn_32 PIE_BM=64 PIE_TABLED=1 PIE_GROUP=128 PIE_BITS=2 PIE_BIASED=1
+// pie:instantiate linear_moe_select_tiled_tabled_affine_bias_bf16_gs_128_b_2_bm_64_bn_64 PIE_BM=64 PIE_TABLED=1 PIE_GROUP=128 PIE_BITS=2 PIE_BIASED=1 PIE_TIER=coopmat PIE_TARGET=spirv

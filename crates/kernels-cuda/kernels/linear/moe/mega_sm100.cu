@@ -1,5 +1,6 @@
 #include "linear/act_quant.cuh"
 #include "linear/moe/mega.cuh"
+#include "linear/moe/table.cuh"
 #include "prim/mma_sm100.cuh"
 
 // The mega-MoE on tcgen05: a routed MLP (the gate-up product, its GLU, the
@@ -60,6 +61,15 @@ struct Params {
     const i32* work;
     int tokens, top, experts, hidden, inter;
     float limit;            // the GLU's clamp (SwiGLU-clamp)
+    // Each bank's expert table (`linear/moe/table.cuh`; `planes` entries an
+    // expert, codes then (W4A8) atoms), or null for the contiguous bank. A
+    // bank's codes map from `*_base` on, `*_row_bytes` a row; its atoms are
+    // read where the table puts them.
+    const u64* up_table;
+    const u64* down_table;
+    u64 up_base, down_base;
+    long long up_row_bytes, down_row_bytes;
+    int planes;
 };
 
 constexpr u32 kTileA = 128 * 128;  // a 128-row, 128-byte box
@@ -312,7 +322,19 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                 }
                 const Task x = task_of<kBN>(R, t, blocks, j1, j2);
                 const int nk = x.l2 ? I / (2 * kBoxK) : H / kBoxK;
-                const int row = x.l2 ? x.e * H + 128 * x.j : x.e * 2 * I + 128 * x.j;
+                // The expert's first codes row in its bank's map, once a task.
+                const int first = x.l2
+                    ? static_cast<int>(expert_row(p.down_table, p.planes, 0, x.e, H,
+                                                  p.down_base, p.down_row_bytes))
+                    : static_cast<int>(expert_row(p.up_table, p.planes, 0, x.e, 2 * I,
+                                                  p.up_base, p.up_row_bytes));
+                const int row = first + 128 * x.j;
+                // Its atoms: the expert's own, past its first row block.
+                const u8* atoms = x.l2
+                    ? expert_plane(p.down_atoms, static_cast<long long>(H / 128) * (I / 128) * 512,
+                                   p.down_table, p.planes, 1, x.e)
+                    : expert_plane(p.up_atoms, static_cast<long long>(2 * I / 128) * (H / 128) * 512,
+                                   p.up_table, p.planes, 1, x.e);
                 for (int kb = 0; kb < nk; ++kb) {
                     bar_wait(&empty[s], ph ^ 1);
                     bar_arrive_expect_tx(&full[s], kTxA);
@@ -321,18 +343,18 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                         // Its two K boxes, one load (the map's K in box chunks).
                         tma_load_3d(a, &full[s], &map_down, 0, row, 2 * kb);
                         if constexpr (kW4) {
-                            const long long at = (static_cast<long long>(row / 128) * (I / 128) + 2 * kb) * 512;
-                            bulk_load(smem + kOffSfA + s * 1024, p.down_atoms + at, 1024, &full[s]);
+                            const long long at = (static_cast<long long>(x.j) * (I / 128) + 2 * kb) * 512;
+                            bulk_load(smem + kOffSfA + s * 1024, atoms + at, 1024, &full[s]);
                         }
                     } else {
                         // Its gate box and up box, one load (the map's rows
                         // in an expert's two halves).
-                        tma_load_3d(a, &full[s], &map_up, kb * kBoxK, 128 * x.j, 2 * x.e);
+                        tma_load_3d(a, &full[s], &map_up, kb * kBoxK, 128 * x.j, first / I);
                         if constexpr (kW4) {
-                            const long long g = (static_cast<long long>(row / 128) * (H / 128) + kb) * 512;
-                            const long long u = (static_cast<long long>((row + I) / 128) * (H / 128) + kb) * 512;
-                            bulk_load(smem + kOffSfA + s * 1024, p.up_atoms + g, 512, &full[s]);
-                            bulk_load(smem + kOffSfA + s * 1024 + 512, p.up_atoms + u, 512, &full[s]);
+                            const long long g = (static_cast<long long>(x.j) * (H / 128) + kb) * 512;
+                            const long long u = (static_cast<long long>((128 * x.j + I) / 128) * (H / 128) + kb) * 512;
+                            bulk_load(smem + kOffSfA + s * 1024, atoms + g, 512, &full[s]);
+                            bulk_load(smem + kOffSfA + s * 1024 + 512, atoms + u, 512, &full[s]);
                         }
                     }
                     if (++s == kStages) {

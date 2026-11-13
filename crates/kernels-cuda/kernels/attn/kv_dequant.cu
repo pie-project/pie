@@ -15,15 +15,17 @@ __global__ void widen_e4m3_pages(
     const u32* __restrict__ page_indices,
     i32* __restrict__ shadow_indices,
     long long n,
-    int page_chunks)
+    int page_chunks,
+    long long k_stride_chunks,
+    long long v_stride_chunks)
 {
     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const long long active = i / page_chunks;
     const int local = static_cast<int>(i % page_chunks);
     if (local == 0) shadow_indices[active] = static_cast<i32>(active);
-    const long long src = static_cast<long long>(page_indices[active]) * page_chunks + local;
-    const uint4 kv[2] = {k_pages[src], v_pages[src]};
+    const long long page = static_cast<long long>(page_indices[active]);
+    const uint4 kv[2] = {k_pages[page * k_stride_chunks + local], v_pages[page * v_stride_chunks + local]};
     uint4* out[2] = {k_out, v_out};
 #pragma unroll
     for (int x = 0; x < 2; ++x) {

@@ -22,7 +22,7 @@ __global__ void sdpa_paged_selected_kernel(
     const u32* __restrict__ kv_last_page_lens,
     const i32* __restrict__ selection,
     T* __restrict__ o,
-    i32 R, i32 H, i32 KVH, i32 D, i32 page_size, float sm_scale,
+    i32 R, i32 H, i32 KVH, i32 D, i32 page_size, i64 stride_page, float sm_scale,
     i32 top_k, i32 ratio, i32 G, i32 per_head,
     const u32* __restrict__ win)
 {
@@ -94,9 +94,10 @@ __global__ void sdpa_paged_selected_kernel(
         const int page =
             static_cast<int>(kv_page_indices[pages_first + j / page_size]);
         const int off = j % page_size;
-        const long long slot = static_cast<long long>(page) * page_size + off;
-        const T* kj = k_pages + (slot * KVH + kv_head) * D;
-        const T* vj = v_pages + (slot * KVH + kv_head) * D;
+        const long long slot = static_cast<long long>(page) * stride_page +
+                               static_cast<long long>(off) * KVH * D;
+        const T* kj = k_pages + slot + kv_head * D;
+        const T* vj = v_pages + slot + kv_head * D;
 
         float pd = 0.f;
         for (int i = 0; i < per; ++i) {

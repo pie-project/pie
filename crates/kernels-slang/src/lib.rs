@@ -23,4 +23,4 @@ pub mod tensor;
 pub use encode::{ABSENT, Arg, ArgValue, Ctx, Encode, Fire, Geometry, Grid, Target, Tier};
 pub use error::Error;
 pub use sources::{CENSUS, SPIRV, WGSL, key, spirv, wgsl};
-pub use tensor::{Bank, Comm, KvPool, RaggedTensor, Tensor};
+pub use tensor::{Bank, Comm, KvPool, RaggedTensor, SEGMENTS, Segments, Tensor, words_of};

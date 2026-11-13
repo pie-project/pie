@@ -18,7 +18,7 @@ use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
+    Dtype, ForwardHybrid, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm, StateRows,
     Trace, Value, Weight, ops, trace_hybrid,
 };
 use poem_ir::InputAxis;
@@ -33,8 +33,8 @@ pub const NAME: &str = "dit-mini";
 pub struct DoubleBlock;
 
 impl ForwardHybrid for DoubleBlock {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         inputs.recorder().declare_switch(

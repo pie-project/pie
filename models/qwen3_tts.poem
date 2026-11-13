@@ -65,9 +65,8 @@ CODES = struct(talker = 3072, books = 15, book = 2048)
 # is even, as a bf16 row lands in whole words on Vulkan.
 HEADS = 16
 
-def stack(c, banks, kv):
-    """A dense Qwen3 stack of config `c`, its caches named under `kv`:
-    pre-norm attention with q and k normed per head, a SwiGLU MLP, and the
+def stack(c, banks):
+    """A dense Qwen3 stack of config `c`: pre-norm attention with q and k normed per head, a SwiGLU MLP, and the
     stack's final norm."""
     hidden, hd, inter = c.hidden, c.head_dim, c.inter
 
@@ -84,7 +83,7 @@ def stack(c, banks, kv):
             gate = weight([inter, hidden], banks),
             up = weight([inter, hidden], banks),
             down = weight([hidden, inter], banks),
-            kv = "{}.kv.{}".format(kv, l),
+            kv = state([tokens, 2, c.kv_heads, hd], dtype.bf16),
         )
 
     return struct(
@@ -126,7 +125,7 @@ def codec_decoder():
             gate = weight([c.inter, c.hidden], dense),
             up = weight([c.inter, c.hidden], dense),
             down = weight([c.hidden, c.inter], dense),
-            kv = "codec.kv.{}".format(l),
+            kv = state([tokens, 2, c.heads, hd], dense),
         )
 
     def upsampler(u):
@@ -219,7 +218,6 @@ def layout(id, deploy):
     banks, per_book = w.talker, w.predictor
     codes = CODES.talker + CODES.books * CODES.book + 1
     return struct(
-        kv = dtype.bf16,
         text_vocab = TEXT.vocab,
         text_embed = weight([TEXT.vocab, TEXT.width], banks),
         text_fc1 = linear(TEXT.width, TEXT.width, banks),
@@ -229,8 +227,8 @@ def layout(id, deploy):
         book = CODES.book,
         # Dense: the talker sums a frame's codes off it by their weights.
         codec_embed = weight([codes, TALKER.hidden]),
-        talker = stack(TALKER, banks, "talker"),
-        predictor = stack(PREDICTOR, per_book, "predictor"),
+        talker = stack(TALKER, banks),
+        predictor = stack(PREDICTOR, per_book),
         talker_head = weight([CODES.talker, TALKER.hidden]),
         books_head = weight([HEADS, CODES.book, PREDICTOR.hidden], per_book),
         route = weight([codes, HEADS], values = route(codes)),
@@ -425,16 +423,6 @@ def run_linear(w, x):
     if w.bias == None:
         return y
     return ops.elemwise.add_bias(w.bias, y)
-
-def caches(m, c):
-    space = c.kv_space(m.kv)
-    for s in [m.talker, m.predictor]:
-        plane = s.kv_heads * s.head_dim
-        for layer in s.layers:
-            c.kv(space, layer.kv, [plane, plane], s.head_dim, heads = True)
-    d = m.codec
-    for layer in d.layers:
-        c.kv(space, layer.kv, [d.heads * d.head_dim, d.heads * d.head_dim], d.head_dim, heads = True)
 
 def forward(m, inputs):
     switch("reading", ["talker", "predictor", "codec.quantize", "codec.prenet", "codec.decode"])

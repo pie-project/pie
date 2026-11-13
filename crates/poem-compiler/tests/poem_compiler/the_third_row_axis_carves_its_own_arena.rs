@@ -1,5 +1,5 @@
 use poem::ops::conv::{self, ConvShape};
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, ops, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, Weight, ops, trace_hybrid};
 use poem_compiler::{
     Budget, Budgets, DeviceProfile, Error, Placement, RowAxis, RowExpr, VoxelLadder, compile,
     compile_axes,
@@ -20,8 +20,8 @@ fn plane(name: &str, c: u32) -> Weight {
 struct Encoder;
 
 impl ForwardHybrid for Encoder {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         let g = inputs.grid();
@@ -47,8 +47,8 @@ impl ForwardHybrid for Encoder {
 struct Decoder;
 
 impl ForwardHybrid for Decoder {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         let latents = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, C * 4, None);

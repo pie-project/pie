@@ -66,7 +66,8 @@ __device__ __forceinline__ void norm_rope_unit(
     const u32* __restrict__ w_page,
     const u32* __restrict__ w_off,
     const u8* __restrict__ row_valid,
-    int page_size)
+    int page_size,
+    long long page_stride)
 {
     static_assert(!APPEND || PER == 16, "an fp8 row is 512 wide");
     constexpr int head_dim = 32 * PER;
@@ -153,7 +154,7 @@ __device__ __forceinline__ void norm_rope_unit(
         const int page = static_cast<int>(w_page[plane_row]);
         const int off = static_cast<int>(w_off[plane_row]);
         if (off < 0 || off >= page_size) return;
-        const ds::DsRow dst = ds::ds_row(pages, page, off, page_size);
+        const ds::DsRow dst = ds::ds_row(pages, page, off, page_size, page_stride);
 #pragma unroll
         for (int r = 0; r < RUNS; ++r) {
             const int e = (lane + 32 * r) * RUN;
@@ -213,6 +214,7 @@ __global__ void __launch_bounds__(256) norm_rope_last(
     const u32* __restrict__ w_off,
     const u8* __restrict__ row_valid,
     int page_size,
+    long long page_stride,
     const u32* __restrict__ win)
 {
     // The tail's frequencies once a block, as the spread form works them.
@@ -238,7 +240,7 @@ __global__ void __launch_bounds__(256) norm_rope_last(
         next.plane_row = -1;
         if (unit + stride < units) norm_rope_fetch<PER>(next, unit + stride, x, heads, win);
         norm_rope_unit<PER, WEIGHTED, APPEND>(freq_s, cur, weight, y, positions, heads, eps, rotary_dim,
-                                              inverse, pages, w_page, w_off, row_valid, page_size);
+                                              inverse, pages, w_page, w_off, row_valid, page_size, page_stride);
         cur = next;
     }
 }
@@ -270,6 +272,7 @@ __global__ void __launch_bounds__(256) norm_rope_pair(
     const u32* __restrict__ w_off,
     const u8* __restrict__ row_valid,
     int page_size,
+    long long page_stride,
     const u32* __restrict__ win)
 {
     __shared__ float freq_s[64];
@@ -293,14 +296,14 @@ __global__ void __launch_bounds__(256) norm_rope_pair(
         next.plane_row = -1;
         if (unit + stride < q_units) norm_rope_fetch<QPER>(next, unit + stride, qx, q_heads, win);
         norm_rope_unit<QPER, false, false>(freq_s, cur, nullptr, qy, positions, q_heads, q_eps, rotary_dim,
-                                           false, nullptr, nullptr, nullptr, nullptr, 0);
+                                           false, nullptr, nullptr, nullptr, nullptr, 0, 0);
         cur = next;
     }
     for (; unit < q_units + kv_units; unit += stride) {
         NormRuns<16> kv;
         norm_rope_fetch<16>(kv, unit - q_units, kx, 1, win);
         norm_rope_unit<16, true, APPEND>(freq_s, kv, kw, ky, positions, 1, kv_eps, rotary_dim, false, pages,
-                                         w_page, w_off, row_valid, page_size);
+                                         w_page, w_off, row_valid, page_size, page_stride);
     }
 }
 

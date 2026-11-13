@@ -693,15 +693,7 @@ impl FramePolicy {
         let mid_boundary = self.boundary_open();
 
         let k = self.k;
-        let (mut max_wave_rows, mut max_wave_tokens) = (self.max_wave_rows, self.max_wave_tokens);
-        if self
-            .stats
-            .as_ref()
-            .is_some_and(|stats| stats.narrow_waves.load(Ordering::Relaxed))
-        {
-            max_wave_rows = max_wave_rows.min(::engine::frame::NARROW_WAVE.0);
-            max_wave_tokens = max_wave_tokens.min(::engine::frame::NARROW_WAVE.1);
-        }
+        let (max_wave_rows, max_wave_tokens) = (self.max_wave_rows, self.max_wave_tokens);
         let max_wave_readouts = self.max_wave_readouts;
         // One frame of prompts on the card at a time: prompts arriving behind
         // it bind together into the next, while decodes keep running ahead.

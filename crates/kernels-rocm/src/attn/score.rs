@@ -155,6 +155,7 @@ pub fn capture(
             stated(OP, observe)?.arg(),
             stated(OP, lane_offset)?.arg(),
             kv_ceiling.arg(),
+            kv::page_elems(OP, pool, 0)?.arg(),
         ],
     )
 }

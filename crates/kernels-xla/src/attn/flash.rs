@@ -32,7 +32,7 @@
 use crate::error::Error;
 use crate::hlo::{Branch, Built, Cmp, Elem, Fold, Func, Malformed, Ty, Val};
 use crate::mosaic::{Body, Compiled, Grid, ICmp, Kernel, MTy, Sem, Space, V, Window};
-use crate::tensor::Operand;
+use crate::tensor::{Operand, PageMap};
 
 use super::paged::{Flashed, Geom, Heads, cmp_i, read_rows_i32, round_up, with_i};
 
@@ -587,6 +587,7 @@ pub(crate) fn attend(
     vmem_cap: i64,
     narrow_rows: i64,
     walk: Walk<'_>,
+    maps: [PageMap; 2],
 ) -> Built<Flashed> {
     let r = f.dims(q4)[0];
     let Some(s) = shape(r, h, scale, vmem_cap, narrow_rows) else {
@@ -595,7 +596,7 @@ pub(crate) fn attend(
     let (start, p0) = segments(f, lane, qpos)?;
     let live = cmp_i(f, Cmp::Ge, qpos, 0)?;
     let old = older(
-        f, geom, slots, planes, lane, qpos, lo, p0, start, live, window,
+        f, geom, slots, planes, lane, qpos, lo, p0, start, live, window, maps,
     )?;
     // Filed in its lane's slot (not the sink, the plane's last page).
     let ps = geom.ps;
@@ -610,7 +611,9 @@ pub(crate) fn attend(
     let got = f.add(got, ap.off)?;
     let filed = f.compare(Cmp::Eq, got, want)?;
     let inside = cmp_i(f, Cmp::Ge, ap.page, 0)?;
-    let below = cmp_i(f, Cmp::Lt, ap.page, slots / ps - 1)?;
+    // the sink is the keys plane's last page, in its own pages
+    let plane_page = maps[0].apply(f, ap.page)?;
+    let below = cmp_i(f, Cmp::Lt, plane_page, slots / ps - 1)?;
     let filed = f.and(filed, inside)?;
     let filed = f.and(filed, below)?;
     let upto = with_i(f, qpos, 1, Func::add)?;
@@ -685,6 +688,7 @@ pub(crate) fn readouts(
     scale: f64,
     ch: crate::tuning::Chunks,
     walk: Branch<'_>,
+    maps: [PageMap; 2],
 ) -> Built<Val> {
     let n = f.dims(lane)[0];
     let r = f.dims(q4)[0];
@@ -699,7 +703,7 @@ pub(crate) fn readouts(
     };
     let hi = with_i(f, qpos, 1, Func::add)?;
     let old = older(
-        f, geom, slots, planes, lane, qpos, lo, p0, start, live, window,
+        f, geom, slots, planes, lane, qpos, lo, p0, start, live, window, maps,
     )?;
     // Each row's fresh key rows, as `attend` reads them.
     let klo = f.max(lo, p0)?;
@@ -779,20 +783,64 @@ pub(crate) fn readouts(
 /// `OLD_PAGES` whole pages, and each row's range `[klo, khi)` in it.
 #[derive(Clone, Copy)]
 struct Older {
-    /// The pages, `[OLD_PAGES]` (the sink page past the ones read).
+    /// The keys plane's pages, `[OLD_PAGES]` (the sink page past the ones
+    /// read).
     pages: Val,
+    /// The values plane's (its own `PageMap`; `pages` when the maps agree).
+    values_pages: Val,
     /// How many pages the rows read (i32 scalar).
     total: Val,
     klo: Val,
     khi: Val,
     planes: (Val, Val),
     ps: i64,
+    /// The pages unmapped (`blocks::SINK` where the sink is read), and each
+    /// plane's map and sink: on a pool the DMA gather maps them itself.
+    raw: Val,
+    maps: [PageMap; 2],
+    sink: i64,
 }
 
 impl Older {
     /// The rectangle's keys and values, `[OLD_PAGES · ps, w]` each.
     fn gather(&self, f: &mut Func) -> Built<(Val, Val)> {
         let n = OLD_PAGES;
+        // Both planes of the chunk pool by DMA, each plane's map applied in
+        // the kernel (the unmapped ids one computation a fire), only with
+        // `PIE_XLA_OLDER_DMA=1`: the kernel call falls between the queries'
+        // projection and the flash, and XLA evicts the queries from fast
+        // memory around it (v6e qwen3-0.6b, 2048-token prefill: a 5.6 us
+        // copy and a flash 7 us slower a layer, against the XLA gather's
+        // 7 us). The XLA gather reads the pool's pages as blocks.
+        if let (Some((pool, Elem::Bf16)), Some((pool_v, Elem::Bf16))) =
+            (f.view_parts(self.planes.0), f.view_parts(self.planes.1))
+            && pool == pool_v
+            && f.view_order(self.planes.0).is_none()
+            && crate::blocks::on()
+            && std::env::var("PIE_XLA_OLDER_DMA").is_ok_and(|v| v == "1")
+        {
+            let mut planes = Vec::with_capacity(2);
+            for (plane, map) in [(self.planes.0, self.maps[0]), (self.planes.1, self.maps[1])] {
+                let (slots, w) = (f.dims(plane)[0], f.dims(plane)[1]);
+                let bytes = self.ps * w * 2;
+                if bytes % 512 == 0 && (bytes / 256) % 16 == 0 {
+                    planes.push((bytes / 512, map, self.sink, slots / self.ps - 1));
+                }
+            }
+            let mut out = Vec::with_capacity(2);
+            if planes.len() == 2 {
+                // both planes in one kernel call
+                let got =
+                    crate::blocks::gather_paged_planes(f, pool, self.raw, Elem::Bf16, &planes)?;
+                for (g, plane) in got.into_iter().zip([self.planes.0, self.planes.1]) {
+                    let w = f.dims(plane)[1];
+                    out.push(f.reshape(g, &[n * self.ps, w])?);
+                }
+            }
+            if out.len() == 2 {
+                return Ok((out[0], out[1]));
+            }
+        }
         let at = f.reshape(self.pages, &[n, 1])?;
         let dims = crate::hlo::GatherDims {
             offset_dims: vec![1, 2],
@@ -801,13 +849,18 @@ impl Older {
             index_vector_dim: 1,
             ..crate::hlo::GatherDims::default()
         };
-        let one = |f: &mut Func, plane: Val| -> Built<Val> {
+        let at_v = if self.values_pages == self.pages {
+            at
+        } else {
+            f.reshape(self.values_pages, &[n, 1])?
+        };
+        let one = |f: &mut Func, plane: Val, at: Val| -> Built<Val> {
             let (slots, w) = (f.dims(plane)[0], f.dims(plane)[1]);
             let paged = f.reshape(plane, &[slots / self.ps, self.ps, w])?;
             let g = f.gather(paged, at, &dims, &[1, self.ps, w])?;
             f.reshape(g, &[n * self.ps, w])
         };
-        Ok((one(f, self.planes.0)?, one(f, self.planes.1)?))
+        f.with_xla_reads(|f| Ok((one(f, self.planes.0, at)?, one(f, self.planes.1, at_v)?)))
     }
 }
 
@@ -826,6 +879,7 @@ fn older(
     start: Val,
     live: Val,
     window: i64,
+    maps: [PageMap; 2],
 ) -> Built<Older> {
     let r = f.dims(qpos)[0];
     let ps = geom.ps;
@@ -890,18 +944,34 @@ fn older(
     let ol = super::paged::clamp_i(f, owner_lane, 0, geom.lanes - 1)?;
     let at = with_i(f, ol, geom.pages, Func::mul)?;
     let at = f.add(at, pix)?;
-    let page = super::paged::take(f, geom.pt, at)?;
+    let raw = super::paged::take(f, geom.pt, at)?;
     let used = cmp_i(f, Cmp::Ge, owner_lane, 0)?;
-    let sink = f.like_i(page, slots / ps - 1);
-    let page = f.select(used, page, sink)?;
-    let page = super::paged::clamp_i(f, page, 0, slots / ps - 1)?;
+    let sink = f.like_i(raw, slots / ps - 1);
+    // each plane's own pages (the sink is either plane's last page)
+    let plane_pages = |f: &mut Func, map: PageMap| -> Built<Val> {
+        let page = map.apply(f, raw)?;
+        let page = f.select(used, page, sink)?;
+        super::paged::clamp_i(f, page, 0, slots / ps - 1)
+    };
+    let page = plane_pages(f, maps[0])?;
+    let values_pages = if maps[1] == maps[0] {
+        page
+    } else {
+        plane_pages(f, maps[1])?
+    };
+    let sentinel = f.like_i(raw, i64::from(crate::blocks::SINK));
+    let raw = f.select(used, raw, sentinel)?;
     Ok(Older {
         pages: page,
+        values_pages,
         total,
         klo,
         khi,
         planes,
         ps,
+        raw,
+        maps,
+        sink: slots / ps - 1,
     })
 }
 
@@ -1004,7 +1074,7 @@ mod tests {
             d: 128,
             dv: 128,
         };
-        let s = shape(1792, &h, 0.1, 110 << 20).unwrap();
+        let s = shape(1792, &h, 0.1, 110 << 20, BQ).unwrap();
         assert_eq!((s.rp, s.bq, s.bk, s.gf, s.gc), (1792, 256, 256, 2, 1));
         let c = kernel(&s, 110 << 20, 256).unwrap();
         assert!(c.module.contains("iteration_bounds = array<i64: 7>"));
@@ -1033,9 +1103,9 @@ mod tests {
             d: 256,
             dv: 256,
         };
-        let s = shape(2048, &h, 0.1, 110 << 20).unwrap();
+        let s = shape(2048, &h, 0.1, 110 << 20, BQ).unwrap();
         assert_eq!((s.bq, s.gf, s.gc), (256, 4, 2));
-        assert!(shape(200, &h, 0.1, 110 << 20).is_none());
-        assert!(shape(1000, &h, 0.1, 110 << 20).is_none());
+        assert!(shape(200, &h, 0.1, 110 << 20, BQ).is_none());
+        assert!(shape(1000, &h, 0.1, 110 << 20, BQ).is_none());
     }
 }

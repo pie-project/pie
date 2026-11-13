@@ -1,4 +1,5 @@
 #include "prim/device.cuh"
+#include "prim/state_rows.cuh"
 
 namespace pie::gather {
 
@@ -54,24 +55,22 @@ __device__ __forceinline__ void ple_map_window(
 
 __global__ void ngram_ids_update(
     const int* __restrict__ ids,
-    int* __restrict__ state_base,
-    const int* __restrict__ slot_ids,
-    long long slot_stride_elems,
+    StateRows rows,
     int* __restrict__ ngram_ids,
-    int rows,
+    int n_rows,
     PleHash h,
     const long long* __restrict__ map,
     const u32* __restrict__ win)
 {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) return;
+    if (r >= n_rows) return;
 
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
 
     const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
-    const int slot = slot_ids[r];
-    if (slot < 0) return;
-    int* state = state_base + (long long)slot * slot_stride_elems;
+    const i32* rid = rows.row(r);
+    if (rid[0] < 0) return;
+    int* state = rows.piece<int>(rid, 0);
 
     const int span = h.ngram - 1;
     int window[PLE_MAX_NGRAM];
@@ -95,10 +94,8 @@ __global__ void ngram_ids_update(
 
 __global__ void ngram_ids_chunked(
     const int* __restrict__ ids,
-    int* __restrict__ state_base,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     int* __restrict__ ngram_ids,
     bool write_state,
     const u8* __restrict__ write_state_mask,
@@ -129,9 +126,9 @@ __global__ void ngram_ids_chunked(
         if (c < Nr) Nr = c;
     }
     if (Nr <= 0) return;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
-    int* state = state_base + (long long)slot * slot_stride_elems;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    int* state = rows.piece<int>(rid, 0);
 
     const int span = h.ngram - 1;
     const int tid = threadIdx.x;

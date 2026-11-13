@@ -1,6 +1,8 @@
 use super::*;
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
+use crate::jit::{
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated,
+};
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
@@ -106,6 +108,7 @@ pub fn bias_sum(
     routes: Tensor,
     weights: Tensor,
     y: &mut Tensor,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_bias_sum";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -148,6 +151,7 @@ pub fn bias_sum(
             stated(OP, top_k)?.arg(),
             stated(OP, y.width)?.arg(),
             ctx.stage(),
+            ArgValue::Ptr(table.at()),
         ],
     )
 }

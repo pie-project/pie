@@ -290,13 +290,15 @@ enum SchedulerItem {
 }
 
 /// A change to how much of the pool has memory under it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum PoolOp {
-    Commit(u32),
-    Release(u32),
-    CommitState(u32),
-    ReleaseState(u32),
-    ReleaseScratch,
+    /// A shared pool backs segments `0..n` (`Engine::commit_segments`).
+    CommitSegments(u32),
+    /// A shared pool gives back segments `n..` (`Engine::release_segments`).
+    ReleaseSegments(u32),
+    /// A shared pool's chunks move, ahead of every fire queued after it
+    /// (`Engine::evacuate`).
+    Evacuate(::engine::chunk::Evacuation),
 }
 
 /// A read or write of host kv slots' bytes, behind every copy queued before
@@ -314,8 +316,17 @@ pub(crate) enum HostKvOp {
     /// The bytes of host rs rows: state slots, then buffer pages.
     ReadState(Vec<u32>, Vec<u32>),
     WriteState(Vec<u32>, Vec<u32>, Vec<u8>),
+    /// The bytes of host tier slots, shape by shape (`Engine::read_tier_slots`).
+    ReadTier(Vec<(::engine::chunk::ShapeId, Vec<u32>)>),
+    WriteTier(Vec<(::engine::chunk::ShapeId, Vec<u32>)>, Vec<u8>),
     /// The engine's tap groups (`Engine::tap_groups`), as JSON.
     TapGroups,
+    /// The weight cache's resident set (`Engine::weight_residency`), ahead
+    /// of every fire queued after it.
+    WeightResidency(::engine::chunk::WeightResidency),
+    /// The engine's weight use record since it last answered
+    /// (`Engine::weight_uses`), as JSON.
+    WeightUses,
 }
 
 type SchedTx = tokio::sync::mpsc::UnboundedSender<SchedulerItem>;
@@ -392,6 +403,9 @@ impl std::future::Future for ReplyWait {
 pub(crate) enum PreLaunchCopy {
     Kv(::engine::KvCopy),
     State(StateCopy),
+    /// Slots of one shape between the device and a tier below it
+    /// (CONTRACT-BC 22).
+    Slots(::engine::chunk::SlotCopy),
 }
 
 impl PreLaunchCopy {
@@ -399,6 +413,7 @@ impl PreLaunchCopy {
         match self {
             Self::Kv(_) => "KV copy",
             Self::State(_) => "recurrent-state copy",
+            Self::Slots(_) => "slot copy",
         }
     }
 }
@@ -886,9 +901,15 @@ impl SchedulerHandle {
             .await?
     }
 
-    /// Keeps waves to [`::engine::frame::NARROW_WAVE`], or stops.
-    pub(crate) fn narrow(&self, on: bool) {
-        self.inner.stats.narrow_waves.store(on, Ordering::Relaxed);
+    /// Queues `op` on the lane without waiting on it: what the lane answers
+    /// arrives on the receiver.
+    pub(crate) fn host_kv_queued(
+        &self,
+        op: HostKvOp,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<Vec<u8>>>> {
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        self.send(SchedulerItem::HostKv { op, response })?;
+        Ok(receiver)
     }
 
     /// Between frames, on the lane that owns the engine.
@@ -917,7 +938,6 @@ pub struct BatchScheduler {
     engine_id: EngineId,
     handle: SchedulerHandle,
     thread: Option<crate::rt::thread::JoinHandle<()>>,
-    stats: Arc<SchedulerStats>,
 }
 
 impl BatchScheduler {
@@ -963,12 +983,7 @@ impl BatchScheduler {
             engine_id,
             handle,
             thread: Some(thread),
-            stats,
         }
-    }
-
-    pub fn stats(&self) -> &Arc<SchedulerStats> {
-        &self.stats
     }
 
     fn shutdown(&mut self) {
@@ -1052,6 +1067,20 @@ impl BatchScheduler {
                 &mut frame_policy,
             );
             progress |= Self::retire_ready_control(&mut in_flight_control);
+            // A step's tokens stay within the pool's activation rung (SPEC
+            // decision 6): smaller while the system is critical.
+            let cap = crate::store::shared::fire_cap(engine_id);
+            let mut stepped = limits;
+            stepped.max_forward_tokens = stepped.max_forward_tokens.min(cap as usize).max(1);
+            // No launch past the cap is submitted from here (`post_frame`
+            // holds it): once none in flight is either, the pool may lower
+            // its rung.
+            if in_flight_launches
+                .iter()
+                .all(|batch| batch.total_tokens <= cap as usize)
+            {
+                crate::store::shared::grant_rung(engine_id, cap);
+            }
             let (dispatched, wait_hint) = Self::dispatch_ready_items(
                 &lane,
                 &mut replies,
@@ -1060,7 +1089,7 @@ impl BatchScheduler {
                 &mut in_flight_launches,
                 &mut in_flight_control,
                 page_size,
-                limits,
+                stepped,
                 &stats,
                 &mut frame_policy,
                 &mut scan_cache,
@@ -2194,6 +2223,13 @@ impl BatchScheduler {
         let mut collisions: Vec<(usize, Box<PendingRequest>)> = Vec::new();
         while let Some(item) = pending.pop_front() {
             match item {
+                // Past the pool's activation rung (SPEC decision 6): it waits
+                // until the rung is back.
+                QueuedItem::Launch(launch)
+                    if launch.request.request.tokens() > limits.max_forward_tokens =>
+                {
+                    kept.push_back(QueuedItem::Launch(launch));
+                }
                 QueuedItem::Launch(launch) => match slot_of.get(&launch.fire_id) {
                     Some(&(wave, position)) => {
                         let slot = &mut slot_buffer[wave][position];
@@ -2231,13 +2267,15 @@ impl BatchScheduler {
         if survivors.iter().all(Vec::is_empty) {
             return (progress, false);
         }
+        // Counted before the build moves the lanes into the fire.
+        let total_tokens = survivors
+            .iter()
+            .flatten()
+            .map(|req| req.request.tokens())
+            .sum::<usize>();
         let (submission, requests) =
             batch::build_frame_submission(survivors, limits, page_size, stats);
         let batch_size = requests.len() as u64;
-        let total_tokens = requests
-            .iter()
-            .map(|req| req.request.tokens())
-            .sum::<usize>();
         for request in &requests {
             if let Some(instance) = instances.get_mut(&request.instance_id) {
                 instance.in_flight += 1;
@@ -2305,13 +2343,15 @@ impl BatchScheduler {
                         request.completion.mark_native_retired();
                     }
                     // A fire its step resolved as it landed is resolved.
-                    for request in retired
-                        .requests
-                        .iter()
-                        .filter(|r| !r.completion.is_settled())
-                    {
-                        request.completion.resolve_landed("frame settle");
-                    }
+                    crate::engine::completion::settle_batched(|| {
+                        for request in retired
+                            .requests
+                            .iter()
+                            .filter(|r| !r.completion.is_settled())
+                        {
+                            request.completion.resolve_landed("frame settle");
+                        }
+                    });
                     stats::record_fire_stats(
                         stats,
                         retired.started.elapsed(),
@@ -2725,7 +2765,6 @@ mod tests {
                         terminal_cells: Vec::new(),
                         completions: Vec::new(),
                         instances: vec![::engine::InstanceId(0)],
-                        logical_fire_ids: vec![token],
                     }],
                 },
                 false,
@@ -2802,7 +2841,6 @@ mod tests {
                     terminal_cells: Vec::new(),
                     completions: Vec::new(),
                     instances: vec![::engine::InstanceId(0)],
-                    logical_fire_ids: vec![42],
                 }],
             },
             false,

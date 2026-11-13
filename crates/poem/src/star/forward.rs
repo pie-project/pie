@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::fmt;
 
 use crate::record::FirstMatch;
-use crate::{HybridSpec, Input, Predicate, Refine as _, Value, ValueId, fact};
+use crate::{Input, Predicate, Refine as _, Value, ValueId, fact};
 use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{GlobalsBuilder, Methods, MethodsBuilder};
@@ -21,14 +21,13 @@ use starlark::values::none::{NoneOr, NoneType};
 use starlark::values::{Heap, NoSerialize, StarlarkValue, Value as Star};
 use starlark_derive::{starlark_module, starlark_value};
 
-use crate::star::values::{DtypeValue, PredicateValue, predicate};
+use crate::star::values::{PredicateValue, predicate};
 
 /// The DSL values a forward handles, by place.
 #[derive(Default)]
 pub(crate) struct Trail {
     pub(crate) values: Vec<Value>,
     pub(crate) inputs: Vec<Input>,
-    pub(crate) spec: Option<HybridSpec>,
 }
 
 thread_local! {
@@ -174,6 +173,12 @@ pub(crate) fn input_of(handle: InputHandle) -> Input {
     with(|t| t.inputs[handle.0 as usize].clone())
 }
 
+/// The rows the forward being traced was called on: every row.
+pub(crate) fn root_input() -> anyhow::Result<Input> {
+    with(|t| t.inputs.first().cloned())
+        .ok_or_else(|| anyhow::anyhow!("a state is read while `forward` runs"))
+}
+
 #[starlark_value(type = "inputs")]
 impl<'v> StarlarkValue<'v> for InputHandle {
     fn get_methods() -> Option<&'static Methods> {
@@ -256,134 +261,6 @@ fn input_methods(builder: &mut MethodsBuilder) {
             carried = out.map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         Ok(carried)
-    }
-}
-
-/// The caches a forward declares, while its `caches` runs.
-#[derive(Debug, Clone, Copy, ProvidesStaticType, NoSerialize, Allocative)]
-pub struct SpecHandle;
-
-starlark_simple_value!(SpecHandle);
-
-impl fmt::Display for SpecHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "caches")
-    }
-}
-
-#[starlark_value(type = "caches")]
-impl<'v> StarlarkValue<'v> for SpecHandle {
-    fn get_methods() -> Option<&'static Methods> {
-        Some(SPEC_METHODS_STATICS.methods())
-    }
-}
-
-#[starlark_module]
-fn spec_methods(builder: &mut MethodsBuilder) {
-    /// A kv space of `dtype`, its rows read through a window of `window`
-    /// tokens if one is given.
-    fn kv_space(
-        #[starlark(this)] _this: &SpecHandle,
-        #[starlark(require = pos)] dtype: &DtypeValue,
-        #[starlark(default = NoneOr::None)] window: NoneOr<u32>,
-    ) -> anyhow::Result<u32> {
-        with(|t| {
-            let spec = t.spec.get_or_insert_with(HybridSpec::new);
-            Ok(match window.into_option() {
-                Some(w) => spec.windowed_kv_space(dtype.0, w),
-                None => spec.kv_space(dtype.0),
-            }
-            .0)
-        })
-    }
-
-    /// The state row `name`, a slab of `slab` of `dtype`; `split` cuts it
-    /// between ranks along that axis.
-    fn state(
-        #[starlark(this)] _this: &SpecHandle,
-        #[starlark(require = pos)] name: &str,
-        #[starlark(require = pos)] slab: UnpackList<u64>,
-        #[starlark(require = pos)] dtype: &DtypeValue,
-        #[starlark(require = named, default = NoneOr::None)] split: NoneOr<u32>,
-    ) -> anyhow::Result<NoneType> {
-        with(|t| {
-            let spec = t.spec.get_or_insert_with(HybridSpec::new);
-            dsl("state", || {
-                let row = spec.state(name, slab.items, dtype.0);
-                if let Some(axis) = split.into_option() {
-                    row.split(axis);
-                }
-            })
-        })?;
-        Ok(NoneType)
-    }
-
-    /// The kv row `name` in `space`, its planes of `planes` and heads of
-    /// `head_dim`; `heads` cuts it between ranks by head; `live`, a key
-    /// head's and a value head's widths, where heads are zero-padded past
-    /// them; `rows`, the quantized rows a u8 plane holds (`"v4"`, `"mx8"`,
-    /// `"nv4"`, `"fp4_keys"`, or `"fp8"`, vLLM's standard rows of the
-    /// plane's width), each plane a row of that format's width (or a compact
-    /// pool's share of one).
-    fn kv(
-        #[starlark(this)] _this: &SpecHandle,
-        #[starlark(require = pos)] space: u32,
-        #[starlark(require = pos)] name: &str,
-        #[starlark(require = pos)] planes: UnpackList<u64>,
-        #[starlark(require = pos)] head_dim: u32,
-        #[starlark(require = named, default = false)] heads: bool,
-        #[starlark(require = named)] live: Option<UnpackList<u32>>,
-        #[starlark(require = named, default = NoneOr::None)] rows: NoneOr<&str>,
-    ) -> anyhow::Result<NoneType> {
-        let live = match live.map(|l| l.items).as_deref() {
-            None => None,
-            Some(&[key, value]) => Some((key, value)),
-            Some(other) => anyhow::bail!("`live` is a key and a value width, not {other:?}"),
-        };
-        let rows = match rows.into_option() {
-            None => None,
-            Some("v4") => Some(poem_ir::KvRows::V4),
-            Some("mx8") => Some(poem_ir::KvRows::Mx8),
-            Some("nv4") => Some(poem_ir::KvRows::Nv4),
-            Some("fp4_keys") => Some(poem_ir::KvRows::Fp4Keys),
-            // a row of the plane's bytes, a column each
-            Some("fp8") => match planes.items.as_slice() {
-                [width] => Some(poem_ir::KvRows::Fp8 {
-                    width: u32::try_from(*width)?,
-                }),
-                _ => anyhow::bail!("vLLM's fp8 rows are one plane, not {:?}", planes.items),
-            },
-            Some(other) => anyhow::bail!(
-                "`rows` is \"v4\", \"mx8\", \"nv4\", \"fp4_keys\" or \"fp8\", not {other:?}"
-            ),
-        };
-        if let Some(format) = rows
-            && planes
-                .items
-                .iter()
-                .any(|&w| w == 0 || format.bytes() % w != 0)
-        {
-            anyhow::bail!(
-                "kv row `{name}` holds {format:?} rows, {} bytes a position (or a share of \
-                 them a compact pool's position), not planes of {:?}",
-                format.bytes(),
-                planes.items
-            );
-        }
-        with(|t| {
-            let spec = t.spec.get_or_insert_with(HybridSpec::new);
-            let mut row = spec.kv(crate::KvSpace(space), name, planes.items, head_dim);
-            if let Some((key, value)) = live {
-                row.live(key, value);
-            }
-            if let Some(format) = rows {
-                row.rows(format);
-            }
-            if heads {
-                row.heads();
-            }
-        });
-        Ok(NoneType)
     }
 }
 

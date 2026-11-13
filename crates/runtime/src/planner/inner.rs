@@ -13,7 +13,7 @@ use super::rank::Rank;
 use super::reclaim::Reclaim;
 use super::wait::{EntryKey, WaitKind, Waiter};
 
-/// The most of the ring the seated lanes' growth holds back from a prompt
+/// The most of the window lists the seated lanes' growth holds back from a prompt
 /// waiting to be seated: a thirty-second, as a small pool seats few lanes
 /// and serves their growth from what the others let go.
 pub(super) const RESERVE_SHARE: u32 = 32;
@@ -130,6 +130,7 @@ impl Inner {
                 .pages
                 .saturating_mul(seated)
                 .min(capacity.pages / RESERVE_SHARE),
+            ..RsUnits::default()
         }
     }
 
@@ -332,14 +333,21 @@ impl Inner {
             }
             let kv = accum.donate(demand.kv_pages);
             debug_assert!(outcome.is_none(), "an unmet waiter carries no outcome");
-            *outcome = Some(Ok(AllocationGrant::new(
-                demand,
-                kv,
-                RsSlotReservation::empty(),
-            )));
+            *outcome = Some(Ok(AllocationGrant::new(kv, RsSlotReservation::empty())));
             wake.push((key, demand.kv_pages, notify.clone()));
         }
         wake
+    }
+
+    /// The pages the resident lanes' next steps take: one each process
+    /// running (admitted, resident, not idle). A restore leaves this much of
+    /// the device free, so bringing one back does not suspend another at
+    /// the next page boundary.
+    pub(super) fn growth_reserve(&self) -> u32 {
+        self.procs
+            .values()
+            .filter(|proc| proc.admitted && !proc.idle && proc.state == Residency::Resident)
+            .count() as u32
     }
 
     pub(super) fn fleet_stalled(&self) -> bool {
@@ -358,7 +366,11 @@ impl Inner {
             }
         }
         self.procs.iter().all(|(pid, proc)| match proc.state {
-            Residency::Resident => !proc.admitted || proc.idle || parked.contains(pid),
+            // Parked, it is stalled only with no fire of its own in flight:
+            // one parked lane beside its peers' running fires waits for them.
+            Residency::Resident => {
+                !proc.admitted || proc.idle || (parked.contains(pid) && !proc.firing())
+            }
             Residency::Evicting | Residency::Restoring => false,
             Residency::Evicted => true,
         })

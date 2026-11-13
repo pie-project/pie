@@ -5,7 +5,7 @@ use poem_ir::Dtype;
 
 use crate::device::{Buffer, Context};
 use crate::error::{Fault, Result};
-use crate::store::SpaceSeat;
+use crate::store::TableSeat;
 use crate::store::kv::{Geometry, Paging};
 
 const ALIGN: u64 = 256;
@@ -65,7 +65,7 @@ struct PatchAt {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SpaceAt {
+struct TableAt {
     indptr: u64,
     indices: u64,
     last_page_len: u64,
@@ -79,9 +79,13 @@ pub struct Handles {
     pub tokens: Tensor,
     pub positions: Tensor,
     pub windows: u32,
-    pub spaces: Vec<SpaceHandles>,
+    pub page_tables: Vec<TableHandles>,
     pub slot_ids: Tensor,
     pub slot_of_row: Tensor,
+    /// Each band's lane and row tables of record piece ids
+    /// (`crate::store::Pools::bands`), `[lanes, width]` and `[rows, width]`.
+    pub lane_bands: Vec<Tensor>,
+    pub row_bands: Vec<Tensor>,
     pub row_valid: Tensor,
     pub adapter_routes: Option<Tensor>,
     pub request_of_token: Tensor,
@@ -99,6 +103,8 @@ pub struct Handles {
     pub rs_replay: Option<Tensor>,
     pub rs_commit: Option<Tensor>,
     pub rs_snaps: Option<Tensor>,
+    /// Each band's snapshot table, `[lanes, RS_SNAPSHOTS * (1 + width)]`.
+    pub rs_snap_bands: Vec<Tensor>,
     pub rs_pages: Option<Tensor>,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
@@ -131,7 +137,7 @@ pub struct PatchHandles {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SpaceHandles {
+pub struct TableHandles {
     pub indptr: Tensor,
     pub indices: Tensor,
     pub last_page_len: Tensor,
@@ -150,7 +156,7 @@ pub struct Fire<'a> {
     pub adapter_routes: Option<&'a [i32]>,
     pub request_of_token: &'a [i32],
     pub readout_rows: &'a [i32],
-    pub spaces: &'a [Geometry],
+    pub page_tables: &'a [Geometry],
     pub mask: Option<&'a crate::mask::Staged>,
     pub patches: Option<PatchFire<'a>>,
     pub voxels: Option<VoxelFire<'a>>,
@@ -197,6 +203,8 @@ pub struct Inputs {
     row_valid: u64,
     slot_ids: u64,
     slot_of_row: u64,
+    /// Each band's width: the piece ids a lane and a row hold for it.
+    bands: Vec<u32>,
     adapter_routes: u64,
     request_of_token: u64,
     readout_rows: u64,
@@ -211,7 +219,7 @@ pub struct Inputs {
     seats: Vec<SeatAt>,
     voxels: Option<VoxelAt>,
     mask_stride: u32,
-    spaces: Vec<SpaceAt>,
+    page_tables: Vec<TableAt>,
     patch: Option<PatchAt>,
     mrope: Option<u64>,
     rs_replay: u64,
@@ -238,41 +246,16 @@ pub struct GroupMaskHandles {
 pub fn window_ints(
     budget: &Budget,
     paging: Paging,
-    spaces: usize,
+    page_tables: usize,
     classes: usize,
-    max_runs: u32,
     gathered: usize,
-    run_caps: &[u32],
-    run_passes: &[u32],
 ) -> u64 {
     let rows = u64::from(budget.max_tokens);
     let lanes = u64::from(budget.max_lanes);
     let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
     let intervals = (classes * (classes + 1) / 2) as u64;
-    let per_gathered = 3 * rows + spaces as u64 * (2 * lanes + (lanes + 1) + pages);
-    let runs = u64::from(max_runs);
-
-    let mut cut = 0u64;
-    let mut chunked: Vec<(u32, u64)> = Vec::new();
-    for (at, &cap) in run_caps.iter().enumerate() {
-        if cap == 0 {
-            continue;
-        }
-        let passes = run_passes.get(at).copied().unwrap_or(0);
-        if passes > 1 {
-            cut += intervals.min(runs) * u64::from(passes) * (lanes + 1);
-        } else {
-            match chunked.iter().position(|(held, _)| *held == cap) {
-                Some(group) => chunked[group].1 += 1,
-                None => chunked.push((cap, 1)),
-            }
-        }
-    }
-    for (cap, regions) in chunked {
-        cut += intervals.min(regions * runs) * rows.div_ceil(u64::from(cap)) * (lanes + 1);
-    }
-
-    (intervals + 1 + gathered as u64) * (lanes + 1) + cut + gathered as u64 * per_gathered
+    let per_gathered = 3 * rows + page_tables as u64 * (2 * lanes + (lanes + 1) + pages);
+    (intervals + 1 + gathered as u64) * (lanes + 1) + gathered as u64 * per_gathered
 }
 
 impl Inputs {
@@ -281,24 +264,29 @@ impl Inputs {
         device: &Context,
         budget: &Budget,
         paging: Paging,
-        spaces: usize,
+        page_tables: usize,
         classes: usize,
-        max_runs: u32,
         gathered: usize,
         patch: Option<PatchSeat>,
         voxel: Option<VoxelSeat>,
         mrope: bool,
         seats: &[Seat],
         selections: usize,
-        run_caps: &[u32],
-        run_passes: &[u32],
+        bands: &[u32],
+        pages_per_lane: u32,
     ) -> Result<Inputs> {
+        let width = u64::from(bands.iter().sum::<u32>().max(1));
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
-        let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
-        let window_ints = window_ints(
-            budget, paging, spaces, classes, max_runs, gathered, run_caps, run_passes,
-        );
+        // A table's page table holds the most pages a lane's table does in
+        // any table: a window list of `T_w`-token slots takes more pages
+        // than the kv list where `T_w` is the smaller.
+        let paged = Paging {
+            pages_per_slot: paging.pages_per_slot.max(pages_per_lane),
+            ..paging
+        };
+        let pages = u64::from(budget.max_lanes) * u64::from(paged.pages_per_slot);
+        let window_ints = window_ints(budget, paged, page_tables, classes, gathered);
 
         let mut at = 0u64;
         let mut take = |bytes: u64| {
@@ -310,8 +298,8 @@ impl Inputs {
         let positions = take(rows * 4);
         let windows = take(window_ints * 4);
         let row_valid = take(rows);
-        let slot_ids = take(lanes * 4);
-        let slot_of_row = take(rows * 4);
+        let slot_ids = take(lanes * width * 4);
+        let slot_of_row = take(rows * width * 4);
         let adapter_routes = take(rows * 4);
         let request_of_token = take(rows * 4);
         let readout_rows = take(rows * 4);
@@ -323,8 +311,8 @@ impl Inputs {
         let mask_plane_bytes = rows * context;
         let mask_planes = take(mask_plane_bytes);
         let mask_enabled = take(rows);
-        let spaces: Vec<SpaceAt> = (0..spaces)
-            .map(|_| SpaceAt {
+        let page_tables: Vec<TableAt> = (0..page_tables)
+            .map(|_| TableAt {
                 indptr: take((lanes + 1) * 4),
                 indices: take(pages * 4),
                 last_page_len: take(lanes * 4),
@@ -377,7 +365,9 @@ impl Inputs {
         let mrope = mrope.then(|| take(rows * AXES * 4));
         let rs_replay = take(lanes * 4);
         let rs_commit = take(lanes * 4);
-        let rs_snaps = take(lanes * u64::from(SNAP_INTS) * 4);
+        let snap_ints =
+            u64::from(kernels_metal::ssm::RS_SNAPSHOTS) * (bands.len().max(1) as u64 + width);
+        let rs_snaps = take(lanes * snap_ints.max(u64::from(SNAP_INTS)) * 4);
         let rs_pages = take(lanes * u64::from(crate::rs::PAGE_INTS) * 4);
         let total = at;
 
@@ -391,6 +381,11 @@ impl Inputs {
             row_valid,
             slot_ids,
             slot_of_row,
+            bands: if bands.is_empty() {
+                vec![1]
+            } else {
+                bands.to_vec()
+            },
             adapter_routes,
             request_of_token,
             readout_rows,
@@ -405,7 +400,7 @@ impl Inputs {
             seats,
             voxels,
             mask_stride,
-            spaces,
+            page_tables,
             patch,
             mrope,
             rs_replay,
@@ -507,7 +502,8 @@ impl Inputs {
 
     pub fn write(&mut self, handles: &crate::device::Handles, fire: &Fire<'_>) -> Result<Handles> {
         let rows = fire.tokens.len() as u32;
-        let lanes = fire.slot_ids.len() as u32;
+        let width = self.bands.iter().sum::<u32>().max(1);
+        let lanes = fire.slot_ids.len() as u32 / width;
 
         let valid = vec![1u8; rows as usize];
 
@@ -899,8 +895,8 @@ impl Inputs {
             }
         };
 
-        let mut spaces = Vec::with_capacity(self.spaces.len());
-        for (at, geometry) in self.spaces.iter().zip(fire.spaces) {
+        let mut page_tables = Vec::with_capacity(self.page_tables.len());
+        for (at, geometry) in self.page_tables.iter().zip(fire.page_tables) {
             self.store.write(at.indptr, bytes_of(&geometry.indptr))?;
             self.store.write(at.indices, bytes_of(&geometry.indices))?;
             self.store
@@ -910,7 +906,7 @@ impl Inputs {
                 .write(at.write_page, bytes_of(&geometry.write_page))?;
             self.store
                 .write(at.write_offset, bytes_of(&geometry.write_offset))?;
-            spaces.push(SpaceHandles {
+            page_tables.push(TableHandles {
                 indptr: i32s(handles, &self.store, at.indptr, lanes + 1)?,
                 indices: i32s(
                     handles,
@@ -929,9 +925,11 @@ impl Inputs {
             tokens: i32s(handles, &self.store, self.tokens, rows)?,
             positions: i32s(handles, &self.store, self.positions, rows)?,
             windows: handles.bind(&self.store, self.windows, fire.windows.len() as u64 * 4)?,
-            spaces,
+            page_tables,
             slot_ids: i32s(handles, &self.store, self.slot_ids, lanes)?,
             slot_of_row: i32s(handles, &self.store, self.slot_of_row, rows)?,
+            lane_bands: bands(handles, &self.store, self.slot_ids, &self.bands, lanes)?,
+            row_bands: bands(handles, &self.store, self.slot_of_row, &self.bands, rows)?,
             adapter_routes: match adapter_routes {
                 None => None,
                 Some(rows) => Some(i32s(handles, &self.store, self.adapter_routes, rows)?),
@@ -1004,6 +1002,24 @@ impl Inputs {
             } else {
                 None
             },
+            rs_snap_bands: match fire.rs_snaps {
+                Some(snaps) => {
+                    let max = kernels_metal::ssm::RS_SNAPSHOTS;
+                    let per_lane: u32 = self.bands.iter().map(|&w| max * (1 + w)).sum();
+                    let lanes = snaps.len() as u32 / per_lane.max(1);
+                    let mut at = self.rs_snaps;
+                    self.bands
+                        .iter()
+                        .map(|&w| {
+                            let ints = lanes * max * (1 + w);
+                            let buf = handles.bind(&self.store, at, u64::from(ints.max(1)) * 4)?;
+                            at += u64::from(ints) * 4;
+                            Ok(Tensor::new(buf, ints.max(1), 1, Dtype::I32))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                }
+                None => Vec::new(),
+            },
             rs_snaps: match fire.rs_snaps {
                 Some(snaps) => Some(i32s(
                     handles,
@@ -1038,18 +1054,20 @@ impl Inputs {
             lanes,
             rows,
             pages,
-            spaces: views
-                .spaces
+            page_tables: views
+                .page_tables
                 .iter()
-                .map(|space| SpaceSeat {
-                    page_indptr: space.indptr,
-                    page_indices: space.indices,
-                    last_page_lens: space.last_page_len,
+                .map(|table| TableSeat {
+                    page_indptr: table.indptr,
+                    page_indices: table.indices,
+                    last_page_lens: table.last_page_len,
                     row_valid: views.row_valid,
                 })
                 .collect(),
             slot_ids: views.slot_ids,
             slot_of_row: views.slot_of_row,
+            lane_bands: views.lane_bands.clone(),
+            row_bands: views.row_bands.clone(),
         }
     }
 }
@@ -1073,6 +1091,25 @@ fn rows_table(into: &mut Vec<i32>, staged: &[i32], rows: u32) {
 fn i32s(handles: &crate::device::Handles, store: &Buffer, at: u64, rows: u32) -> Result<Tensor> {
     let buf = handles.bind(store, at, u64::from(rows) * 4)?;
     Ok(Tensor::new(buf, rows, 1, Dtype::I32))
+}
+
+/// Each band's table, `[count, width]` ints one after another from `at`.
+fn bands(
+    handles: &crate::device::Handles,
+    store: &Buffer,
+    mut at: u64,
+    widths: &[u32],
+    count: u32,
+) -> Result<Vec<Tensor>> {
+    widths
+        .iter()
+        .map(|&width| {
+            let bytes = u64::from(count) * u64::from(width) * 4;
+            let buf = handles.bind(store, at, bytes.max(4))?;
+            at += bytes;
+            Ok(Tensor::new(buf, count, width, Dtype::I32))
+        })
+        .collect()
 }
 
 fn u32s(handles: &crate::device::Handles, store: &Buffer, at: u64, rows: u32) -> Result<Tensor> {

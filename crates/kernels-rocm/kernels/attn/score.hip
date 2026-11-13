@@ -16,7 +16,7 @@ __global__ __launch_bounds__(WAVES * 64) void score_capture(
     const i32* __restrict__ page_indices, const i32* __restrict__ page_indptr,
     const i32* __restrict__ last_page_lens, float* __restrict__ scores, int page_size,
     int num_q_heads, int num_kv_heads, int head_dim, float sm_scale, int observe, int lane_offset,
-    int kv_max) {
+    int kv_max, long long stride) {
     static_assert(HEAD_DIM_MAX % kWave == 0, "a lane takes whole elements of the head");
     constexpr int VPT = HEAD_DIM_MAX / kWave;
     extern __shared__ float smem[];
@@ -45,7 +45,7 @@ __global__ __launch_bounds__(WAVES * 64) void score_capture(
 
     auto dot = [&](int j) {
         const long long page = page_indices[page_first + j / page_size];
-        const bf16* k_row = k_pages + kv_at<HND>(page, j % page_size, kv_head, 0, page_size, num_kv_heads, head_dim);
+        const bf16* k_row = k_pages + kv_at<HND>(page, j % page_size, kv_head, 0, page_size, num_kv_heads, head_dim, stride);
         float acc = 0.f;
 #pragma unroll
         for (int u = 0; u < VPT; ++u) {

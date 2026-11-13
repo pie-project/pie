@@ -10,6 +10,7 @@
 #include <mma.h>
 #endif
 #include "linear/moe_w4.cuh"
+#include "linear/moe/table.cuh"
 #include "linear/quant.cuh"
 
 namespace pie::linear {
@@ -1069,14 +1070,16 @@ __global__ void build_moe_leg_ptrs(
     int max_blocks,
     int block_size,
     int K,
-    int N)
+    int N,
+    const u64* __restrict__ expert_table)
 {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= max_blocks) return;
     const int e = expert_ids[b];
     const long long row = static_cast<long long>(b) * block_size;
-    w_ptrs[b] = bank_base + static_cast<long long>(e < 0 ? 0 : e)
-                * static_cast<long long>(N) * static_cast<long long>(K);
+    // The expert table (one plane an expert): a block's weight pointer.
+    w_ptrs[b] = expert_plane(bank_base, static_cast<long long>(N) * static_cast<long long>(K),
+                             expert_table, 1, 0, e < 0 ? 0 : e);
     act_ptrs[b] = aligned_in + row * static_cast<long long>(K);
     out_ptrs[b] = aligned_out + row * static_cast<long long>(N);
 }

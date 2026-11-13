@@ -10,6 +10,7 @@
 pub mod adapter;
 pub mod caps;
 pub mod channel;
+pub mod chunk;
 #[cfg(any(unix, windows, target_arch = "wasm32"))]
 pub mod disk;
 pub mod engine;
@@ -26,9 +27,14 @@ pub mod runahead;
 pub mod transfer;
 
 pub use adapter::{AdapterPlane, AdapterRegistration};
-pub use caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
+pub use caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
 pub use channel::{
     ChannelId, ChannelRegistration, ChannelSeed, HostMirror, RegisteredChannel, Ticket,
+};
+pub use chunk::{
+    ChunkFacts, ChunkRun, ChunkTable, Evacuation, Growth, Pinned, Reserved, ReservedRun,
+    ResidentWeight, SegmentFacts, ShapeId, SlotCopy, SlotKind, SlotRole, SlotRun, SlotShape,
+    WeightAtom, WeightKind, WeightResidency, WeightShape, WeightUses,
 };
 pub use engine::{
     CompletionSink, Engine, KvWrites, StepDone, StepOutcome, TapGroups, TapSink, Tapped,
@@ -43,6 +49,5 @@ pub use program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
 pub use transfer::{
-    KvCopy, KvHandle, KvLayout, KvLayoutKind, KvMove, KvRegion, MemoryDomain, StateCopy,
-    StateDirection, StateMove,
+    KvCopy, KvHandle, KvLayout, KvLayoutKind, KvMove, KvRegion, MemoryDomain, StateCopy, StateMove,
 };

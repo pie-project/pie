@@ -1,11 +1,11 @@
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, ops, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, ops, trace_hybrid};
 use poem_ir::{Def, Dim, Gather, Operands, Operation, RuntimeInput, Selection, Ty};
 
 struct PackThenUnpack;
 
 impl ForwardHybrid for PackThenUnpack {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         let x = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, 24, None);

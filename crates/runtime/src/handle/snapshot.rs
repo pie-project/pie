@@ -27,7 +27,7 @@ use crate::store::kv::page_table::{ExportedPage, ExportedSet, HostKvSlotId, KvPa
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::registry as store_registry;
 use crate::store::rs::working_set::RsWorkingSet;
-use crate::store::rs::{RingState, RsExport, RsGeometry, RsSlotId};
+use crate::store::rs::{RsExport, RsGeometry, RsSlotId, WindowState};
 
 const VERSION: u32 = 1;
 /// Names are file names here, written out in hex.
@@ -135,10 +135,10 @@ struct SavedState {
     base: u32,
     frozen: u32,
     bytes: u64,
-    /// The window's position, for a model whose state is one: `buffer` is
-    /// then its windowed pages, and `window_tokens` the window.
+    /// The windows' position, for a model whose state is one window list:
+    /// `buffer` is then its table, and `window_tokens` the window.
     #[serde(default)]
-    ring: Option<RingState>,
+    window: Option<WindowState>,
     #[serde(default)]
     window_tokens: u32,
 }
@@ -217,9 +217,89 @@ fn used(root: &Path) -> std::io::Result<u64> {
 }
 
 fn alloc_slots(stores: &store_registry::Stores, n: usize) -> Result<Vec<u32>, HandleError> {
-    store_registry::with_kv_lock(&stores.kv, "snapshot-host", |kv| kv.alloc_host_slots(n))
-        .map(|slots| slots.into_iter().map(|slot| slot.0).collect())
-        .ok_or_else(|| HandleError::quota(format!("the host has no room for {n} kv pages")))
+    let tier = tier_list(stores).is_some();
+    store_registry::with_kv_lock(&stores.kv, "snapshot-host", |kv| {
+        if tier {
+            kv.alloc_tier_slots(n)
+        } else {
+            kv.alloc_host_slots(n)
+        }
+    })
+    .map(|slots| slots.into_iter().map(|slot| slot.0).collect())
+    .ok_or_else(|| HandleError::quota(format!("the host has no room for {n} kv pages")))
+}
+
+/// A shared pool's kv list shape, whose host slots are host tier slots
+/// read and written by their refs (CONTRACT-BC 22); `None` for today's
+/// pools.
+fn tier_list(stores: &store_registry::Stores) -> Option<::engine::chunk::ShapeId> {
+    let shared = stores.shared.as_ref()?;
+    shared.lock().unwrap().list().map(|list| list.id)
+}
+
+/// [`read_pages`] on a shared pool: each page not on the host is copied
+/// into a host tier slot first (from the device, or from disk), shape by
+/// shape as `copy_slots` moves them, and every page's slot is read there.
+async fn read_tier_pages(
+    engine: usize,
+    stores: &store_registry::Stores,
+    list: ::engine::chunk::ShapeId,
+    backings: &[KvPageBacking],
+) -> Result<Vec<u8>, HandleError> {
+    let off = backings
+        .iter()
+        .filter(|backing| !matches!(backing, KvPageBacking::Swapped(_)))
+        .count();
+    let scratch = alloc_slots(stores, off)?;
+    let mut free = scratch.iter().copied();
+    let (mut refs, mut device, mut disk) = (Vec::new(), Vec::new(), Vec::new());
+    for backing in backings {
+        let slot = match *backing {
+            KvPageBacking::Swapped(slot) => slot.0,
+            KvPageBacking::Resident(page) => {
+                let slot = free.next().expect("a slot for each off the host");
+                device.push((page.0, slot));
+                slot
+            }
+            KvPageBacking::OnDisk(page) => {
+                let slot = free.next().expect("a slot for each off the host");
+                disk.push((page.0, slot));
+                slot
+            }
+        };
+        refs.push(slot);
+    }
+    let read = async {
+        for (pairs, source) in [
+            (device, None),
+            (disk, Some(::engine::MemoryDomain::LocalDisk)),
+        ] {
+            if pairs.is_empty() {
+                continue;
+            }
+            let (from, to) = pairs.into_iter().unzip();
+            let copy = TierMove {
+                kind: TierKind::KvSlots(list),
+                tier: ::engine::MemoryDomain::HostPinned,
+                out: true,
+                device: from,
+                slots: to,
+                source,
+            };
+            let completion = scheduler::copy_tier_tracked(engine, &copy)
+                .map_err(|error| failed("copying pages to the host", error))?;
+            completion
+                .wait()
+                .await
+                .map_err(|error| failed("copying pages to the host", error))?;
+        }
+        scheduler::read_tier_slots(engine, vec![(list, refs)])
+            .await
+            .map_err(|error| failed("reading pages", error))
+    }
+    .await;
+    free_slots(stores, scratch);
+    read
 }
 
 fn free_slots(stores: &store_registry::Stores, slots: Vec<u32>) {
@@ -234,6 +314,9 @@ async fn read_pages(
     stores: &store_registry::Stores,
     backings: &[KvPageBacking],
 ) -> Result<Vec<u8>, HandleError> {
+    if let Some(list) = tier_list(stores) {
+        return read_tier_pages(engine, stores, list, backings).await;
+    }
     let scratch = alloc_slots(stores, backings.len())?;
     let read = async {
         let mut out: Vec<Vec<u8>> = vec![Vec::new(); backings.len()];
@@ -301,66 +384,105 @@ async fn read_state(
 ) -> Result<(SavedState, Vec<u8>), HandleError> {
     let stores = store_registry::get(rs.model, rs.engine);
     let held: Vec<RsSlotId> = set.folded.iter().copied().collect();
-    let pages: Vec<RsSlotId> = set.buffer.iter().flatten().copied().collect();
-    let (ids, scratch) = {
+    if set.windows.len() > 1 {
+        return Err(HandleError::invalid(
+            "a state of several window lists is not saved to the host",
+        ));
+    }
+    // A window list's table rides as the buffer.
+    let table = set.windows.first().unwrap_or(&set.buffer);
+    let pages: Vec<RsSlotId> = table.iter().flatten().copied().collect();
+    let shared = stores.rs.lock().unwrap().is_shared();
+    let bytes = if shared {
+        read_tier_state(engine, &stores, &held, &pages).await?
+    } else {
+        // Without a host tier, rows are read where they rest on the host: a
+        // read parks nothing.
+        let (row_slots, row_pages) = {
+            let store = stores.rs.lock().unwrap();
+            if held.iter().chain(&pages).any(|&id| !store.on_host(id)) {
+                return Err(HandleError::quota(
+                    "the host has no room to read this recurrent state out",
+                ));
+            }
+            let ids = |ids: &[RsSlotId]| {
+                ids.iter()
+                    .map(|&id| store.engine_id(id))
+                    .collect::<Vec<_>>()
+            };
+            (ids(&held), ids(&pages))
+        };
+        scheduler::read_host_state(engine, row_slots, row_pages)
+            .await
+            .map_err(|error| failed("reading recurrent state", error))?
+    };
+    Ok((
+        SavedState {
+            state_size: rs.geom.state_size,
+            buffer_page_tokens: rs.geom.buffer_page_tokens,
+            folded: set.folded.is_some(),
+            buffer: table.iter().map(Option::is_some).collect(),
+            base: set.base,
+            frozen: set.frozen,
+            bytes: bytes.len() as u64,
+            window: set.window,
+            window_tokens: crate::model::model().rs_caps().window_tokens,
+        },
+        bytes,
+    ))
+}
+
+/// The bytes of a set's state on a shared pool (CONTRACT-BC 22): `held`
+/// records, then `pages` rs list or window slots, each parked in a host tier
+/// slot first where it is on the device (`copy_slots`, shape by shape), then
+/// read there shape by shape (`read_tier_slots`) in [`RsStore::tier_refs`]
+/// order. The host slots it took for the read are given back.
+///
+/// [`RsStore::tier_refs`]: crate::store::rs::RsStore::tier_refs
+async fn read_tier_state(
+    engine: usize,
+    stores: &store_registry::Stores,
+    held: &[RsSlotId],
+    pages: &[RsSlotId],
+) -> Result<Vec<u8>, HandleError> {
+    let (copies, refs, scratch) = {
         let mut store = stores.rs.lock().unwrap();
-        let on_device = |ids: &[RsSlotId], store: &crate::store::rs::RsStore| {
+        let off = |ids: &[RsSlotId], store: &crate::store::rs::RsStore| {
             ids.iter().filter(|&&id| !store.on_host(id)).count()
         };
-        let (slots, buffer) = (on_device(&held, &store), on_device(&pages, &store));
+        let (slots, buffer) = (off(held, &store), off(pages, &store));
         let scratch = store.take_host(slots, buffer).ok_or_else(|| {
             HandleError::quota("the host has no room to read this recurrent state out")
         })?;
-        (
-            held.iter()
-                .chain(&pages)
-                .map(|&id| (id, store.on_host(id), store.engine_id(id)))
-                .collect::<Vec<_>>(),
-            scratch
-                .iter()
-                .map(|&id| (id, store.engine_id(id)))
-                .collect::<Vec<_>>(),
-        )
+        // Off the host, in order: records take the records `take_host`
+        // gave first, list slots the slots after.
+        let mut free = scratch.iter().copied();
+        let mut moves = Vec::new();
+        let rows: Vec<RsSlotId> = held
+            .iter()
+            .chain(pages)
+            .map(|&id| {
+                if store.on_host(id) {
+                    id
+                } else {
+                    let row = free.next().expect("one row for each off the host");
+                    moves.push((id, row));
+                    row
+                }
+            })
+            .collect();
+        (store.tier_copies(&moves), store.tier_refs(&rows), scratch)
     };
     let read = async {
-        let (mut free, mut row_slots, mut row_pages) = (scratch.iter(), Vec::new(), Vec::new());
-        let (mut slot_moves, mut page_moves) = ((Vec::new(), Vec::new()), (Vec::new(), Vec::new()));
-        for (at, &(_, hosted, id)) in ids.iter().enumerate() {
-            let is_slot = at < held.len();
-            let row = if hosted {
-                id
-            } else {
-                let &(_, row) = free.next().expect("one row for each off the host");
-                let (device, slots) = if is_slot {
-                    (&mut slot_moves.0, &mut slot_moves.1)
-                } else {
-                    (&mut page_moves.0, &mut page_moves.1)
-                };
-                device.push(id);
-                slots.push(row);
-                row
-            };
-            if is_slot {
-                row_slots.push(row);
-            } else {
-                row_pages.push(row);
-            }
-        }
-        let pages_kind = if set.ring.is_some() {
-            TierKind::Window
-        } else {
-            TierKind::RsPages
-        };
-        for (kind, (device, slots)) in [(TierKind::Rs, slot_moves), (pages_kind, page_moves)] {
-            if device.is_empty() {
-                continue;
-            }
+        for (shape, pairs) in copies {
+            let (device, slots) = pairs.into_iter().unzip();
             let copy = TierMove {
-                kind,
+                kind: TierKind::RsSlots(shape),
                 tier: ::engine::MemoryDomain::HostPinned,
                 out: true,
                 device,
                 slots,
+                source: None,
             };
             let completion = scheduler::copy_tier_tracked(engine, &copy)
                 .map_err(|error| failed("copying state to the host", error))?;
@@ -369,31 +491,13 @@ async fn read_state(
                 .await
                 .map_err(|error| failed("copying state to the host", error))?;
         }
-        scheduler::read_host_state(engine, row_slots, row_pages)
+        scheduler::read_tier_slots(engine, refs)
             .await
             .map_err(|error| failed("reading recurrent state", error))
     }
     .await;
-    stores
-        .rs
-        .lock()
-        .unwrap()
-        .give_host(scratch.into_iter().map(|(id, _)| id).collect());
-    let bytes = read?;
-    Ok((
-        SavedState {
-            state_size: rs.geom.state_size,
-            buffer_page_tokens: rs.geom.buffer_page_tokens,
-            folded: set.folded.is_some(),
-            buffer: set.buffer.iter().map(Option::is_some).collect(),
-            base: set.base,
-            frozen: set.frozen,
-            bytes: bytes.len() as u64,
-            ring: set.ring,
-            window_tokens: crate::model::model().rs_caps().window_tokens,
-        },
-        bytes,
-    ))
+    stores.rs.lock().unwrap().give_host(scratch);
+    read
 }
 
 fn token_bytes(pages: &[ExportedPage]) -> Vec<u8> {
@@ -752,6 +856,7 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
         )));
     }
     let count = manifest.pages.len();
+    let tier = tier_list(&stores);
     let slots = alloc_slots(&stores, count)?;
     let filled = async {
         for run in (0..count).collect::<Vec<_>>().chunks(CHUNK_PAGES) {
@@ -767,10 +872,13 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
                 Ok(all)
             })
             .await?;
-            let ids = run.iter().map(|&at| slots[at]).collect();
-            scheduler::write_host_kv(engine, ids, bytes)
-                .await
-                .map_err(|error| failed("writing pages to the host", error))?;
+            let ids: Vec<u32> = run.iter().map(|&at| slots[at]).collect();
+            match tier {
+                // A shared pool's host slots are host tier slots.
+                Some(list) => scheduler::write_tier_slots(engine, vec![(list, ids)], bytes).await,
+                None => scheduler::write_host_kv(engine, ids, bytes).await,
+            }
+            .map_err(|error| failed("writing pages to the host", error))?;
         }
         Ok::<_, HandleError>(())
     }
@@ -860,7 +968,7 @@ async fn load_state(
         || caps.state_size != geom.state_size
         || caps.buffer_page_size != geom.buffer_page_tokens
         || caps.window_tokens != saved.window_tokens
-        || (caps.window_tokens > 0) != saved.ring.is_some()
+        || (caps.window_tokens > 0) != saved.window.is_some()
     {
         return Err(HandleError::invalid(
             "its recurrent state is not this model's",
@@ -876,30 +984,43 @@ async fn load_state(
         let ids: Vec<u32> = rows.iter().map(|&id| store.engine_id(id)).collect();
         (rows, ids)
     };
-    let (row_slots, row_pages) = ids.split_at(slots);
-    let written = scheduler::write_host_state(
-        engine,
-        row_slots.to_vec(),
-        row_pages.to_vec(),
-        bytes.to_vec(),
-    )
-    .await;
+    let tier = {
+        let store = stores.rs.lock().unwrap();
+        store.is_shared().then(|| store.tier_refs(&rows))
+    };
+    let written = match tier {
+        // A shared pool's host rows are host tier slots (CONTRACT-BC 22).
+        Some(refs) => scheduler::write_tier_slots(engine, refs, bytes.to_vec()).await,
+        None => {
+            let (row_slots, row_pages) = ids.split_at(slots);
+            scheduler::write_host_state(
+                engine,
+                row_slots.to_vec(),
+                row_pages.to_vec(),
+                bytes.to_vec(),
+            )
+            .await
+        }
+    };
     let mut store = stores.rs.lock().unwrap();
     if let Err(error) = written {
         store.give_host(rows);
         return Err(failed("writing recurrent state to the host", error));
     }
     let mut buffered = rows[slots..].iter().copied();
+    let table: Vec<Option<RsSlotId>> = saved
+        .buffer
+        .iter()
+        .map(|&page| page.then(|| buffered.next().expect("counted above")))
+        .collect();
+    let windowed = saved.window.is_some();
     let set = RsExport {
         folded: saved.folded.then(|| rows[0]),
-        buffer: saved
-            .buffer
-            .iter()
-            .map(|&page| page.then(|| buffered.next().expect("counted above")))
-            .collect(),
+        buffer: if windowed { Vec::new() } else { table.clone() },
         base: saved.base,
         frozen: saved.frozen,
-        ring: saved.ring,
+        windows: if windowed { vec![table] } else { Vec::new() },
+        window: saved.window,
     };
     let id = store.import(geom, set);
     Ok(RsWorkingSet::new(0, engine, id, geom))

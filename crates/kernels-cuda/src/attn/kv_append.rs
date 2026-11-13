@@ -11,6 +11,8 @@ use crate::attn::kv::lanes_of;
 use crate::attn::kv::max_touched_pages;
 use crate::attn::kv::native_bf16;
 use crate::attn::kv::native_e4m3;
+use crate::attn::kv::packed_only;
+use crate::attn::kv::page_elems;
 use crate::attn::kv::scheme_of;
 use crate::attn::kv_envelope::envelope_update_appended;
 use crate::jit::{Arg, Ctx, Fire, Launch, kernel, refuse, stated};
@@ -94,6 +96,8 @@ fn write_kv_bf16(
             pool.page_size.arg(),
             kv_heads.arg(),
             head_dim.arg(),
+            page_elems(op, pool, 0)?.arg(),
+            page_elems(op, pool, 1)?.arg(),
             ctx.stage(),
         ],
     )?;
@@ -125,6 +129,11 @@ fn write_kv_quantised(
     kv_heads: i32,
     head_dim: i32,
 ) -> Result<(), Error> {
+    packed_only(
+        op,
+        pool,
+        "a quantized scheme's append, its scale planes beside,",
+    )?;
     let num_requests = lanes_of(op, indptr)?;
     let tokens = k.rows;
     let heads = kv_heads.unsigned_abs();

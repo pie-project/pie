@@ -4,6 +4,8 @@
 
 using namespace metal;
 
+#include "../prim/kv_page.h"
+
 METAL_FUNC void sdpa_online_update(
     float score, thread float& max_score, thread float& sum_exp_score,
     thread float& history_scale, thread float& score_scale) {
@@ -32,6 +34,7 @@ inline void sdpa_paged_mma_body(
     const device uint* kv_page_indices,
     const device uint* kv_page_indptr,
     const int page_size,
+    const pie_kv_layout kvl,
     const int n_kv_heads,
     const float scale,
     const device uchar* attention_mask,
@@ -47,6 +50,12 @@ inline void sdpa_paged_mma_body(
     uint3 tpg,
     uint simd_gid,
     uint simd_lid) {
+  // The pool's planes as the layout places them, in elements.
+  k_pages = pie_kv_plane(k_pages, kvl.k_offset);
+  v_pages = pie_kv_plane(v_pages, kvl.v_offset);
+  const size_t k_page = size_t(kvl.k_page) / sizeof(T);
+  const size_t v_page = size_t(kvl.v_page) / sizeof(T);
+  const size_t kv_row = size_t(n_kv_heads) * size_t(D);
   constexpr int QT  = 32;
   constexpr int SGS = 4;
   constexpr int RPS = QT / SGS;
@@ -134,10 +143,9 @@ inline void sdpa_paged_mma_body(
         if (kk < cnt) {
           const int kp = base + kk;
           const int page = int(kv_page_indices[page_base + kp / page_size]);
-          const size_t slot = size_t(page) * page_size + size_t(kp % page_size);
-          const size_t off = (slot * n_kv_heads + kv_head) * D + d;
-          ktile[d * KT + kk] = half(float(k_pages[off]));
-          vtile[e] = half(float(v_pages[off]));
+          const size_t off = size_t(kp % page_size) * kv_row + size_t(kv_head) * D + d;
+          ktile[d * KT + kk] = half(float(k_pages[size_t(page) * k_page + off]));
+          vtile[e] = half(float(v_pages[size_t(page) * v_page + off]));
         } else {
 
           ktile[d * KT + kk] = half(0);
@@ -257,6 +265,10 @@ template <typename T, int D, int KT>
     const constant int& window                 [[buffer(15)]],
     const device T* sinks                      [[buffer(16)]],
     const constant int& n_rows                 [[buffer(17)]],
+    const constant ulong& k_page_stride [[buffer(18)]],
+    const constant ulong& v_page_stride [[buffer(19)]],
+    const constant ulong& k_offset [[buffer(20)]],
+    const constant ulong& v_offset [[buffer(21)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint3 tpg       [[threadgroups_per_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
@@ -267,7 +279,7 @@ template <typename T, int D, int KT>
   (void)sinks;
   sdpa_paged_mma_body<T, D, KT, false>(
       queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
-      kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
+      kv_page_indices, kv_page_indptr, page_size, PIE_KV_LAYOUT_ARGS, n_kv_heads, scale,
       attention_mask, attention_mask_stride, attention_mask_enabled, window,
       n_rows, nullptr,
       qtile, ktile, vtile, tid, tpg, simd_gid, simd_lid);
@@ -294,6 +306,10 @@ template <typename T, int D, int KT>
     const device T* sinks                      [[buffer(16)]],
     const constant int& n_rows                 [[buffer(17)]],
     device float* lse                          [[buffer(18)]],
+    const constant ulong& k_page_stride [[buffer(19)]],
+    const constant ulong& v_page_stride [[buffer(20)]],
+    const constant ulong& k_offset [[buffer(21)]],
+    const constant ulong& v_offset [[buffer(22)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint3 tpg       [[threadgroups_per_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
@@ -304,7 +320,7 @@ template <typename T, int D, int KT>
   (void)sinks;
   sdpa_paged_mma_body<T, D, KT, true>(
       queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
-      kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
+      kv_page_indices, kv_page_indptr, page_size, PIE_KV_LAYOUT_ARGS, n_kv_heads, scale,
       attention_mask, attention_mask_stride, attention_mask_enabled, window,
       n_rows, lse,
       qtile, ktile, vtile, tid, tpg, simd_gid, simd_lid);
@@ -319,7 +335,7 @@ template <typename T, int D, int KT>
       const constant int&, const constant int&, const constant float&,       \
       const device uchar*, const device uint&, const device uchar*,          \
       const constant int&, const device itype*, const constant int&,         \
-      uint3, uint3, uint, uint);
+      PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 
 instantiate_sdpa_paged_mma(bfloat16, bfloat, 64, 16)
 
@@ -332,7 +348,7 @@ instantiate_sdpa_paged_mma(bfloat16, bfloat, 64, 16)
       const constant int&, const constant int&, const constant float&,       \
       const device uchar*, const device uint&, const device uchar*,          \
       const constant int&, const device itype*, const constant int&,         \
-      device float*, uint3, uint3, uint, uint);
+      device float*, PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 
 instantiate_sdpa_paged_mma_lse(bfloat16, bfloat, 64, 16)
 
@@ -356,6 +372,7 @@ METAL_FUNC void sdpa_wide_fetch(
     const device uint* kv_page_indices,
     const int page_base,
     const int page_size,
+    const size_t page_elems,
     const int n_kv_heads,
     const int kv_head,
     const int base,
@@ -372,8 +389,9 @@ METAL_FUNC void sdpa_wide_fetch(
     if (kk < cnt) {
       const int kp = base + kk;
       const int page = int(kv_page_indices[page_base + kp / page_size]);
-      const size_t slot = size_t(page) * page_size + size_t(kp % page_size);
-      w[l] = *reinterpret_cast<const device uint4*>(pages + (slot * n_kv_heads + kv_head) * D + d0);
+      const size_t cell = size_t(page) * page_elems +
+                          size_t(kp % page_size) * size_t(n_kv_heads) * size_t(D);
+      w[l] = *reinterpret_cast<const device uint4*>(pages + cell + size_t(kv_head) * D + d0);
     }
   }
 }
@@ -409,6 +427,7 @@ inline void sdpa_paged_mma_wide_body(
     const device uint* kv_page_indices,
     const device uint* kv_page_indptr,
     const int page_size,
+    const pie_kv_layout kvl,
     const int n_kv_heads,
     const float scale,
     const device uchar* attention_mask,
@@ -422,6 +441,12 @@ inline void sdpa_paged_mma_wide_body(
     uint3 tpg,
     uint simd_gid,
     uint simd_lid) {
+  // The pool's planes as the layout places them, in elements.
+  k_pages = pie_kv_plane(k_pages, kvl.k_offset);
+  v_pages = pie_kv_plane(v_pages, kvl.v_offset);
+  const size_t k_page = size_t(kvl.k_page) / sizeof(T);
+  const size_t v_page = size_t(kvl.v_page) / sizeof(T);
+  const size_t kv_row = size_t(n_kv_heads) * size_t(D);
   constexpr int QT  = 32;
   constexpr int KT  = 16;
   constexpr int WM  = 4;
@@ -525,7 +550,8 @@ inline void sdpa_paged_mma_wide_body(
       {
         uint4 kw[NL];
         sdpa_wide_fetch<D, KT, NT>(
-            kw, k_pages, kv_page_indices, page_base, page_size, n_kv_heads, kv_head, base, cnt, lid);
+            kw, k_pages, kv_page_indices, page_base, page_size, k_page, n_kv_heads, kv_head, base, cnt,
+            lid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         sdpa_wide_land<D, KT, LD, NT>(kv, kw, lid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -635,7 +661,8 @@ inline void sdpa_paged_mma_wide_body(
       {
         uint4 vw[NL];
         sdpa_wide_fetch<D, KT, NT>(
-            vw, v_pages, kv_page_indices, page_base, page_size, n_kv_heads, kv_head, base, cnt, lid);
+            vw, v_pages, kv_page_indices, page_base, page_size, v_page, n_kv_heads, kv_head, base, cnt,
+            lid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         sdpa_wide_land<D, KT, LD, NT>(kv, vw, lid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -698,6 +725,10 @@ inline void sdpa_paged_mma_wide_body(
 template <typename T, int D>
 [[kernel]] [[max_total_threads_per_threadgroup(D / 128 * 128)]] void sdpa_paged_mma_wide(
     sdpa_paged_mma_wide_args(T),
+    const constant ulong& k_page_stride        [[buffer(18)]],
+    const constant ulong& v_page_stride        [[buffer(19)]],
+    const constant ulong& k_offset             [[buffer(20)]],
+    const constant ulong& v_offset             [[buffer(21)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint3 tpg       [[threadgroups_per_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
@@ -706,7 +737,7 @@ template <typename T, int D>
   (void)sinks;
   sdpa_paged_mma_wide_body<T, D, false>(
       queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
-      kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
+      kv_page_indices, kv_page_indptr, page_size, PIE_KV_LAYOUT_ARGS, n_kv_heads, scale,
       attention_mask, attention_mask_stride, attention_mask_enabled, window,
       n_rows, nullptr, kv, tid, tpg, simd_gid, simd_lid);
 }
@@ -715,6 +746,10 @@ template <typename T, int D>
 [[kernel]] [[max_total_threads_per_threadgroup(D / 128 * 128)]] void sdpa_paged_mma_wide_lse(
     sdpa_paged_mma_wide_args(T),
     device float* lse                          [[buffer(18)]],
+    const constant ulong& k_page_stride        [[buffer(19)]],
+    const constant ulong& v_page_stride        [[buffer(20)]],
+    const constant ulong& k_offset             [[buffer(21)]],
+    const constant ulong& v_offset             [[buffer(22)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint3 tpg       [[threadgroups_per_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
@@ -723,7 +758,7 @@ template <typename T, int D>
   (void)sinks;
   sdpa_paged_mma_wide_body<T, D, true>(
       queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
-      kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
+      kv_page_indices, kv_page_indptr, page_size, PIE_KV_LAYOUT_ARGS, n_kv_heads, scale,
       attention_mask, attention_mask_stride, attention_mask_enabled, window,
       n_rows, lse, kv, tid, tpg, simd_gid, simd_lid);
 }
@@ -739,10 +774,10 @@ template <typename T, int D>
 #define instantiate_sdpa_paged_mma_wide(name, itype, d)                       \
   template [[host_name("sdpa_paged_mma_wide_" #name "_d_" #d)]]              \
   [[kernel]] void sdpa_paged_mma_wide<itype, d>(                             \
-      sdpa_paged_mma_wide_types(itype), uint3, uint3, uint, uint);           \
+      sdpa_paged_mma_wide_types(itype), PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);           \
   template [[host_name("sdpa_paged_mma_wide_lse_" #name "_d_" #d)]]          \
   [[kernel]] void sdpa_paged_mma_wide_lse<itype, d>(                         \
-      sdpa_paged_mma_wide_types(itype), device float*, uint3, uint3, uint, uint);
+      sdpa_paged_mma_wide_types(itype), device float*, PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 
 instantiate_sdpa_paged_mma_wide(bfloat16, bfloat, 256)
 instantiate_sdpa_paged_mma_wide(bfloat16, bfloat, 512)

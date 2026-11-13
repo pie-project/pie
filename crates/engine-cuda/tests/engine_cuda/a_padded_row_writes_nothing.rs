@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::common_encoder::{Weights, contract_for};
 use engine::fire::Readout;
 use engine_cuda::{Boot, Graphs, Lane, Recording, Seated, Shell};
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Weight, ops};
+use poem::{Dtype, ForwardHybrid, Input, Platform, Request, StateRows, Weight, ops};
 use poem_compiler::Budget;
 
 const VOCAB: u32 = 64;
@@ -22,11 +22,10 @@ const PROMPT: u32 = 31;
 struct Micro;
 
 impl ForwardHybrid for Micro {
-    fn caches(&self) -> HybridSpec {
-        let mut spec = HybridSpec::new();
-        let space = spec.kv_space(Dtype::Bf16);
+    fn states(&self) -> StateRows {
+        let mut spec = StateRows::new();
         let plane = u64::from(HEADS) * u64::from(HEAD_DIM);
-        spec.kv(space, KV_ROW, [plane, plane], HEAD_DIM);
+        spec.kv(KV_ROW, Dtype::Bf16, [plane, plane], HEAD_DIM);
         spec
     }
 
@@ -61,7 +60,6 @@ fn shell(trace: poem::Trace, path: &Path) -> Shell {
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     let mut shell = Shell::load(Boot {
         voxels: None,
-        deferred_tier: false,
         residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,

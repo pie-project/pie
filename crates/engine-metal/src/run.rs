@@ -19,8 +19,14 @@ pub enum WeightRow {
     Planes(Bank),
 }
 
+/// Each param's binding, and the address table each weight the weight
+/// cache streams is read through (`None`: read whole, as bound): a row
+/// table, or for a routed bank an expert table (one-row blocks).
 #[derive(Clone, Debug, Default)]
-pub struct WeightTable(pub Vec<Option<WeightRow>>);
+pub struct WeightTable(
+    pub Vec<Option<WeightRow>>,
+    pub Vec<Option<crate::store::streamed::Streamed>>,
+);
 
 #[derive(Clone, Debug, Default)]
 pub struct SlotTable(pub Vec<Option<Tensor>>);
@@ -33,10 +39,17 @@ pub enum CachePool {
 
 #[derive(Clone, Debug, Default)]
 pub struct CacheTable {
-    /// One pool per cache space, in space order.
+    /// One pool per cache row, in row order.
     pub pools: Vec<CachePool>,
-    /// The compressor state beside each kv space a pool gather reads.
+    /// The compressor state beside each kv row a pool gather reads.
     pub compressed: Vec<(u32, PoolSlabs)>,
+    /// Each cache row's lane table of record piece ids (its band's), for
+    /// the committed scans that index a state by lane.
+    pub lane_slots: Vec<Option<Tensor>>,
+    /// Each cache row's band, for the snapshot table it reads.
+    pub band_of: Vec<Option<usize>>,
+    /// Each kv cache row's page table (its list's) among the fire's.
+    pub tables: Vec<Option<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -78,12 +91,8 @@ pub struct FireTables {
     pub mask_stride: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct PoolSlabs {
-    pub state_kv: Tensor,
-
-    pub state_score: Tensor,
-}
+/// A compressor's state beside the kv row its gather keys by.
+pub type PoolSlabs = kernels_metal::attn::pool::PoolState;
 
 #[derive(Clone, Debug)]
 pub struct FireBindings {
@@ -119,7 +128,11 @@ pub struct FireBindings {
 
     pub voxels: Option<crate::inputs::VoxelHandles>,
 
+    /// One a page table: the kv list's first, the All axis's.
     pub geometry: Vec<CacheGeometry>,
+    /// The page table of `geometry` each window list's write descriptors
+    /// read, by the window (rows retained) the list keeps.
+    pub window_tables: Vec<(u32, usize)>,
 
     pub tables: FireTables,
 
@@ -128,6 +141,9 @@ pub struct FireBindings {
     /// The fire's recurrent snapshot table, when a lane snapshots
     /// (`kernels_metal::ssm::Snapshots`).
     pub rs_snaps: Option<Tensor>,
+    /// Each band's snapshot table (`crate::store::Pools::bands`), when a lane
+    /// of the fire snapshots.
+    pub rs_snap_bands: Vec<Tensor>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -226,7 +242,7 @@ struct Laid {
 /// tail themselves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Rows {
-    Span([poem_exec::fire::MaskSpan; 3], u32, bool),
+    Span([poem_exec::fire::MaskSpan; 3], bool),
     Region(u32, u32, bool),
 }
 
@@ -841,9 +857,12 @@ impl<'c> Run<'c> {
             moe::REGISTER_CUT.groups(inter, columns),
             rooms,
         )?;
+        let gate_up_table = self.bank_table(bank);
+        self.count_bank(gate_up_table, rt)?;
         moe::register_glu(
             self.ctx(),
             gate_up,
+            gate_up_table,
             shared.map(|s| s.gate_up),
             xt.width,
             inter,
@@ -981,7 +1000,6 @@ impl<'c> Run<'c> {
             }
             let window = self.windows.at(index, 0);
             if window.gathered.is_some()
-                || window.passes > 1
                 || window.span.rows == 0
                 || *rows.get_or_insert(window.span.rows) != window.span.rows
             {
@@ -1024,9 +1042,12 @@ impl<'c> Run<'c> {
         let rooms = self
             .register_rooms()
             .expect("the register chain began over the rooms the load reserved");
+        let table = self.bank_table(bank);
+        self.count_bank(table, self.tensor(routes))?;
         kernels_metal::linear::moe::register_down(
             self.ctx(),
             self.planes(bank),
+            table,
             tiled.shared.map(|s| s.down),
             self.tensor(x).width,
             self.tensor(y).width,
@@ -1169,10 +1190,7 @@ impl<'c> Run<'c> {
     pub(crate) fn region_nodes(&self) -> Option<(std::ops::Range<u32>, bool)> {
         let region = self.regions?.get(self.place.region.get() as usize)?;
         let window = self.window();
-        Some((
-            region.nodes.clone(),
-            window.gathered.is_none() && window.passes <= 1,
-        ))
+        Some((region.nodes.clone(), window.gathered.is_none()))
     }
 
     pub(crate) fn ane(&self) -> Option<&'c crate::ane::Ane> {
@@ -1192,21 +1210,8 @@ impl<'c> Run<'c> {
         self.window().indptr
     }
 
-    #[allow(dead_code)]
     pub(crate) fn qo_indptr_host(&self) -> &'c [i32] {
         &self.window().indptr_host
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn total_tokens(&self) -> u32 {
-        self.window().span.rows
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn multi_token(&self) -> bool {
-        self.qo_indptr_host()
-            .windows(2)
-            .any(|pair| pair[1] - pair[0] > 1)
     }
 
     pub(crate) fn cut_rows(&self, handle: Tensor) -> Tensor {
@@ -1328,9 +1333,18 @@ impl<'c> Run<'c> {
 
     /// Where this window's prompt scans land the state as of rows inside a
     /// lane, when a lane of the fire snapshots.
-    pub(crate) fn rs_snapshots(&self) -> Option<kernels_metal::ssm::Snapshots> {
+    /// The snapshot table of the state `state` reads: its band's, each
+    /// snapshot naming the record's pieces that band holds.
+    pub(crate) fn rs_snapshots(&self, state: ValueId) -> Option<kernels_metal::ssm::Snapshots> {
+        let band = match &self.values[state.0 as usize].def {
+            Def::Cache(row) => self.caches.band_of.get(*row as usize).copied().flatten(),
+            _ => None,
+        };
         self.fire
-            .rs_snaps
+            .rs_snap_bands
+            .get(band.unwrap_or(0))
+            .copied()
+            .or(self.fire.rs_snaps)
             .map(|table| kernels_metal::ssm::Snapshots {
                 table,
                 lane0: self.window().span.lane_offset,
@@ -1381,7 +1395,7 @@ impl<'c> Run<'c> {
         }
         if matches!(
             self.values[at].def,
-            Def::Input(RuntimeInput::Mask { .. })
+            Def::Input(RuntimeInput::Mask)
                 | Def::Input(RuntimeInput::Geometry {
                     kind: GeomKind::Indices,
                     ..
@@ -1424,15 +1438,15 @@ impl<'c> Run<'c> {
             .gathered
             .as_ref()
             .expect("`compacted` is reached only through a gathered window");
-        if let Def::Input(RuntimeInput::Geometry { space, kind }) = &self.values[at].def {
-            let Some(space) = gathered.spaces.get(*space as usize) else {
+        if let Def::Input(RuntimeInput::Geometry { kind }) = &self.values[at].def {
+            let Some(table) = gathered.page_tables.get(self.table_of(*kind)) else {
                 return handle;
             };
             return match kind {
-                GeomKind::Indptr => space.page_indptr,
-                GeomKind::Indices => space.page_indices,
-                GeomKind::LastPageLen => space.last_page_lens,
-                GeomKind::KvLen => space.kv_len,
+                GeomKind::Indptr => table.page_indptr,
+                GeomKind::Indices => table.page_indices,
+                GeomKind::LastPageLen => table.last_page_lens,
+                GeomKind::KvLen => table.kv_len,
                 _ => handle,
             };
         }
@@ -1522,7 +1536,7 @@ impl<'c> Run<'c> {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
             Def::Input(RuntimeInput::ReadoutRows) => self.fire.readout_rows,
             Def::Input(RuntimeInput::Positions) => self.fire.positions,
-            Def::Input(RuntimeInput::Mask { space: _ }) => self.fire.tables.mask,
+            Def::Input(RuntimeInput::Mask) => self.fire.tables.mask,
             Def::Input(RuntimeInput::AdapterRoutes) => {
                 self.fire.adapter_routes.unwrap_or_else(|| {
                     panic!(
@@ -1608,35 +1622,8 @@ impl<'c> Run<'c> {
                 kind: GeomKind::RequestOfToken,
                 ..
             }) => self.fire.tables.request_of_token,
-            Def::Input(RuntimeInput::Geometry { space, kind }) => {
-                let space = *space as usize;
-                let seat = self.fire.geometry.get(space).unwrap_or_else(|| {
-                    panic!(
-                        "value {at} names cache space {space}, and this fire binds \
-                         {} geometry spaces",
-                        self.fire.geometry.len()
-                    )
-                });
-                let bound = match kind {
-                    GeomKind::Indptr => seat.indptr,
-                    GeomKind::Indices => seat.indices,
-                    GeomKind::SeqLens => seat.seq_lens,
-                    GeomKind::LastPageLen => seat.last_page_len,
-                    GeomKind::KvLen => seat.kv_len,
-                    GeomKind::RowValid => seat.row_valid,
-                    GeomKind::WritePage => seat.write_page,
-                    GeomKind::WriteOffset => seat.write_offset,
-                    GeomKind::RequestOfToken
-                    | GeomKind::GroupOfLane
-                    | GeomKind::GroupIndptr { .. }
-                    | GeomKind::LaneIndptr { .. } => None,
-                };
-                bound.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads {kind:?} of cache space {space}, which this \
-                         fire left unbound"
-                    )
-                })
+            Def::Input(RuntimeInput::Geometry { kind }) => {
+                self.geometry_of(at, *kind, self.table_of(*kind))
             }
             Def::Weight(w) => {
                 let row = *w as usize;
@@ -1655,7 +1642,7 @@ impl<'c> Run<'c> {
                 })
             }
             Def::Cache(_) => panic!(
-                "value {at} is a cache space; it resolves to a pool through `Run::pool`, \
+                "value {at} is a cache row; it resolves to a pool through `Run::pool`, \
                  never to a tensor"
             ),
         }
@@ -1676,6 +1663,65 @@ impl<'c> Run<'c> {
                 id.0
             )
         })
+    }
+
+    /// The address table weight `id` is read through, where the weight
+    /// cache streams it (by its rows, or an expert at a time).
+    pub(crate) fn row_table(&self, id: ValueId) -> Option<kernels_metal::gather::RowTable> {
+        match self.streamed(id)? {
+            crate::store::streamed::Streamed::Rows(table) => Some(table),
+            _ => None,
+        }
+    }
+
+    /// The expert table routed bank `id` is read through, where the weight
+    /// cache streams it an expert at a time.
+    pub(crate) fn expert_table(
+        &self,
+        id: ValueId,
+    ) -> Option<kernels_metal::linear::moe::ExpertTable> {
+        match self.streamed(id)? {
+            crate::store::streamed::Streamed::Experts(table) => Some(table),
+            _ => None,
+        }
+    }
+
+    /// The tables a quantized table `id` is read through, where the weight
+    /// cache streams it by its rows.
+    pub(crate) fn bank_rows(&self, id: ValueId) -> Option<kernels_metal::gather::BankRows> {
+        match self.streamed(id)? {
+            crate::store::streamed::Streamed::BankRows(table) => Some(table),
+            _ => None,
+        }
+    }
+
+    /// The tables a quantized routed bank `id` is read through, where the
+    /// weight cache streams it an expert at a time.
+    pub(crate) fn bank_table(&self, id: ValueId) -> Option<kernels_metal::linear::moe::BankTable> {
+        match self.streamed(id)? {
+            crate::store::streamed::Streamed::Bank(table) => Some(table),
+            _ => None,
+        }
+    }
+
+    /// Counts each route of `routes` against its expert, where `table` keeps
+    /// its bank's use record (the weight cache's hit counters).
+    pub(crate) fn count_bank(
+        &self,
+        table: Option<kernels_metal::linear::moe::BankTable>,
+        routes: kernels_metal::Tensor,
+    ) -> Result<(), kernels_metal::Error> {
+        match table.and_then(|table| table.hits) {
+            Some(hits) => kernels_metal::linear::moe::count_routes(self.ctx(), routes, hits),
+            None => Ok(()),
+        }
+    }
+
+    fn streamed(&self, id: ValueId) -> Option<crate::store::streamed::Streamed> {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return None;
+        };
+        self.weights.1.get(*w as usize).copied().flatten()
     }
 
     pub(crate) fn banked(&self, id: ValueId) -> Option<Bank> {
@@ -1725,15 +1771,93 @@ impl<'c> Run<'c> {
         )
     }
 
+    /// The page table of the fire's that geometry input `kind` reads: the
+    /// All axis's (the first), or a write descriptor's row's list's.
+    fn table_of(&self, kind: GeomKind) -> usize {
+        match poem_exec::store::kv::geometry_window(kind) {
+            Some(window) => self
+                .fire
+                .window_tables
+                .iter()
+                .find(|(rows, _)| *rows == window)
+                .or(self.fire.window_tables.first())
+                .map_or(0, |(_, table)| *table),
+            None => 0,
+        }
+    }
+
+    /// Geometry input `at` (of `kind`) as page table `table` states it.
+    fn geometry_of(&self, at: usize, kind: GeomKind, table: usize) -> Tensor {
+        let seat = self.fire.geometry.get(table).unwrap_or_else(|| {
+            panic!(
+                "value {at} reads page table {table}, and this fire binds {} \
+                 page tables",
+                self.fire.geometry.len()
+            )
+        });
+        let bound = match kind {
+            GeomKind::Indptr => seat.indptr,
+            GeomKind::Indices => seat.indices,
+            GeomKind::SeqLens => seat.seq_lens,
+            GeomKind::LastPageLen => seat.last_page_len,
+            GeomKind::KvLen => seat.kv_len,
+            GeomKind::RowValid => seat.row_valid,
+            GeomKind::WritePage { .. } => seat.write_page,
+            GeomKind::WriteOffset { .. } => seat.write_offset,
+            GeomKind::RequestOfToken
+            | GeomKind::GroupOfLane
+            | GeomKind::GroupIndptr { .. }
+            | GeomKind::LaneIndptr { .. } => None,
+        };
+        bound.unwrap_or_else(|| {
+            panic!(
+                "value {at} reads {kind:?} of page table {table}, which this \
+                 fire left unbound"
+            )
+        })
+    }
+
+    /// Prefill plan `plan` as cache row `cache` reads it: its last-page
+    /// lengths are the ones `cache`'s own page table states. A plan reads
+    /// the All axis's table (the kv list's), and a window list whose slot is
+    /// smaller than the kv page counts another last page.
+    pub(crate) fn prefill_plan_over(&self, plan: ValueId, cache: ValueId) -> PrefillPlan {
+        let built = *self.prefill_plan(plan);
+        let Some(Def::Cache(row)) = self.values.get(cache.0 as usize).map(|v| &v.def) else {
+            return built;
+        };
+        let Some(table) = self.caches.tables.get(*row as usize).copied().flatten() else {
+            return built;
+        };
+        if table == 0 {
+            return built;
+        }
+        let last_page_len = match &self.window().gathered {
+            Some(gathered) => gathered
+                .page_tables
+                .get(table)
+                .map_or(built.last_page_len, |seat| seat.last_page_lens),
+            None => {
+                let lens = self.geometry_of(cache.0 as usize, GeomKind::LastPageLen, table);
+                let span = self.window().span;
+                self.slice(lens, span.lane_offset, span.lanes)
+            }
+        };
+        PrefillPlan {
+            last_page_len,
+            ..built
+        }
+    }
+
     pub(crate) fn pool_state(&self, pages: ValueId) -> Option<PoolSlabs> {
         let at = pages.0 as usize;
-        let Some(Def::Cache(space)) = self.values.get(at).map(|v| &v.def) else {
-            panic!("value {at} is not a cache space; the pooled state is keyed by one")
+        let Some(Def::Cache(row)) = self.values.get(at).map(|v| &v.def) else {
+            panic!("value {at} is not a cache row; the pooled state is keyed by one")
         };
         self.caches
             .compressed
             .iter()
-            .find(|(held, _)| *held == *space)
+            .find(|(held, _)| *held == *row)
             .map(|&(_, slabs)| slabs)
     }
 
@@ -1797,20 +1921,7 @@ impl<'c> Run<'c> {
             .unwrap_or_else(|fault| {
                 panic!("the precast plane this load reserved does not mint: {fault}")
             });
-        let window = self.window();
-        let rows = if window.gathered.is_some() || window.passes > 1 {
-            Rows::Region(
-                self.place.region.get(),
-                self.place.run.get(),
-                self.place.tail.get(),
-            )
-        } else {
-            Rows::Span(
-                [window.span, window.patch, window.voxel],
-                window.pass,
-                self.place.tail.get(),
-            )
-        };
+        let rows = self.rows_here();
         let standing = self.table.get().is_some_and(|laid| {
             laid.act == act
                 && laid.rows == rows
@@ -1831,7 +1942,7 @@ impl<'c> Run<'c> {
     /// The rows of a value the walk's place reads ([`Rows`]).
     fn rows_here(&self) -> Rows {
         let window = self.window();
-        if window.gathered.is_some() || window.passes > 1 {
+        if window.gathered.is_some() {
             Rows::Region(
                 self.place.region.get(),
                 self.place.run.get(),
@@ -1840,7 +1951,6 @@ impl<'c> Run<'c> {
         } else {
             Rows::Span(
                 [window.span, window.patch, window.voxel],
-                window.pass,
                 self.place.tail.get(),
             )
         }
@@ -1924,9 +2034,17 @@ impl<'c> Run<'c> {
         match self.cache(id) {
             CachePool::Kv(pool) => pool,
             CachePool::Recurrent(_) => panic!(
-                "value {} is a recurrent state space, and this op walks a paged kv pool",
+                "value {} is a recurrent state row, and this op walks a paged kv pool",
                 id.0
             ),
+        }
+    }
+
+    /// The lane table of record piece ids cache row `id`'s state reads.
+    pub(crate) fn lane_slots(&self, id: ValueId) -> Option<Tensor> {
+        match &self.values[id.0 as usize].def {
+            Def::Cache(row) => self.caches.lane_slots.get(*row as usize).copied().flatten(),
+            _ => None,
         }
     }
 
@@ -1937,7 +2055,7 @@ impl<'c> Run<'c> {
                 ..*pool
             },
             CachePool::Kv(_) => panic!(
-                "value {} is a paged kv space, and this op scans a recurrent state pool",
+                "value {} is a paged kv row, and this op scans a recurrent state pool",
                 id.0
             ),
         }
@@ -1950,12 +2068,12 @@ impl<'c> Run<'c> {
                 let row = *c as usize;
                 self.caches.pools.get(row).unwrap_or_else(|| {
                     panic!(
-                        "value {at} is cache space {row}, and the shell binds {} pools",
+                        "value {at} is cache row {row}, and the shell binds {} pools",
                         self.caches.pools.len()
                     )
                 })
             }
-            _ => panic!("value {at} is not a cache space; tensors resolve through `Run::tensor`"),
+            _ => panic!("value {at} is not a cache row; tensors resolve through `Run::tensor`"),
         }
     }
 

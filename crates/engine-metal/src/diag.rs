@@ -40,7 +40,6 @@ pub enum StreamedKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostics {
-    pub cut_trace: bool,
     pub tier_trace: bool,
     pub rs_trace: bool,
     pub fire_trace: bool,
@@ -48,10 +47,6 @@ pub struct Diagnostics {
     pub streamed_trace: bool,
     pub kernel_profile: Profile,
     pub kernel_dump: Option<PathBuf>,
-    pub route_dump: Option<PathBuf>,
-    pub pass_half: bool,
-    pub route_prefetch: bool,
-    pub expert_passes: bool,
     pub keepalive: bool,
     pub scratch_no_zero: bool,
     pub host_rows: bool,
@@ -60,8 +55,6 @@ pub struct Diagnostics {
     pub nan_limit: f32,
     pub prefault: bool,
     pub copy_resident: bool,
-    pub prefetch_k: Option<usize>,
-    pub seat_threads: Option<usize>,
     pub keepalive_iters: Option<u32>,
     pub window_ceiling: Option<u64>,
     pub streamed_groups: Option<u32>,
@@ -74,7 +67,6 @@ pub struct Diagnostics {
 impl Default for Diagnostics {
     fn default() -> Diagnostics {
         Diagnostics {
-            cut_trace: false,
             tier_trace: false,
             rs_trace: false,
             fire_trace: false,
@@ -82,10 +74,6 @@ impl Default for Diagnostics {
             streamed_trace: false,
             kernel_profile: Profile::Off,
             kernel_dump: None,
-            route_dump: None,
-            pass_half: true,
-            route_prefetch: true,
-            expert_passes: true,
             keepalive: true,
             scratch_no_zero: false,
             host_rows: false,
@@ -93,8 +81,6 @@ impl Default for Diagnostics {
             nan_limit: 3.0e38,
             prefault: false,
             copy_resident: true,
-            prefetch_k: None,
-            seat_threads: None,
             keepalive_iters: None,
             window_ceiling: None,
             streamed_groups: None,
@@ -129,12 +115,11 @@ fn number<T: std::str::FromStr>(word: &str, value: &str) -> std::result::Result<
         .map_err(|_| format!("`{word}` takes a number; `{value}` is not one"))
 }
 
-const WORDS: &str = "`cut-trace`, `tier-trace`, `rs-trace`, `fire-trace`, \
+const WORDS: &str = "`tier-trace`, `rs-trace`, `fire-trace`, \
      `region-trace`, `streamed-trace`, `kernel-profile[=1|2]`, \
-     `nan-check`, `nan-limit=<float>`, `kernel-dump=<dir>`, `route-dump=<file>`, `pass-half=off`, \
-     `route-prefetch=off`, `expert-passes=off`, `keepalive=off`, \
-     `scratch-no-zero`, `host-rows`, `prefault`, `copy-resident`, \
-     `prefetch-k=<n>`, `seat-threads=<n>`, `keepalive-iters=<n>`, \
+     `nan-check`, `nan-limit=<float>`, `kernel-dump=<dir>`, \
+     `keepalive=off`, `scratch-no-zero`, `host-rows`, `prefault`, `copy-resident`, \
+     `keepalive-iters=<n>`, \
      `window-ceiling=<bytes>`, `streamed-groups=<n>`, `streamed-repeat=<n>`, \
      `streamed-repeat-kind=<wide|partial|single|reduce|argmax>`, \
      `streamed-limit=<n>`, `streamed-nop=<n>`";
@@ -154,15 +139,11 @@ impl std::str::FromStr for Diagnostics {
                 None => (term, ""),
             };
             match word {
-                "cut-trace" => diag.cut_trace = switch(word, value)?,
                 "tier-trace" => diag.tier_trace = switch(word, value)?,
                 "rs-trace" => diag.rs_trace = switch(word, value)?,
                 "fire-trace" => diag.fire_trace = switch(word, value)?,
                 "region-trace" => diag.region_trace = switch(word, value)?,
                 "streamed-trace" => diag.streamed_trace = switch(word, value)?,
-                "pass-half" => diag.pass_half = switch(word, value)?,
-                "route-prefetch" => diag.route_prefetch = switch(word, value)?,
-                "expert-passes" => diag.expert_passes = switch(word, value)?,
                 "keepalive" => diag.keepalive = switch(word, value)?,
                 "scratch-no-zero" => diag.scratch_no_zero = switch(word, value)?,
                 "host-rows" => diag.host_rows = switch(word, value)?,
@@ -205,22 +186,11 @@ impl std::str::FromStr for Diagnostics {
                         }
                     });
                 }
-                "kernel-dump" | "route-dump" => {
+                "kernel-dump" => {
                     if value.is_empty() {
                         return Err(format!("`{word}` takes a path: `{word}=<path>`"));
                     }
-                    match word {
-                        "kernel-dump" => diag.kernel_dump = Some(PathBuf::from(value)),
-                        _ => diag.route_dump = Some(PathBuf::from(value)),
-                    }
-                }
-                "prefetch-k" => diag.prefetch_k = Some(number(word, value)?),
-                "seat-threads" => {
-                    let threads: usize = number(word, value)?;
-                    if threads == 0 {
-                        return Err("`seat-threads` must be > 0".to_string());
-                    }
-                    diag.seat_threads = Some(threads);
+                    diag.kernel_dump = Some(PathBuf::from(value));
                 }
                 "keepalive-iters" => diag.keepalive_iters = Some(number(word, value)?),
                 "window-ceiling" => {
@@ -295,16 +265,15 @@ mod tests {
     }
 
     fn a_word_list_names_each_knob() {
-        let diag: Diagnostics = "tier-trace, kernel-profile=2 ,pass-half=off,streamed-nop=3"
+        let diag: Diagnostics = "tier-trace, kernel-profile=2 ,keepalive=off,streamed-nop=3"
             .parse()
             .expect("the four words parse");
         assert!(diag.tier_trace);
         assert_eq!(diag.kernel_profile, Profile::Shaped);
         assert!(diag.kernel_profile.shaped());
         assert_eq!(diag.kernel_profile.rows(), 60);
-        assert!(!diag.pass_half);
         assert_eq!(diag.streamed_nop, 3);
-        assert!(diag.keepalive, "an unnamed arm keeps its default");
+        assert!(!diag.keepalive);
     }
 
     fn an_unknown_word_refuses_by_name() {
@@ -317,8 +286,6 @@ mod tests {
     }
 
     fn a_number_that_is_not_one_refuses() {
-        assert!("prefetch-k=many".parse::<Diagnostics>().is_err());
-        assert!("seat-threads=0".parse::<Diagnostics>().is_err());
         assert!("window-ceiling=0".parse::<Diagnostics>().is_err());
     }
 

@@ -3,7 +3,7 @@ use std::pin::pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use crate::error::{Fault, Result};
+use engine_gpu::error::{Fault, Result};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) type Instant = std::time::Instant;

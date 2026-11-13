@@ -1,13 +1,13 @@
 #![allow(unsafe_code)]
+use engine_gpu::{Handles, NIL};
 use kernels_slang::{ArgValue, Encode, Error, Fire, Target};
 
 use crate::device::ctx::Frame;
-use crate::device::handles::NIL;
-use crate::device::{Context, Handles, Pipelines};
-use crate::error::Fault;
+use crate::device::{Api, Context, Pipelines};
+use engine_gpu::error::Fault;
 
-static KERNEL_PROFILE: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static KERNEL_PROFILE: engine_gpu::kernel_profile::KernelProfile =
+    engine_gpu::kernel_profile::KernelProfile::new();
 
 static PROFILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static HOST_ENCODE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -79,27 +79,16 @@ pub fn profiling() -> bool {
 
 #[must_use]
 pub fn kernel_profile() -> Vec<(String, u64, u64)> {
-    let mut rows: Vec<(String, u64, u64)> = KERNEL_PROFILE
-        .lock()
-        .expect("kernel profile lock poisoned")
-        .iter()
-        .map(|(name, &(ns, n))| (name.clone(), ns, n))
-        .collect();
-    rows.sort_by_key(|row| std::cmp::Reverse((row.1, row.2)));
-    rows
+    KERNEL_PROFILE.rows()
 }
 
 #[cfg(feature = "vulkan")]
 pub(crate) fn credit(name: &str, ns: u64) {
-    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
-    table.entry(name.to_string()).or_insert((0, 0)).0 += ns;
+    KERNEL_PROFILE.time(name, ns);
 }
 
 pub fn reset_kernel_profile() {
-    KERNEL_PROFILE
-        .lock()
-        .expect("kernel profile lock poisoned")
-        .clear();
+    KERNEL_PROFILE.clear();
     HOST_ENCODE_NS.store(0, std::sync::atomic::Ordering::Relaxed);
     BARRIERS.store(0, std::sync::atomic::Ordering::Relaxed);
     BETWEEN_NS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -111,8 +100,7 @@ pub fn reset_kernel_profile() {
 
 #[cfg(feature = "vulkan")]
 fn record_kernel(name: &str) {
-    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
-    table.entry(name.to_string()).or_insert((0, 0)).1 += 1;
+    KERNEL_PROFILE.fire(name);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,11 +142,13 @@ pub struct Sink<'a> {
     device: &'a Context,
     frame: &'a Frame,
     pipelines: &'a Pipelines,
-    handles: &'a Handles,
+    handles: &'a Handles<Api>,
 
     scratch: std::cell::RefCell<Scratch>,
 
     comm: Option<&'a crate::comm::Comm>,
+
+    outer: engine_gpu::probe::Recording,
 }
 
 #[cfg(feature = "vulkan")]
@@ -168,9 +158,9 @@ impl<'a> Sink<'a> {
         device: &'a Context,
         frame: &'a Frame,
         pipelines: &'a Pipelines,
-        handles: &'a Handles,
+        handles: &'a Handles<Api>,
     ) -> Sink<'a> {
-        crate::probe::set_frame(frame);
+        let outer = engine_gpu::probe::set_frame(frame);
 
         LAST_FIRE.with(|cell| cell.set(None));
         Sink {
@@ -180,6 +170,7 @@ impl<'a> Sink<'a> {
             handles,
             scratch: std::cell::RefCell::new(Scratch::default()),
             comm: None,
+            outer,
         }
     }
 
@@ -187,11 +178,6 @@ impl<'a> Sink<'a> {
     pub fn with_comm(mut self, comm: &'a crate::comm::Comm) -> Sink<'a> {
         self.comm = Some(comm);
         self
-    }
-
-    #[must_use]
-    pub fn into_frame(self) -> Option<Frame> {
-        None
     }
 
     fn refuse(fire: Fire, fault: Fault) -> Error {
@@ -212,7 +198,7 @@ impl<'a> Sink<'a> {
 #[cfg(feature = "vulkan")]
 impl Drop for Sink<'_> {
     fn drop(&mut self) {
-        crate::probe::clear_frame(self.frame);
+        engine_gpu::probe::restore(self.outer);
     }
 }
 
@@ -348,15 +334,18 @@ impl Sink<'_> {
                             format!("argument {} binds an empty view", infos.len()),
                         ));
                     }
+                    let range = u64::from(self.device.core.limits.max_storage_buffer_range);
+                    let view = storage_view(infos.len(), remaining, binding.extent(), range)
+                        .map_err(|detail| Sink::backend(fire, detail))?;
                     infos.push(
                         vk::DescriptorBufferInfo::default()
-                            .buffer(binding.slab().buffer)
+                            .buffer(binding.buffer().slab().buffer)
                             .offset(binding.offset())
-                            .range(remaining),
+                            .range(view),
                     );
                     writes_at.push(mutable);
                     extents.push(binding.extent());
-                    self.frame.retain(binding.slab());
+                    self.frame.retain(binding.buffer().slab());
                 }
                 ArgValue::I32(v) => push.extend_from_slice(&v.to_le_bytes()),
                 ArgValue::U32(v) => push.extend_from_slice(&v.to_le_bytes()),
@@ -555,7 +544,7 @@ pub struct Sink<'a> {
     _device: &'a Context,
     _frame: &'a Frame,
     _pipelines: &'a Pipelines,
-    _handles: &'a Handles,
+    _handles: &'a Handles<Api>,
 }
 
 #[cfg(not(feature = "vulkan"))]
@@ -565,7 +554,7 @@ impl<'a> Sink<'a> {
         device: &'a Context,
         frame: &'a Frame,
         pipelines: &'a Pipelines,
-        handles: &'a Handles,
+        handles: &'a Handles<Api>,
     ) -> Sink<'a> {
         Sink {
             _device: device,
@@ -573,11 +562,6 @@ impl<'a> Sink<'a> {
             _pipelines: pipelines,
             _handles: handles,
         }
-    }
-
-    #[must_use]
-    pub fn into_frame(self) -> Option<Frame> {
-        None
     }
 }
 
@@ -621,4 +605,25 @@ pub(crate) fn qmm_ladder(
             Qmm::Qmv { vecs } => Rung::Qmv { vecs },
         })
         .collect()
+}
+
+/// The range argument `at` binds: the `remaining` bytes of its slab from its
+/// offset, or, where those run past `maxStorageBufferRange` (a range drivers
+/// answer by binding a truncated view) and the `extent` it states fits, the
+/// largest range the device binds, which holds every byte the kernel reads.
+/// A view whose own extent is past the limit is refused: no descriptor
+/// holds it, so its slab must be split.
+#[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+fn storage_view(at: usize, remaining: u64, extent: u64, limit: u64) -> Result<u64, String> {
+    if remaining <= limit {
+        return Ok(remaining);
+    }
+    if extent <= limit {
+        return Ok(limit);
+    }
+    Err(format!(
+        "argument {at} binds a {extent}-byte view, past this device's \
+         maxStorageBufferRange of {limit} bytes; the slab must be split to fit \
+         the binding"
+    ))
 }

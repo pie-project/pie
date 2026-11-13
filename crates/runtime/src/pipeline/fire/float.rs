@@ -265,8 +265,9 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         None => Vec::new(),
     };
     let plan = fold_one_plan(&rs_ids);
-    let rs_prepared = match reserve(
+    let (rs_prepared, epoch) = match reserve(
         ctx,
+        (model, engine),
         &stores,
         quorum_pipeline_id,
         &[],
@@ -276,13 +277,14 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
     )
     .await
     {
-        Ok(Reserved { rs, .. }) => rs,
+        Ok(Reserved { rs, epoch, .. }) => (rs, epoch),
         Err(error) => return Ok(Err(error)),
     };
     for lane in &mut req.lanes {
         lane.rs_reset = ::engine::RsReset::Held;
     }
     rs_prepared.apply_to(&mut req);
+    super::rs::apply_shared(&mut req, stores.shared.as_ref(), Some(&rs_prepared));
     let rs_copy = rs_prepared.state_copy();
     let rstxn = super::RsTxnsGuard::new(model, engine, rs_prepared.txn);
     let lanes_of = every_lane(&req);
@@ -305,6 +307,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         completion.clone(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         rs_copy,
         frame,
         lora_program,
@@ -316,6 +319,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
     }
+    epoch.retire_on(&completion);
     ticket_reservation.commit();
     advance_shadow(ctx, &fwd)?;
     let mut advanced: Vec<u32> = Vec::new();
@@ -342,7 +346,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
                 .zip(leases)
                 .map(|(ws, lease)| FireWs {
                     ws: ws.id,
-                    kvtxn: None,
+                    kvtxn: super::KvTxnGuard::new(model, engine, None),
                     log: None,
                     lease,
                     fold: None,
@@ -386,7 +390,7 @@ mod tests {
     }
 
     fn a_frame_folds_one_slot_fresh_then_held() {
-        let mut store = RsStore::new(4, 4, 0, 0);
+        let mut store = RsStore::new(4, 4);
         let ws = store.create_working_set(geom());
         let first = fire(&mut store, &[ws]);
         assert_eq!(first.slot_flags, vec![crate::engine::RS_FLAG_RESET]);
@@ -408,7 +412,7 @@ mod tests {
     }
 
     fn a_fork_decodes_on_from_a_copy_of_its_parents_state() {
-        let mut store = RsStore::new(4, 4, 0, 0);
+        let mut store = RsStore::new(4, 4);
         let parent = store.create_working_set(geom());
         fire(&mut store, &[parent]);
         fire(&mut store, &[parent]);

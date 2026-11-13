@@ -11,7 +11,8 @@ mod launch;
 mod posted;
 
 use engine::Engine;
-use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
+use engine::caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
+use engine::chunk::{ChunkFacts, DegenerateBytes};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout};
@@ -114,10 +115,29 @@ impl Engine for Spatial {
             trace,
             checkpoint,
             budgets,
-            residency: _,
+            residency,
             ordinal: _,
             frames_in_flight: _,
         } = request;
+        // The program keeps one sequence's cache and every lane's as host
+        // tokens: there is no device pool to back with a slot file or to
+        // map out to another worker (CONTRACT-BC 22).
+        if let Some(dir) = &residency.disk_kv_dir {
+            return Err(Error::Load(format!(
+                "the spatial engine has no disk kv tier (disk_kv_dir {} is stated)",
+                dir.display()
+            )));
+        }
+        if residency.kv_export {
+            return Err(Error::Load(
+                "the spatial engine exports no kv planes (kv_export is stated)".into(),
+            ));
+        }
+        if residency.host_kv_budget.is_some_and(|bytes| bytes > 0) {
+            tracing::warn!(
+                "the spatial engine states no host kv tier: host_kv_budget is not used"
+            );
+        }
         let Checkpoint::Path(path) = checkpoint else {
             return Err(Error::Load(
                 "the spatial engine loads a checkpoint path".into(),
@@ -171,6 +191,27 @@ impl Engine for Spatial {
         let paging = facts.paging();
         self.kv.page_size = paging.page_size;
         let state_rows = facts.has_state();
+        let pools = PoolFacts {
+            // The pages hold tokens here (the program's cache is replayed from them).
+            kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
+            kv_page_size: paging.page_size,
+            state_slots: if state_rows { paging.slots } else { 0 },
+            // recurrent state replays from tokens: no buffered verbs
+            buffer_pages: 0,
+            state_slot_bytes: facts.state_slot_bytes(),
+            adapter_banks: 0,
+            ..PoolFacts::default()
+        };
+        // Today's pools as pinned chunks, one slot a chunk, device tier only:
+        // a kv page is its tokens on the host (a 32-bit token a position),
+        // never a device span the runtime could place, evict or stream.
+        let chunks = ChunkFacts::degenerate(
+            &pools,
+            &DegenerateBytes {
+                kv_page: u64::from(paging.page_size) * 4,
+                buffer_page: 0,
+            },
+        );
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "cerebras".to_string(),
@@ -183,17 +224,8 @@ impl Engine for Spatial {
                 storage_max_tile_bytes: u64::MAX,
                 codegen_backend: None,
             },
-            pools: PoolFacts {
-                // The pages hold tokens here (the program's cache is replayed from them).
-                kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
-                kv_page_size: paging.page_size,
-                state_slots: if state_rows { paging.slots } else { 0 },
-                // recurrent state replays from tokens: no buffered verbs
-                buffer_pages: 0,
-                state_slot_bytes: facts.state_slot_bytes(),
-                adapter_banks: 0,
-                ..PoolFacts::default()
-            },
+            pools,
+            chunks,
             limits: FireLimits {
                 // The model holds one sequence's cache; a fire's lanes run one
                 // after another, each cache brought back from its tokens.
@@ -212,13 +244,6 @@ impl Engine for Spatial {
             // One sequence a cache runs causal attention only: no mask port.
             ports: PortMask::DEVICE_GEOMETRY,
             geometry: GeometryClass::DeviceGeometry,
-            kv_copy: KvCopyDomains {
-                // Pages are tokens here: a copy copies them.
-                device_to_device: true,
-                device_to_host: false,
-                host_to_device: false,
-                host_to_host: false,
-            },
             kv_handle: None,
             media_encode: false,
             device_channel_commit: true,
@@ -251,9 +276,44 @@ impl Engine for Spatial {
     /// Recurrent states replay from their tokens (the program holds one
     /// sequence's): a copy is not a device move here.
     fn copy_state(&mut self, copy: &engine::transfer::StateCopy) -> EngineResult<()> {
-        copy.device_only("cerebras-spatial")?;
+        let _ = copy;
         Err(Error::Unsupported {
             verb: "`copy_state` on the wafer program (its state replays from tokens)",
+            engine: "cerebras-spatial",
+        })
+    }
+
+    /// The load states its pools pinned (`ChunkFacts::degenerate`), so the
+    /// runtime moves its kv through `copy_kv`; there is no shared pool and
+    /// no host or disk tier to move slots between.
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        let _ = copy;
+        Err(Error::Unsupported {
+            verb: "`copy_slots` on the wafer program (its pools are pinned, device tier only: \
+                   kv moves through `copy_kv`)",
+            engine: "cerebras-spatial",
+        })
+    }
+
+    fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> EngineResult<Vec<u8>> {
+        let _ = slots;
+        Err(Error::Unsupported {
+            verb: "`read_tier_slots` on the wafer program (it states no host tier)",
+            engine: "cerebras-spatial",
+        })
+    }
+
+    fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        let _ = (slots, bytes);
+        Err(Error::Unsupported {
+            verb: "`write_tier_slots` on the wafer program (it states no host tier)",
             engine: "cerebras-spatial",
         })
     }

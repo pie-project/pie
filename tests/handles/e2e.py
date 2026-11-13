@@ -2,14 +2,19 @@
 """Handles on a real engine: resume, fork, eviction, quota, every SDK.
 
     PIE_HOME=/tmp/pie-test python3 tests/handles/e2e.py --log /tmp/e.log \\
-        --ctx 512 --slots 12 --kv-budget 216MiB
+        --ctx 512 --kv-budget 176MiB
 
 Build first: `pie` for the engine, `working-set-handles` for wasm32-wasip3 in
 examples/, and `--example handles` of pie-client for t_clients. A token here is drawn by position, so a turn split across
-processes must draw exactly what one process does. `--slots 4` with
-`--kv-budget 116MiB --only t_quota,t_close` reaches the host's limit. A policy
-gets its own runs: `--policy keep-handles --only t_keep --ctx 512 --slots 12
---kv-budget 216MiB`, and `--only t_weak --ctx 512 --slots 4 --kv-budget 116MiB`.
+processes must draw exactly what one process does. A working set on the device
+takes its kv pages, an rs list slot and its fixed record from one pool: on
+Qwen3.5-0.8B 176MiB holds 9 or so of t_evict's 470-token sets, short of its 11.
+A policy gets its own runs: `--policy keep-handles --only t_keep --ctx 512
+--kv-budget 136MiB` (8 or so 300-token sets), and `--policy keep-handles --only
+t_weak --ctx 512 --kv-budget 116MiB`. The host's limit (t_quota, t_close,
+t_weak's discard) is the host tier, which `--kv-budget` does not reach:
+`--host-budget 60MiB --only t_quota,t_close --ctx 512 --kv-budget 116MiB` sets
+host_kv_budget so the sets at rest fill it.
 """
 import argparse, asyncio, json, os, re, signal, socket, subprocess, sys, time, traceback
 from pathlib import Path
@@ -23,9 +28,10 @@ HOME = Path(os.environ["PIE_HOME"])  # a home of its own: `pie config init`, the
 EX = ROOT / "examples/target/wasm32-wasip3/release"
 a = argparse.ArgumentParser()
 a.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
-a.add_argument("--ctx", type=int, default=0); a.add_argument("--slots", type=int, default=0)
+a.add_argument("--ctx", type=int, default=0)
 a.add_argument("--kv-budget", default=""); a.add_argument("--log", required=True)
 a.add_argument("--only", default=""); a.add_argument("--policy", default="")
+a.add_argument("--host-budget", default="")
 args = a.parse_args()
 PROMPT = list(range(1000, 1060))
 results = []
@@ -126,6 +132,11 @@ async def t_evict(c, prog, whole):
     for h in hogs + [w, fk2, pair]: await h.close()
 
 async def t_quota(c, prog, whole):
+    # Past the host tier (--host-budget) the host is short: with no worker
+    # policy listening, the default responder lets sets at rest go, the one
+    # keyed lowest first, so no launch starves and none waits. (A policy
+    # that keeps them all instead has a launch fail at the seat deadline
+    # with a "quota:" error naming host_kv_budget.)
     hs, refused = [], None
     for i in range(24):
         h = await c.working_set()
@@ -133,13 +144,19 @@ async def t_quota(c, prog, whole):
             await run(c, prog, h, PROMPT, 2); hs.append(h)
         except Exception as e:
             refused = str(e); await h.close(); break
-    check("past the host a launch is refused, not starved", refused and "quota" in refused, f"{len(hs)} rest; {refused and refused[:90]}")
-    x = await run(c, prog, hs[0], [999], 2, drawn=50)
+    gone, live = [], []
+    for h in hs:
+        try: await h.stat(); live.append(h)
+        except HandleError as e: gone.append(e)
+    check("past the host no launch starves", refused is None, f"{len(hs)} rest; {refused and refused[:120]}")
+    if args.host_budget:  # past what the host tier holds only where it is small
+        check("the default responder lets sets at rest go, by name", gone and all(e.code == "dead" and "default responder" in str(e) for e in gone), f"{len(gone)}/{len(hs)} {gone[:1]}")
+    x = await run(c, prog, live[0], [999], 2, drawn=50)
     check("what rests still runs", len(x) == 2)
-    await hs[0].close()
+    await live[0].close()
     y = await c.working_set(); z = await run(c, prog, y, PROMPT, 32)
     check("and closing one makes room", z == whole)
-    for h in hs[1:] + [y]: await h.close()
+    for h in live[1:] + [y]: await h.close()
 
 async def t_keep(c, prog, whole):
     N = 300
@@ -376,9 +393,9 @@ async def main():
     t = re.sub(r'^source = "[^"]*"', f'source = "{args.model}"', t, flags=re.M)
     t = re.sub(r'^listen = "[^"]*"', f'listen = "127.0.0.1:{port}"', t, flags=re.M)
     if args.kv_budget: t = t.replace('# device_kv_budget     = "20GiB"', f'device_kv_budget = "{args.kv_budget}"')
+    if args.host_budget: t = t.replace('# host_kv_budget       = "32GiB"', f'host_kv_budget = "{args.host_budget}"')
     if args.policy: t = t.replace('# worker_policy            = "noop"', f'worker_policy = "{args.policy}"')
     if args.ctx: t = t.replace("# max_model_len   = 32768", f"max_model_len = {args.ctx}\n#")
-    if args.slots: t = t.replace("# max_state_slots = 256", f"max_state_slots = {args.slots}\n#")
     cfg.write_text(t)
     log = open(args.log, "w")
     srv = subprocess.Popen([str(PIE), "--config", str(cfg), "serve"], stdout=log, stderr=subprocess.STDOUT,

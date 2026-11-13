@@ -88,8 +88,18 @@ fn grouped(tuning: Tuning, ([ex, tokens, top, n, k], bits, group, by_token, dtyp
     let mut y = t(b.up(&vec![0x7c01u16; count * n]), count, n, dtype);
     let ctx = b.ctx().with_tuning(tuning);
     let seat = GroupSeat::RESIDENT;
-    moe::matmul_select_quant(&ctx, x, codes, scales, Some(biases), r, &mut y, seat)
-        .unwrap_or_else(|why| panic!("{what}: the grouped select declined: {why}"));
+    moe::matmul_select_quant(
+        &ctx,
+        x,
+        codes,
+        scales,
+        Some(biases),
+        r,
+        &mut y,
+        seat,
+        moe::ExpertTable::RESIDENT,
+    )
+    .unwrap_or_else(|why| panic!("{what}: the grouped select declined: {why}"));
     b.sync();
     let got: Vec<u16> = b.down(y.ptr, count * n);
     let row = |r: usize| r / div;
@@ -168,4 +178,7 @@ fn the_grouped_affine_select_lands_its_walk_off_the_wmma_arm() {
         }
         grouped(no_wmma, case);
     }
+    // Bf16 rows of 2-bit codes in groups of 32, the WMMA arm on: a group
+    // holds no whole quad of code words, so the CUDA-core kernel takes it.
+    grouped(grouped_from_one, ([8, 12, 2, 128, 256], 2, 32, true, Bf16));
 }

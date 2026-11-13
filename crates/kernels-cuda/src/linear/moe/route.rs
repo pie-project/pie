@@ -596,6 +596,37 @@ pub fn hash_route(
     )
 }
 
+/// Adds each expert's routes of this fire to its u32 of `hits`: the weight
+/// cache's use record for a bank whose selects count none themselves (the
+/// packed banks').
+#[cfg(feature = "cuda")]
+pub fn note_routes(
+    ctx: &Ctx,
+    op: &'static str,
+    routes: Tensor,
+    experts: u32,
+    hits: u64,
+) -> Result<(), Error> {
+    const TALLY_ROUTES: u32 = 2048;
+    let count = routes.rows.checked_mul(routes.width).unwrap_or(0);
+    if hits == 0 || count == 0 || experts == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        op,
+        Fire::at(kernel(ROUTE, "::pie::linear::route_count_tally"))
+            .apply(Launch::flat(count.div_ceil(TALLY_ROUTES) * BLOCK, BLOCK).smem(8 * experts)),
+        &[
+            routes.arg(),
+            stated(op, count)?.arg(),
+            stated(op, routes.width)?.arg(),
+            ctx.stage(),
+            stated(op, experts)?.arg(),
+            ArgValue::Ptr(hits),
+        ],
+    )
+}
+
 pub fn group_routes(ctx: &Ctx, groups: u32, routes: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "linear.group_routes";
     debug_assert_eq!(routes.dtype, Dtype::I32, "`{OP}` lands i32 routes");

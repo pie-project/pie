@@ -1,18 +1,29 @@
 #include "prim/pair.slang"
 #include "prim/params.slang"
+#if defined(PIE_TABLED)
+#include "prim/experts.slang"
+#endif
 
 // Mixture-of-experts combines on bf16, a pair of elements a lane over the
 // token rectangle, an odd tail half there. `PIE_WEIGHTED`: each row the
 // route-weighted sum of its `top_k` routed rows. `PIE_BIAS`: each row plus
 // its routes' weighted expert biases (a route below 0 adds none).
 // `PIE_SHARED`: the routed row plus the shared expert's, gated by the
-// sigmoid of the row's gate.
+// sigmoid of the row's gate. `PIE_TABLED` (with `PIE_BIAS`): the bias bank
+// is read through the weight cache's expert table (`prim/experts.slang`),
+// each expert's row `origin` words into its slot.
 
 [[vk::binding(0)]] StructuredBuffer<uint> a;
 #if defined(PIE_WEIGHTED)
 [[vk::binding(1)]] StructuredBuffer<float> expert_weights;
 [[vk::binding(2)]] RWStructuredBuffer<uint> y;
 #define PIE_PARAMS_AT 3
+#elif defined(PIE_BIAS) && defined(PIE_TABLED)
+[[vk::binding(1)]] StructuredBuffer<int> expert_ids;
+[[vk::binding(2)]] StructuredBuffer<float> expert_weights;
+[[vk::binding(3)]] RWStructuredBuffer<uint> y;
+PIE_EXPERT_TABLE(4)
+#define PIE_PARAMS_AT 12
 #elif defined(PIE_BIAS)
 [[vk::binding(1)]] StructuredBuffer<uint> bias;
 [[vk::binding(2)]] StructuredBuffer<int> expert_ids;
@@ -33,6 +44,13 @@ struct Params {
     int rows;
 #if !defined(PIE_SHARED)
     int experts_per_token;
+#endif
+#if defined(PIE_TABLED)
+    uint seg_words;
+    uint unit_words;
+    uint atom_words;
+    uint atom_first;
+    uint origin;
 #endif
 };
 PIE_PARAMS(PIE_PARAMS_AT, Params, params);
@@ -58,7 +76,13 @@ float combined(uint i) {
     for (uint e = 0u; e < top_k; e++) {
         int expert = expert_ids[base + e];
         if (expert >= 0) {
+#if defined(PIE_TABLED)
+            pie_xt_at(uint(expert), params.atom_first, params.seg_words, params.unit_words,
+                      params.atom_words);
+            acc += expert_weights[base + e] * pie_xt_bf16(params.origin, c);
+#else
             acc += expert_weights[base + e] * bf16_at(bias, uint(expert) * width + c);
+#endif
         }
     }
 #endif
@@ -81,3 +105,4 @@ void main(uint3 gid : SV_DispatchThreadID) {
 // pie:instantiate linear_moe_combine_weighted_sum_bf16 PIE_WEIGHTED=1 PIE_GROUP_X=256
 // pie:instantiate linear_moe_combine_bias_sum_bf16 PIE_BIAS=1 PIE_GROUP_X=256
 // pie:instantiate linear_moe_combine_sigmoid_gate_add_bf16 PIE_SHARED=1 PIE_GROUP_X=256
+// pie:instantiate linear_moe_combine_bias_sum_tabled_bf16 PIE_BIAS=1 PIE_TABLED=1 PIE_GROUP_X=256

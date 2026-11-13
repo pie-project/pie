@@ -58,13 +58,6 @@ pub(super) fn canonical_fp8(
         if trace.params[scales].dtype != Dtype::F32 {
             continue;
         }
-        if tier.is_some_and(|tier| tier.handles(at).is_some() || tier.group_handles(at).is_some()) {
-            return Err(Fault::Param {
-                name: param.name.clone(),
-                why: "is an fp8 bank the expert tier seats from host memory; the FP8 matrix core \
-                      reads its codes reordered and made canonical on the device, so it must be resident",
-            });
-        }
         let (Some(&k), true) = (param.shape.last(), param.shape.len() >= 2) else {
             continue;
         };
@@ -175,7 +168,7 @@ pub(super) fn group_row_factors(
 /// exponents a 32x32 (128x128) block, held on the device, that only W8A8
 /// products of bf16 rows under e4m3 a 1x32 (1x128) block read; with their
 /// exponents and block side.
-fn fp8b_planes(trace: &Trace, tier: Option<&crate::experts::Tier>) -> Vec<(usize, usize, u64)> {
+fn fp8b_planes(trace: &Trace) -> Vec<(usize, usize, u64)> {
     use poem_ir::{ActQuant, Def, Linear, Operands, Operation, Ty};
     let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|decl| &decl.def)
     {
@@ -232,13 +225,7 @@ fn fp8b_planes(trace: &Trace, tier: Option<&crate::experts::Tier>) -> Vec<(usize
         }
     }
     (0..trace.params.len())
-        .filter(|&at| {
-            products[at] > 0
-                && products[at] == reads[at]
-                && !tier.is_some_and(|tier| {
-                    tier.handles(at).is_some() || tier.group_handles(at).is_some()
-                })
-        })
+        .filter(|&at| products[at] > 0 && products[at] == reads[at])
         .map(|at| (at, exps_of[at].0, exps_of[at].1))
         .collect()
 }
@@ -257,7 +244,7 @@ pub(super) fn order_fp8b_planes(
     held: &mut Vec<Buffer>,
     stream: *mut core::ffi::c_void,
 ) -> Result<()> {
-    let found = fp8b_planes(trace, tier);
+    let found = fp8b_planes(trace);
     let Some(widest) = found
         .iter()
         .map(|&(at, _, _)| trace.params[at].shape.iter().product::<u64>())
@@ -426,11 +413,9 @@ fn lane_banks(
                 && selects[at] > 0
                 && selects[at] == reads[at]
                 && !tier.is_some_and(|tier| {
-                    [at, pairing.scales].iter().any(|&p| {
-                        tier.handles(p).is_some()
-                            || tier.group_handles(p).is_some()
-                            || tier.offloaded_at(p).is_some()
-                    })
+                    [at, pairing.scales]
+                        .iter()
+                        .any(|&p| tier.offloaded_at(p).is_some())
                 }))
             .then_some((at, pairing.scales))
         })

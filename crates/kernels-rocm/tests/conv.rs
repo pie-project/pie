@@ -10,14 +10,14 @@ mod common;
 #[path = "common/spatial.rs"]
 mod spatial;
 
-use common::{Gpu, bf16, bf16s, values};
+use common::{Gpu, STATE, bf16, bf16s, values};
 use dtype::Dtype;
-use kernels_rocm::Tensor;
 use kernels_rocm::conv::{
     Conv3d, ConvPath, TimePad, avg_down, cache_gather, cache_store, conv_weight_taps_major,
     conv3d_on, patchify, pixel_shuffle, pixel_unshuffle, unpatchify, upsample_nearest,
 };
 use kernels_rocm::elemwise::posenc::{GridRule, derive_grid};
+use kernels_rocm::{RecurrentPool, Tensor};
 use spatial::{
     Box3, avg_down_ref, conv3d_ref, near, out_boxes, pixel_shuffle_ref, pixel_unshuffle_ref, table,
     upsample_ref,
@@ -508,7 +508,13 @@ fn the_frame_cache_gathers_and_stores_each_lanes_window() {
     let ids = gpu.ints(&slots);
     let ctx = gpu.ctx();
     let mut cache = gpu.zeros(cache_rows as u32, c as u32, Dtype::Bf16);
-    cache_gather(&ctx, slab, ids, g, frames as u32, &mut cache).expect("the gather fires");
+    let pool = |slab: Tensor| RecurrentPool {
+        slab,
+        slot_ids: ids,
+        slot_stride_elems: stride as i64,
+        ..STATE
+    };
+    cache_gather(&ctx, &pool(slab), ids, g, frames as u32, &mut cache).expect("the gather fires");
     let mut want_cache = Vec::new();
     for (b, &slot) in boxes.iter().zip(&slots) {
         let n = frames * b.plane() * c;
@@ -519,15 +525,15 @@ fn the_frame_cache_gathers_and_stores_each_lanes_window() {
     assert_eq!(got_cache, want_cache, "each lane's slot, lane after lane");
 
     let x = bf16s(rows * c, 0x5707, 1.0);
-    let mut out = gpu.tensor(&slab_vals, 3, stride as u32, Dtype::Bf16);
+    let out = gpu.tensor(&slab_vals, 3, stride as u32, Dtype::Bf16);
     cache_store(
         &ctx,
         gpu.tensor(&x, rows as u32, c as u32, Dtype::Bf16),
         cache,
+        &pool(out),
         ids,
         g,
         frames as u32,
-        &mut out,
         0,
     )
     .expect("the store fires");

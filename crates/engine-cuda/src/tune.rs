@@ -37,17 +37,9 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
         checkpoint::plan::StorageTarget::for_backend(checkpoint::types::BackendKind::Cuda, 0, 1);
     let prospect =
         crate::weights::prospect(&trace, &contract, artifact, target).map_err(|e| e.to_string())?;
-    let residency = crate::experts::Plan::cut(
-        &prospect.ranking,
-        crate::experts::Budgets {
-            device: None,
-            host: None,
-        },
-    )
-    .map_err(|e| e.to_string())?;
+    let residency = crate::experts::Plan::cut(&prospect.ranking);
     let mut shell = crate::Shell::load(crate::Boot {
         voxels: None,
-        deferred_tier: false,
         trace: trace.clone(),
         contract: &contract,
         checkpoint: artifact,

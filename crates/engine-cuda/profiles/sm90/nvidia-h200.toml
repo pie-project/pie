@@ -60,7 +60,6 @@ working_set_percent = 70
 forward_tokens = 16384
 # two recurrent-state slots a lane, so a hybrid trunk seats past the fixed 256, as on the RTX PRO 6000:
 # Qwen3.8-Flash-Next mini c512 54.4k -> 65.8k tok/s, single-stream greedy tokens unchanged
-state_slots_per_lane = 2
 # a Gemma-4 process starts only while the pools hold the started ones to the end, a decoding lane's pages
 # before a waiting prompt's, the windowed ring a page a lane past its kv pages, as on the RTX PRO 6000:
 # gemma-4-26b-a4b c1024 10.7k -> 12.7k tok/s, single-request decode 264 -> 279 tok/s
@@ -162,7 +161,6 @@ measured = [
   "engine.graphs",
   "engine.host_planes",
   "engine.lattice_steps",
-  "engine.one_frame_when_short",
   "engine.prefill_lattice_from",
   "engine.prefill_lattice_steps",
   "engine.recording",

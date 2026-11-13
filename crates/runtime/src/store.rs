@@ -1,10 +1,13 @@
-pub mod extent;
+pub mod chunks;
 pub(crate) mod genmap;
 pub(crate) mod kv;
 pub(crate) mod pool;
 pub(crate) mod registry;
 pub(crate) mod rs;
-pub(crate) mod seat;
+pub mod segments;
+pub mod shared;
+pub mod slots;
+pub mod weights;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PipelineScopeId(u128);
@@ -131,7 +134,7 @@ pub fn kv_tokens() -> (u64, u64) {
             let cached: u64 = kv.cached_working_sets().iter().map(|set| set.pages).sum();
             (
                 u64::from(kv.capacity_pages()),
-                u64::from(kv.capacity_pages() - kv.pages_out()),
+                u64::from(kv.capacity_pages().saturating_sub(kv.pages_out())),
                 cached,
             )
         });
@@ -151,7 +154,7 @@ pub fn kv_census() -> (usize, usize, usize, usize) {
     };
     registry::with_kv_lock(&stores.kv, "other", |kv| {
         let total = kv.capacity_pages() as usize;
-        let free = (kv.capacity_pages() - kv.pages_out()) as usize;
+        let free = (kv.capacity_pages().saturating_sub(kv.pages_out())) as usize;
         let idle = kv.reclaimable_cache_pages() as usize;
         (
             free,

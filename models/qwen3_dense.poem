@@ -98,6 +98,8 @@ def layout(id, deploy):
     d = DIMS[id]
     dense = compute(w)
     hidden, hd = d.hidden, d.head_dim
+    # A layer's keys and values, two planes of its kv heads a token.
+    kv = lambda: state([tokens, 2, d.kv_heads, hd], deploy.kv)
 
     def layer(l):
         lora_a, lora_b = banks(hidden)
@@ -113,7 +115,7 @@ def layout(id, deploy):
             gate = weight([d.inter, hidden], proj),
             up = weight([d.inter, hidden], proj),
             down = weight([hidden, d.inter], proj),
-            kv = "kv.{}".format(l),
+            kv = kv(),
             lora_a = lora_a,
             lora_b = lora_b,
         )
@@ -140,7 +142,7 @@ def layout(id, deploy):
             down = weight([hidden, d.inter], w),
             norm = weight([hidden]),
             head = weight([d.vocab, hidden]),
-            kv = "kv.mtp",
+            kv = kv(),
         )
 
     return struct(
@@ -156,12 +158,14 @@ def layout(id, deploy):
         # over 32768 tokens).
         rope = yarn(deploy, 32768),
         sm_scale = f32(1.0 / f32(sqrt(hd))),
-        kv = deploy.kv,
         embed = weight([d.vocab, hidden]),
         head = None if d.tied else weight([d.vocab, hidden]),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
         mtp = mtp,
+        # A deployment drafting by itself keeps the rows a draft layer's
+        # keys and values would take.
+        draft_kv = kv() if mtp == None else None,
     )
 
 # How a Qwen 3 (dense) checkpoint is read: transformers' safetensors, under
@@ -236,16 +240,6 @@ TRANSFORMERS = [
 # A row with an adapter adds its LoRA correction to the attention's output.
 # A deployment stretched by YaRN turns its rotation at the scaled frequencies.
 
-def caches(m, c):
-    kv = c.kv_space(m.kv)
-    plane = m.kv_heads * m.head_dim
-    for w in m.layers:
-        c.kv(kv, w.kv, [plane, plane], m.head_dim, heads = True)
-    if m.mtp != None:
-        c.kv(kv, m.mtp.kv, [plane, plane], m.head_dim, heads = True)
-    else:
-        c.kv(kv, "kv.draft", [plane, plane], m.head_dim, heads = True)
-
 def tap(mtp, layer, y, fused):
     if mtp == None or layer not in mtp.taps:
         return fused
@@ -290,9 +284,6 @@ def draft(m, inputs, fused, logits, scaling):
     plan_mtp = ops.attn.plan_prefill(input_mtp, m.q_heads, m.kv_heads, m.head_dim, None)
     dpos = inputs.positions().on(fact.drafts())
     dlogits = logits.on(fact.drafts())
-    pages = inputs.kv(mtp.kv)
-    write_page = inputs.write_page(mtp.kv)
-    write_offset = inputs.write_offset(mtp.kv)
 
     token = ops.sampling.argmax([dlogits])
     e = ops.gather.embed(token, mtp.embed, m.vocab)
@@ -302,8 +293,8 @@ def draft(m, inputs, fused, logits, scaling):
     k = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.k_embed), ops.linear.matmul(h, mtp.k_hidden))
     v = ops.elemwise.residual_add(ops.linear.matmul(e, mtp.v_embed), ops.linear.matmul(h, mtp.v_hidden))
     q, k = ops.elemwise.rope(q, dpos, m.head_dim, m.theta, rotary.full(), k = k, scaling = scaling)
-    ops.attn.kv_append(k, v, pages, write_page, write_offset)
-    o = ops.attn.prefill(q, plan_mtp, pages, None, m.head_dim, m.kv_heads, m.sm_scale)
+    ops.attn.kv_append(k, v, mtp.kv)
+    o = ops.attn.prefill(q, plan_mtp, mtp.kv, None, m.head_dim, m.kv_heads, m.sm_scale)
     r1 = ops.elemwise.residual_add(ops.linear.matmul(o, mtp.o), fused)
     mlp_in = ops.elemwise.rmsnorm(r1, mtp.mlp_norm, m.eps)
     r2 = ops.elemwise.residual_add(swiglu(mlp_in, mtp), r1)

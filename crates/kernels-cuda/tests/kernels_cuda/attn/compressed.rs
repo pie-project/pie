@@ -8,6 +8,7 @@
 use crate::common::attn_ref::{Quant, YARN, attend, col, landed, near, owners, picks, pool};
 use crate::common::attn_ref::{quantized, ten, tuned, turn};
 use crate::common::host::rows_read;
+use crate::common::spread::agrees;
 use crate::common::{Gpu, Lcg, captured, forget, host::upload_to, replay};
 use dtype::Dtype::{Bf16, F32, I32, U8, U32};
 use kernels_cuda::attn::compressed::decode::{self, Pooled, Rows, Turn};
@@ -164,6 +165,24 @@ fn check(
         fired.expect("the attention fires");
         let what = format!("{pass:?}, {n} rows, {ratio} {top_k}, {fmts:?}, {floored}, {turned:?}");
         landed(&gpu, o_at, &want, 4e-2, 0.05, &what);
+        // The decode over both pools' pages spread apart, byte for byte.
+        if let Pass::Decode = pass {
+            let both = if ratio > 0 { vec![win, ent] } else { vec![win] };
+            let outs = [(o_at, n * H * D * 2)];
+            agrees(&mut gpu, &what, &both, &[], &outs, |_, p, _| {
+                let pooled = (ratio > 0).then(|| Pooled {
+                    entries: &p[1],
+                    ratio,
+                    selection,
+                });
+                let o = &mut ten(o_at, n, H * D, Bf16);
+                decode::decode(
+                    &ctx, qt, pos_t, req_t, floor_t, &p[0], 128, pooled, sink_t, 64, 512, s,
+                    turned, o,
+                )
+                .expect("the attention fires");
+            });
+        }
         for (i, head) in want.chunks_mut(D).enumerate() {
             turn(head, pos[i / H], 64, true, true, yarn);
         }
@@ -324,6 +343,20 @@ fn the_pool_attention_answers_the_reference() {
         let lse_got: Vec<f32> = gpu.down(lse_at, n * heads);
         let close = |(g, w): (&f32, &f32)| g == w || (g - w).abs() <= 2e-2 * w.abs().max(1.0);
         assert!(lse_got.iter().zip(&want_lse).all(close), "{what}: lse");
+        // The same over the pool's pages spread apart, byte for byte.
+        let picked = (top_k > 0).then(|| ten(gpu.up(&sel), n, top_k, I32));
+        let outs = [(o_at, n * heads * d * 2), (lse_at, n * heads * 4)];
+        agrees(&mut gpu, &what, &[ent], &[], &outs, |_, p, _| {
+            let o = &mut ten(o_at, n, heads * d, Bf16);
+            let lse = &mut ten(lse_at, n, heads, F32);
+            match picked {
+                Some(sel_t) => pools::attention_lse_selected(
+                    &ctx, qt, pos_t, req_t, sel_t, &p[0], ratio, k, h, w, s, o, lse,
+                ),
+                None => pools::attention_lse(&ctx, qt, pos_t, req_t, &p[0], ratio, h, w, s, o, lse),
+            }
+            .expect("the pool attention fires");
+        });
         if !mma {
             continue;
         }
@@ -405,7 +438,7 @@ fn a_padded_lane_closes_no_pool_entry() {
         let ctx = gpu.ctx().with_tuning(tuned(|t| t.rows_vec = vec));
         ctx.arm_stage(win_at);
         let out = &mut ten(out_at, 3, 64, Bf16);
-        let fired = pools::gather(&ctx, bpos, breq, &state, 64, 4, kv, score, absent, out);
+        let fired = pools::gather(&ctx, bpos, breq, &state, 64, 4, kv, score, 0, absent, out);
         fired.expect("the gather fires");
         gpu.sync();
         let out: Vec<u16> = gpu.down(out_at, 3 * 64);

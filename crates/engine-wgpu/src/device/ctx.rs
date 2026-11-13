@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::api::DeviceBoot;
 use crate::encode::Mark;
-use crate::error::{Fault, Result};
+use engine_gpu::error::{Fault, Result};
 
 use super::alloc::{Memory, Raw, Slab};
 use super::host::{self, Signal};
@@ -483,7 +483,11 @@ impl Context {
             mappable_primary: features.contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
             pipeline_cache: features.contains(wgpu::Features::PIPELINE_CACHE),
         };
-        let max_buffer = limits.max_buffer_size;
+        // A slab is bound whole, so no larger than one storage binding takes:
+        // past it a fire refuses the view rather than reading a cut slab.
+        let max_buffer = limits
+            .max_buffer_size
+            .min(limits.max_storage_buffer_binding_size);
         let subgroup_min = enabled.subgroups.then_some(info.subgroup_min_size);
         let poller = host::Poller::start(device.clone());
         let core = Arc::new(Core {
@@ -574,15 +578,6 @@ impl Context {
             cores: self.core.cores,
             f16: self.core.enabled.f16,
         }
-    }
-
-    /// Invocations and workgroup memory bytes.
-    #[must_use]
-    pub fn workgroup_limits(&self) -> (u32, u32) {
-        (
-            self.core.limits.max_compute_invocations_per_workgroup,
-            self.core.limits.max_compute_workgroup_storage_size,
-        )
     }
 
     #[must_use]
@@ -765,6 +760,14 @@ impl Frame {
         (ring.chunks.last().expect("non-empty").clone(), at)
     }
 
+    /// Writes `bytes` into `into` from `at` in queue order: the queue lands
+    /// the write after every frame submitted before and before this one
+    /// (WebGPU's queue timeline), so no fire in flight reads it changed and
+    /// no kernel of this frame reads it unwritten.
+    pub(crate) fn update(&self, into: &super::Buffer, at: u64, bytes: &[u8]) -> Result<()> {
+        into.write_shared(at, bytes)
+    }
+
     pub fn copy(
         &mut self,
         source: &super::Buffer,
@@ -813,6 +816,13 @@ impl Frame {
     #[must_use]
     pub fn dispatches(&self) -> u64 {
         self.dispatches.get()
+    }
+
+    /// [`Frame::flush`]: the queue orders a write after every submission
+    /// before it (WebGPU's queue timeline), so landing this frame settles
+    /// what the host writes next through the queue.
+    pub fn flush_settled(&self) -> Result<()> {
+        self.flush()
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -944,7 +954,7 @@ impl Frame {
     }
 }
 
-pub type OnDone = Box<dyn FnOnce(Option<String>) + Send + 'static>;
+pub use engine_gpu::backend::OnDone;
 
 impl Drop for Frame {
     fn drop(&mut self) {

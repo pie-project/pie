@@ -124,6 +124,12 @@ impl ResidencyPlanner {
         }
         let (_, kv_total) = self.port.device_stats();
         if demand.kv_pages > kv_total {
+            if let Some(room) = self.port.room() {
+                return Err(PlannerError::PastPool {
+                    need: demand.kv_pages,
+                    room,
+                });
+            }
             return Err(PlannerError::Impossible {
                 need: demand.kv_pages,
                 total: kv_total,
@@ -139,9 +145,10 @@ impl ResidencyPlanner {
                 };
                 return Err(PlannerError::Impossible { need, total });
             }
-            // A cache entry never makes live work wait: short of state, a
-            // resident process quotes again once the idle cache is dropped,
-            // or else the snapshots sharing its own state, instead of parking.
+            // Short of state, a resident process quotes again once the idle
+            // cache its keys let go is dropped, or else the snapshots sharing
+            // its own state that may go, instead of parking. What a policy
+            // keeps stays: the waiter parks and asks for room.
             let resident = self.with_inner(|inner| {
                 inner.procs.get(&pid).is_some_and(|proc| {
                     proc.state == Residency::Resident && !inner.killing.contains(&pid)
@@ -153,7 +160,7 @@ impl ResidencyPlanner {
                     self.pages_freed();
                     return Ok(Acquired::Requote);
                 }
-                if self.yield_own_checkpoints(pid) {
+                if self.reclaim_own_sharing(pid) {
                     self.pages_freed();
                     return Ok(Acquired::Requote);
                 }
@@ -201,21 +208,40 @@ impl ResidencyPlanner {
                     tokio::pin!(notified);
                     notified.as_mut().enable();
                     let acquired = match self.collect_outcome(key) {
+                        // Short of room only the policy can make, it says so
+                        // again while it waits (the gauge keeps a band only
+                        // while it is told), up to the seat deadline.
                         Collect::Wait => {
-                            notified.await;
-                            continue;
+                            let again = crate::policy::pressure::AGAIN;
+                            if crate::rt::time::timeout(again, notified).await.is_ok() {
+                                continue;
+                            }
+                            self.report_short();
+                            self.note_lapsed_fires();
+                            let Some(error) = self.short_expired(key) else {
+                                continue;
+                            };
+                            match self.collect_outcome(key) {
+                                Collect::Wait => {
+                                    tracing::warn!(%pid, %error, "planner: a short waiter gives up");
+                                    // The registration's drop takes it off the queue.
+                                    Err(error)
+                                }
+                                Collect::Ready(outcome) => outcome.map(Acquired::Granted),
+                                Collect::Yield => Ok(Acquired::Yield),
+                                Collect::Requote => Ok(Acquired::Requote),
+                            }
                         }
                         Collect::Ready(outcome) => {
                             ptrace!("collect key={:?} ok={}", key, outcome.is_ok());
-                            if matches!(outcome, Err(PlannerError::Cancelled)) {
-                                self.stats.cancelled_waits.fetch_add(1, Ordering::Relaxed);
-                            }
                             outcome.map(Acquired::Granted)
                         }
                         Collect::Yield => Ok(Acquired::Yield),
                         Collect::Requote => Ok(Acquired::Requote),
                     };
-                    registration.disarm();
+                    if !matches!(acquired, Err(PlannerError::Short { .. })) {
+                        registration.disarm();
+                    }
                     self.poke();
                     return acquired;
                 }
@@ -236,7 +262,14 @@ impl ResidencyPlanner {
         if settled() {
             return;
         }
-        notified.await;
+        // A restore short of room the policy must make says so again while
+        // it waits, as a parked allocation does.
+        if crate::rt::time::timeout(crate::policy::pressure::AGAIN, notified)
+            .await
+            .is_err()
+        {
+            self.report_short();
+        }
     }
 
     fn collect_outcome(&self, key: EntryKey) -> Collect {
@@ -306,7 +339,7 @@ impl ResidencyPlanner {
             .map(|proc| proc.resident.clone())
     }
 
-    pub async fn wait_resident(&self, pid: ProcessId) -> Result<(), PlannerError> {
+    pub async fn wait_resident(self: &Arc<Self>, pid: ProcessId) -> Result<(), PlannerError> {
         let mut left_pipeline = false;
         loop {
             let signal = {
@@ -325,6 +358,47 @@ impl ResidencyPlanner {
             }
             self.stats.gate_parks.fetch_add(1, Ordering::Relaxed);
             self.await_signal(&signal, || self.is_resident(pid)).await;
+            if let Some(error) = self.restore_expired(pid) {
+                tracing::warn!(%pid, %error, "planner: a short restore gives up");
+                return Err(error);
+            }
         }
+    }
+
+    /// A restore of `pid` short of room only the policy can make past the
+    /// seat deadline, as a parked allocation is: it leaves the queue owing
+    /// what it did (parked, as a holder's set is), and its error says what
+    /// was short. `None` while it may still wait.
+    fn restore_expired(self: &Arc<Self>, pid: ProcessId) -> Option<PlannerError> {
+        let key = self.with_inner(|inner| {
+            inner
+                .queue
+                .iter()
+                .find(|(_, waiter)| {
+                    waiter.pid == pid && matches!(waiter.kind, WaitKind::Restore { .. })
+                })
+                .map(|(key, _)| *key)
+        })?;
+        let error = self.short_expired(key)?;
+        let settled = self.with_inner(|inner| {
+            if let Some(super::wait::Waiter {
+                pid,
+                kind: WaitKind::Restore { demand },
+            }) = inner.queue.remove(&key)
+                && let Some(proc) = inner.procs.get_mut(&pid)
+                && proc.state == Residency::Evicted
+            {
+                proc.parked = Some(demand);
+                return true;
+            }
+            false
+        });
+        if !settled {
+            // Served or gone meanwhile: the loop reads where it stands.
+            return None;
+        }
+        self.note_short(key, 0, 0);
+        self.poke();
+        Some(error)
     }
 }

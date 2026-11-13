@@ -156,6 +156,10 @@ pub fn capture(
             sm_scale.arg(),
             stated(OP, observe)?.arg(),
             stated(OP, kv_max)?.arg(),
+            pool.page_stride[0].arg(),
+            pool.page_stride[1].arg(),
+            crate::tensor::PLANE_AT_BINDING.arg(),
+            crate::tensor::PLANE_AT_BINDING.arg(),
         ],
     )
 }
@@ -194,7 +198,9 @@ mod tests {
             seq_stride: u64::from(kv_heads) * u64::from(head_dim),
             head_stride: u64::from(head_dim),
             q8: false,
+            page_stride: [0; 2],
         }
+        .paged_densely()
     }
 
     fn plan(rows: u32) -> PrefillPlan {

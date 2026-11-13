@@ -6,59 +6,19 @@ use eta_exec::{Extents, OpParams, ValueDesc, describe, layout};
 use crate::device::Context;
 use crate::device::alloc::{Buffer, Memory};
 use crate::device::ctx::{Core, Frame};
-use crate::error::{Fault, Result};
+use engine_gpu::error::{Fault, Result};
 
-const DESC_WORDS: usize = 9;
-
-const BINDINGS: u32 = 6;
-
-const CFG_BINDING: u32 = 5;
+use engine_gpu::guest::session::{
+    BINDINGS, CFG_BINDING, Cfg, DESC_WORDS, alias_reshapes, desc_words, groups_for, words_le,
+};
 
 const READ_ONLY: [bool; BINDINGS as usize] = [false, true, true, true, false, false];
-
-const WORKGROUP: u32 = eta_compiler::codegen::wgsl::WORKGROUP;
-
-const GROUPS_PER_CORE: u32 = 4;
 
 const STATUS_SPAN: u64 = eta_exec::STATUS_BYTES as u64;
 
 const OUTBOX_FLOOR: u64 = 256;
 
 const OUTBOX_KIND: Memory = Memory::Host;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct Cfg {
-    value_count: u32,
-    temporary: u32,
-    op_count: u32,
-    lane: u32,
-}
-
-const _: () = assert!(size_of::<Cfg>() == 16);
-
-fn desc_words(d: &ValueDesc) -> [u32; DESC_WORDS] {
-    let mut out = [0u32; DESC_WORDS];
-    out[0] = d.len;
-    out[1] = d.rows;
-    out[2] = d.last;
-    out[3] = d.rank;
-    out[4] = d.dtype;
-    for (at, &dim) in d.dims.iter().enumerate() {
-        out[5 + at] = dim;
-    }
-    out
-}
-
-fn words_le(words: &[u32]) -> Vec<u8> {
-    words.iter().flat_map(|word| word.to_le_bytes()).collect()
-}
-
-impl Cfg {
-    fn to_le_bytes(self) -> Vec<u8> {
-        words_le(&[self.value_count, self.temporary, self.op_count, self.lane])
-    }
-}
 
 pub struct Code {
     binds: wgpu::BindGroupLayout,
@@ -81,7 +41,7 @@ impl std::fmt::Debug for Code {
 }
 
 impl Code {
-    pub fn new(device: &Context, code: &[crate::guest::Lowered]) -> Result<Code> {
+    pub fn new(device: &Context, code: &[engine_gpu::guest::Lowered<String>]) -> Result<Code> {
         let core = device.core().clone();
         let binds = bind_layout(&core);
         let layout = core
@@ -256,32 +216,6 @@ impl Session {
         Ok(())
     }
 
-    pub fn copy_in(
-        &mut self,
-        frame: &mut Frame,
-        stage: usize,
-        value: u32,
-        source: &Buffer,
-        source_at: u64,
-        len: u64,
-    ) -> Result<()> {
-        let (at, held) = self.span(stage, value).ok_or_else(|| Fault::Program {
-            at: "guest::session",
-            why: format!("value {value} is not stage {stage}'s"),
-        })?;
-        if len > held {
-            return Err(Fault::Program {
-                at: "guest::session",
-                why: format!(
-                    "value {value} of stage {stage} holds {held} bytes and a copy of {len} \
-                     was asked for"
-                ),
-            });
-        }
-        let stage = &self.stages[stage];
-        frame.copy(source, source_at, &stage.heap, at, len)
-    }
-
     pub fn dispatch(&self, frame: &Frame, at: usize) -> Result<()> {
         let stage = self.stages.get(at).ok_or_else(|| Fault::Program {
             at: "guest::session",
@@ -420,28 +354,10 @@ fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
         })
 }
 
-fn groups_for(descriptors: &[ValueDesc], device: &Context) -> u32 {
-    let widest = descriptors.iter().map(|d| d.len).max().unwrap_or(1).max(1);
-    let wanted = widest.div_ceil(WORKGROUP);
-    let cap = device.cores().max(1).saturating_mul(GROUPS_PER_CORE);
-    wanted.clamp(1, cap)
-}
-
-fn alias_reshapes(plan: &LaunchStagePlan, values: &mut [u64]) {
-    for (result, source) in eta_compiler::codegen::wgsl_analysis::analyze_stage(plan).aliases {
-        let Some(&at) = values.get(source as usize) else {
-            continue;
-        };
-        if let Some(slot) = values.get_mut(result as usize) {
-            *slot = at;
-        }
-    }
-}
-
 fn build_pipelines(
     core: &Arc<Core>,
     pipeline_layout: &wgpu::PipelineLayout,
-    lowered: &crate::guest::Lowered,
+    lowered: &engine_gpu::guest::Lowered<String>,
 ) -> Result<Vec<wgpu::ComputePipeline>> {
     if lowered.entries.is_empty() {
         return Ok(Vec::new());
@@ -452,7 +368,7 @@ fn build_pipelines(
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("pie guest"),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&lowered.source)),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&lowered.code)),
             });
         lowered
             .entries
@@ -595,7 +511,7 @@ fn build_stage(
     Ok(Stage {
         group,
         groups: if strides_the_grid {
-            groups_for(&descriptors, device)
+            groups_for(&descriptors, device.cores())
         } else {
             1
         },

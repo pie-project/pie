@@ -9,8 +9,8 @@ use profile::{Facts, Profile, Registry, Report, Shelf};
 /// Rows from which a step is submitted a layer at a time rather than in one
 /// submit: in one, a long prefill on a slow GPU outlasts the driver's
 /// watchdog (about 2 s on Adreno, which a 64-row prefill reaches) and loses
-/// the device. A split step is not recorded, so a desktop GPU with no such
-/// watchdog may say 0, never.
+/// the device. A split step is not recorded, so a desktop GPU, with no such
+/// watchdog, says 0, never (the derived profile).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, profile::Decision)]
 #[decision(id = "engine.submit.split_rows", constant(range(0..=1_048_576)), default = 32, tune = engine)]
 pub struct SubmitSplitRows(pub u32);
@@ -60,6 +60,8 @@ pub struct Device {
     /// Multiprocessors or compute units, where an extension says.
     pub cores: Option<u32>,
     pub coopmat: bool,
+    /// A discrete GPU, by its device type.
+    pub discrete: bool,
 }
 
 impl Device {
@@ -68,7 +70,8 @@ impl Device {
         let facts = Facts::of(registry())
             .word("vendor", self.vendor)
             .int("subgroup", i64::from(self.subgroup))
-            .flag("coopmat", self.coopmat);
+            .flag("coopmat", self.coopmat)
+            .flag("discrete", self.discrete);
         match self.cores {
             Some(cores) => facts.int("cores", i64::from(cores)),
             None => facts,
@@ -111,6 +114,7 @@ mod tests {
     use profile::Source;
 
     use super::*;
+    use engine_gpu::backend::Tactics as _;
 
     #[test]
     fn the_registry_holds_together() {
@@ -135,6 +139,7 @@ mod tests {
             subgroup,
             cores,
             coopmat,
+            discrete: matches!(vendor, "nvidia" | "amd"),
         }
     }
 

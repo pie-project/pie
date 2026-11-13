@@ -18,12 +18,12 @@ use crate::encode::Sink;
 use crate::error::{Fault, Result};
 use crate::experts::Plan;
 use crate::inputs::Inputs;
-use crate::record::{Recording, Tape};
 use crate::run::{CacheGeometry, CacheTable, FireBindings, FireTables, Run, SlotTable};
 use crate::scratch::Scratch;
 use crate::settle::{Airborne, Arms, Done};
 use crate::store::Pools;
 use crate::store::kv::{self, Paging, Seat};
+use crate::store::layout::Layout;
 use crate::weights::{AdapterPlane, Weights};
 use crate::window::Windows;
 
@@ -168,6 +168,22 @@ pub struct Seated<'a> {
     /// its own (`Lane::rs_snapshots`).
     pub rs_snapshots: &'a [engine::fire::RsSnapshot],
     pub translation: &'a [u32],
+    /// The lane's pages, state slots and buffer pages are the runtime's
+    /// slot refs; else (a caller firing directly) they are seat-addressed:
+    /// seat `lane.slot`'s own runs of the pool.
+    pub refs: bool,
+    /// The record the fire reads and writes, a slot ref a piece
+    /// (`Lane::fixed`'s cow side); `None`: `rs_slot`, else the seat's.
+    pub record: Option<&'a [u32]>,
+    /// The record's run side where it differs from `record` (a group's
+    /// copy-on-write): a lane that folds nothing reads its state there
+    /// (CONTRACT-BC 15).
+    pub record_run: Option<&'a [u32]>,
+    /// The lane's window-list slot refs, one table a window list (the
+    /// load's order), each one a `T_w` slot in token order (0 a slot
+    /// trimmed behind the window), for the windowed rows; a missing or empty
+    /// seat-addresses them.
+    pub windows: &'a [Vec<u32>],
 }
 
 impl<'a> Seated<'a> {
@@ -190,6 +206,10 @@ impl<'a> Seated<'a> {
             rs_reset: engine::fire::RsReset::Inferred,
             rs_slot: None,
             rs_snapshots: &[],
+            refs: false,
+            record: None,
+            record_run: None,
+            windows: &[],
         }
     }
 
@@ -233,12 +253,6 @@ pub struct Attached {
     pub adapter_only: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct FireCost {
-    pub launches: u32,
-    pub copied: u32,
-}
-
 pub struct Shell {
     tuning: kernels_metal::Tuning,
     device: Context,
@@ -273,9 +287,7 @@ pub struct Shell {
     host_rows: bool,
     rows_wanted: bool,
     nan_flags: Option<Buffer>,
-    #[allow(dead_code)]
-    facts: kv::Facts,
-    spaces: usize,
+    page_tables: usize,
 
     patch_seat: Option<crate::inputs::PatchSeat>,
     voxel_seat: Option<crate::inputs::VoxelSeat>,
@@ -286,26 +298,221 @@ pub struct Shell {
     feeds: crate::feeds::Feeds,
 
     copies: bool,
-    last: FireCost,
     masked: poem_ir::ClassSet,
     wide: poem_ir::ClassSet,
     corrected: poem_ir::ClassSet,
     adapter_fact: Option<u32>,
     adapters: crate::adapter::Slots,
     blobs: crate::blob::Store,
-    cuts: Vec<Option<ValueId>>,
-    row_cuts: Vec<Option<ValueId>>,
-    run_caps: Vec<u32>,
-    run_passes: Vec<u32>,
     held: Vec<u32>,
     programs: crate::program::Plane,
-    #[cfg(target_vendor = "apple")]
-    icb: Option<crate::icb::Icb>,
-    #[cfg(target_vendor = "apple")]
-    rebound: crate::icb::Rebound,
 }
 
+/// The longest a load waits for the Neural Engine's programs.
+const ANE_COMPILE_LIMIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
 impl Shell {
+    /// Waits until every Neural Engine program this load would split work
+    /// with has compiled, and refuses the load if the compiler refused one
+    /// (after its retries): the Neural Engine's int8 share lands other bits
+    /// than the GPU alone, so a load that served without a refused program
+    /// would answer differently from one where it compiled. Every load that
+    /// serves therefore serves the split the device profile states, for
+    /// its whole life; a load the compiler will not take fails, to be
+    /// retried or loaded with the work kept on the GPU (`kernel.ane.mlp =
+    /// gpu`, `kernel.ane.projections = gpu` in the device profile).
+    fn settle_ane(&self) -> Result<()> {
+        let Some(ane) = &self.ane else {
+            return Ok(());
+        };
+        let began = std::time::Instant::now();
+        loop {
+            match ane.compiled() {
+                Some(Ok(())) => return Ok(()),
+                Some(Err(why)) => {
+                    return Err(Fault::Device {
+                        call: "the Neural Engine compile",
+                        why: format!(
+                            "{why}, on every try: this load would serve the work that program \
+                             takes on the GPU alone, which lands other bits than the split the \
+                             device profile states, so it is refused rather than served \
+                             differently. Load again, or keep the work on the GPU \
+                             (`kernel.ane.mlp = gpu`, `kernel.ane.projections = gpu`)"
+                        ),
+                    });
+                }
+                None if began.elapsed() > ANE_COMPILE_LIMIT => {
+                    return Err(Fault::Device {
+                        call: "the Neural Engine compile",
+                        why: format!(
+                            "no answer in {} s: the load is refused rather than served with \
+                             the split undecided",
+                            ANE_COMPILE_LIMIT.as_secs()
+                        ),
+                    });
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+    }
+
+    /// The weight cache (`store::streamed`): one cache a weight shape the
+    /// recipe gives weights this engine streams, every atom read from its
+    /// weight in place
+    /// until the runtime names slots. None on a device whose queue keeps no
+    /// residency set (the weights are then read whole, as before).
+    fn weight_caches(
+        device: &Context,
+        handles: &Handles,
+        weights: &mut Weights,
+        trace: &Trace,
+        recipe: &poem_compiler::chunk::ChunkRecipe,
+        rows: bool,
+    ) -> Result<Vec<crate::store::streamed::Cache>> {
+        let shapes = crate::store::streamed::Shape::of(trace, recipe, rows);
+        if shapes.is_empty() || !device.hold_resident(std::iter::empty(), true)? {
+            return Ok(Vec::new());
+        }
+        let mut caches = Vec::with_capacity(shapes.len());
+        for shape in shapes {
+            let cache = crate::store::streamed::Cache::open(
+                device,
+                handles,
+                shape,
+                |param| match weights.table().0.get(param).copied().flatten() {
+                    Some(crate::run::WeightRow::Dense(plane)) => Some(plane.buf),
+                    Some(crate::run::WeightRow::Planes(bank)) => Some(bank.codes.buf),
+                    None => None,
+                },
+                |param| weights.filed(param),
+            )?;
+            // The weights' own copies join the residency set only where a
+            // miss reads them in place (`Shell::hold_weight_hosts`, once the
+            // load has or has not seated them): a weight read out of the
+            // serving file gets its window then.
+            for (param, table) in cache.tables() {
+                weights.read_through(param, table);
+            }
+            caches.push(cache);
+        }
+        Shell::bank_tables(weights, trace, &caches)?;
+        Ok(caches)
+    }
+
+    /// Each quantized routed bank the caches stream reads its planes (codes,
+    /// scales, zero points, its select's expert bias) through one
+    /// `BankTable`, at its codes param.
+    fn bank_tables(
+        weights: &mut Weights,
+        trace: &Trace,
+        caches: &[crate::store::streamed::Cache],
+    ) -> Result<()> {
+        use crate::store::streamed::Streamed;
+        let mut planes = BTreeMap::new();
+        let mut rows = BTreeMap::new();
+        for cache in caches {
+            for (param, table) in cache.tables() {
+                match table {
+                    Streamed::Experts(table) => {
+                        planes.insert(param, table);
+                    }
+                    Streamed::Rows(table) => {
+                        rows.insert(param, table);
+                    }
+                    Streamed::Bank(_) | Streamed::BankRows(_) => {}
+                }
+            }
+        }
+        let named = |name: String| trace.params.iter().position(|p| p.name == name);
+        // A quantized table's planes, a block of rows at a time.
+        for (&codes, &table) in &rows {
+            let Some(crate::run::WeightRow::Planes(_)) =
+                weights.table().0.get(codes).copied().flatten()
+            else {
+                continue;
+            };
+            let name = &trace.params[codes].name;
+            let plane = |suffix: &str| {
+                named(format!("{name}{suffix}"))
+                    .and_then(|p| rows.get(&p).copied())
+                    .ok_or_else(|| Fault::Unbound {
+                        what: format!(
+                            "the `{suffix}` plane of streamed table `{name}`, which no cache streams"
+                        ),
+                    })
+            };
+            let (scales, biases) = (plane(poem_ir::SCALES)?, plane(poem_ir::BIASES)?);
+            weights.read_through(
+                codes,
+                Streamed::BankRows(kernels_metal::gather::BankRows {
+                    codes: table.at,
+                    scales: scales.at,
+                    biases: biases.at,
+                    block_rows: table.block_rows,
+                    hits: table.hits.or(scales.hits).or(biases.hits),
+                }),
+            );
+        }
+        let weight_of = |id: ValueId| match trace.values.get(id.0 as usize).map(|d| &d.def) {
+            Some(poem_ir::Def::Weight(w)) => Some(*w as usize),
+            _ => None,
+        };
+        for (&codes, &table) in &planes {
+            let Some(crate::run::WeightRow::Planes(_)) =
+                weights.table().0.get(codes).copied().flatten()
+            else {
+                continue;
+            };
+            let name = &trace.params[codes].name;
+            let missing = |what: &str| Fault::Unbound {
+                what: format!(
+                    "the {what} of streamed routed bank `{name}`, which no cache streams"
+                ),
+            };
+            let at = |param: Option<usize>, what: &str| -> Result<Option<kernels_metal::Tensor>> {
+                param
+                    .map(|p| planes.get(&p).map(|t| t.at).ok_or_else(|| missing(what)))
+                    .transpose()
+            };
+            let scales = at(
+                Some(named(format!("{name}{}", poem_ir::SCALES)).ok_or_else(|| missing("scales"))?),
+                "scales",
+            )?
+            .ok_or_else(|| missing("scales"))?;
+            let biases = at(named(format!("{name}{}", poem_ir::BIASES)), "zero points")?;
+            let bias = trace.nodes.iter().find_map(|node| match &node.op {
+                Operation::Linear(poem_ir::Linear::MoeSelect {
+                    bank,
+                    bias: Some(bias),
+                    ..
+                }) if weight_of(*bank) == Some(codes) => weight_of(*bias),
+                _ => None,
+            });
+            let bias = at(bias, "expert bias")?;
+            let hits = [
+                Some(codes),
+                named(format!("{name}{}", poem_ir::SCALES)),
+                named(format!("{name}{}", poem_ir::BIASES)),
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(|p| planes.get(&p).and_then(|t| t.hits));
+            weights.read_through(
+                codes,
+                Streamed::Bank(kernels_metal::linear::moe::BankTable {
+                    codes: table.at,
+                    scales,
+                    biases,
+                    bias,
+                    pieces: table.pieces,
+                    piece_rows: table.piece_rows,
+                    hits,
+                }),
+            );
+        }
+        Ok(())
+    }
+
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
         Self::prepare(boot)?.load()
     }
@@ -376,7 +583,6 @@ impl Shell {
         Ok(PreparedLoad {
             boot,
             device,
-            perf_cores,
             chip,
             tuning,
             elsewhere,
@@ -391,7 +597,6 @@ impl Shell {
 pub struct PreparedLoad<'a> {
     boot: Boot<'a>,
     device: Context,
-    perf_cores: u32,
     chip: profile::Profile,
     tuning: kernels_metal::Tuning,
     elsewhere: u64,
@@ -417,7 +622,6 @@ impl PreparedLoad<'_> {
         let PreparedLoad {
             boot,
             device,
-            perf_cores,
             chip,
             tuning,
             elsewhere,
@@ -517,83 +721,13 @@ impl PreparedLoad<'_> {
         }
 
         let handles = Handles::new();
-        let cuts = crate::experts::cuts(&boot.trace, &compiled, &boot.residency)?;
-        let run_caps: Vec<u32> = (0..compiled.template().len())
-            .map(|region| {
-                let slots = boot.residency.slots();
-                let routes = region
-                    .checked_sub(1)
-                    .and_then(|router| cuts.get(router).copied().flatten());
-                let stated = match *chip.get::<crate::chip::StreamCut>() {
-                    crate::chip::StreamCut::FanOut => 0,
-                    crate::chip::StreamCut::Fixed { rows } => rows,
-                };
-                match (routes, slots) {
-                    (Some(_), slots) if slots > 0 && stated > 0 => stated,
-                    (Some(routes), slots) if slots > 0 => {
-                        crate::experts::fan_out(&boot.trace, routes)
-                            .map_or(0, |k| (slots / k.max(1)).max(1))
-                    }
-                    _ => 0,
-                }
-            })
-            .collect();
-        let passes_on = crate::diag::on().expert_passes;
-        let run_passes: Vec<u32> = (0..compiled.template().len())
-            .map(|region| {
-                let routes = region
-                    .checked_sub(1)
-                    .and_then(|router| cuts.get(router).copied().flatten());
-                match routes {
-                    Some(routes) if passes_on => boot
-                        .residency
-                        .groups()
-                        .iter()
-                        .find(|group| group.routes == routes)
-                        .map_or(0, |group| {
-                            if group.slots > 0 {
-                                group
-                                    .experts
-                                    .div_ceil(crate::experts::pass_group(group.slots))
-                            } else {
-                                0
-                            }
-                        }),
-                    _ => 0,
-                }
-            })
-            .collect();
-        if crate::diag::on().cut_trace {
-            let capped: Vec<(usize, u32, u32)> = run_caps
-                .iter()
-                .zip(&run_passes)
-                .enumerate()
-                .filter(|(_, (cap, _))| **cap > 0)
-                .map(|(at, (cap, passes))| (at, *cap, *passes))
-                .collect();
-            eprintln!(
-                "cuts: slots {} capped regions (region, cap, passes) {capped:?}",
-                boot.residency.slots()
-            );
-        }
-        let row_cuts = if boot.residency.gathered().gathers() {
-            crate::gather::cuts(&boot.trace, &compiled)?
-        } else {
-            vec![None; compiled.template().len()]
-        };
-        let prefetch = chip.get::<crate::chip::ExpertsPrefetch>().0;
-        let threads = chip.get::<crate::chip::ExpertsThreads>().count(perf_cores);
-        let residency = boot
-            .residency
-            .clone()
-            .with_streaming(prefetch as usize, threads as usize);
         let mut weights = Weights::resident(
             &device,
             &handles,
             &boot.trace,
             boot.contract,
             boot.checkpoint,
-            &residency,
+            &boot.residency,
         )?;
         weights.decode_absorbed(&device, &handles, &boot.trace)?;
         weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
@@ -609,6 +743,29 @@ impl PreparedLoad<'_> {
                 None
             },
         );
+        // The compiler's on-device Metal recipe is the one layout source: the
+        // chunk, the list slot (its tokens are the kv page size), where
+        // every fixed row's pieces lie in a record, and the weight slots.
+        let recipe =
+            crate::chunks::recipe_near(&boot.trace, &budgets, boot.residency.chunk_bytes())?;
+        let weight_caches = if boot.residency.whole_weights() {
+            Vec::new()
+        } else {
+            Shell::weight_caches(
+                &device,
+                &handles,
+                &mut weights,
+                &boot.trace,
+                &recipe,
+                boot.residency.rows_streamed(),
+            )?
+        };
+        // A weight kept apart that no cache takes is read whole, in place.
+        let claimed: std::collections::BTreeSet<usize> = weight_caches
+            .iter()
+            .flat_map(|cache| cache.shape.planes.iter().map(|plane| plane.param))
+            .collect();
+        weights.open_unclaimed(&device, &handles, &claimed)?;
         handles.seal();
 
         // The kv pool and the recurrent-state buffers beside it: both are
@@ -617,11 +774,13 @@ impl PreparedLoad<'_> {
         // scratch and the driver's floor are placed. A stated `kv_budget` is
         // its bytes; none takes all of the room.
         let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
-        let paging_at =
-            |pages: u64, slots: u32| Paging::of(boot.page_size, boot.context, slots, pages);
-        let demand_at = |slots: u32| {
-            crate::store::PoolDemand::of(&boot.trace, paging_at(1, slots)?, rs_layout.as_deref())
+        let rows = crate::store::Rows::plan(&boot.trace, &recipe, &facts, rs_layout.as_deref())?;
+        let page_size = if rows.tokens > 0 {
+            rows.tokens
+        } else {
+            boot.page_size
         };
+        let paging_at = |pages: u64, slots: u32| Paging::of(page_size, boot.context, slots, pages);
         let accounting = |pool: u64| {
             crate::store::accounting::Accounting::with_scratch(
                 device.working_set(),
@@ -631,81 +790,125 @@ impl PreparedLoad<'_> {
                 compiled.arena.bytes,
                 pool,
             )
+            .with_streamable(weights.filed_bytes())
         };
-        // Each plane is one buffer, so no more pages than the device binds in
-        // one, whatever the room allows.
-        let max_buffer = device.max_buffer();
-        let (pages, slots) = engine::fit::pool_for(
-            boot.kv_budget,
-            boot.slots,
-            u64::from(paging_at(1, boot.slots)?.pages_per_slot),
-            accounting(0).pool,
-            |pages, slots| {
-                demand_at(slots).map_or(u64::MAX, |demand| demand.bytes_binding(pages, max_buffer))
-            },
-        )
-        .map_err(|short| Fault::Residency(short.to_string()))?;
-        let demand = demand_at(slots)?;
-        // A stated budget is never cut: one buffer stopping short of it is a
-        // refusal, as the room is.
-        if let Some(budget) = boot.kv_budget
-            && demand.bytes_binding(pages + 1, max_buffer) == u64::MAX
-            && demand.bytes(pages + 1) <= budget
-        {
-            return Err(Fault::Residency(format!(
-                "`[model] device_kv_budget` states {} MiB, and a cache plane is one buffer, \
-                 which this device binds up to {} MiB of: {pages} pages fill it at {} MiB. \
-                 State a budget of at most that",
-                budget >> 20,
-                max_buffer >> 20,
-                demand.bytes(pages) >> 20,
-            )));
-        }
-        let paging = paging_at(pages, slots)?;
-
-        {
-            let acct = accounting(demand.bytes(pages));
-            acct.admit(Some(weights.bytes()), boot.memory_share)?;
-            // A bank read out of the artifact's own mapping is already in the
-            // weights, as the windows that span it: only what lies outside them
-            // is streamed on top.
-            let source = boot
-                .residency
-                .source_bytes()
-                .saturating_sub(weights.spanned());
-            let ram = Context::physical_memory();
-            let wired = acct.weights + acct.scratch + acct.minimum + acct.floor;
-            if source > 0 && ram > 0 && wired + source > ram - ram / 6 {
+        // One chunk pool holds every kv page and every record (the rs
+        // buffer's rows inside it), in what the room holds of whole chunks.
+        let (paging, pool_bytes, layout) = {
+            let seated = paging_at(1, boot.slots)?;
+            let bytes = [rows.list_bytes, rows.fixed_bytes];
+            let chunk = rows.chunk_bytes;
+            // A seat's slots of each window list: its context in `T_w`-token
+            // slots.
+            let window_pages: Vec<u32> = rows
+                .windows
+                .iter()
+                .map(|w| seated.context().div_ceil(w.tokens.max(1)).max(1))
+                .collect();
+            let window_chunks: u32 = rows
+                .windows
+                .iter()
+                .zip(&window_pages)
+                .map(|(w, pages)| {
+                    chunk.checked_div(w.bytes).map_or(0, |per| {
+                        pages.div_ceil(u32::try_from(per).unwrap_or(1).max(1))
+                    })
+                })
+                .sum();
+            let least = Layout::least_chunks(chunk, bytes, rows.pieces, seated.pages_per_slot)
+                + window_chunks;
+            // The row-streamed tables' blocks come out of this room as the
+            // runtime names them; their own copies are counted in the
+            // weights until a held set gives them back.
+            let room = boot.kv_budget.unwrap_or_else(|| accounting(0).pool);
+            let total = engine::chunk::fit(room, chunk, 0, least)
+                .map_err(|short| Fault::Residency(short.to_string()))?;
+            // The pool is one buffer.
+            let binds = u32::try_from(device.max_buffer() / chunk).unwrap_or(u32::MAX);
+            if binds < least {
                 return Err(Fault::Residency(format!(
-                    "this streamed load wires {wired} bytes (weights {weights}, arena scratch \
-                     {scratch} at `[engine] max_forward_tokens`, kv pool {pool}, driver floor \
-                     {floor}) and reads its {source} streamed bytes out of the artifact's page \
-                     cache — the same {ram} bytes of unified memory. Together they exceed \
-                     five sixths of it, so the cache would be squeezed out and every seat \
-                     copy would come from the disk: the load would crawl, not page. Lower \
-                     `[model] device_weight_budget` or `[engine] max_forward_tokens`, or \
-                     hold the model resident on a box that fits it.",
-                    weights = acct.weights,
-                    scratch = acct.scratch,
-                    pool = acct.minimum,
-                    floor = acct.floor,
+                    "one working set takes {least} chunks of {chunk} bytes, and this device \
+                     binds one buffer of {} MiB",
+                    device.max_buffer() >> 20
                 )));
             }
+            let total = total.min(binds);
+            let mut layout = Layout::new(
+                chunk,
+                total,
+                crate::store::pool::segment_chunks(chunk),
+                page_size,
+                bytes,
+                rows.pieces,
+                boot.slots,
+                seated.pages_per_slot,
+            )?;
+            for (window, pages) in rows.windows.iter().zip(&window_pages) {
+                layout = layout.with_window(window.bytes, window.rows, window.tokens, *pages)?;
+            }
+            let layout = layout.with_rs(
+                rows.rs.as_ref().map_or(0, |rs| rs.bytes),
+                rows.rs.as_ref().map_or(0, |rs| rs.tokens),
+                seated.pages_per_slot,
+            )?;
+            let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
+            (
+                paging_at(pages, boot.slots)?,
+                chunk * u64::from(total),
+                layout,
+            )
+        };
+
+        {
+            let acct = accounting(pool_bytes);
+            acct.admit(boot.memory_share)?;
             if crate::diag::on().tier_trace {
                 eprintln!(
-                    "residency: wired {wired} (weights {} scratch {} kv {} floor {}), streamed \
-                     source {source}, working set {}, ram {ram}",
+                    "residency: weights {} scratch {} kv {} floor {}, working set {}",
                     acct.weights, acct.scratch, acct.minimum, acct.floor, acct.working_set
                 );
             }
         }
         let arena = Arena::reserve(&device, &compiled.arena)?;
         let arena_ladder = poem_compiler::arena_ladder(&boot.trace, &budgets, &compiled)?;
-        let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
-        let rs_buffers = match &rs_layout {
-            Some(layout) => Some(crate::rs::Buffers::reserve(&device, layout, paging)?),
-            None => None,
-        };
+        let rs_at = rows.rs.clone();
+        let mut pools = Pools::reserve(&device, rows, layout, paging)?;
+        pools.seat_weights(weight_caches);
+        // The null chunk and the floor stand from the load on.
+        pools.commit_segments(1)?;
+        // A load whose weights the runtime holds seats every atom in pool
+        // slots itself, from the serving file where it reads them there,
+        // and states where (`WeightShape::seated`); the runtime adopts it.
+        if boot.residency.weights_held() && !pools.weight_caches().is_empty() {
+            match pools.preseat_plan() {
+                Some(plan) => {
+                    let started = std::time::Instant::now();
+                    let mut frame = device.frame()?;
+                    pools.preseat_weights(&mut frame, &plan)?;
+                    frame.commit()?;
+                    pools.restage_weights()?;
+                    tracing::info!(
+                        atoms = plan.resident.len(),
+                        shapes = pools.weight_caches().len(),
+                        ms = started.elapsed().as_millis() as u64,
+                        "the held weights are seated in the pool at load"
+                    );
+                }
+                None => tracing::info!(
+                    "the pool cannot hold every weight atom beside the seats: the held \
+                     weights are read in place until the runtime names their slots"
+                ),
+            }
+        }
+        Shell::hold_weight_hosts(&device, &handles, &mut weights, &mut pools)?;
+        let rs_buffers = rs_at.map(|at| {
+            crate::rs::Buffers::in_pool(
+                at.plane_at,
+                at.tokens,
+                pools.view().clone(),
+                layout.rs_stride(),
+            )
+        });
         let scratch = Scratch::reserve(
             &device,
             &boot.trace,
@@ -715,16 +918,7 @@ impl PreparedLoad<'_> {
             paging,
             &tuning,
         )?;
-        let spaces = boot
-            .trace
-            .caches
-            .iter()
-            .filter_map(|row| match row {
-                poem_ir::CacheRow::Kv { space, .. } => Some(*space as usize + 1),
-                poem_ir::CacheRow::State { .. } => None,
-            })
-            .max()
-            .unwrap_or(0);
+        let page_tables = pools.tables().len();
         let arms = boot.runahead.frames().max(1);
         let gathers = fallback::gathers(&boot.trace, &compiled);
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
@@ -802,17 +996,16 @@ impl PreparedLoad<'_> {
                     &device,
                     &boot.budget,
                     paging,
-                    spaces,
+                    page_tables,
                     compiled.classes.classes.len(),
-                    poem_exec::fire::max_runs(&compiled),
                     gathers,
                     patch_seat,
                     voxel_seat,
                     states_mrope,
                     &seats,
                     selections,
-                    &run_caps,
-                    &run_passes,
+                    &pools.bands(),
+                    pools.window_pages_per_slot(),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -881,7 +1074,7 @@ impl PreparedLoad<'_> {
             )?),
             false => None,
         };
-        Ok(Shell {
+        let shell = Shell {
             tuning,
             device,
             keepalive,
@@ -919,36 +1112,253 @@ impl PreparedLoad<'_> {
             states_mrope,
             gathers_readout,
             feeds,
-            facts,
-            spaces,
+            page_tables,
             copies: false,
-            last: FireCost::default(),
             masked,
             wide,
             adapter_fact,
             adapters: adapter_slots,
             blobs: crate::blob::Store::new(),
             corrected,
-            cuts,
-            row_cuts,
-            run_caps,
-            run_passes,
             held: vec![0; paging.slots as usize],
             programs: crate::program::Plane::new(),
-            #[cfg(target_vendor = "apple")]
-            icb: None,
-            #[cfg(target_vendor = "apple")]
-            rebound: crate::icb::Rebound::default(),
-        })
+        };
+        shell.settle_ane()?;
+        Ok(shell)
     }
 }
 
 impl Shell {
+    /// The physical pieces of the record a lane's state sits in: the one
+    /// its slot refs name, else its seat's.
+    fn record_of(&self, seated: &Seated<'_>) -> Result<Vec<u32>> {
+        match (seated.record, seated.rs_slot) {
+            (Some(refs), _) => self.pools.record(Some(refs), seated.lane.slot),
+            (None, Some(slot)) if seated.refs => Ok(vec![self.pools.state_slot(slot, false)?]),
+            (None, Some(slot)) => self.pools.record(None, slot),
+            (None, None) => self.pools.record(None, seated.lane.slot),
+        }
+    }
+
+    /// The physical slot a lane's one-piece state sits in.
+    fn state_id(&self, seated: &Seated<'_>) -> Result<u32> {
+        let record = self.record_of(seated)?;
+        if record.len() != 1 {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "a frame-cache seat of a record cut into {} pieces",
+                    record.len()
+                ),
+            });
+        }
+        Ok(record[0])
+    }
+
+    /// The chunk pool as the runtime counts it.
+    #[must_use]
+    pub fn pool_chunk_facts(&self) -> engine::chunk::ChunkFacts {
+        self.pools.chunk_facts()
+    }
+
+    /// The chunk pool's layout.
+    #[must_use]
+    pub fn pool_layout(&self) -> Layout {
+        *self.pools.layout()
+    }
+
+    /// See `Engine::commit_segments`.
+    pub fn commit_segments(&mut self, segments: u32) -> Result<()> {
+        self.pools.commit_segments(segments)
+    }
+
+    /// See `Engine::weight_residency`: every frame drains, blocks newly
+    /// named a slot land in it, and every address table is rewritten
+    /// before the next fire. A held set naming every atom gives back the
+    /// tables' own copies (`store::streamed`).
+    pub fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> Result<()> {
+        if self.pools.weight_caches().is_empty() && residency.resident.is_empty() {
+            return Ok(());
+        }
+        self.drain()?;
+        let mut frame = self.device.frame()?;
+        self.pools.weight_residency(&mut frame, residency)?;
+        frame.commit()?;
+        self.pools.restage_weights()?;
+        Shell::hold_weight_hosts(
+            &self.device,
+            &self.handles,
+            &mut self.weights,
+            &mut self.pools,
+        )?;
+        let resident: Vec<bool> = self
+            .pools
+            .weight_caches()
+            .iter()
+            .map(crate::store::streamed::Cache::hosts_resident)
+            .collect();
+        let released = self.pools.release_weight_hosts();
+        if !released.is_empty() {
+            let empty = Buffer::zeroed(&self.device, 0)?;
+            if resident.iter().any(|r| *r) {
+                self.device
+                    .hold_resident(released.iter().map(|(_, _, slab)| slab), false)?;
+            }
+            let mut freed = 0;
+            for (param, handle, _) in &released {
+                self.handles.rebind(*handle, &empty)?;
+                freed += usize::from(self.weights.release_hosted(*param));
+            }
+            tracing::info!(
+                tables = released.len(),
+                own_allocations = freed,
+                "the held weight set names every block: the row-streamed tables' own copies \
+                 are given back"
+            );
+        }
+        Ok(())
+    }
+
+    /// Puts the weights' own copies in the queue's residency set wherever a
+    /// fire may read one in place: a cache whose atoms are not all in slots
+    /// under a held set, and the load did not seat them all.
+    fn hold_weight_hosts(
+        device: &Context,
+        handles: &Handles,
+        weights: &mut Weights,
+        pools: &mut Pools,
+    ) -> Result<()> {
+        let whole = pools.weights_whole()
+            || pools
+                .weight_caches()
+                .iter()
+                .all(crate::store::streamed::Cache::preseated);
+        if whole {
+            return Ok(());
+        }
+        let mut opened = false;
+        for cache in pools.weight_caches_mut() {
+            if !cache.hosts_resident() && !cache.released() {
+                // A weight the load reads out of the serving file gets a
+                // window of its own now that a miss reads it in place.
+                cache.open_files(|param, handle| {
+                    opened = true;
+                    weights.open_filed(device, handles, param, handle)
+                })?;
+                device.hold_resident(cache.host_slabs(), true)?;
+                cache.set_hosts_resident(true);
+            }
+        }
+        if opened {
+            pools.restage_weights()?;
+        }
+        Ok(())
+    }
+
+    /// See `Engine::weight_uses`: each atom's reads since the last call.
+    pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
+        // No drain: the counters only grow, and a read takes what landed so
+        // far (a fire still in flight counts toward the next read). The
+        // runtime asks every governor tick; draining here stalled the frame
+        // pipeline four times a second.
+        self.pools.weight_uses()
+    }
+
+    /// Whether every streamed weight's own copy was given back (a held set
+    /// naming every atom).
+    #[must_use]
+    pub fn weights_given_back(&self) -> bool {
+        let caches = self.pools.weight_caches();
+        !caches.is_empty() && caches.iter().all(crate::store::streamed::Cache::released)
+    }
+
+    /// The streamed weights' atoms named a slot, and all of them.
+    #[must_use]
+    pub fn weight_atoms(&self) -> (u64, u64) {
+        self.pools
+            .weight_caches()
+            .iter()
+            .map(crate::store::streamed::Cache::atoms)
+            .fold((0, 0), |(a, b), (c, d)| (a + c, b + d))
+    }
+
+    /// See `Engine::release_segments`: every frame drains first.
+    #[allow(unsafe_code)]
+    pub fn release_segments(&mut self, segments: u32) -> Result<()> {
+        self.drain()?;
+        // SAFETY: drained just above, on the one thread that submits; the
+        // runtime evacuated the segments' chunks before asking.
+        unsafe { self.pools.release_segments(segments) }
+    }
+
+    /// See `Engine::evacuate`: the moved chunks' bytes land, and the chunk
+    /// table changes, before any later fire is encoded.
+    pub fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> Result<()> {
+        if evacuation.moves.is_empty() {
+            return Ok(());
+        }
+        self.drain()?;
+        let mut frame = self.device.frame()?;
+        self.pools.evacuate(&mut frame, evacuation)?;
+        frame.commit()
+    }
+
+    /// Whole-slot copies a fire states (`Lane::slot_copies`), each
+    /// `[src, dst]` of its shape: they land before any lane of the fire
+    /// reads or writes.
+    pub fn copy_slot_pairs(
+        &mut self,
+        copies: &[(engine::chunk::ShapeId, Vec<[u32; 2]>)],
+    ) -> Result<()> {
+        if copies.iter().all(|(_, pairs)| pairs.is_empty()) {
+            return Ok(());
+        }
+        self.drain()?;
+        let mut frame = self.device.frame()?;
+        for (shape, pairs) in copies {
+            let moves: Vec<(u32, u32)> = pairs.iter().map(|&[src, dst]| (src, dst)).collect();
+            self.pools.copy_shape(&mut frame, *shape, &moves)?;
+        }
+        self.grafted = Some(frame.commit_async(None)?);
+        Ok(())
+    }
+
+    /// See `Engine::copy_slots`.
+    pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
+        if copy.slots.is_empty() && copy.runs.is_empty() {
+            return Ok(());
+        }
+        self.drain()?;
+        let mut frame = self.device.frame()?;
+        self.pools.copy_slots(&mut frame, copy)?;
+        self.grafted = Some(frame.commit_async(None)?);
+        Ok(())
+    }
+
+    /// See `Engine::read_tier_slots`: every frame and copy lands first.
+    pub fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> Result<Vec<u8>> {
+        self.drain()?;
+        self.pools.read_tier_slots(slots)
+    }
+
+    /// See `Engine::write_tier_slots`: every frame and copy lands first.
+    pub fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.drain()?;
+        self.pools.write_tier_slots(slots, bytes)
+    }
+
     pub fn open(&mut self, slot: u32) -> Result<()> {
         if self.pools.has_state() {
             self.drain()?;
         }
-        self.pools.clear(slot)?;
+        let record = self.pools.record(None, slot)?;
+        self.pools.clear(&record)?;
         let seats = self.held.len() as u64;
         let held = self.held.get_mut(slot as usize).ok_or(Fault::Ceiling {
             what: "slots",
@@ -995,75 +1405,18 @@ impl Shell {
                 self.pools.page_bytes()?,
             ),
         };
-        self.pools.seat_disk(dir, budget, buffered)
+        self.pools.seat_disk(dir, budget)
     }
 
-    #[must_use]
-    pub fn parked_state_slots(&self) -> u32 {
-        self.pools.parked_slots()
+    /// Seats the shared pool's host tier of `budget` bytes (CONTRACT-BC 22).
+    pub fn seat_tier(&mut self, budget: u64) {
+        self.pools.seat_tier(budget);
     }
 
-    #[must_use]
-    pub fn parked_buffer_pages(&self) -> u32 {
-        self.pools.parked_pages()
-    }
-
+    /// No rs buffer pages: the buffer's rows live in the records.
     #[must_use]
     pub fn buffer_pages(&self) -> u32 {
-        self.rs_buffers
-            .as_ref()
-            .map_or(0, crate::rs::Buffers::page_count)
-    }
-
-    pub fn spill_kv(&mut self, to_disk: bool, pages: &[u32], slots: &[u32]) -> Result<()> {
-        self.drain()?;
-        self.pools.spill_kv(to_disk, pages, slots)
-    }
-
-    pub fn park_state(&mut self, out: bool, device: &[u32], rows: &[u32]) -> Result<()> {
-        self.drain()?;
-        self.pools.park_state(out, device, rows)
-    }
-
-    pub fn park_pages(&mut self, out: bool, pages: &[u32], rows: &[u32]) -> Result<()> {
-        if pages.is_empty() {
-            return Ok(());
-        }
-        self.drain()?;
-        let buffers = self.rs_buffers.as_mut().ok_or(Fault::Ceiling {
-            what: "recurrent buffer pages",
-            need: 1,
-            have: 0,
-        })?;
-        self.pools.park_pages(out, pages, rows, buffers.pages())
-    }
-
-    pub fn copy_pages(&mut self, moves: &[(u32, u32)]) -> Result<()> {
-        if moves.is_empty() {
-            return Ok(());
-        }
-        self.drain()?;
-        let (slab, bytes) = self
-            .rs_buffers
-            .as_mut()
-            .ok_or(Fault::Ceiling {
-                what: "recurrent buffer pages",
-                need: 1,
-                have: 0,
-            })?
-            .pages();
-        let mut frame = self.device.frame()?;
-        for &(src, dst) in moves {
-            frame.copy_span(
-                slab,
-                u64::from(src) * bytes,
-                slab,
-                u64::from(dst) * bytes,
-                bytes,
-            )?;
-        }
-        self.grafted = Some(frame.commit_async(None)?);
-        Ok(())
+        0
     }
 
     pub fn copy_state(&mut self, moves: &[(u32, u32)]) -> Result<()> {
@@ -1244,18 +1597,8 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn watermark(&self) -> Demand {
-        self.pools.watermark()
-    }
-
-    #[must_use]
     pub fn weights_warm(&self) -> bool {
         self.weights.warm()
-    }
-
-    #[must_use]
-    pub fn weight_windows(&self) -> usize {
-        self.weights.windows()
     }
 
     /// The kv pool's bytes with memory behind them now, and the most that
@@ -1263,86 +1606,6 @@ impl Shell {
     #[must_use]
     pub fn pool_residency(&self) -> (u64, u64) {
         (self.pools.committed_bytes(), self.pools.high_water_bytes())
-    }
-
-    /// See `Engine::commit_pool`.
-    pub fn commit_pool(&mut self, kv_pages: u32) -> Result<()> {
-        self.pools.commit(Demand {
-            kv_pages,
-            ..self.pools.watermark()
-        })
-    }
-
-    /// See `Engine::commit_state`.
-    pub fn commit_state(&mut self, slots: u32) -> Result<()> {
-        self.pools.commit(Demand {
-            state_slots: slots,
-            ..self.pools.watermark()
-        })?;
-        match &mut self.rs_buffers {
-            Some(buffers) => buffers.commit(slots),
-            None => Ok(()),
-        }
-    }
-
-    /// See `Engine::release_state`.
-    pub fn release_state(&mut self, slots: u32) -> Result<()> {
-        let mut kept = self.pools.watermark();
-        kept.state_slots = kept.state_slots.min(slots);
-        self.pools.trim(kept);
-        self.pools.release()?;
-        match &mut self.rs_buffers {
-            Some(buffers) => buffers.release(slots),
-            None => Ok(()),
-        }
-    }
-
-    /// What a state slot and its buffer page take, where both gain memory as
-    /// they are handed out.
-    #[must_use]
-    pub fn elastic_state_slot_bytes(&self) -> u64 {
-        if !self.pools.has_state() || self.pools.elastic_page_bytes() == 0 {
-            return 0;
-        }
-        let buffer = self.rs_buffers.as_ref().map_or(Some(0), |buffers| {
-            buffers.elastic().then(|| buffers.page_bytes())
-        });
-        buffer.map_or(0, |buffer| self.pools.state_slot_bytes() + buffer)
-    }
-
-    /// See `Engine::release_scratch`.
-    #[allow(unsafe_code)]
-    pub fn release_scratch(&mut self) -> Result<()> {
-        self.drain()?;
-        #[cfg(target_vendor = "apple")]
-        let narrowest = self
-            .arena_ladder
-            .first()
-            .map_or(self.compiled.arena.bytes, |(_, map)| map.bytes);
-        #[cfg(target_vendor = "apple")]
-        // SAFETY: drained just above, on the one thread that submits.
-        unsafe {
-            self.arena.forget(narrowest)?;
-        }
-        Ok(())
-    }
-
-    /// See `Engine::release_pool`.
-    pub fn release_pool(&mut self, kv_pages: u32) -> Result<()> {
-        let mut kept = self.pools.watermark();
-        kept.kv_pages = kept.kv_pages.min(kv_pages);
-        self.pools.trim(kept);
-        self.pools.release()
-    }
-
-    /// The elastic pool's reporting unit and its budget in that unit; both
-    /// zero for a fixed pool.
-    #[must_use]
-    pub fn pool_elastic(&self) -> (u64, u64) {
-        (
-            self.pools.elastic_page_bytes(),
-            self.pools.elastic_budget_pages(),
-        )
     }
 
     #[must_use]
@@ -1395,14 +1658,6 @@ impl Shell {
         self.programs.close_channel(id)
     }
 
-    pub fn program_ready(
-        &mut self,
-        instance_id: engine::InstanceId,
-    ) -> Result<Option<crate::program::Blocked>> {
-        self.fence_instances(&[instance_id])?;
-        self.programs.ready(instance_id)
-    }
-
     pub fn program_instance(
         &mut self,
         instance_id: engine::InstanceId,
@@ -1414,21 +1669,6 @@ impl Shell {
     pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
         self.fence_instances(&[instance_id])?;
         self.programs.close_instance(instance_id)
-    }
-
-    /// A pass with no forward: its prologue, if it runs on its own, then the rest.
-    pub fn fire_program(&mut self, instance_id: engine::InstanceId) -> Result<crate::Fired> {
-        self.fence_instances(&[instance_id])?;
-        if self.programs.prologue_runs(instance_id) {
-            let fired = self
-                .programs
-                .fire(&self.device, instance_id, Stage::Prologue)?;
-            if fired != crate::Fired::Committed {
-                return Ok(fired);
-            }
-        }
-        self.programs
-            .fire(&self.device, instance_id, Stage::Epilogue)
     }
 
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
@@ -1513,11 +1753,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn blob_store(&self) -> &crate::blob::Store {
-        &self.blobs
-    }
-
-    #[must_use]
     pub fn adapter_slots(&self) -> &crate::adapter::Slots {
         &self.adapters
     }
@@ -1535,66 +1770,8 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn weights_resident(&self) -> bool {
-        self.weights.tier().is_none()
-    }
-
-    #[must_use]
-    pub fn expert_residency(&self) -> Vec<crate::experts::GroupResidency> {
-        self.weights
-            .tier()
-            .map(|tier| tier.borrow().residency())
-            .unwrap_or_default()
-    }
-
-    pub fn set_copies(&mut self, copies: bool) {
-        self.copies = copies;
-    }
-
-    #[must_use]
     pub fn copies(&self) -> bool {
         self.copies
-    }
-
-    #[must_use]
-    pub fn last_fire(&self) -> FireCost {
-        self.last
-    }
-
-    #[must_use]
-    pub fn expert_motion(&self) -> (u64, u64) {
-        self.weights
-            .tier()
-            .map_or((0, 0), |tier| tier.borrow().motion())
-    }
-
-    #[must_use]
-    pub fn expert_hits(&self) -> (u64, u64) {
-        self.weights
-            .tier()
-            .map_or((0, 0), |tier| tier.borrow().hits())
-    }
-
-    #[must_use]
-    pub fn expert_host_time(&self) -> (u64, u64, u64) {
-        self.weights
-            .tier()
-            .map_or((0, 0, 0), |tier| tier.borrow().host_time())
-    }
-
-    #[must_use]
-    pub fn gathered_rows(&self) -> Option<crate::gather::Residency> {
-        self.weights.rows().map(|rows| rows.borrow().residency())
-    }
-
-    #[must_use]
-    pub fn expert_source(&self) -> Option<(u64, u64)> {
-        self.weights.tier().and_then(|tier| tier.borrow().source())
-    }
-
-    #[must_use]
-    pub fn expert_source_kind(&self) -> Option<&'static str> {
-        self.weights.tier().map(|tier| tier.borrow().source_kind())
     }
 
     #[must_use]
@@ -1617,10 +1794,6 @@ impl Shell {
         attachments: &[Attached],
     ) -> Result<Vec<Vec<f32>>> {
         use engine::frame::Shell as FrameShell;
-        // A caller firing directly has no runtime to commit ahead of it.
-        let paging = self.pools.paging();
-        self.commit_pool(u32::try_from(paging.pages()).unwrap_or(u32::MAX))?;
-        self.commit_state(paging.slots)?;
         let prepared = FrameShell::prepare(
             self,
             StepView {
@@ -1666,16 +1839,17 @@ impl Shell {
         self.rs_layout.is_some()
     }
 
+    /// An rs-list slot's bytes; none where nothing buffers.
     #[must_use]
     pub fn buffer_bytes(&self) -> u64 {
-        self.rs_buffers
-            .as_ref()
-            .map_or(0, crate::rs::Buffers::bytes)
+        self.pools.layout().rs.map_or(0, |rs| rs.slot_bytes)
     }
 
+    /// Seat `slot`'s state rows, one after another.
     pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
         self.drain()?;
-        self.pools.read_slot(slot)
+        let record = self.pools.record(None, slot)?;
+        self.pools.read_record(&record)
     }
 
     /// Each lane's read-back row, by its output's name.
@@ -2215,53 +2389,6 @@ impl Shell {
         Ok(())
     }
 
-    pub fn record(&mut self, lanes: &[Lane<'_>]) -> Result<Recording> {
-        let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
-        self.record_seated(&seated)
-    }
-
-    #[cfg(target_vendor = "apple")]
-    pub fn build_icb(&mut self, lanes: &[Lane<'_>]) -> Result<()> {
-        let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
-        let taped = self
-            .drive(&seated, Mode::Record)?
-            .tape
-            .ok_or_else(|| Fault::Unbound {
-                what: "a recording, from a walk that was asked for one".to_string(),
-            })?;
-        let mode = Mode::Build {
-            slots: taped.slots.len(),
-            constants: crate::icb::constants_for(&taped),
-        };
-        self.drive(&seated, mode).map(|_| ())
-    }
-
-    #[cfg(target_vendor = "apple")]
-    #[must_use]
-    pub fn icb(&self) -> Option<&crate::icb::Icb> {
-        self.icb.as_ref()
-    }
-
-    #[cfg(target_vendor = "apple")]
-    #[must_use]
-    pub fn rebound(&self) -> crate::icb::Rebound {
-        self.rebound
-    }
-
-    #[cfg(target_vendor = "apple")]
-    pub fn fire_indirect(&mut self, lanes: &[Lane<'_>]) -> Result<Vec<Vec<f32>>> {
-        let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
-        Ok(self.drive(&seated, Mode::Replay)?.logits)
-    }
-
-    pub fn record_seated(&mut self, lanes: &[Seated<'_>]) -> Result<Recording> {
-        self.drive(lanes, Mode::Record)?
-            .tape
-            .ok_or_else(|| Fault::Unbound {
-                what: "a recording, from a walk that was asked for one".to_string(),
-            })
-    }
-
     #[allow(clippy::arc_with_non_send_sync)]
     fn stage<'a>(&mut self, step: StepView<'a>) -> Result<Prepared<'a>> {
         let StepView {
@@ -2542,34 +2669,49 @@ impl Shell {
             })
             .collect();
         let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
-        let mut descriptor = FireDescriptor::of(&composition);
-        descriptor.run_caps = self.run_caps.clone();
-        descriptor.run_passes = self.run_passes.clone();
+        let descriptor = FireDescriptor::of(&composition);
         let rows = composition.rows();
         let lane_count = composition.lane_count();
 
+        // A seat-addressed lane writes the seat runs' chunks; a weight slot
+        // named there would be overwritten under the cache's feet.
+        if lanes.iter().any(|seated| !seated.refs) && self.pools.weights_in_seats() {
+            return Err(Fault::Unbound {
+                what: "a seat-addressed lane while the weight cache holds a slot in a chunk \
+                       the seat runs take"
+                    .to_string(),
+            });
+        }
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
         let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
+        // Per window list, per lane: its pages.
+        let window_lists = self.pools.layout().window_lists().count();
+        let mut window_tables: Vec<Vec<Vec<u32>>> =
+            vec![Vec::with_capacity(lanes.len()); window_lists];
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
-        let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
+        // Each band's lane and row tables of record piece ids, filled lane
+        // by lane and joined band after band below.
+        let widths = self.pools.bands();
+        let mut lane_bands: Vec<Vec<i32>> = vec![Vec::new(); widths.len()];
+        let mut row_bands: Vec<Vec<i32>> = vec![Vec::new(); widths.len()];
+        let mut state_top = 0u32;
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
         let mut rs_active = false;
         // Per fire lane, the rows inside it whose state lands in a slot of its
         // own and then those slots (`kernels_metal::ssm::Snapshots`).
-        let mut rs_snaps: Vec<i32> = Vec::new();
+        let mut snap_bands: Vec<Vec<i32>> = Vec::new();
         let mut snap_slots = 0u32;
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
-        let mut slot_of_row: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
         let mut adapter_routes: Vec<i32> = Vec::new();
         let any_adapter = lanes.iter().any(|seated| seated.adapter.is_some());
         if any_adapter {
             adapter_routes.reserve(rows as usize);
         }
-        let mut beginning: Vec<u32> = Vec::new();
+        let mut beginning: Vec<Vec<u32>> = Vec::new();
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         for row in composition.lanes() {
             let source = row.source as usize;
@@ -2627,8 +2769,25 @@ impl Shell {
                 engine::fire::RsReset::Fresh => true,
                 engine::fire::RsReset::Held => false,
             };
+            let record = self.record_of(seated)?;
+            for (k, lists) in window_tables.iter_mut().enumerate() {
+                lists.push(if seated.kv_less {
+                    Vec::new()
+                } else {
+                    let page_size = u64::from(self.pools.window_paging(k).page_size.max(1));
+                    let after = u64::from(have) + u64::from(row.rows);
+                    let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
+                    let refs = seated.windows.get(k).map_or(&[][..], Vec::as_slice);
+                    let seat = (!seated.refs || refs.is_empty()).then_some((lane.slot, pages));
+                    self.pools.window_pages(k, refs, seat)?
+                });
+            }
+            state_top = record
+                .iter()
+                .map(|&id| id.saturating_add(1))
+                .fold(state_top, u32::max);
             if fresh {
-                beginning.push(seated.rs_slot.unwrap_or(lane.slot));
+                beginning.push(record.clone());
             }
             seats.push(Seat {
                 slot: lane.slot,
@@ -2637,8 +2796,17 @@ impl Shell {
             });
             kv_less.push(seated.kv_less);
             tables.push(match &device_pages[source] {
-                Some(pages) => std::borrow::Cow::Owned(pages.clone()),
-                None => std::borrow::Cow::Borrowed(seated.pages),
+                Some(pages) => std::borrow::Cow::Owned(self.pools.kv_pages(pages, None)?),
+                None if seated.kv_less => std::borrow::Cow::Borrowed(seated.pages),
+                None => {
+                    let after = u64::from(have) + u64::from(row.rows);
+                    let page_size = u64::from(self.pools.paging().page_size.max(1));
+                    let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
+                    std::borrow::Cow::Owned(
+                        self.pools
+                            .kv_pages(seated.pages, Some((lane.slot, pages)))?,
+                    )
+                }
             });
             // A kv-less lane's mask goes to its group-packed attention, not the paged prefill.
             let masking = if seated.kv_less {
@@ -2686,8 +2854,8 @@ impl Shell {
                     .map_or(-1, |id| i32::try_from(id).unwrap_or(-1));
                 adapter_routes.extend(std::iter::repeat_n(id, row.rows as usize));
             }
-            slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
-            let at_lane = slot_ids.len() as i32 - 1;
+            // This lane's index: its seat was pushed above.
+            let at_lane = seats.len() as i32 - 1;
             {
                 const MAX: usize = kernels_metal::ssm::RS_SNAPSHOTS as usize;
                 let snaps = seated.rs_snapshots;
@@ -2709,19 +2877,44 @@ impl Shell {
                         ),
                     ));
                 }
-                if !snaps.is_empty() && rs_snaps.is_empty() {
-                    rs_snaps.resize(at_lane as usize * 2 * MAX, 0);
+                if !snaps.is_empty() && snap_bands.is_empty() {
+                    snap_bands = widths
+                        .iter()
+                        .map(|&w| vec![0i32; at_lane as usize * MAX * (1 + w as usize)])
+                        .collect();
                 }
-                // Lane 0 leaves the table empty above, so emptiness cannot
+                // Lane 0 leaves the tables empty above, so emptiness cannot
                 // stand for "no lane has snapshots".
-                if !snaps.is_empty() || !rs_snaps.is_empty() {
-                    let mut entry = [0i32; 2 * MAX];
-                    for (at, snap) in snaps.iter().enumerate() {
-                        entry[at] = narrow(u64::from(snap.row));
-                        entry[MAX + at] = narrow(u64::from(snap.slot));
-                        snap_slots = snap_slots.max(snap.slot.saturating_add(1));
+                if !snaps.is_empty() || !snap_bands.is_empty() {
+                    // Each snapshot's record, a physical id a piece
+                    // (`RsSnapshot::pieces`, its slot the first; a seat's
+                    // record where the lane is seat-addressed).
+                    let mut records = Vec::with_capacity(snaps.len());
+                    for snap in snaps {
+                        let record = if !seated.refs {
+                            self.pools.record(None, snap.slot)?
+                        } else if snap.pieces.is_empty() {
+                            vec![self.pools.state_slot(snap.slot, false)?]
+                        } else {
+                            self.pools.record(Some(&snap.pieces), lane.slot)?
+                        };
+                        snap_slots = record
+                            .iter()
+                            .map(|&id| id.saturating_add(1))
+                            .fold(snap_slots, u32::max);
+                        records.push(self.pools.band_ids(&record));
                     }
-                    rs_snaps.extend(entry);
+                    let mut at = 0usize;
+                    for (band, &w) in snap_bands.iter_mut().zip(&widths) {
+                        let w = w as usize;
+                        let mut entry = vec![0i32; MAX * (1 + w)];
+                        for (n, (snap, ids)) in snaps.iter().zip(&records).enumerate() {
+                            entry[n] = narrow(u64::from(snap.row));
+                            entry[MAX + n * w..MAX + (n + 1) * w].copy_from_slice(&ids[at..at + w]);
+                        }
+                        band.extend(entry);
+                        at += w;
+                    }
                 }
             }
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
@@ -2743,8 +2936,26 @@ impl Shell {
             let first = stated
                 .and_then(|slots| slots.first().copied())
                 .unwrap_or(have);
+            // The buffer's rows live in the rs list: the verb's pages, in
+            // token order from its base (CONTRACT-BC 18).
+            let rs = match seated.rs {
+                engine::fire::RsVerb::Buffer {
+                    pages,
+                    base,
+                    folded,
+                    fold,
+                } => engine::fire::RsVerb::Buffer {
+                    pages: self
+                        .pools
+                        .rs_pages(pages, (!seated.refs).then_some(lane.slot))?,
+                    base: *base,
+                    folded: *folded,
+                    fold: *fold,
+                },
+                verb => verb.clone(),
+            };
             let plan = engine::rs::LanePlan::of(
-                seated.rs,
+                &rs,
                 row.rows,
                 first,
                 masking,
@@ -2756,6 +2967,32 @@ impl Shell {
                     "recurrent seat: lane {} rows {} replay {} commit {} gather {:?} scatter {:?}",
                     row.source, row.rows, plan.replay, plan.commit, plan.gather, plan.scatter
                 );
+            }
+            // The state the lane's kernels read and fold: the record it
+            // writes, but a lane of a copy-on-write group that folds nothing
+            // reads the run side, which no other lane writes this fire
+            // (CONTRACT-BC 15); its buffered rows still land in `record`.
+            let state = match seated.record_run {
+                Some(run) if plan.commit == 0 => self.pools.record(Some(run), lane.slot)?,
+                _ => record.clone(),
+            };
+            state_top = state
+                .iter()
+                .map(|&id| id.saturating_add(1))
+                .fold(state_top, u32::max);
+            let band_ids = self.pools.band_ids(&state);
+            {
+                let mut at = 0usize;
+                for ((lanes_band, rows_band), &width) in
+                    lane_bands.iter_mut().zip(row_bands.iter_mut()).zip(&widths)
+                {
+                    let ids = &band_ids[at..at + width as usize];
+                    lanes_band.extend_from_slice(ids);
+                    for _ in 0..row.rows {
+                        rows_band.extend_from_slice(ids);
+                    }
+                    at += width as usize;
+                }
             }
             rs_plans.push(plan);
             if !seated.positions.is_empty() && seated.positions.len() != lane.tokens.len() {
@@ -2788,15 +3025,16 @@ impl Shell {
                     rotations.extend(stated);
                     match &device_writes[source] {
                         Some((slots, offsets)) => {
-                            writes.extend(slots.iter().zip(offsets).map(|(&page, &off)| {
-                                Some((narrow(u64::from(page)), narrow(u64::from(off))))
-                            }));
+                            for (&page, &off) in slots.iter().zip(offsets) {
+                                let page = self.pools.kv_page(page)?;
+                                writes
+                                    .push(Some((narrow(u64::from(page)), narrow(u64::from(off)))));
+                            }
                         }
                         None => writes.extend(std::iter::repeat_n(None, rows_here)),
                     }
                     for _ in 0..rows_here {
                         request_of_token.push(at_lane);
-                        slot_of_row.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
                     }
                 }
                 None => {
@@ -2812,7 +3050,6 @@ impl Shell {
                         positions.push(if self.states_mrope { row } else { stated });
                         rotations.push(stated);
                         request_of_token.push(at_lane);
-                        slot_of_row.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
                     }
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }
@@ -2851,30 +3088,50 @@ impl Shell {
                 .chain(std::iter::once(written))
                 .max()
                 .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX)),
-            state_slots: slot_ids
-                .iter()
-                .map(|&row| (row as u32).saturating_add(1))
-                .max()
-                .unwrap_or(0)
-                .max(snap_slots),
+            state_slots: state_top.max(snap_slots),
             workspace: 0,
         };
+        // A caller firing directly (every lane seat-addressed) has no
+        // runtime to commit ahead of it: the segments its seats touch back now.
+        if lanes.iter().all(|seated| !seated.refs) {
+            self.pools.commit_seats()?;
+        }
         self.pools.admit(demand)?;
 
         if !beginning.is_empty() && self.pools.has_state() {
             self.drain()?;
         }
-        for slot in beginning {
-            self.pools.clear(slot)?;
+        for record in beginning {
+            self.pools.clear(&record)?;
         }
+        let slot_ids: Vec<i32> = lane_bands.concat();
+        let rs_snaps: Vec<i32> = snap_bands.concat();
+        let slot_of_row: Vec<i32> = row_bands.concat();
 
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
-        let mut geometries = (0..self.spaces)
-            .map(|_| kv::geometry_with(&paging, &seats, &table_refs))
-            .collect::<Result<Vec<_>>>()?;
+        let window_refs: Vec<Vec<&[u32]>> = window_tables
+            .iter()
+            .map(|lists| lists.iter().map(Vec::as_slice).collect())
+            .collect();
+        let mut geometries = Vec::with_capacity(self.page_tables);
+        for &paging_of in self.pools.tables() {
+            geometries.push(match paging_of {
+                crate::store::TablePaging::List => kv::geometry_with(&paging, &seats, &table_refs)?,
+                crate::store::TablePaging::Window(k) => {
+                    let k = usize::from(k);
+                    let refs = window_refs.get(k).ok_or_else(|| {
+                        Fault::program("serve::prepare", format!("window list {k} has no table"))
+                    })?;
+                    kv::geometry_with(&self.pools.window_paging(k), &seats, refs)?
+                }
+            });
+        }
         if writes.iter().any(Option::is_some) {
-            for geometry in &mut geometries {
+            for (geometry, &paging_of) in geometries.iter_mut().zip(self.pools.tables()) {
+                if paging_of != crate::store::TablePaging::List {
+                    continue;
+                }
                 for (row, stated) in writes.iter().enumerate() {
                     let Some((page, offset)) = *stated else {
                         continue;
@@ -2919,17 +3176,11 @@ impl Shell {
             crate::window::Copies {
                 bucket,
                 enabled: self.copies && masks.iter().all(|lane| lane.mask.is_none()),
-                spaces: &geometries,
+                page_tables: &geometries,
                 positions: &positions,
                 request_of_token: &request_of_token,
             },
-            &self.run_caps,
-            &self.run_passes,
         )?;
-        self.last = FireCost {
-            launches: windows.launches(),
-            copied: windows.copied(),
-        };
         let boundaries = windows.packed();
 
         let staged = crate::mask::stage(&masks)?;
@@ -3159,7 +3410,7 @@ impl Shell {
                         narrow(u64::from(offset)),
                     ]);
                     let seated = &lanes[row.source as usize];
-                    voxel_slots.push(seated.rs_slot.unwrap_or(seated.lane.slot) as i32);
+                    voxel_slots.push(self.state_id(seated)? as i32);
                     let voxels = boxed[0].saturating_mul(boxed[1]).saturating_mul(boxed[2]);
                     offset = offset.saturating_add(voxels);
                     if let Some(p) = token_patch {
@@ -3273,7 +3524,7 @@ impl Shell {
                 rs_pages: rs_pages.as_deref(),
                 request_of_token: &request_of_token,
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
-                spaces: &geometries,
+                page_tables: &geometries,
                 mask: staged.as_ref(),
                 patches: (patch_rows > 0).then_some(crate::inputs::PatchFire {
                     payload: &patch_payload,
@@ -3319,9 +3570,9 @@ impl Shell {
             self.tuning.kv_q8(),
         )?;
 
-        let mut geometry = Vec::with_capacity(self.spaces);
-        for space in 0..self.spaces {
-            let seat = bound.spaces[space];
+        let mut geometry = Vec::with_capacity(self.page_tables);
+        for table in 0..self.page_tables {
+            let seat = bound.page_tables[table];
             geometry.push(CacheGeometry {
                 indptr: Some(seat.indptr),
                 indices: Some(seat.indices),
@@ -3371,6 +3622,20 @@ impl Shell {
             voxels: bound.voxels,
             inputs: bound.inputs,
             geometry,
+            window_tables: self
+                .pools
+                .layout()
+                .window_lists()
+                .enumerate()
+                .map(|(k, window)| {
+                    (
+                        window.rows,
+                        self.pools.table_of(crate::store::TablePaging::Window(
+                            u8::try_from(k).unwrap_or(u8::MAX),
+                        )),
+                    )
+                })
+                .collect(),
             tables: FireTables {
                 request_of_token: bound.request_of_token,
                 readout_positions: bound.readout_positions,
@@ -3381,6 +3646,7 @@ impl Shell {
                 mask_stride: bound.mask_stride,
             },
             rs_snaps: bound.rs_snaps,
+            rs_snap_bands: bound.rs_snap_bands.clone(),
             rs: if rs_active {
                 let (Some(layout), Some(buffers), Some(scratch)) =
                     (&self.rs_layout, &self.rs_buffers, &self.rs_scratch)
@@ -3580,147 +3846,22 @@ impl Shell {
         Ok(())
     }
 
-    fn walk_once(&self, p: &Prepared<'_>, mode: Mode) -> Result<Walked> {
-        let place = At::new();
-        let mut frame = match mode {
-            Mode::Encode => Some(self.device.frame()?),
-            Mode::Record | Mode::Build { .. } | Mode::Replay => None,
-        };
-        if let Some(frame) = frame.as_mut() {
-            if let Some(plane) = self.nan_flags.as_ref() {
-                frame.fill_zero(plane.slab(), 0, plane.bytes())?;
-                #[cfg(target_vendor = "apple")]
-                frame.next_pass()?;
-            }
-            self.feed_inputs(frame, p)?;
-            self.land_merges(frame, p)?;
-        }
-        let sink = match mode {
-            Mode::Encode => {
-                let sink = Sink::new(
-                    &self.device,
-                    frame.as_ref().expect("the encoding mode opened a frame"),
-                    &self.pipelines,
-                    &self.handles,
-                );
-                #[cfg(target_vendor = "apple")]
-                let sink = sink
-                    .with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff))
-                    .flushing_after(HEAD_LAUNCHES);
-                Encoded::Live(sink)
-            }
-            Mode::Record | Mode::Replay => {
-                Encoded::Taped(Tape::new(&self.handles, &place, &p.windows))
-            }
-            #[cfg(target_vendor = "apple")]
-            Mode::Build { slots, constants } => Encoded::Built(crate::icb::Builder::new(
-                &self.device,
-                &self.pipelines,
-                &self.handles,
-                &place,
-                slots,
-                constants,
-            )?),
-            #[cfg(not(target_vendor = "apple"))]
-            Mode::Build { .. } => return Err(Fault::Deviceless),
-        };
-        {
-            let mut run = Run::new(
-                &sink,
-                &self.handles,
-                &self.trace.values,
-                &self.trace.nodes,
-                self.weights.table(),
-                &p.slots,
-                &p.caches,
-                p.bindings.clone(),
-                &p.windows,
-                &place,
-                &self.scratch,
-                &self.tuning,
-            )
-            .with_ane(self.ane.as_ref().filter(|_| matches!(mode, Mode::Encode)))
-            .with_regions(self.compiled.template());
-            walk(
-                &self.trace,
-                &self.compiled,
-                &p.descriptor,
-                &mut run,
-                &mut Cursor::new(&place),
-                Filter::default(),
-            )?;
-        }
-
-        let classes: Vec<(u32, u32)> = p
-            .composition
-            .classes()
-            .as_slice()
-            .iter()
-            .map(|class| (class.rows, class.lanes))
-            .collect();
-        #[cfg_attr(not(target_vendor = "apple"), allow(unused_mut))]
-        let mut built = None;
-        let taped = match sink {
-            Encoded::Live(_) => None,
-            Encoded::Taped(tape) => Some(tape.finish(classes)),
-            #[cfg(target_vendor = "apple")]
-            Encoded::Built(builder) => {
-                built = Some(builder.finish()?);
-                None
-            }
-        };
-        let launches = (0..self.compiled.template().len() as u32)
-            .map(|region| p.windows.runs(region).max(1))
-            .sum();
-        Ok(Walked {
-            frame,
-            tape: taped,
-            built,
-            launches,
-        })
-    }
-
-    fn walk_streamed(&self, p: &Prepared<'_>) -> Result<Walked> {
-        let tier = self.weights.tier();
-        let rows = self.weights.rows();
-        if let Some(rows) = rows {
-            rows.borrow_mut().fire();
-        }
-        for (region, cut) in self.row_cuts.iter().enumerate() {
-            let runs = p.windows.runs(region as u32);
-            if cut.is_some() && runs > 1 {
-                return Err(Fault::Residency(format!(
-                    "region {region} carries an n-gram hasher and this fire splits its \
-                     window into {runs} runs; a gathered load cuts its command buffer once \
-                     per region, so the second run would read the first run's SEAT numbers \
-                     as table rows and seat them again. Raise `device_weight_budget` to \
-                     hold the n-gram table whole, or submit a composition whose classes \
-                     are consecutive."
-                )));
-            }
-        }
-
+    fn walk_once(&self, p: &Prepared<'_>) -> Result<Walked> {
         let place = At::new();
         let mut frame = self.device.frame()?;
+        if let Some(plane) = self.nan_flags.as_ref() {
+            frame.fill_zero(plane.slab(), 0, plane.bytes())?;
+            #[cfg(target_vendor = "apple")]
+            frame.next_pass()?;
+        }
         self.feed_inputs(&mut frame, p)?;
         self.land_merges(&mut frame, p)?;
-        let sink = Encoded::Live(Sink::streaming(
-            &self.device,
-            frame,
-            &self.pipelines,
-            &self.handles,
-            crate::encode::Cuts::new(
-                &place,
-                &self.cuts,
-                &self.row_cuts,
-                &p.slots,
-                &p.windows,
-                self.arena.store().clone(),
-                tier,
-                rows,
-            ),
-        ));
         {
+            let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
+            #[cfg(target_vendor = "apple")]
+            let sink = sink
+                .with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff))
+                .flushing_after(HEAD_LAUNCHES);
             let mut run = Run::new(
                 &sink,
                 &self.handles,
@@ -3735,6 +3876,7 @@ impl Shell {
                 &self.scratch,
                 &self.tuning,
             )
+            .with_ane(self.ane.as_ref())
             .with_regions(self.compiled.template());
             walk(
                 &self.trace,
@@ -3745,111 +3887,11 @@ impl Shell {
                 Filter::default(),
             )?;
         }
-        let frame = match sink {
-            Encoded::Live(sink) => sink.into_frame(),
-            Encoded::Taped(_) => None,
-            #[cfg(target_vendor = "apple")]
-            Encoded::Built(_) => None,
-        };
+
         let launches = (0..self.compiled.template().len() as u32)
             .map(|region| p.windows.runs(region).max(1))
             .sum();
-        Ok(Walked {
-            frame,
-            tape: None,
-            built: None,
-            launches,
-        })
-    }
-
-    #[allow(clippy::too_many_lines)]
-    #[cfg_attr(
-        not(target_vendor = "apple"),
-        allow(
-            unreachable_code,
-            reason = "off Apple every mode below diverges with `Deviceless`, so the \
-                      readback after them is unreachable rather than absent"
-        )
-    )]
-    fn drive(&mut self, lanes: &[Seated<'_>], mode: Mode) -> Result<Outcome> {
-        debug_assert!(
-            !matches!(mode, Mode::Encode),
-            "the encoding mode goes through the three phases"
-        );
-        self.drain()?;
-        let p = self.stage(StepView {
-            lanes,
-            attachments: &[],
-            media: &[],
-            clips: &[],
-            done: None,
-        })?;
-        let walked = self.walk_once(&p, mode)?;
-        let taped = walked.tape;
-        #[cfg(target_vendor = "apple")]
-        if let Some(built) = walked.built {
-            self.icb = Some(built);
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        let _ = walked.built;
-        match mode {
-            Mode::Record => {
-                self.handles.rewind();
-                return Ok(Outcome {
-                    logits: Vec::new(),
-                    tape: taped,
-                });
-            }
-            Mode::Build { .. } => {
-                self.handles.rewind();
-                return Ok(Outcome {
-                    logits: Vec::new(),
-                    tape: None,
-                });
-            }
-            Mode::Replay => {
-                #[cfg(target_vendor = "apple")]
-                {
-                    let taped = taped.expect("the replay mode records");
-                    let Shell {
-                        device,
-                        pipelines,
-                        icb,
-                        rebound,
-                        ..
-                    } = self;
-                    let icb = icb.as_mut().ok_or_else(|| Fault::Unbound {
-                        what: "an indirect command buffer, which this load never built".to_string(),
-                    })?;
-                    *rebound = icb.rebind(device, pipelines, &taped)?;
-                    icb.execute(device)?;
-                }
-                #[cfg(not(target_vendor = "apple"))]
-                {
-                    let _ = taped;
-                    return Err(Fault::Deviceless);
-                }
-            }
-            Mode::Encode => unreachable!("checked above"),
-        }
-
-        let mut taken = vec![Vec::new(); lanes.len()];
-        for row in p.composition.lanes() {
-            let Some((_, offset, width, element)) = self.readback_row(&p, row)? else {
-                continue;
-            };
-            let mut raw = vec![0u8; width as usize * element as usize];
-            self.arena.read(offset, &mut raw)?;
-            taken[row.source as usize] = widen(&raw, element as usize);
-        }
-
-        self.advance(&p);
-
-        self.handles.rewind();
-        Ok(Outcome {
-            logits: taken,
-            tape: None,
-        })
+        Ok(Walked { frame, launches })
     }
 
     fn advance(&mut self, p: &Prepared<'_>) {
@@ -3865,40 +3907,8 @@ impl Shell {
 
 const SETTLED_RING: usize = 2 * Runahead::STEPS_MAX as usize;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(target_vendor = "apple"),
-    allow(
-        dead_code,
-        reason = "the indirect plane is Apple's; the modes are named on both"
-    )
-)]
-enum Mode {
-    Encode,
-    Record,
-    Build { slots: usize, constants: u64 },
-    Replay,
-}
-
-struct Outcome {
-    #[cfg_attr(
-        not(target_vendor = "apple"),
-        allow(
-            dead_code,
-            reason = "the only reader is the indirect plane's, which is Apple's"
-        )
-    )]
-    logits: Vec<Vec<f32>>,
-    tape: Option<Recording>,
-}
-
 struct Walked {
-    frame: Option<Frame>,
-    tape: Option<Recording>,
-    #[cfg(target_vendor = "apple")]
-    built: Option<crate::icb::Icb>,
-    #[cfg(not(target_vendor = "apple"))]
-    built: Option<()>,
+    frame: Frame,
     launches: u32,
 }
 
@@ -4026,41 +4036,19 @@ impl engine::frame::Shell for Shell {
             keepalive.touch();
             keepalive.begin();
         }
-        fire_trace(|| "encode-begin".to_string());
-        let walked = if self.weights.tier().is_some() || self.weights.rows().is_some() {
-            let trace = crate::diag::on().tier_trace;
-            let before = trace.then(|| {
-                (
-                    self.expert_motion(),
-                    self.expert_hits(),
-                    self.expert_host_time(),
-                    std::time::Instant::now(),
-                )
-            });
-            let walked = self.walk_streamed(&prepared)?;
-            if let Some(((swaps0, cuts0), (hits0, misses0), (cut0, copy0, wait0), started)) = before
-            {
-                let (swaps, cuts) = self.expert_motion();
-                let (hits, misses) = self.expert_hits();
-                let (cut_ns, copy_ns, wait_ns) = self.expert_host_time();
-                eprintln!(
-                    "tier: fire of {} row(s): {} seat copies over {} cuts, {} hits / {} misses; \
-                     cuts {:.1} ms (copies {:.1} ms, waiting on the device {:.1} ms); walk {:.1} ms",
-                    prepared.descriptor.rows,
-                    swaps - swaps0,
-                    cuts - cuts0,
-                    hits - hits0,
-                    misses - misses0,
-                    (cut_ns - cut0) as f64 / 1e6,
-                    (copy_ns - copy0) as f64 / 1e6,
-                    (wait_ns - wait0) as f64 / 1e6,
-                    started.elapsed().as_secs_f64() * 1e3
-                );
-            }
-            walked
-        } else {
-            self.walk_once(&prepared, Mode::Encode)?
-        };
+        fire_trace(|| {
+            let lanes: Vec<String> = prepared
+                .lanes
+                .iter()
+                .map(|lane| format!("{}+{}", lane.held.unwrap_or(0), lane.lane.tokens.len()))
+                .collect();
+            format!(
+                "encode-begin rows={} lanes=[{}]",
+                prepared.descriptor.rows,
+                lanes.join(" ")
+            )
+        });
+        let walked = self.walk_once(&prepared)?;
         fire_trace(|| "forward-encoded".to_string());
         let profile = crate::encode::kernel_profile();
         if !profile.is_empty() {
@@ -4080,7 +4068,7 @@ impl engine::frame::Shell for Shell {
             }
             crate::encode::reset_kernel_profile();
         }
-        let mut frame = walked.frame.expect("the encoding mode opened a frame");
+        let mut frame = walked.frame;
 
         let mut readbacks = vec![None; prepared.lanes.len()];
         if self.host_rows || self.rows_wanted {
@@ -4176,67 +4164,6 @@ impl engine::frame::Shell for Shell {
             lanes,
             launches,
         })
-    }
-}
-
-enum Encoded<'a> {
-    Live(Sink<'a>),
-    Taped(Tape<'a>),
-    #[cfg(target_vendor = "apple")]
-    Built(crate::icb::Builder<'a>),
-}
-
-impl kernels_metal::Encode for Encoded<'_> {
-    fn fire(
-        &self,
-        fire: kernels_metal::Fire,
-        args: &[kernels_metal::ArgValue],
-    ) -> std::result::Result<(), kernels_metal::Error> {
-        match self {
-            Encoded::Live(sink) => sink.fire(fire, args),
-            Encoded::Taped(tape) => tape.fire(fire, args),
-            #[cfg(target_vendor = "apple")]
-            Encoded::Built(builder) => builder.fire(fire, args),
-        }
-    }
-
-    fn absent(&self) -> std::result::Result<kernels_metal::ArgValue, kernels_metal::Error> {
-        match self {
-            Encoded::Live(sink) => sink.absent(),
-            Encoded::Taped(tape) => tape.absent(),
-            #[cfg(target_vendor = "apple")]
-            Encoded::Built(builder) => builder.absent(),
-        }
-    }
-
-    fn signal(&self, stamp: u64) -> std::result::Result<(), kernels_metal::Error> {
-        match self {
-            Encoded::Live(sink) => sink.signal(stamp),
-            Encoded::Taped(tape) => tape.signal(stamp),
-            #[cfg(target_vendor = "apple")]
-            Encoded::Built(builder) => builder.signal(stamp),
-        }
-    }
-
-    fn wait(&self, stamp: u64) -> std::result::Result<(), kernels_metal::Error> {
-        match self {
-            Encoded::Live(sink) => sink.wait(stamp),
-            Encoded::Taped(tape) => tape.wait(stamp),
-            #[cfg(target_vendor = "apple")]
-            Encoded::Built(builder) => builder.wait(stamp),
-        }
-    }
-
-    fn on_commit(
-        &self,
-        then: Box<dyn FnOnce() + Send>,
-    ) -> std::result::Result<(), kernels_metal::Error> {
-        match self {
-            Encoded::Live(sink) => sink.on_commit(then),
-            Encoded::Taped(tape) => tape.on_commit(then),
-            #[cfg(target_vendor = "apple")]
-            Encoded::Built(builder) => builder.on_commit(then),
-        }
     }
 }
 

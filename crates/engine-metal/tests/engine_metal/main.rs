@@ -1,12 +1,13 @@
 //! engine-metal's integration tests, one binary: each module was a test file.
 
 mod a_buffered_fold_is_the_fold_it_replaces;
-mod a_capped_fire_packs_no_more_windows_than_the_load_reserved;
 mod a_column_cut_of_a_bank_multiplies_as_its_copy;
 mod a_copied_window_is_one_encode_over_the_same_rows;
 mod a_fenced_frame_lands_both_sides;
 mod a_gate_and_an_up_apart_land_what_they_land_packed;
+mod a_parked_lane_serves_the_never_parked_logits;
 mod a_prompt_scan_lands_its_snapshots;
+mod a_scattered_pool_serves_the_same_logits;
 mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tower_region_reads_the_patch_window;
 mod a_verify_walk_is_the_committed_walk;
@@ -42,13 +43,13 @@ mod the_selector_reads_out_the_reference_walk;
 mod the_staged_rows_match_affine_dots;
 mod the_tower_reads_pixels_as_the_host_cut_them;
 mod the_voxel_axis_answers_its_host_reference;
+mod the_weight_cache_serves_the_dense_logits;
 
-/// The bytes a pool takes that holds `slots` sequences at `context`, the
-/// `device_kv_budget` a test states for its shell.
+/// The `device_kv_budget` a test states for its shell: none, so the chunk
+/// pool spans the room. A sparse pool maps only the segments a fire touches
+/// (a direct fire, its seats' runs), so the room costs address space alone.
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 fn full_pool(trace: &poem_ir::Trace, page_size: u32, context: u32, slots: u32) -> Option<u64> {
-    let pages = u64::from(slots * context.div_ceil(page_size));
-    let paging = engine_metal::store::kv::Paging::of(page_size, context, slots, pages)
-        .expect("a test's paging");
-    Some(engine_metal::store::pool_bytes(trace, paging).expect("the pool sizes"))
+    let _ = (trace, page_size, context, slots);
+    None
 }

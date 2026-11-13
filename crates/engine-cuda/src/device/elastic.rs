@@ -78,7 +78,6 @@ pub struct PhysicalPool {
     pledged_pages: u64,
     held_pages: u64,
     committed_pages: u64,
-    high_water_pages: u64,
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     utilization: f64,
 }
@@ -106,7 +105,6 @@ impl PhysicalPool {
                 pledged_pages: 0,
                 held_pages: 0,
                 committed_pages: 0,
-                high_water_pages: 0,
                 utilization,
             })
         }
@@ -129,7 +127,6 @@ impl PhysicalPool {
             pledged_pages: 0,
             held_pages: 0,
             committed_pages: 0,
-            high_water_pages: 0,
             utilization: 1.0,
         }
     }
@@ -182,11 +179,6 @@ impl PhysicalPool {
         self.committed_pages
     }
 
-    #[must_use]
-    pub const fn high_water_pages(&self) -> u64 {
-        self.high_water_pages
-    }
-
     /// What the pool can still take: the budget past what is committed and
     /// what is promised.
     #[must_use]
@@ -211,7 +203,11 @@ impl PhysicalPool {
         let promised = self.held_pages.min(pages);
         self.held_pages -= promised;
         self.committed_pages += pages;
-        self.high_water_pages = self.high_water_pages.max(self.committed_pages);
+    }
+
+    /// `pages` committed earlier went back to the device.
+    pub fn mark_released(&mut self, pages: u64) {
+        self.committed_pages = self.committed_pages.saturating_sub(pages);
     }
 
     /// Pledges the pool `pages` whatever the device reports free from here
@@ -425,11 +421,6 @@ impl Arena {
     #[must_use]
     pub const fn max_bytes(&self) -> u64 {
         self.max_bytes
-    }
-
-    #[must_use]
-    pub const fn map_unit(&self) -> u64 {
-        self.map_unit
     }
 
     #[must_use]
@@ -650,6 +641,43 @@ impl Arena {
         }
     }
 
+    /// Unmaps every backed unit not in `keep` (ascending) and returns its
+    /// memory to the device; a flat arena keeps its one allocation.
+    fn shrink_to(&mut self, pool: &mut PhysicalPool, keep: &[usize]) {
+        if self.flat {
+            // One allocation backs every unit: it goes only when none is
+            // kept, as a reshape gives its range back before allocating
+            // the next.
+            if keep.is_empty() && self.base != 0 {
+                #[cfg(feature = "device")]
+                // SAFETY: the flat arena's one allocation, freed once; the
+                // base is cleared so `Drop` frees nothing.
+                unsafe {
+                    let _ = crate::device::rt::cudaFree(self.base as *mut core::ffi::c_void);
+                }
+                pool.mark_released(pages_for_bytes(self.mapped * self.map_unit));
+                self.base = 0;
+                self.units.fill(None);
+                self.mapped = 0;
+            }
+            return;
+        }
+        let mut dropped = 0u64;
+        for unit in 0..self.units.len() {
+            if keep.binary_search(&unit).is_ok() {
+                continue;
+            }
+            let Some(handle) = self.units[unit].take() else {
+                continue;
+            };
+            self.unmap(self.base + unit as u64 * self.map_unit);
+            pool.release_handle(handle);
+            self.mapped = self.mapped.saturating_sub(1);
+            dropped += 1;
+        }
+        pool.mark_released(pages_for_bytes(dropped * self.map_unit));
+    }
+
     pub fn span(&self, offset: u64, len: u64) -> Result<u64> {
         let end = offset.saturating_add(len);
         let backed = self.map_unit != 0
@@ -794,6 +822,217 @@ pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) ->
 pub fn commit_beside(pool: &PhysicalPool, arena: &mut Arena, want: &Want) -> Result<()> {
     let units = arena.target_units(want)?;
     arena.grow(pool, &units)
+}
+
+/// One reserved address range cut into equal segments, backed from the
+/// bottom a segment at a time, with spans of it held backed apart: the
+/// state pool's chunks grow up from offset 0 and a fire's activation sits
+/// under the range's end, so neither end's base ever moves.
+///
+/// A segment need not be a whole number of map units: the units a segment's
+/// bytes touch are backed, and a unit two segments share stays backed while
+/// either is committed.
+#[derive(Debug)]
+pub struct Range {
+    arena: Arena,
+    segment_bytes: u64,
+    committed: u32,
+    /// Spans `(from, bytes)` that stay backed whatever is committed.
+    held: Vec<(u64, u64)>,
+    /// The bytes from the range's start a committed segment backs at most:
+    /// past them a segment backs nothing ([`Range::limit`]).
+    limit: u64,
+    /// The most bytes the committed segments have backed, the held spans
+    /// apart.
+    segment_high: u64,
+}
+
+impl Range {
+    /// Reserves `bytes` of addresses in segments of `segment_bytes`; nothing
+    /// is backed yet.
+    pub fn reserve(
+        pool: &PhysicalPool,
+        bytes: u64,
+        segment_bytes: u64,
+        label: &'static str,
+    ) -> Result<Range> {
+        Ok(Range {
+            arena: Arena::reserve(pool, bytes, label)?,
+            segment_bytes: segment_bytes.max(1),
+            committed: 0,
+            held: Vec::new(),
+            limit: u64::MAX,
+            segment_high: 0,
+        })
+    }
+
+    #[must_use]
+    pub const fn base(&self) -> u64 {
+        self.arena.base
+    }
+
+    #[must_use]
+    pub const fn bytes(&self) -> u64 {
+        self.arena.max_bytes
+    }
+
+    #[must_use]
+    pub const fn segment_bytes(&self) -> u64 {
+        self.segment_bytes
+    }
+
+    /// The unit the range is backed in: what a commit rounds up to.
+    #[must_use]
+    pub const fn map_unit(&self) -> u64 {
+        self.arena.map_unit
+    }
+
+    /// The segments the range holds, the last one short where the range is
+    /// not a whole number of them.
+    #[must_use]
+    pub fn segments(&self) -> u32 {
+        u32::try_from(self.arena.max_bytes.div_ceil(self.segment_bytes)).unwrap_or(u32::MAX)
+    }
+
+    #[must_use]
+    pub const fn committed_segments(&self) -> u32 {
+        self.committed
+    }
+
+    /// The bytes held backed from `from`, apart from the segments.
+    #[must_use]
+    pub fn held(&self, from: u64) -> u64 {
+        self.held
+            .iter()
+            .find(|span| span.0 == from)
+            .map_or(0, |span| span.1)
+    }
+
+    /// Every byte backed: the committed segments' and the held span's.
+    #[must_use]
+    pub fn committed_bytes(&self) -> u64 {
+        self.arena.committed_bytes()
+    }
+
+    /// The bytes the committed segments back, the held span apart.
+    #[must_use]
+    pub fn segment_bytes_committed(&self) -> u64 {
+        let bottom = (u64::from(self.committed) * self.segment_bytes)
+            .min(self.arena.max_bytes)
+            .min(self.limit);
+        self.arena.units_of(&Want::Prefix(bottom)).len() as u64 * self.arena.map_unit
+    }
+
+    #[must_use]
+    pub const fn high_water_bytes(&self) -> u64 {
+        self.arena.high_water
+    }
+
+    /// The most bytes the committed segments have backed: the high water
+    /// of what the segments' prefix ever held, the held spans apart.
+    #[must_use]
+    pub const fn segment_high_water_bytes(&self) -> u64 {
+        self.segment_high
+    }
+
+    /// The address of `offset`, where `len` bytes from it are backed.
+    pub fn span(&self, offset: u64, len: u64) -> Result<u64> {
+        self.arena.span(offset, len)
+    }
+
+    /// What the range backs with `segments` committed and `held` held.
+    fn wanted(&self, segments: u32, held: &[(u64, u64)]) -> Want {
+        let bytes = self.arena.max_bytes.min(self.limit);
+        let bottom = (u64::from(segments) * self.segment_bytes).min(bytes);
+        Want::Ranges(
+            core::iter::once((0, bottom))
+                .chain(held.iter().copied())
+                .collect(),
+        )
+    }
+
+    /// Holds the segments to the first `bytes` of the range: a segment that
+    /// reaches past them backs only its part under them. For a range
+    /// reserved for more than its pool may come to take; set before a
+    /// segment that reaches past it is committed.
+    pub fn limit(&mut self, bytes: u64) {
+        self.limit = bytes;
+    }
+
+    /// Backs `bytes` from `from`, and keeps them backed whatever segments
+    /// are committed or released; a span held from `from` before grows to
+    /// this one, the spans held elsewhere stand. `beside` backs what the
+    /// pool's budget refuses beside it ([`commit_beside`]).
+    pub fn hold(
+        &mut self,
+        pool: &mut PhysicalPool,
+        from: u64,
+        bytes: u64,
+        beside: bool,
+    ) -> Result<Commit> {
+        let mut held = self.held.clone();
+        match held.iter_mut().find(|span| span.0 == from) {
+            Some(span) => span.1 = span.1.max(bytes),
+            None => held.push((from, bytes)),
+        }
+        let want = self.wanted(self.committed, &held);
+        let mut targets = [Target {
+            arena: &mut self.arena,
+            want: want.clone(),
+        }];
+        let mut outcome = commit_atomically(pool, &mut targets)?;
+        if outcome != Commit::Committed && beside {
+            commit_beside(pool, &mut self.arena, &want)?;
+            outcome = Commit::Committed;
+        }
+        if outcome == Commit::Committed {
+            self.held = held;
+        }
+        Ok(outcome)
+    }
+
+    /// Backs the first `segments` segments; those already backed stay.
+    pub fn commit_segments(&mut self, pool: &mut PhysicalPool, segments: u32) -> Result<Commit> {
+        let segments = segments.min(self.segments());
+        if segments <= self.committed {
+            return Ok(Commit::Committed);
+        }
+        let want = self.wanted(segments, &self.held);
+        let mut targets = [Target {
+            arena: &mut self.arena,
+            want,
+        }];
+        let outcome = commit_atomically(pool, &mut targets)?;
+        if outcome == Commit::Committed {
+            self.committed = segments;
+            self.segment_high = self.segment_high.max(self.segment_bytes_committed());
+        }
+        Ok(outcome)
+    }
+
+    /// Gives back every segment past the first `segments`: the units only
+    /// they touch are unmapped and their memory returned to the device. The
+    /// caller has moved everything out of them and waited for whatever read
+    /// or wrote them. A flat range gives nothing back.
+    pub fn release_segments(&mut self, pool: &mut PhysicalPool, segments: u32) -> Result<()> {
+        if segments >= self.committed {
+            return Ok(());
+        }
+        let keep = self
+            .arena
+            .target_units(&self.wanted(segments, &self.held))?;
+        self.arena.shrink_to(pool, &keep);
+        self.committed = segments;
+        Ok(())
+    }
+
+    /// Gives back everything, the held span too: before the range is
+    /// dropped for another, so the pool's count of what is backed stands.
+    pub fn release_all(&mut self, pool: &mut PhysicalPool) {
+        self.arena.shrink_to(pool, &[]);
+        self.committed = 0;
+        self.held.clear();
+    }
 }
 
 /// `bytes` on `device` that every device in `readers` may load and store,
@@ -957,7 +1196,6 @@ mod tests {
         assert!(pool.try_reserve(4));
         pool.mark_committed(10);
         assert_eq!(pool.committed_pages(), 10);
-        assert_eq!(pool.high_water_pages(), 10);
         assert!(!pool.try_reserve(1));
     }
 

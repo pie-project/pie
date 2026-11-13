@@ -202,10 +202,6 @@ impl Recorder {
                 plane.dtype,
                 w.source,
                 w.layout,
-                match plane.suffix {
-                    "" => w.placement,
-                    _ => poem_ir::ParamPlacement::Device,
-                },
             );
             first.get_or_insert(index);
         }
@@ -229,7 +225,7 @@ impl Recorder {
             .caches
             .iter()
             .position(|row| cache_name(row) == name)
-            .unwrap_or_else(|| panic!("`{name}` is not a cache the model's caches() declares"))
+            .unwrap_or_else(|| panic!("`{name}` is not a cache the model declares"))
             as u32;
         if let Some(seen) = p.values.iter().position(|v| v.def == Def::Cache(index)) {
             return ValueId(seen as u32);
@@ -362,7 +358,7 @@ impl Recorder {
     }
 
     pub fn finish(self) -> Trace {
-        let plan = Rc::try_unwrap(self.inner)
+        let mut plan = Rc::try_unwrap(self.inner)
             .unwrap_or_else(|_| panic!("a Value outlived its trace"))
             .into_inner();
         if let Some(why) = unguarded_read(&plan) {
@@ -376,6 +372,7 @@ impl Recorder {
             }
             panic!("{msg}");
         }
+        place(&mut plan);
         plan
     }
 
@@ -411,9 +408,7 @@ fn unguarded_read(plan: &Trace) -> Option<String> {
         node.op.inputs(&mut ins);
         for id in &ins {
             let (builtin, what) = match &plan.values[id.0 as usize].def {
-                Def::Input(RuntimeInput::Mask { .. }) => {
-                    (poem_ir::Builtin::Masked, "fact.has(fact.Mask)")
-                }
+                Def::Input(RuntimeInput::Mask) => (poem_ir::Builtin::Masked, "fact.has(fact.Mask)"),
                 Def::Input(RuntimeInput::AdapterRoutes) => {
                     (poem_ir::Builtin::Adapted, "fact.has(fact.Adapter)")
                 }
@@ -439,7 +434,6 @@ fn intern(
     dtype: Dtype,
     source: ParamSource,
     layout: ParamLayout,
-    placement: poem_ir::ParamPlacement,
 ) -> u32 {
     if let Some(i) = p.params.iter().position(|q| q.name == name) {
         let seen = &p.params[i];
@@ -456,10 +450,6 @@ fn intern(
             seen.layout == layout,
             "`{name}` is declared twice with two device layouts"
         );
-        assert!(
-            seen.placement == placement,
-            "`{name}` is declared twice with two placements"
-        );
         return i as u32;
     }
     p.params.push(Param {
@@ -469,10 +459,20 @@ fn intern(
         dtype,
         source,
         layout,
-        placement,
+        placement: poem_ir::ParamPlacement::Device,
         experts: None,
     });
     (p.params.len() - 1) as u32
+}
+
+/// Each param's placement, as the ops that read it say
+/// ([`poem_ir::residency::placement`]): nothing an author declares.
+fn place(plan: &mut Trace) {
+    let residency = poem_ir::residency::residency(plan);
+    let placement = poem_ir::residency::placement(plan, &residency);
+    for (param, placement) in plan.params.iter_mut().zip(placement) {
+        param.placement = placement;
+    }
 }
 
 pub(crate) fn cache_name(row: &CacheRow) -> &str {

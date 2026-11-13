@@ -92,7 +92,7 @@ fn new_rs(ctx: &mut ProcessCtx) -> Result<u32> {
     let stores = store_registry::get(0, engine);
     let id = stores.rs.lock().unwrap().create_working_set(geom);
     let ws = RsWorkingSet::new(0, engine, id, geom);
-    ctx.register_rs_working_set(0, engine, id);
+    ctx.register_rs_working_set(&ws);
     Ok(ctx.ctx().table.push(ws)?.rep())
 }
 
@@ -127,7 +127,7 @@ pub(crate) fn adopt(
     let kv = ctx.ctx().table.push(kv)?.rep();
     let rs = match rs {
         Some(rs) => {
-            ctx.register_rs_working_set(rs.model, rs.engine, rs.id);
+            ctx.register_rs_working_set(&rs);
             Some(ctx.ctx().table.push(rs)?.rep())
         }
         None => None,
@@ -241,7 +241,7 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
         let kv_rep = self.ctx().table.push(kv_child)?.rep();
         let rs_rep = match rs_child {
             Some(child) => {
-                self.register_rs_working_set(child.model, child.engine, child.id);
+                self.register_rs_working_set(&child);
                 Some(self.ctx().table.push(child)?.rep())
             }
             None => None,

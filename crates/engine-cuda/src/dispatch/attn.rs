@@ -1203,6 +1203,7 @@ impl Run<'_> {
                     *ratio,
                     slabs.state_kv,
                     slabs.state_score,
+                    slabs.stride,
                     ape.map_or(slabs.ape, |id| self.tensor(id)),
                     &mut self.tensor(*entries),
                 )
@@ -1228,6 +1229,7 @@ impl Run<'_> {
                     *ratio,
                     slabs.state_kv,
                     slabs.state_score,
+                    slabs.stride,
                 )
             }
             Attn::PoolKvAppend {
@@ -1418,7 +1420,7 @@ impl Run<'_> {
                 })
             }
             #[cfg(not(feature = "rocm"))]
-            Some((codes, scales, biases, seat)) if codes.dtype == poem_ir::Dtype::Nvfp4 => {
+            Some((codes, scales, biases)) if codes.dtype == poem_ir::Dtype::Nvfp4 => {
                 kernels_cuda::linear::dequant::nvfp4_plane(
                     self.ctx(),
                     op,
@@ -1427,10 +1429,11 @@ impl Run<'_> {
                     super::linear::tensor_scales(op, biases)?,
                     n,
                     k,
-                    seat,
+                    kernels_cuda::linear::moe::GroupSeat::RESIDENT,
                 )
             }
-            Some((codes, scales, biases, seat)) => kernels_cuda::linear::dequant::decoded_plane(
+            #[cfg(not(feature = "rocm"))]
+            Some((codes, scales, biases)) => kernels_cuda::linear::dequant::decoded_plane(
                 self.ctx(),
                 op,
                 codes,
@@ -1440,7 +1443,19 @@ impl Run<'_> {
                 poem_ir::Dtype::Bf16,
                 n,
                 k,
-                seat,
+                kernels_cuda::linear::moe::GroupSeat::RESIDENT,
+            ),
+            #[cfg(feature = "rocm")]
+            Some((codes, scales, biases)) => kernels_cuda::linear::dequant::decoded_plane(
+                self.ctx(),
+                op,
+                codes,
+                scales,
+                kernels_cuda::linear::affine::OffsetKind::Post,
+                biases,
+                poem_ir::Dtype::Bf16,
+                n,
+                k,
             ),
             None => Ok(self.tensor(w)),
         }

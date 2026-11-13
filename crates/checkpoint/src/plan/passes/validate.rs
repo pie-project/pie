@@ -122,6 +122,7 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                         QuantScheme::Fp8E4M3
                             | QuantScheme::Int8Symmetric
                             | QuantScheme::Mxfp4E2M1E8M0
+                            | QuantScheme::Nvfp4E2M1E4M3
                             | QuantScheme::MlxAffineU4
                     )
                 ))

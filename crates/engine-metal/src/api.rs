@@ -5,7 +5,7 @@ use std::path::Path;
 use checkpoint::contract::ModelContract;
 use engine::Engine;
 use engine::adapter::AdapterRegistration;
-use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
+use engine::caps::{Capabilities, DeviceFacts, FireLimits};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
@@ -15,7 +15,7 @@ use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, L
 use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
+use engine::transfer::{KvCopy, MemoryDomain};
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -348,23 +348,48 @@ impl Engine for Metal {
         };
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
 
-        let planes = crate::weights::attachments(&trace, &contract, &path).map_err(fault)?;
-        let (working_set, elsewhere) = {
+        let (working_set, elsewhere, caches) = {
             let device = crate::device::Context::bind().map_err(fault)?;
-            (device.working_set(), device.held_elsewhere())
+            (
+                device.working_set(),
+                device.held_elsewhere(),
+                // The weight cache runs where the queue keeps a residency set.
+                device
+                    .hold_resident(std::iter::empty(), true)
+                    .map_err(fault)?,
+            )
+        };
+        // Dense weights always live in device memory, and so does every
+        // weight the weight cache does not stream; of the streamable ones
+        // (routed experts, token-id tables) only the floor the cache keeps
+        // must: the rest leaves the device under streaming, and a held set
+        // seats it in the pool.
+        let planes = crate::weights::plane_bytes(&trace).map_err(fault)?;
+        let (weights, streamable) = if caches {
+            let recipe = crate::chunks::recipe(
+                &trace,
+                &poem_compiler::Budgets::of(bake_budgets(&budgets, &trace)),
+            )
+            .map_err(fault)?;
+            crate::store::streamed::resident_demand(
+                &trace,
+                &recipe,
+                &planes,
+                crate::experts::rows_streamed(residency.weights_held),
+            )
+        } else {
+            (
+                planes
+                    .iter()
+                    .map(|plane| plane.next_multiple_of(crate::weights::ALIGN))
+                    .sum::<u64>(),
+                0,
+            )
         };
         let util = residency.device_memory_share;
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
-        let paging = crate::store::kv::Paging::of(
-            budgets.page_size,
-            budgets.max_context,
-            match slots {
-                0 => engine::fit::least_state_slots(1),
-                slots => engine::fit::least_state_slots(1).min(slots),
-            },
-            1,
-        )
-        .map_err(|error| fault(Fault::from(error)))?;
+        let paging = crate::store::kv::Paging::of(budgets.page_size, budgets.max_context, 1, 1)
+            .map_err(|error| fault(Fault::from(error)))?;
         // The pool the weights must leave room for: the stated budget,
         // or one sequence when the pool fills what is left.
         let kv_pool = match residency.device_kv_budget {
@@ -382,6 +407,7 @@ impl Engine for Metal {
                 scratch,
                 kv_pool,
             )
+            .with_streamable(streamable)
         };
 
         // Compiled before the residency check, so the check prices the arena
@@ -391,21 +417,8 @@ impl Engine for Metal {
         // the width halves until it fits: a narrower prefill fire is slower,
         // a refused load serves nothing.
         let mut budgets = budgets;
-        let (mut prepared, mut residency_plan) = loop {
-            let gathered = crate::gather::Plan::of(
-                &trace,
-                &planes,
-                residency.device_weight_budget,
-                budgets.max_tokens,
-            )
-            .map_err(fault)?;
-            let plan =
-                experts::Plan::beside(&trace, &planes, residency.device_weight_budget, gathered)
-                    .map_err(fault)?;
-            let room = accounting(plan.device_demand(), 0)
-                .pool
-                .saturating_sub(kv_pool)
-                / 2;
+        let mut prepared = loop {
+            let room = accounting(weights, 0).pool.saturating_sub(kv_pool) / 2;
             let mut fitted = poem_compiler::fit_voxels(
                 &trace,
                 poem_compiler::Budgets {
@@ -446,21 +459,18 @@ impl Engine for Metal {
                 kv_budget: residency.device_kv_budget,
                 memory_share: residency.device_memory_share,
                 runahead: engine::runahead::Runahead::of(frames_in_flight),
-                residency: plan.clone(),
+                residency: experts::Plan::default(),
                 profiles: self.boot.profiles.clone(),
             })
             .map_err(fault)?;
-            let weights = plan.device_demand();
             let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
             if narrower >= budgets.max_tokens
                 || accounting(weights, prepared.arena_bytes())
-                    .admit(residency.device_weight_budget, util)
+                    .admit(util)
                     .is_ok()
-                || accounting(weights, 0)
-                    .admit(residency.device_weight_budget, util)
-                    .is_err()
+                || accounting(weights, 0).admit(util).is_err()
             {
-                break (prepared, plan);
+                break prepared;
             }
             eprintln!(
                 "the arena scratch for {} forward tokens ({} bytes) does not fit beside the \
@@ -473,54 +483,17 @@ impl Engine for Metal {
         };
         let scratch = prepared.arena_bytes();
 
-        {
-            let acct = accounting(residency_plan.device_demand(), scratch);
-            if acct.admit(residency.device_weight_budget, util).is_err() {
-                let headroom = acct.weight_headroom();
-                let regathered =
-                    crate::gather::Plan::of(&trace, &planes, Some(headroom), budgets.max_tokens);
-                let regathered = match regathered {
-                    Ok(plan) => plan,
-                    Err(_) => {
-                        return Err(fault(
-                            acct.admit(residency.device_weight_budget, util)
-                                .expect_err("admit errored above"),
-                        ));
-                    }
-                };
-                match experts::Plan::beside(&trace, &planes, Some(headroom), regathered) {
-                    Ok(shrunk) => {
-                        let re = crate::store::accounting::Accounting::with_scratch(
-                            working_set,
-                            elsewhere,
-                            util,
-                            shrunk.device_demand(),
-                            scratch,
-                            kv_pool,
-                        );
-                        re.admit(Some(headroom), util).map_err(fault)?;
-                        residency_plan = shrunk;
-                    }
-                    Err(_) => {
-                        return Err(fault(
-                            acct.admit(residency.device_weight_budget, util)
-                                .expect_err("admit errored above"),
-                        ));
-                    }
-                }
-            }
-        }
+        accounting(weights, scratch).admit(util).map_err(fault)?;
 
-        residency.admit(residency_plan.device_demand(), residency_plan.host_demand())?;
-        let streams = residency_plan.streams();
-
-        prepared.set_residency(residency_plan);
+        prepared.set_residency(experts::Plan::default().with_weights_held(residency.weights_held));
         let mut shell = prepared.load().map_err(fault)?;
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
         // The device pool already is host memory, so a host tier would only
-        // move kv and rs slots within the same DRAM; suspended ones go
-        // straight to disk.
+        // move kv and rs slots within the same DRAM: one is seated only
+        // where its budget is stated (it frees room in the pool's heap, not
+        // memory), and suspended slots otherwise go straight to disk.
+        shell.seat_tier(residency.host_kv_budget.unwrap_or(0));
         let disk_kv_pages = shell
             .seat_disk_kv(
                 residency.disk_kv_budget,
@@ -533,15 +506,12 @@ impl Engine for Metal {
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
         let (pool_committed_bytes, pool_high_water_bytes) = shell.pool_residency();
-        let (elastic_page_bytes, elastic_budget_pages) = shell.pool_elastic();
         let weights_warm = shell.weights_warm();
 
         let paging = shell.paging();
-        let state_rows = shell
-            .trace()
-            .caches
-            .iter()
-            .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
+        let pools = shell.pool_facts(disk_kv_pages);
+        let chunks = shell.chunk_facts().map_err(fault)?;
+        shell.log_chunk_recipe(&chunks);
 
         let caps = Capabilities {
             device: DeviceFacts {
@@ -555,33 +525,8 @@ impl Engine for Metal {
                 storage_max_tile_bytes: shell.max_buffer(),
                 codegen_backend: Some("metal".to_string()),
             },
-            pools: PoolFacts {
-                kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
-                kv_page_size: paging.page_size,
-                state_slots: if state_rows { paging.slots } else { 0 },
-                state_slot_bytes: shell.state_slot_bytes(),
-                elastic_state_slot_bytes: shell.elastic_state_slot_bytes(),
-                adapter_banks: shell
-                    .banks()
-                    .iter()
-                    .map(|&(_, adapters, _)| adapters)
-                    .min()
-                    .unwrap_or(0),
-                elastic_page_bytes,
-                elastic_budget_pages,
-                disk_kv_pages,
-                one_frame_when_short: false,
-                seated_first: false,
-                seat_to_end: false,
-                seat_spread: false,
-                buffer_pages: shell.buffer_pages(),
-                host_state_slots: shell.parked_state_slots(),
-                host_buffer_pages: shell.parked_buffer_pages(),
-                // The sliding rows are paged in full here: the model's window
-                // is a fact of the model, its pool is not.
-                window_tokens: poem_exec::store::kv::declared_window(shell.trace()).unwrap_or(0),
-                ..PoolFacts::default()
-            },
+            pools,
+            chunks,
             limits: FireLimits {
                 max_lanes: budgets.max_lanes,
                 max_tokens: budgets.max_tokens,
@@ -604,12 +549,6 @@ impl Engine for Metal {
                 .with(Port::AttnMask)
                 .with(Port::Fold),
             geometry: GeometryClass::DeviceGeometry,
-            kv_copy: KvCopyDomains {
-                device_to_device: true,
-                device_to_host: false,
-                host_to_device: false,
-                host_to_host: false,
-            },
             kv_handle: None,
             media_encode: false,
             device_channel_commit: false,
@@ -628,7 +567,7 @@ impl Engine for Metal {
             facts: LoadFacts {
                 trace_name,
                 weight_bytes,
-                weights_resident: !streams,
+                weights_resident: true,
                 weights_from_cache: weights_warm,
                 arena_bytes,
                 pool_bytes,
@@ -654,24 +593,47 @@ impl Engine for Metal {
             .map_err(fault)
     }
 
-    fn commit_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
-        self.loaded_mut()?.commit_pool(kv_pages).map_err(fault)
+    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_segments(segments).map_err(fault)
     }
 
-    fn release_scratch(&mut self) -> EngineResult<()> {
-        self.loaded_mut()?.release_scratch().map_err(fault)
+    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_segments(segments).map_err(fault)
     }
 
-    fn release_pool(&mut self, kv_pages: u32) -> EngineResult<()> {
-        self.loaded_mut()?.release_pool(kv_pages).map_err(fault)
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
     }
 
-    fn commit_state(&mut self, slots: u32) -> EngineResult<()> {
-        self.loaded_mut()?.commit_state(slots).map_err(fault)
+    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        self.loaded_mut()?.copy_slots(copy).map_err(fault)
     }
 
-    fn release_state(&mut self, slots: u32) -> EngineResult<()> {
-        self.loaded_mut()?.release_state(slots).map_err(fault)
+    fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> EngineResult<Vec<u8>> {
+        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
+    }
+
+    fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        self.loaded_mut()?
+            .write_tier_slots(slots, bytes)
+            .map_err(fault)
+    }
+
+    fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
+        self.loaded_mut()?
+            .weight_residency(residency)
+            .map_err(fault)
+    }
+
+    fn weight_uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        self.loaded_mut()?.weight_uses().map_err(fault)
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
@@ -897,14 +859,6 @@ impl Engine for Metal {
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
-        if let Some((MemoryDomain::LocalDisk, out, pages, slots)) =
-            device.and_then(|device| copy.tier_move(device))
-        {
-            return self
-                .loaded_mut()?
-                .spill_kv(out, pages, slots)
-                .map_err(fault);
-        }
         if device.is_none_or(|device| copy.src != device || copy.dst != device) {
             return Err(Error::Unsupported {
                 verb: kv_copy_direction(copy.src, copy.dst),
@@ -914,37 +868,6 @@ impl Engine for Metal {
         let page_size = self.loaded_mut()?.paging().page_size;
         let moves = copy.runs(page_size)?;
         self.loaded_mut()?.copy_kv(&moves).map_err(fault)
-    }
-
-    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
-        for (at, move_) in copy.moves.iter().enumerate() {
-            if move_.src_token_offset != 0 || move_.dst_token_offset != 0 {
-                return Err(Error::Invalid(format!(
-                    "state move {at} names a token offset, and a recurrent bank is a folded \
-                     summary of a prefix rather than an array of per-token entries — this \
-                     engine moves whole slots"
-                )));
-            }
-        }
-        let ends = |moves: &[engine::transfer::StateMove]| -> (Vec<u32>, Vec<u32>) {
-            moves.iter().map(|m| (m.src_slot_id, m.dst_slot_id)).unzip()
-        };
-        let ((src, dst), (page_src, page_dst)) = (ends(&copy.moves), ends(&copy.pages));
-        let shell = self.loaded_mut()?;
-        let copied: crate::error::Result<()> = match copy.direction {
-            StateDirection::DeviceToDevice => shell
-                .copy_state(&src.into_iter().zip(dst).collect::<Vec<_>>())
-                .and_then(|()| {
-                    shell.copy_pages(&page_src.into_iter().zip(page_dst).collect::<Vec<_>>())
-                }),
-            StateDirection::DeviceToHost => shell
-                .park_state(true, &src, &dst)
-                .and_then(|()| shell.park_pages(true, &page_src, &page_dst)),
-            StateDirection::HostToDevice => shell
-                .park_state(false, &dst, &src)
-                .and_then(|()| shell.park_pages(false, &page_dst, &page_src)),
-        };
-        copied.map_err(fault)
     }
 }
 
@@ -1073,6 +996,73 @@ impl Metal {
                 ))
             })?;
         }
+        // A lane stating its slot tables names its kv pages and its state
+        // record there; until the runtime states them, the legacy fields
+        // carry the same slot refs.
+        let mut pages_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut window_of: Vec<Vec<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut forks: Vec<(u32, u32)> = Vec::new();
+        for lane in &submission.lanes {
+            pages_of.push(
+                lane.tables
+                    .iter()
+                    .find(|(shape, _)| *shape == crate::store::layout::LIST)
+                    .map(|(_, refs)| refs.clone()),
+            );
+            // One table a window list, in the load's order; until the
+            // runtime states them, the legacy window pages are the first
+            // list's.
+            let lists = shell.pool_layout().window_lists().count();
+            let mut windows: Vec<Vec<u32>> = crate::store::layout::WINDOWS[..lists]
+                .iter()
+                .map(|id| {
+                    lane.tables
+                        .iter()
+                        .find(|(shape, _)| shape == id)
+                        .map(|(_, refs)| refs.clone())
+                        .unwrap_or_default()
+                })
+                .collect();
+            if let Some(first) = windows.first_mut()
+                && first.is_empty()
+            {
+                first.clone_from(&lane.kv.window);
+            }
+            window_of.push(windows);
+            let fixed = lane
+                .fixed
+                .iter()
+                .find(|(shape, _)| *shape == crate::store::layout::FIXED);
+            run_of.push(fixed.and_then(|(_, pieces)| {
+                pieces
+                    .iter()
+                    .any(|&[run, cow]| run != cow)
+                    .then(|| pieces.iter().map(|&[run, _]| run).collect())
+            }));
+            record_of.push(fixed.map(|(_, pieces)| {
+                // `cow != run`: the record is copied before the fire, once
+                // for every lane of a group naming the same pair.
+                for &[run, cow] in pieces {
+                    if run != cow && !forks.contains(&(run, cow)) {
+                        forks.push((run, cow));
+                    }
+                }
+                pieces.iter().map(|&[_, cow]| cow).collect()
+            }));
+        }
+        if !forks.is_empty() {
+            shell.copy_state(&forks).map_err(fault)?;
+        }
+        // Tail copies (an rs-list or kv slot a fork shares) land before any
+        // lane of the fire reads or writes (CONTRACT-BC 20).
+        let slot_copies: Vec<_> = submission
+            .lanes
+            .iter()
+            .flat_map(|lane| lane.slot_copies.iter().cloned())
+            .collect();
+        shell.copy_slot_pairs(&slot_copies).map_err(fault)?;
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()
@@ -1086,8 +1076,9 @@ impl Metal {
                     },
                     group: lane.group,
                     inputs: &lane.inputs,
-                    pages: &lane.kv.pages,
-                    held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    pages: pages_of[at].as_deref().unwrap_or(&lane.kv.pages),
+                    held: (!lane.kv.pages.is_empty() || pages_of[at].is_some())
+                        .then_some(lane.kv.held),
                     mask: lane.mask.as_ref(),
                     kv_less: lane.kv_less,
                     adapter: lane_adapters[at].or(lane.adapter),
@@ -1101,6 +1092,10 @@ impl Metal {
                     rs_reset: lane.rs_reset,
                     rs_slot: lane.rs_slot,
                     rs_snapshots: &lane.rs_snapshots,
+                    refs: true,
+                    record: record_of[at].as_deref(),
+                    record_run: run_of[at].as_deref(),
+                    windows: &window_of[at],
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

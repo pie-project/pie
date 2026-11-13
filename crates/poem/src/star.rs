@@ -15,6 +15,7 @@ mod ops_by_hand;
 mod package;
 mod paths;
 mod run;
+mod state;
 mod values;
 
 pub use manifest::{Manifest, Model, Published, Template, Tokenizer, dtype_of, precision_of};

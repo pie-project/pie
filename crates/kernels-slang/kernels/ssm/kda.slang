@@ -1,6 +1,7 @@
 #include "prim/bf16.slang"
 #include "prim/params.slang"
 #include "prim/reduce.slang"
+#include "prim/pool.slang"
 
 // Kimi delta attention, token by token: a workgroup a head of a row (or of a
 // request), its `head_dim x head_dim` f32 state walked one token at a time.
@@ -15,7 +16,10 @@
 // The default form is one decode step a row; `PIE_CHUNKED` walks a request's
 // rows of the query CSR; `PIE_COMMITTED` walks a speculative window on a copy
 // of the slot's state in `work`, and the slot takes the state as of row
-// `commit[lane0 + r]` (`ssm/conv1d.slang` says how). The `subgroup` tier
+// `commit[lane0 + r]` (`ssm/conv1d.slang` says how). `PIE_SNAPS` (with
+// either of the last two): a request's lane also lands the state as of up
+// to `PIE_RS_SNAPSHOTS` rows inside it in records of their own
+// (`prim/pool.slang`, CONTRACT-BC 16). The `subgroup` tier
 // folds the norms through subgroups.
 
 #define DMAX 256
@@ -30,10 +34,14 @@
 [[vk::binding(6)]] StructuredBuffer<uint> b;
 [[vk::binding(7)]] StructuredBuffer<float> dt_bias;
 [[vk::binding(8)]] StructuredBuffer<float> a_log;
-[[vk::binding(9)]] RWStructuredBuffer<float> rstate;
-[[vk::binding(10)]] RWStructuredBuffer<float> work;
-[[vk::binding(11)]] RWStructuredBuffer<float> y;
-#define PARAMS_AT 12
+[[vk::binding(9)]] RWStructuredBuffer<float> work;
+[[vk::binding(10)]] RWStructuredBuffer<float> y;
+#if defined(PIE_SNAPS)
+[[vk::binding(11)]] StructuredBuffer<int> pie_snaps;
+#define SEGMENTS_AT 12
+#else
+#define SEGMENTS_AT 11
+#endif
 #define STATE work
 #elif defined(PIE_CHUNKED)
 [[vk::binding(0)]] StructuredBuffer<uint> mixed;
@@ -42,10 +50,14 @@
 [[vk::binding(3)]] StructuredBuffer<uint> b;
 [[vk::binding(4)]] StructuredBuffer<float> dt_bias;
 [[vk::binding(5)]] StructuredBuffer<float> a_log;
-[[vk::binding(6)]] RWStructuredBuffer<float> rstate;
-[[vk::binding(7)]] StructuredBuffer<uint> slots;
-[[vk::binding(8)]] RWStructuredBuffer<float> y;
-#define PARAMS_AT 9
+[[vk::binding(6)]] StructuredBuffer<uint> slots;
+[[vk::binding(7)]] RWStructuredBuffer<float> y;
+#if defined(PIE_SNAPS)
+[[vk::binding(8)]] StructuredBuffer<int> pie_snaps;
+#define SEGMENTS_AT 9
+#else
+#define SEGMENTS_AT 8
+#endif
 #define STATE rstate
 #else
 [[vk::binding(0)]] StructuredBuffer<uint> mixed;
@@ -53,14 +65,22 @@
 [[vk::binding(2)]] StructuredBuffer<uint> b;
 [[vk::binding(3)]] StructuredBuffer<float> dt_bias;
 [[vk::binding(4)]] StructuredBuffer<float> a_log;
-[[vk::binding(5)]] RWStructuredBuffer<float> rstate;
-[[vk::binding(6)]] StructuredBuffer<uint> slots;
-[[vk::binding(7)]] RWStructuredBuffer<float> y;
-#define PARAMS_AT 8
+[[vk::binding(5)]] StructuredBuffer<uint> slots;
+[[vk::binding(6)]] RWStructuredBuffer<float> y;
+#define SEGMENTS_AT 7
 #define STATE rstate
 #endif
+// The state bank, in the chunk pool's segments (`prim/pool.slang`).
+PIE_POOL_SEGMENTS(RWStructuredBuffer, float, SEGMENTS_AT)
+#define PARAMS_AT (SEGMENTS_AT + 4)
 
 struct Params {
+    uint seg_words;
+    uint state_origin;
+    uint slot_stride;
+    uint pieces;
+    uint piece_first;
+    uint piece_atoms;
 #if defined(PIE_COMMITTED)
     int lane0;
 #endif
@@ -68,8 +88,18 @@ struct Params {
     int head_dim;
     float norm_eps;
     float gate_floor;
+#if defined(PIE_SNAPS)
+    int snap_lane0;
+#endif
 };
 PIE_PARAMS(PARAMS_AT, Params, params);
+PIE_POOL_READ(float, params.seg_words)
+PIE_POOL_WRITE(float, params.seg_words)
+PIE_POOL_VIEW(rstate, float, params.state_origin)
+PIE_STATE_PIECES
+#if defined(PIE_SNAPS)
+PIE_STATE_SNAPSHOTS
+#endif
 
 groupshared float sq[DMAX];
 groupshared float sk[DMAX];
@@ -136,6 +166,27 @@ void token(uint tid, uint t, uint h, uint state_base) {
     GroupMemoryBarrierWithGroupSync();
 }
 
+#if defined(PIE_SNAPS)
+// The next snapshot of lane `snap` from `n` on: its row, 0 past the last.
+int snap_next(int snap, uint n) {
+    int at = pie_snap_row(snap, n);
+    return at > 0 ? at : 0;
+}
+
+// This lane's cells of head `h`'s state at `from` (in `STATE`) into the
+// same cells of snapshot `n` of lane `snap`: the cells it walks, so no
+// other lane's writes are read.
+void snap_cells(uint tid, uint from, int snap, uint n, uint h) {
+    uint d = uint(params.head_dim);
+    uint into = pie_snap_atom(uint(snap), n, h, d * d);
+    for (uint vi = tid; vi < d; vi += uint(PIE_GROUP_X)) {
+        for (uint i = 0; i < d; i++) {
+            rstate[into + vi * d + i] = STATE[from + vi * d + i];
+        }
+    }
+}
+#endif
+
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
@@ -153,7 +204,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         }
         int span = (indptr[r + 1] - indptr[r]) + replay[lane];
         kda_lo = begin;
-        kda_hi = slots[lane] < 0 ? begin : begin + span;
+        kda_hi = pie_state_none(lane) ? begin : begin + span;
         kda_keep = min(commit[lane], span);
     }
     GroupMemoryBarrierWithGroupSync();
@@ -165,14 +216,26 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (span <= 0) {
         return;
     }
-    uint bank = (uint(slots[lane]) * uint(params.heads) + h) * cells;
+    uint bank = pie_state_atom(lane, h, cells);
     uint state_base = (lane * uint(params.heads) + h) * cells;
     for (uint i = tid; i < cells; i += uint(PIE_GROUP_X)) {
         work[state_base + i] = rstate[bank + i];
     }
     GroupMemoryBarrierWithGroupSync();
+#if defined(PIE_SNAPS)
+    int snap = pie_snap_lane(r);
+    uint snapped = 0u;
+    int snap_at = snap_next(snap, 0u);
+#endif
     for (int t = 0; t < span; t++) {
         token(tid, uint(begin + t), h, state_base);
+#if defined(PIE_SNAPS)
+        if (t + 1 == snap_at) {
+            snap_cells(tid, state_base, snap, snapped, h);
+            snapped++;
+            snap_at = snap_next(snap, snapped);
+        }
+#endif
         if (t + 1 == keep) {
             for (uint i = tid; i < cells; i += uint(PIE_GROUP_X)) {
                 rstate[bank + i] = work[state_base + i];
@@ -192,12 +255,24 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (end <= begin) {
         return;
     }
-    uint state_base = (slots[uint(begin)] * uint(params.heads) + h) * cells;
+    uint state_base = pie_state_atom(uint(begin), h, cells);
+#if defined(PIE_SNAPS)
+    int snap = pie_snap_lane(r);
+    uint snapped = 0u;
+    int snap_at = snap_next(snap, 0u);
+#endif
     for (int t = begin; t < end; t++) {
         token(tid, uint(t), h, state_base);
+#if defined(PIE_SNAPS)
+        if (t - begin + 1 == snap_at) {
+            snap_cells(tid, state_base, snap, snapped, h);
+            snapped++;
+            snap_at = snap_next(snap, snapped);
+        }
+#endif
     }
 #else
-    token(tid, r, h, (slots[r] * uint(params.heads) + h) * cells);
+    token(tid, r, h, pie_state_atom(r, h, cells));
 #endif
 }
 
@@ -207,3 +282,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate ssm_kda_bf16 PIE_GROUP_X=128 PIE_TIER=subgroup PIE_TARGET=spirv
 // pie:instantiate ssm_kda_chunked_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1 PIE_TIER=subgroup PIE_TARGET=spirv
 // pie:instantiate ssm_kda_committed_bf16 PIE_GROUP_X=128 PIE_COMMITTED=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate ssm_kda_chunked_snap_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1 PIE_SNAPS=1
+// pie:instantiate ssm_kda_committed_snap_bf16 PIE_GROUP_X=128 PIE_COMMITTED=1 PIE_SNAPS=1
+// pie:instantiate ssm_kda_chunked_snap_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1 PIE_SNAPS=1 PIE_TIER=subgroup PIE_TARGET=spirv
+// pie:instantiate ssm_kda_committed_snap_bf16 PIE_GROUP_X=128 PIE_COMMITTED=1 PIE_SNAPS=1 PIE_TIER=subgroup PIE_TARGET=spirv

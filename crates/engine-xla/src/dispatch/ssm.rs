@@ -31,11 +31,12 @@ fn conv_bank(op: &'static str, pool: &RecurrentPool) -> Result<(), kernels_xla::
 fn read_seat(
     l: &mut Lower<'_, '_>,
     seat: &Committed,
+    map: kernels_xla::tensor::PageMap,
 ) -> Result<kernels_xla::lanes::Committed<Operand>, kernels_xla::Error> {
     Ok(kernels_xla::lanes::Committed {
         replay: l.read(seat.replay)?,
         commit: l.read(seat.commit)?,
-        slots: l.read(seat.slots)?,
+        slots: l.read_slots(seat.slots, map)?,
         lane0: seat.lane0,
     })
 }
@@ -66,7 +67,7 @@ impl Run<'_> {
                 let ext_z = self.rs_extend(OP, &seat, *z)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
                 let pool = self.recurrent(*state);
-                let committed = self.rs_committed(&seat);
+                let committed = self.rs_committed(&seat, *state);
                 lower(self.ctx(), |l| {
                     let xbc = l.read(ext_xbc)?;
                     let dt = l.read(ext_dt)?;
@@ -74,7 +75,7 @@ impl Run<'_> {
                     let m = self.mamba2_banks(l, op)?;
                     let slab = l.read(pool.state)?;
                     let indptr = l.read(self.qo_indptr())?;
-                    let seat = read_seat(l, &committed)?;
+                    let seat = read_seat(l, &committed, pool.map)?;
                     let tuning = l.tuning();
                     let (yv, next) = ssm::mamba2_committed(
                         l.f(),
@@ -109,7 +110,7 @@ impl Run<'_> {
                     let z = l.read(self.tensor(*z))?;
                     let m = self.mamba2_banks(l, op)?;
                     let slab = l.read(pool.state)?;
-                    let slots = l.read(pool.slots)?;
+                    let slots = l.slots(&pool)?;
                     let tuning = l.tuning();
                     let (yv, next) =
                         ssm::mamba2(l.f(), xbc, dt, z, m, slab, slots, y.landing(), tuning)?;
@@ -134,7 +135,7 @@ impl Run<'_> {
                     let m = self.mamba2_banks(l, op)?;
                     let slab = l.read(pool.state)?;
                     let indptr = l.read(xbc.indptr)?;
-                    let slots = l.read(pool.slots)?;
+                    let slots = l.slots(&pool)?;
                     let tuning = l.tuning();
                     let (yv, next) = ssm::mamba2_chunked(
                         l.f(),
@@ -175,14 +176,14 @@ impl Run<'_> {
                 let ext_y = self.rs_out(OP, &seat, *y)?;
                 let pool = self.recurrent(*state);
                 conv_bank(OP, &pool)?;
-                let committed = self.rs_committed(&seat);
+                let committed = self.rs_committed(&seat, *state);
                 lower(self.ctx(), |l| {
                     let xv = l.read(ext_x)?;
                     let w = l.read(self.tensor(*weight))?;
                     let bias = bias.map(|b| l.read(self.tensor(b))).transpose()?;
                     let bank = l.read(pool.conv_state)?;
                     let indptr = l.read(self.qo_indptr())?;
-                    let seat = read_seat(l, &committed)?;
+                    let seat = read_seat(l, &committed, pool.map)?;
                     let (yv, next) = ssm::causal_conv1d_committed(
                         l.f(),
                         xv,
@@ -242,13 +243,13 @@ impl Run<'_> {
                 let ext_gates = self.rs_ext_of(OP, &seat, *gates)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
                 let pool = self.recurrent(*state);
-                let committed = self.rs_committed(&seat);
+                let committed = self.rs_committed(&seat, *state);
                 lower(self.ctx(), |l| {
                     let qkv = l.read(ext_qkv)?;
                     let gates = l.read(ext_gates)?;
                     let slab = l.read(pool.state)?;
                     let indptr = l.read(self.qo_indptr())?;
-                    let seat = read_seat(l, &committed)?;
+                    let seat = read_seat(l, &committed, pool.map)?;
                     let tuning = l.tuning();
                     let (yv, next) = ssm::gated_delta_committed(
                         l.f(),
@@ -302,7 +303,7 @@ impl Run<'_> {
                 let ext_b = self.rs_extend(OP, &seat, *b)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
                 let pool = self.recurrent(*state);
-                let committed = self.rs_committed(&seat);
+                let committed = self.rs_committed(&seat, *state);
                 lower(self.ctx(), |l| {
                     let mixed = l.read(ext_mixed)?;
                     let forget = l.read(ext_f)?;
@@ -311,7 +312,7 @@ impl Run<'_> {
                     let a_log = l.read(self.tensor(*a_log))?;
                     let slab = l.read(pool.state)?;
                     let indptr = l.read(self.qo_indptr())?;
-                    let seat = read_seat(l, &committed)?;
+                    let seat = read_seat(l, &committed, pool.map)?;
                     let tuning = l.tuning();
                     let (yv, next) = ssm::kda_committed(
                         l.f(),
@@ -352,7 +353,7 @@ impl Run<'_> {
                     let w = l.read(self.tensor(*weight))?;
                     let bias = bias.map(|b| l.read(self.tensor(b))).transpose()?;
                     let bank = l.read(pool.conv_state)?;
-                    let slots = l.read(pool.slots)?;
+                    let slots = l.slots(&pool)?;
                     let (yv, next) = ssm::causal_conv1d(
                         l.f(),
                         xv,
@@ -386,7 +387,7 @@ impl Run<'_> {
                     let bias = bias.map(|b| l.read(self.tensor(b))).transpose()?;
                     let bank = l.read(pool.conv_state)?;
                     let indptr = l.read(x.indptr)?;
-                    let slots = l.read(pool.slots)?;
+                    let slots = l.slots(&pool)?;
                     let (yv, next) = ssm::causal_conv1d_chunked(
                         l.f(),
                         kernels_xla::tensor::RaggedTensor { data, indptr },
@@ -425,7 +426,7 @@ impl Run<'_> {
                     let qkv = l.read(self.tensor(*qkv))?;
                     let gates = l.read(self.tensor(*gates))?;
                     let slab = l.read(pool.state)?;
-                    let slots = l.read(pool.slots)?;
+                    let slots = l.slots(&pool)?;
                     let tuning = l.tuning();
                     let (yv, next) = ssm::gated_delta(
                         l.f(),
@@ -462,7 +463,7 @@ impl Run<'_> {
                     let gates = l.read(self.tensor(*gates))?;
                     let slab = l.read(pool.state)?;
                     let indptr = l.read(qkv.indptr)?;
-                    let slots = l.read(pool.slots)?;
+                    let slots = l.slots(&pool)?;
                     let tuning = l.tuning();
                     let (yv, next) = ssm::gated_delta_chunked(
                         l.f(),
@@ -503,7 +504,7 @@ impl Run<'_> {
                     let dt_bias = l.read(self.tensor(*dt_bias))?;
                     let a_log = l.read(self.tensor(*a_log))?;
                     let slab = l.read(pool.state)?;
-                    let slots = l.read(pool.slots)?;
+                    let slots = l.slots(&pool)?;
                     let tuning = l.tuning();
                     let (yv, next) = ssm::kda_step(
                         l.f(),
@@ -548,7 +549,7 @@ impl Run<'_> {
                     let a_log = l.read(self.tensor(*a_log))?;
                     let slab = l.read(pool.state)?;
                     let indptr = l.read(mixed.indptr)?;
-                    let slots = l.read(pool.slots)?;
+                    let slots = l.slots(&pool)?;
                     let tuning = l.tuning();
                     let (yv, next) = ssm::kda_chunked(
                         l.f(),
@@ -584,7 +585,7 @@ impl Run<'_> {
                     let xv = l.read(self.tensor(*x))?;
                     let w = l.read(self.tensor(*weight))?;
                     let bank = l.read(pool.conv_state)?;
-                    let slots = l.read(pool.slots)?;
+                    let slots = l.slots(&pool)?;
                     let (yv, next) =
                         ssm::short_conv(l.f(), xv, w, bank, slots, *conv_width, y.landing())?;
                     l.land(y, yv)?;
@@ -606,7 +607,7 @@ impl Run<'_> {
                     let w = l.read(self.tensor(*weight))?;
                     let bank = l.read(pool.conv_state)?;
                     let indptr = l.read(x.indptr)?;
-                    let slots = l.read(pool.slots)?;
+                    let slots = l.slots(&pool)?;
                     let (yv, next) = ssm::short_conv_chunked(
                         l.f(),
                         kernels_xla::tensor::RaggedTensor { data, indptr },

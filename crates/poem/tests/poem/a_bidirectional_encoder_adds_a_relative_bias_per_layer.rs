@@ -1,4 +1,4 @@
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, ops, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, Weight, ops, trace_hybrid};
 use poem_ir::GluAct;
 use poem_ir::{Attn, Def, Dim, Elemwise, Guard, Operands, Operation, RaggedMask, Ty};
 
@@ -14,8 +14,8 @@ const MAX_DISTANCE: f32 = 128.0;
 struct Encoder;
 
 impl ForwardHybrid for Encoder {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         let w = |name: &str, out: u32, inner: u32| {
@@ -81,7 +81,7 @@ fn a_bidirectional_encoder_adds_a_relative_bias_per_layer_every_case() {
 
 fn two_layers_trace_with_one_table_each_and_the_attention_names_it() {
     let trace = trace_hybrid("encoder", &Encoder, Platform::Cuda);
-    assert!(trace.caches.is_empty(), "an encoder declares no kv space");
+    assert!(trace.caches.is_empty(), "an encoder declares no kv row");
     let names: Vec<&str> = trace.outputs.iter().map(|o| o.name.as_str()).collect();
     assert_eq!(names, ["hidden"], "the hidden rows are its one output");
 
@@ -194,8 +194,8 @@ fn refusal(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
 fn a_table_that_disagrees_with_its_max_len_or_is_not_f32_is_refused() {
     struct Misshapen(u32, Dtype);
     impl ForwardHybrid for Misshapen {
-        fn caches(&self) -> HybridSpec {
-            HybridSpec::new()
+        fn states(&self) -> StateRows {
+            StateRows::new()
         }
         fn forward(&self, inputs: Input) {
             let x = inputs.input(

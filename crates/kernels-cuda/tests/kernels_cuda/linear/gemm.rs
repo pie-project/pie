@@ -279,7 +279,7 @@ fn the_fp8_block_projections_answer_the_dot() {
                 let mut routes = t(b.zeros(rg * 4), rows, groups, I32);
                 group_routes(&ctx, groups as u32, &mut routes).expect("the routes lay");
                 let (xr, mut yr) = (t(x, rg, k, Bf16), t(y.ptr, rg, n, Bf16));
-                select_fp8_w8a8(&ctx, xr, codes, atoms, groups as u32, routes, &mut yr)
+                select_fp8_w8a8(&ctx, xr, codes, atoms, groups as u32, routes, &mut yr, kernels_cuda::linear::moe::ExpertTable::RESIDENT)
             }
         }
         .expect("the fp8 projection fires");
@@ -466,7 +466,17 @@ fn an_mxfp8_release_laid_a_row_a_32_answers_the_dot() {
                 assert!(took, "{}", what("W8A16"));
             } else {
                 select_fp8_w8a16(
-                    &ctx, "test", x, codes, atoms, ex as u32, 32, r, &mut y, None,
+                    &ctx,
+                    "test",
+                    x,
+                    codes,
+                    atoms,
+                    ex as u32,
+                    32,
+                    r,
+                    &mut y,
+                    None,
+                    kernels_cuda::linear::moe::ExpertTable::RESIDENT,
                 )
                 .expect("the W8A16 select fires");
             }
@@ -524,8 +534,17 @@ fn the_fp8_select_lands_its_swiglu_as_the_glu_after_it() {
         group_routes(&ctx, groups as u32, &mut routes).expect("the routes lay");
         let xr = t(x, rg, k, Bf16);
         let mut p = t(packed.ptr, rg, 2 * inter, Bf16);
-        select_fp8_w8a8(&ctx, xr, codes, atoms, groups as u32, routes, &mut p)
-            .expect("the select fires");
+        select_fp8_w8a8(
+            &ctx,
+            xr,
+            codes,
+            atoms,
+            groups as u32,
+            routes,
+            &mut p,
+            kernels_cuda::linear::moe::ExpertTable::RESIDENT,
+        )
+        .expect("the select fires");
         let mut ya = t(apart.ptr, rg, inter, Bf16);
         kernels_cuda::linear::glu::swiglu(&ctx, p, inter as u32, 1, &mut ya)
             .expect("the glu fires");
@@ -539,6 +558,7 @@ fn the_fp8_select_lands_its_swiglu_as_the_glu_after_it() {
             routes,
             &mut yf,
             Glu::Swiglu,
+            kernels_cuda::linear::moe::ExpertTable::RESIDENT,
         )
         .expect("the fused select fires");
         assert!(took, "{rows}x{groups}x{inter}x{k} lands its glu");

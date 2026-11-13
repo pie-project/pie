@@ -268,7 +268,9 @@ fn pool_over(rig: &mut Rig, keys: u32, values: u32, dtype: Dtype, head_dim: usiz
         seq_stride: width as u64,
         head_stride: head_dim as u64,
         q8: false,
+        page_stride: [0; 2],
     }
+    .paged_densely()
 }
 
 /// Write the seeded K/V (bf16 tensors) into a pool via the real append op.

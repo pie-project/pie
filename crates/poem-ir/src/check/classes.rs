@@ -591,9 +591,16 @@ mod tests {
 
         fn input(&mut self) -> ValueId {
             self.inputs += 1;
-            let which = RuntimeInput::Mask {
-                space: self.inputs - 1,
+            let which = RuntimeInput::Guest {
+                id: self.inputs - 1,
+                axis: crate::InputAxis::Row,
+                width: 1,
+                dtype: Dtype::Bf16,
             };
+            self.trace.inputs.push(crate::GuestInput {
+                name: format!("in{}", self.inputs - 1),
+                rows: None,
+            });
             self.value(Def::Input(which))
         }
 

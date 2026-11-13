@@ -3,6 +3,7 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 #include "../prim/mpp.h"
+#include "../prim/kv_page.h"
 // KV is int8_t over a q8 pool, whose cells carry their own scale, and bfloat over a pool
 // stored as it was written.
 template <int D, bool DIRECT, typename KV, bool LSE = false>
@@ -16,12 +17,17 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
        const device uchar *mask [[buffer(12)]], constant uint &mask_stride [[buffer(13)]],
        const device uchar *enabled [[buffer(14)]], constant int &window [[buffer(15)]],
        const device bfloat *sinks [[buffer(16)]], constant int &rows [[buffer(17)]],
-       device float *lse [[buffer(18)]], uint2 tile [[threadgroup_position_in_grid]], uint2 grid [[threadgroups_per_grid]],
+       device float *lse [[buffer(18)]], const constant ulong &k_page_stride [[buffer(19)]],
+       const constant ulong &v_page_stride [[buffer(20)]],
+       const constant ulong &k_offset [[buffer(21)]], const constant ulong &v_offset [[buffer(22)]],
+       uint2 tile [[threadgroup_position_in_grid]], uint2 grid [[threadgroups_per_grid]],
        uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
        uint sg [[simdgroup_index_in_threadgroup]]) {
   constexpr int M = 32, N = 32, SG = 8;
   constexpr bool Q8 = sizeof(KV) == 1;
   constexpr int W = Q8 ? 2 * D : D;
+  const device KV *kplane = pie_kv_plane(keys, k_offset);
+  const device KV *vplane = pie_kv_plane(values, v_offset);
   const int head = tile.x, heads = grid.x, kv = head / gqa, row0 = tile.y * M;
   threadgroup bfloat qs[DIRECT ? 1 : M * D];
   threadgroup float scores[M * N], maxima[M], totals[M], factors[M];
@@ -74,14 +80,15 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
     }
     for (int base = (first / N) * N; base <= last; base += N) {
       const uint physical = pages[ptr[req] + base / N];
-      const ulong offset = (ulong(physical) * N * kv_heads + kv) * W;
-      auto b = tensor(const_cast<device KV *>(keys) + offset, dextents<int, 2>{D, N},
+      const ulong k_at = ulong(physical) * (k_page_stride / sizeof(KV)) + ulong(kv) * W;
+      const ulong v_at = ulong(physical) * (v_page_stride / sizeof(KV)) + ulong(kv) * W;
+      auto b = tensor(const_cast<device KV *>(kplane) + k_at, dextents<int, 2>{D, N},
                       array<int, 2>{1, kv_heads * W});
       auto score =
           qkop.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
       qkop.run(a, b, score);
       score.store(score_view);
-      auto v = tensor(const_cast<device KV *>(values) + offset, dextents<int, 2>{D, N},
+      auto v = tensor(const_cast<device KV *>(vplane) + v_at, dextents<int, 2>{D, N},
                       array<int, 2>{1, kv_heads * W});
       threadgroup_barrier(mem_flags::mem_threadgroup);
       for (uint r = sg; r < M; r += SG) {
@@ -90,11 +97,11 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
                     (enabled[row] == 2 || kpos <= pos) && (window <= 0 || kpos >= pos - window + 1);
         if (keep && enabled[row])
           keep = uint(kpos) < mask_stride && mask[ulong(row) * mask_stride + kpos] != 0;
-        const ulong cell = offset + ulong(lane) * kv_heads * W;
+        const ulong cell = ulong(lane) * kv_heads * W;
         float ks = 1, vs = 1;
         if constexpr (Q8) {
-          ks = *reinterpret_cast<const device float *>(keys + cell + D);
-          vs = *reinterpret_cast<const device float *>(values + cell + D);
+          ks = *reinterpret_cast<const device float *>(kplane + k_at + cell + D);
+          vs = *reinterpret_cast<const device float *>(vplane + v_at + cell + D);
         }
         const float s = keep ? scores[r * N + lane] * scale * ks : -1e30f;
         const float newmax = max(maxima[r], simd_max(s));
@@ -140,7 +147,7 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
       constant int &, const device int *, const device int *, const device uint *,                 \
       const device uint *, constant int &, constant int &, constant float &, const device uchar *, \
       constant uint &, const device uchar *, constant int &, const device bfloat *,                \
-      constant int &, device float *, uint2, uint2, uint, uint, uint);
+      constant int &, device float *, PIE_KV_LAYOUT_TYPES uint2, uint2, uint, uint, uint);
 #define Q8_MPP(DIM, DIRECT, KV, NAME) Q8_MPP_LSE(DIM, DIRECT, KV, false, NAME)
 Q8_MPP(128, false, int8_t, "q8_mpp_d128")
 Q8_MPP(256, false, int8_t, "q8_mpp_d256")

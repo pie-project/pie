@@ -628,11 +628,6 @@ impl Plane {
         )
     }
 
-    #[must_use]
-    pub fn device_forms(&self) -> (usize, usize) {
-        self.forms.tally()
-    }
-
     pub fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {
         self.instances
             .remove(&id)
@@ -1194,12 +1189,6 @@ impl Plane {
                 }
             }
         }
-    }
-
-    /// Guest stage executions on the device and the lanes they carried.
-    #[must_use]
-    pub fn stage_runs(&self) -> (u64, u64) {
-        (self.stages.runs, self.stages.lanes)
     }
 
     #[must_use]

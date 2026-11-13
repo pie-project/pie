@@ -1,4 +1,5 @@
 #include "ssm/state.cuh"
+#include "prim/state_rows.cuh"
 
 namespace pie::ssm {
 
@@ -9,10 +10,8 @@ __global__ void gdn_chunked(
     const float* __restrict__ v,
     const float* __restrict__ g_log,
     const float* __restrict__ beta,
-    StateT*      __restrict__ state_base,
-    const int*       __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     float*       __restrict__ out,
     int V_h, int K_d, int V_d,
     const u32* __restrict__ win)
@@ -28,11 +27,9 @@ __global__ void gdn_chunked(
     const int T  = static_cast<int>(qo_indptr[r + 1]) - t0;
     if (T <= 0) return;
 
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
-    StateT* state = state_base
-        + (long long)slot * slot_stride_elems
-        + (long long)h * K_d * V_d;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    StateT* state = rows.atom<StateT>(rid, h, (long long)K_d * V_d);
 
     extern __shared__ float smem[];
     float* sq = smem;
@@ -89,10 +86,8 @@ __global__ void gdn_chunked_warp_tiled(
     const float* __restrict__ v,
     const float* __restrict__ g_log,
     const float* __restrict__ beta,
-    StateT*      __restrict__ state_base,
-    const int*       __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     float*       __restrict__ out,
     int K_h, int V_h, int K_d, int V_d,
     bool write_state,
@@ -119,11 +114,9 @@ __global__ void gdn_chunked_warp_tiled(
     const int T  = static_cast<int>(qo_indptr[r + 1]) - t0;
     if (T <= 0) return;
 
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
-    StateT* state = state_base
-        + (long long)slot * slot_stride_elems
-        + (long long)h * K_d * V_d;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    StateT* state = rows.atom<StateT>(rid, h, (long long)K_d * V_d);
 
     float s_vals[MAX_K_PER_LANE];
     int k_vals[MAX_K_PER_LANE];
@@ -195,10 +188,8 @@ __global__ void gdn_chunked_fla(
     const float* __restrict__ v,
     const float* __restrict__ g_log,
     const float* __restrict__ beta,
-    StateT*      __restrict__ state_base,
-    const int*       __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     float*       __restrict__ out,
     int K_h, int V_h, int K_d, int V_d,
     bool write_state,
@@ -239,11 +230,9 @@ __global__ void gdn_chunked_fla(
     }
     if (T <= 0) return;
 
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
-    StateT* state = state_base
-        + (long long)slot * slot_stride_elems
-        + (long long)h * K_d * V_d;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    StateT* state = rows.atom<StateT>(rid, h, (long long)K_d * V_d);
 
     extern __shared__ float smem[];
     float* sq = smem;
@@ -321,9 +310,8 @@ __global__ void gdn_chunked_fla(
         // stores it.
         if (sn.e0 < sn.e1 && snap_rows[sn.e0] == t + 1) {
             if (write_state && row_persists(write_state_mask, rl)) {
-                StateT* sat = state_base
-                    + (long long)snap_slots[sn.e0] * slot_stride_elems
-                    + (long long)h * K_d * V_d;
+                StateT* sat = rows.atom<StateT>(
+                    snap_slots + (long long)sn.e0 * rows.pieces, h, (long long)K_d * V_d);
                 #pragma unroll
                 for (int j = 0; j < BK_MAX / 2; ++j) {
                     const int k0 = 2 * j;

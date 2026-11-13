@@ -1,5 +1,6 @@
 #include "prim/params.slang"
 #include "prim/u64.slang"
+#include "prim/pool.slang"
 
 // Per-layer embedding n-gram ids: each token hashes the window of itself and
 // the `ngram - 1` ids before it (from the batch, or from the lane's recurrent
@@ -16,23 +17,30 @@
 [[vk::binding(0)]] StructuredBuffer<int> ids;
 
 #if defined(PIE_UPDATE)
-[[vk::binding(1)]] RWStructuredBuffer<int> state;
+[[vk::binding(1)]] StructuredBuffer<uint> slots;
+[[vk::binding(2)]] StructuredBuffer<uint> hash;
+[[vk::binding(3)]] RWStructuredBuffer<int> ngram_ids;
+#define NGRAM_SEGMENTS_AT 4
+#elif defined(PIE_CHUNKED)
+[[vk::binding(1)]] StructuredBuffer<int> indptr;
 [[vk::binding(2)]] StructuredBuffer<uint> slots;
 [[vk::binding(3)]] StructuredBuffer<uint> hash;
 [[vk::binding(4)]] RWStructuredBuffer<int> ngram_ids;
-#define PIE_PARAMS_AT 5
-#elif defined(PIE_CHUNKED)
-[[vk::binding(1)]] StructuredBuffer<int> indptr;
-[[vk::binding(2)]] RWStructuredBuffer<int> state;
-[[vk::binding(3)]] StructuredBuffer<uint> slots;
-[[vk::binding(4)]] StructuredBuffer<uint> hash;
-[[vk::binding(5)]] RWStructuredBuffer<int> ngram_ids;
-#define PIE_PARAMS_AT 6
+#define NGRAM_SEGMENTS_AT 5
 #else
 #error "gather/ngram.slang: no kernel selected"
 #endif
+// The id windows, in the chunk pool's segments (`prim/pool.slang`).
+PIE_POOL_SEGMENTS(RWStructuredBuffer, int, NGRAM_SEGMENTS_AT)
+#define PIE_PARAMS_AT (NGRAM_SEGMENTS_AT + 4)
 
 struct Params {
+    uint seg_words;
+    uint state_origin;
+    uint slot_stride;
+    uint pieces;
+    uint piece_first;
+    uint piece_atoms;
     int ngram;
     int heads;
     int heads_per_ngram;
@@ -40,6 +48,10 @@ struct Params {
     int lanes;
 };
 PIE_PARAMS(PIE_PARAMS_AT, Params, params);
+PIE_POOL_READ(int, params.seg_words)
+PIE_POOL_WRITE(int, params.seg_words)
+PIE_POOL_VIEW(state, int, params.state_origin)
+PIE_STATE_PIECES
 
 U64 hash_at(uint i) {
     return u64_of(hash[2u * i], hash[2u * i + 1u]);
@@ -88,7 +100,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     }
     int span = params.ngram - 1;
 #if defined(PIE_UPDATE)
-    uint slab = slots[r] * uint(span);
+    uint slab = pie_piece_unit(r, 0u) * params.slot_stride;
     int window[MAX_NGRAM] = { 0, 0, 0, 0 };
     int fresh = ids[r];
     window[0] = fresh;
@@ -107,7 +119,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     if (rows <= 0) {
         return;
     }
-    uint slab = slots[uint(begin)] * uint(span);
+    uint slab = pie_piece_unit(uint(begin), 0u) * params.slot_stride;
     for (int t = 0; t < rows; t++) {
         int window[MAX_NGRAM] = { 0, 0, 0, 0 };
         window[0] = ids[uint(begin + t)];

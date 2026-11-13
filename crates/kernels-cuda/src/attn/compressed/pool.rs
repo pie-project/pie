@@ -153,6 +153,7 @@ pub fn state_write(
     ratio: u32,
     state_kv: Tensor,
     state_score: Tensor,
+    state_stride: i64,
 ) -> Result<(), Error> {
     const OP: &str = "attn.pool_state_write";
     dtype_dispatch!(OP, kv.dtype, { Bf16 => () });
@@ -193,6 +194,7 @@ pub fn state_write(
             width.arg(),
             pages.page_size.arg(),
             pitch.arg(),
+            state_stride.arg(),
         ],
     )
 }
@@ -207,6 +209,7 @@ pub fn gather(
     ratio: u32,
     state_kv: Tensor,
     state_score: Tensor,
+    state_stride: i64,
     ape: Tensor,
     entries: &mut Tensor,
 ) -> Result<(), Error> {
@@ -275,6 +278,7 @@ pub fn gather(
                 coff.arg(),
                 pages.page_size.arg(),
                 pitch.arg(),
+                state_stride.arg(),
                 ctx.stage(),
             ],
         );
@@ -300,6 +304,7 @@ pub fn gather(
             coff.arg(),
             pages.page_size.arg(),
             pitch.arg(),
+            state_stride.arg(),
             ctx.stage(),
         ],
     )
@@ -374,6 +379,7 @@ pub fn kv_append(
             head_dim.arg(),
             pool.page_size.arg(),
             div.arg(),
+            kv::page_elems(OP, pool, 0)?.arg(),
             ctx.stage(),
         ],
     )
@@ -461,6 +467,7 @@ pub fn attention_lse(
             entries.page_size.arg(),
             sm_scale.arg(),
             i32::from(compact(entries, ratio.unsigned_abs(), i64::from(head_dim))).arg(),
+            kv::page_elems(OP, entries, 0)?.arg(),
             ctx.stage(),
         ],
     )
@@ -585,6 +592,7 @@ pub fn attention_lse_selected(
             entries.page_size.arg(),
             sm_scale.arg(),
             i32::from(compact(entries, ratio.unsigned_abs(), i64::from(head_dim))).arg(),
+            kv::page_elems(OP, entries, 0)?.arg(),
             ctx.stage(),
         ],
     )
@@ -607,6 +615,7 @@ pub fn compress(
     ratio: u32,
     state_kv: Tensor,
     state_score: Tensor,
+    state_stride: i64,
     ape: Tensor,
     weight: Tensor,
     eps: f32,
@@ -728,11 +737,13 @@ pub fn compress(
             out.page_indptr.arg(),
             out.page_size.arg(),
             out_div.arg(),
+            kv::page_elems(OP, out, 0)?.arg(),
             head_dim_i.arg(),
             ratio.arg(),
             coff.arg(),
             pages.page_size.arg(),
             count(OP, "the state plane's row pitch", pitch)?.arg(),
+            state_stride.arg(),
             state.as_ref().map_or(ArgValue::ABSENT, |s| s.kv.arg()),
             state.as_ref().map_or(ArgValue::ABSENT, |s| s.score.arg()),
             state
@@ -800,6 +811,7 @@ pub fn block_mean(
             head_dim.arg(),
             ratio.arg(),
             keys.page_size.arg(),
+            kv::page_elems(OP, keys, 0)?.arg(),
             ctx.stage(),
         ],
     )?;

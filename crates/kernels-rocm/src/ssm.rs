@@ -7,7 +7,7 @@ use dtype::Dtype;
 use crate::jit::{
     Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
-use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
+use crate::tensor::{RaggedTensor, RecurrentPool, StateRows, Tensor};
 
 const FILE: &str = "ssm/mixers.hip";
 
@@ -221,7 +221,7 @@ fn conv1d_update(
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     let (channels, c, k) = conv_extents(op, x, y, conv_width)?;
     let dil = stated(op, nonzero(op, "the conv's dilation", dilation)?)?;
-    let rows = nonzero(op, "rows", x.rows)?;
+    let n = nonzero(op, "rows", x.rows)?;
     seated(
         op,
         state,
@@ -230,21 +230,21 @@ fn conv1d_update(
         false,
         false,
     )?;
+    // The window cuts along its channels.
+    let rows = state.rows(op, state.conv_slab, state.conv_stride, channels)?;
     // A thread owns one channel of a row.
     let entrypoint = format!("::pie::attn::ssm_conv1d_update{}", out.args());
     let launch = Launch::grid(
-        [channels.div_ceil(CONV_UPDATE_BLOCK), rows, 1],
+        [channels.div_ceil(CONV_UPDATE_BLOCK), n, 1],
         [CONV_UPDATE_BLOCK, 1, 1],
     );
     let args = [
         x.arg(),
         weight.arg(),
         bias.map_or(ArgValue::ABSENT, |b| b.arg()),
-        state.conv_slab.arg(),
-        state.slot_ids.arg(),
-        state.conv_stride.arg(),
+        rows.arg(),
         y.arg(),
-        stated(op, rows)?.arg(),
+        stated(op, n)?.arg(),
         c.arg(),
         k.arg(),
         dil.arg(),
@@ -332,15 +332,17 @@ fn conv1d_chunked(
         true,
         true,
     )?;
-    // Dilation 1 at 2..=4 taps over whole 16-byte channel runs takes the
-    // eight-channel sliding walk (`ssm_conv1d_chunked_v8`).
+    let rows = state.rows(op, state.conv_slab, state.conv_stride, channels)?;
+    // Dilation 1 at 2..=4 taps over whole 16-byte channel runs (a piece's
+    // too) takes the eight-channel sliding walk (`ssm_conv1d_chunked_v8`).
     let vectored = dil == 1
         && (2..=4).contains(&k)
         && channels % 8 == 0
         && crate::jit::aligned16(x.data.ptr)
         && crate::jit::aligned16(y.ptr)
         && crate::jit::aligned16(state.conv_slab.ptr)
-        && state.conv_stride % 8 == 0;
+        && rows.keeps(8)
+        && rows.atoms().is_multiple_of(8);
     if vectored {
         let entrypoint = format!(
             "::pie::attn::ssm_conv1d_chunked_v8{}",
@@ -362,10 +364,8 @@ fn conv1d_chunked(
                 weight.arg(),
                 bias.map_or(ArgValue::ABSENT, |b| b.arg()),
                 y.arg(),
-                state.conv_slab.arg(),
-                state.slot_ids.arg(),
+                rows.arg(),
                 x.indptr.arg(),
-                state.conv_stride.arg(),
                 c.arg(),
                 state.commit_len.arg(),
                 state.begin_at.arg(),
@@ -391,10 +391,8 @@ fn conv1d_chunked(
                 weight.arg(),
                 bias.map_or(ArgValue::ABSENT, |b| b.arg()),
                 y.arg(),
-                state.conv_slab.arg(),
-                state.slot_ids.arg(),
+                rows.arg(),
                 x.indptr.arg(),
-                state.conv_stride.arg(),
                 c.arg(),
                 k.arg(),
                 dil.arg(),
@@ -419,10 +417,8 @@ fn conv1d_chunked(
         )),
         &[
             x.data.arg(),
-            state.conv_slab.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             x.indptr.arg(),
-            state.conv_stride.arg(),
             c.arg(),
             k.arg(),
             dil.arg(),
@@ -644,17 +640,19 @@ pub fn gated_delta(
         false,
         false,
     )?;
+    // The state cuts along its value heads.
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, v_heads)?;
     // A block a (head, row) at any batch: even one row of 48 heads runs in
     // under half the tiled step's time.
     if shape.k_dim == CHUNK_HEAD
         && shape.v_dim == CHUNK_HEAD
-        && state.slot_stride_elems % 8 == 0
+        && rows.keeps(8)
         && shape.conv_dim.is_multiple_of(8)
     {
-        return shape.decode_rows(ctx, OP, qkv, gates, state, y);
+        return shape.decode_rows(ctx, OP, qkv, gates, &rows, state, y);
     }
-    if fused_fits(&shape, state) {
-        return shape.decode_fused(ctx, OP, qkv, gates, state, y);
+    if fused_fits(&shape, &rows) {
+        return shape.decode_fused(ctx, OP, qkv, gates, &rows, state, y);
     }
     Err(refuse(
         OP,
@@ -714,7 +712,6 @@ pub fn gdn_step_fused(
         && ba.width == 2 * v_heads
         && u64::from(conv_weight.rows) * u64::from(conv_weight.width)
             == u64::from(channels) * u64::from(conv_width)
-        && state.slot_stride_elems % 8 == 0
         && state.write_state_mask.is_absent() == conv_state.write_state_mask.is_absent()
         && conv_state.commit_len.is_absent()
         && conv_state.begin_at.is_absent()
@@ -725,8 +722,15 @@ pub fn gdn_step_fused(
     if !covered {
         return Ok(false);
     }
-    let rows = nonzero(OP, "rows", qkvz.rows)?;
-    if u64::from(rows) * u64::from(k_heads) > u64::from(STEP_TICKETS) {
+    // The state cuts along its value heads, the conv window along its
+    // channels.
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, v_heads)?;
+    let conv_rows = conv_state.rows(OP, conv_state.conv_slab, conv_state.conv_stride, channels)?;
+    if !rows.keeps(8) {
+        return Ok(false);
+    }
+    let n = nonzero(OP, "rows", qkvz.rows)?;
+    if u64::from(n) * u64::from(k_heads) > u64::from(STEP_TICKETS) {
         return Ok(false);
     }
     let tickets = ctx.tickets(OP, STEP_TICKETS)?;
@@ -738,21 +742,17 @@ pub fn gdn_step_fused(
             FILE,
             "::pie::attn::ssm_gdn_step_fused<128, 128, 256, 4>",
         ))
-        .apply(Launch::grid([v_heads, rows, 1], [FUSED_BLOCK, 1, 1])),
+        .apply(Launch::grid([v_heads, n, 1], [FUSED_BLOCK, 1, 1])),
         &[
             qkvz.arg(),
             conv_weight.arg(),
-            conv_state.conv_slab.arg(),
-            conv_state.slot_ids.arg(),
-            conv_state.conv_stride.arg(),
+            conv_rows.arg(),
             conv_state.write_state.arg(),
             conv_state.write_state_mask.arg(),
             ba.arg(),
             a_log.arg(),
             dt_bias.arg(),
-            state.slab.arg(),
-            state.slot_ids.arg(),
-            state.slot_stride_elems.arg(),
+            rows.arg(),
             state.write_state.arg(),
             state.write_state_mask.arg(),
             qkv.arg(),
@@ -773,13 +773,13 @@ const FUSED_BLOCK: u32 = 256;
 
 const FUSED_BV: u32 = 16;
 
-fn fused_fits(shape: &Delta, state: &RecurrentPool) -> bool {
+fn fused_fits(shape: &Delta, rows: &StateRows) -> bool {
     const VEC: u32 = 8;
     shape.conv_dim.is_multiple_of(VEC)
         && (shape.k_heads * shape.k_dim).is_multiple_of(VEC)
         && shape.v_dim.is_multiple_of(FUSED_BV)
         && (shape.k_dim * shape.v_dim).is_multiple_of(VEC)
-        && state.slot_stride_elems % i64::from(VEC) == 0
+        && rows.keeps(i64::from(VEC))
         && shape.k_dim <= FUSED_BLOCK * VEC / FUSED_BV
 }
 
@@ -788,12 +788,14 @@ fn fused_fits(shape: &Delta, state: &RecurrentPool) -> bool {
 const ROWS_STEP_FROM: u32 = 256;
 
 impl Delta {
+    #[allow(clippy::too_many_arguments)]
     fn decode_rows(
         self,
         ctx: &Ctx,
         op: &'static str,
         qkv: Tensor,
         gates: Tensor,
+        rows: &StateRows,
         state: &RecurrentPool,
         y: &mut Tensor,
     ) -> Result<(), Error> {
@@ -809,9 +811,7 @@ impl Delta {
             &[
                 qkv.arg(),
                 gates.arg(),
-                state.slab.arg(),
-                state.slot_ids.arg(),
-                state.slot_stride_elems.arg(),
+                rows.arg(),
                 y.arg(),
                 stated(op, self.k_heads)?.arg(),
                 stated(op, self.v_heads)?.arg(),
@@ -824,12 +824,14 @@ impl Delta {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decode_fused(
         self,
         ctx: &Ctx,
         op: &'static str,
         qkv: Tensor,
         gates: Tensor,
+        rows: &StateRows,
         state: &RecurrentPool,
         y: &mut Tensor,
     ) -> Result<(), Error> {
@@ -844,9 +846,7 @@ impl Delta {
             &[
                 qkv.arg(),
                 gates.arg(),
-                state.slab.arg(),
-                state.slot_ids.arg(),
-                state.slot_stride_elems.arg(),
+                rows.arg(),
                 y.arg(),
                 stated(op, self.k_heads)?.arg(),
                 stated(op, self.v_heads)?.arg(),
@@ -926,6 +926,7 @@ pub fn gated_delta_chunked(
         }
     };
     seated(OP, state, "ssm_gdn_scan", true, true, true)?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, v_heads)?;
     let bv = v_dim.min(SCAN_BV);
     let [snap, snap_rows, snap_slots] = state.snapshots.args();
     ctx.fire(
@@ -944,10 +945,8 @@ pub fn gated_delta_chunked(
             ArgValue::Ptr(staged.v),
             ArgValue::Ptr(staged.g_log),
             ArgValue::Ptr(staged.beta),
-            state.slab.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             qkv.indptr.arg(),
-            state.slot_stride_elems.arg(),
             y.arg(),
             stated(OP, k_heads)?.arg(),
             stated(OP, v_heads)?.arg(),
@@ -987,6 +986,7 @@ fn chunk_parallel(
 ) -> Result<(), Error> {
     let lanes = requests(op, qkv)?;
     seated(op, state, "ssm_gdn_chunk", true, true, true)?;
+    let rows = state.rows(op, state.slab, state.slot_stride_elems, shape.v_heads)?;
     let Delta {
         k_dim,
         v_dim,
@@ -1061,7 +1061,7 @@ fn chunk_parallel(
     let args = vec![
         qkv.data.arg(),
         gates.arg(),
-        state.slot_ids.arg(),
+        rows.arg(),
         qkv.indptr.arg(),
         state.commit_len.arg(),
         state.begin_at.arg(),
@@ -1094,10 +1094,8 @@ fn chunk_parallel(
         ArgValue::Ptr(u),
         ArgValue::Ptr(vnt),
         ArgValue::Ptr(hct),
-        state.slab.arg(),
-        state.slot_ids.arg(),
+        rows.arg(),
         qkv.indptr.arg(),
-        state.slot_stride_elems.arg(),
         state.commit_len.arg(),
         state.begin_at.arg(),
         state.write_state.arg(),
@@ -1130,7 +1128,7 @@ fn chunk_parallel(
         ArgValue::Ptr(kb),
         ArgValue::Ptr(vnt),
         ArgValue::Ptr(hct),
-        state.slot_ids.arg(),
+        rows.arg(),
         qkv.indptr.arg(),
         state.commit_len.arg(),
         state.begin_at.arg(),
@@ -1348,6 +1346,8 @@ pub fn kda(
     f32_state(OP, state)?;
     kda_head(OP, head_dim)?;
     seated(OP, state, "ssm_kda_step_batched", true, false, false)?;
+    // The state cuts along its heads.
+    let state_rows = state.rows(OP, state.slab, state.slot_stride_elems, shape.heads)?;
     // A block a (row, head) once the batch fills the device; under that,
     // each head's rows split over D / 32 blocks.
     let rows = if shape.n.saturating_mul(shape.heads) >= ROWS_STEP_FROM {
@@ -1371,9 +1371,7 @@ pub fn kda(
             b.arg(),
             a_log.arg(),
             dt_bias.arg(),
-            state.slab.arg(),
-            state.slot_ids.arg(),
-            state.slot_stride_elems.arg(),
+            state_rows.arg(),
             y.arg(),
             stated(OP, shape.heads)?.arg(),
             norm_eps.arg(),
@@ -1436,6 +1434,7 @@ pub fn kda_chunked(
     f32_state(OP, state)?;
     kda_head(OP, head_dim)?;
     seated(OP, state, "ssm_kda_chunked_batched", true, true, true)?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, shape.heads)?;
     if head_dim == CHUNK_HEAD && !SERIAL_SCAN.with(core::cell::Cell::get) {
         return kda_chunk_parallel(
             ctx,
@@ -1444,6 +1443,7 @@ pub fn kda_chunked(
             mixed,
             [f, b, dt_bias, a_log],
             state,
+            &rows,
             lanes,
             [norm_eps, gate_floor],
             y,
@@ -1467,10 +1467,8 @@ pub fn kda_chunked(
             ArgValue::Ptr(staged.v),
             ArgValue::Ptr(staged.gate),
             ArgValue::Ptr(staged.beta),
-            state.slab.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             mixed.indptr.arg(),
-            state.slot_stride_elems.arg(),
             y.arg(),
             stated(OP, shape.heads)?.arg(),
             stated(OP, shape.head_dim)?.arg(),
@@ -1497,6 +1495,7 @@ fn kda_chunk_parallel(
     mixed: RaggedTensor,
     [f, b, dt_bias, a_log]: [Tensor; 4],
     state: &RecurrentPool,
+    rows: &StateRows,
     lanes: u32,
     [norm_eps, gate_floor]: [f32; 2],
     y: &mut Tensor,
@@ -1525,7 +1524,7 @@ fn kda_chunk_parallel(
         b.arg(),
         a_log.arg(),
         dt_bias.arg(),
-        state.slot_ids.arg(),
+        rows.arg(),
         mixed.indptr.arg(),
         state.commit_len.arg(),
         state.begin_at.arg(),
@@ -1560,10 +1559,8 @@ fn kda_chunk_parallel(
         ArgValue::Ptr(qg),
         ArgValue::Ptr(p),
         y.arg(),
-        state.slab.arg(),
-        state.slot_ids.arg(),
+        rows.arg(),
         mixed.indptr.arg(),
-        state.slot_stride_elems.arg(),
         state.commit_len.arg(),
         state.begin_at.arg(),
         state.write_state.arg(),
@@ -1661,11 +1658,13 @@ pub fn mamba2(
     m.check(OP, xbc, dt, z, y, state_dim)?;
     f32_state(OP, state)?;
     seated(OP, state, "ssm_mamba2_step", true, false, false)?;
-    let rows = nonzero(OP, "rows", xbc.rows)?;
+    let n = nonzero(OP, "rows", xbc.rows)?;
+    // The state cuts along its heads.
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, m.heads)?;
     ctx.fire(
         OP,
         Fire::at(kernel(FILE, "::pie::attn::ssm_mamba2_step"))
-            .apply(Launch::grid([rows, m.heads, 1], [BLOCK, 1, 1])),
+            .apply(Launch::grid([n, m.heads, 1], [BLOCK, 1, 1])),
         &[
             xbc.arg(),
             dt.arg(),
@@ -1673,9 +1672,7 @@ pub fn mamba2(
             m.a_log.arg(),
             m.dt_bias.arg(),
             m.d.arg(),
-            state.slab.arg(),
-            state.slot_ids.arg(),
-            state.slot_stride_elems.arg(),
+            rows.arg(),
             y.arg(),
             stated(OP, m.heads)?.arg(),
             stated(OP, m.groups)?.arg(),
@@ -1688,9 +1685,31 @@ pub fn mamba2(
 }
 
 /// A prompt's Mamba-2 walk, token by token: a block a (request, head) lands
-/// `(C S + D x) * silu(z)` for each row, then the group norm.
+/// `(C S + D x) * silu(z)` for each row, then the group norm. A `tail` pass
+/// (rows past a lane's commit, from the state its first pass folded) walks
+/// before the norm, which every row then takes once.
 #[allow(clippy::too_many_arguments)]
 pub fn mamba2_chunked(
+    ctx: &Ctx,
+    xbc: RaggedTensor,
+    dt: Tensor,
+    z: Tensor,
+    m: Mamba2,
+    state: &RecurrentPool,
+    tail: Option<&RecurrentPool>,
+    state_dim: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.mamba2_chunked";
+    for pass in core::iter::once(state).chain(tail) {
+        mamba2_scan(ctx, xbc, dt, z, m, pass, state_dim, y)?;
+    }
+    m.norm(ctx, OP, y)
+}
+
+/// One pass of [`mamba2_chunked`]'s walk, the norm not taken.
+#[allow(clippy::too_many_arguments)]
+fn mamba2_scan(
     ctx: &Ctx,
     xbc: RaggedTensor,
     dt: Tensor,
@@ -1705,6 +1724,7 @@ pub fn mamba2_chunked(
     let lanes = requests(OP, xbc)?;
     f32_state(OP, state)?;
     seated(OP, state, "ssm_mamba2_scan", true, true, true)?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, m.heads)?;
     let [snap, snap_rows, snap_slots] = state.snapshots.args();
     ctx.fire(
         OP,
@@ -1717,10 +1737,8 @@ pub fn mamba2_chunked(
             m.a_log.arg(),
             m.dt_bias.arg(),
             m.d.arg(),
-            state.slab.arg(),
-            state.slot_ids.arg(),
+            rows.arg(),
             xbc.indptr.arg(),
-            state.slot_stride_elems.arg(),
             state.commit_len.arg(),
             state.begin_at.arg(),
             state.write_state.arg(),
@@ -1733,6 +1751,5 @@ pub fn mamba2_chunked(
             stated(OP, m.groups)?.arg(),
             ctx.stage(),
         ],
-    )?;
-    m.norm(ctx, OP, y)
+    )
 }

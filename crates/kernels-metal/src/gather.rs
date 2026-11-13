@@ -8,10 +8,50 @@ use crate::tensor::{Bank, Tensor};
 
 pub mod ngram;
 
+/// Where the blocks of a table's rows lie, for [`embed_tabled`]: `at` holds
+/// one GPU address a block (`kernels/gather/embed.metal`'s `RowAt`), the
+/// first of its `block_rows` rows, each laid as in the table; `hits`, where
+/// stated, a `u32` a block that each row read adds one to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowTable {
+    pub at: Tensor,
+    pub block_rows: u32,
+    pub hits: Option<Tensor>,
+}
+
+/// Where the blocks of a quantized table's rows lie, for
+/// [`embed_gather_mb_4bit`]: one address table a plane (codes, scales, zero
+/// points), one GPU address a block of `block_rows` rows each, laid as in
+/// the plane; `hits`, where stated, a `u32` a block each row read adds one
+/// to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BankRows {
+    pub codes: Tensor,
+    pub scales: Tensor,
+    pub biases: Tensor,
+    pub block_rows: u32,
+    pub hits: Option<Tensor>,
+}
+
 pub fn embed(
     ctx: &Ctx<'_>,
     ids: Tensor,
     table: Tensor,
+    vocab: u32,
+    y: Tensor,
+) -> Result<(), Error> {
+    embed_tabled(ctx, ids, table, None, vocab, y)
+}
+
+/// [`embed`] reading `table`'s rows where `rows` says (the weight cache's
+/// row table: a block in a pool slot, or in the table's own copy), or the
+/// contiguous `table` where `rows` is `None`. One kernel either way; under a
+/// row table `table` is not bound, so a recording never holds it.
+pub fn embed_tabled(
+    ctx: &Ctx<'_>,
+    ids: Tensor,
+    table: Tensor,
+    rows: Option<RowTable>,
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
@@ -23,6 +63,7 @@ pub fn embed(
         ids.rows, y.rows,
         "the token ids handed over are the rows this gather lands"
     );
+    let [rows_at, block_rows, hits, counting] = row_args(ctx, OP, rows)?;
     ctx.fire(
         Fire::at("gather/embed.metal", entry).apply(Grid::of(
             elementwise_rows(OP, y.width, y.rows)?,
@@ -30,12 +71,41 @@ pub fn embed(
         )),
         &[
             ids.arg(),
-            table.arg(),
+            rows.map_or(table, |rows| rows.at).arg(),
             y.arg_mut(),
             stated(OP, y.width)?.arg(),
             stated(OP, vocab)?.arg(),
+            rows_at,
+            block_rows,
+            hits,
+            counting,
         ],
     )
+}
+
+/// The row-table arguments of `embed.metal`: the address table, its rows a
+/// block (0: the contiguous table), the hit counters and whether to count.
+fn row_args(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    rows: Option<RowTable>,
+) -> Result<[crate::encode::ArgValue; 4], Error> {
+    Ok(match rows {
+        None => [ctx.absent()?, 0i32.arg(), ctx.absent()?, 0i32.arg()],
+        Some(rows) => [
+            rows.at.arg(),
+            stated(
+                op,
+                nonzero(op, "a row table's rows a block", rows.block_rows)?,
+            )?
+            .arg(),
+            match rows.hits {
+                Some(hits) => hits.arg_mut(),
+                None => ctx.absent()?,
+            },
+            i32::from(rows.hits.is_some()).arg(),
+        ],
+    })
 }
 
 fn concat_slices(op: &'static str, ids: Tensor, y: Tensor) -> Result<(u32, u32), Error> {
@@ -83,6 +153,10 @@ pub fn embed_concat(
             y.arg_mut(),
             stated(OP, width)?.arg(),
             stated(OP, vocab)?.arg(),
+            ctx.absent()?,
+            0i32.arg(),
+            ctx.absent()?,
+            0i32.arg(),
         ],
     )
 }
@@ -97,7 +171,7 @@ pub fn embed_concat_mb_4bit(
     const OP: &str = "gather.embed";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
     let (slices, width) = concat_slices(OP, ids, y)?;
-    gather_mb_4bit(ctx, OP, ids, table, vocab, y, slices, width)
+    gather_mb_4bit(ctx, OP, ids, table, None, vocab, y, slices, width)
 }
 
 pub fn split_qkv(
@@ -276,6 +350,7 @@ pub fn embed_gather_mb_4bit(
     ctx: &Ctx<'_>,
     ids: Tensor,
     table: Bank,
+    rows: Option<BankRows>,
     vocab: u32,
     y: Tensor,
 ) -> Result<(), Error> {
@@ -284,7 +359,7 @@ pub fn embed_gather_mb_4bit(
         ids.rows, y.rows,
         "the token ids handed over are the rows this gather lands"
     );
-    gather_mb_4bit(ctx, OP, ids, table, vocab, y, y.rows, y.width)
+    gather_mb_4bit(ctx, OP, ids, table, rows, vocab, y, y.rows, y.width)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -293,6 +368,7 @@ fn gather_mb_4bit(
     op: &'static str,
     ids: Tensor,
     table: Bank,
+    rows: Option<BankRows>,
     vocab: u32,
     y: Tensor,
     slices: u32,
@@ -335,6 +411,29 @@ fn gather_mb_4bit(
             y.arg_mut(),
             stated(op, width)?.arg(),
             stated(op, vocab)?.arg(),
+            match rows {
+                Some(rows) => rows.codes.arg(),
+                None => ctx.absent()?,
+            },
+            match rows {
+                Some(rows) => rows.scales.arg(),
+                None => ctx.absent()?,
+            },
+            match rows {
+                Some(rows) => rows.biases.arg(),
+                None => ctx.absent()?,
+            },
+            match rows {
+                Some(rows) => {
+                    stated(op, nonzero(op, "a row table's rows a block", rows.block_rows)?)?.arg()
+                }
+                None => 0i32.arg(),
+            },
+            match rows.and_then(|rows| rows.hits) {
+                Some(hits) => hits.arg_mut(),
+                None => ctx.absent()?,
+            },
+            i32::from(rows.is_some_and(|rows| rows.hits.is_some())).arg(),
         ],
     )
 }
@@ -816,6 +915,7 @@ mod tests {
             &probe,
             Tensor::new(3, 8, 1, Dtype::I32),
             u4_bank(4096, 64),
+            None,
             0,
             bf16(2, 8, 64),
         )

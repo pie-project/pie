@@ -601,12 +601,11 @@ pub fn sequence(trace: &Trace) -> Option<Vec<String>> {
             pairings.insert(codes, companions);
         }
     }
-    let ranking = engine_cuda::experts::Ranking::of(trace, &pairings).ok()?;
+    let order = engine_cuda::experts::serving_order(trace, &pairings).ok()?;
     Some(
-        ranking
-            .images()
+        order
             .into_iter()
-            .filter_map(|(param, ..)| trace.params.get(param as usize))
+            .filter_map(|param| trace.params.get(param))
             .map(|param| param.name.clone())
             .collect(),
     )

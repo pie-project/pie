@@ -11,27 +11,8 @@ use eta_exec::{PassInputs, StepOutcome};
 use eta_ir::registry::Stage;
 use eta_ir::registry::{GeometryClass, Port};
 
-#[derive(Debug)]
-pub enum Refusal {
-    Closed { what: &'static str, id: u64 },
-
-    Program(String),
-}
-
-impl std::fmt::Display for Refusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Refusal::Closed { what, id } => write!(f, "{what} {id} is closed"),
-            Refusal::Program(why) => f.write_str(why),
-        }
-    }
-}
-
-impl From<String> for Refusal {
-    fn from(why: String) -> Refusal {
-        Refusal::Program(why)
-    }
-}
+use engine_gpu::program::Refusal;
+use engine_gpu::program::{decode, numel_of};
 
 struct Instance {
     plan: Arc<ExecPlan>,
@@ -63,11 +44,7 @@ pub(crate) struct Tally {
     device: AtomicU64,
 }
 
-#[derive(Debug, Clone)]
-pub struct InputCell {
-    pub bytes: Vec<u8>,
-    pub dtype: eta_ir::types::Dtype,
-}
+use engine_gpu::serve::InputCell;
 
 #[cfg(feature = "wgpu")]
 pub(crate) struct Half {
@@ -217,7 +194,7 @@ impl Guests {
     pub(crate) fn jobs(
         self,
         seat: &crate::device::Buffer,
-        layout: &[crate::serve::ReadSpan],
+        layout: &[engine_gpu::serve::ReadSpan],
         pixels: Option<&crate::landing::Pixels>,
     ) -> Vec<Job> {
         let Guests {
@@ -236,7 +213,7 @@ impl Guests {
                      half,
                      held,
                  }| {
-                    let spans: Vec<Vec<crate::serve::ReadSpan>> = (lane..lane + lanes as u32)
+                    let spans: Vec<Vec<engine_gpu::serve::ReadSpan>> = (lane..lane + lanes as u32)
                         .map(|lane| {
                             (layout.iter())
                                 .filter(|span| span.lane == lane && span.rows > 0)
@@ -309,7 +286,7 @@ impl Guests {
 pub struct Plane {
     programs: BTreeMap<ProgramId, Arc<ExecPlan>>,
 
-    forms: crate::guest::Forms,
+    forms: engine_gpu::guest::Forms<crate::device::Api>,
 
     channels: BTreeMap<ChannelId, Arc<ChannelState>>,
     instances: BTreeMap<InstanceId, Instance>,
@@ -555,11 +532,6 @@ impl Plane {
         )
     }
 
-    #[must_use]
-    pub fn device_forms(&self) -> (usize, usize) {
-        self.forms.tally()
-    }
-
     pub fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {
         self.instances
             .remove(&id)
@@ -571,7 +543,11 @@ impl Plane {
     }
 
     /// The oldest cell guest input channel `id` of `instance` holds, in wire bytes.
-    pub fn input_cell(&self, instance: InstanceId, id: ChannelId) -> Result<InputCell, Refusal> {
+    pub fn input_cell(
+        &self,
+        instance: InstanceId,
+        id: ChannelId,
+    ) -> Result<InputCell<crate::device::Api>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
             id: instance.0,
@@ -601,7 +577,7 @@ impl Plane {
         let value = ring.front();
         let mut bytes = vec![0u8; eta_exec::wire_cell_bytes(value.dtype(), value.len())];
         eta_exec::encode_wire(&value, &mut bytes);
-        Ok(InputCell {
+        Ok(InputCell::Host {
             bytes,
             dtype: eta_exec::concrete_dtype(seat.plan.package.channels[dense].dtype),
         })
@@ -1058,33 +1034,6 @@ impl Plane {
     }
 }
 
-fn numel_of(shape: &[u32]) -> usize {
-    shape.iter().map(|&d| d as usize).product::<usize>().max(1)
-}
-
-fn decode(bytes: &[u8], dtype: eta_ir::container::ChanDType, shape: &[u32]) -> Option<Value> {
-    use eta_ir::types::Dtype;
-    let dtype = eta_exec::concrete_dtype(dtype);
-    let numel = numel_of(shape);
-    if bytes.len() != eta_exec::wire_cell_bytes(dtype, numel) {
-        return None;
-    }
-    let words = || {
-        bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| [c[0], c[1], c[2], c[3]])
-    };
-    Some(match dtype {
-        Dtype::Bool => Value::Bool((0..numel).map(|j| (bytes[j / 8] >> (j % 8)) & 1).collect()),
-        Dtype::I32 => Value::I32(words().map(i32::from_le_bytes).collect()),
-        Dtype::U32 => Value::U32(words().map(u32::from_le_bytes).collect()),
-        Dtype::F32 => Value::F32(words().map(f32::from_le_bytes).collect()),
-        _ => return None,
-    })
-}
-
 fn runs_of(row: &[u8]) -> Vec<u32> {
     let mut runs = Vec::new();
     let mut current = false;
@@ -1107,4 +1056,73 @@ fn runs_of(row: &[u8]) -> Vec<u32> {
         runs.push(count);
     }
     runs
+}
+
+impl engine_gpu::program::Programs<crate::device::Api> for Plane {
+    fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
+        Plane::register(self, registration)
+    }
+
+    fn package(&self, program: ProgramId) -> Option<&eta_compiler::codegen::launch::LaunchPackage> {
+        Plane::package(self, program)
+    }
+
+    fn register_channel(
+        &mut self,
+        registration: &ChannelRegistration,
+    ) -> Result<RegisteredChannel, Refusal> {
+        Plane::register_channel(self, registration)
+    }
+
+    fn close_channel(&mut self, id: ChannelId) -> Result<(), Refusal> {
+        Plane::close_channel(self, id)
+    }
+
+    fn bind(
+        &mut self,
+        binding: &InstanceBinding,
+        device: Option<&crate::device::Context>,
+    ) -> Result<BoundInstance, Refusal> {
+        #[cfg(not(feature = "wgpu"))]
+        let _ = device;
+        Plane::bind(
+            self,
+            binding,
+            #[cfg(feature = "wgpu")]
+            device,
+        )
+    }
+
+    fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {
+        Plane::close_instance(self, id)
+    }
+
+    fn input_cell(
+        &self,
+        instance: InstanceId,
+        id: ChannelId,
+    ) -> Result<InputCell<crate::device::Api>, Refusal> {
+        Plane::input_cell(self, instance, id)
+    }
+
+    fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
+        Plane::envelope_fold(self, instance)
+    }
+
+    fn publish(
+        &mut self,
+        instance: InstanceId,
+        channel: u32,
+        cell: &[u8],
+    ) -> Result<bool, Refusal> {
+        Plane::publish(self, instance, channel, cell)
+    }
+
+    fn take(&mut self, instance: InstanceId, channel: u32) -> Result<Option<Vec<u8>>, Refusal> {
+        Plane::take(self, instance, channel)
+    }
+
+    fn reads(&self, instance: InstanceId) -> Vec<(String, u32)> {
+        Plane::reads(self, instance)
+    }
 }

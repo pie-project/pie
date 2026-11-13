@@ -47,9 +47,26 @@ pub(super) struct Proc {
     pub(super) first: (u32, crate::store::rs::RsUnits),
     /// Its holds past its exit; see [`Departure`].
     pub(super) departure: Weak<Departure>,
+    /// Admitted against the state pool: it counts for the fixed sets a
+    /// running working set takes until it leaves.
+    pub(super) charged: bool,
+    /// Its fires on their way through the engine ([`super::FireInFlight`]).
+    pub(super) fires: u32,
+    /// When it last began or settled a fire.
+    pub(super) fired_at: crate::rt::Instant,
+    /// Its fires stood unsettled past `FIRE_PROGRESS`, and the planner was
+    /// told.
+    pub(super) fire_lapsed: bool,
 }
 
 impl Proc {
+    /// A fire of its own is on its way through the engine and has been
+    /// begun or settled lately: it is making progress, whatever of it is
+    /// parked (see [`super::in_flight`]).
+    pub(super) fn firing(&self) -> bool {
+        self.fires > 0 && self.fired_at.elapsed() < super::in_flight::FIRE_PROGRESS
+    }
+
     pub(super) fn rank(&self) -> Rank {
         Rank::of(self.key, self.seq).kept(self.kept)
     }
@@ -83,6 +100,10 @@ impl Proc {
             peak: Default::default(),
             first: Default::default(),
             departure: Weak::new(),
+            charged: false,
+            fires: 0,
+            fired_at: crate::rt::Instant::now(),
+            fire_lapsed: false,
         }
     }
 }

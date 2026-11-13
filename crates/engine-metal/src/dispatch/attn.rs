@@ -30,7 +30,7 @@ impl Run<'_> {
             } => attn::score::capture(
                 self.ctx(),
                 self.ragged(*q),
-                self.prefill_plan(*plan),
+                &self.prefill_plan_over(*plan, *cache),
                 self.pool(*cache),
                 *head_dim,
                 *kv_heads,
@@ -996,8 +996,7 @@ impl Run<'_> {
                     self.pool(*pages),
                     *head_dim,
                     *ratio,
-                    state.state_kv,
-                    state.state_score,
+                    state,
                     ape.map(|id| self.tensor(id)),
                     self.tensor(*entries),
                 )
@@ -1025,8 +1024,7 @@ impl Run<'_> {
                     self.tensor(*write_offset),
                     *head_dim,
                     *ratio,
-                    state.state_kv,
-                    state.state_score,
+                    state,
                 )
             }
             Attn::PoolKvAppend {

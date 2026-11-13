@@ -1,4 +1,4 @@
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, ops, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, Weight, ops, trace_hybrid};
 use poem_ir::{Dim, Gather, Operation, TapKind, Trace, Ty};
 
 #[derive(Clone, Copy)]
@@ -23,8 +23,8 @@ const HIDDEN: u64 = 64;
 const VOCAB: u32 = 2304;
 
 impl ForwardHybrid for OneGather {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
 
     fn forward(&self, inputs: Input) {

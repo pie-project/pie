@@ -53,7 +53,7 @@ const char *pie_version(void);
    defaults:
 
      {"device_kv_budget": "1GiB", "max_forward_tokens": 512, "max_forward_requests": 8,
-      "max_state_slots": 64, "max_model_len": 4096, "device_memory_share": 0.9,
+      "max_model_len": 4096, "device_memory_share": 0.9,
       "sandbox_memory_mb": 512, "max_concurrent_processes": null, "engine": true,
       "frame_size": 8, "frame_dispatch_depth": 2, "verbose": false}
 

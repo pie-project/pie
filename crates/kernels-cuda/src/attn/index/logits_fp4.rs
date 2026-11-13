@@ -77,6 +77,8 @@ pub(crate) fn ranked_fp4(
         || per < 4
         || !per.unsigned_abs().is_power_of_two()
         || keys.seq_stride * i64::from(if compact { ratio } else { 1 }) != i64::from(FP4_ROW)
+        // It reads the keys cell by cell, page after page.
+        || !keys.packed()
         || !keys.keys.ptr.is_multiple_of(16)
         || !q.data.ptr.is_multiple_of(16)
     {

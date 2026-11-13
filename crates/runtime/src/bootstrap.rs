@@ -118,6 +118,11 @@ pub struct RuntimeConfig {
 pub struct ModelConfig {
     /// How much congestion the system may show before this gives memory back.
     pub memory_tolerance: crate::governor::Tolerance,
+    /// Whether streamable weights may be evicted under pressure; resolved
+    /// per engine against [`EngineConfig::weights_fit`], and again against
+    /// the pool the weight shapes take: weights it cannot seat stream under
+    /// `auto` and fail the load under `off`.
+    pub weight_streaming: crate::store::weights::WeightStreaming,
     pub name: String,
     pub model_id: String,
     pub kv_page_size: usize,
@@ -128,28 +133,20 @@ pub struct ModelConfig {
 }
 
 pub struct EngineConfig {
+    /// The model's weights fit the device budget at load
+    /// (`LoadFacts::weights_resident`): what `weight_streaming = auto`
+    /// reads.
+    pub weights_fit: bool,
     pub total_pages: usize,
-    /// Bytes a kv page takes where the pool can change size; zero: it cannot.
-    pub resizable_kv_page_bytes: u64,
-    /// The pool starts whole rather than growing on demand.
-    pub pool_whole_at_load: bool,
-    /// What a state slot takes where it gains memory as it is handed out;
-    /// zero: the load holds them whole.
-    pub elastic_state_slot_bytes: u64,
-    pub window_pages: u32,
+    /// The pools as chunks: what the engine states
+    /// ([`::engine::Capabilities::chunks`]).
+    pub chunks: ::engine::chunk::ChunkFacts,
     pub window_tokens: u32,
     pub cpu_pages: usize,
-    pub cpu_window_pages: u32,
     pub disk_pages: u32,
     /// The disk tier is kept for the next run (`disk_kv_persistent`).
     pub disk_kept: Option<KeptDisk>,
-    pub kv_copy: ::engine::caps::KvCopyDomains,
-    pub backend_kind: String,
-    pub rs_cache_required: bool,
     pub rs_cache_slots: usize,
-    /// The engine asks for one frame a lane when its slots seat fewer lanes
-    /// than it batches (`PoolFacts::one_frame_when_short`).
-    pub one_frame_when_short: bool,
     /// The engine asks the planner to serve a decoding lane's pages before a
     /// prompt waiting to be seated (`PoolFacts::seated_first`).
     pub seated_first: bool,
@@ -160,9 +157,6 @@ pub struct EngineConfig {
     /// to the end at once over a life (`PoolFacts::seat_spread`).
     pub seat_spread: bool,
     pub rs_cache_slot_bytes: u64,
-    pub rs_host_slots: usize,
-    pub rs_buffer_pages: u32,
-    pub rs_host_buffer_pages: u32,
     pub draft_block: u32,
     pub draft_mask_token: u32,
     pub draft_proposals_from: u32,
@@ -207,7 +201,6 @@ pub struct TelemetryConfig {
 
 pub struct BootstrapHandle {
     pub port: u16,
-    pub model_idx: usize,
     shutdown: Option<RuntimeShutdown>,
 }
 
@@ -265,6 +258,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
     let ModelConfig {
         memory_tolerance,
+        weight_streaming,
         name,
         model_id,
         kv_page_size,
@@ -275,40 +269,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     } = config.model;
 
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
-    // A running recurrent sequence holds one state slot, so the pool seats
-    // as many as it has slots; what it buffers unfolded is in pages of
-    // their own.
-    let rs_seat_cap = engine_configs
-        .iter()
-        .map(|d| d.rs_cache_slots)
-        .filter(|&slots| slots > 0)
-        .min();
-    // Each posted frame buffers what it leaves unfolded: where every engine asks
-    // and the slots seat fewer lanes than they batch at the configured depth, post
-    // one frame a lane.
-    let lanes = engine_configs
-        .iter()
-        .map(|d| d.limits.max_forward_requests)
-        .min()
-        .unwrap_or(0);
-    let depth = crate::scheduler::configured_dispatch_depth().max(1);
-    if let Some(slots) = rs_seat_cap
-        && depth > 1
-        && slots / depth < lanes
-        && engine_configs
-            .iter()
-            .all(|d| d.rs_cache_slots == 0 || d.one_frame_when_short)
-    {
-        tracing::info!(
-            lanes,
-            state_slots = slots,
-            seated_at_depth = slots / depth,
-            seated_at_one = slots.min(lanes),
-            "admission: the state slots seat fewer lanes than the engine batches; posting one \
-             frame a lane, as the engine's profile asks"
-        );
-        crate::scheduler::set_dispatch_depth(1);
-    }
+    // A model with fixed recurrent state is admitted by its planner, which
+    // charges each process the fixed set its working set holds against the
+    // state pool, beside a copy-on-write set per lane a fire runs
+    // (`ResidencyPlanner::admit`): no cap here.
+    let has_state = engine_configs.iter().any(|d| d.rs_cache_slots > 0);
     let admission_cap = config
         .max_concurrent_processes
         .or_else(|| {
@@ -317,19 +282,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 .map(|d| d.limits.max_forward_requests)
                 .min()
                 .filter(|&r| r > 0)
-        })
-        .map(|cap| match rs_seat_cap {
-            Some(seats) if cap > seats => {
-                tracing::warn!(
-                    requested = cap,
-                    seated = seats,
-                    "admission: more lanes than the state pool seats; capping, because each \
-                     running sequence holds one recurrent-state slot. Raise `[engine] \
-                     max_state_slots` to seat more"
-                );
-                seats
-            }
-            _ => cap,
         })
         .map(|cap| {
             // A seated-first pool of kv pages alone seats no more than five
@@ -344,7 +296,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 .map(|d| 5 * d.total_pages * kv_page_size / d.limits.max_context)
                 .min();
             match seats {
-                Some(seats) if rs_seat_cap.is_none() && cap > seats.max(1) => {
+                Some(seats) if !has_state && cap > seats.max(1) => {
                     tracing::info!(
                         requested = cap,
                         seated = seats,
@@ -433,40 +385,82 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &metadata,
     )?;
 
-    let arena_kv_pages: Vec<usize> = engine_configs.iter().map(|d| d.total_pages).collect();
-    let resizable: Vec<(u64, bool, u64)> = engine_configs
+    let scales: Vec<crate::policy::pressure::Scale> = engine_configs
         .iter()
         .map(|d| {
-            (
-                d.resizable_kv_page_bytes,
-                d.pool_whole_at_load,
-                d.elastic_state_slot_bytes,
+            crate::store::shared::SharedPool::scale_of(&d.chunks).unwrap_or(
+                crate::policy::pressure::Scale {
+                    kv_page_bytes: 0,
+                    state_slot_bytes: d.rs_cache_slot_bytes,
+                },
             )
         })
         .collect();
-    let arena_cpu_pages: Vec<usize> = engine_configs.iter().map(|d| d.cpu_pages).collect();
-    let arena_disk_pages: Vec<u32> = engine_configs.iter().map(|d| d.disk_pages).collect();
+    // Each engine's weight shapes and the chunks they may take.
+    let chunk_facts: Vec<::engine::chunk::ChunkFacts> =
+        engine_configs.iter().map(|d| d.chunks.clone()).collect();
     let arena_disk_kept: Vec<Option<KeptDisk>> =
         engine_configs.iter().map(|d| d.disk_kept.clone()).collect();
-    let arena_state: Vec<crate::store::registry::StatePool> = engine_configs
+    // Each engine's pools as chunks: what it states, else today's pools as
+    // the degenerate mode's pinned shapes.
+    let arena_stores = engine_configs
         .iter()
-        .map(|d| crate::store::registry::StatePool {
-            slots: d.rs_cache_slots as u32,
-            host_slots: d.rs_host_slots as u32,
-            pages: d.rs_buffer_pages,
-            host_pages: d.rs_host_buffer_pages,
-            window_tokens: d.window_tokens,
-            window_pages: d.window_pages,
-            host_window_pages: d.cpu_window_pages,
+        .map(|d| {
+            let mut pools = crate::store::chunks::StorePools::of(&d.chunks)
+                .map_err(|error| anyhow::anyhow!("engine pools: {error}"))?;
+            // A window the engine holds no pages for is still a window.
+            if pools.window_tokens == 0 {
+                pools.window_tokens = d.window_tokens;
+            }
+            // An engine that states a shared pool: the stores draw from one
+            // pool built of its facts, a copy-on-write record kept back for
+            // each lane a fire runs.
+            let shared = if pools.shared {
+                anyhow::ensure!(
+                    pools.page_size == 0 || pools.page_size as usize == kv_page_size,
+                    "engine pools: the shared pool's slots hold {} tokens, the kv pages {kv_page_size}",
+                    pools.page_size
+                );
+                let pool = crate::store::shared::SharedPool::new(
+                    &d.chunks,
+                    u32::try_from(d.limits.max_context).unwrap_or(u32::MAX),
+                )
+                .map_err(|error| anyhow::anyhow!("engine pools: {error}"))?;
+                Some(std::sync::Arc::new(std::sync::Mutex::new(pool)))
+            } else {
+                None
+            };
+            // Below a shared pool: the host chunks and the kv list's disk
+            // slots the engine states (CONTRACT-BC 22).
+            let tiers = if pools.shared {
+                crate::store::shared::Tiers::of(&d.chunks)
+                    .map_err(|error| anyhow::anyhow!("engine tiers: {error}"))?
+            } else {
+                crate::store::shared::Tiers::default()
+            };
+            Ok(crate::store::registry::EngineStores {
+                pools,
+                max_context: d.limits.max_context,
+                shared,
+                tiers,
+            })
         })
-        .collect();
-    let arena_max_context: Vec<usize> = engine_configs
+        .collect::<Result<Vec<_>>>()?;
+    // A shared pool's tiers are its host chunks and disk slots; today's
+    // pools state theirs in pages.
+    let kv_swap_capable = engine_configs.first().is_some_and(|d| {
+        if crate::store::shared::SharedPool::states_shared(&d.chunks) {
+            d.chunks.host_chunks > 0 || d.chunks.disk_chunks > 0
+        } else {
+            d.cpu_pages > 0 || d.disk_pages > 0
+        }
+    });
+    // The lanes one fire runs on each engine: the copy-on-write sets its
+    // state pool keeps back from admission.
+    let fire_lanes: Vec<u32> = engine_configs
         .iter()
-        .map(|d| d.limits.max_context)
+        .map(|d| d.limits.max_forward_requests as u32)
         .collect();
-    let kv_swap_capable = engine_configs
-        .first()
-        .is_some_and(|d| d.cpu_pages > 0 || d.disk_pages > 0);
     let seated_first = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seated_first);
     let seat_to_end = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seat_to_end);
     let seat_spread = seat_to_end && engine_configs.iter().all(|d| d.seat_spread);
@@ -490,27 +484,44 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let engines: Vec<usize> = engine_configs
         .into_iter()
         .map(|d| {
-            engine::register_engine_backend(
+            // Weights the engine states as shapes start off the device (the
+            // engine reads them from host until the starting residency), so
+            // its `weights_fit` says nothing of them: `auto` holds them
+            // unless the pool cannot seat them all, which
+            // `store::weights::boot_cache` decides.
+            let streams = match weight_streaming {
+                crate::store::weights::WeightStreaming::Auto if !d.chunks.weights.is_empty() => {
+                    false
+                }
+                mode => mode.streams(d.weights_fit),
+            };
+            let id = engine::register_engine_backend(
                 engine::EngineSpec {
                     device_domain: ::engine::MemoryDomain::HostPinned,
-                    num_kv_pages: d.total_pages,
                     limits: d.limits,
                     device_geometry_port_mask: d.device_geometry_port_mask,
                 },
                 d.engine_backend,
-            )
+            );
+            crate::store::weights::set_streaming(id, streams);
+            tracing::info!(
+                engine = id,
+                mode = ?weight_streaming,
+                weights_fit = d.weights_fit,
+                streams,
+                "weight streaming"
+            );
+            id
         })
         .collect();
 
     let _ = engine_count;
-    let arena_model_idx = crate::store::registry::register_model_with_swap(
-        kv_page_size as u32,
-        &arena_kv_pages,
-        &arena_cpu_pages,
-        &arena_disk_pages,
-        &arena_state,
-        &arena_max_context,
-    );
+    let arena_model_idx =
+        crate::store::registry::register_model_with_chunks(kv_page_size as u32, &arena_stores);
+    // The worker policy reads tier bytes off the stores' slot pools.
+    crate::policy::pressure::install_meter(Some(std::sync::Arc::new(
+        crate::store::chunks::SlotMeter,
+    )));
     for (d, kept) in arena_disk_kept.iter().enumerate() {
         let Some(kept) = kept else { continue };
         let stores = crate::store::registry::get(arena_model_idx, d);
@@ -524,35 +535,57 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
     // A planner for each engine: each holds its own kv pages, and a process
     // runs on one of them.
-    let mut extents = Vec::new();
+    let mut shared_grows: Vec<crate::store::shared::SharedGrow> = Vec::new();
+    let mut governed = Vec::new();
     for engine in 0..engines.len().max(1) {
+        // What the worker policy reads tier bytes at; a page of unknown size
+        // leaves them unread.
+        crate::policy::pressure::scale(engine, scales.get(engine).copied().unwrap_or_default());
         let mut pool = crate::planner::RegistryPool::new(arena_model_idx, engine, kv_swap_capable);
-        if let Some(&(page_bytes, whole, slot_bytes)) =
-            resizable.get(engine).filter(|(bytes, ..)| *bytes > 0)
-        {
-            let extent = crate::store::extent::Extent::new(
+        let shared = arena_stores
+            .get(engine)
+            .and_then(|stores| stores.shared.clone());
+        let steered = match &shared {
+            Some(shared) => {
+                let grow =
+                    crate::store::shared::SharedGrow::new(arena_model_idx, engine, shared.clone());
+                shared_grows.push(grow.clone());
+                pool = pool.with_shared_grow(grow.clone());
+                shared_steered_pool(
+                    arena_model_idx,
+                    engine,
+                    weight_streaming,
+                    chunk_facts.get(engine),
+                    grow,
+                )?
+            }
+            None => steered_pool(
                 arena_model_idx,
                 engine,
-                page_bytes,
-                whole,
-                slot_bytes,
-            );
-            extents.push(extent.clone());
-            pool = pool.with_extent(extent);
-        }
+                weight_streaming,
+                chunk_facts.get(engine),
+            )?,
+        };
         crate::planner::init_planner(
             arena_model_idx,
             engine,
             crate::planner::ResidencyPlanner::new(std::sync::Arc::new(pool))
                 .seated_first(seated_first)
+                .cow_lanes(fire_lanes.get(engine).copied().unwrap_or(1))
                 .seat_to_end(seat_to_end)
-                .seat_spread(seat_spread),
+                .seat_spread(seat_spread)
+                .weight_shed(steered.shed_hook()),
         );
+        governed.push(steered);
     }
     // After the gates and the planner it orders exist.
     #[cfg(not(target_arch = "wasm32"))]
     if let Some((name, component)) = &config.policy {
         crate::policy::start(name, component).with_context(|| format!("worker policy {name}"))?;
+    } else {
+        // No policy: the thread still keeps its record, and the default
+        // responder answers tier pressure.
+        crate::policy::start_default().context("the default worker policy thread")?;
     }
     if let Some(period) = std::env::var("PIE_CONTENTION_TRACE_MS")
         .ok()
@@ -577,7 +610,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                      hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} rshort={} \
                      lock_n={} lock_wait_ms={} lock_hold_ms={} lock_wmax_us={} lock_hmax_us={} \
                      d2h_pages={} h2d_pages={} d2h_rs={} h2d_rs={} d2h_ms={} h2d_ms={} \
-                     disk_free={}/{} disk_w_pages={} disk_r_pages={} disk_w_ms={} disk_r_ms={} \
+                     disk_free={}/{} disk_w_pages={} host_disk_pages={} disk_r_pages={} disk_w_ms={} disk_r_ms={} \
                      resident={} evicting={} evicted={} restoring={} admitted={} \
                      runners=[{}]",
                     d.queue.len(),
@@ -624,6 +657,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.disk_slots_free,
                     d.disk_slots_total,
                     d.disk_write_pages_total,
+                    d.host_disk_pages_total,
                     d.disk_read_pages_total,
                     d.disk_write_us_total / 1000,
                     d.disk_read_us_total / 1000,
@@ -651,19 +685,85 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     crate::scheduler::set_frame_size(scheduler.frame_size as usize);
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
     let scheduler_shutdown = crate::scheduler::spawn(&engines, kv_page_size as u32).await?;
-    for extent in &extents {
-        extent.start();
-        crate::governor::run::start(extent.clone(), memory_tolerance);
+    // Each engine takes the weight residency it starts with before the load
+    // returns, so before any fire is submitted: none reads from the host a
+    // row the cache holds. An engine that streams and refuses it fails the
+    // load: its fires would read every row from the host.
+    for (engine, steered) in governed.iter().enumerate() {
+        if let Err(error) = steered.boot().await {
+            scheduler_shutdown.shutdown().await.ok();
+            return Err(error.context(format!(
+                "engine {engine} refused the weight residency it starts with"
+            )));
+        }
+    }
+    for grow in &shared_grows {
+        grow.start();
+    }
+    for steered in governed {
+        crate::governor::run::start(steered, memory_tolerance);
     }
     active_guard.disarm();
     Ok(BootstrapHandle {
         port: bound_port,
-        model_idx: arena_model_idx,
         shutdown: Some(RuntimeShutdown {
             scheduler: scheduler_shutdown,
             engine_ids: engines,
         }),
     })
+}
+
+/// Engine `engine`'s governor target where its pools are pinned (they never
+/// change size), with its weight cache in front ([`boot_cache`]: weights
+/// the pool cannot seat stream under `auto` and fail an `off` load).
+///
+/// [`boot_cache`]: crate::store::weights::boot_cache
+fn steered_pool(
+    model: usize,
+    engine: usize,
+    mode: crate::store::weights::WeightStreaming,
+    facts: Option<&::engine::chunk::ChunkFacts>,
+) -> Result<crate::governor::steered::Shared<crate::governor::steered::Steered>> {
+    use crate::store::weights::{WeightFirst, boot_cache, port::EnginePort, slot_pool};
+    let none = ::engine::chunk::ChunkFacts::default();
+    let facts = facts.unwrap_or(&none);
+    let mut slots = slot_pool(facts);
+    let cache = boot_cache(engine, mode, &facts.weights, 0, &mut slots)?;
+    let quiet = cache.shapes() == 0;
+    let pool = crate::governor::steered::EnginePool::new(model, engine, slots);
+    Ok(crate::governor::steered::Shared::new(WeightFirst::new(
+        pool,
+        cache,
+        EnginePort::new(engine, quiet),
+    )))
+}
+
+/// Engine `engine`'s governor target where its stores draw from a shared
+/// pool: `grow` moves the pool's segments, and the weight shapes take their
+/// slots from the same pool, after the state shapes.
+fn shared_steered_pool(
+    model: usize,
+    engine: usize,
+    mode: crate::store::weights::WeightStreaming,
+    facts: Option<&::engine::chunk::ChunkFacts>,
+    grow: crate::store::shared::SharedGrow,
+) -> Result<crate::governor::steered::Shared<crate::governor::steered::Steered>> {
+    use crate::store::weights::{WeightFirst, boot_cache, port::EnginePort};
+    let none = ::engine::chunk::ChunkFacts::default();
+    let facts = facts.unwrap_or(&none);
+    let cache = {
+        let mut shared = grow.shared().lock().unwrap();
+        let first = shared.weights_first();
+        boot_cache(engine, mode, &facts.weights, first, shared.pool_mut())?
+    };
+    grow.hold_mapped();
+    let quiet = cache.shapes() == 0;
+    let pool = crate::governor::steered::EnginePool::shared(model, engine, grow);
+    Ok(crate::governor::steered::Shared::new(WeightFirst::new(
+        pool,
+        cache,
+        EnginePort::new(engine, quiet),
+    )))
 }
 
 fn verify_config(config: &Config) -> Result<()> {

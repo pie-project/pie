@@ -50,22 +50,22 @@ impl Serving {
         self.artifact.plane(name).ok()
     }
 
+    /// Whether the file holds each of `params` as the trace reads it: a
+    /// plane of exactly `bytes[param]` bytes, which a pool slot can be
+    /// filled from where it lies.
     #[must_use]
-    pub fn name(&self, id: u32) -> Option<&str> {
-        self.names.get(id as usize).map(String::as_str)
+    pub fn holds(&self, params: &[usize], bytes: &[u64]) -> bool {
+        params.iter().all(|&param| {
+            u32::try_from(param)
+                .ok()
+                .and_then(|id| self.plane(id))
+                .is_some_and(|plane| Some(&(plane.len() as u64)) == bytes.get(param))
+        })
     }
 
     #[must_use]
-    pub fn plane_reserved(&self, id: u32, reserved: u64) -> Option<&[u8]> {
-        let name = self.names.get(id as usize)?;
-        let located = self.artifact.locate(name).ok()?;
-        let start = located.at + located.plane.offset;
-        if located.plane.len > reserved || start.checked_add(reserved)? > self.artifact.mapped_len()
-        {
-            return None;
-        }
-        let blob = self.artifact.object(&located.object).ok()?;
-        blob.get(located.plane.range())
+    pub fn name(&self, id: u32) -> Option<&str> {
+        self.names.get(id as usize).map(String::as_str)
     }
 
     pub fn verify_planes(&self, params: &[u32]) -> Result<(), String> {
@@ -420,7 +420,6 @@ mod tests {
     #[test]
     fn checkpoint_serving_every_case() {
         a_plane_is_found_by_its_name_and_not_by_where_it_sits();
-        a_reservation_wider_than_the_plane_is_answered_inside_the_mapping();
         the_fill_rebuilds_the_image_from_one_object_and_sees_a_changed_byte();
         an_ordinary_checkpoint_is_not_a_serving_artifact();
     }
@@ -449,34 +448,6 @@ mod tests {
         assert_eq!(serving.plane(1), Some(&planes[1].1[..]));
         assert_eq!(serving.plane(2), Some(&planes[0].1[..]));
         assert_eq!(serving.plane(3), None);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    fn a_reservation_wider_than_the_plane_is_answered_inside_the_mapping() {
-        let dir = tmp("reserved");
-        let path = dir.join("m.zt");
-        let planes = vec![("short", vec![5u8; 100]), ("long", vec![6u8; 4096])];
-        emit::write(
-            &path,
-            &Stamp::of("cuda", "qwen_3"),
-            &BTreeMap::new(),
-            4096,
-            &leaves(&planes),
-            |o, p, _| panic!("{o}/{p} is not streamed"),
-        )
-        .unwrap();
-        let serving = Serving::open(&path, &trace(&["short", "long"])).expect("it opens");
-        assert_eq!(serving.plane_reserved(0, 256), Some(&planes[0].1[..]));
-        assert_eq!(
-            serving.plane_reserved(0, 64),
-            None,
-            "a plane longer than its seat"
-        );
-        assert_eq!(
-            serving.plane_reserved(1, 1 << 40),
-            None,
-            "a reservation past the file"
-        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

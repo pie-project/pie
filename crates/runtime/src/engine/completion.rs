@@ -284,10 +284,7 @@ struct PendingSubmissionCompletion {
 #[derive(Clone)]
 enum SubmissionCompletionKind {
     ReadyOk,
-    ReadyErr(String),
     Pending(Arc<PendingSubmissionCompletion>),
-
-    All(Arc<Vec<SubmissionCompletion>>),
 }
 
 #[derive(Clone)]
@@ -311,28 +308,10 @@ impl SubmissionCompletion {
         }
     }
 
-    pub fn failed(message: impl Into<String>) -> Self {
-        Self {
-            kind: SubmissionCompletionKind::ReadyErr(message.into()),
-        }
-    }
-
-    pub fn all(parts: Vec<SubmissionCompletion>) -> Self {
-        match parts.len() {
-            0 => Self::ready(),
-            1 => parts.into_iter().next().expect("one part"),
-            _ => Self {
-                kind: SubmissionCompletionKind::All(Arc::new(parts)),
-            },
-        }
-    }
-
     pub fn wait_id(&self) -> u64 {
         match &self.kind {
             SubmissionCompletionKind::Pending(pending) => pending.state.slot,
-            SubmissionCompletionKind::ReadyOk
-            | SubmissionCompletionKind::ReadyErr(_)
-            | SubmissionCompletionKind::All(_) => {
+            SubmissionCompletionKind::ReadyOk => {
                 panic!("only pending submission completions expose a wait id")
             }
         }
@@ -341,9 +320,7 @@ impl SubmissionCompletion {
     pub fn target_epoch(&self) -> u64 {
         match &self.kind {
             SubmissionCompletionKind::Pending(pending) => pending.state.target_epoch,
-            SubmissionCompletionKind::ReadyOk
-            | SubmissionCompletionKind::ReadyErr(_)
-            | SubmissionCompletionKind::All(_) => {
+            SubmissionCompletionKind::ReadyOk => {
                 panic!("only pending submission completions expose a target epoch")
             }
         }
@@ -352,9 +329,7 @@ impl SubmissionCompletion {
     pub fn terminal_cell_ptr(&self) -> Option<CellPtr> {
         match &self.kind {
             SubmissionCompletionKind::Pending(pending) => pending.state.terminal_cell_ptr(),
-            SubmissionCompletionKind::ReadyOk
-            | SubmissionCompletionKind::ReadyErr(_)
-            | SubmissionCompletionKind::All(_) => None,
+            SubmissionCompletionKind::ReadyOk => None,
         }
     }
 
@@ -363,13 +338,7 @@ impl SubmissionCompletion {
             SubmissionCompletionKind::Pending(pending) => {
                 pending.state.close(pending.broker.table, message);
             }
-            SubmissionCompletionKind::All(parts) => {
-                let message = message.into();
-                for part in parts.iter() {
-                    part.close(message.clone());
-                }
-            }
-            SubmissionCompletionKind::ReadyOk | SubmissionCompletionKind::ReadyErr(_) => {}
+            SubmissionCompletionKind::ReadyOk => {}
         }
     }
 
@@ -380,18 +349,6 @@ impl SubmissionCompletion {
     pub fn check(&self) -> Option<Result<()>> {
         match &self.kind {
             SubmissionCompletionKind::ReadyOk => Some(Ok(())),
-            SubmissionCompletionKind::ReadyErr(message) => Some(Err(anyhow!(message.clone()))),
-            SubmissionCompletionKind::All(parts) => {
-                let mut first_error = None;
-                for part in parts.iter() {
-                    match part.check() {
-                        None => return None,
-                        Some(Err(error)) if first_error.is_none() => first_error = Some(error),
-                        Some(_) => {}
-                    }
-                }
-                Some(first_error.map_or(Ok(()), Err))
-            }
             SubmissionCompletionKind::Pending(pending) => {
                 if pending.state.closed.load(Ordering::Acquire) {
                     return Some(pending.state.close_error());
@@ -434,7 +391,11 @@ fn poll_wait_slot<T>(
     }
     match check() {
         Some(result) => {
-            table.deregister(slot);
+            // The slot keeps one entry a task: another future of this task
+            // may wait on the same completion, so the task polls again.
+            if table.deregister_waker(slot, cx.waker()) {
+                cx.waker().wake_by_ref();
+            }
             Poll::Ready(result)
         }
         None => Poll::Pending,
@@ -448,28 +409,6 @@ impl std::future::Future for SubmissionCompletion {
         let this = self.get_mut();
         match &this.kind {
             SubmissionCompletionKind::ReadyOk => Poll::Ready(Ok(())),
-            SubmissionCompletionKind::ReadyErr(message) => {
-                Poll::Ready(Err(anyhow!(message.clone())))
-            }
-            SubmissionCompletionKind::All(parts) => {
-                let mut first_error = None;
-                let mut pending = false;
-                for part in parts.iter() {
-                    let mut part = part.clone();
-                    match std::pin::Pin::new(&mut part).poll(cx) {
-                        Poll::Pending => pending = true,
-                        Poll::Ready(Err(error)) if first_error.is_none() => {
-                            first_error = Some(error);
-                        }
-                        Poll::Ready(_) => {}
-                    }
-                }
-                if pending {
-                    Poll::Pending
-                } else {
-                    Poll::Ready(first_error.map_or(Ok(()), Err))
-                }
-            }
             SubmissionCompletionKind::Pending(pending) => {
                 let slot = pending.state.slot;
                 let table = pending.broker.table;
@@ -513,6 +452,69 @@ struct WorkItemCompletionState {
     native_retired: AtomicBool,
     message: Mutex<Option<String>>,
     guard: Option<Arc<dyn CompletionLease>>,
+    /// Run once the completion resolves (or, never resolved, as the last
+    /// handle on it goes): see [`WorkItemCompletion::on_settled`].
+    on_settled: Mutex<Vec<SettledHook>>,
+}
+
+type SettledHook = Box<dyn FnOnce() + Send>;
+
+std::thread_local! {
+    /// Hooks gathered by [`settle_batched`] on this thread, run together
+    /// once it ends.
+    static BATCHED: std::cell::RefCell<Option<Vec<SettledHook>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `body`, the hooks of every completion it resolves going off the
+/// caller's stack together once it ends, as one task: a landing resolves a
+/// fire a lane, and a task each (spawned from the lane's own thread) cost
+/// that thread ~150 us a step at 64 lanes.
+pub(crate) fn settle_batched<T>(body: impl FnOnce() -> T) -> T {
+    let outer = BATCHED.with(|batch| batch.borrow().is_some());
+    if outer {
+        return body();
+    }
+    BATCHED.with(|batch| *batch.borrow_mut() = Some(Vec::new()));
+    struct Flush;
+    impl Drop for Flush {
+        fn drop(&mut self) {
+            let hooks = BATCHED.with(|batch| batch.borrow_mut().take().unwrap_or_default());
+            run_settled(hooks);
+        }
+    }
+    let _flush = Flush;
+    body()
+}
+
+/// Runs `hooks` off the caller's stack where a runtime is up: a resolution
+/// may come under a store's lock its hooks take. Within [`settle_batched`]
+/// they wait for its end.
+fn run_settled(mut hooks: Vec<SettledHook>) {
+    if hooks.is_empty() {
+        return;
+    }
+    let deferred = BATCHED.with(|batch| match batch.borrow_mut().as_mut() {
+        Some(batch) => {
+            batch.append(&mut hooks);
+            true
+        }
+        None => false,
+    });
+    if deferred {
+        return;
+    }
+    if crate::rt::has_runtime() {
+        crate::rt::spawn(async move {
+            for hook in hooks {
+                hook();
+            }
+        });
+    } else {
+        for hook in hooks {
+            hook();
+        }
+    }
 }
 
 impl WorkItemCompletionState {
@@ -528,7 +530,13 @@ impl WorkItemCompletionState {
             native_retired: AtomicBool::new(false),
             message: Mutex::new(None),
             guard,
+            on_settled: Mutex::new(Vec::new()),
         }
+    }
+
+    fn settled(&self) {
+        let hooks = std::mem::take(&mut *self.on_settled.lock().unwrap());
+        run_settled(hooks);
     }
 
     fn target_epoch(&self) -> u64 {
@@ -555,6 +563,7 @@ impl WorkItemCompletionState {
 
         let outcome = WakerTable::global().wake(self.slot);
         let _ = outcome;
+        self.settled();
     }
 
     fn resolve_failure(&self, message: impl Into<String>) {
@@ -563,6 +572,7 @@ impl WorkItemCompletionState {
             .store(WORK_ITEM_RESOLUTION_FAILED, Ordering::Release);
 
         let _ = WakerTable::global().wake(self.slot);
+        self.settled();
     }
 
     fn request_cancel(&self) {
@@ -634,6 +644,8 @@ impl Drop for WorkItemCompletionState {
         if self.native_retired.load(Ordering::Acquire) {
             self.terminal.mark_recyclable();
         }
+        // No one holds the work item any more: nothing runs it now.
+        run_settled(std::mem::take(self.on_settled.get_mut().unwrap()));
     }
 }
 
@@ -736,6 +748,20 @@ impl WorkItemCompletion {
         self.state.result().is_some()
     }
 
+    /// Runs `hook` once this resolves: now if it has, else as it does (or,
+    /// never resolved, once the last handle on it goes). Unlike awaiting it,
+    /// this takes no waker and no task: a hook runs where the completion
+    /// resolves, with nothing left to poll.
+    pub fn on_settled(&self, hook: impl FnOnce() + Send + 'static) {
+        let mut hooks = self.state.on_settled.lock().unwrap();
+        if self.state.result().is_none() {
+            hooks.push(Box::new(hook));
+            return;
+        }
+        drop(hooks);
+        hook();
+    }
+
     pub fn same_request(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
     }
@@ -825,23 +851,25 @@ impl Landed {
         } else {
             TERMINAL_OUTCOME_SUCCESS
         };
-        for LandingStep {
-            cells,
-            completions,
-            wakes,
-        } in self.steps
-        {
-            settle(&cells, code);
-            // Each fire resolves as its step lands, so what waits on it goes
-            // on a step later rather than once the frame retires.
-            for completion in &completions {
-                completion.resolve_landed("step settle");
+        settle_batched(|| {
+            for LandingStep {
+                cells,
+                completions,
+                wakes,
+            } in self.steps
+            {
+                settle(&cells, code);
+                // Each fire resolves as its step lands, so what waits on it
+                // goes on a step later rather than once the frame retires.
+                for completion in &completions {
+                    completion.resolve_landed("step settle");
+                }
+                for wait_id in &wakes {
+                    let outcome = waker::WakerTable::global().wake(*wait_id);
+                    tracing::debug!(wait_id, ?outcome, "published to a waiter");
+                }
             }
-            for wait_id in &wakes {
-                let outcome = waker::WakerTable::global().wake(*wait_id);
-                tracing::debug!(wait_id, ?outcome, "published to a waiter");
-            }
-        }
+        });
         if let Some((cell, wait_id, epoch)) = self.frame {
             settle(&[cell], code);
             broker.notify(wait_id, epoch);

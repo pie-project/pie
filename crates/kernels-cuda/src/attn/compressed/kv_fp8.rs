@@ -45,6 +45,7 @@ pub fn append(
             pool.row_valid.arg(),
             stated(OP, rows.rows)?.arg(),
             pool.page_size.arg(),
+            crate::attn::kv::page_elems(OP, pool, 0)?.arg(),
             ctx.stage(),
         ],
     )
@@ -81,6 +82,7 @@ pub fn store_entries(
             stated(OP, entries.rows)?.arg(),
             pool.page_size.arg(),
             div.arg(),
+            crate::attn::kv::page_elems(OP, pool, 0)?.arg(),
         ],
     )
 }

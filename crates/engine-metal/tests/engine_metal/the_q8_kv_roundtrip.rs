@@ -121,7 +121,9 @@ fn routes(q8: bool) {
             seq_stride: (kh * d) as u64,
             head_stride: d as u64,
             q8,
-        };
+            page_stride: [0; 2],
+        }
+        .paged_densely();
         let frame = dev.frame().unwrap();
         attn::kv_append(
             &Sink::new(&dev, &frame, &pipes, &handles),

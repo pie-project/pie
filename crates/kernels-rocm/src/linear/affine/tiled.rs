@@ -3,7 +3,6 @@ use dtype::Dtype;
 use crate::error::Error;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::linear::affine::GemmSplit;
-use crate::linear::moe::GroupSeat;
 use crate::tensor::Tensor;
 
 const FILE: &str = "linear/tiled.hip";
@@ -127,20 +126,9 @@ pub fn matmul(
     scales: Tensor,
     biases: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
 ) -> Result<(), Error> {
     let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows);
-    tiled_launch(
-        ctx,
-        "linear.matmul",
-        act,
-        codes,
-        scales,
-        biases,
-        y,
-        seat,
-        tuple,
-    )
+    tiled_launch(ctx, "linear.matmul", act, codes, scales, biases, y, tuple)
 }
 
 pub fn lm_head(
@@ -150,23 +138,11 @@ pub fn lm_head(
     scales: Tensor,
     biases: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
 ) -> Result<(), Error> {
     let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows);
-    tiled_launch(
-        ctx,
-        "linear.matmul",
-        act,
-        codes,
-        scales,
-        biases,
-        y,
-        seat,
-        tuple,
-    )
+    tiled_launch(ctx, "linear.matmul", act, codes, scales, biases, y, tuple)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn matmul_with(
     ctx: &Ctx,
     act: Tensor,
@@ -174,20 +150,9 @@ pub fn matmul_with(
     scales: Tensor,
     biases: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
     tuple: Tuple,
 ) -> Result<(), Error> {
-    tiled_launch(
-        ctx,
-        "linear.matmul",
-        act,
-        codes,
-        scales,
-        biases,
-        y,
-        seat,
-        tuple,
-    )
+    tiled_launch(ctx, "linear.matmul", act, codes, scales, biases, y, tuple)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -199,17 +164,9 @@ fn tiled_launch(
     scales: Tensor,
     biases: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
     tuple: Tuple,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
-    if seat.streams() {
-        return Err(refuse(
-            op,
-            "the tiled arm serves resident dense projections only, and these planes are \
-             seated by a streaming tier",
-        ));
-    }
     debug_assert_eq!(
         act.rows, y.rows,
         "the activation's rows are the rows the result lands"
@@ -339,7 +296,6 @@ pub fn matmul_gemv(
     scales: Tensor,
     biases: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
 ) -> Result<(), Error> {
     gemv_with(
         ctx,
@@ -349,7 +305,6 @@ pub fn matmul_gemv(
         scales,
         biases,
         y,
-        seat,
         carve_for(y.width, y.rows, ctx),
     )
 }
@@ -361,7 +316,6 @@ pub fn lm_head_gemv(
     scales: Tensor,
     biases: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
 ) -> Result<(), Error> {
     gemv_with(
         ctx,
@@ -371,7 +325,6 @@ pub fn lm_head_gemv(
         scales,
         biases,
         y,
-        seat,
         carve_for(y.width, y.rows, ctx),
     )
 }
@@ -385,17 +338,9 @@ pub fn gemv_with(
     scales: Tensor,
     biases: Tensor,
     y: &mut Tensor,
-    seat: GroupSeat,
     carve: Carve,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
-    if seat.streams() {
-        return Err(refuse(
-            op,
-            "the tiled arm serves resident dense projections only, and these planes are \
-             seated by a streaming tier",
-        ));
-    }
     if y.rows > GEMV_ROWS {
         return Err(refuse(
             op,

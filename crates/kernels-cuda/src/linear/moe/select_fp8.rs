@@ -33,6 +33,45 @@ pub const FP8_W8A8_FROM: u32 = 64;
 
 pub const FP8_W8A8_DENSE: core::ops::RangeInclusive<u32> = 33..=256;
 
+/// Under an expert table an expert's atom-laid exponents are a run of their
+/// own only where its rows are whole 128-row atom blocks.
+#[cfg(feature = "cuda")]
+fn tabled_atoms(op: &'static str, table: ExpertTable, rows: u32) -> Result<(), Error> {
+    if table.tabled() && !rows.is_multiple_of(128) {
+        return Err(refuse(
+            op,
+            format!("an expert table needs whole 128-row atom blocks an expert, not {rows} rows"),
+        ));
+    }
+    Ok(())
+}
+
+/// The span a TMA map over a bank's `rows` rows of `row_bytes` takes: the
+/// bank at `bank`, or under a table its window, in whole rows.
+#[cfg(feature = "cuda")]
+pub(super) fn map_window(
+    op: &'static str,
+    table: ExpertTable,
+    bank: u64,
+    rows: u32,
+    row_bytes: u32,
+) -> Result<(u64, u32), Error> {
+    if !table.tabled() {
+        return Ok((bank, rows));
+    }
+    let (base, bytes) = table.window;
+    let rows = u32::try_from(bytes / u64::from(row_bytes.max(1)))
+        .ok()
+        .filter(|&r| r > 0);
+    match rows {
+        Some(rows) if base != 0 => Ok((base, rows)),
+        _ => Err(refuse(
+            op,
+            "a TMA-read bank under an expert table needs the table's window, within 2^32 rows",
+        )),
+    }
+}
+
 /// `x`'s rows as e4m3 in 1x128 blocks (codes, a biased exponent a block) in
 /// stream scratch, for [`select_fp8_w8a8`] and [`matmul_fp8_w8a8`].
 #[cfg(feature = "cuda")]
@@ -100,6 +139,7 @@ pub fn select_fp8_w8a8(
     experts: u32,
     routes: Tensor,
     y: &mut Tensor,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_select_fp8_w8a8";
     let fan = selected(OP, x, routes, y)?;
@@ -110,6 +150,7 @@ pub fn select_fp8_w8a8(
             "the fp8 select takes bf16 rows, K in 512s (128s on Hopper) and N in 128s",
         ));
     }
+    tabled_atoms(OP, table, y.width)?;
     let (xq, xe) = quantize_rows_e4m3b128(ctx, OP, x)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
     let per = fan.route_count.div_ceil(experts);
@@ -122,8 +163,13 @@ pub fn select_fp8_w8a8(
     // (`kernel.moe.fp8a8_ws_from`): 128 routes by 128 weight rows a CTA.
     let ws_from = ctx.tuning().fp8a8_ws_from;
     if hopper_wgmma() && ws_from > 0 && per >= ws_from {
-        // The weight rows by TMA, persistent (`kernel.moe.fp8a8_tma`).
-        if ctx.tuning().fp8a8_tma && y.width.is_multiple_of(256) && !ctx.tuning().fp8a8_ws_narrow {
+        // The weight rows by TMA, persistent (`kernel.moe.fp8a8_tma`), on a
+        // bank the device holds (a streamed table may name host memory).
+        if ctx.tuning().fp8a8_tma
+            && !table.streams()
+            && y.width.is_multiple_of(256)
+            && !ctx.tuning().fp8a8_ws_narrow
+        {
             use crate::linear::gemm_sm100::{Map, encode};
             use cudarc::driver::sys as dr;
             let stages: u32 = 4;
@@ -146,10 +192,13 @@ pub fn select_fp8_w8a8(
                     Share::Take
                 },
             )?;
+            // Under a table the map spans its window, each expert's codes
+            // a whole number of K-byte rows past its base.
+            let (map_base, map_rows) = map_window(OP, table, codes, experts * y.width, x.width)?;
             let map_w = encode(Map {
-                ptr: codes,
+                ptr: map_base,
                 ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                dims: [x.width, experts * y.width, 0],
+                dims: [x.width, map_rows, 0],
                 strides: [u64::from(x.width), 0],
                 boxes: [128, 128, 1],
                 swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
@@ -188,6 +237,8 @@ pub fn select_fp8_w8a8(
                     stated(OP, x.width)?.arg(),
                     stated(OP, experts)?.arg(),
                     ArgValue::Ptr(ticket),
+                    ArgValue::Ptr(table.at()),
+                    ArgValue::Ptr(map_base),
                 ],
             );
         }
@@ -241,6 +292,7 @@ pub fn select_fp8_w8a8(
                 n.arg(),
                 stated(OP, x.width)?.arg(),
                 stated(OP, experts)?.arg(),
+                ArgValue::Ptr(table.at()),
             ],
         );
     }
@@ -288,6 +340,7 @@ pub fn select_fp8_w8a8(
                 n.arg(),
                 stated(OP, x.width)?.arg(),
                 stated(OP, experts)?.arg(),
+                ArgValue::Ptr(table.at()),
             ],
         );
     }
@@ -345,6 +398,7 @@ pub fn select_fp8_w8a8(
                 stated(OP, experts)?.arg(),
                 0f32.arg(),
                 1f32.arg(),
+                ArgValue::Ptr(table.at()),
             ],
         );
     }
@@ -373,6 +427,7 @@ pub fn select_fp8_w8a8(
             stated(OP, x.width)?.arg(),
             stated(OP, experts)?.arg(),
             stated(OP, x.rows)?.arg(),
+            ArgValue::Ptr(table.at()),
         ],
     )
 }
@@ -453,6 +508,7 @@ pub fn select_fp8_w8a8_glu(
     routes: Tensor,
     y: &mut Tensor,
     glu: crate::linear::gemm_sm100::Glu,
+    table: ExpertTable,
 ) -> Result<bool, Error> {
     const OP: &str = "fused.moe_select_fp8_w8a8_glu";
     let fan = selected(OP, x, routes, y)?;
@@ -509,6 +565,7 @@ pub fn select_fp8_w8a8_glu(
             stated(OP, experts)?.arg(),
             limit.arg(),
             alpha.arg(),
+            ArgValue::Ptr(table.at()),
         ],
     )?;
     Ok(true)
@@ -580,6 +637,7 @@ pub fn matmul_fp8_w8a8(
             stated(OP, x.width)?.arg(),
             1i32.arg(),
             stated(OP, x.rows)?.arg(),
+            ArgValue::Ptr(0),
         ],
     )?;
     if splits == 1 {
@@ -646,6 +704,7 @@ pub fn matmul_fp8_w8a8_wide(
             stated(OP, x.rows)?.arg(),
             0f32.arg(),
             1f32.arg(),
+            ArgValue::Ptr(0),
         ],
     )?;
     Ok(true)
@@ -676,6 +735,7 @@ pub fn select_fp8_w8a16(
     routes: Tensor,
     y: &mut Tensor,
     glu: Option<crate::linear::gemm_sm100::Glu>,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     const THREADS: u32 = 128;
     let depth = ctx.tuning().fp8_mma_depth;
@@ -694,6 +754,7 @@ pub fn select_fp8_w8a16(
     }
     let (code, limit, alpha) = glu_code(op, glu)?;
     let bank_rows = if glu.is_some() { 2 * y.width } else { y.width };
+    tabled_atoms(op, table, bank_rows)?;
     let experts = experts.clamp(1, EXPERT_CAP);
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
@@ -759,6 +820,7 @@ pub fn select_fp8_w8a16(
             inter.arg(),
             limit.arg(),
             alpha.arg(),
+            ArgValue::Ptr(table.at()),
         ],
     )
 }

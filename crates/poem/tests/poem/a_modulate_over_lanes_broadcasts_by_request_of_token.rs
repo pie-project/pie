@@ -1,5 +1,5 @@
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Weight, ops, trace_hybrid,
+    Dtype, ForwardHybrid, Input, ModulateForm, Platform, StateRows, Weight, ops, trace_hybrid,
 };
 use poem_ir::{Def, Dim, Elemwise, GeomKind, Operation, RuntimeInput, Ty};
 
@@ -15,8 +15,8 @@ enum By {
 struct AdaLn(By);
 
 impl ForwardHybrid for AdaLn {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         let x = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);
@@ -72,7 +72,7 @@ fn a_lane_vector_is_embedded_per_lane_and_broadcast_per_row() {
     let trace = trace_hybrid("adaln", &AdaLn(By::Lane), Platform::Cuda);
     assert!(
         trace.caches.is_empty(),
-        "no kv space, and the lane map was still readable"
+        "no kv row, and the lane map was still readable"
     );
 
     let sinusoid = trace
@@ -118,10 +118,9 @@ fn a_lane_vector_is_embedded_per_lane_and_broadcast_per_row() {
     assert_eq!(
         trace.values[lanes.0 as usize].def,
         Def::Input(RuntimeInput::Geometry {
-            space: 0,
             kind: GeomKind::RequestOfToken
         }),
-        "the broadcast is the fire's token→lane table in the token space"
+        "the broadcast is the fire's token→lane table on the All axis"
     );
     assert_eq!(
         ty(&trace, lanes),
@@ -203,8 +202,8 @@ fn a_per_token_vector_names_no_lane_map() {
 struct WrongWidth;
 
 impl ForwardHybrid for WrongWidth {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         let x = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);

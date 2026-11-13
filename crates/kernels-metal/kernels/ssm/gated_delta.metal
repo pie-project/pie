@@ -1,6 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "../prim/state_map.h"
+
 #ifndef PIE_RS_SNAPSHOTS
 #define PIE_RS_SNAPSHOTS 4
 #endif
@@ -17,6 +19,7 @@ template <typename T, int WIDTH, int KMAX>
     const constant int& k_dim   [[buffer(7)]],
     const constant int& v_dim   [[buffer(8)]],
     const constant int& splits  [[buffer(9)]],
+    const device ulong* map     [[buffer(10)]],
     uint3 gpos [[threadgroup_position_in_grid]],
     uint3 lpos [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -72,8 +75,8 @@ template <typename T, int WIDTH, int KMAX>
   const float beta = gates[fused + size_t(v_heads)];
 
   device float* state =
-      rstate + (size_t(slots[n]) * size_t(v_heads) + size_t(hv)) *
-                   size_t(dv) * size_t(dk);
+      rstate + pie_state_atom(map, slots + size_t(n) * pie_state_pieces(map), uint(hv),
+                              ulong(dv) * ulong(dk));
   const size_t out = (size_t(n) * size_t(v_heads) + size_t(hv)) * size_t(dv);
 
   const int per_part = dv / splits;
@@ -125,6 +128,7 @@ template <typename T, int WIDTH, int KMAX>
     const constant int& v_dim   [[buffer(9)]],
     const device int* snaps     [[buffer(10)]],
     const constant int& snap_lane0 [[buffer(11)]],
+    const device ulong* map     [[buffer(12)]],
     uint3 pos [[thread_position_in_grid]],
     uint3 lpos [[thread_position_in_threadgroup]]) {
   threadgroup float sq[KMAX];
@@ -147,12 +151,15 @@ template <typename T, int WIDTH, int KMAX>
   const size_t keys = size_t(k_heads) * size_t(dk);
   const size_t pitch = 2 * keys + size_t(v_heads) * size_t(dv);
   const float scale = 1.0f / metal::sqrt(float(dk));
+  const uint pieces = pie_state_pieces(map);
+  const ulong head = ulong(dv) * ulong(dk);
   device float* state =
-      rstate + (size_t(slots[begin]) * size_t(v_heads) + size_t(hv)) *
-                   size_t(dv) * size_t(dk);
+      rstate + pie_state_atom(map, slots + size_t(begin) * pieces, uint(hv), head);
   // The rows whose state lands in a slot of its own, ascending; 0 ends them.
   const device int* snap =
-      snap_lane0 >= 0 ? snaps + size_t(snap_lane0 + r) * 2 * PIE_RS_SNAPSHOTS : nullptr;
+      snap_lane0 >= 0
+          ? snaps + size_t(snap_lane0 + r) * pie_state_snap_row(map) * PIE_RS_SNAPSHOTS
+          : nullptr;
   int snapped = 0;
   int snap_at = snap != nullptr ? begin + snap[0] : -1;
 
@@ -210,8 +217,8 @@ template <typename T, int WIDTH, int KMAX>
     }
     if (t + 1 == snap_at) {
       device float* landed =
-          rstate + (size_t(snap[PIE_RS_SNAPSHOTS + snapped]) * size_t(v_heads) + size_t(hv)) *
-                       size_t(dv) * size_t(dk);
+          rstate + pie_state_atom(map, snap + PIE_RS_SNAPSHOTS + snapped * pieces, uint(hv),
+                                  head);
       for (int c = tid; c < dv; c += WIDTH) {
         for (int i = 0; i < dk; ++i) {
           landed[size_t(c) * size_t(dk) + size_t(i)] = state[size_t(c) * size_t(dk) + size_t(i)];
@@ -231,7 +238,8 @@ template <typename T, int WIDTH, int KMAX>
       const device itype*, const device float*, device float*,           \
       const device uint*, device float*,                                 \
       const constant int&, const constant int&, const constant int&,     \
-      const constant int&, const constant int&, uint3, uint3, uint, uint);
+      const constant int&, const constant int&, const device ulong*,     \
+      uint3, uint3, uint, uint);
 
 #define instantiate_gated_delta_chunked(name, itype, width, kmax)        \
   template [[host_name("gated_delta_chunked_" #name)]]                   \
@@ -240,7 +248,7 @@ template <typename T, int WIDTH, int KMAX>
       device float*, const device uint*, device float*,                  \
       const constant int&, const constant int&, const constant int&,     \
       const constant int&, const device int*, const constant int&,       \
-      uint3, uint3);
+      const device ulong*, uint3, uint3);
 
 instantiate_gated_delta(bfloat16, bfloat, 128, 256)
 
@@ -265,6 +273,7 @@ template <typename T, int WIDTH, int KMAX>
     const constant int& splits  [[buffer(14)]],
     const device int* snaps     [[buffer(15)]],
     const constant int& snap_lane0 [[buffer(16)]],
+    const device ulong* map     [[buffer(17)]],
     uint3 gpos [[threadgroup_position_in_grid]],
     uint3 lpos [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -289,8 +298,9 @@ template <typename T, int WIDTH, int KMAX>
   if (span <= 0) {
     return;
   }
-  const int slot = slots[lane0 + r];
-  if (slot < 0) {
+  const uint pieces = pie_state_pieces(map);
+  const device int* ids = slots + size_t(lane0 + r) * pieces;
+  if (ids[0] < 0) {
     return;
   }
   int keep = commit[lane0 + r];
@@ -306,13 +316,14 @@ template <typename T, int WIDTH, int KMAX>
   const size_t pitch = 2 * keys + size_t(v_heads) * size_t(dv);
   const float scale = 1.0f / metal::sqrt(float(dk));
   const size_t head = size_t(dv) * size_t(dk);
-  device float* bank =
-      rstate + (size_t(slot) * size_t(v_heads) + size_t(hv)) * head;
+  device float* bank = rstate + pie_state_atom(map, ids, uint(hv), ulong(head));
   device float* carry =
       work + (size_t(lane0 + r) * size_t(v_heads) + size_t(hv)) * head;
   // A lane that snapshots folds its own rows, none replayed.
   const device int* snap =
-      snap_lane0 >= 0 ? snaps + size_t(snap_lane0 + r) * 2 * PIE_RS_SNAPSHOTS : nullptr;
+      snap_lane0 >= 0
+          ? snaps + size_t(snap_lane0 + r) * pie_state_snap_row(map) * PIE_RS_SNAPSHOTS
+          : nullptr;
 
   const int per_part = dv / splits;
   const int c0 = part * per_part;
@@ -390,7 +401,8 @@ template <typename T, int WIDTH, int KMAX>
             continue;
           }
           device float* landed =
-              rstate + (size_t(snap[PIE_RS_SNAPSHOTS + n]) * size_t(v_heads) + size_t(hv)) * head +
+              rstate + pie_state_atom(map, snap + PIE_RS_SNAPSHOTS + n * int(pieces), uint(hv),
+                                      ulong(head)) +
               size_t(c) * size_t(dk);
           for (int j = 0; j < PER; ++j) {
             const int i = lane + 32 * j;
@@ -431,6 +443,6 @@ template <typename T, int WIDTH, int KMAX>
       const device float*, device float*, device float*, device float*,\
       const constant int&, const constant int&, const constant int&,   \
       const constant int&, const constant int&, const device int*,     \
-      const constant int&, uint3, uint3, uint, uint);
+      const constant int&, const device ulong*, uint3, uint3, uint, uint);
 
 instantiate_gated_delta_committed(bfloat16, bfloat, 128, 256)

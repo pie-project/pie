@@ -1,4 +1,5 @@
 #include "ssm/tile_sm80.cuh"
+#include "prim/state_rows.cuh"
 
 namespace pie::ssm {
 
@@ -44,7 +45,7 @@ template <int BK, int BV>
 __global__ void __launch_bounds__(256) gdn_chunk_prep(
     const bf16* __restrict__ qkv_post,
     const float* __restrict__ gates,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
     const int* __restrict__ commit_len,
     const int* __restrict__ begin_at,
@@ -76,7 +77,7 @@ __global__ void __launch_bounds__(256) gdn_chunk_prep(
     if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
     if (lanes <= 0) return;
     const int r = gdn_slot_lane_snap(s, lanes, qo_indptr, begin_at, snap, win);
-    const GdnLane lane = gdn_lane(r, qo_indptr, slot_ids, commit_len, begin_at, win);
+    const GdnLane lane = gdn_lane(r, qo_indptr, rows, commit_len, begin_at, win);
     if (lane.T <= 0 || lane.slot < 0) return;
     const int j = s - gdn_chunk_base_snap(r, qo_indptr, begin_at, snap, win);
     if (j < 0) return;
@@ -373,10 +374,8 @@ __global__ void __launch_bounds__(256) gdn_chunk_scan(
     const bf16* __restrict__ w,
     const bf16* __restrict__ u,
     const bf16* __restrict__ pm,
-    void* __restrict__ state_base,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     const int* __restrict__ commit_len,
     const int* __restrict__ begin_at,
     bool write_state,
@@ -417,7 +416,7 @@ __global__ void __launch_bounds__(256) gdn_chunk_scan(
     const int r = static_cast<int>(blockIdx.x) / (nvt * V_h);
     if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
     if (r >= lanes) return;
-    const GdnLane lane = gdn_lane(r, qo_indptr, slot_ids, commit_len, begin_at, win);
+    const GdnLane lane = gdn_lane(r, qo_indptr, rows, commit_len, begin_at, win);
     if (lane.T <= 0 || lane.slot < 0) return;
     const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
     const int hk = h / (V_h / K_h);
@@ -437,9 +436,7 @@ __global__ void __launch_bounds__(256) gdn_chunk_scan(
     const int kr0 = (warp & 3) * 32;
     auto h_row = [&](int q, int half) { return kr0 + (q / CT) * 16 + g + 8 * half; };
     auto h_col = [&](int q) { return c0 + (q % CT) * 8 + 2 * t; };
-    State* state = static_cast<State*>(state_base)
-        + static_cast<long long>(lane.slot) * slot_stride_elems
-        + static_cast<long long>(h) * BK * V;
+    State* state = rows.atom<State>(rows.row(lane.rl), h, static_cast<long long>(BK) * V);
 
     float hacc[NT][4];
     #pragma unroll
@@ -666,9 +663,9 @@ __global__ void __launch_bounds__(256) gdn_chunk_scan(
                     hacc[q][2 * half] = f.x;
                     hacc[q][2 * half + 1] = f.y;
                     if (lands) {
-                        State* sat = static_cast<State*>(state_base)
-                            + static_cast<long long>(snap_slots[at_snap]) * slot_stride_elems
-                            + static_cast<long long>(h) * BK * V;
+                        State* sat = rows.atom<State>(
+                            snap_slots + static_cast<long long>(at_snap) * rows.pieces, h,
+                            static_cast<long long>(BK) * V);
                         *reinterpret_cast<unsigned*>(
                             sat + static_cast<long long>(h_row(q, half)) * V + v0 + h_col(q)) = packed;
                     }
@@ -705,7 +702,7 @@ __global__ void __launch_bounds__(256) gdn_chunk_wu(
     const float* __restrict__ v,
     const float* __restrict__ g_log,
     const float* __restrict__ beta,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
     const int* __restrict__ commit_len,
     const int* __restrict__ begin_at,
@@ -733,7 +730,7 @@ __global__ void __launch_bounds__(256) gdn_chunk_wu(
     if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
     if (lanes <= 0) return;
     const int r = gdn_slot_lane(s, lanes, qo_indptr, begin_at, win);
-    const GdnLane lane = gdn_lane(r, qo_indptr, slot_ids, commit_len, begin_at, win);
+    const GdnLane lane = gdn_lane(r, qo_indptr, rows, commit_len, begin_at, win);
     if (lane.T <= 0 || lane.slot < 0) return;
     const int j = s - (lane.t0 / GDN_CH + r);
     if (j < 0 || j * GDN_CH >= lane.T) return;
@@ -880,10 +877,8 @@ __global__ void __launch_bounds__(256) gdn_chunk_h(
     __nv_bfloat16* __restrict__ u,
     __nv_bfloat16* __restrict__ vnT,
     __nv_bfloat16* __restrict__ hcT,
-    StateT* __restrict__ state_base,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
-    long long slot_stride_elems,
     const int* __restrict__ commit_len,
     const int* __restrict__ begin_at,
     bool write_state,
@@ -904,15 +899,13 @@ __global__ void __launch_bounds__(256) gdn_chunk_h(
     const int r = static_cast<int>(blockIdx.x) / ((BV / BVT) * V_h);
     if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
     if (r >= lanes) return;
-    const GdnLane lane = gdn_lane(r, qo_indptr, slot_ids, commit_len, begin_at, win);
+    const GdnLane lane = gdn_lane(r, qo_indptr, rows, commit_len, begin_at, win);
     if (lane.T <= 0 || lane.slot < 0) return;
     const int hk = h / (V_h / K_h);
     const int v0 = vt * BVT;
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
-    StateT* state = state_base
-        + static_cast<long long>(lane.slot) * slot_stride_elems
-        + static_cast<long long>(h) * BK * BV;
+    StateT* state = rows.atom<StateT>(rows.row(lane.rl), h, static_cast<long long>(BK) * BV);
     for (int e = tid; e < BK * BVT; e += blockDim.x) {
         const int kk = e / BVT, vv = e % BVT;
         hf[e] = state_load(state + static_cast<long long>(kk) * BV + v0 + vv);
@@ -997,7 +990,7 @@ __global__ void __launch_bounds__(256) gdn_chunk_o(
     const __nv_bfloat16* __restrict__ kb,
     const __nv_bfloat16* __restrict__ vnT,
     const __nv_bfloat16* __restrict__ hcT,
-    const int* __restrict__ slot_ids,
+    StateRows rows,
     const u32* __restrict__ qo_indptr,
     const int* __restrict__ commit_len,
     const int* __restrict__ begin_at,
@@ -1017,7 +1010,7 @@ __global__ void __launch_bounds__(256) gdn_chunk_o(
     if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
     if (lanes <= 0) return;
     const int r = gdn_slot_lane(s, lanes, qo_indptr, begin_at, win);
-    const GdnLane lane = gdn_lane(r, qo_indptr, slot_ids, commit_len, begin_at, win);
+    const GdnLane lane = gdn_lane(r, qo_indptr, rows, commit_len, begin_at, win);
     if (lane.T <= 0 || lane.slot < 0) return;
     const int j = s - (lane.t0 / GDN_CH + r);
     if (j < 0 || j * GDN_CH >= lane.T) return;

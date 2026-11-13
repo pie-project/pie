@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
 pub const BUBBLE_HIST_UPPER_US: [u64; 16] = [
@@ -22,9 +22,6 @@ pub const BUBBLE_HIST_UPPER_US: [u64; 16] = [
 
 #[derive(Debug, Default)]
 pub struct SchedulerStats {
-    /// Set while the system is short of memory: waves keep to
-    /// [`::engine::frame::NARROW_WAVE`].
-    pub narrow_waves: AtomicBool,
     pub total_batches: AtomicU64,
     pub total_tokens_processed: AtomicU64,
     pub total_requests_processed: AtomicU64,

@@ -172,23 +172,19 @@ impl Drop for BoundWaitLease {
 
 #[derive(Debug)]
 pub struct BoundInstance {
-    pub engine_id: usize,
     pub program_id: ProgramId,
     pub instance_id: InstanceId,
     pub pacing_wait_id: u64,
-    pub geometry_class: GeometryClass,
     wait_slots: Arc<BoundWaitSlots>,
 }
 
 impl BoundInstance {
     #[must_use]
-    pub fn new(engine_id: usize, bound: &engine::BoundInstance, pacing_wait_id: u64) -> Self {
+    pub fn new(bound: &engine::BoundInstance, pacing_wait_id: u64) -> Self {
         Self {
-            engine_id,
             program_id: bound.program,
             instance_id: bound.id,
             pacing_wait_id,
-            geometry_class: bound.geometry,
             wait_slots: Arc::new(BoundWaitSlots::new(pacing_wait_id)),
         }
     }

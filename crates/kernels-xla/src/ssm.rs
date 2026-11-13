@@ -18,6 +18,7 @@
 //! after it.
 
 mod chunk;
+mod conv_step;
 pub mod dyn_conv;
 mod step;
 
@@ -63,6 +64,13 @@ static STEP_KERNEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::n
 pub fn step_kernel(on: Option<bool>) {
     let v = on.map_or(2, u8::from);
     STEP_KERNEL.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The pool conv step kernel. `PIE_XLA_CONV_KERNEL=0` turns it off: a
+/// diagnostic switch only, for the hybrid gates' parity with the base build
+/// (its output differs at the ulp), never a configuration knob.
+fn conv_step_on() -> bool {
+    !std::env::var("PIE_XLA_CONV_KERNEL").is_ok_and(|v| v == "0")
 }
 
 fn step_kernel_on() -> bool {
@@ -455,6 +463,29 @@ fn conv(
     let bias = bias.map(|b| flat_f32(f, b)).transpose()?;
     let slab = conv_state.val;
     let lanes = lanes.lanes(f, op, t)?;
+    // A decode over the chunk pool: one Mosaic kernel takes each lane's
+    // window out of the pool, weighs it and lands it rolled.
+    if is_decode
+        && conv_step_on()
+        && let Some((acc, slab)) = conv_step::conv_step(
+            f,
+            x.val,
+            w,
+            bias,
+            slab,
+            per,
+            hist as i64,
+            i64::from(dil),
+            lanes.slot,
+            lanes.write,
+        )?
+    {
+        let yv = match out {
+            ConvOut::Silu => f.silu(acc)?,
+            ConvOut::Residual => f.add(acc, xv)?,
+        };
+        return Ok((yv, slab));
+    }
     let past = take_slots(f, slab, lanes.slot, per)?;
     let (yv, next) = if is_decode {
         conv_step(

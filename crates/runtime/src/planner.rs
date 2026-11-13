@@ -10,6 +10,7 @@ mod exec;
 mod global;
 mod grant;
 mod holdings;
+mod in_flight;
 mod inner;
 mod lock;
 mod plan;
@@ -19,6 +20,7 @@ mod rank;
 mod reclaim;
 mod report;
 mod residency_planner;
+mod short;
 mod starvation;
 mod stats;
 mod to_end;
@@ -39,8 +41,10 @@ pub use global::{
     planners, rekey_holders, release, wake,
 };
 pub use grant::{AllocationGrant, Demand};
-pub use pool::{PoolPort, RegistryPool};
+pub use in_flight::FireInFlight;
+pub use pool::{ChunkStats, PoolPort, RegistryPool};
 pub use residency_planner::ResidencyPlanner;
+pub use short::WeightShed;
 pub use stats::PlannerStats;
 pub use trace::trace_enabled;
 

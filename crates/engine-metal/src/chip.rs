@@ -64,19 +64,6 @@ pub enum WeightsLayout {
     MppPacked,
 }
 
-/// How many rows a streamed expert cut serves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.stream.cut", default = "fan_out", tune = engine)]
-pub enum StreamCut {
-    /// The resident slots over the router's fan-out.
-    FanOut,
-    /// A fixed row count.
-    Fixed {
-        #[constant(range(1..=65_536), default = 64)]
-        rows: u32,
-    },
-}
-
 /// The fewest prompt rows the Neural Engine takes: its programs hold a
 /// procedure from 256 rows in steps of 128, so a raise only narrows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -93,41 +80,6 @@ pub struct AneMinRows(pub u32);
     tune = engine
 )]
 pub struct AneMinColumns(pub u32);
-
-/// How many predicted experts a streamed mixture-of-experts load reads
-/// ahead from storage.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.experts.prefetch", constant(range(1..=16)), default = 4, tune = engine)]
-pub struct ExpertsPrefetch(pub u32);
-
-/// The copy threads a streamed mixture-of-experts load seats experts on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(
-    id = "engine.experts.threads",
-    default = r#"{ use = "perf_cores", most = 8 }"#,
-    tune = engine
-)]
-pub enum ExpertsThreads {
-    /// One a CPU performance core, at most `most`.
-    PerfCores {
-        #[constant(range(1..=32), default = 8)]
-        most: u32,
-    },
-    Fixed {
-        #[constant(range(1..=32), default = 8)]
-        threads: u32,
-    },
-}
-
-impl ExpertsThreads {
-    #[must_use]
-    pub fn count(self, perf_cores: u32) -> u32 {
-        match self {
-            ExpertsThreads::PerfCores { most } => perf_cores.clamp(1, most),
-            ExpertsThreads::Fixed { threads } => threads,
-        }
-    }
-}
 
 /// Whether a load keeps the GPU's clocks up between fires with a spin on a queue of its own.
 /// Where the device runs at its power limit while it serves, the spin's draw comes out of the
@@ -159,11 +111,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     r.add::<AneMlp>()
         .add::<AneProjections>()
         .add::<WeightsLayout>()
-        .add::<StreamCut>()
         .add::<AneMinRows>()
         .add::<AneMinColumns>()
-        .add::<ExpertsPrefetch>()
-        .add::<ExpertsThreads>()
         .add::<KeepAliveSpin>()
         .add::<UnreportedCores>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
@@ -335,18 +284,6 @@ mod tests {
             }
             assert_eq!(again.target.assumes, p.target().assumes, "{name}");
         }
-    }
-
-    #[test]
-    fn the_copy_threads_follow_the_performance_cores_up_to_their_cap() {
-        let threads = *registry().defaults().get::<ExpertsThreads>();
-        assert_eq!(
-            [2, 4, 8, 10, 16].map(|p| threads.count(p)),
-            [2, 4, 8, 8, 8],
-            "an M4 Pro, with 8 or 10, keeps the 8 it ran before"
-        );
-        assert_eq!(threads.count(0), 1);
-        assert_eq!(ExpertsThreads::Fixed { threads: 12 }.count(4), 12);
     }
 
     #[cfg(target_vendor = "apple")]

@@ -1,17 +1,20 @@
 #![allow(unsafe_code)]
+pub mod chunks;
+mod host;
 pub mod kv;
+pub mod layout;
 pub mod rs;
 
 use engine::transfer::KvRun;
 use kernels_cuda::{KvPool, RecurrentPool, Tensor};
-use poem_ir::{Attn, CacheRow, Def, Dtype, Operands, Operation, Trace};
+use poem_ir::{CacheRow, Def, Dtype, Operands, Trace};
 
 use crate::device::elastic::{self, Arena, Commit, PhysicalPool};
 use crate::error::{Fault, Result};
 use crate::run::{CachePool, CacheTable, PoolSlabs};
 use crate::settle::Airborne;
 use crate::store::kv::{Facts, Paging};
-pub use engine::fit::{balanced_state_slots, least_state_slots, pages_within, state_slots_within};
+use crate::store::layout::Kind;
 
 impl From<poem_exec::store::Fault> for Fault {
     fn from(fault: poem_exec::store::Fault) -> Fault {
@@ -78,6 +81,23 @@ impl Accounting {
         if self.pool >= self.minimum {
             return Ok(());
         }
+        // Dense weights always live on the device: past the share, no other
+        // knob makes room for them.
+        let room = self.ceiling.saturating_sub(self.floor);
+        if self.weights > room {
+            return Err(Fault::Residency(format!(
+                "the card does not hold this deployment's weights: they take {weights} bytes \
+                 on the device, and of its {card} bytes `[model] device_memory_share` allows \
+                 pie {ceiling}, {room} past the driver's safety floor. Dense weights always \
+                 live in device memory (only routed experts and token-id tables leave it, \
+                 through the weight cache), so serve a quantized deployment of this model, \
+                 split it across devices with tensor parallelism, or raise `[model] \
+                 device_memory_share`.",
+                weights = self.weights,
+                card = self.card,
+                ceiling = self.ceiling,
+            )));
+        }
         Err(Fault::Residency(format!(
             "the card does not hold this deployment: {card} bytes on the device, of which \
              `[model] device_memory_share` allows pie {ceiling}; this load's weight tier \
@@ -87,8 +107,7 @@ impl Accounting {
              omitted. weight tier + elastic pool + safety \
              floor must fit inside the fraction of the card, and here they do not. Lower \
              `[model] max_context` or `[model] slots`, raise `[model] \
-             device_memory_share`, or state a `[model] device_weight_budget` that streams \
-             the weight tier down.",
+             device_memory_share`, or serve a quantized deployment of the model.",
             card = self.card,
             ceiling = self.ceiling,
             weights = self.weights,
@@ -99,24 +118,32 @@ impl Accounting {
     }
 }
 
-/// What `Pools::fit_the_card` did when the declared pool was larger than
-/// the card: the page count asked, the count it was sized to, the bytes the
-/// card had for the cache rows, and what was held back from them.
+/// What `Pools::fit_the_card` sized the pool to: the kv pages asked, the
+/// pages its chunks would hold were every one the kv rows', the chunks it
+/// has, the bytes the card had for them, and what was held back from them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fitted {
     pub asked: u64,
     pub fit: u64,
     pub room: u64,
     pub held: u64,
+    /// What the bodies are held, a stretch included.
     pub bodies: u64,
+    /// Of `bodies`, what a profile's allowance may stretch into while
+    /// arming, past the allowance the card affords.
+    pub stretch: u64,
     pub spare: u64,
-    pub slots: u32,
+    pub chunks: u32,
 }
 
 /// The least `[engine] bodies_mem` is held down to on a card with little
 /// room: enough for the decode bodies, which are what a serve replays every
 /// step and cost tens of megabytes each.
 pub const BODIES_FLOOR_BYTES: u64 = 512 << 20;
+
+/// The share of the cache rows' room a profile's default bodies allowance
+/// may stretch into while the lattice arms: a twentieth.
+pub const BODIES_STRETCH: u64 = 20;
 
 /// What the graph bodies may take on this card: the configured allowance,
 /// or a quarter of `room` — what is left for them and the cache rows once
@@ -200,37 +227,6 @@ pub fn decoded_weight_reserve(widest_plane_bytes: u64, streams: u32) -> u64 {
         .saturating_mul(u64::from(streams.max(1)))
 }
 
-/// What a host pool of `budget` bytes seats: one rs row per device slot
-/// first (`rows` of `row_bytes`), then kv pages (`pages` of `page_bytes`),
-/// then windowed pages (`window_pages` of `window_page_bytes`), then more
-/// kv pages with the rest, which can be more than the device holds. Each is
-/// what the budget holds of it, so zero seats nothing.
-#[must_use]
-pub fn host_pool(
-    budget: u64,
-    rows: u32,
-    row_bytes: u64,
-    pages: u64,
-    page_bytes: u64,
-    window_pages: u64,
-    window_page_bytes: u64,
-) -> (u32, u32, u32) {
-    let clamp = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
-    let rows = u64::from(rows).min(budget.checked_div(row_bytes).unwrap_or(0));
-    let left = budget - rows * row_bytes;
-    let pairs = pages.min(window_pages).min(
-        left.checked_div(page_bytes + window_page_bytes)
-            .unwrap_or(0),
-    );
-    let left = left - pairs * (page_bytes + window_page_bytes);
-    let pages = pairs + (pages - pairs).min(left.checked_div(page_bytes).unwrap_or(0));
-    let left = left - (pages - pairs) * page_bytes;
-    let window_pages =
-        pairs + (window_pages - pairs).min(left.checked_div(window_page_bytes).unwrap_or(0));
-    let left = left - (window_pages - pairs) * window_page_bytes;
-    let pages = pages + left.checked_div(page_bytes).unwrap_or(0);
-    (clamp(rows), clamp(pages), clamp(window_pages))
-}
 /// `slots` of `shelf`, one after another, each its planes in order.
 fn read_shelf(shelf: &Shelf, slots: &[u32]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -406,22 +402,11 @@ pub fn window_fire_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     Ok(bytes)
 }
 
-/// One sequence's cache rows: its kv pages at the declared context and the
-/// recurrent slabs of the least state slots, the least `Pools::fit_the_card`
-/// seats before refusing.
+/// One working set's cache rows: its kv pages at the declared context and
+/// its recurrent record, the least `Pools::fit_the_card` seats before
+/// refusing.
 pub fn least_sequence_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
-    let mut state: u64 = 0;
-    for row in &trace.caches {
-        if let CacheRow::State {
-            name, slab, dtype, ..
-        } = row
-        {
-            let stride: u64 = slab.iter().product();
-            state = state.saturating_add(stride * elem_bytes(name, *dtype)?);
-        }
-    }
-    let slots = u64::from(engine::fit::least_state_slots(1));
-    Ok(one_slot_bytes(trace, paging)?.saturating_add(state.saturating_mul(slots)))
+    one_slot_bytes(trace, paging)
 }
 
 pub fn admit_the_card(
@@ -446,8 +431,9 @@ pub fn admit_the_card(
 }
 
 /// The bytes this load's weight tier puts on the device: every plane the
-/// trace declares, or the `[model] device_weight_budget` stated under it,
-/// plus what else rides along resident.
+/// trace declares, or (`stated`, nonzero) what the load's plan keeps there
+/// once the weight cache's planes leave, plus what else rides along
+/// resident.
 pub fn weight_tier_bytes(trace: &Trace, stated: u64, extra_resident: u64) -> Result<u64> {
     let full: u64 = crate::weights::plane_bytes(trace)?
         .iter()
@@ -481,23 +467,50 @@ pub fn device_memory() -> Result<(u64, u64)> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shape {
     Kv {
-        space: u32,
         windowed: bool,
+        /// The list its pages are slots of: 0 the kv list, `n` window list
+        /// `n - 1`.
+        list: u8,
         dtype: Dtype,
         keys_width: u64,
         values_width: u64,
         values_plane: usize,
         head_stride: u64,
         live: Option<[u32; 2]>,
+        /// Where the key plane and the value plane start in the row's slot
+        /// of the state pool.
+        offsets: [u64; 2],
     },
     State {
         stride: u64,
         dtype: Dtype,
+        /// The row's place in a working set's record: its index among the
+        /// fixed shape's rows.
+        run: usize,
     },
 }
 
+impl Shape {
+    /// The bytes one page holds in a kv row's plane `plane` (0 keys, else
+    /// values).
+    fn page_bytes(&self, plane: usize, page_size: u32) -> u64 {
+        match *self {
+            Shape::Kv {
+                dtype,
+                keys_width,
+                values_width,
+                ..
+            } => {
+                let width = if plane == 0 { keys_width } else { values_width };
+                u64::from(page_size) * width * u64::from(elem_size(dtype))
+            }
+            Shape::State { .. } => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
-pub struct SpaceSeat {
+pub struct TableSeat {
     pub page_indptr: Tensor,
     pub page_indices: Tensor,
     pub last_page_lens: Tensor,
@@ -509,7 +522,8 @@ pub struct Seats {
     pub lanes: u32,
     pub rows: u32,
     pub pages: u32,
-    pub spaces: Vec<SpaceSeat>,
+    /// One a page table: the kv list's, then the window list's.
+    pub page_tables: Vec<TableSeat>,
     pub slot_ids: Tensor,
     pub write_state: bool,
     pub write_state_mask: Tensor,
@@ -543,7 +557,48 @@ impl Seats {
 #[derive(Debug)]
 pub struct Pools {
     pool: PhysicalPool,
-    rows: Vec<Vec<Arena>>,
+    /// The state pool: the kv rows' pages and the working sets' recurrent
+    /// records, a slot each.
+    chunks: chunks::Chunks,
+    /// The row-streamed tables' caches, a shape each ([`Pools::seat_rows`]).
+    row_caches: Vec<RowCache>,
+    /// The routed experts' caches, a shape each ([`Pools::seat_experts`]).
+    expert_caches: Vec<ExpertCache>,
+    /// Where the caches' read counters are snapshotted for
+    /// [`Pools::weight_uses`].
+    use_record: Option<UseRecord>,
+    /// Each window a windowed kv row is declared with, and the list its
+    /// pages are slots of.
+    windows_of: Vec<(u32, u8)>,
+    /// Whether the runtime holds the weights' resident set for the load's
+    /// life (`WeightResidency::held`).
+    weights_held: bool,
+    /// Whether the host copies the caches fill from are gone
+    /// ([`Pools::drop_weight_hosts`]).
+    hosts_dropped: bool,
+    /// The caches' host copies are the serving file's mapping, which no
+    /// fire may read in place ([`Pools::file_weights`]).
+    weights_filed: bool,
+    /// The pinned copy misses are read from, where the load left the
+    /// weights in the file and the runtime streams them after all.
+    miss_copy: Option<crate::device::Pinned>,
+    /// The spans of the serving file's mapping copied out of it since the
+    /// pages were last let go ([`Pools::release_file_pages`]).
+    file_spans: Vec<(u64, usize)>,
+    /// The load seated every weight atom in slots of its own choosing
+    /// ([`Pools::preseat_weights`]), until the runtime's first residency.
+    preseated: bool,
+    /// Arming over a streamed set: an atom on the host copy is read
+    /// through a slot of its shape that the pool holds instead
+    /// ([`Pools::stand_in`]).
+    stand_in: bool,
+    /// Each record a lane named by slot refs, by its first piece's ref: the
+    /// refs of all its pieces.
+    records: std::collections::HashMap<u32, Vec<u32>>,
+    /// The lanes a fire's staged id tables are laid for, and the entries its
+    /// snapshot table is ([`Pools::seat_tables`]).
+    id_lanes: u32,
+    snap_entries: u32,
     shapes: Vec<Shape>,
     pooled: Vec<PoolRow>,
     paging: Paging,
@@ -552,21 +607,20 @@ pub struct Pools {
     /// `[model] device_kv_budget`: the bytes the cache rows take, never cut
     /// to fit; `None` fills what the card hands out.
     budget: Option<u64>,
-    /// The state slots `fit_the_card` keeps whatever the declared context
-    /// seats (`keep_slots`).
-    kept_slots: u32,
+    /// The chunks the fit left the cache rows, of the range's.
+    fitted: u32,
+    /// The range is reserved anew to the fit even where it maps on demand:
+    /// the pool's planes then span about what the fit holds, not the asked
+    /// count (reserved for the asked count, Qwen3.5-0.8B's c64 ran ~1%
+    /// slower on sm_120).
+    whole_fit: bool,
     airborne: Option<Airborne>,
-    committed_kv_pages: u32,
-    committed_state_slots: u32,
-    backed_pages: Vec<u64>,
-    /// The windowed pages backed so far, a bit each: the windowed rows and
-    /// the compressor slabs their pages key are backed a page at a time, as
-    /// the fires' windowed tables (and the windowed moves) first touch it.
-    backed_windowed: Vec<u64>,
-    windowed_backed: bool,
-    buffered: (u64, u64),
     host: Option<HostKv>,
     disk: Option<DiskKv>,
+    /// The shared pool's host tier (CONTRACT-BC 22): chunks of the state
+    /// pool's size, a slot of any shape at the place its host ref names, in
+    /// pageable memory behind a page-locked staging ring ([`host`]).
+    tier: Option<host::HostTier>,
     /// Every declared page and slot is backed ([`Pools::back_whole`]), and
     /// never trimmed since.
     whole: bool,
@@ -576,15 +630,25 @@ pub struct Pools {
     swaps: Vec<Swap>,
 }
 
-/// A move between the device and the host tier, on the swap stream, or a
-/// tap's read-out: its paged and windowed device pages, the paged host
-/// slots it reads or writes, and the event it lands at.
+/// A tier a slot copy reads or writes (CONTRACT-BC 22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Device,
+    Host,
+    Disk,
+}
+
+/// A move of kv pages between the device and their host slots, on the
+/// swap stream, or a tap's read-out: its device pages, the host slots it
+/// reads or writes, and the event it lands at.
 #[derive(Debug)]
 struct Swap {
     landed: crate::device::graph::Event,
     paged: Vec<u32>,
-    windowed: Vec<u32>,
     host: Vec<u32>,
+    /// It holds slots a fire names by no kv run (a window list's, a
+    /// record's, the rs list's): every fire waits for it.
+    wide: bool,
 }
 
 /// The slot file kv is suspended into below host memory, and the pinned
@@ -596,14 +660,14 @@ struct DiskKv {
     /// An h2d out of the stage may still be in flight on the stream.
     landing: bool,
 }
-/// The pinned host pages kv is suspended into. Each paged plane keeps its
-/// host pages side by side, as its device arena does, so a run of pages
-/// moves in one copy; the host rs rows follow them.
+/// The pinned host kv slots a page's bytes are read out to and written in
+/// from by plane ([`Pools::read_host_kv`], a tap's read-out). Each paged
+/// plane keeps its host pages side by side, as its device arena does, so a
+/// run of pages moves in one copy. What a runtime parks moves through the
+/// host tier instead ([`Pools::copy_tier_slots`]).
 #[derive(Debug)]
 struct HostKv {
     paged: Shelf,
-    windowed: Shelf,
-    rows: Shelf,
 }
 
 /// The bytes a host shelf pins at a time.
@@ -631,10 +695,6 @@ impl Shelf {
             per_chunk,
             chunks: (0..slots.div_ceil(per_chunk)).map(|_| None).collect(),
         }
-    }
-
-    fn same_chunk(&self, a: u32, b: u32) -> bool {
-        a / self.per_chunk == b / self.per_chunk
     }
 
     /// Pins the chunks that hold `slots`.
@@ -727,6 +787,7 @@ pub struct ExportedKv {
 }
 
 impl Pools {
+    #[allow(clippy::too_many_arguments)]
     pub fn reserve(
         device: i32,
         utilization: f64,
@@ -734,10 +795,25 @@ impl Pools {
         paging: Paging,
         budget: Option<u64>,
         facts: &Facts,
+        budgets: &poem_compiler::Budgets,
+        activation: u64,
+        chunk_bytes: Option<u64>,
+        experts: &[usize],
+        rows: bool,
+        one_window: bool,
     ) -> Result<Pools> {
         let pool = PhysicalPool::open(device, utilization)?;
-        let mut rows: Vec<Vec<Arena>> = Vec::with_capacity(trace.caches.len());
+        let layout = lay(
+            trace,
+            &paging,
+            budgets,
+            chunk_bytes,
+            experts,
+            rows,
+            one_window,
+        )?;
         let mut shapes = Vec::with_capacity(trace.caches.len());
+        let mut windows_of: Vec<(u32, u8)> = Vec::new();
 
         for (index, row) in trace.caches.iter().enumerate() {
             match row {
@@ -745,7 +821,6 @@ impl Pools {
                     name,
                     planes,
                     dtype,
-                    space,
                     window,
                     live,
                     rows: quantized,
@@ -753,12 +828,30 @@ impl Pools {
                 } => {
                     let element = elem_bytes(name, *dtype)?;
                     let windowed = window.is_some() && paging.window.is_some();
-                    let pages = if windowed {
-                        paging.window_pages()
-                    } else {
-                        paging.pages()
+                    // A windowed row pages in the window list the recipe
+                    // lays it in: its own window's, or a wider one's where
+                    // the windows are merged.
+                    let list = match window.filter(|_| windowed) {
+                        None => 0u8,
+                        Some(held) => layout
+                            .windows
+                            .iter()
+                            .position(|shape| shape.offset_of(index as u32).is_some())
+                            .map(|at| at as u8 + 1)
+                            .ok_or_else(|| {
+                                Fault::program(
+                                    "store::reserve",
+                                    format!(
+                                        "cache `{name}` is read through a window of {held} \
+                                         tokens, and the chunk recipe lays it in no window \
+                                         list"
+                                    ),
+                                )
+                            })?,
                     };
-                    let cells = pages * u64::from(paging.page_size);
+                    if let Some(held) = window.filter(|_| list != 0) {
+                        windows_of.push((held, list));
+                    }
                     let (keys_width, values_width, values_plane) = match planes.as_slice() {
                         [plane] => (*plane, *plane, 0),
                         [keys, values] => (*keys, *values, 1),
@@ -809,18 +902,20 @@ impl Pools {
                             });
                         }
                     }
-                    let mut planes_of_row = Vec::with_capacity(planes.len());
-                    for width in planes {
-                        planes_of_row.push(Arena::reserve(
-                            &pool,
-                            cells * width * element,
-                            "bytes of a kv plane",
-                        )?);
-                    }
-                    rows.push(planes_of_row);
+                    let at = layout
+                        .shape(Kind::paged(list))
+                        .and_then(|shape| shape.offset_of(index as u32))
+                        .ok_or_else(|| {
+                            Fault::program(
+                                "store::reserve",
+                                format!("cache `{name}` has no run in the chunk recipe's slot"),
+                            )
+                        })?;
+                    let keys = u64::from(paging.page_size) * keys_width * element;
                     shapes.push(Shape::Kv {
-                        space: *space,
+                        offsets: [at, at + if values_plane == 0 { 0 } else { keys }],
                         windowed,
+                        list,
                         dtype: *dtype,
                         keys_width,
                         values_width,
@@ -833,80 +928,88 @@ impl Pools {
                     name, slab, dtype, ..
                 } => {
                     let stride: u64 = slab.iter().product();
-                    let bytes = stride * u64::from(paging.slots) * elem_bytes(name, *dtype)?;
-                    rows.push(vec![Arena::reserve(
-                        &pool,
-                        bytes,
-                        "bytes of a recurrent slab",
-                    )?]);
+                    let run = layout
+                        .fixed
+                        .as_ref()
+                        .and_then(|fixed| fixed.rows.iter().position(|run| run.row == index as u32))
+                        .ok_or_else(|| {
+                            Fault::program(
+                                "store::reserve",
+                                format!("state `{name}` has no place in the chunk recipe's record"),
+                            )
+                        })?;
                     shapes.push(Shape::State {
                         stride,
                         dtype: *dtype,
+                        run,
                     });
                 }
             }
-            debug_assert_eq!(rows.len(), index + 1, "one arena set per cache row");
+            debug_assert_eq!(shapes.len(), index + 1, "one shape per cache row");
         }
         let mut pooled = Vec::new();
-        for (space, width) in pooled_spaces(trace) {
-            // A slab keyed by a windowed row's pages (`space` is the cache row
-            // its gather reads) is as long as its windowed pool.
-            let windowed = paging.window.is_some()
-                && matches!(
-                    shapes.get(space as usize),
-                    Some(Shape::Kv { windowed: true, .. })
-                );
-            let row = PoolRow {
-                space,
+        for (row, width) in poem_compiler::chunk::census::pooled(trace) {
+            // A state keyed by a windowed row's pages (`row` is the cache
+            // row its gather reads) lies in the windowed pages' slots.
+            let list = match shapes.get(row as usize) {
+                Some(Shape::Kv { list, .. }) if paging.window.is_some() => *list,
+                _ => 0,
+            };
+            let windowed = list != 0;
+            let offset = layout
+                .shape(Kind::paged(list))
+                .and_then(|shape| shape.pool_of(row))
+                .ok_or_else(|| {
+                    Fault::program(
+                        "store::reserve",
+                        format!(
+                            "the compressor state keyed by cache row {row} has no run in \
+                             the chunk recipe's slot"
+                        ),
+                    )
+                })?;
+            pooled.push(PoolRow {
+                row,
                 width,
                 windowed,
-                planes: Vec::new(),
-            };
-            let bytes = row.watermark_bytes(
-                narrow_pages(paging.pages()),
-                narrow_pages(paging.window_pages()),
-                paging.page_size,
-            );
-            let planes = (0..2)
-                .map(|_| Arena::reserve(&pool, bytes, "bytes of a compressor state slab"))
-                .collect::<Result<Vec<Arena>>>()?;
-            pooled.push(PoolRow { planes, ..row });
+                list,
+                offset,
+            });
         }
+        let total = chunks_at(&layout, &paging, paging.pages(), paging.slots);
+        let chunks = chunks::Chunks::reserve(&pool, layout, total, activation)?;
         Ok(Pools {
             pool,
-            rows,
+            chunks,
+            row_caches: Vec::new(),
+            expert_caches: Vec::new(),
+            use_record: None,
+            windows_of,
+            weights_held: false,
+            hosts_dropped: false,
+            weights_filed: false,
+            miss_copy: None,
+            preseated: false,
+            stand_in: false,
+            file_spans: Vec::new(),
+            records: std::collections::HashMap::new(),
+            id_lanes: 1,
+            snap_entries: 1,
             shapes,
             pooled,
             paging,
             asked: paging.pages(),
             ceiling: paging.pages(),
             budget,
-            kept_slots: 0,
+            fitted: total,
+            whole_fit: false,
             airborne: None,
-            committed_kv_pages: 0,
-            committed_state_slots: 0,
-            backed_pages: Vec::new(),
-            backed_windowed: Vec::new(),
-            windowed_backed: false,
-            buffered: (0, 1),
             host: None,
             disk: None,
+            tier: None,
             whole: false,
             swaps: Vec::new(),
         })
-    }
-
-    /// A fire commits rs buffered pages by slot, so the fit seats them with
-    /// the slots rather than leave them growth past what it sized.
-    pub fn seat_buffered(&mut self, slot_bytes: u64, unit: u64) {
-        self.buffered = (slot_bytes, unit.max(1));
-    }
-
-    /// The state slots the fit keeps while the pages beside them seat one
-    /// sequence at the declared context, rather than cut them to the
-    /// sequences the pages seat there: a slot for each lane a fire batches.
-    pub fn keep_slots(&mut self, slots: u32) {
-        self.kept_slots = slots;
     }
 
     pub fn watch(&mut self, airborne: Airborne) {
@@ -918,38 +1021,34 @@ impl Pools {
         self.paging
     }
 
-    fn arenas(&self) -> impl Iterator<Item = &Arena> {
-        self.rows
-            .iter()
-            .flatten()
-            .chain(self.pooled.iter().flat_map(|row| row.planes.iter()))
-    }
-
     #[must_use]
     pub fn pool_slabs(&self) -> Vec<(u32, PoolSlabs)> {
+        let layout = self.chunks.layout();
         self.pooled
             .iter()
             .map(|row| {
-                let pages = if row.windowed {
-                    self.paging.window_pages()
-                } else {
-                    self.paging.pages()
-                };
-                let cells = pages * u64::from(self.paging.page_size);
-                let plane = |at: usize| {
+                let grain = layout
+                    .shape(Kind::paged(row.list))
+                    .map_or(0, |shape| shape.grain);
+                let rows = u32::try_from(self.chunks.bytes() / row.plane_bytes(1).max(1))
+                    .unwrap_or(u32::MAX);
+                let plane = |at: u64| {
                     Tensor::new(
-                        row.planes.get(at).map_or(0, elastic::Arena::base),
-                        narrow(cells) as u32,
+                        self.chunks.base()
+                            + row.offset
+                            + at * row.plane_bytes(self.paging.page_size),
+                        rows,
                         narrow(row.width) as u32,
                         POOL_STATE,
                     )
                 };
                 (
-                    row.space,
+                    row.row,
                     PoolSlabs {
                         state_kv: plane(0),
                         state_score: plane(1),
                         ape: Tensor::ABSENT,
+                        stride: wide(grain / u64::from(elem_size(POOL_STATE))),
                     },
                 )
             })
@@ -958,123 +1057,23 @@ impl Pools {
 
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.arenas().map(elastic::Arena::max_bytes).sum()
+        self.chunks.bytes()
     }
 
+    /// The watermark the pool reaches: the chunks the fit left it, as the
+    /// map units the range backs them in.
     #[must_use]
     pub fn declared_bytes(&self) -> u64 {
-        self.declared_at(self.paging.pages())
+        self.chunk_bytes(self.fitted)
     }
 
-    /// The watermark the cache rows reach with `pages` kv pages declared and
-    /// the paging's state slots, as the map units their arenas back.
-    #[must_use]
-    pub fn declared_at(&self, pages: u64) -> u64 {
-        self.declared_by(pages, self.paging.slots, |arena, _| arena.map_unit())
-    }
-
-    /// The same watermark were the planes re-reserved for `pages`: each in
-    /// the unit an arena of that size earns, which for a small pool is the
-    /// driver's granularity rather than the handle a huge one maps in.
-    fn declared_reshaped(&self, pages: u64, slots: u32) -> u64 {
-        let (granularity, handle) = (self.pool.granularity(), self.pool.map_unit_bytes());
-        self.declared_by(pages, slots, |_, bytes| {
-            elastic::map_unit_for(bytes, granularity, handle)
-        })
-    }
-
-    fn declared_by(&self, pages: u64, slots: u32, unit_of: impl Fn(&Arena, u64) -> u64) -> u64 {
-        let windowed = narrow_pages(self.paging.window_pages_at(pages));
-        let pages = u32::try_from(pages).unwrap_or(u32::MAX);
-        let page_size = self.paging.page_size;
-        let mapped = |bytes: u64, arena: &Arena| {
-            let unit = unit_of(arena, bytes).max(1);
-            bytes.div_ceil(unit).saturating_mul(unit)
-        };
-        let rows: u64 = self
-            .rows
-            .iter()
-            .zip(self.shapes.iter())
-            .map(|(planes, shape)| {
-                planes
-                    .iter()
-                    .enumerate()
-                    .map(|(at, arena)| {
-                        mapped(
-                            watermark_bytes(shape, at, pages, windowed, slots, page_size),
-                            arena,
-                        )
-                    })
-                    .sum::<u64>()
-            })
-            .sum();
-        let pooled: u64 = self
-            .pooled
-            .iter()
-            .map(|row| {
-                let bytes = row.watermark_bytes(pages, windowed, page_size);
-                row.planes
-                    .iter()
-                    .map(|arena| mapped(bytes, arena))
-                    .sum::<u64>()
-            })
-            .sum();
-        let (slot_bytes, unit) = self.buffered;
-        let buffered = u64::from(slots)
-            .saturating_mul(slot_bytes)
+    /// The bytes `chunks` chunks take backed: the last map unit whole.
+    fn chunk_bytes(&self, chunks: u32) -> u64 {
+        let unit = self.chunks.map_unit().max(1);
+        u64::from(chunks)
+            .saturating_mul(self.chunks.layout().chunk_bytes)
             .div_ceil(unit)
-            .saturating_mul(unit);
-        rows.saturating_add(pooled).saturating_add(buffered)
-    }
-
-    /// Re-reserves the kv planes and compressor slabs for a pool of `pages`,
-    /// so each maps in the unit its size earns rather than the one the asked
-    /// count gave it. Only before anything is committed to them: a mapped
-    /// unit has a base a table may already hold.
-    fn reshape(&mut self, pages: u64, slots: u32) -> Result<()> {
-        let narrow = u32::try_from(pages).unwrap_or(u32::MAX);
-        let windowed = narrow_pages(self.paging.window_pages_at(pages));
-        let page_size = self.paging.page_size;
-        let fresh = |arena: &Arena| {
-            if arena.committed_bytes() == 0 {
-                Ok(())
-            } else {
-                Err(Fault::program(
-                    "store::reshape",
-                    "a cache plane reshaped under committed pages",
-                ))
-            }
-        };
-        for (planes, shape) in self.rows.iter_mut().zip(self.shapes.iter()) {
-            let (label, changed) = match shape {
-                Shape::Kv { .. } => ("bytes of a kv plane", true),
-                Shape::State { .. } => ("bytes of a recurrent slab", slots != self.paging.slots),
-            };
-            if !changed {
-                continue;
-            }
-            for (at, arena) in planes.iter_mut().enumerate() {
-                fresh(arena)?;
-                *arena = Arena::reserve(
-                    &self.pool,
-                    watermark_bytes(shape, at, narrow, windowed, slots, page_size),
-                    label,
-                )?;
-            }
-        }
-        for row in &mut self.pooled {
-            let bytes = row.watermark_bytes(narrow, windowed, page_size);
-            for arena in &mut row.planes {
-                fresh(arena)?;
-                *arena = Arena::reserve(&self.pool, bytes, "bytes of a compressor state slab")?;
-            }
-        }
-        self.ceiling = pages;
-        self.paging.pages = pages;
-        self.paging.slots = slots;
-        self.windowed_backed = false;
-        self.backed_windowed.clear();
-        Ok(())
+            .saturating_mul(unit)
     }
 
     #[must_use]
@@ -1082,177 +1081,244 @@ impl Pools {
         self.pool.map_unit_bytes()
     }
 
-    pub fn spare_bytes(&self) -> Result<u64> {
-        let reserve = self
-            .declared_bytes()
-            .max(self.high_water_bytes())
-            .saturating_sub(self.committed_bytes());
-        self.pool.spare_bytes(reserve)
+    /// What the cache rows may still take of the device: the bytes the fit
+    /// declared them, or the most their segments ever backed, past what
+    /// they back now. The activation's held spans are no part of it: they
+    /// are backed already, out of what the device has free.
+    fn segment_reserve(&self) -> u64 {
+        self.declared_bytes()
+            .max(self.chunks.segment_high_water_bytes())
+            .saturating_sub(self.committed_bytes())
     }
 
+    pub fn spare_bytes(&self) -> Result<u64> {
+        self.pool.spare_bytes(self.segment_reserve())
+    }
+
+    /// What the bodies may still take while the lattice arms: the device's
+    /// free bytes past the cache rows' reserve, or `room` where the device
+    /// has that free. A fit before arming that held the bodies more (a
+    /// profile's allowance stretched) declared the cache rows less, so its
+    /// hold shows here.
     pub fn spare_bytes_for_bodies(&self, room: u64) -> Result<u64> {
         let live = self.pool.spare_bytes(0)?;
-        let reserve = self
-            .declared_bytes()
-            .max(self.high_water_bytes())
-            .saturating_sub(self.committed_bytes());
-        Ok(live.saturating_sub(reserve).max(live.min(room)))
+        Ok(live
+            .saturating_sub(self.segment_reserve())
+            .max(live.min(room)))
     }
 
-    /// Sizes the declared pool to the card. The page count arrives from the
-    /// operator's config (or its 256-slot default) knowing nothing of the
-    /// device, and the watermark it declares is what `spare_bytes` holds back
-    /// and what the runtime admits frames against, so a pool declared past
-    /// what the card can back turns every growth into a refusal the runtime's
-    /// static admission has already forbidden. The fit is against the elastic
-    /// budget as it stands now, so it is called once everything else this
-    /// load puts on the device is resident, and again after arming, when the
-    /// bodies have taken what they take and the rest is the cache rows' to
-    /// declare. `programs` is held for the guests' programs throughout;
-    /// `bodies` is the configured allowance, which `bodies_allowance` holds
-    /// down to what the room affords, and both yield before one sequence at
-    /// the declared context does, since a pool under one sequence is no
-    /// deployment. While nothing is committed to the planes, a pool the
-    /// asked count's map unit would leave under a sequence is re-reserved
-    /// in the finer unit its own size earns. `resident` spells what is on
-    /// the device already, for the refusal when not even that sequence fits.
+    /// What a load's synthetic fires may name, inside the chunks the fit
+    /// left the pool: of `records` recurrent records and `pages` kv pages
+    /// wanted, the most records beside every page, or one record and the
+    /// most pages; and the windowed pages beside those pages, the null page
+    /// among them. A synthetic lane's rows are never read back, so lanes
+    /// may share what they name; the fit holds one working set, so one
+    /// record and its pages always fit.
+    #[must_use]
+    pub fn synthetic_room(&self, records: u32, pages: u64) -> (u32, u64, u64) {
+        let fitted = self.fitted_chunks();
+        let room = fitted.saturating_sub(self.chunks.weight_chunks_under(fitted));
+        let layout = self.chunks.layout();
+        let state = self.has_state();
+        let fits = |records: u32, pages: u64| {
+            chunks_at(layout, &self.paging, pages, if state { records } else { 0 }) <= room
+        };
+        let largest = |lo: u64, hi: u64, ok: &dyn Fn(u64) -> bool| {
+            let (mut lo, mut hi) = (lo, hi);
+            while lo < hi {
+                let mid = lo + (hi - lo).div_ceil(2);
+                if ok(mid) { lo = mid } else { hi = mid - 1 }
+            }
+            lo
+        };
+        let records = records.max(1);
+        let pages = pages.max(1);
+        let (records, pages) = if fits(records, pages) {
+            (records, pages)
+        } else if fits(1, pages) {
+            let most = largest(1, u64::from(records), &|r| fits(r as u32, pages));
+            (u32::try_from(most).unwrap_or(1), pages)
+        } else {
+            (1, largest(1, pages, &|p| fits(1, p)))
+        };
+        (records, pages, self.paging.window_pages_at(pages))
+    }
+
+    /// Sizes the pool to the card: every whole chunk the card has room for,
+    /// each any shape's to take, provided they seat one working set at the
+    /// declared context ([`engine::chunk::fit`]). The room is the elastic
+    /// budget as it stands now, so the fit is called once everything else
+    /// this load puts on the device is resident, and again after arming,
+    /// when the bodies have taken what they take and the rest is the pool's.
+    /// `programs` is held for the guests' programs throughout; `bodies` is
+    /// the configured allowance, which `bodies_allowance` holds down to what
+    /// the room affords, and both yield before that one working set does,
+    /// since a pool under it is no deployment. `resident` spells what is on
+    /// the device already, for the refusal when not even that fits.
+    /// `settled` says the activation has reached its high water: every
+    /// composition fired while the bodies armed. `stretch`: the allowance is
+    /// a profile's default, not the operator's, and the fit before arming
+    /// holds the bodies a twentieth of the cache rows' room past it, so a
+    /// lattice the default does not arm whole may take it
+    /// (`Shell::fit_lattice`); the settled fit gives back what they left.
     pub fn fit_the_card(
         &mut self,
         bodies: u64,
         programs: u64,
+        settled: bool,
+        stretch: bool,
         resident: &dyn core::fmt::Display,
     ) -> Result<Fitted> {
+        // The room is what the card has free plus every byte the range has
+        // backed (its committed segments and held spans; a flat range, once
+        // allocated, the whole of it: the chunks the kv rows have not yet
+        // taken are backed too, and so not free), less the activation the
+        // cache rows never take. Until the activation is settled that is its
+        // whole span, held or still to be (the first fire's activation, and
+        // the room held for the bodies, must find it); once settled (every
+        // composition armed, the activation at its high water), only the
+        // span a fire backed: what no fire backed is no fire's, and the cache
+        // rows take it.
+        let activation = if settled {
+            self.chunks
+                .activation_bytes()
+                .saturating_sub(self.chunks.activation_unheld_bytes())
+        } else {
+            self.chunks.activation_bytes()
+        };
         let live = self
             .pool
             .spare_bytes(0)?
-            .saturating_add(self.committed_bytes());
-        let fresh = self
-            .rows
-            .iter()
-            .flatten()
-            .chain(self.pooled.iter().flat_map(|row| row.planes.iter()))
-            .all(|arena| arena.committed_bytes() == 0);
+            .saturating_add(self.chunks.backed_bytes())
+            .saturating_sub(activation);
+        let layout = self.chunks.layout();
+        let chunk = layout.chunk_bytes;
+        // One working set at the declared context beside the null chunk:
+        // its kv pages, its windowed pages and its recurrent record.
         let one_slot = u64::from(self.paging.pages_per_slot).min(self.ceiling);
-        let mut need = if fresh {
-            self.declared_at(one_slot)
-                .min(self.declared_reshaped(one_slot, self.paging.slots))
+        let slots = u32::from(self.has_state());
+        let least = chunks_at(layout, &self.paging, one_slot, slots);
+        let need = self.chunk_bytes(least);
+        // A stated budget is the pool's before the bodies and programs are
+        // held anything; with none, one working set is, and beside it every
+        // weight the pool would hold wherever the card holds them with the
+        // programs (the activation's span already out of `live`): the
+        // bodies are held out of what is left after the weights, so their
+        // allowance never turns weights that fit into weights that stream.
+        // A card short of that streams them (the runtime's call).
+        let whole = need.saturating_add(self.weight_pool_bytes());
+        let claim = self
+            .budget
+            .unwrap_or(if live >= whole.saturating_add(programs) {
+                whole
+            } else {
+                need
+            });
+        let (bodies, programs) = holds_within(bodies, programs, live.saturating_sub(claim));
+        let stretch = if stretch && !settled && self.budget.is_none() {
+            live.saturating_sub(claim)
+                .saturating_sub(bodies)
+                .saturating_sub(programs)
+                / BODIES_STRETCH
         } else {
-            self.declared_at(one_slot)
+            0
         };
-        // A stated budget is the rows' before the bodies and programs are
-        // held anything; with none, one sequence is.
-        let claim = self.budget.unwrap_or(need);
-        let configured = bodies;
-        let asked_programs = programs;
-        let (mut bodies, mut programs) =
-            holds_within(configured, asked_programs, live.saturating_sub(claim));
-        let mut held = programs.saturating_add(bodies);
-        let mut room = live.saturating_sub(held);
+        let bodies = bodies.saturating_add(stretch);
+        let held = programs.saturating_add(bodies);
+        let room = live.saturating_sub(held);
         if let Some(budget) = self.budget.filter(|&budget| budget > room) {
             return Err(Fault::Residency(
                 engine::fit::Short::Budget { budget, room }.to_string(),
             ));
         }
-        let limit = self.budget.unwrap_or(room);
-        let mut fit = pages_within(self.ceiling, limit, |pages| self.declared_at(pages));
-        if fresh && fit < self.ceiling {
-            let slots = self.paging.slots;
-            let fine = pages_within(self.ceiling, limit, |pages| {
-                self.declared_reshaped(pages, slots)
-            });
-            if fine > fit {
-                // The planes are reserved for what the rows reach once the
-                // bodies' allowance comes back after arming (the second fit
-                // sizes the pages to the room then), not only for this
-                // pass's: reserved at this pass's pages, the later fit could
-                // never pass them.
-                let reach = match self.budget {
-                    Some(_) => fine,
-                    None => pages_within(self.ceiling, live.saturating_sub(programs), |pages| {
-                        self.declared_reshaped(pages, slots)
-                    })
-                    .max(fine),
-                };
-                self.reshape(reach, slots)?;
-                fit = pages_within(self.ceiling, limit, |pages| self.declared_at(pages));
+        // Whole map units of the room, in whole chunks, of the range's.
+        let unit = self.chunks.map_unit().max(1);
+        let limit = self.budget.unwrap_or(room) / unit * unit;
+        let fitted = match engine::chunk::fit(limit, chunk, 0, least) {
+            Ok(chunks) => chunks.min(self.chunks.total()),
+            Err(_) if self.budget.is_some() => {
+                return Err(Fault::Residency(
+                    engine::fit::Short::Sequence {
+                        budget: self.budget.unwrap_or(0),
+                        least: need,
+                    }
+                    .to_string(),
+                ));
             }
-        }
-        // A hybrid declares a recurrent slab for every state slot, whatever
-        // the pool seats: a heavy slab can take the room its lanes' pages
-        // needed, and on a short card the slab alone can be the refusal.
-        // Where the pages that fit seat fewer sequences at the declared
-        // context than there are slots, the slots are cut to where the two
-        // seat alike, never under what leaves the pages their half of the
-        // room past one sequence.
-        let one = one_slot.max(1);
-        let seats = u64::from(self.paging.slots);
-        if fit / one < seats && fresh && self.has_state() && self.budget.is_none() {
-            let one_sequence = self.declared_reshaped(one_slot, 0);
-            // What the fires were asked and the uncut slab left no room to
-            // hold is held after the cut, so the slots leave it too.
-            let cut = room.saturating_sub(asked_programs.saturating_sub(programs));
-            let floor = state_slots_within(self.paging.slots, cut, one_sequence, |slots| {
-                self.declared_reshaped(0, slots)
-            });
-            // The kept slots (`keep_slots`) stay while the pages beside them
-            // still seat one sequence, as TensorRT-LLM's state pool holds a
-            // slot for each of `max_batch_size` and its kv takes the rest.
-            let kept = self.kept_slots.min(self.paging.slots);
-            let floor = if kept > floor
-                && pages_within(self.ceiling, cut, |pages| {
-                    self.declared_reshaped(pages, kept)
-                }) >= one_slot
-            {
-                kept
+            Err(_) => {
+                return Err(Fault::Residency(format!(
+                    "the card does not hold this deployment: {resident}; under `[model] \
+                     device_memory_share` that leaves {room} bytes for the state pool, and one \
+                     working set at the declared context needs {need}. Lower `[engine] \
+                     max_model_len`, raise `[model] device_memory_share`, serve a quantized \
+                     deployment of the model, or free what else holds the device."
+                )));
+            }
+        };
+        self.fitted = fitted;
+        // The kv pages the shell's own seats may name: what the chunks hold
+        // were every one the kv rows', but those the weights take. Weights
+        // the fitted chunks seat whole the runtime holds for the load's life
+        // (`store::weights::boot_cache`), whatever the claim was, a stated
+        // budget's too, so no kv row ever takes their chunks; counted as the
+        // rows', they are pages admission hands out that no chunk backs, and
+        // a load filling them starves with nothing to discard. Where they
+        // leave less than one working set at the declared context, the
+        // pages are what they leave.
+        let weight_chunks = u32::try_from(self.weight_pool_bytes() / chunk).unwrap_or(u32::MAX);
+        let weights_held = if weight_chunks <= fitted {
+            weight_chunks
+        } else {
+            0
+        };
+        let kv_chunks = fitted.saturating_sub(weights_held);
+        let layout = self.chunks.layout();
+        let floor = if kv_chunks >= least {
+            one_slot
+        } else {
+            if settled {
+                eprintln!(
+                    "engine-cuda: the weights this card holds whole leave the cache rows {} MiB, \
+                     under one sequence at the declared context ({} MiB): the kv pool states \
+                     what they leave. Lower `[engine] max_model_len`, raise `[model] \
+                     device_memory_share`, or set `weight_streaming = \"on\"` to stream them.",
+                    (u64::from(kv_chunks) * chunk) >> 20,
+                    need >> 20,
+                );
+            }
+            1
+        };
+        let (mut fits, mut over) = (floor, self.ceiling.saturating_add(1));
+        while over - fits > 1 {
+            let mid = fits + (over - fits) / 2;
+            if chunks_at(layout, &self.paging, mid, 0) <= kv_chunks {
+                fits = mid;
             } else {
-                floor
-            };
-            let slots = balanced_state_slots(self.paging.slots, floor, one_slot, |slots| {
-                pages_within(self.ceiling, cut, |pages| {
-                    self.declared_reshaped(pages, slots)
-                })
-            });
-            let pages = pages_within(self.ceiling, cut, |pages| {
-                self.declared_reshaped(pages, slots)
-            });
-            if pages >= one_slot && slots < self.paging.slots {
-                self.reshape(pages, slots)?;
-                need = self.declared_at(one_slot);
-                // The slab the slots gave back is room the bodies were
-                // refused when the allowance was struck; strike it again.
-                (bodies, programs) =
-                    holds_within(configured, asked_programs, live.saturating_sub(need));
-                held = programs.saturating_add(bodies);
-                room = live.saturating_sub(held);
-                fit = pages_within(self.ceiling, room, |pages| self.declared_at(pages));
+                over = mid;
             }
         }
-        if let Some(budget) = self.budget.filter(|_| fit < one_slot) {
-            return Err(Fault::Residency(
-                engine::fit::Short::Sequence {
-                    budget,
-                    least: need,
-                }
-                .to_string(),
-            ));
+        self.paging.pages = fits;
+        // A flat range is one allocation made on its first commit: of the
+        // fitted chunks, not of every chunk the asked count reserved.
+        // A range mapped on demand reserved anew before the activation is
+        // settled keeps room for what the settled fit may yet give the cache
+        // rows: the activation's span no fire backs, and the bodies'
+        // allowance past what arming holds. Reserved to this fit alone, the
+        // settled one could never grow past it.
+        let flat = !elastic::mapped_on_demand();
+        let reshape = flat || (self.whole_fit && fitted < self.chunks.total());
+        if reshape && self.chunks.fresh() {
+            let reserved = if flat || settled {
+                fitted
+            } else {
+                let more = self.chunks.activation_unheld_bytes().saturating_add(bodies) / chunk;
+                fitted
+                    .saturating_add(u32::try_from(more).unwrap_or(u32::MAX))
+                    .min(self.chunks.total())
+            };
+            self.chunks.reshape(&mut self.pool, reserved)?;
         }
-        if fit < one_slot {
-            return Err(Fault::Residency(format!(
-                "the card does not hold this deployment: {resident}; under `[model] \
-                 device_memory_share` that leaves {room} bytes for the cache rows, and one \
-                 sequence at the declared context, beside the declared state slots, needs \
-                 {need} across them. Lower `[engine] max_model_len` or `[engine] \
-                 max_state_slots`, raise `[model] device_memory_share`, state a `[model] \
-                 device_weight_budget` that streams the weight tier down, or free what \
-                 else holds the device."
-            )));
-        }
-        self.paging.pages = fit;
-        // A flat arena allocates its whole range on its first commit, so its
-        // range is the fitted one, not the one the asked count reserved.
-        if !elastic::mapped_on_demand() && self.committed_bytes() == 0 {
-            self.reshape(fit, self.paging.slots)?;
-        }
+        self.chunks.limit(fitted);
         // The runtime admits frames against this watermark, so the pool is
         // pledged it beside what its other arenas hold now: a frame inside
         // it is a frame the fit already sized the card for, and what a fire
@@ -1262,31 +1328,59 @@ impl Pools {
             .committed_pages()
             .saturating_sub(elastic::pages_for_bytes(self.committed_bytes()));
         self.pool
-            .pledge(elastic::pages_for_bytes(self.declared_at(fit)).saturating_add(others));
+            .pledge(elastic::pages_for_bytes(self.chunk_bytes(fitted)).saturating_add(others));
         Ok(Fitted {
             asked: self.asked,
-            fit,
+            fit: fits,
             room,
             held,
             bodies,
+            stretch,
             spare: live.saturating_sub(need).saturating_sub(programs),
-            slots: self.paging.slots,
+            chunks: fitted,
         })
+    }
+
+    /// Where a fire's activation starts: under the state pool's end.
+    #[must_use]
+    pub fn activation_base(&self) -> u64 {
+        self.chunks.activation_base()
+    }
+
+    /// Backs the first `bytes` of the activation's span, beside the pool's
+    /// budget where `beside` and the budget refuses them.
+    pub(crate) fn hold_activation(&mut self, bytes: u64, beside: bool) -> Result<()> {
+        match self.chunks.hold_activation(&mut self.pool, bytes, beside)? {
+            Commit::Committed => Ok(()),
+            refusal => Err(refuse(&self.pool, refusal)),
+        }
+    }
+
+    /// Reserves the range anew to the fit even where it maps on demand. The
+    /// chunks it keeps past the settled fit, under the activation, are
+    /// stated to no runtime ([`chunks::Chunks::skip_past`]).
+    pub fn fit_range_whole(&mut self) {
+        self.whole_fit = true;
+    }
+
+    /// Backs `bytes` of the activation's span from `offset` into it.
+    pub(crate) fn hold_activation_at(
+        &mut self,
+        offset: u64,
+        bytes: u64,
+        beside: bool,
+    ) -> Result<()> {
+        match self
+            .chunks
+            .hold_activation_at(&mut self.pool, offset, bytes, beside)?
+        {
+            Commit::Committed => Ok(()),
+            refusal => Err(refuse(&self.pool, refusal)),
+        }
     }
 
     pub(crate) fn reserve_arena(&self, max_bytes: u64, label: &'static str) -> Result<Arena> {
         Arena::reserve(&self.pool, max_bytes, label)
-    }
-
-    pub(crate) fn commit_arena(&mut self, arena: &mut Arena, bytes: u64) -> Result<()> {
-        let mut targets = [elastic::Target {
-            arena,
-            want: elastic::Want::Prefix(bytes),
-        }];
-        match elastic::commit_atomically(&mut self.pool, &mut targets)? {
-            Commit::Committed => Ok(()),
-            refusal => Err(refuse(&self.pool, refusal)),
-        }
     }
 
     /// Backs a prefix of `bytes` of an arena beside the pool's budget
@@ -1297,22 +1391,12 @@ impl Pools {
 
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
-        self.arenas().map(elastic::Arena::committed_bytes).sum()
+        self.chunks.committed_bytes()
     }
 
     #[must_use]
     pub fn high_water_bytes(&self) -> u64 {
-        self.arenas().map(elastic::Arena::high_water_bytes).sum()
-    }
-
-    #[must_use]
-    pub fn elastic_page_bytes(&self) -> u64 {
-        self.pool.page_bytes()
-    }
-
-    #[must_use]
-    pub fn elastic_budget_pages(&self) -> u64 {
-        self.pool.hard_pages()
+        self.chunks.high_water_bytes()
     }
 
     #[must_use]
@@ -1320,10 +1404,10 @@ impl Pools {
         self.shapes
             .iter()
             .map(|shape| match *shape {
-                Shape::State { stride, dtype } => stride * u64::from(elem_size(dtype)),
+                Shape::State { stride, dtype, .. } => stride * u64::from(elem_size(dtype)),
                 Shape::Kv { .. } => 0,
             })
-            .sum()
+            .sum::<u64>()
     }
 
     #[must_use]
@@ -1333,11 +1417,64 @@ impl Pools {
             .any(|shape| matches!(shape, Shape::State { .. }))
     }
 
+    /// The page tables a fire stages: one a kv shape, the list's and then
+    /// each window list's, narrowest first. Every kv row of a shape reads
+    /// its shape's.
     #[must_use]
-    pub fn windowed_space(&self, space: u32) -> bool {
-        self.shapes.iter().any(
-            |shape| matches!(shape, Shape::Kv { space: at, windowed: true, .. } if *at == space),
-        )
+    pub fn geometries(&self) -> usize {
+        let layout = self.chunks.layout();
+        usize::from(layout.list.is_some()) + layout.windows.len()
+    }
+
+    /// Whether page table `at` of a fire's is a window list's.
+    #[must_use]
+    pub fn windowed_geometry(&self, at: usize) -> bool {
+        self.geometry_window(at).is_some()
+    }
+
+    /// The window list page table `at` of a fire's is of, if it is one's.
+    #[must_use]
+    pub fn geometry_window(&self, at: usize) -> Option<usize> {
+        let layout = self.chunks.layout();
+        at.checked_sub(usize::from(layout.list.is_some()))
+            .filter(|&window| window < layout.windows.len())
+    }
+
+    /// The tokens window list `window` retains.
+    #[must_use]
+    pub fn window_tokens(&self, window: usize) -> Option<u32> {
+        self.chunks
+            .layout()
+            .windows
+            .get(window)
+            .and_then(|shape| shape.window)
+    }
+
+    /// Each window a kv row is declared with and the page table of a
+    /// fire's that row's list reads: its own window's list's, or the wider
+    /// list's its rows are merged into.
+    #[must_use]
+    pub fn window_tables(&self) -> Vec<(u32, u32)> {
+        let mut tables: Vec<(u32, u32)> = Vec::new();
+        for &(window, list) in &self.windows_of {
+            let table = self.table_of(list) as u32;
+            if !tables.contains(&(window, table)) {
+                tables.push((window, table));
+            }
+        }
+        tables
+    }
+
+    /// The page table of a fire's that the kv rows paged in the window
+    /// list (`windowed`) or in the kv list read. The kv list's is the
+    /// first, and the All axis's: a model keeping no full-retention row
+    /// pages its All axis in its window list, then the only one.
+    #[must_use]
+    pub fn table_of(&self, list: u8) -> usize {
+        match list {
+            0 => 0,
+            window => usize::from(self.chunks.layout().list.is_some()) + usize::from(window) - 1,
+        }
     }
 
     #[must_use]
@@ -1347,42 +1484,67 @@ impl Pools {
             .any(|shape| matches!(shape, Shape::Kv { windowed: true, .. }))
     }
 
-    /// Zeroes page 0 of the windowed rows once they are backed: every page
-    /// behind a window reads it, and a masked column still multiplies its
-    /// value, so it must hold no NaN.
-    fn zero_null_page(&mut self) -> Result<()> {
-        if self.windowed_backed || !self.has_windowed() {
+    /// Seats the kv pages `pages` (the windowed ones, a window list's) on slots of
+    /// the state pool and backs the segments their chunks lie in.
+    fn seat_pages(&mut self, kind: Kind, pages: impl IntoIterator<Item = u64>) -> Result<()> {
+        // The physical chunks the pages lie in. A lane's pages run through
+        // a few chunks, so a chunk just checked is not checked again.
+        let mut highest = None;
+        let mut unbacked = None;
+        let mut checked = None;
+        for page in pages {
+            let page = u32::try_from(page).map_err(|_| Fault::Ceiling {
+                what: kind.name(),
+                need: page,
+                have: u64::from(u32::MAX),
+            })?;
+            let chunk = self.chunks.seat(kind, page)?;
+            highest = highest.max(Some(chunk));
+            if unbacked.is_none() && checked != Some(chunk) {
+                checked = Some(chunk);
+                if !self.chunks.backed(chunk) {
+                    unbacked = Some(chunk);
+                }
+            }
+        }
+        let (Some(highest), Some(unbacked)) = (highest, unbacked) else {
             return Ok(());
+        };
+        if self.chunks.by_refs() {
+            // Nothing is backed on a fire's path: the runtime commits a
+            // segment before it hands out a chunk of it.
+            return Err(Fault::program(
+                "store::chunks",
+                format!(
+                    "a {} lies in physical chunk {unbacked}, which the runtime has not \
+                     committed ({} segments are)",
+                    kind.name(),
+                    self.chunks.committed_segments()
+                ),
+            ));
         }
-        for (arena, bytes) in self.windowed_planes() {
-            crate::device::zero_span(arena.span(0, bytes)?, usize::try_from(bytes).unwrap_or(0))?;
+        let segments = self.chunks.segments_for(u64::from(highest) + 1);
+        match self.chunks.commit_segments(&mut self.pool, segments)? {
+            Commit::Committed => Ok(()),
+            refusal => Err(refuse(&self.pool, refusal)),
         }
-        self.windowed_backed = true;
-        Ok(())
     }
 
-    /// Backs the not-yet-backed windowed pages `pages` (and the null page behind a
-    /// window) in the windowed rows and compressor slabs: the pool grows on first
-    /// use, costing only the windows the seated sequences hold.
+    /// Backs the windowed pages `pages` (and the null page behind a
+    /// window): their slots in the state pool, and their rows of the
+    /// compressor slabs their pages key.
     pub fn ensure_windowed(&mut self, pages: impl IntoIterator<Item = u64>) -> Result<()> {
         if !self.has_windowed() {
             return Ok(());
         }
-        let capacity = self.paging.window_pages();
-        let mut fresh: Vec<u64> = core::iter::once(0)
-            .chain(pages)
-            .filter(|&page| {
-                !self
-                    .backed_windowed
-                    .get((page / 64) as usize)
-                    .is_some_and(|word| word & (1u64 << (page % 64)) != 0)
-            })
-            .collect();
+        let capacity = if self.chunks.by_refs() {
+            u64::MAX
+        } else {
+            self.paging.window_pages()
+        };
+        let mut fresh: Vec<u64> = core::iter::once(0).chain(pages).collect();
         fresh.sort_unstable();
         fresh.dedup();
-        if fresh.is_empty() {
-            return Ok(());
-        }
         if let Some(&page) = fresh.iter().find(|&&page| page >= capacity) {
             return Err(Fault::Ceiling {
                 what: "windowed kv pages",
@@ -1390,112 +1552,59 @@ impl Pools {
                 have: capacity,
             });
         }
-        // Runs of consecutive pages, a range each.
-        let mut runs: Vec<(u64, u64)> = Vec::new();
-        for &page in &fresh {
-            match runs.last_mut() {
-                Some((first, count)) if *first + *count == page => *count += 1,
-                _ => runs.push((page, 1)),
-            }
+        // A windowed page is a slot of every window list.
+        for window in 0..self.chunks.layout().windows.len() {
+            self.seat_pages(Kind::Window(window as u8), fresh.iter().copied())?;
         }
-        let page_size = u64::from(self.paging.page_size);
-        let Pools {
-            pool,
-            rows,
-            shapes,
-            pooled,
-            ..
-        } = self;
-        let mut targets = Vec::new();
-        let ranges = |page_bytes: u64| {
-            elastic::Want::Ranges(
-                runs.iter()
-                    .map(|&(first, count)| (first * page_bytes, count * page_bytes))
-                    .collect(),
-            )
-        };
-        for (planes, shape) in rows.iter_mut().zip(shapes.iter()) {
-            if !matches!(shape, Shape::Kv { windowed: true, .. }) {
-                continue;
-            }
-            for (at, arena) in planes.iter_mut().enumerate() {
-                let page_bytes = watermark_bytes(shape, at, 0, 1, 0, self.paging.page_size);
-                targets.push(elastic::Target {
-                    arena,
-                    want: ranges(page_bytes),
-                });
-            }
-        }
-        for row in pooled.iter_mut().filter(|row| row.windowed) {
-            let page_bytes = page_size * row.width * u64::from(elem_size(POOL_STATE));
-            for arena in row.planes.iter_mut() {
-                targets.push(elastic::Target {
-                    arena,
-                    want: ranges(page_bytes),
-                });
-            }
-        }
-        match elastic::commit_atomically(pool, &mut targets)? {
-            Commit::Committed => {}
-            refusal => return Err(refuse(&self.pool, refusal)),
-        }
-        for &page in &fresh {
-            let (word, bit) = ((page / 64) as usize, page % 64);
-            if self.backed_windowed.len() <= word {
-                self.backed_windowed.resize(word + 1, 0);
-            }
-            self.backed_windowed[word] |= 1u64 << bit;
-        }
-        self.zero_null_page()
-    }
-
-    #[must_use]
-    pub fn bases(&self) -> Vec<u64> {
-        self.arenas().map(elastic::Arena::base).collect()
+        Ok(())
     }
 
     pub fn table(&self, seats: &Seats) -> Result<CacheTable> {
         let mut table = Vec::with_capacity(self.shapes.len());
-        for (planes, shape) in self.rows.iter().zip(&self.shapes) {
+        for shape in &self.shapes {
             table.push(match *shape {
                 Shape::Kv {
-                    space,
                     windowed,
+                    list,
                     dtype,
                     keys_width,
                     values_width,
                     values_plane,
                     head_stride,
                     live,
+                    offsets,
                 } => {
-                    let seat = seats
-                        .spaces
-                        .get(space as usize)
-                        .ok_or_else(|| Fault::Unbound {
-                            what: format!(
-                                "cache space {space}, for which this fire wrote no \
-                                     geometry"
-                            ),
-                        })?;
+                    let table = self.table_of(list);
+                    let seat = seats.page_tables.get(table).ok_or_else(|| Fault::Unbound {
+                        what: format!("page table {table}, which this fire staged none of"),
+                    })?;
                     let pages = if windowed {
                         self.paging.window_pages()
                     } else {
                         self.paging.pages()
                     };
                     let cells = pages * u64::from(self.paging.page_size);
+                    // A plane's pointer carries its offset in a page's
+                    // slot; the pages step by the shape's grain.
+                    let grain = self
+                        .chunks
+                        .layout()
+                        .shape(Kind::paged(list))
+                        .map_or(0, |shape| shape.grain);
+                    let _ = values_plane;
                     let plane = |at: usize, width: u64| {
                         Tensor::new(
-                            planes.get(at).map_or(0, elastic::Arena::base),
+                            self.chunks.base() + offsets[at],
                             u32::try_from(cells).unwrap_or(u32::MAX),
                             u32::try_from(width).unwrap_or(u32::MAX),
                             dtype,
                         )
                     };
                     CachePool::Kv {
-                        space,
+                        table: table as u32,
                         pool: KvPool {
                             keys: plane(0, keys_width),
-                            values: plane(values_plane, values_width),
+                            values: plane(1, values_width),
                             bf16_keys: Tensor::new(0, 0, 0, dtype),
                             bf16_values: Tensor::new(0, 0, 0, dtype),
                             key_scales: Tensor::new(0, 0, 0, Dtype::U8),
@@ -1516,32 +1625,62 @@ impl Pools {
                             max_pages_per_request: narrow(u64::from(self.paging.pages_per_slot)),
                             pages_in_batch: narrow(u64::from(seats.pages)),
                             live: live.unwrap_or([0, 0]),
+                            page_stride: [grain, grain],
                         },
                     }
                 }
-                Shape::State { stride, dtype } => CachePool::Recurrent(RecurrentPool {
-                    write_state: seats.write_state,
-                    write_state_mask: seats.write_state_mask,
-                    commit_len: seats.commit_len,
-                    begin_at: seats.begin_at,
-                    fused_decay: false,
-                    snapshots: seats.snapshots,
-                    slab: Tensor::new(
-                        planes.first().map_or(0, elastic::Arena::base),
-                        self.paging.slots,
+                Shape::State { stride, dtype, run } => {
+                    // A lane names each piece's slot a grain at a time, in
+                    // the id table the row's pieces share; a piece lies
+                    // `offset` into its slot.
+                    let fixed = self.chunks.layout().fixed.as_ref().ok_or_else(|| {
+                        Fault::program("store::table", "a recurrent row and no fixed shape")
+                    })?;
+                    let row = &fixed.rows[run];
+                    let element = u64::from(elem_size(dtype)).max(1);
+                    let step = wide(fixed.slot.grain / element);
+                    let slab = Tensor::new(
+                        self.chunks.base(),
+                        u32::try_from(self.chunks.bytes() / fixed.slot.grain.max(1))
+                            .unwrap_or(u32::MAX),
                         narrow(stride) as u32,
                         dtype,
-                    ),
-                    slot_ids: seats.slot_ids,
-                    slot_stride_elems: stride as i64,
-                    conv_slab: Tensor::new(
-                        planes.first().map_or(0, elastic::Arena::base),
-                        self.paging.slots,
-                        narrow(stride) as u32,
-                        dtype,
-                    ),
-                    conv_stride: stride as i64,
-                }),
+                    );
+                    let column = u64::from(row.column);
+                    let mut snapshots = seats.snapshots;
+                    if !snapshots.slots.is_absent() {
+                        snapshots.slots.ptr += column * u64::from(self.snap_entries) * 4;
+                    }
+                    CachePool::Recurrent(RecurrentPool {
+                        write_state: seats.write_state,
+                        write_state_mask: seats.write_state_mask,
+                        commit_len: seats.commit_len,
+                        begin_at: seats.begin_at,
+                        fused_decay: false,
+                        snapshots,
+                        slab,
+                        slot_ids: Tensor::new(
+                            seats.slot_ids.ptr + column * u64::from(self.id_lanes) * 4,
+                            seats.slot_ids.rows,
+                            row.pieces,
+                            Dtype::I32,
+                        ),
+                        slot_stride_elems: step,
+                        conv_slab: slab,
+                        conv_stride: step,
+                        segments: kernels_cuda::Segments {
+                            table: Tensor::ABSENT,
+                            seg_chunks: 0,
+                            pieces: row.pieces,
+                            piece_off: wide(row.offset / element),
+                            piece_atoms: if row.pieces > 1 {
+                                u32::try_from(row.atoms_per_piece).unwrap_or(u32::MAX)
+                            } else {
+                                0
+                            },
+                        },
+                    })
+                }
             });
         }
         Ok(CacheTable(table))
@@ -1555,28 +1694,251 @@ impl Pools {
         self.zero_slot(Some(stream), slot)
     }
 
+    /// Copies the record `src` names onto the one `dst` names, slot for
+    /// slot: its recurrent rows and the rs buffer's rows with them.
     pub fn copy_slot(&mut self, stream: *mut core::ffi::c_void, src: u32, dst: u32) -> Result<()> {
         for slot in [src, dst] {
-            if !slab_row(self.has_state(), self.paging.slots, slot)? {
+            if !self.state_row(slot)? {
                 return Ok(());
             }
         }
         if src == dst {
             return Ok(());
         }
-        self.ensure_state(src.max(dst) + 1)?;
-        for (planes, shape) in self.rows.iter().zip(&self.shapes) {
-            let Shape::State { stride, dtype } = *shape else {
-                continue;
-            };
-            let Some(arena) = planes.first() else {
-                continue;
-            };
-            let bytes = stride * u64::from(elem_size(dtype));
+        let (from, to) = (self.ensure_record(src)?, self.ensure_record(dst)?);
+        // A record moving to or from the host tier lands first.
+        self.fence_all_swaps(stream)?;
+        let bytes = self.fixed()?.slot.slot_bytes;
+        for (&from, &to) in from.iter().zip(&to) {
             crate::device::copy_d2d(
                 stream,
-                arena.span(u64::from(dst) * bytes, bytes)?,
-                arena.span(u64::from(src) * bytes, bytes)?,
+                self.chunks.span(Kind::Fixed, to, 0, bytes)?,
+                self.chunks.span(Kind::Fixed, from, 0, bytes)?,
+                usize::try_from(bytes).unwrap_or(0),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn fixed(&self) -> Result<&layout::FixedShape> {
+        self.chunks
+            .layout()
+            .fixed
+            .as_ref()
+            .ok_or_else(|| Fault::program("store::state", "a record named and no fixed shape"))
+    }
+
+    /// The lanes a fire's id tables are staged for and the entries of its
+    /// snapshot table: where each row's ids start in them.
+    pub fn seat_tables(&mut self, id_lanes: u32, snap_entries: u32) {
+        self.id_lanes = id_lanes.max(1);
+        self.snap_entries = snap_entries.max(1);
+    }
+
+    /// The ids a fire stages a lane for the recurrent rows.
+    #[must_use]
+    pub fn ids_a_lane(&self) -> u32 {
+        self.chunks
+            .layout()
+            .fixed
+            .as_ref()
+            .map_or(1, |fixed| fixed.ids_a_lane().max(1))
+    }
+
+    /// Names the record whose pieces lie in the slot refs `pieces`, for the
+    /// fires and copies that name it by its first.
+    pub fn name_record(&mut self, pieces: &[u32]) -> Result<u32> {
+        let want = self.fixed()?.pieces as usize;
+        let Some(&key) = pieces.first().filter(|_| pieces.len() == want) else {
+            return Err(Fault::program(
+                "store::state",
+                format!(
+                    "a record named by {} slot refs, and this load's takes {want}",
+                    pieces.len()
+                ),
+            ));
+        };
+        if want > 1 {
+            self.records.insert(key, pieces.to_vec());
+        }
+        Ok(key)
+    }
+
+    /// The slots of the record `key` names, in the record's order: the
+    /// refs a lane named it by, or, where lanes name state slots, the
+    /// slot's own run.
+    fn record(&self, key: u32) -> Result<Vec<u32>> {
+        let mut slots = Vec::new();
+        self.record_into(key, &mut slots)?;
+        Ok(slots)
+    }
+
+    /// [`Pools::record`] into `slots`, cleared first: a fire's lanes reuse
+    /// one buffer.
+    fn record_into(&self, key: u32, slots: &mut Vec<u32>) -> Result<()> {
+        slots.clear();
+        let pieces = self.fixed()?.pieces;
+        if !self.chunks.by_refs() {
+            slots.extend((0..pieces).map(|piece| key * pieces + piece));
+            return Ok(());
+        }
+        if pieces == 1 {
+            slots.push(key);
+            return Ok(());
+        }
+        let held = self.records.get(&key).ok_or_else(|| {
+            Fault::program(
+                "store::state",
+                format!("the record at slot ref {key} is read before a lane names its pieces"),
+            )
+        })?;
+        slots.extend_from_slice(held);
+        Ok(())
+    }
+
+    /// The record `key` names, its slots seated and backed.
+    fn ensure_record(&mut self, key: u32) -> Result<Vec<u32>> {
+        let slots = self.record(key)?;
+        self.seat_pages(Kind::Fixed, slots.iter().map(|&slot| u64::from(slot)))?;
+        Ok(slots)
+    }
+
+    /// The record's bytes as the host holds them, `(slot of the record,
+    /// offset, bytes)` in order: each recurrent row piece after piece.
+    fn record_spans(&self) -> Vec<(u32, u64, u64)> {
+        let Some(fixed) = self.chunks.layout().fixed.as_ref() else {
+            return Vec::new();
+        };
+        let mut spans = Vec::new();
+        for shape in &self.shapes {
+            let Shape::State { run, .. } = *shape else {
+                continue;
+            };
+            let row = &fixed.rows[run];
+            for (piece, &slot) in row.slots.iter().enumerate() {
+                spans.push((slot, row.offset, row.piece_bytes(piece as u32)));
+            }
+        }
+        spans
+    }
+
+    /// The staged id tables of a fire whose lanes name the records `keys`
+    /// (under zero: none): each table's block `id_lanes` lanes long, a
+    /// lane's ids its pieces' slots as the recurrent kernels read them.
+    /// Seats and backs each record.
+    pub fn state_tables(&mut self, keys: &[i32]) -> Result<Vec<i32>> {
+        if !self.has_state() {
+            return Ok(keys.to_vec());
+        }
+        let lanes = self.id_lanes as usize;
+        self.expand(keys, lanes)
+    }
+
+    /// A fire's snapshot slots, as [`Pools::state_tables`] lays a fire's
+    /// lanes: an entry a record a snapshot lands in.
+    pub fn snapshot_tables(&mut self, keys: &[i32]) -> Result<Vec<i32>> {
+        if !self.has_state() || keys.is_empty() {
+            return Ok(keys.to_vec());
+        }
+        let entries = self.snap_entries as usize;
+        self.expand(keys, entries)
+    }
+
+    fn expand(&mut self, keys: &[i32], rows: usize) -> Result<Vec<i32>> {
+        if keys.len() > rows {
+            return Err(Fault::Ceiling {
+                what: "records a fire's id tables name",
+                need: keys.len() as u64,
+                have: rows as u64,
+            });
+        }
+        // Each record seated and backed first; the ids are read after, the
+        // shape borrowed, a buffer of slots reused lane to lane.
+        let mut record = Vec::new();
+        for &key in keys.iter().filter(|&&key| key >= 0) {
+            self.state_row(key as u32)?;
+            self.record_into(key as u32, &mut record)?;
+            self.seat_pages(Kind::Fixed, record.iter().map(|&slot| u64::from(slot)))?;
+        }
+        let fixed = self.fixed()?;
+        // One table of one piece: the ids as the keys lie, no padding.
+        let single = fixed.tables.len() == 1 && fixed.tables[0].len() == 1;
+        let mut out = if single {
+            vec![-1i32; keys.len()]
+        } else {
+            vec![-1i32; rows * fixed.ids_a_lane() as usize]
+        };
+        // A table's block is `rows` lanes long: where it starts.
+        let block = if single { 0 } else { rows };
+        for (lane, &key) in keys.iter().enumerate() {
+            if key < 0 {
+                continue;
+            }
+            self.record_into(key as u32, &mut record)?;
+            let mut column = 0usize;
+            for table in &fixed.tables {
+                for (piece, &slot) in table.iter().enumerate() {
+                    out[column * block + lane * table.len() + piece] =
+                        self.chunks.page_id(Kind::Fixed, record[slot as usize])?;
+                }
+                column += table.len();
+            }
+        }
+        Ok(out)
+    }
+
+    /// The rs list as the chunk recipe lays it: the tokens a page holds, and
+    /// each rs row's run in a page, `(offset, bytes a token)`.
+    #[must_use]
+    pub fn rs_layout(&self) -> Option<(u32, Vec<(u64, u64)>)> {
+        self.chunks
+            .layout()
+            .rs
+            .as_ref()
+            .map(|rs| (rs.slot.tokens, rs.layers.clone()))
+    }
+
+    /// Seats the rs buffer pages `pages` on slots of the state pool and
+    /// backs the segments their chunks lie in.
+    pub fn seat_rs(&mut self, pages: &[u32]) -> Result<()> {
+        self.seat_pages(Kind::Rs, pages.iter().map(|&page| u64::from(page)))
+    }
+
+    /// The address of `bytes` at `offset` of rs buffer page `page`'s slot.
+    pub fn rs_span(&self, page: u32, offset: u64, bytes: u64) -> Result<u64> {
+        self.chunks.span(Kind::Rs, page, offset, bytes)
+    }
+
+    /// Copies whole slots of the shape `shape` names, `(src, dst)`, on
+    /// `stream`: a shared tail slot's rows onto the slot a fire then writes.
+    pub fn copy_whole_slots(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        shape: engine::chunk::ShapeId,
+        pairs: &[[u32; 2]],
+    ) -> Result<()> {
+        let kind = Self::kind_of(shape)?;
+        let bytes = self
+            .chunks
+            .layout()
+            .shape(kind)
+            .map(|shape| shape.slot_bytes)
+            .ok_or_else(|| {
+                Fault::program(
+                    "store::chunks",
+                    format!("a slot copy of a {} in a load that lays none", kind.name()),
+                )
+            })?;
+        self.seat_pages(kind, pairs.iter().flatten().map(|&slot| u64::from(slot)))?;
+        self.fence_all_swaps(stream)?;
+        for &[src, dst] in pairs {
+            if src == dst {
+                continue;
+            }
+            crate::device::copy_d2d(
+                stream,
+                self.chunks.span(kind, dst, 0, bytes)?,
+                self.chunks.span(kind, src, 0, bytes)?,
                 usize::try_from(bytes).unwrap_or(0),
             )?;
         }
@@ -1585,22 +1947,20 @@ impl Pools {
 
     /// The state rows of `slot`, backed first; none when the load keeps no state.
     pub fn state_spans(&mut self, slot: u32) -> Result<Vec<(u64, u64)>> {
-        if !slab_row(self.has_state(), self.paging.slots, slot)? {
+        if !self.state_row(slot)? {
             return Ok(Vec::new());
         }
-        self.ensure_state(slot + 1)?;
-        let mut spans = Vec::new();
-        for (planes, shape) in self.rows.iter().zip(&self.shapes) {
-            let Shape::State { stride, dtype } = *shape else {
-                continue;
-            };
-            let Some(arena) = planes.first() else {
-                continue;
-            };
-            let bytes = stride * u64::from(elem_size(dtype));
-            spans.push((arena.span(u64::from(slot) * bytes, bytes)?, bytes));
-        }
-        Ok(spans)
+        let record = self.ensure_record(slot)?;
+        self.record_spans()
+            .into_iter()
+            .map(|(piece, offset, bytes)| {
+                Ok((
+                    self.chunks
+                        .span(Kind::Fixed, record[piece as usize], offset, bytes)?,
+                    bytes,
+                ))
+            })
+            .collect()
     }
 
     /// Copies `moves` in the full rows and `windowed` (whole pages) in the
@@ -1631,18 +1991,27 @@ impl Pools {
         for span in moves {
             highest = highest.max(u64::from(span.src_page.max(span.dst_page)) + 1);
         }
-        self.ensure_kv(u32::try_from(highest).unwrap_or(u32::MAX))?;
+        self.kv_within(highest)?;
+        self.seat_pages(
+            Kind::List,
+            moves
+                .iter()
+                .flat_map(|span| [u64::from(span.src_page), u64::from(span.dst_page)]),
+        )?;
         self.ensure_windowed(
             windowed
                 .iter()
                 .flat_map(|span| [u64::from(span.src_page), u64::from(span.dst_page)]),
         )?;
-        for (planes, shape) in self.rows.iter().zip(&self.shapes) {
+        for shape in &self.shapes {
             let Shape::Kv {
                 windowed: in_window,
+                list,
                 dtype,
                 keys_width,
                 values_width,
+                values_plane,
+                offsets,
                 ..
             } = *shape
             else {
@@ -1650,7 +2019,7 @@ impl Pools {
             };
             let element = u64::from(elem_size(dtype));
             let moves = if in_window { windowed } else { moves };
-            for (at, arena) in planes.iter().enumerate() {
+            for (at, &offset) in offsets.iter().enumerate().take(values_plane + 1) {
                 let width = if at == 0 { keys_width } else { values_width };
                 let cell = width * element;
                 for span in moves {
@@ -1658,17 +2027,17 @@ impl Pools {
                         continue;
                     }
                     let bytes = u64::from(span.tokens) * cell;
-                    let src =
-                        (u64::from(span.src_page) * page_size + u64::from(span.src_token)) * cell;
-                    let dst =
-                        (u64::from(span.dst_page) * page_size + u64::from(span.dst_token)) * cell;
-                    if src == dst {
+                    let src = offset + u64::from(span.src_token) * cell;
+                    let dst = offset + u64::from(span.dst_token) * cell;
+                    if span.src_page == span.dst_page && src == dst {
                         continue;
                     }
                     crate::device::copy_d2d(
                         stream,
-                        arena.span(dst, bytes)?,
-                        arena.span(src, bytes)?,
+                        self.chunks
+                            .span(Kind::paged(list), span.dst_page, dst, bytes)?,
+                        self.chunks
+                            .span(Kind::paged(list), span.src_page, src, bytes)?,
                         usize::try_from(bytes).unwrap_or(0),
                     )?;
                 }
@@ -1680,29 +2049,37 @@ impl Pools {
     /// The paged planes a kv page spans and the bytes it holds in each: the
     /// full-context rows' key and value planes and the compressor slabs
     /// indexed by the same pages. Windowed rows name their own pages.
-    fn paged_planes(&self) -> Vec<(&Arena, u64)> {
+    fn paged_planes(&self) -> Vec<(PlaneAt, u64)> {
         let mut planes = self.kv_planes(false);
         planes.extend(self.pooled_planes(false));
         planes
     }
 
-    /// The compressor slabs keyed by a windowed space's pages (or not), and
+    /// The compressor slabs keyed by a windowed row's pages (or not), and
     /// the bytes a page holds in each.
-    fn pooled_planes(&self, windowed: bool) -> Vec<(&Arena, u64)> {
-        let page_size = u64::from(self.paging.page_size);
+    fn pooled_planes(&self, windowed: bool) -> Vec<(PlaneAt, u64)> {
+        let page_size = self.paging.page_size;
         self.pooled
             .iter()
             .filter(|row| row.windowed == windowed)
             .flat_map(|row| {
-                let bytes = page_size * row.width * u64::from(elem_size(POOL_STATE));
-                row.planes.iter().map(move |arena| (arena, bytes))
+                let bytes = row.plane_bytes(page_size);
+                (0..2).map(move |at| {
+                    (
+                        PlaneAt {
+                            kind: Kind::paged(row.list),
+                            offset: row.offset + at * bytes,
+                        },
+                        bytes,
+                    )
+                })
             })
             .collect()
     }
 
     /// The windowed planes a windowed page spans: the windowed kv rows' and
     /// the compressor slabs their pages key.
-    fn windowed_planes(&self) -> Vec<(&Arena, u64)> {
+    fn windowed_planes(&self) -> Vec<(PlaneAt, u64)> {
         let mut planes = self.kv_planes(true);
         planes.extend(self.pooled_planes(true));
         planes
@@ -1710,15 +2087,14 @@ impl Pools {
 
     /// The planes of the kv rows that are (or are not) `windowed`, and the
     /// bytes a page holds in each.
-    fn kv_planes(&self, windowed: bool) -> Vec<(&Arena, u64)> {
-        let page_size = u64::from(self.paging.page_size);
+    fn kv_planes(&self, windowed: bool) -> Vec<(PlaneAt, u64)> {
         let mut planes = Vec::new();
-        for (arenas, shape) in self.rows.iter().zip(&self.shapes) {
+        for shape in &self.shapes {
             let Shape::Kv {
                 windowed: in_window,
-                dtype,
-                keys_width,
-                values_width,
+                list,
+                values_plane,
+                offsets,
                 ..
             } = *shape
             else {
@@ -1727,12 +2103,1080 @@ impl Pools {
             if in_window != windowed {
                 continue;
             }
-            for (at, arena) in arenas.iter().enumerate() {
-                let width = if at == 0 { keys_width } else { values_width };
-                planes.push((arena, page_size * width * u64::from(elem_size(dtype))));
+            for (at, &offset) in offsets.iter().enumerate().take(values_plane + 1) {
+                planes.push((
+                    PlaneAt {
+                        kind: Kind::paged(list),
+                        offset,
+                    },
+                    shape.page_bytes(at, self.paging.page_size),
+                ));
             }
         }
         planes
+    }
+
+    /// The address of page `page`'s `bytes` in `plane`; the page is seated
+    /// and backed by the caller.
+    fn plane_span(&self, plane: PlaneAt, page: u32, bytes: u64) -> Result<u64> {
+        self.chunks.span(plane.kind, page, plane.offset, bytes)
+    }
+
+    /// Rewrites the page ids of a fire's table (list `list`'s: 0 the kv
+    /// list, `n` window list `n - 1`)
+    /// as the ids the paged kernels read their slots by; the fire's commit
+    /// has seated them.
+    pub fn page_ids(&self, list: u8, ids: &mut [i32]) -> Result<()> {
+        self.chunks.page_ids(Kind::paged(list), ids)
+    }
+
+    /// Whether the load keeps a recurrent record for state slot `slot`;
+    /// refused past the slots it seats, where lanes do not name slot refs.
+    fn state_row(&self, slot: u32) -> Result<bool> {
+        if self.chunks.by_refs() {
+            return Ok(self.has_state());
+        }
+        slab_row(self.has_state(), self.paging.slots, slot)
+    }
+
+    /// From here on lanes name their slots by slot ref
+    /// ([`chunks::Chunks::take_refs`]).
+    pub fn take_refs(&mut self) {
+        self.chunks.take_refs();
+    }
+
+    /// Whether lanes name slot refs.
+    #[must_use]
+    pub fn by_refs(&self) -> bool {
+        self.chunks.by_refs()
+    }
+
+    /// See `Engine::commit_segments`.
+    pub fn commit_segments(&mut self, segments: u32) -> Result<()> {
+        match self.chunks.commit_segments(&mut self.pool, segments)? {
+            Commit::Committed => Ok(()),
+            refusal => Err(refuse(&self.pool, refusal)),
+        }
+    }
+
+    /// See `Engine::release_segments`: the activation's span stays.
+    pub fn release_segments(&mut self, segments: u32) -> Result<()> {
+        // No move still landing reads or writes a chunk that goes.
+        self.settle_swaps()?;
+        self.chunks.release_segments(&mut self.pool, segments)
+    }
+
+    /// The chunks the fit left the cache rows, of the range's.
+    fn fitted_chunks(&self) -> u32 {
+        self.fitted.min(self.chunks.total())
+    }
+
+    /// See `Engine::evacuate`.
+    pub fn evacuate(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        evacuation: &engine::chunk::Evacuation,
+    ) -> Result<()> {
+        self.fence_all_swaps(stream)?;
+        self.chunks.evacuate(stream, evacuation)?;
+        // A cached atom's chunk may have moved: its table entry with it.
+        self.stage_row_tables(stream)?;
+        self.stage_expert_tables(stream)
+    }
+
+    /// The params of the routed banks streamed an expert at a time.
+    #[must_use]
+    pub fn expert_params(&self) -> Vec<u32> {
+        self.chunks
+            .layout()
+            .experts
+            .iter()
+            .flat_map(|shape| shape.banks.iter().flatten().map(|plane| plane.param))
+            .collect()
+    }
+
+    /// Opens the cache of each expert shape: `hosts` gives each bank's
+    /// mapped host copy by its param. No expert is cached yet; each is read
+    /// from the host copy.
+    ///
+    /// `groups` names each packed bank by its codes' param with the params
+    /// of its planes in the order its select's table lists them (the codes
+    /// first; `None` a plane the bank lacks): one table for the bank, an
+    /// expert's entry a plane. A plane in no group is a dense bank, a table
+    /// of its own.
+    pub fn seat_experts(
+        &mut self,
+        hosts: &[(u32, u64)],
+        groups: &[(u32, Vec<Option<u32>>)],
+    ) -> Result<()> {
+        self.expert_caches.clear();
+        for shape in &self.chunks.layout().experts {
+            let experts = shape.experts as usize;
+            let mut planes: Vec<ExpertBank> = Vec::new();
+            for (layer, bank) in shape.banks.iter().enumerate() {
+                let first = planes.len();
+                // A companion plane is read through its bank's table alone.
+                let companion = |param: u32| {
+                    groups.iter().any(|(codes, members)| {
+                        *codes != param && members.iter().any(|member| *member == Some(param))
+                    })
+                };
+                let mut counted = false;
+                for plane in bank {
+                    let Some(&(_, host)) = hosts.iter().find(|(param, _)| *param == plane.param)
+                    else {
+                        return Err(Fault::program(
+                            "store::experts",
+                            format!(
+                                "param {} streams by its experts and has no host copy",
+                                plane.param
+                            ),
+                        ));
+                    };
+                    let head = !companion(plane.param);
+                    // The planes its table lists, as places among the
+                    // layer's (resolved below, once all are known).
+                    let members = match groups.iter().find(|(codes, _)| *codes == plane.param) {
+                        Some((_, members)) => members.clone(),
+                        None => vec![Some(plane.param)],
+                    };
+                    planes.push(ExpertBank {
+                        plane: *plane,
+                        layer: layer as u32,
+                        host,
+                        head,
+                        members: members
+                            .iter()
+                            .map(|member| member.map(|param| param as usize))
+                            .collect(),
+                        table: crate::device::Buffer::zeroed(experts * members.len().max(1) * 8)?,
+                        // A layer's reads are counted at its first bank.
+                        hits: if head && !std::mem::replace(&mut counted, true) {
+                            Some(crate::device::Buffer::zeroed(experts * 4)?)
+                        } else {
+                            None
+                        },
+                        whole_rows: false,
+                    });
+                }
+                // Each member's param to its place among the cache's planes.
+                let places: Vec<(usize, usize)> = planes[first..]
+                    .iter()
+                    .enumerate()
+                    .map(|(at, held)| (held.plane.param as usize, first + at))
+                    .collect();
+                for held in &mut planes[first..] {
+                    for member in &mut held.members {
+                        if let Some(param) = *member {
+                            let place = places
+                                .iter()
+                                .find(|(held, _)| *held == param)
+                                .map(|&(_, place)| place)
+                                .ok_or_else(|| {
+                                    Fault::program(
+                                        "store::experts",
+                                        format!(
+                                            "param {param} is a plane of a bank whose experts \
+                                             the recipe does not lay it with"
+                                        ),
+                                    )
+                                })?;
+                            *member = Some(place);
+                        }
+                    }
+                }
+            }
+            self.expert_caches.push(ExpertCache {
+                shape: shape.clone(),
+                planes,
+                slots: vec![None; shape.count() as usize],
+            });
+        }
+        self.stage_expert_tables(core::ptr::null_mut())
+    }
+
+    /// Each bank's table as its experts now lie, written behind what
+    /// `stream` holds (a null stream: at once, before any fire).
+    fn stage_expert_tables(&mut self, stream: *mut core::ffi::c_void) -> Result<()> {
+        for at in 0..self.expert_caches.len() {
+            for bank in 0..self.expert_caches[at].planes.len() {
+                let cache = &self.expert_caches[at];
+                let held = &cache.planes[bank];
+                if !held.head {
+                    continue;
+                }
+                let first = (held.layer * cache.shape.experts) as usize;
+                // Arming's stand-in: the shape's first slot the pool holds.
+                let stand_in = self
+                    .stand_in
+                    .then(|| cache.slots.iter().flatten().next().copied())
+                    .flatten();
+                let mut entries =
+                    Vec::with_capacity(cache.shape.experts as usize * held.members.len() * 8);
+                let base = self.chunks.base();
+                let mut whole_rows = true;
+                for expert in 0..cache.shape.experts as usize {
+                    let slot = match cache.slots[first + expert].or(stand_in) {
+                        Some(slot) => Some(self.chunks.weight_slot(
+                            cache.shape.per_chunk,
+                            cache.shape.slot_bytes,
+                            slot,
+                        )?),
+                        None => None,
+                    };
+                    // An expert's entry a plane of the bank, in the order
+                    // its select lists them; 0 a plane the bank lacks.
+                    for member in &held.members {
+                        let address = match member.map(|place| &cache.planes[place]) {
+                            None => 0,
+                            Some(plane) => match slot {
+                                Some(slot) => {
+                                    let row = plane.plane.row;
+                                    whole_rows &= row > 0
+                                        && (slot + plane.plane.offset - base).is_multiple_of(row);
+                                    slot + plane.plane.offset
+                                }
+                                None => plane.host + expert as u64 * plane.plane.bytes,
+                            },
+                        };
+                        entries.extend_from_slice(&address.to_le_bytes());
+                    }
+                }
+                let held = &mut self.expert_caches[at].planes[bank];
+                held.whole_rows = whole_rows;
+                if stream.is_null() {
+                    held.table.write(0, &entries)?;
+                } else {
+                    held.table.stage(stream, 0, &entries)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The expert table of each streamed bank, by its param: what its
+    /// select reads its experts through. A bank whose experts all lie in
+    /// pool slots the runtime holds for the load's life is located, any
+    /// select's, where each entry is a whole number of its plane's rows past
+    /// the pool's base or no kernel of this device maps the window (a TMA
+    /// map indexes an entry by that row, `windows_mapped`); any other may
+    /// name the host copy by the next fire, or lies where no map row indexes
+    /// it, and is the plain-load selects' (a recorded body keeps the select
+    /// it chose).
+    #[must_use]
+    pub fn expert_tables(&self) -> Vec<(u32, kernels_cuda::linear::moe::ExpertTable)> {
+        let window = (self.chunks.base(), self.chunks.bytes());
+        self.expert_caches
+            .iter()
+            .flat_map(|cache| {
+                cache
+                    .planes
+                    .iter()
+                    .filter(|bank| bank.head)
+                    .map(move |bank| {
+                        let first = (bank.layer * cache.shape.experts) as usize;
+                        let located = (self.weights_held || self.preseated)
+                            && (bank.whole_rows || !windows_mapped())
+                            && cache.slots[first..first + cache.shape.experts as usize]
+                                .iter()
+                                .all(Option::is_some);
+                        (
+                            bank.plane.param,
+                            kernels_cuda::linear::moe::ExpertTable {
+                                table: bank.table.ptr(),
+                                hits: bank.hits.as_ref().map_or(0, crate::device::Buffer::ptr),
+                                located,
+                                window: if located { window } else { (0, 0) },
+                            },
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    /// Opens the cache of each row-streamed table: `hosts` gives each
+    /// table's mapped host copy by its param. Every block starts where that
+    /// copy has it, read in place until the runtime names a slot for it.
+    pub fn seat_rows(&mut self, hosts: &[(u32, u64)]) -> Result<()> {
+        self.row_caches.clear();
+        for shape in &self.chunks.layout().rows {
+            let Some(&(_, host)) = hosts.iter().find(|(param, _)| *param == shape.param) else {
+                return Err(Fault::program(
+                    "store::rows",
+                    format!(
+                        "param {} streams by its rows and has no host copy",
+                        shape.param
+                    ),
+                ));
+            };
+            let blocks = shape.blocks as usize;
+            let cache = RowCache {
+                shape: shape.clone(),
+                host,
+                table: crate::device::Buffer::zeroed(blocks * 8)?,
+                hits: crate::device::Buffer::zeroed(blocks * 4)?,
+                slots: vec![None; blocks],
+            };
+            self.row_caches.push(cache);
+        }
+        self.stage_row_tables(core::ptr::null_mut())
+    }
+
+    /// Each cache's table as its blocks now lie, written behind what
+    /// `stream` holds (a null stream: at once, before any fire).
+    fn stage_row_tables(&mut self, stream: *mut core::ffi::c_void) -> Result<()> {
+        for at in 0..self.row_caches.len() {
+            let cache = &self.row_caches[at];
+            let block = u64::from(cache.shape.block_rows) * cache.shape.row_bytes;
+            let mut entries = Vec::with_capacity(cache.slots.len() * 8);
+            let stand_in = self
+                .stand_in
+                .then(|| cache.slots.iter().flatten().next().copied())
+                .flatten();
+            for (atom, slot) in cache.slots.iter().enumerate() {
+                let address = match slot.as_ref().or(stand_in.as_ref()) {
+                    Some(slot) => self.chunks.row_slot(&cache.shape, *slot)?,
+                    None => cache.host + atom as u64 * block,
+                };
+                entries.extend_from_slice(&address.to_le_bytes());
+            }
+            let cache = &mut self.row_caches[at];
+            if stream.is_null() {
+                cache.table.write(0, &entries)?;
+            } else {
+                cache.table.stage(stream, 0, &entries)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The params of the tables streamed by their rows.
+    #[must_use]
+    pub fn row_params(&self) -> Vec<u32> {
+        self.chunks
+            .layout()
+            .rows
+            .iter()
+            .map(|rows| rows.param)
+            .collect()
+    }
+
+    /// The row table of each streamed table, by its param: what its gather
+    /// reads its rows through, counting each block's reads.
+    #[must_use]
+    pub fn row_tables(&self) -> Vec<(u32, kernels_cuda::linear::moe::RowTable)> {
+        self.row_caches
+            .iter()
+            .map(|cache| {
+                (
+                    cache.shape.param,
+                    kernels_cuda::linear::moe::RowTable::located(
+                        cache.table.ptr(),
+                        cache.shape.block_rows,
+                    )
+                    .counting(cache.hits.ptr()),
+                )
+            })
+            .collect()
+    }
+
+    /// See `Engine::weight_residency`: the blocks newly named a slot are
+    /// filled from the host copy and every table rewritten, on `stream`
+    /// behind the fires it holds and before the next. A block no longer
+    /// named is read from the host copy again. Returns whether a bank's
+    /// table became located or stopped being so: the selects a recorded
+    /// body chose for it are then not the ones a fire would choose.
+    pub fn weight_residency(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        residency: &engine::chunk::WeightResidency,
+    ) -> Result<bool> {
+        if self.weights_held && !residency.held {
+            return Err(Fault::Unbound {
+                what: "a weight residency that is not held after one that was: a held set \
+                       is the load's for life"
+                    .to_string(),
+            });
+        }
+        let located = |pools: &Pools| -> Vec<bool> {
+            pools
+                .expert_tables()
+                .iter()
+                .map(|(_, table)| table.located)
+                .collect()
+        };
+        if self.weights_filed {
+            let named = |shape: engine::chunk::ShapeId| {
+                residency
+                    .resident
+                    .iter()
+                    .filter(|resident| resident.atom.shape == shape)
+                    .count()
+            };
+            let whole = self
+                .row_caches
+                .iter()
+                .map(|cache| (cache.shape.id, cache.slots.len()))
+                .chain(
+                    self.expert_caches
+                        .iter()
+                        .map(|cache| (cache.shape.id, cache.slots.len())),
+                )
+                .all(|(shape, atoms)| named(shape) >= atoms);
+            if !residency.held || !whole {
+                // The load was told its weights would be held, and the
+                // runtime streams them after all (its pool does not seat
+                // every atom): the copy a miss is read from is made now.
+                self.pin_weight_hosts()?;
+            }
+        }
+        let before = located(self);
+        // An atom the load seated that the runtime names another slot for
+        // is filled there again: said, since a runtime that adopted the
+        // load's seating moves none.
+        if self.preseated {
+            let moved = residency
+                .resident
+                .iter()
+                .filter(|resident| {
+                    self.row_caches
+                        .iter()
+                        .map(|cache| (cache.shape.id, &cache.slots))
+                        .chain(
+                            self.expert_caches
+                                .iter()
+                                .map(|cache| (cache.shape.id, &cache.slots)),
+                        )
+                        .find(|(id, _)| *id == resident.atom.shape)
+                        .and_then(|(_, slots)| slots.get(resident.atom.atom as usize))
+                        .is_some_and(|held| *held != Some(resident.slot))
+                })
+                .count();
+            if moved > 0 {
+                eprintln!(
+                    "engine-cuda: the first weight residency names {moved} of {} atoms a slot \
+                     other than the one the load seated them in (`WeightShape::seated`); each \
+                     is read from the serving file again",
+                    residency.resident.len()
+                );
+            }
+        }
+        // The runtime's set stands from here on, the load's own no longer.
+        self.preseated = false;
+        self.weights_held = residency.held;
+        for at in 0..self.row_caches.len() {
+            let shape = self.row_caches[at].shape.clone();
+            let mut named: Vec<Option<u32>> = vec![None; shape.blocks as usize];
+            for resident in residency
+                .resident
+                .iter()
+                .filter(|resident| resident.atom.shape == shape.id)
+            {
+                let Some(seat) = named.get_mut(resident.atom.atom as usize) else {
+                    return Err(Fault::Ceiling {
+                        what: "row blocks of a streamed table",
+                        need: u64::from(resident.atom.atom) + 1,
+                        have: u64::from(shape.blocks),
+                    });
+                };
+                *seat = Some(resident.slot);
+            }
+            let block = u64::from(shape.block_rows) * shape.row_bytes;
+            let table_bytes = shape.rows * shape.row_bytes;
+            let host = self.row_caches[at].host;
+            let mut fills = Vec::new();
+            for (atom, slot) in named.iter().enumerate() {
+                let Some(slot) = *slot else { continue };
+                if self.row_caches[at].slots[atom] == Some(slot) {
+                    continue;
+                }
+                let from = atom as u64 * block;
+                let bytes = block.min(table_bytes.saturating_sub(from));
+                fills.push((
+                    self.chunks.row_slot(&shape, slot)?,
+                    host + from,
+                    usize::try_from(bytes).unwrap_or(0),
+                ));
+            }
+            self.fill_weights(stream, &fills)?;
+            self.row_caches[at].slots = named;
+        }
+        for at in 0..self.expert_caches.len() {
+            let shape = self.expert_caches[at].shape.clone();
+            let mut named: Vec<Option<u32>> = vec![None; shape.count() as usize];
+            for resident in residency
+                .resident
+                .iter()
+                .filter(|resident| resident.atom.shape == shape.id)
+            {
+                let Some(seat) = named.get_mut(resident.atom.atom as usize) else {
+                    return Err(Fault::Ceiling {
+                        what: "experts of a streamed shape",
+                        need: u64::from(resident.atom.atom) + 1,
+                        have: u64::from(shape.count()),
+                    });
+                };
+                *seat = Some(resident.slot);
+            }
+            let mut fills = Vec::new();
+            for (atom, slot) in named.iter().enumerate() {
+                let Some(slot) = *slot else { continue };
+                if self.expert_caches[at].slots[atom] == Some(slot) {
+                    continue;
+                }
+                let (layer, expert) = (
+                    atom as u32 / shape.experts,
+                    u64::from(atom as u32 % shape.experts),
+                );
+                let to = self
+                    .chunks
+                    .weight_slot(shape.per_chunk, shape.slot_bytes, slot)?;
+                for bank in self.expert_caches[at]
+                    .planes
+                    .iter()
+                    .filter(|bank| bank.layer == layer)
+                {
+                    fills.push((
+                        to + bank.plane.offset,
+                        bank.host + expert * bank.plane.bytes,
+                        usize::try_from(bank.plane.bytes).unwrap_or(0),
+                    ));
+                }
+            }
+            self.fill_weights(stream, &fills)?;
+            self.expert_caches[at].slots = named;
+        }
+        self.stage_row_tables(stream)?;
+        self.stage_expert_tables(stream)?;
+        Ok(before != located(self))
+    }
+
+    /// The chunks `residency` names weight slots in.
+    #[must_use]
+    pub fn weight_chunks(
+        &self,
+        residency: &engine::chunk::WeightResidency,
+    ) -> std::collections::BTreeSet<u32> {
+        let per_chunk = |shape: engine::chunk::ShapeId| {
+            self.row_caches
+                .iter()
+                .map(|cache| (cache.shape.id, cache.shape.per_chunk))
+                .chain(
+                    self.expert_caches
+                        .iter()
+                        .map(|cache| (cache.shape.id, cache.shape.per_chunk)),
+                )
+                .find(|(id, _)| *id == shape)
+                .map(|(_, per_chunk)| per_chunk.max(1))
+        };
+        residency
+            .resident
+            .iter()
+            .filter_map(|resident| Some(resident.slot / per_chunk(resident.atom.shape)?))
+            .collect()
+    }
+
+    /// Whether a page this pool seated for a lane lies in one of `chunks`.
+    #[must_use]
+    pub fn seated_in(&self, chunks: &std::collections::BTreeSet<u32>) -> bool {
+        self.chunks.seated_in(chunks)
+    }
+
+    /// See [`chunks::Chunks::keep_clear`].
+    pub fn keep_clear(&mut self, chunks: std::collections::BTreeSet<u32>) {
+        self.chunks.keep_clear(chunks);
+    }
+
+    /// Fills weight slots from the host copies, `(slot, host, bytes)` each.
+    fn fill_weights(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        fills: &[(u64, u64, usize)],
+    ) -> Result<()> {
+        if self.hosts_dropped && !fills.is_empty() {
+            return Err(Fault::Unbound {
+                what: "a weight atom named a new slot after the held set's host copy was \
+                       dropped: a held atom stays where it was named"
+                    .to_string(),
+            });
+        }
+        if self.weights_filed {
+            // Pageable memory: a copy a span, staged by the runtime. A span
+            // of the serving file's mapping is let go once copied; one of a
+            // held load's pageable copy (its laid planes, beside planes left
+            // in the file) is no file's pages, and letting it go would zero it.
+            for &(slot, file, bytes) in fills {
+                crate::device::copy_any(stream, slot, file, bytes)?;
+                if !crate::device::alloc::in_pageable_copy(file) {
+                    self.file_spans.push((file, bytes));
+                }
+            }
+            return Ok(());
+        }
+        crate::device::copy_batch(stream, false, fills)
+    }
+
+    /// The caches' host copies are the serving file's mapping: a slot is
+    /// filled from it, and no atom is read where it lies. A residency that
+    /// does not hold every atom makes the copy a miss is read from first
+    /// ([`Pools::pin_weight_hosts`]).
+    pub fn file_weights(&mut self) {
+        self.weights_filed = true;
+    }
+
+    /// Whether a span of the serving file's mapping was copied out since
+    /// its pages were last let go.
+    #[must_use]
+    pub fn copied_from_file(&self) -> bool {
+        !self.file_spans.is_empty()
+    }
+
+    /// Lets go of the pages of the serving file's mapping that were copied
+    /// out of it (into pool slots, or the pinned copy): they are read again
+    /// only to fill a slot, from the page cache. The copies have landed
+    /// (the caller synchronized the stream that carried them).
+    pub fn release_file_pages(&mut self) {
+        const PAGE: u64 = 4096;
+        for (at, bytes) in std::mem::take(&mut self.file_spans) {
+            let first = at.next_multiple_of(PAGE);
+            let end = (at + bytes as u64) / PAGE * PAGE;
+            if end > first {
+                // SAFETY: whole pages inside a read-only file mapping the
+                // weight store holds for the load's life; the advice drops
+                // their resident copies, which a later read faults back in.
+                unsafe {
+                    libc::madvise(
+                        first as *mut core::ffi::c_void,
+                        (end - first) as usize,
+                        libc::MADV_DONTNEED,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The bytes every weight the caches state takes in the pool: each
+    /// shape's atoms in whole chunks of its own, as
+    /// [`Pools::preseat_plan`] seats them.
+    #[must_use]
+    pub fn weight_pool_bytes(&self) -> u64 {
+        let chunks: u64 = self
+            .row_caches
+            .iter()
+            .map(|cache| (cache.shape.per_chunk, cache.slots.len()))
+            .chain(
+                self.expert_caches
+                    .iter()
+                    .map(|cache| (cache.shape.per_chunk, cache.slots.len())),
+            )
+            .map(|(per_chunk, atoms)| (atoms as u64).div_ceil(u64::from(per_chunk.max(1))))
+            .sum();
+        chunks.saturating_mul(self.chunks.layout().chunk_bytes)
+    }
+
+    /// The residency a load seats its weights by before the runtime names
+    /// any slot: every atom of every shape, each shape's in chunks of its
+    /// own from the pool's first on. `None` where the pool cannot hold them
+    /// all with a chunk to spare: the load then keeps a copy its fires read
+    /// in place ([`Pools::pin_weight_hosts`]), and the runtime decides what
+    /// a pool that small may serve.
+    #[must_use]
+    pub fn preseat_plan(&self) -> Option<engine::chunk::WeightResidency> {
+        let shapes = self
+            .row_caches
+            .iter()
+            .map(|cache| (cache.shape.id, cache.shape.per_chunk, cache.slots.len()))
+            .chain(
+                self.expert_caches
+                    .iter()
+                    .map(|cache| (cache.shape.id, cache.shape.per_chunk, cache.slots.len())),
+            );
+        let mut first = 1u32;
+        let mut resident = Vec::new();
+        for (shape, per_chunk, atoms) in shapes {
+            let per_chunk = per_chunk.max(1);
+            resident.extend((0..atoms as u32).map(|atom| engine::chunk::ResidentWeight {
+                atom: engine::chunk::WeightAtom { shape, atom },
+                slot: first * per_chunk + atom,
+            }));
+            first = first.checked_add((atoms as u32).div_ceil(per_chunk))?;
+        }
+        // No more chunks than the fit left the pool (a stated
+        // `device_kv_budget` is all of it): the range is limited to them,
+        // under whatever was seated past it.
+        let most = self.fitted_chunks();
+        (first < most).then_some(engine::chunk::WeightResidency {
+            staging: Vec::new(),
+            resident,
+            held: true,
+        })
+    }
+
+    /// Seats the load's weights by `plan` ([`Pools::preseat_plan`]): the
+    /// slots' segments backed, each filled from the serving file, the
+    /// tables located. The load arms over them; the runtime's first
+    /// residency then names the slots it chose, and an atom it puts
+    /// elsewhere is filled there again.
+    pub fn preseat_weights(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        plan: &engine::chunk::WeightResidency,
+    ) -> Result<()> {
+        let segment = self.chunks.layout().segment_chunks.max(1);
+        let last = self.weight_chunks(plan).into_iter().max().unwrap_or(0);
+        self.commit_segments((last + 1).div_ceil(segment))?;
+        self.weight_residency(stream, plan)?;
+        self.weights_held = false;
+        self.preseated = true;
+        Ok(())
+    }
+
+    /// Gives the caches a copy a fire can read a miss from, out of the
+    /// serving file's mapping they were left in (or the pageable copy a load
+    /// told its weights are held made): the mapping itself where
+    /// the device faults mapped pages in, else a pinned copy of every
+    /// streamed table and bank, refused where the machine has not the
+    /// memory for it.
+    pub fn pin_weight_hosts(&mut self) -> Result<()> {
+        self.weights_filed = false;
+        if crate::experts::pageable_access() {
+            return Ok(());
+        }
+        let align = |bytes: u64| bytes.next_multiple_of(crate::weights::ALIGN);
+        // Each copy's place in the pinned span, its source and its bytes.
+        let mut spans: Vec<(u64, u64, u64)> = Vec::new();
+        let mut total = 0u64;
+        let mut lay = |file: u64, bytes: u64, total: &mut u64| {
+            spans.push((*total, file, bytes));
+            *total += align(bytes);
+        };
+        for cache in &self.row_caches {
+            lay(
+                cache.host,
+                cache.shape.rows * cache.shape.row_bytes,
+                &mut total,
+            );
+        }
+        for cache in &self.expert_caches {
+            for bank in &cache.planes {
+                lay(
+                    bank.host,
+                    u64::from(cache.shape.experts) * bank.plane.bytes,
+                    &mut total,
+                );
+            }
+        }
+        let have = crate::weights::available_memory();
+        if total > have {
+            return Err(Fault::Residency(format!(
+                "the runtime streams this load's weights, which needs a pinned host copy of \
+                 them, {:.1} GiB, and this machine has {:.1} GiB of memory left for it. Give \
+                 the pool room to hold them all (`weight_streaming = \"off\"` with a larger \
+                 device share), or use a device with pageable memory access (HMM).",
+                total as f64 / f64::from(1u32 << 30),
+                have as f64 / f64::from(1u32 << 30),
+            )));
+        }
+        let pinned =
+            crate::device::Pinned::mapped_uninit(usize::try_from(total).unwrap_or(usize::MAX))?;
+        for &(at, file, bytes) in &spans {
+            let len = usize::try_from(bytes).unwrap_or(usize::MAX);
+            // SAFETY: `file` and `bytes` are a plane of the serving file's
+            // mapping the weight store bound and holds for the load's life.
+            let plane = unsafe { core::slice::from_raw_parts(file as *const u8, len) };
+            if !pinned.write(usize::try_from(at).unwrap_or(usize::MAX), plane) {
+                return Err(Fault::program(
+                    "store::weights",
+                    "a streamed weight does not fit the pinned copy sized for it",
+                ));
+            }
+            self.file_spans.push((file, len));
+        }
+        let base = pinned.device();
+        let mut copies = spans.iter().map(|&(at, _, _)| base + at);
+        for cache in &mut self.row_caches {
+            cache.host = copies.next().unwrap_or(cache.host);
+        }
+        for cache in &mut self.expert_caches {
+            for bank in &mut cache.planes {
+                bank.host = copies.next().unwrap_or(bank.host);
+            }
+        }
+        eprintln!(
+            "engine-cuda: the runtime streams weights this load was told it would hold; {} \
+             MiB of them pinned on the host from the serving file, for misses",
+            total >> 20
+        );
+        self.miss_copy = Some(pinned);
+        // The tables name the copy from here on: at once, where no fire has
+        // read them yet (a load that seats none of its weights arms over
+        // the copy); a residency restages them behind its stream after.
+        self.stage_row_tables(core::ptr::null_mut())?;
+        self.stage_expert_tables(core::ptr::null_mut())?;
+        Ok(())
+    }
+
+    /// The params whose host copies no fire reads and no fill needs again:
+    /// every streamed table and bank, where the runtime holds the set for
+    /// the load's life and it names every atom. Empty otherwise.
+    #[must_use]
+    pub fn held_weights(&self) -> Vec<usize> {
+        let whole = self.weights_held
+            && self
+                .row_caches
+                .iter()
+                .map(|cache| &cache.slots)
+                .chain(self.expert_caches.iter().map(|cache| &cache.slots))
+                .all(|slots| slots.iter().all(Option::is_some));
+        if !whole {
+            return Vec::new();
+        }
+        self.row_params()
+            .into_iter()
+            .chain(self.expert_params())
+            .map(|param| param as usize)
+            .collect()
+    }
+
+    /// The host copies are gone: nothing is filled from them again.
+    pub fn drop_weight_hosts(&mut self) {
+        self.hosts_dropped = true;
+    }
+
+    /// Arming over a streamed set reads every atom on the host copy through
+    /// a slot of its shape the pool holds (`on`), and the tables are staged
+    /// so at once; off, as they lie. A synthetic fire's rows are never read
+    /// back, so what the slot holds does not matter, and nothing it records
+    /// names an entry: a body reads the table as it stands when it replays.
+    /// The tables stay unlocated either way, so a body takes the select
+    /// that reads the host copy.
+    pub fn stand_in(&mut self, on: bool) -> Result<()> {
+        self.stand_in = on;
+        self.stage_row_tables(core::ptr::null_mut())?;
+        self.stage_expert_tables(core::ptr::null_mut())
+    }
+
+    /// Whether every atom of every weight shape lies in a pool slot (true
+    /// where the load states none).
+    #[must_use]
+    pub fn weights_seated_whole(&self) -> bool {
+        self.row_caches
+            .iter()
+            .all(|cache| cache.slots.iter().all(Option::is_some))
+            && self
+                .expert_caches
+                .iter()
+                .all(|cache| cache.slots.iter().all(Option::is_some))
+    }
+
+    /// Whether every streamed bank's table is located: each expert in a
+    /// slot of a set that is held.
+    #[must_use]
+    pub fn weights_located(&self) -> bool {
+        self.expert_tables().iter().all(|(_, table)| table.located)
+    }
+
+    /// The row-streamed tables' blocks named a slot, and all of them.
+    #[must_use]
+    pub fn row_blocks(&self) -> (u64, u64) {
+        self.row_caches.iter().fold((0, 0), |(named, all), cache| {
+            (
+                named + cache.slots.iter().flatten().count() as u64,
+                all + cache.slots.len() as u64,
+            )
+        })
+    }
+
+    /// Zeroes the use record on `stream`, behind the fires that counted:
+    /// what the shell's own synthetic fires read (arming the lattice) is
+    /// no use the runtime orders its weight cache by. Waits for the
+    /// stream, so no snapshot taken before lands after the record restarts.
+    pub fn forget_weight_uses(&mut self, stream: *mut core::ffi::c_void) -> Result<()> {
+        for (at, bytes) in self.counters() {
+            crate::device::zero_span_on(stream, at, bytes)?;
+        }
+        crate::device::ctx::sync(stream)?;
+        if let Some(record) = &mut self.use_record {
+            record.host.zero();
+            record.base.fill(0);
+        }
+        Ok(())
+    }
+
+    /// Every read counter of the caches as `(device address, bytes)`: a
+    /// row cache's a block, an expert bank's an expert, in the order
+    /// [`Pools::weight_uses`] reads them.
+    fn counters(&self) -> Vec<(u64, usize)> {
+        self.row_caches
+            .iter()
+            .map(|cache| (cache.hits.ptr(), cache.slots.len() * 4))
+            .chain(self.expert_caches.iter().flat_map(|cache| {
+                let experts = cache.shape.experts as usize;
+                cache
+                    .planes
+                    .iter()
+                    .filter_map(move |bank| bank.hits.as_ref().map(|hits| (hits.ptr(), experts * 4)))
+            }))
+            .collect()
+    }
+
+    /// See `Engine::weight_uses`: each block's reads since the last call.
+    /// The counters run on (never zeroed but by
+    /// [`Pools::forget_weight_uses`]); each call enqueues a snapshot of them
+    /// into mapped host memory on `stream` behind the fires that counted,
+    /// and answers with what the previous call's snapshot holds past the
+    /// one before it. No call waits for the stream, so the record lags a
+    /// call behind the fires, which the runtime's windows of several calls
+    /// absorb.
+    pub fn weight_uses(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<engine::chunk::WeightUses> {
+        let counters = self.counters();
+        if self.use_record.is_none() {
+            let bytes: usize = counters.iter().map(|&(_, bytes)| bytes).sum();
+            let host = crate::device::Pinned::mapped(bytes.max(4))?;
+            host.zero();
+            self.use_record = Some(UseRecord {
+                host,
+                base: vec![0; bytes / 4],
+            });
+        }
+        let record = self.use_record.as_mut().expect("the use record was just made");
+        let mut reads = Vec::with_capacity(record.base.len());
+        for (at, base) in record.base.iter_mut().enumerate() {
+            // SAFETY: inside the record's mapped host span; a snapshot copy
+            // may land meanwhile, and an aligned u32 is read whole.
+            let now = unsafe { record.host.host().cast::<u32>().add(at).read_volatile() };
+            reads.push(now.wrapping_sub(*base));
+            *base = now;
+        }
+        let mut spans = Vec::with_capacity(counters.len());
+        let mut into = record.host.host() as u64;
+        for &(at, bytes) in &counters {
+            spans.push((into, at, bytes));
+            into += bytes as u64;
+        }
+        crate::device::copy_batch(stream, true, &spans)?;
+        let mut uses = Vec::new();
+        let mut reads = reads.into_iter();
+        for cache in &self.row_caches {
+            for (atom, reads) in reads.by_ref().take(cache.slots.len()).enumerate() {
+                if reads > 0 {
+                    uses.push((
+                        engine::chunk::WeightAtom {
+                            shape: cache.shape.id,
+                            atom: atom as u32,
+                        },
+                        reads,
+                    ));
+                }
+            }
+        }
+        for cache in &self.expert_caches {
+            let experts = cache.shape.experts as usize;
+            for bank in cache.planes.iter().filter(|bank| bank.hits.is_some()) {
+                for (expert, reads) in reads.by_ref().take(experts).enumerate() {
+                    if reads > 0 {
+                        uses.push((
+                            engine::chunk::WeightAtom {
+                                shape: cache.shape.id,
+                                atom: bank.layer * cache.shape.experts + expert as u32,
+                            },
+                            reads,
+                        ));
+                    }
+                }
+            }
+        }
+        let held = self
+            .row_caches
+            .iter()
+            .map(|cache| (cache.shape.id, &cache.slots))
+            .chain(
+                self.expert_caches
+                    .iter()
+                    .map(|cache| (cache.shape.id, &cache.slots)),
+            )
+            .map(|(shape, slots)| {
+                let resident = slots.iter().flatten().count() as u32;
+                engine::chunk::WeightHeld {
+                    shape,
+                    resident,
+                    host: slots.len() as u32 - resident,
+                }
+            })
+            .collect();
+        Ok(engine::chunk::WeightUses { uses, held })
+    }
+
+    /// The state pool as the runtime counts it, for fires of up to
+    /// `max_tokens`: the chunks the fit left the cache rows, and the
+    /// activation's right above them, the chunks past the fit skipped
+    /// ([`chunks::Chunks::skip_past`]).
+    ///
+    /// `rungs`, each smaller rung's tokens and the bytes at the bottom of
+    /// the activation's span state may take at it (backed already), each
+    /// stated as the activation's chunks less those.
+    pub fn chunk_facts(
+        &mut self,
+        max_tokens: u32,
+        rungs: &[(u32, u64)],
+    ) -> Result<engine::chunk::ChunkFacts> {
+        let fitted = self.fitted_chunks();
+        self.chunks.limit(fitted);
+        self.chunks.skip_past(fitted);
+        // The state's chunks of the segment the stated activation starts in
+        // are backed from here on, as the runtime counts them.
+        match self.chunks.hold_boundary(&mut self.pool)? {
+            Commit::Committed => {}
+            refusal => return Err(refuse(&self.pool, refusal)),
+        }
+        let chunk = self.chunks.layout().chunk_bytes.max(1);
+        let act = self.chunks.act_chunks();
+        let rungs: Vec<(u32, u32)> = rungs
+            .iter()
+            .map(|&(tokens, under)| {
+                let under = u32::try_from(under / chunk).unwrap_or(u32::MAX);
+                (tokens, act.saturating_sub(under).max(1))
+            })
+            .collect();
+        let mut facts = self
+            .chunks
+            .facts(max_tokens, !elastic::mapped_on_demand(), &rungs);
+        // Where the load seated the weights itself, for a runtime to adopt.
+        if self.preseated {
+            for shape in &mut facts.weights {
+                shape.seated = self
+                    .row_caches
+                    .iter()
+                    .map(|cache| (cache.shape.id, &cache.slots))
+                    .chain(
+                        self.expert_caches
+                            .iter()
+                            .map(|cache| (cache.shape.id, &cache.slots)),
+                    )
+                    .find(|(id, _)| *id == shape.id)
+                    .and_then(|(_, slots)| slots.first().copied().flatten());
+            }
+        }
+        facts.host_chunks = self.tier_chunks();
+        facts.disk_chunks = self.disk_chunks();
+        facts.disk_kept = self.disk_kept();
+        Ok(facts)
+    }
+
+    /// Refuses a page count past the pool's.
+    fn kv_within(&self, pages: u64) -> Result<()> {
+        let capacity = self.paging.pages();
+        if pages > capacity && !self.chunks.by_refs() {
+            return Err(Fault::Ceiling {
+                what: "kv pages",
+                need: pages,
+                have: capacity,
+            });
+        }
+        Ok(())
     }
 
     /// Backs every page and slot the pools declare, at load, and keeps them
@@ -1741,30 +3185,30 @@ impl Pools {
     /// seconds, and a worker taking a dead peer's turns needs new pages then
     /// above all.
     pub fn back_whole(&mut self) -> Result<()> {
-        let pages = u32::try_from(self.paging.pages()).unwrap_or(u32::MAX);
-        let slots = if self.has_state() {
-            self.paging.slots
-        } else {
-            0
-        };
-        match self.commit_to(pages, slots)? {
+        // Every segment the fitted pool's chunks lie in, the last as far
+        // as they reach: the range is reserved for more than the fit left
+        // the cache rows.
+        let fitted = self.fitted_chunks();
+        self.chunks.limit(fitted);
+        match self
+            .chunks
+            .commit_segments(&mut self.pool, self.chunks.segments_for(u64::from(fitted)))?
+        {
             Commit::Committed => {}
             refusal => return Err(refuse(&self.pool, refusal)),
         }
-        self.note_backed(&[(0, u64::from(pages))]);
-        self.ensure_windowed(0..self.paging.window_pages())?;
         self.whole = true;
         Ok(())
     }
 
     /// The kv planes as another worker reads them: every declared page, one
     /// region per paged plane, a page `p` at `base + p * page_stride`. A
-    /// windowed space is refused: its pages are named by its own ring, not by
-    /// the kv pages a peer reads.
+    /// windowed row is refused: its pages are named by its own window list, not
+    /// by the kv pages a peer reads.
     pub fn export_kv(&mut self, ordinal: u32) -> Result<ExportedKv> {
         if !self.windowed_planes().is_empty() {
             return Err(Fault::Residency(
-                "a windowed kv space names its pages by its own ring, so it cannot be \
+                "a windowed kv row names its pages by its own window list, so it cannot be \
                  handed to another worker by the kv pages it reads"
                     .to_string(),
             ));
@@ -1772,14 +3216,20 @@ impl Pools {
         if !self.whole {
             self.back_whole()?;
         }
-        let pages = u32::try_from(self.paging.pages()).unwrap_or(u32::MAX);
         let mut regions = Vec::new();
-        for (arena, page_bytes) in self.paged_planes() {
-            let len = u64::from(pages) * page_bytes;
+        // A kv plane's region is the pool from the plane's offset in a
+        // slot on: the page a slot ref `r` names starts `r` strides in,
+        // while its chunk lies where it was opened.
+        let grain = self
+            .chunks
+            .layout()
+            .shape(Kind::List)
+            .map_or(0, |shape| shape.grain);
+        for (plane, _) in self.paged_planes() {
             regions.push(engine::KvRegion {
-                base: arena.span(0, len)?,
-                len,
-                page_stride: page_bytes,
+                base: self.chunks.base() + plane.offset,
+                len: self.chunks.bytes().saturating_sub(plane.offset),
+                page_stride: grain,
                 domain: engine::MemoryDomain::CudaDevice(ordinal),
             });
         }
@@ -1834,56 +3284,439 @@ impl Pools {
         self.paged_planes().iter().map(|&(_, bytes)| bytes).sum()
     }
 
-    /// Seats `pages` host kv pages, `window_pages` host windowed pages and
-    /// `rows` host rs rows of `row_bytes`, each pinned a chunk at a time as a
-    /// copy first touches it ([`Shelf`]), on reserved huge pages where the
-    /// host keeps a pool that holds them. Pinning at once would hold boot for
-    /// as long as the driver takes to pin it all, and when a process dies the
-    /// driver unpins its memory under a lock every process on the host waits
-    /// on for any allocation, about 0.17 s a GiB of 4 KiB pages and a fifth
-    /// of that of huge ones.
-    pub fn seat_host(
-        &mut self,
-        pages: u32,
-        window_pages: u32,
-        rows: u32,
-        row_bytes: u64,
-    ) -> Result<()> {
-        let rows = if row_bytes == 0 { 0 } else { rows };
-        let planes = |planes: Vec<(&Arena, u64)>| planes.into_iter().map(|(_, b)| b).collect();
-        let host = HostKv {
-            paged: Shelf::new(planes(self.paged_planes()), pages),
-            windowed: Shelf::new(planes(self.windowed_planes()), window_pages),
-            rows: Shelf::new(vec![row_bytes], rows),
+    /// Seats the host tier of `budget` bytes: as many whole chunks of the
+    /// state pool's size, in pageable memory the tier commits as moves
+    /// first write it, behind a page-locked staging ring sized for a device
+    /// pool of `device` bytes ([`host::staging_ring`]).
+    pub fn seat_tier(&mut self, budget: u64, device: u64) -> Result<()> {
+        // No more than the machine has free, known now: a tier stated larger
+        // would fail mid-serve, at the first move past what the host holds.
+        let free = crate::weights::available_memory();
+        let budget = if budget > free {
+            eprintln!(
+                "engine-cuda: WARNING: the host tier's budget of {} MiB is more than this \
+                 machine has free ({} MiB); the tier is seated with {} MiB",
+                budget >> 20,
+                free >> 20,
+                free >> 20
+            );
+            free
+        } else {
+            budget
         };
-        self.host = (pages > 0 || window_pages > 0 || rows > 0).then_some(host);
+        let chunk = self.chunks.layout().chunk_bytes;
+        let chunks = u32::try_from(budget.checked_div(chunk).unwrap_or(0)).unwrap_or(u32::MAX);
+        self.tier = match chunks {
+            0 => None,
+            chunks => Some(host::HostTier::new(
+                chunk,
+                chunks,
+                host::staging_ring(device, budget),
+            )?),
+        };
         Ok(())
     }
 
+    /// The host tier's chunks.
     #[must_use]
-    pub fn host_window_pages(&self) -> u32 {
-        self.host.as_ref().map_or(0, |host| host.windowed.slots)
+    pub fn tier_chunks(&self) -> u32 {
+        self.tier.as_ref().map_or(0, host::HostTier::chunks)
     }
 
-    /// The host rs rows seated and the bytes of one.
+    /// The kv list's slots the slot file holds, in whole chunks of them.
     #[must_use]
-    pub fn host_rows(&self) -> (u32, u64) {
-        self.host
-            .as_ref()
-            .map_or((0, 0), |host| (host.rows.slots, host.rows.planes[0]))
+    pub fn disk_chunks(&self) -> u32 {
+        let per_chunk = self
+            .chunks
+            .layout()
+            .shape(Kind::List)
+            .map_or(0, |list| list.per_chunk);
+        self.disk_pages().checked_div(per_chunk).unwrap_or(0)
     }
 
-    /// The host address of rs row `row`.
-    pub fn host_row(&mut self, row: u32) -> Result<u64> {
-        let Some(host) = self.host.as_mut() else {
+    /// The load's shape `shape` names.
+    fn kind_of(shape: engine::chunk::ShapeId) -> Result<Kind> {
+        Ok(match shape {
+            layout::LIST => Kind::List,
+            window if layout::window_of(window).is_some() => {
+                Kind::Window(layout::window_of(window).unwrap_or(0) as u8)
+            }
+            layout::FIXED => Kind::Fixed,
+            layout::RS => Kind::Rs,
+            other => {
+                return Err(Fault::program(
+                    "store::chunks",
+                    format!("a slot copy names shape {other}, which this load does not state"),
+                ));
+            }
+        })
+    }
+
+    /// Where host ref `slot` of `kind` lies in the host tier, from its
+    /// start: its chunk, and its place among the chunk's slots.
+    fn tier_offset(&self, kind: Kind, slot: u32) -> Result<u64> {
+        let shape = self.chunks.layout().shape(kind).ok_or_else(|| {
+            Fault::program(
+                "store::chunks",
+                format!("a host slot of a {} in a load that lays none", kind.name()),
+            )
+        })?;
+        let (per_chunk, bytes) = (shape.per_chunk.max(1), shape.slot_bytes);
+        let chunk = slot / per_chunk;
+        let have = self.tier_chunks();
+        if chunk >= have {
             return Err(Fault::Ceiling {
-                what: "host rs rows",
-                need: u64::from(row) + 1,
+                what: "chunks of the host tier",
+                need: u64::from(chunk) + 1,
+                have: u64::from(have),
+            });
+        }
+        Ok(u64::from(chunk) * self.chunks.layout().chunk_bytes
+            + u64::from(slot % per_chunk) * bytes)
+    }
+
+    /// Where each of `refs`, host tier slots of `shape`, lies: its chunk of
+    /// the tier (backed) and its byte offset in that chunk; and a slot's
+    /// bytes.
+    fn tier_places(
+        &mut self,
+        shape: engine::chunk::ShapeId,
+        refs: &[u32],
+    ) -> Result<(u64, Vec<(u32, u64)>)> {
+        let kind = Self::kind_of(shape)?;
+        let facts = self.chunks.layout().shape(kind).ok_or_else(|| {
+            Fault::program(
+                "store::chunks",
+                format!("a host slot of a {} in a load that lays none", kind.name()),
+            )
+        })?;
+        let (per_chunk, bytes) = (facts.per_chunk.max(1), facts.slot_bytes);
+        let Some(tier) = self.tier.as_mut() else {
+            return Err(Fault::Ceiling {
+                what: "chunks of the host tier",
+                need: 1,
                 have: 0,
             });
         };
-        host.rows.back([row], "host rs rows")?;
-        host.rows.at(row, 0)
+        if let Some(&slot) = refs.iter().find(|&&slot| slot / per_chunk >= tier.chunks()) {
+            return Err(Fault::Ceiling {
+                what: "chunks of the host tier",
+                need: u64::from(slot / per_chunk) + 1,
+                have: u64::from(tier.chunks()),
+            });
+        }
+        Ok((
+            bytes,
+            refs.iter()
+                .map(|&slot| (slot / per_chunk, u64::from(slot % per_chunk) * bytes))
+                .collect(),
+        ))
+    }
+
+    /// See `Engine::read_tier_slots`: the bytes of host tier slots, shape
+    /// by shape, each laid out as its device slot. The caller has settled
+    /// every copy into them.
+    pub fn read_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        for (shape, refs) in slots {
+            let (bytes, places) = self.tier_places(*shape, refs)?;
+            let tier = self.tier.as_ref().expect("backed above");
+            let chunk_bytes = tier.chunk_bytes();
+            for (chunk, offset) in places {
+                let len = usize::try_from(bytes).unwrap_or(usize::MAX);
+                out.extend_from_slice(tier.slice(u64::from(chunk) * chunk_bytes + offset, len)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// See `Engine::write_tier_slots`: `bytes`, as [`Self::read_tier_slots`]
+    /// lays them out, into host tier slots. The caller has settled every
+    /// copy that touches them.
+    pub fn write_tier_slots(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let mut spans = Vec::new();
+        for (shape, refs) in slots {
+            let (len, places) = self.tier_places(*shape, refs)?;
+            spans.extend(places.into_iter().map(|place| (place, len)));
+        }
+        let need: u64 = spans.iter().map(|&(_, len)| len).sum();
+        if bytes.len() as u64 != need {
+            return Err(Fault::Ceiling {
+                what: "bytes of host tier slots",
+                need,
+                have: bytes.len() as u64,
+            });
+        }
+        let tier = self.tier.as_ref().expect("backed above");
+        let chunk_bytes = tier.chunk_bytes();
+        let mut from = 0usize;
+        for ((chunk, offset), len) in spans {
+            let len = usize::try_from(len).unwrap_or(usize::MAX);
+            tier.slice(u64::from(chunk) * chunk_bytes + offset, len)?
+                .copy_from_slice(&bytes[from..from + len]);
+            from += len;
+        }
+        Ok(())
+    }
+
+    /// Waits out every move between the device and the host tier still
+    /// landing: what a byte read or write of host tier slots stands behind.
+    pub fn settle_all_swaps(&mut self) -> Result<()> {
+        self.prune_swaps()?;
+        for swap in &self.swaps {
+            swap.landed.settle()?;
+        }
+        Ok(())
+    }
+
+    /// Copies whole slots of `shape`, `(src, dst)`, from tier `from` to tier
+    /// `to` (CONTRACT-BC 22), on `stream` behind every fire enqueued on it
+    /// and ahead of every one after: a device ref is the runtime's (through
+    /// the chunk table), a host ref a place in the host tier, a disk ref a
+    /// kv list slot of the slot file. A slot is laid the same on every
+    /// tier, so each moves as one span. What goes to disk is written once
+    /// the stream has it; what comes from disk is read first.
+    ///
+    /// Between the device and the host tier the copy rides `swap` where one
+    /// is given: behind what `stream` has enqueued (the fires that wrote
+    /// the slots), beside the fires after, of which one that names a slot it
+    /// holds waits for it ([`Pools::fence_swaps`]).
+    pub fn copy_tier_slots(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        swap: Option<*mut core::ffi::c_void>,
+        shape: engine::chunk::ShapeId,
+        from: Tier,
+        to: Tier,
+        pairs: &[(u32, u32)],
+    ) -> Result<()> {
+        if pairs.is_empty() || from == to {
+            return Ok(());
+        }
+        let kind = Self::kind_of(shape)?;
+        let bytes = self
+            .chunks
+            .layout()
+            .shape(kind)
+            .map(|shape| shape.slot_bytes)
+            .ok_or_else(|| {
+                Fault::program(
+                    "store::chunks",
+                    format!("a slot copy of a {} in a load that lays none", kind.name()),
+                )
+            })?;
+        let len = usize::try_from(bytes).unwrap_or(usize::MAX);
+        if (from == Tier::Disk || to == Tier::Disk) && kind != Kind::List {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "a {} to or from disk: the slot file holds kv list slots only",
+                    kind.name()
+                ),
+            });
+        }
+        let device: Vec<u64> = pairs
+            .iter()
+            .filter_map(|&(src, dst)| match (from, to) {
+                (Tier::Device, _) => Some(u64::from(src)),
+                (_, Tier::Device) => Some(u64::from(dst)),
+                _ => None,
+            })
+            .collect();
+        self.seat_pages(kind, device.iter().copied())?;
+        match (from, to) {
+            (Tier::Device, Tier::Host) | (Tier::Host, Tier::Device) => {
+                let to_host = to == Tier::Host;
+                let mut slots = Vec::with_capacity(pairs.len());
+                for &(src, dst) in pairs {
+                    let (on_device, on_host) = if to_host { (src, dst) } else { (dst, src) };
+                    let on_host = self.tier_offset(kind, on_host)?;
+                    let on_device = self.chunks.span(kind, on_device, 0, bytes)?;
+                    slots.push(if to_host {
+                        (on_device, on_host, len)
+                    } else {
+                        (on_host, on_device, len)
+                    });
+                }
+                // Behind the fires that wrote the slots, and behind every
+                // move before it (the swap stream's own order); without a
+                // swap stream, on `stream` behind every move still landing.
+                let lane = match swap {
+                    Some(swap) => {
+                        let written = crate::device::graph::Event::new()?;
+                        written.record(stream)?;
+                        written.wait(swap)?;
+                        swap
+                    }
+                    None => {
+                        self.fence_all_swaps(stream)?;
+                        stream
+                    }
+                };
+                let tier = self.tier.as_mut().ok_or(Fault::Ceiling {
+                    what: "chunks of the host tier",
+                    need: 1,
+                    have: 0,
+                })?;
+                let landed = if to_host {
+                    tier.to_host(lane, &slots)?
+                } else {
+                    tier.to_device(lane, &slots)?
+                };
+                if let (Some(landed), Some(_)) = (landed, swap) {
+                    self.swaps.push(Swap {
+                        landed,
+                        paged: if kind == Kind::List {
+                            device.iter().map(|&slot| slot as u32).collect()
+                        } else {
+                            Vec::new()
+                        },
+                        host: Vec::new(),
+                        wide: kind != Kind::List,
+                    });
+                }
+                Ok(())
+            }
+            (Tier::Device, Tier::Disk) | (Tier::Disk, Tier::Device) => {
+                self.fence_all_swaps(stream)?;
+                let to_disk = to == Tier::Disk;
+                let (device, disk): (Vec<u32>, Vec<u32>) = pairs
+                    .iter()
+                    .map(|&(src, dst)| if to_disk { (src, dst) } else { (dst, src) })
+                    .unzip();
+                self.through_disk(stream, to_disk, &disk, |pools, at| {
+                    pools.chunks.span(kind, device[at], 0, bytes)
+                })
+            }
+            (Tier::Host, Tier::Disk) | (Tier::Disk, Tier::Host) => {
+                let to_disk = to == Tier::Disk;
+                // A copy still on a stream may read or write a host slot.
+                self.settle_swaps()?;
+                crate::device::ctx::sync(stream)?;
+                let (host, disk): (Vec<u32>, Vec<u32>) = pairs
+                    .iter()
+                    .map(|&(src, dst)| if to_disk { (src, dst) } else { (dst, src) })
+                    .unzip();
+                let host = host
+                    .into_iter()
+                    .map(|slot| self.tier_offset(kind, slot))
+                    .collect::<Result<Vec<u64>>>()?;
+                self.host_through_disk(to_disk, &disk, &host, len)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Moves kv list slots between the slot file's slots `disk` and the
+    /// host tier's slots at `host` (offsets), `len` bytes each, through the
+    /// slot file's stage, each once every move into it has landed.
+    fn host_through_disk(
+        &mut self,
+        to_disk: bool,
+        disk: &[u32],
+        host: &[u64],
+        len: usize,
+    ) -> Result<()> {
+        let have = u64::from(self.disk_pages());
+        if let Some(&slot) = disk.iter().find(|&&slot| u64::from(slot) >= have) {
+            return Err(Fault::Ceiling {
+                what: "disk kv pages",
+                need: u64::from(slot) + 1,
+                have,
+            });
+        }
+        let (Some(spill), Some(tier)) = (self.disk.as_mut(), self.tier.as_ref()) else {
+            return Ok(());
+        };
+        let (stage, stride) = (spill.stage.host(), spill.file.stride());
+        // SAFETY: the stage is this load's pinned page; no copy on a stream
+        // reads or writes it while the host does (the device moves that go
+        // through it wait for each other, `landing`).
+        let staged = unsafe { std::slice::from_raw_parts_mut(stage, stride) };
+        for (&slot, &offset) in disk.iter().zip(host) {
+            let place = tier.slice(offset, len)?;
+            if to_disk {
+                staged[..len].copy_from_slice(place);
+                spill.file.write(slot, staged).map_err(slot_file)?;
+            } else {
+                spill.file.read(slot, staged).map_err(slot_file)?;
+                place.copy_from_slice(&staged[..len]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves kv list slots between the slot file's slots `disk` and the
+    /// device addresses `at(i)` through the stage, one slot at a time.
+    fn through_disk(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        to_disk: bool,
+        disk: &[u32],
+        at: impl Fn(&Self, usize) -> Result<u64>,
+    ) -> Result<()> {
+        let have = u64::from(self.disk_pages());
+        if let Some(&slot) = disk.iter().find(|&&slot| u64::from(slot) >= have) {
+            return Err(Fault::Ceiling {
+                what: "disk kv pages",
+                need: u64::from(slot) + 1,
+                have,
+            });
+        }
+        let bytes = self
+            .chunks
+            .layout()
+            .shape(Kind::List)
+            .map_or(0, |list| list.slot_bytes);
+        let Some(mut spill) = self.disk.take() else {
+            return Ok(());
+        };
+        let moved = (|| {
+            let (stage, stride) = (spill.stage.host(), spill.file.stride());
+            // SAFETY: the stage is this load's pinned page, and every copy on
+            // the stream that touches it is waited for before the host reads
+            // or writes it.
+            let staged = || unsafe { std::slice::from_raw_parts_mut(stage, stride) };
+            for (i, &slot) in disk.iter().enumerate() {
+                if spill.landing {
+                    crate::device::ctx::sync(stream)?;
+                    spill.landing = false;
+                }
+                let place = at(self, i)?;
+                if to_disk {
+                    crate::device::copy_any(stream, stage as u64, place, bytes as usize)?;
+                    crate::device::ctx::sync(stream)?;
+                    spill.file.write(slot, staged()).map_err(slot_file)?;
+                } else {
+                    spill.file.read(slot, staged()).map_err(slot_file)?;
+                    crate::device::copy_any(stream, place, stage as u64, bytes as usize)?;
+                    spill.landing = true;
+                }
+            }
+            Ok(())
+        })();
+        self.disk = Some(spill);
+        moved
+    }
+
+    /// Seats `pages` host kv pages, each pinned a chunk at a time as a copy
+    /// first touches it ([`Shelf`]), on reserved huge pages where the host
+    /// keeps a pool that holds them. Pinning at once would hold boot for as
+    /// long as the driver takes to pin it all, and when a process dies the
+    /// driver unpins its memory under a lock every process on the host
+    /// waits on for any allocation, about 0.17 s a GiB of 4 KiB pages and a
+    /// fifth of that of huge ones.
+    pub fn seat_host(&mut self, pages: u32) {
+        let planes = self.paged_planes().into_iter().map(|(_, b)| b).collect();
+        self.host = (pages > 0).then(|| HostKv {
+            paged: Shelf::new(planes, pages),
+        });
     }
 
     #[must_use]
@@ -1903,21 +3736,23 @@ impl Pools {
         keep: Option<&str>,
     ) -> Result<()> {
         let name = format!("r{rank}.kv");
+        // A slot holds a kv page as the planes lay it, or a kv list slot of
+        // the shared pool (CONTRACT-BC 22), whichever is larger.
+        let list = self
+            .chunks
+            .layout()
+            .shape(Kind::List)
+            .map_or(0, |list| list.slot_bytes);
+        let slot_bytes = self.paged_page_bytes().max(list);
         let file = match keep {
-            None => engine::disk::SlotFile::open(dir, &name, self.paged_page_bytes(), budget),
+            None => engine::disk::SlotFile::open(dir, &name, slot_bytes, budget),
             Some(load) => {
                 let planes: Vec<u64> = self.paged_planes().iter().map(|&(_, b)| b).collect();
                 let layout = format!(
-                    "cuda {load} page {} planes {planes:?}",
+                    "cuda {load} page {} planes {planes:?} list slot {list}",
                     self.paging.page_size
                 );
-                engine::disk::SlotFile::open_kept(
-                    dir,
-                    &name,
-                    self.paged_page_bytes(),
-                    budget,
-                    &layout,
-                )
+                engine::disk::SlotFile::open_kept(dir, &name, slot_bytes, budget, &layout)
             }
         }
         .map_err(slot_file)?;
@@ -1948,84 +3783,10 @@ impl Pools {
         self.disk.as_ref().is_some_and(|disk| disk.file.kept())
     }
 
-    /// Copies whole kv pages between the device pool and the slot file,
-    /// `device[i]` with `disk[i]`, one page through the stage at a time. A
-    /// write lands behind the fires that wrote the page; a read returns once
-    /// its last h2d copy is enqueued.
-    pub fn spill_kv(
-        &mut self,
-        stream: *mut core::ffi::c_void,
-        to_disk: bool,
-        device: &[u32],
-        disk: &[u32],
-    ) -> Result<()> {
-        let have = u64::from(self.disk_pages());
-        if let Some(&slot) = disk.iter().find(|&&slot| u64::from(slot) >= have) {
-            return Err(Fault::Ceiling {
-                what: "disk kv pages",
-                need: u64::from(slot) + 1,
-                have,
-            });
-        }
-        let highest = device.iter().map(|&page| page + 1).max().unwrap_or(0);
-        self.ensure_kv(highest)?;
-        let Some(mut spill) = self.disk.take() else {
-            return Ok(());
-        };
-        let copied = self.spill_through(&mut spill, stream, to_disk, device, disk);
-        self.disk = Some(spill);
-        copied
-    }
-
-    fn spill_through(
-        &self,
-        spill: &mut DiskKv,
-        stream: *mut core::ffi::c_void,
-        to_disk: bool,
-        device: &[u32],
-        disk: &[u32],
-    ) -> Result<()> {
-        let planes = self.paged_planes();
-        let (stage, stride) = (spill.stage.host(), spill.file.stride());
-        // SAFETY: the stage is this load's pinned page, and every copy on the
-        // stream that touches it is waited for before the host reads or
-        // writes it.
-        let staged = || unsafe { std::slice::from_raw_parts_mut(stage, stride) };
-        for (&page, &slot) in device.iter().zip(disk) {
-            if spill.landing {
-                crate::device::ctx::sync(stream)?;
-                spill.landing = false;
-            }
-            if !to_disk {
-                spill.file.read(slot, staged()).map_err(slot_file)?;
-            }
-            let mut offset = 0u64;
-            for &(arena, page_bytes) in &planes {
-                let on_device = arena.span(u64::from(page) * page_bytes, page_bytes)?;
-                let on_host = stage as u64 + offset;
-                let (dst, src) = if to_disk {
-                    (on_host, on_device)
-                } else {
-                    (on_device, on_host)
-                };
-                crate::device::copy_any(stream, dst, src, page_bytes as usize)?;
-                offset += page_bytes;
-            }
-            if to_disk {
-                crate::device::ctx::sync(stream)?;
-                spill.file.write(slot, staged()).map_err(slot_file)?;
-            } else {
-                spill.landing = true;
-            }
-        }
-        Ok(())
-    }
     /// Copies whole kv pages between the device pool and the host pages,
-    /// `device[i]` with `host[i]`, and the windowed pages `(device, host)`
-    /// between the windowed rows and theirs: on `swap`, behind what `stream`
-    /// has enqueued (the fires that wrote them), so the fires after run
-    /// beside it; one that holds its pages waits for it
-    /// ([`Pools::fence_swaps`]).
+    /// `device[i]` with `host[i]`: on `swap`, behind what `stream` has
+    /// enqueued (the fires that wrote them), so the fires after run beside
+    /// it; one that holds its pages waits for it ([`Pools::fence_swaps`]).
     pub fn swap_kv(
         &mut self,
         stream: *mut core::ffi::c_void,
@@ -2033,60 +3794,33 @@ impl Pools {
         to_host: bool,
         device: &[u32],
         host: &[u32],
-        windowed: &[(u32, u32)],
     ) -> Result<()> {
         let paged: Vec<(u32, u32)> = device.iter().copied().zip(host.iter().copied()).collect();
-        let highest = device.iter().map(|&page| page + 1).max().unwrap_or(0);
-        self.ensure_kv(highest)?;
-        self.ensure_windowed(windowed.iter().map(|&(page, _)| u64::from(page)))?;
+        self.ensure_kv_pages(device)?;
         let Some(tier) = self.host.as_mut() else {
-            return match (host.first(), windowed.first()) {
-                (None, None) => Ok(()),
-                (paged, _) => Err(Fault::Ceiling {
-                    what: if paged.is_some() {
-                        "host kv pages"
-                    } else {
-                        "host windowed pages"
-                    },
+            return match host.first() {
+                None => Ok(()),
+                Some(_) => Err(Fault::Ceiling {
+                    what: "host kv pages",
                     need: 1,
                     have: 0,
                 }),
             };
         };
         tier.paged.back(host.iter().copied(), "host kv pages")?;
-        tier.windowed.back(
-            windowed.iter().map(|&(_, slot)| slot),
-            "host windowed pages",
-        )?;
-        let tier = self.host.as_ref().expect("seated above");
+        let shelf = &self.host.as_ref().expect("seated above").paged;
         let mut spans: Vec<(u64, u64, usize)> = Vec::new();
-        for (planes, pairs, shelf) in [
-            (self.paged_planes(), &paged[..], &tier.paged),
-            (self.windowed_planes(), windowed, &tier.windowed),
-        ] {
-            let mut runs: Vec<(u32, u32, u32)> = Vec::new();
-            for &(d, h) in pairs {
-                match runs.last_mut() {
-                    Some((d0, h0, n))
-                        if *d0 + *n == d && *h0 + *n == h && shelf.same_chunk(*h0, h) =>
-                    {
-                        *n += 1;
-                    }
-                    _ => runs.push((d, h, 1)),
-                }
-            }
-            for (plane, (arena, page_bytes)) in planes.into_iter().enumerate() {
-                for &(d, h, n) in &runs {
-                    let bytes = u64::from(n) * page_bytes;
-                    let on_device = arena.span(u64::from(d) * page_bytes, bytes)?;
-                    let on_host = shelf.at(h, plane)?;
-                    let (dst, src) = if to_host {
-                        (on_host, on_device)
-                    } else {
-                        (on_device, on_host)
-                    };
-                    spans.push((dst, src, usize::try_from(bytes).unwrap_or(0)));
-                }
+        // A page's planes lie apart in its slot, so each is a span.
+        for (at, (plane, page_bytes)) in self.paged_planes().into_iter().enumerate() {
+            for &(d, h) in &paged {
+                let on_device = self.plane_span(plane, d, page_bytes)?;
+                let on_host = shelf.at(h, at)?;
+                let (dst, src) = if to_host {
+                    (on_host, on_device)
+                } else {
+                    (on_device, on_host)
+                };
+                spans.push((dst, src, usize::try_from(page_bytes).unwrap_or(0)));
             }
         }
         if spans.is_empty() {
@@ -2101,8 +3835,8 @@ impl Pools {
         self.swaps.push(Swap {
             landed,
             paged: device.to_vec(),
-            windowed: windowed.iter().map(|&(page, _)| page).collect(),
             host: host.to_vec(),
+            wide: false,
         });
         Ok(())
     }
@@ -2121,8 +3855,8 @@ impl Pools {
         self.swaps.push(Swap {
             landed,
             paged,
-            windowed: Vec::new(),
             host,
+            wide: false,
         });
         Ok(())
     }
@@ -2141,13 +3875,11 @@ impl Pools {
     }
 
     /// Orders `stream` behind the moves still landing that hold any of the
-    /// device pages a fire names: its paged runs `(first, count)` and its
-    /// windowed pages.
+    /// device pages a fire names: its paged runs `(first, count)`.
     pub fn fence_swaps(
         &mut self,
         stream: *mut core::ffi::c_void,
         paged: &[(u64, u64)],
-        windowed: &[u64],
     ) -> Result<()> {
         self.prune_swaps()?;
         for swap in &self.swaps {
@@ -2156,13 +3888,18 @@ impl Pools {
                 paged
                     .iter()
                     .any(|&(first, count)| first <= page && page < first + count)
-            }) || swap
-                .windowed
-                .iter()
-                .any(|&page| windowed.contains(&u64::from(page)));
-            if holds {
+            });
+            if holds || swap.wide {
                 swap.landed.wait(stream)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Waits, on the host, for every move still landing.
+    pub fn settle_swaps(&mut self) -> Result<()> {
+        for swap in self.swaps.drain(..) {
+            swap.landed.settle()?;
         }
         Ok(())
     }
@@ -2227,24 +3964,17 @@ impl Pools {
         })
     }
 
-    /// Bytes one host kv slot holds across the paged planes.
-    #[must_use]
-    pub fn host_kv_slot_bytes(&self) -> u64 {
-        self.paged_planes().iter().map(|&(_, bytes)| bytes).sum()
-    }
-
     /// The cache row of each paged plane, in a host slot's order.
     fn paged_plane_rows(&self) -> Vec<usize> {
         let mut rows = Vec::new();
-        for (row, (arenas, shape)) in self.rows.iter().zip(&self.shapes).enumerate() {
-            if matches!(
-                shape,
-                Shape::Kv {
-                    windowed: false,
-                    ..
-                }
-            ) {
-                rows.extend(std::iter::repeat_n(row, arenas.len()));
+        for (row, shape) in self.shapes.iter().enumerate() {
+            if let Shape::Kv {
+                windowed: false,
+                values_plane,
+                ..
+            } = *shape
+            {
+                rows.extend(std::iter::repeat_n(row, values_plane + 1));
             }
         }
         rows
@@ -2293,7 +4023,7 @@ impl Pools {
         device: &[u32],
         host: &[u32],
     ) -> Result<TapSpans> {
-        self.ensure_kv(device.iter().map(|&page| page + 1).max().unwrap_or(0))?;
+        self.ensure_kv_pages(device)?;
         let Some(tier) = self.host.as_mut() else {
             return Err(Fault::Ceiling {
                 what: "host kv pages",
@@ -2308,9 +4038,9 @@ impl Pools {
         let mut lands = Vec::with_capacity(planes.len() * device.len());
         for (&d, &h) in device.iter().zip(host) {
             for &plane in planes {
-                let (arena, bytes) = all[plane];
+                let (at, bytes) = all[plane];
                 let on_host = shelf.at(h, plane)?;
-                let on_device = arena.span(u64::from(d) * bytes, bytes)?;
+                let on_device = self.plane_span(at, d, bytes)?;
                 let len = usize::try_from(bytes).unwrap_or(0);
                 copies.push((on_host, on_device, len));
                 lands.push((on_host, len));
@@ -2322,93 +4052,23 @@ impl Pools {
     /// Host kv slots `slots`, one after another, each its planes in order.
     /// The caller has synchronized every copy into them.
     pub fn read_host_kv(&mut self, slots: &[u32]) -> Result<Vec<u8>> {
-        Ok(read_shelf(self.host_shelf(false, slots)?, slots))
+        Ok(read_shelf(self.host_shelf(slots)?, slots))
     }
 
     /// Writes `bytes`, as [`Self::read_host_kv`] lays them out, into host kv
     /// slots `slots`.
     pub fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> Result<()> {
         write_shelf(
-            self.host_shelf(false, slots)?,
+            self.host_shelf(slots)?,
             slots,
             bytes,
             "bytes of host kv slots",
         )
     }
 
-    /// Host windowed pages `pages`, a ring's on the host, laid out as
-    /// [`Self::read_host_kv`] lays out kv slots.
-    pub fn read_host_window(&mut self, pages: &[u32]) -> Result<Vec<u8>> {
-        Ok(read_shelf(self.host_shelf(true, pages)?, pages))
-    }
-
-    /// Writes `bytes`, as [`Self::read_host_window`] lays them out.
-    pub fn write_host_window(&mut self, pages: &[u32], bytes: &[u8]) -> Result<()> {
-        write_shelf(
-            self.host_shelf(true, pages)?,
-            pages,
-            bytes,
-            "bytes of host windowed pages",
-        )
-    }
-
-    /// Reads `(row, from, bytes)` spans of the host rs rows, in order.
-    pub fn read_host_rows(&mut self, spans: &[(u32, u64, u64)]) -> Result<Vec<u8>> {
-        let rows = self.backed_rows(spans)?;
-        let mut out = Vec::new();
-        for &(row, from, bytes) in spans {
-            let (pinned, at) = rows.place(row, 0).expect("backed above");
-            out.extend_from_slice(pinned.view(at + from, bytes).expect("inside its chunk"));
-        }
-        Ok(out)
-    }
-
-    /// Writes `bytes`, laid out as [`Self::read_host_rows`] returns them.
-    pub fn write_host_rows(&mut self, spans: &[(u32, u64, u64)], bytes: &[u8]) -> Result<()> {
-        let need: u64 = spans.iter().map(|&(.., bytes)| bytes).sum();
-        if bytes.len() as u64 != need {
-            return Err(Fault::Ceiling {
-                what: "bytes of host rs rows",
-                need,
-                have: bytes.len() as u64,
-            });
-        }
-        let rows = self.backed_rows(spans)?;
-        let mut from = 0;
-        for &(row, offset, len) in spans {
-            let (pinned, at) = rows.place(row, 0).expect("backed above");
-            let at = usize::try_from(at + offset).unwrap_or(usize::MAX);
-            let len = usize::try_from(len).unwrap_or(0);
-            assert!(
-                pinned.write(at, &bytes[from..from + len]),
-                "inside its chunk"
-            );
-            from += len;
-        }
-        Ok(())
-    }
-
-    fn backed_rows(&mut self, spans: &[(u32, u64, u64)]) -> Result<&Shelf> {
-        let Some(host) = self.host.as_mut() else {
-            return Err(Fault::Ceiling {
-                what: "host rs rows",
-                need: spans.len() as u64,
-                have: 0,
-            });
-        };
-        host.rows
-            .back(spans.iter().map(|&(row, ..)| row), "host rs rows")?;
-        Ok(&host.rows)
-    }
-
-    /// The host kv (or, `windowed`, windowed) shelf, with the chunks
-    /// holding `slots` pinned.
-    fn host_shelf(&mut self, windowed: bool, slots: &[u32]) -> Result<&Shelf> {
-        let what = if windowed {
-            "host windowed pages"
-        } else {
-            "host kv pages"
-        };
+    /// The host kv shelf, with the chunks holding `slots` pinned.
+    fn host_shelf(&mut self, slots: &[u32]) -> Result<&Shelf> {
+        let what = "host kv pages";
         let Some(host) = self.host.as_mut() else {
             return Err(Fault::Ceiling {
                 what,
@@ -2416,56 +4076,33 @@ impl Pools {
                 have: 0,
             });
         };
-        let shelf = if windowed {
-            &mut host.windowed
-        } else {
-            &mut host.paged
-        };
-        shelf.back(slots.iter().copied(), what)?;
-        Ok(shelf)
+        host.paged.back(slots.iter().copied(), what)?;
+        Ok(&host.paged)
     }
 
     /// `slot`'s recurrent state, read on `stream` behind the fires that
     /// wrote it.
     pub fn state_bytes(&mut self, stream: *mut core::ffi::c_void, slot: u32) -> Result<Vec<u8>> {
-        if !slab_row(self.has_state(), self.paging.slots, slot)? {
+        if !self.state_row(slot)? {
             return Ok(Vec::new());
         }
-        self.ensure_state(slot + 1)?;
         let mut out = Vec::new();
-        for (planes, shape) in self.rows.iter().zip(&self.shapes) {
-            let Shape::State { stride, dtype } = *shape else {
-                continue;
-            };
-            let Some(arena) = planes.first() else {
-                continue;
-            };
-            let bytes = stride * u64::from(elem_size(dtype));
-            let at = out.len();
-            out.resize(at + usize::try_from(bytes).unwrap_or(0), 0);
-            crate::device::copy_d2h_on(
-                stream,
-                arena.span(u64::from(slot) * bytes, bytes)?,
-                &mut out[at..],
-            )?;
+        for (at, bytes) in self.state_spans(slot)? {
+            let from = out.len();
+            out.resize(from + usize::try_from(bytes).unwrap_or(0), 0);
+            crate::device::copy_d2h_on(stream, at, &mut out[from..])?;
         }
         Ok(out)
     }
 
     fn zero_slot(&mut self, stream: Option<*mut core::ffi::c_void>, slot: u32) -> Result<()> {
-        if !slab_row(self.has_state(), self.paging.slots, slot)? {
+        if !self.state_row(slot)? {
             return Ok(());
         }
-        self.ensure_state(slot + 1)?;
-        for (planes, shape) in self.rows.iter().zip(&self.shapes) {
-            let Shape::State { stride, dtype } = *shape else {
-                continue;
-            };
-            let Some(arena) = planes.first() else {
-                continue;
-            };
-            let bytes = stride * u64::from(elem_size(dtype));
-            let at = arena.span(u64::from(slot) * bytes, bytes)?;
+        let record = self.ensure_record(slot)?;
+        let bytes = self.fixed()?.slot.slot_bytes;
+        for piece in record {
+            let at = self.chunks.span(Kind::Fixed, piece, 0, bytes)?;
             let len = usize::try_from(bytes).unwrap_or(0);
             match stream {
                 Some(stream) => crate::device::zero_span_on(stream, at, len)?,
@@ -2475,217 +4112,233 @@ impl Pools {
         Ok(())
     }
 
-    fn ensure_kv(&mut self, pages: u32) -> Result<()> {
-        let capacity = self.paging.pages();
-        if u64::from(pages) > capacity {
-            return Err(Fault::Ceiling {
-                what: "kv pages",
-                need: u64::from(pages),
-                have: capacity,
-            });
-        }
-        match self.commit_to(pages, 0)? {
-            Commit::Committed => Ok(()),
-            refusal => Err(refuse(&self.pool, refusal)),
-        }
-    }
-
-    fn ensure_state(&mut self, slots: u32) -> Result<()> {
-        match self.commit_to(0, slots)? {
-            Commit::Committed => Ok(()),
-            refusal => Err(refuse(&self.pool, refusal)),
-        }
-    }
-
-    fn commit_to(&mut self, kv_pages: u32, state_slots: u32) -> Result<Commit> {
-        self.commit_ranges(kv_pages, state_slots, None)
+    /// Seats and backs the kv pages `pages`, and the compressor slabs' rows
+    /// under them.
+    fn ensure_kv_pages(&mut self, pages: &[u32]) -> Result<()> {
+        let highest = pages.iter().map(|&page| u64::from(page) + 1).max();
+        let Some(highest) = highest else {
+            return Ok(());
+        };
+        self.kv_within(highest)?;
+        self.seat_pages(Kind::List, pages.iter().map(|&page| u64::from(page)))
     }
 
     pub fn commit_frame(
         &mut self,
         demand: engine::frame::Demand,
         kv_ranges: &[(u64, u64)],
-        window_pages: &[u64],
+        window_pages: &[Vec<u64>],
     ) -> Result<()> {
-        if !(demand.kv_pages <= self.committed_kv_pages
-            && demand.state_slots <= self.committed_state_slots
-            && kv_ranges
+        self.seat_pages(
+            Kind::List,
+            kv_ranges
                 .iter()
-                .all(|&(first, count)| self.pages_backed(first, count)))
-        {
-            match self.commit_ranges(demand.kv_pages, demand.state_slots, Some(kv_ranges))? {
-                Commit::Committed => self.note_backed(kv_ranges),
-                refusal => return Err(refuse(&self.pool, refusal)),
+                .flat_map(|&(first, count)| first..first.saturating_add(count)),
+        )?;
+        let _ = demand;
+        if self.chunks.by_refs() {
+            // Each window list's slot refs are its own.
+            for (window, pages) in window_pages.iter().enumerate() {
+                self.seat_pages(Kind::Window(window as u8), pages.iter().copied())?;
             }
+            Ok(())
+        } else {
+            self.ensure_windowed(window_pages.iter().flatten().copied())
         }
-        self.ensure_windowed(window_pages.iter().copied())
     }
+}
 
-    fn pages_backed(&self, first: u64, count: u64) -> bool {
-        (first..first.saturating_add(count)).all(|page| {
-            self.backed_pages
-                .get((page / 64) as usize)
-                .is_some_and(|word| word & (1u64 << (page % 64)) != 0)
-        })
+/// How `trace`'s kv rows sit in the state pool's chunks: the compiler's
+/// recipe for a server card, its token slots this paging's pages. Where the
+/// paging keeps no window (the widest spans the context) every row is a list
+/// row.
+fn lay(
+    trace: &Trace,
+    paging: &Paging,
+    budgets: &poem_compiler::Budgets,
+    chunk_bytes: Option<u64>,
+    experts: &[usize],
+    rows: bool,
+    one_window: bool,
+) -> Result<layout::Layout> {
+    let context = if paging.window.is_some() {
+        paging.context()
+    } else {
+        0
+    };
+    let mut server = poem_compiler::chunk::ChunkProfile::SERVER_CUDA;
+    if let Some(bytes) = chunk_bytes {
+        server.target_chunk_bytes = bytes;
     }
+    // Where this device's kernels map a table's window, slots lay their
+    // planes on the rows those maps index.
+    let tma = windows_mapped();
+    server.tma_rows = tma;
+    let paged = server.paged(paging.page_size, context);
+    let profile = poem_compiler::DeviceProfile {
+        chunk: if one_window { paged.merged() } else { paged },
+        ..poem_compiler::DeviceProfile::default()
+    };
+    // Each plane at the bytes its slot holds: laid scales as their atoms.
+    let view = crate::weights::laid_view(trace);
+    let recipe =
+        poem_compiler::chunk::plan(&view, budgets, &profile).map_err(|why| Fault::Unbound {
+            what: format!("a chunk recipe for this load's cache rows: {why}"),
+        })?;
+    let banks: Vec<(usize, u64, u64)> = if experts.is_empty() {
+        Vec::new()
+    } else {
+        let bytes = crate::weights::laid_bytes(trace)?;
+        // A plane held on the device beside its bank takes no slot bytes.
+        let beside = experts
+            .iter()
+            .flat_map(|&param| layout::beside_planes(trace, param))
+            .map(|plane| (plane as usize, 0, 0));
+        // Each plane's TMA rows where windows are mapped (the recipe laid
+        // the slot by them), else none.
+        let rows = |param: usize| {
+            if tma {
+                poem_compiler::chunk::weights::tma_rows(trace, param, experts)
+            } else {
+                0
+            }
+        };
+        experts
+            .iter()
+            .map(|&param| (param, bytes[param], rows(param)))
+            .chain(beside)
+            .collect()
+    };
+    let streamed = if rows {
+        layout::streamed_rows(trace)
+    } else {
+        Vec::new()
+    };
+    layout::Layout::of(&recipe, &streamed, &banks)
+}
 
-    fn note_backed(&mut self, ranges: &[(u64, u64)]) {
-        for &(first, count) in ranges {
-            for page in first..first.saturating_add(count) {
-                let (word, bit) = ((page / 64) as usize, page % 64);
-                if self.backed_pages.len() <= word {
-                    self.backed_pages.resize(word + 1, 0);
-                }
-                self.backed_pages[word] |= 1u64 << bit;
-            }
-        }
-    }
+/// The chunks a pool of `pages` kv pages takes: the null chunk, the pages'
+/// and the windowed pages beside them.
+fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64, slots: u32) -> u32 {
+    let chunks = 1
+        + layout.chunks_for(Kind::List, pages)
+        + (0..layout.windows.len())
+            .map(|window| {
+                layout.chunks_for(Kind::Window(window as u8), paging.window_pages_at(pages))
+            })
+            .sum::<u64>()
+        + layout.chunks_for(
+            Kind::Fixed,
+            u64::from(slots)
+                * layout
+                    .fixed
+                    .as_ref()
+                    .map_or(1, |fixed| u64::from(fixed.pieces)),
+        );
+    u32::try_from(chunks).unwrap_or(u32::MAX)
+}
 
-    fn commit_ranges(
-        &mut self,
-        kv_pages: u32,
-        state_slots: u32,
-        kv_ranges: Option<&[(u64, u64)]>,
-    ) -> Result<Commit> {
-        let kv_pages = kv_pages.max(self.committed_kv_pages);
-        let state_slots = state_slots.max(self.committed_state_slots);
-        let page_size = self.paging.page_size;
-        let windowed = narrow_pages(self.paging.window_pages());
-        let Pools {
-            pool,
-            rows,
-            shapes,
-            pooled,
-            ..
-        } = self;
-        let mut targets = Vec::new();
-        for (planes, shape) in rows.iter_mut().zip(shapes.iter()) {
-            for (at, arena) in planes.iter_mut().enumerate() {
-                let want = match (shape, kv_ranges) {
-                    // The windowed pool backs its pages as they are first
-                    // used (`ensure_windowed`).
-                    (Shape::Kv { windowed: true, .. }, _) => continue,
-                    (Shape::Kv { .. }, Some(ranges)) => {
-                        let page_bytes = watermark_bytes(shape, at, 1, 0, 0, page_size);
-                        elastic::Want::Ranges(
-                            ranges
-                                .iter()
-                                .map(|&(first, count)| (first * page_bytes, count * page_bytes))
-                                .collect(),
-                        )
-                    }
-                    _ => elastic::Want::Prefix(watermark_bytes(
-                        shape,
-                        at,
-                        kv_pages,
-                        0,
-                        state_slots,
-                        page_size,
-                    )),
-                };
-                targets.push(elastic::Target { arena, want });
-            }
-        }
-        for row in pooled.iter_mut().filter(|row| !row.windowed) {
-            let bytes = row.watermark_bytes(kv_pages, windowed, page_size);
-            for arena in row.planes.iter_mut() {
-                targets.push(elastic::Target {
-                    arena,
-                    want: elastic::Want::Prefix(bytes),
-                });
-            }
-        }
-        let outcome = elastic::commit_atomically(pool, &mut targets)?;
-        if outcome == Commit::Committed {
-            self.committed_kv_pages = kv_pages;
-            self.committed_state_slots = state_slots;
-        }
-        Ok(outcome)
-    }
+/// A row-streamed table's cache: where each block of its rows lies (a pool
+/// slot the runtime named, or the mapped host copy), the device table its
+/// gather reads them through, and each block's reads since last asked.
+#[derive(Debug)]
+struct RowCache {
+    shape: layout::RowsShape,
+    /// The table's mapped host copy.
+    host: u64,
+    /// A u64 address a block.
+    table: crate::device::Buffer,
+    /// A u32 counter a block.
+    hits: crate::device::Buffer,
+    /// The slot ref each block is cached in.
+    slots: Vec<Option<u32>>,
+}
+
+/// The caches' read counters as last snapshotted: mapped host memory a
+/// snapshot copy lands in, every counter in [`Pools::counters`] order, and
+/// each counter's value as the last answer read it.
+#[derive(Debug)]
+struct UseRecord {
+    host: crate::device::Pinned,
+    base: Vec<u32>,
+}
+
+/// One bank of an expert shape's cache: its plane in an expert's slot, the
+/// layer it is of, its mapped host copy, the device table its select reads
+/// its experts through, and (a layer's first bank) each expert's reads.
+#[derive(Debug)]
+struct ExpertBank {
+    plane: layout::ExpertPlane,
+    layer: u32,
+    host: u64,
+    /// Whether a select reads this plane as its bank (a dense bank, or a
+    /// packed bank's codes): it has the table. A packed bank's other planes
+    /// are read through that table.
+    head: bool,
+    /// The planes an expert's table entry lists, as places among the
+    /// cache's planes; `None` one the bank lacks.
+    members: Vec<Option<usize>>,
+    /// A u64 address an expert.
+    table: crate::device::Buffer,
+    /// A u32 counter an expert.
+    hits: Option<crate::device::Buffer>,
+    /// Whether, as the table was last written, every entry lay in the pool a
+    /// whole number of its plane's rows past the pool's base: what a TMA map
+    /// of the window indexes it by.
+    whole_rows: bool,
+}
+
+/// An expert shape's cache: where each expert of each layer lies (a pool
+/// slot the runtime named, or the mapped host copy).
+#[derive(Debug)]
+struct ExpertCache {
+    shape: layout::ExpertShape,
+    planes: Vec<ExpertBank>,
+    /// The slot ref each atom is cached in.
+    slots: Vec<Option<u32>>,
+}
+
+/// One plane a page holds bytes in: `offset` into the page's slot of the
+/// state pool.
+#[derive(Debug, Clone, Copy)]
+struct PlaneAt {
+    kind: Kind,
+    offset: u64,
 }
 
 const POOL_STATE: Dtype = Dtype::Bf16;
 
+/// A compressor's state for the kv row `row` its gather keys it by: two
+/// planes (the projection, then its score) of `width` a token, `offset`
+/// into the row's pages' slots.
 #[derive(Debug)]
 struct PoolRow {
-    space: u32,
+    row: u32,
     width: u64,
-    /// Keyed by a windowed space's pages: as long as its windowed pool.
+    /// Keyed by a windowed row's pages.
     windowed: bool,
-    planes: Vec<Arena>,
+    /// The list those pages are slots of ([`Shape::Kv`]'s).
+    list: u8,
+    offset: u64,
 }
 
 impl PoolRow {
-    fn watermark_bytes(&self, kv_pages: u32, window_pages: u32, page_size: u32) -> u64 {
-        let pages = if self.windowed {
-            window_pages
-        } else {
-            kv_pages
-        };
-        u64::from(pages) * u64::from(page_size) * self.width * u64::from(elem_size(POOL_STATE))
+    /// The bytes one of its planes holds a page.
+    fn plane_bytes(&self, page_size: u32) -> u64 {
+        u64::from(page_size) * self.width * u64::from(elem_size(POOL_STATE))
     }
 }
 
-const fn compressor_coff(ratio: u32) -> u64 {
-    if ratio == 4 { 2 } else { 1 }
-}
-
-fn pooled_spaces(trace: &Trace) -> Vec<(u32, u64)> {
-    let mut spaces: Vec<(u32, u64)> = Vec::new();
-    for node in &trace.nodes {
-        // A gather, or one the compressor's fused op holds.
-        let gather = match &node.op {
-            Operation::Attn(a) => a,
-            Operation::Fused(poem_ir::Fused::PoolCompress { gather, .. }) => &**gather,
-            _ => continue,
-        };
-        let Attn::PoolGather {
-            pages,
-            head_dim,
-            ratio,
-            ..
-        } = gather
-        else {
-            continue;
-        };
-        let Some(Def::Cache(space)) = trace.values.get(pages.0 as usize).map(|v| &v.def) else {
-            continue;
-        };
-        let width = compressor_coff(*ratio) * u64::from(*head_dim);
-        if width == 0 {
-            continue;
-        }
-        match spaces.iter_mut().find(|(held, _)| *held == *space) {
-            Some((_, held)) => *held = (*held).max(width),
-            None => spaces.push((*space, width)),
-        }
+/// Whether this device's kernels map a located table's window by TMA
+/// (`kernels_cuda::linear::moe::windows_mapped`); none does off CUDA.
+fn windows_mapped() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        kernels_cuda::linear::moe::windows_mapped()
     }
-    spaces
-}
-
-fn watermark_bytes(
-    shape: &Shape,
-    plane: usize,
-    kv_pages: u32,
-    window_pages: u32,
-    state_slots: u32,
-    page_size: u32,
-) -> u64 {
-    match *shape {
-        Shape::Kv {
-            windowed,
-            dtype,
-            keys_width,
-            values_width,
-            ..
-        } => {
-            let width = if plane == 0 { keys_width } else { values_width };
-            let pages = if windowed { window_pages } else { kv_pages };
-            u64::from(pages) * u64::from(page_size) * width * u64::from(elem_size(dtype))
-        }
-        Shape::State { stride, dtype } => {
-            u64::from(state_slots) * stride * u64::from(elem_size(dtype))
-        }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
     }
 }
 
@@ -2734,10 +4387,6 @@ fn elem_size(dtype: Dtype) -> u32 {
     poem_compiler::arena::elem_bytes(dtype).unwrap_or(1) as u32
 }
 
-fn narrow_pages(pages: u64) -> u32 {
-    u32::try_from(pages).unwrap_or(u32::MAX)
-}
-
 /// The widest window a windowed kv row is declared with. Every read of such
 /// a row must look through a window no wider, since the pages behind it
 /// read the null page.
@@ -2784,27 +4433,6 @@ fn wide(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
 }
 
-impl Pools {
-    /// See `Engine::commit_pool`.
-    pub fn commit(&mut self, demand: engine::frame::Demand) -> Result<()> {
-        if let Some(highest) = demand.state_slots.checked_sub(1) {
-            slab_row(self.has_state(), self.paging.slots, highest)?;
-        }
-        let capacity = self.paging.pages();
-        if u64::from(demand.kv_pages) > capacity {
-            return Err(Fault::Ceiling {
-                what: "kv pages",
-                need: u64::from(demand.kv_pages),
-                have: capacity,
-            });
-        }
-        match self.commit_to(demand.kv_pages, demand.state_slots)? {
-            Commit::Committed => Ok(()),
-            refusal => Err(refuse(&self.pool, refusal)),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2812,27 +4440,8 @@ mod tests {
     #[test]
     fn store_every_case() {
         a_seat_past_the_slot_count_is_a_row_only_a_slab_can_refuse();
-        a_host_pool_seats_its_rows_first_and_pages_with_the_rest();
     }
 
-    fn a_host_pool_seats_its_rows_first_and_pages_with_the_rest() {
-        let mib = 1u64 << 20;
-        assert_eq!(
-            host_pool(100 * mib, 8, mib, 1000, mib / 16, 0, 0),
-            (8, 1472, 0)
-        );
-        assert_eq!(
-            host_pool(20 * mib, 8, mib, 1000, mib / 16, 100, mib / 16),
-            (8, 96, 96)
-        );
-        assert_eq!(
-            host_pool(30 * mib, 8, mib, 100, mib / 16, 100, mib / 16),
-            (8, 252, 100)
-        );
-        assert_eq!(host_pool(4 * mib, 8, mib, 1000, mib / 16, 0, 0), (4, 0, 0));
-        assert_eq!(host_pool(0, 8, mib, 1000, mib / 16, 0, 0), (0, 0, 0));
-        assert_eq!(host_pool(mib, 8, 0, 4, mib / 4, 0, 0), (0, 4, 0));
-    }
     // gemma-4 (no slab) with 256 slots reserved seated a lane at 312.
     fn a_seat_past_the_slot_count_is_a_row_only_a_slab_can_refuse() {
         assert!(!slab_row(false, 256, 312).expect("no slab, no ceiling"));

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
 use poem::ops::conv::{self, ConvShape};
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, Weight, trace_hybrid};
 use poem_compiler::{Budget, VoxelLadder};
 use poem_ir::InputAxis;
 
@@ -54,8 +54,8 @@ impl Decoder {
 }
 
 impl ForwardHybrid for Decoder {
-    fn caches(&self) -> HybridSpec {
-        HybridSpec::new()
+    fn states(&self) -> StateRows {
+        StateRows::new()
     }
     fn forward(&self, inputs: Input) {
         let g = inputs.grid();
@@ -406,7 +406,6 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
-        deferred_tier: true,
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
@@ -519,8 +518,8 @@ impl Causal {
 }
 
 impl ForwardHybrid for Causal {
-    fn caches(&self) -> HybridSpec {
-        let mut spec = HybridSpec::new();
+    fn states(&self) -> StateRows {
+        let mut spec = StateRows::new();
         spec.state(
             "conv.cache",
             [(FRAMES * PLANE_MAX) as u64, C_IN as u64],
@@ -683,7 +682,6 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
-        deferred_tier: true,
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),

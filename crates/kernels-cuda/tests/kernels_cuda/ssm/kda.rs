@@ -83,6 +83,7 @@ fn fire(gpu: &mut Gpu, rows: &Rows, slab: &[f32], asks: &[Ask]) -> (Vec<f32>, Ve
             commit_len,
             begin_at,
             fused_decay: false,
+            segments: kernels_cuda::Segments::ONE,
             snapshots: kernels_cuda::Snapshots::NONE,
         };
         let mut y = Tensor::new(y_at, n as u32, WIDE as u32, Dtype::F32);
@@ -260,6 +261,7 @@ fn the_tensor_core_kda_lands_the_serial_walk() {
             commit_len: Tensor::new(commit_at, lens.len() as u32, 1, Dtype::I32),
             begin_at: Tensor::new(begin_at, lens.len() as u32, 1, Dtype::I32),
             fused_decay: false,
+            segments: kernels_cuda::Segments::ONE,
             snapshots: kernels_cuda::Snapshots::NONE,
         };
         let tuning = crate::common::attn_ref::tuned(|t| t.ssm_kda_chunked = chunked);
@@ -338,6 +340,7 @@ fn the_kda_decode_step_lands_the_serial_walk() {
             commit_len: Tensor::ABSENT,
             begin_at: Tensor::ABSENT,
             fused_decay: false,
+            segments: kernels_cuda::Segments::ONE,
             snapshots: kernels_cuda::Snapshots::NONE,
         };
         let mixed_t = Tensor::new(mixed, n as u32, 3 * wide as u32, Dtype::Bf16);

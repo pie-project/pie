@@ -858,6 +858,22 @@ impl KvPageTable {
             .collect()
     }
 
+    /// Each page of `terminal`'s path from token 0: where it is, and its
+    /// key where it is sealed.
+    pub fn path_pages(&self, terminal: NodeId) -> Vec<(TriePageLocation, Option<Hash256>)> {
+        if !self.nodes.contains(terminal) {
+            return Vec::new();
+        }
+        let len = self.contribution_len(terminal);
+        if len == 0 {
+            return Vec::new();
+        }
+        self.path_locations(terminal, len - 1)
+            .into_iter()
+            .map(|at| (at, self.page_key_at(&at)))
+            .collect()
+    }
+
     /// Every sealed page's key, on any tier: what this worker can give a
     /// peer that asks by key.
     pub fn sealed_keys(&self) -> std::collections::HashSet<Hash256> {
@@ -959,7 +975,6 @@ impl KvPageTable {
         self.remove_anchor(node)
     }
 
-    #[cfg(test)]
     pub fn terminal(&self, ws: WorkingSetId) -> Result<Option<NodeId>, KvTableError> {
         Ok(self.entry(ws)?.terminal)
     }
@@ -1467,38 +1482,6 @@ impl KvPageTable {
         Ok(staying)
     }
 
-    /// Whether the anchor at `terminal` keeps a resident page at or past
-    /// `limit`.
-    pub fn holds_past(&self, terminal: NodeId, limit: u32) -> bool {
-        let mut past = false;
-        self.visit_anchor_locations(terminal, |location| {
-            past |= self.resident_past(&location, limit);
-        });
-        past
-    }
-
-    /// The working sets that read a resident page at or past `limit`.
-    pub fn working_sets_past(&self, limit: u32) -> HashSet<WorkingSetId> {
-        let mut sets = HashSet::new();
-        for (ws, _) in self.working_sets.iter() {
-            let mut past = false;
-            let _ = self.visit_working_set_locations(ws, |location| {
-                past |= self.resident_past(&location, limit);
-            });
-            if past {
-                sets.insert(ws);
-            }
-        }
-        sets
-    }
-
-    fn resident_past(&self, location: &TriePageLocation, limit: u32) -> bool {
-        matches!(
-            self.backing_at(location),
-            Ok(KvPageBacking::Resident(id)) if id.index() >= limit
-        )
-    }
-
     /// A running reader kept them on the device and has gone since: readers
     /// in `order`, then the rest, until `wanted` pages are found. The pages
     /// `order` keeps, the first of a reader's, go only once nothing else will
@@ -1508,6 +1491,7 @@ impl KvPageTable {
         keep: &HashSet<WorkingSetId>,
         order: &[(WorkingSetId, u64)],
         wanted: usize,
+        spare_heads: bool,
     ) -> Vec<(TriePageLocation, PhysicalKvPageId)> {
         let mut running = FxHashSet::default();
         for (ws, entry) in self.working_sets.iter() {
@@ -1547,6 +1531,10 @@ impl KvPageTable {
             })
             .collect();
         for spare_kept in [false, true] {
+            // Tails only: what a head's key keeps stays, short or not.
+            if spare_kept && !spare_heads {
+                break;
+            }
             for &ws in &readers {
                 if pages.len() >= wanted {
                     return pages;
@@ -1573,6 +1561,33 @@ impl KvPageTable {
         roots: &[NodeId],
         above: &[NodeId],
     ) -> Vec<(TriePageLocation, PhysicalKvPageId)> {
+        self.cache_only(roots, above, |backing| match backing {
+            KvPageBacking::Resident(id) => Some(id),
+            _ => None,
+        })
+    }
+
+    /// What only the cache reads of `roots` and is parked on the host: it
+    /// can go on down to disk.
+    pub fn cache_only_host_slots(
+        &self,
+        roots: &[NodeId],
+        above: &[NodeId],
+    ) -> Vec<(TriePageLocation, HostKvSlotId)> {
+        self.cache_only(roots, above, |backing| match backing {
+            KvPageBacking::Swapped(slot) => Some(slot),
+            _ => None,
+        })
+    }
+
+    /// The pages of `roots` no working set, pin, move or root of `above`
+    /// reads, as `pick` takes their backings.
+    fn cache_only<T>(
+        &self,
+        roots: &[NodeId],
+        above: &[NodeId],
+        pick: impl Fn(KvPageBacking) -> Option<T>,
+    ) -> Vec<(TriePageLocation, T)> {
         if roots.is_empty() {
             return Vec::new();
         }
@@ -1599,7 +1614,7 @@ impl KvPageTable {
                 {
                     return;
                 }
-                if let Ok(KvPageBacking::Resident(id)) = self.backing_at(&location) {
+                if let Some(id) = self.backing_at(&location).ok().and_then(&pick) {
                     pages.push((location, id));
                 }
             });
@@ -1618,11 +1633,21 @@ impl KvPageTable {
     }
 
     pub fn holds_resident(&self, root: NodeId) -> bool {
+        self.holds(root, |backing| {
+            matches!(backing, KvPageBacking::Resident(_))
+        })
+    }
+
+    /// Whether any page on `root`'s path is parked on the host.
+    pub fn holds_on_host(&self, root: NodeId) -> bool {
+        self.holds(root, |backing| matches!(backing, KvPageBacking::Swapped(_)))
+    }
+
+    fn holds(&self, root: NodeId, backed: impl Fn(&KvPageBacking) -> bool) -> bool {
         self.path_nodes(root).into_iter().any(|node| {
             matches!(
                 self.nodes.get(node).map(|n| &n.pages),
-                Some(Pages::Owned { backings, .. })
-                    if backings.iter().any(|backing| matches!(backing, KvPageBacking::Resident(_)))
+                Some(Pages::Owned { backings, .. }) if backings.iter().any(&backed)
             )
         })
     }

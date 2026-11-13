@@ -49,9 +49,8 @@ def worker_config(i, controller, gateway, listen):
     t = (HOME / "config.toml").read_text()
     t = re.sub(r'^source = "[^"]*"', f'source = "{args.model}"', t, flags=re.M)
     t = re.sub(r'^listen = "[^"]*"', f'listen = "{listen}"', t, flags=re.M)
-    t = t.replace('# device_kv_budget     = "20GiB"', 'device_kv_budget = "1GiB"\ndevice_weight_budget = "4GiB"')
+    t = t.replace('# device_kv_budget     = "20GiB"', 'device_kv_budget = "1GiB"')
     t = t.replace("# max_model_len   = 32768", "max_model_len = 4096\n#")
-    t = t.replace("# max_state_slots = 256", "max_state_slots = 16\n#")
     t += f'\n[cluster]\ncontroller = "{controller}"\nrole = "decode"\ngateways = ["{gateway}"]\n'
     path = LOGS / f"worker{i}.toml"; path.write_text(t); return path
 

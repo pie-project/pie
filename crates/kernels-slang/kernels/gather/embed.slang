@@ -77,6 +77,67 @@ void main(uint3 gid : SV_DispatchThreadID) {
     y[at] = pack_bf16(affine_value(word, c, s, b), affine_value(word, c + 1u, s, b));
 }
 
+#elif defined(PIE_TABLED)
+
+#include "prim/pool.slang"
+
+// A bf16 table streamed by its rows (the weight cache, SPEC "Weight
+// cache"): row `id` lies in block `id / block_rows`, which `blocks` names
+// the pool unit of (its slot) or `NOT_HELD`. A held block's rows lie in
+// its slot, `atom_words` a row apart from word `origin` (a token id's rows
+// of every table sharing the slot side by side); a row of a block not
+// held was staged for this fire, `staged[first + n]` its row of `stage`
+// (a stage laid by the fire's rows, this gather reading those from
+// `first`). Each row read counts one use of its block in `hits`.
+
+#define NOT_HELD 0xffffffffu
+
+[[vk::binding(0)]] StructuredBuffer<int> ids;
+[[vk::binding(1)]] StructuredBuffer<uint> blocks;
+[[vk::binding(2)]] StructuredBuffer<uint> staged;
+[[vk::binding(3)]] StructuredBuffer<uint> stage;
+[[vk::binding(4)]] RWStructuredBuffer<Atomic<uint>> hits;
+[[vk::binding(5)]] RWStructuredBuffer<uint> y;
+PIE_POOL_SEGMENTS(StructuredBuffer, uint, 6)
+
+struct Params {
+    int hidden;
+    int vocab;
+    uint block_rows;
+    uint seg_words;
+    uint unit_words;
+    uint origin;
+    uint atom_words;
+    uint first;
+};
+PIE_PARAMS(10, Params, params);
+PIE_POOL_READ(uint, params.seg_words)
+
+[shader("compute")]
+[numthreads(PIE_GROUP_X, 1, 1)]
+void main(uint3 gid : SV_DispatchThreadID) {
+    uint words = uint(max(params.hidden, 0)) / 2u;
+    uint c = gid.x;
+    uint n = gid.y;
+    if (c >= words) {
+        return;
+    }
+    int raw = ids[n];
+    uint id = (raw >= 0 && raw < params.vocab) ? uint(raw) : 0u;
+    uint block = id / params.block_rows;
+    if (c == 0u) {
+        hits[block].add(1u);
+    }
+    uint unit = blocks[block];
+    if (unit != NOT_HELD) {
+        y[n * words + c] = pie_pool_get(
+            unit * params.unit_words + params.origin + (id % params.block_rows) * params.atom_words + c);
+    } else {
+        uint at = staged[params.first + n];
+        y[n * words + c] = at != NOT_HELD ? stage[at * words + c] : 0u;
+    }
+}
+
 #elif defined(PIE_WEIGHTED)
 
 [[vk::binding(0)]] StructuredBuffer<int> ids;
@@ -118,6 +179,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
 // pie:instantiate gather_embed_bf16 PIE_EMBED=1 PIE_GROUP_X=256
 // pie:instantiate gather_embed_concat_bf16 PIE_CONCAT=1 PIE_GROUP_X=256
+// pie:instantiate gather_embed_tabled_bf16 PIE_TABLED=1 PIE_GROUP_X=256
 // pie:instantiate gather_embed_weighted_bf16 PIE_WEIGHTED=1 PIE_GROUP_X=256
 // pie:instantiate gather_embed_affine_bf16_gs_32_b_2 PIE_AFFINE=1 PIE_GROUP=32 PIE_BITS=2 PIE_GROUP_X=256
 // pie:instantiate gather_embed_affine_bf16_gs_32_b_4 PIE_AFFINE=1 PIE_GROUP=32 PIE_BITS=4 PIE_GROUP_X=256

@@ -4,7 +4,6 @@ use bytes::Bytes;
 use std::io;
 #[cfg(not(target_arch = "wasm32"))]
 use std::pin::Pin;
-use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::task::{Context, Poll};
 #[cfg(not(target_arch = "wasm32"))]
@@ -23,42 +22,22 @@ use crate::inferlet::process;
 use super::ProcessId;
 
 #[derive(Clone)]
-enum Dest {
-    Process(ProcessId),
-    Log(Arc<str>),
-}
-
-#[derive(Clone)]
 pub struct LogStream {
-    dest: Dest,
+    process_id: ProcessId,
     is_stderr: bool,
 }
 
 impl LogStream {
     pub fn new_stdout(process_id: ProcessId) -> Self {
         LogStream {
-            dest: Dest::Process(process_id),
+            process_id,
             is_stderr: false,
         }
     }
 
     pub fn new_stderr(process_id: ProcessId) -> Self {
         LogStream {
-            dest: Dest::Process(process_id),
-            is_stderr: true,
-        }
-    }
-
-    pub fn new_server_stdout(program: Arc<str>) -> Self {
-        LogStream {
-            dest: Dest::Log(program),
-            is_stderr: false,
-        }
-    }
-
-    pub fn new_server_stderr(program: Arc<str>) -> Self {
-        LogStream {
-            dest: Dest::Log(program),
+            process_id,
             is_stderr: true,
         }
     }
@@ -67,27 +46,11 @@ impl LogStream {
         if bytes.is_empty() {
             return;
         }
-        match &self.dest {
-            Dest::Process(process_id) => {
-                let content = String::from_utf8_lossy(bytes).to_string();
-                if self.is_stderr {
-                    process::stderr(*process_id, content);
-                } else {
-                    process::stdout(*process_id, content);
-                }
-            }
-            Dest::Log(program) => {
-                let content = String::from_utf8_lossy(bytes);
-                let text = content.trim_end_matches(['\n', '\r']);
-                if text.is_empty() {
-                    return;
-                }
-                if self.is_stderr {
-                    tracing::warn!(target: "pie::guest", program = %program, "{text}");
-                } else {
-                    tracing::info!(target: "pie::guest", program = %program, "{text}");
-                }
-            }
+        let content = String::from_utf8_lossy(bytes).to_string();
+        if self.is_stderr {
+            process::stderr(self.process_id, content);
+        } else {
+            process::stdout(self.process_id, content);
         }
     }
 }

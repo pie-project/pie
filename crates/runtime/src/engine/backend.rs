@@ -21,7 +21,6 @@ pub struct SchedulerLimits {
 
 #[derive(Debug, Clone)]
 pub struct EngineSpec {
-    pub num_kv_pages: usize,
     pub limits: SchedulerLimits,
     pub device_geometry_port_mask: PortMask,
     pub device_domain: MemoryDomain,

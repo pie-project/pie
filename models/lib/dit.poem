@@ -1,6 +1,6 @@
 # The pieces the diffusion transformers share: a projection and its bias,
-# laid out, read and run; an adaLN projection's slices reordered; and
-# attention over rows grouped by their own permutation and offsets.
+# laid out, read and run; an adaLN projection's slices reordered;
+# and attention over rows grouped by their own permutation and offsets.
 
 def linear(out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""

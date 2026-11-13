@@ -20,6 +20,9 @@ struct Layer {
     ckv_pages: u64,
     kpe_pages: u64,
     page_size: i32,
+    /// Elements from a page's latent (rotated) rows to the next page's.
+    ckv_stride: i64,
+    kpe_stride: i64,
     kv_lora_rank: i32,
     rope_dim: i32,
     /// The pool holds fp8 rows (`kv::mla_fp8_rows`), the matrix-core walks'
@@ -54,6 +57,8 @@ impl Layer {
             ckv_pages: pool.keys.ptr,
             kpe_pages: pool.values.ptr,
             page_size: pool.page_size,
+            ckv_stride: kv::page_elems(op, pool, 0)?,
+            kpe_stride: kv::page_elems(op, pool, 1)?,
             kv_lora_rank,
             rope_dim,
             fp8,
@@ -531,6 +536,9 @@ pub(crate) mod naive {
         pub q_pe: u64,
         pub ckv_pages: u64,
         pub kpe_pages: u64,
+        /// Elements from a page's latent (rotated) rows to the next page's.
+        pub ckv_stride: i64,
+        pub kpe_stride: i64,
         pub qo_indptr: u64,
         pub kv_page_indices: u64,
         pub kv_page_indptr: u64,
@@ -601,6 +609,8 @@ pub(crate) mod naive {
                 shape.kv_lora_rank.arg(),
                 shape.rope_dim.arg(),
                 shape.page_size.arg(),
+                ptrs.ckv_stride.arg(),
+                ptrs.kpe_stride.arg(),
                 shape.sm_scale.arg(),
                 shape.causal.arg(),
                 g.arg(),
@@ -676,9 +686,11 @@ pub(crate) mod latent {
         page_size: i32,
         scale_log2: f32,
         causal: i32,
+        ckv_stride: i64,
+        kpe_stride: i64,
     }
 
-    const _: () = assert!(core::mem::size_of::<Work>() == 160);
+    const _: () = assert!(core::mem::size_of::<Work>() == 176);
 
     /// `pie::attn::mla::Merge`, field for field.
     #[repr(C)]
@@ -728,9 +740,12 @@ pub(crate) mod latent {
         pub scale_log2: f32,
         pub window: i32,
         pub compact: i32,
+        /// Elements from a page's latent (rotated) rows to the next page's.
+        pub ckv_stride: i64,
+        pub kpe_stride: i64,
     }
 
-    const _: () = assert!(core::mem::size_of::<Gather>() == 168);
+    const _: () = assert!(core::mem::size_of::<Gather>() == 184);
 
     /// The planned walk: the MLA scheduler's work list over the batch, then
     /// the fold of every split row. The fold always runs (its blocks with
@@ -786,6 +801,8 @@ pub(crate) mod latent {
             page_size: layer.page_size,
             scale_log2: layer.scale_log2(sm_scale),
             causal: i32::from(causal),
+            ckv_stride: layer.ckv_stride,
+            kpe_stride: layer.kpe_stride,
         };
         #[allow(clippy::cast_sign_loss)]
         let grid = [info.num_blks_x as u32, info.num_blks_y as u32, 1];
@@ -974,6 +991,8 @@ fn dispatch_dense(
                 q_pe: q_pe.ptr,
                 ckv: layer.ckv_pages,
                 kpe: layer.kpe_pages,
+                ckv_stride: layer.ckv_stride,
+                kpe_stride: layer.kpe_stride,
                 page_indices: pool.page_indices.ptr,
                 page_indptr: pool.page_indptr.ptr,
                 last_page_lens: pool.last_page_lens.ptr,
@@ -1018,6 +1037,8 @@ fn dispatch_dense(
             q_pe: q_pe.ptr,
             ckv_pages: layer.ckv_pages,
             kpe_pages: layer.kpe_pages,
+            ckv_stride: layer.ckv_stride,
+            kpe_stride: layer.kpe_stride,
             qo_indptr: qo_indptr.ptr,
             kv_page_indices: pool.page_indices.ptr,
             kv_page_indptr: pool.page_indptr.ptr,
@@ -1139,6 +1160,8 @@ fn selected(
                 q_pe: q_pe.ptr,
                 ckv: layer.ckv_pages,
                 kpe: layer.kpe_pages,
+                ckv_stride: layer.ckv_stride,
+                kpe_stride: layer.kpe_stride,
                 page_indices: pool.page_indices.ptr,
                 page_indptr: pool.page_indptr.ptr,
                 last_page_lens: pool.last_page_lens.ptr,
@@ -1166,6 +1189,8 @@ fn selected(
             q_pe: q_pe.ptr,
             ckv_pages: layer.ckv_pages,
             kpe_pages: layer.kpe_pages,
+            ckv_stride: layer.ckv_stride,
+            kpe_stride: layer.kpe_stride,
             qo_indptr: q.indptr.ptr,
             kv_page_indices: pool.page_indices.ptr,
             kv_page_indptr: pool.page_indptr.ptr,

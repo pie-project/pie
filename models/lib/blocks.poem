@@ -4,12 +4,12 @@
 # weights under their usual names.
 
 def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_norm = None, biased = False):
-    """Grouped-query attention over `w.kv`, out through `w.o`. `biased` adds
-    `w.q_bias`, `w.k_bias` and `w.v_bias`; `qk_norm` norms q and k by
-    `w.q_norm` and `w.k_norm`, each head on its own ("head") or across its
-    full width ("width"); `rotary_dim` rotates only that many leading dims
-    of each head."""
-    pages = inputs.kv(w.kv)
+    """Grouped-query attention over `w.kv`, the layer's per-token keys and
+    values state, out through `w.o`. `biased` adds `w.q_bias`,
+    `w.k_bias` and `w.v_bias`; `qk_norm` norms q and k by `w.q_norm` and
+    `w.k_norm`, each head on its own ("head") or across its full width
+    ("width"); `rotary_dim` rotates only that many leading dims of each
+    head."""
     d = m.head_dim
     q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
     if biased:
@@ -22,7 +22,7 @@ def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_
         k = ops.elemwise.rmsnorm(k, w.k_norm, m.eps)
     rotation = rotary.full() if rotary_dim == None else rotary.partial(rotary_dim)
     q, k = ops.elemwise.rope(q, positions, d, m.theta, rotation, k = k, scaling = scaling)
-    ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
+    ops.attn.kv_append(k, v, w.kv)
 
     # Each lane by its kind; a lane may bring its own mask. A lane capturing
     # scores reads them out too.

@@ -1,4 +1,4 @@
-use crate::run::Run;
+use crate::run::{Run, one_token};
 use kernels_cuda::RaggedTensor;
 use poem_exec::{DispatchSsm, KernelError};
 use poem_ir::Ssm;
@@ -40,7 +40,7 @@ impl Run<'_> {
                     self.tensor(*x),
                     self.tensor(*weight),
                     bias.map(|b| self.tensor(b)),
-                    &self.recurrent_absolute(*state),
+                    &one_token(self.recurrent_absolute(*state)),
                     *conv_width,
                     *dilation,
                     &mut self.tensor(*y),
@@ -56,7 +56,7 @@ impl Run<'_> {
                 self.ctx(),
                 self.tensor(*x),
                 self.tensor(*weight),
-                &self.recurrent_absolute(*state),
+                &one_token(self.recurrent_absolute(*state)),
                 *conv_width,
                 &mut self.tensor(*y),
             ),
@@ -140,10 +140,11 @@ impl Run<'_> {
             } => {
                 if self.rs_extended() {
                     const OP: &str = "ssm.gdn_gates";
+                    self.rs_begin();
                     let ba_ext = self.rs_extend(OP, *ba, true)?;
                     let mut gates_ext = self.rs_out(OP, *gates)?;
                     kernels_cuda::ssm::gdn_gates(
-                        self.ctx(),
+                        self.rs_ext_ctx(OP)?,
                         ba_ext,
                         self.tensor(*dt_bias),
                         self.tensor(*a_log),
@@ -190,7 +191,7 @@ impl Run<'_> {
                     self.tensor(*qkv),
                     self.tensor(*z),
                     self.tensor(*gates),
-                    &self.recurrent_absolute(*state),
+                    &one_token(self.recurrent_absolute(*state)),
                     *k_heads,
                     *v_heads,
                     *k_dim,
@@ -288,7 +289,7 @@ impl Run<'_> {
                     self.tensor(*b),
                     self.tensor(*dt_bias),
                     self.tensor(*a_log),
-                    &self.recurrent(*state),
+                    &one_token(self.recurrent(*state)),
                     *heads,
                     *head_dim,
                     *norm_eps,
@@ -327,10 +328,6 @@ impl Run<'_> {
                 y,
             } => {
                 let chunked = matches!(op, Ssm::Mamba2Chunked { .. });
-                const OP: &str = "ssm.mamba2";
-                if self.rs_extended() {
-                    return Err(kernels_cuda::Error::Unsupported { op: OP });
-                }
                 let m = kernels_cuda::ssm::Mamba2 {
                     a_log: self.tensor(*a_log),
                     dt_bias: self.tensor(*dt_bias),
@@ -340,6 +337,19 @@ impl Run<'_> {
                     heads: *heads,
                     groups: *groups,
                 };
+                if self.rs_extended() {
+                    return self.mamba2_extended(
+                        "ssm.mamba2",
+                        *xbc,
+                        *dt,
+                        *z,
+                        m,
+                        *state,
+                        *state_dim,
+                        *y,
+                    );
+                }
+                self.rs_move("ssm.mamba2", *dt, self.tensor(*dt))?;
                 let (dt, z) = (self.tensor(*dt), self.tensor(*z));
                 if !chunked {
                     return kernels_cuda::ssm::mamba2(
@@ -348,12 +358,11 @@ impl Run<'_> {
                         dt,
                         z,
                         m,
-                        &self.recurrent(*state),
+                        &one_token(self.recurrent(*state)),
                         *state_dim,
                         &mut self.tensor(*y),
                     );
                 }
-                let tail = self.recurrent_tail_absolute(*state);
                 kernels_cuda::ssm::mamba2_chunked(
                     self.ctx(),
                     self.ragged_lanes(*xbc),
@@ -361,17 +370,7 @@ impl Run<'_> {
                     z,
                     m,
                     &self.recurrent_absolute(*state),
-                    *state_dim,
-                    &mut self.tensor(*y),
-                )?;
-                let Some(tail) = tail else { return Ok(()) };
-                kernels_cuda::ssm::mamba2_chunked(
-                    self.ctx(),
-                    self.ragged_lanes(*xbc),
-                    dt,
-                    z,
-                    m,
-                    &tail,
+                    self.recurrent_tail_absolute(*state).as_ref(),
                     *state_dim,
                     &mut self.tensor(*y),
                 )
@@ -474,12 +473,13 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         let bias = bias.map(|b| self.tensor(b));
+        self.rs_begin();
         let x_ext = self.rs_extend(op, x, true)?;
         let csr = self.rs_ext_csr(op)?;
         let mut y_ext = self.rs_out(op, y)?;
         let tail = self.recurrent_tail_absolute(state);
         kernels_cuda::ssm::causal_conv1d_chunked(
-            self.ctx(),
+            self.rs_ext_ctx(op)?,
             RaggedTensor {
                 data: x_ext,
                 indptr: csr,
@@ -493,7 +493,7 @@ impl Run<'_> {
         )?;
         if let Some(tail) = tail {
             kernels_cuda::ssm::causal_conv1d_chunked(
-                self.ctx(),
+                self.rs_ext_ctx(op)?,
                 RaggedTensor {
                     data: x_ext,
                     indptr: csr,
@@ -523,6 +523,7 @@ impl Run<'_> {
         v_dim: u32,
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
+        self.rs_begin();
         let qkv_ext = self.rs_ext_of(op, qkv)?;
         let gates_ext = self.rs_ext_of(op, gates)?;
         let z_ext = self.rs_extend(op, z, false)?;
@@ -530,7 +531,7 @@ impl Run<'_> {
         let mut y_ext = self.rs_out(op, y)?;
         let tail = self.recurrent_tail_absolute(state);
         kernels_cuda::ssm::gated_delta_chunked(
-            self.ctx(),
+            self.rs_ext_ctx(op)?,
             RaggedTensor {
                 data: qkv_ext,
                 indptr: csr,
@@ -546,7 +547,7 @@ impl Run<'_> {
         )?;
         if let Some(tail) = tail {
             kernels_cuda::ssm::gated_delta_chunked(
-                self.ctx(),
+                self.rs_ext_ctx(op)?,
                 RaggedTensor {
                     data: qkv_ext,
                     indptr: csr,
@@ -561,6 +562,47 @@ impl Run<'_> {
                 &mut y_ext,
             )?;
         }
+        self.rs_land(op, y_ext, y)?;
+        self.rs_layer_done();
+        Ok(())
+    }
+
+    /// A Mamba-2 layer over extended rows: the conv landed `xbc`'s
+    /// ([`Run::rs_ext_of`]), the step sizes replay from the buffer, the gate
+    /// reads only the rows the fire lands. A one-token class's step runs the
+    /// chunked scan as the gated-delta one does.
+    #[allow(clippy::too_many_arguments)]
+    fn mamba2_extended(
+        &self,
+        op: &'static str,
+        xbc: ValueId,
+        dt: ValueId,
+        z: ValueId,
+        m: kernels_cuda::ssm::Mamba2,
+        state: ValueId,
+        state_dim: u32,
+        y: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        self.rs_begin();
+        let xbc_ext = self.rs_ext_of(op, xbc)?;
+        let dt_ext = self.rs_extend(op, dt, true)?;
+        let z_ext = self.rs_extend(op, z, false)?;
+        let csr = self.rs_ext_csr(op)?;
+        let mut y_ext = self.rs_out(op, y)?;
+        kernels_cuda::ssm::mamba2_chunked(
+            self.rs_ext_ctx(op)?,
+            RaggedTensor {
+                data: xbc_ext,
+                indptr: csr,
+            },
+            dt_ext,
+            z_ext,
+            m,
+            &self.recurrent_absolute(state),
+            self.recurrent_tail_absolute(state).as_ref(),
+            state_dim,
+            &mut y_ext,
+        )?;
         self.rs_land(op, y_ext, y)?;
         self.rs_layer_done();
         Ok(())
@@ -582,6 +624,7 @@ impl Run<'_> {
         gate_floor: f32,
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
+        self.rs_begin();
         let mixed_ext = self.rs_ext_of(op, mixed)?;
         let f_ext = self.rs_extend(op, f, true)?;
         let b_ext = self.rs_extend(op, b, true)?;
@@ -589,7 +632,7 @@ impl Run<'_> {
         let mut y_ext = self.rs_out(op, y)?;
         let tail = self.recurrent_tail_absolute(state);
         kernels_cuda::ssm::kda_chunked(
-            self.ctx(),
+            self.rs_ext_ctx(op)?,
             RaggedTensor {
                 data: mixed_ext,
                 indptr: csr,
@@ -607,7 +650,7 @@ impl Run<'_> {
         )?;
         if let Some(tail) = tail {
             kernels_cuda::ssm::kda_chunked(
-                self.ctx(),
+                self.rs_ext_ctx(op)?,
                 RaggedTensor {
                     data: mixed_ext,
                     indptr: csr,
