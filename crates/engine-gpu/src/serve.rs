@@ -93,6 +93,24 @@ pub trait Serve: Backend {
     /// The pipelines compiled so far.
     fn compiled(pipelines: &Self::Pipelines) -> u64;
 
+    /// Whether the device reports what the driver holds beside the
+    /// reservations ([`Context::outside`](crate::backend::Context::outside)),
+    /// so a pipeline's share of it can be measured.
+    fn measures_outside(device: &Self::Context) -> bool;
+
+    /// Whether `pipelines` could build instantiation `key` (at `tier`, as
+    /// [`kernels_slang::CENSUS`] names it) on `device`: this build carries
+    /// its module and a fire on the device may name that tier.
+    fn builds(device: &Self::Context, key: &str, tier: &str) -> bool;
+
+    /// Builds instantiation `key` of `unit` into `pipelines`.
+    fn build(
+        device: &Self::Context,
+        pipelines: &Self::Pipelines,
+        unit: &'static str,
+        key: &'static str,
+    ) -> Result<()>;
+
     fn sink<'f>(
         device: &'f Self::Context,
         frame: &'f Self::Frame,
@@ -1061,7 +1079,11 @@ impl<B: Serve> Shell<B> {
         // the weights and the working set leave of the share, in whole
         // chunks; the kernels bind it in at most four segments, none past
         // the device's binding limit.
-        let left = device.left();
+        // Every pipeline a fire may yet build is priced before the pool takes
+        // what is left: one built later must find its driver memory free.
+        let pipelines = B::Pipelines::default();
+        let unbuilt = price_pipelines::<B>(&device, &pipelines);
+        let left = device.left().saturating_sub(unbuilt);
         if let Some(budget) = kv_budget
             && budget > left
         {
@@ -1128,6 +1150,7 @@ impl<B: Serve> Shell<B> {
         // context, the weights and every load-time reservation are up;
         // what the driver holds by then is its own entry.
         device.books().outside("driver", device.outside());
+        device.books().outside("unbuilt pipelines", unbuilt);
         device.books().settle(chunk, device.capacity());
         let paging = Paging {
             pages: pages.max(1),
@@ -1164,7 +1187,7 @@ impl<B: Serve> Shell<B> {
             tuning,
             device,
             tier,
-            pipelines: B::Pipelines::default(),
+            pipelines,
             handles,
             trace: boot.trace,
             compiled,
@@ -3940,6 +3963,94 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             launches,
         })
     }
+}
+
+/// The fewest pipelines a load builds to price one: a driver grows the heap
+/// it keeps shader code in by whole blocks, so a build's price is read over
+/// several.
+const PRICED_FROM: usize = 16;
+
+/// The fewest builds that moved the driver's holding a price is read from.
+const PRICED_MOVES: usize = 3;
+
+/// The most it builds while the driver's holding stands still; past them a
+/// pipeline is priced at what they took.
+const PRICED_FROM_MOST: usize = 64;
+
+/// One load of the process prices at a time: a driver reports what it holds
+/// a process, so another load's builds would be read as this one's.
+static PRICING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// What the driver would take beside the reservations for every pipeline a
+/// fire on `device` could still build (REDESIGN 2.2, `outside`), priced by
+/// measurement before the pool is fit. Which instantiation a kernel fires
+/// hangs on the rows of its fire, so the set a load will build is known only
+/// as every instantiation the device can run: some of them, spread over the
+/// census, are built now into `pipelines` (and kept, for any fire that names
+/// them), and the rest are priced at what those took each.
+///
+/// What the driver holds is read across each build: most builds fit in a
+/// block the driver already has and move nothing, some take a new block.
+/// A build's price is the median move times the share of builds that moved:
+/// a driver reports what it holds a process, so a move another thread's
+/// allocation made (a frame's, a staging belt's) is one large reading that
+/// the median passes over, where a mean would take it whole. A build during
+/// which the process reserved or gave back device memory is not read at all.
+/// The builds go on past [`PRICED_FROM`] until [`PRICED_MOVES`] have moved,
+/// up to [`PRICED_FROM_MOST`]. A device that does not report the driver's
+/// holding prices nothing.
+fn price_pipelines<B: Serve>(device: &B::Context, pipelines: &B::Pipelines) -> u64 {
+    if !B::measures_outside(device) {
+        return 0;
+    }
+    let _alone = PRICING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let census: Vec<(&'static str, &'static str)> = kernels_slang::CENSUS
+        .iter()
+        .filter(|(key, _, tier, _)| B::builds(device, key, tier))
+        .map(|&(key, _, _, unit)| (key, unit))
+        .collect();
+    let stride = (census.len() / PRICED_FROM).max(1);
+    let spread = (0..stride).flat_map(|offset| census.iter().skip(offset).step_by(stride));
+    let (mut built, mut read) = (0u64, 0u64);
+    let mut moves: Vec<u64> = Vec::new();
+    for &(key, unit) in spread {
+        if built as usize >= PRICED_FROM_MOST
+            || (read as usize >= PRICED_FROM && moves.len() >= PRICED_MOVES)
+        {
+            break;
+        }
+        let reserved = crate::books::process_reserved();
+        let before = device.outside();
+        // One the device refuses is priced with the rest; a fire naming
+        // it meets the refusal itself.
+        if B::build(device, pipelines, unit, key).is_err() {
+            continue;
+        }
+        built += 1;
+        let after = device.outside();
+        if crate::books::process_reserved() == reserved {
+            read += 1;
+            if after > before {
+                moves.push(after - before);
+            }
+        }
+    }
+    moves.sort_unstable();
+    let median = moves.get(moves.len() / 2).copied().unwrap_or(0);
+    let each = (median * moves.len() as u64).checked_div(read).unwrap_or(0);
+    let unbuilt = census.len() as u64 - built;
+    let priced = each * unbuilt;
+    tracing::info!(
+        built,
+        read,
+        moved = moves.len(),
+        median,
+        each,
+        unbuilt,
+        priced,
+        "the pipelines a fire may yet build are priced at what building some took"
+    );
+    priced
 }
 
 /// The walk's sink: a kernel's fire, its absent argument and the target,

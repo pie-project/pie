@@ -89,6 +89,30 @@ impl Serve for Api {
         pipelines.compiled()
     }
 
+    fn measures_outside(device: &Context) -> bool {
+        device.enabled().memory_budget
+    }
+
+    fn builds(device: &Context, key: &str, tier: &str) -> bool {
+        // A tactic fires at the baseline, the subgroup tier or, where the
+        // device has them, cooperative matrices.
+        let runs = match tier {
+            "baseline" | "subgroup" => true,
+            "coopmat" => device.enabled().coopmat,
+            _ => false,
+        };
+        runs && kernels_slang::spirv(key).is_some()
+    }
+
+    fn build(
+        device: &Context,
+        pipelines: &Pipelines,
+        unit: &'static str,
+        key: &'static str,
+    ) -> Result<()> {
+        pipelines.get(device, unit, key).map(drop)
+    }
+
     fn sink<'f>(
         device: &'f Context,
         frame: &'f Frame,
