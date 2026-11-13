@@ -22,7 +22,7 @@ type R<T> = Result<T, String>;
 /// head's columns, GDN's a key head's, the o-norm's a value head's (Qwen3: the scores'); the
 /// head PY / 2 columns; the RoPE tables enough levels for the context (`CTX`, the positions
 /// asked for, where fewer than NE PY). Overrides: the
-/// reduction groups (`G2`, `G2X` / `G2Y` / `G2H`, `G2W`), the RoPE tables' levels and digit
+/// reduction groups (`G2`, `G2X` / `G2Y` / `G2H`, `G2W`, `G3W`), the RoPE tables' levels and digit
 /// bits (`RLV`, `RBITS`), `CAP`, `LOOP`, the token loop (`WL`).
 pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
     let (px, py, k) = (pr.need("PX")?, pr.need("PY")?, pr.need("K")?);
@@ -97,6 +97,7 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
             col: pr.int("G2Y").unwrap_or(g2),
             head: pr.int("G2H").unwrap_or(g2),
             token_loop: pr.int("G2W").unwrap_or(24),
+            token_loop3: pr.int("G3W").unwrap_or(0),
         },
         segments: Segments {
             scores,

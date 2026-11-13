@@ -5,7 +5,9 @@
 
 use crate::floor::{Coord, Floor};
 use crate::plan::Plan;
-use crate::wiring::{Chain, Class, NoteKey, PASS, Path, Slot, Wiring, level2};
+use crate::wiring::{
+    Chain, Class, Link, NoteKey, PASS, Path, Slot, Tree, Wiring, level2, three_level,
+};
 
 use super::Block;
 
@@ -59,7 +61,41 @@ impl Block for TokenLoop {
     }
 }
 
-/// The head control PEs max-reduce into the middle row (two-level by `reduce.token_loop`;
+/// The max-reduce over `pts` into `pts[root]` ([`LOOP_REDUCE`]): a two-level chain in groups of
+/// `reduce.token_loop`, or with `reduce.token_loop3` (`G3W`) a three-level tree
+/// ([`three_level`]) on the chain's four colours. The merge (the larger value, ties to the
+/// lower id) is a total order, so either gives the same winner.
+pub fn loop_reduce(plan: &Plan, pts: Vec<Coord>, root: usize) -> Link {
+    let r = plan.partition.reduce;
+    if r.token_loop3 > 0 && r.token_loop > 0 {
+        let parent = three_level(
+            pts.len(),
+            root,
+            r.token_loop as usize,
+            r.token_loop3 as usize,
+        );
+        Link::Tree(Tree {
+            pts,
+            root,
+            parent,
+            colours: [LOOP_L1[0], LOOP_L1[1], LOOP_L2[0], LOOP_L2[1]],
+            cast: LOOP_CAST,
+            slot: LOOP_REDUCE,
+        })
+    } else {
+        Link::Chain(Chain {
+            pts,
+            root,
+            l1: LOOP_L1,
+            l2: level2(LOOP_L2, r.token_loop),
+            cast: LOOP_CAST,
+            loopback: false,
+            slot: LOOP_REDUCE,
+        })
+    }
+}
+
+/// The head control PEs max-reduce into the middle row ([`loop_reduce`];
 /// [`LOOP_REDUCE`]). Then per head column `c`, with `te` / `to` unit 0's CX rows `2c` / `2c + 1`
 /// (adjacent rows inside the head's rows): up the column to the head's top row ([`EMB_UP`]),
 /// down to `te` ([`EMB_DOWN`], when `te` is below the top), across to `to` ([`EMB_SPLIT`]), and
@@ -71,15 +107,11 @@ pub fn token_loop(plan: &Plan, floor: &Floor, w: &mut Wiring) -> R<()> {
         return Err("wiring: the token loop wants a head control column".into());
     };
     let (y0, hr) = (hb.rect.y, hb.rect.h);
-    w.chain(Chain {
-        pts: (y0..y0 + hr).map(|y| Coord::new(hcol, y)).collect(),
-        root: (hr / 2) as usize,
-        l1: LOOP_L1,
-        l2: level2(LOOP_L2, plan.partition.reduce.token_loop),
-        cast: LOOP_CAST,
-        loopback: false,
-        slot: LOOP_REDUCE,
-    });
+    w.link(loop_reduce(
+        plan,
+        (y0..y0 + hr).map(|y| Coord::new(hcol, y)).collect(),
+        (hr / 2) as usize,
+    ));
     let u0 = floor.units.first().ok_or("wiring: no units")?;
     for c in 0..hb.cols() {
         let x = hb.col_x(c);

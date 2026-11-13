@@ -657,6 +657,99 @@ mod tests {
         }
     }
 
+    /// The token loop's three-level max-reduce (`G3W`) composes on every layout with a token
+    /// loop, the shipping heads' control lines included, and lays as its tree: each member's
+    /// send colour leaves its ramp and reaches its parent's ramp, where the parent takes it on a
+    /// queue (a member's level-1 / level-2 input, the root's half).
+    #[test]
+    fn a_three_level_max_reduce_lays_its_tree() {
+        use crate::fabric::{Endpoint, RouteWord};
+        use crate::wiring::Link;
+        let tiny = |file: &str| -> crate::plan::Shape {
+            let path = format!(
+                "{}/tools/wafer/baseline/shapes/{file}.json",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        let mut plans = Vec::new();
+        for (name, preset, set) in [
+            ("qwen35-d0.8b-bf16-kv-bf16", "0.8b", "G2W=8,G3W=8"),
+            ("qwen35-d9b-bf16-kv-bf16", "9b", "G2W=8,G3W=8"),
+            ("gemma4-12b-bf16-kv-bf16", "g12", "G2W=8,G3W=8"),
+            ("gptoss-20b-bf16-mxfp4-kv-bf16", "full", "G2W=7,G3W=7"),
+        ] {
+            let ask = Ask {
+                set: set.into(),
+                ..Ask::preset(preset)
+            };
+            plans.push((name, plan(&trace(name), &ask).unwrap().plan));
+        }
+        for (file, preset, set) in [
+            ("tiny_q35_t08", "tiny-t08", "G2W=2,G3W=2"),
+            ("tiny_q35_t08", "tiny-t08", "HR=48,G2W=3,G3W=2"),
+            ("tiny_gemma", "tiny-gemma", "G2W=1,G3W=1"),
+            ("tiny_g12", "tiny-g12", "G2W=2,G3W=2"),
+            ("tiny_gptoss", "tiny-gptoss", "G2W=2,G3W=3"),
+        ] {
+            let ask = Ask {
+                set: set.into(),
+                ..Ask::preset(preset)
+            };
+            plans.push((file, plan_shape(tiny(file), &ask).unwrap().plan));
+        }
+        for (what, p) in plans {
+            let prog = Program::of(p).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let trees: Vec<_> = prog
+                .wiring
+                .links
+                .iter()
+                .filter_map(|l| match l {
+                    Link::Tree(t) => Some(t),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(trees.len(), 1, "{what}: one max-reduce tree");
+            let t = trees[0];
+            let f = &prog.fabric;
+            let takes = |at, c| match f.io(at).slots.get(&t.slot) {
+                Some(Endpoint::Member(m)) => m.recv1 == Some(c) || m.recv2 == Some(c),
+                Some(Endpoint::Root(r)) => r.lo == Some(c) || r.hi == Some(c),
+                _ => false,
+            };
+            for (i, &at) in t.pts.iter().enumerate() {
+                let Some(p) = t.parent[i] else { continue };
+                let Some(Endpoint::Member(m)) = f.io(at).slots.get(&t.slot) else {
+                    panic!("{what}: point {i} is no member");
+                };
+                let c = m.send;
+                assert!(f.route(at, c).unwrap().from_ramp(), "{what}: {i} sends");
+                let mut j = i;
+                loop {
+                    let w = f.route(t.pts[j], c).unwrap();
+                    if w.to_ramp() {
+                        break;
+                    }
+                    let next = [j.wrapping_sub(1), j + 1]
+                        .into_iter()
+                        .filter(|&k| k < t.pts.len())
+                        .find(|&k| {
+                            t.pts[j]
+                                .dir_to(t.pts[k])
+                                .is_some_and(|d| w.0 & RouteWord::tx(d) != 0)
+                        })
+                        .unwrap_or_else(|| panic!("{what}: {i}'s sum stops at {j}"));
+                    j = next;
+                }
+                assert_eq!(j, p, "{what}: {i}'s sum lands at {j}, not its parent {p}");
+                assert!(
+                    takes(t.pts[p], c),
+                    "{what}: {p} takes no queue of {i}'s sum"
+                );
+            }
+        }
+    }
+
     /// A reduction group need not divide its chain: the last group of each half is short. Tiny
     /// q35 with G2 / G2Y 3 over 8 and tiny gpt-oss with G2 3 run the golden in the simulator;
     /// the chip runs that went wrong at G2Y 10 over 128 and G2 24 over 160 were greedy runs

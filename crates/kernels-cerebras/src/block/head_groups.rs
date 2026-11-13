@@ -9,15 +9,12 @@ use crate::floor::{Coord, Floor, FloorBuilder};
 use crate::plan::Plan;
 use crate::program::Program;
 use crate::weights::Copies;
-use crate::wiring::{Chain, Class, Multicast, NoteKey, Path, Slot, Wiring, level2};
+use crate::wiring::{Class, Multicast, NoteKey, Path, Slot, Wiring};
 
 use super::Block;
 use super::head::{self, HEAD_COL_CAST, HEAD_IN, HeadCopies, ROLE, ROLE_SOURCE};
 use super::row_runs::dims_of;
-use super::token_loop::{
-    self, EMB_DOWN, EMB_IN, EMB_UP, EMB_WEST, LOOP_CAST, LOOP_L1, LOOP_L2, LOOP_REDUCE, TURN,
-    TURN_EVEN, TURN_TOP,
-};
+use super::token_loop::{self, EMB_DOWN, EMB_IN, EMB_UP, EMB_WEST, TURN, TURN_EVEN, TURN_TOP};
 use super::units::{HANDOFF_ACROSS, X_OUT};
 
 type R<T> = Result<T, String>;
@@ -99,15 +96,11 @@ impl Block for HeadGroups {
         let hb = &floor.head;
         let hcol = hb.ctl_x().ok_or("head groups: no control column")?;
         let (y0, hr) = (hb.rect.y, hb.rect.h);
-        w.chain(Chain {
-            pts: (y0..y0 + hr).map(|y| Coord::new(hcol, y)).collect(),
-            root: (hr / 2) as usize,
-            l1: LOOP_L1,
-            l2: level2(LOOP_L2, plan.partition.reduce.token_loop),
-            cast: LOOP_CAST,
-            loopback: false,
-            slot: LOOP_REDUCE,
-        });
+        w.link(token_loop::loop_reduce(
+            plan,
+            (y0..y0 + hr).map(|y| Coord::new(hcol, y)).collect(),
+            (hr / 2) as usize,
+        ));
         let (u0, ul) = match (floor.units.first(), floor.units.last()) {
             (Some(a), Some(b)) if a.rect.y == b.rect.y => (a, b),
             _ => return Err("head groups: unit 0 and the last unit share no rows".into()),

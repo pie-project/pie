@@ -10,7 +10,8 @@ use serde::Serialize;
 use super::floor::{Coord, Dir, Floor, Grid};
 use super::role::Kind;
 use super::wiring::{
-    Chain, Class, LOOPBACK, Link, Multicast, NoteKey, Path, Port, Slot, SlotKind, Turn, Wiring,
+    Chain, Class, LOOPBACK, Link, Multicast, NoteKey, Path, Port, Slot, SlotKind, Tree, Turn,
+    Wiring,
 };
 
 /// A physical colour (0 .. [`COLOURS`]).
@@ -382,6 +383,149 @@ impl Lay<'_> {
         self.bind(r, ch.slot, Endpoint::Root(rq))
     }
 
+    /// A reduction tree ([`Tree`]): each child's link coloured apart from every link it shares a
+    /// PE with, the members' queues by their children (nearest first), the root's by side, the
+    /// multicast back out as a chain's.
+    fn tree(&mut self, t: &Tree) -> Result<(), String> {
+        let (pts, root, n) = (&t.pts, t.root, t.pts.len());
+        if root >= n || t.parent.len() != n || t.parent[root].is_some() {
+            return Err(format!("fabric: tree root {root} of {n} points"));
+        }
+        let pool = t
+            .colours
+            .iter()
+            .map(|&c| self.colour(c))
+            .collect::<Result<Vec<_>, _>>()?;
+        let m = self.colour(t.cast)?;
+        // the links (child, parent), each toward the root
+        let mut links = Vec::with_capacity(n);
+        for (i, p) in t.parent.iter().enumerate() {
+            if i == root {
+                continue;
+            }
+            let p = p.ok_or_else(|| format!("fabric: tree point {i} has no parent"))?;
+            let toward = if i < root {
+                p > i && p <= root
+            } else {
+                p < i && p >= root
+            };
+            if !toward {
+                return Err(format!(
+                    "fabric: tree point {i}'s parent {p} not toward the root {root}"
+                ));
+            }
+            links.push((i, p));
+        }
+        let span = |(i, p): (usize, usize)| (i.min(p), i.max(p));
+        let mut order: Vec<usize> = (0..links.len()).collect();
+        order.sort_by_key(|&e| span(links[e]));
+        let mut col = vec![usize::MAX; links.len()];
+        // left ends first: a link overlaps an earlier one iff that one reaches its left end
+        let mut open: Vec<(usize, usize)> = Vec::new(); // (right end, colour) of the links so far
+        for &e in &order {
+            let (a, b) = span(links[e]);
+            open.retain(|&(r, _)| r >= a);
+            let c = (0..pool.len())
+                .find(|c| open.iter().all(|&(_, oc)| oc != *c))
+                .ok_or_else(|| {
+                    format!(
+                        "fabric: tree over {} PEs at point {a} wants more than {} colours",
+                        open.len() + 1,
+                        pool.len()
+                    )
+                })?;
+            col[e] = c;
+            open.push((b, c));
+        }
+        let mut kids: Vec<Vec<(usize, Colour)>> = vec![Vec::new(); n];
+        let mut send = vec![None; n];
+        for (e, &(i, p)) in links.iter().enumerate() {
+            let c = pool[col[e]];
+            let step = |j: usize| if p < i { j - 1 } else { j + 1 };
+            let back = |j: usize| if p < i { j + 1 } else { j - 1 };
+            let mut j = i;
+            loop {
+                let rx = if j == i {
+                    RX_R
+                } else {
+                    RouteWord::rx(Self::dir(pts[j], pts[back(j)])?)
+                };
+                let tx = if j == p {
+                    TX_R
+                } else {
+                    RouteWord::tx(Self::dir(pts[j], pts[step(j)])?)
+                };
+                self.add(pts[j], c, rx | tx)?;
+                if j == p {
+                    break;
+                }
+                j = step(j);
+            }
+            kids[p].push((i, c));
+            send[i] = Some(c);
+        }
+        for (i, &p) in pts.iter().enumerate() {
+            let mut k = std::mem::take(&mut kids[i]);
+            k.sort_by_key(|&(j, _)| j.abs_diff(i));
+            if i == root {
+                let side = |lo: bool| {
+                    let s: Vec<Colour> = k
+                        .iter()
+                        .filter(|&&(j, _)| (j < i) == lo)
+                        .map(|&(_, c)| c)
+                        .collect();
+                    match s.len() {
+                        0 => Ok(None),
+                        1 => Ok(Some(s[0])),
+                        _ => Err(format!(
+                            "fabric: tree root {root} with {} children a side",
+                            s.len()
+                        )),
+                    }
+                };
+                let rq = RootQueues {
+                    lo: side(true)?,
+                    hi: side(false)?,
+                };
+                let mut tw = 0;
+                if i > 0 {
+                    tw |= RouteWord::tx(Self::dir(p, pts[i - 1])?);
+                }
+                if i < n - 1 {
+                    tw |= RouteWord::tx(Self::dir(p, pts[i + 1])?);
+                }
+                self.add(p, m, RX_R | tw)?;
+                self.bind(p, t.slot, Endpoint::Root(rq))?;
+                continue;
+            }
+            let role = match k.len() {
+                0 => member_role::LEAF,
+                1 => member_role::MID,
+                2 => member_role::GROUP_HEAD,
+                c => return Err(format!("fabric: tree point {i} with {c} children")),
+            };
+            let low = i < root;
+            let tow = Self::dir(p, if low { pts[i + 1] } else { pts[i - 1] })?;
+            let far = if low { i > 0 } else { i < n - 1 };
+            let mw = RouteWord::rx(tow)
+                | TX_R
+                | if far {
+                    RouteWord::tx(tow.opposite())
+                } else {
+                    0
+                };
+            self.add(p, m, mw)?;
+            let member = ChainMember {
+                role,
+                send: send[i].ok_or("fabric: a tree member sends nothing")?,
+                recv1: k.first().map(|&(_, c)| c),
+                recv2: k.get(1).map(|&(_, c)| c),
+            };
+            self.bind(p, t.slot, Endpoint::Member(member))?;
+        }
+        Ok(())
+    }
+
     /// A multicast from its source.
     fn multicast(&mut self, mc: &Multicast) -> Result<(), String> {
         let (pts, src, n) = (&mc.pts, mc.src, mc.pts.len());
@@ -486,6 +630,7 @@ impl Fabric {
         for link in &w.links {
             match link {
                 Link::Chain(c) => l.chain(c)?,
+                Link::Tree(t) => l.tree(t)?,
                 Link::Multicast(m) => l.multicast(m)?,
                 Link::Path(p) => l.path(p)?,
                 Link::Turn(t) => l.turn(t)?,

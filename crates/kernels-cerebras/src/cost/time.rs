@@ -33,6 +33,8 @@ pub const SPAN_ROW: f64 = 1.267e-5;
 pub const SPAN_COL: f64 = 0.0;
 /// ms a head element: the head PE's stamped matvec phase (0.537 cycles an element).
 pub const HEAD: f64 = 0.537 * CYCLE;
+/// ms a cycle of the token loop's max-reduce ([`Features::loop_reduce`]): the chip's cycle.
+pub const LOOP_REDUCE: f64 = CYCLE;
 
 /// The chip's decode ms a step of each shipping model (its shape's signature) under the program
 /// its pinned plan builds: the bare step (wafer-bench, runs 1151-1279) where the chip ran it, else
@@ -58,6 +60,7 @@ pub fn partition(f: &Features) -> f64 {
         + SPAN_ROW * f.span_rows
         + SPAN_COL * f.span_cols
         + HEAD * f.head
+        + LOOP_REDUCE * f.loop_reduce
 }
 
 /// A layer's own cost, in ms: read off the measured step of the model's shipping `reference` plan,
@@ -101,6 +104,20 @@ mod tests {
                 t(g)
             );
         }
+    }
+
+    /// The token loop's max-reduce: the three-level tree shortens the shipping control lines'
+    /// critical path (0.8B's 1,153 head rows, the mini's 748 band columns at G2W 24) by more
+    /// than a third, and on a line too short for it (a tiny head of 10 rows) costs no more than
+    /// a hop's merge.
+    #[test]
+    fn the_three_level_max_reduce_is_shorter() {
+        use super::super::loop_reduce_cycles as lr;
+        for n in [1153, 748] {
+            let (two, three) = (lr(n, 24, 0), lr(n, 8, 6));
+            assert!(three < 0.65 * two, "{n}: {three} vs {two}");
+        }
+        assert!(lr(10, 2, 2) <= lr(10, 2, 0) + 80.0);
     }
 
     /// What moving a pinned plan's keys did to the bare step on the chip (requests 1151-1306),

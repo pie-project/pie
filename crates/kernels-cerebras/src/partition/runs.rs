@@ -39,7 +39,7 @@ pub fn groups_split(py: u32, yc: u32, ra: u32, ga: u32, gw: u32) -> Vec<Vec<u32>
 /// rows `r < RA` with HcA dims and the scores segments, the plain rows with HcW); the sliding
 /// window over the RA KV rows (NES entries a row: exact where RA divides it); the head one
 /// column a row group, VR vocabulary rows a head PE (a multiple of 8). Overrides: `NEG`,
-/// `G2`, `G2W`, `CAP`, `LOOP`.
+/// `G2`, `G2W`, `G3W`, `CAP`, `LOOP`.
 pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
     let (px, py, ra) = (pr.need("PX")?, pr.need("PY")?, pr.need("RA")?);
     let (hca, hcw, swa) = (pr.need("HcA")?, pr.need("HcW")?, pr.need("SWA")?);
@@ -89,6 +89,7 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
                 col: g2,
                 head: g2,
                 token_loop: pr.need("G2W")?,
+                token_loop3: pr.int("G3W").unwrap_or(0),
             },
             segments: Segments {
                 scores: swa,

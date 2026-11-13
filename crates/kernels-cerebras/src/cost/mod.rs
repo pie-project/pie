@@ -33,6 +33,9 @@ pub struct Features {
     /// The head's elements one head PE multiplies a step (its vocabulary rows times its share of
     /// the hidden).
     pub head: f64,
+    /// Cycles a step the token loop's max-reduce takes ([`loop_reduce_cycles`]), the head
+    /// control line's slower half into its middle.
+    pub loop_reduce: f64,
 }
 
 impl Features {
@@ -87,6 +90,17 @@ impl Features {
         let half = |a: u32, b: u32, g: u32| chain_cycles(a, g).max(chain_cycles(b, g));
         let chain = layers * 2.0 * (half(cl, ch, p.reduce.row) + half(rl, rh, p.reduce.col));
         let head = f64::from(p.head.vocab_rows) * (h / f64::from(p.head.cols.max(1))).ceil();
+        // the control line: the band's row of head columns (gpt-oss), else a column of head rows
+        let line = if p.attn_cols.is_some() {
+            p.head.cols
+        } else {
+            p.head.rows
+        };
+        let loop_reduce = if plan.contract.token_loop {
+            loop_reduce_cycles(line, p.reduce.token_loop, p.reduce.token_loop3)
+        } else {
+            0.0
+        };
         Features {
             layers,
             matvec,
@@ -95,8 +109,55 @@ impl Features {
             span_cols,
             kv,
             head,
+            loop_reduce,
         }
     }
+}
+
+/// A head control PE's merge of a received (value, id) pair into its own and its send on, in
+/// cycles. Fitted to the fabric simulator's max-reduce phase (the root's stamps 67 -> 68) on
+/// tiny Qwen3.5 with 48 head rows (`scratch/genD/headmax`): 610 cycles as the chain at G2W=5,
+/// 533 as the tree at G2W=2, G3W=4 (the model: 612, 534). On the mini's chip run (1203: 748
+/// band columns, G2W=24) the phase took 3,594 cycles, the model 3,030.
+const LOOP_MERGE: f64 = 75.0;
+/// A router hop the pairs pass on their way, in cycles.
+const LOOP_WIRE: f64 = 0.5;
+
+/// The cycles the token loop's max-reduce over a control line of `n` PEs takes into its middle
+/// (`n / 2`): the two-level chain in groups of `g1` (`G2W`), or with `g2` (`G3W`) > 0 the
+/// three-level tree ([`crate::wiring::three_level`]). Each PE merges once its children's pairs
+/// are in ([`tree_cycles`]).
+#[must_use]
+pub fn loop_reduce_cycles(n: u32, g1: u32, g2: u32) -> f64 {
+    let (n, root) = (n as usize, (n / 2) as usize);
+    let parent = if g2 > 0 && g1 > 0 {
+        crate::wiring::three_level(n, root, g1 as usize, g2 as usize)
+    } else {
+        crate::wiring::two_level(n, root, g1 as usize)
+    };
+    tree_cycles(&parent, root, LOOP_MERGE, LOOP_WIRE)
+}
+
+/// The cycles a reduction tree over a line (`parent[i]`: the point `i` sends to, `None` at
+/// `root`) takes from every point's own value to the last child's sum at the root: a point
+/// sends `merge` cycles after the last of its children's sums is in (a leaf `merge` after the
+/// start), a sum `wire` cycles a hop on its way.
+#[must_use]
+pub fn tree_cycles(parent: &[Option<usize>], root: usize, merge: f64, wire: f64) -> f64 {
+    let n = parent.len();
+    let mut order: Vec<usize> = (0..n).filter(|&i| i != root).collect();
+    // children are farther from the root than their parents: the farthest first
+    order.sort_by_key(|&i| std::cmp::Reverse(i.abs_diff(root)));
+    let mut ready = vec![0.0f64; n];
+    let mut sent = vec![0.0f64; n];
+    for &i in &order {
+        sent[i] = ready[i] + merge;
+        if let Some(p) = parent[i] {
+            let at = sent[i] + wire * i.abs_diff(p) as f64;
+            ready[p] = ready[p].max(at);
+        }
+    }
+    ready[root]
 }
 
 /// A member's add-and-forward a level-1 hop, in cycles (the fabric simulator: a row chain of 128

@@ -313,6 +313,15 @@ pub struct ReduceGroups {
     pub col: u32,
     pub head: u32,
     pub token_loop: u32,
+    /// The token loop's max-reduce in three levels (`G3W`): level-2 groups of this many
+    /// `token_loop` groups, the level-2 sums chained by a third level (0: two levels, the
+    /// chain). Same winner either way: the merge is a total order (ties to the lower id).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub token_loop3: u32,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]

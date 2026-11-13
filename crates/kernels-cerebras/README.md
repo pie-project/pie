@@ -49,7 +49,8 @@ column 0, then up column 1, and so on.
   the real, lower id; zero rows would win whenever every real logit is negative. The host also
   truncates logits rows to the vocabulary and refuses a ring id past it.
 - **Wafer token loop** (`WL 1`). The rows' (max, id) pairs are max-reduced down the head control
-  column. The root records the winner in `ring`, or takes `force[s]` for a forced prompt. The
+  column (a two-level chain in groups of G2W, or with G3W a three-level tree on the same colours
+  and queues; the same winner, ties to the lower id). The root records the winner in `ring`, or takes `force[s]` for a forced prompt. The
   winner row's head PEs send their embedding slices back to unit 0's CX rows, so a launch runs
   many tokens without the host.
 - **Collectives.** Every reduction is a two-level streamed chain (groups of G2) into a control

@@ -279,6 +279,17 @@ which 7 cycles an add-forward, 7 a merge and 3 a router hop reproduce. That is t
 the best G2 is 12 where the halves are 128 (the Qwen3.5s, E4B, Qwen3-8B), 16 on the 12B (172 and
 141), 8 of E2B's 8 / 16 / 24.
 
+The token loop's max-reduce down the head control line (`cost::loop_reduce_cycles`) is a tree's
+critical path (`cost::tree_cycles`): a PE merges a (value, id) pair 75 cycles after its last
+child's is in, a pair 0.5 cycles a hop on its way, fitted to the simulator's max-reduce phase on a
+48-row tiny head (610 cycles as the chain at G2W=5, 533 as the tree at G2W=2, G3W=4). With `G3W`
+the line reduces in three levels (`wiring::three_level`: each half in level-3 groups of
+`1 + G2W G3W`, the group's first PE taking the level-2 sum of the rest and the level-3 sum from
+beyond), on the chain's four colours and two input queues, so `head_ctl.csl` is unchanged; the
+merge is a total order (the larger value, ties to the lower id), so the winner is the same. On the
+0.8B's 1,153 rows the model gives 3,813 cycles at G2W=24 and 1,985 at G2W=8, G3W=8; on the
+mini's 748 band columns 3,030 and 1,660 at G2W=7, G3W=9 (the chip measured 3,594 for the chain).
+
 The chip's rate a chain cycle is fitted to what moving a pinned plan's keys did to the bare step
 (requests 1151-1306, 25 moves: Llama VR=112 / 144 / 180 and G2=8, 0.8B PX=128 and G2=8 / 12, Gemma
 12B's pick and G2=8 / 12, 4B PY=192 and G2=8 / 12, Qwen3-8B G2=8 / 16, G2=8 / 12 / 24 on the 9B,

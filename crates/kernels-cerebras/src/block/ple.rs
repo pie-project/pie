@@ -138,6 +138,7 @@ impl Block for Ple {
         for l in &w.links {
             let pts: &[Coord] = match l {
                 Link::Chain(c) => &c.pts,
+                Link::Tree(t) => &t.pts,
                 Link::Multicast(m) => &m.pts,
                 Link::Path(p) => &p.pts,
                 Link::Turn(t) => std::slice::from_ref(&t.at),

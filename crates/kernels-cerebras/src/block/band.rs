@@ -18,7 +18,7 @@ use crate::wiring::{Chain, Class, Multicast, Path, Slot, Wiring, level2, loopbac
 
 use super::Block;
 use super::head::{self, HEAD_COL_CAST, HEAD_IN, HEAD_ROW_REDUCE, HEAD_ROW_WORD};
-use super::token_loop::{self, EMB_WEST, LOOP_CAST, LOOP_L1, LOOP_L2, LOOP_REDUCE};
+use super::token_loop::{self, EMB_WEST};
 use super::units::{HANDOFF_OUT, ROW_L1, ROW_L2, X_OUT};
 
 type R<T> = Result<T, String>;
@@ -217,15 +217,11 @@ impl Block for BandLoop {
     fn wire(&self, plan: &Plan, floor: &Floor, w: &mut Wiring) -> R<()> {
         let at = At::of(floor);
         let cols = floor.head.rect.w;
-        w.chain(Chain {
-            pts: (0..cols).map(|j| Coord::new(j, at.ctl())).collect(),
-            root: (cols / 2) as usize,
-            l1: LOOP_L1,
-            l2: level2(LOOP_L2, plan.partition.reduce.token_loop),
-            cast: LOOP_CAST,
-            loopback: false,
-            slot: LOOP_REDUCE,
-        });
+        w.link(token_loop::loop_reduce(
+            plan,
+            (0..cols).map(|j| Coord::new(j, at.ctl())).collect(),
+            (cols / 2) as usize,
+        ));
         let u0 = floor.units.first().ok_or("band: no units")?;
         if u0.rect.y + u0.rect.h != at.y0 {
             return Err("band: unit 0 sits on the band".into());

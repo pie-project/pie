@@ -21,7 +21,7 @@ type R<T> = Result<T, String>;
 ///
 /// Units of K = layers / units, a row's dims the hidden over PY; a scores segment a KV head's
 /// attention columns; the band head HVC columns of VR vocabulary rows (a multiple of 8, the
-/// head control's argmax). Overrides: `NE`, `G2`, `G2W`, `CAP`, `LOOP`, `WL` (the token loop;
+/// head control's argmax). Overrides: `NE`, `G2`, `G2W`, `G3W`, `CAP`, `LOOP`, `WL` (the token loop;
 /// on unless 0).
 pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
     let (ax, mx, py) = (pr.need("AX")?, pr.need("MX")?, pr.need("PY")?);
@@ -107,6 +107,7 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
             col: pr.need("G2")?,
             head: pr.need("G2")?,
             token_loop: pr.need("G2W")?,
+            token_loop3: pr.int("G3W").unwrap_or(0),
         },
         segments: Segments {
             scores: swa,

@@ -22,7 +22,7 @@ type R<T> = Result<T, String>;
 /// over the KV rows (`PYW`: the window over the fewest sliding entries a row, NES, where that
 /// divides it, so the ring is exact; else every row, and the kernel masks the older entries);
 /// the head PY / 2 columns of VR vocabulary rows (a multiple of 8). Overrides: `PYW`, `NEG`,
-/// `G2`, `G2W`, `CAP`, `LOOP`.
+/// `G2`, `G2W`, `G3W`, `CAP`, `LOOP`.
 pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
     let (px, py, nu) = (pr.need("PX")?, pr.need("PY")?, pr.need("NU")?);
     let n = s.layers.len() as u32;
@@ -72,6 +72,7 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
             col: pr.need("G2")?,
             head: pr.need("G2")?,
             token_loop: pr.need("G2W")?,
+            token_loop3: pr.int("G3W").unwrap_or(0),
         },
         // a scores segment a half row
         segments: Segments {
