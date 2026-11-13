@@ -199,6 +199,22 @@ impl Context {
         self.working_set
     }
 
+    /// The bytes this device holds for the process now
+    /// (`currentAllocatedSize`): every buffer, heap and the driver's own
+    /// allocations on our behalf.
+    #[must_use]
+    pub fn allocated(&self) -> u64 {
+        #[cfg(target_vendor = "apple")]
+        {
+            use objc2_metal::MTLDevice as _;
+            self.device().currentAllocatedSize() as u64
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            0
+        }
+    }
+
     /// The working set other processes hold now: what of it the system
     /// could not hand this one (app memory, wired and compressed pages; the
     /// file cache is counted as handed). Measured before a load wires anything,
