@@ -193,12 +193,31 @@ impl Lane {
         engine: Option<EngineBox>,
         stats: Arc<SchedulerStats>,
     ) -> Self {
+        Self::spawn_lending(
+            engine_idx,
+            engine,
+            stats,
+            Box::new(super::arming::PlannerLender),
+        )
+    }
+
+    /// [`Self::spawn`], arming steps lent their room by `lender`.
+    pub(super) fn spawn_lending(
+        engine_idx: usize,
+        engine: Option<EngineBox>,
+        stats: Arc<SchedulerStats>,
+        lender: Box<dyn super::arming::Lender>,
+    ) -> Self {
         let (launch_tx, launch_rx) = crate::rt::channel::unbounded::<LaneRequest>();
         let (control_tx, control_rx) = crate::rt::channel::unbounded::<LaneRequest>();
         let landed_tx = control_tx.clone();
         let thread = crate::rt::thread::Builder::new()
             .name(format!("pie-engine-{engine_idx}"))
-            .spawn(move || Self::run(engine_idx, engine, launch_rx, control_rx, landed_tx, stats))
+            .spawn(move || {
+                Self::run(
+                    engine_idx, engine, launch_rx, control_rx, landed_tx, stats, lender,
+                )
+            })
             .expect("spawn pie-engine lane thread");
         Self {
             launch_tx,
@@ -252,11 +271,15 @@ impl Lane {
         state
     }
 
+    /// The next request, `idle` called while none waits for as long as it
+    /// answers there is more to do (one bounded piece a call).
     fn next_request(
         launch_rx: &crate::rt::channel::Receiver<LaneRequest>,
         control_rx: &crate::rt::channel::Receiver<LaneRequest>,
         turn: &mut LaneTurn,
+        idle: &mut dyn FnMut() -> super::arming::Step,
     ) -> std::result::Result<LaneRequest, ()> {
+        use super::arming::Step;
         use crate::rt::channel::TryRecvError;
         #[cfg(target_arch = "wasm32")]
         const ENGINE_LANE_HOT_US: u64 = 0;
@@ -297,8 +320,20 @@ impl Lane {
                 }
                 Err(TryRecvError::Empty) => {}
             }
+            let idle = idle();
+            if idle == Step::Stepped {
+                spin_until = Instant::now() + hot_window;
+                continue;
+            }
             if Instant::now() < spin_until {
                 std::hint::spin_loop();
+                continue;
+            }
+            // Arming waits on room to free: look again shortly rather
+            // than block until a request comes.
+            #[cfg(not(target_arch = "wasm32"))]
+            if idle == Step::Waiting {
+                std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
             let mut select = crate::rt::channel::Select::new();
@@ -316,6 +351,7 @@ impl Lane {
         control_rx: crate::rt::channel::Receiver<LaneRequest>,
         landed_tx: crate::rt::channel::Sender<LaneRequest>,
         stats: Arc<SchedulerStats>,
+        lender: Box<dyn super::arming::Lender>,
     ) {
         let mut channels = ChannelJoin::new();
         let mut landed_instances: HashMap<::engine::FrameId, Vec<Vec<::engine::InstanceId>>> =
@@ -348,16 +384,29 @@ impl Lane {
         }
         let mut stash: Option<LaneRequest> = None;
         let mut lane_turn = LaneTurn::default();
+        let mut arming = super::arming::Arming::new(engine_idx, engine.as_ref(), lender);
         loop {
+            // Between fires: a raise waiting on a rung not armed gets one
+            // composition of it before the next request, however busy
+            // (REDESIGN 2.5, `super::arming`).
+            if arming.raise_waits() {
+                arming.step(&mut engine, false);
+            } else {
+                arming.unfund();
+            }
             let request = match stash.take() {
                 Some(stashed) => {
                     lane_turn.took_launch();
                     stashed
                 }
-                None => match Self::next_request(&launch_rx, &control_rx, &mut lane_turn) {
-                    Ok(request) => request,
-                    Err(()) => break,
-                },
+                None => {
+                    match Self::next_request(&launch_rx, &control_rx, &mut lane_turn, &mut || {
+                        arming.step(&mut engine, true)
+                    }) {
+                        Ok(request) => request,
+                        Err(()) => break,
+                    }
+                }
             };
             let work = match &request {
                 LaneRequest::Control { .. } => Some(LaneWork::Control),
@@ -384,7 +433,10 @@ impl Lane {
                     ..
                 } => {
                     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let fault = arming.fault();
                         let result = match engine.as_mut() {
+                            // A load fault in arming fails every fire after it.
+                            _ if fault.is_some() => Err(fault.unwrap_or_default().to_string()),
                             Some(engine) => {
                                 crate::probe_fire!(stats.fire.execute.engine_fire_us, {
                                     Self::fire_frame(
@@ -501,7 +553,9 @@ impl Lane {
         std::mem::forget(engine);
         drop(channels);
         let mut turn = LaneTurn::default();
-        while let Ok(request) = Self::next_request(launch_rx, control_rx, &mut turn) {
+        while let Ok(request) = Self::next_request(launch_rx, control_rx, &mut turn, &mut || {
+            super::arming::Step::Over
+        }) {
             if let LaneRequest::Shutdown { response } = request {
                 let _ = response.send((None, ChannelJoin::new()));
                 return;

@@ -163,4 +163,14 @@ impl AllocationGrant {
     pub fn lend_rs(&mut self) -> &mut RsGrant {
         &mut self.rs.grant
     }
+
+    /// The device pages the grant holds, free slots no sequence holds.
+    pub fn kv_pages(&self) -> &[PhysicalKvPageId] {
+        &self.kv.pages
+    }
+
+    /// The fixed state (record) slots the grant holds.
+    pub fn rs_slots(&self) -> &[crate::store::rs::RsSlotId] {
+        &self.rs.grant.slots
+    }
 }
