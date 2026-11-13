@@ -145,6 +145,15 @@ pub struct Shell {
     /// How the arming fire's lanes treat their recurrent rows: a buffering
     /// treatment is recorded with lanes that land and replay nothing.
     arm_rs: record::RsBody,
+    /// Whether this shell arms its rungs past the smallest while it serves
+    /// ([`Shell::arm_step`]), and the lattice left arming.
+    arm_stepped: bool,
+    stepping: Option<arming::Arming>,
+    /// The slots the step in hand was lent: what its synthetic lanes name.
+    lent: Option<engine::live::ArmingLease>,
+    /// What the runtime reads of this shell while it serves: the rungs
+    /// armed.
+    live: engine::live::Live,
     /// The lattice waits for the starting weight residency: the load
     /// streams its weights, and bodies armed over the host copy would read
     /// every expert over the bus (`Staged::finish`).

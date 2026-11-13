@@ -407,7 +407,7 @@ fn load(fixture: &Fixture, cache: &Path) -> Shell {
 static SMALL_POOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shell {
-    Shell::load(Boot {
+    let mut shell = Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
         checkpoint: &fixture.container,
@@ -442,7 +442,27 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
     })
-    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model))
+    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    // `PIE_GOLDEN_ARM_STEPPED`: the load armed its smallest rung; the rest
+    // arm here a composition a step, over the room the shell states, as a
+    // runtime's lane would lend it.
+    let room = shell.arming_room();
+    let lent = engine::live::ArmingLease {
+        pages: (0..room.pages).collect(),
+        records: (0..room.records).collect(),
+    };
+    let mut steps = 0u32;
+    while shell
+        .arm_step(&lent)
+        .unwrap_or_else(|why| panic!("{} arms a step: {why}", fixture.model))
+    {
+        steps += 1;
+    }
+    if steps > 0 {
+        println!("stepped {} {steps}", fixture.model);
+        assert_eq!(shell.live().armed_through(), u32::MAX);
+    }
+    shell
 }
 
 /// The load's knobs: `PIE_GOLDEN_CHUNK` (bytes) sets the chunk size the
@@ -464,6 +484,7 @@ fn knobs() -> engine_cuda::Knobs {
     // `PIE_GOLDEN_ONE_WINDOW`: every windowed row in one window list.
     knobs.diagnostics.one_window = std::env::var_os("PIE_GOLDEN_ONE_WINDOW").is_some();
     knobs.diagnostics.arm_trace = std::env::var_os("PIE_GOLDEN_ARM_TRACE").is_some();
+    knobs.arm_stepped = std::env::var_os("PIE_GOLDEN_ARM_STEPPED").is_some();
     // `PIE_GOLDEN_TIER_INLINE`: tier copies ride the compute stream.
     knobs.diagnostics.tier_inline = std::env::var_os("PIE_GOLDEN_TIER_INLINE").is_some();
     // No weight shape stated: the tables and routed banks dense on the
