@@ -1498,3 +1498,7 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   (8B 19.5 vs 26.4 s, gemma 18.8 vs 20.6, 30B 21.2 vs 24.8, Qwen3.5 21.3 vs 36.5). c256 ~510 tok/s stall is
   intermittent on main too. Open: ROCm capacity -4.6% (M118's bodies stretch is held out of a flat range for good;
   fix sc/rocm-flat-fit in test).
+- A4 step 1 (813def0b, AMD): ROCm streams affine expert banks through the weight cache (layout, ranking, bank_table,
+  HIP biased / quantized selects read the table). MXFP4 (lane-ordered banks, bias_sum) and block FP8 stay resident
+  as main serves them. MI300X glm53-mini u4g64: cached / told held / moved = resident bitwise; host / mixed differ
+  at 6.25e-2 (per-route vs batch u4 arm, 0/12 top tokens) — strict host equality queued with step (b).
