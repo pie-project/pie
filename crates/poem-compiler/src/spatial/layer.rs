@@ -15,6 +15,12 @@
 //! The program is target-neutral: which nodes run (a spatial target serves one token a request
 //! at a time: [`single_token`]) is the caller's, and the placement, kernels and tiling of the
 //! phases are the target's.
+//!
+//! A reading that runs whole sequences a step (a diffusion transformer's denoise) is the stream
+//! regime instead: [`stream::lower`] reads it into the same phases, a body a row class of each
+//! layer, with attention over the step's own rows.
+
+pub mod stream;
 
 use std::collections::{HashMap, HashSet};
 
@@ -63,6 +69,15 @@ pub enum Mixer {
         k_dim: u32,
         v_dim: u32,
     },
+    /// Attention over the step's own rows (the stream regime): every row's keys and values held
+    /// on the tiles for the step, no cache; `causal`, a prefill's mask, else every row of the
+    /// step's group sees every other (a diffusion transformer's joint attention).
+    Joint {
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        causal: bool,
+    },
 }
 
 /// An op of a phase: its name, its output's width, the params it reads (by name, a layer's
@@ -110,6 +125,9 @@ pub enum Phase {
     /// A per-token input read from a table (a gather) and the ops on it before it meets the
     /// layer's vectors.
     SideIn { ops: Vec<Op> },
+    /// The stream regime: every row of the step has stored its keys and values before any query
+    /// reads them.
+    Barrier,
 }
 
 /// The phases of a layer, shared by every layer that has the same.
@@ -229,6 +247,10 @@ struct Reader<'t> {
     /// The layer that appends to each KV cache.
     owner: HashMap<ValueId, u32>,
     layers: &'t [Option<u32>],
+    /// The stream regime ([`stream`]): each node the host runs, `true` where it permutes rows
+    /// the units read (a row stream in), `false` a table (positions); empty in decode.
+    host: Vec<Option<bool>>,
+    stream: bool,
 }
 
 impl Reader<'_> {
@@ -299,6 +321,9 @@ impl Reader<'_> {
     /// Where a value made outside layer `l` is: the residual stream (a layer's output, or an
     /// activation of the model's width before the first) at the row roots; else anywhere.
     fn outside(&self, v: ValueId) -> At {
+        if self.stream {
+            return self.streamed(v);
+        }
         match self.def(v) {
             Some(Def::Op(n)) if self.layers[*n as usize].is_some() => At::Root(Axis::Row),
             Some(Def::Op(_)) if self.width(v) == self.hidden => At::Root(Axis::Row),
@@ -404,6 +429,8 @@ impl Body<'_, '_> {
         let (from, cast) = match self.at(x) {
             At::Root(a) => (a, true),
             At::Tiles(a) => (a, false),
+            // a stream's row (a host input, a lane vector) enters at the row roots
+            At::Any if self.r.stream => (Axis::Row, true),
             At::Any => return Err(format!("{}'s input is on no axis", op.op)),
         };
         if self.matvec_of == Some(x)
@@ -642,6 +669,7 @@ impl Body<'_, '_> {
             Operation::Linear(
                 Linear::MoeRoute { .. } | Linear::MoeCombine { .. } | Linear::MoeBiasSum { .. },
             ) => self.elementwise(op, &acts, &outs),
+            _ if self.r.stream => self.stream_node(&node.op, op, &acts, &outs),
             _ => Err(format!("{name} has no spatial lowering")),
         }
     }
@@ -721,6 +749,8 @@ pub fn lower(
         hidden,
         owner,
         layers: &analysis.layers,
+        host: Vec::new(),
+        stream: false,
     };
     let n_layers = analysis.layers.iter().flatten().max().map_or(0, |&l| l + 1);
     let mut bodies: Vec<Body> = (0..n_layers)
@@ -820,8 +850,8 @@ mod tests {
     }
 
     /// A short form of a body: each phase's letter (C cast, M matvec, R root, X mixer, S
-    /// segment, I side input) and axis.
-    fn form(b: &LayerBody) -> String {
+    /// segment, I side input, B barrier) and axis.
+    pub(super) fn form(b: &LayerBody) -> String {
         let ax = |a: &Axis| match a {
             Axis::Row => "r",
             Axis::Col => "c",
@@ -835,6 +865,7 @@ mod tests {
                 Phase::Mixer { ops, .. } => format!("X{}", ops.len()),
                 Phase::Segment { axis, .. } => format!("S{}", ax(axis)),
                 Phase::SideIn { ops } => format!("I{}", ops.len()),
+                Phase::Barrier => "B".into(),
             })
             .collect::<Vec<_>>()
             .join(" ")
