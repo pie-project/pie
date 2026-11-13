@@ -85,7 +85,6 @@ fn ready() -> Option<Shell> {
         context: 128,
         slots: 8,
         runahead: engine::runahead::Runahead::F1,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         profiles: None,
         residency: engine_metal::ResidencyPlan::default(),
     })

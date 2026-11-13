@@ -93,6 +93,11 @@ impl DeferredZeroBuffer {
         }
     }
 
+    /// The bytes it holds once first read.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.buffer.bytes()
+    }
+
     pub(crate) fn get(&self) -> Result<&Buffer> {
         if !self.initialized.get() {
             let mut buffer = self.buffer.clone();

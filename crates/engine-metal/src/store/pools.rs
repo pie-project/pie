@@ -1172,6 +1172,18 @@ impl Pools {
         self.pool.bytes()
     }
 
+    /// The device bytes the pool keeps beside its chunks: the row-streamed
+    /// tables' segment maps and the weight caches' tables.
+    #[must_use]
+    pub fn table_bytes(&self) -> u64 {
+        self.maps.as_ref().map_or(0, Buffer::bytes)
+            + self
+                .weight_caches
+                .iter()
+                .map(super::streamed::Cache::table_bytes)
+                .sum::<u64>()
+    }
+
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
         self.pool.committed_bytes()

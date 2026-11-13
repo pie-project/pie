@@ -199,25 +199,20 @@ impl Context {
         self.working_set
     }
 
-    /// The working set other processes hold now: what of it the system
-    /// could not hand this one (app memory, wired and compressed pages; the
-    /// file cache is counted as handed). Measured before a load wires anything,
-    /// it is what `device_memory_share` yields to, as on CUDA. 0
-    /// where the system does not say, and where memory is mapped as it is
-    /// asked for: a pool sized by what others hold at the moment of the load
-    /// would serve differently for it, and the Governor answers them as they
-    /// change.
+    /// The bytes this device holds for the process now
+    /// (`currentAllocatedSize`): every buffer, heap and the driver's own
+    /// allocations on our behalf.
     #[must_use]
-    pub fn held_elsewhere(&self) -> u64 {
-        // the sparse mapping is Metal 4's, so only an Apple build asks for it
+    pub fn allocated(&self) -> u64 {
         #[cfg(target_vendor = "apple")]
-        if matches!(self.sparse(), Ok(Some(_))) {
-            return 0;
+        {
+            use objc2_metal::MTLDevice as _;
+            self.device().currentAllocatedSize() as u64
         }
-        available_memory().map_or(0, |available| {
-            self.working_set
-                .saturating_sub(available.min(self.working_set))
-        })
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            0
+        }
     }
 
     #[must_use]
@@ -1008,45 +1003,6 @@ pub(crate) fn compile_options() -> Retained<objc2_metal::MTLCompileOptions> {
 #[cfg(target_vendor = "apple")]
 pub(crate) fn nsstring(text: &str) -> Retained<NSString> {
     NSString::from_str(text)
-}
-
-/// Unified memory the system could hand a process now, where it says: the
-/// host VM statistics are a macOS interface.
-fn available_memory() -> Option<u64> {
-    #[cfg(target_os = "macos")]
-    {
-        // SAFETY: `vm_statistics64` is a C struct of integers, for which all
-        // zero bytes is a valid value.
-        let mut stats: libc::vm_statistics64 = unsafe { core::mem::zeroed() };
-        let mut count = libc::HOST_VM_INFO64_COUNT;
-        // SAFETY: `stats` is a live vm_statistics64 and `count` states its
-        // size in words, as HOST_VM_INFO64 asks; the call writes at most that.
-        #[allow(deprecated, reason = "libc's mach bindings are what this crate links")]
-        let rc = unsafe {
-            libc::host_statistics64(
-                libc::mach_host_self(),
-                libc::HOST_VM_INFO64,
-                (&raw mut stats).cast(),
-                &raw mut count,
-            )
-        };
-        // SAFETY: a plain query.
-        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-        // What the system cannot hand out is what Activity Monitor calls
-        // used: app memory (anonymous pages a process may not give back),
-        // wired and compressed. The file cache, active or not, is handed out
-        // on demand, and a model's own weights sit in it after a read.
-        let used = (u64::from(stats.internal_page_count)
-            .saturating_sub(u64::from(stats.purgeable_count))
-            + u64::from(stats.wire_count)
-            + u64::from(stats.compressor_page_count))
-            * page;
-        (rc == libc::KERN_SUCCESS).then(|| Context::physical_memory().saturating_sub(used))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

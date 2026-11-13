@@ -73,6 +73,19 @@ pub struct Session {
 }
 
 impl Session {
+    /// The device bytes this instance holds: its own rings, and its stages'
+    /// launch tables and scratch.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.rings.bytes()
+            + self
+                .prepared
+                .iter()
+                .flatten()
+                .map(Prepared::bytes)
+                .sum::<u64>()
+    }
+
     pub fn bind(
         device: &Context,
         compiled: &Compiled,

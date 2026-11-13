@@ -66,6 +66,17 @@ impl Arena {
         Ok(())
     }
 
+    /// The bytes behind the store now: the widest carve a fire has mapped,
+    /// or the whole store where it is not sparse.
+    #[must_use]
+    pub fn mapped(&self) -> u64 {
+        #[cfg(target_vendor = "apple")]
+        if let Some((store, _)) = self.sparse.as_ref() {
+            return store.committed();
+        }
+        self.store.bytes()
+    }
+
     #[must_use]
     pub fn store(&self) -> &Buffer {
         &self.store

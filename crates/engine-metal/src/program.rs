@@ -66,6 +66,21 @@ impl Plane {
         }
     }
 
+    /// The device bytes guest programs hold, as (state, fire): shared
+    /// channel rings and each instance's rings and launch tables are kept
+    /// between fires; the batches of lanes launched together are a fire's.
+    #[must_use]
+    pub fn bytes(&self) -> (u64, u64) {
+        let state = self.channels.values().map(|ring| ring.bytes()).sum::<u64>()
+            + self
+                .instances
+                .values()
+                .map(|bound| bound.session.bytes())
+                .sum::<u64>();
+        let fire = self.batches.values().map(launch::Batch::bytes).sum();
+        (state, fire)
+    }
+
     #[must_use]
     pub const fn stats(&self) -> eta_exec::CacheStats {
         self.cache.stats()
