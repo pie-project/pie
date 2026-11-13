@@ -6,6 +6,12 @@
 //! own lane, routed experts, an expert-parallel dispatch and combine, a
 //! tensor-parallel sum and gather) and refuses the rest.
 //!
+//! A stream step ([`Forward::stream`], `stream.rs`) runs several lanes at once,
+//! each its own request word: a diffusion transformer's denoise reading, its
+//! text and image lanes attending each other, with the ops it adds (layer
+//! norms, modulations, axial rotations, attention over the step's rows, row
+//! permutations, the latent's patches).
+//!
 //! Each value is f32 on the host, rounded to bf16 where the trace types it
 //! so. A row's result depends only on that row (and, in attention, on its
 //! lane's earlier rows), never on which other rows a step or a rank holds:
@@ -34,6 +40,9 @@ use poem_ir::{
 };
 
 pub use crate::exchange::{Exchange, Post};
+pub use stream::{StreamLane, StreamStep};
+
+mod stream;
 
 /// A value as the forward holds it: rows of `width` elements.
 #[derive(Clone, Debug)]
@@ -336,6 +345,7 @@ impl Forward {
             lanes: &mut self.lanes,
             group: self.group.as_ref(),
             placed: &self.placed,
+            rows: None,
         };
         let mut aliases = Vec::new();
         for (at, node) in self.trace.nodes.iter().enumerate() {
@@ -434,11 +444,17 @@ struct Run<'a> {
     lanes: &'a mut Vec<Lane>,
     group: Option<&'a Group>,
     placed: &'a std::collections::BTreeMap<u32, Placed>,
+    /// A stream step's lanes ([`Forward::stream`]): each row's lane, the merges made ahead.
+    rows: Option<&'a stream::RowLanes>,
 }
 
 impl Run<'_> {
     /// The value `id` reads as: a merge's arm the word takes.
     fn resolve(&self, mut id: ValueId) -> Result<ValueId, String> {
+        if self.rows.is_some() {
+            // a stream step's merges are made row by row ahead of their readers
+            return Ok(id);
+        }
         while let Def::Merge(arms) = &self.trace.values[id.0 as usize].def {
             id = (arms.iter())
                 .find(|(_, g): &&(ValueId, Guard)| g.holds(self.word))
@@ -514,6 +530,7 @@ impl Run<'_> {
             Operation::Gather(op) => self.gather(op),
             Operation::Linear(op) => self.linear(op),
             Operation::Collective(op) => self.collective(op),
+            Operation::Conv(op) => self.conv(op),
             other => Err(format!("`{}` has no host forward", Operands::name(other))),
         }
     }
@@ -601,7 +618,7 @@ impl Run<'_> {
             Attn::Prefill { mask: Some(_), .. } => {
                 Err("a custom mask, which this forward does not read".into())
             }
-            _ => Err(format!("`{}` has no host forward", Operands::name(op))),
+            _ => self.attn_more(op),
         }
     }
 
@@ -833,7 +850,7 @@ impl Run<'_> {
                 let rows = xs.rows;
                 self.put(y_out, rows, out)
             }
-            _ => Err(format!("`{}` has no host forward", Operands::name(op))),
+            _ => self.elemwise_more(op),
         }
     }
 
@@ -923,7 +940,7 @@ impl Run<'_> {
                 let rows = picks.rows;
                 self.put(y, rows, out)
             }
-            _ => Err(format!("`{}` has no host forward", Operands::name(op))),
+            _ => self.gather_more(op),
         }
     }
 
