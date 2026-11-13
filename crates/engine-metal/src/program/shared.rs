@@ -14,8 +14,9 @@ pub const MAX_ATTACHMENTS: u32 = 8;
 #[derive(Debug)]
 pub struct SharedRing {
     shape: ChannelShape,
-    /// Its cells: in a buffer of its own, or in `Channel` slots. Behind a
-    /// lock only so evacuation can rebind a ring every attachment shares.
+    /// Its cells, in `Channel` slots (a buffer of its own only for a ring
+    /// larger than a chunk). Behind a lock only so evacuation can rebind a
+    /// ring every attachment shares.
     cells: RwLock<Cells>,
     counters: Counters,
 }
@@ -42,16 +43,18 @@ impl SharedRing {
         self.with_cells(|cells| Ok(cells.own_bytes())).unwrap_or(0)
     }
 
-    /// A ring of `shape`, in `slots` (`Channel` slot refs) where the
-    /// runtime took them, else in a buffer of its own.
+    /// A ring of `shape` in `slots`, the `Channel` slot refs the runtime
+    /// took for it (none for a ring larger than a chunk, which the engine
+    /// keeps).
     pub fn open(
         device: &Context,
         shape: ChannelShape,
-        slots: Option<(&Pools, &[u32])>,
+        pools: &Pools,
+        slots: &[u32],
     ) -> Result<SharedRing> {
         Ok(SharedRing {
             shape,
-            cells: RwLock::new(shape.cells(device, slots)?),
+            cells: RwLock::new(shape.cells(device, pools, slots)?),
             counters: Counters::default(),
         })
     }

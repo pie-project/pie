@@ -1753,13 +1753,11 @@ impl Shell {
         instance_slots: &[u32],
         ring_slots: &[engine::RingSlots],
     ) -> Result<engine::InstanceId> {
-        let pooled = (!instance_slots.is_empty() || !ring_slots.is_empty()).then_some(
-            crate::program::session::Pooled {
-                pools: &self.pools,
-                instance: instance_slots,
-                rings: ring_slots,
-            },
-        );
+        let pooled = crate::program::session::Pooled {
+            pools: &self.pools,
+            instance: instance_slots,
+            rings: ring_slots,
+        };
         self.programs.bind(
             &self.device,
             program_id,
@@ -1782,16 +1780,7 @@ impl Shell {
     /// What an instance of `program_id` holds in pool slots
     /// (`Engine::program_facts`).
     pub fn program_facts(&self, program_id: engine::ProgramId) -> Result<engine::ProgramFacts> {
-        let layout = self.pools.layout();
-        match (layout.instance, layout.channel) {
-            (Some(instance), Some(channel)) => self.programs.facts(
-                program_id,
-                instance.slot_bytes,
-                channel.slot_bytes,
-                channel.per_chunk,
-            ),
-            _ => Ok(engine::ProgramFacts::default()),
-        }
+        self.programs.facts(program_id, &self.pools)
     }
 
     /// The `Channel` slots a registered channel's ring of `shape` takes.
@@ -1807,9 +1796,8 @@ impl Shell {
         shape: crate::program::ChannelShape,
         slots: &[u32],
     ) -> Result<()> {
-        let pooled = (!slots.is_empty()).then_some((&self.pools, slots));
         self.programs
-            .register_channel(&self.device, id, shape, pooled)
+            .register_channel(&self.device, id, shape, &self.pools, slots)
     }
 
     pub fn close_shared_channel(&mut self, id: engine::ChannelId) -> bool {

@@ -1,7 +1,8 @@
 //! Where a guest instance's state lives (REDESIGN step 4,
 //! `new-memory/STATE-ROLES.md`): its bind-time launch tables and its rings,
-//! either in buffers of its own or in pool slots of role `Instance` and
-//! `Channel` the runtime took for it.
+//! in pool slots of role `Instance` and `Channel` the runtime took for it.
+//! The one exception the contract states is a ring larger than a chunk: no
+//! slots, a buffer of the engine's own.
 //!
 //! A pooled [`Held`] is one slot ref's bytes, addressed through the pool's
 //! view (a placement-sparse buffer) and written on the host through the heap
@@ -107,13 +108,16 @@ impl Held {
         shape: ShapeId,
         first: u32,
         count: u32,
+        at: u64,
         bytes: u64,
     ) -> Result<Held> {
         let per_chunk = pools.slots_per_chunk(shape)?;
         let slot_bytes = pools.slot_bytes(shape)?;
         let last = first.checked_add(count.max(1) - 1);
         if last.is_none_or(|last| last / per_chunk != first / per_chunk)
-            || bytes > u64::from(count) * slot_bytes
+            || at
+                .checked_add(bytes)
+                .is_none_or(|end| end > u64::from(count) * slot_bytes)
         {
             return Err(Fault::program(
                 "program::held",
@@ -125,15 +129,18 @@ impl Held {
             ));
         }
         let (offset, host, _) = pools.slot_place(shape, first)?;
+        // SAFETY: `at + bytes` lies inside the run, inside the first slot's
+        // chunk.
+        let host = HostAt(unsafe { host.add(usize_of(at)) });
         let mut region = Held {
             buffer: pools.view().clone(),
-            offset,
+            offset: offset + at,
             bytes,
             place: Place::Slot {
                 shape,
                 slot: first,
-                at: 0,
-                host: HostAt(host),
+                at,
+                host,
             },
         };
         region.zero()?;
@@ -311,16 +318,52 @@ pub fn pack(sizes: &[u64], slot_bytes: u64) -> Option<(Vec<(u32, u64)>, u32)> {
     Some((places, if used { slot + 1 } else { 0 }))
 }
 
+/// How an instance's tables lie in its `Instance` slots: one table a slot
+/// at most, packed ([`pack`]), or, where a table is larger than a slot, all
+/// of them one after another in one run of adjacent slots
+/// (`Footprint::contiguous`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableLayout {
+    /// Each table's slot index (0 for a run) and byte in it.
+    pub places: Vec<(u32, u64)>,
+    pub slots: u32,
+    pub run: bool,
+}
+
+impl TableLayout {
+    #[must_use]
+    pub fn of(sizes: &[u64], slot_bytes: u64) -> TableLayout {
+        if let Some((places, slots)) = pack(sizes, slot_bytes) {
+            return TableLayout {
+                places,
+                slots,
+                run: false,
+            };
+        }
+        let mut places = Vec::with_capacity(sizes.len());
+        let mut end = 0u64;
+        for &bytes in sizes {
+            let at = end.next_multiple_of(TABLE_ALIGN);
+            places.push((0, at));
+            end = at + bytes.max(1);
+        }
+        TableLayout {
+            places,
+            slots: u32::try_from(end.div_ceil(slot_bytes)).unwrap_or(u32::MAX),
+            run: true,
+        }
+    }
+}
+
 /// Where an instance's bind-time tables go, taken in the order
-/// [`super::launch::Prepared::table_sizes`] states them, stage by stage.
-pub enum Tables<'a> {
-    Own(&'a Context),
-    Pooled {
-        pools: &'a Pools,
-        shape: ShapeId,
-        slots: &'a [u32],
-        places: std::vec::IntoIter<(u32, u64)>,
-    },
+/// [`super::launch::Prepared::table_sizes`] states them, stage by stage: the
+/// `Instance` slots the runtime took for them.
+pub struct Tables<'a> {
+    pools: &'a Pools,
+    shape: ShapeId,
+    slots: &'a [u32],
+    run: bool,
+    places: std::vec::IntoIter<(u32, u64)>,
 }
 
 impl<'a> Tables<'a> {
@@ -331,57 +374,58 @@ impl<'a> Tables<'a> {
         slots: &'a [u32],
         sizes: &[u64],
     ) -> Result<Tables<'a>> {
-        let slot_bytes = pools.slot_bytes(shape)?;
-        let (places, need) = pack(sizes, slot_bytes).ok_or_else(|| {
-            Fault::program(
-                "program::held",
-                format!("a launch table is larger than a {slot_bytes}-byte instance slot"),
-            )
-        })?;
-        if need as usize != slots.len() {
+        let layout = TableLayout::of(sizes, pools.slot_bytes(shape)?);
+        if layout.slots as usize != slots.len() || (layout.run && !consecutive(slots)) {
             return Err(Fault::program(
                 "program::held",
                 format!(
-                    "this instance's tables take {need} instance slot(s) and the binding \
-                     names {}",
-                    slots.len()
+                    "this instance's tables take {} instance slot(s){} and the binding names \
+                     {slots:?}",
+                    layout.slots,
+                    if layout.run { " in one run" } else { "" },
                 ),
             ));
         }
-        Ok(Tables::Pooled {
+        Ok(Tables {
             pools,
             shape,
             slots,
-            places: places.into_iter(),
+            run: layout.run,
+            places: layout.places.into_iter(),
         })
     }
 
     /// The next table, of `bytes`, zeroed.
     pub fn take(&mut self, bytes: u64) -> Result<Held> {
-        match self {
-            Tables::Own(device) => Held::own(device, bytes),
-            Tables::Pooled {
-                pools,
-                shape,
-                slots,
-                places,
-            } => {
-                let (slot, at) = places.next().ok_or_else(|| {
-                    Fault::program(
-                        "program::held",
-                        "a stage took more launch tables than its program's facts state",
-                    )
-                })?;
-                Held::in_slot(pools, *shape, slots[slot as usize], at, bytes.max(1))
-            }
+        let (slot, at) = self.places.next().ok_or_else(|| {
+            Fault::program(
+                "program::held",
+                "a stage took more launch tables than its program's facts state",
+            )
+        })?;
+        if self.run {
+            let count = u32::try_from(self.slots.len()).unwrap_or(u32::MAX);
+            return Held::in_run(
+                self.pools,
+                self.shape,
+                self.slots[0],
+                count,
+                at,
+                bytes.max(1),
+            );
         }
+        Held::in_slot(
+            self.pools,
+            self.shape,
+            self.slots[slot as usize],
+            at,
+            bytes.max(1),
+        )
     }
 
     /// Refuses tables the facts stated and the stages did not take.
-    pub fn finish(self) -> Result<()> {
-        if let Tables::Pooled { mut places, .. } = self
-            && places.next().is_some()
-        {
+    pub fn finish(mut self) -> Result<()> {
+        if self.places.next().is_some() {
             return Err(Fault::program(
                 "program::held",
                 "a program's facts state more launch tables than its stages took",
@@ -392,8 +436,8 @@ impl<'a> Tables<'a> {
 }
 
 /// Where a ring's cells go: `cells` cells of `stride` bytes, `per_span` of
-/// them in each region (one region for a ring of its own, one a slot for a
-/// pooled ring).
+/// them in each region (one a slot for cells packed a slot; one for a run,
+/// or for a ring larger than a chunk in a buffer of its own).
 #[derive(Debug, Clone)]
 pub struct Cells {
     spans: Vec<Held>,
@@ -415,14 +459,15 @@ pub fn ring_run(cells: u64, stride: u64, slot_bytes: u64, per_chunk: u32) -> Opt
 }
 
 /// Whether `slots` are refs `first .. first + n` in order.
-fn consecutive(slots: &[u32]) -> bool {
+pub fn consecutive(slots: &[u32]) -> bool {
     slots
         .windows(2)
         .all(|pair| pair[0].checked_add(1) == Some(pair[1]))
 }
 
-/// The `Channel` slots a ring of `cells` cells of `stride` bytes takes, or
-/// `None` where a cell is larger than a slot (the engine keeps that ring).
+/// The `Channel` slots a ring of `cells` cells of `stride` bytes takes with
+/// its cells packed a slot, or `None` where a cell is larger than a slot
+/// (the ring then takes a run, [`ring_run`]).
 #[must_use]
 pub fn ring_slots(cells: u64, stride: u64, slot_bytes: u64) -> Option<u32> {
     let per = slot_bytes.checked_div(stride).filter(|&per| per > 0)?;
@@ -509,7 +554,7 @@ impl Cells {
             ));
         }
         Ok(Cells {
-            spans: vec![Held::in_run(pools, shape, slots[0], need, bytes)?],
+            spans: vec![Held::in_run(pools, shape, slots[0], need, 0, bytes)?],
             per_span: cells.max(1),
             stride,
             cells,
@@ -613,6 +658,18 @@ mod tests {
         assert_eq!(slots, 2);
         assert_eq!(pack(&[], 4096), Some((Vec::new(), 0)));
         assert_eq!(pack(&[5000], 4096), None);
+    }
+
+    #[test]
+    fn tables_past_a_slot_lie_one_after_another_in_one_run() {
+        use super::TableLayout;
+        let packed = TableLayout::of(&[100, 40], 4096);
+        assert!(!packed.run);
+        assert_eq!(packed.slots, 1);
+        let run = TableLayout::of(&[5000, 100, 8], 4096);
+        assert!(run.run, "a table past a slot makes the tables a run");
+        assert_eq!(run.places, vec![(0, 0), (0, 5008), (0, 5120)]);
+        assert_eq!(run.slots, 2);
     }
 
     #[test]

@@ -168,7 +168,7 @@ impl Plane {
         geometry: GeometryClass,
         device: eta_ir::registry::PortMask,
         channels: &[ChannelId],
-        pooled: Option<session::Pooled<'_>>,
+        pooled: session::Pooled<'_>,
     ) -> Result<InstanceId> {
         let program = self
             .programs
@@ -211,7 +211,8 @@ impl Plane {
         context: &Context,
         id: ChannelId,
         shape: ChannelShape,
-        slots: Option<(&Pools, &[u32])>,
+        pools: &Pools,
+        slots: &[u32],
     ) -> Result<()> {
         if self.channels.contains_key(&id) {
             return Err(Fault::program(
@@ -223,8 +224,10 @@ impl Plane {
                 ),
             ));
         }
-        self.channels
-            .insert(id, Arc::new(SharedRing::open(context, shape, slots)?));
+        self.channels.insert(
+            id,
+            Arc::new(SharedRing::open(context, shape, pools, slots)?),
+        );
         Ok(())
     }
 
@@ -232,25 +235,32 @@ impl Plane {
     /// `instance_slot` and `channel_slot` bytes. Tables past a slot leave the
     /// instance's tables the engine's (no instance slots); a ring whose cell
     /// is past a slot is the engine's and not listed.
-    pub fn facts(
-        &self,
-        id: ProgramId,
-        instance_slot: u64,
-        channel_slot: u64,
-        channel_per_chunk: u32,
-    ) -> Result<engine::ProgramFacts> {
+    pub fn facts(&self, id: ProgramId, pools: &Pools) -> Result<engine::ProgramFacts> {
+        use crate::store::layout::{CHANNEL, INSTANCE};
+        let instance_slot = pools.slot_bytes(INSTANCE)?;
+        let instance_per_chunk = pools.slots_per_chunk(INSTANCE)?;
+        let channel_slot = pools.slot_bytes(CHANNEL)?;
+        let channel_per_chunk = pools.slots_per_chunk(CHANNEL)?;
         let program = self
             .programs
             .get(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {id}")))?;
         let sizes = Session::table_sizes(&program.compiled);
-        let instance = match held::pack(&sizes, instance_slot) {
-            Some((_, slots)) => engine::Footprint {
-                bytes: sizes.iter().sum(),
-                slots,
-                contiguous: false,
-            },
-            None => engine::Footprint::default(),
+        let layout = held::TableLayout::of(&sizes, instance_slot);
+        if layout.slots > instance_per_chunk {
+            return Err(Fault::program(
+                "program::plane",
+                format!(
+                    "program {id}'s launch tables take {} instance slots, more than a chunk \
+                     holds ({instance_per_chunk})",
+                    layout.slots
+                ),
+            ));
+        }
+        let instance = engine::Footprint {
+            bytes: sizes.iter().sum(),
+            slots: layout.slots,
+            contiguous: layout.run,
         };
         let rings = program
             .plan
@@ -715,6 +725,36 @@ mod tests {
 
     const VOCAB: u32 = 1024;
     const LANES: u32 = 2;
+    const CHUNK: u64 = 16 << 20;
+
+    /// The slots instance `nth` of `facts` takes: its tables from logical
+    /// chunk 1, its rings from chunk 2, each instance's apart.
+    fn slots_for(
+        pools: &crate::store::Pools,
+        facts: &engine::ProgramFacts,
+        nth: u32,
+    ) -> (Vec<u32>, Vec<engine::RingSlots>) {
+        use crate::store::layout::{CHANNEL, INSTANCE};
+        let per_instance = pools.slots_per_chunk(INSTANCE).expect("an instance shape");
+        let per_channel = pools.slots_per_chunk(CHANNEL).expect("a channel shape");
+        let first = per_instance + nth * facts.instance.slots;
+        let instance = (first..first + facts.instance.slots).collect();
+        let ring_slots: u32 = facts.rings.iter().map(|ring| ring.footprint.slots).sum();
+        let mut next = 2 * per_channel + nth * ring_slots;
+        let rings = facts
+            .rings
+            .iter()
+            .map(|ring| {
+                let slots = (next..next + ring.footprint.slots).collect();
+                next += ring.footprint.slots;
+                engine::RingSlots {
+                    channel: ring.channel,
+                    slots,
+                }
+            })
+            .collect();
+        (instance, rings)
+    }
 
     /// The registration, the number of channels it binds, its seeds, and
     /// the token channel's index.
@@ -781,11 +821,13 @@ mod tests {
     #[test]
     fn closing_a_program_drops_its_batches() {
         let context = Context::bind().expect("a Metal 4 device");
+        let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
         let mut plane = Plane::new();
         let (registration, count, seeds, _) = registration();
         let program = plane
             .register(&context, &registration)
             .expect("the program registers");
+        let facts = plane.facts(program, &pools).expect("the program's facts");
         let logits =
             crate::device::Buffer::zeroed(&context, u64::from(VOCAB) * 2).expect("a logits plane");
         let lanes: Vec<InstanceId> = (0..LANES)
@@ -793,6 +835,7 @@ mod tests {
                 let ids: Vec<ChannelId> = (1..=count as u64)
                     .map(|c| ChannelId(c + 1000 * u64::from(lane)))
                     .collect();
+                let (instance, rings) = slots_for(&pools, &facts, lane);
                 let id = plane
                     .bind(
                         &context,
@@ -807,7 +850,11 @@ mod tests {
                         GeometryClass::Host,
                         PortMask::NONE,
                         &ids,
-                        None,
+                        session::Pooled {
+                            pools: &pools,
+                            instance: &instance,
+                            rings: &rings,
+                        },
                     )
                     .expect("the lane binds");
                 plane
@@ -854,15 +901,15 @@ mod tests {
         );
     }
 
-    /// One instance's tables and rings in pool slots fire as one in buffers
-    /// of its own, and still do after an evacuation moved their chunks.
+    /// An instance's tables and rings in pool slots fire as another's in
+    /// other slots, after an evacuation moved their chunks and after a park
+    /// moved them to other refs.
     #[test]
-    fn an_instance_in_pool_slots_fires_as_one_in_its_own_buffers() {
+    fn an_instance_in_pool_slots_fires_through_moves() {
         use crate::store::Pools;
         use crate::store::layout::{CHANNEL, INSTANCE};
         use engine::chunk::Evacuation;
 
-        const CHUNK: u64 = 16 << 20;
         let context = Context::bind().expect("a Metal 4 device");
         let mut pools = Pools::guests_only(&context, CHUNK, 4).expect("a pool");
         let mut plane = Plane::new();
@@ -870,38 +917,13 @@ mod tests {
         let program = plane
             .register(&context, &registration)
             .expect("the program registers");
-        let instance_slot = pools.slot_bytes(INSTANCE).expect("an instance shape");
-        let channel_slot = pools.slot_bytes(CHANNEL).expect("a channel shape");
-        let facts = plane
-            .facts(
-                program,
-                instance_slot,
-                channel_slot,
-                pools.slots_per_chunk(CHANNEL).expect("a channel shape"),
-            )
-            .expect("the program's facts");
+        let facts = plane.facts(program, &pools).expect("the program's facts");
         assert!(facts.instance.slots > 0, "the tables take slots: {facts:?}");
         assert!(!facts.rings.is_empty(), "the rings take slots: {facts:?}");
-
-        // Instance slots in logical chunk 1, channel slots in chunk 2.
-        let per_instance = u32::try_from(CHUNK / instance_slot).expect("slots a chunk");
-        let per_channel = u32::try_from(CHUNK / channel_slot).expect("slots a chunk");
-        let instance: Vec<u32> = (0..facts.instance.slots)
-            .map(|k| per_instance + k)
-            .collect();
-        let mut next = 2 * per_channel;
-        let rings: Vec<engine::RingSlots> = facts
-            .rings
-            .iter()
-            .map(|ring| {
-                let slots = (next..next + ring.footprint.slots).collect();
-                next += ring.footprint.slots;
-                engine::RingSlots {
-                    channel: ring.channel,
-                    slots,
-                }
-            })
-            .collect();
+        let per_instance = pools.slots_per_chunk(INSTANCE).expect("an instance shape");
+        let per_channel = pools.slots_per_chunk(CHANNEL).expect("a channel shape");
+        let (other_instance, other_rings) = slots_for(&pools, &facts, 1);
+        let (instance, rings) = slots_for(&pools, &facts, 0);
 
         let logits =
             crate::device::Buffer::zeroed(&context, u64::from(VOCAB) * 2).expect("a logits plane");
@@ -911,7 +933,7 @@ mod tests {
             query_len: 1,
             ..Extents::default()
         };
-        let bind = |plane: &mut Plane, pooled: Option<session::Pooled<'_>>| {
+        let bind = |plane: &mut Plane, pooled: session::Pooled<'_>| {
             let id = plane
                 .bind(
                     &context,
@@ -938,20 +960,22 @@ mod tests {
                 .expect("the logits bind");
             id
         };
-        let own = bind(&mut plane, None);
+        // Two instances in slots of their own: the second is moved below.
+        let own = bind(
+            &mut plane,
+            session::Pooled {
+                pools: &pools,
+                instance: &other_instance,
+                rings: &other_rings,
+            },
+        );
         let pooled = bind(
             &mut plane,
-            Some(session::Pooled {
+            session::Pooled {
                 pools: &pools,
                 instance: &instance,
                 rings: &rings,
-            }),
-        );
-        let own_state = plane.instance(own).expect("bound").bytes();
-        let pooled_state = plane.instance(pooled).expect("bound").bytes();
-        assert!(
-            pooled_state < own_state,
-            "the pooled instance holds less apart from the pool: {pooled_state} vs {own_state}"
+            },
         );
 
         let peak = |plane: &mut Plane, at: u32| {
@@ -1074,6 +1098,10 @@ mod tests {
         let per_chunk = pools.slots_per_chunk(CHANNEL).expect("a channel shape");
         let facts = ring_facts(0, shape, slot, per_chunk).expect("the ring fits a chunk");
         assert!(
+            SharedRing::open(&context, shape, &pools, &[]).is_err(),
+            "a ring that fits a chunk is placed in slots, never in a buffer of its own"
+        );
+        assert!(
             facts.footprint.contiguous,
             "a cell past a slot is a run: {facts:?}"
         );
@@ -1083,7 +1111,7 @@ mod tests {
         // The run in logical chunk 1, not at its start.
         let first = per_chunk + 100;
         let run: Vec<u32> = (first..first + facts.footprint.slots).collect();
-        let ring = SharedRing::open(&context, shape, Some((&pools, &run))).expect("the ring opens");
+        let ring = SharedRing::open(&context, shape, &pools, &run).expect("the ring opens");
         assert_eq!(
             ring.bytes(),
             0,
