@@ -1126,6 +1126,8 @@ pub struct Prepared<'a> {
     mask_injects: Vec<crate::inputs::MaskInject>,
     kv_reports: Vec<KvReport>,
     bodied: bool,
+    /// Why not, in a load that records bodies: the key and the reason.
+    unbodied: Option<String>,
     admits: std::sync::Arc<[crate::window::Admit]>,
     /// The key's island bits, so the fire records and replays under the key
     /// that was prepared.

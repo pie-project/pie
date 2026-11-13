@@ -1558,20 +1558,22 @@ impl FrameShell for Shell {
         super::btrace::mark("segmentation");
         // A tapped fire is walked, so the walk can mark where each layer
         // ends on the stream.
+        // A body's window holds its own rows twice and at least `REPLAYED`
+        // replayed (`Run::rs_layout`): a fire whose lanes replay more in a
+        // window than its rows or `REPLAYED` walks.
+        let replays_fit = windows.spans().all(|span| {
+            rs_replays
+                .iter()
+                .skip(span.lane_offset as usize)
+                .take(span.lanes as usize)
+                .sum::<u32>()
+                <= span.rows.max(crate::store::rs::REPLAYED)
+        });
+        let snapshots_fit = snapshots.rows.len() <= crate::store::rs::SNAPSHOTS as usize;
         let bodied = records_bodies
             && !tapped
-            // A body's window holds its own rows twice and at least
-            // `REPLAYED` replayed (`Run::rs_layout`): a fire whose lanes
-            // replay more in a window than its rows or `REPLAYED` walks.
-            && windows.spans().all(|span| {
-                rs_replays
-                    .iter()
-                    .skip(span.lane_offset as usize)
-                    .take(span.lanes as usize)
-                    .sum::<u32>()
-                    <= span.rows.max(crate::store::rs::REPLAYED)
-            })
-            && snapshots.rows.len() <= crate::store::rs::SNAPSHOTS as usize
+            && replays_fit
+            && snapshots_fit
             && Self::keyable_units(&self.compiled)
             && world
             && !self.cache.body_refused(&key)
@@ -1608,9 +1610,34 @@ impl FrameShell for Shell {
                     }
                 });
         let readout_ceiling = (last_rows.min(max_lanes) + every_row).min(composition.bucket());
-        let bodied = bodied
-            && readout_rows.len() <= readout_ceiling as usize
-            && composition.lane_count() <= crate::window::lane_capacity(max_lanes);
+        let readouts_fit = readout_rows.len() <= readout_ceiling as usize;
+        let lanes_fit = composition.lane_count() <= crate::window::lane_capacity(max_lanes);
+        // Why a fire of a load that records bodies walks its plan, for the
+        // warning it raises (`Bodies::eager_unbodied`).
+        let unbodied = (records_bodies && !arming && !(bodied && readouts_fit && lanes_fit))
+            .then(|| {
+                let why = if tapped {
+                    "it is tapped"
+                } else if !replays_fit {
+                    "a window's lanes replay more rows than a body's window holds"
+                } else if !snapshots_fit {
+                    "it takes more snapshots than a body holds"
+                } else if !Self::keyable_units(&self.compiled) {
+                    "the plan's units key no body"
+                } else if !world {
+                    "its expert group is not whole"
+                } else if self.cache.body_refused(&key) {
+                    "its body was refused when it was captured"
+                } else if !bodied {
+                    "its admitted set cannot be cut to a body"
+                } else if !readouts_fit {
+                    "it reads out more rows than its bucket's body carries"
+                } else {
+                    "it has more lanes than a body's window table holds"
+                };
+                format!("{key}: {why}")
+            });
+        let bodied = bodied && readouts_fit && lanes_fit;
         let readout_live = readout_rows.len() as u32;
         if bodied {
             readout_rows.resize(readout_ceiling as usize, 0);
@@ -1768,6 +1795,7 @@ impl FrameShell for Shell {
             mask_injects,
             kv_reports,
             bodied,
+            unbodied,
             admits,
             islands: key.islands.clone(),
             ladder,
