@@ -420,6 +420,7 @@ impl Floorplan {
             aux.push(Aux::Store(
                 arr.columns(p.cols + 1)
                     .into_iter()
+                    .filter(|(_, units, _)| !units.is_empty())
                     .map(|(_, units, st)| StoreColumn {
                         units,
                         rows: st.rows,
