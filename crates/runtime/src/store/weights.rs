@@ -865,14 +865,6 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> PoolTarget for WeightFirst<P, W>
         self.inner.take_refused()
     }
 
-    fn shrink_rung(&mut self) {
-        self.inner.shrink_rung();
-    }
-
-    fn restore_rung(&mut self) {
-        self.inner.restore_rung();
-    }
-
     fn ticked(&mut self) {
         match self.port.uses() {
             Ok(uses) => self.cache.record(&uses),

@@ -29,9 +29,9 @@ pub struct SharedGrow {
     refused: Arc<AtomicBool>,
     /// The last shrink found no room.
     no_room: Arc<AtomicBool>,
-    /// The activation rung the governor wants, in tokens (`u32::MAX`: the
-    /// largest), and the walk toward it (SPEC decision 6).
-    rung_goal: Arc<AtomicU32>,
+    /// The walk of the activation rung toward what the passes still to run
+    /// ask of a fire (SPEC decision 6, by demand): the smallest rung while
+    /// none asks past it.
     rung_walk: Arc<std::sync::Mutex<RungWalk>>,
 }
 
@@ -48,60 +48,43 @@ impl SharedGrow {
             wake: Arc::new(Notify::new()),
             refused: Arc::new(AtomicBool::new(false)),
             no_room: Arc::new(AtomicBool::new(false)),
-            rung_goal: Arc::new(AtomicU32::new(u32::MAX)),
             rung_walk: Arc::new(std::sync::Mutex::new(RungWalk::default())),
         }
     }
 
-    /// The rung the governor wants: the next smaller than it wants now
-    /// (`down`), or the largest.
-    fn want_rung(&self, down: bool) {
-        let goal = if down {
-            let pool = self.shared.lock().unwrap();
-            let now = self.rung_goal.load(Ordering::Acquire).min(pool.rung());
-            let rungs = pool.rungs();
-            rungs
-                .iter()
-                .copied()
-                .filter(|&rung| rung < now)
-                .max()
-                .unwrap_or_else(|| rungs.first().copied().unwrap_or(u32::MAX))
-        } else {
-            u32::MAX
-        };
-        if self.rung_goal.swap(goal, Ordering::AcqRel) != goal {
-            tracing::debug!(engine = self.engine, goal, "the activation rung's goal");
-            self.wake.notify_one();
-        }
-    }
-
-    /// Steps the activation rung toward the governor's goal until there or
-    /// until a step has to wait: caps fires, lowers the pool's rung once no
-    /// wider fire is in flight, or raises it, the engine first copying the
-    /// state out of the larger span.
+    /// Steps the activation rung toward the rung the passes still to run
+    /// ask of a fire ([`super::want_rows`]), the smallest while none asks
+    /// past it, until there or until a step has to wait: caps fires, lowers
+    /// the pool's rung once no wider fire is in flight, or raises it, the
+    /// engine first copying the state out of the larger span. A raise short
+    /// of room waits on the room the asking pass has the planner free.
     async fn walk_rung(&self) {
         loop {
-            let goal = self.rung_goal.load(Ordering::Acquire);
             let (current, retired) = self.epochs();
-            let step = {
+            let (step, goal) = {
                 let mut pool = self.shared.lock().unwrap();
                 pool.pool_mut().retire_through(retired);
-                self.rung_walk.lock().unwrap().step(
+                let goal = pool.rung_for(super::wanted_rows(self.engine));
+                let step = self.rung_walk.lock().unwrap().step(
                     &pool,
                     goal,
                     super::fire_cap(self.engine),
                     super::rung_granted(self.engine),
                     current,
                     retired,
-                )
+                );
+                (step, goal)
             };
             let step = match step {
                 Ok(step) => step,
                 Err(error) => {
-                    tracing::debug!(engine = self.engine, %error, "the activation rung waits");
+                    // The pass asking funds the room as a planner waiter
+                    // (`pipeline::fire`'s raise funding).
+                    tracing::debug!(engine = self.engine, %error, goal, "the activation rung waits");
                     return;
                 }
             };
+
             match step {
                 RungStep::Wait => {
                     // A lower waits on the scheduler's grant, which it
@@ -113,16 +96,33 @@ impl SharedGrow {
                     return;
                 }
                 RungStep::Cap(tokens) => {
+                    {
+                        // Under the pool's lock, as a pass's `raise_now`
+                        // lifts it: a cap down past what a pass asks since
+                        // is not taken.
+                        let _pool = self.shared.lock().unwrap();
+                        let now = super::fire_cap(self.engine);
+                        if tokens < now && super::wanted_rows(self.engine) > tokens {
+                            continue;
+                        }
+                        super::set_fire_cap(self.engine, tokens);
+                    }
                     tracing::info!(
                         engine = self.engine,
                         tokens,
                         "fires cut to the activation rung"
                     );
-                    super::set_fire_cap(self.engine, tokens);
                     crate::scheduler::nudge(self.engine);
                 }
                 RungStep::Lower(rung) => {
-                    let lowered = self.shared.lock().unwrap().lower_rung(rung);
+                    let lowered = {
+                        let mut pool = self.shared.lock().unwrap();
+                        // A pass lifted the cap since the walk capped it.
+                        if super::fire_cap(self.engine) > rung {
+                            continue;
+                        }
+                        pool.lower_rung(rung)
+                    };
                     if let Err(error) = lowered {
                         tracing::warn!(engine = self.engine, %error, "the activation rung stays");
                         return;
@@ -356,14 +356,4 @@ impl PoolTarget for SharedGrow {
         self.refused.swap(false, Ordering::AcqRel)
     }
 
-    /// Critical: fires take the next smaller activation rung, the walk
-    /// capping them first and lowering the pool's rung behind them.
-    fn shrink_rung(&mut self) {
-        self.want_rung(true);
-    }
-
-    /// Settled: back to the largest rung.
-    fn restore_rung(&mut self) {
-        self.want_rung(false);
-    }
 }

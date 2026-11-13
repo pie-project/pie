@@ -165,6 +165,13 @@ pub struct KvStore {
     /// The cache's entries by the node their last pages are in: an attach
     /// ages the entries on its own path, not every entry.
     by_owner: HashMap<NodeId, Vec<u64>>,
+    /// Per trie node, the epoch through which a fire may still read its
+    /// pages: the last a working set holding it was let go at (or a copy
+    /// into it was handed out at). An idle entry's pages go back after the
+    /// latest of its path's nodes, not after every fire in flight: a waiter
+    /// short of a prompt's pages waited behind ~1600 handed-out epochs (a
+    /// second) for cache last read long before ([`Self::fence_of`]).
+    node_epochs: HashMap<NodeId, u64>,
     /// Entries already split at a step, by the entry and the pages kept.
     splits: HashSet<(u64, u64)>,
     owners: HashMap<ProcessId, usize>,
@@ -403,6 +410,7 @@ impl KvStore {
             domain: hash::cache_domain(&seed),
             cache: HashMap::new(),
             by_owner: HashMap::new(),
+            node_epochs: HashMap::new(),
             splits: HashSet::new(),
             owners: HashMap::new(),
             keeps: false,
@@ -623,7 +631,32 @@ impl KvStore {
         ws
     }
 
+    /// Stamps the nodes on `node`'s path: a fire handed out through `epoch`
+    /// may read their pages.
+    fn stamp_path(&mut self, node: NodeId, epoch: u64) {
+        for node in self.table.lineage(node) {
+            let stamp = self.node_epochs.entry(node).or_insert(0);
+            *stamp = (*stamp).max(epoch);
+        }
+    }
+
+    /// The epoch after which the pages an idle entry ending at `terminal`
+    /// holds alone may go back: the latest stamp on its path, at most
+    /// `epoch` (now). Stamps every fire has retired through are dropped.
+    fn fence_of(&mut self, terminal: NodeId, epoch: u64) -> u64 {
+        let retired = self.retired_through();
+        self.node_epochs.retain(|_, stamp| *stamp > retired);
+        self.table
+            .lineage(terminal)
+            .iter()
+            .filter_map(|node| self.node_epochs.get(node).copied())
+            .max()
+            .unwrap_or(0)
+            .min(epoch)
+    }
+
     fn release_entry(&mut self, entry: KeptEntry, epoch: u64) -> usize {
+        let epoch = self.fence_of(entry.path.terminal, epoch);
         let freed = self.table.release_cache_root(entry.path.terminal);
         // Device pages: a host or disk slot given back seats no one.
         let count = freed
@@ -1463,6 +1496,9 @@ impl KvStore {
             .table
             .insert_cached(after, backings, token_hashes, page_hashes);
         self.table.lease_cache_root(node);
+        // The copy filling its pages is handed out with the fires after now.
+        let now = self.current_epoch().saturating_add(1);
+        self.stamp_path(node, now);
         // An entry's pages are its path's, from token 0: the prefix it was
         // grafted below as well as its own.
         let pages = self.table.path_len(node);
@@ -1633,6 +1669,11 @@ impl KvStore {
     }
 
     pub fn release_working_set(&mut self, ws: WorkingSetId, epoch: u64) {
+        // Its fires through `epoch` may still read what its path holds,
+        // whatever stays cached of it.
+        if let Ok(Some(terminal)) = self.table.terminal(ws) {
+            self.stamp_path(terminal, epoch);
+        }
         if self.keeps {
             self.keep_sealed_prefix(ws);
         }

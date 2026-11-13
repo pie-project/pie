@@ -662,6 +662,18 @@ impl SlotPool {
         Ok(RungEvacuation { rung, act, moves })
     }
 
+    /// The chunks raising the activation to `rung` lacks now: past what is
+    /// committed, and in free chunks below its span for the state in it.
+    /// 0 when the raise fits.
+    pub fn rung_short(&self, rung: u32) -> u32 {
+        let act = self.act_chunks(rung);
+        let budget = (self.reserved + self.held + act).saturating_sub(self.committed_chunks());
+        let limit = self.total - act;
+        let sources = self.held_in(limit, self.state_limit()).len() as u32;
+        let targets = self.open.iter_in(0, limit).take(sources as usize).count() as u32;
+        budget.max(sources - targets)
+    }
+
     /// Carries out `evacuation` and takes its rung; the fire at `epoch`
     /// carries the copy, and the chunks moved off stay closed until it
     /// retires. All or nothing.

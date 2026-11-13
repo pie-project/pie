@@ -334,7 +334,11 @@ impl ResidencyPlanner {
     /// a waiter's want, never while pages stand free; what keeps back a
     /// share of the host for suspends ([`HOST_RESERVE_DIVISOR`]) is not
     /// spent on cache.
-    pub(super) fn demote_idle(self: &Arc<Self>) -> bool {
+    ///
+    /// `wanted`: the pages the head lacks. No more than that moves: a head
+    /// short of one prompt's pages waited behind the copy of every idle page
+    /// on the device.
+    pub(super) fn demote_idle(self: &Arc<Self>, wanted: u32) -> bool {
         if !self.port.suspend_capable() {
             return false;
         }
@@ -361,7 +365,7 @@ impl ResidencyPlanner {
             host_free = self.port.host_stats().0;
         }
         let (disk_free, _) = self.port.disk_stats();
-        let room = host_free.saturating_sub(reserve) + disk_free;
+        let room = (host_free.saturating_sub(reserve) + disk_free).min(wanted.max(1));
         let txn = (room > 0)
             .then(|| self.port.prepare_demote(room as usize))
             .flatten();
@@ -1020,6 +1024,7 @@ impl ResidencyPlanner {
     /// own, however long a fire leases it), so the fleet is not read as
     /// wedged for pages no one registered holds.
     pub fn unregister(self: &Arc<Self>, pid: ProcessId) {
+        crate::store::shared::forget_process(pid);
         let (model, engine) = self.port.locus();
         let held = held_page_count(pid, model, engine);
         let held_rs = held_rs_units(pid, model, engine);

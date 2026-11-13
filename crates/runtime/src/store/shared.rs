@@ -89,6 +89,12 @@ pub fn fire_cap(engine: usize) -> u32 {
     })
 }
 
+/// Sets `engine`'s cap as the walker would: for a test of what waits on it.
+#[cfg(test)]
+pub(crate) fn set_fire_cap_for_test(engine: usize, tokens: u32) {
+    set_fire_cap(engine, tokens);
+}
+
 fn set_fire_cap(engine: usize, tokens: u32) {
     if let Some(cap) = FIRE_CAP.get(engine) {
         cap.store(tokens, std::sync::atomic::Ordering::Release);
@@ -107,6 +113,129 @@ fn rung_granted(engine: usize) -> u32 {
     RUNG_GRANT.get(engine).map_or(u32::MAX, |grant| {
         grant.load(std::sync::atomic::Ordering::Acquire)
     })
+}
+
+/// Per engine, the rows each pass still to run asks of one fire, by the
+/// pass's key: what moves the activation rung (a pool sits at its smallest
+/// rung while none asks past it).
+static RUNG_WANTS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<usize, std::collections::BTreeMap<u64, u32>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+static RUNG_WANT_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A pass's ask that fires on its engine carry `rows`: held until the pass
+/// is through (dropped), the walker raising the rung toward it meanwhile.
+#[must_use = "the ask stands while it is held"]
+pub struct RungWant {
+    engine: usize,
+    key: u64,
+}
+
+/// Asks that fires on `engine` carry `rows`; the pool's walker raises the
+/// rung that holds them where room allows ([`RungWalk`]).
+pub fn want_rows(engine: usize, rows: u32) -> RungWant {
+    let key = RUNG_WANT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RUNG_WANTS
+        .lock()
+        .unwrap()
+        .entry(engine)
+        .or_default()
+        .insert(key, rows);
+    RungWant { engine, key }
+}
+
+impl Drop for RungWant {
+    fn drop(&mut self) {
+        if let Some(wants) = RUNG_WANTS.lock().unwrap().get_mut(&self.engine) {
+            wants.remove(&self.key);
+        }
+    }
+}
+
+/// Per process, the ask its last pass made: held while the process lives
+/// and its passes stay wide, so the gaps between the passes of one prompt
+/// (an inferlet feeding a prompt in several passes) lower nothing.
+static PROCESS_WANTS: std::sync::LazyLock<Mutex<std::collections::HashMap<uuid::Uuid, RungWant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Process `pid`'s pass on `engine` asks fires of `rows` (`None`: a pass of
+/// a few rows, a decode, asks nothing): what its process holds the rung
+/// for until its next pass says otherwise, or it ends ([`forget_process`]).
+pub fn hold_for_process(pid: uuid::Uuid, engine: usize, rows: Option<u32>) {
+    let mut wants = PROCESS_WANTS.lock().unwrap();
+    match rows {
+        Some(rows) => {
+            wants.insert(pid, want_rows(engine, rows));
+        }
+        None => {
+            wants.remove(&pid);
+        }
+    }
+}
+
+/// Process `pid` ended: its ask goes.
+pub fn forget_process(pid: uuid::Uuid) {
+    PROCESS_WANTS.lock().unwrap().remove(&pid);
+}
+
+/// The width a fire may take at the rung that holds `rows`: the cap the
+/// walker lifts to there (`u32::MAX` at the largest rung).
+#[must_use]
+pub fn cap_for(shared: &Shared, rows: u32) -> u32 {
+    let pool = shared.lock().unwrap();
+    let rungs = pool.rungs();
+    let goal = pool.rung_for(rows);
+    if rungs.last() == Some(&goal) {
+        u32::MAX
+    } else {
+        goal
+    }
+}
+
+/// Raises `shared`'s rung at once to the one fires of `rows` take, where
+/// nothing lies in the larger span and the room is there (a raise that must
+/// move state is the walker's, through the engine's copy): the pass asking
+/// is cut at the raised width from its first piece. A cap the walker
+/// lowered behind a rung still up is lifted back to it.
+pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
+    let mut pool = shared.lock().unwrap();
+    let rungs = pool.rungs();
+    let goal = pool.rung_for(rows);
+    let lifted = |rung: u32| {
+        if rungs.last() == Some(&rung) {
+            u32::MAX
+        } else {
+            rung
+        }
+    };
+    if goal > pool.rung() {
+        let Ok(evacuation) = pool.plan_raise(goal) else {
+            return;
+        };
+        if !evacuation.moves.is_empty() || pool.apply_rung(&evacuation, 0).is_err() {
+            return;
+        }
+        tracing::info!(engine, rung = goal, moved = 0, "the activation rung is raised");
+    }
+    // The rung holds `goal` now: fires may take its width.
+    let cap = lifted(goal);
+    if cap > fire_cap(engine) {
+        set_fire_cap(engine, cap);
+    }
+    drop(pool);
+}
+
+/// The most rows a pass still to run on `engine` asks of one fire; 0 where
+/// none asks.
+#[must_use]
+pub fn wanted_rows(engine: usize) -> u32 {
+    RUNG_WANTS
+        .lock()
+        .unwrap()
+        .get(&engine)
+        .and_then(|wants| wants.values().copied().max())
+        .unwrap_or(0)
 }
 
 /// One step of moving the activation rung toward a goal ([`RungWalk`]).
@@ -1049,6 +1178,44 @@ impl SharedPool {
     #[must_use]
     pub fn rung_moves(evacuation: &RungEvacuation) -> EngineEvacuation {
         engine_moves(&evacuation.moves)
+    }
+
+    /// The chunks raising the activation to `rung` lacks now, and the kv
+    /// pages that many chunks hold: what must be freed before it fits.
+    #[must_use]
+    ///
+    /// The pages are what a grant of them leaves that many chunks freed past
+    /// what stands free now: every free slot of the kv list (the span the
+    /// smaller rung lends included) comes first, so it counts on top (a
+    /// grant it covers frees nothing).
+    pub fn raise_short(&self, rung: u32) -> (u32, u32) {
+        let chunks = self.pool.rung_short(rung);
+        if chunks == 0 {
+            return (0, 0);
+        }
+        let Some(list) = self.list else {
+            return (chunks, chunks);
+        };
+        let spc = self
+            .pool
+            .shape(list.pool)
+            .map_or(1, |shape| shape.slots_per_chunk.max(1));
+        let free = self.pool.available(list.pool);
+        let pages = u64::from(chunks) * u64::from(spc) + free;
+        (chunks, u32::try_from(pages).unwrap_or(u32::MAX))
+    }
+
+    /// The smallest rung whose fires carry `rows`, the largest past every
+    /// rung's; the smallest where `rows` is 0.
+    #[must_use]
+    pub fn rung_for(&self, rows: u32) -> u32 {
+        let rungs = self.pool.rungs();
+        rungs
+            .iter()
+            .copied()
+            .find(|&rung| rung >= rows)
+            .or_else(|| rungs.last().copied())
+            .unwrap_or(u32::MAX)
     }
 
     /// Every activation rung's tokens, ascending.
