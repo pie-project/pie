@@ -68,6 +68,42 @@ struct SyntheticMedia {
 
 /// A synthetic lane's class and row count.
 type LaneRows = (usize, u32);
+/// A lattice being armed: the targets left, and what arming has counted.
+pub(super) struct Arming {
+    targets: std::collections::VecDeque<(u32, BodySynth, record::RsBody)>,
+    /// The rung whose targets are arming.
+    rung: u32,
+    top: Option<u32>,
+    /// Whether a narrower target may capture cold: the top bucket's fires
+    /// have made what its warm fire would.
+    topped: bool,
+    unfireable: Vec<String>,
+    verify: bool,
+    group: bool,
+    records: bool,
+    priced: bool,
+    dropped: std::collections::BTreeSet<u32>,
+    weighed: [(usize, usize); Kind::COUNT],
+    armed: usize,
+    wanted: usize,
+    tally: [(usize, usize); Kind::COUNT],
+    refused: Option<String>,
+    never: usize,
+    warmed_only: usize,
+    never_from: u32,
+    belted: bool,
+    starved: Option<u64>,
+    peer_stopped: bool,
+    unit_margin: u64,
+    ballot: Ballot,
+}
+
+impl Arming {
+    fn narrower(&self, bucket: u32, target: &BodySynth) -> bool {
+        Some(bucket) != self.top && target.kind() != Kind::Decode
+    }
+}
+
 /// A synthetic lane's image and patch counts.
 type LaneMedia = (u32, u32);
 
@@ -917,6 +953,7 @@ impl Shell {
     fn fit_lattice(
         &mut self,
         rest: &[(u32, Kind)],
+        kept: usize,
         weighed: &[(usize, usize); Kind::COUNT],
     ) -> std::collections::BTreeSet<u32> {
         let Some((steps, from, mut fine)) = self.lattice else {
@@ -938,6 +975,7 @@ impl Shell {
                 .filter(|(b, _)| buckets.contains(b))
                 .map(|&(_, kind)| price(kind))
                 .sum::<usize>()
+                + kept * average
         };
         // A profile's allowance stretches to the profile's lattice, as far
         // as the fit before arming held the bodies and the device has free;
@@ -1245,7 +1283,9 @@ impl Shell {
         walked.map(|()| footprint)
     }
 
-    fn arm_lattice_fenced(&mut self, verify: bool) -> Result<()> {
+    /// What arming the lattice starts from, in arming's order; `None`
+    /// where this shell arms nothing.
+    fn arm_begin(&mut self, verify: bool) -> Option<Arming> {
         // An expert-parallel rank fires the lattice whether or not it
         // records bodies: past arming its group serves every composition it
         // does not replay eagerly and unfenced, beside peers spinning in
@@ -1254,301 +1294,410 @@ impl Shell {
         let group = self.ep.is_some();
         let records = self.records_bodies() && Self::keyable_units(&self.compiled);
         if !records && !group {
-            return Ok(());
+            return None;
         }
         if !records && !verify {
             self.cache.seal_bodies();
         }
 
         if self.lane_ceiling() == 0 {
-            return Ok(());
+            return None;
         }
         if super::diag::on().arm_trace {
             for (class, requests) in self.landing.iter().enumerate() {
                 eprintln!("[arm-trace] class c{class}: {requests:?}");
             }
         }
-        let Some(LatticeTargets {
-            targets,
+        let LatticeTargets {
+            mut targets,
             top,
             unfireable,
-        }) = self.lattice_targets()
-        else {
-            return Ok(());
-        };
+        } = self.lattice_targets()?;
         // The top bucket's bodies and every decode body arm first; the
         // narrower prefill, mixed and wide ones after them are what the
         // lattice coarsens to fit the allowance, each priced at what its
-        // kind's bodies armed so far weigh.
-        let narrower =
-            |bucket: u32, target: &BodySynth| Some(bucket) != top && target.kind() != Kind::Decode;
-        let rest: Vec<(u32, Kind)> = targets
-            .iter()
-            .filter(|(bucket, target, _)| narrower(*bucket, target))
-            .map(|(bucket, target, _)| (*bucket, target.kind()))
-            .collect();
-        let mut priced = verify || group || self.lattice.is_none();
-        let mut dropped = std::collections::BTreeSet::new();
-        let mut weighed = [(0usize, 0usize); Kind::COUNT];
+        // kind's bodies armed so far weigh. A shell that arms while it
+        // serves arms its rungs smallest first instead, each rung's targets
+        // in that order.
+        let stepped = self.arm_stepped && !verify && !group;
+        if stepped {
+            targets.sort_by_key(|(bucket, _, _)| self.rung_of(*bucket));
+        }
+        Some(Arming {
+            rung: targets.first().map_or(u32::MAX, |(bucket, _, _)| self.rung_of(*bucket)),
+            targets: targets.into(),
+            top,
+            topped: top.is_none() || !stepped,
+            unfireable,
+            verify,
+            group,
+            records,
+            priced: verify || group || self.lattice.is_none(),
+            dropped: std::collections::BTreeSet::new(),
+            weighed: [(0usize, 0usize); Kind::COUNT],
+            armed: 0,
+            wanted: 0,
+            tally: [(0usize, 0usize); Kind::COUNT],
+            refused: None,
+            never: 0,
+            warmed_only: 0,
+            never_from: 0,
+            belted: false,
+            starved: None,
+            peer_stopped: false,
+            unit_margin: self.pools.map_unit_bytes().saturating_mul(16),
+            ballot: Ballot::open(&self.device),
+        })
+    }
 
-        let mut armed = 0usize;
-        let mut wanted = 0usize;
-        let mut tally = [(0usize, 0usize); Kind::COUNT];
-        let mut refused: Option<String> = None;
+    /// The activation rung a fire of `bucket` rows carves: the smallest
+    /// that holds it, `u32::MAX` past every rung stated (the whole arena).
+    fn rung_of(&self, bucket: u32) -> u32 {
+        self.arena
+            .rungs(None)
+            .into_iter()
+            .map(|(tokens, _)| tokens)
+            .find(|tokens| bucket <= *tokens)
+            .unwrap_or(u32::MAX)
+    }
 
-        let mut never = 0usize;
-        let mut warmed_only = 0usize;
-        let mut never_from = 0u32;
-        let mut belted = false;
-        let mut starved: Option<u64> = None;
-        let mut peer_stopped = false;
-        let unit_margin = self.pools.map_unit_bytes().saturating_mul(16);
-        let mut ballot = Ballot::open(&self.device);
-        for (bucket, target, rs) in targets {
-            if !priced && narrower(bucket, &target) {
-                priced = true;
-                dropped = self.fit_lattice(&rest, &weighed);
+    fn arm_lattice_fenced(&mut self, verify: bool) -> Result<()> {
+        let Some(mut st) = self.arm_begin(verify) else {
+            return Ok(());
+        };
+        // At load: everything, or the smallest rung's targets where the
+        // rest arm while the shell serves ([`Shell::arm_step`]).
+        let first = st.rung;
+        while let Some(&(bucket, _, _)) = st.targets.front() {
+            if self.arm_stepped && self.rung_of(bucket) != first {
+                break;
             }
-            let weighed_before = self.cache.body_stats().census;
-            if dropped.contains(&bucket) {
-                continue;
+            self.arm_next(&mut st)?;
+        }
+        if st.targets.is_empty() {
+            return self.arm_end(st);
+        }
+        eprintln!(
+            "engine-cuda: bodies armed through rung {first} ({} of {} compositions); {} arm \
+             while it serves",
+            st.armed,
+            st.wanted,
+            st.targets.len()
+        );
+        self.live = engine::live::Live::arming(first);
+        self.stepping = Some(st);
+        Ok(())
+    }
+
+    /// Arms one more composition of a lattice left arming at load, and says
+    /// whether more are left. A rung is stated armed ([`engine::live`]) once
+    /// its last composition is.
+    pub fn arm_step(&mut self) -> Result<bool> {
+        let Some(mut st) = self.stepping.take() else {
+            return Ok(false);
+        };
+        let rung = st.targets.front().map_or(st.rung, |(bucket, _, _)| self.rung_of(*bucket));
+        let stepped = self.arm_next(&mut st);
+        self.device.synchronize()?;
+        self.pools.forget_weight_uses(self.device.stream())?;
+        stepped?;
+        match st.targets.front().map(|(bucket, _, _)| self.rung_of(*bucket)) {
+            Some(next) => {
+                if next != rung {
+                    self.live.arm(rung);
+                }
+                self.stepping = Some(st);
+                Ok(true)
             }
-            self.arm_rs = rs;
-            // Past its kind's widest bucket a target captures cold: the top
-            // bucket's fires made what its warm fire would.
-            self.arm_cold = narrower(bucket, &target) && !verify;
-            let spent = self.cache.body_stats();
-            let room = (self.bodies_mem as u64).saturating_sub(spent.census.bytes as u64);
-            let spare = self.pools.spare_bytes_for_bodies(room).unwrap_or(u64::MAX);
-            let price = (2 * spent.census.bytes / spent.census.bodies.max(1)) as u64;
-            // A map unit's margin never past a quarter of the allowance: an
-            // allowance the fit held under the margin would otherwise stop
-            // arming before its first body.
-            let margin = price.max(unit_margin.min(self.bodies_mem as u64 / 4));
-            let headroom = spare < margin;
-            let mine = !verify
-                && (spent.census.bodies >= record::MAX_BODIES
-                    || spent.census.bytes >= self.bodies_mem
-                    || headroom);
-            let stop = match self.ep.as_ref() {
-                // The group's ranks fire one sequence of steps: the allowance
-                // one rank runs out of stops every rank's captures.
-                Some(ep) => !verify && ep.wire().quiet.any(mine)?,
-                None => !verify && ballot.any(&self.device, mine),
-            };
-            if stop {
-                if never == 0 {
-                    never_from = bucket;
-                    belted = spent.census.bodies >= record::MAX_BODIES;
-                    if headroom && !belted && spent.census.bytes < self.bodies_mem {
-                        starved = Some(spare);
-                    }
-                    peer_stopped = !mine;
-                }
-                never += 1;
-                if !group {
-                    continue;
-                }
-                // An expert-parallel rank fires it anyway, sealed so nothing
-                // captures: its served eager walks find what they use made.
-                self.cache.seal_bodies();
-                warmed_only += 1;
+            None => {
+                let ended = self.arm_end(st);
+                self.live.arm(u32::MAX);
+                ended.map(|()| false)
             }
-            let began = std::time::Instant::now();
-            let at = target.kind().at();
-            let (lanes, media) = target.lanes();
-            if !stop {
-                wanted += 1;
-                tally[at].1 += 1;
+        }
+    }
+
+    /// Arms the next target; a rung's targets are priced anew as the rung
+    /// starts, at what the bodies armed by then weigh.
+    fn arm_next(&mut self, st: &mut Arming) -> Result<()> {
+        let Some((bucket, target, rs)) = st.targets.pop_front() else {
+            return Ok(());
+        };
+        let rung = self.rung_of(bucket);
+        if self.arm_stepped && rung != st.rung {
+            st.rung = rung;
+            st.priced = st.verify || st.group || self.lattice.is_none();
+        }
+        self.arm_target(st, bucket, target, rs)
+    }
+
+    fn arm_target(
+        &mut self,
+        st: &mut Arming,
+        bucket: u32,
+        target: BodySynth,
+        rs: record::RsBody,
+    ) -> Result<()> {
+        if !st.priced && st.narrower(bucket, &target) {
+            st.priced = true;
+            // What is still to arm: the narrower targets a coarser lattice
+            // may drop, and the rest (the top bucket's, the decodes'), which
+            // arm whatever the lattice.
+            let rest: Vec<(u32, Kind)> = std::iter::once((bucket, target.kind()))
+                .chain(
+                    st.targets
+                        .iter()
+                        .filter(|(bucket, target, _)| st.narrower(*bucket, target))
+                        .map(|(bucket, target, _)| (*bucket, target.kind())),
+                )
+                .collect();
+            let kept = st.targets.len() + 1 - rest.len();
+            let dropped = self.fit_lattice(&rest, kept, &st.weighed);
+            st.dropped.extend(dropped);
+        }
+        let weighed_before = self.cache.body_stats().census;
+        if st.dropped.contains(&bucket) {
+            return Ok(());
+        }
+        self.arm_rs = rs;
+        // Past its kind's widest bucket a target captures cold: the top
+        // bucket's fires made what its warm fire would.
+        self.arm_cold = st.topped && st.narrower(bucket, &target) && !st.verify;
+        st.topped |= Some(bucket) == st.top;
+        let spent = self.cache.body_stats();
+        let room = (self.bodies_mem as u64).saturating_sub(spent.census.bytes as u64);
+        let spare = self.pools.spare_bytes_for_bodies(room).unwrap_or(u64::MAX);
+        let price = (2 * spent.census.bytes / spent.census.bodies.max(1)) as u64;
+        // A map unit's margin never past a quarter of the allowance: an
+        // allowance the fit held under the margin would otherwise stop
+        // arming before its first body.
+        let margin = price.max(st.unit_margin.min(self.bodies_mem as u64 / 4));
+        let headroom = spare < margin;
+        let mine = !st.verify
+            && (spent.census.bodies >= record::MAX_BODIES
+                || spent.census.bytes >= self.bodies_mem
+                || headroom);
+        let stop = match self.ep.as_ref() {
+            // The group's ranks fire one sequence of steps: the allowance
+            // one rank runs out of stops every rank's captures.
+            Some(ep) => !st.verify && ep.wire().quiet.any(mine)?,
+            None => !st.verify && st.ballot.any(&self.device, mine),
+        };
+        if stop {
+            if st.never == 0 {
+                st.never_from = bucket;
+                st.belted = spent.census.bodies >= record::MAX_BODIES;
+                if headroom && !st.belted && spent.census.bytes < self.bodies_mem {
+                    st.starved = Some(spare);
+                }
+                st.peer_stopped = !mine;
             }
-            let owned = self.synthetic_lanes_with(&lanes, &media);
-            self.armed_body = None;
-            let idle = matches!(target, BodySynth::Idle);
-            for _ in 0..record::WARM_FIRES {
-                if idle {
-                    self.at_bucket(bucket);
-                }
-                let fired = self.fire_synthetic(&owned);
-                let landed = self.device.synchronize();
-                if let Err(why) = fired.and(landed) {
-                    if super::diag::on().arm_trace {
-                        eprintln!("[arm-trace] refused bucket {bucket}, {target}: {why}");
-                    }
-                    refused = Some(format!("bucket {bucket}, {target}: {why}"));
-                    break;
-                }
-                // Armed on its first fire (a cold capture): a second would
-                // only replay it.
-                if self
-                    .armed_body
-                    .as_ref()
-                    .is_some_and(|key| self.cache.holds_body(key))
-                {
-                    break;
-                }
+            st.never += 1;
+            if !st.group {
+                return Ok(());
             }
-            self.arm_cold = false;
-            let key = self.armed_body.take();
-            let warmed_ms = began.elapsed().as_secs_f64() * 1000.0;
-            let mut golden_ms = (0f64, 0f64);
-            if verify
-                && !idle
-                && let Some(key) = key.as_ref()
-                && self.cache.holds_body(key)
+            // An expert-parallel rank fires it anyway, sealed so nothing
+            // captures: its served eager walks find what they use made.
+            self.cache.seal_bodies();
+            st.warmed_only += 1;
+        }
+        let began = std::time::Instant::now();
+        let at = target.kind().at();
+        let (lanes, media) = target.lanes();
+        if !stop {
+            st.wanted += 1;
+            st.tally[at].1 += 1;
+        }
+        let owned = self.synthetic_lanes_with(&lanes, &media);
+        self.armed_body = None;
+        let idle = matches!(target, BodySynth::Idle);
+        for _ in 0..record::WARM_FIRES {
+            if idle {
+                self.at_bucket(bucket);
+            }
+            let fired = self.fire_synthetic(&owned);
+            let landed = self.device.synchronize();
+            if let Err(why) = fired.and(landed) {
+                if super::diag::on().arm_trace {
+                    eprintln!("[arm-trace] refused bucket {bucket}, {target}: {why}");
+                }
+                st.refused = Some(format!("bucket {bucket}, {target}: {why}"));
+                break;
+            }
+            // Armed on its first fire (a cold capture): a second would
+            // only replay it.
+            if self
+                .armed_body
+                .as_ref()
+                .is_some_and(|key| self.cache.holds_body(key))
             {
-                let clock = std::time::Instant::now();
-                self.golden(key, &owned)?;
-                golden_ms.0 = clock.elapsed().as_secs_f64() * 1000.0;
-                let clock = std::time::Instant::now();
-                self.golden_real(key, &owned)?;
-                golden_ms.1 = clock.elapsed().as_secs_f64() * 1000.0;
+                break;
             }
-            if key.as_ref().is_some_and(|key| self.cache.body_armed(key)) {
-                armed += 1;
-                tally[at].0 += 1;
-                let now = self.cache.body_stats().census;
-                if now.bodies > weighed_before.bodies {
-                    weighed[at].0 += now.bytes.saturating_sub(weighed_before.bytes);
-                    weighed[at].1 += now.bodies - weighed_before.bodies;
+        }
+        self.arm_cold = false;
+        let key = self.armed_body.take();
+        let warmed_ms = began.elapsed().as_secs_f64() * 1000.0;
+        let mut golden_ms = (0f64, 0f64);
+        if st.verify
+            && !idle
+            && let Some(key) = key.as_ref()
+            && self.cache.holds_body(key)
+        {
+            let clock = std::time::Instant::now();
+            self.golden(key, &owned)?;
+            golden_ms.0 = clock.elapsed().as_secs_f64() * 1000.0;
+            let clock = std::time::Instant::now();
+            self.golden_real(key, &owned)?;
+            golden_ms.1 = clock.elapsed().as_secs_f64() * 1000.0;
+        }
+        if key.as_ref().is_some_and(|key| self.cache.body_armed(key)) {
+            st.armed += 1;
+            st.tally[at].0 += 1;
+            let now = self.cache.body_stats().census;
+            if now.bodies > weighed_before.bodies {
+                st.weighed[at].0 += now.bytes.saturating_sub(weighed_before.bytes);
+                st.weighed[at].1 += now.bodies - weighed_before.bodies;
+            }
+            if let Some(wanted) = super::diag::on().arm_bench.as_deref()
+                && let Some(key) = key.as_ref()
+                && key.to_string().contains(wanted)
+            {
+                let mut shapes: Vec<(&str, Vec<(usize, u32)>)> =
+                    vec![("lattice", lanes.clone())];
+                let classes: Vec<usize> = lanes.iter().map(|(class, _)| *class).fold(
+                    Vec::new(),
+                    |mut seen, class| {
+                        if !seen.contains(&class) {
+                            seen.push(class);
+                        }
+                        seen
+                    },
+                );
+                let decoders: Vec<usize> = classes
+                    .iter()
+                    .copied()
+                    .filter(|class| self.decoding.contains(*class))
+                    .collect();
+                if matches!(target, BodySynth::Wide { .. }) && decoders.len() > 1 {
+                    let seats = (bucket as usize).min(lanes.len()).max(2);
+                    for &class in &decoders[1..] {
+                        shapes.push(("alone", vec![(class, 1u32); seats]));
+                        let mut pair = vec![(decoders[0], 1u32); seats / 2];
+                        pair.extend(vec![(class, 1u32); seats - seats / 2]);
+                        shapes.push(("pair", pair));
+                    }
+                } else if classes.len() > 1 && lanes.iter().all(|(_, rows)| *rows == 1) {
+                    let mut skewed = vec![(classes[0], 1u32); lanes.len() + 1 - classes.len()];
+                    skewed.extend(classes[1..].iter().map(|class| (*class, 1u32)));
+                    shapes.push(("skewed", skewed));
                 }
-                if let Some(wanted) = super::diag::on().arm_bench.as_deref()
-                    && let Some(key) = key.as_ref()
-                    && key.to_string().contains(wanted)
-                {
-                    let mut shapes: Vec<(&str, Vec<(usize, u32)>)> =
-                        vec![("lattice", lanes.clone())];
-                    let classes: Vec<usize> = lanes.iter().map(|(class, _)| *class).fold(
-                        Vec::new(),
-                        |mut seen, class| {
+                for (what, shape) in shapes {
+                    let owned = self.synthetic_lanes(&shape);
+                    let mut timed = Ok(());
+                    let mut rows_back = 0usize;
+                    for _ in 0..10 {
+                        timed = timed
+                            .and(
+                                self.fire_synthetic_as(&owned, crate::serve::Golden::Off)
+                                    .map(|out| rows_back = out.len()),
+                            )
+                            .and(self.device.synchronize());
+                    }
+                    let before = self.cache.body_stats().tally;
+                    let began = std::time::Instant::now();
+                    const FIRES: u32 = 50;
+                    for _ in 0..FIRES {
+                        timed = timed
+                            .and(self.fire_synthetic(&owned))
+                            .and(self.device.synchronize());
+                    }
+                    let us = began.elapsed().as_secs_f64() * 1e6 / f64::from(FIRES);
+                    let after = self.cache.body_stats().tally;
+                    let replayed = after.hits - before.hits;
+                    let lanes_of =
+                        |class: usize| shape.iter().filter(|(c, _)| *c == class).count();
+                    let layout: Vec<String> = shape
+                        .iter()
+                        .map(|(class, _)| *class)
+                        .fold(Vec::new(), |mut seen, class| {
                             if !seen.contains(&class) {
                                 seen.push(class);
                             }
                             seen
-                        },
-                    );
-                    let decoders: Vec<usize> = classes
-                        .iter()
-                        .copied()
-                        .filter(|class| self.decoding.contains(*class))
-                        .collect();
-                    if matches!(target, BodySynth::Wide { .. }) && decoders.len() > 1 {
-                        let seats = (bucket as usize).min(lanes.len()).max(2);
-                        for &class in &decoders[1..] {
-                            shapes.push(("alone", vec![(class, 1u32); seats]));
-                            let mut pair = vec![(decoders[0], 1u32); seats / 2];
-                            pair.extend(vec![(class, 1u32); seats - seats / 2]);
-                            shapes.push(("pair", pair));
-                        }
-                    } else if classes.len() > 1 && lanes.iter().all(|(_, rows)| *rows == 1) {
-                        let mut skewed = vec![(classes[0], 1u32); lanes.len() + 1 - classes.len()];
-                        skewed.extend(classes[1..].iter().map(|class| (*class, 1u32)));
-                        shapes.push(("skewed", skewed));
-                    }
-                    for (what, shape) in shapes {
-                        let owned = self.synthetic_lanes(&shape);
-                        let mut timed = Ok(());
-                        let mut rows_back = 0usize;
-                        for _ in 0..10 {
-                            timed = timed
-                                .and(
-                                    self.fire_synthetic_as(&owned, crate::serve::Golden::Off)
-                                        .map(|out| rows_back = out.len()),
-                                )
-                                .and(self.device.synchronize());
-                        }
-                        let before = self.cache.body_stats().tally;
-                        let began = std::time::Instant::now();
-                        const FIRES: u32 = 50;
-                        for _ in 0..FIRES {
-                            timed = timed
-                                .and(self.fire_synthetic(&owned))
-                                .and(self.device.synchronize());
-                        }
-                        let us = began.elapsed().as_secs_f64() * 1e6 / f64::from(FIRES);
-                        let after = self.cache.body_stats().tally;
-                        let replayed = after.hits - before.hits;
-                        let lanes_of =
-                            |class: usize| shape.iter().filter(|(c, _)| *c == class).count();
-                        let layout: Vec<String> = shape
-                            .iter()
-                            .map(|(class, _)| *class)
-                            .fold(Vec::new(), |mut seen, class| {
-                                if !seen.contains(&class) {
-                                    seen.push(class);
-                                }
-                                seen
-                            })
-                            .iter()
-                            .map(|c| format!("c{c}x{}", lanes_of(*c)))
-                            .collect();
-                        match timed {
-                            Ok(()) => eprintln!(
-                                "[arm-bench] {key} {what} [{}] {us:.0} us/fire, replayed {replayed}/{FIRES}, rows back {rows_back}, misses +{} declines +{} eager +{}",
-                                layout.join(" "),
-                                after.misses - before.misses,
-                                after.sealed_declines - before.sealed_declines,
-                                (after.eager_buffered + after.eager_copy_world)
-                                    - (before.eager_buffered + before.eager_copy_world)
-                            ),
-                            Err(why) => eprintln!("[arm-bench] {key} {what} refused: {why}"),
-                        }
-                    }
-                }
-                if super::diag::on().arm_trace
-                    && let Some(key) = key.as_ref()
-                {
-                    let last = self.cache.body_stats().last_capture;
-                    let islands: Vec<String> = self
-                        .cache
-                        .body_script(key)
-                        .into_iter()
-                        .filter(|(island, _, _)| *island)
-                        .map(|(_, from, upto)| {
-                            let ops: Vec<&str> = (from..upto)
-                                .map(|at| {
-                                    self.compiled
-                                        .template()
-                                        .get(at as usize)
-                                        .and_then(|region| {
-                                            self.trace.nodes.get(region.nodes.start as usize)
-                                        })
-                                        .map_or("?", |node| poem_ir::Operands::name(&node.op))
-                                })
-                                .collect();
-                            format!("{from}..{upto}:{}", ops.join("+"))
                         })
+                        .iter()
+                        .map(|c| format!("c{c}x{}", lanes_of(*c)))
                         .collect();
-                    eprintln!(
-                        "[arm-trace] armed {key} nodes={} edges={} islands={} ms={:.0} (warm+capture {warmed_ms:.0}, golden {:.0}, real {:.0}){}",
-                        last.nodes,
-                        last.edges,
-                        last.islands,
-                        began.elapsed().as_secs_f64() * 1000.0,
-                        golden_ms.0,
-                        golden_ms.1,
-                        if islands.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" [{}]", islands.join(" "))
-                        }
-                    );
+                    match timed {
+                        Ok(()) => eprintln!(
+                            "[arm-bench] {key} {what} [{}] {us:.0} us/fire, replayed {replayed}/{FIRES}, rows back {rows_back}, misses +{} declines +{} eager +{}",
+                            layout.join(" "),
+                            after.misses - before.misses,
+                            after.sealed_declines - before.sealed_declines,
+                            (after.eager_buffered + after.eager_copy_world)
+                                - (before.eager_buffered + before.eager_copy_world)
+                        ),
+                        Err(why) => eprintln!("[arm-bench] {key} {what} refused: {why}"),
+                    }
                 }
             }
+            if super::diag::on().arm_trace
+                && let Some(key) = key.as_ref()
+            {
+                let last = self.cache.body_stats().last_capture;
+                let islands: Vec<String> = self
+                    .cache
+                    .body_script(key)
+                    .into_iter()
+                    .filter(|(island, _, _)| *island)
+                    .map(|(_, from, upto)| {
+                        let ops: Vec<&str> = (from..upto)
+                            .map(|at| {
+                                self.compiled
+                                    .template()
+                                    .get(at as usize)
+                                    .and_then(|region| {
+                                        self.trace.nodes.get(region.nodes.start as usize)
+                                    })
+                                    .map_or("?", |node| poem_ir::Operands::name(&node.op))
+                            })
+                            .collect();
+                        format!("{from}..{upto}:{}", ops.join("+"))
+                    })
+                    .collect();
+                eprintln!(
+                    "[arm-trace] armed {key} nodes={} edges={} islands={} ms={:.0} (warm+capture {warmed_ms:.0}, golden {:.0}, real {:.0}){}",
+                    last.nodes,
+                    last.edges,
+                    last.islands,
+                    began.elapsed().as_secs_f64() * 1000.0,
+                    golden_ms.0,
+                    golden_ms.1,
+                    if islands.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", islands.join(" "))
+                    }
+                );
+            }
         }
+        Ok(())
+    }
 
+    fn arm_end(&mut self, mut st: Arming) -> Result<()> {
         self.arm_rs = record::RsBody::Folds;
         let stats = self.cache.body_stats();
         // An expert-parallel rank never captures past arming, whatever armed:
         // its peers fire other steps beside its, and an instantiation (a
         // capture's) takes the context while their collectives spin.
-        let seal = if armed == 0 && self.ep.is_some() {
+        let seal = if st.armed == 0 && self.ep.is_some() {
             Seal::Empty
-        } else if armed == 0 {
+        } else if st.armed == 0 {
             Seal::Open
-        } else if never == 0 && refused.is_none() {
+        } else if st.never == 0 && st.refused.is_none() {
             Seal::Complete
         } else {
-            Seal::Partial { never }
+            Seal::Partial { never: st.never }
         };
         let pool_line = format!(
             "pool declared {} MiB, high water {} MiB, committed {} MiB, spare under the ceiling {} MiB",
@@ -1559,22 +1708,22 @@ impl Shell {
         );
         let report = Armed {
             pool_line,
-            wanted,
-            armed,
-            kinds: tally,
-            warmed_only,
+            wanted: st.wanted,
+            armed: st.armed,
+            kinds: st.tally,
+            warmed_only: st.warmed_only,
             segmented: stats.census.segmented,
             bytes: stats.census.bytes,
             unweighed: stats.census.unweighed,
             bodies_mem: self.bodies_mem,
             bodies: stats.census.bodies,
-            last_refusal: refused,
-            unfireable,
-            never,
-            never_from,
-            belted,
-            starved,
-            peer_stopped,
+            last_refusal: st.refused.clone(),
+            unfireable: std::mem::take(&mut st.unfireable),
+            never: st.never,
+            never_from: st.never_from,
+            belted: st.belted,
+            starved: st.starved,
+            peer_stopped: st.peer_stopped,
             declines: stats.tally.declines,
             refusals: stats.tally.refusals,
             seal,
@@ -1583,16 +1732,21 @@ impl Shell {
         // A load that records bodies serves every composition it fires from
         // one: one that armed none, or stopped arming for want of room, would
         // serve eagerly, which is never what a deployment asked for.
-        let attempted = wanted + never;
-        if records && !verify && !group && attempted > 0 && (armed == 0 || starved.is_some()) {
+        let attempted = st.wanted + st.never;
+        if st.records
+            && !st.verify
+            && !st.group
+            && attempted > 0
+            && (st.armed == 0 || st.starved.is_some())
+        {
             return Err(Fault::Residency(format!(
                 "the card does not hold this deployment's graph bodies: {} of {attempted} \
                  compositions armed{}. A load that records bodies serves every composition \
                  from one rather than eagerly. Lower `[engine] max_context`, raise \
                  `[engine.memory] budget_device`, or free what else holds the device. \
                  ({report})",
-                armed,
-                match starved {
+                st.armed,
+                match st.starved {
                     Some(spare) => format!(
                         ", arming stopped with {} MiB spare under the ceiling",
                         spare >> 20
@@ -1629,7 +1783,7 @@ impl Shell {
                     .join(" ")
             );
         }
-        if !verify && !matches!(seal, Seal::Open) {
+        if !st.verify && !matches!(seal, Seal::Open) {
             self.cache.seal_bodies();
         }
         self.armed = Some(report);

@@ -1286,6 +1286,9 @@ impl Shell {
             arm_cold: false,
             arm_rs: crate::record::RsBody::Folds,
             arm_deferred: false,
+            arm_stepped: false,
+            stepping: None,
+            live: engine::live::Live::armed(),
             segments: std::collections::HashMap::new(),
             windows_memo: Vec::new(),
             cache: {
