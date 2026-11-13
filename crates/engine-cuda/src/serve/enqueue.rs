@@ -869,8 +869,11 @@ impl FireCtx<'_> {
                 self.cache.fire_body(&fire, &mut run, &place)
             } else {
                 self.cache.eager_walk(p.rs.body.buffers());
-                self.cache
-                    .eager_unbodied("its composition is one a body does not carry");
+                self.cache.eager_unbodied(
+                    p.unbodied
+                        .as_deref()
+                        .unwrap_or("its composition is one a body does not carry"),
+                );
                 let mut cursor = Cursor::new(&place);
                 walk(
                     self.trace,
