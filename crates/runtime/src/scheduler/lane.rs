@@ -12,6 +12,7 @@ use crate::scheduler::ProcessId;
 use anyhow::{Result, anyhow};
 
 use super::stats::SchedulerStats;
+use crate::store::roles::Pump;
 
 use super::worker::{BindRespond, HostKvOp, PoolOp, PreLaunchCopy, QueuedItem};
 
@@ -324,6 +325,9 @@ impl Lane {
         stats: Arc<SchedulerStats>,
     ) {
         let mut channels = ChannelJoin::new();
+        // The pool's instance and channel slots, looked up at the first
+        // fire (the stores are registered before any process runs).
+        let roles = std::cell::OnceCell::new();
         let mut landed_instances: HashMap<::engine::FrameId, Vec<Vec<::engine::InstanceId>>> =
             HashMap::new();
         let broker = crate::engine::CompletionBroker::new();
@@ -396,6 +400,7 @@ impl Lane {
                                     Self::fire_frame(
                                         engine,
                                         &channels,
+                                        roles.get_or_init(|| roles_of(engine_idx)).as_ref(),
                                         &mut frame,
                                         &launch_rx,
                                         &mut stash,
@@ -447,8 +452,13 @@ impl Lane {
                         if let Err(error) = engine.publish_landed() {
                             tracing::error!(frame = frame.0, step, %error, "publishing a landed step");
                         }
+                        let roles = roles.get_or_init(|| roles_of(engine_idx)).as_ref();
                         for instance in instances {
-                            if let Err(error) = channels.pump_out(engine.as_mut(), instance) {
+                            if let Err(error) =
+                                crate::store::roles::pump(roles, instance, Pump::Out, || {
+                                    channels.pump_out(engine.as_mut(), instance)
+                                })
+                            {
                                 tracing::error!(frame = frame.0, step, %error, "channel take after landing");
                             }
                         }
@@ -517,9 +527,14 @@ impl Lane {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the lane's state a frame reads, each its own"
+    )]
     fn fire_frame(
         engine: &mut EngineBox,
         channels: &ChannelJoin,
+        roles: Option<&crate::store::roles::RolesHandle>,
         frame: &mut crate::engine::FrameFire,
         launch_rx: &crate::rt::channel::Receiver<LaneRequest>,
         stash: &mut Option<LaneRequest>,
@@ -550,7 +565,10 @@ impl Lane {
 
         for step in &submitted.steps {
             for attachment in &step.attachments {
-                if let Err(error) = channels.pump_in(engine.as_mut(), attachment.instance) {
+                let instance = attachment.instance;
+                if let Err(error) = crate::store::roles::pump(roles, instance, Pump::In, || {
+                    channels.pump_in(engine.as_mut(), instance)
+                }) {
                     return Err(format!("channel publish: {error}"));
                 }
             }
@@ -585,9 +603,10 @@ impl Lane {
         for (step, woken) in submitted.steps.iter().zip(&mut wakes) {
             for attachment in &step.attachments {
                 let deferred = asynchronous.then_some(&mut *woken);
-                if let Err(error) =
-                    channels.pump_out_with(engine.as_mut(), attachment.instance, deferred)
-                {
+                let instance = attachment.instance;
+                if let Err(error) = crate::store::roles::pump(roles, instance, Pump::Out, || {
+                    channels.pump_out_with(engine.as_mut(), instance, deferred)
+                }) {
                     return Err(format!("channel take: {error}"));
                 }
             }
@@ -824,7 +843,15 @@ impl Lane {
                         PoolOp::CommitSegments(segments) => engine.commit_segments(segments),
                         PoolOp::ReleaseSegments(segments) => engine.release_segments(segments),
                         PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),
-                        PoolOp::Rebind(rebind) => engine.rebind_slots(rebind),
+                        PoolOp::Rebind(rebind) => crate::store::roles::rebind(
+                            roles_of(engine_idx).as_ref(),
+                            &mut **engine,
+                            rebind,
+                            |engine, instance, pump| match pump {
+                                Pump::In => channels.pump_in(engine, instance),
+                                Pump::Out => channels.pump_out(engine, instance),
+                            },
+                        ),
                     }
                     .map_err(anyhow::Error::from)
                 });
@@ -925,7 +952,7 @@ impl Lane {
             &mut **engine,
             &plan.binding,
             holder,
-            |id| channels.contains(id),
+            |id| channels.engine_registered(id),
         )?;
         let bound = BoundInstance::new(&bound, plan.pacing_wait_id);
         channels.bind(bound.instance_id, plan.binding.channels.clone());

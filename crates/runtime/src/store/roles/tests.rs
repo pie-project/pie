@@ -2,7 +2,9 @@
 //! shapes: binds and closes give their slots back, a shared ring outlives
 //! its channel until the last instance on it closes, a park and unpark move
 //! an item through the host tier and tell the engine its new refs, and the
-//! record math is the same with the shapes as without them.
+//! record math is the same with the shapes as without them. A ring whose
+//! cell is past a slot lies in one run of adjacent slots, never split, and
+//! host writes into a parked item wait for its rebind.
 
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +18,10 @@ use ::engine::{
     RegisteredChannel, RingFacts,
 };
 
-use super::{Owner, Roles, RolesHandle, bind_instance, learn_program, register_channel};
+use super::{
+    Owner, Pump, Roles, RolesError, RolesHandle, bind_instance, learn_program, pump, rebind,
+    register_channel,
+};
 use crate::store::shared::{Shared, SharedPool};
 
 const KIB: u64 = 1 << 10;
@@ -136,6 +141,13 @@ struct FakeEngine {
     bindings: Vec<InstanceBinding>,
     registrations: Vec<ChannelRegistration>,
     rebinds: Vec<Rebind>,
+    /// What `ring_facts` states in place of the two-slot ring.
+    ring: Option<RingFacts>,
+    /// The instance's tables must be one run.
+    contiguous_tables: bool,
+    /// Answers `register_channel` with `Unsupported`, stating no ring for
+    /// it: the runtime keeps such a channel alone.
+    no_channels: bool,
 }
 
 impl Engine for FakeEngine {
@@ -157,6 +169,7 @@ impl Engine for FakeEngine {
             instance: Footprint {
                 bytes: 5000,
                 slots: 3,
+                contiguous: self.contiguous_tables,
             },
             rings: vec![
                 RingFacts {
@@ -166,6 +179,7 @@ impl Engine for FakeEngine {
                     footprint: Footprint {
                         bytes: 352,
                         slots: 1,
+                        contiguous: false,
                     },
                 },
                 RingFacts {
@@ -175,6 +189,7 @@ impl Engine for FakeEngine {
                     footprint: Footprint {
                         bytes: 1832,
                         slots: 3,
+                        contiguous: false,
                     },
                 },
             ],
@@ -185,6 +200,12 @@ impl Engine for FakeEngine {
         &self,
         _registration: &ChannelRegistration,
     ) -> ::engine::Result<Option<RingFacts>> {
+        if self.no_channels {
+            return Ok(None);
+        }
+        if let Some(ring) = self.ring {
+            return Ok(Some(ring));
+        }
         Ok(Some(RingFacts {
             channel: 0,
             cell_bytes: 64,
@@ -192,6 +213,7 @@ impl Engine for FakeEngine {
             footprint: Footprint {
                 bytes: 1376,
                 slots: 2,
+                contiguous: false,
             },
         }))
     }
@@ -200,6 +222,12 @@ impl Engine for FakeEngine {
         &mut self,
         registration: &ChannelRegistration,
     ) -> ::engine::Result<RegisteredChannel> {
+        if self.no_channels {
+            return Err(::engine::Error::unsupported(
+                self.kind(),
+                "register_channel",
+            ));
+        }
         self.registrations.push(registration.clone());
         Ok(RegisteredChannel {
             id: registration.id,
@@ -458,4 +486,332 @@ fn the_record_math_is_the_same_with_the_role_shapes_as_without() {
     // A pool that states neither shape has no roles: nothing changes.
     let b = Arc::new(Mutex::new(b));
     assert!(Roles::new(&b, None).is_none());
+}
+
+/// A ring of `slots` 1 KiB slots (cells past a slot) that must be one run.
+fn run_ring(slots: u32) -> RingFacts {
+    RingFacts {
+        channel: 0,
+        cell_bytes: u64::from(slots) * KIB / 2,
+        capacity: 1,
+        footprint: Footprint {
+            bytes: u64::from(slots) * KIB,
+            slots,
+            contiguous: true,
+        },
+    }
+}
+
+fn adjacent(refs: &[u32], per_chunk: u32) -> bool {
+    refs.windows(2).all(|pair| pair[1] == pair[0] + 1)
+        && refs.first().map(|r| r / per_chunk) == refs.last().map(|r| r / per_chunk)
+}
+
+/// 1 KiB `Channel` slots in 1 MiB chunks.
+const PER_CHUNK: u32 = 1024;
+
+#[test]
+fn a_run_is_adjacent_slots_of_one_chunk_and_its_hole_is_taken_again() {
+    let Pools { device, .. } = pools();
+    let shape = device.lock().unwrap().roles().channel.unwrap().pool;
+    let mut pool = device.lock().unwrap();
+    // A loose slot first, so the run must find room past it.
+    let loose = pool.take_refs(shape, 1).unwrap();
+    let run = pool.take_run(shape, 600).unwrap();
+    assert_eq!(run.len(), 600);
+    assert!(adjacent(&run, PER_CHUNK));
+    // The rest of that chunk holds 423: a run of 500 opens another chunk.
+    let next = pool.take_run(shape, 500).unwrap();
+    assert!(adjacent(&next, PER_CHUNK));
+    assert_ne!(next[0] / PER_CHUNK, run[0] / PER_CHUNK);
+    // Freed, the run's hole holds a run again, in the same place.
+    pool.give_refs(shape, &run);
+    let again = pool.take_run(shape, 600).unwrap();
+    assert_eq!(again, run);
+    for refs in [&loose, &again, &next] {
+        pool.give_refs(shape, refs);
+    }
+    assert_eq!(pool.pool().demand().live, 0);
+}
+
+#[test]
+fn a_run_is_never_split_and_fails_whole_where_no_chunk_has_room() {
+    let Pools { device, .. } = pools();
+    let (shape, list) = {
+        let pool = device.lock().unwrap();
+        (
+            pool.roles().channel.unwrap().pool,
+            pool.list().unwrap().pool,
+        )
+    };
+    let mut pool = device.lock().unwrap();
+    // One chunk of the shape, every other slot freed: half of it free, no
+    // two free slots side by side.
+    let whole = pool.take_refs(shape, u64::from(PER_CHUNK)).unwrap();
+    assert!(adjacent(&whole, PER_CHUNK));
+    let freed: Vec<u32> = whole.iter().copied().step_by(2).collect();
+    pool.give_refs(shape, &freed);
+    // Every other chunk taken by kv.
+    let mut kv = Vec::new();
+    while let Some(refs) = pool.take_refs(list, 1) {
+        kv.extend(refs);
+    }
+    let before = pool.pool().demand();
+    assert_eq!(
+        pool.take_run(shape, 2),
+        Err(crate::store::slots::SlotError::Short {
+            shape,
+            slots: 2,
+            chunks: 1
+        }),
+        "512 slots are free, none two in a row"
+    );
+    assert_eq!(pool.pool().demand(), before, "nothing was taken");
+    // A run of one fits a hole.
+    let one = pool.take_run(shape, 1).unwrap();
+    assert_eq!(one.len(), 1);
+    // A run past a chunk is refused outright.
+    assert!(matches!(
+        pool.take_run(shape, u64::from(PER_CHUNK) + 1),
+        Err(crate::store::slots::SlotError::RunPastChunk {
+            per_chunk: PER_CHUNK,
+            ..
+        })
+    ));
+    // With a kv chunk let go, the run opens it.
+    let spc = 16;
+    let freed_chunk: Vec<u32> = kv.drain(..spc).collect();
+    pool.give_refs(list, &freed_chunk);
+    let run = pool.take_run(shape, 2).unwrap();
+    assert!(adjacent(&run, PER_CHUNK));
+}
+
+#[test]
+fn a_ring_past_a_slot_registers_parks_and_unparks_as_one_run() {
+    let Pools {
+        device,
+        host,
+        roles,
+    } = pools();
+    let mut engine = FakeEngine {
+        ring: Some(run_ring(300)),
+        ..FakeEngine::default()
+    };
+    let before = held(&device);
+    // Scatter the shape first, so a run cannot be the next loose slots.
+    let shape = device.lock().unwrap().roles().channel.unwrap().pool;
+    let loose = device.lock().unwrap().take_refs(shape, 3).unwrap();
+    device.lock().unwrap().give_refs(shape, &loose[1..2]);
+    let channel = registered(&roles, &mut engine, 1, 1);
+    let slots = engine.registrations[0].slots.clone();
+    assert_eq!(slots.len(), 300);
+    assert!(adjacent(&slots, PER_CHUNK));
+    let instance = bind(&roles, &mut engine, vec![channel], 1);
+
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    let ring = park
+        .copies()
+        .iter()
+        .find(|copy| copy.shape == CHANNEL)
+        .unwrap()
+        .clone();
+    assert!(adjacent(&ring.host, PER_CHUNK), "a run on the host too");
+    roles.lock().unwrap().commit(park);
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .unwrap();
+    roles.lock().unwrap().commit(unpark);
+    let back = roles.lock().unwrap().slots(Owner::Channel(channel));
+    assert_eq!(back.len(), 300);
+    assert!(adjacent(&back, PER_CHUNK), "and back into a run");
+    assert_eq!(held(&host), 0);
+
+    roles.lock().unwrap().close_instance(instance);
+    roles.lock().unwrap().close_channel(channel);
+    device
+        .lock()
+        .unwrap()
+        .give_refs(shape, &[loose[0], loose[2]]);
+    assert_eq!(held(&device), before);
+}
+
+#[test]
+fn a_cell_past_a_chunk_is_refused_by_name() {
+    let Pools { device, roles, .. } = pools();
+    let mut engine = FakeEngine {
+        ring: Some(run_ring(PER_CHUNK + 1)),
+        ..FakeEngine::default()
+    };
+    let before = held(&device);
+    let plan = ChannelRegistration {
+        id: ChannelId(1),
+        ..ChannelRegistration::default()
+    };
+    let error = register_channel(Some(&roles), &mut engine, &plan, None, |engine, plan| {
+        Ok(engine.register_channel(plan)?)
+    })
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<RolesError>(),
+        Some(&RolesError::PastChunk {
+            role: SlotRole::Channel,
+            slots: PER_CHUNK + 1,
+            slot_bytes: KIB,
+            per_chunk: PER_CHUNK,
+        })
+    );
+    assert!(error.to_string().contains("larger than a chunk"), "{error}");
+    assert!(engine.registrations.is_empty(), "the engine is never asked");
+    assert_eq!(held(&device), before);
+}
+
+#[test]
+fn host_writes_into_a_parked_ring_wait_and_replay_in_order_after_the_rebind() {
+    let Pools { roles, .. } = pools();
+    let mut engine = FakeEngine::default();
+    let channel = registered(&roles, &mut engine, 1, 1);
+    let instance = bind(&roles, &mut engine, vec![channel], 1);
+    let other_channel = registered(&roles, &mut engine, 2, 2);
+    let other = bind(&roles, &mut engine, vec![other_channel], 2);
+    let written: std::cell::RefCell<Vec<(InstanceId, Pump, u32)>> = Default::default();
+    let write = |instance: InstanceId, way: Pump, n: u32| {
+        pump(Some(&roles), instance, way, || {
+            written.borrow_mut().push((instance, way, n));
+            Ok(())
+        })
+        .unwrap();
+    };
+
+    write(instance, Pump::In, 0);
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    // Held from the moment the copy starts.
+    write(instance, Pump::In, 1);
+    roles.lock().unwrap().commit(park);
+    write(instance, Pump::Out, 2);
+    write(instance, Pump::In, 3);
+    // Another process's instance writes on.
+    write(other, Pump::In, 4);
+    assert_eq!(
+        *written.borrow(),
+        vec![(instance, Pump::In, 0), (other, Pump::In, 4)]
+    );
+
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .unwrap();
+    roles.lock().unwrap().commit(unpark);
+    write(instance, Pump::Out, 5);
+    assert_eq!(written.borrow().len(), 2, "back, but not yet rebound");
+
+    let mut replayed = Vec::new();
+    let stale = roles.lock().unwrap().stale(holder(1));
+    for item in stale {
+        rebind(Some(&roles), &mut engine, item, |_, instance, way| {
+            replayed.push((instance, way));
+            Ok(())
+        })
+        .unwrap();
+    }
+    assert_eq!(
+        replayed,
+        vec![
+            (instance, Pump::In),
+            (instance, Pump::Out),
+            (instance, Pump::In),
+            (instance, Pump::Out),
+        ],
+        "every held write, in the order it was asked, after both rebinds"
+    );
+    assert_eq!(engine.rebinds.len(), 2);
+    write(instance, Pump::In, 6);
+    assert_eq!(written.borrow().last(), Some(&(instance, Pump::In, 6)));
+}
+
+#[test]
+fn instance_tables_past_a_slot_take_one_run() {
+    let Pools { device, roles, .. } = pools();
+    let mut engine = FakeEngine {
+        contiguous_tables: true,
+        ..FakeEngine::default()
+    };
+    // Scatter the shape, so three loose slots would not be adjacent.
+    let shape = device.lock().unwrap().roles().instance.unwrap().pool;
+    let loose = device.lock().unwrap().take_refs(shape, 5).unwrap();
+    device
+        .lock()
+        .unwrap()
+        .give_refs(shape, &[loose[1], loose[3]]);
+    let id = bind(&roles, &mut engine, Vec::new(), 1);
+    let tables = &engine.bindings[0].instance_slots;
+    assert_eq!(tables.len(), 3);
+    // 4 KiB slots, 256 to a 1 MiB chunk.
+    assert!(adjacent(tables, 256), "{tables:?}");
+    roles.lock().unwrap().close_instance(id);
+}
+
+/// Binds an instance on channel 0 joined as the lane joins it, the ring
+/// counted as the channel's only where the engine registered it.
+fn bind_joined(engine: &mut FakeEngine) -> InstanceBinding {
+    let Pools { roles, .. } = pools();
+    let plan = ChannelRegistration {
+        id: ChannelId(1),
+        capacity: 20,
+        ..ChannelRegistration::default()
+    };
+    let mut join = crate::engine::ChannelJoin::new();
+    let channel = register_channel(
+        Some(&roles),
+        engine,
+        &plan,
+        Some(holder(1)),
+        |engine, plan| crate::engine::verbs::register_channel(engine, 0, plan),
+    )
+    .unwrap();
+    join.insert(channel, eta_ir::container::HostRole::Writer);
+    assert!(join.contains(plan.id), "joined either way");
+    learn_program(&roles, engine, PROGRAM).unwrap();
+    let binding = InstanceBinding {
+        program: PROGRAM,
+        channels: vec![plan.id],
+        ..InstanceBinding::default()
+    };
+    bind_instance(Some(&roles), engine, &binding, Some(holder(1)), |id| {
+        join.engine_registered(id)
+    })
+    .unwrap();
+    engine.bindings.last().unwrap().clone()
+}
+
+#[test]
+fn a_channel_the_engine_did_not_register_leaves_its_ring_to_the_instance() {
+    // The engine registers the channel: ring 0 is the channel's.
+    let mut engine = FakeEngine::default();
+    let bound = bind_joined(&mut engine);
+    assert_eq!(
+        bound
+            .ring_slots
+            .iter()
+            .map(|ring| ring.channel)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    // It answers Unsupported: the runtime still joins the channel, and
+    // ring 0 takes slots of the instance's own.
+    let mut engine = FakeEngine {
+        no_channels: true,
+        ..FakeEngine::default()
+    };
+    let bound = bind_joined(&mut engine);
+    let rings: Vec<(u32, usize)> = bound
+        .ring_slots
+        .iter()
+        .map(|ring| (ring.channel, ring.slots.len()))
+        .collect();
+    assert_eq!(rings, vec![(0, 1), (1, 3)]);
 }

@@ -73,6 +73,7 @@ pub mod verbs {
             Err(engine::Error::Unsupported { .. }) => None,
             Err(error) => return Err(anyhow::Error::from(error)),
         };
+        let engine_registered = answered.is_some();
         let mint = |id: u64| if id == 0 { table.alloc() } else { id };
         let (reader_wait_id, writer_wait_id) = answered.as_ref().map_or_else(
             || (table.alloc(), table.alloc()),
@@ -120,14 +121,17 @@ pub mod verbs {
                     writer_wait_id,
                 ))
             }
-            None => Ok(RegisteredChannel::new(
-                engine_id,
-                registration.id,
-                cell_bytes,
-                registration.capacity,
-                reader_wait_id,
-                writer_wait_id,
-            )),
+            None => Ok(RegisteredChannel {
+                engine_registered,
+                ..RegisteredChannel::new(
+                    engine_id,
+                    registration.id,
+                    cell_bytes,
+                    registration.capacity,
+                    reader_wait_id,
+                    writer_wait_id,
+                )
+            }),
         }
     }
 }

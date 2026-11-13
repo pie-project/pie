@@ -42,6 +42,7 @@ pub fn ring_facts(
         footprint: engine::Footprint {
             bytes: shape.cell_count() * shape.cell_stride() as u64,
             slots,
+            contiguous: false,
         },
     })
 }
@@ -236,6 +237,7 @@ impl Plane {
             Some((_, slots)) => engine::Footprint {
                 bytes: sizes.iter().sum(),
                 slots,
+                contiguous: false,
             },
             None => engine::Footprint::default(),
         };

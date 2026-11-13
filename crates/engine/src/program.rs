@@ -102,6 +102,16 @@ pub struct ProgramFacts {
 pub struct Footprint {
     pub bytes: u64,
     pub slots: u32,
+    /// The slots must be one run (`new-memory/STATE-ROLES.md` option D):
+    /// `slots` adjacent slots of one chunk, refs `first .. first + slots`
+    /// in order, so the engine addresses the item as one span from its
+    /// first slot rather than through its ref table. What a ring whose cell
+    /// is larger than a slot states. The runtime refuses an item that
+    /// needs more slots than a chunk holds, and moves a run whole, into
+    /// another run, when it parks or unparks it. `false`: any slots, the
+    /// item addressed slot by slot.
+    #[serde(default)]
+    pub contiguous: bool,
 }
 
 /// One ring: `capacity + 1` cells of `cell_bytes` each (padded to the

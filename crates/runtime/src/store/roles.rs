@@ -42,6 +42,7 @@ use ::engine::{
 };
 
 use super::shared::{FixedShape, RoleShapes, Shared};
+use super::slots::SlotError;
 
 /// Whose slots an item is: an instance's tables (and the rings it holds
 /// itself), or a registered channel's ring.
@@ -62,6 +63,16 @@ impl Owner {
     }
 }
 
+/// A host write the runtime issues into an instance's rings through the
+/// engine: cells published into the rings the guest reads
+/// ([`::engine::Engine::publish_channel`], `In`), or taken out of the ones
+/// it writes ([`::engine::Engine::take_channel`], `Out`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pump {
+    In,
+    Out,
+}
+
 /// The process an item parks and unparks with.
 pub type Holder = uuid::Uuid;
 
@@ -78,6 +89,21 @@ pub enum RolesError {
     Program(ProgramId),
     #[error("channel {0} is parked with its process")]
     Parked(ChannelId),
+    #[error(
+        "no chunk has {slots} adjacent free {role:?} slots for an item that must lie in one run"
+    )]
+    NoRun { role: SlotRole, slots: u32 },
+    #[error(
+        "a {role:?} item must lie in one run of {slots} adjacent slots of {slot_bytes} bytes, \
+         and a chunk holds {per_chunk} of them: its cell is larger than a chunk, which the \
+         pool cannot place (new-memory/STATE-ROLES.md option D)"
+    )]
+    PastChunk {
+        role: SlotRole,
+        slots: u32,
+        slot_bytes: u64,
+        per_chunk: u32,
+    },
 }
 
 /// Where an item's slots lie.
@@ -89,11 +115,14 @@ enum Tier {
     Moving,
 }
 
-/// A run of one role's slots, as refs of the tier the item lies on.
+/// One role's slots of an item, as refs of the tier the item lies on;
+/// `contiguous`, adjacent in one chunk ([`::engine::Footprint::contiguous`]),
+/// and taken so again on every tier it moves to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Part {
     role: SlotRole,
     refs: Vec<u32>,
+    contiguous: bool,
 }
 
 #[derive(Debug)]
@@ -142,10 +171,42 @@ impl Item {
 /// it: [`Roles::bound`] keeps them, [`Roles::untake`] gives them back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Taken {
-    pub instance_slots: Vec<u32>,
-    pub ring_slots: Vec<RingSlots>,
+    /// The tables' part, then each own ring's.
+    parts: Vec<Part>,
+    /// Each own ring's channel index, in part order after the first.
+    rings: Vec<u32>,
     /// The registered channels with slots the binding names.
     channels: Vec<ChannelId>,
+}
+
+impl Taken {
+    /// [`::engine::InstanceBinding::instance_slots`].
+    #[must_use]
+    pub fn instance_slots(&self) -> Vec<u32> {
+        self.parts
+            .first()
+            .map_or_else(Vec::new, |part| part.refs.clone())
+    }
+
+    /// [`::engine::InstanceBinding::ring_slots`].
+    #[must_use]
+    pub fn ring_slots(&self) -> Vec<RingSlots> {
+        own_rings(&self.rings, &self.parts)
+    }
+}
+
+/// The slots taken for a channel about to register:
+/// [`Roles::channel_registered`] keeps them, [`Roles::untake_channel`]
+/// gives them back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakenRing(Part);
+
+impl TakenRing {
+    /// [`::engine::ChannelRegistration::slots`].
+    #[must_use]
+    pub fn slots(&self) -> Vec<u32> {
+        self.0.refs.clone()
+    }
 }
 
 /// A park (`out`) or unpark of a process's items: each item's slots on the
@@ -182,6 +243,9 @@ pub struct Roles {
     shapes: RoleShapes,
     programs: HashMap<ProgramId, ProgramFacts>,
     items: HashMap<Owner, Item>,
+    /// The host writes held while their instance's slots are parked or
+    /// not yet rebound, in the order they were asked.
+    held: Vec<(InstanceId, Pump)>,
 }
 
 impl Roles {
@@ -199,6 +263,7 @@ impl Roles {
             shapes,
             programs: HashMap::new(),
             items: HashMap::new(),
+            held: Vec::new(),
         })
     }
 
@@ -206,15 +271,41 @@ impl Roles {
         self.shapes.of(role).ok_or(RolesError::NoShape(role))
     }
 
-    fn take(&self, on: &Shared, role: SlotRole, slots: u32) -> Result<Vec<u32>, RolesError> {
+    /// `slots` of `role` on `on`: any free ones, or (`contiguous`) one run
+    /// of adjacent ones in a chunk, never split.
+    fn take(
+        &self,
+        on: &Shared,
+        role: SlotRole,
+        slots: u32,
+        contiguous: bool,
+    ) -> Result<Part, RolesError> {
+        let part = |refs| Part {
+            role,
+            refs,
+            contiguous,
+        };
         if slots == 0 {
-            return Ok(Vec::new());
+            return Ok(part(Vec::new()));
         }
         let shape = self.shape(role)?;
-        on.lock()
-            .unwrap()
-            .take_refs(shape.pool, u64::from(slots))
-            .ok_or(RolesError::Short { role, slots })
+        let mut pool = on.lock().unwrap();
+        if !contiguous {
+            return pool
+                .take_refs(shape.pool, u64::from(slots))
+                .map(part)
+                .ok_or(RolesError::Short { role, slots });
+        }
+        match pool.take_run(shape.pool, u64::from(slots)) {
+            Ok(refs) => Ok(part(refs)),
+            Err(SlotError::RunPastChunk { per_chunk, .. }) => Err(RolesError::PastChunk {
+                role,
+                slots,
+                slot_bytes: shape.slot_bytes,
+                per_chunk,
+            }),
+            Err(_) => Err(RolesError::NoRun { role, slots }),
+        }
     }
 
     fn give(&self, on: &Shared, parts: &[Part]) {
@@ -230,11 +321,8 @@ impl Roles {
     fn take_parts(&self, on: &Shared, like: &[Part]) -> Result<Vec<Part>, RolesError> {
         let mut taken = Vec::with_capacity(like.len());
         for part in like {
-            match self.take(on, part.role, part.refs.len() as u32) {
-                Ok(refs) => taken.push(Part {
-                    role: part.role,
-                    refs,
-                }),
+            match self.take(on, part.role, part.refs.len() as u32, part.contiguous) {
+                Ok(part) => taken.push(part),
                 Err(error) => {
                     self.give(on, &taken);
                     return Err(error);
@@ -287,8 +375,13 @@ impl Roles {
             channels: shared,
             ..Taken::default()
         };
-        let untake = |roles: &Self, taken: &Taken| roles.give(&device, &parts_of(taken));
-        taken.instance_slots = self.take(&device, SlotRole::Instance, facts.instance.slots)?;
+        let footprint = facts.instance;
+        taken.parts.push(self.take(
+            &device,
+            SlotRole::Instance,
+            footprint.slots,
+            footprint.contiguous,
+        )?);
         for ring in &facts.rings {
             let covered = channels
                 .get(ring.channel as usize)
@@ -296,13 +389,19 @@ impl Roles {
             if covered {
                 continue;
             }
-            match self.take(&device, SlotRole::Channel, ring.footprint.slots) {
-                Ok(slots) => taken.ring_slots.push(RingSlots {
-                    channel: ring.channel,
-                    slots,
-                }),
+            let footprint = ring.footprint;
+            match self.take(
+                &device,
+                SlotRole::Channel,
+                footprint.slots,
+                footprint.contiguous,
+            ) {
+                Ok(part) => {
+                    taken.parts.push(part);
+                    taken.rings.push(ring.channel);
+                }
                 Err(error) => {
-                    untake(self, &taken);
+                    self.give(&device, &taken.parts);
                     return Err(error);
                 }
             }
@@ -312,7 +411,7 @@ impl Roles {
 
     /// The bind of `taken` failed: its slots go back.
     pub fn untake(&mut self, taken: Taken) {
-        self.give(&self.device, &parts_of(&taken));
+        self.give(&self.device, &taken.parts);
     }
 
     /// The engine bound `taken` as instance `id`, for `holder`.
@@ -322,8 +421,8 @@ impl Roles {
                 item.attached.insert(id);
             }
         }
-        let mut item = Item::new(holder, parts_of(&taken));
-        item.rings = taken.ring_slots.iter().map(|ring| ring.channel).collect();
+        let mut item = Item::new(holder, taken.parts);
+        item.rings = taken.rings;
         item.channels = taken.channels;
         if item.parts.iter().all(|part| part.refs.is_empty()) && item.channels.is_empty() {
             return;
@@ -335,6 +434,7 @@ impl Roles {
     /// channel it was the last on with them.
     pub fn close_instance(&mut self, id: InstanceId) {
         let owner = Owner::Instance(id);
+        self.held.retain(|&(instance, _)| instance != id);
         let Some(item) = self.items.get_mut(&owner) else {
             return;
         };
@@ -352,37 +452,31 @@ impl Roles {
 
     // ---- channels ----
 
-    /// The slots a channel whose ring `facts` states takes.
-    pub fn take_channel(&mut self, facts: &RingFacts) -> Result<Vec<u32>, RolesError> {
-        self.take(&self.device, SlotRole::Channel, facts.footprint.slots)
-    }
-
-    /// The channel's registration failed: `slots` go back.
-    pub fn untake_channel(&mut self, slots: Vec<u32>) {
-        self.give(
+    /// The slots a channel whose ring `facts` states takes: one run of
+    /// adjacent slots where it says `contiguous`.
+    pub fn take_channel(&mut self, facts: &RingFacts) -> Result<TakenRing, RolesError> {
+        let footprint = facts.footprint;
+        self.take(
             &self.device,
-            &[Part {
-                role: SlotRole::Channel,
-                refs: slots,
-            }],
-        );
+            SlotRole::Channel,
+            footprint.slots,
+            footprint.contiguous,
+        )
+        .map(TakenRing)
     }
 
-    /// The engine registered channel `id` over `slots`, for `holder`.
-    pub fn channel_registered(&mut self, id: ChannelId, holder: Option<Holder>, slots: Vec<u32>) {
-        if slots.is_empty() {
+    /// The channel's registration failed: its slots go back.
+    pub fn untake_channel(&mut self, taken: TakenRing) {
+        self.give(&self.device, &[taken.0]);
+    }
+
+    /// The engine registered channel `id` over `taken`, for `holder`.
+    pub fn channel_registered(&mut self, id: ChannelId, holder: Option<Holder>, taken: TakenRing) {
+        if taken.0.refs.is_empty() {
             return;
         }
-        self.items.insert(
-            Owner::Channel(id),
-            Item::new(
-                holder,
-                vec![Part {
-                    role: SlotRole::Channel,
-                    refs: slots,
-                }],
-            ),
-        );
+        self.items
+            .insert(Owner::Channel(id), Item::new(holder, vec![taken.0]));
     }
 
     /// The engine closed channel `id`: its ring goes back once no bound
@@ -586,18 +680,48 @@ impl Roles {
                 Owner::Instance(id) => Rebind::Instance {
                     id,
                     instance: item.parts.first().map_or_else(Vec::new, |p| p.refs.clone()),
-                    rings: item
-                        .rings
-                        .iter()
-                        .zip(item.parts.iter().skip(1))
-                        .map(|(&channel, part)| RingSlots {
-                            channel,
-                            slots: part.refs.clone(),
-                        })
-                        .collect(),
+                    rings: own_rings(&item.rings, &item.parts),
                 },
             })
             .collect()
+    }
+
+    /// Whether a host write into `instance`'s rings must wait: its own
+    /// slots, or a registered channel's it is bound to, are parked, moving,
+    /// or back but not yet rebound.
+    #[must_use]
+    pub fn writes_held(&self, instance: InstanceId) -> bool {
+        let away = |owner: Owner| {
+            self.items
+                .get(&owner)
+                .is_some_and(|item| item.tier != Tier::Device || item.stale)
+        };
+        let Some(item) = self.items.get(&Owner::Instance(instance)) else {
+            return false;
+        };
+        away(Owner::Instance(instance))
+            || item
+                .channels
+                .iter()
+                .any(|&channel| away(Owner::Channel(channel)))
+    }
+
+    /// Holds `pump` of `instance` until its slots are back and rebound.
+    pub fn hold(&mut self, instance: InstanceId, pump: Pump) {
+        if self.held.last() != Some(&(instance, pump)) {
+            self.held.push((instance, pump));
+        }
+    }
+
+    /// The held writes whose instances may write again, in the order they
+    /// were held; the rest stay held.
+    pub fn released(&mut self) -> Vec<(InstanceId, Pump)> {
+        let held = std::mem::take(&mut self.held);
+        let (keep, go): (Vec<_>, Vec<_>) = held
+            .into_iter()
+            .partition(|&(instance, _)| self.writes_held(instance));
+        self.held = keep;
+        go
     }
 
     /// The engine took `owner`'s new slots.
@@ -663,9 +787,9 @@ pub fn register_channel<T>(
     let Some(facts) = engine.ring_facts(plan)? else {
         return register(engine, plan);
     };
-    let slots = roles.lock().unwrap().take_channel(&facts)?;
+    let taken = roles.lock().unwrap().take_channel(&facts)?;
     let plan = ChannelRegistration {
-        slots: slots.clone(),
+        slots: taken.slots(),
         ..plan.clone()
     };
     match register(engine, &plan) {
@@ -673,11 +797,11 @@ pub fn register_channel<T>(
             roles
                 .lock()
                 .unwrap()
-                .channel_registered(plan.id, holder, slots);
+                .channel_registered(plan.id, holder, taken);
             Ok(registered)
         }
         Err(error) => {
-            roles.lock().unwrap().untake_channel(slots);
+            roles.lock().unwrap().untake_channel(taken);
             Err(error)
         }
     }
@@ -704,8 +828,8 @@ pub fn bind_instance(
             .unwrap()
             .take_instance(binding.program, &binding.channels, registered)?;
     let binding = InstanceBinding {
-        instance_slots: taken.instance_slots.clone(),
-        ring_slots: taken.ring_slots.clone(),
+        instance_slots: taken.instance_slots(),
+        ring_slots: taken.ring_slots(),
         ..binding.clone()
     };
     match engine.bind_instance(&binding) {
@@ -720,16 +844,61 @@ pub fn bind_instance(
     }
 }
 
-fn parts_of(taken: &Taken) -> Vec<Part> {
-    std::iter::once(Part {
-        role: SlotRole::Instance,
-        refs: taken.instance_slots.clone(),
-    })
-    .chain(taken.ring_slots.iter().map(|ring| Part {
-        role: SlotRole::Channel,
-        refs: ring.slots.clone(),
-    }))
-    .collect()
+/// Runs `write`, a host write into `instance`'s rings, unless its slots
+/// are away ([`Roles::writes_held`]): then it is held, to be replayed in
+/// order once they are rebound ([`rebind`]).
+pub fn pump(
+    roles: Option<&RolesHandle>,
+    instance: InstanceId,
+    pump: Pump,
+    write: impl FnOnce() -> ::engine::Result<()>,
+) -> ::engine::Result<()> {
+    if let Some(roles) = roles {
+        let mut roles = roles.lock().unwrap();
+        if roles.writes_held(instance) {
+            roles.hold(instance, pump);
+            return Ok(());
+        }
+    }
+    write()
+}
+
+/// Tells `engine` where moved slots lie now (`rebind`), then replays, in
+/// order, the host writes held for the instances that may write again.
+/// Before any later fire: the lane runs it between frames.
+pub fn rebind(
+    roles: Option<&RolesHandle>,
+    engine: &mut dyn Engine,
+    rebind: Rebind,
+    mut replay: impl FnMut(&mut dyn Engine, InstanceId, Pump) -> ::engine::Result<()>,
+) -> ::engine::Result<()> {
+    let owner = Owner::of(&rebind);
+    engine.rebind_slots(rebind)?;
+    let Some(roles) = roles else {
+        return Ok(());
+    };
+    let released = {
+        let mut roles = roles.lock().unwrap();
+        roles.rebound(owner);
+        roles.released()
+    };
+    for (instance, pump) in released {
+        replay(engine, instance, pump)?;
+    }
+    Ok(())
+}
+
+/// An instance's own rings as the engine names them: channel `rings[k]` in
+/// part `k + 1` (part 0 the tables).
+fn own_rings(rings: &[u32], parts: &[Part]) -> Vec<RingSlots> {
+    rings
+        .iter()
+        .zip(parts.iter().skip(1))
+        .map(|(&channel, part)| RingSlots {
+            channel,
+            slots: part.refs.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
