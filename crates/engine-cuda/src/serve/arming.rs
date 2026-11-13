@@ -1492,9 +1492,20 @@ impl Shell {
                 Ok(true)
             }
             None => {
-                let ended = self.arm_end(st).and_then(|()| self.settle());
+                // Every rung is stated armed only where every composition
+                // the lattice planned holds a body: a fire past that would
+                // walk eagerly.
+                let (armed, planned) = (st.armed, st.wanted + st.never);
+                self.arm_end(st)?;
+                if armed < planned {
+                    return Err(Fault::Residency(format!(
+                        "arming ended with {armed} of {planned} compositions holding a body: \
+                         the rungs past the last armed stay unarmed"
+                    )));
+                }
+                self.settle()?;
                 self.live.arm(u32::MAX);
-                ended.map(|()| false)
+                Ok(false)
             }
         }
     }
