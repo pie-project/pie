@@ -552,3 +552,66 @@ fn a_raise_whose_steps_outlast_a_gap_fires_at_each_rung_as_it_arms() {
     assert_eq!(seen.unarmed_fires.load(Ordering::SeqCst), 0);
     lane.shutdown();
 }
+
+/// A waiter short of room parks; room that opens without any slot being
+/// let go (the engine's held span shrinking, the ceiling lifting) reaches
+/// it once the planner is told, as `hold_back` tells it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_waiter_short_of_room_proceeds_once_the_limit_rises() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let slots = Slots::new(4, 0);
+    let planner = planner(&slots);
+    // Another process holds what is there.
+    let (other, pid) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    for pid in [other, pid] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let held = planner
+        .acquire(
+            other,
+            other,
+            Demand {
+                kv_pages: 4,
+                rs: RsUnits::default(),
+            },
+        )
+        .await;
+    assert!(matches!(held, Ok(crate::planner::Acquired::Granted(_))));
+    let p = planner.clone();
+    let parked = crate::rt::spawn(async move {
+        p.acquire(
+            pid,
+            pid,
+            Demand {
+                kv_pages: 4,
+                rs: RsUnits::default(),
+            },
+        )
+        .await
+    });
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+    }
+    if parked.is_finished() {
+        panic!("finished early: {:?}", parked.await.map(|r| r.map(|_| ())));
+    }
+    // The ceiling lifts: chunks open, and no slot is released.
+    slots
+        .pages
+        .lock()
+        .unwrap()
+        .extend((0..8).map(PhysicalKvPageId));
+    planner.pages_freed();
+    for _ in 0..200 {
+        if parked.is_finished() {
+            break;
+        }
+        crate::rt::yield_now().await;
+    }
+    assert!(parked.is_finished(), "the room reaches the waiter");
+    assert!(matches!(
+        parked.await.expect("the parked task"),
+        Ok(crate::planner::Acquired::Granted(_))
+    ));
+}

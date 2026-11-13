@@ -992,3 +992,27 @@ fn a_raise_is_taken_where_it_is_planned_and_held_until_its_copy() {
     pool.pool_mut().retire_through(1_000_001);
     let _ = moved_off;
 }
+
+/// While the engine holds part of its range back, a committed chunk past
+/// the ceiling is no room: the walker sees the shortfall and commits ahead
+/// of a waiter, and the ceiling's lift says so, for the planner's waiters
+/// to be woken.
+#[test]
+fn room_past_the_ceiling_is_not_headroom_and_its_lift_is_said() {
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    let all = pool.pool().headroom();
+    let top = pool.pool().top_segment() * SEGMENT;
+    assert!(!pool.hold_back(u64::from(top - 8) * CHUNK), "lowered");
+    let held_back = pool.pool().headroom();
+    assert!(
+        held_back <= 8 - pool.pool().reserved_chunks(),
+        "only the chunks under the ceiling count: {held_back} of {all}"
+    );
+    assert!(pool.hold_back(0), "lifted: the caller wakes the waiters");
+    assert_eq!(pool.pool().headroom(), all);
+}

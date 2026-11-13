@@ -64,10 +64,15 @@ impl EnginePool {
 
     /// Keeps the shared pool's state chunks out of what the engine holds
     /// back now ([`crate::store::shared::SharedPool::hold_back`]).
+    /// Room it opens wakes the planner's waiters: no slot is let go for
+    /// it, so nothing else would.
     pub fn hold_back(&self) {
         if let Some(shared) = &self.shared {
             let held = crate::engine::live(self.engine).held();
-            shared.shared().lock().unwrap().hold_back(held);
+            let rose = shared.shared().lock().unwrap().hold_back(held);
+            if rose && let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
+                planner.pages_freed();
+            }
         }
     }
 }

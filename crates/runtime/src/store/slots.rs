@@ -764,10 +764,25 @@ impl SlotPool {
         self.reopen(step.from);
     }
 
-    /// Committed chunks neither held nor set aside for activation.
+    /// Committed chunks neither held nor set aside for activation, and
+    /// below the ceiling ([`Self::set_ceiling`]): a committed chunk the
+    /// engine binds none of yet is no room, so the walker commits ahead
+    /// of a waiter rather than count it.
     pub fn headroom(&self) -> u32 {
-        self.committed_chunks()
-            .saturating_sub(self.reserved + self.held + self.act)
+        let all = self
+            .committed_chunks()
+            .saturating_sub(self.reserved + self.held + self.act);
+        if self.ceiling >= self.total {
+            return all;
+        }
+        let below: u32 = (0..self.segments.count())
+            .filter(|&segment| self.segments.state(segment) == SegmentState::Committed)
+            .map(|segment| {
+                let range = self.segments.range(segment);
+                range.end.min(self.ceiling).saturating_sub(range.start)
+            })
+            .sum();
+        all.min(below.saturating_sub(self.reserved + self.held))
     }
 
     pub fn shape(&self, shape: ShapeId) -> Option<&SlotShape> {

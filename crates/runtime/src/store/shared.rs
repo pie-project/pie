@@ -1332,7 +1332,9 @@ impl SharedPool {
     /// ([`::engine::live::Live::held`]): no state chunk is opened in the
     /// top `bytes` of the span below the activation, which the engine binds
     /// none of yet; all of it again once it holds none.
-    pub fn hold_back(&mut self, bytes: u64) {
+    /// Whether the ceiling rose: room opened that a planner waiter may be
+    /// short of, so the caller wakes them.
+    pub fn hold_back(&mut self, bytes: u64) -> bool {
         let ceiling = if bytes == 0 {
             self.pool.total_chunks()
         } else {
@@ -1341,9 +1343,11 @@ impl SharedPool {
                 u32::try_from(bytes.div_ceil(self.pool.chunk_bytes().max(1))).unwrap_or(u32::MAX);
             top.saturating_sub(held).max(self.pool.reserved_chunks())
         };
+        let rose = ceiling > self.pool.ceiling();
         if ceiling != self.pool.ceiling() {
             self.pool.set_ceiling(ceiling);
         }
+        rose
     }
 
     /// [`Self::rung_for`], no wider than `armed` (a rung's tokens): the

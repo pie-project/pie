@@ -151,7 +151,11 @@ impl Lender for PlannerLender {
                 // What the engine holds back now is no lease's either.
                 if let Some(shared) = &shared {
                     let held = crate::engine::live(engine).held();
-                    shared.lock().unwrap().hold_back(held);
+                    if shared.lock().unwrap().hold_back(held)
+                        && let Some(planner) = crate::planner::planner_for(0, engine)
+                    {
+                        planner.pages_freed();
+                    }
                 }
                 let planner = crate::planner::planner_for(0, engine)?;
                 planner
