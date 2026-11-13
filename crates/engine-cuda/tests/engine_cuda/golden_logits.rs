@@ -451,6 +451,7 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
         pages: (0..room.pages).collect(),
         records: (0..room.records).collect(),
     };
+    let before = (shell.live().held(), shell.live().outside());
     let mut steps = 0u32;
     while shell
         .arm_step(&lent)
@@ -459,7 +460,15 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
         steps += 1;
     }
     if steps > 0 {
-        println!("stepped {} {steps}", fixture.model);
+        println!(
+            "stepped {} {steps}: held {} -> {} MiB, outside {} -> {} MiB",
+            fixture.model,
+            before.0 >> 20,
+            shell.live().held() >> 20,
+            before.1 >> 20,
+            shell.live().outside() >> 20
+        );
+        assert!(shell.live().held() <= before.0, "arming gives room back");
         assert_eq!(shell.live().armed_through(), u32::MAX);
     }
     shell

@@ -1448,6 +1448,12 @@ impl Shell {
         self.lent = None;
         self.pools.forget_weight_uses(self.device.stream())?;
         stepped?;
+        let more = self.arm_stepped_on(st, rung);
+        self.state_live();
+        more
+    }
+
+    fn arm_stepped_on(&mut self, st: Arming, rung: u32) -> Result<bool> {
         match st.targets.front().map(|(bucket, _, _)| self.rung_of(*bucket)) {
             Some(next) => {
                 if next != rung {

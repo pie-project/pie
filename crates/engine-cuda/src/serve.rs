@@ -151,6 +151,9 @@ pub struct Shell {
     stepping: Option<arming::Arming>,
     /// The slots the step in hand was lent: what its synthetic lanes name.
     lent: Option<engine::live::ArmingLease>,
+    /// The device's bytes, and those in use before this load began: what
+    /// the ledger is read against ([`Shell::state_live`]).
+    card: (u64, u64),
     /// What the runtime reads of this shell while it serves: the rungs
     /// armed.
     live: engine::live::Live,

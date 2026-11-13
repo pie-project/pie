@@ -1289,6 +1289,7 @@ impl Shell {
             arm_stepped: boot.knobs.arm_stepped,
             stepping: None,
             lent: None,
+            card: (0, 0),
             live: engine::live::Live::armed(),
             segments: std::collections::HashMap::new(),
             windows_memo: Vec::new(),
@@ -1674,6 +1675,8 @@ impl Staged {
                     .join(" ")
             );
         }
+        shell.card = (device_total, free_before);
+        shell.state_live();
         if rank != 0 {
             shell.programs.set_shadow(true);
         }
@@ -1744,6 +1747,29 @@ fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
 /// The device's memory as this load holds it ([`engine::memory`]): each
 /// owner under its class, over what the device has for this process (all of
 /// it but what others held before the load began).
+impl Shell {
+    /// States what the runtime reads of the device beside the cache rows
+    /// ([`engine::live::Live`]): what the driver holds outside the engine's
+    /// span, and what the engine holds for its model and its fires. While
+    /// rungs are left to arm that is the activation's whole span and what
+    /// is left of the bodies' allowance, as the load's fit kept them.
+    pub(super) fn state_live(&self) {
+        use engine::memory::Class;
+        let ledger = ledger(self, self.card.0, self.card.1);
+        let bodies = ledger.of(Class::Outside, "graph bodies");
+        let mut held = ledger.bytes(Class::Model) + ledger.bytes(Class::Fire);
+        if self.stepping.is_some() {
+            let backed = ledger.of(Class::Fire, "activation")
+                + ledger.of(Class::Fire, "workspaces")
+                + ledger.of(Class::Fire, "rs scratch");
+            held = held.saturating_sub(backed) + self.pools.activation_bytes();
+            held += (self.bodies_mem as u64).saturating_sub(bodies);
+        }
+        self.live.set_outside(ledger.bytes(Class::Outside));
+        self.live.set_held(held);
+    }
+}
+
 fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory::Ledger {
     use engine::memory::{Class, Ledger};
     let held = footprint(shell, device_total, free_before);

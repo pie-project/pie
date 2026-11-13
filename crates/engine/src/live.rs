@@ -27,6 +27,8 @@ struct Record {
     armed: AtomicU32,
     /// Bytes the driver allocated beside the engine's span since load.
     outside: AtomicU64,
+    /// Bytes the engine holds on the device beside the cache rows.
+    held: AtomicU64,
 }
 
 impl Live {
@@ -48,6 +50,7 @@ impl Live {
         Live(Arc::new(Record {
             armed: AtomicU32::new(armed),
             outside: AtomicU64::new(0),
+            held: AtomicU64::new(0),
         }))
     }
 
@@ -73,6 +76,24 @@ impl Live {
     #[must_use]
     pub fn outside(&self) -> u64 {
         self.0.outside.load(Ordering::Acquire)
+    }
+}
+
+impl Live {
+    /// The engine holds `bytes` on the device beside the cache rows now:
+    /// its model and fire classes, and while rungs are left to arm what it
+    /// keeps for their fires and bodies. With [`Live::outside`] that is
+    /// everything on the device the state pool may not take; it falls when
+    /// the last rung is armed.
+    pub fn set_held(&self, bytes: u64) {
+        self.0.held.store(bytes, Ordering::Release);
+    }
+
+    /// What the engine holds beside the cache rows, as last stated; 0 from
+    /// an engine that states none.
+    #[must_use]
+    pub fn held(&self) -> u64 {
+        self.0.held.load(Ordering::Acquire)
     }
 }
 
