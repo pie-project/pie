@@ -79,16 +79,23 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
 #[cfg(feature = "rocm")]
 pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
     std::sync::LazyLock::new(|| {
-        use poem_compiler::fuse::rules;
+        use poem_compiler::fuse::rules::{self, Rotated};
         use poem_ir::GluAct;
         use poem_ir::ops::fused::Intermediates;
         vec![
             rules::qkv_fused_qknorm_rope_vnorm_write(),
+            rules::rmsnorm_residual_add(),
+            rules::embed_scale_add_select(),
+            rules::embed_scale_add(),
+            rules::residual_add_rmsnorm(),
             rules::matmul_glu(&[GluAct::GegluTanh]),
             rules::matmul_softcap(),
             rules::matmul_bias(),
             rules::matmul_swiglu_matmul(),
             rules::moe_experts(),
+            rules::gated_residual_norm_modulate(),
+            rules::norm_modulate(),
+            rules::norm_rope(Rotated::First),
             rules::hc_norm_project(),
             rules::gdn_step(),
             rules::q_gate_norm_rope_append(Intermediates::Written),
@@ -119,9 +126,13 @@ pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
     ]
 }
 
-/// The fused kernels left on with `fuse-chains=off`: none, the residual
-/// norms being generated row kernels.
+/// The fused kernels left on with `fuse-chains=off`: none on CUDA, the
+/// residual norms being generated row kernels.
+#[cfg(not(feature = "rocm"))]
 pub const UNCHAINED: &[&str] = &[];
+/// On ROCm the hand residual norm stays on with `fuse-chains=off` (as on main).
+#[cfg(feature = "rocm")]
+pub const UNCHAINED: &[&str] = &["fused.residual_add_rmsnorm"];
 
 /// What `op` reads of a seat's rows: the seat table's entry for its name,
 /// but a gated unit of routed rows (each times its route's weight) reads
