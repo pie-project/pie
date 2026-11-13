@@ -558,6 +558,7 @@ impl Plane {
         self.cache.forget(hash);
         self.by_hash.remove(&hash);
         self.programs.remove(&id);
+        self.batches.retain(|&(program, _, _), _| program != id);
         Ok(())
     }
 }
@@ -577,5 +578,147 @@ struct Bound {
 fn release_seats(shared: &[Option<Arc<SharedRing>>]) {
     for ring in shared.iter().flatten() {
         ring.detach();
+    }
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod tests {
+    use super::*;
+    use eta_compiler::codegen::program::{Backend, emit_program};
+    use eta_compiler::plan::compile_bound;
+    use eta_dsl::prelude::*;
+    use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port, PortMask};
+
+    const VOCAB: u32 = 1024;
+    const LANES: u32 = 2;
+
+    /// The registration, the number of channels it binds, and its seeds.
+    fn registration() -> (ProgramRegistration, usize, Vec<(u32, Vec<u8>)>) {
+        let indptr: &'static Channel = Box::leak(Box::new(Channel::from(vec![0u32, 1])));
+        let token: &'static Channel =
+            Box::leak(Box::new(Channel::new([1], dtype::i32).capacity(4)));
+        let mut b = Builder::new(VOCAB, 16);
+        let logits = OutputDecl {
+            name: "logits".into(),
+            axis: Axis::Row,
+            width: VOCAB,
+            dtype: eta_ir::Dtype::F32,
+            layers: 0,
+            readout: true,
+        };
+        b.outputs(vec![vec![logits.clone()]]);
+        b.bind_port(Port::EmbedIndptr, indptr);
+        b.stage(Attach::Epilogue, move || {
+            let logits = intrinsics::output(0, "logits");
+            token.put(reshape(reduce_argmax(&logits), [1]));
+        });
+        token.note_host_take();
+        let traced = b.build().expect("the program traces");
+        let bound = eta_ir::validate::bind(
+            traced.container().clone(),
+            vec![vec![logits]],
+            EngineCaps {
+                lora: true,
+                attn_page_mask: true,
+            },
+        )
+        .expect("the program binds");
+        let stages = compile_bound(&bound);
+        let backend = Backend::parse("metal").expect("the metal codegen backend");
+        let count = bound.container.channels.len();
+        let at = traced
+            .channel_order()
+            .iter()
+            .position(|&gid| gid == indptr.gid())
+            .expect("the indptr channel is in the trace");
+        let seed = [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+        (
+            ProgramRegistration {
+                program_hash: bound.hash,
+                emitted_kernels: emit_program(backend, &stages, &bound),
+                emitter_version: backend.emitter_version(),
+                launch: eta_compiler::codegen::launch::build(&bound, &stages),
+                ..Default::default()
+            },
+            count,
+            vec![(u32::try_from(at).expect("a channel index"), seed)],
+        )
+    }
+
+    /// A program that launched its lanes together leaves no batch behind
+    /// once it is closed.
+    #[test]
+    fn closing_a_program_drops_its_batches() {
+        let context = Context::bind().expect("a Metal 4 device");
+        let mut plane = Plane::new();
+        let (registration, count, seeds) = registration();
+        let program = plane
+            .register(&context, &registration)
+            .expect("the program registers");
+        let logits =
+            crate::device::Buffer::zeroed(&context, u64::from(VOCAB) * 2).expect("a logits plane");
+        let lanes: Vec<InstanceId> = (0..LANES)
+            .map(|lane| {
+                let ids: Vec<ChannelId> = (1..=count as u64)
+                    .map(|c| ChannelId(c + 1000 * u64::from(lane)))
+                    .collect();
+                let id = plane
+                    .bind(
+                        &context,
+                        program,
+                        &seeds,
+                        Extents {
+                            row_count: 1,
+                            sampled_rows: 1,
+                            query_len: 1,
+                            ..Extents::default()
+                        },
+                        GeometryClass::Host,
+                        PortMask::NONE,
+                        &ids,
+                    )
+                    .expect("the lane binds");
+                plane
+                    .bind_output(
+                        id,
+                        "logits",
+                        0,
+                        &logits,
+                        0,
+                        eta_ir::Dtype::Bf16,
+                        VOCAB,
+                        VOCAB,
+                    )
+                    .expect("the logits bind");
+                id
+            })
+            .collect();
+        let mut frame = context.frame().expect("a frame");
+        let launched = plane
+            .stage_batched(&context, &mut frame, &lanes)
+            .expect("the lanes stage");
+        assert!(
+            launched
+                .iter()
+                .all(|(_, launched)| matches!(launched, Launched::Airborne)),
+            "every lane launches: {launched:?}"
+        );
+        frame.commit().expect("the frame lands");
+        for &lane in &lanes {
+            plane.settle_launched(lane).expect("the lane settles");
+        }
+        assert!(
+            plane.batches.keys().any(|&(owner, _, _)| owner == program),
+            "two lanes of one program launch as a batch"
+        );
+        for lane in lanes {
+            plane.close_instance(lane).expect("the lane closes");
+        }
+        plane.close_program(program).expect("the program closes");
+        assert!(
+            plane.batches.is_empty(),
+            "the closed program's batches are dropped: {} left",
+            plane.batches.len()
+        );
     }
 }
