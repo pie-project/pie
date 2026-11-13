@@ -62,7 +62,7 @@ Removes: `device_memory_share`, `device_kv_budget`, the `min(128 MiB, total/10)`
 trait Span {
     fn capacity(&self) -> u64;                 // measured free bytes
     fn bindings(&self) -> u64;                 // largest single buffer (Vulkan, wgpu, Metal)
-    fn reserve(&mut self, chunks: u32);        // the whole span, once
+    fn reserve(&mut self, chunks: u32);        // the whole span, once, in as many ranges as the device needs
     fn back(&mut self, chunks: Range<u32>);    // optional: default no-op
     fn unback(&mut self, chunks: Range<u32>);  // optional: default no-op
 }
@@ -72,11 +72,13 @@ trait Span {
 |---|---|---|
 | CUDA | `cuMemAddressReserve` | `cuMemCreate` + `cuMemMap` / unmap |
 | ROCm | one `hipMalloc` | no-op |
-| Metal | one placement-sparse buffer (today: two) | heap map / unmap |
+| Metal | N placement-sparse buffers under one budget (today: two buffers, two budgets) | heap map / unmap |
 | Vulkan, wgpu | N buffers of at most `bindings()` | no-op |
 | XLA | the pool tensor | no-op |
 
 **Flat is the base case.** Class boundaries are ledger numbers, so moving the boundary between state and fire costs nothing on a flat span. Today the ROCm range is allocated at its first commit, sized by the fit made before arming, so everything that fit held for arming and arming did not use (the bodies stretch, about 7 GiB on Qwen3-8B, the arena-sized scratch guess) is lost to the cache for the life of the process: the 4.6% fewer pages than main. With boundaries as ledger numbers there is nothing to lose. Backing on demand only matters for giving memory back to other processes; it is an optimisation of two backends, not part of the model. This removes the present ROCm oddity where lowering a rung frees nothing: state simply takes the chunks.
+
+**The span is one ledger, not necessarily one address range** (Mac review). A Metal buffer is capped at `maxBufferLength` (18.7 GiB on an M1 Max with a 25 GiB working set), so one range would put about 6 GiB out of reach; Vulkan and wgpu bind at most four segments addressed by a u32 element index. On these the span is several buffers that draw on one budget: chunk ids are global, a chunk never straddles a buffer, and the fire carve sits in the top buffer. Metal's `elastic` then needs one change: buffers that share a budget may be mapped in one batch (refused today), and tiles may be mapped at any range, not only as a prefix.
 
 Deleted: CUDA device heap, recycle shelf, endpoint pool, kernel slab map, raw `cudaMalloc` sites; Metal's second sparse buffer and `Accounting`; per-owner buffers on Vulkan / wgpu.
 
@@ -84,10 +86,12 @@ Deleted: CUDA device heap, recycle shelf, endpoint pool, kernel slab map, raw `c
 
 `fire(r) = frames × FrameMap(r).bytes + ArenaMap(r).bytes`, in chunks. Both maps come from the compiler.
 
-- **Workspace placements.** Each kernel family exports what it needs as data: `workspace(op, rows, lanes) -> [(name, rows, width, dtype, scope)]`, scope one of `launch` (dead when the op returns), `stream` (read by the next launch on the same stream, e.g. the decoded weight tile), `fire`. `arena::carve` lays them with the values. `Ctx::scratch(name)` becomes a lookup of an address the carve fixed.
+- **Workspace placements.** Each kernel family exports what it needs as data: `workspace(op, rows, lanes, tuning) -> [(name, rows, width, dtype, scope)]` (`tuning` is the device's kernel tuning: Metal's split-K bound and MoE register rooms depend on it), scope one of `launch` (dead when the op returns), `stream` (read by the next launch on the same stream, e.g. the decoded weight tile), `fire`. `arena::carve` lays them with the values. `Ctx::scratch(name)` becomes a lookup of an address the carve fixed.
   - CUDA / ROCm: 25 / 20 names to convert. Removes the slab map, both grains, growth and retirement, the warm-up fires, `Unwarmed`, `scratch_growth`, `decoded_weight_reserve`, `gemm_workspace_mb` (cuBLAS takes the workspace by pointer already).
   - Metal / Vulkan / wgpu: `scratch.rs` rooms move into the same exported form; the two files go.
 - **`FrameMap`.** The staged-input layout (tokens, positions, page tables, masks, rs tables, attention plan workspaces) and the readout rows, as one shared function of `(rows, lanes, pages per lane, context)`. Replaces four `inputs.rs` layouts. A ring of `frames` of them sits in the fire carve.
+- **Data-dependent tables** (group masks, mask and inject runs: sized by a fire's composition, today regrown and the old buffer kept) get a bound from the rung in the `FrameMap`; no growth after load.
+- **Model bytes inside fire buffers** are split out first: the n-gram hash constants in the Metal and Vulkan/wgpu scratch plane are model-class, and a re-carve would overwrite them.
 - **Guest program scratch** is a `fire`-scope workspace of the program's stage, sized by its own plan; `program_scratch_reserve` goes.
 - Lanes are not a second axis: a rung of `r` tokens allows `r` lanes (as `arena_rung` already does). `ARENA_RUNG_LANES` goes.
 
@@ -124,7 +128,11 @@ The governor says how many chunks are needed; PLEX picks what gives them up amon
 
 Unit of comparison: expected time lost (replay time × reuse likelihood for kv; refill time × use rate for a cache atom, from `weight_uses`; re-arm time for a body). All are rates the system already measures. **Open:** this unit is the least settled part of the design and needs measurement before it replaces the fixed weight rule.
 
-### 2.9 XLA
+### 2.9 Metal: ANE
+
+IOSurfaces cannot be placed in our heaps, so ANE memory stays outside the span, but we size every surface and staging buffer ourselves: the ledger counts weight and scale surfaces as model and input, partial and staging surfaces as fire, exactly. Only the compiled ANE program is invisible (owned by the system daemon, not in our footprint): `outside`.
+
+### 2.10 XLA
 
 Same ledger, different realisation:
 - `state` and `model` are counted exactly as elsewhere.
@@ -162,6 +170,6 @@ Hardware: steps 1-5 for CUDA and Vulkan/wgpu can be done on the L40S; ROCm, Meta
 
 ## 5. Open questions
 
-1. Settled: a rung's bodies are captured before its first serving fire; the raise waits (see 2.5).
-2. Vulkan / wgpu address the pool by a u32 element index (about 8 GiB) in at most four bindings. The fire carve must then sit in bindings of its own at the top of the span; is one ledger over several buffers acceptable there?
+1. When a rung's bodies are captured: on the first pass that asks for the rung (the raise waits; unused rungs cost nothing), or all rungs in the background after load (no wait, but bodies for rungs never used, and capture shares the device with serving). Either way capture precedes the rung's first serving fire. Recommended: on first demand. Not decided.
+2. Settled by the Mac review: one ledger over several buffers (2.3), for Metal as well as Vulkan / wgpu.
 3. The policy unit in 2.8.

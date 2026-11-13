@@ -138,6 +138,11 @@ ROCm, MI300X (AMD session, 2026-11-13):
 - Driver memory allocated lazily beside our allocations: graph instantiation (about 11.8 KB a node), module code objects, rocBLAS handle workspace unless set, RCCL buffers.
 - hipBLASLt takes its workspace by pointer; rocBLAS through `rocblas_set_workspace`. One `hipMalloc` of about 150 GB works.
 
+Metal, M1 Max 32 GB (Mac session, 2026-11-13; code read, measurement to follow). `maxBufferLength` 18.72 GiB, `recommendedMaxWorkingSetSize` 24.96 GiB.
+- Confirmed: `act_chunks` empty and the arena a second sparse buffer with its own budget (a batch may not span the two); scratch plane, inputs × arms, readout, rs scratch, group masks and ANE staging are allocated after the second fit and never priced; group masks keep every outgrown buffer (under twice the largest in total); `max_forward_tokens` halves to 512; decoded banks are missing from the first fit pass, so the halving loop can stop one step early and the second admit refuses a load that would have fitted; the flat fallbacks are unreachable on Apple.
+- Corrected: guest batches are replaced when they grow; the leak is that removing a program never removes its batches (`batches` is keyed by program id and never retained). The sparse buffers are Private, the 16 MiB placement heaps under them Shared.
+- Added: `held_elsewhere()` is always 0 where sparse exists, so the Metal budget has no measured term at all; the pool is capped at `maxBufferLength / chunk`; Metal has the "half the remainder" rule too (voxel and frame-slot fit); the arena never unmaps, so lowering a rung frees nothing today; ANE surfaces and staging are allocated before the second fit and priced by neither pass.
+
 ## 7. Not traced
 
 The compiler side that sets chunk and segment sizes and the arena map; runtime-crate callers of commit / release; device bytes of compiled objects on every backend; whether kernel modules are ever unloaded; XLA executable temporaries; Cerebras non-dense families; adapter bank placement on CUDA and ROCm; where compressor side planes live on CUDA, ROCm and Metal.
