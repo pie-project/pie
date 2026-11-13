@@ -1073,7 +1073,7 @@ impl Pools {
     }
 
     /// The bytes `chunks` chunks take backed: the last map unit whole.
-    fn chunk_bytes(&self, chunks: u32) -> u64 {
+    pub(crate) fn chunk_bytes(&self, chunks: u32) -> u64 {
         let unit = self.chunks.map_unit().max(1);
         u64::from(chunks)
             .saturating_mul(self.chunks.layout().chunk_bytes)

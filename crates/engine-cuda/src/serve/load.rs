@@ -1342,36 +1342,13 @@ impl Shell {
             shell.exports.readout_row_bytes(),
         );
         // A plane stored as codes and scales is decoded to bf16 before a
-        // prefill's dense gemm, into one tile a stream. The tile is taken
-        // now, at the widest plane the lane fit left each stream, so the
-        // fit sees it resident and no fire — a capture least of all — has to
-        // grow it: a load whose bodies are held to nothing arms no body at
-        // load, and its first fire is a capture.
+        // prefill's dense gemm, into one tile a stream: a scratch slab like
+        // any other, laid with the kernels' workspaces once the lattice is
+        // walked.
         shell.decoded_tiles = tiles
             .iter()
             .map(|plane| crate::store::decoded_weight_reserve(*plane, 1))
             .collect();
-        let mut decoded = 0u64;
-        for (stream, plane) in tiles.iter().enumerate() {
-            let tile = crate::store::decoded_weight_reserve(*plane, 1);
-            let ctx = match stream {
-                0 => Some(shell.device.ctx()),
-                n => shell.device.side_ctx().get(n - 1).copied(),
-            };
-            let Some(ctx) = ctx else {
-                continue;
-            };
-            kernels_cuda::linear::dequant::warm_decoded_weight(ctx, tile).map_err(|why| {
-                Fault::Residency(format!(
-                    "the card does not hold this deployment: the decoded-weight tile stream \
-                     {stream} decodes its widest plane into, {tile} bytes, would not allocate \
-                     beside the weights, activations and inputs ({why}). Raise `[model] \
-                     device_memory_share`, serve a quantized deployment of the model, or free \
-                     what else holds the device."
-                ))
-            })?;
-            decoded = decoded.saturating_add(tile);
-        }
         // The tickets the fused launches draw, taken on every stream now:
         // the bodies armed at load capture before any eager fire.
         #[cfg(feature = "rocm")]
@@ -1389,10 +1366,9 @@ impl Shell {
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] held for fires: guest programs {} MiB at {} lanes; decoded-weight \
-                 tiles taken at load: {} MiB over {} stream(s) ({})",
+                 tiles over {} stream(s) ({})",
                 programs >> 20,
                 boot.budget.max_lanes,
-                decoded >> 20,
                 tiles.len(),
                 tiles
                     .iter()
@@ -1678,6 +1654,16 @@ impl Staged {
                 fitted.fit / u64::from(shell.pools.paging().pages_per_slot),
                 fitted.room >> 20,
             );
+            if let Some(free) = crate::device::alloc::free_bytes() {
+                let ledger = ledger(&shell, device_total, free_before);
+                let audit = ledger.audit(device_total.saturating_sub(free));
+                eprintln!(
+                    "[arm-trace] ledger: {ledger}; the device reports {} MiB in use: {} MiB no \
+                     owner entered",
+                    audit.device >> 20,
+                    audit.gap() >> 20,
+                );
+            }
             eprintln!(
                 "[arm-trace] after arming: {} MiB asked past the laid workspaces; slabs grown by \
                  allocation: {}",
@@ -1754,6 +1740,29 @@ fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
             .map(|(_, bytes)| *bytes as u64)
             .sum(),
     }
+}
+
+/// The device's memory as this load holds it ([`engine::memory`]): each
+/// owner under its class, over what the device has for this process (all of
+/// it but what others held before the load began).
+fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory::Ledger {
+    use engine::memory::{Class, Ledger};
+    let held = footprint(shell, device_total, free_before);
+    let mut ledger = Ledger::new(shell.pools.chunk_bytes(1), device_total);
+    ledger.enter(Class::Model, "weights", held.weights);
+    ledger.enter(Class::State, "cache rows", held.cache_rows);
+    ledger.enter(Class::Fire, "activation", held.arena);
+    ledger.enter(
+        Class::Fire,
+        "workspaces",
+        shell.workspace.as_ref().map_or(0, |workspace| workspace.bytes),
+    );
+    ledger.enter(Class::Fire, "inputs", held.inputs);
+    ledger.enter(Class::Fire, "readout rows", held.readout);
+    ledger.enter(Class::Fire, "grown slabs", held.scratch);
+    ledger.enter(Class::Outside, "graph bodies", held.bodies);
+    ledger.enter(Class::Outside, "before the load", held.before);
+    ledger
 }
 
 /// What holds the device when the cache rows come to be declared, in bytes:

@@ -151,6 +151,17 @@ Metal, measured (Mac session, 2026-11-13; memory-redesign 0b5b42a7f, release, Qw
 - The driver's own IOAccelerator total is about 225 MiB above `currentAllocatedSize`: `outside`, visible only in the process footprint.
 - For the ledger check on Metal: assert against `currentAllocatedSize` at load; count chunks handed out and `fire(rung)`, never reserved virtual size.
 
+XLA, v6e (TPU session, 2026-11-13; qwen3-0.6b and qwen3-30b-a3b-mini, decode 256 + prefill 2048):
+- Corrections to the XLA column: temporaries are not per executable but one runtime scratch reservation (max temp over loaded programs, grows only, reported as `bytes_reserved`, real HBM: a 4 GiB-temp program fails to load with 2.9 GiB free); non-aliased outputs (readout planes, gather results, carried guest cells) are ordinary buffers in `bytes_in_use`, outside the fit; generated code is device-resident, 20 to 170 MiB a program, outside the fit, and joins `bytes_in_use` at the first execute; executables' footprint is not unknown, `GetCompiledMemoryStats` gives it at compile time.
+- "Prescale and tied copies only under 5/8 of HBM" is the dry-device bound only; on a device they are taken while `total + extra <= device_cap`.
+- Adapter re-upload: the whole bank is uploaded anew and old and new coexist until the old one drops.
+- Measured first-execute change in `bytes_in_use` = code + (output − alias), MiB: 0.6b decode 107.1 (predicted 107.2), 0.6b prefill 466.8 (466.9), MoE decode 31.0 (31.1), MoE prefill 176.9 (176.9); temps 70.3 / 77.2 / 22.3 / 21.7.
+
+CUDA, L40S (this session, 2026-11-13; branch sc/l40s-fire-carve, boot only, the ledger against `cudaMemGetInfo` after arming):
+- Qwen3-30B-A3B-NVFP4: 22390 MiB entered (weights 1746; cache rows 17376; activation 1233, inputs 348, workspaces 40, readout 32; before the load 963, bodies 649), device 22583: 193 MiB no owner entered.
+- Qwen3.5-9B: 28955 MiB entered (weights 17606; cache rows 7136; activation 2236, inputs 575, workspaces 429, readout 9; before the load 963; its 144 bodies are unweighed, 0 entered), device 30397: 1442 MiB no owner entered (bodies and the rs extended-run scratch are the likely owners; not yet traced).
+- Scratch slabs laid in the activation's span, none grown by allocation after arming: Qwen3.5-9B 13 slabs, 429 MiB (GDN chunk planes 376, anchor products 112 across streams); Qwen3-30B FP8 51 slabs, 11 MiB; NVFP4 50 slabs, 40 MiB (decoded tile 24, route order 24).
+
 ## 7. Not traced
 
 The compiler side that sets chunk and segment sizes and the arena map; runtime-crate callers of commit / release; device bytes of compiled objects on every backend; whether kernel modules are ever unloaded; XLA executable temporaries; Cerebras non-dense families; adapter bank placement on CUDA and ROCm; where compressor side planes live on CUDA, ROCm and Metal.
