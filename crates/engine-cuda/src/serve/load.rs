@@ -2144,17 +2144,16 @@ fn walk_fire_fit(trace: &poem_ir::Trace, rows: u32, sms: u32) -> Option<u32> {
 }
 
 /// The activation rungs below the largest (SPEC decision 6): for every
-/// power of two of tokens from the widest decode fire's rows (a row a
-/// lane) up, the largest bucket at most that many tokens and its carve,
-/// where that carve is smaller than the arena for every fire. Smallest
-/// first.
+/// power of two of tokens, the largest bucket at most that many tokens and
+/// its carve, where that carve is smaller than the arena for every fire.
+/// Smallest first.
 fn activation_rungs(
     trace: &poem_ir::Trace,
     budgets: &Budgets,
     compiled: &CompiledModel,
 ) -> Result<Vec<(u32, poem_compiler::ArenaMap)>> {
     let max = budgets.tokens.max_tokens;
-    let mut tokens: Vec<u32> = engine::memory::rungs(budgets.tokens.max_lanes, max)
+    let mut tokens: Vec<u32> = engine::memory::rungs(1, max)
         .into_iter()
         .filter_map(|rung| {
             budgets
