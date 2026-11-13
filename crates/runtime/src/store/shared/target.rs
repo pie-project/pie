@@ -33,8 +33,6 @@ pub struct SharedGrow {
     /// ask of a fire (SPEC decision 6, by demand): the smallest rung while
     /// none asks past it.
     rung_walk: Arc<std::sync::Mutex<RungWalk>>,
-    /// A raise stood short of room, and the planner was asked to free it.
-    raise_funded: Arc<AtomicBool>,
 }
 
 impl SharedGrow {
@@ -51,7 +49,6 @@ impl SharedGrow {
             refused: Arc::new(AtomicBool::new(false)),
             no_room: Arc::new(AtomicBool::new(false)),
             rung_walk: Arc::new(std::sync::Mutex::new(RungWalk::default())),
-            raise_funded: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -60,7 +57,7 @@ impl SharedGrow {
     /// past it, until there or until a step has to wait: caps fires, lowers
     /// the pool's rung once no wider fire is in flight, or raises it, the
     /// engine first copying the state out of the larger span. A raise short
-    /// of room asks the planner to free it as it would for pages.
+    /// of room waits on the room the asking pass has the planner free.
     async fn walk_rung(&self) {
         loop {
             let (current, retired) = self.epochs();
@@ -81,14 +78,13 @@ impl SharedGrow {
             let step = match step {
                 Ok(step) => step,
                 Err(error) => {
+                    // The pass asking funds the room as a planner waiter
+                    // (`pipeline::fire`'s raise funding).
                     tracing::debug!(engine = self.engine, %error, goal, "the activation rung waits");
-                    self.fund_raise(goal);
                     return;
                 }
             };
-            if !matches!(step, RungStep::Raise { .. }) {
-                self.fund_raise(0);
-            }
+
             match step {
                 RungStep::Wait => {
                     // A lower waits on the scheduler's grant, which it
@@ -162,29 +158,8 @@ impl SharedGrow {
                         moved = evacuation.moves.len(),
                         "the activation rung is raised"
                     );
-                    self.fund_raise(0);
                 }
             }
-        }
-    }
-
-    /// Asks the planner to free what raising the activation to `rung` lacks
-    /// (its moves first, then the policy's victims, as for a waiter's
-    /// pages); with 0, or once the raise fits, says it lacks nothing.
-    fn fund_raise(&self, rung: u32) {
-        let pages = if rung == 0 {
-            0
-        } else {
-            self.shared.lock().unwrap().raise_short(rung).1
-        };
-        if pages == 0 && !self.raise_funded.swap(false, Ordering::AcqRel) {
-            return;
-        }
-        if pages > 0 {
-            self.raise_funded.store(true, Ordering::Release);
-        }
-        if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
-            planner.fund_raise(pages);
         }
     }
 

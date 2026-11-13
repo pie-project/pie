@@ -89,6 +89,12 @@ pub fn fire_cap(engine: usize) -> u32 {
     })
 }
 
+/// Sets `engine`'s cap as the walker would: for a test of what waits on it.
+#[cfg(test)]
+pub(crate) fn set_fire_cap_for_test(engine: usize, tokens: u32) {
+    set_fire_cap(engine, tokens);
+}
+
 fn set_fire_cap(engine: usize, tokens: u32) {
     if let Some(cap) = FIRE_CAP.get(engine) {
         cap.store(tokens, std::sync::atomic::Ordering::Release);
@@ -144,6 +150,46 @@ impl Drop for RungWant {
         if let Some(wants) = RUNG_WANTS.lock().unwrap().get_mut(&self.engine) {
             wants.remove(&self.key);
         }
+    }
+}
+
+/// Per process, the ask its last pass made: held while the process lives
+/// and its passes stay wide, so the gaps between the passes of one prompt
+/// (an inferlet feeding a prompt in several passes) lower nothing.
+static PROCESS_WANTS: std::sync::LazyLock<Mutex<std::collections::HashMap<uuid::Uuid, RungWant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Process `pid`'s pass on `engine` asks fires of `rows` (`None`: a pass of
+/// a few rows, a decode, asks nothing): what its process holds the rung
+/// for until its next pass says otherwise, or it ends ([`forget_process`]).
+pub fn hold_for_process(pid: uuid::Uuid, engine: usize, rows: Option<u32>) {
+    let mut wants = PROCESS_WANTS.lock().unwrap();
+    match rows {
+        Some(rows) => {
+            wants.insert(pid, want_rows(engine, rows));
+        }
+        None => {
+            wants.remove(&pid);
+        }
+    }
+}
+
+/// Process `pid` ended: its ask goes.
+pub fn forget_process(pid: uuid::Uuid) {
+    PROCESS_WANTS.lock().unwrap().remove(&pid);
+}
+
+/// The width a fire may take at the rung that holds `rows`: the cap the
+/// walker lifts to there (`u32::MAX` at the largest rung).
+#[must_use]
+pub fn cap_for(shared: &Shared, rows: u32) -> u32 {
+    let pool = shared.lock().unwrap();
+    let rungs = pool.rungs();
+    let goal = pool.rung_for(rows);
+    if rungs.last() == Some(&goal) {
+        u32::MAX
+    } else {
+        goal
     }
 }
 
