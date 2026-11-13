@@ -72,6 +72,7 @@ pub fn resolve(device: &Device, profiles: Option<&Path>) -> (Profile, Report) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine_gpu::backend::Tactics as _;
 
     #[test]
     fn the_registry_holds_together() {

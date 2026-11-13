@@ -36,6 +36,7 @@ mod backend {
     /// The adapter profile's moe tile rows and sorted rows for `pairs`
     /// routes over `experts`, and its sort's lanes.
     pub fn moe_rows(device: &Context, pairs: u32, experts: u32) -> (u32, u32, u32) {
+        use engine_gpu::backend::Tactics as _;
         let (profile, _) = engine_wgpu::chip::resolve(&device.chip(), None);
         let tuning =
             engine_wgpu::tuning::Tuning::new(profile, device.cores(), device.storage_buffers());
