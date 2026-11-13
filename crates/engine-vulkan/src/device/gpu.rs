@@ -80,6 +80,10 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::left(self)
     }
 
+    fn books(&self) -> &engine_gpu::Books {
+        Context::books(self)
+    }
+
     fn bind_thread(&self) -> Result<()> {
         Context::bind_thread(self)
     }

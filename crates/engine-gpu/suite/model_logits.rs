@@ -411,6 +411,28 @@ fn a_windowed_miniature_serves_two_lanes() {
     seats("gemma4-e4b-mini-l1", None);
 }
 
+/// Every byte a served miniature holds on the device is in the device's
+/// ledger under an owner, and the ledger holds within what the device has.
+#[test]
+fn a_served_miniature_is_in_the_ledger_whole() {
+    use engine::memory::Class;
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    serve_seats(&mut shell, &fixture.trace, 2);
+    let books = shell.device().books();
+    let ledger = books.ledger();
+    assert_eq!(ledger.check(), Ok(()), "{ledger}");
+    assert_eq!(books.audit().gap(), 0, "{ledger}");
+    for class in [Class::Model, Class::State, Class::Fire] {
+        assert!(
+            ledger.bytes(class) > 0,
+            "nothing entered as {class:?}: {ledger}"
+        );
+    }
+}
+
 /// Panics at the first row whose logits differ in a bit.
 pub fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
     assert_eq!(got.len(), want.len(), "{what}: rows");

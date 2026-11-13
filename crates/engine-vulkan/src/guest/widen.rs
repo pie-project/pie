@@ -51,7 +51,12 @@ impl Widen {
             }
         })?;
         let core = device.core().clone();
-        let cfg = Buffer::with(device, SLOTS * SLOT_BYTES, Memory::Host)?;
+        let cfg = Buffer::with(
+            device,
+            SLOTS * SLOT_BYTES,
+            Memory::Host,
+            engine_gpu::books::owners::GUEST,
+        )?;
 
         let bindings = LAYOUT.map(|(at, slot)| binding(at, super::descriptor_type(slot)));
         let d = &core.device;

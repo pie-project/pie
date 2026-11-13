@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::api::DeviceBoot;
 use crate::encode::Mark;
+use engine_gpu::Owner;
 use engine_gpu::error::{Fault, Result};
 
 use super::alloc::{Memory, Raw, Slab};
@@ -68,7 +69,7 @@ const SPAN_AT: u64 = (TIMING_QUERIES as u64) * 8;
 
 pub(crate) struct Timing {
     set: wgpu::QuerySet,
-    resolve: wgpu::Buffer,
+    resolve: Held,
     readback: wgpu::Buffer,
     names: Vec<String>,
 }
@@ -82,12 +83,15 @@ impl Timing {
                 ty: wgpu::QueryType::Timestamp,
                 count: TIMING_QUERIES,
             }),
-            resolve: core.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("pie timestamps resolve"),
-                size: bytes,
-                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            }),
+            resolve: core.held(
+                &wgpu::BufferDescriptor {
+                    label: Some("pie timestamps resolve"),
+                    size: bytes,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                },
+                engine_gpu::books::owners::TIMESTAMPS,
+            ),
             readback: core.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("pie timestamps readback"),
                 size: bytes,
@@ -157,11 +161,11 @@ pub(crate) struct Core {
 
     poller: host::Poller,
 
-    pub(crate) uniforms: Mutex<Vec<wgpu::Buffer>>,
-    pub(crate) scratch: Mutex<Vec<wgpu::Buffer>>,
+    pub(crate) uniforms: Mutex<Vec<Held>>,
+    pub(crate) scratch: Mutex<Vec<Held>>,
 
     pub(crate) last_error: Arc<Mutex<Option<String>>>,
-    pub(crate) allocated: AtomicU64,
+    pub(crate) books: Arc<engine_gpu::Books>,
     pub(crate) name: String,
     pub(crate) cores: Option<u32>,
     /// `None` without the subgroup feature.
@@ -218,46 +222,87 @@ impl Core {
         self.wait_for(&index)
     }
 
-    pub(crate) fn uniform_chunk(&self) -> wgpu::Buffer {
+    /// A buffer outside any slab, entered in the books under `owner` while
+    /// it stands.
+    pub(crate) fn held(&self, descriptor: &wgpu::BufferDescriptor<'_>, owner: Owner) -> Held {
+        let buffer = self.device.create_buffer(descriptor);
+        self.books.take(owner, buffer.size());
+        Held {
+            buffer,
+            books: Arc::clone(&self.books),
+            owner,
+        }
+    }
+
+    pub(crate) fn uniform_chunk(&self) -> Held {
         if let Some(chunk) = self.uniforms.lock().expect("uniforms lock poisoned").pop() {
             return chunk;
         }
-        self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pie uniforms"),
-            size: UNIFORM_CHUNK,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
+        self.held(
+            &wgpu::BufferDescriptor {
+                label: Some("pie uniforms"),
+                size: UNIFORM_CHUNK,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+            engine_gpu::books::owners::UNIFORMS,
+        )
     }
 
-    pub(crate) fn return_uniforms(&self, chunks: Vec<wgpu::Buffer>) {
+    pub(crate) fn return_uniforms(&self, chunks: Vec<Held>) {
         self.uniforms
             .lock()
             .expect("uniforms lock poisoned")
             .extend(chunks);
     }
 
-    pub(crate) fn scratch_chunk(&self, bytes: u64) -> wgpu::Buffer {
+    pub(crate) fn scratch_chunk(&self, bytes: u64) -> Held {
         if bytes <= SCRATCH_CHUNK
             && let Some(chunk) = self.scratch.lock().expect("scratch lock poisoned").pop()
         {
             return chunk;
         }
-        self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pie scratch"),
-            size: bytes.max(SCRATCH_CHUNK),
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
+        self.held(
+            &wgpu::BufferDescriptor {
+                label: Some("pie scratch"),
+                size: bytes.max(SCRATCH_CHUNK),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+            engine_gpu::books::owners::FRAME_SCRATCH,
+        )
     }
 
-    pub(crate) fn return_scratch(&self, chunks: Vec<wgpu::Buffer>) {
+    pub(crate) fn return_scratch(&self, chunks: Vec<Held>) {
         self.scratch
             .lock()
             .expect("scratch lock poisoned")
             .extend(chunks.into_iter().filter(|c| c.size() == SCRATCH_CHUNK));
+    }
+}
+
+/// A buffer the device gave outside any slab (a frame's uniform or scratch
+/// chunk, a timestamp plane, a bind group's uniforms), entered in the books
+/// while it stands.
+pub(crate) struct Held {
+    buffer: wgpu::Buffer,
+    books: Arc<engine_gpu::Books>,
+    owner: Owner,
+}
+
+impl std::ops::Deref for Held {
+    type Target = wgpu::Buffer;
+
+    fn deref(&self) -> &wgpu::Buffer {
+        &self.buffer
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.books.give(self.owner, self.buffer.size());
     }
 }
 
@@ -502,12 +547,17 @@ impl Context {
             uniforms: Mutex::new(Vec::new()),
             scratch: Mutex::new(Vec::new()),
             last_error,
-            allocated: AtomicU64::new(0),
+            books: Arc::new(engine_gpu::Books::new()),
             cores: sm,
             subgroup_min,
             device_local,
         });
-        let dummy = Raw::new(&core, DUMMY_BYTES, Memory::Device)?;
+        let dummy = Raw::new(
+            &core,
+            DUMMY_BYTES,
+            Memory::Device,
+            engine_gpu::books::owners::DUMMY,
+        )?;
         let context = Context {
             working_set: (device_local as f64 * share.clamp(0.0, 1.0)) as u64,
             max_buffer,
@@ -588,8 +638,13 @@ impl Context {
     /// What the working set has left now, less this process's allocations.
     #[must_use]
     pub fn left(&self) -> u64 {
-        self.working_set
-            .saturating_sub(self.core.allocated.load(Ordering::Relaxed))
+        self.working_set.saturating_sub(self.core.books.device())
+    }
+
+    /// The device's books: every reservation under its owner.
+    #[must_use]
+    pub fn books(&self) -> &engine_gpu::Books {
+        &self.core.books
     }
 
     pub fn bind_thread(&self) -> Result<()> {
@@ -622,7 +677,7 @@ impl Context {
 
 #[derive(Default)]
 pub(crate) struct UniformRing {
-    chunks: Vec<wgpu::Buffer>,
+    chunks: Vec<Held>,
     used: u64,
 }
 
@@ -716,10 +771,10 @@ impl Frame {
         if ring.chunks.is_empty() || at + bytes > UNIFORM_CHUNK {
             ring.chunks.push(core.uniform_chunk());
             ring.used = bytes;
-            return (ring.chunks.last().expect("just pushed").clone(), 0);
+            return ((*ring.chunks.last().expect("just pushed")).clone(), 0);
         }
         ring.used = at + bytes;
-        (ring.chunks.last().expect("non-empty").clone(), at)
+        ((*ring.chunks.last().expect("non-empty")).clone(), at)
     }
 
     pub(crate) fn timestamp_slot(&self, name: &str) -> Option<(wgpu::QuerySet, u32)> {
@@ -754,10 +809,10 @@ impl Frame {
         if ring.chunks.is_empty() || at + bytes > SCRATCH_CHUNK {
             ring.chunks.push(core.scratch_chunk(bytes));
             ring.used = bytes;
-            return (ring.chunks.last().expect("just pushed").clone(), 0);
+            return ((*ring.chunks.last().expect("just pushed")).clone(), 0);
         }
         ring.used = at + bytes;
-        (ring.chunks.last().expect("non-empty").clone(), at)
+        ((*ring.chunks.last().expect("non-empty")).clone(), at)
     }
 
     /// Writes `bytes` into `into` from `at` in queue order: the queue lands
@@ -1001,7 +1056,7 @@ mod tests {
             return;
         }
         let device = Context::bind(&DeviceBoot::default(), 0.1).unwrap();
-        let mut buffer = Buffer::zeroed(&device, 64).unwrap();
+        let mut buffer = Buffer::zeroed(&device, 64, engine_gpu::books::owners::SCRATCH).unwrap();
         let ramp: Vec<u8> = (1..=24).collect();
         buffer.write(0, &ramp).unwrap();
         let mut frame = device.frame().unwrap();

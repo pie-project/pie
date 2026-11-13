@@ -86,7 +86,7 @@ struct Stage {
     _params: Buffer,
     _offs: Buffer,
 
-    _cfg: wgpu::Buffer,
+    _cfg: crate::device::ctx::Held,
 
     heap: Buffer,
 
@@ -134,7 +134,12 @@ impl Session {
             });
         }
 
-        let mut status = Buffer::with(device, eta_exec::STATUS_BYTES as u64, Memory::Host)?;
+        let mut status = Buffer::with(
+            device,
+            eta_exec::STATUS_BYTES as u64,
+            Memory::Host,
+            engine_gpu::books::owners::GUEST,
+        )?;
         status.write(0, &[0u8; eta_exec::STATUS_BYTES])?;
 
         let core = device.core().clone();
@@ -248,7 +253,12 @@ impl Session {
         let Session { status, stages, .. } = self;
         let seat = &mut stages[stage];
         if seat.outbox.bytes() < cursor {
-            seat.outbox = Buffer::with(device, cursor, OUTBOX_KIND)?;
+            seat.outbox = Buffer::with(
+                device,
+                cursor,
+                OUTBOX_KIND,
+                engine_gpu::books::owners::GUEST,
+            )?;
         }
         frame.copy(status, 0, &seat.outbox, 0, STATUS_SPAN)?;
         for &(_, at, into, len) in &layout {
@@ -450,31 +460,48 @@ fn build_stage(
         lane: 0,
     };
 
-    let mut descs = Buffer::zeroed(device, desc_bytes.len().max(DESC_WORDS * 4) as u64)?;
+    let mut descs = Buffer::zeroed(
+        device,
+        desc_bytes.len().max(DESC_WORDS * 4) as u64,
+        engine_gpu::books::owners::GUEST,
+    )?;
     descs.write(0, &desc_bytes)?;
-    let mut offs = Buffer::zeroed(device, (offset_words.len().max(1) * 4) as u64)?;
+    let mut offs = Buffer::zeroed(
+        device,
+        (offset_words.len().max(1) * 4) as u64,
+        engine_gpu::books::owners::GUEST,
+    )?;
     offs.write(0, &words_le(&offset_words))?;
     let mut params = Buffer::zeroed(
         device,
         (records.len().max(1) * size_of::<OpParams>()) as u64,
+        engine_gpu::books::owners::GUEST,
     )?;
     if !records.is_empty() {
         let record_bytes: Vec<u8> = records.iter().flat_map(OpParams::to_le_bytes).collect();
         params.write(0, &record_bytes)?;
     }
 
-    let cfg = core.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("pie guest cfg"),
-        size: size_of::<Cfg>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let cfg = core.held(
+        &wgpu::BufferDescriptor {
+            label: Some("pie guest cfg"),
+            size: size_of::<Cfg>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        },
+        engine_gpu::books::owners::GUEST,
+    );
     core.take_error("create_buffer")?;
     core.queue.write_buffer(&cfg, 0, &config.to_le_bytes());
 
     let bytes = scratch.total.max(256);
-    let heap = Buffer::zeroed(device, bytes)?;
-    let outbox = Buffer::with(device, OUTBOX_FLOOR, OUTBOX_KIND)?;
+    let heap = Buffer::zeroed(device, bytes, engine_gpu::books::owners::GUEST_STATE)?;
+    let outbox = Buffer::with(
+        device,
+        OUTBOX_FLOOR,
+        OUTBOX_KIND,
+        engine_gpu::books::owners::GUEST,
+    )?;
 
     let group = core.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("pie guest"),

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use engine_gpu::pread::pread_jobs;
 
 use crate::encode::Mark;
+use engine_gpu::Owner;
 use engine_gpu::error::{Fault, Result};
 
 use super::ctx::{Context, Core, note_reservation};
@@ -25,12 +26,15 @@ pub(crate) struct Raw {
     pub(crate) kind: Memory,
     pub(crate) mappable: bool,
     pub(crate) id: u64,
+    /// Whose it is in the device's books; `None` for a buffer the host maps,
+    /// which lies in host memory.
+    owner: Option<Owner>,
 }
 
 pub(crate) type Slab = Arc<Raw>;
 
 impl Raw {
-    pub(crate) fn new(core: &Arc<Core>, bytes: u64, kind: Memory) -> Result<Slab> {
+    pub(crate) fn new(core: &Arc<Core>, bytes: u64, kind: Memory, owner: Owner) -> Result<Slab> {
         note_reservation();
         let size = bytes.max(4).next_multiple_of(4);
         if size > core.limits.max_buffer_size {
@@ -63,14 +67,15 @@ impl Raw {
                 Fault::Wgpu { why, .. } if why.contains("emory") => Fault::Ceiling {
                     what: "device memory",
                     need: size,
-                    have: core
-                        .device_local
-                        .saturating_sub(core.allocated.load(Ordering::Relaxed)),
+                    have: core.device_local.saturating_sub(core.books.device()),
                 },
                 other => other,
             });
         }
-        core.allocated.fetch_add(size, Ordering::Relaxed);
+        let owner = (!mappable).then_some(owner);
+        if let Some(owner) = owner {
+            core.books.take(owner, size);
+        }
 
         let mut encoder = core
             .device
@@ -87,6 +92,7 @@ impl Raw {
             kind,
             mappable,
             id: IDS.fetch_add(1, Ordering::Relaxed),
+            owner,
         }))
     }
 
@@ -234,7 +240,9 @@ impl Raw {
 
 impl Drop for Raw {
     fn drop(&mut self) {
-        self.core.allocated.fetch_sub(self.size, Ordering::Relaxed);
+        if let Some(owner) = self.owner {
+            self.core.books.give(owner, self.size);
+        }
         // A browser frees the memory only when the JS wrapper is collected.
         self.buffer.destroy();
     }
@@ -256,16 +264,16 @@ impl std::fmt::Debug for Buffer {
 }
 
 impl Buffer {
-    pub fn zeroed(device: &Context, bytes: u64) -> Result<Buffer> {
-        Buffer::with(device, bytes, Memory::Device)
+    pub fn zeroed(device: &Context, bytes: u64, owner: Owner) -> Result<Buffer> {
+        Buffer::with(device, bytes, Memory::Device, owner)
     }
 
-    pub fn host(device: &Context, bytes: u64) -> Result<Buffer> {
-        Buffer::with(device, bytes, Memory::Host)
+    pub fn host(device: &Context, bytes: u64, owner: Owner) -> Result<Buffer> {
+        Buffer::with(device, bytes, Memory::Host, owner)
     }
 
-    pub fn with(device: &Context, bytes: u64, kind: Memory) -> Result<Buffer> {
-        let slab = Raw::new(device.core(), bytes, kind)?;
+    pub fn with(device: &Context, bytes: u64, kind: Memory, owner: Owner) -> Result<Buffer> {
+        let slab = Raw::new(device.core(), bytes, kind, owner)?;
         Ok(Buffer { slab, bytes })
     }
 
@@ -364,8 +372,8 @@ impl Buffer {
 }
 
 impl engine_gpu::Buffer<super::Api> for Buffer {
-    fn with(device: &Context, bytes: u64, kind: Memory) -> Result<Buffer> {
-        Buffer::with(device, bytes, kind)
+    fn with(device: &Context, bytes: u64, kind: Memory, owner: Owner) -> Result<Buffer> {
+        Buffer::with(device, bytes, kind, owner)
     }
 
     fn bytes(&self) -> u64 {

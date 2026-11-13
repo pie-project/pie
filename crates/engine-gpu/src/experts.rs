@@ -365,7 +365,11 @@ impl<B: Backend> HostTier<B> {
         planes: Vec<HostPlane>,
     ) -> Result<(HostTier<B>, Vec<u32>)> {
         const STRIDE: u64 = 256;
-        let phantom = B::Buffer::host(device, STRIDE * planes.len().max(1) as u64)?;
+        let phantom = B::Buffer::host(
+            device,
+            STRIDE * planes.len().max(1) as u64,
+            crate::books::owners::EXPERT_TIER,
+        )?;
         let mut minted = Vec::with_capacity(planes.len());
         let mut table = BTreeMap::new();
         let mut bytes = 0u64;
@@ -456,7 +460,7 @@ impl<B: Backend> Seats<B> {
                 continue;
             }
             let cap = per * u64::from(capacity);
-            let buffer = B::Buffer::zeroed(device, cap)?;
+            let buffer = B::Buffer::zeroed(device, cap, crate::books::owners::EXPERT_SEATS)?;
             let handle = handles.bind(&buffer, 0, cap)?;
             slabs.push((kind, buffer));
             seat[kind.at()] = Some((handle, per));
@@ -469,9 +473,10 @@ impl<B: Backend> Seats<B> {
                 device,
                 slot_bytes,
                 crate::backend::Memory::Staging,
+                crate::books::owners::EXPERT_SEATS,
             )?);
         }
-        let routes = B::Buffer::zeroed(device, MAX_ROUTES * 4)?;
+        let routes = B::Buffer::zeroed(device, MAX_ROUTES * 4, crate::books::owners::EXPERT_SEATS)?;
         let routes_handle = handles.bind(&routes, 0, MAX_ROUTES * 4)?;
         Ok(Some(Seats {
             slabs,

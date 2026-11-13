@@ -2,6 +2,7 @@
 //! frames. Everything else in this crate is generic over [`Backend`] and is
 //! monomorphized per backend, so a call through these traits is static.
 
+use crate::books::{Books, Owner};
 use crate::error::{Fault, Result};
 
 /// Where a reservation lives.
@@ -107,6 +108,9 @@ pub trait Context<B: Backend> {
 
     /// The bytes of the working set no reservation holds.
     fn left(&self) -> u64;
+
+    /// The device's books: every reservation under its owner.
+    fn books(&self) -> &Books;
 
     /// Makes the device current on this thread.
     fn bind_thread(&self) -> Result<()>;
@@ -245,14 +249,16 @@ pub trait Pending: std::fmt::Debug {
 
 /// A device reservation as the shared engine moves bytes through it.
 pub trait Buffer<B: Backend>: Clone + std::fmt::Debug + Send + Sync {
-    fn with(device: &B::Context, bytes: u64, kind: Memory) -> Result<Self>;
+    /// A reservation of `bytes` of `kind`, entered in the device's books
+    /// under `owner` while it stands.
+    fn with(device: &B::Context, bytes: u64, kind: Memory, owner: Owner) -> Result<Self>;
 
-    fn zeroed(device: &B::Context, bytes: u64) -> Result<Self> {
-        Self::with(device, bytes, Memory::Device)
+    fn zeroed(device: &B::Context, bytes: u64, owner: Owner) -> Result<Self> {
+        Self::with(device, bytes, Memory::Device, owner)
     }
 
-    fn host(device: &B::Context, bytes: u64) -> Result<Self> {
-        Self::with(device, bytes, Memory::Host)
+    fn host(device: &B::Context, bytes: u64, owner: Owner) -> Result<Self> {
+        Self::with(device, bytes, Memory::Host, owner)
     }
 
     /// The bytes asked for.

@@ -1031,7 +1031,7 @@ impl<B: Serve> Shell<B> {
         };
         let pixel_out = match pixels.iter().map(|plane| plane.4).max() {
             Some(bytes) => (0..arms)
-                .map(|_| B::Buffer::host(&device, bytes))
+                .map(|_| B::Buffer::host(&device, bytes, crate::books::owners::READOUT))
                 .collect::<Result<Vec<_>>>()?,
             None => Vec::new(),
         };
@@ -1055,6 +1055,7 @@ impl<B: Serve> Shell<B> {
                         .max()
                         .unwrap_or(0)
                         .max(1),
+                    crate::books::owners::READOUT,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1142,6 +1143,7 @@ impl<B: Serve> Shell<B> {
             room,
             "the chunk pool is sized to its budget or what the weights and the working set leave"
         );
+        device.books().settle(chunk, device.working_set());
         let paging = Paging {
             pages: pages.max(1),
             slots,
@@ -3103,7 +3105,11 @@ impl<B: Serve> Shell<B> {
                 .is_none_or(|scratch| scratch.bytes() < need)
             {
                 self.drain()?;
-                self.rs_scratch = Some(B::Buffer::zeroed(&self.device, need)?);
+                self.rs_scratch = Some(B::Buffer::zeroed(
+                    &self.device,
+                    need,
+                    crate::books::owners::RS_SCRATCH,
+                )?);
             }
         }
 
@@ -3308,6 +3314,7 @@ impl<B: Serve> Shell<B> {
                 self.snaps = Some(B::Buffer::host(
                     &self.device,
                     bytes.next_power_of_two().max(256),
+                    crate::books::owners::SNAPSHOTS,
                 )?);
             }
             let held = self.snaps.as_mut().expect("just made");
@@ -3801,7 +3808,8 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             .max()
             .unwrap_or(0);
         if need > self.readout[prepared.arm].bytes() {
-            self.readout[prepared.arm] = B::Buffer::host(&self.device, need)?;
+            self.readout[prepared.arm] =
+                B::Buffer::host(&self.device, need, crate::books::owners::READOUT)?;
             B::grown(self, prepared.arm, need)?;
         }
         let (keep, split) = match B::plan(self, &mut prepared)? {

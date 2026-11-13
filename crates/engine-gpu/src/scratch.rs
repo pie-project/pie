@@ -323,7 +323,7 @@ impl<B: Backend> Scratch<B> {
             ple.push(PleHash { key, room });
         }
 
-        let mut plane = B::Buffer::zeroed(device, at)?;
+        let mut plane = B::Buffer::zeroed(device, at, crate::books::owners::SCRATCH)?;
         for hashing in &ple {
             let bytes: Vec<u8> = hashing.key.iter().flat_map(|v| v.to_ne_bytes()).collect();
             plane.write(hashing.room.at, &bytes)?;

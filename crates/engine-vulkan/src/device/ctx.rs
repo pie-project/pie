@@ -175,7 +175,7 @@ pub(crate) struct Core {
     pub(crate) memory: vk::PhysicalDeviceMemoryProperties,
     pub(crate) limits: vk::PhysicalDeviceLimits,
     pub(crate) transfer: Mutex<Transfer>,
-    pub(crate) allocated: AtomicU64,
+    pub(crate) books: engine_gpu::Books,
     pub(crate) name: String,
     pub(crate) subgroup_size: u32,
     /// The narrowest subgroup a pipeline runs at.
@@ -278,7 +278,12 @@ impl Core {
 
     pub(crate) fn staging<'a>(self: &Arc<Self>, transfer: &'a mut Transfer) -> Result<&'a Slab> {
         if transfer.staging.is_none() {
-            transfer.staging = Some(Raw::new(self, STAGING_BYTES, Memory::Staging)?);
+            transfer.staging = Some(Raw::new(
+                self,
+                STAGING_BYTES,
+                Memory::Staging,
+                engine_gpu::books::owners::STAGING,
+            )?);
         }
         Ok(transfer.staging.as_ref().expect("just made"))
     }
@@ -911,7 +916,7 @@ impl Context {
             memory,
             limits: props.limits,
             transfer: Mutex::new(transfer),
-            allocated: AtomicU64::new(0),
+            books: engine_gpu::Books::new(),
             name: name.clone(),
             subgroup_size: pinned.unwrap_or(subgroup.subgroup_size.max(1)),
             subgroup_min,
@@ -927,7 +932,12 @@ impl Context {
         // Taken before this load allocates, so what the heap holds then is
         // other processes'.
         let working_set = ((device_local as f64 * share) as u64).saturating_sub(core.held());
-        let dummy = Raw::new(&core, DUMMY_BYTES, Memory::Device)?;
+        let dummy = Raw::new(
+            &core,
+            DUMMY_BYTES,
+            Memory::Device,
+            engine_gpu::books::owners::DUMMY,
+        )?;
         let pipeline_cache = Arc::new(PipelineCache::open(&core, boot.pipeline_cache.clone())?);
         Ok(Context {
             core,
@@ -1024,8 +1034,13 @@ impl Context {
     /// What the working set has left now, less this load's allocations.
     #[must_use]
     pub fn left(&self) -> u64 {
-        self.working_set
-            .saturating_sub(self.core.allocated.load(Ordering::Relaxed))
+        self.working_set.saturating_sub(self.core.books.device())
+    }
+
+    /// The device's books: every reservation under its owner.
+    #[must_use]
+    pub fn books(&self) -> &engine_gpu::Books {
+        &self.core.books
     }
 
     pub fn bind_thread(&self) -> Result<()> {
@@ -1677,10 +1692,7 @@ impl Frame {
         })
     }
 
-    pub fn commit_async(
-        mut self,
-        on_done: Option<engine_gpu::backend::OnDone>,
-    ) -> Result<Pending> {
+    pub fn commit_async(mut self, on_done: Option<engine_gpu::backend::OnDone>) -> Result<Pending> {
         let at = crate::encode::profiling().then(std::time::Instant::now);
         self.submit()?;
         if let Some(at) = at {

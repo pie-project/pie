@@ -539,7 +539,13 @@ impl<B: Backend> Pools<B> {
         let host = if B::MAPS_HOST {
             HostChunks::Mapped(
                 (host_chunks > 0)
-                    .then(|| B::Buffer::host(device, u64::from(host_chunks) * layout.chunk_bytes))
+                    .then(|| {
+                        B::Buffer::host(
+                            device,
+                            u64::from(host_chunks) * layout.chunk_bytes,
+                            crate::books::owners::HOST_POOL,
+                        )
+                    })
                     .transpose()?,
             )
         } else {
@@ -1498,7 +1504,11 @@ impl<B: Backend> Spill<B> {
         if !B::MAPS_HOST {
             return Ok(Some(Spill::Batched { file }));
         }
-        let stage = B::Buffer::host(device, (file.stride() + engine::disk::ALIGN) as u64)?;
+        let stage = B::Buffer::host(
+            device,
+            (file.stride() + engine::disk::ALIGN) as u64,
+            crate::books::owners::SPILL,
+        )?;
         let mapped = stage.mapped_ptr().ok_or(Fault::Deviceless)?;
         Ok(Some(Spill::Mapped {
             file,
@@ -1600,7 +1610,12 @@ impl<B: Backend> Spill<B> {
         } else {
             Memory::Staging
         };
-        let mut stage = B::Buffer::with(device, (batch * stride) as u64, kind)?;
+        let mut stage = B::Buffer::with(
+            device,
+            (batch * stride) as u64,
+            kind,
+            crate::books::owners::SPILL,
+        )?;
         // A multiple of the stride from an `ALIGN` boundary, so each slot in
         // it is one aligned stage.
         let mut host = engine::disk::Aligned::zeroed(batch * stride);

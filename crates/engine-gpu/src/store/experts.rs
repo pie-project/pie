@@ -330,27 +330,43 @@ impl<B: Backend> ExpertCaches<B> {
                     by_param.insert(plane.param, (caches.len(), l, k));
                 }
             }
-            let mut units = B::Buffer::host(device, u64::from(atoms) * 4)?;
+            let mut units = B::Buffer::host(
+                device,
+                u64::from(atoms) * 4,
+                crate::books::owners::WEIGHT_CACHE,
+            )?;
             units.write(0, &vec![0xffu8; atoms as usize * 4])?;
-            let mut staged = B::Buffer::host(device, u64::from(atoms) * 4)?;
+            let mut staged = B::Buffer::host(
+                device,
+                u64::from(atoms) * 4,
+                crate::books::owners::WEIGHT_CACHE,
+            )?;
             staged.write(0, &vec![0xffu8; atoms as usize * 4])?;
             let mut cache = Cache {
                 slots: vec![NOT_HELD; shape.count as usize],
                 units,
-                hits: B::Buffer::host(device, u64::from(atoms) * 4)?,
+                hits: B::Buffer::host(
+                    device,
+                    u64::from(atoms) * 4,
+                    crate::books::owners::WEIGHT_CACHE,
+                )?,
                 staged,
                 stage: None,
                 held: false,
                 unit: crate::store::layout::gcd(chunk_bytes, shape.slot_bytes),
                 shape,
             };
-            cache.stage = Some(B::Buffer::host(device, cache.stage_bytes().max(4))?);
+            cache.stage = Some(B::Buffer::host(
+                device,
+                cache.stage_bytes().max(4),
+                crate::books::owners::WEIGHT_CACHE,
+            )?);
             caches.push(cache);
         }
         Ok(ExpertCaches {
             caches,
             by_param,
-            spare: B::Buffer::host(device, 16)?,
+            spare: B::Buffer::host(device, 16, crate::books::owners::WEIGHT_CACHE)?,
         })
     }
 
@@ -509,7 +525,11 @@ impl<B: Backend> ExpertCaches<B> {
             if !cache.slots.contains(&NOT_HELD) {
                 cache.stage = None;
             } else if cache.stage.is_none() {
-                cache.stage = Some(B::Buffer::host(device, cache.stage_bytes().max(4))?);
+                cache.stage = Some(B::Buffer::host(
+                    device,
+                    cache.stage_bytes().max(4),
+                    crate::books::owners::WEIGHT_CACHE,
+                )?);
             }
         }
         self.restage(pools)?;
@@ -572,7 +592,8 @@ impl<B: Backend> ExpertCaches<B> {
                 bytes += slot;
                 end += 1;
             }
-            let mut upload = B::Buffer::host(device, bytes.max(4))?;
+            let mut upload =
+                B::Buffer::host(device, bytes.max(4), crate::books::owners::WEIGHT_CACHE)?;
             let mut at = 0u64;
             let mut image = Vec::new();
             for &(_, cache, atom) in &fills[start..end] {

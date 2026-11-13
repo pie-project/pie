@@ -87,7 +87,14 @@ impl Serve for Api {
         Ok(Shelf {
             mirror: readout
                 .iter()
-                .map(|seat| Buffer::with(device, seat.bytes(), crate::device::Memory::Readback))
+                .map(|seat| {
+                    Buffer::with(
+                        device,
+                        seat.bytes(),
+                        crate::device::Memory::Readback,
+                        engine_gpu::books::owners::READOUT,
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?,
             mailbox: std::sync::Arc::default(),
             worker: crate::landing::Worker::default(),
@@ -97,8 +104,12 @@ impl Serve for Api {
     fn forget(_shelf: &mut Shelf) {}
 
     fn grown(shell: &mut Shell<Api>, arm: usize, bytes: u64) -> Result<()> {
-        shell.shelf.mirror[arm] =
-            Buffer::with(&shell.device, bytes, crate::device::Memory::Readback)?;
+        shell.shelf.mirror[arm] = Buffer::with(
+            &shell.device,
+            bytes,
+            crate::device::Memory::Readback,
+            engine_gpu::books::owners::READOUT,
+        )?;
         Ok(())
     }
 

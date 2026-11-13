@@ -439,7 +439,8 @@ impl<B: Backend> Weights<B> {
                 call: "decode_absorbed",
                 why: format!("{}: {why}", param.name),
             })?;
-            let mut buffer = B::Buffer::zeroed(device, plane.len() as u64)?;
+            let mut buffer =
+                B::Buffer::zeroed(device, plane.len() as u64, crate::books::owners::DERIVED)?;
             buffer.write(0, &plane)?;
             let handle = handles.bind(&buffer, 0, plane.len() as u64)?;
             self.table.0[at] = Some(WeightRow::Dense(Tensor::new(
@@ -495,7 +496,11 @@ impl<B: Backend> Weights<B> {
                     }
                 }
             }
-            let mut buffer = B::Buffer::zeroed(device, relabelled.len() as u64)?;
+            let mut buffer = B::Buffer::zeroed(
+                device,
+                relabelled.len() as u64,
+                crate::books::owners::DERIVED,
+            )?;
             buffer.write(0, &relabelled)?;
             let handle = handles.bind(&buffer, 0, relabelled.len() as u64)?;
             self.table.0[at] = Some(WeightRow::Dense(Tensor::new(
