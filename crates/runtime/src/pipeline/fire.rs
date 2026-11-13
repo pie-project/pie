@@ -626,6 +626,7 @@ impl RaiseFunding {
         pid: uuid::Uuid,
         quorum: uuid::Uuid,
         rows: u32,
+        epoch_now: impl Fn() -> u64 + Send + 'static,
     ) -> Self {
         let stop = Arc::new(tokio::sync::Notify::new());
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -637,6 +638,7 @@ impl RaiseFunding {
         };
         crate::rt::spawn(async move {
             let Some(planner) = crate::planner::planner_of(pid) else {
+                tracing::debug!(%pid, "a raise's funding finds no planner");
                 return;
             };
             let target = crate::store::shared::cap_for(&shared, rows);
@@ -659,21 +661,59 @@ impl RaiseFunding {
                     kv_pages: pages,
                     rs: crate::store::rs::RsUnits::default(),
                 };
+                tracing::debug!(engine, rows, pages, "a raise asks the planner for room");
                 let asked = tokio::select! {
                     asked = planner.acquire(pid, quorum, demand) => asked,
                     () = stop.notified() => return,
                 };
                 match asked {
                     Ok(crate::planner::Acquired::Granted(grant)) => {
-                        // The room is free once given back: the rung takes it.
+                        // The room is given back and the rung takes it at
+                        // once, the state in its span moved down first,
+                        // before the pass's own pieces open it again.
+                        // Given back first: its pages go back through the
+                        // pool's own lock.
                         drop(grant);
+                        let evacuation = {
+                            let pool = shared.lock().unwrap();
+                            let goal = pool.rung_for(rows);
+                            (goal > pool.rung()).then(|| pool.plan_raise(goal)).and_then(Result::ok)
+                        };
+                        if let Some(evacuation) = evacuation {
+                            let copied = evacuation.moves.is_empty()
+                                || crate::scheduler::pool(
+                                    engine,
+                                    crate::scheduler::worker::PoolOp::Evacuate(
+                                        crate::store::shared::SharedPool::rung_moves(&evacuation),
+                                    ),
+                                )
+                                .await
+                                .is_ok();
+                            if copied {
+                                let next = epoch_now().saturating_add(1);
+                                let applied = shared.lock().unwrap().apply_rung(&evacuation, next);
+                                if applied.is_ok() {
+                                    tracing::info!(
+                                        engine,
+                                        rung = evacuation.rung,
+                                        moved = evacuation.moves.len(),
+                                        "the activation rung is raised"
+                                    );
+                                }
+                            }
+                        }
                         crate::store::shared::raise_now(&shared, engine, rows);
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                     }
-                    Ok(crate::planner::Acquired::Requote) => {}
+                    Ok(crate::planner::Acquired::Requote) => {
+                        tracing::debug!(engine, "a raise's room is quoted again");
+                    }
                     Ok(crate::planner::Acquired::Yield) => {
+                        tracing::debug!(engine, "a raise's process yields");
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                     Err(error) => {
+                        tracing::debug!(engine, %error, "a raise's room is refused");
                         *failed.lock().unwrap() = Some(error.to_string());
                         return;
                     }
@@ -2950,12 +2990,18 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     && crate::store::shared::fire_cap(engine)
                         < crate::store::shared::cap_for(shared, wanted) =>
             {
+                let kv = stores.kv.clone();
                 Some(RaiseFunding::start(
                     shared.clone(),
                     engine,
                     pid,
                     quorum_pipeline_id,
                     wanted,
+                    move || {
+                        crate::store::registry::with_kv_lock(&kv, "raise-funding", |kv| {
+                            kv.current_epoch()
+                        })
+                    },
                 ))
             }
             _ => None,

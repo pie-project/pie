@@ -1183,13 +1183,26 @@ impl SharedPool {
     /// The chunks raising the activation to `rung` lacks now, and the kv
     /// pages that many chunks hold: what must be freed before it fits.
     #[must_use]
+    ///
+    /// The pages are what a grant of them leaves that many chunks freed past
+    /// what stands free now: every free slot of the kv list (the span the
+    /// smaller rung lends included) comes first, so it counts on top (a
+    /// grant it covers frees nothing).
     pub fn raise_short(&self, rung: u32) -> (u32, u32) {
         let chunks = self.pool.rung_short(rung);
+        if chunks == 0 {
+            return (0, 0);
+        }
+        let Some(list) = self.list else {
+            return (chunks, chunks);
+        };
         let spc = self
-            .list
-            .and_then(|list| self.pool.shape(list.pool))
+            .pool
+            .shape(list.pool)
             .map_or(1, |shape| shape.slots_per_chunk.max(1));
-        (chunks, chunks.saturating_mul(spc))
+        let free = self.pool.available(list.pool);
+        let pages = u64::from(chunks) * u64::from(spc) + free;
+        (chunks, u32::try_from(pages).unwrap_or(u32::MAX))
     }
 
     /// The smallest rung whose fires carry `rows`, the largest past every

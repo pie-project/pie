@@ -729,7 +729,7 @@ fn a_raise_by_demand_says_what_it_lacks_and_moves_the_rest() {
         .unwrap();
     let (chunks, pages) = pool.raise_short(2048);
     assert!(chunks > 0, "state fills the span: the raise lacks room");
-    assert_eq!(pages, chunks * 16, "16 kv pages a chunk");
+    assert!(pages >= chunks * 16, "16 kv pages a chunk, and the partly filled chunks' free slots on top");
     assert!(pool.plan_raise(2048).is_err());
     pool.give_records(&all[..all.len() / 2]);
     pool.pool_mut().retire_through(u64::MAX);
