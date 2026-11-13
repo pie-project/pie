@@ -244,7 +244,11 @@ impl Model {
                 ordinal: 0,
                 frames_in_flight: 1,
             })
-            .expect("the model loads");
+            .unwrap_or_else(|why| {
+                // (the checkpoint goes with a load that fails too)
+                let _ = std::fs::remove_dir_all(&dir);
+                panic!("the model loads: {why:?}")
+            });
         Model {
             engine,
             loaded,

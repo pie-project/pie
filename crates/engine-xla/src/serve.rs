@@ -249,6 +249,9 @@ pub struct Shell {
     streamed: crate::store::streamed::Streamed,
     /// The fire being traced reads its streamed weights through these.
     fire_streamed: Option<std::sync::Arc<crate::store::streamed::Fire>>,
+    /// The warm ladder's second pass: every fire traced as one that stages
+    /// expert misses (`crate::store::streamed::Fire::stages`).
+    pub(crate) stage_all: bool,
     /// The host tier (CONTRACT-BC 22): chunks of the pool's size.
     host: crate::store::tier::Host,
     /// The slot file below it, kv list slots.
@@ -827,6 +830,7 @@ impl Shell {
             pools,
             streamed,
             fire_streamed: None,
+            stage_all: false,
             host: crate::store::tier::Host::default(),
             disk: None,
             exports,
@@ -944,6 +948,14 @@ impl Shell {
     #[must_use]
     pub fn state_slot_bytes(&self) -> u64 {
         self.pools.state_slot_bytes()
+    }
+
+    #[must_use]
+    pub fn streams_experts(&self) -> bool {
+        self.streamed
+            .shapes
+            .iter()
+            .any(|s| matches!(s.form, crate::store::streamed::Form::Experts { .. }))
     }
 
     #[must_use]
@@ -2075,6 +2087,7 @@ impl Shell {
             &feed_rows,
             &real_rows,
             runs_now,
+            self.stage_all,
         )?;
         self.fire_streamed = staged_weights.fire.clone();
         // **THE STATED POSITION IS A ROTATION, NOT A ROW.** The rotary ops
@@ -2292,10 +2305,11 @@ impl Shell {
         // Formatted only where the shape key misses: at 256 lanes the
         // descriptor's text is a tenth of a decode's host time.
         let gathers_readout = self.gathers_readout;
+        let stages = self.fire_streamed.as_ref().is_some_and(|f| f.stages);
         let full_key = |probes: &[ValueId]| -> [u8; 32] {
             *blake3::hash(
                 format!(
-                    "{descriptor:?}|{windows:?}|{}|{max_pages}|{}|{}|{rs_active}|{dit_key}|{:?}|{readout_spans:?}",
+                    "{descriptor:?}|{windows:?}|{}|{max_pages}|{}|{}|{rs_active}|{dit_key}|{:?}|{readout_spans:?}|{stages}",
                     inputs.shapes(),
                     readout_rows.len(),
                     gathers_readout,
@@ -2317,7 +2331,7 @@ impl Shell {
                 descriptor.lanes.iter().map(|l| (l.class, l.word)).collect();
             *blake3::hash(
                 format!(
-                    "{:?}|{}|{}|{lanes:?}|{}|{}|{max_pages}|{}|{}|{rs_active}|{readout_spans:?}",
+                    "{:?}|{}|{}|{lanes:?}|{}|{}|{max_pages}|{}|{}|{rs_active}|{readout_spans:?}|{stages}",
                     descriptor.classes,
                     descriptor.rows,
                     descriptor.bucket,

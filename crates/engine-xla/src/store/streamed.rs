@@ -790,6 +790,11 @@ pub struct Fire {
     pub banks: Vec<(usize, Bank)>,
     /// Groups numbered so far.
     pub groups: usize,
+    /// Whether the fire stages misses: some expert of a streamed layer
+    /// lies in no slot (or the warm ladder asks for the program that
+    /// does). A fire that does not reads every bank where its table says,
+    /// with no staging in its program.
+    pub stages: bool,
 }
 
 /// How a select reads a streamed bank: expert `e`'s plane at pool row

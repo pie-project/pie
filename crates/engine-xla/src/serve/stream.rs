@@ -29,6 +29,7 @@ pub(super) fn stream_fire(
     feed_rows: &[(u32, usize)],
     real: &[bool],
     run: bool,
+    stage: bool,
 ) -> Result<Staged> {
     if streamed.is_empty() {
         return Ok(Staged::default());
@@ -138,6 +139,7 @@ pub(super) fn stream_fire(
                     let slots = &shape.slots
                         [layer_at * experts as usize..(layer_at + 1) * experts as usize];
                     let missing = slots.iter().filter(|&&s| s == NOT_HELD).count();
+                    fire.stages |= stage || missing > 0;
                     if missing > 0 && shape.staging.len() < floor.min(missing) {
                         return Err(Fault::Residency(format!(
                             "layer {layer_at} of `{}` holds {missing} experts in no slot and the \
