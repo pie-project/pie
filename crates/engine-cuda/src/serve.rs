@@ -873,6 +873,17 @@ impl Shell {
         }
     }
 
+    /// The most lanes a fire of prompts alone carries, where the profile
+    /// pads such a fire to fewer than every fire's (`engine.prefill_lanes`):
+    /// its bodies carry no more. 0: as many as any fire.
+    #[must_use]
+    pub fn prefill_lanes(&self) -> u32 {
+        match self.prefill_lanes {
+            0 => 0,
+            cap => cap.min(self.fire_lanes()),
+        }
+    }
+
     pub fn fire(&mut self, lanes: &[Lane<'_>]) -> Result<Vec<Vec<f32>>> {
         // A causal encoder-decoder's long prompts: their leading rows
         // through the encoder alone first (`crate::replay`).
