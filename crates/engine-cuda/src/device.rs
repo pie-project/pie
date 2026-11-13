@@ -40,6 +40,11 @@ pub mod held {
     }
 
     #[must_use]
+    pub fn heap_bytes() -> usize {
+        0
+    }
+
+    #[must_use]
     pub fn kept_bytes() -> usize {
         0
     }
