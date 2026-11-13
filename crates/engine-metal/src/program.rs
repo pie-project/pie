@@ -1,4 +1,5 @@
 pub mod compile;
+pub mod held;
 pub mod launch;
 pub mod ports;
 pub mod session;
@@ -22,6 +23,28 @@ pub use compile::{Cache, Compiled, Module, Region, Stage, Target};
 pub use launch::{ChannelShape, Cursor, Prepared, Rings};
 pub use session::{Blocked, Fired, Launched, Session};
 pub use shared::{MAX_ATTACHMENTS, SharedRing};
+
+use crate::store::Pools;
+
+/// A ring's facts at `channel_slot`-byte `Channel` slots, or `None` where
+/// its cell is past a slot and the engine keeps it.
+#[must_use]
+pub fn ring_facts(
+    channel: u32,
+    shape: ChannelShape,
+    channel_slot: u64,
+) -> Option<engine::RingFacts> {
+    let slots = shape.ring_slots(channel_slot)?;
+    Some(engine::RingFacts {
+        channel,
+        cell_bytes: shape.cell_bytes() as u64,
+        capacity: shape.capacity,
+        footprint: engine::Footprint {
+            bytes: shape.cell_count() * shape.cell_stride() as u64,
+            slots,
+        },
+    })
+}
 
 #[derive(Debug)]
 pub struct Program {
@@ -134,6 +157,7 @@ impl Plane {
         geometry: GeometryClass,
         device: eta_ir::registry::PortMask,
         channels: &[ChannelId],
+        pooled: Option<session::Pooled<'_>>,
     ) -> Result<InstanceId> {
         let program = self
             .programs
@@ -147,6 +171,7 @@ impl Plane {
             seeds,
             extents,
             &adopted,
+            pooled,
         ) {
             Ok(session) => session,
             Err(why) => {
@@ -175,6 +200,7 @@ impl Plane {
         context: &Context,
         id: ChannelId,
         shape: ChannelShape,
+        slots: Option<(&Pools, &[u32])>,
     ) -> Result<()> {
         if self.channels.contains_key(&id) {
             return Err(Fault::program(
@@ -187,8 +213,78 @@ impl Plane {
             ));
         }
         self.channels
-            .insert(id, Arc::new(SharedRing::open(context, shape)?));
+            .insert(id, Arc::new(SharedRing::open(context, shape, slots)?));
         Ok(())
+    }
+
+    /// What an instance of `id` holds in `Instance` and `Channel` slots of
+    /// `instance_slot` and `channel_slot` bytes. Tables past a slot leave the
+    /// instance's tables the engine's (no instance slots); a ring whose cell
+    /// is past a slot is the engine's and not listed.
+    pub fn facts(
+        &self,
+        id: ProgramId,
+        instance_slot: u64,
+        channel_slot: u64,
+    ) -> Result<engine::ProgramFacts> {
+        let program = self
+            .programs
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no program {id}")))?;
+        let sizes = Session::table_sizes(&program.compiled);
+        let instance = match held::pack(&sizes, instance_slot) {
+            Some((_, slots)) => engine::Footprint {
+                bytes: sizes.iter().sum(),
+                slots,
+            },
+            None => engine::Footprint::default(),
+        };
+        let rings = program
+            .plan
+            .package
+            .channels
+            .iter()
+            .enumerate()
+            .filter_map(|(channel, declared)| {
+                let shape = ChannelShape::of(declared);
+                ring_facts(channel as u32, shape, channel_slot)
+            })
+            .collect();
+        Ok(engine::ProgramFacts { instance, rings })
+    }
+
+    /// Points every pooled table and ring at the chunks their slots sit in
+    /// now: after an evacuation moved chunks under unchanged refs.
+    pub fn rebind(&mut self, pools: &Pools) -> Result<()> {
+        for bound in self.instances.values_mut() {
+            bound.session.rebind(pools)?;
+        }
+        for ring in self.channels.values() {
+            ring.rebind(pools)?;
+        }
+        Ok(())
+    }
+
+    /// Moves an instance's or a channel's pooled tables and rings to the
+    /// refs `rebind` names (`Engine::rebind_slots`).
+    pub fn rebind_slots(&mut self, pools: &Pools, rebind: &engine::Rebind) -> Result<()> {
+        match rebind {
+            engine::Rebind::Instance {
+                id,
+                instance,
+                rings,
+            } => self
+                .instances
+                .get_mut(id)
+                .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
+                .session
+                .retarget(pools, instance, rings),
+            engine::Rebind::Channel { id, slots } => self
+                .channels
+                .get(id)
+                .ok_or_else(|| Fault::program("program::plane", format!("no channel {id}")))?
+                .retarget(pools, slots),
+        }
     }
 
     pub fn close_channel(&mut self, id: ChannelId) -> bool {
@@ -204,7 +300,7 @@ impl Plane {
         &self,
         instance: InstanceId,
         id: ChannelId,
-    ) -> Result<(&crate::device::Buffer, u64, u64, eta_ir::Dtype)> {
+    ) -> Result<(crate::device::Buffer, u64, u64, eta_ir::Dtype)> {
         let bound = self.instances.get(&instance).ok_or_else(|| {
             Fault::program(
                 "program::plane",
@@ -607,8 +703,9 @@ mod tests {
     const VOCAB: u32 = 1024;
     const LANES: u32 = 2;
 
-    /// The registration, the number of channels it binds, and its seeds.
-    fn registration() -> (ProgramRegistration, usize, Vec<(u32, Vec<u8>)>) {
+    /// The registration, the number of channels it binds, its seeds, and
+    /// the token channel's index.
+    fn registration() -> (ProgramRegistration, usize, Vec<(u32, Vec<u8>)>, u32) {
         let indptr: &'static Channel = Box::leak(Box::new(Channel::from(vec![0u32, 1])));
         let token: &'static Channel =
             Box::leak(Box::new(Channel::new([1], dtype::i32).capacity(4)));
@@ -647,6 +744,11 @@ mod tests {
             .position(|&gid| gid == indptr.gid())
             .expect("the indptr channel is in the trace");
         let seed = [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let taken = traced
+            .channel_order()
+            .iter()
+            .position(|&gid| gid == token.gid())
+            .expect("the token channel is in the trace");
         (
             ProgramRegistration {
                 program_hash: bound.hash,
@@ -657,6 +759,7 @@ mod tests {
             },
             count,
             vec![(u32::try_from(at).expect("a channel index"), seed)],
+            u32::try_from(taken).expect("a channel index"),
         )
     }
 
@@ -666,7 +769,7 @@ mod tests {
     fn closing_a_program_drops_its_batches() {
         let context = Context::bind().expect("a Metal 4 device");
         let mut plane = Plane::new();
-        let (registration, count, seeds) = registration();
+        let (registration, count, seeds, _) = registration();
         let program = plane
             .register(&context, &registration)
             .expect("the program registers");
@@ -691,6 +794,7 @@ mod tests {
                         GeometryClass::Host,
                         PortMask::NONE,
                         &ids,
+                        None,
                     )
                     .expect("the lane binds");
                 plane
@@ -735,5 +839,196 @@ mod tests {
             "the closed program's batches are dropped: {} left",
             plane.batches.len()
         );
+    }
+
+    /// One instance's tables and rings in pool slots fire as one in buffers
+    /// of its own, and still do after an evacuation moved their chunks.
+    #[test]
+    fn an_instance_in_pool_slots_fires_as_one_in_its_own_buffers() {
+        use crate::store::Pools;
+        use crate::store::layout::{CHANNEL, INSTANCE};
+        use engine::chunk::Evacuation;
+
+        const CHUNK: u64 = 16 << 20;
+        let context = Context::bind().expect("a Metal 4 device");
+        let mut pools = Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+        let mut plane = Plane::new();
+        let (registration, _, seeds, token) = registration();
+        let program = plane
+            .register(&context, &registration)
+            .expect("the program registers");
+        let instance_slot = pools.slot_bytes(INSTANCE).expect("an instance shape");
+        let channel_slot = pools.slot_bytes(CHANNEL).expect("a channel shape");
+        let facts = plane
+            .facts(program, instance_slot, channel_slot)
+            .expect("the program's facts");
+        assert!(facts.instance.slots > 0, "the tables take slots: {facts:?}");
+        assert!(!facts.rings.is_empty(), "the rings take slots: {facts:?}");
+
+        // Instance slots in logical chunk 1, channel slots in chunk 2.
+        let per_instance = u32::try_from(CHUNK / instance_slot).expect("slots a chunk");
+        let per_channel = u32::try_from(CHUNK / channel_slot).expect("slots a chunk");
+        let instance: Vec<u32> = (0..facts.instance.slots)
+            .map(|k| per_instance + k)
+            .collect();
+        let mut next = 2 * per_channel;
+        let rings: Vec<engine::RingSlots> = facts
+            .rings
+            .iter()
+            .map(|ring| {
+                let slots = (next..next + ring.footprint.slots).collect();
+                next += ring.footprint.slots;
+                engine::RingSlots {
+                    channel: ring.channel,
+                    slots,
+                }
+            })
+            .collect();
+
+        let logits =
+            crate::device::Buffer::zeroed(&context, u64::from(VOCAB) * 2).expect("a logits plane");
+        let extents = Extents {
+            row_count: 1,
+            sampled_rows: 1,
+            query_len: 1,
+            ..Extents::default()
+        };
+        let bind = |plane: &mut Plane, pooled: Option<session::Pooled<'_>>| {
+            let id = plane
+                .bind(
+                    &context,
+                    program,
+                    &seeds,
+                    extents,
+                    GeometryClass::Host,
+                    PortMask::NONE,
+                    &[],
+                    pooled,
+                )
+                .expect("the instance binds");
+            plane
+                .bind_output(
+                    id,
+                    "logits",
+                    0,
+                    &logits,
+                    0,
+                    eta_ir::Dtype::Bf16,
+                    VOCAB,
+                    VOCAB,
+                )
+                .expect("the logits bind");
+            id
+        };
+        let own = bind(&mut plane, None);
+        let pooled = bind(
+            &mut plane,
+            Some(session::Pooled {
+                pools: &pools,
+                instance: &instance,
+                rings: &rings,
+            }),
+        );
+        let own_state = plane.instance(own).expect("bound").bytes();
+        let pooled_state = plane.instance(pooled).expect("bound").bytes();
+        assert!(
+            pooled_state < own_state,
+            "the pooled instance holds less apart from the pool: {pooled_state} vs {own_state}"
+        );
+
+        let peak = |plane: &mut Plane, at: u32| {
+            let mut bf16 = vec![0u8; VOCAB as usize * 2];
+            bf16[at as usize * 2..at as usize * 2 + 2].copy_from_slice(&0x3f80u16.to_le_bytes());
+            let mut logits = logits.clone();
+            logits.write(0, &bf16).expect("the logits write");
+            let mut tokens = Vec::new();
+            for id in [own, pooled] {
+                let fired = plane
+                    .fire(&context, id, Attach::Epilogue)
+                    .expect("the stage fires");
+                assert!(matches!(fired, Fired::Committed), "{id} fires: {fired:?}");
+                let cell = plane
+                    .instance_mut(id)
+                    .expect("bound")
+                    .take(token)
+                    .expect("the take")
+                    .expect("a token");
+                tokens.push(i32::from_le_bytes(cell[..4].try_into().expect("an i32")));
+                // The indptr is consumed a fire: put it back.
+                let (channel, seed) = &seeds[0];
+                plane
+                    .instance_mut(id)
+                    .expect("bound")
+                    .publish(*channel, seed)
+                    .expect("the reseed");
+            }
+            tokens
+        };
+        assert_eq!(peak(&mut plane, 777), vec![777, 777]);
+
+        // Move both chunks; the refs stand, the plane rebinds.
+        let mut frame = context.frame().expect("a frame");
+        pools
+            .evacuate(
+                &mut frame,
+                &Evacuation {
+                    moves: vec![(1, 3), (2, 1)],
+                },
+            )
+            .expect("the evacuation");
+        frame.commit().expect("the copies land");
+        plane.rebind(&pools).expect("the rebind");
+        assert_eq!(peak(&mut plane, 123), vec![123, 123]);
+
+        // Park and unpark: the bytes copied to fresh refs, the old refs
+        // zeroed (from a slot nothing wrote), the instance rebound.
+        let moved = |old: &[u32], by: u32| -> Vec<u32> { old.iter().map(|&r| r + by).collect() };
+        let fresh_instance = moved(&instance, 64);
+        let fresh_rings: Vec<engine::RingSlots> = rings
+            .iter()
+            .map(|ring| engine::RingSlots {
+                channel: ring.channel,
+                slots: moved(&ring.slots, 256),
+            })
+            .collect();
+        let mut frame = context.frame().expect("a frame");
+        let pairs = |old: &[u32], new: &[u32]| -> Vec<(u32, u32)> {
+            old.iter().copied().zip(new.iter().copied()).collect()
+        };
+        let blank_instance = 2 * per_instance - 1;
+        let blank_channel = 3 * per_channel - 1;
+        pools
+            .copy_shape(&mut frame, INSTANCE, &pairs(&instance, &fresh_instance))
+            .expect("the tables copy");
+        for (ring, fresh) in rings.iter().zip(&fresh_rings) {
+            pools
+                .copy_shape(&mut frame, CHANNEL, &pairs(&ring.slots, &fresh.slots))
+                .expect("the ring copies");
+        }
+        frame.commit().expect("the copies land");
+        let mut frame = context.frame().expect("a frame");
+        let blanks = |old: &[u32], blank: u32| -> Vec<(u32, u32)> {
+            old.iter().map(|&r| (blank, r)).collect()
+        };
+        pools
+            .copy_shape(&mut frame, INSTANCE, &blanks(&instance, blank_instance))
+            .expect("the old tables zero");
+        for ring in &rings {
+            pools
+                .copy_shape(&mut frame, CHANNEL, &blanks(&ring.slots, blank_channel))
+                .expect("the old ring zeroes");
+        }
+        frame.commit().expect("the zeroes land");
+        plane
+            .rebind_slots(
+                &pools,
+                &engine::Rebind::Instance {
+                    id: pooled,
+                    instance: fresh_instance,
+                    rings: fresh_rings,
+                },
+            )
+            .expect("the slots rebind");
+        assert_eq!(peak(&mut plane, 456), vec![456, 456]);
     }
 }

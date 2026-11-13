@@ -7,8 +7,11 @@ use eta_ir::validate::Direction;
 
 use crate::device::{Buffer, Context, Pipelines};
 use crate::error::{Fault, Result};
+use crate::store::Pools;
+use crate::store::layout::INSTANCE;
 
 use super::compile::Compiled;
+use super::held::Tables;
 use super::launch::{ChannelShape, Cursor, Prepared, Rings};
 use super::ports;
 use super::shared::SharedRing;
@@ -59,8 +62,29 @@ pub enum Launched {
     Refused(Fired),
 }
 
+/// Whether stage `index` of `compiled` launches kernels (and so holds
+/// launch tables).
+fn launches(compiled: &Compiled, index: usize) -> bool {
+    compiled
+        .stages
+        .get(index)
+        .is_some_and(|stage| !stage.regions.is_empty())
+}
+
+/// The pool slots the runtime took for an instance (REDESIGN step 4).
+#[derive(Clone, Copy)]
+pub struct Pooled<'a> {
+    pub pools: &'a Pools,
+    /// `Instance` slot refs for its bind-time tables.
+    pub instance: &'a [u32],
+    /// `Channel` slot refs for the rings it holds itself.
+    pub rings: &'a [engine::program::RingSlots],
+}
+
 #[derive(Debug)]
 pub struct Session {
+    /// The `Instance` slot refs the tables lie in, in order.
+    instance_slots: Vec<u32>,
     rings: Rings,
     shapes: Vec<ChannelShape>,
     cursors: Vec<Cursor>,
@@ -86,6 +110,21 @@ impl Session {
                 .sum::<u64>()
     }
 
+    /// The bind-time tables an instance of `compiled` takes, every
+    /// launching stage's in order.
+    #[must_use]
+    pub fn table_sizes(compiled: &Compiled) -> Vec<u64> {
+        compiled
+            .plans
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| launches(compiled, *index))
+            .flat_map(|(_, plan)| Prepared::table_sizes(plan))
+            .collect()
+    }
+
+    /// The instance's bind-time tables and rings go in `pooled`'s slots
+    /// where it names them, else in buffers of their own.
     pub fn bind(
         device: &Context,
         compiled: &Compiled,
@@ -93,6 +132,7 @@ impl Session {
         seeds: &[(u32, Vec<u8>)],
         extents: Extents,
         adopted: &[Option<std::sync::Arc<SharedRing>>],
+        pooled: Option<Pooled<'_>>,
     ) -> Result<Session> {
         stages_and_plans_agree(compiled)?;
         if plan.package.channels.is_empty() {
@@ -105,23 +145,41 @@ impl Session {
 
         let shapes: Vec<ChannelShape> =
             plan.package.channels.iter().map(ChannelShape::of).collect();
-        let rings = Rings::allocate(device, &shapes, adopted)?;
+        let rings = Rings::allocate(
+            device,
+            &shapes,
+            adopted,
+            pooled.map(|pooled| (pooled.pools, pooled.rings)),
+        )?;
+        let mut tables = match pooled {
+            Some(pooled) if !pooled.instance.is_empty() => Tables::pooled(
+                pooled.pools,
+                INSTANCE,
+                pooled.instance,
+                &Session::table_sizes(compiled),
+            )?,
+            _ => Tables::Own(device),
+        };
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
 
         let mut prepared = Vec::with_capacity(compiled.plans.len());
         for (index, stage_plan) in compiled.plans.iter().enumerate() {
-            let launches = compiled
-                .stages
-                .get(index)
-                .is_some_and(|stage| !stage.regions.is_empty());
-            prepared.push(if launches {
-                Some(Prepared::build(device, stage_plan, &shapes, extents)?)
+            prepared.push(if launches(compiled, index) {
+                Some(Prepared::build(
+                    device,
+                    stage_plan,
+                    &shapes,
+                    extents,
+                    &mut tables,
+                )?)
             } else {
                 None
             });
         }
+        tables.finish()?;
 
         let mut session = Session {
+            instance_slots: pooled.map_or_else(Vec::new, |pooled| pooled.instance.to_vec()),
             rings,
             shapes,
             cursors,
@@ -148,6 +206,55 @@ impl Session {
             }
         }
         Ok(session)
+    }
+
+    /// Points the pooled tables and rings at the chunks their slots sit in
+    /// now (after an evacuation moved them).
+    pub fn rebind(&mut self, pools: &Pools) -> Result<()> {
+        self.rings.rebind(pools)?;
+        self.prepared
+            .iter_mut()
+            .flatten()
+            .try_for_each(|prepared| prepared.rebind(pools))
+    }
+
+    /// Moves the pooled tables to `instance` (the refs, in order, that
+    /// replace this instance's) and its own rings to `rings`; the runtime
+    /// already copied their bytes there.
+    pub fn retarget(
+        &mut self,
+        pools: &Pools,
+        instance: &[u32],
+        rings: &[engine::program::RingSlots],
+    ) -> Result<()> {
+        if instance.len() != self.instance_slots.len() {
+            return Err(Fault::program(
+                "program::session",
+                format!(
+                    "an instance in {} instance slot(s) rebound to {}",
+                    self.instance_slots.len(),
+                    instance.len()
+                ),
+            ));
+        }
+        let old = self.instance_slots.clone();
+        let to = |slot: u32| -> Result<u32> {
+            old.iter()
+                .position(|&held| held == slot)
+                .map(|at| instance[at])
+                .ok_or_else(|| {
+                    Fault::program(
+                        "program::session",
+                        format!("a table in slot {slot}, which this instance does not hold"),
+                    )
+                })
+        };
+        for prepared in self.prepared.iter_mut().flatten() {
+            prepared.retarget(pools, &to)?;
+        }
+        self.rings.retarget(pools, rings)?;
+        self.instance_slots = instance.to_vec();
+        Ok(())
     }
 
     #[must_use]
@@ -238,20 +345,15 @@ impl Session {
         Ok(Some(cell))
     }
 
-    pub fn feed_cell(&self, channel: u32) -> Result<Option<(&Buffer, u64, u64, eta_ir::Dtype)>> {
+    pub fn feed_cell(&self, channel: u32) -> Result<Option<(Buffer, u64, u64, eta_ir::Dtype)>> {
         let slot = channel as usize;
         let shape = self.shape_of(channel)?;
         if self.depth(channel) == 0 {
             return Ok(None);
         }
         let head = self.cursor(channel).unwrap_or_default().head;
-        let at = self.rings.cell_offset(slot, head)?;
-        Ok(Some((
-            self.rings.slab(slot)?,
-            at,
-            shape.cell_bytes() as u64,
-            shape.dtype,
-        )))
+        let (buffer, at) = self.rings.cell_at(slot, head)?;
+        Ok(Some((buffer, at, shape.cell_bytes() as u64, shape.dtype)))
     }
 
     pub fn peek(&self, channel: u32, sequence: u64) -> Result<Vec<u8>> {

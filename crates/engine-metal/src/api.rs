@@ -93,6 +93,12 @@ impl Metal {
             })
     }
 
+    fn loaded(&self) -> EngineResult<&Shell> {
+        self.shell
+            .as_ref()
+            .ok_or_else(|| Error::Load("the metal engine has no model loaded".into()))
+    }
+
     fn loaded_mut(&mut self) -> EngineResult<&mut Shell> {
         self.shell
             .as_mut()
@@ -753,6 +759,24 @@ impl Engine for Metal {
             .map_err(fault)
     }
 
+    fn program_facts(&self, program: ProgramId) -> EngineResult<engine::ProgramFacts> {
+        self.loaded()?.program_facts(program).map_err(fault)
+    }
+
+    fn rebind_slots(&mut self, rebind: engine::Rebind) -> EngineResult<()> {
+        self.loaded_mut()?.rebind_slots(&rebind).map_err(fault)
+    }
+
+    fn ring_facts(
+        &self,
+        registration: &ChannelRegistration,
+    ) -> EngineResult<Option<engine::RingFacts>> {
+        if registration.host_role != eta_ir::container::HostRole::None {
+            return Ok(None);
+        }
+        Ok(self.loaded()?.ring_facts(channel_shape(registration)))
+    }
+
     fn register_channel(
         &mut self,
         registration: &ChannelRegistration,
@@ -760,18 +784,9 @@ impl Engine for Metal {
         if registration.host_role != eta_ir::container::HostRole::None {
             return Err(self.unsupported("register_channel"));
         }
-        let shape = crate::program::ChannelShape {
-            capacity: registration.capacity.max(1),
-            numel: registration
-                .shape
-                .iter()
-                .map(|&dim| dim as usize)
-                .product::<usize>()
-                .max(1),
-            dtype: registration.dtype.program_dtype(),
-        };
+        let shape = channel_shape(registration);
         self.loaded_mut()?
-            .register_shared_channel(registration.id, shape)
+            .register_shared_channel(registration.id, shape, &registration.slots)
             .map_err(fault)?;
         Ok(RegisteredChannel {
             id: registration.id,
@@ -807,6 +822,8 @@ impl Engine for Metal {
                 binding.geometry,
                 binding.device_resolved,
                 &binding.channels,
+                &binding.instance_slots,
+                &binding.ring_slots,
             )
             .map_err(fault)?;
         let landed = adapter_of(shell, binding.program, id, &seeds);
@@ -1169,3 +1186,17 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
 // moves sole ownership of all of them, and Metal's device, queue, pipeline and
 // resource objects are documented usable from any thread.
 unsafe impl Send for Metal {}
+
+/// The ring a registered channel declares.
+fn channel_shape(registration: &ChannelRegistration) -> crate::program::ChannelShape {
+    crate::program::ChannelShape {
+        capacity: registration.capacity.max(1),
+        numel: registration
+            .shape
+            .iter()
+            .map(|&dim| dim as usize)
+            .product::<usize>()
+            .max(1),
+        dtype: registration.dtype.program_dtype(),
+    }
+}
