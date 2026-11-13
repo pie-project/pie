@@ -147,6 +147,39 @@ impl Drop for RungWant {
     }
 }
 
+/// Raises `shared`'s rung at once to the one fires of `rows` take, where
+/// nothing lies in the larger span and the room is there (a raise that must
+/// move state is the walker's, through the engine's copy): the pass asking
+/// is cut at the raised width from its first piece. A cap the walker
+/// lowered behind a rung still up is lifted back to it.
+pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
+    let mut pool = shared.lock().unwrap();
+    let rungs = pool.rungs();
+    let goal = pool.rung_for(rows);
+    let lifted = |rung: u32| {
+        if rungs.last() == Some(&rung) {
+            u32::MAX
+        } else {
+            rung
+        }
+    };
+    if goal > pool.rung() {
+        let Ok(evacuation) = pool.plan_raise(goal) else {
+            return;
+        };
+        if !evacuation.moves.is_empty() || pool.apply_rung(&evacuation, 0).is_err() {
+            return;
+        }
+        tracing::info!(engine, rung = goal, moved = 0, "the activation rung is raised");
+    }
+    // The rung holds `goal` now: fires may take its width.
+    let cap = lifted(goal);
+    if cap > fire_cap(engine) {
+        set_fire_cap(engine, cap);
+    }
+    drop(pool);
+}
+
 /// The most rows a pass still to run on `engine` asks of one fire; 0 where
 /// none asks.
 #[must_use]

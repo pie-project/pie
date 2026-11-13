@@ -2789,8 +2789,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let wanted = u32::try_from(rows_total)
             .unwrap_or(u32::MAX)
             .min(prefill_want(page_size, engine));
-        let rung_want = (rows_total > RUNG_WANT_FROM)
-            .then(|| crate::store::shared::want_rows(engine, wanted));
+        let rung_want = (rows_total > RUNG_WANT_FROM).then(|| {
+            let want = crate::store::shared::want_rows(engine, wanted);
+            if let Some(shared) = stores.shared.as_ref() {
+                crate::store::shared::raise_now(shared, engine, wanted);
+            }
+            want
+        });
         let mut cut_at = crate::store::shared::fire_cap(engine);
         let mut cuts = pass_pieces(
             &full,
@@ -2810,7 +2815,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .max()
             .unwrap_or(0);
         let (wanted, rung_want) = if widest > wanted && rows_total > RUNG_WANT_FROM {
-            (widest, Some(crate::store::shared::want_rows(engine, widest)))
+            let want = crate::store::shared::want_rows(engine, widest);
+            if let Some(shared) = stores.shared.as_ref() {
+                crate::store::shared::raise_now(shared, engine, widest);
+            }
+            (widest, Some(want))
         } else {
             (wanted, rung_want)
         };

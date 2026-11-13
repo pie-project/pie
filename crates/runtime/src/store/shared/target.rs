@@ -100,16 +100,33 @@ impl SharedGrow {
                     return;
                 }
                 RungStep::Cap(tokens) => {
+                    {
+                        // Under the pool's lock, as a pass's `raise_now`
+                        // lifts it: a cap down past what a pass asks since
+                        // is not taken.
+                        let _pool = self.shared.lock().unwrap();
+                        let now = super::fire_cap(self.engine);
+                        if tokens < now && super::wanted_rows(self.engine) > tokens {
+                            continue;
+                        }
+                        super::set_fire_cap(self.engine, tokens);
+                    }
                     tracing::info!(
                         engine = self.engine,
                         tokens,
                         "fires cut to the activation rung"
                     );
-                    super::set_fire_cap(self.engine, tokens);
                     crate::scheduler::nudge(self.engine);
                 }
                 RungStep::Lower(rung) => {
-                    let lowered = self.shared.lock().unwrap().lower_rung(rung);
+                    let lowered = {
+                        let mut pool = self.shared.lock().unwrap();
+                        // A pass lifted the cap since the walk capped it.
+                        if super::fire_cap(self.engine) > rung {
+                            continue;
+                        }
+                        pool.lower_rung(rung)
+                    };
                     if let Err(error) = lowered {
                         tracing::warn!(engine = self.engine, %error, "the activation rung stays");
                         return;
