@@ -144,18 +144,31 @@ impl Lender for PlannerLender {
         if room == ArmingRoom::default() {
             return Some(Lent::empty());
         }
-        if let Some(grant) = take_funded(engine) {
-            return Some(Lent::on_engine(grant, engine));
-        }
-        // What the engine holds back now is no lease's either.
-        if let Some(shared) = crate::store::registry::try_get(0, engine).and_then(|s| s.shared) {
-            let held = crate::engine::live(engine).held();
-            shared.lock().unwrap().hold_back(held);
-        }
-        let planner = crate::planner::planner_for(0, engine)?;
-        planner
-            .try_free(demand(room))
-            .map(|grant| Lent::on_engine(grant, engine))
+        let shared = crate::store::registry::try_get(0, engine).and_then(|s| s.shared);
+        let lent = match take_funded(engine) {
+            Some(grant) => Lent::on_engine(grant, engine),
+            None => {
+                // What the engine holds back now is no lease's either.
+                if let Some(shared) = &shared {
+                    let held = crate::engine::live(engine).held();
+                    shared.lock().unwrap().hold_back(held);
+                }
+                let planner = crate::planner::planner_for(0, engine)?;
+                planner
+                    .try_free(demand(room))
+                    .map(|grant| Lent::on_engine(grant, engine))?
+            }
+        };
+        // Never the activation span's chunks a lowered rung lends state: a
+        // raise takes them back, and the step's own capture runs on them.
+        // A lease that reaches them goes back whole, and no step runs.
+        let below = shared.is_none_or(|shared| {
+            shared
+                .lock()
+                .unwrap()
+                .below_span(&lent.lease.pages, &lent.lease.records)
+        });
+        below.then_some(lent)
     }
 }
 

@@ -113,6 +113,40 @@ impl LaneCommit {
     }
 }
 
+/// With `PIE_CHECK_SLOT_REFS` set, a fire whose lanes name a slot of the
+/// engine's shared pool that is not handed out (its chunk not open for the
+/// shape, or the slot free in it) is refused, saying which: a page table
+/// entry the engine would read or write through unassigned memory.
+fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option<String> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("PIE_CHECK_SLOT_REFS").is_some()) {
+        return None;
+    }
+    let shared = crate::store::registry::try_get(0, engine_idx)?.shared?;
+    let pool = shared.lock().unwrap();
+    frame.steps.iter().find_map(|step| {
+        step.submission
+            .lanes
+            .iter()
+            .enumerate()
+            .find_map(|(at, lane)| {
+                let fixed: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = lane
+                    .fixed
+                    .iter()
+                    .map(|(shape, pairs)| (*shape, pairs.iter().flatten().copied().collect()))
+                    .collect();
+                pool.unassigned(&lane.tables)
+                    .or_else(|| pool.unassigned(&fixed))
+                    .map(|(shape, slot_ref)| {
+                        format!(
+                            "a fire's lane {at} names slot ref {slot_ref} of shape {shape:?}, \
+                         which the pool has not handed out"
+                        )
+                    })
+            })
+    })
+}
+
 fn backend(engine: &mut Option<EngineBox>) -> Result<&mut EngineBox> {
     engine.as_mut().ok_or_else(|| anyhow!(NO_BACKEND))
 }
@@ -449,10 +483,15 @@ impl Lane {
                     ..
                 } => {
                     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let fault = arming.fault();
+                        let fault = arming
+                            .fault()
+                            .map(str::to_string)
+                            .or_else(|| unassigned_ref(engine_idx, &frame));
                         let result = match engine.as_mut() {
-                            // A load fault in arming fails every fire after it.
-                            _ if fault.is_some() => Err(fault.unwrap_or_default().to_string()),
+                            // A load fault in arming fails every fire after
+                            // it, and a fire naming a slot nobody was handed
+                            // is refused before the engine reads it.
+                            _ if fault.is_some() => Err(fault.unwrap_or_default()),
                             Some(engine) => {
                                 crate::probe_fire!(stats.fire.execute.engine_fire_us, {
                                     Self::fire_frame(

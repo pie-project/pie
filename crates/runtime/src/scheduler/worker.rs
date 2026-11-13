@@ -466,21 +466,23 @@ pub(super) enum QueuedItem {
 }
 
 /// The rows the scheduler's queued and in-flight launches ask a fire to
-/// carry, held as a rung want while there are any.
+/// carry, held as a rung want: the most they asked since the scheduler
+/// last slept with nothing to do, so a batch that breathes between its
+/// steps does not move the rung back and forth each step.
 #[derive(Default)]
 struct BatchWant(Option<(usize, crate::store::shared::RungWant)>);
 
 impl BatchWant {
     fn ask(&mut self, engine: usize, rows: usize) {
-        if rows == 0 {
-            self.0 = None;
-            return;
-        }
-        if self.0.as_ref().is_some_and(|(held, _)| *held == rows) {
+        if rows == 0 || self.0.as_ref().is_some_and(|(held, _)| *held >= rows) {
             return;
         }
         let want = crate::store::shared::want_rows(engine, u32::try_from(rows).unwrap_or(u32::MAX));
         self.0 = Some((rows, want));
+    }
+
+    fn release(&mut self) {
+        self.0 = None;
     }
 }
 
@@ -1163,6 +1165,9 @@ impl BatchScheduler {
                 && replies.is_empty()
                 && !stopping
             {
+                // Nothing queued or in flight: the batch's ask goes while
+                // the scheduler sleeps.
+                batch_want.release();
                 match rx.recv().await {
                     Some(item) => Some(item),
                     None => {
@@ -2699,7 +2704,12 @@ mod tests {
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 16);
         want.ask(ENGINE, 64);
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 64);
+        // A batch that breathes keeps what it asked until the scheduler
+        // sleeps with nothing to do.
+        want.ask(ENGINE, 32);
         want.ask(ENGINE, 0);
+        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 64);
+        want.release();
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
     }
 

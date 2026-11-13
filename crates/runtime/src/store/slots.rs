@@ -792,6 +792,22 @@ impl SlotPool {
         &self.logical_to_physical
     }
 
+    /// Whether `slot` of `shape` is handed out: its chunk open for the shape
+    /// and the slot not free in it (held, or waiting on a fire's epoch).
+    pub fn is_held(&self, shape: ShapeId, slot: Slot) -> bool {
+        let Some(meta) = self.chunks.get(slot.chunk as usize) else {
+            return false;
+        };
+        let Some(state) = self.shapes.get(shape as usize) else {
+            return false;
+        };
+        if meta.shape != shape || slot.index >= state.spc() {
+            return false;
+        }
+        let word = meta.frame as usize * state.words + (slot.index / WORD) as usize;
+        state.free[word] & (1 << (slot.index % WORD)) == 0
+    }
+
     /// The shape logical chunk `chunk` is open for.
     pub fn chunk_shape(&self, chunk: u32) -> Option<ShapeId> {
         Some(self.chunks[chunk as usize].shape).filter(|&shape| shape != NO_SHAPE)
@@ -1196,6 +1212,13 @@ impl SlotPool {
     }
 
     /// Every fire through `epoch` has retired: what waited on them is free.
+    /// The chunks fenced until `from` stay fenced until `to` instead.
+    pub fn refence(&mut self, from: u64, to: u64) {
+        if let Some(chunks) = self.fences.remove(&from) {
+            self.fences.entry(to).or_default().extend(chunks);
+        }
+    }
+
     pub fn retire_through(&mut self, epoch: u64) {
         self.retired = self.retired.max(epoch);
         let later = self.fences.split_off(&(epoch.saturating_add(1)));
