@@ -72,8 +72,12 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::cores(self)
     }
 
-    fn working_set(&self) -> u64 {
-        Context::working_set(self)
+    fn capacity(&self) -> u64 {
+        Context::capacity(self)
+    }
+
+    fn outside(&self) -> u64 {
+        Context::outside(self)
     }
 
     fn left(&self) -> u64 {

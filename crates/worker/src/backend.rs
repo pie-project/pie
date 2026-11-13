@@ -701,9 +701,6 @@ pub(crate) fn create_engine_backend(
                 "profiles = {}\n",
                 toml::Value::String(home.join("profiles").display().to_string())
             ));
-            if let Some(memory) = opts.device_memory {
-                boot_doc.push_str(&format!("device_memory = {}\n", memory.as_bytes()));
-            }
             let backend = opened.map_or_else(
                 || runtime::engine::backend::open::wgpu(boot_doc.as_bytes()),
                 Ok,

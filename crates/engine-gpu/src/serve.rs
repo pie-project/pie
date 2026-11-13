@@ -76,9 +76,10 @@ pub trait Serve: Backend {
 
     /// Opens the device (adopting `handed` where the host handed one) and
     /// its tuning.
+    /// The device takes at most `budget` bytes for the load where stated.
     fn open(
         boot: &Self::DeviceBoot,
-        share: f64,
+        budget: Option<u64>,
         handed: Option<Self::Handed>,
     ) -> Result<(Self::Context, Self::Tuning)>;
 
@@ -628,7 +629,7 @@ impl<B: Serve> Shell<B> {
         let mut boot = boot;
         let (device, tuning) = B::open(
             boot.device,
-            boot.residency.device_memory_share,
+            boot.residency.budget_device,
             boot.handed.take(),
         )?;
         let tier = B::tier(&device);
@@ -659,7 +660,7 @@ impl<B: Serve> Shell<B> {
             }
         };
         let weights: u64 = crate::weights::plane_bytes(&boot.trace)?.iter().sum();
-        let room = device.working_set().saturating_sub(weights) / 2;
+        let room = device.left().saturating_sub(weights) / 2;
         let mut budgets = poem_compiler::fit_voxels(&boot.trace, budgets, &profile, room);
         if boot.slots == 0 {
             boot.slots = poem_compiler::fit_frame_slots(
@@ -1126,7 +1127,11 @@ impl<B: Serve> Shell<B> {
             room,
             "the chunk pool is sized to its budget or what the weights and the working set leave"
         );
-        device.books().settle(chunk, device.working_set());
+        // The ledger's capacity is what the device has, measured once the
+        // context, the weights and every load-time reservation are up;
+        // what the driver holds by then is its own entry.
+        device.books().outside("driver", device.outside());
+        device.books().settle(chunk, device.capacity());
         let paging = Paging {
             pages: pages.max(1),
             slots,
@@ -1645,9 +1650,10 @@ impl<B: Serve> Shell<B> {
         self.device.max_buffer()
     }
 
+    /// What the device has for this load, measured now.
     #[must_use]
-    pub fn working_set(&self) -> u64 {
-        self.device.working_set()
+    pub fn capacity(&self) -> u64 {
+        self.device.capacity()
     }
 
     pub fn bind_thread(&self) -> Result<()> {

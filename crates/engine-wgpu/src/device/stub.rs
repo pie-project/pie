@@ -30,11 +30,11 @@ pub struct Handed {
 }
 
 impl Context {
-    pub fn bind(_boot: &DeviceBoot, _share: f64) -> Result<Context> {
+    pub fn bind(_boot: &DeviceBoot, _budget: Option<u64>) -> Result<Context> {
         Err(Fault::Deviceless)
     }
 
-    pub fn adopt(_boot: &DeviceBoot, _share: f64, handed: Handed) -> Result<Context> {
+    pub fn adopt(_boot: &DeviceBoot, _budget: Option<u64>, handed: Handed) -> Result<Context> {
         match handed.never {}
     }
 
@@ -49,7 +49,12 @@ impl Context {
     }
 
     #[must_use]
-    pub fn working_set(&self) -> u64 {
+    pub fn capacity(&self) -> u64 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn outside(&self) -> u64 {
         match self.never {}
     }
 

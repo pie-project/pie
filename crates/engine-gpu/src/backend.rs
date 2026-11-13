@@ -103,11 +103,21 @@ pub trait Context<B: Backend> {
 
     fn cores(&self) -> u32;
 
-    /// The bytes the device lends this load.
-    fn working_set(&self) -> u64;
+    /// What the device has for this load, measured now: what it holds for
+    /// the load (every reservation and what the driver holds beside them)
+    /// and what it has free, capped by the operator's `budget_device`.
+    fn capacity(&self) -> u64;
 
-    /// The bytes of the working set no reservation holds.
-    fn left(&self) -> u64;
+    /// What the driver holds for this process beside every reservation, as
+    /// measured now; zero where the device does not say.
+    fn outside(&self) -> u64;
+
+    /// The bytes of the capacity neither a reservation nor the driver holds.
+    fn left(&self) -> u64 {
+        self.capacity()
+            .saturating_sub(self.books().device())
+            .saturating_sub(self.outside())
+    }
 
     /// The device's books: every reservation under its owner.
     fn books(&self) -> &Books;

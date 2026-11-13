@@ -717,6 +717,8 @@ impl ModelConfig {
             // Unless told to stream, the weight cache holds every atom for
             // the load's life.
             weights_held: self.weight_streaming != runtime::store::weights::WeightStreaming::On,
+            // `[engine.memory] budget_device` is not read here yet.
+            budget_device: None,
         }
     }
 

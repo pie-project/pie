@@ -29,7 +29,7 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn bind(_boot: &DeviceBoot, _share: f64) -> Result<Context> {
+    pub fn bind(_boot: &DeviceBoot, _budget: Option<u64>) -> Result<Context> {
         Err(Fault::Deviceless)
     }
 
@@ -39,7 +39,12 @@ impl Context {
     }
 
     #[must_use]
-    pub fn working_set(&self) -> u64 {
+    pub fn capacity(&self) -> u64 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn outside(&self) -> u64 {
         match self.never {}
     }
 

@@ -78,6 +78,16 @@ pub mod owners {
     pub const TUNING: Owner = Owner::fire("tuning");
 }
 
+/// The device bytes every device's books in this process hold: a driver
+/// reports its usage a process, not a device handle.
+static PROCESS: AtomicU64 = AtomicU64::new(0);
+
+/// What every reservation of this process holds on its devices.
+#[must_use]
+pub fn process_reserved() -> u64 {
+    PROCESS.load(Ordering::Relaxed)
+}
+
 /// One device's books.
 #[derive(Debug)]
 pub struct Books {
@@ -110,6 +120,7 @@ impl Books {
     /// The device gave `bytes` to `owner`.
     pub fn take(&self, owner: Owner, bytes: u64) {
         self.device.fetch_add(bytes, Ordering::Relaxed);
+        PROCESS.fetch_add(bytes, Ordering::Relaxed);
         self.with(|ledger| {
             let held = ledger.of(owner.class, owner.name);
             ledger.enter(owner.class, owner.name, held.saturating_add(bytes));
@@ -119,6 +130,7 @@ impl Books {
     /// `owner` gave `bytes` back to the device.
     pub fn give(&self, owner: Owner, bytes: u64) {
         self.device.fetch_sub(bytes, Ordering::Relaxed);
+        PROCESS.fetch_sub(bytes, Ordering::Relaxed);
         self.with(|ledger| {
             let held = ledger.of(owner.class, owner.name);
             ledger.enter(owner.class, owner.name, held.saturating_sub(bytes));

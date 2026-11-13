@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use units::ByteSize;
 
-use super::removed::{MaxStateSlots, Removed};
+use super::removed::{MaxStateSlots, Removed, WgpuDeviceMemory};
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -99,7 +99,8 @@ pub struct WgpuEngineOptions {
     #[serde(skip_serializing)]
     pub max_state_slots: Removed<MaxStateSlots>,
     pub pipeline_cache: Option<PathBuf>,
-    pub device_memory: Option<ByteSize>,
+    #[serde(skip_serializing)]
+    pub device_memory: Removed<WgpuDeviceMemory>,
 }
 
 impl Default for WgpuEngineOptions {
@@ -113,7 +114,7 @@ impl Default for WgpuEngineOptions {
             max_model_len: None,
             max_state_slots: Removed::default(),
             pipeline_cache: None,
-            device_memory: None,
+            device_memory: Removed::default(),
         }
     }
 }
@@ -130,13 +131,6 @@ impl WgpuEngineOptions {
             self.power_preference
         );
         limits_are_positive(self.max_forward_tokens, self.max_forward_requests)?;
-        if let Some(memory) = self.device_memory {
-            ensure!(
-                memory.as_bytes() > 0,
-                "engine.device_memory must be > 0; \
-                 omit it to read the adapter's own answer"
-            );
-        }
         Ok(())
     }
 }

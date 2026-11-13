@@ -185,6 +185,8 @@ pub(crate) struct Core {
     pub(crate) pinned: Option<u32>,
     pub(crate) cores: Option<u32>,
     pub(crate) device_local: u64,
+    /// The largest device-local heap, which device reservations take.
+    heap: usize,
     pub(crate) vendor_id: u32,
     pub(crate) discrete: bool,
     pub(crate) api_version: u32,
@@ -206,12 +208,12 @@ pub struct Enabled {
 }
 
 impl Core {
-    /// What the largest device-local heap holds now, as the driver's memory
-    /// budget reports it: the heap less what the budget leaves free. A
-    /// driver without one reports nothing held.
-    fn held(&self) -> u64 {
+    /// The largest device-local heap's budget for this process and what
+    /// this process holds of it, as the driver's memory budget reports them
+    /// now; `None` without `VK_EXT_memory_budget`.
+    fn budget(&self) -> Option<(u64, u64)> {
         if !self.features.memory_budget {
-            return 0;
+            return None;
         }
         let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
         let mut props = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
@@ -222,15 +224,27 @@ impl Core {
             self.instance
                 .get_physical_device_memory_properties2(self.physical, &mut props);
         }
-        self.memory.memory_heaps[..self.memory.memory_heap_count as usize]
-            .iter()
-            .enumerate()
-            .filter(|(_, heap)| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
-            .max_by_key(|(_, heap)| heap.size)
-            .map_or(0, |(i, heap)| {
-                heap.size
-                    .saturating_sub(budget.heap_budget[i].saturating_sub(budget.heap_usage[i]))
-            })
+        Some((budget.heap_budget[self.heap], budget.heap_usage[self.heap]))
+    }
+
+    /// The device-local bytes free to this process now: the heap's budget
+    /// less its usage where the driver reports them, else the heap less
+    /// every reservation (blind to other processes).
+    pub(crate) fn free(&self) -> u64 {
+        match self.budget() {
+            Some((budget, usage)) => budget.saturating_sub(usage),
+            None => self
+                .device_local
+                .saturating_sub(engine_gpu::books::process_reserved()),
+        }
+    }
+
+    /// What the driver holds for this process in the heap beside every
+    /// reservation of this process: its usage less them, where it reports it.
+    pub(crate) fn outside(&self) -> u64 {
+        self.budget().map_or(0, |(_, usage)| {
+            usage.saturating_sub(engine_gpu::books::process_reserved())
+        })
     }
 
     pub(crate) fn fault(&self, call: &'static str, code: vk::Result) -> Fault {
@@ -412,9 +426,8 @@ unsafe extern "system" fn on_validation(
 
 pub struct Context {
     pub(crate) core: Arc<Core>,
-    /// The load's share of the device-local heap, less what other
-    /// processes held of it when the device was bound.
-    working_set: u64,
+    /// The operator's cap on what the load takes, all of it together.
+    budget: Option<u64>,
     max_buffer: u64,
     pub(crate) dummy: Slab,
     pipeline_cache: Arc<PipelineCache>,
@@ -555,7 +568,7 @@ impl std::fmt::Debug for Context {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Context")
             .field("name", &self.core.name)
-            .field("working_set", &self.working_set)
+            .field("budget", &self.budget)
             .finish()
     }
 }
@@ -579,9 +592,9 @@ pub(crate) fn buffer_ceiling(storage_range: u32, allocation: u64, buffer: Option
 }
 
 impl Context {
-    /// Binds the device `boot` names for a load that may take `share` of
-    /// its device-local heap.
-    pub fn bind(boot: &DeviceBoot, share: f64) -> Result<Context> {
+    /// Binds the device `boot` names for a load that takes at most
+    /// `budget` bytes of it where stated, else what it has.
+    pub fn bind(boot: &DeviceBoot, budget: Option<u64>) -> Result<Context> {
         let entry = entry().map_err(|e| Fault::NoDevice {
             detail: format!("no Vulkan loader: {e}"),
         })?;
@@ -594,7 +607,7 @@ impl Context {
                 .iter()
                 .any(|l| l.layer_name_as_c_str().is_ok_and(|s| s == validation));
         let (instance, props2) = shared_instance(&entry, validated)?;
-        Self::finish(entry, instance, boot, share, props2)
+        Self::finish(entry, instance, boot, budget, props2)
     }
 
     #[allow(
@@ -606,7 +619,7 @@ impl Context {
         entry: ash::Entry,
         instance: ash::Instance,
         boot: &DeviceBoot,
-        share: f64,
+        budget: Option<u64>,
         _props2: bool,
     ) -> Result<Context> {
         macro_rules! bail {
@@ -894,12 +907,13 @@ impl Context {
         };
         // SAFETY: `physical` was enumerated from the live `instance`.
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
-        let device_local: u64 = memory.memory_heaps[..memory.memory_heap_count as usize]
+        let (heap, device_local) = memory.memory_heaps[..memory.memory_heap_count as usize]
             .iter()
-            .filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
-            .map(|h| h.size)
-            .max()
-            .unwrap_or(0);
+            .enumerate()
+            .filter(|(_, h)| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .map(|(at, h)| (at, h.size))
+            .max_by_key(|&(_, size)| size)
+            .unwrap_or((0, 0));
         let core = Arc::new(Core {
             _entry: entry,
             instance,
@@ -923,15 +937,13 @@ impl Context {
             pinned,
             cores,
             device_local,
+            heap,
             vendor_id: props.vendor_id,
             discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
             api_version: props.api_version,
             features: enabled,
         });
 
-        // Taken before this load allocates, so what the heap holds then is
-        // other processes'.
-        let working_set = ((device_local as f64 * share) as u64).saturating_sub(core.held());
         let dummy = Raw::new(
             &core,
             DUMMY_BYTES,
@@ -941,7 +953,7 @@ impl Context {
         let pipeline_cache = Arc::new(PipelineCache::open(&core, boot.pipeline_cache.clone())?);
         Ok(Context {
             core,
-            working_set,
+            budget,
             max_buffer,
             dummy,
             pipeline_cache,
@@ -958,9 +970,20 @@ impl Context {
         &self.core.name
     }
 
+    /// What the device has for this load, measured now: every reservation,
+    /// what the driver holds beside them and what is free, capped by the
+    /// operator's budget.
     #[must_use]
-    pub fn working_set(&self) -> u64 {
-        self.working_set
+    pub fn capacity(&self) -> u64 {
+        let core = &self.core;
+        let measured = core.books.device() + core.outside() + core.free();
+        self.budget.map_or(measured, |budget| measured.min(budget))
+    }
+
+    /// What the driver holds for this process beside every reservation.
+    #[must_use]
+    pub fn outside(&self) -> u64 {
+        self.core.outside()
     }
 
     #[must_use]
@@ -1031,10 +1054,13 @@ impl Context {
         }
     }
 
-    /// What the working set has left now, less this load's allocations.
+    /// What the capacity has left now, past every reservation and the
+    /// driver's own.
     #[must_use]
     pub fn left(&self) -> u64 {
-        self.working_set.saturating_sub(self.core.books.device())
+        self.capacity()
+            .saturating_sub(self.core.books.device())
+            .saturating_sub(self.core.outside())
     }
 
     /// The device's books: every reservation under its owner.

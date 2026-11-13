@@ -98,6 +98,12 @@ pub struct Residency {
     /// them and choose its kernels once, at that residency.
     #[serde(default)]
     pub weights_held: bool,
+    /// The most device bytes the load may take, all its classes and what
+    /// the driver holds for it together (`[engine.memory] budget_device`):
+    /// for a device shared with another process. `None`: what the device
+    /// has, measured.
+    #[serde(default)]
+    pub budget_device: Option<u64>,
 }
 
 fn default_share() -> f64 {
@@ -132,6 +138,7 @@ impl Residency {
             disk_kv_persistent: false,
             kv_export: false,
             weights_held: false,
+            budget_device: None,
         }
     }
 }

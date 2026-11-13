@@ -108,6 +108,8 @@ removed_keys! {
         "the engine's own weight tier it deferred is gone: dense weights always live in device memory, and the weight cache fills its own host copy";
     MaxStateSlots = "max_state_slots":
         "state now shares the device budget with kv pages";
+    WgpuDeviceMemory = "device_memory":
+        "the engine measures what the device has; state `[engine.memory] budget_device` to cap what a load takes";
 }
 
 /// The refusal for `key` (dotted or bare) if it names a removed key.

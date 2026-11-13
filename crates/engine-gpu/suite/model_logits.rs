@@ -281,16 +281,26 @@ pub fn load_with(
         ..DeviceBoot::default()
     };
     // The device is shared: a driver that fails to come up is asked again
-    // before the test is skipped.
+    // before the test is skipped, and a load takes at most a quarter of what
+    // the device has, as tests load at once.
     let mut tries = 0;
-    while let Err(why) = Context::bind(&device, 0.25) {
-        tries += 1;
-        if tries == 5 {
-            eprintln!("skipping: no {} device ({why})", backend::NAME);
-            return None;
+    let quarter = loop {
+        match Context::bind(&device, None) {
+            Ok(bound) => break engine_gpu::backend::Context::capacity(&bound) / 4,
+            Err(why) => {
+                tries += 1;
+                if tries == 5 {
+                    eprintln!("skipping: no {} device ({why})", backend::NAME);
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
         }
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
+    };
+    let residency = engine::load::Residency {
+        budget_device: residency.budget_device.or(Some(quarter)),
+        ..residency
+    };
     Some(
         Shell::load(Boot {
             trace: fixture.trace.clone(),
