@@ -67,6 +67,18 @@ unsafe impl Send for Sparse {}
 // `Mutex`-guarded ticks.
 unsafe impl Sync for Sparse {}
 
+/// Lets go of every allocation the residency set holds. The set is
+/// attached to the shell's frame queue, which keeps it, and the
+/// allocations in it, past the shell: without this a dropped shell's
+/// weight-cache tables stay allocated (`currentAllocatedSize`), and the
+/// next load in the process measures them as held outside it.
+impl Drop for Sparse {
+    fn drop(&mut self) {
+        self.residency.removeAllAllocations();
+        self.residency.commit();
+    }
+}
+
 impl std::fmt::Debug for Sparse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let ticks = self.ticks();
