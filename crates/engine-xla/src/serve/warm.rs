@@ -253,15 +253,22 @@ impl Shell {
         self.deferred = Some(Vec::new());
         let mut fired = 0;
         let mut failed = None;
-        for shape in &shapes {
-            match self.warm_fire(shape) {
-                Ok(()) => fired += 1,
-                Err(fault) => {
-                    failed = Some(fault);
-                    break;
+        // A load streaming experts serves each shape two ways: reading the
+        // experts where they lie, and staging the ones in no slot first.
+        let passes = if self.streams_experts() { 2 } else { 1 };
+        'passes: for pass in 0..passes {
+            self.stage_all = pass == 1;
+            for shape in &shapes {
+                match self.warm_fire(shape) {
+                    Ok(()) => fired += 1,
+                    Err(fault) => {
+                        failed = Some(fault);
+                        break 'passes;
+                    }
                 }
             }
         }
+        self.stage_all = false;
         let deferred = self.deferred.take().unwrap_or_default();
         if let Some(fault) = failed {
             return Err(fault);

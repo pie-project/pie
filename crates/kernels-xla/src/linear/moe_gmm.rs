@@ -387,7 +387,7 @@ impl Gmm {
             outs: vec![out],
             vmem_limit: Some(limit as u64),
             scratch: vec![
-                MTy::Ref(vec![2, rb, cb], self.w, Space::Vmem),
+                self.slots_ty(rb, cb, self.w),
                 MTy::Sem(vec![2]),
                 MTy::Ref(vec![2, j * tm, wo], out_elem, Space::Vmem),
                 MTy::Sem(vec![2]),
@@ -408,8 +408,7 @@ impl Gmm {
             // The copies of expert `ex`'s weights into slot `slot`.
             let wcopy = |b: &mut Body, ex: V, slot: V| -> Built<Vec<(V, V, V)>> {
                 let z = b.i32(0);
-                let dst = b.ref_slice(wbuf, &[slot, z, z], &[1, rb, cb])?;
-                let dst = b.ref_squeeze(dst)?;
+                let dst = self.slot_ref(b, wbuf, slot, rb, cb)?;
                 let sem = b.ref_slice(wsems, &[slot], &[1])?;
                 let sem = b.ref_squeeze(sem)?;
                 if let Some(table) = table {
@@ -481,7 +480,8 @@ impl Gmm {
                 })?;
                 b.when(first, |b| {
                     let z = b.i32(0);
-                    for (src, dst, sem) in wcopy(b, z, wslot)? {
+                    let waits = wcopy(b, z, wslot)?;
+                    for (src, dst, sem) in waits {
                         b.dma_wait(sem, src, dst)?;
                     }
                     let nx = b.load(pre[3], &[si])?;
@@ -502,9 +502,7 @@ impl Gmm {
                 let back = b.subi(s, two)?;
                 let had = b.cmpi(ICmp::Sge, back, z)?;
                 b.when(had, |b| owait(b, back))?;
-                let z = b.i32(0);
-                let held = b.ref_slice(wbuf, &[wslot, z, z], &[1, rb, cb])?;
-                let held = b.ref_squeeze(held)?;
+                let held = self.slot_ref(b, wbuf, wslot, rb, cb)?;
                 let cnt = b.load(pre[5], &[si])?;
                 for c in 1..=j {
                     let cc = b.i32(c);
@@ -520,9 +518,7 @@ impl Gmm {
                                 // weight in f32, rounded once.
                                 let h = n / 2;
                                 let half = |b: &mut Body, at: i64| -> Built<V> {
-                                    let zi = b.index(0);
-                                    let ri = b.index(at);
-                                    let w = b.vload(held, &[ri, zi], &[h, k])?;
+                                    let w = self.load_rows(b, held, at, h)?;
                                     let w = b.convert_f(w, Elem::Bf16)?;
                                     let acc = b.splat_f(&[c * tm, h], Elem::F32, 0.0)?;
                                     let y = b.matmul(x, w, acc, true)?;
@@ -539,7 +535,11 @@ impl Gmm {
                                 b.convert_f(a, out_elem)?
                             }
                             None => {
-                                let w = b.vload_all(held)?;
+                                let w = if self.pooled.is_some() {
+                    self.load_rows(b, held, 0, n)?
+                } else {
+                    b.vload_all(held)?
+                };
                                 let w = b.convert_f(w, Elem::Bf16)?;
                                 let acc = b.splat_f(&[c * tm, n], Elem::F32, 0.0)?;
                                 let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;
@@ -672,9 +672,9 @@ impl Gmm {
             outs: vec![whole([rows, dnn], Elem::Bf16)],
             vmem_limit: Some(limit as u64),
             scratch: vec![
-                MTy::Ref(vec![2, n, k], Elem::Bf16, Space::Vmem),
+                self.slots_ty(n, k, Elem::Bf16),
                 MTy::Sem(vec![2]),
-                MTy::Ref(vec![2, drb, dcb], Elem::Bf16, Space::Vmem),
+                dn.slots_ty(drb, dcb, Elem::Bf16),
                 MTy::Sem(vec![2]),
                 MTy::Ref(vec![2, j * tm, dnn], Elem::Bf16, Space::Vmem),
                 MTy::Sem(vec![2]),
@@ -701,12 +701,10 @@ impl Gmm {
             // The copies of expert `ex`'s two blocks into slot `slot`.
             let wcopy = |b: &mut Body, ex: V, slot: V| -> Built<Vec<(V, V, V)>> {
                 let z = b.i32(0);
-                let dst = b.ref_slice(ubuf, &[slot, z, z], &[1, n, k])?;
-                let dst = b.ref_squeeze(dst)?;
+                let dst = self.slot_ref(b, ubuf, slot, n, k)?;
                 let sem = b.ref_slice(usems, &[slot], &[1])?;
                 let sem = b.ref_squeeze(sem)?;
-                let ddst = b.ref_slice(dbuf, &[slot, z, z], &[1, drb, dcb])?;
-                let ddst = b.ref_squeeze(ddst)?;
+                let ddst = dn.slot_ref(b, dbuf, slot, drb, dcb)?;
                 let dsem = b.ref_slice(dsems, &[slot], &[1])?;
                 let dsem = b.ref_squeeze(dsem)?;
                 if let Some((ut, dt)) = tables {
@@ -780,7 +778,8 @@ impl Gmm {
                 })?;
                 b.when(first, |b| {
                     let z = b.i32(0);
-                    for (src, dst, sem) in wcopy(b, z, wslot)? {
+                    let waits = wcopy(b, z, wslot)?;
+                    for (src, dst, sem) in waits {
                         b.dma_wait(sem, src, dst)?;
                     }
                     let nx = b.load(pre[3], &[si])?;
@@ -799,11 +798,8 @@ impl Gmm {
                 let back = b.subi(s, two)?;
                 let had = b.cmpi(ICmp::Sge, back, z)?;
                 b.when(had, |b| owait(b, back))?;
-                let z = b.i32(0);
-                let uheld = b.ref_slice(ubuf, &[wslot, z, z], &[1, n, k])?;
-                let uheld = b.ref_squeeze(uheld)?;
-                let dheld = b.ref_slice(dbuf, &[wslot, z, z], &[1, drb, dcb])?;
-                let dheld = b.ref_squeeze(dheld)?;
+                let uheld = self.slot_ref(b, ubuf, wslot, n, k)?;
+                let dheld = dn.slot_ref(b, dbuf, wslot, drb, dcb)?;
                 let cnt = b.load(pre[5], &[si])?;
                 for c in 1..=j {
                     let cc = b.i32(c);
@@ -815,9 +811,7 @@ impl Gmm {
                         // land, the GLU and the weight in f32, rounded once:
                         // the rows the gate-up kernel lands.
                         let halfdot = |b: &mut Body, at: i64| -> Built<V> {
-                            let zi = b.index(0);
-                            let ri = b.index(at);
-                            let w = b.vload(uheld, &[ri, zi], &[half, k])?;
+                            let w = self.load_rows(b, uheld, at, half)?;
                             let acc = b.splat_f(&[c * tm, half], Elem::F32, 0.0)?;
                             let y = b.matmul(x, w, acc, true)?;
                             let y = b.convert_f(y, Elem::Bf16)?;
@@ -832,7 +826,11 @@ impl Gmm {
                         let a = b.mulf(a, wv)?;
                         let hrows = b.convert_f(a, Elem::Bf16)?;
                         // The down product of those rows, as the down kernel's.
-                        let wd = b.vload_all(dheld)?;
+                        let wd = if dn.pooled.is_some() {
+                            dn.load_rows(b, dheld, 0, dnn)?
+                        } else {
+                            b.vload_all(dheld)?
+                        };
                         let acc = b.splat_f(&[c * tm, dnn], Elem::F32, 0.0)?;
                         let y = b.matmul(hrows, wd, acc, dorient == Orient::NMajor)?;
                         let y = b.convert_f(y, Elem::Bf16)?;
@@ -919,19 +917,59 @@ impl Gmm {
         let off = b.i32(p.offset);
         let base = b.addi(base, off)?;
         let two = b.i32(2);
-        let base = b.muli(base, two)?;
+        let at = b.muli(base, two)?;
+        let at = b.assume_multiple(at, 16)?;
         let z = b.i32(0);
-        let mut out = Vec::with_capacity((k / 128) as usize);
-        for j in 0..k / 128 {
-            let step = b.i32(j * n);
-            let at = b.addi(base, step)?;
-            let at = b.assume_multiple(at, 16)?;
-            let src = b.ref_slice(rows, &[at, z], &[n, 128])?;
-            let col = b.i32(j * 128);
-            let to = b.ref_slice(dst, &[z, col], &[n, 128])?;
-            out.push((src, to, sem));
+        // The panels lie back to back: one copy of `[K / 128, N, 128]`.
+        let src = b.ref_slice(rows, &[at, z], &[k / 128 * n, 128])?;
+        let src = b.ref_reshape(src, &[k / 128, n, 128])?;
+        Ok(vec![(src, dst, sem)])
+    }
+
+    /// A weight slot's scratch, two slots: `[2, rb, cb]`, or a pooled
+    /// bank's panels as they land, `[2, K / 128, N, 128]`.
+    fn slots_ty(&self, rb: i64, cb: i64, elem: Elem) -> MTy {
+        if self.pooled.is_some() {
+            MTy::Ref(vec![2, self.k / 128, self.n, 128], Elem::Bf16, Space::Vmem)
+        } else {
+            MTy::Ref(vec![2, rb, cb], elem, Space::Vmem)
         }
-        Ok(out)
+    }
+
+    /// Slot `slot` of a weight scratch ([`Gmm::slots_ty`]).
+    fn slot_ref(&self, b: &mut Body, buf: V, slot: V, rb: i64, cb: i64) -> Built<V> {
+        let z = b.i32(0);
+        let r = if self.pooled.is_some() {
+            b.ref_slice(buf, &[slot, z, z, z], &[1, self.k / 128, self.n, 128])?
+        } else {
+            b.ref_slice(buf, &[slot, z, z], &[1, rb, cb])?
+        };
+        b.ref_squeeze(r)
+    }
+
+    /// Rows `[at, at + rows)` of the expert a slot holds (its slot ref),
+    /// `[rows, K]`: a pooled bank's panels side by side.
+    fn load_rows(&self, b: &mut Body, held: V, at: i64, rows: i64) -> Built<V> {
+        let zi = b.index(0);
+        let ri = b.index(at);
+        if self.pooled.is_none() {
+            return b.vload(held, &[ri, zi], &[rows, self.k]);
+        }
+        let mut parts = Vec::with_capacity((self.k / 128) as usize);
+        for j in 0..self.k / 128 {
+            let ji = b.index(j);
+            let v = b.vload(held, &[ji, ri, zi], &[1, rows, 128])?;
+            parts.push(b.op(
+                "vector.shape_cast",
+                &[v],
+                "",
+                &[MTy::Vector(vec![rows, 128], Elem::Bf16)],
+            )[0]);
+        }
+        if parts.len() == 1 {
+            return Ok(parts[0]);
+        }
+        b.concat(&parts, 1)
     }
 
     fn kernel_prefetching(&self) -> Built<Compiled> {
@@ -1021,7 +1059,7 @@ impl Gmm {
             outs: vec![out],
             vmem_limit: Some(limit as u64),
             scratch: vec![
-                MTy::Ref(vec![2, rb, cb], self.w, Space::Vmem),
+                self.slots_ty(rb, cb, self.w),
                 MTy::Sem(vec![2]),
             ],
         };
@@ -1034,8 +1072,7 @@ impl Gmm {
             // The copies of expert `ex`'s weights into slot `s`.
             let copy = |b: &mut Body, ex: V, s: V| -> Built<Vec<(V, V, V)>> {
                 let z = b.i32(0);
-                let dst = b.ref_slice(wbuf, &[s, z, z], &[1, rb, cb])?;
-                let dst = b.ref_squeeze(dst)?;
+                let dst = self.slot_ref(b, wbuf, s, rb, cb)?;
                 let sem = b.ref_slice(sems, &[s], &[1])?;
                 let sem = b.ref_squeeze(sem)?;
                 if let Some(table) = table {
@@ -1074,7 +1111,8 @@ impl Gmm {
                 })?;
                 b.when(first, |b| {
                     let z = b.i32(0);
-                    for (src, dst, sem) in copy(b, z, slot)? {
+                    let waits = copy(b, z, slot)?;
+                    for (src, dst, sem) in waits {
                         b.dma_wait(sem, src, dst)?;
                     }
                     let nx = b.load(pre[3], &[ti])?;
@@ -1088,11 +1126,13 @@ impl Gmm {
                         Ok(())
                     })
                 })?;
-                let z = b.i32(0);
-                let held = b.ref_slice(wbuf, &[slot, z, z], &[1, rb, cb])?;
-                let held = b.ref_squeeze(held)?;
+                let held = self.slot_ref(b, wbuf, slot, rb, cb)?;
                 let x = b.vload_all(blk.ins[0])?;
-                let w = b.vload_all(held)?;
+                let w = if self.pooled.is_some() {
+                    self.load_rows(b, held, 0, n)?
+                } else {
+                    b.vload_all(held)?
+                };
                 let w = b.convert_f(w, Elem::Bf16)?;
                 let acc = b.splat_f(&[tm, cols], Elem::F32, 0.0)?;
                 let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;

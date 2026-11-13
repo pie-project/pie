@@ -121,12 +121,32 @@ impl Lower<'_, '_> {
             let s = f.dims(staging.val).iter().product::<i64>();
             let staging = f.reshape(staging.val, &[s])?;
             let rows = i64::from(bank.plane_rows);
-            let (next, table) = f.stage_misses(pool, table, routes, host, rows, staging)?;
+            let (next, table) = if std::env::var_os("PIE_XLA_NOSTAGE").is_some() {
+                let _ = (host, rows, staging);
+                (pool, table)
+            } else {
+                f.stage_misses(pool, table, routes, host, rows, staging)?
+            };
             pool = next;
             tables.push((param, table));
         }
         self.cx.write(first.pool, pool)?;
         Ok(tables)
+    }
+
+    /// One layer's streamed banks' tables as the fire lays them (every
+    /// expert in a slot: nothing to stage).
+    pub fn tables(
+        &mut self,
+        banks: &[(usize, crate::store::streamed::Bank)],
+    ) -> Result<Vec<(usize, Val)>, Error> {
+        let mut out = Vec::with_capacity(banks.len());
+        for &(param, bank) in banks {
+            let loc = self.read(bank.loc)?;
+            let f = self.cx.func();
+            out.push((param, f.reshape(loc.val, &[i64::from(bank.experts)])?));
+        }
+        Ok(out)
     }
 
     /// A streamed bank as the dense `[experts · rows, width]` value the base

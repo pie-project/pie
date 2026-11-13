@@ -321,8 +321,20 @@ impl<'c> Run<'c> {
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, t)| t.clone());
+        let stages = self.streamed.as_ref().is_some_and(|f| f.stages);
         let tables = match known {
             Some(t) => t,
+            None if !stages => {
+                // Every expert where its table says: no staging.
+                let group = self
+                    .streamed
+                    .as_ref()
+                    .map(|f| f.group(bank.group))
+                    .unwrap_or_default();
+                let t = l.tables(&group)?;
+                self.staged.borrow_mut().push((key, t.clone()));
+                t
+            }
             None => {
                 let group = self
                     .streamed

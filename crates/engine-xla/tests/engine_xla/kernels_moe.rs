@@ -1494,3 +1494,65 @@ fn the_routed_mlp_over_pooled_experts_lands_the_banks_bits() {
         }
     }
 }
+
+/// `PIE_XLA_GMM_TIME=1`: a routed select's device time over a dense bank
+/// and over the same experts in the pool, at the MoE mini's widths.
+#[test]
+fn time_a_pooled_select() {
+    if std::env::var("PIE_XLA_GMM_TIME").is_err() {
+        return;
+    }
+    for (e, n, k, t, tk) in [(16usize, 1536usize, 2048usize, 64usize, 8usize), (16, 2048, 768, 64, 8), (128, 1536, 2048, 64, 8)] {
+        let w: Vec<f32> = data(e * n * k, 91).iter().map(|v| round_bf16(v * 0.25)).collect();
+        let rows = k / 128 * (n / 2);
+        let table: Vec<i32> = (0..e).map(|x| (8 + x * rows) as i32).collect();
+        let pool_rows = 8 + e * rows + 8;
+        let mut pool = vec![0u8; pool_rows * 512];
+        place_panels(&mut pool, &w, e, n, k, &table, 0);
+        let words: Vec<u32> = pool.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect();
+        let p = t * tk;
+        let x = data(t * k, 92);
+        let routes: Vec<i32> = (0..p).map(|i| (hash(i, 93) % e as u32) as i32).collect();
+        let mut times = Vec::new();
+        for pooled in [false, true] {
+            let mut b = Bench::new();
+            let xt = b.bf16(t as u32, k as u32, &x);
+            let rt = b.i32(t as u32, tk as u32, &routes);
+            let d = b.bf16((e * n) as u32, k as u32, &w);
+            let pt = b.u32(pool_rows as u32, 128, &words);
+            let tt = b.i32(1, e as u32, &table);
+            let y = b.bf16(p as u32, n as u32, &vec![PREV; p * n]);
+            let s = b
+                .time(50, |ctx| {
+                    engine_xla::lower::lower(ctx, |l| {
+                        let x_v = l.read(xt)?;
+                        let routes_v = l.read(rt)?;
+                        let y_v = l.read(y)?;
+                        let bank_v = if pooled {
+                            let pool_v = l.read(pt)?.val;
+                            let tv = l.read(tt)?.val;
+                            let tv = l.f().reshape(tv, &[e as i64])?;
+                            let v = l.f().bank_view(kernels_xla::hlo::BankAt {
+                                pool: pool_v,
+                                table: tv,
+                                offset: 0,
+                                experts: e as i64,
+                                n: n as i64,
+                                k: k as i64,
+                            })?;
+                            kernels_xla::tensor::Operand { val: v, rows: (e * n) as u32, width: k as u32, dtype: Dtype::Bf16 }
+                        } else {
+                            l.read(d)?
+                        };
+                        let tuning = l.tuning();
+                        let v = moe::matmul_select(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
+                        l.land(y, v)
+                    })
+                })
+                .unwrap_or_else(|err| panic!("{err}"));
+            let Some(s) = s else { return };
+            times.push(s * 1e6);
+        }
+        eprintln!("TIME e{e} n{n} k{k} p{p}: dense {:.1} us, pooled {:.1} us ({:+.1}%)", times[0], times[1], 100.0 * (times[1] / times[0] - 1.0));
+    }
+}
