@@ -418,12 +418,6 @@ impl Ctx {
         }
     }
 
-    /// [`Ctx::tickets`] taken now, at the size every launch draws, so no
-    /// capture has to grow them: a load arms bodies before any eager fire.
-    pub fn warm_tickets(&self) -> Result<(), Error> {
-        self.tickets("pie.tickets", TICKETS).map(|_| ())
-    }
-
     /// `count` i32 tickets, zero when first handed out, one slab a stream:
     /// a launch that draws them puts every one back to zero before it ends
     /// (its last block), so the next launch on the stream finds them zero.
