@@ -3473,6 +3473,7 @@ impl<B: Serve> Shell<B> {
                 &p.windows,
                 &place,
                 &self.scratch,
+                self.weights.hashes(),
                 &self.tuning,
                 self.tier,
                 self.weights.gathered(),

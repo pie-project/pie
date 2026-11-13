@@ -102,6 +102,86 @@ pub struct Weights<B: Backend> {
     /// The host bytes of the tables and routed banks the weight cache
     /// streams (the runtime's to place, not this load's own tier).
     cached_bytes: u64,
+
+    hashes: NgramHashes<B>,
+}
+
+/// The hash constants of every n-gram id gather (`gather.ngram_ids`), one
+/// run of u64 a distinct key, written at load: model bytes, kept apart
+/// from any fire's buffer, which a re-carve may lay anew.
+#[derive(Debug)]
+pub struct NgramHashes<B: Backend> {
+    plane: Option<B::Buffer>,
+    held: Vec<(Box<[u64]>, u64)>,
+}
+
+impl<B: Backend> NgramHashes<B> {
+    pub fn write(device: &B::Context, trace: &Trace) -> Result<NgramHashes<B>> {
+        use kernels_slang::gather::ngram;
+        use poem_ir::{Gather, Operation};
+        let mut held: Vec<(Box<[u64]>, u64)> = Vec::new();
+        let mut at = 0u64;
+        for node in &trace.nodes {
+            let Operation::Gather(
+                Gather::NgramIds {
+                    mults,
+                    primes,
+                    offsets,
+                    ..
+                }
+                | Gather::NgramIdsChunked {
+                    mults,
+                    primes,
+                    offsets,
+                    ..
+                },
+            ) = &node.op
+            else {
+                continue;
+            };
+            let key: Box<[u64]> = ngram::hash_constants(mults, primes, offsets).into();
+            if key.is_empty() || held.iter().any(|(seen, _)| *seen == key) {
+                continue;
+            }
+            let start = at.next_multiple_of(ALIGN);
+            at = start + 8 * key.len() as u64;
+            held.push((key, start));
+        }
+        if held.is_empty() {
+            return Ok(NgramHashes { plane: None, held });
+        }
+        let mut plane = B::Buffer::zeroed(device, at, crate::books::owners::NGRAM_HASHES)?;
+        for (key, start) in &held {
+            let bytes: Vec<u8> = key.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            plane.write(*start, &bytes)?;
+        }
+        Ok(NgramHashes {
+            plane: Some(plane),
+            held,
+        })
+    }
+
+    /// The constants of the gather stating `mults`, `primes`, `offsets`.
+    pub fn bind(
+        &self,
+        handles: &Handles<B>,
+        mults: &[u64],
+        primes: &[u64],
+        offsets: &[u64],
+    ) -> Option<Result<Tensor>> {
+        let want = kernels_slang::gather::ngram::hash_constants(mults, primes, offsets);
+        let (key, start) = self.held.iter().find(|(key, _)| **key == *want)?;
+        let plane = self.plane.as_ref()?;
+        let bytes = 8 * key.len() as u64;
+        Some(handles.bind(plane, *start, bytes).map(|buf| {
+            Tensor::new(
+                buf,
+                1,
+                u32::try_from(key.len()).unwrap_or(u32::MAX),
+                Dtype::U64,
+            )
+        }))
+    }
 }
 
 impl<B: Backend> Weights<B> {
@@ -299,7 +379,13 @@ impl<B: Backend> Weights<B> {
             banks: banks(trace, &places),
             decoded: Vec::new(),
             cached_bytes: streamed.iter().map(|&at| reserved[at]).sum(),
+            hashes: NgramHashes::write(device, trace)?,
         })
+    }
+
+    #[must_use]
+    pub fn hashes(&self) -> &NgramHashes<B> {
+        &self.hashes
     }
 
     #[must_use]

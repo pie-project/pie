@@ -1,10 +1,9 @@
 use kernels_slang::Tensor;
-use kernels_slang::gather::ngram;
 use kernels_slang::linear::moe::select::RoutedScratch;
 use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
 use poem_exec::fire::fallback;
 use poem_exec::store::arena::rect;
-use poem_ir::{Attn, Def, Dim, Dtype, Gather, Linear, Operation, Trace, Ty, ValueId};
+use poem_ir::{Attn, Def, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
 
 use crate::store::kv::Paging;
 
@@ -79,12 +78,6 @@ struct Pool {
     state_score: Room,
 }
 
-#[derive(Clone, Debug)]
-struct PleHash {
-    key: Box<[u64]>,
-    room: Room,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct Routed {
     perm: Room,
@@ -110,8 +103,6 @@ pub struct Scratch<B: Backend> {
     copy: Option<CopyRoom>,
 
     pool: Vec<Pool>,
-
-    ple: Vec<PleHash>,
 
     capacity: Vec<u32>,
 
@@ -296,38 +287,7 @@ impl<B: Backend> Scratch<B> {
             })
             .collect();
 
-        let mut ple: Vec<PleHash> = Vec::new();
-        for node in &trace.nodes {
-            let Operation::Gather(
-                Gather::NgramIds {
-                    mults,
-                    primes,
-                    offsets,
-                    ..
-                }
-                | Gather::NgramIdsChunked {
-                    mults,
-                    primes,
-                    offsets,
-                    ..
-                },
-            ) = &node.op
-            else {
-                continue;
-            };
-            let key: Box<[u64]> = ngram::hash_constants(mults, primes, offsets).into();
-            if key.is_empty() || ple.iter().any(|held| held.key == key) {
-                continue;
-            }
-            let room = Room::lay(&mut at, 1, key.len() as u64, Dtype::U64);
-            ple.push(PleHash { key, room });
-        }
-
-        let mut plane = B::Buffer::zeroed(device, at, crate::books::owners::SCRATCH)?;
-        for hashing in &ple {
-            let bytes: Vec<u8> = hashing.key.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            plane.write(hashing.room.at, &bytes)?;
-        }
+        let plane = B::Buffer::zeroed(device, at, crate::books::owners::SCRATCH)?;
 
         Ok(Scratch {
             plane,
@@ -337,7 +297,6 @@ impl<B: Backend> Scratch<B> {
             spatial,
             copy,
             pool,
-            ple,
             capacity: crate::arena::capacities(map),
             routers,
         })
@@ -455,18 +414,6 @@ impl<B: Backend> Scratch<B> {
             })
         };
         Some(mint())
-    }
-
-    pub fn ple_hash(
-        &self,
-        handles: &Handles<B>,
-        mults: &[u64],
-        primes: &[u64],
-        offsets: &[u64],
-    ) -> Option<Result<Tensor>> {
-        let want = ngram::hash_constants(mults, primes, offsets);
-        let held = self.ple.iter().find(|h| *h.key == *want)?;
-        Some(held.room.bind(handles, &self.plane))
     }
 }
 

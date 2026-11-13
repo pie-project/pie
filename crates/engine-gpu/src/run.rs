@@ -179,6 +179,8 @@ pub struct Run<'c, B: Backend> {
 
     scratch: &'c Scratch<B>,
 
+    hashes: &'c crate::weights::NgramHashes<B>,
+
     tuning: &'c B::Tuning,
 
     /// The layer whose work the frame holds unsubmitted, when the step is
@@ -209,6 +211,7 @@ impl<'c, B: Backend> Run<'c, B> {
         windows: &'c Windows,
         place: &'c At,
         scratch: &'c Scratch<B>,
+        hashes: &'c crate::weights::NgramHashes<B>,
         tuning: &'c B::Tuning,
         tier: kernels_slang::Tier,
         rows: Option<&'c crate::experts::Gathered<B>>,
@@ -237,6 +240,7 @@ impl<'c, B: Backend> Run<'c, B> {
             place,
             copy: CopyPlan::default(),
             scratch,
+            hashes,
             tuning,
             split: None,
             tier,
@@ -980,8 +984,8 @@ impl<'c, B: Backend> Run<'c, B> {
 
     pub fn ple_hash(&self, mults: &[u64], primes: &[u64], offsets: &[u64]) -> Option<Tensor> {
         Some(
-            self.scratch
-                .ple_hash(self.handles, mults, primes, offsets)?
+            self.hashes
+                .bind(self.handles, mults, primes, offsets)?
                 .unwrap_or_else(|fault| {
                     panic!("the PLE hash plane this load wrote does not mint: {fault}")
                 }),
