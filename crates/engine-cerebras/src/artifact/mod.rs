@@ -14,6 +14,7 @@
 pub mod place;
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use kernels_cerebras::artifact::Artifact;
 use kernels_cerebras::emit::host::HostLayout;
@@ -90,6 +91,9 @@ pub struct ArtifactModel {
     pub fed: Vec<u32>,
     pub launches: u64,
     pub steps: u64,
+    /// Host time by part of a launch, all launches together: (reading the
+    /// embedding row, `put`s, the `compute` call, the ring's read), ns.
+    pub host_ns: [u64; 4],
     hl: HostLayout,
     /// Every CX row's x offset in the placed hidden vector ([`HostLayout::x_offsets`]).
     x_off: Vec<usize>,
@@ -104,8 +108,54 @@ pub struct ArtifactModel {
 /// Where a token's embedding row comes from: the head's tiles (`hemb`, the head's layout:
 /// `words` a head PE), else (a tied head with no tiles) the embedding table `embed` (bf16 [V][H]).
 enum Embed {
-    Tiles { hemb: Npy, words: u32 },
-    Table(Npy),
+    Tiles { hemb: Rows, words: u32 },
+    Table(Rows),
+}
+
+/// A `.npy` the host reads a token's row from at every launch: a head's
+/// tiles hold the row as one slice a head PE (a band head's 160 on gpt-oss),
+/// so it is read through a map of the file (one `pread` a slice cost a launch
+/// ~0.36 ms there), by `pread` where the file can't be mapped.
+struct Rows {
+    npy: Npy,
+    map: Option<ztensor::Store>,
+}
+
+impl Rows {
+    fn open(npy: Npy, path: &Path) -> Rows {
+        let map = ztensor::Store::map(path, "npy")
+            .ok()
+            .filter(|m| m.bytes().is_some());
+        if let Some(m) = &map {
+            // the tiles were just placed from this file: its pages are likely
+            // cached; asking for them ahead keeps the first launches' reads off disk
+            let _ = m.prefetch(0, m.len());
+        }
+        Rows { npy, map }
+    }
+
+    /// Elements `at .. at + n` (flat C order), one a word, as [`Npy::words`].
+    fn words(&self, at: usize, n: usize, out: &mut Vec<u32>) -> R<()> {
+        let Some(bytes) = self.map.as_ref().and_then(|m| m.bytes()) else {
+            return self.npy.words(at, n, out);
+        };
+        let elem = self.npy.elem;
+        let from = self.npy.data_offset() as usize + at * elem;
+        let b = bytes
+            .get(from..from + n * elem)
+            .ok_or_else(|| format!("embedding row {at}+{n} past the file"))?;
+        if elem == 2 {
+            out.extend(
+                b.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_le_bytes(*c) as u32),
+            );
+        } else {
+            out.extend(b.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)));
+        }
+        Ok(())
+    }
 }
 
 impl ArtifactModel {
@@ -132,9 +182,12 @@ impl ArtifactModel {
             } else {
                 hl.hemb_words
             };
-            Embed::Tiles { hemb, words }
+            Embed::Tiles {
+                hemb: Rows::open(hemb, &spec.file("hemb.npy")),
+                words,
+            }
         } else {
-            Embed::Table(spec.npy("embed")?)
+            Embed::Table(Rows::open(spec.npy("embed")?, &spec.file("embed.npy")))
         };
         Ok(ArtifactModel {
             vocab: vocab.min(model.vocab as usize),
@@ -144,6 +197,7 @@ impl ArtifactModel {
             fed: Vec::new(),
             launches: 0,
             steps: 0,
+            host_ns: [0; 4],
             x_off: hl.x_offsets(),
             embed,
             eps: model.eps,
@@ -161,7 +215,10 @@ impl ArtifactModel {
             return Ok(());
         };
         let words = vec![v; (r.w * r.h) as usize];
-        self.dev.put("tin", rect(&r), 1, &words)
+        let t0 = Instant::now();
+        let r = self.dev.put("tin", rect(&r), 1, &words);
+        self.host_ns[1] += ns(t0);
+        r
     }
 
     /// Token `v`'s embedding row (bf16 bits), from the head's tiles or the table.
@@ -200,7 +257,10 @@ impl ArtifactModel {
 
     /// `v`'s embedding into unit 0's CX column (the next pass's x), by the x runs.
     fn put_x(&mut self, v: u32) -> R<()> {
+        let t0 = Instant::now();
         let mut e: Vec<u32> = self.embedding(v)?.into_iter().map(|b| b << 16).collect();
+        self.host_ns[0] += ns(t0);
+        let t0 = Instant::now();
         let total = *self.x_off.last().unwrap();
         if e.len() < total {
             // (a padded hidden's dims past the model's are 0)
@@ -212,13 +272,16 @@ impl ArtifactModel {
             let r = floor::Rect::new(cx.x, cx.y + ly, 1, r1 - r0);
             self.dev.put("x", rect(&r), dims as usize, &e[a..b])?;
         }
+        self.host_ns[1] += ns(t0);
         Ok(())
     }
 
     fn launch(&mut self, steps: usize, pos: usize) -> R<()> {
+        let t0 = Instant::now();
         self.dev
             .call("compute", &[steps as u32, pos as u32])
             .map_err(|e| format!("compute({steps}, {pos}): {e}"))?;
+        self.host_ns[2] += ns(t0);
         self.launches += 1;
         self.steps += steps as u64;
         Ok(())
@@ -295,7 +358,9 @@ impl ArtifactModel {
     /// refused rather than handed on.
     fn ring(&mut self, n: usize) -> R<Vec<u32>> {
         let root = floor::Rect::new(self.hl.root.x, self.hl.root.y, 1, 1);
+        let t0 = Instant::now();
         let ring = self.dev.get("ring", rect(&root), n)?;
+        self.host_ns[3] += ns(t0);
         if let Some(&id) = ring.iter().find(|&&id| id as usize >= self.vocab) {
             return Err(format!(
                 "artifact: the token loop chose id {id}, past the vocabulary ({}): a padded head row \
@@ -386,6 +451,11 @@ impl ArtifactModel {
         }
         Ok((am, Some(l)))
     }
+}
+
+/// `t0`'s age in ns.
+fn ns(t0: Instant) -> u64 {
+    u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// The SDK's rectangle of a floor rectangle.

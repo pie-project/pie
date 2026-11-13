@@ -91,6 +91,11 @@ impl Npy {
         Ok(())
     }
 
+    /// The data's first byte in the file (past the header).
+    pub fn data_offset(&self) -> u64 {
+        self.data
+    }
+
     /// Elements an index of axis 0.
     pub fn stride0(&self) -> usize {
         self.shape[1..].iter().product()

@@ -49,26 +49,49 @@ fn main() {
     }
 }
 
-/// `n` tokens after `prompt`, `steps` a launch.
-fn greedy(
-    m: &mut ArtifactModel,
-    prompt: &[u32],
-    n: usize,
+/// A greedy run's tokens, and its decode launches' (the ones after the prompt's): their wall ms,
+/// steps and count, and their host ns by part ([`ArtifactModel::host_ns`]). Decode is the rate
+/// Pie's posted loops are timed at; the run's ms a token also holds the prompt's one-pass launches.
+struct Run {
+    got: Vec<u32>,
+    ms: f64,
     steps: usize,
-) -> Result<Vec<u32>, String> {
+    launches: usize,
+    host: [u64; 4],
+}
+
+/// `n` tokens after `prompt`, `steps` a launch.
+fn greedy(m: &mut ArtifactModel, prompt: &[u32], n: usize, steps: usize) -> Result<Run, String> {
     let mut got = Vec::new();
     let mut feed = prompt.to_vec();
     let mut start = 0;
+    let mut run = Run {
+        got: Vec::new(),
+        ms: 0.0,
+        steps: 0,
+        launches: 0,
+        host: [0; 4],
+    };
     while got.len() < n {
         let extra = (steps - 1).min(n - got.len() - 1);
+        let (t0, h0) = (std::time::Instant::now(), m.host_ns);
         let a = m.greedy(&feed, start, extra)?;
+        if start > 0 {
+            run.ms += t0.elapsed().as_secs_f64() * 1e3;
+            run.steps += extra + 1;
+            run.launches += 1;
+            for (h, (now, was)) in run.host.iter_mut().zip(m.host_ns.iter().zip(h0)) {
+                *h += now - was;
+            }
+        }
         let new = &a[feed.len() - 1..];
         start += feed.len() + new.len() - 1;
         got.extend_from_slice(new);
         feed = vec![*new.last().ok_or("a launch made no token")?];
     }
     got.truncate(n);
-    Ok(got)
+    run.got = got;
+    Ok(run)
 }
 
 /// The golden's first `n` tokens fed one a launch after `prompt`: each step whose argmax is not
@@ -269,7 +292,8 @@ fn run() -> Result<bool, String> {
     let mut ok = true;
     for rep in 0..2 {
         let t0 = std::time::Instant::now();
-        let got = greedy(&mut m, &prompt, n, steps)?;
+        let run = greedy(&mut m, &prompt, n, steps)?;
+        let got = &run.got;
         let mis = got.iter().zip(&want).filter(|(g, w)| g != w).count();
         let from = got.iter().zip(&want).position(|(g, w)| g != w);
         ok &= mis == 0;
@@ -281,6 +305,19 @@ fn run() -> Result<bool, String> {
             m.steps,
             &got[..n.min(16)]
         );
+        if run.launches > 0 {
+            let a_launch = |ns: u64| ns as f64 / 1e6 / run.launches as f64;
+            println!(
+                "DECODE {rep}: {:.4} ms a step over {} steps, {steps} a launch; a launch's host ms: \
+                 embedding {:.3} puts {:.3} compute {:.3} ring {:.3}",
+                run.ms / run.steps as f64,
+                run.steps,
+                a_launch(run.host[0]),
+                a_launch(run.host[1]),
+                a_launch(run.host[2]),
+                a_launch(run.host[3]),
+            );
+        }
     }
     // a rollback: the wafer holds the whole sequence; a run at the prompt + 2 replays from 0
     if n > 4 {

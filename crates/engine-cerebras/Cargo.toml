@@ -28,6 +28,7 @@ eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
 eta-exec = { path = "../eta-exec" }
 eta-compiler = { path = "../eta-compiler" }
 checkpoint = { path = "../checkpoint" }
+ztensor = { workspace = true }
 tracing = "0.1"
 blake3 = "1"
 
