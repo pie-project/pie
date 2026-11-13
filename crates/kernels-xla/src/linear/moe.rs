@@ -1874,38 +1874,37 @@ fn tiles_of(
     let kernel = spec.kernel()?;
     if spec.stepping() {
         let st = steps(f, spec, sorted)?;
-        let args = pooled_args(
-            f,
-            spec,
-            w,
-            vec![st[0], st[1], st[2], st[3], st[4], st[5]],
-            vec![xs, w],
-        )?;
+        let args = pooled_args(f, &[(spec, w)], st.to_vec(), vec![xs, w])?;
         return Ok(kernel.call(f, &args)?[0]);
     }
     if spec.prefetching() {
         let pre = vec![sorted.se, sorted.nt, sorted.run, sorted.nxt];
-        let args = pooled_args(f, spec, w, pre, vec![xs, w])?;
+        let args = pooled_args(f, &[(spec, w)], pre, vec![xs, w])?;
         return Ok(kernel.call(f, &args)?[0]);
     }
     Ok(kernel.call(f, &[sorted.se, sorted.nt, xs, w])?[0])
 }
 
-/// A pooled kernel's operands: the bank's table after the scalar-prefetched
-/// ones, and the pool in the bank's place.
+/// A kernel's operands with its banks in the pool: each pooled bank's table
+/// after the scalar-prefetched ones (in `banks` order), and the pool in the
+/// bank's place.
 fn pooled_args(
     f: &mut Func,
-    spec: crate::linear::moe_gmm::Gmm,
-    bank: Val,
+    banks: &[(crate::linear::moe_gmm::Gmm, Val)],
     mut pre: Vec<Val>,
-    ins: Vec<Val>,
+    mut ins: Vec<Val>,
 ) -> Result<Vec<Val>, Error> {
-    let Some(at) = f.bank_parts(bank).filter(|_| spec.pooled.is_some()) else {
-        pre.extend(ins);
-        return Ok(pre);
-    };
-    pre.push(at.table);
-    pre.extend(ins.into_iter().map(|v| if v == bank { at.pool } else { v }));
+    for &(spec, bank) in banks {
+        if let Some(at) = f.bank_parts(bank).filter(|_| spec.pooled.is_some()) {
+            pre.push(at.table);
+            for v in &mut ins {
+                if *v == bank {
+                    *v = at.pool;
+                }
+            }
+        }
+    }
+    pre.extend(ins);
     Ok(pre)
 }
 
@@ -1926,7 +1925,6 @@ fn pooled_spec(
             rows,
             offset: at.offset,
         }),
-        run: 1,
         ..spec?
     };
     (spec.prefetching() && spec.kernel().is_ok()).then_some(spec)
@@ -2539,16 +2537,19 @@ pub fn experts(
     }
     let up_bank = read_bank(f, Form::Dense(gate_up), up_fan)?;
     let down_bank = read_bank(f, Form::Dense(down), down_fan)?;
-    // Banks in the pool run as two selects (`pooled_spec`).
-    if f.bank_parts(up_bank.codes.val()).is_some() || f.bank_parts(down_bank.codes.val()).is_some()
-    {
-        return Ok(None);
-    }
     let elem = |f: &mut Func, b: &Read| f.elem(b.codes.val());
     let (ue, de) = (elem(f, &up_bank), elem(f, &down_bank));
     let (Some(up), Some(dn)) = (
-        bf16_rows(gmm_spec(up_fan, &up_bank, ue, false, tuning)),
-        bf16_rows(gmm_spec(down_fan, &down_bank, de, false, tuning)),
+        pooled_spec(
+            f,
+            bf16_rows(gmm_spec(up_fan, &up_bank, ue, false, tuning)),
+            &up_bank,
+        ),
+        pooled_spec(
+            f,
+            bf16_rows(gmm_spec(down_fan, &down_bank, de, false, tuning)),
+            &down_bank,
+        ),
     ) else {
         return Ok(None);
     };
@@ -2620,14 +2621,13 @@ pub fn experts(
             crate::linear::moe_gmm::Orient::KMajor => f.transpose(wd, &[1, 0])?,
             crate::linear::moe_gmm::Orient::NMajor => wd,
         };
-        Some(
-            kernel.call(
-                f,
-                &[
-                    st[0], st[1], st[2], st[3], st[4], st[5], sorted.xs, wu, wl, wd,
-                ],
-            )?[0],
-        )
+        let args = pooled_args(
+            f,
+            &[(inside, wu), (dn, wd)],
+            st.to_vec(),
+            vec![sorted.xs, wu, wl, wd],
+        )?;
+        Some(kernel.call(f, &args)?[0])
     } else {
         None
     };
@@ -2638,10 +2638,8 @@ pub fn experts(
                 let wl = f.broadcast(ws, &[rows, 128], &[0])?;
                 let st = steps(f, inside, &sorted)?;
                 let w = up_bank.codes.val();
-                inside.kernel()?.call(
-                    f,
-                    &[st[0], st[1], st[2], st[3], st[4], st[5], sorted.xs, w, wl],
-                )?[0]
+                let args = pooled_args(f, &[(inside, w)], st.to_vec(), vec![sorted.xs, w, wl])?;
+                inside.kernel()?.call(f, &args)?[0]
             } else {
                 let up_rows = tiles_of(f, up, &up_bank, &sorted, sorted.xs)?;
                 let held = Operand {

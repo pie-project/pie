@@ -330,13 +330,7 @@ impl Gmm {
                 Ok(vec![at, b.i32(0)])
             }),
         };
-        let bank = Operand {
-            array: self.bank_dims().to_vec(),
-            elem: self.w,
-            block: self.bank_dims().to_vec(),
-            window: Window::Any,
-            index: Box::new(|b: &mut Body, _: &Grid| Ok(vec![b.i32(0), b.i32(0)])),
-        };
+        let bank = self.bank_operand()?;
         let glu = self.glu;
         if glu.is_some() && (orient != Orient::NMajor || out_elem != Elem::Bf16 || n % 32 != 0) {
             return bad(format!("a GLU over {self:?}"));
@@ -378,14 +372,14 @@ impl Gmm {
             name: "gmm".into(),
             grid: vec![1, steps],
             semantics: vec![Sem::Arbitrary, Sem::Arbitrary],
-            prefetch: vec![
+            prefetch: self.with_table(vec![
                 vec![steps],
                 vec![1],
                 vec![steps],
                 vec![steps],
                 vec![steps],
                 vec![steps],
-            ],
+            ]),
             ins: [Some(xs), Some(bank), weights]
                 .into_iter()
                 .flatten()
@@ -406,24 +400,28 @@ impl Gmm {
                 blk.scratch[2],
                 blk.scratch[3],
             );
-            let bank = blk.ins[1];
+            let bank = self.bank_ref(b, blk.ins[1])?;
             let outr = blk.outs[0];
             let pre = &blk.grid.prefetch;
+            let table = self.pooled.map(|_| pre[pre.len() - 1]);
             let s = blk.grid.ids[1];
-            // The copy of expert `ex`'s weights into slot `slot`.
-            let wcopy = |b: &mut Body, ex: V, slot: V| -> Built<(V, V, V)> {
+            // The copies of expert `ex`'s weights into slot `slot`.
+            let wcopy = |b: &mut Body, ex: V, slot: V| -> Built<Vec<(V, V, V)>> {
                 let z = b.i32(0);
+                let dst = b.ref_slice(wbuf, &[slot, z, z], &[1, rb, cb])?;
+                let dst = b.ref_squeeze(dst)?;
+                let sem = b.ref_slice(wsems, &[slot], &[1])?;
+                let sem = b.ref_squeeze(sem)?;
+                if let Some(table) = table {
+                    return self.panels(b, bank, table, ex, dst, sem);
+                }
                 let nn = b.i32(n);
                 let at = b.muli(ex, nn)?;
                 let src = match orient {
                     Orient::NMajor => b.ref_slice(bank, &[at, z], &[n, k])?,
                     Orient::KMajor => b.ref_slice(bank, &[z, at], &[k, n])?,
                 };
-                let dst = b.ref_slice(wbuf, &[slot, z, z], &[1, rb, cb])?;
-                let dst = b.ref_squeeze(dst)?;
-                let sem = b.ref_slice(wsems, &[slot], &[1])?;
-                let sem = b.ref_squeeze(sem)?;
-                Ok((src, dst, sem))
+                Ok(vec![(src, dst, sem)])
             };
             // The copy of step `st`'s `c` tiles of result rows out of slot
             // `slot`.
@@ -476,20 +474,25 @@ impl Gmm {
                 let first = b.select(at0, at0, moved)?;
                 b.when(at0, |b| {
                     let ex = b.load(pre[0], &[si])?;
-                    let (src, dst, sem) = wcopy(b, ex, wslot)?;
-                    b.dma_start(src, dst, sem)
+                    for (src, dst, sem) in wcopy(b, ex, wslot)? {
+                        b.dma_start(src, dst, sem)?;
+                    }
+                    Ok(())
                 })?;
                 b.when(first, |b| {
                     let z = b.i32(0);
-                    let (src, dst, sem) = wcopy(b, z, wslot)?;
-                    b.dma_wait(sem, src, dst)?;
+                    for (src, dst, sem) in wcopy(b, z, wslot)? {
+                        b.dma_wait(sem, src, dst)?;
+                    }
                     let nx = b.load(pre[3], &[si])?;
                     let has = b.cmpi(ICmp::Sge, nx, z)?;
                     b.when(has, |b| {
                         let one = b.i32(1);
                         let other = b.subi(one, wslot)?;
-                        let (src, dst, sem) = wcopy(b, nx, other)?;
-                        b.dma_start(src, dst, sem)
+                        for (src, dst, sem) in wcopy(b, nx, other)? {
+                            b.dma_start(src, dst, sem)?;
+                        }
+                        Ok(())
                     })
                 })?;
                 // The slot this step lands in was last copied out two steps
@@ -596,6 +599,9 @@ impl Gmm {
         {
             return bad(format!("one kernel over {self:?} and {dn:?}"));
         }
+        if self.pooled.is_some() != dn.pooled.is_some() {
+            return bad("one bank in the pool and one not");
+        }
         let glu = self.glu.expect("checked");
         let rows = self.tiles * tm;
         let (drb, dcb) = match dn.orient {
@@ -648,19 +654,20 @@ impl Gmm {
             name: "gmm_mlp".into(),
             grid: vec![1, steps],
             semantics: vec![Sem::Arbitrary, Sem::Arbitrary],
-            prefetch: vec![
+            // Pooled: the gate-up bank's table, then the down bank's.
+            prefetch: dn.with_table(self.with_table(vec![
                 vec![steps],
                 vec![1],
                 vec![steps],
                 vec![steps],
                 vec![steps],
                 vec![steps],
-            ],
+            ])),
             ins: vec![
                 rows_of(k, Elem::Bf16),
-                whole(self.bank_dims(), Elem::Bf16),
+                self.bank_operand()?,
                 rows_of(128, Elem::F32),
-                whole(dn.bank_dims(), Elem::Bf16),
+                dn.bank_operand()?,
             ],
             outs: vec![whole([rows, dnn], Elem::Bf16)],
             vmem_limit: Some(limit as u64),
@@ -683,31 +690,40 @@ impl Gmm {
                 blk.scratch[4],
                 blk.scratch[5],
             );
-            let (ubank, dbank) = (blk.ins[1], blk.ins[3]);
+            let ubank = self.bank_ref(b, blk.ins[1])?;
+            let dbank = dn.bank_ref(b, blk.ins[3])?;
             let outr = blk.outs[0];
             let pre = &blk.grid.prefetch;
+            let tables = self
+                .pooled
+                .map(|_| (pre[pre.len() - 2], pre[pre.len() - 1]));
             let s = blk.grid.ids[1];
             // The copies of expert `ex`'s two blocks into slot `slot`.
-            let wcopy = |b: &mut Body, ex: V, slot: V| -> Built<[(V, V, V); 2]> {
+            let wcopy = |b: &mut Body, ex: V, slot: V| -> Built<Vec<(V, V, V)>> {
                 let z = b.i32(0);
-                let nn = b.i32(n);
-                let at = b.muli(ex, nn)?;
-                let src = b.ref_slice(ubank, &[at, z], &[n, k])?;
                 let dst = b.ref_slice(ubuf, &[slot, z, z], &[1, n, k])?;
                 let dst = b.ref_squeeze(dst)?;
                 let sem = b.ref_slice(usems, &[slot], &[1])?;
                 let sem = b.ref_squeeze(sem)?;
+                let ddst = b.ref_slice(dbuf, &[slot, z, z], &[1, drb, dcb])?;
+                let ddst = b.ref_squeeze(ddst)?;
+                let dsem = b.ref_slice(dsems, &[slot], &[1])?;
+                let dsem = b.ref_squeeze(dsem)?;
+                if let Some((ut, dt)) = tables {
+                    let mut out = self.panels(b, ubank, ut, ex, dst, sem)?;
+                    out.extend(dn.panels(b, dbank, dt, ex, ddst, dsem)?);
+                    return Ok(out);
+                }
+                let nn = b.i32(n);
+                let at = b.muli(ex, nn)?;
+                let src = b.ref_slice(ubank, &[at, z], &[n, k])?;
                 let dd = b.i32(dnn);
                 let dat = b.muli(ex, dd)?;
                 let dsrc = match dorient {
                     Orient::NMajor => b.ref_slice(dbank, &[dat, z], &[dnn, dk])?,
                     Orient::KMajor => b.ref_slice(dbank, &[z, dat], &[dk, dnn])?,
                 };
-                let ddst = b.ref_slice(dbuf, &[slot, z, z], &[1, drb, dcb])?;
-                let ddst = b.ref_squeeze(ddst)?;
-                let dsem = b.ref_slice(dsems, &[slot], &[1])?;
-                let dsem = b.ref_squeeze(dsem)?;
-                Ok([(src, dst, sem), (dsrc, ddst, dsem)])
+                Ok(vec![(src, dst, sem), (dsrc, ddst, dsem)])
             };
             let ocopy = |b: &mut Body, st: V, slot: V, c: i64| -> Built<(V, V, V)> {
                 let z = b.i32(0);
