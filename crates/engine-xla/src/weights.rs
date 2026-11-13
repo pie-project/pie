@@ -117,6 +117,7 @@ pub(crate) fn plane_bytes(name: &str, dtype: Dtype, shape: &[u64]) -> Result<u64
 }
 
 impl Weights {
+    #[allow(clippy::too_many_arguments)]
     pub fn resident(
         device: &Device,
         handles: &Handles,
@@ -125,7 +126,10 @@ impl Weights {
         path: &Path,
         device_cap: u64,
         engine: &Engine,
+        streamed: Option<&mut crate::store::streamed::Streamed>,
     ) -> Result<Weights> {
+        let streamed_params = streamed.as_ref().map(|s| s.params()).unwrap_or_default();
+        let streams = |at: usize| streamed_params.contains(&at);
         if let Some(param) = trace.params.iter().find(|p| p.dtype == Dtype::U4g64tiled) {
             return Err(Fault::Param {
                 name: param.name.clone(),
@@ -185,7 +189,13 @@ impl Weights {
             .iter()
             .map(|p| plane_bytes(&p.name, p.dtype, &p.shape))
             .collect::<Result<_>>()?;
-        let total: u64 = sizes.iter().sum();
+        // A streamed plane lands in the pool, not as a buffer of its own.
+        let total: u64 = sizes
+            .iter()
+            .enumerate()
+            .filter(|&(at, _)| !streams(at))
+            .map(|(_, b)| b)
+            .sum();
         if total > device_cap {
             return Err(Fault::Residency(format!(
                 "the weights are {} MiB and the device budget for them is {} MiB; this \
@@ -257,6 +267,9 @@ impl Weights {
         // `gather_only`.
         let mut folded: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
         for at in gather_only(trace, &codes_planes, engine) {
+            if streams(at) {
+                continue;
+            }
             let Some(&pairing) = pairings.get(trace.params[at].name.as_str()) else {
                 let (rows, width) = rectangle(&trace.params[at].shape);
                 folded.insert(at, fold_of(rows, width));
@@ -289,6 +302,8 @@ impl Weights {
             transposed: &transposed,
             tied_gemm: &tied_gemm,
             folded: &folded,
+            streamed,
+            kept: std::collections::BTreeSet::new(),
         };
         Execution::new(&streaming, snapshot)
             .streaming()
@@ -300,6 +315,7 @@ impl Weights {
                 why: "is half of an mxfp4 bank whose other plane never landed",
             });
         }
+        let kept = std::mem::take(&mut sink.kept);
         let stored = sink.stored;
         // A pre-scaled mxfp4 plane holds a byte per code, twice its codes.
         let total = total
@@ -339,6 +355,19 @@ impl Weights {
         let mut table = Vec::with_capacity(trace.params.len());
         let mut gemm_table = Vec::with_capacity(trace.params.len());
         for (at, param) in trace.params.iter().enumerate() {
+            if kept.contains(&at) {
+                // Read through the pool (`crate::store::streamed`): a root no
+                // program may read whole.
+                let (rows, width) = shape_of(at);
+                table.push(Some(WeightRow::Dense(handles.root(Root {
+                    source: Source::Streamed { param: at as u32 },
+                    dtype: param.dtype,
+                    rows: u32::try_from(rows).unwrap_or(u32::MAX),
+                    width: u32::try_from(width).unwrap_or(u32::MAX),
+                }))));
+                gemm_table.push(None);
+                continue;
+            }
             if buffers[at].is_none() {
                 return Err(Fault::Param {
                     name: param.name.clone(),
@@ -997,6 +1026,10 @@ struct Landing<'a> {
     /// The planes of gather-only tables: the `[rows, width]` each lands
     /// folded as (`gather_only`).
     folded: &'a BTreeMap<usize, (u64, u64)>,
+    /// The streamed weights: their planes are kept on the host, the pool
+    /// holds them (`crate::store::streamed`).
+    streamed: Option<&'a mut crate::store::streamed::Streamed>,
+    kept: std::collections::BTreeSet<usize>,
 }
 
 impl Landing<'_> {
@@ -1122,6 +1155,13 @@ impl TensorSink for Landing<'_> {
                 bytes.len(),
                 self.sizes[at]
             )));
+        }
+        if let Some(streamed) = self.streamed.as_deref_mut()
+            && streamed.streams(at)
+        {
+            streamed.keep(at, bytes);
+            self.kept.insert(at);
+            return Ok(());
         }
         let landed = if let Some(&scales_at) = self.prescale.get(&at) {
             match self.held.remove(&scales_at) {

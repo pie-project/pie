@@ -23,6 +23,14 @@ pub trait Emit {
     fn scope(&self, name: &str) {
         let _ = name;
     }
+
+    /// Closes what was emitted so far as a program of its own, the next
+    /// emits starting the next (a fire cut where its routes must come back
+    /// first, `crate::store::streamed`); `false` where the sink does not
+    /// cut, and nothing happened.
+    fn cut(&self) -> bool {
+        false
+    }
 }
 
 pub type Ctx<'a> = dyn Emit + 'a;

@@ -86,6 +86,13 @@ impl Inputs {
         })
     }
 
+    /// Overwrites the pack from `offset` with `values` (an input staged
+    /// before a cut fire's earlier segments landed, `crate::serve::stream`).
+    pub fn set_i32s(&mut self, offset: u32, values: &[i32]) {
+        let at = offset as usize;
+        self.pack[at..at + values.len()].copy_from_slice(values);
+    }
+
     /// Where the next `i32s` input starts in the pack.
     #[must_use]
     pub fn pack_offset(&self) -> u32 {
