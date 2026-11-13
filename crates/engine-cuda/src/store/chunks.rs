@@ -394,6 +394,14 @@ impl Chunks {
             .min(self.range.segments())
     }
 
+    /// The segments that lie wholly within the first `chunks` chunks.
+    #[must_use]
+    pub fn segments_under(&self, chunks: u64) -> u32 {
+        u32::try_from(chunks / u64::from(self.layout.segment_chunks.max(1)))
+            .unwrap_or(u32::MAX)
+            .min(self.range.segments())
+    }
+
     /// Backs the first `segments` segments, and zeroes the null chunk once
     /// it is backed: every page behind a window reads it, and a masked
     /// column still multiplies its value, so it must hold no NaN.
