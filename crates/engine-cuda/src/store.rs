@@ -1442,7 +1442,7 @@ impl Pools {
 
     /// Reserves the range anew with `bytes` more of activation
     /// ([`Chunks::widen_activation`]).
-    pub(crate) fn widen_activation(&mut self, bytes: u64) -> Result<()> {
+    pub(crate) fn widen_activation(&mut self, bytes: u64) -> Result<u64> {
         self.chunks.widen_activation(&mut self.pool, bytes)
     }
 

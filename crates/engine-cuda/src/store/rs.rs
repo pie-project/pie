@@ -80,13 +80,15 @@ impl Buffers {
 
     /// The buffered planes of `trace`, laid as the pool's rs list lays its
     /// pages, and the scratch in the activation's span, widened by the most
-    /// a fire of up to `max_rows` rows asks: its rows twice, and what its
-    /// replay tables hold (`inputs`: every row once more and [`REPLAYED`] a
-    /// lane) beside [`REPLAYED`] a window.
+    /// a fire of up to `max_rows` rows on `max_lanes` lanes asks: its rows
+    /// twice, and what its replay tables hold (`inputs`: every row once
+    /// more and [`REPLAYED`] a lane) beside [`REPLAYED`] a window, a window
+    /// a lane at most.
     pub fn reserve(
         trace: &Trace,
         paging: Paging,
         max_rows: u32,
+        max_lanes: u32,
         pools: &mut Pools,
     ) -> Result<Option<Buffers>> {
         let layout = pools.rs_layout();
@@ -118,11 +120,10 @@ impl Buffers {
         let reach = RsScratch::need(
             max_rows
                 .saturating_mul(3)
-                .saturating_add(paging.slots.saturating_mul(2 * REPLAYED)),
+                .saturating_add(max_lanes.min(paging.slots).saturating_mul(2 * REPLAYED)),
             ext_row_bytes,
         );
-        let at = pools.activation_bytes();
-        pools.widen_activation(reach)?;
+        let at = pools.widen_activation(reach)?;
         Ok(Some(Buffers {
             scratch: Scratch {
                 at,
