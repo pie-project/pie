@@ -30,6 +30,10 @@ pub(super) const FIXED_SETS_PER_WORKING_SET: u32 = 1;
 /// It suspends no process of its own.
 const SWEEP: ProcessId = ProcessId::nil();
 
+/// The shortfall an activation rung's raise reports under, apart from every
+/// process waiter's ([`ResidencyPlanner::fund_raise`]).
+const RAISE_WAITER: u64 = u64::MAX;
+
 pub struct ResidencyPlanner {
     pub(super) inner: parking_lot::Mutex<Inner>,
     pub(super) pause_due: AtomicBool,
@@ -199,7 +203,7 @@ impl ResidencyPlanner {
         });
         let said = {
             let mut short = self.short.lock();
-            short.retain(|id| waiting.contains(&id));
+            short.retain(|id| id == RAISE_WAITER || waiting.contains(&id));
             short.take_said()
         };
         for (tier, bytes) in said {
@@ -1100,6 +1104,29 @@ impl ResidencyPlanner {
         }
         self.re_arm_idle_reclaim();
         self.poke();
+    }
+
+    /// The activation rung a pass asks for lacks `pages` of room (0: it
+    /// lacks none now). Funded as a waiter's pages are: idle cache its keys
+    /// let go, then keyed idle cache down a tier, and past that the policy
+    /// is told the device is short, so it picks what goes. What is freed
+    /// comes back through [`Self::pages_freed`]; the pool's walker raises
+    /// once the raise fits.
+    pub fn fund_raise(self: &Arc<Self>, pages: u32) {
+        if pages == 0 {
+            self.short.lock().note(RAISE_WAITER, [0, 0]);
+            self.report_short();
+            return;
+        }
+        if self.reclaim_idle_once() || self.demote_idle() {
+            return;
+        }
+        let bytes = self.bytes_of(Reclaim {
+            pages,
+            rs: RsUnits::default(),
+        });
+        self.short.lock().note(RAISE_WAITER, [bytes, 0]);
+        self.report_short();
     }
 
     pub fn pages_freed(self: &Arc<Self>) {

@@ -581,6 +581,31 @@ fn prefill_share(page: u32, engine: usize) -> u32 {
     })
 }
 
+/// The rows a piece of a prompt on `engine` would take were the pool at its
+/// largest activation rung: what a pass asks the rung for
+/// ([`crate::store::shared::want_rows`]).
+fn prefill_want(page: u32, engine: usize) -> u32 {
+    if let Some(rows) = fire_rows() {
+        return rows;
+    }
+    crate::engine::get_spec(engine).map_or(u32::MAX, |spec| {
+        crate::inferlet::host::model::prefill_share(
+            crate::inferlet::host::model::prefill_budget(spec.limits).max(1),
+            crate::inferlet::process::live_count(),
+            page as usize,
+        )
+    })
+}
+
+/// The rows past which a pass asks the activation rung for wider fires: a
+/// decode's few rows never do.
+const RUNG_WANT_FROM: usize = 16;
+
+/// How many of a pass's pieces run ahead of the one being cut while its
+/// rung's raise is pending: the device stays fed, and the rest is cut wider
+/// once the raise lands.
+const PIECES_AHEAD: usize = 2;
+
 fn fire_rows() -> Option<u32> {
     static ROWS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     *ROWS.get_or_init(|| {
@@ -603,6 +628,20 @@ fn host_cuts(
     forced: &[u32],
     tail: u32,
 ) -> Vec<(u32, u32)> {
+    host_cuts_from(req, cuttable, share, page, forced, tail, 0)
+}
+
+/// [`host_cuts`] of the rows from `start` on: the rest of a pass cut again
+/// once its rung was raised.
+fn host_cuts_from(
+    req: &crate::engine::FireRequest,
+    cuttable: bool,
+    share: u32,
+    page: u32,
+    forced: &[u32],
+    tail: u32,
+    start: u32,
+) -> Vec<(u32, u32)> {
     let rows = |lane: &::engine::Lane| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
     let [lane] = req.lanes.as_slice() else {
         return vec![(0, req.lanes.first().map_or(0, rows))];
@@ -618,10 +657,10 @@ fn host_cuts(
         .iter()
         .copied()
         .chain(media.map(|row| ((held + row) / page * page).saturating_sub(held)))
-        .filter(|&end| 0 < end && end < rows)
+        .filter(|&end| start < end && end < rows)
         .collect();
     if share > 0 {
-        let mut from = 0;
+        let mut from = start;
         while rows - from > share {
             let mut to = ((held + from + share) / page * page).saturating_sub(held);
             if to <= from {
@@ -635,7 +674,7 @@ fn host_cuts(
     ends.push(rows);
     ends.sort_unstable();
     ends.dedup();
-    let mut from = 0;
+    let mut from = start;
     ends.into_iter()
         .map(|to| {
             let cut = (from, to);
@@ -2737,7 +2776,23 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .collect();
         // Several lanes run in pieces only where none carries recurrent
         // state, which is bound lane by lane.
-        let cuts = pass_pieces(
+        let rows_total = full
+            .lanes
+            .iter()
+            .map(|lane| lane.tokens.len())
+            .sum::<usize>();
+        // A prompt asks the activation rung for the rows its pieces take at
+        // the largest rung (SPEC decision 6, by demand), from before it is
+        // cut until its last piece settles: the pool raises toward it where
+        // room allows, and lowers once no pass asks past its smallest rung,
+        // so no piece cut wider waits on a lowered rung.
+        let wanted = u32::try_from(rows_total)
+            .unwrap_or(u32::MAX)
+            .min(prefill_want(page_size, engine));
+        let rung_want = (rows_total > RUNG_WANT_FROM)
+            .then(|| crate::store::shared::want_rows(engine, wanted));
+        let mut cut_at = crate::store::shared::fire_cap(engine);
+        let mut cuts = pass_pieces(
             &full,
             cuttable,
             rs_ws_ids.is_empty(),
@@ -2746,11 +2801,19 @@ pub async fn submit_pass_stamped<C: FireContext>(
             &forced,
             &switched.tails,
         );
-        let rows_total = full
-            .lanes
+        // Only a lone lane's rest is cut again once a raise lands.
+        let recuttable = full.lanes.len() == 1 && cuts.len() > 1;
+        // A piece that would not cut to the rung asks for its own width.
+        let widest = cuts
             .iter()
-            .map(|lane| lane.tokens.len())
-            .sum::<usize>();
+            .map(|piece| piece.iter().flatten().map(|&(from, to)| to - from).sum::<u32>())
+            .max()
+            .unwrap_or(0);
+        let (wanted, rung_want) = if widest > wanted && rows_total > RUNG_WANT_FROM {
+            (widest, Some(crate::store::shared::want_rows(engine, widest)))
+        } else {
+            (wanted, rung_want)
+        };
         // What one fire would run past what a fire holds is refused here, by
         // name, rather than by the scheduler's row count.
         let capacity = crate::engine::get_spec(engine)
@@ -2796,17 +2859,65 @@ pub async fn submit_pass_stamped<C: FireContext>(
         }
         // The pieces in frames of their own, in the order they are cut, so
         // the pieces of concurrent prompts seal together.
-        let piece_frames = {
+        let frame_size = crate::scheduler::configured_frame_size().max(1);
+        let mut frames = {
             let pipeline = ctx.resources().get(&this)?;
-            piece_frames(
-                frame,
-                cuts.len(),
-                crate::scheduler::configured_frame_size(),
-                || pipeline.next_frame_seq(),
-            )
+            piece_frames(frame, cuts.len(), frame_size, || pipeline.next_frame_seq())
         };
+        let framed = matches!(frame, Some(stamp) if stamp.fires == 1);
+        let mut submitted: Vec<crate::engine::completion::WorkItemCompletion> = Vec::new();
         let mut settles = Vec::new();
-        for (at, piece) in cuts.iter().enumerate() {
+        let mut at = 0;
+        while at < cuts.len() {
+            if recuttable && at > 0 && at + 1 < cuts.len() {
+                // While the raise is pending the pass runs no further ahead
+                // of the device than a few pieces, so what is left is cut at
+                // the raised rung once it lands.
+                // A framed piece waits only on a frame already whole.
+                let ahead = PIECES_AHEAD.max(frame_size);
+                if at >= ahead && wanted > cut_at {
+                    let behind = submitted[at - ahead].clone();
+                    while !behind.is_settled() && crate::store::shared::fire_cap(engine) <= cut_at
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                }
+                let cap = crate::store::shared::fire_cap(engine);
+                if cap > cut_at && (!framed || at % frame_size == 0) {
+                    cut_at = cap;
+                    let start = cuts[at - 1][0].map_or(0, |(_, to)| to);
+                    let rest = host_cuts_from(
+                        &full,
+                        cuttable,
+                        prefill_share(page_size, engine),
+                        page_size,
+                        &forced,
+                        switched.tails.first().copied().unwrap_or(0),
+                        start,
+                    );
+                    cuts.truncate(at);
+                    cuts.extend(rest.into_iter().map(|cut| vec![Some(cut)]));
+                    let stamp = if framed {
+                        let pipeline = ctx.resources().get(&this)?;
+                        frame.map(|stamp| crate::scheduler::FrameStamp {
+                            seq: pipeline.next_frame_seq(),
+                            ..stamp
+                        })
+                    } else {
+                        frame
+                    };
+                    let pipeline = ctx.resources().get(&this)?;
+                    frames.truncate(at);
+                    frames.extend(piece_frames(
+                        stamp,
+                        cuts.len() - at,
+                        frame_size,
+                        || pipeline.next_frame_seq(),
+                    ));
+                }
+            }
+            let piece = cuts[at].clone();
+            let piece = &piece;
             let last = at + 1 == cuts.len();
             let mut req = if cuts.len() == 1 {
                 full.clone()
@@ -3048,7 +3159,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     copy_dst,
                     window_copies,
                     rs_copy,
-                    piece_frames[at],
+                    frames[at],
                     adapted,
                 )
                 .err()
@@ -3063,6 +3174,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             for part in &mut parts {
                 part.kvtxn.retire_on(&completion);
             }
+            submitted.push(completion.clone());
             if let Some(reservation) = ticket_reservation {
                 reservation.commit();
             }
@@ -3092,6 +3204,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // The next piece reads the KV this one writes: they run in
             // order on the device, so it is submitted now, as a decode's
             // next pass is, rather than once this one retires.
+            at += 1;
+        }
+        if let (Some(want), Some(last)) = (rung_want, submitted.last()) {
+            last.on_settled(move || drop(want));
         }
         advance_cursors(&pass_lanes, Some(&landings), &matched, &fold, &settles);
         crate::probe_fire_record!(submit_probe.total_us, submit_clock.elapsed());
@@ -4520,6 +4636,24 @@ mod cut_tests {
         a_lane_only_in_the_last_piece_is_not_written_before_it();
         a_pass_with_media_is_cut_before_its_first_span();
         a_pass_with_media_keys_the_rows_before_it();
+        the_rest_of_a_pass_is_cut_again_wider();
+    }
+
+    /// A raise landing mid-pass: what is left from the last cut is cut at
+    /// the wider share, on the same page boundaries and checkpoint rows.
+    fn the_rest_of_a_pass_is_cut_again_wider() {
+        let req = prefill_lane(5, 200, 16);
+        let narrow = host_cuts(&req, true, 32, 16, &[123], 0);
+        assert_eq!(narrow[..2], [(0, 27), (27, 59)]);
+        assert_eq!(
+            host_cuts_from(&req, true, 160, 16, &[123], 0, 59),
+            [(59, 123), (123, 200)],
+            "the checkpoint row still cuts"
+        );
+        assert_eq!(
+            host_cuts_from(&req, true, 64, 16, &[], 0, 59),
+            [(59, 123), (123, 187), (187, 200)]
+        );
     }
 
     fn prefill_lane(held: u32, rows: u32, page: u32) -> crate::engine::FireRequest {

@@ -109,6 +109,56 @@ fn rung_granted(engine: usize) -> u32 {
     })
 }
 
+/// Per engine, the rows each pass still to run asks of one fire, by the
+/// pass's key: what moves the activation rung (a pool sits at its smallest
+/// rung while none asks past it).
+static RUNG_WANTS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<usize, std::collections::BTreeMap<u64, u32>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+static RUNG_WANT_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A pass's ask that fires on its engine carry `rows`: held until the pass
+/// is through (dropped), the walker raising the rung toward it meanwhile.
+#[must_use = "the ask stands while it is held"]
+pub struct RungWant {
+    engine: usize,
+    key: u64,
+}
+
+/// Asks that fires on `engine` carry `rows`; the pool's walker raises the
+/// rung that holds them where room allows ([`RungWalk`]).
+pub fn want_rows(engine: usize, rows: u32) -> RungWant {
+    let key = RUNG_WANT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RUNG_WANTS
+        .lock()
+        .unwrap()
+        .entry(engine)
+        .or_default()
+        .insert(key, rows);
+    RungWant { engine, key }
+}
+
+impl Drop for RungWant {
+    fn drop(&mut self) {
+        if let Some(wants) = RUNG_WANTS.lock().unwrap().get_mut(&self.engine) {
+            wants.remove(&self.key);
+        }
+    }
+}
+
+/// The most rows a pass still to run on `engine` asks of one fire; 0 where
+/// none asks.
+#[must_use]
+pub fn wanted_rows(engine: usize) -> u32 {
+    RUNG_WANTS
+        .lock()
+        .unwrap()
+        .get(&engine)
+        .and_then(|wants| wants.values().copied().max())
+        .unwrap_or(0)
+}
+
 /// One step of moving the activation rung toward a goal ([`RungWalk`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RungStep {
@@ -1049,6 +1099,31 @@ impl SharedPool {
     #[must_use]
     pub fn rung_moves(evacuation: &RungEvacuation) -> EngineEvacuation {
         engine_moves(&evacuation.moves)
+    }
+
+    /// The chunks raising the activation to `rung` lacks now, and the kv
+    /// pages that many chunks hold: what must be freed before it fits.
+    #[must_use]
+    pub fn raise_short(&self, rung: u32) -> (u32, u32) {
+        let chunks = self.pool.rung_short(rung);
+        let spc = self
+            .list
+            .and_then(|list| self.pool.shape(list.pool))
+            .map_or(1, |shape| shape.slots_per_chunk.max(1));
+        (chunks, chunks.saturating_mul(spc))
+    }
+
+    /// The smallest rung whose fires carry `rows`, the largest past every
+    /// rung's; the smallest where `rows` is 0.
+    #[must_use]
+    pub fn rung_for(&self, rows: u32) -> u32 {
+        let rungs = self.pool.rungs();
+        rungs
+            .iter()
+            .copied()
+            .find(|&rung| rung >= rows)
+            .or_else(|| rungs.last().copied())
+            .unwrap_or(u32::MAX)
     }
 
     /// Every activation rung's tokens, ascending.

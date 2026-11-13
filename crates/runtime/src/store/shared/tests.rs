@@ -706,3 +706,40 @@ fn the_rung_walk_caps_fires_then_lowers_and_raises_back_with_an_evacuation() {
         RungStep::Cap(16)
     );
 }
+
+/// Rungs by demand: the rung a pass's rows ask for, and what a raise lacks
+/// while state fills the span the larger rung's fires take; once some of it
+/// goes, the raise moves what is left in the span down.
+#[test]
+fn a_raise_by_demand_says_what_it_lacks_and_moves_the_rest() {
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.rung_for(0), 16, "no ask: the smallest");
+    assert_eq!(pool.rung_for(16), 16);
+    assert_eq!(pool.rung_for(17), 256);
+    assert_eq!(pool.rung_for(5000), 2048, "past every rung: the largest");
+    pool.lower_rung(16).unwrap();
+    assert_eq!(pool.raise_short(2048), (0, 0), "an empty pool raises at once");
+    let all = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
+    let (chunks, pages) = pool.raise_short(2048);
+    assert!(chunks > 0, "state fills the span: the raise lacks room");
+    assert_eq!(pages, chunks * 16, "16 kv pages a chunk");
+    assert!(pool.plan_raise(2048).is_err());
+    pool.give_records(&all[..all.len() / 2]);
+    pool.pool_mut().retire_through(u64::MAX);
+    assert_eq!(pool.raise_short(2048), (0, 0));
+    let evacuation = pool.plan_raise(2048).unwrap();
+    assert!(!evacuation.moves.is_empty(), "the span's state moves down");
+    engine
+        .evacuate(&SharedPool::rung_moves(&evacuation))
+        .unwrap();
+    pool.apply_rung(&evacuation, 1).unwrap();
+    assert_eq!(pool.rung(), 2048);
+    assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
+}

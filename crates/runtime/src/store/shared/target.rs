@@ -29,10 +29,12 @@ pub struct SharedGrow {
     refused: Arc<AtomicBool>,
     /// The last shrink found no room.
     no_room: Arc<AtomicBool>,
-    /// The activation rung the governor wants, in tokens (`u32::MAX`: the
-    /// largest), and the walk toward it (SPEC decision 6).
-    rung_goal: Arc<AtomicU32>,
+    /// The walk of the activation rung toward what the passes still to run
+    /// ask of a fire (SPEC decision 6, by demand): the smallest rung while
+    /// none asks past it.
     rung_walk: Arc<std::sync::Mutex<RungWalk>>,
+    /// A raise stood short of room, and the planner was asked to free it.
+    raise_funded: Arc<AtomicBool>,
 }
 
 impl SharedGrow {
@@ -48,60 +50,45 @@ impl SharedGrow {
             wake: Arc::new(Notify::new()),
             refused: Arc::new(AtomicBool::new(false)),
             no_room: Arc::new(AtomicBool::new(false)),
-            rung_goal: Arc::new(AtomicU32::new(u32::MAX)),
             rung_walk: Arc::new(std::sync::Mutex::new(RungWalk::default())),
+            raise_funded: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// The rung the governor wants: the next smaller than it wants now
-    /// (`down`), or the largest.
-    fn want_rung(&self, down: bool) {
-        let goal = if down {
-            let pool = self.shared.lock().unwrap();
-            let now = self.rung_goal.load(Ordering::Acquire).min(pool.rung());
-            let rungs = pool.rungs();
-            rungs
-                .iter()
-                .copied()
-                .filter(|&rung| rung < now)
-                .max()
-                .unwrap_or_else(|| rungs.first().copied().unwrap_or(u32::MAX))
-        } else {
-            u32::MAX
-        };
-        if self.rung_goal.swap(goal, Ordering::AcqRel) != goal {
-            tracing::debug!(engine = self.engine, goal, "the activation rung's goal");
-            self.wake.notify_one();
-        }
-    }
-
-    /// Steps the activation rung toward the governor's goal until there or
-    /// until a step has to wait: caps fires, lowers the pool's rung once no
-    /// wider fire is in flight, or raises it, the engine first copying the
-    /// state out of the larger span.
+    /// Steps the activation rung toward the rung the passes still to run
+    /// ask of a fire ([`super::want_rows`]), the smallest while none asks
+    /// past it, until there or until a step has to wait: caps fires, lowers
+    /// the pool's rung once no wider fire is in flight, or raises it, the
+    /// engine first copying the state out of the larger span. A raise short
+    /// of room asks the planner to free it as it would for pages.
     async fn walk_rung(&self) {
         loop {
-            let goal = self.rung_goal.load(Ordering::Acquire);
             let (current, retired) = self.epochs();
-            let step = {
+            let (step, goal) = {
                 let mut pool = self.shared.lock().unwrap();
                 pool.pool_mut().retire_through(retired);
-                self.rung_walk.lock().unwrap().step(
+                let goal = pool.rung_for(super::wanted_rows(self.engine));
+                let step = self.rung_walk.lock().unwrap().step(
                     &pool,
                     goal,
                     super::fire_cap(self.engine),
                     super::rung_granted(self.engine),
                     current,
                     retired,
-                )
+                );
+                (step, goal)
             };
             let step = match step {
                 Ok(step) => step,
                 Err(error) => {
-                    tracing::debug!(engine = self.engine, %error, "the activation rung waits");
+                    tracing::debug!(engine = self.engine, %error, goal, "the activation rung waits");
+                    self.fund_raise(goal);
                     return;
                 }
             };
+            if !matches!(step, RungStep::Raise { .. }) {
+                self.fund_raise(0);
+            }
             match step {
                 RungStep::Wait => {
                     // A lower waits on the scheduler's grant, which it
@@ -158,8 +145,29 @@ impl SharedGrow {
                         moved = evacuation.moves.len(),
                         "the activation rung is raised"
                     );
+                    self.fund_raise(0);
                 }
             }
+        }
+    }
+
+    /// Asks the planner to free what raising the activation to `rung` lacks
+    /// (its moves first, then the policy's victims, as for a waiter's
+    /// pages); with 0, or once the raise fits, says it lacks nothing.
+    fn fund_raise(&self, rung: u32) {
+        let pages = if rung == 0 {
+            0
+        } else {
+            self.shared.lock().unwrap().raise_short(rung).1
+        };
+        if pages == 0 && !self.raise_funded.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if pages > 0 {
+            self.raise_funded.store(true, Ordering::Release);
+        }
+        if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
+            planner.fund_raise(pages);
         }
     }
 
@@ -356,14 +364,4 @@ impl PoolTarget for SharedGrow {
         self.refused.swap(false, Ordering::AcqRel)
     }
 
-    /// Critical: fires take the next smaller activation rung, the walk
-    /// capping them first and lowering the pool's rung behind them.
-    fn shrink_rung(&mut self) {
-        self.want_rung(true);
-    }
-
-    /// Settled: back to the largest rung.
-    fn restore_rung(&mut self) {
-        self.want_rung(false);
-    }
 }

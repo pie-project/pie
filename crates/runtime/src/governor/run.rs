@@ -87,11 +87,7 @@ impl Steer {
                 } else {
                     read
                 };
-                let target = self.governor.tick(pressure, demand);
-                if pressure == Pressure::Critical {
-                    pool.shrink_rung();
-                }
-                target
+                self.governor.tick(pressure, demand)
             }
         };
         let limits = *self.governor.limits();
@@ -122,9 +118,6 @@ impl Steer {
         };
         if self.governor.yielding() != self.yielded {
             self.yielded = self.governor.yielding();
-            if !self.yielded {
-                pool.restore_rung();
-            }
             turn.yielding = Some(self.yielded);
         }
         if self.governor.idle() != self.idled {
