@@ -3315,10 +3315,12 @@ impl Pools {
         // Every segment the fitted pool's chunks lie in, the last as far
         // as they reach: the range is reserved for more than the fit left
         // the cache rows.
-        let fitted = self
-            .stated
-            .map_or(self.fitted_chunks(), |stated| stated.max(self.fitted_chunks()));
-        self.chunks.limit(fitted);
+        // Backed as far as the fit holds; limited to what the runtime is
+        // stated, where that is more: what the fit keeps back is backed
+        // when the runtime comes to take it.
+        let fitted = self.fitted_chunks();
+        self.chunks
+            .limit(self.stated.map_or(fitted, |stated| stated.max(fitted)));
         match self
             .chunks
             .commit_segments(&mut self.pool, self.chunks.segments_for(u64::from(fitted)))?
