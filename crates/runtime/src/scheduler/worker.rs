@@ -465,6 +465,25 @@ pub(super) enum QueuedItem {
     },
 }
 
+/// The rows the scheduler's queued and in-flight launches ask a fire to
+/// carry, held as a rung want while there are any.
+#[derive(Default)]
+struct BatchWant(Option<(usize, crate::store::shared::RungWant)>);
+
+impl BatchWant {
+    fn ask(&mut self, engine: usize, rows: usize) {
+        if rows == 0 {
+            self.0 = None;
+            return;
+        }
+        if self.0.as_ref().is_some_and(|(held, _)| *held == rows) {
+            return;
+        }
+        let want = crate::store::shared::want_rows(engine, u32::try_from(rows).unwrap_or(u32::MAX));
+        self.0 = Some((rows, want));
+    }
+}
+
 pub(super) struct QueuedLaunch {
     fire_id: u64,
     framed: bool,
@@ -1018,6 +1037,7 @@ impl BatchScheduler {
         let mut slot_buffer = SlotBuffer::new();
         let mut terminated_processes: HashSet<ProcessId> = HashSet::new();
         let mut in_flight_launches = VecDeque::new();
+        let mut batch_want = BatchWant::default();
         let mut in_flight_control = InFlightControls::default();
         let mut stopping = false;
         let mut frame_policy = FramePolicy::new(
@@ -1069,6 +1089,23 @@ impl BatchScheduler {
             progress |= Self::retire_ready_control(&mut in_flight_control);
             // A step's tokens stay within the pool's activation rung (SPEC
             // decision 6): smaller while the system is critical.
+            // What is queued and in flight asks the rung of its rows, a
+            // decode batch's lane count as any pass's (REDESIGN 2.5): it is
+            // never cut to a narrower rung for want of asking.
+            let queued: usize = pending
+                .items
+                .iter()
+                .map(|item| match item {
+                    QueuedItem::Launch(launch) => launch.request.request.tokens(),
+                    _ => 0,
+                })
+                .sum();
+            let flying = in_flight_launches
+                .iter()
+                .map(|batch: &PendingLaunchBatch| batch.total_tokens)
+                .max()
+                .unwrap_or(0);
+            batch_want.ask(engine_id, queued.max(flying).min(limits.max_forward_tokens));
             let cap = crate::store::shared::fire_cap(engine_id);
             let mut stepped = limits;
             stepped.max_forward_tokens = stepped.max_forward_tokens.min(cap as usize).max(1);
@@ -2650,6 +2687,20 @@ mod tests {
         ) -> engine::Result<engine::FrameTicket> {
             panic!("the shape of an interpreter reading lane zero of an empty cell");
         }
+    }
+
+    /// A batch of decodes asks the rung of its lane count while it is
+    /// queued or in flight, and asks nothing once none is.
+    #[test]
+    fn a_batch_asks_the_rung_of_its_rows_while_it_lasts() {
+        const ENGINE: usize = 9201;
+        let mut want = BatchWant::default();
+        want.ask(ENGINE, 16);
+        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 16);
+        want.ask(ENGINE, 64);
+        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 64);
+        want.ask(ENGINE, 0);
+        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
     }
 
     #[test]
