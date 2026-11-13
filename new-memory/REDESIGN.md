@@ -50,7 +50,9 @@ struct Ledger {            // one per device
 
 ### 2.2 `total` is measured, never configured
 
-`total = (device free after context, handles and modules are up) / chunk_bytes`, capped by `[engine.memory] budget_device` when the operator states one (the single legitimate knob: sharing a device with another process cannot be derived).
+`total = (device free after context, handles and modules are up − outside) / chunk_bytes`, capped by `[engine.memory] budget_device` when the operator states one (the single legitimate knob: sharing a device with another process cannot be derived).
+
+`outside` is what the driver allocates beside our span after that point (AMD review, MI300X): graph body instantiation (Qwen3.5-9B: 845 MiB for 161 bodies, about 11.8 KB a node), code objects of modules loaded on first use, BLAS handle workspaces we do not set, collective buffers under TP / EP. It is a fourth ledger term, **priced by measurement, not guessed**: bodies are `nodes × price`, the node count known from the compiled regions and the price measured on the first instantiation (the code already measures it); a module's bytes are the free-memory delta of its load. A flat span cannot give physical memory back, so on flat backends the span is reserved after the first body has been priced, and a rung's bodies are priced before the rung is offered.
 
 Removes: `device_memory_share`, `device_kv_budget`, the `min(128 MiB, total/10)` floor, XLA `headroom`, `[wgpu] device_memory` default of 8 GiB.
 
@@ -74,7 +76,7 @@ trait Span {
 | Vulkan, wgpu | N buffers of at most `bindings()` | no-op |
 | XLA | the pool tensor | no-op |
 
-**Flat is the base case.** Class boundaries are ledger numbers, so moving the boundary between state and fire costs nothing on a flat span. Backing on demand only matters for giving memory back to other processes; it is an optimisation of two backends, not part of the model. This removes the present ROCm oddity where lowering a rung frees nothing: state simply takes the chunks.
+**Flat is the base case.** Class boundaries are ledger numbers, so moving the boundary between state and fire costs nothing on a flat span. Today the ROCm range is allocated at its first commit, sized by the fit made before arming, so everything that fit held for arming and arming did not use (the bodies stretch, about 7 GiB on Qwen3-8B, the arena-sized scratch guess) is lost to the cache for the life of the process: the 4.6% fewer pages than main. With boundaries as ledger numbers there is nothing to lose. Backing on demand only matters for giving memory back to other processes; it is an optimisation of two backends, not part of the model. This removes the present ROCm oddity where lowering a rung frees nothing: state simply takes the chunks.
 
 Deleted: CUDA device heap, recycle shelf, endpoint pool, kernel slab map, raw `cudaMalloc` sites; Metal's second sparse buffer and `Accounting`; per-owner buffers on Vulkan / wgpu.
 
@@ -92,7 +94,7 @@ Deleted: CUDA device heap, recycle shelf, endpoint pool, kernel slab map, raw `c
 ### 2.5 Rungs: powers of two, the largest derived
 
 - Rungs are every power of two from the smallest useful fire up to the largest `r` with `floor + one working set + fire(r) <= total`. `chunk::fit` already checks this inequality; it is solved for `r` instead of halving a configured token count.
-- Carves for all rungs are computed at load (they are layouts, cheap). Bodies for a rung are armed when a pass first asks for it; a body is a model-class cache entry (2.7).
+- Carves for all rungs are computed at load (they are layouts, cheap). A rung's bodies are captured when a pass first asks for it, and the raise waits on the capture (it is already a planner waiter): every serving fire replays a captured body, never runs eagerly (existing user decision; Metal encodes live and is exempt). A body is a model-class cache entry (2.7).
 - Removes: `ACTIVATION_RUNGS`, `max_forward_tokens` as a sizing input, `tokens_within`, `TOKENS_FLOOR`, `working_set_percent`, `walk_fire_rows`, the lane/token refit.
 - The runtime side (M118: rest at the smallest rung, raise on demand as a planner waiter) is unchanged.
 
@@ -160,6 +162,6 @@ Hardware: steps 1-5 for CUDA and Vulkan/wgpu can be done on the L40S; ROCm, Meta
 
 ## 5. Open questions
 
-1. Arming a rung's bodies on first demand adds latency to the first wide pass. Acceptable, or arm every rung in the background after load?
+1. Settled: a rung's bodies are captured before its first serving fire; the raise waits (see 2.5).
 2. Vulkan / wgpu address the pool by a u32 element index (about 8 GiB) in at most four bindings. The fire carve must then sit in bindings of its own at the top of the span; is one ledger over several buffers acceptable there?
 3. The policy unit in 2.8.

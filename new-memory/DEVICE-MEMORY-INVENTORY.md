@@ -126,6 +126,18 @@ Reported, not checked:
 7. Vulkan/wgpu `LoadFacts` reports the whole pool range as committed while one segment is backed.
 8. Metal: decoded banks are missing from the first fit pass.
 
+## 6a. Measurements from the backends' own machines
+
+ROCm, MI300X (AMD session, 2026-11-13):
+- Qwen3.5-9B after load: arming takes 6442 MiB of free memory: bodies 845, scratch slabs 2528, rs scratch 1138 (first allocated at the first fire), arena growth about 1.9 GiB.
+- Scratch slabs by name, final sizes in MiB: `ssm_gdn_chunk_hct` 872, `ut` 440, `vnt` 440, `kt` 224, `w` 176, `kb` 96, `qb` 96, `gcum` 16; `linear.lt_workspace` 128 (one stream); `live_args` 8; `pie.tickets` 24 (taken by the runtime channel, outside `Ctx::scratch`). Qwen3-30B adds `linear.moe_ordered_h` 120 and `moe_route_order` 8. The growth path sums to 2992 MiB with retired slabs, against 2528 final: "old + new" is real.
+- GDN chunk-plane rows scale with the widest prefill bucket.
+- `device_memory_share` 0.9 leaves about 19.6 GiB of 196 GiB physically free on every load.
+- Qwen3-8B after arming: device used 165153 MiB; the fit's itemised sum plus what was in use before is about 166451 MiB, 1.3 GiB over (probably the arena counted both inside the range and as committed).
+- The flat range is allocated at its first commit, sized by the fit made before arming; what that fit held for arming and arming did not use is lost to the cache.
+- Driver memory allocated lazily beside our allocations: graph instantiation (about 11.8 KB a node), module code objects, rocBLAS handle workspace unless set, RCCL buffers.
+- hipBLASLt takes its workspace by pointer; rocBLAS through `rocblas_set_workspace`. One `hipMalloc` of about 150 GB works.
+
 ## 7. Not traced
 
 The compiler side that sets chunk and segment sizes and the arena map; runtime-crate callers of commit / release; device bytes of compiled objects on every backend; whether kernel modules are ever unloaded; XLA executable temporaries; Cerebras non-dense families; adapter bank placement on CUDA and ROCm; where compressor side planes live on CUDA, ROCm and Metal.
