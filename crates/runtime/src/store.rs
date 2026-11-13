@@ -3,6 +3,7 @@ pub(crate) mod genmap;
 pub(crate) mod kv;
 pub(crate) mod pool;
 pub(crate) mod registry;
+pub(crate) mod roles;
 pub(crate) mod rs;
 pub mod segments;
 pub mod shared;

@@ -128,6 +128,10 @@ pub(crate) enum TierKind {
     /// A shared pool's recurrent slots of this shape: record pieces, rs
     /// list or window list slots, moved by `copy_slots`.
     RsSlots(::engine::chunk::ShapeId),
+    /// A shared pool's instance or channel slots of this shape
+    /// ([`crate::store::roles`]): parked with their process, moved by
+    /// `copy_slots`.
+    RoleSlots(::engine::chunk::ShapeId),
 }
 
 impl TierKind {
@@ -142,6 +146,7 @@ impl TierMove {
         let kind = match self.kind {
             TierKind::Kv | TierKind::KvSlots(_) => "kv",
             TierKind::RsSlots(_) => "rs-slots",
+            TierKind::RoleSlots(_) => "role-slots",
         };
         let way = if self.out { "to" } else { "from" };
         match self.source {
@@ -154,7 +159,9 @@ impl TierMove {
     /// whole slots `(src, dst)` between `device` (or the move's source
     /// tier) and the tier; `None` for today's pages and slots.
     pub(crate) fn slot_copy(&self, device: MemoryDomain) -> Option<SlotCopy> {
-        let (TierKind::KvSlots(shape) | TierKind::RsSlots(shape)) = self.kind else {
+        let (TierKind::KvSlots(shape) | TierKind::RsSlots(shape) | TierKind::RoleSlots(shape)) =
+            self.kind
+        else {
             return None;
         };
         let device = self.source.unwrap_or(device);
@@ -188,10 +195,12 @@ pub(crate) fn copy_tier_tracked(
         anyhow::bail!("{}: only kv list slots move between tiers", copy.label());
     }
     let plan = match copy.kind {
-        TierKind::KvSlots(_) | TierKind::RsSlots(_) => PreLaunchCopy::Slots(
-            copy.slot_copy(super::device_domain(engine_idx))
-                .expect("a slot kind states a slot copy"),
-        ),
+        TierKind::KvSlots(_) | TierKind::RsSlots(_) | TierKind::RoleSlots(_) => {
+            PreLaunchCopy::Slots(
+                copy.slot_copy(super::device_domain(engine_idx))
+                    .expect("a slot kind states a slot copy"),
+            )
+        }
         TierKind::Kv => {
             let device = super::device_domain(engine_idx);
             let (src, dst, src_page_ids, dst_page_ids) = if copy.out {

@@ -63,7 +63,7 @@ pub mod verbs {
     }
 
     pub fn register_channel(
-        engine: &mut EngineBox,
+        engine: &mut dyn ::engine::Engine,
         engine_id: EngineId,
         registration: &ChannelRegistration,
     ) -> Result<RegisteredChannel> {

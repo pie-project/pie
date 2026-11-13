@@ -50,6 +50,9 @@ pub struct Stores {
     /// The shared pool's host tier, where the engine states one
     /// (CONTRACT-BC 22): what suspended and demoted state parks in.
     pub host: Option<Shared>,
+    /// The instance and channel slots, where the shared pool states their
+    /// shapes ([`super::roles`]).
+    pub roles: Option<super::roles::RolesHandle>,
 }
 
 fn context_pages(max_context: usize, kv_page_size: u32) -> u64 {
@@ -179,6 +182,7 @@ pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -
                 context_pages: context_pages(max_context, kv_page_size),
                 shared: None,
                 host: None,
+                roles: None,
             })
         })
         .collect();
@@ -227,6 +231,8 @@ pub fn shared_stores(
         context_pages: context_pages(max_context, kv_page_size),
         shared: Some(Arc::clone(shared)),
         host: tiers.host.clone(),
+        roles: super::roles::Roles::new(shared, tiers.host.as_ref())
+            .map(|roles| Arc::new(Mutex::new(roles))),
     }
 }
 
@@ -304,6 +310,7 @@ mod tests {
             context_pages: context_pages(max_context, kv_page_size),
             shared: None,
             host: None,
+            roles: None,
         });
         Ok(())
     }

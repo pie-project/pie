@@ -117,6 +117,15 @@ pub struct RingFacts {
     pub footprint: Footprint,
 }
 
+/// Whose pool slots an [`crate::Engine::rebind_slots`] moves: an
+/// instance's tables (and the rings it holds itself), or a registered
+/// channel's ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SlotOwner {
+    Instance(InstanceId),
+    Channel(crate::channel::ChannelId),
+}
+
 /// The `Channel` slots the runtime took for one of an instance's rings.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RingSlots {
