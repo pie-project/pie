@@ -924,6 +924,9 @@ impl Run<'_> {
                     "the biased select is the mxfp4 gate/up leg's; an affine bank's \
                      zero points ride the quant twin"
                 );
+                // A bank the weight cache streams reads its experts (codes,
+                // exponents and bias) through the cache's table.
+                let experts = self.bank_table(*bank);
                 linear::moe::matmul_select_bias(
                     self.ctx(),
                     self.tensor(*x),
@@ -932,8 +935,7 @@ impl Run<'_> {
                     self.tensor(*bias),
                     self.tensor(*routes),
                     &mut self.tensor(*y),
-                    // The engine streams no experts on ROCm yet.
-                    linear::moe::ExpertTable::RESIDENT,
+                    experts,
                 )
             }
             Linear::MoeSelect {
@@ -1035,9 +1037,16 @@ impl Run<'_> {
                 linear::moe::ExpertTable::RESIDENT,
             );
         }
-        let (codes, scales, biases, routes) = self
-            .staged_experts(codes, scales, biases, routes)
-            .unwrap_or((codes, scales, biases, routes));
+        // A bank the weight cache streams reads its experts through the
+        // cache's table; a bank on the expert tier's host copy is staged a
+        // call at a time.
+        let experts = self.bank_table(bank);
+        let (codes, scales, biases, routes) = if experts.tabled() {
+            (codes, scales, biases, routes)
+        } else {
+            self.staged_experts(codes, scales, biases, routes)
+                .unwrap_or((codes, scales, biases, routes))
+        };
         linear::moe::matmul_select_quant(
             self.ctx(),
             x,
@@ -1046,7 +1055,7 @@ impl Run<'_> {
             biases,
             routes,
             &mut self.tensor(y),
-            linear::moe::ExpertTable::RESIDENT,
+            experts,
         )
     }
 
