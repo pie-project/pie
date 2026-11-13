@@ -17,6 +17,7 @@ use engine::chunk::ShapeId;
 use crate::device::{Buffer, Context};
 use crate::error::{Fault, Result};
 use crate::store::Pools;
+use crate::store::layout::CHANNEL;
 
 /// A table's alignment inside an `Instance` slot: the widest field the
 /// kernels read from one (`device` address space).
@@ -92,6 +93,47 @@ impl Held {
                 slot,
                 at,
                 host,
+            },
+        };
+        region.zero()?;
+        Ok(region)
+    }
+
+    /// `bytes` zeroed bytes over the run of `count` slots of `shape` from
+    /// `first`: adjacent slots of one chunk, so one span in the view and in
+    /// the heap (STATE-ROLES.md option D).
+    pub fn in_run(
+        pools: &Pools,
+        shape: ShapeId,
+        first: u32,
+        count: u32,
+        bytes: u64,
+    ) -> Result<Held> {
+        let per_chunk = pools.slots_per_chunk(shape)?;
+        let slot_bytes = pools.slot_bytes(shape)?;
+        let last = first.checked_add(count.max(1) - 1);
+        if last.is_none_or(|last| last / per_chunk != first / per_chunk)
+            || bytes > u64::from(count) * slot_bytes
+        {
+            return Err(Fault::program(
+                "program::held",
+                format!(
+                    "a run of {count} slot(s) of shape {shape} from {first} holding {bytes} \
+                     bytes: a run lies inside one chunk of {per_chunk} slots and holds its \
+                     item whole"
+                ),
+            ));
+        }
+        let (offset, host, _) = pools.slot_place(shape, first)?;
+        let mut region = Held {
+            buffer: pools.view().clone(),
+            offset,
+            bytes,
+            place: Place::Slot {
+                shape,
+                slot: first,
+                at: 0,
+                host: HostAt(host),
             },
         };
         region.zero()?;
@@ -358,6 +400,25 @@ pub struct Cells {
     per_span: u64,
     stride: u64,
     cells: u64,
+    /// The slots of a ring held as one run (a cell past a slot), whose one
+    /// span starts at the run's first slot.
+    run: Option<u32>,
+}
+
+/// The `Channel` slots a ring takes as one run where its cell is larger
+/// than a slot (`Footprint::contiguous`), or `None` where the run would
+/// not fit one chunk of `per_chunk` slots.
+#[must_use]
+pub fn ring_run(cells: u64, stride: u64, slot_bytes: u64, per_chunk: u32) -> Option<u32> {
+    let slots = u32::try_from(cells.checked_mul(stride)?.div_ceil(slot_bytes)).ok()?;
+    (slots <= per_chunk).then_some(slots)
+}
+
+/// Whether `slots` are refs `first .. first + n` in order.
+fn consecutive(slots: &[u32]) -> bool {
+    slots
+        .windows(2)
+        .all(|pair| pair[0].checked_add(1) == Some(pair[1]))
 }
 
 /// The `Channel` slots a ring of `cells` cells of `stride` bytes takes, or
@@ -378,6 +439,7 @@ impl Cells {
             per_span: cells.max(1),
             stride,
             cells,
+            run: None,
         })
     }
 
@@ -390,15 +452,9 @@ impl Cells {
         stride: u64,
     ) -> Result<Cells> {
         let slot_bytes = pools.slot_bytes(shape)?;
-        let need = ring_slots(cells, stride, slot_bytes).ok_or_else(|| {
-            Fault::program(
-                "program::held",
-                format!(
-                    "a {stride}-byte cell is larger than a {slot_bytes}-byte channel slot, \
-                     and this ring is the engine's to keep"
-                ),
-            )
-        })?;
+        let Some(need) = ring_slots(cells, stride, slot_bytes) else {
+            return Cells::run(pools, shape, slots, cells, stride);
+        };
         if slots.len() != need as usize {
             return Err(Fault::program(
                 "program::held",
@@ -423,6 +479,41 @@ impl Cells {
             per_span,
             stride,
             cells,
+            run: None,
+        })
+    }
+
+    /// A ring whose cell is past a slot, in one run of `slots`.
+    fn run(pools: &Pools, shape: ShapeId, slots: &[u32], cells: u64, stride: u64) -> Result<Cells> {
+        let slot_bytes = pools.slot_bytes(shape)?;
+        let per_chunk = pools.slots_per_chunk(shape)?;
+        let bytes = cells
+            .checked_mul(stride)
+            .ok_or_else(|| Fault::program("program::held", "a ring past what a u64 counts"))?;
+        let need = ring_run(cells, stride, slot_bytes, per_chunk).ok_or_else(|| {
+            Fault::program(
+                "program::held",
+                format!(
+                    "a ring of {bytes} bytes is larger than a chunk of {per_chunk} \
+                     {slot_bytes}-byte channel slots, and is the engine's to keep"
+                ),
+            )
+        })?;
+        if slots.len() != need as usize || !consecutive(slots) {
+            return Err(Fault::program(
+                "program::held",
+                format!(
+                    "a ring of {cells} cells of {stride} bytes takes a run of {need} adjacent \
+                     channel slots and the binding names {slots:?}"
+                ),
+            ));
+        }
+        Ok(Cells {
+            spans: vec![Held::in_run(pools, shape, slots[0], need, bytes)?],
+            per_span: cells.max(1),
+            stride,
+            cells,
+            run: Some(need),
         })
     }
 
@@ -457,6 +548,26 @@ impl Cells {
 
     /// Moves a pooled ring to `slots`, one a span, in order.
     pub fn retarget(&mut self, pools: &Pools, slots: &[u32]) -> Result<()> {
+        if let Some(need) = self.run {
+            if slots.len() != need as usize || !consecutive(slots) {
+                return Err(Fault::program(
+                    "program::held",
+                    format!(
+                        "a ring in a run of {need} slot(s) rebound to {slots:?}, which is \
+                         not a run of as many"
+                    ),
+                ));
+            }
+            let per_chunk = pools.slots_per_chunk(CHANNEL)?;
+            let (first, last) = (slots[0], slots[slots.len() - 1]);
+            if first / per_chunk != last / per_chunk {
+                return Err(Fault::program(
+                    "program::held",
+                    format!("a ring's run {first}..={last} crosses a chunk"),
+                ));
+            }
+            return self.spans[0].retarget(pools, first);
+        }
         if self.spans.iter().any(|span| !span.is_pooled()) || slots.len() != self.spans.len() {
             return Err(Fault::program(
                 "program::held",
@@ -509,5 +620,15 @@ mod tests {
         assert_eq!(ring_slots(2, 16, 1024), Some(1));
         assert_eq!(ring_slots(12, 192, 1024), Some(3));
         assert_eq!(ring_slots(5, 600_016, 1024), None);
+    }
+
+    #[test]
+    fn a_cell_past_a_slot_takes_one_run_inside_a_chunk() {
+        use super::{consecutive, ring_run};
+        // A vocab-wide probabilities cell, capacity 4: five cells.
+        assert_eq!(ring_run(5, 607_744, 1024, 16_384), Some(2968));
+        assert_eq!(ring_run(5, 607_744, 1024, 2048), None);
+        assert!(consecutive(&[7, 8, 9]));
+        assert!(!consecutive(&[7, 9]));
     }
 }

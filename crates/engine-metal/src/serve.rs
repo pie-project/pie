@@ -1784,10 +1784,12 @@ impl Shell {
     pub fn program_facts(&self, program_id: engine::ProgramId) -> Result<engine::ProgramFacts> {
         let layout = self.pools.layout();
         match (layout.instance, layout.channel) {
-            (Some(instance), Some(channel)) => {
-                self.programs
-                    .facts(program_id, instance.slot_bytes, channel.slot_bytes)
-            }
+            (Some(instance), Some(channel)) => self.programs.facts(
+                program_id,
+                instance.slot_bytes,
+                channel.slot_bytes,
+                channel.per_chunk,
+            ),
             _ => Ok(engine::ProgramFacts::default()),
         }
     }
@@ -1796,7 +1798,7 @@ impl Shell {
     #[must_use]
     pub fn ring_facts(&self, shape: crate::program::ChannelShape) -> Option<engine::RingFacts> {
         let channel = self.pools.layout().channel?;
-        crate::program::ring_facts(0, shape, channel.slot_bytes)
+        crate::program::ring_facts(0, shape, channel.slot_bytes, channel.per_chunk)
     }
 
     pub fn register_shared_channel(

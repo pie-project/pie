@@ -26,23 +26,33 @@ pub use shared::{MAX_ATTACHMENTS, SharedRing};
 
 use crate::store::Pools;
 
-/// A ring's facts at `channel_slot`-byte `Channel` slots, or `None` where
-/// its cell is past a slot and the engine keeps it.
+/// A ring's facts at `channel_slot`-byte `Channel` slots, `per_chunk` a
+/// chunk: cells packed whole a slot, or, where a cell is past a slot, one
+/// contiguous run (STATE-ROLES.md A+D). `None` where the run would not fit
+/// a chunk: the engine keeps that ring.
 #[must_use]
 pub fn ring_facts(
     channel: u32,
     shape: ChannelShape,
     channel_slot: u64,
+    per_chunk: u32,
 ) -> Option<engine::RingFacts> {
-    let slots = shape.ring_slots(channel_slot)?;
+    let stride = shape.cell_stride() as u64;
+    let (slots, contiguous) = match shape.ring_slots(channel_slot) {
+        Some(slots) => (slots, false),
+        None => (
+            held::ring_run(shape.cell_count(), stride, channel_slot, per_chunk)?,
+            true,
+        ),
+    };
     Some(engine::RingFacts {
         channel,
         cell_bytes: shape.cell_bytes() as u64,
         capacity: shape.capacity,
         footprint: engine::Footprint {
-            bytes: shape.cell_count() * shape.cell_stride() as u64,
+            bytes: shape.cell_count() * stride,
             slots,
-            contiguous: false,
+            contiguous,
         },
     })
 }
@@ -227,6 +237,7 @@ impl Plane {
         id: ProgramId,
         instance_slot: u64,
         channel_slot: u64,
+        channel_per_chunk: u32,
     ) -> Result<engine::ProgramFacts> {
         let program = self
             .programs
@@ -249,7 +260,7 @@ impl Plane {
             .enumerate()
             .filter_map(|(channel, declared)| {
                 let shape = ChannelShape::of(declared);
-                ring_facts(channel as u32, shape, channel_slot)
+                ring_facts(channel as u32, shape, channel_slot, channel_per_chunk)
             })
             .collect();
         Ok(engine::ProgramFacts { instance, rings })
@@ -862,7 +873,12 @@ mod tests {
         let instance_slot = pools.slot_bytes(INSTANCE).expect("an instance shape");
         let channel_slot = pools.slot_bytes(CHANNEL).expect("a channel shape");
         let facts = plane
-            .facts(program, instance_slot, channel_slot)
+            .facts(
+                program,
+                instance_slot,
+                channel_slot,
+                pools.slots_per_chunk(CHANNEL).expect("a channel shape"),
+            )
             .expect("the program's facts");
         assert!(facts.instance.slots > 0, "the tables take slots: {facts:?}");
         assert!(!facts.rings.is_empty(), "the rings take slots: {facts:?}");
@@ -1032,5 +1048,141 @@ mod tests {
             )
             .expect("the slots rebind");
         assert_eq!(peak(&mut plane, 456), vec![456, 456]);
+    }
+
+    /// A ring whose cell is past a Channel slot lies in one run of adjacent
+    /// slots: what the host writes, the GPU reads at the cells' addresses,
+    /// after an evacuation moves the run's chunk and after a park moves it
+    /// to another run.
+    #[test]
+    fn a_ring_past_a_slot_lies_in_one_run() {
+        use crate::store::Pools;
+        use crate::store::layout::CHANNEL;
+        use engine::chunk::Evacuation;
+
+        const CHUNK: u64 = 16 << 20;
+        let context = Context::bind().expect("a Metal 4 device");
+        let mut pools = Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+        // 1024 f32 lanes a cell: 4 KiB, four Channel slots' worth; capacity
+        // 3, so four cells.
+        let shape = ChannelShape {
+            capacity: 3,
+            numel: 1024,
+            dtype: eta_ir::Dtype::F32,
+        };
+        let slot = pools.slot_bytes(CHANNEL).expect("a channel shape");
+        let per_chunk = pools.slots_per_chunk(CHANNEL).expect("a channel shape");
+        let facts = ring_facts(0, shape, slot, per_chunk).expect("the ring fits a chunk");
+        assert!(
+            facts.footprint.contiguous,
+            "a cell past a slot is a run: {facts:?}"
+        );
+        assert_eq!(facts.footprint.slots, 16);
+        assert_eq!(shape.ring_slots(slot), None);
+
+        // The run in logical chunk 1, not at its start.
+        let first = per_chunk + 100;
+        let run: Vec<u32> = (first..first + facts.footprint.slots).collect();
+        let ring = SharedRing::open(&context, shape, Some((&pools, &run))).expect("the ring opens");
+        assert_eq!(
+            ring.bytes(),
+            0,
+            "a pooled ring holds nothing apart from the pool"
+        );
+        let cell_bytes = shape.cell_bytes();
+        let cells = shape.cell_count();
+        let pattern = |cell: u64, salt: u8| -> Vec<u8> {
+            (0..cell_bytes)
+                .map(|at| (at as u64 * 7 + cell * 31) as u8 ^ salt)
+                .collect()
+        };
+        let gpu_reads = |ring: &SharedRing| -> Vec<Vec<u8>> {
+            let out = crate::device::Buffer::zeroed(&context, cells * cell_bytes as u64)
+                .expect("a readback");
+            let mut frame = context.frame().expect("a frame");
+            for cell in 0..cells {
+                ring.with_cells(|held| {
+                    let (span, at) = held.locate(cell)?;
+                    frame.copy_span(
+                        span.buffer(),
+                        span.offset() + at,
+                        &out,
+                        cell * cell_bytes as u64,
+                        cell_bytes as u64,
+                    )
+                })
+                .expect("the cell copies");
+            }
+            frame.commit().expect("the copies land");
+            (0..cells)
+                .map(|cell| {
+                    let mut got = vec![0u8; cell_bytes];
+                    out.read(cell * cell_bytes as u64, &mut got)
+                        .expect("the readback");
+                    got
+                })
+                .collect()
+        };
+        let write_all = |ring: &SharedRing, salt: u8| {
+            for cell in 0..cells {
+                ring.write_cell(cell, &pattern(cell, salt))
+                    .expect("the cell writes");
+            }
+        };
+        let want =
+            |salt: u8| -> Vec<Vec<u8>> { (0..cells).map(|cell| pattern(cell, salt)).collect() };
+
+        write_all(&ring, 1);
+        assert_eq!(
+            gpu_reads(&ring),
+            want(1),
+            "the GPU reads what the host wrote"
+        );
+
+        // Evacuation: logical chunk 1 moves to physical 3 and the unused
+        // chunk 2 (zeros) onto physical 1, so the old place no longer holds
+        // the cells; the ref stands.
+        let mut frame = context.frame().expect("a frame");
+        pools
+            .evacuate(
+                &mut frame,
+                &Evacuation {
+                    moves: vec![(1, 3), (2, 1)],
+                },
+            )
+            .expect("the evacuation");
+        frame.commit().expect("the copies land");
+        ring.rebind(&pools).expect("the rebind");
+        assert_eq!(gpu_reads(&ring), want(1), "the moved run reads the same");
+        write_all(&ring, 2);
+        assert_eq!(
+            gpu_reads(&ring),
+            want(2),
+            "and takes host writes where it is now"
+        );
+
+        // Park and unpark into another run of chunk 2, the old run zeroed.
+        let fresh: Vec<u32> = run.iter().map(|&r| r + per_chunk).collect();
+        let blank = 3 * per_chunk - 1;
+        let mut frame = context.frame().expect("a frame");
+        let pairs: Vec<(u32, u32)> = run.iter().copied().zip(fresh.iter().copied()).collect();
+        pools
+            .copy_shape(&mut frame, CHANNEL, &pairs)
+            .expect("the run copies");
+        frame.commit().expect("the copy lands");
+        let mut frame = context.frame().expect("a frame");
+        let blanks: Vec<(u32, u32)> = run.iter().map(|&r| (blank, r)).collect();
+        pools
+            .copy_shape(&mut frame, CHANNEL, &blanks)
+            .expect("the old run zeroes");
+        frame.commit().expect("the zeroes land");
+        let mut gapped = fresh.clone();
+        gapped[3] += 1;
+        assert!(
+            ring.retarget(&pools, &gapped).is_err(),
+            "a run is adjacent slots"
+        );
+        ring.retarget(&pools, &fresh).expect("the run moves");
+        assert_eq!(gpu_reads(&ring), want(2), "the unparked run reads the same");
     }
 }
