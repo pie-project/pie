@@ -1,6 +1,7 @@
 # The generic wafer compiler: design
 
-Status: phase 0 (baseline and design). Nothing here is built yet; ARCHITECTURE.md is what runs.
+Status: M1a and M1b done (§4.1); nothing of the wafer's stream regime builds yet. ARCHITECTURE.md is
+what runs.
 
 **Goal.** A `.poem` model the compiler has not seen runs on the wafer with no hand code. The
 primary acceptance target is `models/flux_2.poem`: a text encoder, a DiT denoiser run over whole
@@ -370,7 +371,7 @@ milestone's tail.
 - **M1b, reference.** `engine-cpu::Forward` runs flux2-mini's denoise (`attn.ragged`, `rope_axes`,
   `layernorm`, `modulate`, `sinusoid`, P11 ops). `mk_tiny_flux2.py` gives the diffusers golden.
   `Forward` must match diffusers before the wafer is compared to either.
-- **M1c, primitives**:
+- **M1c, primitives** (§4.1 lists what the M1a program asks of them):
   - P1-stream: `mv` over a row ring in the weight PE.
   - P7 v0: queries streamed over K / V stored by row, reusing `att`'s dim-major keys and
     log-sum-exp.
@@ -384,6 +385,52 @@ milestone's tail.
 - **M1e, artifact entries.** The artifact states readings and their entry streams (rows in, rows
   out, per-step lane inputs). `wafer-bench` gets a `--reading` mode that feeds a golden's inputs
   and compares outputs. The engine change is generic: it reads entries from the artifact.
+
+### 4.1 M1a / M1b: where they stand
+
+- **M1a.** `spatial::layer::stream::lower(trace, analysis, classes)` reads a stream reading into the
+  decode program's phases, a `RowClass` (a request word, its rows) at a time: classes whose bodies
+  (so weights) are equal share a `Side` of a `Stage` (entry, each layer, between two runs of layers,
+  exit): one unit. `attn.ragged` is `Mixer::Joint`: a store phase (`gather.pack_rows` x3), a
+  `Phase::Barrier`, the attend phase (`attn.ragged`, `gather.unpack_rows`). The lane vectors are the
+  program's `lanes` body (once a step); the host's ops are `Host { Rows | Table }` (`conv.patchify` /
+  `unpatchify` in and out, `conv.cells` and its split a table). Decode lowering is unchanged (the
+  stream arms are behind the reader's stream flag; plan + build of the 0.8B, gpt-oss-20b and tiny
+  t08 byte-identical). `kernels_cerebras::stream::shape` reads the params; the survey prints a
+  stream line (`STREAM-SHAPE-OK` for flux2-mini and klein).
+  - flux2-mini at 64 + 64 rows: 9 units (entry 2, double 2 + 2, single 1 + 1, exit 1), 3 layer
+    bodies; klein: 32 units, the same 3 bodies. The double body (a class each) is
+    `Rr2 Cr Mr1 Rc4 Cc X3 B X2 Mc1 Rr3 Cr Mr1 Rc1 Cc Mc1 Rr1`; the single body (both classes)
+    `Rr2 Cr Mr1 Rc4 Cc X3 B X2 Mc1 Rc1 Cc Mc1 Rr2`; the exit `Rr2 Cr Mr1`.
+- **M1b.** `engine-cpu::Forward::stream` runs a step of lanes, each its own word; the wafer's trace
+  of flux2-mini's denoise against diffusers' `Flux2Transformer2DModel` (`tools/wafer/flux/
+  mk_tiny_flux2.py`, f32 over bf16 weights; the engine-cpu test `flux_2_minis_denoise_answers_
+  diffusers`): rel L2 5.4e-3, cosine 0.999985 (trunk bf16 as the trace types it); 5.1e-6 with every
+  activation f32.
+- **What M1c needs**, read off the program:
+  - P1-stream: the sides' matvecs over a row ring, bf16 tiles and f32 accumulation (`MV 0`): per
+    double side qkv 256 -> 768, out 256 -> 256, linear_in 256 -> 1536, linear_out 768 -> 256; single
+    in_proj 256 -> 2304, out_attn, out_mlp 768 -> 256; entry context 192 -> 256, x_embed 128 -> 256;
+    exit proj_out 256 -> 128. A matvec whose input is a host row (`Cr` with no root op before it:
+    the entry) reads the token stream path straight.
+  - P7 v0: `Mixer::Joint` over the step's 128 rows (one group, non-causal, 2 heads of 128, scale
+    0.08838835): the store phase lands each row's k / v (a row's 2 x 128 bf16 each, 64 KB a block a
+    step) by row; the barrier is the last row's store; the attend phase is P6's dim-major
+    dot + log-sum-exp per query. Both classes' rows land in one store (the double blocks' two units
+    share one K / V region).
+  - P4 region printer for exactly these root ops: `layernorm` without affine (eps 1e-6; mean and
+    variance are row reductions over the unit's row roots: P3 between passes), `modulate`
+    scale-shift and the gated `residual_add` (their scale / shift / gate a lane vector resident at
+    the roots), `rmsnorm` per 128-wide head with a gain (col roots), `rope_axes` (4 axes of 32,
+    interleaved, theta 2000; P5 tables from the host's cell table, per row), SwiGLU `glu` (col
+    roots), `residual_add`.
+  - The lane prologue: a decode-regime body (`I1 Cr Mr1 Rc1 Cc Mc1`, twice, `Rr2 Cr Mr4`: the
+    timestep and guidance embedders, then mod_txt, mod_img, mod_single, norm_out) run once a step,
+    and a new link: each lane vector multicast to the roots of every unit that reads it.
+  - Host: `conv.cells` (the positions' table), `conv.patchify` in, `conv.unpatchify` out, the row
+    permutation (identity for one group); `wafer-bench --reading` (M1e) feeds them.
+  - Oracles: `kernels_ir::interp` per region; `Forward::stream` for the model, which needs a hook
+    that dumps a node's value (an op-level capture) for the per-primitive sim comparisons.
 
 ## 5. Risks
 
