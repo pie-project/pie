@@ -43,6 +43,8 @@ impl InstanceBindingPlan {
                 geometry,
                 extents,
                 device_resolved,
+                instance_slots: Vec::new(),
+                ring_slots: Vec::new(),
             },
         }
     }

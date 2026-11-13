@@ -7,7 +7,10 @@ use crate::chunk::{Evacuation, SlotCopy, WeightResidency, WeightUses};
 use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
-use crate::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
+use crate::program::{
+    BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, ProgramRegistration,
+    RingFacts,
+};
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -82,6 +85,23 @@ pub trait Engine: Send {
     fn register_program(&mut self, registration: &ProgramRegistration) -> Result<ProgramId> {
         let _ = registration;
         Err(self.unsupported("register_program"))
+    }
+
+    /// What an instance of a registered program holds in the pool's
+    /// `Instance` and `Channel` slots, asked before the runtime takes them
+    /// and binds. The default states none: the engine keeps its tables and
+    /// rings itself.
+    fn program_facts(&self, program: ProgramId) -> Result<ProgramFacts> {
+        let _ = program;
+        Ok(ProgramFacts::default())
+    }
+
+    /// The `Channel` slots a registered channel's ring takes, asked before
+    /// [`Engine::register_channel`]. `None`: the engine keeps the ring
+    /// itself.
+    fn ring_facts(&self, registration: &ChannelRegistration) -> Result<Option<RingFacts>> {
+        let _ = registration;
+        Ok(None)
     }
 
     fn register_channel(

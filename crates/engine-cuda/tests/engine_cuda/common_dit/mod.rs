@@ -555,6 +555,7 @@ impl Rig {
                 extern_dir: None,
                 capacity: 2,
                 extern_name: Vec::new(),
+                slots: Vec::new(),
             })
             .expect("the channel registers");
         id
@@ -578,6 +579,8 @@ impl Rig {
                 seeds: Vec::new(),
                 geometry: GeometryClass::Host,
                 device_resolved: Default::default(),
+                instance_slots: Vec::new(),
+                ring_slots: Vec::new(),
                 extents: engine::program::BindExtents {
                     row_count: rows,
                     token_count: rows,

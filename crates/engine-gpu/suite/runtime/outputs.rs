@@ -247,6 +247,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
                 extern_dir: None,
                 capacity: 2,
                 extern_name: Vec::new(),
+                slots: Vec::new(),
             })
             .expect("the channel registers");
         id
@@ -267,6 +268,8 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
                 ..engine::program::BindExtents::default()
             },
             device_resolved: Default::default(),
+            instance_slots: Vec::new(),
+            ring_slots: Vec::new(),
         })
         .expect("the instance binds")
         .id;

@@ -262,6 +262,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
                 extern_dir: None,
                 capacity: 2,
                 extern_name: Vec::new(),
+                slots: Vec::new(),
             })
             .expect("the channel registers");
         let instance = engine
@@ -271,6 +272,8 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
                 seeds: Vec::new(),
                 geometry: GeometryClass::Host,
                 device_resolved: Default::default(),
+                instance_slots: Vec::new(),
+                ring_slots: Vec::new(),
                 extents: engine::program::BindExtents {
                     row_count: rows,
                     token_count: rows,
