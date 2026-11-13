@@ -52,20 +52,8 @@ pub struct Accounting {
 
 impl Accounting {
     #[must_use]
-    pub fn of(card: u64, utilization: f64, weights: u64, minimum: u64) -> Accounting {
-        let fraction = if utilization.is_finite() {
-            utilization.clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-        #[expect(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "a byte count of a GPU card is far inside f64's exact integer range, \
-                      and the product is floored back into u64 deliberately"
-        )]
-        let ceiling = (card as f64 * fraction) as u64;
+    pub fn of(card: u64, allowance: engine::Allowance, weights: u64, minimum: u64) -> Accounting {
+        let ceiling = allowance.ceiling(card);
         let floor = elastic::safety_floor_bytes(card);
         Accounting {
             card,
@@ -81,18 +69,18 @@ impl Accounting {
         if self.pool >= self.minimum {
             return Ok(());
         }
-        // Dense weights always live on the device: past the share, no other
-        // knob makes room for them.
+        // Dense weights always live on the device: past the allowance, no
+        // other knob makes room for them.
         let room = self.ceiling.saturating_sub(self.floor);
         if self.weights > room {
             return Err(Fault::Residency(format!(
                 "the card does not hold this deployment's weights: they take {weights} bytes \
-                 on the device, and of its {card} bytes `[model] device_memory_share` allows \
-                 pie {ceiling}, {room} past the driver's safety floor. Dense weights always \
-                 live in device memory (only routed experts and token-id tables leave it, \
-                 through the weight cache), so serve a quantized deployment of this model, \
-                 split it across devices with tensor parallelism, or raise `[model] \
-                 device_memory_share`.",
+                 on the device, and of its {card} bytes the load's allowance (`[engine.memory] \
+                 budget_device`, or the whole card) gives pie {ceiling}, {room} past the \
+                 driver's safety floor. Dense weights always live in device memory (only \
+                 routed experts and token-id tables leave it, through the weight cache), so \
+                 serve a quantized deployment of this model, split it across devices with \
+                 tensor parallelism, or raise `[engine.memory] budget_device`.",
                 weights = self.weights,
                 card = self.card,
                 ceiling = self.ceiling,
@@ -100,14 +88,13 @@ impl Accounting {
         }
         Err(Fault::Residency(format!(
             "the card does not hold this deployment: {card} bytes on the device, of which \
-             `[model] device_memory_share` allows pie {ceiling}; this load's weight tier \
-             takes {weights} and the driver's safety floor holds back {floor}, leaving the \
-             elastic pool {pool} bytes — and the cache rows need {minimum}: `[model] \
-             device_kv_budget`, or one sequence at the declared context when that is \
-             omitted. weight tier + elastic pool + safety \
-             floor must fit inside the fraction of the card, and here they do not. Lower \
-             `[model] max_context` or `[model] slots`, raise `[model] \
-             device_memory_share`, or serve a quantized deployment of the model.",
+             the load's allowance (`[engine.memory] budget_device`, or the whole card) \
+             gives pie {ceiling}; this load's weight tier takes {weights} and the driver's \
+             safety floor holds back {floor}, leaving the elastic pool {pool} bytes — and \
+             the cache rows need {minimum}, one sequence at the declared context. weight \
+             tier + elastic pool + safety floor must fit inside the allowance, and here \
+             they do not. Lower `[engine] max_context`, raise `[engine.memory] \
+             budget_device`, or serve a quantized deployment of the model.",
             card = self.card,
             ceiling = self.ceiling,
             weights = self.weights,
@@ -304,7 +291,7 @@ pub fn page_ceiling(trace: &Trace, page_size: u32, context: u32, bytes: u64) -> 
 
 /// A model's declared context shortened to what the card holds: the
 /// longest whole number of pages, at most `declared`, at which one sequence
-/// takes no more than half of what `utilization` of the card, less what others
+/// takes no more than half of what the `allowance` of the card, less what others
 /// already hold, leaves past the weight tier: the activations and a second
 /// sequence have the other half.
 /// Never under one page.
@@ -313,7 +300,7 @@ pub fn declared_context_that_fits(
     page_size: u32,
     declared: u32,
     max_tokens: u32,
-    utilization: f64,
+    allowance: engine::Allowance,
     weights: u64,
 ) -> Result<u32> {
     let page_size = page_size.max(1);
@@ -324,7 +311,7 @@ pub fn declared_context_that_fits(
         one_slot_bytes(trace, paging)
     };
     let (free, total) = device_memory()?;
-    let room = elastic::budget_bytes(free, total, utilization)
+    let room = elastic::budget_bytes(free, total, allowance)
         .saturating_sub(weight_tier_bytes(trace, weights, 0)?)
         / 2;
     let most = declared.div_ceil(page_size).max(1);
@@ -410,7 +397,7 @@ pub fn least_sequence_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
 }
 
 pub fn admit_the_card(
-    utilization: f64,
+    allowance: engine::Allowance,
     weights: u64,
     extra_resident: u64,
     trace: &Trace,
@@ -419,7 +406,7 @@ pub fn admit_the_card(
 ) -> Result<Accounting> {
     let accounting = Accounting::of(
         device_memory()?.1,
-        utilization,
+        allowance,
         weight_tier_bytes(trace, weights, extra_resident)?,
         match kv_budget {
             Some(budget) => budget,
@@ -604,8 +591,8 @@ pub struct Pools {
     paging: Paging,
     asked: u64,
     ceiling: u64,
-    /// `[model] device_kv_budget`: the bytes the cache rows take, never cut
-    /// to fit; `None` fills what the card hands out.
+    /// A load's stated bytes for the cache rows (a test's), never cut to
+    /// fit; `None` fills what the card hands out.
     budget: Option<u64>,
     /// The chunks the fit left the cache rows, of the range's.
     fitted: u32,
@@ -790,7 +777,7 @@ impl Pools {
     #[allow(clippy::too_many_arguments)]
     pub fn reserve(
         device: i32,
-        utilization: f64,
+        allowance: engine::Allowance,
         trace: &Trace,
         paging: Paging,
         budget: Option<u64>,
@@ -802,7 +789,7 @@ impl Pools {
         rows: bool,
         one_window: bool,
     ) -> Result<Pools> {
-        let pool = PhysicalPool::open(device, utilization)?;
+        let pool = PhysicalPool::open(device, allowance)?;
         let layout = lay(
             trace,
             &paging,
@@ -1250,11 +1237,11 @@ impl Pools {
             }
             Err(_) => {
                 return Err(Fault::Residency(format!(
-                    "the card does not hold this deployment: {resident}; under `[model] \
-                     device_memory_share` that leaves {room} bytes for the state pool, and one \
-                     working set at the declared context needs {need}. Lower `[engine] \
-                     max_model_len`, raise `[model] device_memory_share`, serve a quantized \
-                     deployment of the model, or free what else holds the device."
+                    "the card does not hold this deployment: {resident}; under the load's \
+                     allowance that leaves {room} bytes for the state pool, and one working set \
+                     at the declared context needs {need}. Lower `[engine] max_context`, raise \
+                     `[engine.memory] budget_device`, serve a quantized deployment of the \
+                     model, or free what else holds the device."
                 )));
             }
         };
@@ -1283,8 +1270,9 @@ impl Pools {
                 eprintln!(
                     "engine-cuda: the weights this card holds whole leave the cache rows {} MiB, \
                      under one sequence at the declared context ({} MiB): the kv pool states \
-                     what they leave. Lower `[engine] max_model_len`, raise `[model] \
-                     device_memory_share`, or set `weight_streaming = \"on\"` to stream them.",
+                     what they leave, and live demand takes chunks from the weight cache as it \
+                     needs them. Lower `[engine] max_context` or raise `[engine.memory] \
+                     budget_device` to hold more.",
                     (u64::from(kv_chunks) * chunk) >> 20,
                     need >> 20,
                 );
@@ -2874,8 +2862,8 @@ impl Pools {
             return Err(Fault::Residency(format!(
                 "the runtime streams this load's weights, which needs a pinned host copy of \
                  them, {:.1} GiB, and this machine has {:.1} GiB of memory left for it. Give \
-                 the pool room to hold them all (`weight_streaming = \"off\"` with a larger \
-                 device share), or use a device with pageable memory access (HMM).",
+                 the pool room to hold them all (a larger `[engine.memory] budget_device`, or \
+                 a device to itself), or use a device with pageable memory access (HMM).",
                 total as f64 / f64::from(1u32 << 30),
                 have as f64 / f64::from(1u32 << 30),
             )));
@@ -3015,10 +3003,9 @@ impl Pools {
             .map(|cache| (cache.hits.ptr(), cache.slots.len() * 4))
             .chain(self.expert_caches.iter().flat_map(|cache| {
                 let experts = cache.shape.experts as usize;
-                cache
-                    .planes
-                    .iter()
-                    .filter_map(move |bank| bank.hits.as_ref().map(|hits| (hits.ptr(), experts * 4)))
+                cache.planes.iter().filter_map(move |bank| {
+                    bank.hits.as_ref().map(|hits| (hits.ptr(), experts * 4))
+                })
             }))
             .collect()
     }
@@ -3045,7 +3032,10 @@ impl Pools {
                 base: vec![0; bytes / 4],
             });
         }
-        let record = self.use_record.as_mut().expect("the use record was just made");
+        let record = self
+            .use_record
+            .as_mut()
+            .expect("the use record was just made");
         let mut reads = Vec::with_capacity(record.base.len());
         for (at, base) in record.base.iter_mut().enumerate() {
             // SAFETY: inside the record's mapped host span; a snapshot copy

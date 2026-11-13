@@ -174,16 +174,22 @@ pub(crate) struct Core {
     pub(crate) device_local: u64,
     adapter: wgpu::Adapter,
     heap: Option<Heap>,
+    /// The device's bytes as the host states them (`DeviceBoot::device_memory`).
+    stated: Option<u64>,
 }
 
 impl Core {
     /// The device bytes free to this process now: the heap's budget less its
     /// usage where the driver reports them, else the heap less every
-    /// reservation (blind to other processes); where wgpu reports no heap
-    /// (Metal, DX12, GL, a browser), the pool's own binding ceiling, four
-    /// segments of the largest storage binding.
+    /// reservation (blind to other processes). Where wgpu reports no heap
+    /// (Metal, DX12, GL, a browser): the size the host states less every
+    /// reservation, else the pool's own binding ceiling, four segments of
+    /// the largest storage binding.
     fn free(&self) -> u64 {
         let Some(heap) = self.heap else {
+            if let Some(stated) = self.stated {
+                return stated.saturating_sub(engine_gpu::books::process_reserved());
+            }
             let binding = self
                 .limits
                 .max_buffer_size
@@ -570,19 +576,25 @@ pub async fn request(boot: &DeviceBoot) -> Result<Handed> {
 }
 
 impl Context {
-    /// The device `boot` names, of which a load takes at most `budget`
-    /// bytes where stated, else what it has.
-    pub fn bind(boot: &DeviceBoot, budget: Option<u64>) -> Result<Context> {
+    /// The device `boot` names, of which a load takes what it has, no more
+    /// than `allowance.budget` where the operator states one.
+    pub fn bind(boot: &DeviceBoot, allowance: engine::Allowance) -> Result<Context> {
         let _gate = gate();
         let handed = host::block_on("request_device", request(boot))??;
-        Context::adopt(boot, budget, handed)
+        Context::adopt(boot, allowance, handed)
     }
 
-    /// A device the host already holds, of which a load takes at most
-    /// `budget` bytes where stated. wgpu reports no memory of its own: what
+    /// A device the host already holds, of which a load takes what it has,
+    /// no more than `allowance.budget` where stated. wgpu reports no memory
+    /// of its own: what
     /// the device has is read from the Vulkan driver under the adapter
     /// where there is one ([`Core::free`] says what stands in elsewhere).
-    pub fn adopt(boot: &DeviceBoot, budget: Option<u64>, handed: Handed) -> Result<Context> {
+    pub fn adopt(
+        boot: &DeviceBoot,
+        allowance: engine::Allowance,
+        handed: Handed,
+    ) -> Result<Context> {
+        let budget = allowance.budget;
         let Handed {
             adapter,
             device,
@@ -601,7 +613,10 @@ impl Context {
             }));
         }
         let (heap, sm) = vulkan_facts(&adapter);
-        let device_local = heap.map_or(0, |heap| heap.bytes);
+        let device_local = heap
+            .map(|heap| heap.bytes)
+            .or(boot.device_memory)
+            .unwrap_or(0);
         let enabled = Enabled {
             subgroups: features.contains(wgpu::Features::SUBGROUP),
             f16: features.contains(wgpu::Features::SHADER_F16),
@@ -634,6 +649,7 @@ impl Context {
             device_local,
             adapter,
             heap,
+            stated: boot.device_memory,
         });
         let dummy = Raw::new(
             &core,
@@ -1152,7 +1168,7 @@ mod tests {
         if !present() {
             return;
         }
-        let device = Context::bind(&DeviceBoot::default(), None).unwrap();
+        let device = Context::bind(&DeviceBoot::default(), engine::Allowance::WHOLE).unwrap();
         let mut buffer = Buffer::zeroed(&device, 64, engine_gpu::books::owners::SCRATCH).unwrap();
         let ramp: Vec<u8> = (1..=24).collect();
         buffer.write(0, &ramp).unwrap();

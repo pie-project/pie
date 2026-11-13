@@ -386,7 +386,6 @@ impl Engine for Metal {
                 0,
             )
         };
-        let util = residency.device_memory_share;
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
         let paging = crate::store::kv::Paging::of(budgets.page_size, budgets.max_context, 1, 1)
             .map_err(|error| fault(Fault::from(error)))?;
@@ -402,7 +401,7 @@ impl Engine for Metal {
             crate::store::accounting::Accounting::with_scratch(
                 working_set,
                 elsewhere,
-                util,
+                residency.device,
                 weights,
                 scratch,
                 kv_pool,
@@ -457,7 +456,7 @@ impl Engine for Metal {
                 context: budgets.max_context,
                 slots,
                 kv_budget: residency.device_kv_budget,
-                memory_share: residency.device_memory_share,
+                allowance: residency.device,
                 runahead: engine::runahead::Runahead::of(frames_in_flight),
                 residency: experts::Plan::default(),
                 profiles: self.boot.profiles.clone(),
@@ -465,16 +464,14 @@ impl Engine for Metal {
             .map_err(fault)?;
             let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
             if narrower >= budgets.max_tokens
-                || accounting(weights, prepared.arena_bytes())
-                    .admit(util)
-                    .is_ok()
-                || accounting(weights, 0).admit(util).is_err()
+                || accounting(weights, prepared.arena_bytes()).admit().is_ok()
+                || accounting(weights, 0).admit().is_err()
             {
                 break prepared;
             }
             eprintln!(
                 "the arena scratch for {} forward tokens ({} bytes) does not fit beside the \
-                 resident weights on this device: `[engine] max_forward_tokens` lowered to {narrower}",
+                 resident weights on this device: fires narrowed to {narrower} tokens",
                 budgets.max_tokens,
                 prepared.arena_bytes(),
             );
@@ -483,7 +480,7 @@ impl Engine for Metal {
         };
         let scratch = prepared.arena_bytes();
 
-        accounting(weights, scratch).admit(util).map_err(fault)?;
+        accounting(weights, scratch).admit().map_err(fault)?;
 
         prepared.set_residency(experts::Plan::default().with_weights_held(residency.weights_held));
         let mut shell = prepared.load().map_err(fault)?;

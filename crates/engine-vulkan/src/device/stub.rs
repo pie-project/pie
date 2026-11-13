@@ -29,7 +29,7 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn bind(_boot: &DeviceBoot, _budget: Option<u64>) -> Result<Context> {
+    pub fn bind(_boot: &DeviceBoot, _allowance: engine::Allowance) -> Result<Context> {
         Err(Fault::Deviceless)
     }
 

@@ -47,18 +47,12 @@ fn parse(config_bytes: &[u8]) -> Result<toml::Table, String> {
 }
 
 fn device_boot(doc: &toml::Table) -> Result<DeviceBoot, String> {
-    if table(doc).is_some_and(|t| t.contains_key("device_memory")) {
-        return Err(
-            "`[wgpu] device_memory` was removed: the engine measures what the device \
-                    has; state `[engine.memory] budget_device` to cap what a load takes"
-                .to_string(),
-        );
-    }
     Ok(DeviceBoot {
         adapter_index: adapter_index(doc),
         backends: backends(doc),
         power_preference: power_preference(doc),
         pipeline_cache: pipeline_cache(doc),
+        device_memory: device_memory(doc),
         profiles: profiles(doc)?,
         chunk_bytes: None,
     })
@@ -102,6 +96,14 @@ fn pipeline_cache(doc: &toml::Table) -> Option<std::path::PathBuf> {
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .map(std::path::PathBuf::from)
+}
+
+fn device_memory(doc: &toml::Table) -> Option<u64> {
+    table(doc)
+        .and_then(|t| t.get("device_memory"))
+        .and_then(toml::Value::as_integer)
+        .and_then(|v| u64::try_from(v).ok())
+        .filter(|&v| v > 0)
 }
 
 fn profiles(doc: &toml::Table) -> Result<Option<std::path::PathBuf>, String> {

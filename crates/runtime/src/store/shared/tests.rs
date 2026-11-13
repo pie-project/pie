@@ -722,14 +722,33 @@ fn a_raise_by_demand_says_what_it_lacks_and_moves_the_rest() {
     assert_eq!(pool.rung_for(16), 16);
     assert_eq!(pool.rung_for(17), 256);
     assert_eq!(pool.rung_for(5000), 2048, "past every rung: the largest");
+    assert_eq!(
+        pool.armed_rung_for(5000, 256),
+        256,
+        "a rung still being captured is not offered"
+    );
+    assert_eq!(pool.armed_rung_for(17, 256), 256);
+    assert_eq!(
+        pool.armed_rung_for(17, 0),
+        16,
+        "the smallest is always served"
+    );
+    assert_eq!(pool.armed_rung_for(5000, u32::MAX), 2048);
     pool.lower_rung(16).unwrap();
-    assert_eq!(pool.raise_short(2048), (0, 0), "an empty pool raises at once");
+    assert_eq!(
+        pool.raise_short(2048),
+        (0, 0),
+        "an empty pool raises at once"
+    );
     let all = pool
         .take_records(pool.records_available() as usize)
         .unwrap();
     let (chunks, pages) = pool.raise_short(2048);
     assert!(chunks > 0, "state fills the span: the raise lacks room");
-    assert!(pages >= chunks * 16, "16 kv pages a chunk, and the partly filled chunks' free slots on top");
+    assert!(
+        pages >= chunks * 16,
+        "16 kv pages a chunk, and the partly filled chunks' free slots on top"
+    );
     assert!(pool.plan_raise(2048).is_err());
     pool.give_records(&all[..all.len() / 2]);
     pool.pool_mut().retire_through(u64::MAX);

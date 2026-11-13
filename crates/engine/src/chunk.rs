@@ -753,10 +753,10 @@ impl std::fmt::Display for FitShort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "the device has {} MiB for the state pool under `[model] device_memory_share`, and \
-             one working set at the declared context beside the largest fire's activation takes \
-             {} MiB; raise the share, state a shorter `max_model_len`, or serve a quantized \
-             deployment of the model",
+            "the device has {} MiB for the state pool under its allowance (`[engine.memory] \
+             budget_device`, or the whole device), and one working set at the declared context \
+             beside the largest fire's activation takes {} MiB; state a shorter `[engine] \
+             max_context`, a larger budget, or serve a quantized deployment of the model",
             self.room >> 20,
             self.least >> 20,
         )

@@ -34,10 +34,11 @@ pub fn ordinals(ranks: u32) -> Vec<i32> {
     (0..ranks).map(|rank| (rank % count) as i32).collect()
 }
 
-/// The share of its device a load may hold, less what is in use as it
-/// begins (the ranks loaded before it, other processes): every load's kv
-/// is small and fixed, so the ranks sharing a device fit beside each other.
-pub const SHARE: f64 = 0.95;
+/// What a load may take of its device (`[engine.memory] budget_device`):
+/// small and fixed, so the ranks sharing a device fit beside each other.
+pub const ALLOWANCE: engine::Allowance = engine::Allowance {
+    budget: Some(1 << 30),
+};
 
 /// Each load's kv.
 pub const KV: u64 = 64 << 20;
@@ -160,9 +161,9 @@ pub fn request(trace: &Trace, checkpoint: &Path) -> LoadRequest {
             max_voxels: None,
             max_clips: None,
         },
-        // Ranks sharing a device: each its share of it, and a small kv.
+        // Ranks sharing a device: each a small budget of it, and a small kv.
         residency: Residency {
-            device_memory_share: SHARE,
+            device: ALLOWANCE,
             device_kv_budget: Some(KV),
             host_kv_budget: Some(64 << 20),
             disk_kv_budget: Some(0),

@@ -108,8 +108,40 @@ removed_keys! {
         "the engine's own weight tier it deferred is gone: dense weights always live in device memory, and the weight cache fills its own host copy";
     MaxStateSlots = "max_state_slots":
         "state now shares the device budget with kv pages";
-    WgpuDeviceMemory = "device_memory":
-        "the engine measures what the device has; state `[engine.memory] budget_device` to cap what a load takes";
+    DeviceMemoryShare = "device_memory_share":
+        "the load measures the device and takes all of it; to share the device with another process, state `[engine.memory] budget_device`";
+    DeviceKvBudget = "device_kv_budget":
+        "the kv pages and state slots take what the device holds past the weights and the fires; to cap what the load takes, state `[engine.memory] budget_device`";
+    HostKvBudget = "host_kv_budget":
+        "the host tier's cap is `[engine.memory] budget_host` now: move the value there";
+    DiskKvBudget = "disk_kv_budget":
+        "the disk tier's cap is `[engine.memory] budget_disk` now: move the value there";
+    DiskKvDir = "disk_kv_dir":
+        "the disk tier's directory is `[engine.memory] disk_path` now: move the value there";
+    DiskKvPersistent = "disk_kv_persistent":
+        "keeping the disk tier is `[engine.memory] disk_persistent` now: move the value there";
+    MemoryTolerance = "memory_tolerance":
+        "state `[engine.memory] governor_backoff` (the share of memory kept each congested stretch: dedicated 1.0, aggressive 0.9, balanced 0.8, polite 0.7) and `governor_release_idle = true` to give back memory demand stopped asking for";
+    WeightStreaming = "weight_streaming":
+        "the weight cache has no mode: every streamable weight stays resident while the device has room, and live demand takes chunks from it before any kv or state gives way";
+    MaxPatches = "max_patches":
+        "the patch rungs are derived from the device like the token rungs; a request past the largest is refused";
+    MaxImages = "max_images":
+        "the patch rungs are derived from the device like the token rungs; a request past the largest is refused";
+    MaxVoxels = "max_voxels":
+        "the voxel rungs are derived from the device like the token rungs; a request past the largest is refused";
+    MaxClips = "max_clips":
+        "the voxel rungs are derived from the device like the token rungs; a request past the largest is refused";
+    MaxForwardTokens = "max_forward_tokens":
+        "a fire's rows are the largest rung the device holds, derived at load; a request past it is refused";
+    MaxForwardRequests = "max_forward_requests":
+        "a fire's lanes are the largest rung the device holds, derived at load; a request past it is refused";
+    MaxModelLen = "max_model_len":
+        "the context cap is `[engine] max_context` now: move the value there";
+    KvPageSize = "kv_page_size":
+        "a kv page is the compiler's chunk plan";
+    DeviceMemory = "device_memory":
+        "the load measures the device; where the adapter says nothing, state `[engine.memory] budget_device`";
 }
 
 /// The refusal for `key` (dotted or bare) if it names a removed key.

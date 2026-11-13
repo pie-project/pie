@@ -76,10 +76,11 @@ pub trait Serve: Backend {
 
     /// Opens the device (adopting `handed` where the host handed one) and
     /// its tuning.
-    /// The device takes at most `budget` bytes for the load where stated.
+    /// Opens the device (adopting `handed` where the host handed one), of
+    /// which the load takes no more than `allowance` caps, and its tuning.
     fn open(
         boot: &Self::DeviceBoot,
-        budget: Option<u64>,
+        allowance: engine::Allowance,
         handed: Option<Self::Handed>,
     ) -> Result<(Self::Context, Self::Tuning)>;
 
@@ -627,11 +628,7 @@ pub struct Shell<B: Serve> {
 impl<B: Serve> Shell<B> {
     pub fn load(boot: Boot<'_, B>) -> Result<Shell<B>> {
         let mut boot = boot;
-        let (device, tuning) = B::open(
-            boot.device,
-            boot.residency.budget_device,
-            boot.handed.take(),
-        )?;
+        let (device, tuning) = B::open(boot.device, boot.residency.device, boot.handed.take())?;
         let tier = B::tier(&device);
         let chip = tuning.profile();
         let mut boot = Boot {

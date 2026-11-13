@@ -62,13 +62,13 @@ impl Serve for Api {
 
     fn open(
         boot: &crate::api::DeviceBoot,
-        budget: Option<u64>,
+        allowance: engine::Allowance,
         handed: Option<std::convert::Infallible>,
     ) -> Result<(Context, crate::tuning::Tuning)> {
         if let Some(handed) = handed {
             match handed {}
         }
-        let device = Context::bind(boot, budget)?;
+        let device = Context::bind(boot, allowance)?;
         let measured = device.chip();
         let (chip, report) = crate::chip::resolve(&measured, boot.profiles.as_deref());
         crate::chip::SHELF.tell_untuned(&measured.name, &report);

@@ -592,9 +592,10 @@ pub(crate) fn buffer_ceiling(storage_range: u32, allocation: u64, buffer: Option
 }
 
 impl Context {
-    /// Binds the device `boot` names for a load that takes at most
-    /// `budget` bytes of it where stated, else what it has.
-    pub fn bind(boot: &DeviceBoot, budget: Option<u64>) -> Result<Context> {
+    /// Binds the device `boot` names for a load that takes what it has,
+    /// no more than `allowance.budget` where the operator states one.
+    pub fn bind(boot: &DeviceBoot, allowance: engine::Allowance) -> Result<Context> {
+        let budget = allowance.budget;
         let entry = entry().map_err(|e| Fault::NoDevice {
             detail: format!("no Vulkan loader: {e}"),
         })?;

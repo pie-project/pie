@@ -36,7 +36,7 @@ pub struct Gpu {
 
 impl Gpu {
     pub fn open() -> Option<Gpu> {
-        let device = Context::bind(&DeviceBoot::default(), None).ok()?;
+        let device = Context::bind(&DeviceBoot::default(), engine::Allowance::WHOLE).ok()?;
         Some(Gpu {
             device,
             handles: Handles::new(),

@@ -285,7 +285,7 @@ pub fn load_with(
     // the device has, as tests load at once.
     let mut tries = 0;
     let quarter = loop {
-        match Context::bind(&device, None) {
+        match Context::bind(&device, engine::Allowance::WHOLE) {
             Ok(bound) => break engine_gpu::backend::Context::capacity(&bound) / 4,
             Err(why) => {
                 tries += 1;
@@ -298,7 +298,9 @@ pub fn load_with(
         }
     };
     let residency = engine::load::Residency {
-        budget_device: residency.budget_device.or(Some(quarter)),
+        device: engine::Allowance {
+            budget: residency.device.budget.or(Some(quarter)),
+        },
         ..residency
     };
     Some(

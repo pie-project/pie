@@ -65,6 +65,31 @@ class ClusterConfig:
 
 
 @dataclass
+class MemoryConfig:
+    """`[engine.memory]`: optional caps for sharing a machine. Empty, the
+    engine measures the device and uses all of it."""
+    # The most device memory the load takes ("20GiB"), per device.
+    budget_device: Optional[str] = None
+    # Pinned host bytes for suspended kv; omit for every seat at full context.
+    budget_host: Optional[str] = None
+    # Disk bytes suspended kv spills to below the host (the only tier on metal
+    # and vulkan); omit for the engine's default. The tier is always on.
+    budget_disk: Optional[str] = None
+    disk_path: Optional[str] = None
+    # Keep the disk tier for the next run (cuda): a restart takes back the
+    # sealed pages it holds as cache.
+    disk_persistent: Optional[bool] = None
+    # The share of memory kept each congested stretch (1.0: never yield).
+    governor_backoff: Optional[float] = None
+    # Give back memory demand stopped asking for.
+    governor_release_idle: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        if self.budget_host is None and os.environ.get("PIE_HOST_KV_BUDGET_DEFAULT", "1") == "1":
+            self.budget_host = "1GiB"
+
+
+@dataclass
 class EngineConfig:
     """`[engine]`: `type` and `device` are required; `options` are the
     engine's own knobs, written beside the common keys."""
@@ -72,6 +97,9 @@ class EngineConfig:
     device: list[str] = field(default_factory=list)
     tensor_parallel_size: Optional[int] = None
     activation_dtype: Optional[str] = None
+    # The longest sequence one lane holds; omit for the model's own context.
+    max_context: Optional[int] = None
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
     options: dict = field(default_factory=dict)
 
 
@@ -88,34 +116,8 @@ class ModelConfig:
     skip_parts: list[str] = field(default_factory=list)
     drafter: Optional[str] = None
     weight_dtype: Optional[str] = None
-    # Device bytes for the kv pages and state slots ("20GiB"); omit to fill
-    # what device_memory_share leaves past the weights.
-    device_kv_budget: Optional[str] = None
-    # The share of the device's memory the load may take; omit for 0.9.
-    device_memory_share: Optional[float] = None
-    # How much congestion the system may show before memory goes back:
-    # "dedicated", "aggressive", "balanced", "polite".
-    memory_tolerance: Optional[str] = None
-    # Whether MoE experts and PLE rows may leave the device under pressure
-    # before kv and state do: "auto" (on when the weights do not fit), "on", "off".
-    weight_streaming: Optional[str] = None
-    # Pinned host bytes for suspended kv; omit for every seat at full context.
-    host_kv_budget: Optional[str] = None
-    # Disk bytes suspended kv spills to below the host (the only tier on metal
-    # and vulkan); omit for the engine's default. The tier is always on.
-    disk_kv_budget: Optional[str] = None
-    disk_kv_dir: Optional[str] = None
-    # Keep the disk tier for the next run (cuda): a restart takes back the
-    # sealed pages it holds as cache.
-    disk_kv_persistent: Optional[bool] = None
-    max_patches: Optional[int] = None
-    max_images: Optional[int] = None
-    max_voxels: Optional[int] = None
-    max_clips: Optional[int] = None
 
     def __post_init__(self) -> None:
-        if self.host_kv_budget is None and os.environ.get("PIE_HOST_KV_BUDGET_DEFAULT", "1") == "1":
-            self.host_kv_budget = "1GiB"
         if self.source and not self.source.startswith(("/", "./", "../")):
             from pathlib import Path
 
@@ -188,20 +190,17 @@ class Config:
                 if os.path.isdir(art_dir):
                     source = repo_id
         model: dict = {"name": m.name, "source": source}
-        for name in ("weight_precision", "kv_dtype", "drafter", "weight_dtype", "device_kv_budget", "device_memory_share", "memory_tolerance", "weight_streaming", "host_kv_budget",
-                     "disk_kv_budget", "disk_kv_dir", "disk_kv_persistent",
-                     "max_patches", "max_images", "max_voxels", "max_clips"):
+        for name in ("weight_precision", "kv_dtype", "drafter", "weight_dtype"):
             put(model, name, getattr(m, name))
-        if "host_kv_budget" not in model:
+        memory = _block(self.engine.memory)
+        if "budget_host" not in memory:
             env_hkv = os.environ.get("PIE_HOST_KV_BUDGET", "1GiB")
             if env_hkv:
-                model["host_kv_budget"] = env_hkv
-        if "device_kv_budget" not in model:
-            # unstated, the engine fits the pool to what the weights leave under device_memory_share;
-            # a fixed 32 GiB does not fit beside the weights on a 48 GB card
-            env_dkv = os.environ.get("PIE_DEVICE_KV_BUDGET")
-            if env_dkv:
-                model["device_kv_budget"] = env_dkv
+                memory["budget_host"] = env_hkv
+        if "budget_device" not in memory:
+            env_device = os.environ.get("PIE_BUDGET_DEVICE")
+            if env_device:
+                memory["budget_device"] = env_device
         if m.skip_parts:
             model["skip_parts"] = list(m.skip_parts)
 
@@ -209,14 +208,15 @@ class Config:
         engine: dict = {"type": e.type, "device": e.device}
         put(engine, "tensor_parallel_size", e.tensor_parallel_size)
         put(engine, "activation_dtype", e.activation_dtype)
+        put(engine, "max_context", e.max_context)
         for key, value in e.options.items():
-            if key in engine:
+            if key in engine or key == "memory":
                 raise ValueError(f"engine option {key!r} collides with a common [engine] key")
             engine[key] = value
-        if "max_model_len" not in engine:
-            env_mml = os.environ.get("PIE_MAX_MODEL_LEN", "4096")
-            if env_mml:
-                engine["max_model_len"] = int(env_mml)
+        if "max_context" not in engine:
+            env_context = os.environ.get("PIE_MAX_CONTEXT", "4096")
+            if env_context:
+                engine["max_context"] = int(env_context)
 
         cluster: dict = {}
         if self.cluster.cluster_policies:
@@ -227,6 +227,7 @@ class Config:
         _emit_table(buf, "telemetry", _block(self.telemetry), leading_newline=True)
         _emit_table(buf, "model", model, leading_newline=True)
         _emit_table(buf, "engine", engine, leading_newline=True)
+        _emit_table(buf, "engine.memory", memory, leading_newline=True)
         _emit_table(buf, "runtime", _block(self.runtime), leading_newline=True)
         _emit_table(buf, "sandbox", _block(self.sandbox), leading_newline=True)
         _emit_table(buf, "cluster", cluster, leading_newline=True)

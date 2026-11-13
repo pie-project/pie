@@ -25,7 +25,7 @@ pub async fn boot(
     let artifact = PathBuf::from(MODELS_DIR).join(model_name);
     let mut config = settings.config(&artifact, &PathBuf::from("/"))?;
     config.server.worker_threads = 1;
-    config.model.disk_kv_dir = Some(PathBuf::from(KV_DIR));
+    config.engine.memory.disk_path = Some(PathBuf::from(KV_DIR));
     let Mount { len, fetch } = mount;
     ztensor::memfs::mount_lazy(&artifact, len, fetch);
     tracing::info!(

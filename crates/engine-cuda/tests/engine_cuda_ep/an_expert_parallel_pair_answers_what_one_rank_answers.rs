@@ -23,7 +23,7 @@ use poem_compiler::Budget;
 use poem_ir::{Collective, Def, Linear, Operation, Trace};
 
 use crate::micro::{
-    KV, MICRO, SHARE, Scratch, close, ordinals, prompt, ranks, values, write_checkpoint,
+    ALLOWANCE, KV, MICRO, Scratch, close, ordinals, prompt, ranks, values, write_checkpoint,
 };
 
 const CEILING: u32 = 256;
@@ -94,7 +94,7 @@ fn stage(
         context: CEILING,
         slots: 2,
         kv_budget: Some(KV),
-        memory_share: SHARE,
+        allowance: ALLOWANCE,
         ordinal,
         knobs: engine_cuda::Knobs {
             chip: Some(chip),

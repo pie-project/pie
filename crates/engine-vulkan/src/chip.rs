@@ -92,7 +92,9 @@ pub fn resolve(device: &Device, profiles: Option<&Path>) -> (Profile, Report) {
 
 #[must_use]
 pub fn probe() -> Option<(String, Facts)> {
-    let context = crate::device::Context::bind(&crate::api::DeviceBoot::default(), None).ok()?;
+    let context =
+        crate::device::Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
+            .ok()?;
     let device = context.chip();
     Some((device.name.clone(), device.facts()))
 }
@@ -315,7 +317,10 @@ mod tests {
 mod device_probe {
     #[test]
     fn the_probe_reads_the_device_it_names() {
-        let bound = crate::device::Context::bind(&crate::api::DeviceBoot::default(), None);
+        let bound = crate::device::Context::bind(
+            &crate::api::DeviceBoot::default(),
+            engine::Allowance::WHOLE,
+        );
         let Ok(context) = bound else {
             eprintln!("not asked: {:?}", bound.err());
             return;

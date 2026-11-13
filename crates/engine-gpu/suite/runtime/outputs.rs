@@ -150,7 +150,7 @@ fn epilogue() -> TraceContainer {
 #[test]
 fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
     let boot = backend::DeviceBoot::default();
-    if backend::Context::bind(&boot, None).is_err() {
+    if backend::Context::bind(&boot, engine::Allowance::WHOLE).is_err() {
         eprintln!("not asked: no device");
         return;
     }
