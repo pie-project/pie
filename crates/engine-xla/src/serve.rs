@@ -925,6 +925,26 @@ impl Shell {
         self.pools.evacuate(&self.device, &self.handles, evacuation)
     }
 
+    /// Lands `bytes` in slots `(shape, ref)` of one shape, each whole, in
+    /// order.
+    pub fn write_slot_bytes(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, u32)],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let Some(&(id, _)) = slots.first() else {
+            return Ok(());
+        };
+        if slots.iter().any(|&(other, _)| other != id) {
+            return Err(Fault::Unbound {
+                what: "slots of two shapes in one write".to_string(),
+            });
+        }
+        let refs: Vec<u32> = slots.iter().map(|&(_, r)| r).collect();
+        self.pools
+            .write_slots(&self.device, &self.handles, id, &refs, bytes)
+    }
+
     /// The bytes of slots `(shape, ref)`, in order.
     pub fn slot_bytes(&self, slots: &[(engine::chunk::ShapeId, u32)]) -> Result<Vec<u8>> {
         self.pools.read(slots)
@@ -956,6 +976,17 @@ impl Shell {
             _ => None,
         };
         Ok(())
+    }
+
+    /// The snapshots a lane lands in one fire (`crate::snapshot`), where
+    /// the load holds recurrent state.
+    #[must_use]
+    pub fn snapshots(&self) -> u32 {
+        if self.pools.has_state() {
+            crate::snapshot::MOST
+        } else {
+            0
+        }
     }
 
     /// The pool's facts with its tiers.

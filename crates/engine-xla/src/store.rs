@@ -732,6 +732,11 @@ impl Pools {
         }
     }
 
+    /// Every fixed shape and its pieces a record.
+    pub fn fixed_shapes(&self) -> impl Iterator<Item = (ShapeId, u32)> + '_ {
+        self.layout.fixed().map(|s| (s.id, s.pieces()))
+    }
+
     /// The kv list's shape, the window list's, the rs list's.
     #[must_use]
     pub fn kv_shape(&self) -> Option<ShapeId> {
@@ -946,6 +951,29 @@ impl Pools {
             spans.push((rows, from, to));
         }
         self.copy_rows(device, handles, &spans)
+    }
+
+    /// Runs, at load, every whole-record copy program a snapshot lands
+    /// (`crate::snapshot`): a record's pieces of equal rows copy in one
+    /// program, padded to a power of two, so each count up to a record's.
+    /// Each copies the pool's first rows onto themselves.
+    pub fn warm_copies(&mut self, device: &Device, handles: &Handles) -> Result<()> {
+        let mut by_rows: std::collections::BTreeMap<u64, u32> = Default::default();
+        let fixed: Vec<(ShapeId, u32)> = self.fixed_shapes().collect();
+        for (id, pieces) in fixed {
+            *by_rows
+                .entry(self.shape(id)?.slot_bytes / ROW_BYTES)
+                .or_default() += pieces;
+        }
+        for (rows, pieces) in by_rows {
+            let mut n = 1;
+            while n <= pieces.next_power_of_two() {
+                let spans = vec![(rows, 0, 0); n as usize];
+                self.copy_rows(device, handles, &spans)?;
+                n *= 2;
+            }
+        }
+        Ok(())
     }
 
     /// Copies `rows` pool rows from each span's first to its second, a
