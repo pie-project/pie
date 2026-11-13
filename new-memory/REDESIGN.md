@@ -135,7 +135,7 @@ One attribute on a role: **replayable** (kv, rs: may be dropped and rebuilt) or 
 - **Cache**: streamable atoms (as today), optional derived copies (fp8 shadow, prescaled banks, tied-embedding copy, decoded planes). Each is a `WeightShape`-like entry with a size and a cost to rebuild. This is FOLLOWUPS F1 extended from atoms to copies and bodies.
 - Removes: fp8 shadow "under free/8", XLA "under 5/8 of HBM", `bodies_mem` with its quarter rule, 512 MiB floor and 1/20 stretch, `weights_streaming`.
 
-### 2.7a The weight cache without a mode or a threshold (proposal)
+### 2.7a The weight cache without a mode or a threshold
 
 Today (`runtime/src/store/weights.rs`): `weight_streaming = auto | on | off`; `on` sheds the whole cache to its floor before anything else gives way; refill only into room no waiter is short of; order by the use record; membership changes once a window of `WINDOW_TICKS = 4` governor ticks. Rimuru (arXiv 2610.40305) has the same principle, attention state first and experts into what is free, realised with thresholds: shrink below 2 free pages, expand above 9, at most 5 experts a pass, an offline routing profile, a configured floor; it reports slow recovery after a burst.
 
@@ -145,7 +145,7 @@ The principle both share is the operating system's page cache: a weight atom is 
 2. **Among cache entries, lowest value per byte goes first**, value = use rate × miss time, both measured: for an atom, uses a second from `weight_uses` × the time to stream it from the host; for idle kv, the reuse the policy's retention key stands for × the time to replay its tokens. This is the cost-aware cache (GreedyDual-Size), the standard rule for entries of different sizes and miss costs, with a competitive bound; it replaces "weights always first". The engine publishes the facts; PLEX may reorder by key (2.8).
 3. **An atom comes back at break-even**: when the miss time it has cost since it left reaches the time to load it (the ski-rental rule, at most twice the cost of the best choice in hindsight). This replaces the window constant, and gives recovery after a burst an order: the atoms that have cost most come back first.
 
-Open: rule 2 across weights and idle kv needs a reuse estimate for idle kv where no policy sets a key; whether the runtime records prefix-cache hits has not been checked. Rules 1 and 3 need nothing new and already remove the mode key and the window constant; rule 2 can follow.
+Decided by the user (2026-11-13): rules 1 and 3 first; rule 2 after measurement. Rule 2 across weights and idle kv needs a reuse estimate for idle kv where no policy sets a key; whether the runtime records prefix-cache hits has not been checked. Rules 1 and 3 need nothing new and already remove the mode key and the window constant; rule 2 can follow.
 
 ### 2.8 Governor, PLEX and the pool: unchanged roles, fed by the ledger
 
@@ -191,7 +191,7 @@ Memory sizing reads **no key by default**. Everything below is optional; an empt
 | `disk_path`, `disk_persistent` | no disk tier | where files go is the operator's |
 | `governor_backoff`, `governor_release_idle` | dedicated: `1.0`, `false` | how much to yield when the system is congested, and whether idle memory goes back |
 
-Seven keys, none required. `governor_patience` (F2) is proposed away: in `Governor::tick` it is the count of congested ticks before the backoff acts, a debounce of the pressure signal rather than an intent, so it becomes one fixed value (to be confirmed by measurement; today's profiles tie it to the backoff: 0.9 → 4 ticks, 0.8 → 2, 0.7 → 1). Limits that are product decisions rather than memory (`max_context`, and F2's `max_batch_tokens` / `max_batch_sequences`) stay outside `[engine.memory]` as optional caps; when absent the context is the model's and the batch is the largest rung.
+Seven keys, none required. `governor_patience` (F2) goes (user decision, 2026-11-13): in `Governor::tick` it is the count of congested ticks before the backoff acts, a debounce of the pressure signal rather than an intent, so it becomes one fixed value ( today's profiles tie it to the backoff: 0.9 → 4 ticks, 0.8 → 2, 0.7 → 1). Limits that are product decisions rather than memory (`max_context`, and F2's `max_batch_tokens` / `max_batch_sequences`) stay outside `[engine.memory]` as optional caps; when absent the context is the model's and the batch is the largest rung.
 
 Removed, each refused with a message naming what replaced it:
 
@@ -232,10 +232,16 @@ Each step is mergeable alone. Steps 1-5 are verified bit-for-bit with the golden
 
 Hardware: steps 1-5 for CUDA and Vulkan/wgpu can be done on the L40S; ROCm, Metal and XLA need their own machines.
 
+## 4a. How we work on this (user, 2026-11-13)
+
+1. No full test suites and no verification done only to feel safer.
+2. An experiment needed during implementation is set up to run fast; no end-to-end runs for it.
+3. Clean implementation first; refactoring is approved where it is needed; verification may be done once per package, at its end.
+
 ## 5. Open questions
 
 1. Settled by the user: every rung's bodies are captured in the background after load (2.5). Open in its place: the rung ratio, by measuring arming time and body memory per rung.
 2. Settled by the Mac review: one ledger over several buffers (2.3), for Metal as well as Vulkan / wgpu.
 3. Settled: no valuation in the engine; PLEX weighs the facts the ledger publishes (2.8).
 4. Settled by the user: `max_patches` / `max_images` / `max_voxels` / `max_clips` go; derived rungs, only abnormal requests refused.
-5. The weight cache rule (2.7a): proposed, not decided.
+5. Settled by the user: weight cache rules 1 and 3 now, rule 2 later (2.7a); governor is two keys (section 3).
