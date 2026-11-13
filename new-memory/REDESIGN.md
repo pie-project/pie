@@ -2,6 +2,18 @@
 
 Draft, 2026-11-13. Based on `memory-followups` at dbb5e043d and the inventory in `DEVICE-MEMORY-INVENTORY.md`. Covers CUDA, ROCm, Metal, Vulkan, wgpu and XLA. Cerebras is out of scope.
 
+## North star
+
+> An operator loads any model on any device with no memory setting, and the engine uses the whole device: every byte is in one ledger, and how the bytes are split between weights, state and fires follows demand at run time.
+
+How we know we are there:
+1. **One ledger.** On every backend the ledger's sum equals what the device reports as used, at any time, asserted in tests.
+2. **Nothing to set.** A load with an empty memory config works and is the best configuration; the only keys are optional caps for sharing a machine.
+3. **Load decides one thing:** whether the floor fits. Every other split is made at run time and can be undone.
+4. **No number without a derivation.** Each remaining constant is listed in section 3 with the hardware or structural fact it comes from.
+5. **One implementation.** The ledger, the layouts and the fit are shared code; a backend supplies only how to reserve and back memory.
+6. **No loss.** Throughput and capacity are at least main's on every backend.
+
 ## 0. The one rule
 
 > Every device byte we allocate belongs to exactly one of three classes, is counted in chunks in one ledger, and the ledger holds `model + state + fire(rung) <= total` at all times. Nothing is decided at load except whether the floor fits.
@@ -98,7 +110,8 @@ Deleted: CUDA device heap, recycle shelf, endpoint pool, kernel slab map, raw `c
 ### 2.5 Rungs: powers of two, the largest derived
 
 - Rungs are every power of two from the smallest useful fire up to the largest `r` with `floor + one working set + fire(r) <= total`. `chunk::fit` already checks this inequality; it is solved for `r` instead of halving a configured token count.
-- Carves for all rungs are computed at load (they are layouts, cheap). A rung's bodies are captured when a pass first asks for it, and the raise waits on the capture (it is already a planner waiter): every serving fire replays a captured body, never runs eagerly (existing user decision; Metal encodes live and is exempt). A body is a model-class cache entry (2.7).
+- Carves for all rungs are computed at load (they are layouts, cheap). Every rung's bodies are captured in the background after load (user decision, 2026-11-13), smallest rung first; the model serves at the rungs already armed meanwhile, and a raise to a rung still being captured waits on it. Every serving fire replays a captured body, never runs eagerly (existing user decision; Metal encodes live and is exempt). Bodies are therefore a fixed model-class cost, known once arming ends, not a cache entry.
+- Because every rung is armed, the number of rungs multiplies arming time and body memory: the rung ratio (2 here) is to be set by measuring both, not assumed.
 - Removes: `ACTIVATION_RUNGS`, `max_forward_tokens` as a sizing input, `tokens_within`, `TOKENS_FLOOR`, `working_set_percent`, `walk_fire_rows`, the lane/token refit.
 - The runtime side (M118: rest at the smallest rung, raise on demand as a planner waiter) is unchanged.
 
@@ -119,7 +132,7 @@ One attribute on a role: **replayable** (kv, rs: may be dropped and rebuilt) or 
 ### 2.7 Model: a floor and a cache
 
 - **Floor**: what one fire cannot run without. Dense weights stay resident (existing user decision). Load places the floor and refuses if it does not fit. That is all load decides.
-- **Cache**: streamable atoms (as today), optional derived copies (fp8 shadow, prescaled banks, tied-embedding copy, decoded planes), compiled bodies per rung. Each is a `WeightShape`-like entry with a size and a cost to rebuild. This is FOLLOWUPS F1 extended from atoms to copies and bodies.
+- **Cache**: streamable atoms (as today), optional derived copies (fp8 shadow, prescaled banks, tied-embedding copy, decoded planes). Each is a `WeightShape`-like entry with a size and a cost to rebuild. This is FOLLOWUPS F1 extended from atoms to copies and bodies.
 - Removes: fp8 shadow "under free/8", XLA "under 5/8 of HBM", `bodies_mem` with its quarter rule, 512 MiB floor and 1/20 stretch, `weights_streaming`.
 
 ### 2.8 One policy
@@ -170,6 +183,6 @@ Hardware: steps 1-5 for CUDA and Vulkan/wgpu can be done on the L40S; ROCm, Meta
 
 ## 5. Open questions
 
-1. When a rung's bodies are captured: on the first pass that asks for the rung (the raise waits; unused rungs cost nothing), or all rungs in the background after load (no wait, but bodies for rungs never used, and capture shares the device with serving). Either way capture precedes the rung's first serving fire. Recommended: on first demand. Not decided.
+1. Settled by the user: every rung's bodies are captured in the background after load (2.5). Open in its place: the rung ratio, by measuring arming time and body memory per rung.
 2. Settled by the Mac review: one ledger over several buffers (2.3), for Metal as well as Vulkan / wgpu.
 3. The policy unit in 2.8.
