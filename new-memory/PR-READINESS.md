@@ -26,7 +26,7 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A18 | Idle cache demoted only when PLEX keys it above the floor | RT6 | done M90 |
 | A20 | Window-only models never reuse a prefix (no auto checkpoint; main reused full window pages) -> auto checkpoints at page-aligned fire ends holding window slot refs | RT8 | done M99 (gpt-oss p2048 parity with main) |
 | A22 | Metal perf vs main (M1 Max): ACCEPTED by user 2026-11-11 — c1 Qwen3-0.6B +0.3%, gemma -0.3%, Qwen3.5 -0.5% (c8 +1.1%); prefill and boot faster on all. (Metal serving encodes live on main too; ICB recording not required — user 2026-11-11) | Metal agent (sc/metal-gate) | in progress |
-| A23 | Layer-major recurrent state (one fixed shape per recurrent layer; a layer's lanes contiguous) — user 2026-11-12: prototype on CUDA, adopt on all backends ONLY if a net win (speed vs lane-major and main, fragmentation / cache pages under churn) | LM agent | prototyping |
+| A23 | Layer-major recurrent state — prototyped on CUDA (sc/layer-major 13f88fa5d): Qwen3.5 c64 +2% (to main parity), c256 / churn no gain, +75-190 MB; NOT adopted (user 2026-11-13) | — | closed |
 | A24 | engine-gpu: one crate holding everything Vulkan and wgpu share — user decision 2026-11-12 | EG agent | done M116 (tip prefill / c64 re-measure pending; tests/ still duplicated) |
 | A25 | sm_90 / sm_100 verification of A1 TMA paths: tables laid on TMA rows (b7003ab5a) must be taken by tcgen05 / wgmma arms (located, windowed) and match main's speed — needs H100 / B200 access | (hardware owner TBD) | pending hardware |
 | A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |
@@ -72,3 +72,4 @@ medians. Known gaps to close:
 - sm_90 / sm_100 speed of the A1 TMA paths unverified (A25, needs H100 / B200).
 - wgpu c1 drifts ~+-10% between sessions on this box: gate it with >= 12 reps x 10 alternating rounds, repeated in two
   sessions (scratchpad/egv/wgpair.sh). The earlier -9% was noise (rerun +6.1%, p=0.23; engine-gpu merge alone +0.6%).
+- Hybrid (Qwen3.5) CUDA decode c64 ~-2% vs main from lane-major recurrent state (layer-major prototype closes it but was not adopted: no gain at c256 / churn, all-backend layout change; prototype kept on sc/layer-major).

@@ -23,7 +23,7 @@ The KV admission wait sits inside the synchronous `submit` WIT call, so a waitin
 and admitted lanes can't drain. Make `submit` async (or add an admission future) across every SDK. Until then,
 inferlets that batch should cap their in-flight lanes (text-completion-bench: batch_concurrency).
 
-## F4 — Layer-major recurrent state — DECIDED 2026-11-12: in this PR, all backends (moved to PR-READINESS A23)
+## F4 — Layer-major recurrent state — prototyped, NOT adopted (2026-11-13): c64 +2% only; prototype on sc/layer-major
 Per-lane state records put a layer's lane states one record apart, interleaved with other layers / conv rows. In
 the partly-L2-resident regime (sm_120, 64 lanes, ~64 MB working set) any interleaving loses 12-16% on the GDN step
 vs main's gapless per-layer bank; no stride / offset skew recovers it (sweep: 528 KiB..11 MiB strides all 69-75 us
