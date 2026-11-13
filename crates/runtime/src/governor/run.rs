@@ -75,6 +75,11 @@ impl Steer {
         let moved = limits.segments(hard_limit) != limits.segments(limits.hard_limit);
         if moved {
             self.governor.set_hard_limit(hard_limit);
+            tracing::info!(
+                hard_limit,
+                held = pool.held(),
+                "the pool's hard limit moves with what the engine holds beside it"
+            );
         }
         if self.governor.tolerance().dedicated() {
             if moved && pool.growth() != Growth::Fixed {
@@ -171,6 +176,13 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
         interval.tick().await;
         steer.turn(&mut pool, Some(Pressure::Calm), &mut |_| {});
         read_ledger(&pool, engine);
+        // Chunks are handed out of mapped segments only: a pool mapped
+        // past its limit is what lets a sequence or a lease onto chunks the
+        // engine still holds.
+        let (held, hard_limit) = (pool.held(), steer.governor().limits().hard_limit);
+        if shared && held > hard_limit {
+            tracing::warn!(held, hard_limit, "the pool is mapped past its hard limit");
+        }
     }
 }
 
