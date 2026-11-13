@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::api::DeviceBoot;
 use crate::encode::Mark;
+use engine_gpu::Owner;
 use engine_gpu::error::{Fault, Result};
 
 use super::alloc::{Memory, Raw, Slab};
@@ -68,7 +69,7 @@ const SPAN_AT: u64 = (TIMING_QUERIES as u64) * 8;
 
 pub(crate) struct Timing {
     set: wgpu::QuerySet,
-    resolve: wgpu::Buffer,
+    resolve: Held,
     readback: wgpu::Buffer,
     names: Vec<String>,
 }
@@ -82,12 +83,15 @@ impl Timing {
                 ty: wgpu::QueryType::Timestamp,
                 count: TIMING_QUERIES,
             }),
-            resolve: core.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("pie timestamps resolve"),
-                size: bytes,
-                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            }),
+            resolve: core.held(
+                &wgpu::BufferDescriptor {
+                    label: Some("pie timestamps resolve"),
+                    size: bytes,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                },
+                engine_gpu::books::owners::TIMESTAMPS,
+            ),
             readback: core.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("pie timestamps readback"),
                 size: bytes,
@@ -157,19 +161,60 @@ pub(crate) struct Core {
 
     poller: host::Poller,
 
-    pub(crate) uniforms: Mutex<Vec<wgpu::Buffer>>,
-    pub(crate) scratch: Mutex<Vec<wgpu::Buffer>>,
+    pub(crate) uniforms: Mutex<Vec<Held>>,
+    pub(crate) scratch: Mutex<Vec<Held>>,
 
     pub(crate) last_error: Arc<Mutex<Option<String>>>,
-    pub(crate) allocated: AtomicU64,
+    pub(crate) books: Arc<engine_gpu::Books>,
     pub(crate) name: String,
     pub(crate) cores: Option<u32>,
     /// `None` without the subgroup feature.
     pub(crate) subgroup_min: Option<u32>,
+    /// The device-local heap's bytes, where the adapter reports one; else 0.
     pub(crate) device_local: u64,
+    adapter: wgpu::Adapter,
+    heap: Option<Heap>,
+    /// The device's bytes as the host states them (`DeviceBoot::device_memory`).
+    stated: Option<u64>,
 }
 
 impl Core {
+    /// The device bytes free to this process now: the heap's budget less its
+    /// usage where the driver reports them, else the heap less every
+    /// reservation (blind to other processes). Where wgpu reports no heap
+    /// (Metal, DX12, GL, a browser): the size the host states less every
+    /// reservation, else the pool's own binding ceiling, four segments of
+    /// the largest storage binding.
+    fn free(&self) -> u64 {
+        let Some(heap) = self.heap else {
+            if let Some(stated) = self.stated {
+                return stated.saturating_sub(engine_gpu::books::process_reserved());
+            }
+            let binding = self
+                .limits
+                .max_buffer_size
+                .min(self.limits.max_storage_buffer_binding_size);
+            return binding.saturating_mul(kernels_slang::SEGMENTS as u64);
+        };
+        match vulkan_budget(&self.adapter, heap) {
+            Some((budget, usage)) => budget.saturating_sub(usage),
+            None => heap
+                .bytes
+                .saturating_sub(engine_gpu::books::process_reserved()),
+        }
+    }
+
+    /// What the driver (wgpu's allocator blocks among it) holds for this
+    /// process in the heap beside every reservation of this process, where it
+    /// reports it.
+    fn outside(&self) -> u64 {
+        self.heap
+            .and_then(|heap| vulkan_budget(&self.adapter, heap))
+            .map_or(0, |(_, usage)| {
+                usage.saturating_sub(engine_gpu::books::process_reserved())
+            })
+    }
+
     pub(crate) fn fault(&self, what: &'static str, why: impl ToString) -> Fault {
         Fault::Wgpu {
             what,
@@ -218,42 +263,60 @@ impl Core {
         self.wait_for(&index)
     }
 
-    pub(crate) fn uniform_chunk(&self) -> wgpu::Buffer {
+    /// A buffer outside any slab, entered in the books under `owner` while
+    /// it stands.
+    pub(crate) fn held(&self, descriptor: &wgpu::BufferDescriptor<'_>, owner: Owner) -> Held {
+        let buffer = self.device.create_buffer(descriptor);
+        self.books.take(owner, buffer.size());
+        Held {
+            buffer,
+            books: Arc::clone(&self.books),
+            owner,
+        }
+    }
+
+    pub(crate) fn uniform_chunk(&self) -> Held {
         if let Some(chunk) = self.uniforms.lock().expect("uniforms lock poisoned").pop() {
             return chunk;
         }
-        self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pie uniforms"),
-            size: UNIFORM_CHUNK,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
+        self.held(
+            &wgpu::BufferDescriptor {
+                label: Some("pie uniforms"),
+                size: UNIFORM_CHUNK,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+            engine_gpu::books::owners::UNIFORMS,
+        )
     }
 
-    pub(crate) fn return_uniforms(&self, chunks: Vec<wgpu::Buffer>) {
+    pub(crate) fn return_uniforms(&self, chunks: Vec<Held>) {
         self.uniforms
             .lock()
             .expect("uniforms lock poisoned")
             .extend(chunks);
     }
 
-    pub(crate) fn scratch_chunk(&self, bytes: u64) -> wgpu::Buffer {
+    pub(crate) fn scratch_chunk(&self, bytes: u64) -> Held {
         if bytes <= SCRATCH_CHUNK
             && let Some(chunk) = self.scratch.lock().expect("scratch lock poisoned").pop()
         {
             return chunk;
         }
-        self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pie scratch"),
-            size: bytes.max(SCRATCH_CHUNK),
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
+        self.held(
+            &wgpu::BufferDescriptor {
+                label: Some("pie scratch"),
+                size: bytes.max(SCRATCH_CHUNK),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+            engine_gpu::books::owners::FRAME_SCRATCH,
+        )
     }
 
-    pub(crate) fn return_scratch(&self, chunks: Vec<wgpu::Buffer>) {
+    pub(crate) fn return_scratch(&self, chunks: Vec<Held>) {
         self.scratch
             .lock()
             .expect("scratch lock poisoned")
@@ -261,10 +324,34 @@ impl Core {
     }
 }
 
+/// A buffer the device gave outside any slab (a frame's uniform or scratch
+/// chunk, a timestamp plane, a bind group's uniforms), entered in the books
+/// while it stands.
+pub(crate) struct Held {
+    buffer: wgpu::Buffer,
+    books: Arc<engine_gpu::Books>,
+    owner: Owner,
+}
+
+impl std::ops::Deref for Held {
+    type Target = wgpu::Buffer;
+
+    fn deref(&self) -> &wgpu::Buffer {
+        &self.buffer
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.books.give(self.owner, self.buffer.size());
+    }
+}
+
 #[derive(Clone)]
 pub struct Context {
     pub(crate) core: Arc<Core>,
-    working_set: u64,
+    /// The operator's cap on what the load takes, all of it together.
+    budget: Option<u64>,
     max_buffer: u64,
     pub(crate) dummy: Slab,
     pipeline_cache: Option<std::path::PathBuf>,
@@ -276,7 +363,7 @@ impl std::fmt::Debug for Context {
         f.debug_struct("Context")
             .field("name", &self.core.name)
             .field("backend", &self.core.info.backend)
-            .field("working_set", &self.working_set)
+            .field("budget", &self.budget)
             .finish()
     }
 }
@@ -301,8 +388,18 @@ fn rank(kind: wgpu::DeviceType, preference: wgpu::PowerPreference) -> u8 {
     }
 }
 
+/// The device-local heap device reservations take, where the adapter is a
+/// Vulkan one: its index, its bytes, and whether the driver reports a
+/// budget of it (`VK_EXT_memory_budget`, which wgpu enables where offered).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Heap {
+    index: usize,
+    bytes: u64,
+    budgeted: bool,
+}
+
 #[cfg(not(any(target_vendor = "apple", target_arch = "wasm32")))]
-fn vulkan_facts(adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>) {
+fn vulkan_facts(adapter: &wgpu::Adapter) -> (Option<Heap>, Option<u32>) {
     use ash::vk;
     // SAFETY: the guard is only read through, and dropped before the adapter;
     // nothing here destroys the instance or physical device it hands out.
@@ -315,17 +412,24 @@ fn vulkan_facts(adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>) {
     // `hal`, and the call only fills the returned struct.
     let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
     let heaps = memory.memory_heap_count as usize;
+    // SAFETY: as above — a query on a live physical device of `instance`.
+    let exts =
+        unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
+    let budgeted = exts
+        .iter()
+        .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::memory_budget::NAME));
     let local = (0..heaps)
         .filter(|&i| {
             memory.memory_heaps[i]
                 .flags
                 .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
         })
-        .map(|i| memory.memory_heaps[i].size)
-        .max();
-    // SAFETY: as above — a query on a live physical device of `instance`.
-    let exts =
-        unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
+        .max_by_key(|&i| memory.memory_heaps[i].size)
+        .map(|index| Heap {
+            index,
+            bytes: memory.memory_heaps[index].size,
+            budgeted,
+        });
     // SAFETY: as above; `shader_cores` chains onto `p2` only the struct of an
     // extension `exts` says this physical device supports.
     let cores = kernels_slang::cores::shader_cores(&exts, &mut |p2| unsafe {
@@ -335,8 +439,37 @@ fn vulkan_facts(adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>) {
 }
 
 #[cfg(any(target_vendor = "apple", target_arch = "wasm32"))]
-fn vulkan_facts(_adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>) {
+fn vulkan_facts(_adapter: &wgpu::Adapter) -> (Option<Heap>, Option<u32>) {
     (None, None)
+}
+
+/// `heap`'s budget for this process and what this process holds of it, as
+/// the Vulkan driver under the adapter reports them now.
+#[cfg(not(any(target_vendor = "apple", target_arch = "wasm32")))]
+fn vulkan_budget(adapter: &wgpu::Adapter, heap: Heap) -> Option<(u64, u64)> {
+    use ash::vk;
+    if !heap.budgeted {
+        return None;
+    }
+    // SAFETY: the guard is only read through, and dropped before the adapter.
+    let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
+    let instance = hal.shared_instance().raw_instance();
+    let physical = hal.raw_physical_device();
+    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut props = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+    // SAFETY: `physical` is a live handle of `instance`, both kept alive by
+    // `hal`; the budget struct is chained only where the physical device
+    // offers `VK_EXT_memory_budget`, and both structs outlive the call.
+    unsafe { instance.get_physical_device_memory_properties2(physical, &mut props) };
+    Some((
+        budget.heap_budget[heap.index],
+        budget.heap_usage[heap.index],
+    ))
+}
+
+#[cfg(any(target_vendor = "apple", target_arch = "wasm32"))]
+fn vulkan_budget(_adapter: &wgpu::Adapter, _heap: Heap) -> Option<(u64, u64)> {
+    None
 }
 
 pub struct Handed {
@@ -443,24 +576,25 @@ pub async fn request(boot: &DeviceBoot) -> Result<Handed> {
 }
 
 impl Context {
-    /// The device `boot` names, of whose memory a load takes what
-    /// `allowance` gives.
+    /// The device `boot` names, of which a load takes what it has, no more
+    /// than `allowance.budget` where the operator states one.
     pub fn bind(boot: &DeviceBoot, allowance: engine::Allowance) -> Result<Context> {
         let _gate = gate();
         let handed = host::block_on("request_device", request(boot))??;
         Context::adopt(boot, allowance, handed)
     }
 
-    /// A device the host already holds, of whose memory a load takes what
-    /// `allowance` gives. wgpu reports no free memory, so the allowance is
-    /// of the whole: what the host states (a browser tab's
-    /// `device_memory`), else the Vulkan device-local heap, else
-    /// `[engine.memory] budget_device`, else 8 GiB.
+    /// A device the host already holds, of which a load takes what it has,
+    /// no more than `allowance.budget` where stated. wgpu reports no memory
+    /// of its own: what
+    /// the device has is read from the Vulkan driver under the adapter
+    /// where there is one ([`Core::free`] says what stands in elsewhere).
     pub fn adopt(
         boot: &DeviceBoot,
         allowance: engine::Allowance,
         handed: Handed,
     ) -> Result<Context> {
+        let budget = allowance.budget;
         let Handed {
             adapter,
             device,
@@ -479,11 +613,10 @@ impl Context {
             }));
         }
         let (heap, sm) = vulkan_facts(&adapter);
-        let device_local = boot
-            .device_memory
-            .or(heap)
-            .or(allowance.budget)
-            .unwrap_or(crate::boot::DEFAULT_DEVICE_MEMORY);
+        let device_local = heap
+            .map(|heap| heap.bytes)
+            .or(boot.device_memory)
+            .unwrap_or(0);
         let enabled = Enabled {
             subgroups: features.contains(wgpu::Features::SUBGROUP),
             f16: features.contains(wgpu::Features::SHADER_F16),
@@ -510,14 +643,22 @@ impl Context {
             uniforms: Mutex::new(Vec::new()),
             scratch: Mutex::new(Vec::new()),
             last_error,
-            allocated: AtomicU64::new(0),
+            books: Arc::new(engine_gpu::Books::new()),
             cores: sm,
             subgroup_min,
             device_local,
+            adapter,
+            heap,
+            stated: boot.device_memory,
         });
-        let dummy = Raw::new(&core, DUMMY_BYTES, Memory::Device)?;
+        let dummy = Raw::new(
+            &core,
+            DUMMY_BYTES,
+            Memory::Device,
+            engine_gpu::books::owners::DUMMY,
+        )?;
         let context = Context {
-            working_set: allowance.ceiling(device_local),
+            budget,
             max_buffer,
             core,
             dummy,
@@ -542,9 +683,20 @@ impl Context {
         self.core.info.backend.to_str()
     }
 
+    /// What the device has for this load, measured now: every reservation,
+    /// what the driver holds beside them and what is free, capped by the
+    /// operator's budget.
     #[must_use]
-    pub fn working_set(&self) -> u64 {
-        self.working_set
+    pub fn capacity(&self) -> u64 {
+        let core = &self.core;
+        let measured = core.books.device() + core.outside() + core.free();
+        self.budget.map_or(measured, |budget| measured.min(budget))
+    }
+
+    /// What the driver holds for this process beside every reservation.
+    #[must_use]
+    pub fn outside(&self) -> u64 {
+        self.core.outside()
     }
 
     #[must_use]
@@ -593,11 +745,19 @@ impl Context {
         self.core.limits.max_storage_buffers_per_shader_stage
     }
 
-    /// What the working set has left now, less this process's allocations.
+    /// What the capacity has left now, past every reservation and the
+    /// driver's own.
     #[must_use]
     pub fn left(&self) -> u64 {
-        self.working_set
-            .saturating_sub(self.core.allocated.load(Ordering::Relaxed))
+        self.capacity()
+            .saturating_sub(self.core.books.device())
+            .saturating_sub(self.core.outside())
+    }
+
+    /// The device's books: every reservation under its owner.
+    #[must_use]
+    pub fn books(&self) -> &engine_gpu::Books {
+        &self.core.books
     }
 
     pub fn bind_thread(&self) -> Result<()> {
@@ -630,7 +790,7 @@ impl Context {
 
 #[derive(Default)]
 pub(crate) struct UniformRing {
-    chunks: Vec<wgpu::Buffer>,
+    chunks: Vec<Held>,
     used: u64,
 }
 
@@ -724,10 +884,10 @@ impl Frame {
         if ring.chunks.is_empty() || at + bytes > UNIFORM_CHUNK {
             ring.chunks.push(core.uniform_chunk());
             ring.used = bytes;
-            return (ring.chunks.last().expect("just pushed").clone(), 0);
+            return ((*ring.chunks.last().expect("just pushed")).clone(), 0);
         }
         ring.used = at + bytes;
-        (ring.chunks.last().expect("non-empty").clone(), at)
+        ((*ring.chunks.last().expect("non-empty")).clone(), at)
     }
 
     pub(crate) fn timestamp_slot(&self, name: &str) -> Option<(wgpu::QuerySet, u32)> {
@@ -762,10 +922,10 @@ impl Frame {
         if ring.chunks.is_empty() || at + bytes > SCRATCH_CHUNK {
             ring.chunks.push(core.scratch_chunk(bytes));
             ring.used = bytes;
-            return (ring.chunks.last().expect("just pushed").clone(), 0);
+            return ((*ring.chunks.last().expect("just pushed")).clone(), 0);
         }
         ring.used = at + bytes;
-        (ring.chunks.last().expect("non-empty").clone(), at)
+        ((*ring.chunks.last().expect("non-empty")).clone(), at)
     }
 
     /// Writes `bytes` into `into` from `at` in queue order: the queue lands
@@ -1008,14 +1168,8 @@ mod tests {
         if !present() {
             return;
         }
-        let device = Context::bind(
-            &DeviceBoot::default(),
-            engine::Allowance {
-                budget: Some(1 << 30),
-            },
-        )
-        .unwrap();
-        let mut buffer = Buffer::zeroed(&device, 64).unwrap();
+        let device = Context::bind(&DeviceBoot::default(), engine::Allowance::WHOLE).unwrap();
+        let mut buffer = Buffer::zeroed(&device, 64, engine_gpu::books::owners::SCRATCH).unwrap();
         let ramp: Vec<u8> = (1..=24).collect();
         buffer.write(0, &ramp).unwrap();
         let mut frame = device.frame().unwrap();

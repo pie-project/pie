@@ -149,6 +149,19 @@ enum Row {
     },
 }
 
+/// A compressor's state beside kv row `row` (the row a pool gather keys
+/// by its pages), in that row's slots: the recipe's `RowId::Pool` run, a
+/// projection plane at `kv` and a score plane at `score` of the slot,
+/// `width` bf16 a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Compressed {
+    row: u32,
+    paged: Paged,
+    width: u64,
+    kv: u64,
+    score: u64,
+}
+
 /// The rs list's slot as this shell reads it: `tokens` rows of each rs
 /// plane, each of the shell's planes at `plane_at` in the slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +175,7 @@ pub struct RsRows {
 #[derive(Debug, Clone)]
 pub struct Rows {
     rows: Vec<Row>,
+    compressed: Vec<Compressed>,
     pub chunk_bytes: u64,
     pub list_bytes: u64,
     /// The list slot's tokens: the kv page size.
@@ -411,12 +425,47 @@ impl Rows {
                 }
             }
         }
+        let mut compressed = Vec::new();
+        for (row, width) in poem_compiler::chunk::census::pooled(trace) {
+            let id = RowId::Pool(row);
+            let (paged, run, run_tokens) = if let Some(run) = runs.iter().find(|run| run.row == id)
+            {
+                (Paged::List, run, tokens)
+            } else if let Some((k, run)) = window_runs
+                .iter()
+                .enumerate()
+                .find_map(|(k, runs)| runs.iter().find(|run| run.row == id).map(|run| (k, run)))
+            {
+                (Paged::Window(k), run, windows[k].tokens)
+            } else {
+                return Err(disagree(format!(
+                    "keeps no compressor state beside kv row {row}, which a pool gather \
+                         keys by"
+                )));
+            };
+            let plane = width * Dtype::Bf16.bytes_ceil();
+            if run.per_token != 2 * plane || run.offset % 4 != 0 {
+                return Err(disagree(format!(
+                    "keeps kv row {row}'s compressor state at byte {} and {} bytes a token, \
+                     where this shell keeps two word-aligned {plane}-byte planes",
+                    run.offset, run.per_token
+                )));
+            }
+            compressed.push(Compressed {
+                row,
+                paged,
+                width,
+                kv: run.offset,
+                score: run.offset + u64::from(run_tokens) * plane,
+            });
+        }
         let rs = match rs {
             None => None,
             Some(layout) => Some(rs_rows(recipe, layout)?),
         };
         Ok(Rows {
             rows,
+            compressed,
             chunk_bytes: recipe.chunk_bytes,
             list_bytes,
             tokens,
@@ -504,6 +553,7 @@ fn rs_rows(recipe: &ChunkRecipe, layout: &crate::rs::Layout) -> Result<RsRows> {
 pub struct Pools<B: Backend> {
     paging: Paging,
     rows: Vec<Row>,
+    compressed: Vec<Compressed>,
     pool: Pool<B>,
     layout: Layout,
     /// The cache rows each shape lays out: the kv list's, the record's,
@@ -539,7 +589,13 @@ impl<B: Backend> Pools<B> {
         let host = if B::MAPS_HOST {
             HostChunks::Mapped(
                 (host_chunks > 0)
-                    .then(|| B::Buffer::host(device, u64::from(host_chunks) * layout.chunk_bytes))
+                    .then(|| {
+                        B::Buffer::host(
+                            device,
+                            u64::from(host_chunks) * layout.chunk_bytes,
+                            crate::books::owners::HOST_POOL,
+                        )
+                    })
                     .transpose()?,
             )
         } else {
@@ -563,6 +619,7 @@ impl<B: Backend> Pools<B> {
             tables: rows.tables.clone(),
             rs: rows.rs,
             rows: rows.rows,
+            compressed: rows.compressed,
             pool,
             layout,
             host,
@@ -980,7 +1037,26 @@ impl<B: Backend> Pools<B> {
                 }),
             });
         }
-        Ok(CacheTable(rows))
+        let states = self
+            .compressed
+            .iter()
+            .map(|state| {
+                let stride = u32::try_from(self.unit(state.paged.shape())? / 4).unwrap_or(u32::MAX);
+                Ok((
+                    state.row,
+                    kernels_slang::attn::pool::PoolState {
+                        pool: segments,
+                        origin: [
+                            u32::try_from(state.kv / 4).unwrap_or(u32::MAX),
+                            u32::try_from(state.score / 4).unwrap_or(u32::MAX),
+                        ],
+                        page_stride: stride,
+                        pitch: u32::try_from(state.width).unwrap_or(u32::MAX),
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(CacheTable(rows, states))
     }
 
     /// Zeroes the record at `units` (a piece each): a fresh lane's state.
@@ -1434,20 +1510,9 @@ impl<B: Backend> Pools<B> {
     /// and takes the moves into the chunk table.
     /// Returns each move as `(from, to)` physical list pages: the first
     /// page of each chunk moved and the pages a chunk holds.
-    pub fn evacuate(
-        &mut self,
-        frame: &mut B::Frame,
-        evacuation: &Evacuation,
-    ) -> Result<(Vec<(u64, u64)>, u64)> {
-        let moved = self.pool.evacuate(frame, evacuation)?;
-        let per = u64::from(self.layout.list.map_or(0, |list| list.per_chunk));
-        Ok((
-            moved
-                .into_iter()
-                .map(|(from, to)| (u64::from(from) * per, u64::from(to) * per))
-                .collect(),
-            per,
-        ))
+    pub fn evacuate(&mut self, frame: &mut B::Frame, evacuation: &Evacuation) -> Result<()> {
+        self.pool.evacuate(frame, evacuation)?;
+        Ok(())
     }
 }
 
@@ -1498,7 +1563,11 @@ impl<B: Backend> Spill<B> {
         if !B::MAPS_HOST {
             return Ok(Some(Spill::Batched { file }));
         }
-        let stage = B::Buffer::host(device, (file.stride() + engine::disk::ALIGN) as u64)?;
+        let stage = B::Buffer::host(
+            device,
+            (file.stride() + engine::disk::ALIGN) as u64,
+            crate::books::owners::SPILL,
+        )?;
         let mapped = stage.mapped_ptr().ok_or(Fault::Deviceless)?;
         Ok(Some(Spill::Mapped {
             file,
@@ -1600,7 +1669,12 @@ impl<B: Backend> Spill<B> {
         } else {
             Memory::Staging
         };
-        let mut stage = B::Buffer::with(device, (batch * stride) as u64, kind)?;
+        let mut stage = B::Buffer::with(
+            device,
+            (batch * stride) as u64,
+            kind,
+            crate::books::owners::SPILL,
+        )?;
         // A multiple of the stride from an `ALIGN` boundary, so each slot in
         // it is one aligned stage.
         let mut host = engine::disk::Aligned::zeroed(batch * stride);

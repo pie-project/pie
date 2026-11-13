@@ -381,14 +381,7 @@ fn scratch() -> PathBuf {
 #[test]
 fn a_conv_decoder_fires_over_a_voxel_input() {
     let device = DeviceBoot::default();
-    if Context::bind(
-        &device,
-        engine::Allowance {
-            budget: Some(2 << 30),
-        },
-    )
-    .is_err()
-    {
+    if Context::bind(&device, engine::Allowance::WHOLE).is_err() {
         eprintln!("not asked: no device");
         return;
     }

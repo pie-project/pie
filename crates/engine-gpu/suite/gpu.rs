@@ -36,13 +36,7 @@ pub struct Gpu {
 
 impl Gpu {
     pub fn open() -> Option<Gpu> {
-        let device = Context::bind(
-            &DeviceBoot::default(),
-            engine::Allowance {
-                budget: Some(2 << 30),
-            },
-        )
-        .ok()?;
+        let device = Context::bind(&DeviceBoot::default(), engine::Allowance::WHOLE).ok()?;
         Some(Gpu {
             device,
             handles: Handles::new(),
@@ -66,7 +60,12 @@ impl Gpu {
     pub fn up(&mut self, values: &[f32]) -> (u32, Vec<f32>) {
         let halves: Vec<u16> = values.iter().map(|v| bf16(*v)).collect();
         let bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
-        let mut buf = Buffer::zeroed(&self.device, bytes.len() as u64).expect("a buffer");
+        let mut buf = Buffer::zeroed(
+            &self.device,
+            bytes.len() as u64,
+            engine_gpu::books::owners::SCRATCH,
+        )
+        .expect("a buffer");
         buf.write(0, &bytes).expect("written");
         let handle = self.handles.bind(&buf, 0, buf.bytes()).expect("bound");
         self.held.push(buf);
@@ -76,7 +75,12 @@ impl Gpu {
     /// `values` as f32 rows.
     pub fn up_f32(&mut self, values: &[f32]) -> u32 {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let mut buf = Buffer::zeroed(&self.device, bytes.len() as u64).expect("a buffer");
+        let mut buf = Buffer::zeroed(
+            &self.device,
+            bytes.len() as u64,
+            engine_gpu::books::owners::SCRATCH,
+        )
+        .expect("a buffer");
         buf.write(0, &bytes).expect("written");
         let handle = self.handles.bind(&buf, 0, buf.bytes()).expect("bound");
         self.held.push(buf);
@@ -86,7 +90,12 @@ impl Gpu {
     /// `values` as an i32 stream.
     pub fn up_i32(&mut self, values: &[i32]) -> u32 {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let mut buf = Buffer::zeroed(&self.device, bytes.len() as u64).expect("a buffer");
+        let mut buf = Buffer::zeroed(
+            &self.device,
+            bytes.len() as u64,
+            engine_gpu::books::owners::SCRATCH,
+        )
+        .expect("a buffer");
         buf.write(0, &bytes).expect("written");
         let handle = self.handles.bind(&buf, 0, buf.bytes()).expect("bound");
         self.held.push(buf);
@@ -96,7 +105,12 @@ impl Gpu {
     /// `values` as raw 32-bit words.
     pub fn up_u32(&mut self, values: &[u32]) -> u32 {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let mut buf = Buffer::zeroed(&self.device, bytes.len() as u64).expect("a buffer");
+        let mut buf = Buffer::zeroed(
+            &self.device,
+            bytes.len() as u64,
+            engine_gpu::books::owners::SCRATCH,
+        )
+        .expect("a buffer");
         buf.write(0, &bytes).expect("written");
         let handle = self.handles.bind(&buf, 0, buf.bytes()).expect("bound");
         self.held.push(buf);
@@ -104,7 +118,12 @@ impl Gpu {
     }
 
     pub fn zeros(&mut self, n: usize) -> u32 {
-        let buf = Buffer::zeroed(&self.device, (n * 2) as u64).expect("a buffer");
+        let buf = Buffer::zeroed(
+            &self.device,
+            (n * 2) as u64,
+            engine_gpu::books::owners::SCRATCH,
+        )
+        .expect("a buffer");
         let handle = self.handles.bind(&buf, 0, buf.bytes()).expect("bound");
         self.held.push(buf);
         handle

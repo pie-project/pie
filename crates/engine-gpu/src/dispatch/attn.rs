@@ -1109,8 +1109,7 @@ impl<B: Backend> Run<'_, B> {
                     self.pool(*pages),
                     *head_dim,
                     *ratio,
-                    state.state_kv,
-                    state.state_score,
+                    state,
                     ape.map(|id| self.tensor(id)),
                     self.tensor(*entries),
                 )
@@ -1139,8 +1138,7 @@ impl<B: Backend> Run<'_, B> {
                     self.tensor(*write_offset),
                     *head_dim,
                     *ratio,
-                    state.state_kv,
-                    state.state_score,
+                    state,
                 )
             }
             Attn::PoolKvAppend {

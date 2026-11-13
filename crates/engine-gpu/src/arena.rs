@@ -16,7 +16,7 @@ pub struct Arena<B: Backend> {
 impl<B: Backend> Arena<B> {
     pub fn reserve(device: &B::Context, map: &ArenaMap) -> Result<Arena<B>> {
         Ok(Arena {
-            store: B::Buffer::zeroed(device, map.bytes)?,
+            store: B::Buffer::zeroed(device, map.bytes, crate::books::owners::ARENA)?,
         })
     }
 

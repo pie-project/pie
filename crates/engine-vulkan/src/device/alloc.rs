@@ -5,6 +5,7 @@ use std::sync::Arc;
 use ash::vk;
 use engine_gpu::pread::pread_jobs;
 
+use engine_gpu::Owner;
 use engine_gpu::error::{Fault, Result};
 
 use super::ctx::{Context, Core, STAGING_BYTES, note_reservation};
@@ -17,8 +18,10 @@ pub(crate) struct Raw {
     memory: vk::DeviceMemory,
     pub(crate) size: u64,
     /// What the driver took for it (its requirement, at least `size`):
-    /// what `Core::allocated` counts.
+    /// what the device's books count, where it lies in a device-local heap.
     charged: u64,
+    /// Whose it is in the device's books; `None` off the device's heaps.
+    owner: Option<Owner>,
     pub(crate) mapped: Option<NonNull<u8>>,
     pub(crate) kind: Memory,
 }
@@ -57,7 +60,7 @@ impl Raw {
         }
     }
 
-    pub(crate) fn new(core: &Arc<Core>, bytes: u64, kind: Memory) -> Result<Slab> {
+    pub(crate) fn new(core: &Arc<Core>, bytes: u64, kind: Memory, owner: Owner) -> Result<Slab> {
         note_reservation();
         let size = bytes.max(4).next_multiple_of(4);
         let d = &core.device;
@@ -102,9 +105,7 @@ impl Raw {
                             "host-visible memory"
                         },
                         need: need.size,
-                        have: core.device_local.saturating_sub(
-                            core.allocated.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
+                        have: core.device_local.saturating_sub(core.books.device()),
                     });
                 }
                 return Err(core.fault("vkAllocateMemory", e));
@@ -137,14 +138,22 @@ impl Raw {
                 }
             }
         };
-        core.allocated
-            .fetch_add(need.size, std::sync::atomic::Ordering::Relaxed);
+        // A host-visible type off every device-local heap is host memory.
+        let heap = core.memory.memory_types[index as usize].heap_index as usize;
+        let owner = core.memory.memory_heaps[heap]
+            .flags
+            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+            .then_some(owner);
+        if let Some(owner) = owner {
+            core.books.take(owner, need.size);
+        }
         Ok(Arc::new(Raw {
             core: Arc::clone(core),
             buffer,
             memory,
             size,
             charged: need.size,
+            owner,
             mapped,
             kind,
         }))
@@ -292,9 +301,9 @@ impl Drop for Raw {
             d.destroy_buffer(self.buffer, None);
             d.free_memory(self.memory, None);
         }
-        self.core
-            .allocated
-            .fetch_sub(self.charged, std::sync::atomic::Ordering::Relaxed);
+        if let Some(owner) = self.owner {
+            self.core.books.give(owner, self.charged);
+        }
     }
 }
 
@@ -314,16 +323,16 @@ impl std::fmt::Debug for Buffer {
 }
 
 impl Buffer {
-    pub fn zeroed(device: &Context, bytes: u64) -> Result<Buffer> {
-        Buffer::with(device, bytes, Memory::Device)
+    pub fn zeroed(device: &Context, bytes: u64, owner: Owner) -> Result<Buffer> {
+        Buffer::with(device, bytes, Memory::Device, owner)
     }
 
-    pub fn host(device: &Context, bytes: u64) -> Result<Buffer> {
-        Buffer::with(device, bytes, Memory::Host)
+    pub fn host(device: &Context, bytes: u64, owner: Owner) -> Result<Buffer> {
+        Buffer::with(device, bytes, Memory::Host, owner)
     }
 
-    pub fn with(device: &Context, bytes: u64, kind: Memory) -> Result<Buffer> {
-        let slab = Raw::new(device.core(), bytes, kind)?;
+    pub fn with(device: &Context, bytes: u64, kind: Memory, owner: Owner) -> Result<Buffer> {
+        let slab = Raw::new(device.core(), bytes, kind, owner)?;
         let buffer = Buffer { slab, bytes };
         buffer.slab.zero(0, buffer.slab.size)?;
         Ok(buffer)
@@ -405,8 +414,8 @@ impl Buffer {
 }
 
 impl engine_gpu::Buffer<super::Api> for Buffer {
-    fn with(device: &Context, bytes: u64, kind: Memory) -> Result<Buffer> {
-        Buffer::with(device, bytes, kind)
+    fn with(device: &Context, bytes: u64, kind: Memory, owner: Owner) -> Result<Buffer> {
+        Buffer::with(device, bytes, kind, owner)
     }
 
     fn bytes(&self) -> u64 {

@@ -378,7 +378,7 @@ impl<B: Backend> Inputs<B> {
         });
         let total = at;
 
-        let store = B::Buffer::host(device, total)?;
+        let store = B::Buffer::host(device, total, crate::books::owners::INPUTS)?;
         Ok(Inputs {
             store,
             tokens,
@@ -440,7 +440,11 @@ impl<B: Backend> Inputs<B> {
             .as_ref()
             .is_none_or(|held| held.bytes() < image.len() as u64)
         {
-            let grown = B::Buffer::host(device, (image.len() as u64).next_power_of_two())?;
+            let grown = B::Buffer::host(
+                device,
+                (image.len() as u64).next_power_of_two(),
+                crate::books::owners::INPUTS,
+            )?;
             if let Some(old) = self.group_masks.replace(grown) {
                 self.outgrown.push(old);
             }

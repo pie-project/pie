@@ -509,8 +509,12 @@ mod device {
         };
         for _ in 0..copies {
             for (bytes, into) in [(&packed, 0), (&sc, 1), (&bi, 2)] {
-                let mut b =
-                    Buffer::zeroed(device, bytes.len() as u64).map_err(|e| e.to_string())?;
+                let mut b = Buffer::zeroed(
+                    device,
+                    bytes.len() as u64,
+                    engine_gpu::books::owners::TUNING,
+                )
+                .map_err(|e| e.to_string())?;
                 b.write(0, bytes).map_err(|e| e.to_string())?;
                 let h = handles.bind(&b, 0, b.bytes()).map_err(|e| e.to_string())?;
                 match into {
@@ -569,7 +573,10 @@ mod device {
                 act_bytes[2 * i..2 * i + 2].copy_from_slice(&bf16(v));
                 act[i] = seen(v);
             }
-            let alloc = |bytes: u64| Buffer::zeroed(device, bytes).map_err(|e| e.to_string());
+            let alloc = |bytes: u64| {
+                Buffer::zeroed(device, bytes, engine_gpu::books::owners::TUNING)
+                    .map_err(|e| e.to_string())
+            };
             let mut act_b = alloc(act_bytes.len() as u64)?;
             act_b.write(0, &act_bytes).map_err(|e| e.to_string())?;
             let out_b = alloc(u64::from(cap) * u64::from(n) * 2)?;

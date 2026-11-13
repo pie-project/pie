@@ -53,7 +53,12 @@ impl Context {
     }
 
     #[must_use]
-    pub fn working_set(&self) -> u64 {
+    pub fn capacity(&self) -> u64 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn outside(&self) -> u64 {
         match self.never {}
     }
 
@@ -104,6 +109,11 @@ impl Context {
 
     #[must_use]
     pub fn left(&self) -> u64 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn books(&self) -> &engine_gpu::Books {
         match self.never {}
     }
 
@@ -192,15 +202,20 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    pub fn zeroed(_device: &Context, _bytes: u64) -> Result<Buffer> {
+    pub fn zeroed(_device: &Context, _bytes: u64, _owner: engine_gpu::Owner) -> Result<Buffer> {
         Err(Fault::Deviceless)
     }
 
-    pub fn host(_device: &Context, _bytes: u64) -> Result<Buffer> {
+    pub fn host(_device: &Context, _bytes: u64, _owner: engine_gpu::Owner) -> Result<Buffer> {
         Err(Fault::Deviceless)
     }
 
-    pub fn with(_device: &Context, _bytes: u64, _kind: Memory) -> Result<Buffer> {
+    pub fn with(
+        _device: &Context,
+        _bytes: u64,
+        _kind: Memory,
+        _owner: engine_gpu::Owner,
+    ) -> Result<Buffer> {
         Err(Fault::Deviceless)
     }
 
@@ -267,8 +282,13 @@ impl Buffer {
 }
 
 impl engine_gpu::Buffer<super::Api> for Buffer {
-    fn with(device: &Context, bytes: u64, kind: Memory) -> Result<Buffer> {
-        Buffer::with(device, bytes, kind)
+    fn with(
+        device: &Context,
+        bytes: u64,
+        kind: Memory,
+        owner: engine_gpu::Owner,
+    ) -> Result<Buffer> {
+        Buffer::with(device, bytes, kind, owner)
     }
 
     fn bytes(&self) -> u64 {

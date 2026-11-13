@@ -130,7 +130,12 @@ impl Session {
             });
         }
 
-        let mut status = Buffer::with(device, eta_exec::STATUS_BYTES as u64, Memory::Host)?;
+        let mut status = Buffer::with(
+            device,
+            eta_exec::STATUS_BYTES as u64,
+            Memory::Host,
+            engine_gpu::books::owners::GUEST,
+        )?;
         status.write(0, &[0u8; eta_exec::STATUS_BYTES])?;
 
         let core = device.core().clone();
@@ -321,7 +326,10 @@ impl Session {
         let id = self.channel(channel)?;
         let mut kept = self.kept.lock().expect("kept cells lock poisoned");
         if kept.get(&id).is_none_or(|cell| cell.bytes() < len) {
-            kept.insert(id, Buffer::zeroed(device, len)?);
+            kept.insert(
+                id,
+                Buffer::zeroed(device, len, engine_gpu::books::owners::GUEST)?,
+            );
         }
         frame.copy(&self.stages[stage].heap, at, &kept[&id], 0, len)
     }
@@ -333,7 +341,12 @@ impl Session {
         let spare = self.landings.lock().expect("landings lock poisoned").pop();
         match spare {
             Some(buffer) if buffer.bytes() >= bytes => Ok(buffer),
-            _ => Buffer::with(device, bytes, Memory::Host),
+            _ => Buffer::with(
+                device,
+                bytes,
+                Memory::Host,
+                engine_gpu::books::owners::GUEST,
+            ),
         }
     }
 
@@ -601,25 +614,49 @@ fn build_stage(
         lane: 0,
     };
 
-    let mut descs = Buffer::zeroed(device, desc_bytes.len().max(DESC_WORDS * 4) as u64)?;
+    let mut descs = Buffer::zeroed(
+        device,
+        desc_bytes.len().max(DESC_WORDS * 4) as u64,
+        engine_gpu::books::owners::GUEST,
+    )?;
     descs.write(0, &desc_bytes)?;
-    let mut offs = Buffer::zeroed(device, (offset_words.len().max(1) * 4) as u64)?;
+    let mut offs = Buffer::zeroed(
+        device,
+        (offset_words.len().max(1) * 4) as u64,
+        engine_gpu::books::owners::GUEST,
+    )?;
     offs.write(0, &words_le(&offset_words))?;
     let mut params = Buffer::zeroed(
         device,
         (records.len().max(1) * size_of::<OpParams>()) as u64,
+        engine_gpu::books::owners::GUEST,
     )?;
     if !records.is_empty() {
         let record_bytes: Vec<u8> = records.iter().flat_map(OpParams::to_le_bytes).collect();
         params.write(0, &record_bytes)?;
     }
-    let mut cfg = Buffer::with(device, size_of::<Cfg>() as u64, Memory::Host)?;
+    let mut cfg = Buffer::with(
+        device,
+        size_of::<Cfg>() as u64,
+        Memory::Host,
+        engine_gpu::books::owners::GUEST,
+    )?;
     cfg.write(0, &config.to_le_bytes())?;
 
     let bytes = scratch.total.max(256);
-    let heap = Buffer::zeroed(device, bytes)?;
-    let staging = Buffer::with(device, bytes, Memory::Host)?;
-    let landing = Buffer::with(device, bytes, Memory::Host)?;
+    let heap = Buffer::zeroed(device, bytes, engine_gpu::books::owners::GUEST_STATE)?;
+    let staging = Buffer::with(
+        device,
+        bytes,
+        Memory::Host,
+        engine_gpu::books::owners::GUEST,
+    )?;
+    let landing = Buffer::with(
+        device,
+        bytes,
+        Memory::Host,
+        engine_gpu::books::owners::GUEST,
+    )?;
 
     Ok(Stage {
         built,

@@ -155,7 +155,7 @@ type BindKey = (usize, Vec<View>, Vec<u8>);
 struct BindCache {
     groups: HashMap<BindKey, wgpu::BindGroup>,
 
-    chunks: Vec<wgpu::Buffer>,
+    chunks: Vec<super::ctx::Held>,
     used: u64,
 }
 
@@ -248,19 +248,20 @@ impl Pipelines {
             let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
             let at = binds.used.next_multiple_of(align);
             if binds.chunks.is_empty() || at + uniform_bytes > UNIFORM_ARENA_CHUNK {
-                binds
-                    .chunks
-                    .push(core.device.create_buffer(&wgpu::BufferDescriptor {
+                binds.chunks.push(core.held(
+                    &wgpu::BufferDescriptor {
                         label: Some("pie uniform arena"),
                         size: UNIFORM_ARENA_CHUNK,
                         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                         mapped_at_creation: false,
-                    }));
+                    },
+                    engine_gpu::books::owners::UNIFORMS,
+                ));
                 binds.used = 0;
             }
             let at = binds.used.next_multiple_of(align);
             binds.used = at + uniform_bytes;
-            let chunk = binds.chunks.last().expect("non-empty").clone();
+            let chunk = (*binds.chunks.last().expect("non-empty")).clone();
             let mut padded = scalars.to_vec();
             padded.resize(uniform_bytes as usize, 0);
             core.queue.write_buffer(&chunk, at, &padded);

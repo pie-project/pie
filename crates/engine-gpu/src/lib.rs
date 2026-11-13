@@ -7,6 +7,7 @@ pub mod api;
 pub mod arena;
 pub mod backend;
 pub mod blob;
+pub mod books;
 pub mod chunks;
 pub mod decoded;
 mod dispatch;
@@ -33,6 +34,7 @@ pub mod weights;
 pub mod window;
 
 pub use backend::{Backend, Buffer, Memory};
+pub use books::{Books, Owner};
 pub use error::{Fault, Result, kernel};
 pub use handles::{Binding, Handles, NIL};
 pub use settle::{Airborne, Arms, Done};

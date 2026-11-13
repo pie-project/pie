@@ -3,8 +3,6 @@ use engine_gpu::api::ContractFor;
 
 pub const DEFAULT_POWER_PREFERENCE: &str = "high-performance";
 
-pub const DEFAULT_DEVICE_MEMORY: u64 = 8 << 30;
-
 pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Wgpu, String> {
     let doc = parse(config_bytes)?;
     Ok(Wgpu::new(device_boot(&doc)?, contract_for))

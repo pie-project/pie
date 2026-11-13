@@ -71,7 +71,7 @@ impl<B: Backend> Store<B> {
             if held > 0 && held + reserved > ceiling {
                 chunks.push(Chunk {
                     start,
-                    buffer: B::Buffer::with(device, held, kind)?,
+                    buffer: B::Buffer::with(device, held, kind, crate::books::owners::WEIGHTS)?,
                 });
                 start += held;
                 held = 0;
@@ -81,7 +81,7 @@ impl<B: Backend> Store<B> {
 
         chunks.push(Chunk {
             start,
-            buffer: B::Buffer::with(device, held, kind)?,
+            buffer: B::Buffer::with(device, held, kind, crate::books::owners::WEIGHTS)?,
         });
         Ok(Store {
             chunks,

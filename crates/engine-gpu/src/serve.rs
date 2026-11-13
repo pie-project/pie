@@ -74,8 +74,10 @@ pub trait Serve: Backend {
     /// reads are prestaged in the arm's ring rather than handed from the host.
     const RECORDS: bool;
 
+    /// Opens the device (adopting `handed` where the host handed one) and
+    /// its tuning.
     /// Opens the device (adopting `handed` where the host handed one), of
-    /// which the load takes what `allowance` gives, and its tuning.
+    /// which the load takes no more than `allowance` caps, and its tuning.
     fn open(
         boot: &Self::DeviceBoot,
         allowance: engine::Allowance,
@@ -655,7 +657,7 @@ impl<B: Serve> Shell<B> {
             }
         };
         let weights: u64 = crate::weights::plane_bytes(&boot.trace)?.iter().sum();
-        let room = device.working_set().saturating_sub(weights) / 2;
+        let room = device.left().saturating_sub(weights) / 2;
         let mut budgets = poem_compiler::fit_voxels(&boot.trace, budgets, &profile, room);
         if boot.slots == 0 {
             boot.slots = poem_compiler::fit_frame_slots(
@@ -800,9 +802,9 @@ impl<B: Serve> Shell<B> {
         };
 
         let arena = Arena::reserve(&device, &compiled.arena)?;
-        let device_cap = device.left().saturating_sub(
-            u64::from(least_chunks) * chunk + crate::scratch::pool_bytes(&boot.trace, least),
-        );
+        let device_cap = device
+            .left()
+            .saturating_sub(u64::from(least_chunks) * chunk);
         let mut weights = Weights::resident(
             &device,
             &handles,
@@ -819,8 +821,7 @@ impl<B: Serve> Shell<B> {
 
         handles.seal();
 
-        let mut scratch =
-            Scratch::reserve(&device, &boot.trace, &compiled, &budgets, least, &tuning)?;
+        let scratch = Scratch::reserve(&device, &boot.trace, &compiled, &budgets, least, &tuning)?;
         // A page table a list the kv rows lie in: the kv list's first (the
         // All axis's), then each window list's (CONTRACT-BC 21).
         let page_tables = rows.tables.len();
@@ -1027,7 +1028,7 @@ impl<B: Serve> Shell<B> {
         };
         let pixel_out = match pixels.iter().map(|plane| plane.4).max() {
             Some(bytes) => (0..arms)
-                .map(|_| B::Buffer::host(&device, bytes))
+                .map(|_| B::Buffer::host(&device, bytes, crate::books::owners::READOUT))
                 .collect::<Result<Vec<_>>>()?,
             None => Vec::new(),
         };
@@ -1051,6 +1052,7 @@ impl<B: Serve> Shell<B> {
                         .max()
                         .unwrap_or(0)
                         .max(1),
+                    crate::books::owners::READOUT,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1079,23 +1081,7 @@ impl<B: Serve> Shell<B> {
         let words = u32::try_from(2 * u64::from(u32::MAX) / chunk).unwrap_or(u32::MAX)
             / kernels_slang::SEGMENTS as u32
             * kernels_slang::SEGMENTS as u32;
-        // The compressor side planes hold a cell a token of every physical
-        // list page, beside the pool in one scratch buffer: a chunk costs its
-        // share of them, and they stay within one binding.
-        let side = crate::scratch::pool_bytes(
-            &boot.trace,
-            Paging {
-                pages: chunk.checked_div(rows.list_bytes).unwrap_or(0),
-                ..asked
-            },
-        );
-        let sides = if side == 0 {
-            u32::MAX
-        } else {
-            let room_chunks = room / (chunk + side);
-            u32::try_from(room_chunks.min(device.max_buffer() / side)).unwrap_or(u32::MAX)
-        };
-        let total = total.min(binds).min(words).min(sides);
+        let total = total.min(binds).min(words);
         if total < least_chunks {
             return Err(Fault::Residency(format!(
                 "one working set takes {least_chunks} chunks of {chunk} bytes, and this device \
@@ -1138,17 +1124,16 @@ impl<B: Serve> Shell<B> {
             room,
             "the chunk pool is sized to its budget or what the weights and the working set leave"
         );
+        // The ledger's capacity is what the device has, measured once the
+        // context, the weights and every load-time reservation are up;
+        // what the driver holds by then is its own entry.
+        device.books().outside("driver", device.outside());
+        device.books().settle(chunk, device.capacity());
         let paging = Paging {
             pages: pages.max(1),
             slots,
             ..asked
         };
-        if crate::scratch::pool_bytes(&boot.trace, paging)
-            > crate::scratch::pool_bytes(&boot.trace, least)
-        {
-            drop(scratch);
-            scratch = Scratch::reserve(&device, &boot.trace, &compiled, &budgets, paging, &tuning)?;
-        }
         let host_chunks =
             host_kv_budget.map_or(0, |bytes| u32::try_from(bytes / chunk).unwrap_or(u32::MAX));
         let rs_at = rows.rs.clone();
@@ -1581,7 +1566,7 @@ impl<B: Serve> Shell<B> {
             return Ok(());
         }
         let mut frame = self.device.frame()?;
-        let (moved, pages) = self.pools.evacuate(&mut frame, evacuation)?;
+        self.pools.evacuate(&mut frame, evacuation)?;
         // The weight cache's entries name physical units: those in moved
         // chunks are rewritten once every fire reading them has landed.
         if !self.row_caches.is_empty() || !self.expert_caches.is_empty() {
@@ -1590,22 +1575,6 @@ impl<B: Serve> Shell<B> {
             self.row_caches.restage(&self.pools)?;
             self.expert_caches.restage(&self.pools)?;
             frame = self.device.frame()?;
-        }
-        // The compressor side planes hold a cell a token of every physical
-        // list page: each moved chunk's pages move with it.
-        let tokens = u64::from(self.pools.paging().page_size);
-        let plane = self.scratch.plane();
-        for (at, cell) in self.scratch.side_planes() {
-            let run = pages * tokens * cell;
-            for &(from, to) in &moved {
-                frame.copy(
-                    plane,
-                    at + from * tokens * cell,
-                    plane,
-                    at + to * tokens * cell,
-                    run,
-                )?;
-            }
         }
         self.grafted = Some(frame.commit_async(None)?);
         Ok(())
@@ -1678,9 +1647,10 @@ impl<B: Serve> Shell<B> {
         self.device.max_buffer()
     }
 
+    /// What the device has for this load, measured now.
     #[must_use]
-    pub fn working_set(&self) -> u64 {
-        self.device.working_set()
+    pub fn capacity(&self) -> u64 {
+        self.device.capacity()
     }
 
     pub fn bind_thread(&self) -> Result<()> {
@@ -3099,7 +3069,11 @@ impl<B: Serve> Shell<B> {
                 .is_none_or(|scratch| scratch.bytes() < need)
             {
                 self.drain()?;
-                self.rs_scratch = Some(B::Buffer::zeroed(&self.device, need)?);
+                self.rs_scratch = Some(B::Buffer::zeroed(
+                    &self.device,
+                    need,
+                    crate::books::owners::RS_SCRATCH,
+                )?);
             }
         }
 
@@ -3304,6 +3278,7 @@ impl<B: Serve> Shell<B> {
                 self.snaps = Some(B::Buffer::host(
                     &self.device,
                     bytes.next_power_of_two().max(256),
+                    crate::books::owners::SNAPSHOTS,
                 )?);
             }
             let held = self.snaps.as_mut().expect("just made");
@@ -3462,6 +3437,7 @@ impl<B: Serve> Shell<B> {
                 &p.windows,
                 &place,
                 &self.scratch,
+                self.weights.hashes(),
                 &self.tuning,
                 self.tier,
                 self.weights.gathered(),
@@ -3797,7 +3773,8 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             .max()
             .unwrap_or(0);
         if need > self.readout[prepared.arm].bytes() {
-            self.readout[prepared.arm] = B::Buffer::host(&self.device, need)?;
+            self.readout[prepared.arm] =
+                B::Buffer::host(&self.device, need, crate::books::owners::READOUT)?;
             B::grown(self, prepared.arm, need)?;
         }
         let (keep, split) = match B::plan(self, &mut prepared)? {

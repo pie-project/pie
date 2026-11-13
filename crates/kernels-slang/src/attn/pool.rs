@@ -7,7 +7,19 @@ use dtype::Dtype;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, nonzero, refuse, stated};
 use crate::error::Error;
-use crate::tensor::{KvPool, RaggedTensor, Tensor};
+use crate::tensor::{KvPool, RaggedTensor, Segments, Tensor};
+
+/// A compressor's state, rows of the list slots of the kv row its gather
+/// keys by (in the chunk pool): page `p`'s projection rows from word
+/// `origin[0] + p * page_stride`, its score rows from `origin[1] + p *
+/// page_stride`, `pitch` bf16 a token. It moves with the slot it lies in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PoolState {
+    pub pool: Segments,
+    pub origin: [u32; 2],
+    pub page_stride: u32,
+    pub pitch: u32,
+}
 
 const POOL: &str = "attn/pool.slang";
 
@@ -124,18 +136,13 @@ pub fn state_write(
     write_offset: Tensor,
     head_dim: u32,
     ratio: u32,
-    state_kv: Tensor,
-    state_score: Tensor,
+    state: PoolState,
 ) -> Result<(), Error> {
     const OP: &str = "attn.pool_state_write";
     let entry = dtype_dispatch!(OP, kv.dtype, { Bf16 => "attn_pool_state_write_bf16" });
     debug_assert_eq!(
         score.dtype, kv.dtype,
         "`{OP}` writes both projections in one element"
-    );
-    debug_assert!(
-        state_kv.dtype == kv.dtype && state_score.dtype == kv.dtype,
-        "`{OP}` lands the state plane in the projections' own element"
     );
     debug_assert!(
         write_page.dtype == Dtype::U32 && write_offset.dtype == Dtype::U32,
@@ -162,22 +169,12 @@ pub fn state_write(
         score.rows, kv.rows,
         "the two projections are one row per token row"
     );
-    let pitch = state_kv.width;
-    if state_score.width != pitch {
-        return Err(refuse(
-            OP,
-            format!(
-                "`state_kv` is {pitch} wide and `state_score` is {} — the two state slabs \
-                 are one plane laid at one pitch",
-                state_score.width
-            ),
-        ));
-    }
+    let pitch = state.pitch;
     if pitch < width {
         return Err(refuse(
             OP,
             format!(
-                "the state slabs are {pitch} wide and this compressor writes coff {coff} x \
+                "the state rows are {pitch} wide and this compressor writes coff {coff} x \
                  head width {head_dim} = {width} columns of every row"
             ),
         ));
@@ -185,15 +182,22 @@ pub fn state_write(
     let rows = nonzero(OP, "rows", kv.rows)?;
     let pairs = super::even_lanes(OP, "compressor row", width)?;
     super::even_lanes(OP, "state pitch", pitch)?;
+    let [s0, s1, s2, s3] = state.pool.args(true);
     ctx.fire(
         Fire::at(POOL, entry).apply(Grid::of([pairs, rows, 1], [LANE_GROUP, 1, 1])),
         &[
             kv.arg(),
             score.arg(),
-            state_kv.arg_mut(),
-            state_score.arg_mut(),
             write_page.arg(),
             write_offset.arg(),
+            s0,
+            s1,
+            s2,
+            s3,
+            state.pool.words.arg(),
+            state.origin[0].arg(),
+            state.origin[1].arg(),
+            state.page_stride.arg(),
             stated(OP, width)?.arg(),
             pages.page_size.arg(),
             stated(OP, pitch)?.arg(),
@@ -209,22 +213,13 @@ pub fn gather(
     pages: &KvPool,
     head_dim: u32,
     ratio: u32,
-    state_kv: Tensor,
-    state_score: Tensor,
+    state: PoolState,
     ape: Option<Tensor>,
     entries: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attn.pool_gather";
     let entry = dtype_dispatch!(OP, entries.dtype, { Bf16 => "attn_pool_gather_bf16" });
     boundary_tables(OP, &boundary_pos, &boundary_req);
-    debug_assert_eq!(
-        state_kv.dtype, entries.dtype,
-        "`{OP}` pools the state plane into an entry of its own element"
-    );
-    debug_assert_eq!(
-        state_score.dtype, entries.dtype,
-        "`{OP}` reads the gate logits in the state plane's element"
-    );
     if pages.page_size <= 0 {
         return Err(refuse(OP, "the pooled space's page size is zero"));
     }
@@ -255,22 +250,12 @@ pub fn gather(
         }
     };
     let width = head_dim.saturating_mul(coff.unsigned_abs());
-    let pitch = state_kv.width;
-    if state_score.width != pitch {
-        return Err(refuse(
-            OP,
-            format!(
-                "`state_kv` is {pitch} wide and `state_score` is {} — the two state slabs \
-                 are one plane laid at one pitch",
-                state_score.width
-            ),
-        ));
-    }
+    let pitch = state.pitch;
     if pitch < width {
         return Err(refuse(
             OP,
             format!(
-                "the state slabs are {pitch} wide and this gather reads coff {coff} x head \
+                "the state rows are {pitch} wide and this gather reads coff {coff} x head \
                  width {head_dim} = {width} columns of every row"
             ),
         ));
@@ -292,17 +277,24 @@ pub fn gather(
     }
     let pairs = super::even_lanes(OP, "pooled head", head_dim)?;
     super::even_lanes(OP, "state pitch", pitch)?;
+    let [s0, s1, s2, s3] = state.pool.args(false);
     ctx.fire(
         Fire::at(POOL, entry).apply(Grid::of([pairs, rows, 1], [LANE_GROUP, 1, 1])),
         &[
-            state_kv.arg(),
-            state_score.arg(),
-            ape.unwrap_or(state_score).arg(),
+            ape.map_or(crate::ArgValue::Buffer(crate::ABSENT), Tensor::arg),
             boundary_pos.arg(),
             boundary_req.arg(),
             pages.page_indices.arg(),
             pages.page_indptr.arg(),
             entries.arg_mut(),
+            s0,
+            s1,
+            s2,
+            s3,
+            state.pool.words.arg(),
+            state.origin[0].arg(),
+            state.origin[1].arg(),
+            state.page_stride.arg(),
             stated(OP, head_dim)?.arg(),
             stated(OP, ratio)?.arg(),
             coff.arg(),

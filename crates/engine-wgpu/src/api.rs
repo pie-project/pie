@@ -22,6 +22,8 @@ pub struct DeviceBoot {
 
     pub pipeline_cache: Option<PathBuf>,
 
+    /// The device's bytes as the host states them, where the adapter
+    /// reports no heap (a browser tab's `device_memory_mb`).
     pub device_memory: Option<u64>,
 
     /// `$PIE_HOME/profiles`, where a native user's adapter profiles live.

@@ -281,21 +281,28 @@ pub fn load_with(
         ..DeviceBoot::default()
     };
     // The device is shared: a driver that fails to come up is asked again
-    // before the test is skipped.
+    // before the test is skipped, and a load takes at most a quarter of what
+    // the device has, as tests load at once.
     let mut tries = 0;
-    while let Err(why) = Context::bind(
-        &device,
-        engine::Allowance {
-            budget: Some(2 << 30),
-        },
-    ) {
-        tries += 1;
-        if tries == 5 {
-            eprintln!("skipping: no {} device ({why})", backend::NAME);
-            return None;
+    let quarter = loop {
+        match Context::bind(&device, engine::Allowance::WHOLE) {
+            Ok(bound) => break engine_gpu::backend::Context::capacity(&bound) / 4,
+            Err(why) => {
+                tries += 1;
+                if tries == 5 {
+                    eprintln!("skipping: no {} device ({why})", backend::NAME);
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
         }
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
+    };
+    let residency = engine::load::Residency {
+        device: engine::Allowance {
+            budget: residency.device.budget.or(Some(quarter)),
+        },
+        ..residency
+    };
     Some(
         Shell::load(Boot {
             trace: fixture.trace.clone(),
@@ -414,6 +421,28 @@ fn a_hybrid_miniature_serves_two_lanes() {
 #[test]
 fn a_windowed_miniature_serves_two_lanes() {
     seats("gemma4-e4b-mini-l1", None);
+}
+
+/// Every byte a served miniature holds on the device is in the device's
+/// ledger under an owner, and the ledger holds within what the device has.
+#[test]
+fn a_served_miniature_is_in_the_ledger_whole() {
+    use engine::memory::Class;
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    serve_seats(&mut shell, &fixture.trace, 2);
+    let books = shell.device().books();
+    let ledger = books.ledger();
+    assert_eq!(ledger.check(), Ok(()), "{ledger}");
+    assert_eq!(books.audit().gap(), 0, "{ledger}");
+    for class in [Class::Model, Class::State, Class::Fire] {
+        assert!(
+            ledger.bytes(class) > 0,
+            "nothing entered as {class:?}: {ledger}"
+        );
+    }
 }
 
 /// Panics at the first row whose logits differ in a bit.
@@ -648,8 +677,8 @@ fn a_scattered_hybrid_pool_serves_the_same_logits() {
     scattered("qwen35-tiny");
 }
 
-/// A model with a compressed kv pool: its compressor side planes, a cell a
-/// token of every physical list page, follow the pages an evacuation moves.
+/// A model with a compressed kv pool: its compressor state, rows of the list
+/// slots it describes, moves with the slots an evacuation moves.
 /// Ignored: dsv4-flash-mini does not serve here, before the pool as after
 /// (before it, its side planes overran a binding; now its index top-k
 /// refuses the index pool's pitch).

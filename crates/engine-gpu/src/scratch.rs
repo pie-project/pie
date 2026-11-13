@@ -1,17 +1,15 @@
 use kernels_slang::Tensor;
-use kernels_slang::gather::ngram;
 use kernels_slang::linear::moe::select::RoutedScratch;
 use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
 use poem_exec::fire::fallback;
 use poem_exec::store::arena::rect;
-use poem_ir::{Attn, Def, Dim, Dtype, Gather, Linear, Operation, Trace, Ty, ValueId};
+use poem_ir::{Attn, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
 
 use crate::store::kv::Paging;
 
 use crate::backend::{Backend, Buffer as _, Tactics as _};
 use crate::error::Result;
 use crate::handles::Handles;
-use crate::run::PoolSlabs;
 
 const ALIGN: u64 = 256;
 
@@ -73,19 +71,6 @@ struct CopyRoom {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Pool {
-    row: u32,
-    state_kv: Room,
-    state_score: Room,
-}
-
-#[derive(Clone, Debug)]
-struct PleHash {
-    key: Box<[u64]>,
-    room: Room,
-}
-
-#[derive(Clone, Copy, Debug)]
 struct Routed {
     perm: Room,
     row_expert: Room,
@@ -108,10 +93,6 @@ pub struct Scratch<B: Backend> {
     spatial: Option<Room>,
 
     copy: Option<CopyRoom>,
-
-    pool: Vec<Pool>,
-
-    ple: Vec<PleHash>,
 
     capacity: Vec<u32>,
 
@@ -285,49 +266,9 @@ impl<B: Backend> Scratch<B> {
             bytes,
         });
 
-        let mut at = copy.map_or(union, |room| room.at + room.bytes);
+        let at = copy.map_or(union, |room| room.at + room.bytes);
 
-        let pool: Vec<Pool> = pool_state(trace, paging)
-            .into_iter()
-            .map(|(row, cells, width)| Pool {
-                row,
-                state_kv: Room::lay(&mut at, cells, width, Dtype::Bf16),
-                state_score: Room::lay(&mut at, cells, width, Dtype::Bf16),
-            })
-            .collect();
-
-        let mut ple: Vec<PleHash> = Vec::new();
-        for node in &trace.nodes {
-            let Operation::Gather(
-                Gather::NgramIds {
-                    mults,
-                    primes,
-                    offsets,
-                    ..
-                }
-                | Gather::NgramIdsChunked {
-                    mults,
-                    primes,
-                    offsets,
-                    ..
-                },
-            ) = &node.op
-            else {
-                continue;
-            };
-            let key: Box<[u64]> = ngram::hash_constants(mults, primes, offsets).into();
-            if key.is_empty() || ple.iter().any(|held| held.key == key) {
-                continue;
-            }
-            let room = Room::lay(&mut at, 1, key.len() as u64, Dtype::U64);
-            ple.push(PleHash { key, room });
-        }
-
-        let mut plane = B::Buffer::zeroed(device, at)?;
-        for hashing in &ple {
-            let bytes: Vec<u8> = hashing.key.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            plane.write(hashing.room.at, &bytes)?;
-        }
+        let plane = B::Buffer::zeroed(device, at, crate::books::owners::SCRATCH)?;
 
         Ok(Scratch {
             plane,
@@ -336,8 +277,6 @@ impl<B: Backend> Scratch<B> {
             split,
             spatial,
             copy,
-            pool,
-            ple,
             capacity: crate::arena::capacities(map),
             routers,
         })
@@ -433,88 +372,6 @@ impl<B: Backend> Scratch<B> {
     pub fn plane(&self) -> &B::Buffer {
         &self.plane
     }
-
-    /// Every compressor side plane (state and score of each pooled row): its
-    /// first byte in [`Scratch::plane`] and the bytes a cell (a token of a
-    /// physical list page) takes.
-    #[must_use]
-    pub fn side_planes(&self) -> Vec<(u64, u64)> {
-        self.pool
-            .iter()
-            .flat_map(|pool| [pool.state_kv, pool.state_score])
-            .map(|room| (room.at, u64::from(room.width) * room.dtype.bytes_ceil()))
-            .collect()
-    }
-
-    pub fn pool_state(&self, handles: &Handles<B>, row: u32) -> Option<Result<PoolSlabs>> {
-        let rooms = *self.pool.iter().find(|held| held.row == row)?;
-        let mint = || {
-            Ok(PoolSlabs {
-                state_kv: rooms.state_kv.bind(handles, &self.plane)?,
-                state_score: rooms.state_score.bind(handles, &self.plane)?,
-            })
-        };
-        Some(mint())
-    }
-
-    pub fn ple_hash(
-        &self,
-        handles: &Handles<B>,
-        mults: &[u64],
-        primes: &[u64],
-        offsets: &[u64],
-    ) -> Option<Result<Tensor>> {
-        let want = ngram::hash_constants(mults, primes, offsets);
-        let held = self.ple.iter().find(|h| *h.key == *want)?;
-        Some(held.room.bind(handles, &self.plane))
-    }
-}
-
-const fn compressor_coff(ratio: u32) -> u64 {
-    if ratio == 4 { 2 } else { 1 }
-}
-
-/// What the pool-gather rooms take at `paging`: a state and a score row a
-/// pooled cell, so they grow with the pool as its slabs do.
-#[must_use]
-pub fn pool_bytes(trace: &Trace, paging: Paging) -> u64 {
-    pool_state(trace, paging)
-        .iter()
-        .map(|(_, cells, width)| 2 * cells * width * Dtype::Bf16.bytes_ceil())
-        .sum()
-}
-
-fn pool_state(trace: &Trace, paging: Paging) -> Vec<(u32, u64, u64)> {
-    let cells = paging.pages() * u64::from(paging.page_size);
-    if cells == 0 {
-        return Vec::new();
-    }
-    let mut rows: Vec<(u32, u64)> = Vec::new();
-    for node in &trace.nodes {
-        let Operation::Attn(Attn::PoolGather {
-            pages,
-            head_dim,
-            ratio,
-            ..
-        }) = &node.op
-        else {
-            continue;
-        };
-        let Some(Def::Cache(row)) = trace.values.get(pages.0 as usize).map(|v| &v.def) else {
-            continue;
-        };
-        let width = compressor_coff(*ratio) * u64::from(*head_dim);
-        if width == 0 {
-            continue;
-        }
-        match rows.iter_mut().find(|(held, _)| *held == *row) {
-            Some((_, held)) => *held = (*held).max(width),
-            None => rows.push((*row, width)),
-        }
-    }
-    rows.into_iter()
-        .map(|(row, width)| (row, cells, width))
-        .collect()
 }
 
 fn copy_ceiling(trace: &Trace, compiled: &CompiledModel, budget: &Budget) -> Option<u64> {

@@ -205,7 +205,11 @@ impl<B: Backend> Pool<B> {
             });
         }
         for segment in self.committed..segments {
-            let buffer = B::Buffer::zeroed(device, self.segment_bytes(segment))?;
+            let buffer = B::Buffer::zeroed(
+                device,
+                self.segment_bytes(segment),
+                crate::books::owners::POOL,
+            )?;
             self.segments[segment as usize] = Some(buffer);
             self.committed = segment + 1;
         }

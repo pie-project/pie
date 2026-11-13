@@ -259,7 +259,11 @@ impl<B: Backend> RowCaches<B> {
         for shape in shapes {
             let blocks = shape.blocks.max(1);
             widest = widest.max(blocks);
-            let mut units = B::Buffer::host(device, u64::from(blocks) * 4)?;
+            let mut units = B::Buffer::host(
+                device,
+                u64::from(blocks) * 4,
+                crate::books::owners::WEIGHT_CACHE,
+            )?;
             units.write(0, &vec![0xffu8; blocks as usize * 4])?;
             for (k, table) in shape.tables.iter().enumerate() {
                 by_param.insert(table.param, (caches.len(), k));
@@ -267,28 +271,56 @@ impl<B: Backend> RowCaches<B> {
             caches.push(Cache {
                 slots: vec![NOT_HELD; shape.blocks as usize],
                 blocks: units,
-                hits: B::Buffer::host(device, u64::from(blocks) * 4)?,
+                hits: B::Buffer::host(
+                    device,
+                    u64::from(blocks) * 4,
+                    crate::books::owners::WEIGHT_CACHE,
+                )?,
                 stage: shape
                     .tables
                     .iter()
-                    .map(|t| B::Buffer::host(device, u64::from(rows.max(1)) * t.row_bytes))
+                    .map(|t| {
+                        B::Buffer::host(
+                            device,
+                            u64::from(rows.max(1)) * t.row_bytes,
+                            crate::books::owners::WEIGHT_CACHE,
+                        )
+                    })
                     .collect::<Result<_>>()?,
                 staged: shape
                     .tables
                     .iter()
-                    .map(|_| B::Buffer::host(device, u64::from(rows.max(1)) * 4))
+                    .map(|_| {
+                        B::Buffer::host(
+                            device,
+                            u64::from(rows.max(1)) * 4,
+                            crate::books::owners::WEIGHT_CACHE,
+                        )
+                    })
                     .collect::<Result<_>>()?,
                 ring: (0..arms)
                     .map(|_| {
                         let stage = shape
                             .tables
                             .iter()
-                            .map(|t| B::Buffer::host(device, u64::from(rows.max(1)) * t.row_bytes))
+                            .map(|t| {
+                                B::Buffer::host(
+                                    device,
+                                    u64::from(rows.max(1)) * t.row_bytes,
+                                    crate::books::owners::WEIGHT_CACHE,
+                                )
+                            })
                             .collect::<Result<_>>()?;
                         let staged = shape
                             .tables
                             .iter()
-                            .map(|_| B::Buffer::host(device, u64::from(rows.max(1)) * 4))
+                            .map(|_| {
+                                B::Buffer::host(
+                                    device,
+                                    u64::from(rows.max(1)) * 4,
+                                    crate::books::owners::WEIGHT_CACHE,
+                                )
+                            })
                             .collect::<Result<_>>()?;
                         Ok((stage, staged))
                     })
@@ -313,7 +345,11 @@ impl<B: Backend> RowCaches<B> {
         Ok(RowCaches {
             caches,
             by_param,
-            spare_hits: B::Buffer::host(device, u64::from(widest.max(1)) * 4)?,
+            spare_hits: B::Buffer::host(
+                device,
+                u64::from(widest.max(1)) * 4,
+                crate::books::owners::WEIGHT_CACHE,
+            )?,
             rows,
             by_tokens,
         })
@@ -532,8 +568,8 @@ impl<B: Backend> RowCaches<B> {
         };
         let mapped = if B::MAPS_HOST {
             Some([
-                B::Buffer::host(device, capacity)?,
-                B::Buffer::host(device, capacity)?,
+                B::Buffer::host(device, capacity, crate::books::owners::WEIGHT_CACHE)?,
+                B::Buffer::host(device, capacity, crate::books::owners::WEIGHT_CACHE)?,
             ])
         } else {
             None
@@ -578,7 +614,8 @@ impl<B: Backend> RowCaches<B> {
                     upload
                 }
                 None => {
-                    let mut upload = B::Buffer::host(device, bytes.max(4))?;
+                    let mut upload =
+                        B::Buffer::host(device, bytes.max(4), crate::books::owners::WEIGHT_CACHE)?;
                     image.resize(usize::try_from(bytes).unwrap_or(0), 0);
                     self.lay(&mut image, host, planes, batch)?;
                     upload.write(0, &image)?;
