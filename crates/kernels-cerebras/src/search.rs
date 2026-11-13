@@ -1,5 +1,5 @@
 //! The search: a model's partitions ranked by what they cost ([`crate::cost`]). From each of its
-//! layout's pinned plans ([`crate::pins`]: the one made for the model first), it moves the keys one or
+//! kernel set's pinned plans ([`crate::pins`]: the one made for the model first), it moves the keys one or
 //! two at a time over a ladder of values, keeps the moves that plan, serve the positions asked for
 //! and leave every image its stack room, and walks to the fastest predicted step. A candidate
 //! ranks ahead of the made-for preset only where it beats it by the time model's resolution
@@ -49,10 +49,10 @@ pub struct Asked {
 
 /// The candidates `shape` searched to, fastest first (at most `keep`), each built.
 pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
-    let layout = crate::compose::Layout::of_shape(shape);
+    let set = crate::kernels::KernelSet::of_shape(shape);
     crate::compose::refuse(shape)?;
     let sig = shape.signature();
-    let mut seeds = crate::pins::of(layout);
+    let mut seeds = crate::pins::of(set);
     seeds.sort_by_key(|p| p.made_for != Some(sig));
     let seeds: Vec<Preset> = seeds
         .into_iter()

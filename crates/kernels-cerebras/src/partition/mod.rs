@@ -4,7 +4,7 @@
 //! and head groups, the split's attention / MoE columns) and refuses the shapes its cut and
 //! kernels cannot take by name. Nothing physical is decided here.
 
-use super::compose::Layout;
+use super::kernels::KernelSet;
 use super::plan::{LayerKind, Plan, Preset, Shape};
 
 pub mod runs;
@@ -17,11 +17,11 @@ type R<T> = Result<T, String>;
 /// The plan of `shape` under `preset`: the partition and contract the preset's keys make for the
 /// model, by its layout.
 pub fn plan(shape: &Shape, preset: &Preset) -> R<Plan> {
-    match Layout::of_shape(shape) {
-        Layout::Snake => snake::plan(shape, preset),
-        Layout::Stacked => stacked::plan(shape, preset),
-        Layout::Runs => runs::plan(shape, preset),
-        Layout::Split => split::plan(shape, preset),
+    match KernelSet::of_shape(shape) {
+        KernelSet::Own => snake::plan(shape, preset),
+        KernelSet::Shared => stacked::plan(shape, preset),
+        KernelSet::Windows => runs::plan(shape, preset),
+        KernelSet::Experts => split::plan(shape, preset),
     }
 }
 

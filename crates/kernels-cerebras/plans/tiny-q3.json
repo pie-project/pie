@@ -1,6 +1,6 @@
 {
   "name": "tiny-q3",
-  "layout": "snake",
+  "kernels": "own",
   "keys": {"G2": 2, "G2W": 2, "HR": 10, "K": 3, "NE": 4, "PX": 16, "PY": 8, "UNX": 2, "UNY": 2, "VR": 8, "WL": 1},
   "levers": ""
 }

@@ -161,7 +161,7 @@ pub fn layout_text(prog: &Program, kinds: &Kernels) -> Result<String, String> {
             r.y + r.h,
         );
     }
-    for (n, t) in crate::kernels::symbols(prog.layout) {
+    for (n, t) in crate::kernels::symbols(prog.roles) {
         let _ = writeln!(s, "  @export_name(\"{n}\", [*]{t}, true);");
     }
     s.push_str(
@@ -181,7 +181,7 @@ pub fn write(
 ) -> Result<(), String> {
     let kinds = kernels(prog, levers)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
-    let syms = crate::kernels::symbols(prog.layout);
+    let syms = crate::kernels::symbols(prog.roles);
     let wr = |name: &str, text: &str| {
         let p = out.join(name);
         std::fs::write(&p, text).map_err(|e| format!("{}: {e}", p.display()))

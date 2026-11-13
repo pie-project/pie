@@ -1,6 +1,6 @@
 {
   "name": "e4b",
-  "layout": "stacked",
+  "kernels": "shared",
   "made_for": [2560, 42, 10240],
   "keys": {"G2": 12, "G2W": 24, "HR": 1130, "LOOP": 64, "NEG": 20, "NU": 7, "PX": 256, "PY": 160},
   "levers": "DIAG:0,WSPEC:0,w.FIFOW:16",

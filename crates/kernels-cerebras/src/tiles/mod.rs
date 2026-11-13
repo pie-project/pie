@@ -1,6 +1,6 @@
 //! The tiles a plan places: the model's params, as the trace names them, cut into the arrays the
 //! program's bindings copy onto the wafer (`<name>.npy`, what the engine's placer reads). Each
-//! layout states its cut as a [`spec::Spec`] ([`spec_of`]: [`snake`], [`stacked`], [`runs`],
+//! kernel set states its cut as a [`spec::Spec`] ([`spec_of`]: [`snake`], [`stacked`], [`runs`],
 //! [`split`]) and [`cut::cut`] makes it; the params come from the checkpoint through the engine's import contract, so no
 //! checkpoint name appears here.
 //!
@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use poem_ir::Dtype;
 
-use super::compose::Layout;
+use super::kernels::KernelSet;
 use super::plan::Plan;
 
 type R<T> = Result<T, String>;
@@ -204,13 +204,13 @@ impl Out {
 }
 
 /// The cut of the model's params into the tiles `plan`'s bindings place, as data ([`spec`]), by
-/// its layout; `shapes` gives a param's shape where the trace holds it.
+/// its kernel set; `shapes` gives a param's shape where the trace holds it.
 pub fn spec_of(plan: &Plan, shapes: &dyn Fn(&str) -> Option<Vec<u64>>) -> R<spec::Spec> {
-    match Layout::of_shape(&plan.shape) {
-        Layout::Snake => snake::tiles(plan, shapes),
-        Layout::Stacked => stacked::tiles(plan, shapes),
-        Layout::Runs => runs::tiles(plan, shapes),
-        Layout::Split => split::tiles(plan, shapes),
+    match KernelSet::of_shape(&plan.shape) {
+        KernelSet::Own => snake::tiles(plan, shapes),
+        KernelSet::Shared => stacked::tiles(plan, shapes),
+        KernelSet::Windows => runs::tiles(plan, shapes),
+        KernelSet::Experts => split::tiles(plan, shapes),
     }
 }
 

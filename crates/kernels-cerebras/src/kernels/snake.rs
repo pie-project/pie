@@ -1,6 +1,6 @@
-//! The snake's role kernels (Qwen3.5's GDN layers + gated full attention, Qwen3 and Llama 3's dense
-//! attention): `weight.csl` (direct norms, own-cache attention / GDN mixers), `cx.csl`, `cy.csl`, with the head's and the relay's
-//! ([`super::head`], [`super::common::RELAY`]). Their params from the plan ([`kernels`]) and
+//! The own caches' role kernels ([`super::KernelSet::Own`]: Qwen3.5's GDN layers + gated full
+//! attention, Qwen3 and Llama 3's dense attention): `weight.csl` (direct norms, own-cache
+//! attention / GDN mixers), `cx.csl`, `cy.csl`. Their params from the plan ([`kernels`]) and
 //! their rcfg writers.
 
 use crate::abi::{FILLER, Kernel, KernelBuild, Kernels, Lit, Params, params};
@@ -13,8 +13,7 @@ use crate::program::Program;
 use crate::role::{Kind, Place};
 
 use super::Pe;
-use super::common::{self, CT5, CxIo, RELAY};
-use super::head::{HEAD_CTL, HEAD_PE, HeadCtl, HeadPe};
+use super::common::{self, CT5, CxIo};
 
 type R<T> = Result<T, String>;
 
@@ -138,7 +137,7 @@ fn cy(pe: &Pe) -> R<Vec<u32>> {
     common::cy(pe, Some((ONORM, ONORM_CAST)))
 }
 
-/// Every kind's kernel of a Qwen program, its params from the plan.
+/// The units' kernels of a Qwen program (and the idle filler), their params from the plan.
 pub fn kernels(prog: &Program) -> R<Kernels> {
     let sc = prog.schedule;
     let plan = &prog.plan;
@@ -252,33 +251,6 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
             },
         )?,
     );
-    out.insert(
-        Kind::HEAD,
-        KernelBuild::of(
-            &HEAD_PE,
-            HeadPe {
-                VR: p.head.vocab_rows,
-                HDc: 2 * hcc,
-                NPX: 1,
-                HACC16: 0,
-            },
-        )?,
-    );
-    out.insert(
-        Kind::HEAD_CTL,
-        KernelBuild::of(
-            &HEAD_CTL,
-            HeadCtl {
-                VR: p.head.vocab_rows,
-                FIFOW: 32,
-                WFORCE: 0,
-                WFN: p.head.rows,
-            },
-        )?,
-    );
-    if !prog.floor.relays.is_empty() {
-        out.insert(Kind::RELAY, KernelBuild::of(&RELAY, Params::default())?);
-    }
     out.insert(Kind::IDLE, KernelBuild::of(&FILLER, Params::default())?);
     Ok(out)
 }

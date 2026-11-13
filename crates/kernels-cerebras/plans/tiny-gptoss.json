@@ -1,6 +1,6 @@
 {
   "name": "tiny-gptoss",
-  "layout": "split",
+  "kernels": "experts",
   "keys": {"AX": 4, "G2": 2, "G2W": 2, "HSCALE": 32768, "HVC": 26, "LOOP": 64, "MX": 8, "NE": 8, "NLV": 5, "PY": 4, "SWA": 2, "SWR": 8, "UNX": 2, "UNY": 1},
   "levers": ""
 }

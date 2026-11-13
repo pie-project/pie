@@ -1,5 +1,5 @@
 //! What the role kernels read off the PEs of each block the composer places ([`KernelCopies`]):
-//! the copies onto each kind, by the layout the plan's layers take ([`Layout`]) and the plan's
+//! the copies onto each kind, by the kernel set the plan's layers take ([`KernelSet`]) and the plan's
 //! facts (the placed hidden's zero pad, the head's padded vocabulary rows, the experts' encoding,
 //! the token loop's embedding). The sources each copy names are the cut's checkpoint tensors
 //! (documentation: [`crate::weights::Binding::from`]).
@@ -12,17 +12,18 @@ use crate::kernels::split::Dims;
 use crate::plan::Plan;
 use crate::weights::{From, Slice, Transform, from};
 
-use super::{KernelCopies, Layout};
+use super::KernelCopies;
+use crate::kernels::KernelSet;
 
 type R<T> = Result<T, String>;
 
-/// The copies the kernels of `layout` read off `plan`'s blocks.
-pub fn of(plan: &Plan, layout: Layout) -> R<KernelCopies> {
-    match layout {
-        Layout::Snake => snake(plan),
-        Layout::Stacked => Ok(stacked(plan)),
-        Layout::Runs => Ok(runs(plan)),
-        Layout::Split => split(plan),
+/// The copies the kernels of `set` read off `plan`'s blocks.
+pub fn of(plan: &Plan, set: KernelSet) -> R<KernelCopies> {
+    match set {
+        KernelSet::Own => snake(plan),
+        KernelSet::Shared => Ok(stacked(plan)),
+        KernelSet::Windows => Ok(runs(plan)),
+        KernelSet::Experts => split(plan),
     }
 }
 

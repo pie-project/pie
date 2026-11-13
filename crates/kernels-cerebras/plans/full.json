@@ -1,6 +1,6 @@
 {
   "name": "full",
-  "layout": "split",
+  "kernels": "experts",
   "made_for": [2880, 24, 2880],
   "keys": {"AX": 64, "G2": 16, "G2W": 24, "HSCALE": 32768, "HVC": 748, "LOOP": 64, "MX": 288, "NE": 128, "NLV": 5, "PY": 160, "SWA": 8, "SWR": 32, "UNX": 2, "UNY": 6},
   "levers": "DIAG:0,GLUV:1,CYV:2"

@@ -1,6 +1,6 @@
 {
   "name": "e4b-meta",
-  "layout": "stacked",
+  "kernels": "shared",
   "keys": {"G2": 16, "G2W": 24, "HR": 1130, "LOOP": 64, "NEG": 16, "NU": 7, "PX": 256, "PY": 160, "PYW": 160},
   "levers": "w.FIFOW:16",
   "arrangement": {

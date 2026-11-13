@@ -1,6 +1,6 @@
 //! The wafer as a target of poem's spatial pass ([`poem_compiler::spatial`]): the model's
-//! [`Shape`] read off its trace ([`shape`]), the layout its layers take
-//! ([`super::compose::Layout`]), the pinned plan named or made for the shape ([`super::pins`]) as
+//! [`Shape`] read off its trace ([`shape`]), the role kernels its layers take
+//! ([`super::kernels::KernelSet`]), the pinned plan named or made for the shape ([`super::pins`]) as
 //! the partition to try, a plan that builds ([`Program::build`]) as the fit; a model with no
 //! pinned plan that builds plans by the search ([`super::search`]). [`plan`] runs the pass over a
 //! trace; [`plan_shape`] does the same for a shape stated outright (a checkpoint with no catalog
@@ -12,7 +12,8 @@ use poem_ir::{
     RouteScore, Ssm, Trace, Turn, ValueId,
 };
 
-use super::compose::{BiasOn, Layout};
+use super::compose::BiasOn;
+use super::kernels::KernelSet;
 use super::plan::{
     Act, AttnSpec, GdnSpec, HeadSpec, LayerKind, MlpSpec, MoeSpec, NormSpec, Plan, PleSpec, Preset,
     RopeSpec, Shape, YarnSpec,
@@ -411,7 +412,7 @@ pub struct Planned {
 /// A partition to try: a pinned plan's preset (the `order`-th tried), with the overrides set.
 #[derive(Clone, Debug)]
 pub struct Candidate {
-    pub layout: Layout,
+    pub kernels: KernelSet,
     pub preset: Preset,
     pub order: usize,
 }
@@ -428,13 +429,13 @@ pub struct Wafer {
 }
 
 impl Wafer {
-    /// The partitions to try: the pinned plan named (it must be of the shape's layout), else the
+    /// The partitions to try: the pinned plan named (it must be of the shape's kernel set), else the
     /// one made for this shape ([`crate::pins`]); none for a model with no pinned plan (the
     /// search plans it).
     pub fn candidates(&self) -> Vec<Candidate> {
-        let layout = Layout::of_shape(&self.shape);
+        let kernels = KernelSet::of_shape(&self.shape);
         let sig = self.shape.signature();
-        crate::pins::of(layout)
+        crate::pins::of(kernels)
             .into_iter()
             .filter(|p| match &self.preset {
                 Some(n) => *n == p.name,
@@ -447,7 +448,7 @@ impl Wafer {
                     preset.keys.insert("CTX".into(), f64::from(n));
                 }
                 Some(Candidate {
-                    layout,
+                    kernels,
                     preset,
                     order,
                 })
@@ -542,9 +543,9 @@ impl Wafer {
         match (&self.preset, why.is_empty()) {
             (Some(p), true) => match crate::pins::named(p) {
                 Some((l, _)) => format!(
-                    "the pinned plan {p} is a {} plan; this model's layers take the {} layout",
+                    "the pinned plan {p} is a plan for the {} kernels; this model's layers take the {} kernels",
                     l.name(),
-                    Layout::of_shape(&self.shape).name()
+                    KernelSet::of_shape(&self.shape).name()
                 ),
                 None => format!("no pinned plan {p}"),
             },
@@ -558,7 +559,7 @@ impl SpatialTarget for Wafer {
     type Partition = Candidate;
 
     /// Every node is the wafer's: the program lays out the whole model (its blocks are the
-    /// layout's, chosen from the shape).
+    /// floorplan's elements, asked for by the shape's layers).
     fn classify(&self, _trace: &Trace, _node: u32) -> Option<BlockKind> {
         Some(BlockKind("wafer"))
     }
@@ -680,7 +681,7 @@ mod tests {
         );
     }
 
-    /// Every shipping model plans from its trace to the cut its staged prep holds: (layout,
+    /// Every shipping model plans from its trace to the cut its staged prep holds: (kernel set,
     /// units, layers a unit, columns, rows, a row's dims, vocabulary rows a head PE).
     #[test]
     fn shipping_models_plan_from_their_traces() {
@@ -688,47 +689,47 @@ mod tests {
             (
                 "qwen35-d9b-bf16-kv-bf16",
                 "9b",
-                (Layout::Snake, 8, 4, 256, 256, 16, 216),
+                (KernelSet::Own, 8, 4, 256, 256, 16, 216),
             ),
             (
                 "qwen35-d4b-bf16-kv-bf16",
                 "4b",
-                (Layout::Snake, 8, 4, 256, 192, 14, 216),
+                (KernelSet::Own, 8, 4, 256, 192, 14, 216),
             ),
             (
                 "qwen35-d0.8b-bf16-kv-bf16",
                 "0.8b",
-                (Layout::Snake, 6, 4, 256, 128, 8, 216),
+                (KernelSet::Own, 6, 4, 256, 128, 8, 216),
             ),
             (
                 "qwen3-8b-bf16-kv-bf16",
                 "q3-8b",
-                (Layout::Snake, 9, 4, 256, 228, 18, 132),
+                (KernelSet::Own, 9, 4, 256, 228, 18, 132),
             ),
             (
                 "gemma4-e2b-bf16-kv-bf16",
                 "e2b",
-                (Layout::Stacked, 7, 5, 256, 128, 12, 232),
+                (KernelSet::Shared, 7, 5, 256, 128, 12, 232),
             ),
             (
                 "gemma4-e4b-bf16-kv-bf16",
                 "e4b",
-                (Layout::Stacked, 7, 6, 256, 160, 16, 232),
+                (KernelSet::Shared, 7, 6, 256, 160, 16, 232),
             ),
             (
                 "gemma4-12b-bf16-kv-bf16",
                 "g12",
-                (Layout::Runs, 8, 6, 344, 283, 12, 232),
+                (KernelSet::Windows, 8, 6, 344, 283, 12, 232),
             ),
             (
                 "gptoss-20b-bf16-mxfp4-kv-bf16",
                 "full",
-                (Layout::Split, 12, 2, 352, 160, 18, 272),
+                (KernelSet::Experts, 12, 2, 352, 160, 18, 272),
             ),
             (
                 "llama31-8b-bf16-kv-bf16",
                 "l3-8b",
-                (Layout::Snake, 8, 4, 256, 256, 16, 112),
+                (KernelSet::Own, 8, 4, 256, 256, 16, 112),
             ),
         ] {
             // with no preset named, each picks its shipping one
@@ -737,7 +738,7 @@ mod tests {
             let p = plan(&trace(name), &Ask::preset(preset)).unwrap().plan;
             let q = &p.partition;
             let got = (
-                Layout::of_shape(&p.shape),
+                KernelSet::of_shape(&p.shape),
                 q.units,
                 q.layers_per_unit,
                 q.cols,
@@ -757,7 +758,7 @@ mod tests {
             .unwrap()
             .plan;
         let s = &p.shape;
-        assert_eq!(Layout::of_shape(&p.shape), Layout::Snake);
+        assert_eq!(KernelSet::of_shape(&p.shape), KernelSet::Own);
         assert!(!s.attn.qk_norm && !s.attn.output_gate && s.gdn.is_none());
         assert_eq!(
             (s.attn.q_heads, s.attn.kv_heads, s.attn.head_dim),
@@ -819,8 +820,8 @@ mod tests {
     }
 
     /// With no pinned plan made for the shape, the search plans it: Qwen3.5-0.8B with another
-    /// MLP width (no shipping model's shape) plans from its layout's pinned plans and builds. A
-    /// pinned plan of another layout is refused by name.
+    /// MLP width (no shipping model's shape) plans from its kernel set's pinned plans and builds.
+    /// A pinned plan of another kernel set is refused by name.
     #[test]
     fn a_shape_with_no_pinned_plan_is_searched() {
         let mut s = shape(&trace("qwen35-d0.8b-bf16-kv-bf16")).unwrap();
@@ -828,7 +829,7 @@ mod tests {
         let p = plan_shape(s, &Ask::default()).unwrap();
         Program::of(p.plan).unwrap();
         let e = plan(&trace("qwen35-d0.8b-bf16-kv-bf16"), &Ask::preset("e2b")).unwrap_err();
-        assert!(e.contains("is a stacked plan"), "{e}");
+        assert!(e.contains("is a plan for the shared kernels"), "{e}");
     }
 
     /// The plans a load may fall back on start with the one `plan` chooses: a shipping model's

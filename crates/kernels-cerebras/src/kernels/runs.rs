@@ -1,20 +1,18 @@
-//! The row runs' role kernels (Gemma 4 12B): `weight.csl` (deferred norms, sliding / global caches, plain rows), `cx.csl` (deferred norms, head groups), `cy.csl`, `head_pe.csl` (GRP 1), with the
-//! shared head control ([`super::head::HEAD_CTL`]). Their params from the plan ([`kernels`]) and
-//! their rcfg writers.
+//! The windowed rows' role kernels ([`super::KernelSet::Windows`]: Gemma 4 12B): `weight.csl`
+//! (deferred norms, sliding / global caches, plain rows), `cx.csl` (deferred norms, head
+//! groups), `cy.csl`. Their params from the plan ([`kernels`]) and their rcfg writers.
 
 use crate::abi::{Kernel, KernelBuild, Kernels, params};
-use crate::block::head::ROLE;
 use crate::block::head_groups::{CHAIN_IN, CHAIN_OUT, FORWARD, group_dims};
 use crate::block::row_runs::{PLAIN_ROW, dims_of};
-use crate::block::token_loop::{EMB_IN, TURN};
+use crate::block::token_loop::EMB_IN;
 use crate::block::units::{RELAY_POST, RELAY_PRE, X_IN, X_OUT};
 use crate::plan::{LayerKind, Plan};
 use crate::program::Program;
 use crate::role::{Kind, Place};
 
 use super::Pe;
-use super::common::{self, CT6, CX_EMB, CX_NO_OUTPUT, CxIo, HeadIo};
-use super::head::{HEAD_CTL, HeadCtl, HeadPeGroups};
+use super::common::{self, CT6, CX_EMB, CX_NO_OUTPUT, CxIo};
 
 type R<T> = Result<T, String>;
 
@@ -92,14 +90,6 @@ pub const CTL_CY_GEMMA12: Kernel = Kernel {
 };
 
 /// `head_pe.csl` with head groups and the tied embedding.
-pub const HEAD_GEMMA12: Kernel = Kernel {
-    source: "head_pe.csl",
-    owns: &["hw", "hg", "rcfg", "hemb", "tdbg"],
-    params: HeadPeGroups::NAMES,
-    route_slots: 12,
-    rcfg: Some(head),
-};
-
 /// A weight PE's flags: column 0, the last unit's (it flushes).
 pub const W_COL0: u32 = 1;
 pub const W_LAST: u32 = 4;
@@ -168,24 +158,6 @@ fn cy(pe: &Pe) -> R<Vec<u32>> {
     let mut w = common::cy(pe, None)?;
     let fl = if last_unit(pe, unit) { CY_LAST } else { 0 };
     w.extend_from_slice(&[fl, 0, 0, 0, 0]);
-    Ok(w)
-}
-
-/// A head PE: [`common::head`] with the blocks' notes (a group root takes no relay from the
-/// north), then its group's dims.
-fn head(pe: &Pe) -> R<Vec<u32>> {
-    let Place::Head { row, col } = pe.role().place else {
-        return Err(format!("{:?}: a grouped head kernel off a head PE", pe.at));
-    };
-    let h = HeadIo {
-        row,
-        role: pe.note(ROLE),
-        relay_north: false,
-        turns: pe.note(TURN),
-        token_loop: true,
-    };
-    let mut w = common::head(pe, h)?;
-    w.push(group_dims(&pe.prog.plan, col as usize));
     Ok(w)
 }
 
@@ -289,7 +261,7 @@ impl Dims {
     }
 }
 
-/// Every kind's kernel of a Gemma 12B program, its params from the plan (the weight / CX PEs'
+/// The units' kernels of a Gemma 12B program, their params from the plan (the weight / CX PEs'
 /// `Hc` and `ATT` are the plain rows' here; [`crate::block::row_runs`] sets each
 /// PE's).
 pub fn kernels(prog: &Program) -> R<Kernels> {
@@ -298,7 +270,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     let p = &plan.partition;
     let d = Dims::of(plan)?;
     let hcw = p.row_dims[1].dims;
-    let (vr, hr) = (p.head.vocab_rows, p.head.rows);
+    let (_vr, _hr) = (p.head.vocab_rows, p.head.rows);
     let mut out = Kernels::new();
     out.insert(
         Kind::WEIGHT,
@@ -371,31 +343,6 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 ACT: sc.act,
                 KEV: sc.kev,
                 GELUT: 2,
-            },
-        )?,
-    );
-    out.insert(
-        Kind::HEAD,
-        KernelBuild::of(
-            &HEAD_GEMMA12,
-            HeadPeGroups {
-                VR: vr,
-                HDc: d.hdc,
-                NPX: 1,
-                HACC16: 0,
-                GRP: 1,
-            },
-        )?,
-    );
-    out.insert(
-        Kind::HEAD_CTL,
-        KernelBuild::of(
-            &HEAD_CTL,
-            HeadCtl {
-                VR: vr,
-                FIFOW: 32,
-                WFORCE: 0,
-                WFN: hr,
             },
         )?,
     );

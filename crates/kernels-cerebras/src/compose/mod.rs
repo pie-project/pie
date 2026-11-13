@@ -13,8 +13,9 @@
 //! - the head (east of the units, by row groups of the runs, or a band below a MoE snake) and the
 //!   token loop close the program.
 //!
-//! What the role kernels read off each block's PEs (their ABI with the host) follows the layout
-//! ([`copies`]); what the kernels do not run is refused by name ([`refuse`]).
+//! What the role kernels read off each block's PEs (their ABI with the host) follows their set
+//! ([`copies`], [`crate::kernels::KernelSet`]); what the kernels do not run is refused by name
+//! ([`refuse`]).
 
 pub mod copies;
 pub mod stacked;
@@ -35,6 +36,7 @@ use crate::block::shared_kv::SharedKv;
 use crate::block::token_loop::TokenLoop;
 use crate::block::units::{UnitCopies, Units, UnitsCopies};
 use crate::floorplan::{Aux, Floorplan, HeadAt, Segment};
+use crate::kernels::KernelSet;
 use crate::plan::{Act, Plan, Shape};
 
 type R<T> = Result<T, String>;
@@ -167,66 +169,16 @@ impl Needs {
     }
 }
 
-/// How a program's units lie, from what its layers need: the one choice the blocks and the role
-/// kernels' phases both follow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Layout {
-    /// A snake of units.
-    Snake,
-    /// Stacked unit columns, a side input's storage above them (a side input or a cache read
-    /// across layers).
-    Stacked,
-    /// Attention / plain row runs in a U of two unit columns, the head fed by row groups
-    /// (sliding windows).
-    Runs,
-    /// Attention | MoE halves in a snake of two unit columns from the band (routed experts).
-    Split,
-}
-
-impl Layout {
-    /// The layout's name (the plan's record, error messages).
-    #[must_use]
-    pub fn name(self) -> &'static str {
-        match self {
-            Layout::Snake => "snake",
-            Layout::Stacked => "stacked",
-            Layout::Runs => "runs",
-            Layout::Split => "split",
-        }
-    }
-
-    /// The layout `shape`'s layers take.
-    #[must_use]
-    pub fn of_shape(shape: &Shape) -> Layout {
-        Layout::of(&Needs::of(&crate::layers::of(shape)))
-    }
-
-    /// The layout layers that need `needs` take.
-    #[must_use]
-    pub fn of(needs: &Needs) -> Layout {
-        if needs.experts {
-            Layout::Split
-        } else if needs.side_in || needs.shared_cache {
-            Layout::Stacked
-        } else if needs.sliding {
-            Layout::Runs
-        } else {
-            Layout::Snake
-        }
-    }
-}
-
-/// Refuses, by name, what `shape` needs that the role kernels of its layout do not run (else the
-/// program would run the model without it). The snake, the stacked columns and the row runs run
-/// no projection biases or sinks; the attention / MoE halves run full and sliding-window attention
-/// with or without q / k / v and output biases, sinks or q / k head norms (not head norms and
-/// biases at once: the biases' words hold the norms' weights), a router with or without its bias,
-/// MXFP4 or 16-bit experts with or without biases, and the clamped SwiGLU or SiLU's GLU.
+/// Refuses, by name, what `shape` needs that the role kernels of its set do not run (else the
+/// program would run the model without it). The own, shared and windowed caches' kernels run no
+/// projection biases or sinks; the experts' attention / MoE halves run full and sliding-window
+/// attention with or without q / k / v and output biases, sinks or q / k head norms (not head
+/// norms and biases at once: the biases' words hold the norms' weights), a router with or without
+/// its bias, MXFP4 or 16-bit experts with or without biases, and the clamped SwiGLU or SiLU's GLU.
 pub fn refuse(shape: &Shape) -> R<()> {
-    let layout = Layout::of_shape(shape);
+    let set = KernelSet::of_shape(shape);
     let a = &shape.attn;
-    let (unmet, kernels): (Vec<(bool, &str)>, &str) = if layout == Layout::Split {
+    let (unmet, kernels): (Vec<(bool, &str)>, &str) = if set == KernelSet::Experts {
         (
             vec![
                 (
@@ -251,7 +203,7 @@ pub fn refuse(shape: &Shape) -> R<()> {
                 (a.o_bias, "an output projection bias"),
                 (a.sinks, "attention sinks"),
             ],
-            layout.name(),
+            set.name(),
         )
     };
     match unmet.iter().find(|(on, _)| *on) {
@@ -277,7 +229,7 @@ pub struct Schedule {
     pub ple: u32,
     /// 1: the shared caches' KVS line.
     pub kvs: u32,
-    /// 1: x leaves the last unit for the head by row groups ([`Layout::Runs`]).
+    /// 1: x leaves the last unit for the head by row groups ([`HeadAt::Groups`]).
     pub hg: u32,
     /// (attention halves) 1: the q / k / v biases; 1: the sinks; 1: the q / k head norms.
     pub qb: u32,
@@ -289,17 +241,18 @@ pub struct Schedule {
     pub xb: u32,
     /// (MoE halves) the experts' GLU: 0 the clamped SwiGLU, 1 SiLU's.
     pub glu: u32,
-    /// (row runs) 1: a global layer projects q | raw k and takes v as k's unscaled norm (the
-    /// row runs' cut leaves a global layer's v rows out: Gemma 4's k = v checkpoints, which the
-    /// trace's packed bank does not tell apart).
+    /// (windowed rows) 1: a global layer projects q | raw k and takes v as k's unscaled norm (the
+    /// windowed rows' cut leaves a global layer's v rows out: Gemma 4's k = v checkpoints, which
+    /// the trace's packed bank does not tell apart).
     pub kev: u32,
 }
 
 impl Schedule {
-    /// The phases of `program`'s layers.
+    /// The phases of `program`'s layers laid as `fp`.
     #[must_use]
-    pub fn of(program: &LayerProgram) -> Schedule {
+    pub fn of(program: &LayerProgram, fp: &Floorplan) -> Schedule {
         let needs = &Needs::of(program);
+        let set = KernelSet::of(needs);
         let gelu = program
             .bodies
             .iter()
@@ -318,7 +271,7 @@ impl Schedule {
             act: u32::from(gelu),
             ple: u32::from(needs.side_in),
             kvs: u32::from(needs.shared_cache),
-            hg: u32::from(Layout::of(needs) == Layout::Runs),
+            hg: u32::from(fp.head.at == HeadAt::Groups),
             qb: u32::from(needs.attn_bias),
             snk: u32::from(needs.sinks),
             qkn: u32::from(needs.qk_norm),
@@ -326,7 +279,7 @@ impl Schedule {
             rb: u32::from(needs.router_bias),
             xb: u32::from(needs.expert_bias),
             glu: u32::from(program.bodies.iter().any(|b| b.glu == Some(GluAct::Swiglu))),
-            kev: u32::from(Layout::of(needs) == Layout::Runs),
+            kev: u32::from(set == KernelSet::Windows),
         }
     }
 
@@ -351,7 +304,7 @@ pub fn snake_gap(units: u32, (unx, uny): (u32, u32)) -> R<Option<(u32, u32)>> {
 }
 
 /// What the role kernels read off the PEs of the blocks the composer places: the copies onto
-/// each kind (the kernels' ABI with the host, by layout: [`copies::of`]). A kind the kernels have
+/// each kind (the kernels' ABI with the host, by kernel set: [`copies::of`]). A kind the kernels have
 /// no copies for is a kind they do not run.
 #[derive(Default)]
 pub struct KernelCopies {
@@ -368,8 +321,8 @@ fn take<T>(c: Option<T>, what: &str) -> R<T> {
 /// The blocks of `plan`'s floorplan, in order: the units first, then the segments laid over
 /// them, the blocks placed beside them for a feature (a side input's storage, the shared caches'
 /// line), the head, the token loop; each block's copies the role kernels' ([`copies::of`]).
-pub fn blocks(plan: &Plan, needs: &Needs, fp: &Floorplan) -> R<Vec<Box<dyn Block>>> {
-    let copies = copies::of(plan, Layout::of(needs))?;
+pub fn blocks(plan: &Plan, set: KernelSet, fp: &Floorplan) -> R<Vec<Box<dyn Block>>> {
+    let copies = copies::of(plan, set)?;
     let shape = &fp.units.shape;
     let mut out: Vec<Box<dyn Block>> = Vec::new();
     let unit_copies = match (copies.units, copies.runs, copies.moe) {
@@ -457,19 +410,35 @@ mod tests {
         .unwrap()
     }
 
-    /// The role kernels' phases read off each shipping model's layer program: what its layout's
-    /// kernels were built with.
+    /// The schedule of `name`'s plan (the pinned plan `preset`, else the search's).
+    fn schedule(name: &str, preset: Option<&str>) -> Schedule {
+        let ask = preset.map_or_else(Ask::default, Ask::preset);
+        let p = plan(&trace(name), &ask).unwrap().plan;
+        let sc = Program::of(p.clone()).unwrap().schedule;
+        let fp = Floorplan::of(
+            &p,
+            &crate::floorplan::Requests::of(&Needs::of(&program(&trace(name)))),
+        );
+        assert_eq!(
+            Schedule::of(&program(&trace(name)), &fp.unwrap()),
+            sc,
+            "{name}"
+        );
+        sc
+    }
+
+    /// The role kernels' phases read off each shipping model's layer program and floorplan: what
+    /// its kernels were built with.
     #[test]
-    fn a_layer_program_schedules_its_layout_kernels() {
-        for (name, nrm, mixk, act, ple, kvs, hg) in [
-            ("qwen35-d9b-bf16-kv-bf16", 0, 0, 0, 0, 0, 0),
-            ("llama31-8b-bf16-kv-bf16", 0, 0, 0, 0, 0, 0),
-            ("gemma4-e4b-bf16-kv-bf16", 1, 1, 1, 1, 1, 0),
-            ("gemma4-12b-bf16-kv-bf16", 1, 1, 1, 0, 0, 1),
-            ("gptoss-20b-bf16-mxfp4-kv-bf16", 2, 2, 0, 0, 0, 0),
+    fn a_layer_program_schedules_its_kernels() {
+        for (name, preset, nrm, mixk, act, ple, kvs, hg) in [
+            ("qwen35-d9b-bf16-kv-bf16", "9b", 0, 0, 0, 0, 0, 0),
+            ("llama31-8b-bf16-kv-bf16", "l3-8b", 0, 0, 0, 0, 0, 0),
+            ("gemma4-e4b-bf16-kv-bf16", "e4b", 1, 1, 1, 1, 1, 0),
+            ("gemma4-12b-bf16-kv-bf16", "g12", 1, 1, 1, 0, 0, 1),
+            ("gptoss-20b-bf16-mxfp4-kv-bf16", "full", 2, 2, 0, 0, 0, 0),
         ] {
-            let t = trace(name);
-            let sc = Schedule::of(&program(&t));
+            let sc = schedule(name, Some(preset));
             assert_eq!(
                 (sc.nrm, sc.mixk, sc.act, sc.ple, sc.kvs, sc.hg),
                 (nrm, mixk, act, ple, kvs, hg),
@@ -477,11 +446,19 @@ mod tests {
             );
         }
         // the MoE halves' variants: gpt-oss's biases and sinks, the mini's head norms and SiLU
-        for (name, want) in [
-            ("gptoss-20b-bf16-mxfp4-kv-bf16", (1, 1, 0, 1, 1, 1, 0)),
-            ("qwen3-30b-a3b-mini-bf16-kv-bf16", (0, 0, 1, 0, 0, 0, 1)),
+        for (name, preset, want) in [
+            (
+                "gptoss-20b-bf16-mxfp4-kv-bf16",
+                Some("full"),
+                (1, 1, 0, 1, 1, 1, 0),
+            ),
+            (
+                "qwen3-30b-a3b-mini-bf16-kv-bf16",
+                None,
+                (0, 0, 1, 0, 0, 0, 1),
+            ),
         ] {
-            let sc = Schedule::of(&program(&trace(name)));
+            let sc = schedule(name, preset);
             assert_eq!(
                 (sc.qb, sc.snk, sc.qkn, sc.ob, sc.rb, sc.xb, sc.glu),
                 want,

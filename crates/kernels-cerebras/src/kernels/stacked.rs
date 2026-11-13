@@ -1,7 +1,7 @@
-//! The stacked columns' role kernels (Gemma 4 E2B / E4B): `weight.csl` (18 route slots), `cx.csl` (deferred norms, the PLE phase),
-//! `cy.csl`, `head_ctl.csl` with the token bus, `ple_gemma.csl` (the PLE store), with the shared
-//! head PE ([`super::head::HEAD_PE`]). Their params from the plan ([`kernels`]) and their rcfg
-//! writers.
+//! The shared caches' role kernels ([`super::KernelSet::Shared`]: Gemma 4 E2B / E4B):
+//! `weight.csl` (18 route slots), `cx.csl` (deferred norms, the PLE phase), `cy.csl`; and the
+//! side input's store, `ple_gemma.csl` ([`store`]). Their params from the plan ([`kernels`]) and
+//! their rcfg writers.
 
 use crate::abi::{Kernel, KernelBuild, Kernels, params};
 use crate::block::ple::{self, STORE, TOKEN, bus, column_of, store_of};
@@ -15,7 +15,6 @@ use crate::role::{Kind, Place};
 
 use super::Pe;
 use super::common::{self, CT5, CT6, CxIo};
-use super::head::{HEAD_PE, HeadCtlTb, HeadPe};
 
 type R<T> = Result<T, String>;
 
@@ -105,23 +104,12 @@ pub const CTL_CY_GEMMA: Kernel = Kernel {
     rcfg: Some(cy),
 };
 
-/// `head_ctl.csl` with the token bus to the PLE storage.
-pub const HEAD_CTL_GEMMA: Kernel = Kernel {
-    source: "head_ctl.csl",
-    owns: &[
-        "res", "rcfg", "tdbg", "ring", "lgt", "force", "nforce", "tin",
-    ],
-    params: HeadCtlTb::NAMES,
-    route_slots: 12,
-    rcfg: Some(head_ctl),
-};
-
 pub const PLE_GEMMA: Kernel = Kernel {
     source: "ple_gemma.csl",
     owns: &["ptab", "rcfg", "psend"],
     params: PleGemma::NAMES,
     route_slots: 8,
-    rcfg: Some(store),
+    rcfg: Some(store_pe),
 };
 
 /// A weight PE's own word bits: column 0 sends the deferred scalar, a sharer takes the shared
@@ -203,24 +191,9 @@ fn cy(pe: &Pe) -> R<Vec<u32>> {
     Ok(w)
 }
 
-/// A head control PE: the shared words at its vocabulary offset, then whether its row carries
-/// the PLE token word, and its colour.
-fn head_ctl(pe: &Pe) -> R<Vec<u32>> {
-    let vr = pe.prog.plan.partition.head.vocab_rows;
-    let mut w = common::hctl(pe, pe.at.y * vr, true)?;
-    let tb = pe
-        .prog
-        .floor
-        .stores
-        .iter()
-        .any(|s| pe.at.y >= s.rect.y && pe.at.y < s.rect.y + s.rect.h);
-    w.extend_from_slice(&[u32::from(tb), pe.c(TOKEN)?]);
-    Ok(w)
-}
-
 /// A store PE: its route table (8 slots), its bits, first token, tokens, bus words, bus colour,
 /// the token word's queue, a spare colour. A route-only PE parks its queues.
-fn store(pe: &Pe) -> R<Vec<u32>> {
+fn store_pe(pe: &Pe) -> R<Vec<u32>> {
     let Place::Store {
         first,
         count,
@@ -260,9 +233,8 @@ fn store(pe: &Pe) -> R<Vec<u32>> {
     Ok(w)
 }
 
-/// Every kind's kernel of a Gemma program, its params from the plan: the KV-owning units'
-/// `SH` / `Ic` (the sharers' are [`shared_kv::SharedKv`]'s overrides), the store PEs' `NTW` the
-/// largest column's (the route-only PEs': [`ple::Ple`]'s).
+/// The units' kernels of a Gemma program, their params from the plan: the KV-owning units' `SH` /
+/// `Ic` (the sharers' are [`shared_kv::SharedKv`]'s overrides).
 pub fn kernels(prog: &Program) -> R<Kernels> {
     let sc = prog.schedule;
     let plan = &prog.plan;
@@ -368,37 +340,19 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
             },
         )?,
     );
-    out.insert(
-        Kind::HEAD,
-        KernelBuild::of(
-            &HEAD_PE,
-            HeadPe {
-                VR: p.head.vocab_rows,
-                HDc: 2 * hcc,
-                NPX: 1,
-                HACC16: 0,
-            },
-        )?,
-    );
-    out.insert(
-        Kind::HEAD_CTL,
-        KernelBuild::of(
-            &HEAD_CTL_GEMMA,
-            HeadCtlTb {
-                VR: p.head.vocab_rows,
-                FIFOW: 32,
-                WFORCE: 0,
-                WFN: p.head.rows,
-                TB: 1,
-            },
-        )?,
-    );
+    Ok(out)
+}
+
+/// The side input's store kernel: every store PE's `NTW` the largest column's (the route-only
+/// PEs': [`ple::Ple`]'s).
+pub fn store(prog: &Program) -> R<Kernels> {
+    let mut out = Kernels::new();
     out.insert(
         STORE,
         KernelBuild::of(
             &PLE_GEMMA,
             PleGemma {
-                NTW: ple::words(plan, &prog.floor),
+                NTW: ple::words(&prog.plan, &prog.floor),
                 DLY: 1500,
             },
         )?,

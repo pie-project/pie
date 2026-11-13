@@ -120,8 +120,8 @@ fn plan(args: &[String]) -> Result<(), String> {
     let out = PathBuf::from(get(&f, "--out").ok_or(USAGE)?);
     mkdir(&out)?;
     eprintln!(
-        "wafer-compile plan: the {} layout, preset {}",
-        kernels_cerebras::compose::Layout::of_shape(&planned.plan.shape).name(),
+        "wafer-compile plan: the {} kernels, preset {}",
+        kernels_cerebras::kernels::KernelSet::of_shape(&planned.plan.shape).name(),
         planned.preset.name
     );
     json(&out, "plan.json", &planned.plan)
@@ -199,7 +199,7 @@ fn search(args: &[String]) -> Result<(), String> {
     let keep = get(&f, "--keep")
         .map_or(Ok(5), str::parse)
         .map_err(|e| format!("--keep: {e}"))?;
-    let made = kernels_cerebras::pins::of(kernels_cerebras::compose::Layout::of_shape(&shape))
+    let made = kernels_cerebras::pins::of(kernels_cerebras::kernels::KernelSet::of_shape(&shape))
         .into_iter()
         .find(|p| p.made_for == Some(shape.signature()));
     for (i, c) in kernels_cerebras::search::search(&shape, &ask, keep)?

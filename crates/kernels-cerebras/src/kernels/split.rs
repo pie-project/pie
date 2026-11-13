@@ -1,7 +1,9 @@
-//! The attention / MoE halves' role kernels (gpt-oss, Qwen3 MoE): the attention / MoE weight halves (`weight.csl`, its entry-major attention and routed experts),
-//! CX (`cx.csl`, NRM 2), the CY halves (`cy.csl` (MIXK 2, MIXK 3)), the
-//! band's head ([`super::head::HEAD_PE`]'s source, BAND 1) and control row ([`super::head::HEAD_CTL`]'s source). Their
-//! params from the plan ([`kernels`]) and their rcfg writers.
+//! The routed experts' role kernels ([`super::KernelSet::Experts`]: gpt-oss, Qwen3 MoE): the
+//! attention / MoE weight halves (`weight.csl`, its entry-major attention and routed experts),
+//! CX (`cx.csl`, NRM 2), the CY halves (`cy.csl` (MIXK 2, MIXK 3)) ([`kernels`]); and the band
+//! head's ([`super::head::HEAD_PE`]'s source, BAND 1) and control row's
+//! ([`super::head::HEAD_CTL`]'s source) ([`band`]). Their params from the plan and their rcfg
+//! writers.
 
 use crate::abi::{FILLER, Kernel, KernelBuild, Kernels, Lit, Params, params};
 use crate::block::band::{BAND_IN, BAND_OUT, BAND_V1, BAND_VERT, BUS, BUS_COLOUR, V1_RX, W2_TX};
@@ -220,7 +222,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     let (s, p) = (&plan.shape, &plan.partition);
     let d = Dims::of(plan)?;
     let qsc = 1.0f64 / f64::from(s.attn.head_dim).sqrt();
-    let (vr, hr) = (p.head.vocab_rows, s.hidden);
+    let (_vr, hr) = (p.head.vocab_rows, s.hidden);
     let mut out = Kernels::new();
     let att = WeightAtt {
         K: d.k,
@@ -314,6 +316,17 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         SWA: Lit::f64(if sc.glu == 1 { 1.0 } else { 1.702 }),
     };
     out.insert(CYM, KernelBuild::of(&CY_MOE, cym)?);
+    out.insert(Kind::IDLE, KernelBuild::of(&FILLER, Params::default())?);
+    Ok(out)
+}
+
+/// The band's kernels: a band PE takes one CX row's dims; the control row's argmax over the
+/// band's columns.
+pub fn band(prog: &Program) -> R<Kernels> {
+    let p = &prog.plan.partition;
+    let d = Dims::of(&prog.plan)?;
+    let vr = p.head.vocab_rows;
+    let mut out = Kernels::new();
     let hp = HeadPeBand {
         VR: vr,
         HDc: d.hcc,
@@ -328,7 +341,6 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
         WFN: p.head.cols,
     };
     out.insert(Kind::HEAD_CTL, KernelBuild::of(&HEAD_CTL_BAND, hc)?);
-    out.insert(Kind::IDLE, KernelBuild::of(&FILLER, Params::default())?);
     Ok(out)
 }
 

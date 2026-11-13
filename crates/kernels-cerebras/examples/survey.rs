@@ -190,18 +190,18 @@ fn survey(d: &Deployment, deep: bool) {
     if let Err(e) = kernels_cerebras::compose::refuse(&shape) {
         return println!("{name}\tREFUSE\t{}\tbodies={bodies}", short(&e));
     }
-    let layout = kernels_cerebras::compose::Layout::of_shape(&shape).name();
+    let kernels = kernels_cerebras::kernels::KernelSet::of_shape(&shape).name();
     if !deep {
-        return println!("{name}\tSHAPE-OK\tlayout={layout} bodies={bodies}");
+        return println!("{name}\tSHAPE-OK\tkernels={kernels} bodies={bodies}");
     }
     match target::plan(&trace, &Ask::default()) {
         Ok(p) => println!(
-            "{name}\tPLAN-OK\tlayout={layout} preset={} bodies={bodies} {:.1}s",
+            "{name}\tPLAN-OK\tkernels={kernels} preset={} bodies={bodies} {:.1}s",
             p.preset.name,
             t0.elapsed().as_secs_f64()
         ),
         Err(e) => println!(
-            "{name}\tPLAN\tlayout={layout} {}\t{:.1}s",
+            "{name}\tPLAN\tkernels={kernels} {}\t{:.1}s",
             short(&e),
             t0.elapsed().as_secs_f64()
         ),

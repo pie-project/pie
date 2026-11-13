@@ -1,6 +1,6 @@
 {
   "name": "tiny-gemma",
-  "layout": "stacked",
+  "kernels": "shared",
   "keys": {"G2": 2, "G2W": 2, "HR": 32, "LOOP": 64, "NEG": 4, "NU": 5, "PX": 8, "PY": 8},
   "levers": "",
   "arrangement": {

@@ -4,10 +4,11 @@
 
 use super::abi::{Kernels, Overrides};
 use super::block::Block;
-use super::compose::{self, Layout, Needs, Schedule};
+use super::compose::{self, Needs, Schedule};
 use super::fabric::{Fabric, Palette};
 use super::floor::{Floor, FloorBuilder};
 use super::floorplan::{Floorplan, Requests};
+use super::kernels::KernelSet;
 use super::layers;
 use super::plan::Plan;
 use super::toolchain::{Arch, memcpy_fabric};
@@ -25,8 +26,8 @@ pub struct Program {
     pub overrides: Overrides,
     /// The plan's elements: what the blocks place.
     pub floorplan: Floorplan,
-    /// How the plan's units lie: the blocks' and the role kernels' one choice.
-    pub layout: Layout,
+    /// The role kernels the units run (by what the plan's layers need).
+    pub roles: KernelSet,
     /// The role kernels' layer phases, from what the plan's layers need.
     pub schedule: Schedule,
 }
@@ -48,7 +49,7 @@ impl Program {
         compose::refuse(&plan.shape)?;
         let needs = Needs::of(&layers::of(&plan.shape));
         let floorplan = Floorplan::of(&plan, &Requests::of(&needs))?;
-        let blocks = compose::blocks(&plan, &needs, &floorplan)?;
+        let blocks = compose::blocks(&plan, KernelSet::of(&needs), &floorplan)?;
         Program::build_with(blocks, floorplan, plan)
     }
 
@@ -84,8 +85,8 @@ impl Program {
         let fabric = Fabric::lay(&floor, &wiring, &palette)?;
         fabric.validate(&floor)?;
         let program = layers::of(&plan.shape);
-        let schedule = Schedule::of(&program);
-        let layout = Layout::of(&Needs::of(&program));
+        let schedule = Schedule::of(&program, &floorplan);
+        let roles = KernelSet::of(&Needs::of(&program));
         let mut prog = Program {
             plan,
             blocks,
@@ -96,7 +97,7 @@ impl Program {
             kernels: Kernels::new(),
             overrides: Overrides::default(),
             floorplan,
-            layout,
+            roles,
             schedule,
         };
         prog.kernels = super::kernels::of(&prog)?;

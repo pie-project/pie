@@ -1,24 +1,30 @@
 //! The wafer program kernels: one [`super::abi::Kernel`] descriptor a CSL source, its params
 //! struct and its rcfg writer. An rcfg writer sees one PE as a [`Pe`]: the queues the blocks'
-//! links bound there (by slot), the notes they left, the program's palette and fabric. Each
-//! layout's role kernels take their params from the plan ([`of`]) and export their symbols in one
-//! order ([`symbols`]):
+//! links bound there (by slot), the notes they left, the program's palette and fabric. The
+//! program's kernels ([`of`]) are read off its elements: the units' role kernels by the set the
+//! layer program's mixers take ([`KernelSet`]: its params from the plan, its symbols exported in
+//! one order, [`symbols`]), the head's by where the floorplan puts it ([`head`]), the side
+//! input's store kernel where there is storage, the relay where the path leaves gap slots.
 //!
-//! - [`common`]: the word layouts every layout's weight, CX, CY, head and head control kernels
-//!   share (their leading words), with the codes the kernels read named;
-//! - [`snake`]: the unit snake's (`weight.csl`, `cx.csl`, `cy.csl`, `head_pe.csl`,
-//!   `head_ctl.csl`, `relay.csl`);
-//! - [`stacked`]: the stacked columns' (`weight.csl`, `cx.csl`, `cy.csl`, `head_ctl.csl` (TB 1),
-//!   `ple_gemma.csl`; `head_pe.csl`);
-//! - [`runs`]: the row runs' (`weight.csl` with row roles, `cx.csl`, `cy.csl`, `head_pe.csl`
-//!   with head groups, `head_ctl.csl`);
-//! - [`split`]: the attention / MoE halves' (`weight.csl`, `cx.csl`, `cy.csl`'s halves,
-//!   `head_pe.csl` on the band, `head_ctl.csl`).
+//! - [`common`]: the word layouts every set's weight, CX, CY, head and head control kernels
+//!   share (their leading words), with the codes the kernels read named, and the relay;
+//! - [`head`]: the head east of the units (`head_pe.csl`, `head_ctl.csl`, its token bus where a
+//!   side input's storage reads the winner), fed by row groups (GRP 1), the band (BAND 1);
+//! - [`snake`]: [`KernelSet::Own`]'s units (`weight.csl`, `cx.csl`, `cy.csl`);
+//! - [`stacked`]: [`KernelSet::Shared`]'s (`weight.csl`, `cx.csl`, `cy.csl`) and the side
+//!   input's store (`ple_gemma.csl`);
+//! - [`runs`]: [`KernelSet::Windows`]' (`weight.csl` with row roles, `cx.csl`, `cy.csl`);
+//! - [`split`]: [`KernelSet::Experts`]' (`weight.csl`, `cx.csl`, `cy.csl`'s halves).
+
+use serde::{Deserialize, Serialize};
 
 use super::abi::Kernels;
-use super::compose::Layout;
+use super::compose::Needs;
 use super::fabric::{ChainMember, Colour, Endpoint, PeIo, RootQueues};
 use super::floor::Coord;
+use super::floorplan::{Aux, HeadAt};
+use super::layers;
+use super::plan::Shape;
 use super::program::Program;
 use super::role::PeRole;
 use super::wiring::{Class, NoteKey, Slot};
@@ -32,26 +38,100 @@ pub mod stacked;
 
 type R<T> = Result<T, String>;
 
-/// Each kind's kernel and its params for `prog`, by its layout (levers applied by
-/// [`super::emit::params::kernels`]).
-pub fn of(prog: &Program) -> R<Kernels> {
-    match prog.layout {
-        Layout::Snake => snake::kernels(prog),
-        Layout::Stacked => stacked::kernels(prog),
-        Layout::Runs => runs::kernels(prog),
-        Layout::Split => split::kernels(prog),
+/// The role kernels a program's units run: one CSL ABI a set (the kernels' params, rcfg words,
+/// exported symbols, the copies they read and the cut that makes them), each the mixers and norms
+/// of a family of layer programs. Chosen by what the layer program's mixers need
+/// ([`KernelSet::of`]), not by where the units lie: the placement is the floorplan's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KernelSet {
+    /// Attention over a layer's own cache and the gated delta rule, direct norms (`MIXK 0`:
+    /// Qwen3.5, Qwen3, Llama 3).
+    Own,
+    /// Sliding / global caches, caches read across layers and a per-token side input, deferred
+    /// norms (`MIXK 1`, `PLE`, `KVS`: Gemma 4 E2B / E4B).
+    Shared,
+    /// Sliding / global caches over attention and plain row runs, deferred norms (`MIXK 1`,
+    /// `AROW`, `KEV`: Gemma 4 12B).
+    Windows,
+    /// Routed experts: attention | MoE halves (`MIXK 2`, `3`: gpt-oss, Qwen3 MoE).
+    Experts,
+}
+
+impl KernelSet {
+    /// The set's name (the plan's record, error messages).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            KernelSet::Own => "own",
+            KernelSet::Shared => "shared",
+            KernelSet::Windows => "windows",
+            KernelSet::Experts => "experts",
+        }
+    }
+
+    /// The set that runs layers that need `needs`: routed experts the halves'; a side input or a
+    /// cache read across layers the shared caches'; windows the windowed rows'; else the own
+    /// caches'.
+    #[must_use]
+    pub fn of(needs: &Needs) -> KernelSet {
+        if needs.experts {
+            KernelSet::Experts
+        } else if needs.side_in || needs.shared_cache {
+            KernelSet::Shared
+        } else if needs.sliding {
+            KernelSet::Windows
+        } else {
+            KernelSet::Own
+        }
+    }
+
+    /// The set `shape`'s layers take.
+    #[must_use]
+    pub fn of_shape(shape: &Shape) -> KernelSet {
+        KernelSet::of(&Needs::of(&layers::of(shape)))
     }
 }
 
-/// Every name the kernels of `layout` export, with its element type, in export order: the ABI
+/// Each kind's kernel and its params for `prog` (levers applied by
+/// [`super::emit::params::kernels`]): the units' by the program's kernel set, the head's by
+/// where it sits, the store kernel where a side input has storage, the relay where the units'
+/// path leaves gap slots.
+pub fn of(prog: &Program) -> R<Kernels> {
+    let mut out = match prog.roles {
+        KernelSet::Own => snake::kernels(prog),
+        KernelSet::Shared => stacked::kernels(prog),
+        KernelSet::Windows => runs::kernels(prog),
+        KernelSet::Experts => split::kernels(prog),
+    }?;
+    let fp = &prog.floorplan;
+    let store = fp.aux.iter().any(|a| matches!(a, Aux::Store(_)));
+    out.append(&mut match fp.head.at {
+        HeadAt::East => head::east(prog, store)?,
+        HeadAt::Groups => head::groups(prog)?,
+        HeadAt::Band => split::band(prog)?,
+    });
+    if store {
+        out.append(&mut stacked::store(prog)?);
+    }
+    if !prog.floor.relays.is_empty() {
+        out.insert(
+            super::role::Kind::RELAY,
+            super::abi::KernelBuild::of(&common::RELAY, super::abi::Params::default())?,
+        );
+    }
+    Ok(out)
+}
+
+/// Every name the kernels of `set` export, with its element type, in export order: the ABI
 /// between the kernels and the host's memcpy.
 #[must_use]
-pub fn symbols(layout: Layout) -> &'static [(&'static str, &'static str)] {
-    match layout {
-        Layout::Snake => snake::SYMBOLS,
-        Layout::Stacked => stacked::SYMBOLS,
-        Layout::Runs => runs::SYMBOLS,
-        Layout::Split => split::SYMBOLS,
+pub fn symbols(set: KernelSet) -> &'static [(&'static str, &'static str)] {
+    match set {
+        KernelSet::Own => snake::SYMBOLS,
+        KernelSet::Shared => stacked::SYMBOLS,
+        KernelSet::Windows => runs::SYMBOLS,
+        KernelSet::Experts => split::SYMBOLS,
     }
 }
 

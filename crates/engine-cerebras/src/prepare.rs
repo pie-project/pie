@@ -247,7 +247,7 @@ pub fn prepare(
         for planned in tries {
             let plan = planned.plan;
             tracing::info!(
-                layout = kernels_cerebras::compose::Layout::of_shape(&plan.shape).name(),
+                kernels = kernels_cerebras::kernels::KernelSet::of_shape(&plan.shape).name(),
                 preset = %planned.preset.name,
                 positions = plan.contract.positions,
                 "cerebras: the wafer program's plan"

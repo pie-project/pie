@@ -1,6 +1,6 @@
 {
   "name": "q3-8b",
-  "layout": "snake",
+  "kernels": "own",
   "made_for": [4096, 36, 12288],
   "keys": {"G2": 12, "HR": 1153, "K": 4, "NE": 17, "PX": 256, "PY": 228, "UNX": 2, "UNY": 5, "VR": 132, "WL": 1},
   "levers": "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2,SLW:1"

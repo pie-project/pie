@@ -1,6 +1,6 @@
 {
   "name": "tiny-t08",
-  "layout": "snake",
+  "kernels": "own",
   "keys": {"G2": 2, "G2W": 2, "HR": 10, "K": 4, "NE": 4, "PX": 8, "PY": 8, "UNX": 2, "UNY": 3, "VR": 8, "WL": 1},
   "levers": ""
 }
