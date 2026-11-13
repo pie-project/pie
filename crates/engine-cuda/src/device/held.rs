@@ -498,6 +498,20 @@ pub fn heap_bytes() -> usize {
     heap::DEVICE_CHUNKS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A load begins: the heaps' chunks made so far are what the device held
+/// before it ([`heap_bytes_since`]).
+pub fn heap_mark() {
+    HEAP_MARK.store(heap_bytes(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The device bytes of the heaps' chunks made since the last load began.
+#[must_use]
+pub fn heap_bytes_since() -> usize {
+    heap_bytes().saturating_sub(HEAP_MARK.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+static HEAP_MARK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// The device bytes the process keeps from dropped buffers, for the next
 /// of their size ([`recycle`]).
 #[must_use]

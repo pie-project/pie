@@ -771,6 +771,7 @@ impl Shell {
         let regions =
             crate::synth::Regions::load(&boot.trace, &folded, &anchored, &device.ctx().tuning())?;
         let (free_before, device_total) = crate::store::device_memory()?;
+        crate::device::held::heap_mark();
         // The pool's address space is reserved for every page its bytes
         // could hold, the stated budget or the share of the card before the
         // weights land; `Pools::fit_the_card` sizes it within that.
@@ -1743,7 +1744,7 @@ fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory:
     ledger.enter(
         Class::Outside,
         "heap chunks",
-        crate::device::held::heap_bytes() as u64,
+        crate::device::held::heap_bytes_since() as u64,
     );
     ledger.enter(
         Class::Outside,

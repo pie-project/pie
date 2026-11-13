@@ -1126,11 +1126,18 @@ impl Bodies {
                 steps.push(Step::Island(cut));
                 continue;
             }
-            let per_node = Recorder::node_price(&graph);
+            // What the instantiation holds on the device is what it took of
+            // the card's free bytes, landed: weighed as it is made, whatever
+            // the graph (one with conditional nodes holds one instantiation
+            // at a time, so no copies of it can be weighed apart).
+            let before = crate::device::free_bytes();
             let exec = graph.instantiate(at.stream)?;
+            crate::device::ctx::sync(at.stream)?;
             let took = exec.nodes();
-            bytes = match (bytes, per_node) {
-                (Some(held), Some(price)) => Some(held + took * price),
+            bytes = match (bytes, before, crate::device::free_bytes()) {
+                (Some(held), Some(before), Some(after)) => {
+                    Some(held + usize::try_from(before.saturating_sub(after)).unwrap_or(0))
+                }
                 _ => None,
             };
             nodes += took;
@@ -1202,26 +1209,6 @@ impl Bodies {
         self.recorder.bstats.evictions += seating.evictions;
         self.recorder.bstats.captures += u64::from(seating.seated);
         seating.seated
-    }
-}
-
-impl Recorder {
-    fn node_price(graph: &Graph) -> Option<usize> {
-        const COPIES: usize = 8;
-
-        static PRICE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-        *PRICE.get_or_init(|| {
-            let nodes = graph.nodes().filter(|nodes| *nodes > 0)?;
-            let bytes = graph.instantiated_bytes(COPIES).ok()?;
-            let price = (bytes > 0.0).then(|| (bytes / nodes as f64).ceil() as usize);
-            if crate::serve::diag::on().arm_trace {
-                eprintln!(
-                    "[arm-trace] node price {price:?} B/node, weighed on a {nodes}-node graph \
-                     ({bytes:.0} B per instantiation over {COPIES} copies)"
-                );
-            }
-            price
-        })
     }
 }
 

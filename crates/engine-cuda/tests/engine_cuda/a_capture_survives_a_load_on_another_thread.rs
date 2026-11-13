@@ -84,7 +84,12 @@ fn a_capture_survives_a_load_on_another_thread() {
                 held.zero_span_on(context.stream(), 0, 4096)
             })
             .expect("a graph");
-            assert!(graph.instantiated_bytes(2).is_ok(), "the weighing answers");
+            // As a body is weighed: instantiated, landed, the card's free
+            // bytes read on either side.
+            let before = engine_cuda::device::free_bytes();
+            let exec = graph.instantiate(context.stream());
+            assert!(exec.is_ok(), "the instantiation answers");
+            let _ = (before, engine_cuda::device::free_bytes());
         }),
     ];
     for (what, beside) in cases {
