@@ -212,7 +212,12 @@ pub struct Run<'c> {
     tiled: std::cell::RefCell<Vec<TiledEntry>>,
     /// The streamed weights' tables of this fire (`crate::store::streamed`).
     streamed: Option<std::sync::Arc<crate::store::streamed::Fire>>,
+    /// Each streamed layer staged on this walk: `(group, routes, span)` and
+    /// its banks' tables.
+    staged: std::cell::RefCell<Vec<StagedGroup>>,
 }
+
+type StagedGroup = ((u32, ValueId, (u32, u32)), Vec<(usize, kernels_xla::hlo::Val)>);
 
 /// A tile-ordered routed result: its value, the routes value it was sorted
 /// on, the span `(lane_offset, lanes)` it was cut on, and its rows.
@@ -262,6 +267,7 @@ impl<'c> Run<'c> {
             group_routes: Vec::new(),
             boundaries: Vec::new(),
             tiled: std::cell::RefCell::new(Vec::new()),
+            staged: std::cell::RefCell::new(Vec::new()),
             streamed: None,
         }
     }
@@ -296,51 +302,52 @@ impl<'c> Run<'c> {
         self.streamed.as_ref()?.bank_of(param)
     }
 
-    /// Before the first select of a layer whose experts are not all in a
-    /// slot, once a `(routes, span)`: the fire is cut, so its routes come
-    /// back and the experts they name are staged before the next segment
-    /// reads them (`crate::store::streamed`). Every value this walk kept
-    /// of the closed program goes.
-    pub(crate) fn cut_for(
-        &mut self,
+    /// Streamed bank `bank` as a select on `routes` reads it: its layer's
+    /// banks staged first, once a `(routes, span)` (`Lower::stage_group`).
+    pub(crate) fn streamed_operand(
+        &self,
+        l: &mut crate::lower::Lower<'_, '_>,
         bank: crate::store::streamed::Bank,
+        param: usize,
+        width: u32,
         routes: ValueId,
-    ) -> Result<(), kernels_xla::Error> {
-        if bank.whole {
-            return Ok(());
-        }
-        let Some(streamed) = self.streamed.clone() else {
-            return Ok(());
-        };
+        routes_v: kernels_xla::hlo::Val,
+    ) -> Result<kernels_xla::tensor::Operand, kernels_xla::Error> {
         let span = self.window().span;
-        let key = (routes, (span.lane_offset, span.lanes));
-        if streamed.cut_for.lock().expect("unpoisoned").contains(&key) {
-            return Ok(());
-        }
-        if !self.ctx.cut() {
-            return Err(kernels_xla::Error::Backend {
+        let key = (bank.group, routes, (span.lane_offset, span.lanes));
+        let known = self
+            .staged
+            .borrow()
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, t)| t.clone());
+        let tables = match known {
+            Some(t) => t,
+            None => {
+                let group = self
+                    .streamed
+                    .as_ref()
+                    .map(|f| f.group(bank.group))
+                    .unwrap_or_default();
+                let t = l.stage_group(&group, routes_v)?;
+                self.staged.borrow_mut().push((key, t.clone()));
+                t
+            }
+        };
+        let table = tables
+            .iter()
+            .find(|(p, _)| *p == param)
+            .map(|&(_, t)| t)
+            .ok_or_else(|| kernels_xla::Error::Backend {
                 op: "linear.moe_select",
-                detail: "a streamed bank whose experts are not all resident, in a fire that \
-                         cannot be cut at its routes"
-                    .to_string(),
-            });
-        }
-        streamed.cut_for.lock().expect("unpoisoned").push(key);
-        streamed
-            .cuts
-            .lock()
-            .expect("unpoisoned")
-            .push(crate::store::streamed::Cut {
-                routes: self.tensor(routes),
-                shape: bank.shape,
-                layer: bank.layer,
-            });
-        self.appended.clear();
-        self.group_routes.clear();
-        self.boundaries.clear();
-        self.tiled.borrow_mut().clear();
-        self.probed.borrow_mut().clear();
-        Ok(())
+                detail: format!("streamed bank {param} staged with no table"),
+            })?;
+        l.pooled_bank(bank, width, table)
+    }
+
+    /// The param a weight value reads (a streamed bank's).
+    pub(crate) fn weight_param_of(&self, id: ValueId) -> Option<usize> {
+        self.weight_param(id)
     }
 
     /// The tile-ordered rows of `value` on `routes`, cut on this span.

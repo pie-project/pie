@@ -1986,9 +1986,10 @@ fn routed(
     let viewed = f.bank_parts(bank.codes.val()).is_some();
     let grouped = pooled_spec(f, grouped, &bank);
     let path = match tuning.moe_path {
-        _ if viewed && grouped.is_some() && !(p <= c.slice_pairs && fan.tokens == 1) => {
-            MoePath::Gmm
-        }
+        // (one token's pairs too: sliced out of its panels, each expert
+        // is put back together in XLA, a copy a pair; v6e MoE mini decode
+        // c1 at half the held rate)
+        _ if viewed && grouped.is_some() => MoePath::Gmm,
         _ if viewed && grouped.is_none() && p <= c.slice_pairs => MoePath::Slice,
         MoePath::Gmm if grouped.is_none() => MoePath::All,
         // One token's pairs route to as many experts: sliced out, they read

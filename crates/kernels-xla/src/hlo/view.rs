@@ -233,6 +233,87 @@ impl Func {
         self.concat(&panels, 1)
     }
 
+    /// Lands the routed experts of a bank in no slot before a select reads
+    /// it: each expert `routes` names (any i32 shape; ids outside
+    /// `0..experts` name none) whose `table` row is negative is copied, its
+    /// plane's `rows` pool rows, from `host` (u32 `[experts · rows, 128]`
+    /// in pinned host memory, each expert's plane as the pool lays it) into
+    /// the next of the `staging` rows (i32 `[S]`), in expert order. Answers
+    /// the pool and the table with those experts at their staging rows. No
+    /// expert missing: no copy (the loop takes no step). More missing than
+    /// `S`: the extra ones read the last staging row (the caller sizes `S`
+    /// to the most a fire routes to).
+    pub fn stage_misses(
+        &mut self,
+        pool: Val,
+        table: Val,
+        routes: Val,
+        host: Val,
+        rows: i64,
+        staging: Val,
+    ) -> Built<(Val, Val)> {
+        use super::Fold;
+        let e = self.dims(table)[0];
+        let s = self.dims(staging)[0];
+        let p: i64 = self.dims(routes).iter().product();
+        let r = self.reshape(routes, &[p, 1])?;
+        let r = self.broadcast(r, &[p, e], &[0, 1])?;
+        let ids = self.iota(Elem::I32, &[p, e], 1);
+        let named = self.compare(Cmp::Eq, r, ids)?;
+        let named = self.reduce(named, &[0], Fold::Or)?;
+        let zero = self.const_i(Elem::I32, 0, &[e]);
+        let none = self.compare(Cmp::Lt, table, zero)?;
+        let miss = self.and(named, none)?;
+        let one = self.const_i(Elem::I32, 1, &[e]);
+        let missed = self.select(miss, one, zero)?;
+        let upto = self.scan(missed, 0, Fold::Sum)?;
+        let rank = self.sub(upto, missed)?;
+        let top = self.const_i(Elem::I32, s - 1, &[e]);
+        let at = self.min(rank, top)?;
+        let at = self.reshape(at, &[e, 1])?;
+        let row = self.gather_rows_i32(staging, at)?;
+        let table = self.select(miss, row, table)?;
+        let count = self.reduce(missed, &[0], Fold::Sum)?;
+        // Each staging row's expert: the missing one ranked there.
+        let ks = self.iota(Elem::I32, &[s, e], 0);
+        let rk = self.broadcast(rank, &[s, e], &[1])?;
+        let here = self.compare(Cmp::Eq, rk, ks)?;
+        let mb = self.broadcast(miss, &[s, e], &[1])?;
+        let here = self.and(here, mb)?;
+        let es = self.iota(Elem::I32, &[s, e], 1);
+        let zs = self.const_i(Elem::I32, 0, &[s, e]);
+        let pick = self.select(here, es, zs)?;
+        let list = self.reduce(pick, &[1], Fold::Sum)?;
+        let out = crate::lanes::loop_upto(
+            self,
+            count,
+            &[pool],
+            &[list, staging, host],
+            |f, k, carried, inv| {
+                let (pool, list, staging, host) = (carried[0], inv[0], inv[1], inv[2]);
+                let ex = f.dynamic_slice(list, &[k], &[1])?;
+                let ex = f.reshape(ex, &[])?;
+                let rv = f.const_i(Elem::I32, rows, &[]);
+                let from = f.mul(ex, rv)?;
+                let z = f.const_i(Elem::I32, 0, &[]);
+                let block = f.dynamic_slice(host, &[from, z], &[rows, LANES])?;
+                let block = f.to_device(block);
+                let to = f.dynamic_slice(staging, &[k], &[1])?;
+                let to = f.reshape(to, &[])?;
+                Ok(vec![f.dynamic_update_slice(pool, block, &[to, z])?])
+            },
+        )?;
+        Ok((out[0], table))
+    }
+
+    /// `table[at]` (i32 `[n]`) for i32 `at` `[m, 1]`: `[m]`.
+    fn gather_rows_i32(&mut self, table: Val, at: Val) -> Built<Val> {
+        let m = self.dims(at)[0];
+        let t = self.reshape(table, &[self.dims(table)[0], 1])?;
+        let g = self.take_rows(t, at)?;
+        self.reshape(g, &[m])
+    }
+
     /// A bank view as a value: every expert read (a copy of the bank,
     /// logged in [`Func::materialized`]).
     pub fn bank_solid(&mut self, v: Val, why: &str) -> Built<Val> {

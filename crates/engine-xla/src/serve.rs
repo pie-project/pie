@@ -250,11 +250,6 @@ pub struct Shell {
     streamed: crate::store::streamed::Streamed,
     /// The fire being traced reads its streamed weights through these.
     fire_streamed: Option<std::sync::Arc<crate::store::streamed::Fire>>,
-    /// A cut fire's earlier segments, by its last program.
-    segmented: std::collections::HashMap<usize, std::sync::Arc<stream::Segmented>>,
-    /// The segments and cuts the latest trace closed.
-    cut_trace:
-        std::cell::RefCell<Option<(Vec<crate::trace::Segment>, Vec<crate::store::streamed::Cut>)>>,
     /// The host tier (CONTRACT-BC 22): chunks of the pool's size.
     host: crate::store::tier::Host,
     /// The slot file below it, kv list slots.
@@ -725,6 +720,7 @@ impl Shell {
         let mut pools = pools;
         streamed.renumber(narrow(pools.layout().shapes.len() as u64) as u32);
         pools.view_weights(&handles, &streamed)?;
+        pools.land_host_banks(&device, &handles, &streamed)?;
         handles.seal();
         if !streamed.is_empty() {
             for at in 0..streamed.shapes.len() {
@@ -835,8 +831,6 @@ impl Shell {
             pools,
             streamed,
             fire_streamed: None,
-            segmented: std::collections::HashMap::new(),
-            cut_trace: std::cell::RefCell::new(None),
             host: crate::store::tier::Host::default(),
             disk: None,
             exports,
@@ -2370,13 +2364,7 @@ impl Shell {
                 &lands,
                 pixels_seat.as_ref(),
             )?;
-            // A fire cut at its routes runs only as it is fired.
-            let cut = self
-                .cut_trace
-                .borrow_mut()
-                .take()
-                .is_some_and(|(segments, _)| !segments.is_empty());
-            if let Some(deferred) = self.deferred.as_mut().filter(|_| !cut) {
+            if let Some(deferred) = self.deferred.as_mut() {
                 deferred.push(Deferred {
                     key: missed(key),
                     shape_key,
@@ -2436,32 +2424,14 @@ impl Shell {
         }
         // The fire is enqueued, not awaited: whatever reads its outputs (a
         // guest stage, a download) is ordered behind it on the device.
-        let segmented = self
-            .segmented
-            .get(&(std::sync::Arc::as_ptr(&program) as usize))
-            .cloned();
-        let outs = match segmented {
-            Some(segmented) => {
-                let carried = self.run_segments(&segmented, &mut inputs, &staged_weights)?;
-                crate::exec::run_carried(
-                    &self.device,
-                    &program,
-                    Some(&self.weights),
-                    &mut self.pools,
-                    &inputs,
-                    &carried,
-                    timing(),
-                )?
-            }
-            None => crate::exec::run_program(
-                &self.device,
-                &program,
-                Some(&self.weights),
-                &mut self.pools,
-                &inputs,
-                timing(),
-            )?,
-        };
+        let outs = crate::exec::run_program(
+            &self.device,
+            &program,
+            Some(&self.weights),
+            &mut self.pools,
+            &inputs,
+            timing(),
+        )?;
         let t3 = std::time::Instant::now();
         // The program's outputs: a plane per output the fire's classes
         // write, then a decoder's pixel plane and its grid, then the probes.
@@ -2985,13 +2955,7 @@ impl Shell {
         }
         let probed_ids: Vec<ValueId> = probed.iter().map(|(value, _)| *value).collect();
         extras.extend(probed.into_iter().map(|(_, read)| read));
-        let (segments, text, sig) = tracer.finish_segments(&extras);
-        let cuts = self
-            .fire_streamed
-            .as_ref()
-            .map(|fire| fire.cuts.lock().expect("unpoisoned").drain(..).collect())
-            .unwrap_or_default();
-        *self.cut_trace.borrow_mut() = Some((segments, cuts));
+        let (text, sig) = tracer.finish(&extras);
         Ok((text, sig, probed_ids))
     }
 

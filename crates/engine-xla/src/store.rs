@@ -161,6 +161,9 @@ pub struct Pools {
     /// Each streamed weight plane's view of the pool: `(width, view)`,
     /// bf16 rows of `width`.
     weight_views: Vec<(u32, Tensor)>,
+    /// Each streamed bank's miss copy in pinned host memory: `(param, pool
+    /// rows an expert's plane takes, root, buffer)`.
+    host_banks: Vec<(u32, u32, Tensor, Buffer)>,
 }
 
 impl std::fmt::Debug for Pools {
@@ -581,7 +584,54 @@ impl Pools {
             bytes: total,
             weight_chunks,
             weight_views: Vec::new(),
+            host_banks: Vec::new(),
         })
+    }
+
+    /// Lands each streamed bank's miss copy in pinned host memory
+    /// (`Streamed::host_banks`), a root each (before the handles seal).
+    pub fn land_host_banks(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        streamed: &streamed::Streamed,
+    ) -> Result<()> {
+        for (param, rows, bytes) in streamed.host_banks()? {
+            let all = u32::try_from(bytes.len() as u64 / ROW_BYTES).map_err(|_| Fault::Ceiling {
+                what: "rows of a host bank",
+                need: bytes.len() as u64 / ROW_BYTES,
+                have: u64::from(u32::MAX),
+            })?;
+            let buffer = device.upload_host(Dtype::U32, all, 128, &bytes)?;
+            let p = u32::try_from(param).unwrap_or(u32::MAX);
+            let tensor = handles.root(Root {
+                source: Source::HostBank { param: p },
+                dtype: Dtype::U32,
+                rows: all,
+                width: 128,
+            });
+            self.host_banks.push((p, rows, tensor, buffer));
+        }
+        Ok(())
+    }
+
+    /// The miss copy of streamed bank `param`: its buffer.
+    #[must_use]
+    pub fn host_bank(&self, param: u32) -> Option<&Buffer> {
+        self.host_banks.iter().find(|b| b.0 == param).map(|b| &b.3)
+    }
+
+    /// The miss copy of streamed bank `param`: its root and the pool rows an
+    /// expert's plane takes.
+    #[must_use]
+    pub fn host_bank_root(&self, param: u32) -> Option<(Tensor, u32)> {
+        self.host_banks.iter().find(|b| b.0 == param).map(|b| (b.2, b.1))
+    }
+
+    /// The pool's whole root (u32 `[rows, 128]`).
+    #[must_use]
+    pub fn root(&self) -> Tensor {
+        self.root
     }
 
     /// Mints a bf16 view of the pool `width` wide for each width the

@@ -195,6 +195,21 @@ impl Device {
             .upload(self.device()?, bytes, element_type(ty.elem), &ty.dims)?)
     }
 
+    /// [`Device::upload`] into the device's pinned host memory, which its
+    /// programs read through a host parameter
+    /// (`kernels_xla::hlo::Func::pin_host`).
+    pub fn upload_host(&self, dtype: Dtype, rows: u32, width: u32, bytes: &[u8]) -> Result<Buffer> {
+        let ty = storage(dtype, rows, width).ok_or_else(|| Fault::Unbound {
+            what: format!("a {dtype:?} plane, which has no storage form on this device"),
+        })?;
+        let client = self.client()?;
+        let device = self.device()?;
+        let host = client.memory(device, "pinned_host")?.ok_or_else(|| Fault::Unbound {
+            what: "pinned host memory, which this device does not address".to_string(),
+        })?;
+        Ok(client.upload_to(device, Some(host), bytes, element_type(ty.elem), &ty.dims)?)
+    }
+
     /// Lands `bytes` as a rank-1 array of `len` elements of `ty`.
     pub fn upload_flat(&self, ty: ElementType, bytes: &[u8], len: i64) -> Result<Buffer> {
         Ok(self.client()?.upload(self.device()?, bytes, ty, &[len])?)

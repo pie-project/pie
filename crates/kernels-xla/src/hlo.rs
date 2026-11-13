@@ -273,6 +273,8 @@ pub struct Func {
     /// Parameters laid out row-major (`pin_row_major`), and whether every
     /// result is.
     row_major: Vec<usize>,
+    /// Parameters that live in pinned host memory (`pin_host`).
+    host_params: Vec<usize>,
     row_major_results: bool,
     /// From this many rows a narrow-head rope turns the row as it lies
     /// (`tuning::RopeFlatRows`; 0 never).
@@ -399,6 +401,7 @@ impl Func {
             next: 0,
             scope: None,
             row_major: Vec::new(),
+            host_params: Vec::new(),
             row_major_results: false,
             rope_flat_rows: 0,
             views: std::collections::HashMap::new(),
@@ -524,6 +527,26 @@ impl Func {
         if let Some(at) = self.params.iter().position(|(p, _)| *p == v) {
             self.row_major.push(at);
         }
+    }
+
+    /// Parameter `v` lives in pinned host memory: the program reads it
+    /// only through [`Func::to_device`] of slices of it.
+    pub fn pin_host(&mut self, v: Val) {
+        if let Some(at) = self.params.iter().position(|(p, _)| *p == v) {
+            self.host_params.push(at);
+        }
+    }
+
+    /// `x` (a slice of a host parameter) moved to the device.
+    pub fn to_device(&mut self, x: Val) -> Val {
+        let ty = self.ty(x).clone();
+        self.op_named(
+            "stablehlo.custom_call",
+            &[x],
+            "call_target_name = \"annotate_device_placement\", has_side_effect = true, \
+             mhlo.frontend_attributes = {_xla_buffer_placement = \"device\"}",
+            vec![ty],
+        )[0]
     }
 
     /// Lays every result out row-major.
@@ -801,6 +824,10 @@ impl Func {
                 s.push_str(", ");
             }
             let _ = write!(s, "{}: {}", self.name(*v), self.ty(*v));
+            if self.host_params.contains(&i) {
+                s.push_str(" {mhlo.memory_kind = \"pinned_host\"}");
+                continue;
+            }
             let pinned = self.row_major.contains(&i);
             match (pinned, alias) {
                 (true, Some(out)) => {

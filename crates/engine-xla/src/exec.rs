@@ -56,40 +56,7 @@ pub fn run_program(
     inputs: &Inputs,
     wait: bool,
 ) -> Result<Vec<Buffer>> {
-    bind_and_run(
-        device,
-        &program.sig,
-        program,
-        weights,
-        pools,
-        inputs,
-        None,
-        wait,
-    )
-}
-
-/// Runs a segment of a cut fire (`crate::trace::Tracer::cut`) or the last
-/// one: its carried parameters from `carried` (activation root -> the
-/// buffer an earlier segment returned for it).
-pub fn run_carried(
-    device: &Device,
-    program: &crate::device::Program,
-    weights: Option<&Weights>,
-    pools: &mut Pools,
-    inputs: &Inputs,
-    carried: &std::collections::BTreeMap<u32, Buffer>,
-    wait: bool,
-) -> Result<Vec<Buffer>> {
-    bind_and_run(
-        device,
-        &program.sig,
-        program,
-        weights,
-        pools,
-        inputs,
-        Some(carried),
-        wait,
-    )
+    bind_and_run(device, &program.sig, program, weights, pools, inputs, wait)
 }
 
 /// A maintenance program: pools and `inputs` in, nothing out.
@@ -102,7 +69,6 @@ pub fn maintain(
     run(device, tracer, &[], None, pools, inputs, false).map(|_| ())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn bind_and_run(
     device: &Device,
     sig: &Signature,
@@ -110,7 +76,6 @@ fn bind_and_run(
     weights: Option<&Weights>,
     pools: &mut Pools,
     inputs: &Inputs,
-    carried: Option<&std::collections::BTreeMap<u32, Buffer>>,
     wait: bool,
 ) -> Result<Vec<Buffer>> {
     if device.is_dry() {
@@ -149,9 +114,9 @@ fn bind_and_run(
                 weights.and_then(|w| w.buffer_plane(param, plane))
             }
             Source::Pool { row, plane } => pools.get(row, plane),
+            Source::HostBank { param } => pools.host_bank(param),
             Source::Input { input } => uploaded.iter().find(|(i, _)| *i == input).map(|(_, b)| b),
             Source::Pack => pack.as_ref(),
-            Source::Carried { root } => carried.and_then(|c| c.get(&root)),
             Source::Temp | Source::Packed { .. } | Source::Streamed { .. } => None,
         }
         .ok_or_else(|| Fault::Unbound {

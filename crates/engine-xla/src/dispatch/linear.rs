@@ -708,17 +708,17 @@ impl Run<'_> {
                 ..
             } => {
                 let streamed = self.streamed_bank(*bank);
-                if let Some(b) = streamed {
-                    self.cut_for(b, *routes)?;
-                }
+                let param = self.weight_param_of(*bank);
                 let bank_t = self.tensor(*bank);
                 crate::lower::lower(self.ctx(), |l| {
                     let x_v = l.read(self.tensor(*x))?;
                     let routes_v = l.read(self.tensor(*routes))?;
                     let y_v = l.read(self.tensor(*y))?;
-                    let bank_v = match streamed {
-                        Some(b) => l.streamed_bank(b, bank_t.width)?,
-                        None => l.read(bank_t)?,
+                    let bank_v = match (streamed, param) {
+                        (Some(b), Some(p)) => {
+                            self.streamed_operand(l, b, p, bank_t.width, *routes, routes_v.val)?
+                        }
+                        _ => l.read(bank_t)?,
                     };
                     let o_y = self.tensor(*y);
                     let tuning = l.tuning();
