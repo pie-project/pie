@@ -865,7 +865,115 @@ impl SharedPool {
             };
             ids.push(id);
         }
+        self.maybe_report();
         Some(ids)
+    }
+
+    /// Whether record `id` should move to a fresh record at its next
+    /// write (PROTOTYPE layer-major compaction): its first shape's next slot
+    /// comes out of another chunk at least as full as the record's own, so
+    /// moving packs live records into fewer chunks and lets the emptiest go.
+    #[must_use]
+    pub fn record_should_move(&self, id: u32) -> bool {
+        if self.fixed.len() < 2 || std::env::var_os("PIE_NO_COMPACT").is_some() {
+            return false;
+        }
+        let Some(Some(record)) = self.records.get(id as usize) else {
+            return false;
+        };
+        let Some(slot) = record.first().and_then(|slots| slots.first()) else {
+            return false;
+        };
+        let used = self.pool.chunk_used(slot.chunk);
+        self.pool
+            .next_partial(self.fixed[0].pool)
+            .is_some_and(|next| next != slot.chunk && self.pool.chunk_used(next) >= used)
+    }
+
+    /// Whether moving record `from` onto the fresh record `to` packs the
+    /// pool tighter: `to`'s first slot lies in another chunk, fuller than
+    /// `from`'s (PROTOTYPE compaction). Else the fresh record goes back.
+    #[must_use]
+    pub fn record_move_helps(&self, from: u32, to: u32) -> bool {
+        let first = |id: u32| {
+            self.records
+                .get(id as usize)
+                .and_then(Option::as_ref)
+                .and_then(|record| record.first())
+                .and_then(|slots| slots.first())
+                .copied()
+        };
+        match (first(from), first(to)) {
+            (Some(a), Some(b)) => {
+                a.chunk != b.chunk && self.pool.chunk_used(b.chunk) > self.pool.chunk_used(a.chunk)
+            }
+            _ => false,
+        }
+    }
+
+    /// The fixed shapes' fragmentation (PROTOTYPE): chunks open for them,
+    /// slots taken, the chunks those slots would fill packed, partly filled
+    /// chunks, and contiguous runs of taken slots (by address) against the
+    /// fewest they could make.
+    #[must_use]
+    pub fn fixed_report(&self) -> String {
+        let (mut chunks, mut taken, mut packed, mut partial, mut runs, mut least) =
+            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        for shape in &self.fixed {
+            let spc = self
+                .pool
+                .shape(shape.pool)
+                .map_or(1, |s| s.slots_per_chunk.max(1)) as usize;
+            let open = self.pool.shape_chunks(shape.pool);
+            chunks += open.len();
+            let mut used = 0usize;
+            for (_, slots) in &open {
+                let n = slots.iter().filter(|&&t| t).count();
+                used += n;
+                if n < spc {
+                    partial += 1;
+                }
+                let mut prev = false;
+                for &t in slots {
+                    if t && !prev {
+                        runs += 1;
+                    }
+                    prev = t;
+                }
+            }
+            taken += used;
+            packed += used.div_ceil(spc);
+            least += used.div_ceil(spc);
+        }
+        format!(
+            "fixed shapes {} records {} chunks {chunks} packed {packed} partial {partial} \
+             slots {taken} runs {runs} least_runs {least}",
+            self.fixed.len(),
+            self.live_records()
+        )
+    }
+
+    /// Logs [`Self::fixed_report`] at most once a second where
+    /// `PIE_FRAG_LOG` is set (PROTOTYPE).
+    fn maybe_report(&self) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("PIE_FRAG_LOG").is_some()) {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let last = LAST.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < 1000
+            || LAST
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        tracing::warn!(target: "frag", "{}", self.fixed_report());
     }
 
     /// The store lets records `ids` go; no fire reads them any more.
@@ -881,6 +989,7 @@ impl SharedPool {
             }
             self.free_records.insert(id);
         }
+        self.maybe_report();
     }
 
     /// Each fixed shape's slot refs record `id` holds, pieces in order.
@@ -985,17 +1094,18 @@ impl SharedPool {
             .unwrap_or(0)
     }
 
-    /// Every piece of record `id`'s first fixed shape, in piece order, for
-    /// [`::engine::fire::RsSnapshot::pieces`] (CONTRACT-BC 16); empty where
-    /// the record is one piece, which [`Self::snapshot_ref`] names alone.
+    /// Every piece of record `id`, each fixed shape's in shape order, pieces
+    /// in order within it, for [`::engine::fire::RsSnapshot::pieces`]
+    /// (CONTRACT-BC 16); empty where the record is one piece, which
+    /// [`Self::snapshot_ref`] names alone.
     #[must_use]
     pub fn snapshot_pieces(&self, id: u32) -> Vec<u32> {
-        self.record_refs(id)
+        let refs: Vec<u32> = self
+            .record_refs(id)
             .into_iter()
-            .next()
-            .map(|(_, refs)| refs)
-            .filter(|refs| refs.len() > 1)
-            .unwrap_or_default()
+            .flat_map(|(_, refs)| refs)
+            .collect();
+        if refs.len() > 1 { refs } else { Vec::new() }
     }
 
     // ---- rungs ----

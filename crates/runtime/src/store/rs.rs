@@ -1585,9 +1585,37 @@ impl RsStore {
                 available: self.available(),
             })?,
         };
+        // PROTOTYPE compaction: a record written in place whose next fresh
+        // record would pack the pool tighter moves there in this fire.
+        let moved = match folded {
+            Some(old)
+                if write_state
+                    && !fresh
+                    && self.ref_count(old) <= 1
+                    && self.slots.should_move(old) =>
+            {
+                self.slots
+                    .try_alloc_n(1)
+                    .and_then(|ids| ids.first().copied())
+                    .and_then(|fresh| {
+                        if self.slots.move_helps(old, fresh) {
+                            Some(fresh)
+                        } else {
+                            self.slots.release_reserved(vec![fresh]);
+                            None
+                        }
+                    })
+            }
+            _ => None,
+        };
         let mut fresh_slots = slots.iter().copied();
         let mut fresh_ids = pages.iter().copied();
-        let allocated: Vec<RsSlotId> = slots.iter().chain(&pages).copied().collect();
+        let allocated: Vec<RsSlotId> = slots
+            .iter()
+            .chain(&pages)
+            .chain(&moved)
+            .copied()
+            .collect();
 
         let state = if write_state {
             Some(match folded {
@@ -1603,11 +1631,19 @@ impl RsStore {
                     copy_from: Some(old),
                     fold_tokens,
                 },
-                Some(old) => RsStateTarget {
-                    slot: old,
-                    reset: false,
-                    copy_from: None,
-                    fold_tokens,
+                Some(old) => match moved {
+                    Some(slot) => RsStateTarget {
+                        slot,
+                        reset: false,
+                        copy_from: Some(old),
+                        fold_tokens,
+                    },
+                    None => RsStateTarget {
+                        slot: old,
+                        reset: false,
+                        copy_from: None,
+                        fold_tokens,
+                    },
                 },
             })
         } else {

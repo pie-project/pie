@@ -177,6 +177,30 @@ impl<I: PoolId> ShapePool<I> {
         }
     }
 
+    /// Whether record `id` should move to a fresh one at its next write
+    /// (PROTOTYPE compaction); never for a list shape or a pinned pool.
+    pub fn should_move(&self, id: I) -> bool {
+        match &self.slots {
+            Backing::Records(shared) if self.contains(id) => shared
+                .lock()
+                .unwrap()
+                .record_should_move(id.index() - self.base),
+            _ => false,
+        }
+    }
+
+    /// Whether moving record `from` onto fresh record `to` packs the pool
+    /// tighter (PROTOTYPE compaction).
+    pub fn move_helps(&self, from: I, to: I) -> bool {
+        match &self.slots {
+            Backing::Records(shared) if self.contains(from) && self.contains(to) => shared
+                .lock()
+                .unwrap()
+                .record_move_helps(from.index() - self.base, to.index() - self.base),
+            _ => false,
+        }
+    }
+
     /// One past the highest id the pool may hand out.
     pub fn ids_end(&self) -> u32 {
         self.ids_end

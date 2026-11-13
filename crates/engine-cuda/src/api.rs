@@ -845,6 +845,16 @@ impl Engine for Cuda {
                 .copy_tier_slots(copy.shape, from, to, &copy.slots)
                 .map_err(fault);
         }
+        if crate::store::layout::fixed_of(copy.shape).is_some() && shell.layer_major() {
+            // A layer-major record moves a shape at a time: whole slots.
+            if !copy.runs.is_empty() {
+                return Err(Error::Invalid(
+                    "a fixed record is copied whole, not a run of its tokens".into(),
+                ));
+            }
+            let pairs: Vec<[u32; 2]> = copy.slots.iter().map(|&(src, dst)| [src, dst]).collect();
+            return shell.copy_whole_slots(copy.shape, &pairs).map_err(fault);
+        }
         if copy.shape == FIXED {
             if !copy.runs.is_empty() {
                 return Err(Error::Invalid(
@@ -1279,7 +1289,30 @@ impl Cuda {
         let mut records: Vec<Option<(u32, u32)>> = Vec::with_capacity(submission.lanes.len());
         let mut forked: Vec<(u32, u32)> = Vec::new();
         for lane in &submission.lanes {
-            let record = match lane.fixed.as_slice() {
+            // A layer-major record names a shape a piece: its pairs in piece
+            // order, as one record.
+            let joined;
+            let fixed = if lane.fixed.len() > 1
+                && lane
+                    .fixed
+                    .iter()
+                    .all(|(shape, pairs)| {
+                        crate::store::layout::fixed_of(*shape).is_some() && pairs.len() == 1
+                    }) {
+                let mut pairs: Vec<(u32, [u32; 2])> = lane
+                    .fixed
+                    .iter()
+                    .filter_map(|(shape, pairs)| {
+                        Some((crate::store::layout::fixed_of(*shape)?, pairs[0]))
+                    })
+                    .collect();
+                pairs.sort_unstable_by_key(|(piece, _)| *piece);
+                joined = [(FIXED, pairs.into_iter().map(|(_, pair)| pair).collect())];
+                &joined[..]
+            } else {
+                lane.fixed.as_slice()
+            };
+            let record = match fixed {
                 [] => None,
                 [(shape, pieces)] if *shape == FIXED => {
                     let runs: Vec<u32> = pieces.iter().map(|[run, _]| *run).collect();

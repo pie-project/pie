@@ -45,8 +45,32 @@ pub const fn window_id(at: usize) -> ShapeId {
 pub fn window_of(id: ShapeId) -> Option<usize> {
     (0..MOST_WINDOWS).find(|&at| window_id(at) == id)
 }
-/// The fixed shape's.
+/// The fixed shape's: of a layer-major record, its first piece's.
 pub const FIXED: ShapeId = ShapeId(2);
+/// The ids of a layer-major record's pieces past the first start here,
+/// clear of the window lists' and the weight shapes'.
+const MORE_FIXED: u32 = 1 << 17;
+
+/// Piece `piece`'s shape id of a layer-major record (each piece a shape of
+/// its own); piece 0 is [`FIXED`].
+#[must_use]
+pub const fn fixed_id(piece: u32) -> ShapeId {
+    if piece == 0 {
+        FIXED
+    } else {
+        ShapeId(MORE_FIXED + piece)
+    }
+}
+
+/// The piece of the record shape id `id` names, if it names a fixed shape.
+#[must_use]
+pub fn fixed_of(id: ShapeId) -> Option<u32> {
+    if id == FIXED {
+        Some(0)
+    } else {
+        id.0.checked_sub(MORE_FIXED).filter(|&piece| piece > 0)
+    }
+}
 /// The rs list's.
 pub const RS: ShapeId = ShapeId(3);
 
@@ -535,6 +559,9 @@ pub struct FixedShape {
     /// The id tables a fire stages a lane: each a run of the record's slots
     /// some row's pieces lie in, the rows that share a run sharing a table.
     pub tables: Vec<Vec<u32>>,
+    /// Each piece is a slot shape of its own ([`fixed_id`]), all of one
+    /// slot size: a layer's pieces of every lane share chunks.
+    pub layer_major: bool,
 }
 
 impl FixedShape {
@@ -607,6 +634,7 @@ impl FixedShape {
             pieces: (*pieces_per_ws).max(1),
             rows,
             tables,
+            layer_major: recipe.profile.layer_major,
         })
     }
 

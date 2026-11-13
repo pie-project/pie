@@ -851,7 +851,13 @@ pub fn plan(
         let pick = if fixed_rows.is_empty() {
             None
         } else {
-            match pick_fixed(&fixed_rows, record, chunk, align) {
+            let pick = if device.layer_major {
+                pick_layer_major(&fixed_rows, chunk, align)
+                    .or_else(|| pick_fixed(&fixed_rows, record, chunk, align))
+            } else {
+                pick_fixed(&fixed_rows, record, chunk, align)
+            };
+            match pick {
                 Some(pick) => Some(pick),
                 None => continue,
             }
@@ -1298,6 +1304,25 @@ fn pick_fixed(rows: &[FixedRow], record: u64, chunk: u64, align: u64) -> Option<
     None
 }
 
+/// The layer-major fixed slot for chunks of `chunk` bytes: the largest row,
+/// whole, so a recurrent layer's state fills a piece of its own and smaller
+/// rows pack first-fit beside each other; `None` where that row outgrows the
+/// chunk (the record is then cut as [`pick_fixed`] cuts it).
+fn pick_layer_major(rows: &[FixedRow], chunk: u64, align: u64) -> Option<FixedPick> {
+    let largest = rows.iter().map(|r| r.bytes).max()?;
+    let slot = align_up(largest.max(FIXED_SLOT_FLOOR), align);
+    if slot > chunk {
+        return None;
+    }
+    let pick = FixedPick {
+        slot,
+        pieces: 0,
+        least: 0,
+    };
+    let (pieces, _) = fixed::pack(rows, pick.packing(align), false)?;
+    Some(FixedPick { pieces, ..pick })
+}
+
 /// What a working set takes at the profile's context with chunks of `chunk`
 /// bytes, and what of that holds nothing: its kv and window lists, its rs list
 /// at [`EXPECTED_UNFOLDED`] tokens, its own fixed record, and its share of
@@ -1341,7 +1366,12 @@ fn weigh(
         waste.chunk_tail += tail(rs.slots(), rs.bytes);
     }
     if let Some(pick) = fixed {
-        shapes += 1;
+        // Layer-major: each piece a shape of its own, each keeping a chunk open.
+        shapes += if device.layer_major {
+            u64::from(pick.pieces.max(1))
+        } else {
+            1
+        };
         // The pool's fixed records: a set a working set, and the reserve once.
         let working = u64::from(device.concurrency.max(1));
         let sets = working * u64::from(FIXED_SETS_PER_WS) + u64::from(cow);

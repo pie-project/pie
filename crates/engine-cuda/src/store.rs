@@ -1013,6 +1013,16 @@ impl Pools {
         self.paging
     }
 
+    /// Whether each piece of the record is a slot shape of its own.
+    #[must_use]
+    pub fn layer_major(&self) -> bool {
+        self.chunks
+            .layout()
+            .fixed
+            .as_ref()
+            .is_some_and(|fixed| fixed.layer_major)
+    }
+
     #[must_use]
     pub fn pool_slabs(&self) -> Vec<(u32, PoolSlabs)> {
         let layout = self.chunks.layout();
@@ -3259,7 +3269,7 @@ impl Pools {
             window if layout::window_of(window).is_some() => {
                 Kind::Window(layout::window_of(window).unwrap_or(0) as u8)
             }
-            layout::FIXED => Kind::Fixed,
+            fixed if layout::fixed_of(fixed).is_some() => Kind::Fixed,
             layout::RS => Kind::Rs,
             other => {
                 return Err(Fault::program(
@@ -4085,6 +4095,8 @@ fn lay(
         0
     };
     let mut server = poem_compiler::chunk::ChunkProfile::SERVER_CUDA;
+    // PROTOTYPE A/B: layer-major records unless PIE_LANE_MAJOR is set.
+    server.layer_major = std::env::var_os("PIE_LANE_MAJOR").is_none();
     if let Some(bytes) = chunk_bytes {
         server.target_chunk_bytes = bytes;
     }
@@ -4121,14 +4133,16 @@ fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64, slots: u32) -
                 layout.chunks_for(Kind::Window(window as u8), paging.window_pages_at(pages))
             })
             .sum::<u64>()
-        + layout.chunks_for(
-            Kind::Fixed,
-            u64::from(slots)
-                * layout
-                    .fixed
-                    .as_ref()
-                    .map_or(1, |fixed| u64::from(fixed.pieces)),
-        );
+        + match layout.fixed.as_ref() {
+            // Layer-major: each piece its own shape, its own chunks.
+            Some(fixed) if fixed.layer_major => {
+                u64::from(fixed.pieces) * layout.chunks_for(Kind::Fixed, u64::from(slots))
+            }
+            fixed => layout.chunks_for(
+                Kind::Fixed,
+                u64::from(slots) * fixed.map_or(1, |fixed| u64::from(fixed.pieces)),
+            ),
+        };
     u32::try_from(chunks).unwrap_or(u32::MAX)
 }
 

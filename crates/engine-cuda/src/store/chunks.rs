@@ -654,12 +654,21 @@ impl Chunks {
             shapes.push(stated);
         }
         if let Some(fixed) = &layout.fixed {
-            shapes.push(shape(
-                &fixed.slot,
-                SlotKind::Fixed {
-                    pieces: fixed.pieces,
-                },
-            ));
+            if fixed.layer_major {
+                // A shape a piece, one slot of each a record.
+                for piece in 0..fixed.pieces {
+                    let mut stated = shape(&fixed.slot, SlotKind::Fixed { pieces: 1 });
+                    stated.id = crate::store::layout::fixed_id(piece);
+                    shapes.push(stated);
+                }
+            } else {
+                shapes.push(shape(
+                    &fixed.slot,
+                    SlotKind::Fixed {
+                        pieces: fixed.pieces,
+                    },
+                ));
+            }
         }
         let total = self.total.saturating_add(self.act);
         let max = u32::try_from(u64::from(total).div_ceil(u64::from(layout.segment_chunks.max(1))))

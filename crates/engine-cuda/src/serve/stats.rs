@@ -291,6 +291,12 @@ impl Shell {
         self.pools.weight_uses(self.device.stream())
     }
 
+    /// Whether each piece of the record is a slot shape of its own.
+    #[must_use]
+    pub fn layer_major(&self) -> bool {
+        self.pools.layer_major()
+    }
+
     /// From here on lanes name their slots by slot ref.
     pub fn take_refs(&mut self) {
         self.pools.take_refs();

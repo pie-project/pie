@@ -69,6 +69,7 @@ pub fn profile(page_size: u32, context: u32, binding: u64, target: Option<u64>) 
         one_window: false,
         // A window as wide as the context keeps every token: a list row.
         full_from: Some(context),
+        layer_major: false,
     }
 }
 

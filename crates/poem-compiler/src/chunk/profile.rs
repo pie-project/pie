@@ -53,6 +53,12 @@ pub struct ChunkProfile {
     /// window at least this wide keeps every token, so its rows are list
     /// rows.
     pub full_from: Option<u32>,
+    /// Whether each piece of the fixed record is a slot shape of its own
+    /// (layer-major state): the record's slot is its largest row, so a
+    /// recurrent layer's state fills a piece alone and the pieces of one
+    /// layer of every lane share chunks, back to back. Else one fixed shape
+    /// holds every piece of every record (lane-major).
+    pub layer_major: bool,
 }
 
 impl ChunkProfile {
@@ -90,6 +96,7 @@ impl ChunkProfile {
         token_slot: None,
         one_window: false,
         full_from: None,
+        layer_major: false,
     };
 
     /// An on-device Metal GPU: chunks of a couple of MiB out of 64 MiB
@@ -108,6 +115,7 @@ impl ChunkProfile {
         token_slot: None,
         one_window: false,
         full_from: None,
+        layer_major: false,
     };
 
     /// A TPU pool fixed at load, realized as `[chunks, rows, 128]` u32 tiles.
@@ -125,6 +133,7 @@ impl ChunkProfile {
         token_slot: None,
         one_window: false,
         full_from: None,
+        layer_major: false,
     };
 
     /// What every row offset and slot size aligns to.

@@ -762,6 +762,46 @@ impl SlotPool {
         Some(self.chunks[chunk as usize].shape).filter(|&shape| shape != NO_SHAPE)
     }
 
+    /// The partly filled chunk `shape` hands its next slot out of: the
+    /// fullest, then the lowest.
+    pub fn next_partial(&self, shape: ShapeId) -> Option<u32> {
+        self.shapes
+            .get(shape as usize)?
+            .partial
+            .first()
+            .map(|&(_, _, logical)| logical)
+    }
+
+    /// Slots held or waiting on an epoch in logical chunk `chunk`.
+    pub fn chunk_used(&self, chunk: u32) -> u32 {
+        self.chunks.get(chunk as usize).map_or(0, |meta| meta.used)
+    }
+
+    /// Every chunk open for `shape`: its physical place and which of its
+    /// slots are taken (held or waiting on an epoch).
+    pub fn shape_chunks(&self, shape: ShapeId) -> Vec<(u32, Vec<bool>)> {
+        let Some(state) = self.shapes.get(shape as usize) else {
+            return Vec::new();
+        };
+        let spc = state.spc();
+        let mut out = Vec::new();
+        for (logical, meta) in self.chunks.iter().enumerate() {
+            if meta.shape != shape {
+                continue;
+            }
+            let base = meta.frame as usize * state.words;
+            let taken = (0..spc)
+                .map(|index| {
+                    let (word, bit) = Bits::locate(index);
+                    state.free[base + word] & bit == 0
+                })
+                .collect();
+            out.push((self.logical_to_physical[logical], taken));
+        }
+        out.sort_unstable_by_key(|(physical, _)| *physical);
+        out
+    }
+
     /// Slots `holder` holds references on.
     pub fn held_by(&self, holder: &Holder) -> u64 {
         self.holders.get(holder).copied().unwrap_or(0)
