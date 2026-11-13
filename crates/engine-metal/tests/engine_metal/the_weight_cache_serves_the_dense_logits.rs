@@ -369,6 +369,15 @@ fn check_fixture(model: &str, fixture: &Fixture) {
         Mode::Reseated,
     ] {
         let (got, _) = serve(fixture, mode);
+        // A dropped shell gives the device back what it held, its
+        // weight-cache tables in the residency set too: the next load
+        // measures what the device holds before it as held outside.
+        let left = engine_metal::Context::bind().expect("a device").allocated();
+        assert!(
+            left <= 16 << 20,
+            "{model}: {mode:?}: the dropped shell leaves {} MiB allocated",
+            left >> 20
+        );
         same(
             &format!("{model}: rows {mode:?} against whole"),
             &got,
