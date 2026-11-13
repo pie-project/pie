@@ -29,6 +29,11 @@ pub struct FireLimits {
     /// this many rows.
     #[serde(default)]
     pub prefill_rows: u32,
+    /// The most lanes a fire of prompts only (no lane decoding) carries,
+    /// past which the engine holds no body for it (0: as many as
+    /// `max_lanes`).
+    #[serde(default)]
+    pub prefill_lanes: u32,
     /// 0: as many as `max_tokens`.
     #[serde(default)]
     pub max_readouts: u32,

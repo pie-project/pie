@@ -737,6 +737,7 @@ impl Engine for Cuda {
                     .saturating_mul(shell.budget().max_lanes),
                 max_context: paging.context(),
                 prefill_rows: 0,
+                prefill_lanes: 0,
                 max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(shell.budget()))
                     .unwrap_or(u32::MAX),
             },
