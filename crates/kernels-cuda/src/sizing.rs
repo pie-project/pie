@@ -29,6 +29,17 @@ pub struct Footprint {
     pub bytes: usize,
     /// By slab name, largest first.
     pub slabs: Vec<(&'static str, usize)>,
+    /// Every slab the walk asked for, by its key.
+    pub keys: Vec<Sized>,
+}
+
+/// One slab of a walk: the most the walk asked of it, and what growing it
+/// to that would have allocated along the way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sized {
+    pub key: crate::jit::SlabKey,
+    pub asked: usize,
+    pub grown: usize,
 }
 
 /// Starts a walk on this thread.

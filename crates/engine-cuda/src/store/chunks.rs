@@ -315,6 +315,37 @@ impl Chunks {
         Ok(())
     }
 
+    /// Reserves the range anew with `bytes` more of activation above what
+    /// it had: what a load learns its fires take beside their arena (the
+    /// kernels' workspaces) once it has walked them. Only while no segment
+    /// is backed; the activation it held is laid again.
+    pub fn widen_activation(&mut self, pool: &mut PhysicalPool, bytes: u64) -> Result<()> {
+        if !self.fresh() {
+            return Err(Fault::program(
+                "store::chunks",
+                "the activation's span widened under committed chunks",
+            ));
+        }
+        let chunk = self.layout.chunk_bytes;
+        let held = self.range.held(u64::from(self.total) * chunk);
+        self.range.release_all(pool);
+        let act_bytes = (u64::from(self.act) * chunk).saturating_add(bytes);
+        let mut fresh = Chunks::reserve(pool, self.layout.clone(), self.total, act_bytes)?;
+        if held > 0 {
+            match fresh.hold_activation(pool, held, true)? {
+                Commit::Committed => {}
+                _ => {
+                    return Err(Fault::program(
+                        "store::chunks",
+                        "the activation's span was refused the room it held",
+                    ));
+                }
+            }
+        }
+        *self = fresh;
+        Ok(())
+    }
+
     #[must_use]
     pub fn high_water_bytes(&self) -> u64 {
         self.range.high_water_bytes()

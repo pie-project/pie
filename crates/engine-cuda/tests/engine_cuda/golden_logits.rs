@@ -463,6 +463,7 @@ fn knobs() -> engine_cuda::Knobs {
     }
     // `PIE_GOLDEN_ONE_WINDOW`: every windowed row in one window list.
     knobs.diagnostics.one_window = std::env::var_os("PIE_GOLDEN_ONE_WINDOW").is_some();
+    knobs.diagnostics.arm_trace = std::env::var_os("PIE_GOLDEN_ARM_TRACE").is_some();
     // `PIE_GOLDEN_TIER_INLINE`: tier copies ride the compute stream.
     knobs.diagnostics.tier_inline = std::env::var_os("PIE_GOLDEN_TIER_INLINE").is_some();
     // No weight shape stated: the tables and routed banks dense on the

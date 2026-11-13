@@ -1386,6 +1386,18 @@ impl Pools {
         self.whole_fit = true;
     }
 
+    /// The bytes of the activation's span under the pool's end.
+    #[must_use]
+    pub fn activation_bytes(&self) -> u64 {
+        self.chunks.activation_bytes()
+    }
+
+    /// Reserves the range anew with `bytes` more of activation
+    /// ([`Chunks::widen_activation`]).
+    pub(crate) fn widen_activation(&mut self, bytes: u64) -> Result<()> {
+        self.chunks.widen_activation(&mut self.pool, bytes)
+    }
+
     /// Backs `bytes` of the activation's span from `offset` into it.
     pub(crate) fn hold_activation_at(
         &mut self,

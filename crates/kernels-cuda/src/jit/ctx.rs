@@ -123,8 +123,71 @@ impl Fire {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Slabs(u32);
 
+/// What names a slab: the arena it is one of ([`Slabs::id`]), its name, the
+/// region that takes it (or `NO_REGION`), and the stream it is scoped to (0
+/// where it is a region's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SlabKey {
+    pub arena: u32,
+    pub name: &'static str,
+    pub region: u32,
+    pub scope: usize,
+}
+
+/// What a placed slab is aligned to.
+pub const PLACED_ALIGN: usize = 256;
+
 impl Slabs {
     pub const PROCESS: Slabs = Slabs(0);
+
+    /// The arena a [`SlabKey`] names these slabs by.
+    #[must_use]
+    pub const fn id(self) -> u32 {
+        self.0
+    }
+
+    /// The bytes `slabs` take laid one after another, each of `(key,
+    /// bytes)` at [`PLACED_ALIGN`].
+    #[must_use]
+    pub fn placed_bytes(slabs: &[(SlabKey, usize)]) -> usize {
+        slabs.iter().fold(0usize, |at, (_, bytes)| {
+            at.saturating_add(bytes.next_multiple_of(PLACED_ALIGN))
+        })
+    }
+
+    /// Lays `slabs` one after another from `base`: a take of one answers
+    /// its place there, and nothing is allocated for it. A slab laid before
+    /// is laid anew.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be device memory of [`Slabs::placed_bytes`] bytes, zeroed,
+    /// that the caller keeps backed for as long as the slabs' arenas live.
+    pub unsafe fn place(base: *mut c_void, slabs: &[(SlabKey, usize)]) {
+        #[cfg(feature = "cuda")]
+        {
+            crate::jit::device::place(base, slabs);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (base, slabs);
+        }
+    }
+
+    /// The bytes takes asked past what was placed for them (a slab not
+    /// placed, or placed smaller) since the process began: what still grows
+    /// by allocation.
+    #[must_use]
+    pub fn unplaced_bytes() -> usize {
+        #[cfg(feature = "cuda")]
+        {
+            crate::jit::device::unplaced_bytes()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            0
+        }
+    }
 
     #[must_use]
     pub fn census() -> Vec<(&'static str, usize)> {

@@ -16,7 +16,37 @@ struct Slab {
 struct Arena {
     slabs: HashMap<(&'static str, u32, usize), Slab>,
     retired: Vec<*mut c_void>,
+    /// Slabs laid in memory the engine holds ([`place`]): never grown,
+    /// never freed here.
+    placed: HashMap<(&'static str, u32, usize), Slab>,
 }
+
+use super::ctx::{PLACED_ALIGN, SlabKey};
+
+/// [`super::Slabs::place`].
+pub(crate) fn place(base: *mut c_void, slabs: &[(SlabKey, usize)]) {
+    let mut arenas = locked();
+    let mut at = 0usize;
+    for (key, bytes) in slabs {
+        let bytes = bytes.next_multiple_of(PLACED_ALIGN);
+        arenas.entry(key.arena).or_default().placed.insert(
+            (key.name, key.region, key.scope),
+            Slab {
+                // SAFETY: inside the span the caller holds, by `placed_bytes`.
+                ptr: unsafe { base.byte_add(at) },
+                bytes,
+            },
+        );
+        at += bytes;
+    }
+}
+
+/// [`super::Slabs::unplaced_bytes`].
+pub(crate) fn unplaced_bytes() -> usize {
+    UNPLACED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+static UNPLACED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 // SAFETY: the only pointers here are device allocations this map owns
 // outright. `cudaMalloc`/`cudaFree` are thread-safe and the map is behind a
@@ -40,6 +70,8 @@ struct Sized {
     slabs: HashMap<(u32, &'static str, u32, usize), usize>,
     grown: usize,
     by_name: HashMap<&'static str, usize>,
+    /// By key: the most asked, and what growing to it allocated.
+    asked: HashMap<(u32, &'static str, u32, usize), (usize, usize)>,
 }
 
 thread_local! {
@@ -55,9 +87,25 @@ pub(crate) fn sizing_take() -> crate::sizing::Footprint {
         let sized = core::mem::take(&mut *sized.borrow_mut());
         let mut slabs: Vec<(&'static str, usize)> = sized.by_name.into_iter().collect();
         slabs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let mut keys: Vec<crate::sizing::Sized> = sized
+            .asked
+            .into_iter()
+            .map(|((arena, name, region, scope), (asked, grown))| crate::sizing::Sized {
+                key: SlabKey {
+                    arena,
+                    name,
+                    region,
+                    scope,
+                },
+                asked,
+                grown,
+            })
+            .collect();
+        keys.sort_by(|a, b| a.key.cmp(&b.key));
         crate::sizing::Footprint {
             bytes: sized.grown,
             slabs,
+            keys,
         }
     })
 }
@@ -80,6 +128,8 @@ fn take_sized(
         let mut sized = sized.borrow_mut();
         let key = (arena, name, region, scope);
         let have = sized.slabs.get(&key).copied().unwrap_or(held);
+        let asked = sized.asked.entry(key).or_insert((0, 0));
+        asked.0 = asked.0.max(bytes);
         if bytes > have {
             let grain = if bytes < SLAB_GRAIN {
                 SMALL_SLAB_GRAIN
@@ -88,6 +138,9 @@ fn take_sized(
             };
             let want = bytes.div_ceil(grain).saturating_mul(grain);
             sized.slabs.insert(key, want);
+            if let Some(asked) = sized.asked.get_mut(&key) {
+                asked.1 = asked.1.saturating_add(want);
+            }
             sized.grown = sized.grown.saturating_add(want);
             *sized.by_name.entry(name).or_insert(0) += want;
         }
@@ -163,10 +216,18 @@ pub(crate) fn take(
     let mut arenas = locked();
     let held = arenas.entry(arena).or_default();
     let scope = scope_of(owner, region);
+    if let Some(slab) = held.placed.get(&(name, region, scope))
+        && slab.bytes >= bytes
+    {
+        return Ok(slab.ptr);
+    }
     if let Some(slab) = held.slabs.get(&(name, region, scope))
         && slab.bytes >= bytes
     {
         return Ok(slab.ptr);
+    }
+    if !held.placed.is_empty() {
+        UNPLACED.fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
     }
     if capture_status(stream)
         .is_some_and(|s| s != rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone)
@@ -196,12 +257,17 @@ pub(crate) fn take_zeroed(
     bytes: usize,
 ) -> Result<*mut c_void, Fault> {
     let key = (name, region, scope_of(owner, region));
-    let before = locked()
-        .get(&arena)
-        .and_then(|held| held.slabs.get(&key))
-        .map(|slab| slab.ptr);
+    let (before, placed) = {
+        let arenas = locked();
+        let held = arenas.get(&arena);
+        (
+            held.and_then(|held| held.slabs.get(&key)).map(|slab| slab.ptr),
+            held.and_then(|held| held.placed.get(&key)).map(|slab| slab.ptr),
+        )
+    };
     let ptr = take(arena, stream, owner, name, region, bytes)?;
-    if ptr.is_null() || before == Some(ptr) || crate::sizing::active() {
+    // A placed slab was zeroed where it was laid.
+    if ptr.is_null() || before == Some(ptr) || placed == Some(ptr) || crate::sizing::active() {
         return Ok(ptr);
     }
     let size = locked()
