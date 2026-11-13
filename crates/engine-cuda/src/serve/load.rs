@@ -1754,20 +1754,38 @@ fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
 /// owner under its class, over what the device has for this process (all of
 /// it but what others held before the load began).
 impl Shell {
-    /// States what the runtime keeps the pool under the chunks it was
-    /// stated ([`engine::live::Live::set_held`]): what the fit holds back
-    /// while rungs are left to arm, none once it has settled.
+    /// States what the runtime reads of this shell ([`engine::live::Live`]):
+    /// what the fit holds back of the chunks it stated while rungs are left
+    /// to arm (none once it has settled), and the ledger's outside class.
     pub(super) fn state_live(&self) {
         self.live.set_held(self.pools.kept_back_bytes());
+        // What the driver holds outside the engine's span, as the ledger
+        // enters it: read by the policy, taken out of no range.
+        let ledger = ledger(self, self.card.0, self.card.1);
+        self.live
+            .set_outside(ledger.bytes(engine::memory::Class::Outside));
     }
 
     /// The fit once the last rung is armed: the activation at its high
     /// water and the bodies at what they take, the rest the cache rows'.
     pub(super) fn settle(&mut self) -> Result<()> {
         let resident = footprint(self, self.card.0, self.card.1);
-        self.pools
+        let before = (self.pools.declared_bytes(), self.pools.kept_back_bytes());
+        let fitted = self
+            .pools
             .fit_the_card(0, self.card.2, true, false, &resident)?;
         self.state_live();
+        if super::diag::on().arm_trace {
+            eprintln!(
+                "[arm-trace] settled after the last step: cache rows {} -> {} MiB of the {} MiB \
+                 the card hands out for them, {} -> {} MiB of the stated chunks held back",
+                before.0 >> 20,
+                self.pools.declared_bytes() >> 20,
+                fitted.room >> 20,
+                before.1 >> 20,
+                self.pools.kept_back_bytes() >> 20,
+            );
+        }
         Ok(())
     }
 }
