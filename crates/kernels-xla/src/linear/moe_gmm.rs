@@ -110,6 +110,30 @@ pub struct Gmm {
     /// GLU times its weight (`ins[2]`, f32 `[rows, 128]`, the weight in
     /// every lane), `N / 2` wide, in bf16.
     pub glu: Option<crate::linear::moe::ExpertGlu>,
+    /// The bank lies in the u32 state pool (`rows` rows of 128 words), an
+    /// expert at a time where the fire's table puts it (`Pooled`).
+    pub pooled: Option<Pooled>,
+}
+
+/// A bank whose experts lie in the u32 pool: each expert's `[N, K]` bf16
+/// weights as `K / 128` column panels of `[N, 128]`, a panel `N / 2` pool
+/// rows in the packed rows order (two bf16 rows a pool row, which a
+/// Mosaic bitcast of the pool reads back as `[N, 128]`), the panels in
+/// order, the expert's first at `offset` past the row its table entry
+/// names. The table (i32 `[E]`, each expert's row) follows the kernel's
+/// other scalar-prefetched operands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pooled {
+    pub rows: i64,
+    pub offset: i64,
+}
+
+impl Pooled {
+    /// Pool rows an expert's `[n, k]` panels take.
+    #[must_use]
+    pub const fn expert_rows(n: i64, k: i64) -> i64 {
+        k / 128 * (n / 2)
+    }
 }
 
 /// How the weights are cut into blocks.
@@ -819,6 +843,81 @@ impl Gmm {
         })
     }
 
+    /// The bank operand: the bank as it lies, or the u32 pool.
+    fn bank_operand(&self) -> Built<Operand> {
+        let (array, elem) = match self.pooled {
+            Some(p) => {
+                if self.orient != Orient::NMajor
+                    || self.w != Elem::Bf16
+                    || self.k % 128 != 0
+                    || self.n % 16 != 0
+                {
+                    return bad(format!("a pooled bank of {self:?}"));
+                }
+                (vec![p.rows, 128], Elem::U32)
+            }
+            None => (self.bank_dims().to_vec(), self.w),
+        };
+        Ok(Operand {
+            block: array.clone(),
+            array,
+            elem,
+            window: Window::Any,
+            index: Box::new(|b: &mut Body, _: &Grid| Ok(vec![b.i32(0), b.i32(0)])),
+        })
+    }
+
+    /// The scalar-prefetched operands, the pooled bank's table last.
+    fn with_table(&self, mut prefetch: Vec<Vec<i64>>) -> Vec<Vec<i64>> {
+        if self.pooled.is_some() {
+            prefetch.push(vec![self.experts]);
+        }
+        prefetch
+    }
+
+    /// The bank's ref as the kernel reads it: a pool reads as bf16 rows.
+    fn bank_ref(&self, b: &mut Body, bank: V) -> Built<V> {
+        match self.pooled {
+            Some(_) => b.ref_bitcast(bank, Elem::Bf16),
+            None => Ok(bank),
+        }
+    }
+
+    /// The copies of pooled expert `ex`'s panels into `dst` (`[N, K]`), on
+    /// `sem`: one `[N, 128]` panel each.
+    fn panels(
+        &self,
+        b: &mut Body,
+        rows: V,
+        table: V,
+        ex: V,
+        dst: V,
+        sem: V,
+    ) -> Built<Vec<(V, V, V)>> {
+        let Some(p) = self.pooled else {
+            return bad("panels of a bank not in the pool");
+        };
+        let (n, k) = (self.n, self.k);
+        let ei = b.as_index(ex)?;
+        let base = b.load(table, &[ei])?;
+        let off = b.i32(p.offset);
+        let base = b.addi(base, off)?;
+        let two = b.i32(2);
+        let base = b.muli(base, two)?;
+        let z = b.i32(0);
+        let mut out = Vec::with_capacity((k / 128) as usize);
+        for j in 0..k / 128 {
+            let step = b.i32(j * n);
+            let at = b.addi(base, step)?;
+            let at = b.assume_multiple(at, 16)?;
+            let src = b.ref_slice(rows, &[at, z], &[n, 128])?;
+            let col = b.i32(j * 128);
+            let to = b.ref_slice(dst, &[z, col], &[n, 128])?;
+            out.push((src, to, sem));
+        }
+        Ok(out)
+    }
+
     fn kernel_prefetching(&self) -> Built<Compiled> {
         let (k, n, tm, e) = (self.k, self.n, self.tm, self.experts);
         let rows = self.tiles * tm;
@@ -860,13 +959,7 @@ impl Gmm {
             window: Window::Blocked,
             index: Box::new(|b: &mut Body, g: &Grid| Ok(vec![last(b, g)?, b.i32(0)])),
         };
-        let bank = Operand {
-            array: self.bank_dims().to_vec(),
-            elem: self.w,
-            block: self.bank_dims().to_vec(),
-            window: Window::Any,
-            index: Box::new(|b: &mut Body, _: &Grid| Ok(vec![b.i32(0), b.i32(0)])),
-        };
+        let bank = self.bank_operand()?;
         let out_elem = self.out;
         let out = Operand {
             array: vec![rows, cols],
@@ -902,12 +995,12 @@ impl Gmm {
             name: "gmm".into(),
             grid: vec![1, self.tiles],
             semantics: vec![Sem::Arbitrary, Sem::Arbitrary],
-            prefetch: vec![
+            prefetch: self.with_table(vec![
                 vec![self.tiles],
                 vec![1],
                 vec![self.tiles],
                 vec![self.tiles],
-            ],
+            ]),
             ins: [Some(xs), Some(bank), bias].into_iter().flatten().collect(),
             outs: vec![out],
             vmem_limit: Some(limit as u64),
@@ -918,22 +1011,26 @@ impl Gmm {
         };
         kernel.build(|b, blk| {
             let (wbuf, sems) = (blk.scratch[0], blk.scratch[1]);
-            let bank = blk.ins[1];
+            let bank = self.bank_ref(b, blk.ins[1])?;
             let pre = &blk.grid.prefetch;
+            let table = self.pooled.map(|_| pre[pre.len() - 1]);
             let t = blk.grid.ids[1];
-            // The copy of expert `ex`'s weights into slot `s`.
-            let copy = |b: &mut Body, ex: V, s: V| -> Built<(V, V, V)> {
+            // The copies of expert `ex`'s weights into slot `s`.
+            let copy = |b: &mut Body, ex: V, s: V| -> Built<Vec<(V, V, V)>> {
                 let z = b.i32(0);
+                let dst = b.ref_slice(wbuf, &[s, z, z], &[1, rb, cb])?;
+                let dst = b.ref_squeeze(dst)?;
+                let sem = b.ref_slice(sems, &[s], &[1])?;
+                let sem = b.ref_squeeze(sem)?;
+                if let Some(table) = table {
+                    return self.panels(b, bank, table, ex, dst, sem);
+                }
                 let at = start(b, ex)?;
                 let src = match orient {
                     Orient::NMajor => b.ref_slice(bank, &[at, z], &[n, k])?,
                     Orient::KMajor => b.ref_slice(bank, &[z, at], &[k, cols])?,
                 };
-                let dst = b.ref_slice(wbuf, &[s, z, z], &[1, rb, cb])?;
-                let dst = b.ref_squeeze(dst)?;
-                let sem = b.ref_slice(sems, &[s], &[1])?;
-                let sem = b.ref_squeeze(sem)?;
-                Ok((src, dst, sem))
+                Ok(vec![(src, dst, sem)])
             };
             let zero = b.index(0);
             let nt = b.load(pre[1], &[zero])?;
@@ -954,20 +1051,25 @@ impl Gmm {
                 let first = b.select(at0, at0, moved)?;
                 b.when(at0, |b| {
                     let ex = b.load(pre[0], &[ti])?;
-                    let (src, dst, sem) = copy(b, ex, slot)?;
-                    b.dma_start(src, dst, sem)
+                    for (src, dst, sem) in copy(b, ex, slot)? {
+                        b.dma_start(src, dst, sem)?;
+                    }
+                    Ok(())
                 })?;
                 b.when(first, |b| {
                     let z = b.i32(0);
-                    let (src, dst, sem) = copy(b, z, slot)?;
-                    b.dma_wait(sem, src, dst)?;
+                    for (src, dst, sem) in copy(b, z, slot)? {
+                        b.dma_wait(sem, src, dst)?;
+                    }
                     let nx = b.load(pre[3], &[ti])?;
                     let has = b.cmpi(ICmp::Sge, nx, z)?;
                     b.when(has, |b| {
                         let one = b.i32(1);
                         let other = b.subi(one, slot)?;
-                        let (src, dst, sem) = copy(b, nx, other)?;
-                        b.dma_start(src, dst, sem)
+                        for (src, dst, sem) in copy(b, nx, other)? {
+                            b.dma_start(src, dst, sem)?;
+                        }
+                        Ok(())
                     })
                 })?;
                 let z = b.i32(0);
@@ -1321,7 +1423,13 @@ impl Gmm {
 
 /// `act(g) · u` over f32 `dims` vectors, as `linear::mlp`'s GLUs take it:
 /// SwiGLU `g · σ(g) · u`, GeGLU `0.5 g (1 + tanh(√(2/π) (g + 0.044715 g³))) u`.
-pub(crate) fn glu_of(b: &mut Body, act: crate::linear::moe::ExpertGlu, g: V, u: V, dims: &[i64]) -> Built<V> {
+pub(crate) fn glu_of(
+    b: &mut Body,
+    act: crate::linear::moe::ExpertGlu,
+    g: V,
+    u: V,
+    dims: &[i64],
+) -> Built<V> {
     let k = |b: &mut Body, x: f64| b.splat_f(dims, Elem::F32, x);
     let a = match act {
         crate::linear::moe::ExpertGlu::Swiglu => {
@@ -1813,6 +1921,7 @@ mod tests {
             sums: None,
             run: 1,
             glu: None,
+            pooled: None,
         }
     }
 

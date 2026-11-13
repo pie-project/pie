@@ -1198,3 +1198,131 @@ fn the_routed_mlp_on_one_sort_answers_its_parts() {
         assert_eq!(one, inside);
     }
 }
+
+/// Bf16 bytes as the pool lays them: each 512-byte pool row in the packed
+/// rows order (word `l`: elements `l` and `l + 128`).
+fn packed_rows(bytes: &mut [u8]) {
+    let mut row = [0u8; 512];
+    for chunk in bytes.as_chunks_mut::<512>().0 {
+        row.copy_from_slice(chunk);
+        for l in 0..128 {
+            chunk[4 * l..4 * l + 2].copy_from_slice(&row[2 * l..2 * l + 2]);
+            chunk[4 * l + 2..4 * l + 4].copy_from_slice(&row[2 * (l + 128)..2 * (l + 128) + 2]);
+        }
+    }
+}
+
+/// A dense routed select over a bank whose experts lie in the pool (a bank
+/// view: `kernels_xla::hlo::BankAt`, each expert's `K / 128` column panels
+/// where a table puts them) lands what the select over the bank lands, bit
+/// for bit: one token's pairs (each expert sliced out of its panels), and
+/// wider fires through the grouped-matmul kernel reading the pool.
+#[test]
+fn a_select_over_pooled_experts_lands_the_banks_bits() {
+    let (e, n, k, tk) = (8usize, 256usize, 512usize, 4usize);
+    let w: Vec<f32> = data(e * n * k, 71)
+        .iter()
+        .map(|v| round_bf16(v * 0.25))
+        .collect();
+    // Pool: each expert's panels at a scrambled row, past `offset` rows.
+    let offset = 8usize;
+    let expert_rows = k / 128 * (n / 2);
+    let order = [5usize, 2, 7, 0, 3, 6, 1, 4];
+    let table: Vec<i32> = (0..e)
+        .map(|x| (order[x] * (expert_rows + offset) + 16) as i32)
+        .collect();
+    let pool_rows = 16 + e * (expert_rows + offset) + 8;
+    let mut pool = vec![0u8; pool_rows * 512];
+    for x in 0..e {
+        let mut atom = Vec::with_capacity(expert_rows * 512);
+        for j in 0..k / 128 {
+            for r in 0..n {
+                for c in 0..128 {
+                    let v = w[(x * n + r) * k + j * 128 + c];
+                    atom.extend_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
+                }
+            }
+        }
+        packed_rows(&mut atom);
+        let at = (table[x] as usize + offset) * 512;
+        pool[at..at + atom.len()].copy_from_slice(&atom);
+    }
+    let words: Vec<u32> = pool
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
+        .collect();
+    for t in [1usize, 16, 64] {
+        let p = t * tk;
+        let x = data(t * k, 72 + t as u32);
+        let routes: Vec<i32> = (0..p)
+            .map(|i| (hash(i, 73 + t as u32) % e as u32) as i32)
+            .collect();
+        let mut b = Bench::new();
+        let xt = b.bf16(t as u32, k as u32, &x);
+        let rt = b.i32(t as u32, tk as u32, &routes);
+        let d = b.bf16((e * n) as u32, k as u32, &w);
+        let pt = b.u32(pool_rows as u32, 128, &words);
+        let tt = b.i32(1, e as u32, &table);
+        let y1 = b.bf16(p as u32, n as u32, &vec![PREV; p * n]);
+        let y2 = b.bf16(p as u32, n as u32, &vec![PREV; p * n]);
+        let mut materialized = Vec::new();
+        let ran = b
+            .run(|ctx| {
+                engine_xla::lower::lower(ctx, |l| {
+                    let x_v = l.read(xt)?;
+                    let routes_v = l.read(rt)?;
+                    let y_v = l.read(y1)?;
+                    let bank_v = l.read(d)?;
+                    let tuning = l.tuning();
+                    let v = moe::matmul_select(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
+                    l.land(y1, v)
+                })?;
+                engine_xla::lower::lower(ctx, |l| {
+                    let x_v = l.read(xt)?;
+                    let routes_v = l.read(rt)?;
+                    let y_v = l.read(y2)?;
+                    let pool_v = l.read(pt)?.val;
+                    let table_v = l.read(tt)?.val;
+                    let table_v = l.f().reshape(table_v, &[e as i64])?;
+                    let view = l.f().bank_view(kernels_xla::hlo::BankAt {
+                        pool: pool_v,
+                        table: table_v,
+                        offset: offset as i64,
+                        experts: e as i64,
+                        n: n as i64,
+                        k: k as i64,
+                    })?;
+                    let bank_v = kernels_xla::tensor::Operand {
+                        val: view,
+                        rows: (e * n) as u32,
+                        width: k as u32,
+                        dtype: Dtype::Bf16,
+                    };
+                    let tuning = l.tuning();
+                    let v = moe::matmul_select(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
+                    materialized = l.f().materialized().to_vec();
+                    l.land(y2, v)
+                })
+            })
+            .unwrap_or_else(|err| panic!("{err}\n{}", b.last_module));
+        if !ran {
+            return;
+        }
+        assert!(materialized.is_empty(), "{t} tokens: {materialized:?}");
+        let kernel = b.last_module.lines().any(|l| {
+            l.contains("tpu_custom_call") && l.contains(&format!("tensor<{pool_rows}x128xui32>"))
+        });
+        assert!(
+            t == 1 || kernel,
+            "{t} tokens: the grouped matmul read the pool"
+        );
+        assert_eq!(
+            b.bytes(y1),
+            b.bytes(y2),
+            "{t} tokens: the pooled select lands the bank's bits"
+        );
+        eprintln!("{t} tokens x {tk}: pooled select = the bank's, bit for bit (kernel: {kernel})");
+    }
+}

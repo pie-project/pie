@@ -10,6 +10,7 @@
 use std::fmt::{self, Write as _};
 
 mod view;
+pub use view::BankAt;
 pub use view::LANES as POOL_LANES;
 pub use view::Order as PoolOrder;
 
@@ -278,6 +279,9 @@ pub struct Func {
     rope_flat_rows: i64,
     /// Views of the chunk pool ([`Func::pool_view`]): values with no text.
     views: std::collections::HashMap<u32, view::View>,
+    /// Banks whose experts lie in the pool ([`Func::bank_view`]): values
+    /// with no text.
+    banks: std::collections::HashMap<u32, view::BankAt>,
     /// What views were materialized for (each a copy of the pool).
     materialized: Vec<String>,
     /// Pool view reads by XLA's gather, not a DMA kernel call (see
@@ -398,6 +402,7 @@ impl Func {
             row_major_results: false,
             rope_flat_rows: 0,
             views: std::collections::HashMap::new(),
+            banks: std::collections::HashMap::new(),
             materialized: Vec::new(),
             xla_reads: false,
             dot_barrier_rows: 0,
