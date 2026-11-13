@@ -1818,6 +1818,22 @@ impl Pools {
             .map_or(1, |fixed| fixed.ids_a_lane().max(1))
     }
 
+    /// The slots of the record shape a record takes; none where the load
+    /// lays no record.
+    #[must_use]
+    pub fn record_pieces(&self) -> u32 {
+        self.chunks
+            .layout()
+            .fixed
+            .as_ref()
+            .map_or(0, |fixed| fixed.pieces.max(1))
+    }
+
+    /// Lets go of the name [`Pools::name_record`] gave `key`.
+    pub fn forget_record(&mut self, key: u32) {
+        self.records.remove(&key);
+    }
+
     /// Names the record whose pieces lie in the slot refs `pieces`, for the
     /// fires and copies that name it by its first.
     pub fn name_record(&mut self, pieces: &[u32]) -> Result<u32> {

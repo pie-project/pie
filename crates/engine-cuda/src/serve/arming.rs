@@ -499,10 +499,12 @@ impl Shell {
         if self.stepping.is_none() {
             return engine::live::ArmingRoom::default();
         }
-        let (records, pages, _) = self.synthetic_room();
+        let (_, pages, _) = self.synthetic_room();
         engine::live::ArmingRoom {
             pages: u32::try_from(pages).unwrap_or(u32::MAX),
-            records: if self.pools.has_state() { records } else { 0 },
+            // One record, every piece of it: a synthetic lane's rows are
+            // never read back, so a step's lanes share it.
+            records: self.pools.record_pieces(),
         }
     }
 
@@ -1441,11 +1443,40 @@ impl Shell {
         let Some(mut st) = self.stepping.take() else {
             return Ok(false);
         };
-        self.lent = Some(lent.clone());
+        // The records the step's lanes name, each by the slots lent for its
+        // pieces: by ref once lanes name refs, else by the state slot those
+        // slots are.
+        let pieces = self.pools.record_pieces() as usize;
+        if lent.records.len() < pieces {
+            return Err(Fault::program(
+                "serve::arming",
+                format!(
+                    "a step lent {} record slots, and a record takes {pieces}",
+                    lent.records.len()
+                ),
+            ));
+        }
+        let mut named = Vec::new();
+        for record in lent.records.chunks_exact(pieces.max(1)) {
+            named.push(if self.pools.by_refs() {
+                self.pools.name_record(record)?
+            } else {
+                record[0] / pieces as u32
+            });
+        }
+        self.lent = Some(engine::live::ArmingLease {
+            pages: lent.pages.clone(),
+            records: named.clone(),
+        });
         let rung = st.targets.front().map_or(st.rung, |(bucket, _, _)| self.rung_of(*bucket));
         let stepped = self.arm_next(&mut st);
         self.device.synchronize()?;
         self.lent = None;
+        if self.pools.by_refs() {
+            for key in named {
+                self.pools.forget_record(key);
+            }
+        }
         self.pools.forget_weight_uses(self.device.stream())?;
         stepped?;
         self.arm_stepped_on(st, rung)
@@ -1571,6 +1602,13 @@ impl Shell {
             if let Err(why) = fired.and(landed) {
                 if super::diag::on().arm_trace {
                     eprintln!("[arm-trace] refused bucket {bucket}, {target}: {why}");
+                }
+                // A lattice arming while the shell serves leaves no key to
+                // walk eagerly: a refusal there is the step's fault.
+                if self.lent.is_some() {
+                    return Err(Fault::Unbound {
+                        what: format!("arming bucket {bucket}, {target}: {why}"),
+                    });
                 }
                 st.refused = Some(format!("bucket {bucket}, {target}: {why}"));
                 break;
