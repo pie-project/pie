@@ -36,7 +36,7 @@ fn decode(name: &str, lanes: u32, held: u32, steps: u32) -> f64 {
     set("SLOTS", lanes.max(4));
     set("LANES", lanes.max(8));
     set("TOKENS", (2 * lanes).max(held).max(128));
-    let mut model = Model::load(name, None, context, 7);
+    let mut model = load(name, context);
     let vocab = model.vocab;
     let mut refs = Refs::of(&model);
     let mut seqs: Vec<Seq> = (0..lanes).map(Seq::new).collect();
@@ -93,7 +93,7 @@ fn prefill(name: &str, len: u32, runs: u32) -> f64 {
     // `runs` prompts after two warm ones, each a working set of its own
     set("LANES", 8);
     set("TOKENS", len);
-    let mut model = Model::load(name, None, context, 7);
+    let mut model = load(name, context);
     let vocab = model.vocab;
     let mut refs = Refs::of(&model);
     let fire = |model: &mut Model, refs: &mut Refs, slot: u32| {
@@ -111,6 +111,21 @@ fn prefill(name: &str, len: u32, runs: u32) -> f64 {
         times.push(t.elapsed().as_secs_f64());
     }
     f64::from(len) / median(&mut times)
+}
+
+/// The model as the gate loads it: streaming its weights, or held with
+/// `PIE_XLA_WEIGHTS_HELD=1` (what the worker loads unless streaming is on);
+/// cut to `PIE_XLA_SPEED_LAYERS` layers where set (a whole model's widths
+/// at a depth one chip holds).
+fn load(name: &str, context: u32) -> Model {
+    let layers = std::env::var("PIE_XLA_SPEED_LAYERS")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    if std::env::var("PIE_XLA_WEIGHTS_HELD").is_ok_and(|v| v == "1") {
+        Model::load_held(name, layers, context, 7)
+    } else {
+        Model::load(name, layers, context, 7)
+    }
 }
 
 #[test]

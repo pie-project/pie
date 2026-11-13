@@ -595,6 +595,36 @@ impl Streamed {
         Ok(out)
     }
 
+    /// Each streamed bank's planes as a fire's miss copy reads them
+    /// (`crate::trace::Source::HostBank`): `(param, pool rows an expert's
+    /// plane takes, bytes)`, every expert's plane as the pool lays it, in
+    /// expert order.
+    pub fn host_banks(&self) -> Result<Vec<(usize, u32, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for shape in &self.shapes {
+            let Form::Experts { experts, layers } = &shape.form else {
+                continue;
+            };
+            for (_, banks) in layers {
+                for (plane, &p) in shape.planes.iter().zip(banks) {
+                    let host = self.host.get(&p).ok_or_else(|| {
+                        Fault::Residency(format!("weight `{}` keeps no host copy", shape.name))
+                    })?;
+                    let n = plane.bytes() as usize;
+                    let mut bytes = vec![0u8; n * *experts as usize];
+                    for e in 0..*experts as usize {
+                        let to = &mut bytes[e * n..(e + 1) * n];
+                        panels(&host[e * n..(e + 1) * n], plane.rows as usize, plane.width as usize, to);
+                        packed_rows(to);
+                    }
+                    let rows = u32::try_from(plane.bytes() / ROW_BYTES).unwrap_or(u32::MAX);
+                    out.push((p, rows, bytes));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Takes `residency` as the whole set: each atom's slot from here on.
     /// Answers the atoms newly named a slot, `(shape, atom, slot)`, which
     /// the caller fills ([`Streamed::atom_bytes`]) before any fire reads
@@ -758,36 +788,30 @@ pub struct Fire {
     pub rows: Vec<(usize, crate::handle::Tensor, crate::handle::Tensor)>,
     /// Each streamed bank: its param and how a select reads it.
     pub banks: Vec<(usize, Bank)>,
-    /// The routes each cut brought back, in cut order (`Cut`).
-    pub cuts: std::sync::Mutex<Vec<Cut>>,
-    /// The `(routes, span)` already cut for.
-    pub cut_for: std::sync::Mutex<Vec<(poem_ir::ValueId, (u32, u32))>>,
+    /// Groups numbered so far.
+    pub groups: usize,
 }
 
-/// How a select reads a streamed bank: expert `e`'s plane is rows
-/// `[loc[e], loc[e] + rows)` of `view`.
+/// How a select reads a streamed bank: expert `e`'s plane at pool row
+/// `loc[e]` (-1: in no slot, staged by the fire from `host` into the next
+/// of `staging`'s rows).
 #[derive(Debug, Clone, Copy)]
 pub struct Bank {
-    pub view: crate::handle::Tensor,
+    /// The pool's whole root.
+    pub pool: crate::handle::Tensor,
     pub loc: crate::handle::Tensor,
-    /// The bank's rows an expert, and the view's rows an expert takes.
+    pub staging: crate::handle::Tensor,
+    /// The bank's miss copy (`crate::trace::Source::HostBank`), and the
+    /// pool rows an expert's plane takes.
+    pub host: crate::handle::Tensor,
+    pub plane_rows: u32,
+    /// The bank's rows an expert.
     pub rows: u32,
-    pub view_rows: u32,
     pub experts: u32,
-    /// The shape and its layer (`Form::Experts::layers`).
-    pub shape: usize,
-    pub layer: usize,
-    /// Every expert of the layer lies in a slot: no cut.
-    pub whole: bool,
-}
-
-/// Where a cut fire's routes for one layer came back: the handle the
-/// routes value had, and the layer.
-#[derive(Debug, Clone, Copy)]
-pub struct Cut {
-    pub routes: crate::handle::Tensor,
-    pub shape: usize,
-    pub layer: usize,
+    /// The atom's other planes share its slots: a fire stages them all at
+    /// once, before any select of the layer reads the pool
+    /// ([`Fire::group`]).
+    pub group: u32,
 }
 
 impl Fire {
@@ -797,6 +821,16 @@ impl Fire {
             .iter()
             .find(|(p, ..)| *p == param)
             .map(|&(_, view, idx)| (view, idx))
+    }
+
+    /// Every bank of group `group` (one layer's atom), param and bank.
+    #[must_use]
+    pub fn group(&self, group: u32) -> Vec<(usize, Bank)> {
+        self.banks
+            .iter()
+            .filter(|(_, b)| b.group == group)
+            .copied()
+            .collect()
     }
 
     #[must_use]

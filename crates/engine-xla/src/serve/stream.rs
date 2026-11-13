@@ -9,24 +9,12 @@ use engine::chunk::{WeightResidency, WeightUses};
 use super::Shell;
 use crate::error::{Fault, Result};
 use crate::inputs::Inputs;
-use crate::pjrt::Buffer;
 use crate::store::streamed::{Bank, Fire, Form, NOT_HELD, Streamed};
-
-/// A cut fire's segments before its last program: each program and the
-/// activation roots it returns, and the cut each closes on.
-pub(super) struct Segmented {
-    pub segments: Vec<(std::sync::Arc<crate::device::Program>, Vec<u32>)>,
-    pub cuts: Vec<crate::store::streamed::Cut>,
-}
 
 /// What `Shell::stream_fire` staged for a fire.
 #[derive(Default)]
 pub(super) struct Staged {
     pub fire: Option<Arc<Fire>>,
-    /// Where each streamed bank's expert places start in the pack.
-    pub locs: Vec<(usize, u32)>,
-    /// What the program key names: which layers the fire cuts at.
-    pub key: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -68,8 +56,6 @@ pub(super) fn stream_fire(
         }
     }
     let mut fire = Fire::default();
-    let mut locs = Vec::new();
-    let mut key = String::new();
     for at in 0..streamed.shapes.len() {
         let shape = &streamed.shapes[at];
         match &shape.form {
@@ -142,36 +128,54 @@ pub(super) fn stream_fire(
             }
             Form::Experts { experts, layers } => {
                 let experts = *experts;
+                // The staging slots, a fixed count (the shape's floor) so the
+                // program is the same whatever lies resident; past the ones
+                // the runtime named, rows no expert in no slot is staged to.
+                let floor = shape.floor as usize;
                 for (layer_at, (_, banks)) in layers.iter().enumerate() {
-                    let whole = streamed.layer_whole(at, layer_at);
-                    if !whole {
-                        key.push_str(&format!("{at}.{layer_at},"));
-                    }
+                    let group = u32::try_from(fire.groups).unwrap_or(u32::MAX);
+                    fire.groups += 1;
                     let slots = &shape.slots
                         [layer_at * experts as usize..(layer_at + 1) * experts as usize];
+                    let missing = slots.iter().filter(|&&s| s == NOT_HELD).count();
+                    if missing > 0 && shape.staging.len() < floor.min(missing) {
+                        return Err(Fault::Residency(format!(
+                            "layer {layer_at} of `{}` holds {missing} experts in no slot and the \
+                             residency names {} staging slots of the {floor} a fire may need",
+                            shape.name,
+                            shape.staging.len()
+                        )));
+                    }
                     for (plane, &param) in shape.planes.iter().zip(banks) {
                         let loc: Vec<i32> = slots
                             .iter()
                             .map(|&slot| expert_row(pools, &streamed.shapes[at], *plane, slot))
                             .collect::<Result<_>>()?;
-                        let view = pools
-                            .weight_view(plane.view)
-                            .ok_or_else(|| Fault::Unbound {
-                                what: format!("the {}-wide weight view", plane.view),
-                            })?;
-                        locs.push((param, inputs.pack_offset()));
+                        let mut staging: Vec<i32> = shape
+                            .staging
+                            .iter()
+                            .take(floor)
+                            .map(|&slot| expert_row(pools, &streamed.shapes[at], *plane, slot))
+                            .collect::<Result<_>>()?;
+                        let pad = staging.last().copied().unwrap_or(0);
+                        staging.resize(floor.max(1), pad);
+                        let p = u32::try_from(param).unwrap_or(u32::MAX);
+                        let host = pools.host_bank_root(p).ok_or_else(|| Fault::Unbound {
+                            what: format!("the host copy of streamed bank {param}"),
+                        })?;
                         let loc = inputs.i32s(handles, &loc, 1);
+                        let staging = inputs.i32s(handles, &staging, 1);
                         fire.banks.push((
                             param,
                             Bank {
-                                view,
+                                pool: pools.root(),
                                 loc,
+                                staging,
+                                host: host.0,
+                                plane_rows: host.1,
                                 rows: plane.rows,
-                                view_rows: plane.view_rows(),
                                 experts,
-                                shape: at,
-                                layer: layer_at,
-                                whole,
+                                group,
                             },
                         ));
                     }
@@ -181,129 +185,10 @@ pub(super) fn stream_fire(
     }
     Ok(Staged {
         fire: Some(Arc::new(fire)),
-        locs,
-        key,
     })
 }
 
 impl Shell {
-    /// Lays this fire's streamed weights: each streamed table's row for
-    /// every token row (staging the blocks in no slot, unless `run` is
-    /// false: a fire traced and not run), each streamed bank's expert
-    /// places. `tokens` are the fire's token rows, `feeds` the lanes whose
-    /// tokens the device supplies (read back here: the host places their
-    /// rows), `real` the rows of real lanes.
-    /// Runs a cut fire's segments before its last program: after each, the
-    /// routes of the layer it cut at come back, the experts they name in no
-    /// slot are staged and the layer's banks re-placed in `inputs`. Answers
-    /// the activations the last program reads.
-    pub(super) fn run_segments(
-        &mut self,
-        segmented: &Segmented,
-        inputs: &mut Inputs,
-        staged: &Staged,
-    ) -> Result<BTreeMap<u32, Buffer>> {
-        let mut carried: BTreeMap<u32, Buffer> = BTreeMap::new();
-        for ((program, roots), cut) in segmented.segments.iter().zip(&segmented.cuts) {
-            let outs = crate::exec::run_carried(
-                &self.device,
-                program,
-                Some(&self.weights),
-                &mut self.pools,
-                inputs,
-                &carried,
-                true,
-            )?;
-            if outs.len() != roots.len() {
-                return Err(Fault::Unbound {
-                    what: format!(
-                        "a fire segment returned {} activations for the {} it carries",
-                        outs.len(),
-                        roots.len()
-                    ),
-                });
-            }
-            for (&root, out) in roots.iter().zip(outs) {
-                carried.insert(root, out);
-            }
-            // The routes, as the segment landed them.
-            let (root, skip) =
-                self.handles
-                    .locate(cut.routes.buf)
-                    .ok_or_else(|| Fault::Unbound {
-                        what: "the handle of a cut's routes".to_string(),
-                    })?;
-            let buffer = carried.get(&root).ok_or_else(|| Fault::Unbound {
-                what: "the routes of a cut, which its segment did not return".to_string(),
-            })?;
-            let bytes = buffer.download()?;
-            let width = cut.routes.width as usize;
-            let from = skip as usize * width * 4;
-            let to = from + cut.routes.rows as usize * width * 4;
-            let words = bytes.get(from..to).ok_or_else(|| Fault::Unbound {
-                what: "the rows of a cut's routes".to_string(),
-            })?;
-            let shape = self.streamed.shapes[cut.shape].clone();
-            let Form::Experts {
-                experts,
-                ref layers,
-            } = shape.form
-            else {
-                continue;
-            };
-            let mut named: Vec<u32> = words
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|w| i32::from_le_bytes(*w))
-                .filter(|&e| e >= 0 && (e as u32) < experts)
-                .map(|e| e as u32)
-                .collect();
-            named.sort_unstable();
-            named.dedup();
-            let base = cut.layer as u32 * experts;
-            self.streamed
-                .count(cut.shape, named.iter().map(|&e| base + e));
-            let misses: Vec<u32> = named
-                .iter()
-                .copied()
-                .filter(|&e| shape.slots[(base + e) as usize] == NOT_HELD)
-                .collect();
-            if misses.len() > shape.staging.len() {
-                return Err(Fault::Residency(format!(
-                    "a fire's routes read {} experts of layer {} of `{}` in no slot and the \
-                     residency names {} staging slots for them",
-                    misses.len(),
-                    cut.layer,
-                    shape.name,
-                    shape.staging.len()
-                )));
-            }
-            let mut fills = Vec::with_capacity(misses.len());
-            let mut placed = BTreeMap::new();
-            for (&e, &slot) in misses.iter().zip(&shape.staging) {
-                fills.push((slot, self.streamed.atom_bytes(cut.shape, base + e)?));
-                placed.insert(e, slot);
-            }
-            self.pools
-                .write_weights(&self.device, &self.handles, &shape, &fills)?;
-            for (&plane, &param) in shape.planes.iter().zip(&layers[cut.layer].1) {
-                let Some(&(_, offset)) = staged.locs.iter().find(|(p, _)| *p == param) else {
-                    continue;
-                };
-                let slots = &shape.slots[base as usize..(base + experts) as usize];
-                let loc: Vec<i32> = (0..experts)
-                    .map(|e| {
-                        let slot = placed.get(&e).copied().unwrap_or(slots[e as usize]);
-                        expert_row(&self.pools, &shape, plane, slot)
-                    })
-                    .collect::<Result<_>>()?;
-                inputs.set_i32s(offset, &loc);
-            }
-        }
-        Ok(carried)
-    }
-
     /// The streamed weights' residency from the next fire on
     /// (`Engine::weight_residency`): fills the slots newly named.
     pub fn weight_residency(&mut self, residency: &WeightResidency) -> Result<()> {
@@ -340,8 +225,8 @@ impl Shell {
     }
 }
 
-/// The row of `plane`'s view an expert in `slot` starts at; an expert
-/// in no slot reads the null chunk (zeros) until a cut stages it.
+/// The pool row `plane` of an expert in `slot` starts at; -1 for an expert
+/// in no slot (a fire stages it: `kernels_xla::hlo::Func::stage_misses`).
 fn expert_row(
     pools: &crate::store::Pools,
     shape: &crate::store::streamed::Shape,
@@ -349,7 +234,7 @@ fn expert_row(
     slot: u32,
 ) -> Result<i32> {
     if slot == NOT_HELD {
-        return Ok(0);
+        return Ok(-1);
     }
     let off = pools.weight_offset(shape, slot)? + plane.offset;
     i32::try_from(off / plane.view_row_bytes()).map_err(|_| Fault::Ceiling {
