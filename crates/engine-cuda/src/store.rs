@@ -603,6 +603,10 @@ pub struct Pools {
     pooled: Vec<PoolRow>,
     paging: Paging,
     asked: u64,
+    /// The chunks the range was first reserved for, the asked count's: a
+    /// fit may reserve a fresh range anew up to them, whatever an earlier
+    /// fit cut it to.
+    asked_chunks: u32,
     ceiling: u64,
     /// `[model] device_kv_budget`: the bytes the cache rows take, never cut
     /// to fit; `None` fills what the card hands out.
@@ -999,6 +1003,7 @@ impl Pools {
             pooled,
             paging,
             asked: paging.pages(),
+            asked_chunks: total,
             ceiling: paging.pages(),
             budget,
             fitted: total,
@@ -1237,8 +1242,16 @@ impl Pools {
         // Whole map units of the room, in whole chunks, of the range's.
         let unit = self.chunks.map_unit().max(1);
         let limit = self.budget.unwrap_or(room) / unit * unit;
+        // Before arming a fresh range may be reserved anew up to the asked
+        // count. Once armed it never moves, fresh or not: the bodies name
+        // addresses in it.
+        let most = if !settled && self.chunks.fresh() {
+            self.asked_chunks.max(self.chunks.total())
+        } else {
+            self.chunks.total()
+        };
         let fitted = match engine::chunk::fit(limit, chunk, 0, least) {
-            Ok(chunks) => chunks.min(self.chunks.total()),
+            Ok(chunks) => chunks.min(most),
             Err(_) if self.budget.is_some() => {
                 return Err(Fault::Residency(
                     engine::fit::Short::Sequence {
@@ -1342,6 +1355,13 @@ impl Pools {
             spare: live.saturating_sub(need).saturating_sub(programs),
             chunks: fitted,
         })
+    }
+
+    /// Whether no segment is backed yet: a fit before arming may still
+    /// reserve the range anew (its held activation laid again).
+    #[must_use]
+    pub fn fresh(&self) -> bool {
+        self.chunks.fresh()
     }
 
     /// Where a fire's activation starts: under the state pool's end.
@@ -2369,6 +2389,12 @@ impl Pools {
     #[must_use]
     pub fn expert_tables(&self) -> Vec<(u32, kernels_cuda::linear::moe::ExpertTable)> {
         let window = (self.chunks.base(), self.chunks.bytes());
+        // A size-only walk before the weights are seated reads them as
+        // arming will: located, where the fit claimed them whole (the load
+        // preseats them before it arms). Nothing reads through the table.
+        let walked_held = crate::sizing::active()
+            && self.weight_pool_bytes() / self.chunks.layout().chunk_bytes.max(1)
+                <= u64::from(self.fitted);
         self.expert_caches
             .iter()
             .flat_map(|cache| {
@@ -2378,11 +2404,12 @@ impl Pools {
                     .filter(|bank| bank.head)
                     .map(move |bank| {
                         let first = (bank.layer * cache.shape.experts) as usize;
-                        let located = (self.weights_held || self.preseated)
-                            && (bank.whole_rows || !windows_mapped())
-                            && cache.slots[first..first + cache.shape.experts as usize]
-                                .iter()
-                                .all(Option::is_some);
+                        let located = walked_held
+                            || ((self.weights_held || self.preseated)
+                                && (bank.whole_rows || !windows_mapped())
+                                && cache.slots[first..first + cache.shape.experts as usize]
+                                    .iter()
+                                    .all(Option::is_some));
                         (
                             bank.plane.param,
                             kernels_cuda::linear::moe::ExpertTable {

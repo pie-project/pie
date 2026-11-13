@@ -32,6 +32,63 @@ fn locked() -> std::sync::MutexGuard<'static, HashMap<u32, Arena>> {
     arenas().lock().expect("lock poisoned")
 }
 
+/// A size-only walk's slabs (`crate::sizing`): each key's size as the walk
+/// would have grown it, and every allocation it would have made.
+#[derive(Default)]
+struct Sized {
+    slabs: HashMap<(u32, &'static str, u32, usize), usize>,
+    grown: usize,
+    by_name: HashMap<&'static str, usize>,
+}
+
+thread_local! {
+    static SIZED: core::cell::RefCell<Sized> = core::cell::RefCell::new(Sized::default());
+}
+
+pub(crate) fn sizing_reset() {
+    SIZED.with(|sized| *sized.borrow_mut() = Sized::default());
+}
+
+pub(crate) fn sizing_take() -> crate::sizing::Footprint {
+    SIZED.with(|sized| {
+        let sized = core::mem::take(&mut *sized.borrow_mut());
+        let mut slabs: Vec<(&'static str, usize)> = sized.by_name.into_iter().collect();
+        slabs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        crate::sizing::Footprint {
+            bytes: sized.grown,
+            slabs,
+        }
+    })
+}
+
+/// [`take_as`] in a size-only walk: the slab `grow` would leave, counted,
+/// and a stand-in address for it.
+fn take_sized(
+    arena: u32,
+    owner: *mut c_void,
+    name: &'static str,
+    region: u32,
+    bytes: usize,
+) -> *mut c_void {
+    let scope = scope_of(owner, region);
+    let held = locked()
+        .get(&arena)
+        .and_then(|held| held.slabs.get(&(name, region, scope)))
+        .map_or(0, |slab| slab.bytes);
+    SIZED.with(|sized| {
+        let mut sized = sized.borrow_mut();
+        let key = (arena, name, region, scope);
+        let have = sized.slabs.get(&key).copied().unwrap_or(held);
+        if bytes > have {
+            let want = bytes.div_ceil(SLAB_GRAIN).saturating_mul(SLAB_GRAIN);
+            sized.slabs.insert(key, want);
+            sized.grown = sized.grown.saturating_add(want);
+            *sized.by_name.entry(name).or_insert(0) += want;
+        }
+    });
+    crate::sizing::STAND_IN as *mut c_void
+}
+
 pub(crate) fn attach(arena: u32, stream: *mut c_void) {
     let _ = (arena, stream);
 }
@@ -118,6 +175,10 @@ fn take_as(
 ) -> Result<*mut c_void, Fault> {
     if bytes == 0 {
         return Ok(core::ptr::null_mut());
+    }
+    if crate::sizing::active() {
+        let _ = (stream, zero);
+        return Ok(take_sized(arena, owner, name, region, bytes));
     }
     let mut arenas = locked();
     let held = arenas.entry(arena).or_default();

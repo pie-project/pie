@@ -15,6 +15,13 @@ pub(crate) mod device {
     pub(crate) fn compute_capability_major() -> Option<u32> {
         None
     }
+
+    /// No slab is ever taken: a walk sizes nothing.
+    pub(crate) fn sizing_reset() {}
+
+    pub(crate) fn sizing_take() -> crate::sizing::Footprint {
+        crate::sizing::Footprint::default()
+    }
 }
 #[cfg(all(test, feature = "cuda"))]
 mod launches;

@@ -1044,6 +1044,11 @@ fn bounce(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Result<bool
 }
 
 pub fn stage_raw(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Result<()> {
+    // A size-only walk (`crate::sizing`) copies nothing to or from a
+    // stand-in span.
+    if crate::sizing::active() && (crate::sizing::stands_in(dst as usize)) {
+        return Ok(());
+    }
     if bytes.is_empty() {
         return Ok(());
     }
@@ -1082,6 +1087,13 @@ pub fn stage_raw(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Resu
 }
 
 pub fn copy_d2d(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize) -> Result<()> {
+    // A size-only walk (`crate::sizing`) copies nothing to or from a
+    // stand-in span.
+    if crate::sizing::active()
+        && (crate::sizing::stands_in(dst as usize) || crate::sizing::stands_in(src as usize))
+    {
+        return Ok(());
+    }
     if bytes == 0 {
         return Ok(());
     }
@@ -1133,7 +1145,18 @@ fn batch(
     dst_host: bool,
     spans: &[(u64, u64, usize)],
 ) -> Result<()> {
-    let live: Vec<(u64, u64, usize)> = spans.iter().copied().filter(|s| s.2 > 0).collect();
+    // A size-only walk (`crate::sizing`) copies no span to or from a
+    // stand-in.
+    let live: Vec<(u64, u64, usize)> = spans
+        .iter()
+        .copied()
+        .filter(|s| {
+            s.2 > 0
+                && !(crate::sizing::active()
+                    && (crate::sizing::stands_in(s.0 as usize)
+                        || crate::sizing::stands_in(s.1 as usize)))
+        })
+        .collect();
     #[cfg(all(feature = "cuda", not(feature = "rocm")))]
     if live.len() > 1 {
         use crate::device::rt;
@@ -1197,6 +1220,13 @@ fn batch(
 }
 
 pub fn copy_any(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize) -> Result<()> {
+    // A size-only walk (`crate::sizing`) copies nothing to or from a
+    // stand-in span.
+    if crate::sizing::active()
+        && (crate::sizing::stands_in(dst as usize) || crate::sizing::stands_in(src as usize))
+    {
+        return Ok(());
+    }
     if bytes == 0 {
         return Ok(());
     }
@@ -1226,6 +1256,11 @@ pub fn copy_any(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize
 }
 
 pub fn zero_span(at: u64, len: usize) -> Result<()> {
+    // A size-only walk (`crate::sizing`) copies nothing to or from a
+    // stand-in span.
+    if crate::sizing::active() && (crate::sizing::stands_in(at as usize)) {
+        return Ok(());
+    }
     if len == 0 {
         return Ok(());
     }
@@ -1242,6 +1277,11 @@ pub fn zero_span(at: u64, len: usize) -> Result<()> {
 }
 
 pub fn zero_span_on(stream: *mut core::ffi::c_void, at: u64, len: usize) -> Result<()> {
+    // A size-only walk (`crate::sizing`) copies nothing to or from a
+    // stand-in span.
+    if crate::sizing::active() && (crate::sizing::stands_in(at as usize)) {
+        return Ok(());
+    }
     if len == 0 {
         return Ok(());
     }
@@ -1281,6 +1321,14 @@ pub fn copy_d2h(at: u64, into: &mut [u8]) -> Result<()> {
 /// Reads `into` from `at` on `stream`, behind whatever it holds, and waits
 /// for it to land.
 pub fn copy_d2h_on(stream: *mut core::ffi::c_void, at: u64, into: &mut [u8]) -> Result<()> {
+    // A read of a stand-in span back to the host has no answer in a
+    // size-only walk (`crate::sizing`): it refuses.
+    if crate::sizing::active() && crate::sizing::stands_in(at as usize) {
+        return Err(Fault::program(
+            "device::copy_d2h",
+            "a size-only walk read a span it never backed back to the host",
+        ));
+    }
     if into.is_empty() {
         return Ok(());
     }

@@ -819,7 +819,24 @@ impl FireCtx<'_> {
         }
         super::btrace::mark("run_new");
         let records = self.graphs.records();
-        let walked = if records {
+        // A size-only walk (`crate::sizing`) walks what arming would capture,
+        // eagerly: nothing launches, and a capture would record nothing.
+        let walked = if records && crate::sizing::active() {
+            if self.arming && !p.bodied {
+                Ok(())
+            } else {
+                let mut cursor = Cursor::new(&place);
+                walk(
+                    self.trace,
+                    self.compiled,
+                    &p.descriptor,
+                    &mut run,
+                    &mut cursor,
+                    Filter::default(),
+                )
+                .map_err(Fault::from)
+            }
+        } else if records {
             if self.arming && !p.bodied {
                 Ok(())
             } else if p.bodied {

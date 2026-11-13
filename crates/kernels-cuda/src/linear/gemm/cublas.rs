@@ -428,7 +428,8 @@ pub(crate) fn anchored(
         if let (Some(_), Some(plan)) = (epi.lt(), plan.as_deref()) {
             candidates.extend((0..plan.heuristics.len()).map(Tactic::LtEpilogue));
         }
-        if candidates.is_empty() {
+        // A size-only walk (`crate::sizing`) times nothing and keeps no pick.
+        if candidates.is_empty() || crate::sizing::active() {
             return (None, plan, lt);
         }
         let charge = device.charge(m);
@@ -899,28 +900,33 @@ fn gemm_ex(handle: cublasHandle_t, call: Call, algo: cublasGemmAlgo_t) -> cublas
     // pointer mode and the 32F compute type take. `call` names an `m x k`
     // act, an `n x k` weight and an `m x n` y, all bf16: the caller's
     // tensors, or the arena's slabs allocated at those sizes.
-    unsafe {
-        cublasGemmEx(
-            handle,
-            cublasOperation_t::CUBLAS_OP_T,
-            cublasOperation_t::CUBLAS_OP_N,
-            call.n,
-            call.m,
-            call.k,
-            std::ptr::from_ref(&alpha).cast(),
-            dev(call.w),
-            cudaDataType::CUDA_R_16BF,
-            call.k,
-            dev(call.act),
-            cudaDataType::CUDA_R_16BF,
-            call.k,
-            std::ptr::from_ref(&beta).cast(),
-            dev_mut(call.y),
-            cudaDataType::CUDA_R_16BF,
-            call.n,
-            cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            algo,
-        )
+    if crate::sizing::active() {
+        // A size-only walk (`crate::sizing`) runs no product.
+        cublasStatus_t::CUBLAS_STATUS_SUCCESS
+    } else {
+        unsafe {
+            cublasGemmEx(
+                handle,
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+                call.n,
+                call.m,
+                call.k,
+                std::ptr::from_ref(&alpha).cast(),
+                dev(call.w),
+                cudaDataType::CUDA_R_16BF,
+                call.k,
+                dev(call.act),
+                cudaDataType::CUDA_R_16BF,
+                call.k,
+                std::ptr::from_ref(&beta).cast(),
+                dev_mut(call.y),
+                cudaDataType::CUDA_R_16BF,
+                call.n,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                algo,
+            )
+        }
     }
 }
 
@@ -964,28 +970,33 @@ fn gemm_ex_f32(handle: cublasHandle_t, call: Call) -> cublasStatus_t {
     let (alpha, beta) = (1.0f32, 0.0f32);
     // SAFETY: `handle` is a live cuBLAS handle bound to the caller's stream;
     // the operands are device rows of the call's extents.
-    unsafe {
-        cublasGemmEx(
-            handle,
-            cublasOperation_t::CUBLAS_OP_T,
-            cublasOperation_t::CUBLAS_OP_N,
-            call.n,
-            call.m,
-            call.k,
-            std::ptr::from_ref(&alpha).cast(),
-            dev(call.w),
-            cudaDataType::CUDA_R_16BF,
-            call.k,
-            dev(call.act),
-            cudaDataType::CUDA_R_16BF,
-            call.k,
-            std::ptr::from_ref(&beta).cast(),
-            dev_mut(call.y),
-            cudaDataType::CUDA_R_32F,
-            call.n,
-            cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-        )
+    if crate::sizing::active() {
+        // A size-only walk (`crate::sizing`) runs no product.
+        cublasStatus_t::CUBLAS_STATUS_SUCCESS
+    } else {
+        unsafe {
+            cublasGemmEx(
+                handle,
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+                call.n,
+                call.m,
+                call.k,
+                std::ptr::from_ref(&alpha).cast(),
+                dev(call.w),
+                cudaDataType::CUDA_R_16BF,
+                call.k,
+                dev(call.act),
+                cudaDataType::CUDA_R_16BF,
+                call.k,
+                std::ptr::from_ref(&beta).cast(),
+                dev_mut(call.y),
+                cudaDataType::CUDA_R_32F,
+                call.n,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+        }
     }
 }
 
@@ -1401,25 +1412,30 @@ fn run_lt(
     // its heuristics; `alpha`/`beta` are host f32 locals. `ws` is a device slab
     // of `ws_bytes` (or null and 0) and `stream` live, as `run_tactic`'s callers
     // hold. The operands are the caller's `call`, as for `gemm_ex`.
-    let status = unsafe {
-        lt::cublasLtMatmul(
-            lt_handle,
-            plan.op_desc,
-            std::ptr::from_ref(&alpha).cast(),
-            dev(call.w),
-            plan.a_desc,
-            dev(call.act),
-            plan.b_desc,
-            std::ptr::from_ref(&beta).cast(),
-            dev(call.y),
-            plan.c_desc,
-            dev_mut(call.y),
-            plan.c_desc,
-            std::ptr::from_ref(algo),
-            ws,
-            ws_bytes,
-            stream.cast(),
-        )
+    let status = if crate::sizing::active() {
+        // A size-only walk (`crate::sizing`) runs no product.
+        lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
+    } else {
+        unsafe {
+            lt::cublasLtMatmul(
+                lt_handle,
+                plan.op_desc,
+                std::ptr::from_ref(&alpha).cast(),
+                dev(call.w),
+                plan.a_desc,
+                dev(call.act),
+                plan.b_desc,
+                std::ptr::from_ref(&beta).cast(),
+                dev(call.y),
+                plan.c_desc,
+                dev_mut(call.y),
+                plan.c_desc,
+                std::ptr::from_ref(algo),
+                ws,
+                ws_bytes,
+                stream.cast(),
+            )
+        }
     };
     status == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
 }
@@ -1515,25 +1531,30 @@ fn run_lt_epilogue(
     // SAFETY: as in `run_lt`, with `desc.0` the descriptor just set up;
     // `bias`, where the epilogue reads one, is the caller's `n`-long bf16
     // bias, non-zero by the test above.
-    let status = unsafe {
-        lt::cublasLtMatmul(
-            lt_handle,
-            desc.0,
-            std::ptr::from_ref(&alpha).cast(),
-            dev(call.w),
-            plan.a_desc,
-            dev(call.act),
-            plan.b_desc,
-            std::ptr::from_ref(&beta).cast(),
-            dev(call.y),
-            plan.c_desc,
-            dev_mut(call.y),
-            plan.c_desc,
-            std::ptr::from_ref(algo),
-            ws,
-            ws_bytes,
-            stream.cast(),
-        )
+    let status = if crate::sizing::active() {
+        // A size-only walk (`crate::sizing`) runs no product.
+        lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
+    } else {
+        unsafe {
+            lt::cublasLtMatmul(
+                lt_handle,
+                desc.0,
+                std::ptr::from_ref(&alpha).cast(),
+                dev(call.w),
+                plan.a_desc,
+                dev(call.act),
+                plan.b_desc,
+                std::ptr::from_ref(&beta).cast(),
+                dev(call.y),
+                plan.c_desc,
+                dev_mut(call.y),
+                plan.c_desc,
+                std::ptr::from_ref(algo),
+                ws,
+                ws_bytes,
+                stream.cast(),
+            )
+        }
     };
     if status != ok {
         clear_error();
@@ -1710,7 +1731,11 @@ impl Device {
             self.chosen.insert(key, tactic);
             return Some(tactic);
         }
-        if capturing != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone {
+        // A capture times nothing, nor does a size-only walk (`crate::sizing`),
+        // which keeps no pick it did not time either.
+        if capturing != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone
+            || crate::sizing::active()
+        {
             return None;
         }
         if (call.m as usize) * (call.n as usize) * 2 > 256 * 1024 * 1024 {

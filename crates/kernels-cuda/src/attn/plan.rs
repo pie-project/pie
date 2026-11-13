@@ -563,13 +563,18 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
         // `int_ptr` addresses `bytes.len()` writable device bytes is the
         // caller's to vouch for.
         let code = unsafe {
-            rt::cudaMemcpyAsync(
-                int_ptr as usize as *mut core::ffi::c_void,
-                from.cast(),
-                bytes.len(),
-                rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
-                ctx.stream().cast(),
-            )
+            if crate::sizing::active() {
+                // A size-only walk (`crate::sizing`) moves nothing.
+                rt::cudaError::cudaSuccess
+            } else {
+                rt::cudaMemcpyAsync(
+                    int_ptr as usize as *mut core::ffi::c_void,
+                    from.cast(),
+                    bytes.len(),
+                    rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                    ctx.stream().cast(),
+                )
+            }
         };
         if code != rt::cudaError::cudaSuccess {
             return Err(refuse(

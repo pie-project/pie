@@ -103,6 +103,10 @@ pub unsafe fn gemm(
     d: Operand,
 ) -> Result<(), Refused> {
     const CALL: &str = "rocblas_gemm_ex";
+    // A size-only walk (`crate::sizing`) runs no product.
+    if crate::sizing::active() {
+        return Ok(());
+    }
     let blas = blas(CALL)?;
     // SAFETY: `ALPHA` and `BETA` are statics rocBLAS reads as host f32 scalars;
     // the caller guarantees `handle` is live and each operand covers its shape.
@@ -155,6 +159,10 @@ pub unsafe fn gemm_strided(
     batch: i32,
 ) -> Result<(), Refused> {
     const CALL: &str = "rocblas_gemm_strided_batched_ex";
+    // A size-only walk (`crate::sizing`) runs no product.
+    if crate::sizing::active() {
+        return Ok(());
+    }
     let blas = blas(CALL)?;
     // SAFETY: as in [`gemm`], for each of the `batch` problems the caller
     // guarantees lie at the given strides.
@@ -212,6 +220,10 @@ pub unsafe fn gemm_batched(
     batch: i32,
 ) -> Result<(), Refused> {
     const CALL: &str = "rocblas_gemm_batched_ex";
+    // A size-only walk (`crate::sizing`) runs no product.
+    if crate::sizing::active() {
+        return Ok(());
+    }
     let blas = blas(CALL)?;
     // SAFETY: as in [`gemm`]; the caller guarantees each operand's array holds
     // `batch` live device addresses.
