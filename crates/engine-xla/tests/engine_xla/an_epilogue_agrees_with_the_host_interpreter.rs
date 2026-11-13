@@ -204,6 +204,7 @@ fn kept(device: &Device, plane: &[f32], rows: u32, layout: Vec<(u32, u32)>) -> K
             .collect(),
         readback: vec![None; layout.len()],
         pixels: (String::new(), Vec::new()),
+        host: None,
     }
 }
 

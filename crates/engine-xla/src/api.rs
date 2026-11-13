@@ -1296,6 +1296,7 @@ impl Xla {
                     Readout::Rows(rows) => Some(rows.as_slice()),
                     Readout::Last | Readout::None => None,
                 },
+                quiet: matches!(lane.readout, Readout::None),
                 rs_reset: lane.rs_reset,
                 rs_slot: lane.rs_slot,
                 rs: &verbs[at],

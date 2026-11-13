@@ -601,6 +601,19 @@ impl Buffer {
         Ok(Event::adopt(self.api.clone(), a.event))
     }
 
+    /// Copies the whole buffer, a buffer of 32-bit elements, into `words`
+    /// (resized to it; a reused vector's pages are not touched twice) and
+    /// waits for it.
+    pub fn download_words(&self, words: &mut Vec<f32>) -> Result<()> {
+        let bytes = self.host_bytes()?;
+        words.resize(bytes.div_ceil(4), 0.0);
+        // SAFETY: `words` holds at least `bytes` bytes, any bit pattern is an
+        // f32, and the vector is neither moved nor read until the wait below.
+        let dst = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), bytes) };
+        // SAFETY: `dst` stays valid and unaliased until the wait.
+        unsafe { self.download_into(dst) }?.wait()
+    }
+
     /// Copies the whole buffer to the host and waits for it.
     pub fn download(&self) -> Result<Vec<u8>> {
         let mut out = vec![0u8; self.host_bytes()?];

@@ -3,7 +3,7 @@
 //! read them there; a plane's host copy is made once, and only when
 //! something on the host reads it.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use eta_exec::Value;
 use poem_ir::{Dtype, InputAxis};
@@ -61,13 +61,10 @@ impl Plane {
     fn on_host(&self) -> Result<&Value, String> {
         self.host
             .get_or_init(|| {
-                let raw = self.buffer.download().map_err(|e| e.to_string())?;
-                let words = raw.as_chunks::<4>().0;
+                let words = download_words(&self.buffer)?;
                 Ok(match self.dtype {
-                    Dtype::I32 => {
-                        Value::I32(words.iter().map(|c| i32::from_le_bytes(*c)).collect())
-                    }
-                    _ => Value::F32(words.iter().map(|c| f32::from_le_bytes(*c)).collect()),
+                    Dtype::I32 => Value::I32(words.iter().map(|w| w.to_bits() as i32).collect()),
+                    _ => Value::F32(words),
                 })
             })
             .as_ref()
@@ -97,6 +94,87 @@ impl Plane {
     }
 }
 
+impl Drop for Plane {
+    fn drop(&mut self) {
+        if let Some(Ok(Value::F32(words))) = self.host.take() {
+            recycle(words);
+        }
+    }
+}
+
+/// Host buffers of planes dropped, kept for the next copy out: a fresh
+/// buffer of a wide plane is pages the kernel zeroes on first touch (v6e
+/// qwen35-d0.8b decode of 256 lanes: a 254 MB logits plane a readout).
+static SPARE: Mutex<Vec<Vec<f32>>> = Mutex::new(Vec::new());
+
+/// The most spare host buffers kept.
+const SPARES: usize = 2;
+
+fn recycle(words: Vec<f32>) {
+    if let Ok(mut spare) = SPARE.lock()
+        && spare.len() < SPARES
+    {
+        spare.push(words);
+    }
+}
+
+/// `buffer` copied out as 32-bit words, into a spare host buffer when one
+/// is kept (the largest; its tail cut off or grown).
+fn download_words(buffer: &Buffer) -> Result<Vec<f32>, String> {
+    let mut words = SPARE
+        .lock()
+        .ok()
+        .and_then(|mut spare| {
+            let at = (0..spare.len()).max_by_key(|&i| spare[i].len())?;
+            Some(spare.swap_remove(at))
+        })
+        .unwrap_or_default();
+    buffer
+        .download_words(&mut words)
+        .map_err(|e| e.to_string())?;
+    Ok(words)
+}
+
+/// The rows of the readout plane the lanes reading back to the host read,
+/// gathered by the fire into a short plane of their own: copied out in
+/// place of the whole plane when a lane's rows are all in it.
+pub struct HostRows {
+    /// The readout plane's index in `Kept::planes`.
+    pub plane: usize,
+    pub buffer: Buffer,
+    /// Per real lane: where its readout rows start in `buffer`.
+    pub at: Vec<Option<u32>>,
+    host: OnceLock<Result<Vec<f32>, String>>,
+}
+
+impl HostRows {
+    #[must_use]
+    pub fn new(plane: usize, buffer: Buffer, at: Vec<Option<u32>>) -> HostRows {
+        HostRows {
+            plane,
+            buffer,
+            at,
+            host: OnceLock::new(),
+        }
+    }
+
+    fn on_host(&self) -> Result<&[f32], String> {
+        self.host
+            .get_or_init(|| download_words(&self.buffer))
+            .as_ref()
+            .map(Vec::as_slice)
+            .map_err(Clone::clone)
+    }
+}
+
+impl Drop for HostRows {
+    fn drop(&mut self) {
+        if let Some(Ok(words)) = self.host.take() {
+            recycle(words);
+        }
+    }
+}
+
 pub type Rows<'a> = (&'a str, u32, Vec<f32>);
 
 pub struct Kept {
@@ -108,6 +186,8 @@ pub struct Kept {
     pub readback: Vec<Option<(usize, Vec<u32>)>>,
     /// The output a decoder's pixels are, and each real lane's on the host.
     pub pixels: (String, Vec<Vec<f32>>),
+    /// The host-reading lanes' readout rows, when the fire gathered them.
+    pub host: Option<HostRows>,
 }
 
 impl std::fmt::Debug for Kept {
@@ -172,6 +252,18 @@ impl Kept {
             return Ok(None);
         };
         let plane = &self.planes[*at];
+        if let Some(host) = self.host.as_ref().filter(|host| host.plane == *at)
+            && let Some(Some(start)) = host.at.get(lane)
+            && plane.layers <= 1
+        {
+            // The lane's rows are the readout rows of its seat, in order, as
+            // the fire laid them in the short plane.
+            let width = plane.width as usize;
+            let all = host.on_host()?;
+            let from = *start as usize * width;
+            let values = all[from..from + rows.len() * width].to_vec();
+            return Ok(Some((plane.name.as_str(), rows.len() as u32, values)));
+        }
         let values = match plane.rows_of(rows.iter().copied())? {
             Value::F32(values) => values,
             _ => return Ok(None),

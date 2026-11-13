@@ -248,6 +248,7 @@ impl Shell {
         }
         let traced_s = started.elapsed().as_secs_f64();
         let skipped = self.compile_deferred(deferred)?;
+        self.warm_gathers()?;
         let touched = shapes.iter().map(Vec::len).max().unwrap_or(0) as u32;
         for slot in 0..touched.min(self.held.len() as u32) {
             self.open(slot)?;
