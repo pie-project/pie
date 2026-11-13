@@ -53,6 +53,14 @@ mod backend {
     }
 }
 
+/// A test of a SPIR-V-only form: reported skipped here.
+macro_rules! spirv_only {
+    ($test:item) => {
+        #[ignore = "SPIR-V only: it folds through subgroups WGSL does not have"]
+        $test
+    };
+}
+
 #[path = "../../../engine-gpu/suite/attn/mod.rs"]
 mod attn;
 #[path = "../../../engine-gpu/suite/collective/mod.rs"]

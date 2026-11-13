@@ -53,6 +53,13 @@ mod backend {
     }
 }
 
+/// A test of a SPIR-V-only form: it runs here.
+macro_rules! spirv_only {
+    ($test:item) => {
+        $test
+    };
+}
+
 #[path = "../../../engine-gpu/suite/attn/mod.rs"]
 mod attn;
 #[path = "../../../engine-gpu/suite/collective/mod.rs"]

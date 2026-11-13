@@ -104,39 +104,37 @@ fn the_vector_point_answers_the_reference() {
     }
 }
 
-#[test]
-fn the_one_row_point_answers_the_reference() {
-    let Some(mut gpu) = Gpu::open() else {
-        eprintln!("not asked: no device");
-        return;
-    };
-    if !crate::backend::SPIRV {
-        eprintln!("not asked: the one-row point folds through subgroups, SPIR-V's");
-        return;
-    }
-    let width = gpu.subgroup();
-    let k = 512usize;
-    for (bits, group, n) in [(4u32, 64usize, 24usize), (8, 128, 21), (4, 32, 40)] {
-        let (w, weights) = bank(&mut gpu, (bits, group, n, k));
-        let (x, xr) = gpu.up(&noise(9, k));
-        let xt = t(x, 1, k, Dtype::Bf16);
-        let want = reference(&xr, &weights, 1, n, k);
-        for (lanes, rows) in [(32u32, 1u32), (32, 2), (16, 1), (16, 2), (8, 1), (8, 2)] {
-            if lanes > width {
-                continue;
+spirv_only! {
+    #[test]
+    fn the_one_row_point_answers_the_reference() {
+        let Some(mut gpu) = Gpu::open() else {
+            eprintln!("not asked: no device");
+            return;
+        };
+        let width = gpu.subgroup();
+        let k = 512usize;
+        for (bits, group, n) in [(4u32, 64usize, 24usize), (8, 128, 21), (4, 32, 40)] {
+            let (w, weights) = bank(&mut gpu, (bits, group, n, k));
+            let (x, xr) = gpu.up(&noise(9, k));
+            let xt = t(x, 1, k, Dtype::Bf16);
+            let want = reference(&xr, &weights, 1, n, k);
+            for (lanes, rows) in [(32u32, 1u32), (32, 2), (16, 1), (16, 2), (8, 1), (8, 2)] {
+                if lanes > width {
+                    continue;
+                }
+                landed(
+                    &mut gpu,
+                    &format!(
+                        "qmv row {bits} bits, group {group}, {n} columns, {lanes} lanes, {rows} a lane"
+                    ),
+                    &|g| vec![(g.zeros(n), n, false)],
+                    std::slice::from_ref(&want),
+                    &|g, o| {
+                        let y = t(o[0].0, 1, n, Dtype::Bf16);
+                        g.run(|c| qmm::matmul(c, &[Qmm::OneRow { lanes, rows }], xt, w, y, 1));
+                    },
+                );
             }
-            landed(
-                &mut gpu,
-                &format!(
-                    "qmv row {bits} bits, group {group}, {n} columns, {lanes} lanes, {rows} a lane"
-                ),
-                &|g| vec![(g.zeros(n), n, false)],
-                std::slice::from_ref(&want),
-                &|g, o| {
-                    let y = t(o[0].0, 1, n, Dtype::Bf16);
-                    g.run(|c| qmm::matmul(c, &[Qmm::OneRow { lanes, rows }], xt, w, y, 1));
-                },
-            );
         }
     }
 }
