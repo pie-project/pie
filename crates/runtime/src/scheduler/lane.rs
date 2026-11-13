@@ -386,11 +386,19 @@ impl Lane {
         let mut lane_turn = LaneTurn::default();
         let mut arming = super::arming::Arming::new(engine_idx, engine.as_ref(), lender);
         loop {
-            // Between fires: a raise waiting on a rung not armed gets one
-            // composition of it before the next request, however busy
-            // (REDESIGN 2.5, `super::arming`).
+            // Between fires: a raise waiting on a rung not armed has it
+            // armed before the next request, however busy (REDESIGN 2.5,
+            // `super::arming`). Its pass fires at the narrowest rung
+            // meanwhile, so every gap a step is left out costs it far more
+            // fires than the step costs the others; a step short of room
+            // ends the run until the raise funds it.
             if arming.raise_waits() {
-                arming.step(&mut engine, false);
+                loop {
+                    let stepped = arming.step(&mut engine, false);
+                    if stepped != super::arming::Step::Stepped || !arming.raise_waits() {
+                        break;
+                    }
+                }
             } else {
                 arming.unfund();
             }

@@ -305,7 +305,13 @@ impl RungWalk {
             .max()
             .unwrap_or(rungs[0]);
         let now = pool.rung();
-        if goal < now {
+        // Rungs whose activation takes as many chunks are one class: the
+        // pool sets aside the same span for each, and reports the widest
+        // ([`SlotPool::rung`]). A move within a class sets aside nothing
+        // new, so the walk only caps fires there, never lowers or raises.
+        let chunks = |rung: u32| pool.pool().act_chunks(rung);
+        let moves = chunks(goal) != chunks(now);
+        if goal < now && moves {
             if cap > goal {
                 self.lowering = None;
                 return Ok(RungStep::Cap(goal));
@@ -329,7 +335,7 @@ impl RungWalk {
             });
         }
         self.lowering = None;
-        if goal > now {
+        if goal > now && moves {
             let evacuation = pool.plan_raise(goal)?;
             return Ok(RungStep::Raise {
                 rung: goal,

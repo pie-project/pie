@@ -784,6 +784,23 @@ impl RsStore {
         out
     }
 
+    /// Device rows `rows` as the engine names them, one after another:
+    /// on a shared pool a record's pieces (fixed shapes in order) or a list
+    /// slot's ref, the null chunk's never among them; a pinned pool's rows
+    /// by their engine ids.
+    pub fn device_refs(&self, rows: &[RsSlotId]) -> Vec<u32> {
+        rows.iter()
+            .flat_map(|&row| {
+                let refs = self.pool_of(row).slot_refs(row);
+                if refs.is_empty() {
+                    vec![self.engine_id(row)]
+                } else {
+                    refs.into_iter().flat_map(|(_, refs)| refs).collect()
+                }
+            })
+            .collect()
+    }
+
     /// A shared pool's copy of device rows to host rows, `(device, host)`
     /// pairs, shape by shape: what `copy_slots` moves.
     pub fn tier_copies(

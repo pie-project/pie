@@ -112,17 +112,23 @@ impl PoolTarget for EnginePool {
         self.target().map_or(0, PoolTarget::floor)
     }
 
-    /// The pool's range, less what the engine and its driver hold beside
-    /// it now ([`::engine::live::Live`]: `outside`, `held`), never under
-    /// the floor.
+    /// The pool's range, less what the engine holds beside it for fires and
+    /// bodies now ([`::engine::live::Live::held`]), never under the floor.
+    /// The range stated at load already leaves out what the driver holds
+    /// (`outside`, a ledger term the policy reads, not subtracted here).
+    ///
+    /// While the engine holds any, the limit is whole segments: the segment
+    /// it only partly leaves is one whose top chunks the engine may still
+    /// use, so no sequence may be handed them.
     fn hard_limit(&self) -> u64 {
         self.target().map_or(0, |target| {
-            let live = crate::engine::live(self.engine);
-            let beside = live.outside().saturating_add(live.held());
-            target
-                .hard_limit()
-                .saturating_sub(beside)
-                .max(target.floor())
+            let held = crate::engine::live(self.engine).held();
+            if held == 0 {
+                return target.hard_limit();
+            }
+            let segment = target.segment_bytes().max(1);
+            let left = target.hard_limit().saturating_sub(held);
+            (left - left % segment).max(target.floor())
         })
     }
 
