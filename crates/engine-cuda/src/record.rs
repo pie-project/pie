@@ -1000,11 +1000,14 @@ impl Bodies {
         // opens a conditional node. An arming fire about to be captured
         // skips its walk: nothing reads a synthetic fire's rows, and the warm
         // fire before it made what the walk would (modules, tunes, slabs).
-        let cold = at.arming && at.cold && !self.map.cold_refused.contains(&key);
+        // A key whose cold capture was refused warms on its next fire: that
+        // fire walks before it captures, its first having walked nothing.
+        let refused = self.map.cold_refused.contains(&key);
+        let cold = at.arming && at.cold && !refused;
         let captures = at.arming
             && !self.map.sealed()
             && run.capturable()
-            && (cold || self.map.warmed(&key) + 1 >= WARM_FIRES);
+            && (cold || (!refused && self.map.warmed(&key) + 1 >= WARM_FIRES));
         if !captures {
             walk_capture(at, run, place, Streams::Warm)?;
         }

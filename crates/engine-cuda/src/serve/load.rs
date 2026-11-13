@@ -1265,6 +1265,7 @@ impl Shell {
             seat_to_end: engine.seat_to_end,
             seat_spread: engine.seat_spread,
             prefill_lanes: engine.prefill_lanes,
+            fire_lanes: engine.fire_lanes,
             lattice: (!stated_buckets && engine.prefill_lattice_from > 0).then_some((
                 engine.lattice_steps,
                 engine.prefill_lattice_from,

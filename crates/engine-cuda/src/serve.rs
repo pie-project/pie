@@ -118,6 +118,8 @@ pub struct Shell {
     seat_spread: bool,
     /// `engine.prefill_lanes`.
     prefill_lanes: u32,
+    /// `engine.fire_lanes` (`Shell::fire_lanes`).
+    fire_lanes: u32,
     /// The default lattice's `(steps, prefill_from, prefill_steps)` where no
     /// buckets were stated: what arming coarsens to fit the bodies' allowance
     /// (`Shell::fit_lattice`).
@@ -856,8 +858,19 @@ impl Shell {
 
     fn lane_ceiling(&self) -> u32 {
         (self.held.len() as u32)
-            .min(self.budget.max_lanes)
+            .min(self.fire_lanes())
             .min(self.budget.max_tokens)
+    }
+
+    /// The most lanes one fire carries: the load's lanes, or fewer where
+    /// `engine.fire_lanes` says so (the runtime fires a wider wave as fires
+    /// of this many). The load seats `budget.max_lanes` all the same.
+    #[must_use]
+    pub fn fire_lanes(&self) -> u32 {
+        match self.fire_lanes {
+            0 => self.budget.max_lanes,
+            cap => self.budget.max_lanes.min(cap),
+        }
     }
 
     pub fn fire(&mut self, lanes: &[Lane<'_>]) -> Result<Vec<Vec<f32>>> {
