@@ -95,6 +95,32 @@ pub struct SlabKey {
     pub scope: usize,
 }
 
+impl SlabKey {
+    /// Every key a fire may name this slab by on a context of `streams`
+    /// (its own first, then its side streams): a slab scoped to a stream is
+    /// one a stream, a region's shared slab one a lane (lane `i` runs on
+    /// stream `i`), and any other is its own. A walk fires on the first
+    /// stream and lane alone; a fire's regions run on every one.
+    #[must_use]
+    pub fn over(self, streams: &[usize]) -> Vec<SlabKey> {
+        // `Ctx::scratch_shared` keys lane `l` as the shared region less `l`.
+        const SHARED: u32 = u32::MAX - 1;
+        const LANES: u32 = 1 << 8;
+        let mut keys = vec![self];
+        if self.scope != 0 {
+            keys.extend(streams.iter().map(|&scope| SlabKey { scope, ..self }));
+        } else if self.region != u32::MAX && self.region >= SHARED - LANES {
+            keys.extend((0..streams.len() as u32).map(|lane| SlabKey {
+                region: SHARED - lane.min(LANES),
+                ..self
+            }));
+        }
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+}
+
 /// What a placed slab is aligned to.
 pub const PLACED_ALIGN: usize = 256;
 
