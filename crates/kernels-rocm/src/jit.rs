@@ -9,6 +9,15 @@ mod launch;
 
 #[cfg(feature = "rocm")]
 pub(crate) mod device;
+/// Without the HIP half there is no slab to take: a walk sizes nothing.
+#[cfg(not(feature = "rocm"))]
+pub(crate) mod device {
+    pub(crate) fn sizing_reset() {}
+
+    pub(crate) fn sizing_take() -> crate::sizing::Footprint {
+        crate::sizing::Footprint::default()
+    }
+}
 #[cfg(feature = "rocm")]
 pub mod hiprtc;
 mod root;
