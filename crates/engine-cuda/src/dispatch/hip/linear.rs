@@ -1029,6 +1029,10 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         let (codes, scales, biases) = self.planes(bank);
         let routes = self.tensor(routes);
+        // A bank the weight cache streams reads its experts through the
+        // cache's table; a bank on the expert tier's host copy is staged a
+        // call at a time.
+        let experts = self.bank_table(bank);
         if self.planes_in_lanes(bank) {
             return linear::moe::matmul_select_mxfp4_lanes(
                 self.ctx(),
@@ -1037,13 +1041,9 @@ impl Run<'_> {
                 scales,
                 routes,
                 &mut self.tensor(y),
-                linear::moe::ExpertTable::RESIDENT,
+                experts,
             );
         }
-        // A bank the weight cache streams reads its experts through the
-        // cache's table; a bank on the expert tier's host copy is staged a
-        // call at a time.
-        let experts = self.bank_table(bank);
         let (codes, scales, biases, routes) = if experts.tabled() {
             (codes, scales, biases, routes)
         } else {

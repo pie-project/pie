@@ -485,7 +485,7 @@ fn a_lane_order_or_fp8_select_lands_the_same_bits_through_any_table() {
             routes: &r,
             y,
         };
-        same_bits(&g, &case, &ctx, Host::Refused, |at, tables| {
+        same_bits(&g, &case, &ctx, Host::Same, |at, tables| {
             let mut y = y;
             moe::matmul_select_mxfp4_lanes(at, x, lc, ls, rt, &mut y, tables[0]).map(|()| true)
         });

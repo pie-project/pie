@@ -803,6 +803,13 @@ impl Tier {
             .map(|plane| plane.at)
     }
 
+    /// Whether `param` is left in the serving file ([`Plan::filed`]): its
+    /// copy is the file's read-only mapping.
+    #[must_use]
+    pub fn filed(&self, param: usize) -> bool {
+        self.plan.filed(param)
+    }
+
     #[must_use]
     pub fn offloaded_at(&self, param: usize) -> Option<u64> {
         self.pinned_at(param).or_else(|| self.mapped_at(param))
