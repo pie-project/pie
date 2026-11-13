@@ -540,11 +540,15 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
         if !read {
             continue;
         }
+        // `weights::hip::order_mxfp4_banks` lays a bank in lane order where
+        // its rows are whole 16-row strips and its K whole 128-code units
+        // (K a row's bytes twice: the codes' trailing dims).
         if cfg!(feature = "rocm")
             && param.dtype == poem_ir::Dtype::Mxfp4
             && planes.get(2).is_none_or(Option::is_none)
             && param.shape.len() >= 3
             && param.shape[1] % 16 == 0
+            && (2 * param.shape[2..].iter().product::<u64>()) % 128 == 0
         {
             continue;
         }
