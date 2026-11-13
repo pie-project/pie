@@ -1482,3 +1482,12 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   w8a16 GEMM takes the deepest ring that fits (cuBLAS fallback) -> dsv4.1 two-window mini fires on sm_89 / sm_120
   (was 0/10 armed; main refuses it too). Eager window-list goldens bitwise (base / two lists / one list). Open:
   bodies-mode base vs by_refs differ from the first window-crossing prefill on this fp8 path (bf16 dsv4 is bitwise).
+
+### M120 — 2026-11-13: origin/main merged (for the PR)
+- `sc/main-merge` (923292885, TPU): origin/main 30abc9d5a (27 commits, mostly XLA kernels #1612-#1637, gemma-4
+  shared tail #1618, ROCm hash routes #1611). Resolutions keep new-memory's pool views / row order / readout gather
+  under main's new kernels: chunk-kernel signature (stored, blocked, pooled), main's row-block GDN path given pooled
+  handling (else it copies the pool), flash readouts take the page maps. v6e: dense / wide / routed / windowed /
+  parked / wide-decode / epilogue bitwise vs pre-merge; hybrids differ only by main's own #1627 / #1612 arithmetic
+  (bitwise with those arms forced). Workspace --all-targets, engine-cuda cuda/rocm, pie cuda/xla/vulkan+wgpu check
+  clean; runtime / XLA lib tests pass.
