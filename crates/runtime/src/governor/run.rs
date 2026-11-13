@@ -77,7 +77,9 @@ impl Steer {
             self.governor.set_hard_limit(hard_limit);
             tracing::info!(
                 hard_limit,
-                held = pool.held(),
+                // The bytes under the pool's mapped segments, not the
+                // engine's `Live::held`.
+                mapped = pool.held(),
                 "the pool's hard limit moves with what the engine holds beside it"
             );
         }
@@ -185,14 +187,15 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
         // Chunks are handed out of mapped segments only: a pool mapped
         // past its limit is what lets a sequence or a lease onto chunks the
         // engine still holds.
-        let (held, hard_limit) = (pool.held(), steer.governor().limits().hard_limit);
-        let past = shared && held > hard_limit;
+        // `mapped`: the bytes under the pool's mapped segments.
+        let (mapped, hard_limit) = (pool.held(), steer.governor().limits().hard_limit);
+        let past = shared && mapped > hard_limit;
         if past && !warned {
-            tracing::warn!(held, hard_limit, "the pool is mapped past its hard limit");
+            tracing::warn!(mapped, hard_limit, "the pool is mapped past its hard limit");
         }
         if !past && warned {
             tracing::info!(
-                held,
+                mapped,
                 hard_limit,
                 "the pool is mapped within its hard limit again"
             );
