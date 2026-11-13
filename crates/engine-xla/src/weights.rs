@@ -699,7 +699,9 @@ fn gemm_only(
         inputs.clear();
         node.op.inputs(&mut inputs);
         let w = match &node.op {
-            // The one fused op XLA forms (`crate::FUSIONS`) holds no matmul.
+            // A dense GeGLU's gate-up (`crate::FUSIONS`) reads its weight as
+            // the gemm it fuses does.
+            Operation::Fused(poem_ir::Fused::MatmulGlu { w, .. }) => vec![*w],
             Operation::Linear(
                 Linear::Matmul {
                     w,

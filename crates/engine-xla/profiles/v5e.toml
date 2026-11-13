@@ -4,9 +4,9 @@ api = 1
 assumes = { generation = 5, hbm_gib = 16 }
 
 # as on v6e: on the powers-of-two ladder a 512-token prompt (and its template) ran a 1024-row fire;
-# 128-row rungs from 512 run it at 640
+# 128-row rungs from 512 run it at 640, and from 1024 three 553-token prompts at 1664 rows, not 1792
 [engine]
-pad.row_steps = 4
+pad.row_steps = 8
 # a process starts only while the pools hold the started ones to the pages a finished one held, a
 # decoding lane's pages before a waiting prompt's, the starts past them spread over a life: the engine
 # keeps no kv on the host, and gemma-4-E4B's 548 pages restarted the processes they ran short for
@@ -33,11 +33,41 @@ attn.decode_pages = 64
 # heads took 896 us a layer (482 now), Qwen3.6-27B's 48 heads 2464 (1285); under 16 lanes the VPU's is
 # as fast
 ssm.step_mxu = 16
+# a prompt fire of up to 64 lanes takes its GDN rows where they lie, a step a 64-row block, each lane's piece
+# of it in turn: no chunk of q|k|v rows gathered and no output gathered back (Qwen3.6-27B's 2816-row fire of
+# five prompts: a GDN layer 1148 -> 723 us, pf256-512 at 2816 rows 24.7k -> 25.3k tok/s; 1792 rows of three
+# 668 -> 446; Qwen3.5-0.8B 2048 rows 326 -> 212)
+ssm.row_blocks = 64
+# a prefill's flash kernel takes 128 query rows a block for 128-wide heads, not 256: fewer key blocks
+# past a row block's own prompt where a fire's prompts meet, and the v5e's softmax holds its VPU
+# (Qwen3-0.6B pf256-512 1792-row fires: 106.1k -> 108.2k tok/s; a v6e loses 10%, so it stays at 256)
+attn.flash_narrow_rows = 128
+# a prompt fire of 2304 rows and more lays its GLU rows and gated-norm rows out before the dots that read
+# them: fused into the dots, they cost Qwen3.8-27B's mini8 cut's 2816-row fires 124.2 ms (the down
+# product at 68-75% of the MXU's rate), laid out 116.4 (96%); pf32-512 at 2816 rows 22.5k -> 23.9k tok/s
+linear.dot_barrier_rows = 2304
 # a routed MLP's prompt of 1280 tokens and more sums each block of 128 tokens' runs of expert rows by its
 # own dot, as on v6e, not by the pick (Gemma-4-26B-A4B's 32-expert cut, 1664 tokens: 2132 -> 1734 us;
 # Qwen3.6-35B-A3B's 16-expert cut 995 -> 936); at 1088 Qwen's pick is cheaper (690 vs 725)
 moe.segment_tokens = 128
 moe.segment_from = 1280
+# a routed MLP's prompt of 1024 tokens and more takes two of an expert's row tiles a grid step, its gate-up
+# kernel landing the GLU: Qwen3.6-35B-A3B's 16-expert cut 2176 tokens 1043 -> 959 us, 1792 819 -> 802;
+# Gemma-4-26B-A4B's 32-expert cut 1792 1702 -> 1532, 1024 984 -> 931 (at four a step its gate-up is twice as slow)
+moe.gmm_run = 2
+moe.gmm_run_from = 1024
+moe.gmm_glu = 1
+# and runs both legs as one kernel there, the GLU rows staying in VMEM: Qwen3.6's 16-expert cut 1024 tokens
+# 497 -> 443 us, 1792 803 -> 762 (2176: 958 -> 1005); Gemma's 1792 1532 -> 1522, 2176 1888 -> 1868 (1024: 929 -> 960)
+moe.gmm_fuse_from = 1024
+# a row norm 3072 wide and more, from 1152 rows to under 2048, lands a gemm's rows before it and its own rows
+# after it: its sum of squares fused into the dot before slowed that dot (Gemma-4-31B cut's 1664-row down dot
+# 2.46 -> 2.20 ms; 1152 rows 1.64 -> 1.47; at 2048 the fused one is faster, 2.66 against 2.85), and so did the
+# norm fused into the dots after (pf32-512: 31B cut 25.8k -> 26.6k, 12B cut 28.6k -> 29.4k)
+norm.land_from = 1152
+norm.land_below = 2048
+# a prompt's q and k head norms and their rope run as one kernel (Gemma-4-31B cut's 1664-row fire 62.2 -> 60.9 ms, pf32-512 26.6k -> 27.2k)
+norm.rope_from = 640
 
 [provenance]
 measured = [
@@ -47,9 +77,19 @@ measured = [
   "engine.seat_to_end",
   "engine.seated_first",
   "kernel.attn.decode_pages",
+  "kernel.attn.flash_narrow_rows",
   "kernel.attn.unrolled_blocks",
+  "kernel.linear.dot_barrier_rows",
   "kernel.moe.cost.onehot_mi",
+  "kernel.moe.gmm_fuse_from",
+  "kernel.moe.gmm_glu",
+  "kernel.moe.gmm_run",
+  "kernel.moe.gmm_run_from",
   "kernel.moe.segment_from",
   "kernel.moe.segment_tokens",
+  "kernel.norm.land_below",
+  "kernel.norm.land_from",
+  "kernel.norm.rope_from",
+  "kernel.ssm.row_blocks",
   "kernel.ssm.step_mxu",
 ]

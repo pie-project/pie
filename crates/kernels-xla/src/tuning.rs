@@ -61,6 +61,14 @@ pub struct MoeGmmTm(pub u32);
 #[decision(id = "kernel.moe.gmm_run", constant(set(1, 2, 4, 8)), default = 1, tune = search)]
 pub struct MoeGmmRun(pub u32);
 
+/// The fewest tokens a fire holds for its routed MLP's grouped matmuls to
+/// take `kernel.moe.gmm_run` tiles a step: below them a step takes one (v5e:
+/// Gemma-4-26B-A4B's 32-expert cut at 640 tokens 838 -> 862 us at two a
+/// step, at 1024 984 -> 965).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.gmm_run_from", constant(range(0..=8192)), default = 0, tune = search)]
+pub struct MoeGmmRunFrom(pub u32);
+
 /// Weight bytes one block of the grouped-matmul kernel holds, in MiB (two
 /// are in flight, plus a bf16 copy): bigger blocks take fewer DMA steps and
 /// more VMEM.
@@ -72,7 +80,7 @@ pub struct MoeGmmBlockMib(pub u32);
 /// row): each block copies the runs its tokens hold of each expert's rows
 /// and sums them by its own dot (`moe_gmm::SegmentSum`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.moe.segment_tokens", constant(set(0, 128)), default = 0, tune = search)]
+#[decision(id = "kernel.moe.segment_tokens", constant(set(0, 128, 256)), default = 0, tune = search)]
 pub struct MoeSegmentTokens(pub u32);
 
 /// The fewest tokens a fire holds for its routed MLP's sum to take the
@@ -89,6 +97,13 @@ pub struct MoeSegmentFrom(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.gmm_glu", constant(set(0, 1)), default = 0, tune = search)]
 pub struct MoeGmmGlu(pub u32);
+
+/// The fewest tokens a fire holds for its routed MLP's two legs to run as
+/// one kernel (`moe_gmm::Gmm::mlp_kernel`, its GLU rows kept in VMEM between
+/// them); 0: never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.gmm_fuse_from", constant(range(0..=8192)), default = 0, tune = search)]
+pub struct MoeGmmFuseFrom(pub u32);
 
 macro_rules! moe_costs {
     ($($ty:ident = $id:literal, $lo:literal ..= $hi:literal, $default:literal, $doc:literal;)*) => {
@@ -153,6 +168,54 @@ pub enum QuantDecode {
 #[decision(id = "kernel.rope.flat_rows", constant(set(0, 1024, 2048, 4096)), default = 0, tune = search)]
 pub struct RopeFlatRows(pub u32);
 
+/// From this many rows a dense GeGLU lands its rows (in bf16) before the
+/// down dot that reads them, not left to XLA to fuse into that dot's
+/// operand: on a v6e the fused GLU slows the MXU by more than the GLU's own
+/// pass costs (Gemma-4-31B's 2304-row `[21504, 5376]` down dot: 0.96 ms
+/// with the GLU fused, 0.66 ms plain). 0 never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.glu.land_from", constant(set(0, 512, 1024, 2048)), default = 0, tune = search)]
+pub struct GluLandFrom(pub u32);
+/// From this many rows, a dot's activation 6144 wide or more is laid out
+/// whole before the dot (`linear::gemm`); 0 never is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.linear.dot_barrier_rows", constant(set(0, 1024, 2048, 2304, 4096)), default = 0, tune = search)]
+pub struct DotBarrierRows(pub u32);
+
+/// From this many rows a dense gemm's rows a row norm reads land behind a
+/// barrier before the norm, not left to XLA to fuse the norm's sum of
+/// squares into the dot: on a v5e that second output slows the dot
+/// (Gemma-4-31B's 1664-row `[21504, 5376]` down dot: 2.46 ms with the sum
+/// fused, 2.20 ms plain). 0 never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.norm.land_from", constant(set(0, 1024, 1152)), default = 0, tune = search)]
+pub struct NormLandFrom(pub u32);
+
+/// Below this many rows only (0: no bound) a gemm's rows land before their
+/// norm (see [`NormLandFrom`]): at 2048 rows a v5e's fused sum is the faster
+/// (31B's down dot 2.66 ms fused, 2.85 landed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.norm.land_below", constant(set(0, 2048)), default = 0, tune = search)]
+pub struct NormLandBelow(pub u32);
+
+/// From this many rows a dense GeGLU's packed gate-up projection and its GLU
+/// run as one Mosaic kernel (`linear::glu_gemm`), not XLA's dot and a GLU
+/// pass: on a v6e XLA's dot runs Gemma-4-31B's 2304-row `[5376, 43008]`
+/// gate-up at ~82% of the MXU, the kernel at 94%, and no product lands. 0
+/// never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.glu.gemm_from", constant(set(0, 1024, 2048)), default = 0, tune = search)]
+pub struct GluGemmFrom(pub u32);
+/// From this many rows a rope over the heads a per-head rms norm landed
+/// turns the rows that norm read, norming each head in the same Mosaic
+/// kernel (`elemwise::rope::normed`), not the norm's kernel landing them for
+/// the rope to read again (Gemma-4-31B's rope alone: 1.1 ms a 1664-row fire
+/// of a 6-layer cut on a v5e, 2.7 ms a 2304-row fire of 18 layers on a
+/// v6e). 0 never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.norm.rope_from", constant(set(0, 640, 1024)), default = 0, tune = search)]
+pub struct NormRopeFrom(pub u32);
+
 /// Up to this many rows per lane, an `auto` attention walk gathers each
 /// row's keys; past it, row blocks walk the key axis. 0 always blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -188,6 +251,14 @@ pub struct AttnBlockKeys(pub u32);
 #[decision(id = "kernel.attn.unrolled_blocks", constant(range(1..=16)), default = 16, tune = search)]
 pub struct AttnUnrolledBlocks(pub u32);
 
+/// Query rows a block of the prefill flash kernel takes for heads 128 wide
+/// and narrower. A smaller block reads fewer key blocks past a row block's
+/// own prompt where a fire's prompts meet; where the softmax holds the VPU
+/// (a v5e) that wins, where the MXU's 256 rows want filling (a v6e) it loses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.attn.flash_narrow_rows", constant(set(128, 256)), default = 256, tune = search)]
+pub struct AttnFlashNarrowRows(pub u32);
+
 /// Tokens per chunk of the scalar-decay (GDN) chunked scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.ssm.chunk", constant(set(16, 32, 64, 128, 256)), default = 64, tune = search)]
@@ -205,6 +276,13 @@ pub struct SsmLongChunk(pub u32);
 #[decision(id = "kernel.ssm.step_mxu", constant(set(0, 8, 16, 32, 64)), default = 0, tune = search)]
 pub struct SsmStepMxu(pub u32);
 
+/// Up to this many segments a prefill fire's GDN chunk kernel takes the
+/// fire's rows where they lie, a step a block of them (`ssm::chunk`), not
+/// each segment's chunks gathered and their outputs gathered back. 0 never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.row_blocks", constant(set(0, 16, 64)), default = 0, tune = search)]
+pub struct SsmRowBlocks(pub u32);
+
 /// Tokens per chunk of the per-channel-decay (KDA) chunked scan, whose
 /// intra-chunk decay is a `[C, C, d]` product.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -218,10 +296,12 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeLoopTileMax>()
         .add::<MoeGmmTm>()
         .add::<MoeGmmRun>()
+        .add::<MoeGmmRunFrom>()
         .add::<MoeGmmBlockMib>()
         .add::<MoeSegmentTokens>()
         .add::<MoeSegmentFrom>()
         .add::<MoeGmmGlu>()
+        .add::<MoeGmmFuseFrom>()
         .add::<MoeDenseAllMi>()
         .add::<MoeSliceMib>()
         .add::<MoeSlicePairs>()
@@ -237,12 +317,20 @@ pub fn register(registry: &mut Registry) {
         .add::<AttnDecodePages>()
         .add::<AttnBlockRows>()
         .add::<RopeFlatRows>()
+        .add::<GluLandFrom>()
+        .add::<NormLandFrom>()
+        .add::<NormLandBelow>()
+        .add::<NormRopeFrom>()
+        .add::<DotBarrierRows>()
+        .add::<GluGemmFrom>()
         .add::<AttnBlockKeys>()
         .add::<AttnUnrolledBlocks>()
+        .add::<AttnFlashNarrowRows>()
         .add::<SsmChunk>()
         .add::<SsmLongChunk>()
         .add::<SsmKdaChunk>()
-        .add::<SsmStepMxu>();
+        .add::<SsmStepMxu>()
+        .add::<SsmRowBlocks>();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -282,6 +370,9 @@ pub struct Chunks {
     /// Rows from which a decode takes the page-copy kernel (see
     /// [`AttnDecodePages`]).
     pub decode_pages: i64,
+    /// A flash prefill block's query rows for narrow heads (see
+    /// [`AttnFlashNarrowRows`]).
+    pub flash_narrow_rows: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,6 +383,9 @@ pub struct SsmChunks {
     /// The lanes from which a GDN decode step runs through the MXU
     /// ([`SsmStepMxu`]).
     pub step_mxu: i64,
+    /// The most segments a fire's GDN takes in row blocks
+    /// ([`SsmRowBlocks`]); 0 never.
+    pub row_blocks: i64,
 }
 
 /// The kernel decisions one load runs under, and the device's VMEM.
@@ -302,14 +396,32 @@ pub struct Tuning {
     pub moe_loop_tile_max: i64,
     pub moe_gmm_tm: i64,
     pub moe_gmm_run: i64,
+    pub moe_gmm_run_from: i64,
     pub moe_gmm_block_bytes: i64,
     pub moe_segment_tokens: i64,
     pub moe_segment_from: i64,
     pub moe_gmm_glu: bool,
+    pub moe_gmm_fuse_from: i64,
     pub moe_costs: MoeCosts,
     pub grouped: Grouped,
     pub attn_per_row_max: i64,
     pub rope_flat_rows: i64,
+    /// Rows from which a dense GeGLU lands before its down dot (see
+    /// [`GluLandFrom`]); 0 never.
+    pub glu_land_from: i64,
+    /// Rows from which a row norm's input lands before the norm (see
+    /// [`NormLandFrom`]); 0 never.
+    pub norm_land_from: i64,
+    /// Rows from which a gemm's rows no longer land before their norm; 0
+    /// none.
+    pub norm_land_below: i64,
+    /// Rows from which a per-head norm's rope norms the rows it turns (see
+    /// [`NormRopeFrom`]); 0 never.
+    pub norm_rope_from: i64,
+    pub dot_barrier_rows: i64,
+    /// Rows from which a dense GeGLU's gate-up and GLU run as one kernel
+    /// (see [`GluGemmFrom`]); 0 never.
+    pub glu_gemm_from: i64,
     pub chunks: Chunks,
     pub ssm: SsmChunks,
     pub vmem_bytes: i64,
@@ -325,10 +437,12 @@ impl Tuning {
         moe_loop_tile_max: 128,
         moe_gmm_tm: 16,
         moe_gmm_run: 1,
+        moe_gmm_run_from: 0,
         moe_gmm_block_bytes: 12 << 20,
         moe_segment_tokens: 0,
         moe_segment_from: 1024,
         moe_gmm_glu: false,
+        moe_gmm_fuse_from: 0,
         moe_costs: MoeCosts {
             dense_all: 1 << 27,
             slice_bytes: 18 << 20,
@@ -346,6 +460,12 @@ impl Tuning {
         },
         attn_per_row_max: 2,
         rope_flat_rows: 0,
+        glu_land_from: 0,
+        norm_land_from: 0,
+        norm_land_below: 0,
+        norm_rope_from: 0,
+        dot_barrier_rows: 0,
+        glu_gemm_from: 0,
         chunks: Chunks {
             budget: 1 << 24,
             block_rows: 512,
@@ -353,12 +473,14 @@ impl Tuning {
             unrolled: 16,
             window_reach: true,
             decode_pages: 0,
+            flash_narrow_rows: 256,
         },
         ssm: SsmChunks {
             chunk: 64,
             long_chunk: 128,
             kda_chunk: 16,
             step_mxu: 0,
+            row_blocks: 0,
         },
         vmem_bytes: Self::V6E_VMEM,
     };
@@ -372,10 +494,12 @@ impl Tuning {
             moe_loop_tile_max: n(profile.get::<MoeLoopTileMax>().0),
             moe_gmm_tm: n(profile.get::<MoeGmmTm>().0),
             moe_gmm_run: n(profile.get::<MoeGmmRun>().0),
+            moe_gmm_run_from: n(profile.get::<MoeGmmRunFrom>().0),
             moe_gmm_block_bytes: n(profile.get::<MoeGmmBlockMib>().0) << 20,
             moe_segment_tokens: n(profile.get::<MoeSegmentTokens>().0),
             moe_segment_from: n(profile.get::<MoeSegmentFrom>().0),
             moe_gmm_glu: profile.get::<MoeGmmGlu>().0 == 1,
+            moe_gmm_fuse_from: n(profile.get::<MoeGmmFuseFrom>().0),
             moe_costs: MoeCosts {
                 dense_all: n(profile.get::<MoeDenseAllMi>().0) << 20,
                 slice_bytes: n(profile.get::<MoeSliceMib>().0) << 20,
@@ -402,6 +526,12 @@ impl Tuning {
             },
             attn_per_row_max: n(profile.get::<AttnPerRowMax>().0),
             rope_flat_rows: n(profile.get::<RopeFlatRows>().0),
+            glu_land_from: n(profile.get::<GluLandFrom>().0),
+            norm_land_from: n(profile.get::<NormLandFrom>().0),
+            norm_land_below: n(profile.get::<NormLandBelow>().0),
+            norm_rope_from: n(profile.get::<NormRopeFrom>().0),
+            dot_barrier_rows: n(profile.get::<DotBarrierRows>().0),
+            glu_gemm_from: n(profile.get::<GluGemmFrom>().0),
             chunks: Chunks {
                 budget: n(profile.get::<AttnBudgetMi>().0) << 20,
                 block_rows: n(profile.get::<AttnBlockRows>().0),
@@ -409,12 +539,14 @@ impl Tuning {
                 unrolled: n(profile.get::<AttnUnrolledBlocks>().0),
                 window_reach: true,
                 decode_pages: n(profile.get::<AttnDecodePages>().0),
+                flash_narrow_rows: n(profile.get::<AttnFlashNarrowRows>().0),
             },
             ssm: SsmChunks {
                 chunk: n(profile.get::<SsmChunk>().0),
                 long_chunk: n(profile.get::<SsmLongChunk>().0),
                 kda_chunk: n(profile.get::<SsmKdaChunk>().0),
                 step_mxu: n(profile.get::<SsmStepMxu>().0),
+                row_blocks: n(profile.get::<SsmRowBlocks>().0),
             },
             vmem_bytes,
         }

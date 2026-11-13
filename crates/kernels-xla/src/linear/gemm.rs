@@ -178,6 +178,10 @@ const MXU_ROWS: i64 = 8;
 /// ahead of it.
 const WIDE_WEIGHT_BYTES: i64 = 64 << 20;
 
+/// The narrowest contraction whose activation `Func::dot_barrier_rows` lays
+/// out before its dot (a 27B's GDN output, 6144 wide, and its GLU rows).
+const BARRIER_WIDTH: i64 = 6144;
+
 /// `act · wᵀ` in f32, `[y.rows, w.rows]`.
 ///
 /// A one-row product is a vector against the matrix, which XLA rewrites as a
@@ -192,6 +196,17 @@ fn dense_f32(f: &mut Func, act: Operand, w: Operand, rows: u32) -> Result<Val, E
     let x = head_rows(f, x, rows)?;
     let wv = w.val;
     let m = i64::from(rows);
+    // A wide activation of `Func::dot_barrier_rows` rows and more is laid
+    // out before its dot: XLA fuses its producer (a GLU, a gated norm) into
+    // the dot's operand otherwise, and the fused dot loses MXU time to it,
+    // more the more rows (v5e Qwen3.8-27B mini8, 2816-row fires: 124.2 ->
+    // 116.4 ms).
+    let from = f.dot_barrier_rows();
+    let x = if from > 0 && m >= from && f.dims(x)[1] >= BARRIER_WIDTH {
+        f.barrier(x)
+    } else {
+        x
+    };
     let wbytes = f.ty(wv).elements() * i64::from(f.elem(wv).bits()) / 8;
     if m >= MXU_ROWS || wbytes < WIDE_WEIGHT_BYTES {
         return project(f, x, wv, false);

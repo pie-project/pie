@@ -302,6 +302,10 @@ impl<'h> Tracer<'h> {
             .borrow_mut()
             .func
             .set_rope_flat_rows(tuning.rope_flat_rows);
+        self.state
+            .borrow_mut()
+            .func
+            .set_dot_barrier_rows(tuning.dot_barrier_rows);
         self
     }
 

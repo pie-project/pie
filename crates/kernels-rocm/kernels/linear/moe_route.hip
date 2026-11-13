@@ -43,6 +43,20 @@ __global__ void hash_route_gather(const i32* __restrict__ token_ids, const i64* 
     for (int r = 0; r < top_k; ++r) ws[r] *= scale;
 }
 
+// The routed rows whose route names no expert of the bank zeroed (a hash
+// table's pick past a miniature's experts, a route every select skips), so
+// a sum of the routes adds nothing for it. One block a route row.
+template <class T>
+__global__ void zero_dropped_routes(const i32* __restrict__ routes, T* __restrict__ y, int n, int num_experts,
+                                    int top_k, const u32* __restrict__ win) {
+    const Window window{win};
+    if (!window.live(blockIdx.x, top_k)) return;
+    const long long row = window.plane(blockIdx.x, top_k);
+    const i32 e = routes[row];
+    if (e >= 0 && e < num_experts) return;
+    for (int h = threadIdx.x; h < n; h += blockDim.x) y[row * n + h] = from_f32<T>(0.f);
+}
+
 // routes[n][slot] = slot: every token visits every group once.
 __global__ void group_routes(i32* __restrict__ routes, int tokens, int groups, const u32* __restrict__ win) {
     const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;

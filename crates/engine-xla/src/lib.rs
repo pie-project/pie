@@ -36,7 +36,13 @@ pub use error::{Fault, Result, kernel};
 pub use serve::{Boot, Fired, Lane, Media, Seated, Shell};
 
 /// The fusions this backend implements: the routed MLP on one sort
-/// (`kernels_xla::linear::moe::experts`), its parts run one by one where the
-/// kernel declines it.
+/// (`kernels_xla::linear::moe::experts`) and a dense GeGLU's gate-up with its
+/// GLU (`kernels_xla::linear::glu_gemm`), their parts run one by one where
+/// the kernel declines them.
 pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
-    std::sync::LazyLock::new(|| vec![poem_compiler::fuse::rules::moe_experts()]);
+    std::sync::LazyLock::new(|| {
+        vec![
+            poem_compiler::fuse::rules::moe_experts(),
+            poem_compiler::fuse::rules::matmul_glu(&[poem_ir::GluAct::GegluTanh]),
+        ]
+    });

@@ -19,14 +19,28 @@ rope.flat_rows = 1024
 # a routed MLP's grouped matmul takes up to four of an expert's row tiles a step through one dot
 # (Gemma-4-26B-A4B's 32-expert cut, 1792-row fire: 1228 -> 1022 us a layer, bit for bit)
 moe.gmm_run = 4
-# a routed MLP's prompt sums each block of 128 tokens' runs of expert rows by its own dot, not one one-hot dot
-# over every row (Gemma-4-26B-A4B's 32-expert cut, 1792-row fire: the sum 288 us a layer)
-moe.segment_tokens = 128
+# a routed MLP's prompt sums each block of 256 tokens' runs of expert rows by its own dot, not one one-hot dot
+# over every row (Gemma-4-26B-A4B's 32-expert cut, 1792-row fire: the sum 288 us a layer; 128-token blocks copy
+# their runs' partial chunks twice as often: 2176 tokens 763 -> 753 us a layer at 256)
+moe.segment_tokens = 256
 # a routed MLP's gate-up kernel lands its rows' GLU, each times its weight, at 64-row tiles and more (Gemma-4-26B-
 # A4B's cut, 1792 rows: 833 -> 788 us; Qwen3.6-35B-A3B's 660 -> 618; its 256-lane decode 359 -> 337)
 moe.gmm_glu = 1
+# a routed MLP's prompt of 1024 tokens and more runs its gate-up and down legs as one kernel, the GLU rows staying in
+# VMEM between them (Gemma-4-26B-A4B's 32-expert cut, 2176 tokens: 761 -> 736 us a layer, 1024: 514 -> 493;
+# Qwen3.6-35B-A3B's 2176: 523 -> 504, 1792 equal; at 640 tokens one kernel is 10% slower)
+moe.gmm_fuse_from = 1024
 # a decode of 64 rows and more reads each row's own pages through the page-copy kernel
 attn.decode_pages = 64
+# a prompt's GeGLU rows land before the down dot reads them, not fused into its operand (Gemma-4-31B cut's
+# 2304-row fire 74.8 -> 72.2 ms, pf256-512 28.3k -> 29.3k tok/s)
+glu.land_from = 1024
+# and from 1024 rows its gate-up and GLU run as one Mosaic kernel, the fire's rows whole against 512-wide
+# blocks of each half (Gemma-4-31B's 2304-row gate-up: 1.62 ms dot and GLU pass -> 1.24 ms)
+glu.gemm_from = 1024
+# and a prompt's q and k per-head norms and their rope run as one Mosaic kernel (Gemma-4-31B cut pf256-512
+# 32.4k -> 33.7k tok/s)
+norm.rope_from = 1024
 
 [provenance]
 measured = [
@@ -36,6 +50,9 @@ measured = [
   "kernel.attn.budget_mi",
   "kernel.attn.decode_pages",
   "kernel.attn.per_row_max",
+  "kernel.glu.gemm_from",
+  "kernel.glu.land_from",
+  "kernel.norm.rope_from",
   "kernel.moe.cost.dense_all_mi",
   "kernel.moe.cost.loop_row_ns",
   "kernel.moe.cost.loop_tile_ns",
@@ -45,6 +62,7 @@ measured = [
   "kernel.moe.cost.whole_bytes_per_ns",
   "kernel.moe.cost.whole_partial_fs",
   "kernel.moe.gmm_block_mib",
+  "kernel.moe.gmm_fuse_from",
   "kernel.moe.gmm_glu",
   "kernel.moe.gmm_run",
   "kernel.moe.gmm_tm",

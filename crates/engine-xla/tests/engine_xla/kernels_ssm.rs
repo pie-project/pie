@@ -782,6 +782,61 @@ fn the_chunked_conv_walks_each_lane_from_its_window() {
     }
 }
 
+/// A prompt's fire (lanes few beside its rows) convolves its rows in one
+/// pass and takes each lane's first rows again from its kept rows: lanes of
+/// 100, 2 and 130 rows, then padded rows, over a bf16 bank.
+#[test]
+fn a_tall_fires_conv_walks_each_lane_from_its_window() {
+    let (c, k, dil, slots) = (24usize, 4usize, 1usize, 5usize);
+    let hist = (k - 1) * dil + 1;
+    let indptr = [0i32, 100, 102, 232];
+    let rows = 256usize;
+    let lane_slot = [3i32, 1, 4];
+    let mut slot_of_row = vec![DROP; rows];
+    for l in 0..3 {
+        for t in indptr[l]..indptr[l + 1] {
+            slot_of_row[t as usize] = lane_slot[l];
+        }
+    }
+    let mut rng = Rng(17);
+    let xs = rng.bf16s(rows * c, 1.0);
+    let ws = rng.bf16s(c * k, 0.5);
+    let bank0: Vec<f32> = rng
+        .f32s(slots * hist * c, -1.0, 1.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let mut b = Bench::new();
+    let x = b.bf16(rows as u32, c as u32, &xs);
+    let ip = b.i32(indptr.len() as u32, 1, &indptr);
+    let w = b.bf16(c as u32, k as u32, &ws);
+    let bank = b.bf16(slots as u32, (hist * c) as u32, &bank0);
+    let sl = b.i32(rows as u32, 1, &slot_of_row);
+    let y = b.zeros(Dtype::Bf16, rows as u32, c as u32);
+    let p = pool(bank, sl);
+    let rt = RaggedTensor {
+        data: x,
+        indptr: ip,
+    };
+    let ran = b
+        .run(|ctx| ssm::causal_conv1d_chunked(ctx, rt, w, &p, k as u32, dil as u32, y))
+        .unwrap();
+    if !ran {
+        return;
+    }
+    let mut want_bank = bank0.clone();
+    let got_y = b.read_f32(y);
+    for l in 0..3 {
+        let (lo, hi) = (indptr[l] as usize, indptr[l + 1] as usize);
+        let s = lane_slot[l] as usize;
+        let past = &bank0[s * hist * c..(s + 1) * hist * c];
+        let (yr, next) = conv_ref(&xs[lo * c..hi * c], c, &ws, k, dil, past, hi - lo, false);
+        want_bank[s * hist * c..(s + 1) * hist * c].copy_from_slice(&next);
+        assert_close(&got_y[lo * c..hi * c], &yr, 2e-2, 1e-2);
+    }
+    assert_close(&b.read_f32(bank), &want_bank, 0.0, 0.0);
+}
+
 /// At Qwen3.5's conv width (rows of 6144 channels) a lane walked one decode
 /// fire at a time reads what its prefill read. (A TPU scatter into a
 /// one-row operand of rows this wide lands out-of-range updates on the row
@@ -2372,11 +2427,14 @@ fn the_committed_mamba2_lands_the_state_after_the_commit() {
 /// The chunked rule over 128-wide heads and a slot-blocked bf16 bank takes
 /// the fused Mosaic chunk kernel on a TPU (`ssm::chunk`): its rows and landed
 /// states against the XLA form's (the token walk is reported beside them),
-/// over 64-row chunks of grouped heads and 128-row chunks of one head each.
+/// over 64-row chunks of grouped heads, 128-row chunks of one head each and
+/// 32-row chunks of 48 heads.
 #[test]
 fn the_fused_chunk_kernel_matches_the_xla_form() {
     // Lanes of 70 (two chunks), 0, 5, 1 and 130 rows, then 3 padded rows;
-    // then one lane of 300 rows (three 128-row chunks) and 20 padded rows.
+    // then one lane of 300 rows (three 128-row chunks) and 20 padded rows;
+    // then Qwen3.6-27B's 48 value heads over two lanes of 150 and 140 rows
+    // (32-row chunks, four heads to a row of the blocks' inverses).
     for (g, indptr, rows, lane_slot, seed) in [
         (
             Gdn {
@@ -2402,12 +2460,31 @@ fn the_fused_chunk_kernel_matches_the_xla_form() {
             vec![1i32],
             36u64,
         ),
+        (
+            Gdn {
+                hk: 16,
+                hv: 48,
+                dk: 128,
+                dv: 128,
+            },
+            vec![0i32, 150, 290],
+            300usize,
+            vec![2i32, 1],
+            37u64,
+        ),
     ] {
-        fused_against_xla(&g, &indptr, rows, &lane_slot, seed);
+        fused_against_xla(&g, &indptr, rows, &lane_slot, seed, 0);
     }
 }
 
-fn fused_against_xla(g: &Gdn, indptr: &[i32], rows: usize, lane_slot: &[i32], seed: u64) {
+fn fused_against_xla(
+    g: &Gdn,
+    indptr: &[i32],
+    rows: usize,
+    lane_slot: &[i32],
+    seed: u64,
+    row_blocks: i64,
+) {
     let lanes = indptr.len() - 1;
     let slots = lane_slot.iter().max().map_or(1, |&m| m as usize + 2);
     let mut slot_of_row = vec![DROP; rows];
@@ -2425,7 +2502,14 @@ fn fused_against_xla(g: &Gdn, indptr: &[i32], rows: usize, lane_slot: &[i32], se
         .collect();
     let run = |kernel: bool| -> Option<(Vec<f32>, Vec<f32>)> {
         kernels_xla::ssm::fused_chunks(Some(kernel));
-        let mut b = Bench::new();
+        let d = kernels_xla::tuning::Tuning::DEFAULT;
+        let mut b = Bench::new().with_tuning(kernels_xla::tuning::Tuning {
+            ssm: kernels_xla::tuning::SsmChunks {
+                row_blocks,
+                ..d.ssm
+            },
+            ..d
+        });
         let x = b.bf16(rows as u32, g.width() as u32, &qkv);
         let ip = b.i32(indptr.len() as u32, 1, indptr);
         let z = b.zeros(Dtype::Bf16, rows as u32, (g.hv * g.dv) as u32);
@@ -2715,4 +2799,33 @@ fn the_gdn_kernels_step_a_mapped_bank_tpu_only() {
     assert_eq!(bits(&got.0[..live]), bits(&want.0[..live]), "chunks: y");
     assert_eq!(bits(&got.1), bits(&want.1), "chunks: bank");
     assert!(got.2, "chunks: a write left its slot");
+}
+
+/// A fire of whole 64-row blocks through the row-block kernel, its lanes
+/// meeting inside blocks (and three in one), against the XLA form: 48 value
+/// heads, the padding rows past the last lane, and 16.
+#[test]
+fn the_row_block_kernel_matches_the_xla_form() {
+    let g = Gdn {
+        hk: 16,
+        hv: 48,
+        dk: 128,
+        dv: 128,
+    };
+    fused_against_xla(&g, &[0, 150, 290, 555], 640, &[2, 1, 3], 37, 64);
+    fused_against_xla(
+        &g,
+        &[0, 20, 40, 300, 301, 600],
+        640,
+        &[2, 1, 3, 4, 5],
+        38,
+        64,
+    );
+    let g = Gdn {
+        hk: 16,
+        hv: 16,
+        dk: 128,
+        dv: 128,
+    };
+    fused_against_xla(&g, &[0, 555, 1110], 1152, &[1, 2], 39, 64);
 }
