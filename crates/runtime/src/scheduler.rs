@@ -215,14 +215,10 @@ pub(crate) async fn pool(engine_id: usize, op: worker::PoolOp) -> Result<()> {
     scheduler_handle(engine_id)?.pool(op).await
 }
 
-/// Tells engine `engine_id` that `owner`'s pool slots are `slots` now, on
-/// its lane ahead of every fire queued after it.
-pub(crate) async fn rebind_slots(
-    engine_id: usize,
-    owner: ::engine::SlotOwner,
-    slots: Vec<u32>,
-) -> Result<()> {
-    pool(engine_id, worker::PoolOp::Rebind(owner, slots)).await
+/// Tells engine `engine_id` where moved pool slots lie now, on its lane
+/// ahead of every fire queued after it.
+pub(crate) async fn rebind_slots(engine_id: usize, rebind: ::engine::Rebind) -> Result<()> {
+    pool(engine_id, worker::PoolOp::Rebind(rebind)).await
 }
 
 /// The engine's host-tier layout, once asked.

@@ -117,13 +117,26 @@ pub struct RingFacts {
     pub footprint: Footprint,
 }
 
-/// Whose pool slots an [`crate::Engine::rebind_slots`] moves: an
-/// instance's tables (and the rings it holds itself), or a registered
-/// channel's ring.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum SlotOwner {
-    Instance(InstanceId),
-    Channel(crate::channel::ChannelId),
+/// Pool slots the runtime moved, as [`crate::Engine::rebind_slots`] tells
+/// them: it parked them on another tier and copied them back into fresh
+/// refs of the same shapes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Rebind {
+    /// An instance's tables (`Instance` slots, as
+    /// [`InstanceBinding::instance_slots`]) and the rings it holds itself
+    /// (those no registered channel covers, in [`ProgramFacts::rings`]
+    /// order, as [`InstanceBinding::ring_slots`]).
+    Instance {
+        id: InstanceId,
+        instance: Vec<u32>,
+        rings: Vec<RingSlots>,
+    },
+    /// A registered channel's ring (`Channel` slots, as
+    /// [`crate::channel::ChannelRegistration::slots`]).
+    Channel {
+        id: crate::channel::ChannelId,
+        slots: Vec<u32>,
+    },
 }
 
 /// The `Channel` slots the runtime took for one of an instance's rings.

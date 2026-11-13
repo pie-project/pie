@@ -9,7 +9,7 @@ use crate::scheduler::{TierKind, TierMove};
 use crate::store::kv::page_table::WorkingSetId;
 use crate::store::kv::working_set::KvSuspendHandle;
 use crate::store::kv::{KvResidencyTxn, KvSpillTxn, KvStoreError};
-use crate::store::roles::{RoleMove, RolesHandle};
+use crate::store::roles::{Owner, RoleMove, RolesHandle};
 use crate::store::rs::RsResidencyTxn;
 use ::engine::transfer::MemoryDomain;
 
@@ -617,8 +617,9 @@ const MOVE_WAIT: Duration = Duration::from_secs(10);
 /// again on the next restore.
 async fn rebind(engine: usize, roles: &RolesHandle, pid: ProcessId) -> Result<(), String> {
     let stale = roles.lock().unwrap().stale(pid);
-    for (owner, slots) in stale {
-        crate::scheduler::rebind_slots(engine, owner, slots)
+    for rebind in stale {
+        let owner = Owner::of(&rebind);
+        crate::scheduler::rebind_slots(engine, rebind)
             .await
             .map_err(|error| format!("rebind {owner:?}: {error:#}"))?;
         roles.lock().unwrap().rebound(owner);

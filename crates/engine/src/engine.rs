@@ -9,7 +9,7 @@ use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
 use crate::program::{
     BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, ProgramRegistration,
-    RingFacts, SlotOwner,
+    Rebind, RingFacts,
 };
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
 
@@ -104,16 +104,14 @@ pub trait Engine: Send {
         Ok(None)
     }
 
-    /// `owner`'s pool slots moved: the runtime parked them on another tier
-    /// and copied them back into `slots`, fresh refs of the same shapes, in
-    /// the order the binding or registration named the old ones (for an
-    /// instance, its [`InstanceBinding::instance_slots`] and then each of its
-    /// [`InstanceBinding::ring_slots`] in turn). Called before the next fire
-    /// that reads them, which must address the new slots. The default does
+    /// An instance's or a channel's pool slots moved: the runtime parked
+    /// them on another tier and copied them back into the fresh refs
+    /// `rebind` names, each shape apart. Called before the next fire that
+    /// reads them, which must address the new slots. The default does
     /// nothing: an engine that states no `Instance` or `Channel` shape is
     /// never asked.
-    fn rebind_slots(&mut self, owner: SlotOwner, slots: Vec<u32>) -> Result<()> {
-        let _ = (owner, slots);
+    fn rebind_slots(&mut self, rebind: Rebind) -> Result<()> {
+        let _ = rebind;
         Ok(())
     }
 

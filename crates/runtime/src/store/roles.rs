@@ -38,10 +38,29 @@ use std::sync::{Arc, Mutex};
 use ::engine::chunk::{ShapeId as EngineShape, SlotRole};
 use ::engine::{
     BoundInstance, ChannelId, ChannelRegistration, Engine, InstanceBinding, InstanceId,
-    ProgramFacts, ProgramId, RingFacts, RingSlots, SlotOwner,
+    ProgramFacts, ProgramId, Rebind, RingFacts, RingSlots,
 };
 
 use super::shared::{FixedShape, RoleShapes, Shared};
+
+/// Whose slots an item is: an instance's tables (and the rings it holds
+/// itself), or a registered channel's ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Owner {
+    Instance(InstanceId),
+    Channel(ChannelId),
+}
+
+impl Owner {
+    /// Whose slots `rebind` moves.
+    #[must_use]
+    pub fn of(rebind: &Rebind) -> Self {
+        match rebind {
+            Rebind::Instance { id, .. } => Owner::Instance(*id),
+            Rebind::Channel { id, .. } => Owner::Channel(*id),
+        }
+    }
+}
 
 /// The process an item parks and unparks with.
 pub type Holder = uuid::Uuid;
@@ -134,7 +153,7 @@ pub struct Taken {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleMove {
     out: bool,
-    items: Vec<(SlotOwner, Vec<Part>)>,
+    items: Vec<(Owner, Vec<Part>)>,
     copies: Vec<RoleCopy>,
 }
 
@@ -162,7 +181,7 @@ pub struct Roles {
     host: Option<Shared>,
     shapes: RoleShapes,
     programs: HashMap<ProgramId, ProgramFacts>,
-    items: HashMap<SlotOwner, Item>,
+    items: HashMap<Owner, Item>,
 }
 
 impl Roles {
@@ -256,7 +275,7 @@ impl Roles {
             .ok_or(RolesError::Program(program))?;
         let mut shared = Vec::new();
         for &id in channels {
-            if let Some(item) = self.items.get(&SlotOwner::Channel(id)) {
+            if let Some(item) = self.items.get(&Owner::Channel(id)) {
                 if item.tier != Tier::Device {
                     return Err(RolesError::Parked(id));
                 }
@@ -299,7 +318,7 @@ impl Roles {
     /// The engine bound `taken` as instance `id`, for `holder`.
     pub fn bound(&mut self, id: InstanceId, holder: Option<Holder>, taken: Taken) {
         for &channel in &taken.channels {
-            if let Some(item) = self.items.get_mut(&SlotOwner::Channel(channel)) {
+            if let Some(item) = self.items.get_mut(&Owner::Channel(channel)) {
                 item.attached.insert(id);
             }
         }
@@ -309,13 +328,13 @@ impl Roles {
         if item.parts.iter().all(|part| part.refs.is_empty()) && item.channels.is_empty() {
             return;
         }
-        self.items.insert(SlotOwner::Instance(id), item);
+        self.items.insert(Owner::Instance(id), item);
     }
 
     /// The engine closed instance `id`: its slots go back, and a closed
     /// channel it was the last on with them.
     pub fn close_instance(&mut self, id: InstanceId) {
-        let owner = SlotOwner::Instance(id);
+        let owner = Owner::Instance(id);
         let Some(item) = self.items.get_mut(&owner) else {
             return;
         };
@@ -323,7 +342,7 @@ impl Roles {
         let channels = item.channels.clone();
         self.free_if_done(owner);
         for channel in channels {
-            let owner = SlotOwner::Channel(channel);
+            let owner = Owner::Channel(channel);
             if let Some(item) = self.items.get_mut(&owner) {
                 item.attached.remove(&id);
             }
@@ -355,7 +374,7 @@ impl Roles {
             return;
         }
         self.items.insert(
-            SlotOwner::Channel(id),
+            Owner::Channel(id),
             Item::new(
                 holder,
                 vec![Part {
@@ -369,14 +388,14 @@ impl Roles {
     /// The engine closed channel `id`: its ring goes back once no bound
     /// instance holds it.
     pub fn close_channel(&mut self, id: ChannelId) {
-        let owner = SlotOwner::Channel(id);
+        let owner = Owner::Channel(id);
         if let Some(item) = self.items.get_mut(&owner) {
             item.open = false;
         }
         self.free_if_done(owner);
     }
 
-    fn free_if_done(&mut self, owner: SlotOwner) {
+    fn free_if_done(&mut self, owner: Owner) {
         let Some(item) = self.items.get(&owner) else {
             return;
         };
@@ -395,15 +414,15 @@ impl Roles {
     /// Whether `owner` parks and unparks with `holder`: an instance it
     /// holds, or a channel it registered that only its instances are bound
     /// to.
-    fn moves_with(&self, owner: SlotOwner, item: &Item, holder: Holder) -> bool {
+    fn moves_with(&self, owner: Owner, item: &Item, holder: Holder) -> bool {
         if item.holder != Some(holder) || !item.open {
             return false;
         }
         match owner {
-            SlotOwner::Instance(_) => true,
-            SlotOwner::Channel(_) => item.attached.iter().all(|&id| {
+            Owner::Instance(_) => true,
+            Owner::Channel(_) => item.attached.iter().all(|&id| {
                 self.items
-                    .get(&SlotOwner::Instance(id))
+                    .get(&Owner::Instance(id))
                     .is_some_and(|instance| instance.holder == Some(holder))
             }),
         }
@@ -414,7 +433,7 @@ impl Roles {
     /// on the device; nothing is dropped. `None` when nothing moves.
     pub fn prepare_park(&mut self, holder: Holder) -> Option<RoleMove> {
         let host = self.host.clone()?;
-        let owners: Vec<SlotOwner> = self
+        let owners: Vec<Owner> = self
             .items
             .iter()
             .filter(|(owner, item)| {
@@ -441,14 +460,14 @@ impl Roles {
     /// Unparks `holder`'s parked items: device slots taken for each, all or
     /// none. `None` when nothing is parked.
     pub fn prepare_unpark(&mut self, holder: Holder) -> Result<Option<RoleMove>, RolesError> {
-        let owners: Vec<SlotOwner> = self
+        let owners: Vec<Owner> = self
             .items
             .iter()
             .filter(|(_, item)| item.tier == Tier::Host && item.holder == Some(holder))
             .map(|(owner, _)| *owner)
             .collect();
         let device = Arc::clone(&self.device);
-        let mut items: Vec<(SlotOwner, Vec<Part>)> = Vec::new();
+        let mut items: Vec<(Owner, Vec<Part>)> = Vec::new();
         for owner in owners {
             match self.take_parts(&device, &self.items[&owner].parts) {
                 Ok(to) => items.push((owner, to)),
@@ -468,7 +487,7 @@ impl Roles {
 
     /// The move of `items` (each item's slots to take), with the copies
     /// from the slots each holds now.
-    fn moving(&self, out: bool, items: Vec<(SlotOwner, Vec<Part>)>) -> RoleMove {
+    fn moving(&self, out: bool, items: Vec<(Owner, Vec<Part>)>) -> RoleMove {
         let mut copies: Vec<RoleCopy> = Vec::new();
         for (owner, to) in &items {
             let from = &self.items[owner].parts;
@@ -543,26 +562,46 @@ impl Roles {
     }
 
     /// `holder`'s items whose slots moved since the engine last named them:
-    /// what [`::engine::Engine::rebind_slots`] tells it, every slot of the
-    /// item in binding order.
+    /// what [`::engine::Engine::rebind_slots`] tells it, channels first (an
+    /// instance's tables may address their rings).
     #[must_use]
-    pub fn stale(&self, holder: Holder) -> Vec<(SlotOwner, Vec<u32>)> {
-        let mut stale: Vec<(SlotOwner, Vec<u32>)> = self
+    pub fn stale(&self, holder: Holder) -> Vec<Rebind> {
+        let mut stale: Vec<(Owner, &Item)> = self
             .items
             .iter()
             .filter(|(_, item)| item.stale && item.holder == Some(holder))
-            .map(|(owner, item)| (*owner, item.refs()))
+            .map(|(owner, item)| (*owner, item))
             .collect();
-        // Channels first: an instance's tables may address its rings.
         stale.sort_by_key(|(owner, _)| match owner {
-            SlotOwner::Channel(id) => (0, id.0),
-            SlotOwner::Instance(id) => (1, id.0),
+            Owner::Channel(id) => (0, id.0),
+            Owner::Instance(id) => (1, id.0),
         });
         stale
+            .into_iter()
+            .map(|(owner, item)| match owner {
+                Owner::Channel(id) => Rebind::Channel {
+                    id,
+                    slots: item.refs(),
+                },
+                Owner::Instance(id) => Rebind::Instance {
+                    id,
+                    instance: item.parts.first().map_or_else(Vec::new, |p| p.refs.clone()),
+                    rings: item
+                        .rings
+                        .iter()
+                        .zip(item.parts.iter().skip(1))
+                        .map(|(&channel, part)| RingSlots {
+                            channel,
+                            slots: part.refs.clone(),
+                        })
+                        .collect(),
+                },
+            })
+            .collect()
     }
 
     /// The engine took `owner`'s new slots.
-    pub fn rebound(&mut self, owner: SlotOwner) {
+    pub fn rebound(&mut self, owner: Owner) {
         if let Some(item) = self.items.get_mut(&owner) {
             item.stale = false;
         }
@@ -585,7 +624,7 @@ impl Roles {
     /// none.
     #[cfg(test)]
     #[must_use]
-    pub fn slots(&self, owner: SlotOwner) -> Vec<u32> {
+    pub fn slots(&self, owner: Owner) -> Vec<u32> {
         self.items.get(&owner).map_or_else(Vec::new, Item::refs)
     }
 }

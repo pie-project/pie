@@ -12,11 +12,11 @@ use ::engine::chunk::{
 };
 use ::engine::{
     BoundInstance, ChannelId, ChannelRegistration, Engine, Footprint, FrameSubmission, FrameTicket,
-    InstanceBinding, InstanceId, LoadRequest, Loaded, ProgramFacts, ProgramId, RegisteredChannel,
-    RingFacts, SlotOwner,
+    InstanceBinding, InstanceId, LoadRequest, Loaded, ProgramFacts, ProgramId, Rebind,
+    RegisteredChannel, RingFacts,
 };
 
-use super::{Roles, RolesHandle, bind_instance, learn_program, register_channel};
+use super::{Owner, Roles, RolesHandle, bind_instance, learn_program, register_channel};
 use crate::store::shared::{Shared, SharedPool};
 
 const KIB: u64 = 1 << 10;
@@ -135,7 +135,7 @@ struct FakeEngine {
     next: u64,
     bindings: Vec<InstanceBinding>,
     registrations: Vec<ChannelRegistration>,
-    rebinds: Vec<(SlotOwner, Vec<u32>)>,
+    rebinds: Vec<Rebind>,
 }
 
 impl Engine for FakeEngine {
@@ -219,8 +219,8 @@ impl Engine for FakeEngine {
         })
     }
 
-    fn rebind_slots(&mut self, owner: SlotOwner, slots: Vec<u32>) -> ::engine::Result<()> {
-        self.rebinds.push((owner, slots));
+    fn rebind_slots(&mut self, rebind: Rebind) -> ::engine::Result<()> {
+        self.rebinds.push(rebind);
         Ok(())
     }
 }
@@ -300,26 +300,23 @@ fn a_shared_ring_is_freed_when_the_last_instance_on_it_closes() {
     let channel = registered(&roles, &mut engine, 1, 1);
     let first = bind(&roles, &mut engine, vec![channel], 1);
     let second = bind(&roles, &mut engine, vec![channel], 2);
-    let ring = roles.lock().unwrap().slots(SlotOwner::Channel(channel));
+    let ring = roles.lock().unwrap().slots(Owner::Channel(channel));
     assert_eq!(ring.len(), 2);
 
     roles.lock().unwrap().close_channel(channel);
     assert_eq!(
-        roles.lock().unwrap().slots(SlotOwner::Channel(channel)),
+        roles.lock().unwrap().slots(Owner::Channel(channel)),
         ring,
         "two instances still read it"
     );
     roles.lock().unwrap().close_instance(first);
-    assert_eq!(
-        roles.lock().unwrap().slots(SlotOwner::Channel(channel)),
-        ring
-    );
+    assert_eq!(roles.lock().unwrap().slots(Owner::Channel(channel)), ring);
     roles.lock().unwrap().close_instance(second);
     assert!(
         roles
             .lock()
             .unwrap()
-            .slots(SlotOwner::Channel(channel))
+            .slots(Owner::Channel(channel))
             .is_empty()
     );
     assert_eq!(held(&device), before);
@@ -339,9 +336,9 @@ fn a_park_and_unpark_moves_through_the_host_and_rebinds_the_new_refs() {
     // Another process's instance on a channel of its own: it stays.
     let other_channel = registered(&roles, &mut engine, 2, 2);
     let other = bind(&roles, &mut engine, vec![other_channel], 2);
-    let others = roles.lock().unwrap().slots(SlotOwner::Instance(other));
+    let others = roles.lock().unwrap().slots(Owner::Instance(other));
     let resident = held(&device);
-    let was = roles.lock().unwrap().slots(SlotOwner::Instance(instance));
+    let was = roles.lock().unwrap().slots(Owner::Instance(instance));
 
     let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
     let copies = park.copies().to_vec();
@@ -356,10 +353,7 @@ fn a_park_and_unpark_moves_through_the_host_and_rebinds_the_new_refs() {
         "its device slots are free"
     );
     assert_eq!(held(&host), parked);
-    assert_eq!(
-        roles.lock().unwrap().slots(SlotOwner::Instance(other)),
-        others
-    );
+    assert_eq!(roles.lock().unwrap().slots(Owner::Instance(other)), others);
     assert!(roles.lock().unwrap().stale(holder(1)).is_empty());
 
     // Something else takes the freed slots meanwhile, so the item comes
@@ -377,31 +371,37 @@ fn a_park_and_unpark_moves_through_the_host_and_rebinds_the_new_refs() {
     }
     roles.lock().unwrap().commit(unpark);
     assert_eq!(held(&host), 0, "the host slots are back");
-    let now = roles.lock().unwrap().slots(SlotOwner::Instance(instance));
+    let now = roles.lock().unwrap().slots(Owner::Instance(instance));
     assert_ne!(now, was);
 
     // The restore's rebind: every moved item, its new refs.
     let stale = roles.lock().unwrap().stale(holder(1));
     assert_eq!(stale.len(), 2);
-    for (owner, slots) in stale {
-        engine.rebind_slots(owner, slots).unwrap();
+    for rebind in stale {
+        let owner = Owner::of(&rebind);
+        engine.rebind_slots(rebind).unwrap();
         roles.lock().unwrap().rebound(owner);
     }
     assert!(roles.lock().unwrap().stale(holder(1)).is_empty());
-    assert!(
-        engine
-            .rebinds
-            .contains(&(SlotOwner::Instance(instance), now.clone()))
-    );
-    assert!(engine.rebinds.contains(&(
-        SlotOwner::Channel(channel),
-        roles.lock().unwrap().slots(SlotOwner::Channel(channel))
-    )));
+    // Each shape apart: the tables, then its own ring (channel index 1;
+    // index 0 is the registered channel's).
+    assert!(engine.rebinds.contains(&Rebind::Instance {
+        id: instance,
+        instance: now[..3].to_vec(),
+        rings: vec![::engine::RingSlots {
+            channel: 1,
+            slots: now[3..].to_vec(),
+        }],
+    }));
+    assert!(engine.rebinds.contains(&Rebind::Channel {
+        id: channel,
+        slots: roles.lock().unwrap().slots(Owner::Channel(channel)),
+    }));
     assert!(
         !engine
             .rebinds
             .iter()
-            .any(|(owner, _)| *owner == SlotOwner::Instance(other))
+            .any(|rebind| Owner::of(rebind) == Owner::Instance(other))
     );
 
     device.lock().unwrap().give_refs(instance_pool, &squatter);

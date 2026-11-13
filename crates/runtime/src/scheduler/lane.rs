@@ -824,7 +824,7 @@ impl Lane {
                         PoolOp::CommitSegments(segments) => engine.commit_segments(segments),
                         PoolOp::ReleaseSegments(segments) => engine.release_segments(segments),
                         PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),
-                        PoolOp::Rebind(owner, slots) => engine.rebind_slots(owner, slots),
+                        PoolOp::Rebind(rebind) => engine.rebind_slots(rebind),
                     }
                     .map_err(anyhow::Error::from)
                 });
