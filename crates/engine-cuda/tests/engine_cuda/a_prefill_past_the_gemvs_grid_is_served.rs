@@ -190,7 +190,7 @@ fn load(fixture: &Fixture, leg: Leg) -> engine_cuda::Result<Shell> {
         context: fixture.text.ceiling.next_multiple_of(PAGE),
         slots: 2,
         kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        allowance: engine::Allowance::WHOLE,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
             chip: Some(chip),

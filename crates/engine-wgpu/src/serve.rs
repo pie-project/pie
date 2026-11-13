@@ -40,12 +40,12 @@ impl Serve for Api {
 
     fn open(
         boot: &crate::api::DeviceBoot,
-        share: f64,
+        allowance: engine::Allowance,
         handed: Option<crate::device::Handed>,
     ) -> Result<(Context, crate::tuning::Tuning)> {
         let device = match handed {
-            Some(handed) => Context::adopt(boot, share, handed)?,
-            None => Context::bind(boot, share)?,
+            Some(handed) => Context::adopt(boot, allowance, handed)?,
+            None => Context::bind(boot, allowance)?,
         };
         let measured = device.chip();
         let (chip, report) = crate::chip::resolve(&measured, boot.profiles.as_deref());

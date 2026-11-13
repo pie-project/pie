@@ -605,33 +605,6 @@ fn check_tuning(config_path: &Path) -> Checks {
 
     let mut checks = Vec::new();
 
-    match (
-        set("engine.max_forward_tokens"),
-        set("engine.max_forward_requests"),
-    ) {
-        (Some(tokens), Some(requests)) => checks.push((
-            "forward shape".to_string(),
-            format!("pinned at {tokens} tokens x {requests} requests"),
-            Status::Pass,
-        )),
-        (Some(tokens), None) => checks.push((
-            "forward shape".to_string(),
-            format!("max_forward_tokens pinned at {tokens}, decode width still derived"),
-            Status::Warn,
-        )),
-        (None, Some(requests)) => checks.push((
-            "forward shape".to_string(),
-            format!("max_forward_requests pinned at {requests}, token budget still derived"),
-            Status::Warn,
-        )),
-        (None, None) => checks.push((
-            "forward shape".to_string(),
-            "derived from the engine's own defaults; state them to pin this machine's shape"
-                .to_string(),
-            Status::Warn,
-        )),
-    }
-
     let frame_knobs = ["runtime.frame_size", "runtime.frame_dispatch_depth"];
     let pinned: Vec<&str> = frame_knobs
         .iter()
@@ -696,7 +669,7 @@ mod tests {
 
     #[test]
     fn the_unmeasured_machine_still_serves() {
-        for config in ["", "[engine]\nkv_page_size = 32\n"] {
+        for config in ["", "[engine.memory]\nbudget_device = \"8GiB\"\n"] {
             let checks = tuning_of(config);
             assert!(
                 !checks.iter().any(|(_, _, status)| *status == Status::Fail),

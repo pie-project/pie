@@ -407,8 +407,8 @@ unsafe extern "system" fn on_validation(
 
 pub struct Context {
     pub(crate) core: Arc<Core>,
-    /// The load's share of the device-local heap, less what other
-    /// processes held of it when the device was bound.
+    /// What the load's allowance gives of the device-local heap, less what
+    /// other processes held of it when the device was bound.
     working_set: u64,
     max_buffer: u64,
     pub(crate) dummy: Slab,
@@ -574,9 +574,9 @@ pub(crate) fn buffer_ceiling(storage_range: u32, allocation: u64, buffer: Option
 }
 
 impl Context {
-    /// Binds the device `boot` names for a load that may take `share` of
-    /// its device-local heap.
-    pub fn bind(boot: &DeviceBoot, share: f64) -> Result<Context> {
+    /// Binds the device `boot` names for a load that may take what
+    /// `allowance` gives of its device-local heap.
+    pub fn bind(boot: &DeviceBoot, allowance: engine::Allowance) -> Result<Context> {
         let entry = entry().map_err(|e| Fault::NoDevice {
             detail: format!("no Vulkan loader: {e}"),
         })?;
@@ -589,7 +589,7 @@ impl Context {
                 .iter()
                 .any(|l| l.layer_name_as_c_str().is_ok_and(|s| s == validation));
         let (instance, props2) = shared_instance(&entry, validated)?;
-        Self::finish(entry, instance, boot, share, props2)
+        Self::finish(entry, instance, boot, allowance, props2)
     }
 
     #[allow(
@@ -601,7 +601,7 @@ impl Context {
         entry: ash::Entry,
         instance: ash::Instance,
         boot: &DeviceBoot,
-        share: f64,
+        allowance: engine::Allowance,
         _props2: bool,
     ) -> Result<Context> {
         macro_rules! bail {
@@ -926,7 +926,7 @@ impl Context {
 
         // Taken before this load allocates, so what the heap holds then is
         // other processes'.
-        let working_set = ((device_local as f64 * share) as u64).saturating_sub(core.held());
+        let working_set = allowance.room(device_local, core.held());
         let dummy = Raw::new(&core, DUMMY_BYTES, Memory::Device)?;
         let pipeline_cache = Arc::new(PipelineCache::open(&core, boot.pipeline_cache.clone())?);
         Ok(Context {
@@ -1677,10 +1677,7 @@ impl Frame {
         })
     }
 
-    pub fn commit_async(
-        mut self,
-        on_done: Option<engine_gpu::backend::OnDone>,
-    ) -> Result<Pending> {
+    pub fn commit_async(mut self, on_done: Option<engine_gpu::backend::OnDone>) -> Result<Pending> {
         let at = crate::encode::profiling().then(std::time::Instant::now);
         self.submit()?;
         if let Some(at) = at {

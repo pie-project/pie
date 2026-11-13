@@ -42,7 +42,7 @@ impl Steer {
     #[must_use]
     pub fn new(pool: &impl PoolTarget, tolerance: Tolerance, step: u64) -> Self {
         let tolerance = if pool.growth() == Growth::Fixed {
-            Tolerance::Dedicated
+            Tolerance::DEDICATED
         } else {
             tolerance
         };
@@ -68,7 +68,7 @@ impl Steer {
         read: Option<Pressure>,
         signal: &mut impl FnMut(Signal),
     ) -> Turn {
-        if self.governor.tolerance() == Tolerance::Dedicated {
+        if self.governor.tolerance().dedicated() {
             if read.is_some() {
                 pool.ticked();
             }
@@ -134,7 +134,7 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
     let mut interval = crate::rt::time::interval(TICK);
     // A shared pool moves its own segments off the fire path; the loop reads
     // the system each tick and hands it the target.
-    if shared && steer.governor().tolerance() != Tolerance::Dedicated {
+    if shared && !steer.governor().tolerance().dedicated() {
         let mut system: Box<dyn System> = super::system();
         loop {
             interval.tick().await;
@@ -142,12 +142,13 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
             steer.turn(&mut pool, read, &mut |signal| {
                 steered::signal(engine, signal);
             });
+            read_ledger(&pool, engine);
         }
     }
     // A dedicated shared pool may take every segment its range holds: its
     // walker commits them ahead of the waiters that need them, off the fire
     // path, and never gives them back.
-    if shared && steer.governor().tolerance() == Tolerance::Dedicated {
+    if shared && steer.governor().tolerance().dedicated() {
         use crate::governor::PoolTarget;
         let segment = pool.segment_bytes().max(1);
         let all = pool.hard_limit().div_ceil(segment);
@@ -158,5 +159,19 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
     loop {
         interval.tick().await;
         steer.turn(&mut pool, Some(Pressure::Calm), &mut |_| {});
+        read_ledger(&pool, engine);
     }
+}
+
+/// Puts `engine`'s ledger terms where the policy reads them: its weight
+/// cache's bytes above the floor, and what its driver holds outside.
+fn read_ledger(pool: &Shared<Steered>, engine: usize) {
+    let model = pool.with(|pool| pool.cache().cache_bytes());
+    crate::policy::pressure::set_ledger(
+        engine,
+        crate::policy::pressure::Ledger {
+            model,
+            outside: crate::engine::live(engine).outside(),
+        },
+    );
 }

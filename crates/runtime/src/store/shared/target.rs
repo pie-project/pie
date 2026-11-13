@@ -57,14 +57,16 @@ impl SharedGrow {
     /// past it, until there or until a step has to wait: caps fires, lowers
     /// the pool's rung once no wider fire is in flight, or raises it, the
     /// engine first copying the state out of the larger span. A raise short
-    /// of room waits on the room the asking pass has the planner free.
+    /// of room waits on the room the asking pass has the planner free; one
+    /// to a rung the engine has not armed waits on its capture
+    /// ([`super::rung_goal`]), the walk looking again each poll.
     async fn walk_rung(&self) {
         loop {
             let (current, retired) = self.epochs();
             let (step, goal) = {
                 let mut pool = self.shared.lock().unwrap();
                 pool.pool_mut().retire_through(retired);
-                let goal = pool.rung_for(super::wanted_rows(self.engine));
+                let goal = super::rung_goal(&pool, self.engine, super::wanted_rows(self.engine));
                 let step = self.rung_walk.lock().unwrap().step(
                     &pool,
                     goal,
@@ -355,5 +357,4 @@ impl PoolTarget for SharedGrow {
     fn take_refused(&mut self) -> bool {
         self.refused.swap(false, Ordering::AcqRel)
     }
-
 }

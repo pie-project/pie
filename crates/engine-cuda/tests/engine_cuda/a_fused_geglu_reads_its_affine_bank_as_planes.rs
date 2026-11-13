@@ -198,7 +198,7 @@ fn fire(fixture: &Fixture, knobs: Knobs) -> engine_cuda::Result<Vec<f32>> {
         context: ceiling,
         slots: 1,
         kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        allowance: engine::Allowance::WHOLE,
         ordinal: 0,
         // Eager: the fold is read off the walk, not a recorded body.
         knobs: Knobs {

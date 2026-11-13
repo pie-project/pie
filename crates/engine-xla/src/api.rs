@@ -371,7 +371,7 @@ impl Engine for Xla {
                 context: budgets.max_context,
                 slots,
                 kv_budget: residency.device_kv_budget,
-                memory_share: residency.device_memory_share,
+                allowance: residency.device,
                 device: &boot,
             },
             voxels,

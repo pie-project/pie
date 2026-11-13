@@ -2,19 +2,21 @@
 """Handles on a real engine: resume, fork, eviction, quota, every SDK.
 
     PIE_HOME=/tmp/pie-test python3 tests/handles/e2e.py --log /tmp/e.log \\
-        --ctx 512 --kv-budget 176MiB
+        --ctx 512 --budget-device <weights + fires + 176MiB>
 
 Build first: `pie` for the engine, `working-set-handles` for wasm32-wasip3 in
 examples/, and `--example handles` of pie-client for t_clients. A token here is drawn by position, so a turn split across
 processes must draw exactly what one process does. A working set on the device
 takes its kv pages, an rs list slot and its fixed record from one pool: on
-Qwen3.5-0.8B 176MiB holds 9 or so of t_evict's 470-token sets, short of its 11.
-A policy gets its own runs: `--policy keep-handles --only t_keep --ctx 512
---kv-budget 136MiB` (8 or so 300-token sets), and `--policy keep-handles --only
-t_weak --ctx 512 --kv-budget 116MiB`. The host's limit (t_quota, t_close,
-t_weak's discard) is the host tier, which `--kv-budget` does not reach:
-`--host-budget 60MiB --only t_quota,t_close --ctx 512 --kv-budget 116MiB` sets
-host_kv_budget so the sets at rest fill it.
+Qwen3.5-0.8B a pool of 176MiB holds 9 or so of t_evict's 470-token sets, short
+of its 11. `--budget-device` is `[engine.memory] budget_device`, of which the
+weights and the fires take theirs first: state the pool size above plus what
+the load reports for them. A policy gets its own runs: `--policy keep-handles
+--only t_keep --ctx 512` at a 136MiB pool (8 or so 300-token sets), and
+`--policy keep-handles --only t_weak --ctx 512` at 116MiB. The host's limit
+(t_quota, t_close, t_weak's discard) is the host tier, which `--budget-device`
+does not reach: `--host-budget 60MiB --only t_quota,t_close --ctx 512` at a
+116MiB pool sets budget_host so the sets at rest fill it.
 """
 import argparse, asyncio, json, os, re, signal, socket, subprocess, sys, time, traceback
 from pathlib import Path
@@ -29,7 +31,7 @@ EX = ROOT / "examples/target/wasm32-wasip3/release"
 a = argparse.ArgumentParser()
 a.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
 a.add_argument("--ctx", type=int, default=0)
-a.add_argument("--kv-budget", default=""); a.add_argument("--log", required=True)
+a.add_argument("--budget-device", default=""); a.add_argument("--log", required=True)
 a.add_argument("--only", default=""); a.add_argument("--policy", default="")
 a.add_argument("--host-budget", default="")
 args = a.parse_args()
@@ -136,7 +138,7 @@ async def t_quota(c, prog, whole):
     # policy listening, the default responder lets sets at rest go, the one
     # keyed lowest first, so no launch starves and none waits. (A policy
     # that keeps them all instead has a launch fail at the seat deadline
-    # with a "quota:" error naming host_kv_budget.)
+    # with a "quota:" error naming budget_host.)
     hs, refused = [], None
     for i in range(24):
         h = await c.working_set()
@@ -392,10 +394,10 @@ async def main():
     t = (HOME / "config.toml").read_text()
     t = re.sub(r'^source = "[^"]*"', f'source = "{args.model}"', t, flags=re.M)
     t = re.sub(r'^listen = "[^"]*"', f'listen = "127.0.0.1:{port}"', t, flags=re.M)
-    if args.kv_budget: t = t.replace('# device_kv_budget     = "20GiB"', f'device_kv_budget = "{args.kv_budget}"')
-    if args.host_budget: t = t.replace('# host_kv_budget       = "32GiB"', f'host_kv_budget = "{args.host_budget}"')
+    if args.budget_device: t = t.replace('# budget_device         = "20GiB"', f'budget_device = "{args.budget_device}"')
+    if args.host_budget: t = t.replace('# budget_host           = "32GiB"', f'budget_host = "{args.host_budget}"')
     if args.policy: t = t.replace('# worker_policy            = "noop"', f'worker_policy = "{args.policy}"')
-    if args.ctx: t = t.replace("# max_model_len   = 32768", f"max_model_len = {args.ctx}\n#")
+    if args.ctx: t = t.replace("# max_context     = 32768", f"max_context = {args.ctx}\n#")
     cfg.write_text(t)
     log = open(args.log, "w")
     srv = subprocess.Popen([str(PIE), "--config", str(cfg), "serve"], stdout=log, stderr=subprocess.STDOUT,

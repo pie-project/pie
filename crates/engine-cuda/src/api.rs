@@ -563,15 +563,15 @@ impl Engine for Cuda {
                 } else {
                     budgets.max_tokens
                 },
-                residency.device_memory_share,
+                residency.device,
                 plan.device_demand(),
             )
             .map_err(fault)?;
             if fits < budgets.max_context {
                 eprintln!(
                     "engine-cuda: the model declares a {}-token context and one sequence at it \
-                     takes more than half of what `[model] device_memory_share` leaves past the \
-                     weights; serving {fits} tokens. State `[engine] max_model_len` to choose.",
+                     takes more than half of what the load's allowance leaves past the weights; \
+                     serving {fits} tokens. State `[engine] max_context` to choose.",
                     budgets.max_context
                 );
                 budgets.max_context = fits;
@@ -597,7 +597,7 @@ impl Engine for Cuda {
             context: budgets.max_context,
             slots: budgets.slots,
             kv_budget: residency.device_kv_budget,
-            memory_share: residency.device_memory_share,
+            allowance: residency.device,
             ordinal: if ordinal >= 0 {
                 ordinal
             } else {

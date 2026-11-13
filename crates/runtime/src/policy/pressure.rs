@@ -7,8 +7,11 @@
 //! [`raise`] with what its tier is short of. The worker policy hears that as
 //! one `tier-pressure` edge per band crossing, and reads the bytes as attrs
 //! on the worker (`{device,host}-{total,state,live,wanted,act,short}-bytes`
-//! and `-band`). It answers with the verbs it already has: `discard` a
-//! working set, or install retention keys.
+//! and `-band`), beside the device's two ledger terms
+//! (`{device,host}-{model,outside}-bytes`, [`Ledger`]). It answers with the
+//! verbs it already has: `discard` a working set, or install retention
+//! keys. Attrs are not verbs: the model cache's bytes say what live demand
+//! may take from the weights before it asks for state.
 //!
 //! When no installed policy subscribes to `tier-pressure`, the default
 //! responder answers for it ([`choose`]). It uses the same `discard` verb a
@@ -123,6 +126,43 @@ pub struct Bytes {
     pub wanted: u64,
     /// Held for activations inside `total`.
     pub act: u64,
+}
+
+/// One engine's device bytes outside its state pools, as the ledger
+/// (REDESIGN 2.1, 2.8) puts them to the policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Ledger {
+    /// The model cache: weight atoms resident above the floor, what live
+    /// demand may take before any state gives way.
+    pub model: u64,
+    /// What the driver holds beside the engine's span (graph bodies,
+    /// modules, library workspaces), as the engine states it
+    /// ([`::engine::live::Live::outside`]).
+    pub outside: u64,
+}
+
+/// Per engine, its [`Ledger`] as its governor last read it.
+static LEDGERS: RwLock<BTreeMap<usize, Ledger>> = RwLock::new(BTreeMap::new());
+
+/// `engine`'s ledger terms now: what its governor reads each tick.
+pub fn set_ledger(engine: usize, ledger: Ledger) {
+    LEDGERS.write().unwrap().insert(engine, ledger);
+}
+
+/// Every engine's ledger terms on `tier`, summed; none off the device.
+#[must_use]
+pub fn ledger(tier: Tier) -> Ledger {
+    if tier != Tier::Device {
+        return Ledger::default();
+    }
+    LEDGERS
+        .read()
+        .unwrap()
+        .values()
+        .fold(Ledger::default(), |sum, one| Ledger {
+            model: sum.model.saturating_add(one.model),
+            outside: sum.outside.saturating_add(one.outside),
+        })
 }
 
 /// What reads a tier's bytes. The stores' own reading ([`stores`]) stands

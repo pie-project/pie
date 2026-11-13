@@ -16,8 +16,10 @@
 //!
 //! A platform supplies two things and no policy: the hard limit, and whether
 //! the system is congested ([`Pressure`]). A platform that cannot tell reads
-//! as calm, so demand alone moves the target there. Every threshold here was
-//! measured on one 16 GB machine; none is claimed for a larger one.
+//! as calm, so demand alone moves the target there. A deployment states two
+//! things ([`Tolerance`]): how much to yield when the system is congested,
+//! and whether memory demand stopped asking for goes back. Every threshold
+//! here was measured on one 16 GB machine; none is claimed for a larger one.
 
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -26,8 +28,6 @@ pub mod run;
 pub mod steered;
 
 use std::time::Duration;
-
-use serde::{Deserialize, Serialize};
 
 /// What the platform says about the system right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,34 +87,49 @@ pub fn system() -> Box<dyn System> {
     )
 }
 
-/// How much congestion this process puts up with, the one axis a deployment
-/// sets. Whether one axis is enough is unproven.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Tolerance {
-    /// The machine is this process's: the loop never lowers the target and
-    /// growth is unlimited. What a server has always done.
-    #[default]
-    Dedicated,
-    /// Backs off only as the system nears critical.
-    Aggressive,
-    Balanced,
-    /// Yields at the first sign of congestion.
-    Polite,
+/// How this process yields memory to the system around it
+/// (`[engine.memory] governor_backoff` and `governor_release_idle`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tolerance {
+    /// The share of the target kept each time the system stays congested
+    /// for [`PATIENCE`] ticks; `1.0` never yields to pressure.
+    pub backoff: f64,
+    /// Whether memory demand stopped asking for goes back, a little at a
+    /// time, with or without anyone else wanting it.
+    pub release_idle: bool,
 }
 
 impl Tolerance {
-    /// The share of the target kept on a congested tick, and the ticks of
-    /// congestion in a row it takes to act.
-    const fn backoff(self) -> (f64, u32) {
-        match self {
-            Self::Dedicated => (1.0, u32::MAX),
-            Self::Aggressive => (0.9, 4),
-            Self::Balanced => (0.8, 2),
-            Self::Polite => (0.7, 1),
-        }
+    /// The machine is this process's: the loop never lowers the target and
+    /// growth is unlimited. What a server has always done.
+    pub const DEDICATED: Tolerance = Tolerance {
+        backoff: 1.0,
+        release_idle: false,
+    };
+
+    /// Whether it yields to pressure: a backoff under the whole target.
+    #[must_use]
+    pub fn yields(self) -> bool {
+        self.backoff < 1.0
+    }
+
+    /// Whether the loop moves the target at all.
+    #[must_use]
+    pub fn dedicated(self) -> bool {
+        !self.yields() && !self.release_idle
     }
 }
+
+impl Default for Tolerance {
+    fn default() -> Self {
+        Self::DEDICATED
+    }
+}
+
+/// Congested ticks in a row before a backoff acts: a debounce of the
+/// pressure signal, not an intent. One congested tick is a single reading
+/// of a noisy signal; two in a row are a stretch.
+pub const PATIENCE: u32 = 2;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -281,9 +296,10 @@ impl Governor {
             limits.shrink_step,
             limits.segment_bytes,
         );
-        let target = match tolerance {
-            Tolerance::Dedicated => limits.hard_limit,
-            _ => held.clamp(limits.floor, limits.hard_limit),
+        let target = if tolerance.dedicated() {
+            limits.hard_limit
+        } else {
+            held.clamp(limits.floor, limits.hard_limit)
         };
         Self {
             limits,
@@ -331,9 +347,15 @@ impl Governor {
     /// for is not taken on the strength of a calm system, and it falls back
     /// toward demand once that stops rising.
     pub fn tick(&mut self, pressure: Pressure, demand: Demand) -> u64 {
-        if self.tolerance == Tolerance::Dedicated {
+        if self.tolerance.dedicated() {
             return self.target;
         }
+        // A process that does not yield reads every tick as calm.
+        let pressure = if self.tolerance.yields() {
+            pressure
+        } else {
+            Pressure::Calm
+        };
         if pressure != Pressure::Calm {
             self.idle_ticks = 0;
         }
@@ -345,10 +367,10 @@ impl Governor {
             Pressure::Congested => {
                 self.calm_ticks = 0;
                 self.congested_ticks += 1;
-                let (keep, patience) = self.tolerance.backoff();
-                if self.congested_ticks >= patience {
+                if self.congested_ticks >= PATIENCE {
                     self.congested_ticks = 0;
-                    self.target = ((self.target as f64 * keep) as u64).max(self.limits.floor);
+                    self.target = ((self.target as f64 * self.tolerance.backoff) as u64)
+                        .max(self.limits.floor);
                     self.backed_off();
                 }
             }
@@ -383,7 +405,10 @@ impl Governor {
         };
         self.last_live = demand.live;
         let kept = self.kept(demand);
-        if self.idle() && (self.idle_ticks - IDLE_AFTER).is_multiple_of(CUT_EVERY) {
+        if self.tolerance.release_idle
+            && self.idle()
+            && (self.idle_ticks - IDLE_AFTER).is_multiple_of(CUT_EVERY)
+        {
             self.cut(kept);
         }
         if self.held < self.hold {
@@ -454,6 +479,21 @@ mod tests {
     use super::*;
 
     const MIB: u64 = 1 << 20;
+
+    /// The four profiles the old `memory_tolerance` named, as the two keys
+    /// state them.
+    const AGGRESSIVE: Tolerance = Tolerance {
+        backoff: 0.9,
+        release_idle: true,
+    };
+    const BALANCED: Tolerance = Tolerance {
+        backoff: 0.8,
+        release_idle: true,
+    };
+    const POLITE: Tolerance = Tolerance {
+        backoff: 0.7,
+        release_idle: true,
+    };
     const LIMITS: Limits = Limits {
         floor: 100 * MIB,
         hard_limit: 1000 * MIB,
@@ -477,7 +517,7 @@ mod tests {
 
     #[test]
     fn a_dedicated_process_holds_the_hard_limit_whatever_happens() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Dedicated, 0);
+        let mut governor = Governor::new(LIMITS, Tolerance::DEDICATED, 0);
         assert_eq!(governor.tick(Pressure::Critical, all(0)), LIMITS.hard_limit);
         assert_eq!(
             governor.tick(Pressure::Congested, all(0)),
@@ -488,13 +528,13 @@ mod tests {
 
     #[test]
     fn a_pool_that_starts_whole_starts_the_target_there() {
-        let governor = Governor::new(LIMITS, Tolerance::Balanced, LIMITS.hard_limit);
+        let governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
         assert_eq!(governor.target(), LIMITS.hard_limit);
     }
 
     #[test]
     fn calm_grows_by_a_step_toward_demand_and_no_further() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Balanced, 0);
+        let mut governor = Governor::new(LIMITS, BALANCED, 0);
         assert_eq!(governor.tick(Pressure::Calm, all(400 * MIB)), 150 * MIB);
         calm_to(&mut governor, 100, 400 * MIB);
         assert_eq!(governor.target(), 400 * MIB);
@@ -504,14 +544,14 @@ mod tests {
 
     #[test]
     fn growth_stops_at_the_hard_limit() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Aggressive, 0);
+        let mut governor = Governor::new(LIMITS, AGGRESSIVE, 0);
         calm_to(&mut governor, 100, u64::MAX);
         assert_eq!(governor.target(), LIMITS.hard_limit);
     }
 
     #[test]
     fn critical_cuts_to_the_floor_at_once() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Aggressive, 0);
+        let mut governor = Governor::new(LIMITS, AGGRESSIVE, 0);
         calm_to(&mut governor, 100, u64::MAX);
         assert_eq!(
             governor.tick(Pressure::Critical, all(u64::MAX)),
@@ -521,12 +561,17 @@ mod tests {
 
     #[test]
     fn congestion_backs_off_by_the_tolerance_and_stops_at_the_floor() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Polite, 0);
+        let mut governor = Governor::new(LIMITS, POLITE, 0);
         calm_to(&mut governor, 100, u64::MAX);
         assert_eq!(
             governor.tick(Pressure::Congested, all(u64::MAX)),
+            LIMITS.hard_limit,
+            "one congested tick is a reading, not a stretch"
+        );
+        assert_eq!(
+            governor.tick(Pressure::Congested, all(u64::MAX)),
             700 * MIB,
-            "a polite process acts on the first tick"
+            "two are: the backoff keeps its share"
         );
         for _ in 0..64 {
             governor.tick(Pressure::Congested, all(u64::MAX));
@@ -536,7 +581,7 @@ mod tests {
 
     #[test]
     fn a_balanced_process_waits_out_one_congested_tick() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Balanced, 0);
+        let mut governor = Governor::new(LIMITS, BALANCED, 0);
         calm_to(&mut governor, 100, u64::MAX);
         assert_eq!(
             governor.tick(Pressure::Congested, all(0)),
@@ -552,9 +597,10 @@ mod tests {
 
     #[test]
     fn a_probe_that_fails_soon_waits_longer_before_the_next() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Polite, 0);
+        let mut governor = Governor::new(LIMITS, POLITE, 0);
         calm_to(&mut governor, 100, u64::MAX);
         let held_for = |governor: &mut Governor| {
+            governor.tick(Pressure::Congested, all(u64::MAX));
             let backed = governor.tick(Pressure::Congested, all(u64::MAX));
             let mut ticks = 0;
             while governor.tick(Pressure::Calm, all(u64::MAX)) == backed {
@@ -569,7 +615,7 @@ mod tests {
 
     #[test]
     fn one_stretch_of_pressure_is_one_failure() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Balanced, LIMITS.hard_limit);
+        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
         for _ in 0..8 {
             governor.tick(Pressure::Critical, all(u64::MAX));
         }
@@ -578,7 +624,8 @@ mod tests {
 
     #[test]
     fn yielding_ends_only_after_a_calm_as_long_as_the_failures_earned() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Polite, 0);
+        let mut governor = Governor::new(LIMITS, POLITE, 0);
+        governor.tick(Pressure::Congested, all(0));
         governor.tick(Pressure::Congested, all(0));
         assert!(governor.yielding());
         calm_to(&mut governor, SETTLED - 1, 0);
@@ -587,13 +634,15 @@ mod tests {
         assert!(!governor.yielding(), "one round settles in one stretch");
 
         governor.tick(Pressure::Congested, all(0));
+        governor.tick(Pressure::Congested, all(0));
         calm_to(&mut governor, SETTLED, 0);
         assert!(governor.yielding(), "a second round in a row takes longer");
     }
 
     #[test]
     fn a_long_calm_forgets_the_backoff() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Polite, 0);
+        let mut governor = Governor::new(LIMITS, POLITE, 0);
+        governor.tick(Pressure::Congested, all(u64::MAX));
         governor.tick(Pressure::Congested, all(u64::MAX));
         calm_to(&mut governor, 1000, u64::MAX);
         assert_eq!(governor.hold, 0);
@@ -610,13 +659,13 @@ mod tests {
 
     #[test]
     fn a_pause_keeps_its_memory() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Balanced, LIMITS.hard_limit);
+        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
         assert_eq!(kept(&mut governor, IDLE_AFTER - 1, 0, 0), LIMITS.hard_limit);
     }
 
     #[test]
     fn idle_memory_goes_back_a_little_at_a_time_as_far_as_the_floor() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Balanced, LIMITS.hard_limit);
+        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
         kept(&mut governor, IDLE_AFTER, 0, 0);
         let first = governor.target();
         assert_eq!(first, LIMITS.hard_limit - 900 * MIB / CUT_SHARE);
@@ -627,7 +676,7 @@ mod tests {
 
     #[test]
     fn a_cut_stops_at_what_the_cache_keeps_until_it_has_gone_unused_for_long() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Balanced, LIMITS.hard_limit);
+        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
         let (keeps, in_use) = (600 * MIB, 300 * MIB);
         assert_eq!(kept(&mut governor, KEEP_CACHE - 1, keeps, in_use), keeps);
         assert_eq!(kept(&mut governor, 400, keeps, in_use), in_use);
@@ -639,13 +688,13 @@ mod tests {
             shrink_step: u64::MAX,
             ..LIMITS
         };
-        let mut governor = Governor::new(limits, Tolerance::Balanced, limits.hard_limit);
+        let mut governor = Governor::new(limits, BALANCED, limits.hard_limit);
         assert_eq!(kept(&mut governor, IDLE_AFTER, 0, 0), limits.floor);
     }
 
     #[test]
     fn a_waiter_gets_the_rise_at_once_and_ends_the_idle() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Balanced, LIMITS.floor);
+        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.floor);
         // The first tick sees `live` rise from nothing.
         kept(&mut governor, IDLE_AFTER + 1, LIMITS.floor, LIMITS.floor);
         assert!(governor.idle());
@@ -658,7 +707,7 @@ mod tests {
 
     #[test]
     fn a_waiter_gets_no_rise_while_the_system_pushes_back() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Balanced, LIMITS.hard_limit);
+        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
         governor.tick(Pressure::Critical, all(0));
         assert!(!governor.can_rise());
         assert_eq!(governor.asked(all(900 * MIB)), LIMITS.floor);
@@ -666,13 +715,13 @@ mod tests {
 
     #[test]
     fn a_dedicated_process_is_never_asked() {
-        let governor = Governor::new(LIMITS, Tolerance::Dedicated, 0);
+        let governor = Governor::new(LIMITS, Tolerance::DEDICATED, 0);
         assert!(!governor.can_rise());
     }
 
     #[test]
     fn a_request_ends_the_idle_and_the_target_grows_again() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Balanced, LIMITS.hard_limit);
+        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
         kept(&mut governor, 2000, 0, 0);
         assert!(governor.idle());
         governor.tick(Pressure::Calm, all(400 * MIB));
@@ -682,7 +731,7 @@ mod tests {
 
     #[test]
     fn pressure_ends_the_idle() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Balanced, LIMITS.hard_limit);
+        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
         kept(&mut governor, IDLE_AFTER, 0, 0);
         assert!(governor.idle());
         governor.tick(Pressure::Congested, all(0));
@@ -691,8 +740,38 @@ mod tests {
 
     #[test]
     fn a_dedicated_process_gives_nothing_back_however_idle() {
-        let mut governor = Governor::new(LIMITS, Tolerance::Dedicated, 0);
+        let mut governor = Governor::new(LIMITS, Tolerance::DEDICATED, 0);
         assert_eq!(kept(&mut governor, 2000, 0, 0), LIMITS.hard_limit);
+    }
+
+    #[test]
+    fn a_process_that_keeps_idle_memory_gives_none_back() {
+        let keeps = Tolerance {
+            backoff: 0.8,
+            release_idle: false,
+        };
+        let mut governor = Governor::new(LIMITS, keeps, LIMITS.hard_limit);
+        assert_eq!(kept(&mut governor, 2000, 0, 0), LIMITS.hard_limit);
+        governor.tick(Pressure::Congested, all(0));
+        assert_eq!(governor.tick(Pressure::Congested, all(0)), 800 * MIB);
+    }
+
+    #[test]
+    fn a_process_that_does_not_yield_still_releases_idle_memory() {
+        let releases = Tolerance {
+            backoff: 1.0,
+            release_idle: true,
+        };
+        let mut governor = Governor::new(LIMITS, releases, LIMITS.hard_limit);
+        for _ in 0..8 {
+            governor.tick(Pressure::Critical, all(LIMITS.hard_limit));
+        }
+        assert_eq!(
+            governor.target(),
+            LIMITS.hard_limit,
+            "pressure moves nothing"
+        );
+        assert_eq!(kept(&mut governor, 2000, 0, 0), LIMITS.floor);
     }
 
     #[test]

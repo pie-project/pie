@@ -47,7 +47,7 @@ fn shell(name: &str) -> Shell {
             context: CONTEXT,
             slots: SLOTS,
             kv_budget: Some(kv_budget),
-            memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+            allowance: engine::Allowance::WHOLE,
             device: &DeviceBoot::default(),
         },
         None,

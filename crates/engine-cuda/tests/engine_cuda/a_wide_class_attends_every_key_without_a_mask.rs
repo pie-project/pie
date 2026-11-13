@@ -113,7 +113,7 @@ fn shell(trace: Trace, path: &Path, graphs: Graphs) -> Shell {
         context: 256,
         slots: 1,
         kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        allowance: engine::Allowance::WHOLE,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
             chip: Some(engine_cuda::chip::pinned(graphs, None)),

@@ -753,12 +753,12 @@ impl Plan {
         if dense > cap {
             return Err(Fault::Residency(format!(
                 "this deployment's dense weights take {dense} bytes, and the device holds {cap} \
-                 for them under `[model] device_memory_share` once the working set and one \
-                 sequence's kv pages and state slots are down. Dense weights always live in \
-                 device memory (only routed experts and token-id tables leave it, through the \
-                 weight cache), so serve a quantized deployment of this model, split it across \
-                 devices with tensor parallelism, or raise `[model] device_memory_share` or \
-                 shorten `max_model_len`."
+                 for them under the load's allowance once the working set and one sequence's \
+                 kv pages and state slots are down. Dense weights always live in device \
+                 memory (only routed experts and token-id tables leave it, through the weight \
+                 cache), so serve a quantized deployment of this model, split it across \
+                 devices with tensor parallelism, raise `[engine.memory] budget_device`, or \
+                 shorten `[engine] max_context`."
             )));
         }
         let mut device = dense;

@@ -65,6 +65,14 @@ pub trait Engine: Send {
         None
     }
 
+    /// What it learns of itself while it serves, read by the runtime from
+    /// load on ([`crate::live`]): the rungs armed, the bytes outside its
+    /// span. An engine that captures every body before load returns states
+    /// every rung armed.
+    fn live(&self) -> crate::live::Live {
+        crate::live::Live::armed()
+    }
+
     fn bind_thread(&mut self) -> Result<()> {
         Ok(())
     }

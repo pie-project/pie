@@ -245,6 +245,7 @@ fn load(dir: &Path, deployment: Deployment, head_dim: u32) -> Shell {
         slots: 4,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_metal::ResidencyPlan::default(),
+        allowance: engine::Allowance::WHOLE,
         profiles: None,
     })
     .expect("the micro_text shell loads")

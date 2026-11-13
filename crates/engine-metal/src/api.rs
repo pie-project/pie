@@ -175,7 +175,7 @@ fn extents(stated: &BindExtents) -> eta_exec::Extents {
     }
 }
 
-/// The narrowest forward width a load lowers `[engine] max_forward_tokens` to
+/// The narrowest forward width a load narrows its fires to
 /// so its arena scratch fits beside resident weights.
 const MIN_FITTED_FORWARD_TOKENS: u32 = 512;
 
@@ -386,16 +386,6 @@ impl Engine for Metal {
                 0,
             )
         };
-        // The device's capacity is measured (`store::accounting::capacity`):
-        // a configured share of it is not read here.
-        if residency.device_memory_share != engine::load::DEFAULT_DEVICE_MEMORY_SHARE {
-            tracing::warn!(
-                share = residency.device_memory_share,
-                "`[model] device_memory_share` is not read on Metal: the load takes the \
-                 working set Metal recommends less what the device already holds; cap the kv \
-                 pool with `[model] device_kv_budget`"
-            );
-        }
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
         let paging = crate::store::kv::Paging::of(budgets.page_size, budgets.max_context, 1, 1)
             .map_err(|error| fault(Fault::from(error)))?;
@@ -411,6 +401,7 @@ impl Engine for Metal {
             crate::store::accounting::Accounting::of(
                 working_set,
                 outside,
+                residency.device.budget,
                 weights,
                 scratch,
                 kv_pool,
@@ -465,6 +456,7 @@ impl Engine for Metal {
                 context: budgets.max_context,
                 slots,
                 kv_budget: residency.device_kv_budget,
+                allowance: residency.device,
                 runahead: engine::runahead::Runahead::of(frames_in_flight),
                 residency: experts::Plan::default(),
                 profiles: self.boot.profiles.clone(),
@@ -479,7 +471,7 @@ impl Engine for Metal {
             }
             eprintln!(
                 "the arena scratch for {} forward tokens ({} bytes) does not fit beside the \
-                 resident weights on this device: `[engine] max_forward_tokens` lowered to {narrower}",
+                 resident weights on this device: fires narrowed to {narrower} tokens",
                 budgets.max_tokens,
                 prepared.arena_bytes(),
             );
