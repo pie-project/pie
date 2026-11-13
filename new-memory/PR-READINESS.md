@@ -29,7 +29,7 @@ Branch today: 432 commits ahead of main, 782 files, +86k / -13k. Main merged in 
 | A23 | Layer-major recurrent state — prototyped on CUDA (sc/layer-major 13f88fa5d): Qwen3.5 c64 +2% (to main parity), c256 / churn no gain, +75-190 MB; NOT adopted (user 2026-11-13) | — | closed |
 | A24 | engine-gpu: one crate holding everything Vulkan and wgpu share — user decision 2026-11-12 | EG agent | done M116 (tip prefill / c64 re-measure pending; tests/ still duplicated) |
 | A25 | sm_90 / sm_100 verification of A1 TMA paths: tables laid on TMA rows (b7003ab5a) must be taken by tcgen05 / wgmma arms (located, windowed) and match main's speed — needs H100 / B200 access | (hardware owner TBD) | pending hardware |
-| A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 (fused.lse_sink kernel gap) -> two-window CUDA unverified | L40S | queued |
+| A9 | dsv41 two-window mini cannot fire on sm_89/sm_120 | L40S | fires now (5a9d55584); bodies-mode by_refs residual on the fp8 path under investigation |
 
 ## B. Decide before the PR (user)
 - B1: DECIDED: ROCm anchored (GEMM-epilogue) synth is IN the PR (AMD, A4 of their synth plan).

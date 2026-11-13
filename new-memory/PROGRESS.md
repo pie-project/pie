@@ -1478,3 +1478,7 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   equal; 30B pages 66312 (held-weight fix); Qwen3-8B speed = main; boot faster than main (8B 19.6 vs 26.4 s, gemma
   18.8 vs 20.6). Open: capacity -4.6% vs main (Qwen3-8B 60352 vs 63232 pages; ~11.5 GiB of room outside the pool vs
   ~4 GiB at M93). c256 ~510 tok/s stall reproduces on main too.
+- A9 (5a9d55584, L40S): the compressed decode's ring is 2 stages where the smem opt-in is under 128 KiB, and the fp8
+  w8a16 GEMM takes the deepest ring that fits (cuBLAS fallback) -> dsv4.1 two-window mini fires on sm_89 / sm_120
+  (was 0/10 armed; main refuses it too). Eager window-list goldens bitwise (base / two lists / one list). Open:
+  bodies-mode base vs by_refs differ from the first window-crossing prefill on this fp8 path (bf16 dsv4 is bitwise).
