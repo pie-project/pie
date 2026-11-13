@@ -402,7 +402,7 @@ fn load(fixture: &Fixture, cache: &Path) -> Shell {
     load_with(fixture, cache, knobs())
 }
 
-/// The `device_kv_budget` a load is given, in MiB; 0 for none
+/// The cache rows' bytes a load is given, in MiB; 0 for none
 /// ([`golden_held_small`]).
 static SMALL_POOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -432,7 +432,7 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
                 .map(|mib| mib << 20),
             mib => Some(mib << 20),
         },
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        allowance: engine::Allowance::WHOLE,
         ordinal: 0,
         knobs,
         cache_dir: Some(cache),
@@ -708,7 +708,11 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             Some(replay) => {
                 let skipped = tokens.len() - replay.window as usize;
                 shell
-                    .fire_media(&[seated(word | replay.bit, &tokens[..skipped], fed)], &[], &[])
+                    .fire_media(
+                        &[seated(word | replay.bit, &tokens[..skipped], fed)],
+                        &[],
+                        &[],
+                    )
                     .expect("the encoder-only rows fire");
                 (skipped, fed + u32::try_from(skipped).expect("a count"))
             }
@@ -1165,7 +1169,7 @@ fn served_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         context: CONTEXT,
         slots: 4,
         kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        allowance: engine::Allowance::WHOLE,
         ordinal: 0,
         knobs: buffering(knobs()),
         cache_dir: Some(cache),
@@ -1326,7 +1330,7 @@ fn served_pair_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         context: CONTEXT,
         slots: 4,
         kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        allowance: engine::Allowance::WHOLE,
         ordinal: 0,
         knobs: buffering(engine_cuda::Knobs::default()),
         cache_dir: Some(cache),
@@ -2005,7 +2009,7 @@ fn served_experts_as(fixture: &Fixture, cache: &Path, rows: Rows, told: bool) ->
     steps
 }
 
-/// A load told its weights are held whose pool (`device_kv_budget`,
+/// A load told its weights are held whose pool (`kv_budget`,
 /// `PIE_GOLDEN_KV_MIB`, 256 by default) is smaller than them: it seats none
 /// in the pool, keeps a copy its fires read in place, and serves what a
 /// load that streams every expert from its host copy serves. (A runtime
@@ -2181,7 +2185,7 @@ fn load_lanes(
         context: CONTEXT,
         slots: lanes,
         kv_budget,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        allowance: engine::Allowance::WHOLE,
         ordinal: 0,
         knobs,
         cache_dir: Some(cache),

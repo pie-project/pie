@@ -137,6 +137,8 @@ pub use engine_cuda::{DeviceBoot, Diagnostics, Knobs, World, ordinal_of};
 struct EngineRegistration {
     spec: EngineSpec,
     backend: Option<EngineBox>,
+    /// What the engine learns of itself while it serves, held from load on.
+    live: ::engine::live::Live,
 }
 
 fn registry() -> &'static Mutex<Vec<Option<EngineRegistration>>> {
@@ -150,11 +152,26 @@ pub fn register_engine_backend(mut spec: EngineSpec, backend: EngineBox) -> usiz
     spec.device_domain = backend
         .device_facts()
         .map_or(MemoryDomain::HostPinned, |facts| facts.domain);
+    let live = backend.live();
     engines.push(Some(EngineRegistration {
         spec,
         backend: Some(backend),
+        live,
     }));
     id
+}
+
+/// What engine `engine_id` learns of itself while it serves
+/// ([`::engine::Engine::live`]); every rung armed for an engine not
+/// registered.
+#[must_use]
+pub fn live(engine_id: usize) -> ::engine::live::Live {
+    registry()
+        .lock()
+        .unwrap()
+        .get(engine_id)
+        .and_then(|d| d.as_ref().map(|r| r.live.clone()))
+        .unwrap_or_default()
 }
 
 pub fn get_spec(engine_id: usize) -> Result<EngineSpec> {

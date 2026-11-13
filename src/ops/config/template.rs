@@ -35,13 +35,15 @@ pub fn default_config_content() -> Result<String> {
         _ => DEFAULT_FRAMES,
     };
     Ok(format!(
-        "{HEADER}{model_block}{engine_block}{RUNTIME}{frames}{TAIL}"
+        "{HEADER}{model_block}{engine_block}{MEMORY}{RUNTIME}{frames}{TAIL}"
     ))
 }
 
 #[cfg(test)]
 pub(crate) fn config_content_with_any_engine() -> String {
-    format!("{HEADER}{DEFAULT_MODEL_BLOCK}{CUDA_ENGINE_BLOCK}{RUNTIME}{DEFAULT_FRAMES}{TAIL}")
+    format!(
+        "{HEADER}{DEFAULT_MODEL_BLOCK}{CUDA_ENGINE_BLOCK}{MEMORY}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
+    )
 }
 
 const HEADER: &str = r#"# Pie configuration, written by `pie config init`. Edit freely.
@@ -69,20 +71,20 @@ source = "Qwen/Qwen3.5-0.8B"
 # weight_dtype     = "bfloat16"  # what the CHECKPOINT holds. activation_dtype
                                  # is what the engine computes in, so that is
                                  # an engine key and this is a model one.
-# Device memory, per device. The share is of the device's memory, less what
-# other processes hold when the engine starts; the kv pool fills what the
-# share leaves past the weights, unless its bytes are stated.
-# memory_tolerance     = "dedicated"  # or aggressive, balanced, polite: gives memory back
-                                       # under pressure and when demand falls
-# device_memory_share  = 0.90
-# device_kv_budget     = "20GiB"  # kv pages and state slots; refused if it does not fit
-# weight_streaming     = "auto"   # or on, off: MoE experts and PLE rows leave the
-                                  # device under pressure before kv does
-# Suspended kv goes to the host, then the disk.
-# host_kv_budget       = "32GiB"
-# disk_kv_budget       = "200GiB"  # the tier is always on
-# disk_kv_dir          = "/nvme/pie"  # omit for $PIE_HOME/cache/kv/<digest>
-# disk_kv_persistent   = false    # keep the disk tier as cache for the next run
+"#;
+
+const MEMORY: &str = r#"
+[engine.memory]
+# Nothing to set on a dedicated machine: the engine measures the device and
+# uses all of it, and the split between weights, kv and fires follows demand.
+# Each key is a cap for sharing the machine.
+# budget_device         = "20GiB"   # per device; omit for the whole device
+# budget_host           = "32GiB"   # suspended kv goes to the host, then the disk
+# budget_disk           = "200GiB"  # the tier is always on
+# disk_path             = "/nvme/pie"  # omit for $PIE_HOME/cache/kv/<digest>
+# disk_persistent       = false     # keep the disk tier as cache for the next run
+# governor_backoff      = 1.0       # share kept each congested stretch; 1.0 never yields
+# governor_release_idle = false     # give back memory demand stopped asking for
 "#;
 
 const RUNTIME: &str = r#"
@@ -106,7 +108,7 @@ const CEREBRAS_FRAMES: &str = r#"frame_size               = 4     # the most: ea
 frame_dispatch_depth     = 15    # ahead, so every lane rides each wafer loop
 "#;
 
-const TAIL: &str = r#"# max_concurrent_processes = 64    # omit: from the engine's max_forward_requests
+const TAIL: &str = r#"# max_concurrent_processes = 64    # omit: from the engine's fire lanes
 # worker_policy            = "noop"  # a PLEX worker policy: built-in name or .wasm path
 # snapshot_budget          = "64GiB"  # what handle snapshots may take on disk
 
@@ -157,8 +159,7 @@ type = "cuda"
 device = ["cuda:0"]
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
-# kv_page_size    = 32      # omit: the engine derives one
-# max_model_len   = 32768   # the most tokens one sequence may hold; omit for
+# max_context     = 32768   # the most tokens one sequence may hold; omit for
 #                           # the context the model's config.json declares,
 #                           # shortened where one sequence at it would take
 #                           # more than half the pool (4096 if it declares
@@ -174,10 +175,7 @@ const METAL_ENGINE_BLOCK: &str = r#"
 type = "metal"
 device = ["metal:0"]
 activation_dtype = "bfloat16"
-# kv_page_size         = 32     # omit for the engine's own
-# max_forward_tokens   = 10240  # omit for the engine's own defaults
-# max_forward_requests = 512    # (max_concurrent_processes derives from this)
-# max_model_len        = 8192   # omit to keep the engine's KV-ring ceiling;
+# max_context          = 8192   # omit to keep the engine's KV-ring ceiling;
                                 # setting it only ever shrinks the ring
 "#;
 
@@ -190,8 +188,6 @@ const VULKAN_ENGINE_BLOCK: &str = r#"
 type = "vulkan"
 device = ["vulkan:0"]       # vkEnumeratePhysicalDevices order; 0 is the first
 activation_dtype = "bfloat16"
-# max_forward_tokens   = 10240  # omit for the engine's own defaults
-# max_forward_requests = 512    # (max_concurrent_processes derives from this)
 # validation           = false  # VK_LAYER_KHRONOS_validation; diagnostic only
 # pipeline_cache       = "/path/to/pipeline.bin"  # omit for $PIE_HOME/cache/vulkan-pipelines.bin
 "#;
@@ -207,9 +203,6 @@ device = ["wgpu:0"]         # enumeration order among the reachable adapters
 activation_dtype = "bfloat16"
 # backends = "vulkan"           # omit for every backend this build carries
 # power_preference     = "high-performance"  # or "low-power", "none"
-# max_forward_tokens   = 10240  # omit for the engine's own defaults
-# max_forward_requests = 512    # (max_concurrent_processes derives from this)
-# device_memory        = "16GiB"  # omit unless the backend reports none
 # pipeline_cache       = "/path/to/pipeline.bin"  # omit for in-process only
 "#;
 
@@ -222,8 +215,6 @@ type = "xla"
 device = ["tpu:0"]          # which of the plugin's addressable devices
 activation_dtype = "bfloat16"
 # plugin               = "/path/to/libtpu.so"  # omit: PIE_XLA_PLUGIN, TPU_LIBRARY_PATH, libtpu.so
-# max_forward_tokens   = 2048   # omit for the engine's own
-# max_forward_requests = 64
 "#;
 
 #[cfg(any(feature = "cerebras", test))]
@@ -238,8 +229,6 @@ activation_dtype = "bfloat16"
 target = "wse3"             # the wafer generation: "wse2" or "wse3"
 num_threads = 16            # host threads for the simulator and staging
 # cmaddr               = "10.0.0.1:9000"  # omit to run the fabric simulator
-# max_forward_tokens   = 64     # omit for the engine's own
-# max_forward_requests = 4
 "#;
 
 #[cfg(test)]
@@ -249,6 +238,7 @@ mod tests {
     #[test]
     fn template_every_case() {
         default_config_is_parseable();
+        every_memory_line_uncommented_parses();
         the_vulkan_block_states_only_keys_the_engine_declares();
         the_wgpu_block_states_only_keys_the_engine_declares();
         the_xla_block_states_only_keys_the_engine_declares();
@@ -270,6 +260,7 @@ mod tests {
             WGPU_ENGINE_BLOCK,
             XLA_ENGINE_BLOCK,
             CEREBRAS_ENGINE_BLOCK,
+            MEMORY,
             RUNTIME,
             DEFAULT_FRAMES,
             CEREBRAS_FRAMES,
@@ -292,6 +283,24 @@ mod tests {
         }
     }
 
+    /// The `[engine.memory]` block, every line uncommented, is a config.
+    fn every_memory_line_uncommented_parses() {
+        let memory: String = MEMORY
+            .lines()
+            .map(|line| line.strip_prefix("# ").unwrap_or(line))
+            .filter(|line| line.starts_with('[') || line.contains(" = "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let content = format!(
+            "{HEADER}{DEFAULT_MODEL_BLOCK}{CUDA_ENGINE_BLOCK}{memory}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
+        );
+        let config = worker::Config::parse(&content).expect("the memory block must parse");
+        assert_eq!(
+            config.engine.memory.budget_device.map(|b| b.as_bytes()),
+            Some(20 << 30)
+        );
+    }
+
     fn default_config_is_parseable() {
         let content = config_content_with_any_engine();
         worker::Config::parse(&content).expect("generated config must parse");
@@ -299,28 +308,28 @@ mod tests {
 
     fn the_vulkan_block_states_only_keys_the_engine_declares() {
         let content = format!(
-            "{HEADER}{DEFAULT_MODEL_BLOCK}{VULKAN_ENGINE_BLOCK}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
+            "{HEADER}{DEFAULT_MODEL_BLOCK}{VULKAN_ENGINE_BLOCK}{MEMORY}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
         );
         worker::Config::parse(&content).expect("the vulkan template must parse");
     }
 
     fn the_wgpu_block_states_only_keys_the_engine_declares() {
         let content = format!(
-            "{HEADER}{DEFAULT_MODEL_BLOCK}{WGPU_ENGINE_BLOCK}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
+            "{HEADER}{DEFAULT_MODEL_BLOCK}{WGPU_ENGINE_BLOCK}{MEMORY}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
         );
         worker::Config::parse(&content).expect("the wgpu template must parse");
     }
 
     fn the_xla_block_states_only_keys_the_engine_declares() {
         let content = format!(
-            "{HEADER}{DEFAULT_MODEL_BLOCK}{XLA_ENGINE_BLOCK}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
+            "{HEADER}{DEFAULT_MODEL_BLOCK}{XLA_ENGINE_BLOCK}{MEMORY}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
         );
         worker::Config::parse(&content).expect("the xla template must parse");
     }
 
     fn the_cerebras_block_states_only_keys_the_engine_declares() {
         let content = format!(
-            "{HEADER}{DEFAULT_MODEL_BLOCK}{CEREBRAS_ENGINE_BLOCK}{RUNTIME}{CEREBRAS_FRAMES}{TAIL}"
+            "{HEADER}{DEFAULT_MODEL_BLOCK}{CEREBRAS_ENGINE_BLOCK}{MEMORY}{RUNTIME}{CEREBRAS_FRAMES}{TAIL}"
         );
         let config = worker::Config::parse(&content).expect("the cerebras template must parse");
         // The runtime's most (`Runahead::STEPS_MAX`, `MAX_FRAMES`), which the

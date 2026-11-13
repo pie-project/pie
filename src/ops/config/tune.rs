@@ -302,9 +302,8 @@ impl crate::ui::Report for TuneReport {
             );
         }
         println!();
-        println!("  Not searched: kv_page_size, max_forward_tokens and max_forward_requests are");
-        println!("  fixed at boot; state them in the config rather than expecting this sweep");
-        println!("  to move them.");
+        println!("  Not searched: the kv page and the fire rungs are derived from the model and");
+        println!("  the device at boot; this sweep does not move them.");
         println!();
         println!(
             "  Measured at {} lanes. A geometry that wins at one fleet width can lose at",

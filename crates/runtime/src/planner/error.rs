@@ -23,7 +23,7 @@ impl StarveCause {
                 "this process alone holds what the pool holds and nothing of it is running \
                  to free any: its parked ask cannot be placed beside what it holds, and a \
                  restart would replay the same asks into the same wall — run fewer lanes at \
-                 once or raise device_kv_budget"
+                 once or raise [engine.memory] budget_device"
             }
             StarveCause::NoRsSlots => {
                 "every RS folded slot is held and no admitted process is still \
@@ -130,7 +130,7 @@ impl std::fmt::Display for PlannerError {
                     f,
                     ": {sum} of a {total}-page pool even with every other holder evicted, so no \
                      eviction or restart (which asks for the same again) can make room — run \
-                     fewer lanes at once or raise device_kv_budget"
+                     fewer lanes at once or raise [engine.memory] budget_device"
                 )
             }
             PlannerError::Starved {
@@ -165,9 +165,9 @@ impl std::fmt::Display for PlannerError {
                 waited,
             } => write!(
                 f,
-                "quota: the host tier is full (host_kv_budget): short by {bytes} bytes for \
-                 {waited:?} of room to park state, and no policy let a set at rest go; close a \
-                 set at rest or raise host_kv_budget"
+                "quota: the host tier is full ([engine.memory] budget_host): short by {bytes} \
+                 bytes for {waited:?} of room to park state, and no policy let a set at rest \
+                 go; close a set at rest or raise budget_host"
             ),
             PlannerError::Short {
                 tier,

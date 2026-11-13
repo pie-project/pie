@@ -116,13 +116,9 @@ pub struct RuntimeConfig {
 }
 
 pub struct ModelConfig {
-    /// How much congestion the system may show before this gives memory back.
+    /// How this process yields memory to the system around it
+    /// (`[engine.memory] governor_*`).
     pub memory_tolerance: crate::governor::Tolerance,
-    /// Whether streamable weights may be evicted under pressure; resolved
-    /// per engine against [`EngineConfig::weights_fit`], and again against
-    /// the pool the weight shapes take: weights it cannot seat stream under
-    /// `auto` and fail the load under `off`.
-    pub weight_streaming: crate::store::weights::WeightStreaming,
     pub name: String,
     pub model_id: String,
     pub kv_page_size: usize,
@@ -133,10 +129,6 @@ pub struct ModelConfig {
 }
 
 pub struct EngineConfig {
-    /// The model's weights fit the device budget at load
-    /// (`LoadFacts::weights_resident`): what `weight_streaming = auto`
-    /// reads.
-    pub weights_fit: bool,
     pub total_pages: usize,
     /// The pools as chunks: what the engine states
     /// ([`::engine::Capabilities::chunks`]).
@@ -258,7 +250,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
     let ModelConfig {
         memory_tolerance,
-        weight_streaming,
         name,
         model_id,
         kv_page_size,
@@ -484,34 +475,14 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let engines: Vec<usize> = engine_configs
         .into_iter()
         .map(|d| {
-            // Weights the engine states as shapes start off the device (the
-            // engine reads them from host until the starting residency), so
-            // its `weights_fit` says nothing of them: `auto` holds them
-            // unless the pool cannot seat them all, which
-            // `store::weights::boot_cache` decides.
-            let streams = match weight_streaming {
-                crate::store::weights::WeightStreaming::Auto if !d.chunks.weights.is_empty() => {
-                    false
-                }
-                mode => mode.streams(d.weights_fit),
-            };
-            let id = engine::register_engine_backend(
+            engine::register_engine_backend(
                 engine::EngineSpec {
                     device_domain: ::engine::MemoryDomain::HostPinned,
                     limits: d.limits,
                     device_geometry_port_mask: d.device_geometry_port_mask,
                 },
                 d.engine_backend,
-            );
-            crate::store::weights::set_streaming(id, streams);
-            tracing::info!(
-                engine = id,
-                mode = ?weight_streaming,
-                weights_fit = d.weights_fit,
-                streams,
-                "weight streaming"
-            );
-            id
+            )
         })
         .collect();
 
@@ -551,20 +522,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     crate::store::shared::SharedGrow::new(arena_model_idx, engine, shared.clone());
                 shared_grows.push(grow.clone());
                 pool = pool.with_shared_grow(grow.clone());
-                shared_steered_pool(
-                    arena_model_idx,
-                    engine,
-                    weight_streaming,
-                    chunk_facts.get(engine),
-                    grow,
-                )?
+                shared_steered_pool(arena_model_idx, engine, chunk_facts.get(engine), grow)?
             }
-            None => steered_pool(
-                arena_model_idx,
-                engine,
-                weight_streaming,
-                chunk_facts.get(engine),
-            )?,
+            None => steered_pool(arena_model_idx, engine, chunk_facts.get(engine))?,
         };
         crate::planner::init_planner(
             arena_model_idx,
@@ -714,21 +674,20 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 }
 
 /// Engine `engine`'s governor target where its pools are pinned (they never
-/// change size), with its weight cache in front ([`boot_cache`]: weights
-/// the pool cannot seat stream under `auto` and fail an `off` load).
+/// change size), with its weight cache in front ([`boot_cache`]: held where
+/// the pool seats every weight, else streaming).
 ///
 /// [`boot_cache`]: crate::store::weights::boot_cache
 fn steered_pool(
     model: usize,
     engine: usize,
-    mode: crate::store::weights::WeightStreaming,
     facts: Option<&::engine::chunk::ChunkFacts>,
 ) -> Result<crate::governor::steered::Shared<crate::governor::steered::Steered>> {
     use crate::store::weights::{WeightFirst, boot_cache, port::EnginePort, slot_pool};
     let none = ::engine::chunk::ChunkFacts::default();
     let facts = facts.unwrap_or(&none);
     let mut slots = slot_pool(facts);
-    let cache = boot_cache(engine, mode, &facts.weights, 0, &mut slots)?;
+    let cache = boot_cache(engine, &facts.weights, 0, &mut slots)?;
     let quiet = cache.shapes() == 0;
     let pool = crate::governor::steered::EnginePool::new(model, engine, slots);
     Ok(crate::governor::steered::Shared::new(WeightFirst::new(
@@ -744,7 +703,6 @@ fn steered_pool(
 fn shared_steered_pool(
     model: usize,
     engine: usize,
-    mode: crate::store::weights::WeightStreaming,
     facts: Option<&::engine::chunk::ChunkFacts>,
     grow: crate::store::shared::SharedGrow,
 ) -> Result<crate::governor::steered::Shared<crate::governor::steered::Steered>> {
@@ -754,7 +712,7 @@ fn shared_steered_pool(
     let cache = {
         let mut shared = grow.shared().lock().unwrap();
         let first = shared.weights_first();
-        boot_cache(engine, mode, &facts.weights, first, shared.pool_mut())?
+        boot_cache(engine, &facts.weights, first, shared.pool_mut())?
     };
     grow.hold_mapped();
     let quiet = cache.shapes() == 0;

@@ -49,7 +49,7 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
         context: CONTEXT,
         slots,
         kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        allowance: engine::Allowance::WHOLE,
         ordinal: 0,
         knobs: crate::Knobs {
             chip: Some(chip.clone()),

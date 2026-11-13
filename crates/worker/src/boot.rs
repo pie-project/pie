@@ -106,7 +106,7 @@ pub(crate) fn load_model_engines(
         let mut group_engines: Vec<GroupEngine> = Vec::with_capacity(topology.len());
         #[cfg(feature = "engine-cuda")]
         if ep_degree > 1 {
-            let mut residency = m.residency();
+            let mut residency = user_cfg.engine.memory.residency();
             residency.kv_seats = user_cfg
                 .runtime
                 .max_concurrent_processes
@@ -126,8 +126,7 @@ pub(crate) fn load_model_engines(
                 u8::try_from(user_cfg.runtime.frame_dispatch_depth).unwrap_or(u8::MAX),
                 &m.adapters,
                 residency,
-                m.patch_ceilings(),
-                m.voxel_ceilings(),
+                e.max_context,
                 &overrides,
             )
             .with_context(|| {
@@ -142,7 +141,7 @@ pub(crate) fn load_model_engines(
                 break;
             }
             // The default swap tiers hold every seat the runtime admits.
-            let mut residency = m.residency();
+            let mut residency = user_cfg.engine.memory.residency();
             residency.kv_seats = user_cfg
                 .runtime
                 .max_concurrent_processes
@@ -393,8 +392,7 @@ fn create_engine_group(
                 frames_in_flight,
                 &m.adapters,
                 residency.clone(),
-                m.patch_ceilings(),
-                m.voxel_ceilings(),
+                cfg.engine.max_context,
                 &m.overrides()?,
             )
             .with_context(|| {
@@ -427,8 +425,7 @@ fn create_engine_group(
         frames_in_flight,
         &m.adapters,
         residency,
-        m.patch_ceilings(),
-        m.voxel_ceilings(),
+        cfg.engine.max_context,
         &m.overrides()?,
         opened,
     )

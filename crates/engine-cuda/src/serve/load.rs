@@ -235,7 +235,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // halves toward its floor until they do, and the lattice follows.
     let (free, total) = crate::store::device_memory()?;
     let after_weights =
-        crate::device::elastic::budget_bytes(free, total, boot.memory_share).saturating_sub(
+        crate::device::elastic::budget_bytes(free, total, boot.allowance).saturating_sub(
             crate::store::weight_tier_bytes(&boot.trace, boot.residency.device_demand(), 0)?,
         );
     let after_weights = held_beside(boot, after_weights)?;
@@ -334,7 +334,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 working(tokens, &Some(at)).saturating_add(seat.payload_bytes())
             });
             eprintln!(
-                "engine-cuda: [model] max_voxels unstated: {fitted} rows of the widest voxel \
+                "engine-cuda: the voxel rung derived: {fitted} rows of the widest voxel \
                  value fit the working set beside {tokens} tokens"
             );
             Some(ladder.at(fitted))
@@ -352,12 +352,11 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     });
     if tokens != asked_tokens {
         eprintln!(
-            "engine-cuda: [engine] max_forward_tokens {asked_tokens} is served at {tokens}: at \
+            "engine-cuda: a fire of {asked_tokens} tokens is served at {tokens}: at \
              {asked_tokens} the activation arena, attention workspaces and one fire's windowed \
              kv rows take {} MiB of the \
-             {} MiB this card has after the weight tier under [model] device_memory_share, and \
-             the cache rows, graph bodies and guest programs need the other half. State a \
-             smaller max_forward_tokens to choose it, or a larger device_memory_share.",
+             {} MiB this card has after the weight tier under the load's allowance, and \
+             the cache rows, graph bodies and guest programs need the other half.",
             working_at(asked_tokens) >> 20,
             after_weights >> 20,
         );
@@ -540,9 +539,9 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
                 "Its checkpoint's planes need decoding at load, so they cannot be read \
                  from the file; give the host more memory."
             } else {
-                "Set `weight_streaming = \"off\"` (the weights are then held on the \
-                 device and read from the file), or use a device with pageable memory \
-                 access (HMM)."
+                "Give the device room to hold them all (they are then held on the device \
+                 and read from the file), or use a device with pageable memory access \
+                 (HMM)."
             }
         )));
     }
@@ -577,7 +576,7 @@ fn refit(
     asked: &Budget,
 ) -> Result<(CompiledModel, Budgets, Vec<u64>)> {
     let (free, total) = crate::store::device_memory()?;
-    let live = crate::device::elastic::budget_bytes(free, total, boot.memory_share);
+    let live = crate::device::elastic::budget_bytes(free, total, boot.allowance);
     let live = held_beside(boot, live)?;
     let facts = kv::probe(&boot.trace)?;
     let window = crate::store::window_of(&boot.trace)?;
@@ -725,13 +724,12 @@ fn refit(
         return Ok((compiled, budgets, tiles_of(&planes, scoped)));
     }
     eprintln!(
-        "engine-cuda: [engine] max_forward_tokens {} and max_forward_requests \
-         {asked_lanes} are served at {tokens} and {lanes}: at the asked budgets a fire's \
-         working set (activation arena, attention workspaces, decoded-weight tiles, guest \
-         programs) takes {} MiB of the {} MiB this card has after the weight tier under \
-         [model] device_memory_share, past the half the cache rows are owed and what one \
-         sequence at the declared context and the bodies' floor need. State smaller budgets \
-         to choose them, or a larger device_memory_share.",
+        "engine-cuda: a fire of {} tokens and {asked_lanes} lanes is served at {tokens} \
+         and {lanes}: at the asked budgets a fire's working set (activation arena, attention \
+         workspaces, decoded-weight tiles, guest programs) takes {} MiB of the {} MiB this \
+         card has after the weight tier under the load's allowance, past the half the cache \
+         rows are owed and what one sequence at the declared context and the bodies' floor \
+         need.",
         asked.max_tokens,
         working_at(asked_lanes, asked_tokens, scoped) >> 20,
         live >> 20,
@@ -775,7 +773,7 @@ impl Shell {
         // could hold, the stated budget or the share of the card before the
         // weights land; `Pools::fit_the_card` sizes it within that.
         let pool_bytes = boot.kv_budget.unwrap_or_else(|| {
-            crate::device::elastic::budget_bytes(free_before, device_total, boot.memory_share)
+            crate::device::elastic::budget_bytes(free_before, device_total, boot.allowance)
         });
         let paging = Paging::of(
             boot.page_size,
@@ -803,7 +801,7 @@ impl Shell {
             0
         };
         let accounting = crate::store::admit_the_card(
-            boot.memory_share,
+            boot.allowance,
             boot.residency.device_demand(),
             decoded_dense,
             &boot.trace,
@@ -1006,7 +1004,7 @@ impl Shell {
         let arena_bytes = compiled.arena.bytes.max(forked_bytes);
         let pools = Pools::reserve(
             device.ordinal(),
-            boot.memory_share,
+            boot.allowance,
             &boot.trace,
             paging,
             boot.kv_budget,
@@ -1364,8 +1362,8 @@ impl Shell {
                 Fault::Residency(format!(
                     "the card does not hold this deployment: the decoded-weight tile stream \
                      {stream} decodes its widest plane into, {tile} bytes, would not allocate \
-                     beside the weights, activations and inputs ({why}). Raise `[model] \
-                     device_memory_share`, serve a quantized deployment of the model, or free \
+                     beside the weights, activations and inputs ({why}). Raise `[engine.memory] \
+                     budget_device`, serve a quantized deployment of the model, or free \
                      what else holds the device."
                 ))
             })?;
@@ -1619,7 +1617,7 @@ fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
 /// What holds the device when the cache rows come to be declared, in bytes:
 /// what was in use before this load began (other processes, and this one's
 /// context) and each thing the load has put down since. The elastic budget
-/// is what `[model] device_memory_share` leaves after all of it.
+/// is what the load's allowance leaves after all of it.
 struct Footprint {
     total: u64,
     before: u64,

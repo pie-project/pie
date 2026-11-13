@@ -1003,6 +1003,8 @@ impl Snapshot {
         match what {
             "band" => Some(Value::Text(reading.band.name().into())),
             "short-bytes" => int(reading.short),
+            "model-bytes" => int(pressure::ledger(tier).model),
+            "outside-bytes" => int(pressure::ledger(tier).outside),
             _ => {
                 let bytes = self.bytes(tier)?;
                 match what {

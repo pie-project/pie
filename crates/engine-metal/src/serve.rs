@@ -43,9 +43,13 @@ pub struct Boot<'a> {
     pub page_size: u32,
     pub context: u32,
     pub slots: u32,
-    /// `[model] device_kv_budget`: the bytes the kv pool and the state slots
-    /// beside it take; `None` fills what the measured capacity leaves.
+    /// The bytes the kv pool and the state slots beside it take, as a test
+    /// states them (`Residency::device_kv_budget`); `None` fills what the
+    /// measured capacity leaves.
     pub kv_budget: Option<u64>,
+    /// `[engine.memory] budget_device`: a cap on the measured capacity. Its
+    /// stand-in share of the device is not read here: Metal measures.
+    pub allowance: engine::Allowance,
     pub runahead: Runahead,
     pub residency: Plan,
     /// `$PIE_HOME/profiles`, where a user's device profiles live; `None`
@@ -256,6 +260,9 @@ pub struct Shell {
     /// What the device held for this process before the load: the ledger's
     /// `outside`.
     outside: u64,
+    /// `[engine.memory] budget_device`, where stated: the ledger's capacity
+    /// is the working set capped by it.
+    budget: Option<u64>,
     keepalive: Option<crate::keepalive::KeepAlive>,
     pipelines: Pipelines,
     handles: Handles,
@@ -974,6 +981,7 @@ impl PreparedLoad<'_> {
             crate::store::accounting::Accounting::of(
                 device.working_set(),
                 outside,
+                boot.allowance.budget,
                 model_bytes,
                 fire_bytes,
                 pool,
@@ -1113,6 +1121,7 @@ impl PreparedLoad<'_> {
             tuning,
             device,
             outside,
+            budget: boot.allowance.budget,
             keepalive,
             pipelines: Pipelines::new(),
             handles,
@@ -1553,8 +1562,11 @@ impl Shell {
     #[must_use]
     pub fn ledger(&self) -> engine::memory::Ledger {
         use engine::memory::Class::{Fire, Model, Outside, State};
-        let mut ledger =
-            engine::memory::Ledger::new(self.pools.layout().chunk_bytes, self.working_set());
+        let mut ledger = engine::memory::Ledger::new(
+            self.pools.layout().chunk_bytes,
+            self.budget
+                .map_or(self.working_set(), |budget| budget.min(self.working_set())),
+        );
         let (ane_model, ane_fire) = self.ane.as_ref().map_or((0, 0), crate::ane::Ane::bytes);
         let (guest_state, guest_fire) = self.programs.bytes();
         let entries = [

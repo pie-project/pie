@@ -53,20 +53,59 @@ pub enum Checkpoint {
     None,
 }
 
-/// The share of the device's memory a load may take when `[model]
-/// device_memory_share` is not stated.
-pub const DEFAULT_DEVICE_MEMORY_SHARE: f64 = 0.9;
+/// The share of a device's memory a load takes for itself; the rest is left
+/// to what the driver allocates beside it after load (graph bodies, modules
+/// loaded on first use, library workspaces). Provisional: it stands until
+/// that `outside` term is measured into the ledger (REDESIGN 2.2).
+pub const DEVICE_SHARE: f64 = 0.9;
+
+/// What a load may take of its device: [`DEVICE_SHARE`] of it, less what is
+/// held already, and no more than `[engine.memory] budget_device` when the
+/// operator states one (sharing a device with another process is the one
+/// thing a load cannot derive).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Allowance {
+    /// `[engine.memory] budget_device`, in bytes.
+    pub budget: Option<u64>,
+}
+
+impl Allowance {
+    /// The whole device: no budget stated.
+    pub const WHOLE: Allowance = Allowance { budget: None };
+
+    /// Of a device of `total` bytes, `held` of which are taken already (by
+    /// this process or another): what this load may still take.
+    #[must_use]
+    pub fn room(self, total: u64, held: u64) -> u64 {
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a device's byte count is far inside f64's exact integer range, and \
+                      the product is floored back into u64 deliberately"
+        )]
+        let share = (total as f64 * DEVICE_SHARE) as u64;
+        let room = share.saturating_sub(held);
+        self.budget.map_or(room, |budget| room.min(budget))
+    }
+
+    /// Of a device of `total` bytes: what a load may take of all of it.
+    #[must_use]
+    pub fn ceiling(self, total: u64) -> u64 {
+        self.room(total, 0)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Residency {
-    /// Device bytes the kv pages and recurrent-state slots take; `None`
-    /// fills what `device_memory_share` leaves.
+    /// What the load may take of its device.
+    #[serde(default)]
+    pub device: Allowance,
+    /// The bytes the kv pages and recurrent-state slots take, where a test
+    /// or bench fixes them; `None` (what every served load states: no
+    /// config key reaches it) fills what `device` leaves.
     #[serde(default)]
     pub device_kv_budget: Option<u64>,
-    /// The share of the device's memory the load may take: weights, working
-    /// set and pool. What other processes hold when it begins comes off it.
-    #[serde(default = "default_share")]
-    pub device_memory_share: f64,
     /// `None`: every seat at full context, and at least one device pool.
     #[serde(default)]
     pub host_kv_budget: Option<u64>,
@@ -91,17 +130,16 @@ pub struct Residency {
     /// at load and keeps them mapped for its life.
     #[serde(default)]
     pub kv_export: bool,
-    /// Whether the weights an engine states as weight shapes are held for
-    /// the load's life: the deployment does not stream them, and the first
-    /// weight residency names every atom before any fire
-    /// (`WeightResidency::held`). An engine may then keep no host copy of
-    /// them and choose its kernels once, at that residency.
+    /// Whether the weights an engine states as weight shapes start held:
+    /// the first weight residency names every atom before any fire
+    /// (`WeightResidency::held`) where the runtime's pool seats them all.
+    /// Live demand comes before that cache (REDESIGN 2.7a, rule 1): the
+    /// runtime may later offer a residency that is not held, and moves no
+    /// slot until the engine took it. An engine that refuses the offer
+    /// keeps the set held for the load (and may then keep no host copy and
+    /// choose its kernels once); one that takes it streams from then on.
     #[serde(default)]
     pub weights_held: bool,
-}
-
-fn default_share() -> f64 {
-    DEFAULT_DEVICE_MEMORY_SHARE
 }
 
 impl Default for Residency {
@@ -123,8 +161,8 @@ impl Residency {
     #[must_use]
     pub const fn uncapped() -> Residency {
         Residency {
+            device: Allowance::WHOLE,
             device_kv_budget: None,
-            device_memory_share: DEFAULT_DEVICE_MEMORY_SHARE,
             host_kv_budget: None,
             kv_seats: None,
             disk_kv_budget: Some(0),

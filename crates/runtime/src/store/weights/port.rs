@@ -1,18 +1,19 @@
 //! The weight cache's engine side, through the engine's scheduler lane.
 //!
-//! The governor's tick cannot wait on the lane, so neither verb blocks: a
+//! The governor's tick cannot wait on the lane, so no verb blocks: a
 //! resident set is queued on the lane ahead of every fire queued after it,
 //! and the use record a tick reads is the one the lane answered since the
-//! last tick asked (one tick late, within a window of
-//! [`super::WINDOW_TICKS`]). An engine that answers either verb
-//! unsupported is asked nothing more; one with no weight shapes is never
-//! asked at all. The load alone waits: on the resident set the engine
-//! starts with, before the first fire can be submitted.
+//! last tick asked (one tick late). A set offered for the engine to refuse
+//! ([`WeightPort::propose`]) hands its answer back to be read on a later
+//! tick. An engine that answers a verb unsupported is asked nothing more;
+//! one with no weight shapes is never asked at all. The load alone waits:
+//! on the resident set the engine starts with, before the first fire can be
+//! submitted.
 
 use ::engine::chunk::{WeightResidency, WeightUses};
 use tokio::sync::oneshot::{Receiver, error::TryRecvError};
 
-use super::WeightPort;
+use super::{Proposal, WeightPort};
 use crate::scheduler::worker::HostKvOp;
 
 pub type Answer = Receiver<anyhow::Result<Vec<u8>>>;
@@ -149,5 +150,18 @@ impl WeightPort for EnginePort {
         let pending = self.queue(HostKvOp::WeightResidency(residency.clone()))?;
         self.residencies.push(pending);
         Ok(())
+    }
+
+    fn propose(&mut self, residency: &WeightResidency) -> Proposal {
+        if self.quiet {
+            return Proposal::Taken;
+        }
+        if self.unsupported {
+            return Proposal::Refused;
+        }
+        match self.queue(HostKvOp::WeightResidency(residency.clone())) {
+            Ok(answer) => Proposal::Pending(answer),
+            Err(_) => Proposal::Refused,
+        }
     }
 }

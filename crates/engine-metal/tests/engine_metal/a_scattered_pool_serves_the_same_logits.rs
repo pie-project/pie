@@ -298,6 +298,7 @@ fn load_near(fixture: &Fixture, context: u32, chunk: Option<u64>) -> Shell {
         context,
         slots: SEATS,
         kv_budget: None,
+        allowance: engine::Allowance::WHOLE,
         runahead: engine::runahead::Runahead::F1,
         residency: match chunk {
             Some(bytes) => residency.with_chunk_bytes(bytes),

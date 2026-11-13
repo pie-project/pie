@@ -1094,8 +1094,8 @@ impl Prepared {
                         "a guest program's scratch does not fit beside this load: {} bytes a \
                          lane at {lanes} lanes wants {need}, and the device has {have} free once \
                          the weights, the declared kv pool and everything else the load holds \
-                         are resident. Lower `[engine] max_forward_requests`, or state a `[model] \
-                         device_kv_budget` under what the load derived.",
+                         are resident. Lower `[engine.memory] budget_device` beside another \
+                         process, or free what else holds the device.",
                         self.scratch_stride
                     )),
                     other => other,

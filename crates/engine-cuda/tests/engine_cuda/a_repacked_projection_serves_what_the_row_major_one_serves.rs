@@ -322,7 +322,7 @@ fn logits(arm: Arm, prompt: &[u32]) -> Vec<f32> {
         context: 256,
         slots: 1,
         kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        allowance: engine::Allowance::WHOLE,
         ordinal: 0,
         knobs: engine_cuda::Knobs::default(),
         cache_dir: None,

@@ -280,11 +280,9 @@ fn measure(
     grid: &qmm::Grid,
     say: &mut dyn FnMut(&str),
 ) -> Result<qmm::Measured, String> {
-    let device = crate::device::Context::bind(
-        &crate::api::DeviceBoot::default(),
-        engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-    )
-    .map_err(|e| e.to_string())?;
+    let device =
+        crate::device::Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
+            .map_err(|e| e.to_string())?;
     qmm::measure(&device, base, grid, say)
 }
 

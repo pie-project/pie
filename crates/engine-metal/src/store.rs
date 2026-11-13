@@ -171,8 +171,8 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
 }
 
 /// The bytes a load's pool takes at `paging`: the kv and state rows and the
-/// recurrent-state buffers beside them, what `[model] device_kv_budget`
-/// states for it.
+/// recurrent-state buffers beside them, what a test's
+/// `Residency::device_kv_budget` states for it.
 pub fn pool_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     let rs = crate::rs::Layout::read(trace)?;
     Ok(PoolDemand::of(trace, paging, rs.as_ref())?.bytes(paging.pages()))

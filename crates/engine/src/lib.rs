@@ -18,6 +18,7 @@ pub mod error;
 pub mod fire;
 pub mod fit;
 pub mod frame;
+pub mod live;
 pub mod load;
 pub mod memory;
 pub mod placement;
@@ -45,7 +46,7 @@ pub use fire::{
     Attachment, FireId, FireTicket, FoldLen, FrameId, FrameSubmission, FrameTicket, KvDelta, Lane,
     LaneReadout, Mask, Masking, MediaEncode, Readout, RsReset, RsSnapshot, RsVerb, Serves, Step,
 };
-pub use load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
+pub use load::{Allowance, Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
 pub use program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };

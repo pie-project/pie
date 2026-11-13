@@ -1,4 +1,4 @@
-# Keeps on its worker's persistent disk tier (`disk_kv_persistent`) the
+# Keeps on its worker's persistent disk tier (`[engine.memory] disk_persistent`) the
 # prefix a process asked for: its system turn under `persist-system`, or its
 # first `persist-prefix-tokens`. A level-triggered replication table at tier
 # `disk`, re-enacted until each such prefix is there.

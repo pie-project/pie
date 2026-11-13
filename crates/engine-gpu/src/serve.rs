@@ -74,11 +74,11 @@ pub trait Serve: Backend {
     /// reads are prestaged in the arm's ring rather than handed from the host.
     const RECORDS: bool;
 
-    /// Opens the device (adopting `handed` where the host handed one) and
-    /// its tuning.
+    /// Opens the device (adopting `handed` where the host handed one), of
+    /// which the load takes what `allowance` gives, and its tuning.
     fn open(
         boot: &Self::DeviceBoot,
-        share: f64,
+        allowance: engine::Allowance,
         handed: Option<Self::Handed>,
     ) -> Result<(Self::Context, Self::Tuning)>;
 
@@ -626,11 +626,7 @@ pub struct Shell<B: Serve> {
 impl<B: Serve> Shell<B> {
     pub fn load(boot: Boot<'_, B>) -> Result<Shell<B>> {
         let mut boot = boot;
-        let (device, tuning) = B::open(
-            boot.device,
-            boot.residency.device_memory_share,
-            boot.handed.take(),
-        )?;
+        let (device, tuning) = B::open(boot.device, boot.residency.device, boot.handed.take())?;
         let tier = B::tier(&device);
         let chip = tuning.profile();
         let mut boot = Boot {

@@ -373,7 +373,12 @@ mod tests {
         let fields = fields(EngineKind::Cuda);
         let by_key = |k: &str| fields.iter().find(|f| f.key == k).expect(k);
         assert!(by_key("runtime.max_concurrent_processes").default.is_none());
-        assert!(by_key("engine.kv_page_size").default.is_none());
+        assert!(by_key("engine.max_context").default.is_none());
+        assert!(by_key("engine.memory.budget_device").default.is_none());
+        assert_eq!(
+            by_key("engine.memory.governor_backoff").default,
+            Some(toml::Value::Float(1.0))
+        );
         assert_eq!(
             by_key("server.listen").default,
             Some(toml::Value::String("127.0.0.1:8080".into()))

@@ -70,13 +70,14 @@ pub struct Boot<'a> {
 
     pub slots: u32,
 
-    /// Device bytes the kv pages and state slots take (`[model]
-    /// device_kv_budget`); `None` fills what `memory_share` leaves.
+    /// Device bytes the kv pages and state slots take, where a test fixes
+    /// them (`Residency::device_kv_budget`); `None` fills what `allowance`
+    /// leaves.
     pub kv_budget: Option<u64>,
 
-    /// The share of the device's memory the load may take (`[model]
-    /// device_memory_share`).
-    pub memory_share: f64,
+    /// What the load may take of the device (`[engine.memory]
+    /// budget_device`).
+    pub allowance: engine::Allowance,
 
     pub device: &'a crate::api::DeviceBoot,
 }
@@ -449,8 +450,8 @@ impl Shell {
             weight_floor
         };
         let room = device.memory().map_or(u64::MAX, |bytes| {
-            ((bytes as f64 * boot.memory_share) as u64)
-                .saturating_sub(device.held())
+            boot.allowance
+                .room(bytes, device.held())
                 .saturating_sub(weight_floor)
                 .saturating_sub(headroom)
                 / 2
@@ -551,7 +552,10 @@ impl Shell {
         // budget of kv pages and state slots does not pay for: off the room.
         let reserved = crate::store::reserved_bytes(
             &boot.trace,
-            paging_at(u64::from(boot.context.div_ceil(boot.page_size.max(1))), boot.slots)?,
+            paging_at(
+                u64::from(boot.context.div_ceil(boot.page_size.max(1))),
+                boot.slots,
+            )?,
             rs_layout.as_deref(),
             target,
         )?;
@@ -562,7 +566,7 @@ impl Shell {
         // since it plans none of its own.
         let working = device
             .memory()
-            .map(|bytes| ((bytes as f64 * boot.memory_share) as u64).saturating_sub(device.held()));
+            .map(|bytes| boot.allowance.room(bytes, device.held()));
         let weight_floor = boot.trace.params.iter().try_fold(0u64, |sum, p| {
             crate::weights::plane_bytes(&p.name, p.dtype, &p.shape).map(|b| sum + b)
         })?;

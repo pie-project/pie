@@ -512,96 +512,49 @@ pub struct ModelConfig {
     /// Removed: dense weights always live on the device.
     #[serde(default, skip_serializing)]
     pub host_weight_budget: Removed<removed::HostWeightBudget>,
-    /// How much congestion the system may show before this gives memory
-    /// back: `dedicated` never does, then `aggressive`, `balanced`, `polite`.
-    /// All but `dedicated` also give back what demand stopped asking for.
-    #[serde(default)]
-    pub memory_tolerance: runtime::governor::Tolerance,
-    /// Whether the streamable weights (routed MoE experts, per-layer
-    /// embedding rows) may leave the device under memory pressure: `on`
-    /// sheds their cache down to the staging floor before any kv or state
-    /// gives way, `off` keeps every weight resident and lets the pressure
-    /// fall on kv and state, `auto` is off when the weights fit the
-    /// device at load and on when they do not.
-    #[serde(default)]
-    pub weight_streaming: runtime::store::weights::WeightStreaming,
-    /// How many device bytes the kv pages and recurrent-state slots take
-    /// (`"20GiB"`), per device. Omit to fill what `device_memory_share`
-    /// leaves once the weights and working set are down. A budget the device
-    /// does not hold refuses the load; it is never cut to fit.
-    #[serde(default)]
-    pub device_kv_budget: Option<ByteSize>,
-    /// The share of the device's memory this load may take: weights, working
-    /// set and kv pool. What other processes hold when the load begins comes
-    /// off it, as on a card another server shares.
-    #[serde(default = "default_device_memory_share")]
-    pub device_memory_share: f64,
-    /// How many pinned host bytes a preempted process's kv pages and
-    /// recurrent-state slots may be suspended into (`"32GiB"`), shared by
-    /// the tensor-parallel ranks: one rs row per device slot, then kv pages.
-    /// Omit for every seat at full context, at least one device pool and at
-    /// most four (cuda), up to half the host memory the load leaves free (so
-    /// workers sharing a host each find room); a stated budget is capped by
-    /// all of it. Pinned memory is slow to give back: a worker that dies
-    /// holds its host's other GPU processes ~0.2 s a GiB of it. The
-    /// container's cgroup limit (v1 or v2) counts as the host's. pie cannot
-    /// compute kv again, so this is where memory contention goes: it cannot
-    /// be turned off.
-    #[serde(default)]
-    pub host_kv_budget: Option<ByteSize>,
-    /// How many disk bytes suspended kv may spill into once host swap is
-    /// full (`"200GiB"`), shared by the ranks, each in its own slot file
-    /// under `disk_kv_dir` (default `$PIE_HOME/cache/kv/<checkpoint
-    /// digest>`), unlinked once open so it never outlives the server unless
-    /// `disk_kv_persistent`. Metal
-    /// and Vulkan keep no host tier, so there it is the only one, and
-    /// suspended rs slots go to it too. Omit for four host tiers' worth on
-    /// cuda, or every seat at full context elsewhere, within a quarter of
-    /// the free space there. The tier is always on: it is what keeps a
-    /// session when memory is taken back.
-    #[serde(default)]
-    pub disk_kv_budget: Option<ByteSize>,
-    /// Where the disk tier's slot files go. Omit for
-    /// `$PIE_HOME/cache/kv/<checkpoint digest>`.
-    #[serde(default)]
-    pub disk_kv_dir: Option<std::path::PathBuf>,
-    /// Keeps the disk tier for the next run: its slot files stay under
-    /// `disk_kv_dir` with a journal of the sealed pages they hold, and a
-    /// restart takes those pages back as cache. Swap and cache share
-    /// `disk_kv_budget`, suspended kv first. Off by default; cuda only, and
-    /// not for a model with recurrent state or a window.
-    #[serde(default)]
-    pub disk_kv_persistent: bool,
+    /// Removed: `[engine.memory] governor_backoff` / `governor_release_idle`.
+    #[serde(default, skip_serializing)]
+    pub memory_tolerance: Removed<removed::MemoryTolerance>,
+    /// Removed: the weight cache has no mode.
+    #[serde(default, skip_serializing)]
+    pub weight_streaming: Removed<removed::WeightStreaming>,
+    /// Removed: the kv pool takes what the device has.
+    #[serde(default, skip_serializing)]
+    pub device_kv_budget: Removed<removed::DeviceKvBudget>,
+    /// Removed: the load measures the device.
+    #[serde(default, skip_serializing)]
+    pub device_memory_share: Removed<removed::DeviceMemoryShare>,
+    /// Removed: `[engine.memory] budget_host`.
+    #[serde(default, skip_serializing)]
+    pub host_kv_budget: Removed<removed::HostKvBudget>,
+    /// Removed: `[engine.memory] budget_disk`.
+    #[serde(default, skip_serializing)]
+    pub disk_kv_budget: Removed<removed::DiskKvBudget>,
+    /// Removed: `[engine.memory] disk_path`.
+    #[serde(default, skip_serializing)]
+    pub disk_kv_dir: Removed<removed::DiskKvDir>,
+    /// Removed: `[engine.memory] disk_persistent`.
+    #[serde(default, skip_serializing)]
+    pub disk_kv_persistent: Removed<removed::DiskKvPersistent>,
     /// Removed: the engine tier it deferred is gone.
     #[serde(default, skip_serializing)]
     pub host_weight_deferred: Removed<removed::HostWeightDeferred>,
-    /// The most patch rows one fire may carry, over every image of every lane
-    /// in it. Omit it: a vision deployment derives a ceiling from the checkpoint's
-    /// own shapes, and a text-only deployment wants no ladder at all.
-    #[serde(default)]
-    pub max_patches: Option<u32>,
-    /// The patch axis's lane ceiling: the most images one fire may carry.
-    /// Omit it, as above; the default is derived from `max_patches`.
-    #[serde(default)]
-    pub max_images: Option<u32>,
-    /// The most rows the widest voxel value of one fire may hold: a
-    /// `vae.decode` pass is admitted at this over its growth in latents, a
-    /// `vae.encode` pass at this in pixels. Omit it and the engine fits it to
-    /// the working set its memory share leaves.
-    #[serde(default)]
-    pub max_voxels: Option<u32>,
-    /// The most clips one fire may carry, over every lane. Omit it and one
-    /// is derived from the lane ceiling.
-    #[serde(default)]
-    pub max_clips: Option<u32>,
+    /// Removed: the patch ladder is derived.
+    #[serde(default, skip_serializing)]
+    pub max_patches: Removed<removed::MaxPatches>,
+    /// Removed: the patch ladder is derived.
+    #[serde(default, skip_serializing)]
+    pub max_images: Removed<removed::MaxImages>,
+    /// Removed: the voxel ladder is derived.
+    #[serde(default, skip_serializing)]
+    pub max_voxels: Removed<removed::MaxVoxels>,
+    /// Removed: the voxel ladder is derived.
+    #[serde(default, skip_serializing)]
+    pub max_clips: Removed<removed::MaxClips>,
     /// How many adapter seats this deployment intends to use, and which
     /// adapters to write into them at boot. Absent means zero seats.
     #[serde(default)]
     pub adapters: AdapterConfig,
-}
-
-fn default_device_memory_share() -> f64 {
-    engine::load::DEFAULT_DEVICE_MEMORY_SHARE
 }
 
 fn default_weight_dtype() -> String {
@@ -694,42 +647,6 @@ impl ModelConfig {
         (!self.adapter_dir.is_empty()).then(|| std::path::PathBuf::from(&self.adapter_dir))
     }
 
-    /// The two weight budgets and the tier arm, in the form the engine's load
-    /// contract states them. Both budgets absent and the arm on is
-    /// [`engine::Residency::uncapped`].
-    /// The second row axis's two ceilings, in the form the engine's load
-    /// contract states them. Both absent derives a ladder from the loaded
-    /// text when the plan states a patch axis.
-    /// The THIRD row axis's two ceilings, in the same form. Both absent
-    /// derives a ladder from the loaded text when the plan states a voxel
-    /// axis.
-    #[must_use]
-    pub fn residency(&self) -> engine::Residency {
-        engine::Residency {
-            device_kv_budget: self.device_kv_budget.map(|b| b.as_bytes()),
-            device_memory_share: self.device_memory_share,
-            host_kv_budget: self.host_kv_budget.map(|b| b.as_bytes()),
-            kv_seats: None,
-            disk_kv_budget: self.disk_kv_budget.map(|b| b.as_bytes()),
-            disk_kv_dir: self.disk_kv_dir.clone(),
-            disk_kv_persistent: self.disk_kv_persistent,
-            kv_export: false,
-            // Unless told to stream, the weight cache holds every atom for
-            // the load's life.
-            weights_held: self.weight_streaming != runtime::store::weights::WeightStreaming::On,
-        }
-    }
-
-    #[must_use]
-    pub fn patch_ceilings(&self) -> (Option<u32>, Option<u32>) {
-        (self.max_patches, self.max_images)
-    }
-
-    #[must_use]
-    pub fn voxel_ceilings(&self) -> (Option<u32>, Option<u32>) {
-        (self.max_voxels, self.max_clips)
-    }
-
     /// What this config changes about the deployment its checkpoint states.
     ///
     /// # Errors
@@ -814,38 +731,6 @@ impl ModelConfig {
             "model.adapter_dir must be an absolute path (got {:?}); \
              leave it empty to mount no shared adapters at all",
             self.adapter_dir
-        );
-        for (key, rows) in [
-            ("max_patches", self.max_patches),
-            ("max_images", self.max_images),
-        ] {
-            ensure!(
-                rows != Some(0),
-                "model.{key} = 0 admits no image at all; omit the key to let the engine \
-                 derive a ladder from the model text, or state a positive count"
-            );
-        }
-        ensure!(
-            self.device_memory_share.is_finite()
-                && self.device_memory_share > 0.0
-                && self.device_memory_share <= 1.0,
-            "model.device_memory_share must be finite and in (0.0, 1.0]"
-        );
-        ensure!(
-            self.device_kv_budget.is_none_or(|b| b.as_bytes() > 0),
-            "model.device_kv_budget is zero, and no load serves without a kv pool; \
-             state a real budget or omit the key to fill what device_memory_share leaves"
-        );
-        ensure!(
-            self.disk_kv_budget.is_none_or(|b| b.as_bytes() > 0),
-            "model.disk_kv_budget is zero, and the disk tier is what keeps a session when \
-             memory is taken back; state a real budget or omit the key"
-        );
-        ensure!(
-            self.host_kv_budget.is_none_or(|b| b.as_bytes() > 0),
-            "model.host_kv_budget is zero, but pie cannot compute kv again: under \
-             memory contention suspended kv has to go to host memory. State a real \
-             budget or omit the key for every seat at full context"
         );
         self.adapters.validate()?;
         Ok(())
@@ -1003,26 +888,145 @@ pub struct EngineConfig {
     /// computes.
     #[serde(default = "default_activation_dtype")]
     pub activation_dtype: String,
+    /// The longest sequence (prompt + output) one lane holds, in tokens: a
+    /// product limit, not a memory one. Omit for the model's own context,
+    /// shortened to what the device holds where one sequence at it would
+    /// not fit.
+    #[serde(default)]
+    pub max_context: Option<u32>,
+    /// `[engine.memory]`: the optional caps for sharing a machine.
+    #[serde(default)]
+    pub memory: MemoryConfig,
     /// Engine-specific knobs, written beside the common keys. Embedded
     /// engines parse this into typed option structs.
     #[serde(flatten)]
     pub options: toml::Table,
 }
 
+/// `[engine.memory]`: what a load may take of the machine. Memory sizing
+/// reads none of these by default: the engine measures the device and
+/// uses all of it, and how it is split between weights, state and fires
+/// follows demand at run time. An empty table is the best configuration
+/// for a dedicated machine; each key is a cap for sharing one.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// The most device memory this load takes (`"20GiB"`), per device, for
+    /// a device shared with another process. Omit to use the whole device.
+    pub budget_device: Option<ByteSize>,
+    /// The most pinned host memory suspended kv pages and state slots may
+    /// take (`"32GiB"`), shared by the tensor-parallel ranks. Omit for every
+    /// seat at full context, within half of what the host has free (so
+    /// workers sharing a host each find room). pie cannot compute kv again,
+    /// so this is where memory contention goes: it cannot be turned off.
+    pub budget_host: Option<ByteSize>,
+    /// The most disk suspended kv may spill into once the host tier is full
+    /// (`"200GiB"`), shared by the ranks, in slot files under `disk_path`.
+    /// Omit for the engine's own share of the free space there.
+    pub budget_disk: Option<ByteSize>,
+    /// Where the disk tier's slot files go. Omit for
+    /// `$PIE_HOME/cache/kv/<checkpoint digest>`.
+    pub disk_path: Option<PathBuf>,
+    /// Keeps the disk tier for the next run: its slot files stay under
+    /// `disk_path` with a journal of the sealed pages they hold, and a
+    /// restart takes those pages back as cache. Off by default; cuda only,
+    /// and not for a model with recurrent state or a window.
+    pub disk_persistent: bool,
+    /// The share of its memory this process keeps each time the system
+    /// around it stays congested: `1.0` never yields (a dedicated machine),
+    /// `0.7` yields at once.
+    pub governor_backoff: f64,
+    /// Gives back, a little at a time, the memory demand stopped asking
+    /// for, whether or not anything else wants it.
+    pub governor_release_idle: bool,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            budget_device: None,
+            budget_host: None,
+            budget_disk: None,
+            disk_path: None,
+            disk_persistent: false,
+            governor_backoff: 1.0,
+            governor_release_idle: false,
+        }
+    }
+}
+
+impl MemoryConfig {
+    /// What a load may take of the machine, in the form the engine's load
+    /// contract states it. The weights start held (every streamable atom
+    /// resident where the pool seats them all); live demand may take them
+    /// off the device later.
+    #[must_use]
+    pub fn residency(&self) -> engine::Residency {
+        engine::Residency {
+            device: engine::Allowance {
+                budget: self.budget_device.map(|b| b.as_bytes()),
+            },
+            device_kv_budget: None,
+            host_kv_budget: self.budget_host.map(|b| b.as_bytes()),
+            kv_seats: None,
+            disk_kv_budget: self.budget_disk.map(|b| b.as_bytes()),
+            disk_kv_dir: self.disk_path.clone(),
+            disk_kv_persistent: self.disk_persistent,
+            kv_export: false,
+            weights_held: true,
+        }
+    }
+
+    /// How this process yields memory to the system around it.
+    #[must_use]
+    pub const fn tolerance(&self) -> runtime::governor::Tolerance {
+        runtime::governor::Tolerance {
+            backoff: self.governor_backoff,
+            release_idle: self.governor_release_idle,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.governor_backoff.is_finite()
+                && self.governor_backoff > 0.0
+                && self.governor_backoff <= 1.0,
+            "engine.memory.governor_backoff must be in (0.0, 1.0]: the share kept each \
+             congested stretch, 1.0 to never yield"
+        );
+        for (key, budget) in [
+            ("budget_device", self.budget_device),
+            ("budget_host", self.budget_host),
+            ("budget_disk", self.budget_disk),
+        ] {
+            ensure!(
+                budget.is_none_or(|b| b.as_bytes() > 0),
+                "engine.memory.{key} is zero, and a load needs some of every tier it \
+                 has; state a real budget or omit the key"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl EngineConfig {
     fn validate(&self) -> Result<()> {
         ensure!(!self.device.is_empty(), "engine.device must be non-empty");
+        ensure!(
+            self.max_context != Some(0),
+            "engine.max_context = 0 holds no sequence; omit it for the model's own context"
+        );
+        self.memory.validate()?;
         match self.kind {
             EngineKind::Cuda => {
-                let opts: CudaEngineOptions = toml::Value::Table(self.options.clone())
+                let _: CudaEngineOptions = toml::Value::Table(self.options.clone())
                     .try_into()
                     .map_err(|e| {
-                    anyhow::anyhow!(
-                        "invalid [engine] options for engine type {:?}: {e}",
-                        self.kind,
-                    )
-                })?;
-                opts.validate()?;
+                        anyhow::anyhow!(
+                            "invalid [engine] options for engine type {:?}: {e}",
+                            self.kind,
+                        )
+                    })?;
             }
             EngineKind::Metal => {
                 let _: MetalEngineOptions = toml::Value::Table(self.options.clone())
@@ -1035,7 +1039,7 @@ impl EngineConfig {
                     })?;
             }
             EngineKind::Vulkan => {
-                let opts: VulkanEngineOptions = toml::Value::Table(self.options.clone())
+                let _: VulkanEngineOptions = toml::Value::Table(self.options.clone())
                     .try_into()
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -1043,7 +1047,6 @@ impl EngineConfig {
                             self.kind,
                         )
                     })?;
-                opts.validate()?;
             }
             EngineKind::Wgpu => {
                 let opts: WgpuEngineOptions = toml::Value::Table(self.options.clone())
@@ -1057,7 +1060,7 @@ impl EngineConfig {
                 opts.validate()?;
             }
             EngineKind::Xla => {
-                let opts: XlaEngineOptions = toml::Value::Table(self.options.clone())
+                let _: XlaEngineOptions = toml::Value::Table(self.options.clone())
                     .try_into()
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -1065,7 +1068,6 @@ impl EngineConfig {
                             self.kind,
                         )
                     })?;
-                opts.validate()?;
             }
             EngineKind::Cerebras => {
                 let opts: CerebrasEngineOptions = toml::Value::Table(self.options.clone())
@@ -1200,8 +1202,10 @@ device = ["metal:0"]
         adapters_are_absent_by_default_and_that_is_zero_seats();
         the_seat_count_is_stated_once_or_derived_from_the_roster();
         an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name();
-        weight_streaming_is_auto_unless_stated();
+        an_empty_memory_table_is_the_dedicated_machine();
+        the_memory_keys_are_seven_and_prefixed();
         a_removed_key_is_refused_with_why();
+        a_removed_memory_key_names_its_replacement();
         the_dispatch_depth_is_bounded_by_the_engine_kind();
     }
 
@@ -1235,22 +1239,104 @@ device = ["metal:0"]
         assert!(err.contains("`max_state_slots` was removed"), "{err}");
     }
 
-    fn weight_streaming_is_auto_unless_stated() {
-        use runtime::store::weights::WeightStreaming;
+    fn an_empty_memory_table_is_the_dedicated_machine() {
         let cfg = Config::parse(MINIMAL_METAL).unwrap();
-        assert_eq!(cfg.model.weight_streaming, WeightStreaming::Auto);
-        for (word, mode) in [("on", WeightStreaming::On), ("off", WeightStreaming::Off)] {
+        assert_eq!(cfg.engine.memory, MemoryConfig::default());
+        assert_eq!(
+            cfg.engine.memory.tolerance(),
+            runtime::governor::Tolerance::DEDICATED
+        );
+        let residency = cfg.engine.memory.residency();
+        assert_eq!(residency.device, engine::Allowance::WHOLE);
+        assert!(residency.weights_held);
+
+        let shared = format!(
+            "{MINIMAL_METAL}\n[engine.memory]\nbudget_device = \"20GiB\"\n\
+             budget_host = \"8GiB\"\ngovernor_backoff = 0.8\ngovernor_release_idle = true\n"
+        );
+        let cfg = Config::parse(&shared).unwrap();
+        assert_eq!(
+            cfg.engine.memory.residency().device.budget,
+            Some(20 << 30),
+            "budget_device caps the device"
+        );
+        assert_eq!(cfg.engine.memory.residency().host_kv_budget, Some(8 << 30));
+        let tolerance = cfg.engine.memory.tolerance();
+        assert!(tolerance.yields() && tolerance.release_idle);
+
+        for bad in [
+            "governor_backoff = 0.0",
+            "governor_backoff = 1.5",
+            "budget_device = 0",
+        ] {
+            let toml = format!("{MINIMAL_METAL}\n[engine.memory]\n{bad}\n");
+            assert!(Config::parse(&toml).is_err(), "{bad} should be refused");
+        }
+    }
+
+    fn the_memory_keys_are_seven_and_prefixed() {
+        let keys: Vec<String> = schema::fields(EngineKind::Cuda)
+            .into_iter()
+            .map(|field| field.key)
+            .filter(|key| key.starts_with("engine.memory."))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "engine.memory.budget_device",
+                "engine.memory.budget_host",
+                "engine.memory.budget_disk",
+                "engine.memory.disk_path",
+                "engine.memory.disk_persistent",
+                "engine.memory.governor_backoff",
+                "engine.memory.governor_release_idle",
+            ]
+        );
+    }
+
+    fn a_removed_memory_key_names_its_replacement() {
+        for (key, value, names) in [
+            ("device_memory_share", "0.9", "budget_device"),
+            ("device_kv_budget", "\"20GiB\"", "budget_device"),
+            ("host_kv_budget", "\"20GiB\"", "budget_host"),
+            ("disk_kv_budget", "\"20GiB\"", "budget_disk"),
+            ("disk_kv_dir", "\"/nvme\"", "disk_path"),
+            ("disk_kv_persistent", "true", "disk_persistent"),
+            ("memory_tolerance", "\"polite\"", "governor_backoff"),
+            ("weight_streaming", "\"on\"", "no mode"),
+            ("max_patches", "4096", "refused"),
+            ("max_voxels", "4096", "refused"),
+        ] {
             let toml = MINIMAL_METAL.replace(
                 "source = \"Qwen/Qwen3-0.6B\"",
-                &format!("source = \"Qwen/Qwen3-0.6B\"\nweight_streaming = \"{word}\""),
+                &format!("source = \"Qwen/Qwen3-0.6B\"\n{key} = {value}"),
             );
-            assert_eq!(Config::parse(&toml).unwrap().model.weight_streaming, mode);
+            let err = Config::parse(&toml).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("`{key}` was removed")) && err.contains(names),
+                "{key}: {err}"
+            );
         }
-        let bad = MINIMAL_METAL.replace(
-            "source = \"Qwen/Qwen3-0.6B\"",
-            "source = \"Qwen/Qwen3-0.6B\"\nweight_streaming = \"maybe\"",
-        );
-        assert!(Config::parse(&bad).is_err());
+        for (key, names) in [
+            ("max_forward_tokens = 2048", "largest rung"),
+            ("max_forward_requests = 64", "largest rung"),
+            ("max_model_len = 8192", "max_context"),
+            ("kv_page_size = 16", "chunk plan"),
+        ] {
+            let toml = MINIMAL_METAL.replace(
+                "device = [\"metal:0\"]",
+                &format!("device = [\"metal:0\"]\n{key}"),
+            );
+            let err = Config::parse(&toml).unwrap_err().to_string();
+            assert!(
+                err.contains("was removed") && err.contains(names),
+                "{key}: {err}"
+            );
+        }
+        let err = toml::from_str::<backend::WgpuEngineOptions>("device_memory = \"8GiB\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("budget_device"), "{err}");
     }
 
     /// A staged engine keeps the 64-bit ring's 15 frames; only the cerebras
