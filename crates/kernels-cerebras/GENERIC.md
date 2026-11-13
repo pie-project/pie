@@ -1,7 +1,7 @@
 # The generic wafer compiler: design
 
-Status: M1a and M1b done (§4.1); nothing of the wafer's stream regime builds yet. ARCHITECTURE.md is
-what runs.
+Status: M1a and M1b done (§4.1), and M3 (the decode layouts as points of the Floorplan, §2.5);
+nothing of the wafer's stream regime builds yet. ARCHITECTURE.md is what runs.
 
 **Goal.** A `.poem` model the compiler has not seen runs on the wafer with no hand code. The
 primary acceptance target is `models/flux_2.poem`: a text encoder, a DiT denoiser run over whole
@@ -50,7 +50,7 @@ Two terms used in the tables:
 | qwen_3 (Qwen3.5 dense) | qwen35-d{0.8b,4b,9b}, d3b, tiny, qwen38-27b(-mini) | ok / plan | 0.8b/4b/9b ship (snake); d3b and tiny plan by the search (from `4b`); 27B unfit; **27b-mini: the search finds no partition** (A) |
 | qwen3_dense | qwen3-{0.6b,8b,14b,32b} | ok / plan | 8B ships; 0.6B plans by the search; **14B (28 GB, fits the SRAM) finds no partition**: the snake's unit grid cannot grow past the pins' (A); 32B unfit |
 | llama_3 | llama31-8b, llama33-70b(-mini-l4) | ok / plan | 8B ships. 70B unfit; mini-l4 plans by the search |
-| gemma_4 dense | e2b, e4b, 12b; 31b(-mini-l30); e4b-mini-l{1,6,24,30,36} | ok / plan | e2b/e4b/12b ship. 31B unfit. **The e4b minis do not plan**: the stacked arrangement is made for one unit shape and the search cannot move it (a layout gap, A) |
+| gemma_4 dense | e2b, e4b, 12b; 31b(-mini-l30); e4b-mini-l{1,6,24,30,36} | ok / plan | e2b/e4b/12b ship. 31B unfit. The e4b minis did not plan (the stacked arrangement was made for one unit shape and the search could not move it); since M3 they plan by the search on the derived arrangement |
 | gemma_4 MoE | gemma4-26b-a4b(-mini-e64) | shape | `linear.moe_route` with a per-expert scale/bias (router kernel: plain softmax over the top k only) |
 | gpt_oss | gptoss-20b-bf16-mxfp4, -mini | ok / plan | 20b ships (split); **the mini finds no partition** (A) |
 | qwen3_moe | qwen3-30b-a3b(-mini), 235b, coder-480b | plan | mini plans by the search; the full models are unfit |
@@ -250,6 +250,56 @@ does:
    predicts ≤ +0.5%.
 2. The pin built through the Floorplan is byte-identical: the baseline harness capture (`floor`,
    `rcfg`, `layout.csl`, `bindings`, `host`) of every shipping config and every tiny config.
+
+### 2.5 What M3 built
+
+`src/floorplan/` holds the IR; ARCHITECTURE.md ("The floorplan") walks it.
+
+- **Elements, each asked for on its own.** `Requests::of(needs)`: attention over a cache asks for
+  `Segment::Scores` (on the attention row runs' attention columns), GDN for `Segment::Gdn` +
+  `Segment::Onorm`, routed experts for a `ColRole::Moe` column run + `Segment::Router`, a window
+  for KV rows, a side input for `Aux::Store`, a shared cache for `Aux::KvLine`.
+  `Floorplan::of(plan, requests)` reads each element's choice off the plan: the `UnitShape`
+  (column runs, row runs, control lines, K, KV rows), the path (`floor::UnitLayout`: the stacked
+  arrangement's origins, two columns from a band, the unit slots' snake, else two columns down
+  then up), the `Head` (`East`, `Groups`, `Band`). `compose::blocks` maps elements to blocks in one
+  order and names no layout: one `Units` block (kinds by half where a MoE column run halves it,
+  row-run overrides where rows come in runs), one `Scores` block (the split's and the row runs'
+  scores are it), the head and token loop by the head element.
+- **The four layouts are constructors.** `floorplan::{snake, stacked, runs, split}` read a preset's
+  keys into a plan (the old partitions, error texts kept: the search's repair follows them).
+  `floorplan::plan` picks the one the shape's **kernel set** is keyed for.
+- **Kernel sets, not layouts.** What `Layout` decided for the kernels is `kernels::KernelSet`
+  (`Own`, `Shared`, `Windows`, `Experts`: chosen by the mixers, the CSL ABI each set's params,
+  symbols, copies and cut are written for). `kernels::of` takes the units' kernels from the set and
+  the rest from elements: the head's by `Head::at` (the token bus on where there is storage), the
+  store kernel by `Aux::Store`, the relay by gap slots; `Schedule::hg` reads the head element.
+  Merging the four sets' params into one per role (the design's "role kernels read elements") is
+  left for M5: it changes every `layout.csl`'s literals, so it needs the fast-path parity M5
+  measures, not byte identity.
+- **Colours by interference colouring.** `Palette::allocate`: each class's footprint is read off a
+  lay with every class on its own colour; classes meet where both route at a PE (one pass-through
+  word excepted); a class keeps its block's preferred colour where no class it meets kept it, the
+  rest take the lowest free colour, the most constrained first; a class meeting all 21 is refused
+  by name. Every shipping and tiny program keeps every preferred colour (a test checks it).
+- **Derived arrangement.** `Arrangement::derive` places stacked columns for any unit shape: column
+  A from the shared caches' source unit up (the KV line runs north) and at least half the units,
+  column B level with it, storage of 19,000 words a PE above each column. It reproduces the pinned
+  E2B / E4B columns but for column A's top row. The five e4b minis now plan by the search.
+- **Byte identity.** Every shipping and tiny config's `plan.json`, `layout.csl`, kernel sources,
+  `kernels.json`, rcfg, floor, host and bindings (the baseline capture), and the search's plans
+  for the catalog models it plans, are unchanged.
+
+Not reached: gemma4-26b-a4b (experts + windows) still stops at `shape` (the router's per-expert
+scale) and then at `refuse` (the experts' kernels run no sandwich norms, GELU or final softcap):
+kernel and lowering gaps (M5), not placement. Its floorplan (a MoE column run, a band, KV rows for
+its windows) is expressible as gpt-oss's is.
+
+What M1d / M2 plug in: a stream path (a `UnitLayout` visited by a row stream, one unit a layer, and
+a token-stream link in `wiring`), replicas of a `UnitShape`, an `Aux` K / V region per attention
+block and a grid region for convolutions, a reading with no head (`Floorplan::head` made optional), and their
+classes coloured by `Palette::allocate` with no preferred colours. Each is a new element, a block
+the composer maps it to, and its `Requests` field; nothing in the composer's other arms changes.
 
 ## 3. (B) Op lowering: new ops into a primitive set
 

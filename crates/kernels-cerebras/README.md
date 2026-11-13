@@ -15,7 +15,7 @@ fit. The wafer program layout gives PEs fixed roles. Most PEs hold only weights,
 kernel of about 8 KB, so about 40 KB of each PE holds weights. The element-wise work and the roots
 of every collective move onto a few control PEs.
 
-**Kernels and op modules.** Each role runs one kernel (`programs/wafer/<role>.csl`) in its layout's
+**Kernels and op modules.** Each role runs one kernel (`programs/wafer/<role>.csl`) in its kernel set's
 phase order. The ops come from the modules under `programs/wafer/ops` (the fabric plumbing, the
 tile matvec, the chain reductions, the segment collectives, the elementwise math, RoPE and the head
 argmax; ARCHITECTURE.md), imported with comptime params.
@@ -24,7 +24,7 @@ argmax; ARCHITECTURE.md), imported with comptime params.
 (PX + 1) x (PY + 1) PEs. Each unit runs K layers. The units are visited as a snake: down unit
 column 0, then up column 1, and so on.
 
-- **Weight PE** (`programs/wafer/weight.csl`, every layout's: its core `ops/wpe.csl`, its mixers
+- **Weight PE** (`programs/wafer/weight.csl`, every kernel set's: its core `ops/wpe.csl`, its mixers
   `ops/att.csl`, `ops/gdn.csl`, `ops/kv.csl`, `ops/swa.csl`, `ops/moe.csl`). Holds its K layers' four tiles: the row's x chunk
   (Hc dims) by the column's outputs, as f16 bits. A layer runs as:
   1. x from CX's row multicast
@@ -36,9 +36,9 @@ column 0, then up column 1, and so on.
   The PE also holds the mixer's per-PE parts:
   - GDN: its slice of the recurrent state.
   - Attention: NE KV entries a row; position p lives on row p % PY.
-- **CX** (`cx.csl`, every layout's). Holds x's chunk, the residuals and the norms' gammas. It is the root of the
+- **CX** (`cx.csl`, every kernel set's). Holds x's chunk, the residuals and the norms' gammas. It is the root of the
   row reductions and does the unit handoff.
-- **CY** (`cy.csl`, every layout's). The root of the column reductions. It does the rms scale (or the
+- **CY** (`cy.csl`, every kernel set's). The root of the column reductions. It does the rms scale (or the
   deferred norm's combine), the GDN conv, SiLU, gates, delta and the gated norm, RoPE and the q/k norms,
   the softmax's o / l with its redo flag and log-sum-exp steps, and the MLP's activation.
 - **Head** (`head_pe.csl`, `head_ctl.csl`). HC columns of HDc dims by HR rows of VR vocabulary rows.
@@ -148,17 +148,17 @@ async = true
 # loop_room = false                  # loops not bounded by the lane's pages
 ```
 
-A load plans the model's trace (the layout its layers take, the pinned plan or the search's, the positions), builds and links the
+A load plans the model's trace (the kernel set its layers take, the pinned plan or the search's, the positions), builds and links the
 program, and cuts the checkpoint for it (`engine-cerebras` `prepare`). Both are kept in the engine cache
 (`<PIE_HOME>/.../cerebras/wafer`, `p-<model>-<key>` and `t-<model>-<key>`), keyed by everything they follow from,
 so a second load compiles and cuts nothing; a whole-wafer compile takes minutes. Pie config: `frame_size 4`,
-`frame_dispatch_depth 63`. Every layout's checkpoint is cut in Rust (`tiles`: the layout states its
+`frame_dispatch_depth 63`. Every kernel set's checkpoint is cut in Rust (`tiles`: the set states its
 cut, one tiler makes it); `[engine.debug] weights` serves tiles staged elsewhere instead.
 
 **Build by hand** (no SDK needed until the link):
 
 1. **Plan**: `wafer-compile plan --model <deployment> [--preset <name>] [--set K=V,..] [--positions N] --out
-   <plan dir>` (`ARCHITECTURE.md`): the model's shape from its trace, the layout it takes, the pinned plan's
+   <plan dir>` (`ARCHITECTURE.md`): the model's shape from its trace, the kernel set it takes, the pinned plan's
    partition (else the search's). Pinned plans (`plans/`): `9b`, `4b`, `0.8b`, `q3-8b`, `l3-8b`; `e2b`, `e4b`,
    `e4b-meta`; `g12`; `full` (gpt-oss); and `tiny*` for the simulator. A pinned plan carries the keys, kernel
    levers and arrangement its program shipped with. A checkpoint with no catalog deployment takes
@@ -174,7 +174,7 @@ cut, one tiler makes it); `[engine.debug] weights` serves tiles staged elsewhere
    stack room checked (>= 768 B), the artifact put in `out/artifact`. A PE that runs out of memory shows here
    only: the plan does not model PE memory yet.
 4. **Cut**: `wafer-stage --model <deployment> --checkpoint <dir> --out <dir> [--positions N]` (engine-cerebras):
-   the tiles a load cuts (`tiles::stage`: the layout's [`tiles::spec`] statement of its cut, made by the one
+   the tiles a load cuts (`tiles::stage`: the kernel set's [`tiles::spec`] statement of its cut, made by the one
    tiler `tiles::cut`). `wafer-stage --plan <plan.json> --landed <params.safetensors> --out <dir>` cuts params
    already landed under the trace's names (a tiny checkpoint's: `tools/wafer/baseline/landed.py`).
 5. **Tiny end-to-end on the simulator** (no chip):
@@ -277,9 +277,10 @@ They match HF f32 logprobs to within 0.004 on the chosen token.
 ## 7. Gemma 4 and gpt-oss-20b
 
 Both reuse the wafer program machinery (the generic chains, segments, handoffs, head and token loop; `head_ctl.csl`)
-with a layout each (`partition/stacked.rs`, `partition/split.rs`, `partition/runs.rs`; their kernels and cuts
-under `kernels/` and `tiles/`). The layer program selects the layout (`compose::Layout`): experts take the split
-halves, per-layer inputs or shared KV the stacked columns, sliding layers otherwise the row runs. Tiny fixtures: `tools/wafer/gemma`, `tools/wafer/gemma12`, `tools/wafer/gptoss`.
+with a kernel set each and a floorplan constructor each (`floorplan/stacked.rs`, `floorplan/split.rs`,
+`floorplan/runs.rs`; their kernels and cuts under `kernels/` and `tiles/`). The layer program selects the kernel set
+(`kernels::KernelSet`): experts take the split halves, per-layer inputs or shared KV the stacked columns, sliding
+layers otherwise the row runs; each feature asks the floorplan for its element (`floorplan::Requests`). Tiny fixtures: `tools/wafer/gemma`, `tools/wafer/gemma12`, `tools/wafer/gptoss`.
 
 **Gemma 4** (`*_gemma.csl`, E2B and E4B; 12B below).
 - Units at explicit origins: 7 units (E2B 256 x 128, Hc 12, K 5; E4B 256 x 160, Hc 16, K 6) placed around the
@@ -319,7 +320,7 @@ layers and a 2 GB tied head fill 98% of the wafer, which only fits with a row-ro
   column takes a group of CX rows: attention rows in sixes, plain rows in fives, no group across the CY row. The
   group's CX PEs chain their x to the group's root on the last unit's CX column, and the root sends it east. The
   wafer loop's embedding returns to unit 0's root row and down the same chain.
-- Tools: `tools/wafer/gemma12`; the layout is `partition/runs.rs`.
+- Tools: `tools/wafer/gemma12`; the constructor is `floorplan/runs.rs`.
 
 **gpt-oss-20b** (`*_gptoss*.csl`).
 - Experts: the released MXFP4 values re-encoded losslessly as FP8 E5M2 (the high byte of an f16) with one power of

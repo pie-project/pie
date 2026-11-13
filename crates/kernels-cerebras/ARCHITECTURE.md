@@ -1,22 +1,25 @@
 # The wafer program: architecture
 
 A wafer program is a list of **blocks** over a logical **plan**. poem's spatial pass reads the
-model's **shape** off its trace; the partition of the **layout** its layers take turns it and a
-**preset** (a pinned plan's keys, or the search's) into the plan; the composer picks the blocks
-from what the plan's layer program needs; the core runs every build step over the blocks in order
-and knows no model, no layout and no block's vocabulary. The build lives here (`kernels-cerebras`); the
+model's **shape** off its trace; the **kernel set** its layers' mixers take keys the **preset** (a
+pinned plan's keys, or the search's) that a floorplan constructor turns into the plan; the plan's
+**floorplan** states each element the layer program's features ask for, and the composer maps
+elements to blocks; the core runs every build step over the blocks in order and knows no model,
+no constructor and no block's vocabulary. The build lives here (`kernels-cerebras`); the
 engine (`engine-cerebras`) runs its **artifact** and knows none of it (below).
 
 ```
-.poem trace ─target::shape─▶ Shape ─compose::Layout::of_shape─▶ Layout
+.poem trace ─target::shape─▶ Shape ─KernelSet::of_shape─▶ KernelSet
  (or a shape file)               │                       │ pins (a named one, or the one made for the shape; else the search)
                                  └──────────┬────────────┘
-                                            ▼ partition::plan         (poem_compiler::spatial::plan:
-                                          Plan ─compose::blocks─▶ [Block]  the first of them that builds)
+                                            ▼ floorplan::plan (the set's constructor)   (poem_compiler::spatial::plan:
+                                          Plan ─Floorplan::of─▶ Floorplan                 the first of them that builds)
+                                            │  (the elements each feature asks for: units, segments, aux, head)
+                                            │ ─compose::blocks─▶ [Block]
                                             │                        │ floor   ─▶ Floor  (units, head, stores; a PeRole a PE)
                                             │                        │ wire    ─▶ Wiring (typed links over open Classes / Slots)
                                             │                        │ settle  ─▶ Floor  (PEs placed where links cross)
-                                            │                        │ colours ─▶ Palette
+                                            │                        │ colours ─▶ Palette (interference colouring, preferred colours)
                                             │                        ▼
                                             │                     Fabric::lay + validate (routes, queues, invariants)
                                             │
@@ -32,28 +35,28 @@ Modules are under `src/`.
 | Layer | Module | Holds | Knows |
 |---|---|---|---|
 | Plan | `plan.rs` | `Shape` (the model's facts), `Partition` (counts, split factors, the stacked arrangement), `Contract` (positions, CAP, LOOP, WL, the logits' prescale); `Preset` (a partition's named keys, levers and arrangement: a pinned plan's or the search's); serde, so a plan is a file | nothing physical: the seam to poem's spatial pass (below) |
-| Target | `target.rs` | the wafer as poem's `SpatialTarget`: `shape` (a trace's `Shape`), `Wafer` (candidates: the pinned plan named or made for the shape; fit: the plan builds; else the search), `plan` / `plan_shape` | the trace's ops, the layouts |
+| Target | `target.rs` | the wafer as poem's `SpatialTarget`: `shape` (a trace's `Shape`), `Wafer` (candidates: the pinned plan named or made for the shape; fit: the plan builds; else the search), `plan` / `plan_shape` | the trace's ops, the kernel sets |
 | Roles | `role.rs` | `PeRole { kind: Kind, place: Place }`. `Kind` is open (name + build stem; the architecture's kinds are consts, a block declares more). `Place` is the wafer program architecture's positions: weight / CX / CY of a unit, head / head control, a storage column's PE, none | coordinates |
 | Floor | `floor.rs` | `FloorBuilder` (blocks place onto it in order), units, gap / relay slots, the head block, store blocks, a `PeRole` a PE in a dense `Grid` | coordinates |
 | Wiring | `wiring.rs` | `Chain`, `Multicast`, `Path`, `Turn`, `Note`; open `Class { name, index }`, `Slot { name, kind: SlotKind }`, `NoteKey`; the core's only own vocabulary is `LOOPBACK` and `PASS` | coordinates, logical colours |
-| Fabric | `fabric.rs` | `Palette` (the blocks' colours, later replacing earlier), routes, `PeIo` (slot → endpoint, notes), parks / spare / route words, the invariants | physical colours, route words |
+| Floorplan | `floorplan/` | `Floorplan` (the IR between the plan and the floor: `Units { shape: UnitShape { col_runs, row_runs, control, layers, kv_rows }, path, count }`, `Segment`s, `Aux` (a side input's storage, the KV line), `Head { at: East / Band / Groups }`), `Requests` (the element each layer-program feature asks for), `Floorplan::of` (a plan's elements); `plan` and the four constructors (`snake`, `stacked`, `runs`, `split`: the points the old layouts were, each reading its keys off a preset, its partition and contract, its refusals; the stacked arrangement and its derivation) | the model's shape |
+| Fabric | `fabric.rs` | `Palette` (`allocate`: an interference colouring of the classes' footprints, each class its block's preferred colour where free), routes, `PeIo` (slot → endpoint, notes), parks / spare / route words, the invariants | physical colours, route words |
 | Blocks | `block/` | the `Block` trait and the blocks (table below); each owns its classes, slots, notes, kinds and colours as consts | coordinates, its own vocabulary |
 | ABI | `abi.rs` | `Kernel` (source, owned symbols, params' names, route slots, rcfg writer), `params!` (a kernel's typed params struct), `words!` (an rcfg word layout), `KernelBuild`, `Kernels`, `Overrides` | the build's view of a kernel |
-| Kernels | `kernels/` | `Pe` (one PE as an rcfg writer sees it); `common` (the word layouts every layout's weight / CX / CY / head / head control kernel shares, its codes named, the relay); `head` (`head_pe.csl`, `head_ctl.csl`); one module a layout's own kernels: `snake`, `split`, `stacked`, `runs` (`of`, `symbols`) | the CSL kernels' ABI |
+| Kernels | `kernels/` | `KernelSet` (the role kernels a layer program's mixers take: `Own`, `Shared`, `Windows`, `Experts`), `of` (the units' kernels by set, the head's by the head element, the store kernel by the storage, the relay by gap slots), `symbols` (by set); `Pe` (one PE as an rcfg writer sees it); `common` (the word layouts every set's weight / CX / CY / head / head control kernel shares, its codes named, the relay); `head` (`head_pe.csl`, `head_ctl.csl`: east, east by row groups); one module a set's units: `snake` (Own), `stacked` (Shared, and the store), `runs` (Windows), `split` (Experts, and the band) | the CSL kernels' ABI |
 | Layers | `layers.rs` | the plan's layer program (`poem_compiler::spatial::layer::LayerProgram`), stated from its shape; pinned to the trace's lowering | the shape |
-| Composer | `compose/` | `Needs` and `Schedule` (read off the layer program), `blocks` (the blocks a program's needs take), `KernelCopies` (what the role kernels read off each block, by layout: `copies`), `refuse` (what the layout's kernels do not run, by name), `stacked` (the plan's stacked arrangement laid out) | the blocks |
-| Partition | `partition/` | `plan` (the plan of a shape under a preset's keys, by its layout); `snake`, `stacked`, `runs`, `split`: each layout's keys, its partition and contract, its refusals | the model's shape |
-| Pins | `pins.rs`, `plans/` | the pinned plans: each shipping program's layout, keys, levers, made-for shape and arrangement | the shipping programs |
+| Composer | `compose/` | `Needs` (read off the layer program) and `Schedule` (the layer program's phases on its floorplan), `blocks` (the blocks a floorplan's elements take), `KernelCopies` (what the role kernels read off each block, by kernel set: `copies`), `refuse` (what the set's kernels do not run, by name) | the blocks |
+| Pins | `pins.rs`, `plans/` | the pinned plans: each shipping program's kernel set, keys, levers, made-for shape and arrangement | the shipping programs |
 | Emit | `emit/` | rcfg, kernel params (levers, overrides) and `layout.csl`, `HostLayout` (everything the host driver reads and writes on the wafer) | kernel builds |
 | Weights | `weights.rs` | `Binding`s (symbol, rect, source, transforms), `Copies`, the placer | the device |
-| Program | `program.rs` | `Program { plan, blocks, floor, wiring, palette, fabric, kernels, overrides, layout, schedule }`, `build`, `bindings` | all of the above |
+| Program | `program.rs` | `Program { plan, blocks, floor, wiring, palette, fabric, kernels, overrides, floorplan, roles, schedule }`, `build`, `bindings` | all of the above |
 | Artifact | `artifact.rs` | `Artifact`: the program as the engine runs it (`HostLayout`, bindings, rcfg words, the model facts of the host's math, the plan as a record) | files |
 
 Rules:
 
 - **The block is the unit of extension.** A model's blocks are what its layers need; a new dataflow part
   (a new segment kind, a storage column, a band head) is a new block. Nothing in the core names a
-  model, a layout or a block's classes, slots, notes or kinds.
+  model, a constructor or a block's classes, slots, notes or kinds.
 - **A block owns its vocabulary.** Its `Class`es, `Slot`s, `NoteKey`s (and their value codes),
   extra `Kind`s and colours are consts in its module (`units::ROW_L1`, `head::HEAD_IN`,
   `head::ROLE_SOURCE`, `token_loop::TURN_TOP`, ...). Kernels' rcfg writers read the slots and
@@ -67,7 +70,7 @@ Rules:
 - **Per-PE param differences are typed `Overrides`** a block states (`Block::overrides`), checked
   against the PE's kernel at resolution. There are no stringly per-PE notes.
 - **Physical facts are derived once.** Blocks read the floor (`Unit::row_y`, `HeadBlock::col_x`,
-  ...) and the notes other blocks left; no layout restates the plan as its own geometry struct.
+  ...) and the notes other blocks left; no block restates the plan as its own geometry struct.
 - **Wiring is order-free.** The fabric sorts routes and binds endpoints order-free, so the block
   order only matters for the floor (later blocks place against earlier ones), the palette (later
   replaces) and the copies (placement order is the host's device protocol).
@@ -89,7 +92,8 @@ The hardware lessons of the bring-up, made checks:
 5. **Path continuity.** Every `Path` runs from its sender's ramp to its receiver's ramp.
 6. **Route slots.** Routes at a PE ≤ its kind's kernel's `route_slots`; a non-idle PE whose kind
    has no kernel is an error.
-7. **Colour count.** Every colour < `COLOURS` (21).
+7. **Colour count.** Every colour < `COLOURS` (21): `Palette::allocate` refuses a class that meets
+   every colour by name, with the classes it meets.
 8. **Loop-backs.** Every root of a `SlotKind::Reduce { loopback: true }` slot loops back to its own
    ramp on `LOOPBACK`'s colour.
 9. **Kernel-side rules** (not geometry; listed so nobody drops them): restore a route only after
@@ -100,38 +104,57 @@ The hardware lessons of the bring-up, made checks:
 
 | Block | Floor | Wiring | Vocabulary | Copies |
 |---|---|---|---|---|
-| `units::Units { grid, copies }` | units per `UnitGrid` (snake with gaps, or explicit origins); gap slots `Kind::RELAY` | `unit_chains`: row chains into CX, column chains into CY (two-level by `reduce.row` / `.col`), root loop-backs, `handoff`s along the visit order | `ROW_L1/L2/CAST`, `COL_L1/L2/CAST`, `HANDOFF_OUT/VERT[parity]/IN/ACROSS`; slots `ROW_REDUCE`, `COL_REDUCE`, `X_IN`, `X_OUT`, `RELAY_PRE`, `RELAY_POST` | `UnitCopies` per unit (quadrants of `w{u}`, CX `gam`, CY tables), relays' rcfg |
-| `segments::Scores { width }` | — | every weight row in segments of `width` | `SCORE_L1`, `SCORE_CAST`; slot `SEGMENT` | — |
+| `units::Units { grid, halves, copies }` | units per `UnitGrid` (snake with gaps, or explicit origins); gap slots `Kind::RELAY`; with `halves` (a MoE column run) the weight / CY kinds refined by half (`moe::halves`: `WA`, `WM`, `CYA`, `CYM`, attention columns west of CX, MoE east) | `unit_chains`: row chains into CX, column chains into CY (two-level by `reduce.row` / `.col`), root loop-backs, `handoff`s along the visit order | `ROW_L1/L2/CAST`, `COL_L1/L2/CAST`, `HANDOFF_OUT/VERT[parity]/IN/ACROSS`; slots `ROW_REDUCE`, `COL_REDUCE`, `X_IN`, `X_OUT`, `RELAY_PRE`, `RELAY_POST`; where the rows come in runs, `row_runs::overrides` (`HC`, `AROW` (`ATT_ROW`, `PLAIN_ROW`): a weight / CX PE's run's dims, a weight PE's run's role) | `UnitsCopies`: `UnitCopies` per unit (quadrants of `w{u}`, CX `gam`, CY tables), `RunCopies` per unit and run block (`w{u}a` / `w{u}w`, `gama` / `gamw`), `MoeCopies` per unit and half; relays' rcfg |
+| `segments::Scores { width, rows, cols }` | — | every attention row's attention columns in segments of `width` | `SCORE_L1`, `SCORE_CAST`; slot `SEGMENT` | — |
 | `segments::Onorm { width }` | — | every CY row in segments (no single-PE ones) | `ONORM_L1`, `ONORM_CAST`; slot `ONORM` | — |
 | `gdn::Gdn` (`Gdn::of(plan)`) | — | the (k, q) multicast per GDN segment and key row; `Gdn::source` is the weight kernel's source word | `GDN_KQ`; slot `GDN`; `SOURCE_*` | — |
 | `head::HeadEast { cols, rows, token_loop, copies }` | the head east of the floor so far, control column in the middle | `head_rows` (into the control column), `head_input` (two CX rows a head column: relay north, column multicast) | `HEAD_RELAY`, `HEAD_COL_CAST`, `HEAD_ROW_WORD`; slots `HEAD_ROW_REDUCE`, `HEAD_IN`, `HEAD_RELAY_IN`, `HEAD_CAST`; note `ROLE` (`ROLE_RELAY`, `ROLE_SOURCE`) | `HeadCopies` (`hw`, `hg`, `hemb`, rcfg) |
 | `token_loop::TokenLoop` | — | the control column's max-reduce, the embedding's return into unit 0's CX | `LOOP_L1/L2/CAST`, `EMB_UP/DOWN/SPLIT/WEST`; slots `LOOP_REDUCE`, `EMB_IN`; note `TURN` (`TURN_TOP/EVEN/ODD`) | — |
 | `ple::Ple { columns }` | a storage block above each unit column's top unit (`Place::Store`, kind `STORE`; its CX column route-only); `settle`: every idle PE west of the head outside the units and storage that a link crosses runs the store kernel route-only | `TOKEN` west along each storage row from the head control column; `bus(i)` down each weight column of column `i` into every unit's CY | `TOKEN`, `bus(i)`; `NTW` (route-only PEs outside the storage: 1) | storage tiles `pt<col>_<n>` (staged files under 1,900 MiB), the route-only PEs' rcfg |
 | `shared_kv::SharedKv` | — | `LINE` north from the source unit's CY row through the sharers above it | `LINE`; `SH`, `Ic` on the sharers' weight / CY PEs | — |
-| `moe::MoeUnits { grid, copies }` | units as `Units`, weight / CY kinds refined by half (`WA`, `WM`, `CYA`, `CYM`: attention columns west of CX, MoE east) | `unit_chains` | the kinds | `MoeCopies` per unit and half |
-| `moe::AttnScores`, `moe::Router` | — | scores segments on the attention columns; router segments on the CY row's MoE columns | `ROUTER` (a segment slot) | — |
+| `moe::Router` | — | router segments on the CY row's MoE columns | `ROUTER` (a segment slot) | — |
 | `band::Band` | the head as a band below the units with a control row | the x down the MoE columns (`BAND_VERT`), the band columns' chains into the control row | `BAND_VERT`; slots `BAND_IN`, `BAND_OUT`, `BAND_CAST` | the band's head tiles |
-| `band::BandLoop` | — | the control row's max-reduce, the bus, the embedding's return (`BAND_V1`, `BAND_W2`); recolours `token_loop::EMB_WEST` to `BUS_COLOUR` | `BAND_V1`, `BAND_W2`; slots `BUS`, `BUS_TX`, `V1_TX`, `V1_RX`, `W2_TX` | — |
-| `row_runs::RowRuns { grid, copies }` | units as `Units` | `unit_chains`; scores segments on the attention runs' rows only | `HC`, `ATT` (`ATT_ROW`, `PLAIN_ROW`) overrides: a weight / CX PE's run's dims, a weight PE's run's role | `RunCopies` per unit and run block (`w{u}a` / `w{u}w`, `gama` / `gamw`, the CY tables) |
+| `band::BandLoop` | — | the control row's max-reduce, the bus, the embedding's return (`BAND_V1`, `BAND_W2`); prefers `BUS_COLOUR` for `token_loop::EMB_WEST` (the band's kernels read the bus's colour off the palette) | `BAND_V1`, `BAND_W2`; slots `BUS`, `BUS_TX`, `V1_TX`, `V1_RX`, `W2_TX` | — |
 | `head_groups::HeadGroups { cols, rows, copies }` | the head east of the units (token loop on) | `head_rows`; per group the x chain north on the last unit (`HEAD_GROUP`), its root east, the column multicast; the embedding back up, down, west into unit 0 and down the chain; the max-reduce | `HEAD_GROUP`; slots `CHAIN_IN`, `CHAIN_OUT`, `CAST`; notes `FORWARD`, `head::ROLE`, `token_loop::TURN` | `HeadCopies` |
 
-The role kernels' layer phases come from the plan's layer program (`compose::Schedule`: `NRM` from a deferred norm or the expert halves, `MIXK` from the mixers, `ACT` from the MLP's gate activation, `PLE` from a side input, `KVS` from a shared cache, `HG` from the row-run layout: `compose::Layout`, the one choice the blocks follow too), on `Program::schedule`; every layout's kernels read them there. Row roles (`AROW`) are the row runs' per-PE overrides; k = v layers (`KEV`) are the row-run layout's (`Schedule::kev`: its cut leaves a global layer's v rows out, for a checkpoint with no global `v_proj`, which the trace's packed bank does not tell apart); the GELU form (`GELUT`) is a lever the plan carries (Gemma 4 12B's: `GELUT:1`).
+The role kernels' layer phases come from the plan's layer program and floorplan (`compose::Schedule`: `NRM` from a deferred norm or the expert halves, `MIXK` from the mixers, `ACT` from the MLP's gate activation, `PLE` from a side input, `KVS` from a shared cache, `HG` from a head fed by row groups), on `Program::schedule`; every set's kernels read them there. Row roles (`AROW`) are the row runs' per-PE overrides; k = v layers (`KEV`) are the `Windows` set's (`Schedule::kev`: its cut leaves a global layer's v rows out, for a checkpoint with no global `v_proj`, which the trace's packed bank does not tell apart); the GELU form (`GELUT`) is a lever the plan carries (Gemma 4 12B's: `GELUT:1`).
 
-Compositions: the composer (`compose/`) picks the blocks from what the layers need (`compose::Needs`, read off the plan's layer program, `layers.rs`):
+### The floorplan
 
-- routed experts: `MoeUnits` (attention | MoE halves, a snake of two unit columns starting upward), `AttnScores`, `Router`, `Band`, `BandLoop` under the token loop;
-- a side input or a cache read across layers: `Units` at the explicit origins of the plan's stacked arrangement (`Partition::arrangement`, made for its unit shape: `compose::stacked`), `Scores`, `Ple` for a side input, `SharedKv` for a shared cache, `HeadEast`, `TokenLoop`;
-- sliding windows (else): `RowRuns` (attention / plain row runs, a U of two unit columns), `HeadGroups`;
-- otherwise: `Units` (snake, at most one gap slot), `Scores` when any layer attends over its own cache, `Gdn` + `Onorm` when any is GDN, `HeadEast`, `TokenLoop` under the token loop.
+The floorplan (`floorplan/`) is the IR between the plan and the floor. Each feature of the layer program asks for its own element (`floorplan::Requests`), whatever else the program has:
 
-What each block's PEs hold is the layout kernels' (`compose::copies`). The layouts' kernels:
-
-| Layout | Models | Kernels |
+| feature | element | block |
 |---|---|---|
-| snake | Qwen3.5, Qwen3, Llama 3 | `kernels::snake` (`weight` (NRM 0, MIXK 0), `cx` (NRM 0), `cy` (MIXK 0, NRM 0)) + `head` + `common::RELAY` |
-| split | gpt-oss, Qwen3 MoE (routed experts) | `kernels::split` (`wa`, `wm`: `weight` (MIXK 2, 3), `cx`, `cya`, `cym`, the band head; `head_ctl.csl` with the bus reserved) |
-| stacked | Gemma 4 E2B / E4B (a side input and shared caches) | `kernels::stacked` (`weight` (NRM 1, MIXK 1, PLE 1), `cx` (NRM 1, PLE 1), `cy` (NRM 1, MIXK 1, PLE 1, KVS 1), `head_ctl` (token bus on), `ple_gemma`) + `head::HEAD_PE` |
-| runs | Gemma 4 12B (sliding windows) | `kernels::runs` (`weight` (NRM 1, MIXK 1, row roles by `AROW`), `cx` (NRM 1, HG 1), `cy` (NRM 1, MIXK 1, KEV 1 from `Schedule::kev`), `head_pe` with head groups) + `head::HEAD_CTL` |
+| attention over a cache | scores segments on the attention rows' attention columns (`Segment::Scores`) | `Scores` |
+| the gated delta rule | its (k, q) multicast and o-norm (`Segment::Gdn`, `Segment::Onorm`) | `Gdn`, `Onorm` |
+| routed experts | a MoE column run (`ColRole::Moe`) and the router's segments (`Segment::Router`) | `Units { halves }`, `Router` |
+| a window | KV rows sized to it (`UnitShape::kv_rows`, an attention row run) | the units' rows |
+| a per-token side input | storage above each unit column (`Aux::Store`) | `Ple` |
+| a cache read across layers | the KV line (`Aux::KvLine`) | `SharedKv` |
+
+The units are one `UnitShape` (column runs by role, row runs by dims and role, the control lines, K layers) visited along a path (`floor::UnitLayout`: a snake of slots with gap slots, or explicit origins); the head is east of the units (`HeadEast` + `TokenLoop`), east fed by row groups (`HeadGroups`), or a band below them (`Band` + `BandLoop`). `Floorplan::of` reads each element's choice off the plan: the path is the stacked arrangement's origins where the plan has one, two unit columns from the band where the head is a band, the plan's unit slots, else two unit columns down then up. The composer (`compose::blocks`) maps the elements to blocks in one order (units, segments, aux, head, token loop) and never names a constructor.
+
+The four constructors (`floorplan::{snake, stacked, runs, split}`, chosen by the kernel set the pinned plans and the search's moves are keyed for) are the points the old hand layouts were:
+
+| constructor | units | path | head | beside the units |
+|---|---|---|---|---|
+| snake | one plain column run, one row run | a snake of UNX x UNY slots, at most one gap slot | east | — |
+| stacked | one plain column run, KV on PYW rows | explicit origins in two unit columns (the pinned arrangement made for the unit shape, else `Arrangement::derive`) | east, token bus on | storage, KV line |
+| runs | one plain column run, attention / plain row runs | two unit columns, down then up | east by row groups | — |
+| split | attention / MoE column runs | two unit columns from the band, up then down | a band | — |
+
+Colours are the palette's (`Palette::allocate`): an interference colouring of the classes' footprints (two classes meet where both route at a PE, unless one pass-through word there), each class its block's preferred colour where no class it meets kept it first, the rest the lowest colour free. Every shipping program keeps every preferred colour.
+
+What each block's PEs hold is the kernel set's (`compose::copies`). The sets' kernels:
+
+| Kernel set | Models | Kernels |
+|---|---|---|
+| `Own` | Qwen3.5, Qwen3, Llama 3 | `kernels::snake` (`weight` (NRM 0, MIXK 0), `cx` (NRM 0), `cy` (MIXK 0, NRM 0)) |
+| `Experts` | gpt-oss, Qwen3 MoE (routed experts) | `kernels::split` (`wa`, `wm`: `weight` (MIXK 2, 3), `cx`, `cya`, `cym`) |
+| `Shared` | Gemma 4 E2B / E4B (a side input and shared caches) | `kernels::stacked` (`weight` (NRM 1, MIXK 1, PLE 1), `cx` (NRM 1, PLE 1), `cy` (NRM 1, MIXK 1, PLE 1, KVS 1)) |
+| `Windows` | Gemma 4 12B (sliding windows) | `kernels::runs` (`weight` (NRM 1, MIXK 1, row roles by `AROW`), `cx` (NRM 1, HG 1), `cy` (NRM 1, MIXK 1, KEV 1 from `Schedule::kev`)) |
+
+and by element: the head east `head::HEAD_PE` + `head::HEAD_CTL` (`HEAD_CTL_TB`, the token bus on, where a side input has storage), east by row groups `head::HEAD_GROUPS` + `HEAD_CTL`, the band `split::band` (`head_pe.csl` BAND 1, `head_ctl.csl` with the bus reserved); the storage `stacked::store` (`ple_gemma`); gap slots `common::RELAY`.
 
 ## Kernels and their ABI
 
@@ -149,7 +172,7 @@ pub const HEAD_PE: Kernel = Kernel {
     rcfg: Some(head_pe),           // fn(&Pe) -> Result<Vec<u32>, String>
 };
 
-// in the layout's kernels():
+// in head::east():
 out.insert(Kind::HEAD, KernelBuild::of(&HEAD_PE, HeadPe { VR: vr, HDc: 2 * hc, NPX: 1, HACC16: 0 })?);
 ```
 
@@ -167,14 +190,14 @@ weight FIFO) in that kind only; a lever no kernel takes is an error.
 
 `layout.csl` is written from the floor: each maximal rectangle of PEs with one kind and one
 resolved param list is one loop nest, every param a literal, so the link passes no params.
-The per-kind sources are the kernels', with one-word dummies for the layout's other exported
+The per-kind sources are the kernels', with one-word dummies for the kernel set's other exported
 symbols (`kernels::symbols`, export order).
 
 ### Op modules (`programs/wafer/ops`)
 
 The weight PEs (`weight.csl`) and the row control PEs (`cx.csl`) are one kernel each for every
 layer program: the layer's phases (the input norm `NRM`, the mixer kind `MIXK`, the PLE round, head
-groups) are comptime params, and the mixers are op modules. The other roles still run their layout's
+groups) are comptime params, and the mixers are op modules. The other roles still run their set's
 phase order. A kernel's ops come from op modules it imports with comptime params
 (`@import_module("ops/<name>.csl", .{ .. })`). A module's code is emitted only where
 a kernel calls it; the per-step ones are `inline fn`, so a kernel compiles to the code it had.
@@ -207,7 +230,7 @@ them all to `layout/ops`.
 
 The three role kernels of a unit (`weight`, `cx`, `cy`) are each one image over every layer program: the
 phase order is theirs, the mixer and norm kinds comptime params (`NRM`, `MIXK`, `ACT`, `PLE`). What is still
-a layout's own is in the head and PLE kernels: the token loop's winner merge and the handoff relays.
+a set's own is in the head and PLE kernels: the token loop's winner merge and the handoff relays.
 
 ## Adding a model
 
@@ -215,13 +238,14 @@ a layout's own is in the head and PLE kernels: the token loop's winner merge and
    runs on the wafer and that no kernel runs (a new mixer, a new activation) is refused by name
    (`LAYER_OPS`, `OUTER_OPS`); teach `target.rs` the op and give the plan's `Shape` the field the
    blocks need.
-2. **Layout.** `compose::Layout::of` picks the layout from what the layer program needs. A model of
-   an existing layout plans by the search from its layout's pinned plans; once its program is
-   validated on the chip, its plan is pinned (`plans/<name>.json`: the keys, levers and, for
-   stacked columns, the arrangement; one `include_str!` in `pins.rs`). A new layout is a rule in
-   `Layout::of`, its partition (`partition/<layout>.rs`), its blocks (`compose::blocks`), copies
-   (`compose::copies`), refusals (`compose::refuse`), kernels (`kernels/<layout>.rs`) and cut
-   (`tiles/<layout>.rs`).
+2. **Kernel set and floorplan.** `KernelSet::of` picks the role kernels from what the layer
+   program's mixers need. A model of an existing set plans by the search from its set's pinned
+   plans; once its program is validated on the chip, its plan is pinned (`plans/<name>.json`:
+   the set, keys, levers and, for stacked columns, the arrangement; one `include_str!` in
+   `pins.rs`). A new feature asks for its element (`floorplan::Requests`, `Floorplan::of`) and the
+   composer maps it to its block (`compose::blocks`); a new set is a rule in `KernelSet::of`, its
+   constructor (`floorplan/<point>.rs`), copies (`compose::copies`), refusals
+   (`compose::refuse`), kernels (`kernels/<set>.rs`) and cut (`tiles/<set>.rs`).
 3. **List the blocks.** Units first, then what places against them, then wiring-only blocks.
    Reuse a block where its doc fits exactly; otherwise write a new module under `block/` (a new
    block, not a flag on a shared one).
@@ -235,12 +259,12 @@ a layout's own is in the head and PLE kernels: the token loop's winner merge and
    `units::handoff`, `head::head_rows`, `head::head_input`, `token_loop::token_loop`,
    `wiring::segments`) where it fits; leave notes for facts a kernel needs (`head::ROLE`,
    `token_loop::TURN`) instead of recomputing them in an rcfg writer.
-6. **Kernels** in `kernels/<layout>.rs`: one `params!` struct and one `Kernel` const a CSL source,
+6. **Kernels** in `kernels/<set>.rs`: one `params!` struct and one `Kernel` const a CSL source,
    the writer over `Pe` using `common::*` for the shared words. Values that differ by PE are
    `Block::overrides`. The CSL imports its ops from `programs/wafer/ops`; an op no module has is a
    new module there (and a row in `sources::OPS`), not code in the kernel.
 7. **Copies** in each block's `bindings`, in placement order (the host's device protocol); the
-   layout's cut states the arrays they copy (`tiles/<layout>.rs`).
+   set's cut states the arrays they copy (`tiles/<set>.rs`).
 8. **Host.** Anything the driver must find goes in `HostLayout`, derived from the program.
 9. **Verify** with the baseline harness (below) and the tiny simulator run.
 
@@ -249,7 +273,7 @@ a layout's own is in the head and PLE kernels: the token loop's winner merge and
 `Program::build(plan)` is the whole physical compiler; its only input is a `Plan`. The plan
 comes from poem's spatial pass (`poem_compiler::spatial::plan` over `target::Wafer`): the trace
 gives the `Shape` (layer kinds, attention / MLP / MoE / GDN / PLE specs, head, RoPE, norms), the
-shape picks the layout, and the pinned plan made for the shape (`pins`: `plans/*.json`, the keys,
+shape picks the kernel set, and the pinned plan made for the shape (`pins`: `plans/*.json`, the keys,
 levers and arrangement of each shipping model's chip-validated program) is the partition tried (a
 named one, `--preset <name>`, tries only itself; `--set` overrides its keys). A checkpoint with no
 catalog deployment states its shape in a file (`target::plan_shape`; the tiny test checkpoints'
@@ -313,12 +337,12 @@ else Pie decode; a model the chip has not run takes the median).
 layers' tiles, its KV cache, its scores' buffers) and the head PE's (its vocabulary rows' tiles and
 embeddings); code and the small buffers move with the kernels' flags, not the partition. So an
 image is measured off an anchor (`cost/anchors.rs`: a link of the model's own program, else its
-layout's widest), plus what the plan moves over the anchor's. Off the same kernels' anchor the
+kernel set's widest), plus what the plan moves over the anchor's. Off the same kernels' anchor the
 model is within 380 B (Qwen3.5 4B from 0.8B); across kernel flags it is off by up to 2 KB, which
 is why a model anchors on its own link. `anchors.rs` is regenerated from links when the kernels
 change.
 
-`search::search` walks from each of the layout's pinned plans (the made-for one first), moving one key
+`search::search` walks from each of the kernel set's pinned plans (the made-for one first), moving one key
 or two (a move another must follow: the positions, the units' grid) over a ladder of values; a
 seed that does not plan is repaired a key at a time, following each move that gets it past the
 check it failed. A candidate plans, serves the positions asked for (the made-for plan's, else
@@ -339,13 +363,13 @@ head tiles, `ple`'s 1,900 MiB storage files).
 ## The cut
 
 What the bindings place is cut from the model's params, named as the trace names them (the
-runtime's import contract lands them, so no checkpoint name appears in the crate). Each layout
-states its cut as data (`tiles/<layout>.rs`: a `tiles::spec::Spec`, every staged array and
+runtime's import contract lands them, so no checkpoint name appears in the crate). Each kernel
+set states its cut as data (`tiles/<set>.rs`: a `tiles::spec::Spec`, every staged array and
 how each element follows from the params): a weight PE grid's tiles (a matrix's rows or columns
 gathered a column, its hidden dims split a row), gathered vectors, constants, and the tables a block
 computes rather than copies (RoPE's cos / sin, the head's vocabulary tiles, Gemma's per-layer
 inputs, MXFP4 experts as E5M2 pairs, each checked exact). One tiler (`tiles::cut`) makes every
-layout's arrays; rounding is numpy's (f16 to nearest even, bf16 truncated), so the arrays are the
+set's arrays; rounding is numpy's (f16 to nearest even, bf16 truncated), so the arrays are the
 earlier Python preps' byte for byte, with one deliberate exception. Gemma's per-layer inputs are
 computed in f64 throughout and rounded once to f16, where the prep summed its projection in f32 in
 its BLAS build's own order (OpenBLAS's K blocks). The cut's tables are the reference: each value is
@@ -393,7 +417,7 @@ shape, partition and contract and the checkpoint; each model keeps one of each.
 ## Verification
 
 `tools/wafer/baseline` captures everything the build and the host produce for every shipping config
-and each layout's tiny (the host's placement, calls and derived values on a recording device; the
+and each kernel set's tiny (the host's placement, calls and derived values on a recording device; the
 build's per-PE kernel and params, evaluated from `layout.csl` by `layout_eval.py`; the tiny cuts),
 and compares two captures. A change that must not change behaviour is checked against the capture
 of the tree before it (README there).
