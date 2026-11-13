@@ -162,7 +162,7 @@ impl Held {
         self.offset
     }
 
-    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    #[cfg(target_vendor = "apple")]
     pub(crate) fn raw(&self) -> &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer> {
         self.buffer.raw()
     }
