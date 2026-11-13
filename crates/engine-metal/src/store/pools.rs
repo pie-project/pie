@@ -1189,6 +1189,12 @@ impl Pools {
         self.pool.committed_bytes()
     }
 
+    /// The device bytes behind the pool's committed segments.
+    #[must_use]
+    pub fn held_bytes(&self) -> u64 {
+        self.pool.held_bytes()
+    }
+
     #[must_use]
     pub fn high_water_bytes(&self) -> u64 {
         self.pool.high_water_bytes()
