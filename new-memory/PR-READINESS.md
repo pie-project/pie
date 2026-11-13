@@ -70,3 +70,5 @@ medians. Known gaps to close:
   2/32 MiB handles, alignment, slot stride, in-place rewrite). Weight-use readback made async (a6ccbefe9).
 - Metal c1: gemma -0.3%, Qwen3.5 -0.5% (accepted by user 2026-11-11).
 - sm_90 / sm_100 speed of the A1 TMA paths unverified (A25, needs H100 / B200).
+- wgpu c1 drifts ~+-10% between sessions on this box: gate it with >= 12 reps x 10 alternating rounds, repeated in two
+  sessions (scratchpad/egv/wgpair.sh). The earlier -9% was noise (rerun +6.1%, p=0.23; engine-gpu merge alone +0.6%).
