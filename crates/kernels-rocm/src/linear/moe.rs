@@ -3194,6 +3194,8 @@ fn weighted_fold(
     )
 }
 
+/// `table` places the bias's experts where the weight cache streams it
+/// (a one-plane bank); [`ExpertTable::RESIDENT`] reads it contiguous.
 pub fn bias_sum(
     ctx: &Ctx,
     x: Tensor,
@@ -3201,6 +3203,7 @@ pub fn bias_sum(
     routes: Tensor,
     weights: Tensor,
     y: &mut Tensor,
+    table: ExpertTable,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_bias_sum";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -3240,6 +3243,7 @@ pub fn bias_sum(
             stated(OP, top_k)?.arg(),
             stated(OP, y.width)?.arg(),
             ctx.stage(),
+            ArgValue::Ptr(table.table),
         ],
     )
 }
