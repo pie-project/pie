@@ -677,20 +677,45 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             false,
         ));
         let more: Vec<&[u32]> = windows.iter().skip(1).map(Vec::as_slice).collect();
-        let seated = Seated {
-            pages: &pages,
-            held: Some(fed),
-            window: windows.first().map_or(&[], Vec::as_slice),
-            more_windows: &more,
-            rs_slot: record,
-            ..Seated::of(Lane {
-                slot: 0,
-                word,
-                tokens: &tokens,
-            })
+        let window = windows.first().map_or(&[][..], Vec::as_slice);
+        fn seat<'a>(
+            (pages, window, more, record): (&'a [u32], &'a [u32], &'a [&'a [u32]], Option<u32>),
+            word: u64,
+            tokens: &'a [u32],
+            held: u32,
+        ) -> Seated<'a> {
+            Seated {
+                pages,
+                held: Some(held),
+                window,
+                more_windows: more,
+                rs_slot: record,
+                ..Seated::of(Lane {
+                    slot: 0,
+                    word,
+                    tokens,
+                })
+            }
+        }
+        let tables = (&pages[..], window, &more[..], record);
+        let seated = |word, tokens, held| seat(tables, word, tokens, held);
+        // A long prompt of a load that replays (`engine_cuda::replay`) fires
+        // as the runtime's step and `Shell::fire` split it: its leading rows
+        // encoder-only, then its last window.
+        let replay = engine_cuda::replay::Replay::of(&shell)
+            .filter(|replay| tokens.len() > replay.window as usize);
+        let tail = match replay {
+            Some(replay) => {
+                let skipped = tokens.len() - replay.window as usize;
+                shell
+                    .fire_media(&[seated(word | replay.bit, &tokens[..skipped], fed)], &[], &[])
+                    .expect("the encoder-only rows fire");
+                (skipped, fed + u32::try_from(skipped).expect("a count"))
+            }
+            None => (0, fed),
         };
         let mut rows = shell
-            .fire_media(&[seated], &[], &[])
+            .fire_media(&[seated(word, &tokens[tail.0..], tail.1)], &[], &[])
             .expect("the step fires");
         let logits = rows.swap_remove(0);
         fed = after;
