@@ -336,6 +336,13 @@ impl Api {
     }
 }
 
+/// One memory a device addresses (its HBM, pinned host memory).
+#[derive(Clone, Copy)]
+pub struct Memory<'c> {
+    raw: *mut sys::PJRT_Memory,
+    _client: PhantomData<&'c Client>,
+}
+
 /// A device the client addresses. Borrowed from the client; valid while it is.
 #[derive(Clone, Copy)]
 pub struct Device<'c> {
@@ -412,6 +419,28 @@ impl Client {
             raw,
             _client: PhantomData,
         })
+    }
+
+    /// The memory of `device` of `kind` (`"device"`, `"pinned_host"`,
+    /// `"unpinned_host"`), where the plugin addresses one.
+    pub fn memory(&self, device: Device<'_>, kind: &str) -> Result<Option<Memory<'_>>> {
+        let mut a = args!(PJRT_Device_AddressableMemories_Args { device: device.raw });
+        call!(&self.api, PJRT_Device_AddressableMemories, &mut a)?;
+        for i in 0..a.num_memories {
+            // SAFETY: the plugin hands `num_memories` memories owned by the
+            // client, alive as long as `&self`.
+            let raw = unsafe { *a.memories.add(i) };
+            let mut k = args!(PJRT_Memory_Kind_Args { memory: raw });
+            call!(&self.api, PJRT_Memory_Kind, &mut k)?;
+            // SAFETY: the kind is owned by the memory and `kind_size` bytes.
+            if unsafe { text(k.kind, k.kind_size) } == kind {
+                return Ok(Some(Memory {
+                    raw,
+                    _client: PhantomData,
+                }));
+            }
+        }
+        Ok(None)
     }
 
     #[must_use]
@@ -491,6 +520,19 @@ impl Client {
         ty: ElementType,
         dims: &[i64],
     ) -> Result<Buffer> {
+        self.upload_to(device, None, data, ty, dims)
+    }
+
+    /// [`Client::upload`] into `memory` of `device` (a host memory the
+    /// device's programs read), or the device's own where `None`.
+    pub fn upload_to(
+        &self,
+        device: Device<'_>,
+        memory: Option<Memory<'_>>,
+        data: &[u8],
+        ty: ElementType,
+        dims: &[i64],
+    ) -> Result<Buffer> {
         let elements: i64 = dims.iter().product();
         let want = ty.bytes(usize::try_from(elements).unwrap_or(usize::MAX));
         if data.len() != want {
@@ -506,7 +548,12 @@ impl Client {
             dims: dims.as_ptr(),
             num_dims: dims.len(),
             host_buffer_semantics: sys::PJRT_HostBufferSemantics_kImmutableOnlyDuringCall,
-            device: device.raw,
+            device: if memory.is_some() {
+                ptr::null_mut()
+            } else {
+                device.raw
+            },
+            memory: memory.map_or(ptr::null_mut(), |m| m.raw),
         });
         call!(&self.api, PJRT_Client_BufferFromHostBuffer, &mut a)?;
         if !a.done_with_host_buffer.is_null() {
