@@ -2,7 +2,9 @@
 //! stage: the trace, the layer program (`spatial::layer::lower`), the shape (`target::shape`), the
 //! kernels' refusals (`compose::refuse`), the plan (pinned or searched) and the program
 //! (`Program::build`). Prints one line a deployment: the stage it stops at and why, and every op
-//! that runs on the wafer with no spatial lowering (not just the first).
+//! that runs on the wafer with no spatial lowering (not just the first). A poem with a `denoise`
+//! reading (a diffusion transformer) gets a second line, its stream regime's: the reading's stream
+//! program and shape (`kernels_cerebras::stream::shape_of`, 64 rows a class) or the refusal.
 //!
 //! ```text
 //! cargo run --release -p kernels-cerebras --example survey [-- <name filter>... | =<deployment>...]
@@ -106,6 +108,49 @@ fn short(s: &str) -> String {
     }
 }
 
+/// The stream regime's line for a poem with a `denoise` reading: its shape at 64 rows a class,
+/// or where it stops (STREAM-LOWER: the stream program; STREAM-SHAPE: the params).
+fn stream(d: &Deployment, trace: &Trace) {
+    let reading = "denoise";
+    let denoises = trace.facts.table.iter().any(|f| {
+        matches!(f, poem_ir::Fact::Switch { name, value } if name == "reading" && value == reading)
+    });
+    if !denoises {
+        return;
+    }
+    let name = &d.name;
+    let classes = poem_compiler::spatial::layer::stream::classes(trace, reading, 64);
+    let an = match poem_compiler::analysis::analyze(trace) {
+        Ok(a) => a,
+        Err(e) => {
+            return println!(
+                "{name}\treading={reading}\tANALYSIS\t{}",
+                short(&e.to_string())
+            );
+        }
+    };
+    if let Err(e) = poem_compiler::spatial::layer::stream::lower(trace, &an, &classes) {
+        return println!("{name}\treading={reading}\tSTREAM-LOWER\t{}", short(&e));
+    }
+    match kernels_cerebras::stream::shape(trace, reading, &classes) {
+        Ok(s) => println!(
+            "{name}\treading={reading}\tSTREAM-SHAPE-OK\tclasses={} units={} layer-bodies={} \
+             hidden={} heads={}x{}",
+            s.classes
+                .iter()
+                .map(|(c, r)| format!("{c}:{r}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            s.units,
+            s.layer_bodies,
+            s.hidden,
+            s.attn.q_heads,
+            s.attn.head_dim
+        ),
+        Err(e) => println!("{name}\treading={reading}\tSTREAM-SHAPE\t{}", short(&e)),
+    }
+}
+
 fn survey(d: &Deployment, deep: bool) {
     let t0 = Instant::now();
     let name = &d.name;
@@ -113,6 +158,7 @@ fn survey(d: &Deployment, deep: bool) {
         Ok(t) => t,
         Err(e) => return println!("{name}\tTRACE\t{}", short(&e.0)),
     };
+    stream(d, &trace);
     let (inner, outer) = missing(&trace);
     let fmt = |m: &BTreeMap<String, usize>| {
         m.iter()

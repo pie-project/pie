@@ -34,6 +34,7 @@ pub mod program;
 pub mod role;
 pub mod search;
 pub mod sources;
+pub mod stream;
 pub mod target;
 pub mod tiles;
 pub mod toolchain;

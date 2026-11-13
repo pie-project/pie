@@ -62,7 +62,7 @@ fn maker(trace: &Trace, v: ValueId) -> Option<&Operation> {
     }
 }
 
-fn act(a: &GluAct) -> R<Act> {
+pub(crate) fn act(a: &GluAct) -> R<Act> {
     match a {
         GluAct::Swiglu => Ok(Act::Silu),
         GluAct::GegluTanh => Ok(Act::GeluTanh),
