@@ -388,11 +388,11 @@ impl Lane {
         loop {
             // Between fires: a raise waiting on a rung not armed gets steps
             // toward it, however busy the lane (REDESIGN 2.5,
-            // `super::arming`): at least one a gap, more while the gap's
-            // budget lasts. Its pass never waits on them: it fires at the
-            // widest rung armed meanwhile, cut to it, and takes a wider one
-            // as it arms. A step short of room ends the gap's run until the
-            // raise funds it.
+            // `super::arming`): half the lane's time at most, a gap running
+            // steps while its budget lasts. Its pass never waits on them: it
+            // fires at the widest rung armed meanwhile, cut to it, and takes
+            // a wider one as it arms. A step short of room ends the gap's run
+            // until the raise funds it.
             if arming.raise_waits() {
                 let until = Instant::now() + super::arming::GAP_BUDGET;
                 loop {
@@ -421,6 +421,9 @@ impl Lane {
                     }
                 }
             };
+            if matches!(request, LaneRequest::Launch { .. }) {
+                arming.served();
+            }
             let work = match &request {
                 LaneRequest::Control { .. } => Some(LaneWork::Control),
                 LaneRequest::Launch { prefill: true, .. } => Some(LaneWork::Prefill),

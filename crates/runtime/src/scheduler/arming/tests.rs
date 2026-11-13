@@ -411,7 +411,7 @@ fn a_raise_under_continuous_fires_is_armed_between_them() {
     let live = engine.live.clone();
     let mut lane = spawn(ENGINE, engine, &planner);
     let mut in_flight = std::collections::VecDeque::new();
-    for _ in 0..16 {
+    for _ in 0..48 {
         in_flight.push_back(fire(&lane, 256));
     }
     drop(blocker);
@@ -427,9 +427,8 @@ fn a_raise_under_continuous_fires_is_armed_between_them() {
     );
     assert_eq!(seen.steps.load(Ordering::SeqCst), 0);
 
-    // A pass asks 2048 rows: steps run between fires, as many as a gap's
-    // budget holds (all of them, steps here costing nothing), and the pass
-    // then fires at its rung.
+    // A pass asks 2048 rows: steps run between fires, half the busy lane's
+    // time at most, and the pass fires at each rung as it arms.
     let want = crate::store::shared::want_rows(ENGINE, 2048);
     let mut fires = 0;
     let mut widths = Vec::new();
@@ -447,8 +446,12 @@ fn a_raise_under_continuous_fires_is_armed_between_them() {
     }
     drop(want);
     assert!(
-        fires <= 2,
-        "steps this cheap arm the raise's rung within one gap: {widths:?}"
+        fires <= 2 * (RUNGS.len() - 1) * COMPOSITIONS as usize,
+        "a step every gap or two, never starved: {widths:?}"
+    );
+    assert!(
+        widths.windows(2).all(|w| w[0] <= w[1]),
+        "and only ever wider: {widths:?}"
     );
     let steps = seen.steps.load(Ordering::SeqCst);
     let rungs = (RUNGS.len() - 1) * COMPOSITIONS as usize;
