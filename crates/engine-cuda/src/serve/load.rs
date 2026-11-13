@@ -1623,11 +1623,16 @@ impl Staged {
         // One whose rungs past the smallest arm later keeps what is left of
         // the allowance out likewise, and its range where the bodies armed
         // name it.
+        // Whatever armed a body, the range stays where it lies: the bodies
+        // name addresses in it, and a fit that reserved it anew (a flat
+        // range's does) would leave them naming the old one.
+        if shell.cache.body_stats().census.bodies > 0 {
+            shell.pools.pin();
+        }
         let settled = shell.records_bodies() && !deferred && !stepping;
         let bodies = if deferred {
             shell.bodies_mem as u64
         } else if stepping {
-            shell.pools.pin();
             (shell.bodies_mem as u64).saturating_sub(shell.cache.body_stats().census.bytes as u64)
         } else {
             0
