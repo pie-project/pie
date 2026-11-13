@@ -64,6 +64,11 @@ impl SharedGrow {
             let (step, goal) = {
                 let mut pool = self.shared.lock().unwrap();
                 pool.pool_mut().retire_through(retired);
+                // A raise's copy is still the engine's to take: nothing
+                // moves until it has.
+                if pool.copying().is_some() {
+                    return;
+                }
                 let goal = pool.rung_for(super::wanted_rows(self.engine));
                 let step = self.rung_walk.lock().unwrap().step(
                     &pool,
@@ -73,6 +78,14 @@ impl SharedGrow {
                     current,
                     retired,
                 );
+                // A raise is taken in the hold it was planned in: no slot is
+                // handed out between, and the engine's copy follows.
+                let step = match step {
+                    Ok(RungStep::Raise { rung, evacuation }) => pool
+                        .raise_applied(&evacuation)
+                        .map(|()| RungStep::Raise { rung, evacuation }),
+                    step => step,
+                };
                 (step, goal)
             };
             let step = match step {
@@ -138,19 +151,20 @@ impl SharedGrow {
                         let copied =
                             crate::scheduler::pool(self.engine, PoolOp::Evacuate(moves)).await;
                         if let Err(error) = copied {
-                            tracing::warn!(engine = self.engine, %error, "a rung's evacuation was refused");
+                            // The pool moved the chunks and the engine did
+                            // not: no fire passes the rung held before.
+                            tracing::error!(
+                                engine = self.engine,
+                                %error,
+                                "a raise's copy was refused; the rung stays held"
+                            );
                             return;
                         }
-                    }
-                    let (current, _) = self.epochs();
-                    let applied = self
-                        .shared
-                        .lock()
-                        .unwrap()
-                        .apply_rung(&evacuation, current.saturating_add(1));
-                    if let Err(error) = applied {
-                        tracing::warn!(engine = self.engine, %error, "the activation rung stays");
-                        return;
+                        let (current, _) = self.epochs();
+                        self.shared
+                            .lock()
+                            .unwrap()
+                            .raise_copied(current.saturating_add(1));
                     }
                     tracing::info!(
                         engine = self.engine,
@@ -355,5 +369,4 @@ impl PoolTarget for SharedGrow {
     fn take_refused(&mut self) -> bool {
         self.refused.swap(false, Ordering::AcqRel)
     }
-
 }
