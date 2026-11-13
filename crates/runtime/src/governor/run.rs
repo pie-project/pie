@@ -188,6 +188,9 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
         if past && !warned {
             tracing::warn!(held, hard_limit, "the pool is mapped past its hard limit");
         }
+        if !past && warned {
+            tracing::info!(held, hard_limit, "the pool is mapped within its hard limit again");
+        }
         warned = past;
     }
 }
