@@ -34,7 +34,11 @@ pub enum CachePool {
 }
 
 #[derive(Clone, Debug, Default, Hash)]
-pub struct CacheTable(pub Vec<CachePool>);
+pub struct CacheTable(
+    pub Vec<CachePool>,
+    /// Each compressor's state, by the kv row its gather keys by.
+    pub Vec<(u32, kernels_slang::attn::pool::PoolState)>,
+);
 
 #[derive(Clone, Copy, Debug, Default, Hash)]
 pub struct CacheGeometry {
@@ -66,13 +70,6 @@ pub struct FireTables {
     pub mask_enabled: Tensor,
 
     pub mask_stride: u32,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct PoolSlabs {
-    pub state_kv: Tensor,
-
-    pub state_score: Tensor,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -968,18 +965,16 @@ impl<'c, B: Backend> Run<'c, B> {
         }))
     }
 
-    pub fn pool_state(&self, pages: ValueId) -> Option<PoolSlabs> {
+    pub fn pool_state(&self, pages: ValueId) -> Option<kernels_slang::attn::pool::PoolState> {
         let at = pages.0 as usize;
         let Some(Def::Cache(row)) = self.values.get(at).map(|v| &v.def) else {
             panic!("value {at} is not a cache row; the pooled state is keyed by one")
         };
-        Some(
-            self.scratch
-                .pool_state(self.handles, *row)?
-                .unwrap_or_else(|fault| {
-                    panic!("the compressor state this load reserved does not mint: {fault}")
-                }),
-        )
+        self.caches
+            .1
+            .iter()
+            .find(|(keyed, _)| keyed == row)
+            .map(|(_, state)| *state)
     }
 
     pub fn ple_hash(&self, mults: &[u64], primes: &[u64], offsets: &[u64]) -> Option<Tensor> {

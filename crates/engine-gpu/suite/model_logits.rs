@@ -665,8 +665,8 @@ fn a_scattered_hybrid_pool_serves_the_same_logits() {
     scattered("qwen35-tiny");
 }
 
-/// A model with a compressed kv pool: its compressor side planes, a cell a
-/// token of every physical list page, follow the pages an evacuation moves.
+/// A model with a compressed kv pool: its compressor state, rows of the list
+/// slots it describes, moves with the slots an evacuation moves.
 /// Ignored: dsv4-flash-mini does not serve here, before the pool as after
 /// (before it, its side planes overran a binding; now its index top-k
 /// refuses the index pool's pitch).

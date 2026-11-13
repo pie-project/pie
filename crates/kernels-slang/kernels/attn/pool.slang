@@ -51,18 +51,26 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
 [[vk::binding(0)]] StructuredBuffer<uint> kv;
 [[vk::binding(1)]] StructuredBuffer<uint> score;
-[[vk::binding(2)]] RWStructuredBuffer<uint> state_kv;
-[[vk::binding(3)]] RWStructuredBuffer<uint> state_score;
-[[vk::binding(4)]] StructuredBuffer<uint> w_page;
-[[vk::binding(5)]] StructuredBuffer<uint> w_off;
+[[vk::binding(2)]] StructuredBuffer<uint> w_page;
+[[vk::binding(3)]] StructuredBuffer<uint> w_off;
+// The state planes, rows of the list slots they describe, in the chunk
+// pool's segments: page `p`'s projection rows from word `kv_origin + p *
+// page_stride`, its score rows from `score_origin + p * page_stride`.
+PIE_POOL_SEGMENTS(RWStructuredBuffer, uint, 4)
 
 struct Params {
+    uint seg_words;
+    uint kv_origin;
+    uint score_origin;
+    uint page_stride;
     int width;
     int page_size;
     int state_pitch;
     int rows;
 };
-PIE_PARAMS(6, Params, params);
+PIE_PARAMS(8, Params, params);
+PIE_POOL_READ(uint, params.seg_words)
+PIE_POOL_WRITE(uint, params.seg_words)
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
@@ -77,11 +85,11 @@ void main(uint3 gid : SV_DispatchThreadID) {
     if (page < 0 || off < 0 || off >= params.page_size) {
         return;
     }
-    uint slot = uint(page) * uint(params.page_size) + uint(off);
-    uint dst = (slot * uint(params.state_pitch) + uint(d)) >> 1;
+    uint dst = uint(page) * params.page_stride
+        + ((uint(off) * uint(params.state_pitch) + uint(d)) >> 1);
     uint src = (i * uint(params.width) + uint(d)) >> 1;
-    state_kv[dst] = kv[src];
-    state_score[dst] = score[src];
+    pie_pool_set(params.kv_origin + dst, kv[src]);
+    pie_pool_set(params.score_origin + dst, score[src]);
 }
 
 #elif defined(PIE_BLOCK_MEAN) || defined(PIE_GATHER) || defined(PIE_STORE)
@@ -108,16 +116,21 @@ PIE_PARAMS(9, Params, params);
 PIE_POOL_READ(uint, params.seg_words)
 PIE_POOL_VIEW_RO(key_pages, uint, params.k_origin)
 #elif defined(PIE_GATHER)
-[[vk::binding(0)]] StructuredBuffer<uint> state_kv;
-[[vk::binding(1)]] StructuredBuffer<uint> state_score;
-[[vk::binding(2)]] StructuredBuffer<float> ape;
-[[vk::binding(3)]] StructuredBuffer<int> boundary_pos;
-[[vk::binding(4)]] StructuredBuffer<int> boundary_req;
-[[vk::binding(5)]] StructuredBuffer<uint> page_indices;
-[[vk::binding(6)]] StructuredBuffer<uint> page_indptr;
-[[vk::binding(7)]] RWStructuredBuffer<uint> o;
+[[vk::binding(0)]] StructuredBuffer<float> ape;
+[[vk::binding(1)]] StructuredBuffer<int> boundary_pos;
+[[vk::binding(2)]] StructuredBuffer<int> boundary_req;
+[[vk::binding(3)]] StructuredBuffer<uint> page_indices;
+[[vk::binding(4)]] StructuredBuffer<uint> page_indptr;
+[[vk::binding(5)]] RWStructuredBuffer<uint> o;
+// The state planes, rows of the list slots they describe, in the chunk
+// pool's segments (as `PIE_STATE_WRITE` lays them).
+PIE_POOL_SEGMENTS(StructuredBuffer, uint, 6)
 
 struct Params {
+    uint seg_words;
+    uint kv_origin;
+    uint score_origin;
+    uint page_stride;
     int head_dim;
     int ratio;
     int coff;
@@ -126,7 +139,14 @@ struct Params {
     int state_pitch;
     int rows;
 };
-PIE_PARAMS(8, Params, params);
+PIE_PARAMS(10, Params, params);
+PIE_POOL_READ(uint, params.seg_words)
+
+// The bf16 element `e` of the plane from word `origin` on.
+float state_at(uint origin, uint e) {
+    uint word = pie_pool_get(origin + (e >> 1));
+    return bf16_to_f32((e & 1u) != 0u ? (word >> 16) : (word & 0xffffu));
+}
 #else
 [[vk::binding(0)]] StructuredBuffer<uint> entries;
 [[vk::binding(1)]] StructuredBuffer<int> boundary_pos;
@@ -159,11 +179,14 @@ uint pool_row(int req, int pos, uint width) {
 }
 #endif
 
-// The page slot of position `pos` of request `req`.
-uint pool_slot(int req, int pos) {
+#if defined(PIE_GATHER)
+// The bf16 element position `pos` of request `req`'s state row starts at in
+// a state plane: its page, `page_stride` words a page, then the row in it.
+uint state_row(int req, int pos) {
     uint page = page_indices[page_indptr[uint(req)] + uint(pos / params.page_size)];
-    return page * uint(params.page_size) + uint(pos % params.page_size);
+    return page * (2u * params.page_stride) + uint(pos % params.page_size) * uint(params.state_pitch);
 }
+#endif
 
 #if defined(PIE_BLOCK_MEAN)
 float block_value(int d, int bpos, int req) {
@@ -185,14 +208,13 @@ float block_value(int d, int bpos, int req) {
 float block_value(int d, int bpos, int req) {
     int window = params.coff * params.ratio;
     uint width = uint(params.coff * params.head_dim);
-    uint pitch = uint(params.state_pitch);
     float max_s = neg_inf();
     for (int i = 0; i < window; i++) {
         int pos = bpos + i - (window - 1);
         if (pos >= 0) {
             uint col = uint((i >= params.ratio ? params.head_dim : 0) + d);
-            uint e = pool_slot(req, pos) * pitch + col;
-            float sc = bf16_at(state_score, e);
+            uint e = state_row(req, pos) + col;
+            float sc = state_at(params.score_origin, e);
             if (params.has_ape != 0) {
                 sc += ape[uint(pos % params.ratio) * width + col];
             }
@@ -208,14 +230,14 @@ float block_value(int d, int bpos, int req) {
         int pos = bpos + i - (window - 1);
         if (pos >= 0) {
             uint col = uint((i >= params.ratio ? params.head_dim : 0) + d);
-            uint e = pool_slot(req, pos) * pitch + col;
-            float sc = bf16_at(state_score, e);
+            uint e = state_row(req, pos) + col;
+            float sc = state_at(params.score_origin, e);
             if (params.has_ape != 0) {
                 sc += ape[uint(pos % params.ratio) * width + col];
             }
             float ex = exp(sc - max_s);
             sum_e += ex;
-            acc += ex * bf16_at(state_kv, e);
+            acc += ex * state_at(params.kv_origin, e);
         }
     }
     return sum_e > 0.0 ? acc / sum_e : 0.0;

@@ -804,9 +804,9 @@ impl<B: Serve> Shell<B> {
         };
 
         let arena = Arena::reserve(&device, &compiled.arena)?;
-        let device_cap = device.left().saturating_sub(
-            u64::from(least_chunks) * chunk + crate::scratch::pool_bytes(&boot.trace, least),
-        );
+        let device_cap = device
+            .left()
+            .saturating_sub(u64::from(least_chunks) * chunk);
         let mut weights = Weights::resident(
             &device,
             &handles,
@@ -823,8 +823,7 @@ impl<B: Serve> Shell<B> {
 
         handles.seal();
 
-        let mut scratch =
-            Scratch::reserve(&device, &boot.trace, &compiled, &budgets, least, &tuning)?;
+        let scratch = Scratch::reserve(&device, &boot.trace, &compiled, &budgets, least, &tuning)?;
         // A page table a list the kv rows lie in: the kv list's first (the
         // All axis's), then each window list's (CONTRACT-BC 21).
         let page_tables = rows.tables.len();
@@ -1084,23 +1083,7 @@ impl<B: Serve> Shell<B> {
         let words = u32::try_from(2 * u64::from(u32::MAX) / chunk).unwrap_or(u32::MAX)
             / kernels_slang::SEGMENTS as u32
             * kernels_slang::SEGMENTS as u32;
-        // The compressor side planes hold a cell a token of every physical
-        // list page, beside the pool in one scratch buffer: a chunk costs its
-        // share of them, and they stay within one binding.
-        let side = crate::scratch::pool_bytes(
-            &boot.trace,
-            Paging {
-                pages: chunk.checked_div(rows.list_bytes).unwrap_or(0),
-                ..asked
-            },
-        );
-        let sides = if side == 0 {
-            u32::MAX
-        } else {
-            let room_chunks = room / (chunk + side);
-            u32::try_from(room_chunks.min(device.max_buffer() / side)).unwrap_or(u32::MAX)
-        };
-        let total = total.min(binds).min(words).min(sides);
+        let total = total.min(binds).min(words);
         if total < least_chunks {
             return Err(Fault::Residency(format!(
                 "one working set takes {least_chunks} chunks of {chunk} bytes, and this device \
@@ -1149,12 +1132,6 @@ impl<B: Serve> Shell<B> {
             slots,
             ..asked
         };
-        if crate::scratch::pool_bytes(&boot.trace, paging)
-            > crate::scratch::pool_bytes(&boot.trace, least)
-        {
-            drop(scratch);
-            scratch = Scratch::reserve(&device, &boot.trace, &compiled, &budgets, paging, &tuning)?;
-        }
         let host_chunks =
             host_kv_budget.map_or(0, |bytes| u32::try_from(bytes / chunk).unwrap_or(u32::MAX));
         let rs_at = rows.rs.clone();
@@ -1587,7 +1564,7 @@ impl<B: Serve> Shell<B> {
             return Ok(());
         }
         let mut frame = self.device.frame()?;
-        let (moved, pages) = self.pools.evacuate(&mut frame, evacuation)?;
+        self.pools.evacuate(&mut frame, evacuation)?;
         // The weight cache's entries name physical units: those in moved
         // chunks are rewritten once every fire reading them has landed.
         if !self.row_caches.is_empty() || !self.expert_caches.is_empty() {
@@ -1596,22 +1573,6 @@ impl<B: Serve> Shell<B> {
             self.row_caches.restage(&self.pools)?;
             self.expert_caches.restage(&self.pools)?;
             frame = self.device.frame()?;
-        }
-        // The compressor side planes hold a cell a token of every physical
-        // list page: each moved chunk's pages move with it.
-        let tokens = u64::from(self.pools.paging().page_size);
-        let plane = self.scratch.plane();
-        for (at, cell) in self.scratch.side_planes() {
-            let run = pages * tokens * cell;
-            for &(from, to) in &moved {
-                frame.copy(
-                    plane,
-                    at + from * tokens * cell,
-                    plane,
-                    at + to * tokens * cell,
-                    run,
-                )?;
-            }
         }
         self.grafted = Some(frame.commit_async(None)?);
         Ok(())
