@@ -1098,20 +1098,23 @@ impl BatchScheduler {
             progress |= Self::retire_ready_control(&mut in_flight_control);
             // A step's tokens stay within the pool's activation rung (SPEC
             // decision 6): smaller while the system is critical.
-            // What is queued and in flight asks the rung of its rows, a
-            // decode batch's lane count as any pass's (REDESIGN 2.5): it is
-            // never cut to a narrower rung for want of asking.
+            // What is queued and in flight asks the rung of its lanes, a
+            // decode batch's lane count (REDESIGN 2.5): it is never cut to a
+            // narrower rung for want of asking. A prompt's rows ask through
+            // its pass ([`crate::store::shared::want_rows`]), not here.
             let queued: usize = pending
                 .items
                 .iter()
                 .map(|item| match item {
-                    QueuedItem::Launch(launch) => launch.request.request.tokens(),
+                    QueuedItem::Launch(launch) => launch.request.request.lanes.len(),
                     _ => 0,
                 })
                 .sum();
             let flying = in_flight_launches
                 .iter()
-                .map(|batch: &PendingLaunchBatch| batch.total_tokens)
+                .map(|batch: &PendingLaunchBatch| {
+                    usize::try_from(batch.batch_size).unwrap_or(usize::MAX)
+                })
                 .max()
                 .unwrap_or(0);
             batch_want.ask(engine_id, queued.max(flying).min(limits.max_forward_tokens));
