@@ -298,8 +298,9 @@ impl Arming {
             records = ?lent.lease.records,
             "an arming step is lent"
         );
+        let want = crate::store::shared::wanted_rows(self.engine_idx);
         let armed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            engine.arm_step(&lent.lease)
+            engine.arm_step(&lent.lease, want)
         }));
         // The room goes back to free before anything else runs.
         drop(lent);
