@@ -430,7 +430,7 @@ impl Lane {
             if arming.raise_waits() {
                 let until = Instant::now() + super::arming::GAP_BUDGET;
                 loop {
-                    let stepped = arming.step(&mut engine, false);
+                    let stepped = arming.step(&mut engine, false, true);
                     if stepped != super::arming::Step::Stepped
                         || !arming.raise_waits()
                         || Instant::now() >= until
@@ -448,16 +448,15 @@ impl Lane {
                 }
                 None => {
                     match Self::next_request(&launch_rx, &control_rx, &mut lane_turn, &mut || {
-                        arming.step(&mut engine, true)
+                        // Frames still in flight: the lane is between
+                        // fires, not idle.
+                        arming.step(&mut engine, true, !landed_instances.is_empty())
                     }) {
                         Ok(request) => request,
                         Err(()) => break,
                     }
                 }
             };
-            if matches!(request, LaneRequest::Launch { .. }) {
-                arming.served();
-            }
             let work = match &request {
                 LaneRequest::Control { .. } => Some(LaneWork::Control),
                 LaneRequest::Launch { prefill: true, .. } => Some(LaneWork::Prefill),

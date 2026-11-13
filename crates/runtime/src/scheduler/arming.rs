@@ -201,11 +201,6 @@ pub(crate) enum Step {
 /// past the first one it runs.
 pub(crate) const GAP_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// How recently the lane served a request for it to count as serving: a
-/// gap shorter than this is one between fires (the engine computing one
-/// still), not a lane with nothing to do.
-const SERVING: std::time::Duration = std::time::Duration::from_millis(40);
-
 /// How long a step short of room waits before its room is looked for
 /// again, so an idle lane does not take the planner's lock each spin.
 const ROOM_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
@@ -227,10 +222,6 @@ pub(crate) struct Arming {
     lender: Box<dyn Lender>,
     /// No room was free: not looked for again before then.
     retry_at: Option<crate::rt::Instant>,
-    /// When the lane last served a request.
-    served_at: Option<crate::rt::Instant>,
-    /// The lane time steps took since then, which is no idle time.
-    stepped_since: std::time::Duration,
     /// While the lane serves, no step before then: a step's time is owed
     /// back to the requests as much again, so arming takes at most half of
     /// a busy lane however long one composition's capture runs.
@@ -270,28 +261,8 @@ impl Arming {
             state,
             lender,
             retry_at: None,
-            served_at: None,
-            stepped_since: std::time::Duration::ZERO,
             owed_until: None,
         }
-    }
-
-    /// The lane served a request just now.
-    pub(crate) fn served(&mut self) {
-        if matches!(self.state, State::Arming) {
-            self.served_at = Some(crate::rt::Instant::now());
-            self.stepped_since = std::time::Duration::ZERO;
-        }
-    }
-
-    /// Whether the lane served a request within [`SERVING`] of its own
-    /// time, the steps run since not counted.
-    fn serving(&self, now: crate::rt::Instant) -> bool {
-        self.served_at.is_some_and(|at| {
-            now.saturating_duration_since(at)
-                .saturating_sub(self.stepped_since)
-                < SERVING
-        })
     }
 
     pub(crate) fn fault(&self) -> Option<&str> {
@@ -318,7 +289,9 @@ impl Arming {
     }
 
     /// One composition, while any remain and its room can be lent.
-    pub(crate) fn step(&mut self, engine: &mut Option<EngineBox>, idle: bool) -> Step {
+    /// `busy`: the lane has work on hand (a frame in flight, a raise
+    /// waiting); arming then takes half its time at most.
+    pub(crate) fn step(&mut self, engine: &mut Option<EngineBox>, idle: bool, busy: bool) -> Step {
         if !matches!(self.state, State::Arming) {
             return Step::Over;
         }
@@ -330,9 +303,8 @@ impl Arming {
         if self.retry_at.is_some_and(|at| now < at) {
             return Step::Waiting;
         }
-        // A lane serving requests gives arming half its time at most.
-        let serving = self.serving(now);
-        if serving && self.owed_until.is_some_and(|at| now < at) {
+        // A busy lane gives arming half its time at most.
+        if busy && self.owed_until.is_some_and(|at| now < at) {
             return Step::Waiting;
         }
         let Some(lent) = self.lender.lend(self.engine_idx, self.room, idle) else {
@@ -354,8 +326,7 @@ impl Arming {
         drop(lent);
         let after = crate::rt::Instant::now();
         let took = after.saturating_duration_since(now);
-        self.stepped_since += took;
-        self.owed_until = serving.then(|| after + took);
+        self.owed_until = busy.then(|| after + took);
         match armed {
             Ok(Ok(true)) => Step::Stepped,
             Ok(Ok(false)) => {

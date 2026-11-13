@@ -130,6 +130,9 @@ struct Seen {
     bad_leases: AtomicUsize,
     /// Free slots seen during a step, its lease out.
     free_in_step: Mutex<Vec<(usize, usize)>>,
+    /// Fires submitted since the last step, and at each step that count.
+    fires_since: AtomicUsize,
+    fires_between: Mutex<Vec<usize>>,
 }
 
 /// Arms `RUNGS` past the first, `COMPOSITIONS` steps a rung.
@@ -185,6 +188,8 @@ impl ::engine::Engine for Arms {
             return Err(::engine::Error::Load("capture refused".into()));
         }
         self.seen.steps.fetch_add(1, Ordering::SeqCst);
+        let since = self.seen.fires_since.swap(0, Ordering::SeqCst);
+        self.seen.fires_between.lock().unwrap().push(since);
         std::thread::sleep(self.step_sleep);
         {
             let held = self.held.lock().unwrap();
@@ -234,6 +239,7 @@ impl ::engine::Engine for Arms {
                 self.seen.unarmed_fires.fetch_add(1, Ordering::SeqCst);
             }
         }
+        self.seen.fires_since.fetch_add(1, Ordering::SeqCst);
         if !self.fire_sleep.is_zero() {
             std::thread::sleep(self.fire_sleep);
         }
@@ -527,6 +533,17 @@ fn a_raise_whose_steps_outlast_a_gap_fires_at_each_rung_as_it_arms() {
     assert!(
         widths.contains(&512) && widths.contains(&1024),
         "the pass fires at each rung as it arms: {widths:?}"
+    );
+    // Arming takes half the busy lane at most: between two steps of 25 ms
+    // the lane serves fires for as long, a few ms each.
+    // (A synchronous engine's lane looks idle whenever its queue runs dry,
+    // so a step may come early there; most wait out what the last took.)
+    let between = seen.fires_between.lock().unwrap().clone();
+    let mut sorted = between.clone();
+    sorted.sort_unstable();
+    assert!(
+        sorted[sorted.len() / 2] >= 3,
+        "fires between steps: {between:?}"
     );
     assert!(
         widths.windows(2).all(|w| w[0] <= w[1]),
