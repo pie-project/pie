@@ -1449,3 +1449,7 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   crates/engine-gpu/suite/ (thin per-backend main.rs); identical KernelProfile / program decode / tuning defaults
   into engine-gpu; alias modules removed (public: open, chip, tune, api, device, encode, guest, program, serve,
   FUSIONS); kernel-lint paths fixed. engine_vulkan 65/0/1, engine_wgpu 65/0/1; seats dumps byte-identical.
+- XLA readout (e220e18d4, TPU): when a fire's host readers fit in 8 rows of a deeper readout plane, a small separately
+  compiled gather program (prewarmed per traced shape) copies only those rows; host copies reuse a recycled f32
+  buffer. Fire programs byte-identical (logits untouched). vs main: MoE d256 +68%, 0.6b d64 / d256 +19%, d0.8b d64
+  +7.3% (was -2.6%), d256 +11.3%. Gates bitwise.
