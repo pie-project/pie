@@ -475,6 +475,37 @@ impl Shell {
         self.synthetic_lanes_with(lanes, &[])
     }
 
+    /// The records, kv pages and windowed pages the lattice's synthetic
+    /// fires name ([`Pools::synthetic_room`]): the widest fire's.
+    fn synthetic_room(&self) -> (u32, u64, u64) {
+        let page_size = u64::from(self.pools.paging().page_size).max(1);
+        let lanes_most = self.fire_lanes().max(1);
+        self.pools.synthetic_room(
+            (self.held.len().max(1) as u32).min(lanes_most),
+            u64::from(self.budget.max_tokens).div_ceil(page_size) + u64::from(lanes_most),
+        )
+    }
+
+    /// What the runtime reads of this shell while it serves.
+    #[must_use]
+    pub fn live(&self) -> engine::live::Live {
+        self.live.clone()
+    }
+
+    /// The slots a step of the lattice left arming writes
+    /// ([`Shell::arm_step`]); none where nothing is left.
+    #[must_use]
+    pub fn arming_room(&self) -> engine::live::ArmingRoom {
+        if self.stepping.is_none() {
+            return engine::live::ArmingRoom::default();
+        }
+        let (records, pages, _) = self.synthetic_room();
+        engine::live::ArmingRoom {
+            pages: u32::try_from(pages).unwrap_or(u32::MAX),
+            records: if self.pools.has_state() { records } else { 0 },
+        }
+    }
+
     fn synthetic_lanes_with(&self, lanes: &[LaneRows], media: &[LaneMedia]) -> Vec<Synthetic> {
         let page_size = u64::from(self.pools.paging().page_size).max(1);
         // What the lanes name, inside the chunks the fit left the pool: a
@@ -483,11 +514,25 @@ impl Shell {
         // read back, so its lanes share them there. The pool seats what a
         // fire names for good, so every fire of the lattice folds into one
         // room: the widest fire's.
-        let lanes_most = self.fire_lanes().max(1);
-        let (slots, room, windowed) = self.pools.synthetic_room(
-            (self.held.len().max(1) as u32).min(lanes_most),
-            u64::from(self.budget.max_tokens).div_ceil(page_size) + u64::from(lanes_most),
-        );
+        let (slots, room, windowed) = self.synthetic_room();
+        // A step arming while the shell serves names the slots it was lent,
+        // by ref.
+        let lent = self.lent.as_ref();
+        let slot_of = |at: u32| match lent {
+            Some(lent) => lent.records.get(at as usize).copied().unwrap_or(0),
+            None => at,
+        };
+        let page_of = |at: u64| match lent {
+            Some(lent) => lent.pages.get(at as usize).copied().unwrap_or(u32::MAX),
+            None => u32::try_from(at).unwrap_or(u32::MAX),
+        };
+        let (slots, room) = match lent {
+            Some(lent) => (
+                (lent.records.len() as u32).clamp(1, slots.max(1)),
+                (lent.pages.len() as u64).clamp(1, room.max(1)),
+            ),
+            None => (slots, room),
+        };
         let mut next_page = 0u64;
         let row_bytes = self.patch_seat.map_or(0, |seat| seat.row_bytes) as usize;
         let fold = (self.patch_fold as usize).max(1);
@@ -504,12 +549,12 @@ impl Shell {
                         .has_custom_mask()
                         .then(|| Masking::Extent(Mask::new(vec![0, rows], u64::from(rows)))),
                     adapter: request.has_adapter().then_some(0),
-                    slot: (at as u32) % slots,
+                    slot: slot_of((at as u32) % slots),
                     window: Vec::new(),
                     pages: {
                         let pages = u64::from(rows).div_ceil(page_size).max(1);
                         let table: Vec<u32> = (next_page..next_page + pages)
-                            .map(|page| u32::try_from(page % room).unwrap_or(u32::MAX))
+                            .map(|page| page_of(page % room))
                             .collect();
                         next_page += pages;
                         table
@@ -1392,13 +1437,15 @@ impl Shell {
     /// Arms one more composition of a lattice left arming at load, and says
     /// whether more are left. A rung is stated armed ([`engine::live`]) once
     /// its last composition is.
-    pub fn arm_step(&mut self) -> Result<bool> {
+    pub fn arm_step(&mut self, lent: &engine::live::ArmingLease) -> Result<bool> {
         let Some(mut st) = self.stepping.take() else {
             return Ok(false);
         };
+        self.lent = Some(lent.clone());
         let rung = st.targets.front().map_or(st.rung, |(bucket, _, _)| self.rung_of(*bucket));
         let stepped = self.arm_next(&mut st);
         self.device.synchronize()?;
+        self.lent = None;
         self.pools.forget_weight_uses(self.device.stream())?;
         stepped?;
         match st.targets.front().map(|(bucket, _, _)| self.rung_of(*bucket)) {
@@ -1950,7 +1997,7 @@ impl core::fmt::Display for Armed {
             .join(", ");
         write!(
             f,
-            "bodies armed {} of {} compositions at load ({columns}; {} segmented; {} MiB of {} \
+            "bodies armed {} of {} compositions ({columns}; {} segmented; {} MiB of {} \
              MiB, {} of {} seats)",
             self.armed,
             self.wanted,

@@ -600,6 +600,9 @@ pub struct Pools {
     budget: Option<u64>,
     /// The chunks the fit left the cache rows, of the range's.
     fitted: u32,
+    /// A graph body names addresses in the range: it is never reserved
+    /// anew ([`Pools::pin`]).
+    pinned: bool,
     /// The range is reserved anew to the fit even where it maps on demand:
     /// the pool's planes then span about what the fit holds, not the asked
     /// count (reserved for the asked count, Qwen3.5-0.8B's c64 ran ~1%
@@ -994,6 +997,7 @@ impl Pools {
             ceiling: paging.pages(),
             budget,
             fitted: total,
+            pinned: false,
             whole_fit: false,
             airborne: None,
             host: None,
@@ -1097,6 +1101,12 @@ impl Pools {
         Ok(live
             .saturating_sub(self.segment_reserve())
             .max(live.min(room)))
+    }
+
+    /// The range stays where it lies from here on: a body captured over it
+    /// names its addresses.
+    pub(crate) fn pin(&mut self) {
+        self.pinned = true;
     }
 
     /// What a load's synthetic fires may name, inside the chunks the fit
@@ -1232,7 +1242,7 @@ impl Pools {
         // Before arming a fresh range may be reserved anew up to the asked
         // count. Once armed it never moves, fresh or not: the bodies name
         // addresses in it.
-        let most = if !settled && self.chunks.fresh() {
+        let most = if !settled && !self.pinned && self.chunks.fresh() {
             self.asked_chunks.max(self.chunks.total())
         } else {
             self.chunks.total()

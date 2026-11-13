@@ -149,6 +149,8 @@ pub struct Shell {
     /// ([`Shell::arm_step`]), and the lattice left arming.
     arm_stepped: bool,
     stepping: Option<arming::Arming>,
+    /// The slots the step in hand was lent: what its synthetic lanes name.
+    lent: Option<engine::live::ArmingLease>,
     /// What the runtime reads of this shell while it serves: the rungs
     /// armed.
     live: engine::live::Live,

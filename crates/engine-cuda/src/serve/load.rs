@@ -1286,8 +1286,9 @@ impl Shell {
             arm_cold: false,
             arm_rs: crate::record::RsBody::Folds,
             arm_deferred: false,
-            arm_stepped: false,
+            arm_stepped: boot.knobs.arm_stepped,
             stepping: None,
+            lent: None,
             live: engine::live::Live::armed(),
             segments: std::collections::HashMap::new(),
             windows_memo: Vec::new(),
@@ -1611,15 +1612,32 @@ impl Staged {
                  weight residency, over the slots the cache holds then"
             );
         } else {
+            // The rungs past the smallest arm in the lane time the caller
+            // gives, over slots it lends: of the kv list and the records,
+            // so not where a fire also names windowed pages.
+            shell.arm_stepped = shell.arm_stepped
+                && shell.ep.is_none()
+                && !shell.pools.has_windowed();
             shell.arm_bodies()?;
         }
+        let stepping = shell.stepping.is_some();
         let resident = footprint(&shell, device_total, free_before);
         // Arming fired every composition, so the activation is at its high
         // water; a load that records no bodies, or arms at its starting
         // weight residency, has fired none yet, and keeps the bodies'
         // allowance out of the cache rows till it arms.
-        let settled = shell.records_bodies() && !deferred;
-        let bodies = if deferred { shell.bodies_mem as u64 } else { 0 };
+        // One whose rungs past the smallest arm later keeps what is left of
+        // the allowance out likewise, and its range where the bodies armed
+        // name it.
+        let settled = shell.records_bodies() && !deferred && !stepping;
+        let bodies = if deferred {
+            shell.bodies_mem as u64
+        } else if stepping {
+            shell.pools.pin();
+            (shell.bodies_mem as u64).saturating_sub(shell.cache.body_stats().census.bytes as u64)
+        } else {
+            0
+        };
         let fitted = shell
             .pools
             .fit_the_card(bodies, held_for_fires, settled, false, &resident)?;
