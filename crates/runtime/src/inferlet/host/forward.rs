@@ -1317,6 +1317,7 @@ impl ProcessCtx {
                     extern_name: extern_binding
                         .map(|(name, _)| name.as_bytes().to_vec())
                         .unwrap_or_default(),
+                    slots: Vec::new(),
                 });
             }
             let channel_ids: Vec<::engine::ChannelId> =

@@ -7,7 +7,10 @@ use crate::chunk::{Evacuation, SlotCopy, WeightResidency, WeightUses};
 use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
-use crate::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
+use crate::program::{
+    BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, ProgramRegistration,
+    RingFacts,
+};
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -73,6 +76,36 @@ pub trait Engine: Send {
         crate::live::Live::armed()
     }
 
+    /// The pool slots one [`Engine::arm_step`] writes, stated once at load
+    /// ([`crate::live::ArmingRoom`]). The default writes none.
+    fn arming_room(&self) -> crate::live::ArmingRoom {
+        crate::live::ArmingRoom::default()
+    }
+
+    /// Captures the graph bodies of at most one composition of the next
+    /// rung not armed (REDESIGN 2.5), on the lane's own thread, and says
+    /// whether any remain. Bounded: the runtime calls it while its lane is
+    /// idle, and between fires while a raise waits on a rung not armed, so
+    /// one call holds the lane for one composition's capture at most. When
+    /// a rung's last composition is captured the engine states it
+    /// ([`crate::live::Live::arm`], `u32::MAX` after the last rung).
+    ///
+    /// `lent` holds [`Engine::arming_room`]'s slots, free slots no sequence
+    /// holds, lent for this call only: the step's synthetic fires may write
+    /// them, and they are free again when it returns. The runtime calls
+    /// only when it can lend the whole room.
+    ///
+    /// Once it answers `false` the runtime never calls it again for the
+    /// life of the load. An error is a load fault: the runtime fails every
+    /// fire after it, as it fails a fire's own error. A call may fall
+    /// between an [`Engine::expect_fire`] and the fire it announced. The
+    /// default arms nothing: every rung is armed at load, or by the engine
+    /// on its own.
+    fn arm_step(&mut self, lent: &crate::live::ArmingLease) -> Result<bool> {
+        let _ = lent;
+        Ok(false)
+    }
+
     fn bind_thread(&mut self) -> Result<()> {
         Ok(())
     }
@@ -82,6 +115,23 @@ pub trait Engine: Send {
     fn register_program(&mut self, registration: &ProgramRegistration) -> Result<ProgramId> {
         let _ = registration;
         Err(self.unsupported("register_program"))
+    }
+
+    /// What an instance of a registered program holds in the pool's
+    /// `Instance` and `Channel` slots, asked before the runtime takes them
+    /// and binds. The default states none: the engine keeps its tables and
+    /// rings itself.
+    fn program_facts(&self, program: ProgramId) -> Result<ProgramFacts> {
+        let _ = program;
+        Ok(ProgramFacts::default())
+    }
+
+    /// The `Channel` slots a registered channel's ring takes, asked before
+    /// [`Engine::register_channel`]. `None`: the engine keeps the ring
+    /// itself.
+    fn ring_facts(&self, registration: &ChannelRegistration) -> Result<Option<RingFacts>> {
+        let _ = registration;
+        Ok(None)
     }
 
     fn register_channel(

@@ -29,6 +29,11 @@ pub struct ChannelRegistration {
     pub extern_dir: Option<ExternDir>,
     pub capacity: u32,
     pub extern_name: Vec<u8>,
+    /// The `Channel` slots the runtime took for this channel's ring, as many
+    /// as [`crate::Engine::ring_facts`] states. Empty where it states none:
+    /// the engine then places the ring itself.
+    #[serde(default)]
+    pub slots: Vec<u32>,
 }
 
 impl Default for ChannelRegistration {
@@ -42,6 +47,7 @@ impl Default for ChannelRegistration {
             extern_dir: None,
             capacity: 0,
             extern_name: Vec::new(),
+            slots: Vec::new(),
         }
     }
 }

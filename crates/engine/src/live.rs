@@ -3,7 +3,8 @@
 //! device bytes the driver holds beside the engine's own (`outside`, 2.2).
 //!
 //! The engine keeps a [`Live`] and advances it from wherever it learns the
-//! facts (a background arming thread, the first body instantiated); the
+//! facts (a rung armed in [`crate::Engine::arm_step`], the lane time the
+//! runtime gives it; the first body instantiated); the
 //! runtime holds a clone from load on ([`crate::Engine::live`]) and reads
 //! it without asking the engine's lane.
 //!
@@ -79,6 +80,27 @@ impl Default for Live {
     fn default() -> Self {
         Live::armed()
     }
+}
+
+/// The pool slots one [`crate::Engine::arm_step`] writes while it captures:
+/// its synthetic fires' kv pages (slots of the kv list shape) and record
+/// slots (the record shape). Stated once at load; zero for an engine whose
+/// arming writes no pool slot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArmingRoom {
+    pub pages: u32,
+    pub records: u32,
+}
+
+/// The slots the runtime lends one [`crate::Engine::arm_step`], as slot
+/// refs: [`ArmingRoom::pages`] of the kv list shape and
+/// [`ArmingRoom::records`] of the record shape. Free slots no sequence
+/// holds; the engine may write them, and what it leaves in them is garbage
+/// the runtime never reads. They go back to free when the call returns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArmingLease {
+    pub pages: Vec<u32>,
+    pub records: Vec<u32>,
 }
 
 #[cfg(test)]
