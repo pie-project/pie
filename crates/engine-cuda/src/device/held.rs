@@ -502,7 +502,33 @@ pub fn heap_bytes() -> usize {
 /// before it ([`heap_bytes_since`]).
 pub fn heap_mark() {
     HEAP_MARK.store(heap_bytes(), std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "rocm")]
+    MALLOC_MARK.store(
+        kernels_cuda::hip::rt::malloced_bytes(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
+
+/// The device bytes this process took from the allocator itself since the
+/// last load began, where it can tell (`None` where it cannot): what the
+/// device holds past them and what it held before is the driver's.
+#[must_use]
+pub fn malloced_since() -> Option<u64> {
+    #[cfg(feature = "rocm")]
+    {
+        Some(
+            kernels_cuda::hip::rt::malloced_bytes()
+                .saturating_sub(MALLOC_MARK.load(std::sync::atomic::Ordering::Relaxed)),
+        )
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        None
+    }
+}
+
+#[cfg(feature = "rocm")]
+static MALLOC_MARK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The device bytes of the heaps' chunks made since the last load began.
 #[must_use]

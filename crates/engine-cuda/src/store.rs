@@ -1470,6 +1470,18 @@ impl Pools {
         self.chunks.committed_bytes()
     }
 
+    /// Every byte the range has backed: on a flat range, all of it.
+    #[must_use]
+    pub fn backed_bytes(&self) -> u64 {
+        self.chunks.backed_bytes()
+    }
+
+    /// The bytes of the activation's span, under the range's end.
+    #[must_use]
+    pub fn activation_span_bytes(&self) -> u64 {
+        u64::from(self.chunks.act_chunks()) * self.chunks.layout().chunk_bytes
+    }
+
     #[must_use]
     pub fn high_water_bytes(&self) -> u64 {
         self.chunks.high_water_bytes()

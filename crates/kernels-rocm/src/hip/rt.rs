@@ -191,16 +191,59 @@ pub unsafe fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> HipError {
 
 pub unsafe fn hipMalloc(ptr: *mut *mut c_void, bytes: usize) -> HipError {
     match sys::api() {
-        // SAFETY: forwarded unchanged; the caller holds HIP's contract.
-        Ok(api) => unsafe { (api.hip.hipMalloc)(ptr, bytes) },
+        Ok(api) => {
+            // SAFETY: forwarded unchanged; the caller holds HIP's contract.
+            let code = unsafe { (api.hip.hipMalloc)(ptr, bytes) };
+            if code == hipSuccess {
+                // SAFETY: the call succeeded, so it wrote the allocation to `ptr`.
+                malloced(unsafe { *ptr }, bytes);
+            }
+            code
+        }
         Err(_) => hipErrorNotInitialized,
     }
+}
+
+/// The device bytes this process holds from `hipMalloc`, by address: what
+/// the engine's ledger owners account for. What the device has in use past
+/// these is the driver's and its libraries' (streams' queues, code
+/// objects, graph bodies), measured as that difference.
+static MALLOCED: std::sync::Mutex<std::collections::BTreeMap<usize, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// `bytes` from `hipMalloc` at `ptr`, held till [`freed`].
+pub fn malloced(ptr: *mut c_void, bytes: usize) {
+    if let Ok(mut held) = MALLOCED.lock() {
+        held.insert(ptr as usize, bytes);
+    }
+}
+
+/// `ptr`, from `hipMalloc`, given back.
+pub fn freed(ptr: *mut c_void) {
+    if let Ok(mut held) = MALLOCED.lock() {
+        held.remove(&(ptr as usize));
+    }
+}
+
+/// Every device byte this process holds from `hipMalloc` now.
+#[must_use]
+pub fn malloced_bytes() -> u64 {
+    MALLOCED
+        .lock()
+        .map_or(0, |held| held.values().map(|bytes| *bytes as u64).sum())
 }
 
 pub unsafe fn hipFree(ptr: *mut c_void) -> HipError {
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
-        Ok(api) => unsafe { (api.hip.hipFree)(ptr) },
+        Ok(api) => {
+            // SAFETY: forwarded unchanged; the caller holds HIP's contract.
+            let code = unsafe { (api.hip.hipFree)(ptr) };
+            if code == hipSuccess {
+                freed(ptr);
+            }
+            code
+        }
         Err(_) => hipErrorNotInitialized,
     }
 }
