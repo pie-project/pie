@@ -1428,7 +1428,7 @@ impl SharedPool {
             .take_while(|&s| segments.state(s) != SegmentState::Uncommitted)
             .count() as u32;
         let mapped = self.mapped_segments();
-        if mapped < target && prefix < top {
+        if mapped < target && prefix < top && self.pool.backs(prefix) {
             return Some(SegmentMove::Commit { prefix: prefix + 1 });
         }
         if mapped <= target || prefix == 0 {

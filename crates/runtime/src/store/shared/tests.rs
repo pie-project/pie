@@ -92,7 +92,7 @@ fn facts() -> ChunkFacts {
     facts
 }
 
-fn pool() -> SharedPool {
+pub(super) fn pool() -> SharedPool {
     SharedPool::new(&facts(), 256).unwrap()
 }
 
@@ -1040,4 +1040,43 @@ fn no_commit_reaches_into_what_the_engine_holds_back() {
         "nothing ahead past the ceiling"
     );
     assert!(pool.mapped_segments() <= 2 + (8 - pool.pool().top_segment()));
+}
+
+/// A segment that straddles the ceiling is not committed while the engine
+/// holds anything back, by the weights' commit, the walker's ahead or its
+/// grow: what is mapped never passes the range less what is held, not for
+/// a moment.
+#[test]
+fn a_segment_straddling_the_ceiling_is_never_mapped() {
+    let mut pool = pool();
+    let top = pool.pool().top_segment() * SEGMENT;
+    // Held back: 20 chunks under the activation, so the ceiling (at 28)
+    // falls inside segment 3.
+    let held = 20;
+    assert!(!pool.hold_back(u64::from(held) * CHUNK));
+    let ceiling = pool.pool().ceiling();
+    assert_eq!(ceiling, top - held);
+    assert_ne!(ceiling % SEGMENT, 0, "the ceiling straddles a segment");
+    let list = pool.list().expect("a kv list").pool;
+    let committed = pool.pool_mut().commit_for(&[(list, u64::MAX / 2)], 0);
+    assert!(
+        committed
+            .iter()
+            .all(|&segment| (segment + 1) * SEGMENT <= ceiling),
+        "committed {committed:?} past the ceiling at chunk {ceiling}"
+    );
+    assert!(pool.pool().commit_ahead(u64::MAX / 2).is_empty());
+    let mut grows = 0;
+    while let Some(SegmentMove::Commit { prefix }) = pool.next_move(u32::MAX, 0) {
+        pool.pool_mut().commit_segment(prefix - 1).unwrap();
+        grows += 1;
+        assert!(grows < 16, "the walk keeps committing");
+    }
+    let range = u64::from(TOTAL) * CHUNK;
+    assert!(
+        pool.held() <= range - u64::from(held) * CHUNK,
+        "mapped {} past the range less what is held {}",
+        pool.held(),
+        range - u64::from(held) * CHUNK
+    );
 }

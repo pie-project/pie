@@ -4,13 +4,13 @@
 //! commit, evacuation and release is ordered with the fires around it.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Notify;
 
 use super::{RungStep, RungWalk, SegmentMove, Shared, SharedPool};
-use crate::governor::{Demand, Growth, PoolTarget, Retarget};
+use crate::governor::{Demand, Growth, PATIENCE, PoolTarget, Retarget};
 use crate::scheduler::worker::PoolOp;
 use crate::store::registry;
 
@@ -33,6 +33,11 @@ pub struct SharedGrow {
     /// ask of a fire (SPEC decision 6, by demand): the smallest rung while
     /// none asks past it.
     rung_walk: Arc<std::sync::Mutex<RungWalk>>,
+    /// The governor's ticks, counted ([`PoolTarget::ticked`]).
+    ticks: Arc<AtomicU64>,
+    /// The tick since which the rung has stood past what is asked: a cap
+    /// down or a lower waits the governor's patience from it.
+    idle_since: Arc<std::sync::Mutex<Option<u64>>>,
 }
 
 impl SharedGrow {
@@ -49,6 +54,8 @@ impl SharedGrow {
             refused: Arc::new(AtomicBool::new(false)),
             no_room: Arc::new(AtomicBool::new(false)),
             rung_walk: Arc::new(std::sync::Mutex::new(RungWalk::default())),
+            ticks: Arc::new(AtomicU64::new(0)),
+            idle_since: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -83,6 +90,22 @@ impl SharedGrow {
                     return;
                 }
                 let goal = super::rung_goal(&pool, self.engine, self.walk_rows());
+                // The pool stands past what is asked: it comes down only
+                // once it has for the governor's patience, so a pause
+                // between batches moves no rung.
+                let past = pool.pool().act_chunks(goal) < pool.pool().act_chunks(pool.rung());
+                let tick = self.ticks.load(Ordering::Acquire);
+                let waited = {
+                    let mut since = self.idle_since.lock().unwrap();
+                    if past {
+                        tick >= since
+                            .get_or_insert(tick)
+                            .saturating_add(u64::from(PATIENCE))
+                    } else {
+                        *since = None;
+                        true
+                    }
+                };
                 let step = self.rung_walk.lock().unwrap().step(
                     &pool,
                     goal,
@@ -97,6 +120,13 @@ impl SharedGrow {
                     Ok(RungStep::Raise { rung, evacuation }) => pool
                         .raise_applied(&evacuation)
                         .map(|()| RungStep::Raise { rung, evacuation }),
+                    // A cap down or a lower before the patience is out.
+                    Ok(RungStep::Lower(_)) if !waited => Ok(RungStep::Wait),
+                    Ok(RungStep::Cap(tokens))
+                        if !waited && tokens < super::fire_cap(self.engine) =>
+                    {
+                        Ok(RungStep::Wait)
+                    }
                     step => step,
                 };
                 (step, goal)
@@ -387,5 +417,47 @@ impl PoolTarget for SharedGrow {
 
     fn take_refused(&mut self) -> bool {
         self.refused.swap(false, Ordering::AcqRel)
+    }
+
+    /// A governor tick: counted for the rung's patience, and the walk looks
+    /// again.
+    fn ticked(&mut self) {
+        self.ticks.fetch_add(1, Ordering::AcqRel);
+        self.wake.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pool that stands past what is asked comes down only once it has
+    /// for the governor's patience: a pause shorter than that moves no rung.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_rung_comes_down_only_after_the_governor_s_patience() {
+        const ENGINE: usize = 59;
+        let pool = super::super::tests::pool();
+        assert_eq!(pool.rung(), 2048);
+        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+        let mut grow = SharedGrow::new(0, ENGINE, shared);
+        super::super::set_fire_cap_for_test(ENGINE, u32::MAX);
+        // Nothing asked: the walk would cap fires to the smallest rung.
+        grow.walk_rung().await;
+        assert_eq!(
+            super::super::fire_cap(ENGINE),
+            u32::MAX,
+            "not before a tick"
+        );
+        for tick in 1..PATIENCE {
+            grow.ticked();
+            grow.walk_rung().await;
+            assert_eq!(super::super::fire_cap(ENGINE), u32::MAX, "tick {tick}");
+        }
+        grow.ticked();
+        grow.walk_rung().await;
+        assert!(
+            super::super::fire_cap(ENGINE) < u32::MAX,
+            "past the patience: fires are cut toward the rung asked"
+        );
     }
 }

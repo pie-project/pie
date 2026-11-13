@@ -526,6 +526,13 @@ impl SlotPool {
         self.ceiling
     }
 
+    /// Whether `segment` may be committed: it lies wholly under the
+    /// ceiling (all of it, with no ceiling). One that straddles it would map
+    /// chunks the engine holds back, past the pool's hard limit.
+    pub fn backs(&self, segment: u32) -> bool {
+        self.ceiling >= self.total || self.segments.range(segment).end <= self.ceiling
+    }
+
     /// Brings `chunk`'s place in [`Self::open`] up to date.
     fn reopen(&mut self, chunk: u32) {
         if self.openable(chunk) {
@@ -936,9 +943,11 @@ impl SlotPool {
             // Never into what the engine holds back (the ceiling): a
             // segment there is no room the engine binds, and backing it
             // takes the memory the engine keeps for its bodies.
-            let Some(segment) = self.segments.uncommitted().find(|&segment| {
-                segment < self.top_segment && self.segments.range(segment).start < self.ceiling
-            }) else {
+            let Some(segment) = self
+                .segments
+                .uncommitted()
+                .find(|&segment| segment < self.top_segment && self.backs(segment))
+            else {
                 return committed;
             };
             self.commit_segment(segment)
@@ -1547,7 +1556,7 @@ impl SlotPool {
         for segment in self
             .segments
             .uncommitted()
-            .filter(|&segment| self.segments.range(segment).start < self.ceiling)
+            .filter(|&segment| self.backs(segment))
         {
             if room >= want {
                 break;
