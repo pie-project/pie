@@ -489,6 +489,13 @@ impl Elastic {
         self.committed
     }
 
+    /// The bytes of the placement heaps this buffer holds: what its mapped
+    /// tiles cost the device, a whole [`CHUNK`] at a time.
+    #[must_use]
+    pub fn held(&self) -> u64 {
+        self.chunks.iter().map(|chunk| chunk.bytes).sum()
+    }
+
     /// A binding view over the sparse buffer, for encoders and blits.
     #[must_use]
     pub fn view(&self) -> super::Buffer {

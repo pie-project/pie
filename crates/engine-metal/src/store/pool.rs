@@ -182,6 +182,17 @@ impl Pool {
         }
     }
 
+    /// The device bytes behind the pool now: the placement heaps its
+    /// committed segments hold, or the whole buffer where it is flat.
+    #[must_use]
+    pub fn held_bytes(&self) -> u64 {
+        match &self.backing {
+            Backing::Flat(buffer) => buffer.bytes(),
+            #[cfg(target_vendor = "apple")]
+            Backing::Sparse { store, .. } => store.held(),
+        }
+    }
+
     /// The most that has had memory behind it at once.
     #[must_use]
     pub fn high_water_bytes(&self) -> u64 {

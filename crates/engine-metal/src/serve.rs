@@ -1563,7 +1563,7 @@ impl Shell {
             (Model, "weight cache tables", self.pools.table_bytes()),
             (Model, "ngram constants", self.scratch.constant_bytes()),
             (Model, "ane surfaces", ane_model),
-            (State, "pool", self.pools.committed_bytes()),
+            (State, "pool", self.pools.held_bytes()),
             (State, "guest instances", guest_state),
             (Fire, "arena", self.arena.mapped()),
             (

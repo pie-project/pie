@@ -66,13 +66,14 @@ impl Arena {
         Ok(())
     }
 
-    /// The bytes behind the store now: the widest carve a fire has mapped,
-    /// or the whole store where it is not sparse.
+    /// The device bytes behind the store now: the placement heaps the widest
+    /// carve a fire has mapped holds, or the whole store where it is not
+    /// sparse.
     #[must_use]
     pub fn mapped(&self) -> u64 {
         #[cfg(target_vendor = "apple")]
         if let Some((store, _)) = self.sparse.as_ref() {
-            return store.committed();
+            return store.held();
         }
         self.store.bytes()
     }
