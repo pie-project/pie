@@ -9,7 +9,8 @@ use eta_exec::StepOutcome;
 use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, Value};
 use eta_ir::registry::{GeometryClass, Port, Stage};
 
-pub use engine_gpu::program::Refusal;
+use engine_gpu::program::Refusal;
+use engine_gpu::program::{decode, numel_of};
 
 struct Instance {
     #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
@@ -28,13 +29,13 @@ struct Instance {
     faulted: Arc<AtomicBool>,
 }
 
-pub use crate::serve::InputCell;
+use engine_gpu::serve::InputCell;
 
 #[derive(Default)]
 pub struct Plane {
     programs: BTreeMap<ProgramId, Arc<ExecPlan>>,
 
-    forms: crate::guest::Forms,
+    forms: engine_gpu::guest::Forms<crate::device::Api>,
 
     channels: BTreeMap<ChannelId, Arc<ChannelState>>,
     instances: BTreeMap<InstanceId, Instance>,
@@ -225,7 +226,11 @@ impl Plane {
             })
     }
 
-    pub fn input_cell(&self, instance: InstanceId, id: ChannelId) -> Result<InputCell, Refusal> {
+    pub fn input_cell(
+        &self,
+        instance: InstanceId,
+        id: ChannelId,
+    ) -> Result<InputCell<crate::device::Api>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
             id: instance.0,
@@ -561,7 +566,7 @@ impl Plane {
         instance: InstanceId,
         device: &crate::device::Context,
         seats: Vec<Vec<crate::guest::run::Readout<'_>>>,
-        done: Option<crate::settle::Done>,
+        done: Option<engine_gpu::settle::Done>,
     ) -> Result<(), Refusal> {
         let Plane {
             instances,
@@ -755,33 +760,6 @@ impl Plane {
     }
 }
 
-fn numel_of(shape: &[u32]) -> usize {
-    shape.iter().map(|&d| d as usize).product::<usize>().max(1)
-}
-
-fn decode(bytes: &[u8], dtype: eta_ir::container::ChanDType, shape: &[u32]) -> Option<Value> {
-    use eta_ir::types::Dtype;
-    let dtype = eta_exec::concrete_dtype(dtype);
-    let numel = numel_of(shape);
-    if bytes.len() != eta_exec::wire_cell_bytes(dtype, numel) {
-        return None;
-    }
-    let words = || {
-        bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| [c[0], c[1], c[2], c[3]])
-    };
-    Some(match dtype {
-        Dtype::Bool => Value::Bool((0..numel).map(|j| (bytes[j / 8] >> (j % 8)) & 1).collect()),
-        Dtype::I32 => Value::I32(words().map(i32::from_le_bytes).collect()),
-        Dtype::U32 => Value::U32(words().map(u32::from_le_bytes).collect()),
-        Dtype::F32 => Value::F32(words().map(f32::from_le_bytes).collect()),
-        _ => return None,
-    })
-}
-
 impl engine_gpu::program::Programs<crate::device::Api> for Plane {
     fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
         Plane::register(self, registration)
@@ -821,7 +799,11 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         Plane::close_instance(self, id)
     }
 
-    fn input_cell(&self, instance: InstanceId, id: ChannelId) -> Result<InputCell, Refusal> {
+    fn input_cell(
+        &self,
+        instance: InstanceId,
+        id: ChannelId,
+    ) -> Result<InputCell<crate::device::Api>, Refusal> {
         Plane::input_cell(self, instance, id)
     }
 

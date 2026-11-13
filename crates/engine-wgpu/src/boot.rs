@@ -1,4 +1,5 @@
-use crate::api::{ContractFor, DeviceBoot, Wgpu};
+use crate::api::{DeviceBoot, Wgpu};
+use engine_gpu::api::ContractFor;
 
 pub const DEFAULT_POWER_PREFERENCE: &str = "high-performance";
 

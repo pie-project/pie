@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::api::DeviceBoot;
 use crate::encode::Mark;
-use crate::error::{Fault, Result};
+use engine_gpu::error::{Fault, Result};
 
 use super::alloc::{Memory, Raw, Slab};
 use super::host::{self, Signal};

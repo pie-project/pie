@@ -201,15 +201,40 @@ pub trait Tactics: std::fmt::Debug {
     /// The recurrences' fold and register-state threshold.
     fn recurrent(&self) -> kernels_slang::ssm::gdn_recurrent::Tactic;
 
-    fn moe_tile_rows(&self, pairs: u32, experts: u32) -> u32;
+    fn moe_tile_rows(&self, pairs: u32, experts: u32) -> u32 {
+        if experts == 0 {
+            return 1;
+        }
+        let at = crate::tuning::MoeTileRowsAt {
+            per_expert: i64::from(pairs / experts),
+        };
+        self.profile().pick::<crate::tuning::MoeTileRows>(&at).0
+    }
 
-    fn moe_sorted_rows(&self, pairs: u32, experts: u32) -> u32;
+    /// The rows a batched route sorts into: every touched expert's run
+    /// padded to whole `kernel.moe.tile_rows` tiles; the pairs themselves
+    /// where the route stays unsorted.
+    fn moe_sorted_rows(&self, pairs: u32, experts: u32) -> u32 {
+        let tile = self.moe_tile_rows(pairs, experts);
+        if tile <= 1 {
+            return pairs;
+        }
+        let touched = pairs.min(experts);
+        let bound = pairs.saturating_add(touched.saturating_mul(tile - 1));
+        bound.div_ceil(tile) * tile
+    }
 
-    fn sdpa_tile_rows_per_request(&self) -> u32;
+    fn sdpa_tile_rows_per_request(&self) -> u32 {
+        self.profile()
+            .get::<crate::tuning::SdpaTileRowsPerRequest>()
+            .0
+    }
 
     fn sdpa_split_groups(&self) -> u32;
 
-    fn sdpa_split_min_keys(&self) -> u32;
+    fn sdpa_split_min_keys(&self) -> u32 {
+        self.profile().get::<crate::tuning::DecodeSplitMinKeys>().0
+    }
 }
 
 /// A submitted frame.

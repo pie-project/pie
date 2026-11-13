@@ -6,7 +6,7 @@ use eta_exec::{Extents, OpParams, ValueDesc, describe, layout};
 use crate::device::Context;
 use crate::device::alloc::{Buffer, Memory};
 use crate::device::ctx::{Core, Frame};
-use crate::error::{Fault, Result};
+use engine_gpu::error::{Fault, Result};
 
 use engine_gpu::guest::session::{
     BINDINGS, CFG_BINDING, Cfg, DESC_WORDS, alias_reshapes, desc_words, groups_for, words_le,
@@ -41,7 +41,7 @@ impl std::fmt::Debug for Code {
 }
 
 impl Code {
-    pub fn new(device: &Context, code: &[crate::guest::Lowered]) -> Result<Code> {
+    pub fn new(device: &Context, code: &[engine_gpu::guest::Lowered<String>]) -> Result<Code> {
         let core = device.core().clone();
         let binds = bind_layout(&core);
         let layout = core
@@ -357,7 +357,7 @@ fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
 fn build_pipelines(
     core: &Arc<Core>,
     pipeline_layout: &wgpu::PipelineLayout,
-    lowered: &crate::guest::Lowered,
+    lowered: &engine_gpu::guest::Lowered<String>,
 ) -> Result<Vec<wgpu::ComputePipeline>> {
     if lowered.entries.is_empty() {
         return Ok(Vec::new());

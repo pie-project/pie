@@ -377,8 +377,9 @@ mod device {
     use profile::{Decision as _, Profile, Source};
 
     use super::{Bank, Grid, Measured, Point, body, candidates, forcing, kernel};
-    use crate::device::{Buffer, Context, Handles, Pipelines};
+    use crate::device::{Api, Buffer, Context, Pipelines};
     use crate::encode::Sink;
+    use engine_gpu::Handles;
 
     /// Remembers the entries it fired: which kernel a forced candidate ran.
     struct Watch<'a> {
@@ -452,7 +453,7 @@ mod device {
 
     fn weights(
         device: &Context,
-        handles: &Handles,
+        handles: &Handles<Api>,
         n: u32,
         k: u32,
         bank: Bank,
@@ -549,7 +550,7 @@ mod device {
         }
         let today = Tuning::new(base.clone(), limits);
 
-        let handles = Handles::new();
+        let handles = Handles::<Api>::new();
         let pipelines = Pipelines::new();
         let widest = *grid.rows.iter().max().expect("rows");
         let cap = widest.div_ceil(64) * 64;
@@ -690,7 +691,7 @@ mod device {
     /// A sample of the last launch's outputs against the f64 reference.
     #[allow(clippy::too_many_arguments)]
     fn wrong(
-        handles: &Handles,
+        handles: &Handles<Api>,
         ho: u32,
         m: u32,
         n: u32,
@@ -731,7 +732,7 @@ mod device {
     fn time(
         device: &Context,
         pipelines: &Pipelines,
-        handles: &Handles,
+        handles: &Handles<Api>,
         live: &[usize],
         launch: impl Fn(&dyn Encode, usize, usize) -> Result<(), Error>,
     ) -> Result<Vec<f64>, String> {

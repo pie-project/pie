@@ -4,7 +4,7 @@
 use engine_gpu::backend::OnDone;
 
 use super::{Api, Buffer, Context, Frame, Pending};
-use crate::error::{Fault, Result};
+use engine_gpu::error::{Fault, Result};
 
 impl engine_gpu::Backend for Api {
     const NAME: &'static str = "Vulkan";

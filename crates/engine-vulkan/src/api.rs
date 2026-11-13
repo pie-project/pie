@@ -15,13 +15,13 @@ use eta_ir::registry::{PortMask, Stage};
 use engine_gpu::api::{Envelope, Host, PendingStep, fault, program_attachments, refusal};
 
 use crate::device::Api;
+use engine_gpu::serve::Landed;
 #[cfg(feature = "vulkan")]
-use crate::serve::Shell;
-use crate::serve::{Landed, Seats};
-#[cfg(feature = "vulkan")]
-use crate::settle::Done;
+use engine_gpu::serve::Shell;
 
-pub use engine_gpu::api::{ContractFor, patch_ladder};
+use crate::serve::Seats;
+#[cfg(feature = "vulkan")]
+use engine_gpu::settle::Done;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DeviceBoot {
@@ -256,7 +256,7 @@ fn defer_attachment(
 /// What step `landed` read out for each lane of `attachment`, its pixels among them.
 #[cfg(feature = "vulkan")]
 fn lane_seats<'a>(
-    shell: &'a Shell,
+    shell: &'a Shell<Api>,
     landed: &Landed,
     attachment: &engine::fire::Attachment,
 ) -> Vec<Vec<crate::guest::run::Readout<'a>>> {

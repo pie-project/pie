@@ -114,6 +114,7 @@ mod tests {
     use profile::Source;
 
     use super::*;
+    use engine_gpu::backend::Tactics as _;
 
     #[test]
     fn the_registry_holds_together() {

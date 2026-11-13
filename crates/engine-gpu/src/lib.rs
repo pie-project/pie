@@ -15,6 +15,7 @@ pub mod experts;
 pub mod guest;
 pub mod handles;
 pub mod inputs;
+pub mod kernel_profile;
 pub mod mask;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod pread;
@@ -26,6 +27,7 @@ pub mod scratch;
 pub mod serve;
 pub mod settle;
 pub mod store;
+pub mod tuning;
 pub mod weight_store;
 pub mod weights;
 pub mod window;

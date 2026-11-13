@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use engine_gpu::pread::pread_jobs;
 
 use crate::encode::Mark;
-use crate::error::{Fault, Result};
+use engine_gpu::error::{Fault, Result};
 
 use super::ctx::{Context, Core, note_reservation};
 use super::host::Signal;

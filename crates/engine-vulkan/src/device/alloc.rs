@@ -5,7 +5,7 @@ use std::sync::Arc;
 use ash::vk;
 use engine_gpu::pread::pread_jobs;
 
-use crate::error::{Fault, Result};
+use engine_gpu::error::{Fault, Result};
 
 use super::ctx::{Context, Core, STAGING_BYTES, note_reservation};
 

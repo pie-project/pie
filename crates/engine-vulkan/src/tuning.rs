@@ -1,6 +1,7 @@
 //! The hardware-dependent decisions engine-vulkan reads when it fires
 //! kernels-slang's entries, and [`Tuning`], the values one load runs under.
 
+use engine_gpu::tuning::{DecodeSplitMinKeys, MoeTileRows, SdpaTileRowsPerRequest};
 use profile::{Decision, Domain, Profile, Registry, Var};
 
 pub const FACTS: &[Var] = &[
@@ -115,23 +116,6 @@ pub enum MoePath {
     Coopmat,
 }
 
-/// The row tile a routed matmul sorts its pairs into, by pairs per expert;
-/// 1 leaves the pairs unsorted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(
-    id = "kernel.moe.tile_rows",
-    shape(per_expert: derived),
-    constant(set(1, 16, 32, 64)),
-    default = r#"[{ when = "per_expert < 2", value = 1 }, { when = "per_expert >= 32", value = 32 }, { value = 16 }]"#,
-    tune = search
-)]
-pub struct MoeTileRows(pub u32);
-
-/// The fewest rows per request that take the tiled attention kernel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.tile_rows_per_request", constant(range(1..=4096)), default = 32, tune = search)]
-pub struct SdpaTileRowsPerRequest(pub u32);
-
 /// How many workgroups a decode row's keys may split across.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(
@@ -152,11 +136,6 @@ pub enum DecodeSplit {
         per: u32,
     },
 }
-
-/// The fewest keys a split slice holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.split_min_keys", constant(range(1..=65_536)), default = 256, tune = search)]
-pub struct DecodeSplitMinKeys(pub u32);
 
 /// Invocations a decode attention workgroup walks a row's keys with: more
 /// walk more keys at once and merge more partial sums. The device's
@@ -267,36 +246,6 @@ impl Tuning {
         *self.profile.get::<MoePath>() == MoePath::Coopmat
     }
 
-    #[must_use]
-    pub fn moe_tile_rows(&self, pairs: u32, experts: u32) -> u32 {
-        if experts == 0 {
-            return 1;
-        }
-        let at = MoeTileRowsAt {
-            per_expert: i64::from(pairs / experts),
-        };
-        self.profile.pick::<MoeTileRows>(&at).0
-    }
-
-    /// The rows a batched route sorts into: every touched expert's run
-    /// padded to whole `kernel.moe.tile_rows` tiles; the pairs themselves
-    /// where the route stays unsorted.
-    #[must_use]
-    pub fn moe_sorted_rows(&self, pairs: u32, experts: u32) -> u32 {
-        let tile = self.moe_tile_rows(pairs, experts);
-        if tile <= 1 {
-            return pairs;
-        }
-        let touched = pairs.min(experts);
-        let bound = pairs.saturating_add(touched.saturating_mul(tile - 1));
-        bound.div_ceil(tile) * tile
-    }
-
-    #[must_use]
-    pub fn sdpa_tile_rows_per_request(&self) -> u32 {
-        self.profile.get::<SdpaTileRowsPerRequest>().0
-    }
-
     /// The profile's, halved until 32 lanes a row fit the invocation limit.
     #[must_use]
     pub fn sdpa_tile_rows(&self) -> u32 {
@@ -327,11 +276,6 @@ impl Tuning {
             DecodeSplit::Fixed { groups } => groups,
             DecodeSplit::PerCore { per } => self.limits.cores.saturating_mul(per).max(1),
         }
-    }
-
-    #[must_use]
-    pub fn sdpa_split_min_keys(&self) -> u32 {
-        self.profile.get::<DecodeSplitMinKeys>().0
     }
 
     #[must_use]
@@ -434,24 +378,8 @@ impl engine_gpu::backend::Tactics for Tuning {
         }
     }
 
-    fn moe_tile_rows(&self, pairs: u32, experts: u32) -> u32 {
-        Tuning::moe_tile_rows(self, pairs, experts)
-    }
-
-    fn moe_sorted_rows(&self, pairs: u32, experts: u32) -> u32 {
-        Tuning::moe_sorted_rows(self, pairs, experts)
-    }
-
-    fn sdpa_tile_rows_per_request(&self) -> u32 {
-        Tuning::sdpa_tile_rows_per_request(self)
-    }
-
     fn sdpa_split_groups(&self) -> u32 {
         Tuning::sdpa_split_groups(self)
-    }
-
-    fn sdpa_split_min_keys(&self) -> u32 {
-        Tuning::sdpa_split_min_keys(self)
     }
 }
 

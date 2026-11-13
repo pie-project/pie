@@ -9,7 +9,7 @@ use crate::device::alloc::{Buffer, Memory};
 use crate::device::ctx::{Core, Frame};
 use engine_gpu::guest::widen::{Cfg, STORAGE_SOURCE, WG, config_bytes};
 
-use crate::error::Result;
+use engine_gpu::error::Result;
 
 /// Config slots, one per widen still on the queue: a frame that runs ahead
 /// keeps its own offsets while the next frame records.
@@ -45,7 +45,7 @@ impl std::fmt::Debug for Widen {
 impl Widen {
     pub fn new(device: &Context) -> Result<Widen> {
         let words = super::lower(usize::MAX, STORAGE_SOURCE, &LAYOUT).map_err(|why| {
-            crate::error::Fault::Program {
+            engine_gpu::error::Fault::Program {
                 at: "guest::widen",
                 why: format!("the readout widen does not lower: {why}"),
             }
@@ -111,7 +111,7 @@ impl Widen {
         lanes: u32,
     ) -> Result<()> {
         if self.armed.get() {
-            return Err(crate::error::Fault::Program {
+            return Err(engine_gpu::error::Fault::Program {
                 at: "guest::widen",
                 why: "a second readout widen was recorded into one frame; there is one config \
                       slot and the first would run with the second's offsets"
@@ -119,7 +119,7 @@ impl Widen {
             });
         }
         if !src_at.is_multiple_of(4) || !dst_at.is_multiple_of(4) {
-            return Err(crate::error::Fault::Program {
+            return Err(engine_gpu::error::Fault::Program {
                 at: "guest::widen",
                 why: format!(
                     "a widen reads and writes whole words, and was offered byte offsets \

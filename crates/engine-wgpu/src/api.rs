@@ -12,8 +12,6 @@ use engine_gpu::api::{Envelope, Host, PendingStep, program_attachments, refusal}
 
 use crate::device::Api;
 
-pub use engine_gpu::api::{ContractFor, patch_ladder};
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceBoot {
     pub adapter_index: u32,
