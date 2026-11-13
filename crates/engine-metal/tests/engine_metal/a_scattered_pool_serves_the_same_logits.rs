@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use checkpoint::contract::ModelContract;
 use engine::chunk::{Evacuation, Growth};
 use engine_metal::serve::Seated;
-use engine_metal::store::layout::{FIXED, LIST};
+use engine_metal::store::layout::{FIXED, LIST, WINDOWS};
 use engine_metal::{Boot, Lane, Shell};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
@@ -326,31 +326,80 @@ enum Placement {
     /// Slot refs the runtime would name: pages strided over chunks
     /// `first .. first + 3` from the top down, the lanes' pages interleaved
     /// in each and scattered over its slots (no two share one), piece `p`
-    /// of lane `l`'s record in chunk `first + 3 + l * pieces + p`.
+    /// of lane `l`'s record in chunk `first + 3 + l * pieces + p`, and the
+    /// window list's pages as the kv pages are, over the three chunks above
+    /// the records.
     Refs {
         first: u32,
-        per_list: u32,
+        /// The kv list's slots a chunk; `None` where the load states no kv
+        /// list (every layer windowed), so no fire reads a page table.
+        per_list: Option<u32>,
         per_fixed: u32,
         pieces: u32,
+        /// The window list's tokens a slot and slots a chunk, where the
+        /// load states one.
+        window: Option<(u32, u32)>,
     },
+}
+
+/// Page `page` of lane `lane` among the three chunks `base .. base + 3` of
+/// `per` slots each: chunks from the top down, the lanes in turn in each,
+/// at an odd stride coprime to `per`.
+fn scatter(base: u32, per: u32, lane: u32, page: u32) -> u32 {
+    let chunk = base + 2 - (page % 3);
+    let nth = (page / 3) * 2 + lane;
+    let stride = (7..)
+        .step_by(2)
+        .find(|&s| gcd(s, per) == 1)
+        .expect("an odd stride coprime to the slots");
+    let index = (stride * nth + 3) % per;
+    chunk * per + index
 }
 
 impl Placement {
     fn page(&self, lane: u32, page: u32) -> u32 {
         match *self {
-            Placement::Seats => unreachable!(),
             Placement::Refs {
-                first, per_list, ..
-            } => {
-                let chunk = first + 2 - (page % 3);
-                let nth = (page / 3) * 2 + lane;
-                let stride = (7..)
-                    .step_by(2)
-                    .find(|&s| gcd(s, per_list) == 1)
-                    .expect("an odd stride coprime to the slots");
-                let index = (stride * nth + 3) % per_list;
-                chunk * per_list + index
-            }
+                first,
+                per_list: Some(per),
+                ..
+            } => scatter(first, per, lane, page),
+            _ => unreachable!("a page table of a placement with a kv list"),
+        }
+    }
+
+    fn window_page(&self, lane: u32, page: u32) -> u32 {
+        match *self {
+            Placement::Refs {
+                first,
+                pieces,
+                window: Some((_, per)),
+                ..
+            } => scatter(first + 3 + 2 * pieces, per, lane, page),
+            _ => unreachable!("a window table of a placement with a window list"),
+        }
+    }
+
+    /// The lane's kv page table and window table over its first `rows`.
+    fn tables(&self, lane: u32, rows: u32, page: u32) -> (Vec<u32>, Vec<Vec<u32>>) {
+        match *self {
+            Placement::Seats => (Vec::new(), Vec::new()),
+            Placement::Refs {
+                per_list, window, ..
+            } => (
+                per_list.map_or_else(Vec::new, |_| {
+                    (0..rows.div_ceil(page))
+                        .map(|p| self.page(lane, p))
+                        .collect()
+                }),
+                window.map_or_else(Vec::new, |(tokens, _)| {
+                    vec![
+                        (0..rows.div_ceil(tokens))
+                            .map(|p| self.window_page(lane, p))
+                            .collect(),
+                    ]
+                }),
+            ),
         }
     }
 
@@ -368,19 +417,26 @@ impl Placement {
         }
     }
 
-    /// Every slot ref of both lanes' `pages` pages is its own.
-    fn distinct(&self, pages: u32) -> bool {
-        let refs: std::collections::BTreeSet<u32> = (0..2)
-            .flat_map(|lane| (0..pages).map(move |p| self.page(lane, p)))
-            .collect();
-        refs.len() == 2 * pages as usize
+    /// Every slot ref of both lanes' tables over `rows` rows is its own, in
+    /// the kv list and in the window list.
+    fn distinct(&self, rows: u32, page: u32) -> bool {
+        let tables = [self.tables(0, rows, page), self.tables(1, rows, page)];
+        let pages: Vec<u32> = tables.iter().flat_map(|t| t.0.clone()).collect();
+        let windows: Vec<u32> = tables.iter().flat_map(|t| t.1.concat()).collect();
+        let unique = |refs: &[u32]| {
+            refs.iter().collect::<std::collections::BTreeSet<_>>().len() == refs.len()
+        };
+        unique(&pages) && unique(&windows)
     }
 
-    /// The chunks this placement holds: three of pages and the records.
+    /// The chunks this placement holds: three of pages, the records, and
+    /// three of window pages where the load states a window list.
     fn held(&self) -> u32 {
         match *self {
             Placement::Seats => 0,
-            Placement::Refs { pieces, .. } => 3 + 2 * pieces,
+            Placement::Refs { pieces, window, .. } => {
+                3 + 2 * pieces + if window.is_some() { 3 } else { 0 }
+            }
         }
     }
 }
@@ -413,27 +469,21 @@ fn serve(
     let mut fed: [Vec<u32>; 2] = prompts();
     let page = shell.paging().page_size;
     assert!(
-        !refs || place.distinct(CONTEXT.div_ceil(page)),
+        !refs || place.distinct(CONTEXT, page),
         "the lanes' pages share no slot"
     );
     let records = [place.record(0), place.record(1)];
     let mut rows = Vec::new();
-    let tables = |held: [u32; 2], rows: [u32; 2]| -> [Vec<u32>; 2] {
-        [0, 1].map(|lane| {
-            if !refs {
-                return Vec::new();
-            }
-            let pages = (held[lane] + rows[lane]).div_ceil(page);
-            (0..pages)
-                .map(|page| place.page(lane as u32, page))
-                .collect()
-        })
+    let tables = |held: [u32; 2], rows: [u32; 2]| -> [(Vec<u32>, Vec<Vec<u32>>); 2] {
+        [0, 1].map(|lane| place.tables(lane as u32, held[lane] + rows[lane], page))
     };
-    let fire = |shell: &mut Shell, lanes: &[(u32, &[u32], u32, &[u32])]| -> Vec<Vec<f32>> {
+    type Fired<'t> = (u32, &'t [u32], u32, &'t (Vec<u32>, Vec<Vec<u32>>));
+    let fire = |shell: &mut Shell, lanes: &[Fired<'_>]| -> Vec<Vec<f32>> {
         let seated: Vec<Seated<'_>> = lanes
             .iter()
-            .map(|&(lane, tokens, have, pages)| Seated {
+            .map(|&(lane, tokens, have, (pages, windows))| Seated {
                 pages,
+                windows,
                 held: Some(have),
                 record: refs.then(|| records[lane as usize].as_slice()),
                 refs,
@@ -549,11 +599,25 @@ fn check_near(model: &str, hybrid: bool, chunk: Option<u64>) -> Vec<Vec<f32>> {
     let segment = facts.segment_chunks;
     let low = 1 + layout.seat_chunks();
     let per = |id| facts.shape(id).map_or(1, |s| s.slots_per_chunk);
+    let per_list = facts.shape(LIST).map(|s| s.slots_per_chunk);
+    // The one window list a windowed model here states: its pages by slot
+    // ref too, so the scattered serve moves every row the fire reads.
+    assert!(
+        facts.shape(WINDOWS[1]).is_none(),
+        "{model}: one window list at most"
+    );
+    let window = facts.shape(WINDOWS[0]).map(|w| {
+        let engine::chunk::SlotKind::List { tokens, .. } = w.kind else {
+            panic!("{model}: the window list is a list: {:?}", w.kind);
+        };
+        (tokens, w.slots_per_chunk)
+    });
     let place = Placement::Refs {
         first: 0,
-        per_list: per(LIST),
+        per_list,
         per_fixed: per(FIXED),
         pieces: layout.pieces,
+        window,
     };
     let held = place.held();
     let kept = (low + held).div_ceil(segment);
@@ -565,9 +629,10 @@ fn check_near(model: &str, hybrid: bool, chunk: Option<u64>) -> Vec<Vec<f32>> {
     );
     let place = Placement::Refs {
         first,
-        per_list: per(LIST),
+        per_list,
         per_fixed: per(FIXED),
         pieces: layout.pieces,
+        window,
     };
     shell.commit_segments(commit).expect("the segments commit");
     let sparse = facts.segments.growth == Growth::Bottom;
@@ -764,8 +829,6 @@ fn trimmed_window(model: &str, layers: Option<u32>, context: u32, prompt: u32) {
 /// runtime trims, each of the load's `lists` window lists by its own window
 /// and `T_w`, its slots in chunks of its own.
 fn trimmed_windows(model: &str, fixture: &Fixture, context: u32, prompt: u32, lists: usize) {
-    use engine_metal::store::layout::WINDOWS;
-
     let prompt: Vec<u32> = (0..prompt).map(|at| (at * 37 + 11) % 256).collect();
     const STEPS: usize = 24;
     let run = |trimmed: bool| -> Vec<Vec<f32>> {
