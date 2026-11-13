@@ -330,100 +330,27 @@ pub(super) fn order_fp8b_planes(
     Ok(())
 }
 
-/// The mxfp4 expert banks that may land in the matrix core's lane order:
-/// `[experts, n, ..]` banks (n a multiple of 16) under e8m0
-/// exponents alone, held on the device, that only routed selects of bf16
-/// rows read (`MoeMatmulSelectQuant`, or its e4m3-quantized twin).
-fn lane_banks(
-    trace: &Trace,
-    tier: Option<&crate::experts::Tier>,
-    pairings: &BTreeMap<&str, Pairing>,
-) -> Vec<(usize, usize)> {
-    use poem_ir::{ActQuant, Def, Fused, Linear, Operands, Operation, Ty};
-    let weight = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|decl| &decl.def)
-    {
-        Some(Def::Weight(w)) => Some(*w as usize),
-        _ => None,
-    };
-    let bf16 = |id: poem_ir::ValueId| {
-        matches!(
-            trace.values.get(id.0 as usize).map(|decl| &decl.ty),
-            Some(Ty::Tensor {
-                dtype: Dtype::Bf16,
-                ..
-            })
-        )
-    };
-    let mut reads = vec![0u32; trace.params.len()];
-    let mut selects = vec![0u32; trace.params.len()];
-    let mut ins = Vec::new();
-    for node in &trace.nodes {
-        ins.clear();
-        node.op.inputs(&mut ins);
-        for &id in &ins {
-            if let Some(w) = weight(id) {
-                reads[w] += 1;
-            }
-        }
-        let legs: Vec<&Linear> = match &node.op {
-            Operation::Linear(op) => vec![op],
-            Operation::Fused(
-                Fused::MoeExperts { select, down, .. } | Fused::MoeMega { select, down, .. },
-            ) => vec![&**select, &**down],
-            Operation::Fused(Fused::MoeSelectGlu { select, .. }) => vec![&**select],
-            _ => Vec::new(),
-        };
-        for leg in legs {
-            let (x, bank) = match leg {
-                Linear::MoeSelect {
-                    x,
-                    bank,
-                    bias: None,
-                    quantized: true,
-                    quant: None,
-                    ..
-                } => (*x, *bank),
-                Linear::MoeSelect {
-                    x,
-                    bank,
-                    quant: Some(ActQuant::E4m3 { .. }),
-                    bias: None,
-                    quantized: true,
-                    ..
-                } => (*x, *bank),
-                _ => continue,
-            };
-            if let Some(w) = weight(bank)
-                && bf16(x)
-            {
-                selects[w] += 1;
-            }
-        }
-    }
+/// The mxfp4 expert banks that land in the matrix core's lane order
+/// (`store::layout::lane_ordered`), each with its exponents: on the device
+/// or in the host copy the weight cache fills its slots from.
+fn lane_banks(trace: &Trace, pairings: &BTreeMap<&str, Pairing>) -> Vec<(usize, usize)> {
     trace
         .params
         .iter()
         .enumerate()
         .filter_map(|(at, param)| {
             let pairing = pairings.get(param.name.as_str())?;
-            (param.dtype == Dtype::Mxfp4
-                && pairing.biases.is_none()
-                && param.shape.len() >= 3
-                && param.shape[1] % 16 == 0
-                && selects[at] > 0
-                && selects[at] == reads[at]
-                && !tier.is_some_and(|tier| {
-                    [at, pairing.scales]
-                        .iter()
-                        .any(|&p| tier.offloaded_at(p).is_some())
-                }))
-            .then_some((at, pairing.scales))
+            (pairing.biases.is_none() && crate::store::layout::lane_ordered(trace, at))
+                .then_some((at, pairing.scales))
         })
         .collect()
 }
 
 /// Puts `lane_banks` in the matrix core's lane order where they lie, codes
-/// and exponents through one staging span, and marks their rows.
+/// and exponents through one staging span, and marks their rows. A bank in
+/// the host copy (one the weight cache takes) is laid there in place, a run
+/// of experts at a time copied in beside the staging span and back: its
+/// slots and any read of the copy see the lane order.
 pub(super) fn order_mxfp4_banks(
     trace: &Trace,
     places: &[Place],
@@ -435,7 +362,7 @@ pub(super) fn order_mxfp4_banks(
 ) -> Result<()> {
     // Each bank's experts, rows (n) and K, from its codes' row: n · K / 2
     // bytes an expert. K a whole number of 128-code units.
-    let banks: Vec<(usize, usize, u64, u64, u64)> = lane_banks(trace, tier, pairings)
+    let banks: Vec<(usize, usize, u64, u64, u64)> = lane_banks(trace, pairings)
         .into_iter()
         .filter_map(|(at, scales)| {
             let Some(Some(WeightRow::Planes { codes, .. })) = table.get(at) else {
@@ -465,8 +392,10 @@ pub(super) fn order_mxfp4_banks(
     let per_expert = widest / 2 + widest / 32;
     let run = (STAGED / per_expert).max(1);
     let codes_span = (run * widest / 2).next_multiple_of(16);
-    let staging =
-        Buffer::zeroed(usize::try_from(codes_span + run * widest / 32).unwrap_or(usize::MAX))?;
+    let span = codes_span + run * widest / 32;
+    // The staging span, and beside it the source a run in host memory is
+    // copied into first (the lane-order kernel reads device memory).
+    let staging = Buffer::zeroed(usize::try_from(2 * span).unwrap_or(usize::MAX))?;
     for &(at, scales, experts, n, k) in &banks {
         let codes = address(tier, store, places[at].offset, at)?;
         let exps = address(tier, store, places[scales].offset, scales)?;
@@ -476,12 +405,28 @@ pub(super) fn order_mxfp4_banks(
             let take = run.min(experts - first);
             let rows = take * n;
             let (c, e) = (codes + first * n * k / 2, exps + first * n * k / 32);
+            let host = crate::device::alloc::is_host_pointer(c)
+                || crate::device::alloc::is_host_pointer(e);
+            let (src_c, src_e) = if host {
+                let (in_c, in_e) = (staging.ptr() + span, staging.ptr() + span + codes_span);
+                for (to, from, bytes) in [(in_c, c, rows * k / 2), (in_e, e, rows * k / 32)] {
+                    crate::device::copy_any(
+                        stream,
+                        to,
+                        from,
+                        usize::try_from(bytes).unwrap_or(usize::MAX),
+                    )?;
+                }
+                (in_c, in_e)
+            } else {
+                (c, e)
+            };
             kernels_cuda::linear::moe::mxfp4_lanes(
                 &ctx,
                 "linear.moe_select",
-                c,
+                src_c,
                 staged_codes,
-                e,
+                src_e,
                 staged_exps,
                 rows,
                 k,
@@ -490,12 +435,16 @@ pub(super) fn order_mxfp4_banks(
                 (c, staged_codes, rows * k / 2),
                 (e, staged_exps, rows * k / 32),
             ] {
-                crate::device::copy_d2d(
-                    stream,
-                    to,
-                    from,
-                    usize::try_from(bytes).unwrap_or(usize::MAX),
-                )?;
+                let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+                if host {
+                    crate::device::copy_any(stream, to, from, bytes)?;
+                } else {
+                    crate::device::copy_d2d(stream, to, from, bytes)?;
+                }
+            }
+            if host {
+                // The staged source is overwritten by the next run.
+                crate::device::ctx::sync(stream)?;
             }
             first += take;
         }

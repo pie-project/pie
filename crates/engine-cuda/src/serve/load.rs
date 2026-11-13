@@ -508,10 +508,23 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
     // its size: its copy is laid in place at load.
     let bytes = crate::weights::laid_bytes(&boot.trace)?;
     let laid = crate::weights::laid_planes(&boot.trace);
-    let in_file = !params.iter().any(|&param| {
-        laid.iter()
-            .any(|laid| laid.codes == param || laid.scales == param)
-    }) && crate::checkpoint_serving::Serving::open(boot.checkpoint, &boot.trace)
+    // So is a bank ROCm lays in the matrix core's lane order, codes and
+    // exponents (`store::layout::lane_ordered`).
+    let lanes: Vec<usize> = params
+        .iter()
+        .filter(|&&codes| crate::store::layout::lane_ordered(&boot.trace, codes))
+        .flat_map(|&codes| crate::store::layout::packed_planes(&boot.trace, codes))
+        .flatten()
+        .map(|plane| plane as usize)
+        .collect();
+    let relaid = |param: usize| {
+        lanes.contains(&param)
+            || laid
+                .iter()
+                .any(|laid| laid.codes == param || laid.scales == param)
+    };
+    let in_file = !params.iter().any(|&param| relaid(param))
+        && crate::checkpoint_serving::Serving::open(boot.checkpoint, &boot.trace)
         .is_some_and(|serving| serving.holds(params, &bytes));
     let pinned: u64 = params.iter().map(|&param| bytes[param]).sum();
     if boot.knobs.weights_held {

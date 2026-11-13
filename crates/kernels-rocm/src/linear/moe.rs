@@ -2274,7 +2274,8 @@ pub fn matmul_select_mxfp4_lanes(
     const OP: &str = "linear.moe_select";
     let op = OP;
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
-    located_only(op, table, "a bank in lane order")?;
+    // A table that may name mapped host memory reads as a located one: a
+    // bank streamed lands the bits it does held.
     let fan = selected(op, x, routes, y)?;
     let experts = codes.rows;
     if !x.width.is_multiple_of(128)
