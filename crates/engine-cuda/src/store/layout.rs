@@ -431,17 +431,19 @@ pub fn beside_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<u32> {
 /// The routed banks of `trace` this engine streams an expert at a time:
 /// planes out of the checkpoint read only at the `bank` port of a plain
 /// routed select with no bias, the select whose kernels read an expert
-/// table: a dense bank, or (off tcgen05, whose grouped GEMM reads no table,
-/// and off the HIP build) an MXFP4, NVFP4 or affine u4 bank against bf16
-/// activations or (W4A8, W4A4) against the rows its select quantizes, with
-/// the planes its table lists.
+/// table: a dense bank, or (off tcgen05, whose grouped GEMM reads no table)
+/// an MXFP4, NVFP4 or affine u4 bank against bf16 activations or (W4A8,
+/// W4A4) against the rows its select quantizes, with the planes its table
+/// lists. The HIP build streams no bank it lays in the matrix core's lane
+/// order (an unbiased MXFP4 bank, `weights::hip::lane_banks`): that order is
+/// laid where the bank lies, and no table names it.
 #[must_use]
 pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
     use poem_ir::residency::{Residency, residency};
     use poem_ir::{Def, Linear, Operands, Operation};
     let classes = residency(trace);
     let leads = poem_ir::residency::leads(trace);
-    let packs = !cfg!(feature = "rocm") && !packed_unread();
+    let packs = !packed_unread();
     let mut out = Vec::new();
     let mut inputs = Vec::new();
     'params: for (at, param) in trace.params.iter().enumerate() {
@@ -477,9 +479,10 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
                 }
                 // An expert bias summed into the routed rows (gpt-oss's
                 // down leg): a one-plane bank the sum reads through its
-                // table.
+                // table (the HIP sum reads none: the bias stays whole).
                 Operation::Linear(Linear::MoeBiasSum { bias, .. })
                     if packs
+                        && !cfg!(feature = "rocm")
                         && planes.is_empty()
                         && matches!(trace.values.get(bias.0 as usize).map(|d| &d.def),
                             Some(Def::Weight(w)) if *w as usize == at) =>
@@ -536,6 +539,14 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
             }
         }
         if !read {
+            continue;
+        }
+        if cfg!(feature = "rocm")
+            && param.dtype == poem_ir::Dtype::Mxfp4
+            && planes.get(2).is_none_or(Option::is_none)
+            && param.shape.len() >= 3
+            && param.shape[1] % 16 == 0
+        {
             continue;
         }
         // A packed bank streams with every plane of it, each an expert's:
@@ -611,7 +622,11 @@ fn packed_unread() -> bool {
     {
         kernels_cuda::linear::gemm_sm100::supported()
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(feature = "rocm")]
+    {
+        false
+    }
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     {
         true
     }
