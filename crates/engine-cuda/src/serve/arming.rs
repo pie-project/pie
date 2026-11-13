@@ -1448,9 +1448,7 @@ impl Shell {
         self.lent = None;
         self.pools.forget_weight_uses(self.device.stream())?;
         stepped?;
-        let more = self.arm_stepped_on(st, rung);
-        self.state_live();
-        more
+        self.arm_stepped_on(st, rung)
     }
 
     fn arm_stepped_on(&mut self, st: Arming, rung: u32) -> Result<bool> {
@@ -1463,7 +1461,7 @@ impl Shell {
                 Ok(true)
             }
             None => {
-                let ended = self.arm_end(st);
+                let ended = self.arm_end(st).and_then(|()| self.settle());
                 self.live.arm(u32::MAX);
                 ended.map(|()| false)
             }

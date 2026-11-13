@@ -603,6 +603,9 @@ pub struct Pools {
     /// A graph body names addresses in the range: it is never reserved
     /// anew ([`Pools::pin`]).
     pinned: bool,
+    /// The chunks stated to the runtime where the fit may yet give the
+    /// cache rows more than it holds now ([`Pools::state_most`]).
+    stated: Option<u32>,
     /// The range is reserved anew to the fit even where it maps on demand:
     /// the pool's planes then span about what the fit holds, not the asked
     /// count (reserved for the asked count, Qwen3.5-0.8B's c64 ran ~1%
@@ -998,6 +1001,7 @@ impl Pools {
             budget,
             fitted: total,
             pinned: false,
+            stated: None,
             whole_fit: false,
             airborne: None,
             host: None,
@@ -1101,6 +1105,56 @@ impl Pools {
         Ok(live
             .saturating_sub(self.segment_reserve())
             .max(live.min(room)))
+    }
+
+    /// States the pool to the runtime as the chunks the fit holds and
+    /// `more` bytes' worth past them, within the range: what a later fit
+    /// may give the cache rows (the activation no fire has backed, the
+    /// bodies' allowance the bodies do not take). The runtime keeps the
+    /// pool under [`Pools::kept_back_bytes`] less than that meanwhile.
+    pub(crate) fn state_most(&mut self, more: u64) {
+        // A stated budget is the pool's whole: no fit gives it more.
+        if self.budget.is_some() {
+            return;
+        }
+        let chunk = self.chunks.layout().chunk_bytes.max(1);
+        let more = u32::try_from(more / chunk).unwrap_or(u32::MAX);
+        self.stated = Some(
+            self.fitted_chunks()
+                .saturating_add(more)
+                .min(self.chunks.total()),
+        );
+        self.pledge();
+    }
+
+    /// Pledges the pool the chunks the runtime is stated, beside what its
+    /// other arenas hold now.
+    fn pledge(&mut self) {
+        let chunks = self
+            .stated
+            .map_or(self.fitted, |stated| stated.max(self.fitted));
+        let others = self
+            .pool
+            .committed_pages()
+            .saturating_sub(elastic::pages_for_bytes(self.committed_bytes()));
+        self.pool
+            .pledge(elastic::pages_for_bytes(self.chunk_bytes(chunks)).saturating_add(others));
+    }
+
+    /// The bytes of the chunks stated to the runtime that the fit does not
+    /// hold for the cache rows now.
+    #[must_use]
+    pub fn kept_back_bytes(&self) -> u64 {
+        self.stated.map_or(0, |stated| {
+            self.chunk_bytes(stated)
+                .saturating_sub(self.chunk_bytes(self.fitted_chunks()))
+        })
+    }
+
+    /// The activation's span no fire has backed.
+    #[must_use]
+    pub fn activation_unheld_bytes(&self) -> u64 {
+        self.chunks.activation_unheld_bytes()
     }
 
     /// The range stays where it lies from here on: a body captured over it
@@ -1332,17 +1386,13 @@ impl Pools {
             };
             self.chunks.reshape(&mut self.pool, reserved)?;
         }
-        self.chunks.limit(fitted);
+        self.chunks
+            .limit(self.stated.map_or(fitted, |stated| stated.max(fitted)));
         // The runtime admits frames against this watermark, so the pool is
         // pledged it beside what its other arenas hold now: a frame inside
         // it is a frame the fit already sized the card for, and what a fire
         // allocates beside the pool later is not its refusal to answer.
-        let others = self
-            .pool
-            .committed_pages()
-            .saturating_sub(elastic::pages_for_bytes(self.committed_bytes()));
-        self.pool
-            .pledge(elastic::pages_for_bytes(self.chunk_bytes(fitted)).saturating_add(others));
+        self.pledge();
         Ok(Fitted {
             asked: self.asked,
             fit: fits,
@@ -3155,7 +3205,9 @@ impl Pools {
         max_tokens: u32,
         rungs: &[(u32, u64)],
     ) -> Result<engine::chunk::ChunkFacts> {
-        let fitted = self.fitted_chunks();
+        let fitted = self
+            .stated
+            .map_or(self.fitted_chunks(), |stated| stated.max(self.fitted_chunks()));
         self.chunks.limit(fitted);
         self.chunks.skip_past(fitted);
         // The state's chunks of the segment the stated activation starts in
