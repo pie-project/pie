@@ -1169,6 +1169,9 @@ impl Pools {
         stretch: bool,
         resident: &dyn core::fmt::Display,
     ) -> Result<Fitted> {
+        // What the load dropped and the process keeps for reuse is free
+        // room, not the card's use.
+        crate::device::held::release_idle();
         // The room is what the card has free plus every byte the range has
         // backed (its committed segments and held spans; a flat range, once
         // allocated, the whole of it: the chunks the kv rows have not yet

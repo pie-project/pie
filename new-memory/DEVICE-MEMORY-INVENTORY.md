@@ -126,6 +126,31 @@ Reported, not checked:
 7. Vulkan/wgpu `LoadFacts` reports the whole pool range as committed while one segment is backed.
 8. Metal: decoded banks are missing from the first fit pass.
 
+## 6a. Measurements from the backends' own machines
+
+ROCm, MI300X (AMD session, 2026-11-13):
+- Qwen3.5-9B after load: arming takes 6442 MiB of free memory: bodies 845, scratch slabs 2528, rs scratch 1138 (first allocated at the first fire), arena growth about 1.9 GiB.
+- Scratch slabs by name, final sizes in MiB: `ssm_gdn_chunk_hct` 872, `ut` 440, `vnt` 440, `kt` 224, `w` 176, `kb` 96, `qb` 96, `gcum` 16; `linear.lt_workspace` 128 (one stream); `live_args` 8; `pie.tickets` 24 (taken by the runtime channel, outside `Ctx::scratch`). Qwen3-30B adds `linear.moe_ordered_h` 120 and `moe_route_order` 8. The growth path sums to 2992 MiB with retired slabs, against 2528 final: "old + new" is real.
+- GDN chunk-plane rows scale with the widest prefill bucket.
+- `device_memory_share` 0.9 leaves about 19.6 GiB of 196 GiB physically free on every load.
+- Qwen3-8B after arming: device used 165153 MiB; the fit's itemised sum plus what was in use before is about 166451 MiB, 1.3 GiB over (probably the arena counted both inside the range and as committed).
+- The flat range is allocated at its first commit, sized by the fit made before arming; what that fit held for arming and arming did not use is lost to the cache.
+- Driver memory allocated lazily beside our allocations: graph instantiation (about 11.8 KB a node), module code objects, rocBLAS handle workspace unless set, RCCL buffers.
+- hipBLASLt takes its workspace by pointer; rocBLAS through `rocblas_set_workspace`. One `hipMalloc` of about 150 GB works.
+
+Metal, M1 Max 32 GB (Mac session, 2026-11-13; code read, measurement to follow). `maxBufferLength` 18.72 GiB, `recommendedMaxWorkingSetSize` 24.96 GiB.
+- Confirmed: `act_chunks` empty and the arena a second sparse buffer with its own budget (a batch may not span the two); scratch plane, inputs × arms, readout, rs scratch, group masks and ANE staging are allocated after the second fit and never priced; group masks keep every outgrown buffer (under twice the largest in total); `max_forward_tokens` halves to 512; decoded banks are missing from the first fit pass, so the halving loop can stop one step early and the second admit refuses a load that would have fitted; the flat fallbacks are unreachable on Apple.
+- Corrected: guest batches are replaced when they grow; the leak is that removing a program never removes its batches (`batches` is keyed by program id and never retained). The sparse buffers are Private, the 16 MiB placement heaps under them Shared.
+- Added: `held_elsewhere()` is always 0 where sparse exists, so the Metal budget has no measured term at all; the pool is capped at `maxBufferLength / chunk`; Metal has the "half the remainder" rule too (voxel and frame-slot fit); the arena never unmaps, so lowering a rung frees nothing today; ANE surfaces and staging are allocated before the second fit and priced by neither pass.
+
+Metal, measured (Mac session, 2026-11-13; memory-redesign 0b5b42a7f, release, Qwen3-0.6B bf16, a temporary probe of `MTLDevice.currentAllocatedSize`):
+- After load the device holds 1,684 MB: weights 1,218 MB, one pool segment 67 MB, inputs + readout for two arms 398 MB, arena 0 mapped, residual 1.0 MB. The owners explain it to 0.06%.
+- Accounting priced weights 1.22 GB + arena 2.89 GB + kv 19.88 GB + floor 0.13 GB = 24.12 GB of a 26.80 GB working set. The 398 MB of inputs + readout is priced nowhere and is three times the 128 MiB floor that is supposed to cover it, on a 0.6B model.
+- Mapped bytes are a small part of what is reserved: 106 MB of the 2.89 GB arena, 200 MB of the 19.88 GB pool after 256 fires. The arena stayed at its first, widest carve (106 MB) when later fires carved 88.8 MB: it never shrinks.
+- After the first fires about 26 MiB is held by owners the probe did not name (pipelines, argument tables, group masks, guest tables); flat through fire 128.
+- The driver's own IOAccelerator total is about 225 MiB above `currentAllocatedSize`: `outside`, visible only in the process footprint.
+- For the ledger check on Metal: assert against `currentAllocatedSize` at load; count chunks handed out and `fire(rung)`, never reserved virtual size.
+
 ## 7. Not traced
 
 The compiler side that sets chunk and segment sizes and the arena map; runtime-crate callers of commit / release; device bytes of compiled objects on every backend; whether kernel modules are ever unloaded; XLA executable temporaries; Cerebras non-dense families; adapter bank placement on CUDA and ROCm; where compressor side planes live on CUDA, ROCm and Metal.

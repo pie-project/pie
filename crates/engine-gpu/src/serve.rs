@@ -1063,7 +1063,15 @@ impl<B: Serve> Shell<B> {
         // the weights and the working set leave of the share, in whole
         // chunks; the kernels bind it in at most four segments, none past
         // the device's binding limit.
-        let room = kv_budget.unwrap_or_else(|| device.left());
+        let left = device.left();
+        if let Some(budget) = kv_budget
+            && budget > left
+        {
+            return Err(Fault::Residency(
+                engine::fit::Short::Budget { budget, room: left }.to_string(),
+            ));
+        }
+        let room = kv_budget.unwrap_or(left);
         let total = engine::chunk::fit(room, chunk, 0, least_chunks)
             .map_err(|short| Fault::Residency(short.to_string()))?;
         let binds = u32::try_from(

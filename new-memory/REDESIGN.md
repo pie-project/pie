@@ -2,6 +2,18 @@
 
 Draft, 2026-11-13. Based on `memory-followups` at dbb5e043d and the inventory in `DEVICE-MEMORY-INVENTORY.md`. Covers CUDA, ROCm, Metal, Vulkan, wgpu and XLA. Cerebras is out of scope.
 
+## North star
+
+> An operator loads any model on any device with no memory setting, and the engine uses the whole device: every byte is in one ledger, and how the bytes are split between weights, state and fires follows demand at run time.
+
+How we know we are there:
+1. **One ledger.** On every backend the ledger's sum equals what the device reports as used, at any time, asserted in tests.
+2. **Nothing to set.** A load with an empty memory config works and is the best configuration; the only keys are optional caps for sharing a machine.
+3. **Load decides one thing:** whether the floor fits. Every other split is made at run time and can be undone.
+4. **No number without a derivation.** Each remaining constant is listed in section 3 with the hardware or structural fact it comes from.
+5. **One implementation.** The ledger, the layouts and the fit are shared code; a backend supplies only how to reserve and back memory.
+6. **No loss.** Throughput and capacity are at least main's on every backend.
+
 ## 0. The one rule
 
 > Every device byte we allocate belongs to exactly one of three classes, is counted in chunks in one ledger, and the ledger holds `model + state + fire(rung) <= total` at all times. Nothing is decided at load except whether the floor fits.
@@ -50,7 +62,9 @@ struct Ledger {            // one per device
 
 ### 2.2 `total` is measured, never configured
 
-`total = (device free after context, handles and modules are up) / chunk_bytes`, capped by `[engine.memory] budget_device` when the operator states one (the single legitimate knob: sharing a device with another process cannot be derived).
+`total = (device free after context, handles and modules are up − outside) / chunk_bytes`, capped by `[engine.memory] budget_device` when the operator states one (the single legitimate knob: sharing a device with another process cannot be derived).
+
+`outside` is what the driver allocates beside our span after that point (AMD review, MI300X): graph body instantiation (Qwen3.5-9B: 845 MiB for 161 bodies, about 11.8 KB a node), code objects of modules loaded on first use, BLAS handle workspaces we do not set, collective buffers under TP / EP. It is a fourth ledger term, **priced by measurement, not guessed**: bodies are `nodes × price`, the node count known from the compiled regions and the price measured on the first instantiation (the code already measures it); a module's bytes are the free-memory delta of its load. A flat span cannot give physical memory back, so on flat backends the span is reserved after the first body has been priced, and a rung's bodies are priced before the rung is offered.
 
 Removes: `device_memory_share`, `device_kv_budget`, the `min(128 MiB, total/10)` floor, XLA `headroom`, `[wgpu] device_memory` default of 8 GiB.
 
@@ -60,7 +74,7 @@ Removes: `device_memory_share`, `device_kv_budget`, the `min(128 MiB, total/10)`
 trait Span {
     fn capacity(&self) -> u64;                 // measured free bytes
     fn bindings(&self) -> u64;                 // largest single buffer (Vulkan, wgpu, Metal)
-    fn reserve(&mut self, chunks: u32);        // the whole span, once
+    fn reserve(&mut self, chunks: u32);        // the whole span, once, in as many ranges as the device needs
     fn back(&mut self, chunks: Range<u32>);    // optional: default no-op
     fn unback(&mut self, chunks: Range<u32>);  // optional: default no-op
 }
@@ -70,11 +84,13 @@ trait Span {
 |---|---|---|
 | CUDA | `cuMemAddressReserve` | `cuMemCreate` + `cuMemMap` / unmap |
 | ROCm | one `hipMalloc` | no-op |
-| Metal | one placement-sparse buffer (today: two) | heap map / unmap |
+| Metal | N placement-sparse buffers under one budget (today: two buffers, two budgets) | heap map / unmap |
 | Vulkan, wgpu | N buffers of at most `bindings()` | no-op |
 | XLA | the pool tensor | no-op |
 
-**Flat is the base case.** Class boundaries are ledger numbers, so moving the boundary between state and fire costs nothing on a flat span. Backing on demand only matters for giving memory back to other processes; it is an optimisation of two backends, not part of the model. This removes the present ROCm oddity where lowering a rung frees nothing: state simply takes the chunks.
+**Flat is the base case.** Class boundaries are ledger numbers, so moving the boundary between state and fire costs nothing on a flat span. Today the ROCm range is allocated at its first commit, sized by the fit made before arming, so everything that fit held for arming and arming did not use (the bodies stretch, about 7 GiB on Qwen3-8B, the arena-sized scratch guess) is lost to the cache for the life of the process: the 4.6% fewer pages than main. With boundaries as ledger numbers there is nothing to lose. Backing on demand only matters for giving memory back to other processes; it is an optimisation of two backends, not part of the model. This removes the present ROCm oddity where lowering a rung frees nothing: state simply takes the chunks.
+
+**The span is one ledger, not necessarily one address range** (Mac review). A Metal buffer is capped at `maxBufferLength` (18.7 GiB on an M1 Max with a 25 GiB working set), so one range would put about 6 GiB out of reach; Vulkan and wgpu bind at most four segments addressed by a u32 element index. On these the span is several buffers that draw on one budget: chunk ids are global, a chunk never straddles a buffer, and the fire carve sits in the top buffer. Metal's `elastic` then needs one change: buffers that share a budget may be mapped in one batch (refused today), and tiles may be mapped at any range, not only as a prefix.
 
 Deleted: CUDA device heap, recycle shelf, endpoint pool, kernel slab map, raw `cudaMalloc` sites; Metal's second sparse buffer and `Accounting`; per-owner buffers on Vulkan / wgpu.
 
@@ -82,17 +98,20 @@ Deleted: CUDA device heap, recycle shelf, endpoint pool, kernel slab map, raw `c
 
 `fire(r) = frames × FrameMap(r).bytes + ArenaMap(r).bytes`, in chunks. Both maps come from the compiler.
 
-- **Workspace placements.** Each kernel family exports what it needs as data: `workspace(op, rows, lanes) -> [(name, rows, width, dtype, scope)]`, scope one of `launch` (dead when the op returns), `stream` (read by the next launch on the same stream, e.g. the decoded weight tile), `fire`. `arena::carve` lays them with the values. `Ctx::scratch(name)` becomes a lookup of an address the carve fixed.
+- **Workspace placements.** Each kernel family exports what it needs as data: `workspace(op, rows, lanes, tuning) -> [(name, rows, width, dtype, scope)]` (`tuning` is the device's kernel tuning: Metal's split-K bound and MoE register rooms depend on it), scope one of `launch` (dead when the op returns), `stream` (read by the next launch on the same stream, e.g. the decoded weight tile), `fire`. `arena::carve` lays them with the values. `Ctx::scratch(name)` becomes a lookup of an address the carve fixed.
   - CUDA / ROCm: 25 / 20 names to convert. Removes the slab map, both grains, growth and retirement, the warm-up fires, `Unwarmed`, `scratch_growth`, `decoded_weight_reserve`, `gemm_workspace_mb` (cuBLAS takes the workspace by pointer already).
   - Metal / Vulkan / wgpu: `scratch.rs` rooms move into the same exported form; the two files go.
 - **`FrameMap`.** The staged-input layout (tokens, positions, page tables, masks, rs tables, attention plan workspaces) and the readout rows, as one shared function of `(rows, lanes, pages per lane, context)`. Replaces four `inputs.rs` layouts. A ring of `frames` of them sits in the fire carve.
+- **Data-dependent tables** (group masks, mask and inject runs: sized by a fire's composition, today regrown and the old buffer kept) get a bound from the rung in the `FrameMap`; no growth after load.
+- **Model bytes inside fire buffers** are split out first: the n-gram hash constants in the Metal and Vulkan/wgpu scratch plane are model-class, and a re-carve would overwrite them.
 - **Guest program scratch** is a `fire`-scope workspace of the program's stage, sized by its own plan; `program_scratch_reserve` goes.
 - Lanes are not a second axis: a rung of `r` tokens allows `r` lanes (as `arena_rung` already does). `ARENA_RUNG_LANES` goes.
 
 ### 2.5 Rungs: powers of two, the largest derived
 
 - Rungs are every power of two from the smallest useful fire up to the largest `r` with `floor + one working set + fire(r) <= total`. `chunk::fit` already checks this inequality; it is solved for `r` instead of halving a configured token count.
-- Carves for all rungs are computed at load (they are layouts, cheap). Bodies for a rung are armed when a pass first asks for it; a body is a model-class cache entry (2.7).
+- Carves for all rungs are computed at load (they are layouts, cheap). Every rung's bodies are captured in the background after load (user decision, 2026-11-13), smallest rung first; the model serves at the rungs already armed meanwhile, and a raise to a rung still being captured waits on it. Every serving fire replays a captured body, never runs eagerly (existing user decision; Metal encodes live and is exempt). Bodies are therefore a fixed model-class cost, known once arming ends, not a cache entry.
+- Because every rung is armed, the number of rungs multiplies arming time and body memory: the rung ratio (2 here) is to be set by measuring both, not assumed.
 - Removes: `ACTIVATION_RUNGS`, `max_forward_tokens` as a sizing input, `tokens_within`, `TOKENS_FLOOR`, `working_set_percent`, `walk_fire_rows`, the lane/token refit.
 - The runtime side (M118: rest at the smallest rung, raise on demand as a planner waiter) is unchanged.
 
@@ -113,33 +132,88 @@ One attribute on a role: **replayable** (kv, rs: may be dropped and rebuilt) or 
 ### 2.7 Model: a floor and a cache
 
 - **Floor**: what one fire cannot run without. Dense weights stay resident (existing user decision). Load places the floor and refuses if it does not fit. That is all load decides.
-- **Cache**: streamable atoms (as today), optional derived copies (fp8 shadow, prescaled banks, tied-embedding copy, decoded planes), compiled bodies per rung. Each is a `WeightShape`-like entry with a size and a cost to rebuild. This is FOLLOWUPS F1 extended from atoms to copies and bodies.
+- **Cache**: streamable atoms (as today), optional derived copies (fp8 shadow, prescaled banks, tied-embedding copy, decoded planes). Each is a `WeightShape`-like entry with a size and a cost to rebuild. This is FOLLOWUPS F1 extended from atoms to copies and bodies.
 - Removes: fp8 shadow "under free/8", XLA "under 5/8 of HBM", `bodies_mem` with its quarter rule, 512 MiB floor and 1/20 stretch, `weights_streaming`.
 
-### 2.8 One policy
+### 2.7a The weight cache without a mode or a threshold (proposal)
 
-The governor says how many chunks are needed; PLEX picks what gives them up among idle kv, cache atoms, derived copies, bodies. The rung is not a candidate: it follows demand (M118) and its chunks count as state room while lowered.
+Today (`runtime/src/store/weights.rs`): `weight_streaming = auto | on | off`; `on` sheds the whole cache to its floor before anything else gives way; refill only into room no waiter is short of; order by the use record; membership changes once a window of `WINDOW_TICKS = 4` governor ticks. Rimuru (arXiv 2610.40305) has the same principle, attention state first and experts into what is free, realised with thresholds: shrink below 2 free pages, expand above 9, at most 5 experts a pass, an offline routing profile, a configured floor; it reports slow recovery after a burst.
 
-Unit of comparison: expected time lost (replay time × reuse likelihood for kv; refill time × use rate for a cache atom, from `weight_uses`; re-arm time for a body). All are rates the system already measures. **Open:** this unit is the least settled part of the design and needs measurement before it replaces the fixed weight rule.
+The principle both share is the operating system's page cache: a weight atom is a clean page (read-only, a copy on the host), so dropping it loses no work, only future misses. Three rules, no mode and no threshold:
 
-### 2.9 XLA
+1. **Live demand before cache.** Running working sets and the fire's rung are never refused for the sake of a cache entry. The governor's `Demand { wanted, live }` already draws this line. `weight_streaming` goes: when everything fits, every atom is resident (today's `off`); when live demand needs chunks, atoms go (today's `on`). The engines switch their held fast path on their own (F1).
+2. **Among cache entries, lowest value per byte goes first**, value = use rate × miss time, both measured: for an atom, uses a second from `weight_uses` × the time to stream it from the host; for idle kv, the reuse the policy's retention key stands for × the time to replay its tokens. This is the cost-aware cache (GreedyDual-Size), the standard rule for entries of different sizes and miss costs, with a competitive bound; it replaces "weights always first". The engine publishes the facts; PLEX may reorder by key (2.8).
+3. **An atom comes back at break-even**: when the miss time it has cost since it left reaches the time to load it (the ski-rental rule, at most twice the cost of the best choice in hindsight). This replaces the window constant, and gives recovery after a burst an order: the atoms that have cost most come back first.
+
+Open: rule 2 across weights and idle kv needs a reuse estimate for idle kv where no policy sets a key; whether the runtime records prefix-cache hits has not been checked. Rules 1 and 3 need nothing new and already remove the mode key and the window constant; rule 2 can follow.
+
+### 2.8 Governor, PLEX and the pool: unchanged roles, fed by the ledger
+
+SPEC decision 7 stands: the governor decides how much, PLEX decides what stays, the pool decides how it moves, and the runtime never drops state on its own. The redesign adds no role and no PLEX verb; it changes where their numbers come from.
+
+| Role | Interface today | What it reads after the redesign |
+|---|---|---|
+| Governor (`runtime/src/governor.rs`) | `PoolTarget`: `floor`, `hard_limit`, `held`, `demand {wanted, live}`, `growth`, `retarget(segments)` | `hard_limit` = measured capacity − `outside` − model floor (2.2), no longer a share of the card. `floor` = one working set + the smallest rung's `fire` (as its doc already says). `held` and `demand` are ledger sums. `growth` is `Fixed` on a span that cannot be unbacked (ROCm, Vulkan, wgpu, XLA) and `Elastic` on CUDA and Metal, as today. |
+| Ledger | — | `total` at any moment is `min(capacity, governor target)`. The invariant `model + state + fire(rung) <= total` is checked against that. |
+| PLEX (`plex:policy`, `runtime/src/policy/pressure.rs`) | one `tier-pressure` edge a band crossing; worker attrs `{device,host}-{total,state,live,wanted,act,short}-bytes`; answers with `discard` and retention keys | The same attrs, now exact because every byte is in the ledger (`act` is `fire(rung)` whole, not the arena alone). Two attrs added, `model` (cache bytes) and `outside`; attrs are not verbs. |
+| Pool | segments, evacuation, `copy_slots` | unchanged |
+| Rung | demand-driven; a raise is a planner waiter (M118) | unchanged; a raise short of room raises `tier-pressure` like any waiter |
+
+What PLEX may be asked to give up:
+- **Replayable state** (kv, rs, prefix entries, snapshots): as today, by retention key; the default responder discards lowest key first.
+- **Model cache** (FOLLOWUPS F1): weight atoms and optional derived copies become holders with retention keys. The engine publishes facts for each (bytes, uses from `weight_uses`, refill cost); how to weigh them is the policy's, exactly as for kv. The fixed rule in `store/weights.rs` (shed every weight to the floor first) goes.
+- **Never offered**: the floor, bodies, and state that cannot be replayed (channels, adapters). Unreplayable state may only be parked on the host tier.
+
+So the redesign defines no valuation of its own. An earlier draft proposed a common unit ("expected time lost"); that is a policy's business and is dropped.
+
+Not addressed here: the governor's own loop constants (`FIRST_HOLD`, `IDLE_AFTER`, `KEEP_CACHE`, `CUT_SHARE`, and the tolerance table), which its header says were measured on one 16 GB machine. They act only when the process is not dedicated, and they size nothing; FOLLOWUPS F2 turns the tolerance into `governor_*` keys.
+
+### 2.9 Metal: ANE
+
+IOSurfaces cannot be placed in our heaps, so ANE memory stays outside the span, but we size every surface and staging buffer ourselves: the ledger counts weight and scale surfaces as model and input, partial and staging surfaces as fire, exactly. Only the compiled ANE program is invisible (owned by the system daemon, not in our footprint): `outside`.
+
+### 2.10 XLA
 
 Same ledger, different realisation:
 - `state` and `model` are counted exactly as elsewhere.
 - `fire(r)` cannot be laid out by us. It is **measured**: run rung `r`'s executable once at load or on first raise and read the device's peak (`PJRT_Device_MemoryStats` is already used at open). The measurement replaces `headroom`.
 - Open risk, already in XLA-TPU-CHECKLIST 3.2: whether donating the pool updates in place. If it copies, `fire(r)` includes a pool-sized term and the ledger will show it.
 
-## 3. What remains configurable
+## 3. Configuration
 
-| Key | Why it cannot be derived |
+Memory sizing reads **no key by default**. Everything below is optional; an empty `[engine.memory]` is the best configuration for a dedicated machine.
+
+| Key (`[engine.memory]`, FOLLOWUPS F2 names) | Default | Why it cannot be derived |
+|---|---|---|
+| `budget_device` | all the device has | sharing a device is the operator's intent |
+| `budget_host` | what the governor allows | same, for host memory |
+| `budget_disk` | none without `disk_path` | same, for disk |
+| `disk_path`, `disk_persistent` | no disk tier | where files go is the operator's |
+| `governor_backoff`, `governor_release_idle` | dedicated: `1.0`, `false` | how much to yield when the system is congested, and whether idle memory goes back |
+
+Seven keys, none required. `governor_patience` (F2) is proposed away: in `Governor::tick` it is the count of congested ticks before the backoff acts, a debounce of the pressure signal rather than an intent, so it becomes one fixed value (to be confirmed by measurement; today's profiles tie it to the backoff: 0.9 → 4 ticks, 0.8 → 2, 0.7 → 1). Limits that are product decisions rather than memory (`max_context`, and F2's `max_batch_tokens` / `max_batch_sequences`) stay outside `[engine.memory]` as optional caps; when absent the context is the model's and the batch is the largest rung.
+
+Removed, each refused with a message naming what replaced it:
+
+| Key | Replaced by |
 |---|---|
-| `[engine.memory] budget_device` / `budget_host` / `budget_disk` (optional caps, F2 names) | sharing a machine is the operator's intent |
-| `governor_*` (F2) | how politely to share is intent too |
-| `max_context` (optional cap) | a product limit, not a memory one |
+| `device_memory_share`, `[wgpu] device_memory` | measured capacity; `budget_device` to cap |
+| `device_kv_budget`, `host_kv_budget`, `disk_kv_budget` | the ledger; `budget_*` to cap a tier |
+| `disk_kv_dir`, `disk_kv_persistent` | `disk_path`, `disk_persistent` |
+| `memory_tolerance` | `governor_*` |
+| `weight_streaming` | weights are holders (2.7, F1) |
+| `snapshot_budget` | snapshots are disk-tier holders (F1) |
+| `max_forward_tokens`, `max_forward_requests` | the derived largest rung (2.5) |
+| `max_model_len` | `max_context` |
+| `max_state_slots`, `kv_page_size`, `[xla] seat_tokens` | the compiler's chunk plan |
+| `bodies_mem` | bodies priced by measurement (2.2) |
+| `working_set_percent`, `window_spare` | `fire(rung)` stated by the compiler (2.4) |
+| `gemm_workspace_mb` | the workspace declared by the kernel (2.4) |
+| `[xla] headroom` | measured `fire(r)` (2.10) |
+| `adapters.seats` | adapters are state slots taken on registration (2.6) |
+| `max_patches`, `max_images`, `max_voxels`, `max_clips` | rungs on the patch and voxel axes, derived like the token rung (user decision: no product limit; a request is refused only when it is past the largest rung the device can hold) |
 
-`max_batch_tokens` and `max_batch_sequences` (F2) become optional caps on the rung, defaulting to derived.
-
-Structural constants that stay, each with a reason: chunk size (from the compiler's plan of the model and the device binding limit), alignment 256 B, frames in flight (pipeline depth), rung ratio 2.
+Structural constants that stay, each with its reason: chunk size (the compiler's plan of the model and the device's binding limit), alignment 256 B (kernel requirement), frames in flight (pipeline depth, a runtime setting, not a memory one), rung ratio (to be measured, 2.5).
 
 ## 4. Order of work
 
@@ -153,13 +227,15 @@ Each step is mergeable alone. Steps 1-5 are verified bit-for-bit with the golden
    c. ROCm (20 names), then Metal and Vulkan/wgpu (`scratch.rs` → exported workspaces, arena into the span, `act_chunks` stated).
 4. **State stragglers** into the pool (channels, instance tables, adapters, side planes).
 5. **Derived rungs and measured total**; delete the load-time fit, `engine/src/fit.rs`, and the config keys, each refused with a message.
-6. **Model cache under PLEX** (F1 extended).
+6. **Model cache under PLEX** (F1 extended) and the config surface (F2, section 3).
 7. **XLA**: measured `fire(r)`.
 
 Hardware: steps 1-5 for CUDA and Vulkan/wgpu can be done on the L40S; ROCm, Metal and XLA need their own machines.
 
 ## 5. Open questions
 
-1. Arming a rung's bodies on first demand adds latency to the first wide pass. Acceptable, or arm every rung in the background after load?
-2. Vulkan / wgpu address the pool by a u32 element index (about 8 GiB) in at most four bindings. The fire carve must then sit in bindings of its own at the top of the span; is one ledger over several buffers acceptable there?
-3. The policy unit in 2.8.
+1. Settled by the user: every rung's bodies are captured in the background after load (2.5). Open in its place: the rung ratio, by measuring arming time and body memory per rung.
+2. Settled by the Mac review: one ledger over several buffers (2.3), for Metal as well as Vulkan / wgpu.
+3. Settled: no valuation in the engine; PLEX weighs the facts the ledger publishes (2.8).
+4. Settled by the user: `max_patches` / `max_images` / `max_voxels` / `max_clips` go; derived rungs, only abnormal requests refused.
+5. The weight cache rule (2.7a): proposed, not decided.
