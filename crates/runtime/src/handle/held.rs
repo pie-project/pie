@@ -51,6 +51,9 @@ impl Held {
         cursor: Cursor,
     ) -> Self {
         kv.leave_owner();
+        if let Some(rs) = &rs {
+            rs.leave_owner();
+        }
         let residency = Arc::new(Mutex::new(ProcessResidency::default()));
         {
             let mut held = residency.lock().unwrap();

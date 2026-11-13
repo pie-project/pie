@@ -84,6 +84,15 @@ impl RsWorkingSet {
         self.lifecycle.release();
     }
 
+    /// This set leaves its owner alive (a handle takes it): the owner's hold
+    /// on the planner goes back, as a kv set's does. Kept, it held the
+    /// departed owner's reclaim "on its way back" for as long as the handle
+    /// lived, the planner counted pages and a state slot that never came as
+    /// supply, and a head short of a slot planned no eviction again.
+    pub fn leave_owner(&self) {
+        drop(self.lifecycle.departure.lock().unwrap().take());
+    }
+
     pub fn claim_pipeline_scope(
         &self,
         scope: &crate::store::PipelineScope,
