@@ -1453,3 +1453,18 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   compiled gather program (prewarmed per traced shape) copies only those rows; host copies reuse a recycled f32
   buffer. Fire programs byte-identical (logits untouched). vs main: MoE d256 +68%, 0.6b d64 / d256 +19%, d0.8b d64
   +7.3% (was -2.6%), d256 +11.3%. Gates bitwise.
+
+### M118 — 2026-11-13: demand-driven rungs; idle-cache reclaim fence (user decision: no rung heuristics)
+- `sc/rung-demand` (647df5803..9105d424b, runtime only): a pool rests at its smallest rung (activation room above it
+  counts as kv while lowered); a long pass asks for the rung it needs; the raise is a planner waiter funded like any
+  ask (idle cache, keyed demote, host suspend), evacuates state down and applies at once; pieces keep firing at the
+  current rung meanwhile and the rest re-cuts wide; a fire no cut brings under the rung waits on its raise or fails
+  with the planner's error (never waits forever); the rung is held for a process between its wide passes and lowers
+  when no pass asks past it. Governor shrink_rung / restore_rung deleted.
+- 54bc446a5: a dropped idle-cache entry's pages return once the fires that could read it retire (per-node last
+  release epoch), not after every fire in flight (~1 s stall per prompt under pressure); a demote moves only what the
+  head lacks. This was the mixed-load regression vs main.
+- sm_120 Qwen3-8B: mixed load (64 decoding lanes + 16 x 6000-token prompts) TTFT p99 950 ms vs main 925-944
+  (current was 1480-2183); c256 (m2=160) 6861-6881 vs main 6659-6701 (current 5890); c64 2648 vs 2651; gpt-oss
+  24 x 31.4k 61.3 s vs 63.2; boot 6.2 s vs ~19.3. runtime 156 pass; rung.py plain 5/5, hold-40 8/8 (raise
+  evacuated, no held set discarded).
