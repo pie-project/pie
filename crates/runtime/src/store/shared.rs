@@ -216,9 +216,18 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
         if !evacuation.moves.is_empty() || pool.apply_rung(&evacuation, 0).is_err() {
             return;
         }
-        tracing::info!(engine, rung = goal, moved = 0, "the activation rung is raised");
+        tracing::info!(
+            engine,
+            rung = goal,
+            moved = 0,
+            "the activation rung is raised"
+        );
     }
-    // The rung holds `goal` now: fires may take its width.
+    // The rung holds `goal` now: fires may take its width, once a raise's
+    // copy is the engine's.
+    if pool.copying().is_some() {
+        return;
+    }
     let cap = lifted(goal);
     if cap > fire_cap(engine) {
         set_fire_cap(engine, cap);
@@ -484,7 +493,15 @@ pub struct SharedPool {
     records_most: u32,
     /// Chunks one working set takes at the longest context.
     least_chunks: u32,
+    /// A raise is applied here and its chunks' copy is not yet the
+    /// engine's: no fire is let past the rung held before it
+    /// ([`Self::raise_applied`]).
+    copying: Option<u32>,
 }
+
+/// The fence epoch a raise's moved-off chunks wait on until the engine has
+/// taken its copy ([`SharedPool::raise_copied`]): no fire retires it.
+const UNTIL_COPIED: u64 = u64::MAX - 1;
 
 /// The engine's moves expressed as `(logical, new physical)`.
 fn engine_moves(moves: &[super::segments::ChunkMove]) -> EngineEvacuation {
@@ -669,6 +686,7 @@ impl SharedPool {
             free_records: BTreeSet::new(),
             records_most: 0,
             least_chunks: 0,
+            copying: None,
         };
         // Under the smallest rung state may take every chunk but the
         // reserved ones and that rung's activation.
@@ -1166,6 +1184,37 @@ impl SharedPool {
         self.pool
             .apply_rung(evacuation, epoch)
             .map_err(RungError::Pool)
+    }
+
+    /// Takes `evacuation`'s rung here, in the same hold of the pool it was
+    /// planned in, so no slot is handed out between plan and apply: the
+    /// chunks it moves off stay fenced, and no fire is let past the rung
+    /// held before, until the engine has the copy ([`Self::raise_copied`]).
+    /// The engine's copy follows ([`Self::rung_moves`]); a raise that moves
+    /// nothing needs none.
+    pub fn raise_applied(&mut self, evacuation: &RungEvacuation) -> Result<(), RungError> {
+        let before = self.pool.rung();
+        if evacuation.moves.is_empty() {
+            return self.apply_rung(evacuation, 0);
+        }
+        self.apply_rung(evacuation, UNTIL_COPIED)?;
+        self.copying = Some(self.copying.map_or(before, |held| held.min(before)));
+        Ok(())
+    }
+
+    /// The engine has taken a raise's copy, carried by the fire at `epoch`
+    /// (the next it is handed): its chunks moved off reopen once that fire
+    /// retires, and fires may take the raised rung.
+    pub fn raise_copied(&mut self, epoch: u64) {
+        self.pool.refence(UNTIL_COPIED, epoch);
+        self.copying = None;
+    }
+
+    /// The rung fires may not pass while a raise's copy is the engine's to
+    /// take; `None` when none is.
+    #[must_use]
+    pub fn copying(&self) -> Option<u32> {
+        self.copying
     }
 
     /// What raising the activation to `rung` moves: the state in its span,

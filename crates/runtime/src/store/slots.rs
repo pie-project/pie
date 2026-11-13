@@ -1173,6 +1173,13 @@ impl SlotPool {
     }
 
     /// Every fire through `epoch` has retired: what waited on them is free.
+    /// The chunks fenced until `from` stay fenced until `to` instead.
+    pub fn refence(&mut self, from: u64, to: u64) {
+        if let Some(chunks) = self.fences.remove(&from) {
+            self.fences.entry(to).or_default().extend(chunks);
+        }
+    }
+
     pub fn retire_through(&mut self, epoch: u64) {
         self.retired = self.retired.max(epoch);
         let later = self.fences.split_off(&(epoch.saturating_add(1)));
