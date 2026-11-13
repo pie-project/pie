@@ -422,12 +422,12 @@ fn an_fp4_or_affine_select_lands_the_same_bits_through_any_table() {
                 routes: &r,
                 y,
             };
-            // An affine bank's arms read a host table as a located one;
-            // MXFP4's batch and matrix-core arms leave it to the stream.
-            let host = if bits == 4 {
-                Host::Same
-            } else {
+            // An affine or MXFP4 bank's arms read a host table as a located
+            // one; eight-bit codes have the stream alone.
+            let host = if bits == 8 {
                 Host::Stream(&stream)
+            } else {
+                Host::Same
             };
             same_bits(&g, &case, &ctx, host, |at, tables| {
                 let mut y = y;
