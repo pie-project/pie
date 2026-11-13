@@ -71,6 +71,58 @@ pub struct InstanceBinding {
     /// source ([`crate::ports::engine_resolves`]).
     #[serde(default)]
     pub device_resolved: eta_ir::registry::PortMask,
+    /// The `Instance` slots the runtime took for this instance's tables, as
+    /// many as [`ProgramFacts::instance`] states. Empty where the program's
+    /// facts state none: the engine then places the tables itself.
+    #[serde(default)]
+    pub instance_slots: Vec<u32>,
+    /// The `Channel` slots of each ring this instance holds itself, one
+    /// entry per [`ProgramFacts::rings`] entry the binding does not cover
+    /// with a registered channel in `channels`.
+    #[serde(default)]
+    pub ring_slots: Vec<RingSlots>,
+}
+
+/// What an instance of a registered program holds in the pool, beside the
+/// fire's bytes (REDESIGN 2.6, `new-memory/STATE-ROLES.md`). The engine
+/// counts slots with the slot bytes it stated for the `Instance` and
+/// `Channel` shapes in [`crate::chunk::ChunkFacts`]; an engine that states
+/// neither shape returns the default, and keeps the tables and rings itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramFacts {
+    /// The instance's bind-time launch tables.
+    pub instance: Footprint,
+    /// The rings the program declares, by its channel index. A binding
+    /// that names a registered channel for one holds no slots for it.
+    pub rings: Vec<RingFacts>,
+}
+
+/// An item's bytes and the slots of its role that hold them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Footprint {
+    pub bytes: u64,
+    pub slots: u32,
+}
+
+/// One ring: `capacity + 1` cells of `cell_bytes` each (padded to the
+/// engine's stride) and the head / tail words, in `footprint.slots`
+/// `Channel` slots. Cells are packed whole into a slot where one fits, so a
+/// slot count is not always `ceil(bytes / slot_bytes)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RingFacts {
+    /// The program's channel index.
+    pub channel: u32,
+    pub cell_bytes: u64,
+    pub capacity: u32,
+    pub footprint: Footprint,
+}
+
+/// The `Channel` slots the runtime took for one of an instance's rings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RingSlots {
+    /// The program's channel index ([`RingFacts::channel`]).
+    pub channel: u32,
+    pub slots: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

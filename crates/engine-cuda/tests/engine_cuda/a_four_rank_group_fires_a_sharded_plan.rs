@@ -289,6 +289,7 @@ fn four_ranks_land_what_one_rank_lands() {
                     extern_dir: None,
                     capacity: 2,
                     extern_name: Vec::new(),
+                    slots: Vec::new(),
                 })
                 .expect("the channel registers");
             id
@@ -302,6 +303,8 @@ fn four_ranks_land_what_one_rank_lands() {
                 seeds: Vec::new(),
                 geometry: GeometryClass::Host,
                 device_resolved: Default::default(),
+                instance_slots: Vec::new(),
+                ring_slots: Vec::new(),
                 extents: BindExtents {
                     row_count: n,
                     token_count: n,

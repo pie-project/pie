@@ -224,6 +224,30 @@ pub enum SlotRole {
     /// slot `(s - base) / tokens` of the lane's `RsVerb::Buffer::pages`, at
     /// row `(s - base) % tokens`.
     RsBuffer,
+    /// One guest instance's bind-time launch tables (a fixed shape): an
+    /// instance of `n` slots holds bytes `[k * slot_bytes, (k + 1) *
+    /// slot_bytes)` of its tables in slot `k` of
+    /// [`crate::program::InstanceBinding::instance_slots`].
+    Instance,
+    /// One channel's ring (a fixed shape): its cells and head / tail words,
+    /// at the slots [`crate::program::RingFacts`] states, in the order of
+    /// [`crate::program::RingSlots::slots`] or
+    /// [`crate::channel::ChannelRegistration::slots`].
+    Channel,
+}
+
+impl SlotRole {
+    /// Whether the slot's bytes can be rebuilt from the tokens the runtime
+    /// holds. A slot that is not may be parked on another tier (copied out
+    /// and back to any slot) but never dropped: an instance's tables and a
+    /// ring's unread cells exist nowhere else.
+    #[must_use]
+    pub fn replayable(self) -> bool {
+        match self {
+            SlotRole::State | SlotRole::RsBuffer => true,
+            SlotRole::Instance | SlotRole::Channel => false,
+        }
+    }
 }
 
 /// A shape's own chunks on each tier, and the id the engine numbers the
@@ -785,4 +809,17 @@ pub fn fit(
         });
     }
     Ok(u32::try_from(chunks).unwrap_or(u32::MAX))
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::SlotRole;
+
+    #[test]
+    fn only_state_the_tokens_rebuild_is_replayable() {
+        assert!(SlotRole::State.replayable());
+        assert!(SlotRole::RsBuffer.replayable());
+        assert!(!SlotRole::Instance.replayable());
+        assert!(!SlotRole::Channel.replayable());
+    }
 }
