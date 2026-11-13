@@ -238,6 +238,10 @@ impl Pipelines {
         let mut binds = self.binds.borrow_mut();
         if binds.groups.len() >= BIND_CACHE_CAP {
             binds.groups.clear();
+            // The groups that read the earlier chunks are gone: keep the one
+            // the next uniform is written to.
+            let from = binds.chunks.len().saturating_sub(1);
+            binds.chunks.drain(..from);
             binds.used = 0;
         }
         let uniform = pipeline.uniform.map(|binding| {

@@ -16,6 +16,9 @@ pub(crate) struct Raw {
     pub(crate) buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     pub(crate) size: u64,
+    /// What the driver took for it (its requirement, at least `size`):
+    /// what `Core::allocated` counts.
+    charged: u64,
     pub(crate) mapped: Option<NonNull<u8>>,
     pub(crate) kind: Memory,
 }
@@ -141,6 +144,7 @@ impl Raw {
             buffer,
             memory,
             size,
+            charged: need.size,
             mapped,
             kind,
         }))
@@ -290,7 +294,7 @@ impl Drop for Raw {
         }
         self.core
             .allocated
-            .fetch_sub(self.size, std::sync::atomic::Ordering::Relaxed);
+            .fetch_sub(self.charged, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
