@@ -60,6 +60,17 @@ impl SharedGrow {
     /// of room waits on the room the asking pass has the planner free; one
     /// to a rung the engine has not armed waits on its capture
     /// ([`super::rung_goal`]), the walk looking again each poll.
+    /// The rows the walk holds the rung to: what passes ask, and never
+    /// fewer than the widest decode fire (the engine's lane count), whose
+    /// frames the scheduler holds rather than cuts: a rung under it would
+    /// leave a decode batch waiting on a raise nobody funds.
+    fn walk_rows(&self) -> u32 {
+        let lanes = crate::engine::get_spec(self.engine).map_or(0, |spec| {
+            u32::try_from(spec.limits.max_forward_requests).unwrap_or(u32::MAX)
+        });
+        super::wanted_rows(self.engine).max(lanes)
+    }
+
     async fn walk_rung(&self) {
         loop {
             let (current, retired) = self.epochs();
@@ -71,7 +82,7 @@ impl SharedGrow {
                 if pool.copying().is_some() {
                     return;
                 }
-                let goal = super::rung_goal(&pool, self.engine, super::wanted_rows(self.engine));
+                let goal = super::rung_goal(&pool, self.engine, self.walk_rows());
                 let step = self.rung_walk.lock().unwrap().step(
                     &pool,
                     goal,
@@ -117,7 +128,7 @@ impl SharedGrow {
                         // is not taken.
                         let _pool = self.shared.lock().unwrap();
                         let now = super::fire_cap(self.engine);
-                        if tokens < now && super::wanted_rows(self.engine) > tokens {
+                        if tokens < now && self.walk_rows() > tokens {
                             continue;
                         }
                         super::set_fire_cap(self.engine, tokens);
