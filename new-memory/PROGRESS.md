@@ -1441,7 +1441,8 @@ The `new-memory/` directory is bookkeeping and is removed before anything lands 
   was refused now walks before capturing (affine 138 -> 154/154 armed).
 - M115 re-measures on L40S: affine Qwen3.6 with the bodies stretch 154/154 at the full lattice, prefill +2.1% / +0.5%
   (was +10 / +4%), c256 +21%, boot 16 s vs 64; FP8 30B pages 3600 / seated 7 = main's admission (c64 407 vs 403).
-  Open: FP8 prefill 2048 121.6 vs main 91.4 ms (fit now serves 1024 rows x 128 lanes).
+  FP8 prefill 2048 on clean HEAD builds: 89.2 ms vs main 91.4 (the 121.6 ms reading came from a stale WIP build;
+  refit is identical pre/post M115 and fire_lanes).
 - `sc/oversub-3` (62d689db5): Held::park gives the state set's owner hold back like the kv set (handles holding a
   hybrid's state kept a finished process's pages counted as returning -> no eviction ever planned). t_evict 4/4.
 - M116 follow-up (`sc/engine-gpu-2`, 6 commits, -10.3k lines): every Vulkan / wgpu integration test body lives once in
