@@ -197,6 +197,13 @@ impl Arming {
         let arming = matches!(state, State::Arming);
         if arming {
             set(engine_idx, room, true);
+            tracing::info!(
+                engine = engine_idx,
+                armed_through = live.armed_through(),
+                pages = room.pages,
+                records = room.records,
+                "the lane arms the rest of the rungs, a composition at a time"
+            );
         }
         Self {
             engine_idx,
@@ -251,6 +258,13 @@ impl Arming {
             return Step::Waiting;
         };
         self.retry_at = None;
+        tracing::debug!(
+            engine = self.engine_idx,
+            idle,
+            pages = ?lent.lease.pages,
+            records = ?lent.lease.records,
+            "an arming step is lent"
+        );
         let armed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             engine.arm_step(&lent.lease)
         }));

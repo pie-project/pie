@@ -80,8 +80,8 @@ impl Live {
     }
 
     /// The engine holds `bytes` outside the pool's cache rows for its fires
-    /// and bodies now; the runtime's pool takes no more than what is left
-    /// beside it and [`Live::outside`].
+    /// and bodies now, inside the range it stated at load: the runtime's
+    /// pool takes no more than the range less this.
     pub fn set_held(&self, bytes: u64) {
         self.0.held.store(bytes, Ordering::Release);
     }
