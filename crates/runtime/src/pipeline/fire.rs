@@ -581,19 +581,21 @@ fn prefill_share(page: u32, engine: usize) -> u32 {
     })
 }
 
-/// The rows a piece of a prompt on `engine` would take were the pool at its
-/// largest activation rung: what a pass asks the rung for
+/// The rows a fire on `engine` takes to carry `rows` of a prompt whole
+/// beside the decode row each other live lane spends in it
+/// ([`crate::inferlet::host::model::prefill_share`]), up to what the
+/// largest activation rung holds: what a pass asks the rung for
 /// ([`crate::store::shared::want_rows`]).
-fn prefill_want(page: u32, engine: usize) -> u32 {
-    if let Some(rows) = fire_rows() {
-        return rows;
+fn prefill_want(rows: usize, engine: usize) -> u32 {
+    if let Some(fire) = fire_rows() {
+        return fire.min(u32::try_from(rows).unwrap_or(u32::MAX));
     }
-    crate::engine::get_spec(engine).map_or(u32::MAX, |spec| {
-        crate::inferlet::host::model::prefill_share(
-            crate::inferlet::host::model::prefill_budget(spec.limits).max(1),
-            crate::inferlet::process::live_count(),
-            page as usize,
-        )
+    let live = crate::inferlet::process::live_count();
+    let wide = rows.saturating_add(live.saturating_sub(1));
+    let wide = u32::try_from(wide).unwrap_or(u32::MAX);
+    crate::engine::get_spec(engine).map_or(wide, |spec| {
+        let budget = crate::inferlet::host::model::prefill_budget(spec.limits).max(1);
+        wide.min(u32::try_from(budget).unwrap_or(u32::MAX))
     })
 }
 
@@ -2933,14 +2935,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .iter()
             .map(|lane| lane.tokens.len())
             .sum::<usize>();
-        // A prompt asks the activation rung for the rows its pieces take at
-        // the largest rung (SPEC decision 6, by demand), from before it is
-        // cut until its last piece settles: the pool raises toward it where
-        // room allows, and lowers once no pass asks past its smallest rung,
-        // so no piece cut wider waits on a lowered rung.
-        let wanted = u32::try_from(rows_total)
-            .unwrap_or(u32::MAX)
-            .min(prefill_want(page_size, engine));
+        // A prompt asks the activation rung for the rows a fire takes to
+        // carry it whole beside the other live lanes' decodes (SPEC decision
+        // 6, by demand), from before it is cut until its last piece settles:
+        // the pool raises toward it where room allows, and lowers once no
+        // pass asks past its smallest rung, so no piece cut wider waits on a
+        // lowered rung.
+        let wanted = prefill_want(rows_total, engine);
         let rung_want = (rows_total > RUNG_WANT_FROM).then(|| {
             let want = crate::store::shared::want_rows(engine, wanted);
             if let Some(shared) = stores.shared.as_ref() {
