@@ -170,7 +170,7 @@ fn check(
             let both = if ratio > 0 { vec![win, ent] } else { vec![win] };
             let outs = [(o_at, n * H * D * 2)];
             agrees(&mut gpu, &what, &both, &[], &outs, |_, p, _| {
-                let pooled = (ratio > 0).then_some(Pooled {
+                let pooled = (ratio > 0).then(|| Pooled {
                     entries: &p[1],
                     ratio,
                     selection,
