@@ -517,7 +517,9 @@ impl Engine for Cuda {
             .map_or_else(Default::default, Shell::arming_room)
     }
 
-    fn arm_step(&mut self, lent: &engine::live::ArmingLease) -> EngineResult<bool> {
+    fn arm_step(&mut self, lent: &engine::live::ArmingLease, want: u32) -> EngineResult<bool> {
+        // The lattice arms smallest first whatever is asked, for now.
+        let _ = want;
         match self.shell.as_mut() {
             Some(shell) => shell.arm_step(lent).map_err(fault),
             None => Ok(false),
