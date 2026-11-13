@@ -1030,7 +1030,7 @@ impl Shell {
                 paging,
                 budgets.tokens.max_tokens,
                 budgets.tokens.max_lanes,
-                &mut pools,
+                &pools,
             )?;
         // Each row-streamed table's cache opens over its host copy.
         let hosts: Vec<(u32, u64)> = pools
@@ -1425,6 +1425,9 @@ impl Shell {
                 .map(|slab| (slab.key, slab.asked))
                 .collect();
             let workspace = kernels_cuda::jit::Slabs::placed_bytes(&placed) as u64;
+            if let Some(buffers) = shell.buffers.as_mut() {
+                buffers.lay_reach(&mut shell.pools, true)?;
+            }
             let at = shell.pools.widen_activation(workspace)?;
             if boot.knobs.diagnostics.arm_trace {
                 eprintln!(
@@ -1463,6 +1466,13 @@ impl Shell {
                     shell.pools.fresh()
                 );
             }
+        }
+        // A load that walked nothing lays the rs scratch for the most any
+        // fire may ask.
+        if shell.workspace.is_none()
+            && let Some(buffers) = shell.buffers.as_mut()
+        {
+            buffers.lay_reach(&mut shell.pools, false)?;
         }
         // The most a profile's allowance may stretch to while arming.
         shell.bodies_ceiling = usize::try_from(fitted.bodies).unwrap_or(usize::MAX);
