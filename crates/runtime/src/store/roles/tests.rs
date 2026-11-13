@@ -157,6 +157,7 @@ impl Engine for FakeEngine {
             instance: Footprint {
                 bytes: 5000,
                 slots: 3,
+                contiguous: false,
             },
             rings: vec![
                 RingFacts {
@@ -166,6 +167,7 @@ impl Engine for FakeEngine {
                     footprint: Footprint {
                         bytes: 352,
                         slots: 1,
+                        contiguous: false,
                     },
                 },
                 RingFacts {
@@ -175,6 +177,7 @@ impl Engine for FakeEngine {
                     footprint: Footprint {
                         bytes: 1832,
                         slots: 3,
+                        contiguous: false,
                     },
                 },
             ],
@@ -192,6 +195,7 @@ impl Engine for FakeEngine {
             footprint: Footprint {
                 bytes: 1376,
                 slots: 2,
+                contiguous: false,
             },
         }))
     }
