@@ -1289,6 +1289,7 @@ impl Shell {
             arm_stepped: boot.knobs.arm_stepped,
             stepping: None,
             lent: None,
+            card: (0, 0, 0),
             live: engine::live::Live::armed(),
             segments: std::collections::HashMap::new(),
             windows_memo: Vec::new(),
@@ -1641,6 +1642,12 @@ impl Staged {
         let fitted = shell
             .pools
             .fit_the_card(bodies, held_for_fires, settled, false, &resident)?;
+        if stepping {
+            // The runtime is stated what the settled fit may come to, and
+            // keeps the pool under it by what this fit holds back.
+            let more = shell.pools.activation_unheld_bytes().saturating_add(fitted.bodies);
+            shell.pools.state_most(more);
+        }
         // A load that arms later may have had its range reserved anew by
         // this fit: the workspaces are laid where it now lies.
         shell.lay_workspace()?;
@@ -1674,6 +1681,8 @@ impl Staged {
                     .join(" ")
             );
         }
+        shell.card = (device_total, free_before, held_for_fires);
+        shell.state_live();
         if rank != 0 {
             shell.programs.set_shadow(true);
         }
@@ -1744,6 +1753,25 @@ fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
 /// The device's memory as this load holds it ([`engine::memory`]): each
 /// owner under its class, over what the device has for this process (all of
 /// it but what others held before the load began).
+impl Shell {
+    /// States what the runtime keeps the pool under the chunks it was
+    /// stated ([`engine::live::Live::set_held`]): what the fit holds back
+    /// while rungs are left to arm, none once it has settled.
+    pub(super) fn state_live(&self) {
+        self.live.set_held(self.pools.kept_back_bytes());
+    }
+
+    /// The fit once the last rung is armed: the activation at its high
+    /// water and the bodies at what they take, the rest the cache rows'.
+    pub(super) fn settle(&mut self) -> Result<()> {
+        let resident = footprint(self, self.card.0, self.card.1);
+        self.pools
+            .fit_the_card(0, self.card.2, true, false, &resident)?;
+        self.state_live();
+        Ok(())
+    }
+}
+
 fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory::Ledger {
     use engine::memory::{Class, Ledger};
     let held = footprint(shell, device_total, free_before);
