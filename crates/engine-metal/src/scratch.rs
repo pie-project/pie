@@ -92,6 +92,8 @@ struct Register {
 #[derive(Debug)]
 pub struct Scratch {
     plane: Buffer,
+    /// The n-gram hash constants (`ple`'s rooms), model bytes.
+    constants: Buffer,
 
     precast: Option<Room>,
     partials: Option<Room>,
@@ -348,8 +350,11 @@ impl Scratch {
             bytes,
         });
 
-        let mut at = copy.map_or(union, |room| room.at + room.bytes);
+        let at = copy.map_or(union, |room| room.at + room.bytes);
 
+        // The n-gram hash constants are the model's, not a fire's: they lie
+        // in a buffer of their own, which no carve of the plane overwrites.
+        let mut constant_at = 0u64;
         let mut ple: Vec<PleHash> = Vec::new();
         for node in &trace.nodes {
             let Operation::Gather(
@@ -373,18 +378,20 @@ impl Scratch {
             if key.is_empty() || ple.iter().any(|held| held.key == key) {
                 continue;
             }
-            let room = Room::lay(&mut at, 1, key.len() as u64, Dtype::U64);
+            let room = Room::lay(&mut constant_at, 1, key.len() as u64, Dtype::U64);
             ple.push(PleHash { key, room });
         }
 
-        let mut plane = Buffer::zeroed(device, at)?;
+        let plane = Buffer::zeroed(device, at)?;
+        let mut constants = Buffer::zeroed(device, constant_at)?;
         for hashing in &ple {
             let bytes: Vec<u8> = hashing.key.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            plane.write(hashing.room.at, &bytes)?;
+            constants.write(hashing.room.at, &bytes)?;
         }
 
         Ok(Scratch {
             plane,
+            constants,
             precast,
             partials,
             routed,
@@ -401,6 +408,12 @@ impl Scratch {
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.plane.bytes()
+    }
+
+    /// The model's constants kept beside the plane.
+    #[must_use]
+    pub fn constant_bytes(&self) -> u64 {
+        self.constants.bytes()
     }
 
     #[must_use]
@@ -548,7 +561,7 @@ impl Scratch {
     ) -> Option<Result<Tensor>> {
         let want = ngram::hash_constants(mults, primes, offsets);
         let held = self.ple.iter().find(|h| *h.key == *want)?;
-        Some(held.room.bind(handles, &self.plane))
+        Some(held.room.bind(handles, &self.constants))
     }
 }
 

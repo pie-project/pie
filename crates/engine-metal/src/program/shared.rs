@@ -31,6 +31,11 @@ unsafe impl Send for SharedRing {}
 unsafe impl Sync for SharedRing {}
 
 impl SharedRing {
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.slab.bytes()
+    }
+
     pub fn open(device: &Context, shape: ChannelShape) -> Result<SharedRing> {
         let cells = u64::from(shape.capacity) + 1;
         let bytes = cells

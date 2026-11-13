@@ -25,6 +25,7 @@ mod the_kv_codec_round_trips;
 mod the_kv_pool_grows_in_place;
 mod the_kv_rotation_is_the_unrotated_forward;
 mod the_kv_write_round_trips;
+mod the_ledger_accounts_for_the_device;
 mod the_mpp_prefill_matches_affine_dots;
 mod the_mpp_routed_matmul_matches_affine_dots;
 mod the_mpp_routed_mxfp4_matmul_matches_its_dots;

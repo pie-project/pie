@@ -44,11 +44,8 @@ pub struct Boot<'a> {
     pub context: u32,
     pub slots: u32,
     /// `[model] device_kv_budget`: the bytes the kv pool and the state slots
-    /// beside it take; `None` fills what `memory_share` leaves.
+    /// beside it take; `None` fills what the measured capacity leaves.
     pub kv_budget: Option<u64>,
-    /// `[model] device_memory_share`: the share of the device's working set
-    /// this load may wire.
-    pub memory_share: f64,
     pub runahead: Runahead,
     pub residency: Plan,
     /// `$PIE_HOME/profiles`, where a user's device profiles live; `None`
@@ -256,6 +253,9 @@ pub struct Attached {
 pub struct Shell {
     tuning: kernels_metal::Tuning,
     device: Context,
+    /// What the device held for this process before the load: the ledger's
+    /// `outside`.
+    outside: u64,
     keepalive: Option<crate::keepalive::KeepAlive>,
     pipelines: Pipelines,
     handles: Handles,
@@ -552,7 +552,9 @@ impl Shell {
             ),
             ..boot
         };
-        let elsewhere = device.held_elsewhere();
+        // What the device holds for this process before the load places
+        // anything: the context, queues and libraries (`outside`).
+        let outside = device.allocated();
         let keepalive = if crate::keepalive::KeepAlive::wanted()
             && *chip.get::<crate::chip::KeepAliveSpin>() == crate::chip::KeepAliveSpin::Spin
         {
@@ -585,7 +587,7 @@ impl Shell {
             device,
             chip,
             tuning,
-            elsewhere,
+            outside,
             keepalive,
             budgets,
             compiled,
@@ -599,7 +601,8 @@ pub struct PreparedLoad<'a> {
     device: Context,
     chip: profile::Profile,
     tuning: kernels_metal::Tuning,
-    elsewhere: u64,
+    /// What the device held for this process before the load.
+    outside: u64,
     keepalive: Option<crate::keepalive::KeepAlive>,
     budgets: Budgets,
     compiled: CompiledModel,
@@ -624,7 +627,7 @@ impl PreparedLoad<'_> {
             device,
             chip,
             tuning,
-            elsewhere,
+            outside,
             keepalive,
             budgets,
             compiled,
@@ -769,10 +772,9 @@ impl PreparedLoad<'_> {
         handles.seal();
 
         // The kv pool and the recurrent-state buffers beside it: both are
-        // wired for the life of the load, in what `memory_share` leaves of the
-        // room the device had when the load began, once the weights, the arena
-        // scratch and the driver's floor are placed. A stated `kv_budget` is
-        // its bytes; none takes all of the room.
+        // wired for the life of the load, in what the device's measured
+        // capacity leaves once the model's bytes and one fire's are placed.
+        // A stated `kv_budget` is its bytes; none takes all of the room.
         let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
         let rows = crate::store::Rows::plan(&boot.trace, &recipe, &facts, rs_layout.as_deref())?;
         let page_size = if rows.tokens > 0 {
@@ -781,144 +783,34 @@ impl PreparedLoad<'_> {
             boot.page_size
         };
         let paging_at = |pages: u64, slots: u32| Paging::of(page_size, boot.context, slots, pages);
-        let accounting = |pool: u64| {
-            crate::store::accounting::Accounting::with_scratch(
-                device.working_set(),
-                elsewhere,
-                boot.memory_share,
-                weights.bytes(),
-                compiled.arena.bytes,
-                pool,
-            )
-            .with_streamable(weights.filed_bytes())
-        };
-        // One chunk pool holds every kv page and every record (the rs
-        // buffer's rows inside it), in what the room holds of whole chunks.
-        let (paging, pool_bytes, layout) = {
-            let seated = paging_at(1, boot.slots)?;
-            let bytes = [rows.list_bytes, rows.fixed_bytes];
-            let chunk = rows.chunk_bytes;
-            // A seat's slots of each window list: its context in `T_w`-token
-            // slots.
-            let window_pages: Vec<u32> = rows
-                .windows
+        // The fire's buffers a load places beside the weights, reserved
+        // before the pool so the pool is sized by what they leave: they read
+        // a seat's pages, never the pool's whole count.
+        let seated_paging = paging_at(1, boot.slots)?;
+        let bands: Vec<u32> = if rows.bands.is_empty() {
+            vec![1]
+        } else {
+            rows.bands
                 .iter()
-                .map(|w| seated.context().div_ceil(w.tokens.max(1)).max(1))
-                .collect();
-            let window_chunks: u32 = rows
-                .windows
-                .iter()
-                .zip(&window_pages)
-                .map(|(w, pages)| {
-                    chunk.checked_div(w.bytes).map_or(0, |per| {
-                        pages.div_ceil(u32::try_from(per).unwrap_or(1).max(1))
-                    })
-                })
-                .sum();
-            let least = Layout::least_chunks(chunk, bytes, rows.pieces, seated.pages_per_slot)
-                + window_chunks;
-            // The row-streamed tables' blocks come out of this room as the
-            // runtime names them; their own copies are counted in the
-            // weights until a held set gives them back.
-            let room = boot.kv_budget.unwrap_or_else(|| accounting(0).pool);
-            let total = engine::chunk::fit(room, chunk, 0, least)
-                .map_err(|short| Fault::Residency(short.to_string()))?;
-            // The pool is one buffer.
-            let binds = u32::try_from(device.max_buffer() / chunk).unwrap_or(u32::MAX);
-            if binds < least {
-                return Err(Fault::Residency(format!(
-                    "one working set takes {least} chunks of {chunk} bytes, and this device \
-                     binds one buffer of {} MiB",
-                    device.max_buffer() >> 20
-                )));
-            }
-            let total = total.min(binds);
-            let mut layout = Layout::new(
-                chunk,
-                total,
-                crate::store::pool::segment_chunks(chunk),
-                page_size,
-                bytes,
-                rows.pieces,
-                boot.slots,
-                seated.pages_per_slot,
-            )?;
-            for (window, pages) in rows.windows.iter().zip(&window_pages) {
-                layout = layout.with_window(window.bytes, window.rows, window.tokens, *pages)?;
-            }
-            let layout = layout.with_rs(
-                rows.rs.as_ref().map_or(0, |rs| rs.bytes),
-                rows.rs.as_ref().map_or(0, |rs| rs.tokens),
-                seated.pages_per_slot,
-            )?;
-            let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
-            (
-                paging_at(pages, boot.slots)?,
-                chunk * u64::from(total),
-                layout,
-            )
+                .map(|band| u32::try_from(band.len()).unwrap_or(u32::MAX))
+                .collect()
         };
-
-        {
-            let acct = accounting(pool_bytes);
-            acct.admit(boot.memory_share)?;
-            if crate::diag::on().tier_trace {
-                eprintln!(
-                    "residency: weights {} scratch {} kv {} floor {}, working set {}",
-                    acct.weights, acct.scratch, acct.minimum, acct.floor, acct.working_set
-                );
-            }
-        }
-        let arena = Arena::reserve(&device, &compiled.arena)?;
-        let arena_ladder = poem_compiler::arena_ladder(&boot.trace, &budgets, &compiled)?;
-        let rs_at = rows.rs.clone();
-        let mut pools = Pools::reserve(&device, rows, layout, paging)?;
-        pools.seat_weights(weight_caches);
-        // The null chunk and the floor stand from the load on.
-        pools.commit_segments(1)?;
-        // A load whose weights the runtime holds seats every atom in pool
-        // slots itself, from the serving file where it reads them there,
-        // and states where (`WeightShape::seated`); the runtime adopts it.
-        if boot.residency.weights_held() && !pools.weight_caches().is_empty() {
-            match pools.preseat_plan() {
-                Some(plan) => {
-                    let started = std::time::Instant::now();
-                    let mut frame = device.frame()?;
-                    pools.preseat_weights(&mut frame, &plan)?;
-                    frame.commit()?;
-                    pools.restage_weights()?;
-                    tracing::info!(
-                        atoms = plan.resident.len(),
-                        shapes = pools.weight_caches().len(),
-                        ms = started.elapsed().as_millis() as u64,
-                        "the held weights are seated in the pool at load"
-                    );
-                }
-                None => tracing::info!(
-                    "the pool cannot hold every weight atom beside the seats: the held \
-                     weights are read in place until the runtime names their slots"
-                ),
-            }
-        }
-        Shell::hold_weight_hosts(&device, &handles, &mut weights, &mut pools)?;
-        let rs_buffers = rs_at.map(|at| {
-            crate::rs::Buffers::in_pool(
-                at.plane_at,
-                at.tokens,
-                pools.view().clone(),
-                layout.rs_stride(),
-            )
-        });
+        let window_pages_per_slot = rows
+            .windows
+            .iter()
+            .map(|w| seated_paging.context().div_ceil(w.tokens.max(1)).max(1))
+            .max()
+            .unwrap_or(0);
         let scratch = Scratch::reserve(
             &device,
             &boot.trace,
             weights.table(),
             &compiled,
             &budgets,
-            paging,
+            seated_paging,
             &tuning,
         )?;
-        let page_tables = pools.tables().len();
+        let page_tables = rows.tables.len();
         let arms = boot.runahead.frames().max(1);
         let gathers = fallback::gathers(&boot.trace, &compiled);
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
@@ -995,7 +887,7 @@ impl PreparedLoad<'_> {
                 Inputs::reserve(
                     &device,
                     &boot.budget,
-                    paging,
+                    seated_paging,
                     page_tables,
                     compiled.classes.classes.len(),
                     gathers,
@@ -1004,8 +896,8 @@ impl PreparedLoad<'_> {
                     states_mrope,
                     &seats,
                     selections,
-                    &pools.bands(),
-                    pools.window_pages_per_slot(),
+                    &bands,
+                    window_pages_per_slot,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1067,6 +959,149 @@ impl PreparedLoad<'_> {
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
 
+        // What the load places beside the pool, by class: the model's
+        // weights and constants, and one fire's arena, staged inputs,
+        // readout and kernel scratch (the Neural Engine's surfaces split
+        // between the two).
+        let (ane_model, ane_fire) = ane.as_ref().map_or((0, 0), crate::ane::Ane::bytes);
+        let model_bytes = weights.bytes() + scratch.constant_bytes() + ane_model;
+        let fire_bytes = compiled.arena.bytes
+            + scratch.bytes()
+            + inputs.iter().map(Inputs::bytes).sum::<u64>()
+            + readout.iter().map(Buffer::bytes).sum::<u64>()
+            + ane_fire;
+        let accounting = |pool: u64| {
+            crate::store::accounting::Accounting::of(
+                device.working_set(),
+                outside,
+                model_bytes,
+                fire_bytes,
+                pool,
+            )
+            .with_streamable(weights.filed_bytes())
+        };
+        // One chunk pool holds every kv page and every record (the rs
+        // buffer's rows inside it), in what the room holds of whole chunks.
+        let (paging, pool_bytes, layout) = {
+            let seated = paging_at(1, boot.slots)?;
+            let bytes = [rows.list_bytes, rows.fixed_bytes];
+            let chunk = rows.chunk_bytes;
+            // A seat's slots of each window list: its context in `T_w`-token
+            // slots.
+            let window_pages: Vec<u32> = rows
+                .windows
+                .iter()
+                .map(|w| seated.context().div_ceil(w.tokens.max(1)).max(1))
+                .collect();
+            let window_chunks: u32 = rows
+                .windows
+                .iter()
+                .zip(&window_pages)
+                .map(|(w, pages)| {
+                    chunk.checked_div(w.bytes).map_or(0, |per| {
+                        pages.div_ceil(u32::try_from(per).unwrap_or(1).max(1))
+                    })
+                })
+                .sum();
+            let least = Layout::least_chunks(chunk, bytes, rows.pieces, seated.pages_per_slot)
+                + window_chunks;
+            // The row-streamed tables' blocks come out of this room as the
+            // runtime names them; their own copies are counted in the
+            // weights until a held set gives them back.
+            let room = boot.kv_budget.unwrap_or_else(|| accounting(0).pool);
+            let total = engine::chunk::fit(room, chunk, 0, least)
+                .map_err(|short| Fault::Residency(short.to_string()))?;
+            // The pool is one buffer.
+            let binds = u32::try_from(device.max_buffer() / chunk).unwrap_or(u32::MAX);
+            if binds < least {
+                return Err(Fault::Residency(format!(
+                    "one working set takes {least} chunks of {chunk} bytes, and this device \
+                     binds one buffer of {} MiB",
+                    device.max_buffer() >> 20
+                )));
+            }
+            let total = total.min(binds);
+            let mut layout = Layout::new(
+                chunk,
+                total,
+                crate::store::pool::segment_chunks(chunk),
+                page_size,
+                bytes,
+                rows.pieces,
+                boot.slots,
+                seated.pages_per_slot,
+            )?;
+            for (window, pages) in rows.windows.iter().zip(&window_pages) {
+                layout = layout.with_window(window.bytes, window.rows, window.tokens, *pages)?;
+            }
+            let layout = layout.with_rs(
+                rows.rs.as_ref().map_or(0, |rs| rs.bytes),
+                rows.rs.as_ref().map_or(0, |rs| rs.tokens),
+                seated.pages_per_slot,
+            )?;
+            let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
+            (
+                paging_at(pages, boot.slots)?,
+                chunk * u64::from(total),
+                layout,
+            )
+        };
+
+        {
+            let acct = accounting(pool_bytes);
+            acct.admit()?;
+            if crate::diag::on().tier_trace {
+                eprintln!(
+                    "residency: model {} fire {} kv {} of capacity {} (working set {}, outside {})",
+                    acct.weights,
+                    acct.fire,
+                    acct.minimum,
+                    acct.capacity,
+                    acct.working_set,
+                    acct.outside
+                );
+            }
+        }
+        let arena = Arena::reserve(&device, &compiled.arena)?;
+        let arena_ladder = poem_compiler::arena_ladder(&boot.trace, &budgets, &compiled)?;
+        let rs_at = rows.rs.clone();
+        let mut pools = Pools::reserve(&device, rows, layout, paging)?;
+        pools.seat_weights(weight_caches);
+        // The null chunk and the floor stand from the load on.
+        pools.commit_segments(1)?;
+        // A load whose weights the runtime holds seats every atom in pool
+        // slots itself, from the serving file where it reads them there,
+        // and states where (`WeightShape::seated`); the runtime adopts it.
+        if boot.residency.weights_held() && !pools.weight_caches().is_empty() {
+            match pools.preseat_plan() {
+                Some(plan) => {
+                    let started = std::time::Instant::now();
+                    let mut frame = device.frame()?;
+                    pools.preseat_weights(&mut frame, &plan)?;
+                    frame.commit()?;
+                    pools.restage_weights()?;
+                    tracing::info!(
+                        atoms = plan.resident.len(),
+                        shapes = pools.weight_caches().len(),
+                        ms = started.elapsed().as_millis() as u64,
+                        "the held weights are seated in the pool at load"
+                    );
+                }
+                None => tracing::info!(
+                    "the pool cannot hold every weight atom beside the seats: the held \
+                     weights are read in place until the runtime names their slots"
+                ),
+            }
+        }
+        Shell::hold_weight_hosts(&device, &handles, &mut weights, &mut pools)?;
+        let rs_buffers = rs_at.map(|at| {
+            crate::rs::Buffers::in_pool(
+                at.plane_at,
+                at.tokens,
+                pools.view().clone(),
+                layout.rs_stride(),
+            )
+        });
         let nan_flags = match crate::diag::on().nan_check {
             true => Some(Buffer::zeroed(
                 &device,
@@ -1077,6 +1112,7 @@ impl PreparedLoad<'_> {
         let shell = Shell {
             tuning,
             device,
+            outside,
             keepalive,
             pipelines: Pipelines::new(),
             handles,
@@ -1508,6 +1544,70 @@ impl Shell {
     #[must_use]
     pub fn working_set(&self) -> u64 {
         self.device.working_set()
+    }
+
+    /// The device's memory as one ledger, read off the owners that hold it
+    /// now: nothing is counted on the side, so it cannot drift from them.
+    /// `outside` is what the device held before the load; what the driver
+    /// takes since is what an [`Shell::audit`] finds beside the entries.
+    #[must_use]
+    pub fn ledger(&self) -> engine::memory::Ledger {
+        use engine::memory::Class::{Fire, Model, Outside, State};
+        let mut ledger =
+            engine::memory::Ledger::new(self.pools.layout().chunk_bytes, self.working_set());
+        let (ane_model, ane_fire) = self.ane.as_ref().map_or((0, 0), crate::ane::Ane::bytes);
+        let (guest_state, guest_fire) = self.programs.bytes();
+        let entries = [
+            (Outside, "before the load", self.outside),
+            (Model, "weights", self.weights.bytes()),
+            (Model, "weight cache tables", self.pools.table_bytes()),
+            (Model, "ngram constants", self.scratch.constant_bytes()),
+            (Model, "ane surfaces", ane_model),
+            (State, "pool", self.pools.committed_bytes()),
+            (State, "guest instances", guest_state),
+            (Fire, "arena", self.arena.mapped()),
+            (
+                Fire,
+                "inputs",
+                self.inputs.iter().map(Inputs::bytes).sum::<u64>(),
+            ),
+            (
+                Fire,
+                "group masks",
+                self.inputs
+                    .iter()
+                    .map(Inputs::group_mask_bytes)
+                    .sum::<u64>(),
+            ),
+            (
+                Fire,
+                "readout",
+                self.readout.iter().map(Buffer::bytes).sum::<u64>(),
+            ),
+            (Fire, "scratch", self.scratch.bytes()),
+            (
+                Fire,
+                "rs scratch",
+                self.rs_scratch.as_ref().map_or(0, Buffer::bytes),
+            ),
+            (Fire, "guest batches", guest_fire),
+            (Fire, "ane staging", ane_fire),
+            (
+                Fire,
+                "nan flags",
+                self.nan_flags.as_ref().map_or(0, Buffer::bytes),
+            ),
+        ];
+        for (class, owner, bytes) in entries {
+            ledger.enter(class, owner, bytes);
+        }
+        ledger
+    }
+
+    /// The ledger against what the device holds for this process now.
+    #[must_use]
+    pub fn audit(&self) -> engine::memory::Audit {
+        self.ledger().audit(self.device.allocated())
     }
 
     pub fn bind_thread(&self) -> Result<()> {

@@ -500,6 +500,13 @@ impl Inputs {
         self.store.bytes()
     }
 
+    /// The group mask buffer and every one it outgrew, which it keeps.
+    #[must_use]
+    pub fn group_mask_bytes(&self) -> u64 {
+        self.group_masks.as_ref().map_or(0, Buffer::bytes)
+            + self.outgrown.iter().map(Buffer::bytes).sum::<u64>()
+    }
+
     pub fn write(&mut self, handles: &crate::device::Handles, fire: &Fire<'_>) -> Result<Handles> {
         let rows = fire.tokens.len() as u32;
         let width = self.bands.iter().sum::<u32>().max(1);

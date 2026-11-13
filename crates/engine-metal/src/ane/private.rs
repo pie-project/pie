@@ -87,7 +87,7 @@ pub struct Private {
     /// How many projections have.
     /// The fewest rows handed over (`kernel.ane.min_rows`).
     min_rows: u32,
-    _buffers: Vec<Buffer>,
+    buffers: banks::Keep,
 }
 
 fn view(
@@ -96,7 +96,7 @@ fn view(
     surface: &Surface,
     rows: u32,
     width: u32,
-    keep: &mut Vec<Buffer>,
+    keep: &mut banks::Keep,
 ) -> Result<Tensor> {
     let at = std::ptr::NonNull::new(surface.base()).ok_or(Fault::Device {
         call: "IOSurfaceGetBaseAddress",
@@ -125,8 +125,9 @@ fn target(
     weights: &Surface,
     scale: &Surface,
     rows: u32,
-    keep: &mut Vec<Buffer>,
+    keep: &mut banks::Keep,
 ) -> Result<Target> {
+    keep.model += weights.bytes() + scale.bytes();
     Ok(Target {
         weights: view(device, handles, weights, rows, weights.stride(), keep)?,
         stride: weights.stride(),
@@ -167,7 +168,7 @@ fn mlp_site(
     common: &Common,
     mlps: &[Mlp],
     split: AneMlp,
-    keep: &mut Vec<Buffer>,
+    keep: &mut banks::Keep,
     keys: &mut BTreeMap<u32, Key>,
 ) -> Result<Option<MlpSite>> {
     let (hidden, intermediate) = (mlps[0].gate_up.codes.width, mlps[0].intermediate);
@@ -190,7 +191,7 @@ fn mlp_site(
         view(device, handles, &memory.partial, hidden + 1, MAX_ROWS, keep)?,
         memory.partial.stride() / 2,
     );
-    let set = |w: &ffn::Weights, keep: &mut Vec<Buffer>| -> Result<Set> {
+    let set = |w: &ffn::Weights, keep: &mut banks::Keep| -> Result<Set> {
         Ok(Set {
             gate: w
                 .gate
@@ -270,7 +271,7 @@ fn projection_site(
     (k, n): (u32, u32),
     projections: &[banks::Projection],
     percent: u32,
-    keep: &mut Vec<Buffer>,
+    keep: &mut banks::Keep,
     keys: &mut BTreeMap<u32, Key>,
 ) -> Result<Option<ProjectionSite>> {
     let Ok(shape) = linear::Shape::new(k, n, share(n / ffn::UNIT, percent)) else {
@@ -292,7 +293,7 @@ fn projection_site(
         view(device, handles, &memory.partial, shape.ane, MAX_ROWS, keep)?,
         memory.partial.stride() / 2,
     );
-    let set = |w: &linear::Weights, keep: &mut Vec<Buffer>| -> Result<Vec<Target>> {
+    let set = |w: &linear::Weights, keep: &mut banks::Keep| -> Result<Vec<Target>> {
         w.w.iter()
             .map(|s| target(device, handles, s, &w.scale, shape.ane, keep))
             .collect()
@@ -422,7 +423,7 @@ pub fn load(
     min_rows: u32,
 ) -> Result<Option<Private>> {
     use objc2_metal::MTLDevice;
-    let mut keep = Vec::new();
+    let mut keep = banks::Keep::default();
     let signs = banks::staging(
         device,
         handles,
@@ -432,9 +433,9 @@ pub fn load(
         &mut keep,
     )?;
     let bytes: Vec<u8> = ffn::signs().iter().flat_map(|v| v.to_le_bytes()).collect();
-    banks::host(&keep[keep.len() - 1])?[..bytes.len()].copy_from_slice(&bytes);
+    banks::host(keep.last())?[..bytes.len()].copy_from_slice(&bytes);
     let status = banks::staging(device, handles, 1, 1, Dtype::U32, &mut keep)?;
-    let status_host = banks::host(&keep[keep.len() - 1])?.as_mut_ptr() as usize;
+    let status_host = banks::host(keep.last())?.as_mut_ptr() as usize;
     let common = Common { signs, status };
     let mut keys = BTreeMap::new();
 
@@ -522,11 +523,19 @@ pub fn load(
         keys,
         status: status_host,
         splits: AtomicU64::new(0),
-        _buffers: keep,
+        buffers: keep,
     }))
 }
 
 impl Private {
+    /// The device bytes this load holds, as (model, fire): the weight and
+    /// scale surfaces, and the activation surfaces, partials and staging.
+    #[must_use]
+    pub fn bytes(&self) -> (u64, u64) {
+        let model = self.buffers.model;
+        (model, self.buffers.bytes().saturating_sub(model))
+    }
+
     /// The most rows the Neural Engine takes a share of in one fire; a fire
     /// past them runs on the GPU alone.
     #[must_use]

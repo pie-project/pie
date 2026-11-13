@@ -348,11 +348,11 @@ impl Engine for Metal {
         };
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
 
-        let (working_set, elsewhere, caches) = {
+        let (working_set, outside, caches) = {
             let device = crate::device::Context::bind().map_err(fault)?;
             (
                 device.working_set(),
-                device.held_elsewhere(),
+                device.allocated(),
                 // The weight cache runs where the queue keeps a residency set.
                 device
                     .hold_resident(std::iter::empty(), true)
@@ -386,7 +386,16 @@ impl Engine for Metal {
                 0,
             )
         };
-        let util = residency.device_memory_share;
+        // The device's capacity is measured (`store::accounting::capacity`):
+        // a configured share of it is not read here.
+        if residency.device_memory_share != engine::load::DEFAULT_DEVICE_MEMORY_SHARE {
+            tracing::warn!(
+                share = residency.device_memory_share,
+                "`[model] device_memory_share` is not read on Metal: the load takes the \
+                 working set Metal recommends less what the device already holds; cap the kv \
+                 pool with `[model] device_kv_budget`"
+            );
+        }
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
         let paging = crate::store::kv::Paging::of(budgets.page_size, budgets.max_context, 1, 1)
             .map_err(|error| fault(Fault::from(error)))?;
@@ -399,10 +408,9 @@ impl Engine for Metal {
                 .bytes(u64::from(paging.pages_per_slot)),
         };
         let accounting = |weights: u64, scratch: u64| {
-            crate::store::accounting::Accounting::with_scratch(
+            crate::store::accounting::Accounting::of(
                 working_set,
-                elsewhere,
-                util,
+                outside,
                 weights,
                 scratch,
                 kv_pool,
@@ -457,7 +465,6 @@ impl Engine for Metal {
                 context: budgets.max_context,
                 slots,
                 kv_budget: residency.device_kv_budget,
-                memory_share: residency.device_memory_share,
                 runahead: engine::runahead::Runahead::of(frames_in_flight),
                 residency: experts::Plan::default(),
                 profiles: self.boot.profiles.clone(),
@@ -465,10 +472,8 @@ impl Engine for Metal {
             .map_err(fault)?;
             let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
             if narrower >= budgets.max_tokens
-                || accounting(weights, prepared.arena_bytes())
-                    .admit(util)
-                    .is_ok()
-                || accounting(weights, 0).admit(util).is_err()
+                || accounting(weights, prepared.arena_bytes()).admit().is_ok()
+                || accounting(weights, 0).admit().is_err()
             {
                 break prepared;
             }
@@ -483,7 +488,7 @@ impl Engine for Metal {
         };
         let scratch = prepared.arena_bytes();
 
-        accounting(weights, scratch).admit(util).map_err(fault)?;
+        accounting(weights, scratch).admit().map_err(fault)?;
 
         prepared.set_residency(experts::Plan::default().with_weights_held(residency.weights_held));
         let mut shell = prepared.load().map_err(fault)?;
@@ -503,6 +508,15 @@ impl Engine for Metal {
             )
             .map_err(fault)?;
 
+        if crate::diag::on().tier_trace {
+            let audit = shell.audit();
+            eprintln!(
+                "ledger: {}; device {} MiB, {} KiB beside the entries",
+                shell.ledger(),
+                audit.device >> 20,
+                audit.gap() / 1024
+            );
+        }
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
         let (pool_committed_bytes, pool_high_water_bytes) = shell.pool_residency();

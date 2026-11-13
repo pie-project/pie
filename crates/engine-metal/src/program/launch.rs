@@ -92,6 +92,18 @@ pub struct Rings {
 }
 
 impl Rings {
+    /// The rings this instance holds itself (adopted shared rings are the
+    /// plane's).
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.slabs
+            .iter()
+            .zip(&self.shared)
+            .filter(|(_, shared)| shared.is_none())
+            .map(|(slab, _)| slab.bytes())
+            .sum()
+    }
+
     pub fn allocate(
         device: &Context,
         shapes: &[ChannelShape],
@@ -287,6 +299,21 @@ const GROUPED_LANES: u32 = 1;
 const THE_LANE: u32 = 0;
 
 impl Grouped {
+    fn bytes(&self) -> u64 {
+        [
+            &self.table,
+            &self.bindings,
+            &self.pending_flags,
+            &self.lane_indices,
+            &self.row_meta,
+            &self.row_indices,
+        ]
+        .into_iter()
+        .chain(&self.layouts)
+        .map(Buffer::bytes)
+        .sum()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build(
         device: &Context,
@@ -704,6 +731,23 @@ pub struct BatchKey {
 }
 
 impl Prepared {
+    /// The device bytes this stage's launch holds for its instance.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        [
+            &self.status,
+            &self.descriptors,
+            &self.params,
+            &self.offsets,
+            &self.addresses,
+        ]
+        .into_iter()
+        .map(Buffer::bytes)
+        .sum::<u64>()
+            + self.scratch.bytes()
+            + self.grouped.as_ref().map_or(0, Grouped::bytes)
+    }
+
     pub fn build(
         device: &Context,
         plan: &LaunchStagePlan,
@@ -1375,6 +1419,28 @@ pub struct Batch {
 }
 
 impl Batch {
+    /// The device bytes this batch's tables hold.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        [
+            &self.table,
+            &self.descriptors,
+            &self.params,
+            &self.offsets,
+            &self.bindings,
+            &self.pending_flags,
+            &self.lane_indices,
+            &self.row_meta,
+            &self.row_indices,
+            &self.scratch,
+            &self.addresses,
+        ]
+        .into_iter()
+        .chain(&self.layouts)
+        .map(Buffer::bytes)
+        .sum()
+    }
+
     pub fn build(device: &Context, template: &Prepared, lanes: u32) -> Result<Batch> {
         let key = template.batch_key().ok_or_else(|| {
             Fault::program(

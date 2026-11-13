@@ -677,6 +677,17 @@ pub struct Cache {
 }
 
 impl Cache {
+    /// The device bytes of this cache's own tables: each plane's address
+    /// table and the hit counters.
+    #[must_use]
+    pub fn table_bytes(&self) -> u64 {
+        self.tables
+            .iter()
+            .map(|(table, _)| table.bytes())
+            .sum::<u64>()
+            + self.hits.bytes()
+    }
+
     /// The cache of `shape` over the weights the load bound (`handle_of` a
     /// param), every atom read from its weight in place; its buffers bound
     /// in `handles` (before the load seals them).
