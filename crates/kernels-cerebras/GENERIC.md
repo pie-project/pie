@@ -655,10 +655,14 @@ milestone's tail.
       (image); taps (`--tap`) inside it: layernorm + modulate 9.0e-5, attention + out proj
       2.9e-3, gated residual 6.2e-4, linear_out 3.4e-3. 6.18M cycles of PE stamps (that includes
       the launch's row-group skew); 1.7 h of simulator time; no redo pass in the K / V columns.
-    - The full step (60 x 28 PEs, 8 K / V columns, cost model 26.3M cycles): compiles and was
-      running on the simulator when this was written (`tools/wafer/stream/sim.sh` over
-      `wafer-compile stream`, about 2.3k simulated cycles a second): its velocity against the
-      capture and diffusers is M1e's first line.
+    - The full step (60 x 28 PEs, 8 K / V columns, cost model 26.3M cycles) compiles, loads and
+      runs, but stalls: the simulator stops at 13.76M cycles with every PE waiting, and the read
+      of the exit's rows finds nothing. The first double block (both sides, its K / V columns,
+      the lane bus) is clean, so the stall lies past it: the second double block's store order
+      (its first unit's rows arrive image-first), the single blocks (one unit, both classes,
+      queries in its own order) or the exit (it drops the text rows). M1e's first item: bisect
+      with `--stages 3`, `4`, `5` and `--tap`, then the velocity against the capture and
+      diffusers.
   - Decode is unchanged: plan + build `diff -r` identical against a6de5047d's wafer-compile for
     q35_08b, q35_4b, q35_9b, q3_8b, llama31-8b, gemma_e2b, gemma_e4b, gemma_12b, gptoss_20b, tiny
     t08, tiny llama, tiny gemma, tiny gpt-oss. tiny_q35_t08 on the simulator (wafer-bench, 5
