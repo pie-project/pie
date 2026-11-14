@@ -284,26 +284,43 @@ impl Func {
         let zs = self.const_i(Elem::I32, 0, &[s, e]);
         let pick = self.select(here, es, zs)?;
         let list = self.reduce(pick, &[1], Fold::Sum)?;
+        let pool = self.copy_from_host(pool, host, list, staging, count, rows)?;
+        Ok((pool, table))
+    }
+
+    /// Copies `count` (i32 scalar) planes of `rows` pool rows from `host`
+    /// (u32 `[n · rows, 128]` in pinned host memory) into the pool: the
+    /// `k`-th takes plane `from[k]` (i32 `[F]`) to pool row `to[k]`
+    /// (i32 `[F]`). Entries past `count` copy nothing. Answers the pool.
+    pub fn copy_from_host(
+        &mut self,
+        pool: Val,
+        host: Val,
+        from: Val,
+        to: Val,
+        count: Val,
+        rows: i64,
+    ) -> Built<Val> {
         let out = crate::lanes::loop_upto(
             self,
             count,
             &[pool],
-            &[list, staging, host],
+            &[from, to, host],
             |f, k, carried, inv| {
-                let (pool, list, staging, host) = (carried[0], inv[0], inv[1], inv[2]);
-                let ex = f.dynamic_slice(list, &[k], &[1])?;
+                let (pool, from, to, host) = (carried[0], inv[0], inv[1], inv[2]);
+                let ex = f.dynamic_slice(from, &[k], &[1])?;
                 let ex = f.reshape(ex, &[])?;
                 let rv = f.const_i(Elem::I32, rows, &[]);
-                let from = f.mul(ex, rv)?;
+                let at = f.mul(ex, rv)?;
                 let z = f.const_i(Elem::I32, 0, &[]);
-                let block = f.dynamic_slice(host, &[from, z], &[rows, LANES])?;
+                let block = f.dynamic_slice(host, &[at, z], &[rows, LANES])?;
                 let block = f.to_device(block);
-                let to = f.dynamic_slice(staging, &[k], &[1])?;
-                let to = f.reshape(to, &[])?;
-                Ok(vec![f.dynamic_update_slice(pool, block, &[to, z])?])
+                let dst = f.dynamic_slice(to, &[k], &[1])?;
+                let dst = f.reshape(dst, &[])?;
+                Ok(vec![f.dynamic_update_slice(pool, block, &[dst, z])?])
             },
         )?;
-        Ok((out[0], table))
+        Ok(out[0])
     }
 
     /// `table[at]` (i32 `[n]`) for i32 `at` `[m, 1]`: `[m]`.
