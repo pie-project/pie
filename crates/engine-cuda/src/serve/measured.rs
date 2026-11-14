@@ -11,10 +11,10 @@
 //! `<cache_dir>/bodies/<key>`, text:
 //!
 //! ```text
-//! pie-bodies 2
+//! pie-bodies 3
 //! bytes <census bytes once every rung armed>
 //! bodies <bodies armed>
-//! peak <the most device memory arming took, sampled at each composition>
+//! captured <what device memory fell by across each composition's capture, summed>
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -25,21 +25,22 @@ pub(crate) struct Measured {
     /// The bodies' census.
     pub bytes: u64,
     pub bodies: u64,
-    /// The most device memory arming took at once (a capture's own
-    /// transients above what its body keeps), never under the census.
-    pub peak: u64,
+    /// What device memory fell by across each composition's capture,
+    /// summed (each clamped at zero): the bodies and what their captures
+    /// keep beside them, never under the census.
+    pub captured: u64,
 }
 
 impl Measured {
-    /// What a load holds for its bodies: the recorded peak, exactly. It is
+    /// What a load holds for its bodies: the recorded figure, exactly. It is
     /// a measurement of the same build and deployment, so no margin.
     #[must_use]
     pub fn hold(&self) -> u64 {
-        self.peak
+        self.captured
     }
 }
 
-const HEADER: &str = "pie-bodies 2";
+const HEADER: &str = "pie-bodies 3";
 
 /// The record's file for a deployment whose bodies `parts` shape.
 #[must_use]
@@ -76,11 +77,11 @@ pub(crate) fn read(path: &Path) -> Option<Measured> {
     };
     let bytes = field("bytes ")?;
     let bodies = field("bodies ")?;
-    let peak = field("peak ")?;
-    (bodies > 0 && peak >= bytes).then_some(Measured {
+    let captured = field("captured ")?;
+    (bodies > 0 && captured >= bytes).then_some(Measured {
         bytes,
         bodies,
-        peak,
+        captured,
     })
 }
 
@@ -94,8 +95,8 @@ pub(crate) fn write(path: &Path, measured: Measured) -> std::io::Result<()> {
     std::fs::write(
         &partial,
         format!(
-            "{HEADER}\nbytes {}\nbodies {}\npeak {}\n",
-            measured.bytes, measured.bodies, measured.peak
+            "{HEADER}\nbytes {}\nbodies {}\ncaptured {}\n",
+            measured.bytes, measured.bodies, measured.captured
         ),
     )?;
     std::fs::rename(partial, path)
@@ -137,14 +138,14 @@ mod tests {
     use super::{Measured, conclude, path, read, write};
 
     #[test]
-    fn a_record_reads_back_and_holds_its_peak() {
+    fn a_record_reads_back_and_holds_what_its_captures_took() {
         let dir = std::env::temp_dir().join(format!("pie-measured-{}", std::process::id()));
         let at = path(&dir, "deployment");
         assert_eq!(read(&at), None, "no record yet");
         let measured = Measured {
             bytes: 404 << 20,
             bodies: 161,
-            peak: 500 << 20,
+            captured: 500 << 20,
         };
         write(&at, measured).expect("the record is written");
         assert_eq!(read(&at), Some(measured));
@@ -162,7 +163,7 @@ mod tests {
         let measured = Measured {
             bytes: 404 << 20,
             bodies: 161,
-            peak: 500 << 20,
+            captured: 500 << 20,
         };
         // Armed whole: written, nothing said.
         assert_eq!(conclude(&at, false, true, measured, 161, 161).unwrap(), None);

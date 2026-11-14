@@ -1434,12 +1434,12 @@ impl Shell {
                 let held = usize::try_from(measured.hold()).unwrap_or(usize::MAX);
                 if boot.knobs.diagnostics.arm_trace {
                     eprintln!(
-                        "[arm-trace] bodies held {} MiB: {} bodies took {} MiB, arming {} MiB at \
-                         its peak, when this deployment last armed whole (bodies_mem {} MiB)",
+                        "[arm-trace] bodies held {} MiB: {} bodies took {} MiB, their captures {} \
+                         MiB, when this deployment last armed whole (bodies_mem {} MiB)",
                         held.min(shell.bodies_mem) >> 20,
                         measured.bodies,
                         measured.bytes >> 20,
-                        measured.peak >> 20,
+                        measured.captured >> 20,
                         shell.bodies_mem >> 20,
                     );
                 }

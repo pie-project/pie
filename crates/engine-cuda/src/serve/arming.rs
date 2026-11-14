@@ -102,10 +102,10 @@ pub(super) struct Arming {
     /// A capture found no device room on a record's allowance while the
     /// shell served: arming stopped there and the rest walk eagerly.
     record_short: bool,
-    /// Device memory free as arming began, and the least seen since, at
-    /// each composition: what arming took at its peak.
-    free_began: Option<u64>,
-    free_least: Option<u64>,
+    /// What the device's free memory fell by across each composition's
+    /// fires, summed: what the captures took, and nothing serving or the
+    /// runtime took between them. None where free memory cannot be read.
+    took: Option<u64>,
     /// The buckets of the profile's lattice, before arming coarsened any
     /// away.
     profiled: usize,
@@ -1501,8 +1501,7 @@ impl Shell {
             unit_margin: self.pools.arming_margin_bytes(),
             from_record: self.bodies_from_record,
             record_short: false,
-            free_began: crate::device::free_bytes(),
-            free_least: crate::device::free_bytes(),
+            took: Some(0),
             profiled: self.budget.buckets.len(),
             ballot: Ballot::open(&self.device),
         })
@@ -1642,11 +1641,7 @@ impl Shell {
             st.rung = rung;
             st.priced = st.verify || st.group || self.lattice.is_none();
         }
-        let armed = self.arm_target(st, bucket, target, rs);
-        if let Some(free) = crate::device::free_bytes() {
-            st.free_least = Some(st.free_least.map_or(free, |least| least.min(free)));
-        }
-        armed
+        self.arm_target(st, bucket, target, rs)
     }
 
     fn arm_target(
@@ -1731,6 +1726,7 @@ impl Shell {
         }
         let owned = self.synthetic_lanes_with(&lanes, &media);
         self.armed_body = None;
+        let free_before = crate::device::free_bytes();
         let idle = matches!(target, BodySynth::Idle);
         for _ in 0..record::WARM_FIRES {
             if idle {
@@ -1776,6 +1772,11 @@ impl Shell {
             }
         }
         self.arm_cold = false;
+        st.took = st
+            .took
+            .zip(free_before)
+            .zip(crate::device::free_bytes())
+            .map(|((took, before), after)| took + before.saturating_sub(after));
         let key = self.armed_body.take();
         let warmed_ms = began.elapsed().as_secs_f64() * 1000.0;
         let mut golden_ms = (0f64, 0f64);
@@ -1977,26 +1978,22 @@ impl Shell {
             st.profiled
         );
         // The record: written where every rung armed, at what the bodies
-        // took and arming's peak; dropped, and said, where a record's
+        // took and what their captures took; dropped, and said, where a record's
         // allowance armed short of whole.
         if let Some(record) = self.bodies_record.as_deref()
             && !st.verify
         {
             let took = stats.census.bytes as u64;
-            let peak = st
-                .free_began
-                .zip(st.free_least)
-                .map_or(took, |(began, least)| began.saturating_sub(least))
-                .max(took);
+            let captured = st.took.map_or(took, |captured| captured.max(took));
             let measured = super::measured::Measured {
                 bytes: took,
                 bodies: stats.census.bodies as u64,
-                peak,
+                captured,
             };
             if super::diag::on().arm_trace {
                 eprintln!(
-                    "[arm-trace] arming took {} MiB at its peak; {} bodies weigh {} MiB",
-                    peak >> 20,
+                    "[arm-trace] arming's captures took {} MiB; {} bodies weigh {} MiB",
+                    captured >> 20,
                     measured.bodies,
                     took >> 20,
                 );
@@ -2337,8 +2334,7 @@ mod tests {
             unit_margin: 0,
             from_record: false,
             record_short: false,
-            free_began: None,
-            free_least: None,
+            took: None,
             profiled: 0,
             ballot: Ballot { slip: None },
         }
