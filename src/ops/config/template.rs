@@ -203,7 +203,6 @@ device = ["wgpu:0"]         # enumeration order among the reachable adapters
 activation_dtype = "bfloat16"
 # backends = "vulkan"           # omit for every backend this build carries
 # power_preference     = "high-performance"  # or "low-power", "none"
-# pipeline_cache       = "/path/to/pipeline.bin"  # omit for in-process only
 "#;
 
 #[cfg(any(feature = "xla", test))]

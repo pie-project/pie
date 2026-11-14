@@ -16,8 +16,6 @@ pub struct Enabled {
     pub subgroups: bool,
     pub f16: bool,
     pub timestamps: bool,
-    pub mappable_primary: bool,
-    pub pipeline_cache: bool,
 }
 
 #[derive(Debug)]
@@ -94,11 +92,6 @@ impl Context {
 
     #[must_use]
     pub fn device_index(&self) -> u32 {
-        match self.never {}
-    }
-
-    #[must_use]
-    pub fn pipeline_cache_path(&self) -> Option<&std::path::Path> {
         match self.never {}
     }
 
@@ -394,10 +387,6 @@ impl Pipelines {
         _key: &'static str,
     ) -> Result<std::sync::Arc<Pipeline>> {
         Err(Fault::Deviceless)
-    }
-
-    pub fn persist(&self) -> Result<()> {
-        Ok(())
     }
 }
 

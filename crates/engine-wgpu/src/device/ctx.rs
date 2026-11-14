@@ -1,4 +1,3 @@
-#![allow(unsafe_code)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -146,8 +145,6 @@ pub struct Enabled {
     pub subgroups: bool,
     pub f16: bool,
     pub timestamps: bool,
-    pub mappable_primary: bool,
-    pub pipeline_cache: bool,
 }
 
 pub(crate) struct Core {
@@ -167,61 +164,14 @@ pub(crate) struct Core {
     pub(crate) last_error: Arc<Mutex<Option<String>>>,
     pub(crate) books: Arc<engine_gpu::Books>,
     pub(crate) name: String,
-    pub(crate) cores: Option<u32>,
     /// `None` without the subgroup feature.
     pub(crate) subgroup_min: Option<u32>,
-    /// The device-local heap's bytes, where the adapter reports one; else 0.
-    pub(crate) device_local: u64,
-    adapter: wgpu::Adapter,
-    heap: Option<Heap>,
-    /// The device's bytes as the host states them (`DeviceBoot::device_memory`).
-    stated: Option<u64>,
+    /// `[engine.memory] budget_device`: what the load takes, all of it
+    /// together. The environment reports no memory size, so it is stated.
+    pub(crate) budget: u64,
 }
 
 impl Core {
-    /// The device bytes free to this process now: the heap's budget less its
-    /// usage where the driver reports them, else the heap less every
-    /// reservation (blind to other processes). Where wgpu reports no heap
-    /// (Metal, DX12, GL, a browser): the size the host states less every
-    /// reservation, else the pool's own binding ceiling, four segments of
-    /// the largest storage binding.
-    fn free(&self) -> u64 {
-        let Some(heap) = self.heap else {
-            if let Some(stated) = self.stated {
-                return stated.saturating_sub(engine_gpu::books::process_reserved());
-            }
-            let binding = self
-                .limits
-                .max_buffer_size
-                .min(self.limits.max_storage_buffer_binding_size);
-            return binding.saturating_mul(kernels_slang::SEGMENTS as u64);
-        };
-        match vulkan_budget(&self.adapter, heap) {
-            Some((budget, usage)) => budget.saturating_sub(usage),
-            None => heap
-                .bytes
-                .saturating_sub(engine_gpu::books::process_reserved()),
-        }
-    }
-
-    /// What the driver (wgpu's allocator blocks among it) holds for this
-    /// process in the heap beside every reservation of this process, where it
-    /// reports it.
-    fn outside(&self) -> u64 {
-        self.heap
-            .and_then(|heap| vulkan_budget(&self.adapter, heap))
-            .map_or(0, |(_, usage)| {
-                usage.saturating_sub(engine_gpu::books::process_reserved())
-            })
-    }
-
-    /// Whether the driver reports the heap's usage, so [`Core::outside`]
-    /// measures what it holds.
-    fn measures_outside(&self) -> bool {
-        self.heap
-            .is_some_and(|heap| vulkan_budget(&self.adapter, heap).is_some())
-    }
-
     pub(crate) fn fault(&self, what: &'static str, why: impl ToString) -> Fault {
         Fault::Wgpu {
             what,
@@ -357,11 +307,8 @@ impl Drop for Held {
 #[derive(Clone)]
 pub struct Context {
     pub(crate) core: Arc<Core>,
-    /// The operator's cap on what the load takes, all of it together.
-    budget: Option<u64>,
     max_buffer: u64,
     pub(crate) dummy: Slab,
-    pipeline_cache: Option<std::path::PathBuf>,
     device_index: u32,
 }
 
@@ -370,7 +317,7 @@ impl std::fmt::Debug for Context {
         f.debug_struct("Context")
             .field("name", &self.core.name)
             .field("backend", &self.core.info.backend)
-            .field("budget", &self.budget)
+            .field("budget", &self.core.budget)
             .finish()
     }
 }
@@ -393,90 +340,6 @@ fn rank(kind: wgpu::DeviceType, preference: wgpu::PowerPreference) -> u8 {
             D::Cpu => 4,
         },
     }
-}
-
-/// The device-local heap device reservations take, where the adapter is a
-/// Vulkan one: its index, its bytes, and whether the driver reports a
-/// budget of it (`VK_EXT_memory_budget`, which wgpu enables where offered).
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Heap {
-    index: usize,
-    bytes: u64,
-    budgeted: bool,
-}
-
-#[cfg(not(any(target_vendor = "apple", target_arch = "wasm32")))]
-fn vulkan_facts(adapter: &wgpu::Adapter) -> (Option<Heap>, Option<u32>) {
-    use ash::vk;
-    // SAFETY: the guard is only read through, and dropped before the adapter;
-    // nothing here destroys the instance or physical device it hands out.
-    let Some(hal) = (unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }) else {
-        return (None, None);
-    };
-    let instance = hal.shared_instance().raw_instance();
-    let physical = hal.raw_physical_device();
-    // SAFETY: `physical` is a live handle of `instance`, both kept alive by
-    // `hal`, and the call only fills the returned struct.
-    let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
-    let heaps = memory.memory_heap_count as usize;
-    // SAFETY: as above — a query on a live physical device of `instance`.
-    let exts =
-        unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
-    let budgeted = exts
-        .iter()
-        .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::memory_budget::NAME));
-    let local = (0..heaps)
-        .filter(|&i| {
-            memory.memory_heaps[i]
-                .flags
-                .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-        })
-        .max_by_key(|&i| memory.memory_heaps[i].size)
-        .map(|index| Heap {
-            index,
-            bytes: memory.memory_heaps[index].size,
-            budgeted,
-        });
-    // SAFETY: as above; `shader_cores` chains onto `p2` only the struct of an
-    // extension `exts` says this physical device supports.
-    let cores = kernels_slang::cores::shader_cores(&exts, &mut |p2| unsafe {
-        instance.get_physical_device_properties2(physical, p2);
-    });
-    (local, cores)
-}
-
-#[cfg(any(target_vendor = "apple", target_arch = "wasm32"))]
-fn vulkan_facts(_adapter: &wgpu::Adapter) -> (Option<Heap>, Option<u32>) {
-    (None, None)
-}
-
-/// `heap`'s budget for this process and what this process holds of it, as
-/// the Vulkan driver under the adapter reports them now.
-#[cfg(not(any(target_vendor = "apple", target_arch = "wasm32")))]
-fn vulkan_budget(adapter: &wgpu::Adapter, heap: Heap) -> Option<(u64, u64)> {
-    use ash::vk;
-    if !heap.budgeted {
-        return None;
-    }
-    // SAFETY: the guard is only read through, and dropped before the adapter.
-    let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
-    let instance = hal.shared_instance().raw_instance();
-    let physical = hal.raw_physical_device();
-    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-    let mut props = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
-    // SAFETY: `physical` is a live handle of `instance`, both kept alive by
-    // `hal`; the budget struct is chained only where the physical device
-    // offers `VK_EXT_memory_budget`, and both structs outlive the call.
-    unsafe { instance.get_physical_device_memory_properties2(physical, &mut props) };
-    Some((
-        budget.heap_budget[heap.index],
-        budget.heap_usage[heap.index],
-    ))
-}
-
-#[cfg(any(target_vendor = "apple", target_arch = "wasm32"))]
-fn vulkan_budget(_adapter: &wgpu::Adapter, _heap: Heap) -> Option<(u64, u64)> {
-    None
 }
 
 pub struct Handed {
@@ -504,9 +367,7 @@ pub fn wanted_features(offered: wgpu::Features) -> wgpu::Features {
     let wanted = wgpu::Features::SUBGROUP
         | wgpu::Features::SHADER_F16
         | wgpu::Features::TIMESTAMP_QUERY
-        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
-        | wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
-        | wgpu::Features::PIPELINE_CACHE;
+        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
     offered & wanted
 }
 
@@ -582,26 +443,36 @@ pub async fn request(boot: &DeviceBoot) -> Result<Handed> {
     })
 }
 
+/// `allowance.budget`, refused where the operator states none.
+fn stated(allowance: engine::Allowance) -> Result<u64> {
+    allowance.budget.ok_or_else(|| {
+        Fault::Residency(
+            "wgpu: the environment reports no memory size; state \
+             `[engine.memory] budget_device` for what the load may take"
+                .to_string(),
+        )
+    })
+}
+
 impl Context {
-    /// The device `boot` names, of which a load takes what it has, no more
-    /// than `allowance.budget` where the operator states one.
+    /// The device `boot` names, of which a load takes `allowance.budget`,
+    /// which must be stated.
     pub fn bind(boot: &DeviceBoot, allowance: engine::Allowance) -> Result<Context> {
+        stated(allowance)?;
         let _gate = gate();
         let handed = host::block_on("request_device", request(boot))??;
         Context::adopt(boot, allowance, handed)
     }
 
-    /// A device the host already holds, of which a load takes what it has,
-    /// no more than `allowance.budget` where stated. wgpu reports no memory
-    /// of its own: what
-    /// the device has is read from the Vulkan driver under the adapter
-    /// where there is one ([`Core::free`] says what stands in elsewhere).
+    /// A device the host already holds, of which a load takes
+    /// `allowance.budget`, which must be stated: WebGPU reports no memory
+    /// size.
     pub fn adopt(
         boot: &DeviceBoot,
         allowance: engine::Allowance,
         handed: Handed,
     ) -> Result<Context> {
-        let budget = allowance.budget;
+        let budget = stated(allowance)?;
         let Handed {
             adapter,
             device,
@@ -619,17 +490,10 @@ impl Context {
                 *sink.lock().expect("sink lock poisoned") = Some(text);
             }));
         }
-        let (heap, sm) = vulkan_facts(&adapter);
-        let device_local = heap
-            .map(|heap| heap.bytes)
-            .or(boot.device_memory)
-            .unwrap_or(0);
         let enabled = Enabled {
             subgroups: features.contains(wgpu::Features::SUBGROUP),
             f16: features.contains(wgpu::Features::SHADER_F16),
             timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
-            mappable_primary: features.contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
-            pipeline_cache: features.contains(wgpu::Features::PIPELINE_CACHE),
         };
         // A slab is bound whole, so no larger than one storage binding takes:
         // past it a fire refuses the view rather than reading a cut slab.
@@ -651,12 +515,8 @@ impl Context {
             scratch: Mutex::new(Vec::new()),
             last_error,
             books: Arc::new(engine_gpu::Books::new()),
-            cores: sm,
             subgroup_min,
-            device_local,
-            adapter,
-            heap,
-            stated: boot.device_memory,
+            budget,
         });
         let dummy = Raw::new(
             &core,
@@ -665,11 +525,9 @@ impl Context {
             engine_gpu::books::owners::DUMMY,
         )?;
         let context = Context {
-            budget,
             max_buffer,
             core,
             dummy,
-            pipeline_cache: boot.pipeline_cache.clone(),
             device_index: boot.adapter_index,
         };
 
@@ -690,27 +548,23 @@ impl Context {
         self.core.info.backend.to_str()
     }
 
-    /// What the device has for this load, measured now: every reservation,
-    /// what the driver holds beside them and what is free, capped by the
-    /// operator's budget.
+    /// What the device has for this load: the operator's budget.
     #[must_use]
     pub fn capacity(&self) -> u64 {
-        let core = &self.core;
-        let measured = core.books.device() + core.outside() + core.free();
-        self.budget.map_or(measured, |budget| measured.min(budget))
+        self.core.budget
     }
 
-    /// What the driver holds for this process beside every reservation.
+    /// What the driver holds for this process beside every reservation:
+    /// wgpu reports none.
     #[must_use]
     pub fn outside(&self) -> u64 {
-        self.core.outside()
+        0
     }
 
-    /// Whether [`Context::outside`] is measured: the driver reports the
-    /// heap's usage.
+    /// Whether [`Context::outside`] is measured: never under wgpu.
     #[must_use]
     pub fn measures_outside(&self) -> bool {
-        self.core.measures_outside()
+        false
     }
 
     #[must_use]
@@ -720,7 +574,7 @@ impl Context {
 
     #[must_use]
     pub fn cores(&self) -> u32 {
-        self.core.cores.unwrap_or(crate::chip::UNREPORTED_CORES)
+        crate::chip::UNREPORTED_CORES
     }
 
     /// The alignment a guest table takes in its pool slot: 16 at least, and
@@ -747,11 +601,6 @@ impl Context {
     }
 
     #[must_use]
-    pub fn pipeline_cache_path(&self) -> Option<&std::path::Path> {
-        self.pipeline_cache.as_deref()
-    }
-
-    #[must_use]
     pub fn enabled(&self) -> Enabled {
         self.core.enabled
     }
@@ -762,7 +611,7 @@ impl Context {
             name: self.core.name.clone(),
             vendor: profile::vendor::of_pci(self.core.info.vendor),
             subgroup_min: self.core.subgroup_min,
-            cores: self.core.cores,
+            cores: None,
             f16: self.core.enabled.f16,
         }
     }
@@ -776,9 +625,7 @@ impl Context {
     /// driver's own.
     #[must_use]
     pub fn left(&self) -> u64 {
-        self.capacity()
-            .saturating_sub(self.core.books.device())
-            .saturating_sub(self.core.outside())
+        self.capacity().saturating_sub(self.core.books.device())
     }
 
     /// The device's books: every reservation under its owner.
@@ -1191,11 +1038,23 @@ mod tests {
     use crate::device::Buffer;
 
     #[test]
+    fn a_load_without_budget_device_is_refused() {
+        let why = Context::bind(&DeviceBoot::default(), engine::Allowance::WHOLE)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("reports no memory size"), "{why}");
+        assert!(why.contains("[engine.memory] budget_device"), "{why}");
+    }
+
+    #[test]
     fn a_copy_between_two_spans_of_one_buffer_lands() {
         if !present() {
             return;
         }
-        let device = Context::bind(&DeviceBoot::default(), engine::Allowance::WHOLE).unwrap();
+        let allowance = engine::Allowance {
+            budget: Some(1 << 30),
+        };
+        let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
         let mut buffer = Buffer::zeroed(&device, 64, engine_gpu::books::owners::SCRATCH).unwrap();
         let ramp: Vec<u8> = (1..=24).collect();
         buffer.write(0, &ramp).unwrap();
