@@ -9,6 +9,8 @@ pub mod segments;
 pub mod shared;
 pub mod slots;
 pub mod weights;
+#[cfg(test)]
+mod fence_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PipelineScopeId(u128);

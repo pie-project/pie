@@ -2110,6 +2110,87 @@ mod tests {
         pool.check();
     }
 
+    /// A shrink's evacuation (suspect d): a fire built before it may still
+    /// read or write the drained segment's old place, so the segment is not
+    /// given back (`release_segments`) until the fire at the evacuation's
+    /// epoch retires.
+    #[test]
+    fn a_drained_segment_is_held_until_the_fires_that_named_it_retire() {
+        let mut pool = SlotPool::new(facts(96, 16, 3, &[(ShapeKind::List, 1)]));
+        let holder = Holder::WorkingSet(0);
+        let slots = pool.acquire(holder, 0, 40).unwrap();
+        // The low chunks go back: room below for what sits in segment 2.
+        let (low, kept): (Vec<Slot>, Vec<Slot>) = slots
+            .into_iter()
+            .partition(|slot| pool.physical(slot.chunk).unwrap() < 24);
+        pool.release(holder, &low, 0);
+        pool.retire_through(0);
+        let segment = 2;
+        assert!(
+            kept.iter()
+                .any(|slot| pool.segments().of(pool.physical(slot.chunk).unwrap()) == segment),
+            "state sits in the segment to drain"
+        );
+        let evacuation = pool.plan_evacuation(segment).expect("room below it");
+        assert!(!evacuation.moves.is_empty());
+        const FIRE: u64 = 7;
+        pool.apply_evacuation(&evacuation, FIRE).unwrap();
+        assert_eq!(pool.segments().used(segment), 0);
+        pool.retire_through(FIRE - 1);
+        assert!(
+            matches!(
+                pool.release_segment(segment),
+                Err(SegmentError::Draining { .. })
+            ),
+            "a drained segment went back while a fire naming its old place was in flight"
+        );
+        pool.retire_through(FIRE);
+        pool.release_segment(segment).unwrap();
+    }
+
+    /// A raise's evacuation (suspect d): the chunks it moves state off stay
+    /// out of the pool until the fire at its epoch retires, even when the
+    /// rung comes back down at once: a fire built before the move may still
+    /// read or write them, and no slot of another holder may lie there.
+    #[test]
+    fn a_raise_s_moved_off_chunks_open_for_no_one_until_their_fires_retire() {
+        let mut pool = SlotPool::new(facts(96, 16, 6, &[(ShapeKind::List, 1)]));
+        pool.set_rung(16).unwrap();
+        let holder = Holder::WorkingSet(0);
+        let all = pool.acquire(holder, 0, pool.available(0)).unwrap();
+        let (low, kept): (Vec<Slot>, Vec<Slot>) = all
+            .into_iter()
+            .partition(|slot| pool.physical(slot.chunk).unwrap() < 40);
+        pool.release(holder, &low, 0);
+        pool.retire_through(0);
+        let evacuation = pool.plan_rung(4096).unwrap();
+        assert!(!evacuation.moves.is_empty(), "state sits in the span");
+        let moved_off: HashSet<u32> = evacuation.moves.iter().map(|step| step.from).collect();
+        const FIRE: u64 = 9;
+        pool.apply_rung(&evacuation, FIRE).unwrap();
+        // Down again before the fire that named them retires.
+        pool.set_rung(16).unwrap();
+        pool.retire_through(FIRE - 1);
+        let other = Holder::WorkingSet(1);
+        let taken = pool.acquire(other, 0, pool.available(0)).unwrap();
+        for slot in &taken {
+            let physical = pool.physical(slot.chunk).unwrap();
+            assert!(
+                !moved_off.contains(&physical),
+                "{slot:?} handed out on chunk {physical}, which a fire in flight still names"
+            );
+        }
+        pool.retire_through(FIRE);
+        let after = pool.acquire(other, 0, pool.available(0)).unwrap();
+        assert!(
+            after
+                .iter()
+                .any(|slot| moved_off.contains(&pool.physical(slot.chunk).unwrap())),
+            "the moved-off chunks open once the fire retires"
+        );
+        let _ = kept;
+    }
+
     #[test]
     fn random_runs_keep_every_invariant() {
         for seed in 0..24 {
