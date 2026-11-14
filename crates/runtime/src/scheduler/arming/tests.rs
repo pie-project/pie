@@ -362,7 +362,7 @@ fn a_lease_is_free_slots_no_sequence_holds_and_goes_back_after_the_step() {
     }
     let held = engine.held.clone();
     let live = engine.live.clone();
-    let mut lane = spawn(9102, engine, &planner);
+    let mut lane = spawn(62, engine, &planner);
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(
         seen.steps.load(Ordering::SeqCst),
@@ -380,6 +380,9 @@ fn a_lease_is_free_slots_no_sequence_holds_and_goes_back_after_the_step() {
         }
     }
     slots.pages.lock().unwrap().extend(gone);
+    // As the planner tells it when room is let go: the lane, waiting on
+    // room, wakes.
+    crate::scheduler::arming::room_freed(62);
     wait_until("every rung armed", || seen.over.load(Ordering::SeqCst));
     assert_eq!(
         seen.bad_leases.load(Ordering::SeqCst),

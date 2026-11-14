@@ -15,6 +15,8 @@ use crate::store::shared::programs::{FireKey, Funder, Mover, ProgramOpen, fund_s
 
 const PROGRAM: ProgramId = ProgramId(7);
 const LANES: u32 = 64;
+/// The engine whose rung events these tests' raises tell.
+const TEST_ENGINE: usize = 50;
 
 /// `program` bound at the default extents.
 fn key(program: ProgramId) -> FireKey {
@@ -115,6 +117,10 @@ impl Mover for Lane {
             .unwrap()
             .set_rung(from, to)
             .map_err(|error| error.to_string())
+    }
+
+    fn engine(&self) -> usize {
+        TEST_ENGINE
     }
 
     fn epoch_now(&self) -> u64 {
@@ -413,6 +419,7 @@ async fn a_term_past_the_largest_rung_funds_the_widest_that_fits_and_cuts_fires_
         .unwrap();
     assert_eq!(step, RungStep::Cap(256));
     cap.store(256, Ordering::Release);
+    crate::store::shared::rung_changed(TEST_ENGINE);
     wait.await.unwrap().unwrap();
     drop(open);
 
@@ -447,6 +454,10 @@ async fn a_bind_whose_room_is_refused_fails_its_wait() {
         }
         async fn set_rung(&self, _from: u32, _to: u32) -> Result<(), String> {
             Ok(())
+        }
+
+        fn engine(&self) -> usize {
+            TEST_ENGINE
         }
         fn epoch_now(&self) -> u64 {
             0
@@ -552,7 +563,8 @@ async fn a_pool_without_rungs_skips_the_term_check() {
     );
     let shared: Shared = Arc::new(Mutex::new(pool));
     let open = ProgramOpen::new(&shared, key(PROGRAM)).expect("the term is ignored");
-    let huge = ProgramOpen::new(&shared, key(ProgramId(9))).expect("past the device, still ignored");
+    let huge =
+        ProgramOpen::new(&shared, key(ProgramId(9))).expect("past the device, still ignored");
     {
         let pool = shared.lock().unwrap();
         assert_eq!(

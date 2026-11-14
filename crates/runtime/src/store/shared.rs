@@ -87,6 +87,45 @@ static FIRE_CAP: [std::sync::atomic::AtomicU32; RUNG_ENGINES] =
 static RUNG_GRANT: [std::sync::atomic::AtomicU32; RUNG_ENGINES] =
     [const { std::sync::atomic::AtomicU32::new(u32::MAX) }; RUNG_ENGINES];
 
+/// Per engine, the event every wait on the activation rung waits on: the
+/// fire cap moved, a raise was applied, copied or refused, the rung was
+/// lowered, segments were committed, or room was freed (a fire retired).
+static RUNG_EVENTS: [tokio::sync::Notify; RUNG_ENGINES] =
+    [const { tokio::sync::Notify::const_new() }; RUNG_ENGINES];
+
+/// Wakes every wait on `engine`'s rung: what it waits on may have changed.
+pub fn rung_changed(engine: usize) {
+    if let Some(event) = RUNG_EVENTS.get(engine) {
+        event.notify_waiters();
+    }
+}
+
+/// The next [`rung_changed`] of `engine`, armed before the caller looks at
+/// what it waits on, so a change between the look and the wait is not
+/// lost: pin it, `enable` it, look, then await it.
+#[must_use]
+pub fn rung_watch(engine: usize) -> tokio::sync::futures::Notified<'static> {
+    RUNG_EVENTS
+        .get(engine)
+        .unwrap_or(&RUNG_EVENTS[RUNG_ENGINES - 1])
+        .notified()
+}
+
+/// Waits for the next [`rung_changed`] of `engine` after `check` reads
+/// `false`; at once when it reads `true`. A change between the look and the
+/// wait is not lost.
+pub async fn rung_wait_until(engine: usize, mut check: impl FnMut() -> bool) {
+    loop {
+        let watch = rung_watch(engine);
+        tokio::pin!(watch);
+        watch.as_mut().enable();
+        if check() {
+            return;
+        }
+        watch.await;
+    }
+}
+
 /// The tokens a fire on `engine` is cut and stepped to now.
 #[must_use]
 pub fn fire_cap(engine: usize) -> u32 {
@@ -105,6 +144,7 @@ fn set_fire_cap(engine: usize, tokens: u32) {
     if let Some(cap) = FIRE_CAP.get(engine) {
         cap.store(tokens, std::sync::atomic::Ordering::Release);
     }
+    rung_changed(engine);
 }
 
 /// The scheduler of `engine` has no step wider than `cap` in flight, and
@@ -252,6 +292,7 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
             moved = 0,
             "the activation rung is raised"
         );
+        rung_changed(engine);
     }
     // The rung holds `goal` now: fires may take its width, once a raise's
     // copy is the engine's.

@@ -295,6 +295,10 @@ pub trait Mover {
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 
     fn epoch_now(&self) -> u64;
+
+    /// The engine whose rung events ([`super::rung_changed`]) a wait on
+    /// this raise waits on.
+    fn engine(&self) -> usize;
 }
 
 /// Raises `shared`'s activation to `goal`'s (a rung's tokens, given the
@@ -319,8 +323,11 @@ pub async fn take_raise(
         return Ok(None);
     };
     if !carry_raise(shared, &evacuation, mover).await {
+        // Refused and taken back: the rung's waiters look again.
+        super::rung_changed(mover.engine());
         return Ok(None);
     }
+    super::rung_changed(mover.engine());
     tracing::info!(
         rung = evacuation.rung,
         moved = evacuation.moves.len(),
@@ -380,7 +387,12 @@ pub async fn fund_span(
     funder: &impl Funder,
     mover: &impl Mover,
 ) -> Result<(), String> {
+    let engine = mover.engine();
     loop {
+        // Armed before the look: a change between the two is not lost.
+        let watch = super::rung_watch(engine);
+        tokio::pin!(watch);
+        watch.as_mut().enable();
         let (short, copying, goal, capped) = {
             let pool = shared.lock().unwrap();
             let rows = cap();
@@ -397,8 +409,8 @@ pub async fn fund_span(
         }
         if copying || short == 0 {
             // A raise's copy is the engine's to take, or the walk is to cut
-            // fires to the widest rung that fits.
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            // fires to the widest rung that fits: either tells the rung.
+            watch.await;
             continue;
         }
         let pages = shared.lock().unwrap().raise_short(goal).1;
@@ -409,7 +421,7 @@ pub async fn fund_span(
                 "a program's fire term asks the planner for room"
             );
             if !funder.fund(pages).await? {
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                // Quoted again: the planner's answer is the event.
                 continue;
             }
         }
@@ -417,8 +429,9 @@ pub async fn fund_span(
             .await?
             .is_none()
         {
-            // The walk is raising it, or the room went to another since.
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            // The walk is raising it, or the room went to another since:
+            // either moves the rung or frees room.
+            watch.await;
         }
     }
 }
@@ -459,6 +472,10 @@ pub struct LaneMover<F> {
 }
 
 impl<F: Fn() -> u64 + Sync> Mover for LaneMover<F> {
+    fn engine(&self) -> usize {
+        self.engine
+    }
+
     async fn evacuate(&self, evacuation: ::engine::chunk::Evacuation) -> Result<(), String> {
         crate::scheduler::pool(
             self.engine,
