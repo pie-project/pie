@@ -1297,11 +1297,11 @@ impl Xla {
                 {
                     None => None,
                     Some(crate::program::Tokens::Host(ids)) => Some(ids),
-                    Some(crate::program::Tokens::Device { words }) => {
-                        let stand_in = vec![0; words.len()];
+                    Some(crate::program::Tokens::Device { at }) => {
+                        let stand_in = vec![0; at.len()];
                         token_feeds.push(crate::serve::TokenFeed {
                             lane: lane_index,
-                            words,
+                            at,
                         });
                         Some(stand_in)
                     }

@@ -2057,9 +2057,10 @@ impl Shell {
             readout_table(&composition, lanes, real)?;
         self.readouts.insert(readout_rows.len() as u32);
         let tokens_t = inputs.i32s(handles, &tokens, 1);
-        // Tokens a guest pass put on the device: the pool words the fire
-        // gathers them from (`-1`: the host's own).
-        let mut words = vec![-1i32; tokens.len()];
+        // Tokens a guest pass put on the device: the pool row and lane the
+        // fire gathers each from (row `-1`: the host's own).
+        let mut token_rows = vec![-1i32; tokens.len()];
+        let mut token_lanes = vec![0i32; tokens.len()];
         for feed in &token_feeds {
             let Some(row) = composition
                 .lanes()
@@ -2074,23 +2075,33 @@ impl Shell {
                     ),
                 });
             };
-            if row.rows as usize != feed.words.len() {
+            if row.rows as usize != feed.at.len() {
                 return Err(Fault::Program {
                     at: "serve::tokens",
                     why: format!(
                         "lane {} is fed {} token(s) off the device and seats {} row(s)",
                         feed.lane,
-                        feed.words.len(),
+                        feed.at.len(),
                         row.rows
                     ),
                 });
             }
-            for (i, &word) in feed.words.iter().enumerate() {
-                words[(row.row_offset + i as u32) as usize] =
-                    i32::try_from(word).unwrap_or(i32::MAX);
+            for (i, &(r, l)) in feed.at.iter().enumerate() {
+                let at = (row.row_offset + i as u32) as usize;
+                token_rows[at] = i32::try_from(r).map_err(|_| Fault::Ceiling {
+                    what: "pool rows an i32 addresses",
+                    need: u64::from(r),
+                    have: i32::MAX as u64,
+                })?;
+                token_lanes[at] = l as i32;
             }
         }
-        let token_words = (!token_feeds.is_empty()).then(|| inputs.i32s(handles, &words, 1));
+        let token_words = (!token_feeds.is_empty()).then(|| {
+            (
+                inputs.i32s(handles, &token_rows, 1),
+                inputs.i32s(handles, &token_lanes, 1),
+            )
+        });
         // The streamed weights this fire reads: each streamed table's row
         // for every token row, each streamed bank's expert places
         // (`crate::store::streamed`).
@@ -2937,21 +2948,20 @@ impl Shell {
         // The tokens a guest pass put in the pool, gathered over the host's
         // stand-ins before anything reads them (a read of the pool: no
         // write, so the fire's placement is untouched).
-        if let Some(words) = bindings.token_words {
+        if let Some((token_rows, token_lanes)) = bindings.token_words {
             use crate::emit::Emit as _;
             let (root, tokens) = (self.pools.root(), bindings.tokens);
             tracer.emit(&mut |cx| {
                 let pool = cx.read(root)?;
-                let at = cx.read(words)?;
+                let at = cx.read(token_rows)?;
+                let col = cx.read(token_lanes)?;
                 let host = cx.read(tokens)?;
                 let n = i64::from(tokens.rows) * i64::from(tokens.width);
                 let at = cx.reshape(at, &[n])?;
+                let col = cx.reshape(col, &[n])?;
                 let zero = cx.const_i(kernels_xla::hlo::Elem::I32, 0, &[n]);
                 let fed = cx.compare(kernels_xla::hlo::Cmp::Ge, at, zero)?;
-                let w = cx.max(at, zero)?;
-                let lanes = cx.const_i(kernels_xla::hlo::Elem::I32, 128, &[n]);
-                let row = cx.div(w, lanes)?;
-                let col = cx.rem(w, lanes)?;
+                let row = cx.max(at, zero)?;
                 let rows = cx.take_rows(pool, row)?;
                 let col = cx.reshape(col, &[n, 1])?;
                 let col = cx.broadcast(col, &[n, 128], &[0, 1])?;
@@ -3332,12 +3342,11 @@ fn narrow(n: u64) -> i32 {
 /// Lane `lane` of the next fire reads its tokens off the device
 /// (`Shell::feed_tokens`).
 #[derive(Debug, Clone)]
-/// A lane's tokens the device put: the pool's u32 words they lie at (row
-/// `w / 128`, lane `w % 128`), in the fed ring's slots
-/// (`crate::program::Tokens::Device`).
+/// A lane's tokens the device put: the pool row and lane each lies at, in
+/// the fed ring's slots (`crate::program::Tokens::Device`).
 pub struct TokenFeed {
     pub lane: usize,
-    pub words: Vec<u32>,
+    pub at: Vec<(u32, u32)>,
 }
 
 /// `PIE_XLA_TIMING=1` prints where each fire's host time goes.

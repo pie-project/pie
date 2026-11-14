@@ -48,11 +48,11 @@ pub(super) fn stream_fire(
             let whole = pools.buffer().ok_or_else(|| Fault::Unbound {
                 what: "the pool, which a program still holds".to_string(),
             })?;
-            for (i, &word) in feed.words.iter().enumerate() {
-                let raw = whole.read_raw(i64::from(word) * 4, 4)?;
+            for (i, &(row, lane)) in feed.at.iter().enumerate() {
+                let raw = whole.read_raw(i64::from(row) * 512 + i64::from(lane) * 4, 4)?;
                 let w: [u8; 4] = raw.as_slice().try_into().map_err(|_| Fault::Program {
                     at: "serve::stream",
-                    why: format!("a token feed's word {word} read short"),
+                    why: format!("a token feed's row {row} lane {lane} read short"),
                 })?;
                 ids[offset as usize + i] = i32::from_le_bytes(w);
             }
