@@ -164,6 +164,6 @@ pub fn alone_plane() -> engine_cuda::ProgramPlane {
     let buffer = engine_cuda::device::Buffer::zeroed(SPAN).expect("the span's buffer");
     let end = Box::leak(Box::new(buffer)).ptr() + SPAN as u64;
     let mut plane = engine_cuda::ProgramPlane::new(engine_cuda::program::compile::Disk::disabled());
-    plane.set_span([(end, SPAN as u64), (0, 0)]);
+    plane.set_span((end, SPAN as u64));
     plane
 }

@@ -1072,30 +1072,6 @@ impl Pools {
             .max(live.min(room)))
     }
 
-    /// States the pool to the runtime as the chunks the fit holds and
-    /// `more` bytes' worth past them, within the range: what a later fit
-    /// may give the cache rows (the activation no fire has backed, the
-    /// bodies' allowance the bodies do not take). The runtime keeps the
-    /// pool under [`Pools::kept_back_bytes`] less than that meanwhile.
-    pub(crate) fn state_most(&mut self, more: u64) {
-        // A stated budget is the pool's whole: no fit gives it more.
-        if self.budget.is_some() {
-            return;
-        }
-        let chunk = self.chunks.layout().chunk_bytes.max(1);
-        let more = u32::try_from(more / chunk).unwrap_or(u32::MAX);
-        self.stated = Some(
-            self.fitted_chunks()
-                .saturating_add(more)
-                .min(self.chunks.total()),
-        );
-        self.paging.pages = self
-            .paging
-            .pages
-            .max(self.pages_within(self.stated.unwrap_or(0)));
-        self.pledge();
-    }
-
     /// The kv pages `chunks` chunks hold beside the weights they seat
     /// whole, as the fit counts them.
     fn pages_within(&self, chunks: u32) -> u64 {
@@ -1826,24 +1802,57 @@ impl Pools {
         self.records.remove(&key);
     }
 
-    /// Where a fire of `rung` tokens whose carve leaves `under` bytes of the
-    /// span below it lays its guests' programs, of `term` bytes at that
-    /// rung: two spans, each its end and its bytes. The first is in the
-    /// activation's span, right under the fire's own chunks; the second is
-    /// the state's last chunks, for what the first has no room for. Both
-    /// lie in the chunks the runtime keeps free of state at every rung the
-    /// fire may be cut to.
-    #[must_use]
-    pub fn program_span(&self, under: u64, term: u64) -> [(u64, u64); 2] {
+    /// Where a fire whose carve leaves `under` bytes of the span below it
+    /// lays its guests' programs, of `term` bytes at its rung: one span,
+    /// its end and its bytes, right under the fire's own chunks and on
+    /// down through the state's last chunks. It lies in the chunks the
+    /// runtime keeps free of state at every rung the fire may be cut to.
+    /// The state's chunks end where the activation starts wherever any of
+    /// the span is lent ([`Pools::state_whole`]), so the span is one.
+    pub fn program_span(&self, under: u64, term: u64) -> Result<(u64, u64)> {
+        let chunk = self.chunks.layout().chunk_bytes.max(1);
+        let lent = self.lent_bytes(under);
+        let term = term.div_ceil(chunk) * chunk;
+        if lent == 0 {
+            return Ok((self.chunks.state_end(), term));
+        }
+        if self.chunks.state_end() != self.chunks.activation_base() {
+            return Err(Fault::program(
+                "store::chunks",
+                "the activation lends its span to state and does not start where the \
+                 state's chunks end",
+            ));
+        }
+        Ok((self.chunks.activation_base() + lent, term))
+    }
+
+    /// The whole chunks of the span under a carve that leaves `under`
+    /// bytes below it, as the rungs state them lent.
+    fn lent_bytes(&self, under: u64) -> u64 {
         let chunk = self.chunks.layout().chunk_bytes.max(1);
         let act = u64::from(self.chunks.act_chunks());
-        let lent = (under / chunk).min(act.saturating_sub(1)) * chunk;
-        let term = term.div_ceil(chunk) * chunk;
-        let above = term.min(lent);
-        [
-            (self.chunks.activation_base() + lent, above),
-            (self.chunks.state_end(), term - above),
-        ]
+        (under / chunk).min(act.saturating_sub(1)) * chunk
+    }
+
+    /// The bytes of a fire's programs of `term` bytes that lie under the
+    /// state's end, where its carve leaves `under` bytes of the span.
+    #[must_use]
+    pub fn program_bytes_under_state(&self, under: u64, term: u64) -> u64 {
+        let chunk = self.chunks.layout().chunk_bytes.max(1);
+        (term.div_ceil(chunk) * chunk).saturating_sub(self.lent_bytes(under))
+    }
+
+    /// States the range whole to the runtime: every chunk it reserved, the
+    /// fit's and those a later fit may give the cache rows, which the
+    /// runtime keeps the pool under by [`Pools::kept_back_bytes`]
+    /// meanwhile. The state's chunks then end where the activation starts.
+    pub(crate) fn state_whole(&mut self) {
+        self.stated = Some(self.chunks.total());
+        self.paging.pages = self
+            .paging
+            .pages
+            .max(self.pages_within(self.chunks.total()));
+        self.pledge();
     }
 
     /// Backs `bytes` under the state's end for the guests' programs.

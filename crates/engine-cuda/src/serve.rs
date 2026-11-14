@@ -811,7 +811,7 @@ impl Shell {
             .into_iter()
             .map(|(rung, under)| {
                 let term = self.programs.fire_term(self.program_lanes(rung));
-                self.pools.program_span(under, term)[1].1
+                self.pools.program_bytes_under_state(under, term)
             })
             .max()
             .unwrap_or(0);
@@ -820,7 +820,7 @@ impl Shell {
 
     /// Points the guests' programs at where a fire of `tokens` tokens and
     /// `lanes` lanes lays them: under its own carve.
-    pub(crate) fn point_programs(&mut self, tokens: u64, lanes: u64) {
+    pub(crate) fn point_programs(&mut self, tokens: u64, lanes: u64) -> Result<()> {
         let span = program_span(
             &self.arena,
             &self.pools,
@@ -829,8 +829,9 @@ impl Shell {
             (self.budget.max_tokens, self.fire_lanes()),
             tokens,
             lanes,
-        );
+        )?;
         self.programs.set_span(span);
+        Ok(())
     }
 
     /// What a fire of `program` bound at `extents` takes of a fire's span.
@@ -1324,7 +1325,7 @@ pub(crate) fn program_span(
     limits: (u32, u32),
     tokens: u64,
     lanes: u64,
-) -> [(u64, u64); 2] {
+) -> Result<(u64, u64)> {
     let (rung, under) = arena.rung_of(forked, tokens, lanes, limits.0);
     pools.program_span(under, programs.fire_term(rung.min(limits.1)))
 }

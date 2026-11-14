@@ -1624,14 +1624,13 @@ impl Staged {
         let fitted = shell
             .pools
             .fit_the_card(bodies, held_for_fires, settled, &resident)?;
-        if stepping {
-            // The runtime is stated what the settled fit may come to, and
-            // keeps the pool under it by what this fit holds back.
-            let more = shell
-                .pools
-                .activation_unheld_bytes()
-                .saturating_add(fitted.bodies);
-            shell.pools.state_most(more);
+        if stepping || shell.arena.has_rungs() {
+            // The runtime is stated the range whole, what a later fit may
+            // yet give the cache rows with it, and keeps the pool under it
+            // by what this fit holds back. The state's chunks then end
+            // where the activation starts, so what a rung lends and what
+            // lies under it are one span.
+            shell.pools.state_whole();
         }
         // A load that arms later may have had its range reserved anew by
         // this fit: the workspaces are laid where it now lies.

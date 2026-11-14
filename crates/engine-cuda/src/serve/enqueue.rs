@@ -254,7 +254,7 @@ impl Shell {
         // the smallest rung that holds its lanes, which no rung the fire is
         // cut to lies under.
         let lanes = attachments.len() as u64;
-        self.point_programs(lanes, lanes);
+        self.point_programs(lanes, lanes)?;
         let mut verdicts: Vec<(usize, Fired)> = Vec::new();
         let mut launched = AirborneFires::default();
         for (at, attached) in attachments.iter().enumerate() {
@@ -542,7 +542,7 @@ impl FireCtx<'_> {
             (self.budget.max_tokens, self.fire_lanes),
             carve_rows,
             carve_lanes,
-        );
+        )?;
         self.programs.set_span(span);
         if let Some(ep) = self.ep {
             ep.seats(forked)

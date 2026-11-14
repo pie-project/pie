@@ -174,7 +174,7 @@ pub struct Plane {
     /// Where the fire in hand lays its programs' tables and scratch: the
     /// address their span ends at (under the fire's own activation) and
     /// the bytes backed below it ([`Plane::set_span`]).
-    span: [(u64, u64); 2],
+    span: (u64, u64),
     /// The most lanes one fire carries: the rows of a wave's own tables.
     fire_lanes: u32,
     /// The (program, extents) pairs bound now, what a fire of each takes
@@ -227,7 +227,7 @@ impl Plane {
             flight: u32::MAX,
             closing: std::collections::BTreeSet::new(),
             fan: fan::Fan::default(),
-            span: [(0, 0); 2],
+            span: (0, 0),
             fire_lanes: 0,
             pairs: Vec::new(),
             laid: Vec::new(),
@@ -245,9 +245,9 @@ impl Plane {
         self.fire_lanes = lanes;
     }
 
-    /// The fire in hand lays its programs in `span`: two spans, each its
-    /// end and the bytes backed below it, the first filled first.
-    pub fn set_span(&mut self, span: [(u64, u64); 2]) {
+    /// The fire in hand lays its programs in `span`: its end and the bytes
+    /// backed below it.
+    pub fn set_span(&mut self, span: (u64, u64)) {
         if self.span != span {
             self.laid.clear();
         }
@@ -697,18 +697,23 @@ impl Plane {
         }
         // The wave's own tables lie first in the fire's span, its groups'
         // under them.
-        let mut spans = self.span;
-        let need = self.wave.bytes().next_multiple_of(256);
-        let Some(first) = spans.iter_mut().find(|span| span.1 >= need) else {
-            return Err(Fault::Ceiling {
-                what: "bytes of the fire's span its guests' wave lays",
-                need,
-                have: spans[0].1.max(spans[1].1),
-            });
+        let (end, room) = self.span;
+        // What the fire lays, down from the span's end: the bind that
+        // opened each pair backed it, so a fire past it counted wrong.
+        let mut under = end;
+        let mut lay = |bytes: u64| -> Result<u64> {
+            under = under.saturating_sub(bytes.next_multiple_of(256));
+            if end - under > room {
+                return Err(Fault::Ceiling {
+                    what: "bytes of the fire's span its guests' programs lay",
+                    need: end - under,
+                    have: room,
+                });
+            }
+            Ok(under)
         };
-        first.0 -= need;
-        first.1 -= need;
-        self.wave.fly(context, first.0)?;
+        let wave_at = lay(self.wave.bytes())?;
+        self.wave.fly(context, wave_at)?;
         let main = context.stream();
         let Plane {
             programs,
@@ -751,10 +756,8 @@ impl Plane {
                     .any(|prepared| prepared.meets_across_blocks()),
             );
         }
-        // Each group's span, laid down from the end of the fire's spans:
-        // its flights fly one after another in it, as wide as its widest.
-        // A group the span in hand has no room for takes the next, or flies
-        // narrower flights: slower, never elsewhere.
+        // Each group's span, laid down from there: its flights fly one
+        // after another in it, as wide as its widest.
         let mut laying = Vec::with_capacity(groups.len());
         let mut places = Vec::with_capacity(groups.len());
         for (program_id, extents, members) in &groups {
@@ -765,30 +768,14 @@ impl Plane {
                 )
             })?;
             let bytes = fire_bytes(&program.batch(*extents)?.stages, *flight);
-            let mut lanes = u32::try_from(members.len())
+            let lanes = u32::try_from(members.len())
                 .unwrap_or(u32::MAX)
                 .checked_next_power_of_two()
                 .unwrap_or(u32::MAX)
                 .min(bytes.max_lanes)
                 .max(1);
-            let place = loop {
-                let need = bytes.at(lanes).next_multiple_of(256);
-                if let Some(span) = spans.iter_mut().find(|span| span.1 >= need) {
-                    span.0 -= need;
-                    span.1 -= need;
-                    break span.0;
-                }
-                if lanes == 1 {
-                    return Err(Fault::Ceiling {
-                        what: "bytes of the fire's span its guest programs lay",
-                        need,
-                        have: spans[0].1.max(spans[1].1),
-                    });
-                }
-                lanes /= 2;
-            };
             laying.push((*program_id, *extents, lanes));
-            places.push((place, lanes));
+            places.push((lay(bytes.at(lanes))?, lanes));
         }
         let fresh = *laid != laying;
         *laid = laying;
