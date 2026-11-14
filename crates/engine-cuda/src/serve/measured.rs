@@ -72,9 +72,8 @@ pub(crate) fn read(path: &Path) -> Option<Measured> {
     if lines.next()? != HEADER {
         return None;
     }
-    let mut field = |name: &str| -> Option<u64> {
-        lines.next()?.strip_prefix(name)?.trim().parse().ok()
-    };
+    let mut field =
+        |name: &str| -> Option<u64> { lines.next()?.strip_prefix(name)?.trim().parse().ok() };
     let bytes = field("bytes ")?;
     let bodies = field("bodies ")?;
     let captured = field("captured ")?;
@@ -107,6 +106,14 @@ pub(crate) fn write(path: &Path, measured: Measured) -> std::io::Result<()> {
 /// after holding a record's figure, the record under-held, and it is
 /// dropped, so the next load holds the ceiling and records again. The
 /// line to say, where there is one.
+///
+/// Armed whole, the record never shrinks: the key fixes the build and the
+/// deployment, so the bound is what a cold process's captures cost, and a
+/// load in a process that already holds what an earlier load of it built
+/// (its modules, its graph resources), or a re-arm within one load, costs
+/// less. The larger of the stored and the measured figure is kept, and a
+/// measurement whose captures came to less than the bodies' own census,
+/// something reused, is not written at all.
 pub(crate) fn conclude(
     path: &Path,
     held_from_record: bool,
@@ -116,7 +123,17 @@ pub(crate) fn conclude(
     wanted: usize,
 ) -> std::io::Result<Option<String>> {
     if whole {
-        write(path, measured)?;
+        if measured.bodies == 0 || measured.captured < measured.bytes {
+            return Ok(None);
+        }
+        let stored = read(path).map_or(0, |stored| stored.captured);
+        write(
+            path,
+            Measured {
+                captured: measured.captured.max(stored),
+                ..measured
+            },
+        )?;
         return Ok(None);
     }
     if !held_from_record {
@@ -152,7 +169,46 @@ mod tests {
         assert_eq!(measured.hold(), 500 << 20);
         std::fs::write(&at, "pie-bodies 1\nbytes 1\nbodies 1\n").unwrap();
         assert_eq!(read(&at), None, "an older record reads as none");
-        assert_ne!(path(&dir, "another deployment"), at, "another key, another file");
+        assert_ne!(
+            path(&dir, "another deployment"),
+            at,
+            "another key, another file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_record_never_shrinks_and_skips_a_reused_measurement() {
+        let dir = std::env::temp_dir().join(format!("pie-measured-keep-{}", std::process::id()));
+        let at = path(&dir, "deployment");
+        let cold = Measured {
+            bytes: 6 << 20,
+            bodies: 10,
+            captured: 8 << 20,
+        };
+        assert_eq!(conclude(&at, false, true, cold, 10, 10).unwrap(), None);
+        assert_eq!(read(&at), Some(cold));
+        // A warmer load costs less: the record keeps the cold figure.
+        let warm = Measured {
+            captured: 7 << 20,
+            ..cold
+        };
+        assert_eq!(conclude(&at, true, true, warm, 10, 10).unwrap(), None);
+        assert_eq!(read(&at), Some(cold));
+        // Captures under the census reused something: not written.
+        let reused = Measured {
+            captured: 1 << 20,
+            ..cold
+        };
+        assert_eq!(conclude(&at, true, true, reused, 10, 10).unwrap(), None);
+        assert_eq!(read(&at), Some(cold));
+        // A colder one costs more: the record grows to it.
+        let colder = Measured {
+            captured: 9 << 20,
+            ..cold
+        };
+        assert_eq!(conclude(&at, true, true, colder, 10, 10).unwrap(), None);
+        assert_eq!(read(&at), Some(colder));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -166,17 +222,27 @@ mod tests {
             captured: 500 << 20,
         };
         // Armed whole: written, nothing said.
-        assert_eq!(conclude(&at, false, true, measured, 161, 161).unwrap(), None);
+        assert_eq!(
+            conclude(&at, false, true, measured, 161, 161).unwrap(),
+            None
+        );
         assert_eq!(read(&at), Some(measured));
         // Short of whole on the ceiling: the record stands.
-        assert_eq!(conclude(&at, false, false, measured, 150, 161).unwrap(), None);
+        assert_eq!(
+            conclude(&at, false, false, measured, 150, 161).unwrap(),
+            None
+        );
         assert_eq!(read(&at), Some(measured));
         // Short of whole on the record's figure: dropped, and said.
         let said = conclude(&at, true, false, measured, 150, 161).unwrap();
         assert!(said.is_some_and(|line| line.contains("150 of 161 compositions armed")));
         assert_eq!(read(&at), None, "the next load holds bodies_mem");
         // Dropped twice is no error.
-        assert!(conclude(&at, true, false, measured, 150, 161).unwrap().is_some());
+        assert!(
+            conclude(&at, true, false, measured, 150, 161)
+                .unwrap()
+                .is_some()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

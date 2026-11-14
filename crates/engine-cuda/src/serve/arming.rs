@@ -1984,7 +1984,7 @@ impl Shell {
             && !st.verify
         {
             let took = stats.census.bytes as u64;
-            let captured = st.took.map_or(took, |captured| captured.max(took));
+            let captured = st.took.unwrap_or(took);
             let measured = super::measured::Measured {
                 bytes: took,
                 bodies: stats.census.bodies as u64,
