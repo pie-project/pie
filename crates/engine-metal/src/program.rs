@@ -73,7 +73,13 @@ pub struct Plane {
     by_hash: BTreeMap<u64, ProgramId>,
     instances: BTreeMap<InstanceId, Bound>,
     channels: BTreeMap<ChannelId, Arc<SharedRing>>,
-    batches: BTreeMap<(ProgramId, usize, launch::BatchKey), launch::Batch>,
+    /// The tables of the lanes one fire launches together, by program,
+    /// stage, key and frame in flight: laid when a binding opens them, at
+    /// the most lanes a fire flies, never grown at a fire.
+    batches: BTreeMap<(ProgramId, usize, launch::BatchKey, usize), launch::Batch>,
+    /// The most lanes one fire flies, and the frames in flight.
+    lanes: u32,
+    arms: usize,
     next_program: u64,
     next_instance: u64,
 }
@@ -95,6 +101,8 @@ impl Plane {
             instances: BTreeMap::new(),
             channels: BTreeMap::new(),
             batches: BTreeMap::new(),
+            lanes: 64,
+            arms: 1,
             next_program: 1,
             next_instance: 1,
         }
@@ -204,7 +212,49 @@ impl Plane {
                 ids: channels.to_vec(),
             },
         );
+        // Its batch tables are laid now, refused here rather than at a fire.
+        if let Err(why) = self.seat_batches(context, id) {
+            let _ = self.close_instance(id);
+            return Err(why);
+        }
         Ok(id)
+    }
+
+    /// The most lanes one fire flies and the frames in flight: what the
+    /// batch tables a binding opens are laid for.
+    pub fn set_flight(&mut self, lanes: u32, arms: usize) {
+        self.lanes = lanes.max(1);
+        self.arms = arms.max(1);
+    }
+
+    /// Lays the batch tables instance `id`'s stages fire with, one set a
+    /// frame in flight at the most lanes a fire flies, where none is laid.
+    fn seat_batches(&mut self, device: &Context, id: InstanceId) -> Result<()> {
+        let Some(bound) = self.instances.get_mut(&id) else {
+            return Ok(());
+        };
+        let program_id = bound.program_id;
+        let stages = self
+            .programs
+            .get(&program_id)
+            .map_or(0, |program| program.compiled.stages.len());
+        let lanes = self.lanes.next_power_of_two();
+        for stage in 0..stages {
+            let Some(prepared) = bound.session.prepared_mut(stage) else {
+                continue;
+            };
+            let Some(key) = prepared.batch_key() else {
+                continue;
+            };
+            for arm in 0..self.arms {
+                let slot = (program_id, stage, key, arm);
+                if !self.batches.contains_key(&slot) {
+                    self.batches
+                        .insert(slot, launch::Batch::build(device, prepared, lanes)?);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn register_channel(
@@ -274,10 +324,7 @@ impl Plane {
                 ring_facts(channel as u32, shape, channel_slot, channel_per_chunk)
             })
             .collect();
-        Ok(engine::ProgramFacts {
-            instance,
-            rings,
-        })
+        Ok(engine::ProgramFacts { instance, rings })
     }
 
     /// Points every pooled table and ring at the chunks their slots sit in
@@ -551,10 +598,10 @@ impl Plane {
 
     pub fn stage_batched(
         &mut self,
-        device: &Context,
         frame: &mut Frame,
         ids: &[InstanceId],
         carve: &GuestCarve,
+        arm: usize,
     ) -> Result<Vec<(InstanceId, Launched)>> {
         let mut results = Vec::with_capacity(ids.len());
         let mut by_program: BTreeMap<ProgramId, Vec<InstanceId>> = BTreeMap::new();
@@ -635,20 +682,16 @@ impl Plane {
                         continue;
                     };
                     let needed = u32::try_from(group.len()).unwrap_or(u32::MAX);
-                    let slot = (program_id, stage_index, key);
-                    let rebuild = self
-                        .batches
-                        .get(&slot)
-                        .is_none_or(|batch| batch.lanes() < needed);
-                    if rebuild {
-                        let batch =
-                            launch::Batch::build(device, group[0], needed.next_power_of_two())?;
-                        self.batches.insert(slot, batch);
-                    }
+                    let slot = (program_id, stage_index, key, arm % self.arms);
                     let batch = self
                         .batches
                         .get_mut(&slot)
-                        .expect("inserted or present one statement ago");
+                        .filter(|batch| batch.lanes() >= needed)
+                        .ok_or(Fault::Ceiling {
+                            what: "lanes of a batch laid when its binding opened",
+                            need: u64::from(needed),
+                            have: u64::from(self.lanes),
+                        })?;
                     batch.seat_scratch(room.take(batch.scratch_bytes(needed))?);
                     batch.encode(frame, &stage.regions, &mut group)?;
                 }
@@ -736,7 +779,7 @@ impl Plane {
         self.cache.forget(hash);
         self.by_hash.remove(&hash);
         self.programs.remove(&id);
-        self.batches.retain(|&(program, _, _), _| program != id);
+        self.batches.retain(|&(program, _, _, _), _| program != id);
         Ok(())
     }
 }
@@ -972,7 +1015,7 @@ mod tests {
             .collect();
         let mut frame = context.frame().expect("a frame");
         let launched = plane
-            .stage_batched(&context, &mut frame, &lanes, &guests(&context))
+            .stage_batched(&mut frame, &lanes, &guests(&context), 0)
             .expect("the lanes stage");
         assert!(
             launched
@@ -985,7 +1028,10 @@ mod tests {
             plane.settle_launched(lane).expect("the lane settles");
         }
         assert!(
-            plane.batches.keys().any(|&(owner, _, _)| owner == program),
+            plane
+                .batches
+                .keys()
+                .any(|&(owner, _, _, _)| owner == program),
             "two lanes of one program launch as a batch"
         );
         for lane in lanes {
