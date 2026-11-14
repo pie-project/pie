@@ -804,6 +804,7 @@ impl Shell {
         Ok(engine::program::ProgramFacts {
             fire_bytes_a_lane: 0,
             fire_bytes_fixed: 0,
+            max_lanes: 0,
             instance: footprint(SlotRole::Instance, held.instance_bytes),
             rings: held
                 .ring_bytes
