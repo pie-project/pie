@@ -3,9 +3,13 @@
 //! A kernel whose metadata names a hostcall, printf or heap buffer among
 //! its hidden arguments (a `printf`, an `assert`, a device `malloc`) has the
 //! runtime allocate that buffer, and start a listener thread for a hostcall,
-//! at the kernel's first launch: some tens of MiB on a large device, after
-//! the load, outside every ledger. A load refuses such a code object by the
-//! kernel's name instead.
+//! at the kernel's first launch. A kernel with a private segment (a spill,
+//! a private array) or a dynamic stack has ROCr grow the queue's scratch
+//! when a dispatch of it first needs more than the queue holds, from ROCr's
+//! own thread as the device reaches it. Either is some tens of MiB on a
+//! large device, taken after the load, outside every ledger and at a time
+//! no fire chooses. A load refuses such a code object by the kernel's name
+//! instead.
 
 use super::msgpack::{self, Mp};
 
@@ -21,9 +25,10 @@ const LATE_BUFFERS: &[(&str, &str)] = &[
     ("hidden_heap_v1", "heap"),
 ];
 
-/// Refuses `image` where one of its kernels asks the runtime for a buffer
-/// it allocates at first launch, naming the kernel and the buffer. An image
-/// that is not an ELF code object, or carries no metadata, asks nothing.
+/// Refuses `image` where one of its kernels asks the runtime for memory it
+/// allocates late (a buffer at first launch, or scratch), naming the kernel
+/// and what it asks. An image that is not an ELF code object, or carries no
+/// metadata, asks nothing.
 pub fn refuse_late_buffers(image: &[u8]) -> Result<(), String> {
     let asked = late_buffers(image);
     if asked.is_empty() {
@@ -31,18 +36,13 @@ pub fn refuse_late_buffers(image: &[u8]) -> Result<(), String> {
     }
     Err(asked
         .iter()
-        .map(|(kernel, buffer)| {
-            format!(
-                "kernel {kernel} asks the HIP runtime for a {buffer} buffer, which it \
-                 allocates at the kernel's first launch"
-            )
-        })
+        .map(|(kernel, asked)| format!("kernel {kernel} asks the HIP runtime for {asked}"))
         .collect::<Vec<_>>()
         .join("; "))
 }
 
-/// Each kernel of `image` and the late buffer it asks for.
-fn late_buffers(image: &[u8]) -> Vec<(String, &'static str)> {
+/// Each kernel of `image` and the late memory it asks for.
+fn late_buffers(image: &[u8]) -> Vec<(String, String)> {
     let mut asked = Vec::new();
     for meta in notes(image).filter_map(msgpack::read) {
         let Some(Mp::Arr(kernels)) = meta.get("amdhsa.kernels") else {
@@ -50,14 +50,40 @@ fn late_buffers(image: &[u8]) -> Vec<(String, &'static str)> {
         };
         for kernel in kernels {
             let name = kernel.get(".name").and_then(Mp::text).unwrap_or("?");
-            let Some(Mp::Arr(args)) = kernel.get(".args") else {
-                continue;
+            let args = match kernel.get(".args") {
+                Some(Mp::Arr(args)) => args.as_slice(),
+                _ => &[],
             };
             for arg in args {
                 let kind = arg.get(".value_kind").and_then(Mp::text);
                 if let Some(&(_, buffer)) = LATE_BUFFERS.iter().find(|(k, _)| Some(*k) == kind) {
-                    asked.push((name.to_owned(), buffer));
+                    asked.push((
+                        name.to_owned(),
+                        format!(
+                            "a {buffer} buffer, which it allocates at the kernel's first launch"
+                        ),
+                    ));
                 }
+            }
+            let private = kernel
+                .get(".private_segment_fixed_size")
+                .and_then(Mp::int)
+                .unwrap_or(0);
+            if private > 0 {
+                asked.push((
+                    name.to_owned(),
+                    format!(
+                        "scratch ({private} bytes a lane), which ROCr grows when a dispatch \
+                         first needs it"
+                    ),
+                ));
+            }
+            if kernel.get(".uses_dynamic_stack").is_some_and(Mp::truth) {
+                asked.push((
+                    name.to_owned(),
+                    "a dynamic stack in scratch, which ROCr grows when a dispatch first needs it"
+                        .to_owned(),
+                ));
             }
         }
     }
@@ -207,6 +233,46 @@ mod tests {
         );
         assert!(refuse_late_buffers(&image(&metadata("say", "hidden_printf_buffer"))).is_err());
         assert!(refuse_late_buffers(&image(&metadata("grow", "hidden_heap_v1"))).is_err());
+    }
+
+    /// The metadata of one kernel `name` with no arguments and one more
+    /// `field` of `value` (a MessagePack-encoded value).
+    fn metadata_with(name: &str, field: &str, value: &[u8]) -> Vec<u8> {
+        let mut m = vec![0x81];
+        s(&mut m, "amdhsa.kernels");
+        m.extend_from_slice(&[0x91, 0x82]);
+        s(&mut m, ".name");
+        s(&mut m, name);
+        s(&mut m, field);
+        m.extend_from_slice(value);
+        m
+    }
+
+    #[test]
+    fn a_kernel_using_scratch_is_refused_by_name() {
+        let spills = image(&metadata_with(
+            "spill",
+            ".private_segment_fixed_size",
+            &[0x30],
+        ));
+        assert_eq!(
+            refuse_late_buffers(&spills),
+            Err(
+                "kernel spill asks the HIP runtime for scratch (48 bytes a lane), which ROCr \
+                 grows when a dispatch first needs it"
+                    .to_owned()
+            )
+        );
+        let stack = image(&metadata_with("recurse", ".uses_dynamic_stack", &[0xc3]));
+        assert!(refuse_late_buffers(&stack).is_err_and(|why| why.contains("dynamic stack")));
+        let none = image(&metadata_with(
+            "tidy",
+            ".private_segment_fixed_size",
+            &[0x00],
+        ));
+        assert_eq!(refuse_late_buffers(&none), Ok(()));
+        let flat = image(&metadata_with("tidy", ".uses_dynamic_stack", &[0xc2]));
+        assert_eq!(refuse_late_buffers(&flat), Ok(()));
     }
 
     #[test]
