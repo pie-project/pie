@@ -1319,14 +1319,14 @@ impl Run<'_> {
         }
         let stream = self.ctx().stream();
         if crate::device::alloc::is_capturing(stream) {
-            return None;
+            return over_the_bus(|| "a capture cannot read the routes back".to_owned());
         }
         let count = routes.rows as usize * routes.width as usize;
         let mut picked = vec![0i32; count];
         if crate::device::copy_any(stream, picked.as_mut_ptr() as u64, routes.ptr, count * 4)
             .is_err()
         {
-            return None;
+            return over_the_bus(|| "the routes did not read back".to_owned());
         }
         let mut unique: Vec<i32> = picked.iter().copied().filter(|e| *e >= 0).collect();
         unique.sort_unstable();
@@ -1337,7 +1337,14 @@ impl Run<'_> {
         let per_expert = |plane: Tensor| u64::from(plane.width);
         let bytes_each = per_expert(codes) + per_expert(scales) + biases.map_or(0, per_expert);
         if unique.len() as u64 * bytes_each > STAGED_EXPERT_BYTES {
-            return None;
+            return over_the_bus(|| {
+                format!(
+                    "{} experts of {} KiB each are past the {} MiB the stage holds",
+                    unique.len(),
+                    bytes_each >> 10,
+                    STAGED_EXPERT_BYTES >> 20
+                )
+            });
         }
         let slot_of = |expert: i32| unique.binary_search(&expert).map_or(-1, |at| at as i32);
         let remapped: Vec<i32> = picked
@@ -1363,14 +1370,21 @@ impl Run<'_> {
                 plane.dtype,
             ))
         };
-        let staged_codes = stage("moe.staged.codes", codes)?;
-        let staged_scales = stage("moe.staged.scales", scales)?;
-        let staged_biases = match biases {
-            Some(biases) => Some(stage("moe.staged.biases", biases)?),
-            None => None,
+        let staged = (|| {
+            let codes = stage("moe.staged.codes", codes)?;
+            let scales = stage("moe.staged.scales", scales)?;
+            let biases = match biases {
+                Some(biases) => Some(stage("moe.staged.biases", biases)?),
+                None => None,
+            };
+            let routes_ptr = staging("moe.staged.routes", count * 4)?;
+            crate::device::copy_any(stream, routes_ptr, remapped.as_ptr() as u64, count * 4)
+                .ok()?;
+            Some((codes, scales, biases, routes_ptr))
+        })();
+        let Some((staged_codes, staged_scales, staged_biases, routes_ptr)) = staged else {
+            return over_the_bus(|| "the stage could not be allocated or filled".to_owned());
         };
-        let routes_ptr = staging("moe.staged.routes", count * 4)?;
-        crate::device::copy_any(stream, routes_ptr, remapped.as_ptr() as u64, count * 4).ok()?;
         Some((
             staged_codes,
             staged_scales,
@@ -1378,6 +1392,23 @@ impl Run<'_> {
             Tensor::new(routes_ptr, routes.rows, routes.width, routes.dtype),
         ))
     }
+}
+
+/// A select whose host-resident experts are not staged reads them where
+/// they lie, across the bus: counted, and said at the first and at every
+/// doubling of the count, with why.
+fn over_the_bus<T>(why: impl FnOnce() -> String) -> Option<T> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static READ: AtomicU64 = AtomicU64::new(0);
+    let read = READ.fetch_add(1, Ordering::Relaxed) + 1;
+    if read.is_power_of_two() {
+        eprintln!(
+            "engine-cuda: WARNING: a select reads its host-resident experts across the bus, \
+             unstaged: {}; {read} such select(s) so far",
+            why()
+        );
+    }
+    None
 }
 
 /// A staging buffer per `name`, grown by doubling. A buffer it outgrows is
@@ -1390,7 +1421,7 @@ fn staging(name: &'static str, bytes: usize) -> Option<u64> {
     use std::sync::Mutex;
     struct Held {
         live: HashMap<&'static str, (u64, usize)>,
-        retired: Vec<u64>,
+        retired: Vec<(u64, usize)>,
     }
     static HELD: Mutex<Option<Held>> = Mutex::new(None);
     if bytes == 0 {
@@ -1407,9 +1438,16 @@ fn staging(name: &'static str, bytes: usize) -> Option<u64> {
     }
     let size = bytes.max(cap * 2);
     let fresh = crate::device::alloc::raw_alloc(size)?;
-    if let Some((old, _)) = held.live.insert(name, (fresh, size)) {
-        held.retired.push(old);
+    if let Some((old, old_size)) = held.live.insert(name, (fresh, size)) {
+        held.retired.push((old, old_size));
     }
+    let retired: usize = held.retired.iter().map(|(_, size)| size).sum();
+    eprintln!(
+        "engine-cuda: the experts' stage `{name}` grows to {} MiB beside the pool ({} MiB \
+         retired, kept for copies in flight)",
+        size >> 20,
+        retired >> 20
+    );
     Some(fresh)
 }
 
