@@ -76,7 +76,7 @@ fn shell(trace: poem::Trace, path: &Path) -> Shell {
         page_size: 16,
         context: 256,
         slots: 1,
-        kv_budget: None,
+        kv_budget: Some(crate::POOL),
         allowance: engine::Allowance::WHOLE,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
