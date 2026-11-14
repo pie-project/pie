@@ -1317,9 +1317,9 @@ impl<'c> Run<'c> {
         self
     }
 
-    /// The decoded-weight tile each stream was warmed with at load, main
-    /// stream first; a plane wider than its tile is served by the
-    /// fused-dequant arm rather than growing it.
+    /// The decoded-weight tile laid for each stream at load, the widest
+    /// plane it decodes, main stream first; a plane wider than its tile is
+    /// served by the fused-dequant arm.
     #[must_use]
     pub fn decoded_tiles(mut self, tiles: &'c [u64]) -> Self {
         self.decoded = tiles;
@@ -1328,7 +1328,7 @@ impl<'c> Run<'c> {
 
     /// Whether this region's stream holds an `[n, k]` plane in bf16. A
     /// conditional body runs in the main stream's order and decodes into its
-    /// tile; a load that warmed no tiles decodes as it did.
+    /// tile; a load that laid no tiles decodes as it did.
     pub(crate) fn decoded_tile_holds(&self, n: u32, k: u32) -> bool {
         let at = match self.stream.get() {
             _ if self.side.is_empty() => 0,

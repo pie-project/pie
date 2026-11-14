@@ -644,8 +644,7 @@ fn refit(
             scoped,
         )
         .iter()
-        .map(|plane| crate::store::decoded_weight_reserve(*plane, 1))
-        .fold(0u64, u64::saturating_add);
+        .fold(0u64, |sum, plane| sum.saturating_add(*plane));
         compiled
             .arena
             .bytes
@@ -724,8 +723,8 @@ fn refit(
                      the widest plane fired at token rows, not the {} MiB plane fired at \
                      readout rows: at {asked_lanes} lanes it leaves no room for one sequence on \
                      this card. A plane past the tile is served by the fused-dequant arm.",
-                    crate::store::decoded_weight_reserve(plane.at_tokens, 1) >> 20,
-                    crate::store::decoded_weight_reserve(plane.widest, 1) >> 20,
+                    plane.at_tokens >> 20,
+                    plane.widest >> 20,
                 );
             }
         }
@@ -1384,10 +1383,7 @@ impl Shell {
         // prefill's dense gemm, into one tile a stream: a scratch slab like
         // any other, laid with the kernels' workspaces once the lattice is
         // walked.
-        shell.decoded_tiles = tiles
-            .iter()
-            .map(|plane| crate::store::decoded_weight_reserve(*plane, 1))
-            .collect();
+        shell.decoded_tiles = tiles.clone();
         let held_for_fires = programs;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(

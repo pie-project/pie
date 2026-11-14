@@ -193,21 +193,6 @@ pub fn program_scratch_reserve(max_lanes: u32, out_row_bytes: u64) -> u64 {
         .min(eta_exec::SCRATCH_MAX_BYTES)
 }
 
-/// What the decoded-weight tiles take on this load: a plane stored in codes
-/// and scales is decoded to bf16 before a prefill's dense gemm reads it,
-/// into one tile a stream the size of the widest plane fired on it, rounded
-/// up to 8 MiB: a plane up to the tile decodes into it, one past it takes
-/// the fused-dequant arm. The tile is a slab laid with the kernels'
-/// workspaces.
-#[must_use]
-pub fn decoded_weight_reserve(widest_plane_bytes: u64, streams: u32) -> u64 {
-    const GRAIN: u64 = 8 << 20;
-    widest_plane_bytes
-        .checked_next_multiple_of(GRAIN)
-        .unwrap_or(u64::MAX)
-        .saturating_mul(u64::from(streams.max(1)))
-}
-
 /// `slots` of `shelf`, one after another, each its planes in order.
 fn read_shelf(shelf: &Shelf, slots: &[u32]) -> Vec<u8> {
     let mut out = Vec::new();

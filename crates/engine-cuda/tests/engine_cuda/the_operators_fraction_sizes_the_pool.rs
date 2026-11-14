@@ -4,7 +4,7 @@ use engine_cuda::device::elastic::map_unit_for;
 use engine_cuda::device::elastic::{budget_bytes, safety_floor_bytes};
 use engine_cuda::store::kv::Paging;
 use engine_cuda::store::{
-    Accounting, BODIES_FLOOR_BYTES, PROGRAM_ROWS_A_LANE, bodies_allowance, decoded_weight_reserve,
+    Accounting, BODIES_FLOOR_BYTES, PROGRAM_ROWS_A_LANE, bodies_allowance,
     holds_within, one_slot_bytes, program_scratch_reserve, tokens_within, window_fire_bytes,
     window_of,
 };
@@ -57,8 +57,8 @@ fn a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes() {
     let issue_reserve =
         |lanes: u32| program_scratch_reserve(lanes, VOCAB * 4) * 6 / PROGRAM_ROWS_A_LANE;
     let live = budget_bytes(CARD - BEFORE, CARD, Allowance::WHOLE) - WEIGHTS;
-    let lm_head = decoded_weight_reserve(VOCAB * HIDDEN * 2, 1);
-    let mlp = decoded_weight_reserve(INTERMEDIATE * HIDDEN * 2, 1);
+    let lm_head = VOCAB * HIDDEN * 2;
+    let mlp = INTERMEDIATE * HIDDEN * 2;
     let working = |lanes: u32, tile: u64| {
         let fewer = u64::from(LANES - lanes);
         (ARENA - fewer * ARENA_A_LANE)
@@ -166,16 +166,11 @@ fn the_bodies_keep_their_floor_and_the_tile_is_taken_before_any_capture() {
         "a configured allowance under the floor is the floor"
     );
 
-    // The tile a stream is warmed with at load covers the widest plane its
-    // regions decode, so the capture's want is under what was taken.
-    let tile = decoded_weight_reserve(MLP_PLANE, 1);
+    // The tile a stream decodes into is laid at the widest plane its
+    // regions decode, so the capture's want is under what was laid.
     assert!(
-        tile >= FIRST_CAPTURE,
-        "the mlp stream's tile holds the capture: {tile}"
-    );
-    assert!(
-        (MLP_PLANE..MLP_PLANE + (8 << 20)).contains(&tile),
-        "in the scratch grain"
+        MLP_PLANE >= FIRST_CAPTURE,
+        "the mlp stream's tile holds the capture: {MLP_PLANE}"
     );
 }
 
@@ -191,29 +186,14 @@ fn the_decoded_weight_tiles_are_held_out_of_the_pool() {
     const INTERMEDIATE: u64 = 21_504;
     const POOL_ROOM: u64 = 6456 << 20;
     const ONE_SLOT_4K: u64 = 3520 << 20;
-    const GRAIN: u64 = 8 << 20;
 
     let lm_head = VOCAB * HIDDEN * 2;
     let mlp = INTERMEDIATE * HIDDEN * 2;
     assert_eq!(lm_head, 2_818_572_288);
     assert_eq!(mlp, 231_211_008);
 
-    let tile = decoded_weight_reserve(lm_head, 1);
-    assert_eq!(
-        tile,
-        lm_head.next_multiple_of(GRAIN),
-        "one tile a stream, in the scratch grain"
-    );
-    assert_eq!(
-        decoded_weight_reserve(lm_head, 2),
-        2 * tile,
-        "a side stream holds its own"
-    );
-    assert_eq!(
-        decoded_weight_reserve(0, 4),
-        0,
-        "a dense load decodes nothing"
-    );
+    // One tile a stream, at the widest plane it decodes.
+    let tile = lm_head;
     assert!(
         POOL_ROOM - tile >= ONE_SLOT_4K,
         "held out of the fitted pool, the L40S still seats a 4k sequence: {} MiB left",
