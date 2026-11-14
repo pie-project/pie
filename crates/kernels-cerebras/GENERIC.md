@@ -713,7 +713,19 @@ milestone's tail.
     - The host's 2-step loop (sigmas 1.0, 0.7672, 0) through that split lands within rel L2
       3.48e-3, cosine 0.99999393 of diffusers' loop over the same sigmas
       (`mk_tiny_flux2.py --loop`, f32).
-  - **Simulator** (`wafer-bench --reading`, flux2-mini's full step, 60 x 28 PEs): SIM_RESULT
+  - **Simulator** (`wafer-bench --reading --rows 1`, the Rust runner in the SDK container; every
+    entry the engine's, the static arrays the compile's; rel L2 / cosine against the capture):
+    - Entry units only (`--stages 1`): context_embed 6.19e-5 / 0.999999998, x_embed 7.64e-6 /
+      0.99999999997; 147k cycles of stamps; 3 min.
+    - Entry + lane prologue (its input the engine's timestep and guidance sinusoids) + double
+      block 0 (`--stages 2`): the block's residual out 1.397e-3 / 0.9999990 (text), 1.419e-3 /
+      0.9999990 (image), as M1d's capture-fed run; 7.02M cycles of stamps; 40 min.
+    - The full step does not finish on the simulator yet, from the capture's inputs either:
+      M1d's run stopped after 3 h (`std::runtime_error`), a 16-channel retry at 5.8M simulated
+      cycles ("the received length (0 bytes) is not expected (8192 bytes), could be a kernel
+      stall", then signal 11). That is the program's (M2), not the host's: the same `run/prog`
+      runs a step and a 2-step loop on the host bit for bit, and `wafer-bench --reading --steps
+      N --golden` holds each step's velocity and latent to engine-cpu's once it does.
   - Decode is unchanged: plan + build `diff -r` identical against 33ab39681's wafer-compile for
     q35_08b, q35_9b, llama31-8b, gptoss_20b, gemma_e2b and tiny t08.
   - Left for M2: the stream re-armed for a second launch (tiles kept, a step's entries
