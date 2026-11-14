@@ -820,6 +820,9 @@ impl FrameShell for Shell {
         let mut rs_pages: Vec<u32> = Vec::new();
         let mut rs_reads: Vec<Vec<std::ops::Range<u32>>> = vec![Vec::new(); lanes.len()];
         let mut rs_folded: Vec<Option<u32>> = vec![None; lanes.len()];
+        // Per lane, one past the last slot its rows land at, where a port
+        // says where they land: what its report tells the runtime.
+        let mut rs_ends: Vec<Option<u32>> = vec![None; lanes.len()];
         let mut rs_lens: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut rs_order: Vec<u32> = vec![0; lanes.len()];
         let mut snapshots = crate::store::rs::SnapTable {
@@ -1057,6 +1060,7 @@ impl FrameShell for Shell {
                         .saturating_add(stated_fold(*fold, cell, port)?)
                         .min(first + row.rows);
                     rs_folded[source] = Some(to - folded);
+                    rs_ends[source] = Some(first + row.rows);
                     if *fold == FoldLen::Device {
                         self.rs_ahead.insert(slot, to);
                     }
@@ -1780,6 +1784,7 @@ impl FrameShell for Shell {
                     offsets: Vec::new(),
                     fold,
                     fold_at: fold_at[row.source as usize].filter(|_| fold.is_none()),
+                    end: rs_ends[row.source as usize],
                 };
                 let Some(table) = placed else {
                     return report;

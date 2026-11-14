@@ -70,7 +70,7 @@ fn written(reports: Vec<super::KvReport>, tap: Option<Tap>) -> Vec<engine::KvWri
                 pages: report.pages,
                 offsets: report.offsets,
                 fold,
-                end: None,
+                end: report.end,
             }
         })
         .collect()
