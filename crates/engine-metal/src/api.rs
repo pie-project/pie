@@ -776,6 +776,25 @@ impl Engine for Metal {
         self.loaded()?.program_facts(program).map_err(fault)
     }
 
+    fn fire_facts(
+        &self,
+        program: ProgramId,
+        extents: &engine::BindExtents,
+    ) -> EngineResult<engine::FireFacts> {
+        self.loaded()?
+            .fire_facts(
+                program,
+                &eta_exec::Extents {
+                    row_count: extents.row_count,
+                    token_count: extents.token_count,
+                    sampled_rows: extents.sampled_rows,
+                    query_len: extents.query_len,
+                    key_len: extents.key_len,
+                },
+            )
+            .map_err(fault)
+    }
+
     fn rebind_slots(&mut self, rebind: engine::Rebind) -> EngineResult<()> {
         self.loaded_mut()?.rebind_slots(&rebind).map_err(fault)
     }

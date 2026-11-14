@@ -195,6 +195,7 @@ impl Plane {
             id,
             Bound {
                 program_id,
+                extents,
                 session,
                 geometry,
                 device,
@@ -485,7 +486,13 @@ impl Plane {
             .is_some_and(|program| program.plan.prologue_runs())
     }
 
-    pub fn fire(&mut self, context: &Context, id: InstanceId, at: Attach) -> Result<Fired> {
+    pub fn fire(
+        &mut self,
+        context: &Context,
+        id: InstanceId,
+        at: Attach,
+        carve: &GuestCarve,
+    ) -> Result<Fired> {
         let bound = self
             .instances
             .get_mut(&id)
@@ -505,7 +512,37 @@ impl Plane {
             &program.compiled,
             &program.plan,
             at,
+            carve,
         )
+    }
+
+    /// What a fire holding lanes of `program` bound at `extents` lays in
+    /// the span's guest region (`engine::Engine::fire_facts`): a lane's
+    /// value scratch; the tables stay the instance's and the batch's own.
+    pub fn fire_facts(&self, program: ProgramId, extents: &Extents) -> Result<engine::FireFacts> {
+        let program = self
+            .programs
+            .get(&program)
+            .ok_or_else(|| Fault::program("program::plane", format!("no program {program}")))?;
+        Ok(engine::FireFacts {
+            a_lane: Session::scratch_for(&program.compiled, extents)?,
+            fixed: 0,
+            max_lanes: 0,
+        })
+    }
+
+    /// Each live (program, extents) pair's fire term, once a pair.
+    pub fn live_terms(&self) -> Result<Vec<engine::FireFacts>> {
+        let mut pairs: Vec<(ProgramId, Extents)> = Vec::new();
+        for bound in self.instances.values() {
+            if !pairs.contains(&(bound.program_id, bound.extents)) {
+                pairs.push((bound.program_id, bound.extents));
+            }
+        }
+        pairs
+            .iter()
+            .map(|(program, extents)| self.fire_facts(*program, extents))
+            .collect()
     }
 
     pub fn stage_batched(
@@ -513,6 +550,7 @@ impl Plane {
         device: &Context,
         frame: &mut Frame,
         ids: &[InstanceId],
+        carve: &GuestCarve,
     ) -> Result<Vec<(InstanceId, Launched)>> {
         let mut results = Vec::with_capacity(ids.len());
         let mut by_program: BTreeMap<ProgramId, Vec<InstanceId>> = BTreeMap::new();
@@ -560,6 +598,9 @@ impl Plane {
                 {
                     continue;
                 }
+                // Stages fire one after another: each lays its scratch from
+                // the region's top afresh.
+                let mut room = carve.clone();
                 let mut groups: BTreeMap<Option<launch::BatchKey>, Vec<&mut launch::Prepared>> =
                     BTreeMap::new();
                 for (id, bound) in self.instances.iter_mut() {
@@ -580,10 +621,9 @@ impl Plane {
                 for (key, mut group) in groups {
                     let Some(key) = key else {
                         for prepared in group {
+                            prepared.seat_scratch(room.take(prepared.scratch_bytes())?);
                             #[cfg(target_vendor = "apple")]
                             prepared.zero_scratch_on(frame)?;
-                            #[cfg(not(target_vendor = "apple"))]
-                            prepared.zero_scratch()?;
                             for region in stage.regions.iter() {
                                 prepared.encode_into(frame, region)?;
                             }
@@ -605,6 +645,7 @@ impl Plane {
                         .batches
                         .get_mut(&slot)
                         .expect("inserted or present one statement ago");
+                    batch.seat_scratch(room.take(batch.scratch_bytes(needed))?);
                     batch.encode(frame, &stage.regions, &mut group)?;
                 }
             }
@@ -699,6 +740,9 @@ impl Plane {
 #[derive(Debug)]
 struct Bound {
     program_id: ProgramId,
+    /// The extents it was bound at: with the program, the pair whose fire
+    /// term the runtime counts (`engine::Engine::fire_facts`).
+    extents: Extents,
     session: Session,
     geometry: GeometryClass,
     /// The ports the program computes on the device
@@ -706,6 +750,46 @@ struct Bound {
     device: eta_ir::registry::PortMask,
     shared: Vec<Option<Arc<SharedRing>>>,
     ids: Vec<ChannelId>,
+}
+
+/// One fire's guest region: the span's bytes under the model's carve,
+/// handed out from the top down (`next`), never under `floor` (the backed
+/// span's bottom). A stage starts again from the top, since stages fire one
+/// after another and none reads another's scratch.
+#[derive(Debug, Clone)]
+pub struct GuestCarve {
+    buffer: crate::device::Buffer,
+    next: u64,
+    floor: u64,
+}
+
+impl GuestCarve {
+    #[must_use]
+    pub fn new(buffer: crate::device::Buffer, top: u64, floor: u64) -> GuestCarve {
+        GuestCarve {
+            buffer,
+            next: top,
+            floor,
+        }
+    }
+
+    /// `bytes` of the region, below what was taken.
+    pub fn take(&mut self, bytes: u64) -> Result<launch::ScratchAt> {
+        let at = self
+            .next
+            .checked_sub(bytes)
+            .filter(|&at| at >= self.floor)
+            .ok_or(Fault::Ceiling {
+                what: "bytes of the span's guest region the rung backs",
+                need: bytes,
+                have: self.next.saturating_sub(self.floor),
+            })?;
+        self.next = at;
+        Ok(launch::ScratchAt {
+            buffer: self.buffer.clone(),
+            offset: at,
+        })
+    }
 }
 
 fn release_seats(shared: &[Option<Arc<SharedRing>>]) {
@@ -728,6 +812,17 @@ mod tests {
 
     /// The slots instance `nth` of `facts` takes: its tables from logical
     /// chunk 1, its rings from chunk 2, each instance's apart.
+    /// A guest region of its own for fires with no model carve above
+    /// them: a buffer, laid from its top.
+    fn guests(context: &Context) -> GuestCarve {
+        const BYTES: u64 = 64 << 20;
+        GuestCarve::new(
+            crate::device::Buffer::zeroed(context, BYTES).expect("a guest region"),
+            BYTES,
+            0,
+        )
+    }
+
     fn slots_for(
         pools: &crate::store::Pools,
         facts: &engine::ProgramFacts,
@@ -873,7 +968,7 @@ mod tests {
             .collect();
         let mut frame = context.frame().expect("a frame");
         let launched = plane
-            .stage_batched(&context, &mut frame, &lanes)
+            .stage_batched(&context, &mut frame, &lanes, &guests(&context))
             .expect("the lanes stage");
         assert!(
             launched
@@ -1005,7 +1100,7 @@ mod tests {
             let mut tokens = Vec::new();
             for id in [own, pooled] {
                 let fired = plane
-                    .fire(&context, id, Attach::Epilogue)
+                    .fire(&context, id, Attach::Epilogue, &guests(&context))
                     .expect("the stage fires");
                 assert!(matches!(fired, Fired::Committed), "{id} fires: {fired:?}");
                 let cell = plane
