@@ -239,11 +239,17 @@ impl ResidencyPlanner {
     /// The error waiter `key` fails with when it has stood short of what
     /// only the policy can free past the seat deadline, rather than wait on.
     pub(super) fn short_expired(&self, key: EntryKey) -> Option<super::PlannerError> {
-        let (waited, host) = {
+        let (waited, host, answered) = {
             let short = self.short.lock();
-            (short.since(key.1)?.elapsed(), short.host_short(key.1))
+            (
+                short.since(key.1)?.elapsed(),
+                short.host_short(key.1),
+                short.answered_nothing(key.1),
+            )
         };
-        if waited < crate::pipeline::fire::SEAT_WAIT {
+        // The event, not a clock: the policy answered its pressure and
+        // freed nothing.
+        if !answered {
             return None;
         }
         // Short of device room while processes still run, it is behind
@@ -619,6 +625,28 @@ impl ResidencyPlanner {
     }
 
     /// Whether an eviction has this holder's set in hand.
+    /// Waits until `pid` is not being moved off the device: its eviction
+    /// ends (or rolls back) and tells its signal. At once where it is not.
+    pub async fn wait_not_moving(&self, pid: ProcessId) {
+        loop {
+            let Some(signal) = self
+                .lock_inner()
+                .procs
+                .get(&pid)
+                .map(|proc| proc.signal.clone())
+            else {
+                return;
+            };
+            let notified = signal.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.holder_moving(pid) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     pub fn holder_moving(&self, pid: ProcessId) -> bool {
         self.lock_inner()
             .procs
@@ -1154,6 +1182,7 @@ impl ResidencyPlanner {
     }
 
     pub fn pages_freed(self: &Arc<Self>) {
+        self.port.freed();
         self.re_arm_idle_reclaim();
         if self.waiters.load(Ordering::Acquire) != 0 {
             self.poke();

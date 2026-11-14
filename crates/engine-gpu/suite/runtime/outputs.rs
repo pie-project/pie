@@ -150,7 +150,7 @@ fn epilogue() -> TraceContainer {
 #[test]
 fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
     let boot = backend::DeviceBoot::default();
-    if backend::Context::bind(&boot, engine::Allowance::WHOLE).is_err() {
+    if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return;
     }
@@ -191,7 +191,10 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
                 max_voxels: None,
                 max_clips: None,
             },
-            residency: Residency::default(),
+            residency: Residency {
+                device: backend::ALLOWANCE,
+                ..Residency::default()
+            },
             ordinal: 0,
             frames_in_flight: 1,
         })
@@ -275,6 +278,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
             device_resolved: Default::default(),
             instance_slots: Vec::new(),
             ring_slots: Vec::new(),
+            adapter_slots: Vec::new(),
         },
         &channels,
     );

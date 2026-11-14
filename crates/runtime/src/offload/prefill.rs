@@ -805,7 +805,7 @@ pub async fn serve(
         && let Some(run) = super::stream::expect(&keys, from as usize).await
     {
         tokio::spawn(async move {
-            let ran = run_prefill(&whole).await;
+            let ran = run_prefill(&whole).await.map(drop);
             super::stream::done(run, ran);
         });
         tracing::debug!(
@@ -817,22 +817,33 @@ pub async fn serve(
         );
         return Ok(answer);
     }
-    run_prefill(&whole).await?;
+    let departure = run_prefill(&whole).await?;
     let t_run = t0.elapsed();
     // The program has exited; its working set's pages are kept as it is
-    // released, which may land just after.
-    let mut kept = false;
-    for _ in 0..50 {
-        kept = with_kv_lock(&stores.kv, "offload-serve", |kv| {
+    // released, which may land just after. Pages joining the cache and the
+    // program's full departure (every set released) are the events: once
+    // gone with the pages not all cached, they never will be.
+    let cached_event = with_kv_lock(&stores.kv, "offload-serve", |kv| kv.cached());
+    loop {
+        let joined = cached_event.notified();
+        let gone = crate::planner::DepartureWatch::next();
+        let mut joined = std::pin::pin!(joined);
+        let mut gone = std::pin::pin!(gone);
+        joined.as_mut().enable();
+        gone.as_mut().enable();
+        let kept = with_kv_lock(&stores.kv, "offload-serve", |kv| {
             kv.cached_run_any_tier(&keys).len() == keys.len()
         });
         if kept {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    if !kept {
-        bail!("the prefill's pages are not all cached here");
+        if departure.gone() {
+            bail!("the prefill's pages are not all cached here");
+        }
+        tokio::select! {
+            () = &mut joined => {}
+            () = &mut gone => {}
+        }
     }
     tracing::debug!(
         target: "pie::offload",
@@ -859,37 +870,28 @@ pub async fn fetch(keys: Vec<Hash256>, from: u32) -> Result<PageStream> {
     }
     let stores = crate::store::registry::try_get(0, 0)
         .ok_or_else(|| anyhow!("no engine serves a model here"))?;
-    export(&stores, 0, &keys, from as usize, false).await
+    export(&stores, 0, &keys, from as usize).await
 }
 
 /// Reads out sealed pages `keys[from..]` a chunk at a time; all of `keys`
 /// must be found here as one run, and what is read must be on the device.
-/// They are held until the last chunk is read. With `wait`, gives a
-/// just-ended program's release a moment to keep them.
+/// They are held until the last chunk is read; refused at once where they
+/// are not.
 async fn export(
     stores: &Stores,
     engine: usize,
     keys: &[Hash256],
     from: usize,
-    wait: bool,
 ) -> Result<PageStream> {
-    let tries = if wait { 50 } else { 1 };
-    let mut held = None;
-    for _ in 0..tries {
-        held = with_kv_lock(&stores.kv, "offload-export", |kv| {
-            let run = kv.cached_run_any_tier(keys);
-            if run.len() != keys.len() || from >= run.len() {
-                return None;
-            }
-            let hashes = kv.run_slots(&run[from..]).unwrap_or_default();
-            kv.pin_resident(&run[from..])
-                .map(|(pin, device)| (pin, device, hashes))
-        });
-        if held.is_some() {
-            break;
+    let held = with_kv_lock(&stores.kv, "offload-export", |kv| {
+        let run = kv.cached_run_any_tier(keys);
+        if run.len() != keys.len() || from >= run.len() {
+            return None;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+        let hashes = kv.run_slots(&run[from..]).unwrap_or_default();
+        kv.pin_resident(&run[from..])
+            .map(|(pin, device)| (pin, device, hashes))
+    });
     let (pin, device, hashes) =
         held.ok_or_else(|| anyhow!("those pages are not all cached on the device here"))?;
     let release = |stores: &Stores, pin| {
@@ -969,7 +971,9 @@ async fn read_chunk(
 /// The built-in program [`serve`] runs; no HTTP route serves it.
 pub const PROGRAM: &str = "prefill";
 
-async fn run_prefill(tokens: &[u32]) -> Result<()> {
+/// Runs the built-in prefill program over `tokens`; answers a watch on its
+/// full departure, taken while it runs.
+async fn run_prefill(tokens: &[u32]) -> Result<crate::planner::DepartureWatch> {
     use crate::inferlet::program;
     let reference = program::ProgramRef::parse(PROGRAM)?;
     let name = program::resolve(None, &reference)
@@ -978,7 +982,7 @@ async fn run_prefill(tokens: &[u32]) -> Result<()> {
     program::load(&name).await?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let input = serde_json::json!({ "tokens": tokens }).to_string();
-    crate::inferlet::process::spawn(
+    let (_, departure) = crate::inferlet::process::spawn_watched(
         "pie".into(),
         name,
         input,
@@ -993,5 +997,5 @@ async fn run_prefill(tokens: &[u32]) -> Result<()> {
     rx.await
         .map_err(|_| anyhow!("the prefill program went away"))?
         .map_err(|why| anyhow!("the prefill program failed: {why}"))?;
-    Ok(())
+    Ok(departure)
 }

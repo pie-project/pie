@@ -45,6 +45,7 @@ use wasmtime::component::Resource;
 
 pub use context::FireContext;
 
+use ::engine::fire::UNFOLDED_ROWS;
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 
 use crate::pipeline::Pipeline;
@@ -130,13 +131,22 @@ enum ReservedError {
 }
 
 fn stale_demand_error() -> String {
-    format!(
-        "pipeline: resource demand kept drifting under contention \
-         (still stale after {STALE_DEMAND_ATTEMPTS} re-acquisitions)"
-    )
+    "pipeline: resource demand reads stale against a grant quoted for the same demand".to_string()
 }
 
-const STALE_DEMAND_ATTEMPTS: usize = 3;
+/// A grant found stale is quoted again only on the drift event: the demand
+/// read now differs from the one it was quoted for. Stale against the very
+/// demand it was quoted for, no new quote can cover it, and it is refused.
+fn requote_on_drift(
+    stale_at: &mut Option<crate::planner::Demand>,
+    quoted: crate::planner::Demand,
+) -> bool {
+    if *stale_at == Some(quoted) {
+        return false;
+    }
+    *stale_at = Some(quoted);
+    true
+}
 
 /// A kv epoch a fire holds: settled by whoever finishes the fire, or, let go
 /// unsettled, when dropped — at once while the fire was never submitted,
@@ -376,11 +386,11 @@ async fn ask_while_tail_lands<C: FireContext, A: std::future::Future>(
                         .await
                         .map_err(|error| format!("pipeline: settle for windowed kv: {error:#}"))?;
                 }
+                // A front signals exactly when it reads as settled: none
+                // drained means another finalizer took it, and the next
+                // front is waited on.
                 if any {
                     drained();
-                } else {
-                    // A front that signals before it reads as settled.
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
             }
         }
@@ -504,7 +514,6 @@ fn host_rs_plan(
     req: &crate::engine::FireRequest,
     fold: &geometry::Fold,
     snapshots: &[u32],
-    bound: u32,
 ) -> Result<rs::RsPlan, String> {
     if ids.is_empty() {
         return Ok(rs::RsPlan::Groups(Vec::new()));
@@ -533,7 +542,8 @@ fn host_rs_plan(
         let (start, end) = span(first);
         let fold = group_fold(fold, first, frozen, end);
         for &lane in lanes {
-            check_unfolded(lane, bound, frozen, span(lane).1, fold)?;
+            let (start, end) = span(lane);
+            check_unfolded(lane, frozen, start, end, fold)?;
         }
         let writes =
             if lanes.len() == 1 && start == frozen && fold == rs::GroupFold::Host(end - start) {
@@ -569,7 +579,6 @@ fn device_rs_plan(
     groups: &LaneGroups,
     lanes: &PassLanes,
     fold: &geometry::Fold,
-    bound: u32,
 ) -> Result<rs::RsPlan, String> {
     if ids.is_empty() {
         return Ok(rs::RsPlan::Groups(Vec::new()));
@@ -583,7 +592,9 @@ fn device_rs_plan(
             .map_err(|error| error.to_string())?;
         let reserved = lanes.cursors[first].lock().unwrap().reserved;
         let fold = group_fold(fold, first, frozen, reserved);
-        check_unfolded(first, bound, frozen, reserved, fold)?;
+        // The device picks where a lane's rows start, so the host cannot
+        // bound what it carries in: its engine keeps a replay past
+        // `UNFOLDED_ROWS` inside its scratch or fails the fire.
         plans.push(rs::GroupPlan {
             lanes: group.clone(),
             writes: Some(frozen..reserved),
@@ -594,46 +605,48 @@ fn device_rs_plan(
     Ok(rs::RsPlan::Groups(plans))
 }
 
-/// The rows lane `lane` holds unfolded once a pass writing up to `end`
-/// lands with `fold`, from `frozen` folded: refused past `bound`, one rs
-/// page ([`unfolded_bound`]; 0: no rs list, no bound), before anything is
-/// submitted. The fold point is the inferlet's (a speculative rollback
-/// lands on it): the runtime never folds more behind its back. A fold the
-/// device computes is unknown before the fire: it counts as nothing folded,
-/// so no engine ever has to refuse mid-fire.
+/// Lane `lane`'s pass, writing `start..end` over a state folded through
+/// `frozen` and landing with `fold`, refused by name before anything is
+/// submitted: (a) when it carries more than [`UNFOLDED_ROWS`] unfolded
+/// rows in, `start - frozen`; (b) when a fold the host knows leaves more
+/// than that unfolded behind it, `end - frozen - folded`. The fire's own
+/// rows never count against the bound. A fold the device computes leaves
+/// a count unknown before the fire: (a) checks it at the next fire. The
+/// fold point is the inferlet's (a speculative rollback lands on it): the
+/// runtime never folds more behind its back.
 fn check_unfolded(
     lane: usize,
-    bound: u32,
     frozen: u32,
+    start: u32,
     end: u32,
     fold: rs::GroupFold,
 ) -> Result<(), String> {
-    let folded = match fold {
-        rs::GroupFold::Device | rs::GroupFold::None => 0,
-        rs::GroupFold::Host(count) => count,
+    check_carried(lane, start.saturating_sub(frozen))?;
+    let rs::GroupFold::Host(folded) = fold else {
+        return Ok(());
     };
-    let unfolded = end.saturating_sub(frozen).saturating_sub(folded);
-    if bound == 0 || unfolded <= bound {
+    let left = end.saturating_sub(frozen).saturating_sub(folded);
+    if left <= UNFOLDED_ROWS {
         return Ok(());
     }
     Err(format!(
-        "pipeline: lane {lane} would hold {unfolded} recurrent rows unfolded, past one rs page \
-         ({bound} rows); fold what it has written before it writes more"
+        "pipeline: lane {lane} would leave {left} recurrent rows unfolded behind this fire, \
+         past the {UNFOLDED_ROWS} rows earlier fires may leave unfolded for a lane's next \
+         fire; fold what it has written before it writes more"
     ))
 }
 
-/// The bound on a lane's unfolded recurrent rows: one rs page.
-///
-/// One rule on every backend, derived from the pool, not stated by the
-/// engine: a lane holds at most one rs page unfolded, the rows a slot of
-/// the RsBuffer list shape holds (what every backend pages the rs buffer
-/// by). A pool with no rs list has no bound to apply (0).
-fn unfolded_bound(stores: &crate::store::registry::Stores) -> u32 {
-    stores
-        .shared
-        .as_ref()
-        .and_then(|shared| shared.lock().unwrap().rs_list())
-        .map_or(0, |list| list.tokens)
+/// (a) of [`check_unfolded`]: `carried` rows earlier fires wrote and
+/// nothing folded, which this fire replays ahead of its own.
+fn check_carried(lane: usize, carried: u32) -> Result<(), String> {
+    if carried <= UNFOLDED_ROWS {
+        return Ok(());
+    }
+    Err(format!(
+        "pipeline: lane {lane} carries {carried} recurrent rows unfolded into this fire, past \
+         the {UNFOLDED_ROWS} rows earlier fires may leave unfolded for a lane's next fire; \
+         fold what it has written before it writes more"
+    ))
 }
 
 fn group_fold(fold: &geometry::Fold, first: usize, frozen: u32, end: u32) -> rs::GroupFold {
@@ -758,7 +771,13 @@ impl RaiseFunding {
                 return;
             };
             let target = crate::store::shared::cap_for(&shared, rows);
+            // A step with nothing to do waits on the rung's next change (a
+            // raise, a copy, the cap, room freed), armed at its top, or the
+            // stop.
             while !stopped.load(std::sync::atomic::Ordering::Acquire) {
+                let watch = crate::store::shared::rung_watch(engine);
+                tokio::pin!(watch);
+                watch.as_mut().enable();
                 crate::store::shared::raise_now(&shared, engine, rows);
                 if crate::store::shared::fire_cap(engine) >= target {
                     return;
@@ -784,14 +803,18 @@ impl RaiseFunding {
                             Ok(crate::planner::Acquired::Granted(grant)) => {
                                 crate::scheduler::arming::fund(engine, grant);
                             }
-                            Ok(
-                                crate::planner::Acquired::Requote | crate::planner::Acquired::Yield,
-                            ) => {
-                                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                            // Quoted again: the planner's answer is the event.
+                            Ok(crate::planner::Acquired::Requote) => {}
+                            Ok(crate::planner::Acquired::Yield) => {
+                                tokio::select! {
+                                    _ = planner.wait_resident(pid) => {}
+                                    () = stop.notified() => return,
+                                }
                             }
                             Err(error) => {
                                 tracing::debug!(engine, %error, "a rung's arming room is refused");
                                 *failed.lock().unwrap() = Some(error.to_string());
+                                crate::store::shared::rung_changed(engine);
                                 return;
                             }
                         }
@@ -799,8 +822,12 @@ impl RaiseFunding {
                     }
                     // The room is there and state lies in the span: the
                     // walker moves it out, the engine copying it. Or the
-                    // rung is being armed with room already funded.
-                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    // rung is being armed with room already funded. Either
+                    // tells the rung.
+                    tokio::select! {
+                        () = &mut watch => {}
+                        () = stop.notified() => return,
+                    }
                     continue;
                 }
                 let demand = crate::planner::Demand {
@@ -833,21 +860,25 @@ impl RaiseFunding {
                         if let Err(error) = taken {
                             tracing::error!(engine, %error, "a raise's copy was refused");
                             *failed.lock().unwrap() = Some(error);
+                            crate::store::shared::rung_changed(engine);
                             return;
                         }
                         crate::store::shared::raise_now(&shared, engine, rows);
-                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                     }
                     Ok(crate::planner::Acquired::Requote) => {
                         tracing::debug!(engine, "a raise's room is quoted again");
                     }
                     Ok(crate::planner::Acquired::Yield) => {
                         tracing::debug!(engine, "a raise's process yields");
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        tokio::select! {
+                            _ = planner.wait_resident(pid) => {}
+                            () = stop.notified() => return,
+                        }
                     }
                     Err(error) => {
                         tracing::debug!(engine, %error, "a raise's room is refused");
                         *failed.lock().unwrap() = Some(error.to_string());
+                        crate::store::shared::rung_changed(engine);
                         return;
                     }
                 }
@@ -872,16 +903,21 @@ async fn wait_for_rung(
     let Some(failed) = failed else {
         return Ok(());
     };
-    while crate::store::shared::fire_cap(engine) < width {
-        if let Some(why) = failed() {
-            return Err(format!(
-                "pipeline: a fire of {width} rows needs a wider activation rung, and its room \
-                 was refused: {why}"
-            ));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    // The cap moving and the funding failing both tell the rung.
+    let mut refused = None;
+    crate::store::shared::rung_wait_until(engine, || {
+        refused = failed();
+        refused.is_some() || crate::store::shared::fire_cap(engine) >= width
+    })
+    .await;
+    if crate::store::shared::fire_cap(engine) >= width {
+        return Ok(());
     }
-    Ok(())
+    Err(format!(
+        "pipeline: a fire of {width} rows needs a wider activation rung, and its room was \
+         refused: {}",
+        refused.unwrap_or_default()
+    ))
 }
 
 impl Drop for RaiseFunding {
@@ -1586,7 +1622,7 @@ async fn reserve<C: FireContext>(
     rs_plan: impl Fn() -> Result<rs::RsPlan, String>,
     windowed: bool,
 ) -> Result<Reserved, String> {
-    let mut attempts = 0;
+    let mut stale_at = None;
     'grant: loop {
         let mut kv_pages = 0usize;
         for (set, written) in sets {
@@ -1624,7 +1660,7 @@ async fn reserve<C: FireContext>(
                     epoch: FireEpoch::begin(model, engine, stores, ctx.process_id()),
                 });
             }
-            Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => attempts += 1,
+            Err(ReservedError::Stale) if requote_on_drift(&mut stale_at, demand) => {}
             Err(ReservedError::Stale) => return Err(stale_demand_error()),
             Err(ReservedError::Fatal(error)) => return Err(error),
         }
@@ -2156,8 +2192,10 @@ pub(crate) async fn seat_lane_slots(
     stores: &crate::store::registry::Stores,
     groups: &LaneGroups,
 ) -> Result<(), String> {
-    let deadline = crate::rt::time::Instant::now() + SEAT_WAIT;
     let freed = stores.seats.lock().unwrap().freed();
+    // A working set letting its seats go is the event: it waits for it,
+    // however long, and is refused at once only where no release could
+    // ever seat it.
     loop {
         let mut freed = Box::pin(freed.notified());
         freed.as_mut().enable();
@@ -2170,15 +2208,7 @@ pub(crate) async fn seat_lane_slots(
                 "pipeline: seating this fire's lanes: {refusal}; no release can seat it"
             ));
         }
-        let now = crate::rt::time::Instant::now();
-        if now >= deadline {
-            return Err(format!(
-                "pipeline: seating this fire's lanes: {refusal}; waited {:?} for a peer to \
-                 release seats and none did",
-                SEAT_WAIT
-            ));
-        }
-        let _ = crate::rt::time::timeout(deadline - now, freed).await;
+        freed.await;
     }
 }
 
@@ -2966,6 +2996,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
         } else {
             Attach::No
         };
+        // What this pass claims to compute for others to wait on, held until
+        // its last piece settles.
+        let mut coalesced: Option<crate::pipeline::coalesce::ClaimGuard> = None;
         // Rows no worker here holds may be prefilled on a peer, whose pages
         // land in the host tier for the promote below to find. Media stays
         // here.
@@ -2976,8 +3009,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
             let lane = &full.lanes[0];
             // Pages another pass is computing now are waited for, not
             // computed again.
-            crate::pipeline::coalesce::before_pass(&stores, ws.id, u64::from(lane.kv.held), slots)
-                .await;
+            coalesced = crate::pipeline::coalesce::before_pass(
+                &stores,
+                ws.id,
+                u64::from(lane.kv.held),
+                slots,
+            )
+            .await;
             crate::offload::prefill::before_pass(
                 pid,
                 &stores,
@@ -3221,8 +3259,19 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 let ahead = PIECES_AHEAD.max(frame_size);
                 if at >= ahead && wanted > cut_at {
                     let behind = submitted[at - ahead].clone();
-                    while !behind.is_settled() && crate::store::shared::fire_cap(engine) <= cut_at {
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    // The piece behind settling or the cap rising, each its
+                    // own event.
+                    loop {
+                        let watch = crate::store::shared::rung_watch(engine);
+                        tokio::pin!(watch);
+                        watch.as_mut().enable();
+                        if behind.is_settled() || crate::store::shared::fire_cap(engine) > cut_at {
+                            break;
+                        }
+                        tokio::select! {
+                            () = &mut watch => {}
+                            _ = behind.clone() => {}
+                        }
                     }
                 }
                 let cap = crate::store::shared::fire_cap(engine);
@@ -3368,15 +3417,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 if windowed {
                     host_window_plan(&req, &fold, &rs_ws_ids, keep)
                 } else {
-                    host_rs_plan(
-                        &stores,
-                        &rs_ws_ids,
-                        &groups,
-                        &req,
-                        &fold,
-                        &inside,
-                        unfolded_bound(&stores),
-                    )
+                    host_rs_plan(&stores, &rs_ws_ids, &groups, &req, &fold, &inside)
                 }
             };
             let reserved = reserve(
@@ -3573,6 +3614,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
         }
         if let (Some(want), Some(last)) = (rung_want, submitted.last()) {
             last.on_settled(move || drop(want));
+        }
+        // The claims on what this pass computes stand until its last piece
+        // settles (its pages sealed); a pass that ends early drops them.
+        if let (Some(guard), Some(last)) = (coalesced.take(), submitted.last()) {
+            last.on_settled(move || drop(guard));
         }
         advance_cursors(&pass_lanes, Some(&landings), &matched, &fold, &settles);
         crate::probe_fire_record!(submit_probe.total_us, submit_clock.elapsed());
@@ -4341,14 +4387,7 @@ async fn fire_device_geometry<C: FireContext>(
         if windowed {
             device_window_plan(&stores, ws.id, &write_indexes[0], &rs_ws_ids)
         } else {
-            device_rs_plan(
-                &stores,
-                &rs_ws_ids,
-                &groups,
-                &pass_lanes,
-                &fold,
-                unfolded_bound(&stores),
-            )
+            device_rs_plan(&stores, &rs_ws_ids, &groups, &pass_lanes, &fold)
         }
     };
     let reserved = reserve(
@@ -4770,6 +4809,78 @@ pub(crate) mod lifecycle_tests {
         Ok(())
     }
 
+    /// Yields until `task` has run as far as it can without an event.
+    async fn settle_tasks() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A stale grant is quoted again on drift (the demand changed), not by
+    /// count, and refused when stale against the demand it was quoted for.
+    #[test]
+    fn a_stale_grant_is_quoted_again_only_on_drift() {
+        let demand = |kv_pages| crate::planner::Demand {
+            kv_pages,
+            rs: crate::store::rs::RsUnits::default(),
+        };
+        let mut stale_at = None;
+        assert!(
+            requote_on_drift(&mut stale_at, demand(4)),
+            "first stale: quoted again"
+        );
+        assert!(
+            requote_on_drift(&mut stale_at, demand(6)),
+            "drifted: quoted again"
+        );
+        assert!(
+            requote_on_drift(&mut stale_at, demand(7)),
+            "drifted again: however often"
+        );
+        assert!(
+            !requote_on_drift(&mut stale_at, demand(7)),
+            "stale against the demand it was quoted for: refused"
+        );
+    }
+
+    /// A piece waiting for a wider rung wakes when the cap is lifted, not
+    /// on a clock.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_piece_waiting_on_the_rung_wakes_when_the_cap_lifts() {
+        const ENGINE: usize = 40;
+        crate::store::shared::set_fire_cap_for_test(ENGINE, 16);
+        let waiting = tokio::spawn(wait_for_rung(ENGINE, 256, Some(|| None)));
+        settle_tasks().await;
+        assert!(!waiting.is_finished(), "cut to 16, it waits");
+        crate::store::shared::set_fire_cap_for_test(ENGINE, 256);
+        settle_tasks().await;
+        assert!(waiting.is_finished(), "the cap lifted: it runs");
+        assert!(waiting.await.unwrap().is_ok());
+        crate::store::shared::set_fire_cap_for_test(ENGINE, u32::MAX);
+    }
+
+    /// A piece waiting for a wider rung wakes when its raise's funding is
+    /// refused, and says so.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_piece_waiting_on_the_rung_wakes_when_its_funding_is_refused() {
+        const ENGINE: usize = 41;
+        crate::store::shared::set_fire_cap_for_test(ENGINE, 16);
+        let refused = Arc::new(Mutex::new(None::<String>));
+        let failed = {
+            let refused = refused.clone();
+            move || refused.lock().unwrap().clone()
+        };
+        let waiting = tokio::spawn(wait_for_rung(ENGINE, 256, Some(failed)));
+        settle_tasks().await;
+        assert!(!waiting.is_finished());
+        *refused.lock().unwrap() = Some("no room".into());
+        crate::store::shared::rung_changed(ENGINE);
+        settle_tasks().await;
+        assert!(waiting.is_finished(), "the refusal told the rung: it ends");
+        assert!(waiting.await.unwrap().unwrap_err().contains("no room"));
+        crate::store::shared::set_fire_cap_for_test(ENGINE, u32::MAX);
+    }
+
     pub(crate) fn pending_fire_fixture(
         cells: BoundCells,
     ) -> (
@@ -5142,6 +5253,8 @@ mod rung_wait_tests {
         let refuse = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             *says.lock().unwrap() = Some("the device is short".into());
+            // As a raise's funding tells the rung when it fails.
+            crate::store::shared::rung_changed(REFUSED);
         });
         let waited = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -5679,36 +5792,39 @@ mod fold_tests {
 #[cfg(test)]
 mod unfolded_tests {
     use super::*;
+    use crate::inferlet::host::working_set::Cursor;
 
-    /// A lane may hold one rs page unfolded; one row past it is refused by
-    /// name before anything is submitted; 0 (no rs list) is unbounded;
-    /// what the pass folds counts against it; a fold the device computes
-    /// counts as nothing folded.
+    /// A lane carries at most `UNFOLDED_ROWS` unfolded rows into a fire,
+    /// whatever its own rows; one past is refused by name; a fold the host
+    /// knows may leave no more behind it; a device fold's leftover waits for
+    /// the next fire.
     #[test]
-    fn a_pass_past_the_unfolded_bound_is_refused() {
-        // Folded through 100, writing through 164: 64 unfolded.
-        assert!(check_unfolded(0, 64, 100, 164, rs::GroupFold::None).is_ok());
-        let refused = check_unfolded(3, 64, 100, 165, rs::GroupFold::None).unwrap_err();
-        assert!(refused.contains("lane 3") && refused.contains("65") && refused.contains("64"));
-        assert!(refused.contains("one rs page (64 rows)"), "{refused}");
+    fn a_pass_past_the_unfolded_rows_is_refused() {
+        let most = UNFOLDED_ROWS;
+        // Folded through 100: carrying `most` in, writing 1000 of its own.
+        assert!(check_unfolded(0, 100, 100 + most, 1100 + most, rs::GroupFold::None).is_ok());
+        let refused =
+            check_unfolded(3, 100, 101 + most, 102 + most, rs::GroupFold::None).unwrap_err();
         assert!(
-            check_unfolded(0, 0, 0, u32::MAX, rs::GroupFold::None).is_ok(),
-            "no rs list: unbounded"
+            refused.contains("lane 3")
+                && refused.contains(&format!("carries {} recurrent rows", most + 1))
+                && refused.contains("fold what it has written before it writes more")
+                && !refused.contains("rs page"),
+            "{refused}"
         );
+        // A host fold leaves `end - frozen - folded`.
+        assert!(check_unfolded(0, 100, 100, 200, rs::GroupFold::Host(100 - most)).is_ok());
+        let left = check_unfolded(0, 100, 100, 200, rs::GroupFold::Host(99 - most)).unwrap_err();
         assert!(
-            check_unfolded(0, 64, 100, 200, rs::GroupFold::Host(36)).is_ok(),
-            "what the pass folds leaves 64"
+            left.contains(&format!("leave {} recurrent rows", most + 1)),
+            "{left}"
         );
-        assert!(check_unfolded(0, 64, 100, 200, rs::GroupFold::Host(35)).is_err());
-        // A device fold counts as nothing folded: checked as if none.
-        assert!(check_unfolded(0, 64, 100, 164, rs::GroupFold::Device).is_ok());
-        assert!(check_unfolded(0, 64, 100, 165, rs::GroupFold::Device).is_err());
+        // A device fold's leftover is unknown now: the next fire checks it.
+        assert!(check_unfolded(0, 100, 100, 1000, rs::GroupFold::Device).is_ok());
+        assert!(check_unfolded(0, 100, 101 + most, 1000, rs::GroupFold::Device).is_err());
     }
 
-    /// The bound is the pool's rs page, the RsBuffer list's rows a slot,
-    /// whatever the engine: none without an rs list.
-    #[test]
-    fn the_bound_is_one_rs_page_of_the_pool() {
+    fn pool_of_one_row_rs_pages() -> crate::store::registry::Stores {
         use ::engine::chunk::{
             ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
             SlotShape,
@@ -5744,7 +5860,8 @@ mod unfolded_tests {
             }],
             shapes: vec![
                 shape(0, list(16), SlotRole::State),
-                shape(1, list(8), SlotRole::RsBuffer),
+                // One recurrent row an rs page, as Qwen3.5's.
+                shape(1, list(1), SlotRole::RsBuffer),
                 shape(2, SlotKind::Fixed { pieces: 1 }, SlotRole::State),
             ],
             ..ChunkFacts::default()
@@ -5759,12 +5876,116 @@ mod unfolded_tests {
                 tiers: crate::store::shared::Tiers::default(),
             }],
         );
-        assert_eq!(unfolded_bound(&crate::store::registry::get(model, 0)), 8);
-        let plain = crate::store::registry::register_model(32, &[1], &[1]);
-        assert_eq!(
-            unfolded_bound(&crate::store::registry::get(plain, 0)),
-            0,
-            "no rs list: no bound"
+        crate::store::registry::get(model, 0)
+    }
+
+    fn lane(held: u32, rows: u32) -> crate::engine::FireRequest {
+        crate::engine::FireRequest {
+            lanes: vec![::engine::Lane {
+                tokens: vec![0; rows as usize],
+                kv: ::engine::KvDelta {
+                    held,
+                    ..Default::default()
+                },
+                ..::engine::Lane::default()
+            }],
+            ..crate::engine::FireRequest::default()
+        }
+    }
+
+    fn groups(plan: rs::RsPlan) -> Vec<rs::GroupPlan> {
+        match plan {
+            rs::RsPlan::Groups(groups) => groups,
+            rs::RsPlan::Window(_) => panic!("a plain recurrent model plans groups"),
+        }
+    }
+
+    /// MTP with k = 4 on a pool whose rs pages hold one row: the draft
+    /// writes a window of five rows unfolded, the next window carries those
+    /// five in and folds the accepted rows, and only a host-placed lane
+    /// carrying past `UNFOLDED_ROWS` is refused; a device-placed one is the
+    /// engine's to hold. Not one rs page: a lane's buffer names several.
+    #[test]
+    fn mtp_k4_rides_one_row_rs_pages() {
+        let stores = pool_of_one_row_rs_pages();
+        let kv = stores.kv.lock().create_working_set();
+        let ws = stores
+            .rs
+            .lock()
+            .unwrap()
+            .create_working_set(crate::store::rs::RsGeometry {
+                state_size: 1 << 10,
+                buffer_page_tokens: 1,
+            });
+        // The prompt is folded through 10.
+        stores.rs.lock().unwrap().fold(ws, 10);
+        let ids = [ws];
+        let groups_of = lane_groups(&[kv]);
+        let host = |held, rows, fold: Vec<u32>| {
+            host_rs_plan(
+                &stores,
+                &ids,
+                &groups_of,
+                &lane(held, rows),
+                &geometry::Fold::Host(fold),
+                &[],
+            )
+        };
+
+        // Draft: five rows (the truth and k = 4 drafts), nothing folded.
+        let draft = groups(host(10, 5, vec![0]).expect("a draft of five rows"));
+        assert_eq!(draft[0].writes, Some(10..15));
+        assert_eq!(draft[0].fold, rs::GroupFold::None);
+
+        // Verify: carries the draft's five in and folds the accepted three.
+        let verify = groups(host(15, 5, vec![3]).expect("carries five in"));
+        assert_eq!(verify[0].writes, Some(15..20));
+        assert_eq!(verify[0].fold, rs::GroupFold::Host(3));
+        stores.rs.lock().unwrap().fold(ws, 3);
+        assert_eq!(stores.rs.lock().unwrap().frozen(ws).unwrap(), 13);
+
+        // A lane that never folds piles up: past 13, carrying 17 in.
+        assert!(host(13 + UNFOLDED_ROWS, 5, vec![0]).is_ok());
+        let refused = host(13 + UNFOLDED_ROWS + 1, 5, vec![0]).unwrap_err();
+        assert!(
+            refused.contains(&format!("carries {} recurrent rows", UNFOLDED_ROWS + 1)),
+            "{refused}"
         );
+        // A host fold that leaves 17 behind is refused before it fires.
+        let left = host(13, 5 + UNFOLDED_ROWS, vec![4]).unwrap_err();
+        assert!(
+            left.contains(&format!("leave {} recurrent rows", UNFOLDED_ROWS + 1)),
+            "{left}"
+        );
+
+        // The device plan: the device picks where the rows start, so the
+        // host refuses nothing it carries in, however far ahead the
+        // inferlet reserved; the engine holds it to `UNFOLDED_ROWS`.
+        let device = |reserved: u32| {
+            let cell = Arc::new(Mutex::new(Cursor {
+                folded: 13,
+                reserved,
+                tail: None,
+                ..Cursor::default()
+            }));
+            let lanes = PassLanes {
+                places: vec![geometry::Place {
+                    folded: 13,
+                    folded_exact: true,
+                    tail: None,
+                    shared: false,
+                    spans: Vec::new(),
+                }],
+                cursors: vec![cell],
+                kv: Vec::new(),
+            };
+            device_rs_plan(&stores, &ids, &groups_of, &lanes, &geometry::Fold::Device)
+        };
+        let planned = groups(device(13 + 5 + 5).unwrap());
+        assert_eq!(planned[0].writes, Some(13..23));
+        assert_eq!(planned[0].fold, rs::GroupFold::Device);
+        // The decode reserved its whole extent up front, as the MTP example.
+        let ahead = groups(device(13 + 4 * UNFOLDED_ROWS).expect("no carried-in refusal"));
+        assert_eq!(ahead[0].writes, Some(13..13 + 4 * UNFOLDED_ROWS));
     }
 }

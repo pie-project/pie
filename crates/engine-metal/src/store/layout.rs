@@ -37,6 +37,9 @@ pub const RS: ShapeId = ShapeId(3);
 pub const INSTANCE: ShapeId = ShapeId(7);
 /// A ring's cells (`SlotRole::Channel`).
 pub const CHANNEL: ShapeId = ShapeId(8);
+/// One plane of a landed adapter (`SlotRole::Adapter`): a bank's plane a
+/// slot, shared by every instance that lands the same adapter.
+pub const ADAPTER: ShapeId = ShapeId(9);
 
 /// An `Instance` slot's bytes: every measured instance's tables in one
 /// (`new-memory/STATE-ROLES.md` section 3). Structural, not config.
@@ -116,6 +119,10 @@ impl Slots {
     }
 }
 
+/// The most activation rungs a layout states: every power of two of tokens
+/// a fire can carry.
+pub const MAX_RUNGS: usize = 32;
+
 /// The pool's chunk size, its shapes and its extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
@@ -142,6 +149,20 @@ pub struct Layout {
     /// working set holds, taken per instance and channel.
     pub instance: Option<Slots>,
     pub channel: Option<Slots>,
+    /// Landed adapters' planes, one a slot ([`Layout::with_adapter`]);
+    /// none for a model with no registered banks.
+    pub adapter: Option<Slots>,
+    /// The activation span (REDESIGN 3c): `(rung tokens, chunks)` a fire of
+    /// up to that many tokens takes out of the range's top, ascending, the
+    /// first `act_rungs`; the last is the span. None where activation lives
+    /// apart.
+    pub act: [(u32, u32); MAX_RUNGS],
+    pub act_rungs: usize,
+    /// The engine's own tables (`Reserved::Tables`): this many chunks right
+    /// after the null chunk, laid at the load ([`super::Pools::tables`]):
+    /// the registered adapter banks, the weight caches' atom tables and use
+    /// counters and the state maps. The seat runs lie past them.
+    pub tables: u32,
 }
 
 impl Layout {
@@ -173,6 +194,10 @@ impl Layout {
             seats,
             instance: Slots::of(INSTANCE, INSTANCE_SLOT, chunk_bytes),
             channel: Slots::of(CHANNEL, CHANNEL_SLOT, chunk_bytes),
+            adapter: None,
+            act: [(0, 0); MAX_RUNGS],
+            act_rungs: 0,
+            tables: 0,
         };
         if let Some(shape) = layout.shapes().find(|s| s.per_chunk == 0) {
             return Err(Fault::Ceiling {
@@ -225,7 +250,7 @@ impl Layout {
             });
         }
         let seats = self.seats;
-        window.seat_chunk = 1 + self.seat_chunks();
+        window.seat_chunk = 1 + self.tables + self.seat_chunks();
         window.seat_slots = seats.saturating_mul(pages_per_seat);
         self.windows[at] = Some(WindowList {
             slots: window,
@@ -248,6 +273,92 @@ impl Layout {
 
     /// This layout with an rs list of `bytes` slots of `tokens` rows; its
     /// seat run, `pages_per_seat` slots a seat, after the others.
+    /// This layout with an activation span of `rungs`, `(tokens, chunks)`
+    /// ascending in both, the last the span; refused where the span leaves
+    /// the range no chunk beside the null one.
+    pub fn with_act(mut self, rungs: &[(u32, u32)]) -> Result<Layout> {
+        if rungs.len() > MAX_RUNGS {
+            return Err(Fault::Ceiling {
+                what: "activation rungs",
+                need: rungs.len() as u64,
+                have: MAX_RUNGS as u64,
+            });
+        }
+        let span = rungs.last().map_or(0, |&(_, chunks)| chunks);
+        if span.saturating_add(1) >= self.total_chunks {
+            return Err(Fault::Ceiling {
+                what: "chunks of the range beside its activation span",
+                need: u64::from(span) + 2,
+                have: u64::from(self.total_chunks),
+            });
+        }
+        self.act[..rungs.len()].copy_from_slice(rungs);
+        self.act_rungs = rungs.len();
+        Ok(self)
+    }
+
+    /// Each rung's `(tokens, chunks)`, ascending.
+    #[must_use]
+    pub fn act(&self) -> &[(u32, u32)] {
+        &self.act[..self.act_rungs]
+    }
+
+    /// The activation span's chunks: the largest rung's.
+    #[must_use]
+    pub fn act_span(&self) -> u32 {
+        self.act().last().map_or(0, |&(_, chunks)| chunks)
+    }
+
+    /// This layout with `Adapter` slots of `bytes`, the widest plane of a
+    /// registered bank: a landed adapter takes one a bank.
+    pub fn with_adapter(mut self, bytes: u64) -> Result<Layout> {
+        if bytes == 0 {
+            return Ok(self);
+        }
+        let slots = Slots::of(ADAPTER, bytes, self.chunk_bytes).ok_or(Fault::Ceiling {
+            what: "bytes of a pool chunk an adapter plane fits in",
+            need: bytes,
+            have: self.chunk_bytes,
+        })?;
+        if slots.per_chunk == 0 {
+            return Err(Fault::Ceiling {
+                what: "bytes of a pool chunk an adapter plane fits in",
+                need: bytes,
+                have: self.chunk_bytes,
+            });
+        }
+        self.adapter = Some(slots);
+        Ok(self)
+    }
+
+    /// This layout with the engine's tables in `chunks` chunks right after
+    /// the null chunk: every seat run moves past them.
+    #[must_use]
+    pub fn with_tables(mut self, chunks: u32) -> Layout {
+        let by = chunks - self.tables;
+        for shape in [&mut self.list, &mut self.fixed, &mut self.rs]
+            .into_iter()
+            .flatten()
+            .chain(
+                self.windows
+                    .iter_mut()
+                    .flatten()
+                    .map(|window| &mut window.slots),
+            )
+        {
+            shape.seat_chunk += by;
+        }
+        self.tables = chunks;
+        self
+    }
+
+    /// The first chunk past the null chunk, the tables and the seat runs:
+    /// where a caller addressing slots by ref starts.
+    #[must_use]
+    pub fn free_chunk(&self) -> u32 {
+        1 + self.tables + self.seat_chunks()
+    }
+
     pub fn with_rs(mut self, bytes: u64, tokens: u32, pages_per_seat: u32) -> Result<Layout> {
         let Some(mut rs) = Slots::of(RS, bytes, self.chunk_bytes) else {
             return Ok(self);
@@ -259,7 +370,7 @@ impl Layout {
                 have: self.chunk_bytes,
             });
         }
-        rs.seat_chunk = 1 + self.seat_chunks();
+        rs.seat_chunk = 1 + self.tables + self.seat_chunks();
         rs.seat_slots = self.seats.saturating_mul(pages_per_seat);
         self.rs = Some(rs);
         self.rs_tokens = tokens;
@@ -274,6 +385,7 @@ impl Layout {
             .chain(&self.rs)
             .chain(&self.instance)
             .chain(&self.channel)
+            .chain(&self.adapter)
     }
 
     #[must_use]
@@ -310,7 +422,7 @@ impl Layout {
 
     /// The pool as the runtime counts it: one shared chunk space, chunk 0
     /// null, segments of `segment_chunks` growing from the bottom where the
-    /// pool is sparse; activation lives in the arena apart.
+    /// pool is sparse, the activation span (where stated) the top chunks.
     #[must_use]
     pub fn facts(&self, growth: Growth, committed: u32, rows: &[Vec<u32>; 2]) -> ChunkFacts {
         let segments = self.total_chunks.div_ceil(self.segment_chunks.max(1));
@@ -375,6 +487,7 @@ impl Layout {
         for (slots, role) in [
             (&self.instance, SlotRole::Instance),
             (&self.channel, SlotRole::Channel),
+            (&self.adapter, SlotRole::Adapter),
         ] {
             if let Some(slots) = slots {
                 // The role, not the count, keeps these out of a working
@@ -386,7 +499,9 @@ impl Layout {
             }
         }
         ChunkFacts {
-            span_backed_on_demand: false,
+            // A mapped placement heap is resident whether touched or not:
+            // the span is backed as fires and lent state need it.
+            span_backed_on_demand: !self.act().is_empty(),
             chunk_bytes: self.chunk_bytes,
             total_chunks: self.total_chunks,
             segment_chunks: self.segment_chunks,
@@ -399,13 +514,19 @@ impl Layout {
                 max: segments,
                 growth,
             },
-            reserved: vec![ReservedRun {
+            reserved: std::iter::once(ReservedRun {
                 what: Reserved::Null,
                 first: 0,
                 chunks: 1,
-            }],
+            })
+            .chain((self.tables > 0).then_some(ReservedRun {
+                what: Reserved::Tables,
+                first: 1,
+                chunks: self.tables,
+            }))
+            .collect(),
             shapes,
-            act_chunks: Vec::new(),
+            act_chunks: self.act().to_vec(),
             host_chunks: 0,
             disk_chunks: 0,
             disk_persistent: false,

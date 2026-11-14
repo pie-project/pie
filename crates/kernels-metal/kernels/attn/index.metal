@@ -237,12 +237,12 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
       for (int h = 0; h < kSmallHeads; ++h) part[h] = 0.0f;
       if (j < nkeys) {
         const int cell = (j + 1) * stride - D / pitch;
-        const int page = int(kv_page_indices[pages_first + cell / page_size]);
+        const uint page = kv_page_indices[pages_first + cell / page_size];
         const int off = cell % page_size;
         // Two bf16 a word: `dpl` is even and the row is D-aligned, so the
         // slice starts on a 4-byte boundary.
         const device uint* kw = (const device uint*)(
-            key_pages + size_t(page) * k_page + size_t(off) * size_t(pitch) +
+            key_pages + pie_page_at(page, k_page, sizeof(bfloat)) + size_t(off) * size_t(pitch) +
             size_t(sub * dpl));
         for (int i = 0; i < kSlice; i += 2) {
           if (i < dpl) {
@@ -281,10 +281,10 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
       float acc = 0.0f;
       if (j < nkeys) {
         const int cell = (j + 1) * stride - D / pitch;
-        const int page = int(kv_page_indices[pages_first + cell / page_size]);
+        const uint page = kv_page_indices[pages_first + cell / page_size];
         const int off = cell % page_size;
         const device bfloat* kj =
-            key_pages + size_t(page) * k_page + size_t(off) * size_t(pitch);
+            key_pages + pie_page_at(page, k_page, sizeof(bfloat)) + size_t(off) * size_t(pitch);
         for (int h = hh; h < H; h += kLanesPerKey) {
           const device bfloat* qh = qi + size_t(h) * size_t(D);
           float dot = 0.0f;
@@ -469,9 +469,9 @@ constant constexpr int kBlockMaxPer = 8;
     const int lo = b * block;
     const int hi = min(lo + block, abs_q + 1);
     for (int j = lo; j < hi; ++j) {
-      const int page = int(kv_page_indices[pages_first + j / page_size]);
+      const uint page = kv_page_indices[pages_first + j / page_size];
       const device bfloat* kj = pie_kv_plane(key_pages, k_offset) +
-                                size_t(page) * (k_page_stride / sizeof(bfloat)) +
+                                pie_page_at(page, k_page_stride / sizeof(bfloat), sizeof(bfloat)) +
                                 size_t(j % page_size) * size_t(D);
       float kv[kBlockMaxPer];
       for (int i = 0; i < per; ++i) kv[i] = float(kj[lane + i * 32]);

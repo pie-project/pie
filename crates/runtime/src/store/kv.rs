@@ -183,6 +183,9 @@ pub struct KvStore {
     seq: u64,
     outstanding: BTreeSet<u64>,
     moved: Arc<tokio::sync::Notify>,
+    /// Told when pages may have joined the cache: a fire's pages settle, or
+    /// a working set is released and keeps its sealed prefix.
+    cached: Arc<tokio::sync::Notify>,
     /// A persistent disk tier's journal, and the slots it names.
     persisted: Option<Persisted>,
     /// How many leading tokens each owner's props ask to keep on disk
@@ -420,6 +423,7 @@ impl KvStore {
             seq: 0,
             outstanding: BTreeSet::new(),
             moved: Arc::new(tokio::sync::Notify::new()),
+            cached: Arc::new(tokio::sync::Notify::new()),
             persisted: None,
             hints: HashMap::new(),
             reclaimable: std::cell::Cell::new(None),
@@ -1587,6 +1591,17 @@ impl KvStore {
         self.retire_idle();
     }
 
+    /// Told when pages may have joined the cache (a fire's pages settle, a
+    /// working set is released): arm it before looking.
+    pub fn cached(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.cached)
+    }
+
+    /// Pages may have joined the cache.
+    pub fn note_cached(&self) {
+        self.cached.notify_waiters();
+    }
+
     /// A move that found its pages in another waits for it here.
     pub fn moves_ended(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.moved)
@@ -1687,6 +1702,7 @@ impl KvStore {
         let freed = self.table.release_working_set_backings(ws);
         self.recycle_backings(freed, epoch);
         self.flat.remove(&ws);
+        self.note_cached();
     }
 
     fn keep_sealed_prefix(&mut self, ws: WorkingSetId) {

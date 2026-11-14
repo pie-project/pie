@@ -413,6 +413,7 @@ impl Rig {
                 },
                 instance_slots: Vec::new(),
                 ring_slots: Vec::new(),
+                adapter_slots: Vec::new(),
             },
         );
         LaneHandles {

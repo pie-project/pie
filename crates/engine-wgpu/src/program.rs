@@ -1084,7 +1084,7 @@ impl Plane {
         .map_err(|fault| Refusal::Program(fault.to_string()))?;
         Ok(ProgramFacts {
             instance,
-            rings: Vec::new(),
+            ..ProgramFacts::default()
         })
     }
 
@@ -1124,6 +1124,7 @@ impl Plane {
                 id,
                 instance,
                 rings,
+                ..
             } => {
                 if !rings.is_empty() {
                     return Err(Refusal::Program(format!(

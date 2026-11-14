@@ -45,6 +45,7 @@ impl InstanceBindingPlan {
                 device_resolved,
                 instance_slots: Vec::new(),
                 ring_slots: Vec::new(),
+                adapter_slots: Vec::new(),
             },
         }
     }

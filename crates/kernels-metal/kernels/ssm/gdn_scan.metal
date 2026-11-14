@@ -5,6 +5,7 @@
 using namespace metal;
 
 #include "../prim/state_map.h"
+#include "../prim/kv_page.h"
 
 #ifndef PIE_RS_SNAPSHOTS
 #define PIE_RS_SNAPSHOTS 4
@@ -461,7 +462,7 @@ inline device uchar* gdn_buffered_row(
     device uchar* slab, const device int* pages, int e, uint page_tokens, uint page_bytes,
     uint row_bytes) {
   const uint at = uint(pages[0] + e);
-  return slab + size_t(pages[1 + at / page_tokens]) * page_bytes +
+  return slab + pie_page_at(uint(pages[1 + at / page_tokens]), page_bytes, 1) +
          size_t(at % page_tokens) * row_bytes;
 }
 

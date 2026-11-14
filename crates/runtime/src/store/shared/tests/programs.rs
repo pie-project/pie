@@ -15,6 +15,8 @@ use crate::store::shared::programs::{FireKey, Funder, Mover, ProgramOpen, fund_s
 
 const PROGRAM: ProgramId = ProgramId(7);
 const LANES: u32 = 64;
+/// The engine whose rung events these tests' raises tell.
+const TEST_ENGINE: usize = 50;
 
 /// `program` bound at the default extents.
 fn key(program: ProgramId) -> FireKey {
@@ -115,6 +117,10 @@ impl Mover for Lane {
             .unwrap()
             .set_rung(from, to)
             .map_err(|error| error.to_string())
+    }
+
+    fn engine(&self) -> usize {
+        TEST_ENGINE
     }
 
     fn epoch_now(&self) -> u64 {
@@ -413,6 +419,7 @@ async fn a_term_past_the_largest_rung_funds_the_widest_that_fits_and_cuts_fires_
         .unwrap();
     assert_eq!(step, RungStep::Cap(256));
     cap.store(256, Ordering::Release);
+    crate::store::shared::rung_changed(TEST_ENGINE);
     wait.await.unwrap().unwrap();
     drop(open);
 
@@ -430,8 +437,9 @@ async fn a_term_past_the_largest_rung_funds_the_widest_that_fits_and_cuts_fires_
 }
 
 /// A bind is never sent unfunded: the planner's refusal ends the wait with
-/// an error; a raise the engine refuses is taken back and the wait holds,
-/// the span and the state as they were.
+/// an error; a raise the engine refuses is taken back, the span and the
+/// state as they were, and refuses the bind too: nothing tries it again on
+/// its own wake.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_whose_room_is_refused_fails_its_wait() {
     struct Refusing;
@@ -447,6 +455,10 @@ async fn a_bind_whose_room_is_refused_fails_its_wait() {
         }
         async fn set_rung(&self, _from: u32, _to: u32) -> Result<(), String> {
             Ok(())
+        }
+
+        fn engine(&self) -> usize {
+            TEST_ENGINE
         }
         fn epoch_now(&self) -> u64 {
             0
@@ -472,9 +484,8 @@ async fn a_bind_whose_room_is_refused_fails_its_wait() {
     assert!(error.contains("the planner refuses"));
     assert_eq!(shared.lock().unwrap().pool().act_reserved(), 4);
 
-    // Room there, the copy refused: a refused raise, taken back. The wait
-    // holds the bind (never sent) as any waiter, the span and the state as
-    // they were, and nothing faults.
+    // Room there, the copy refused: a refused raise, taken back, and the
+    // bind refused (never sent), the span and the state as they were.
     let kept = all[all.len() / 2..].to_vec();
     {
         let mut pool = shared.lock().unwrap();
@@ -488,12 +499,10 @@ async fn a_bind_whose_room_is_refused_fails_its_wait() {
             .map(|slot| pool.pool().physical(slot.chunk).unwrap())
             .collect()
     };
-    let waited = tokio::time::timeout(
-        std::time::Duration::from_millis(50),
-        fund_span(&shared, || 256, &Granting, &NoCopy),
-    )
-    .await;
-    assert!(waited.is_err(), "the bind still waits");
+    let refused = fund_span(&shared, || 256, &Granting, &NoCopy)
+        .await
+        .unwrap_err();
+    assert!(refused.contains("the engine refuses"), "{refused}");
     let pool = shared.lock().unwrap();
     assert_eq!(pool.pool().act_reserved(), 4, "the rung in hand");
     assert!(pool.copying().is_none());
@@ -504,6 +513,84 @@ async fn a_bind_whose_room_is_refused_fails_its_wait() {
         .collect();
     assert_eq!(where_after, where_before, "the state where it lay");
     pool.pool().check();
+}
+
+/// A pool that states no rungs (Vulkan, wgpu, XLA, Metal before its span):
+/// its activation is no part of it.
+fn rungless_pool() -> (SharedPool, FakeEngine) {
+    let mut facts = facts();
+    facts.act_chunks = Vec::new();
+    let mut pool = SharedPool::new(&facts, 256).unwrap();
+    pool.set_max_lanes(LANES);
+    assert!(pool.rungs().is_empty());
+    (pool, FakeEngine::new())
+}
+
+/// The regression: on a pool without rungs every bind was refused, a zero
+/// term included ("fires need 0 bytes ... 0 chunks of the 15173"). A zero
+/// term never refuses, and the bind waits on nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_zero_term_never_refuses_a_bind_on_a_pool_without_rungs() {
+    let (mut pool, engine) = rungless_pool();
+    pool.fire_facts_learned(key(PROGRAM), &FireFacts::default());
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let open = ProgramOpen::new(&shared, key(PROGRAM)).expect("a zero term never refuses");
+    fund_span(
+        &shared,
+        || u32::MAX,
+        &NoPlanner,
+        &Lane(Arc::new(Mutex::new(engine))),
+    )
+    .await
+    .unwrap();
+    drop(open);
+}
+
+/// On a pool without rungs a term, however large, is ignored: no bind is
+/// refused for it and none waits on it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pool_without_rungs_skips_the_term_check() {
+    let (mut pool, engine) = rungless_pool();
+    pool.fire_facts_learned(key(PROGRAM), &fire_facts());
+    pool.fire_facts_learned(
+        key(ProgramId(9)),
+        &FireFacts {
+            fixed: u64::from(TOTAL) * CHUNK,
+            ..FireFacts::default()
+        },
+    );
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let open = ProgramOpen::new(&shared, key(PROGRAM)).expect("the term is ignored");
+    let huge =
+        ProgramOpen::new(&shared, key(ProgramId(9))).expect("past the device, still ignored");
+    {
+        let pool = shared.lock().unwrap();
+        assert_eq!(
+            pool.pool().act_chunks(16),
+            0,
+            "no activation to fold it into"
+        );
+        assert_eq!(pool.span_short(u32::MAX), 0);
+        assert_eq!(pool.fit_cap(), u32::MAX, "fires uncut");
+    }
+    fund_span(
+        &shared,
+        || u32::MAX,
+        &NoPlanner,
+        &Lane(Arc::new(Mutex::new(engine))),
+    )
+    .await
+    .unwrap();
+    drop((open, huge));
+}
+
+/// On a pool with rungs a zero term never refuses either.
+#[test]
+fn a_zero_term_never_refuses_a_bind_on_a_pool_with_rungs() {
+    let (mut pool, _) = pool_at_256();
+    pool.fire_facts_learned(key(PROGRAM), &FireFacts::default());
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    assert!(ProgramOpen::new(&shared, key(PROGRAM)).is_ok());
 }
 
 /// One program at two extents is two terms, summed: 256 rows take 8 MiB

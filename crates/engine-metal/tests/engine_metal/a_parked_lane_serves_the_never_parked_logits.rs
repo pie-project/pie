@@ -199,7 +199,7 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
         "a disk tier is stated for the kv list"
     );
     let layout = shell.pool_layout();
-    let first = (1 + layout.seat_chunks()).div_ceil(facts.segment_chunks) * facts.segment_chunks;
+    let first = layout.free_chunk().div_ceil(facts.segment_chunks) * facts.segment_chunks;
     shell
         .commit_segments((first + 64).div_ceil(facts.segment_chunks))
         .expect("the segments commit");
@@ -389,4 +389,19 @@ fn a_parked_windowed_lane_serves_the_never_parked_logits() {
 #[test]
 fn a_parked_hybrid_lane_serves_the_never_parked_logits() {
     check("qwen35-tiny");
+}
+
+/// The dense and hybrid lanes over a range of a segment a buffer: their
+/// pages and record park and come back to fresh chunks in other buffers.
+#[test]
+fn a_parked_lane_over_buffers_serves_the_never_parked_logits() {
+    engine_metal::store::pool::cap_parts(1);
+    let lifted = std::panic::catch_unwind(|| {
+        check("qwen3-micro-text");
+        check("qwen35-tiny");
+    });
+    engine_metal::store::pool::cap_parts(0);
+    if let Err(why) = lifted {
+        std::panic::resume_unwind(why);
+    }
 }

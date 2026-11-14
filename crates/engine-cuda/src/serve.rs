@@ -888,6 +888,7 @@ impl Shell {
                     })
                 })
                 .collect(),
+            adapter: engine::program::Footprint::default(),
         })
     }
 

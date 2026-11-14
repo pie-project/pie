@@ -205,9 +205,38 @@ pub(crate) enum Step {
 /// past the first one it runs.
 pub(crate) const GAP_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// How long a step short of room waits before its room is looked for
-/// again, so an idle lane does not take the planner's lock each spin.
-const ROOM_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
+/// Per engine, room was freed since an arming step last found none: the
+/// next step looks again (set by [`room_freed`], taken by the step).
+static ROOM_FREED: [std::sync::atomic::AtomicBool; 64] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; 64];
+
+/// Per engine, what wakes an idle lane whose arming waits on room.
+#[cfg(not(target_arch = "wasm32"))]
+static ROOM_WAKE: std::sync::LazyLock<
+    Vec<(
+        crate::rt::channel::Sender<()>,
+        crate::rt::channel::Receiver<()>,
+    )>,
+> = std::sync::LazyLock::new(|| (0..64).map(|_| crate::rt::channel::bounded(1)).collect());
+
+/// Room was freed on `engine` (a fire retired, a slot let go): an arming
+/// step short of room looks again, and an idle lane waiting on it wakes.
+pub(crate) fn room_freed(engine: usize) {
+    if let Some(freed) = ROOM_FREED.get(engine) {
+        freed.store(true, std::sync::atomic::Ordering::Release);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some((wake, _)) = ROOM_WAKE.get(engine) {
+        let _ = wake.try_send(());
+    }
+}
+
+/// What an idle lane whose arming waits on room selects on beside its
+/// requests.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn room_wake(engine: usize) -> Option<&'static crate::rt::channel::Receiver<()>> {
+    ROOM_WAKE.get(engine).map(|(_, wake)| wake)
+}
 
 enum State {
     Arming,
@@ -224,8 +253,9 @@ pub(crate) struct Arming {
     room: ArmingRoom,
     state: State,
     lender: Box<dyn Lender>,
-    /// No room was free: not looked for again before then.
-    retry_at: Option<crate::rt::Instant>,
+    /// No room was free: not looked for again until some is
+    /// ([`room_freed`]).
+    short_of_room: bool,
     /// While the lane serves, no step before then: a step's time is owed
     /// back to the requests as much again, so arming takes at most half of
     /// a busy lane however long one composition's capture runs.
@@ -264,7 +294,7 @@ impl Arming {
             room,
             state,
             lender,
-            retry_at: None,
+            short_of_room: false,
             owed_until: None,
         }
     }
@@ -304,18 +334,26 @@ impl Arming {
             return Step::Over;
         };
         let now = crate::rt::Instant::now();
-        if self.retry_at.is_some_and(|at| now < at) {
+        if self.short_of_room
+            && !ROOM_FREED
+                .get(self.engine_idx)
+                .is_some_and(|freed| freed.swap(false, std::sync::atomic::Ordering::AcqRel))
+        {
             return Step::Waiting;
         }
         // A busy lane gives arming half its time at most.
         if busy && self.owed_until.is_some_and(|at| now < at) {
             return Step::Waiting;
         }
+        // Taken before the look: room freed while it looks is not lost.
+        if let Some(freed) = ROOM_FREED.get(self.engine_idx) {
+            freed.store(false, std::sync::atomic::Ordering::Release);
+        }
         let Some(lent) = self.lender.lend(self.engine_idx, self.room, idle) else {
-            self.retry_at = Some(crate::rt::Instant::now() + ROOM_RETRY);
+            self.short_of_room = true;
             return Step::Waiting;
         };
-        self.retry_at = None;
+        self.short_of_room = false;
         tracing::debug!(
             engine = self.engine_idx,
             idle,

@@ -248,6 +248,7 @@ fn load(dir: &Path, deployment: Deployment, head_dim: u32) -> Shell {
         allowance: engine::Allowance::WHOLE,
         profiles: None,
     })
+    .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .expect("the micro_text shell loads")
 }
 

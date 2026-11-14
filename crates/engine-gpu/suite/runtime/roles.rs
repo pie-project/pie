@@ -168,7 +168,7 @@ impl Bound {
 #[test]
 fn an_instance_in_pool_slots_fires_through_moves() {
     let boot = backend::DeviceBoot::default();
-    if backend::Context::bind(&boot, engine::Allowance::WHOLE).is_err() {
+    if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return;
     }
@@ -218,6 +218,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
                 max_clips: None,
             },
             residency: Residency {
+                device: backend::ALLOWANCE,
                 host_kv_budget: Some(64 << 20),
                 ..Residency::default()
             },
@@ -334,6 +335,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             device_resolved: Default::default(),
             instance_slots: Vec::new(),
             ring_slots: Vec::new(),
+            adapter_slots: Vec::new(),
         },
         &registered,
     );
@@ -453,6 +455,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             id: bound.instance,
             instance: binding.instance_slots.clone(),
             rings: binding.ring_slots.clone(),
+            adapter: Vec::new(),
         })
         .expect("the slots rebind");
     // The stale pass kept its ids where the cell no longer is: `seen` reads
@@ -536,6 +539,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
                     slots: slots.clone(),
                 })
                 .collect(),
+            adapter: Vec::new(),
         })
         .expect("the unparked slots rebind");
     last = before;

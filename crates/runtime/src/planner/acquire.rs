@@ -212,9 +212,24 @@ impl ResidencyPlanner {
                         // again while it waits (the gauge keeps a band only
                         // while it is told), up to the seat deadline.
                         Collect::Wait => {
+                            // Woken by its own notify, by the policy
+                            // answering pressure with nothing freed (what it
+                            // fails on), or by the re-report's interval.
                             let again = crate::policy::pressure::AGAIN;
-                            if crate::rt::time::timeout(again, notified).await.is_ok() {
-                                continue;
+                            let answered = crate::policy::pressure::answered();
+                            tokio::pin!(answered);
+                            answered.as_mut().enable();
+                            if self.short.lock().answered_nothing(key.1) {
+                                // Answered between the report and here.
+                            } else {
+                                let woke = tokio::select! {
+                                    () = &mut notified => true,
+                                    () = &mut answered => false,
+                                    _ = crate::rt::time::timeout(again, std::future::pending::<()>()) => false,
+                                };
+                                if woke {
+                                    continue;
+                                }
                             }
                             self.report_short();
                             self.note_lapsed_fires();

@@ -23,7 +23,9 @@ fn fixed_shapes(model: &Model) -> Vec<(ShapeId, u32)> {
         .shapes
         .iter()
         .filter_map(|s| match s.kind {
-            SlotKind::Fixed { pieces } => Some((s.id, pieces)),
+            SlotKind::Fixed { pieces } if s.role == engine::chunk::SlotRole::State => {
+                Some((s.id, pieces))
+            }
             _ => None,
         })
         .collect()

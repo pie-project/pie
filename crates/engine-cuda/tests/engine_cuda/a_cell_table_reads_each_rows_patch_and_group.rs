@@ -287,6 +287,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
                     },
                     instance_slots: Vec::new(),
                     ring_slots: Vec::new(),
+                    adapter_slots: Vec::new(),
                 },
             )
             .id;

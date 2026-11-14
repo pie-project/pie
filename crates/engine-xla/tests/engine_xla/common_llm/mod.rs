@@ -138,6 +138,36 @@ impl Model {
         seed: u64,
         disk: Option<&std::path::Path>,
     ) -> Model {
+        Model::load_full(name, layers, context, seed, disk, false, 0)
+    }
+
+    /// [`Model::load`] told whether its weights are held
+    /// (`Residency::weights_held`: held, nothing streams).
+    pub fn load_held(name: &str, layers: Option<u32>, context: u32, seed: u64) -> Model {
+        Model::load_full(name, layers, context, seed, None, true, 0)
+    }
+
+    /// [`Model::load_held`] with `extra` chunks more in its pool: the pool
+    /// a streaming load of the same model takes.
+    pub fn load_held_grown(
+        name: &str,
+        layers: Option<u32>,
+        context: u32,
+        seed: u64,
+        extra: u32,
+    ) -> Model {
+        Model::load_full(name, layers, context, seed, None, true, extra)
+    }
+
+    fn load_full(
+        name: &str,
+        layers: Option<u32>,
+        context: u32,
+        seed: u64,
+        disk: Option<&std::path::Path>,
+        held: bool,
+        extra: u32,
+    ) -> Model {
         let package = poem_compiler::catalog::package_of(name).expect("the model is listed");
         let deploy = poem::star::Deploy {
             layers,
@@ -167,6 +197,7 @@ impl Model {
         // fires then run only programs it prepared)
         let boot = DeviceBoot {
             prewarm: knob("PREWARM", 0) == 1,
+            pool_extra_chunks: extra,
             ..DeviceBoot::default()
         };
         let mut engine = Xla::new(boot, contract_for);
@@ -188,6 +219,7 @@ impl Model {
             }),
             disk_kv_dir: disk.map(std::path::Path::to_path_buf),
             disk_kv_budget: disk.map(|_| 64 << 20),
+            weights_held: held,
             ..Residency::default()
         };
         let loaded = engine
@@ -212,7 +244,11 @@ impl Model {
                 ordinal: 0,
                 frames_in_flight: 1,
             })
-            .expect("the model loads");
+            .unwrap_or_else(|why| {
+                // (the checkpoint goes with a load that fails too)
+                let _ = std::fs::remove_dir_all(&dir);
+                panic!("the model loads: {why:?}")
+            });
         Model {
             engine,
             loaded,
@@ -424,7 +460,9 @@ impl Seq {
             lane.tables.push((list.id, table));
         }
         if self.record.is_empty() {
-            for fixed in refs.shapes(|s| matches!(s.kind, SlotKind::Fixed { .. })) {
+            for fixed in refs.shapes(|s| {
+                matches!(s.kind, SlotKind::Fixed { .. }) && s.role == engine::chunk::SlotRole::State
+            }) {
                 let SlotKind::Fixed { pieces } = fixed.kind else {
                     unreachable!()
                 };

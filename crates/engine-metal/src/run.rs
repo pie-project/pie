@@ -1504,6 +1504,18 @@ impl<'c> Run<'c> {
         mask.map_or(self.fire.tables.mask, |mask| self.tensor(mask))
     }
 
+    /// Axis `axis` of `id`'s stated shape where it is a constant: a
+    /// registered bank's rank, read off its declaration.
+    pub(crate) fn const_dim(&self, id: ValueId, axis: usize) -> Option<u32> {
+        let Ty::Tensor { shape, .. } = &self.values[id.0 as usize].ty else {
+            return None;
+        };
+        match shape.get(axis) {
+            Some(poem_ir::Dim::Const(n)) => u32::try_from(*n).ok(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn tensor(&self, id: ValueId) -> Tensor {
         self.cut(id, self.whole(id))
     }

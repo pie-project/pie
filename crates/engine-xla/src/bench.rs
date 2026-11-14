@@ -247,6 +247,16 @@ impl Bench {
         self.time_with(iters, &[], false, body)
     }
 
+    /// [`Bench::time`] with the runs queued back to back (only the last
+    /// waited for): the device's time a run, without the launch's.
+    pub fn time_pipelined(
+        &mut self,
+        iters: u32,
+        body: impl FnOnce(&crate::emit::Ctx<'_>) -> Result<(), kernels_xla::Error>,
+    ) -> Result<Option<f64>, String> {
+        self.time_with(iters, &[], true, body)
+    }
+
     fn time_with(
         &mut self,
         iters: u32,
@@ -334,6 +344,9 @@ impl Bench {
         };
         run(true)?;
         run(true)?;
+        // `PIE_XLA_BENCH_TRACE=<dir>`: a device trace of the timed runs.
+        let trace = std::env::var_os("PIE_XLA_BENCH_TRACE")
+            .and_then(|d| Some((d, crate::pjrt::profiler::Profiler::start(client.api()).ok()?)));
         let started = std::time::Instant::now();
         let mut last = None;
         for i in 0..iters {
@@ -341,6 +354,13 @@ impl Bench {
         }
         if let Some(e) = last {
             e.wait().map_err(|e| e.to_string())?;
+        }
+        if let Some((dir, p)) = trace {
+            static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let bytes = p.finish().map_err(|e| e.to_string())?;
+            let path = std::path::Path::new(&dir).join(format!("bench-{seq}.xplane.pb"));
+            std::fs::write(path, bytes).map_err(|e| e.to_string())?;
         }
         Ok(Some(
             started.elapsed().as_secs_f64() / f64::from(iters.max(1)),

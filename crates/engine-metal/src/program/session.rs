@@ -99,41 +99,64 @@ pub struct Session {
 }
 
 impl Session {
-    /// The device bytes this instance holds: its own rings, and its stages'
-    /// launch tables and scratch.
-    #[must_use]
-    pub fn bytes(&self) -> u64 {
-        self.rings.bytes()
-            + self
-                .prepared
-                .iter()
-                .flatten()
-                .map(Prepared::bytes)
-                .sum::<u64>()
-    }
-
     /// The bind-time tables an instance of `compiled` takes, every
     /// launching stage's in order.
     #[must_use]
-    pub fn table_sizes(compiled: &Compiled) -> Vec<u64> {
+    /// The value scratch one lane of the program takes in a fire at
+    /// `extents`: the widest launching stage's. Stages fire one after
+    /// another in one serial pass order and none reads another's scratch
+    /// (values cross stages through channels), so one stage's room serves
+    /// every stage of the fire.
+    pub fn scratch_for(compiled: &Compiled, extents: &Extents) -> Result<u64> {
+        let mut widest = 0;
+        for (index, plan) in compiled.plans.iter().enumerate() {
+            if launches(compiled, index) {
+                widest = widest.max(Prepared::scratch_for(plan, extents)?);
+            }
+        }
+        Ok(widest)
+    }
+
+    /// The span bytes the batch tables of `lanes` lanes take for every
+    /// launching stage of `compiled` ([`super::launch::Batch::bytes_for`]).
+    #[must_use]
+    pub fn batch_bytes_for(compiled: &Compiled, channels: usize, lanes: u32, rows: u32) -> u64 {
+        let channels = u32::try_from(channels).unwrap_or(u32::MAX);
         compiled
             .plans
             .iter()
             .enumerate()
             .filter(|(index, _)| launches(compiled, *index))
-            .flat_map(|(_, plan)| Prepared::table_sizes(plan))
+            .map(|(_, plan)| super::launch::Batch::bytes_for(plan, channels, lanes, rows))
+            .sum()
+    }
+
+    /// The stages this instance carries, launching or not.
+    #[must_use]
+    pub fn stages(&self) -> usize {
+        self.prepared.len()
+    }
+
+    pub fn table_sizes(compiled: &Compiled, channels: usize, rows: u32) -> Vec<u64> {
+        let channels = u32::try_from(channels).unwrap_or(u32::MAX);
+        compiled
+            .plans
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| launches(compiled, *index))
+            .flat_map(|(_, plan)| Prepared::table_sizes(plan, channels, rows))
             .collect()
     }
 
     /// The instance's bind-time tables and rings go in `pooled`'s slots.
     pub fn bind(
-        device: &Context,
         compiled: &Compiled,
         plan: &ExecPlan,
         seeds: &[(u32, Vec<u8>)],
         extents: Extents,
         adopted: &[Option<std::sync::Arc<SharedRing>>],
         pooled: Pooled<'_>,
+        rows: u32,
     ) -> Result<Session> {
         stages_and_plans_agree(compiled)?;
         if plan.package.channels.is_empty() {
@@ -146,8 +169,8 @@ impl Session {
 
         let shapes: Vec<ChannelShape> =
             plan.package.channels.iter().map(ChannelShape::of).collect();
-        let rings = Rings::allocate(device, &shapes, adopted, pooled.pools, pooled.rings)?;
-        let sizes = Session::table_sizes(compiled);
+        let rings = Rings::allocate(&shapes, adopted, pooled.pools, pooled.rings)?;
+        let sizes = Session::table_sizes(compiled, shapes.len(), rows);
         let tables_run = TableLayout::of(&sizes, pooled.pools.slot_bytes(INSTANCE)?).run;
         let mut tables = Tables::pooled(pooled.pools, INSTANCE, pooled.instance, &sizes)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
@@ -156,10 +179,10 @@ impl Session {
         for (index, stage_plan) in compiled.plans.iter().enumerate() {
             prepared.push(if launches(compiled, index) {
                 Some(Prepared::build(
-                    device,
                     stage_plan,
                     &shapes,
                     extents,
+                    rows,
                     &mut tables,
                 )?)
             } else {
@@ -402,6 +425,7 @@ impl Session {
         compiled: &Compiled,
         plan: &ExecPlan,
         at: Stage,
+        carve: &super::GuestCarve,
     ) -> Result<Fired> {
         if self.airborne.is_some() {
             return Err(Fault::program(
@@ -425,8 +449,13 @@ impl Session {
                 continue;
             };
             prepared.refresh(&self.rings, &cursors)?;
-            for region in stage.regions.iter() {
-                prepared.launch_region(device, pipelines, &self.rings, region)?;
+            // Its scratch from the guest region's top, zeroed on the GPU in
+            // the frame of the stage's first region: the one queue orders it
+            // after whatever frame still reads the span, with no submission
+            // or wait of its own.
+            prepared.seat_scratch(carve.clone().take(prepared.scratch_bytes())?);
+            for (at, region) in stage.regions.iter().enumerate() {
+                prepared.launch_region(device, pipelines, &self.rings, region, at == 0)?;
             }
             launched.push(index);
         }

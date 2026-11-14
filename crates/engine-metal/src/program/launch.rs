@@ -10,7 +10,6 @@ use eta_exec::{
 use eta_ir::Dtype;
 use eta_ir::op::tags;
 
-use crate::device::alloc::DeferredZeroBuffer;
 use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context};
 use crate::error::{Fault, Result};
@@ -100,10 +99,10 @@ impl ChannelShape {
     }
 
     /// Zeroed cells for this ring in `slots`, the `Channel` slot refs the
-    /// runtime took for it. A ring larger than a chunk is the one the
-    /// engine keeps (the contract states no slots for it): a buffer of its
-    /// own.
-    pub fn cells(&self, device: &Context, pools: &Pools, slots: &[u32]) -> Result<Cells> {
+    /// runtime took for it. A ring whose cells pass a slot lies in one run,
+    /// which lies in one chunk: a ring past that is refused, never held
+    /// beside the pool.
+    pub fn cells(&self, pools: &Pools, slots: &[u32]) -> Result<Cells> {
         let stride = self.cell_stride() as u64;
         let slot = pools.slot_bytes(CHANNEL)?;
         let per_chunk = pools.slots_per_chunk(CHANNEL)?;
@@ -112,18 +111,16 @@ impl ChannelShape {
         if fits {
             return Cells::pooled(pools, CHANNEL, slots, self.cell_count(), stride);
         }
-        if !slots.is_empty() {
-            return Err(Fault::program(
-                "program::launch",
-                format!(
-                    "a ring of {} bytes is larger than a chunk, the engine's to keep, and the \
-                     binding names {} channel slot(s) for it",
-                    self.cell_count() * stride,
-                    slots.len()
-                ),
-            ));
-        }
-        Cells::own(device, self.cell_count(), stride)
+        Err(Fault::program(
+            "program::launch",
+            format!(
+                "a ring of {} cells of {stride} bytes: its cells pass a {slot}-byte channel slot, \
+                 so it lies in one run of adjacent slots, and the run's {} bytes pass a chunk \
+                 of {per_chunk} slots; declare fewer cells or a smaller cell",
+                self.cell_count(),
+                self.cell_count() * stride,
+            ),
+        ))
     }
 }
 
@@ -137,18 +134,9 @@ pub struct Rings {
 }
 
 impl Rings {
-    /// The rings this instance holds itself apart from the pool (adopted
-    /// shared rings are the plane's; pooled rings are the pool's).
-    #[must_use]
-    pub fn bytes(&self) -> u64 {
-        self.own.iter().flatten().map(Cells::own_bytes).sum()
-    }
-
     /// `rings`: the `Channel` slots the runtime took for each ring this
-    /// instance holds itself, by channel (none for a ring larger than a
-    /// chunk, which the engine keeps).
+    /// instance holds itself, by channel.
     pub fn allocate(
-        device: &Context,
         shapes: &[ChannelShape],
         adopted: &[Option<Arc<SharedRing>>],
         pools: &Pools,
@@ -183,7 +171,7 @@ impl Rings {
                 .iter()
                 .find(|ring| ring.channel as usize == channel)
                 .map_or(&[][..], |ring| ring.slots.as_slice());
-            own.push(Some(shape.cells(device, pools, slots)?));
+            own.push(Some(shape.cells(pools, slots)?));
             shared.push(None);
         }
         Ok(Rings {
@@ -378,14 +366,16 @@ struct RowMeta {
 #[derive(Debug)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 struct Grouped {
-    table: Buffer,
+    /// The lane table, the flags, indices and rows, and each fused
+    /// region's layout: the instance's, in its `Instance` slots.
+    table: Held,
     shape: LaneShape,
-    layouts: Vec<Buffer>,
+    layouts: Vec<Held>,
     bindings: Held,
-    pending_flags: Buffer,
-    lane_indices: Buffer,
-    row_meta: Buffer,
-    row_indices: Buffer,
+    pending_flags: Held,
+    lane_indices: Held,
+    row_meta: Held,
+    row_indices: Held,
     readout_rows: u32,
     layout_words: Vec<GroupLayout>,
     record: LaneRecord,
@@ -396,35 +386,65 @@ const GROUPED_LANES: u32 = 1;
 const THE_LANE: u32 = 0;
 
 impl Grouped {
-    fn bytes(&self) -> u64 {
+    /// Every table, in the order [`Prepared::table_sizes`] states them.
+    fn helds(&mut self) -> impl Iterator<Item = &mut Held> {
         [
-            &self.table,
-            &self.pending_flags,
-            &self.lane_indices,
-            &self.row_meta,
-            &self.row_indices,
+            &mut self.bindings,
+            &mut self.table,
+            &mut self.pending_flags,
+            &mut self.lane_indices,
+            &mut self.row_meta,
+            &mut self.row_indices,
         ]
         .into_iter()
-        .chain(&self.layouts)
-        .map(Buffer::bytes)
-        .sum::<u64>()
-            + self.bindings.own_bytes()
+        .chain(self.layouts.iter_mut())
+    }
+
+    /// The lane record's commit slot names the status word where it lies
+    /// now, after the instance's slots moved.
+    fn recommit(&mut self, status: &Held) -> Result<()> {
+        self.record.commit_slot = status.address_at(0).ok_or_else(|| {
+            Fault::program(
+                "program::launch",
+                "the status word has no GPU address, so a grouped kernel would have \
+                 nothing to write its verdict through",
+            )
+        })?;
+        self.write_record()
     }
 
     #[allow(clippy::too_many_arguments)]
     fn build(
-        device: &Context,
         plan: &LaunchStagePlan,
         descriptors: &[ValueDesc],
         shape: LaneShape,
-        status: &Buffer,
+        status: &Held,
         extents: Extents,
-        readout_rows: u32,
+        (readout_rows, rows_bound): (u32, u32),
         tables: &mut Tables<'_>,
     ) -> Result<Option<Grouped>> {
         if !plan.needs.grouped_valid {
             return Ok(None);
         }
+        if readout_rows > rows_bound.max(1) {
+            return Err(Fault::program(
+                "program::launch",
+                format!(
+                    "this bind reads {readout_rows} readout rows a lane, and the load lays \
+                     the rows of {} (the readouts a lane may take in one fire)",
+                    rows_bound.max(1)
+                ),
+            ));
+        }
+        let stride = u32::try_from(plan.channel_bindings.len())
+            .map_err(|_| Fault::program("program::launch", "more channels than a u32 can count"))?;
+        let binding_bytes: Vec<u8> = (0..GROUPED_LANES)
+            .flat_map(|_| plan.channel_bindings.iter().copied())
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let mut bindings = tables.take(binding_bytes.len().max(4) as u64)?;
+        bindings.write(0, &binding_bytes)?;
+
         let Some(bytes) = shape.bytes() else {
             return Err(Fault::program(
                 "program::launch",
@@ -432,7 +452,7 @@ impl Grouped {
                  lane count multiply past what an allocation can be",
             ));
         };
-        let mut table = Buffer::zeroed(device, bytes)?;
+        let mut table = tables.take(bytes)?;
         table.write(
             0,
             &record_bytes(&LaneHeader {
@@ -464,28 +484,15 @@ impl Grouped {
         })?;
         table.write(at, &record_bytes(&record))?;
 
-        let stride = u32::try_from(plan.channel_bindings.len())
-            .map_err(|_| Fault::program("program::launch", "more channels than a u32 can count"))?;
-        let binding_bytes: Vec<u8> = (0..GROUPED_LANES)
-            .flat_map(|_| plan.channel_bindings.iter().copied())
-            .flat_map(u32::to_le_bytes)
-            .collect();
-        let mut bindings = tables.take(binding_bytes.len().max(4) as u64)?;
-        bindings.write(0, &binding_bytes)?;
-
         let flags = u64::from(GROUPED_LANES) * u64::from(shape.channel_slots_per_lane);
-        let pending_flags = Buffer::zeroed(device, flags.max(1))?;
+        let pending_flags = tables.take(flags.max(1))?;
 
         let index_bytes: Vec<u8> = (0..GROUPED_LANES).flat_map(u32::to_le_bytes).collect();
-        let mut lane_indices = Buffer::zeroed(device, index_bytes.len() as u64)?;
+        let mut lane_indices = tables.take(index_bytes.len() as u64)?;
         lane_indices.write(0, &index_bytes)?;
 
-        let row_meta =
-            Buffer::zeroed(device, (GROUPED_LANES as u64) * size_of::<RowMeta>() as u64)?;
-        let row_indices = Buffer::zeroed(
-            device,
-            u64::from(readout_rows).max(1) * size_of::<u32>() as u64,
-        )?;
+        let row_meta = tables.take((GROUPED_LANES as u64) * size_of::<RowMeta>() as u64)?;
+        let row_indices = tables.take(u64::from(rows_bound.max(1)) * size_of::<u32>() as u64)?;
 
         let scratch_layout = layout(descriptors).map_err(|why| {
             Fault::program(
@@ -518,7 +525,7 @@ impl Grouped {
                 reserved1: rows,
                 ..base
             };
-            let mut buffer = Buffer::zeroed(device, size_of::<GroupLayout>() as u64)?;
+            let mut buffer = tables.take(size_of::<GroupLayout>() as u64)?;
             buffer.write(0, &record_bytes(&words))?;
             layout_words.push(words);
             layouts.push(buffer);
@@ -599,22 +606,36 @@ impl Grouped {
     }
 }
 
+/// Where a fire's value scratch lies: the activation span's guest region,
+/// laid per fire under the model's carve (REDESIGN 3, guest programs), or
+/// nowhere before a fire seats it.
+#[derive(Debug, Clone)]
+pub struct ScratchAt {
+    pub buffer: Buffer,
+    pub offset: u64,
+}
+
 #[derive(Debug)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub struct Prepared {
-    status: Buffer,
+    /// The status word and the output address table: the instance's, in
+    /// its `Instance` slots, as the tables below.
+    status: Held,
     /// The bind-time tables (the instance's state, REDESIGN step 4): in
     /// `Instance` slots where the runtime took them.
     descriptors: Held,
     params: Held,
     offsets: Held,
-    scratch: DeferredZeroBuffer,
+    /// The value scratch this fire seated ([`Prepared::seat_scratch`]),
+    /// `scratch_bytes` of it.
+    scratch: Option<ScratchAt>,
+    scratch_bytes: u64,
     /// By output slot ([`eta_ir::op::output_slot`]): how the stage reads it,
     /// what is bound there and its table entry.
     reads: Vec<Option<Read>>,
     outputs: Vec<Option<Slot>>,
     seats: Vec<OutputSeat>,
-    addresses: Buffer,
+    addresses: Held,
     /// The one slot read through the readout plane.
     readout: Option<usize>,
     /// The stage's names and the slots a lane takes in its table.
@@ -833,70 +854,138 @@ pub struct BatchKey {
 impl Prepared {
     /// Moves each pooled table to the ref `to` maps its slot to.
     pub fn retarget(&mut self, pools: &Pools, to: &impl Fn(u32) -> Result<u32>) -> Result<()> {
-        let grouped = self.grouped.as_mut().map(|grouped| &mut grouped.bindings);
-        for held in [&mut self.descriptors, &mut self.params, &mut self.offsets]
-            .into_iter()
-            .chain(grouped)
+        let grouped = self.grouped.as_mut().into_iter().flat_map(Grouped::helds);
+        for held in [
+            &mut self.descriptors,
+            &mut self.params,
+            &mut self.offsets,
+            &mut self.status,
+            &mut self.addresses,
+        ]
+        .into_iter()
+        .chain(grouped)
         {
             if let Some(slot) = held.slot() {
                 held.retarget(pools, to(slot)?)?;
             }
         }
-        Ok(())
+        self.recommit()
     }
 
     /// Points the pooled bind-time tables at the chunks their slots sit in
     /// now.
     pub fn rebind(&mut self, pools: &Pools) -> Result<()> {
-        self.descriptors.rebind(pools)?;
-        self.params.rebind(pools)?;
-        self.offsets.rebind(pools)?;
-        if let Some(grouped) = self.grouped.as_mut() {
-            grouped.bindings.rebind(pools)?;
+        let grouped = self.grouped.as_mut().into_iter().flat_map(Grouped::helds);
+        for held in [
+            &mut self.descriptors,
+            &mut self.params,
+            &mut self.offsets,
+            &mut self.status,
+            &mut self.addresses,
+        ]
+        .into_iter()
+        .chain(grouped)
+        {
+            held.rebind(pools)?;
         }
-        Ok(())
+        self.recommit()
     }
 
-    /// The device bytes this stage's launch holds for its instance.
-    #[must_use]
-    pub fn bytes(&self) -> u64 {
-        [&self.status, &self.addresses]
-            .into_iter()
-            .map(Buffer::bytes)
-            .sum::<u64>()
-            + [&self.descriptors, &self.params, &self.offsets]
-                .into_iter()
-                .map(Held::own_bytes)
-                .sum::<u64>()
-            + self.scratch.bytes()
-            + self.grouped.as_ref().map_or(0, Grouped::bytes)
+    /// Whether the lane table, as the pool holds it, names the status word
+    /// where it lies now; `None` for a stage with no lane table.
+    #[cfg(test)]
+    pub fn commit_slot_names_status(&self) -> Result<Option<bool>> {
+        let Some(grouped) = self.grouped.as_ref() else {
+            return Ok(None);
+        };
+        let at = grouped.shape.record_offset(THE_LANE).ok_or_else(|| {
+            Fault::program("program::launch", "the one lane is outside the lane table")
+        })?;
+        let mut word = [0u8; 8];
+        grouped.table.read(
+            at + std::mem::offset_of!(LaneRecord, commit_slot) as u64,
+            &mut word,
+        )?;
+        Ok(Some(
+            Some(u64::from_le_bytes(word)) == self.status.address_at(0),
+        ))
+    }
+
+    /// The lane record names the status word where it lies now: its GPU
+    /// address is baked into the lane table.
+    fn recommit(&mut self) -> Result<()> {
+        match self.grouped.as_mut() {
+            Some(grouped) => grouped.recommit(&self.status),
+            None => Ok(()),
+        }
+    }
+
+    /// The value scratch one lane of a stage of `plan` takes in a fire at
+    /// `extents`: its stride, aligned, as [`Prepared::build`] lays it.
+    pub fn scratch_for(plan: &LaunchStagePlan, extents: &Extents) -> Result<u64> {
+        let descriptors: Vec<ValueDesc> = plan
+            .value_types
+            .iter()
+            .map(|value| {
+                describe(value, extents).map_err(|why| {
+                    Fault::program(
+                        "program::launch",
+                        format!("a value's shape does not resolve against these extents: {why:?}"),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let total = layout(&descriptors)
+            .map_err(|why| {
+                Fault::program(
+                    "program::launch",
+                    format!("a stage's scratch does not fit: {why:?}"),
+                )
+            })?
+            .total;
+        Ok(u64::try_from(total)
+            .unwrap_or(u64::MAX)
+            .max(SCRATCH_ALIGN)
+            .next_multiple_of(SCRATCH_ALIGN))
     }
 
     /// The bind-time tables a stage of `plan` takes, in the order `build`
-    /// takes them from its [`Tables`]: params, descriptors, offsets and,
-    /// for a grouped stage, the channel bindings. Counts alone size them,
-    /// so a program states them at registration.
+    /// takes them from its [`Tables`]: params, descriptors, offsets, the
+    /// status word and the output addresses and, for a grouped stage, the
+    /// channel bindings, the lane table (`channels` slots a lane), its
+    /// flags, indices, row meta, `rows` readout rows and each fused
+    /// region's layout. Counts alone size them, so a program states them
+    /// at registration.
     #[must_use]
-    pub fn table_sizes(plan: &LaunchStagePlan) -> Vec<u64> {
+    pub fn table_sizes(plan: &LaunchStagePlan, channels: u32, rows: u32) -> Vec<u64> {
         let mut sizes = vec![
             (plan.ops.len() * size_of::<OpParams>()).max(size_of::<OpParams>()) as u64,
             (plan.value_types.len() * size_of::<ValueDesc>()).max(1) as u64,
             (plan.value_types.len() * size_of::<u32>()).max(size_of::<u32>()) as u64,
+            eta_exec::STATUS_BYTES as u64,
+            ((plan.output_pitch as usize).max(1) * size_of::<OutputSeat>()) as u64,
         ];
         if plan.needs.grouped_valid {
-            sizes.push(
+            let shape = LaneShape::of(GROUPED_LANES, channels);
+            sizes.extend([
                 (GROUPED_LANES as usize * plan.channel_bindings.len() * size_of::<u32>()).max(4)
                     as u64,
-            );
+                shape.bytes().unwrap_or(u64::MAX),
+                (u64::from(GROUPED_LANES) * u64::from(shape.channel_slots_per_lane)).max(1),
+                u64::from(GROUPED_LANES) * size_of::<u32>() as u64,
+                u64::from(GROUPED_LANES) * size_of::<RowMeta>() as u64,
+                u64::from(rows.max(1)) * size_of::<u32>() as u64,
+            ]);
+            sizes.extend(plan.fused.iter().map(|_| size_of::<GroupLayout>() as u64));
         }
         sizes
     }
 
     pub fn build(
-        device: &Context,
         plan: &LaunchStagePlan,
         shapes: &[ChannelShape],
         extents: Extents,
+        rows: u32,
         tables: &mut Tables<'_>,
     ) -> Result<Prepared> {
         let channel_count = u32::try_from(plan.channel_bindings.len())
@@ -1016,9 +1105,11 @@ impl Prepared {
         let mut offsets = tables.take(offset_bytes.len().max(size_of::<u32>()) as u64)?;
         offsets.write(0, &offset_bytes)?;
 
-        let scratch_bytes = u64::from(scratch_stride).max(SCRATCH_ALIGN);
-        let scratch = DeferredZeroBuffer::new(device, scratch_bytes)?;
-        let status = Buffer::zeroed(device, eta_exec::STATUS_BYTES as u64)?;
+        let scratch_bytes = u64::from(scratch_stride)
+            .max(SCRATCH_ALIGN)
+            .next_multiple_of(SCRATCH_ALIGN);
+        let status = tables.take(eta_exec::STATUS_BYTES as u64)?;
+        let addresses = tables.take((pitch.max(1) * size_of::<OutputSeat>()) as u64)?;
 
         let lanes = LaneShape::of(
             GROUPED_LANES,
@@ -1027,13 +1118,12 @@ impl Prepared {
             })?,
         );
         let grouped = Grouped::build(
-            device,
             plan,
             &descriptors,
             lanes,
             &status,
             extents,
-            readout_rows,
+            (readout_rows, rows),
             tables,
         )?;
 
@@ -1042,11 +1132,12 @@ impl Prepared {
             descriptors: descriptor_buffer,
             params,
             offsets,
-            scratch,
+            scratch: None,
+            scratch_bytes,
             reads,
             outputs: vec![None; pitch],
             seats: vec![OutputSeat::default(); pitch],
-            addresses: Buffer::zeroed(device, (pitch.max(1) * size_of::<OutputSeat>()) as u64)?,
+            addresses,
             readout,
             names: plan.names.clone(),
             output_slots: plan.output_slots,
@@ -1085,24 +1176,39 @@ impl Prepared {
     }
 
     pub fn refresh(&mut self, rings: &Rings, cursors: &[Cursor]) -> Result<()> {
-        self.refresh_cells(rings, cursors)?;
-        if scratch_zeroing_skipped() {
-            return Ok(());
-        }
-        self.scratch.clear()
+        self.refresh_cells(rings, cursors)
     }
 
-    pub fn zero_scratch(&mut self) -> Result<()> {
-        self.scratch.clear()
+    /// The value scratch one fire of this stage takes: its stride, aligned.
+    #[must_use]
+    pub fn scratch_bytes(&self) -> u64 {
+        self.scratch_bytes
     }
 
+    /// Seats this fire's value scratch at `at` (the guest region under the
+    /// fire's model carve); a later fire seats its own.
+    pub fn seat_scratch(&mut self, at: ScratchAt) {
+        self.scratch = Some(at);
+    }
+
+    fn scratch(&self) -> Result<&ScratchAt> {
+        self.scratch.as_ref().ok_or_else(|| {
+            Fault::program(
+                "program::launch",
+                "a stage fired before its fire seated its value scratch in the span",
+            )
+        })
+    }
+
+    /// Zeroes the seated scratch on the GPU, in `frame`, ahead of the
+    /// stage's passes.
     #[cfg(target_vendor = "apple")]
     pub fn zero_scratch_on(&mut self, frame: &mut Frame) -> Result<()> {
         if scratch_zeroing_skipped() {
             return Ok(());
         }
-        let scratch = self.scratch.get()?;
-        frame.fill(scratch.slab(), 0, scratch.bytes())?;
+        let scratch = self.scratch()?.clone();
+        frame.fill(scratch.buffer.slab(), scratch.offset, self.scratch_bytes)?;
         frame.next_pass()?;
         Ok(())
     }
@@ -1222,7 +1328,10 @@ impl Prepared {
 
     pub fn encode_into(&self, frame: &Frame, region: &Region) -> Result<()> {
         match region.form {
-            Form::Fused => self.encode_fused(frame, region, self.scratch.get()?, 0),
+            Form::Fused => {
+                let scratch = self.scratch()?;
+                self.encode_fused(frame, region, &scratch.buffer, scratch.offset)
+            }
             Form::Streamed => self.encode_streamed(frame, region),
             Form::Grouped | Form::GroupedLibrary => self.encode_grouped(frame, region),
         }
@@ -1254,9 +1363,13 @@ impl Prepared {
                 })?;
             let encoder = frame.encoder();
             encoder.setComputePipelineState(region.pipeline());
-            // SAFETY: every reservation is retained by `self`; every offset is zero.
+            // SAFETY: every reservation is retained by `self`; every offset lies inside its slot.
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(grouped.table.raw()), 0, 0);
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.table.raw()),
+                    grouped.table.offset() as usize,
+                    0,
+                );
                 encoder.setBuffer_offset_atIndex(
                     Some(self.descriptors.raw()),
                     self.descriptors.offset() as usize,
@@ -1272,20 +1385,43 @@ impl Prepared {
                     self.offsets.offset() as usize,
                     3,
                 );
-                encoder.setBuffer_offset_atIndex(Some(self.scratch.get()?.raw()), 0, 4);
-                encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
+                {
+                    let scratch = self.scratch()?;
+                    encoder.setBuffer_offset_atIndex(
+                        Some(scratch.buffer.raw()),
+                        usize::try_from(scratch.offset).unwrap_or(usize::MAX),
+                        4,
+                    );
+                }
+                encoder.setBuffer_offset_atIndex(Some(layout.raw()), layout.offset() as usize, 5);
                 encoder.setBuffer_offset_atIndex(
                     Some(grouped.bindings.raw()),
                     grouped.bindings.offset() as usize,
                     6,
                 );
-                encoder.setBuffer_offset_atIndex(Some(grouped.pending_flags.raw()), 0, 7);
-                encoder.setBuffer_offset_atIndex(Some(grouped.lane_indices.raw()), 0, 8);
-                encoder.setBuffer_offset_atIndex(Some(grouped.row_meta.raw()), 0, 9);
-                encoder.setBuffer_offset_atIndex(Some(grouped.row_indices.raw()), 0, 10);
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.pending_flags.raw()),
+                    grouped.pending_flags.offset() as usize,
+                    7,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.lane_indices.raw()),
+                    grouped.lane_indices.offset() as usize,
+                    8,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.row_meta.raw()),
+                    grouped.row_meta.offset() as usize,
+                    9,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.row_indices.raw()),
+                    grouped.row_indices.offset() as usize,
+                    10,
+                );
                 encoder.setBuffer_offset_atIndex(
                     Some(self.addresses.raw()),
-                    0,
+                    self.addresses.offset() as usize,
                     eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
                 );
             }
@@ -1295,7 +1431,7 @@ impl Prepared {
                 encoder.useResource_usage(resource, usage);
             };
             resident(
-                &self.status,
+                self.status.buffer(),
                 MTLResourceUsage::Read | MTLResourceUsage::Write,
             );
             for cell in &self.bound {
@@ -1349,7 +1485,11 @@ impl Prepared {
             let scratch_at = usize::try_from(scratch_at).unwrap_or(usize::MAX);
             // SAFETY: every buffer is retained by `self`/`region`/the batch; every offset was bounds-checked.
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(self.status.raw()), 0, 0);
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.status.raw()),
+                    self.status.offset() as usize,
+                    0,
+                );
                 encoder.setBuffer_offset_atIndex(
                     Some(self.descriptors.raw()),
                     self.descriptors.offset() as usize,
@@ -1385,7 +1525,7 @@ impl Prepared {
                 }
                 encoder.setBuffer_offset_atIndex(
                     Some(self.addresses.raw()),
-                    0,
+                    self.addresses.offset() as usize,
                     eta_compiler::codegen::metal::M2_INTRINSIC_TABLE_BUFFER,
                 );
                 for (local, bound) in self.bound.iter().enumerate() {
@@ -1449,9 +1589,13 @@ impl Prepared {
 
             let encoder = frame.encoder();
             encoder.setComputePipelineState(region.pipeline());
-            // SAFETY: every reservation is retained by `self`; every offset is zero (the kernel strides off `layout`).
+            // SAFETY: every reservation is retained by `self`; every offset lies inside its slot (the kernel strides off `layout`).
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(grouped.table.raw()), 0, 0);
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.table.raw()),
+                    grouped.table.offset() as usize,
+                    0,
+                );
                 encoder.setBuffer_offset_atIndex(
                     Some(self.descriptors.raw()),
                     self.descriptors.offset() as usize,
@@ -1467,20 +1611,43 @@ impl Prepared {
                     self.offsets.offset() as usize,
                     3,
                 );
-                encoder.setBuffer_offset_atIndex(Some(self.scratch.get()?.raw()), 0, 4);
-                encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
+                {
+                    let scratch = self.scratch()?;
+                    encoder.setBuffer_offset_atIndex(
+                        Some(scratch.buffer.raw()),
+                        usize::try_from(scratch.offset).unwrap_or(usize::MAX),
+                        4,
+                    );
+                }
+                encoder.setBuffer_offset_atIndex(Some(layout.raw()), layout.offset() as usize, 5);
                 encoder.setBuffer_offset_atIndex(
                     Some(grouped.bindings.raw()),
                     grouped.bindings.offset() as usize,
                     6,
                 );
-                encoder.setBuffer_offset_atIndex(Some(grouped.pending_flags.raw()), 0, 7);
-                encoder.setBuffer_offset_atIndex(Some(grouped.lane_indices.raw()), 0, 8);
-                encoder.setBuffer_offset_atIndex(Some(grouped.row_meta.raw()), 0, 9);
-                encoder.setBuffer_offset_atIndex(Some(grouped.row_indices.raw()), 0, 10);
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.pending_flags.raw()),
+                    grouped.pending_flags.offset() as usize,
+                    7,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.lane_indices.raw()),
+                    grouped.lane_indices.offset() as usize,
+                    8,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.row_meta.raw()),
+                    grouped.row_meta.offset() as usize,
+                    9,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.row_indices.raw()),
+                    grouped.row_indices.offset() as usize,
+                    10,
+                );
                 encoder.setBuffer_offset_atIndex(
                     Some(self.addresses.raw()),
-                    0,
+                    self.addresses.offset() as usize,
                     eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
                 );
             }
@@ -1491,7 +1658,7 @@ impl Prepared {
                 encoder.useResource_usage(resource, usage);
             };
             resident(
-                &self.status,
+                self.status.buffer(),
                 MTLResourceUsage::Read | MTLResourceUsage::Write,
             );
             for cell in &self.bound {
@@ -1538,23 +1705,30 @@ impl Prepared {
         }
     }
 
+    /// Fires `region` in a frame of its own; `zero` first zeroes the seated
+    /// scratch in that same frame (a stage's first region), so the zeroing
+    /// costs no submission and no wait of its own.
     pub fn launch_region(
-        &self,
+        &mut self,
         device: &Context,
         pipelines: &crate::device::Pipelines,
         rings: &Rings,
         region: &Region,
+        zero: bool,
     ) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
             let _ = (pipelines, rings);
-            let frame = device.frame()?;
+            let mut frame = device.frame()?;
+            if zero {
+                self.zero_scratch_on(&mut frame)?;
+            }
             self.encode_into(&frame, region)?;
             frame.commit()
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            let _ = (device, pipelines, rings, region);
+            let _ = (device, pipelines, rings, region, zero);
             Err(Fault::Deviceless)
         }
     }
@@ -1592,27 +1766,109 @@ pub struct Batch {
     key: BatchKey,
     lanes: u32,
     shape: LaneShape,
-    table: Buffer,
-    descriptors: Buffer,
-    params: Buffer,
-    offsets: Buffer,
-    bindings: Buffer,
-    pending_flags: Buffer,
-    lane_indices: Buffer,
-    row_meta: Buffer,
-    row_indices: Buffer,
-    scratch: Buffer,
-    addresses: Buffer,
+    /// Every table, a region of the span's batch area ([`Batch::lay`]):
+    /// this batch's frame in flight writes them, and no other frame reads
+    /// them while it is airborne.
+    table: SpanRegion,
+    descriptors: SpanRegion,
+    params: SpanRegion,
+    offsets: SpanRegion,
+    bindings: SpanRegion,
+    pending_flags: SpanRegion,
+    lane_indices: SpanRegion,
+    row_meta: SpanRegion,
+    row_indices: SpanRegion,
+    /// This fire's value scratch, seated per fire ([`Batch::seat_scratch`]):
+    /// a stride a member, in the span's guest region.
+    scratch: Option<ScratchAt>,
+    addresses: SpanRegion,
     table_bytes: u64,
-    layouts: Vec<Buffer>,
+    layouts: Vec<SpanRegion>,
     layout_words: Vec<GroupLayout>,
     rows_per_lane: u32,
+    /// What [`Batch::lay`] writes again wherever the batch is laid: the
+    /// template's tables, a copy a lane where they are per lane.
+    descriptor_bytes: Vec<u8>,
+    param_bytes: Vec<u8>,
+    offset_bytes: Vec<u8>,
+    binding_bytes: Vec<u8>,
+}
+
+/// A batch table's region of the span.
+type SpanRegion = crate::inputs::Region;
+
+/// A batch's tables' bytes, in the order [`Batch::lay`] lays them: the lane
+/// table, descriptors, params, offsets, bindings, pending flags, lane
+/// indices, row meta, row indices, output addresses and each fused
+/// region's layout.
+#[allow(clippy::too_many_arguments)]
+fn batch_pieces(
+    lanes: u32,
+    channel_slots: u32,
+    (descriptor, param, offset, binding): (u64, u64, u64, u64),
+    rows: u32,
+    table_bytes: u64,
+    fused: usize,
+) -> Vec<u64> {
+    let lanes64 = u64::from(lanes);
+    let mut pieces = vec![
+        LaneShape::of(lanes, channel_slots)
+            .bytes()
+            .unwrap_or(u64::MAX),
+        (descriptor * lanes64).max(4),
+        (param * lanes64).max(4),
+        offset.max(4),
+        (binding * lanes64).max(4),
+        (lanes64 * u64::from(channel_slots)).max(1),
+        lanes64 * size_of::<u32>() as u64,
+        lanes64 * size_of::<RowMeta>() as u64,
+        (lanes64 * u64::from(rows) * size_of::<u32>() as u64).max(4),
+        lanes64 * table_bytes,
+    ];
+    pieces.extend((0..fused).map(|_| size_of::<GroupLayout>() as u64));
+    pieces
+}
+
+/// The span bytes `pieces` take, each on the arena's boundary.
+fn batch_area(pieces: &[u64]) -> u64 {
+    pieces.iter().map(|&bytes| crate::arena::room(bytes)).sum()
 }
 
 impl Batch {
-    /// The device bytes this batch's tables hold.
+    /// The span bytes this batch's tables take where it is laid.
     #[must_use]
     pub fn bytes(&self) -> u64 {
+        self.regions()
+            .map(|region| crate::arena::room(region.bytes()))
+            .sum()
+    }
+
+    /// The span bytes a batch of `lanes` lanes of a stage of `plan` takes,
+    /// its instances carrying `channels` channels and reading at most
+    /// `rows` readout rows a lane: what a fire term states before any is
+    /// laid; 0 for a stage with no grouped seat.
+    #[must_use]
+    pub fn bytes_for(plan: &LaunchStagePlan, channels: u32, lanes: u32, rows: u32) -> u64 {
+        if !plan.needs.grouped_valid {
+            return 0;
+        }
+        let values = plan.value_types.len() as u64;
+        batch_area(&batch_pieces(
+            lanes.max(1),
+            LaneShape::of(GROUPED_LANES, channels).channel_slots_per_lane,
+            (
+                values * size_of::<ValueDesc>() as u64,
+                (plan.ops.len() * size_of::<OpParams>()) as u64,
+                values * size_of::<u32>() as u64,
+                (plan.channel_bindings.len() * size_of::<u32>()) as u64,
+            ),
+            rows.max(1),
+            ((plan.output_pitch as usize).max(1) * size_of::<OutputSeat>()) as u64,
+            plan.fused.len(),
+        ))
+    }
+
+    fn regions(&self) -> impl Iterator<Item = &SpanRegion> {
         [
             &self.table,
             &self.descriptors,
@@ -1623,16 +1879,32 @@ impl Batch {
             &self.lane_indices,
             &self.row_meta,
             &self.row_indices,
-            &self.scratch,
             &self.addresses,
         ]
         .into_iter()
         .chain(&self.layouts)
-        .map(Buffer::bytes)
-        .sum()
     }
 
-    pub fn build(device: &Context, template: &Prepared, lanes: u32) -> Result<Batch> {
+    fn regions_mut(&mut self) -> impl Iterator<Item = &mut SpanRegion> {
+        [
+            &mut self.table,
+            &mut self.descriptors,
+            &mut self.params,
+            &mut self.offsets,
+            &mut self.bindings,
+            &mut self.pending_flags,
+            &mut self.lane_indices,
+            &mut self.row_meta,
+            &mut self.row_indices,
+            &mut self.addresses,
+        ]
+        .into_iter()
+        .chain(self.layouts.iter_mut())
+    }
+
+    /// A batch of `lanes` lanes of `template`'s stage, its tables sized and
+    /// not yet laid ([`Batch::lay`]): nothing binds or writes them before.
+    pub fn plan(template: &Prepared, lanes: u32, empty: &Buffer) -> Result<Batch> {
         let key = template.batch_key().ok_or_else(|| {
             Fault::program(
                 "program::launch",
@@ -1647,83 +1919,129 @@ impl Batch {
         let lanes = lanes.max(1);
         let table_bytes = (template.seats.len().max(1) * size_of::<OutputSeat>()) as u64;
         let shape = LaneShape::of(lanes, grouped.shape.channel_slots_per_lane);
-        let bytes = shape.bytes().ok_or_else(|| {
-            Fault::program(
+        if shape.bytes().is_none() {
+            return Err(Fault::program(
                 "program::launch",
                 "a batch lane table whose size does not fit a u64",
-            )
-        })?;
-        let mut table = Buffer::zeroed(device, bytes)?;
-        table.write(
-            0,
-            &record_bytes(&LaneHeader {
-                abi_version: LANE_ABI_VERSION,
-                lane_count: lanes,
-                channel_slots_per_lane: shape.channel_slots_per_lane,
-                flags: 0,
-            }),
-        )?;
-        let replicate = |device: &Context, bytes: &[u8]| -> Result<Buffer> {
-            let mut buffer =
-                Buffer::zeroed(device, (bytes.len() as u64 * u64::from(lanes)).max(4))?;
-            for lane in 0..lanes {
-                buffer.write(u64::from(lane) * bytes.len() as u64, bytes)?;
-            }
-            Ok(buffer)
-        };
-        let descriptors = replicate(device, &template.descriptor_bytes)?;
-        let params = replicate(device, &template.param_bytes)?;
-        let mut offsets = Buffer::zeroed(device, template.offset_bytes.len().max(4) as u64)?;
-        offsets.write(0, &template.offset_bytes)?;
+            ));
+        }
         let binding_bytes: Vec<u8> = template
             .bindings
             .iter()
             .copied()
             .flat_map(u32::to_le_bytes)
             .collect();
-        let bindings = replicate(device, &binding_bytes)?;
-        let pending_flags = Buffer::zeroed(
-            device,
-            (u64::from(lanes) * u64::from(shape.channel_slots_per_lane)).max(1),
-        )?;
-        let index_bytes: Vec<u8> = (0..lanes).flat_map(u32::to_le_bytes).collect();
-        let mut lane_indices = Buffer::zeroed(device, index_bytes.len() as u64)?;
-        lane_indices.write(0, &index_bytes)?;
-        let row_meta = Buffer::zeroed(device, u64::from(lanes) * size_of::<RowMeta>() as u64)?;
         let rows_per_lane = grouped.readout_rows;
-        let row_indices = Buffer::zeroed(
-            device,
-            (u64::from(lanes) * u64::from(rows_per_lane) * size_of::<u32>() as u64).max(4),
-        )?;
-        let scratch = Buffer::zeroed(
-            device,
-            (u64::from(lanes) * u64::from(template.scratch_stride)).max(SCRATCH_ALIGN),
-        )?;
-        let mut layouts = Vec::with_capacity(grouped.layout_words.len());
-        for words in &grouped.layout_words {
-            let mut buffer = Buffer::zeroed(device, size_of::<GroupLayout>() as u64)?;
-            buffer.write(0, &record_bytes(words))?;
-            layouts.push(buffer);
-        }
+        let pieces = batch_pieces(
+            lanes,
+            grouped.shape.channel_slots_per_lane,
+            (
+                template.descriptor_bytes.len() as u64,
+                template.param_bytes.len() as u64,
+                template.offset_bytes.len() as u64,
+                binding_bytes.len() as u64,
+            ),
+            rows_per_lane,
+            table_bytes,
+            grouped.layout_words.len(),
+        );
+        let mut regions = pieces
+            .iter()
+            .map(|&bytes| SpanRegion::unplaced(bytes, empty.clone()));
+        let mut next = || regions.next().expect("a region a piece");
         Ok(Batch {
             key,
             lanes,
             shape,
-            table,
-            descriptors,
-            params,
-            offsets,
-            bindings,
-            pending_flags,
-            lane_indices,
-            row_meta,
-            row_indices,
-            scratch,
-            addresses: Buffer::zeroed(device, u64::from(lanes) * table_bytes)?,
+            table: next(),
+            descriptors: next(),
+            params: next(),
+            offsets: next(),
+            bindings: next(),
+            pending_flags: next(),
+            lane_indices: next(),
+            row_meta: next(),
+            row_indices: next(),
+            scratch: None,
+            addresses: next(),
             table_bytes,
-            layouts,
+            layouts: (0..grouped.layout_words.len()).map(|_| next()).collect(),
             layout_words: grouped.layout_words.clone(),
             rows_per_lane,
+            descriptor_bytes: template.descriptor_bytes.clone(),
+            param_bytes: template.param_bytes.clone(),
+            offset_bytes: template.offset_bytes.clone(),
+            binding_bytes,
+        })
+    }
+
+    /// Lays the batch's tables from `at` of `view` (the span's buffer)
+    /// upward, written through `host` (`(at, bytes)` to its host runs), and
+    /// writes what a batch holds from its first fire; the caller drained
+    /// every frame that read where it was. Returns where the next lies.
+    pub fn lay(
+        &mut self,
+        view: &Buffer,
+        at: u64,
+        host: &dyn Fn(u64, u64) -> Result<Vec<(u64, u64, std::ptr::NonNull<u8>)>>,
+    ) -> Result<u64> {
+        let mut next = at;
+        for region in self.regions_mut() {
+            let bytes = region.bytes();
+            region.place(view.clone(), next);
+            region.rehost(if bytes > 0 {
+                host(next, bytes)?
+            } else {
+                Vec::new()
+            })?;
+            next += crate::arena::room(bytes);
+        }
+        self.table.write(
+            0,
+            &record_bytes(&LaneHeader {
+                abi_version: LANE_ABI_VERSION,
+                lane_count: self.lanes,
+                channel_slots_per_lane: self.shape.channel_slots_per_lane,
+                flags: 0,
+            }),
+        )?;
+        for lane in 0..u64::from(self.lanes) {
+            let descriptor = self.descriptor_bytes.len() as u64;
+            self.descriptors
+                .write(lane * descriptor, &self.descriptor_bytes)?;
+            let param = self.param_bytes.len() as u64;
+            self.params.write(lane * param, &self.param_bytes)?;
+            let binding = self.binding_bytes.len() as u64;
+            self.bindings.write(lane * binding, &self.binding_bytes)?;
+        }
+        self.offsets.write(0, &self.offset_bytes)?;
+        let index_bytes: Vec<u8> = (0..self.lanes).flat_map(u32::to_le_bytes).collect();
+        self.lane_indices.write(0, &index_bytes)?;
+        for (words, region) in self.layout_words.iter().zip(self.layouts.iter_mut()) {
+            region.write(0, &record_bytes(words))?;
+        }
+        Ok(next)
+    }
+
+    /// The value scratch a fire of `members` members takes: a stride each.
+    #[must_use]
+    pub fn scratch_bytes(&self, members: u32) -> u64 {
+        (u64::from(members) * u64::from(self.key.scratch_stride))
+            .max(SCRATCH_ALIGN)
+            .next_multiple_of(SCRATCH_ALIGN)
+    }
+
+    /// Seats this fire's value scratch at `at`.
+    pub fn seat_scratch(&mut self, at: ScratchAt) {
+        self.scratch = Some(at);
+    }
+
+    fn scratch(&self) -> Result<&ScratchAt> {
+        self.scratch.as_ref().ok_or_else(|| {
+            Fault::program(
+                "program::launch",
+                "a batch fired before its fire seated its value scratch in the span",
+            )
         })
     }
 
@@ -1759,14 +2077,14 @@ impl Batch {
             0,
             u64::from(count) * u64::from(self.shape.channel_slots_per_lane),
         )?;
+        let scratch = self.scratch()?.clone();
         if !scratch_zeroing_skipped() {
-            #[cfg(target_vendor = "apple")]
-            {
-                frame.fill(self.scratch.slab(), 0, u64::from(count) * stride)?;
-                frame.next_pass()?;
-            }
-            #[cfg(not(target_vendor = "apple"))]
-            self.scratch.zero_span(0, u64::from(count) * stride)?;
+            frame.fill(
+                scratch.buffer.slab(),
+                scratch.offset,
+                u64::from(count) * stride,
+            )?;
+            frame.next_pass()?;
         }
         let frame: &Frame = frame;
         let vocab = members[0]
@@ -1853,7 +2171,12 @@ impl Batch {
             match region.form {
                 Form::Fused => {
                     for (index, member) in members.iter().enumerate() {
-                        member.encode_fused(frame, region, &self.scratch, index as u64 * stride)?;
+                        member.encode_fused(
+                            frame,
+                            region,
+                            &scratch.buffer,
+                            scratch.offset + index as u64 * stride,
+                        )?;
                     }
                 }
                 Form::Grouped | Form::GroupedLibrary => {
@@ -1897,20 +2220,67 @@ impl Batch {
             encoder.setComputePipelineState(region.pipeline());
             // SAFETY: every buffer is retained by `self`; every offset is zero.
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(self.table.raw()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
-                encoder.setBuffer_offset_atIndex(Some(self.scratch.raw()), 0, 4);
-                encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
-                encoder.setBuffer_offset_atIndex(Some(self.bindings.raw()), 0, 6);
-                encoder.setBuffer_offset_atIndex(Some(self.pending_flags.raw()), 0, 7);
-                encoder.setBuffer_offset_atIndex(Some(self.lane_indices.raw()), 0, 8);
-                encoder.setBuffer_offset_atIndex(Some(self.row_meta.raw()), 0, 9);
-                encoder.setBuffer_offset_atIndex(Some(self.row_indices.raw()), 0, 10);
                 encoder.setBuffer_offset_atIndex(
-                    Some(self.addresses.raw()),
+                    Some(self.table.view().raw()),
+                    self.table.at(0) as usize,
                     0,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.descriptors.view().raw()),
+                    self.descriptors.at(0) as usize,
+                    1,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.params.view().raw()),
+                    self.params.at(0) as usize,
+                    2,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.offsets.view().raw()),
+                    self.offsets.at(0) as usize,
+                    3,
+                );
+                {
+                    let scratch = self.scratch()?;
+                    encoder.setBuffer_offset_atIndex(
+                        Some(scratch.buffer.raw()),
+                        usize::try_from(scratch.offset).unwrap_or(usize::MAX),
+                        4,
+                    );
+                }
+                encoder.setBuffer_offset_atIndex(
+                    Some(layout.view().raw()),
+                    layout.at(0) as usize,
+                    5,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.bindings.view().raw()),
+                    self.bindings.at(0) as usize,
+                    6,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.pending_flags.view().raw()),
+                    self.pending_flags.at(0) as usize,
+                    7,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.lane_indices.view().raw()),
+                    self.lane_indices.at(0) as usize,
+                    8,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.row_meta.view().raw()),
+                    self.row_meta.at(0) as usize,
+                    9,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.row_indices.view().raw()),
+                    self.row_indices.at(0) as usize,
+                    10,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.addresses.view().raw()),
+                    self.addresses.at(0) as usize,
                     eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
                 );
             }
@@ -1921,7 +2291,7 @@ impl Batch {
             };
             for member in members {
                 resident(
-                    &member.status,
+                    member.status.buffer(),
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
                 );
                 for cell in &member.bound {
@@ -2031,20 +2401,67 @@ impl Batch {
             }
             // SAFETY: every buffer is retained by `self`; every offset is zero (the kernel strides off `layout`).
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(self.table.raw()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
-                encoder.setBuffer_offset_atIndex(Some(self.scratch.raw()), 0, 4);
-                encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
-                encoder.setBuffer_offset_atIndex(Some(self.bindings.raw()), 0, 6);
-                encoder.setBuffer_offset_atIndex(Some(self.pending_flags.raw()), 0, 7);
-                encoder.setBuffer_offset_atIndex(Some(self.lane_indices.raw()), 0, 8);
-                encoder.setBuffer_offset_atIndex(Some(self.row_meta.raw()), 0, 9);
-                encoder.setBuffer_offset_atIndex(Some(self.row_indices.raw()), 0, 10);
                 encoder.setBuffer_offset_atIndex(
-                    Some(self.addresses.raw()),
+                    Some(self.table.view().raw()),
+                    self.table.at(0) as usize,
                     0,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.descriptors.view().raw()),
+                    self.descriptors.at(0) as usize,
+                    1,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.params.view().raw()),
+                    self.params.at(0) as usize,
+                    2,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.offsets.view().raw()),
+                    self.offsets.at(0) as usize,
+                    3,
+                );
+                {
+                    let scratch = self.scratch()?;
+                    encoder.setBuffer_offset_atIndex(
+                        Some(scratch.buffer.raw()),
+                        usize::try_from(scratch.offset).unwrap_or(usize::MAX),
+                        4,
+                    );
+                }
+                encoder.setBuffer_offset_atIndex(
+                    Some(layout.view().raw()),
+                    layout.at(0) as usize,
+                    5,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.bindings.view().raw()),
+                    self.bindings.at(0) as usize,
+                    6,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.pending_flags.view().raw()),
+                    self.pending_flags.at(0) as usize,
+                    7,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.lane_indices.view().raw()),
+                    self.lane_indices.at(0) as usize,
+                    8,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.row_meta.view().raw()),
+                    self.row_meta.at(0) as usize,
+                    9,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.row_indices.view().raw()),
+                    self.row_indices.at(0) as usize,
+                    10,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.addresses.view().raw()),
+                    self.addresses.at(0) as usize,
                     eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
                 );
             }
@@ -2055,7 +2472,7 @@ impl Batch {
             };
             for member in members {
                 resident(
-                    &member.status,
+                    member.status.buffer(),
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
                 );
                 for cell in &member.bound {

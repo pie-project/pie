@@ -1689,7 +1689,11 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
         3,
         "dropped"
     );
-    assert_eq!(store.available_pages(), 8, "back at once: no fire in flight read it");
+    assert_eq!(
+        store.available_pages(),
+        8,
+        "back at once: no fire in flight read it"
+    );
     store.settle(busy);
     store.settle(other);
 
@@ -1705,7 +1709,11 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
         "dropped"
     );
     store.retire_idle();
-    assert_eq!(store.available_pages(), 5, "the fire that read it is in flight");
+    assert_eq!(
+        store.available_pages(),
+        5,
+        "the fire that read it is in flight"
+    );
     store.settle(read);
     store.retire_idle();
     assert_eq!(store.available_pages(), 8, "and back once it retires");

@@ -592,7 +592,12 @@ impl Refs {
     }
 
     fn shape(&self, kind: fn(&engine::chunk::SlotKind) -> bool) -> Option<usize> {
-        self.facts.shapes.iter().position(|shape| kind(&shape.kind))
+        self.facts.shapes.iter().position(|shape| {
+            !matches!(
+                shape.role,
+                engine::chunk::SlotRole::Instance | engine::chunk::SlotRole::Channel
+            ) && kind(&shape.kind)
+        })
     }
 
     fn take(&mut self, shape: usize) -> u32 {
@@ -1523,7 +1528,7 @@ fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     };
     let list = shape(|s| matches!(s.kind, SlotKind::List { .. }) && s.role == SlotRole::State);
     let rs = shape(|s| s.role == SlotRole::RsBuffer);
-    let fixed = shape(|s| matches!(s.kind, SlotKind::Fixed { .. }));
+    let fixed = shape(|s| matches!(s.kind, SlotKind::Fixed { .. }) && s.role == SlotRole::State);
     let ids = [list, rs, fixed].map(|at| facts.shapes[at].id);
     let SlotKind::List { tokens: page, .. } = facts.shapes[rs].kind else {
         unreachable!("the rs list")
@@ -2246,7 +2251,13 @@ fn small_pool_arms(fixture: &Fixture, cache: &Path) {
         facts
             .shapes
             .iter()
-            .find(|shape| matches!(shape.kind, SlotKind::Fixed { .. }))
+            .find(|shape| {
+                matches!(shape.kind, SlotKind::Fixed { .. })
+                    && !matches!(
+                        shape.role,
+                        engine::chunk::SlotRole::Instance | engine::chunk::SlotRole::Channel
+                    )
+            })
             .expect("a hybrid's recurrent record")
             .slot_bytes
     };
@@ -2259,7 +2270,12 @@ fn small_pool_arms(fixture: &Fixture, cache: &Path) {
             facts
                 .shapes
                 .iter()
-                .find(|shape| kind(&shape.kind))
+                .find(|shape| {
+                    !matches!(
+                        shape.role,
+                        engine::chunk::SlotRole::Instance | engine::chunk::SlotRole::Channel
+                    ) && kind(&shape.kind)
+                })
                 .map_or(0, |shape| {
                     slots.div_ceil(u64::from(shape.slots_per_chunk.max(1)))
                 })
@@ -2267,6 +2283,12 @@ fn small_pool_arms(fixture: &Fixture, cache: &Path) {
         let pieces = facts
             .shapes
             .iter()
+            .filter(|shape| {
+                !matches!(
+                    shape.role,
+                    engine::chunk::SlotRole::Instance | engine::chunk::SlotRole::Channel
+                )
+            })
             .find_map(|shape| match shape.kind {
                 SlotKind::Fixed { pieces } => Some(u64::from(pieces)),
                 _ => None,

@@ -100,7 +100,6 @@ pub struct WgpuEngineOptions {
     pub max_forward_tokens: Removed<MaxForwardTokens>,
     #[serde(skip_serializing)]
     pub max_forward_requests: Removed<MaxForwardRequests>,
-    pub pipeline_cache: Option<PathBuf>,
     #[serde(skip_serializing)]
     pub device_memory: Removed<DeviceMemory>,
 }
@@ -116,7 +115,6 @@ impl Default for WgpuEngineOptions {
             max_model_len: Removed::default(),
             max_forward_tokens: Removed::default(),
             max_forward_requests: Removed::default(),
-            pipeline_cache: None,
             device_memory: Removed::default(),
         }
     }

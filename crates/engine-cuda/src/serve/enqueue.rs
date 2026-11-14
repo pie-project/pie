@@ -691,7 +691,7 @@ impl FireCtx<'_> {
             grid: staged.voxels.as_ref().map(|seats| seats.grid),
             token_grid: staged.voxels.as_ref().and_then(|seats| seats.token_grid),
             voxels: staged.voxels.as_ref().and_then(|seats| seats.voxels),
-            clip_slots: staged.voxels.as_ref().map(|seats| seats.slots),
+            clip_lanes: staged.voxels.as_ref().map(|seats| seats.clip_lanes),
             lane_of_row: handles.lane_of_row,
             group_of_lane: handles.group_of_lane,
             group_masks: staged.group_masks.clone(),

@@ -209,6 +209,9 @@ impl Pad {
 
 pub const NO_REGION: u32 = u32::MAX;
 
+/// The slab rocBLAS's calls run on ([`Ctx::blas_workspace`]).
+const BLAS_WORKSPACE: &str = "linear.rocblas_workspace";
+
 /// The tickets a stream holds ([`Ctx::tickets`]): every launch that draws
 /// them asks for this many, so one laid slab serves every one.
 pub const TICKETS: u32 = 1 << 16;
@@ -344,6 +347,19 @@ impl Ctx {
             return Err(refuse(op, "this context carries no rocBLAS handle"));
         }
         Ok(self.blas)
+    }
+
+    /// Where this context's rocBLAS calls take their workspace: one slab a
+    /// stream, at the most any call on it asks (`hip::blas::Workspace`), so
+    /// rocBLAS allocates none of its own.
+    pub fn blas_workspace(
+        &self,
+        op: &'static str,
+    ) -> impl FnMut(usize) -> Result<u64, Error> + '_ {
+        move |bytes| {
+            self.scratch_stream(op, BLAS_WORKSPACE, bytes)
+                .map(|at| at as usize as u64)
+        }
     }
 
     pub fn comm(&self, op: &'static str) -> Result<*mut c_void, Error> {

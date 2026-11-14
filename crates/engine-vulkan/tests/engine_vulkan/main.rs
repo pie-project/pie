@@ -29,6 +29,9 @@ mod backend {
     pub const FIXTURES: &str = "PIE_VK_FIXTURES";
     pub const CHUNK: &str = "PIE_VK_CHUNK";
 
+    /// What a test's load takes: the whole device.
+    pub const ALLOWANCE: engine::Allowance = engine::Allowance::WHOLE;
+
     /// The narrowest subgroup the device runs.
     pub fn subgroup(device: &Context) -> u32 {
         device.chip().subgroup

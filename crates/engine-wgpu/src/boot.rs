@@ -51,8 +51,6 @@ fn device_boot(doc: &toml::Table) -> Result<DeviceBoot, String> {
         adapter_index: adapter_index(doc),
         backends: backends(doc),
         power_preference: power_preference(doc),
-        pipeline_cache: pipeline_cache(doc),
-        device_memory: device_memory(doc),
         profiles: profiles(doc)?,
         chunk_bytes: None,
     })
@@ -87,23 +85,6 @@ fn power_preference(doc: &toml::Table) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or(DEFAULT_POWER_PREFERENCE)
         .to_string()
-}
-
-fn pipeline_cache(doc: &toml::Table) -> Option<std::path::PathBuf> {
-    table(doc)
-        .and_then(|t| t.get("pipeline_cache"))
-        .and_then(toml::Value::as_str)
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(std::path::PathBuf::from)
-}
-
-fn device_memory(doc: &toml::Table) -> Option<u64> {
-    table(doc)
-        .and_then(|t| t.get("device_memory"))
-        .and_then(toml::Value::as_integer)
-        .and_then(|v| u64::try_from(v).ok())
-        .filter(|&v| v > 0)
 }
 
 fn profiles(doc: &toml::Table) -> Result<Option<std::path::PathBuf>, String> {

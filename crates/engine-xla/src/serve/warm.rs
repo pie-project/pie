@@ -253,15 +253,22 @@ impl Shell {
         self.deferred = Some(Vec::new());
         let mut fired = 0;
         let mut failed = None;
-        for shape in &shapes {
-            match self.warm_fire(shape) {
-                Ok(()) => fired += 1,
-                Err(fault) => {
-                    failed = Some(fault);
-                    break;
+        // A load streaming experts serves each shape two ways: reading the
+        // experts where they lie, and staging the ones in no slot first.
+        let passes = if self.streams_experts() { 2 } else { 1 };
+        'passes: for pass in 0..passes {
+            self.stage_all = pass == 1;
+            for shape in &shapes {
+                match self.warm_fire(shape) {
+                    Ok(()) => fired += 1,
+                    Err(fault) => {
+                        failed = Some(fault);
+                        break 'passes;
+                    }
                 }
             }
         }
+        self.stage_all = false;
         let deferred = self.deferred.take().unwrap_or_default();
         if let Some(fault) = failed {
             return Err(fault);
@@ -269,9 +276,7 @@ impl Shell {
         let traced_s = started.elapsed().as_secs_f64();
         let skipped = self.compile_deferred(deferred)?;
         self.warm_gathers()?;
-        if self.has_state() {
-            self.pools.warm_copies(&self.device, &self.handles)?;
-        }
+        self.pools.warm_copies(&self.device, &self.handles)?;
         let touched = shapes.iter().map(Vec::len).max().unwrap_or(0) as u32;
         for slot in 0..touched.min(self.held.len() as u32) {
             self.open(slot)?;
@@ -336,8 +341,13 @@ impl Shell {
         let budget = available_memory().map_or(u64::MAX, |b| b.saturating_sub(2 * need));
         let held = std::sync::atomic::AtomicU64::new(0);
         let parked = std::sync::atomic::AtomicUsize::new(0);
-        let running = std::sync::atomic::AtomicU64::new(0);
-        let admit = std::sync::Mutex::new(());
+        // The compiles' room, fixed here: what the held programs' budget
+        // leaves of the free memory. A compile starts once its own need and
+        // every running one's fit in it, woken by a compile that ends (no
+        // poll of the free memory).
+        let room_for_compiles = available_memory().map_or(u64::MAX, |b| b.saturating_sub(budget));
+        let running = std::sync::Mutex::new(0u64);
+        let ended = std::sync::Condvar::new();
         let room = available_memory().map_or(8, |b| b / least.max(1)) as usize;
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
@@ -378,18 +388,16 @@ impl Shell {
                         // not have taken its memory yet, so each counts as
                         // still to come.
                         let own = need_of(text);
-                        loop {
-                            let turn = admit.lock().expect("the warm admission lock poisoned");
-                            let busy = running.load(SeqCst);
-                            if busy == 0 || available_memory().is_none_or(|b| b >= busy + own) {
-                                running.fetch_add(own, SeqCst);
-                                break;
+                        {
+                            let mut busy = running.lock().expect("the warm admission lock poisoned");
+                            while *busy > 0 && *busy + own > room_for_compiles {
+                                busy = ended.wait(busy).expect("the warm admission lock poisoned");
                             }
-                            drop(turn);
-                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            *busy += own;
                         }
                         let program = device.program(text, (*sig).clone());
-                        running.fetch_sub(own, SeqCst);
+                        *running.lock().expect("the warm admission lock poisoned") -= own;
+                        ended.notify_all();
                         if kept || program.is_err() {
                             if let Ok(mut slot) = slots[at].lock() {
                                 *slot = Some(program);
@@ -422,6 +430,7 @@ impl Shell {
             let next = std::sync::atomic::AtomicUsize::new(0);
             let full = std::sync::atomic::AtomicBool::new(false);
             let loading = std::sync::atomic::AtomicU64::new(0);
+            let admit = std::sync::Mutex::new(());
             let loads: Vec<
                 std::sync::Mutex<Option<Result<std::sync::Arc<crate::device::Program>>>>,
             > = (0..texts.len())

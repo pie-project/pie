@@ -75,6 +75,36 @@ struct Device {
 // `hipblasLtMatmul`, which hipBLASLt documents as safe across threads.
 unsafe impl Send for Device {}
 
+/// The device bytes hipBLASLt took on its own: its library's code on the
+/// first handle, and what each handle keeps (about 26 MiB on gfx942). No
+/// call hands that memory to the caller, so it is measured as the device's
+/// free bytes before and after each create.
+static HELD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The device bytes hipBLASLt took on its own since the process began.
+#[must_use]
+pub fn held_bytes() -> u64 {
+    HELD.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Runs `create` and adds what the device has fewer free after it to
+/// [`held_bytes`].
+pub(crate) fn measured<T>(create: impl FnOnce() -> T) -> T {
+    let free = || {
+        let (mut free, mut total) = (0usize, 0usize);
+        // SAFETY: two live locals the call writes.
+        let _ = unsafe { crate::hip::rt::hipMemGetInfo(&raw mut free, &raw mut total) };
+        free as u64
+    };
+    let before = free();
+    let made = create();
+    HELD.fetch_add(
+        before.saturating_sub(free()),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    made
+}
+
 fn registry() -> &'static Mutex<HashMap<c_int, Device>> {
     static DEVICES: OnceLock<Mutex<HashMap<c_int, Device>>> = OnceLock::new();
     DEVICES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -249,9 +279,11 @@ pub unsafe fn matmul(
         std::collections::hash_map::Entry::Vacant(e) => {
             let mut handle: Lt = core::ptr::null_mut();
             // SAFETY: writes the handle.
-            answered("hipblasLtCreate", unsafe {
-                (lt.hipblasLtCreate)(&raw mut handle)
-            })?;
+            answered(
+                "hipblasLtCreate",
+                // SAFETY: writes the handle.
+                measured(|| unsafe { (lt.hipblasLtCreate)(&raw mut handle) }),
+            )?;
             e.insert(Device {
                 handle,
                 plans: HashMap::new(),

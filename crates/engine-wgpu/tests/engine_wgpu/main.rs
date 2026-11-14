@@ -29,6 +29,12 @@ mod backend {
     pub const FIXTURES: &str = "PIE_WGPU_FIXTURES";
     pub const CHUNK: &str = "PIE_WGPU_CHUNK";
 
+    /// What a test's load takes: WebGPU reports no memory size, so
+    /// `[engine.memory] budget_device` is stated.
+    pub const ALLOWANCE: engine::Allowance = engine::Allowance {
+        budget: Some(8 << 30),
+    };
+
     /// The narrowest subgroup the adapter runs (0 without subgroups).
     pub fn subgroup(device: &Context) -> u32 {
         device.chip().subgroup_min.unwrap_or(0)

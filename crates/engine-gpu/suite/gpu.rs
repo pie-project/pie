@@ -3,7 +3,7 @@
 //! the kernels fire into, and the comparison with an f64 host reference
 //! every test shares.
 
-use crate::backend::{Buffer, Context, DeviceBoot, Handles, Pipelines, Sink};
+use crate::backend::{ALLOWANCE, Buffer, Context, DeviceBoot, Handles, Pipelines, Sink};
 
 pub fn bf16(v: f32) -> u16 {
     let bits = v.to_bits();
@@ -36,7 +36,7 @@ pub struct Gpu {
 
 impl Gpu {
     pub fn open() -> Option<Gpu> {
-        let device = Context::bind(&DeviceBoot::default(), engine::Allowance::WHOLE).ok()?;
+        let device = Context::bind(&DeviceBoot::default(), ALLOWANCE).ok()?;
         Some(Gpu {
             device,
             handles: Handles::new(),

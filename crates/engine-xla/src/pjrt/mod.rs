@@ -336,6 +336,13 @@ impl Api {
     }
 }
 
+/// One memory a device addresses (its HBM, pinned host memory).
+#[derive(Clone, Copy)]
+pub struct Memory<'c> {
+    raw: *mut sys::PJRT_Memory,
+    _client: PhantomData<&'c Client>,
+}
+
 /// A device the client addresses. Borrowed from the client; valid while it is.
 #[derive(Clone, Copy)]
 pub struct Device<'c> {
@@ -412,6 +419,28 @@ impl Client {
             raw,
             _client: PhantomData,
         })
+    }
+
+    /// The memory of `device` of `kind` (`"device"`, `"pinned_host"`,
+    /// `"unpinned_host"`), where the plugin addresses one.
+    pub fn memory(&self, device: Device<'_>, kind: &str) -> Result<Option<Memory<'_>>> {
+        let mut a = args!(PJRT_Device_AddressableMemories_Args { device: device.raw });
+        call!(&self.api, PJRT_Device_AddressableMemories, &mut a)?;
+        for i in 0..a.num_memories {
+            // SAFETY: the plugin hands `num_memories` memories owned by the
+            // client, alive as long as `&self`.
+            let raw = unsafe { *a.memories.add(i) };
+            let mut k = args!(PJRT_Memory_Kind_Args { memory: raw });
+            call!(&self.api, PJRT_Memory_Kind, &mut k)?;
+            // SAFETY: the kind is owned by the memory and `kind_size` bytes.
+            if unsafe { text(k.kind, k.kind_size) } == kind {
+                return Ok(Some(Memory {
+                    raw,
+                    _client: PhantomData,
+                }));
+            }
+        }
+        Ok(None)
     }
 
     #[must_use]
@@ -491,6 +520,19 @@ impl Client {
         ty: ElementType,
         dims: &[i64],
     ) -> Result<Buffer> {
+        self.upload_to(device, None, data, ty, dims)
+    }
+
+    /// [`Client::upload`] into `memory` of `device` (a host memory the
+    /// device's programs read), or the device's own where `None`.
+    pub fn upload_to(
+        &self,
+        device: Device<'_>,
+        memory: Option<Memory<'_>>,
+        data: &[u8],
+        ty: ElementType,
+        dims: &[i64],
+    ) -> Result<Buffer> {
         let elements: i64 = dims.iter().product();
         let want = ty.bytes(usize::try_from(elements).unwrap_or(usize::MAX));
         if data.len() != want {
@@ -506,7 +548,12 @@ impl Client {
             dims: dims.as_ptr(),
             num_dims: dims.len(),
             host_buffer_semantics: sys::PJRT_HostBufferSemantics_kImmutableOnlyDuringCall,
-            device: device.raw,
+            device: if memory.is_some() {
+                ptr::null_mut()
+            } else {
+                device.raw
+            },
+            memory: memory.map_or(ptr::null_mut(), |m| m.raw),
         });
         call!(&self.api, PJRT_Client_BufferFromHostBuffer, &mut a)?;
         if !a.done_with_host_buffer.is_null() {
@@ -549,6 +596,29 @@ impl fmt::Debug for Buffer {
 }
 
 impl Buffer {
+    /// `size` bytes from byte `offset` of the buffer's device layout, copied
+    /// to the host (`PJRT_Buffer_CopyRawToHost`); waits for them. A u32
+    /// `[_, 128]` array's row `r` lies at `512 r`.
+    pub fn read_raw(&self, offset: i64, size: i64) -> Result<Vec<u8>> {
+        // The plugin copies into 32-byte-aligned host memory only.
+        #[repr(C, align(32))]
+        #[derive(Clone, Copy)]
+        struct Block([u8; 32]);
+        let n = usize::try_from(size).unwrap_or(0);
+        let mut blocks = vec![Block([0; 32]); n.div_ceil(32)];
+        let mut a = args!(PJRT_Buffer_CopyRawToHost_Args {
+            buffer: self.raw,
+            dst: blocks.as_mut_ptr().cast(),
+            offset: offset,
+            transfer_size: size,
+        });
+        call!(&self.api, PJRT_Buffer_CopyRawToHost, &mut a)?;
+        Event::adopt(self.api.clone(), a.event).wait()?;
+        let mut out: Vec<u8> = blocks.iter().flat_map(|b| b.0).collect();
+        out.truncate(n);
+        Ok(out)
+    }
+
     pub fn dims(&self) -> Result<Vec<i64>> {
         let mut a = args!(PJRT_Buffer_Dimensions_Args { buffer: self.raw });
         call!(&self.api, PJRT_Buffer_Dimensions, &mut a)?;
@@ -779,6 +849,46 @@ impl Executable {
             .collect();
         Ok((outputs, Event::adopt(self.api.clone(), done)))
     }
+}
+
+impl Executable {
+    /// The memory the compiled program takes (`GetCompiledMemoryStats`):
+    /// argument, output, alias, temp and generated-code bytes, and its peak.
+    pub fn compiled_memory(&self) -> Result<CompiledMemory> {
+        let mut g = args!(PJRT_LoadedExecutable_GetExecutable_Args {
+            loaded_executable: self.raw
+        });
+        call!(&self.api, PJRT_LoadedExecutable_GetExecutable, &mut g)?;
+        let mut m = args!(PJRT_Executable_GetCompiledMemoryStats_Args {
+            executable: g.executable
+        });
+        let r = call!(&self.api, PJRT_Executable_GetCompiledMemoryStats, &mut m);
+        let mut d = args!(PJRT_Executable_Destroy_Args {
+            executable: g.executable
+        });
+        let _ = call!(&self.api, PJRT_Executable_Destroy, &mut d);
+        r?;
+        let bytes = |v: i64| u64::try_from(v).unwrap_or(0);
+        Ok(CompiledMemory {
+            argument: bytes(m.argument_size_in_bytes),
+            output: bytes(m.output_size_in_bytes),
+            alias: bytes(m.alias_size_in_bytes),
+            temp: bytes(m.temp_size_in_bytes),
+            code: bytes(m.generated_code_size_in_bytes),
+            peak: bytes(m.peak_memory_in_bytes),
+        })
+    }
+}
+
+/// A compiled program's memory (`Executable::compiled_memory`), in bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompiledMemory {
+    pub argument: u64,
+    pub output: u64,
+    pub alias: u64,
+    pub temp: u64,
+    pub code: u64,
+    pub peak: u64,
 }
 
 impl Drop for Executable {

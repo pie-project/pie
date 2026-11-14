@@ -4,7 +4,10 @@
 //! an item through the host tier and tell the engine its new refs, and the
 //! record math is the same with the shapes as without them. A ring whose
 //! cell is past a slot lies in one run of adjacent slots, never split, and
-//! host writes into a parked item wait for its rebind.
+//! host writes into a parked item wait for its rebind. An adapter is keyed
+//! by its content: instances that land the same one share one set of
+//! `Adapter` slots, freed at the last close, parked only once every holder
+//! is, and rebound for each holder where it lands.
 
 use std::sync::{Arc, Mutex};
 
@@ -31,6 +34,7 @@ const LIST: EngineShape = EngineShape(0);
 const RECORD: EngineShape = EngineShape(1);
 const INSTANCE: EngineShape = EngineShape(2);
 const CHANNEL: EngineShape = EngineShape(3);
+const ADAPTER: EngineShape = EngineShape(4);
 const PROGRAM: ProgramId = ProgramId(7);
 
 fn shape(id: EngineShape, kind: SlotKind, slot_bytes: u64, role: SlotRole) -> SlotShape {
@@ -47,7 +51,8 @@ fn shape(id: EngineShape, kind: SlotKind, slot_bytes: u64, role: SlotRole) -> Sl
 }
 
 /// 32 chunks of 1 MiB, a kv list and a one-piece record, and (`roles`) a
-/// 4 KiB `Instance` and a 1 KiB `Channel` shape; 8 host chunks.
+/// 4 KiB `Instance`, a 1 KiB `Channel` and a 64 KiB `Adapter` shape; 8
+/// host chunks.
 fn facts(roles: bool) -> ChunkFacts {
     let mut shapes = vec![
         shape(
@@ -79,6 +84,12 @@ fn facts(roles: bool) -> ChunkFacts {
             SlotKind::Fixed { pieces: 1 },
             KIB,
             SlotRole::Channel,
+        ));
+        shapes.push(shape(
+            ADAPTER,
+            SlotKind::Fixed { pieces: 1 },
+            64 * KIB,
+            SlotRole::Adapter,
         ));
     }
     let facts = ChunkFacts {
@@ -148,6 +159,10 @@ struct FakeEngine {
     /// Answers `register_channel` with `Unsupported`, stating no ring for
     /// it: the runtime keeps such a channel alone.
     no_channels: bool,
+    /// The adapter an instance lands, where the program carries one.
+    adapter: Footprint,
+    /// The key of the adapter the next binding lands ([`Engine::adapter_key`]).
+    key: Option<u128>,
 }
 
 impl Engine for FakeEngine {
@@ -193,6 +208,7 @@ impl Engine for FakeEngine {
                     },
                 },
             ],
+            adapter: self.adapter,
         })
     }
 
@@ -216,6 +232,10 @@ impl Engine for FakeEngine {
                 contiguous: false,
             },
         }))
+    }
+
+    fn adapter_key(&self, _binding: &InstanceBinding) -> ::engine::Result<Option<u128>> {
+        Ok(self.key)
     }
 
     fn register_channel(
@@ -420,6 +440,7 @@ fn a_park_and_unpark_moves_through_the_host_and_rebinds_the_new_refs() {
             channel: 1,
             slots: now[3..].to_vec(),
         }],
+        adapter: Vec::new(),
     }));
     assert!(engine.rebinds.contains(&Rebind::Channel {
         id: channel,
@@ -814,4 +835,169 @@ fn a_channel_the_engine_did_not_register_leaves_its_ring_to_the_instance() {
         .map(|ring| (ring.channel, ring.slots.len()))
         .collect();
     assert_eq!(rings, vec![(0, 1), (1, 3)]);
+}
+
+/// An engine whose program lands an adapter of four planes, a slot each,
+/// keyed `key`.
+fn adapting(key: u128) -> FakeEngine {
+    FakeEngine {
+        adapter: Footprint {
+            bytes: 4 * 48 * KIB,
+            slots: 4,
+            contiguous: false,
+        },
+        key: Some(key),
+        ..FakeEngine::default()
+    }
+}
+
+/// The device bytes an instance of [`PROGRAM`] holds beside its adapter:
+/// its tables and its two own rings.
+const INSTANCE_BYTES: u64 = 3 * 4 * KIB + (1 + 3) * KIB;
+const ADAPTER_BYTES: u64 = 4 * 64 * KIB;
+
+#[test]
+fn an_adapter_takes_its_slots_at_bind_and_gives_them_back_at_close() {
+    let Pools { device, roles, .. } = pools();
+    let mut engine = adapting(7);
+    let before = held(&device);
+    let id = bind(&roles, &mut engine, Vec::new(), 1);
+    let binding = &engine.bindings[0];
+    assert_eq!(binding.adapter_slots.len(), 4, "the slots its facts count");
+    let mut distinct = binding.adapter_slots.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 4);
+    assert_eq!(held(&device) - before, INSTANCE_BYTES + ADAPTER_BYTES);
+    assert!(
+        !SlotRole::Adapter.replayable(),
+        "an adapter's planes exist nowhere else"
+    );
+    roles.lock().unwrap().close_instance(id);
+    assert_eq!(held(&device), before, "the adapter's slots are back");
+}
+
+#[test]
+fn a_shared_adapter_is_one_set_of_slots_freed_at_the_last_close() {
+    let Pools { device, roles, .. } = pools();
+    let mut engine = adapting(7);
+    let before = held(&device);
+    let first = bind(&roles, &mut engine, Vec::new(), 1);
+    let second = bind(&roles, &mut engine, Vec::new(), 2);
+    let (a, b) = (engine.bindings[0].clone(), engine.bindings[1].clone());
+    assert_eq!(a.adapter_slots, b.adapter_slots, "one adapter, one set of slots");
+    assert_eq!(
+        held(&device) - before,
+        2 * INSTANCE_BYTES + ADAPTER_BYTES,
+        "the adapter's slots are taken once"
+    );
+    // Another adapter is slots of its own.
+    engine.key = Some(8);
+    let third = bind(&roles, &mut engine, Vec::new(), 1);
+    assert!(
+        engine.bindings[2]
+            .adapter_slots
+            .iter()
+            .all(|slot| !a.adapter_slots.contains(slot))
+    );
+    roles.lock().unwrap().close_instance(third);
+    roles.lock().unwrap().close_instance(first);
+    assert_eq!(
+        held(&device) - before,
+        INSTANCE_BYTES + ADAPTER_BYTES,
+        "a holder is left: the adapter stays"
+    );
+    assert_eq!(
+        roles.lock().unwrap().slots(Owner::Adapter(7)),
+        engine.bindings[0].adapter_slots
+    );
+    roles.lock().unwrap().close_instance(second);
+    assert_eq!(held(&device), before, "freed at the last close");
+    assert!(roles.lock().unwrap().slots(Owner::Adapter(7)).is_empty());
+}
+
+#[test]
+fn a_shared_adapter_parks_only_once_every_holder_has() {
+    let Pools {
+        device,
+        host,
+        roles,
+    } = pools();
+    let mut engine = adapting(7);
+    let before = held(&device);
+    let first = bind(&roles, &mut engine, Vec::new(), 1);
+    let second = bind(&roles, &mut engine, Vec::new(), 2);
+    let was = engine.bindings[0].adapter_slots.clone();
+
+    // The first holder parks: its tables move, the adapter stays for the
+    // second.
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    assert!(
+        park.copies().iter().all(|copy| copy.shape != ADAPTER),
+        "a holder is left on the device"
+    );
+    roles.lock().unwrap().commit(park);
+    assert_eq!(held(&host), INSTANCE_BYTES);
+    assert_eq!(roles.lock().unwrap().slots(Owner::Adapter(7)), was);
+
+    // The second parks too: the adapter goes with it, copied, not dropped.
+    let park = roles.lock().unwrap().prepare_park(holder(2)).unwrap();
+    let copy = park
+        .copies()
+        .iter()
+        .find(|copy| copy.shape == ADAPTER)
+        .cloned()
+        .expect("the last holder takes the adapter along");
+    assert_eq!(copy.device, was);
+    roles.lock().unwrap().commit(park);
+    assert_eq!(held(&device), before, "parked whole");
+    assert_eq!(held(&host), 2 * INSTANCE_BYTES + ADAPTER_BYTES);
+
+    // The first unparks: the adapter comes back with it, elsewhere, and only
+    // the holder on the device is rebound now.
+    let adapter_pool = device.lock().unwrap().roles().adapter.unwrap().pool;
+    let squatter = device.lock().unwrap().take_refs(adapter_pool, 4).unwrap();
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .unwrap();
+    roles.lock().unwrap().commit(unpark);
+    let now = roles.lock().unwrap().slots(Owner::Adapter(7));
+    assert!(now.iter().all(|slot| !was.contains(slot)));
+    let stale = roles.lock().unwrap().stale(holder(1));
+    assert_eq!(stale.len(), 1);
+    assert!(matches!(
+        &stale[0],
+        Rebind::Instance { id, adapter, .. } if *id == first && *adapter == now
+    ));
+    for rebind in stale {
+        let owner = Owner::of(&rebind);
+        roles.lock().unwrap().rebound(owner);
+    }
+
+    // The second unparks later: it is rebound to the same slots.
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(2))
+        .unwrap()
+        .unwrap();
+    assert!(
+        unpark.copies().iter().all(|copy| copy.shape != ADAPTER),
+        "the adapter is back already"
+    );
+    roles.lock().unwrap().commit(unpark);
+    let stale = roles.lock().unwrap().stale(holder(2));
+    assert!(matches!(
+        &stale[..],
+        [Rebind::Instance { id, adapter, .. }] if *id == second && *adapter == now
+    ));
+    device.lock().unwrap().give_refs(adapter_pool, &squatter);
+    for id in [first, second] {
+        roles.lock().unwrap().close_instance(id);
+    }
+    assert_eq!(held(&device), before);
+    assert_eq!(held(&host), 0);
 }

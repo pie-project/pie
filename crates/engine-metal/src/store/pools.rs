@@ -197,6 +197,17 @@ fn disagree(what: String) -> Fault {
 }
 
 impl Rows {
+    /// The state rows: one segment map each in the tables run.
+    #[must_use]
+    pub fn state_rows(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|row| matches!(row, Row::State { .. }))
+            .count()
+    }
+}
+
+impl Rows {
     /// The bytes one token takes across every kv row, and a working set's
     /// state rows, unaligned: an estimate before any recipe.
     pub fn estimate(trace: &Trace, page_size: u32) -> Result<(u64, u64, u64)> {
@@ -545,8 +556,12 @@ pub struct Pools {
     rows: Vec<Row>,
     pool: Pool,
     layout: Layout,
-    /// Every state row's segment table, one after another.
-    maps: Option<Buffer>,
+    /// Every state row's segment table, one after another, in the tables
+    /// run.
+    maps: Option<crate::inputs::Region>,
+    /// Where the next of the engine's own tables lies in the tables run
+    /// (`Reserved::Tables`), and where the run ends: range byte offsets.
+    table_run: (u64, u64),
     shape_rows: [Vec<u32>; 2],
     /// Each distinct set of record slots a state row's pieces lie in.
     bands: Vec<Vec<u32>>,
@@ -621,9 +636,22 @@ impl Pools {
     /// A pool of `chunks` chunks of `chunk_bytes` holding no state rows:
     /// only the guest shapes (`INSTANCE`, `CHANNEL`), every segment
     /// committed. For tests of what guests place in slots.
-    #[cfg(test)]
+    #[cfg(all(test, target_vendor = "apple"))]
     pub(crate) fn guests_only(device: &Context, chunk_bytes: u64, chunks: u32) -> Result<Pools> {
-        let layout = Layout::new(chunk_bytes, chunks, chunks, 16, [0, 0], 1, 0, 0)?;
+        Self::guests_over(device, chunk_bytes, chunks, chunks)
+    }
+
+    /// [`Pools::guests_only`] in segments of `segment` chunks, every
+    /// segment committed: under [`super::pool::cap_parts`], a buffer a
+    /// segment.
+    #[cfg(all(test, target_vendor = "apple"))]
+    pub(crate) fn guests_over(
+        device: &Context,
+        chunk_bytes: u64,
+        chunks: u32,
+        segment: u32,
+    ) -> Result<Pools> {
+        let layout = Layout::new(chunk_bytes, chunks, segment, 16, [0, 0], 1, 0, 0)?;
         let rows = Rows {
             rows: Vec::new(),
             chunk_bytes,
@@ -640,7 +668,7 @@ impl Pools {
         };
         let paging = super::kv::Paging::of(16, 256, 1, 1)?;
         let mut pools = Pools::reserve(device, rows, layout, paging)?;
-        pools.commit_segments(1)?;
+        pools.commit_segments(chunks.div_ceil(segment))?;
         Ok(pools)
     }
 
@@ -651,7 +679,26 @@ impl Pools {
             layout.chunk_bytes,
             layout.total_chunks,
             layout.segment_chunks,
+            layout.act_span(),
+            super::pool::part_cap(device),
         )?;
+        // A page id carries its slot in its buffer under the buffer index:
+        // a buffer may hold no more slots of a shape than those bits count.
+        if pool.parts() > 1 {
+            let room = 1u64 << super::pool::PART_SHIFT;
+            if let Some(slots) = layout
+                .shapes()
+                .find(|slots| u64::from(slots.per_chunk) * u64::from(pool.part_chunks()) >= room)
+            {
+                return Err(Fault::Residency(format!(
+                    "a buffer of {} chunks holds {} slots of {} bytes, and a page id \
+                     addresses {room} a buffer",
+                    pool.part_chunks(),
+                    u64::from(slots.per_chunk) * u64::from(pool.part_chunks()),
+                    slots.slot_bytes
+                )));
+            }
+        }
         let list_slots = layout.list.map_or(0, |list| {
             u64::from(list.per_chunk) * u64::from(layout.total_chunks)
         });
@@ -679,14 +726,24 @@ impl Pools {
             tier: None,
             weight_caches: Vec::new(),
             weights_held: false,
+            table_run: (
+                layout.chunk_bytes,
+                layout.chunk_bytes * u64::from(1 + layout.tables),
+            ),
         };
+        // The tables run is backed from the load on: the engine writes its
+        // tables there before any fire.
+        if layout.tables > 0 {
+            let segments = (1 + layout.tables).div_ceil(layout.segment_chunks.max(1));
+            pools.pool.commit_segments(segments)?;
+        }
         pools.write_maps(device)?;
         Ok(pools)
     }
 
     /// Writes each state row's segment table: the bank is the whole pool,
     /// a chunk `chunk_bytes` apart, a slot the fixed slot apart, the row at
-    /// its offset in each of its pieces' slots; one segment.
+    /// its offset in each of its pieces' slots; a segment a buffer.
     fn write_maps(&mut self, device: &Context) -> Result<()> {
         let Some(fixed) = self.layout.fixed else {
             return Ok(());
@@ -704,24 +761,82 @@ impl Pools {
                 continue;
             };
             let element = u64::from(elem_size(dtype));
+            // A segment a buffer: each base is the buffer's first element
+            // from the first buffer's, where the bank is bound (wrapping, so
+            // a buffer below the first is a negative step).
+            let parts = self.pool.parts();
             let map = StateMap {
                 slot_stride: fixed.slot_bytes / element,
                 chunk_slots: fixed.per_chunk,
                 chunk_stride: self.layout.chunk_bytes / element,
-                seg_chunks: u32::MAX,
+                seg_chunks: if parts == 1 {
+                    u32::MAX
+                } else {
+                    self.pool.part_chunks()
+                },
                 piece_atoms,
                 pieces: pieces.max(1),
-                bases: vec![offset / element],
+                bases: (0..super::pool::MAX_PARTS)
+                    .map(|at| {
+                        let deltas = self.pool.deltas();
+                        deltas[at.min(deltas.len() - 1)]
+                    })
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .map(|&delta| {
+                        (((delta as i64) / element as i64) as u64).wrapping_add(offset / element)
+                    })
+                    .collect(),
             };
             tables.extend(map.bytes());
         }
         if tables.is_empty() {
             return Ok(());
         }
-        let mut buffer = Buffer::zeroed(device, tables.len() as u64)?;
-        buffer.write(0, &tables)?;
-        self.maps = Some(buffer);
+        let mut region = self.run_table(device, tables.len() as u64)?;
+        region.write(0, &tables)?;
+        self.maps = Some(region);
         Ok(())
+    }
+
+    /// The tables run's bytes the state maps of `state_rows` state rows
+    /// take: what a load counts into the run before it lays it.
+    #[must_use]
+    pub fn map_bytes(state_rows: usize) -> u64 {
+        crate::arena::room(state_rows as u64 * STATE_MAP_BYTES)
+    }
+
+    /// `bytes` of the tables run (`Reserved::Tables`), zeroed and written
+    /// through its host runs: one of the engine's own load-time tables. The
+    /// run was sized for every one at the load; one past it is refused.
+    pub fn run_table(&mut self, device: &Context, bytes: u64) -> Result<crate::inputs::Region> {
+        let (at, end) = self.table_run;
+        let room = crate::arena::room(bytes.max(1));
+        if at + room > end {
+            return Err(Fault::Ceiling {
+                what: "bytes of the engine's tables run",
+                need: at + room - self.layout.chunk_bytes,
+                have: end - self.layout.chunk_bytes,
+            });
+        }
+        let (part, local) = self.pool.locate(at);
+        if self.pool.locate(at + room - 1).0 != part {
+            return Err(Fault::Residency(format!(
+                "a {bytes}-byte table of the engine's tables run would straddle two of the \
+                 pool's buffers"
+            )));
+        }
+        let mut region = crate::inputs::Region::unplaced(bytes, Buffer::zeroed(device, 0)?);
+        region.place(self.pool.part_view(part).clone(), local);
+        region.rehost(self.pool.host_runs(at, room)?)?;
+        self.table_run.0 = at + room;
+        Ok(region)
+    }
+
+    /// The tables run's bytes, laid or not: model bytes in the pool.
+    #[must_use]
+    pub fn tables_run_bytes(&self) -> u64 {
+        u64::from(self.layout.tables) * self.layout.chunk_bytes
     }
 
     /// Each band's width: the ids a lane's or a row's table holds for the
@@ -770,7 +885,7 @@ impl Pools {
                 let offset = self.slot_offset(RS, slot)?;
                 self.pool
                     .admit(u32::try_from(offset / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
-                Ok(u32::try_from(offset / stride).unwrap_or(u32::MAX))
+                Ok(self.pool.page_id(offset, stride))
             })
             .collect()
     }
@@ -943,22 +1058,44 @@ impl Pools {
     }
 
     /// Slot ref `slot` of shape `id` as a guest's table or ring holds it
-    /// (`program::held`): its byte offset in the view, the host address of
+    /// (`program::held`): the buffer it lies in, its byte offset there, the host address of
     /// its first byte (through the heap under it), and its bytes.
-    pub fn slot_place(&self, id: ShapeId, slot: u32) -> Result<(u64, std::ptr::NonNull<u8>, u64)> {
+    pub fn slot_place(
+        &self,
+        id: ShapeId,
+        slot: u32,
+    ) -> Result<(Buffer, u64, std::ptr::NonNull<u8>, u64)> {
+        let (view, at, runs, slot_bytes) = self.slot_runs(id, slot)?;
+        // One host address: the slot lies in one heap (a chunk may cross a
+        // heap's end; a slot a table or ring holds does not).
+        let [(_, _, host)] = runs[..] else {
+            return Err(Fault::Device {
+                call: "slot host address",
+                why: format!(
+                    "slot {slot} of shape {id} crosses a placement heap's end, so no one \
+                     host address spans it; write it through its host runs"
+                ),
+            });
+        };
+        Ok((view, at, host, slot_bytes))
+    }
+
+    /// Slot ref `slot` of shape `id`: the buffer it lies in, its byte offset
+    /// there, its bytes' host runs `(from, len, address)` (one a heap they
+    /// cross) and its bytes.
+    pub fn slot_runs(
+        &self,
+        id: ShapeId,
+        slot: u32,
+    ) -> Result<(Buffer, u64, Vec<(u64, u64, std::ptr::NonNull<u8>)>, u64)> {
         let shape = *self.shape(id)?;
         let (chunk, index) = self.place(&shape, slot)?;
-        let inner = u64::from(index) * shape.slot_bytes;
-        let host = self.pool.chunk_host(chunk)?;
-        // SAFETY: `index < per_chunk`, so the slot lies inside the chunk the
-        // host address names.
-        #[allow(unsafe_code)]
-        let host = unsafe { host.add(usize::try_from(inner).unwrap_or(usize::MAX)) };
-        Ok((
-            u64::from(chunk) * self.layout.chunk_bytes + inner,
-            host,
-            shape.slot_bytes,
-        ))
+        let global =
+            u64::from(chunk) * self.layout.chunk_bytes + u64::from(index) * shape.slot_bytes;
+        self.pool.admit(chunk)?;
+        let runs = self.pool.host_runs(global, shape.slot_bytes)?;
+        let (view, at) = self.pool.view_at(global);
+        Ok((view.clone(), at, runs, shape.slot_bytes))
     }
 
     /// The slots of shape `id` one chunk holds.
@@ -994,11 +1131,16 @@ impl Pools {
             return (0..pages)
                 .map(|page| {
                     let id = u32::try_from(first + u64::from(page)).unwrap_or(u32::MAX);
-                    self.physical(LIST, list.seat_ref(id)?)
+                    Ok(self
+                        .pool
+                        .slot_page(self.physical(LIST, list.seat_ref(id)?)?, list.per_chunk))
                 })
                 .collect();
         }
-        refs.iter().map(|&r| self.physical(LIST, r)).collect()
+        let list = *self.shape(LIST)?;
+        refs.iter()
+            .map(|&r| Ok(self.pool.slot_page(self.physical(LIST, r)?, list.per_chunk)))
+            .collect()
     }
 
     /// The page tables a fire stages, by the list each pages: the kv
@@ -1068,7 +1210,7 @@ impl Pools {
             let at = self.slot_offset(id, slot)?;
             self.pool
                 .admit(u32::try_from(at / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
-            Ok(u32::try_from(at / stride).unwrap_or(u32::MAX))
+            Ok(self.pool.page_id(at, stride))
         };
         if let Some((slot, pages)) = seat
             && refs.is_empty()
@@ -1227,16 +1369,10 @@ impl Pools {
         self.pool.bytes()
     }
 
-    /// The device bytes the pool keeps beside its chunks: the row-streamed
-    /// tables' segment maps and the weight caches' tables.
+    /// The tables run's bytes its tables were laid in.
     #[must_use]
     pub fn table_bytes(&self) -> u64 {
-        self.maps.as_ref().map_or(0, Buffer::bytes)
-            + self
-                .weight_caches
-                .iter()
-                .map(super::streamed::Cache::table_bytes)
-                .sum::<u64>()
+        self.table_run.0 - self.layout.chunk_bytes
     }
 
     #[must_use]
@@ -1253,6 +1389,132 @@ impl Pools {
     #[must_use]
     pub fn high_water_bytes(&self) -> u64 {
         self.pool.high_water_bytes()
+    }
+
+    /// Where the activation span starts in the pool's buffer, and its bytes.
+    #[must_use]
+    pub fn span(&self) -> (u64, u64) {
+        let offset = self.pool.span_offset();
+        (offset, self.pool.bytes() - offset)
+    }
+
+    /// The buffers the range spans.
+    #[must_use]
+    pub fn parts(&self) -> usize {
+        self.pool.parts()
+    }
+
+    /// The physical kv list slot a kernel's page id names (ids carry their
+    /// buffer, [`Pool::slot_page`]).
+    #[must_use]
+    pub fn list_slot(&self, id: u32) -> u32 {
+        let per = self.layout.list.map_or(1, |list| list.per_chunk);
+        self.pool.page_slot(id, per)
+    }
+
+    /// Every buffer of the range past the first, which kernels reach
+    /// through an address in the first.
+    #[must_use]
+    pub fn part_slabs(&self) -> Vec<crate::device::alloc::Slab> {
+        (1..self.pool.parts())
+            .map(|at| self.pool.part_view(at).slab().clone())
+            .collect()
+    }
+
+    /// Each buffer's address less the first's ([`Pool::deltas`]).
+    #[must_use]
+    pub fn deltas(&self) -> Vec<u64> {
+        self.pool.deltas()
+    }
+
+    /// The buffer the activation span lies in (the last), where in it the
+    /// span starts, and its bytes.
+    #[must_use]
+    pub fn span_view(&self) -> (&Buffer, u64, u64) {
+        let (offset, bytes) = self.span();
+        let (view, at) = self.pool.view_at(offset);
+        (view, at, bytes)
+    }
+
+    /// The device bytes the span's backed segments hold.
+    #[must_use]
+    pub fn span_held_bytes(&self) -> u64 {
+        self.pool.top_held_bytes()
+    }
+
+    /// The span's bytes, backed or not, which the ledger holds reserved.
+    #[must_use]
+    pub fn span_reserved_bytes(&self) -> u64 {
+        self.pool.top_bytes()
+    }
+
+    /// `len` bytes at `offset` of the pool's buffer as host runs
+    /// ([`Pool::host_runs`]).
+    pub fn host_runs(
+        &self,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<(u64, u64, std::ptr::NonNull<u8>)>> {
+        self.pool.host_runs(offset, len)
+    }
+
+    /// `into.len()` bytes at `offset` of the pool's buffer, read on the host.
+    pub fn read_span(&self, offset: u64, into: &mut [u8]) -> Result<()> {
+        self.pool.read(offset, into)
+    }
+
+    /// Backs the range's top `bytes` for a fire's carve ([`Pool::cover`]).
+    pub fn cover(&mut self, bytes: u64) -> Result<()> {
+        self.pool.cover(bytes)
+    }
+
+    /// The span's segments, from the one it starts in to the range's end.
+    #[must_use]
+    pub fn span_segments(&self) -> u32 {
+        self.pool.span_segments()
+    }
+
+    /// The bytes from the range's end the rung's carve backs.
+    #[must_use]
+    pub fn covered(&self) -> u64 {
+        self.pool.covered()
+    }
+
+    /// Whether the range's top `bytes` are backed for a fire's carve.
+    #[must_use]
+    pub fn covers(&self, bytes: u64) -> bool {
+        self.pool.covers(bytes)
+    }
+
+    /// Gives back the carve past the range's top `bytes`.
+    ///
+    /// # Safety
+    ///
+    /// As [`Pool::narrow`].
+    pub unsafe fn narrow(&mut self, bytes: u64) -> Result<()> {
+        // SAFETY: the caller's contract.
+        unsafe { self.pool.narrow(bytes) }
+    }
+
+    /// Backs the span's top `segments` for state ([`Pool::commit_span`]).
+    pub fn commit_span(&mut self, segments: u32) -> Result<()> {
+        self.pool.commit_span(segments)
+    }
+
+    /// Gives back the span's segments past the top `segments`.
+    ///
+    /// # Safety
+    ///
+    /// As [`Pool::release_span`].
+    pub unsafe fn release_span(&mut self, segments: u32) -> Result<()> {
+        // SAFETY: the caller's contract.
+        unsafe { self.pool.release_span(segments) }
+    }
+
+    /// Zeroes `len` bytes at `offset` of the pool's buffer on the host,
+    /// where no frame reads them.
+    pub fn zero_span(&mut self, offset: u64, len: u64) -> Result<()> {
+        self.pool.zero(offset, len)
     }
 
     /// The cache table one fire binds; `q8` reads every kv pool through the
@@ -1370,9 +1632,13 @@ impl Pools {
                         what: "the state rows' segment tables".to_string(),
                     })?;
                     let segments = Tensor::new(
-                        handles.bind(maps, state_row * STATE_MAP_BYTES, STATE_MAP_BYTES)?,
+                        handles.bind(
+                            maps.view(),
+                            maps.at(state_row * STATE_MAP_BYTES),
+                            STATE_MAP_BYTES,
+                        )?,
                         1,
-                        (StateMap::HEAD + 1) as u32,
+                        (StateMap::HEAD + super::pool::MAX_PARTS) as u32,
                         Dtype::U64,
                     );
                     state_row += 1;
@@ -1482,7 +1748,6 @@ impl Pools {
         }
         let list = *self.shape(LIST)?;
         let runs = self.kv_runs();
-        let view = self.pool.view();
         for (src, dst, span) in placed {
             if span.tokens == 0 {
                 continue;
@@ -1494,7 +1759,7 @@ impl Pools {
                 let from = src_at + offset + u64::from(span.src_token) * cell;
                 let to = dst_at + offset + u64::from(span.dst_token) * cell;
                 if from != to {
-                    frame.copy_span(view, from, view, to, bytes)?;
+                    self.pool.copy(frame, from, to, bytes)?;
                 }
             }
         }
@@ -1523,7 +1788,6 @@ impl Pools {
     /// Copies whole slots of `id` (slot refs) `(src, dst)` on the device.
     fn copy_whole(&self, frame: &mut Frame, id: ShapeId, moves: &[(u32, u32)]) -> Result<()> {
         let shape = *self.shape(id)?;
-        let view = self.pool.view();
         for &(src, dst) in moves {
             let from = self.slot_offset(id, src)?;
             let to = self.slot_offset(id, dst)?;
@@ -1532,7 +1796,7 @@ impl Pools {
             self.pool
                 .admit(u32::try_from(to / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
             if from != to {
-                frame.copy_span(view, from, view, to, shape.slot_bytes)?;
+                self.pool.copy(frame, from, to, shape.slot_bytes)?;
             }
         }
         Ok(())
@@ -1702,7 +1966,7 @@ impl Pools {
     /// Backs the segments the seat runs lie in: what a caller firing
     /// directly asks.
     pub fn commit_seats(&mut self) -> Result<()> {
-        let chunks = 1 + self.layout.seat_chunks();
+        let chunks = self.layout.free_chunk();
         let segments = chunks
             .div_ceil(self.layout.segment_chunks.max(1))
             .min(self.pool.segments());
@@ -1750,8 +2014,19 @@ impl Pools {
     }
 
     /// Takes the weight cache's row-streamed tables (`super::rows`).
-    pub fn seat_weights(&mut self, caches: Vec<super::streamed::Cache>) {
+    /// Seats the weight caches, each one's tables laid in the tables run
+    /// and its handles pointed there.
+    pub fn seat_weights(
+        &mut self,
+        device: &Context,
+        handles: &Handles,
+        mut caches: Vec<super::streamed::Cache>,
+    ) -> Result<()> {
+        for cache in &mut caches {
+            cache.lay(handles, |bytes| self.run_table(device, bytes))?;
+        }
         self.weight_caches = caches;
+        Ok(())
     }
 
     #[must_use]
@@ -1764,9 +2039,9 @@ impl Pools {
     /// the pool, or on a chunk with no memory behind it.
     fn weight_slot(&self, per_chunk: u32, slot_bytes: u64, slot: u32) -> Result<u64> {
         let (chunk, index) = (slot / per_chunk.max(1), slot % per_chunk.max(1));
-        if chunk == 0 || chunk >= self.layout.total_chunks {
+        if chunk <= self.layout.tables || chunk >= self.layout.total_chunks {
             return Err(Fault::Ceiling {
-                what: "chunks a weight slot ref may name (past the null chunk)",
+                what: "chunks a weight slot ref may name (past the null chunk and the tables run)",
                 need: u64::from(chunk) + 1,
                 have: u64::from(self.layout.total_chunks),
             });
@@ -1857,7 +2132,8 @@ impl Pools {
                     *seat = Some(resident.slot);
                 }
                 let offset = |slot: u32| self.weight_slot(shape.per_chunk, shape.slot_bytes, slot);
-                fills.extend(cache.take(frame, named, self.pool.view(), &offset)?);
+                let into = |at: u64| self.pool.view_at(at);
+                fills.extend(cache.take(frame, named, &into, &offset)?);
             }
             Ok(())
         })();
@@ -1997,8 +2273,8 @@ impl Pools {
     #[must_use]
     pub fn preseat_plan(&self) -> Option<engine::chunk::WeightResidency> {
         let segment = self.layout.segment_chunks.max(1);
-        let above = (1 + self.layout.seat_chunks()).div_ceil(segment) * segment;
-        [above, 1]
+        let above = self.layout.free_chunk().div_ceil(segment) * segment;
+        [above, 1 + self.layout.tables]
             .into_iter()
             .find_map(|first| self.preseat_from(first))
     }
@@ -2070,11 +2346,14 @@ impl Pools {
     /// Rewrites every weight address table for where its blocks lie now.
     /// No frame is in flight.
     pub fn restage_weights(&mut self) -> Result<()> {
-        let base = crate::device::alloc::slab_address(self.pool.view().slab());
         let mut caches = std::mem::take(&mut self.weight_caches);
         let staged = caches.iter_mut().try_for_each(|cache| {
             let (per_chunk, slot_bytes) = (cache.shape.per_chunk, cache.shape.slot_bytes);
-            cache.restage(base, &|slot| self.weight_slot(per_chunk, slot_bytes, slot))
+            cache.restage(&|slot| {
+                Ok(self
+                    .pool
+                    .address(self.weight_slot(per_chunk, slot_bytes, slot)?))
+            })
         });
         self.weight_caches = caches;
         staged
@@ -2121,7 +2400,7 @@ impl Pools {
     /// the runtime does not see.
     #[must_use]
     pub fn weights_in_seats(&self) -> bool {
-        let seats = 1..1 + self.layout.seat_chunks();
+        let seats = 1 + self.layout.tables..self.layout.free_chunk();
         self.weight_caches.iter().any(|cache| {
             cache
                 .slots()
