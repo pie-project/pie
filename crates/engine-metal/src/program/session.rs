@@ -117,6 +117,26 @@ impl Session {
         Ok(widest)
     }
 
+    /// The span bytes the batch tables of `lanes` lanes take for every
+    /// launching stage of `compiled` ([`super::launch::Batch::bytes_for`]).
+    #[must_use]
+    pub fn batch_bytes_for(compiled: &Compiled, channels: usize, lanes: u32, rows: u32) -> u64 {
+        let channels = u32::try_from(channels).unwrap_or(u32::MAX);
+        compiled
+            .plans
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| launches(compiled, *index))
+            .map(|(_, plan)| super::launch::Batch::bytes_for(plan, channels, lanes, rows))
+            .sum()
+    }
+
+    /// The stages this instance carries, launching or not.
+    #[must_use]
+    pub fn stages(&self) -> usize {
+        self.prepared.len()
+    }
+
     pub fn table_sizes(compiled: &Compiled, channels: usize, rows: u32) -> Vec<u64> {
         let channels = u32::try_from(channels).unwrap_or(u32::MAX);
         compiled

@@ -276,6 +276,10 @@ pub struct Shell {
     /// The activation rung the runtime last set (`Engine::set_rung`): its
     /// carve and the live guests' terms are what the span backs.
     rung: u32,
+    /// Where the guests' batch tables start in the span's buffer, packed
+    /// under the rung's widest carve ([`Shell::lay_batches`]): fires lay
+    /// their guests' value scratch under it.
+    batch_bottom: u64,
     pools: Pools,
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
     rs_buffers: Option<crate::rs::Buffers>,
@@ -1267,6 +1271,7 @@ impl PreparedLoad<'_> {
             ane,
             weights,
             rung: arena.floor_tokens(),
+            batch_bottom: arena.rung_guest_top(arena.floor_tokens()),
             arena,
             pools,
             rs_layout,
@@ -1512,6 +1517,9 @@ impl Shell {
                 index,
                 true,
             )?;
+            // The batches lie under the rung's carve: they move with it.
+            self.rung = to;
+            self.lay_batches()?;
         }
         if to >= from {
             self.rung = to;
@@ -1543,12 +1551,36 @@ impl Shell {
 
     /// The guest region a fire whose model carve ends at `top` lays its
     /// guests' scratch in: down to the backed span's bottom.
-    fn guest_carve(&self, top: u64) -> crate::program::GuestCarve {
+    fn guest_carve(&self) -> crate::program::GuestCarve {
         crate::program::GuestCarve::new(
             self.arena.store().clone(),
-            top,
+            self.batch_bottom,
             self.arena.end() - self.pools.covered(),
         )
+    }
+
+    /// Lays every guest batch under the rung's widest carve, every frame
+    /// drained first: where they lie moves with the rung, and a bind or a
+    /// close that plans or drops one packs them again.
+    fn lay_batches(&mut self) -> Result<()> {
+        self.drain()?;
+        let top = self.arena.rung_guest_top(self.rung);
+        let pools = &self.pools;
+        let bottom = self
+            .programs
+            .lay_batches(self.arena.store(), top, &|at, bytes| {
+                span_host(pools, at, bytes)
+            })?;
+        let floor = self.arena.end() - self.pools.covered();
+        if bottom < floor {
+            return Err(Fault::Ceiling {
+                what: "bytes of the backed span the guests' batch tables take",
+                need: top - bottom,
+                have: top.saturating_sub(floor),
+            });
+        }
+        self.batch_bottom = bottom;
+        Ok(())
     }
 
     /// Raises the rung to the widest, backing its carve: what a caller that
@@ -1812,7 +1844,6 @@ impl Shell {
                 .map_or(self.working_set(), |budget| budget.min(self.working_set())),
         );
         let (ane_model, ane_fire) = self.ane.as_ref().map_or((0, 0), crate::ane::Ane::bytes);
-        let guest_fire = self.programs.batch_bytes();
         let entries = [
             (Outside, "before the load", self.outside),
             (
@@ -1835,7 +1866,7 @@ impl Shell {
             ),
             (
                 Fire,
-                "activation span (arena, staged inputs, readout, kernel scratch), reserved",
+                "activation span (arena, staged inputs, readout, kernel scratch, guest scratch and batch tables), reserved",
                 self.pools.span_reserved_bytes(),
             ),
             (
@@ -1843,7 +1874,6 @@ impl Shell {
                 "rs scratch",
                 self.rs_scratch.as_ref().map_or(0, Buffer::bytes),
             ),
-            (Fire, "guest batches", guest_fire),
             (
                 Fire,
                 "ane staging and surfaces (IOSurfaces outside the pool by the OS)",
@@ -2022,11 +2052,20 @@ impl Shell {
             let _ = self.programs.close_instance(id);
             return Err(why);
         }
+        // A pair's first bind planned its batches: laid now, every frame
+        // drained, so no fire reads a batch where another is laid.
+        if !self.programs.batches_laid() {
+            if let Err(why) = self.lay_batches() {
+                let _ = self.programs.close_instance(id);
+                let _ = self.lay_batches();
+                return Err(why);
+            }
+        }
         if crate::diag::on().tier_trace {
             let fire = self.programs.batch_bytes();
             eprintln!(
                 "residency: program {} bound at {extents:?}: its fires lay {} bytes a lane in \
-                 the span; guests hold {fire} bytes of batch tables beside their slots; \
+                 the span; the guests' batch tables take {fire} bytes of it; \
                  the span backs {}",
                 program_id.0,
                 self.programs
@@ -2092,7 +2131,12 @@ impl Shell {
 
     pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
         self.fence_instances(&[instance_id])?;
-        self.programs.close_instance(instance_id)
+        self.programs.close_instance(instance_id)?;
+        // The last instance of a pair drops its batches: the rest packed.
+        if !self.programs.batches_laid() {
+            self.lay_batches()?;
+        }
+        Ok(())
     }
 
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
@@ -2731,7 +2775,7 @@ impl Shell {
             if !self.programs.prologue_runs(attached.instance) {
                 continue;
             }
-            let carve = self.guest_carve(self.arena.rung_guest_top(self.rung));
+            let carve = self.guest_carve();
             match self
                 .programs
                 .fire(&self.device, attached.instance, Stage::Prologue, &carve)?
@@ -4118,7 +4162,7 @@ impl Shell {
             },
         };
 
-        let guest = self.guest_carve(self.arena.guest_top(fire));
+        let guest = self.guest_carve();
         Ok(Prepared {
             guest,
             lanes,
@@ -4778,6 +4822,13 @@ impl Shell {
 /// Hosts rung `index`'s staged regions, zeroed (`on`), or drops their
 /// host runs once frames leave the rung, so nothing writes the heaps
 /// another rung lays there.
+/// The host runs of `bytes` at `at` of the span's buffer: the range counts
+/// the span from its own start.
+fn span_host(pools: &Pools, at: u64, bytes: u64) -> Result<Vec<(u64, u64, std::ptr::NonNull<u8>)>> {
+    let (_, span_at, _) = pools.span_view();
+    pools.host_runs(pools.span().0 + (at - span_at), bytes)
+}
+
 fn host_rung(
     pools: &Pools,
     inputs: &mut [Vec<Inputs>],
@@ -4792,10 +4843,7 @@ fn host_rung(
     {
         let (at, bytes) = region.extent();
         let host = if on && bytes > 0 {
-            // The region lies at `at` of the span's buffer; the range
-            // counts the span from its own start.
-            let (_, span_at, _) = pools.span_view();
-            pools.host_runs(pools.span().0 + (at - span_at), bytes)?
+            span_host(pools, at, bytes)?
         } else {
             Vec::new()
         };

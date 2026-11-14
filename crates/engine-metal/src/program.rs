@@ -77,6 +77,9 @@ pub struct Plane {
     /// stage, key and frame in flight: laid when a binding opens them, at
     /// the most lanes a fire flies, never grown at a fire.
     batches: BTreeMap<(ProgramId, usize, launch::BatchKey, usize), launch::Batch>,
+    /// Whether every batch lies where [`Plane::lay_batches`] last laid
+    /// them: false once a bind plans one or a close drops one.
+    batches_laid: bool,
     /// The most lanes one fire flies, and the frames in flight.
     lanes: u32,
     arms: usize,
@@ -104,6 +107,7 @@ impl Plane {
             instances: BTreeMap::new(),
             channels: BTreeMap::new(),
             batches: BTreeMap::new(),
+            batches_laid: true,
             lanes: 64,
             arms: 1,
             rows: 1,
@@ -112,7 +116,7 @@ impl Plane {
         }
     }
 
-    /// The device bytes the batches of lanes launched together hold; an
+    /// The span bytes the batches of lanes launched together take; an
     /// instance's tables and rings are all in its pool slots.
     #[must_use]
     pub fn batch_bytes(&self) -> u64 {
@@ -225,9 +229,11 @@ impl Plane {
         self.rows = rows.max(1);
     }
 
-    /// Lays the batch tables instance `id`'s stages fire with, one set a
-    /// frame in flight at the most lanes a fire flies, where none is laid.
+    /// Plans the batch tables instance `id`'s stages fire with, one set a
+    /// frame in flight at the most lanes a fire flies, where none is:
+    /// sized now, laid in the span by [`Plane::lay_batches`].
     fn seat_batches(&mut self, device: &Context, id: InstanceId) -> Result<()> {
+        let empty = crate::device::Buffer::zeroed(device, 0)?;
         let Some(bound) = self.instances.get_mut(&id) else {
             return Ok(());
         };
@@ -248,7 +254,8 @@ impl Plane {
                 let slot = (program_id, stage, key, arm);
                 if !self.batches.contains_key(&slot) {
                     self.batches
-                        .insert(slot, launch::Batch::build(device, prepared, lanes)?);
+                        .insert(slot, launch::Batch::plan(prepared, lanes, &empty)?);
+                    self.batches_laid = false;
                 }
             }
         }
@@ -574,9 +581,17 @@ impl Plane {
             .programs
             .get(&program)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program}")))?;
+        let batches = Session::batch_bytes_for(
+            &program.compiled,
+            program.plan.package.channels.len(),
+            self.lanes.next_power_of_two(),
+            self.rows,
+        );
         Ok(engine::FireFacts {
             a_lane: Session::scratch_for(&program.compiled, extents)?,
-            fixed: 0,
+            // Its batch tables, a set a frame in flight, laid once a pair
+            // under the model's carve.
+            fixed: self.arms as u64 * batches,
             max_lanes: 0,
         })
     }
@@ -751,7 +766,57 @@ impl Plane {
             .remove(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
         release_seats(&bound.shared);
+        // A batch no live instance fires with is dropped: the runtime no
+        // longer counts its pair's term in the span.
+        let mut live = std::collections::BTreeSet::new();
+        for bound in self.instances.values_mut() {
+            for stage in 0..bound.session.stages() {
+                if let Some(key) = bound
+                    .session
+                    .prepared_mut(stage)
+                    .and_then(|prepared| prepared.batch_key())
+                {
+                    live.insert((bound.program_id, stage, key));
+                }
+            }
+        }
+        let before = self.batches.len();
+        self.batches
+            .retain(|&(program, stage, key, _), _| live.contains(&(program, stage, key)));
+        if self.batches.len() != before {
+            self.batches_laid = false;
+        }
         Ok(())
+    }
+
+    /// Whether every batch lies where it was last laid.
+    #[must_use]
+    pub fn batches_laid(&self) -> bool {
+        self.batches_laid
+    }
+
+    /// Lays every batch in `view` (the span's buffer) under `top`, packed
+    /// down from it, written through `host`; the caller drained every frame
+    /// that read the batches where they were. Returns where the lowest
+    /// starts.
+    pub fn lay_batches(
+        &mut self,
+        view: &crate::device::Buffer,
+        top: u64,
+        host: &dyn Fn(u64, u64) -> Result<Vec<(u64, u64, std::ptr::NonNull<u8>)>>,
+    ) -> Result<u64> {
+        let total = self.batch_bytes();
+        let bottom = top.checked_sub(total).ok_or(Fault::Ceiling {
+            what: "bytes of the span under the model's carve for guest batch tables",
+            need: total,
+            have: top,
+        })?;
+        let mut at = bottom;
+        for batch in self.batches.values_mut() {
+            at = batch.lay(view, at, host)?;
+        }
+        self.batches_laid = true;
+        Ok(bottom)
     }
 
     pub fn close_program(&mut self, id: ProgramId) -> Result<()> {
@@ -1012,6 +1077,17 @@ mod tests {
                 id
             })
             .collect();
+        // The batches the binds planned, laid in a buffer standing for the
+        // span (the shell lays them under the rung's carve).
+        let area = 1u64 << 24;
+        let tables = crate::device::Buffer::zeroed(&context, area).expect("a batch area");
+        let host = |at: u64, bytes: u64| -> crate::error::Result<_> {
+            Ok(vec![(0, bytes, tables.host_span(at, bytes)?)])
+        };
+        assert!(!plane.batches_laid(), "the binds planned batches");
+        plane
+            .lay_batches(&tables, area, &host)
+            .expect("the batches lay");
         let mut frame = context.frame().expect("a frame");
         let launched = plane
             .stage_batched(&mut frame, &lanes, &guests(&context), 0)

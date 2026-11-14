@@ -1759,29 +1759,109 @@ pub struct Batch {
     key: BatchKey,
     lanes: u32,
     shape: LaneShape,
-    table: Buffer,
-    descriptors: Buffer,
-    params: Buffer,
-    offsets: Buffer,
-    bindings: Buffer,
-    pending_flags: Buffer,
-    lane_indices: Buffer,
-    row_meta: Buffer,
-    row_indices: Buffer,
+    /// Every table, a region of the span's batch area ([`Batch::lay`]):
+    /// this batch's frame in flight writes them, and no other frame reads
+    /// them while it is airborne.
+    table: SpanRegion,
+    descriptors: SpanRegion,
+    params: SpanRegion,
+    offsets: SpanRegion,
+    bindings: SpanRegion,
+    pending_flags: SpanRegion,
+    lane_indices: SpanRegion,
+    row_meta: SpanRegion,
+    row_indices: SpanRegion,
     /// This fire's value scratch, seated per fire ([`Batch::seat_scratch`]):
     /// a stride a member, in the span's guest region.
     scratch: Option<ScratchAt>,
-    addresses: Buffer,
+    addresses: SpanRegion,
     table_bytes: u64,
-    layouts: Vec<Buffer>,
+    layouts: Vec<SpanRegion>,
     layout_words: Vec<GroupLayout>,
     rows_per_lane: u32,
+    /// What [`Batch::lay`] writes again wherever the batch is laid: the
+    /// template's tables, a copy a lane where they are per lane.
+    descriptor_bytes: Vec<u8>,
+    param_bytes: Vec<u8>,
+    offset_bytes: Vec<u8>,
+    binding_bytes: Vec<u8>,
+}
+
+/// A batch table's region of the span.
+type SpanRegion = crate::inputs::Region;
+
+/// A batch's tables' bytes, in the order [`Batch::lay`] lays them: the lane
+/// table, descriptors, params, offsets, bindings, pending flags, lane
+/// indices, row meta, row indices, output addresses and each fused
+/// region's layout.
+#[allow(clippy::too_many_arguments)]
+fn batch_pieces(
+    lanes: u32,
+    channel_slots: u32,
+    (descriptor, param, offset, binding): (u64, u64, u64, u64),
+    rows: u32,
+    table_bytes: u64,
+    fused: usize,
+) -> Vec<u64> {
+    let lanes64 = u64::from(lanes);
+    let mut pieces = vec![
+        LaneShape::of(lanes, channel_slots)
+            .bytes()
+            .unwrap_or(u64::MAX),
+        (descriptor * lanes64).max(4),
+        (param * lanes64).max(4),
+        offset.max(4),
+        (binding * lanes64).max(4),
+        (lanes64 * u64::from(channel_slots)).max(1),
+        lanes64 * size_of::<u32>() as u64,
+        lanes64 * size_of::<RowMeta>() as u64,
+        (lanes64 * u64::from(rows) * size_of::<u32>() as u64).max(4),
+        lanes64 * table_bytes,
+    ];
+    pieces.extend((0..fused).map(|_| size_of::<GroupLayout>() as u64));
+    pieces
+}
+
+/// The span bytes `pieces` take, each on the arena's boundary.
+fn batch_area(pieces: &[u64]) -> u64 {
+    pieces.iter().map(|&bytes| crate::arena::room(bytes)).sum()
 }
 
 impl Batch {
-    /// The device bytes this batch's tables hold.
+    /// The span bytes this batch's tables take where it is laid.
     #[must_use]
     pub fn bytes(&self) -> u64 {
+        self.regions()
+            .map(|region| crate::arena::room(region.bytes()))
+            .sum()
+    }
+
+    /// The span bytes a batch of `lanes` lanes of a stage of `plan` takes,
+    /// its instances carrying `channels` channels and reading at most
+    /// `rows` readout rows a lane: what a fire term states before any is
+    /// laid; 0 for a stage with no grouped seat.
+    #[must_use]
+    pub fn bytes_for(plan: &LaunchStagePlan, channels: u32, lanes: u32, rows: u32) -> u64 {
+        if !plan.needs.grouped_valid {
+            return 0;
+        }
+        let values = plan.value_types.len() as u64;
+        batch_area(&batch_pieces(
+            lanes.max(1),
+            LaneShape::of(GROUPED_LANES, channels).channel_slots_per_lane,
+            (
+                values * size_of::<ValueDesc>() as u64,
+                (plan.ops.len() * size_of::<OpParams>()) as u64,
+                values * size_of::<u32>() as u64,
+                (plan.channel_bindings.len() * size_of::<u32>()) as u64,
+            ),
+            rows.max(1),
+            ((plan.output_pitch as usize).max(1) * size_of::<OutputSeat>()) as u64,
+            plan.fused.len(),
+        ))
+    }
+
+    fn regions(&self) -> impl Iterator<Item = &SpanRegion> {
         [
             &self.table,
             &self.descriptors,
@@ -1796,11 +1876,28 @@ impl Batch {
         ]
         .into_iter()
         .chain(&self.layouts)
-        .map(Buffer::bytes)
-        .sum()
     }
 
-    pub fn build(device: &Context, template: &Prepared, lanes: u32) -> Result<Batch> {
+    fn regions_mut(&mut self) -> impl Iterator<Item = &mut SpanRegion> {
+        [
+            &mut self.table,
+            &mut self.descriptors,
+            &mut self.params,
+            &mut self.offsets,
+            &mut self.bindings,
+            &mut self.pending_flags,
+            &mut self.lane_indices,
+            &mut self.row_meta,
+            &mut self.row_indices,
+            &mut self.addresses,
+        ]
+        .into_iter()
+        .chain(self.layouts.iter_mut())
+    }
+
+    /// A batch of `lanes` lanes of `template`'s stage, its tables sized and
+    /// not yet laid ([`Batch::lay`]): nothing binds or writes them before.
+    pub fn plan(template: &Prepared, lanes: u32, empty: &Buffer) -> Result<Batch> {
         let key = template.batch_key().ok_or_else(|| {
             Fault::program(
                 "program::launch",
@@ -1815,80 +1912,108 @@ impl Batch {
         let lanes = lanes.max(1);
         let table_bytes = (template.seats.len().max(1) * size_of::<OutputSeat>()) as u64;
         let shape = LaneShape::of(lanes, grouped.shape.channel_slots_per_lane);
-        let bytes = shape.bytes().ok_or_else(|| {
-            Fault::program(
+        if shape.bytes().is_none() {
+            return Err(Fault::program(
                 "program::launch",
                 "a batch lane table whose size does not fit a u64",
-            )
-        })?;
-        let mut table = Buffer::zeroed(device, bytes)?;
-        table.write(
-            0,
-            &record_bytes(&LaneHeader {
-                abi_version: LANE_ABI_VERSION,
-                lane_count: lanes,
-                channel_slots_per_lane: shape.channel_slots_per_lane,
-                flags: 0,
-            }),
-        )?;
-        let replicate = |device: &Context, bytes: &[u8]| -> Result<Buffer> {
-            let mut buffer =
-                Buffer::zeroed(device, (bytes.len() as u64 * u64::from(lanes)).max(4))?;
-            for lane in 0..lanes {
-                buffer.write(u64::from(lane) * bytes.len() as u64, bytes)?;
-            }
-            Ok(buffer)
-        };
-        let descriptors = replicate(device, &template.descriptor_bytes)?;
-        let params = replicate(device, &template.param_bytes)?;
-        let mut offsets = Buffer::zeroed(device, template.offset_bytes.len().max(4) as u64)?;
-        offsets.write(0, &template.offset_bytes)?;
+            ));
+        }
         let binding_bytes: Vec<u8> = template
             .bindings
             .iter()
             .copied()
             .flat_map(u32::to_le_bytes)
             .collect();
-        let bindings = replicate(device, &binding_bytes)?;
-        let pending_flags = Buffer::zeroed(
-            device,
-            (u64::from(lanes) * u64::from(shape.channel_slots_per_lane)).max(1),
-        )?;
-        let index_bytes: Vec<u8> = (0..lanes).flat_map(u32::to_le_bytes).collect();
-        let mut lane_indices = Buffer::zeroed(device, index_bytes.len() as u64)?;
-        lane_indices.write(0, &index_bytes)?;
-        let row_meta = Buffer::zeroed(device, u64::from(lanes) * size_of::<RowMeta>() as u64)?;
         let rows_per_lane = grouped.readout_rows;
-        let row_indices = Buffer::zeroed(
-            device,
-            (u64::from(lanes) * u64::from(rows_per_lane) * size_of::<u32>() as u64).max(4),
-        )?;
-        let mut layouts = Vec::with_capacity(grouped.layout_words.len());
-        for words in &grouped.layout_words {
-            let mut buffer = Buffer::zeroed(device, size_of::<GroupLayout>() as u64)?;
-            buffer.write(0, &record_bytes(words))?;
-            layouts.push(buffer);
-        }
+        let pieces = batch_pieces(
+            lanes,
+            grouped.shape.channel_slots_per_lane,
+            (
+                template.descriptor_bytes.len() as u64,
+                template.param_bytes.len() as u64,
+                template.offset_bytes.len() as u64,
+                binding_bytes.len() as u64,
+            ),
+            rows_per_lane,
+            table_bytes,
+            grouped.layout_words.len(),
+        );
+        let mut regions = pieces
+            .iter()
+            .map(|&bytes| SpanRegion::unplaced(bytes, empty.clone()));
+        let mut next = || regions.next().expect("a region a piece");
         Ok(Batch {
             key,
             lanes,
             shape,
-            table,
-            descriptors,
-            params,
-            offsets,
-            bindings,
-            pending_flags,
-            lane_indices,
-            row_meta,
-            row_indices,
+            table: next(),
+            descriptors: next(),
+            params: next(),
+            offsets: next(),
+            bindings: next(),
+            pending_flags: next(),
+            lane_indices: next(),
+            row_meta: next(),
+            row_indices: next(),
             scratch: None,
-            addresses: Buffer::zeroed(device, u64::from(lanes) * table_bytes)?,
+            addresses: next(),
             table_bytes,
-            layouts,
+            layouts: (0..grouped.layout_words.len()).map(|_| next()).collect(),
             layout_words: grouped.layout_words.clone(),
             rows_per_lane,
+            descriptor_bytes: template.descriptor_bytes.clone(),
+            param_bytes: template.param_bytes.clone(),
+            offset_bytes: template.offset_bytes.clone(),
+            binding_bytes,
         })
+    }
+
+    /// Lays the batch's tables from `at` of `view` (the span's buffer)
+    /// upward, written through `host` (`(at, bytes)` to its host runs), and
+    /// writes what a batch holds from its first fire; the caller drained
+    /// every frame that read where it was. Returns where the next lies.
+    pub fn lay(
+        &mut self,
+        view: &Buffer,
+        at: u64,
+        host: &dyn Fn(u64, u64) -> Result<Vec<(u64, u64, std::ptr::NonNull<u8>)>>,
+    ) -> Result<u64> {
+        let mut next = at;
+        for region in self.regions_mut() {
+            let bytes = region.bytes();
+            region.place(view.clone(), next);
+            region.rehost(if bytes > 0 {
+                host(next, bytes)?
+            } else {
+                Vec::new()
+            })?;
+            next += crate::arena::room(bytes);
+        }
+        self.table.write(
+            0,
+            &record_bytes(&LaneHeader {
+                abi_version: LANE_ABI_VERSION,
+                lane_count: self.lanes,
+                channel_slots_per_lane: self.shape.channel_slots_per_lane,
+                flags: 0,
+            }),
+        )?;
+        for lane in 0..u64::from(self.lanes) {
+            let descriptor = self.descriptor_bytes.len() as u64;
+            self.descriptors
+                .write(lane * descriptor, &self.descriptor_bytes)?;
+            let param = self.param_bytes.len() as u64;
+            self.params.write(lane * param, &self.param_bytes)?;
+            let binding = self.binding_bytes.len() as u64;
+            self.bindings.write(lane * binding, &self.binding_bytes)?;
+        }
+        self.offsets.write(0, &self.offset_bytes)?;
+        let index_bytes: Vec<u8> = (0..self.lanes).flat_map(u32::to_le_bytes).collect();
+        self.lane_indices.write(0, &index_bytes)?;
+        for (words, region) in self.layout_words.iter().zip(self.layouts.iter_mut()) {
+            region.write(0, &record_bytes(words))?;
+        }
+        Ok(next)
     }
 
     /// The value scratch a fire of `members` members takes: a stride each.
@@ -2088,10 +2213,26 @@ impl Batch {
             encoder.setComputePipelineState(region.pipeline());
             // SAFETY: every buffer is retained by `self`; every offset is zero.
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(self.table.raw()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.table.view().raw()),
+                    self.table.at(0) as usize,
+                    0,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.descriptors.view().raw()),
+                    self.descriptors.at(0) as usize,
+                    1,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.params.view().raw()),
+                    self.params.at(0) as usize,
+                    2,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.offsets.view().raw()),
+                    self.offsets.at(0) as usize,
+                    3,
+                );
                 {
                     let scratch = self.scratch()?;
                     encoder.setBuffer_offset_atIndex(
@@ -2100,15 +2241,39 @@ impl Batch {
                         4,
                     );
                 }
-                encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
-                encoder.setBuffer_offset_atIndex(Some(self.bindings.raw()), 0, 6);
-                encoder.setBuffer_offset_atIndex(Some(self.pending_flags.raw()), 0, 7);
-                encoder.setBuffer_offset_atIndex(Some(self.lane_indices.raw()), 0, 8);
-                encoder.setBuffer_offset_atIndex(Some(self.row_meta.raw()), 0, 9);
-                encoder.setBuffer_offset_atIndex(Some(self.row_indices.raw()), 0, 10);
                 encoder.setBuffer_offset_atIndex(
-                    Some(self.addresses.raw()),
-                    0,
+                    Some(layout.view().raw()),
+                    layout.at(0) as usize,
+                    5,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.bindings.view().raw()),
+                    self.bindings.at(0) as usize,
+                    6,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.pending_flags.view().raw()),
+                    self.pending_flags.at(0) as usize,
+                    7,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.lane_indices.view().raw()),
+                    self.lane_indices.at(0) as usize,
+                    8,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.row_meta.view().raw()),
+                    self.row_meta.at(0) as usize,
+                    9,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.row_indices.view().raw()),
+                    self.row_indices.at(0) as usize,
+                    10,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.addresses.view().raw()),
+                    self.addresses.at(0) as usize,
                     eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
                 );
             }
@@ -2229,10 +2394,26 @@ impl Batch {
             }
             // SAFETY: every buffer is retained by `self`; every offset is zero (the kernel strides off `layout`).
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(self.table.raw()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.table.view().raw()),
+                    self.table.at(0) as usize,
+                    0,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.descriptors.view().raw()),
+                    self.descriptors.at(0) as usize,
+                    1,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.params.view().raw()),
+                    self.params.at(0) as usize,
+                    2,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.offsets.view().raw()),
+                    self.offsets.at(0) as usize,
+                    3,
+                );
                 {
                     let scratch = self.scratch()?;
                     encoder.setBuffer_offset_atIndex(
@@ -2241,15 +2422,39 @@ impl Batch {
                         4,
                     );
                 }
-                encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
-                encoder.setBuffer_offset_atIndex(Some(self.bindings.raw()), 0, 6);
-                encoder.setBuffer_offset_atIndex(Some(self.pending_flags.raw()), 0, 7);
-                encoder.setBuffer_offset_atIndex(Some(self.lane_indices.raw()), 0, 8);
-                encoder.setBuffer_offset_atIndex(Some(self.row_meta.raw()), 0, 9);
-                encoder.setBuffer_offset_atIndex(Some(self.row_indices.raw()), 0, 10);
                 encoder.setBuffer_offset_atIndex(
-                    Some(self.addresses.raw()),
-                    0,
+                    Some(layout.view().raw()),
+                    layout.at(0) as usize,
+                    5,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.bindings.view().raw()),
+                    self.bindings.at(0) as usize,
+                    6,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.pending_flags.view().raw()),
+                    self.pending_flags.at(0) as usize,
+                    7,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.lane_indices.view().raw()),
+                    self.lane_indices.at(0) as usize,
+                    8,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.row_meta.view().raw()),
+                    self.row_meta.at(0) as usize,
+                    9,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.row_indices.view().raw()),
+                    self.row_indices.at(0) as usize,
+                    10,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.addresses.view().raw()),
+                    self.addresses.at(0) as usize,
                     eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
                 );
             }
