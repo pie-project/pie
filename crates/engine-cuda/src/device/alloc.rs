@@ -1261,6 +1261,37 @@ pub fn copy_any(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize
     }
 }
 
+/// `bytes` written at `at`, landed before this returns: for device memory
+/// no fire is reading yet.
+pub fn write_raw(at: u64, bytes: &[u8]) -> Result<()> {
+    // A size-only walk (`crate::sizing`) copies nothing to or from a
+    // stand-in span.
+    if crate::sizing::active() && (crate::sizing::stands_in(at as usize)) {
+        return Ok(());
+    }
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    #[cfg(feature = "device")]
+    {
+        // SAFETY: the address is a span the caller resolved against an
+        // allocation this shell owns, and `bytes` is live until the copy lands.
+        unsafe {
+            landed_copy(
+                at as *mut core::ffi::c_void,
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                crate::device::rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
+            )
+        }
+    }
+    #[cfg(not(feature = "device"))]
+    {
+        let _ = at;
+        Err(Fault::Runtimeless)
+    }
+}
+
 pub fn zero_span(at: u64, len: usize) -> Result<()> {
     // A size-only walk (`crate::sizing`) copies nothing to or from a
     // stand-in span.
