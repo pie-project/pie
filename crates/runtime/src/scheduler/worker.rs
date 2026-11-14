@@ -233,6 +233,10 @@ enum SchedulerItem {
         program: Box<ProgramRegistration>,
         response: tokio::sync::oneshot::Sender<Result<::engine::ProgramId>>,
     },
+    FireFacts {
+        key: crate::store::shared::programs::FireKey,
+        response: tokio::sync::oneshot::Sender<Result<()>>,
+    },
     RegisterChannelsBind {
         pipeline_id: Option<ProcessId>,
         plans: Vec<ChannelRegistration>,
@@ -455,6 +459,12 @@ pub(super) enum QueuedItem {
     RegisterProgram {
         program: Box<ProgramRegistration>,
         response: tokio::sync::oneshot::Sender<Result<::engine::ProgramId>>,
+    },
+    /// Asks the engine what fires of a program bound at given extents take
+    /// beside the model's activation, for the pool's rung arithmetic.
+    FireFacts {
+        key: crate::store::shared::programs::FireKey,
+        response: tokio::sync::oneshot::Sender<Result<()>>,
     },
     RegisterChannelsBind {
         pipeline_id: Option<ProcessId>,
@@ -967,14 +977,23 @@ impl SchedulerHandle {
             }
         };
         bind.binding.program = program_id;
-        // The program's fire term counts while the bind is under way, and
-        // the activation the fires may take holds it before the bind
-        // proceeds (`store::shared::programs`).
+        // The fire term of the program at these extents counts while the
+        // bind is under way, and the activation the fires may take holds it
+        // before the bind is sent (`store::shared::programs`). The engine is
+        // asked the pair's facts once, at its first bind.
         let _open = match crate::store::registry::try_get(0, bind.engine_id)
             .and_then(|stores| stores.shared)
         {
             Some(shared) => {
-                let open = crate::store::shared::programs::ProgramOpen::new(&shared, program_id)
+                let key = crate::store::shared::programs::FireKey {
+                    program: program_id,
+                    extents: bind.binding.extents,
+                };
+                if !shared.lock().unwrap().knows_fire(&key) {
+                    self.request(|response| SchedulerItem::FireFacts { key, response })
+                        .await??;
+                }
+                let open = crate::store::shared::programs::ProgramOpen::new(&shared, key)
                     .map_err(|why| anyhow!("pipeline: {why}"))?;
                 let engine = bind.engine_id;
                 let pid = pipeline_id.unwrap_or_default();
@@ -1514,6 +1533,7 @@ impl BatchScheduler {
                     plan, pipeline_id, ..
                 } => format!("PreLaunchCopy({}) pipeline {pipeline_id:?}", plan.label()),
                 QueuedItem::RegisterProgram { .. } => "RegisterProgram".to_string(),
+                QueuedItem::FireFacts { key, .. } => format!("FireFacts({key})"),
                 QueuedItem::RegisterChannelsBind { .. } => "RegisterChannelsBind".to_string(),
                 QueuedItem::CopyTracked { plan, .. } => format!("CopyTracked({})", plan.label()),
                 QueuedItem::HostKv { op, .. } => format!("HostKv({op:?})"),
@@ -1712,6 +1732,9 @@ impl BatchScheduler {
             SchedulerItem::RegisterProgram { program, response } => {
                 pending.push_back(QueuedItem::RegisterProgram { program, response });
             }
+            SchedulerItem::FireFacts { key, response } => {
+                pending.push_back(QueuedItem::FireFacts { key, response });
+            }
             SchedulerItem::RegisterChannelsBind {
                 pipeline_id,
                 plans,
@@ -1847,6 +1870,7 @@ impl BatchScheduler {
                 | QueuedItem::HostKv { .. }
                 | QueuedItem::Pool { .. }
                 | QueuedItem::RegisterProgram { .. }
+                | QueuedItem::FireFacts { .. }
         )
     }
 

@@ -184,6 +184,9 @@ fn fail_request(request: LaneRequest, why: &str) {
                 QueuedItem::RegisterProgram { response, .. } => {
                     let _ = response.send(Err(anyhow!("{why}")));
                 }
+                QueuedItem::FireFacts { response, .. } => {
+                    let _ = response.send(Err(anyhow!("{why}")));
+                }
                 _ => {}
             }
             let _ = reply.send(commit);
@@ -614,7 +617,8 @@ impl Lane {
             | QueuedItem::CloseChannels { .. }
             | QueuedItem::HostKv { .. }
             | QueuedItem::Pool { .. }
-            | QueuedItem::RegisterProgram { .. } => LaneCommit::None,
+            | QueuedItem::RegisterProgram { .. }
+            | QueuedItem::FireFacts { .. } => LaneCommit::None,
         }
     }
 
@@ -810,6 +814,19 @@ impl Lane {
                 let _ = response.send(registered);
                 LaneCommit::None
             }
+            QueuedItem::FireFacts { key, response } => {
+                let asked = backend(engine).and_then(|engine| {
+                    let facts = engine.fire_facts(key.program, &key.extents)?;
+                    if let Some(shared) =
+                        crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared)
+                    {
+                        shared.lock().unwrap().fire_facts_learned(key, &facts);
+                    }
+                    Ok(())
+                });
+                let _ = response.send(asked);
+                LaneCommit::None
+            }
             QueuedItem::RegisterChannelsBind {
                 pipeline_id,
                 plans,
@@ -868,10 +885,13 @@ impl Lane {
                         if let Some(shared) =
                             crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared)
                         {
-                            shared
-                                .lock()
-                                .unwrap()
-                                .instance_bound(bound.instance_id, bind.program_id());
+                            shared.lock().unwrap().instance_bound(
+                                bound.instance_id,
+                                crate::store::shared::programs::FireKey {
+                                    program: bind.program_id(),
+                                    extents: bind.binding.extents,
+                                },
+                            );
                         }
                         LaneCommit::BindInstance {
                             pipeline_id,
