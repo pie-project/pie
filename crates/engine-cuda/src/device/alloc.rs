@@ -11,6 +11,9 @@ pub struct Buffer {
     carved: Option<(usize, i32)>,
     /// Another owner's bytes ([`Buffer::over`]): never given back here.
     lent: bool,
+    /// Whether a lent run lies where its owner laid it; one that does not
+    /// yet stands in ([`Buffer::lent`]).
+    laid: bool,
 }
 
 /// `bytes` of device memory for a [`Buffer`], given back once in its `Drop`,
@@ -122,6 +125,7 @@ impl Buffer {
                 bytes: 0,
                 carved: None,
                 lent: false,
+                laid: true,
             });
         }
         #[cfg(feature = "device")]
@@ -135,6 +139,7 @@ impl Buffer {
                 bytes,
                 carved,
                 lent: false,
+                laid: true,
             })
         }
         #[cfg(not(feature = "device"))]
@@ -150,6 +155,7 @@ impl Buffer {
                 bytes: 0,
                 carved: None,
                 lent: false,
+                laid: true,
             });
         }
         #[cfg(feature = "device")]
@@ -170,6 +176,7 @@ impl Buffer {
                 bytes,
                 carved,
                 lent: false,
+                laid: true,
             })
         }
         #[cfg(not(feature = "device"))]
@@ -188,6 +195,7 @@ impl Buffer {
             bytes,
             carved: None,
             lent: true,
+            laid: true,
         }
     }
 
@@ -195,9 +203,9 @@ impl Buffer {
     /// for a run not laid yet, which only a size-only walk
     /// (`crate::sizing`) may stage into.
     fn stood_in(&self) -> Result<bool> {
-        // An allocation of the driver's may lie anywhere, the stand-in span
-        // included: only a lent run is ever a stand-in.
-        if !self.lent || !crate::sizing::stands_in(self.ptr as usize) {
+        // Never by its address: a range the driver places may lie anywhere,
+        // the stand-in span included.
+        if self.laid {
             return Ok(false);
         }
         if crate::sizing::active() {
@@ -213,13 +221,17 @@ impl Buffer {
     /// it stands in till [`Buffer::lay`].
     #[must_use]
     pub fn lent(bytes: usize) -> Buffer {
-        Buffer::over(crate::sizing::STAND_IN, bytes)
+        Buffer {
+            laid: false,
+            ..Buffer::over(crate::sizing::STAND_IN, bytes)
+        }
     }
 
     /// The lent run lies at `ptr` from here on.
     pub fn lay(&mut self, ptr: u64) {
         debug_assert!(self.lent, "only a lent run is laid");
         self.ptr = ptr;
+        self.laid = true;
     }
 
     #[must_use]
