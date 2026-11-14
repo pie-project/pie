@@ -1582,3 +1582,224 @@ fn a_stalled_process_that_alone_holds_the_pool_fails_instead_of_restarting() {
     );
     drop(terminate(&planner, process));
 }
+
+/// Mac's gemma-4-e4b c64 stall: a windowed model on a pool that states no
+/// activation rungs and grows (one segment of eight committed at load).
+fn growing_window_model() -> usize {
+    use ::engine::chunk::{
+        ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
+        SlotShape,
+    };
+    let kind = SlotKind::List {
+        tokens: 16,
+        rate: 1,
+        window: Some(32),
+    };
+    let facts = ChunkFacts {
+        chunk_bytes: 1 << 20,
+        total_chunks: 256,
+        segment_chunks: 32,
+        segments: SegmentFacts {
+            committed: 1,
+            max: 8,
+            growth: Growth::Bottom,
+        },
+        reserved: vec![ReservedRun {
+            what: Reserved::Null,
+            first: 0,
+            chunks: 1,
+        }],
+        shapes: vec![SlotShape {
+            id: ShapeId(1),
+            kind,
+            slot_bytes: 1 << 20,
+            slots_per_chunk: 1,
+            sets_per_working_set: kind.sets_per_working_set(),
+            rows: Vec::new(),
+            pinned: None,
+            role: SlotRole::State,
+        }],
+        ..ChunkFacts::default()
+    };
+    let pool = crate::store::shared::SharedPool::new(&facts, 1024).expect("the window pool");
+    crate::store::registry::register_model_with_chunks(
+        16,
+        &[crate::store::registry::EngineStores {
+            pools: crate::store::chunks::StorePools::of(&facts).expect("shared facts"),
+            max_context: 1024,
+            shared: Some(Arc::new(std::sync::Mutex::new(pool))),
+            tiers: crate::store::shared::Tiers::default(),
+        }],
+    )
+}
+
+/// 64 processes each fire 48 prompt rows over a windowed model whose pool
+/// commits one segment at load and states no rungs: the waiters' window
+/// slots reach the governor's demand, the walk commits ahead of them, and
+/// every one is served. The governor and the segment walk are played here
+/// a turn at a time, the engine committing what it is told.
+#[tokio::test(flavor = "current_thread")]
+async fn sixty_four_windowed_prompts_grow_a_pool_that_starts_at_one_segment() {
+    use crate::governor::run::Steer;
+    use crate::governor::{PoolTarget, Pressure, Tolerance};
+    use crate::store::shared::SegmentMove;
+
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    const PROCESSES: usize = 64;
+    let model = growing_window_model();
+    let stores = crate::store::registry::get(model, 0);
+    let shared = stores.shared.clone().expect("a shared pool");
+    assert_eq!(shared.lock().unwrap().mapped_segments(), 1);
+    assert!(shared.lock().unwrap().rungs().is_empty());
+    let mut grow = crate::store::shared::SharedGrow::new(model, 0, shared.clone());
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(
+        RegistryPool::new(model, 0, false).with_shared_grow(grow.clone()),
+    )));
+    let mut steer = Steer::new(
+        &grow,
+        Tolerance {
+            backoff: 0.5,
+            release_idle: true,
+        },
+        512 << 20,
+    );
+    let geom = crate::store::rs::RsGeometry {
+        state_size: 0,
+        buffer_page_tokens: 16,
+    };
+    let mut tasks = Vec::new();
+    for _ in 0..PROCESSES {
+        let pid = ProcessId::new_v4();
+        planner.register(pid);
+        planner.note_admitted(pid);
+        let ws = stores.rs.lock().unwrap().create_working_set(geom);
+        let (planner, stores) = (planner.clone(), stores.clone());
+        tasks.push(crate::rt::spawn(async move {
+            let demand = window_demand(&stores, ws, 0, 48);
+            match planner.acquire(pid, pid, demand).await {
+                Ok(Acquired::Granted(grant)) => {
+                    window_write(&stores, ws, 0, 48, grant, false);
+                    Ok(())
+                }
+                Ok(other) => Err(format!("not granted: {}", matches!(other, Acquired::Yield))),
+                Err(error) => Err(error.to_string()),
+            }
+        }));
+    }
+    let mut epoch = 0u64;
+    for _ in 0..2000 {
+        if tasks.iter().all(|task| task.is_finished()) {
+            break;
+        }
+        // The governor's tick, then the walk toward its target.
+        steer.turn(&mut grow, Some(Pressure::Calm), &mut |_| {});
+        loop {
+            let goal = grow.goal_for_test();
+            epoch += 1;
+            let step = shared.lock().unwrap().next_move(goal, epoch);
+            match step {
+                Some(SegmentMove::Commit { prefix }) => {
+                    shared.lock().unwrap().committed(prefix);
+                    planner.pages_freed();
+                }
+                _ => break,
+            }
+        }
+        shared.lock().unwrap().pool_mut().retire_through(epoch);
+        // The fires the served prompts ran retire: what their windows moved
+        // past is free, as a retiring fire tells the planner.
+        planner.pages_freed();
+        for _ in 0..4 {
+            crate::rt::yield_now().await;
+        }
+    }
+    let done = tasks.iter().filter(|task| task.is_finished()).count();
+    let mapped = shared.lock().unwrap().mapped_segments();
+    let demand = grow.demand();
+    assert_eq!(
+        done, PROCESSES,
+        "{done} of {PROCESSES} served; mapped {mapped} segments, demand {demand:?}"
+    );
+    for task in tasks {
+        task.await.expect("the task").expect("granted");
+    }
+}
+
+/// A head short of window slots tells the segment walker its whole ask, the
+/// free slots it will take included: a shortfall alone under-counts the
+/// pool's demand by the free slots, so a pool whose free slots fall just
+/// short of the head is never asked to grow.
+#[tokio::test(flavor = "current_thread")]
+async fn a_window_head_short_of_slots_asks_the_walker_for_its_whole_ask() {
+    use crate::governor::PoolTarget;
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = growing_window_model();
+    let stores = crate::store::registry::get(model, 0);
+    let shared = stores.shared.clone().expect("a shared pool");
+    let mut grow = crate::store::shared::SharedGrow::new(model, 0, shared.clone());
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(
+        RegistryPool::new(model, 0, false).with_shared_grow(grow.clone()),
+    )));
+    let geom = crate::store::rs::RsGeometry {
+        state_size: 0,
+        buffer_page_tokens: 16,
+    };
+    let start = |stores: &crate::store::registry::Stores| {
+        let pid = ProcessId::new_v4();
+        planner.register(pid);
+        planner.note_admitted(pid);
+        (pid, stores.rs.lock().unwrap().create_working_set(geom))
+    };
+    // Prompts of 48 rows, three slots each, until fewer than three stand
+    // free.
+    while stores.rs.lock().unwrap().free().pages >= 3 {
+        let (pid, ws) = start(&stores);
+        let demand = window_demand(&stores, ws, 0, 48);
+        let Ok(Acquired::Granted(grant)) = planner.acquire(pid, pid, demand).await else {
+            panic!("a grant while three stand free");
+        };
+        window_write(&stores, ws, 0, 48, grant, false);
+    }
+    let free = stores.rs.lock().unwrap().free().pages;
+    assert!((1..3).contains(&free), "{free} free");
+    let before = grow.demand();
+    let (pid, ws) = start(&stores);
+    let demand = window_demand(&stores, ws, 0, 48);
+    let p = planner.clone();
+    let parked = crate::rt::spawn(async move { p.acquire(pid, pid, demand).await });
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+    }
+    assert!(!parked.is_finished(), "{free} free, three asked: it parks");
+    let after = grow.demand();
+    assert_eq!(
+        after.wanted - before.wanted,
+        3 << 20,
+        "the walker is asked the head's three slots, not the {} the free ones lack",
+        3 - free
+    );
+    parked.abort();
+}
+
+/// A window model's list 0 is its pages: a seating reserve stated in
+/// `pages` reaches the walker as an ask stated in `windows[0]` does.
+#[tokio::test(flavor = "current_thread")]
+async fn a_window_store_tells_the_walker_a_reserve_stated_in_pages() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = growing_window_model();
+    let stores = crate::store::registry::get(model, 0);
+    let shared = stores.shared.clone().expect("a shared pool");
+    let wanted = || shared.lock().unwrap().demand().wanted;
+    let before = wanted();
+    stores.rs.lock().unwrap().note_short_shared(RsUnits {
+        pages: 2,
+        ..RsUnits::default()
+    });
+    assert_eq!(wanted() - before, 2 << 20);
+    stores
+        .rs
+        .lock()
+        .unwrap()
+        .note_short_shared(RsUnits::default());
+    assert_eq!(wanted(), before);
+}

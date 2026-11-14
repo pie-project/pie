@@ -16,7 +16,14 @@ enum Step {
         fund_by_eviction: bool,
     },
     ShortRs {
+        /// What the free slots lack for the head.
         need: RsUnits,
+        /// The head's whole ask, the free slots it will take included: what
+        /// a shared pool's segment walker grows for. The free slots are no
+        /// one's yet, so a shortfall alone would under-count the demand by
+        /// them, and a pool whose free slots fall just short of a head
+        /// would never be asked to grow.
+        ask: RsUnits,
         fund_by_eviction: bool,
         /// Pages gathered past the head's own kv need.
         surplus: u32,
@@ -92,6 +99,7 @@ impl ResidencyPlanner {
                 if !rs_free.covers(seated) {
                     return Step::ShortRs {
                         need: seated.sub(rs_free),
+                        ask: seated,
                         fund_by_eviction: !is_restore || inner.fleet_stalled(),
                         surplus: (inner.accum.len() as u32).saturating_sub(waiter.kv_need()),
                     };
@@ -148,6 +156,7 @@ impl ResidencyPlanner {
                 }
                 Step::ShortRs {
                     need,
+                    ask,
                     fund_by_eviction,
                     surplus,
                 } => {
@@ -167,7 +176,7 @@ impl ResidencyPlanner {
                             continue;
                         }
                     }
-                    if self.port.grow_rs(need) {
+                    if self.port.grow_rs(ask) {
                         return;
                     }
                     // On a shared pool the chunks idle cache holds open for

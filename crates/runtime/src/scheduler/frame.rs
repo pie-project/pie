@@ -22,6 +22,10 @@ pub(crate) fn set_dispatch_depth(depth: usize) {
 
 static DISPATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
+/// How long a frame held for lanes that have not submitted waits before it
+/// says which, and again after each such span.
+const HOLD_SAYS_AFTER: Duration = Duration::from_secs(5);
+
 fn idle_dump_min_seats() -> usize {
     static SEATS: OnceLock<usize> = OnceLock::new();
     *SEATS.get_or_init(|| {
@@ -196,6 +200,8 @@ pub(super) struct FramePolicy {
     suspended: BTreeSet<ProcessId>,
     truncated_seqs: BTreeMap<ProcessId, u64>,
     strict_watchdog_deadline: Option<Instant>,
+    /// When a held frame last said which lanes it waits on.
+    hold_said: Option<Instant>,
     join_hold: Option<Instant>,
     gather_seq: u64,
     quiesce_mark: Option<u64>,
@@ -249,6 +255,7 @@ impl FramePolicy {
             suspended: BTreeSet::new(),
             truncated_seqs: BTreeMap::new(),
             strict_watchdog_deadline: None,
+            hold_said: None,
             join_hold: None,
             gather_seq: 0,
             quiesce_mark: None,
@@ -1096,6 +1103,7 @@ ready_age_newest={}us",
             }
             let mut missing_decoders = 0usize;
             let mut missing = 0;
+            let mut blocking_lanes: Vec<(ProcessId, bool, bool)> = Vec::new();
             let mut expired: Vec<ProcessId> = Vec::new();
             let leash = self.submit_deadline;
             let silence = self.silence_timeout;
@@ -1150,6 +1158,9 @@ ready_age_newest={}us",
                 if blocking {
                     missing += 1;
                     missing_decoders += usize::from(!lane.prompting);
+                    if blocking_lanes.len() < 16 {
+                        blocking_lanes.push((lane.owner.unwrap_or(*lane_id), lane.prompting, owes));
+                    }
                 }
             }
             if !expired.is_empty() {
@@ -1178,6 +1189,27 @@ ready_age_newest={}us",
                 if let Some(FramePlan::Dispatch(_)) = sealed {
                     continue;
                 }
+            }
+            if missing > 0
+                && self
+                    .hold_said
+                    .is_none_or(|said| now.saturating_duration_since(said) >= HOLD_SAYS_AFTER)
+            {
+                if self.hold_said.is_some() {
+                    tracing::warn!(
+                        missing,
+                        executing,
+                        pending_binds = self.pending_binds.values().sum::<usize>(),
+                        joining = self.is_joining(),
+                        lanes = self.lanes.len(),
+                        waits_on = ?blocking_lanes,
+                        "a frame is held for lanes that have not submitted (owner, prompting, owes)"
+                    );
+                }
+                self.hold_said = Some(now);
+            }
+            if missing == 0 {
+                self.hold_said = None;
             }
             if missing > 0 {
                 if executing {
