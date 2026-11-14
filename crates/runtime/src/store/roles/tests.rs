@@ -195,6 +195,7 @@ impl Engine for FakeEngine {
             ],
             fire_bytes_a_lane: 0,
             fire_bytes_fixed: 0,
+            max_lanes: 0,
         })
     }
 

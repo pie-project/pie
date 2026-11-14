@@ -227,6 +227,25 @@ async fn a_program_s_fire_term_widens_the_span_before_its_bind_and_its_close_giv
             "the engine copied what the raise moved"
         );
         assert!(pool.copying().is_none());
+        // What the engine relies on when it backs its own span: no state
+        // slot lies in the widened span once the wait is through, and the
+        // copy that moved them is done (the wait awaited it).
+        let in_span: Vec<u32> = all[all.len() / 2..]
+            .iter()
+            .flat_map(|&record| pool.record_slots(record))
+            .map(|slot| pool.pool().physical(slot.chunk).unwrap())
+            .filter(|&physical| physical >= TOTAL - 7)
+            .collect();
+        assert!(in_span.is_empty(), "state left in the span: {in_span:?}");
+        assert!(
+            engine
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .any(|call| matches!(call, Call::Evacuate(moves) if !moves.is_empty())),
+            "the raise moved state out through the engine's copy"
+        );
     }
 
     // The bind went through: the instance holds the term past the guard.
@@ -256,4 +275,160 @@ async fn a_program_s_fire_term_widens_the_span_before_its_bind_and_its_close_giv
     let pool = shared.lock().unwrap();
     assert_eq!(pool.pool().act_reserved(), 4, "the room is back");
     assert_eq!(pool.pool().state_limit(), TOTAL - 4);
+}
+
+/// A program that flies at most 16 lanes a fire takes its term at 16 lanes
+/// on every rung past 16 tokens: `fixed + min(r, max_lanes, program
+/// max_lanes) × a_lane`.
+#[test]
+fn a_program_s_own_lane_cap_bounds_its_term() {
+    let (mut pool, _) = pool_at_256();
+    pool.program_registered(
+        PROGRAM,
+        &ProgramFacts {
+            max_lanes: 16,
+            ..fire_facts()
+        },
+    );
+    pool.instance_bound(InstanceId(1), PROGRAM);
+    // 20 + 16 x 0.25 MiB = 24 MiB, 2 chunks, at 16, 256 and 2048 alike.
+    assert_eq!(pool.pool().act_chunks(16), 1 + 2);
+    assert_eq!(pool.pool().act_chunks(256), 4 + 2);
+    assert_eq!(pool.pool().act_chunks(2048), 12 + 2);
+    // Beside an uncapped program: each takes its own lanes.
+    const OTHER: ProgramId = ProgramId(8);
+    pool.program_registered(OTHER, &fire_facts());
+    pool.instance_bound(InstanceId(2), OTHER);
+    // 24 + 36 MiB = 60 MiB, 4 chunks.
+    assert_eq!(pool.pool().act_chunks(256), 4 + 4);
+}
+
+/// 55 chunks a fire: the 2048 rung (12 + 55) no longer fits the 63 chunks
+/// past the reserved one, the 256 rung (4 + 55) does.
+fn wide_facts() -> ProgramFacts {
+    ProgramFacts {
+        fire_bytes_fixed: 55 * CHUNK,
+        ..ProgramFacts::default()
+    }
+}
+
+/// A term the largest rung cannot hold with it cuts fires to the widest
+/// rung that fits rather than refusing the bind: the wait funds that rung,
+/// then holds until the walk has cut fires to it. Only where even the
+/// smallest rung cannot fit is a bind refused.
+#[tokio::test(flavor = "current_thread")]
+async fn a_term_past_the_largest_rung_funds_the_widest_that_fits_and_cuts_fires_to_it() {
+    let mut pool = pool();
+    pool.set_max_lanes(LANES);
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.rung(), 2048);
+    pool.program_registered(PROGRAM, &wide_facts());
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let open = ProgramOpen::new(&shared, PROGRAM).unwrap();
+    {
+        let pool = shared.lock().unwrap();
+        assert_eq!(pool.widest_fit(), Some(256));
+        assert_eq!(pool.rung_for(u32::MAX), 256, "fires are asked no wider");
+        assert_eq!(pool.fit_cap(), 256);
+    }
+    // Fires are cut at the largest rung's width when the bind starts.
+    let cap = Arc::new(AtomicU32::new(u32::MAX));
+    let wait = tokio::spawn({
+        let (shared, cap, engine) = (shared.clone(), cap.clone(), engine);
+        async move {
+            fund_span(
+                &shared,
+                move || cap.load(Ordering::Acquire),
+                &NoPlanner,
+                &Lane(Arc::new(Mutex::new(engine))),
+            )
+            .await
+        }
+    });
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        shared.lock().unwrap().pool().act_reserved(),
+        4 + 55,
+        "the 256 rung with its term is taken"
+    );
+    assert!(!wait.is_finished(), "fires are still cut wider than it");
+    // The walk cuts them, whatever is asked.
+    let step = RungWalk::default()
+        .step(&shared.lock().unwrap(), u32::MAX, u32::MAX, u32::MAX, 1, 1)
+        .unwrap();
+    assert_eq!(step, RungStep::Cap(256));
+    cap.store(256, Ordering::Release);
+    wait.await.unwrap().unwrap();
+    drop(open);
+
+    // A term even the smallest rung cannot hold is refused.
+    const HUGE: ProgramId = ProgramId(9);
+    shared.lock().unwrap().program_registered(
+        HUGE,
+        &ProgramFacts {
+            fire_bytes_fixed: 63 * CHUNK,
+            ..ProgramFacts::default()
+        },
+    );
+    assert!(ProgramOpen::new(&shared, HUGE).is_err());
+    assert_eq!(shared.lock().unwrap().fit_cap(), u32::MAX, "no term counts");
+}
+
+/// A bind that cannot be funded is refused, never sent: the planner's
+/// refusal and a refused copy both end the wait with an error, the span as
+/// it was.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_whose_room_is_refused_fails_its_wait() {
+    struct Refusing;
+    impl Funder for Refusing {
+        async fn fund(&self, _pages: u32) -> Result<bool, String> {
+            Err("the planner refuses".into())
+        }
+    }
+    struct NoCopy;
+    impl Mover for NoCopy {
+        async fn evacuate(&self, _evacuation: EngineEvacuation) -> Result<(), String> {
+            Err("the engine refuses".into())
+        }
+        fn epoch_now(&self) -> u64 {
+            0
+        }
+    }
+    struct Granting;
+    impl Funder for Granting {
+        async fn fund(&self, _pages: u32) -> Result<bool, String> {
+            Ok(true)
+        }
+    }
+
+    let (mut pool, _) = pool_at_256();
+    pool.program_registered(PROGRAM, &fire_facts());
+    let all = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let _open = ProgramOpen::new(&shared, PROGRAM).unwrap();
+    let error = fund_span(&shared, || 256, &Refusing, &NoCopy)
+        .await
+        .unwrap_err();
+    assert!(error.contains("the planner refuses"));
+    assert_eq!(shared.lock().unwrap().pool().act_reserved(), 4);
+
+    // Room there, the copy refused: the wait fails rather than let the
+    // bind past state still in the span.
+    {
+        let mut pool = shared.lock().unwrap();
+        pool.give_records(&all[..all.len() / 2]);
+        pool.pool_mut().retire_through(u64::MAX);
+    }
+    let error = fund_span(&shared, || 256, &Granting, &NoCopy)
+        .await
+        .unwrap_err();
+    assert!(error.contains("the engine refuses"), "{error}");
 }
