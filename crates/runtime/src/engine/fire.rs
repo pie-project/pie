@@ -12,6 +12,10 @@ pub struct FireRequest {
     pub boundary_program: bool,
     pub voxels: Vec<engine::fire::StepVoxels>,
     pub media: Vec<engine::fire::StepMedia>,
+    /// The recurrent rows its lanes carry unfolded into the fire, which it
+    /// replays ahead of its own, summed over them
+    /// ([`engine::fire::rung_rows`]).
+    pub carried: u32,
 }
 
 impl FireRequest {
@@ -33,6 +37,13 @@ impl FireRequest {
     #[must_use]
     pub fn tokens(&self) -> usize {
         self.lanes.iter().map(|lane| lane.tokens.len().max(1)).sum()
+    }
+
+    /// What the fire asks its activation rung for: its own rows, or the
+    /// rows it carries where they are more ([`engine::fire::rung_rows`]).
+    #[must_use]
+    pub fn rung_rows(&self) -> usize {
+        self.tokens().max(self.carried as usize)
     }
 
     /// The rows the fire reads out: a lane's last row, the rows it names,

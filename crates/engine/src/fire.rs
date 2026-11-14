@@ -566,28 +566,30 @@ pub enum RsVerb {
     },
 }
 
-/// The most recurrent rows a lane carries unfolded into a fire: rows
-/// earlier fires wrote and nothing has folded yet, which the fire replays
-/// ahead of its own. The fire's own rows never count against it.
+/// The rows a fire asks its activation rung for: `own` rows of its lanes,
+/// and `carried` recurrent rows, those earlier fires wrote and nothing has
+/// folded yet, which the fire replays ahead of its own.
 ///
-/// The runtime refuses, before anything is submitted, a host-placed pass
-/// whose lane carries more in, or whose host fold leaves more unfolded
-/// behind it; an engine sizes a lane's rs replay scratch as the fire's own
-/// rows plus this.
+/// The contract on carried rows, with no stated limit: a rung's replay
+/// scratch holds the rung's tokens of carried rows; a fire carries at most
+/// its rung's tokens; the runtime asks the rung for max(own, carried) and
+/// refuses past the largest rung.
 ///
-/// A device-geometry fire picks where its rows land on the device, so the
-/// host cannot bound what it carries in. Its engine must: a lane replaying
-/// more than this many carried rows never writes past its scratch; the
-/// kernel clamps and the engine reports the fire failed, never a silent
-/// overrun. CUDA's walked path already sizes its scratch for what its lanes
-/// replay (`replayed` beside `REPLAYED` in `Run::rs_layout` and
-/// `serve::prepare`).
-///
-/// A stated limit, not a derived value: 16 covers the deepest speculative
-/// draft served today (15 drafts and the row they follow). It could be
-/// derived instead, from the model's MTP head count or from a draft depth
-/// the inferlet declares in its manifest; that is a possible follow-up.
-pub const UNFOLDED_ROWS: u32 = 16;
+/// - The engine: at rung `r` a fire's replay scratch holds `r` own rows and
+///   `r` carried rows, in extended rows (the recurrent layers' rows only).
+/// - The runtime: a fire carrying more than its rung's tokens raises the
+///   rung as a wider fire does; one carrying more than the largest rung's
+///   tokens is refused by name, before anything is submitted. The counts
+///   are a fire's, summed over its lanes.
+/// - Device geometry: the device picks where a lane's rows land, so the
+///   carried count the runtime asks with is the host's bound, the slots the
+///   lane reserved past its frozen length (`reserved - frozen`). An
+///   inferlet that reserves far ahead asks a wider rung than it uses;
+///   tightening that belongs to the reservation API.
+#[must_use]
+pub fn rung_rows(own: u32, carried: u32) -> u32 {
+    own.max(carried)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FoldLen {

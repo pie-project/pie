@@ -35,7 +35,7 @@ struct Refs {
 /// Buffers `UNFOLDED_ROWS + 1` rows, folding one, then carries the rest
 /// into a one-token fire: both fires' logits.
 fn walk(shell: &mut Shell, fixture: &Fixture, rs_pages: u32, refs: Option<&Refs>) -> Vec<Vec<f32>> {
-    let bound = engine::fire::UNFOLDED_ROWS;
+    let bound = engine_metal::serve::UNFOLDED_ROWS;
     let rows: Vec<u32> = (0..=bound).map(|at| (7 + at * 37) % 256).collect();
     let next = [42u32];
     let seat_pages: Vec<u32> = (0..rs_pages).collect();
@@ -97,7 +97,7 @@ fn an_rs_page_past_the_first_buffer_holds_its_rows() {
     let segment = facts.segment_chunks;
     let per = |id| facts.shape(id).map_or(1, |s| s.slots_per_chunk);
     // The walk's rows (the bound and one more) over the rs slot's tokens.
-    let rs_pages = (engine::fire::UNFOLDED_ROWS + 2).div_ceil(layout.rs_tokens.max(1)) + 1;
+    let rs_pages = (engine_metal::serve::UNFOLDED_ROWS + 2).div_ceil(layout.rs_tokens.max(1)) + 1;
     // A chunk a shape, from the first segment past the seats: under the
     // buffer cap, a buffer past the first.
     let first = layout.free_chunk().div_ceil(segment).max(1) * segment;
