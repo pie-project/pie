@@ -1675,12 +1675,7 @@ impl Pools {
                     let seat = seats.page_tables.get(table).ok_or_else(|| Fault::Unbound {
                         what: format!("page table {table}, which this fire staged none of"),
                     })?;
-                    let pages = if windowed {
-                        self.paging.window_pages()
-                    } else {
-                        self.paging.pages()
-                    };
-                    let cells = pages * u64::from(self.paging.page_size);
+                    let _ = windowed;
                     // A plane's pointer carries its offset in a page's
                     // slot; the pages step by the shape's grain.
                     let grain = self
@@ -1688,6 +1683,15 @@ impl Pools {
                         .layout()
                         .shape(Kind::paged(list))
                         .map_or(0, |shape| shape.grain);
+                    // The plane's extent is every page id the range holds,
+                    // not the pages the fit counts: a page's id is its place
+                    // in the range, and a page in a chunk past the fit (a
+                    // span chunk lent to state, a chunk beside a weight's)
+                    // has an id past that count. A kernel that bounds its
+                    // reads by the extent (a tensor map) would read it as
+                    // zeros.
+                    let cells =
+                        self.chunks.bytes() / grain.max(1) * u64::from(self.paging.page_size);
                     let _ = values_plane;
                     let plane = |at: usize, width: u64| {
                         Tensor::new(
