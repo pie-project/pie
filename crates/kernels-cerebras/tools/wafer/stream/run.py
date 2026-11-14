@@ -1,12 +1,20 @@
-"""stream/run.py <compiled dir> <program dir> [diffusers velocity .f32]: one step of a stream reading on the
-simulator, as wafer-compile stream laid it (host.json): every array the host writes (weights, tables,
-the host's rows), one launch of `run`, the host's rows read back and compared with the step's own values
+"""stream/run.py <compiled dir> <program dir> [diffusers velocity .f32] [--entries <dir>]: one step of a stream
+reading on the simulator, as wafer-compile stream laid it (host.json): every array the host writes (weights,
+tables, the host's rows), one launch of `run`, the host's rows read back and compared with the step's own values
 (engine-cpu's Forward::stream_capture: rel L2, cosine), and the step's cycles off every PE's stamps. With a
-diffusers golden (flux2-mini: mk_tiny_flux2.py's velocity), the output is unpatchified and compared to it."""
-import json, sys, time
+diffusers golden (flux2-mini: mk_tiny_flux2.py's velocity), the output is unpatchified and compared to it.
+--entries: the arrays a step's inputs make (host.json's `entry` arrays) are taken from <dir>, as the engine
+computed them from the step's own inputs (`wafer-bench --reading ... --entries <dir>`), not from the capture.
+(`wafer-bench --reading` runs the whole step, the exit's ops and a denoise loop itself.)"""
+import json, os, sys, time
 import numpy as np
 from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime, MemcpyDataType, MemcpyOrder
 
+entries = None
+if "--entries" in sys.argv:
+    at = sys.argv.index("--entries")
+    entries = sys.argv[at + 1]
+    del sys.argv[at:at + 2]
 out_dir, prog = sys.argv[1], sys.argv[2]
 host = json.load(open(f"{prog}/host.json"))
 W, H = host["w"], host["h"]
@@ -16,13 +24,18 @@ t0 = time.time()
 r = SdkRuntime(out_dir)
 r.load()
 r.run()
+took = 0
 for a in host["h2d"]:
-    d = np.load(f"{prog}/{a['file']}")
+    f = f"{prog}/{a['file']}"
+    if entries and "entry" in a:
+        f = f"{entries}/{os.path.basename(a['file'])}"
+        took += 1
+    d = np.load(f)
     data = d.reshape(-1).astype(np.uint32) if a["u16"] else d.reshape(-1).astype(np.float32)
     r.memcpy_h2d(r.get_id(a["sym"]), data, a["x"], a["y"], a["w"], a["h"], a["len"],
                  data_type=U16 if a["u16"] else F32, **kw)
 t1 = time.time()
-print(f"loaded {len(host['h2d'])} arrays in {t1 - t0:.0f} s", flush=True)
+print(f"loaded {len(host['h2d'])} arrays ({took} the engine's entries) in {t1 - t0:.0f} s", flush=True)
 r.launch("run", nonblock=False)
 t2 = time.time()
 print(f"step ran in {t2 - t1:.0f} s", flush=True)

@@ -22,6 +22,23 @@
 //! stamps; `<probe>.counts`: a kernel's counters, as read), the token loop's steps), also
 //! written to `--times`.
 //! Prints `WAFER_BENCH ok` and exits 0 when every check holds.
+//!
+//! A stream reading (GENERIC.md M1e: a diffusion transformer's denoise, `wafer-compile stream`):
+//!
+//! ```text
+//! wafer-bench --reading <stream program dir> --program <compiled out dir> --inputs <dir>
+//!             [--grid T,H,W] [--steps N] [--golden <dir>] [--cmaddr <addr>]
+//! wafer-bench --reading <stream program dir> --inputs <dir> --entries <out dir> [--grid T,H,W]
+//! ```
+//!
+//! The step's guest inputs are `<inputs>/<name>.f32` (each as the trace's input axis lays it);
+//! `--grid` is the latent's voxel grid (`T,H,W`). The engine computes every entry from them
+//! (`engine_cerebras::reading`), loads the program, writes its arrays, runs the step, reads the
+//! rows back and runs the exit's ops; `--steps` steps of the poem's flow schedule, an Euler step
+//! each (the program is loaded afresh a step). With `--golden`, each step's velocity is held to
+//! `cpu_velocity<i>.f32` and the latent after it to `cpu_latent<i + 1>.f32` (relative L2 1e-2,
+//! cosine 0.999). `--entries` writes the first step's entries as the h2d files they replace
+//! (`<k>.npy`) and runs nothing: `tools/wafer/stream/run.py --entries` takes them.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -33,7 +50,8 @@ use serde_json::{Value, json};
 
 const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix>] --golden \
                      <golden.json> [--steps N] [--tokens N] [--cmaddr <addr>] [--logits <out.json>] \
-                     [--times <out.json>] [--forced N]";
+                     [--times <out.json>] [--forced N]\n       wafer-bench --reading <dir> --program <dir> \
+                     --inputs <dir> [--grid T,H,W] [--steps N] [--golden <dir>] [--cmaddr <addr>]";
 
 fn main() {
     match run() {
@@ -246,6 +264,151 @@ fn stamped(
     }))
 }
 
+/// `--reading`: a stream reading's steps on the program, the host's ops the engine's.
+fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
+    use engine_cerebras::reading::{Denoise, Reading};
+    let need = |k: &str| get.get(k).cloned().ok_or_else(|| USAGE.to_string());
+    let reading = Reading::open(Path::new(&need("reading")?))?;
+    let trace = reading.trace()?;
+    let grid: Option<[u32; 3]> = match get.get("grid") {
+        Some(g) => {
+            let v: Vec<u32> = g
+                .split(',')
+                .map(|x| x.parse().map_err(|e| format!("--grid {g}: {e}")))
+                .collect::<Result<_, String>>()?;
+            Some(<[u32; 3]>::try_from(v).map_err(|_| format!("--grid {g}: T,H,W"))?)
+        }
+        None => None,
+    };
+    let dir = need("inputs")?;
+    let read_f32 = |p: &Path| -> Result<Vec<f32>, String> {
+        let b = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        Ok(b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    };
+    let mut inputs: Vec<(String, Vec<f32>)> = Vec::new();
+    for i in &trace.inputs {
+        let p = Path::new(&dir).join(format!("{}.f32", i.name));
+        if p.is_file() {
+            inputs.push((i.name.clone(), read_f32(&p)?));
+        }
+    }
+    let mut host = engine_cpu::Forward::host(trace.clone());
+    if let Some(out) = get.get("entries") {
+        let step = reading.step(&trace, grid, &inputs);
+        let entries = reading.entries(&mut host, &step)?;
+        std::fs::create_dir_all(out).map_err(|e| format!("{out}: {e}"))?;
+        for (a, e) in reading.h2d.iter().zip(&entries) {
+            let Some(e) = e else { continue };
+            let name = a.file.file_name().ok_or("an h2d file")?;
+            let shape = [a.rect.h as usize, a.rect.w as usize, a.len];
+            kernels_cerebras::npy::write_f32(&Path::new(out).join(name), &shape, e)?;
+        }
+        println!("READING entries written to {out}");
+        return Ok(true);
+    }
+    let program = need("program")?;
+    let steps = get
+        .get("steps")
+        .map_or(Ok(1), |v| v.parse::<u32>())
+        .map_err(|e| format!("--steps: {e}"))?;
+    let image_rows = reading
+        .classes
+        .iter()
+        .zip(&reading.step(&trace, grid, &inputs).lanes)
+        .filter(|(_, l)| l.clip.is_some())
+        .map(|(c, _)| c.rows)
+        .sum::<u32>();
+    let d = Denoise::of(&reading.model, steps, Some(image_rows))?;
+    let platform = match get.get("cmaddr") {
+        Some(c) => Platform::System { cmaddr: c.clone() },
+        None => Platform::Simulator(Simulator {
+            num_threads: 8,
+            ..Simulator::new(Target::Wse3)
+        }),
+    };
+    let sdk = Sdk::open().map_err(|e| e.to_string())?;
+    let golden = get.get("golden").map(std::path::PathBuf::from);
+    let rel_cos = |a: &[f32], b: &[f32]| {
+        let dot = |x: &[f32], y: &[f32]| -> f64 {
+            x.iter()
+                .zip(y)
+                .map(|(p, q)| f64::from(*p) * f64::from(*q))
+                .sum()
+        };
+        let diff: Vec<f32> = a.iter().zip(b).map(|(x, y)| x - y).collect();
+        (
+            (dot(&diff, &diff) / dot(b, b)).sqrt(),
+            dot(a, b) / (dot(a, a) * dot(b, b)).sqrt(),
+        )
+    };
+    println!(
+        "READING {} {}: sigmas {:?}",
+        reading.model, reading.reading, d.sigmas
+    );
+    let mut ok = true;
+    let lanes = reading.classes.len();
+    let x0 = inputs
+        .iter()
+        .find(|(n, _)| *n == d.latent)
+        .map(|(_, v)| v.clone())
+        .ok_or("no latent input")?;
+    let (_, vs) = d.run(&mut inputs, lanes, |i, ins| {
+        let step = reading.step(&trace, grid, ins);
+        let entries = reading.entries(&mut host, &step)?;
+        let t0 = std::time::Instant::now();
+        let mut rt = Runtime::new(
+            sdk.clone(),
+            Path::new(&program),
+            platform.clone(),
+            "WARNING",
+        )
+        .map_err(|e| e.to_string())?;
+        rt.load();
+        rt.run();
+        let (got, cycles) = reading.fire(&mut rt, &entries)?;
+        rt.stop();
+        drop(rt);
+        let back = reading.rows_back(&got)?;
+        let v = reading
+            .finish(&mut host, &trace, &step, &back, &[d.velocity.as_str()])?
+            .remove(0);
+        let mut line = json!({"step": i, "sigma": d.sigmas[i], "cycles": cycles,
+            "wall_s": t0.elapsed().as_secs(), "finite": v.iter().all(|x| x.is_finite())});
+        if let Some(g) = &golden {
+            let p = g.join(format!("cpu_velocity{i}.f32"));
+            if p.is_file() {
+                let (rel, cos) = rel_cos(&v, &read_f32(&p)?);
+                ok &= rel <= 1e-2 && cos >= 0.999;
+                line["velocity"] = json!({"rel_l2": rel, "cosine": cos});
+            }
+        }
+        println!("READING_STEP {line}");
+        Ok(v)
+    })?;
+    // each step's latent, from the velocities the program gave
+    let mut x = x0;
+    for (i, v) in vs.iter().enumerate() {
+        let dt = d.sigmas[i + 1] - d.sigmas[i];
+        for (x, v) in x.iter_mut().zip(v) {
+            *x += dt * v;
+        }
+        if let Some(g) = &golden {
+            let p = g.join(format!("cpu_latent{}.f32", i + 1));
+            if p.is_file() {
+                let (rel, cos) = rel_cos(&x, &read_f32(&p)?);
+                ok &= rel <= 1e-2 && cos >= 0.999;
+                println!(
+                    "READING_LATENT {}",
+                    json!({"after": i + 1, "rel_l2": rel, "cosine": cos})
+                );
+            }
+        }
+    }
+    Ok(ok)
+}
+
 fn run() -> Result<bool, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut get = HashMap::new();
@@ -256,6 +419,9 @@ fn run() -> Result<bool, String> {
             }
             _ => return Err(USAGE.into()),
         }
+    }
+    if get.contains_key("reading") {
+        return reading(&get);
     }
     let need = |k: &str| get.get(k).cloned().ok_or_else(|| USAGE.to_string());
     let num = |k: &str, d: usize| -> Result<usize, String> {
