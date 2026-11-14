@@ -2744,6 +2744,7 @@ impl Pools {
                 // SAFETY: whole pages inside a read-only file mapping the
                 // weight store holds for the load's life; the advice drops
                 // their resident copies, which a later read faults back in.
+                #[cfg(unix)]
                 unsafe {
                     libc::madvise(
                         first as *mut core::ffi::c_void,
