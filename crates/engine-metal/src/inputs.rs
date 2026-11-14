@@ -203,9 +203,137 @@ pub fn group_mask_bytes(ragged: usize, tokens: u32, lanes: u32) -> u64 {
     ragged as u64 * (indptr.next_multiple_of(ALIGN) + bits.next_multiple_of(ALIGN))
 }
 
+/// Where a fire's staged inputs lie: `bytes` from `local` of `view` as
+/// kernels bind them, written on the host through `host` (the bytes'
+/// host address, contiguous runs of it) or, where it is a buffer of its
+/// own, through the buffer.
+#[derive(Debug)]
+pub struct Region {
+    view: Buffer,
+    local: u64,
+    bytes: u64,
+    /// `(from, len, address)`: the region's bytes from `from` lie at
+    /// `address` on the host. Empty for a region that is its buffer.
+    host: Vec<(u64, u64, std::ptr::NonNull<u8>)>,
+}
+
+// SAFETY: the host addresses are the heaps' shared aliases, written only
+// on the thread that stages a fire, where no frame reads them.
+unsafe impl Send for Region {}
+
+impl Region {
+    /// A buffer of its own, the whole of it.
+    #[must_use]
+    pub fn of(buffer: Buffer) -> Region {
+        Region {
+            local: 0,
+            bytes: buffer.bytes(),
+            view: buffer,
+            host: Vec::new(),
+        }
+    }
+
+    /// `bytes` from `local` of `view`, written through `host`.
+    #[must_use]
+    pub fn at_place(
+        view: Buffer,
+        local: u64,
+        bytes: u64,
+        host: Vec<(u64, u64, std::ptr::NonNull<u8>)>,
+    ) -> Region {
+        Region {
+            view,
+            local,
+            bytes,
+            host,
+        }
+    }
+
+    /// The buffer kernels bind.
+    #[must_use]
+    pub fn view(&self) -> &Buffer {
+        &self.view
+    }
+
+    /// Where byte `at` of the region lies in the view.
+    #[must_use]
+    pub fn at(&self, at: u64) -> u64 {
+        self.local + at
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn walk(
+        &self,
+        at: u64,
+        len: u64,
+        mut piece: impl FnMut(std::ptr::NonNull<u8>, u64, u64),
+    ) -> Result<()> {
+        if at.saturating_add(len) > self.bytes {
+            return Err(Fault::Ceiling {
+                what: "bytes of a fire's staged inputs",
+                need: at.saturating_add(len),
+                have: self.bytes,
+            });
+        }
+        let mut done = 0;
+        while done < len {
+            let here = at + done;
+            let (from, run, address) = *self
+                .host
+                .iter()
+                .find(|(from, run, _)| here >= *from && here < from + run)
+                .ok_or(Fault::Ceiling {
+                    what: "host-mapped bytes of a fire's staged inputs",
+                    need: here + 1,
+                    have: self.bytes,
+                })?;
+            let take = (len - done).min(from + run - here);
+            // SAFETY: `here - from < run`, inside the run's mapped bytes.
+            let at = unsafe { address.add(usize::try_from(here - from).unwrap_or(usize::MAX)) };
+            piece(at, done, take);
+            done += take;
+        }
+        Ok(())
+    }
+
+    pub fn write(&mut self, at: u64, from: &[u8]) -> Result<()> {
+        if self.host.is_empty() {
+            return self.view.write(self.local + at, from);
+        }
+        self.walk(at, from.len() as u64, |to, done, take| {
+            // SAFETY: `walk` hands `take` mapped bytes at `to`, distinct
+            // from `from`'s host allocation.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    from.as_ptr()
+                        .add(usize::try_from(done).unwrap_or(usize::MAX)),
+                    to.as_ptr(),
+                    usize::try_from(take).unwrap_or(usize::MAX),
+                );
+            }
+        })
+    }
+
+    pub fn zero_span(&mut self, at: u64, len: u64) -> Result<()> {
+        if self.host.is_empty() {
+            return self.view.zero_span(self.local + at, len);
+        }
+        self.walk(at, len, |to, _, take| {
+            // SAFETY: as `write`.
+            unsafe {
+                std::ptr::write_bytes(to.as_ptr(), 0, usize::try_from(take).unwrap_or(usize::MAX));
+            }
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct Inputs {
-    store: Buffer,
+    store: Region,
     tokens: u64,
     positions: u64,
     windows: u64,
@@ -383,7 +511,7 @@ impl Inputs {
 
         let store = Buffer::zeroed(device, total)?;
         Ok(Inputs {
-            store,
+            store: Region::of(store),
             tokens,
             positions,
             windows,
@@ -495,12 +623,13 @@ impl Inputs {
         self.seats
             .iter()
             .find(|at| at.seat.id == id)
-            .map(|at| (&self.store, at.at))
+            .map(|at| (self.store.view(), self.store.at(at.at)))
     }
 
     #[must_use]
     pub fn voxel_payload(&self) -> Option<(&Buffer, u64)> {
-        self.voxels.map(|at| (&self.store, at.payload))
+        self.voxels
+            .map(|at| (self.store.view(), self.store.at(at.payload)))
     }
 
     #[must_use]
@@ -702,22 +831,31 @@ impl Inputs {
                     .unwrap_or(u32::MAX);
                 Some(PatchHandles {
                     patches: Tensor::new(
-                        handles.bind(&self.store, at.payload, staged.payload.len() as u64)?,
+                        handles.bind(
+                            self.store.view(),
+                            self.store.at(at.payload),
+                            staged.payload.len() as u64,
+                        )?,
                         rows32,
                         width,
                         seat.dtype,
                     ),
                     segments: i32s(
                         handles,
-                        &self.store,
-                        at.segments,
+                        self.store.view(),
+                        self.store.at(at.segments),
                         staged.segments.len() as u32,
                     )?,
-                    routes: i32s(handles, &self.store, at.routes, staged.routes.len() as u32)?,
+                    routes: i32s(
+                        handles,
+                        self.store.view(),
+                        self.store.at(at.routes),
+                        staged.routes.len() as u32,
+                    )?,
                     positions: Tensor::new(
                         handles.bind(
-                            &self.store,
-                            at.positions,
+                            self.store.view(),
+                            self.store.at(at.positions),
                             staged.positions.len() as u64 * 4,
                         )?,
                         rows32,
@@ -725,7 +863,11 @@ impl Inputs {
                         Dtype::I32,
                     ),
                     grids: Tensor::new(
-                        handles.bind(&self.store, at.grids, staged.grids.len() as u64 * 4)?,
+                        handles.bind(
+                            self.store.view(),
+                            self.store.at(at.grids),
+                            staged.grids.len() as u64 * 4,
+                        )?,
                         staged.grids.len() as u32 / AXES as u32,
                         AXES as u32,
                         Dtype::I32,
@@ -746,7 +888,11 @@ impl Inputs {
                 }
                 self.store.write(at, bytes_of(triples))?;
                 Some(Tensor::new(
-                    handles.bind(&self.store, at, triples.len() as u64 * 4)?,
+                    handles.bind(
+                        self.store.view(),
+                        self.store.at(at),
+                        triples.len() as u64 * 4,
+                    )?,
                     triples.len() as u32 / AXES as u32,
                     AXES as u32,
                     Dtype::I32,
@@ -766,7 +912,12 @@ impl Inputs {
             }
             self.store
                 .write(self.group_of_lane, bytes_of(fire.group_of_lane))?;
-            Some(i32s(handles, &self.store, self.group_of_lane, lanes)?)
+            Some(i32s(
+                handles,
+                self.store.view(),
+                self.store.at(self.group_of_lane),
+                lanes,
+            )?)
         };
         if fire.packings.len() != self.packings.len() {
             return Err(Fault::Ceiling {
@@ -810,9 +961,24 @@ impl Inputs {
             rows_table(&mut scratch, staged.permutation, rows);
             self.store.write(at.permutation, bytes_of(&scratch))?;
             packings.push(PackingHandles {
-                group_indptr: i32s(handles, &self.store, at.group_indptr, lanes + 1)?,
-                lane_indptr: i32s(handles, &self.store, at.lane_indptr, lanes + 1)?,
-                permutation: i32s(handles, &self.store, at.permutation, rows)?,
+                group_indptr: i32s(
+                    handles,
+                    self.store.view(),
+                    self.store.at(at.group_indptr),
+                    lanes + 1,
+                )?,
+                lane_indptr: i32s(
+                    handles,
+                    self.store.view(),
+                    self.store.at(at.lane_indptr),
+                    lanes + 1,
+                )?,
+                permutation: i32s(
+                    handles,
+                    self.store.view(),
+                    self.store.at(at.permutation),
+                    rows,
+                )?,
             });
         }
 
@@ -823,7 +989,7 @@ impl Inputs {
             inputs.push((
                 seat.id,
                 Tensor::new(
-                    handles.bind(&self.store, at.at, at.bytes)?,
+                    handles.bind(self.store.view(), self.store.at(at.at), at.bytes)?,
                     carved,
                     seat.width,
                     seat.dtype,
@@ -885,8 +1051,8 @@ impl Inputs {
                 Some(VoxelHandles {
                     payload: Tensor::new(
                         handles.bind(
-                            &self.store,
-                            at.payload,
+                            self.store.view(),
+                            self.store.at(at.payload),
                             seat.rows * seat.channels * element,
                         )?,
                         voxel_rows,
@@ -894,7 +1060,7 @@ impl Inputs {
                         seat.dtype,
                     ),
                     grid: Tensor::new(
-                        handles.bind(&self.store, at.grid, clips * 4 * 4)?,
+                        handles.bind(self.store.view(), self.store.at(at.grid), clips * 4 * 4)?,
                         clips32,
                         4,
                         Dtype::I32,
@@ -902,14 +1068,18 @@ impl Inputs {
                     token_grid: seat.token_patch.is_some().then(|| {
                         Tensor::new(
                             handles
-                                .bind(&self.store, at.token_grid, clips * 4 * 4)
+                                .bind(
+                                    self.store.view(),
+                                    self.store.at(at.token_grid),
+                                    clips * 4 * 4,
+                                )
                                 .expect("a handle"),
                             clips32,
                             4,
                             Dtype::I32,
                         )
                     }),
-                    slots: i32s(handles, &self.store, at.slots, clips32)?,
+                    slots: i32s(handles, self.store.view(), self.store.at(at.slots), clips32)?,
                 })
             }
         };
@@ -926,62 +1096,127 @@ impl Inputs {
             self.store
                 .write(at.write_offset, bytes_of(&geometry.write_offset))?;
             page_tables.push(TableHandles {
-                indptr: i32s(handles, &self.store, at.indptr, lanes + 1)?,
+                indptr: i32s(
+                    handles,
+                    self.store.view(),
+                    self.store.at(at.indptr),
+                    lanes + 1,
+                )?,
                 indices: i32s(
                     handles,
-                    &self.store,
-                    at.indices,
+                    self.store.view(),
+                    self.store.at(at.indices),
                     geometry.indices.len() as u32,
                 )?,
-                last_page_len: i32s(handles, &self.store, at.last_page_len, lanes)?,
-                kv_len: i32s(handles, &self.store, at.kv_len, lanes)?,
-                write_page: u32s(handles, &self.store, at.write_page, rows)?,
-                write_offset: u32s(handles, &self.store, at.write_offset, rows)?,
+                last_page_len: i32s(
+                    handles,
+                    self.store.view(),
+                    self.store.at(at.last_page_len),
+                    lanes,
+                )?,
+                kv_len: i32s(handles, self.store.view(), self.store.at(at.kv_len), lanes)?,
+                write_page: u32s(
+                    handles,
+                    self.store.view(),
+                    self.store.at(at.write_page),
+                    rows,
+                )?,
+                write_offset: u32s(
+                    handles,
+                    self.store.view(),
+                    self.store.at(at.write_offset),
+                    rows,
+                )?,
             });
         }
 
         Ok(Handles {
-            tokens: i32s(handles, &self.store, self.tokens, rows)?,
-            positions: i32s(handles, &self.store, self.positions, rows)?,
-            windows: handles.bind(&self.store, self.windows, fire.windows.len() as u64 * 4)?,
+            tokens: i32s(handles, self.store.view(), self.store.at(self.tokens), rows)?,
+            positions: i32s(
+                handles,
+                self.store.view(),
+                self.store.at(self.positions),
+                rows,
+            )?,
+            windows: handles.bind(
+                self.store.view(),
+                self.store.at(self.windows),
+                fire.windows.len() as u64 * 4,
+            )?,
             page_tables,
-            slot_ids: i32s(handles, &self.store, self.slot_ids, lanes)?,
-            slot_of_row: i32s(handles, &self.store, self.slot_of_row, rows)?,
-            lane_bands: bands(handles, &self.store, self.slot_ids, &self.bands, lanes)?,
-            row_bands: bands(handles, &self.store, self.slot_of_row, &self.bands, rows)?,
+            slot_ids: i32s(
+                handles,
+                self.store.view(),
+                self.store.at(self.slot_ids),
+                lanes,
+            )?,
+            slot_of_row: i32s(
+                handles,
+                self.store.view(),
+                self.store.at(self.slot_of_row),
+                rows,
+            )?,
+            lane_bands: bands(
+                handles,
+                self.store.view(),
+                self.store.at(self.slot_ids),
+                &self.bands,
+                lanes,
+            )?,
+            row_bands: bands(
+                handles,
+                self.store.view(),
+                self.store.at(self.slot_of_row),
+                &self.bands,
+                rows,
+            )?,
             adapter_routes: match adapter_routes {
                 None => None,
-                Some(rows) => Some(i32s(handles, &self.store, self.adapter_routes, rows)?),
+                Some(rows) => Some(i32s(
+                    handles,
+                    self.store.view(),
+                    self.store.at(self.adapter_routes),
+                    rows,
+                )?),
             },
             row_valid: Tensor::new(
-                handles.bind(&self.store, self.row_valid, u64::from(rows))?,
+                handles.bind(
+                    self.store.view(),
+                    self.store.at(self.row_valid),
+                    u64::from(rows),
+                )?,
                 rows,
                 1,
                 Dtype::U8,
             ),
-            request_of_token: i32s(handles, &self.store, self.request_of_token, rows)?,
+            request_of_token: i32s(
+                handles,
+                self.store.view(),
+                self.store.at(self.request_of_token),
+                rows,
+            )?,
             readout_rows: i32s(
                 handles,
-                &self.store,
-                self.readout_rows,
+                self.store.view(),
+                self.store.at(self.readout_rows),
                 fire.readout_rows.len() as u32,
             )?,
             readout_positions: i32s(
                 handles,
-                &self.store,
-                self.readout_positions,
+                self.store.view(),
+                self.store.at(self.readout_positions),
                 fire.readout_rows.len() as u32,
             )?,
             readout_request_of_token: i32s(
                 handles,
-                &self.store,
-                self.readout_request_of_token,
+                self.store.view(),
+                self.store.at(self.readout_request_of_token),
                 fire.readout_rows.len() as u32,
             )?,
             readout_mask_enabled: Tensor::new(
                 handles.bind(
-                    &self.store,
-                    self.readout_mask_enabled,
+                    self.store.view(),
+                    self.store.at(self.readout_mask_enabled),
                     fire.readout_rows.len() as u64,
                 )?,
                 fire.readout_rows.len() as u32,
@@ -994,8 +1229,8 @@ impl Inputs {
             voxels,
             mask: Tensor::new(
                 handles.bind(
-                    &self.store,
-                    self.mask_planes,
+                    self.store.view(),
+                    self.store.at(self.mask_planes),
                     u64::from(rows) * u64::from(stride),
                 )?,
                 rows,
@@ -1003,7 +1238,11 @@ impl Inputs {
                 Dtype::U8,
             ),
             mask_enabled: Tensor::new(
-                handles.bind(&self.store, self.mask_enabled, u64::from(rows))?,
+                handles.bind(
+                    self.store.view(),
+                    self.store.at(self.mask_enabled),
+                    u64::from(rows),
+                )?,
                 rows,
                 1,
                 Dtype::U8,
@@ -1012,12 +1251,22 @@ impl Inputs {
             patches,
             mrope_positions,
             rs_replay: if rs_tables {
-                Some(i32s(handles, &self.store, self.rs_replay, lanes)?)
+                Some(i32s(
+                    handles,
+                    self.store.view(),
+                    self.store.at(self.rs_replay),
+                    lanes,
+                )?)
             } else {
                 None
             },
             rs_commit: if rs_tables {
-                Some(i32s(handles, &self.store, self.rs_commit, lanes)?)
+                Some(i32s(
+                    handles,
+                    self.store.view(),
+                    self.store.at(self.rs_commit),
+                    lanes,
+                )?)
             } else {
                 None
             },
@@ -1031,7 +1280,11 @@ impl Inputs {
                         .iter()
                         .map(|&w| {
                             let ints = lanes * max * (1 + w);
-                            let buf = handles.bind(&self.store, at, u64::from(ints.max(1)) * 4)?;
+                            let buf = handles.bind(
+                                self.store.view(),
+                                self.store.at(at),
+                                u64::from(ints.max(1)) * 4,
+                            )?;
                             at += u64::from(ints) * 4;
                             Ok(Tensor::new(buf, ints.max(1), 1, Dtype::I32))
                         })
@@ -1042,8 +1295,8 @@ impl Inputs {
             rs_snaps: match fire.rs_snaps {
                 Some(snaps) => Some(i32s(
                     handles,
-                    &self.store,
-                    self.rs_snaps,
+                    self.store.view(),
+                    self.store.at(self.rs_snaps),
                     snaps.len() as u32,
                 )?),
                 None => None,
@@ -1051,8 +1304,8 @@ impl Inputs {
             rs_pages: match fire.rs_pages {
                 Some(pages) => Some(i32s(
                     handles,
-                    &self.store,
-                    self.rs_pages,
+                    self.store.view(),
+                    self.store.at(self.rs_pages),
                     pages.len() as u32,
                 )?),
                 None => None,
