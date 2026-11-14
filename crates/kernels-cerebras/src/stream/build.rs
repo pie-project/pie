@@ -367,6 +367,9 @@ pub fn program_at(
         let mut blk = Vec::new();
         for (side, nodes) in st.sides.iter().zip(&st.nodes) {
             let word = prog.classes[side.classes[0]].word;
+            // a side of several classes leaves what any of them reads after it (the last
+            // single block's rows reach the exit by the image class alone)
+            let words: Vec<u64> = side.classes.iter().map(|&c| prog.classes[c].word).collect();
             let cname: Vec<&str> = side
                 .classes
                 .iter()
@@ -375,7 +378,7 @@ pub fn program_at(
             let rows = side.classes.iter().map(|&c| prog.classes[c].rows).sum();
             let mut u = unit::lower(
                 trace,
-                &[word],
+                &words,
                 &format!("{tag}.{}", cname.join("+")),
                 nodes,
                 &host,
