@@ -21,6 +21,10 @@ pub use paged::*;
 /// positions and owning request, and the custom-mask plane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodePlan<T> {
+    /// Each lane's keys once this fire lands (`have + rows`), i32: where a
+    /// wide row's keys end.
+    pub kv_len: T,
+
     pub positions: T,
 
     pub request_of_token: T,
@@ -34,6 +38,10 @@ pub struct DecodePlan<T> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefillPlan<T> {
+    /// Each lane's keys once this fire lands (`have + rows`), i32: where a
+    /// wide row's keys end.
+    pub kv_len: T,
+
     pub positions: T,
 
     pub request_of_token: T,

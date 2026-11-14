@@ -71,7 +71,6 @@ pub struct PullLane {
     pub ticket_offset: u32,
     pub ticket_count: u32,
     pub initial_commit: u32,
-    pub diagnose: u32,
 }
 
 const _: () = assert!(
