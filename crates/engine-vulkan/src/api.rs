@@ -118,7 +118,9 @@ impl Host for Api {
 
     /// Before the step resolves its inputs: the forward reads the cells a prologue put.
     fn run_prologues(gpu: &mut Vulkan, step: &Step) -> EngineResult<()> {
-        for attachment in program_attachments(step) {
+        #[cfg(feature = "vulkan")]
+        let places = scratch_places(gpu, step)?;
+        for (_at, attachment) in program_attachments(step).enumerate() {
             if !gpu.programs.prologue_runs(attachment.instance) {
                 continue;
             }
@@ -130,6 +132,8 @@ impl Host for Api {
                     gpu.shell.as_ref().map(Shell::device),
                     #[cfg(feature = "vulkan")]
                     Vec::new(),
+                    #[cfg(feature = "vulkan")]
+                    places.get(_at).map(|(buffer, base)| (buffer, *base)),
                 )
                 .map_err(refusal)?;
         }
@@ -178,10 +182,12 @@ fn reads_on_device(gpu: &Vulkan, step: &Step, landed: &Landed) -> bool {
 }
 
 fn run_attachments(gpu: &mut Vulkan, step: &Step, landed: &Landed) -> EngineResult<()> {
+    #[cfg(feature = "vulkan")]
+    let places = scratch_places(gpu, step)?;
     let Vulkan {
         shell, programs, ..
     } = gpu;
-    for attachment in program_attachments(step) {
+    for (_at, attachment) in program_attachments(step).enumerate() {
         #[cfg(feature = "vulkan")]
         let (device, seats) = match shell.as_ref() {
             Some(shell) => (Some(shell.device()), lane_seats(shell, landed, attachment)),
@@ -195,6 +201,8 @@ fn run_attachments(gpu: &mut Vulkan, step: &Step, landed: &Landed) -> EngineResu
                 device,
                 #[cfg(feature = "vulkan")]
                 seats,
+                #[cfg(feature = "vulkan")]
+                places.get(_at).map(|(buffer, base)| (buffer, *base)),
             )
             .map_err(refusal)?;
     }
@@ -230,6 +238,7 @@ fn defer_attachment(
 ) -> EngineResult<()> {
     #[cfg(feature = "vulkan")]
     {
+        let places = scratch_places(gpu, step)?;
         let Vulkan {
             shell,
             programs,
@@ -243,7 +252,16 @@ fn defer_attachment(
         let seats = lane_seats(shell, landed, attachment);
         let done = sink.clone().map(|sink| Done { at, sink });
         programs
-            .fire_deferred(attachment.instance, shell.device(), seats, done)
+            .fire_deferred(
+                attachment.instance,
+                shell.device(),
+                seats,
+                done,
+                places
+                    .first()
+                    .map(|(buffer, base)| (buffer, *base))
+                    .ok_or_else(|| Error::Invalid("a deferred pass with no attachment".into()))?,
+            )
             .map_err(refusal)
     }
     #[cfg(not(feature = "vulkan"))]
@@ -251,6 +269,33 @@ fn defer_attachment(
         let _ = (gpu, step, at, landed);
         Err(Error::unsupported("vulkan", "a deferred guest pass"))
     }
+}
+
+/// Where each program attachment of `step` (in order) has its instance's
+/// value scratch in the activation span: one under another below the
+/// chunks stated for the rung that holds the step, as the runtime funds
+/// the programs' fire terms there.
+#[cfg(feature = "vulkan")]
+fn scratch_places(gpu: &Vulkan, step: &Step) -> EngineResult<Vec<(crate::device::Buffer, u64)>> {
+    let Some(shell) = gpu.shell.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let tokens: usize = step.lanes.iter().map(|lane| lane.tokens.len()).sum();
+    let rows = u32::try_from(tokens.max(step.lanes.len())).unwrap_or(u32::MAX);
+    let (buffer, mut top) = shell.guest_top(rows).map_err(fault)?;
+    let mut places = Vec::new();
+    for attachment in program_attachments(step) {
+        let bytes = gpu.programs.scratch_bytes(attachment.instance);
+        top = top.checked_sub(bytes).ok_or_else(|| {
+            fault(engine_gpu::error::Fault::Ceiling {
+                what: "bytes of the span under the rung's chunks for the guests' scratch",
+                need: bytes,
+                have: top,
+            })
+        })?;
+        places.push((buffer.clone(), top));
+    }
+    Ok(places)
 }
 
 /// What step `landed` read out for each lane of `attachment`, its pixels among them.

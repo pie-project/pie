@@ -2019,6 +2019,15 @@ impl<B: Serve> Shell<B> {
             .adapted_word(&self.corrected, bit, word)
     }
 
+    /// Where the guest programs' value scratch of a fire of `tokens` rows
+    /// (and as many lanes at most) ends: the span's buffer and the byte the
+    /// lanes' scratch lies under, one under another
+    /// ([`crate::arena::Span::guest_top`]).
+    pub fn guest_top(&self, tokens: u32) -> Result<(B::Buffer, u64)> {
+        let (buffer, top) = self.span.guest_top(tokens)?;
+        Ok((buffer.clone(), top))
+    }
+
     #[must_use]
     pub fn serves_rs_verbs(&self) -> bool {
         self.rs_layout.is_some()

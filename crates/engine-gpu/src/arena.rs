@@ -116,6 +116,10 @@ pub struct Span<B: Backend> {
     /// For each rung, the carve its fires take ([`Span::widen`]).
     widest: Vec<usize>,
     routers: Vec<u32>,
+    /// The rungs the pool states, `(tokens, chunks)`, and its chunk's
+    /// bytes ([`Span::widen`]).
+    stated: Vec<(u32, u32)>,
+    chunk_bytes: u64,
     /// The pool's last segment and the byte in it the span ends at.
     place: Option<(B::Buffer, u64)>,
 }
@@ -147,6 +151,8 @@ impl<B: Backend> Span<B> {
             widest: (0..rungs.len()).collect(),
             rungs,
             routers,
+            stated: Vec::new(),
+            chunk_bytes: 0,
             place: None,
         })
     }
@@ -225,6 +231,8 @@ impl<B: Backend> Span<B> {
     /// them, where the span lies past the kernels' state index) it lays
     /// out as at the top fire and lends nothing it would not.
     pub fn widen(&mut self, stated: &[(u32, u32)], chunk_bytes: u64) {
+        self.stated = stated.to_vec();
+        self.chunk_bytes = chunk_bytes;
         let room = |tokens: u32| {
             stated
                 .iter()
@@ -241,6 +249,24 @@ impl<B: Backend> Span<B> {
                     .unwrap_or(at)
             })
             .collect();
+    }
+
+    /// Where the guest programs' room of a fire of `tokens` tokens and
+    /// lanes ends in the span's buffer: under the chunks stated for the
+    /// narrowest rung holding it, which its carve lies in. The runtime
+    /// funds the programs' fire terms right under those chunks
+    /// (`FireFacts`, folded into each rung's activation), so their value
+    /// scratch lies there, a lane under another.
+    pub fn guest_top(&self, tokens: u32) -> Result<(&B::Buffer, u64)> {
+        let (buffer, end) = self.placed()?;
+        let chunks = self
+            .stated
+            .iter()
+            .find(|&&(rung, _)| rung >= tokens)
+            .or(self.stated.last())
+            .map_or(0, |&(_, chunks)| u64::from(chunks));
+        let top = end.saturating_sub(chunks * self.chunk_bytes);
+        Ok((buffer, top - top % ALIGN))
     }
 
     /// Where rung `rung`'s carve starts in the span's buffer: the span's

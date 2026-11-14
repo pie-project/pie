@@ -349,6 +349,55 @@ impl Plane {
         })
     }
 
+    /// What a fire carrying lanes of `program` bound at `extents` takes in
+    /// the activation span: each lane its instance's value scratch, every
+    /// stage's one after another ([`crate::guest::session::scratch_bytes`]).
+    /// A program with no device half takes none.
+    pub fn fire_facts(
+        &self,
+        program: ProgramId,
+        extents: &engine::BindExtents,
+    ) -> Result<engine::FireFacts, Refusal> {
+        let plan = self.programs.get(&program).ok_or(Refusal::Closed {
+            what: "program",
+            id: program.0,
+        })?;
+        #[cfg(feature = "vulkan")]
+        if self.forms.get(program).is_some() {
+            let extents = eta_exec::Extents {
+                row_count: extents.row_count,
+                token_count: extents.token_count,
+                sampled_rows: extents.sampled_rows,
+                query_len: extents.query_len,
+                key_len: extents.key_len,
+            };
+            let a_lane = crate::guest::session::scratch_bytes(&plan.package.plans, &extents)
+                .map_err(|fault| Refusal::Program(fault.to_string()))?;
+            return Ok(engine::FireFacts {
+                a_lane,
+                ..engine::FireFacts::default()
+            });
+        }
+        let _ = (plan, extents);
+        Ok(engine::FireFacts::default())
+    }
+
+    /// The bytes of `instance`'s value scratch, which a fire carrying a
+    /// lane of it takes in the span (0 without a device half).
+    #[must_use]
+    pub fn scratch_bytes(&self, instance: InstanceId) -> u64 {
+        #[cfg(feature = "vulkan")]
+        return self
+            .instances
+            .get(&instance)
+            .map_or(0, |seat| seat.session.bytes());
+        #[cfg(not(feature = "vulkan"))]
+        {
+            let _ = instance;
+            0
+        }
+    }
+
     /// The `Channel` slots a registered channel's device cell takes.
     pub fn ring_facts(
         &self,
@@ -709,6 +758,7 @@ impl Plane {
         at: Stage,
         #[cfg(feature = "vulkan")] device: Option<&crate::device::Context>,
         #[cfg(feature = "vulkan")] seats: Vec<Vec<crate::guest::run::Readout<'_>>>,
+        #[cfg(feature = "vulkan")] scratch: Option<(&crate::device::Buffer, u64)>,
     ) -> Result<(), Refusal> {
         let Plane {
             instances,
@@ -746,6 +796,9 @@ impl Plane {
         let (outcome, ran) = {
             let widen = widen.as_ref().expect("the device arm checked for one");
             let session = &mut seat.session;
+            if let Some((buffer, base)) = scratch {
+                session.seat(buffer, base);
+            }
             let mut runner = crate::guest::run::OnDevice::new(device_half, session, widen, seats);
             let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner, at);
             let ran = runner.ran().len();
@@ -827,6 +880,7 @@ impl Plane {
         device: &crate::device::Context,
         seats: Vec<Vec<crate::guest::run::Readout<'_>>>,
         done: Option<engine_gpu::settle::Done>,
+        scratch: (&crate::device::Buffer, u64),
     ) -> Result<(), Refusal> {
         let Plane {
             instances,
@@ -844,6 +898,7 @@ impl Plane {
             ))
         })?;
         let inputs = PassInputs::none();
+        seat.session.seat(scratch.0, scratch.1);
         let mut runner =
             crate::guest::run::OnDevice::new(device, &mut seat.session, widen, seats).deferred();
         let outcome = eta_exec::step_with(
@@ -1041,6 +1096,14 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         place: &Place<'_, crate::device::Api>,
     ) -> Result<ProgramFacts, Refusal> {
         Plane::facts(self, program, place)
+    }
+
+    fn fire_facts(
+        &self,
+        program: ProgramId,
+        extents: &engine::BindExtents,
+    ) -> Result<engine::FireFacts, Refusal> {
+        Plane::fire_facts(self, program, extents)
     }
 
     fn ring_facts(

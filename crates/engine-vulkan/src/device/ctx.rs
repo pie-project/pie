@@ -230,11 +230,14 @@ impl Core {
         let mut laid = self.descriptors.lock().expect("descriptors lock poisoned");
         let sets = laid.sets;
         let pools = laid.pools;
-        laid.free.pop().map(|pool| (pool, sets)).ok_or(Fault::Ceiling {
-            what: "descriptor pools the load laid, one a frame in flight or kept to replay",
-            need: u64::from(pools) + 1,
-            have: u64::from(pools),
-        })
+        laid.free
+            .pop()
+            .map(|pool| (pool, sets))
+            .ok_or(Fault::Ceiling {
+                what: "descriptor pools the load laid, one a frame in flight or kept to replay",
+                need: u64::from(pools) + 1,
+                have: u64::from(pools),
+            })
     }
 
     /// A dropped frame's pool, reset, for the next frame; `bound` the sets
@@ -459,7 +462,10 @@ impl Drop for Core {
                 self.device.destroy_command_pool(pool, None);
             }
             // Every frame has given its descriptor pool back by now.
-            let laid = self.descriptors.get_mut().expect("descriptors lock poisoned");
+            let laid = self
+                .descriptors
+                .get_mut()
+                .expect("descriptors lock poisoned");
             for pool in std::mem::take(&mut laid.free) {
                 self.device.destroy_descriptor_pool(pool, None);
             }
@@ -1166,9 +1172,15 @@ impl Context {
             });
         }
         let sets = sets.max(SETS_PER_BATCH);
-        let sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(sets.saturating_mul(BUFFERS_PER_SET))];
+        // A guest stage's set binds its config as a uniform, one a set.
+        let sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(sets.saturating_mul(BUFFERS_PER_SET)),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(sets),
+        ];
         for _ in 0..frames {
             // SAFETY: `core.device` is live and the create info is complete.
             let pool = unsafe {

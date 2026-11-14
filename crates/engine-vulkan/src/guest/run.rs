@@ -104,6 +104,11 @@ impl<'a> OnDevice<'a> {
             Some(frame) => frame,
             None => self.device.frame()?,
         };
+        // The pass's value scratch lies in the activation span: it is
+        // zeroed before the pass's first stage writes anything there.
+        if self.ran.is_empty() {
+            self.session.zero(&mut frame)?;
+        }
 
         for &global in roots {
             let Some(local) = local_of(package, at, global)? else {
@@ -133,20 +138,23 @@ impl<'a> OnDevice<'a> {
                         ),
                     });
                 }
-                let heap = self.session.heap(at).ok_or_else(|| Fault::Program {
-                    at: "guest::run",
-                    why: format!("stage {at} has no heap"),
-                })?;
+                let (heap, base) = self.session.heap(at)?;
+                let heap = heap.clone();
                 let (into, _) = self
                     .session
                     .span(at, local)
                     .expect("the span was just read");
                 if seat.dtype != Dtype::Bf16 {
-                    let heap = heap.clone();
-                    frame.copy(seat.seat, seat.at, &heap, into, u64::from(values) * 4)?;
+                    frame.copy(
+                        seat.seat,
+                        seat.at,
+                        &heap,
+                        base + into,
+                        u64::from(values) * 4,
+                    )?;
                 } else {
                     self.widen
-                        .encode(&frame, seat.seat, seat.at, heap, into, values)?;
+                        .encode(&frame, seat.seat, seat.at, &heap, base + into, values)?;
                 }
                 continue;
             }

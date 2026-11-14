@@ -583,6 +583,14 @@ where
         self.programs.facts(program, &place(shell)).map_err(refusal)
     }
 
+    fn fire_facts(
+        &self,
+        program: ProgramId,
+        extents: &engine::BindExtents,
+    ) -> EngineResult<engine::FireFacts> {
+        self.programs.fire_facts(program, extents).map_err(refusal)
+    }
+
     fn ring_facts(
         &self,
         registration: &ChannelRegistration,

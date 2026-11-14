@@ -54,6 +54,17 @@ pub trait Programs<B: Serve>: Default {
     /// `Channel` slots (`Engine::program_facts`).
     fn facts(&self, program: ProgramId, place: &Place<'_, B>) -> Result<ProgramFacts, Refusal>;
 
+    /// What a fire carrying lanes of `program` bound at `extents` needs in
+    /// the activation span beside the model's (`Engine::fire_facts`).
+    fn fire_facts(
+        &self,
+        program: ProgramId,
+        extents: &engine::BindExtents,
+    ) -> Result<engine::FireFacts, Refusal> {
+        let _ = (program, extents);
+        Ok(engine::FireFacts::default())
+    }
+
     /// The `Channel` slots a registered channel takes, if any
     /// (`Engine::ring_facts`).
     fn ring_facts(
