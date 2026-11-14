@@ -1815,6 +1815,11 @@ impl Shell {
         let (guest_state, guest_fire) = self.programs.bytes();
         let entries = [
             (Outside, "before the load", self.outside),
+            (
+                Outside,
+                "pipelines and libraries built (measured)",
+                self.pipelines.built_bytes(),
+            ),
             (Model, "weights", self.weights.bytes()),
             (Model, "weight cache tables", self.pools.table_bytes()),
             (Model, "ngram constants", self.scratch.constant_bytes()),
