@@ -1750,25 +1750,47 @@ fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory:
     let held = footprint(shell, device_total, free_before);
     let mut ledger = Ledger::new(shell.pools.chunk_bytes(1), device_total);
     ledger.enter(Class::Model, "weights", held.weights);
-    ledger.enter(Class::State, "cache rows", held.cache_rows);
+    let workspaces = shell.workspace.as_ref().map_or(0, |workspace| workspace.bytes);
+    let rs_scratch = shell.buffers.as_ref().map_or(0, |buffers| buffers.scratch_bytes());
     ledger.enter(Class::Fire, "activation", held.arena);
-    ledger.enter(
-        Class::Fire,
-        "workspaces",
-        shell.workspace.as_ref().map_or(0, |workspace| workspace.bytes),
-    );
+    ledger.enter(Class::Fire, "workspaces", workspaces);
+    ledger.enter(Class::Fire, "rs scratch", rs_scratch);
+    if crate::device::elastic::mapped_on_demand() {
+        ledger.enter(Class::State, "cache rows", held.cache_rows);
+    } else {
+        // A flat range is backed whole once allocated: the state's chunks
+        // hold the device whether committed or not, and so does the
+        // activation's span past the carve, the workspaces and the rs
+        // scratch laid in it.
+        let span = shell.pools.activation_span_bytes();
+        ledger.enter(
+            Class::State,
+            "cache rows",
+            shell.pools.backed_bytes().saturating_sub(span),
+        );
+        ledger.enter(
+            Class::Fire,
+            "activation span spare",
+            span.saturating_sub(held.arena + workspaces + rs_scratch),
+        );
+    }
     ledger.enter(Class::Fire, "inputs", held.inputs);
     ledger.enter(Class::Fire, "readout rows", held.readout);
     ledger.enter(Class::Fire, "grown slabs", held.scratch);
-    ledger.enter(
-        Class::Fire,
-        "rs scratch",
-        shell.buffers.as_ref().map_or(0, |buffers| buffers.scratch_bytes()),
-    );
+    // The heaps' chunks are this process's whatever load made them, and a
+    // load carves its own cells from them (the readout rows among them),
+    // so they are entered whole, less the cells entered by their owners,
+    // and the device held before the load is entered without them.
+    let heaps = crate::device::held::heap_bytes() as u64;
+    let heaps_before = heaps.saturating_sub(crate::device::held::heap_bytes_since() as u64);
     ledger.enter(
         Class::Outside,
         "heap chunks",
-        crate::device::held::heap_bytes_since() as u64,
+        heaps.saturating_sub(if shell.readout_rows.carved() {
+            held.readout
+        } else {
+            0
+        }),
     );
     ledger.enter(
         Class::Outside,
@@ -1776,7 +1798,29 @@ fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory:
         crate::device::held::kept_bytes() as u64,
     );
     ledger.enter(Class::Outside, "graph bodies", held.bodies);
-    ledger.enter(Class::Outside, "before the load", held.before);
+    ledger.enter(
+        Class::Outside,
+        "before the load",
+        held.before.saturating_sub(heaps_before),
+    );
+    // Where the allocator's own takes are known, the driver's and its
+    // libraries' (streams' queues, code objects) are measured as what the
+    // device holds past them, the bodies apart; the audit then states only
+    // what this load allocated that no owner entered.
+    if let (Some(malloced), Some(free)) = (
+        crate::device::held::malloced_since(),
+        crate::device::alloc::free_bytes(),
+    ) {
+        let in_use = device_total.saturating_sub(free);
+        ledger.enter(
+            Class::Outside,
+            "driver",
+            in_use
+                .saturating_sub(held.before)
+                .saturating_sub(malloced)
+                .saturating_sub(held.bodies),
+        );
+    }
     ledger
 }
 

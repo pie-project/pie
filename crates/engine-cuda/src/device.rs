@@ -42,6 +42,11 @@ pub mod held {
     pub fn heap_mark() {}
 
     #[must_use]
+    pub fn malloced_since() -> Option<u64> {
+        None
+    }
+
+    #[must_use]
     pub fn heap_bytes_since() -> usize {
         0
     }

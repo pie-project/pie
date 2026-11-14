@@ -183,6 +183,12 @@ impl Buffer {
         self.bytes
     }
 
+    /// Whether this is a cell carved from the device heap's chunks.
+    #[must_use]
+    pub const fn carved(&self) -> bool {
+        self.carved.is_some()
+    }
+
     pub fn at(&self, offset: u64) -> Result<u64> {
         if offset > self.bytes as u64 {
             return Err(Fault::Ceiling {

@@ -165,6 +165,7 @@ pub(crate) fn release(arena: u32) {
             // SAFETY: an address this map allocated with `hipMalloc` and
             // handed to nobody who outlives the arena.
             let _ = unsafe { (api.hip.hipFree)(slab.ptr) };
+            crate::hip::rt::freed(slab.ptr);
         }
     }
     for ptr in held.retired {
@@ -172,6 +173,7 @@ pub(crate) fn release(arena: u32) {
             // SAFETY: as above — an address this map allocated and never
             // handed to anything that outlives the arena.
             let _ = unsafe { (api.hip.hipFree)(ptr) };
+            crate::hip::rt::freed(ptr);
         }
     }
 }
@@ -342,6 +344,7 @@ fn grow(
             code,
         });
     }
+    crate::hip::rt::malloced(fresh, want);
     if zero {
         // SAFETY: the slab just allocated, `want` bytes long.
         let code = unsafe { (api.hip.hipMemset)(fresh, 0, want) };
