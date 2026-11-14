@@ -3450,6 +3450,9 @@ impl Pools {
         } else {
             self.chunks.segments_for(u64::from(fitted))
         };
+        // The fit that sized these chunks ran in this same step of the
+        // load, so the card holds them: a refusal here is a fit that
+        // counted wrong, and the load says so.
         match self.chunks.commit_segments(&mut self.pool, segments)? {
             Commit::Committed => {}
             refusal => return Err(refuse(&self.pool, refusal)),
