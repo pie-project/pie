@@ -126,6 +126,16 @@ pub trait Engine: Send {
         Ok(ProgramFacts::default())
     }
 
+    /// The adapter an instance bound by `binding` lands, by its content: a
+    /// digest of its planes (every bank, in bank-name order). Asked before
+    /// the runtime takes the binding's slots: bindings with one key share
+    /// one set of `Adapter` slots ([`InstanceBinding::adapter_slots`]),
+    /// landed once, freed at the last close. `None`: it lands none.
+    fn adapter_key(&self, binding: &InstanceBinding) -> Result<Option<u128>> {
+        let _ = binding;
+        Ok(None)
+    }
+
     /// What a fire holding lanes of `program` bound at `extents` needs
     /// beside the model's activation, asked before the first bind of those
     /// extents is sent. The default states none.
