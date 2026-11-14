@@ -185,6 +185,20 @@ pub fn forget_process(pid: uuid::Uuid) {
     PROCESS_WANTS.lock().unwrap().remove(&pid);
 }
 
+/// The rows past which a pass asks the activation rung for wider fires
+/// whatever the cap: a decode's few rows never do.
+pub const PASS_ASKS_FROM: usize = 16;
+
+/// Whether a pass of `rows` rows, its fires `wanted` rows wide beside the
+/// live lanes' decodes, asks the rung for them, fires now cut to `cap`:
+/// past [`PASS_ASKS_FROM`] rows, or where the cap cuts its fire narrower
+/// (a pool resting at a small rung). It asks the smallest rung that
+/// covers `wanted` ([`SharedPool::rung_for`]), not past it.
+#[must_use]
+pub fn pass_asks(rows: usize, wanted: u32, cap: u32) -> bool {
+    rows > PASS_ASKS_FROM || wanted > cap
+}
+
 /// The width a fire may take at the rung that holds `rows`: the cap the
 /// walker lifts to there (`u32::MAX` at the largest rung).
 #[must_use]

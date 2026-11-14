@@ -35,6 +35,8 @@ pub struct SharedGrow {
     rung_walk: Arc<std::sync::Mutex<RungWalk>>,
     /// The governor's ticks, counted ([`PoolTarget::ticked`]).
     ticks: Arc<AtomicU64>,
+    /// The lanes live now that may decode ([`Self::walk_rows`]).
+    live_lanes: Arc<dyn Fn() -> u32 + Send + Sync>,
     /// The tick since which the rung has stood past what is asked: a cap
     /// down or a lower waits the governor's patience from it.
     idle_since: Arc<std::sync::Mutex<Option<u64>>>,
@@ -62,7 +64,31 @@ impl SharedGrow {
             rung_walk: Arc::new(std::sync::Mutex::new(RungWalk::default())),
             ticks: Arc::new(AtomicU64::new(0)),
             idle_since: Arc::new(std::sync::Mutex::new(None)),
+            live_lanes: Arc::new(move || {
+                let most = crate::engine::get_spec(engine)
+                    .map_or(usize::MAX, |spec| spec.limits.max_forward_requests);
+                let live = crate::inferlet::process::live_count().min(most);
+                u32::try_from(live).unwrap_or(u32::MAX)
+            }),
         }
+    }
+
+    /// A governor tick; for a test.
+    #[cfg(test)]
+    pub(crate) fn ticked_for_test(&self) {
+        self.ticks.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The lanes live now that may decode, as the walk's floor counts them;
+    /// for a test.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_live_lanes(
+        mut self,
+        live: impl Fn() -> u32 + Send + Sync + 'static,
+    ) -> Self {
+        self.live_lanes = Arc::new(live);
+        self
     }
 
     /// Steps the activation rung toward the rung the passes still to run
@@ -73,18 +99,21 @@ impl SharedGrow {
     /// of room waits on the room the asking pass has the planner free; one
     /// to a rung the engine has not armed waits on its capture
     /// ([`super::rung_goal`]), the walk looking again each poll.
-    /// The rows the walk holds the rung to: what passes ask, and never
-    /// fewer than the widest decode fire (the engine's lane count), whose
-    /// frames the scheduler holds rather than cuts: a rung under it would
-    /// leave a decode batch waiting on a raise nobody funds.
+    /// The rows the walk holds the rung to: what passes and decode batches
+    /// ask ([`super::wanted_rows`]), and never fewer than the lanes live now
+    /// (a live process each, at most the engine's lane count), whose decode
+    /// frames the scheduler holds rather than cuts. The rung never lowers
+    /// under the decode fire the live lanes take, so their decodes never
+    /// wait on a raise nobody funds; a lane joins through its prompt's pass,
+    /// whose funded ask counts the live lanes beside it
+    /// (`pipeline::fire::prefill_want`), and a batch's ask raises at once
+    /// where nothing moves. Not the engine's whole lane count: a pool with
+    /// one live lane rests at a small rung.
     fn walk_rows(&self) -> u32 {
-        let lanes = crate::engine::get_spec(self.engine).map_or(0, |spec| {
-            u32::try_from(spec.limits.max_forward_requests).unwrap_or(u32::MAX)
-        });
-        super::wanted_rows(self.engine).max(lanes)
+        super::wanted_rows(self.engine).max((self.live_lanes)())
     }
 
-    async fn walk_rung(&self) {
+    pub(crate) async fn walk_rung(&self) {
         loop {
             let (current, retired) = self.epochs();
             let (step, goal) = {
@@ -98,7 +127,9 @@ impl SharedGrow {
                 let goal = super::rung_goal(&pool, self.engine, self.walk_rows());
                 // The pool stands past what is asked: it comes down only
                 // once it has for the governor's patience, so a pause
-                // between batches moves no rung.
+                // between batches moves no rung. On a span backed on
+                // demand an idle pool always comes down after it: the
+                // carve held costs resident memory there.
                 let past = pool.pool().act_chunks(goal) < pool.pool().act_reserved();
                 let tick = self.ticks.load(Ordering::Acquire);
                 let forced = super::fire_cap(self.engine) > pool.fit_cap();
