@@ -39,6 +39,10 @@ pub struct Arena {
     arms: u64,
     /// The rung the runtime set: whose regions frames stage in now.
     current: usize,
+    /// Each rung's rs scratch, under its staged regions and over its
+    /// carve: what a fire of the rung's tokens and lanes replays its
+    /// recurrent rows in (0 for a model with none).
+    rs: Vec<u64>,
 }
 
 /// `bytes` on the [`ALIGN`] boundary.
@@ -55,21 +59,23 @@ pub fn io_room((inputs, readout): (u64, u64)) -> u64 {
 }
 
 /// The span's chunks of `chunk_bytes` each rung takes: the `scratch` plane,
-/// `arms` frames' staged regions `io` and its carve, `(tokens, chunks)`
-/// ascending.
+/// `arms` frames' staged regions `io`, its rs scratch `rs` and its carve,
+/// `(tokens, chunks)` ascending.
 #[must_use]
 pub fn act_chunks(
     rungs: &[(u32, ArenaMap)],
     scratch: u64,
     io: &[(u64, u64)],
+    rs: &[u64],
     arms: u64,
     chunk_bytes: u64,
 ) -> Vec<(u32, u32)> {
     rungs
         .iter()
         .zip(io)
-        .map(|((tokens, map), &io)| {
-            let bytes = room(scratch) + arms * io_room(io) + room(map.bytes);
+        .zip(rs)
+        .map(|(((tokens, map), &io), &rs)| {
+            let bytes = room(scratch) + arms * io_room(io) + room(rs) + room(map.bytes);
             (
                 *tokens,
                 u32::try_from(bytes.div_ceil(chunk_bytes.max(1))).unwrap_or(u32::MAX),
@@ -81,8 +87,9 @@ pub fn act_chunks(
 impl Arena {
     /// The arena over the span `[offset, offset + bytes)` of `store`, the
     /// pool's buffer: `scratch` plane bytes at its top, then each rung's
-    /// staged regions (`io`, `arms` frames' of them), then its carve, the
-    /// last rung the whole arena. It starts at the smallest rung.
+    /// staged regions (`io`, `arms` frames' of them), its rs scratch (`rs`)
+    /// and then its carve, the last rung the whole arena. It starts at the
+    /// smallest rung.
     #[must_use]
     pub fn over(
         store: Buffer,
@@ -90,6 +97,7 @@ impl Arena {
         scratch: u64,
         rungs: Vec<(u32, ArenaMap)>,
         io: Vec<(u64, u64)>,
+        rs: Vec<u64>,
         arms: u64,
     ) -> Arena {
         Arena {
@@ -100,6 +108,7 @@ impl Arena {
             io,
             arms: arms.max(1),
             current: 0,
+            rs,
         }
     }
 
@@ -134,6 +143,23 @@ impl Arena {
     /// The staged regions' bytes at rung `index`, every frame's.
     fn io_total(&self, index: usize) -> u64 {
         self.arms * self.io.get(index).copied().map_or(0, io_room)
+    }
+
+    /// What lies over rung `index`'s carve under the plane: its staged
+    /// regions and its rs scratch.
+    fn over_carve(&self, index: usize) -> u64 {
+        self.io_total(index) + room(self.rs.get(index).copied().unwrap_or(0))
+    }
+
+    /// Where the current rung's rs scratch lies in the span's buffer, and
+    /// its bytes.
+    #[must_use]
+    pub fn rs_region(&self) -> (u64, u64) {
+        let bytes = self.rs.get(self.current).copied().unwrap_or(0);
+        (
+            self.scratch_at() - self.io_total(self.current) - room(bytes),
+            bytes,
+        )
     }
 
     /// Where frame `arm`'s staged inputs and readout lie at rung `index` in
@@ -191,9 +217,10 @@ impl Arena {
         &self.rungs[at].1
     }
 
-    /// Where a fire's carve starts under the current rung's staged regions.
+    /// Where a fire's carve starts under the current rung's staged regions
+    /// and rs scratch.
     fn carve_top(&self) -> u64 {
-        self.scratch_at() - self.io_total(self.current)
+        self.scratch_at() - self.over_carve(self.current)
     }
 
     /// The smallest rung's tokens: where the runtime starts an on-demand
@@ -225,14 +252,14 @@ impl Arena {
             lanes: u64::from(tokens),
             ..FireRows::default()
         };
-        self.scratch_at() - self.io_total(self.index(tokens)) - room(self.carve_for(rows).bytes)
+        self.scratch_at() - self.over_carve(self.index(tokens)) - room(self.carve_for(rows).bytes)
     }
 
     /// The bytes from the span's end a fire of `rows` takes at the current
     /// rung: the plane, the rung's staged regions and its carve.
     #[must_use]
     pub fn reach(&self, rows: FireRows) -> u64 {
-        self.scratch + self.io_total(self.current) + room(self.carve_for(rows).bytes)
+        self.scratch + self.over_carve(self.current) + room(self.carve_for(rows).bytes)
     }
 
     /// The bytes from the span's end a rung of `tokens` takes: the plane,
@@ -241,7 +268,7 @@ impl Arena {
     pub fn rung_reach(&self, tokens: u32) -> u64 {
         let index = self.index(tokens);
         self.scratch
-            + self.io_total(index)
+            + self.over_carve(index)
             + self.rungs.get(index).map_or(0, |(_, map)| room(map.bytes))
     }
 
