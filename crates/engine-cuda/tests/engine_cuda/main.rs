@@ -60,6 +60,7 @@ mod a_lane_sampler_draws_what_the_interpreter_draws;
 mod a_missing_or_misshapen_input_feed_is_refused_by_name;
 mod a_nucleus_cut_agrees_with_the_host_interpreter;
 mod a_padded_row_writes_nothing;
+mod a_parked_instance_fires_as_it_did;
 mod a_prefill_past_the_gemvs_grid_is_served;
 mod a_prologue_put_input_is_the_cell_the_forward_reads;
 mod a_prologue_put_port_is_the_cell_the_fire_resolves;

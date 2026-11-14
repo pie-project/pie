@@ -632,6 +632,24 @@ pub enum Tier {
     Disk,
 }
 
+/// A shape whose slots the host tier holds: one of the load's kinds, or a
+/// guest shape (`new-memory/STATE-ROLES.md`), whose slots park and unpark
+/// but are none of the kinds the pool seats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tiered {
+    Kind(Kind),
+    Guest(layout::GuestShape),
+}
+
+impl Tiered {
+    fn name(self) -> String {
+        match self {
+            Tiered::Kind(kind) => kind.name().to_string(),
+            Tiered::Guest(shape) => format!("{:?} slot", shape.role),
+        }
+    }
+}
+
 /// A move of kv pages between the device and their host slots, on the
 /// swap stream, or a tap's read-out: its device pages, the host slots it
 /// reads or writes, and the event it lands at.
@@ -3615,16 +3633,59 @@ impl Pools {
         })
     }
 
-    /// Where host ref `slot` of `kind` lies in the host tier, from its
-    /// start: its chunk, and its place among the chunk's slots.
-    fn tier_offset(&self, kind: Kind, slot: u32) -> Result<u64> {
-        let shape = self.chunks.layout().shape(kind).ok_or_else(|| {
-            Fault::program(
-                "store::chunks",
-                format!("a host slot of a {} in a load that lays none", kind.name()),
-            )
-        })?;
-        let (per_chunk, bytes) = (shape.per_chunk.max(1), shape.slot_bytes);
+    /// The shape the host tier holds slots of that `shape` names: one of
+    /// the load's kinds, or a guest shape, whose slots only park and unpark.
+    fn tiered(&self, shape: engine::chunk::ShapeId) -> Result<Tiered> {
+        use engine::chunk::SlotRole;
+        let guest = match shape {
+            layout::INSTANCE => Some(SlotRole::Instance),
+            layout::CHANNEL => Some(SlotRole::Channel),
+            _ => None,
+        };
+        match guest {
+            Some(role) => self
+                .chunks
+                .layout()
+                .guest(role)
+                .map(Tiered::Guest)
+                .ok_or_else(|| {
+                    Fault::program("store::chunks", format!("no {role:?} shape in this load"))
+                }),
+            None => Ok(Tiered::Kind(Self::kind_of(shape)?)),
+        }
+    }
+
+    /// A slot's bytes of `tiered`, and how many a chunk holds.
+    fn tier_slot(&self, tiered: Tiered) -> Result<(u64, u32)> {
+        match tiered {
+            Tiered::Kind(kind) => self
+                .chunks
+                .layout()
+                .shape(kind)
+                .map(|shape| (shape.slot_bytes, shape.per_chunk.max(1)))
+                .ok_or_else(|| {
+                    Fault::program(
+                        "store::chunks",
+                        format!("a slot copy of a {} in a load that lays none", kind.name()),
+                    )
+                }),
+            Tiered::Guest(shape) => Ok((shape.slot_bytes, shape.per_chunk.max(1))),
+        }
+    }
+
+    /// Where device ref `slot` of `tiered` lies now, `bytes` of it.
+    fn tier_device_span(&self, tiered: Tiered, slot: u32, bytes: u64) -> Result<u64> {
+        match tiered {
+            Tiered::Kind(kind) => self.chunks.span(kind, slot, 0, bytes),
+            Tiered::Guest(shape) => self.chunks.guest_span(shape.role, &[slot], bytes),
+        }
+    }
+
+    /// Where host ref `slot` of `tiered` lies in the host tier, from its
+    /// start: its chunk, and its place among the chunk's slots. Adjacent
+    /// refs of one chunk lie adjacent, so a guest item's run parks as a run.
+    fn tier_offset(&self, tiered: Tiered, slot: u32) -> Result<u64> {
+        let (bytes, per_chunk) = self.tier_slot(tiered)?;
         let chunk = slot / per_chunk;
         let have = self.tier_chunks();
         if chunk >= have {
@@ -3646,14 +3707,7 @@ impl Pools {
         shape: engine::chunk::ShapeId,
         refs: &[u32],
     ) -> Result<(u64, Vec<(u32, u64)>)> {
-        let kind = Self::kind_of(shape)?;
-        let facts = self.chunks.layout().shape(kind).ok_or_else(|| {
-            Fault::program(
-                "store::chunks",
-                format!("a host slot of a {} in a load that lays none", kind.name()),
-            )
-        })?;
-        let (per_chunk, bytes) = (facts.per_chunk.max(1), facts.slot_bytes);
+        let (bytes, per_chunk) = self.tier_slot(self.tiered(shape)?)?;
         let Some(tier) = self.tier.as_mut() else {
             return Err(Fault::Ceiling {
                 what: "chunks of the host tier",
@@ -3763,24 +3817,15 @@ impl Pools {
         if pairs.is_empty() || from == to {
             return Ok(());
         }
-        let kind = Self::kind_of(shape)?;
-        let bytes = self
-            .chunks
-            .layout()
-            .shape(kind)
-            .map(|shape| shape.slot_bytes)
-            .ok_or_else(|| {
-                Fault::program(
-                    "store::chunks",
-                    format!("a slot copy of a {} in a load that lays none", kind.name()),
-                )
-            })?;
+        let tiered = self.tiered(shape)?;
+        let (bytes, _) = self.tier_slot(tiered)?;
         let len = usize::try_from(bytes).unwrap_or(usize::MAX);
-        if (from == Tier::Disk || to == Tier::Disk) && kind != Kind::List {
+        let list = tiered == Tiered::Kind(Kind::List);
+        if (from == Tier::Disk || to == Tier::Disk) && !list {
             return Err(Fault::Unbound {
                 what: format!(
                     "a {} to or from disk: the slot file holds kv list slots only",
-                    kind.name()
+                    tiered.name()
                 ),
             });
         }
@@ -3792,15 +3837,18 @@ impl Pools {
                 _ => None,
             })
             .collect();
-        self.seat_pages(kind, device.iter().copied())?;
+        // A guest item's chunk is backed while the runtime holds its slots.
+        if let Tiered::Kind(kind) = tiered {
+            self.seat_pages(kind, device.iter().copied())?;
+        }
         match (from, to) {
             (Tier::Device, Tier::Host) | (Tier::Host, Tier::Device) => {
                 let to_host = to == Tier::Host;
                 let mut slots = Vec::with_capacity(pairs.len());
                 for &(src, dst) in pairs {
                     let (on_device, on_host) = if to_host { (src, dst) } else { (dst, src) };
-                    let on_host = self.tier_offset(kind, on_host)?;
-                    let on_device = self.chunks.span(kind, on_device, 0, bytes)?;
+                    let on_host = self.tier_offset(tiered, on_host)?;
+                    let on_device = self.tier_device_span(tiered, on_device, bytes)?;
                     slots.push(if to_host {
                         (on_device, on_host, len)
                     } else {
@@ -3835,13 +3883,13 @@ impl Pools {
                 if let (Some(landed), Some(_)) = (landed, swap) {
                     self.swaps.push(Swap {
                         landed,
-                        paged: if kind == Kind::List {
+                        paged: if list {
                             device.iter().map(|&slot| slot as u32).collect()
                         } else {
                             Vec::new()
                         },
                         host: Vec::new(),
-                        wide: kind != Kind::List,
+                        wide: !list,
                     });
                 }
                 Ok(())
@@ -3854,7 +3902,7 @@ impl Pools {
                     .map(|&(src, dst)| if to_disk { (src, dst) } else { (dst, src) })
                     .unzip();
                 self.through_disk(stream, to_disk, &disk, |pools, at| {
-                    pools.chunks.span(kind, device[at], 0, bytes)
+                    pools.tier_device_span(tiered, device[at], bytes)
                 })
             }
             (Tier::Host, Tier::Disk) | (Tier::Disk, Tier::Host) => {
@@ -3868,7 +3916,7 @@ impl Pools {
                     .unzip();
                 let host = host
                     .into_iter()
-                    .map(|slot| self.tier_offset(kind, slot))
+                    .map(|slot| self.tier_offset(tiered, slot))
                     .collect::<Result<Vec<u64>>>()?;
                 self.host_through_disk(to_disk, &disk, &host, len)
             }
