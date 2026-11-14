@@ -64,6 +64,12 @@ const kc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NE} -> kc[i] });
 const vc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc + 1} -> vc[i] });
 const sc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * NE} -> y[i] });
 const p_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * NE} -> pp[i] });
+// the stores' 16-bit views: a key down its entry's column of kc (stride NE), a value row of vc, a
+// held q row of qc (each offset to the entry at run time)
+const kcol_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> kc[i * @as(i16, NE)] });
+const vrow_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> vc[i] });
+const qrow_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QFW} -> qc[i] });
+const sxk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> sx[i] });
 const k_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * NE} -> kk[i] });
 var pl_d = k_d;
 
@@ -78,17 +84,21 @@ fn init(row: u16) void {
   while (h < Qh) : (h += 1) { mref[h] = 0.0; }
 }
 
+// Entry e's key and value (and its ones column) from sx's words from `at`: two narrowing DSD
+// moves (the key strided down kc's column e).
+fn keep(e: u16, at: u16) void {
+  @fs2h(@increment_dsd_offset(kcol_d, @as(i16, e), u16),
+        @increment_dsd_offset(sxk_d, @as(i16, at), f32));
+  @fs2h(@increment_dsd_offset(vrow_d, @as(i16, e * (Dc + 1)), u16),
+        @increment_dsd_offset(sxk_d, @as(i16, at + Dc), f32));
+  vc[e * (Dc + 1) + Dc] = @bitcast(u16, @as(@fp16(), 1.0));
+}
+
 // Row p's [k | v] from the root's multicast; kept by row p % PYA as entry p / PYA.
 fn store(p: u16) void {
   @fmovs(sx_d, fab.fin(YM, 2 * Dc));
   if (p % PYA != myrow) { return; }
-  const e = p / PYA;
-  var d: u16 = 0;
-  while (d < Dc) : (d += 1) {
-    kc[d * NE + e] = @bitcast(u16, @as(@fp16(), sx[d]));
-    vc[e * (Dc + 1) + d] = @bitcast(u16, @as(@fp16(), sx[Dc + d]));
-  }
-  vc[e * (Dc + 1) + Dc] = @bitcast(u16, @as(@fp16(), 1.0));
+  keep(p / PYA, 0);
 }
 
 // Row p's [q | k | v] from the root's multicast; kept (q too) by row p % PYA as entry p / PYA.
@@ -97,25 +107,17 @@ fn store_q(p: u16) void {
   @fmovs(@set_dsd_length(sx_d, QD + 2 * Dc), fab.fin(YM, QD + 2 * Dc));
   if (p % PYA != myrow) { return; }
   const e = p / PYA;
-  var d: u16 = 0;
-  while (d < Dc) : (d += 1) {
-    kc[d * NE + e] = @bitcast(u16, @as(@fp16(), sx[QD + d]));
-    vc[e * (Dc + 1) + d] = @bitcast(u16, @as(@fp16(), sx[QD + Dc + d]));
-  }
-  vc[e * (Dc + 1) + Dc] = @bitcast(u16, @as(@fp16(), 1.0));
-  d = 0;
-  while (d < QD) : (d += 1) { qc[e * QD + d] = @bitcast(u16, @as(@fp16(), sx[d])); }
+  keep(e, QD);
+  @fs2h(@increment_dsd_offset(qrow_d, @as(i16, e * QD), u16), @set_dsd_length(sxk_d, QD));
 }
 
 // Row p's query: its q up the chain from the PE that keeps it, then query().
 fn query_q(p: u16) void {
   const QD: u16 = Qh * Dc;
-  var d: u16 = 0;
   if (p % PYA == myrow) {
-    const e = p / PYA;
-    while (d < QD) : (d += 1) { qf[d] = @as(f32, @bitcast(@fp16(), qc[e * QD + d])); }
+    @fh2s(qf_d, @increment_dsd_offset(qrow_d, @as(i16, (p / PYA) * QD), u16));
   } else {
-    while (d < QD) : (d += 1) { qf[d] = 0.0; }
+    @fmovs(qf_d, @as(f32, 0.0));
   }
   red.send(qf_d, QD);
   query();

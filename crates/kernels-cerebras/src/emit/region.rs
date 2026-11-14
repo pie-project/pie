@@ -17,7 +17,8 @@
 //! before and after it; a head's reduction is the chunk's own (heads must not straddle roots).
 //! The cos / sin of an angle `position x frequency` (a rotation; the position a row's scalar, the
 //! frequency static, a select over static conditions picking each column's axis) come from P5
-//! rotation tables (ops/rope.csl: the position's digits times the host's per-frequency rotations).
+//! rotation tables (ops/srope.csl: the position's digits times the host's per-frequency rotations,
+//! a DSD product a level).
 //! A row's exp is math.vexp; a row's reciprocal a bit guess and three Newton steps. A select on a
 //! static condition is `a m + b (1 - m)` over the host's mask, exact; a gather within the row
 //! (`Peer`) by a static index must stay in the chunk (a pair's mate: two stride-2 moves).
@@ -989,7 +990,7 @@ impl Printer<'_> {
                 "var rc = @zeros([{0}]f32);\nvar rs = @zeros([{0}]f32);\n\
                  const RC = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{{0}}} -> rc[i] }});\n\
                  const RS = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{{0}}} -> rs[i] }});\n\
-                 const rp = @import_module(\"ops/rope.csl\", .{{ .rot = &T_rot_a, .rc = &rc, .rs = &rs, .NROT = {0}, .LV = {1}, .BITS = {2} }});\n\
+                 const rp = @import_module(\"ops/srope.csl\", .{{ .rot = &T_rot_a, .rc = &rc, .rs = &rs, .NROT = {0}, .LV = {1}, .BITS = {2} }});\n\
                  // (sources: {3:?})",
                 r.slots, self.place.rope_lv, self.place.rope_bits, r.sources
             );
@@ -1011,9 +1012,25 @@ impl Printer<'_> {
         }
         if self.sums {
             s.push_str(
-                "// n words' sum from p[o] (a scalar loop: a stride-0 accumulating DSD op is wrong on the CS-3)\n\
-                 fn vsum(p: [*]f32, o: u16, n: u16) f32 {\n  var t: f32 = 0.0;\n  var e: u16 = 0;\n\
-                 \x20 while (e < n) : (e += 1) { t += p[o + e]; }\n  return t;\n}\n",
+                "// n words' sum from p[o]: a halving tree of DSD adds over a scratch row (a stride-0\n\
+                 // accumulating DSD op is wrong on the CS-3); an odd run's middle word waits a level\n\
+                 var sumt: [C]f32 align(16) = @zeros([C]f32);\n\
+                 const SUMT = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{C} -> sumt[i] });\n\
+                 fn vsum(p: [*]f32, o: u16, n: u16) f32 {\n\
+                 \x20 if (n == 1) { return p[o]; }\n\
+                 \x20 const src = @increment_dsd_offset(@set_dsd_base_addr(SUMT, p), @as(i16, o), f32);\n\
+                 \x20 var h: u16 = n / 2;\n\
+                 \x20 @fadds(@set_dsd_length(SUMT, h), @set_dsd_length(src, h),\n\
+                 \x20        @set_dsd_length(@increment_dsd_offset(src, @as(i16, n - h), f32), h));\n\
+                 \x20 var m: u16 = h;\n\
+                 \x20 if (n % 2 == 1) { sumt[h] = p[o + h]; m = h + 1; }\n\
+                 \x20 while (m > 1) {\n\
+                 \x20   h = m / 2;\n\
+                 \x20   @fadds(@set_dsd_length(SUMT, h), @set_dsd_length(SUMT, h),\n\
+                 \x20          @set_dsd_length(@increment_dsd_offset(SUMT, @as(i16, m - h), f32), h));\n\
+                 \x20   m -= h;\n\
+                 \x20 }\n\
+                 \x20 return sumt[0];\n}\n",
             );
         }
         if self.exp {

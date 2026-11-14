@@ -1,0 +1,48 @@
+// wafer/ops/srope.csl: the stream regions' rotation tables (GENERIC.md §3.1 P5), ops/rope.csl's
+// tables() as DSD ops: a position's digit is one for every pair, so each level is a run of
+// NROT-wide vector products over the pairs, not a scalar product a pair. The host's tables are
+// rope.csl's: for each table set, LV levels of 2^BITS digits of [cos | sin][NROT].
+//
+// Params: rot, rc, rs (the region's tables and its cos / sin of the current position), NROT (a
+// table row's pairs), LV, BITS.
+param rot: [*]f32;
+param rc: [*]f32;
+param rs: [*]f32;
+param NROT: u16;
+param LV: u16;
+param BITS: u16;
+
+const RB: u16 = 1 << BITS;
+
+var t1: [NROT]f32 align(16) = @zeros([NROT]f32);
+var t2: [NROT]f32 align(16) = @zeros([NROT]f32);
+const T1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NROT} -> t1[i] });
+const T2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NROT} -> t2[i] });
+
+// cos / sin of position p for pairs j < n of the table set at base, into rc / rs from out:
+// c' = c c2 - s s2, s' = s c2 + c s2 a level, the first level's (c2, s2) taken as they are.
+fn tables(p: u32, base: u16, out: u16, n: u16) void {
+  const tab = @set_dsd_length(@set_dsd_base_addr(T1, rot), n);
+  const c = @increment_dsd_offset(@set_dsd_length(@set_dsd_base_addr(T1, rc), n), @as(i16, out), f32);
+  const s = @increment_dsd_offset(@set_dsd_length(@set_dsd_base_addr(T1, rs), n), @as(i16, out), f32);
+  const a = @set_dsd_length(T1, n);
+  const b = @set_dsd_length(T2, n);
+  var lv: u16 = 0;
+  while (lv < LV) : (lv += 1) {
+    const d = @as(u16, (p >> @as(u16, BITS * (LV - 1 - lv))) & @as(u32, RB - 1));
+    const o = base + ((lv * RB + d) * 2) * NROT;
+    const c2 = @increment_dsd_offset(tab, @as(i16, o), f32);
+    const s2 = @increment_dsd_offset(tab, @as(i16, o + NROT), f32);
+    if (lv == 0) {
+      @fmovs(c, c2);
+      @fmovs(s, s2);
+    } else {
+      @fmuls(a, s, s2);
+      @fmuls(b, c, s2);
+      @fmuls(c, c, c2);
+      @fsubs(c, c, a);
+      @fmuls(s, s, c2);
+      @fadds(s, s, b);
+    }
+  }
+}
