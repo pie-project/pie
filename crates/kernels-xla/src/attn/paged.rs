@@ -185,6 +185,16 @@ pub(crate) fn geometry(
     pages: i64,
 ) -> Built<Geom> {
     let lanes = f.dims(indptr)[0] - 1;
+    // A key's place over the fire is `lane · span + position`, an i32.
+    if lanes * pages * ps > i64::from(i32::MAX) {
+        return Err(Malformed {
+            op: "paged attention",
+            detail: format!(
+                "{lanes} lanes of {} key positions each pass the 2^31 key places a fire indexes",
+                pages * ps
+            ),
+        });
+    }
     let start = f.slice(indptr, &[0], &[lanes], &[1])?;
     let end = f.slice(indptr, &[1], &[lanes + 1], &[1])?;
     let count = f.sub(end, start)?;
@@ -2027,6 +2037,16 @@ pub fn attend_fresh(
     }
     if let Some((bias, extent, _, _)) = call.rel {
         nonzero(op, "the relative extent", extent)?;
+        // A bias's place is `(row · q_heads + head) · extent + distance`, an i32.
+        if u64::from(rows) * u64::from(q_heads) * u64::from(extent) > i32::MAX as u64 {
+            return Err(refuse(
+                op,
+                format!(
+                    "{rows} rows of {q_heads} heads x {extent} relative biases pass the 2^31 \
+                     a fire indexes"
+                ),
+            ));
+        }
         if bias.dtype != Dtype::F32
             || bias.rows < rows
             || u64::from(bias.width) != u64::from(q_heads) * u64::from(extent)
@@ -2062,6 +2082,14 @@ pub fn attend_fresh(
         None
     };
     let mask = if call.masked {
+        // A cell's place is `row · pitch + key`, an i32.
+        let pitch = f.dims(t.mask.val)[1];
+        if r * pitch > i64::from(i32::MAX) {
+            return Err(refuse(
+                op,
+                format!("{r} rows of a {pitch}-key mask plane pass the 2^31 cells a fire indexes"),
+            ));
+        }
         Some(f.slice_axis(t.mask.val, 0, 0, r)?)
     } else {
         None
@@ -3726,4 +3754,23 @@ pub fn kv_append_shared(
         None,
         [pool.keys_map, pool.values_map],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fire whose lanes × key span passes 2^31 is refused by name, never
+    /// traced with a key place that wraps.
+    #[test]
+    fn a_fire_past_two_to_the_31_key_places_is_refused() {
+        let mut f = Func::new("geometry");
+        let indptr = f.param(Ty::new(Elem::I32, &[257]), None);
+        let indices = f.param(Ty::new(Elem::I32, &[1 << 20]), None);
+        let fits = geometry(&mut f, indptr, indices, 16, (1 << 19) / 16);
+        assert!(fits.is_ok(), "256 lanes of 512K keys fit: {fits:?}");
+        let wide = geometry(&mut f, indptr, indices, 16, (8 << 20) / 16);
+        let why = wide.expect_err("256 lanes of 8M keys pass 2^31").to_string();
+        assert!(why.contains("2^31 key places"), "{why}");
+    }
 }
