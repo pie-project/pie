@@ -37,6 +37,9 @@ pub struct Gpu {
 impl Gpu {
     pub fn open() -> Option<Gpu> {
         let device = Context::bind(&DeviceBoot::default(), ALLOWANCE).ok()?;
+        // A kernel test's frames bind through what a load would lay.
+        <crate::backend::Api as engine_gpu::serve::Serve>::lay_frames(&device, 2, 1 << 14)
+            .expect("the frames' descriptors are laid");
         Some(Gpu {
             device,
             handles: Handles::new(),

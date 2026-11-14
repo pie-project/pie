@@ -274,6 +274,10 @@ fn bench_qmm(
     Ok((fitted, lines, wrong))
 }
 
+/// The frames a tuning run holds at once.
+#[cfg(feature = "vulkan")]
+const TUNING_FRAMES: u32 = 8;
+
 #[cfg(feature = "vulkan")]
 fn measure(
     base: &Profile,
@@ -283,6 +287,10 @@ fn measure(
     let device =
         crate::device::Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
             .map_err(|e| e.to_string())?;
+    // The tuning frames bind through pools laid as a load lays them.
+    device
+        .lay_frames(TUNING_FRAMES, 1 << 12)
+        .map_err(|e| e.to_string())?;
     qmm::measure(&device, base, grid, say)
 }
 

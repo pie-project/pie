@@ -71,7 +71,7 @@ impl KeyBuilder {
     }
 }
 
-const SHAPES_KEPT: usize = 64;
+pub(crate) const SHAPES_KEPT: usize = 64;
 
 pub(crate) struct Recorder {
     by_key: HashMap<Key, Recording>,

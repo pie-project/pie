@@ -58,9 +58,13 @@ pub fn present() -> bool {
 
 pub(crate) const DUMMY_BYTES: u64 = 256;
 
-const UNIFORM_CHUNK: u64 = 1 << 20;
+/// The uniform ring's bytes: every bind group the cache keeps
+/// (`pipelines::BIND_CACHE_CAP`) at a 256-byte block.
+pub(crate) const UNIFORM_RING: u64 = 4 << 20;
 
-const SCRATCH_CHUNK: u64 = 8 << 20;
+/// The frame scratch ring's bytes: views staged at an offset the device
+/// cannot bind, and copies whose two ends are one buffer, in pieces.
+const SCRATCH_RING: u64 = 8 << 20;
 
 const TIMING_QUERIES: u32 = 4096;
 
@@ -158,8 +162,11 @@ pub(crate) struct Core {
 
     poller: host::Poller,
 
-    pub(crate) uniforms: Mutex<Vec<Held>>,
-    pub(crate) scratch: Mutex<Vec<Held>>,
+    /// Uniform blocks of bind groups (cached or a frame's own), and a
+    /// frame's scratch: each one buffer laid at the load
+    /// ([`Context::lay_frames`]), taken in order and wrapped, never grown.
+    pub(crate) uniforms: Mutex<Ring>,
+    pub(crate) scratch: Mutex<Ring>,
 
     pub(crate) last_error: Arc<Mutex<Option<String>>>,
     pub(crate) books: Arc<engine_gpu::Books>,
@@ -232,52 +239,131 @@ impl Core {
         }
     }
 
-    pub(crate) fn uniform_chunk(&self) -> Held {
-        if let Some(chunk) = self.uniforms.lock().expect("uniforms lock poisoned").pop() {
-            return chunk;
-        }
-        self.held(
-            &wgpu::BufferDescriptor {
-                label: Some("pie uniforms"),
-                size: UNIFORM_CHUNK,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
+    /// Lays the two rings, once.
+    fn lay_rings(&self) -> Result<()> {
+        let lay = |ring: &Mutex<Ring>,
+                   bytes: u64,
+                   usage: wgpu::BufferUsages,
+                   owner: Owner,
+                   label: &'static str| {
+            let mut ring = ring.lock().expect("ring lock poisoned");
+            if ring.buffer.is_some() {
+                return Err(Fault::Unbound {
+                    what: "a second lay of the frames' rings".to_string(),
+                });
+            }
+            ring.buffer = Some(self.held(
+                &wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: bytes,
+                    usage,
+                    mapped_at_creation: false,
+                },
+                owner,
+            ));
+            Ok(())
+        };
+        lay(
+            &self.uniforms,
+            UNIFORM_RING,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             engine_gpu::books::owners::UNIFORMS,
-        )
-    }
-
-    pub(crate) fn return_uniforms(&self, chunks: Vec<Held>) {
-        self.uniforms
-            .lock()
-            .expect("uniforms lock poisoned")
-            .extend(chunks);
-    }
-
-    pub(crate) fn scratch_chunk(&self, bytes: u64) -> Held {
-        if bytes <= SCRATCH_CHUNK
-            && let Some(chunk) = self.scratch.lock().expect("scratch lock poisoned").pop()
-        {
-            return chunk;
-        }
-        self.held(
-            &wgpu::BufferDescriptor {
-                label: Some("pie scratch"),
-                size: bytes.max(SCRATCH_CHUNK),
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            },
+            "pie uniforms",
+        )?;
+        lay(
+            &self.scratch,
+            SCRATCH_RING,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             engine_gpu::books::owners::FRAME_SCRATCH,
+            "pie frame scratch",
         )
     }
+}
 
-    pub(crate) fn return_scratch(&self, chunks: Vec<Held>) {
-        self.scratch
-            .lock()
-            .expect("scratch lock poisoned")
-            .extend(chunks.into_iter().filter(|c| c.size() == SCRATCH_CHUNK));
+/// One buffer laid at the load and handed out in order, wrapping to its
+/// start. What a frame wrote there stands until the frame is submitted:
+/// a write the host queues (`write_buffer`) lands in queue order, and the
+/// device runs submitted frames in order, so only a frame still encoding
+/// could be overwritten, which a take refuses instead. A wrap is reported,
+/// for the bind groups the cache keeps over the ring to be dropped.
+#[derive(Default)]
+pub(crate) struct Ring {
+    buffer: Option<Held>,
+    cursor: u64,
+    /// Bumped at each wrap.
+    lap: u64,
+    /// Frames still encoding: their id, and the lap and byte of the first
+    /// block each took.
+    open: Vec<(usize, u64, u64)>,
+}
+
+impl Ring {
+    /// `bytes` aligned to `align` for frame `frame` (`Frame::ring_id`): the
+    /// buffer, the offset, and whether the ring wrapped to give it.
+    pub(crate) fn take(
+        &mut self,
+        frame: usize,
+        bytes: u64,
+        align: u64,
+        what: &'static str,
+    ) -> Result<(wgpu::Buffer, u64, bool)> {
+        let buffer = self.buffer.as_ref().ok_or_else(|| Fault::Unbound {
+            what: format!("the ring of {what}, which no load laid"),
+        })?;
+        let size = buffer.size();
+        if bytes > size {
+            return Err(Fault::Ceiling {
+                what,
+                need: bytes,
+                have: size,
+            });
+        }
+        let mut at = self.cursor.next_multiple_of(align.max(1));
+        let wrapped = at + bytes > size;
+        if wrapped {
+            at = 0;
+            self.lap += 1;
+        }
+        // A frame still encoding keeps every block from its first.
+        let lap = self.lap;
+        if let Some(&(_, _, first)) = self
+            .open
+            .iter()
+            .find(|&&(_, from, first)| from + 1 < lap || (from < lap && at + bytes > first))
+        {
+            return Err(Fault::Ceiling {
+                what,
+                need: at + bytes,
+                have: first,
+            });
+        }
+        if !self.open.iter().any(|&(id, _, _)| id == frame) {
+            self.open.push((frame, lap, at));
+        }
+        self.cursor = at + bytes;
+        Ok(((**buffer).clone(), at, wrapped))
+    }
+
+    /// The lap the ring is on.
+    pub(crate) fn lap(&self) -> u64 {
+        self.lap
+    }
+
+    /// Frame `frame` reads the block taken at `at` of lap `lap` (a kept
+    /// bind group's): it stands while the frame encodes.
+    pub(crate) fn hold(&mut self, frame: usize, lap: u64, at: u64) {
+        match self.open.iter_mut().find(|(id, _, _)| *id == frame) {
+            Some(held) if (lap, at) < (held.1, held.2) => *held = (frame, lap, at),
+            Some(_) => {}
+            None => self.open.push((frame, lap, at)),
+        }
+    }
+
+    /// Frame `frame` was submitted or dropped: its blocks may be taken.
+    pub(crate) fn close(&mut self, frame: usize) {
+        self.open.retain(|&(id, _, _)| id != frame);
     }
 }
 
@@ -511,8 +597,8 @@ impl Context {
             enabled,
             spent: Mutex::new(Vec::new()),
             poller,
-            uniforms: Mutex::new(Vec::new()),
-            scratch: Mutex::new(Vec::new()),
+            uniforms: Mutex::new(Ring::default()),
+            scratch: Mutex::new(Ring::default()),
             last_error,
             books: Arc::new(engine_gpu::Books::new()),
             subgroup_min,
@@ -638,6 +724,12 @@ impl Context {
         Ok(())
     }
 
+    /// Lays the rings every frame takes its uniform blocks and scratch
+    /// from, once, at the load.
+    pub fn lay_frames(&self) -> Result<()> {
+        self.core.lay_rings()
+    }
+
     pub fn frame(&self) -> Result<Frame> {
         let core = &self.core;
         let encoder = core
@@ -649,8 +741,6 @@ impl Context {
             inner: Arc::new(Inner {
                 core: Arc::clone(core),
                 encoder: Mutex::new(Some(encoder)),
-                uniforms: Mutex::new(UniformRing::default()),
-                scratch: Mutex::new(UniformRing::default()),
                 index: Mutex::new(None),
                 done: AtomicBool::new(false),
                 timing: Mutex::new(Vec::new()),
@@ -662,17 +752,9 @@ impl Context {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct UniformRing {
-    chunks: Vec<Held>,
-    used: u64,
-}
-
 pub(crate) struct Inner {
     pub(crate) core: Arc<Core>,
     encoder: Mutex<Option<wgpu::CommandEncoder>>,
-    uniforms: Mutex<UniformRing>,
-    scratch: Mutex<UniformRing>,
     index: Mutex<Option<wgpu::SubmissionIndex>>,
     done: AtomicBool,
     timing: Mutex<Vec<Timing>>,
@@ -689,12 +771,31 @@ impl Inner {
     }
 }
 
+impl Inner {
+    /// This frame's id in the rings.
+    fn id(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    /// The frame is submitted or gone: the rings may take its blocks.
+    fn release_rings(&self) {
+        let id = self.id();
+        self.core
+            .uniforms
+            .lock()
+            .expect("uniforms lock poisoned")
+            .close(id);
+        self.core
+            .scratch
+            .lock()
+            .expect("scratch lock poisoned")
+            .close(id);
+    }
+}
+
 impl Drop for Inner {
     fn drop(&mut self) {
-        let ring = std::mem::take(self.uniforms.get_mut().expect("uniforms lock poisoned"));
-        self.core.return_uniforms(ring.chunks);
-        let scratch = std::mem::take(self.scratch.get_mut().expect("scratch lock poisoned"));
-        self.core.return_scratch(scratch.chunks);
+        self.release_rings();
     }
 }
 
@@ -705,6 +806,11 @@ pub struct Frame {
 }
 
 impl Frame {
+    /// The frame's id in the rings its blocks come from.
+    pub(crate) fn ring_id(&self) -> usize {
+        self.inner.id()
+    }
+
     pub(crate) fn close_pass(&self) {
         self.inner.pass.lock().expect("pass lock poisoned").take();
     }
@@ -750,18 +856,16 @@ impl Frame {
         Ok(f(encoder))
     }
 
-    pub(crate) fn uniform_slot(&self, bytes: u64) -> (wgpu::Buffer, u64) {
+    pub(crate) fn uniform_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
-        let mut ring = self.inner.uniforms.lock().expect("uniforms lock poisoned");
-        let at = ring.used.next_multiple_of(align);
-        if ring.chunks.is_empty() || at + bytes > UNIFORM_CHUNK {
-            ring.chunks.push(core.uniform_chunk());
-            ring.used = bytes;
-            return ((*ring.chunks.last().expect("just pushed")).clone(), 0);
-        }
-        ring.used = at + bytes;
-        ((*ring.chunks.last().expect("non-empty")).clone(), at)
+        let (buffer, at, _) = core.uniforms.lock().expect("uniforms lock poisoned").take(
+            self.inner.id(),
+            bytes,
+            align,
+            "bytes of the uniform ring laid at the load",
+        )?;
+        Ok((buffer, at))
     }
 
     pub(crate) fn timestamp_slot(&self, name: &str) -> Option<(wgpu::QuerySet, u32)> {
@@ -788,18 +892,16 @@ impl Frame {
         Some((set, 2 * at))
     }
 
-    pub(crate) fn scratch_slot(&self, bytes: u64) -> (wgpu::Buffer, u64) {
+    pub(crate) fn scratch_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(256);
-        let mut ring = self.inner.scratch.lock().expect("scratch lock poisoned");
-        let at = ring.used.next_multiple_of(align);
-        if ring.chunks.is_empty() || at + bytes > SCRATCH_CHUNK {
-            ring.chunks.push(core.scratch_chunk(bytes));
-            ring.used = bytes;
-            return ((*ring.chunks.last().expect("just pushed")).clone(), 0);
-        }
-        ring.used = at + bytes;
-        ((*ring.chunks.last().expect("non-empty")).clone(), at)
+        let (buffer, at, _) = core.scratch.lock().expect("scratch lock poisoned").take(
+            self.inner.id(),
+            bytes,
+            align,
+            "bytes of the frame scratch ring laid at the load",
+        )?;
+        Ok((buffer, at))
     }
 
     /// Writes `bytes` into `into` from `at` in queue order: the queue lands
@@ -831,14 +933,31 @@ impl Frame {
         }
         crate::encode::record_copy();
         let (from, to) = (&source.slab().buffer, &into.slab().buffer);
-        // wgpu refuses a copy whose ends are one buffer: it goes through
-        // scratch, which also reads overlapping ends as they were.
-        let stage = (from == to).then(|| self.scratch_slot(len));
-        self.encode(|encoder| match &stage {
-            None => encoder.copy_buffer_to_buffer(from, source_at, to, into_at, Some(len)),
-            Some((scratch, at)) => {
-                encoder.copy_buffer_to_buffer(from, source_at, scratch, *at, Some(len));
-                encoder.copy_buffer_to_buffer(scratch, *at, to, into_at, Some(len));
+        if from != to {
+            return self.encode(|encoder| {
+                encoder.copy_buffer_to_buffer(from, source_at, to, into_at, Some(len));
+            });
+        }
+        // wgpu refuses a copy whose ends are one buffer: it goes through one
+        // block of scratch a piece at a time (each piece lands before the
+        // next is staged, in the encoder's order). Ends that overlap are
+        // staged whole, which reads them as they were.
+        let piece = len.min(SCRATCH_RING / 2);
+        if len > piece && source_at < into_at + len && into_at < source_at + len {
+            return Err(Fault::Ceiling {
+                what: "bytes of a copy whose ends overlap in one buffer (staged whole)",
+                need: len,
+                have: piece,
+            });
+        }
+        let (scratch, at) = self.scratch_slot(piece)?;
+        self.encode(|encoder| {
+            let mut done = 0u64;
+            while done < len {
+                let n = piece.min(len - done);
+                encoder.copy_buffer_to_buffer(from, source_at + done, &scratch, at, Some(n));
+                encoder.copy_buffer_to_buffer(&scratch, at, to, into_at + done, Some(n));
+                done += n;
             }
         })
     }
@@ -947,6 +1066,7 @@ impl Frame {
         let finished = encoder.finish();
         crate::encode::record_read_phase(0, started.ns());
         let index = core.queue.submit(std::iter::once(finished));
+        self.inner.release_rings();
         crate::encode::record_submit(started.ns(), 0);
         let inner = Arc::clone(&self.inner);
         core.queue.on_submitted_work_done(move || {

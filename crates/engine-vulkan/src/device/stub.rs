@@ -127,6 +127,10 @@ impl Context {
         match self.never {}
     }
 
+    pub fn lay_frames(&self, _frames: u32, _sets: u32) -> Result<()> {
+        match self.never {}
+    }
+
     pub fn frame_kept(&self) -> Result<Frame> {
         match self.never {}
     }

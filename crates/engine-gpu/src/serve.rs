@@ -107,6 +107,15 @@ pub trait Serve: Backend {
     /// so a pipeline's share of it can be measured.
     fn measures_outside(device: &Self::Context) -> bool;
 
+    /// Lays what each frame binds its kernels' arguments through, for
+    /// `arms` frames in flight, each of at most `dispatches` dispatches
+    /// ([`dispatch_ceiling`]): laid once at the load, never grown. A backend
+    /// binding through nothing it lays (WebGPU's bind groups) lays nothing.
+    fn lay_frames(device: &Self::Context, arms: u32, dispatches: u32) -> Result<()> {
+        let _ = (device, arms, dispatches);
+        Ok(())
+    }
+
     /// Whether `pipelines` could build instantiation `key` (at `tier`, as
     /// [`kernels_slang::CENSUS`] names it) on `device`: this build carries
     /// its module and a fire on the device may name that tier.
@@ -1114,6 +1123,13 @@ impl<B: Serve> Shell<B> {
         // Every pipeline a fire may yet build is priced before the pool takes
         // what is left: one built later must find its driver memory free.
         let pipelines = B::Pipelines::default();
+        // What the frames bind their kernels' arguments through is laid
+        // now, before the driver's holding is measured.
+        B::lay_frames(
+            &device,
+            u32::try_from(arms).unwrap_or(u32::MAX),
+            dispatch_ceiling(&compiled),
+        )?;
         let unbuilt = price_pipelines::<B>(&device, &pipelines);
         let left = device.left().saturating_sub(unbuilt);
         if let Some(budget) = kv_budget
@@ -4073,6 +4089,26 @@ static PRICING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// The builds go on past [`PRICED_FROM`] until [`PRICED_MOVES`] have moved,
 /// up to [`PRICED_FROM_MOST`]. A device that does not report the driver's
 /// holding prices nothing.
+/// The dispatches one frame of the compiled model may record, at most: a
+/// few kernels for each node every region runs (a node lowers to at most
+/// [`DISPATCHES_A_NODE`]), and what the frame does beside them (input casts,
+/// the readout gathers and copies).
+#[must_use]
+pub fn dispatch_ceiling(compiled: &CompiledModel) -> u32 {
+    let nodes: u64 = compiled
+        .template()
+        .iter()
+        .map(|region| u64::from(region.nodes.end.saturating_sub(region.nodes.start)))
+        .sum();
+    u32::try_from(nodes * DISPATCHES_A_NODE + DISPATCHES_BESIDE).unwrap_or(u32::MAX)
+}
+
+/// The most kernels one node of the trace lowers to.
+pub const DISPATCHES_A_NODE: u64 = 4;
+
+/// The dispatches a frame records beside its nodes'.
+pub const DISPATCHES_BESIDE: u64 = 256;
+
 fn price_pipelines<B: Serve>(device: &B::Context, pipelines: &B::Pipelines) -> u64 {
     if !B::measures_outside(device) {
         return 0;

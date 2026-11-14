@@ -127,6 +127,10 @@ impl Context {
     pub fn frame(&self) -> Result<Frame> {
         match self.never {}
     }
+
+    pub fn lay_frames(&self) -> Result<()> {
+        match self.never {}
+    }
 }
 
 pub struct Frame {

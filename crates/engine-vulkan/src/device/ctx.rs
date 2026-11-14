@@ -191,6 +191,23 @@ pub(crate) struct Core {
     pub(crate) discrete: bool,
     pub(crate) api_version: u32,
     pub(crate) features: Enabled,
+    /// The descriptor pools the load laid for its frames ([`Context::lay_frames`]).
+    descriptors: Mutex<Laid>,
+}
+
+/// The descriptor pools a load lays, each a frame's sets: frames take one
+/// when they first bind a set and give it back reset when they drop. None
+/// is made after the load; a frame finding none free, or binding more sets
+/// than one holds, is refused.
+#[derive(Default)]
+struct Laid {
+    free: Vec<vk::DescriptorPool>,
+    /// The sets one pool holds.
+    sets: u32,
+    /// The pools laid.
+    pools: u32,
+    /// The most sets one frame has bound, for the load's report.
+    most: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -208,6 +225,47 @@ pub struct Enabled {
 }
 
 impl Core {
+    /// A laid descriptor pool for a frame binding its first set.
+    fn take_descriptors(&self) -> Result<(vk::DescriptorPool, u32)> {
+        let mut laid = self.descriptors.lock().expect("descriptors lock poisoned");
+        let sets = laid.sets;
+        let pools = laid.pools;
+        laid.free.pop().map(|pool| (pool, sets)).ok_or(Fault::Ceiling {
+            what: "descriptor pools the load laid, one a frame in flight or kept to replay",
+            need: u64::from(pools) + 1,
+            have: u64::from(pools),
+        })
+    }
+
+    /// A dropped frame's pool, reset, for the next frame; `bound` the sets
+    /// the frame bound.
+    fn give_descriptors(&self, pool: vk::DescriptorPool, bound: u32) {
+        // SAFETY: the frame that held `pool` is gone and waited for its
+        // submission, so no set of the pool is in use; the reset frees them.
+        let reset = unsafe {
+            self.device
+                .reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
+        };
+        let mut laid = self.descriptors.lock().expect("descriptors lock poisoned");
+        if bound > laid.most {
+            laid.most = bound;
+            tracing::debug!(
+                sets = bound,
+                laid = laid.sets,
+                "the most descriptor sets one frame has bound"
+            );
+        }
+        match reset {
+            Ok(()) => laid.free.push(pool),
+            Err(e) => {
+                tracing::warn!(code = e.as_raw(), "vkResetDescriptorPool; the pool is lost");
+                laid.pools = laid.pools.saturating_sub(1);
+                // SAFETY: as above, no set of `pool` is in use.
+                unsafe { self.device.destroy_descriptor_pool(pool, None) };
+            }
+        }
+    }
+
     /// The largest device-local heap's budget for this process and what
     /// this process holds of it, as the driver's memory budget reports them
     /// now; `None` without `VK_EXT_memory_budget`.
@@ -400,6 +458,11 @@ impl Drop for Core {
             for pool in pools.into_values() {
                 self.device.destroy_command_pool(pool, None);
             }
+            // Every frame has given its descriptor pool back by now.
+            let laid = self.descriptors.get_mut().expect("descriptors lock poisoned");
+            for pool in std::mem::take(&mut laid.free) {
+                self.device.destroy_descriptor_pool(pool, None);
+            }
             // The instance is the process's (`shared_instance`).
             self.device.destroy_device(None);
         }
@@ -456,16 +519,16 @@ impl PipelineCache {
             .and_then(|p| std::fs::read(p).ok())
             .unwrap_or_default();
         // SAFETY: `core.device` is live; any bytes are acceptable initial
-        // data, as the driver validates the header and ignores a stale cache.
-        let make = |bytes: &[u8]| unsafe {
+        // data, as the driver validates the header and starts empty from a
+        // stale or foreign cache (the spec's rule), so a refusal here is the
+        // device's and the load's: it is not tried again without the file.
+        let cache = unsafe {
             core.device.create_pipeline_cache(
-                &vk::PipelineCacheCreateInfo::default().initial_data(bytes),
+                &vk::PipelineCacheCreateInfo::default().initial_data(&initial),
                 None,
             )
-        };
-        let cache = make(&initial)
-            .or_else(|_| make(&[]))
-            .map_err(|e| core.fault("vkCreatePipelineCache", e))?;
+        }
+        .map_err(|e| core.fault("vkCreatePipelineCache", e))?;
         Ok(PipelineCache {
             core: Arc::clone(core),
             cache,
@@ -931,6 +994,7 @@ impl Context {
             memory,
             limits: props.limits,
             transfer: Mutex::new(transfer),
+            descriptors: Mutex::new(Laid::default()),
             books: engine_gpu::Books::new(),
             name: name.clone(),
             subgroup_size: pinned.unwrap_or(subgroup.subgroup_size.max(1)),
@@ -1089,6 +1153,40 @@ impl Context {
         self.frame_with(true)
     }
 
+    /// Lays the descriptor pools of the load's frames: `frames` of them
+    /// (every frame that can be in flight or kept to replay at once), each
+    /// holding `sets` sets, the most one frame binds. Laid once: a second
+    /// lay is refused.
+    pub fn lay_frames(&self, frames: u32, sets: u32) -> Result<()> {
+        let core = &self.core;
+        let mut laid = core.descriptors.lock().expect("descriptors lock poisoned");
+        if laid.pools > 0 {
+            return Err(Fault::Unbound {
+                what: "a second lay of the frames' descriptor pools".to_string(),
+            });
+        }
+        let sets = sets.max(SETS_PER_BATCH);
+        let sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(sets.saturating_mul(BUFFERS_PER_SET))];
+        for _ in 0..frames {
+            // SAFETY: `core.device` is live and the create info is complete.
+            let pool = unsafe {
+                core.device.create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(sets)
+                        .pool_sizes(&sizes),
+                    None,
+                )
+            }
+            .map_err(|e| core.fault("vkCreateDescriptorPool", e))?;
+            laid.free.push(pool);
+            laid.pools += 1;
+        }
+        laid.sets = sets;
+        Ok(())
+    }
+
     pub fn frame_kept(&self) -> Result<Frame> {
         self.frame_with(false)
     }
@@ -1170,7 +1268,7 @@ impl Context {
                 cuts: Mutex::new(Vec::new()),
                 cmd_pool: pool,
                 fence,
-                pools: Mutex::new(Vec::new()),
+                pool: Mutex::new(None),
                 keep: Mutex::new(Vec::new()),
                 submitted: std::sync::atomic::AtomicBool::new(false),
                 timing: Mutex::new(timing),
@@ -1212,7 +1310,9 @@ pub(crate) struct Inner {
     pub(crate) cmd_pool: vk::CommandPool,
     pub(crate) fence: vk::Fence,
 
-    pub(crate) pools: Mutex<Vec<vk::DescriptorPool>>,
+    /// The laid descriptor pool the frame binds its sets from, taken at its
+    /// first set, the sets it holds and the sets bound from it.
+    pub(crate) pool: Mutex<Option<(vk::DescriptorPool, u32, u32)>>,
 
     pub(crate) keep: Mutex<Vec<Slab>>,
     submitted: std::sync::atomic::AtomicBool,
@@ -1250,8 +1350,9 @@ impl Drop for Inner {
             if self.submitted.load(Ordering::Acquire) {
                 let _ = d.wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS);
             }
-            for pool in self.pools.get_mut().expect("pools lock poisoned").drain(..) {
-                d.destroy_descriptor_pool(pool, None);
+            if let Some((pool, _, bound)) = self.pool.get_mut().expect("pool lock poisoned").take()
+            {
+                self.core.give_descriptors(pool, bound);
             }
             if let Some(timing) = self.timing.get_mut().expect("timing lock poisoned").take() {
                 d.destroy_query_pool(timing.pool, None);
@@ -1278,10 +1379,12 @@ impl Drop for Inner {
     }
 }
 
-const SETS_PER_POOL: u32 = 1024;
+const SETS_PER_BATCH: u32 = 64;
 
-const SETS_PER_BATCH: usize = 64;
-const BUFFERS_PER_POOL: u32 = SETS_PER_POOL * 8;
+/// The storage descriptors a laid pool holds a set, on average: the pool's
+/// buffers a kernel binds ([`kernels_slang::SEGMENTS`], the one place that
+/// count is stated) and as many operands beside them.
+const BUFFERS_PER_SET: u32 = 2 * kernels_slang::SEGMENTS as u32;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Span {
@@ -1409,52 +1512,42 @@ impl Frame {
                 return Ok(set);
             }
         }
-        let layouts = [layout; SETS_PER_BATCH];
-        let mut pools = self.inner.pools.lock().expect("pools lock poisoned");
-        let mut got: Option<Vec<vk::DescriptorSet>> = None;
-        if let Some(&pool) = pools.last() {
-            let info = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(pool)
-                .set_layouts(&layouts);
-            // SAFETY: the `pools` lock is held, which is the external sync
-            // the descriptor pool needs; `layout` is a live layout of `d`.
-            got = unsafe { d.allocate_descriptor_sets(&info) }.ok();
+        let mut held = self.inner.pool.lock().expect("pool lock poisoned");
+        if held.is_none() {
+            let (pool, sets) = core.take_descriptors()?;
+            *held = Some((pool, sets, 0));
         }
-        let mut sets = match got {
-            Some(sets) => sets,
-            None => {
-                let sizes = [vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(BUFFERS_PER_POOL)];
-                // SAFETY: `d` is live and the create info is complete.
-                let pool = unsafe {
-                    d.create_descriptor_pool(
-                        &vk::DescriptorPoolCreateInfo::default()
-                            .max_sets(SETS_PER_POOL)
-                            .pool_sizes(&sizes),
-                        None,
-                    )
-                }
-                .map_err(|e| core.fault("vkCreateDescriptorPool", e))?;
-                pools.push(pool);
-                let info = vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(pool)
-                    .set_layouts(&layouts);
-                // SAFETY: as above, under the `pools` lock, from the fresh pool.
-                unsafe { d.allocate_descriptor_sets(&info) }
-                    .map_err(|e| core.fault("vkAllocateDescriptorSets", e))?
-            }
-        };
-        drop(pools);
-        let one = sets.pop().expect("a batch of one or more");
-        if !sets.is_empty() {
+        let (pool, sets, bound) = held.as_mut().expect("a pool was just taken");
+        // A batch the pool still holds; none past it is asked for.
+        let batch = SETS_PER_BATCH.min(*sets - *bound);
+        if batch == 0 {
+            return Err(Fault::Ceiling {
+                what: "descriptor sets of one frame (the load laid each frame's pool for its \
+                       widest fire)",
+                need: u64::from(*bound) + 1,
+                have: u64::from(*sets),
+            });
+        }
+        let layouts = vec![layout; batch as usize];
+        let info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(*pool)
+            .set_layouts(&layouts);
+        // SAFETY: the `pool` lock is held, which is the external sync the
+        // descriptor pool needs; `layout` is a live layout of `d`, and the
+        // pool holds `batch` more sets.
+        let mut got = unsafe { d.allocate_descriptor_sets(&info) }
+            .map_err(|e| core.fault("vkAllocateDescriptorSets", e))?;
+        *bound += batch;
+        drop(held);
+        let one = got.pop().expect("a batch of one or more");
+        if !got.is_empty() {
             self.inner
                 .spare
                 .lock()
                 .expect("spare lock poisoned")
                 .entry(key)
                 .or_default()
-                .extend(sets);
+                .extend(got);
         }
         Ok(one)
     }

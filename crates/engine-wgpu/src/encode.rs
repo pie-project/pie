@@ -371,7 +371,10 @@ impl Sink<'_> {
                                 .read(at, &mut bytes[..len as usize])
                                 .map_err(|fault| Sink::refuse(fire, fault))?;
                             let staged_len = bytes.len() as u64;
-                            let (chunk, slot) = self.frame.scratch_slot(staged_len);
+                            let (chunk, slot) = self
+                                .frame
+                                .scratch_slot(staged_len)
+                                .map_err(|fault| Sink::refuse(fire, fault))?;
                             core.queue.write_buffer(&chunk, slot, &bytes);
                             scratch_views += 1;
                             STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -382,7 +385,10 @@ impl Sink<'_> {
                     let len = remaining
                         .next_multiple_of(4)
                         .min(binding.buffer().slab().size.saturating_sub(at) & !3);
-                    let (chunk, slot) = self.frame.scratch_slot(len);
+                    let (chunk, slot) = self
+                        .frame
+                        .scratch_slot(len)
+                        .map_err(|fault| Sink::refuse(fire, fault))?;
                     self.frame
                         .encode(|encoder| {
                             encoder.copy_buffer_to_buffer(&source, at, &chunk, slot, len);
@@ -474,7 +480,15 @@ impl Sink<'_> {
         let uniform_bytes = u64::from(pipeline.push_bytes.max(rounded).max(16));
         let group = if scratch_views == 0 {
             self.pipelines
-                .bind_group(core, &pipeline, &keyed, &words, uniform_bytes)
+                .bind_group(
+                    core,
+                    self.frame.ring_id(),
+                    &pipeline,
+                    &keyed,
+                    &words,
+                    uniform_bytes,
+                )
+                .map_err(|fault| Sink::refuse(fire, fault))?
         } else {
             let mut entries: Vec<wgpu::BindGroupEntry<'_>> = Vec::with_capacity(declared + 1);
             for (at, (buffer, offset, size, _)) in views.iter().enumerate().take(declared) {
@@ -492,7 +506,10 @@ impl Sink<'_> {
             }
             let uniform;
             if let Some(binding) = pipeline.uniform {
-                let (chunk, at) = self.frame.uniform_slot(uniform_bytes);
+                let (chunk, at) = self
+                    .frame
+                    .uniform_slot(uniform_bytes)
+                    .map_err(|fault| Sink::refuse(fire, fault))?;
                 let mut padded = words.clone();
                 padded.resize(uniform_bytes as usize, 0);
                 core.queue.write_buffer(&chunk, at, &padded);

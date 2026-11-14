@@ -150,14 +150,13 @@ type BindKey = (usize, Vec<View>, Vec<u8>);
 
 #[derive(Default)]
 struct BindCache {
-    groups: HashMap<BindKey, wgpu::BindGroup>,
-
-    chunks: Vec<super::ctx::Held>,
-    used: u64,
+    /// Each group, and the ring lap and byte of its uniform block.
+    groups: HashMap<BindKey, (wgpu::BindGroup, u64, u64)>,
 }
 
-const BIND_CACHE_CAP: usize = 16 * 1024;
-const UNIFORM_ARENA_CHUNK: u64 = 1 << 20;
+/// The bind groups the cache keeps: their uniform blocks fill the uniform
+/// ring the load lays (`ctx::UNIFORM_RING`) at 256 bytes each.
+pub(crate) const BIND_CACHE_CAP: usize = 16 * 1024;
 
 #[derive(Default)]
 pub struct Pipelines {
@@ -214,55 +213,59 @@ impl Pipelines {
     pub(crate) fn bind_group(
         &self,
         core: &Arc<Core>,
+        frame: usize,
         pipeline: &Pipeline,
         views: &[View],
         scalars: &[u8],
         uniform_bytes: u64,
-    ) -> wgpu::BindGroup {
+    ) -> engine_gpu::error::Result<wgpu::BindGroup> {
         let key: BindKey = (
             std::ptr::from_ref(pipeline) as usize,
             views.to_vec(),
             scalars.to_vec(),
         );
-        if let Some(group) = self.binds.borrow().groups.get(&key) {
+        if let Some((group, lap, at)) = self.binds.borrow().groups.get(&key) {
             self.bind_hits.set(self.bind_hits.get() + 1);
             BIND_TRAFFIC[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return group.clone();
+            // The frame reads the group's block: it stands while the frame
+            // encodes.
+            core.uniforms
+                .lock()
+                .expect("uniforms lock poisoned")
+                .hold(frame, *lap, *at);
+            return Ok(group.clone());
         }
         self.bind_misses.set(self.bind_misses.get() + 1);
         BIND_TRAFFIC[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut binds = self.binds.borrow_mut();
         if binds.groups.len() >= BIND_CACHE_CAP {
             binds.groups.clear();
-            // The groups that read the earlier chunks are gone: keep the one
-            // the next uniform is written to.
-            let from = binds.chunks.len().saturating_sub(1);
-            binds.chunks.drain(..from);
-            binds.used = 0;
         }
-        let uniform = pipeline.uniform.map(|binding| {
-            let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
-            let at = binds.used.next_multiple_of(align);
-            if binds.chunks.is_empty() || at + uniform_bytes > UNIFORM_ARENA_CHUNK {
-                binds.chunks.push(core.held(
-                    &wgpu::BufferDescriptor {
-                        label: Some("pie uniform arena"),
-                        size: UNIFORM_ARENA_CHUNK,
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    },
-                    engine_gpu::books::owners::UNIFORMS,
-                ));
-                binds.used = 0;
+        let uniform = match pipeline.uniform {
+            None => None,
+            Some(binding) => {
+                let align = u64::from(core.limits.min_uniform_buffer_offset_alignment).max(16);
+                // A kept group's block stands until the ring wraps over it:
+                // a wrap drops every kept group (a frame still encoding is
+                // never overwritten, `Ring::take`).
+                let mut ring = core.uniforms.lock().expect("uniforms lock poisoned");
+                let (chunk, at, wrapped) = ring.take(
+                    frame,
+                    uniform_bytes,
+                    align,
+                    "bytes of the uniform ring laid at the load",
+                )?;
+                let lap = ring.lap();
+                drop(ring);
+                if wrapped {
+                    binds.groups.clear();
+                }
+                let mut padded = scalars.to_vec();
+                padded.resize(uniform_bytes as usize, 0);
+                core.queue.write_buffer(&chunk, at, &padded);
+                Some((binding, chunk, at, lap))
             }
-            let at = binds.used.next_multiple_of(align);
-            binds.used = at + uniform_bytes;
-            let chunk = (*binds.chunks.last().expect("non-empty")).clone();
-            let mut padded = scalars.to_vec();
-            padded.resize(uniform_bytes as usize, 0);
-            core.queue.write_buffer(&chunk, at, &padded);
-            (binding, chunk, at)
-        });
+        };
         let mut entries: Vec<wgpu::BindGroupEntry<'_>> = Vec::with_capacity(views.len() + 1);
         for (at, (buffer, offset, size)) in views.iter().enumerate() {
             if at >= pipeline.used.len() || !pipeline.used[at] {
@@ -277,7 +280,7 @@ impl Pipelines {
                 }),
             });
         }
-        if let Some((binding, chunk, at)) = &uniform {
+        if let Some((binding, chunk, at, _)) = &uniform {
             entries.push(wgpu::BindGroupEntry {
                 binding: *binding,
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -292,8 +295,11 @@ impl Pipelines {
             layout: &pipeline.layout,
             entries: &entries,
         });
-        binds.groups.insert(key, group.clone());
-        group
+        let (lap, at) = uniform
+            .as_ref()
+            .map_or((0, 0), |&(_, _, at, lap)| (lap, at));
+        binds.groups.insert(key, (group.clone(), lap, at));
+        Ok(group)
     }
 
     /// The pipeline of kernels-slang's module `key` (an instantiation at a
@@ -353,12 +359,7 @@ fn compile(
     })
 }
 
-fn build(
-    core: &Arc<Core>,
-    file: &'static str,
-    name: &'static str,
-    wgsl: &str,
-) -> Result<Pipeline> {
+fn build(core: &Arc<Core>, file: &'static str, name: &'static str, wgsl: &str) -> Result<Pipeline> {
     let shader = |why: String| Fault::Shader {
         file,
         entrypoint: name,

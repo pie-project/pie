@@ -116,7 +116,7 @@ impl Widen {
             lanes,
             pad: 0,
         });
-        let (cfg, cfg_at) = frame.uniform_slot(bytes.len() as u64);
+        let (cfg, cfg_at) = frame.uniform_slot(bytes.len() as u64)?;
         self.core.queue.write_buffer(&cfg, cfg_at, &bytes);
 
         let group = self

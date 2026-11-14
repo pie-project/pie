@@ -101,6 +101,16 @@ impl Serve for Api {
         device.enabled().memory_budget
     }
 
+    fn lay_frames(device: &Context, arms: u32, dispatches: u32) -> Result<()> {
+        // A pool for every frame that can hold sets at once: each kept
+        // recording, and for each frame in flight its fire, the feed and
+        // guest frames beside it, and the one being walked.
+        let frames = u32::try_from(crate::record::SHAPES_KEPT).unwrap_or(u32::MAX)
+            + 3 * arms.max(1)
+            + FRAMES_BESIDE;
+        device.lay_frames(frames, dispatches)
+    }
+
     fn builds(device: &Context, key: &str, tier: &str) -> bool {
         // A tactic fires at the baseline, the subgroup tier or, where the
         // device has them, cooperative matrices.
@@ -368,6 +378,11 @@ impl Serve for Api {
         Ok(())
     }
 }
+
+/// The frames beside the fires' that may hold descriptor sets at once: the
+/// one walking and the device's own (a pool's evacuation copy, a guest
+/// pass's widen).
+const FRAMES_BESIDE: u32 = 4;
 
 fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
     let mut key = crate::record::KeyBuilder::new();

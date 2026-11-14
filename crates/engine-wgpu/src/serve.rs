@@ -82,6 +82,14 @@ impl Serve for Api {
         device.measures_outside()
     }
 
+    fn lay_frames(device: &Context, _arms: u32, _dispatches: u32) -> Result<()> {
+        // A bind group's uniform block and a frame's scratch come from two
+        // rings laid once: a frame in flight is never written over (the
+        // queue orders it before any later write), and a frame encoding
+        // past a ring's room is refused.
+        device.lay_frames()
+    }
+
     fn builds(device: &Context, key: &str, tier: &str) -> bool {
         let runs = match tier {
             "baseline" => true,
