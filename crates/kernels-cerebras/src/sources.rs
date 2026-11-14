@@ -66,6 +66,12 @@ pub const OPS: &[(&str, &str)] = &[
     ("wpe.csl", include_str!("../programs/wafer/ops/wpe.csl")),
 ];
 
+/// The stream regime's op modules (GENERIC.md §3.1, M1c), `programs/wafer/ops` too: P1-stream (the
+/// matvec over a row stream). No decode kind imports them, and a decode build neither writes nor
+/// keys them, so the shipping programs stay byte-identical; the stream build (M1d) takes them
+/// with [`OPS`].
+pub const STREAM_OPS: &[(&str, &str)] = &[("smv.csl", include_str!("../programs/wafer/ops/smv.csl"))];
+
 /// The source of the kernel file `name`.
 pub fn get(name: &str) -> Option<&'static str> {
     KERNELS.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
@@ -92,7 +98,10 @@ mod tests {
     fn every_kernel_and_op_is_embedded() {
         let names: Vec<&str> = super::KERNELS.iter().map(|(n, _)| *n).collect();
         assert_eq!(files("programs/wafer"), names);
-        let ops: Vec<&str> = super::OPS.iter().map(|(n, _)| *n).collect();
+        let mut ops: Vec<&str> = (super::OPS.iter().chain(super::STREAM_OPS))
+            .map(|(n, _)| *n)
+            .collect();
+        ops.sort_unstable();
         assert_eq!(files("programs/wafer/ops"), ops);
     }
 }

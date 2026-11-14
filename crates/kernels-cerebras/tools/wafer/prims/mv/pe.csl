@@ -1,0 +1,84 @@
+// prims/mv's PEs (layout.csl): ROLE 0 a row source, 1 a weight PE (ops/smv.csl), 2 a chain root,
+// 3 idle. tsc: the role's first and last row stamps (TSC low words), [0] / [1].
+param memcpy_params;
+param ROLE: u16;
+param FIRST: bool;
+param Hc: u16;
+param Nc: u16;
+param TB: u16;
+param C_ROW: color;
+param CIN: color;
+param COUT: color;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const timestamp = @import_module("<time>");
+const fab = @import_module("ops/fabric.csl");
+
+const q_in1 = @get_input_queue(2);
+const q_in2 = @get_input_queue(3);
+const q_x = @get_input_queue(4);
+const q_out = @get_output_queue(5);
+const q_row = @get_output_queue(2);
+const red = @import_module("ops/red.csl", .{ .fab = fab, .IN1 = q_in1, .IN2 = q_in2, .OUT = q_out,
+                                             .UT1 = @get_ut_id(2), .UT2 = @get_ut_id(3) });
+const smv = @import_module("ops/smv.csl", .{ .fab = fab, .red = red, .XQ = q_x,
+                                             .Hc = if (ROLE == 1) Hc else 1, .Nc = if (ROLE == 1) Nc else 1 });
+
+const XN: u16 = if (ROLE == 0) TB * Hc else 1;
+const ON: u16 = if (ROLE == 2) TB * Nc else 1;
+var xs = @zeros([XN]f32);
+var out = @zeros([ON]f32);
+var tsc = @zeros([2]u32);
+var ts = @zeros([3]u16);
+var w_ptr: [*]u16 = &smv.w;
+var xs_ptr: [*]f32 = &xs;
+var out_ptr: [*]f32 = &out;
+var tsc_ptr: [*]u32 = &tsc;
+
+fn stamp(i: u16) void { timestamp.get_timestamp(&ts); tsc[i] = @as(u32, ts[0]) | (@as(u32, ts[1]) << 16); }
+
+var nrows: u16 = 0;
+const T_RUN: local_task_id = @get_local_task_id(8);
+task go() void {
+  const n = nrows;
+  timestamp.enable_tsc();
+  if (ROLE == 0) {
+    var t: u16 = 0;
+    while (t < n) : (t += 1) {
+      if (t == 0) { stamp(0); }
+      const src = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> xs[i] });
+      @fmovs(fab.fout(q_row, Hc), @increment_dsd_offset(src, @as(i16, t * Hc), f32));
+    }
+    stamp(1);
+  } else if (ROLE == 1) {
+    red.role = if (FIRST) 0 else 1;
+    stamp(0);
+    smv.rows(n);
+    stamp(1);
+  } else if (ROLE == 2) {
+    var t: u16 = 0;
+    while (t < n) : (t += 1) {
+      const dst = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Nc} -> out[i] });
+      @fmovs(@increment_dsd_offset(dst, @as(i16, t * Nc), f32), fab.fin(q_in1, Nc));
+      if (t == 0) { stamp(0); }
+    }
+    stamp(1);
+  }
+  sys_mod.unblock_cmd_stream();
+}
+fn run(n: u16) void { nrows = n; @activate(T_RUN); }
+
+comptime {
+  @bind_local_task(go, T_RUN);
+  @export_symbol(w_ptr, "w");
+  @export_symbol(xs_ptr, "xs");
+  @export_symbol(out_ptr, "out");
+  @export_symbol(tsc_ptr, "tsc");
+  @export_symbol(run);
+  // each input queue its own colour; the unused ones parked on colours nothing routes here
+  @initialize_queue(q_in1, .{ .color = if ((ROLE == 1 and !FIRST) or ROLE == 2) CIN else @get_color(16) });
+  @initialize_queue(q_in2, .{ .color = @get_color(17) });
+  @initialize_queue(q_x, .{ .color = if (ROLE == 1) C_ROW else @get_color(18) });
+  @initialize_queue(q_out, .{ .color = if (ROLE == 1) COUT else @get_color(19) });
+  @initialize_queue(q_row, .{ .color = if (ROLE == 0) C_ROW else @get_color(20) });
+}

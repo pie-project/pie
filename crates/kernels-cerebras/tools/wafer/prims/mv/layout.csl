@@ -1,0 +1,53 @@
+// prims/mv: P1-stream (ops/smv.csl) on its own. A column of row sources (CX roots, x = 0) feeds
+// TB rows through PX x PY weight PEs (x 1..PX, y 0..PY-1): each source multicasts its Hc of a row
+// east along its weight row; each weight column's partials chain south into its root (y = PY).
+param PX: u16;
+param PY: u16;
+param Hc: u16;
+param Nc: u16;
+param TB: u16;
+
+const C_ROW: color = @get_color(1);
+const C_CH0: color = @get_color(2);   // the chain's colours alternate by row
+const C_CH1: color = @get_color(3);
+
+const memcpy = @import_module("<memcpy/get_params>", .{ .width = PX + 1, .height = PY + 1 });
+
+fn chain(y: u16) color { return if (y % 2 == 0) C_CH0 else C_CH1; }
+
+layout {
+  @set_rectangle(PX + 1, PY + 1);
+  for (@range(u16, PX + 1)) |x| {
+    const mp = memcpy.get_params(x);
+    for (@range(u16, PY + 1)) |y| {
+      const role: u16 = if (x == 0 and y == PY) 3 else if (x == 0) 0 else if (y == PY) 2 else 1;
+      const cin: color = if (y == 0) C_CH0 else chain(y - 1);
+      @set_tile_code(x, y, "pe.csl", .{
+        .memcpy_params = mp, .ROLE = role, .FIRST = y == 0, .Hc = Hc, .Nc = Nc, .TB = TB,
+        .C_ROW = C_ROW, .CIN = cin, .COUT = chain(y),
+      });
+      if (role == 0) {
+        @set_color_config(x, y, C_ROW, .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } } });
+      }
+      if (role == 1) {
+        if (x < PX) {
+          @set_color_config(x, y, C_ROW, .{ .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP, EAST } } });
+        } else {
+          @set_color_config(x, y, C_ROW, .{ .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } } });
+        }
+        @set_color_config(x, y, chain(y), .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ SOUTH } } });
+        if (y > 0) {
+          @set_color_config(x, y, chain(y - 1), .{ .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP } } });
+        }
+      }
+      if (role == 2) {
+        @set_color_config(x, y, chain(y - 1), .{ .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP } } });
+      }
+    }
+  }
+  @export_name("w", [*]u16, true);
+  @export_name("xs", [*]f32, true);
+  @export_name("out", [*]f32, true);
+  @export_name("tsc", [*]u32, true);
+  @export_name("run", fn(u16) void);
+}
