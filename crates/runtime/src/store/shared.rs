@@ -153,20 +153,22 @@ impl Drop for RungWant {
     }
 }
 
-/// Per process, the ask its last pass made: held while the process lives
-/// and its passes stay wide, so the gaps between the passes of one prompt
-/// (an inferlet feeding a prompt in several passes) lower nothing.
-static PROCESS_WANTS: std::sync::LazyLock<Mutex<std::collections::HashMap<uuid::Uuid, RungWant>>> =
+/// Per process, the prompt rows its last pass asked of the rung, by engine:
+/// held while the process lives and its passes stay wide, so the gaps
+/// between the passes of one prompt lower nothing; the prompts in flight
+/// together ask for their rows summed ([`wanted_rows`]).
+static PROCESS_WANTS: std::sync::LazyLock<Mutex<std::collections::HashMap<uuid::Uuid, (usize, u32)>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
-/// Process `pid`'s pass on `engine` asks fires of `rows` (`None`: a pass of
-/// a few rows, a decode, asks nothing): what its process holds the rung
-/// for until its next pass says otherwise, or it ends ([`forget_process`]).
+/// Process `pid`'s pass on `engine` carries `rows` of a prompt (`None`: a
+/// pass of a few rows, a decode, asks nothing): what its process holds the
+/// rung for until its next pass says otherwise, or it ends
+/// ([`forget_process`]).
 pub fn hold_for_process(pid: uuid::Uuid, engine: usize, rows: Option<u32>) {
     let mut wants = PROCESS_WANTS.lock().unwrap();
     match rows {
         Some(rows) => {
-            wants.insert(pid, want_rows(engine, rows));
+            wants.insert(pid, (engine, rows));
         }
         None => {
             wants.remove(&pid);
@@ -235,16 +237,31 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
     drop(pool);
 }
 
-/// The most rows a pass still to run on `engine` asks of one fire; 0 where
-/// none asks.
+/// The rows the passes still to run on `engine` ask of one fire: the
+/// widest a pass asks alone, or the prompts in flight together, their rows
+/// summed beside the decode row each other live lane spends (one fire
+/// carries them all at the rung that holds it); 0 where none asks.
 #[must_use]
 pub fn wanted_rows(engine: usize) -> u32 {
-    RUNG_WANTS
+    let alone = RUNG_WANTS
         .lock()
         .unwrap()
         .get(&engine)
         .and_then(|wants| wants.values().copied().max())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let (prompts, rows) = PROCESS_WANTS
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|(on, _)| *on == engine)
+        .fold((0usize, 0u32), |(n, sum), (_, rows)| (n + 1, sum.saturating_add(*rows)));
+    let together = if prompts == 0 {
+        0
+    } else {
+        let decodes = crate::inferlet::process::live_count().saturating_sub(prompts);
+        rows.saturating_add(u32::try_from(decodes).unwrap_or(u32::MAX))
+    };
+    alone.max(together)
 }
 
 /// One step of moving the activation rung toward a goal ([`RungWalk`]).

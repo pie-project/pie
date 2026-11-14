@@ -2952,7 +2952,16 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // the pool raises toward it where room allows, and lowers once no
         // pass asks past its smallest rung, so no piece cut wider waits on a
         // lowered rung.
-        let wanted = prefill_want(rows_total, engine);
+        // The process holds its prompt's rows past this pass (an inferlet
+        // feeding a prompt in several passes lowers nothing between them);
+        // a pass of a few rows says its process asks nothing. The prompts
+        // in flight together ask for the fire that carries them all.
+        crate::store::shared::hold_for_process(
+            pid,
+            engine,
+            (rows_total > RUNG_WANT_FROM).then(|| u32::try_from(rows_total).unwrap_or(u32::MAX)),
+        );
+        let wanted = prefill_want(rows_total, engine).max(crate::store::shared::wanted_rows(engine));
         let rung_want = (rows_total > RUNG_WANT_FROM).then(|| {
             let want = crate::store::shared::want_rows(engine, wanted);
             if let Some(shared) = stores.shared.as_ref() {
@@ -2987,14 +2996,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
         } else {
             (wanted, rung_want)
         };
-        // The process holds the ask past this pass (an inferlet feeding a
-        // prompt in several passes lowers nothing between them); a pass of a
-        // few rows says its process asks nothing.
-        crate::store::shared::hold_for_process(
-            pid,
-            engine,
-            (rows_total > RUNG_WANT_FROM).then_some(wanted),
-        );
         // What the rung lacks for it is funded beside the pass.
         let funding = match stores.shared.as_ref() {
             Some(shared)
