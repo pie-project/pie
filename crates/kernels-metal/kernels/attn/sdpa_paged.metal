@@ -169,8 +169,8 @@ inline void sdpa_paged_decode_body(
   const bool masked = mask_word != 0;
 
   auto absorb = [&](uint page, uint off) {
-    const size_t kcell = size_t(page) * k_page + (off * k_row);
-    const size_t vcell = size_t(page) * v_page + (off * v_row);
+    const size_t kcell = pie_page_at(page, k_page, kv_unit) + (off * k_row);
+    const size_t vcell = pie_page_at(page, v_page, kv_unit) + (off * v_row);
     if constexpr (PACKED) {
       // Byte-index the lane's slice of the packed 130-byte block: read the K and
       // V per-block fp16 scales once, then dequantize this lane's own elements
@@ -690,10 +690,12 @@ inline void sdpa_paged_tiled_body(
       // out of the element loop.
       if (int(lid) < cnt) {
         const int kp = base + int(lid);
-        const ulong page = ulong(kv_page_indices[page_base + kp / page_size]);
+        const uint page = uint(kv_page_indices[page_base + kp / page_size]);
         const ulong off = ulong(kp % page_size);
-        cells[lid] = page * k_page + off * k_row + ulong(kv_head) * kv_head_width;
-        cells[KT + lid] = page * v_page + off * v_row + ulong(kv_head) * kv_head_width;
+        cells[lid] = pie_page_at(page, k_page, kv_unit) + off * k_row +
+                     ulong(kv_head) * kv_head_width;
+        cells[KT + lid] = pie_page_at(page, v_page, kv_unit) + off * v_row +
+                          ulong(kv_head) * kv_head_width;
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
       for (int e = int(lid); e < cnt * D; e += 1024) {

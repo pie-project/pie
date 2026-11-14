@@ -74,9 +74,9 @@ inline void q8_decode_body(const device T *queries, const device T *k_pages,
   auto absorb = [&](uint page, uint off) {
     const ulong at = (ulong(off) * n_kv_heads + kv_head_idx) * ulong(2 * D);
     const device char *kb = reinterpret_cast<const device char *>(k_pages) + kvl.k_offset +
-                            ulong(page) * kvl.k_page + at;
+                            pie_page_at(page, kvl.k_page, 1) + at;
     const device char *vb = reinterpret_cast<const device char *>(v_pages) + kvl.v_offset +
-                            ulong(page) * kvl.v_page + at;
+                            pie_page_at(page, kvl.v_page, 1) + at;
     const float ks = *reinterpret_cast<const device float *>(kb + D);
     const float vs = *reinterpret_cast<const device float *>(vb + D);
     for (int j = 0; j < qk_per_thread; ++j)
@@ -288,9 +288,9 @@ q8_vector_gqa(const device bfloat *queries [[buffer(0)]], const device bfloat *k
   auto absorb = [&](uint page, uint off) {
     const size_t at = (size_t(off) * kv_heads + kv) * 2 * D;
     const device char *kb =
-        reinterpret_cast<const device char *>(keys) + k_offset + ulong(page) * k_page_stride + at;
+        reinterpret_cast<const device char *>(keys) + k_offset + pie_page_at(page, k_page_stride, 1) + at;
     const device char *vb = reinterpret_cast<const device char *>(values) + v_offset +
-                            ulong(page) * v_page_stride + at;
+                            pie_page_at(page, v_page_stride, 1) + at;
     const float ks = *reinterpret_cast<const device float *>(kb + D);
     const float vs = *reinterpret_cast<const device float *>(vb + D);
     float k[PER], v[PER];

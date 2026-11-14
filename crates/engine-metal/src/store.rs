@@ -67,7 +67,9 @@ pub struct Seats {
 }
 
 /// Bytes of one state row's segment table: its head and one segment.
-const STATE_MAP_BYTES: u64 = ((StateMap::HEAD + 1) * 8) as u64;
+/// A state row's segment table: the head and a base for each buffer the
+/// range may span (`pool::MAX_PARTS`), the unused ones repeating the last.
+const STATE_MAP_BYTES: u64 = ((StateMap::HEAD + pool::MAX_PARTS) * 8) as u64;
 
 #[derive(Debug)]
 struct Spill {

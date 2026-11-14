@@ -80,8 +80,8 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
     }
     for (int base = (first / N) * N; base <= last; base += N) {
       const uint physical = pages[ptr[req] + base / N];
-      const ulong k_at = ulong(physical) * (k_page_stride / sizeof(KV)) + ulong(kv) * W;
-      const ulong v_at = ulong(physical) * (v_page_stride / sizeof(KV)) + ulong(kv) * W;
+      const ulong k_at = pie_page_at(physical, k_page_stride / sizeof(KV), sizeof(KV)) + ulong(kv) * W;
+      const ulong v_at = pie_page_at(physical, v_page_stride / sizeof(KV), sizeof(KV)) + ulong(kv) * W;
       auto b = tensor(const_cast<device KV *>(kplane) + k_at, dextents<int, 2>{D, N},
                       array<int, 2>{1, kv_heads * W});
       auto score =

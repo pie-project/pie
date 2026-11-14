@@ -20,6 +20,34 @@ constant ulong pie_fc_v_page [[function_constant(1)]];
 constant bool pie_fc_pages = is_function_constant_defined(pie_fc_k_page) &&
                              is_function_constant_defined(pie_fc_v_page);
 
+// A pool past one buffer's length spans up to four (`engine-metal`'s
+// `store::pool`): a page id then names its buffer in its top two bits and
+// its page in that buffer under them, and a kernel reaches buffer `b` from
+// the plane bound in the first by buffer `b`'s address less the first's
+// (`pie_fc_pool_delta1..3`, bytes, wrapping). Function constants, fixed for
+// a load, so a pool of one buffer compiles to `page * stride`, bit for bit.
+constant bool pie_fc_pool_split [[function_constant(2)]];
+constant ulong pie_fc_pool_delta1 [[function_constant(3)]];
+constant ulong pie_fc_pool_delta2 [[function_constant(4)]];
+constant ulong pie_fc_pool_delta3 [[function_constant(5)]];
+constant bool pie_pool_split =
+    is_function_constant_defined(pie_fc_pool_split) && pie_fc_pool_split;
+
+// Where page `page` starts, from the plane bound in the first buffer, in
+// units of `unit` bytes (an element's, or 1 for bytes): `stride` units a
+// page.
+inline ulong pie_page_at(uint page, ulong stride, ulong unit) {
+  if (!pie_pool_split) {
+    return ulong(page) * stride;
+  }
+  const uint part = page >> 30;
+  const ulong delta = part == 0u   ? 0ul
+                      : part == 1u ? pie_fc_pool_delta1
+                      : part == 2u ? pie_fc_pool_delta2
+                                   : pie_fc_pool_delta3;
+  return ulong(page & 0x3fffffffu) * stride + ulong(long(delta) / long(unit));
+}
+
 struct pie_kv_layout {
   ulong k_page;
   ulong v_page;

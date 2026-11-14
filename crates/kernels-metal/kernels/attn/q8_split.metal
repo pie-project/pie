@@ -96,8 +96,8 @@ template <int GH, typename KV = int8_t, int DD = 256>
         break;
 
       const uint physical = kv_page_indices[kv_page_indptr[req] + page];
-      const ulong k_at = ulong(physical) * (k_page_stride / sizeof(KV)) + ulong(kv) * W;
-      const ulong v_at = ulong(physical) * (v_page_stride / sizeof(KV)) + ulong(kv) * W;
+      const ulong k_at = pie_page_at(physical, k_page_stride / sizeof(KV), sizeof(KV)) + ulong(kv) * W;
+      const ulong v_at = pie_page_at(physical, v_page_stride / sizeof(KV), sizeof(KV)) + ulong(kv) * W;
       auto k = tensor(const_cast<device KV *>(kplane) + k_at, dextents<int, 2>{D, N},
                       array<int, 2>{1, n_kv_heads * W});
       auto score =
