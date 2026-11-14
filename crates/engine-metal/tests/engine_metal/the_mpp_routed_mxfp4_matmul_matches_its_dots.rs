@@ -27,9 +27,6 @@ fn every_routed_row_answers_its_experts_exact_mxfp4_reference() {
     let Ok(device) = Context::bind() else {
         return;
     };
-    if !device.supports_elastic() {
-        return;
-    }
     let handles = Handles::new();
     let pipelines = Pipelines::new();
     let tuning = engine_metal::chip::tuning(

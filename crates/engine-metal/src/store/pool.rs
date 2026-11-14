@@ -2,13 +2,12 @@
 //! physical chunk `p` at `p * chunk_bytes` from its base, every kind of held
 //! state (kv pages, recurrent records, rs buffer pages) in chunks of it.
 //!
-//! On a Metal 4 device the buffer is placement sparse: its address range is
+//! The buffer is placement sparse (Metal 4, which the context requires): its address range is
 //! the whole pool from the load on, and memory comes and goes beneath it a
 //! segment (`segment_chunks` chunks) at a time, always the first `n`
 //! segments ([`Pool::commit_segments`], [`Pool::release_segments`]). A
 //! segment edge inside a 256 KiB tile keeps that tile mapped while either
-//! side is committed. A device without sparse buffers holds the pool flat,
-//! whole from the load.
+//! side is committed.
 //!
 //! The activation span is the top `act` chunks (`act_chunks` of the
 //! largest rung): the segments it starts in and above are backed from the
@@ -34,6 +33,7 @@ pub const SEGMENT_BYTES: u64 = 64 << 20;
 
 #[derive(Debug)]
 enum Backing {
+    #[cfg(not(target_vendor = "apple"))]
     Flat(Buffer),
     #[cfg(target_vendor = "apple")]
     Sparse {
@@ -114,14 +114,15 @@ impl Pool {
         }
         let bytes = chunk_bytes.saturating_mul(u64::from(total_chunks));
         #[cfg(target_vendor = "apple")]
-        if let Some(sparse) = device.sparse()? {
+        {
+            let sparse = device.sparse()?;
             let arena = elastic::Arena::new(elastic::pages_up(bytes));
             let mut store = elastic::create(&sparse, &arena, bytes)?;
             if act > 0 {
                 let first = top_first(total_chunks, segment_chunks, act);
                 store.pin_top(pinned_from(first, chunk_bytes))?;
             }
-            return Ok(Pool {
+            Ok(Pool {
                 backing: Backing::Sparse {
                     view: store.view(),
                     store,
@@ -133,8 +134,11 @@ impl Pool {
                 committed: 0,
                 act,
                 table: ChunkTable::identity(total_chunks),
-            });
+            })
         }
+        // No device off Apple: a flat pool stands in for the tests that
+        // build one, and `Buffer::zeroed` refuses there.
+        #[cfg(not(target_vendor = "apple"))]
         let mut pool = Pool {
             backing: Backing::Flat(Buffer::zeroed(device, bytes)?),
             chunk_bytes,
@@ -144,8 +148,11 @@ impl Pool {
             act,
             table: ChunkTable::identity(total_chunks),
         };
-        pool.committed = pool.segments();
-        Ok(pool)
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            pool.committed = pool.segments();
+            Ok(pool)
+        }
     }
 
     #[must_use]
@@ -217,6 +224,7 @@ impl Pool {
     #[must_use]
     pub fn top_held_bytes(&self) -> u64 {
         match &self.backing {
+            #[cfg(not(target_vendor = "apple"))]
             Backing::Flat(_) => u64::from(self.total_chunks - self.top_first()) * self.chunk_bytes,
             #[cfg(target_vendor = "apple")]
             Backing::Sparse { store, .. } => store.top_held(),
@@ -237,6 +245,7 @@ impl Pool {
     #[must_use]
     pub fn is_sparse(&self) -> bool {
         match &self.backing {
+            #[cfg(not(target_vendor = "apple"))]
             Backing::Flat(_) => false,
             #[cfg(target_vendor = "apple")]
             Backing::Sparse { .. } => true,
@@ -247,6 +256,7 @@ impl Pool {
     #[must_use]
     pub fn view(&self) -> &Buffer {
         match &self.backing {
+            #[cfg(not(target_vendor = "apple"))]
             Backing::Flat(buffer) => buffer,
             #[cfg(target_vendor = "apple")]
             Backing::Sparse { view, .. } => view,
@@ -263,6 +273,7 @@ impl Pool {
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
         match &self.backing {
+            #[cfg(not(target_vendor = "apple"))]
             Backing::Flat(buffer) => buffer.bytes(),
             #[cfg(target_vendor = "apple")]
             Backing::Sparse { store, .. } => store.committed(),
@@ -274,6 +285,7 @@ impl Pool {
     #[must_use]
     pub fn held_bytes(&self) -> u64 {
         match &self.backing {
+            #[cfg(not(target_vendor = "apple"))]
             Backing::Flat(buffer) => buffer.bytes(),
             #[cfg(target_vendor = "apple")]
             Backing::Sparse { store, .. } => store.held(),
@@ -284,6 +296,7 @@ impl Pool {
     #[must_use]
     pub fn high_water_bytes(&self) -> u64 {
         match &self.backing {
+            #[cfg(not(target_vendor = "apple"))]
             Backing::Flat(buffer) => buffer.bytes(),
             #[cfg(target_vendor = "apple")]
             Backing::Sparse { arena, .. } => arena.budget().high_water,
@@ -347,7 +360,8 @@ impl Pool {
         #[cfg(target_vendor = "apple")]
         let (top, pinned) = (self.top_first(), self.pinned_from());
         #[cfg(target_vendor = "apple")]
-        if let Backing::Sparse { store, .. } = &mut self.backing {
+        {
+            let Backing::Sparse { store, .. } = &mut self.backing;
             let chunks = segments.saturating_mul(self.segment_chunks).min(top);
             let bytes = (u64::from(chunks) * self.chunk_bytes).min(pinned);
             elastic::grow_all(&mut [elastic::Target {
@@ -372,7 +386,8 @@ impl Pool {
         #[cfg(target_vendor = "apple")]
         let (top, pinned) = (self.top_first(), self.pinned_from());
         #[cfg(target_vendor = "apple")]
-        if let Backing::Sparse { store, .. } = &mut self.backing {
+        {
+            let Backing::Sparse { store, .. } = &mut self.backing;
             let bytes = (u64::from(segments.saturating_mul(self.segment_chunks).min(top))
                 * self.chunk_bytes)
                 .min(pinned);
@@ -385,7 +400,7 @@ impl Pool {
             }
         }
         #[cfg(target_vendor = "apple")]
-        if matches!(self.backing, Backing::Sparse { .. }) {
+        {
             self.committed = segments;
         }
         Ok(())
@@ -427,6 +442,7 @@ impl Pool {
         self.admit(physical)?;
         let offset = u64::from(physical) * self.chunk_bytes;
         match &self.backing {
+            #[cfg(not(target_vendor = "apple"))]
             Backing::Flat(buffer) => buffer.host_span(offset, self.chunk_bytes),
             #[cfg(target_vendor = "apple")]
             Backing::Sparse { store, .. } => store.host_span(offset, self.chunk_bytes),
@@ -436,6 +452,7 @@ impl Pool {
     /// `into.len()` bytes from `offset`, read on the host.
     pub fn read(&self, offset: u64, into: &mut [u8]) -> Result<()> {
         match &self.backing {
+            #[cfg(not(target_vendor = "apple"))]
             Backing::Flat(buffer) => buffer.read(offset, into),
             #[cfg(target_vendor = "apple")]
             Backing::Sparse { store, .. } => store.read_into(offset, into),
@@ -446,6 +463,7 @@ impl Pool {
     /// frame that touches these bytes.
     pub fn write(&mut self, offset: u64, from: &[u8]) -> Result<()> {
         match &mut self.backing {
+            #[cfg(not(target_vendor = "apple"))]
             Backing::Flat(buffer) => buffer.write(offset, from),
             #[cfg(target_vendor = "apple")]
             // SAFETY: the caller's contract, restated on every host write.
@@ -456,6 +474,7 @@ impl Pool {
     /// Zeroes `len` bytes at `offset` on the host; as [`Pool::write`].
     pub fn zero(&mut self, offset: u64, len: u64) -> Result<()> {
         match &mut self.backing {
+            #[cfg(not(target_vendor = "apple"))]
             Backing::Flat(buffer) => buffer.zero_span(offset, len),
             #[cfg(target_vendor = "apple")]
             // SAFETY: as `write`.
@@ -478,9 +497,6 @@ mod tests {
         assert_eq!(top_first(12, 4, 5), 4);
         assert_eq!(top_first(12, 4, 0), 12, "no span, no top");
         let device = Context::bind().expect("a device");
-        if device.sparse().expect("the sparse side").is_none() {
-            return;
-        }
         let mut pool = Pool::reserve(&device, CHUNK, 12, 4, 3).expect("a pool");
         assert_eq!(pool.growth(), engine::chunk::Growth::TwoEnded);
         assert_eq!(pool.span_offset(), 9 * CHUNK);
