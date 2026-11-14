@@ -536,9 +536,15 @@ impl Private {
     /// The device bytes this load holds, as (model, fire): the weight and
     /// scale surfaces, and the activation surfaces, partials and staging.
     #[must_use]
-    pub fn bytes(&self) -> (u64, u64) {
+    /// (model surfaces, a fire's surfaces, staging buffers).
+    pub fn bytes(&self) -> (u64, u64, u64) {
         let model = self.buffers.model;
-        (model, self.buffers.bytes().saturating_sub(model))
+        let staging = self.buffers.staging;
+        (
+            model,
+            self.buffers.bytes().saturating_sub(model + staging),
+            staging,
+        )
     }
 
     /// The most rows the Neural Engine takes a share of in one fire; a fire

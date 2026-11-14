@@ -1014,7 +1014,9 @@ impl PreparedLoad<'_> {
         // weights and constants, and the activation span at its widest
         // (the arena, every frame's staged inputs and readout, the kernel
         // scratch), the Neural Engine's surfaces split between the two.
-        let (ane_model, ane_fire) = ane.as_ref().map_or((0, 0), crate::ane::Ane::bytes);
+        let (ane_model, ane_fire, ane_staging) =
+            ane.as_ref().map_or((0, 0, 0), crate::ane::Ane::bytes);
+        let ane_fire = ane_fire + ane_staging;
         // The engine's own tables (`Reserved::Tables`): a run of whole
         // chunks right after the null chunk, model bytes in the pool: the
         // registered adapter banks, the weight caches' atom tables and use
@@ -1874,7 +1876,8 @@ impl Shell {
             self.budget
                 .map_or(self.working_set(), |budget| budget.min(self.working_set())),
         );
-        let (ane_model, ane_fire) = self.ane.as_ref().map_or((0, 0), crate::ane::Ane::bytes);
+        let (ane_model, ane_fire, ane_staging) =
+            self.ane.as_ref().map_or((0, 0, 0), crate::ane::Ane::bytes);
         let entries = [
             (Outside, "before the load", self.outside),
             (
@@ -1906,8 +1909,13 @@ impl Shell {
             ),
             (
                 Fire,
-                "ane staging and surfaces (IOSurfaces outside the pool by the OS)",
+                "ane fire surfaces (IOSurfaces outside the pool by the OS)",
                 ane_fire,
+            ),
+            (
+                Fire,
+                "ane staging (fixed buffers of the opt-in Neural Engine path, for the load's life)",
+                ane_staging,
             ),
             (
                 Fire,
