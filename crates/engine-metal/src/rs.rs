@@ -320,29 +320,37 @@ impl Layout {
 
 #[derive(Debug)]
 pub struct Buffers {
-    slab: Buffer,
+    /// The pool's buffers, the first the one kernels bind (reaching the
+    /// others from it, `kv_page.h`).
+    parts: Vec<Buffer>,
     page_tokens: u32,
-    /// The page ids the slab holds: units of `stride` across the state
-    /// pool it lives in.
-    slots: u32,
+    /// An rs-list slot's bytes: what a page id steps by in a chunk.
     page_bytes: u64,
-    /// What a page id steps by: `gcd(chunk, page)` in the state pool.
-    stride: u64,
+    /// The rs list's slots a chunk.
+    per_chunk: u32,
+    /// How a page id names its slot.
+    ids: crate::store::pool::PageIds,
     plane_at: Vec<u64>,
 }
 
 impl Buffers {
-    /// The rs buffer as the state pool's rs list (`slab`): each plane's
-    /// `page_tokens` rows at `plane_at` in an rs-list slot, a lane's page ids
-    /// counting `stride` bytes from the pool's base.
+    /// The rs buffer as the state pool's rs list over the pool's buffers
+    /// `parts`: each plane's `page_tokens` rows at `plane_at` in an rs-list
+    /// slot of `slots`, a lane's pages named as `ids` states.
     #[must_use]
-    pub fn in_pool(plane_at: Vec<u64>, page_tokens: u32, slab: Buffer, stride: u64) -> Buffers {
+    pub fn in_pool(
+        plane_at: Vec<u64>,
+        page_tokens: u32,
+        parts: Vec<Buffer>,
+        slots: crate::store::layout::Slots,
+        ids: crate::store::pool::PageIds,
+    ) -> Buffers {
         Buffers {
-            slots: u32::try_from(slab.bytes() / stride.max(1)).unwrap_or(u32::MAX),
-            slab,
+            parts,
             page_tokens: page_tokens.max(1),
-            page_bytes: stride,
-            stride,
+            page_bytes: slots.slot_bytes,
+            per_chunk: slots.per_chunk,
+            ids,
             plane_at,
         }
     }
@@ -378,13 +386,11 @@ impl Buffers {
         self.page_bytes
     }
 
-    #[must_use]
-    pub fn page_count(&self) -> u32 {
-        self.slots
-    }
-
-    fn handle(&self, handles: &Handles) -> Result<u32> {
-        handles.bind(&self.slab, 0, self.slab.bytes())
+    fn handles(&self, handles: &Handles) -> Result<Vec<u32>> {
+        self.parts
+            .iter()
+            .map(|part| handles.bind(part, 0, part.bytes()))
+            .collect()
     }
 }
 
@@ -398,7 +404,7 @@ pub const PAGE_INTS: u32 = kernels_metal::ssm::RS_PAGE_INTS;
 /// lane's replayed and own rows fit the row's pages; else `None`, and the
 /// fire's recurrent ops gather and scatter by copies.
 #[must_use]
-pub fn page_table(lanes: &[LanePlan], page_tokens: u32, pool_slots: u32) -> Option<Vec<i32>> {
+pub fn page_table(lanes: &[LanePlan], page_tokens: u32) -> Option<Vec<i32>> {
     let page_tokens = page_tokens.max(1);
     let mut table = Vec::with_capacity(lanes.len() * PAGE_INTS as usize);
     for plan in lanes {
@@ -427,9 +433,6 @@ pub fn page_table(lanes: &[LanePlan], page_tokens: u32, pool_slots: u32) -> Opti
         }
         row[0] = i32::try_from(in_page).ok()?;
         for (at, &slot) in pages.get(page0..page0 + touched)?.iter().enumerate() {
-            if slot >= pool_slots {
-                return None;
-            }
             row[1 + at] = i32::try_from(slot).ok()?;
         }
         table.extend(row);
@@ -443,12 +446,17 @@ pub struct Seat {
     pub replay: Tensor,
     pub commit: Tensor,
     pub slots: Tensor,
-    pub pool: u32,
+    /// Each of the pool's buffers, bound: the first the one kernels read
+    /// every page through.
+    pub pool: Vec<u32>,
+    /// The first buffer's bytes.
+    pub first_bytes: u64,
     pub layout: Arc<Layout>,
     pub plane_at: Vec<u64>,
     pub page_tokens: u32,
     pub page_bytes: u64,
-    pub pool_slots: u32,
+    pub per_chunk: u32,
+    pub ids: crate::store::pool::PageIds,
     pub ext_in: Vec<Tensor>,
     pub ext_out: Vec<Tensor>,
     pub work: Tensor,
@@ -546,12 +554,14 @@ impl Seat {
             replay,
             commit,
             slots,
-            pool: buffers.handle(handles)?,
+            pool: buffers.handles(handles)?,
+            first_bytes: buffers.parts.first().map_or(0, Buffer::bytes),
             layout: Arc::clone(layout),
             plane_at: buffers.plane_at.clone(),
             page_tokens: buffers.page_tokens,
-            page_bytes: buffers.stride,
-            pool_slots: buffers.slots,
+            page_bytes: buffers.page_bytes,
+            per_chunk: buffers.per_chunk,
+            ids: buffers.ids,
             ext_in,
             ext_out,
             work,
@@ -568,8 +578,9 @@ impl Seat {
         let pages = self.pages?;
         let plane = *self.layout.in_of.get(&value.0)?;
         let at = self.plane_at[plane];
-        let slab = self.page_bytes.checked_mul(u64::from(self.pool_slots))?;
-        let view = handles.cut(self.pool, at, slab.checked_sub(at)?).ok()?;
+        let view = handles
+            .cut(*self.pool.first()?, at, self.first_bytes.checked_sub(at)?)
+            .ok()?;
         Some(kernels_metal::ssm::Paged {
             slab: Tensor::new(view, 1, 1, Dtype::U8),
             pages,
@@ -579,7 +590,9 @@ impl Seat {
         })
     }
 
-    pub fn locate(&self, run: &Run, plane: usize, token: u32) -> Result<(u64, u32)> {
+    /// Where `token` of `run` lies in plane `plane`: the bound buffer it
+    /// lies in, the byte there, and the tokens left in its page.
+    pub fn locate(&self, run: &Run, plane: usize, token: u32) -> Result<(u32, u64, u32)> {
         let page = token / self.page_tokens;
         let in_page = token % self.page_tokens;
         let slot = *run.pages.get(page as usize).ok_or(Fault::Ceiling {
@@ -587,18 +600,16 @@ impl Seat {
             need: u64::from(page) + 1,
             have: run.pages.len() as u64,
         })?;
-        if slot >= self.pool_slots {
-            return Err(Fault::Ceiling {
-                what: "recurrent buffer page slots",
-                need: u64::from(slot) + 1,
-                have: u64::from(self.pool_slots),
-            });
-        }
+        let (part, at) = self.ids.place(slot, self.per_chunk, self.page_bytes);
+        let buffer = *self.pool.get(part).ok_or(Fault::Ceiling {
+            what: "the pool's buffers a recurrent buffer page names",
+            need: part as u64 + 1,
+            have: self.pool.len() as u64,
+        })?;
         let row_bytes = self.layout.planes[plane].row_bytes;
         Ok((
-            u64::from(slot) * self.page_bytes
-                + self.plane_at[plane]
-                + u64::from(in_page) * row_bytes,
+            buffer,
+            at + self.plane_at[plane] + u64::from(in_page) * row_bytes,
             self.page_tokens - in_page,
         ))
     }

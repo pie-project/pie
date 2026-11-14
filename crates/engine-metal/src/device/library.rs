@@ -37,6 +37,11 @@ pub struct Pipelines {
     /// (`kv_page.h`'s `pie_fc_pool_delta1..3`); none where the pool is one
     /// buffer. Fixed before the first pipeline is built.
     pool: RefCell<Vec<u64>>,
+    /// How a page id splits its slot in its buffer (`kv_page.h`'s
+    /// `pie_fc_slot_shift` and `pie_fc_chunk_bytes`): the bits of a slot's
+    /// index in its chunk and a chunk's bytes, where a paged shape's slots
+    /// do not tile a chunk; none where they do.
+    slots: std::cell::Cell<Option<(u32, u64)>>,
 }
 
 // SAFETY: `MTLLibrary` and `MTLComputePipelineState` are documented
@@ -60,9 +65,12 @@ impl Pipelines {
     }
 
     /// States the pool's buffers (`deltas`, each's address less the
-    /// first's, the first's 0) for every pipeline built from now on.
-    pub fn set_pool(&self, deltas: &[u64]) {
+    /// first's, the first's 0) and how a page id names its slot (`ids`) for
+    /// every pipeline built from now on.
+    pub fn set_pool(&self, deltas: &[u64], ids: crate::store::pool::PageIds) {
         *self.pool.borrow_mut() = deltas.iter().skip(1).copied().collect();
+        self.slots
+            .set(ids.shift.map(|shift| (shift, ids.chunk_bytes)));
     }
 
     /// The device bytes building this shell's libraries and pipelines took,
@@ -129,6 +137,31 @@ impl Pipelines {
             }
         }
         drop(pool);
+        // How a page id splits its slot (`kv_page.h`): by chunk and index
+        // where the load's paged slots do not tile a chunk.
+        let (split, shift, chunk) = match self.slots.get() {
+            Some((shift, chunk)) => (true, shift, chunk),
+            None => (false, 0u32, 0u64),
+        };
+        // SAFETY: a bool at index 6, a uint at 7 and a ulong at 8, each read
+        // from a live value of its type.
+        unsafe {
+            constants.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from(&split).cast(),
+                objc2_metal::MTLDataType::Bool,
+                6,
+            );
+            constants.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from(&shift).cast(),
+                objc2_metal::MTLDataType::UInt,
+                7,
+            );
+            constants.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from(&chunk).cast(),
+                objc2_metal::MTLDataType::ULong,
+                8,
+            );
+        }
         let function = library
             .newFunctionWithName_constantValues_error(&name, &constants)
             .ok()

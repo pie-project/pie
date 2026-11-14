@@ -1272,12 +1272,13 @@ impl PreparedLoad<'_> {
             }
         }
         Shell::hold_weight_hosts(&device, &handles, &mut weights, &mut pools)?;
-        let rs_buffers = rs_at.map(|at| {
+        let rs_buffers = rs_at.zip(layout.rs).map(|(at, slots)| {
             crate::rs::Buffers::in_pool(
                 at.plane_at,
                 at.tokens,
-                pools.view().clone(),
-                layout.rs_stride(),
+                pools.part_views(),
+                slots,
+                pools.page_ids(),
             )
         });
         let nan_flags = match crate::diag::on().nan_check {
@@ -1295,9 +1296,7 @@ impl PreparedLoad<'_> {
             keepalive,
             pipelines: {
                 let pipelines = Pipelines::new();
-                if pools.parts() > 1 {
-                    pipelines.set_pool(&pools.deltas());
-                }
+                pipelines.set_pool(&pools.deltas(), pools.page_ids());
                 pipelines
             },
             handles,
@@ -1390,6 +1389,12 @@ impl Shell {
     #[must_use]
     pub fn pool_layout(&self) -> Layout {
         *self.pools.layout()
+    }
+
+    /// How the pool's page ids name their slots, and the buffers it spans.
+    #[must_use]
+    pub fn page_ids(&self) -> (crate::store::pool::PageIds, usize) {
+        (self.pools.page_ids(), self.pools.parts())
     }
 
     /// See `Engine::commit_segments`.
@@ -3920,9 +3925,9 @@ impl Shell {
         let rs_commit: Vec<i32> = rs_plans.iter().map(|plan| plan.commit as i32).collect();
         let rows_ext = rows.saturating_add(rs_plans.iter().map(|plan| plan.replay).sum::<u32>());
         let rs_pages = if rs_active {
-            self.rs_buffers.as_ref().and_then(|buffers| {
-                crate::rs::page_table(&rs_plans, buffers.page_tokens(), buffers.page_count())
-            })
+            self.rs_buffers
+                .as_ref()
+                .and_then(|buffers| crate::rs::page_table(&rs_plans, buffers.page_tokens()))
         } else {
             None
         };
