@@ -13,7 +13,7 @@
 
 use engine_cpu::Forward;
 use engine_cpu::forward::{Output, StreamLane, StreamStep, Values};
-use poem_ir::{Platform, Request, Trace};
+use poem_ir::{Operands, Platform, Request, Trace};
 
 const MINI: &str = "flux2-mini-bf16-kv-bf16";
 const GOLDEN: &[u8] = include_bytes!("flux_2_mini_velocity.f32");
@@ -70,8 +70,8 @@ fn velocity(outs: &[Output]) -> Vec<f32> {
     }
 }
 
-/// The relative L2 distance and cosine of `trace`'s velocity from diffusers'.
-fn against_diffusers(trace: &Trace) -> (f64, f64) {
+/// flux2-mini loaded with the weights mk_tiny_flux2.py draws, and the step it runs.
+fn setup(trace: &Trace) -> (Forward, StreamStep<'static>) {
     let shapes: Vec<(String, Vec<u64>)> = (trace.params.iter())
         .map(|p| (p.name.clone(), p.shape.clone()))
         .collect();
@@ -125,7 +125,13 @@ fn against_diffusers(trace: &Trace) -> (f64, f64) {
             ("latents", latents),
         ],
     };
-    let mut forward = Forward::new(trace.clone(), None, &plane).expect("flux2-mini loads");
+    let forward = Forward::new(trace.clone(), None, &plane).expect("flux2-mini loads");
+    (forward, step)
+}
+
+/// The relative L2 distance and cosine of `trace`'s velocity from diffusers'.
+fn against_diffusers(trace: &Trace) -> (f64, f64) {
+    let (mut forward, step) = setup(trace);
     let got = velocity(&forward.stream(&step).expect("the denoise step runs"));
     let want: Vec<f32> = GOLDEN
         .chunks(4)
@@ -160,4 +166,100 @@ fn flux_2_minis_denoise_answers_diffusers() {
     let (rel, cos) = against_diffusers(&trace);
     eprintln!("every activation f32: rel L2 {rel:.3e}, cosine {cos:.8}");
     assert!(rel <= 1e-4, "relative L2 {rel} with every activation f32");
+}
+
+/// A node's values as the step held them: the exit projection's output, captured, is the
+/// velocity's patches, and a captured input is the value its producer wrote.
+#[test]
+fn a_stream_step_captures_a_nodes_values() {
+    let trace = trace();
+    let (mut forward, step) = setup(&trace);
+    let at = |name: &str, nth: usize| {
+        (trace.nodes.iter().enumerate())
+            .filter(|(_, n)| n.op.name() == name)
+            .nth(nth)
+            .map(|(i, _)| i)
+            .expect("flux2-mini runs the op")
+    };
+    let (last, unpatch) = (at("linear.matmul", 32), at("conv.unpatchify", 0));
+    let (outs, caps) = forward
+        .stream_capture(&step, &[last, unpatch])
+        .expect("the denoise step runs");
+    let held = |node: usize, input: bool, k: usize| {
+        caps.iter()
+            .filter(|c| c.node == node && c.input == input)
+            .nth(k)
+            .expect("a captured value")
+    };
+    let (proj, patches) = (held(last, false, 0), held(unpatch, true, 0));
+    // (bit for bit: the text rows the image lane's projection keeps from are NaN)
+    let bits = |v: &Values| match v {
+        Values::F32(v) => v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>(),
+        Values::I32(_) => panic!("a float value"),
+    };
+    assert_eq!(proj.value, patches.value);
+    assert_eq!(bits(&proj.values), bits(&patches.values));
+    assert_eq!((proj.rows, proj.width), (2 * TEXT, 128));
+    let unpatched = held(unpatch, false, 0);
+    assert_eq!(bits(&Values::F32(velocity(&outs))), bits(&unpatched.values));
+}
+
+/// The values every node of `PRIM_NODES` (comma-separated node indices) reads and writes in
+/// flux2-mini's denoise step, as `.npy` files under `PRIM_OUT`: `n<node>_in<k>.npy` /
+/// `n<node>_out<k>.npy`, f32 or i32 `[rows, width]`, with `nodes.json` naming each node's op. The
+/// op-level oracle kernels-cerebras' primitive sims are held to (`tools/wafer/prims`).
+#[test]
+#[ignore = "writes goldens; run with PRIM_OUT and PRIM_NODES"]
+fn flux_2_minis_primitive_goldens() {
+    let (Ok(dir), Ok(list)) = (std::env::var("PRIM_OUT"), std::env::var("PRIM_NODES")) else {
+        panic!("set PRIM_OUT and PRIM_NODES");
+    };
+    let nodes: Vec<usize> = (list.split(','))
+        .map(|n| n.trim().parse().expect("a node index"))
+        .collect();
+    let trace = trace();
+    let (mut forward, step) = setup(&trace);
+    let (_, caps) = forward
+        .stream_capture(&step, &nodes)
+        .expect("the denoise step runs");
+    let dir = std::path::Path::new(&dir);
+    std::fs::create_dir_all(dir).expect("the goldens' directory");
+    let mut index = Vec::new();
+    for &node in &nodes {
+        let (mut ins, mut outs) = (0, 0);
+        let mut files = Vec::new();
+        for c in caps.iter().filter(|c| c.node == node) {
+            let k = if c.input { &mut ins } else { &mut outs };
+            let name = format!("n{node}_{}{k}.npy", if c.input { "in" } else { "out" });
+            *k += 1;
+            std::fs::write(dir.join(&name), npy(c)).expect("a golden file");
+            files.push(format!("\"{name}\": {}", c.value.0));
+        }
+        index.push(format!(
+            "\"{node}\": {{\"op\": \"{}\", \"values\": {{{}}}}}",
+            trace.nodes[node].op.name(),
+            files.join(", ")
+        ));
+    }
+    std::fs::write(dir.join("nodes.json"), format!("{{{}}}\n", index.join(",\n")))
+        .expect("the goldens' index");
+}
+
+/// A captured value as a `.npy` file: little-endian f32 or i32, `[rows, width]`.
+fn npy(c: &engine_cpu::forward::Captured) -> Vec<u8> {
+    let (descr, body): (&str, Vec<u8>) = match &c.values {
+        Values::F32(v) => ("<f4", v.iter().flat_map(|x| x.to_le_bytes()).collect()),
+        Values::I32(v) => ("<i4", v.iter().flat_map(|x| x.to_le_bytes()).collect()),
+    };
+    let mut header =
+        format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': ({}, {}), }}", c.rows, c.width);
+    while (10 + header.len() + 1) % 64 != 0 {
+        header.push(' ');
+    }
+    header.push('\n');
+    let mut out = b"\x93NUMPY\x01\x00".to_vec();
+    out.extend_from_slice(&u16::try_from(header.len()).expect("a short header").to_le_bytes());
+    out.extend_from_slice(header.as_bytes());
+    out.extend(body);
+    out
 }

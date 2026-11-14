@@ -40,7 +40,7 @@ use poem_ir::{
 };
 
 pub use crate::exchange::{Exchange, Post};
-pub use stream::{StreamLane, StreamStep};
+pub use stream::{Captured, StreamLane, StreamStep};
 
 mod stream;
 

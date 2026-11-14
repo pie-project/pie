@@ -133,10 +133,36 @@ fn act(f: ActFn, x: f32) -> f32 {
     }
 }
 
+/// A node's value as one stream step held it ([`Forward::stream_capture`]): what the node read,
+/// before it ran, or what it wrote, after (the rows its guard keeps; the others NaN, or what an
+/// in-place op found there).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Captured {
+    pub node: usize,
+    /// `true`: one of the node's inputs, as it read it; `false`: one of its outputs.
+    pub input: bool,
+    pub value: ValueId,
+    pub rows: usize,
+    pub width: usize,
+    pub values: Values,
+}
+
 impl Forward {
     /// One stream step of `step`'s lanes, every lane one group. Returns every output its lanes'
     /// words write, in the order the trace first names them.
     pub fn stream(&mut self, step: &StreamStep<'_>) -> Result<Vec<Output>, String> {
+        Ok(self.stream_capture(step, &[])?.0)
+    }
+
+    /// [`Forward::stream`], and the inputs and outputs of each node of `nodes` as the step held
+    /// them: the op-level oracle a primitive run on its own is compared to. A node its guard
+    /// keeps from every lane captures nothing.
+    pub fn stream_capture(
+        &mut self,
+        step: &StreamStep<'_>,
+        nodes: &[usize],
+    ) -> Result<(Vec<Output>, Vec<Captured>), String> {
+        let mut captured: Vec<Captured> = Vec::new();
         let words: Vec<u64> = step.lanes.iter().map(|l| l.word).collect();
         let (mut token, mut positions, mut voxel, mut clip) = (vec![], vec![], vec![], vec![]);
         let (mut grid, mut tgrid) = (Vec::new(), Vec::new());
@@ -260,16 +286,26 @@ impl Forward {
             for &v in &ins {
                 run.materialize(v)?;
             }
+            let tapped = nodes.contains(&at);
+            if tapped {
+                for &v in &ins {
+                    captured.extend(run.captured(at, true, v));
+                }
+            }
             run.op(&node.op)
                 .map_err(|why| format!("node {at}: {why}"))?;
-            if live.iter().all(|&l| l) {
-                continue;
-            }
             outs.clear();
             node.op.outputs(&mut outs);
-            for &o in &outs {
-                let into = aliases.iter().find(|(out, _)| *out == o).map(|&(_, i)| i);
-                run.keep(o, &live, into);
+            if !live.iter().all(|&l| l) {
+                for &o in &outs {
+                    let into = aliases.iter().find(|(out, _)| *out == o).map(|&(_, i)| i);
+                    run.keep(o, &live, into);
+                }
+            }
+            if tapped {
+                for &o in &outs {
+                    captured.extend(run.captured(at, false, o));
+                }
             }
         }
         let holds = |g: &poem_ir::Guard| rows.words.iter().any(|&w| g.holds(w));
@@ -297,11 +333,28 @@ impl Forward {
                 values,
             });
         }
-        Ok(out)
+        Ok((out, captured))
     }
 }
 
 impl Run<'_> {
+    /// `v` as it is held now, node `at`'s input or output.
+    fn captured(&self, at: usize, input: bool, v: ValueId) -> Option<Captured> {
+        let (rows, width, values) = match self.held(v).ok()? {
+            Held::Floats { rows, width, v } => (*rows, *width, Values::F32(v.clone())),
+            Held::Ints { rows, width, v } => (*rows, *width, Values::I32(v.clone())),
+            Held::Opaque => return None,
+        };
+        Some(Captured {
+            node: at,
+            input,
+            value: v,
+            rows,
+            width,
+            values,
+        })
+    }
+
     /// A merge `v` (in a stream step) as a value: each row from the arm its lane's word takes.
     pub(super) fn materialize(&mut self, v: ValueId) -> Result<(), String> {
         let Some(rows) = self.rows else {
