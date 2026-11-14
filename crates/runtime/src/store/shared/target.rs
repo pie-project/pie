@@ -314,6 +314,13 @@ impl SharedGrow {
 
     /// The segments to be at: the governor's target, and on the way up no
     /// further than what stands ready ahead of the waiters asks.
+    /// The segments the walk moves toward now; for a test that walks the
+    /// segments itself.
+    #[cfg(test)]
+    pub(crate) fn goal_for_test(&self) -> u32 {
+        self.goal()
+    }
+
     fn goal(&self) -> u32 {
         let pinned = pinned_segments();
         let target = pinned.unwrap_or_else(|| self.target.load(Ordering::Acquire));

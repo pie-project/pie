@@ -110,6 +110,14 @@ impl SharedPool {
             .max()
     }
 
+    /// Whether the fire terms leave no rung room on the device: never where
+    /// no term counts (a zero term is no term), and never on a pool that
+    /// states no rungs, whose activation is no part of it, so the terms are
+    /// ignored there.
+    fn term_refused(&self) -> bool {
+        !self.pool.fire().is_empty() && !self.pool.rungs().is_empty() && self.widest_fit().is_none()
+    }
+
     /// The widest rung fires may take: [`Self::widest_fit`], the smallest
     /// where none fits (a bind is refused then), `u32::MAX` without rungs.
     pub(super) fn fit_rung(&self) -> u32 {
@@ -154,7 +162,7 @@ impl SharedPool {
         *self.programs.open.entry(key).or_default() += 1;
         if first {
             self.refold();
-            if self.widest_fit().is_none() {
+            if self.term_refused() {
                 let most = self.act_room();
                 let smallest = self.pool.act_chunks(0);
                 let term = self.programs.terms.get(&key).copied().unwrap_or_default();

@@ -1363,8 +1363,10 @@ impl ProcessCtx {
                 seeds: instance_seeds,
             };
             let process_id = self.id();
-            let (registered, bound_instance, scheduler) =
-                match crate::scheduler::register_channels_bind_classified(
+            let (registered, bound_instance, scheduler) = match crate::inferlet::process::said(
+                "bind",
+                process_id,
+                crate::scheduler::register_channels_bind_classified(
                     engine,
                     Some(process_id),
                     registration_plans,
@@ -1379,17 +1381,18 @@ impl ProcessCtx {
                     // The ports the program computes on the device: the
                     // engine's to resolve, and no others.
                     decode_envelope.unwrap_or(PortMask::NONE),
-                )
-                .await
-                {
-                    Ok(pair) => pair,
-                    Err(error) => {
-                        for attached in &cells {
-                            attached.lock().unwrap().detach(instance_id);
-                        }
-                        return Ok(Err(format!("pipeline: register+bind: {error:#}")));
+                ),
+            )
+            .await
+            {
+                Ok(pair) => pair,
+                Err(error) => {
+                    for attached in &cells {
+                        attached.lock().unwrap().detach(instance_id);
                     }
-                };
+                    return Ok(Err(format!("pipeline: register+bind: {error:#}")));
+                }
+            };
             if registered.len() != missing_dense.len() {
                 let _ = scheduler
                     .close_instance(bound_instance.instance_id, bound_instance.pacing_wait_id);

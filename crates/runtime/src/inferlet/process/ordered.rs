@@ -11,8 +11,14 @@ use crate::policy::schedule;
 
 #[derive(Debug)]
 pub(crate) struct OrderedSemaphore {
+    /// Which gate, for what a long wait says.
+    name: &'static str,
     state: Mutex<State>,
 }
+
+/// How long a waiter waits before it says where, and again after each
+/// such span: what a stall at the gates is read from.
+const WAIT_SAYS_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug)]
 struct State {
@@ -40,8 +46,9 @@ impl Drop for OrderedPermit {
 }
 
 impl OrderedSemaphore {
-    pub(crate) fn new(permits: usize, holds: bool) -> Arc<Self> {
+    pub(crate) fn new(name: &'static str, permits: usize, holds: bool) -> Arc<Self> {
         Arc::new(Self {
+            name,
             state: Mutex::new(State {
                 permits,
                 holds,
@@ -92,7 +99,35 @@ impl OrderedSemaphore {
         };
         // The sender lives in the waiter list until it grants: it is
         // dropped unsent only by `Queued`, which this future owns.
-        let _ = waiting.await;
+        tokio::pin!(waiting);
+        let mut waited = std::time::Duration::ZERO;
+        loop {
+            match crate::rt::time::timeout(WAIT_SAYS_AFTER, &mut waiting).await {
+                Ok(_) => break,
+                Err(_) => {
+                    waited += WAIT_SAYS_AFTER;
+                    let (permits, waiters, held) = {
+                        let state = self.lock();
+                        let schedule = schedule::current();
+                        let held = state
+                            .waiters
+                            .iter()
+                            .filter(|w| schedule.as_ref().is_some_and(|s| s.held(w.pid)))
+                            .count();
+                        (state.permits, state.waiters.len(), held)
+                    };
+                    tracing::warn!(
+                        gate = self.name,
+                        %pid,
+                        waited_s = waited.as_secs(),
+                        permits,
+                        waiters,
+                        held_below_floor = held,
+                        "a process waits at an admission gate"
+                    );
+                }
+            }
+        }
         queued.done = true;
         OrderedPermit {
             semaphore: Arc::clone(&self),
@@ -163,7 +198,7 @@ mod tests {
     }
 
     async fn grant_order(pids: &[ProcessId]) -> Vec<ProcessId> {
-        let semaphore = OrderedSemaphore::new(0, true);
+        let semaphore = OrderedSemaphore::new("test", 0, true);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut tasks = Vec::new();
         for &p in pids {
@@ -203,7 +238,7 @@ mod tests {
         // A floor of 1 holds every unnamed process until it is named.
         let keys = HashMap::from([(pid(4), 1)]);
         schedule::install(Some(Table::new(keys, Some(1))));
-        let semaphore = OrderedSemaphore::new(1, true);
+        let semaphore = OrderedSemaphore::new("test", 1, true);
         let held = tokio::spawn({
             let semaphore = Arc::clone(&semaphore);
             async move { semaphore.acquire_owned(pid(1)).await }
@@ -221,7 +256,7 @@ mod tests {
 
         // A waiter that gives up returns its place, or its permit.
         schedule::install(None);
-        let semaphore = OrderedSemaphore::new(0, true);
+        let semaphore = OrderedSemaphore::new("test", 0, true);
         let abandoned = tokio::spawn({
             let semaphore = Arc::clone(&semaphore);
             async move { semaphore.acquire_owned(pid(1)).await }

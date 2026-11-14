@@ -12,4 +12,10 @@ pub trait FireContext {
     async fn settle_pipeline_tail(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// The pending fires of every pipeline whose residency this process
+    /// holds: the tail a windowed ask finalizes as it lands.
+    fn pipeline_tails(&self) -> Vec<crate::pipeline::fire::PendingFires> {
+        Vec::new()
+    }
 }

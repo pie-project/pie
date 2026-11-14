@@ -302,8 +302,13 @@ fn kv_demand(
 }
 
 /// `windowed`: the fire reads window slots, which come back only once every
-/// fire that read them settles, so a fire that would park settles its own
-/// tail first rather than hold back the pages parked fires wait on.
+/// fire that read them settles (its process finalizes it). A fire that would
+/// park finalizes its own tail as it lands while it waits, rather than
+/// settle it whole first: the tail may hold this pass's earlier pieces,
+/// which make up one frame with the piece now asking, and settling them
+/// before this ask returns waited on a frame only this ask completes (Mac's
+/// gemma-4-e4b c64 stall). The lane is parked first, so the scheduler waits
+/// on none of its fires.
 async fn acquire_grant<C: FireContext>(
     ctx: &mut C,
     pipeline_id: uuid::Uuid,
@@ -322,20 +327,21 @@ async fn acquire_grant<C: FireContext>(
             planner.note_peak(pid, demand);
             return Ok(Some(grant));
         }
-        // The tail may hold this frame's earlier slots, which fire only once
-        // the scheduler stops waiting on this one: park the lane first.
         crate::scheduler::worker::notify_lane_close(pipeline_id, Some(pid));
-        ctx.settle_pipeline_tail()
-            .await
-            .map_err(|error| format!("pipeline: settle for windowed kv: {error:#}"))?;
     }
     // A yield may have dropped snapshots the demand was quoted against, so
     // the caller quotes it again rather than asking for the same.
-    match planner
-        .acquire(pid, pipeline_id, demand)
-        .await
-        .map_err(|error| format!("pipeline: KV capacity: {error}"))?
-    {
+    let acquire = crate::inferlet::process::said(
+        "plan: the planner's grant",
+        pid,
+        planner.acquire(pid, pipeline_id, demand),
+    );
+    let acquired = if windowed {
+        ask_while_tail_lands(ctx, acquire, || planner.pages_freed()).await?
+    } else {
+        acquire.await
+    };
+    match acquired.map_err(|error| format!("pipeline: KV capacity: {error}"))? {
         crate::planner::Acquired::Granted(grant) => Ok(Some(grant)),
         crate::planner::Acquired::Yield => {
             settle_and_wait_resident(ctx).await?;
@@ -345,6 +351,62 @@ async fn acquire_grant<C: FireContext>(
     }
 }
 
+/// Awaits `ask` (a windowed planner ask) while finalizing the process's
+/// pending fires as each lands, `drained` told when any did (their window
+/// slots are back): never waits on the tail whole before the ask, since the
+/// tail may be this pass's earlier pieces, whose frame only the piece now
+/// asking completes.
+async fn ask_while_tail_lands<C: FireContext, A: std::future::Future>(
+    ctx: &mut C,
+    ask: A,
+    drained: impl Fn(),
+) -> Result<A::Output, String> {
+    tokio::pin!(ask);
+    loop {
+        let tails = ctx.pipeline_tails();
+        let landed = tail_landed(&tails);
+        tokio::select! {
+            asked = &mut ask => return Ok(asked),
+            () = landed => {
+                // What landed is finalized: the window slots its fires read
+                // come back, and the planner looks again.
+                let mut any = false;
+                for fires in &tails {
+                    any |= drain_settled(ctx, Some(fires))
+                        .await
+                        .map_err(|error| format!("pipeline: settle for windowed kv: {error:#}"))?;
+                }
+                if any {
+                    drained();
+                } else {
+                    // A front that signals before it reads as settled.
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+        }
+    }
+}
+
+/// Resolves once the front of any of `tails` has landed; never where all
+/// are empty.
+async fn tail_landed(tails: &[PendingFires]) {
+    let fronts: Vec<_> = tails
+        .iter()
+        .filter_map(|fires| {
+            fires
+                .lock()
+                .unwrap()
+                .front()
+                .map(PendingOp::completion_signal)
+        })
+        .map(Box::pin)
+        .collect();
+    if fronts.is_empty() {
+        return std::future::pending().await;
+    }
+    futures::future::select_all(fronts).await;
+}
+
 async fn settle_and_wait_resident<C: FireContext>(ctx: &mut C) -> Result<(), String> {
     let Some(planner) = crate::planner::planner_of(ctx.process_id()) else {
         return Err("pipeline: KV working set is suspend-fenced".to_string());
@@ -352,10 +414,13 @@ async fn settle_and_wait_resident<C: FireContext>(ctx: &mut C) -> Result<(), Str
     ctx.settle_pipeline_tail()
         .await
         .map_err(|error| format!("pipeline: settle for eviction: {error:#}"))?;
-    planner
-        .wait_resident(ctx.process_id())
-        .await
-        .map_err(|error| format!("pipeline: KV residency: {error}"))
+    crate::inferlet::process::said(
+        "plan: resident again",
+        ctx.process_id(),
+        planner.wait_resident(ctx.process_id()),
+    )
+    .await
+    .map_err(|error| format!("pipeline: KV residency: {error}"))
 }
 
 fn bound_rs_working_sets<C: FireContext>(
@@ -2752,7 +2817,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .iter()
             .map(|(_, lanes)| pass_lanes.kv[lanes[0]].clone())
             .collect();
-        if let Err(refusal) = seat_lane_slots(&mut req, &stores, &groups).await {
+        if let Err(refusal) = crate::inferlet::process::said(
+            "seat the lanes",
+            ctx.process_id(),
+            seat_lane_slots(&mut req, &stores, &groups),
+        )
+        .await
+        {
             return Ok(Err(refusal));
         }
         for (group, (_, lanes)) in groups.iter().enumerate() {
@@ -3142,10 +3213,14 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // for the raise its pass funds, or fails with what the planner
             // said: it never waits on a rung that does not come.
             let width: u32 = piece.iter().flatten().map(|&(from, to)| to - from).sum();
-            if let Err(refusal) = wait_for_rung(
-                engine,
-                width,
-                funding.as_ref().map(|funding| move || funding.failed()),
+            if let Err(refusal) = crate::inferlet::process::said(
+                "enqueue: the activation rung",
+                pid,
+                wait_for_rung(
+                    engine,
+                    width,
+                    funding.as_ref().map(|funding| move || funding.failed()),
+                ),
             )
             .await
             {
@@ -4358,7 +4433,13 @@ async fn fire_device_geometry<C: FireContext>(
         device_rows.as_deref(),
     );
     let reads_each_other = reads_each_other(&req);
-    if let Err(refusal) = seat_lane_slots(&mut req, &stores, &groups).await {
+    if let Err(refusal) = crate::inferlet::process::said(
+        "seat the lanes",
+        ctx.process_id(),
+        seat_lane_slots(&mut req, &stores, &groups),
+    )
+    .await
+    {
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
         return Ok(Err(refusal));
     }
@@ -4514,6 +4595,7 @@ pub(crate) mod lifecycle_tests {
     struct TestContext {
         id: uuid::Uuid,
         resources: ResourceTable,
+        tails: Vec<PendingFires>,
     }
 
     impl FireContext for TestContext {
@@ -4524,6 +4606,104 @@ pub(crate) mod lifecycle_tests {
         fn process_id(&self) -> uuid::Uuid {
             self.id
         }
+
+        fn pipeline_tails(&self) -> Vec<PendingFires> {
+            self.tails.clone()
+        }
+    }
+
+    /// Mac's gemma-4-e4b c64 stall: a windowed ask that settled its tail
+    /// whole first waited on its pass's earlier piece, whose frame only the
+    /// piece asking completes. The ask now returns once the planner grants
+    /// (growth), the tail still in flight and untouched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_windowed_ask_never_waits_on_its_own_unlanded_tail() -> anyhow::Result<()> {
+        let (fires, completion, ws, _stores, _failure) = pending_fire_fixture(Vec::new());
+        let mut context = TestContext {
+            id: uuid::Uuid::new_v4(),
+            resources: ResourceTable::new(),
+            tails: vec![fires.clone()],
+        };
+        context.resources.push(ws)?;
+        let (grow, grown) = tokio::sync::oneshot::channel::<()>();
+        let ask = async move {
+            grown.await.expect("the pool grows");
+            "granted"
+        };
+        let task = tokio::spawn(async move {
+            // The pool grows a moment later; the tail never lands meanwhile.
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            let _ = grow.send(());
+        });
+        let asked = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ask_while_tail_lands(&mut context, ask, || {}),
+        )
+        .await
+        .expect("the ask returns without its tail landing");
+        assert_eq!(asked.map_err(anyhow::Error::msg)?, "granted");
+        task.await?;
+        assert_eq!(fires.lock().expect("test FIFO").len(), 1, "the tail stays");
+        resolve_test_completion(&completion, false);
+        finalize_all(&mut context, &fires, true).await?;
+        Ok(())
+    }
+
+    /// Two windowed processes, a pool that cannot grant at once: one ask is
+    /// served only by the window slots the other's tail gives back, and the
+    /// other's tail lands while it asks too. Each finalizes its tail as it
+    /// lands, so the slots come back and both asks are served.
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_windowed_asks_are_served_by_the_tails_they_finalize_as_they_land()
+    -> anyhow::Result<()> {
+        let mut processes = Vec::new();
+        for _ in 0..2 {
+            let (fires, completion, ws, _stores, _failure) = pending_fire_fixture(Vec::new());
+            let mut context = TestContext {
+                id: uuid::Uuid::new_v4(),
+                resources: ResourceTable::new(),
+                tails: vec![fires.clone()],
+            };
+            context.resources.push(ws)?;
+            processes.push((context, fires, completion));
+        }
+        // The planner's room: slots come back as a tail is finalized.
+        let freed = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut tasks = Vec::new();
+        for (mut context, fires, completion) in processes {
+            let freed = freed.clone();
+            let released = freed.clone();
+            tasks.push(tokio::spawn(async move {
+                let ask = async move {
+                    // Served once the other process's tail gave its slots back.
+                    freed.acquire().await.expect("room").forget();
+                };
+                let lands = tokio::spawn(async move {
+                    for _ in 0..5 {
+                        tokio::task::yield_now().await;
+                    }
+                    resolve_test_completion(&completion, false);
+                });
+                ask_while_tail_lands(&mut context, ask, || released.add_permits(1))
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                lands.await?;
+                // Whatever landed after the grant is finalized on the fire's
+                // own path, and its slots go back to the planner as well.
+                finalize_all(&mut context, &fires, true).await?;
+                released.add_permits(1);
+                anyhow::Ok(fires.lock().expect("test FIFO").len())
+            }));
+        }
+        for task in tasks {
+            let left = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .expect("both asks are served")??;
+            assert_eq!(left, 0);
+        }
+        Ok(())
     }
 
     pub(crate) fn pending_fire_fixture(
@@ -4606,6 +4786,7 @@ pub(crate) mod lifecycle_tests {
             let mut context = TestContext {
                 id: uuid::Uuid::new_v4(),
                 resources: ResourceTable::new(),
+                tails: Vec::new(),
             };
             context.resources.push(ws)?;
             {
@@ -4658,6 +4839,7 @@ pub(crate) mod lifecycle_tests {
         let mut context = TestContext {
             id: uuid::Uuid::new_v4(),
             resources: ResourceTable::new(),
+            tails: Vec::new(),
         };
         context.resources.push(ws)?;
         let flag = || Arc::new(Flag(AtomicBool::new(false)));
@@ -4708,6 +4890,7 @@ pub(crate) mod lifecycle_tests {
         let mut context = TestContext {
             id: uuid::Uuid::new_v4(),
             resources: ResourceTable::new(),
+            tails: Vec::new(),
         };
         let pipeline = context.resources.push(Pipeline::new())?;
         let rep = pipeline.rep();

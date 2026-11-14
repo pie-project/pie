@@ -64,21 +64,14 @@ impl Chunks {
         act_bytes: u64,
     ) -> Result<Chunks> {
         let act = u32::try_from(act_bytes.div_ceil(layout.chunk_bytes.max(1))).unwrap_or(u32::MAX);
-        // The range is every chunk the pool's ceiling backs beside the
-        // activation: the cache rows' demand is `total`, and what the
-        // guests' instances and rings take of it is known to no load. A
-        // range mapped on demand only reserves addresses, and the fit
-        // decides how many chunks are ever backed; a flat one (ROCm) is one
-        // allocation of every chunk, so it holds no more than that.
-        let backed =
-            pool.hard_pages().saturating_mul(pool.page_bytes()) / layout.chunk_bytes.max(1);
-        let backed = u32::try_from(backed)
-            .unwrap_or(u32::MAX)
-            .saturating_sub(act);
+        // A flat range (no device memory mapped on demand: ROCm) is one
+        // allocation of every chunk at once, so it can hold no more chunks
+        // than the pool's ceiling backs; a mapped range only reserves
+        // addresses, and the fit decides how many chunks are ever backed.
         let total = if crate::device::elastic::mapped_on_demand() {
-            total.max(backed)
+            total
         } else {
-            total.min(backed)
+            total.min(Chunks::ceiling(pool, &layout, act))
         };
         let total = total.max(1);
         let bytes = (u64::from(total) + u64::from(act)) * layout.chunk_bytes;
@@ -97,6 +90,17 @@ impl Chunks {
             weights: std::collections::BTreeSet::new(),
             skip: (total, 0),
         })
+    }
+
+    /// The chunks the pool's ceiling backs beside an activation of `act`
+    /// chunks: the most a range of this layout can ever hold.
+    #[must_use]
+    pub fn ceiling(pool: &PhysicalPool, layout: &Layout, act: u32) -> u32 {
+        let backed =
+            pool.hard_pages().saturating_mul(pool.page_bytes()) / layout.chunk_bytes.max(1);
+        u32::try_from(backed)
+            .unwrap_or(u32::MAX)
+            .saturating_sub(act)
     }
 
     #[must_use]
@@ -409,6 +413,15 @@ impl Chunks {
         u32::try_from(chunks.div_ceil(u64::from(self.layout.segment_chunks.max(1))))
             .unwrap_or(u32::MAX)
             .min(self.range.segments())
+    }
+
+    /// The pages backing the first `chunks` chunks would take beyond what
+    /// is backed now ([`Range::growth_of`]).
+    pub fn growth_for(&self, chunks: u32) -> Result<u64> {
+        self.range.growth_of(
+            self.segments_for(u64::from(chunks)),
+            u64::from(chunks) * self.layout.chunk_bytes,
+        )
     }
 
     /// The segments that lie wholly within the first `chunks` chunks.
