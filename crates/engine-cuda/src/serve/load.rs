@@ -1308,6 +1308,7 @@ impl Shell {
             bodies: engine.recording.bodies(),
             bodies_mem: (engine.recording.bodies_mem() as usize).saturating_mul(1 << 20),
             workspace: None,
+            inputs_at: 0,
             decoded_tiles: Vec::new(),
             arming: false,
             armed_body: None,
@@ -1417,36 +1418,48 @@ impl Shell {
         // arenas, at the size the walk asked of it. A take answers its
         // place, and nothing is allocated for it. The fit comes after, so
         // the cache rows take what the walk leaves.
-        if shell.pools.fresh()
-            && let Some(walked) = shell.size_arming()?
+        // The staged inputs' slab is a run of that span as well, past the
+        // workspaces: one address every body names, under no rung's carve.
+        let walked = if shell.pools.fresh() {
+            shell.size_arming()?
+        } else {
+            None
+        };
+        let placed = walked.as_ref().map(crate::sizing::Footprint::placed);
+        let workspace = placed.as_ref().map_or(0, |placed| {
+            kernels_cuda::jit::Slabs::placed_bytes(placed) as u64
+        });
+        if placed.is_some()
+            && let Some(buffers) = shell.buffers.as_mut()
         {
-            let placed = walked.placed();
-            let workspace = kernels_cuda::jit::Slabs::placed_bytes(&placed) as u64;
-            if let Some(buffers) = shell.buffers.as_mut() {
-                buffers.lay_reach(&mut shell.pools, true)?;
-            }
-            let at = shell.pools.widen_activation(workspace)?;
-            if boot.knobs.diagnostics.arm_trace {
-                eprintln!(
-                    "[arm-trace] size-only walk: {} slabs of {} MiB laid in the activation's \
-                     span: {}",
-                    placed.len(),
-                    workspace >> 20,
-                    walked
-                        .slabs
-                        .iter()
-                        .take(8)
-                        .map(|(name, bytes)| format!("{name}={}", bytes >> 20))
-                        .collect::<Vec<String>>()
-                        .join(" ")
-                );
-            }
-            shell.workspace = Some(Workspace {
-                at,
-                bytes: workspace,
-                slabs: placed,
-            });
+            buffers.lay_reach(&mut shell.pools, true)?;
         }
+        let staged = workspace.next_multiple_of(INPUTS_ALIGN);
+        let at = shell
+            .pools
+            .widen_activation(staged.saturating_add(shell.inputs.bytes()))?;
+        shell.inputs_at = at + staged;
+        if boot.knobs.diagnostics.arm_trace {
+            eprintln!(
+                "[arm-trace] size-only walk: {} slabs of {} MiB and the staged inputs' {} MiB \
+                 laid in the activation's span: {}",
+                placed.as_ref().map_or(0, Vec::len),
+                workspace >> 20,
+                shell.inputs.bytes() >> 20,
+                walked.as_ref().map_or_else(String::new, |walked| walked
+                    .slabs
+                    .iter()
+                    .take(8)
+                    .map(|(name, bytes)| format!("{name}={}", bytes >> 20))
+                    .collect::<Vec<String>>()
+                    .join(" "))
+            );
+        }
+        shell.workspace = placed.map(|slabs| Workspace {
+            at,
+            bytes: workspace,
+            slabs,
+        });
         // A load that walked nothing lays the rs scratch for the most any
         // fire may ask.
         if shell.workspace.is_none()
@@ -1496,6 +1509,10 @@ impl Shell {
     }
 }
 
+/// What a buffer the device allocates is aligned to, kept for the staged
+/// inputs' slab in the span.
+const INPUTS_ALIGN: u64 = 4096;
+
 /// The kernels' workspaces, laid in the activation's span past its arenas:
 /// the slabs a size-only walk of the lattice asked for, each at the most it
 /// asked.
@@ -1514,6 +1531,12 @@ impl Shell {
         if let Some(buffers) = &self.buffers {
             buffers.lay_scratch(&mut self.pools)?;
         }
+        let staged = self.inputs.bytes();
+        self.pools
+            .hold_activation_at(self.inputs_at, staged, false)?;
+        let base = self.pools.activation_base() + self.inputs_at;
+        crate::device::zero_span(base, usize::try_from(staged).unwrap_or(0))?;
+        self.inputs.lay(base);
         let Some(workspace) = &self.workspace else {
             return Ok(());
         };

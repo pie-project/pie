@@ -130,6 +130,8 @@ pub struct Shell {
     /// The kernels' workspaces in the activation's span, once a load has
     /// walked what its fires take.
     workspace: Option<load::Workspace>,
+    /// Where the staged inputs' slab starts in the activation's span.
+    inputs_at: u64,
     decoded_tiles: Vec<u64>,
     arming: bool,
     golden_arm: Golden,

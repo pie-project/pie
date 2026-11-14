@@ -420,7 +420,7 @@ const GATHERED_INJECTS: usize = 4;
 /// lanes in one gather launch; one copy each inside a stream capture.
 fn inject_tokens(
     device: &crate::device::Context,
-    runs: &mut Option<Buffer>,
+    runs: (&mut Buffer, u64),
     tokens: u64,
     injects: &[TokenInject],
 ) -> Result<()> {
@@ -451,7 +451,7 @@ fn inject_tokens(
 #[cfg(not(feature = "rocm"))]
 fn gather_injects(
     device: &crate::device::Context,
-    runs: &mut Option<Buffer>,
+    (store, at): (&mut Buffer, u64),
     tokens: u64,
     injects: &[TokenInject],
 ) -> Result<()> {
@@ -465,16 +465,12 @@ fn gather_injects(
         })
         .collect();
     let bytes = table.len() * size_of::<kernels_cuda::runtime::channel::WordRun>();
-    if runs.as_ref().is_none_or(|held| held.bytes() < bytes) {
-        *runs = Some(Buffer::zeroed(bytes.next_power_of_two())?);
-    }
-    let held = runs.as_mut().expect("sized just above");
     // SAFETY: `WordRun` is plain `repr(C)` data, read as its bytes.
     let raw = unsafe { core::slice::from_raw_parts(table.as_ptr().cast::<u8>(), bytes) };
-    held.stage(stream, 0, raw)?;
+    store.stage(stream, at, raw)?;
     kernels_cuda::runtime::channel::gather_words(
         device.ctx(),
-        held.ptr(),
+        store.ptr() + at,
         tokens,
         u32::try_from(table.len()).unwrap_or(u32::MAX),
     )?;
@@ -486,7 +482,7 @@ fn gather_injects(
 /// one launch each inside a stream capture.
 fn inject_masks(
     device: &crate::device::Context,
-    runs: &mut Option<Buffer>,
+    (store, at): (&mut Buffer, u64),
     mask: u64,
     injects: &[MaskInject],
 ) -> Result<()> {
@@ -511,16 +507,12 @@ fn inject_masks(
         })
         .collect();
     let bytes = table.len() * size_of::<kernels_cuda::runtime::channel::BitRun>();
-    if runs.as_ref().is_none_or(|held| held.bytes() < bytes) {
-        *runs = Some(Buffer::zeroed(bytes.next_power_of_two())?);
-    }
-    let held = runs.as_mut().expect("sized just above");
     // SAFETY: `BitRun` is plain `repr(C)` data, read as its bytes.
     let raw = unsafe { core::slice::from_raw_parts(table.as_ptr().cast::<u8>(), bytes) };
-    held.stage(stream, 0, raw)?;
+    store.stage(stream, at, raw)?;
     kernels_cuda::runtime::channel::gather_bit_runs(
         device.ctx(),
-        held.ptr(),
+        store.ptr() + at,
         mask,
         u32::try_from(table.len()).unwrap_or(u32::MAX),
     )?;
@@ -563,9 +555,14 @@ pub struct Inputs {
     max_rows: u32,
     plans: Vec<Option<Workspace>>,
     plan_values: usize,
-    inject_runs: Option<Buffer>,
-    /// The staged run table of [`inject_masks`].
-    mask_runs: Option<Buffer>,
+    /// Each plan's workspace grant in the slab, and the runs it is granted
+    /// for: where the slab lies decides their addresses ([`Inputs::lay`]).
+    grants: Vec<Option<Grant>>,
+    runs: u32,
+    /// The staged run table of [`inject_tokens`] in the slab: a run a lane.
+    inject_runs: u64,
+    /// The staged run table of [`inject_masks`] in the slab: a run a lane.
+    mask_runs: u64,
     /// Staged apart from the slab: their size is the groups', not the load's.
     group_masks: Option<Buffer>,
     /// Smaller ones it outgrew, kept: an earlier fire may still read them.
@@ -637,6 +634,9 @@ impl Inputs {
             0
         };
         let mask_bits = take(mask_bytes);
+        // A lane feeds its tokens, and its mask, from the device in one run.
+        let inject_runs = take(lanes * size_of::<kernels_cuda::runtime::channel::WordRun>() as u64);
+        let mask_runs = take(lanes * size_of::<kernels_cuda::runtime::channel::BitRun>() as u64);
         let mask_indptr = take((lanes + 1) * 4);
         let page_tables: Vec<TableAt> = (0..page_tables)
             .map(|_| TableAt {
@@ -725,15 +725,20 @@ impl Inputs {
             .collect();
         let total = at;
 
-        let store = Buffer::zeroed(usize::try_from(total).unwrap_or(usize::MAX))?;
-        let base = store.ptr();
+        // The slab is a run of the activation's span, laid once the load
+        // knows what else its fires take there ([`Inputs::lay`]); till then
+        // it stands in, as every span of a size-only walk does.
+        let store = Buffer::over(
+            crate::sizing::STAND_IN,
+            usize::try_from(total).unwrap_or(usize::MAX),
+        );
         let depth = runahead.staging_depth();
         let slot_bytes = usize::try_from(stage_bytes).unwrap_or(usize::MAX);
         let mut staging = Vec::with_capacity(depth);
         for _ in 0..depth {
             staging.push(Pinned::mapped(slot_bytes)?);
         }
-        Ok(Inputs {
+        let mut inputs = Inputs {
             staging,
             free: Free::of(depth),
             stage_bytes,
@@ -765,26 +770,20 @@ impl Inputs {
             rs,
             max_lanes: crate::window::lane_capacity(budget.max_lanes),
             max_rows: budget.max_tokens,
-            inject_runs: None,
-            mask_runs: None,
+            inject_runs,
+            mask_runs,
             group_masks: None,
             outgrown: Vec::new(),
             staged_windows: Vec::new(),
             plan_values: grants.len(),
-            plans: (0..runs as usize)
-                .flat_map(|run| {
-                    grants.iter().map(move |grant| {
-                        grant.as_ref().map(|grant| Workspace {
-                            int_ptr: base + grant.int_at[run],
-                            int_bytes: GRANT_INT_BYTES as usize,
-                            float_ptr: base + grant.float_at,
-                            float_bytes: usize::try_from(grant.float_bytes).unwrap_or(usize::MAX),
-                        })
-                    })
-                })
-                .collect(),
+            plans: Vec::new(),
+            grants,
+            runs,
             store,
-        })
+        };
+        // Granted where the slab stands in, as a size-only walk reads them.
+        inputs.lay(crate::sizing::STAND_IN);
+        Ok(inputs)
     }
 
     #[must_use]
@@ -796,6 +795,25 @@ impl Inputs {
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.store.bytes() as u64
+    }
+
+    /// The slab lies at `base` from here on: a run of the activation's
+    /// span the load holds backed and zeroed, of [`Inputs::bytes`].
+    pub fn lay(&mut self, base: u64) {
+        self.store = Buffer::over(base, self.store.bytes());
+        let grants = &self.grants;
+        self.plans = (0..self.runs as usize)
+            .flat_map(|run| {
+                grants.iter().map(move |grant| {
+                    grant.as_ref().map(|grant| Workspace {
+                        int_ptr: base + grant.int_at[run],
+                        int_bytes: GRANT_INT_BYTES as usize,
+                        float_ptr: base + grant.float_at,
+                        float_bytes: usize::try_from(grant.float_bytes).unwrap_or(usize::MAX),
+                    })
+                })
+            })
+            .collect();
     }
 
     pub fn claim(&self) -> Result<SlotGuard> {
@@ -1315,6 +1333,15 @@ impl Inputs {
         let packing_places: Vec<PackingAt> = self.packings.clone();
         let rs_at = self.rs;
         let stream = device.stream();
+        // The run tables hold a run a lane.
+        let fed = token_injects.len().max(mask_injects.len()) as u64;
+        if fed > u64::from(self.max_lanes) {
+            return Err(crate::error::Fault::Ceiling {
+                what: "lanes fed from the device in one fire",
+                need: fed,
+                have: u64::from(self.max_lanes),
+            });
+        }
         let Inputs {
             store,
             staging,
@@ -1411,7 +1438,12 @@ impl Inputs {
         // SAFETY: the sources are the slot's pinned bytes, held until the `SlotGuard` drops.
         unsafe { store.stage_batch_from(stream, &spans)? };
 
-        inject_tokens(device, inject_runs, base + at_tokens, token_injects)?;
+        inject_tokens(
+            device,
+            (&mut *store, *inject_runs),
+            base + at_tokens,
+            token_injects,
+        )?;
         if !mask_injects.is_empty() && mask_bytes.is_none() {
             return Err(crate::error::Fault::program(
                 "inputs::commit",
@@ -1420,7 +1452,12 @@ impl Inputs {
             ));
         }
         // Over the cleared rows just staged, in stream order.
-        inject_masks(device, mask_runs, base + at_mask, mask_injects)?;
+        inject_masks(
+            device,
+            (&mut *store, *mask_runs),
+            base + at_mask,
+            mask_injects,
+        )?;
 
         Ok(Handles {
             tokens: i32s(base + at_tokens, rows),
