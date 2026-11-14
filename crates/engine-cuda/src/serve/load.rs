@@ -771,6 +771,19 @@ impl Shell {
             asked,
             stated_buckets,
         } = bake(&mut boot)?;
+        // What shapes this deployment's bodies, beside the engine build
+        // the record's key carries ([`super::measured`]).
+        let bodies_shape = format!(
+            "{}|{:?}|{}|{:?}|{}|{}|{}|{:?}",
+            boot.checkpoint.display(),
+            std::fs::metadata(boot.checkpoint).map(|meta| (meta.len(), meta.modified().ok())).ok(),
+            boot.trace.name,
+            profile,
+            boot.page_size,
+            boot.context,
+            boot.slots,
+            boot.kv_budget,
+        );
         // Every generated kernel compiled and loaded now, before a fire can
         // ask for one.
         let regions =
@@ -1308,6 +1321,8 @@ impl Shell {
             golden_arm: Golden::Off,
             bodies: engine.recording.bodies(),
             bodies_mem: (engine.recording.bodies_mem() as usize).saturating_mul(1 << 20),
+            bodies_record: None,
+            bodies_from_record: false,
             workspace: None,
             inputs_at: 0,
             decoded_tiles: Vec::new(),
@@ -1407,6 +1422,32 @@ impl Shell {
             );
         }
         let footprint = |shell: &Shell| footprint(shell, device_total, free_before);
+        // The bodies are held what they took when this deployment last
+        // armed whole, where it is recorded; the configured `bodies_mem` is
+        // the ceiling and what a first boot holds. One number: arming's
+        // allowance is the hold.
+        if shell.records_bodies()
+            && let Some(dir) = boot.cache_dir
+        {
+            let record = super::measured::path(dir, &format!("{bodies_shape}|{:?}", shell.budget));
+            if let Some(measured) = super::measured::read(&record) {
+                let held = usize::try_from(measured.hold()).unwrap_or(usize::MAX);
+                if boot.knobs.diagnostics.arm_trace {
+                    eprintln!(
+                        "[arm-trace] bodies held {} MiB: {} bodies took {} MiB, arming {} MiB at \
+                         its peak, when this deployment last armed whole (bodies_mem {} MiB)",
+                        held.min(shell.bodies_mem) >> 20,
+                        measured.bodies,
+                        measured.bytes >> 20,
+                        measured.peak >> 20,
+                        shell.bodies_mem >> 20,
+                    );
+                }
+                shell.bodies_from_record = held < shell.bodies_mem;
+                shell.bodies_mem = shell.bodies_mem.min(held);
+            }
+            shell.bodies_record = Some(record);
+        }
         let bodies = if shell.records_bodies() {
             shell.bodies_mem as u64
         } else {

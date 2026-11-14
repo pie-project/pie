@@ -377,6 +377,19 @@ impl From<poem_exec::Error> for Fault {
 }
 
 impl Fault {
+    /// Whether the device had no room for an allocation the call made.
+    #[must_use]
+    pub(crate) fn out_of_room(&self) -> bool {
+        match self {
+            Self::OutOfMemory { .. } => true,
+            #[cfg(feature = "device")]
+            Self::Device { code, .. } => {
+                *code == crate::device::rt::cudaError::cudaErrorMemoryAllocation as i32
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn program(at: &'static str, why: impl Into<String>) -> Fault {
         Fault::Program {
             at,

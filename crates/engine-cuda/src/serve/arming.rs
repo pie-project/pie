@@ -95,6 +95,17 @@ pub(super) struct Arming {
     starved: Option<u64>,
     peer_stopped: bool,
     unit_margin: u64,
+    /// The bodies' allowance is a record's measurement
+    /// ([`super::measured`]): the lattice arms as recorded, unpriced, and
+    /// no headroom estimate stops it.
+    from_record: bool,
+    /// A capture found no device room on a record's allowance while the
+    /// shell served: arming stopped there and the rest walk eagerly.
+    record_short: bool,
+    /// Device memory free as arming began, and the least seen since, at
+    /// each composition: what arming took at its peak.
+    free_began: Option<u64>,
+    free_least: Option<u64>,
     /// The buckets of the profile's lattice, before arming coarsened any
     /// away.
     profiled: usize,
@@ -1488,6 +1499,10 @@ impl Shell {
             starved: None,
             peer_stopped: false,
             unit_margin: self.pools.arming_margin_bytes(),
+            from_record: self.bodies_from_record,
+            record_short: false,
+            free_began: crate::device::free_bytes(),
+            free_least: crate::device::free_bytes(),
             profiled: self.budget.buckets.len(),
             ballot: Ballot::open(&self.device),
         })
@@ -1604,7 +1619,9 @@ impl Shell {
                 // Every rung is stated armed only where every composition
                 // the lattice planned holds a body: a fire past that would
                 // walk eagerly.
-                let whole = st.whole();
+                // A record's allowance that fell short stopped arming on
+                // purpose: the line is said and the record dropped.
+                let whole = if st.record_short { Ok(()) } else { st.whole() };
                 self.arm_end(st)?;
                 whole?;
                 self.settle()?;
@@ -1625,7 +1642,11 @@ impl Shell {
             st.rung = rung;
             st.priced = st.verify || st.group || self.lattice.is_none();
         }
-        self.arm_target(st, bucket, target, rs)
+        let armed = self.arm_target(st, bucket, target, rs);
+        if let Some(free) = crate::device::free_bytes() {
+            st.free_least = Some(st.free_least.map_or(free, |least| least.min(free)));
+        }
+        armed
     }
 
     fn arm_target(
@@ -1635,7 +1656,8 @@ impl Shell {
         target: BodySynth,
         rs: record::RsBody,
     ) -> Result<()> {
-        if !st.priced && st.narrower(bucket, &target) {
+        // A record says the lattice fit whole: it arms as recorded.
+        if !st.priced && !st.from_record && st.narrower(bucket, &target) {
             st.priced = true;
             // What is still to arm: the narrower targets a coarser lattice
             // may drop, and the rest (the top bucket's, the decodes'), which
@@ -1669,7 +1691,9 @@ impl Shell {
         // allowance the fit held under the margin would otherwise stop
         // arming before its first body.
         let margin = price.max(st.unit_margin.min(self.bodies_mem as u64 / 4));
-        let headroom = spare < margin;
+        // Estimated where nothing is known; a record's allowance is a
+        // measurement, and the headroom estimate is not consulted.
+        let headroom = !st.from_record && spare < margin;
         let mine = !st.verify
             && (spent.census.bodies >= record::MAX_BODIES
                 || spent.census.bytes >= self.bodies_mem
@@ -1717,6 +1741,19 @@ impl Shell {
             if let Err(why) = fired.and(landed) {
                 if super::diag::on().arm_trace {
                     eprintln!("[arm-trace] refused bucket {bucket}, {target}: {why}");
+                }
+                // On a record's allowance a capture short of device room
+                // stops arming here, not the load: the rest walk eagerly,
+                // and arming's end drops the record and says so.
+                if self.lent.is_some() && st.from_record && why.out_of_room() {
+                    st.refused = Some(format!("bucket {bucket}, {target}: {why}"));
+                    if st.never == 0 {
+                        st.never_from = bucket;
+                    }
+                    st.never += st.targets.len();
+                    st.targets.clear();
+                    st.record_short = true;
+                    break;
                 }
                 // A lattice arming while the shell serves leaves no key to
                 // walk eagerly: a refusal there is the step's fault.
@@ -1939,6 +1976,47 @@ impl Shell {
             self.budget.buckets.len(),
             st.profiled
         );
+        // The record: written where every rung armed, at what the bodies
+        // took and arming's peak; dropped, and said, where a record's
+        // allowance armed short of whole.
+        if let Some(record) = self.bodies_record.as_deref()
+            && !st.verify
+        {
+            let took = stats.census.bytes as u64;
+            let peak = st
+                .free_began
+                .zip(st.free_least)
+                .map_or(took, |(began, least)| began.saturating_sub(least))
+                .max(took);
+            let measured = super::measured::Measured {
+                bytes: took,
+                bodies: stats.census.bodies as u64,
+                peak,
+            };
+            if super::diag::on().arm_trace {
+                eprintln!(
+                    "[arm-trace] arming took {} MiB at its peak; {} bodies weigh {} MiB",
+                    peak >> 20,
+                    measured.bodies,
+                    took >> 20,
+                );
+            }
+            match super::measured::conclude(
+                record,
+                self.bodies_from_record,
+                matches!(seal, Seal::Complete),
+                measured,
+                st.armed,
+                st.wanted + st.never,
+            ) {
+                Ok(Some(line)) => eprintln!("{line}"),
+                Ok(None) => {}
+                Err(why) => eprintln!(
+                    "engine-cuda: WARNING: the bodies' record at {} is not kept: {why}",
+                    record.display()
+                ),
+            }
+        }
         // A load that records bodies serves every composition it fires from
         // one: one that armed none, or stopped arming for want of room, would
         // serve eagerly, which is never what a deployment asked for.
@@ -2257,6 +2335,10 @@ mod tests {
             starved: None,
             peer_stopped: false,
             unit_margin: 0,
+            from_record: false,
+            record_short: false,
+            free_began: None,
+            free_least: None,
             profiled: 0,
             ballot: Ballot { slip: None },
         }

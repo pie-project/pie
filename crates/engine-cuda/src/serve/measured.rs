@@ -1,0 +1,181 @@
+//! What a deployment's graph bodies took the last time it armed whole,
+//! kept beside the kernel cache: a load that finds it holds that for its
+//! bodies, not the `[engine] bodies_mem` ceiling, and arms its lattice as
+//! recorded, without the estimates a load that knows nothing prices by.
+//!
+//! The record is keyed on everything that shapes the bodies: the engine
+//! build (its crate version and the binary's own size and time), the
+//! deployment's checkpoint, the trace, the device profile and the budgets.
+//! A key that differs in any part names another file, so a record never
+//! reads across builds or deployments. The file is
+//! `<cache_dir>/bodies/<key>`, text:
+//!
+//! ```text
+//! pie-bodies 2
+//! bytes <census bytes once every rung armed>
+//! bodies <bodies armed>
+//! peak <the most device memory arming took, sampled at each composition>
+//! ```
+
+use std::path::{Path, PathBuf};
+
+/// What the bodies took when every rung armed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Measured {
+    /// The bodies' census.
+    pub bytes: u64,
+    pub bodies: u64,
+    /// The most device memory arming took at once (a capture's own
+    /// transients above what its body keeps), never under the census.
+    pub peak: u64,
+}
+
+impl Measured {
+    /// What a load holds for its bodies: the recorded peak, exactly. It is
+    /// a measurement of the same build and deployment, so no margin.
+    #[must_use]
+    pub fn hold(&self) -> u64 {
+        self.peak
+    }
+}
+
+const HEADER: &str = "pie-bodies 2";
+
+/// The record's file for a deployment whose bodies `parts` shape.
+#[must_use]
+pub(crate) fn path(cache_dir: &Path, parts: &str) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let build = std::env::current_exe()
+        .and_then(std::fs::metadata)
+        .map(|meta| {
+            let time = meta
+                .modified()
+                .ok()
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |at| at.as_nanos());
+            format!("{}:{time}", meta.len())
+        })
+        .unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (env!("CARGO_PKG_VERSION"), build, parts).hash(&mut hasher);
+    cache_dir
+        .join("bodies")
+        .join(format!("{:016x}", hasher.finish()))
+}
+
+/// The record at `path`; none where it is missing or not whole.
+#[must_use]
+pub(crate) fn read(path: &Path) -> Option<Measured> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != HEADER {
+        return None;
+    }
+    let mut field = |name: &str| -> Option<u64> {
+        lines.next()?.strip_prefix(name)?.trim().parse().ok()
+    };
+    let bytes = field("bytes ")?;
+    let bodies = field("bodies ")?;
+    let peak = field("peak ")?;
+    (bodies > 0 && peak >= bytes).then_some(Measured {
+        bytes,
+        bodies,
+        peak,
+    })
+}
+
+/// Writes `measured` at `path`, through a file beside it so a reader never
+/// sees half a record.
+pub(crate) fn write(path: &Path, measured: Measured) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let partial = path.with_extension("partial");
+    std::fs::write(
+        &partial,
+        format!(
+            "{HEADER}\nbytes {}\nbodies {}\npeak {}\n",
+            measured.bytes, measured.bodies, measured.peak
+        ),
+    )?;
+    std::fs::rename(partial, path)
+}
+
+/// What a load's arming ends with for the record at `path`: armed whole,
+/// what the bodies took is written; short of whole (`armed` of `wanted`)
+/// after holding a record's figure, the record under-held, and it is
+/// dropped, so the next load holds the ceiling and records again. The
+/// line to say, where there is one.
+pub(crate) fn conclude(
+    path: &Path,
+    held_from_record: bool,
+    whole: bool,
+    measured: Measured,
+    armed: usize,
+    wanted: usize,
+) -> std::io::Result<Option<String>> {
+    if whole {
+        write(path, measured)?;
+        return Ok(None);
+    }
+    if !held_from_record {
+        return Ok(None);
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(why) if why.kind() == std::io::ErrorKind::NotFound => {}
+        Err(why) => return Err(why),
+    }
+    Ok(Some(format!(
+        "engine-cuda: the bodies' record under-held: {armed} of {wanted} compositions armed; \
+         the record is dropped and the next load holds bodies_mem"
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Measured, conclude, path, read, write};
+
+    #[test]
+    fn a_record_reads_back_and_holds_its_peak() {
+        let dir = std::env::temp_dir().join(format!("pie-measured-{}", std::process::id()));
+        let at = path(&dir, "deployment");
+        assert_eq!(read(&at), None, "no record yet");
+        let measured = Measured {
+            bytes: 404 << 20,
+            bodies: 161,
+            peak: 500 << 20,
+        };
+        write(&at, measured).expect("the record is written");
+        assert_eq!(read(&at), Some(measured));
+        assert_eq!(measured.hold(), 500 << 20);
+        std::fs::write(&at, "pie-bodies 1\nbytes 1\nbodies 1\n").unwrap();
+        assert_eq!(read(&at), None, "an older record reads as none");
+        assert_ne!(path(&dir, "another deployment"), at, "another key, another file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_record_that_under_held_is_dropped_and_said() {
+        let dir = std::env::temp_dir().join(format!("pie-measured-drop-{}", std::process::id()));
+        let at = path(&dir, "deployment");
+        let measured = Measured {
+            bytes: 404 << 20,
+            bodies: 161,
+            peak: 500 << 20,
+        };
+        // Armed whole: written, nothing said.
+        assert_eq!(conclude(&at, false, true, measured, 161, 161).unwrap(), None);
+        assert_eq!(read(&at), Some(measured));
+        // Short of whole on the ceiling: the record stands.
+        assert_eq!(conclude(&at, false, false, measured, 150, 161).unwrap(), None);
+        assert_eq!(read(&at), Some(measured));
+        // Short of whole on the record's figure: dropped, and said.
+        let said = conclude(&at, true, false, measured, 150, 161).unwrap();
+        assert!(said.is_some_and(|line| line.contains("150 of 161 compositions armed")));
+        assert_eq!(read(&at), None, "the next load holds bodies_mem");
+        // Dropped twice is no error.
+        assert!(conclude(&at, true, false, measured, 150, 161).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
