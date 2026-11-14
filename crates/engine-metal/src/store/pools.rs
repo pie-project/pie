@@ -12,8 +12,8 @@ use poem_ir::{CacheRow, Dtype, Trace};
 use super::layout::{FIXED, LIST, Layout, MAX_WINDOWS, RS, Slots, WINDOWS};
 use super::pool::Pool;
 use super::{
-    STATE_MAP_BYTES, Seats, Spill, TableSeat, compressed_rows, elem_bytes, elem_size, narrow,
-    row_stride, split, state_dtype,
+    Seats, Spill, TableSeat, compressed_rows, elem_bytes, elem_size, narrow, row_stride, split,
+    state_dtype,
 };
 use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context, Handles};
@@ -559,6 +559,10 @@ pub struct Pools {
     /// Every state row's segment table, one after another, in the tables
     /// run.
     maps: Option<crate::inputs::Region>,
+    /// Each buffer's address less the first's, one ulong a buffer, in the
+    /// tables run, where the range spans more than one: what kernels reach
+    /// a page in another buffer by (`kv_page.h`'s `pie_fc_part_table`).
+    deltas: Option<crate::inputs::Region>,
     /// Where the next of the engine's own tables lies in the tables run
     /// (`Reserved::Tables`), and where the run ends: range byte offsets.
     table_run: (u64, u64),
@@ -707,6 +711,7 @@ impl Pools {
                 ..paging
             },
             maps: None,
+            deltas: None,
             shape_rows: [rows.kv_rows.clone(), rows.state_rows.clone()],
             // A load without state rows still numbers each lane's seat: one
             // band of one id.
@@ -737,7 +742,39 @@ impl Pools {
             pools.pool.commit_segments(segments)?;
         }
         pools.write_maps(device)?;
+        pools.write_deltas(device)?;
         Ok(pools)
+    }
+
+    /// Writes the buffers' delta table where the range spans more than one
+    /// and pages a shape (kv list, window lists, rs list) kernels reach
+    /// through it; a state row reaches the buffers through its own map.
+    fn write_deltas(&mut self, device: &Context) -> Result<()> {
+        let paged = self.layout.list.is_some()
+            || self.layout.rs.is_some()
+            || (0..MAX_WINDOWS).any(|k| self.layout.window(k).is_some());
+        if self.pool.parts() < 2 || !paged {
+            return Ok(());
+        }
+        let words: Vec<u8> = self
+            .pool
+            .deltas()
+            .iter()
+            .flat_map(|delta| delta.to_le_bytes())
+            .collect();
+        let mut region = self.run_table(device, words.len() as u64)?;
+        region.write(0, &words)?;
+        self.deltas = Some(region);
+        Ok(())
+    }
+
+    /// The device address of the buffers' delta table, where the range
+    /// spans more than one buffer.
+    #[must_use]
+    pub fn delta_table(&self) -> Option<u64> {
+        self.deltas.as_ref().map(|region| {
+            crate::device::alloc::slab_address(region.view().slab()).wrapping_add(region.at(0))
+        })
     }
 
     /// Writes each state row's segment table: the bank is the whole pool,
@@ -775,12 +812,9 @@ impl Pools {
                 },
                 piece_atoms,
                 pieces: pieces.max(1),
-                bases: (0..super::pool::MAX_PARTS)
-                    .map(|at| {
-                        let deltas = self.pool.deltas();
-                        deltas[at.min(deltas.len() - 1)]
-                    })
-                    .collect::<Vec<_>>()
+                bases: self
+                    .pool
+                    .deltas()
                     .iter()
                     .map(|&delta| {
                         (((delta as i64) / element as i64) as u64).wrapping_add(offset / element)
@@ -798,11 +832,21 @@ impl Pools {
         Ok(())
     }
 
-    /// The tables run's bytes the state maps of `state_rows` state rows
-    /// take: what a load counts into the run before it lays it.
+    /// The tables run's bytes the state maps of `state_rows` state rows and
+    /// the buffers' delta table take where the range spans at most `parts`
+    /// buffers: what a load counts into the run before it lays it.
     #[must_use]
-    pub fn map_bytes(state_rows: usize) -> u64 {
-        crate::arena::room(state_rows as u64 * STATE_MAP_BYTES)
+    pub fn map_bytes(state_rows: usize, parts: usize) -> u64 {
+        let maps = match state_rows {
+            0 => 0,
+            rows => crate::arena::room(rows as u64 * super::state_map_bytes(parts)),
+        };
+        let deltas = if parts > 1 {
+            crate::arena::room(parts as u64 * 8)
+        } else {
+            0
+        };
+        maps + deltas
     }
 
     /// `bytes` of the tables run (`Reserved::Tables`), zeroed and written
@@ -1647,11 +1691,11 @@ impl Pools {
                     let segments = Tensor::new(
                         handles.bind(
                             maps.view(),
-                            maps.at(state_row * STATE_MAP_BYTES),
-                            STATE_MAP_BYTES,
+                            maps.at(state_row * super::state_map_bytes(self.pool.parts())),
+                            super::state_map_bytes(self.pool.parts()),
                         )?,
                         1,
-                        (StateMap::HEAD + super::pool::MAX_PARTS) as u32,
+                        (StateMap::HEAD + self.pool.parts()) as u32,
                         Dtype::U64,
                     );
                     state_row += 1;

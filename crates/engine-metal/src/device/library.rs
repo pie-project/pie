@@ -33,10 +33,11 @@ pub struct Pipelines {
     /// pipeline build: the driver's share of them, measured (an `outside`
     /// line of the ledger).
     built: std::cell::Cell<u64>,
-    /// The pool's buffers past the first, each's address less the first's
-    /// (`kv_page.h`'s `pie_fc_pool_delta1..3`); none where the pool is one
-    /// buffer. Fixed before the first pipeline is built.
-    pool: RefCell<Vec<u64>>,
+    /// The device address of the pool's buffer delta table and the bits of
+    /// a page id under its buffer (`kv_page.h`'s `pie_fc_part_table` and
+    /// `pie_fc_part_shift`); none where the pool is one buffer. Fixed
+    /// before the first pipeline is built.
+    pool: std::cell::Cell<Option<(u64, u32)>>,
     /// How a page id splits its slot in its buffer (`kv_page.h`'s
     /// `pie_fc_slot_shift` and `pie_fc_chunk_bytes`): the bits of a slot's
     /// index in its chunk and a chunk's bytes, where a paged shape's slots
@@ -64,11 +65,11 @@ impl Pipelines {
         Pipelines::default()
     }
 
-    /// States the pool's buffers (`deltas`, each's address less the
-    /// first's, the first's 0) and how a page id names its slot (`ids`) for
-    /// every pipeline built from now on.
-    pub fn set_pool(&self, deltas: &[u64], ids: crate::store::pool::PageIds) {
-        *self.pool.borrow_mut() = deltas.iter().skip(1).copied().collect();
+    /// States the pool's buffer delta table (`table`, its device address,
+    /// where the range spans more than one buffer) and how a page id names
+    /// its slot (`ids`) for every pipeline built from now on.
+    pub fn set_pool(&self, table: Option<u64>, ids: crate::store::pool::PageIds) {
+        self.pool.set(table.map(|at| (at, ids.part_shift)));
         self.slots
             .set(ids.shift.map(|shift| (shift, ids.chunk_bytes)));
     }
@@ -115,28 +116,32 @@ impl Pipelines {
         }
         // The pool's buffers (`kv_page.h`): split where there is more than
         // one, each past the first at its address less the first's.
-        let pool = self.pool.borrow();
-        let split = !pool.is_empty();
-        // SAFETY: a bool constant at index 2, read from a live bool.
+        // The pool's buffers (`kv_page.h`): split where there is more than
+        // one, each reached through the delta table at its device address,
+        // a page id's buffer in the bits over the part shift.
+        let (split, table, part_shift) = match self.pool.get() {
+            Some((table, shift)) => (true, table, shift),
+            None => (false, 0u64, 31u32),
+        };
+        // SAFETY: a bool at index 2, a uint at 3 and a ulong at 4, each read
+        // from a live value of its type.
         unsafe {
             constants.setConstantValue_type_atIndex(
                 std::ptr::NonNull::from(&split).cast(),
                 objc2_metal::MTLDataType::Bool,
                 2,
             );
+            constants.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from(&part_shift).cast(),
+                objc2_metal::MTLDataType::UInt,
+                3,
+            );
+            constants.setConstantValue_type_atIndex(
+                std::ptr::NonNull::from(&table).cast(),
+                objc2_metal::MTLDataType::ULong,
+                4,
+            );
         }
-        let deltas: [u64; 3] = std::array::from_fn(|at| pool.get(at).copied().unwrap_or(0));
-        for (at, delta) in deltas.iter().enumerate() {
-            // SAFETY: a ulong constant at indexes 3 to 5, read from a live u64.
-            unsafe {
-                constants.setConstantValue_type_atIndex(
-                    std::ptr::NonNull::from(delta).cast(),
-                    objc2_metal::MTLDataType::ULong,
-                    3 + at,
-                );
-            }
-        }
-        drop(pool);
         // How a page id splits its slot (`kv_page.h`): by chunk and index
         // where the load's paged slots do not tile a chunk.
         let (split, shift, chunk) = match self.slots.get() {

@@ -865,7 +865,8 @@ fn a_reserved_hybrid_pool_states_shared_chunks() {
     .expect("a layout")
     // The state maps' run of the engine's tables, as a load sizes it.
     .with_tables(
-        u32::try_from(Pools::map_bytes(rows.state_rows()).div_ceil(chunk)).expect("a chunk count"),
+        u32::try_from(Pools::map_bytes(rows.state_rows(), 4).div_ceil(chunk))
+            .expect("a chunk count"),
     );
     let paging = engine_metal::store::kv::Paging::of(rows.tokens, 256, SEATS, 1).expect("a paging");
     let bands = rows.bands.clone();

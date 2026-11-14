@@ -1023,7 +1023,23 @@ impl PreparedLoad<'_> {
         // The engine's own tables (`Reserved::Tables`): a run of whole
         // chunks right after the null chunk, model bytes in the pool: the
         // registered adapter banks, the weight caches' atom tables and use
-        // counters and the state maps.
+        // counters, the state maps and the buffers' delta table. The maps
+        // and the table take a word a buffer, sized for the most buffers the
+        // device's working set (or the stated kv budget) can take.
+        let part_cap = crate::store::pool::part_cap(&device);
+        let part_chunks = crate::store::pool::part_chunks(
+            part_cap,
+            rows.chunk_bytes,
+            crate::store::pool::segment_chunks(rows.chunk_bytes),
+        );
+        let parts_bound = usize::try_from(
+            device
+                .working_set()
+                .max(boot.kv_budget.unwrap_or(0))
+                .div_ceil(u64::from(part_chunks.max(1)) * rows.chunk_bytes.max(1))
+                + 1,
+        )
+        .unwrap_or(usize::MAX);
         let tables_chunks = u32::try_from(
             (weights.bank_bytes()
                 + crate::arena::room(scratch.constant_bytes())
@@ -1031,7 +1047,7 @@ impl PreparedLoad<'_> {
                     .iter()
                     .map(|cache| crate::store::streamed::Cache::table_bytes_for(&cache.shape))
                     .sum::<u64>()
-                + Pools::map_bytes(rows.state_rows()))
+                + Pools::map_bytes(rows.state_rows(), parts_bound))
             .div_ceil(rows.chunk_bytes.max(1)),
         )
         .unwrap_or(u32::MAX);
@@ -1115,31 +1131,30 @@ impl PreparedLoad<'_> {
                 .map_err(|short| Fault::Residency(short.to_string()))?
                 .saturating_add(span)
                 .saturating_add(tables_chunks);
-            // The range spans up to `MAX_PARTS` buffers, each as many whole
-            // segments as one buffer binds; the span lies in the last.
-            let cap = crate::store::pool::part_cap(&device);
-            let per = crate::store::pool::part_chunks(
-                cap,
-                chunk,
-                crate::store::pool::segment_chunks(chunk),
-            );
-            let binds = per.saturating_mul(crate::store::pool::MAX_PARTS as u32);
-            if binds < least.saturating_add(span).saturating_add(tables_chunks) || per < span {
+            // The range spans as many buffers as it takes, each as many
+            // whole segments as one buffer binds; the span lies in the last.
+            let per = part_chunks;
+            if per < span {
                 return Err(Fault::Residency(format!(
-                    "one working set takes {least} chunks of {chunk} bytes and one fire's \
-                     activation {span}, and this device binds {} buffers of {} MiB, the \
-                     activation in one",
-                    crate::store::pool::MAX_PARTS,
-                    cap >> 20
+                    "one fire's activation takes {span} chunks of {chunk} bytes, and one \
+                     buffer of this device binds {per} ({} MiB): the activation lies in one",
+                    part_cap >> 20
                 )));
             }
-            let mut total = total.min(binds);
+            let mut total = total;
             // The last buffer holds the span: a leftover too small for it
             // goes, at most one span and segment of state.
             let left = total % per;
             let seg = crate::store::pool::segment_chunks(chunk);
             if total > per && left != 0 && left < span.saturating_add(seg) {
                 total -= left;
+            }
+            if total.div_ceil(per) as usize > parts_bound {
+                return Err(Fault::Residency(format!(
+                    "the pool's {total} chunks of {chunk} bytes take {} buffers, and the \
+                     tables run was sized for {parts_bound}",
+                    total.div_ceil(per)
+                )));
             }
             let mut layout = Layout::new(
                 chunk,
@@ -1296,7 +1311,7 @@ impl PreparedLoad<'_> {
             keepalive,
             pipelines: {
                 let pipelines = Pipelines::new();
-                pipelines.set_pool(&pools.deltas(), pools.page_ids());
+                pipelines.set_pool(pools.delta_table(), pools.page_ids());
                 pipelines
             },
             handles,
@@ -1389,6 +1404,11 @@ impl Shell {
     #[must_use]
     pub fn pool_layout(&self) -> Layout {
         *self.pools.layout()
+    }
+
+    /// The page ids kernels address kv list slot refs `refs` by.
+    pub fn kv_page_ids(&self, refs: &[u32]) -> Result<Vec<u32>> {
+        self.pools.kv_pages(refs, None)
     }
 
     /// How the pool's page ids name their slots, and the buffers it spans.
