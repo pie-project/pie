@@ -1274,6 +1274,32 @@ impl Pools {
         self.pool.read(offset, into)
     }
 
+    /// Backs the range's top `bytes` for a fire's carve ([`Pool::cover`]).
+    pub fn cover(&mut self, bytes: u64) -> Result<()> {
+        self.pool.cover(bytes)
+    }
+
+    /// The span's segments, from the one it starts in to the range's end.
+    #[must_use]
+    pub fn span_segments(&self) -> u32 {
+        self.pool.span_segments()
+    }
+
+    /// Backs the span's top `segments` for state ([`Pool::commit_span`]).
+    pub fn commit_span(&mut self, segments: u32) -> Result<()> {
+        self.pool.commit_span(segments)
+    }
+
+    /// Gives back the span's segments past the top `segments`.
+    ///
+    /// # Safety
+    ///
+    /// As [`Pool::release_span`].
+    pub unsafe fn release_span(&mut self, segments: u32) -> Result<()> {
+        // SAFETY: the caller's contract.
+        unsafe { self.pool.release_span(segments) }
+    }
+
     /// Zeroes `len` bytes at `offset` of the pool's buffer on the host,
     /// where no frame reads them.
     pub fn zero_span(&mut self, offset: u64, len: u64) -> Result<()> {
