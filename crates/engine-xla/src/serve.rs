@@ -632,9 +632,9 @@ impl Shell {
         };
         // A hybrid's state slots balance against the pages a seat takes: at
         // the tokens a sequence is expected to hold where the operator says
-        // (`seat_tokens`), else at the context. The pool holds one sequence
-        // at the context either way: seats it would not hold fall back to
-        // seats at the context.
+        // (`seat_tokens`), else at the context. The pool must hold one
+        // sequence at the context: a seat that leaves it fewer pages is
+        // refused, not fitted again at another seat.
         // The tokens a seat is balanced at are the power of two nearest those
         // asked (448 and 592 both seat 512): a load's shapes that differ a
         // little share one pool, so one compiled ladder (Qwen3.6-35B-A3B's v5e
@@ -648,13 +648,16 @@ impl Shell {
             };
             u64::from(tokens.div_ceil(boot.page_size.max(1))).clamp(1, least)
         });
-        let fitted = |one_slot: u64| {
-            engine::fit::pool_for(boot.kv_budget, boot.slots, one_slot, room, &demand)
-        };
-        let (fit, slots) = match fitted(seat) {
-            Ok((fit, slots)) if fit >= least => (fit, slots),
-            _ => fitted(least).map_err(|short| Fault::Residency(short.to_string()))?,
-        };
+        let (fit, slots) =
+            engine::fit::pool_for(boot.kv_budget, boot.slots, seat, room, demand)
+                .map_err(|short| Fault::Residency(short.to_string()))?;
+        if fit < least {
+            return Err(Fault::Residency(format!(
+                "seats of {seat} page(s) (`seat_tokens`) leave the pool {fit} page(s), fewer \
+                 than the {least} one sequence at the context takes: name fewer slots or \
+                 more seat tokens"
+            )));
+        }
         tracing::info!(
             pages = fit,
             slots,

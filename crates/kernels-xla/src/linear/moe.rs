@@ -1983,7 +1983,7 @@ fn pooled_spec(
         }),
         ..spec?
     };
-    (spec.prefetching() && spec.kernel().is_ok()).then_some(spec)
+    (spec.prefetching() && spec.admit().is_ok()).then_some(spec)
 }
 
 /// The routed matmul every select entry lowers to: `y[t*k + s] = W[routes[t,
@@ -2663,13 +2663,14 @@ pub fn experts(
         && (intermediate % 128 == 0 || up.tm >= 128)
         && up.stepping()
         && up.orient == crate::linear::moe_gmm::Orient::NMajor
-        && inside.kernel().is_ok();
+        && inside.admit().is_ok();
     // Both legs in one kernel, the GLU rows staying in VMEM between them.
     let fused = if glu_inside
         && tuning.moe_gmm_fuse_from > 0
         && t >= tuning.moe_gmm_fuse_from
-        && let Ok(kernel) = inside.mlp_kernel(&dn)
+        && inside.admit_mlp(&dn).is_ok()
     {
+        let kernel = inside.mlp_kernel(&dn)?;
         let wl = f.broadcast(ws, &[rows, 128], &[0])?;
         let st = steps(f, inside, &sorted)?;
         let wu = up_bank.codes.val();
