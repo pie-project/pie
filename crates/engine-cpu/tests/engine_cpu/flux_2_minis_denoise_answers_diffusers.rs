@@ -241,8 +241,11 @@ fn flux_2_minis_primitive_goldens() {
             files.join(", ")
         ));
     }
-    std::fs::write(dir.join("nodes.json"), format!("{{{}}}\n", index.join(",\n")))
-        .expect("the goldens' index");
+    std::fs::write(
+        dir.join("nodes.json"),
+        format!("{{{}}}\n", index.join(",\n")),
+    )
+    .expect("the goldens' index");
 }
 
 /// A captured value as a `.npy` file: little-endian f32 or i32, `[rows, width]`.
@@ -251,14 +254,20 @@ fn npy(c: &engine_cpu::forward::Captured) -> Vec<u8> {
         Values::F32(v) => ("<f4", v.iter().flat_map(|x| x.to_le_bytes()).collect()),
         Values::I32(v) => ("<i4", v.iter().flat_map(|x| x.to_le_bytes()).collect()),
     };
-    let mut header =
-        format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': ({}, {}), }}", c.rows, c.width);
+    let mut header = format!(
+        "{{'descr': '{descr}', 'fortran_order': False, 'shape': ({}, {}), }}",
+        c.rows, c.width
+    );
     while (10 + header.len() + 1) % 64 != 0 {
         header.push(' ');
     }
     header.push('\n');
     let mut out = b"\x93NUMPY\x01\x00".to_vec();
-    out.extend_from_slice(&u16::try_from(header.len()).expect("a short header").to_le_bytes());
+    out.extend_from_slice(
+        &u16::try_from(header.len())
+            .expect("a short header")
+            .to_le_bytes(),
+    );
     out.extend_from_slice(header.as_bytes());
     out.extend(body);
     out

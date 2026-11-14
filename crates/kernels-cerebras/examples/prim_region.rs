@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use kernels_cerebras::emit::region::{self, ParamAt, Place};
-use kernels_ir::interp::{self, Arg};
 use kernels_ir::Shape;
+use kernels_ir::interp::{self, Arg};
 use poem_ir::Platform;
 
 const MINI: &str = "flux2-mini-bf16-kv-bf16";
@@ -36,7 +36,11 @@ fn read_npy(path: &Path) -> (Vec<usize>, Vec<f32>) {
         .chunks(4)
         .map(|c| {
             let w = [c[0], c[1], c[2], c[3]];
-            if ints { i32::from_le_bytes(w) as f32 } else { f32::from_le_bytes(w) }
+            if ints {
+                i32::from_le_bytes(w) as f32
+            } else {
+                f32::from_le_bytes(w)
+            }
         })
         .collect();
     (shape, v)
@@ -45,7 +49,10 @@ fn read_npy(path: &Path) -> (Vec<usize>, Vec<f32>) {
 fn write_npy(path: &Path, shape: &[usize], v: &[f32]) {
     let dims: Vec<String> = shape.iter().map(ToString::to_string).collect();
     let tail = if shape.len() == 1 { "," } else { "" };
-    let mut h = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({}{tail}), }}", dims.join(", "));
+    let mut h = format!(
+        "{{'descr': '<f4', 'fortran_order': False, 'shape': ({}{tail}), }}",
+        dims.join(", ")
+    );
     while (10 + h.len() + 1) % 64 != 0 {
         h.push(' ');
     }
@@ -62,7 +69,10 @@ fn write_npy(path: &Path, shape: &[usize], v: &[f32]) {
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let (gold, out) = (Path::new(&a[1]), Path::new(&a[2]));
-    let run: Vec<u32> = a[3].split(',').map(|n| n.parse().expect("a node")).collect();
+    let run: Vec<u32> = a[3]
+        .split(',')
+        .map(|n| n.parse().expect("a node"))
+        .collect();
     let (from, rows, lane, chunk) = (
         a[4].parse::<usize>().unwrap(),
         a[5].parse::<usize>().unwrap(),
@@ -105,7 +115,11 @@ fn main() {
     for (input, &shape) in chain.ins.iter().zip(&reg.params) {
         let (s, v) = load(input.value);
         // a weight (shared by every row) is its elements whole
-        let w = if input.shared { v.len() } else { *s.last().unwrap() };
+        let w = if input.shared {
+            v.len()
+        } else {
+            *s.last().unwrap()
+        };
         let at = if shape == Shape::Scalar {
             ParamAt::Scalar
         } else if input.by.is_some() || input.shared || s.len() == 1 {
@@ -114,16 +128,34 @@ fn main() {
             ParamAt::Row
         };
         place.push(at);
-        data.push((input.by.is_some(), input.from as usize, w, input.shared || s.len() == 1, v));
+        data.push((
+            input.by.is_some(),
+            input.from as usize,
+            w,
+            input.shared || s.len() == 1,
+            v,
+        ));
     }
     let arg = |k: usize, r: usize| -> Arg {
         let (by, from, w, flat, v) = &data[k];
-        let row = if *flat { 0 } else if *by { lane } else { r };
+        let row = if *flat {
+            0
+        } else if *by {
+            lane
+        } else {
+            r
+        };
         match place[k] {
             ParamAt::Scalar => Arg::Scalar(v[row * w + from]),
             _ => Arg::Row(
                 (0..width)
-                    .map(|e| if *flat { v[(from + e) % w] } else { v[row * w + from + e] })
+                    .map(|e| {
+                        if *flat {
+                            v[(from + e) % w]
+                        } else {
+                            v[row * w + from + e]
+                        }
+                    })
                     .collect(),
             ),
         }
@@ -163,7 +195,8 @@ fn main() {
             for (k, p) in place.iter().enumerate() {
                 match (p, &args[k]) {
                     (ParamAt::Row, Arg::Row(v)) => {
-                        rowv[base + i * c..base + (i + 1) * c].copy_from_slice(&v[root * c..(root + 1) * c]);
+                        rowv[base + i * c..base + (i + 1) * c]
+                            .copy_from_slice(&v[root * c..(root + 1) * c]);
                         i += 1;
                     }
                     (ParamAt::Scalar, Arg::Scalar(x)) => {
@@ -200,7 +233,11 @@ fn main() {
             }
         }
     }
-    let ntab: usize = printed.tables.iter().map(|t| t.of_chunk.iter().map(Vec::len).max().unwrap_or(0)).sum();
+    let ntab: usize = printed
+        .tables
+        .iter()
+        .map(|t| t.of_chunk.iter().map(Vec::len).max().unwrap_or(0))
+        .sum();
     let mut tabs = vec![0f32; roots as usize * ntab.max(1)];
     for root in 0..roots as usize {
         let mut off = 0;
@@ -212,8 +249,16 @@ fn main() {
         }
     }
     let nout = reg.results.len();
-    write_npy(&out.join("rows.npy"), &[rows, roots as usize, rec.max(1)], &rowv);
-    write_npy(&out.join("res.npy"), &[roots as usize, (nres * c).max(1)], &resv);
+    write_npy(
+        &out.join("rows.npy"),
+        &[rows, roots as usize, rec.max(1)],
+        &rowv,
+    );
+    write_npy(
+        &out.join("res.npy"),
+        &[roots as usize, (nres * c).max(1)],
+        &resv,
+    );
     write_npy(&out.join("tabs.npy"), &[roots as usize, ntab.max(1)], &tabs);
     write_npy(&out.join("want.npy"), &[rows, nout, width], &want);
     write_npy(&out.join("trace.npy"), &[rows, nout, width], &tracev);
@@ -224,7 +269,11 @@ fn main() {
         "tables": printed.tables.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
         "ops": reg.ops.len(), "round16": round16,
     });
-    std::fs::write(out.join("meta.json"), serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    std::fs::write(
+        out.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
     println!(
         "PRIM_REGION_HOST nodes {run:?}: interp vs trace rel L2 {:.3e} over {} values; {} all-reduces a row",
         (d2 / n2).sqrt(),

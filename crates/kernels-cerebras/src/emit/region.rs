@@ -212,21 +212,22 @@ pub fn print(region: &Region, place: &Place) -> R<Printed> {
             continue;
         }
         p.op(v, op, k)?;
-        if p.place.round16 && region.rounding(v).is_some() {
-            if let Some(Val::Buf(b)) = p.vals.get(&v) {
-                let b = *b;
-                p.scratch16 = true;
-                let _ = writeln!(p.body, "  @fs2h(H16, B{b}); @fh2s(B{b}, H16);");
-            }
+        if p.place.round16
+            && region.rounding(v).is_some()
+            && let Some(Val::Buf(b)) = p.vals.get(&v)
+        {
+            let b = *b;
+            p.scratch16 = true;
+            let _ = writeln!(p.body, "  @fs2h(H16, B{b}); @fh2s(B{b}, H16);");
         }
         // free what dies here
         for a in op.args() {
-            if p.last_use[a as usize] == k {
-                if let Some(Val::Buf(b)) = p.vals.get(&a) {
-                    let b = *b;
-                    if !p.bufs_free.contains(&b) {
-                        p.bufs_free.push(b);
-                    }
+            if p.last_use[a as usize] == k
+                && let Some(Val::Buf(b)) = p.vals.get(&a)
+            {
+                let b = *b;
+                if !p.bufs_free.contains(&b) {
+                    p.bufs_free.push(b);
                 }
             }
         }
@@ -270,7 +271,8 @@ impl Printer<'_> {
                 _ => Arg::Row(vec![0.0; self.region.width as usize]),
             })
             .collect();
-        let rows = interp::eval(&probe, &args).map_err(|e| Refused(format!("static values: {e}")))?;
+        let rows =
+            interp::eval(&probe, &args).map_err(|e| Refused(format!("static values: {e}")))?;
         for (v, row) in wanted.into_iter().zip(rows) {
             self.host.insert(v, row);
         }
@@ -377,7 +379,9 @@ impl Printer<'_> {
         let shape = self.shape(v);
         let elem = self.types[v as usize].1;
         if elem != Elem::F32 && !matches!(op, Op::Broadcast(_)) {
-            return refuse(format!("op {k} ({op:?}): a row's bools or indices that depend on its values"));
+            return refuse(format!(
+                "op {k} ({op:?}): a row's bools or indices that depend on its values"
+            ));
         }
         match (*op, shape) {
             (Op::Broadcast(a), _) => {
@@ -462,7 +466,7 @@ impl Printer<'_> {
 
     fn head(&mut self, v: ValueId, op: &Op, k: usize, size: u32) -> R<()> {
         let c = self.c();
-        if c % size != 0 {
+        if !c.is_multiple_of(size) {
             return refuse(format!("op {k}: heads of {size} straddle chunks of {c}"));
         }
         let nh = c / size;
@@ -521,7 +525,11 @@ impl Printer<'_> {
         }
         let size = hx.as_ref().or(hy.as_ref()).map(|h| h.1).unwrap_or(1);
         let nh = self.c() / size;
-        let sub = |s: &str| format!("@set_dsd_length(@increment_dsd_offset({s}, @as(i16, j * {size}), f32), {size})");
+        let sub = |s: &str| {
+            format!(
+                "@set_dsd_length(@increment_dsd_offset({s}, @as(i16, j * {size}), f32), {size})"
+            )
+        };
         let xs = match hx {
             Some((h, _)) => format!("{h}[j]"),
             None => sub(&self.operand(x)?),
@@ -542,7 +550,8 @@ impl Printer<'_> {
         // cos / sin of an angle: P5 tables
         if let Op::Unary(u @ (Unary::Cos | Unary::Sin), a) = *op {
             let (cb, sb) = self.trig_of(a, k)?;
-            self.vals.insert(v, Val::Buf(if u == Unary::Cos { cb } else { sb }));
+            self.vals
+                .insert(v, Val::Buf(if u == Unary::Cos { cb } else { sb }));
             return Ok(());
         }
         let dst = self.new_buf();
@@ -615,7 +624,10 @@ impl Printer<'_> {
                     let (row, s) = if sb { (xa, xb) } else { (xb, xa) };
                     let _ = writeln!(self.body, "  @fmacs({d}, {xc}, {row}, {s});");
                 } else {
-                    let _ = writeln!(self.body, "  @fmuls({d}, {xa}, {xb}); @fadds({d}, {d}, {xc});");
+                    let _ = writeln!(
+                        self.body,
+                        "  @fmuls({d}, {xa}, {xb}); @fadds({d}, {d}, {xc});"
+                    );
                 }
             }
             Op::Select(cnd, a, b) => {
@@ -647,14 +659,16 @@ impl Printer<'_> {
                 let swap = idx
                     .iter()
                     .enumerate()
-                    .all(|(e, &m)| m as usize == (e ^ 1) && c % 2 == 0);
+                    .all(|(e, &m)| m as usize == (e ^ 1) && c.is_multiple_of(2));
                 if !swap {
                     return refuse(format!("op {k}: a gather other than a pair's mate"));
                 }
                 let s = self.row_of(src)?;
                 let h = c / 2;
                 let half = |t: &str, o: u32| {
-                    format!("@increment_dsd_offset(@set_dsd_stride(@set_dsd_length({t}, {h}), 2), {o}, f32)")
+                    format!(
+                        "@increment_dsd_offset(@set_dsd_stride(@set_dsd_length({t}, {h}), 2), {o}, f32)"
+                    )
                 };
                 let _ = writeln!(
                     self.body,
@@ -703,8 +717,7 @@ impl Printer<'_> {
         let inside = |u: &ValueId| tree.contains(u) || trig.contains(u);
         let mut keep = tree.clone();
         keep.retain(|v| {
-            users.get(v).is_none_or(|us| us.iter().all(inside))
-                && !self.region.results.contains(v)
+            users.get(v).is_none_or(|us| us.iter().all(inside)) && !self.region.results.contains(v)
         });
         keep
     }
@@ -735,17 +748,31 @@ impl Printer<'_> {
             Op::Select(c, x, y) if self.statics[*c as usize] && self.shape(*c) != Shape::Scalar => {
                 let (tx, ty) = (self.angle_terms(*x)?, self.angle_terms(*y)?);
                 let cond = &self.host[c];
-                Some((0..w).map(|e| if cond[e] != 0.0 { tx[e] } else { ty[e] }).collect())
+                Some(
+                    (0..w)
+                        .map(|e| if cond[e] != 0.0 { tx[e] } else { ty[e] })
+                        .collect(),
+                )
             }
             Op::Binary(Binary::Mul, x, y) => {
-                let (p, f) = if self.statics[*y as usize] { (*x, *y) } else { (*y, *x) };
+                let (p, f) = if self.statics[*y as usize] {
+                    (*x, *y)
+                } else {
+                    (*y, *x)
+                };
                 if !self.statics[f as usize] || self.statics[p as usize] {
                     return None;
                 }
-                if self.shape(p) != Shape::Scalar && !matches!(self.vals.get(&p), Some(Val::Scal(_))) {
+                if self.shape(p) != Shape::Scalar
+                    && !matches!(self.vals.get(&p), Some(Val::Scal(_)))
+                {
                     return None;
                 }
-                let freq = self.host.get(&f).cloned().unwrap_or_else(|| vec![self.host_scalar(f); w]);
+                let freq = self
+                    .host
+                    .get(&f)
+                    .cloned()
+                    .unwrap_or_else(|| vec![self.host_scalar(f); w]);
                 Some(freq.into_iter().map(|fr| (p, fr)).collect())
             }
             _ => None,
@@ -791,7 +818,12 @@ impl Printer<'_> {
             slot_of.push(
                 chunk
                     .iter()
-                    .map(|&(s, f)| slots.iter().position(|&x| x == (s, f.to_bits())).unwrap_or(0) as f32)
+                    .map(|&(s, f)| {
+                        slots
+                            .iter()
+                            .position(|&x| x == (s, f.to_bits()))
+                            .unwrap_or(0) as f32
+                    })
                     .collect(),
             );
             freqs.push(slots.iter().map(|&(_, f)| f32::from_bits(f)).collect());
@@ -807,7 +839,8 @@ impl Printer<'_> {
                 let mut t = vec![0f32; lv as usize * rb * 2 * ns];
                 for l in 0..lv as usize {
                     for d in 0..rb {
-                        let scale = (d as f64) * f64::from(1u32 << (bits as usize * (lv as usize - 1 - l)));
+                        let scale =
+                            (d as f64) * f64::from(1u32 << (bits as usize * (lv as usize - 1 - l)));
                         for (j, &f) in fs.iter().enumerate() {
                             let ang = scale * f64::from(f);
                             t[((l * rb + d) * 2) * ns + j] = ang.cos() as f32;
@@ -818,11 +851,25 @@ impl Printer<'_> {
                 t
             })
             .collect();
-        let pairs = slot_of.iter().all(|m| m.iter().enumerate().all(|(e, &j)| j as usize == e / 2));
-        self.tables.push(Table { name: "rot".into(), u16: false, of_chunk: rot });
-        self.tables.push(Table { name: "rng".into(), u16: false, of_chunk: ranges });
+        let pairs = slot_of
+            .iter()
+            .all(|m| m.iter().enumerate().all(|(e, &j)| j as usize == e / 2));
+        self.tables.push(Table {
+            name: "rot".into(),
+            u16: false,
+            of_chunk: rot,
+        });
+        self.tables.push(Table {
+            name: "rng".into(),
+            u16: false,
+            of_chunk: ranges,
+        });
         if !pairs {
-            self.tables.push(Table { name: "slot".into(), u16: true, of_chunk: slot_of });
+            self.tables.push(Table {
+                name: "slot".into(),
+                u16: true,
+                of_chunk: slot_of,
+            });
         }
         let (cb, sb) = (self.new_buf(), self.new_buf());
         let mut code = String::new();
@@ -852,7 +899,10 @@ impl Printer<'_> {
             );
         }
         self.body.push_str(&code);
-        self.rope = Some(RopeUse { slots: ns as u32, sources });
+        self.rope = Some(RopeUse {
+            slots: ns as u32,
+            sources,
+        });
         self.trig.insert(a, (cb, sb));
         Ok((cb, sb))
     }
@@ -869,7 +919,10 @@ impl Printer<'_> {
              // Params: math (ops/math.csl), seg (an ops/seg.csl: the row reductions' all-reduce over the roots).",
             self.place.roots
         );
-        let _ = writeln!(s, "param math: imported_module;\nparam seg: imported_module;\n");
+        let _ = writeln!(
+            s,
+            "param math: imported_module;\nparam seg: imported_module;\n"
+        );
         let _ = writeln!(s, "const C: u16 = {c};");
         for (k, (&at, &shape)) in (0u32..).zip(self.place.params.iter().zip(&self.region.params)) {
             if shape == Shape::Scalar {
@@ -878,7 +931,11 @@ impl Printer<'_> {
                 let _ = writeln!(
                     s,
                     "var in{k}: [C]f32 align(16) = @zeros([C]f32);   // {}\nconst IN{k} = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{C}} -> in{k}[i] }});",
-                    if at == ParamAt::Resident { "resident" } else { "a row's" }
+                    if at == ParamAt::Resident {
+                        "resident"
+                    } else {
+                        "a row's"
+                    }
                 );
             }
         }
@@ -972,7 +1029,11 @@ impl Printer<'_> {
                 _ => rows.push(k),
             }
         }
-        let ntab: usize = self.tables.iter().map(|t| t.of_chunk.iter().map(Vec::len).max().unwrap_or(0)).sum();
+        let ntab: usize = self
+            .tables
+            .iter()
+            .map(|t| t.of_chunk.iter().map(Vec::len).max().unwrap_or(0))
+            .sum();
         let _ = writeln!(
             s,
             "const NROW: u16 = {};\nconst NSC: u16 = {};\nconst NRES: u16 = {};\nconst NOUT: u16 = {};\nconst NTAB: u16 = {};",
@@ -984,18 +1045,34 @@ impl Printer<'_> {
         );
         s.push_str("fn load_row(p: [*]f32) void {\n  const src = @set_dsd_base_addr(OUT0, p);\n");
         for (i, k) in rows.iter().enumerate() {
-            let _ = writeln!(s, "  @fmovs(IN{k}, @increment_dsd_offset(src, @as(i16, {}), f32));", i as u32 * c);
+            let _ = writeln!(
+                s,
+                "  @fmovs(IN{k}, @increment_dsd_offset(src, @as(i16, {}), f32));",
+                i as u32 * c
+            );
         }
         for (i, k) in scal.iter().enumerate() {
             let _ = writeln!(s, "  sc{k} = p[{}];", rows.len() as u32 * c + i as u32);
         }
-        s.push_str("}\nfn load_res(p: [*]f32) void {\n  const src = @set_dsd_base_addr(OUT0, p);\n");
+        s.push_str(
+            "}\nfn load_res(p: [*]f32) void {\n  const src = @set_dsd_base_addr(OUT0, p);\n",
+        );
         for (i, k) in res.iter().enumerate() {
-            let _ = writeln!(s, "  @fmovs(IN{k}, @increment_dsd_offset(src, @as(i16, {}), f32));", i as u32 * c);
+            let _ = writeln!(
+                s,
+                "  @fmovs(IN{k}, @increment_dsd_offset(src, @as(i16, {}), f32));",
+                i as u32 * c
+            );
         }
-        s.push_str("}\nfn store_row(p: [*]f32) void {\n  const dst = @set_dsd_base_addr(OUT0, p);\n");
+        s.push_str(
+            "}\nfn store_row(p: [*]f32) void {\n  const dst = @set_dsd_base_addr(OUT0, p);\n",
+        );
         for k in 0..self.region.results.len() {
-            let _ = writeln!(s, "  @fmovs(@increment_dsd_offset(dst, @as(i16, {}), f32), OUT{k});", k as u32 * c);
+            let _ = writeln!(
+                s,
+                "  @fmovs(@increment_dsd_offset(dst, @as(i16, {}), f32), OUT{k});",
+                k as u32 * c
+            );
         }
         // the tables a word at a time: word g of the packed tables (load_tabs: n words from g = off)
         s.push_str("}\nfn tab_put(g: u16, x: f32) void {\n");
@@ -1017,7 +1094,9 @@ impl Printer<'_> {
         s.push_str("}\nfn load_tabs(p: [*]f32, off: u16, n: u16) void {\n  var e: u16 = 0;\n  while (e < n) : (e += 1) { tab_put(off + e, p[e]); }\n}\n");
         s.push_str("\nfn init() void {\n");
         if self.exp {
-            s.push_str("  EPL = @set_dsd_stride(@set_dsd_base_addr(EK, @ptrcast([*]u16, &ep)), 2);\n");
+            s.push_str(
+                "  EPL = @set_dsd_stride(@set_dsd_base_addr(EK, @ptrcast([*]u16, &ep)), 2);\n",
+            );
         }
         if self.recip {
             s.push_str(
