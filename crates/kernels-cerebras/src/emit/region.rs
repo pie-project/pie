@@ -125,11 +125,19 @@ struct Printer<'a> {
     /// Cos / sin rows already made from an angle: angle -> (cos buf, sin buf).
     trig: BTreeMap<ValueId, (usize, usize)>,
     rope: Option<RopeUse>,
+    /// The angles the rotation tables were made for, and their cos / sin rows: a second
+    /// rotation of the same angles (q's and k's) reads them again.
+    angles: Option<Angles>,
+    /// Buffers never freed (the cos / sin rows a later rotation may read).
+    pinned: Vec<usize>,
     scratch16: bool,
     exp: bool,
     recip: bool,
     sums: bool,
 }
+
+/// Angles' terms (source, frequency bits) and the cos / sin rows made of them.
+type Angles = (Vec<(ValueId, u32)>, (usize, usize));
 
 struct RopeUse {
     slots: u32,
@@ -185,6 +193,8 @@ pub fn print(region: &Region, place: &Place) -> R<Printed> {
         all_reduces: 0,
         trig: BTreeMap::new(),
         rope: None,
+        angles: None,
+        pinned: Vec::new(),
         scratch16: false,
         exp: false,
         recip: false,
@@ -226,7 +236,7 @@ pub fn print(region: &Region, place: &Place) -> R<Printed> {
                 && let Some(Val::Buf(b)) = p.vals.get(&a)
             {
                 let b = *b;
-                if !p.bufs_free.contains(&b) {
+                if !p.bufs_free.contains(&b) && !p.pinned.contains(&b) {
                     p.bufs_free.push(b);
                 }
             }
@@ -787,6 +797,14 @@ impl Printer<'_> {
         let Some(terms) = self.angle_terms(a) else {
             return refuse(format!("op {k}: a cos / sin of no position x frequency"));
         };
+        let key: Vec<(ValueId, u32)> = terms.iter().map(|&(s, f)| (s, f.to_bits())).collect();
+        if let Some((held, cs)) = &self.angles
+            && *held == key
+        {
+            let cs = *cs;
+            self.trig.insert(a, cs);
+            return Ok(cs);
+        }
         if self.rope.is_some() {
             return refuse(format!("op {k}: a second rotation's angles"));
         }
@@ -904,6 +922,8 @@ impl Printer<'_> {
             sources,
         });
         self.trig.insert(a, (cb, sb));
+        self.angles = Some((key, (cb, sb)));
+        self.pinned.extend([cb, sb]);
         Ok((cb, sb))
     }
 

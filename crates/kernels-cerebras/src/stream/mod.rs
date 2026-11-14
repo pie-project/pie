@@ -16,6 +16,11 @@ use serde::Serialize;
 
 use crate::plan::Act;
 
+pub mod build;
+pub mod host;
+pub mod place;
+pub mod unit;
+
 type R<T> = Result<T, String>;
 
 /// The attention over a step's rows.
@@ -211,6 +216,60 @@ pub fn shape(trace: &Trace, reading: &str, classes: &[RowClass]) -> R<StreamShap
         layer_bodies: prog.layer_bodies().len(),
         program: prog,
     })
+}
+
+/// What [`compile`] builds: a reading at `rows` rows a class, its roundings the build's 16-bit
+/// type's (`round16`, a bf16 build), the first `upto` stages only, `taps` also read back.
+#[derive(Clone, Debug)]
+pub struct Options {
+    pub reading: String,
+    pub rows: u32,
+    pub round16: bool,
+    pub upto: Option<usize>,
+    pub taps: Vec<u32>,
+}
+
+/// Compiles `trace`'s stream reading (`o`) into `out`: the program's CSL (`layout.csl`, the
+/// kernels, the printed regions) and, given a step's captured values `gold`, the host's files
+/// (`host.json`, `h2d/`). Returns the program.
+pub fn compile(
+    trace: &Trace,
+    o: &Options,
+    out: &std::path::Path,
+    gold: Option<&std::path::Path>,
+) -> R<build::Program> {
+    let s = shape_of(trace, &o.reading, o.rows)?;
+    let p = build::program_upto(trace, s, o.round16, o.upto, &o.taps)?;
+    let e = crate::emit::stream::emit(&p)?;
+    std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    for (name, text) in &e.files {
+        std::fs::write(out.join(name), text).map_err(|e| format!("{name}: {e}"))?;
+    }
+    std::fs::write(
+        out.join("fabric.txt"),
+        format!("{} {} {}\n", e.w, e.h, u8::from(o.round16)),
+    )
+    .map_err(|e| e.to_string())?;
+    let meta = serde_json::json!({
+        "fabric": [e.w, e.h],
+        "units": p.units.iter().map(|b| serde_json::json!({
+            "name": b.unit.name, "rows": b.unit.rows, "cols": b.layout.px(), "heads": b.layout.heads,
+            "segs": b.sched.as_ref().map(|s| format!("{:?}", s.segs)),
+        })).collect::<Vec<_>>(),
+        "kv": p.kv,
+        "palette": p.palette.map.iter().map(|(k, c)| (format!("{}{}", k.name, k.index), c.0)).collect::<std::collections::BTreeMap<_, _>>(),
+        "lane_words": p.lane_words,
+        "cost": crate::cost::stream::time(&p),
+    });
+    std::fs::write(
+        out.join("stream.json"),
+        serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    if let Some(g) = gold {
+        host::write(&p, &e.arrays, g, out)?;
+    }
+    Ok(p)
 }
 
 /// The shape of `trace`'s `reading` over the conventional row classes

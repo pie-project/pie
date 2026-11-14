@@ -23,6 +23,14 @@ var u = @zeros([1 + Qh]f32);
 const t_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{TW} -> t[i] });
 const u_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1 + Qh} -> u[i] });
 var passes: u32 = 0;   // every query's passes, summed (a redo is one more)
+var qh: [QD]f32 align(16) = @zeros([QD]f32);
+const qh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> qh[i] });
+
+// A query whose q the column holds (ops/satt.csl's QH): q up the chain, then query().
+fn query_q(o: mem1d_dsd) void {
+  @fmovs(qh_d, fab.fin(IN, QD));
+  query(qh_d, o);
+}
 
 // Row's [k | v] (kv, 2 Dc f32) to the column.
 fn store(kv: mem1d_dsd) void { @fmovs(fab.fout(YO, 2 * Dc), kv); }

@@ -156,3 +156,52 @@ pub fn u32_bytes(shape: &[usize], data: &[u32]) -> Vec<u8> {
     }
     b
 }
+
+/// A little-endian f32 npy of `shape`, as [`u32_bytes`] lays it.
+#[must_use]
+pub fn f32_bytes(shape: &[usize], data: &[f32]) -> Vec<u8> {
+    let mut b = u32_bytes(shape, &data.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+    if let Some(at) = b.windows(4).position(|w| w == b"<u4'") {
+        b[at..at + 3].copy_from_slice(b"<f4");
+    }
+    b
+}
+
+/// Writes [`u32_bytes`] to `path`.
+pub fn write_u32(path: &Path, shape: &[usize], data: &[u32]) -> R<()> {
+    std::fs::write(path, u32_bytes(shape, data)).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Writes [`f32_bytes`] to `path`.
+pub fn write_f32(path: &Path, shape: &[usize], data: &[f32]) -> R<()> {
+    std::fs::write(path, f32_bytes(shape, data)).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// A little-endian f32 or i32 npy's shape and values (an i32's as f32).
+pub fn read_f32_or_i32(path: &Path) -> R<(Vec<usize>, Vec<f32>)> {
+    let b = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if b.len() < 10 || &b[..6] != b"\x93NUMPY" {
+        return Err(format!("{}: not an npy", path.display()));
+    }
+    let hl = u16::from_le_bytes([b[8], b[9]]) as usize;
+    let h = std::str::from_utf8(&b[10..10 + hl]).map_err(|e| e.to_string())?;
+    let (lo, hi) = (h.find('(').unwrap_or(0), h.find(')').unwrap_or(0));
+    let shape: Vec<usize> = h[lo + 1..hi]
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    let ints = h.contains("<i4");
+    let v = b[10 + hl..]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&w| {
+            if ints {
+                i32::from_le_bytes(w) as f32
+            } else {
+                f32::from_le_bytes(w)
+            }
+        })
+        .collect();
+    Ok((shape, v))
+}

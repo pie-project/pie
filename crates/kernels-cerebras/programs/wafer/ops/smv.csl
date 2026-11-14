@@ -7,16 +7,22 @@
 // left: the buffer a send reads is free again two rows on. The 16-bit type is the build's
 // (`--fp16-format`): IEEE f16, or bf16 (the stream regime's activations, GENERIC.md §5).
 //
+// An f32 row (X32: a value the trace keeps f32, a lane vector's) is multiplied as its two 16-bit
+// halves, x = hi + lo, the tile run twice into one accumulator.
+//
 // Interface: w (the tile, Hc rows of Nc 16-bit words, row k the weights of x element k; w[0]
-// unused: memcpy's 16-bit writes start at an odd half), `rows(n)`.
+// unused: memcpy's 16-bit writes start at an odd half), `rows(n)`, `row(t)` (row t of a stream
+// the caller interleaves with other matvecs).
 //
 // Params: fab (ops/fabric.csl), red (an ops/red.csl instance: the column chain the partials go
-// into), XQ (the rows' input queue), Hc (a row's elements the tile multiplies), Nc (its outputs).
+// into), XQ (the rows' input queue), Hc (a row's elements the tile multiplies), Nc (its outputs),
+// X32 (f32 rows in two halves).
 param fab: imported_module;
 param red: imported_module;
 param XQ: input_queue;
 param Hc: u16;
 param Nc: u16;
+param X32: bool = false;
 
 const matvec = @import_module("ops/mv.csl");
 
@@ -27,15 +33,36 @@ const xh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> xh[i] });
 const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Nc} -> y[i] });
 const a_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Nc} -> w[1 + i] });
 
-// n rows through the tile: each row's x chunk in, its partials into the chain.
-fn rows(n: u16) void {
-  var t: u16 = 0;
-  while (t < n) : (t += 1) {
-    const b: u16 = t & 1;
-    const xv = @increment_dsd_offset(xh_d, @as(i16, b * Hc), @fp16());
-    const yv = @increment_dsd_offset(y_d, @as(i16, b * Nc), f32);
+const XN: u16 = if (X32) Hc else 1;
+var xs: [XN]f32 align(16) = @zeros([XN]f32);
+var xr: [XN]f32 align(16) = @zeros([XN]f32);
+var xl = @zeros([XN]@fp16());
+const xr_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XN} -> xr[i] });
+const xs_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XN} -> xs[i] });
+const xl_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XN} -> xl[i] });
+
+// Row t: its x chunk in, its partials into the chain.
+fn row(t: u16) void {
+  const b: u16 = t & 1;
+  const xv = @increment_dsd_offset(xh_d, @as(i16, b * Hc), @fp16());
+  const yv = @increment_dsd_offset(y_d, @as(i16, b * Nc), f32);
+  if (X32) {
+    @fmovs(xs_d, fab.fin(XQ, Hc));
+    @fs2h(xv, xs_d);
+    @fh2s(xr_d, xv);
+    @fsubs(xs_d, xs_d, xr_d);
+    @fs2h(xl_d, xs_d);
+    matvec.tile32(yv, a_d, xv);
+    matvec.mac32(yv, a_d, xl_d);
+  } else {
     @fs2h(xv, fab.fin(XQ, Hc));
     matvec.tile32(yv, a_d, xv);
-    red.send(yv, Nc);
   }
+  red.send(yv, Nc);
+}
+
+// n rows through the tile.
+fn rows(n: u16) void {
+  var t: u16 = 0;
+  while (t < n) : (t += 1) { row(t); }
 }

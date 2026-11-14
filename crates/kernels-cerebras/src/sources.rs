@@ -76,6 +76,10 @@ pub const STREAM_OPS: &[(&str, &str)] = &[
         include_str!("../programs/wafer/ops/cy_satt.csl"),
     ),
     ("satt.csl", include_str!("../programs/wafer/ops/satt.csl")),
+    (
+        "schain.csl",
+        include_str!("../programs/wafer/ops/schain.csl"),
+    ),
     ("smv.csl", include_str!("../programs/wafer/ops/smv.csl")),
 ];
 

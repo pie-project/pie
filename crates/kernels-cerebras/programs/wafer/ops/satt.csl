@@ -14,10 +14,15 @@
 // the root's word pair a head [redo, step]: mref += step, and a redo pass when any head's sum
 // left the probabilities' window (ops/cy_satt.csl decides).
 //
+// QH, the queries held on the column (a stream unit's root keeps no row's q over the barrier):
+// store_q(p) takes row p's [q | k | v] and keeps its q too (16-bit, entry-major); query_q(p) sends
+// row p's q up the chain from the PE that keeps it (the others send zeros), the root multicasts
+// it back, and the query runs as query()'s.
+//
 // Params: fab (ops/fabric.csl), math (ops/math.csl), red (the column chain), YM (the root's
 // multicast input queue), Qh (q heads on the kv head), Dc (the head's dims), NE (entries a row),
 // PYA (the column's rows), SC (the scores' scale), PMAX (the 16-bit probabilities' ceiling: f16's
-// max for IEEE builds).
+// max for IEEE builds), QH (queries held).
 param fab: imported_module;
 param math: imported_module;
 param red: imported_module;
@@ -28,6 +33,7 @@ param NE: u16;
 param PYA: u16;
 param SC: f32;
 param PMAX: f32 = 65504.0;
+param QH: bool = false;
 
 const matvec = @import_module("ops/mv.csl");
 
@@ -40,7 +46,13 @@ var kc = @zeros([KCW]u16);
 var vc = @zeros([VCW]u16);
 var xh = @zeros([XW]@fp16());
 var y: [YW]f32 align(16) = @zeros([YW]f32);
-var sx: [2 * Dc]f32 align(16) = @zeros([2 * Dc]f32);
+const SXW: u16 = if (QH) (Qh + 2) * Dc else 2 * Dc;
+var sx: [SXW]f32 align(16) = @zeros([SXW]f32);
+const QCW: u16 = if (QH) NE * Qh * Dc else 1;
+var qc = @zeros([QCW]u16);
+const QFW: u16 = if (QH) Qh * Dc else 1;
+var qf: [QFW]f32 align(16) = @zeros([QFW]f32);
+const qf_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QFW} -> qf[i] });
 var pp = @zeros([Qh * NE]f32);
 var kk = @zeros([Qh * NE]u16);
 var mref = @zeros([Qh]f32);
@@ -77,6 +89,36 @@ fn store(p: u16) void {
     vc[e * (Dc + 1) + d] = @bitcast(u16, @as(@fp16(), sx[Dc + d]));
   }
   vc[e * (Dc + 1) + Dc] = @bitcast(u16, @as(@fp16(), 1.0));
+}
+
+// Row p's [q | k | v] from the root's multicast; kept (q too) by row p % PYA as entry p / PYA.
+fn store_q(p: u16) void {
+  const QD: u16 = Qh * Dc;
+  @fmovs(@set_dsd_length(sx_d, QD + 2 * Dc), fab.fin(YM, QD + 2 * Dc));
+  if (p % PYA != myrow) { return; }
+  const e = p / PYA;
+  var d: u16 = 0;
+  while (d < Dc) : (d += 1) {
+    kc[d * NE + e] = @bitcast(u16, @as(@fp16(), sx[QD + d]));
+    vc[e * (Dc + 1) + d] = @bitcast(u16, @as(@fp16(), sx[QD + Dc + d]));
+  }
+  vc[e * (Dc + 1) + Dc] = @bitcast(u16, @as(@fp16(), 1.0));
+  d = 0;
+  while (d < QD) : (d += 1) { qc[e * QD + d] = @bitcast(u16, @as(@fp16(), sx[d])); }
+}
+
+// Row p's query: its q up the chain from the PE that keeps it, then query().
+fn query_q(p: u16) void {
+  const QD: u16 = Qh * Dc;
+  var d: u16 = 0;
+  if (p % PYA == myrow) {
+    const e = p / PYA;
+    while (d < QD) : (d += 1) { qf[d] = @as(f32, @bitcast(@fp16(), qc[e * QD + d])); }
+  } else {
+    while (d < QD) : (d += 1) { qf[d] = 0.0; }
+  }
+  red.send(qf_d, QD);
+  query();
 }
 
 // One query: q in, passes until no head's sum left the window.

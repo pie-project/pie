@@ -4,6 +4,7 @@
 //! measured, and says how far off it was there (`ARCHITECTURE.md`, "Cost").
 
 pub mod memory;
+pub mod stream;
 pub mod time;
 
 use serde::Serialize;

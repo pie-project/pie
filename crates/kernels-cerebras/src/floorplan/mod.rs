@@ -47,6 +47,7 @@ pub mod runs;
 pub mod snake;
 pub mod split;
 pub mod stacked;
+pub mod stream;
 
 pub use snake::snake_gap;
 
@@ -96,6 +97,13 @@ pub struct Requests {
     pub store: bool,
     /// A cache read across layers: the KV line from the unit that appends it.
     pub kv_line: bool,
+    /// The stream regime: units laid one a layer side along a row stream ([`stream::Stream`]).
+    pub stream: bool,
+    /// Attention over a step's own rows: a K / V column a kv head under each attending block.
+    pub joint: bool,
+    /// Lane vectors computed once a step: the lane prologue's unit and the bus to the roots
+    /// that hold them.
+    pub lanes: bool,
 }
 
 impl Requests {
@@ -109,6 +117,9 @@ impl Requests {
             window: needs.sliding,
             store: needs.side_in,
             kv_line: needs.shared_cache,
+            stream: false,
+            joint: false,
+            lanes: false,
         }
     }
 }

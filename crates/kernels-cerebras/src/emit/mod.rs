@@ -9,3 +9,4 @@ pub mod params;
 pub mod rcfg;
 pub mod region;
 pub mod stamps;
+pub mod stream;

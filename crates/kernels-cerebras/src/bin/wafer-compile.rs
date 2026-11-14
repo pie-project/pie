@@ -41,7 +41,9 @@ const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <
      [--preset <name>] [--set K=V,...] [--positions N] --out <dir>\n       wafer-compile build --plan <plan.json> \
      --out <dir> [--emit a,b] [--levers K:V,...] [--kernels <dir>]\n       wafer-compile link \
      --build <dir> [--fabric simulator|system]\n       wafer-compile cost --plan <plan.json>\n       \
-     wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]";
+     wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]\n       \
+     wafer-compile stream --model <deployment> [--reading R] [--rows N] [--ieee] --out <dir> \
+     [--values <dir>] [--stages N] [--tap v,..]";
 
 fn main() {
     if let Err(e) = run() {
@@ -218,6 +220,59 @@ fn search(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `stream --model <name> [--reading denoise] [--rows 64] [--ieee] --out <dir> [--values <dir>]`:
+/// a stream reading's wafer program (kernels-cerebras `stream::compile`); with a step's captured
+/// values, the host's files for a run of it (`tools/wafer/stream/run.py`).
+fn stream(args: &[String]) -> Result<(), String> {
+    let get = |k: &str| {
+        args.iter()
+            .position(|a| a == k)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let model = get("--model").ok_or("stream: --model")?;
+    let out = get("--out").ok_or("stream: --out")?;
+    let reading = get("--reading").unwrap_or_else(|| "denoise".into());
+    let rows: u32 = get("--rows")
+        .map_or(Ok(64), |r| r.parse())
+        .map_err(|e| format!("--rows: {e}"))?;
+    let ieee = args.iter().any(|a| a == "--ieee");
+    let trace = poem_compiler::catalog::repository()
+        .parse(&model)
+        .ok_or_else(|| format!("no catalog model {model}"))?
+        .trace(poem_ir::Platform::Cerebras);
+    let values = get("--values");
+    let taps: Vec<u32> = get("--tap")
+        .map(|t| t.split(',').filter_map(|v| v.parse().ok()).collect())
+        .unwrap_or_default();
+    let upto = get("--stages")
+        .map(|s| s.parse::<usize>())
+        .transpose()
+        .map_err(|e| format!("--stages: {e}"))?;
+    let o = kernels_cerebras::stream::Options {
+        reading: reading.clone(),
+        rows,
+        round16: !ieee,
+        upto,
+        taps,
+    };
+    let p = kernels_cerebras::stream::compile(
+        &trace,
+        &o,
+        std::path::Path::new(&out),
+        values.as_deref().map(std::path::Path::new),
+    )?;
+    println!(
+        "{model} {reading}: {} units, {} K / V columns, {} x {} PEs, {} lane words",
+        p.units.len(),
+        p.stream.kv.len(),
+        p.stream.w,
+        p.stream.h,
+        p.lane_words
+    );
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -226,6 +281,7 @@ fn run() -> Result<(), String> {
         Some("link") => link(&args[1..]),
         Some("cost") => cost(&args[1..]),
         Some("search") => search(&args[1..]),
+        Some("stream") => stream(&args[1..]),
         _ => Err(USAGE.to_string()),
     }
 }

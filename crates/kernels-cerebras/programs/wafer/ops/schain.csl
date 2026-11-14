@@ -1,0 +1,20 @@
+// wafer/ops/schain.csl: a stream unit's chain member (GENERIC.md §4.1, M1d), ops/red.csl's
+// single-level `send` made synchronous: a PE that runs several matvecs a row into one chain
+// would otherwise issue a send on the microthread while the one before it waits for its input
+// (the simulator refuses an async op over one still pending: "overwriting ut_instr").
+//
+// A member's role (`role`): 0 the chain's start (sends its partial), else it adds its partial to
+// what comes in and sends that on.
+//
+// Params: fab (ops/fabric.csl), IN1 (the member's input), OUT (its send).
+param fab: imported_module;
+param IN1: input_queue;
+param OUT: output_queue;
+
+var role: u16 = 0;
+
+// A member's partial d (n words) into the chain.
+fn send(d: mem1d_dsd, n: u16) void {
+  if (role == 0) { @fmovs(fab.fout(OUT, n), d); }
+  else { @fadds(fab.fout(OUT, n), fab.fin(IN1, n), d); }
+}
