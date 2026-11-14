@@ -548,6 +548,15 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         .as_ref()
         .and_then(|roles| roles.lock().unwrap().prepare_park(pid));
     let prepared_at = began.elapsed();
+    // The pages each tier below the device takes, for the move's log line.
+    let (host_pages, disk_pages) = kv.as_ref().map_or((0, 0), |txn| {
+        txn.copy_plans()
+            .iter()
+            .fold((0usize, 0usize), |(host, disk), (tier, pages, _)| match tier {
+                MemoryDomain::LocalDisk => (host, disk + pages.len()),
+                _ => (host + pages.len(), disk),
+            })
+    });
     let mut guard = MoveGuard::new(model, engine, Move::Suspend { kv, rs, roles });
     if let Err(error) = guard.copy(&planner, pid).await {
         tracing::warn!(pid = %pid, %error, "planner: eviction copy failed");
@@ -604,6 +613,17 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         copied.as_millis(),
         began.elapsed().as_millis(),
         freed
+    );
+    tracing::info!(
+        %pid,
+        pages = freed,
+        host_pages,
+        disk_pages,
+        drained_ms = drained.as_millis(),
+        quiesced_ms = quiesced.as_millis(),
+        copied_ms = copied.as_millis(),
+        done_ms = began.elapsed().as_millis(),
+        "planner: a process is moved to the host"
     );
     planner.report_evicted(pid, freed as u32, rs_freed);
 }

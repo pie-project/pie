@@ -217,13 +217,14 @@ impl SharedGrow {
                     crate::scheduler::nudge(self.engine);
                 }
                 RungStep::Lower(rung) => {
-                    let lowered = {
+                    let (lowered, pages) = {
                         let mut pool = self.shared.lock().unwrap();
                         // A pass lifted the cap since the walk capped it.
                         if super::fire_cap(self.engine) > rung {
                             continue;
                         }
-                        pool.lower_rung(rung)
+                        let lowered = pool.lower_rung(rung);
+                        (lowered, pool.pages_at_rung())
                     };
                     let notice = match lowered {
                         Ok(notice) => notice,
@@ -232,7 +233,12 @@ impl SharedGrow {
                             return;
                         }
                     };
-                    tracing::info!(engine = self.engine, rung, "the activation rung is lowered");
+                    tracing::info!(
+                        engine = self.engine,
+                        rung,
+                        pages,
+                        "the activation rung is lowered"
+                    );
                     // Past the retire fence: the engine may give back the
                     // carve above the new rung. A failed notice is no
                     // fault.

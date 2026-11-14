@@ -603,4 +603,106 @@ impl ResidencyPlanner {
             }
         }
     }
+
+    /// A raise of the activation rung moves the processes whose kv pages lie
+    /// in the span chunks no free chunk below can take (`offload`) to the
+    /// next tier the engine seats (host, else disk: the suspend's own
+    /// choice) at once, whatever their rank: a move, not a drop, so what is
+    /// kept stays the policy's. Their lanes wait for their pages as any
+    /// suspended process's do, and come back as room frees (the rung lowered
+    /// or pages let go). `keep` (the raise's carrier and the prompts asking
+    /// beside it) is not moved. Answers the processes whose moves began or
+    /// are under way.
+    pub fn offload_for_raise(
+        self: &Arc<Self>,
+        keep: &std::collections::HashSet<ProcessId>,
+        offload: &crate::store::shared::RaiseOffload,
+    ) -> usize {
+        let (model, engine) = self.port.locus();
+        let Some(stores) = crate::store::registry::try_get(model, engine) else {
+            return 0;
+        };
+        let pids: Vec<ProcessId> = self.with_inner(|inner| {
+            inner
+                .procs
+                .iter()
+                .filter(|(pid, proc)| {
+                    !keep.contains(*pid)
+                        && proc.admitted
+                        && (!proc.holder || proc.idle)
+                        && (proc.state == Residency::Resident || inner.evicting.contains_key(*pid))
+                        && !inner.host_swap_blocked.contains(*pid)
+                        && !inner.prepare_blocked.contains(*pid)
+                })
+                .map(|(pid, _)| *pid)
+                .collect()
+        });
+        if pids.is_empty() {
+            return 0;
+        }
+        let working_sets =
+            crate::inferlet::process::residency::kv_working_sets_for(&pids, model, engine);
+        let picks: Vec<(ProcessId, Reclaim)> =
+            crate::store::registry::with_kv_lock(&stores.kv, "planner-raise-offload", |kv| {
+                pids.iter()
+                    .zip(&working_sets)
+                    .filter_map(|(&pid, sets)| {
+                        let sets = sets.as_ref()?;
+                        let mut pages = 0u32;
+                        let mut inside = false;
+                        for &ws in sets {
+                            let Ok(table) = kv.flat_table(ws) else {
+                                continue;
+                            };
+                            pages = pages
+                                .saturating_add(u32::try_from(table.len()).unwrap_or(u32::MAX));
+                            inside |= table.iter().any(|page| offload.holds(page.0));
+                        }
+                        inside.then(|| {
+                            (
+                                pid,
+                                Reclaim {
+                                    pages,
+                                    rs: suspendable_rs_units(pid, model, engine),
+                                },
+                            )
+                        })
+                    })
+                    .collect()
+            });
+        if picks.is_empty() {
+            return 0;
+        }
+        let (wake, spawned, moving) = self.with_inner(|inner| {
+            let (mut wake, mut spawned, mut moving) = (Vec::new(), Vec::new(), 0usize);
+            for (pid, expected) in picks {
+                if inner.evicting.contains_key(&pid) {
+                    moving += 1;
+                    continue;
+                }
+                if inner
+                    .procs
+                    .get(&pid)
+                    .is_none_or(|proc| proc.state != Residency::Resident)
+                {
+                    continue;
+                }
+                wake.extend(inner.begin_eviction(pid, expected));
+                spawned.push(pid);
+            }
+            (wake, spawned, moving)
+        });
+        if !spawned.is_empty() {
+            tracing::info!(
+                engine,
+                processes = spawned.len(),
+                already = moving,
+                chunks = offload.chunks.len(),
+                "a raise moves the state in its span below the device"
+            );
+        }
+        let began = spawned.len();
+        self.start_evictions(wake, spawned);
+        began + moving
+    }
 }

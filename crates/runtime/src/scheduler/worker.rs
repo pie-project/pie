@@ -533,6 +533,23 @@ struct LaneCount {
 }
 
 impl LaneCount {
+    /// The rows the launches ask a fire to carry: their distinct lanes and
+    /// the rows past its first each prompt carries, summed. A wave of
+    /// prompts queued and in flight together asks for the fire that carries
+    /// them all; a lane's pipelined one-row decodes count once, as its lane.
+    fn rows<'a>(
+        &mut self,
+        fires: impl IntoIterator<Item = &'a crate::engine::FireRequest> + Clone,
+    ) -> usize {
+        let lanes = self.count(fires.clone());
+        let prompts: usize = fires
+            .into_iter()
+            .flat_map(|fire| &fire.lanes)
+            .map(|lane| lane.tokens.len().saturating_sub(1))
+            .sum();
+        prompts.saturating_add(lanes)
+    }
+
     fn count<'a>(
         &mut self,
         fires: impl IntoIterator<Item = &'a crate::engine::FireRequest>,
@@ -1219,10 +1236,10 @@ impl BatchScheduler {
             progress |= Self::retire_ready_control(&mut in_flight_control);
             // A step's tokens stay within the pool's activation rung (SPEC
             // decision 6): smaller while the system is critical.
-            // What is queued and in flight asks the rung of its lanes, a
-            // decode batch's lane count (REDESIGN 2.5): it is never cut to a
-            // narrower rung for want of asking. A prompt's rows ask through
-            // its pass ([`crate::store::shared::want_rows`]), not here.
+            // What is queued and in flight asks the rung of its rows: a
+            // decode batch's lane count (REDESIGN 2.5), and a wave of
+            // prompts its rows summed beside them, so the wave is never cut
+            // to a narrower rung for want of asking.
             let queued = pending.items.iter().filter_map(|item| match item {
                 QueuedItem::Launch(launch) => Some(&launch.request.request),
                 _ => None,
@@ -1231,8 +1248,8 @@ impl BatchScheduler {
                 .iter()
                 .flat_map(|batch: &PendingLaunchBatch| batch.requests.iter())
                 .map(|request| &request.request);
-            let lanes = lane_count.count(queued.chain(flying));
-            batch_want.ask(engine_id, lanes.min(limits.max_forward_tokens));
+            let rows = lane_count.rows(queued.chain(flying));
+            batch_want.ask(engine_id, rows.min(limits.max_forward_tokens));
             let cap = crate::store::shared::fire_cap(engine_id);
             let mut stepped = limits;
             stepped.max_forward_tokens = stepped.max_forward_tokens.min(cap as usize).max(1);
@@ -2856,6 +2873,7 @@ mod tests {
         let launches: Vec<_> = (0..16).map(|_| fire(0..64)).collect();
         let mut count = LaneCount::default();
         assert_eq!(count.count(&launches), 64);
+        assert_eq!(count.rows(&launches), 64, "one-row decodes: their lanes");
         // Two batches of 32 lanes each, each pipelined: 64 rows.
         let halves: Vec<_> = (0..8).flat_map(|_| [fire(0..32), fire(32..64)]).collect();
         assert_eq!(count.count(&halves), 64);
@@ -2867,6 +2885,32 @@ mod tests {
             lane.kv_less = true;
         }
         assert_eq!(count.count(&[seatless.clone(), seatless, fire(0..8)]), 12);
+    }
+
+    /// A wave of prompts queued and in flight asks its rows summed beside
+    /// the decoding lanes, not its lane count.
+    #[test]
+    fn a_wave_of_prompts_asks_its_rows_summed() {
+        let lane = |slot: u32, rows: u32| ::engine::Lane {
+            slot,
+            tokens: (0..rows).collect(),
+            ..Default::default()
+        };
+        let fire = |lanes: Vec<::engine::Lane>| crate::engine::FireRequest {
+            lanes,
+            ..Default::default()
+        };
+        // 32 prompts of 128 rows in two launches, beside 224 decoding lanes
+        // pipelined three deep.
+        let mut launches: Vec<_> = (0..2)
+            .map(|half| fire((half * 16..half * 16 + 16).map(|slot| lane(slot, 128)).collect()))
+            .collect();
+        for _ in 0..3 {
+            launches.push(fire((32..256).map(|slot| lane(slot, 1)).collect()));
+        }
+        let mut count = LaneCount::default();
+        assert_eq!(count.count(&launches), 256);
+        assert_eq!(count.rows(&launches), 32 * 128 + 224);
     }
 
     #[test]

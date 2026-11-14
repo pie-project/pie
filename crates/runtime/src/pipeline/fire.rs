@@ -830,6 +830,30 @@ impl RaiseFunding {
                     }
                     continue;
                 }
+                // The state in the span no free chunk below can take moves
+                // to the next tier the engine seats (host, else disk) at
+                // once, whatever its owners' rank: the raise takes the span
+                // once the moves free it (room freed tells the rung). The
+                // rung is the one all the prompts in flight ask together,
+                // not this pass's alone: one move clears the span the wave
+                // takes. Where no tier takes it, the planner's ask below
+                // frees room by rank as before.
+                let offload = {
+                    let asked = rows.max(crate::store::shared::wanted_rows(engine));
+                    let pool = shared.lock().unwrap();
+                    pool.raise_offload(crate::store::shared::rung_goal(&pool, engine, asked))
+                };
+                if let Some(offload) = offload {
+                    let mut keep = crate::store::shared::asking_processes(engine);
+                    keep.insert(pid);
+                    if planner.offload_for_raise(&keep, &offload) > 0 {
+                        tokio::select! {
+                            () = &mut watch => {}
+                            () = stop.notified() => return,
+                        }
+                        continue;
+                    }
+                }
                 let demand = crate::planner::Demand {
                     kv_pages: pages,
                     rs: crate::store::rs::RsUnits::default(),

@@ -850,6 +850,20 @@ impl SlotPool {
         budget.max(sources - targets)
     }
 
+    /// The logical chunks of state in rung `rung`'s activation span that no
+    /// free chunk below it can take: what a raise to it must move off the
+    /// device. Empty when the raise's moves all fit below.
+    pub fn rung_unplaced(&self, rung: u32) -> Vec<u32> {
+        let act = self.act_chunks(rung);
+        let limit = self.total.saturating_sub(act);
+        let sources = self.held_in(limit, self.state_limit());
+        let targets = self.open.iter_in(0, limit).take(sources.len()).count();
+        sources[targets..]
+            .iter()
+            .map(|&physical| self.physical_to_logical[physical as usize])
+            .collect()
+    }
+
     /// Carries out `evacuation` and takes its rung; the fire at `epoch`
     /// carries the copy, and the chunks moved off stay closed until it
     /// retires. All or nothing.

@@ -232,6 +232,19 @@ pub fn hold_for_process(pid: uuid::Uuid, engine: usize, rows: Option<u32>) {
     }
 }
 
+/// The processes whose prompts ask fires on `engine` wide now: a raise
+/// moves none of them off the device for the room it takes.
+#[must_use]
+pub fn asking_processes(engine: usize) -> std::collections::HashSet<uuid::Uuid> {
+    PROCESS_WANTS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, want)| want.engine == engine)
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
 /// Process `pid` ended: its ask goes.
 pub fn forget_process(pid: uuid::Uuid) {
     PROCESS_WANTS.lock().unwrap().remove(&pid);
@@ -328,6 +341,24 @@ pub fn wanted_rows(engine: usize) -> u32 {
         .get(&engine)
         .and_then(|wants| wants.values().copied().max())
         .unwrap_or(0)
+}
+
+/// The kv list chunks a raise must move off the device
+/// ([`SharedPool::raise_offload`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaiseOffload {
+    /// Slots a kv list chunk holds.
+    pub spc: u32,
+    /// The logical chunks, by id.
+    pub chunks: std::collections::BTreeSet<u32>,
+}
+
+impl RaiseOffload {
+    /// Whether kv list slot `slot_ref` lies in a chunk the raise moves off.
+    #[must_use]
+    pub fn holds(&self, slot_ref: u32) -> bool {
+        self.chunks.contains(&(slot_ref / self.spc))
+    }
 }
 
 /// One step of moving the activation rung toward a goal ([`RungWalk`]).
@@ -1072,6 +1103,17 @@ impl SharedPool {
         }
     }
 
+    /// The kv list pages the device has beside the rung in hand: what the
+    /// state chunks hold with the activation set aside for it.
+    #[must_use]
+    pub fn pages_at_rung(&self) -> u64 {
+        let room = self.room();
+        let state = u64::from(room.state_chunks) + u64::from(room.act_chunks)
+            - u64::from(self.pool.act_reserved().max(room.act_chunks));
+        self.list
+            .map_or(0, |list| state * u64::from(list.slots_per_chunk))
+    }
+
     /// The chunks `n` records take from empty chunks.
     fn record_chunks(&self, n: u64) -> u64 {
         self.fixed
@@ -1497,6 +1539,25 @@ impl SharedPool {
     /// each chunk to a free one below (empty when nothing is in the way).
     pub fn plan_raise(&self, rung: u32) -> Result<RungEvacuation, RungError> {
         self.pool.plan_rung(rung).map_err(RungError::Pool)
+    }
+
+    /// The kv pages a raise to `rung` must move off the device: those in
+    /// the state chunks of its span no free chunk below can take, as a test
+    /// of a kv list slot ref. `None` where none must move (or the pool keeps
+    /// no kv list).
+    #[must_use]
+    pub fn raise_offload(&self, rung: u32) -> Option<RaiseOffload> {
+        let list = self.list?;
+        let chunks: std::collections::BTreeSet<u32> =
+            self.pool.rung_unplaced(rung).into_iter().collect();
+        if chunks.is_empty() {
+            return None;
+        }
+        let spc = self
+            .pool
+            .shape(list.pool)
+            .map_or(1, |shape| shape.slots_per_chunk.max(1));
+        Some(RaiseOffload { spc, chunks })
     }
 
     /// `evacuation`'s moves as the engine takes them (`Engine::evacuate`).

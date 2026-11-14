@@ -822,6 +822,38 @@ fn a_raise_by_demand_says_what_it_lacks_and_moves_the_rest() {
     assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
 }
 
+/// A raise short of free chunks below its span names the kv pages it must
+/// move off the device: those in the span's chunks past what the free
+/// chunks below can take, and none once the moves all fit.
+#[test]
+fn a_raise_short_of_room_names_the_kv_pages_it_moves_off_the_device() {
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    pool.lower_rung(16).unwrap();
+    assert_eq!(pool.raise_offload(2048), None, "an empty pool moves nothing");
+    let list = pool.list().unwrap().pool;
+    let mut pages = Vec::new();
+    while let Some(refs) = pool.take_refs(list, 1) {
+        pages.extend(refs);
+    }
+    let (chunks, _) = pool.raise_short(2048);
+    assert!(chunks > 0, "kv fills the span");
+    let offload = pool.raise_offload(2048).expect("the raise moves some off");
+    assert_eq!(offload.chunks.len() as u32, chunks, "one a chunk the raise lacks");
+    let off: Vec<u32> = pages.iter().copied().filter(|&p| offload.holds(p)).collect();
+    assert_eq!(off.len() as u32, chunks * offload.spc, "whole chunks of kv pages");
+    // The pages it names go (moved to the host): the raise fits.
+    pool.give_refs(list, &off);
+    pool.pool_mut().retire_through(u64::MAX);
+    assert_eq!(pool.raise_offload(2048), None);
+    assert_eq!(pool.raise_short(2048), (0, 0));
+    assert!(pool.plan_raise(2048).is_ok());
+}
+
 /// Twelve rungs, every power of two from 1, the small ones sharing their
 /// activation's chunk count: an idle pool lowered to the smallest stays
 /// there, the walk never lowering again within the class it is in.
