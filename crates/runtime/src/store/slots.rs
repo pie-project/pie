@@ -125,6 +125,15 @@ pub struct FireTerm {
     pub max_lanes: u32,
 }
 
+/// The lanes an engine lays a guest program's flight of `members` lanes
+/// for: the power of two over them, so that a wave whose members come and
+/// go keeps one layout of its lane tables fire to fire. A fire term counts
+/// those lanes, never fewer: the room a rung backs is what a fire lays.
+#[must_use]
+pub fn flight_lanes(members: u32) -> u32 {
+    members.checked_next_power_of_two().unwrap_or(u32::MAX)
+}
+
 impl FireTerm {
     #[must_use]
     pub fn is_zero(&self) -> bool {
@@ -685,10 +694,11 @@ impl SlotPool {
             })
     }
 
-    /// The chunks the fire terms take at a rung of `tokens`: `min(tokens,
-    /// max_lanes)` lanes, each program's own cap taken.
+    /// The chunks the fire terms take at a rung of `tokens`: a flight of
+    /// `min(tokens, max_lanes)` lanes, laid for the power of two over them
+    /// ([`flight_lanes`]), each program's own cap taken.
     fn fire_chunks(&self, tokens: u32) -> u32 {
-        let lanes = tokens.min(self.max_lanes);
+        let lanes = flight_lanes(tokens.min(self.max_lanes));
         let bytes = self
             .fire
             .iter()

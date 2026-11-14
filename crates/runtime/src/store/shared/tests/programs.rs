@@ -204,6 +204,28 @@ fn the_fire_term_takes_its_chunks_at_every_rung_s_lanes() {
     assert_eq!(pool.rung(), 256);
 }
 
+/// The term a rung backs for `n` live instances is what a fire of `n` lays,
+/// for every `n` up to the fire's lanes: the engine lays a guest flight for
+/// the power of two over its members, so 33 live take 64 lanes' bytes.
+#[test]
+fn the_term_a_rung_backs_for_n_live_is_what_a_fire_of_n_lays() {
+    let (mut pool, _) = pool_at_256();
+    let facts = FireFacts {
+        a_lane: MIB,
+        ..FireFacts::default()
+    };
+    pool.fire_facts_learned(key(PROGRAM), &facts);
+    for n in 1..=u64::from(LANES) {
+        pool.instance_bound(InstanceId(n), key(PROGRAM));
+        let laid = u64::from(crate::store::slots::flight_lanes(n as u32)) * MIB;
+        assert_eq!(
+            u64::from(pool.pool().act_chunks(2048)),
+            12 + laid.div_ceil(CHUNK),
+            "{n} live"
+        );
+    }
+}
+
 /// A term that leaves the smallest rung no room on the device refuses the
 /// bind at once rather than waiting on room that never comes.
 #[test]

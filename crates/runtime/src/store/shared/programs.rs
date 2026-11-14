@@ -47,13 +47,15 @@ pub struct ProgramFires {
 impl ProgramFires {
     /// The terms of the pairs that can be in a fire now, each capped at
     /// its live instances: a fire carries no more lanes of a pair than it
-    /// has instances bound (or binding), so `l = min(r, FireLimits::max_lanes,
-    /// the pair's max_lanes, its live instances)`.
+    /// has instances bound (or binding), and an engine lays a flight for
+    /// the power of two over its members, so `l = min(pow2(min(r,
+    /// FireLimits::max_lanes, its live instances)), the pair's max_lanes)`.
     fn open_terms(&self) -> Vec<FireTerm> {
         self.open
             .iter()
             .filter_map(|(key, &live)| {
                 let term = *self.terms.get(key)?;
+                let live = crate::store::slots::flight_lanes(live);
                 let max_lanes = match term.max_lanes {
                     0 => live,
                     own => own.min(live),

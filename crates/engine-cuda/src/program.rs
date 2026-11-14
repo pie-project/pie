@@ -196,6 +196,19 @@ pub struct FireBytes {
     pub max_lanes: u32,
 }
 
+/// The lanes a flight of `members` instances is laid for: the power of two
+/// over them. The lanes laid key what a stage keeps between fires: its lane
+/// table and descriptor rows are built again, and its tables staged again,
+/// whenever the lanes differ from the last lay (`launch::Prepared::lay`,
+/// and `Plane::fly`'s `laid`). A wave whose members come and go fire by fire
+/// stays in one layout at a power of two, where the exact count would build
+/// and stage the tables every fire. A pair's fire term counts the same
+/// lanes, so a fire never lays more than the term its rung backs.
+#[must_use]
+pub fn flight_lanes(members: u32) -> u32 {
+    members.checked_next_power_of_two().unwrap_or(u32::MAX)
+}
+
 impl FireBytes {
     /// The bytes `lanes` lanes take.
     #[must_use]
@@ -274,10 +287,12 @@ impl Plane {
     /// (`engine::Engine::fire_facts`).
     #[must_use]
     pub fn fire_term(&self, lanes: u32) -> u64 {
-        // A pair flies no more lanes than it has instances bound.
+        // A pair flies no more lanes than it has instances bound, in
+        // flights as wide as the power of two over its members
+        // (`Plane::fly`): what it lays.
         self.pairs
             .iter()
-            .map(|(_, _, bytes, bound)| bytes.at(lanes.min(*bound)))
+            .map(|(_, _, bytes, bound)| bytes.at(flight_lanes(lanes.min(*bound))))
             .sum()
     }
 
@@ -769,10 +784,7 @@ impl Plane {
                 )
             })?;
             let bytes = fire_bytes(&program.batch(*extents)?.stages, *flight);
-            let lanes = u32::try_from(members.len())
-                .unwrap_or(u32::MAX)
-                .checked_next_power_of_two()
-                .unwrap_or(u32::MAX)
+            let lanes = flight_lanes(u32::try_from(members.len()).unwrap_or(u32::MAX))
                 .min(bytes.max_lanes)
                 .max(1);
             laying.push((*program_id, *extents, lanes));
@@ -1177,6 +1189,48 @@ fn release_seats(endpoints: &[Option<std::sync::Arc<Endpoint>>]) {
     for endpoint in endpoints.iter().flatten() {
         if endpoint.role() == HostRole::None {
             endpoint.detach();
+        }
+    }
+}
+
+#[cfg(test)]
+mod term_tests {
+    use super::*;
+
+    /// The term a rung backs for `n` bound instances is what a fire of `n`
+    /// lays, for every `n` up to the flight's lanes: the fire lays a flight
+    /// for `flight_lanes(n)` (`Plane::fly`), and the room it is checked
+    /// against is `fire_term` (`program_span`). 170 bound fly as 256.
+    #[test]
+    fn the_term_a_rung_backs_for_n_bound_is_what_a_fire_of_n_lays() {
+        assert_eq!(flight_lanes(170), 256);
+        assert_eq!(flight_lanes(33), 64);
+        // Flights of 64 lanes and of 256: waves of every width below each,
+        // and past 64 a group flying in several flights of 64.
+        for max_lanes in [64, 256] {
+            let bytes = FireBytes {
+                a_lane: 455_990,
+                fixed: 1 << 20,
+                max_lanes,
+            };
+            for n in 1..=256 {
+                let mut plane = Plane::default();
+                plane.pairs.push((ProgramId(1), Extents::default(), bytes, n));
+                // What `Plane::fly` lays for a group of `n` members.
+                let lays = bytes.at(flight_lanes(n).min(bytes.max_lanes).max(1));
+                assert_eq!(
+                    plane.fire_term(256),
+                    lays,
+                    "{n} bound, flights of {max_lanes}"
+                );
+                // A narrower rung's fire carries no more lanes than it holds.
+                let narrow = flight_lanes(n.min(64)).min(bytes.max_lanes);
+                assert_eq!(
+                    plane.fire_term(64),
+                    bytes.at(narrow),
+                    "{n} bound at a 64-lane rung, flights of {max_lanes}"
+                );
+            }
         }
     }
 }
