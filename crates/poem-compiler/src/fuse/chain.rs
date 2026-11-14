@@ -42,8 +42,8 @@ use kernels_ir::build::{self, Ops};
 use kernels_ir::{Binary, Op, Reduce, Region, Shape, Unary};
 use poem_ir::{
     ActFn, BinaryOp, Bounds, Def, Dim, Dtype, Elemwise, Fused, Gather, GluAct, Linear,
-    ModulateForm, Node, NormAxis, NormWeight, Operands, Operation, RegionRead, ResidualGate, Trace,
-    Turn, Ty, ValueId,
+    ModulateForm, Node, NormAxis, NormWeight, Operands, Operation, RegionRead, ResidualGate,
+    RopeForm, Trace, Turn, Ty, ValueId,
 };
 
 /// The most ops one chain holds.
@@ -378,8 +378,14 @@ pub(super) struct Rows {
 /// The rows `node` runs over, if this module lowers it: every value it
 /// reads or writes is a row of one width (or a weight that wide).
 pub(super) fn row_of(trace: &Trace, node: u32) -> Option<Rows> {
+    row_of_with(trace, node, false)
+}
+
+/// [`row_of`], `explicit`: also over the ops only a run asked for by name
+/// lowers ([`lower_run`]).
+fn row_of_with(trace: &Trace, node: u32, explicit: bool) -> Option<Rows> {
     let op = &trace.nodes[node as usize].op;
-    if !lowers(op) {
+    if !lowers(op) && !(explicit && lowers_explicitly(op)) {
         return None;
     }
     // A device scale is its first element: a region reads one of a weight
@@ -397,9 +403,9 @@ pub(super) fn row_of(trace: &Trace, node: u32) -> Option<Rows> {
     op.outputs(&mut outs);
     // what the op reads of a row by id or from a column on is a row's part
     // of another plane, its width that plane's
-    let parted = reads_of(op, 0)
+    let parted = reads_with(op, 0, explicit)
         .into_iter()
-        .filter(|read| read.by.is_some() || read.from > 0 || read.half)
+        .filter(|read| read.by.is_some() || read.from > 0 || read.half || read.elem)
         .map(|read| read.value)
         .collect::<Vec<_>>();
     ins.retain(|v| !parted.contains(v));
@@ -448,13 +454,15 @@ fn ins_of(op: &Operation) -> Vec<ValueId> {
 }
 
 /// One value an op reads, and how: as its own rows, or by id (`by`, one
-/// element a row) and from a column on; `half`, a part of a wider row.
+/// element a row) and from a column on; `half`, a part of a wider row;
+/// `elem`, its row's element `from` alone (one of a row's positions).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Read {
     pub(super) value: ValueId,
     pub(super) by: Option<ValueId>,
     pub(super) from: u32,
     pub(super) half: bool,
+    pub(super) elem: bool,
 }
 
 impl Read {
@@ -464,6 +472,7 @@ impl Read {
             by: None,
             from: 0,
             half: false,
+            elem: false,
         }
     }
 }
@@ -477,6 +486,7 @@ pub(super) fn reads_of(op: &Operation, width: u32) -> Vec<Read> {
         by,
         from,
         half: true,
+        elem: false,
     };
     match op {
         Operation::Elemwise(Elemwise::Modulate {
@@ -516,7 +526,47 @@ pub(super) fn reads_of(op: &Operation, width: u32) -> Vec<Read> {
             width: part,
             ..
         }) => vec![parted(*table, None, layer.saturating_mul(*part))],
+        // a rotation over position axes: each axis's position, one element a row
+        Operation::Elemwise(Elemwise::RopeAxes {
+            x, positions, dims, ..
+        }) => {
+            let mut reads = vec![Read::plain(*x)];
+            for (axis, _) in (0u32..).zip(dims).filter(|(_, d)| **d > 0) {
+                reads.push(Read {
+                    value: *positions,
+                    by: None,
+                    from: axis,
+                    half: false,
+                    elem: true,
+                });
+            }
+            reads
+        }
         _ => ins_of(op).into_iter().map(Read::plain).collect(),
+    }
+}
+
+/// [`reads_of`], and, for a run named outright ([`lower_run`]), a gated
+/// MLP's packed `[gate | up]` row read as its two halves (a chain's ops
+/// never read a product so: only a contraction's epilogue does).
+fn reads_with(op: &Operation, width: u32, explicit: bool) -> Vec<Read> {
+    match op {
+        Operation::Linear(Linear::Glu {
+            packed: Some(packed),
+            gate: None,
+            up: None,
+            intermediate,
+            ..
+        }) if explicit => [0, *intermediate]
+            .map(|from| Read {
+                value: *packed,
+                by: None,
+                from,
+                half: true,
+                elem: false,
+            })
+            .to_vec(),
+        _ => reads_of(op, width),
     }
 }
 
@@ -632,6 +682,28 @@ fn lowers(op: &Operation) -> bool {
         | Operation::Gather(Gather::Select { .. }) => true,
         _ => false,
     }
+}
+
+/// Whether this module lowers `op` when a run names it ([`lower_run`]),
+/// though no chain forms over it: a rotation over position axes (a
+/// diffusion transformer's), whose positions are a row's elements, and a
+/// gated MLP's activation over its packed `[gate | up]` row.
+fn lowers_explicitly(op: &Operation) -> bool {
+    matches!(
+        op,
+        Operation::Elemwise(Elemwise::RopeAxes {
+            form: RopeForm::Interleaved,
+            ..
+        }) | Operation::Linear(Linear::Glu {
+            packed: Some(_),
+            gate: None,
+            up: None,
+            weights: None,
+            limit: None,
+            act: GluAct::Swiglu | GluAct::GegluTanh,
+            ..
+        })
+    )
 }
 
 /// The rotation `turn` states of `head_dim`-wide heads of a row of `width`
@@ -824,7 +896,21 @@ impl Escapes {
 }
 
 /// The region `run` lowers to, or `None` where an op of it does not lower.
+/// The region of the ops `run` names (trace node indices, in order), as a
+/// chain of them lowers: a spatial target's root phase, its ops' region
+/// ([`Region`]; GENERIC.md §3.2). The run need not be one a chain forms
+/// (a lone op, or a rotation over position axes); `None` where an op does
+/// not lower.
+#[must_use]
+pub fn lower_run(trace: &Trace, run: &[u32]) -> Option<Chain> {
+    lower_with(trace, run, &Escapes::of(trace), true)
+}
+
 fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
+    lower_with(trace, run, escapes, false)
+}
+
+fn lower_with(trace: &Trace, run: &[u32], escapes: &Escapes, explicit: bool) -> Option<Chain> {
     // An embedding's table holds its whole vocabulary, so an id past it
     // picks row 0 in the skeleton as in the gather (a table cut by its rows
     // gathers each rank's share).
@@ -837,7 +923,7 @@ fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
             return None;
         }
     }
-    let row = row_of(trace, run[0])?;
+    let row = row_of_with(trace, run[0], explicit)?;
     let row_width = u32::try_from(row.width).ok()?;
     // The region's row: a head, where every op is a head's alone (each
     // row cut into its heads, each the kernel's row), else the row.
@@ -850,7 +936,7 @@ fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
     let mut ids = Vec::new();
     for &node in run {
         let op = &trace.nodes[node as usize].op;
-        for read in reads_of(op, width) {
+        for read in reads_with(op, width, explicit) {
             let v = read.value;
             let held = ins
                 .iter()
@@ -877,7 +963,7 @@ fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
                 dtype: dtype_of(trace, v),
                 shared: matches!(form, Form::Shared { .. }),
                 one: matches!(form, Form::One),
-                each: matches!(form, Form::Each) && !read.half,
+                each: (matches!(form, Form::Each) && !read.half) || read.elem,
                 by: read.by,
                 from: read.from,
             });
@@ -889,7 +975,7 @@ fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
 
     let mut b = Builder::new(u32::try_from(ins.len()).ok()?, width);
     for (k, input) in (0u32..).zip(&ins) {
-        if input.by.is_some() || input.from > 0 || reads_parted(trace, run, input.value) {
+        if input.by.is_some() || input.from > 0 || reads_parted(trace, run, input.value, explicit) {
             b.parts.insert((input.value, input.from), k);
         } else {
             b.of.insert(input.value, k);
@@ -933,6 +1019,8 @@ fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
             Some(match form(trace, input.value)? {
                 Form::One => Shape::Scalar,
                 Form::Each if input.by.is_none() && input.from == 0 => Shape::Scalar,
+                // a row's element: one of its positions
+                Form::Rows { .. } if input.each => Shape::Scalar,
                 _ => Shape::Row,
             })
         })
@@ -997,11 +1085,11 @@ fn part(trace: &Trace, run: &[u32], width: u32) -> Option<u32> {
 
 /// Whether an op of `run` reads `v` as a part of a wider row (a
 /// modulation's half, a lane's gate).
-fn reads_parted(trace: &Trace, run: &[u32], v: ValueId) -> bool {
+fn reads_parted(trace: &Trace, run: &[u32], v: ValueId, explicit: bool) -> bool {
     run.iter().any(|&node| {
-        reads_of(&trace.nodes[node as usize].op, 0)
+        reads_with(&trace.nodes[node as usize].op, 0, explicit)
             .iter()
-            .any(|read| read.value == v && read.half)
+            .any(|read| read.value == v && (read.half || read.elem))
     })
 }
 
@@ -1309,6 +1397,35 @@ impl Builder {
                 let turn = rotation(self.width, *head_dim, *theta, turn)?;
                 let out = self.b.rotate(self.get(*q)?, self.get(*positions)?, &turn);
                 self.set(*q_out, out);
+            }
+            // a rotation over position axes, pairs interleaved, each
+            // axis's position a row's element (a scalar parameter)
+            Elemwise::RopeAxes {
+                x,
+                positions,
+                dims,
+                thetas,
+                form: RopeForm::Interleaved,
+                rotary_dim,
+                head_dim,
+                x_out,
+            } => {
+                if *rotary_dim != *head_dim
+                    || dims.iter().sum::<u32>() != *head_dim
+                    || *head_dim == 0
+                    || !self.width.is_multiple_of(*head_dim)
+                    || dims.iter().any(|d| d % 2 != 0)
+                {
+                    return None;
+                }
+                let mut axes = Vec::new();
+                for (axis, (&dim, &theta)) in (0u32..).zip(dims.iter().zip(thetas)) {
+                    if dim > 0 {
+                        axes.push((dim, theta, self.part(*positions, axis)?));
+                    }
+                }
+                let out = self.b.rotate_axes(self.get(*x)?, *head_dim, &axes);
+                self.set(*x_out, out);
             }
             // AttnRes's blend: each candidate (the closed blocks, then the
             // prefix) scaled by the norm's weight and the projection and

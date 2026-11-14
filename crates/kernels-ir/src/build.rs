@@ -108,6 +108,59 @@ impl Ops {
         self.bin(Binary::Mul, x, r)
     }
 
+    /// `x`, its `head_dim`-wide heads turned over position axes (a
+    /// diffusion transformer's rotation): each head is runs of `axes`' dims
+    /// in order, the pair `(2w, 2w + 1)` of an axis of `dim` turning at
+    /// `theta^(-2w / dim)` (`powf` in f32) times the axis's position `pos`
+    /// (a scalar: the row's element), as the hand rotation lands it: the
+    /// pair's first `a cos - b sin`, its second `b cos + a sin`, each one
+    /// fused multiply-add over the other's product.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn rotate_axes(&mut self, x: ValueId, head_dim: u32, axes: &[(u32, f32, ValueId)]) -> ValueId {
+        let col = self.push(Op::Column);
+        let head = self.u32(head_dim);
+        let i = self.bin(Binary::Rem, col, head);
+        let two = self.u32(2);
+        let odd = self.bin(Binary::Rem, i, two);
+        let zero = self.u32(0);
+        let first = self.bin(Binary::Eq, odd, zero);
+        // each axis's angle, the column's pair counted from the axis's first column
+        let mut start = 0u32;
+        let mut angles = Vec::new();
+        for &(dim, theta, pos) in axes {
+            let from = self.u32(start);
+            let off = self.bin(Binary::Sub, i, from);
+            let pair2 = self.bin(Binary::Sub, off, odd);
+            let e = self.push(Op::Cast(pair2, Elem::F32));
+            let d = self.f32(dim as f32);
+            let e = self.bin(Binary::Div, e, d);
+            let e = self.push(Op::Unary(Unary::Neg, e));
+            let t = self.f32(theta);
+            let freq = self.bin(Binary::Pow, t, e);
+            let angle = self.bin(Binary::Mul, pos, freq);
+            start += dim;
+            angles.push((start, angle));
+        }
+        // the angle of the axis the column falls in: the first whose end is past it
+        let mut angle = angles.last().map_or(zero, |&(_, a)| a);
+        for &(end, a) in angles.iter().rev().skip(1) {
+            let end = self.u32(end);
+            let within = self.bin(Binary::Lt, i, end);
+            angle = self.push(Op::Select(within, a, angle));
+        }
+        let cos = self.push(Op::Unary(Unary::Cos, angle));
+        let sin = self.push(Op::Unary(Unary::Sin, angle));
+        let one = self.u32(1);
+        let up = self.bin(Binary::Add, col, one);
+        let down = self.bin(Binary::Sub, col, one);
+        let mate = self.push(Op::Select(first, up, down));
+        let b = self.push(Op::Peer(x, mate));
+        let bs = self.bin(Binary::Mul, b, sin);
+        let nbs = self.push(Op::Unary(Unary::Neg, bs));
+        let add = self.push(Op::Select(first, nbs, bs));
+        self.push(Op::Fma(x, cos, add))
+    }
+
     /// `x`, a row of `width`, its heads turned at `pos` (a scalar, the row's
     /// position) as the hand rotations turn them: each turned column's
     /// pair index `d`, its frequency `theta^e` (`powf`, the exponent as the
