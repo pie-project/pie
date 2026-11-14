@@ -136,6 +136,9 @@ pub struct Shell {
     bodies_from_record: bool,
     /// The load's own arming is under way: its pool is not backed yet.
     arming_at_load: bool,
+    /// A re-arm within the load is under way, allowed what the load's own
+    /// arming took ([`Shell::rearm_bodies`]).
+    rearming: bool,
     /// What the last arming's captures took, which a re-arm within the
     /// same load is allowed.
     bodies_took: u64,

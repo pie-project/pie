@@ -776,7 +776,9 @@ impl Shell {
         let bodies_shape = format!(
             "{}|{:?}|{}|{:?}|{}|{}|{}|{:?}",
             boot.checkpoint.display(),
-            std::fs::metadata(boot.checkpoint).map(|meta| (meta.len(), meta.modified().ok())).ok(),
+            std::fs::metadata(boot.checkpoint)
+                .map(|meta| (meta.len(), meta.modified().ok()))
+                .ok(),
             boot.trace.name,
             profile,
             boot.page_size,
@@ -1324,6 +1326,7 @@ impl Shell {
             bodies_record: None,
             bodies_from_record: false,
             arming_at_load: false,
+            rearming: false,
             bodies_took: 0,
             workspace: None,
             inputs_at: 0,

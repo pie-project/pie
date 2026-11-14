@@ -1143,14 +1143,19 @@ impl Shell {
     /// Forgets the recorded bodies and arms the lattice again within the
     /// same load, allowed what its last arming took: the pool is backed by
     /// now and those bodies' memory is what the forgetting frees, whatever
-    /// the record said.
+    /// the record said. Capped by that figure, as stepped arming is.
     pub(super) fn rearm_bodies(&mut self) -> Result<()> {
         self.cache.forget_bodies();
         self.bodies_mem = self
             .bodies_mem
             .max(usize::try_from(self.bodies_took).unwrap_or(usize::MAX));
-        self.bodies_from_record = false;
-        self.arm_bodies()
+        // A measured allowance, as a record's is: the estimates a load that
+        // knows nothing prices by are not consulted (on a flat range backed
+        // whole they read no spare at all).
+        self.rearming = true;
+        let armed = self.arm_bodies();
+        self.rearming = false;
+        armed
     }
 
     pub(super) fn arm_bodies(&mut self) -> Result<()> {
@@ -1518,7 +1523,7 @@ impl Shell {
             starved: None,
             peer_stopped: false,
             unit_margin: self.pools.arming_margin_bytes(),
-            from_record: self.bodies_from_record,
+            from_record: self.bodies_from_record || self.rearming,
             capped: !(self.bodies_from_record && self.arming_at_load),
             record_short: false,
             took: Some(0),
