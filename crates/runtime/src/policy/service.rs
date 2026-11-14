@@ -247,6 +247,18 @@ fn run(program: Option<Program>, events: Receiver<Event>) {
                     retention = commit.retention.as_ref().map(|t| t.steps.len()),
                     "worker policy call"
                 );
+                // The policy answered the pressure it was left: freeing
+                // nothing (no discard, no termination, no new keys) is the
+                // event a waiter only it could serve fails on.
+                let freed_nothing = commit.discard.is_empty()
+                    && commit.terminate.is_empty()
+                    && commit.retention.is_none()
+                    && commit.schedule.is_none();
+                if freed_nothing {
+                    for &tier in &left {
+                        pressure::answered_nothing(tier);
+                    }
+                }
                 enact(&mut registry, commit, program.name());
             }
             Err(Fault::Dead(error)) => {
@@ -396,6 +408,7 @@ fn respond(registry: &Registry, pressed: &[Tier], keys: &dyn retention::Keys) ->
                 short,
                 "tier pressure: nothing is left to discard; the waiters wait on the governor"
             );
+            pressure::answered_nothing(tier);
         }
         for id in chosen {
             let Ok(owner) = ProcessId::from_str(&id) else {
