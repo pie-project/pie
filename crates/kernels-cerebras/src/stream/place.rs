@@ -400,8 +400,39 @@ fn held_words(u: &Unit, l: &Layout, col: u32) -> u32 {
     w
 }
 
+/// Words of held rows at a row root of `py` (the host's rows, rows held over the barrier).
+fn row_held_words(r: &Reader, u: &Unit, py: u32) -> u32 {
+    let mut w = 0;
+    let mut hin = Vec::new();
+    for s in &u.steps {
+        if let Step::In {
+            value,
+            side: Side::Row,
+            host: true,
+        } = s
+        {
+            w += u.rows * (r.width(*value) / py);
+            hin.push(*value);
+        }
+    }
+    for v in &u.held {
+        if u.sides.get(v) == Some(&Side::Row) && !hin.contains(v) {
+            w += u.rows * (r.width(*v) / py);
+        }
+    }
+    w
+}
+
 /// `u`'s layout: the fewest rest roots whose every tile and held rows fit.
 pub fn layout(r: &Reader, u: &Unit, py: u32) -> R<Layout> {
+    let held = row_held_words(r, u, py);
+    if held > ROOT_BUDGET {
+        return Err(format!(
+            "{}: {} rows held at a row root ({held} words > {ROOT_BUDGET}): the rows a step \
+             outgrow the roots; a row store off them (M2b) or row replicas",
+            u.name, u.rows
+        ));
+    }
     for rest in 0..=MAX_REST {
         let Some(l) = layout_with(r, u, py, rest) else {
             continue;

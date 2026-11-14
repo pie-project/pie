@@ -18,8 +18,25 @@ use crate::floorplan::stream::{Bounds, Stream, UnitAsk};
 
 type R<T> = Result<T, String>;
 
-/// Attention PEs a K / V column.
+/// Attention PEs a K / V column at least.
 pub const PYA: u32 = 8;
+/// 16-bit words an attention PE gives its entries (of 24,576: the rest is code and buffers).
+pub const KV_WORDS: u32 = 18_432;
+
+/// Entries an attention PE keeps at most (ops/satt.csl with QH): a key, a value and its ones
+/// column, the held q, and the scores' f32, 16-bit and probability words a q head.
+#[must_use]
+pub fn kv_entries(q_heads: u32, head_dim: u32) -> u32 {
+    let per = head_dim + (head_dim + 1) + q_heads * head_dim + q_heads * 6;
+    (KV_WORDS / per).max(1)
+}
+
+/// The attention PEs a K / V column of `rows` stored rows takes (P7 v1: a column as long as its
+/// entries ask, rows `p` kept by PE `p % pya`).
+#[must_use]
+pub fn kv_pya(rows: u32, q_heads: u32, head_dim: u32) -> u32 {
+    rows.div_ceil(kv_entries(q_heads, head_dim)).max(PYA)
+}
 
 /// A unit as built: its steps, layout, printed regions (by step index) and place on the stream.
 #[derive(Clone, Debug)]
@@ -512,7 +529,13 @@ pub fn program_at(
             lanes: b.lanes,
         })
         .collect();
-    let stream = Stream::of(&requests, py, &asks, &blocks, heads, PYA, bounds)?;
+    let qh = shape.attn.q_heads / shape.attn.kv_heads.max(1);
+    let pya = kv
+        .iter()
+        .map(|k| kv_pya(k.stores.iter().map(|s| s.1).sum(), qh, shape.attn.head_dim))
+        .max()
+        .unwrap_or(PYA);
+    let stream = Stream::of(&requests, py, &asks, &blocks, heads, pya, bounds)?;
     let wiring = stream.wiring();
     let floor = stream.floor();
     let palette = Palette::allocate(Vec::new(), &floor, &wiring)?;

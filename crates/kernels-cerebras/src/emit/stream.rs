@@ -1490,7 +1490,8 @@ fn kv_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String
 fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)> {
     let (qh, dc, _, sc) = kv_consts(p);
     let total: u32 = ks.stores.iter().map(|s| s.1).sum();
-    let ne = total.div_ceil(crate::stream::build::PYA);
+    let pya = p.stream.kv[k].pya;
+    let ne = total.div_ceil(pya);
     let pmax = if p.round16 { "1.0e30" } else { "65504.0" };
     let name = format!("kp_{k}.csl");
     let mut t = String::new();
@@ -1505,7 +1506,7 @@ fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)>
     let _ = writeln!(
         t,
         "const att = @import_module(\"ops/satt.csl\", .{{ .fab = fab, .math = math, .red = red, .YM = q_am, .Qh = {qh}, .Dc = {dc}, .NE = {ne}, .PYA = {}, .SC = {sc:?}, .PMAX = {pmax}, .QH = true }});",
-        crate::stream::build::PYA
+        pya
     );
     let mut body = String::from("  stamp(0);\n  att.init(K);\n  red.role = ROLE;\n");
     for &(_, rows, p0) in &ks.stores {

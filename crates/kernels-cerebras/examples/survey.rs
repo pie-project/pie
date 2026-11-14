@@ -109,6 +109,7 @@ fn short(s: &str) -> String {
 }
 
 /// The stream regime's line for a poem with a `denoise` reading: its program at 64 rows a class
+/// (`ROWS=context=512,latents=4096`: those classes' rows)
 /// (STREAM-BUILD-OK: units, K / V columns and lane bus laid and coloured, the CSL emitted; its
 /// fabric and the op-derived step cycles), or where it stops (STREAM-LOWER: the stream program;
 /// STREAM-SHAPE: the params; STREAM-BUILD: the units, layouts, floorplan, colours or CSL).
@@ -121,7 +122,12 @@ fn stream(d: &Deployment, trace: &Trace) {
         return;
     }
     let name = &d.name;
-    let classes = poem_compiler::spatial::layer::stream::classes(trace, reading, 64);
+    let rows = kernels_cerebras::stream::parse_rows(&std::env::var("ROWS").unwrap_or_default())
+        .unwrap_or_default();
+    let classes = kernels_cerebras::stream::with_rows(
+        poem_compiler::spatial::layer::stream::classes(trace, reading, 64),
+        &rows,
+    );
     let an = match poem_compiler::analysis::analyze(trace) {
         Ok(a) => a,
         Err(e) => {
@@ -157,11 +163,13 @@ fn stream(d: &Deployment, trace: &Trace) {
     });
     match built {
         Ok(p) => println!(
-            "{name}\treading={reading}\tSTREAM-BUILD-OK\t{what} fabric={}x{} kv-columns={} \
-             lane-words={} cycles~{:.1}M",
+            "{name}\treading={reading}\tSTREAM-BUILD-OK\t{what} fabric={}x{} py={} \
+             kv-columns={}x{} lane-words={} cycles~{:.1}M",
             p.stream.w,
             p.stream.h,
+            p.stream.py,
             p.stream.kv.len(),
+            p.stream.kv.first().map_or(0, |k| k.pya),
             p.lane_words,
             kernels_cerebras::cost::stream::time(&p).cycles / 1e6
         ),

@@ -43,7 +43,8 @@ const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <
      --build <dir> [--fabric simulator|system]\n       wafer-compile cost --plan <plan.json>\n       \
      wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]\n       \
      wafer-compile stream --model <deployment> [--reading R] [--rows N] [--ieee] --out <dir> \
-     [--values <dir>] [--stages N] [--tap v,..] [--py N]";
+     [--values <dir>] [--stages N] [--tap v,..] [--py N] \
+     [--class-rows context=512,latents=4096] [--price context=512,latents=4096]";
 
 fn main() {
     if let Err(e) = run() {
@@ -220,8 +221,8 @@ fn search(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `stream --model <name> [--reading denoise] [--rows 64] [--ieee] [--py N] --out <dir>
-/// [--values <dir>]`:
+/// `stream --model <name> [--reading denoise] [--rows 64] [--class-rows name=N,..] [--ieee]
+/// [--py N] --out <dir> [--values <dir>]`:
 /// a stream reading's wafer program (kernels-cerebras `stream::compile`); with a step's captured
 /// values, the host's files for a run of it (`tools/wafer/stream/run.py`).
 fn stream(args: &[String]) -> Result<(), String> {
@@ -261,6 +262,7 @@ fn stream(args: &[String]) -> Result<(), String> {
         upto,
         taps,
         py,
+        class_rows: kernels_cerebras::stream::parse_rows(&get("--class-rows").unwrap_or_default())?,
     };
     let p = kernels_cerebras::stream::compile(
         &trace,
@@ -268,6 +270,28 @@ fn stream(args: &[String]) -> Result<(), String> {
         std::path::Path::new(&out),
         values.as_deref().map(std::path::Path::new),
     )?;
+    if let Some(at) = get("--price") {
+        // the program's cost model read at other rows a class (its layout as built)
+        let named = kernels_cerebras::stream::parse_rows(&at)?;
+        let rows: Vec<u32> = p
+            .shape
+            .classes
+            .iter()
+            .map(|(c, r)| named.iter().find(|(n, _)| n == c).map_or(*r, |x| x.1))
+            .collect();
+        let c = kernels_cerebras::cost::stream::time_at(&p, &rows);
+        println!(
+            "priced at {at}: {:.1}M cycles ({:.1} ms at 875 MHz)",
+            c.cycles / 1e6,
+            c.cycles / 875e3
+        );
+        for u in &c.units {
+            println!(
+                "  {} rows {} early {:.0} late {:.0} matvec {:.0} cycles a row",
+                u.name, u.rows, u.early_row, u.late_row, u.matvec_row
+            );
+        }
+    }
     println!(
         "{model} {reading}: {} units, {} K / V columns, {} x {} PEs, py {}, {} lane words",
         p.units.len(),

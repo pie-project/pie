@@ -230,6 +230,9 @@ pub struct Options {
     pub taps: Vec<u32>,
     /// Row roots a unit (`None`: the cost model's choice, [`build::program_py`]).
     pub py: Option<u32>,
+    /// Rows of the classes named here in place of `rows` (flux at 1024²: context 512, latents
+    /// 4096).
+    pub class_rows: Vec<(String, u32)>,
 }
 
 /// Compiles `trace`'s stream reading (`o`) into `out`: the program's CSL (`layout.csl`, the
@@ -241,7 +244,11 @@ pub fn compile(
     out: &std::path::Path,
     gold: Option<&std::path::Path>,
 ) -> R<build::Program> {
-    let s = shape_of(trace, &o.reading, o.rows)?;
+    let s = shape(
+        trace,
+        &o.reading,
+        &with_rows(program::classes(trace, &o.reading, o.rows), &o.class_rows),
+    )?;
     let p = build::program_py(trace, s, o.round16, o.upto, &o.taps, o.py)?;
     let e = crate::emit::stream::emit(&p)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
@@ -274,6 +281,30 @@ pub fn compile(
         host::write(&p, &e.arrays, g, out)?;
     }
     Ok(p)
+}
+
+/// `classes` with the rows of those `rows` names.
+#[must_use]
+pub fn with_rows(mut classes: Vec<RowClass>, rows: &[(String, u32)]) -> Vec<RowClass> {
+    for c in &mut classes {
+        if let Some((_, n)) = rows.iter().find(|(name, _)| *name == c.name) {
+            c.rows = *n;
+        }
+    }
+    classes
+}
+
+/// Parses `name=rows,...` (wafer-compile's `--class-rows`, the survey's `ROWS`).
+pub fn parse_rows(s: &str) -> R<Vec<(String, u32)>> {
+    s.split(',')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let (n, r) = p
+                .split_once('=')
+                .ok_or_else(|| format!("{p}: not name=rows"))?;
+            Ok((n.to_string(), r.parse().map_err(|e| format!("{p}: {e}"))?))
+        })
+        .collect()
 }
 
 /// The shape of `trace`'s `reading` over the conventional row classes
