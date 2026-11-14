@@ -73,10 +73,12 @@ fn state_dtype(declared: Dtype) -> Dtype {
     }
 }
 
-/// The null chunk; the sink is the pool's top chunk ([`Pools::sink_chunk`]):
-/// every kernel that treats a plane view's last page or block as the sink
-/// (the prefill page writer drops rows bound there) then finds it in a
-/// chunk the runtime never hands out.
+/// The null chunk; the sink is the pool's top chunk ([`Pools::sink_chunk`]),
+/// one past the range the load states (`ChunkFacts::total_chunks`): every
+/// kernel that treats a plane view's last page or block as the sink (the
+/// prefill page writer drops rows bound there) then finds it in a chunk the
+/// runtime never names, and the activation span the runtime keeps at the
+/// top of the stated range lies just below it.
 const NULL_CHUNK: u32 = 0;
 const RESERVED_CHUNKS: u32 = 2;
 
@@ -868,25 +870,19 @@ impl Pools {
         ChunkFacts {
             span_backed_on_demand: false,
             chunk_bytes: self.layout.chunk_bytes,
-            total_chunks: self.chunks,
-            segment_chunks: self.chunks,
+            // The sink lies past the stated range: the runtime never names it.
+            total_chunks: self.sink_chunk(),
+            segment_chunks: self.sink_chunk(),
             segments: SegmentFacts {
                 committed: 1,
                 max: 1,
                 growth: Growth::Fixed,
             },
-            reserved: vec![
-                ReservedRun {
-                    what: Reserved::Null,
-                    first: NULL_CHUNK,
-                    chunks: 1,
-                },
-                ReservedRun {
-                    what: Reserved::Sink,
-                    first: self.sink_chunk(),
-                    chunks: 1,
-                },
-            ],
+            reserved: vec![ReservedRun {
+                what: Reserved::Null,
+                first: NULL_CHUNK,
+                chunks: 1,
+            }],
             shapes,
             act_chunks: Vec::new(),
             host_chunks: 0,

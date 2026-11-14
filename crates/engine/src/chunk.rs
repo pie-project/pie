@@ -129,9 +129,6 @@ pub enum Reserved {
     /// Chunk 0: what a window list's slot trimmed behind its window, or an
     /// unset table entry, reads (ref 0). Replaces the windowed pool's page 0.
     Null,
-    /// Where padding lanes write, so a fire of a fixed lane count never
-    /// writes a live slot. Replaces XLA's and Cerebras' one-past sink.
-    Sink,
     /// State of lanes the runtime does not seat (`Lane::kv_less` lanes that
     /// carry state of their own), `lanes` of them.
     Runtimeless { lanes: u32 },
