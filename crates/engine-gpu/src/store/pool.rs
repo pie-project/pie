@@ -41,39 +41,24 @@ pub struct Pool<B: Backend> {
 }
 
 /// The chunks a segment holds for a pool of `total_chunks` whose top `span`
-/// lie in its last segment, and the chunks the pool keeps for that: a
-/// quarter of the pool (the kernels bind four segments) where the last
-/// quarter holds the span, else the narrowest wider segment whose last one
-/// does; never more than one binding spans. A pool whose last segment
-/// cannot hold the span at any width keeps whole segments of the widest.
-/// `None`: one binding cannot hold the span.
+/// lie in its last segment: the pool cut into as many segments as it may
+/// be (the kernels bind [`SEGMENTS`]), so commits stay fine, with each
+/// segment within one binding and the last at least the span. Cut into `n`
+/// segments of `ceil(total / n)`, the last holds at least `total / n -
+/// (n - 1)`, so `n <= total / (span + SEGMENTS - 1)` keeps the span whole.
+/// `None`: no count of segments does both (the load is refused).
 #[must_use]
-pub fn segment_chunks(
-    chunk_bytes: u64,
-    total_chunks: u32,
-    binding: u64,
-    span: u32,
-) -> Option<(u32, u32)> {
+pub fn segment_chunks(chunk_bytes: u64, total_chunks: u32, binding: u64, span: u32) -> Option<u32> {
     let fits = u32::try_from(binding / chunk_bytes.max(1))
         .unwrap_or(u32::MAX)
         .max(1);
-    if span > fits {
-        return None;
-    }
-    let quarter = total_chunks.div_ceil(SEGMENTS as u32).max(1);
-    let last = |segment: u32| {
-        let count = total_chunks.div_ceil(segment);
-        total_chunks - (count - 1) * segment
+    let most = if span == 0 {
+        SEGMENTS as u32
+    } else {
+        (total_chunks / (span + SEGMENTS as u32 - 1)).min(SEGMENTS as u32)
     };
-    let mut segment = quarter.max(span).min(fits);
-    while segment < fits && last(segment) < span {
-        segment += 1;
-    }
-    if last(segment) >= span {
-        return Some((segment, total_chunks));
-    }
-    // Whole segments only: the last is as wide as the rest.
-    Some((segment, total_chunks / segment * segment))
+    let least = total_chunks.div_ceil(fits);
+    (most > 0 && least <= most).then(|| total_chunks.div_ceil(most))
 }
 
 impl<B: Backend> Pool<B> {
@@ -410,23 +395,24 @@ mod tests {
         let chunk = 4 << 20;
         for (total, binding, span) in [
             (2256, 4u64 << 30, 40),
+            (3016, 4095 << 20, 760),
             (2257, 4 << 30, 563),
             (1001, 4 << 30, 250),
-            (64, 64 << 20, 16),
-            (60, 64 << 20, 16),
-            (64, 1 << 30, 63),
+            (64, 1 << 30, 0),
         ] {
-            let (segment, kept) =
-                segment_chunks(chunk, total, binding, span).expect("a binding holds the span");
-            let count = kept.div_ceil(segment);
+            let segment =
+                segment_chunks(chunk, total, binding, span).expect("a cut holds the span");
+            let count = total.div_ceil(segment);
             assert!(
                 count <= super::SEGMENTS as u32,
                 "{total} {span}: {count} segments"
             );
             assert!(u64::from(segment) * chunk <= binding);
-            assert!(kept <= total);
-            assert!(kept - (count - 1) * segment >= span, "{total} {span}");
+            assert!(total - (count - 1) * segment >= span, "{total} {span}");
         }
-        assert_eq!(segment_chunks(chunk, 100, 64 << 20, 17), None);
+        // Refused, not cut smaller: more segments than bind, or a span past
+        // the widest last segment.
+        assert_eq!(segment_chunks(chunk, 64, 64 << 20, 16), None);
+        assert_eq!(segment_chunks(chunk, 64, 1 << 30, 63), None);
     }
 }

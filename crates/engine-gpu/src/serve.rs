@@ -1152,7 +1152,7 @@ impl<B: Serve> Shell<B> {
                 device.max_buffer() >> 20
             ))
         };
-        let (segment_chunks, total) =
+        let segment_chunks =
             crate::store::pool::segment_chunks(chunk, total, device.max_buffer(), act)
                 .ok_or_else(span_short)?;
         if total < least_chunks + act {
