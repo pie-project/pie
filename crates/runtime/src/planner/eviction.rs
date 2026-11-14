@@ -260,8 +260,12 @@ impl ResidencyPlanner {
         let (free, _) = self.port.device_stats();
         let (rs_free, rs_total) = self.port.rs_stats();
         let rs_growth = self.rs_growth();
+        let (_, engine) = self.port.locus();
         let (mut victims, spare) = self.with_inner(|inner| {
             let (head, waiter) = inner.unmet_head()?;
+            // An activation rung's raise is no reason to move a process it
+            // serves off the device: short of others, it waits.
+            let serves = crate::store::shared::raise_serves(engine, waiter.pid);
             // What the device still has free and an eviction in flight
             // returns is supply, not deficit, as `supply_stalled` counts it.
             let missing = waiter
@@ -307,6 +311,7 @@ impl ResidencyPlanner {
                         && proc.state == Residency::Resident
                         && !inner.host_swap_blocked.contains(*pid)
                         && !inner.prepare_blocked.contains(*pid)
+                        && serves.as_ref().is_none_or(|served| !served.contains(*pid))
                 })
                 .map(|(pid, proc)| Victim {
                     pid: *pid,

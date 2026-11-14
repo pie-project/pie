@@ -181,6 +181,45 @@ pub fn forget_process(pid: uuid::Uuid) {
     PROCESS_WANTS.lock().unwrap().remove(&pid);
 }
 
+/// The processes whose prompts ask `engine`'s rung now: the ones a raise
+/// serves.
+#[must_use]
+pub fn asking_processes(engine: usize) -> Vec<uuid::Uuid> {
+    PROCESS_WANTS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, (on, _))| *on == engine)
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
+/// Per engine, the process carrying the raise's planner waiter now.
+static RAISE_CARRIERS: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, uuid::Uuid>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// `carrier` carries `engine`'s raise as a planner waiter (`None`: no
+/// longer).
+pub fn carry_raise(engine: usize, carrier: Option<uuid::Uuid>) {
+    let mut carriers = RAISE_CARRIERS.lock().unwrap();
+    match carrier {
+        Some(pid) => {
+            carriers.insert(engine, pid);
+        }
+        None => {
+            carriers.remove(&engine);
+        }
+    }
+}
+
+/// Where `waiter` carries `engine`'s raise, the processes the raise serves:
+/// none of them is moved off the device to fund it.
+#[must_use]
+pub fn raise_serves(engine: usize, waiter: uuid::Uuid) -> Option<std::collections::HashSet<uuid::Uuid>> {
+    let carried = RAISE_CARRIERS.lock().unwrap().get(&engine) == Some(&waiter);
+    carried.then(|| asking_processes(engine).into_iter().collect())
+}
+
 /// The width a fire may take at the rung that holds `rows`: the cap the
 /// walker lifts to there (`u32::MAX` at the largest rung).
 #[must_use]

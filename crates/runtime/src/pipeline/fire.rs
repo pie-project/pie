@@ -619,6 +619,8 @@ struct RaiseFunding {
     stop: Arc<tokio::sync::Notify>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
     failed: Arc<Mutex<Option<String>>>,
+    /// Its task has ended (raised, refused, or its process left the device).
+    ended: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RaiseFunding {
@@ -629,7 +631,13 @@ impl RaiseFunding {
         quorum: uuid::Uuid,
         rows: u32,
         epoch_now: impl Fn() -> u64 + Send + 'static,
-    ) -> Self {
+    ) -> Option<Self> {
+        // One waiter funds a raise: a pass asking no wider than the one
+        // under way leaves it to that one (a wave of prompts each funding
+        // the same room would have the planner free it once per prompt).
+        let target = crate::store::shared::cap_for(&shared, rows);
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let funded = FundedRaise::claim(engine, target, ended.clone())?;
         let stop = Arc::new(tokio::sync::Notify::new());
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let failed = Arc::new(Mutex::new(None));
@@ -637,13 +645,14 @@ impl RaiseFunding {
             stop: stop.clone(),
             stopped: stopped.clone(),
             failed: failed.clone(),
+            ended,
         };
         crate::rt::spawn(async move {
+            let _funded = funded;
             let Some(planner) = crate::planner::planner_of(pid) else {
                 tracing::debug!(%pid, "a raise's funding finds no planner");
                 return;
             };
-            let target = crate::store::shared::cap_for(&shared, rows);
             while !stopped.load(std::sync::atomic::Ordering::Acquire) {
                 crate::store::shared::raise_now(&shared, engine, rows);
                 if crate::store::shared::fire_cap(engine) >= target {
@@ -663,9 +672,22 @@ impl RaiseFunding {
                     kv_pages: pages,
                     rs: crate::store::rs::RsUnits::default(),
                 };
-                tracing::debug!(engine, rows, pages, "a raise asks the planner for room");
+                // The waiter is carried by the process the policy keys
+                // highest of those the raise serves and still on the device
+                // (PLEX's key read, no retention decided here); the planner
+                // moves none of the processes it serves to fund it. Its own
+                // lane is no frame's: the scope is the carrier itself.
+                let carrier = crate::store::shared::asking_processes(engine)
+                    .into_iter()
+                    .chain([pid])
+                    .filter(|&asking| planner.is_resident(asking))
+                    .max_by_key(|&asking| (crate::policy::schedule::key(asking), asking == pid))
+                    .unwrap_or(pid);
+                crate::store::shared::carry_raise(engine, Some(carrier));
+                tracing::debug!(engine, rows, pages, %carrier, "a raise asks the planner for room");
+                let _ = quorum;
                 let asked = tokio::select! {
-                    asked = planner.acquire(pid, quorum, demand) => asked,
+                    asked = planner.acquire(carrier, carrier, demand) => asked,
                     () = stop.notified() => return,
                 };
                 match asked {
@@ -722,8 +744,18 @@ impl RaiseFunding {
                         tracing::debug!(engine, "a raise's room is quoted again");
                     }
                     Ok(crate::planner::Acquired::Yield) => {
-                        tracing::debug!(engine, "a raise's process yields");
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        // Its process is off the device (a victim of the
+                        // room asked, maybe of this ask): it funds nothing
+                        // until restored, so the raise goes to the next pass
+                        // that asks for it, from a process still resident.
+                        tracing::debug!(engine, "a raise's process yields its funding");
+                        return;
+                    }
+                    Err(error) if carrier != pid => {
+                        // Another process carried it and went (finished or
+                        // cancelled): the next asking pass takes it up.
+                        tracing::debug!(engine, %error, "a raise's carrier left");
+                        return;
                     }
                     Err(error) => {
                         tracing::debug!(engine, %error, "a raise's room is refused");
@@ -733,11 +765,16 @@ impl RaiseFunding {
                 }
             }
         });
-        funding
+        Some(funding)
     }
 
     fn failed(&self) -> Option<String> {
         self.failed.lock().unwrap().clone()
+    }
+
+    /// Its task ended without a refusal: another pass may fund the raise.
+    fn handed_back(&self) -> bool {
+        self.ended.load(std::sync::atomic::Ordering::Acquire) && self.failed().is_none()
     }
 }
 
@@ -762,6 +799,44 @@ async fn wait_for_rung(
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
     Ok(())
+}
+
+/// Per engine, the widest cap a raise's funding under way asks: a pass
+/// asking no wider waits on that one's raise rather than funding its own.
+static FUNDED_RAISES: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, u32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// A raise's funding under way on an engine, until its task ends.
+struct FundedRaise {
+    engine: usize,
+    target: u32,
+    ended: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FundedRaise {
+    fn claim(engine: usize, target: u32, ended: Arc<std::sync::atomic::AtomicBool>) -> Option<Self> {
+        let mut funded = FUNDED_RAISES.lock().unwrap();
+        if funded.get(&engine).is_some_and(|&under_way| under_way >= target) {
+            return None;
+        }
+        funded.insert(engine, target);
+        Some(Self {
+            engine,
+            target,
+            ended,
+        })
+    }
+}
+
+impl Drop for FundedRaise {
+    fn drop(&mut self) {
+        let mut funded = FUNDED_RAISES.lock().unwrap();
+        if funded.get(&self.engine) == Some(&self.target) {
+            funded.remove(&self.engine);
+            crate::store::shared::carry_raise(self.engine, None);
+        }
+        self.ended.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl Drop for RaiseFunding {
@@ -2997,14 +3072,17 @@ pub async fn submit_pass_stamped<C: FireContext>(
             (wanted, rung_want)
         };
         // What the rung lacks for it is funded beside the pass.
-        let funding = match stores.shared.as_ref() {
+        // A pass whose raise no funder carries (another's under way, or one
+        // whose process has left the device since) takes it up between its
+        // pieces: the raise stays a waiter under a process still asking.
+        let fund = || match stores.shared.as_ref() {
             Some(shared)
                 if rung_want.is_some()
                     && crate::store::shared::fire_cap(engine)
                         < crate::store::shared::cap_for(shared, wanted) =>
             {
                 let kv = stores.kv.clone();
-                Some(RaiseFunding::start(
+                RaiseFunding::start(
                     shared.clone(),
                     engine,
                     pid,
@@ -3015,10 +3093,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
                             kv.current_epoch()
                         })
                     },
-                ))
+                )
             }
             _ => None,
         };
+        let mut funding = fund();
         // What one fire would run past what a fire holds is refused here, by
         // name, rather than by the scheduler's row count.
         let capacity = crate::engine::get_spec(engine)
@@ -3074,6 +3153,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let mut settles = Vec::new();
         let mut at = 0;
         while at < cuts.len() {
+            if funding.as_ref().is_none_or(RaiseFunding::handed_back)
+                && let Some(taken) = fund()
+            {
+                funding = Some(taken);
+            }
             if recuttable && at > 0 && at + 1 < cuts.len() {
                 // While the raise is pending the pass runs no further ahead
                 // of the device than a few pieces, so what is left is cut at
