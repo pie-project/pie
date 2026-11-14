@@ -355,7 +355,7 @@ impl Layout {
 
     /// The pool as the runtime counts it: one shared chunk space, chunk 0
     /// null, segments of `segment_chunks` growing from the bottom where the
-    /// pool is sparse; activation lives in the arena apart.
+    /// pool is sparse; the caller states the activation rungs (`act_chunks`).
     #[must_use]
     pub fn facts(
         &self,

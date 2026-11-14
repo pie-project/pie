@@ -378,6 +378,9 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
     // field rather than through their debug text keeps a step's key off
     // the CPU's critical path (1.6 ms of a token on a phone's core).
     key.hashed(&p.slots);
+    // The rung names where its carve and rooms lie in the span: a fire of
+    // another rung binds other bytes under the same handles.
+    key.shown(&p.rung);
     key.hashed(&p.caches);
     key.shown(&p.bindings);
     key.shown(&p.windows);

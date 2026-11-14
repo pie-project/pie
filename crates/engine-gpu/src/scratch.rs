@@ -1,13 +1,13 @@
 use kernels_slang::Tensor;
 use kernels_slang::linear::moe::select::RoutedScratch;
-use poem_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
+use poem_compiler::{ArenaMap, Budget, Budgets, CompiledModel, Fallback, FireRows};
 use poem_exec::fire::fallback;
 use poem_exec::store::arena::rect;
 use poem_ir::{Attn, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
 
 use crate::store::kv::Paging;
 
-use crate::backend::{Backend, Buffer as _, Tactics as _};
+use crate::backend::{Backend, Tactics};
 use crate::error::Result;
 use crate::handles::Handles;
 
@@ -38,9 +38,9 @@ impl Room {
         u64::from(self.rows) * u64::from(self.width) * self.dtype.bytes_ceil()
     }
 
-    fn bind<B: Backend>(&self, handles: &Handles<B>, plane: &B::Buffer) -> Result<Tensor> {
+    fn bind<B: Backend>(&self, handles: &Handles<B>, plane: &B::Buffer, base: u64) -> Result<Tensor> {
         Ok(Tensor::new(
-            handles.bind(plane, self.at, self.bytes())?,
+            handles.bind(plane, base + self.at, self.bytes())?,
             self.rows,
             self.width,
             self.dtype,
@@ -80,10 +80,12 @@ struct Routed {
     y: Room,
 }
 
-#[derive(Debug)]
-pub struct Scratch<B: Backend> {
-    plane: B::Buffer,
-
+/// Where a fire's kernel scratch lies, as offsets from the start of its
+/// rooms: laid statically from the compiled model at one rung's width (the
+/// ceiling of the fires that rung holds), and bound in the pool's
+/// activation span at the place the rung's carve takes ([`crate::arena`]).
+#[derive(Clone, Debug, Default)]
+pub struct Rooms {
     routed: Option<Routed>,
 
     index: Option<Room>,
@@ -94,34 +96,36 @@ pub struct Scratch<B: Backend> {
 
     copy: Option<CopyRoom>,
 
-    capacity: Vec<u32>,
-
-    routers: Vec<u32>,
+    bytes: u64,
 }
 
-impl<B: Backend> Scratch<B> {
-    pub fn reserve(
-        device: &B::Context,
+impl Rooms {
+    /// The rooms fires of at most `tokens` tokens (and as many lanes) take,
+    /// `map` the arena carved for them and `budgets` the load's: every room
+    /// sized by the same walk of the trace at that width.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lay<T: Tactics + ?Sized>(
         trace: &Trace,
         compiled: &CompiledModel,
+        map: &ArenaMap,
         budgets: &Budgets,
+        tokens: u32,
         paging: Paging,
-        tuning: &B::Tuning,
-    ) -> Result<Scratch<B>> {
+        tuning: &T,
+        routers: &[u32],
+    ) -> Rooms {
         let budget = &budgets.tokens;
-        let map = &compiled.arena;
+        let narrow = narrowed(budget, tokens);
         let ceiling = FireRows {
-            tokens: u64::from(budget.max_tokens),
-            lanes: u64::from(budget.max_lanes),
+            tokens: u64::from(narrow.max_tokens),
+            lanes: u64::from(narrow.max_lanes),
             patches: u64::from(budgets.max_patches()),
             images: u64::from(budgets.max_images()),
             voxels: u64::from(budgets.max_voxels()),
             clips: u64::from(budgets.max_clips()),
-            readouts: poem_compiler::arena::readouts_ceiling(budget),
+            readouts: poem_compiler::arena::readouts_ceiling(&narrow),
         };
         let of = |id: ValueId| rect(map, id, ceiling);
-
-        let routers = routers(trace);
 
         let (mut sorted, mut pairs, mut routed_k, mut routed_n) = (0u64, 0u64, 0u64, 0u64);
         for node in &trace.nodes {
@@ -261,30 +265,88 @@ impl<B: Backend> Scratch<B> {
             .max(split.map_or(0, |r| r.part_lse.at + r.part_lse.bytes()))
             .max(spatial.map_or(0, |r| r.at + r.bytes()));
 
-        let copy = copy_ceiling(trace, compiled, budget).map(|bytes| CopyRoom {
-            at: union.next_multiple_of(ALIGN),
-            bytes,
+        let copy = copy_ceiling(trace, compiled, map, budget, narrow.max_tokens).map(|bytes| {
+            CopyRoom {
+                at: union.next_multiple_of(ALIGN),
+                bytes,
+            }
         });
 
-        let at = copy.map_or(union, |room| room.at + room.bytes);
+        let bytes = copy.map_or(union, |room| room.at + room.bytes);
 
-        let plane = B::Buffer::zeroed(device, at, crate::books::owners::SCRATCH)?;
-
-        Ok(Scratch {
-            plane,
+        Rooms {
             routed,
             index,
             split,
             spatial,
             copy,
-            capacity: crate::arena::capacities(map),
-            routers,
-        })
+            bytes,
+        }
     }
 
+    /// The bytes every room spans together.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.plane.bytes()
+        self.bytes
+    }
+}
+
+/// `budget` for fires of at most `tokens` tokens and as many lanes, as
+/// `poem_compiler::arena_rung` narrows it for that rung's carve; the budget
+/// itself where `tokens` is its own ceiling or more.
+#[must_use]
+pub fn narrowed(budget: &Budget, tokens: u32) -> Budget {
+    if tokens >= budget.max_tokens {
+        return budget.clone();
+    }
+    let mut narrow = budget.clone();
+    narrow.max_tokens = narrow.max_tokens.min(tokens);
+    narrow.max_lanes = narrow.max_lanes.min(tokens);
+    narrow.buckets.retain(|&rows| rows <= tokens);
+    narrow
+}
+
+/// One fire's rooms where they lie: a rung's [`Rooms`] at `base` of the
+/// span's buffer.
+pub struct FireScratch<'a, B: Backend> {
+    rooms: &'a Rooms,
+    plane: &'a B::Buffer,
+    base: u64,
+    capacity: &'a [u32],
+    routers: &'a [u32],
+}
+
+impl<B: Backend> Clone for FireScratch<'_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<B: Backend> Copy for FireScratch<'_, B> {}
+
+impl<'a, B: Backend> FireScratch<'a, B> {
+    /// `rooms` at `base` of `plane`; `capacity` the rows each value's
+    /// placement holds in the carve the fire takes, `routers` each route
+    /// value's expert count.
+    #[must_use]
+    pub fn new(
+        rooms: &'a Rooms,
+        plane: &'a B::Buffer,
+        base: u64,
+        capacity: &'a [u32],
+        routers: &'a [u32],
+    ) -> FireScratch<'a, B> {
+        FireScratch {
+            rooms,
+            plane,
+            base,
+            capacity,
+            routers,
+        }
+    }
+
+    fn bind(&self, handles: &Handles<B>, room: Room) -> Result<Tensor> {
+        room.bind(handles, self.plane, self.base)
     }
 
     pub fn spatial_moments(
@@ -293,7 +355,7 @@ impl<B: Backend> Scratch<B> {
         clips: u32,
         groups: u32,
     ) -> Option<Result<(Tensor, Tensor)>> {
-        let room = self.spatial?;
+        let room = self.rooms.spatial?;
         let splits = kernels_slang::conv::group_norm::SPLITS;
         let partial_floats = u64::from(clips) * u64::from(splits) * u64::from(groups) * 4;
         let stat_floats = u64::from(clips) * u64::from(groups) * 2;
@@ -312,12 +374,7 @@ impl<B: Backend> Scratch<B> {
             width: groups * 2,
             dtype: Dtype::F32,
         };
-        Some((|| {
-            Ok((
-                partials.bind(handles, &self.plane)?,
-                stats.bind(handles, &self.plane)?,
-            ))
-        })())
+        Some((|| Ok((self.bind(handles, partials)?, self.bind(handles, stats)?)))())
     }
 
     #[must_use]
@@ -331,51 +388,54 @@ impl<B: Backend> Scratch<B> {
     }
 
     pub fn copy(&self, handles: &Handles<B>, offset: u64, bytes: u64) -> Option<Result<u32>> {
-        let room = self.copy?;
+        let room = self.rooms.copy?;
         if offset.saturating_add(bytes) > room.bytes {
             return None;
         }
-        Some(handles.bind(&self.plane, room.at + offset, bytes))
+        Some(handles.bind(self.plane, self.base + room.at + offset, bytes))
     }
 
     pub fn routed(&self, handles: &Handles<B>) -> Option<Result<RoutedScratch>> {
-        let r = self.routed?;
+        let r = self.rooms.routed?;
         let mint = || {
             Ok(RoutedScratch {
-                perm: r.perm.bind(handles, &self.plane)?,
-                row_expert: r.row_expert.bind(handles, &self.plane)?,
-                tile_expert: r.tile_expert.bind(handles, &self.plane)?,
-                inv: r.inv.bind(handles, &self.plane)?,
-                x: r.x.bind(handles, &self.plane)?,
-                y: r.y.bind(handles, &self.plane)?,
+                perm: self.bind(handles, r.perm)?,
+                row_expert: self.bind(handles, r.row_expert)?,
+                tile_expert: self.bind(handles, r.tile_expert)?,
+                inv: self.bind(handles, r.inv)?,
+                x: self.bind(handles, r.x)?,
+                y: self.bind(handles, r.y)?,
             })
         };
         Some(mint())
     }
 
     pub fn index_scores(&self, handles: &Handles<B>) -> Option<Result<Tensor>> {
-        Some(self.index?.bind(handles, &self.plane))
+        Some(self.bind(handles, self.rooms.index?))
     }
 
     pub fn split(&self, handles: &Handles<B>) -> Option<Result<kernels_slang::attn::sdpa::Split>> {
-        let rooms = self.split?;
+        let rooms = self.rooms.split?;
         Some((|| {
             Ok(kernels_slang::attn::sdpa::Split {
-                part_out: rooms.part_out.bind(handles, &self.plane)?,
-                part_lse: rooms.part_lse.bind(handles, &self.plane)?,
+                part_out: self.bind(handles, rooms.part_out)?,
+                part_lse: self.bind(handles, rooms.part_lse)?,
             })
         })())
     }
-
-    /// The buffer every room lies in.
-    #[must_use]
-    pub fn plane(&self) -> &B::Buffer {
-        &self.plane
-    }
 }
 
-fn copy_ceiling(trace: &Trace, compiled: &CompiledModel, budget: &Budget) -> Option<u64> {
-    let lanes = u64::from(budget.max_lanes);
+/// The copy room's bytes: every region a fallback copies, its operands'
+/// rows at the most rows such a region runs at, capped at `tokens` (a
+/// rung's fires run no more), rectangles from `map`.
+fn copy_ceiling(
+    trace: &Trace,
+    compiled: &CompiledModel,
+    map: &ArenaMap,
+    budget: &Budget,
+    tokens: u32,
+) -> Option<u64> {
+    let lanes = u64::from(budget.max_lanes.min(tokens));
     let mut most = 0u64;
     for region in compiled.template() {
         let rows = compiled
@@ -394,7 +454,9 @@ fn copy_ceiling(trace: &Trace, compiled: &CompiledModel, budget: &Budget) -> Opt
                     .any(|row| region.nodes.contains(&row.node) && row.fallback == Fallback::Copy)
                     .then_some(budget.max_tokens)
             });
-        let Some(rows) = rows else { continue };
+        let Some(rows) = rows.map(|rows| rows.min(tokens)) else {
+            continue;
+        };
         if !fallback::copyable_mask(trace, compiled, &region.mask) {
             continue;
         }
@@ -414,7 +476,7 @@ fn copy_ceiling(trace: &Trace, compiled: &CompiledModel, budget: &Budget) -> Opt
                 continue;
             }
             let Some(rect) = rect(
-                &compiled.arena,
+                map,
                 *id,
                 FireRows::text_only(u64::from(rows), lanes),
             ) else {
@@ -434,7 +496,9 @@ fn copy_ceiling(trace: &Trace, compiled: &CompiledModel, budget: &Budget) -> Opt
 
 const COPY_ALIGN: u64 = 16;
 
-fn routers(trace: &Trace) -> Vec<u32> {
+/// Each route value's expert count, 0 for every other value.
+#[must_use]
+pub fn routers(trace: &Trace) -> Vec<u32> {
     let mut out = vec![0u32; trace.values.len()];
     for node in &trace.nodes {
         let Operation::Linear(op) = &node.op else {

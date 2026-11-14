@@ -17,13 +17,12 @@ use poem_exec::fire::{
 };
 use poem_ir::{Dtype, Gather, Operation, RuntimeInput, Trace, Ty, ValueId};
 
-use crate::arena::Arena;
+use crate::arena::Span;
 use crate::backend::{Backend, Buffer as _, Context as _, Frame as _, Pending as _, Tactics as _};
 use crate::error::{Fault, Result};
 use crate::handles::Handles;
 use crate::inputs::Inputs;
 use crate::run::{CacheGeometry, CacheTable, FireBindings, FireTables, Run, SlotTable};
-use crate::scratch::Scratch;
 use crate::settle::{Airborne, Arms, Done};
 use crate::store::Pools;
 use crate::store::kv::{self, Paging, Seat};
@@ -588,14 +587,13 @@ pub struct Shell<B: Serve> {
 
     budgets: Budgets,
     pub weights: Weights<B>,
-    arena: Arena<B>,
+    /// A fire's arena and kernel scratch, at the top of the pool.
+    span: Span<B>,
     pools: Pools<B>,
     /// The weight cache's row tables (PLE), streamed through pool slots.
     pub row_caches: crate::store::rows::RowCaches<B>,
     /// The weight cache's routed experts, streamed through pool slots.
     pub expert_caches: crate::store::experts::ExpertCaches<B>,
-
-    scratch: Scratch<B>,
 
     inputs: Vec<Inputs<B>>,
 
@@ -838,10 +836,15 @@ impl<B: Serve> Shell<B> {
             ..asked
         };
 
-        let arena = Arena::reserve(&device, &compiled.arena)?;
+        // A fire's arena and kernel scratch, laid at the top fire's width;
+        // they take the pool's top chunks once it is reserved.
+        let top = budgets.tokens.max_tokens;
+        let rung_tokens = vec![top];
+        let mut span = Span::plan(&boot.trace, &compiled, &budgets, &rung_tokens, least, &tuning)?;
         let device_cap = device
             .left()
-            .saturating_sub(u64::from(least_chunks) * chunk);
+            .saturating_sub(u64::from(least_chunks) * chunk)
+            .saturating_sub(span.bytes());
         let mut weights = Weights::resident(
             &device,
             &handles,
@@ -858,7 +861,6 @@ impl<B: Serve> Shell<B> {
 
         handles.seal();
 
-        let scratch = Scratch::reserve(&device, &boot.trace, &compiled, &budgets, least, &tuning)?;
         // A page table a list the kv rows lie in: the kv list's first (the
         // All axis's), then each window list's (CONTRACT-BC 21).
         let page_tables = rows.tables.len();
@@ -986,21 +988,17 @@ impl<B: Serve> Shell<B> {
             .map(|out| out.values[0]);
 
         let (out_width, pixels, readouts) = {
-            let carved = arena.slots(
-                &handles,
-                &compiled.arena,
-                FireRows {
-                    tokens: u64::from(boot.budget.max_tokens),
-                    lanes: u64::from(boot.budget.max_lanes),
-                    patches: u64::from(budgets.max_patches()),
-                    images: u64::from(budgets.max_images()),
-                    voxels: u64::from(budgets.max_voxels()),
-                    clips: u64::from(budgets.max_clips()),
-                    readouts: poem_compiler::arena::readouts_ceiling(&boot.budget),
-                },
-            )?;
+            let ceiling = FireRows {
+                tokens: u64::from(boot.budget.max_tokens),
+                lanes: u64::from(boot.budget.max_lanes),
+                patches: u64::from(budgets.max_patches()),
+                images: u64::from(budgets.max_images()),
+                voxels: u64::from(budgets.max_voxels()),
+                clips: u64::from(budgets.max_clips()),
+                readouts: poem_compiler::arena::readouts_ceiling(&boot.budget),
+            };
             let rect_of = |value: ValueId, name: &str| {
-                carved.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
+                poem_exec::store::arena::rect(&compiled.arena, value, ceiling).ok_or_else(|| Fault::Unbound {
                     what: format!(
                         "value {}, of output `{name}`, which the carve gave no rectangle",
                         value.0
@@ -1060,7 +1058,6 @@ impl<B: Serve> Shell<B> {
                 Some(out) => rect_of(out, "readout")?.width,
                 None => 0,
             };
-            handles.rewind();
             (out_width, pixels, readouts)
         };
         let pixel_out = match pixels.iter().map(|plane| plane.4).max() {
@@ -1110,8 +1107,14 @@ impl<B: Serve> Shell<B> {
                 engine::fit::Short::Budget { budget, room: left }.to_string(),
             ));
         }
-        let room = kv_budget.unwrap_or(left);
-        let total = engine::chunk::fit(room, chunk, 0, least_chunks)
+        // The activation span takes the pool's top chunks beside what the
+        // budget states for state.
+        let act_chunks = span.act_chunks(chunk);
+        let act = act_chunks.last().map_or(0, |&(_, chunks)| chunks);
+        let room = kv_budget.map_or(left, |budget| {
+            budget.saturating_add(u64::from(act) * chunk).min(left)
+        });
+        let total = engine::chunk::fit(room, chunk, act, least_chunks)
             .map_err(|short| Fault::Residency(short.to_string()))?;
         let binds = u32::try_from(
             (device.max_buffer() / chunk).saturating_mul(kernels_slang::SEGMENTS as u64),
@@ -1123,14 +1126,19 @@ impl<B: Serve> Shell<B> {
             / kernels_slang::SEGMENTS as u32
             * kernels_slang::SEGMENTS as u32;
         let total = total.min(binds).min(words);
-        if total < least_chunks {
-            return Err(Fault::Residency(format!(
-                "one working set takes {least_chunks} chunks of {chunk} bytes, and this device \
-                 binds four segments of {} MiB",
+        let span_short = || {
+            Fault::Residency(format!(
+                "one working set takes {least_chunks} chunks of {chunk} bytes beside a fire's \
+                 {act}, and this device binds four segments of {} MiB",
                 device.max_buffer() >> 20
-            )));
+            ))
+        };
+        let (segment_chunks, total) =
+            crate::store::pool::segment_chunks(chunk, total, device.max_buffer(), act)
+                .ok_or_else(span_short)?;
+        if total < least_chunks + act {
+            return Err(span_short());
         }
-        let segment_chunks = crate::store::pool::segment_chunks(chunk, total, device.max_buffer());
         let layout = crate::store::layout::Layout::new(
             chunk,
             total,
@@ -1156,6 +1164,10 @@ impl<B: Serve> Shell<B> {
                     asked.context().div_ceil(w.tokens.max(1)),
                 )
             })?;
+        // The seats' runs lie under the span.
+        if 1 + layout.seat_chunks() > total - act {
+            return Err(span_short());
+        }
         let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
         let slots = boot.slots;
         tracing::info!(
@@ -1164,7 +1176,9 @@ impl<B: Serve> Shell<B> {
             segment_chunks,
             kv_budget,
             room,
-            "the chunk pool is sized to its budget or what the weights and the working set leave"
+            rungs = ?act_chunks,
+            "the chunk pool is sized to its budget or what the weights and the working set leave; \
+             a fire's activation takes its top chunks"
         );
         // The ledger's capacity is what the device has, measured once the
         // context, the weights and every load-time reservation are up;
@@ -1180,7 +1194,7 @@ impl<B: Serve> Shell<B> {
         let host_chunks =
             host_kv_budget.map_or(0, |bytes| u32::try_from(bytes / chunk).unwrap_or(u32::MAX));
         let rs_at = rows.rs.clone();
-        let mut pools = Pools::reserve(&device, rows, layout, paging, host_chunks)?;
+        let mut pools = Pools::reserve(&device, rows, layout, paging, host_chunks, act_chunks)?;
         let row_caches = crate::store::rows::RowCaches::new(
             &device,
             &boot.trace,
@@ -1191,8 +1205,14 @@ impl<B: Serve> Shell<B> {
         )?;
         let expert_caches =
             crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
-        // The null chunk's segment stands from the load on.
+        // The null chunk's segment and the span's stand from the load on.
         pools.commit_segments(&device, 1)?;
+        {
+            let (buffer, end): (&B::Buffer, u64) = pools.span_place().ok_or_else(|| Fault::Unbound {
+                what: "the pool's last segment, which its first commit backs".to_string(),
+            })?;
+            span.place(buffer.clone(), end)?;
+        }
         let rs_buffers =
             rs_at.map(|at| crate::rs::Buffers::in_pool(at.plane_at, at.tokens, pools.rs_stride()));
 
@@ -1213,11 +1233,10 @@ impl<B: Serve> Shell<B> {
             compiled,
             budgets,
             weights,
-            arena,
+            span,
             pools,
             row_caches,
             expert_caches,
-            scratch,
             inputs,
             readout,
             out_width,
@@ -1456,7 +1475,7 @@ impl<B: Serve> Shell<B> {
             }));
             first += shape.count.div_ceil(per);
         }
-        if first > layout.total_chunks {
+        if first > layout.total_chunks - self.pools.span_chunks() {
             tracing::warn!(
                 chunks = first,
                 total = layout.total_chunks,
@@ -1754,7 +1773,7 @@ impl<B: Serve> Shell<B> {
     pub fn footprint(&self) -> (u64, u64, u64, u64) {
         (
             self.weights.bytes(),
-            self.arena.bytes(),
+            self.span.bytes(),
             self.pools.bytes(),
             self.inputs.iter().map(Inputs::bytes).sum::<u64>()
                 + self.readout.iter().map(B::Buffer::bytes).sum::<u64>(),
@@ -2157,7 +2176,7 @@ impl<B: Serve> Shell<B> {
                 have: into.bytes(),
             });
         }
-        frame.copy(self.arena.store(), at, into, 0, bytes)?;
+        frame.copy(self.span.buffer()?, at, into, 0, bytes)?;
         self.pixel_spans(p)
     }
 
@@ -3278,19 +3297,19 @@ impl<B: Serve> Shell<B> {
                 have: readouts_ceiling,
             });
         }
-        let slots = self.arena.slots(
-            &self.handles,
-            &self.compiled.arena,
-            FireRows {
-                tokens: u64::from(rows),
-                lanes: u64::from(lane_count),
-                patches: u64::from(composition.patch_rows()),
-                images: u64::from(composition.images()),
-                voxels: u64::from(composition.voxel_widest()),
-                clips: u64::from(composition.clips()),
-                readouts,
-            },
-        )?;
+        let fire_rows = FireRows {
+            tokens: u64::from(rows),
+            lanes: u64::from(lane_count),
+            patches: u64::from(composition.patch_rows()),
+            images: u64::from(composition.images()),
+            voxels: u64::from(composition.voxel_widest()),
+            clips: u64::from(composition.clips()),
+            readouts,
+        };
+        // The narrowest rung that holds the fire: its carve at its fixed
+        // place under the span's end.
+        let rung = self.span.rung_of(fire_rows);
+        let slots = self.span.slots(&self.handles, rung, fire_rows)?;
         let caches = self.pools.table(
             &self.handles,
             &self.inputs[arm].seats(&self.handles, &bound, pages, rows, lane_count),
@@ -3452,6 +3471,7 @@ impl<B: Serve> Shell<B> {
             tables,
             windows,
             slots,
+            rung,
             caches,
             bindings,
             demand,
@@ -3484,7 +3504,7 @@ impl<B: Serve> Shell<B> {
                 p.bindings.clone(),
                 &p.windows,
                 &place,
-                &self.scratch,
+                self.span.scratch(p.rung)?,
                 self.weights.hashes(),
                 &self.tuning,
                 self.tier,
@@ -3589,6 +3609,8 @@ pub struct Prepared<'a, B: Serve> {
     tables: Vec<std::borrow::Cow<'a, [u32]>>,
     pub windows: Windows,
     pub slots: SlotTable,
+    /// The activation rung the fire takes ([`crate::arena::Span::rung_of`]).
+    pub rung: usize,
     pub caches: CacheTable,
     pub bindings: FireBindings,
     demand: Demand,
@@ -3893,7 +3915,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 let bytes = u64::from(span.rows) * row_bytes;
                 for (layer, base) in layers.iter().enumerate() {
                     frame.copy(
-                        self.arena.store(),
+                        self.span.buffer()?,
                         base + u64::from(span.first) * row_bytes,
                         &self.readout[prepared.arm],
                         span.at + layer as u64 * bytes,
@@ -3912,7 +3934,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                     u64::try_from(token_row).unwrap_or(0)
                 };
                 frame.copy(
-                    self.arena.store(),
+                    self.span.buffer()?,
                     layers[0] + at * row_bytes,
                     &self.readout[prepared.arm],
                     span.at + u64::from(k) * row_bytes,

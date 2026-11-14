@@ -8,7 +8,7 @@ use poem_ir::{Def, Dim, Dtype, GeomKind, Node, RuntimeInput, StructKind, Ty, Val
 use crate::backend::Backend;
 use crate::dispatch::copy::CopyPlan;
 use crate::handles::Handles;
-use crate::scratch::Scratch;
+use crate::scratch::FireScratch;
 use crate::window::{Window, Windows};
 
 use crate::store::RecurrentPool;
@@ -174,7 +174,7 @@ pub struct Run<'c, B: Backend> {
 
     copy: CopyPlan,
 
-    scratch: &'c Scratch<B>,
+    scratch: FireScratch<'c, B>,
 
     hashes: &'c crate::weights::NgramHashes<B>,
 
@@ -207,7 +207,7 @@ impl<'c, B: Backend> Run<'c, B> {
         fire: FireBindings,
         windows: &'c Windows,
         place: &'c At,
-        scratch: &'c Scratch<B>,
+        scratch: FireScratch<'c, B>,
         hashes: &'c crate::weights::NgramHashes<B>,
         tuning: &'c B::Tuning,
         tier: kernels_slang::Tier,
