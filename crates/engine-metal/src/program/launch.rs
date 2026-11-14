@@ -503,8 +503,8 @@ impl Grouped {
         let base = GroupLayout {
             lane_count: GROUPED_LANES,
             value_count: u32::try_from(plan.value_types.len()).unwrap_or(u32::MAX),
-            scratch_stride: u32::try_from(scratch_layout.total).unwrap_or(u32::MAX),
-            temporary_offset: u32::try_from(scratch_layout.temporary).unwrap_or(u32::MAX),
+            scratch_stride: lane_word(LANE_SCRATCH, scratch_layout.total)?,
+            temporary_offset: lane_word(LANE_TEMPORARY, scratch_layout.temporary)?,
             vocab: 0,
             reserved0: stride,
             reserved1: 1,
@@ -604,6 +604,22 @@ impl Grouped {
         }
         Ok(())
     }
+}
+
+const LANE_SCRATCH: &str = "bytes of one lane's value scratch (the kernels' `uint scratch_stride`)";
+const LANE_TEMPORARY: &str =
+    "bytes before one lane's temporaries (the kernels' `uint temporary_offset`)";
+
+/// A lane's scratch extent as the generated kernels' layout word holds it:
+/// a `uint`, refused past one. A lane's base is `ulong(lane) * ulong(stride)`
+/// in every generated kernel, so a batch of lanes addresses as far as the
+/// region its scratch is taken from (`GuestCarve::take` refuses past that).
+fn lane_word(what: &'static str, bytes: u64) -> Result<u32> {
+    u32::try_from(bytes).map_err(|_| Fault::Ceiling {
+        what,
+        need: bytes,
+        have: u64::from(u32::MAX),
+    })
 }
 
 /// Where a fire's value scratch lies: the activation span's guest region,
@@ -1011,10 +1027,8 @@ impl Prepared {
                 format!("this fire's scratch does not fit: {why:?}"),
             )
         })?;
-        let scratch_stride = u32::try_from(scratch_layout.total)
-            .map_err(|_| Fault::program("program::launch", "a scratch stride past a u32"))?;
-        let temporary_offset = u32::try_from(scratch_layout.temporary)
-            .map_err(|_| Fault::program("program::launch", "a temporary offset past a u32"))?;
+        let scratch_stride = lane_word(LANE_SCRATCH, scratch_layout.total)?;
+        let temporary_offset = lane_word(LANE_TEMPORARY, scratch_layout.temporary)?;
 
         let mut records = Vec::with_capacity(plan.ops.len());
         let pitch = plan.output_pitch as usize;
@@ -2566,6 +2580,22 @@ fn records_bytes<T: Copy>(records: &[T]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lane's scratch past a `uint` is refused by name, not clamped: the
+    /// kernels' layout word would hold another stride than the one laid.
+    #[test]
+    fn a_lane_scratch_past_a_uint_is_refused_by_name() {
+        assert_eq!(
+            lane_word(LANE_SCRATCH, u64::from(u32::MAX)).ok(),
+            Some(u32::MAX)
+        );
+        let refused = lane_word(LANE_SCRATCH, 1 << 32).expect_err("past a uint");
+        assert!(
+            matches!(refused, Fault::Ceiling { what, need, .. }
+                if what == LANE_SCRATCH && need == 1 << 32),
+            "{refused}"
+        );
+    }
 
     #[test]
     fn launch_every_case() {

@@ -695,6 +695,9 @@ fn routed_point(op: &'static str, bank: Bank, biased: bool) -> Result<&'static s
 }
 
 fn routed_bank(op: &'static str, x: Tensor, bank: Bank) -> Result<(), Error> {
+    // A routed kernel steps an expert's rows at the contraction (its `ld`
+    // may name the whole expert as one row).
+    crate::linear::qmm::addressable(op, x.width)?;
     if bank.affine() {
         debug_assert_eq!(
             bank.scales.dtype, x.dtype,

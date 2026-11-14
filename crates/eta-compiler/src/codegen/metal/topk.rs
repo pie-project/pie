@@ -61,7 +61,7 @@ pub const SIGNATURE: &str = r#"(
   const device M1OpParams* lane_params =
       params + dispatch_lane * layout->reserved2;
   device uchar* scratch =
-      all_scratch + dispatch_lane * layout->scratch_stride;
+      all_scratch + ulong(dispatch_lane) * ulong(layout->scratch_stride);
   device uchar* temporary = scratch + layout->temporary_offset;
 "#;
 

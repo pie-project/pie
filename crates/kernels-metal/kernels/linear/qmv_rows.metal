@@ -207,9 +207,9 @@ METAL_FUNC void qmv_rows_impl(
 
   constexpr bool UNPACKED_ROAD = bits == 4 && packs_per_thread == 1 && R == 4;
 
-  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  ws += int64_t(out_row) * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += int64_t(out_row) * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += int64_t(out_row) * in_vec_size_g + simd_lid / scale_step_per_thread;
 
   const device T* xb = x + simd_lid * values_per_thread;
   int roff[R];

@@ -69,3 +69,37 @@ fn every_emitted_kernel_is_a_source_or_a_reason() {
         );
     }
 }
+
+/// A lane's value scratch starts `lane × stride` bytes in: a 64-bit product
+/// in every Metal kernel that seats one, so a batch's scratch past 4 GiB is
+/// not read at its offset modulo 2^32.
+#[test]
+fn every_metal_lane_scratch_base_is_a_64_bit_product() {
+    let mut seated = 0;
+    for (trace, backend, kernel) in every_emitted_kernel() {
+        if backend != Backend::Metal || !kernel.source.contains("all_scratch") {
+            continue;
+        }
+        seated += 1;
+        assert!(
+            kernel
+                .source
+                .contains("all_scratch + ulong(dispatch_lane) * ulong(layout->scratch_stride)"),
+            "{trace} stage {} region {} ({}): the lane's scratch base is not a 64-bit product",
+            kernel.stage_index,
+            kernel.region_index,
+            kernel.entry_name
+        );
+        assert!(
+            !kernel
+                .source
+                .contains("dispatch_lane * layout->scratch_stride"),
+            "{trace} {}: a 32-bit lane scratch product remains",
+            kernel.entry_name
+        );
+    }
+    assert!(
+        seated > 0,
+        "the corpus emits Metal kernels that seat scratch"
+    );
+}
