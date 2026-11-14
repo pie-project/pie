@@ -1364,6 +1364,13 @@ impl Shell {
     #[allow(unsafe_code)]
     pub fn set_rung(&mut self, from: u32, to: u32) -> Result<()> {
         let reach = self.arena.rung_reach(to);
+        if crate::diag::on().tier_trace {
+            eprintln!(
+                "residency: rung {from} -> {to}, the carve {reach} bytes from the span's top \
+                 (span backed {})",
+                self.pools.span_held_bytes()
+            );
+        }
         if to >= from {
             return self.pools.cover(reach);
         }
