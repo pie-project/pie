@@ -33,6 +33,9 @@ pub struct SharedGrow {
     /// The tick since which the rung has stood past what is asked: a cap
     /// down or a lower waits the governor's patience from it.
     idle_since: Arc<std::sync::Mutex<Option<u64>>>,
+    /// The last raise found no room: none is tried again until room is
+    /// freed ([`Self::room_freed`]), the one event that can change that.
+    raise_blocked: Arc<AtomicBool>,
 }
 
 impl SharedGrow {
@@ -51,6 +54,7 @@ impl SharedGrow {
             rung_walk: Arc::new(std::sync::Mutex::new(RungWalk::default())),
             ticks: Arc::new(AtomicU64::new(0)),
             idle_since: Arc::new(std::sync::Mutex::new(None)),
+            raise_blocked: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -112,7 +116,11 @@ impl SharedGrow {
                 );
                 // A raise is taken in the hold it was planned in: no slot is
                 // handed out between, and the engine's copy follows.
+                let blocked = self.raise_blocked.load(Ordering::Acquire);
                 let step = match step {
+                    // A raise refused for room is not tried again until
+                    // room is freed.
+                    Ok(RungStep::Raise { .. }) | Err(_) if blocked => Ok(RungStep::Wait),
                     Ok(RungStep::Raise { rung, evacuation }) => pool
                         .raise_applied(&evacuation)
                         .map(|()| RungStep::Raise { rung, evacuation }),
@@ -134,7 +142,9 @@ impl SharedGrow {
                 Ok(step) => step,
                 Err(error) => {
                     // The pass asking funds the room as a planner waiter
-                    // (`pipeline::fire`'s raise funding).
+                    // (`pipeline::fire`'s raise funding); the walk tries
+                    // again once room is freed, not on its next wake.
+                    self.raise_blocked.store(true, Ordering::Release);
                     tracing::debug!(engine = self.engine, %error, goal, "the activation rung waits");
                     return;
                 }
@@ -237,6 +247,19 @@ impl SharedGrow {
     #[must_use]
     pub fn shared(&self) -> &Shared {
         &self.shared
+    }
+
+    /// Room was freed (a fire retired, a slot let go): a raise refused for
+    /// room may be tried again, and the walk looks now.
+    pub fn room_freed(&self) {
+        self.raise_blocked.store(false, Ordering::Release);
+        self.wake.notify_one();
+    }
+
+    /// The walk's last raise was refused for room; for a test.
+    #[cfg(test)]
+    pub(crate) fn block_raise_for_test(&self) {
+        self.raise_blocked.store(true, Ordering::Release);
     }
 
     /// Looks again now: a waiter is short.
@@ -522,5 +545,28 @@ mod tests {
             "cut before any tick: {}",
             super::super::fire_cap(ENGINE)
         );
+    }
+
+    /// A raise the walk found no room for is not tried again on its next
+    /// wake (a governor tick), only once room is freed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_raise_refused_for_room_waits_for_room_freed_not_the_next_walk() {
+        const ENGINE: usize = 52;
+        let mut pool = super::super::tests::pool();
+        pool.lower_rung(16).unwrap();
+        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+        let mut grow = SharedGrow::new(0, ENGINE, shared.clone());
+        let _want = super::super::want_rows(ENGINE, 2048);
+        grow.block_raise_for_test();
+        grow.ticked();
+        grow.walk_rung().await;
+        assert_eq!(
+            shared.lock().unwrap().rung(),
+            16,
+            "blocked: not tried again"
+        );
+        grow.room_freed();
+        grow.walk_rung().await;
+        assert_eq!(shared.lock().unwrap().rung(), 2048, "room freed: raised");
     }
 }

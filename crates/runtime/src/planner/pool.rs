@@ -311,7 +311,7 @@ impl PoolPort for RegistryPool {
         crate::store::shared::rung_changed(self.engine);
         crate::scheduler::arming::room_freed(self.engine);
         if let Some(shared) = &self.shared {
-            shared.wake();
+            shared.room_freed();
         }
     }
 
