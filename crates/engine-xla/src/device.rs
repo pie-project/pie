@@ -31,6 +31,9 @@ pub struct Device {
     /// a serving fire missing the ladder.
     sealed: std::sync::atomic::AtomicBool,
     misses: std::sync::atomic::AtomicU64,
+    /// Where a program a serving fire waits on is counted, from the end of
+    /// the load on ([`Device::report_to`]).
+    live: std::sync::OnceLock<engine::live::Live>,
     /// The largest temp of any program compiled or loaded, and of the
     /// load's own at its seal: the runtime's one temp reservation is the
     /// largest loaded program's, so a later program adds only its excess.
@@ -101,6 +104,7 @@ impl Device {
             cache: Mutex::new(HashMap::new()),
             sealed: std::sync::atomic::AtomicBool::new(false),
             misses: std::sync::atomic::AtomicU64::new(0),
+            live: std::sync::OnceLock::new(),
             temp_max: std::sync::atomic::AtomicU64::new(0),
             sealed_temp: std::sync::atomic::AtomicU64::new(0),
             dump: std::env::var_os("PIE_XLA_DUMP").map(PathBuf::from),
@@ -139,6 +143,7 @@ impl Device {
             cache: Mutex::new(HashMap::new()),
             sealed: std::sync::atomic::AtomicBool::new(false),
             misses: std::sync::atomic::AtomicU64::new(0),
+            live: std::sync::OnceLock::new(),
             temp_max: std::sync::atomic::AtomicU64::new(0),
             sealed_temp: std::sync::atomic::AtomicU64::new(0),
             dump: std::env::var_os("PIE_XLA_DUMP").map(PathBuf::from),
@@ -282,6 +287,9 @@ impl Device {
         let key = *blake3::hash(text.as_bytes()).as_bytes();
         if let Some(hit) = self.cache.lock().expect("cache lock poisoned").get(&key) {
             return Ok(Arc::clone(hit));
+        }
+        if serving && let Some(live) = self.live.get() {
+            live.tally(engine::live::Tally::Compiled, 1);
         }
         if serving && self.sealed.load(std::sync::atomic::Ordering::Relaxed) {
             // Serving fires run programs the warm ladder prepared: one built
@@ -453,6 +461,12 @@ impl Device {
         } else {
             self.temp_max.load(std::sync::atomic::Ordering::Relaxed)
         }
+    }
+
+    /// From now on every program a serving fire waits on (built, or loaded
+    /// from the disk cache) is counted in `live`, prewarmed or not.
+    pub fn report_to(&self, live: engine::live::Live) {
+        let _ = self.live.set(live);
     }
 
     /// Programs wanted after [`Device::seal`] that the ladder had not built.
