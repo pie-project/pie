@@ -43,7 +43,6 @@ struct PullLane {
     u32 ticket_offset;
     u32 ticket_count;
     u32 initial_commit;
-    u32 diagnose;
 };
 static_assert(sizeof(PullLane) == 32, "PullLane ABI");
 
@@ -161,17 +160,7 @@ __global__ void pull_validate(const Ticket* __restrict__ tickets, const PullLane
         const Ticket ticket = tickets[lane.ticket_offset + index];
         u64 head = 0, tail = 0;
         if (!ticket_holds(ticket, head, tail)) {
-            if (within == 0) {
-                if (lane.diagnose != 0) {
-                    printf("[kernels-rocm] pull-validate reject: slot=%u flags=0x%x head=%llu tail=%llu "
-                           "expected_head=%llu expected_tail=%llu cap1=%u\n",
-                           ticket.slot, ticket.flags, static_cast<unsigned long long>(head),
-                           static_cast<unsigned long long>(tail),
-                           static_cast<unsigned long long>(ticket.expected_head),
-                           static_cast<unsigned long long>(ticket.expected_tail), ticket.cap1);
-                }
-                vetoed = 1;
-            }
+            if (within == 0) vetoed = 1;
             continue;
         }
         if ((ticket.flags & TICKET_HOST_WRITER) == 0 || (ticket.flags & TICKET_CONSUME) == 0) continue;

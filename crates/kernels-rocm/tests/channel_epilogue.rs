@@ -256,7 +256,6 @@ impl Rig {
                 ticket_offset: offset,
                 ticket_count: SLOTS as u32,
                 initial_commit: 1,
-                diagnose: 0,
             });
             spans.push((taken_at, taken.len() - taken_at, put_at, put.len() - put_at));
             bump.push(rings.bump_lane(0, 0, 0, 0, commit));

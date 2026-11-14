@@ -796,7 +796,6 @@ impl Session {
                 ticket_offset: 0,
                 ticket_count: 0,
                 initial_commit: 1,
-                diagnose: 0,
             },
             rings.bump_lane(0, 0, 0, 0, commit),
             PublishLane {
