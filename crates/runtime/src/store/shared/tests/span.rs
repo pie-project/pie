@@ -9,6 +9,7 @@
 //! activation 52..64.
 
 use super::*;
+use crate::governor::PATIENCE;
 use crate::store::shared::programs::{Mover, take_raise};
 
 /// The engine's lane as a raise meets it: the fake engine, shared.
@@ -447,5 +448,130 @@ fn with_the_flag_off_a_pool_starts_at_the_largest_rung() {
     assert_eq!(pool.rung(), 2048);
     assert_eq!(pool.start_cap(), u32::MAX);
     let _grow = SharedGrow::new(0, ENGINE, Arc::new(Mutex::new(pool)));
+    assert_eq!(fire_cap(ENGINE), u32::MAX);
+}
+
+/// Every power of two from 1 to 2048, the span backed on demand.
+fn fine_on_demand() -> (SharedPool, FakeEngine) {
+    let mut facts = facts();
+    facts.span_backed_on_demand = true;
+    facts.act_chunks = (0..12).map(|k| (1u32 << k, 1 + k)).collect();
+    (
+        SharedPool::new(&facts, 256).unwrap(),
+        FakeEngine::on_demand(),
+    )
+}
+
+/// Mac's footprint at rest: on an on-demand pool with one live lane, a
+/// 5-token pass raises the rung to the smallest that covers it (8), not to
+/// the engine's whole lane count; idle again, the pool comes back down
+/// after the governor's patience, the carve held costing resident memory.
+#[tokio::test(flavor = "current_thread")]
+async fn a_small_pass_raises_to_the_rung_covering_it_and_an_idle_pool_lowers_after_patience() {
+    const ENGINE: usize = 54;
+    let (mut pool, mut engine) = fine_on_demand();
+    pool.set_max_lanes(512);
+    assert_eq!(
+        walk_segments(&mut pool, 6, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.rung(), 1);
+    engine.calls.clear();
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+    assert_eq!(fire_cap(ENGINE), 1);
+    grant_rung(ENGINE, u32::MAX);
+    // Idle with one live lane: the walk holds the floor, no raise.
+    grow.walk_rung().await;
+    assert_eq!(
+        shared.lock().unwrap().rung(),
+        1,
+        "not the engine's 512 lanes"
+    );
+
+    // The pass: 5 rows, cut narrower by the cap, ask the rung covering them.
+    assert!(pass_asks(5, 5, fire_cap(ENGINE)));
+    assert!(!pass_asks(5, 5, 8), "a cap that covers it: no ask");
+    let want = want_rows(ENGINE, 5);
+    let engine = Arc::new(Mutex::new(engine));
+    let taken = take_raise(
+        &shared,
+        |pool| rung_goal(pool, ENGINE, wanted_rows(ENGINE)),
+        &Lane(engine.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(taken.is_some());
+    assert_eq!(engine.lock().unwrap().calls, [Call::Rung(1, 8)]);
+    raise_now(&shared, ENGINE, 5);
+    assert_eq!(
+        shared.lock().unwrap().rung(),
+        8,
+        "the smallest rung covering 5"
+    );
+    assert_eq!(fire_cap(ENGINE), 8);
+
+    // The pass is through: the pool stays up until the patience is out.
+    drop(want);
+    for _ in 0..PATIENCE {
+        grow.ticked_for_test();
+        grow.walk_rung().await;
+        assert_eq!(fire_cap(ENGINE), 8);
+    }
+    grow.ticked_for_test();
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), 1, "past the patience: fires cut back");
+    grant_rung(ENGINE, 1);
+    grow.walk_rung().await;
+    grow.walk_rung().await;
+    assert_eq!(shared.lock().unwrap().rung(), 1, "lowered back");
+    assert_eq!(shared.lock().unwrap().pool().act_reserved(), 1);
+}
+
+/// The 8B c256 hang (decodes cut at a low cap, waiting on a raise nobody
+/// funds) cannot come back: the walk never lowers the rung under the
+/// decode fire the live lanes take, however long the pool idles, so a
+/// decode batch of every live lane is never held for a raise; and a batch
+/// past it is raised at once where nothing moves.
+#[tokio::test(flavor = "current_thread")]
+async fn the_walk_never_lowers_under_the_live_lanes_decode() {
+    const ENGINE: usize = 53;
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 200);
+    assert_eq!(fire_cap(ENGINE), u32::MAX);
+    for _ in 0..3 * PATIENCE {
+        grow.ticked_for_test();
+        grant_rung(ENGINE, fire_cap(ENGINE));
+        grow.walk_rung().await;
+        assert!(fire_cap(ENGINE) >= 200, "a 200-lane decode is never cut");
+    }
+    assert_eq!(
+        shared.lock().unwrap().rung(),
+        256,
+        "down to the live lanes' rung"
+    );
+    // The batch of every live lane asks: nothing to raise, nothing held.
+    raise_now(&shared, ENGINE, 200);
+    assert_eq!(fire_cap(ENGINE), 256);
+    // State takes the span the rung lent; a batch past the live lanes is
+    // raised at once once nothing lies in its span.
+    let all = {
+        let mut pool = shared.lock().unwrap();
+        let n = pool.records_available() as usize;
+        pool.take_records(n).unwrap()
+    };
+    {
+        let mut pool = shared.lock().unwrap();
+        pool.give_records(&all);
+        pool.pool_mut().retire_through(u64::MAX);
+    }
+    raise_now(&shared, ENGINE, 300);
+    assert_eq!(shared.lock().unwrap().rung(), 2048);
     assert_eq!(fire_cap(ENGINE), u32::MAX);
 }
