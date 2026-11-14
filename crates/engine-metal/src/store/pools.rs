@@ -667,6 +667,23 @@ impl Pools {
             layout.act_span(),
             super::pool::part_cap(device),
         )?;
+        // A page id carries its slot in its buffer under the buffer index:
+        // a buffer may hold no more slots of a shape than those bits count.
+        if pool.parts() > 1 {
+            let room = 1u64 << super::pool::PART_SHIFT;
+            if let Some(slots) = layout
+                .shapes()
+                .find(|slots| u64::from(slots.per_chunk) * u64::from(pool.part_chunks()) >= room)
+            {
+                return Err(Fault::Residency(format!(
+                    "a buffer of {} chunks holds {} slots of {} bytes, and a page id \
+                     addresses {room} a buffer",
+                    pool.part_chunks(),
+                    u64::from(slots.per_chunk) * u64::from(pool.part_chunks()),
+                    slots.slot_bytes
+                )));
+            }
+        }
         let list_slots = layout.list.map_or(0, |list| {
             u64::from(list.per_chunk) * u64::from(layout.total_chunks)
         });
