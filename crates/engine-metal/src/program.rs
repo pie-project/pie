@@ -1069,12 +1069,87 @@ mod tests {
                 &pools,
                 &engine::Rebind::Instance {
                     id: pooled,
-                    instance: fresh_instance,
-                    rings: fresh_rings,
+                    instance: fresh_instance.clone(),
+                    rings: fresh_rings.clone(),
                 },
             )
             .expect("the slots rebind");
         assert_eq!(peak(&mut plane, 456), vec![456, 456]);
+
+        // Park to the host tier and back, as a process parked under pressure
+        // is: the Instance and Channel slots copy out whole, the device
+        // slots are zeroed, and they copy back into the first refs.
+        pools.seat_tier(2 * CHUNK);
+        let to_host = |shape, slots: &[u32], first: u32| engine::chunk::SlotCopy {
+            shape,
+            src: engine::MemoryDomain::MetalShared,
+            dst: engine::MemoryDomain::HostPinned,
+            slots: slots
+                .iter()
+                .enumerate()
+                .map(|(at, &slot)| (slot, first + at as u32))
+                .collect(),
+            runs: Vec::new(),
+        };
+        let from_host = |copy: &engine::chunk::SlotCopy, back: &[u32]| engine::chunk::SlotCopy {
+            shape: copy.shape,
+            src: engine::MemoryDomain::HostPinned,
+            dst: engine::MemoryDomain::MetalShared,
+            slots: copy
+                .slots
+                .iter()
+                .zip(back)
+                .map(|(&(_, host), &slot)| (host, slot))
+                .collect(),
+            runs: Vec::new(),
+        };
+        let mut parked = vec![to_host(INSTANCE, &fresh_instance, 0)];
+        let mut back = vec![instance.clone()];
+        for (at, (ring, fresh)) in rings.iter().zip(&fresh_rings).enumerate() {
+            parked.push(to_host(
+                CHANNEL,
+                &fresh.slots,
+                per_channel + at as u32 * fresh.slots.len() as u32,
+            ));
+            back.push(ring.slots.clone());
+        }
+        let mut frame = context.frame().expect("a frame");
+        for copy in &parked {
+            pools.copy_slots(&mut frame, copy).expect("the slots park");
+        }
+        frame.commit().expect("nothing in flight");
+        let mut frame = context.frame().expect("a frame");
+        pools
+            .copy_shape(
+                &mut frame,
+                INSTANCE,
+                &blanks(&fresh_instance, blank_instance),
+            )
+            .expect("the parked tables zero");
+        for fresh in &fresh_rings {
+            pools
+                .copy_shape(&mut frame, CHANNEL, &blanks(&fresh.slots, blank_channel))
+                .expect("the parked ring zeroes");
+        }
+        frame.commit().expect("the zeroes land");
+        let mut frame = context.frame().expect("a frame");
+        for (copy, back) in parked.iter().zip(&back) {
+            pools
+                .copy_slots(&mut frame, &from_host(copy, back))
+                .expect("the slots unpark");
+        }
+        frame.commit().expect("nothing in flight");
+        plane
+            .rebind_slots(
+                &pools,
+                &engine::Rebind::Instance {
+                    id: pooled,
+                    instance,
+                    rings,
+                },
+            )
+            .expect("the slots rebind");
+        assert_eq!(peak(&mut plane, 789), vec![789, 789]);
     }
 
     /// A ring whose cell is past a Channel slot lies in one run of adjacent
