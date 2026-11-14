@@ -114,6 +114,36 @@ impl Arena {
         &self.rungs[at].1
     }
 
+    /// The smallest rung's tokens: where the runtime starts an on-demand
+    /// pool's rung.
+    #[must_use]
+    pub fn floor_tokens(&self) -> u32 {
+        self.rungs.first().map_or(1, |(tokens, _)| *tokens)
+    }
+
+    /// Where the span ends in its buffer: the plane's end.
+    #[must_use]
+    pub fn end(&self) -> u64 {
+        self.end
+    }
+
+    /// Where a fire of `rows` lays its guests' scratch from, down: under
+    /// its own carve.
+    #[must_use]
+    pub fn guest_top(&self, rows: FireRows) -> u64 {
+        self.scratch_at() - room(self.carve_for(rows).bytes)
+    }
+
+    /// [`Arena::guest_top`] of the widest fire a rung of `tokens` carries.
+    #[must_use]
+    pub fn rung_guest_top(&self, tokens: u32) -> u64 {
+        self.guest_top(FireRows {
+            tokens: u64::from(tokens),
+            lanes: u64::from(tokens),
+            ..FireRows::default()
+        })
+    }
+
     /// The bytes from the span's end a fire of `rows` takes: the scratch
     /// plane and its carve.
     #[must_use]

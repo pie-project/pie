@@ -115,6 +115,21 @@ impl Session {
     /// The bind-time tables an instance of `compiled` takes, every
     /// launching stage's in order.
     #[must_use]
+    /// The value scratch one lane of the program takes in a fire at
+    /// `extents`: the widest launching stage's. Stages fire one after
+    /// another in one serial pass order and none reads another's scratch
+    /// (values cross stages through channels), so one stage's room serves
+    /// every stage of the fire.
+    pub fn scratch_for(compiled: &Compiled, extents: &Extents) -> Result<u64> {
+        let mut widest = 0;
+        for (index, plan) in compiled.plans.iter().enumerate() {
+            if launches(compiled, index) {
+                widest = widest.max(Prepared::scratch_for(plan, extents)?);
+            }
+        }
+        Ok(widest)
+    }
+
     pub fn table_sizes(compiled: &Compiled) -> Vec<u64> {
         compiled
             .plans
@@ -402,6 +417,7 @@ impl Session {
         compiled: &Compiled,
         plan: &ExecPlan,
         at: Stage,
+        carve: &super::GuestCarve,
     ) -> Result<Fired> {
         if self.airborne.is_some() {
             return Err(Fault::program(
@@ -425,6 +441,15 @@ impl Session {
                 continue;
             };
             prepared.refresh(&self.rings, &cursors)?;
+            // Its scratch from the guest region's top, zeroed on the GPU on
+            // the one queue, after whatever frame still reads the span.
+            prepared.seat_scratch(carve.clone().take(prepared.scratch_bytes())?);
+            #[cfg(target_vendor = "apple")]
+            {
+                let mut frame = device.frame()?;
+                prepared.zero_scratch_on(&mut frame)?;
+                frame.commit()?;
+            }
             for region in stage.regions.iter() {
                 prepared.launch_region(device, pipelines, &self.rings, region)?;
             }

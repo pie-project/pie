@@ -10,7 +10,6 @@ use eta_exec::{
 use eta_ir::Dtype;
 use eta_ir::op::tags;
 
-use crate::device::alloc::DeferredZeroBuffer;
 use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context};
 use crate::error::{Fault, Result};
@@ -599,6 +598,15 @@ impl Grouped {
     }
 }
 
+/// Where a fire's value scratch lies: the activation span's guest region,
+/// laid per fire under the model's carve (REDESIGN 3, guest programs), or
+/// nowhere before a fire seats it.
+#[derive(Debug, Clone)]
+pub struct ScratchAt {
+    pub buffer: Buffer,
+    pub offset: u64,
+}
+
 #[derive(Debug)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub struct Prepared {
@@ -608,7 +616,10 @@ pub struct Prepared {
     descriptors: Held,
     params: Held,
     offsets: Held,
-    scratch: DeferredZeroBuffer,
+    /// The value scratch this fire seated ([`Prepared::seat_scratch`]),
+    /// `scratch_bytes` of it.
+    scratch: Option<ScratchAt>,
+    scratch_bytes: u64,
     /// By output slot ([`eta_ir::op::output_slot`]): how the stage reads it,
     /// what is bound there and its table entry.
     reads: Vec<Option<Read>>,
@@ -868,8 +879,36 @@ impl Prepared {
                 .into_iter()
                 .map(Held::own_bytes)
                 .sum::<u64>()
-            + self.scratch.bytes()
             + self.grouped.as_ref().map_or(0, Grouped::bytes)
+    }
+
+    /// The value scratch one lane of a stage of `plan` takes in a fire at
+    /// `extents`: its stride, aligned, as [`Prepared::build`] lays it.
+    pub fn scratch_for(plan: &LaunchStagePlan, extents: &Extents) -> Result<u64> {
+        let descriptors: Vec<ValueDesc> = plan
+            .value_types
+            .iter()
+            .map(|value| {
+                describe(value, extents).map_err(|why| {
+                    Fault::program(
+                        "program::launch",
+                        format!("a value's shape does not resolve against these extents: {why:?}"),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let total = layout(&descriptors)
+            .map_err(|why| {
+                Fault::program(
+                    "program::launch",
+                    format!("a stage's scratch does not fit: {why:?}"),
+                )
+            })?
+            .total;
+        Ok(u64::try_from(total)
+            .unwrap_or(u64::MAX)
+            .max(SCRATCH_ALIGN)
+            .next_multiple_of(SCRATCH_ALIGN))
     }
 
     /// The bind-time tables a stage of `plan` takes, in the order `build`
@@ -1016,8 +1055,9 @@ impl Prepared {
         let mut offsets = tables.take(offset_bytes.len().max(size_of::<u32>()) as u64)?;
         offsets.write(0, &offset_bytes)?;
 
-        let scratch_bytes = u64::from(scratch_stride).max(SCRATCH_ALIGN);
-        let scratch = DeferredZeroBuffer::new(device, scratch_bytes)?;
+        let scratch_bytes = u64::from(scratch_stride)
+            .max(SCRATCH_ALIGN)
+            .next_multiple_of(SCRATCH_ALIGN);
         let status = Buffer::zeroed(device, eta_exec::STATUS_BYTES as u64)?;
 
         let lanes = LaneShape::of(
@@ -1042,7 +1082,8 @@ impl Prepared {
             descriptors: descriptor_buffer,
             params,
             offsets,
-            scratch,
+            scratch: None,
+            scratch_bytes,
             reads,
             outputs: vec![None; pitch],
             seats: vec![OutputSeat::default(); pitch],
@@ -1085,24 +1126,39 @@ impl Prepared {
     }
 
     pub fn refresh(&mut self, rings: &Rings, cursors: &[Cursor]) -> Result<()> {
-        self.refresh_cells(rings, cursors)?;
-        if scratch_zeroing_skipped() {
-            return Ok(());
-        }
-        self.scratch.clear()
+        self.refresh_cells(rings, cursors)
     }
 
-    pub fn zero_scratch(&mut self) -> Result<()> {
-        self.scratch.clear()
+    /// The value scratch one fire of this stage takes: its stride, aligned.
+    #[must_use]
+    pub fn scratch_bytes(&self) -> u64 {
+        self.scratch_bytes
     }
 
+    /// Seats this fire's value scratch at `at` (the guest region under the
+    /// fire's model carve); a later fire seats its own.
+    pub fn seat_scratch(&mut self, at: ScratchAt) {
+        self.scratch = Some(at);
+    }
+
+    fn scratch(&self) -> Result<&ScratchAt> {
+        self.scratch.as_ref().ok_or_else(|| {
+            Fault::program(
+                "program::launch",
+                "a stage fired before its fire seated its value scratch in the span",
+            )
+        })
+    }
+
+    /// Zeroes the seated scratch on the GPU, in `frame`, ahead of the
+    /// stage's passes.
     #[cfg(target_vendor = "apple")]
     pub fn zero_scratch_on(&mut self, frame: &mut Frame) -> Result<()> {
         if scratch_zeroing_skipped() {
             return Ok(());
         }
-        let scratch = self.scratch.get()?;
-        frame.fill(scratch.slab(), 0, scratch.bytes())?;
+        let scratch = self.scratch()?.clone();
+        frame.fill(scratch.buffer.slab(), scratch.offset, self.scratch_bytes)?;
         frame.next_pass()?;
         Ok(())
     }
@@ -1222,7 +1278,10 @@ impl Prepared {
 
     pub fn encode_into(&self, frame: &Frame, region: &Region) -> Result<()> {
         match region.form {
-            Form::Fused => self.encode_fused(frame, region, self.scratch.get()?, 0),
+            Form::Fused => {
+                let scratch = self.scratch()?;
+                self.encode_fused(frame, region, &scratch.buffer, scratch.offset)
+            }
             Form::Streamed => self.encode_streamed(frame, region),
             Form::Grouped | Form::GroupedLibrary => self.encode_grouped(frame, region),
         }
@@ -1272,7 +1331,14 @@ impl Prepared {
                     self.offsets.offset() as usize,
                     3,
                 );
-                encoder.setBuffer_offset_atIndex(Some(self.scratch.get()?.raw()), 0, 4);
+                {
+                    let scratch = self.scratch()?;
+                    encoder.setBuffer_offset_atIndex(
+                        Some(scratch.buffer.raw()),
+                        usize::try_from(scratch.offset).unwrap_or(usize::MAX),
+                        4,
+                    );
+                }
                 encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
                 encoder.setBuffer_offset_atIndex(
                     Some(grouped.bindings.raw()),
@@ -1467,7 +1533,14 @@ impl Prepared {
                     self.offsets.offset() as usize,
                     3,
                 );
-                encoder.setBuffer_offset_atIndex(Some(self.scratch.get()?.raw()), 0, 4);
+                {
+                    let scratch = self.scratch()?;
+                    encoder.setBuffer_offset_atIndex(
+                        Some(scratch.buffer.raw()),
+                        usize::try_from(scratch.offset).unwrap_or(usize::MAX),
+                        4,
+                    );
+                }
                 encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
                 encoder.setBuffer_offset_atIndex(
                     Some(grouped.bindings.raw()),
@@ -1601,7 +1674,9 @@ pub struct Batch {
     lane_indices: Buffer,
     row_meta: Buffer,
     row_indices: Buffer,
-    scratch: Buffer,
+    /// This fire's value scratch, seated per fire ([`Batch::seat_scratch`]):
+    /// a stride a member, in the span's guest region.
+    scratch: Option<ScratchAt>,
     addresses: Buffer,
     table_bytes: u64,
     layouts: Vec<Buffer>,
@@ -1623,7 +1698,6 @@ impl Batch {
             &self.lane_indices,
             &self.row_meta,
             &self.row_indices,
-            &self.scratch,
             &self.addresses,
         ]
         .into_iter()
@@ -1695,10 +1769,6 @@ impl Batch {
             device,
             (u64::from(lanes) * u64::from(rows_per_lane) * size_of::<u32>() as u64).max(4),
         )?;
-        let scratch = Buffer::zeroed(
-            device,
-            (u64::from(lanes) * u64::from(template.scratch_stride)).max(SCRATCH_ALIGN),
-        )?;
         let mut layouts = Vec::with_capacity(grouped.layout_words.len());
         for words in &grouped.layout_words {
             let mut buffer = Buffer::zeroed(device, size_of::<GroupLayout>() as u64)?;
@@ -1718,12 +1788,34 @@ impl Batch {
             lane_indices,
             row_meta,
             row_indices,
-            scratch,
+            scratch: None,
             addresses: Buffer::zeroed(device, u64::from(lanes) * table_bytes)?,
             table_bytes,
             layouts,
             layout_words: grouped.layout_words.clone(),
             rows_per_lane,
+        })
+    }
+
+    /// The value scratch a fire of `members` members takes: a stride each.
+    #[must_use]
+    pub fn scratch_bytes(&self, members: u32) -> u64 {
+        (u64::from(members) * u64::from(self.key.scratch_stride))
+            .max(SCRATCH_ALIGN)
+            .next_multiple_of(SCRATCH_ALIGN)
+    }
+
+    /// Seats this fire's value scratch at `at`.
+    pub fn seat_scratch(&mut self, at: ScratchAt) {
+        self.scratch = Some(at);
+    }
+
+    fn scratch(&self) -> Result<&ScratchAt> {
+        self.scratch.as_ref().ok_or_else(|| {
+            Fault::program(
+                "program::launch",
+                "a batch fired before its fire seated its value scratch in the span",
+            )
         })
     }
 
@@ -1759,14 +1851,10 @@ impl Batch {
             0,
             u64::from(count) * u64::from(self.shape.channel_slots_per_lane),
         )?;
+        let scratch = self.scratch()?.clone();
         if !scratch_zeroing_skipped() {
-            #[cfg(target_vendor = "apple")]
-            {
-                frame.fill(self.scratch.slab(), 0, u64::from(count) * stride)?;
-                frame.next_pass()?;
-            }
-            #[cfg(not(target_vendor = "apple"))]
-            self.scratch.zero_span(0, u64::from(count) * stride)?;
+            frame.fill(scratch.buffer.slab(), scratch.offset, u64::from(count) * stride)?;
+            frame.next_pass()?;
         }
         let frame: &Frame = frame;
         let vocab = members[0]
@@ -1853,7 +1941,12 @@ impl Batch {
             match region.form {
                 Form::Fused => {
                     for (index, member) in members.iter().enumerate() {
-                        member.encode_fused(frame, region, &self.scratch, index as u64 * stride)?;
+                        member.encode_fused(
+                            frame,
+                            region,
+                            &scratch.buffer,
+                            scratch.offset + index as u64 * stride,
+                        )?;
                     }
                 }
                 Form::Grouped | Form::GroupedLibrary => {
@@ -1901,7 +1994,14 @@ impl Batch {
                 encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
                 encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
                 encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
-                encoder.setBuffer_offset_atIndex(Some(self.scratch.raw()), 0, 4);
+                {
+                    let scratch = self.scratch()?;
+                    encoder.setBuffer_offset_atIndex(
+                        Some(scratch.buffer.raw()),
+                        usize::try_from(scratch.offset).unwrap_or(usize::MAX),
+                        4,
+                    );
+                }
                 encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
                 encoder.setBuffer_offset_atIndex(Some(self.bindings.raw()), 0, 6);
                 encoder.setBuffer_offset_atIndex(Some(self.pending_flags.raw()), 0, 7);
@@ -2035,7 +2135,14 @@ impl Batch {
                 encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
                 encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
                 encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
-                encoder.setBuffer_offset_atIndex(Some(self.scratch.raw()), 0, 4);
+                {
+                    let scratch = self.scratch()?;
+                    encoder.setBuffer_offset_atIndex(
+                        Some(scratch.buffer.raw()),
+                        usize::try_from(scratch.offset).unwrap_or(usize::MAX),
+                        4,
+                    );
+                }
                 encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
                 encoder.setBuffer_offset_atIndex(Some(self.bindings.raw()), 0, 6);
                 encoder.setBuffer_offset_atIndex(Some(self.pending_flags.raw()), 0, 7);

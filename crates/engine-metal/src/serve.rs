@@ -273,6 +273,9 @@ pub struct Shell {
     ane: Option<crate::ane::Ane>,
     weights: Weights,
     arena: Arena,
+    /// The activation rung the runtime last set (`Engine::set_rung`): its
+    /// carve and the live guests' terms are what the span backs.
+    rung: u32,
     pools: Pools,
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
     rs_buffers: Option<crate::rs::Buffers>,
@@ -1199,6 +1202,7 @@ impl PreparedLoad<'_> {
             budgets,
             ane,
             weights,
+            rung: arena.floor_tokens(),
             arena,
             pools,
             rs_layout,
@@ -1405,7 +1409,7 @@ impl Shell {
     /// carve above it once every frame drains.
     #[allow(unsafe_code)]
     pub fn set_rung(&mut self, from: u32, to: u32) -> Result<()> {
-        let reach = self.arena.rung_reach(to);
+        let reach = self.span_for(to)?;
         if crate::diag::on().tier_trace {
             eprintln!(
                 "residency: rung {from} -> {to}, the carve {reach} bytes from the span's top \
@@ -1414,12 +1418,42 @@ impl Shell {
             );
         }
         if to >= from {
-            return self.pools.cover(reach);
+            self.pools.cover(reach)?;
+            self.rung = to;
+            return Ok(());
         }
         self.drain()?;
         // SAFETY: drained just above, on the one thread that submits; the
         // runtime lowers only once every fire wider than `to` retired.
-        unsafe { self.pools.narrow(reach) }
+        unsafe { self.pools.narrow(reach)? };
+        self.rung = to;
+        Ok(())
+    }
+
+    /// The span's bytes from its end a rung of `to` tokens takes, as the
+    /// runtime counts it: the model's chunks, then one ceil over every live
+    /// (program, extents) pair's term at the lanes such a fire flies.
+    fn span_for(&self, to: u32) -> Result<u64> {
+        let chunk = self.pools.layout().chunk_bytes.max(1);
+        let model = self.arena.rung_reach(to).div_ceil(chunk);
+        let lanes = u64::from(to.min(self.budgets.tokens.max_lanes));
+        let guests: u64 = self
+            .programs
+            .live_terms()?
+            .iter()
+            .map(|term| term.bytes(lanes))
+            .sum();
+        Ok((model + guests.div_ceil(chunk)) * chunk)
+    }
+
+    /// The guest region a fire whose model carve ends at `top` lays its
+    /// guests' scratch in: down to the backed span's bottom.
+    fn guest_carve(&self, top: u64) -> crate::program::GuestCarve {
+        crate::program::GuestCarve::new(
+            self.arena.store().clone(),
+            top,
+            self.arena.end() - self.pools.covered(),
+        )
     }
 
     /// Raises the rung to the widest, backing its carve: what a caller that
@@ -1880,7 +1914,7 @@ impl Shell {
             instance: instance_slots,
             rings: ring_slots,
         };
-        self.programs.bind(
+        let id = self.programs.bind(
             &self.device,
             program_id,
             seeds,
@@ -1889,7 +1923,18 @@ impl Shell {
             device,
             channels,
             pooled,
-        )
+        )?;
+        // A pair the bind opens widens what the rung's fires lay under their
+        // carve: backed here, and the bind refused (`Fault::Refused`) where
+        // the system refuses the heap.
+        let backed = self
+            .span_for(self.rung)
+            .and_then(|span| self.pools.cover(span));
+        if let Err(why) = backed {
+            let _ = self.programs.close_instance(id);
+            return Err(why);
+        }
+        Ok(id)
     }
 
     /// See `Engine::rebind_slots`: every frame lands first, so no fire in
@@ -1897,6 +1942,16 @@ impl Shell {
     pub fn rebind_slots(&mut self, rebind: &engine::Rebind) -> Result<()> {
         self.drain()?;
         self.programs.rebind_slots(&self.pools, rebind)
+    }
+
+    /// What a fire holding lanes of `program_id` bound at `extents` lays
+    /// in the span (`Engine::fire_facts`).
+    pub fn fire_facts(
+        &self,
+        program_id: engine::ProgramId,
+        extents: &eta_exec::Extents,
+    ) -> Result<engine::FireFacts> {
+        self.programs.fire_facts(program_id, extents)
     }
 
     /// What an instance of `program_id` holds in pool slots
@@ -2476,7 +2531,10 @@ impl Shell {
             staged.push(attached.instance);
         }
         let mut refusal = None;
-        for (instance, launched) in self.programs.stage_batched(&self.device, frame, &staged)? {
+        for (instance, launched) in
+            self.programs
+                .stage_batched(&self.device, frame, &staged, &prepared.guest)?
+        {
             match launched {
                 crate::program::Launched::Airborne => owed.push(instance),
                 crate::program::Launched::Refused(fired) => {
@@ -2571,9 +2629,10 @@ impl Shell {
             if !self.programs.prologue_runs(attached.instance) {
                 continue;
             }
+            let carve = self.guest_carve(self.arena.rung_guest_top(self.rung));
             match self
                 .programs
-                .fire(&self.device, attached.instance, Stage::Prologue)?
+                .fire(&self.device, attached.instance, Stage::Prologue, &carve)?
             {
                 crate::Fired::Committed => {}
                 other => {
@@ -3950,7 +4009,9 @@ impl Shell {
             },
         };
 
+        let guest = self.guest_carve(self.arena.guest_top(fire));
         Ok(Prepared {
+            guest,
             lanes,
             input_feeds,
             merge_lands,
@@ -4201,6 +4262,8 @@ pub struct Clips<'a> {
 }
 
 pub struct Prepared<'a> {
+    /// The guest region under this fire's model carve.
+    guest: crate::program::GuestCarve,
     lanes: &'a [Seated<'a>],
     input_feeds: Vec<InputFeedPlan>,
     merge_lands: Vec<MergeLand>,

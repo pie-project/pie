@@ -1369,6 +1369,12 @@ impl Pools {
         self.pool.span_segments()
     }
 
+    /// The bytes from the range's end the rung's carve backs.
+    #[must_use]
+    pub fn covered(&self) -> u64 {
+        self.pool.covered()
+    }
+
     /// Whether the range's top `bytes` are backed for a fire's carve.
     #[must_use]
     pub fn covers(&self, bytes: u64) -> bool {
