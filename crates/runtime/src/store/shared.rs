@@ -72,33 +72,47 @@ pub type Shared = Arc<Mutex<SharedPool>>;
 /// a mapping's cost on the lane against how often the lane pays it.
 pub const COMMIT_AHEAD_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Engines a process drives at most, for the per-engine rung gates.
-const RUNG_ENGINES: usize = 64;
+/// One engine's rung gates.
+struct RungGate {
+    /// The tokens a fire is cut and stepped to (SPEC decision 6): the
+    /// activation rung the pool is at or going to, `u32::MAX` at its
+    /// largest. Set by the pool's walker, read by the pipeline's cuts and
+    /// the scheduler's steps.
+    cap: std::sync::atomic::AtomicU32,
+    /// The widest fire the scheduler may still have in flight: lowered to
+    /// the cap once no step past it is (the scheduler holds back a launch
+    /// past the cap), so the walker may lower the pool's rung behind it.
+    grant: std::sync::atomic::AtomicU32,
+    /// The event every wait on the activation rung waits on: the fire cap
+    /// moved, a raise was applied, copied or refused, the rung was lowered,
+    /// segments were committed, or room was freed (a fire retired).
+    event: tokio::sync::Notify,
+}
 
-/// Per engine, the tokens a fire is cut and stepped to (SPEC decision 6):
-/// the activation rung the pool is at or going to, `u32::MAX` at its
-/// largest. Set by the pool's walker, read by the pipeline's cuts and the
-/// scheduler's steps.
-static FIRE_CAP: [std::sync::atomic::AtomicU32; RUNG_ENGINES] =
-    [const { std::sync::atomic::AtomicU32::new(u32::MAX) }; RUNG_ENGINES];
+/// Every engine's rung gate by its id: one for each engine named here,
+/// made the first time it is (uncapped, as an engine no walker has set is)
+/// and kept for the process, as engine ids are (an id is never handed out
+/// twice). No bound on how many.
+static RUNG_GATES: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<usize, &'static RungGate>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
 
-/// Per engine, the widest fire the scheduler may still have in flight:
-/// lowered to the cap once no step past it is (the scheduler holds back a
-/// launch past the cap), so the walker may lower the pool's rung behind it.
-static RUNG_GRANT: [std::sync::atomic::AtomicU32; RUNG_ENGINES] =
-    [const { std::sync::atomic::AtomicU32::new(u32::MAX) }; RUNG_ENGINES];
-
-/// Per engine, the event every wait on the activation rung waits on: the
-/// fire cap moved, a raise was applied, copied or refused, the rung was
-/// lowered, segments were committed, or room was freed (a fire retired).
-static RUNG_EVENTS: [tokio::sync::Notify; RUNG_ENGINES] =
-    [const { tokio::sync::Notify::const_new() }; RUNG_ENGINES];
+fn rung_gate(engine: usize) -> &'static RungGate {
+    if let Some(gate) = RUNG_GATES.read().unwrap().get(&engine) {
+        return gate;
+    }
+    RUNG_GATES.write().unwrap().entry(engine).or_insert_with(|| {
+        Box::leak(Box::new(RungGate {
+            cap: std::sync::atomic::AtomicU32::new(u32::MAX),
+            grant: std::sync::atomic::AtomicU32::new(u32::MAX),
+            event: tokio::sync::Notify::new(),
+        }))
+    })
+}
 
 /// Wakes every wait on `engine`'s rung: what it waits on may have changed.
 pub fn rung_changed(engine: usize) {
-    if let Some(event) = RUNG_EVENTS.get(engine) {
-        event.notify_waiters();
-    }
+    rung_gate(engine).event.notify_waiters();
 }
 
 /// The next [`rung_changed`] of `engine`, armed before the caller looks at
@@ -106,10 +120,7 @@ pub fn rung_changed(engine: usize) {
 /// lost: pin it, `enable` it, look, then await it.
 #[must_use]
 pub fn rung_watch(engine: usize) -> tokio::sync::futures::Notified<'static> {
-    RUNG_EVENTS
-        .get(engine)
-        .unwrap_or(&RUNG_EVENTS[RUNG_ENGINES - 1])
-        .notified()
+    rung_gate(engine).event.notified()
 }
 
 /// Waits for the next [`rung_changed`] of `engine` after `check` reads
@@ -130,9 +141,9 @@ pub async fn rung_wait_until(engine: usize, mut check: impl FnMut() -> bool) {
 /// The tokens a fire on `engine` is cut and stepped to now.
 #[must_use]
 pub fn fire_cap(engine: usize) -> u32 {
-    FIRE_CAP.get(engine).map_or(u32::MAX, |cap| {
-        cap.load(std::sync::atomic::Ordering::Acquire)
-    })
+    rung_gate(engine)
+        .cap
+        .load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Sets `engine`'s cap as the walker would: for a test of what waits on it.
@@ -142,24 +153,24 @@ pub(crate) fn set_fire_cap_for_test(engine: usize, tokens: u32) {
 }
 
 fn set_fire_cap(engine: usize, tokens: u32) {
-    if let Some(cap) = FIRE_CAP.get(engine) {
-        cap.store(tokens, std::sync::atomic::Ordering::Release);
-    }
+    rung_gate(engine)
+        .cap
+        .store(tokens, std::sync::atomic::Ordering::Release);
     rung_changed(engine);
 }
 
 /// The scheduler of `engine` has no step wider than `cap` in flight, and
 /// submits none from here.
 pub fn grant_rung(engine: usize, cap: u32) {
-    if let Some(grant) = RUNG_GRANT.get(engine) {
-        grant.store(cap, std::sync::atomic::Ordering::Release);
-    }
+    rung_gate(engine)
+        .grant
+        .store(cap, std::sync::atomic::Ordering::Release);
 }
 
 fn rung_granted(engine: usize) -> u32 {
-    RUNG_GRANT.get(engine).map_or(u32::MAX, |grant| {
-        grant.load(std::sync::atomic::Ordering::Acquire)
-    })
+    rung_gate(engine)
+        .grant
+        .load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Per engine, the rows each pass still to run asks of one fire, by the
