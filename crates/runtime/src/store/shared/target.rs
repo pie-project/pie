@@ -569,4 +569,34 @@ mod tests {
         grow.walk_rung().await;
         assert_eq!(shared.lock().unwrap().rung(), 2048, "room freed: raised");
     }
+
+    /// The walk runs on its wakes only: an ask made while it sleeps waits
+    /// for the next event (here room freed), with no poll of its own.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_walk_wakes_on_room_freed_not_on_a_clock() {
+        const ENGINE: usize = 51;
+        let mut pool = super::super::tests::pool();
+        pool.lower_rung(16).unwrap();
+        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+        let grow = SharedGrow::new(0, ENGINE, shared.clone());
+        grow.start();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(shared.lock().unwrap().rung(), 16, "nothing asked");
+        let _want = super::super::want_rows(ENGINE, 2048);
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            shared.lock().unwrap().rung(),
+            16,
+            "asked while it sleeps: no poll"
+        );
+        grow.room_freed();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(shared.lock().unwrap().rung(), 2048, "woken: it raises");
+    }
 }
