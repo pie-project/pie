@@ -279,7 +279,7 @@ fn the_fp8_block_projections_answer_the_dot() {
                 let mut routes = t(b.zeros(rg * 4), rows, groups, I32);
                 group_routes(&ctx, groups as u32, &mut routes).expect("the routes lay");
                 let (xr, mut yr) = (t(x, rg, k, Bf16), t(y.ptr, rg, n, Bf16));
-                select_fp8_w8a8(&ctx, xr, codes, atoms, groups as u32, routes, &mut yr, kernels_cuda::linear::moe::ExpertTable::RESIDENT)
+                b.laid(&ctx, |ctx| select_fp8_w8a8(ctx, xr, codes, atoms, groups as u32, routes, &mut yr, kernels_cuda::linear::moe::ExpertTable::RESIDENT))
             }
         }
         .expect("the fp8 projection fires");
@@ -366,16 +366,19 @@ fn the_w8a16_projections_answer_the_dot() {
         let atoms = &s.scales.as_ref().expect("scaled").0;
         let (codes, atoms) = (b.up(&s.bytes), b.up(atoms));
         let (mut y, ctx) = (b.out(m, n), b.ctx());
-        let took = w8a16::matmul(
-            &ctx,
-            "test",
-            t(x, m, k, Bf16),
-            codes,
-            atoms,
-            gran as u32,
-            &mut y,
-        )
-        .expect("the W8A16 product fires");
+        let took = b
+            .laid(&ctx, |ctx| {
+                w8a16::matmul(
+                    ctx,
+                    "test",
+                    t(x, m, k, Bf16),
+                    codes,
+                    atoms,
+                    gran as u32,
+                    &mut y,
+                )
+            })
+            .expect("the W8A16 product fires");
         assert!(took, "{m}x{n}x{k} in {gran}s is a shape it reads");
         let want = dot(
             [m, n, k],
@@ -462,7 +465,11 @@ fn an_mxfp8_release_laid_a_row_a_32_answers_the_dot() {
             // W8A16: the bf16 rows against the codes widened in registers.
             let mut y = b.out(m, n);
             if ex == 1 {
-                let took = w8a16::matmul(&ctx, "test", x, codes, atoms, 32, &mut y).expect("fires");
+                let took = b
+                    .laid(&ctx, |ctx| {
+                        w8a16::matmul(ctx, "test", x, codes, atoms, 32, &mut y)
+                    })
+                    .expect("fires");
                 assert!(took, "{}", what("W8A16"));
             } else {
                 select_fp8_w8a16(
@@ -534,16 +541,18 @@ fn the_fp8_select_lands_its_swiglu_as_the_glu_after_it() {
         group_routes(&ctx, groups as u32, &mut routes).expect("the routes lay");
         let xr = t(x, rg, k, Bf16);
         let mut p = t(packed.ptr, rg, 2 * inter, Bf16);
-        select_fp8_w8a8(
-            &ctx,
-            xr,
-            codes,
-            atoms,
-            groups as u32,
-            routes,
-            &mut p,
-            kernels_cuda::linear::moe::ExpertTable::RESIDENT,
-        )
+        b.laid(&ctx, |ctx| {
+            select_fp8_w8a8(
+                ctx,
+                xr,
+                codes,
+                atoms,
+                groups as u32,
+                routes,
+                &mut p,
+                kernels_cuda::linear::moe::ExpertTable::RESIDENT,
+            )
+        })
         .expect("the select fires");
         let mut ya = t(apart.ptr, rg, inter, Bf16);
         kernels_cuda::linear::glu::swiglu(&ctx, p, inter as u32, 1, &mut ya)

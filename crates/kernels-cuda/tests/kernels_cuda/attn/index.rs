@@ -121,6 +121,7 @@ fn rank(
             fired.expect("the ranking fires");
         }
     };
+    gpu.lay(&ctx, |_| fire(&keys));
     fire(&keys);
     gpu.sync();
     let (got, mut differ): (Vec<i32>, usize) = (gpu.down(sel_at, rows * top_k), 0);
@@ -277,6 +278,7 @@ fn the_block_max_ranking_answers_the_reference() {
         let fired = index::topk_block_max(&ctx, iq_t, keys, ih32, 128, k32, b32, sel);
         fired.expect("the ranking fires");
     };
+    gpu.lay(&ctx, |_| fire(&ikeys));
     fire(&ikeys);
     gpu.sync();
     assert!(
