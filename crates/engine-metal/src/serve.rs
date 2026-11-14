@@ -24,7 +24,7 @@ use crate::settle::{Airborne, Arms, Done};
 use crate::store::Pools;
 use crate::store::kv::{self, Paging, Seat};
 use crate::store::layout::Layout;
-use crate::weights::{AdapterPlane, Weights};
+use crate::weights::Weights;
 use crate::window::Windows;
 
 use engine::fire::Masking;
@@ -318,7 +318,11 @@ pub struct Shell {
     wide: poem_ir::ClassSet,
     corrected: poem_ir::ClassSet,
     adapter_fact: Option<u32>,
-    adapters: crate::adapter::Slots,
+    /// The adapters instances landed in `Adapter` slots, by the first slot
+    /// ref of their item (one landing a content key, the runtime's), and
+    /// which landing each instance holds.
+    landings: BTreeMap<u32, Landing>,
+    held_landing: BTreeMap<engine::InstanceId, u32>,
     blobs: crate::blob::Store,
     held: Vec<u32>,
     programs: crate::program::Plane,
@@ -1008,7 +1012,6 @@ impl PreparedLoad<'_> {
             .collect();
 
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
-        let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
 
         // What the load places beside the pool, by class: the model's
         // weights and constants, and the activation span at its widest
@@ -1148,7 +1151,8 @@ impl PreparedLoad<'_> {
                 boot.slots,
                 seated.pages_per_slot,
             )?
-            .with_tables(tables_chunks);
+            .with_tables(tables_chunks)
+            .with_adapter(weights.widest_bank_plane())?;
             for (window, pages) in rows.windows.iter().zip(&window_pages) {
                 layout = layout.with_window(window.bytes, window.rows, window.tokens, *pages)?;
             }
@@ -1334,7 +1338,8 @@ impl PreparedLoad<'_> {
             masked,
             wide,
             adapter_fact,
-            adapters: adapter_slots,
+            landings: BTreeMap::new(),
+            held_landing: BTreeMap::new(),
             blobs: crate::blob::Store::new(),
             corrected,
             held: vec![0; paging.slots as usize],
@@ -1651,8 +1656,12 @@ impl Shell {
         let mut frame = self.device.frame()?;
         self.pools.evacuate(&mut frame, evacuation)?;
         frame.commit()?;
-        // Guest tables and rings in moved chunks: the refs stand, their
-        // addresses do not.
+        // Guest tables, rings and landed adapters in moved chunks: the refs
+        // stand, their addresses do not.
+        let landings: Vec<Landing> = self.landings.values().cloned().collect();
+        for landing in &landings {
+            self.point_landing(landing)?;
+        }
         self.programs.rebind(&self.pools)
     }
 
@@ -2122,6 +2131,11 @@ impl Shell {
     /// flight reads the old refs' addresses.
     pub fn rebind_slots(&mut self, rebind: &engine::Rebind) -> Result<()> {
         self.drain()?;
+        if let engine::Rebind::Instance { id, adapter, .. } = rebind
+            && !adapter.is_empty()
+        {
+            self.rebind_adapter(*id, adapter)?;
+        }
         self.programs.rebind_slots(&self.pools, rebind)
     }
 
@@ -2138,7 +2152,17 @@ impl Shell {
     /// What an instance of `program_id` holds in pool slots
     /// (`Engine::program_facts`).
     pub fn program_facts(&self, program_id: engine::ProgramId) -> Result<engine::ProgramFacts> {
-        self.programs.facts(program_id, &self.pools)
+        let mut facts = self.programs.facts(program_id, &self.pools)?;
+        // The adapter its `lora` sink lands: a bank's plane an `Adapter`
+        // slot, taken once a content key and shared by every holder.
+        if let Some(banks) = self.adapter_banks(program_id)? {
+            facts.adapter = engine::Footprint {
+                bytes: banks.iter().map(|bank| bank.slot).sum(),
+                slots: u32::try_from(banks.len()).unwrap_or(u32::MAX),
+                contiguous: false,
+            };
+        }
+        Ok(facts)
     }
 
     /// The `Channel` slots a registered channel's ring of `shape` takes.
@@ -2180,10 +2204,6 @@ impl Shell {
         Ok(())
     }
 
-    pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
-        self.weights.register_adapter(id, planes)
-    }
-
     #[must_use]
     pub fn bank_seats(&self) -> Vec<crate::weights::BankSeat> {
         self.weights.seats()
@@ -2202,72 +2222,171 @@ impl Shell {
         crate::adapter::sink_of(&program.plan.package)
     }
 
-    pub fn bind_adapter(
-        &mut self,
-        source: crate::adapter::Source<'_>,
-    ) -> Result<crate::adapter::Binding> {
-        let key = match source {
-            crate::adapter::Source::Own { instance, .. } => crate::adapter::Key::Instance(instance),
-            crate::adapter::Source::Shared { name } => {
-                crate::adapter::Key::Shared(self.blobs.stamp(name)?)
-            }
-        };
-        let shared = matches!(source, crate::adapter::Source::Shared { .. });
-        let grant = self.adapters.acquire(key.clone())?;
-        if !grant.fresh {
-            return Ok(crate::adapter::Binding {
-                slot: grant.slot,
-                shared,
-                landed: false,
-                key,
-            });
-        }
-        let landed = match source {
-            crate::adapter::Source::Own { planes, .. } => {
-                self.weights.register_adapter(grant.slot, planes)
-            }
-            crate::adapter::Source::Shared { name } => {
-                let seats = self.weights.seats();
-                match self.blobs.planes(name, &seats) {
-                    Ok((built, _fingerprint)) => {
-                        let planes: Vec<crate::weights::AdapterPlane<'_>> = built
-                            .iter()
-                            .map(|(bank, bytes)| crate::weights::AdapterPlane {
-                                bank: bank.as_str(),
-                                bytes,
-                            })
-                            .collect();
-                        self.weights.register_adapter(grant.slot, &planes)
-                    }
-                    Err(why) => Err(why),
-                }
-            }
-        };
-        match landed {
-            Ok(()) => Ok(crate::adapter::Binding {
-                slot: grant.slot,
-                shared,
-                landed: true,
-                key,
-            }),
-            Err(why) => {
-                self.adapters.abandon(&key);
-                Err(why)
-            }
-        }
-    }
-
     pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {
         self.blobs.mount(root);
     }
 
-    #[must_use]
-    pub fn adapter_slots(&self) -> &crate::adapter::Slots {
-        &self.adapters
+    /// The banks the adapter a program's `lora` sink lands fills, in
+    /// bank-name order: one `Adapter` slot each. None: it lands none.
+    pub fn adapter_banks(
+        &self,
+        program_id: engine::ProgramId,
+    ) -> Result<Option<Vec<crate::weights::BankSeat>>> {
+        let Some(sink) = self.program_adapter_sink(program_id)? else {
+            return Ok(None);
+        };
+        let seats = self.weights.seats();
+        let site = sink.site()?;
+        let mut banks: Vec<crate::weights::BankSeat> = Vec::new();
+        for (role, _) in &sink.planes {
+            for bank in crate::adapter::banks_for(*role, site, &seats)? {
+                if !banks.iter().any(|seen| seen.name == bank.name) {
+                    banks.push(bank.clone());
+                }
+            }
+        }
+        banks.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Some(banks))
     }
 
-    pub fn release_adapter(&mut self, binding: &crate::adapter::Binding) {
-        self.adapters.release(&binding.key);
+    /// Lands the adapter `instance` carries (`planes`, a bank's plane each)
+    /// in the `Adapter` slots the runtime took for its item (`slots`, in
+    /// bank-name order): where another instance landed the same item there,
+    /// it joins it and nothing is written. Its adapter id: what its lanes
+    /// route by.
+    pub fn land_adapter(
+        &mut self,
+        instance: engine::InstanceId,
+        slots: &[u32],
+        mut planes: Vec<(String, Vec<u8>)>,
+    ) -> Result<u32> {
+        planes.sort_by(|a, b| a.0.cmp(&b.0));
+        if slots.len() != planes.len() || slots.is_empty() {
+            return Err(Fault::Adapter {
+                bank: planes
+                    .first()
+                    .map_or_else(String::new, |(name, _)| name.clone()),
+                why: format!(
+                    "lands {} planes and the runtime took {} `Adapter` slots for it; the \
+                     facts state one slot a bank",
+                    planes.len(),
+                    slots.len()
+                ),
+            });
+        }
+        if let Some(landing) = self.landings.get_mut(&slots[0]) {
+            landing.holders.insert(instance);
+            self.held_landing.insert(instance, slots[0]);
+            return Ok(landing.id);
+        }
+        let id = (0..crate::weights::ADAPTER_IDS)
+            .find(|id| !self.landings.values().any(|landing| landing.id == *id))
+            .ok_or(Fault::Ceiling {
+                what: "adapter ids a bank's table holds",
+                need: u64::from(crate::weights::ADAPTER_IDS) + 1,
+                have: u64::from(crate::weights::ADAPTER_IDS),
+            })?;
+        let banks: Vec<String> = planes.iter().map(|(name, _)| name.clone()).collect();
+        for ((bank, bytes), &slot) in planes.iter().zip(slots) {
+            let (_, _, runs, slot_bytes) =
+                self.pools.slot_runs(crate::store::layout::ADAPTER, slot)?;
+            if bytes.len() as u64 > slot_bytes {
+                return Err(Fault::Adapter {
+                    bank: bank.clone(),
+                    why: format!(
+                        "a plane of {} bytes past an `Adapter` slot of {slot_bytes}",
+                        bytes.len()
+                    ),
+                });
+            }
+            // The plane, zero past its bytes, through the slot's host runs
+            // (a run a heap it crosses); no frame reads a slot nothing
+            // routes to yet.
+            for (from, len, host) in runs {
+                let (from, len) = (
+                    usize::try_from(from).unwrap_or(usize::MAX),
+                    usize::try_from(len).unwrap_or(usize::MAX),
+                );
+                let have = bytes.len().saturating_sub(from).min(len);
+                // SAFETY: `host` addresses `len` mapped bytes of the slot.
+                #[allow(unsafe_code)]
+                unsafe {
+                    std::ptr::write_bytes(host.as_ptr(), 0, len);
+                    if have > 0 {
+                        std::ptr::copy_nonoverlapping(bytes[from..].as_ptr(), host.as_ptr(), have);
+                    }
+                }
+            }
+        }
+        let landing = Landing {
+            id,
+            refs: slots.to_vec(),
+            banks,
+            holders: std::iter::once(instance).collect(),
+        };
+        self.point_landing(&landing)?;
+        self.landings.insert(slots[0], landing);
+        self.held_landing.insert(instance, slots[0]);
+        Ok(id)
+    }
+
+    /// Points a landing's id at its slots in every bank's table.
+    fn point_landing(&mut self, landing: &Landing) -> Result<()> {
+        for (bank, &slot) in landing.banks.iter().zip(&landing.refs) {
+            let (buffer, offset, _, _) =
+                self.pools.slot_place(crate::store::layout::ADAPTER, slot)?;
+            let address = buffer.address_at(offset).ok_or_else(|| Fault::Unbound {
+                what: format!("a GPU address for `Adapter` slot {slot}"),
+            })?;
+            self.weights.point(bank, landing.id, Some(address))?;
+        }
+        Ok(())
+    }
+
+    /// `instance` lets go of its adapter: the last holder's close forgets
+    /// the landing and its id (the runtime frees the slots).
+    pub fn detach_adapter(&mut self, instance: engine::InstanceId) {
+        let Some(first) = self.held_landing.remove(&instance) else {
+            return;
+        };
+        if let Some(landing) = self.landings.get_mut(&first) {
+            landing.holders.remove(&instance);
+            if landing.holders.is_empty() {
+                // Forgotten: its id reads the zero plane until it lands anew.
+                if let Some(landing) = self.landings.remove(&first) {
+                    for bank in &landing.banks {
+                        let _ = self.weights.point(bank, landing.id, None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `instance`'s adapter now lies in `slots` (parked and back, or moved):
+    /// the item's bytes copied there by the runtime, its id pointed there.
+    /// Every holder of one item names the same new refs; the first told
+    /// moves the landing, the rest find it moved.
+    pub fn rebind_adapter(&mut self, instance: engine::InstanceId, slots: &[u32]) -> Result<()> {
+        let Some(&first) = self.held_landing.get(&instance) else {
+            return Ok(());
+        };
+        let Some(&new_first) = slots.first() else {
+            return Ok(());
+        };
+        if first == new_first {
+            return Ok(());
+        }
+        if let Some(mut landing) = self.landings.remove(&first) {
+            landing.refs = slots.to_vec();
+            self.point_landing(&landing)?;
+            for holder in &landing.holders {
+                self.held_landing.insert(*holder, new_first);
+            }
+            self.landings.insert(new_first, landing);
+        } else {
+            self.held_landing.insert(instance, new_first);
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -4872,6 +4991,16 @@ fn span_host(pools: &Pools, at: u64, bytes: u64) -> Result<Vec<(u64, u64, std::p
 /// the runtime's bound on a pass, `engine::fire::UNFOLDED_ROWS` once the
 /// contract states it (16 there); a fire past it is refused at the lane.
 const RS_UNFOLDED_ROWS: u32 = 16;
+
+/// An adapter landed in `Adapter` slots: its id, its slot refs and the bank
+/// each holds (bank-name order), and the instances holding it.
+#[derive(Debug, Clone)]
+struct Landing {
+    id: u32,
+    refs: Vec<u32>,
+    banks: Vec<String>,
+    holders: std::collections::BTreeSet<engine::InstanceId>,
+}
 
 fn host_rung(
     pools: &Pools,

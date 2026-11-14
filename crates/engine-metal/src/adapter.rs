@@ -1,11 +1,8 @@
-use std::collections::BTreeMap;
-
-use engine::program::InstanceId;
 use eta_compiler::codegen::launch::{LaunchPackage, ValueOrigin};
 use eta_ir::op::tags;
 
 use crate::error::{Fault, Result};
-use crate::weights::{AdapterPlane, BankSeat};
+use crate::weights::BankSeat;
 
 pub const LORA: &str = "lora";
 
@@ -242,12 +239,9 @@ pub fn sink_of(package: &LaunchPackage) -> Result<Option<Sink>> {
     }))
 }
 
-pub fn planes_of(
-    role: Role,
-    site: Option<Site>,
-    wire: &[u8],
-    seats: &[BankSeat],
-) -> Result<Vec<(String, Vec<u8>)>> {
+/// The banks a plane of `role` for `site` fills, one a layer in layer
+/// order: refused where the load declares none of them.
+pub fn banks_for(role: Role, site: Option<Site>, seats: &[BankSeat]) -> Result<Vec<&BankSeat>> {
     let refuse = |why: String| Fault::Adapter {
         bank: role.bank().to_string(),
         why,
@@ -267,7 +261,7 @@ pub fn planes_of(
         .filter(|seat| site_of(&seat.name) == want)
         .collect();
     banks.sort_by_key(|seat| layer_of(&seat.name));
-    let seat = *banks.first().ok_or_else(|| {
+    banks.first().ok_or_else(|| {
         let declared = {
             let mut seen: Vec<String> = Vec::new();
             for seat in &of_role {
@@ -298,6 +292,21 @@ pub fn planes_of(
             )),
         }
     })?;
+    Ok(banks)
+}
+
+pub fn planes_of(
+    role: Role,
+    site: Option<Site>,
+    wire: &[u8],
+    seats: &[BankSeat],
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let refuse = |why: String| Fault::Adapter {
+        bank: role.bank().to_string(),
+        why,
+    };
+    let banks = banks_for(role, site, seats)?;
+    let seat = banks[0];
     if let Some(odd) = banks
         .iter()
         .find(|bank| bank.slot != seat.slot || bank.rows != seat.rows)
@@ -391,100 +400,6 @@ pub fn bf16_bits(value: f32) -> u16 {
     ((bits + rounding) >> 16) as u16
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum Source<'a> {
-    Own {
-        instance: InstanceId,
-        planes: &'a [AdapterPlane<'a>],
-    },
-    Shared {
-        name: &'a str,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Binding {
-    pub slot: u32,
-    pub shared: bool,
-    pub landed: bool,
-    pub key: Key,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Key {
-    Instance(InstanceId),
-    Shared(crate::blob::Stamp),
-}
-
-#[derive(Debug, Default)]
-pub struct Slots {
-    seats: u32,
-    held: BTreeMap<Key, (u32, u32)>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Grant {
-    pub slot: u32,
-    pub fresh: bool,
-}
-
-impl Slots {
-    #[must_use]
-    pub fn new(seats: u32) -> Slots {
-        Slots {
-            seats,
-            held: BTreeMap::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn seats(&self) -> u32 {
-        self.seats
-    }
-
-    #[must_use]
-    pub fn live(&self) -> usize {
-        self.held.len()
-    }
-
-    pub fn acquire(&mut self, key: Key) -> Result<Grant> {
-        if let Some((slot, count)) = self.held.get_mut(&key) {
-            *count += 1;
-            return Ok(Grant {
-                slot: *slot,
-                fresh: false,
-            });
-        }
-        let taken: Vec<u32> = self.held.values().map(|(slot, _)| *slot).collect();
-        let slot = (0..self.seats)
-            .find(|slot| !taken.contains(slot))
-            .ok_or(Fault::AdapterSlots { seats: self.seats })?;
-        self.held.insert(key, (slot, 1));
-        Ok(Grant { slot, fresh: true })
-    }
-
-    pub fn abandon(&mut self, key: &Key) {
-        self.release_key(key);
-    }
-
-    pub fn release(&mut self, key: &Key) {
-        self.release_key(key);
-    }
-
-    fn release_key(&mut self, key: &Key) {
-        let drop = match self.held.get_mut(key) {
-            Some((_, count)) => {
-                *count = count.saturating_sub(1);
-                *count == 0
-            }
-            None => false,
-        };
-        if drop {
-            self.held.remove(key);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,9 +444,6 @@ mod tests {
         the_sink_answers_its_two_channels_in_role_order();
         the_placement_constant_is_one_site_or_a_refusal();
         a_package_with_no_sink_answers_none();
-        the_residency_pins_releases_and_refuses_by_name();
-        one_blob_is_one_slot_however_many_instances_name_it();
-        an_abandoned_acquire_leaves_the_slot_free();
     }
 
     fn a_layered_cell_becomes_one_plane_per_layer_bank() {
@@ -657,90 +569,5 @@ mod tests {
             sink_of(&LaunchPackage::default()).expect("no sink is not an error"),
             None
         );
-    }
-
-    fn the_residency_pins_releases_and_refuses_by_name() {
-        let mut slots = Slots::new(2);
-        let first = slots
-            .acquire(Key::Instance(InstanceId(1)))
-            .expect("a free slot");
-        assert!(first.fresh);
-        let second = slots
-            .acquire(Key::Instance(InstanceId(2)))
-            .expect("the other one");
-        assert_ne!(first.slot, second.slot, "two instances are two slots");
-        let why = slots
-            .acquire(Key::Instance(InstanceId(3)))
-            .expect_err("both are pinned");
-        assert!(why.to_string().contains('2'), "names the capacity: {why}");
-        let again = slots
-            .acquire(Key::Instance(InstanceId(1)))
-            .expect("its own slot");
-        assert_eq!(again.slot, first.slot);
-        assert!(!again.fresh, "a held key does not re-land");
-        slots.release(&Key::Instance(InstanceId(1)));
-        assert_eq!(slots.live(), 2, "the second hold keeps it pinned");
-        slots.release(&Key::Instance(InstanceId(1)));
-        assert_eq!(slots.live(), 1, "the last release frees it");
-        let reused = slots
-            .acquire(Key::Instance(InstanceId(3)))
-            .expect("the freed slot");
-        assert_eq!(reused.slot, first.slot, "the lowest free slot is taken");
-    }
-
-    fn stamp(at: &str, bytes: u64) -> crate::blob::Stamp {
-        crate::blob::Stamp {
-            at: at.to_string(),
-            files: vec![("adapter.toml".to_string(), bytes, 7)],
-        }
-    }
-
-    fn one_blob_is_one_slot_however_many_instances_name_it() {
-        let mut slots = Slots::new(2);
-        let alice = Key::Shared(stamp("/mnt/alice-v2", 128));
-
-        let first = slots.acquire(alice.clone()).expect("a free slot");
-        assert!(first.fresh, "the first bind is the one that pays");
-        let second = slots.acquire(alice.clone()).expect("the same identity");
-        assert_eq!(second.slot, first.slot, "one blob, one slot");
-        assert!(!second.fresh, "the second joins what is already there");
-        let third = slots.acquire(alice.clone()).expect("and a third");
-        assert_eq!(third.slot, first.slot);
-        assert_eq!(slots.live(), 1, "three binds, one resident identity");
-
-        let private = slots
-            .acquire(Key::Instance(InstanceId(77)))
-            .expect("the other slot");
-        assert_ne!(private.slot, first.slot);
-        assert!(private.fresh);
-
-        let rewritten = Key::Shared(stamp("/mnt/alice-v2", 129));
-        let why = slots
-            .acquire(rewritten)
-            .expect_err("a new identity wants a seat and both are pinned");
-        assert!(why.to_string().contains('2'), "names the capacity: {why}");
-
-        slots.release(&alice);
-        slots.release(&alice);
-        assert_eq!(slots.live(), 2, "two holds are gone and one remains");
-        slots.release(&alice);
-        assert_eq!(slots.live(), 1, "the last release frees the shared slot");
-        let after = slots
-            .acquire(Key::Shared(stamp("/mnt/bob-v1", 64)))
-            .expect("the freed slot seats the next identity");
-        assert_eq!(after.slot, first.slot);
-    }
-
-    fn an_abandoned_acquire_leaves_the_slot_free() {
-        let mut slots = Slots::new(1);
-        let grant = slots
-            .acquire(Key::Instance(InstanceId(7)))
-            .expect("the only slot");
-        slots.abandon(&Key::Instance(InstanceId(7)));
-        assert_eq!(slots.live(), 0);
-        let after = slots
-            .acquire(Key::Instance(InstanceId(8)))
-            .expect("it is free again");
-        assert_eq!(after.slot, grant.slot);
     }
 }

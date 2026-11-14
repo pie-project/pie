@@ -83,7 +83,7 @@ use crate::error::{Fault, Result};
 /// The first weight shape's id: past the state shapes (the kv list, the
 /// fixed record, up to four window lists, the rs list) and the guest shapes
 /// (`layout::INSTANCE`, `layout::CHANNEL`).
-pub const WEIGHTS: u32 = 9;
+pub const WEIGHTS: u32 = 10;
 
 /// Whether every node of `trace` that reads param `at` is one `reads`
 /// accepts, and one does.

@@ -1065,18 +1065,37 @@ impl Pools {
         id: ShapeId,
         slot: u32,
     ) -> Result<(Buffer, u64, std::ptr::NonNull<u8>, u64)> {
+        let (view, at, runs, slot_bytes) = self.slot_runs(id, slot)?;
+        // One host address: the slot lies in one heap (a chunk may cross a
+        // heap's end; a slot a table or ring holds does not).
+        let [(_, _, host)] = runs[..] else {
+            return Err(Fault::Device {
+                call: "slot host address",
+                why: format!(
+                    "slot {slot} of shape {id} crosses a placement heap's end, so no one \
+                     host address spans it; write it through its host runs"
+                ),
+            });
+        };
+        Ok((view, at, host, slot_bytes))
+    }
+
+    /// Slot ref `slot` of shape `id`: the buffer it lies in, its byte offset
+    /// there, its bytes' host runs `(from, len, address)` (one a heap they
+    /// cross) and its bytes.
+    pub fn slot_runs(
+        &self,
+        id: ShapeId,
+        slot: u32,
+    ) -> Result<(Buffer, u64, Vec<(u64, u64, std::ptr::NonNull<u8>)>, u64)> {
         let shape = *self.shape(id)?;
         let (chunk, index) = self.place(&shape, slot)?;
-        let inner = u64::from(index) * shape.slot_bytes;
-        let host = self.pool.chunk_host(chunk)?;
-        // SAFETY: `index < per_chunk`, so the slot lies inside the chunk the
-        // host address names.
-        #[allow(unsafe_code)]
-        let host = unsafe { host.add(usize::try_from(inner).unwrap_or(usize::MAX)) };
-        let (view, at) = self
-            .pool
-            .view_at(u64::from(chunk) * self.layout.chunk_bytes + inner);
-        Ok((view.clone(), at, host, shape.slot_bytes))
+        let global =
+            u64::from(chunk) * self.layout.chunk_bytes + u64::from(index) * shape.slot_bytes;
+        self.pool.admit(chunk)?;
+        let runs = self.pool.host_runs(global, shape.slot_bytes)?;
+        let (view, at) = self.pool.view_at(global);
+        Ok((view.clone(), at, runs, shape.slot_bytes))
     }
 
     /// The slots of shape `id` one chunk holds.
