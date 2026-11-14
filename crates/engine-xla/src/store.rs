@@ -1203,6 +1203,25 @@ impl Pools {
     }
 
     /// The pool rows grain index `q` of shape `id` starts at.
+    /// Pool rows a slot of shape `id` takes: a state shape's, or a
+    /// `Channel` slot's ([`layout::CHANNEL`]).
+    fn slot_rows(&self, id: ShapeId) -> Result<u64> {
+        if id == layout::CHANNEL {
+            return Ok(crate::guest::CHANNEL_SLOT / ROW_BYTES);
+        }
+        Ok(self.shape(id)?.slot_bytes / ROW_BYTES)
+    }
+
+    /// The pool row slot `slot` of shape `id` starts at.
+    fn slot_row(&self, id: ShapeId, slot: u32) -> Result<i64> {
+        if id == layout::CHANNEL {
+            return self.channel_row(slot).map(i64::from).ok_or_else(|| Fault::Unbound {
+                what: format!("Channel slot {slot}, which lies past the pool"),
+            });
+        }
+        self.rows_at(id, self.grain(id, slot)?)
+    }
+
     fn rows_at(&self, id: ShapeId, q: u32) -> Result<i64> {
         let shape = self.shape(id)?;
         Ok(i64::try_from(u64::from(q) * self.layout.grain(shape) / ROW_BYTES).unwrap_or(i64::MAX))
@@ -1258,9 +1277,9 @@ impl Pools {
             if src == dst {
                 continue;
             }
-            let rows = self.shape(id)?.slot_bytes / ROW_BYTES;
-            let from = self.rows_at(id, self.grain(id, src)?)?;
-            let to = self.rows_at(id, self.grain(id, dst)?)?;
+            let rows = self.slot_rows(id)?;
+            let from = self.slot_row(id, src)?;
+            let to = self.slot_row(id, dst)?;
             spans.push((rows, from, to));
         }
         self.copy_rows(device, handles, &spans)
@@ -1442,10 +1461,10 @@ impl Pools {
         if slots.is_empty() || device.is_dry() {
             return Ok(Vec::new());
         }
-        let rows = self.shape(id)?.slot_bytes / ROW_BYTES;
+        let rows = self.slot_rows(id)?;
         let mut at: Vec<i64> = slots
             .iter()
-            .map(|&slot| self.rows_at(id, self.grain(id, slot)?))
+            .map(|&slot| self.slot_row(id, slot))
             .collect::<Result<_>>()?;
         let n = at.len();
         pad_pow2(&mut at, 1);
@@ -1493,7 +1512,7 @@ impl Pools {
         if slots.is_empty() || device.is_dry() {
             return Ok(());
         }
-        let rows = self.shape(id)?.slot_bytes / ROW_BYTES;
+        let rows = self.slot_rows(id)?;
         if bytes.len() as u64 != slots.len() as u64 * rows * ROW_BYTES {
             return Err(Fault::Unbound {
                 what: format!(
@@ -1506,7 +1525,7 @@ impl Pools {
         }
         let at: Vec<i64> = slots
             .iter()
-            .map(|&slot| self.rows_at(id, self.grain(id, slot)?))
+            .map(|&slot| self.slot_row(id, slot))
             .collect::<Result<_>>()?;
         self.write_rows(device, handles, rows, at, bytes)
     }

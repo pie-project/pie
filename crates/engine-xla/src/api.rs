@@ -580,6 +580,20 @@ impl Engine for Xla {
             .map_err(refusal)
     }
 
+    /// An instance's carried rings moved to fresh `Channel` slots (a park
+    /// and its return): its cells are read and written there from now on.
+    /// XLA keeps no registered channel's ring in the pool.
+    fn rebind_slots(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
+        match rebind {
+            engine::program::Rebind::Instance { id, rings, .. } => {
+                let shell = self.shell.as_ref();
+                let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));
+                self.programs.rebind(id, &rings, &cell_row).map_err(refusal)
+            }
+            engine::program::Rebind::Channel { .. } => Ok(()),
+        }
+    }
+
     fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
         let caps = self
             .caps

@@ -459,6 +459,32 @@ impl Plane {
         self.programs.get(&program).map(|plan| &plan.package)
     }
 
+    /// An instance's carried rings moved (`Engine::rebind_slots`): the
+    /// runtime copied their cells into the fresh `Channel` slots `rings`
+    /// names, so the instance reads and writes them there from now on.
+    pub fn rebind(
+        &mut self,
+        id: InstanceId,
+        rings: &[engine::program::RingSlots],
+        cell_row: &dyn Fn(u32) -> Option<u32>,
+    ) -> Result<(), Refusal> {
+        let carried = {
+            let held = self.instances.get(&id).ok_or(Refusal::Closed {
+                what: "instance",
+                id: id.0,
+            })?;
+            self.forms
+                .get(held.program)
+                .map(|c| c.carried_words.clone())
+                .unwrap_or_default()
+        };
+        let cells = cells_of(&carried, rings, cell_row)?;
+        if let Some(held) = self.instances.get_mut(&id) {
+            held.cells = cells;
+        }
+        Ok(())
+    }
+
     /// Program `program`'s device form, where its every stage lowers.
     #[must_use]
     pub fn compiled_form(&self, program: ProgramId) -> Option<&Arc<crate::guest::Compiled>> {

@@ -5,6 +5,7 @@ mod common_dit;
 mod common_llm;
 
 mod a_channel_fed_voxel_input_lands_the_committed_cell;
+mod a_channel_slot_parks_and_returns_whole;
 mod a_context_input_merged_into_the_stream_lands_its_rows;
 mod a_conv_decoder_fires_over_a_voxel_input;
 mod a_device_geometry_beam_answers_the_host_path;
