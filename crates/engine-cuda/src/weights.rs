@@ -23,12 +23,6 @@ use crate::run::{WeightRow, WeightTable};
 
 pub(crate) const ALIGN: u64 = 256;
 
-#[derive(Debug, Clone, Copy)]
-pub struct AdapterPlane<'a> {
-    pub bank: &'a str,
-    pub bytes: &'a [u8],
-}
-
 #[derive(Debug)]
 pub struct Weights {
     store: Buffer,
@@ -56,10 +50,10 @@ pub fn decoded_dense_bytes(trace: &Trace) -> u64 {
         .sum()
 }
 
+/// A bank's adapter plane: what one adapter's plane of it holds (its
+/// `Adapter` slot's bytes are the pool's, never this store's).
 #[derive(Debug, Clone, Copy)]
 struct Bank {
-    offset: u64,
-    adapters: u32,
     slot: u64,
     rows: u64,
     cols: u64,
@@ -69,33 +63,33 @@ struct Bank {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BankSeat {
     pub name: String,
-    pub adapters: u32,
+    /// One adapter's plane of the bank, in bytes.
     pub slot: u64,
     pub rows: u64,
     pub cols: u64,
     pub elem: u64,
 }
 
-fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
+/// The trace's adapter banks (its `registered` weights, `[ids, ..]`), an
+/// adapter's plane each: the store holds none of them.
+fn banks(trace: &Trace) -> BTreeMap<String, Bank> {
     trace
         .params
         .iter()
-        .zip(places)
-        .filter(|(param, _)| param.source == ParamSource::Registered)
-        .map(|(param, place)| {
-            let adapters =
-                u32::try_from(param.shape.first().copied().unwrap_or(0)).unwrap_or(u32::MAX);
-            let slot = if adapters == 0 {
-                0
-            } else {
-                place.bytes / u64::from(adapters)
-            };
+        .filter(|param| param.source == ParamSource::Registered)
+        .map(|param| {
+            let elem = poem_compiler::arena::elem_bytes(param.dtype).unwrap_or(0);
+            let slot = param
+                .shape
+                .get(1..)
+                .unwrap_or(&[])
+                .iter()
+                .product::<u64>()
+                .saturating_mul(elem);
             let (rows, cols) = rectangle(param.shape.get(1..).unwrap_or(&[]));
             (
                 param.name.clone(),
                 Bank {
-                    offset: place.offset,
-                    adapters,
                     slot,
                     rows,
                     cols,
@@ -905,7 +899,7 @@ impl Weights {
                 BTreeMap::new(),
                 BTreeMap::new(),
             ),
-            banks: banks(trace, &places),
+            banks: banks(trace),
             experts,
             from_cache,
             decoded,
@@ -1520,63 +1514,6 @@ impl Weights {
         Ok(hash)
     }
 
-    /// Writes adapter `id`'s planes into its slots, once `stream` (the
-    /// stream the shell fires on) has drained: no fire airborne still reads
-    /// a slot this rewrites.
-    pub fn register_adapter(
-        &mut self,
-        stream: *mut core::ffi::c_void,
-        id: u32,
-        planes: &[AdapterPlane<'_>],
-    ) -> Result<()> {
-        for plane in planes {
-            let bank = self.banks.get(plane.bank).ok_or_else(|| Fault::Adapter {
-                bank: plane.bank.to_string(),
-                why: "is not a bank this plan declares; a bank is a weight the model \
-                      text marked `registered`, and this plan marked none by that name"
-                    .to_string(),
-            })?;
-            if id >= bank.adapters {
-                return Err(Fault::Adapter {
-                    bank: plane.bank.to_string(),
-                    why: format!(
-                        "seats {} adapters and this registration is id {id}; capacity is \
-                         a shape the model text declared, so the fix is the model text \
-                         and not a retry",
-                        bank.adapters
-                    ),
-                });
-            }
-            if plane.bytes.len() as u64 != bank.slot {
-                return Err(Fault::Adapter {
-                    bank: plane.bank.to_string(),
-                    why: format!(
-                        "seats {} bytes per adapter and this plane carries {}; a plane \
-                         is one whole slot, zero-padded by the caller past its own rank",
-                        bank.slot,
-                        plane.bytes.len()
-                    ),
-                });
-            }
-        }
-        crate::device::ctx::sync(stream)?;
-        for plane in planes {
-            let bank = self.banks[plane.bank];
-            let at = bank.offset + u64::from(id) * bank.slot;
-            self.store
-                .zero_span(at, usize::try_from(bank.slot).unwrap_or(0))?;
-            self.store.write(at, plane.bytes)?;
-        }
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn banks(&self) -> Vec<(&str, u32, u64)> {
-        self.banks
-            .iter()
-            .map(|(name, bank)| (name.as_str(), bank.adapters, bank.slot))
-            .collect()
-    }
 
     #[must_use]
     pub fn seats(&self) -> Vec<BankSeat> {
@@ -1584,22 +1521,12 @@ impl Weights {
             .iter()
             .map(|(name, bank)| BankSeat {
                 name: name.clone(),
-                adapters: bank.adapters,
                 slot: bank.slot,
                 rows: bank.rows,
                 cols: bank.cols,
                 elem: bank.elem,
             })
             .collect()
-    }
-
-    #[must_use]
-    pub fn adapter_seats(&self) -> u32 {
-        self.banks
-            .values()
-            .map(|bank| bank.adapters)
-            .min()
-            .unwrap_or(0)
     }
 
     #[must_use]
@@ -1676,7 +1603,13 @@ fn places(trace: &Trace, plan: &crate::experts::Plan) -> Result<Vec<Place>> {
     for (index, param) in trace.params.iter().enumerate() {
         let (rows, width) = rectangle(&param.shape);
         let plane = bytes[index];
-        let held = if plan.streamed_whole(index) { 0 } else { plane };
+        // An adapter bank lies in the pool's `Adapter` slots, a plane an
+        // adapter: the store holds none of it.
+        let held = if plan.streamed_whole(index) || param.source == ParamSource::Registered {
+            0
+        } else {
+            plane
+        };
         out.push(Place {
             offset: at,
             bytes: plane,

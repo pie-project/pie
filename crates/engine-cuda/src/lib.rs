@@ -190,10 +190,8 @@ pub use serve::{
     Recording, Seal, Seated, Shell,
 };
 
-pub use blob::{
-    Adapters, Binding, Site as AdapterSite, Source as AdapterSource, layer_of, role_of, site_of,
-};
-pub use weights::{AdapterPlane, BankSeat};
+pub use blob::{Adapters, Site as AdapterSite, layer_of, role_of, site_of};
+pub use weights::BankSeat;
 pub use window::{Cursor, Window, WindowShape, Windows};
 
 #[cfg(test)]

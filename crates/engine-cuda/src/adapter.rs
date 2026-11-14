@@ -305,7 +305,6 @@ mod tests {
     fn seat(name: &str, rows: u64, cols: u64) -> BankSeat {
         BankSeat {
             name: name.to_string(),
-            adapters: 8,
             slot: rows * cols * 2,
             rows,
             cols,

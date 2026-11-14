@@ -64,7 +64,8 @@ pub struct Cuda {
     sink: Option<engine::CompletionSink>,
     tap_sink: Option<engine::TapSink>,
     pending: Option<(FrameId, Vec<PendingStep>)>,
-    adapters: BTreeMap<InstanceId, crate::Binding>,
+    /// The instances whose adapter lies in `Adapter` slots here.
+    adapters: std::collections::BTreeSet<InstanceId>,
     replay: Option<crate::replay::Replay>,
     /// This rank's place in its expert-parallel group (`size` 1 outside
     /// one): which experts' planes its banks load.
@@ -93,7 +94,7 @@ impl Cuda {
             sink: None,
             tap_sink: None,
             pending: None,
-            adapters: BTreeMap::new(),
+            adapters: std::collections::BTreeSet::new(),
             replay: None,
             expert: World::default(),
             before_arming: None,
@@ -322,11 +323,6 @@ fn fault(fault: Fault) -> Error {
         | Fault::MaskWord { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
-        Fault::AdapterSlots { .. } => Error::Exhausted {
-            resource: "adapter slots",
-            wanted: 1,
-            available: 0,
-        },
         Fault::Compile(_) | Fault::Program { .. } | Fault::Interpret(_) => {
             Error::Program(fault.to_string())
         }
@@ -470,14 +466,18 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
     })
 }
 
+/// Lands the adapter an instance of `program` carries, its planes the
+/// bind's seeds, in the `Adapter` slots the runtime took (`slots`).
+/// Whether it carries one.
 fn adapter_of(
     shell: &mut Shell,
     program: engine::program::ProgramId,
     instance: InstanceId,
     seeds: &[(u32, Vec<u8>)],
-) -> EngineResult<Option<crate::Binding>> {
+    slots: &[u32],
+) -> EngineResult<bool> {
     let Some(sink) = shell.program_adapter_sink(program).map_err(fault)? else {
-        return Ok(None);
+        return Ok(false);
     };
     let seats = shell.bank_seats();
     let site = sink.site().map_err(fault)?;
@@ -499,19 +499,9 @@ fn adapter_of(
             })?;
         built.extend(crate::adapter::planes_of(*role, site, wire, &seats).map_err(fault)?);
     }
-    let planes: Vec<crate::AdapterPlane<'_>> = built
-        .iter()
-        .map(|(bank, bytes)| crate::AdapterPlane {
-            bank: bank.as_str(),
-            bytes,
-        })
-        .collect();
     shell
-        .bind_adapter(crate::AdapterSource::Own {
-            instance,
-            planes: &planes,
-        })
-        .map(Some)
+        .land_adapter(instance, slots, &built)
+        .map(|()| true)
         .map_err(fault)
 }
 
@@ -760,12 +750,7 @@ impl Engine for Cuda {
                 state_slots: if state_rows { paging.slots } else { 0 },
                 state_slot_bytes: shell.state_slot_bytes(),
                 buffer_pages: shell.buffer_pages(),
-                adapter_banks: shell
-                    .banks()
-                    .iter()
-                    .map(|&(_, adapters, _)| adapters)
-                    .min()
-                    .unwrap_or(0),
+                adapter_banks: u32::try_from(shell.bank_seats().len()).unwrap_or(u32::MAX),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
                 host_kv_pages,
                 disk_kv_pages,
@@ -845,17 +830,13 @@ impl Engine for Cuda {
         &mut self,
         registration: &engine::adapter::AdapterRegistration,
     ) -> EngineResult<()> {
-        let planes: Vec<crate::AdapterPlane<'_>> = registration
-            .planes
-            .iter()
-            .map(|plane| crate::AdapterPlane {
-                bank: plane.bank.as_str(),
-                bytes: &plane.bytes,
-            })
-            .collect();
-        self.loaded_mut()?
-            .register_adapter(registration.id, &planes)
-            .map_err(fault)
+        Err(Error::Load(format!(
+            "adapter {} is registered by id into the model's banks, and this engine \
+             keeps no bank rows: an adapter's planes lie in the pool's `Adapter` slots, \
+             landed when an instance binds a program whose `lora` sink names them as \
+             seeds, and given back when it closes",
+            registration.id
+        )))
     }
 
     fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
@@ -916,11 +897,16 @@ impl Engine for Cuda {
                 id,
                 instance,
                 rings,
-                ..
-            } => self
-                .loaded_mut()?
-                .rebind_program(id, crate::program::Slots { instance, rings })
-                .map_err(fault),
+                adapter,
+            } => {
+                let shell = self.loaded_mut()?;
+                if !adapter.is_empty() {
+                    shell.rebind_adapter(id, &adapter).map_err(fault)?;
+                }
+                shell
+                    .rebind_program(id, crate::program::Slots { instance, rings })
+                    .map_err(fault)
+            }
             engine::program::Rebind::Channel { id, slots } => {
                 let old = self.channels.get(&id).cloned().ok_or_else(|| {
                     Error::Program(format!("channel {id} is not registered on this engine"))
@@ -1219,16 +1205,16 @@ impl Engine for Cuda {
                 },
             )
             .map_err(fault)?;
-        let landed = adapter_of(shell, binding.program, id, &seeds);
-        let bound = match landed {
-            Ok(bound) => bound,
+        let landed = adapter_of(shell, binding.program, id, &seeds, &binding.adapter_slots);
+        let adapted = match landed {
+            Ok(adapted) => adapted,
             Err(why) => {
                 let _ = shell.close_program_instance(id);
                 return Err(why);
             }
         };
-        if let Some(bound) = bound {
-            self.adapters.insert(id, bound);
+        if adapted {
+            self.adapters.insert(id);
         }
         Ok(BoundInstance {
             id,
@@ -1240,8 +1226,8 @@ impl Engine for Cuda {
     fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
         let held = self.adapters.remove(&id);
         let shell = self.loaded_mut()?;
-        if let Some(held) = held {
-            shell.release_adapter(held);
+        if held {
+            shell.close_adapter(id);
         }
         shell.close_program_instance(id).map_err(fault)
     }
@@ -1353,21 +1339,39 @@ impl Cuda {
                 at,
                 sink: std::sync::Arc::clone(sink),
             });
+        if let Some(at) = submission.lanes.iter().position(|lane| lane.adapter.is_some()) {
+            return Err(Error::Invalid(format!(
+                "lane {at} names an adapter id itself, and this engine reads an adapter \
+                 through the instance that landed it: attach the lane to that instance"
+            )));
+        }
         let mut lane_adapters: Vec<Option<u32>> = vec![None; submission.lanes.len()];
-        if !self.adapters.is_empty() {
-            for attachment in &submission.attachments {
-                let Some(bound) = self.adapters.get(&attachment.instance) else {
-                    continue;
-                };
-                // The attachment is its pass's lanes, `lanes` of them from `lane`.
-                for at in attachment.lane..attachment.lane + attachment.lanes.max(1) {
+        // Each attachment's instance that landed an adapter, and the lanes
+        // of its pass (`lanes` of them from `lane`).
+        let adapted: Vec<(InstanceId, u32, u32)> = submission
+            .attachments
+            .iter()
+            .filter(|attachment| self.adapters.contains(&attachment.instance))
+            .map(|attachment| {
+                (
+                    attachment.instance,
+                    attachment.lane,
+                    attachment.lane + attachment.lanes.max(1),
+                )
+            })
+            .collect();
+        let shell = self.loaded_mut()?;
+        if !adapted.is_empty() {
+            let instances: Vec<InstanceId> = adapted.iter().map(|&(id, _, _)| id).collect();
+            let ids = shell.adapter_ids(&instances).map_err(fault)?;
+            for (&(_, from, to), id) in adapted.iter().zip(ids) {
+                for at in from..to {
                     if let Some(slot) = lane_adapters.get_mut(at as usize) {
-                        *slot = Some(bound.slot);
+                        *slot = Some(id);
                     }
                 }
             }
         }
-        let shell = self.loaded_mut()?;
         let mut words: Vec<u64> = submission.lanes.iter().map(|lane| lane.word).collect();
         for (at, slot) in lane_adapters.iter().enumerate() {
             if slot.is_none() {
@@ -1491,7 +1495,7 @@ impl Cuda {
                     },
                     more_windows: if by_refs { &more_windows[at] } else { &[] },
                     mask: lane.mask.as_ref(),
-                    adapter: lane_adapters[at].or(lane.adapter),
+                    adapter: lane_adapters[at],
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
                     rs_slot: records[at].map(|(_, written)| written).or(lane.rs_slot),

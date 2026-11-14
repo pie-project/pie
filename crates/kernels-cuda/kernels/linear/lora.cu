@@ -1,4 +1,5 @@
 #include "prim/device.cuh"
+#include "linear/moe/table.cuh"
 
 namespace pie::linear {
 
@@ -7,6 +8,7 @@ __global__ void lora_combine(
     const i32* __restrict__ routes,
     const T* __restrict__ t,
     const T* __restrict__ bank_b,
+    const u64* __restrict__ table_b,
     T* __restrict__ y,
     const i32* __restrict__ segments,
     int segs,
@@ -28,7 +30,8 @@ __global__ void lora_combine(
     const int adapter = routes[row];
     if (adapter < 0) return;
 
-    const T* b = bank_b + (long long)adapter * adapter_stride;
+    // The adapter's up plane where its table says (its `Adapter` slot).
+    const T* b = expert_plane(bank_b, adapter_stride, table_b, 1, 0, adapter);
     const T* tv = t + (long long)row * rank;
     T* out = y + (long long)row * out_width;
 
