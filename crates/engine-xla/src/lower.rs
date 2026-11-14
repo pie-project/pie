@@ -97,6 +97,81 @@ impl Lower<'_, '_> {
         })
     }
 
+    /// Stages one layer's streamed banks (`crate::store::streamed`, an
+    /// atom's planes) before any select reads them: the experts `routes`
+    /// names in no slot are copied from each bank's host copy into its
+    /// staging rows (`kernels_xla::hlo::Func::stage_misses`; none missing,
+    /// no copy), the pool landed once. Answers each bank's table.
+    pub fn stage_group(
+        &mut self,
+        banks: &[(usize, crate::store::streamed::Bank)],
+        routes: Val,
+    ) -> Result<Vec<(usize, Val)>, Error> {
+        let Some((_, first)) = banks.first() else {
+            return Ok(Vec::new());
+        };
+        let mut pool = self.cx.read(first.pool)?;
+        let mut tables = Vec::with_capacity(banks.len());
+        for &(param, bank) in banks {
+            let loc = self.read(bank.loc)?;
+            let staging = self.read(bank.staging)?;
+            let host = self.cx.read(bank.host)?;
+            let f = self.cx.func();
+            let table = f.reshape(loc.val, &[i64::from(bank.experts)])?;
+            let s = f.dims(staging.val).iter().product::<i64>();
+            let staging = f.reshape(staging.val, &[s])?;
+            let rows = i64::from(bank.plane_rows);
+            let (next, table) = f.stage_misses(pool, table, routes, host, rows, staging)?;
+            pool = next;
+            tables.push((param, table));
+        }
+        self.cx.write(first.pool, pool)?;
+        Ok(tables)
+    }
+
+    /// One layer's streamed banks' tables as the fire lays them (every
+    /// expert in a slot: nothing to stage).
+    pub fn tables(
+        &mut self,
+        banks: &[(usize, crate::store::streamed::Bank)],
+    ) -> Result<Vec<(usize, Val)>, Error> {
+        let mut out = Vec::with_capacity(banks.len());
+        for &(param, bank) in banks {
+            let loc = self.read(bank.loc)?;
+            let f = self.cx.func();
+            out.push((param, f.reshape(loc.val, &[i64::from(bank.experts)])?));
+        }
+        Ok(out)
+    }
+
+    /// A streamed bank as the dense `[experts · rows, width]` value the base
+    /// build reads: a bank view of the pool (`kernels_xla::hlo::BankAt`),
+    /// expert `e`'s panels at pool row `table[e]`, which the grouped matmul
+    /// reads in place.
+    pub fn pooled_bank(
+        &mut self,
+        bank: crate::store::streamed::Bank,
+        width: u32,
+        table: Val,
+    ) -> Result<Operand, Error> {
+        let pool = self.cx.read(bank.pool)?;
+        let f = self.cx.func();
+        let val = f.bank_view(kernels_xla::hlo::BankAt {
+            pool,
+            table,
+            offset: 0,
+            experts: i64::from(bank.experts),
+            n: i64::from(bank.rows),
+            k: i64::from(width),
+        })?;
+        Ok(Operand {
+            val,
+            rows: bank.experts * bank.rows,
+            width,
+            dtype: dtype::Dtype::Bf16,
+        })
+    }
+
     /// A ragged tensor's data, then its indptr.
     pub fn ragged(
         &mut self,

@@ -10,6 +10,7 @@
 //! too; one lane holding the rest otherwise). A padding lane reads and writes
 //! only the sink page and the sink slot.
 
+mod stream;
 mod warm;
 
 use std::collections::BTreeMap;
@@ -244,6 +245,14 @@ pub struct Shell {
     budgets: Budgets,
     weights: Weights,
     pools: Pools,
+    /// The weights streamed through the pool (`crate::store::streamed`);
+    /// empty where the load holds its weights.
+    streamed: crate::store::streamed::Streamed,
+    /// The fire being traced reads its streamed weights through these.
+    fire_streamed: Option<std::sync::Arc<crate::store::streamed::Fire>>,
+    /// The warm ladder's second pass: every fire traced as one that stages
+    /// expert misses (`crate::store::streamed::Fire::stages`).
+    pub(crate) stage_all: bool,
     /// The host tier (CONTRACT-BC 22): chunks of the pool's size.
     host: crate::store::tier::Host,
     /// The slot file below it, kv list slots.
@@ -403,7 +412,13 @@ impl Shell {
                 device.kind()
             );
         }
-        let tuning = kernels_xla::tuning::Tuning::on(&chip, tpu.vmem_bytes());
+        let mut tuning = kernels_xla::tuning::Tuning::on(&chip, tpu.vmem_bytes());
+        // `PIE_XLA_MOE_GMM=0`: routed MLPs take no grouped-matmul (Mosaic)
+        // kernel, as the other Mosaic switches turn theirs off (a GPU
+        // plugin runs none).
+        if std::env::var("PIE_XLA_MOE_GMM").is_ok_and(|v| v == "0") {
+            tuning.moe_path = kernels_xla::tuning::MoePath::Auto { gmm: false };
+        }
         let engine = crate::chip::Engine::of(&chip);
         let pad = engine.pad;
         let mut boot = Boot {
@@ -656,6 +671,21 @@ impl Shell {
                 .saturating_sub(reserved)
                 .saturating_sub(headroom)
         });
+        // A load told its weights are held streams nothing: every plane
+        // lands as the base build lands it, and its programs are the base
+        // build's. Else the streamable weights live in the pool, seated
+        // whole at load (`crate::store::streamed`).
+        let mut streamed = if boot.device.stream_weights && !device.is_dry() {
+            crate::store::streamed::Streamed::plan(&boot.trace, 0, budgets.tokens.max_tokens)?
+        } else {
+            crate::store::streamed::Streamed::default()
+        };
+        let streamed_bytes: u64 = streamed
+            .shapes
+            .iter()
+            .map(|s| s.slot_bytes * u64::from(s.count))
+            .sum();
+        let device_cap = device_cap.saturating_sub(streamed_bytes);
         let weights = if device.is_dry() {
             // A device of the target's size would pre-scale an mxfp4 bank
             // when the weights leave room for it: under 5/8 of its HBM (20 of
@@ -675,6 +705,7 @@ impl Shell {
                 boot.checkpoint,
                 device_cap,
                 &engine,
+                (!streamed.is_empty()).then_some(&mut streamed),
             )?
         };
         let pools = Pools::reserve(
@@ -686,8 +717,33 @@ impl Shell {
             rs_layout.as_deref(),
             demand(fit, slots),
             target,
+            Some(&mut streamed),
+            boot.device.pool_extra_chunks,
         )?;
+        let mut pools = pools;
+        streamed.renumber(narrow(pools.layout().shapes.len() as u64) as u32);
+        pools.view_weights(&handles, &streamed)?;
+        pools.land_host_banks(&device, &handles, &streamed)?;
+        streamed.release_expert_copies();
         handles.seal();
+        if !streamed.is_empty() {
+            for at in 0..streamed.shapes.len() {
+                let shape = &streamed.shapes[at];
+                let atoms: Vec<(u32, u32)> = (0..shape.count)
+                    .map(|atom| (atom, shape.slots[atom as usize]))
+                    .collect();
+                stream::fill(&streamed, &mut pools, &device, &handles, at, &atoms)?;
+            }
+            tracing::info!(
+                shapes = ?streamed
+                    .shapes
+                    .iter()
+                    .map(|s| (s.id.0, s.name.as_str(), s.count, s.slot_bytes, s.per_chunk))
+                    .collect::<Vec<_>>(),
+                first_chunk = pools.weight_start(),
+                "xla weights streamed: every atom seated in the pool"
+            );
+        }
 
         let exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled)
             .map_err(|why| Fault::Unbound { what: why })?;
@@ -777,6 +833,9 @@ impl Shell {
             budgets,
             weights,
             pools,
+            streamed,
+            fire_streamed: None,
+            stage_all: false,
             host: crate::store::tier::Host::default(),
             disk: None,
             exports,
@@ -897,6 +956,14 @@ impl Shell {
     }
 
     #[must_use]
+    pub fn streams_experts(&self) -> bool {
+        self.streamed
+            .shapes
+            .iter()
+            .any(|s| matches!(s.form, crate::store::streamed::Form::Experts { .. }))
+    }
+
+    #[must_use]
     pub fn has_state(&self) -> bool {
         self.pools.has_state()
     }
@@ -997,6 +1064,7 @@ impl Shell {
     #[must_use]
     pub fn tiered_facts(&self) -> engine::chunk::ChunkFacts {
         let mut facts = self.pools.facts();
+        facts.weights = self.streamed.facts();
         facts.host_chunks = self.host.chunks();
         if let (Some(disk), Some(kv)) = (&self.disk, self.pools.layout().kv()) {
             let spc = self.pools.layout().slots_per_chunk(kv).max(1);
@@ -1990,6 +2058,43 @@ impl Shell {
                 );
             }
         }
+        // The streamed weights this fire reads: each streamed table's row
+        // for every token row, each streamed bank's expert places
+        // (`crate::store::streamed`).
+        let feed_rows: Vec<(u32, usize)> = token_feeds
+            .iter()
+            .map(|feed| {
+                composition
+                    .lanes()
+                    .iter()
+                    .find(|row| row.source as usize == feed.lane)
+                    .map_or((0, feed.lane), |row| (row.row_offset, feed.lane))
+            })
+            .collect();
+        let mut real_rows = vec![false; tokens.len()];
+        for row in composition.lanes() {
+            if (row.source as usize) < real {
+                let from = row.row_offset as usize;
+                for r in real_rows.iter_mut().skip(from).take(row.rows as usize) {
+                    *r = true;
+                }
+            }
+        }
+        let runs_now = self.deferred.is_none() && !self.device.is_dry();
+        let staged_weights = stream::stream_fire(
+            &mut self.streamed,
+            &mut self.pools,
+            &self.device,
+            handles,
+            &mut inputs,
+            &tokens,
+            &token_feeds,
+            &feed_rows,
+            &real_rows,
+            runs_now,
+            self.stage_all,
+        )?;
+        self.fire_streamed = staged_weights.fire.clone();
         // **THE STATED POSITION IS A ROTATION, NOT A ROW.** The rotary ops
         // read `positions` (what the lane states: shifted past an attention
         // sink, rewound by a StreamingLLM inferlet, or M-RoPE's text rotating
@@ -2205,10 +2310,11 @@ impl Shell {
         // Formatted only where the shape key misses: at 256 lanes the
         // descriptor's text is a tenth of a decode's host time.
         let gathers_readout = self.gathers_readout;
+        let stages = self.fire_streamed.as_ref().is_some_and(|f| f.stages);
         let full_key = |probes: &[ValueId]| -> [u8; 32] {
             *blake3::hash(
                 format!(
-                    "{descriptor:?}|{windows:?}|{}|{max_pages}|{}|{}|{rs_active}|{dit_key}|{:?}|{readout_spans:?}",
+                    "{descriptor:?}|{windows:?}|{}|{max_pages}|{}|{}|{rs_active}|{dit_key}|{:?}|{readout_spans:?}|{stages}",
                     inputs.shapes(),
                     readout_rows.len(),
                     gathers_readout,
@@ -2230,7 +2336,7 @@ impl Shell {
                 descriptor.lanes.iter().map(|l| (l.class, l.word)).collect();
             *blake3::hash(
                 format!(
-                    "{:?}|{}|{}|{lanes:?}|{}|{}|{max_pages}|{}|{}|{rs_active}|{readout_spans:?}",
+                    "{:?}|{}|{}|{lanes:?}|{}|{}|{max_pages}|{}|{}|{rs_active}|{readout_spans:?}|{stages}",
                     descriptor.classes,
                     descriptor.rows,
                     descriptor.bucket,
@@ -2796,7 +2902,8 @@ impl Shell {
             .with_rs(rs)
             .with_readout_rowed(&self.readout_rowed)
             .with_probes(self.probes.clone())
-            .with_head_norms(Self::head_norms(&self.trace));
+            .with_head_norms(Self::head_norms(&self.trace))
+            .with_streamed(self.fire_streamed.clone());
             walk(
                 &self.trace,
                 &self.compiled,

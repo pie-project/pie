@@ -45,12 +45,22 @@ pub enum Source {
     Pack,
     /// An activation computed by this fire; zeros until written.
     Temp,
+    /// A streamed weight (`crate::store::streamed`): it lives in the pool,
+    /// read through per-fire tables, never as a parameter of its own.
+    Streamed { param: u32 },
+    /// A streamed bank's planes in pinned host memory, each expert's plane
+    /// as the pool lays it (`crate::store::streamed`): a fire copies the
+    /// routed experts in no slot from it into staging slots.
+    HostBank { param: u32 },
 }
 
 impl Source {
     #[must_use]
     pub const fn on_device(self) -> bool {
-        !matches!(self, Source::Temp | Source::Packed { .. })
+        !matches!(
+            self,
+            Source::Temp | Source::Packed { .. } | Source::Streamed { .. }
+        )
     }
 
     #[must_use]
@@ -412,6 +422,15 @@ fn root_value(
         return Ok(v);
     }
     let r = handles.root_of(root);
+    if let Source::Streamed { param } = r.source {
+        return Err(kernels_xla::Error::Backend {
+            op: "trace",
+            detail: format!(
+                "weight {param} streams through the pool and is read only through its \
+                 tables, never whole"
+            ),
+        });
+    }
     let ty = storage(r.dtype, r.rows, r.width).ok_or_else(|| kernels_xla::Error::Backend {
         op: "trace",
         detail: format!("root {root} is {:?}, which has no storage form", r.dtype),
@@ -453,6 +472,11 @@ fn root_value(
         } else {
             func.slice_axis(t, 0, 0, ty.dims[0])?
         }
+    } else if let Source::HostBank { .. } = r.source {
+        params.push((root, r.source));
+        let p = func.param(ty, None);
+        func.pin_host(p);
+        p
     } else if r.source.on_device() {
         params.push((root, r.source));
         let p = func.param(ty, None);

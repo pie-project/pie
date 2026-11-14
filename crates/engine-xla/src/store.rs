@@ -20,6 +20,7 @@
 
 pub mod kv;
 pub mod layout;
+pub mod streamed;
 pub mod tier;
 
 use crate::handle::{KvPool, RecurrentPool, Tensor};
@@ -78,6 +79,9 @@ fn state_dtype(declared: Dtype) -> Dtype {
 /// chunk the runtime never hands out.
 const NULL_CHUNK: u32 = 0;
 const RESERVED_CHUNKS: u32 = 2;
+
+/// Lone weight slots one program lands at most.
+const LONE_SLOTS: usize = 64;
 
 /// A plane's affine map: page or slot id `p` is the plane's block
 /// `p · stride + offset` of its view.
@@ -151,6 +155,15 @@ pub struct Pools {
     views: Vec<(What, Tensor, Map)>,
     paging: Paging,
     bytes: u64,
+    /// The chunks the load seated the streamed weights in, just below the
+    /// sink (`crate::store::streamed`); 0 where none streams.
+    weight_chunks: u32,
+    /// Each streamed weight plane's view of the pool: `(width, view)`,
+    /// bf16 rows of `width`.
+    weight_views: Vec<(u32, Tensor)>,
+    /// Each streamed bank's miss copy in pinned host memory: `(param, pool
+    /// rows an expert's plane takes, root, buffer)`.
+    host_banks: Vec<(u32, u32, Tensor, Buffer)>,
 }
 
 impl std::fmt::Debug for Pools {
@@ -424,13 +437,30 @@ impl Pools {
         rs: Option<&crate::rs::Layout>,
         bytes: u64,
         target: u64,
+        streamed: Option<&mut streamed::Streamed>,
+        extra_chunks: u32,
     ) -> Result<Pools> {
         let (rows, heads) = layout_rows(trace, paging, facts, rs)?;
-        let layout = Layout::of(&rows, target)?;
+        let layout = match &streamed {
+            Some(s) if !s.is_empty() => Layout::of_with(&rows, target, s.unit, s.least)?,
+            _ => Layout::of(&rows, target)?,
+        };
         // `bytes` buys pages and state slots; the null and sink chunks lie
         // past them ([`reserved_bytes`]).
         let least = RESERVED_CHUNKS + narrow(layout.shapes.len() as u64);
         let chunks = (RESERVED_CHUNKS + narrow(bytes / layout.chunk_bytes.max(1))).max(least);
+        // The streamed weights seated whole, in chunks of their own just
+        // below the sink: the state chunks the pool would have had stay
+        // below them.
+        let (chunks, weight_chunks) = match streamed {
+            Some(s) if !s.is_empty() => {
+                let weight_chunks = s.chunks(layout.chunk_bytes);
+                let chunks = chunks + weight_chunks;
+                s.seat(layout.chunk_bytes, chunks - 1 - weight_chunks)?;
+                (chunks, weight_chunks)
+            }
+            _ => (chunks + extra_chunks, 0),
+        };
         layout.check_reach(chunks)?;
         let pool_rows = u64::from(chunks) * layout.chunk_bytes / ROW_BYTES;
         let pool_rows = u32::try_from(pool_rows).map_err(|_| Fault::Ceiling {
@@ -552,7 +582,242 @@ impl Pools {
             views,
             paging,
             bytes: total,
+            weight_chunks,
+            weight_views: Vec::new(),
+            host_banks: Vec::new(),
         })
+    }
+
+    /// Lands each streamed bank's miss copy in pinned host memory
+    /// (`Streamed::host_banks`), a root each (before the handles seal).
+    pub fn land_host_banks(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        streamed: &streamed::Streamed,
+    ) -> Result<()> {
+        for (param, rows, bytes) in streamed.host_banks()? {
+            let all =
+                u32::try_from(bytes.len() as u64 / ROW_BYTES).map_err(|_| Fault::Ceiling {
+                    what: "rows of a host bank",
+                    need: bytes.len() as u64 / ROW_BYTES,
+                    have: u64::from(u32::MAX),
+                })?;
+            let buffer = device.upload_host(Dtype::U32, all, 128, &bytes)?;
+            let p = u32::try_from(param).unwrap_or(u32::MAX);
+            let tensor = handles.root(Root {
+                source: Source::HostBank { param: p },
+                dtype: Dtype::U32,
+                rows: all,
+                width: 128,
+            });
+            self.host_banks.push((p, rows, tensor, buffer));
+        }
+        Ok(())
+    }
+
+    /// The miss copy of streamed bank `param`: its buffer.
+    #[must_use]
+    pub fn host_bank(&self, param: u32) -> Option<&Buffer> {
+        self.host_banks.iter().find(|b| b.0 == param).map(|b| &b.3)
+    }
+
+    /// The miss copy of streamed bank `param`: its root and the pool rows an
+    /// expert's plane takes.
+    #[must_use]
+    pub fn host_bank_root(&self, param: u32) -> Option<(Tensor, u32)> {
+        self.host_banks
+            .iter()
+            .find(|b| b.0 == param)
+            .map(|b| (b.2, b.1))
+    }
+
+    /// The pool's whole root (u32 `[rows, 128]`).
+    #[must_use]
+    pub fn root(&self) -> Tensor {
+        self.root
+    }
+
+    /// Mints a bf16 view of the pool `width` wide for each width the
+    /// streamed weights' planes read (before the handles seal).
+    pub fn view_weights(&mut self, handles: &Handles, streamed: &streamed::Streamed) -> Result<()> {
+        for shape in &streamed.shapes {
+            for plane in &shape.planes {
+                if self.weight_views.iter().any(|(w, _)| *w == plane.view) {
+                    continue;
+                }
+                let t = handles
+                    .view(self.root, Dtype::Bf16, plane.view)
+                    .map_err(|e| Fault::Unbound {
+                        what: format!("a {}-wide weight view of the pool: {e}", plane.view),
+                    })?;
+                self.weight_views.push((plane.view, t));
+            }
+        }
+        Ok(())
+    }
+
+    /// The bf16 view of the pool `width` wide.
+    #[must_use]
+    pub fn weight_view(&self, width: u32) -> Option<Tensor> {
+        self.weight_views
+            .iter()
+            .find(|(w, _)| *w == width)
+            .map(|&(_, t)| t)
+    }
+
+    /// The first chunk the streamed weights were seated in (the sink where
+    /// none streams).
+    #[must_use]
+    pub fn weight_start(&self) -> u32 {
+        self.sink_chunk() - self.weight_chunks
+    }
+
+    /// Byte offset in the pool of weight slot ref `slot` of `shape`.
+    pub fn weight_offset(&self, shape: &streamed::Shape, slot: u32) -> Result<u64> {
+        let spc = shape.per_chunk.max(1);
+        let logical = slot / spc;
+        let chunk = self.table.physical(logical).ok_or(Fault::Ceiling {
+            what: "chunks a weight slot ref names",
+            need: u64::from(logical) + 1,
+            have: u64::from(self.chunks),
+        })?;
+        if chunk == NULL_CHUNK || chunk >= self.sink_chunk() {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "weight slot ref {slot} of {}, which lies in reserved chunk {chunk}",
+                    shape.name
+                ),
+            });
+        }
+        Ok(u64::from(chunk) * self.layout.chunk_bytes + u64::from(slot % spc) * shape.slot_bytes)
+    }
+
+    /// Lands whole slots of a weight shape: `(slot ref, bytes)` each its
+    /// slot's bytes.
+    pub fn write_weights(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        shape: &streamed::Shape,
+        slots: &[(u32, Vec<u8>)],
+    ) -> Result<()> {
+        let rows = shape.slot_bytes / ROW_BYTES;
+        let mut placed: Vec<(i64, &[u8])> = slots
+            .iter()
+            .map(|(slot, bytes)| {
+                self.weight_offset(shape, *slot).map(|o| {
+                    (
+                        i64::try_from(o / ROW_BYTES).unwrap_or(i64::MAX),
+                        bytes.as_slice(),
+                    )
+                })
+            })
+            .collect::<Result<_>>()?;
+        placed.sort_by_key(|&(at, _)| at);
+        // Slots that lie back to back land as one block (the load seats a
+        // shape's atoms in a row), up to a few hundred MiB an upload; lone
+        // slots land a few dozen to a program (one update each), so the
+        // programs are few and small.
+        let most = i64::try_from(((256u64 << 20) / shape.slot_bytes.max(1)).max(1)).unwrap_or(1);
+        let step = i64::try_from(rows).unwrap_or(i64::MAX);
+        let mut runs: Vec<(i64, Vec<&[u8]>)> = Vec::new();
+        for (at, bytes) in placed {
+            match runs.last_mut() {
+                Some((start, run))
+                    if *start + step * run.len() as i64 == at && (run.len() as i64) < most =>
+                {
+                    run.push(bytes);
+                }
+                _ => runs.push((at, vec![bytes])),
+            }
+        }
+        let (lone, long): (Vec<_>, Vec<_>) = runs.into_iter().partition(|(_, run)| run.len() == 1);
+        for (start, run) in long {
+            let bytes: Vec<u8> = run.concat();
+            self.write_rows(
+                device,
+                handles,
+                rows * run.len() as u64,
+                vec![start],
+                &bytes,
+            )?;
+        }
+        for batch in lone.chunks(LONE_SLOTS) {
+            let at: Vec<i64> = batch.iter().map(|(at, _)| *at).collect();
+            let bytes: Vec<u8> = batch
+                .iter()
+                .flat_map(|(_, run)| run[0].iter().copied())
+                .collect();
+            self.write_rows(device, handles, rows, at, &bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Fills pool slots of streamed bank `param` from its pinned host copy,
+    /// in the program: each `(expert, pool row)` lands that expert's plane
+    /// at the row. One program a bank shape, as many experts a run as the
+    /// bank holds (the rest copy nothing), so the load's seating warms what
+    /// a residency later runs.
+    pub fn fill_from_bank(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        param: u32,
+        fills: &[(u32, i64)],
+    ) -> Result<()> {
+        if fills.is_empty() || device.is_dry() {
+            return Ok(());
+        }
+        let (host, rows) = self.host_bank_root(param).ok_or_else(|| Fault::Unbound {
+            what: format!("the host copy of streamed bank {param}"),
+        })?;
+        let all = self
+            .host_banks
+            .iter()
+            .find(|b| b.0 == param)
+            .map_or(0, |b| {
+                b.3.dims()
+                    .ok()
+                    .and_then(|d| d.first().copied())
+                    .unwrap_or(0)
+            });
+        let width = usize::try_from(all / i64::from(rows.max(1)))
+            .unwrap_or(0)
+            .max(1);
+        for batch in fills.chunks(width) {
+            let mut from: Vec<i32> = batch
+                .iter()
+                .map(|&(e, _)| narrow(u64::from(e)) as i32)
+                .collect();
+            let mut to: Vec<i32> = batch
+                .iter()
+                .map(|&(_, at)| i32::try_from(at).unwrap_or(i32::MAX))
+                .collect();
+            from.resize(width, 0);
+            to.resize(width, 0);
+            let mut inputs = crate::inputs::Inputs::new();
+            let from = inputs.i32s(handles, &from, 1);
+            let to = inputs.i32s(handles, &to, 1);
+            let count = inputs.i32s(handles, &[batch.len() as i32], 1);
+            let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
+            let root = self.root;
+            let w = width as i64;
+            tracer.emit(&mut |cx| {
+                let pool = cx.read(root)?;
+                let bank = cx.read(host)?;
+                let from = cx.read(from)?;
+                let from = cx.reshape(from, &[w])?;
+                let to = cx.read(to)?;
+                let to = cx.reshape(to, &[w])?;
+                let count = cx.read(count)?;
+                let count = cx.reshape(count, &[])?;
+                let pool = cx.copy_from_host(pool, bank, from, to, count, i64::from(rows))?;
+                cx.write(root, pool)
+            })?;
+            crate::exec::maintain(device, tracer, self, &inputs)?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -701,7 +966,11 @@ impl Pools {
     /// wrapping over the pool. What such fires write is never read.
     #[must_use]
     pub fn scratch(&self, lane: u32, pages: usize) -> Scratch {
-        let room = u64::from(self.chunks.saturating_sub(RESERVED_CHUNKS).max(1));
+        let room = u64::from(
+            self.chunks
+                .saturating_sub(RESERVED_CHUNKS + self.weight_chunks)
+                .max(1),
+        );
         let refs = |shape: &layout::Shape, n: usize, from: u64| -> Vec<u32> {
             let spc = u64::from(self.layout.slots_per_chunk(shape).max(1));
             (0..n as u64)
@@ -1192,10 +1461,26 @@ impl Pools {
                 ),
             });
         }
-        let mut at: Vec<i64> = slots
+        let at: Vec<i64> = slots
             .iter()
             .map(|&slot| self.rows_at(id, self.grain(id, slot)?))
             .collect::<Result<_>>()?;
+        self.write_rows(device, handles, rows, at, bytes)
+    }
+
+    /// Lands `bytes`, blocks of `rows` pool rows each, at pool rows `at`:
+    /// one upload, a `dynamic_update_slice` a block.
+    fn write_rows(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        rows: u64,
+        mut at: Vec<i64>,
+        bytes: &[u8],
+    ) -> Result<()> {
+        if at.is_empty() || device.is_dry() {
+            return Ok(());
+        }
         // Pads repeat the last slot with its own bytes.
         let n = at.len();
         pad_pow2(&mut at, 1);

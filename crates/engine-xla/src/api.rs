@@ -69,6 +69,17 @@ pub struct DeviceBoot {
     /// The tokens a hybrid's state slot is balanced against the kv pages
     /// for (a sequence's expected prompt and output); `None`: the context.
     pub seat_tokens: Option<u32>,
+
+    /// The load streams its streamable weights through the pool
+    /// (`crate::store::streamed`): set by each load from
+    /// `Residency::weights_held` (held: `false`, every plane lands as the
+    /// base build lands it).
+    pub stream_weights: bool,
+
+    /// Chunks a load that streams nothing adds to its pool: a test that
+    /// compares it with a streaming load at one pool size (the streamed
+    /// weights' chunks).
+    pub pool_extra_chunks: u32,
 }
 
 impl Default for DeviceBoot {
@@ -81,6 +92,8 @@ impl Default for DeviceBoot {
             window_pool: true,
             headroom: None,
             seat_tokens: None,
+            stream_weights: false,
+            pool_extra_chunks: 0,
         }
     }
 }
@@ -343,6 +356,7 @@ impl Engine for Xla {
             frames_in_flight: _,
         } = request;
         let mut boot = self.boot.clone();
+        boot.stream_weights = !residency.weights_held;
         if ordinal > 0 {
             boot.ordinal = u32::try_from(ordinal).unwrap_or(0);
         }
@@ -710,6 +724,16 @@ impl Engine for Xla {
     /// source or destination is a host or disk chunk (`SlotCopy`'s tier,
     /// from sc/tier-shared's contract) lands here; until that contract is
     /// merged only device-to-device copies are served.
+    fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
+        self.loaded_mut()?
+            .weight_residency(residency)
+            .map_err(fault)
+    }
+
+    fn weight_uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        Ok(self.loaded_mut()?.weight_uses())
+    }
+
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         use crate::serve::Tier;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);

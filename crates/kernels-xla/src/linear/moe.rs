@@ -955,8 +955,14 @@ fn read_bank(f: &mut Func, form: Form, fan: Fan) -> Result<Read, Error> {
     Ok(match form {
         Form::Dense(bank) => {
             let w = bank.val;
+            // A bank view is `[rows, k]` already (and has no text to reshape).
+            let w = if f.bank_parts(w).is_some() && f.dims(w) == [rows, fan.k] {
+                w
+            } else {
+                f.reshape(w, &[rows, fan.k])?
+            };
             Read {
-                codes: Codes::Weights(f.reshape(w, &[rows, fan.k])?),
+                codes: Codes::Weights(w),
                 factor: None,
                 bias: None,
             }
@@ -1154,6 +1160,7 @@ fn gmm_spec(
         sums: None,
         run: 1,
         glu: None,
+        pooled: None,
     };
     spec.out_width().ok().map(|_| spec)
 }
@@ -1204,6 +1211,7 @@ pub(crate) fn tile_projection(
         sums,
         run: 1,
         glu: None,
+        pooled: None,
     };
     if spec.out_width().ok() != Some(n) {
         return Ok(None);
@@ -1629,6 +1637,9 @@ struct Sorted {
     src: Val,
     /// The pair each row holds (a pad row: `>= p`).
     held: Val,
+    /// Each row's place in that order, where the order was ranked rather
+    /// than sorted ([`ranked`]).
+    pos: Option<Val>,
     /// The weight each row carries (0 for a pad), when the sort carried one.
     ws: Option<Val>,
     /// Each tile's run (its expert's rank among the routed ones) and the
@@ -1796,9 +1807,15 @@ fn sorted(
         let none = f.const_f(Elem::F32, 0.0, &[fill]);
         carried.push(f.concat(&[w, none], 0)?);
     }
-    let by = f.sort(&carried, 0, true, |fq, a, b| {
-        fq.compare(Cmp::Lt, a[0], b[0])
-    })?;
+    let (by, pos) = if rows <= RANKED_ROWS {
+        let (by, pos) = ranked(f, &carried)?;
+        (by, Some(pos))
+    } else {
+        let by = f.sort(&carried, 0, true, |fq, a, b| {
+            fq.compare(Cmp::Lt, a[0], b[0])
+        })?;
+        (by, None)
+    };
     let held = by[1];
     // Padded row `i` holds pair `held[i]` (a pad when `>= p`).
     let src = {
@@ -1829,6 +1846,7 @@ fn sorted(
         xs,
         src,
         held,
+        pos,
         ws: weights.map(|_| by[2]),
         run,
         nxt,
@@ -1838,8 +1856,54 @@ fn sorted(
     })
 }
 
+/// Fires of at most this many padded rows rank their rows instead of
+/// sorting them: two `[rows, rows]` compares in place of XLA's sort, which
+/// costs some 3 us however few the rows (v6e, Qwen3-30B-A3B decode c1: two
+/// sorts a routed matmul, a fifth of its time).
+const RANKED_ROWS: i64 = 256;
+
+/// What a stable ascending sort on `xs[0]` (i32 keys) answers, without the
+/// sort: each row's place is how many rows' keys are smaller, and how many
+/// equal ones come before it. Answers the carried values in that order,
+/// and each row's place.
+fn ranked(f: &mut Func, xs: &[Val]) -> Result<(Vec<Val>, Val), Error> {
+    let n = f.dims(xs[0])[0];
+    let mine = f.broadcast(xs[0], &[n, n], &[0])?;
+    let theirs = f.broadcast(xs[0], &[n, n], &[1])?;
+    let less = f.compare(Cmp::Lt, theirs, mine)?;
+    let same = f.compare(Cmp::Eq, theirs, mine)?;
+    let ri = f.iota(Elem::I32, &[n, n], 0);
+    let ci = f.iota(Elem::I32, &[n, n], 1);
+    let before = f.compare(Cmp::Lt, ci, ri)?;
+    let tie = f.and(same, before)?;
+    let ahead = f.or(less, tie)?;
+    let one = f.const_i(Elem::I32, 1, &[n, n]);
+    let zero = f.const_i(Elem::I32, 0, &[n, n]);
+    let ahead = f.select(ahead, one, zero)?;
+    let pos = f.reduce(ahead, &[1], Fold::Sum)?;
+    // Place `i` holds the row whose place is `i`: one hit a place.
+    let pb = f.broadcast(pos, &[n, n], &[1])?;
+    let at = f.compare(Cmp::Eq, pb, ri)?;
+    let mut out = Vec::with_capacity(xs.len());
+    for &x in xs {
+        let elem = f.elem(x);
+        let xb = f.broadcast(x, &[n, n], &[1])?;
+        let none = if elem.is_float() {
+            f.const_f(elem, 0.0, &[n, n])
+        } else {
+            f.const_i(elem, 0, &[n, n])
+        };
+        let hit = f.select(at, xb, none)?;
+        out.push(f.reduce(hit, &[1], Fold::Sum)?);
+    }
+    Ok((out, pos))
+}
+
 /// Pair `i`'s row of the kernel's result: where the sort put it.
 fn dest(f: &mut Func, sorted: &Sorted, p: i64) -> Result<Val, Error> {
+    if let Some(pos) = sorted.pos {
+        return Ok(f.slice(pos, &[0], &[p], &[1])?);
+    }
     let rows = f.dims(sorted.held)[0];
     let iota = f.iota(Elem::I32, &[rows], 0);
     let back = f.sort(&[sorted.held, iota], 0, true, |fq, a, b| {
@@ -1866,12 +1930,60 @@ fn tiles_of(
     let kernel = spec.kernel()?;
     if spec.stepping() {
         let st = steps(f, spec, sorted)?;
-        return Ok(kernel.call(f, &[st[0], st[1], st[2], st[3], st[4], st[5], xs, w])?[0]);
+        let args = pooled_args(f, &[(spec, w)], st.to_vec(), vec![xs, w])?;
+        return Ok(kernel.call(f, &args)?[0]);
     }
     if spec.prefetching() {
-        return Ok(kernel.call(f, &[sorted.se, sorted.nt, sorted.run, sorted.nxt, xs, w])?[0]);
+        let pre = vec![sorted.se, sorted.nt, sorted.run, sorted.nxt];
+        let args = pooled_args(f, &[(spec, w)], pre, vec![xs, w])?;
+        return Ok(kernel.call(f, &args)?[0]);
     }
     Ok(kernel.call(f, &[sorted.se, sorted.nt, xs, w])?[0])
+}
+
+/// A kernel's operands with its banks in the pool: each pooled bank's table
+/// after the scalar-prefetched ones (in `banks` order), and the pool in the
+/// bank's place.
+fn pooled_args(
+    f: &mut Func,
+    banks: &[(crate::linear::moe_gmm::Gmm, Val)],
+    mut pre: Vec<Val>,
+    mut ins: Vec<Val>,
+) -> Result<Vec<Val>, Error> {
+    for &(spec, bank) in banks {
+        if let Some(at) = f.bank_parts(bank).filter(|_| spec.pooled.is_some()) {
+            pre.push(at.table);
+            for v in &mut ins {
+                if *v == bank {
+                    *v = at.pool;
+                }
+            }
+        }
+    }
+    pre.extend(ins);
+    Ok(pre)
+}
+
+/// `spec` reading a bank view in place, where its kernel takes a pooled
+/// bank (one expert fetched whole, a run at a time); `None` where it does
+/// not (the bank's experts are then sliced or the bank read whole).
+fn pooled_spec(
+    f: &Func,
+    spec: Option<crate::linear::moe_gmm::Gmm>,
+    bank: &Read,
+) -> Option<crate::linear::moe_gmm::Gmm> {
+    let Some(at) = f.bank_parts(bank.codes.val()) else {
+        return spec;
+    };
+    let rows = f.dims(at.pool)[0];
+    let spec = crate::linear::moe_gmm::Gmm {
+        pooled: Some(crate::linear::moe_gmm::Pooled {
+            rows,
+            offset: at.offset,
+        }),
+        ..spec?
+    };
+    (spec.prefetching() && spec.kernel().is_ok()).then_some(spec)
 }
 
 /// The routed matmul every select entry lowers to: `y[t*k + s] = W[routes[t,
@@ -1925,7 +2037,16 @@ fn routed(
     // A forced `gmm` falls back to `all` for a bank the kernel does not read.
     let mxfp4 = matches!(form, Form::Mxfp4 { .. });
     let grouped = gmm_spec(fan, &bank, f.elem(bank.codes.val()), mxfp4, tuning);
+    // A bank view (experts in the pool): the kernel reads it in place, or
+    // each pair's expert is sliced out of it; any other path reads it whole.
+    let viewed = f.bank_parts(bank.codes.val()).is_some();
+    let grouped = pooled_spec(f, grouped, &bank);
     let path = match tuning.moe_path {
+        // (one token's pairs too: sliced out of its panels, each expert
+        // is put back together in XLA, a copy a pair; v6e MoE mini decode
+        // c1 at half the held rate)
+        _ if viewed && grouped.is_some() => MoePath::Gmm,
+        _ if viewed && grouped.is_none() && p <= c.slice_pairs => MoePath::Slice,
         MoePath::Gmm if grouped.is_none() => MoePath::All,
         // One token's pairs route to as many experts: sliced out, they read
         // what the grouped matmul would, without its sort (v6e,
@@ -1948,6 +2069,15 @@ fn routed(
         MoePath::Auto { .. } if worth >= p => MoePath::Loop,
         MoePath::Auto { .. } => MoePath::Active,
         forced => forced,
+    };
+    let bank = if viewed && !matches!(path, MoePath::Gmm | MoePath::Slice) {
+        let w = f.bank_solid(bank.codes.val(), "a routed select off the kernel")?;
+        Read {
+            codes: bank.codes.with(w),
+            ..bank
+        }
+    } else {
+        bank
     };
     let y = match path {
         MoePath::Slice => {
@@ -2072,6 +2202,14 @@ fn routed(
 
 /// Expert `e`'s (an i32 scalar) rows of a read bank: `[N, ..]` of each plane.
 fn expert(f: &mut Func, bank: &Read, e: Val, n: i64) -> Result<Read, Error> {
+    if f.bank_parts(bank.codes.val()).is_some() {
+        let w = f.bank_expert(bank.codes.val(), e)?;
+        return Ok(Read {
+            codes: bank.codes.with(w),
+            factor: None,
+            bias: None,
+        });
+    }
     let nn = f.const_i(Elem::I32, n, &[]);
     let at = f.mul(e, nn)?;
     let zero = f.const_i(Elem::I32, 0, &[]);
@@ -2459,8 +2597,16 @@ pub fn experts(
     let elem = |f: &mut Func, b: &Read| f.elem(b.codes.val());
     let (ue, de) = (elem(f, &up_bank), elem(f, &down_bank));
     let (Some(up), Some(dn)) = (
-        bf16_rows(gmm_spec(up_fan, &up_bank, ue, false, tuning)),
-        bf16_rows(gmm_spec(down_fan, &down_bank, de, false, tuning)),
+        pooled_spec(
+            f,
+            bf16_rows(gmm_spec(up_fan, &up_bank, ue, false, tuning)),
+            &up_bank,
+        ),
+        pooled_spec(
+            f,
+            bf16_rows(gmm_spec(down_fan, &down_bank, de, false, tuning)),
+            &down_bank,
+        ),
     ) else {
         return Ok(None);
     };
@@ -2532,14 +2678,13 @@ pub fn experts(
             crate::linear::moe_gmm::Orient::KMajor => f.transpose(wd, &[1, 0])?,
             crate::linear::moe_gmm::Orient::NMajor => wd,
         };
-        Some(
-            kernel.call(
-                f,
-                &[
-                    st[0], st[1], st[2], st[3], st[4], st[5], sorted.xs, wu, wl, wd,
-                ],
-            )?[0],
-        )
+        let args = pooled_args(
+            f,
+            &[(inside, wu), (dn, wd)],
+            st.to_vec(),
+            vec![sorted.xs, wu, wl, wd],
+        )?;
+        Some(kernel.call(f, &args)?[0])
     } else {
         None
     };
@@ -2550,10 +2695,8 @@ pub fn experts(
                 let wl = f.broadcast(ws, &[rows, 128], &[0])?;
                 let st = steps(f, inside, &sorted)?;
                 let w = up_bank.codes.val();
-                inside.kernel()?.call(
-                    f,
-                    &[st[0], st[1], st[2], st[3], st[4], st[5], sorted.xs, w, wl],
-                )?[0]
+                let args = pooled_args(f, &[(inside, w)], st.to_vec(), vec![sorted.xs, w, wl])?;
+                inside.kernel()?.call(f, &args)?[0]
             } else {
                 let up_rows = tiles_of(f, up, &up_bank, &sorted, sorted.xs)?;
                 let held = Operand {

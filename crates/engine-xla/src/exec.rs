@@ -22,9 +22,11 @@ pub fn run(
     let t0 = std::time::Instant::now();
     let (text, sig) = tracer.finish(extra);
     let t1 = std::time::Instant::now();
-    let program = device.program(&text, sig)?;
+    // The program is cached by its text: one traced over other roots of the
+    // same shapes (another host bank, say) binds this trace's roots.
+    let program = device.program(&text, sig.clone())?;
     let t2 = std::time::Instant::now();
-    let out = run_program(device, &program, weights, pools, inputs, wait);
+    let out = bind_and_run(device, &sig, &program, weights, pools, inputs, wait);
     if crate::serve::timing() {
         eprintln!(
             "  xla run: finish {:.2}ms ({} KiB) lookup {:.2}ms bind+run {:.2}ms",
@@ -114,9 +116,10 @@ fn bind_and_run(
                 weights.and_then(|w| w.buffer_plane(param, plane))
             }
             Source::Pool { row, plane } => pools.get(row, plane),
+            Source::HostBank { param } => pools.host_bank(param),
             Source::Input { input } => uploaded.iter().find(|(i, _)| *i == input).map(|(_, b)| b),
             Source::Pack => pack.as_ref(),
-            Source::Temp | Source::Packed { .. } => None,
+            Source::Temp | Source::Packed { .. } | Source::Streamed { .. } => None,
         }
         .ok_or_else(|| Fault::Unbound {
             what: format!("parameter {at} ({source:?}), which nothing on this device holds"),

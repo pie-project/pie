@@ -107,7 +107,13 @@ impl Run<'_> {
             // takes the landing.
             let wv = l.read(wt)?.val;
             let wv = l.f().transpose(wv, &[1, 0])?;
-            match kernels_xla::linear::glu_gemm::geglu(l.f(), x, wv, o_y.rows, i64::from(intermediate))? {
+            match kernels_xla::linear::glu_gemm::geglu(
+                l.f(),
+                x,
+                wv,
+                o_y.rows,
+                i64::from(intermediate),
+            )? {
                 Some(v) => {
                     fused = true;
                     l.land(o_y, v)
@@ -185,12 +191,23 @@ impl Run<'_> {
         {
             return Ok(false);
         }
+        let streamed = |bank| self.streamed_bank(bank).zip(self.weight_param_of(bank));
+        let (up_streamed, down_streamed) = (streamed(up_bank), streamed(down_bank));
+        let (up_t, down_t) = (self.tensor(up_bank), self.tensor(down_bank));
         let mut fused = false;
         crate::lower::lower(self.ctx(), |l| {
             let x_v = l.read(self.tensor(x))?;
-            let up_v = l.read(self.tensor(up_bank))?;
             let routes_v = l.read(self.tensor(routes))?;
-            let down_v = l.read(self.tensor(down_bank))?;
+            let up_v = match up_streamed {
+                Some((b, p)) => self.streamed_operand(l, b, p, up_t.width, routes, routes_v.val)?,
+                None => l.read(up_t)?,
+            };
+            let down_v = match down_streamed {
+                Some((b, p)) => {
+                    self.streamed_operand(l, b, p, down_t.width, routes, routes_v.val)?
+                }
+                None => l.read(down_t)?,
+            };
             let weights_v = l.read(self.tensor(*weights))?;
             let o_y = self.tensor(*y);
             let tuning = l.tuning();
