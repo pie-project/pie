@@ -629,7 +629,9 @@ impl SharedPool {
 
     /// The pool `facts` state, and `max_context` tokens the longest a
     /// working set holds. The rung starts at the largest: state never takes
-    /// the top span until a rung is lowered.
+    /// the top span until a rung is lowered. Where the span is backed on
+    /// demand, at the smallest, the rung the engine backs at load
+    /// ([`Self::start_cap`]).
     pub fn new(facts: &ChunkFacts, max_context: u32) -> Result<Self, SharedError> {
         facts
             .validate()
@@ -763,7 +765,12 @@ impl SharedPool {
             act_chunks: facts.act_chunks.clone(),
             span_on_demand: facts.span_backed_on_demand,
         });
-        if let Some(&(rung, _)) = facts.act_chunks.last() {
+        // The span backed from the load: the pool starts at the largest
+        // rung. Backed on demand: at the smallest, the one the engine backs
+        // at load; passes raise it through `Engine::set_rung` as fires need.
+        if !facts.span_backed_on_demand
+            && let Some(&(rung, _)) = facts.act_chunks.last()
+        {
             pool.set_rung(rung)
                 .expect("an empty pool takes its largest rung");
         }
@@ -1328,6 +1335,14 @@ impl SharedPool {
     #[must_use]
     pub fn raise_waits(&self, evacuation: &RungEvacuation) -> bool {
         !evacuation.moves.is_empty() || self.pool.span_on_demand()
+    }
+
+    /// The cap fires start at: the rung the pool starts at, lifted. The
+    /// largest's (no cap) unless the span is backed on demand, where fires
+    /// start cut to the smallest rung until a raise reaches the engine.
+    #[must_use]
+    pub fn start_cap(&self) -> u32 {
+        self.lifted(self.rung())
     }
 
     /// Whether every rung change is told the engine (`Engine::set_rung`):

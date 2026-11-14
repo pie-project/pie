@@ -44,7 +44,13 @@ impl SharedGrow {
     /// Steers `shared`, engine `engine`'s, from the segments mapped at load.
     #[must_use]
     pub fn new(model: usize, engine: usize, shared: Shared) -> Self {
-        let mapped = shared.lock().unwrap().mapped_segments();
+        let (mapped, start_cap) = {
+            let pool = shared.lock().unwrap();
+            (pool.mapped_segments(), pool.start_cap())
+        };
+        // Fires start cut to the rung the pool starts at: on a span backed
+        // on demand, the smallest, until a raise reaches the engine.
+        super::set_fire_cap(engine, start_cap);
         Self {
             model,
             engine,
