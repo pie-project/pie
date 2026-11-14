@@ -597,11 +597,12 @@ impl Pools {
         streamed: &streamed::Streamed,
     ) -> Result<()> {
         for (param, rows, bytes) in streamed.host_banks()? {
-            let all = u32::try_from(bytes.len() as u64 / ROW_BYTES).map_err(|_| Fault::Ceiling {
-                what: "rows of a host bank",
-                need: bytes.len() as u64 / ROW_BYTES,
-                have: u64::from(u32::MAX),
-            })?;
+            let all =
+                u32::try_from(bytes.len() as u64 / ROW_BYTES).map_err(|_| Fault::Ceiling {
+                    what: "rows of a host bank",
+                    need: bytes.len() as u64 / ROW_BYTES,
+                    have: u64::from(u32::MAX),
+                })?;
             let buffer = device.upload_host(Dtype::U32, all, 128, &bytes)?;
             let p = u32::try_from(param).unwrap_or(u32::MAX);
             let tensor = handles.root(Root {
@@ -625,7 +626,10 @@ impl Pools {
     /// expert's plane takes.
     #[must_use]
     pub fn host_bank_root(&self, param: u32) -> Option<(Tensor, u32)> {
-        self.host_banks.iter().find(|b| b.0 == param).map(|b| (b.2, b.1))
+        self.host_banks
+            .iter()
+            .find(|b| b.0 == param)
+            .map(|b| (b.2, b.1))
     }
 
     /// The pool's whole root (u32 `[rows, 128]`).
@@ -746,6 +750,72 @@ impl Pools {
                 .flat_map(|(_, run)| run[0].iter().copied())
                 .collect();
             self.write_rows(device, handles, rows, at, &bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Fills pool slots of streamed bank `param` from its pinned host copy,
+    /// in the program: each `(expert, pool row)` lands that expert's plane
+    /// at the row. One program a bank shape, as many experts a run as the
+    /// bank holds (the rest copy nothing), so the load's seating warms what
+    /// a residency later runs.
+    pub fn fill_from_bank(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        param: u32,
+        fills: &[(u32, i64)],
+    ) -> Result<()> {
+        if fills.is_empty() || device.is_dry() {
+            return Ok(());
+        }
+        let (host, rows) = self.host_bank_root(param).ok_or_else(|| Fault::Unbound {
+            what: format!("the host copy of streamed bank {param}"),
+        })?;
+        let all = self
+            .host_banks
+            .iter()
+            .find(|b| b.0 == param)
+            .map_or(0, |b| {
+                b.3.dims()
+                    .ok()
+                    .and_then(|d| d.first().copied())
+                    .unwrap_or(0)
+            });
+        let width = usize::try_from(all / i64::from(rows.max(1)))
+            .unwrap_or(0)
+            .max(1);
+        for batch in fills.chunks(width) {
+            let mut from: Vec<i32> = batch
+                .iter()
+                .map(|&(e, _)| narrow(u64::from(e)) as i32)
+                .collect();
+            let mut to: Vec<i32> = batch
+                .iter()
+                .map(|&(_, at)| i32::try_from(at).unwrap_or(i32::MAX))
+                .collect();
+            from.resize(width, 0);
+            to.resize(width, 0);
+            let mut inputs = crate::inputs::Inputs::new();
+            let from = inputs.i32s(handles, &from, 1);
+            let to = inputs.i32s(handles, &to, 1);
+            let count = inputs.i32s(handles, &[batch.len() as i32], 1);
+            let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
+            let root = self.root;
+            let w = width as i64;
+            tracer.emit(&mut |cx| {
+                let pool = cx.read(root)?;
+                let bank = cx.read(host)?;
+                let from = cx.read(from)?;
+                let from = cx.reshape(from, &[w])?;
+                let to = cx.read(to)?;
+                let to = cx.reshape(to, &[w])?;
+                let count = cx.read(count)?;
+                let count = cx.reshape(count, &[])?;
+                let pool = cx.copy_from_host(pool, bank, from, to, count, i64::from(rows))?;
+                cx.write(root, pool)
+            })?;
+            crate::exec::maintain(device, tracer, self, &inputs)?;
         }
         Ok(())
     }

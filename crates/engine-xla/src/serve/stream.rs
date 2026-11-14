@@ -198,16 +198,19 @@ impl Shell {
             return Ok(());
         }
         let fills = self.streamed.residency(residency)?;
-        let mut by: BTreeMap<usize, Vec<(u32, Vec<u8>)>> = BTreeMap::new();
+        let mut by: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
         for (at, atom, slot) in fills {
-            by.entry(at)
-                .or_default()
-                .push((slot, self.streamed.atom_bytes(at, atom)?));
+            by.entry(at).or_default().push((atom, slot));
         }
-        for (at, slots) in by {
-            let shape = &self.streamed.shapes[at];
-            self.pools
-                .write_weights(&self.device, &self.handles, shape, &slots)?;
+        for (at, atoms) in by {
+            fill(
+                &self.streamed,
+                &mut self.pools,
+                &self.device,
+                &self.handles,
+                at,
+                &atoms,
+            )?;
         }
         self.streamed.settle_held();
         Ok(())
@@ -224,6 +227,50 @@ impl Shell {
     #[must_use]
     pub fn weight_shapes(&self) -> Vec<engine::chunk::WeightShape> {
         self.streamed.facts()
+    }
+}
+
+/// Fills `atoms` (`(atom, slot)`) of shape `at` into their pool slots: an
+/// expert shape's from the pinned host banks in the program
+/// (`Pools::fill_from_bank`), a row table's from its host copy.
+pub(super) fn fill(
+    streamed: &Streamed,
+    pools: &mut crate::store::Pools,
+    device: &crate::device::Device,
+    handles: &crate::trace::Handles,
+    at: usize,
+    atoms: &[(u32, u32)],
+) -> Result<()> {
+    let shape = &streamed.shapes[at];
+    match &shape.form {
+        Form::Experts { experts, layers } => {
+            let experts = *experts;
+            let mut by: BTreeMap<u32, Vec<(u32, i64)>> = BTreeMap::new();
+            for &(atom, slot) in atoms.iter().filter(|&&(_, slot)| slot != NOT_HELD) {
+                let layer = (atom / experts) as usize;
+                let (_, banks) = layers.get(layer).ok_or_else(|| Fault::Unbound {
+                    what: format!("expert atom {atom} of {}", shape.name),
+                })?;
+                for (plane, &param) in shape.planes.iter().zip(banks) {
+                    let row = expert_row(pools, shape, *plane, slot)?;
+                    let p = u32::try_from(param).unwrap_or(u32::MAX);
+                    by.entry(p)
+                        .or_default()
+                        .push((atom % experts, i64::from(row)));
+                }
+            }
+            for (param, fills) in by {
+                pools.fill_from_bank(device, handles, param, &fills)?;
+            }
+            Ok(())
+        }
+        Form::Rows { .. } => {
+            let slots: Vec<(u32, Vec<u8>)> = atoms
+                .iter()
+                .map(|&(atom, slot)| Ok((slot, streamed.atom_bytes(at, atom)?)))
+                .collect::<Result<_>>()?;
+            pools.write_weights(device, handles, shape, &slots)
+        }
     }
 }
 

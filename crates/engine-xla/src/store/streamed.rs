@@ -181,6 +181,8 @@ pub struct Streamed {
     by_param: BTreeMap<usize, (usize, usize)>,
     /// Each streamed param's bytes, row-major as declared: the miss copy.
     host: BTreeMap<usize, Vec<u8>>,
+    /// A held set settled: no host copy is kept, so no atom moves again.
+    dropped: bool,
     /// A held residency named every atom: the miss copy is gone.
     held: bool,
     /// What every slot start and chunk is a multiple of.
@@ -469,6 +471,7 @@ impl Streamed {
             shapes,
             by_param,
             host: BTreeMap::new(),
+            dropped: false,
             held: false,
             unit,
             least,
@@ -537,6 +540,26 @@ impl Streamed {
                 u32::try_from(u64::from(s.count).div_ceil(per)).unwrap_or(u32::MAX)
             })
             .sum()
+    }
+
+    /// Drops the heap copies of the expert banks once their pinned copies
+    /// landed (`Pools::land_host_banks`): experts fill from those.
+    pub fn release_expert_copies(&mut self) {
+        for shape in &self.shapes {
+            if let Form::Experts { layers, .. } = &shape.form {
+                for (_, banks) in layers {
+                    for p in banks {
+                        self.host.remove(p);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether a held set settled and dropped its host copies.
+    #[must_use]
+    pub fn dropped(&self) -> bool {
+        self.dropped
     }
 
     /// Keeps `bytes`, param `param`'s landed bytes, as its miss copy.
@@ -614,7 +637,12 @@ impl Streamed {
                     let mut bytes = vec![0u8; n * *experts as usize];
                     for e in 0..*experts as usize {
                         let to = &mut bytes[e * n..(e + 1) * n];
-                        panels(&host[e * n..(e + 1) * n], plane.rows as usize, plane.width as usize, to);
+                        panels(
+                            &host[e * n..(e + 1) * n],
+                            plane.rows as usize,
+                            plane.width as usize,
+                            to,
+                        );
                         packed_rows(to);
                     }
                     let rows = u32::try_from(plane.bytes() / ROW_BYTES).unwrap_or(u32::MAX);
@@ -663,7 +691,7 @@ impl Streamed {
                 }
             }
         }
-        if self.host.is_empty() && !fills.is_empty() {
+        if self.dropped && !fills.is_empty() {
             return Err(Fault::Residency(format!(
                 "the residency moves {} weight atom(s) of a held set, which keeps no host \
                  copy to fill them from",
@@ -688,9 +716,10 @@ impl Streamed {
     /// After the fills of a held residency landed: with every atom named,
     /// the miss copy goes (held = no host copy kept).
     pub fn settle_held(&mut self) {
-        if self.held && self.whole() && !self.host.is_empty() {
+        if self.held && self.whole() && !self.dropped {
             let bytes: usize = self.host.values().map(Vec::len).sum();
             self.host.clear();
+            self.dropped = true;
             tracing::info!(
                 host_mib = bytes >> 20,
                 "xla weights held: every atom resident, the host copy dropped"

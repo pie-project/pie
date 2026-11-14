@@ -724,14 +724,15 @@ impl Shell {
         streamed.renumber(narrow(pools.layout().shapes.len() as u64) as u32);
         pools.view_weights(&handles, &streamed)?;
         pools.land_host_banks(&device, &handles, &streamed)?;
+        streamed.release_expert_copies();
         handles.seal();
         if !streamed.is_empty() {
             for at in 0..streamed.shapes.len() {
                 let shape = &streamed.shapes[at];
-                let slots: Vec<(u32, Vec<u8>)> = (0..shape.count)
-                    .map(|atom| Ok((shape.slots[atom as usize], streamed.atom_bytes(at, atom)?)))
-                    .collect::<Result<_>>()?;
-                pools.write_weights(&device, &handles, shape, &slots)?;
+                let atoms: Vec<(u32, u32)> = (0..shape.count)
+                    .map(|atom| (atom, shape.slots[atom as usize]))
+                    .collect();
+                stream::fill(&streamed, &mut pools, &device, &handles, at, &atoms)?;
             }
             tracing::info!(
                 shapes = ?streamed
