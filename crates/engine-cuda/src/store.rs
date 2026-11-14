@@ -3443,20 +3443,45 @@ impl Pools {
         // Backed as far as the fit holds; limited to what the runtime is
         // stated, where that is more: what the fit keeps back is backed
         // when the runtime comes to take it.
-        let fitted = self.fitted_chunks();
-        let stated = self.stated.map_or(fitted, |stated| stated.max(fitted));
-        self.chunks.limit(stated);
-        // Where the fit keeps chunks back, only the segments wholly under
-        // them: the last the fitted chunks reach into would back some of
-        // what is kept.
-        let segments = if stated > fitted {
-            self.chunks.segments_under(u64::from(fitted))
-        } else {
-            self.chunks.segments_for(u64::from(fitted))
-        };
-        match self.chunks.commit_segments(&mut self.pool, segments)? {
-            Commit::Committed => {}
-            refusal => return Err(refuse(&self.pool, refusal)),
+        loop {
+            let fitted = self.fitted_chunks();
+            let stated = self.stated.map_or(fitted, |stated| stated.max(fitted));
+            self.chunks.limit(stated);
+            // Where the fit keeps chunks back, only the segments wholly
+            // under them: the last the fitted chunks reach into would back
+            // some of what is kept.
+            let segments = if stated > fitted {
+                self.chunks.segments_under(u64::from(fitted))
+            } else {
+                self.chunks.segments_for(u64::from(fitted))
+            };
+            match self.chunks.commit_segments(&mut self.pool, segments)? {
+                Commit::Committed => break,
+                // The card has less now than the fit measured (the driver
+                // took some since: a context, a module, a body): the pool
+                // is what backs, never a load that fails on its own fit.
+                // Where the runtime is stated more than the fit, what the
+                // fit gives up is kept back with the rest.
+                Commit::Exhausted { growth, spare } if fitted > 1 && growth > spare => {
+                    let chunk = self.chunks.layout().chunk_bytes.max(1);
+                    let short = (growth - spare).saturating_mul(self.pool.page_bytes());
+                    let fewer = u32::try_from(short.div_ceil(chunk)).unwrap_or(u32::MAX);
+                    let fitted = fitted.saturating_sub(fewer).max(1);
+                    eprintln!(
+                        "engine-cuda: the card backs {} MiB less than the fit measured: the \
+                         pool is {} chunks, not {}",
+                        short >> 20,
+                        fitted,
+                        self.fitted
+                    );
+                    self.fitted = fitted;
+                    if self.stated.is_none() {
+                        self.paging.pages = self.pages_within(fitted);
+                    }
+                    self.pledge();
+                }
+                refusal => return Err(refuse(&self.pool, refusal)),
+            }
         }
         self.whole = true;
         Ok(())

@@ -455,7 +455,11 @@ impl Shell {
 
     /// Backs every page the pools declare ([`crate::store::Pools::back_whole`]).
     pub fn back_whole(&mut self) -> Result<()> {
-        self.pools.back_whole()
+        self.pools.back_whole()?;
+        // Backing may have found the card short of the fit: what the pool
+        // keeps back is stated again.
+        self.state_live();
+        Ok(())
     }
 
     /// The kv planes, for another worker to read in place
