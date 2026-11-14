@@ -578,7 +578,6 @@ fn device_rs_plan(
     ids: &[crate::store::rs::RsWorkingSetId],
     groups: &LaneGroups,
     lanes: &PassLanes,
-    split: &[u32],
     fold: &geometry::Fold,
 ) -> Result<rs::RsPlan, String> {
     if ids.is_empty() {
@@ -593,17 +592,9 @@ fn device_rs_plan(
             .map_err(|error| error.to_string())?;
         let reserved = lanes.cursors[first].lock().unwrap().reserved;
         let fold = group_fold(fold, first, frozen, reserved);
-        // The device picks where a lane's rows start, so the host bounds
-        // it: they land inside what `reserve` granted, so they start no
-        // later than `reserved` less the lane's own rows.
-        for &lane in group {
-            let rows = match (split.get(lane), split.get(lane + 1)) {
-                (Some(&from), Some(&to)) => to.saturating_sub(from),
-                _ => 0,
-            };
-            let carried = reserved.saturating_sub(rows).saturating_sub(frozen);
-            check_carried(lane, carried)?;
-        }
+        // The device picks where a lane's rows start, so the host cannot
+        // bound what it carries in: its engine keeps a replay past
+        // `UNFOLDED_ROWS` inside its scratch or fails the fire.
         plans.push(rs::GroupPlan {
             lanes: group.clone(),
             writes: Some(frozen..reserved),
@@ -4396,7 +4387,7 @@ async fn fire_device_geometry<C: FireContext>(
         if windowed {
             device_window_plan(&stores, ws.id, &write_indexes[0], &rs_ws_ids)
         } else {
-            device_rs_plan(&stores, &rs_ws_ids, &groups, &pass_lanes, &split, &fold)
+            device_rs_plan(&stores, &rs_ws_ids, &groups, &pass_lanes, &fold)
         }
     };
     let reserved = reserve(
@@ -5911,9 +5902,9 @@ mod unfolded_tests {
 
     /// MTP with k = 4 on a pool whose rs pages hold one row: the draft
     /// writes a window of five rows unfolded, the next window carries those
-    /// five in and folds the accepted rows, and only a lane carrying past
-    /// `UNFOLDED_ROWS` is refused, on the host plan and the device plan
-    /// alike. Not one rs page: a lane's buffer names several.
+    /// five in and folds the accepted rows, and only a host-placed lane
+    /// carrying past `UNFOLDED_ROWS` is refused; a device-placed one is the
+    /// engine's to hold. Not one rs page: a lane's buffer names several.
     #[test]
     fn mtp_k4_rides_one_row_rs_pages() {
         let stores = pool_of_one_row_rs_pages();
@@ -5967,8 +5958,9 @@ mod unfolded_tests {
             "{left}"
         );
 
-        // The device plan: the device picks where the rows start, inside
-        // what `reserve` granted, so the host bounds the start by it.
+        // The device plan: the device picks where the rows start, so the
+        // host refuses nothing it carries in, however far ahead the
+        // inferlet reserved; the engine holds it to `UNFOLDED_ROWS`.
         let device = |reserved: u32| {
             let cell = Arc::new(Mutex::new(Cursor {
                 folded: 13,
@@ -5987,24 +5979,13 @@ mod unfolded_tests {
                 cursors: vec![cell],
                 kv: Vec::new(),
             };
-            device_rs_plan(
-                &stores,
-                &ids,
-                &groups_of,
-                &lanes,
-                &[0, 5],
-                &geometry::Fold::Device,
-            )
+            device_rs_plan(&stores, &ids, &groups_of, &lanes, &geometry::Fold::Device)
         };
-        // Five carried in and five of its own, a fold the device counts.
         let planned = groups(device(13 + 5 + 5).unwrap());
         assert_eq!(planned[0].writes, Some(13..23));
         assert_eq!(planned[0].fold, rs::GroupFold::Device);
-        assert!(device(13 + UNFOLDED_ROWS + 5).is_ok());
-        let refused = device(13 + UNFOLDED_ROWS + 1 + 5).unwrap_err();
-        assert!(
-            refused.contains(&format!("carries {} recurrent rows", UNFOLDED_ROWS + 1)),
-            "{refused}"
-        );
+        // The decode reserved its whole extent up front, as the MTP example.
+        let ahead = groups(device(13 + 4 * UNFOLDED_ROWS).expect("no carried-in refusal"));
+        assert_eq!(ahead[0].writes, Some(13..13 + 4 * UNFOLDED_ROWS));
     }
 }

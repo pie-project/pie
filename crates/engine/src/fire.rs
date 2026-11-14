@@ -570,9 +570,18 @@ pub enum RsVerb {
 /// earlier fires wrote and nothing has folded yet, which the fire replays
 /// ahead of its own. The fire's own rows never count against it.
 ///
-/// The runtime refuses, before anything is submitted, a pass whose lane
-/// carries more in, or whose host fold leaves more unfolded behind it; an
-/// engine sizes a lane's rs replay scratch as the fire's own rows plus this.
+/// The runtime refuses, before anything is submitted, a host-placed pass
+/// whose lane carries more in, or whose host fold leaves more unfolded
+/// behind it; an engine sizes a lane's rs replay scratch as the fire's own
+/// rows plus this.
+///
+/// A device-geometry fire picks where its rows land on the device, so the
+/// host cannot bound what it carries in. Its engine must: a lane replaying
+/// more than this many carried rows never writes past its scratch; the
+/// kernel clamps and the engine reports the fire failed, never a silent
+/// overrun. CUDA's walked path already sizes its scratch for what its lanes
+/// replay (`replayed` beside `REPLAYED` in `Run::rs_layout` and
+/// `serve::prepare`).
 ///
 /// A stated limit, not a derived value: 16 covers the deepest speculative
 /// draft served today (15 drafts and the row they follow). It could be
