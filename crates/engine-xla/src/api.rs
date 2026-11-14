@@ -115,7 +115,11 @@ pub struct Xla {
     next_frame: u64,
     sink: Option<engine::CompletionSink>,
     adapters: BTreeMap<InstanceId, crate::adapter::Binding>,
-    /// What the engine counts while it serves, read by the runtime.
+    /// What the engine counts while it serves, read by the runtime: a
+    /// program a fire waited on (Compiled), a guest pass the host
+    /// interprets (Fallback), a frame or registration refused (Refused).
+    /// Never Unrecorded: every serving fire runs a program, built if need
+    /// be.
     live: engine::live::Live,
 }
 

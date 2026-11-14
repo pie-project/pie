@@ -165,6 +165,19 @@ pub fn register_engine_backend(mut spec: EngineSpec, backend: EngineBox) -> usiz
     id
 }
 
+/// What each registered engine learns of itself while it serves, in
+/// engine order: every engine serves the one model the worker loads.
+#[must_use]
+pub fn lives() -> Vec<::engine::live::Live> {
+    registry()
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .map(|r| r.live.clone())
+        .collect()
+}
+
 /// What engine `engine_id` learns of itself while it serves
 /// ([`::engine::Engine::live`]); every rung armed for an engine not
 /// registered.

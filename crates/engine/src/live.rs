@@ -34,30 +34,42 @@ struct Record {
     tallies: [AtomicU64; Tally::ALL.len()],
 }
 
-/// What an engine counts while it serves, each a way a fire was served
-/// worse than its load prepared, or not at all: never silent, read by the
-/// runtime's model status.
+/// What an engine counts while it serves, each a per-fire event: a way a
+/// serving fire was served other than its load prepared, or not at all.
+/// Never silent; read by the runtime's model status. A slower arm an
+/// engine chooses at load is no tally: it is a load fact, stated once in
+/// the load's summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tally {
-    /// A program built while serving, a fire waiting on its compile: a
-    /// shape the load did not prepare.
+    /// A program, shape or pipeline built or loaded (from a disk cache)
+    /// while serving: a fire waited on it, its shape not prepared at load.
     Compiled,
-    /// A pass served by a slower path than the device's own (a guest
-    /// stage interpreted on the host).
+    /// A legitimate slower path taken for a fire (a guest stage the host
+    /// interprets).
     Fallback,
+    /// A serving fire that ran with no captured body or program where one
+    /// is required: a bug under the rule that every serving fire replays
+    /// one, kept apart so it is never mistaken for a compile.
+    Unrecorded,
     /// A frame or registration the engine refused.
     Refused,
 }
 
 impl Tally {
-    pub const ALL: [Tally; 3] = [Tally::Compiled, Tally::Fallback, Tally::Refused];
+    pub const ALL: [Tally; 4] = [
+        Tally::Compiled,
+        Tally::Fallback,
+        Tally::Unrecorded,
+        Tally::Refused,
+    ];
 
     /// Its name in the model status.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Tally::Compiled => "compiled_serving",
-            Tally::Fallback => "fallbacks",
+            Tally::Compiled => "compiled",
+            Tally::Fallback => "fallback",
+            Tally::Unrecorded => "unrecorded",
             Tally::Refused => "refused",
         }
     }
@@ -175,6 +187,7 @@ mod tests {
         live.tally(Tally::Refused, 1);
         assert_eq!(read.tallied(Tally::Compiled), 2);
         assert_eq!(read.tallied(Tally::Fallback), 0);
+        assert_eq!(read.tallied(Tally::Unrecorded), 0);
         assert_eq!(read.tallied(Tally::Refused), 1);
     }
 

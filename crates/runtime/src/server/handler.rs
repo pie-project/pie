@@ -50,13 +50,20 @@ impl Session {
                         serde_json::Value::from(total),
                     );
 
-                    // Every way a fire was served worse than the load
-                    // prepared, or refused, as the engine counted it.
-                    let live = crate::engine::backend::live(0);
+                    // Every way a fire was served other than the load
+                    // prepared, or refused, as the engines serving the
+                    // model counted it: summed, and each engine's.
+                    let lives = crate::engine::backend::lives();
                     for tally in ::engine::live::Tally::ALL {
+                        let each: Vec<u64> =
+                            lives.iter().map(|live| live.tallied(tally)).collect();
                         stats.insert(
                             format!("{}.engine.{}", model_name, tally.name()),
-                            serde_json::Value::from(live.tallied(tally)),
+                            serde_json::Value::from(each.iter().sum::<u64>()),
+                        );
+                        stats.insert(
+                            format!("{}.engine.{}_by_engine", model_name, tally.name()),
+                            serde_json::Value::from(each),
                         );
                     }
 
