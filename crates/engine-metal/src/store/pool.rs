@@ -58,7 +58,7 @@ pub struct Pool {
     committed: u32,
     /// The activation span's chunks, the top of the range.
     act: u32,
-    /// The bytes from the range's end the widest fire's carve has taken.
+    /// The bytes from the range's end the current rung's carve takes.
     carve: u64,
     /// The span's segments from the top the runtime committed for state.
     span: u32,
@@ -248,14 +248,47 @@ impl Pool {
         carve.min(span).max(self.pinned_from())
     }
 
-    /// Backs the top `bytes` of the range for a fire's carve, kept for the
-    /// widest carve so far.
+    /// Backs the top `bytes` of the range for the rung's carve, on a raise;
+    /// a narrower `bytes` is no change ([`Pool::narrow`] gives back).
     pub fn cover(&mut self, bytes: u64) -> Result<()> {
         if bytes <= self.carve {
             return Ok(());
         }
+        let was = self.carve;
         self.carve = bytes.min(self.bytes() - self.pinned_from());
-        self.back_top()
+        let backed = self.back_top();
+        if backed.is_err() {
+            self.carve = was;
+        }
+        backed
+    }
+
+    /// Whether the top `bytes` of the range are backed for a fire's carve.
+    #[must_use]
+    pub fn covers(&self, bytes: u64) -> bool {
+        bytes <= self.carve
+    }
+
+    /// Gives back the carve past the top `bytes`, on a lower, keeping what
+    /// the span segments committed for state take.
+    ///
+    /// # Safety
+    ///
+    /// No frame reads the carve given back: the caller has drained every
+    /// frame wider than the rung it lowers to.
+    pub unsafe fn narrow(&mut self, bytes: u64) -> Result<()> {
+        if bytes >= self.carve {
+            return Ok(());
+        }
+        self.carve = bytes;
+        #[cfg(target_vendor = "apple")]
+        {
+            let want = self.top_want();
+            let Backing::Sparse { store, .. } = &mut self.backing;
+            // SAFETY: the caller's contract above.
+            unsafe { store.unmap_top(want)? };
+        }
+        Ok(())
     }
 
     /// Backs the top `segments` of the span for state the runtime opens
@@ -656,6 +689,14 @@ mod tests {
         assert_eq!(pool.top_held_bytes(), 2 * CHUNK);
         assert!(pool.admit(9).is_err());
         pool.admit(10).expect("still under the carve");
+        // A lowered rung gives back the carve above it.
+        assert!(pool.covers(CHUNK + 1));
+        // SAFETY: nothing ran on this pool.
+        unsafe { pool.narrow(1) }.expect("the rung lowers");
+        assert_eq!(pool.top_held_bytes(), CHUNK);
+        assert!(!pool.covers(CHUNK + 1));
+        assert!(pool.admit(10).is_err());
+        pool.admit(11).expect("the narrow carve's heap stays");
         assert!(
             Pool::reserve(&device, CHUNK, 4, 4, 4).is_err(),
             "a span that leaves no chunk under it"

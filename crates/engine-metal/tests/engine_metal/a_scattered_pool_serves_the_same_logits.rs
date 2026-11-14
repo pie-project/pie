@@ -306,6 +306,7 @@ fn load_near(fixture: &Fixture, context: u32, chunk: Option<u64>) -> Shell {
         },
         profiles: None,
     })
+    .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
 }
 

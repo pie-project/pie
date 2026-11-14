@@ -233,6 +233,7 @@ pub(crate) fn try_load(dir: &Path, w: Dtype, rotate: bool) -> Result<Shell, Stri
         allowance: engine::Allowance::WHOLE,
         profiles: None,
     })
+    .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .map_err(|e| e.to_string())
 }
 

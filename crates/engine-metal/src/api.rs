@@ -615,6 +615,10 @@ impl Engine for Metal {
         self.loaded_mut()?.release_segments(segments).map_err(fault)
     }
 
+    fn set_rung(&mut self, from: u32, to: u32) -> EngineResult<()> {
+        self.loaded_mut()?.set_rung(from, to).map_err(fault)
+    }
+
     fn commit_span(&mut self, segments: u32) -> EngineResult<()> {
         self.loaded_mut()?.commit_span(segments).map_err(fault)
     }
