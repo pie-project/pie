@@ -35,6 +35,10 @@ impl crate::pipeline::fire::FireContext for ProcessCtx {
     async fn settle_pipeline_tail(&mut self) -> anyhow::Result<()> {
         crate::inferlet::process::gate::drain_pending_fires(self).await
     }
+
+    fn pipeline_tails(&self) -> Vec<crate::pipeline::fire::PendingFires> {
+        self.residency_pipelines()
+    }
 }
 
 wasmtime::component::bindgen!({
