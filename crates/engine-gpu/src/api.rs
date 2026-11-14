@@ -484,7 +484,7 @@ where
 
         let paging = shell.paging();
 
-        let pools = shell.pool_facts(disk_kv_pages);
+        let pools = shell.pool_facts(disk_kv_pages).map_err(fault)?;
         let chunks = shell.chunk_facts().map_err(fault)?;
 
         let caps = Capabilities {

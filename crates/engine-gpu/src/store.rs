@@ -571,6 +571,22 @@ pub struct Pools<B: Backend> {
     act_chunks: Vec<(u32, u32)>,
 }
 
+/// A record's unit as a slot table's entry. Kernels read the entries as i32,
+/// a negative one as no record, so a unit past `i32::MAX` is refused: staged,
+/// it would read as a lane with no record.
+pub fn slot_entry(unit: u32) -> Result<i32> {
+    i32::try_from(unit).map_err(|_| Fault::Ceiling {
+        what: "record units (a slot table's entry is an i32)",
+        need: u64::from(unit),
+        have: i32::MAX as u64,
+    })
+}
+
+/// A record's units as a slot table's entries ([`slot_entry`]).
+pub fn slot_entries(units: &[u32]) -> Result<Vec<i32>> {
+    units.iter().map(|&unit| slot_entry(unit)).collect()
+}
+
 impl<B: Backend> Pools<B> {
     /// The pool `layout` sizes over `rows`, kv pages of `paging`'s size,
     /// and `host_chunks` host chunks beside it, its top chunks the
@@ -1801,4 +1817,31 @@ fn elem_size(dtype: Dtype) -> u32 {
 
 fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{slot_entries, slot_entry};
+    use crate::error::Fault;
+
+    /// A unit a slot table's i32 cannot state is refused by name, where a
+    /// cast would stage a negative entry: no record.
+    #[test]
+    fn a_record_unit_past_i32_is_refused() {
+        assert_eq!(slot_entry(0).ok(), Some(0));
+        assert_eq!(slot_entry(i32::MAX as u32).ok(), Some(i32::MAX));
+        for unit in [1 << 31, u32::MAX] {
+            let refused = slot_entry(unit).expect_err("past i32");
+            assert!(
+                matches!(
+                    refused,
+                    Fault::Ceiling { need, have, .. }
+                        if need == u64::from(unit) && have == i32::MAX as u64
+                ),
+                "{refused}"
+            );
+        }
+        assert_eq!(slot_entries(&[3, 7]).ok(), Some(vec![3, 7]));
+        assert!(slot_entries(&[3, 1 << 31]).is_err());
+    }
 }
