@@ -179,6 +179,16 @@ impl ResidencyPlanner {
         let Some(victims) = self.victim_set() else {
             return;
         };
+        // An activation rung above what the passes ask is lowered for a kv
+        // waiter before anyone moves off the device: the chunks it frees
+        // fund the head (not a raise's own waiter, whose room it is).
+        let (_, engine) = self.port.locus();
+        if victims.deficit.pages > 0
+            && crate::store::shared::raise_serves(engine, victims.head_pid).is_none()
+            && crate::store::shared::lower_for_kv(engine)
+        {
+            return;
+        }
         let (swap_free, swap_total) = self.swap_stats();
         let deficit = self.bytes_of(victims.deficit);
         // A new ask leaves one set's state room on the host: a set at rest

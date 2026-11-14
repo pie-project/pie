@@ -69,7 +69,15 @@ impl SharedGrow {
                 if pool.copying().is_some() {
                     return;
                 }
-                let goal = pool.rung_for(super::wanted_rows(self.engine));
+                let asked = pool.rung_for(super::wanted_rows(self.engine));
+                // Past a prompt wave the rung stays where it is: it is
+                // lowered toward what the passes ask only for a kv waiter
+                // short of the room that frees (`super::lower_for_kv`).
+                let goal = if super::rung_above(self.engine, asked < pool.rung(), pool.rung()) {
+                    asked
+                } else {
+                    asked.max(pool.rung())
+                };
                 let step = self.rung_walk.lock().unwrap().step(
                     &pool,
                     goal,
@@ -138,6 +146,11 @@ impl SharedGrow {
                     };
                     if let Err(error) = lowered {
                         tracing::warn!(engine = self.engine, %error, "the activation rung stays");
+                        let now = self.shared.lock().unwrap().rung();
+                        super::rung_lower_refused(self.engine, now);
+                        if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
+                            planner.pages_freed();
+                        }
                         return;
                     }
                     tracing::info!(engine = self.engine, rung, "the activation rung is lowered");
@@ -207,6 +220,7 @@ impl SharedGrow {
 
     /// Starts moving; the scheduler that takes the moves is up.
     pub fn start(&self) {
+        super::rung_wake_on(self.engine, self.wake.clone());
         crate::rt::spawn(self.clone().run());
         self.wake.notify_one();
     }

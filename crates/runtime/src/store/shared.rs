@@ -194,6 +194,95 @@ pub fn asking_processes(engine: usize) -> Vec<uuid::Uuid> {
         .collect()
 }
 
+/// Per engine, whether the activation rung stands above what the passes
+/// ask, and whether a kv waiter has asked for the room lowering it frees:
+/// the rung stays raised past a prompt wave and is lowered only for that
+/// room (SPEC decision 6, by demand).
+#[derive(Default)]
+struct RungLowering {
+    above: std::sync::atomic::AtomicBool,
+    asked: std::sync::atomic::AtomicBool,
+    /// The rung a lower from was refused (0: none): no kv waiter waits on
+    /// it until the rung moves.
+    refused_at: std::sync::atomic::AtomicU32,
+    wake: Mutex<Option<Arc<tokio::sync::Notify>>>,
+}
+
+static RUNG_LOWERINGS: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, Arc<RungLowering>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn rung_lowering(engine: usize) -> Arc<RungLowering> {
+    RUNG_LOWERINGS
+        .lock()
+        .unwrap()
+        .entry(engine)
+        .or_default()
+        .clone()
+}
+
+/// A kv waiter on `engine` short of room: where the rung stands above what
+/// the passes ask, its walker lowers it for the chunks that frees (the
+/// planner funds kv this way before moving any process off the device).
+/// Whether a lower is on its way.
+pub fn lower_for_kv(engine: usize) -> bool {
+    let lowering = rung_lowering(engine);
+    if !lowering.above.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    lowering
+        .asked
+        .store(true, std::sync::atomic::Ordering::Release);
+    if let Some(wake) = lowering.wake.lock().unwrap().as_ref() {
+        wake.notify_one();
+    }
+    true
+}
+
+/// The walker of `engine`'s rung: woken when a kv waiter asks a lower.
+fn rung_wake_on(engine: usize, wake: Arc<tokio::sync::Notify>) {
+    *rung_lowering(engine).wake.lock().unwrap() = Some(wake);
+}
+
+/// The walker found the rung, `now`, above (`true`) or not above what the
+/// passes ask: whether a kv waiter has asked it lowered. Not above (or a
+/// lower from `now` refused): the ask goes.
+fn rung_above(engine: usize, above: bool, now: u32) -> bool {
+    let lowering = rung_lowering(engine);
+    let refused = lowering
+        .refused_at
+        .load(std::sync::atomic::Ordering::Acquire);
+    if refused != 0 && refused != now {
+        lowering
+            .refused_at
+            .store(0, std::sync::atomic::Ordering::Release);
+    }
+    let above = above && refused != now;
+    lowering
+        .above
+        .store(above, std::sync::atomic::Ordering::Release);
+    if !above {
+        lowering
+            .asked
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    above && lowering.asked.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// A lower of `engine`'s rung from `now` was refused: kv waiters fund
+/// themselves otherwise until the rung moves.
+fn rung_lower_refused(engine: usize, now: u32) {
+    let lowering = rung_lowering(engine);
+    lowering
+        .refused_at
+        .store(now, std::sync::atomic::Ordering::Release);
+    lowering
+        .above
+        .store(false, std::sync::atomic::Ordering::Release);
+    lowering
+        .asked
+        .store(false, std::sync::atomic::Ordering::Release);
+}
+
 /// Per engine, the process carrying the raise's planner waiter now.
 static RAISE_CARRIERS: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, uuid::Uuid>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
