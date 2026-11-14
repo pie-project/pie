@@ -596,6 +596,29 @@ impl fmt::Debug for Buffer {
 }
 
 impl Buffer {
+    /// `size` bytes from byte `offset` of the buffer's device layout, copied
+    /// to the host (`PJRT_Buffer_CopyRawToHost`); waits for them. A u32
+    /// `[_, 128]` array's row `r` lies at `512 r`.
+    pub fn read_raw(&self, offset: i64, size: i64) -> Result<Vec<u8>> {
+        // The plugin copies into 32-byte-aligned host memory only.
+        #[repr(C, align(32))]
+        #[derive(Clone, Copy)]
+        struct Block([u8; 32]);
+        let n = usize::try_from(size).unwrap_or(0);
+        let mut blocks = vec![Block([0; 32]); n.div_ceil(32)];
+        let mut a = args!(PJRT_Buffer_CopyRawToHost_Args {
+            buffer: self.raw,
+            dst: blocks.as_mut_ptr().cast(),
+            offset: offset,
+            transfer_size: size,
+        });
+        call!(&self.api, PJRT_Buffer_CopyRawToHost, &mut a)?;
+        Event::adopt(self.api.clone(), a.event).wait()?;
+        let mut out: Vec<u8> = blocks.iter().flat_map(|b| b.0).collect();
+        out.truncate(n);
+        Ok(out)
+    }
+
     pub fn dims(&self) -> Result<Vec<i64>> {
         let mut a = args!(PJRT_Buffer_Dimensions_Args { buffer: self.raw });
         call!(&self.api, PJRT_Buffer_Dimensions, &mut a)?;

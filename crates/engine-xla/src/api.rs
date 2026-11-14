@@ -394,6 +394,9 @@ impl Engine for Xla {
         let mut shell = shell;
         if boot.prewarm {
             shell.prewarm().map_err(fault)?;
+            // The program a bind or a host pass lands guest cells with.
+            let (rows, _) = shell.pool_geometry();
+            crate::guest::run::cells_program(shell.device(), rows).map_err(Error::Load)?;
             // from here a program built is a fire the ladder missed
             shell.device().seal();
         }
@@ -464,6 +467,8 @@ impl Engine for Xla {
         };
         self.programs.seat(budgets.max_lanes);
         self.programs.seat_readouts(shell.readouts());
+        let (rows, sink_row) = shell.pool_geometry();
+        self.programs.seat_pool(rows, sink_row);
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -556,6 +561,16 @@ impl Engine for Xla {
         self.programs.register(registration).map_err(refusal)
     }
 
+    /// The rings an instance keeps in the pool's `Channel` slots: its
+    /// program's carried channels on the device; every other ring lives on
+    /// the host. No `Instance` slots: the bind-time tables stay host-side.
+    fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
+        Ok(engine::program::ProgramFacts {
+            rings: self.programs.compiled_form(program).map_or_else(Vec::new, |c| c.rings()),
+            ..Default::default()
+        })
+    }
+
     fn register_channel(
         &mut self,
         registration: &ChannelRegistration,
@@ -563,6 +578,20 @@ impl Engine for Xla {
         self.programs
             .register_channel(registration)
             .map_err(refusal)
+    }
+
+    /// An instance's carried rings moved to fresh `Channel` slots (a park
+    /// and its return): its cells are read and written there from now on.
+    /// XLA keeps no registered channel's ring in the pool.
+    fn rebind_slots(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
+        match rebind {
+            engine::program::Rebind::Instance { id, rings, .. } => {
+                let shell = self.shell.as_ref();
+                let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));
+                self.programs.rebind(id, &rings, &cell_row).map_err(refusal)
+            }
+            engine::program::Rebind::Channel { .. } => Ok(()),
+        }
     }
 
     fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
@@ -576,7 +605,9 @@ impl Engine for Xla {
                 caps.ports, caps.geometry, binding.geometry
             )));
         }
-        let bound = self.programs.bind(binding).map_err(refusal)?;
+        let shell = self.shell.as_ref();
+        let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));
+        let bound = self.programs.bind(binding, &cell_row).map_err(refusal)?;
         let seeds: Vec<(u32, Vec<u8>)> = binding
             .seeds
             .iter()
@@ -1015,13 +1046,13 @@ impl Xla {
         if prologues.is_empty() {
             return Ok(());
         }
-        let device = self
+        let (device, pool) = self
             .shell
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| Error::Load("the xla engine has no model loaded".into()))?
-            .device();
+            .device_and_pool();
         self.programs
-            .fire_guests(device, &prologues, None, Stage::Prologue)
+            .fire_guests(device, &prologues, None, pool, Stage::Prologue)
             .map_err(refusal)?;
         Ok(())
     }
@@ -1421,17 +1452,18 @@ impl Xla {
             .collect();
         let mut on_device = vec![false; submission.lanes.len()];
         if !attached.is_empty() {
-            let device = self
+            let (device, pool) = self
                 .shell
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| Error::Load("the xla engine has no model loaded".into()))?
-                .device();
+                .device_and_pool();
             let ran = self
                 .programs
                 .fire_guests_with(
                     device,
                     &attached,
                     kept.as_deref(),
+                    pool,
                     Some(latch),
                     Stage::Epilogue,
                 )

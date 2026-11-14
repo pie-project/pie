@@ -94,6 +94,12 @@ impl Plane {
     }
 }
 
+/// The pool's `Channel` slots (`SlotRole::Channel`): the cells of guest
+/// rings an instance keeps on the device, 1 KiB a slot, as many a chunk as
+/// fit. The state shapes' layout leaves them out; only the load's facts
+/// state them.
+pub const CHANNEL: engine::chunk::ShapeId = engine::chunk::ShapeId((1 << 17) + 1);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// The kv list.

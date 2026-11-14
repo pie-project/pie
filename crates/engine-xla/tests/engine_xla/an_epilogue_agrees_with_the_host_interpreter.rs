@@ -1204,9 +1204,10 @@ fn a_group_answers_what_each_lane_answers_alone(device: &Device, stages: &mut St
         .map(|(inst, lane)| Member {
             inst,
             bound: bound(&plan, &kept, lane),
+            cells: Vec::new(),
         })
         .collect();
-    let (outcomes, _) = step_group(
+    let outcomes = step_group(
         device,
         stages,
         key,
@@ -1214,7 +1215,7 @@ fn a_group_answers_what_each_lane_answers_alone(device: &Device, stages: &mut St
         Some(&kept),
         &mut members,
         &[],
-        None,
+        &mut None,
         eta_ir::registry::Stage::Epilogue,
     );
     assert!(
@@ -1324,7 +1325,48 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
         .collect();
     let mut device_insts: Vec<InterpInstance> = seeds.iter().map(|s| instance(&plan, s)).collect();
     let mut host_insts: Vec<InterpInstance> = seeds.iter().map(|s| instance(&plan, s)).collect();
-    let mut cells = None;
+    // A small pool: each lane's cells in rows of their own, the sink last.
+    let words = engine_xla::guest::carried_words(&plan.package);
+    let per_lane: u32 = words
+        .iter()
+        .map(|&(_, w)| engine_xla::guest::lower::cell_rows(w as usize) as u32)
+        .sum();
+    let pool_rows = per_lane * lanes + 8;
+    let sink_row = pool_rows - 8;
+    let cells: Vec<Vec<(u32, u32)>> = (0..lanes)
+        .map(|l| {
+            let mut at = l * per_lane;
+            words
+                .iter()
+                .map(|&(c, w)| {
+                    let first = at;
+                    at += engine_xla::guest::lower::cell_rows(w as usize) as u32;
+                    (c, first)
+                })
+                .collect()
+        })
+        .collect();
+    stages.pool_rows = i64::from(pool_rows);
+    stages.sink_row = sink_row;
+    let mut pool = device
+        .zeros_or_dry(dtype::Dtype::U32, pool_rows, 128)
+        .expect("the pool");
+    {
+        let writes: Vec<(&InterpInstance, &[(u32, u32)])> = device_insts
+            .iter()
+            .zip(&cells)
+            .map(|(i, c)| (i, c.as_slice()))
+            .collect();
+        engine_xla::guest::run::write_cells(
+            device,
+            &plan,
+            &mut pool,
+            i64::from(pool_rows),
+            sink_row,
+            &writes,
+        )
+        .expect("the seeds land in the slots");
+    }
     for pass in 0..4 {
         let plane = logits_plane(lanes, VOCAB, 70 + pass);
         let kept = kept(device, &plane, lanes, (0..lanes).map(|l| (l, 1)).collect());
@@ -1334,9 +1376,10 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
             .map(|(l, inst)| Member {
                 inst,
                 bound: bound(&plan, &kept, l),
+                cells: cells[l].clone(),
             })
             .collect();
-        let (outcomes, next) = step_group(
+        let outcomes = step_group(
             device,
             stages,
             key,
@@ -1344,15 +1387,13 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
             Some(&kept),
             &mut members,
             &carried,
-            cells.take(),
+            &mut pool,
             eta_ir::registry::Stage::Epilogue,
         );
         assert!(
             outcomes.iter().all(|o| *o == StepOutcome::Committed),
             "{outcomes:?}"
         );
-        assert!(next.is_some(), "the pass carried its cells");
-        cells = next;
         for (l, inst) in host_insts.iter_mut().enumerate() {
             let row = &plane[l * VOCAB as usize..(l + 1) * VOCAB as usize];
             let outputs = [("logits".to_string(), 0, Value::F32(row.to_vec()))];
@@ -1364,9 +1405,10 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
         }
     }
     // Back to the rings: the cells the device carried are the interpreter's.
-    let cells = cells.expect("cells");
-    let insts: Vec<Option<&InterpInstance>> = device_insts.iter().map(Some).collect();
-    engine_xla::guest::run::flush(&plan, &cells, &insts).expect("the cells come back");
+    let whole = pool.as_ref().expect("the pool");
+    for (inst, c) in device_insts.iter().zip(&cells) {
+        engine_xla::guest::run::read_cells(&plan, whole, c, inst).expect("the cells come back");
+    }
     for (d, h) in device_insts.iter().zip(&host_insts) {
         for c in 0..2 {
             exact(

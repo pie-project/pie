@@ -9,8 +9,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Carried cells a group pass left on the device, and whose they are.
-type Carried = (Vec<InstanceId>, BTreeMap<u32, crate::pjrt::Buffer>);
 /// Where an attachment runs: its plan, its content hash, where it reads its
 /// outputs.
 type Placed = (Arc<ExecPlan>, [u8; 32], Vec<crate::guest::run::Bound>);
@@ -53,6 +51,12 @@ struct Instance {
     channels: Vec<ChannelId>,
 
     poisoned: Arc<AtomicBool>,
+
+    /// Each carried channel's cell: the pool row its `Channel` slots start
+    /// at (empty where the program carries none), and whether the cells
+    /// there are the instance's current ones (else its rings' fronts are).
+    cells: Vec<(u32, u32)>,
+    on_device: bool,
 }
 
 impl Instance {
@@ -400,10 +404,6 @@ pub struct Plane {
     /// Compiled guest stages, by program content and batch shape.
     stages: crate::guest::run::Stages,
 
-    /// Per program content, the carried cells its last group pass left on
-    /// the device and the instances (in row order) they belong to.
-    carry: BTreeMap<[u8; 32], Carried>,
-
     /// Guest passes whose last stage is still on the device.
     flights: Arc<Flights>,
 }
@@ -418,6 +418,13 @@ impl Plane {
     /// compiles for too.
     pub fn seat_readouts(&mut self, rows: Vec<u32>) {
         self.stages.readouts = rows;
+    }
+
+    /// The pool a guest stage carrying cells takes: its rows and its sink's
+    /// first row (a padding lane's cells).
+    pub fn seat_pool(&mut self, rows: i64, sink_row: u32) {
+        self.stages.pool_rows = rows;
+        self.stages.sink_row = sink_row;
     }
 
     pub fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
@@ -452,7 +459,39 @@ impl Plane {
         self.programs.get(&program).map(|plan| &plan.package)
     }
 
-    pub fn register_channel(
+    /// An instance's carried rings moved (`Engine::rebind_slots`): the
+    /// runtime copied their cells into the fresh `Channel` slots `rings`
+    /// names, so the instance reads and writes them there from now on.
+    pub fn rebind(
+        &mut self,
+        id: InstanceId,
+        rings: &[engine::program::RingSlots],
+        cell_row: &dyn Fn(u32) -> Option<u32>,
+    ) -> Result<(), Refusal> {
+        let carried = {
+            let held = self.instances.get(&id).ok_or(Refusal::Closed {
+                what: "instance",
+                id: id.0,
+            })?;
+            self.forms
+                .get(held.program)
+                .map(|c| c.carried_words.clone())
+                .unwrap_or_default()
+        };
+        let cells = cells_of(&carried, rings, cell_row)?;
+        if let Some(held) = self.instances.get_mut(&id) {
+            held.cells = cells;
+        }
+        Ok(())
+    }
+
+    /// Program `program`'s device form, where its every stage lowers.
+    #[must_use]
+    pub fn compiled_form(&self, program: ProgramId) -> Option<&Arc<crate::guest::Compiled>> {
+        self.forms.get(program)
+    }
+
+        pub fn register_channel(
         &mut self,
         registration: &ChannelRegistration,
     ) -> Result<RegisteredChannel, Refusal> {
@@ -496,7 +535,13 @@ impl Plane {
             })
     }
 
-    pub fn bind(&mut self, binding: &InstanceBinding) -> Result<BoundInstance, Refusal> {
+    /// Binds an instance; `cell_row` answers the pool row a `Channel` slot
+    /// ref starts at, for the carried rings it keeps on the device.
+    pub fn bind(
+        &mut self,
+        binding: &InstanceBinding,
+        cell_row: &dyn Fn(u32) -> Option<u32>,
+    ) -> Result<BoundInstance, Refusal> {
         let plan = self
             .programs
             .get(&binding.program)
@@ -543,6 +588,12 @@ impl Plane {
             seeds.insert(seed.channel, value);
         }
         let inst = eta_exec::make_host_instance(&plan, &externs, &seeds);
+        let carried = self
+            .forms
+            .get(binding.program)
+            .map(|c| c.carried_words.clone())
+            .unwrap_or_default();
+        let cells = cells_of(&carried, &binding.ring_slots, cell_row)?;
 
         self.next_instance += 1;
         let id = InstanceId(self.next_instance);
@@ -556,6 +607,8 @@ impl Plane {
                 geometry: binding.geometry,
                 channels: binding.channels.clone(),
                 poisoned,
+                cells,
+                on_device: false,
             },
         );
         Ok(BoundInstance {
@@ -953,9 +1006,10 @@ impl Plane {
         device: &crate::device::Device,
         attachments: &[(InstanceId, u32)],
         kept: Option<&crate::readout::Kept>,
+        pool: &mut Option<crate::pjrt::Buffer>,
         at: Stage,
     ) -> Result<Vec<bool>, Refusal> {
-        self.fire_guests_with(device, attachments, kept, None, at)
+        self.fire_guests_with(device, attachments, kept, pool, None, at)
     }
 
     /// `fire_guests`, with each device group's last stage left in flight
@@ -969,6 +1023,7 @@ impl Plane {
         device: &crate::device::Device,
         attachments: &[(InstanceId, u32)],
         kept: Option<&crate::readout::Kept>,
+        pool: &mut Option<crate::pjrt::Buffer>,
         latch: Option<&Arc<Latch>>,
         point: Stage,
     ) -> Result<Vec<bool>, Refusal> {
@@ -984,9 +1039,6 @@ impl Plane {
         // Where each attachment runs.
         let mut plans: Vec<Option<Placed>> = Vec::with_capacity(attachments.len());
         let mut carried_of: BTreeMap<[u8; 32], Vec<u32>> = BTreeMap::new();
-        // Cells carried from the last fire: kept for a group of exactly the
-        // same instances below, written back to the rings otherwise.
-        let mut carry = std::mem::take(&mut self.carry);
         for &(instance, lane) in attachments {
             let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
                 what: "instance",
@@ -1026,7 +1078,16 @@ impl Plane {
         };
         let mut ran = vec![false; attachments.len()];
         if shared {
-            self.flush_carry(std::mem::take(&mut carry));
+            // These step one by one on the host's rings: their cells come
+            // back from the pool first.
+            for &(instance, _) in attachments {
+                if let Some(held) = self.instances.get_mut(&instance)
+                    && let Err(why) = cells_to_host(held, pool.as_ref())
+                {
+                    held.inst.poisoned = true;
+                    note(StepOutcome::Faulted(why), instance, held.program);
+                }
+            }
             for (at, &(instance, _)) in attachments.iter().enumerate() {
                 let Some((plan, key, bound)) = plans[at].clone() else {
                     continue;
@@ -1069,16 +1130,33 @@ impl Plane {
             for (key, _, plan, members) in groups {
                 let wanted: BTreeMap<InstanceId, usize> =
                     members.iter().map(|&at| (attachments[at].0, at)).collect();
-                let ids: Vec<InstanceId> = wanted.keys().copied().collect();
-                let cells = match carry.remove(&key) {
-                    Some((held, cells)) if held == ids => Some(cells),
-                    Some(other) => {
-                        self.flush_carry(BTreeMap::from([(key, other)]));
-                        None
-                    }
-                    None => None,
-                };
                 let carried = carried_of.get(&key).cloned().unwrap_or_default();
+                // Cells the rings hold (a fresh bind, a pass on the host) land
+                // in the members' slots before the pass reads them there.
+                {
+                    let fresh: Vec<(&InterpInstance, &[(u32, u32)])> = (self.instances.iter())
+                        .filter(|(id, held)| {
+                            wanted.contains_key(id) && !held.on_device && !held.cells.is_empty()
+                        })
+                        .map(|(_, held)| (&held.inst, held.cells.as_slice()))
+                        .collect();
+                    if !fresh.is_empty() {
+                        crate::guest::run::write_cells(
+                            device,
+                            &plan,
+                            pool,
+                            self.stages.pool_rows,
+                            self.stages.sink_row,
+                            &fresh,
+                        )
+                        .map_err(Refusal::Program)?;
+                    }
+                    for (id, held) in &mut self.instances {
+                        if wanted.contains_key(id) {
+                            held.on_device = true;
+                        }
+                    }
+                }
                 let mut order: Vec<(usize, InstanceId, ProgramId)> = Vec::new();
                 let mut group: Vec<Member<'_>> = Vec::new();
                 for (&id, held) in &mut self.instances {
@@ -1089,9 +1167,10 @@ impl Plane {
                     group.push(Member {
                         inst: &mut held.inst,
                         bound: plans[at].as_ref().map(|p| p.2.clone()).unwrap_or_default(),
+                        cells: held.cells.clone(),
                     });
                 }
-                let (outcomes, cells, deferred) = if latch.is_some() {
+                let (outcomes, deferred) = if latch.is_some() {
                     step_group_deferred(
                         device,
                         &mut self.stages,
@@ -1100,11 +1179,11 @@ impl Plane {
                         kept,
                         &mut group,
                         &carried,
-                        cells,
+                        pool,
                         point,
                     )
                 } else {
-                    let (outcomes, cells) = step_group(
+                    let outcomes = step_group(
                         device,
                         &mut self.stages,
                         key,
@@ -1112,10 +1191,10 @@ impl Plane {
                         kept,
                         &mut group,
                         &carried,
-                        cells,
+                        pool,
                         point,
                     );
-                    (outcomes, cells, None)
+                    (outcomes, None)
                 };
                 if let Some(deferred) = deferred {
                     let poison: Vec<Arc<AtomicBool>> = deferred
@@ -1127,16 +1206,12 @@ impl Plane {
                         .collect();
                     self.flights.launch(deferred, poison, latch);
                 }
-                if let Some(cells) = cells {
-                    self.carry.insert(key, (ids, cells));
-                }
                 for ((at, id, program), outcome) in order.into_iter().zip(outcomes) {
                     ran[at] = true;
                     note(outcome, id, program);
                 }
             }
         }
-        self.flush_carry(carry);
         let on_device = ran.iter().filter(|&&r| r).count() as u64;
         if on_device > 0 && self.tally.device.fetch_add(on_device, Ordering::AcqRel) == 0 {
             tracing::info!(passes = on_device, "a guest pass ran on the device");
@@ -1155,6 +1230,13 @@ impl Plane {
                     }
                 }
             }
+            if let Some(held) = self.instances.get_mut(&instance)
+                && let Err(why) = cells_to_host(held, pool.as_ref())
+            {
+                held.inst.poisoned = true;
+                first_error.get_or_insert(Refusal::Program(why));
+                continue;
+            }
             let outcome = self.fire_interpreted(instance, &outputs, point);
             if let Err(why) = outcome {
                 first_error.get_or_insert(why);
@@ -1163,31 +1245,6 @@ impl Plane {
         match first_error {
             Some(why) => Err(why),
             None => Ok(ran),
-        }
-    }
-
-    /// Writes carried cells back into their instances' rings.
-    fn flush_carry(&mut self, carry: BTreeMap<[u8; 32], Carried>) {
-        for (_, (ids, cells)) in carry {
-            let Some(plan) = ids
-                .iter()
-                .find_map(|id| self.instances.get(id))
-                .map(|seat| Arc::clone(&seat.plan))
-            else {
-                continue;
-            };
-            let insts: Vec<Option<&InterpInstance>> = ids
-                .iter()
-                .map(|id| self.instances.get(id).map(|seat| &seat.inst))
-                .collect();
-            if let Err(why) = crate::guest::run::flush(&plan, &cells, &insts) {
-                tracing::warn!(%why, "carried guest cells did not come back to the host");
-                for id in &ids {
-                    if let Some(seat) = self.instances.get_mut(id) {
-                        seat.inst.poisoned = true;
-                    }
-                }
-            }
         }
     }
 
@@ -1461,4 +1518,46 @@ impl Plane {
         }
         Ok(ring.front())
     }
+}
+
+/// Each carried channel's first pool row, from the `Channel` slots the
+/// binding names for it (`ProgramFacts::rings`, one contiguous run each).
+fn cells_of(
+    carried: &[(u32, u32)],
+    rings: &[engine::program::RingSlots],
+    cell_row: &dyn Fn(u32) -> Option<u32>,
+) -> Result<Vec<(u32, u32)>, Refusal> {
+    carried
+        .iter()
+        .map(|&(channel, _)| {
+            let first = rings
+                .iter()
+                .find(|r| r.channel == channel)
+                .and_then(|r| r.slots.first().copied())
+                .ok_or_else(|| {
+                    Refusal::Program(format!(
+                        "the program keeps carried channel {channel} in Channel slots and the \
+                         binding names none for it"
+                    ))
+                })?;
+            let row = cell_row(first).ok_or_else(|| {
+                Refusal::Program(format!(
+                    "Channel slot {first} of carried channel {channel} lies past the pool"
+                ))
+            })?;
+            Ok((channel, row))
+        })
+        .collect()
+}
+
+/// An instance's carried cells back into its rings' fronts, where the pool
+/// held them: the host runs its next pass.
+fn cells_to_host(held: &mut Instance, pool: Option<&crate::pjrt::Buffer>) -> Result<(), String> {
+    if !held.on_device || held.cells.is_empty() {
+        return Ok(());
+    }
+    let pool = pool.ok_or("the pool, which another program holds")?;
+    crate::guest::run::read_cells(&held.plan, pool, &held.cells, &held.inst)?;
+    held.on_device = false;
+    Ok(())
 }

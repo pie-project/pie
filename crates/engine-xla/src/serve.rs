@@ -896,6 +896,24 @@ impl Shell {
         &self.device
     }
 
+    /// The device and the pool buffer at once: a guest pass's programs take
+    /// the pool (its carried cells' `Channel` slots).
+    pub fn device_and_pool(&mut self) -> (&Device, &mut Option<crate::pjrt::Buffer>) {
+        (&self.device, self.pools.buffer_mut())
+    }
+
+    /// The pool's rows and its sink's first row.
+    #[must_use]
+    pub fn pool_geometry(&self) -> (i64, u32) {
+        (self.pools.rows(), self.pools.sink_row())
+    }
+
+    /// The pool row a `Channel` slot ref starts at.
+    #[must_use]
+    pub fn channel_row(&self, slot: u32) -> Option<u32> {
+        self.pools.channel_row(slot)
+    }
+
     /// The patch element the plan's image tower reads, if it has one.
     /// Reads `values` back from every later fire, each as its writer left
     /// it (`Fired::probes`): a debugging reader's view of the walk.

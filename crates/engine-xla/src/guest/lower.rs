@@ -95,10 +95,14 @@ pub struct Layout {
     /// The planes the stage reads, a parameter each after the pack.
     pub reads: Vec<Read>,
     /// Carried cells: channels whose cell stays on the device between
-    /// passes. Each is its own `u32 [B, words]` parameter (after the pack
-    /// and the readouts) and its own result (after the pack), per channel.
+    /// passes, in each lane's `Channel` slots of the pool. The stage takes
+    /// the pool (its last parameter, donated, and its last result) and, at
+    /// `carried_rows_at` of each lane's packed row, one word a channel of
+    /// `carried`: the pool row the lane's cell starts at.
     pub carried_in: Vec<(u32, Slot)>,
     pub carried_out: Vec<(u32, Slot)>,
+    pub carried: Vec<(u32, usize)>,
+    pub carried_rows_at: usize,
 }
 
 impl Layout {
@@ -107,6 +111,18 @@ impl Layout {
     pub fn runs(&self) -> bool {
         self.out_words > 0 || !self.carried_out.is_empty()
     }
+
+    /// Whether the stage reads or writes the pool (its carried cells).
+    #[must_use]
+    pub fn pooled(&self) -> bool {
+        !self.carried.is_empty()
+    }
+}
+
+/// Pool rows (u32 `[_, 128]`) a carried cell of `words` takes.
+#[must_use]
+pub fn cell_rows(words: usize) -> usize {
+    words.div_ceil(128).max(1)
 }
 
 #[derive(Clone, Debug)]
@@ -194,6 +210,7 @@ pub fn lower(
     at: usize,
     batch: Batch,
     carried: &[u32],
+    pool_rows: i64,
 ) -> Lowering<Lowered> {
     if at >= package.stages.len() {
         return refuse(format!("the package has no stage {at}"));
@@ -309,6 +326,17 @@ pub fn lower(
         layout.out_words += w;
     }
 
+    // One pack word a carried channel: the lane's cell's first pool row.
+    let mut chans: Vec<(u32, usize)> = Vec::new();
+    for (c, slot) in layout.carried_in.iter().chain(&layout.carried_out) {
+        if !chans.iter().any(|(k, _)| k == c) {
+            chans.push((*c, slot.words));
+        }
+    }
+    layout.carried_rows_at = layout.in_words;
+    layout.in_words += chans.len();
+    layout.carried = chans;
+
     let mut l = Lower {
         f: Func::new("main"),
         package,
@@ -327,18 +355,39 @@ pub fn lower(
             ))
         })
         .collect::<Lowering<_>>()?;
-    let carried_params: Vec<Val> = layout
-        .carried_in
-        .iter()
-        .map(|(_, slot)| {
-            l.f.param(Ty::new(Elem::U32, &[l.b, slot.words as i64]), None)
-        })
-        .collect();
-    for ((_, slot), &param) in layout.carried_in.iter().zip(&carried_params) {
+    // The pool, last: aliased to the last result.
+    let pool = layout.pooled().then(|| {
+        let result = u32::from(layout.out_words > 0);
+        let p = l.f.param(Ty::new(Elem::U32, &[pool_rows.max(1), 128]), Some(result));
+        l.f.pin_row_major(p);
+        p
+    });
+    // Each carried channel's rows, `[B · rows]`: its cell's rows a lane.
+    let mut cell_at: HashMap<u32, Val> = HashMap::new();
+    for (k, &(c, w)) in layout.carried.iter().enumerate() {
+        let pack = pack.expect("carried rows ride the pack");
+        let first = l.f.slice(
+            pack,
+            &[0, (layout.carried_rows_at + k) as i64],
+            &[l.b, (layout.carried_rows_at + k + 1) as i64],
+            &[1, 1],
+        )?;
+        let first = l.f.bitcast(first, Elem::I32)?;
+        let nr = cell_rows(w) as i64;
+        let first = l.f.broadcast(first, &[l.b, nr], &[0, 1])?;
+        let step = l.f.iota(Elem::I32, &[l.b, nr], 1);
+        let rows = l.f.add(first, step)?;
+        cell_at.insert(c, l.f.reshape(rows, &[l.b * nr])?);
+    }
+    for (c, slot) in &layout.carried_in {
         let Feed::Value(dtype, n) = slot.feed else {
             unreachable!("carried cells are values");
         };
-        let v = l.unpack(param, 0, dtype, n)?;
+        let nr = cell_rows(slot.words) as i64;
+        let pool = pool.expect("carried cells ride the pool");
+        let cells = l.f.take_rows(pool, cell_at[c])?;
+        let cells = l.f.reshape(cells, &[l.b, nr * 128])?;
+        let v = l.unpack(cells, 0, dtype, n)?;
         let v = l.reshaped(v, &package.values[slot.value as usize].shape)?;
         l.env.insert(slot.value, v);
     }
@@ -395,12 +444,25 @@ pub fn lower(
     if !packed.is_empty() {
         results.push(l.f.concat(&packed, 1)?);
     }
-    for (_, slot) in &layout.carried_out {
-        let v = l.get(slot.value)?;
-        let Feed::Value(dtype, n) = slot.feed else {
-            unreachable!("carried cells are values");
-        };
-        results.push(l.pack(v, dtype, n)?);
+    if let Some(mut pool) = pool {
+        for (c, slot) in &layout.carried_out {
+            let v = l.get(slot.value)?;
+            let Feed::Value(dtype, n) = slot.feed else {
+                unreachable!("carried cells are values");
+            };
+            let cell = l.pack(v, dtype, n)?;
+            let nr = cell_rows(slot.words) as i64;
+            let w = slot.words as i64;
+            let cell = if nr * 128 > w {
+                let z = l.f.const_i(Elem::U32, 0, &[]);
+                l.f.pad(cell, z, &[0, 0], &[0, nr * 128 - w], &[0, 0])?
+            } else {
+                cell
+            };
+            let cell = l.f.reshape(cell, &[l.b * nr, 128])?;
+            pool = l.f.put_rows(pool, cell_at[c], cell, kernels_xla::hlo::Combine::Set)?;
+        }
+        results.push(pool);
     }
     let text = if results.is_empty() {
         String::new()

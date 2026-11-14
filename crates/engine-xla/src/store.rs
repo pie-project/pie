@@ -866,6 +866,16 @@ impl Pools {
                     SlotRole::State
                 },
             })
+            .chain(std::iter::once(SlotShape {
+                id: layout::CHANNEL,
+                kind: SlotKind::Fixed { pieces: 1 },
+                slot_bytes: crate::guest::CHANNEL_SLOT,
+                slots_per_chunk: narrow(self.layout.chunk_bytes / crate::guest::CHANNEL_SLOT),
+                sets_per_working_set: 1,
+                rows: Vec::new(),
+                pinned: None,
+                role: SlotRole::Channel,
+            }))
             .collect();
         ChunkFacts {
             span_backed_on_demand: false,
@@ -940,6 +950,39 @@ impl Pools {
     /// Each of `slots` (refs of shape `id`) as its grain index.
     pub fn grains(&self, id: ShapeId, slots: &[u32]) -> Result<Vec<u32>> {
         slots.iter().map(|&slot| self.grain(id, slot)).collect()
+    }
+
+    /// The pool's rows (u32 `[rows, 128]`).
+    #[must_use]
+    pub fn rows(&self) -> i64 {
+        i64::try_from(u64::from(self.chunks) * self.layout.chunk_bytes / ROW_BYTES)
+            .unwrap_or(i64::MAX)
+    }
+
+    /// The sink chunk's first row: where a padding lane's guest cells go.
+    #[must_use]
+    pub fn sink_row(&self) -> u32 {
+        narrow(u64::from(self.sink_chunk()) * self.layout.chunk_bytes / ROW_BYTES)
+    }
+
+    /// The pool buffer itself, for programs that take it beside the
+    /// tracer's (guest stages carrying cells).
+    pub fn buffer_mut(&mut self) -> &mut Option<Buffer> {
+        &mut self.buffer
+    }
+
+    /// The pool row `Channel` slot ref `slot` starts at
+    /// ([`layout::CHANNEL`], 1 KiB slots).
+    #[must_use]
+    pub fn channel_row(&self, slot: u32) -> Option<u32> {
+        let per = u32::try_from(self.layout.chunk_bytes / crate::guest::CHANNEL_SLOT).ok()?;
+        let chunk = self.table.physical(slot / per.max(1))?;
+        if chunk == NULL_CHUNK || chunk >= self.sink_chunk() {
+            return None;
+        }
+        let at = u64::from(chunk) * self.layout.chunk_bytes
+            + u64::from(slot % per.max(1)) * crate::guest::CHANNEL_SLOT;
+        u32::try_from(at / ROW_BYTES).ok()
     }
 
     /// The sink chunk: the pool's top one.
@@ -1156,6 +1199,25 @@ impl Pools {
     }
 
     /// The pool rows grain index `q` of shape `id` starts at.
+    /// Pool rows a slot of shape `id` takes: a state shape's, or a
+    /// `Channel` slot's ([`layout::CHANNEL`]).
+    fn slot_rows(&self, id: ShapeId) -> Result<u64> {
+        if id == layout::CHANNEL {
+            return Ok(crate::guest::CHANNEL_SLOT / ROW_BYTES);
+        }
+        Ok(self.shape(id)?.slot_bytes / ROW_BYTES)
+    }
+
+    /// The pool row slot `slot` of shape `id` starts at.
+    fn slot_row(&self, id: ShapeId, slot: u32) -> Result<i64> {
+        if id == layout::CHANNEL {
+            return self.channel_row(slot).map(i64::from).ok_or_else(|| Fault::Unbound {
+                what: format!("Channel slot {slot}, which lies past the pool"),
+            });
+        }
+        self.rows_at(id, self.grain(id, slot)?)
+    }
+
     fn rows_at(&self, id: ShapeId, q: u32) -> Result<i64> {
         let shape = self.shape(id)?;
         Ok(i64::try_from(u64::from(q) * self.layout.grain(shape) / ROW_BYTES).unwrap_or(i64::MAX))
@@ -1211,9 +1273,9 @@ impl Pools {
             if src == dst {
                 continue;
             }
-            let rows = self.shape(id)?.slot_bytes / ROW_BYTES;
-            let from = self.rows_at(id, self.grain(id, src)?)?;
-            let to = self.rows_at(id, self.grain(id, dst)?)?;
+            let rows = self.slot_rows(id)?;
+            let from = self.slot_row(id, src)?;
+            let to = self.slot_row(id, dst)?;
             spans.push((rows, from, to));
         }
         self.copy_rows(device, handles, &spans)
@@ -1395,10 +1457,10 @@ impl Pools {
         if slots.is_empty() || device.is_dry() {
             return Ok(Vec::new());
         }
-        let rows = self.shape(id)?.slot_bytes / ROW_BYTES;
+        let rows = self.slot_rows(id)?;
         let mut at: Vec<i64> = slots
             .iter()
-            .map(|&slot| self.rows_at(id, self.grain(id, slot)?))
+            .map(|&slot| self.slot_row(id, slot))
             .collect::<Result<_>>()?;
         let n = at.len();
         pad_pow2(&mut at, 1);
@@ -1446,7 +1508,7 @@ impl Pools {
         if slots.is_empty() || device.is_dry() {
             return Ok(());
         }
-        let rows = self.shape(id)?.slot_bytes / ROW_BYTES;
+        let rows = self.slot_rows(id)?;
         if bytes.len() as u64 != slots.len() as u64 * rows * ROW_BYTES {
             return Err(Fault::Unbound {
                 what: format!(
@@ -1459,7 +1521,7 @@ impl Pools {
         }
         let at: Vec<i64> = slots
             .iter()
-            .map(|&slot| self.rows_at(id, self.grain(id, slot)?))
+            .map(|&slot| self.slot_row(id, slot))
             .collect::<Result<_>>()?;
         self.write_rows(device, handles, rows, at, bytes)
     }
