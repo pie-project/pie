@@ -3477,6 +3477,8 @@ impl Pools {
         if !self.whole {
             self.back_whole()?;
         }
+        // What the fit backs: the range reserves addresses past it.
+        let backed = self.chunk_bytes(self.fitted_chunks());
         let mut regions = Vec::new();
         // A kv plane's region is the pool from the plane's offset in a
         // slot on: the page a slot ref `r` names starts `r` strides in,
@@ -3489,7 +3491,7 @@ impl Pools {
         for (plane, _) in self.paged_planes() {
             regions.push(engine::KvRegion {
                 base: self.chunks.base() + plane.offset,
-                len: self.chunks.bytes().saturating_sub(plane.offset),
+                len: backed.saturating_sub(plane.offset),
                 page_stride: grain,
                 domain: engine::MemoryDomain::CudaDevice(ordinal),
             });

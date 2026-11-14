@@ -64,20 +64,21 @@ impl Chunks {
         act_bytes: u64,
     ) -> Result<Chunks> {
         let act = u32::try_from(act_bytes.div_ceil(layout.chunk_bytes.max(1))).unwrap_or(u32::MAX);
-        // A flat range (no device memory mapped on demand: ROCm) is one
-        // allocation of every chunk at once, so it can hold no more chunks
-        // than the pool's ceiling backs; a mapped range only reserves
-        // addresses, and the fit decides how many chunks are ever backed.
+        // The range is every chunk the pool's ceiling backs beside the
+        // activation: the cache rows' demand is `total`, and what the
+        // guests' instances and rings take of it is known to no load. A
+        // range mapped on demand only reserves addresses, and the fit
+        // decides how many chunks are ever backed; a flat one (ROCm) is one
+        // allocation of every chunk, so it holds no more than that.
+        let backed =
+            pool.hard_pages().saturating_mul(pool.page_bytes()) / layout.chunk_bytes.max(1);
+        let backed = u32::try_from(backed)
+            .unwrap_or(u32::MAX)
+            .saturating_sub(act);
         let total = if crate::device::elastic::mapped_on_demand() {
-            total
+            total.max(backed)
         } else {
-            let backed =
-                pool.hard_pages().saturating_mul(pool.page_bytes()) / layout.chunk_bytes.max(1);
-            total.min(
-                u32::try_from(backed)
-                    .unwrap_or(u32::MAX)
-                    .saturating_sub(act),
-            )
+            total.min(backed)
         };
         let total = total.max(1);
         let bytes = (u64::from(total) + u64::from(act)) * layout.chunk_bytes;
