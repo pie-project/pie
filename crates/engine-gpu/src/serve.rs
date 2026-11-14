@@ -2705,6 +2705,8 @@ impl<B: Serve> Shell<B> {
                 Some(run) if plan.commit == 0 => self.pools.record(Some(run), seat_slot)?,
                 _ => record.clone(),
             };
+            // The record as the slot tables state it, once a lane.
+            let state = crate::store::slot_entries(&state)?;
             let fresh = match seated.rs_reset {
                 engine::fire::RsReset::Inferred => have == 0,
                 engine::fire::RsReset::Fresh => true,
@@ -2812,7 +2814,7 @@ impl<B: Serve> Shell<B> {
                 adapter_routes.extend(std::iter::repeat_n(id, row.rows as usize));
             }
 
-            slot_ids.extend(state.iter().map(|&unit| unit as i32));
+            slot_ids.extend_from_slice(&state);
             {
                 const MAX: usize = kernels_slang::ssm::RS_SNAPSHOTS as usize;
                 let snaps = seated.rs_snapshots;
@@ -2860,7 +2862,7 @@ impl<B: Serve> Shell<B> {
                     }
                     entry[n] = narrow(u64::from(snap.row));
                     for (p, &unit) in units.iter().enumerate() {
-                        entry[MAX + n * pieces + p] = unit as i32;
+                        entry[MAX + n * pieces + p] = crate::store::slot_entry(unit)?;
                         snap_units = snap_units.max(unit.saturating_add(1));
                     }
                 }
@@ -2912,7 +2914,7 @@ impl<B: Serve> Shell<B> {
                         positions.push(if self.states_mrope { row } else { stated });
                         rotations.push(stated);
                         request_of_token.push(at_lane);
-                        slot_of_row.extend(state.iter().map(|&unit| unit as i32));
+                        slot_of_row.extend_from_slice(&state);
                     }
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }

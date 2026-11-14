@@ -61,19 +61,29 @@ pub fn recipe(
     })
 }
 
+/// The pool's kv pages as its facts state them, a u32: a count past it is
+/// refused at the load, where a clamp would tell the runtime of fewer pages
+/// than the pool holds.
+fn stated_pages(pages: u64) -> Result<u32> {
+    u32::try_from(pages).map_err(|_| Fault::Ceiling {
+        what: "kv pages (the pool's facts state the count as a u32)",
+        need: pages,
+        have: u64::from(u32::MAX),
+    })
+}
+
 impl<B: Serve> Shell<B> {
     /// The pool as the legacy facts state it: its kv pages, its records;
     /// `disk_kv_pages` is what [`Shell::seat_disk_kv`] seated.
-    #[must_use]
-    pub fn pool_facts(&self, disk_kv_pages: u32) -> PoolFacts {
+    pub fn pool_facts(&self, disk_kv_pages: u32) -> Result<PoolFacts> {
         let paging = self.paging();
         let state_rows = self
             .trace()
             .caches
             .iter()
             .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
-        PoolFacts {
-            kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
+        Ok(PoolFacts {
+            kv_pages: stated_pages(paging.pages())?,
             kv_page_size: paging.page_size,
             state_slots: if state_rows { paging.slots } else { 0 },
             state_slot_bytes: self.state_slot_bytes(),
@@ -82,7 +92,7 @@ impl<B: Serve> Shell<B> {
             // The model's window; its rows lie in window lists.
             window_tokens: poem_exec::store::kv::declared_window(self.trace()).unwrap_or(0),
             ..PoolFacts::default()
-        }
+        })
     }
 
     /// The pool as chunks: shared slot shapes over one chunk space.
@@ -92,5 +102,26 @@ impl<B: Serve> Shell<B> {
             what: format!("the pool's chunk facts: {why}"),
         })?;
         Ok(facts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stated_pages;
+    use crate::error::Fault;
+
+    /// The facts state every page the pool holds or the load is refused.
+    #[test]
+    fn a_page_count_past_u32_is_refused() {
+        assert_eq!(stated_pages(0).ok(), Some(0));
+        assert_eq!(stated_pages(u64::from(u32::MAX)).ok(), Some(u32::MAX));
+        let refused = stated_pages(1 << 32).expect_err("past u32");
+        assert!(
+            matches!(
+                refused,
+                Fault::Ceiling { need, have, .. } if need == 1 << 32 && have == u64::from(u32::MAX)
+            ),
+            "{refused}"
+        );
     }
 }
