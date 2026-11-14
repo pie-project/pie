@@ -521,8 +521,9 @@ impl Elastic {
         }
     }
 
-    /// Maps `[from, end)` once, zeroed, and keeps it mapped for the buffer's
-    /// life, charged to the arena like any growth: the top of a range whose
+    /// Maps `[from, end)` once, untouched (a heap's pages are paid on first
+    /// touch, so what no kernel writes costs an address only), and keeps it
+    /// mapped for the buffer's life, charged to the arena like any growth: the top of a range whose
     /// bottom grows and shrinks beneath it ([`grow_all`], [`shrink_all`]
     /// stop at `from`). `from` is a whole [`CHUNK`] and at or above what the
     /// bottom has mapped; a buffer pins its top once.
@@ -606,9 +607,7 @@ impl Elastic {
         if let Some(fault) = fault {
             return Err(fault);
         }
-        // SAFETY: just mapped by the flush waited for; no frame has been
-        // encoded against these tiles.
-        unsafe { self.zero(from, self.len - from) }
+        Ok(())
     }
 
     /// A binding view over the sparse buffer, for encoders and blits.

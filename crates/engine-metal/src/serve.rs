@@ -1094,6 +1094,9 @@ impl PreparedLoad<'_> {
                 layout.act(),
             );
         }
+        // The span is mapped untouched; the kernel scratch plane is the one
+        // part a kernel reads before it writes.
+        pools.zero_span(arena.scratch_at(), scratch.bytes())?;
         scratch.seat(pools.view().clone(), arena.scratch_at());
         pools.seat_weights(weight_caches);
         // The null chunk and the floor stand from the load on.
