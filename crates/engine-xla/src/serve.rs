@@ -649,7 +649,7 @@ impl Shell {
             u64::from(tokens.div_ceil(boot.page_size.max(1))).clamp(1, least)
         });
         let (fit, slots) =
-            engine::fit::pool_for(boot.kv_budget, boot.slots, seat, room, &demand)
+            engine::fit::pool_for(boot.kv_budget, boot.slots, seat, room, demand)
                 .map_err(|short| Fault::Residency(short.to_string()))?;
         if fit < least {
             return Err(Fault::Residency(format!(
