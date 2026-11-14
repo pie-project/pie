@@ -128,7 +128,10 @@ fn the_slots_a_request_lands_in_trace_no_new_program() {
     let fixed = facts
         .shapes
         .iter()
-        .find(|s| matches!(s.kind, engine::chunk::SlotKind::Fixed { .. }))
+        .find(|s| {
+            matches!(s.kind, engine::chunk::SlotKind::Fixed { .. })
+                && s.role == engine::chunk::SlotRole::State
+        })
         .expect("a hybrid states a record")
         .id;
     let pages: Vec<u32> = (0..120).map(|_| refs.take(kv)).collect();

@@ -596,6 +596,29 @@ impl fmt::Debug for Buffer {
 }
 
 impl Buffer {
+    /// `size` bytes from byte `offset` of the buffer's device layout, copied
+    /// to the host (`PJRT_Buffer_CopyRawToHost`); waits for them. A u32
+    /// `[_, 128]` array's row `r` lies at `512 r`.
+    pub fn read_raw(&self, offset: i64, size: i64) -> Result<Vec<u8>> {
+        // The plugin copies into 32-byte-aligned host memory only.
+        #[repr(C, align(32))]
+        #[derive(Clone, Copy)]
+        struct Block([u8; 32]);
+        let n = usize::try_from(size).unwrap_or(0);
+        let mut blocks = vec![Block([0; 32]); n.div_ceil(32)];
+        let mut a = args!(PJRT_Buffer_CopyRawToHost_Args {
+            buffer: self.raw,
+            dst: blocks.as_mut_ptr().cast(),
+            offset: offset,
+            transfer_size: size,
+        });
+        call!(&self.api, PJRT_Buffer_CopyRawToHost, &mut a)?;
+        Event::adopt(self.api.clone(), a.event).wait()?;
+        let mut out: Vec<u8> = blocks.iter().flat_map(|b| b.0).collect();
+        out.truncate(n);
+        Ok(out)
+    }
+
     pub fn dims(&self) -> Result<Vec<i64>> {
         let mut a = args!(PJRT_Buffer_Dimensions_Args { buffer: self.raw });
         call!(&self.api, PJRT_Buffer_Dimensions, &mut a)?;
@@ -826,6 +849,46 @@ impl Executable {
             .collect();
         Ok((outputs, Event::adopt(self.api.clone(), done)))
     }
+}
+
+impl Executable {
+    /// The memory the compiled program takes (`GetCompiledMemoryStats`):
+    /// argument, output, alias, temp and generated-code bytes, and its peak.
+    pub fn compiled_memory(&self) -> Result<CompiledMemory> {
+        let mut g = args!(PJRT_LoadedExecutable_GetExecutable_Args {
+            loaded_executable: self.raw
+        });
+        call!(&self.api, PJRT_LoadedExecutable_GetExecutable, &mut g)?;
+        let mut m = args!(PJRT_Executable_GetCompiledMemoryStats_Args {
+            executable: g.executable
+        });
+        let r = call!(&self.api, PJRT_Executable_GetCompiledMemoryStats, &mut m);
+        let mut d = args!(PJRT_Executable_Destroy_Args {
+            executable: g.executable
+        });
+        let _ = call!(&self.api, PJRT_Executable_Destroy, &mut d);
+        r?;
+        let bytes = |v: i64| u64::try_from(v).unwrap_or(0);
+        Ok(CompiledMemory {
+            argument: bytes(m.argument_size_in_bytes),
+            output: bytes(m.output_size_in_bytes),
+            alias: bytes(m.alias_size_in_bytes),
+            temp: bytes(m.temp_size_in_bytes),
+            code: bytes(m.generated_code_size_in_bytes),
+            peak: bytes(m.peak_memory_in_bytes),
+        })
+    }
+}
+
+/// A compiled program's memory (`Executable::compiled_memory`), in bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompiledMemory {
+    pub argument: u64,
+    pub output: u64,
+    pub alias: u64,
+    pub temp: u64,
+    pub code: u64,
+    pub peak: u64,
 }
 
 impl Drop for Executable {

@@ -1038,6 +1038,123 @@ fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
     a_group_answers_what_each_lane_answers_alone(device, &mut stages);
     carried_cells_answer_what_the_rings_answer(device, &mut stages);
     eprintln!("compiled {} stage program(s)", stages.len());
+    // Last: it seals the device.
+    registration_compiles_every_pass(device);
+}
+
+/// Registration's compile (`Stages::compile_all`, every lane rung and every
+/// plane a fire returns) leaves no pass anything to compile: four passes of
+/// a carrying group after the device seals build no program; and the
+/// program's fire facts cover every rung it compiled.
+fn registration_compiles_every_pass(device: &Device) {
+    let (container, out) = carrying(VOCAB);
+    let plan = plan_of(container, VOCAB);
+    let carried = engine_xla::guest::carried_channels(&plan.package);
+    let key = key_of(&plan);
+    let lanes = 3u32;
+    let probe = kept(device, &logits_plane(lanes, VOCAB, 1), lanes, vec![(0, 1)]);
+    let read = &probe.planes[0];
+    let words = engine_xla::guest::carried_words(&plan.package);
+    let per_lane: u32 = words
+        .iter()
+        .map(|&(_, w)| (engine_xla::guest::lower::cell_rows(w as usize) as u32).next_multiple_of(2))
+        .sum();
+    let pool_rows = per_lane * lanes + 8;
+    let mut stages = Stages::default();
+    stages.top = lanes;
+    stages.pool_rows = i64::from(pool_rows);
+    stages.sink_row = pool_rows - 8;
+    stages.plane_reads = vec![(
+        read.name.clone(),
+        read.rows,
+        read.width,
+        read.layers,
+        read.readout,
+        read.dtype,
+    )];
+    stages
+        .compile_all(device, &plan.package, key, &carried)
+        .expect("every stage compiles at registration");
+    let compiled = stages.len();
+    let facts = stages.fire_facts(key, &carried, device.load_temp());
+    eprintln!("registration compiled {compiled} stage program(s); fire facts {facts:?}");
+    assert_eq!(facts.max_lanes, 4, "every lane rung up to the widest fire");
+    assert!(
+        facts.fixed + 4 * facts.a_lane > 0,
+        "a pass returns its outputs: {facts:?}"
+    );
+    device.seal();
+    let before = device.misses();
+    let seeds: Vec<Vec<(u32, Value)>> = (0..lanes)
+        .map(|i| {
+            vec![
+                (0, Value::U32(vec![9 + i, 1])),
+                (1, Value::F32(vec![0.0; VOCAB as usize])),
+            ]
+        })
+        .collect();
+    let mut insts: Vec<InterpInstance> = seeds.iter().map(|s| instance(&plan, s)).collect();
+    let cells: Vec<Vec<(u32, u32)>> = (0..lanes)
+        .map(|l| {
+            let mut at = l * per_lane;
+            words
+                .iter()
+                .map(|&(c, w)| {
+                    let first = at;
+                    at += (engine_xla::guest::lower::cell_rows(w as usize) as u32).next_multiple_of(2);
+                    (c, first)
+                })
+                .collect()
+        })
+        .collect();
+    let mut pool = device
+        .zeros_or_dry(dtype::Dtype::U32, pool_rows, 128)
+        .expect("the pool");
+    let _ = engine_xla::guest::run::cells_program(device, i64::from(pool_rows));
+    let before = before.max(device.misses());
+    {
+        let writes: Vec<(&InterpInstance, &[(u32, u32)])> =
+            insts.iter().zip(&cells).map(|(i, c)| (i, c.as_slice())).collect();
+        engine_xla::guest::run::write_cells(
+            device,
+            &plan,
+            &mut pool,
+            i64::from(pool_rows),
+            stages.sink_row,
+            &writes,
+        )
+        .expect("the seeds land");
+    }
+    for pass in 0..4 {
+        let plane = logits_plane(lanes, VOCAB, 90 + pass);
+        let kept = kept(device, &plane, lanes, (0..lanes).map(|l| (l, 1)).collect());
+        let mut members: Vec<Member<'_>> = insts
+            .iter_mut()
+            .enumerate()
+            .map(|(l, inst)| Member {
+                inst,
+                bound: bound(&plan, &kept, l),
+                cells: cells[l].clone(),
+            })
+            .collect();
+        let outcomes = step_group(
+            device,
+            &mut stages,
+            key,
+            &plan,
+            Some(&kept),
+            &mut members,
+            &carried,
+            &mut pool,
+            eta_ir::registry::Stage::Epilogue,
+        );
+        assert!(outcomes.iter().all(|o| *o == StepOutcome::Committed), "{outcomes:?}");
+        for inst in &insts {
+            let _ = take_all(&plan, inst, &[out]);
+        }
+    }
+    assert_eq!(stages.len(), compiled, "no pass compiled a stage");
+    assert_eq!(device.misses(), before, "no program built after the seal");
 }
 
 fn the_statistics_agree(device: &Device, stages: &mut Stages) {
@@ -1204,9 +1321,10 @@ fn a_group_answers_what_each_lane_answers_alone(device: &Device, stages: &mut St
         .map(|(inst, lane)| Member {
             inst,
             bound: bound(&plan, &kept, lane),
+            cells: Vec::new(),
         })
         .collect();
-    let (outcomes, _) = step_group(
+    let outcomes = step_group(
         device,
         stages,
         key,
@@ -1214,7 +1332,7 @@ fn a_group_answers_what_each_lane_answers_alone(device: &Device, stages: &mut St
         Some(&kept),
         &mut members,
         &[],
-        None,
+        &mut None,
         eta_ir::registry::Stage::Epilogue,
     );
     assert!(
@@ -1324,7 +1442,48 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
         .collect();
     let mut device_insts: Vec<InterpInstance> = seeds.iter().map(|s| instance(&plan, s)).collect();
     let mut host_insts: Vec<InterpInstance> = seeds.iter().map(|s| instance(&plan, s)).collect();
-    let mut cells = None;
+    // A small pool: each lane's cells in rows of their own, the sink last.
+    let words = engine_xla::guest::carried_words(&plan.package);
+    let per_lane: u32 = words
+        .iter()
+        .map(|&(_, w)| (engine_xla::guest::lower::cell_rows(w as usize) as u32).next_multiple_of(2))
+        .sum();
+    let pool_rows = per_lane * lanes + 8;
+    let sink_row = pool_rows - 8;
+    let cells: Vec<Vec<(u32, u32)>> = (0..lanes)
+        .map(|l| {
+            let mut at = l * per_lane;
+            words
+                .iter()
+                .map(|&(c, w)| {
+                    let first = at;
+                    at += (engine_xla::guest::lower::cell_rows(w as usize) as u32).next_multiple_of(2);
+                    (c, first)
+                })
+                .collect()
+        })
+        .collect();
+    stages.pool_rows = i64::from(pool_rows);
+    stages.sink_row = sink_row;
+    let mut pool = device
+        .zeros_or_dry(dtype::Dtype::U32, pool_rows, 128)
+        .expect("the pool");
+    {
+        let writes: Vec<(&InterpInstance, &[(u32, u32)])> = device_insts
+            .iter()
+            .zip(&cells)
+            .map(|(i, c)| (i, c.as_slice()))
+            .collect();
+        engine_xla::guest::run::write_cells(
+            device,
+            &plan,
+            &mut pool,
+            i64::from(pool_rows),
+            sink_row,
+            &writes,
+        )
+        .expect("the seeds land in the slots");
+    }
     for pass in 0..4 {
         let plane = logits_plane(lanes, VOCAB, 70 + pass);
         let kept = kept(device, &plane, lanes, (0..lanes).map(|l| (l, 1)).collect());
@@ -1334,9 +1493,10 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
             .map(|(l, inst)| Member {
                 inst,
                 bound: bound(&plan, &kept, l),
+                cells: cells[l].clone(),
             })
             .collect();
-        let (outcomes, next) = step_group(
+        let outcomes = step_group(
             device,
             stages,
             key,
@@ -1344,15 +1504,13 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
             Some(&kept),
             &mut members,
             &carried,
-            cells.take(),
+            &mut pool,
             eta_ir::registry::Stage::Epilogue,
         );
         assert!(
             outcomes.iter().all(|o| *o == StepOutcome::Committed),
             "{outcomes:?}"
         );
-        assert!(next.is_some(), "the pass carried its cells");
-        cells = next;
         for (l, inst) in host_insts.iter_mut().enumerate() {
             let row = &plane[l * VOCAB as usize..(l + 1) * VOCAB as usize];
             let outputs = [("logits".to_string(), 0, Value::F32(row.to_vec()))];
@@ -1364,9 +1522,10 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
         }
     }
     // Back to the rings: the cells the device carried are the interpreter's.
-    let cells = cells.expect("cells");
-    let insts: Vec<Option<&InterpInstance>> = device_insts.iter().map(Some).collect();
-    engine_xla::guest::run::flush(&plan, &cells, &insts).expect("the cells come back");
+    let whole = pool.as_ref().expect("the pool");
+    for (inst, c) in device_insts.iter().zip(&cells) {
+        engine_xla::guest::run::read_cells(&plan, whole, c, inst).expect("the cells come back");
+    }
     for (d, h) in device_insts.iter().zip(&host_insts) {
         for c in 0..2 {
             exact(
@@ -1376,4 +1535,242 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
             );
         }
     }
+}
+
+/// `PIE_XLA_GUEST_BENCH=1`: the sampler over a 64-lane group, its carried
+/// cells in the pool, timed over 50 passes after 3 that warm.
+#[test]
+fn a_guest_group_pass_is_timed() {
+    if std::env::var_os("PIE_XLA_GUEST_BENCH").is_none() {
+        return;
+    }
+    let Some(dev) = device() else {
+        return;
+    };
+    let device = &dev.device;
+    let vocab: u32 = std::env::var("PIE_XLA_GUEST_BENCH_VOCAB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32768);
+    let lanes = 64u32;
+    let (container, out) = carrying(vocab);
+    let outs = [out];
+    let plan = plan_of(container, vocab);
+    let carried = engine_xla::guest::carried_channels(&plan.package);
+    let key = key_of(&plan);
+    let words = engine_xla::guest::carried_words(&plan.package);
+    let per_lane: u32 = words
+        .iter()
+        .map(|&(_, w)| (engine_xla::guest::lower::cell_rows(w as usize) as u32).next_multiple_of(2))
+        .sum();
+    let pool_rows = per_lane * lanes + 8;
+    let mut stages = Stages::default();
+    stages.top = lanes;
+    stages.pool_rows = i64::from(pool_rows);
+    stages.sink_row = pool_rows - 8;
+    let seeds = |i: u32| {
+        vec![
+            (0, Value::U32(vec![9 + i, 1])),
+            (1, Value::F32(vec![0.0; vocab as usize])),
+        ]
+    };
+    let mut insts: Vec<InterpInstance> = (0..lanes).map(|i| instance(&plan, &seeds(i))).collect();
+    let cells: Vec<Vec<(u32, u32)>> = (0..lanes)
+        .map(|l| {
+            let mut at = l * per_lane;
+            words
+                .iter()
+                .map(|&(c, w)| {
+                    let first = at;
+                    at += (engine_xla::guest::lower::cell_rows(w as usize) as u32).next_multiple_of(2);
+                    (c, first)
+                })
+                .collect()
+        })
+        .collect();
+    let mut pool = device
+        .zeros_or_dry(dtype::Dtype::U32, pool_rows, 128)
+        .expect("the pool");
+    {
+        let writes: Vec<(&InterpInstance, &[(u32, u32)])> =
+            insts.iter().zip(&cells).map(|(i, c)| (i, c.as_slice())).collect();
+        engine_xla::guest::run::write_cells(
+            device, &plan, &mut pool, i64::from(pool_rows), stages.sink_row, &writes,
+        )
+        .expect("the seeds land");
+    }
+    let plane = logits_plane(lanes, vocab, 5);
+    let kept = kept(device, &plane, lanes, (0..lanes).map(|l| (l, 1)).collect());
+    let mut timed = std::time::Duration::ZERO;
+    for pass in 0..53 {
+        // Fresh rings each pass (the inputs refilled); the carried cells
+        // stay in the pool.
+        insts = (0..lanes).map(|i| instance(&plan, &seeds(i))).collect();
+        let mut members: Vec<Member<'_>> = insts
+            .iter_mut()
+            .enumerate()
+            .map(|(l, inst)| Member {
+                inst,
+                bound: bound(&plan, &kept, l),
+                cells: cells[l].clone(),
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        let outcomes = step_group(
+            device, &mut stages, key, &plan, Some(&kept), &mut members, &carried, &mut pool,
+            eta_ir::registry::Stage::Epilogue,
+        );
+        if pass >= 3 {
+            timed += t.elapsed();
+        }
+        assert!(outcomes.iter().all(|o| *o == StepOutcome::Committed), "{outcomes:?}");
+        for inst in &insts {
+            let _ = take_all(&plan, inst, &outs);
+        }
+    }
+    eprintln!(
+        "GUEST BENCH carrying vocab {vocab} lanes {lanes} carried {:?}: {:.3} ms a pass",
+        carried,
+        timed.as_secs_f64() * 1e3 / 50.0
+    );
+}
+
+/// `PIE_XLA_GUEST_BENCH=1`: a serving step's shape, a model fire then a
+/// guest pass, alternating: 64 decode lanes of qwen3-30b-a3b-mini, then the
+/// carrying program over 64 lanes (vocab 32768 cells) in the model's own
+/// pool. Timed over 50 steps after 3 that warm.
+#[test]
+fn a_fire_then_a_guest_pass_is_timed() {
+    use crate::common_llm::{Model, Refs, Seq, tokens};
+    use engine_xla::store::layout::CHANNEL;
+    if std::env::var_os("PIE_XLA_GUEST_BENCH").is_none() {
+        return;
+    }
+    if device().is_none() {
+        return;
+    }
+    let (vocab, lanes) = (32768u32, 64u32);
+    let mut model = Model::load_with("qwen3-30b-a3b-mini", None, 256, 7, None);
+    let mut refs = Refs::of(&model);
+    let mvocab = model.vocab;
+    let mut seqs: Vec<Seq> = (0..lanes).map(Seq::new).collect();
+    let prompts: Vec<_> = seqs
+        .iter_mut()
+        .enumerate()
+        .map(|(i, s)| s.lane(&model, &mut refs, tokens(i as u64, 16, mvocab)))
+        .collect();
+    model.fire(prompts);
+    for s in &mut seqs {
+        s.held = 16;
+    }
+    // Each lane's cells: whole Channel slots, contiguous rows.
+    let (container, out) = carrying(vocab);
+    let plan = plan_of(container, vocab);
+    let carried = engine_xla::guest::carried_channels(&plan.package);
+    let key = key_of(&plan);
+    let words = engine_xla::guest::carried_words(&plan.package);
+    let rows_of = |w: u32| (engine_xla::guest::lower::cell_rows(w as usize) as u32).next_multiple_of(2);
+    let per_lane: u32 = words.iter().map(|&(_, w)| rows_of(w)).sum();
+    let mut free: Vec<u32> = Vec::new();
+    while (free.len() as u32) * 2 < per_lane * lanes + 4096 {
+        let slot = refs.take(CHANNEL);
+        let row = model.engine.shell().expect("loaded").channel_row(slot).expect("a row");
+        free.push(row);
+    }
+    free.sort_unstable();
+    let mut cells: Vec<Vec<(u32, u32)>> = Vec::new();
+    let mut at = 0usize;
+    while cells.len() < lanes as usize {
+        // A run of contiguous slots long enough for one lane.
+        let need = (per_lane / 2) as usize;
+        let run_ok = (0..need).all(|k| free.get(at + k) == Some(&(free[at] + 2 * k as u32)));
+        if !run_ok {
+            at += 1;
+            continue;
+        }
+        let mut row = free[at];
+        cells.push(
+            words
+                .iter()
+                .map(|&(c, w)| {
+                    let first = row;
+                    row += rows_of(w);
+                    (c, first)
+                })
+                .collect(),
+        );
+        at += need;
+    }
+    let mut stages = Stages::default();
+    stages.top = lanes;
+    {
+        let shell = model.engine.shell().expect("loaded");
+        let (rows, sink) = shell.pool_geometry();
+        stages.pool_rows = rows;
+        stages.sink_row = sink;
+    }
+    let seeds = |i: u32| {
+        vec![
+            (0, Value::U32(vec![9 + i, 1])),
+            (1, Value::F32(vec![0.0; vocab as usize])),
+        ]
+    };
+    let mut insts: Vec<InterpInstance> = (0..lanes).map(|i| instance(&plan, &seeds(i))).collect();
+    {
+        let shell = model.engine.shell_mut().expect("loaded");
+        let (device, pool) = shell.device_and_pool();
+        let writes: Vec<(&InterpInstance, &[(u32, u32)])> =
+            insts.iter().zip(&cells).map(|(i, c)| (i, c.as_slice())).collect();
+        engine_xla::guest::run::write_cells(
+            device, &plan, pool, stages.pool_rows, stages.sink_row, &writes,
+        )
+        .expect("the seeds land");
+    }
+    let plane = logits_plane(lanes, vocab, 5);
+    let kept = {
+        let shell = model.engine.shell().expect("loaded");
+        kept(shell.device(), &plane, lanes, (0..lanes).map(|l| (l, 1)).collect())
+    };
+    let mut timed = std::time::Duration::ZERO;
+    for step in 0..53u64 {
+        let t = std::time::Instant::now();
+        let lanes_now: Vec<_> = seqs
+            .iter_mut()
+            .enumerate()
+            .map(|(i, s)| s.lane(&model, &mut refs, tokens(100 + step * 64 + i as u64, 1, mvocab)))
+            .collect();
+        model.fire(lanes_now);
+        for s in &mut seqs {
+            s.held += 1;
+        }
+        insts = (0..lanes).map(|i| instance(&plan, &seeds(i))).collect();
+        {
+            let shell = model.engine.shell_mut().expect("loaded");
+            let (device, pool) = shell.device_and_pool();
+            let mut members: Vec<Member<'_>> = insts
+                .iter_mut()
+                .enumerate()
+                .map(|(l, inst)| Member {
+                    inst,
+                    bound: bound(&plan, &kept, l),
+                    cells: cells[l].clone(),
+                })
+                .collect();
+            let outcomes = step_group(
+                device, &mut stages, key, &plan, Some(&kept), &mut members, &carried, pool,
+                eta_ir::registry::Stage::Epilogue,
+            );
+            assert!(outcomes.iter().all(|o| *o == StepOutcome::Committed), "{outcomes:?}");
+        }
+        if step >= 3 {
+            timed += t.elapsed();
+        }
+        for inst in &insts {
+            let _ = take_all(&plan, inst, &[out]);
+        }
+    }
+    eprintln!(
+        "STEP BENCH fire+pass, 64 lanes, cells vocab {vocab}: {:.3} ms a step",
+        timed.as_secs_f64() * 1e3 / 50.0
+    );
 }

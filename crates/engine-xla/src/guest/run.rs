@@ -81,6 +81,14 @@ pub struct Stages {
     /// The readout rows of the fire shapes the warm ladder traced
     /// (`Shell::readouts`).
     pub readouts: Vec<u32>,
+    /// The pool's rows (u32 `[pool_rows, 128]`), which a stage that carries
+    /// cells takes, and the sink's first row, where a padding lane's cells
+    /// go.
+    pub pool_rows: i64,
+    pub sink_row: u32,
+    /// Every plane a fire returns, as a stage reads it (`Shell::plane_reads`):
+    /// output, rows, width, layers, readout flag, dtype.
+    pub plane_reads: Vec<(String, u32, u32, u32, bool, Dtype)>,
 }
 
 /// A rung's stage as a compile thread leaves it.
@@ -93,8 +101,10 @@ fn stage(
     at: usize,
     batch: Batch,
     carried: &[u32],
+    pool_rows: i64,
 ) -> Result<Arc<Staged>, String> {
-    let lowered = lower::lower(package, at, batch, carried).map_err(|why| why.to_string())?;
+    let lowered =
+        lower::lower(package, at, batch, carried, pool_rows).map_err(|why| why.to_string())?;
     if !lowered.text.is_empty()
         && let Some(path) = std::env::var_os("PIE_XLA_DUMP_GUEST")
     {
@@ -120,6 +130,10 @@ fn stage(
 }
 
 impl Stages {
+    /// Stage `at` of `package` for `batch`, as registration compiled it
+    /// (`Stages::compile_all`). A shape registration did not reach
+    /// compiles here, which a load warm-up sealed reports as a program
+    /// outside the ladder (WARM_STRICT refuses it).
     pub fn get(
         &mut self,
         device: &Device,
@@ -133,71 +147,82 @@ impl Stages {
         if let Some(hit) = self.map.get(&slot) {
             return Ok(Arc::clone(hit));
         }
-        // Another package whose stage lowers the same (a guest's prompt
-        // reaches its package, not its sampler) compiled this one already:
-        // it is found, nothing compiles beside it.
-        let lowered =
-            lower::lower(package, at, batch.clone(), carried).map_err(|why| why.to_string())?;
-        if !lowered.layout.runs() || device.holds(&lowered.text) {
-            let staged = stage(device, package, at, batch, carried)?;
-            self.map.insert(slot, Arc::clone(&staged));
-            return Ok(staged);
-        }
-        // A stage first seen compiles for every lane rung up to the fire's
-        // widest, side by side: a group grows a lane at a time, and each rung
-        // it reached compiled in its own turn (v6e gpt-oss c256 on a fresh
-        // VM: 26 stage programs at 1.4 s each, 35 s of a 70 s run). One that
-        // reads a readout plane does so at every readout row count the fires
-        // traced too: a fire's readout rows follow its lanes, and each count
-        // first met compiled its rungs in turn (v6e Qwen3-0.6B c256: nine
-        // counts, ~2.4 s each, all inside the measured rounds).
-        let top = padded(self.top as usize).max(batch.lanes);
-        let rungs = |top: u32| -> Vec<u32> {
-            std::iter::successors(Some(1u32), |&r| (r < top).then(|| r.saturating_mul(2))).collect()
-        };
-        let mut shapes: Vec<Batch> = rungs(top)
-            .into_iter()
-            .map(|lanes| Batch {
-                lanes,
-                reads: batch.reads.clone(),
-            })
-            .collect();
-        if !shapes.contains(&batch) {
-            shapes.push(batch.clone());
-        }
-        if batch.reads.iter().any(|r| r.readout) {
-            for &rows in &self.readouts {
-                if batch.reads.iter().any(|r| r.readout && r.rows == rows) {
-                    continue;
-                }
-                let reads: Vec<Read> = (batch.reads.iter())
-                    .map(|r| Read {
-                        rows: if r.readout { rows } else { r.rows },
-                        ..r.clone()
+        let staged = stage(device, package, at, batch, carried, self.pool_rows)?;
+        self.map.insert(slot, Arc::clone(&staged));
+        Ok(staged)
+    }
+
+    /// Compiles every stage of `package` for every shape a pass can take:
+    /// each lane rung up to the widest fire (`top`), each combination of
+    /// the planes its outputs can be read off (the fires the warm ladder
+    /// traced, `plane_reads`), with the `carried` channels in the pool;
+    /// and one lane with none carried (an instance that steps alone).
+    /// Side by side; the first refusal refuses the program.
+    pub fn compile_all(
+        &mut self,
+        device: &Device,
+        package: &LaunchPackage,
+        key: [u8; 32],
+        carried: &[u32],
+    ) -> Result<(), String> {
+        let top = padded(self.top as usize);
+        let rungs: Vec<u32> =
+            std::iter::successors(Some(1u32), |&r| (r < top).then(|| r.saturating_mul(2)))
+                .collect();
+        let mut wanted: Vec<(usize, Batch, Vec<u32>)> = Vec::new();
+        for at in 0..package.stages.len() {
+            let mut combos: Vec<Vec<Read>> = vec![Vec::new()];
+            for (name, lane) in lower::outputs(package, at) {
+                let options: Vec<Read> = (self.plane_reads.iter())
+                    .filter(|p| p.0 == name)
+                    .map(|p| Read {
+                        name: name.clone(),
+                        lane,
+                        rows: p.1,
+                        readout: p.4,
+                        layers: p.3,
+                        width: p.2,
+                        dtype: p.5,
                     })
                     .collect();
-                for lanes in rungs(top.min(padded(rows as usize))) {
-                    shapes.push(Batch {
-                        lanes,
-                        reads: reads.clone(),
-                    });
+                if options.is_empty() {
+                    continue;
                 }
+                combos = combos
+                    .into_iter()
+                    .flat_map(|c| {
+                        options.iter().map(move |o| {
+                            let mut c = c.clone();
+                            c.push(o.clone());
+                            c
+                        })
+                    })
+                    .collect();
+            }
+            for reads in &combos {
+                for &lanes in &rungs {
+                    wanted.push((at, Batch { lanes, reads: reads.clone() }, carried.to_vec()));
+                }
+                wanted.push((at, Batch { lanes: 1, reads: reads.clone() }, Vec::new()));
             }
         }
+        wanted.retain(|(at, batch, c)| !self.map.contains_key(&(key, *at, batch.clone(), c.clone())));
+        wanted.dedup();
+        let pool_rows = self.pool_rows;
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
-            .clamp(1, shapes.len().min(8));
+            .clamp(1, wanted.len().clamp(1, 8));
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let built: Vec<Built> = shapes.iter().map(|_| std::sync::Mutex::new(None)).collect();
+        let built: Vec<Built> = wanted.iter().map(|_| std::sync::Mutex::new(None)).collect();
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 scope.spawn(|| {
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(shape) = shapes.get(i) else {
+                        let Some((at, batch, c)) = wanted.get(i) else {
                             break;
                         };
-                        let staged = stage(device, package, at, shape.clone(), carried);
+                        let staged = stage(device, package, *at, batch.clone(), c, pool_rows);
                         if let Ok(mut slot) = built[i].lock() {
                             *slot = Some(staged);
                         }
@@ -205,22 +230,57 @@ impl Stages {
                 });
             }
         });
-        let mut asked = None;
-        for (shape, built) in shapes.into_iter().zip(built) {
-            let Ok(staged) = built.into_inner().expect("a built rung").ok_or(()) else {
+        for ((at, batch, c), built) in wanted.into_iter().zip(built) {
+            let staged = built
+                .into_inner()
+                .map_err(|_| "a stage compile panicked".to_string())?
+                .ok_or("a stage was never compiled")??;
+            self.map.insert((key, at, batch, c), staged);
+        }
+        Ok(())
+    }
+
+    /// What a pass of the program `key` names takes on the device beyond
+    /// the load's own (`Engine::fire_facts`), from its stages as
+    /// registration compiled them: at each lane rung, the largest temp past
+    /// `load_temp` (the runtime's one temp reservation is the largest loaded
+    /// program's) and the outputs its stages return (not the pool they
+    /// alias). `fixed + lanes · a_lane` covers every rung, up to `top`.
+    /// `carried` names the group variant (the program's carried channels).
+    #[must_use]
+    pub fn fire_facts(
+        &self,
+        key: [u8; 32],
+        carried: &[u32],
+        load_temp: u64,
+    ) -> engine::program::FireFacts {
+        let mut by_lanes: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
+        // A group's passes (the carried variants): what a fire holds.
+        for ((k, _, batch, c), staged) in &self.map {
+            if *k != key || c.as_slice() != carried {
+                continue;
+            }
+            let Some(program) = &staged.program else {
                 continue;
             };
-            let staged = match staged {
-                Ok(staged) => staged,
-                Err(why) if shape == batch => return Err(why),
-                Err(_) => continue,
-            };
-            if shape == batch {
-                asked = Some(Arc::clone(&staged));
-            }
-            self.map.insert((key, at, shape, carried.to_vec()), staged);
+            let m = program.memory;
+            let entry = by_lanes.entry(batch.lanes).or_default();
+            entry.0 = entry.0.max(m.temp.saturating_sub(load_temp));
+            entry.1 += m.output.saturating_sub(m.alias);
         }
-        asked.ok_or_else(|| format!("stage {at} did not compile for {} lanes", batch.lanes))
+        let bytes = |lanes: u32| by_lanes.get(&lanes).map_or(0, |&(t, o)| t + o);
+        let one = bytes(1);
+        let a_lane = by_lanes
+            .keys()
+            .filter(|&&r| r > 1)
+            .map(|&r| bytes(r).saturating_sub(one).div_ceil(u64::from(r - 1)))
+            .max()
+            .unwrap_or(0);
+        engine::program::FireFacts {
+            a_lane,
+            fixed: one.saturating_sub(a_lane),
+            max_lanes: by_lanes.keys().copied().max().unwrap_or(0),
+        }
     }
 
     #[must_use]
@@ -276,6 +336,9 @@ pub fn padded(lanes: usize) -> u32 {
 pub struct Feeding<'a> {
     pub vals: &'a [Value],
     pub bound: &'a [Bound],
+    /// The pool row each carried channel's cell starts at, for this lane
+    /// (its `Channel` slots).
+    pub cells: &'a [(u32, u32)],
 }
 
 fn encode(value: &Value, dtype: Dtype, n: usize, out: &mut Vec<u32>) -> Result<(), String> {
@@ -316,9 +379,8 @@ fn decode(words: &[u32], dtype: Dtype, n: usize) -> Value {
     }
 }
 
-/// What one stage run answers: per lane, the values it puts (host side),
-/// and per carried channel the device cells of every lane (`u32 [B, words]`).
-pub type Ran = (Vec<Vec<(u32, Value)>>, Vec<(u32, Buffer)>);
+/// What one stage run answers: per lane, the values it puts (host side).
+pub type Ran = Vec<Vec<(u32, Value)>>;
 
 fn upload_words(
     device: &Device,
@@ -337,7 +399,6 @@ fn upload_words(
 /// the carried cells it returned.
 pub struct Launched {
     pub out: Option<Arc<Buffer>>,
-    pub carried: Vec<(u32, Buffer)>,
     pub batch: usize,
     pub lanes: usize,
     /// Host words packed and uploaded, for the timing line.
@@ -346,21 +407,20 @@ pub struct Launched {
 
 /// Packs `lanes`' roots (padded to the staged batch by repeating lane 0),
 /// uploads them and enqueues the stage; nothing waits for the device. A
-/// carried channel's cells come from `cells` when it holds them (the
-/// previous pass's, same lanes in the same order), else from the lanes'
-/// values.
+/// stage that carries cells reads and writes them in `pool` at each lane's
+/// rows (a padding lane's at `sink_row`), the pool donated and put back.
 pub fn launch_stage(
     device: &Device,
     staged: &Staged,
     kept: Option<&Kept>,
     lanes: &[Feeding<'_>],
-    cells: Option<&BTreeMap<u32, Buffer>>,
+    pool: &mut Option<Buffer>,
+    sink_row: u32,
 ) -> Result<Launched, String> {
     let batch = padded(lanes.len()) as usize;
     let Some(program) = &staged.program else {
         return Ok(Launched {
             out: None,
-            carried: Vec::new(),
             batch,
             lanes: lanes.len(),
             packed: 0,
@@ -395,27 +455,23 @@ pub fn launch_stage(
                 }
             }
         }
+        for (chan, _) in &layout.carried {
+            let row = if b < lanes.len() {
+                (lane.cells.iter())
+                    .find(|(c, _)| c == chan)
+                    .map(|&(_, row)| row)
+                    .ok_or_else(|| format!("this lane holds no slots for carried channel {chan}"))?
+            } else {
+                sink_row
+            };
+            words.push(row);
+        }
     }
     let pack: Option<Buffer> = if layout.in_words > 0 {
         Some(upload_words(device, &words, batch, layout.in_words)?)
     } else {
         None
     };
-    let mut fresh: Vec<Buffer> = Vec::new();
-    for (chan, slot) in &layout.carried_in {
-        if cells.is_some_and(|c| c.contains_key(chan)) {
-            continue;
-        }
-        let Feed::Value(dtype, n) = slot.feed else {
-            unreachable!("carried cells are values");
-        };
-        let mut cell: Vec<u32> = Vec::with_capacity(batch * slot.words);
-        for b in 0..batch {
-            let lane = &lanes[if b < lanes.len() { b } else { 0 }];
-            encode(&lane.vals[slot.value as usize], dtype, n, &mut cell)?;
-        }
-        fresh.push(upload_words(device, &cell, batch, slot.words)?);
-    }
     let mut args: Vec<Arg<'_>> = Vec::with_capacity(3);
     if let Some(pack) = &pack {
         args.push(Arg::Keep(pack));
@@ -428,14 +484,9 @@ pub fn launch_stage(
             .plane;
         args.push(Arg::Keep(&kept.planes[plane].buffer));
     }
-    let mut fresh = fresh.iter();
-    for (chan, _) in &layout.carried_in {
-        match cells.and_then(|c| c.get(chan)) {
-            Some(cell) => args.push(Arg::Keep(cell)),
-            None => args.push(Arg::Keep(
-                fresh.next().expect("a fresh cell per carried root"),
-            )),
-        }
+    if layout.pooled() {
+        let whole = pool.take().ok_or("the pool, which another program holds")?;
+        args.push(Arg::Donate(whole));
     }
     let outs = device
         .run(program, args, crate::serve::timing())
@@ -446,15 +497,11 @@ pub fn launch_stage(
     } else {
         None
     };
-    let carried: Vec<(u32, Buffer)> = layout
-        .carried_out
-        .iter()
-        .map(|(chan, _)| outs.next().map(|b| (*chan, b)))
-        .collect::<Option<_>>()
-        .ok_or("the stage returned fewer carried cells than it puts")?;
+    if layout.pooled() {
+        *pool = Some(outs.next().ok_or("the stage returned no pool")?);
+    }
     Ok(Launched {
         out,
-        carried,
         batch,
         lanes: lanes.len(),
         packed: words.len(),
@@ -516,10 +563,11 @@ pub fn run_stage(
     staged: &Staged,
     kept: Option<&Kept>,
     lanes: &[Feeding<'_>],
-    cells: Option<&BTreeMap<u32, Buffer>>,
+    pool: &mut Option<Buffer>,
+    sink_row: u32,
 ) -> Result<Ran, String> {
     let t0 = std::time::Instant::now();
-    let launched = launch_stage(device, staged, kept, lanes, cells)?;
+    let launched = launch_stage(device, staged, kept, lanes, pool, sink_row)?;
     let t1 = std::time::Instant::now();
     let raw = match &launched.out {
         Some(out) => out.download().map_err(|e| e.to_string())?,
@@ -537,10 +585,9 @@ pub fn run_stage(
         );
     }
     if staged.program.is_none() {
-        return Ok((vec![Vec::new(); lanes.len()], Vec::new()));
+        return Ok(vec![Vec::new(); lanes.len()]);
     }
-    let values = unpack(&staged.layout, &raw, lanes.len(), launched.batch)?;
-    Ok((values, launched.carried))
+    unpack(&staged.layout, &raw, lanes.len(), launched.batch)
 }
 
 /// Whether the device binds the output `root` reads where `bound` says: a
@@ -605,15 +652,18 @@ impl StageRunner for OnDevice<'_> {
             .stages
             .get(self.device, &plan.package, self.key, at, batch, &[])
             .map_err(fail)?;
-        let (outs, _) = run_stage(
+        // No carried channels on this path: the stage never takes the pool.
+        let outs = run_stage(
             self.device,
             &staged,
             self.kept,
             &[Feeding {
                 vals,
                 bound: &self.bound,
+                cells: &[],
             }],
-            None,
+            &mut None,
+            0,
         )
         .map_err(fail)?;
         self.stages.runs += 1;
@@ -635,6 +685,10 @@ impl StageRunner for OnDevice<'_> {
 pub struct Member<'a> {
     pub inst: &'a mut InterpInstance,
     pub bound: Vec<Bound>,
+    /// Each carried channel's cell: the pool row its `Channel` slots start
+    /// at. The cells there are the instance's (`write_cells` lands the
+    /// rings' before a first pass on the device).
+    pub cells: Vec<(u32, u32)>,
 }
 
 /// A cell a pass puts: known on the host, or lane `row`'s `slot` of the
@@ -704,45 +758,118 @@ fn const_root(root: &eta_compiler::codegen::launch::LaunchValue) -> Value {
     }
 }
 
-/// Writes carried cells (`u32 [B, words]` per channel, row `r` is
-/// `insts[r]`'s) back into the instances' rings, where a pass that kept
-/// them on the device left the ring's front stale.
-pub fn flush(
+/// A carried channel's cell: its dtype, elements and u32 words.
+fn cell_shape(plan: &ExecPlan, chan: u32) -> Result<(Dtype, usize, usize), String> {
+    let decl = plan
+        .package
+        .channels
+        .get(chan as usize)
+        .ok_or_else(|| format!("carried channel {chan} is past the program's"))?;
+    let dtype = eta_exec::concrete_dtype(decl.dtype);
+    let n = decl
+        .shape
+        .iter()
+        .map(|&d| d as usize)
+        .product::<usize>()
+        .max(1);
+    Ok((dtype, n, lower::words(dtype, n)))
+}
+
+/// Reads an instance's carried cells out of `pool` at `cells` (channel,
+/// first row) into the front of its rings: where the host runs its next
+/// pass, or the cells leave the device.
+pub fn read_cells(
     plan: &ExecPlan,
-    cells: &BTreeMap<u32, Buffer>,
-    insts: &[Option<&InterpInstance>],
+    pool: &Buffer,
+    cells: &[(u32, u32)],
+    inst: &InterpInstance,
 ) -> Result<(), String> {
-    for (&chan, cell) in cells {
-        let decl = plan
-            .package
-            .channels
-            .get(chan as usize)
-            .ok_or_else(|| format!("carried channel {chan} is past the program's"))?;
-        let dtype = eta_exec::concrete_dtype(decl.dtype);
-        let n = decl
-            .shape
-            .iter()
-            .map(|&d| d as usize)
-            .product::<usize>()
-            .max(1);
-        let w = lower::words(dtype, n);
-        let raw = cell.download().map_err(|e| e.to_string())?;
-        let all: Vec<u32> = raw
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| u32::from_le_bytes(*c))
-            .collect();
-        for (r, inst) in insts.iter().enumerate() {
-            let (Some(inst), Some(row)) = (inst, all.get(r * w..(r + 1) * w)) else {
-                continue;
-            };
-            if let Some(ring) = inst.channels.get(chan as usize) {
-                ring.encode_sequence(ring.head(), &decode(row, dtype, n));
-            }
+    for &(chan, row) in cells {
+        let (dtype, n, w) = cell_shape(plan, chan)?;
+        let raw = pool
+            .read_raw(i64::from(row) * 512, (w * 4) as i64)
+            .map_err(|e| e.to_string())?;
+        if let Some(ring) = inst.channels.get(chan as usize) {
+            ring.encode_sequence(ring.head(), &decode(&words_of(&raw), dtype, n));
         }
     }
     Ok(())
+}
+
+/// Rows `write_cells` lands a program run: one program, warmed at load.
+pub const CELL_ROWS: usize = 16;
+
+/// Lands each instance's carried cells, the front of its rings, in `pool`
+/// at its rows (`cells[i]` for `insts[i]`): before a first pass on the
+/// device, or after the host ran one. One program over `CELL_ROWS` rows a
+/// run, padded with the sink row.
+pub fn write_cells(
+    device: &Device,
+    plan: &ExecPlan,
+    pool: &mut Option<Buffer>,
+    pool_rows: i64,
+    sink_row: u32,
+    writes: &[(&InterpInstance, &[(u32, u32)])],
+) -> Result<(), String> {
+    let mut rows: Vec<(u32, Vec<u32>)> = Vec::new();
+    for (inst, cells) in writes {
+        for &(chan, first) in *cells {
+            let (dtype, n, w) = cell_shape(plan, chan)?;
+            let ring = inst
+                .channels
+                .get(chan as usize)
+                .ok_or_else(|| format!("carried channel {chan} is past the instance's"))?;
+            let mut words = Vec::with_capacity(w);
+            encode(&ring.current(), dtype, n, &mut words)?;
+            words.resize(lower::cell_rows(w) * 128, 0);
+            for (k, row) in words.chunks(128).enumerate() {
+                rows.push((first + k as u32, row.to_vec()));
+            }
+        }
+    }
+    let program = cells_program(device, pool_rows)?;
+    for batch in rows.chunks(CELL_ROWS) {
+        let mut at: Vec<i32> = batch.iter().map(|(r, _)| *r as i32).collect();
+        let mut data: Vec<u32> = batch.iter().flat_map(|(_, w)| w.iter().copied()).collect();
+        at.resize(CELL_ROWS, sink_row as i32);
+        data.resize(CELL_ROWS * 128, 0);
+        let at_bytes: Vec<u8> = at.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let at = device
+            .upload(dtype::Dtype::I32, CELL_ROWS as u32, 1, &at_bytes)
+            .map_err(|e| e.to_string())?;
+        let data = device
+            .upload(dtype::Dtype::U32, CELL_ROWS as u32, 128, &data_bytes)
+            .map_err(|e| e.to_string())?;
+        let whole = pool.take().ok_or("the pool, which another program holds")?;
+        let mut outs = device
+            .run(&program, vec![Arg::Donate(whole), Arg::Keep(&at), Arg::Keep(&data)], false)
+            .map_err(|e| e.to_string())?;
+        *pool = Some(outs.pop().ok_or("the cells program returned no pool")?);
+    }
+    Ok(())
+}
+
+/// The program `write_cells` runs: `pool` with `data` (u32 `[CELL_ROWS,
+/// 128]`) landed at rows `at` (i32 `[CELL_ROWS, 1]`).
+pub fn cells_program(device: &Device, pool_rows: i64) -> Result<Arc<Program>, String> {
+    use kernels_xla::hlo::{Combine, Elem, Func, Ty};
+    let mut f = Func::new("main");
+    let pool = f.param(Ty::new(Elem::U32, &[pool_rows.max(1), 128]), Some(0));
+    f.pin_row_major(pool);
+    let at = f.param(Ty::new(Elem::I32, &[CELL_ROWS as i64, 1]), None);
+    let data = f.param(Ty::new(Elem::U32, &[CELL_ROWS as i64, 128]), None);
+    let built = (|| -> Result<_, kernels_xla::Error> {
+        let at = f.reshape(at, &[CELL_ROWS as i64])?;
+        let out = f.put_rows(pool, at, data, Combine::Set)?;
+        Ok(f.module("eta_cells", &[out]))
+    })()
+    .map_err(|e| e.to_string())?;
+    let sig = crate::trace::Signature {
+        params: Vec::new(),
+        results: Vec::new(),
+    };
+    device.program(&built, sig).map_err(|e| e.to_string())
 }
 
 /// `eta_exec::step_with` for every member at once: the same readiness
@@ -750,9 +877,9 @@ pub fn flush(
 /// over the members. Members must all run `plan` and every output it reads
 /// must bind on the device (`bound`).
 ///
-/// The `carried` channels' cells stay on the device: `cells` are the last
-/// pass's (row `r` is member `r`'s) and the pass's come back when every
-/// member committed. Otherwise the cells are written into the rings.
+/// The `carried` channels' cells stay on the device, in each member's
+/// `Channel` slots of `pool` (`Member::cells`): a pass reads and writes
+/// them there.
 #[allow(clippy::too_many_arguments)]
 pub fn step_group(
     device: &Device,
@@ -762,14 +889,14 @@ pub fn step_group(
     kept: Option<&Kept>,
     members: &mut [Member<'_>],
     carried: &[u32],
-    cells: Option<BTreeMap<u32, Buffer>>,
+    pool: &mut Option<Buffer>,
     at: Stage,
-) -> (Vec<StepOutcome>, Option<BTreeMap<u32, Buffer>>) {
-    let (outcomes, cells, deferred) = step_group_with(
-        device, stages, key, plan, kept, members, carried, cells, false, at,
+) -> Vec<StepOutcome> {
+    let (outcomes, deferred) = step_group_with(
+        device, stages, key, plan, kept, members, carried, pool, false, at,
     );
     debug_assert!(deferred.is_none(), "a synchronous pass defers nothing");
-    (outcomes, cells)
+    outcomes
 }
 
 /// `step_group` whose last stage is left running: its output comes back
@@ -785,15 +912,11 @@ pub fn step_group_deferred(
     kept: Option<&Kept>,
     members: &mut [Member<'_>],
     carried: &[u32],
-    cells: Option<BTreeMap<u32, Buffer>>,
+    pool: &mut Option<Buffer>,
     at: Stage,
-) -> (
-    Vec<StepOutcome>,
-    Option<BTreeMap<u32, Buffer>>,
-    Option<Deferred>,
-) {
+) -> (Vec<StepOutcome>, Option<Deferred>) {
     step_group_with(
-        device, stages, key, plan, kept, members, carried, cells, true, at,
+        device, stages, key, plan, kept, members, carried, pool, true, at,
     )
 }
 
@@ -806,14 +929,10 @@ fn step_group_with(
     kept: Option<&Kept>,
     members: &mut [Member<'_>],
     carried: &[u32],
-    cells: Option<BTreeMap<u32, Buffer>>,
+    pool: &mut Option<Buffer>,
     defer: bool,
     at: Stage,
-) -> (
-    Vec<StepOutcome>,
-    Option<BTreeMap<u32, Buffer>>,
-    Option<Deferred>,
-) {
+) -> (Vec<StepOutcome>, Option<Deferred>) {
     let mut outcome: Vec<Option<StepOutcome>> = vec![None; members.len()];
     for (m, member) in members.iter().enumerate() {
         if member.inst.poisoned {
@@ -833,19 +952,6 @@ fn step_group_with(
             }
         }
     }
-    let mut cells = cells;
-    if cells.is_some() && outcome.iter().any(Option::is_some) {
-        // Not every member runs: the rows no longer line up. Back to the rings.
-        let insts: Vec<Option<&InterpInstance>> = members.iter().map(|m| Some(&*m.inst)).collect();
-        if let Some(c) = cells.take()
-            && let Err(why) = flush(plan, &c, &insts)
-        {
-            for o in &mut outcome {
-                o.get_or_insert(StepOutcome::Faulted(why.clone()));
-            }
-        }
-    }
-    let mut produced: BTreeMap<u32, Buffer> = BTreeMap::new();
     let mut overlays: Vec<Overlay> = members
         .iter()
         .map(|member| Overlay::new(member.inst.channels.len()))
@@ -924,21 +1030,22 @@ fn step_group_with(
                     .map(|&m| Feeding {
                         vals: &vals[m],
                         bound: &members[m].bound,
+                        cells: &members[m].cells,
                     })
                     .collect();
                 if leave {
-                    let launched = launch_stage(device, &staged, kept, &feeds, cells.as_ref())?;
+                    let launched =
+                        launch_stage(device, &staged, kept, &feeds, pool, stages.sink_row)?;
                     let out = launched.out.ok_or("a deferred stage returned no output")?;
                     launched_out = Some((out, staged.layout.out_words, launched.batch));
-                    Ok((None, launched.carried, Some(staged)))
+                    Ok((None, Some(staged)))
                 } else {
-                    run_stage(device, &staged, kept, &feeds, cells.as_ref())
-                        .map(|(outs, carry)| (Some(outs), carry, None))
+                    run_stage(device, &staged, kept, &feeds, pool, stages.sink_row)
+                        .map(|outs| (Some(outs), None))
                 }
             });
             match ran {
-                Ok((outs, carry, left)) => {
-                    produced.extend(carry);
+                Ok((outs, left)) => {
                     stages.runs += 1;
                     stages.lanes += live.len() as u64;
                     let stage = &plan.package.stages[at];
@@ -1029,20 +1136,9 @@ fn step_group_with(
         }),
         _ => None,
     };
-    if produced.is_empty() {
-        return (outcomes, None, deferred);
-    }
-    if outcomes.iter().all(|o| *o == StepOutcome::Committed) {
-        return (outcomes, Some(produced), deferred);
-    }
-    // Rows are live members in order; write the committed ones back.
-    let insts: Vec<Option<&InterpInstance>> = members
-        .iter()
-        .zip(&outcomes)
-        .map(|(m, o)| (*o == StepOutcome::Committed).then_some(&*m.inst))
-        .collect();
-    let _ = flush(plan, &produced, &insts);
-    (outcomes, None, deferred)
+    // The carried cells are in the members' slots: a member that faulted
+    // after running is poisoned, so no cell of its is read again.
+    (outcomes, deferred)
 }
 
 fn bind_roots(
