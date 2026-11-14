@@ -1083,6 +1083,17 @@ impl PreparedLoad<'_> {
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging)?;
         let arena = Arena::over(pools.view().clone(), pools.span(), scratch.bytes(), rungs);
+        if crate::diag::on().tier_trace {
+            let layout = pools.layout();
+            eprintln!(
+                "residency: range {} chunks of {} bytes, the activation span the top {} \
+                 (rung tokens, chunks) {:?}",
+                layout.total_chunks,
+                layout.chunk_bytes,
+                layout.act_span(),
+                layout.act(),
+            );
+        }
         scratch.seat(pools.view().clone(), arena.scratch_at());
         pools.seat_weights(weight_caches);
         // The null chunk and the floor stand from the load on.
