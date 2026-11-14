@@ -1068,6 +1068,9 @@ impl Shell {
             })
             .collect();
         pools.seat_experts(&hosts, &groups)?;
+        // The adapters' tables, every id on the zero plane until an
+        // instance lands one.
+        pools.lay_adapter_tables()?;
         // The banks laid in lane order, which a slot filled from the file
         // (or a copy pinned from it) is laid in once filled.
         pools.lane_banks(
@@ -1239,7 +1242,6 @@ impl Shell {
                 .saturating_mul(boot.budget.max_tokens as usize)
                 .saturating_mul(size_of::<u64>()),
         )?;
-        let adapter_seats = weights.adapter_seats();
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let compiled_towered = compiled.order_for(poem_ir::RowAxis::Patches).is_some();
         // A tensor-parallel rank holds its band of every page's heads, not
@@ -1287,7 +1289,7 @@ impl Shell {
             lane_shifted,
             staging,
             schedule_readers,
-            adapters: crate::blob::Adapters::new(adapter_seats),
+            adapters: crate::blob::Adapters::default(),
             held: vec![0; boot.slots as usize],
             readout_rows,
             exports,

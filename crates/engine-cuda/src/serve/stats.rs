@@ -74,11 +74,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn banks(&self) -> Vec<(&str, u32, u64)> {
-        self.weights.banks()
-    }
-
-    #[must_use]
     pub fn weights_resident(&self) -> bool {
         self.weights.all_resident()
     }

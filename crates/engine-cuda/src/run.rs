@@ -144,6 +144,10 @@ pub struct FireTables {
 
     /// The expert table of each bank streamed by its experts, by its param.
     pub expert_tables: Vec<(u32, ExpertTable)>,
+
+    /// The table of each adapter bank, by its param: an address an id
+    /// (`Adapter` slots, or the zero plane).
+    pub adapter_tables: Vec<(u32, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1990,6 +1994,20 @@ impl<'c> Run<'c> {
             data: self.tensor(id),
             indptr,
         }
+    }
+
+    /// The adapter table bank `id` is read through (0 where the value is no
+    /// bank: the correction refuses it).
+    pub(crate) fn adapter_table(&self, id: ValueId) -> u64 {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return 0;
+        };
+        self.fire
+            .tables
+            .adapter_tables
+            .iter()
+            .find(|(param, _)| param == w)
+            .map_or(0, |&(_, table)| table)
     }
 
     /// The row table weight `id`'s gather reads its rows through: the

@@ -20,6 +20,16 @@ pub struct Segments {
     pub max_rows: u32,
 }
 
+/// Where each adapter's planes lie: for the down (`a`) and up (`b`) bank, a
+/// device array of one u64 address an adapter id, its plane of the bank
+/// (the engine's `Adapter` pool slots). An id no adapter holds names a zero
+/// plane.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdapterTables {
+    pub a: u64,
+    pub b: u64,
+}
+
 pub fn correct(
     ctx: &Ctx,
     x: Tensor,
@@ -28,6 +38,7 @@ pub fn correct(
     routes: Tensor,
     y: &mut Tensor,
     segments: Option<Segments>,
+    tables: AdapterTables,
 ) -> Result<(), Error> {
     const OP: &str = "linear.lora_correct";
 
@@ -78,6 +89,13 @@ pub fn correct(
     }
     debug_assert_eq!(y.rows, x.rows, "a correction lands one row per input row");
     debug_assert_eq!(routes.rows, x.rows, "one adapter id per token row");
+    if tables.a == 0 || tables.b == 0 {
+        return Err(refuse(
+            OP,
+            "an adapter's planes lie in pool slots and are read through its tables, \
+             and this fire names none",
+        ));
+    }
 
     let bytes = (rows as usize)
         .saturating_mul(rank as usize)
@@ -92,7 +110,7 @@ pub fn correct(
         bank_a,
         routes,
         &mut projected,
-        super::moe::ExpertTable::RESIDENT,
+        super::moe::ExpertTable::located(tables.a, (0, 0)),
     )?;
 
     let rank_i = stated(OP, rank)?;
@@ -118,6 +136,7 @@ pub fn correct(
             routes.arg(),
             projected.arg(),
             bank_b.arg(),
+            ArgValue::Ptr(tables.b),
             y.arg(),
             list,
             segs.arg(),

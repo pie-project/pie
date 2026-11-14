@@ -551,8 +551,7 @@ pub struct ModelConfig {
     /// Removed: the voxel ladder is derived.
     #[serde(default, skip_serializing)]
     pub max_clips: Removed<removed::MaxClips>,
-    /// How many adapter seats this deployment intends to use, and which
-    /// adapters to write into them at boot. Absent means zero seats.
+    /// Which adapters to register at boot. Absent means none.
     #[serde(default)]
     pub adapters: AdapterConfig,
 }
@@ -561,20 +560,17 @@ fn default_weight_dtype() -> String {
     "bfloat16".to_string()
 }
 
-/// What an operator states about LoRA adapters: a capacity and a roster.
+/// What an operator states about LoRA adapters: a roster.
 ///
-/// The capacity is an intent, not a pool size: `seats` states how many the
-/// deployment intends to register, and a load whose intent exceeds what the
-/// model text seats is refused at compile.
+/// No capacity is configured: an adapter's planes lie in the pool's
+/// `Adapter` slots, taken as instances bind (removed `seats`).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterConfig {
-    /// How many adapter rows this deployment intends to use. Omit to derive
-    /// it from [`registered`](AdapterConfig::registered); state it to reserve
-    /// room for adapters that arrive later.
-    /// The adapters to write into those seats at boot, in the order given.
-    #[serde(default)]
-    pub seats: Option<u32>,
+    /// Removed: adapters lie in the pool's `Adapter` slots.
+    #[serde(default, skip_serializing)]
+    pub seats: Removed<removed::AdapterSeats>,
+    /// The adapters to register at boot, in the order given.
     #[serde(default)]
     pub registered: Vec<RegisteredAdapter>,
 }
@@ -596,36 +592,26 @@ pub struct RegisteredAdapter {
 }
 
 impl AdapterConfig {
-    /// The capacity to bake against: what the operator stated, else what the
-    /// roster needs (a roster whose highest id is `n` needs `n + 1` seats).
-    /// Nothing to seat and nothing to register.
+    /// The rows the roster numbers: a roster whose highest id is `n`
+    /// numbers `n + 1`. What a bank the model text sizes must hold.
     #[must_use]
     pub fn seats(&self) -> u32 {
-        self.seats.unwrap_or_else(|| {
-            self.registered
-                .iter()
-                .map(|adapter| adapter.id.saturating_add(1))
-                .max()
-                .unwrap_or(0)
-        })
+        self.registered
+            .iter()
+            .map(|adapter| adapter.id.saturating_add(1))
+            .max()
+            .unwrap_or(0)
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.seats() == 0 && self.registered.is_empty()
+        self.registered.is_empty()
     }
 
-    /// Checks what this layer can answer without a device: whether the
-    /// roster fits the stated capacity, and every plane path is absolute.
+    /// Checks what this layer can answer without a device: every plane
+    /// path is absolute.
     fn validate(&self) -> Result<()> {
-        let seats = self.seats();
         for adapter in &self.registered {
-            ensure!(
-                adapter.id < seats,
-                "model.adapters: adapter id {} is past the {seats} seat(s) this \
-                 deployment asks for; raise `[model.adapters] seats` or renumber it",
-                adapter.id
-            );
             for (bank, path) in &adapter.planes {
                 ensure!(
                     Path::new(path).is_absolute(),
@@ -1200,8 +1186,8 @@ device = ["metal:0"]
         parses_minimal_metal_config();
         every_engine_kind_round_trips_through_its_config_string();
         adapters_are_absent_by_default_and_that_is_zero_seats();
-        the_seat_count_is_stated_once_or_derived_from_the_roster();
-        an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name();
+        the_seat_count_is_derived_from_the_roster();
+        an_adapter_on_a_relative_path_is_refused_by_name();
         an_empty_memory_table_is_the_dedicated_machine();
         the_memory_keys_are_seven_and_prefixed();
         a_removed_key_is_refused_with_why();
@@ -1492,7 +1478,7 @@ device = ["metal:0"]
         assert!(cfg.model.adapters.registered.is_empty());
     }
 
-    fn the_seat_count_is_stated_once_or_derived_from_the_roster() {
+    fn the_seat_count_is_derived_from_the_roster() {
         let plane = if cfg!(windows) {
             "C:/adapters/0/a.bin"
         } else {
@@ -1517,24 +1503,14 @@ device = ["metal:0"]
         );
 
         let stated = toml.replace("[model.adapters]", "[model.adapters]\nseats = 8");
-        let cfg: Config = toml::from_str(&stated).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(cfg.model.adapters.seats(), 8);
+        let err = toml::from_str::<Config>(&stated)
+            .expect_err("`seats` is removed")
+            .to_string();
+        assert!(err.contains("`seats` was removed"), "got: {err}");
+        assert!(err.contains("`Adapter` slots"), "names the replacement: {err}");
     }
 
-    fn an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name() {
-        let past = MINIMAL_METAL.replace(
-            "source = \"Qwen/Qwen3-0.6B\"",
-            "source = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\nseats = 2\n\
-             [[model.adapters.registered]]\n\
-             id = 5\n",
-        );
-        let cfg: Config = toml::from_str(&past).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("adapter id 5 is past the 2 seat"),
-            "got: {err}"
-        );
+    fn an_adapter_on_a_relative_path_is_refused_by_name() {
 
         let relative = MINIMAL_METAL.replace(
             "source = \"Qwen/Qwen3-0.6B\"",
@@ -1555,7 +1531,6 @@ device = ["metal:0"]
             "source = \"Qwen/Qwen3-0.6B\"",
             "source = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\nseat = 2\n",
         );
-        toml::from_str::<Config>(&typo)
-            .expect_err("a near-miss of `seats` must be refused by name");
+        toml::from_str::<Config>(&typo).expect_err("an unknown key is refused");
     }
 }

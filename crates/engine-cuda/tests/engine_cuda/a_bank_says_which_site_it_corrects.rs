@@ -23,7 +23,6 @@ fn pair(prefix: &str) -> [BankSeat; 2] {
     [
         BankSeat {
             name: format!("{prefix}.lora_a"),
-            adapters: 2,
             slot,
             rows: BANK_RANK,
             cols: HIDDEN,
@@ -31,7 +30,6 @@ fn pair(prefix: &str) -> [BankSeat; 2] {
         },
         BankSeat {
             name: format!("{prefix}.lora_b"),
-            adapters: 2,
             slot,
             rows: HIDDEN,
             cols: BANK_RANK,
@@ -71,7 +69,7 @@ fn write_adapter(mount: &Path, name: &str, rank: u64, site: Option<&str>) {
 
 fn mounted(what: &str) -> (PathBuf, Adapters) {
     let mount = scratch(what);
-    let mut adapters = Adapters::new(4);
+    let mut adapters = Adapters::default();
     adapters.mount(Some(mount.clone()));
     (mount, adapters)
 }

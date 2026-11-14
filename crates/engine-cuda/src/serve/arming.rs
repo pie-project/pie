@@ -964,7 +964,9 @@ impl Shell {
         {
             return Ok(());
         }
-        let row = u32::from(self.adapters().slots().seats() >= 2);
+        // The second of the ids that always name the zero plane: an
+        // adapted row reads past the first entry of its tables.
+        let row = crate::store::layout::ZERO_IDS - 1;
         let real: Vec<Synthetic> = owned
             .iter()
             .map(|lane| {
@@ -1330,12 +1332,12 @@ impl Shell {
         }
         crate::sizing::begin();
         let mut walked = Ok(());
-        // Where the load seats adapters, each composition is walked once
-        // more with every lane it can adapt adapted: the lattice names the
-        // plain classes, and a lane with an adapter runs kernels they do
-        // not (the correction's waist, a slab a lane), which a fire must
-        // find laid like any other.
-        let adapts = self.adapters().slots().seats() > 0;
+        // Where the model text declares adapter banks, each composition is
+        // walked once more with every lane it can adapt adapted: the
+        // lattice names the plain classes, and a lane with an adapter runs
+        // kernels they do not (the correction's waist, a slab a lane),
+        // which a fire must find laid like any other.
+        let adapts = !self.bank_seats().is_empty();
         'targets: for (bucket, target, rs) in &targets {
             self.arm_rs = *rs;
             let (lanes, media) = target.lanes();

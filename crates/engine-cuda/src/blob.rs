@@ -2,9 +2,7 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
-use std::time::UNIX_EPOCH;
 
-use crate::AdapterPlane;
 use crate::error::{Fault, Result};
 use crate::weights::BankSeat;
 
@@ -379,201 +377,16 @@ pub fn fingerprint(bytes: &[u8]) -> u64 {
     hash
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Stamp {
-    pub at: String,
-    pub files: Vec<(String, u64, u128)>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Key {
-    Shared(Stamp),
-    Own(engine::InstanceId),
-    /// An instance's own planes, by their contents: every pass that carries
-    /// the same adapter shares one slot, landed once.
-    Planes(u64),
-}
-
-/// A fingerprint of an adapter's planes: every bank name and byte.
-fn planes_fingerprint(planes: &[AdapterPlane<'_>]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut mix = |w: u64| h = (h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
-    for plane in planes {
-        for chunk in plane.bank.as_bytes().chunks(8).chain(plane.bytes.chunks(8)) {
-            let mut word = [0u8; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            mix(u64::from_le_bytes(word));
-        }
-        mix(plane.bytes.len() as u64);
-    }
-    h
-}
-
-fn stat(at: &Path, file: &str, name: &str) -> Result<(String, u64, u128)> {
-    let meta = std::fs::metadata(at).map_err(|error| Fault::Blob {
-        path: name.to_string(),
-        why: format!("names `{file}`, which is not in the directory: {error}"),
-    })?;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |since| since.as_nanos());
-    Ok((file.to_string(), meta.len(), mtime))
-}
-
-#[derive(Debug, Clone)]
-pub struct Occupant {
-    pub key: Key,
-    pub refs: u32,
-    pub used: u64,
-    pub fingerprint: u64,
-}
-
-#[derive(Debug)]
-pub struct Slots {
-    seats: u32,
-    occupants: Vec<Option<Occupant>>,
-    clock: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Grant {
-    pub slot: u32,
-    pub fresh: bool,
-}
-
-impl Slots {
-    #[must_use]
-    pub fn new(seats: u32) -> Slots {
-        Slots {
-            seats,
-            occupants: vec![None; seats as usize],
-            clock: 0,
-        }
-    }
-
-    #[must_use]
-    pub fn seats(&self) -> u32 {
-        self.seats
-    }
-
-    #[must_use]
-    pub fn resident(&self) -> Vec<(u32, &Occupant)> {
-        self.occupants
-            .iter()
-            .enumerate()
-            .filter_map(|(at, held)| held.as_ref().map(|held| (at as u32, held)))
-            .collect()
-    }
-
-    #[must_use]
-    pub fn refs(&self, slot: u32) -> u32 {
-        self.occupants
-            .get(slot as usize)
-            .and_then(|held| held.as_ref().map(|held| held.refs))
-            .unwrap_or(0)
-    }
-
-    pub fn acquire(&mut self, key: Key) -> Result<Grant> {
-        self.clock += 1;
-        let clock = self.clock;
-        if let Some(at) = self
-            .occupants
-            .iter()
-            .position(|held| held.as_ref().is_some_and(|held| held.key == key))
-        {
-            let held = self.occupants[at]
-                .as_mut()
-                .expect("the slot the search just matched on");
-            held.refs += 1;
-            held.used = clock;
-            return Ok(Grant {
-                slot: at as u32,
-                fresh: false,
-            });
-        }
-        let free = self.occupants.iter().position(Option::is_none);
-        let at = match free {
-            Some(at) => at,
-            None => self
-                .occupants
-                .iter()
-                .enumerate()
-                .filter(|(_, held)| held.as_ref().is_some_and(|held| held.refs == 0))
-                .min_by_key(|(_, held)| held.as_ref().map_or(0, |held| held.used))
-                .map(|(at, _)| at)
-                .ok_or(Fault::AdapterSlots { seats: self.seats })?,
-        };
-        self.occupants[at] = Some(Occupant {
-            key,
-            refs: 1,
-            used: clock,
-            fingerprint: 0,
-        });
-        Ok(Grant {
-            slot: at as u32,
-            fresh: true,
-        })
-    }
-
-    pub fn stamp(&mut self, slot: u32, fingerprint: u64) {
-        if let Some(Some(held)) = self.occupants.get_mut(slot as usize) {
-            held.fingerprint = fingerprint;
-        }
-    }
-
-    pub fn release(&mut self, slot: u32) {
-        self.clock += 1;
-        let clock = self.clock;
-        if let Some(Some(held)) = self.occupants.get_mut(slot as usize) {
-            held.refs = held.refs.saturating_sub(1);
-            held.used = clock;
-        }
-    }
-
-    pub fn abandon(&mut self, slot: u32) {
-        if let Some(held) = self.occupants.get_mut(slot as usize) {
-            *held = None;
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum Source<'a> {
-    Shared {
-        name: &'a str,
-    },
-    Own {
-        instance: engine::InstanceId,
-        planes: &'a [AdapterPlane<'a>],
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Binding {
-    pub slot: u32,
-    pub shared: bool,
-    pub landed: bool,
-}
-
-#[derive(Debug)]
+/// A shared adapter directory's reader: what a mounted adapter's planes
+/// are, by bank. Where they land is the binding's (`Adapter` slots the
+/// runtime takes), never this reader's.
+#[derive(Debug, Default)]
 pub struct Adapters {
     vfs: Vfs,
     blobs: Blobs,
-    slots: Slots,
 }
 
 impl Adapters {
-    #[must_use]
-    pub fn new(seats: u32) -> Adapters {
-        Adapters {
-            vfs: Vfs::default(),
-            blobs: Blobs::default(),
-            slots: Slots::new(seats),
-        }
-    }
-
     pub fn mount(&mut self, root: Option<PathBuf>) {
         self.vfs = Vfs::new(root);
     }
@@ -586,84 +399,6 @@ impl Adapters {
     #[must_use]
     pub fn blobs(&self) -> &Blobs {
         &self.blobs
-    }
-
-    #[must_use]
-    pub fn slots(&self) -> &Slots {
-        &self.slots
-    }
-
-    pub fn bind<L>(&mut self, source: Source<'_>, seats: &[BankSeat], land: L) -> Result<Binding>
-    where
-        L: FnOnce(u32, &[AdapterPlane<'_>]) -> Result<()>,
-    {
-        let shared = matches!(source, Source::Shared { .. });
-        let key = self.key(&source)?;
-        let grant = self.slots.acquire(key)?;
-        if !grant.fresh {
-            return Ok(Binding {
-                slot: grant.slot,
-                shared,
-                landed: false,
-            });
-        }
-        let landed = match source {
-            Source::Own { planes, .. } => land(grant.slot, planes).map(|()| 0),
-            Source::Shared { name } => self.land_shared(name, seats, grant.slot, land),
-        };
-        match landed {
-            Ok(fingerprint) => {
-                self.slots.stamp(grant.slot, fingerprint);
-                Ok(Binding {
-                    slot: grant.slot,
-                    shared,
-                    landed: true,
-                })
-            }
-            Err(fault) => {
-                self.slots.abandon(grant.slot);
-                Err(fault)
-            }
-        }
-    }
-
-    pub fn release(&mut self, binding: Binding) {
-        self.slots.release(binding.slot);
-    }
-
-    pub fn key(&self, source: &Source<'_>) -> Result<Key> {
-        match source {
-            Source::Own { planes, .. } => Ok(Key::Planes(planes_fingerprint(planes))),
-            Source::Shared { name } => {
-                let dir = self.vfs.resolve(name)?;
-                let manifest = Manifest::read(&dir, name)?;
-                let mut files = Vec::with_capacity(manifest.planes.len() + 1);
-                files.push(stat(&dir.join(MANIFEST), MANIFEST, name)?);
-                for plane in &manifest.planes {
-                    files.push(stat(&dir.join(&plane.file), &plane.file, name)?);
-                }
-                Ok(Key::Shared(Stamp {
-                    at: dir.display().to_string(),
-                    files,
-                }))
-            }
-        }
-    }
-
-    fn land_shared<L>(&self, name: &str, seats: &[BankSeat], slot: u32, land: L) -> Result<u64>
-    where
-        L: FnOnce(u32, &[AdapterPlane<'_>]) -> Result<()>,
-    {
-        let (built, fingerprint) = self.planes(name, seats)?;
-        let planes: Vec<AdapterPlane<'_>> = built
-            .iter()
-            .map(|(bank, bytes)| AdapterPlane {
-                bank: bank.as_str(),
-                bytes,
-            })
-            .collect();
-        land(slot, &planes)?;
-        Ok(fingerprint)
     }
 
     /// Each plane's bank and bytes, and the adapter's fingerprint.
