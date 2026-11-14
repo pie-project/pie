@@ -107,10 +107,19 @@ pub struct Context {
     /// tile, and a second command queue is a scheduler context in the
     /// driver. `None` inside once opened means the device is not Metal 4.
     #[cfg(target_vendor = "apple")]
-    sparse: std::cell::OnceCell<Option<std::sync::Arc<super::sparse::Sparse>>>,
+    sparse: std::cell::OnceCell<std::sync::Arc<super::sparse::Sparse>>,
     /// What [`Frame::barrier`] signals and waits on, and the value it last set.
     #[cfg(target_vendor = "apple")]
     barrier: (Retained<ProtocolObject<dyn MTLEvent>>, std::cell::Cell<u64>),
+    /// Buffers kernels reach through an address in another (the pool's
+    /// buffers past the first): every compute pass declares them
+    /// (`useResource`), so Metal orders their writes and reads as it does a
+    /// bound buffer's.
+    #[cfg(target_vendor = "apple")]
+    indirect: RefCell<Vec<super::alloc::Slab>>,
+    /// The shared empty binding ([`Context::empty`]).
+    #[cfg(target_vendor = "apple")]
+    empty: std::cell::OnceCell<super::alloc::Slab>,
 }
 
 // SAFETY: `MTLDevice` and `MTLCommandQueue` are documented thread-safe.
@@ -181,6 +190,8 @@ impl Context {
                 family,
                 sparse: std::cell::OnceCell::new(),
                 barrier: (barrier, std::cell::Cell::new(0)),
+                indirect: RefCell::new(Vec::new()),
+                empty: std::cell::OnceCell::new(),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -328,14 +339,20 @@ impl Context {
         }
     }
 
+    /// The one empty binding every zero-byte buffer shares, made on first
+    /// ask: an empty bind allocates nothing after that.
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     pub(crate) fn empty(&self) -> super::alloc::Slab {
-        RESERVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(target_vendor = "apple")]
         {
-            self.device
-                .newBufferWithLength_options(1, MTLResourceOptions::StorageModeShared)
-                .expect("one byte of shared storage")
+            self.empty
+                .get_or_init(|| {
+                    RESERVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.device
+                        .newBufferWithLength_options(1, MTLResourceOptions::StorageModeShared)
+                        .expect("one byte of shared storage")
+                })
+                .clone()
         }
         #[cfg(not(target_vendor = "apple"))]
         {}
@@ -346,23 +363,11 @@ impl Context {
         &self.device
     }
 
-    /// Whether this device can map sparse buffer tiles: `MTLGPUFamilyMetal4`.
-    #[must_use]
-    pub fn supports_elastic(&self) -> bool {
-        #[cfg(target_vendor = "apple")]
-        {
-            super::sparse::Sparse::supported(&self.device)
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            false
-        }
-    }
-
-    /// The mapping side, opened on first ask; `None` when the device is not
-    /// Metal 4. Its residency set is attached to this context's frame queue.
+    /// The mapping side, opened on first ask: every pool and span is a
+    /// placement sparse buffer over it. Its residency set is attached to
+    /// this context's frame queue.
     #[cfg(target_vendor = "apple")]
-    pub fn sparse(&self) -> Result<Option<std::sync::Arc<super::sparse::Sparse>>> {
+    pub fn sparse(&self) -> Result<std::sync::Arc<super::sparse::Sparse>> {
         if let Some(opened) = self.sparse.get() {
             return Ok(opened.clone());
         }
@@ -381,10 +386,7 @@ impl Context {
     ) -> Result<bool> {
         #[cfg(target_vendor = "apple")]
         {
-            let Some(sparse) = self.sparse()? else {
-                return Ok(false);
-            };
-            sparse.hold(slabs, keep);
+            self.sparse()?.hold(slabs, keep);
             Ok(true)
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -393,6 +395,17 @@ impl Context {
             Ok(false)
         }
     }
+
+    /// Declares `slabs` to every compute pass from now on: buffers kernels
+    /// reach through an address in another (the pool's past the first).
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn reach_indirectly(&self, slabs: Vec<super::alloc::Slab>) {
+        *self.indirect.borrow_mut() = slabs;
+    }
+
+    /// No device off Apple: no pass to declare anything to.
+    #[cfg(not(target_vendor = "apple"))]
+    pub(crate) fn reach_indirectly(&self, _slabs: Vec<super::alloc::Slab>) {}
 
     pub fn frame(&self) -> Result<Frame> {
         #[cfg(target_vendor = "apple")]
@@ -405,7 +418,10 @@ impl Context {
                 call: "computeCommandEncoder",
                 why: "the command buffer would not open a compute pass".to_string(),
             })?;
+            let indirect = self.indirect.borrow().clone();
+            declare(&encoder, &indirect);
             Ok(Frame {
+                indirect,
                 buffer: RefCell::new(buffer),
                 encoder: RefCell::new(Some(encoder)),
                 blit: None,
@@ -425,6 +441,9 @@ impl Context {
 /// the buffer, and opens the next pass. The cells let a fence happen
 /// through a shared `&Frame`, which is all a live encode holds.
 pub struct Frame {
+    /// [`Context`]'s indirect buffers, declared in every compute pass.
+    #[cfg(target_vendor = "apple")]
+    indirect: Vec<super::alloc::Slab>,
     #[cfg(target_vendor = "apple")]
     buffer: RefCell<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     #[cfg(not(target_vendor = "apple"))]
@@ -492,6 +511,7 @@ impl Frame {
             call: "computeCommandEncoder",
             why: "the command buffer would not open a compute pass".to_string(),
         })?;
+        declare(&encoder, &self.indirect);
         head.commit();
         for then in self.committed.borrow_mut().drain(..) {
             then();
@@ -523,6 +543,12 @@ impl Frame {
         }
     }
 
+    /// No device off Apple: no pass to open.
+    #[cfg(not(target_vendor = "apple"))]
+    pub(crate) fn next_pass(&mut self) -> Result<()> {
+        Err(Fault::Deviceless)
+    }
+
     #[cfg(target_vendor = "apple")]
     pub(crate) fn next_pass(&mut self) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>> {
         self.end_pass();
@@ -534,6 +560,7 @@ impl Frame {
                 call: "computeCommandEncoder",
                 why: "the command buffer would not open a second compute pass".to_string(),
             })?;
+        declare(&encoder, &self.indirect);
         *self.encoder.get_mut() = Some(encoder);
         Ok(self.encoder.get_mut().as_deref().expect("just opened"))
     }
@@ -554,6 +581,7 @@ impl Frame {
             call: "computeCommandEncoder",
             why: "the command buffer would not open a compute pass after a barrier".to_string(),
         })?;
+        declare(&encoder, &self.indirect);
         *self.encoder.get_mut() = Some(encoder);
         Ok(())
     }
@@ -598,6 +626,7 @@ impl Frame {
                 call: "computeCommandEncoder",
                 why: "the command buffer would not reopen a compute pass after a fence".to_string(),
             })?;
+        declare(&reopened, &self.indirect);
         *self.encoder.borrow_mut() = Some(reopened);
         Ok(())
     }
@@ -1016,6 +1045,18 @@ mod tests {
         assert!(
             cores >= 7,
             "no Apple Silicon GPU has fewer than 7 cores: {cores}"
+        );
+    }
+}
+
+/// Declares `slabs` read and written through addresses in `encoder`'s
+/// dispatches, so Metal tracks their hazards as a bound buffer's.
+#[cfg(target_vendor = "apple")]
+fn declare(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, slabs: &[super::alloc::Slab]) {
+    for slab in slabs {
+        encoder.useResource_usage(
+            ProtocolObject::from_ref(&**slab),
+            objc2_metal::MTLResourceUsage::Read | objc2_metal::MTLResourceUsage::Write,
         );
     }
 }

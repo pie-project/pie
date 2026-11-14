@@ -614,6 +614,18 @@ impl Engine for Metal {
         self.loaded_mut()?.release_segments(segments).map_err(fault)
     }
 
+    fn set_rung(&mut self, from: u32, to: u32) -> EngineResult<()> {
+        self.loaded_mut()?.set_rung(from, to).map_err(fault)
+    }
+
+    fn commit_span(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_span(segments).map_err(fault)
+    }
+
+    fn release_span(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_span(segments).map_err(fault)
+    }
+
     fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
         self.loaded_mut()?.evacuate(evacuation).map_err(fault)
     }
@@ -762,6 +774,25 @@ impl Engine for Metal {
 
     fn program_facts(&self, program: ProgramId) -> EngineResult<engine::ProgramFacts> {
         self.loaded()?.program_facts(program).map_err(fault)
+    }
+
+    fn fire_facts(
+        &self,
+        program: ProgramId,
+        extents: &engine::BindExtents,
+    ) -> EngineResult<engine::FireFacts> {
+        self.loaded()?
+            .fire_facts(
+                program,
+                &eta_exec::Extents {
+                    row_count: extents.row_count,
+                    token_count: extents.token_count,
+                    sampled_rows: extents.sampled_rows,
+                    query_len: extents.query_len,
+                    key_len: extents.key_len,
+                },
+            )
+            .map_err(fault)
     }
 
     fn rebind_slots(&mut self, rebind: engine::Rebind) -> EngineResult<()> {

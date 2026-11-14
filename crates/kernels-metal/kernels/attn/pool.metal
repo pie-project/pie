@@ -6,13 +6,14 @@ using namespace metal;
 #include "../prim/state_map.h"
 
 // The first element of position `pos` of request `req` in a paged plane
-// whose pages are `page_elems` apart and whose rows are `row` wide.
+// whose pages are `page_elems` apart and whose rows are `row` wide, its
+// elements `unit` bytes.
 inline size_t pool_paged_cell(
     const device uint* page_indices,
     const device uint* page_indptr,
-    int req, int pos, int page_size, size_t page_elems, size_t row) {
+    int req, int pos, int page_size, size_t page_elems, size_t row, size_t unit) {
   const uint page = page_indices[page_indptr[req] + uint(pos / page_size)];
-  return size_t(page) * page_elems + size_t(pos % page_size) * row;
+  return pie_page_at(page, page_elems, unit) + size_t(pos % page_size) * row;
 }
 
 
@@ -83,9 +84,9 @@ template <typename T>
   if (d >= width) return;
   const size_t in_page = size_t(w_off[i]) * size_t(state_pitch) + size_t(d);
   const size_t src = size_t(i) * size_t(width) + size_t(d);
-  pie_kv_plane(state_kv, k_offset)[size_t(w_page[i]) * (k_page_stride / sizeof(T)) + in_page] =
+  pie_kv_plane(state_kv, k_offset)[pie_page_at(w_page[i], k_page_stride / sizeof(T), sizeof(T)) + in_page] =
       kv[src];
-  pie_kv_plane(state_score, v_offset)[size_t(w_page[i]) * (v_page_stride / sizeof(T)) +
+  pie_kv_plane(state_score, v_offset)[pie_page_at(w_page[i], v_page_stride / sizeof(T), sizeof(T)) +
                                       in_page] = score[src];
 }
 
@@ -147,7 +148,7 @@ template <typename T>
     if (pos < 0) continue;
     const int col = ((i >= ratio) ? head_dim : 0) + d;
     const size_t vcell =
-        pool_paged_cell(page_indices, page_indptr, req, pos, page_size, v_page, pitch);
+        pool_paged_cell(page_indices, page_indptr, req, pos, page_size, v_page, pitch, sizeof(T));
     float sc = float(scores[vcell + size_t(col)]);
     if (has_ape != 0) {
       sc += ape[size_t(pos % ratio) * size_t(width) + size_t(col)];
@@ -166,7 +167,7 @@ template <typename T>
     if (pos < 0) continue;
     const int col = ((i >= ratio) ? head_dim : 0) + d;
     const size_t vcell =
-        pool_paged_cell(page_indices, page_indptr, req, pos, page_size, v_page, pitch);
+        pool_paged_cell(page_indices, page_indptr, req, pos, page_size, v_page, pitch, sizeof(T));
     float sc = float(scores[vcell + size_t(col)]);
     if (has_ape != 0) {
       sc += ape[size_t(pos % ratio) * size_t(width) + size_t(col)];
@@ -174,7 +175,7 @@ template <typename T>
     const float e = precise::exp(sc - max_s);
     sum_e += e;
     const size_t kcell =
-        pool_paged_cell(page_indices, page_indptr, req, pos, page_size, k_page, pitch);
+        pool_paged_cell(page_indices, page_indptr, req, pos, page_size, k_page, pitch, sizeof(T));
     acc += e * float(kvs[kcell + size_t(col)]);
   }
   out[size_t(c) * size_t(head_dim) + size_t(d)] =
@@ -218,7 +219,7 @@ template <typename T>
   const int div = head_dim / pitch;
   const size_t cell = pool_paged_cell(
       page_indices, page_indptr, boundary_req[c], boundary_pos[c] - (div - 1), page_size,
-      k_page_stride / sizeof(T), size_t(pitch));
+      k_page_stride / sizeof(T), size_t(pitch), sizeof(T));
   pie_kv_plane(comp_kv_pages, k_offset)[cell + size_t(d)] =
       entries[size_t(c) * size_t(head_dim) + size_t(d)];
 }
@@ -264,7 +265,7 @@ template <typename T>
     const int pos = bpos + i - (ratio - 1);
     if (pos < 0) continue;
     const size_t cell = pool_paged_cell(page_indices, page_indptr, req, pos, page_size,
-                                        k_page_stride / sizeof(T), size_t(head_dim));
+                                        k_page_stride / sizeof(T), size_t(head_dim), sizeof(T));
     acc += float(pie_kv_plane(key_pages, k_offset)[cell + size_t(d)]);
   }
   out[size_t(c) * size_t(head_dim) + size_t(d)] = T(acc / float(ratio));
@@ -345,7 +346,7 @@ constant int POOL_HEAD_MAX = 512;
     const device bfloat* k_row =
         pie_kv_plane(comp_kv_pages, k_offset) +
         pool_paged_cell(page_indices, page_indptr, req, (c + 1) * ratio - head_dim / pitch,
-                        page_size, k_page_stride / sizeof(bfloat), size_t(pitch));
+                        page_size, k_page_stride / sizeof(bfloat), size_t(pitch), sizeof(bfloat));
     float dot = 0.0f;
     for (int d = 0; d < head_dim; ++d) {
       dot += q_smem[d] * float(k_row[d]);
@@ -374,7 +375,7 @@ constant int POOL_HEAD_MAX = 512;
     const device bfloat* k_row =
         pie_kv_plane(comp_kv_pages, k_offset) +
         pool_paged_cell(page_indices, page_indptr, req, (c + 1) * ratio - head_dim / pitch,
-                        page_size, k_page_stride / sizeof(bfloat), size_t(pitch));
+                        page_size, k_page_stride / sizeof(bfloat), size_t(pitch), sizeof(bfloat));
     float dot = 0.0f;
     for (int d = tid; d < head_dim; d += POOL_ATTN_BLOCK) {
       dot += q_smem[d] * float(k_row[d]);
@@ -480,7 +481,7 @@ constant int POOL_HEAD_MAX = 512;
     const device bfloat* k_row =
         pie_kv_plane(comp_kv_pages, k_offset) +
         pool_paged_cell(page_indices, page_indptr, req, (c + 1) * ratio - head_dim / pitch,
-                        page_size, k_page_stride / sizeof(bfloat), size_t(pitch));
+                        page_size, k_page_stride / sizeof(bfloat), size_t(pitch), sizeof(bfloat));
     float dot = 0.0f;
     for (int d = 0; d < head_dim; ++d) {
       dot += q_smem[d] * float(k_row[d]);
@@ -522,7 +523,7 @@ constant int POOL_HEAD_MAX = 512;
     const device bfloat* k_row =
         pie_kv_plane(comp_kv_pages, k_offset) +
         pool_paged_cell(page_indices, page_indptr, req, (c + 1) * ratio - head_dim / pitch,
-                        page_size, k_page_stride / sizeof(bfloat), size_t(pitch));
+                        page_size, k_page_stride / sizeof(bfloat), size_t(pitch), sizeof(bfloat));
     float dot = 0.0f;
     for (int d = tid; d < head_dim; d += POOL_ATTN_BLOCK) {
       dot += q_smem[d] * float(k_row[d]);

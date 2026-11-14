@@ -191,11 +191,7 @@ pub(super) fn deployed_fixture(name: &str) -> Fixture {
     if !encoded {
         return fixture_from(trace, name);
     }
-    let dir = std::env::var_os("PIE_FIXTURE_DIR").map_or_else(
-        || std::env::temp_dir().join(format!("pie-bm-pool-{}", std::process::id())),
-        std::path::PathBuf::from,
-    );
-    std::fs::create_dir_all(&dir).expect("the fixture dir");
+    let (dir, owned) = fixture_dir();
     let floats = dir.join(format!("{name}.floats.zt"));
     if !floats.exists() {
         write_checkpoint(&floats, &trace);
@@ -230,13 +226,43 @@ pub(super) fn deployed_fixture(name: &str) -> Fixture {
         trace,
         contract,
         container,
+        owned,
     }
+}
+
+/// Where a fixture's files go: `PIE_FIXTURE_DIR`, kept across processes (a
+/// probe), or a directory of its own under the temp dir, which the fixture
+/// removes when dropped (`owned`), passing or failing.
+fn fixture_dir() -> (PathBuf, Option<PathBuf>) {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if let Some(kept) = std::env::var_os("PIE_FIXTURE_DIR") {
+        let dir = PathBuf::from(kept);
+        std::fs::create_dir_all(&dir).expect("the fixture dir");
+        return (dir, None);
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "pie-bm-pool-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("the fixture dir");
+    (dir.clone(), Some(dir))
 }
 
 pub(super) struct Fixture {
     pub(super) trace: Trace,
     pub(super) contract: ModelContract,
     pub(super) container: PathBuf,
+    /// The directory the fixture made for itself, removed with it.
+    owned: Option<PathBuf>,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if let Some(dir) = self.owned.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 fn fixture(model: &str) -> Fixture {
@@ -259,11 +285,7 @@ pub(super) fn fixture_of(model: &str, layers: Option<u32>) -> Fixture {
 /// The fixture of `trace`, its checkpoint written under `name`.
 pub(super) fn fixture_from(trace: Trace, name: &str) -> Fixture {
     // `PIE_FIXTURE_DIR` keeps the fixtures across processes (a probe).
-    let dir = std::env::var_os("PIE_FIXTURE_DIR").map_or_else(
-        || std::env::temp_dir().join(format!("pie-bm-pool-{}", std::process::id())),
-        std::path::PathBuf::from,
-    );
-    std::fs::create_dir_all(&dir).expect("the fixture dir");
+    let (dir, owned) = fixture_dir();
     let container = dir.join(format!("{name}.zt"));
     if !container.exists() {
         write_checkpoint(&container, &trace);
@@ -275,6 +297,7 @@ pub(super) fn fixture_from(trace: Trace, name: &str) -> Fixture {
         trace,
         contract,
         container,
+        owned,
     }
 }
 
@@ -306,6 +329,7 @@ fn load_near(fixture: &Fixture, context: u32, chunk: Option<u64>) -> Shell {
         },
         profiles: None,
     })
+    .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
 }
 
@@ -679,6 +703,36 @@ fn a_scattered_hybrid_pool_serves_the_same_logits() {
     check("qwen35-tiny", true);
 }
 
+/// Caps each buffer of a pool loaded while it lives at one segment, so a
+/// small model's range spans several buffers; lifted when dropped.
+struct OverBuffers;
+
+impl OverBuffers {
+    fn cap() -> OverBuffers {
+        engine_metal::store::pool::cap_parts(1);
+        OverBuffers
+    }
+}
+
+impl Drop for OverBuffers {
+    fn drop(&mut self) {
+        engine_metal::store::pool::cap_parts(0);
+    }
+}
+
+/// The range over several buffers, a segment each: kv pages, records and
+/// the activation span in buffers past the first, read through each
+/// buffer's place from the first, give the seats' logits.
+#[test]
+fn a_pool_over_buffers_serves_the_same_logits() {
+    if !engine_metal::device::present() {
+        return;
+    }
+    let _over = OverBuffers::cap();
+    check("qwen3-micro-text", false);
+    check("qwen35-tiny", true);
+}
+
 /// A gated-delta hybrid's record cut into pieces on device: its chunk aimed
 /// at 256 KiB, the 1.6 MiB record lies in pieces of their own, each piece of
 /// each lane in a chunk of its own once scattered by slot ref (and evacuated
@@ -774,7 +828,10 @@ fn a_reserved_hybrid_pool_states_shared_chunks() {
     }
     assert_eq!(facts.chunk_bytes % facts.shape(LIST).unwrap().slot_bytes, 0);
     assert_eq!(facts.segments.max, 3);
-    assert!(facts.act_chunks.is_empty(), "activation lives in the arena");
+    assert!(
+        facts.act_chunks.is_empty(),
+        "a layout with no activation span states none"
+    );
     if facts.segments.growth != Growth::Bottom {
         assert_eq!(facts.segments.committed, 3);
         return;
