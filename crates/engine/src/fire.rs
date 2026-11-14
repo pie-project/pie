@@ -586,12 +586,21 @@ pub enum RsVerb {
 ///   [`buffered_reads`]). Where the device says where a lane's rows land,
 ///   both ends are its program's (`fold` and `slots`), resolved at the
 ///   engine's prepare, after the lane's earlier fires have run: no count
-///   exists when the runtime asks. The runtime asks for such a fire's own
-///   rows and states no carried count for it, nor a bound in its place
-///   (the slots a lane reserved are no measure of what it carries). Its
-///   engine holds it to the contract where the count resolves: a fire whose
-///   lanes replay more than the tokens of the rung it runs at is refused by
-///   name at prepare and writes nothing, never replayed past the scratch.
+///   exists when the runtime asks. The runtime states a bound in its place,
+///   the rows that can stand unfolded in the lane's working set when the
+///   fire runs: those between the state's frozen length and the set's
+///   written end (one past the highest slot a settled fire wrote; a lane
+///   that rewinds leaves the rows past it buffered, so the end only
+///   rises), and every row of the set's device-placed fires staged and not
+///   yet settled. It asks the rung for max(own, that bound) summed over the
+///   fire's lanes, and refuses past the largest rung as for any fire. An
+///   engine that takes such fires reports where each lane's rows ended
+///   when the fire settles ([`crate::KvWrites::end`]); a fire that reports
+///   none is taken to have written as far as its set reserved. The
+///   engine's check where the count resolves is a fault for a wrong count
+///   only (a mask admitting slots nobody wrote): a fire whose lanes replay
+///   more than the tokens of the rung it runs at, summed over them, is
+///   refused by name at prepare and writes nothing.
 #[must_use]
 pub fn rung_rows(own: u32, carried: u32) -> u32 {
     own.max(carried)

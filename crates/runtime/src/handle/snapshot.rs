@@ -123,6 +123,10 @@ struct SavedCursor {
     folded: u32,
     tail: Option<u32>,
     reserved: u32,
+    /// One past the highest slot written ([`Cursor::written`]); a manifest
+    /// that states none wrote inside what it reserved.
+    #[serde(default)]
+    written: Option<u32>,
     spans: Vec<(u32, u32, u32)>,
 }
 
@@ -791,6 +795,7 @@ async fn finish(
             folded: cursor.folded,
             tail: cursor.tail,
             reserved: cursor.reserved,
+            written: Some(cursor.written_end()),
             spans: cursor.spans.clone(),
         },
         page_len: set.page_len,
@@ -948,6 +953,8 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
         unsettled: 0,
         tail: cursor.tail,
         reserved: cursor.reserved,
+        written: cursor.written.unwrap_or(cursor.reserved),
+        staged: Vec::new(),
         spans: cursor.spans,
     };
     Ok(Held::park(holder, kv, rs, cursor))

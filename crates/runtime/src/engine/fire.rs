@@ -14,8 +14,8 @@ pub struct FireRequest {
     pub media: Vec<engine::fire::StepMedia>,
     /// The recurrent rows its lanes carry unfolded into the fire, which it
     /// replays ahead of its own, summed over them
-    /// ([`engine::fire::rung_rows`]); none stated for a fire whose rows
-    /// land where the device says, whose engine counts them at prepare.
+    /// ([`engine::fire::rung_rows`]): their count where the host places
+    /// its rows, a bound on it where the device does.
     pub carried: u32,
 }
 

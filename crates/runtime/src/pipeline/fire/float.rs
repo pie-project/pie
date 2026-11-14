@@ -334,6 +334,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         cursor.folded += 1;
         cursor.tail = Some(cursor.folded);
         cursor.reserved = cursor.reserved.max(cursor.folded);
+        cursor.written = cursor.written.max(cursor.folded);
     }
     pipe_fires
         .lock()
@@ -351,6 +352,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
                     lease,
                     fold: None,
                     reports: Vec::new(),
+                    staged: None,
                 })
                 .collect(),
             device_geometry: false,

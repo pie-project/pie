@@ -588,8 +588,7 @@ fn device_rs_plan(
         let reserved = lanes.cursors[first].lock().unwrap().reserved;
         let fold = group_fold(fold, first, frozen, reserved);
         // The device picks where a lane's rows start: what it carries in is
-        // counted where its ports resolve, at the engine's prepare
-        // ([`::engine::fire::rung_rows`], device geometry).
+        // bounded by what stands unfolded in its set ([`device_lane_rows`]).
         plans.push(rs::GroupPlan {
             lanes: group.clone(),
             writes: Some(frozen..reserved),
@@ -630,12 +629,30 @@ impl FireRows {
 /// The own and carried rows of a lane the host places at `start..end`, its
 /// recurrent state folded through `frozen` (`None`: it has none, and
 /// carries nothing): it carries the rows between its state and its first
-/// row. A lane the device places has no count here: its first row is its
-/// program's, resolved at the engine's prepare.
+/// row.
 fn lane_rows(start: u32, end: u32, frozen: Option<u32>) -> FireRows {
     FireRows {
         own: end.saturating_sub(start),
         carried: frozen.map_or(0, |frozen| start.saturating_sub(frozen)),
+    }
+}
+
+/// The `own` rows of a lane the device places, and a bound on what it
+/// carries, its recurrent state folded through `frozen` (`None`: it has
+/// none, and carries nothing). Its first row is its program's, resolved on
+/// the device after its set's earlier fires have run, so no count exists
+/// here; it replays no more than the rows standing unfolded in its set
+/// then: those written past `frozen`, up to the set's written end, by
+/// fires that settled, and every row of its fires staged and still to
+/// settle ([`::engine::fire::rung_rows`], device geometry).
+fn device_lane_rows(
+    own: u32,
+    cursor: &crate::inferlet::host::working_set::Cursor,
+    frozen: Option<u32>,
+) -> FireRows {
+    FireRows {
+        own,
+        carried: frozen.map_or(0, |frozen| cursor.unfolded(frozen)),
     }
 }
 
@@ -1943,6 +1960,41 @@ struct FireWs {
     lease: KvFireLease,
     fold: Option<FoldAt>,
     reports: Vec<ReportTag>,
+    staged: Option<StagedFire>,
+}
+
+/// A fire's rows on one working set that land where the device says: the
+/// set counts them as unfolded until the fire settles, and learns from the
+/// reports under `tags` where they ended.
+struct StagedFire {
+    rows: std::sync::Arc<crate::inferlet::host::working_set::StagedRows>,
+    tags: Vec<u64>,
+}
+
+impl StagedFire {
+    /// The end its lanes reported, the furthest of them; none unless each
+    /// reported one.
+    fn settle(
+        &self,
+        reported: &std::collections::HashMap<u64, ::engine::KvWrites>,
+        success: bool,
+    ) {
+        let end = self
+            .tags
+            .iter()
+            .map(|tag| reported.get(tag).and_then(|written| written.end))
+            .collect::<Option<Vec<u32>>>()
+            .and_then(|ends| ends.into_iter().max())
+            .filter(|_| success);
+        self.rows.settle(end);
+    }
+}
+
+/// A fire dropped unsettled reported no end.
+impl Drop for StagedFire {
+    fn drop(&mut self) {
+        self.rows.settle(None);
+    }
 }
 
 struct FoldAt {
@@ -2693,6 +2745,7 @@ fn advance_cursors(
             .unwrap_or(0);
         cursor.tail = Some(end);
         cursor.reserved = cursor.reserved.max(end);
+        cursor.written = cursor.written.max(end);
         let start = mine
             .iter()
             .filter_map(|&lane| landings.get(lane))
@@ -3683,6 +3736,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                         decoded: reports,
                     }),
                     reports: tags,
+                    staged: None,
                 });
             }
             settles.extend(settling(&parts));
@@ -4284,6 +4338,7 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
         }
         let mut logs = Vec::with_capacity(kv.len());
         let mut folds = Vec::with_capacity(kv.len());
+        let mut staged = Vec::new();
         let mut reported = std::collections::HashMap::new();
         for part in kv {
             if let Some(kvtxn) = part.kvtxn.into_inner() {
@@ -4302,7 +4357,13 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
             if let Some(fold) = part.fold {
                 folds.push((part.ws, fold));
             }
+            staged.extend(part.staged);
             leases.push(part.lease);
+        }
+        // Where its rows ended, before what it froze: a set never counts
+        // fewer rows unfolded than stand in its buffer.
+        for fire in &staged {
+            fire.settle(&reported, success);
         }
         for (ws, LogFire { seq, rows }) in logs {
             let known = match rows {
@@ -4527,14 +4588,41 @@ async fn fire_device_geometry<C: FireContext>(
     } else {
         vec![0; pass_lanes.places.len() + 1]
     };
+    let rs_ws_ids = match bound_rs_working_sets(ctx, &ws, &rs_reps, &split, &pipeline_scope)? {
+        Ok(ids) => ids,
+        Err(error) => return Ok(Err(error)),
+    };
+    let windowed = crate::model::model().rs_caps().window_tokens > 0;
     // The fire stages its rows whole (the device places them, so it is never
     // cut): it asks the activation rung for them as every pass does
     // ([`RungAsk`]), and is staged once the rung takes them. It asks for
-    // its own rows only: the rows it carries in start where its program
-    // says, on the device, after the lane's earlier fires have run, so no
-    // count exists here and none is stated in its place; its engine counts
-    // them at prepare ([`::engine::fire::rung_rows`], device geometry).
-    let rows = resolved_qo_indptr.last().copied().unwrap_or(0);
+    // the recurrent rows it may carry in as well: each lane's are bounded
+    // by what stands unfolded in its set ([`device_lane_rows`]).
+    let frozen = match lanes_frozen(
+        &stores,
+        &rs_ws_ids,
+        &groups,
+        pass_lanes.places.len(),
+        windowed,
+    ) {
+        Ok(frozen) => frozen,
+        Err(error) => return Ok(Err(error)),
+    };
+    let counted = FireRows::of(groups.iter().flat_map(|(_, lanes)| {
+        let carried = {
+            let cursor = pass_lanes.cursors[lanes[0]].lock().unwrap();
+            device_lane_rows(0, &cursor, frozen[lanes[0]]).carried
+        };
+        let split = &resolved_qo_indptr;
+        lanes.iter().map(move |&lane| FireRows {
+            own: split[lane + 1] - split[lane],
+            carried,
+        })
+    }));
+    if let Err(refusal) = check_largest_rung(counted, largest_rung(&stores, ws.engine)) {
+        return Ok(Err(refusal));
+    }
+    let rows = counted.ask();
     let rung_ask = ask_rung(
         &stores,
         ws.engine,
@@ -4548,11 +4636,6 @@ async fn fire_device_geometry<C: FireContext>(
     {
         return Ok(Err(refusal));
     }
-    let rs_ws_ids = match bound_rs_working_sets(ctx, &ws, &rs_reps, &split, &pipeline_scope)? {
-        Ok(ids) => ids,
-        Err(error) => return Ok(Err(error)),
-    };
-    let windowed = crate::model::model().rs_caps().window_tokens > 0;
     if windowed && groups.len() > 1 {
         return Ok(Err(
             "pipeline: on a model with window lists, a pass whose rows land where the device \
@@ -4671,6 +4754,7 @@ async fn fire_device_geometry<C: FireContext>(
                 ..::engine::Lane::default()
             })
             .collect(),
+        carried: counted.carried,
         ..crate::engine::FireRequest::default()
     };
     rs_prepared.apply_to(&mut req);
@@ -4779,6 +4863,21 @@ async fn fire_device_geometry<C: FireContext>(
             &mut req,
             &mut tags,
         );
+        // A set with a recurrent state counts the fire's rows unfolded
+        // until it settles, and each of its lanes reports where its rows
+        // ended.
+        let staged = frozen[lanes[0]].map(|_| StagedFire {
+            rows: crate::inferlet::host::working_set::StagedRows::new(
+                lanes
+                    .iter()
+                    .map(|&lane| split[lane + 1] - split[lane])
+                    .sum(),
+            ),
+            tags: lanes
+                .iter()
+                .map(|&lane| report_on(&mut req, lane, &mut tags))
+                .collect(),
+        });
         parts.push(FireWs {
             ws: set.id,
             kvtxn,
@@ -4789,6 +4888,7 @@ async fn fire_device_geometry<C: FireContext>(
                 decoded: plain_decode,
             }),
             reports: tags,
+            staged,
         });
     }
     let settles = settling(&parts);
@@ -4824,6 +4924,14 @@ async fn fire_device_geometry<C: FireContext>(
     ticket_reservation.commit();
     advance_shadow(ctx, &fwd)?;
     advance_cursors(&pass_lanes, None, &[], &fold, &settles);
+    for (part, (_, lanes)) in parts.iter().zip(&groups) {
+        if let Some(staged) = &part.staged {
+            pass_lanes.cursors[lanes[0]]
+                .lock()
+                .unwrap()
+                .stage(staged.rows.clone());
+        }
+    }
 
     pipe_fires
         .lock()
@@ -5105,6 +5213,7 @@ pub(crate) mod lifecycle_tests {
                     lease: ws.fire_lease().expect("lease the submitted working set"),
                     fold: None,
                     reports: Vec::new(),
+                    staged: None,
                 }],
                 device_geometry: false,
                 rstxn: RsTxnsGuard::new(model, 0, None),
@@ -6098,6 +6207,253 @@ mod unfolded_tests {
         );
     }
 
+    /// A set whose prompt the host placed through slot 105, its state
+    /// folded through 100, with `reserved` slots granted.
+    fn decoding(reserved: u32) -> Cursor {
+        Cursor {
+            folded: 100,
+            tail: Some(105),
+            reserved,
+            written: 105,
+            ..Cursor::default()
+        }
+    }
+
+    /// A lane the device places carries no more than stands unfolded in
+    /// its set: the rows between its state and the set's written end, and
+    /// every row of the fires staged and not yet settled. With `n` fires
+    /// of two rows staged since the last settle it asks for `5 + 2n`.
+    #[test]
+    fn a_device_lane_asks_for_what_stands_unfolded_in_its_set() {
+        use crate::inferlet::host::working_set::StagedRows;
+        let mut set = decoding(184);
+        assert_eq!(
+            device_lane_rows(2, &set, Some(100)),
+            FireRows { own: 2, carried: 5 }
+        );
+        assert_eq!(device_lane_rows(2, &set, None).carried, 0);
+        let mut fires = Vec::new();
+        for n in 1..=10u32 {
+            let fire = StagedRows::new(2);
+            set.stage(fire.clone());
+            fires.push(fire);
+            let rows = device_lane_rows(2, &set, Some(100));
+            assert_eq!(rows.carried, 5 + 2 * n);
+            assert_eq!(rows.ask(), 5 + 2 * n);
+        }
+        // The first settles, its rows ended at 107 and one slot frozen:
+        // its rows are counted where they landed, not as staged.
+        fires[0].settle(Some(107));
+        assert_eq!(set.standing(), (107, 18));
+        assert_eq!(device_lane_rows(2, &set, Some(100)).carried, 25);
+        assert_eq!(device_lane_rows(2, &set, Some(101)).carried, 24);
+        // The second rewound and ended at 106: the rows through 107 are
+        // still buffered, so the written end stays.
+        fires[1].settle(Some(106));
+        assert_eq!(set.standing(), (107, 16));
+        // The rest settle; the set froze through 107: nothing is carried,
+        // and the fire asks for its own rows.
+        for fire in &fires[2..] {
+            fire.settle(Some(107));
+        }
+        assert_eq!(
+            device_lane_rows(2, &set, Some(107)),
+            FireRows { own: 2, carried: 0 }
+        );
+        assert_eq!(device_lane_rows(2, &set, Some(107)).ask(), 2);
+        // Staging takes in what settled.
+        set.stage(StagedRows::new(2));
+        assert_eq!((set.written, set.staged.len()), (107, 1));
+        // A fire's rows are its lanes' summed, each lane of a set carrying
+        // what stands unfolded in it.
+        let lanes = [
+            device_lane_rows(2, &set, Some(107)),
+            device_lane_rows(3, &set, Some(107)),
+        ];
+        assert_eq!(FireRows::of(lanes), FireRows { own: 5, carried: 4 });
+    }
+
+    /// A fire that settles with no end reported (it failed, or its engine
+    /// tells none) wrote inside what its set reserved; a fork made while a
+    /// fire is in flight shares its rows, and counts them until it settles.
+    #[test]
+    fn a_fire_with_no_end_wrote_inside_what_was_reserved_and_a_fork_shares_it() {
+        use crate::inferlet::host::working_set::StagedRows;
+        let mut set = decoding(184);
+        let fire = StagedRows::new(2);
+        set.stage(fire.clone());
+        let fork = set.clone();
+        assert_eq!(fork.unfolded(100), 7);
+        assert_eq!(fork.written_end(), 184, "a snapshot states no end it lacks");
+        fire.settle(Some(107));
+        assert_eq!((set.unfolded(100), fork.unfolded(100)), (7, 7));
+        assert_eq!((set.standing(), fork.standing()), ((107, 0), (107, 0)));
+        assert_eq!(fork.written_end(), 107);
+
+        let fire = StagedFire {
+            rows: StagedRows::new(2),
+            tags: vec![7],
+        };
+        set.stage(fire.rows.clone());
+        // Its lane reported, but the fire failed.
+        let reported = std::collections::HashMap::from([(
+            7,
+            ::engine::KvWrites {
+                tag: 7,
+                end: Some(109),
+                ..::engine::KvWrites::default()
+            },
+        )]);
+        fire.settle(&reported, false);
+        assert_eq!(set.standing(), (184, 0));
+
+        let mut set = decoding(184);
+        let fire = StagedFire {
+            rows: StagedRows::new(2),
+            tags: vec![7, 8],
+        };
+        set.stage(fire.rows.clone());
+        // One of its two lanes reported no end.
+        fire.settle(&reported, true);
+        assert_eq!(set.standing(), (184, 0));
+
+        let mut set = decoding(184);
+        let fire = StagedFire {
+            rows: StagedRows::new(2),
+            tags: vec![7],
+        };
+        set.stage(fire.rows.clone());
+        fire.settle(&reported, true);
+        assert_eq!(set.standing(), (109, 0));
+
+        // Dropped unsettled.
+        let mut set = decoding(184);
+        let fire = StagedFire {
+            rows: StagedRows::new(2),
+            tags: vec![7],
+        };
+        set.stage(fire.rows.clone());
+        drop(fire);
+        assert_eq!(set.standing(), (184, 0));
+    }
+
+    /// The bound is never below what the engine replays: over runs of
+    /// fires staged ahead, each landing wherever a lane may (at or past
+    /// the engine's folded length, no further than rows were written),
+    /// folding what its program says, and settling later, the rows
+    /// `buffered_reads` returns for the fire are no more than it stated
+    /// when it was staged.
+    #[test]
+    fn the_bound_is_never_below_what_the_engine_replays() {
+        use crate::inferlet::host::working_set::StagedRows;
+        struct Fire {
+            own: u32,
+            stated: u32,
+            rows: Arc<StagedRows>,
+            /// Once run: where its rows ended, and what it folded.
+            ran: Option<(u32, u32)>,
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut pick = |below: u32| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 33) % u64::from(below.max(1))) as u32
+        };
+        let mut replayed = 0u32;
+        for depth in [1usize, 2, 10] {
+            let mut set = decoding(4096);
+            // The runtime's frozen length, the engine's folded length (past
+            // it while a device-counted fold has not settled), and the
+            // furthest slot written.
+            let (mut frozen, mut folded, mut end) = (100u32, 100u32, 105u32);
+            let mut fires: std::collections::VecDeque<Fire> = Default::default();
+            for _ in 0..4000 {
+                let running = fires.iter().position(|fire| fire.ran.is_none());
+                match pick(3) {
+                    0 if fires.len() < depth => {
+                        let own = 1 + pick(5);
+                        let stated = device_lane_rows(own, &set, Some(frozen)).carried;
+                        let rows = StagedRows::new(own);
+                        set.stage(rows.clone());
+                        fires.push_back(Fire {
+                            own,
+                            stated,
+                            rows,
+                            ran: None,
+                        });
+                    }
+                    1 if running.is_some() => {
+                        let fire = &mut fires[running.unwrap()];
+                        // Anywhere from its state to the furthest row written:
+                        // on, or rewound over rows it rejects.
+                        let first = folded + pick(end - folded + 1);
+                        let reads =
+                            ::engine::fire::buffered_reads(None, folded, first, fire.own).unwrap();
+                        let carried: u32 = reads.iter().map(|span| span.end - span.start).sum();
+                        assert!(
+                            carried <= fire.stated,
+                            "replays {carried} rows, stated {}",
+                            fire.stated
+                        );
+                        replayed = replayed.max(carried);
+                        // Most fires fold nothing (their rows stand buffered);
+                        // one in four folds any part of what stands.
+                        let fold = match pick(4) {
+                            0 => pick(first + fire.own - folded + 1),
+                            _ => 0,
+                        };
+                        folded += fold;
+                        end = end.max(first + fire.own);
+                        fire.ran = Some((first + fire.own, fold));
+                    }
+                    _ => {
+                        if fires.front().is_some_and(|fire| fire.ran.is_some()) {
+                            let fire = fires.pop_front().unwrap();
+                            let (ended, fold) = fire.ran.unwrap();
+                            fire.rows.settle(Some(ended));
+                            frozen += fold;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(replayed > 16, "the runs replay past what a rung of 16 held");
+    }
+
+    /// The rows a device-placed fire may carry raise the rung through the
+    /// ask every pass makes: the fire enqueues once the rung takes them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_device_fire_asks_the_rung_for_the_rows_it_may_carry() {
+        use crate::inferlet::host::working_set::StagedRows;
+        const ENGINE: usize = 48;
+        let stores = pool_of_one_row_rs_pages();
+        let pid = uuid::Uuid::new_v4();
+        crate::store::shared::set_fire_cap_for_test(ENGINE, 8);
+        // Two rows of its own, behind ten fires of two rows still to
+        // settle and five rows unfolded.
+        let mut set = decoding(184);
+        for _ in 0..10 {
+            set.stage(StagedRows::new(2));
+        }
+        let rows = device_lane_rows(2, &set, Some(100)).ask();
+        assert_eq!(rows, 25);
+        let raise = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert_eq!(crate::store::shared::wanted_rows(ENGINE), 25);
+            crate::store::shared::set_fire_cap_for_test(ENGINE, 32);
+        });
+        let ask = ask_rung(&stores, ENGINE, pid, pid, rows as usize, rows).expect("it asks");
+        tokio::time::timeout(std::time::Duration::from_secs(5), ask.wait(rows))
+            .await
+            .expect("no indefinite wait")
+            .expect("the rung takes it");
+        raise.await.unwrap();
+        assert!(crate::store::shared::fire_cap(ENGINE) >= 25);
+        drop(ask);
+        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
+    }
+
     /// A fire carrying no more rows than its own asks its rung for what it
     /// asked before: its own rows, in the pass's ask and in what the
     /// scheduler steps and holds it by.
@@ -6386,9 +6742,8 @@ mod unfolded_tests {
             [None]
         );
 
-        // The device plan: the device picks where the rows start, so what
-        // the fire carries is the host's bound, every slot the lane
-        // reserved past its frozen length.
+        // The device plan: the device picks where the rows start, inside
+        // what the lane reserved.
         let device = |reserved: u32| {
             let cell = Arc::new(Mutex::new(Cursor {
                 folded: 13,
