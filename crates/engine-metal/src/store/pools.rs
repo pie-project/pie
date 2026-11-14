@@ -1263,10 +1263,16 @@ impl Pools {
         (offset, self.pool.bytes() - offset)
     }
 
-    /// The device bytes the span's backed segments hold, from the load on.
+    /// The device bytes the span's backed segments hold.
     #[must_use]
     pub fn span_held_bytes(&self) -> u64 {
         self.pool.top_held_bytes()
+    }
+
+    /// The span's bytes, backed or not, which the ledger holds reserved.
+    #[must_use]
+    pub fn span_reserved_bytes(&self) -> u64 {
+        self.pool.top_bytes()
     }
 
     /// `into.len()` bytes at `offset` of the pool's buffer, read on the host.

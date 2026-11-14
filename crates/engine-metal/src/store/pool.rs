@@ -297,12 +297,20 @@ impl Pool {
         Ok(())
     }
 
+    /// Backs the top down to [`Pool::top_want`]. Its bytes are reserved
+    /// from the load (the ledger's fire class), so the budget never refuses
+    /// it; a heap the system refuses is [`Fault::Refused`], which the
+    /// runtime takes as a refused raise or lend, never a fault mid-fire.
     fn back_top(&mut self) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
             let want = self.top_want();
             let Backing::Sparse { store, .. } = &mut self.backing;
-            store.map_top(want)?;
+            let need = store.top_mapped_from().saturating_sub(want);
+            store.map_top(want).map_err(|fault| match fault {
+                Fault::Ceiling { .. } => Fault::Refused { bytes: need },
+                other => other,
+            })?;
         }
         Ok(())
     }
@@ -311,6 +319,13 @@ impl Pool {
     #[must_use]
     pub fn committed_span(&self) -> u32 {
         self.span
+    }
+
+    /// The top's bytes, backed or not: the span from the heap seam under
+    /// the segment it starts in, which the ledger holds reserved.
+    #[must_use]
+    pub fn top_bytes(&self) -> u64 {
+        self.bytes() - self.pinned_from()
     }
 
     /// Where the top's backed bytes start: the range's end where none are.

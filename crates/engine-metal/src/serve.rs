@@ -1614,8 +1614,8 @@ impl Shell {
             (State, "guest instances", guest_state),
             (
                 Fire,
-                "activation span (arena, kernel scratch)",
-                self.pools.span_held_bytes(),
+                "activation span (arena, kernel scratch), reserved",
+                self.pools.span_reserved_bytes(),
             ),
             (
                 Fire,
@@ -1657,7 +1657,10 @@ impl Shell {
     /// The ledger against what the device holds for this process now.
     #[must_use]
     pub fn audit(&self) -> engine::memory::Audit {
-        self.ledger().audit(self.device.allocated())
+        // The span is entered whole, backed or not: the bytes it has not
+        // backed yet are the device's too, as far as the ledger counts.
+        let unbacked = self.pools.span_reserved_bytes() - self.pools.span_held_bytes();
+        self.ledger().audit(self.device.allocated() + unbacked)
     }
 
     pub fn bind_thread(&self) -> Result<()> {
