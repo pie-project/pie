@@ -36,11 +36,13 @@ use crate::error::{Fault, Result};
 pub const SEGMENT_BYTES: u64 = 64 << 20;
 
 /// The most buffers a pool's range spans: a kv page id carries its
-/// buffer in its top two bits ([`Pool::page_id`]).
+/// buffer in the two bits over [`PART_SHIFT`] ([`Pool::page_id`]).
 pub const MAX_PARTS: usize = 4;
 
-/// The bits of a kv page id under its buffer index.
-pub const PART_SHIFT: u32 = 30;
+/// The bits of a kv page id under its buffer index: 29, so an id in the
+/// last buffer stays under `i32::MAX`, as the page tables kernels read
+/// hold it (`kv_page.h`'s `pie_page_at` decodes the same split).
+pub const PART_SHIFT: u32 = 29;
 
 thread_local! {
     /// A cap on each buffer's bytes below the device's own, for tests that

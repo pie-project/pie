@@ -1410,6 +1410,7 @@ mod tests {
                     id: pooled,
                     instance,
                     rings,
+                    adapter: Vec::new(),
                 },
             )
             .expect("the slots rebind");

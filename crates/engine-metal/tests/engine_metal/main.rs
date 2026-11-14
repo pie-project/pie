@@ -4,6 +4,7 @@ mod a_buffered_fold_is_the_fold_it_replaces;
 mod a_column_cut_of_a_bank_multiplies_as_its_copy;
 mod a_copied_window_is_one_encode_over_the_same_rows;
 mod a_fenced_frame_lands_both_sides;
+mod a_forked_lane_serves_the_unforked_logits;
 mod a_gate_and_an_up_apart_land_what_they_land_packed;
 mod a_parked_lane_serves_the_never_parked_logits;
 mod a_prompt_scan_lands_its_snapshots;
