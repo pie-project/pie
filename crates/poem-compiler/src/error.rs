@@ -17,8 +17,6 @@ pub enum Error {
     AliasOutside { holds: ValueId, shares: ValueId },
     #[error("the budgets {what}")]
     Budget { what: &'static str },
-    #[error("{}", adapter_capacity(*.asked, *.seated))]
-    AdapterCapacity { asked: u32, seated: u64 },
     #[error("the device profile {what}")]
     Profile { what: &'static str },
     #[error("{}", class_faults(.0))]
@@ -111,23 +109,6 @@ impl Error {
                 .join("\n"),
             other => other.to_string(),
         }
-    }
-}
-
-fn adapter_capacity(asked: u32, seated: u64) -> String {
-    if seated == 0 {
-        format!(
-            "the budgets ask to register {asked} adapters and this plan \
-             declares no bank at all: a bank is a weight the model text \
-             marked `registered`, and capacity is its leading axis"
-        )
-    } else {
-        format!(
-            "the budgets ask to register {asked} adapters and the narrowest \
-             bank of this plan seats {seated}; capacity is a shape the \
-             model text declares, so one of the two numbers has to move \
-             before the load and not at a registration"
-        )
     }
 }
 

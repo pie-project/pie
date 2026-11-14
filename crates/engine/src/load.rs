@@ -9,7 +9,6 @@ pub struct Budgets {
     pub max_lanes: u32,
     pub max_tokens: u32,
     pub buckets: Vec<u32>,
-    pub max_adapters: u32,
     pub page_size: u32,
     pub max_context: u32,
     /// `max_context` is the model's own declared context, not one the
@@ -34,7 +33,6 @@ impl Default for Budgets {
             max_lanes: 256,
             max_tokens: 8192,
             buckets: Vec::new(),
-            max_adapters: 0,
             page_size: 16,
             max_context: 4096,
             context_declared: false,

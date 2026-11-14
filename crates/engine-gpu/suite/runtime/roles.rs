@@ -207,7 +207,6 @@ fn an_instance_in_pool_slots_fires_through_moves() {
                 max_lanes: 4,
                 max_tokens: 16,
                 buckets: vec![16],
-                max_adapters: 0,
                 page_size: 16,
                 max_context: 64,
                 context_declared: false,

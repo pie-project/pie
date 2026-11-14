@@ -356,7 +356,6 @@ fn budget() -> poem_compiler::Budget {
         max_lanes: 64,
         max_tokens: 4096,
         buckets: vec![64, 256, 1024, 4096],
-        max_adapters: 0,
         readouts_per_lane: poem_compiler::arena::READOUTS_PER_LANE,
     }
 }

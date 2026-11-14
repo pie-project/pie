@@ -469,7 +469,6 @@ impl Rig {
                     max_lanes: 8,
                     max_tokens,
                     buckets,
-                    max_adapters: 0,
                     page_size: 16,
                     max_context: 64,
                     context_declared: false,

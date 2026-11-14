@@ -222,7 +222,6 @@ mod tests {
             max_lanes: 8,
             max_tokens: 4096,
             buckets: vec![64, 4096],
-            max_adapters: 0,
             readouts_per_lane: poem_compiler::arena::READOUTS_PER_LANE,
         };
         let compiled =

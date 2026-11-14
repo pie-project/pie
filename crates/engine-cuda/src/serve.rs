@@ -104,7 +104,6 @@ pub struct Shell {
     staging: Vec<bool>,
     schedule_readers: Vec<Option<u32>>,
     adapter_fact: Option<u32>,
-    adapters: crate::blob::Adapters,
     held: Vec<u32>,
     readout_rows: crate::device::Buffer,
     exports: Exports,
@@ -667,10 +666,6 @@ impl Shell {
         self.predicate.lands_snapshots()
     }
 
-    pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {
-        self.adapters.mount(root);
-    }
-
     /// Lands `instance`'s adapter, each bank's plane (`planes`, by bank
     /// name) in its `Adapter` slot of `refs`, ahead of every fire that
     /// reads it.
@@ -738,11 +733,6 @@ impl Shell {
         self.compiled
             .classes
             .adapted_word(&self.corrected, bit, word)
-    }
-
-    #[must_use]
-    pub fn adapters(&self) -> &crate::blob::Adapters {
-        &self.adapters
     }
 
     pub fn open(&mut self, slot: u32) -> Result<()> {

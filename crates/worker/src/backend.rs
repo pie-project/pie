@@ -3,7 +3,9 @@ pub mod flavor;
 use std::path::Path;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow};
+#[cfg(feature = "engine-cuda")]
+use anyhow::Context;
+use anyhow::{Result, anyhow};
 
 #[cfg(feature = "engine-cuda")]
 use runtime::engine::backend::{DeviceBoot, Diagnostics, Knobs, Transport, World, ordinal_of};
@@ -139,11 +141,7 @@ const CUDA_PAGE_SIZE: u32 = 16;
 const CUDA_FIRE_LANES: u32 = 512;
 
 #[cfg(any(feature = "engine-cuda", test))]
-fn cuda_budgets(
-    adapter_seats: u32,
-    max_context: Option<u32>,
-    declared: Option<u32>,
-) -> engine::Budgets {
+fn cuda_budgets(max_context: Option<u32>, declared: Option<u32>) -> engine::Budgets {
     let page_size = CUDA_PAGE_SIZE;
     let stated = max_context.filter(|&len| len > 0);
     // Unstated: the context the model declares (the engine shortens it to
@@ -159,7 +157,6 @@ fn cuda_budgets(
         // the profile says nothing, and fits the rungs to the card.
         max_tokens: 0,
         buckets: Vec::new(),
-        max_adapters: adapter_seats,
         page_size,
         max_context,
         context_declared,
@@ -173,12 +170,7 @@ fn cuda_budgets(
 }
 
 #[cfg(feature = "engine-cuda")]
-fn device_boot(
-    opts: &CudaEngineOptions,
-    home: &Path,
-    cache_dir: &Path,
-    adapter_dir: Option<&Path>,
-) -> Result<DeviceBoot> {
+fn device_boot(opts: &CudaEngineOptions, home: &Path, cache_dir: &Path) -> Result<DeviceBoot> {
     let mut knobs = Knobs {
         profiles: Some(home.join("profiles")),
         ..Knobs::default()
@@ -208,7 +200,6 @@ fn device_boot(
         comm: None,
         knobs,
         cache_dir: Some(cache_dir.to_path_buf()),
-        adapter_dir: adapter_dir.map(Path::to_path_buf),
     })
 }
 
@@ -272,40 +263,6 @@ fn land(
     Ok((loaded, deployment, disk_kv_dir))
 }
 
-fn register_operator_adapters(
-    backend: &mut runtime::engine::EngineBox,
-    adapters: &crate::config::AdapterConfig,
-) -> Result<()> {
-    for adapter in &adapters.registered {
-        let mut planes = Vec::with_capacity(adapter.planes.len());
-        for (bank, path) in &adapter.planes {
-            let bytes = std::fs::read(path).with_context(|| {
-                format!(
-                    "read the plane for bank {bank:?} of adapter {} from {path:?}",
-                    adapter.id
-                )
-            })?;
-            planes.push(engine::AdapterPlane {
-                bank: bank.clone(),
-                bytes,
-            });
-        }
-        let registration = engine::AdapterRegistration {
-            id: adapter.id,
-            planes,
-        };
-        runtime::engine::verbs::register_adapter(backend, &registration).with_context(|| {
-            format!("registering adapter {} into this model's banks", adapter.id)
-        })?;
-        tracing::info!(
-            id = adapter.id,
-            planes = adapter.planes.len(),
-            "registered an operator-declared adapter into this model's banks"
-        );
-    }
-    Ok(())
-}
-
 #[cfg(feature = "engine-cuda")]
 /// The context the model at `snapshot_dir` declares, stretched by the yarn
 /// factor a deployment turns at past the config.
@@ -338,10 +295,8 @@ pub(crate) fn create_engine_backend_group(
     rank_options: &[EngineOptions],
     snapshot_dir: &Path,
     home: &Path,
-    adapter_dir: Option<&Path>,
     group_id: usize,
     frames_in_flight: u8,
-    adapters: &crate::config::AdapterConfig,
     residency: engine::Residency,
     max_context: Option<u32>,
     overrides: &runtime::engine::load::Overrides,
@@ -361,7 +316,7 @@ pub(crate) fn create_engine_backend_group(
         let EngineOptions::Cuda(opts) = rank_options else {
             return Err(anyhow!("cuda group creation requires cuda rank options"));
         };
-        let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
+        let boot = device_boot(opts, home, cache_dir)?;
         if opts.verbose {
             dump_device_boot(home, &boot, group_id, Some(rank));
         }
@@ -383,18 +338,12 @@ pub(crate) fn create_engine_backend_group(
         &mut backend,
         snapshot_dir,
         cache_dir,
-        cuda_budgets(
-            adapters.seats(),
-            max_context,
-            declared_context(snapshot_dir, overrides),
-        ),
+        cuda_budgets(max_context, declared_context(snapshot_dir, overrides)),
         residency,
         poem_ir::Platform::Cuda,
         frames_in_flight,
         overrides,
     )?;
-    register_operator_adapters(&mut backend, adapters)?;
-
     Ok(GroupEngine {
         deployment,
         caps: loaded.caps,
@@ -414,9 +363,7 @@ pub(crate) fn create_engine_lockstep(
     rank_options: &[EngineOptions],
     snapshot_dir: &Path,
     home: &Path,
-    adapter_dir: Option<&Path>,
     frames_in_flight: u8,
-    adapters: &crate::config::AdapterConfig,
     residency: engine::Residency,
     max_context: Option<u32>,
     overrides: &runtime::engine::load::Overrides,
@@ -434,7 +381,7 @@ pub(crate) fn create_engine_lockstep(
                 "an expert-parallel group requires cuda rank options"
             ));
         };
-        let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
+        let boot = device_boot(opts, home, cache_dir)?;
         if opts.verbose {
             dump_device_boot(home, &boot, rank, Some(rank));
         }
@@ -442,11 +389,7 @@ pub(crate) fn create_engine_lockstep(
     }
     let ep = u32::try_from(boots.len()).context("a rank count fits u32")?;
     let backends = runtime::engine::backend::open::cuda_lockstep(boots)?;
-    let budgets = cuda_budgets(
-        adapters.seats(),
-        max_context,
-        declared_context(snapshot_dir, overrides),
-    );
+    let budgets = cuda_budgets(max_context, declared_context(snapshot_dir, overrides));
     let landed: Vec<Result<GroupEngine>> = std::thread::scope(|scope| {
         let loads: Vec<_> = backends
             .into_iter()
@@ -471,7 +414,6 @@ pub(crate) fn create_engine_lockstep(
                         &overrides,
                     )
                     .with_context(|| format!("loading expert-parallel rank {rank}"))?;
-                    register_operator_adapters(&mut backend, adapters)?;
                     Ok(GroupEngine {
                         deployment,
                         caps: loaded.caps,
@@ -508,17 +450,15 @@ pub(crate) fn create_engine_backend(
     options: &EngineOptions,
     snapshot_dir: &Path,
     home: &Path,
-    adapter_dir: Option<&Path>,
     group_id: usize,
     frames_in_flight: u8,
-    adapters: &crate::config::AdapterConfig,
     residency: engine::Residency,
     max_context: Option<u32>,
     overrides: &runtime::engine::load::Overrides,
     opened: Option<runtime::engine::EngineBox>,
 ) -> Result<GroupEngine> {
     let cache_dir = &crate::disk::engine_cache_dir(home);
-    let _ = (group_id, adapter_dir, &opened);
+    let _ = (group_id, &opened);
     validate_snapshot_dir(snapshot_dir)?;
 
     let (mut backend, budgets, platform): (
@@ -537,18 +477,14 @@ pub(crate) fn create_engine_backend(
         _ => unreachable!("`EngineOptions` has no variants in this build"),
         #[cfg(feature = "engine-cuda")]
         EngineOptions::Cuda(opts) => {
-            let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
+            let boot = device_boot(opts, home, cache_dir)?;
             if opts.verbose {
                 dump_device_boot(home, &boot, group_id, None);
             }
             let backend = runtime::engine::backend::open::cuda(boot)?;
             (
                 backend,
-                cuda_budgets(
-                    adapters.seats(),
-                    max_context,
-                    declared_context(snapshot_dir, overrides),
-                ),
+                cuda_budgets(max_context, declared_context(snapshot_dir, overrides)),
                 poem_ir::Platform::Cuda,
             )
         }
@@ -565,12 +501,6 @@ pub(crate) fn create_engine_backend(
                 "profiles = {}\n",
                 toml::Value::String(home.join("profiles").display().to_string())
             ));
-            if let Some(mount) = adapter_dir {
-                boot_doc.push_str(&format!(
-                    "\n[model]\nadapter_dir = {}\n",
-                    toml::Value::String(mount.display().to_string())
-                ));
-            }
             let backend = opened.map_or_else(
                 || runtime::engine::backend::open::metal(boot_doc.as_bytes()),
                 Ok,
@@ -584,7 +514,6 @@ pub(crate) fn create_engine_backend(
                     max_lanes,
                     max_tokens,
                     buckets: Vec::new(),
-                    max_adapters: adapters.seats(),
                     page_size,
                     max_context,
                     context_declared: false,
@@ -626,7 +555,6 @@ pub(crate) fn create_engine_backend(
                     max_lanes,
                     max_tokens,
                     buckets: Vec::new(),
-                    max_adapters: adapters.seats(),
                     page_size: defaults.page_size,
                     max_context: max_context.unwrap_or(defaults.max_context),
                     context_declared: false,
@@ -668,7 +596,6 @@ pub(crate) fn create_engine_backend(
                     max_lanes,
                     max_tokens,
                     buckets: Vec::new(),
-                    max_adapters: adapters.seats(),
                     page_size: defaults.page_size,
                     max_context: max_context.unwrap_or(defaults.max_context),
                     context_declared: false,
@@ -713,7 +640,6 @@ pub(crate) fn create_engine_backend(
                     max_lanes,
                     max_tokens,
                     buckets: Vec::new(),
-                    max_adapters: adapters.seats(),
                     page_size: defaults.page_size,
                     max_context: max_context
                         .filter(|&len| len > 0)
@@ -779,7 +705,6 @@ pub(crate) fn create_engine_backend(
                     max_lanes,
                     max_tokens,
                     buckets: Vec::new(),
-                    max_adapters: adapters.seats(),
                     page_size: defaults.page_size,
                     max_context: max_context
                         .filter(|&len| len > 0)
@@ -825,8 +750,6 @@ pub(crate) fn create_engine_backend(
         frames_in_flight,
         overrides,
     )?;
-
-    register_operator_adapters(&mut backend, adapters)?;
 
     Ok(GroupEngine {
         deployment,
@@ -874,7 +797,7 @@ mod tests {
     }
 
     fn the_rungs_and_ladders_are_the_engines_to_derive() {
-        let derived = cuda_budgets(0, None, None);
+        let derived = cuda_budgets(None, None);
         assert_eq!(derived.max_tokens, 0, "the card's largest rung");
         assert_eq!(
             (derived.max_patches, derived.max_images),
@@ -885,11 +808,11 @@ mod tests {
     }
 
     fn the_pool_budget_seats_by_state_slots_not_pages() {
-        let budgets = cuda_budgets(0, None, None);
+        let budgets = cuda_budgets(None, None);
         assert_eq!(budgets.page_size, 16);
         assert_eq!(budgets.max_context, 4096);
         assert_eq!(budgets.slots, 0, "the engine's chip sizes the slab");
-        let capped = cuda_budgets(0, Some(2048), Some(32_768));
+        let capped = cuda_budgets(Some(2048), Some(32_768));
         assert_eq!(capped.max_context, 2048, "`[engine] max_context` caps it");
         assert!(!capped.context_declared);
     }

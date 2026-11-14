@@ -142,8 +142,10 @@ removed_keys! {
         "a kv page is the compiler's chunk plan";
     DeviceMemory = "device_memory":
         "the load measures the device; where the adapter says nothing, state `[engine.memory] budget_device`";
-    AdapterSeats = "seats":
-        "an adapter's room is not configured: its planes lie in the pool's `Adapter` slots, which the runtime takes when an instance binds a program that carries one and gives back when it closes (the CUDA engine; the others keep the banks the model text sizes), so the pool's room is the only bound; `[[model.adapters.registered]]` ids number the roster alone";
+    Adapters = "adapters":
+        "no adapter is the operator's on any engine: an adapter is an inferlet's, its planes the seeds of its program's `lora` sink, landed in the pool's `Adapter` slots when its instance binds (shared by every instance that lands the same planes) and given back at the last close";
+    AdapterDir = "adapter_dir":
+        "no adapter is the operator's on any engine, so there is no shared adapter directory to mount: an adapter is an inferlet's, its planes the seeds of its program's `lora` sink, landed in the pool's `Adapter` slots when its instance binds";
 }
 
 /// The refusal for `key` (dotted or bare) if it names a removed key.

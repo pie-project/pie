@@ -13,7 +13,7 @@ use std::io::Write;
 use poem_compiler::catalog::{deployments, splits};
 use poem_compiler::{Budget, Budgets, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_compiler::{VoxelLadder, compile_axes, fuse, shard};
-use poem_ir::{ParamSource, Platform, RowAxis, Trace, Ty};
+use poem_ir::{Platform, RowAxis, Trace, Ty};
 
 const PLATFORMS: [Platform; 6] = [
     Platform::Cuda,
@@ -65,20 +65,12 @@ fn states(trace: &Trace, axis: RowAxis) -> bool {
 
 /// The budgets a serving shell derives for `trace` (the tests' `budgets_of`).
 fn budgets_of(trace: &Trace) -> Budgets {
-    let seats = trace
-        .params
-        .iter()
-        .filter(|param| param.source == ParamSource::Registered)
-        .map(|param| param.shape.first().copied().unwrap_or(0))
-        .min()
-        .unwrap_or(0);
     let budget = Budget {
         max_lanes: 256,
         max_tokens: 8192,
         buckets: vec![
             1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
         ],
-        max_adapters: u32::try_from(seats).unwrap_or(u32::MAX),
         readouts_per_lane: poem_compiler::arena::READOUTS_PER_LANE,
     };
     let mut budgets = Budgets::of(budget.clone());

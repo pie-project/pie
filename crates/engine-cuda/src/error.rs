@@ -96,11 +96,6 @@ pub enum Fault {
         why: String,
     },
 
-    Blob {
-        path: String,
-        why: String,
-    },
-
     Straddled {
         value: u32,
         node: u32,
@@ -280,9 +275,6 @@ impl fmt::Display for Fault {
             ),
             Self::Adapter { bank, why } => {
                 write!(f, "the adapter bank `{bank}` {why}")
-            }
-            Self::Blob { path, why } => {
-                write!(f, "the shared adapter `{path}` {why}")
             }
             Self::Straddled {
                 value,

@@ -151,7 +151,6 @@ pub fn request(trace: &Trace, checkpoint: &Path) -> LoadRequest {
             max_lanes: 2,
             max_tokens: 256,
             buckets: vec![16, 64, 256],
-            max_adapters: 0,
             page_size: 16,
             max_context: 256,
             context_declared: false,

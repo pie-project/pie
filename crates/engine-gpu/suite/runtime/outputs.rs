@@ -181,7 +181,6 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
                 max_lanes: 4,
                 max_tokens: 16,
                 buckets: vec![16],
-                max_adapters: 0,
                 page_size: 16,
                 max_context: 64,
                 context_declared: false,

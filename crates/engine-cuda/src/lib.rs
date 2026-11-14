@@ -190,7 +190,7 @@ pub use serve::{
     Recording, Seal, Seated, Shell,
 };
 
-pub use blob::{Adapters, Site as AdapterSite, layer_of, role_of, site_of};
+pub use blob::{Site as AdapterSite, layer_of, role_of, site_of};
 pub use weights::BankSeat;
 pub use window::{Cursor, Window, WindowShape, Windows};
 

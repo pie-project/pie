@@ -167,7 +167,6 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
                 max_lanes: 4,
                 max_tokens: 64,
                 buckets: vec![32, 64],
-                max_adapters: 0,
                 page_size: 16,
                 max_context: 64,
                 context_declared: false,

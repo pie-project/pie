@@ -218,7 +218,6 @@ fn four_ranks_land_what_one_rank_lands() {
                 max_lanes: 8,
                 max_tokens: 64,
                 buckets: vec![16, 64],
-                max_adapters: 0,
                 page_size: 16,
                 max_context: 64,
                 context_declared: false,

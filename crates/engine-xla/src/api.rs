@@ -242,7 +242,6 @@ fn bake_budgets(budgets: &LoadBudgets) -> Budget {
         max_lanes: budgets.max_lanes,
         max_tokens: budgets.max_tokens,
         buckets: budgets.buckets.clone(),
-        max_adapters: budgets.max_adapters,
         readouts_per_lane: poem_compiler::arena::READOUTS_PER_LANE,
     }
 }

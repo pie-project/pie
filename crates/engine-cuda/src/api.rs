@@ -45,7 +45,6 @@ pub struct DeviceBoot {
     pub comm: Option<Arc<crate::comm::Comm>>,
     pub knobs: Knobs,
     pub cache_dir: Option<std::path::PathBuf>,
-    pub adapter_dir: Option<std::path::PathBuf>,
 }
 
 pub(crate) struct PendingStep {
@@ -305,7 +304,6 @@ fn fault(fault: Fault) -> Error {
         | Fault::Unlowered { .. }
         | Fault::Region { .. }
         | Fault::Golden { .. } => Error::Load(fault.to_string()),
-        Fault::Blob { .. } => Error::Load(fault.to_string()),
         Fault::OutOfMemory { need, have } => Error::Exhausted {
             resource: "device memory",
             wanted: need,
@@ -423,7 +421,6 @@ fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
         max_lanes: budgets.max_lanes,
         max_tokens: budgets.max_tokens,
         buckets: budgets.buckets.clone(),
-        max_adapters: budgets.max_adapters,
         readouts_per_lane: poem_compiler::arena::readouts_per_lane(trace),
     }
 }
@@ -737,7 +734,6 @@ impl Engine for Cuda {
         }
         let mut shell = staged.finish().map_err(fault)?;
 
-        shell.mount_adapters(self.boot.adapter_dir.clone());
         let host_kv_pages = shell
             .seat_host_kv(
                 residency.host_kv_budget,
@@ -1410,7 +1406,11 @@ impl Cuda {
                 at,
                 sink: std::sync::Arc::clone(sink),
             });
-        if let Some(at) = submission.lanes.iter().position(|lane| lane.adapter.is_some()) {
+        if let Some(at) = submission
+            .lanes
+            .iter()
+            .position(|lane| lane.adapter.is_some())
+        {
             return Err(Error::Invalid(format!(
                 "lane {at} names an adapter id itself, and this engine reads an adapter \
                  through the instance that landed it: attach the lane to that instance"
@@ -1975,6 +1975,9 @@ mod adapter_key_tests {
         let a: Vec<u8> = (0x00..=0x0f).collect();
         let b: Vec<u8> = (100..=123).collect();
         let key = adapter_digest(5, &[("lora_a", &a), ("lora_b", &b)]);
-        assert_eq!(key, 0x48d3_ea2e_650c_f1e9_8eff_b3e0_9bc8_eb41, "{key:#034x}");
+        assert_eq!(
+            key, 0x48d3_ea2e_650c_f1e9_8eff_b3e0_9bc8_eb41,
+            "{key:#034x}"
+        );
     }
 }

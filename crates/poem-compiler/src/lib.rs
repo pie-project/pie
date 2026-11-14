@@ -70,7 +70,6 @@ pub fn compile_axes(
 }
 
 fn accept(trace: &Trace, budgets: &Budgets, profile: &DeviceProfile) -> Result<(), Error> {
-    let budget = &budgets.tokens;
     let facts = poem_ir::fact_width(trace);
     if facts > MAX_FACTS {
         return Err(Error::TooManyFacts { facts });
@@ -92,30 +91,6 @@ fn accept(trace: &Trace, budgets: &Budgets, profile: &DeviceProfile) -> Result<(
         return Err(Error::Profile {
             what: "describes a device with no streaming multiprocessors",
         });
-    }
-
-    if budget.max_adapters > 0 {
-        let seats = trace
-            .params
-            .iter()
-            .filter(|param| param.source == poem_ir::ParamSource::Registered)
-            .map(|param| param.shape.first().copied().unwrap_or(0))
-            .min();
-        match seats {
-            None => {
-                return Err(Error::AdapterCapacity {
-                    asked: budget.max_adapters,
-                    seated: 0,
-                });
-            }
-            Some(seated) if seated < u64::from(budget.max_adapters) => {
-                return Err(Error::AdapterCapacity {
-                    asked: budget.max_adapters,
-                    seated,
-                });
-            }
-            Some(_) => {}
-        }
     }
 
     Ok(())

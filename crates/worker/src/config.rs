@@ -496,11 +496,9 @@ pub struct ModelConfig {
     /// artifact store at `$PIE_HOME/artifacts`).
     #[serde(default)]
     pub weight_cache_dir: String,
-    /// Where this deployment's shared adapters live, or empty to mount none.
-    /// A read-only directory with one subdirectory per adapter, each holding
-    /// an `adapter.toml` and the plane files it names.
-    #[serde(default)]
-    pub adapter_dir: String,
+    /// Removed: no adapter is the operator's.
+    #[serde(default, skip_serializing)]
+    pub adapter_dir: Removed<removed::AdapterDir>,
     /// Dtype weights are materialized in. Separate from `activation_dtype`
     /// (in `[engine]`, the dtype compute happens in) — narrower weights and
     /// wider compute is a normal combination.
@@ -551,88 +549,16 @@ pub struct ModelConfig {
     /// Removed: the voxel ladder is derived.
     #[serde(default, skip_serializing)]
     pub max_clips: Removed<removed::MaxClips>,
-    /// Which adapters to register at boot. Absent means none.
-    #[serde(default)]
-    pub adapters: AdapterConfig,
+    /// Removed: no adapter is the operator's.
+    #[serde(default, skip_serializing)]
+    pub adapters: Removed<removed::Adapters>,
 }
 
 fn default_weight_dtype() -> String {
     "bfloat16".to_string()
 }
 
-/// What an operator states about LoRA adapters: a roster.
-///
-/// No capacity is configured: an adapter's planes lie in the pool's
-/// `Adapter` slots, taken as instances bind (removed `seats`).
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct AdapterConfig {
-    /// Removed: adapters lie in the pool's `Adapter` slots.
-    #[serde(default, skip_serializing)]
-    pub seats: Removed<removed::AdapterSeats>,
-    /// The adapters to register at boot, in the order given.
-    #[serde(default)]
-    pub registered: Vec<RegisteredAdapter>,
-}
-
-/// One adapter, as an operator names it.
-///
-/// The planes are raw bytes and the padding is the caller's: a file here is
-/// one bank's slot, exactly, in the bank's declared dtype and layout. A file
-/// of the wrong length is refused by the engine, by name, with both numbers.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RegisteredAdapter {
-    /// Which row of every named bank this fills — the id a lane routes to.
-    pub id: u32,
-    /// Bank name (the plan's own `Param` spelling) to the file holding one
-    /// slot of it. A bank this map omits keeps what it held.
-    #[serde(default)]
-    pub planes: std::collections::BTreeMap<String, String>,
-}
-
-impl AdapterConfig {
-    /// The rows the roster numbers: a roster whose highest id is `n`
-    /// numbers `n + 1`. What a bank the model text sizes must hold.
-    #[must_use]
-    pub fn seats(&self) -> u32 {
-        self.registered
-            .iter()
-            .map(|adapter| adapter.id.saturating_add(1))
-            .max()
-            .unwrap_or(0)
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.registered.is_empty()
-    }
-
-    /// Checks what this layer can answer without a device: every plane
-    /// path is absolute.
-    fn validate(&self) -> Result<()> {
-        for adapter in &self.registered {
-            for (bank, path) in &adapter.planes {
-                ensure!(
-                    Path::new(path).is_absolute(),
-                    "model.adapters: the plane for bank {bank:?} of adapter {} must be \
-                     an absolute path (got {path:?})",
-                    adapter.id
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
 impl ModelConfig {
-    /// The shared-adapter mount as the boot seam spells it: `Some(path)` when
-    /// the operator stated one, `None` (the feature off) for the empty
-    /// default.
-    pub fn adapter_mount(&self) -> Option<std::path::PathBuf> {
-        (!self.adapter_dir.is_empty()).then(|| std::path::PathBuf::from(&self.adapter_dir))
-    }
-
     /// What this config changes about the deployment its checkpoint states.
     ///
     /// # Errors
@@ -712,13 +638,6 @@ impl ModelConfig {
              leave it empty for $PIE_HOME/cache/weights",
             self.weight_cache_dir
         );
-        ensure!(
-            self.adapter_dir.is_empty() || Path::new(&self.adapter_dir).is_absolute(),
-            "model.adapter_dir must be an absolute path (got {:?}); \
-             leave it empty to mount no shared adapters at all",
-            self.adapter_dir
-        );
-        self.adapters.validate()?;
         Ok(())
     }
 }
@@ -1171,11 +1090,7 @@ device = ["metal:0"]
     /// Every engine kind's `as_str` is the word a config file spells it with;
     /// `as_str` is a hand-written match and nothing ties it to serde's
     /// `rename_all` if they drift.
-    /// `[model.adapters]` absent is the shape hard-coded before it existed:
-    /// zero seats, no roster, and the correction op never launches.
-    /// The capacity is stated once: either the operator says it, or the
-    /// roster does — one number, one owner.
-    /// The two refusals this layer can make without a device.
+    /// Operator-declared adapters are refused, with what replaced them.
     #[test]
     fn config_every_case() {
         an_unknown_key_is_refused();
@@ -1185,9 +1100,7 @@ device = ["metal:0"]
         an_engine_s_own_key_is_written_beside_the_common_ones();
         parses_minimal_metal_config();
         every_engine_kind_round_trips_through_its_config_string();
-        adapters_are_absent_by_default_and_that_is_zero_seats();
-        the_seat_count_is_derived_from_the_roster();
-        an_adapter_on_a_relative_path_is_refused_by_name();
+        an_operator_declared_adapter_is_refused_with_its_replacement();
         an_empty_memory_table_is_the_dedicated_machine();
         the_memory_keys_are_seven_and_prefixed();
         a_removed_key_is_refused_with_why();
@@ -1470,67 +1383,33 @@ device = ["metal:0"]
         );
     }
 
-    fn adapters_are_absent_by_default_and_that_is_zero_seats() {
+    fn an_operator_declared_adapter_is_refused_with_its_replacement() {
         let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.validate().unwrap();
-        assert!(cfg.model.adapters.is_empty());
-        assert_eq!(cfg.model.adapters.seats(), 0);
-        assert!(cfg.model.adapters.registered.is_empty());
-    }
-
-    fn the_seat_count_is_derived_from_the_roster() {
-        let plane = if cfg!(windows) {
-            "C:/adapters/0/a.bin"
-        } else {
-            "/adapters/0/a.bin"
-        };
-        let toml = MINIMAL_METAL.replace(
+        for stated in [
+            "[model.adapters]\n[[model.adapters.registered]]\nid = 0\n",
+            "[model.adapters]\nseats = 8\n",
+        ] {
+            let toml = MINIMAL_METAL.replace(
+                "source = \"Qwen/Qwen3-0.6B\"",
+                &format!("source = \"Qwen/Qwen3-0.6B\"\n\n{stated}"),
+            );
+            let err = toml::from_str::<Config>(&toml)
+                .expect_err("operator-declared adapters are refused")
+                .to_string();
+            assert!(err.contains("`adapters` was removed"), "got: {err}");
+            assert!(
+                err.contains("`Adapter` slots"),
+                "names the replacement: {err}"
+            );
+        }
+        let mounted = MINIMAL_METAL.replace(
             "source = \"Qwen/Qwen3-0.6B\"",
-            &format!(
-                "source = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\n\
-                 [[model.adapters.registered]]\n\
-                 id = 2\n\
-                 planes = {{ \"layer.0.lora_a\" = \"{plane}\" }}\n"
-            ),
+            "source = \"Qwen/Qwen3-0.6B\"\nadapter_dir = \"/srv/adapters\"",
         );
-        let cfg: Config = toml::from_str(&toml).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(cfg.model.adapters.seats(), 3);
-        assert_eq!(cfg.model.adapters.registered.len(), 1);
-        assert_eq!(
-            cfg.model.adapters.registered[0].planes["layer.0.lora_a"],
-            plane
-        );
-
-        let stated = toml.replace("[model.adapters]", "[model.adapters]\nseats = 8");
-        let err = toml::from_str::<Config>(&stated)
-            .expect_err("`seats` is removed")
+        let err = toml::from_str::<Config>(&mounted)
+            .expect_err("a shared adapter mount is refused")
             .to_string();
-        assert!(err.contains("`seats` was removed"), "got: {err}");
-        assert!(err.contains("`Adapter` slots"), "names the replacement: {err}");
-    }
-
-    fn an_adapter_on_a_relative_path_is_refused_by_name() {
-
-        let relative = MINIMAL_METAL.replace(
-            "source = \"Qwen/Qwen3-0.6B\"",
-            "source = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\n\
-             [[model.adapters.registered]]\n\
-             id = 0\n\
-             planes = { \"layer.0.lora_a\" = \"a.bin\" }\n",
-        );
-        let cfg: Config = toml::from_str(&relative).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("must be \n             an absolute path")
-                || err.contains("absolute path"),
-            "got: {err}"
-        );
-
-        let typo = MINIMAL_METAL.replace(
-            "source = \"Qwen/Qwen3-0.6B\"",
-            "source = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\nseat = 2\n",
-        );
-        toml::from_str::<Config>(&typo).expect_err("an unknown key is refused");
+        assert!(err.contains("`adapter_dir` was removed"), "got: {err}");
     }
 }

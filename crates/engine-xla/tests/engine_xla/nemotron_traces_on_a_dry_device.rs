@@ -34,7 +34,6 @@ fn shell(name: &str) -> Shell {
                 max_lanes: 64,
                 max_tokens: 2048,
                 buckets: Vec::new(),
-                max_adapters: 0,
                 readouts_per_lane: poem_compiler::arena::READOUTS_PER_LANE,
             },
             patches: None,

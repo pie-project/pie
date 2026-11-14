@@ -3,7 +3,7 @@ use poem_compiler::{
     Budget, Budgets, CompiledModel, DeviceProfile, Error, PATCH_LATTICE_FLOOR, PatchLadder,
     VoxelLadder, compile_axes,
 };
-use poem_ir::{ParamSource, RowAxis, Trace, Ty};
+use poem_ir::{RowAxis, Trace, Ty};
 
 pub const PLATFORMS: [Platform; 4] = [
     Platform::Cuda,
@@ -12,21 +12,13 @@ pub const PLATFORMS: [Platform; 4] = [
     Platform::Vulkan,
 ];
 
-pub fn budgets_for(trace: &Trace) -> Budget {
-    let seats = trace
-        .params
-        .iter()
-        .filter(|param| param.source == ParamSource::Registered)
-        .map(|param| param.shape.first().copied().unwrap_or(0))
-        .min()
-        .unwrap_or(0);
+pub fn budgets_for() -> Budget {
     Budget {
         max_lanes: 256,
         max_tokens: 8192,
         buckets: vec![
             1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
         ],
-        max_adapters: u32::try_from(seats).unwrap_or(u32::MAX),
         readouts_per_lane: poem_compiler::arena::READOUTS_PER_LANE,
     }
 }
@@ -61,7 +53,7 @@ pub fn patch_ladder_for(budget: &Budget) -> PatchLadder {
 /// The budgets a row's own axes need: a patch ladder for a tower, a voxel
 /// ladder for a VAE, as a serving shell derives them.
 pub fn budgets_of(trace: &Trace) -> Budgets {
-    let budget = budgets_for(trace);
+    let budget = budgets_for();
     let mut budgets = Budgets::of(budget.clone());
     if states(trace, RowAxis::Patches) {
         budgets = budgets.with_patches(patch_ladder_for(&budget));

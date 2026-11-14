@@ -230,7 +230,6 @@ impl Model {
                     max_lanes: knob("LANES", 8),
                     max_tokens: knob("TOKENS", 128),
                     buckets: Vec::new(),
-                    max_adapters: 0,
                     page_size: PAGE,
                     max_context: context,
                     context_declared: false,

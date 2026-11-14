@@ -1502,7 +1502,6 @@ fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
                 max_lanes: 1,
                 max_tokens: TOKENS,
                 buckets: Vec::new(),
-                max_adapters: 0,
                 page_size: PAGE,
                 max_context: CONTEXT,
                 context_declared: false,

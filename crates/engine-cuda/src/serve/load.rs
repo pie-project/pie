@@ -1289,7 +1289,6 @@ impl Shell {
             lane_shifted,
             staging,
             schedule_readers,
-            adapters: crate::blob::Adapters::default(),
             held: vec![0; boot.slots as usize],
             readout_rows,
             exports,
