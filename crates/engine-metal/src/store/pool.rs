@@ -404,6 +404,7 @@ impl Pool {
 
     /// Where the top is to be backed from: the widest carve's start or the
     /// lowest committed span segment's, whichever is lower.
+    #[cfg(target_vendor = "apple")]
     fn top_want(&self) -> u64 {
         let carve = self.bytes().saturating_sub(self.carve);
         let span = u64::from(self.segments() - self.span.min(self.span_segments()))

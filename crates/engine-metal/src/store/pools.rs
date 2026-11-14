@@ -621,7 +621,7 @@ impl Pools {
     /// A pool of `chunks` chunks of `chunk_bytes` holding no state rows:
     /// only the guest shapes (`INSTANCE`, `CHANNEL`), every segment
     /// committed. For tests of what guests place in slots.
-    #[cfg(test)]
+    #[cfg(all(test, target_vendor = "apple"))]
     pub(crate) fn guests_only(device: &Context, chunk_bytes: u64, chunks: u32) -> Result<Pools> {
         Self::guests_over(device, chunk_bytes, chunks, chunks)
     }
@@ -629,7 +629,7 @@ impl Pools {
     /// [`Pools::guests_only`] in segments of `segment` chunks, every
     /// segment committed: under [`super::pool::cap_parts`], a buffer a
     /// segment.
-    #[cfg(test)]
+    #[cfg(all(test, target_vendor = "apple"))]
     pub(crate) fn guests_over(
         device: &Context,
         chunk_bytes: u64,

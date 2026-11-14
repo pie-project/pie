@@ -403,6 +403,10 @@ impl Context {
         *self.indirect.borrow_mut() = slabs;
     }
 
+    /// No device off Apple: no pass to declare anything to.
+    #[cfg(not(target_vendor = "apple"))]
+    pub(crate) fn reach_indirectly(&self, _slabs: Vec<super::alloc::Slab>) {}
+
     pub fn frame(&self) -> Result<Frame> {
         #[cfg(target_vendor = "apple")]
         {
@@ -537,6 +541,12 @@ impl Frame {
         if let Some(blit) = self.blit.take() {
             blit.endEncoding();
         }
+    }
+
+    /// No device off Apple: no pass to open.
+    #[cfg(not(target_vendor = "apple"))]
+    pub(crate) fn next_pass(&mut self) -> Result<()> {
+        Err(Fault::Deviceless)
     }
 
     #[cfg(target_vendor = "apple")]
