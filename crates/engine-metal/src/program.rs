@@ -601,17 +601,21 @@ impl Plane {
         })
     }
 
-    /// Each live (program, extents) pair's fire term, once a pair.
-    pub fn live_terms(&self) -> Result<Vec<engine::FireFacts>> {
-        let mut pairs: Vec<(ProgramId, Extents)> = Vec::new();
+    /// Each live (program, extents) pair's fire term, once a pair, with each
+    /// pair's live instances: no fire carries more lanes of a
+    /// pair than it has bound, as the runtime counts the term.
+    pub fn live_terms(&self) -> Result<Vec<(engine::FireFacts, u64)>> {
+        let mut pairs: Vec<((ProgramId, Extents), u64)> = Vec::new();
         for bound in self.instances.values() {
-            if !pairs.contains(&(bound.program_id, bound.extents)) {
-                pairs.push((bound.program_id, bound.extents));
+            let pair = (bound.program_id, bound.extents);
+            match pairs.iter_mut().find(|(seen, _)| *seen == pair) {
+                Some((_, live)) => *live += 1,
+                None => pairs.push((pair, 1)),
             }
         }
         pairs
             .iter()
-            .map(|(program, extents)| self.fire_facts(*program, extents))
+            .map(|((program, extents), live)| Ok((self.fire_facts(*program, extents)?, *live)))
             .collect()
     }
 
@@ -690,10 +694,16 @@ impl Plane {
                 }
                 for (key, mut group) in groups {
                     let Some(key) = key else {
-                        for prepared in group {
+                        // Each member's scratch is taken one under another,
+                        // so one fill zeroes them all, not a blit a member.
+                        #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
+                        let mark = room.mark();
+                        for prepared in group.iter_mut() {
                             prepared.seat_scratch(room.take(prepared.scratch_bytes())?);
-                            #[cfg(target_vendor = "apple")]
-                            prepared.zero_scratch_on(frame)?;
+                        }
+                        #[cfg(target_vendor = "apple")]
+                        room.zero_since(mark, frame)?;
+                        for prepared in group {
                             for region in stage.regions.iter() {
                                 prepared.encode_into(frame, region)?;
                             }
@@ -887,6 +897,25 @@ impl GuestCarve {
             next: top,
             floor,
         }
+    }
+
+    /// Where the next take ends: what [`GuestCarve::zero_since`] zeroes
+    /// down from.
+    #[must_use]
+    pub fn mark(&self) -> u64 {
+        self.next
+    }
+
+    /// Zeroes everything taken since `mark` in `frame`, in one fill: the
+    /// scratch of every member a stage seated one after another.
+    #[cfg(target_vendor = "apple")]
+    pub fn zero_since(&self, mark: u64, frame: &mut crate::device::ctx::Frame) -> Result<()> {
+        if mark <= self.next || crate::diag::on().scratch_no_zero {
+            return Ok(());
+        }
+        frame.fill(self.buffer.slab(), self.next, mark - self.next)?;
+        frame.next_pass()?;
+        Ok(())
     }
 
     /// `bytes` of the region, below what was taken.

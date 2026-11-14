@@ -1705,23 +1705,30 @@ impl Prepared {
         }
     }
 
+    /// Fires `region` in a frame of its own; `zero` first zeroes the seated
+    /// scratch in that same frame (a stage's first region), so the zeroing
+    /// costs no submission and no wait of its own.
     pub fn launch_region(
-        &self,
+        &mut self,
         device: &Context,
         pipelines: &crate::device::Pipelines,
         rings: &Rings,
         region: &Region,
+        zero: bool,
     ) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
             let _ = (pipelines, rings);
-            let frame = device.frame()?;
+            let mut frame = device.frame()?;
+            if zero {
+                self.zero_scratch_on(&mut frame)?;
+            }
             self.encode_into(&frame, region)?;
             frame.commit()
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            let _ = (device, pipelines, rings, region);
+            let _ = (device, pipelines, rings, region, zero);
             Err(Fault::Deviceless)
         }
     }

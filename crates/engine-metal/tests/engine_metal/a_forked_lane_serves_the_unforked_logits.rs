@@ -102,7 +102,7 @@ fn serve(fixture: &Fixture, fork: Fork) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
     let list = per(LIST).expect("a kv list");
     let fixed = per(FIXED);
     let layout = shell.pool_layout();
-    let first = (1 + layout.seat_chunks()).div_ceil(segment) * segment;
+    let first = layout.free_chunk().div_ceil(segment) * segment;
     // The fork's slots start a segment (a buffer) past the first lane's.
     let second = first + segment;
     shell

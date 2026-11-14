@@ -345,6 +345,9 @@ impl Context {
     pub(crate) fn empty(&self) -> super::alloc::Slab {
         #[cfg(target_vendor = "apple")]
         {
+            // One byte every empty binding shares: one of the three tiny
+            // fixed buffers outside the pool (this, the keepalive sink, the
+            // warm-load bind placeholder), left there by ruling.
             self.empty
                 .get_or_init(|| {
                     RESERVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

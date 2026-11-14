@@ -152,6 +152,11 @@ pub struct Layout {
     /// apart.
     pub act: [(u32, u32); MAX_RUNGS],
     pub act_rungs: usize,
+    /// The engine's own tables (`Reserved::Tables`): this many chunks right
+    /// after the null chunk, laid at the load ([`super::Pools::tables`]):
+    /// the registered adapter banks, the weight caches' atom tables and use
+    /// counters and the state maps. The seat runs lie past them.
+    pub tables: u32,
 }
 
 impl Layout {
@@ -185,6 +190,7 @@ impl Layout {
             channel: Slots::of(CHANNEL, CHANNEL_SLOT, chunk_bytes),
             act: [(0, 0); MAX_RUNGS],
             act_rungs: 0,
+            tables: 0,
         };
         if let Some(shape) = layout.shapes().find(|s| s.per_chunk == 0) {
             return Err(Fault::Ceiling {
@@ -237,7 +243,7 @@ impl Layout {
             });
         }
         let seats = self.seats;
-        window.seat_chunk = 1 + self.seat_chunks();
+        window.seat_chunk = 1 + self.tables + self.seat_chunks();
         window.seat_slots = seats.saturating_mul(pages_per_seat);
         self.windows[at] = Some(WindowList {
             slots: window,
@@ -296,6 +302,34 @@ impl Layout {
         self.act().last().map_or(0, |&(_, chunks)| chunks)
     }
 
+    /// This layout with the engine's tables in `chunks` chunks right after
+    /// the null chunk: every seat run moves past them.
+    #[must_use]
+    pub fn with_tables(mut self, chunks: u32) -> Layout {
+        let by = chunks - self.tables;
+        for shape in [&mut self.list, &mut self.fixed, &mut self.rs]
+            .into_iter()
+            .flatten()
+            .chain(
+                self.windows
+                    .iter_mut()
+                    .flatten()
+                    .map(|window| &mut window.slots),
+            )
+        {
+            shape.seat_chunk += by;
+        }
+        self.tables = chunks;
+        self
+    }
+
+    /// The first chunk past the null chunk, the tables and the seat runs:
+    /// where a caller addressing slots by ref starts.
+    #[must_use]
+    pub fn free_chunk(&self) -> u32 {
+        1 + self.tables + self.seat_chunks()
+    }
+
     pub fn with_rs(mut self, bytes: u64, tokens: u32, pages_per_seat: u32) -> Result<Layout> {
         let Some(mut rs) = Slots::of(RS, bytes, self.chunk_bytes) else {
             return Ok(self);
@@ -307,7 +341,7 @@ impl Layout {
                 have: self.chunk_bytes,
             });
         }
-        rs.seat_chunk = 1 + self.seat_chunks();
+        rs.seat_chunk = 1 + self.tables + self.seat_chunks();
         rs.seat_slots = self.seats.saturating_mul(pages_per_seat);
         self.rs = Some(rs);
         self.rs_tokens = tokens;
@@ -449,11 +483,17 @@ impl Layout {
                 max: segments,
                 growth,
             },
-            reserved: vec![ReservedRun {
+            reserved: std::iter::once(ReservedRun {
                 what: Reserved::Null,
                 first: 0,
                 chunks: 1,
-            }],
+            })
+            .chain((self.tables > 0).then_some(ReservedRun {
+                what: Reserved::Tables,
+                first: 1,
+                chunks: self.tables,
+            }))
+            .collect(),
             shapes,
             act_chunks: self.act().to_vec(),
             host_chunks: 0,

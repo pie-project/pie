@@ -197,6 +197,17 @@ fn disagree(what: String) -> Fault {
 }
 
 impl Rows {
+    /// The state rows: one segment map each in the tables run.
+    #[must_use]
+    pub fn state_rows(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|row| matches!(row, Row::State { .. }))
+            .count()
+    }
+}
+
+impl Rows {
     /// The bytes one token takes across every kv row, and a working set's
     /// state rows, unaligned: an estimate before any recipe.
     pub fn estimate(trace: &Trace, page_size: u32) -> Result<(u64, u64, u64)> {
@@ -545,8 +556,12 @@ pub struct Pools {
     rows: Vec<Row>,
     pool: Pool,
     layout: Layout,
-    /// Every state row's segment table, one after another.
-    maps: Option<Buffer>,
+    /// Every state row's segment table, one after another, in the tables
+    /// run.
+    maps: Option<crate::inputs::Region>,
+    /// Where the next of the engine's own tables lies in the tables run
+    /// (`Reserved::Tables`), and where the run ends: range byte offsets.
+    table_run: (u64, u64),
     shape_rows: [Vec<u32>; 2],
     /// Each distinct set of record slots a state row's pieces lie in.
     bands: Vec<Vec<u32>>,
@@ -711,7 +726,17 @@ impl Pools {
             tier: None,
             weight_caches: Vec::new(),
             weights_held: false,
+            table_run: (
+                layout.chunk_bytes,
+                layout.chunk_bytes * u64::from(1 + layout.tables),
+            ),
         };
+        // The tables run is backed from the load on: the engine writes its
+        // tables there before any fire.
+        if layout.tables > 0 {
+            let segments = (1 + layout.tables).div_ceil(layout.segment_chunks.max(1));
+            pools.pool.commit_segments(segments)?;
+        }
         pools.write_maps(device)?;
         Ok(pools)
     }
@@ -768,10 +793,50 @@ impl Pools {
         if tables.is_empty() {
             return Ok(());
         }
-        let mut buffer = Buffer::zeroed(device, tables.len() as u64)?;
-        buffer.write(0, &tables)?;
-        self.maps = Some(buffer);
+        let mut region = self.run_table(device, tables.len() as u64)?;
+        region.write(0, &tables)?;
+        self.maps = Some(region);
         Ok(())
+    }
+
+    /// The tables run's bytes the state maps of `state_rows` state rows
+    /// take: what a load counts into the run before it lays it.
+    #[must_use]
+    pub fn map_bytes(state_rows: usize) -> u64 {
+        crate::arena::room(state_rows as u64 * STATE_MAP_BYTES)
+    }
+
+    /// `bytes` of the tables run (`Reserved::Tables`), zeroed and written
+    /// through its host runs: one of the engine's own load-time tables. The
+    /// run was sized for every one at the load; one past it is refused.
+    pub fn run_table(&mut self, device: &Context, bytes: u64) -> Result<crate::inputs::Region> {
+        let (at, end) = self.table_run;
+        let room = crate::arena::room(bytes.max(1));
+        if at + room > end {
+            return Err(Fault::Ceiling {
+                what: "bytes of the engine's tables run",
+                need: at + room - self.layout.chunk_bytes,
+                have: end - self.layout.chunk_bytes,
+            });
+        }
+        let (part, local) = self.pool.locate(at);
+        if self.pool.locate(at + room - 1).0 != part {
+            return Err(Fault::Residency(format!(
+                "a {bytes}-byte table of the engine's tables run would straddle two of the \
+                 pool's buffers"
+            )));
+        }
+        let mut region = crate::inputs::Region::unplaced(bytes, Buffer::zeroed(device, 0)?);
+        region.place(self.pool.part_view(part).clone(), local);
+        region.rehost(self.pool.host_runs(at, room)?)?;
+        self.table_run.0 = at + room;
+        Ok(region)
+    }
+
+    /// The tables run's bytes, laid or not: model bytes in the pool.
+    #[must_use]
+    pub fn tables_run_bytes(&self) -> u64 {
+        u64::from(self.layout.tables) * self.layout.chunk_bytes
     }
 
     /// Each band's width: the ids a lane's or a row's table holds for the
@@ -1285,16 +1350,10 @@ impl Pools {
         self.pool.bytes()
     }
 
-    /// The device bytes the pool keeps beside its chunks: the row-streamed
-    /// tables' segment maps and the weight caches' tables.
+    /// The tables run's bytes its tables were laid in.
     #[must_use]
     pub fn table_bytes(&self) -> u64 {
-        self.maps.as_ref().map_or(0, Buffer::bytes)
-            + self
-                .weight_caches
-                .iter()
-                .map(super::streamed::Cache::table_bytes)
-                .sum::<u64>()
+        self.table_run.0 - self.layout.chunk_bytes
     }
 
     #[must_use]
@@ -1554,7 +1613,11 @@ impl Pools {
                         what: "the state rows' segment tables".to_string(),
                     })?;
                     let segments = Tensor::new(
-                        handles.bind(maps, state_row * STATE_MAP_BYTES, STATE_MAP_BYTES)?,
+                        handles.bind(
+                            maps.view(),
+                            maps.at(state_row * STATE_MAP_BYTES),
+                            STATE_MAP_BYTES,
+                        )?,
                         1,
                         (StateMap::HEAD + super::pool::MAX_PARTS) as u32,
                         Dtype::U64,
@@ -1884,7 +1947,7 @@ impl Pools {
     /// Backs the segments the seat runs lie in: what a caller firing
     /// directly asks.
     pub fn commit_seats(&mut self) -> Result<()> {
-        let chunks = 1 + self.layout.seat_chunks();
+        let chunks = self.layout.free_chunk();
         let segments = chunks
             .div_ceil(self.layout.segment_chunks.max(1))
             .min(self.pool.segments());
@@ -1932,8 +1995,19 @@ impl Pools {
     }
 
     /// Takes the weight cache's row-streamed tables (`super::rows`).
-    pub fn seat_weights(&mut self, caches: Vec<super::streamed::Cache>) {
+    /// Seats the weight caches, each one's tables laid in the tables run
+    /// and its handles pointed there.
+    pub fn seat_weights(
+        &mut self,
+        device: &Context,
+        handles: &Handles,
+        mut caches: Vec<super::streamed::Cache>,
+    ) -> Result<()> {
+        for cache in &mut caches {
+            cache.lay(handles, |bytes| self.run_table(device, bytes))?;
+        }
         self.weight_caches = caches;
+        Ok(())
     }
 
     #[must_use]
@@ -1946,9 +2020,9 @@ impl Pools {
     /// the pool, or on a chunk with no memory behind it.
     fn weight_slot(&self, per_chunk: u32, slot_bytes: u64, slot: u32) -> Result<u64> {
         let (chunk, index) = (slot / per_chunk.max(1), slot % per_chunk.max(1));
-        if chunk == 0 || chunk >= self.layout.total_chunks {
+        if chunk <= self.layout.tables || chunk >= self.layout.total_chunks {
             return Err(Fault::Ceiling {
-                what: "chunks a weight slot ref may name (past the null chunk)",
+                what: "chunks a weight slot ref may name (past the null chunk and the tables run)",
                 need: u64::from(chunk) + 1,
                 have: u64::from(self.layout.total_chunks),
             });
@@ -2180,8 +2254,8 @@ impl Pools {
     #[must_use]
     pub fn preseat_plan(&self) -> Option<engine::chunk::WeightResidency> {
         let segment = self.layout.segment_chunks.max(1);
-        let above = (1 + self.layout.seat_chunks()).div_ceil(segment) * segment;
-        [above, 1]
+        let above = self.layout.free_chunk().div_ceil(segment) * segment;
+        [above, 1 + self.layout.tables]
             .into_iter()
             .find_map(|first| self.preseat_from(first))
     }
@@ -2307,7 +2381,7 @@ impl Pools {
     /// the runtime does not see.
     #[must_use]
     pub fn weights_in_seats(&self) -> bool {
-        let seats = 1..1 + self.layout.seat_chunks();
+        let seats = 1 + self.layout.tables..self.layout.free_chunk();
         self.weight_caches.iter().any(|cache| {
             cache
                 .slots()

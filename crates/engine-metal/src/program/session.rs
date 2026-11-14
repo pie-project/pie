@@ -449,17 +449,13 @@ impl Session {
                 continue;
             };
             prepared.refresh(&self.rings, &cursors)?;
-            // Its scratch from the guest region's top, zeroed on the GPU on
-            // the one queue, after whatever frame still reads the span.
+            // Its scratch from the guest region's top, zeroed on the GPU in
+            // the frame of the stage's first region: the one queue orders it
+            // after whatever frame still reads the span, with no submission
+            // or wait of its own.
             prepared.seat_scratch(carve.clone().take(prepared.scratch_bytes())?);
-            #[cfg(target_vendor = "apple")]
-            {
-                let mut frame = device.frame()?;
-                prepared.zero_scratch_on(&mut frame)?;
-                frame.commit()?;
-            }
-            for region in stage.regions.iter() {
-                prepared.launch_region(device, pipelines, &self.rings, region)?;
+            for (at, region) in stage.regions.iter().enumerate() {
+                prepared.launch_region(device, pipelines, &self.rings, region, at == 0)?;
             }
             launched.push(index);
         }

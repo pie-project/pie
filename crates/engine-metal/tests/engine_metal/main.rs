@@ -12,6 +12,7 @@ mod a_scattered_pool_serves_the_same_logits;
 mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tower_region_reads_the_patch_window;
 mod a_verify_walk_is_the_committed_walk;
+mod an_adapter_in_the_tables_run_corrects_its_lanes;
 mod each_checked_in_profile_runs_its_familys_old_tuning;
 mod every_catalog_deployment_dispatches;
 mod every_unit_compiles;

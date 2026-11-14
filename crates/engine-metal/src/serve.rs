@@ -283,7 +283,6 @@ pub struct Shell {
     pools: Pools,
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
     rs_buffers: Option<crate::rs::Buffers>,
-    rs_scratch: Option<Buffer>,
     scratch: Scratch,
     /// Each rung's staged inputs, a frame in flight each, laid in the
     /// span under the kernel scratch plane; frames stage in the current
@@ -1015,9 +1014,47 @@ impl PreparedLoad<'_> {
         // weights and constants, and the activation span at its widest
         // (the arena, every frame's staged inputs and readout, the kernel
         // scratch), the Neural Engine's surfaces split between the two.
-        let (ane_model, ane_fire) = ane.as_ref().map_or((0, 0), crate::ane::Ane::bytes);
-        let model_bytes = weights.bytes() + scratch.constant_bytes() + ane_model;
+        let (ane_model, ane_fire, ane_staging) =
+            ane.as_ref().map_or((0, 0, 0), crate::ane::Ane::bytes);
+        let ane_fire = ane_fire + ane_staging;
+        // The engine's own tables (`Reserved::Tables`): a run of whole
+        // chunks right after the null chunk, model bytes in the pool: the
+        // registered adapter banks, the weight caches' atom tables and use
+        // counters and the state maps.
+        let tables_chunks = u32::try_from(
+            (weights.bank_bytes()
+                + crate::arena::room(scratch.constant_bytes())
+                + weight_caches
+                    .iter()
+                    .map(|cache| crate::store::streamed::Cache::table_bytes_for(&cache.shape))
+                    .sum::<u64>()
+                + Pools::map_bytes(rows.state_rows()))
+            .div_ceil(rows.chunk_bytes.max(1)),
+        )
+        .unwrap_or(u32::MAX);
+        let model_bytes = weights.bytes() + ane_model + u64::from(tables_chunks) * rows.chunk_bytes;
+        // Each rung's rs scratch: a fire of the rung's tokens and lanes
+        // replays its own rows and, for each lane, the rows it carries
+        // unfolded into the fire (`RS_UNFOLDED_ROWS`, the runtime's bound).
+        let rs_room: Vec<u64> = rungs
+            .iter()
+            .map(|(tokens, _)| match (&rs_layout, &rows.rs) {
+                (Some(layout), Some(_)) => {
+                    let lanes = (*tokens).min(boot.budget.max_lanes).max(1);
+                    let unfolded = lanes.saturating_mul(RS_UNFOLDED_ROWS);
+                    crate::rs::Seat::scratch_bytes(
+                        layout,
+                        (*tokens)
+                            .min(boot.budget.max_tokens)
+                            .saturating_add(unfolded),
+                        lanes,
+                    )
+                }
+                _ => 0,
+            })
+            .collect();
         let fire_bytes = compiled.arena.bytes
+            + crate::arena::room(rs_room.last().copied().unwrap_or(0))
             + scratch.bytes()
             + arms as u64 * io.last().copied().map_or(0, crate::arena::io_room)
             + ane_fire;
@@ -1032,8 +1069,14 @@ impl PreparedLoad<'_> {
             )
             .with_streamable(weights.filed_bytes())
         };
-        let act =
-            crate::arena::act_chunks(&rungs, scratch.bytes(), &io, arms as u64, rows.chunk_bytes);
+        let act = crate::arena::act_chunks(
+            &rungs,
+            scratch.bytes(),
+            &io,
+            &rs_room,
+            arms as u64,
+            rows.chunk_bytes,
+        );
         let span = act.last().map_or(0, |&(_, chunks)| chunks);
         // One chunk pool holds every kv page and every record (the rs
         // buffer's rows inside it), in what the room holds of whole chunks,
@@ -1067,7 +1110,8 @@ impl PreparedLoad<'_> {
             let room = boot.kv_budget.unwrap_or_else(|| accounting(0).pool);
             let total = engine::chunk::fit(room, chunk, 0, least)
                 .map_err(|short| Fault::Residency(short.to_string()))?
-                .saturating_add(span);
+                .saturating_add(span)
+                .saturating_add(tables_chunks);
             // The range spans up to `MAX_PARTS` buffers, each as many whole
             // segments as one buffer binds; the span lies in the last.
             let cap = crate::store::pool::part_cap(&device);
@@ -1077,7 +1121,7 @@ impl PreparedLoad<'_> {
                 crate::store::pool::segment_chunks(chunk),
             );
             let binds = per.saturating_mul(crate::store::pool::MAX_PARTS as u32);
-            if binds < least.saturating_add(span) || per < span {
+            if binds < least.saturating_add(span).saturating_add(tables_chunks) || per < span {
                 return Err(Fault::Residency(format!(
                     "one working set takes {least} chunks of {chunk} bytes and one fire's \
                      activation {span}, and this device binds {} buffers of {} MiB, the \
@@ -1103,7 +1147,8 @@ impl PreparedLoad<'_> {
                 rows.pieces,
                 boot.slots,
                 seated.pages_per_slot,
-            )?;
+            )?
+            .with_tables(tables_chunks);
             for (window, pages) in rows.windows.iter().zip(&window_pages) {
                 layout = layout.with_window(window.bytes, window.rows, window.tokens, *pages)?;
             }
@@ -1119,7 +1164,7 @@ impl PreparedLoad<'_> {
             // the accounting already counts.
             (
                 paging_at(pages, boot.slots)?,
-                chunk * u64::from(total - span),
+                chunk * u64::from(total - span - tables_chunks),
                 layout,
             )
         };
@@ -1160,6 +1205,7 @@ impl PreparedLoad<'_> {
             scratch.bytes(),
             rungs,
             io,
+            rs_room,
             arms as u64,
         );
         if crate::diag::on().tier_trace {
@@ -1190,7 +1236,11 @@ impl PreparedLoad<'_> {
         host_rung(&pools, &mut inputs, &mut readout, arena.current(), true)?;
         pools.zero_span(pools.bytes() - arena.scratch_room(), scratch.bytes())?;
         scratch.seat(arena.store().clone(), arena.scratch_at());
-        pools.seat_weights(weight_caches);
+        pools.seat_weights(&device, &handles, weight_caches)?;
+        weights.lay_banks(&handles, |bytes| pools.run_table(&device, bytes))?;
+        if scratch.constant_bytes() > 0 {
+            scratch.lay_constants(pools.run_table(&device, scratch.constant_bytes())?)?;
+        }
         // The null chunk and the floor stand from the load on.
         pools.commit_segments(1)?;
         // A load whose weights the runtime holds seats every atom in pool
@@ -1226,24 +1276,6 @@ impl PreparedLoad<'_> {
                 layout.rs_stride(),
             )
         });
-        // The rs scratch a fire takes at most, laid once: every row of the
-        // widest fire and, for each of its lanes, the most rs rows a lane may
-        // hold unfolded, one rs page's rows, the bound the runtime holds
-        // every pass to. Never grown at a fire.
-        let rs_scratch = match (&rs_layout, &rs_buffers) {
-            (Some(layout), Some(buffers)) => {
-                let lanes = boot.budget.max_lanes.max(1);
-                let rows = boot
-                    .budget
-                    .max_tokens
-                    .saturating_add(lanes.saturating_mul(buffers.page_tokens()));
-                Some(Buffer::zeroed(
-                    &device,
-                    crate::rs::Seat::scratch_bytes(layout, rows, lanes),
-                )?)
-            }
-            _ => None,
-        };
         let nan_flags = match crate::diag::on().nan_check {
             true => Some(Buffer::zeroed(
                 &device,
@@ -1276,7 +1308,6 @@ impl PreparedLoad<'_> {
             pools,
             rs_layout,
             rs_buffers,
-            rs_scratch,
             scratch,
             inputs,
             readout,
@@ -1540,11 +1571,13 @@ impl Shell {
         let chunk = self.pools.layout().chunk_bytes.max(1);
         let model = self.arena.rung_reach(to).div_ceil(chunk);
         let lanes = u64::from(to.min(self.budgets.tokens.max_lanes));
+        // A pair's lanes are no more than its live instances, as the runtime
+        // counts its term: `min(r, max_lanes, the pair's own cap, live)`.
         let guests: u64 = self
             .programs
             .live_terms()?
             .iter()
-            .map(|term| term.bytes(lanes))
+            .map(|(term, live)| term.bytes(lanes.min(*live)))
             .sum();
         Ok((model + guests.div_ceil(chunk)) * chunk)
     }
@@ -1843,7 +1876,8 @@ impl Shell {
             self.budget
                 .map_or(self.working_set(), |budget| budget.min(self.working_set())),
         );
-        let (ane_model, ane_fire) = self.ane.as_ref().map_or((0, 0), crate::ane::Ane::bytes);
+        let (ane_model, ane_fire, ane_staging) =
+            self.ane.as_ref().map_or((0, 0, 0), crate::ane::Ane::bytes);
         let entries = [
             (Outside, "before the load", self.outside),
             (
@@ -1851,9 +1885,11 @@ impl Shell {
                 "pipelines and libraries built (measured)",
                 self.pipelines.built_bytes(),
             ),
-            (Model, "weights", self.weights.bytes()),
-            (Model, "weight cache tables", self.pools.table_bytes()),
-            (Model, "ngram constants", self.scratch.constant_bytes()),
+            (
+                Model,
+                "engine tables run (adapter banks, weight-cache tables, state maps, n-gram constants), reserved",
+                self.pools.tables_run_bytes(),
+            ),
             (
                 Model,
                 "ane surfaces (IOSurfaces the Neural Engine maps itself: outside the pool by the OS)",
@@ -1862,22 +1898,24 @@ impl Shell {
             (
                 State,
                 "pool",
-                self.pools.held_bytes() - self.pools.span_held_bytes(),
+                self.pools.held_bytes()
+                    - self.pools.span_held_bytes()
+                    - self.pools.tables_run_bytes(),
             ),
             (
                 Fire,
-                "activation span (arena, staged inputs, readout, kernel scratch, guest scratch and batch tables), reserved",
+                "activation span (arena, staged inputs, readout, rs scratch, kernel scratch, guest scratch and batch tables), reserved",
                 self.pools.span_reserved_bytes(),
             ),
             (
                 Fire,
-                "rs scratch",
-                self.rs_scratch.as_ref().map_or(0, Buffer::bytes),
+                "ane fire surfaces (IOSurfaces outside the pool by the OS)",
+                ane_fire,
             ),
             (
                 Fire,
-                "ane staging and surfaces (IOSurfaces outside the pool by the OS)",
-                ane_fire,
+                "ane staging (fixed buffers of the opt-in Neural Engine path, for the load's life)",
+                ane_staging,
             ),
             (
                 Fire,
@@ -1885,6 +1923,9 @@ impl Shell {
                 self.nan_flags.as_ref().map_or(0, Buffer::bytes),
             ),
         ];
+        for (owner, bytes) in self.weights.lines() {
+            ledger.enter(Model, owner, bytes);
+        }
         for (class, owner, bytes) in entries {
             ledger.enter(class, owner, bytes);
         }
@@ -3755,10 +3796,10 @@ impl Shell {
                 .as_ref()
                 .expect("rs_active implies a layout, checked at the lane");
             let need = crate::rs::Seat::scratch_bytes(layout, rows_ext, lane_count);
-            let have = self.rs_scratch.as_ref().map_or(0, Buffer::bytes);
+            let have = self.arena.rs_region().1;
             if need > have {
                 return Err(Fault::Ceiling {
-                    what: "bytes of the rs scratch laid at the load for one rs page unfolded a lane",
+                    what: "bytes of the rung's rs scratch in the span (its rows and the unfolded rows a lane may hold)",
                     need,
                     have,
                 });
@@ -4133,9 +4174,7 @@ impl Shell {
             rs_snaps: bound.rs_snaps,
             rs_snap_bands: bound.rs_snap_bands.clone(),
             rs: if rs_active {
-                let (Some(layout), Some(buffers), Some(scratch)) =
-                    (&self.rs_layout, &self.rs_buffers, &self.rs_scratch)
-                else {
+                let (Some(layout), Some(buffers)) = (&self.rs_layout, &self.rs_buffers) else {
                     return Err(Fault::Unbound {
                         what: "the recurrent seat of a fire whose plan buffers nothing".to_string(),
                     });
@@ -4149,7 +4188,7 @@ impl Shell {
                     &self.handles,
                     layout,
                     buffers,
-                    scratch,
+                    (self.arena.store(), self.arena.rs_region()),
                     rs_plans,
                     replay,
                     commit,
@@ -4828,6 +4867,11 @@ fn span_host(pools: &Pools, at: u64, bytes: u64) -> Result<Vec<(u64, u64, std::p
     let (_, span_at, _) = pools.span_view();
     pools.host_runs(pools.span().0 + (at - span_at), bytes)
 }
+
+/// The rows a lane carries unfolded into a fire (its own rows not counted):
+/// the runtime's bound on a pass, `engine::fire::UNFOLDED_ROWS` once the
+/// contract states it (16 there); a fire past it is refused at the lane.
+const RS_UNFOLDED_ROWS: u32 = 16;
 
 fn host_rung(
     pools: &Pools,
