@@ -1072,9 +1072,14 @@ fn registration_compiles_every_pass(device: &Device) {
         read.readout,
         read.dtype,
     )];
+    // A program registers on a served model, its load's ladder sealed:
+    // registration compiles are no ladder misses.
+    device.seal();
+    let before = device.misses();
     stages
         .compile_all(device, &plan.package, key, &carried)
         .expect("every stage compiles at registration");
+    assert_eq!(device.misses(), before, "registration compiles are not ladder misses");
     let compiled = stages.len();
     let facts = stages.fire_facts(key, &carried, device.load_temp());
     eprintln!("registration compiled {compiled} stage program(s); fire facts {facts:?}");
@@ -1083,8 +1088,6 @@ fn registration_compiles_every_pass(device: &Device) {
         facts.fixed + 4 * facts.a_lane > 0,
         "a pass returns its outputs: {facts:?}"
     );
-    device.seal();
-    let before = device.misses();
     let seeds: Vec<Vec<(u32, Value)>> = (0..lanes)
         .map(|i| {
             vec![
@@ -1773,4 +1776,51 @@ fn a_fire_then_a_guest_pass_is_timed() {
         "STEP BENCH fire+pass, 64 lanes, cells vocab {vocab}: {:.3} ms a step",
         timed.as_secs_f64() * 1e3 / 50.0
     );
+}
+
+/// `PIE_XLA_GUEST_BENCH=1`: a sampler registers on a served model, its
+/// ladder sealed (qwen3-30b-a3b-mini at `PIE_XLA_GUEST_LANES` lanes, 256 unset, prewarmed):
+/// how many stage programs registration compiles and how long it takes,
+/// none of them a ladder miss.
+#[test]
+fn a_sampler_registers_on_a_served_model() {
+    use crate::common_llm::{Model, set_knob};
+    use engine::Engine as _;
+    if std::env::var_os("PIE_XLA_GUEST_BENCH").is_none() {
+        return;
+    }
+    if device().is_none() {
+        return;
+    }
+    let lanes = std::env::var("PIE_XLA_GUEST_LANES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256u32);
+    set_knob("PREWARM", 1);
+    set_knob("SLOTS", lanes);
+    set_knob("LANES", lanes);
+    set_knob("TOKENS", 2 * lanes);
+    let mut model = Model::load_with("qwen3-30b-a3b-mini", None, 512, 7, None);
+    let device = model.engine.shell().expect("loaded").device();
+    let (misses, held) = (device.misses(), device.compiled());
+    let reads = model.engine.shell().expect("loaded").plane_reads();
+    let (container, _) = carrying(model.vocab);
+    let plan = plan_of(container, model.vocab);
+    let t = std::time::Instant::now();
+    model
+        .engine
+        .register_program(&engine::program::ProgramRegistration {
+            launch: plan.package.clone(),
+            ..Default::default()
+        })
+        .expect("the sampler registers");
+    let took = t.elapsed();
+    let device = model.engine.shell().expect("loaded").device();
+    eprintln!(
+        "REGISTRATION {} stage program(s) in {:.1} s over {} plane read(s)",
+        device.compiled() - held,
+        took.as_secs_f64(),
+        reads.len()
+    );
+    assert_eq!(device.misses(), misses, "registration compiles are not ladder misses");
 }
