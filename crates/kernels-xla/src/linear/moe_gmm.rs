@@ -577,6 +577,7 @@ impl Gmm {
     /// what `kernel` (stepping) takes and the down bank last; the result is
     /// the down kernel's.
     pub fn mlp_kernel(&self, dn: &Gmm) -> Built<Compiled> {
+        self.admit_mlp(dn)?;
         let (k, n, tm, j) = (self.k, self.n, self.tm, self.run);
         let half = n / 2;
         let (dk, dnn) = (dn.k, dn.n);
@@ -1179,10 +1180,112 @@ impl Gmm {
         })
     }
 
-    pub fn kernel(&self) -> Built<Compiled> {
+    /// Whether [`Gmm::kernel`] builds for this spec, decided from the spec
+    /// alone (no kernel is built): what a caller picks an arm by.
+    pub fn admit(&self) -> Built<()> {
         if self.tm % 16 != 0 || self.tiles < 1 || self.k < 1 || self.n < 1 || self.experts < 1 {
             return bad(format!("{self:?}"));
         }
+        let out_ok = matches!(self.out, Elem::F32 | Elem::Bf16);
+        if self.stepping() {
+            if !out_ok {
+                return bad(format!("a {:?} result", self.out));
+            }
+            if self.glu.is_some()
+                && (self.orient != Orient::NMajor || self.out != Elem::Bf16 || self.n % 32 != 0)
+            {
+                return bad(format!("a GLU over {self:?}"));
+            }
+            return self.admit_bank();
+        }
+        if self.prefetching() {
+            if self.bias && self.out != Elem::Bf16 {
+                return bad(format!("a {:?} result beside a bias", self.out));
+            }
+            return self.admit_bank();
+        }
+        if !matches!(
+            self.w,
+            Elem::Bf16 | Elem::F8E5m2 | Elem::F8E4m3fn | Elem::F4E2m1fn
+        ) || (self.w == Elem::F4E2m1fn) != self.scaled
+            || (self.scaled && (self.orient != Orient::KMajor || self.k % 32 != 0))
+            || (self.tile
+                && (self.w != Elem::F8E4m3fn || self.orient != Orient::KMajor || self.k % 128 != 0))
+        {
+            return bad(format!("{:?} weights (scaled {})", self.w, self.scaled));
+        }
+        let cut = self.cut()?;
+        let cols = match cut {
+            Cut::Blocked { tn } => tn,
+            Cut::Element { width } => width,
+        };
+        if let Some(h) = self.sums
+            && (!self.tile
+                || self.experts != 1
+                || h <= 0
+                || h % 128 != 0
+                || cols % h != 0
+                || !matches!(cut, Cut::Blocked { .. }))
+        {
+            return bad(format!("{h}-wide head sums over {cols}-column blocks"));
+        }
+        if self.orient == Orient::NMajor && matches!(cut, Cut::Element { .. }) {
+            return bad("an element window over rows");
+        }
+        if self.bias && matches!(cut, Cut::Element { .. }) {
+            return bad("a bias over an element window");
+        }
+        if !out_ok || (self.bias && self.out != Elem::Bf16) {
+            return bad(format!("a {:?} result (bias {})", self.out, self.bias));
+        }
+        self.admit_bank()
+    }
+
+    /// The bank operand's own condition ([`Gmm::bank_operand`]).
+    fn admit_bank(&self) -> Built<()> {
+        if self.pooled.is_some()
+            && (self.orient != Orient::NMajor
+                || self.w != Elem::Bf16
+                || self.k % 128 != 0
+                || self.n % 16 != 0)
+        {
+            return bad(format!("a pooled bank of {self:?}"));
+        }
+        Ok(())
+    }
+
+    /// Whether [`Gmm::mlp_kernel`] builds over this gate-up and `dn`, from
+    /// the specs alone.
+    pub fn admit_mlp(&self, dn: &Gmm) -> Built<()> {
+        let (n, tm, j) = (self.n, self.tm, self.run);
+        if !self.stepping()
+            || !dn.stepping()
+            || self.glu.is_none()
+            || dn.glu.is_some()
+            || self.orient != Orient::NMajor
+            || self.out != Elem::Bf16
+            || dn.out != Elem::Bf16
+            || self.w != Elem::Bf16
+            || dn.w != Elem::Bf16
+            || n % 32 != 0
+            || dn.tiles != self.tiles
+            || dn.tm != tm
+            || dn.run != j
+            || dn.experts != self.experts
+            || dn.k != n / 2
+            || dn.out_width()? != dn.n
+        {
+            return bad(format!("one kernel over {self:?} and {dn:?}"));
+        }
+        if self.pooled.is_some() != dn.pooled.is_some() {
+            return bad("one bank in the pool and one not");
+        }
+        self.admit()?;
+        dn.admit()
+    }
+
+    pub fn kernel(&self) -> Built<Compiled> {
+        self.admit()?;
         if self.stepping() {
             return self.kernel_steps();
         }
