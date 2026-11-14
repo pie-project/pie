@@ -1051,7 +1051,7 @@ impl FrameShell for Shell {
                         .map_err(|error| {
                             Fault::program("serve::rs", format!("lane {}: {error}", row.source))
                         })?;
-                    let replay = crate::run::replayed(&reads);
+                    let replay = carried_in(row.source, crate::run::replayed(&reads))?;
                     let cell = envelope_of[source].map_or(fire_lane, |(_, at)| at);
                     let to = folded
                         .saturating_add(stated_fold(*fold, cell, port)?)
@@ -1895,6 +1895,25 @@ impl FrameShell for Shell {
     }
 }
 
+/// Lane `lane`'s replay of `replay` buffered rows, refused past
+/// [`engine::fire::UNFOLDED_ROWS`]: the runtime bounds what a host plan
+/// carries in, and a device-geometry plan leaves it to the engine, whose
+/// replay tables and scratch hold that many a lane. The fire fails by name
+/// rather than overrun them.
+fn carried_in(lane: u32, replay: u32) -> Result<u32> {
+    if replay > engine::fire::UNFOLDED_ROWS {
+        return Err(Fault::program(
+            "serve::rs",
+            format!(
+                "lane {lane} carries {replay} unfolded recurrent rows into this fire, past the \
+                 {} a lane's replay holds; the fire is failed rather than overrun its tables",
+                engine::fire::UNFOLDED_ROWS
+            ),
+        ));
+    }
+    Ok(replay)
+}
+
 fn stated_fold(len: FoldLen, lane: usize, port: Option<&[u32]>) -> Result<u32> {
     Ok(match len {
         FoldLen::Host(n) => n,
@@ -2089,7 +2108,22 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::{fold_held, readout_extent};
+    use super::{carried_in, fold_held, readout_extent};
+
+    #[test]
+    fn a_lane_carrying_past_the_unfolded_bound_fails_the_fire_by_name() {
+        let most = engine::fire::UNFOLDED_ROWS;
+        assert_eq!(carried_in(3, 0).unwrap(), 0);
+        assert_eq!(carried_in(3, most).unwrap(), most);
+        let refused = carried_in(3, most + 1).unwrap_err().to_string();
+        assert!(
+            refused.contains(&format!(
+                "lane 3 carries {} unfolded recurrent rows",
+                most + 1
+            )),
+            "{refused}"
+        );
+    }
 
     #[test]
     fn a_readout_as_tall_as_the_fire_holds_the_bucket() {
