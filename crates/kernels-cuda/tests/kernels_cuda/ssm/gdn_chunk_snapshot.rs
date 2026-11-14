@@ -149,18 +149,20 @@ fn fire(gpu: &mut Gpu, arm: Arm, inputs: &Inputs, slab_at: u64, f: &Fire) -> Vec
             } else {
                 ssm::gated_delta_chunked
             };
-            scan(
-                &ctx,
-                x,
-                Tensor::ABSENT,
-                gates,
-                &pool,
-                K_HEADS,
-                V_HEADS,
-                D,
-                D,
-                &mut y,
-            )
+            gpu.laid(&ctx, |ctx| {
+                scan(
+                    ctx,
+                    x,
+                    Tensor::ABSENT,
+                    gates,
+                    &pool,
+                    K_HEADS,
+                    V_HEADS,
+                    D,
+                    D,
+                    &mut y,
+                )
+            })
             .expect("the gated delta fires");
             gpu.sync();
             gpu.down::<f32>(y_at, cells)

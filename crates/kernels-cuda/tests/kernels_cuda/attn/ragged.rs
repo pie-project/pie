@@ -87,7 +87,10 @@ fn check(heads: [usize; 3], q_sizes: &[u32], kv_sizes: &[u32], mask: Mask, extra
     if extra > 0 {
         ctx.arm_stage(gpu.up(&[qr as u32, 0, 2, 1]));
     }
-    ragged(&ctx, qp, kp, vp, qtab, ktab, hd32, scale, arm, o).expect("the arm fires");
+    gpu.laid(&ctx, |ctx| {
+        ragged(ctx, qp, kp, vp, qtab, ktab, hd32, scale, arm, o)
+    })
+    .expect("the arm fires");
     // A row past every group keeps its noise.
     let past = (qr - extra) * qh * hd;
     want[past..].copy_from_slice(&wide(&fill[past..]));
@@ -160,6 +163,7 @@ fn the_ragged_arm_replays_from_a_captured_graph() {
     };
     fresh(&gpu);
     ctx.arm_stage(win_at);
+    gpu.lay(&ctx, |_| fire(o_at));
     fire(o_at).expect("the warm fire");
     gpu.sync();
     let mut fired = None;

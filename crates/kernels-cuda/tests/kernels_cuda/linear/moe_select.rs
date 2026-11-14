@@ -126,28 +126,45 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
                 K::Nv => GluBank::Nvfp4 { codes: nvc, scales: sc, tensor_scales: nvt },
                 _ => GluBank::Mxfp4 { codes: mx, scales: sc, bias },
             };
-            moe::select_glu(&ctx, x, bank, r, &mut y, g, RES).map(took)
+            b.laid(&ctx, |ctx| moe::select_glu(ctx, x, bank, r, &mut y, g, RES))
+                .map(took)
         }
-        (K::Bf16, _) => moe::matmul_select(&ctx, x, t(c, ex, n * k, Bf16), r, &mut y, RES),
+        (K::Bf16, _) => b.laid(&ctx, |ctx| {
+            moe::matmul_select(ctx, x, t(c, ex, n * k, Bf16), r, &mut y, RES)
+        }),
         (K::Affine, _) => {
             let (fs, zs) = (t(fz.0, ex, n * k / 32, U8), t(fz.1, ex, n * k / 32, U8));
-            moe::matmul_select_quant(&ctx, x, mx, fs, Some(zs), r, &mut y, SEAT, RES)
+            b.laid(&ctx, |ctx| {
+                moe::matmul_select_quant(ctx, x, mx, fs, Some(zs), r, &mut y, SEAT, RES)
+            })
         }
         (K::Mx, _) if tuning.mxfp4_w4a8_from > 0 => {
             let gran = pick(flags & 16 != 0, 128, 32);
-            moe::select_mxfp4_w4a8(&ctx, x, mx, sc, r, &mut y, gran, RES)
-                .map(|took| assert_eq!(took, w4a8_here(), "the arm takes the fire"))
+            b.laid(&ctx, |ctx| {
+                moe::select_mxfp4_w4a8(ctx, x, mx, sc, r, &mut y, gran, RES)
+            })
+            .map(|took| assert_eq!(took, w4a8_here(), "the arm takes the fire"))
         }
-        (K::Mx, _) => moe::matmul_select_quant(&ctx, x, mx, sc, None, r, &mut y, SEAT, RES),
+        (K::Mx, _) => b.laid(&ctx, |ctx| {
+            moe::matmul_select_quant(ctx, x, mx, sc, None, r, &mut y, SEAT, RES)
+        }),
         (K::MxBias, _) => {
             let bias = t(bias, ex, n, Bf16);
-            moe::matmul_select_bias(&ctx, x, mx, sc, bias, r, &mut y, SEAT, RES)
+            b.laid(&ctx, |ctx| {
+                moe::matmul_select_bias(ctx, x, mx, sc, bias, r, &mut y, SEAT, RES)
+            })
         }
-        (K::Nv, _) => moe::select_nvfp4(&ctx, x, nvc, sc, nvt, r, &mut y, SEAT, RES),
+        (K::Nv, _) => b.laid(&ctx, |ctx| {
+            moe::select_nvfp4(ctx, x, nvc, sc, nvt, r, &mut y, SEAT, RES)
+        }),
         (K::Atoms, _) => {
             let xb = read_back(&ctx, "test", fmt, Source::rows(x, None), back).expect("reads");
             a = b.read(back, rows_x * k);
-            let mut go = || moe::select_mxfp4_atoms(&ctx, xb, mx, atoms, r, &mut y, RES);
+            let mut go = || {
+                b.laid(&ctx, |ctx| {
+                    moe::select_mxfp4_atoms(ctx, xb, mx, atoms, r, &mut y, RES)
+                })
+            };
             let keep = flags & 8 != 0;
             (if keep { moe::keeping_order(go) } else { go() }).map(took)
         }
@@ -155,7 +172,9 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
             let globals = nv.then(|| t(inputs, ex, 1, F32));
             let alpha = nv.then(|| [b.zeros(ex * 4), inputs, tsv]);
             let bank = bank(c, atoms, [ex, n, k], alpha);
-            let fired = select(&ctx, "test", fmt, x, r, globals, bank, &mut y);
+            let fired = b.laid(&ctx, |ctx| {
+                select(ctx, "test", fmt, x, r, globals, bank, &mut y)
+            });
             ctx.disarm_stage();
             // Each route's rows as the select reads them back.
             let (rows, div) = (live as u32, div as u32);
@@ -552,9 +571,11 @@ fn the_w8a16_selects_answer_the_routed_dot() {
         let mut y = b.out(count, n);
         let ctx = b.ctx();
         let x = t(x, rows_x, k, Bf16);
-        select_fp8_w8a16(
-            &ctx, "test", x, codes, atoms, ex as u32, 128, r, &mut y, None, RES,
-        )
+        b.laid(&ctx, |ctx| {
+            select_fp8_w8a16(
+                ctx, "test", x, codes, atoms, ex as u32, 128, r, &mut y, None, RES,
+            )
+        })
         .expect("the W8A16 select fires");
         let w = |r: usize, c: usize, i: usize| f64::from(s.value(routes[r] as usize * n + c, k, i));
         let want = dot([count, n, k], |r, i| a[r / div * k + i], w);

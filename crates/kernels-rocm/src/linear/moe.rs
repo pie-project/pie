@@ -1525,7 +1525,10 @@ fn lt_launch(
     // SAFETY: the argument array was written on this stream, its records
     // naming staged planes and the bank, all live through the fire.
     unsafe { lib.launch(at, experts + 1, args, grid, stream) }.map_err(|why| refuse(op, why))?;
-    LT_FIRES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // A size-only walk launches nothing.
+    if !crate::sizing::active() {
+        LT_FIRES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
     Ok(())
 }
 

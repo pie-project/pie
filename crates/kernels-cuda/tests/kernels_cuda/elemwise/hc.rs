@@ -67,7 +67,8 @@ fn the_projection_and_the_gates_answer_the_host() {
             ten(w_at, mix, fan, F32),
             &mut ten(m_at, rows, mix, F32),
         );
-        hc_project::project(&gpu.ctx(), x_t, w_t, 4, m).expect("the projection fires");
+        gpu.laid(&gpu.ctx(), |ctx| hc_project::project(ctx, x_t, w_t, 4, m))
+            .expect("the projection fires");
         gpu.sync();
         let want: Vec<f32> = x
             .chunks(fan)
@@ -202,7 +203,9 @@ fn the_tensor_core_prenorm_projection_answers_the_host() {
         .with_tuning(tuned(|t| (t.hc_tile, t.hc_mma) = (true, true)));
     let (x_t, w_t) = (ten(x_at, rows, fan, Bf16), ten(w_at, MIX, fan, F32));
     let mixes = &mut ten(m_at, rows, MIX, F32);
-    let landed = hc_project::prenorm_project(&ctx, x_t, eps, w_t, M as u32, mixes);
+    let landed = gpu.laid(&ctx, |ctx| {
+        hc_project::prenorm_project(ctx, x_t, eps, w_t, M as u32, mixes)
+    });
     assert!(
         landed.expect("the projection fires"),
         "a 16384-wide row is the tile's"

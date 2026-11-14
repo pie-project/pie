@@ -22,6 +22,11 @@ pub struct Arena {
     /// For every carve laid at the reservation's end, its bytes and the
     /// bytes before its `attn.scores` planes ([`Arena::ensure_rungs`]).
     prefixes: Vec<(u64, u64)>,
+    /// The lanes every fire carves for, whatever its own: a fire that
+    /// replays a recorded body lays its lane tables at the body's capacity
+    /// (`window::lane_capacity`), so its carve is the smallest rung's that
+    /// holds that many lanes. 0 where fires carve for their own lanes.
+    lane_reach: u32,
 }
 
 impl Arena {
@@ -34,7 +39,14 @@ impl Arena {
             reserved: bytes,
             rungs: Vec::new(),
             prefixes: Vec::new(),
+            lane_reach: 0,
         }
+    }
+
+    /// Every fire of this load carves for `lanes` lanes at least: what the
+    /// rungs state to the runtime follows the carve a fire really lays.
+    pub fn reach_lanes(&mut self, lanes: u32) {
+        self.lane_reach = lanes;
     }
 
     /// With `rungs`, each a carve no larger than the reservation, smallest
@@ -71,8 +83,17 @@ impl Arena {
     pub fn rungs(&self, forked: Option<&ArenaMap>) -> Vec<(u32, u64)> {
         self.rungs
             .iter()
-            .map(|(tokens, map)| {
-                let bytes = map.bytes.max(forked.map_or(0, |forked| forked.bytes));
+            .map(|(tokens, _)| {
+                // The carve a fire cut to this rung lays: the smallest
+                // rung's that holds its tokens and the lanes it carves
+                // for, the whole arena past every rung
+                // ([`Arena::fire_slots`]).
+                let carve = self
+                    .rungs
+                    .iter()
+                    .find(|(rung, _)| rung >= tokens && *rung >= self.lane_reach)
+                    .map_or(self.reserved, |(_, map)| map.bytes);
+                let bytes = carve.max(forked.map_or(0, |forked| forked.bytes));
                 (
                     *tokens,
                     self.reserved.saturating_sub(bytes).min(self.committed),

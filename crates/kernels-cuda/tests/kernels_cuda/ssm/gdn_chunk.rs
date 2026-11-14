@@ -156,31 +156,35 @@ fn check_on(case: &Case, fused: Arm) {
             ctx.arm_stage(win);
         }
         let fired = if serial {
-            ssm::gated_delta_chunked_serial(
-                &ctx,
-                qkv,
-                Tensor::ABSENT,
-                gates_t,
-                &pool,
-                k_heads,
-                v_heads,
-                k_dim,
-                v_dim,
-                &mut y,
-            )
+            gpu.laid(&ctx, |ctx| {
+                ssm::gated_delta_chunked_serial(
+                    ctx,
+                    qkv,
+                    Tensor::ABSENT,
+                    gates_t,
+                    &pool,
+                    k_heads,
+                    v_heads,
+                    k_dim,
+                    v_dim,
+                    &mut y,
+                )
+            })
         } else {
-            ssm::gated_delta_chunked(
-                &ctx,
-                qkv,
-                Tensor::ABSENT,
-                gates_t,
-                &pool,
-                k_heads,
-                v_heads,
-                k_dim,
-                v_dim,
-                &mut y,
-            )
+            gpu.laid(&ctx, |ctx| {
+                ssm::gated_delta_chunked(
+                    ctx,
+                    qkv,
+                    Tensor::ABSENT,
+                    gates_t,
+                    &pool,
+                    k_heads,
+                    v_heads,
+                    k_dim,
+                    v_dim,
+                    &mut y,
+                )
+            })
         };
         fired.expect("the gated delta fires");
         gpu.sync();

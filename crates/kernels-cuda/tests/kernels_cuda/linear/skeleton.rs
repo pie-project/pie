@@ -337,7 +337,10 @@ fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
         // Twice: the first call times the shape's candidates, the second
         // fires the pick.
         for _ in 0..2 {
-            let served = gemm::anchored(&ctx, "test.anchored", epi, a, wt, &[], &[yt], None)
+            let served = gpu
+                .laid(&ctx, |ctx| {
+                    gemm::anchored(ctx, "test.anchored", epi, a, wt, &[], &[yt], None)
+                })
                 .unwrap_or_else(|e| panic!("{what} fires: {e:?}"));
             assert!(served, "{what} is served");
         }
@@ -370,16 +373,9 @@ fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
     let ((wr, wv), (ar, av), (sr, sv)) = (lcg.row(n * k), lcg.row(m * k), lcg.row(m));
     let (w, act, s, y) = (gpu.up(&wr), gpu.up(&ar), gpu.up(&sr), gpu.zeros(m * n * 2));
     let (a, wt, yt) = (t(act, m, k, Bf16), t(w, n, k, Bf16), t(y, m, n, Bf16));
-    let served = gemm::anchored(
-        &gpu.ctx(),
-        "test.anchored",
-        epi,
-        a,
-        wt,
-        &[In::row(s)],
-        &[yt],
-        None,
-    );
+    let served = gpu.laid(&gpu.ctx(), |ctx| {
+        gemm::anchored(ctx, "test.anchored", epi, a, wt, &[In::row(s)], &[yt], None)
+    });
     assert_eq!(served.ok(), Some(true), "the leg serves {m} rows");
     gpu.sync();
     let want = eval(&anchored, m, &av, &wv, &[], &[Given::Row(sv)]).expect("runs");
@@ -390,16 +386,18 @@ fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
     assert!(skeleton::serves(&narrow, &[Bf16], &[Bf16]).is_err());
     let epi = Epilogue::interned(&narrow).expect("the skeletons take it");
     let y = gpu.zeros(m * 4 * 2);
-    let served = gemm::anchored(
-        &gpu.ctx(),
-        "test.anchored",
-        epi,
-        t(act, m, k, Bf16),
-        t(w, 4, k, Bf16),
-        &[In::row(s)],
-        &[t(y, m, 4, Bf16)],
-        None,
-    );
+    let served = gpu.laid(&gpu.ctx(), |ctx| {
+        gemm::anchored(
+            ctx,
+            "test.anchored",
+            epi,
+            t(act, m, k, Bf16),
+            t(w, 4, k, Bf16),
+            &[In::row(s)],
+            &[t(y, m, 4, Bf16)],
+            None,
+        )
+    });
     assert_eq!(
         served.ok(),
         Some(false),
@@ -543,17 +541,20 @@ fn cublaslts_own_epilogue_lands_the_anchored_region() {
             if m >= 100 {
                 let y2 = gpu.zeros(m * n * 2);
                 for _ in 0..2 {
-                    let served = gemm::anchored(
-                        &gpu.ctx(),
-                        "test.lt",
-                        epi,
-                        t(act, m, k, Bf16),
-                        t(w, n, k, Bf16),
-                        &ins,
-                        &[t(y2, m, n, Bf16)],
-                        None,
-                    )
-                    .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                    let served = gpu
+                        .laid(&gpu.ctx(), |ctx| {
+                            gemm::anchored(
+                                ctx,
+                                "test.lt",
+                                epi,
+                                t(act, m, k, Bf16),
+                                t(w, n, k, Bf16),
+                                &ins,
+                                &[t(y2, m, n, Bf16)],
+                                None,
+                            )
+                        })
+                        .unwrap_or_else(|e| panic!("{what}: {e:?}"));
                     assert!(served, "{what}");
                 }
                 gpu.sync();
@@ -718,17 +719,20 @@ fn a_heads_norm_and_turn_lands_its_windows_as_the_interpreter() {
                         .zip(widths)
                         .map(|(&o, wd)| t(o, rows, wd, Bf16))
                         .collect();
-                    let served = gemm::anchored(
-                        &ctx,
-                        "test.qkv",
-                        epi,
-                        t(act, rows, k, Bf16),
-                        t(w, n, k, Bf16),
-                        &ins,
-                        &landed,
-                        None,
-                    )
-                    .unwrap_or_else(|e| panic!("{what} fires: {e:?}"));
+                    let served = gpu
+                        .laid(&ctx, |ctx| {
+                            gemm::anchored(
+                                ctx,
+                                "test.qkv",
+                                epi,
+                                t(act, rows, k, Bf16),
+                                t(w, n, k, Bf16),
+                                &ins,
+                                &landed,
+                                None,
+                            )
+                        })
+                        .unwrap_or_else(|e| panic!("{what} fires: {e:?}"));
                     assert!(served, "{what}: served at {rows} rows");
                 } else {
                     Skeleton::Skinny
@@ -805,17 +809,20 @@ fn a_turned_row_past_the_row_skeletons_width_lands_on_its_slices() {
     let (ar, av) = lcg.row(m * k);
     let (w, act, y) = (gpu.up(&wr), gpu.up(&ar), gpu.zeros(m * n * 2));
     for _ in 0..2 {
-        let served = gemm::anchored(
-            &gpu.ctx(),
-            "test.turn",
-            epi,
-            t(act, m, k, Bf16),
-            t(w, n, k, Bf16),
-            &ins,
-            &[t(y, m, n, Bf16)],
-            None,
-        )
-        .unwrap_or_else(|e| panic!("{e:?}"));
+        let served = gpu
+            .laid(&gpu.ctx(), |ctx| {
+                gemm::anchored(
+                    ctx,
+                    "test.turn",
+                    epi,
+                    t(act, m, k, Bf16),
+                    t(w, n, k, Bf16),
+                    &ins,
+                    &[t(y, m, n, Bf16)],
+                    None,
+                )
+            })
+            .unwrap_or_else(|e| panic!("{e:?}"));
         assert!(served);
     }
     gpu.sync();
@@ -947,17 +954,20 @@ fn a_paged_epilogue_lands_k_and_v_in_their_caches_rows() {
                         t(keys, pages_cells, kv, element),
                         t(values, pages_cells, kv, element),
                     ];
-                    let served = gemm::anchored(
-                        &ctx,
-                        "test.paged",
-                        epi,
-                        t(act, rows, k, Bf16),
-                        t(w, n, k, Bf16),
-                        &ins,
-                        &landed,
-                        paging,
-                    )
-                    .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                    let served = gpu
+                        .laid(&ctx, |ctx| {
+                            gemm::anchored(
+                                ctx,
+                                "test.paged",
+                                epi,
+                                t(act, rows, k, Bf16),
+                                t(w, n, k, Bf16),
+                                &ins,
+                                &landed,
+                                paging,
+                            )
+                        })
+                        .unwrap_or_else(|e| panic!("{what}: {e:?}"));
                     assert!(served, "{what}");
                 } else {
                     Skeleton::Skinny
@@ -1099,17 +1109,20 @@ fn a_head_major_window_lands_a_head_of_every_stride() {
         for _ in 0..2 {
             if through {
                 let landed = [t(outs[0], rows, half, Bf16), t(outs[1], rows, half, Bf16)];
-                let served = gemm::anchored(
-                    &ctx,
-                    "test.strided",
-                    epi,
-                    t(act, rows, k, Bf16),
-                    t(w, n, k, Bf16),
-                    &[],
-                    &landed,
-                    None,
-                )
-                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                let served = gpu
+                    .laid(&ctx, |ctx| {
+                        gemm::anchored(
+                            ctx,
+                            "test.strided",
+                            epi,
+                            t(act, rows, k, Bf16),
+                            t(w, n, k, Bf16),
+                            &[],
+                            &landed,
+                            None,
+                        )
+                    })
+                    .unwrap_or_else(|e| panic!("{what}: {e:?}"));
                 assert!(served, "{what}");
             } else {
                 Skeleton::Skinny

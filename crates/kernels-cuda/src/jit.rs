@@ -125,16 +125,11 @@ pub(crate) enum Fault {
         unit: &'static str,
         log: String,
     },
-    Unwarmed {
+    /// A take past the slabs laid for its arena: a fire no walk sized.
+    Unplaced {
         name: &'static str,
         have: usize,
         need: usize,
-    },
-    Exhausted {
-        name: &'static str,
-        have: usize,
-        need: usize,
-        free: usize,
     },
 }
 
@@ -144,23 +139,11 @@ impl core::fmt::Display for Fault {
         match self {
             Self::Device { call, code } => write!(f, "`{call}` answered {code}"),
             Self::Compile { unit, log } => write!(f, "`{unit}` would not compile: {log}"),
-            Self::Unwarmed { name, have, need } => write!(
+            Self::Unplaced { name, have, need } => write!(
                 f,
-                "the `{name}` scratch holds {have} bytes and this capture needs {need}; \
-                 growing it mid-capture would poison the graph — warm it with an eager \
-                 fire before capturing"
-            ),
-            Self::Exhausted {
-                name,
-                have,
-                need,
-                free,
-            } => write!(
-                f,
-                "`cudaMalloc` answered cudaErrorMemoryAllocation growing the `{name}` scratch \
-                 from {have} to {need} bytes, with {free} bytes free on the device: this \
-                 fire's workspace lies outside the fitted pool, so the load left too little \
-                 beside the weights, the cache rows and the graph bodies for it"
+                "the `{name}` scratch is laid at {have} bytes and this launch needs {need}: \
+                 slabs are laid ahead from a size-only walk of the fires they serve, and \
+                 none grows, so this fire is one no walk sized"
             ),
         }
     }

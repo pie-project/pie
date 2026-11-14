@@ -411,7 +411,16 @@ fn moe_folds() {
     let bt = gpu.tensor(&bias, experts, hidden, Dtype::Bf16);
     let routes_t = gpu.upload(&routes, tokens, k, Dtype::I32);
     let mut y = gpu.zeros(tokens, hidden, Dtype::Bf16);
-    moe::bias_sum(&ctx, xt, bt, routes_t, wt, &mut y, moe::ExpertTable::RESIDENT).unwrap();
+    moe::bias_sum(
+        &ctx,
+        xt,
+        bt,
+        routes_t,
+        wt,
+        &mut y,
+        moe::ExpertTable::RESIDENT,
+    )
+    .unwrap();
     let want: Vec<f32> = (0..t * h)
         .map(|i| {
             let (n, c) = (i / h, i % h);
@@ -581,7 +590,10 @@ fn moe_matmul_dense() {
             let xt = gpu.tensor(&x, x_rows as u32, k, Dtype::Bf16);
             let rt = gpu.upload(&routes, tokens, top_k, Dtype::I32);
             let mut y = gpu.zeros(tokens * top_k, n, Dtype::Bf16);
-            moe::matmul_select(&ctx, xt, bt, rt, &mut y, moe::ExpertTable::RESIDENT).unwrap();
+            gpu.laid(&ctx, |ctx| {
+                moe::matmul_select(ctx, xt, bt, rt, &mut y, moe::ExpertTable::RESIDENT)
+            })
+            .unwrap();
             let (want, mag) = reference(&bank, &x, &routes, kk, by_token, None);
             close_dot(
                 &format!("dense {leg} {experts}e {tokens}x{top_k} {n}x{k} by_token={by_token}"),
@@ -675,7 +687,10 @@ fn moe_matmul_dense_wide_skewed() {
     let (want, mag) = reference(&bank, &x, &routes, 2, true, None);
     let ctx = tuned(&gpu, |t| t.moe_dense_wide_from = 1);
     let mut y = gpu.zeros(tokens * top_k, n, Dtype::Bf16);
-    moe::matmul_select(&ctx, xt, bt, rt, &mut y, moe::ExpertTable::RESIDENT).unwrap();
+    gpu.laid(&ctx, |ctx| {
+        moe::matmul_select(ctx, xt, bt, rt, &mut y, moe::ExpertTable::RESIDENT)
+    })
+    .unwrap();
     close_dot("wide skewed", &gpu.read(&y), &want, &mag, 1e-5);
 }
 
@@ -757,16 +772,18 @@ fn moe_matmul_mxfp4() {
                 )
                 .unwrap();
             } else {
-                moe::matmul_select_quant(
-                    &ctx,
-                    xt,
-                    ct,
-                    st,
-                    None,
-                    rt,
-                    &mut y,
-                    moe::ExpertTable::RESIDENT,
-                )
+                gpu.laid(&ctx, |ctx| {
+                    moe::matmul_select_quant(
+                        ctx,
+                        xt,
+                        ct,
+                        st,
+                        None,
+                        rt,
+                        &mut y,
+                        moe::ExpertTable::RESIDENT,
+                    )
+                })
                 .unwrap();
             }
             let (want, mag) = reference(
@@ -826,15 +843,17 @@ fn moe_matmul_mxfp4_lanes() {
             let xt = gpu.tensor(&x, x_rows as u32, k, Dtype::Bf16);
             let rt = gpu.upload(&routes, tokens, top_k, Dtype::I32);
             let mut y = gpu.zeros(tokens * top_k, n, Dtype::Bf16);
-            moe::matmul_select_mxfp4_lanes(
-                &ctx,
-                xt,
-                lc,
-                ls,
-                rt,
-                &mut y,
-                moe::ExpertTable::RESIDENT,
-            )
+            gpu.laid(&ctx, |ctx| {
+                moe::matmul_select_mxfp4_lanes(
+                    ctx,
+                    xt,
+                    lc,
+                    ls,
+                    rt,
+                    &mut y,
+                    moe::ExpertTable::RESIDENT,
+                )
+            })
             .unwrap();
             let (want, mag) = reference(&bank, &x, &routes, kk, by_token, None);
             close_dot(
@@ -872,8 +891,10 @@ fn mxfp4_lanes_guard() {
         const GUARD: u32 = 64;
         let full = gpu.zeros(tokens * top_k + GUARD, n, Dtype::Bf16);
         let mut y = Tensor::new(full.ptr, tokens * top_k, n, Dtype::Bf16);
-        moe::matmul_select_mxfp4_lanes(&ctx, xt, ct, st, rt, &mut y, moe::ExpertTable::RESIDENT)
-            .unwrap();
+        gpu.laid(&ctx, |ctx| {
+            moe::matmul_select_mxfp4_lanes(ctx, xt, ct, st, rt, &mut y, moe::ExpertTable::RESIDENT)
+        })
+        .unwrap();
         let got = gpu.read(&full);
         let live = (tokens * top_k * n) as usize;
         let past = got[live..].iter().filter(|v| **v != 0.0).count();
@@ -970,16 +991,18 @@ fn moe_matmul_affine() {
                 let xt = gpu.tensor(&x, x_rows as u32, k, Dtype::Bf16);
                 let rt = gpu.upload(&routes, tokens, top_k, Dtype::I32);
                 let mut y = gpu.zeros(tokens * top_k, n, Dtype::Bf16);
-                moe::matmul_select_quant(
-                    &ctx,
-                    xt,
-                    ct,
-                    st,
-                    Some(bt),
-                    rt,
-                    &mut y,
-                    moe::ExpertTable::RESIDENT,
-                )
+                gpu.laid(&ctx, |ctx| {
+                    moe::matmul_select_quant(
+                        ctx,
+                        xt,
+                        ct,
+                        st,
+                        Some(bt),
+                        rt,
+                        &mut y,
+                        moe::ExpertTable::RESIDENT,
+                    )
+                })
                 .unwrap();
                 let bank = if leg == "wmma" { &rounded } else { &exact };
                 let (want, mag) = reference(bank, &x, &routes, kk, by_token, None);
@@ -1032,7 +1055,10 @@ fn moe_matmul_f16() {
         let xt = gpu.tensor(&x, tokens, k, Dtype::F16);
         let rt = gpu.upload(&routes, tokens, top_k, Dtype::I32);
         let mut y = gpu.zeros(tokens * top_k, n, Dtype::F16);
-        moe::matmul_select(&ctx, xt, bt, rt, &mut y, moe::ExpertTable::RESIDENT).unwrap();
+        gpu.laid(&ctx, |ctx| {
+            moe::matmul_select(ctx, xt, bt, rt, &mut y, moe::ExpertTable::RESIDENT)
+        })
+        .unwrap();
         let (want, mag) = reference(&bank, &x, &routes, kk, true, None);
         close_dot(
             &format!("f16 dense {leg} {n}x{k}"),
@@ -1147,15 +1173,17 @@ fn moe_matmul_grouped_projection() {
             let (want, mag) = reference(&bank, &x, &routes, g, false, None);
             for identity in [true, false] {
                 let mut y = gpu.zeros(rows, n, Dtype::Bf16);
-                moe::matmul_grouped(
-                    &ctx,
-                    xt,
-                    bt,
-                    rt,
-                    &mut y,
-                    moe::ExpertTable::RESIDENT,
-                    identity,
-                )
+                gpu.laid(&ctx, |ctx| {
+                    moe::matmul_grouped(
+                        ctx,
+                        xt,
+                        bt,
+                        rt,
+                        &mut y,
+                        moe::ExpertTable::RESIDENT,
+                        identity,
+                    )
+                })
                 .unwrap();
                 close_dot(
                     &format!("grouped {groups}x{n}x{k} tokens {tokens} identity={identity}"),
@@ -1191,16 +1219,18 @@ fn moe_matmul_windowed_grouped() {
         });
         let win = gpu.ints(&[2, 1, 0, 0]);
         ctx.arm_stage(win.ptr);
-        moe::matmul_select_quant(
-            &ctx,
-            xt,
-            ct,
-            st,
-            None,
-            rt,
-            &mut y,
-            moe::ExpertTable::RESIDENT,
-        )
+        gpu.laid(&ctx, |ctx| {
+            moe::matmul_select_quant(
+                ctx,
+                xt,
+                ct,
+                st,
+                None,
+                rt,
+                &mut y,
+                moe::ExpertTable::RESIDENT,
+            )
+        })
         .unwrap();
         ctx.disarm_stage();
         let (want, mag) = reference(&bank, &x, &routes, 4, true, None);

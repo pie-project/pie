@@ -100,13 +100,17 @@ fn build(gpu: &mut Gpu, c: Case) -> Fire {
 fn rank(gpu: &mut Gpu, c: Case, f: &Fire, tuning: Tuning) -> (Vec<i32>, Vec<f32>) {
     let sel_at = gpu.zeros(f.rows * c.top_k * 4);
     let ctx = gpu.ctx().with_tuning(tuning);
+    let (h, kk, r) = (c.heads as u32, c.top_k as u32, c.ratio as u32);
+    let sel = &mut ten(sel_at, f.rows, c.top_k, I32);
+    // The ranking's slabs laid first: the scores are read where it lands them.
+    gpu.lay(&ctx, |ctx| {
+        index::topk(ctx, f.q, Some(f.w), &f.keys, h, DIM as u32, kk, r, sel)
+    });
     let scores = ctx
         .scratch_shared("test", "attn.index_topk_scores", f.rows * f.stride * 4)
         .expect("the scores scratch") as u64;
     // NaN where the scorer writes nothing.
     gpu.fill(scores, 0xff, f.rows * f.stride * 4);
-    let (h, kk, r) = (c.heads as u32, c.top_k as u32, c.ratio as u32);
-    let sel = &mut ten(sel_at, f.rows, c.top_k, I32);
     let fired = index::topk(&ctx, f.q, Some(f.w), &f.keys, h, DIM as u32, kk, r, sel);
     fired.expect("the ranking fires");
     gpu.sync();

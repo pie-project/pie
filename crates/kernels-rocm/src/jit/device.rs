@@ -11,16 +11,11 @@ struct Slab {
     bytes: usize,
 }
 
+/// One arena's slabs, each laid in memory its caller holds ([`place`]):
+/// nothing here allocates or frees device memory.
 #[derive(Default)]
 struct Arena {
-    slabs: HashMap<(&'static str, u32, usize), Slab>,
-    retired: Vec<*mut c_void>,
-    /// Slabs laid in memory the engine holds ([`place`]): never grown,
-    /// never freed here.
     placed: HashMap<(&'static str, u32, usize), Slab>,
-    /// The engine laid every slab its fires take ([`seal`]): a take past
-    /// them is a fire it did not walk, and nothing grows.
-    sealed: bool,
 }
 
 use super::ctx::{PLACED_ALIGN, SlabKey};
@@ -43,11 +38,6 @@ pub(crate) fn place(base: *mut c_void, slabs: &[(SlabKey, usize)]) {
     }
 }
 
-/// [`super::Slabs::seal`].
-pub(crate) fn seal(arena: u32) {
-    locked().entry(arena).or_default().sealed = true;
-}
-
 /// [`super::Slabs::unplaced_bytes`].
 pub(crate) fn unplaced_bytes() -> usize {
     UNPLACED.load(core::sync::atomic::Ordering::Relaxed)
@@ -55,10 +45,8 @@ pub(crate) fn unplaced_bytes() -> usize {
 
 static UNPLACED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-// SAFETY: the only pointers here are device allocations this map owns
-// outright. `hipMalloc`/`hipFree` are thread-safe and the map is behind a
-// mutex; nothing else holds a slab except a launch that has already been
-// enqueued.
+// SAFETY: the pointers here are spans of memory the placing caller holds;
+// the map is behind a mutex and never dereferences them.
 unsafe impl Send for Arena {}
 
 fn arenas() -> &'static Mutex<HashMap<u32, Arena>> {
@@ -70,15 +58,10 @@ fn locked() -> std::sync::MutexGuard<'static, HashMap<u32, Arena>> {
     arenas().lock().expect("lock poisoned")
 }
 
-/// A size-only walk's slabs (`crate::sizing`): each key's size as the walk
-/// would have grown it, and every allocation it would have made.
+/// A size-only walk's slabs (`crate::sizing`): the most each key asked.
 #[derive(Default)]
 struct Sized {
-    slabs: HashMap<(u32, &'static str, u32, usize), usize>,
-    grown: usize,
-    by_name: HashMap<&'static str, usize>,
-    /// By key: the most asked, and what growing to it allocated.
-    asked: HashMap<(u32, &'static str, u32, usize), (usize, usize)>,
+    asked: HashMap<(u32, &'static str, u32, usize), usize>,
 }
 
 thread_local! {
@@ -92,33 +75,25 @@ pub(crate) fn sizing_reset() {
 pub(crate) fn sizing_take() -> crate::sizing::Footprint {
     SIZED.with(|sized| {
         let sized = core::mem::take(&mut *sized.borrow_mut());
-        let mut slabs: Vec<(&'static str, usize)> = sized.by_name.into_iter().collect();
-        slabs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-        let mut keys: Vec<crate::sizing::Sized> = sized
-            .asked
-            .into_iter()
-            .map(|((arena, name, region, scope), (asked, grown))| crate::sizing::Sized {
-                key: SlabKey {
-                    arena,
-                    name,
-                    region,
-                    scope,
-                },
-                asked,
-                grown,
-            })
-            .collect();
-        keys.sort_by(|a, b| a.key.cmp(&b.key));
-        crate::sizing::Footprint {
-            bytes: sized.grown,
-            slabs,
-            keys,
-        }
+        crate::sizing::Footprint::of(
+            sized
+                .asked
+                .into_iter()
+                .map(|((arena, name, region, scope), asked)| crate::sizing::Sized {
+                    key: SlabKey {
+                        arena,
+                        name,
+                        region,
+                        scope,
+                    },
+                    asked,
+                })
+                .collect(),
+        )
     })
 }
 
-/// [`take_as`] in a size-only walk: the slab `grow` would leave, counted,
-/// and a stand-in address for it.
+/// [`take`] in a size-only walk: the ask counted, and a stand-in address.
 fn take_sized(
     arena: u32,
     owner: *mut c_void,
@@ -126,26 +101,11 @@ fn take_sized(
     region: u32,
     bytes: usize,
 ) -> *mut c_void {
-    let scope = scope_of(owner, region);
-    let held = locked()
-        .get(&arena)
-        .and_then(|held| held.slabs.get(&(name, region, scope)))
-        .map_or(0, |slab| slab.bytes);
+    let key = (arena, name, region, scope_of(owner, region));
     SIZED.with(|sized| {
         let mut sized = sized.borrow_mut();
-        let key = (arena, name, region, scope);
-        let have = sized.slabs.get(&key).copied().unwrap_or(held);
-        let asked = sized.asked.entry(key).or_insert((0, 0));
-        asked.0 = asked.0.max(bytes);
-        if bytes > have {
-            let want = bytes.div_ceil(SLAB_GRAIN).saturating_mul(SLAB_GRAIN);
-            sized.slabs.insert(key, want);
-            if let Some(asked) = sized.asked.get_mut(&key) {
-                asked.1 = asked.1.saturating_add(want);
-            }
-            sized.grown = sized.grown.saturating_add(want);
-            *sized.by_name.entry(name).or_insert(0) += want;
-        }
+        let asked = sized.asked.entry(key).or_insert(0);
+        *asked = (*asked).max(bytes);
     });
     crate::sizing::STAND_IN as *mut c_void
 }
@@ -154,43 +114,9 @@ pub(crate) fn attach(arena: u32, stream: *mut c_void) {
     let _ = (arena, stream);
 }
 
+/// Forgets the arena's slabs; their memory is the placing caller's.
 pub(crate) fn release(arena: u32) {
-    let Ok(api) = sys::api() else { return };
-    let mut arenas = locked();
-    let Some(held) = arenas.remove(&arena) else {
-        return;
-    };
-    for (_, slab) in held.slabs {
-        if !slab.ptr.is_null() {
-            // SAFETY: an address this map allocated with `hipMalloc` and
-            // handed to nobody who outlives the arena.
-            let _ = unsafe { (api.hip.hipFree)(slab.ptr) };
-            crate::hip::rt::freed(slab.ptr);
-        }
-    }
-    for ptr in held.retired {
-        if !ptr.is_null() {
-            // SAFETY: as above — an address this map allocated and never
-            // handed to anything that outlives the arena.
-            let _ = unsafe { (api.hip.hipFree)(ptr) };
-            crate::hip::rt::freed(ptr);
-        }
-    }
-}
-
-/// The stream's `hipStreamCaptureStatus`, or `None` when HIP would not say.
-pub(crate) fn capture_status(stream: *mut c_void) -> Option<i32> {
-    let api = sys::api().ok()?;
-    let mut status = sys::STREAM_CAPTURE_STATUS_NONE;
-    // SAFETY: `stream` is the live stream of the caller's `Ctx` (`Ctx::on`);
-    // `status` a live local.
-    if unsafe { (api.hip.hipStreamIsCapturing)(stream, &raw mut status) } != sys::HIP_SUCCESS {
-        // SAFETY: `hipGetLastError` takes nothing; it clears the error the
-        // failed query left.
-        let _ = unsafe { (api.hip.hipGetLastError)() };
-        return None;
-    }
-    Some(status)
+    locked().remove(&arena);
 }
 
 fn scope_of(stream: *mut c_void, region: u32) -> usize {
@@ -201,171 +127,40 @@ fn scope_of(stream: *mut c_void, region: u32) -> usize {
     }
 }
 
+/// The slab laid for `(name, region)` in `arena`, at least `bytes` long.
 /// `owner` is the stream a stream-scoped slab belongs to: the launching
-/// stream, or the one whose order it launches in.
+/// stream, or the one whose order it launches in. A slab is laid zeroed
+/// ([`super::Slabs::place`]), so counters a launch puts back to zero
+/// (tickets) read zero at every take. A take past what is laid is a fire
+/// no walk sized, and faults.
 pub(crate) fn take(
     arena: u32,
-    stream: *mut c_void,
     owner: *mut c_void,
     name: &'static str,
     region: u32,
     bytes: usize,
-) -> Result<*mut c_void, Fault> {
-    take_as(arena, stream, owner, name, region, bytes, false)
-}
-
-/// [`take`], a slab grown zeroed: for counters a launch leaves as it found
-/// them (each fire's last block puts its tickets back to zero).
-pub(crate) fn take_zeroed(
-    arena: u32,
-    stream: *mut c_void,
-    owner: *mut c_void,
-    name: &'static str,
-    region: u32,
-    bytes: usize,
-) -> Result<*mut c_void, Fault> {
-    take_as(arena, stream, owner, name, region, bytes, true)
-}
-
-fn take_as(
-    arena: u32,
-    stream: *mut c_void,
-    owner: *mut c_void,
-    name: &'static str,
-    region: u32,
-    bytes: usize,
-    zero: bool,
 ) -> Result<*mut c_void, Fault> {
     if bytes == 0 {
         return Ok(core::ptr::null_mut());
     }
     if crate::sizing::active() {
-        let _ = (stream, zero);
         return Ok(take_sized(arena, owner, name, region, bytes));
     }
-    let mut arenas = locked();
-    let held = arenas.entry(arena).or_default();
-    let scope = scope_of(owner, region);
-    if let Some(slab) = held.placed.get(&(name, region, scope))
-        && slab.bytes >= bytes
-    {
-        return Ok(slab.ptr);
-    }
-    if let Some(slab) = held.slabs.get(&(name, region, scope))
-        && slab.bytes >= bytes
-    {
-        return Ok(slab.ptr);
-    }
-    // An arena whose slabs are laid grows none: every fire it serves was
-    // walked, so a take past what is laid is a fire the walk did not see.
-    if held.sealed {
-        UNPLACED.fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
-        return Err(Fault::Unwarmed {
-            name,
-            have: held
-                .placed
-                .get(&(name, region, scope))
-                .map_or(0, |slab| slab.bytes),
-            need: bytes,
-        });
-    }
-    if capture_status(stream).is_some_and(|s| s != sys::STREAM_CAPTURE_STATUS_NONE) {
-        return Err(Fault::Unwarmed {
-            name,
-            have: held
-                .slabs
-                .get(&(name, region, scope))
-                .map_or(0, |slab| slab.bytes),
-            need: bytes,
-        });
-    }
-    grow(held, name, region, scope, bytes, zero)?;
-    Ok(held.slabs[&(name, region, scope)].ptr)
-}
-
-#[must_use]
-pub fn census() -> Vec<(&'static str, usize)> {
     let arenas = locked();
-    let mut by_name: HashMap<&'static str, usize> = HashMap::new();
-    for arena in arenas.values() {
-        for ((name, _, _), slab) in &arena.slabs {
-            *by_name.entry(name).or_insert(0) += slab.bytes;
+    let have = arenas
+        .get(&arena)
+        .and_then(|held| held.placed.get(&(name, region, scope_of(owner, region))));
+    match have {
+        Some(slab) if slab.bytes >= bytes => Ok(slab.ptr),
+        _ => {
+            UNPLACED.fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
+            Err(Fault::Unplaced {
+                name,
+                have: have.map_or(0, |slab| slab.bytes),
+                need: bytes,
+            })
         }
     }
-    let mut out: Vec<(&'static str, usize)> = by_name.into_iter().collect();
-    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-    out
-}
-
-const SLAB_GRAIN: usize = 8 << 20;
-
-fn grow(
-    arena: &mut Arena,
-    name: &'static str,
-    region: u32,
-    scope: usize,
-    bytes: usize,
-    zero: bool,
-) -> Result<(), Fault> {
-    let (old_ptr, old_bytes) = arena
-        .slabs
-        .get(&(name, region, scope))
-        .map_or((core::ptr::null_mut(), 0), |slab| (slab.ptr, slab.bytes));
-    if old_bytes >= bytes {
-        return Ok(());
-    }
-    let want = bytes.div_ceil(SLAB_GRAIN).saturating_mul(SLAB_GRAIN);
-    let api = sys::api().map_err(|_| Fault::Device {
-        call: "hipMalloc",
-        code: -1,
-    })?;
-    let mut fresh: *mut c_void = core::ptr::null_mut();
-
-    // SAFETY: a live local out-parameter and a byte count this caller checked
-    // is non-zero.
-    let code = unsafe { (api.hip.hipMalloc)(&raw mut fresh, want) };
-    if code == sys::ERROR_OUT_OF_MEMORY {
-        // SAFETY: `hipGetLastError` takes nothing; it clears the out-of-memory
-        // error so the next call does not see it.
-        let _ = unsafe { (api.hip.hipGetLastError)() };
-        let (mut free, mut total) = (0usize, 0usize);
-        // SAFETY: two live locals; the call only writes them.
-        let _ = unsafe { (api.hip.hipMemGetInfo)(&raw mut free, &raw mut total) };
-        return Err(Fault::Exhausted {
-            name,
-            have: old_bytes,
-            need: want,
-            free,
-        });
-    }
-    if code != sys::HIP_SUCCESS || fresh.is_null() {
-        return Err(Fault::Device {
-            call: "hipMalloc",
-            code,
-        });
-    }
-    crate::hip::rt::malloced(fresh, want);
-    if zero {
-        // SAFETY: the slab just allocated, `want` bytes long.
-        let code = unsafe { (api.hip.hipMemset)(fresh, 0, want) };
-        if code != sys::HIP_SUCCESS {
-            return Err(Fault::Device {
-                call: "hipMemset",
-                code,
-            });
-        }
-    }
-    if !old_ptr.is_null() {
-        arena.retired.push(old_ptr);
-    }
-    arena.slabs.insert(
-        (name, region, scope),
-        Slab {
-            ptr: fresh,
-            bytes: want,
-        },
-    );
-    Ok(())
 }
 
 fn current() -> Option<i32> {
