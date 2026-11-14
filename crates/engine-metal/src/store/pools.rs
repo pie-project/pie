@@ -1274,6 +1274,12 @@ impl Pools {
         self.pool.read(offset, into)
     }
 
+    /// Zeroes `len` bytes at `offset` of the pool's buffer on the host,
+    /// where no frame reads them.
+    pub fn zero_span(&mut self, offset: u64, len: u64) -> Result<()> {
+        self.pool.zero(offset, len)
+    }
+
     /// The cache table one fire binds; `q8` reads every kv pool through the
     /// 8-bit attention kernels.
     pub fn table(&self, handles: &Handles, seats: &Seats, q8: bool) -> Result<CacheTable> {
