@@ -1540,11 +1540,13 @@ impl Shell {
         let chunk = self.pools.layout().chunk_bytes.max(1);
         let model = self.arena.rung_reach(to).div_ceil(chunk);
         let lanes = u64::from(to.min(self.budgets.tokens.max_lanes));
+        // A pair's lanes are no more than its live instances, as the runtime
+        // counts its term: `min(r, max_lanes, the pair's own cap, live)`.
         let guests: u64 = self
             .programs
             .live_terms()?
             .iter()
-            .map(|term| term.bytes(lanes))
+            .map(|(term, live)| term.bytes(lanes.min(*live)))
             .sum();
         Ok((model + guests.div_ceil(chunk)) * chunk)
     }

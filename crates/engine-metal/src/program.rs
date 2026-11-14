@@ -601,17 +601,21 @@ impl Plane {
         })
     }
 
-    /// Each live (program, extents) pair's fire term, once a pair.
-    pub fn live_terms(&self) -> Result<Vec<engine::FireFacts>> {
-        let mut pairs: Vec<(ProgramId, Extents)> = Vec::new();
+    /// Each live (program, extents) pair's fire term, once a pair, with each
+    /// pair's live instances: no fire carries more lanes of a
+    /// pair than it has bound, as the runtime counts the term.
+    pub fn live_terms(&self) -> Result<Vec<(engine::FireFacts, u64)>> {
+        let mut pairs: Vec<((ProgramId, Extents), u64)> = Vec::new();
         for bound in self.instances.values() {
-            if !pairs.contains(&(bound.program_id, bound.extents)) {
-                pairs.push((bound.program_id, bound.extents));
+            let pair = (bound.program_id, bound.extents);
+            match pairs.iter_mut().find(|(seen, _)| *seen == pair) {
+                Some((_, live)) => *live += 1,
+                None => pairs.push((pair, 1)),
             }
         }
         pairs
             .iter()
-            .map(|(program, extents)| self.fire_facts(*program, extents))
+            .map(|((program, extents), live)| Ok((self.fire_facts(*program, extents)?, *live)))
             .collect()
     }
 
