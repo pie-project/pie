@@ -920,6 +920,49 @@ async fn wait_for_rung(
     ))
 }
 
+/// A fire of `rows` it cannot cut asks the activation rung for them: the
+/// ask is held (dropped once the fire settles) so the walker lowers nothing
+/// under it while it is queued, the rung is raised where it can be at once
+/// and funded beside the pass where it needs room, and this returns once
+/// fires on `engine` may take `rows`, or with what the planner refused. A
+/// fire of one row a lane asks nothing: the scheduler's lane count holds
+/// that.
+async fn ask_rung(
+    stores: &crate::store::registry::Stores,
+    engine: usize,
+    pid: uuid::Uuid,
+    quorum: uuid::Uuid,
+    rows: u32,
+) -> Result<Option<crate::store::shared::RungWant>, String> {
+    let Some(shared) = stores.shared.as_ref() else {
+        return Ok(None);
+    };
+    if rows <= 1 {
+        return Ok(None);
+    }
+    let want = crate::store::shared::want_rows(engine, rows);
+    crate::store::shared::raise_now(shared, engine, rows);
+    let funding = (crate::store::shared::fire_cap(engine)
+        < crate::store::shared::cap_for(shared, rows))
+    .then(|| {
+        let kv = stores.kv.clone();
+        RaiseFunding::start(shared.clone(), engine, pid, quorum, rows, move || {
+            crate::store::registry::with_kv_lock(&kv, "raise-funding", |kv| kv.current_epoch())
+        })
+    });
+    crate::inferlet::process::said(
+        "enqueue: the activation rung",
+        pid,
+        wait_for_rung(
+            engine,
+            rows,
+            funding.as_ref().map(|funding| move || funding.failed()),
+        ),
+    )
+    .await?;
+    Ok(Some(want))
+}
+
 impl Drop for RaiseFunding {
     fn drop(&mut self) {
         self.stopped
@@ -4366,6 +4409,16 @@ async fn fire_device_geometry<C: FireContext>(
     } else {
         vec![0; pass_lanes.places.len() + 1]
     };
+    // The fire stages its rows whole (the device places them, so it is never
+    // cut): it asks the activation rung for them, as a prompt's pass does,
+    // and holds the ask until it settles. Past the rung the scheduler keeps
+    // a fire queued until the rung is back, and nothing else raises it for
+    // a device-carried decode.
+    let rows = resolved_qo_indptr.last().copied().unwrap_or(0);
+    let rung_want = match ask_rung(&stores, ws.engine, pid, quorum_pipeline_id, rows).await {
+        Ok(want) => want,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
     let rs_ws_ids = match bound_rs_working_sets(ctx, &ws, &rs_reps, &split, &pipeline_scope)? {
         Ok(ids) => ids,
         Err(error) => return Ok(Err(error)),
@@ -4635,6 +4688,9 @@ async fn fire_device_geometry<C: FireContext>(
     epoch.retire_on(&completion);
     for part in &mut parts {
         part.kvtxn.retire_on(&completion);
+    }
+    if let Some(want) = rung_want {
+        completion.on_settled(move || drop(want));
     }
     ticket_reservation.commit();
     advance_shadow(ctx, &fwd)?;
@@ -5273,6 +5329,51 @@ mod rung_wait_tests {
         assert_eq!(wait_for_rung(UNFUNDED, 1600, unfunded).await, Ok(()));
         assert_eq!(wait_for_rung(UNFUNDED, 200, Some(|| None)).await, Ok(()));
     }
+
+    /// The MTP k=4 stall: a device-carried decode's fires of two rows sat
+    /// queued behind a rung the walker had lowered to one row, since the
+    /// scheduler's lane count asks one row a lane and nothing asked for
+    /// theirs; the scheduler keeps a fire past the rung queued, so its frame
+    /// never ran. Such a fire now asks the rung for its rows, enqueues once
+    /// the rung takes them, and holds the ask while it is queued.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_device_fire_asks_the_rung_for_its_rows_and_holds_it() {
+        const ENGINE: usize = 58;
+        let stores = super::unfolded_tests::pool_of_one_row_rs_pages();
+        let pid = uuid::Uuid::new_v4();
+        crate::store::shared::set_fire_cap_for_test(ENGINE, 1);
+        // One row a lane: the lane count holds it; it asks nothing.
+        let one = super::ask_rung(&stores, ENGINE, pid, pid, 1).await;
+        assert!(matches!(one, Ok(None)));
+        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
+
+        let raise = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            // As the walker lifts the cap toward what is asked.
+            assert_eq!(crate::store::shared::wanted_rows(ENGINE), 2);
+            crate::store::shared::set_fire_cap_for_test(ENGINE, 2);
+        });
+        let want = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::ask_rung(&stores, ENGINE, pid, pid, 2),
+        )
+        .await
+        .expect("no indefinite wait")
+        .expect("the rung takes it")
+        .expect("two rows ask");
+        raise.await.unwrap();
+        assert!(
+            crate::store::shared::fire_cap(ENGINE) >= 2,
+            "enqueued once the rung takes it"
+        );
+        assert_eq!(
+            crate::store::shared::wanted_rows(ENGINE),
+            2,
+            "the ask stands while the fire is queued"
+        );
+        drop(want);
+        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
+    }
 }
 
 #[cfg(test)]
@@ -5824,7 +5925,7 @@ mod unfolded_tests {
         assert!(check_unfolded(0, 100, 101 + most, 1000, rs::GroupFold::Device).is_err());
     }
 
-    fn pool_of_one_row_rs_pages() -> crate::store::registry::Stores {
+    pub(super) fn pool_of_one_row_rs_pages() -> crate::store::registry::Stores {
         use ::engine::chunk::{
             ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
             SlotShape,

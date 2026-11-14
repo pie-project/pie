@@ -61,11 +61,36 @@ pub fn resolve(
                 })?;
             as_u32(binding.port, &folded.value)?
         } else {
+            if binding.port == Port::Fold {
+                put_before(binding.channel, cursors)?;
+            }
             read_cell(binding.port, binding.channel, rings, cursors, shapes)?
         };
         *slot = Some(value);
     }
     Ok(out)
+}
+
+/// The `fold` cell a fire resolves is the one the step feeding it put: the
+/// cell at the channel's head has a put behind it (its tail past the head).
+/// A fire prepared before that put would fold by the cell an earlier step
+/// left, and report that count as exact; it fails by name instead.
+fn put_before(channel: u32, cursors: &[Cursor]) -> Result<()> {
+    let Some(cursor) = cursors.get(channel as usize) else {
+        return Ok(());
+    };
+    if cursor.tail > cursor.head {
+        return Ok(());
+    }
+    Err(Fault::program(
+        "program::ports",
+        format!(
+            "port fold reads cell {} of channel {channel}, which nothing has put yet \
+             (its tail is {}): the fire was prepared before the step that feeds it put its \
+             fold, and would fold by a count an earlier step left",
+            cursor.head, cursor.tail
+        ),
+    ))
 }
 
 fn read_cell(
@@ -152,5 +177,20 @@ fn as_u32(port: Port, value: &Value) -> Result<Vec<u32>> {
                 name_or_unknown(other.dtype())
             ),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cursor, put_before};
+
+    /// A fold cell is read only once the step feeding the fire has put it:
+    /// a head the tail has not passed is a fire prepared ahead of that put.
+    #[test]
+    fn a_fold_cell_is_read_only_once_it_is_put() {
+        let cursors = [Cursor { head: 3, tail: 4 }, Cursor { head: 4, tail: 4 }];
+        assert!(put_before(0, &cursors).is_ok());
+        let refused = put_before(1, &cursors).unwrap_err().to_string();
+        assert!(refused.contains("nothing has put yet"), "{refused}");
     }
 }
