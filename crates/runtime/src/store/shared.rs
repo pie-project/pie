@@ -185,6 +185,20 @@ pub fn forget_process(pid: uuid::Uuid) {
     PROCESS_WANTS.lock().unwrap().remove(&pid);
 }
 
+/// The rows past which a pass asks the activation rung for wider fires
+/// whatever the cap: a decode's few rows never do.
+pub const PASS_ASKS_FROM: usize = 16;
+
+/// Whether a pass of `rows` rows, its fires `wanted` rows wide beside the
+/// live lanes' decodes, asks the rung for them, fires now cut to `cap`:
+/// past [`PASS_ASKS_FROM`] rows, or where the cap cuts its fire narrower
+/// (a pool resting at a small rung). It asks the smallest rung that
+/// covers `wanted` ([`SharedPool::rung_for`]), not past it.
+#[must_use]
+pub fn pass_asks(rows: usize, wanted: u32, cap: u32) -> bool {
+    rows > PASS_ASKS_FROM || wanted > cap
+}
+
 /// The width a fire may take at the rung that holds `rows`: the cap the
 /// walker lifts to there (`u32::MAX` at the largest rung).
 #[must_use]
@@ -229,7 +243,7 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
         let Ok(evacuation) = pool.plan_raise(goal) else {
             return;
         };
-        if !evacuation.moves.is_empty() || pool.apply_rung(&evacuation, 0).is_err() {
+        if pool.raise_waits(&evacuation) || pool.apply_rung(&evacuation, 0).is_err() {
             return;
         }
         tracing::info!(
@@ -527,6 +541,14 @@ pub enum SegmentMove {
     /// Give back segments `prefix..` (`release_segments(prefix)`), released
     /// in the pool already.
     Release { prefix: u32 },
+    /// Back the top `n` span segments (`commit_span(n)`), where the span is
+    /// backed on demand: the rung lends a chunk there no segment backs. The
+    /// pool opens their chunks once the engine has, [`SharedPool::span_committed`].
+    CommitSpan { n: u32 },
+    /// Give back the span segments below the top `n` (`release_span(n)`),
+    /// released in the pool already: no state chunk is open there and the
+    /// rung no longer lends them.
+    ReleaseSpan { n: u32 },
     /// The highest committed segment cannot be emptied into the rest.
     NoRoom,
     /// A drained segment waits for the fire carrying its copy.
@@ -561,6 +583,9 @@ pub struct SharedPool {
     /// engine's: no fire is let past the rung held before it
     /// ([`Self::raise_applied`]).
     copying: Option<u32>,
+    /// The activation set aside before the raise whose copy is the
+    /// engine's to take: what a refused raise goes back to.
+    raise_from: Option<u32>,
     /// The registered programs' fire terms ([`programs`]).
     programs: programs::ProgramFires,
 }
@@ -618,7 +643,9 @@ impl SharedPool {
 
     /// The pool `facts` state, and `max_context` tokens the longest a
     /// working set holds. The rung starts at the largest: state never takes
-    /// the top span until a rung is lowered.
+    /// the top span until a rung is lowered. Where the span is backed on
+    /// demand, at the smallest, the rung the engine backs at load
+    /// ([`Self::start_cap`]).
     pub fn new(facts: &ChunkFacts, max_context: u32) -> Result<Self, SharedError> {
         facts
             .validate()
@@ -750,8 +777,14 @@ impl SharedPool {
             reserved_chunks: reserved,
             shapes,
             act_chunks: facts.act_chunks.clone(),
+            span_on_demand: facts.span_backed_on_demand,
         });
-        if let Some(&(rung, _)) = facts.act_chunks.last() {
+        // The span backed from the load: the pool starts at the largest
+        // rung. Backed on demand: at the smallest, the one the engine backs
+        // at load; passes raise it through `Engine::set_rung` as fires need.
+        if !facts.span_backed_on_demand
+            && let Some(&(rung, _)) = facts.act_chunks.last()
+        {
             pool.set_rung(rung)
                 .expect("an empty pool takes its largest rung");
         }
@@ -772,6 +805,7 @@ impl SharedPool {
             records_most: 0,
             least_chunks: 0,
             copying: None,
+            raise_from: None,
             programs: programs::ProgramFires::default(),
         };
         // Under the smallest rung state may take every chunk but the
@@ -1293,14 +1327,54 @@ impl SharedPool {
     /// held before, until the engine has the copy ([`Self::raise_copied`]).
     /// The engine's copy follows ([`Self::rung_moves`]); a raise that moves
     /// nothing needs none.
+    ///
+    /// The engine may refuse the copy ([`Self::raise_refused`]).
     pub fn raise_applied(&mut self, evacuation: &RungEvacuation) -> Result<(), RungError> {
         let before = self.pool.rung();
-        if evacuation.moves.is_empty() {
+        let act = self.pool.act_reserved();
+        if !self.raise_waits(evacuation) {
             return self.apply_rung(evacuation, 0);
         }
         self.apply_rung(evacuation, UNTIL_COPIED)?;
         self.copying = Some(self.copying.map_or(before, |held| held.min(before)));
+        self.raise_from = Some(self.raise_from.map_or(act, |held| held.min(act)));
         Ok(())
+    }
+
+    /// Whether `evacuation`'s raise goes through the engine before fires
+    /// take it: it moves state, which the engine copies first, or the span
+    /// is backed on demand, where the engine backs its carve for the wider
+    /// rung first (`Engine::set_rung`). With the span backed from the load,
+    /// a move-free raise makes no lane trip.
+    #[must_use]
+    pub fn raise_waits(&self, evacuation: &RungEvacuation) -> bool {
+        !evacuation.moves.is_empty() || self.pool.span_on_demand()
+    }
+
+    /// The cap fires start at: the rung the pool starts at, lifted. The
+    /// largest's (no cap) unless the span is backed on demand, where fires
+    /// start cut to the smallest rung until a raise reaches the engine.
+    #[must_use]
+    pub fn start_cap(&self) -> u32 {
+        self.lifted(self.rung())
+    }
+
+    /// Whether every rung change is told the engine (`Engine::set_rung`):
+    /// the span is backed on demand.
+    #[must_use]
+    pub fn tells_rungs(&self) -> bool {
+        self.pool.span_on_demand()
+    }
+
+    /// The engine refused `evacuation`'s raise (its carve for the wider
+    /// rung, or the copy): the raise is taken back, the state where it lay
+    /// and the activation the rung in hand's. Fires stay cut to it; a later
+    /// raise may try again. Nothing faults.
+    pub fn raise_refused(&mut self, evacuation: &RungEvacuation) {
+        if let Some(act) = self.raise_from.take() {
+            self.pool.undo_rung(evacuation, act);
+        }
+        self.copying = None;
     }
 
     /// The engine has taken a raise's copy, carried by the fire at `epoch`
@@ -1309,6 +1383,7 @@ impl SharedPool {
     pub fn raise_copied(&mut self, epoch: u64) {
         self.pool.refence(UNTIL_COPIED, epoch);
         self.copying = None;
+        self.raise_from = None;
     }
 
     /// The rung fires may not pass while a raise's copy is the engine's to
@@ -1506,12 +1581,18 @@ impl SharedPool {
         self.pool.rung()
     }
 
-    /// Lets state take the span above `rung`'s activation again.
-    pub fn lower_rung(&mut self, rung: u32) -> Result<(), RungError> {
+    /// Lets state take the span above `rung`'s activation again. Where the
+    /// span is backed on demand, the notice the engine is sent
+    /// (`Engine::set_rung(from, to)`), after the walk's retire fence: every
+    /// fire wider than `rung` has retired, so it may give back the carve
+    /// above it.
+    pub fn lower_rung(&mut self, rung: u32) -> Result<Option<(u32, u32)>, RungError> {
         if self.pool.act_chunks(rung) > self.pool.act_reserved() {
             return Err(RungError::Pool(SlotError::Occupied { rung, chunks: 0 }));
         }
-        self.pool.set_rung(rung).map_err(RungError::Pool)
+        let from = self.pool.rung();
+        self.pool.set_rung(rung).map_err(RungError::Pool)?;
+        Ok(self.tells_rungs().then_some((from, rung)))
     }
 
     // ---- segments ----
@@ -1540,9 +1621,22 @@ impl SharedPool {
         let prefix = (0..top)
             .take_while(|&s| segments.state(s) != SegmentState::Uncommitted)
             .count() as u32;
+        // A span segment backed on demand goes once the rung no longer
+        // lends it and it holds nothing.
+        if let Some(n) = self.pool.span_to_release() {
+            self.pool.release_span(n);
+            return Some(SegmentMove::ReleaseSpan { n });
+        }
         let mapped = self.mapped_segments();
         if mapped < target && prefix < top && self.pool.backs(prefix) {
             return Some(SegmentMove::Commit { prefix: prefix + 1 });
+        }
+        // The prefix is whole: the span a lowered rung lends is backed next,
+        // before state opens a chunk there.
+        if mapped < target
+            && let Some(n) = self.pool.span_to_commit()
+        {
+            return Some(SegmentMove::CommitSpan { n });
         }
         if mapped <= target || prefix == 0 {
             return None;
@@ -1588,6 +1682,12 @@ impl SharedPool {
         self.pool
             .apply_evacuation(evacuation, epoch)
             .expect("an evacuation planned under the lock applies");
+    }
+
+    /// The engine backed the top `n` span segments: the chunks of theirs the
+    /// rung lends go out now.
+    pub fn span_committed(&mut self, n: u32) {
+        self.pool.commit_span(n);
     }
 
     /// The engine backed segments `0..prefix`: their chunks go out now.

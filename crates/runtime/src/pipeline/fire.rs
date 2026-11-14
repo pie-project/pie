@@ -714,8 +714,8 @@ fn prefill_want(rows: usize, engine: usize) -> u32 {
 }
 
 /// The rows past which a pass asks the activation rung for wider fires: a
-/// decode's few rows never do.
-const RUNG_WANT_FROM: usize = 16;
+/// decode's few rows never do ([`crate::store::shared::pass_asks`]).
+const RUNG_WANT_FROM: usize = crate::store::shared::PASS_ASKS_FROM;
 
 /// How many of a pass's pieces run ahead of the one being cut while its
 /// rung's raise is pending: the device stays fed, and the rest is cut wider
@@ -3080,7 +3080,14 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // pass asks past its smallest rung, so no piece cut wider waits on a
         // lowered rung.
         let wanted = prefill_want(rows_total, engine);
-        let rung_want = (rows_total > RUNG_WANT_FROM).then(|| {
+        // A few rows ask too where the cap cuts them narrower (a pool
+        // resting at a small rung): the smallest rung that covers them.
+        let asks = crate::store::shared::pass_asks(
+            rows_total,
+            wanted,
+            crate::store::shared::fire_cap(engine),
+        );
+        let rung_want = asks.then(|| {
             let want = crate::store::shared::want_rows(engine, wanted);
             if let Some(shared) = stores.shared.as_ref() {
                 crate::store::shared::raise_now(shared, engine, wanted);
@@ -3111,7 +3118,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             })
             .max()
             .unwrap_or(0);
-        let (wanted, rung_want) = if widest > wanted && rows_total > RUNG_WANT_FROM {
+        let (wanted, rung_want) = if widest > wanted && asks {
             let want = crate::store::shared::want_rows(engine, widest);
             if let Some(shared) = stores.shared.as_ref() {
                 crate::store::shared::raise_now(shared, engine, widest);
