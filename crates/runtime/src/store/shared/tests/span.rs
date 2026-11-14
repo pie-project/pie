@@ -36,13 +36,22 @@ impl Mover for Lane {
     }
 }
 
-fn on_demand_pool() -> (SharedPool, FakeEngine) {
+/// An on-demand pool as it loads: at the smallest rung.
+fn loaded_on_demand() -> (SharedPool, FakeEngine) {
     let mut facts = facts();
     facts.span_backed_on_demand = true;
     (
         SharedPool::new(&facts, 256).unwrap(),
         FakeEngine::on_demand(),
     )
+}
+
+/// An on-demand pool raised to the largest rung, as a first wide pass
+/// takes it (the engine told), nothing held yet.
+fn on_demand_pool() -> (SharedPool, FakeEngine) {
+    let (mut pool, engine) = loaded_on_demand();
+    pool.pool_mut().set_rung(2048).unwrap();
+    (pool, engine)
 }
 
 fn state_chunks(pool: &SharedPool, records: &[u32]) -> Vec<u32> {
@@ -383,4 +392,60 @@ fn a_lower_notice_comes_after_the_retire_fence() {
     );
     // Only now is the rung lowered, and the notice it yields sent.
     assert_eq!(pool.lower_rung(256).unwrap(), Some((2048, 256)));
+}
+
+/// An on-demand pool starts at the smallest rung, the one the engine backs
+/// at load, fires cut to it. A first wider pass does not widen fires in
+/// place: the raise reaches the engine (`set_rung`) first, and only then is
+/// the cap lifted for the pass's fire.
+#[tokio::test(flavor = "current_thread")]
+async fn an_on_demand_pool_starts_at_the_smallest_rung_and_raises_through_the_engine() {
+    const ENGINE: usize = 56;
+    let (pool, mut engine) = loaded_on_demand();
+    assert_eq!(pool.rung(), 16, "the floor rung");
+    assert_eq!(pool.pool().act_reserved(), 1);
+    assert_eq!(pool.start_cap(), 16);
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let _grow = SharedGrow::new(0, ENGINE, shared.clone());
+    assert_eq!(fire_cap(ENGINE), 16, "fires start cut to it");
+    {
+        let mut pool = shared.lock().unwrap();
+        assert_eq!(
+            walk_segments(&mut pool, 6, 0, &mut engine),
+            Retarget::Reached
+        );
+    }
+    engine.calls.clear();
+    let engine = Arc::new(Mutex::new(engine));
+
+    // A pass of 2000 rows asks: nothing widens before the engine hears.
+    raise_now(&shared, ENGINE, 2000);
+    assert_eq!(shared.lock().unwrap().rung(), 16);
+    assert_eq!(fire_cap(ENGINE), 16, "no fire wider yet");
+    assert!(engine.lock().unwrap().calls.is_empty());
+
+    // The raise reaches the engine, then the pass's fire may be wide.
+    let taken = take_raise(&shared, |pool| pool.rung_for(2000), &Lane(engine.clone()))
+        .await
+        .unwrap();
+    assert!(taken.is_some());
+    assert_eq!(engine.lock().unwrap().calls, [Call::Rung(16, 2048)]);
+    raise_now(&shared, ENGINE, 2000);
+    assert_eq!(shared.lock().unwrap().rung(), 2048);
+    assert_eq!(
+        fire_cap(ENGINE),
+        u32::MAX,
+        "the cap lifted after the engine backed it"
+    );
+}
+
+/// With the flag off, a pool starts at the largest rung, fires uncut.
+#[test]
+fn with_the_flag_off_a_pool_starts_at_the_largest_rung() {
+    const ENGINE: usize = 55;
+    let pool = pool();
+    assert_eq!(pool.rung(), 2048);
+    assert_eq!(pool.start_cap(), u32::MAX);
+    let _grow = SharedGrow::new(0, ENGINE, Arc::new(Mutex::new(pool)));
+    assert_eq!(fire_cap(ENGINE), u32::MAX);
 }
