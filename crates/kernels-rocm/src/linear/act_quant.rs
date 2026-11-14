@@ -605,6 +605,10 @@ pub fn matmul_fp8b32_lanes(
 /// stage). Up to 64 rows (`kernel.fp8.decode_until` for `e4m3tile128`) on
 /// the decode tile (`dense_fp8_mfma`), past them on the prefill tiles
 /// (`dense_fp8_tiles`).
+/// The bytes one buffer descriptor reaches (`batch_plane`'s clamp in
+/// `linear/moe_kit.hip`): a plane read through one must lie under it.
+const FP8_CODES_REACH: u64 = 0xffff_f000;
+
 #[allow(clippy::too_many_arguments)]
 fn fire_fp8_dense(
     ctx: &Ctx,
@@ -618,6 +622,19 @@ fn fire_fp8_dense(
 ) -> Result<(), Error> {
     let act = q;
     let (n, k) = (codes.rows, codes.width);
+    // Both tiles read the codes through one buffer descriptor, whose reach
+    // stops short of 4 GiB (`batch_plane`, `linear/moe_kit.hip`) and whose
+    // offsets are 32-bit: a weight past it would read zeros, not fail.
+    if u64::from(n) * u64::from(k) >= FP8_CODES_REACH {
+        return Err(refuse(
+            op,
+            format!(
+                "an FP8 weight of {n} x {k} codes is {} bytes, and the FP8 tiles read a weight \
+                 under {FP8_CODES_REACH} bytes through one buffer descriptor",
+                u64::from(n) * u64::from(k)
+            ),
+        ));
+    }
     let stages = k / FP8_BLOCK;
     // SB 0: the rows a factor covers, by the factors' own shape.
     let fr = if sb == 0 {
