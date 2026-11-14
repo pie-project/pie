@@ -2943,6 +2943,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
         } else {
             Attach::No
         };
+        // What this pass claims to compute for others to wait on, held until
+        // its last piece settles.
+        let mut coalesced: Option<crate::pipeline::coalesce::ClaimGuard> = None;
         // Rows no worker here holds may be prefilled on a peer, whose pages
         // land in the host tier for the promote below to find. Media stays
         // here.
@@ -2953,8 +2956,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
             let lane = &full.lanes[0];
             // Pages another pass is computing now are waited for, not
             // computed again.
-            crate::pipeline::coalesce::before_pass(&stores, ws.id, u64::from(lane.kv.held), slots)
-                .await;
+            coalesced = crate::pipeline::coalesce::before_pass(
+                &stores,
+                ws.id,
+                u64::from(lane.kv.held),
+                slots,
+            )
+            .await;
             crate::offload::prefill::before_pass(
                 pid,
                 &stores,
@@ -3546,6 +3554,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
         }
         if let (Some(want), Some(last)) = (rung_want, submitted.last()) {
             last.on_settled(move || drop(want));
+        }
+        // The claims on what this pass computes stand until its last piece
+        // settles (its pages sealed); a pass that ends early drops them.
+        if let (Some(guard), Some(last)) = (coalesced.take(), submitted.last()) {
+            last.on_settled(move || drop(guard));
         }
         advance_cursors(&pass_lanes, Some(&landings), &matched, &fold, &settles);
         crate::probe_fire_record!(submit_probe.total_us, submit_clock.elapsed());
