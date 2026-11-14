@@ -391,3 +391,32 @@ impl<B: Backend> Pool<B> {
         buffer.zero_span(at % span, len)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::segment_chunks;
+
+    /// The last segment holds the span whole, no segment passes a binding,
+    /// and the kernels bind four at most.
+    #[test]
+    fn the_last_segment_holds_the_span() {
+        let chunk = 4 << 20;
+        for (total, binding, span) in [
+            (2256, 4u64 << 30, 40),
+            (2257, 4 << 30, 563),
+            (1001, 4 << 30, 250),
+            (64, 64 << 20, 16),
+            (60, 64 << 20, 16),
+            (64, 1 << 30, 63),
+        ] {
+            let (segment, kept) =
+                segment_chunks(chunk, total, binding, span).expect("a binding holds the span");
+            let count = kept.div_ceil(segment);
+            assert!(count <= super::SEGMENTS as u32, "{total} {span}: {count} segments");
+            assert!(u64::from(segment) * chunk <= binding);
+            assert!(kept <= total);
+            assert!(kept - (count - 1) * segment >= span, "{total} {span}");
+        }
+        assert_eq!(segment_chunks(chunk, 100, 64 << 20, 17), None);
+    }
+}

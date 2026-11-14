@@ -65,8 +65,9 @@ pub mod owners {
     /// The activation span at the top of the pool: entered as the fire's,
     /// out of the pool segment it lies in.
     pub const SPAN: Owner = Owner::fire("activation span");
-    pub const ARENA: Owner = Owner::fire("arena");
-    pub const SCRATCH: Owner = Owner::fire("scratch");
+
+    /// A kernel test's operands, outside any load.
+    pub const TEST: Owner = Owner::fire("test operands");
     pub const INPUTS: Owner = Owner::fire("inputs");
     pub const READOUT: Owner = Owner::fire("readout");
     pub const RS_SCRATCH: Owner = Owner::fire("rs scratch");

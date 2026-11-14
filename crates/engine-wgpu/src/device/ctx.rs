@@ -1196,7 +1196,7 @@ mod tests {
             return;
         }
         let device = Context::bind(&DeviceBoot::default(), engine::Allowance::WHOLE).unwrap();
-        let mut buffer = Buffer::zeroed(&device, 64, engine_gpu::books::owners::SCRATCH).unwrap();
+        let mut buffer = Buffer::zeroed(&device, 64, engine_gpu::books::owners::TEST).unwrap();
         let ramp: Vec<u8> = (1..=24).collect();
         buffer.write(0, &ramp).unwrap();
         let mut frame = device.frame().unwrap();

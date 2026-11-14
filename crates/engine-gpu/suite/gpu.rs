@@ -63,7 +63,7 @@ impl Gpu {
         let mut buf = Buffer::zeroed(
             &self.device,
             bytes.len() as u64,
-            engine_gpu::books::owners::SCRATCH,
+            engine_gpu::books::owners::TEST,
         )
         .expect("a buffer");
         buf.write(0, &bytes).expect("written");
@@ -78,7 +78,7 @@ impl Gpu {
         let mut buf = Buffer::zeroed(
             &self.device,
             bytes.len() as u64,
-            engine_gpu::books::owners::SCRATCH,
+            engine_gpu::books::owners::TEST,
         )
         .expect("a buffer");
         buf.write(0, &bytes).expect("written");
@@ -93,7 +93,7 @@ impl Gpu {
         let mut buf = Buffer::zeroed(
             &self.device,
             bytes.len() as u64,
-            engine_gpu::books::owners::SCRATCH,
+            engine_gpu::books::owners::TEST,
         )
         .expect("a buffer");
         buf.write(0, &bytes).expect("written");
@@ -108,7 +108,7 @@ impl Gpu {
         let mut buf = Buffer::zeroed(
             &self.device,
             bytes.len() as u64,
-            engine_gpu::books::owners::SCRATCH,
+            engine_gpu::books::owners::TEST,
         )
         .expect("a buffer");
         buf.write(0, &bytes).expect("written");
@@ -121,7 +121,7 @@ impl Gpu {
         let buf = Buffer::zeroed(
             &self.device,
             (n * 2) as u64,
-            engine_gpu::books::owners::SCRATCH,
+            engine_gpu::books::owners::TEST,
         )
         .expect("a buffer");
         let handle = self.handles.bind(&buf, 0, buf.bytes()).expect("bound");

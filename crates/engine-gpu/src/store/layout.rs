@@ -355,7 +355,7 @@ impl Layout {
 
     /// The pool as the runtime counts it: one shared chunk space, chunk 0
     /// null, segments of `segment_chunks` growing from the bottom where the
-    /// pool is sparse; the caller states the activation rungs (`act_chunks`).
+    /// pool is sparse; `act_chunks` the activation rungs on its top chunks.
     #[must_use]
     pub fn facts(
         &self,
@@ -363,6 +363,7 @@ impl Layout {
         committed: u32,
         rows: &[Vec<u32>],
         [host_chunks, disk_chunks]: [u32; 2],
+        act_chunks: &[(u32, u32)],
     ) -> ChunkFacts {
         let segments = self.total_chunks.div_ceil(self.segment_chunks.max(1));
         let shape = |slots: &Slots, kind: SlotKind, rows: &Vec<u32>| SlotShape {
@@ -457,7 +458,7 @@ impl Layout {
                 chunks: 1,
             }],
             shapes,
-            act_chunks: Vec::new(),
+            act_chunks: act_chunks.to_vec(),
             host_chunks,
             disk_chunks,
             disk_persistent: false,

@@ -644,15 +644,13 @@ impl<B: Backend> Pools<B> {
     /// The pool as the runtime counts it.
     #[must_use]
     pub fn chunk_facts(&self) -> ChunkFacts {
-        ChunkFacts {
-            act_chunks: self.act_chunks.clone(),
-            ..self.layout.facts(
-                self.pool.growth(),
-                self.pool.committed_segments(),
-                &self.shape_rows,
-                [self.host_chunks, self.disk_pages()],
-            )
-        }
+        self.layout.facts(
+            self.pool.growth(),
+            self.pool.committed_segments(),
+            &self.shape_rows,
+            [self.host_chunks, self.disk_pages()],
+            &self.act_chunks,
+        )
     }
 
     /// The activation span's buffer (the pool's last segment) and the byte
