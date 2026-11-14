@@ -199,7 +199,7 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
         "a disk tier is stated for the kv list"
     );
     let layout = shell.pool_layout();
-    let first = (1 + layout.seat_chunks()).div_ceil(facts.segment_chunks) * facts.segment_chunks;
+    let first = layout.free_chunk().div_ceil(facts.segment_chunks) * facts.segment_chunks;
     shell
         .commit_segments((first + 64).div_ceil(facts.segment_chunks))
         .expect("the segments commit");

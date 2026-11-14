@@ -184,7 +184,7 @@ fn serve(fixture: &Fixture, mode: Mode) -> (Vec<Vec<f32>>, u64) {
     // The weight slots from the first segment above the seats' runs, so a
     // seat-addressed fire never writes them.
     let segment = facts.segment_chunks;
-    let first = (1 + shell.pool_layout().seat_chunks()).div_ceil(segment) * segment;
+    let first = shell.pool_layout().free_chunk().div_ceil(segment) * segment;
     let (all, span) = lay(&shell, first, |_| true);
     // Room for the slots twice over: the evacuation's targets above them.
     let commit = (first + 2 * span).div_ceil(segment);
@@ -323,8 +323,9 @@ fn serve(fixture: &Fixture, mode: Mode) -> (Vec<Vec<f32>>, u64) {
         );
     }
     if mode == Mode::Host {
-        // A weight slot in the seats' runs: a seat-addressed fire refuses.
-        let (seat_named, _) = lay(&shell, 1, |atom| atom == 0);
+        // A weight slot in the seats' runs (past the null chunk and the
+        // tables run): a seat-addressed fire refuses.
+        let (seat_named, _) = lay(&shell, 1 + shell.pool_layout().tables, |atom| atom == 0);
         shell
             .weight_residency(&WeightResidency {
                 staging: Vec::new(),
@@ -512,7 +513,7 @@ fn a_held_warm_load_probe() {
     let at_load = memory_mib();
     let facts = shell.pool_chunk_facts();
     let segment = facts.segment_chunks;
-    let first = (1 + shell.pool_layout().seat_chunks()).div_ceil(segment) * segment;
+    let first = shell.pool_layout().free_chunk().div_ceil(segment) * segment;
     let resident: Vec<ResidentWeight> = if held {
         facts
             .weights

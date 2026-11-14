@@ -662,12 +662,13 @@ pub struct Cache {
     pub shape: Shape,
     /// Each plane's own copy; `None` once given back.
     hosts: Vec<Option<Host>>,
-    /// Each plane's address table, a u64 an entry, and its handle.
-    tables: Vec<(Buffer, u32)>,
+    /// Each plane's address table, a u64 an entry, and its handle: laid in
+    /// the pool's tables run ([`Cache::lay`]).
+    tables: Vec<(crate::inputs::Region, u32)>,
     /// A u32 a group (a row block, or an expert: every piece of it), and
-    /// each counting plane's handle on its groups.
-    hits: Buffer,
-    hit_handles: Vec<Option<u32>>,
+    /// each counting plane's handle on its groups and where they start.
+    hits: crate::inputs::Region,
+    hit_handles: Vec<Option<(u32, u64)>>,
     /// Each group's counter as the last [`Cache::uses`] read it.
     seen: Vec<u32>,
     /// The slot ref each atom is named, if any.
@@ -681,15 +682,38 @@ pub struct Cache {
 }
 
 impl Cache {
-    /// The device bytes of this cache's own tables: each plane's address
-    /// table and the hit counters.
+    /// The tables run's bytes a cache of `shape` lays: each plane's address
+    /// table and the hit counters, each on the arena's boundary.
     #[must_use]
-    pub fn table_bytes(&self) -> u64 {
-        self.tables
+    pub fn table_bytes_for(shape: &Shape) -> u64 {
+        let pieces = shape.pieces.max(1);
+        shape
+            .planes
             .iter()
-            .map(|(table, _)| table.bytes())
+            .map(|plane| crate::arena::room(u64::from(plane.entries) * 8))
             .sum::<u64>()
-            + self.hits.bytes()
+            + crate::arena::room(u64::from(shape.count / pieces) * 4)
+    }
+
+    /// Lays the cache's tables in regions `table` hands out of the pool's
+    /// tables run, points their handles there and writes every address
+    /// table (each atom read from its weight in place).
+    pub fn lay(
+        &mut self,
+        handles: &Handles,
+        mut table: impl FnMut(u64) -> Result<crate::inputs::Region>,
+    ) -> Result<()> {
+        let pieces = self.shape.pieces.max(1);
+        self.hits = table(u64::from(self.shape.count / pieces) * 4)?;
+        for (k, plane) in self.shape.planes.iter().enumerate() {
+            let region = table(u64::from(plane.entries) * 8)?;
+            handles.rebind_at(self.tables[k].1, region.view(), region.at(0))?;
+            self.tables[k].0 = region;
+            if let Some((handle, at)) = self.hit_handles[k] {
+                handles.rebind_at(handle, self.hits.view(), self.hits.at(at))?;
+            }
+        }
+        self.stage(None)
     }
 
     /// The cache of `shape` over the weights the load bound (`handle_of` a
@@ -705,7 +729,10 @@ impl Cache {
         let mut hosts = Vec::with_capacity(shape.planes.len());
         let mut tables = Vec::with_capacity(shape.planes.len());
         let pieces = shape.pieces.max(1);
-        let hits = Buffer::zeroed(device, u64::from(shape.count / pieces) * 4)?;
+        // The tables lie in the pool's tables run, laid once the pool is
+        // ([`Cache::lay`]): until then each handle is a row of no bytes.
+        let unlaid = Buffer::zeroed(device, 0)?;
+        let hits = crate::inputs::Region::unplaced(0, unlaid.clone());
         let mut hit_handles = Vec::with_capacity(shape.planes.len());
         for plane in &shape.planes {
             let param = plane.param;
@@ -724,18 +751,18 @@ impl Cache {
                 opened: false,
                 file: file_of(param),
             }));
-            let entries = u64::from(plane.entries);
-            let table = Buffer::zeroed(device, entries * 8)?;
-            let bound = handles.bind(&table, 0, entries * 8)?;
-            tables.push((table, bound));
-            let groups = u64::from(plane.entries / pieces);
+            let bound = handles.bind(&unlaid, 0, 0)?;
+            tables.push((crate::inputs::Region::unplaced(0, unlaid.clone()), bound));
             hit_handles.push(if plane.counts {
-                Some(handles.bind(&hits, u64::from(plane.atom / pieces) * 4, groups * 4)?)
+                Some((
+                    handles.bind(&unlaid, 0, 0)?,
+                    u64::from(plane.atom / pieces) * 4,
+                ))
             } else {
                 None
             });
         }
-        let mut cache = Cache {
+        let cache = Cache {
             slots: vec![None; shape.count as usize],
             shape,
             hosts,
@@ -746,7 +773,6 @@ impl Cache {
             preseated: false,
             hosts_resident: false,
         };
-        cache.stage(None)?;
         Ok(cache)
     }
 
@@ -754,11 +780,11 @@ impl Cache {
     /// param.
     pub fn tables(&self) -> impl Iterator<Item = (usize, Streamed)> + '_ {
         self.shape.planes.iter().enumerate().map(|(k, plane)| {
-            let (_, handle) = self.tables[k];
+            let handle = self.tables[k].1;
             let groups = plane.entries / plane.pieces.max(1);
             let at = Tensor::new(handle, plane.entries, 1, poem_ir::Dtype::I64);
-            let hits =
-                self.hit_handles[k].map(|hits| Tensor::new(hits, groups, 1, poem_ir::Dtype::U32));
+            let hits = self.hit_handles[k]
+                .map(|(hits, _)| Tensor::new(hits, groups, 1, poem_ir::Dtype::U32));
             (
                 plane.param,
                 match self.shape.kind {
