@@ -1173,6 +1173,24 @@ impl PreparedLoad<'_> {
                 layout.rs_stride(),
             )
         });
+        // The rs scratch a fire takes at most, laid once: every row of the
+        // widest fire and, for each of its lanes, the most rs rows a lane may
+        // hold unfolded, one rs page's rows, the bound the runtime holds
+        // every pass to. Never grown at a fire.
+        let rs_scratch = match (&rs_layout, &rs_buffers) {
+            (Some(layout), Some(buffers)) => {
+                let lanes = boot.budget.max_lanes.max(1);
+                let rows = boot
+                    .budget
+                    .max_tokens
+                    .saturating_add(lanes.saturating_mul(buffers.page_tokens()));
+                Some(Buffer::zeroed(
+                    &device,
+                    crate::rs::Seat::scratch_bytes(layout, rows, lanes),
+                )?)
+            }
+            _ => None,
+        };
         let nan_flags = match crate::diag::on().nan_check {
             true => Some(Buffer::zeroed(
                 &device,
@@ -1203,7 +1221,7 @@ impl PreparedLoad<'_> {
             pools,
             rs_layout,
             rs_buffers,
-            rs_scratch: None,
+            rs_scratch,
             scratch,
             inputs,
             readout,
@@ -3550,13 +3568,13 @@ impl Shell {
                 .as_ref()
                 .expect("rs_active implies a layout, checked at the lane");
             let need = crate::rs::Seat::scratch_bytes(layout, rows_ext, lane_count);
-            if self
-                .rs_scratch
-                .as_ref()
-                .is_none_or(|scratch| scratch.bytes() < need)
-            {
-                self.drain()?;
-                self.rs_scratch = Some(Buffer::zeroed(&self.device, need)?);
+            let have = self.rs_scratch.as_ref().map_or(0, Buffer::bytes);
+            if need > have {
+                return Err(Fault::Ceiling {
+                    what: "bytes of the rs scratch laid at the load for one rs page unfolded a lane",
+                    need,
+                    have,
+                });
             }
         }
 
