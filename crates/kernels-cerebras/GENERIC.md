@@ -680,6 +680,46 @@ milestone's tail.
     `PY` above 16 (hidden 3,072) and the K / V columns' entries (T = 4,608) exceed a PE: P7 v1.
   - Co-resident readings (text encoder, VAE) on one fabric: the floorplan places readings side
     by side; colours are already allocated per class.
+- **M1e, the reading's entries from the engine.** The host's ops around a stream step are the
+  engine's, computed from the step's own inputs, not taken from a capture:
+  - **The artifact states the entries** (`stream::host`, `host.json`). An array a step's inputs
+    make (a value that reaches a trace input: the host rows, each row's scalars, the lane
+    prologue's input) is also written as a gather (`entries/<k>.npy`: each word a value's
+    (row, column), flags for a one-row lane vector, f16 clamping, a flat resident). The
+    capture-fed fill goes through the same gather (`host::apply`), so the h2d files are unchanged.
+    `host.json` names the model, the reading, its classes (request words, rows) and the values
+    read back whole (`outs`). flux2-mini: 16 entries (the lane prologue's sinusoids, the entries'
+    context and patch rows, every unit's per-row positions and lane ids) over 6 values.
+  - **The engine computes them** (engine-cerebras `reading`). `Reading::step` lays the step out
+    from the classes (a lane a class; a lane whose word reads a voxel input on the latent's grid);
+    `Reading::entries` runs the trace's own entry ops (patchify, the cell table and its split, the
+    timestep and guidance sinusoids, the request ids, the context's rows) with engine-cpu's
+    `Forward::stream_values` on a weightless `Forward::host`: only the nodes the entries' values
+    need. `Reading::finish` runs the exit's ops (unpatchify) over the rows read back. No model op
+    is named in the engine: the values are the trace's, by id.
+  - **The loop** (`reading::Denoise`): the poem's flow schedule (`ScheduleFact::flow_sigmas`, the
+    guest's `FlowMatchEuler` on the host: flux2-mini's pinned sigmas resampled), timestep
+    `sigma · train_steps`, an Euler step a velocity. `wafer-bench --reading <program dir>
+    --program <compiled> --inputs <dir> --grid T,H,W --steps N --golden <dir>` runs it on the
+    simulator (or `--cmaddr`): the program loaded a step (the stream does not re-arm yet), the
+    entries written from the engine, the rows read back and finished on the host, each velocity
+    and latent against engine-cpu's. `--entries <dir>` writes a step's entries for
+    `tools/wafer/stream/run.py --entries`.
+  - **Host-only results** (engine-cerebras `a_stream_readings_entries_are_the_engines`):
+    - Every entry the engine computes for flux2-mini's step equals the capture-fed compile's,
+      bit for bit (16 arrays; also through `wafer-bench --entries`, byte for byte the h2d files).
+    - The velocity from the rows a program returns, unpatchified on the host, equals
+      `Forward::stream`'s bit for bit.
+    - The host's 2-step loop (sigmas 1.0, 0.7672, 0) through that split lands within rel L2
+      3.48e-3, cosine 0.99999393 of diffusers' loop over the same sigmas
+      (`mk_tiny_flux2.py --loop`, f32).
+  - **Simulator** (`wafer-bench --reading`, flux2-mini's full step, 60 x 28 PEs): SIM_RESULT
+  - Decode is unchanged: plan + build `diff -r` identical against 33ab39681's wafer-compile for
+    q35_08b, q35_9b, llama31-8b, gptoss_20b, gemma_e2b and tiny t08.
+  - Left for M2: the stream re-armed for a second launch (tiles kept, a step's entries
+    rewritten); the static arrays (tiles, residents) cut from a checkpoint by the engine, not
+    read from the capture (`--values` still names the weights' source); a step's inputs from a
+    guest's request (the inferlet's denoise loop driving the reading), not files.
 
 ## 5. Risks
 

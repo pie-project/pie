@@ -431,5 +431,8 @@ the row stream's order from `stream::place`, its elements (`floorplan::stream`: 
 K / V column a kv head, the lane bus) from the floorplan's `Requests::{stream, joint, lanes}`,
 their links from `Stream::wiring`, coloured and laid by the same `Palette::allocate` and
 `Fabric::lay`. `emit::stream` writes `layout.csl` and a kernel a PE kind; `stream::host` the
-arrays the host writes. The decode build never reaches any of it (its outputs are unchanged).
+arrays the host writes, and which of them a step's inputs make (`host.json`'s entries: gathers of
+the trace's values, computed each step by engine-cerebras' `reading` from the step's own inputs
+and run by `wafer-bench --reading`). The decode build never reaches any of it (its outputs are
+unchanged).
 GENERIC.md §4.1 (M1d) has the details and the simulator results; `tools/wafer/stream` runs it.

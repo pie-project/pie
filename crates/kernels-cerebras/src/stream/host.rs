@@ -238,22 +238,22 @@ pub const CLAMP: u32 = 2;
 /// `col` indexes the value's elements over every row, modulo its size (a static resident).
 pub const FLAT: u32 = 4;
 
-/// `g`'s words from the values `get` holds: (rows, width, elements) by value id.
-pub fn apply(
-    g: &[Word],
-    get: &dyn Fn(u32) -> R<(usize, usize, std::rc::Rc<Vec<f32>>)>,
-) -> R<Vec<f32>> {
-    let mut held: BTreeMap<u32, (usize, usize, std::rc::Rc<Vec<f32>>)> = BTreeMap::new();
+/// A value as [`apply`] reads it: its rows, width and elements.
+pub type Rows = (usize, usize, std::rc::Rc<Vec<f32>>);
+
+/// `g`'s words from the values `get` holds, by value id.
+pub fn apply(g: &[Word], get: &dyn Fn(u32) -> R<Rows>) -> R<Vec<f32>> {
+    let mut held: BTreeMap<u32, Rows> = BTreeMap::new();
     let mut out = Vec::with_capacity(g.len());
     for &[v, row, col, flags] in g {
         if v == NONE {
             out.push(0.0);
             continue;
         }
-        if !held.contains_key(&v) {
-            held.insert(v, get(v)?);
-        }
-        let (rows, width, d) = &held[&v];
+        let (rows, width, d) = match held.entry(v) {
+            std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::btree_map::Entry::Vacant(e) => e.insert(get(v)?),
+        };
         let at = if flags & FLAT != 0 {
             col as usize % d.len().max(1)
         } else {
@@ -262,7 +262,7 @@ pub fn apply(
             } else {
                 row as usize
             };
-            r * width + col as usize
+            r * *width + col as usize
         };
         let mut x = *d
             .get(at)

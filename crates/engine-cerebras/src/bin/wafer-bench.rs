@@ -38,7 +38,9 @@
 //! each (the program is loaded afresh a step). With `--golden`, each step's velocity is held to
 //! `cpu_velocity<i>.f32` and the latent after it to `cpu_latent<i + 1>.f32` (relative L2 1e-2,
 //! cosine 0.999). `--entries` writes the first step's entries as the h2d files they replace
-//! (`<k>.npy`) and runs nothing: `tools/wafer/stream/run.py --entries` takes them.
+//! (`<k>.npy`) and runs nothing: `tools/wafer/stream/run.py --entries` takes them. `--rows 1`:
+//! one step at the inputs' own timestep, the rows read back held to the capture the program was
+//! compiled from (`host.json`'s refs; a program cut at `--stages` reads back no velocity).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -283,8 +285,10 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
     let dir = need("inputs")?;
     let read_f32 = |p: &Path| -> Result<Vec<f32>, String> {
         let b = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
-        Ok(b.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        Ok(b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect())
     };
     let mut inputs: Vec<(String, Vec<f32>)> = Vec::new();
@@ -343,6 +347,45 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
             dot(a, b) / (dot(a, a) * dot(b, b)).sqrt(),
         )
     };
+    if get.contains_key("rows") {
+        // one step at the inputs' own timestep, the rows read back against the capture's
+        let step = reading.step(&trace, grid, &inputs);
+        let entries = reading.entries(&mut host, &step)?;
+        let t0 = std::time::Instant::now();
+        let mut rt = Runtime::new(sdk, Path::new(&program), platform, "WARNING")
+            .map_err(|e| e.to_string())?;
+        rt.load();
+        rt.run();
+        let (got, cycles) = reading.fire(&mut rt, &entries)?;
+        rt.stop();
+        let mut ok = true;
+        for c in reading.rows_back(&got)? {
+            let engine_cpu::forward::Values::F32(v) = &c.values else {
+                continue;
+            };
+            let Some((_, file)) = reading.refs.iter().find(|(r, _)| *r == c.value.0) else {
+                continue;
+            };
+            let (_, want) = kernels_cerebras::npy::read_f32_or_i32(file)?;
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            for r in 0..c.rows {
+                let row = &v[r * c.width..(r + 1) * c.width];
+                if row.iter().all(|x| !x.is_nan()) {
+                    a.extend_from_slice(row);
+                    b.extend_from_slice(&want[r * c.width..(r + 1) * c.width]);
+                }
+            }
+            let (rel, cos) = rel_cos(&a, &b);
+            ok &= rel <= 1e-2 && cos >= 0.999;
+            println!(
+                "READING_ROWS {}",
+                json!({"value": c.value.0, "rows": a.len() / c.width.max(1), "rel_l2": rel,
+                    "cosine": cos, "finite": a.iter().all(|x| x.is_finite()), "cycles": cycles,
+                    "wall_s": t0.elapsed().as_secs()})
+            );
+        }
+        return Ok(ok);
+    }
     println!(
         "READING {} {}: sigmas {:?}",
         reading.model, reading.reading, d.sigmas

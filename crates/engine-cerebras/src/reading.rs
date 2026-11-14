@@ -77,6 +77,8 @@ pub struct Reading {
     pub d2h: Vec<Back>,
     /// The values read back whole: (value, rows, width).
     pub outs: Vec<(u32, usize, usize)>,
+    /// The capture the program was compiled from, if any: each value read back, its file there.
+    pub refs: Vec<(u32, PathBuf)>,
     pub w: u32,
     pub h: u32,
 }
@@ -128,11 +130,7 @@ impl Reading {
             let entry = match a["entry"].as_str() {
                 Some(f) => {
                     let (_, w) = npy_words(&dir.join(f))?;
-                    Some(
-                        w.chunks_exact(4)
-                            .map(|c| [c[0], c[1], c[2], c[3]])
-                            .collect(),
-                    )
+                    Some(w.as_chunks::<4>().0.to_vec())
                 }
                 None => None,
             };
@@ -191,7 +189,15 @@ impl Reading {
                 ))
             })
             .collect::<R<Vec<_>>>()?;
+        let gold = host["gold"].as_str().map(PathBuf::from);
+        let refs = (host["refs"].as_array().into_iter().flatten())
+            .filter_map(|r| {
+                let file = gold.as_ref()?.join(r["file"].as_str()?);
+                Some((r["value"].as_u64()? as u32, file))
+            })
+            .collect();
         Ok(Reading {
+            refs,
             dir: dir.to_path_buf(),
             model: text(&host, "model")?,
             reading: text(&host, "reading")?,
