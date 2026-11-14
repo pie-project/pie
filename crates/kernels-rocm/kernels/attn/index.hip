@@ -450,10 +450,15 @@ __device__ __forceinline__ void radix_select(int groups, int k, int* hist, int* 
     constexpr int BINS = 2048;
     u32 prefix = 0, mask = 0;
     int rank = k;
-    // A set of one group is read once, for all three passes.
+    // A set of one narrow group is read once, for all three passes. A wide
+    // group (the walk's 32 keys a thread) is read again each pass: kept
+    // across them, its keys beside the pass's own spill under a 1024-thread
+    // block's registers, and a kernel with a private segment has ROCr grow
+    // the queue's scratch at its first dispatch.
+    constexpr bool keeps = PER <= 8;
     u32 kept[PER];
     bool kept_ok[PER];
-    if (groups == 1) group(0, kept, kept_ok);
+    if (keeps && groups == 1) group(0, kept, kept_ok);
 #pragma unroll 1
     for (int pass = 0; pass < 3; ++pass) {
         const int sh = pass == 0 ? 21 : pass == 1 ? 10 : 0;
@@ -464,7 +469,7 @@ __device__ __forceinline__ void radix_select(int groups, int k, int* hist, int* 
         for (int g = 0; g < groups; ++g) {
             u32 key[PER];
             bool ok[PER];
-            if (groups == 1) {
+            if (keeps && groups == 1) {
 #pragma unroll
                 for (int u = 0; u < PER; ++u) key[u] = kept[u], ok[u] = kept_ok[u];
             } else {
