@@ -175,6 +175,8 @@ pub struct Plane {
     /// address their span ends at (under the fire's own activation) and
     /// the bytes backed below it ([`Plane::set_span`]).
     span: [(u64, u64); 2],
+    /// The most lanes one fire carries: the rows of a wave's own tables.
+    fire_lanes: u32,
     /// The (program, extents) pairs bound now, what a fire of each takes
     /// and the instances bound at it.
     pairs: Vec<(ProgramId, Extents, FireBytes, u32)>,
@@ -226,6 +228,7 @@ impl Plane {
             closing: std::collections::BTreeSet::new(),
             fan: fan::Fan::default(),
             span: [(0, 0); 2],
+            fire_lanes: 0,
             pairs: Vec::new(),
             laid: Vec::new(),
         }
@@ -235,6 +238,11 @@ impl Plane {
     /// width: a wider group flies in several.
     pub fn set_flight(&mut self, lanes: u32) {
         self.flight = lanes.max(1);
+    }
+
+    /// The most lanes one fire carries.
+    pub fn set_fire_lanes(&mut self, lanes: u32) {
+        self.fire_lanes = lanes;
     }
 
     /// The fire in hand lays its programs in `span`: two spans, each its
@@ -253,7 +261,12 @@ impl Plane {
             .programs
             .get(&program_id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
-        Ok(fire_bytes(&program.stages(extents)?, self.flight))
+        let mut bytes = fire_bytes(&program.stages(extents)?, self.flight);
+        // The wave's own tables ride the same span, a row for every lane of
+        // the fire whatever the flights it flies in: stated whole.
+        let (lane, fixed) = Wave::lane_bytes(program.plan.package.channels.len());
+        bytes.fixed += lane * u64::from(self.fire_lanes) + fixed + 256;
+        Ok(bytes)
     }
 
     /// What the fires of every pair bound now take of a fire's span, at
@@ -682,7 +695,20 @@ impl Plane {
         if self.staged.is_empty() {
             return Ok(());
         }
-        self.wave.fly(context)?;
+        // The wave's own tables lie first in the fire's span, its groups'
+        // under them.
+        let mut spans = self.span;
+        let need = self.wave.bytes().next_multiple_of(256);
+        let Some(first) = spans.iter_mut().find(|span| span.1 >= need) else {
+            return Err(Fault::Ceiling {
+                what: "bytes of the fire's span its guests' wave lays",
+                need,
+                have: spans[0].1.max(spans[1].1),
+            });
+        };
+        first.0 -= need;
+        first.1 -= need;
+        self.wave.fly(context, first.0)?;
         let main = context.stream();
         let Plane {
             programs,
@@ -691,7 +717,6 @@ impl Plane {
             flight,
             at,
             fan,
-            span,
             laid,
             ..
         } = self;
@@ -730,7 +755,6 @@ impl Plane {
         // its flights fly one after another in it, as wide as its widest.
         // A group the span in hand has no room for takes the next, or flies
         // narrower flights: slower, never elsewhere.
-        let mut spans = *span;
         let mut laying = Vec::with_capacity(groups.len());
         let mut places = Vec::with_capacity(groups.len());
         for (program_id, extents, members) in &groups {

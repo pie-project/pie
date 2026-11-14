@@ -734,7 +734,7 @@ fn refit(
     eprintln!(
         "engine-cuda: a fire of {} tokens and {asked_lanes} lanes is served at {tokens} \
          and {lanes}: at the asked budgets a fire's working set (activation arena, attention \
-         workspaces, decoded-weight tiles, guest programs) takes {} MiB of the {} MiB this \
+         workspaces, decoded-weight tiles) takes {} MiB of the {} MiB this \
          card has after the weight tier under the load's allowance, past the half the cache \
          rows are owed and what one sequence at the declared context and the bodies' floor \
          need.",
@@ -1370,6 +1370,7 @@ impl Shell {
         // several, and its scratch is held at this width, not at the lanes.
         let flight = 1 << shell.device.device().num_sm.max(1).ilog2();
         shell.programs.set_flight(flight);
+        shell.programs.set_fire_lanes(shell.fire_lanes());
         // A program's fires lay their tables and scratch in the span the
         // runtime widens for them when it binds (`Shell::fire_facts`):
         // nothing is held for them here.
@@ -1385,10 +1386,7 @@ impl Shell {
         let held_for_fires = programs;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
-                "[arm-trace] held for fires: guest programs {} MiB at {} lanes; decoded-weight \
-                 tiles over {} stream(s) ({})",
-                programs >> 20,
-                boot.budget.max_lanes,
+                "[arm-trace] decoded-weight tiles over {} stream(s) ({})",
                 tiles.len(),
                 tiles
                     .iter()
