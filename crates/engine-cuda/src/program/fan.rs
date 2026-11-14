@@ -44,7 +44,7 @@ impl Fan {
         if width == 0 {
             return Ok(vec![main; meet.len()]);
         }
-        self.reserve(width)?;
+        self.open()?;
         let forked = match &self.forked {
             Some(event) => event,
             None => self.forked.insert(Event::new()?),
@@ -80,11 +80,15 @@ impl Fan {
         Ok(())
     }
 
-    fn reserve(&mut self, width: usize) -> Result<()> {
-        while self.side.len() < width {
+    /// Opens every side stream a fork may take, and its join event: a
+    /// stream's creation allocates on the device (a hardware queue's ring on
+    /// HIP), which a load does once, never a serving fire. Opened already,
+    /// nothing.
+    pub fn open(&mut self) -> Result<()> {
+        while self.side.len() < SIDE {
             self.side.push(open_stream()?);
         }
-        while self.joined.len() < width {
+        while self.joined.len() < SIDE {
             self.joined.push(Event::new()?);
         }
         Ok(())

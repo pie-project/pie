@@ -1356,6 +1356,9 @@ impl Shell {
             rs_ahead: std::collections::HashMap::new(),
             _released: Released,
         };
+        // The guests' fan streams open with the load, before the fit reads
+        // the card, so a serving fire never creates one.
+        shell.programs.open_fan()?;
         if !shell.graphs.records() {
             eprintln!(
                 "engine-cuda: engine.graphs is {}, a diagnostic mode — every fire \
