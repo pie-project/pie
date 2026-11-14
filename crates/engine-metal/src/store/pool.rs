@@ -192,6 +192,26 @@ pub fn top_first(total: u32, segment_chunks: u32, act: u32) -> u32 {
     start / segment_chunks.max(1) * segment_chunks.max(1)
 }
 
+/// The bytes a range of `total_chunks` chunks of `chunk_bytes` maps at
+/// most over buffers of `per` chunks: each buffer maps whole tiles of its
+/// own length (`elastic::TILE`), so a buffer whose chunks do not end on a
+/// tile maps past its share of the range. The budget the buffers draw on
+/// and the load's admission count this, not the range's bytes.
+#[must_use]
+pub fn mapped_bytes(chunk_bytes: u64, total_chunks: u32, per: u32) -> u64 {
+    #[cfg(target_vendor = "apple")]
+    let tile = elastic::TILE;
+    #[cfg(not(target_vendor = "apple"))]
+    let tile = 1u64;
+    let per = per.max(1);
+    (0..total_chunks.div_ceil(per))
+        .map(|at| {
+            let chunks = per.min(total_chunks - at * per);
+            (u64::from(chunks) * chunk_bytes).next_multiple_of(tile)
+        })
+        .sum()
+}
+
 /// The chunks each part but the last holds when one buffer binds at most
 /// `cap` bytes: whole segments, one at least.
 #[must_use]
@@ -242,8 +262,11 @@ impl Pool {
         #[cfg(target_vendor = "apple")]
         {
             let sparse = device.sparse()?;
-            let bytes = chunk_bytes.saturating_mul(u64::from(total_chunks));
-            let arena = elastic::Arena::new(elastic::pages_up(bytes));
+            let arena = elastic::Arena::new(elastic::pages_up(mapped_bytes(
+                chunk_bytes,
+                total_chunks,
+                per,
+            )));
             let mut built = Vec::with_capacity(parts as usize);
             for at in 0..parts {
                 let first = at * per;
@@ -1106,6 +1129,29 @@ mod tests {
         pool.read(5 * small + (4 << 20) - 32, &mut seen)
             .expect("a read");
         assert_eq!(seen, [6u8; 64]);
+    }
+
+    /// Buffers whose chunks do not end on a tile each map past their share
+    /// of the range: the budget counts what they map, so backing every
+    /// segment of ten one-segment buffers and the span's segment for state
+    /// fits (it was refused by the heap budget, a range's bytes rounded once).
+    #[test]
+    fn every_segment_of_many_buffers_backs_under_the_budget() {
+        let device = Context::bind().expect("a device");
+        let chunk = 1_092_608u64;
+        let seg = 61u32;
+        let total = 10 * seg;
+        let mut pool =
+            Pool::reserve(&device, chunk, total, seg, 3, u64::from(seg) * chunk).expect("a pool");
+        assert_eq!(pool.parts(), 10);
+        assert!(
+            super::mapped_bytes(chunk, total, seg) > chunk * u64::from(total),
+            "the buffers map past the range's bytes"
+        );
+        pool.cover(3 * chunk).expect("the carve");
+        pool.commit_segments(9)
+            .expect("every segment under the span's");
+        pool.commit_span(1).expect("the span's segment backs state");
     }
 
     /// The buffer index takes the bits that count the buffers under the
