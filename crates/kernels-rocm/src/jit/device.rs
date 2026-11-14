@@ -187,7 +187,18 @@ fn per_device(
 #[must_use]
 pub(crate) fn multiprocessors() -> Option<u32> {
     static COUNT: OnceLock<Mutex<HashMap<i32, Option<u32>>>> = OnceLock::new();
-    per_device(&COUNT, |o| attribute(sys::ATTR_MULTIPROCESSOR_COUNT, o))
+    per_device(&COUNT, |o| {
+        let count = attribute(sys::ATTR_MULTIPROCESSOR_COUNT, o);
+        // The launchers size their grids for MI300X's 304 CUs without it,
+        // which another part runs, only shaped for the wrong card.
+        if count.is_none() {
+            eprintln!(
+                "kernels-rocm: WARNING: device {o} did not answer its compute-unit count; the \
+                 launchers shape their grids for 304 CUs (MI300X)"
+            );
+        }
+        count
+    })
 }
 
 /// The gfx major: 9 on CDNA (gfx90a, gfx942, gfx950), 11/12 on RDNA.
