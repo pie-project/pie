@@ -179,6 +179,7 @@ fn build_model(
                     prefill_rows: g.caps.limits.prefill_rows as usize,
                     prefill_lanes: g.caps.limits.prefill_lanes as usize,
                     max_readouts: g.caps.limits.max_readouts as usize,
+                    max_unfolded_rows: g.caps.limits.max_unfolded_rows,
                 },
                 engine_backend: g.backend,
             }

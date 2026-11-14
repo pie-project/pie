@@ -21,6 +21,9 @@ pub struct SchedulerLimits {
     pub prefill_lanes: usize,
     /// 0: up to `max_forward_tokens`.
     pub max_readouts: usize,
+    /// The most recurrent rows one lane may hold unfolded
+    /// ([`::engine::FireLimits::max_unfolded_rows`]); 0: unbounded.
+    pub max_unfolded_rows: u32,
 }
 
 #[derive(Debug, Clone)]
