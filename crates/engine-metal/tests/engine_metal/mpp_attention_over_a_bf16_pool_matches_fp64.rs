@@ -40,9 +40,6 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
         return;
     };
     // MPP ships with Metal 4, which is what the elastic pool asks of the device too.
-    if !dev.supports_elastic() {
-        return;
-    }
     let handles = Handles::new();
     let pipes = Pipelines::new();
     let tuning = engine_metal::chip::tuning("[kernel]\nsdpa.prefill = \"mpp\"", false);
