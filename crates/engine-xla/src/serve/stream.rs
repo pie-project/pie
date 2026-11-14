@@ -45,14 +45,16 @@ pub(super) fn stream_fire(
         // first), so the host places their rows.
         for (feed, &(offset, lane)) in feeds.iter().zip(feed_rows) {
             debug_assert_eq!(feed.lane, lane);
-            let words = feed.src.download()?;
+            let whole = pools.buffer().ok_or_else(|| Fault::Unbound {
+                what: "the pool, which a program still holds".to_string(),
+            })?;
             for (i, &word) in feed.words.iter().enumerate() {
-                let at = word as usize * 4;
-                let w = words.get(at..at + 4).ok_or_else(|| Fault::Program {
+                let raw = whole.read_raw(i64::from(word) * 4, 4)?;
+                let w: [u8; 4] = raw.as_slice().try_into().map_err(|_| Fault::Program {
                     at: "serve::stream",
-                    why: format!("a token feed names word {word} past its buffer"),
+                    why: format!("a token feed's word {word} read short"),
                 })?;
-                ids[offset as usize + i] = i32::from_le_bytes(w.try_into().expect("four bytes"));
+                ids[offset as usize + i] = i32::from_le_bytes(w);
             }
         }
     }

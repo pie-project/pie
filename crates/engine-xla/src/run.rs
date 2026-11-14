@@ -101,6 +101,11 @@ pub struct DitBindings {
 pub struct FireBindings {
     pub tokens: Tensor,
 
+    /// Each token row's word of the pool the last guest pass put its token
+    /// in (`-1`: the host staged it in `tokens`): the fire gathers them at
+    /// its start, before any read of `tokens`.
+    pub token_words: Option<Tensor>,
+
     /// Each row's stated position: what the rotary ops read.
     pub positions: Tensor,
 

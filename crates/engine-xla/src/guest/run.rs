@@ -1019,6 +1019,12 @@ fn step_group_with(
                 &members[live[0]].bound,
             );
             let staged = stages.get(device, &plan.package, key, at, batch, carried);
+            // The puts that stay in the pool only (carried cells): the host
+            // sees every other one, a fed channel's included.
+            let pool_only: Vec<u32> = staged.as_ref().map_or_else(
+                |_| Vec::new(),
+                |s| s.layout.carried_out.iter().map(|(c, _)| *c).collect(),
+            );
             let leave = defer
                 && last == Some(at)
                 && staged
@@ -1056,7 +1062,7 @@ fn step_group_with(
                                     vals[m][id as usize] = value;
                                 }
                                 for put in &stage.puts {
-                                    if !carried.contains(&put.channel) {
+                                    if !pool_only.contains(&put.channel) {
                                         overlays[m].pending.insert(
                                             put.channel,
                                             Cell::Known(vals[m][put.value as usize].clone()),
@@ -1070,7 +1076,7 @@ fn step_group_with(
                             let layout = &left.expect("a deferred stage is kept").layout;
                             for (row, &m) in live.iter().enumerate() {
                                 for put in &stage.puts {
-                                    if !carried.contains(&put.channel) {
+                                    if !pool_only.contains(&put.channel) {
                                         let cell = match layout
                                             .outputs
                                             .iter()
