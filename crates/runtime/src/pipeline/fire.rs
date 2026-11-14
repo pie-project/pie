@@ -726,9 +726,10 @@ fn prefill_want(rows: usize, engine: usize) -> u32 {
     })
 }
 
-/// The rows past which a pass asks the activation rung for wider fires: a
-/// decode's few rows never do ([`crate::store::shared::pass_asks`]).
-const RUNG_WANT_FROM: usize = crate::store::shared::PASS_ASKS_FROM;
+/// The rows past which a pass's ask is its process's between passes
+/// ([`crate::store::shared::hold_for_process`]): a decode's few rows ask
+/// only while they are queued.
+const RUNG_WANT_FROM: usize = 16;
 
 /// How many of a pass's pieces run ahead of the one being cut while its
 /// rung's raise is pending: the device stays fed, and the rest is cut wider
@@ -920,47 +921,94 @@ async fn wait_for_rung(
     ))
 }
 
-/// A fire of `rows` it cannot cut asks the activation rung for them: the
-/// ask is held (dropped once the fire settles) so the walker lowers nothing
-/// under it while it is queued, the rung is raised where it can be at once
-/// and funded beside the pass where it needs room, and this returns once
-/// fires on `engine` may take `rows`, or with what the planner refused. A
-/// fire of one row a lane asks nothing: the scheduler's lane count holds
-/// that.
-async fn ask_rung(
+/// A pass's ask of the activation rung, the one rule for every fire the
+/// host stages (a prompt's cut pieces, a decode's few rows, a
+/// device-carried decode staged whole): a pass asks the rung for the rows
+/// its fire takes before its first fire is staged and holds the ask until
+/// its last has settled, whatever the cap is when it is cut; only a lone
+/// row the cap covers asks nothing, no cap being narrower than it.
+///
+/// The scheduler keeps a fire past the cap queued until the rung is back,
+/// and the walker cuts fires to what is asked, the live lanes' one row
+/// each otherwise: a fire wider than a row staged under a cap that covered
+/// it, asking nothing, sat queued for good once the walker took the cap
+/// down under it.
+struct RungAsk {
+    engine: usize,
+    pid: uuid::Uuid,
+    /// Held (the walker cuts nothing under it) until dropped.
+    want: crate::store::shared::RungWant,
+    /// The room the rung lacks for it, asked of the planner beside the
+    /// pass; `None` where fires may take the rows now.
+    funding: Option<RaiseFunding>,
+}
+
+/// Asks the rung on `engine` for the `rows` a fire of a pass of `own` rows
+/// takes ([`RungAsk`]; `None`: a lone row the cap covers): the rung is
+/// raised at once where nothing moves, a cap the walker lowered behind a
+/// rung still up is lifted back, and what the raise lacks is funded under
+/// the pass's process.
+fn ask_rung(
     stores: &crate::store::registry::Stores,
     engine: usize,
     pid: uuid::Uuid,
     quorum: uuid::Uuid,
+    own: usize,
     rows: u32,
-) -> Result<Option<crate::store::shared::RungWant>, String> {
-    let Some(shared) = stores.shared.as_ref() else {
-        return Ok(None);
-    };
-    if rows <= 1 {
-        return Ok(None);
+) -> Option<RungAsk> {
+    if own <= 1 && rows <= crate::store::shared::fire_cap(engine) {
+        return None;
     }
+    // Held before the cap is read: the walker takes no cap down past an
+    // ask, and `raise_now` lifts one it took before, both in the pool's
+    // lock.
     let want = crate::store::shared::want_rows(engine, rows);
-    crate::store::shared::raise_now(shared, engine, rows);
-    let funding = (crate::store::shared::fire_cap(engine)
-        < crate::store::shared::cap_for(shared, rows))
-    .then(|| {
-        let kv = stores.kv.clone();
-        RaiseFunding::start(shared.clone(), engine, pid, quorum, rows, move || {
-            crate::store::registry::with_kv_lock(&kv, "raise-funding", |kv| kv.current_epoch())
-        })
+    let funding = stores.shared.as_ref().and_then(|shared| {
+        crate::store::shared::raise_now(shared, engine, rows);
+        (crate::store::shared::fire_cap(engine) < crate::store::shared::cap_for(shared, rows)).then(
+            || {
+                let kv = stores.kv.clone();
+                RaiseFunding::start(shared.clone(), engine, pid, quorum, rows, move || {
+                    crate::store::registry::with_kv_lock(&kv, "raise-funding", |kv| {
+                        kv.current_epoch()
+                    })
+                })
+            },
+        )
     });
-    crate::inferlet::process::said(
-        "enqueue: the activation rung",
+    Some(RungAsk {
+        engine,
         pid,
-        wait_for_rung(
-            engine,
-            rows,
-            funding.as_ref().map(|funding| move || funding.failed()),
-        ),
-    )
-    .await?;
-    Ok(Some(want))
+        want,
+        funding,
+    })
+}
+
+impl RungAsk {
+    /// Returns once fires may take `width` rows, or with what the planner
+    /// refused the raise: a fire wider than the rung waits for the raise
+    /// its pass funds, never on a rung that does not come.
+    async fn wait(&self, width: u32) -> Result<(), String> {
+        crate::inferlet::process::said(
+            "enqueue: the activation rung",
+            self.pid,
+            wait_for_rung(
+                self.engine,
+                width,
+                self.funding
+                    .as_ref()
+                    .map(|funding| move || funding.failed()),
+            ),
+        )
+        .await
+    }
+
+    /// The ask stands until `last`, the pass's last fire, settles; its
+    /// funding ends here, every fire staged.
+    fn until_settled(self, last: &crate::engine::completion::WorkItemCompletion) {
+        let want = self.want;
+        last.on_settled(move || drop(want));
+    }
 }
 
 impl Drop for RaiseFunding {
@@ -3159,22 +3207,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // 6, by demand), from before it is cut until its last piece settles:
         // the pool raises toward it where room allows, and lowers once no
         // pass asks past its smallest rung, so no piece cut wider waits on a
-        // lowered rung.
+        // lowered rung. A few rows ask as a prompt does, whatever the cap
+        // is now (the smallest rung that covers them, held while they are
+        // queued); only a lone row the rung carries beside the live lanes'
+        // asks nothing, no cap being narrower than it.
         let wanted = prefill_want(rows_total, engine);
-        // A few rows ask too where the cap cuts them narrower (a pool
-        // resting at a small rung): the smallest rung that covers them.
-        let asks = crate::store::shared::pass_asks(
-            rows_total,
-            wanted,
-            crate::store::shared::fire_cap(engine),
-        );
-        let rung_want = asks.then(|| {
-            let want = crate::store::shared::want_rows(engine, wanted);
-            if let Some(shared) = stores.shared.as_ref() {
-                crate::store::shared::raise_now(shared, engine, wanted);
-            }
-            want
-        });
+        let rung_ask = ask_rung(&stores, engine, pid, quorum_pipeline_id, rows_total, wanted);
         let mut cut_at = crate::store::shared::fire_cap(engine);
         let mut cuts = pass_pieces(
             &full,
@@ -3199,14 +3237,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
             })
             .max()
             .unwrap_or(0);
-        let (wanted, rung_want) = if widest > wanted && asks {
-            let want = crate::store::shared::want_rows(engine, widest);
-            if let Some(shared) = stores.shared.as_ref() {
-                crate::store::shared::raise_now(shared, engine, widest);
-            }
-            (widest, Some(want))
+        let (wanted, rung_ask) = if widest > wanted {
+            // The wider ask stands before the narrower goes.
+            let wider = ask_rung(&stores, engine, pid, quorum_pipeline_id, rows_total, widest);
+            drop(rung_ask);
+            (widest, wider)
         } else {
-            (wanted, rung_want)
+            (wanted, rung_ask)
         };
         // The process holds the ask past this pass (an inferlet feeding a
         // prompt in several passes lowers nothing between them); a pass of a
@@ -3216,29 +3253,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
             engine,
             (rows_total > RUNG_WANT_FROM).then_some(wanted),
         );
-        // What the rung lacks for it is funded beside the pass.
-        let funding = match stores.shared.as_ref() {
-            Some(shared)
-                if rung_want.is_some()
-                    && crate::store::shared::fire_cap(engine)
-                        < crate::store::shared::cap_for(shared, wanted) =>
-            {
-                let kv = stores.kv.clone();
-                Some(RaiseFunding::start(
-                    shared.clone(),
-                    engine,
-                    pid,
-                    quorum_pipeline_id,
-                    wanted,
-                    move || {
-                        crate::store::registry::with_kv_lock(&kv, "raise-funding", |kv| {
-                            kv.current_epoch()
-                        })
-                    },
-                ))
-            }
-            _ => None,
-        };
         // What one fire would run past what a fire holds is refused here, by
         // name, rather than by the scheduler's row count.
         let capacity = crate::engine::get_spec(engine)
@@ -3354,16 +3368,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // for the raise its pass funds, or fails with what the planner
             // said: it never waits on a rung that does not come.
             let width: u32 = piece.iter().flatten().map(|&(from, to)| to - from).sum();
-            if let Err(refusal) = crate::inferlet::process::said(
-                "enqueue: the activation rung",
-                pid,
-                wait_for_rung(
-                    engine,
-                    width,
-                    funding.as_ref().map(|funding| move || funding.failed()),
-                ),
-            )
-            .await
+            if let Some(ask) = rung_ask.as_ref()
+                && let Err(refusal) = ask.wait(width).await
             {
                 return Ok(Err(refusal));
             }
@@ -3655,8 +3661,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // next pass is, rather than once this one retires.
             at += 1;
         }
-        if let (Some(want), Some(last)) = (rung_want, submitted.last()) {
-            last.on_settled(move || drop(want));
+        if let (Some(ask), Some(last)) = (rung_ask, submitted.last()) {
+            ask.until_settled(last);
         }
         // The claims on what this pass computes stand until its last piece
         // settles (its pages sealed); a pass that ends early drops them.
@@ -4410,15 +4416,22 @@ async fn fire_device_geometry<C: FireContext>(
         vec![0; pass_lanes.places.len() + 1]
     };
     // The fire stages its rows whole (the device places them, so it is never
-    // cut): it asks the activation rung for them, as a prompt's pass does,
-    // and holds the ask until it settles. Past the rung the scheduler keeps
-    // a fire queued until the rung is back, and nothing else raises it for
-    // a device-carried decode.
+    // cut): it asks the activation rung for them as every pass does
+    // ([`RungAsk`]), and is staged once the rung takes them.
     let rows = resolved_qo_indptr.last().copied().unwrap_or(0);
-    let rung_want = match ask_rung(&stores, ws.engine, pid, quorum_pipeline_id, rows).await {
-        Ok(want) => want,
-        Err(refusal) => return Ok(Err(refusal)),
-    };
+    let rung_ask = ask_rung(
+        &stores,
+        ws.engine,
+        pid,
+        quorum_pipeline_id,
+        rows as usize,
+        rows,
+    );
+    if let Some(ask) = rung_ask.as_ref()
+        && let Err(refusal) = ask.wait(rows).await
+    {
+        return Ok(Err(refusal));
+    }
     let rs_ws_ids = match bound_rs_working_sets(ctx, &ws, &rs_reps, &split, &pipeline_scope)? {
         Ok(ids) => ids,
         Err(error) => return Ok(Err(error)),
@@ -4689,8 +4702,8 @@ async fn fire_device_geometry<C: FireContext>(
     for part in &mut parts {
         part.kvtxn.retire_on(&completion);
     }
-    if let Some(want) = rung_want {
-        completion.on_settled(move || drop(want));
+    if let Some(ask) = rung_ask {
+        ask.until_settled(&completion);
     }
     ticket_reservation.commit();
     advance_shadow(ctx, &fwd)?;
@@ -5343,8 +5356,7 @@ mod rung_wait_tests {
         let pid = uuid::Uuid::new_v4();
         crate::store::shared::set_fire_cap_for_test(ENGINE, 1);
         // One row a lane: the lane count holds it; it asks nothing.
-        let one = super::ask_rung(&stores, ENGINE, pid, pid, 1).await;
-        assert!(matches!(one, Ok(None)));
+        assert!(super::ask_rung(&stores, ENGINE, pid, pid, 1, 1).is_none());
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
 
         let raise = tokio::spawn(async {
@@ -5353,14 +5365,11 @@ mod rung_wait_tests {
             assert_eq!(crate::store::shared::wanted_rows(ENGINE), 2);
             crate::store::shared::set_fire_cap_for_test(ENGINE, 2);
         });
-        let want = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            super::ask_rung(&stores, ENGINE, pid, pid, 2),
-        )
-        .await
-        .expect("no indefinite wait")
-        .expect("the rung takes it")
-        .expect("two rows ask");
+        let ask = super::ask_rung(&stores, ENGINE, pid, pid, 2, 2).expect("two rows ask");
+        tokio::time::timeout(std::time::Duration::from_secs(5), ask.wait(2))
+            .await
+            .expect("no indefinite wait")
+            .expect("the rung takes it");
         raise.await.unwrap();
         assert!(
             crate::store::shared::fire_cap(ENGINE) >= 2,
@@ -5371,8 +5380,67 @@ mod rung_wait_tests {
             2,
             "the ask stands while the fire is queued"
         );
-        drop(want);
+        drop(ask);
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
+    }
+
+    /// The MTP `--k 0 --pad 1` stall: a decode's pass of two rows was
+    /// staged while the cap stood wide (a bind had raised the rung), so it
+    /// asked nothing; the walker, seeing one live lane and no ask, then cut
+    /// fires to one row, and the scheduler kept the pass's two-row fires
+    /// queued behind a rung nothing raised. The pass now asks whatever the
+    /// cap is, and the walker cuts nothing under it until its last fire has
+    /// settled.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_few_rows_staged_under_a_wide_cap_hold_the_rung_until_they_settle() {
+        const ENGINE: usize = 49;
+        let stores = super::unfolded_tests::pool_with_rungs(vec![(1, 1), (2, 2), (4, 3)]);
+        let shared = stores.shared.clone().expect("a shared pool");
+        // The walker of a pool with one live lane, as the governor ticks it.
+        let grow =
+            crate::store::shared::SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+        let pid = uuid::Uuid::new_v4();
+        // The rung is up and fires may take any width: a cap that covers
+        // the pass.
+        assert_eq!(shared.lock().unwrap().rung(), 4);
+        assert_eq!(crate::store::shared::fire_cap(ENGINE), u32::MAX);
+
+        // A two-row pass is cut and its fire staged under that cap.
+        let ask = super::ask_rung(&stores, ENGINE, pid, pid, 2, 2)
+            .expect("two rows ask whatever the cap");
+        assert_eq!(ask.wait(2).await, Ok(()));
+        let fire = crate::engine::completion::WorkItemCompletion::new(1, 1);
+        ask.until_settled(&fire);
+
+        // The pool idles past the walker's patience with the fire queued:
+        // fires are cut to what is asked, never under the staged fire.
+        for _ in 0..2 * crate::governor::PATIENCE + 2 {
+            grow.ticked_for_test();
+            grow.walk_rung().await;
+            assert!(
+                crate::store::shared::fire_cap(ENGINE) >= 2,
+                "never cut under the staged fire"
+            );
+        }
+        assert_eq!(
+            crate::store::shared::fire_cap(ENGINE),
+            2,
+            "cut to the rung the staged fire asks, not to the live lane's row"
+        );
+        assert!(!fire.is_settled());
+
+        // Settled, the ask goes, and the walker takes the cap down to the
+        // live lane's row.
+        fire.reject("settled");
+        // A settlement runs its hooks off the caller's stack.
+        tokio::task::yield_now().await;
+        assert!(fire.is_settled());
+        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
+        for _ in 0..2 * crate::governor::PATIENCE + 2 {
+            grow.ticked_for_test();
+            grow.walk_rung().await;
+        }
+        assert_eq!(crate::store::shared::fire_cap(ENGINE), 1);
     }
 }
 
@@ -5926,6 +5994,12 @@ mod unfolded_tests {
     }
 
     pub(super) fn pool_of_one_row_rs_pages() -> crate::store::registry::Stores {
+        pool_with_rungs(Vec::new())
+    }
+
+    /// That pool with activation rungs `act_chunks` (tokens, chunks), its
+    /// span backed from the load: it starts at the largest.
+    pub(super) fn pool_with_rungs(act_chunks: Vec<(u32, u32)>) -> crate::store::registry::Stores {
         use ::engine::chunk::{
             ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
             SlotShape,
@@ -5965,6 +6039,7 @@ mod unfolded_tests {
                 shape(1, list(1), SlotRole::RsBuffer),
                 shape(2, SlotKind::Fixed { pieces: 1 }, SlotRole::State),
             ],
+            act_chunks,
             ..ChunkFacts::default()
         };
         let pool = crate::store::shared::SharedPool::new(&facts, 1024).unwrap();
