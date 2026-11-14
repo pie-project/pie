@@ -3356,6 +3356,9 @@ impl Shell {
         let mut lane_bands: Vec<Vec<i32>> = vec![Vec::new(); widths.len()];
         let mut row_bands: Vec<Vec<i32>> = vec![Vec::new(); widths.len()];
         let mut state_top = 0u32;
+        // Every physical fixed slot the fire's records name, each admitted
+        // (checked backed) once the fire's segments are committed.
+        let mut state_ids: Vec<u32> = Vec::new();
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
         let mut rs_active = false;
         // Per fire lane, the rows inside it whose state lands in a slot of its
@@ -3444,6 +3447,7 @@ impl Shell {
                 .iter()
                 .map(|&id| id.saturating_add(1))
                 .fold(state_top, u32::max);
+            state_ids.extend_from_slice(&record);
             if fresh {
                 beginning.push(record.clone());
             }
@@ -3560,6 +3564,7 @@ impl Shell {
                             .iter()
                             .map(|&id| id.saturating_add(1))
                             .fold(snap_slots, u32::max);
+                        state_ids.extend_from_slice(&record);
                         records.push(self.pools.band_ids(&record));
                     }
                     let mut at = 0usize;
@@ -3655,6 +3660,7 @@ impl Shell {
                 .iter()
                 .map(|&id| id.saturating_add(1))
                 .fold(state_top, u32::max);
+            state_ids.extend_from_slice(&state);
             let band_ids = self.pools.band_ids(&state);
             {
                 let mut at = 0usize;
@@ -3771,7 +3777,26 @@ impl Shell {
         if lanes.iter().all(|seated| !seated.refs) {
             self.pools.commit_seats()?;
         }
-        self.pools.admit(demand)?;
+        // Every page and record piece the fire reads or writes is checked
+        // backed, ref by ref: a page in an uncommitted chunk under the
+        // highest one (two-ended growth backs a bottom run and the span's
+        // top, not what lies between) is refused by name, not read.
+        for ((seat, table), &free) in seats.iter().zip(&tables).zip(&kv_less) {
+            if free || table.is_empty() {
+                continue;
+            }
+            let after = u64::from(seat.have).saturating_add(u64::from(seat.rows));
+            let pages = usize::try_from(after.div_ceil(page_size).max(1)).unwrap_or(usize::MAX);
+            for &page in table.iter().take(pages) {
+                self.pools.admit_list_page(page)?;
+            }
+        }
+        for &(page, _) in writes.iter().flatten() {
+            self.pools.admit_list_page(page.max(0) as u32)?;
+        }
+        for &id in &state_ids {
+            self.pools.admit_state_slot(id)?;
+        }
 
         if !beginning.is_empty() && self.pools.has_state() {
             self.drain()?;

@@ -1989,30 +1989,20 @@ impl Pools {
         Ok(Spill::slots(self.disk.as_ref()))
     }
 
-    /// Checks what a fire touches is committed: `demand`'s kv pages and
-    /// state slots are one past the highest physical page and slot it
-    /// names. An unmapped tile read by a kernel faults the whole queue.
-    pub fn admit(&self, demand: engine::frame::Demand) -> Result<()> {
-        if demand.workspace > 0 {
-            return Err(Fault::Ceiling {
-                what: "pool workspace bytes",
-                need: demand.workspace,
-                have: 0,
-            });
+    /// Checks the chunk kv list page id `id` names backed.
+    pub fn admit_list_page(&self, id: u32) -> Result<()> {
+        let list = *self.shape(LIST)?;
+        self.pool
+            .admit(self.pool.page_slot(id, list.per_chunk) / list.per_chunk.max(1))
+    }
+
+    /// Checks the chunk physical fixed slot `slot` lies in backed, where
+    /// the pool holds state.
+    pub fn admit_state_slot(&self, slot: u32) -> Result<()> {
+        match self.layout.fixed {
+            Some(fixed) if self.has_state() => self.pool.admit(slot / fixed.per_chunk.max(1)),
+            _ => Ok(()),
         }
-        if demand.kv_pages > 0
-            && let Some(list) = self.layout.list
-        {
-            self.pool.admit((demand.kv_pages - 1) / list.per_chunk)?;
-        }
-        if demand.state_slots > 0
-            && self.has_state()
-            && let Some(fixed) = self.layout.fixed
-        {
-            self.pool
-                .admit((demand.state_slots - 1) / fixed.per_chunk)?;
-        }
-        Ok(())
     }
 
     /// Backs the pool's first `segments` segments.
@@ -2025,27 +2015,6 @@ impl Pools {
     pub fn commit_seats(&mut self) -> Result<()> {
         let chunks = self.layout.free_chunk();
         let segments = chunks
-            .div_ceil(self.layout.segment_chunks.max(1))
-            .min(self.pool.segments());
-        self.pool.commit_segments(segments)
-    }
-
-    /// Backs every segment up to the highest physical page and slot
-    /// `demand` names (one past each, as [`Pools::admit`] reads them).
-    pub fn commit_for(&mut self, demand: engine::frame::Demand) -> Result<()> {
-        let mut chunk = 0u32;
-        if demand.kv_pages > 0
-            && let Some(list) = self.layout.list
-        {
-            chunk = chunk.max((demand.kv_pages - 1) / list.per_chunk);
-        }
-        if demand.state_slots > 0
-            && self.has_state()
-            && let Some(fixed) = self.layout.fixed
-        {
-            chunk = chunk.max((demand.state_slots - 1) / fixed.per_chunk);
-        }
-        let segments = (chunk + 1)
             .div_ceil(self.layout.segment_chunks.max(1))
             .min(self.pool.segments());
         self.pool.commit_segments(segments)
