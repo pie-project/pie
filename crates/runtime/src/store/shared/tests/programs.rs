@@ -32,13 +32,29 @@ fn at(program: ProgramId, rows: u32) -> FireKey {
     }
 }
 
-/// 20 MiB a fire and 256 KiB a lane: a rung of 16 tokens 24 MiB (2
-/// chunks), one of 256 or more 64 lanes, 36 MiB (3 chunks).
+/// 36 MiB a fire, nothing a lane: 3 chunks at every rung, however many
+/// instances are live.
 fn fire_facts() -> FireFacts {
+    FireFacts {
+        fixed: 36 * MIB,
+        ..FireFacts::default()
+    }
+}
+
+/// 20 MiB a fire and 256 KiB a lane: 16 lanes 24 MiB (2 chunks), 64 lanes
+/// 36 MiB (3 chunks).
+fn lane_facts() -> FireFacts {
     FireFacts {
         fixed: 20 * MIB,
         a_lane: 256 << 10,
         ..FireFacts::default()
+    }
+}
+
+/// Binds `n` instances of `key`, ids from `from`.
+fn bind_live(pool: &mut SharedPool, key: FireKey, from: u64, n: u64) {
+    for id in from..from + n {
+        pool.instance_bound(InstanceId(id), key);
     }
 }
 
@@ -147,28 +163,37 @@ async fn a_zero_fire_term_leaves_the_rung_arithmetic_unchanged() {
     assert_eq!(shared.lock().unwrap().pool().act_reserved(), 4);
 }
 
-/// A rung's activation is the model's chunks plus the term's at its lanes,
-/// the lanes capped by the engine's `max_lanes`; only while an instance of
-/// the program can be in a fire.
+/// A rung's activation is the model's chunks plus the term's at its lanes:
+/// `min(r, FireLimits::max_lanes, the pair's max_lanes, its live
+/// instances)`. Each bind grows it, each close shrinks it.
 #[test]
 fn the_fire_term_takes_its_chunks_at_every_rung_s_lanes() {
     let (mut pool, _) = pool_at_256();
-    pool.fire_facts_learned(key(PROGRAM), &fire_facts());
+    pool.fire_facts_learned(key(PROGRAM), &lane_facts());
     assert_eq!(pool.pool().act_chunks(256), 4, "registered, no instance");
+    // One live instance: one lane at every rung, 20.25 MiB, 2 chunks.
     pool.instance_bound(InstanceId(1), key(PROGRAM));
-    // 16 lanes: 20 + 4 MiB, 2 chunks; 64 lanes: 20 + 16 MiB, 3 chunks.
+    assert_eq!(pool.pool().act_chunks(16), 1 + 2);
+    assert_eq!(
+        pool.pool().act_chunks(2048),
+        12 + 2,
+        "one live instance: one lane"
+    );
+    // 64 live: 16 lanes at 16 (24 MiB, 2 chunks), 64 past it (36 MiB, 3).
+    bind_live(&mut pool, key(PROGRAM), 2, 63);
     assert_eq!(pool.pool().act_chunks(16), 1 + 2);
     assert_eq!(pool.pool().act_chunks(256), 4 + 3);
     assert_eq!(pool.pool().act_chunks(2048), 12 + 3, "lanes capped at 64");
-    // Two instances count the program once.
-    pool.instance_bound(InstanceId(2), key(PROGRAM));
-    assert_eq!(pool.pool().act_chunks(256), 4 + 3);
+    // More live than the fire carries: still the fire's 64.
+    bind_live(&mut pool, key(PROGRAM), 65, 10);
+    assert_eq!(pool.pool().act_chunks(2048), 12 + 3);
     // The span set aside at 256 no longer holds the 256 rung.
     assert_eq!(pool.span_short(256), 3);
     assert_eq!(pool.rung(), 16, "4 chunks hold the 16 rung with its term");
-    pool.instance_closed(InstanceId(1));
-    assert_eq!(pool.pool().act_chunks(256), 4 + 3);
-    pool.instance_closed(InstanceId(2));
+    // Closes shrink it, a live instance a lane, to nothing with the last.
+    for id in 1..=74 {
+        pool.instance_closed(InstanceId(id));
+    }
     assert_eq!(pool.pool().act_chunks(256), 4, "the last closed: gone");
     assert_eq!(pool.rung(), 256);
 }
@@ -302,8 +327,8 @@ async fn a_program_s_fire_term_widens_the_span_before_its_bind_and_its_close_giv
 }
 
 /// A program that flies at most 16 lanes a fire takes its term at 16 lanes
-/// on every rung past 16 tokens: `fixed + min(r, max_lanes, program
-/// max_lanes) × a_lane`.
+/// on every rung past 16 tokens, however many are live: `fixed + min(r,
+/// max_lanes, program max_lanes, live) × a_lane`.
 #[test]
 fn a_program_s_own_lane_cap_bounds_its_term() {
     let (mut pool, _) = pool_at_256();
@@ -311,18 +336,18 @@ fn a_program_s_own_lane_cap_bounds_its_term() {
         key(PROGRAM),
         &FireFacts {
             max_lanes: 16,
-            ..fire_facts()
+            ..lane_facts()
         },
     );
-    pool.instance_bound(InstanceId(1), key(PROGRAM));
+    bind_live(&mut pool, key(PROGRAM), 1, 64);
     // 20 + 16 x 0.25 MiB = 24 MiB, 2 chunks, at 16, 256 and 2048 alike.
     assert_eq!(pool.pool().act_chunks(16), 1 + 2);
     assert_eq!(pool.pool().act_chunks(256), 4 + 2);
     assert_eq!(pool.pool().act_chunks(2048), 12 + 2);
-    // Beside an uncapped program: each takes its own lanes.
+    // Beside an uncapped program with 64 live: each takes its own lanes.
     const OTHER: ProgramId = ProgramId(8);
-    pool.fire_facts_learned(key(OTHER), &fire_facts());
-    pool.instance_bound(InstanceId(2), key(OTHER));
+    pool.fire_facts_learned(key(OTHER), &lane_facts());
+    bind_live(&mut pool, key(OTHER), 100, 64);
     // 24 + 36 MiB = 60 MiB, 4 chunks.
     assert_eq!(pool.pool().act_chunks(256), 4 + 4);
 }
@@ -795,4 +820,74 @@ async fn a_bind_the_engine_refuses_closes_its_term_as_if_it_never_happened() {
     assert_eq!(shared.lock().unwrap().pool().act_chunks(256), 4 + 8);
     shared.lock().unwrap().instance_closed(InstanceId(7));
     assert!(shared.lock().unwrap().pool().fire().is_empty());
+}
+
+/// Each bind of a pair grows its term by a live instance, and widens the
+/// span through fund_span before the bind is sent; each close shrinks it,
+/// and the next lower gives the room back.
+#[tokio::test(flavor = "current_thread")]
+async fn each_bind_grows_the_term_and_each_close_shrinks_it() {
+    let (mut pool, engine) = pool_at_256();
+    // 8 MiB a lane: two live take 1 chunk, three take 2.
+    pool.fire_facts_learned(
+        key(PROGRAM),
+        &FireFacts {
+            a_lane: 8 * MIB,
+            ..FireFacts::default()
+        },
+    );
+    bind_live(&mut pool, key(PROGRAM), 1, 2);
+    let evacuation = pool.plan_raise(256).unwrap();
+    pool.apply_rung(&evacuation, 0).unwrap();
+    assert_eq!(pool.pool().act_reserved(), 4 + 1);
+    let shared: Shared = Arc::new(Mutex::new(pool));
+
+    // A third bind: its guard grows the term before it is sent.
+    let open = ProgramOpen::new(&shared, key(PROGRAM)).unwrap();
+    assert_eq!(
+        shared.lock().unwrap().span_short(256),
+        1,
+        "three live: one chunk more"
+    );
+    fund_span(
+        &shared,
+        || 256,
+        &NoPlanner,
+        &Lane(Arc::new(Mutex::new(engine))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        shared.lock().unwrap().pool().act_reserved(),
+        4 + 2,
+        "widened before the bind"
+    );
+    shared
+        .lock()
+        .unwrap()
+        .instance_bound(InstanceId(3), key(PROGRAM));
+    drop(open);
+    assert_eq!(shared.lock().unwrap().pool().act_chunks(256), 4 + 2);
+
+    // A close shrinks it; the walk lowers once fires cut to the old span
+    // have retired.
+    shared.lock().unwrap().instance_closed(InstanceId(3));
+    let pool = shared.lock().unwrap();
+    assert_eq!(pool.pool().act_chunks(256), 4 + 1, "two live again");
+    let mut walk = RungWalk::default();
+    assert_eq!(
+        walk.step(&pool, 256, 256, 256, 5, 4).unwrap(),
+        RungStep::Wait
+    );
+    assert_eq!(
+        walk.step(&pool, 256, 256, 256, 5, 5).unwrap(),
+        RungStep::Lower(256)
+    );
+    drop(pool);
+    shared.lock().unwrap().lower_rung(256).unwrap();
+    assert_eq!(
+        shared.lock().unwrap().pool().act_reserved(),
+        4 + 1,
+        "the room is back"
+    );
 }
