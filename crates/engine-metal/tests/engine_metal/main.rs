@@ -1,5 +1,6 @@
 //! engine-metal's integration tests, one binary: each module was a test file.
 
+mod a_bank_past_2_gib_reads_its_last_rows;
 mod a_buffered_fold_is_the_fold_it_replaces;
 mod a_column_cut_of_a_bank_multiplies_as_its_copy;
 mod a_copied_window_is_one_encode_over_the_same_rows;
