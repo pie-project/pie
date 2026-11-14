@@ -394,6 +394,9 @@ impl Engine for Xla {
         let mut shell = shell;
         if boot.prewarm {
             shell.prewarm().map_err(fault)?;
+            // The program a bind or a host pass lands guest cells with.
+            let (rows, _) = shell.pool_geometry();
+            crate::guest::run::cells_program(shell.device(), rows).map_err(Error::Load)?;
             // from here a program built is a fire the ladder missed
             shell.device().seal();
         }
@@ -464,6 +467,8 @@ impl Engine for Xla {
         };
         self.programs.seat(budgets.max_lanes);
         self.programs.seat_readouts(shell.readouts());
+        let (rows, sink_row) = shell.pool_geometry();
+        self.programs.seat_pool(rows, sink_row);
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -586,7 +591,9 @@ impl Engine for Xla {
                 caps.ports, caps.geometry, binding.geometry
             )));
         }
-        let bound = self.programs.bind(binding).map_err(refusal)?;
+        let shell = self.shell.as_ref();
+        let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));
+        let bound = self.programs.bind(binding, &cell_row).map_err(refusal)?;
         let seeds: Vec<(u32, Vec<u8>)> = binding
             .seeds
             .iter()
@@ -1025,13 +1032,13 @@ impl Xla {
         if prologues.is_empty() {
             return Ok(());
         }
-        let device = self
+        let (device, pool) = self
             .shell
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| Error::Load("the xla engine has no model loaded".into()))?
-            .device();
+            .device_and_pool();
         self.programs
-            .fire_guests(device, &prologues, None, Stage::Prologue)
+            .fire_guests(device, &prologues, None, pool, Stage::Prologue)
             .map_err(refusal)?;
         Ok(())
     }
@@ -1431,17 +1438,18 @@ impl Xla {
             .collect();
         let mut on_device = vec![false; submission.lanes.len()];
         if !attached.is_empty() {
-            let device = self
+            let (device, pool) = self
                 .shell
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| Error::Load("the xla engine has no model loaded".into()))?
-                .device();
+                .device_and_pool();
             let ran = self
                 .programs
                 .fire_guests_with(
                     device,
                     &attached,
                     kept.as_deref(),
+                    pool,
                     Some(latch),
                     Stage::Epilogue,
                 )

@@ -135,6 +135,7 @@ pub fn admits(package: &LaunchPackage) -> Result<(), Refused> {
                 reads: Vec::new(),
             },
             &carried_channels(package),
+            1,
         )?;
     }
     Ok(())

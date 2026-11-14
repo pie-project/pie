@@ -956,6 +956,39 @@ impl Pools {
         slots.iter().map(|&slot| self.grain(id, slot)).collect()
     }
 
+    /// The pool's rows (u32 `[rows, 128]`).
+    #[must_use]
+    pub fn rows(&self) -> i64 {
+        i64::try_from(u64::from(self.chunks) * self.layout.chunk_bytes / ROW_BYTES)
+            .unwrap_or(i64::MAX)
+    }
+
+    /// The sink chunk's first row: where a padding lane's guest cells go.
+    #[must_use]
+    pub fn sink_row(&self) -> u32 {
+        narrow(u64::from(self.sink_chunk()) * self.layout.chunk_bytes / ROW_BYTES)
+    }
+
+    /// The pool buffer itself, for programs that take it beside the
+    /// tracer's (guest stages carrying cells).
+    pub fn buffer_mut(&mut self) -> &mut Option<Buffer> {
+        &mut self.buffer
+    }
+
+    /// The pool row `Channel` slot ref `slot` starts at
+    /// ([`layout::CHANNEL`], 1 KiB slots).
+    #[must_use]
+    pub fn channel_row(&self, slot: u32) -> Option<u32> {
+        let per = u32::try_from(self.layout.chunk_bytes / crate::guest::CHANNEL_SLOT).ok()?;
+        let chunk = self.table.physical(slot / per.max(1))?;
+        if chunk == NULL_CHUNK || chunk >= self.sink_chunk() {
+            return None;
+        }
+        let at = u64::from(chunk) * self.layout.chunk_bytes
+            + u64::from(slot % per.max(1)) * crate::guest::CHANNEL_SLOT;
+        u32::try_from(at / ROW_BYTES).ok()
+    }
+
     /// The sink chunk: the pool's top one.
     #[must_use]
     pub fn sink_chunk(&self) -> u32 {
