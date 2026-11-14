@@ -21,7 +21,12 @@
 //! A ring an instance holds itself is the instance's item. A registered
 //! channel's ring is the channel's, shared by every instance bound to it,
 //! and freed once the channel is closed and the last of them has closed
-//! too.
+//! too. An adapter is keyed by its content ([`Engine::adapter_key`]): every
+//! instance whose binding lands the same planes holds the one item, taken
+//! at the first bind and freed at the last close; it parks only when every
+//! instance holding it parks, and each holder is rebound to where it lands.
+//!
+//! [`Engine::adapter_key`]: ::engine::Engine::adapter_key
 //!
 //! An engine that states neither shape has no [`Roles`]: it keeps its
 //! tables and rings itself, as before.
@@ -52,6 +57,8 @@ use super::slots::SlotError;
 pub enum Owner {
     Instance(InstanceId),
     Channel(ChannelId),
+    /// An adapter, by its content key, shared by the instances that land it.
+    Adapter(u128),
 }
 
 impl Owner {
@@ -91,6 +98,8 @@ pub enum RolesError {
     Program(ProgramId),
     #[error("channel {0} is parked with its process")]
     Parked(ChannelId),
+    #[error("the adapter this binding lands is parked with the instances that hold it")]
+    AdapterParked,
     #[error(
         "no chunk has {slots} adjacent free {role:?} slots for an item that must lie in one run"
     )]
@@ -131,15 +140,17 @@ struct Part {
 struct Item {
     holder: Option<Holder>,
     tier: Tier,
-    /// An instance: its tables' part, then each ring it holds itself, then
-    /// its adapter's. A channel: its ring's part.
+    /// An instance: its tables' part, then each ring it holds itself. A
+    /// channel: its ring's part. An adapter: its planes' part.
     parts: Vec<Part>,
     /// An instance: each own ring's channel index, in part order after the
     /// first.
     rings: Vec<u32>,
     /// An instance: the registered channels with slots it is bound to.
     channels: Vec<ChannelId>,
-    /// A channel: the instances bound to it.
+    /// An instance: the adapter it holds, by its key.
+    adapter: Option<u128>,
+    /// A channel or an adapter: the instances bound to it.
     attached: BTreeSet<InstanceId>,
     /// A channel: still registered. An instance: still bound.
     open: bool,
@@ -155,6 +166,7 @@ impl Item {
             parts,
             rings: Vec::new(),
             channels: Vec::new(),
+            adapter: None,
             attached: BTreeSet::new(),
             open: true,
             stale: false,
@@ -173,12 +185,15 @@ impl Item {
 /// it: [`Roles::bound`] keeps them, [`Roles::untake`] gives them back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Taken {
-    /// The tables' part, then each own ring's, then the adapter's.
+    /// The tables' part, then each own ring's.
     parts: Vec<Part>,
     /// Each own ring's channel index, in part order after the first.
     rings: Vec<u32>,
     /// The registered channels with slots the binding names.
     channels: Vec<ChannelId>,
+    /// The adapter the binding lands: its key, its slots, and whether they
+    /// were taken for it (the first holder) or are another's.
+    adapter: Option<(u128, Part, bool)>,
 }
 
 impl Taken {
@@ -199,7 +214,9 @@ impl Taken {
     /// [`::engine::InstanceBinding::adapter_slots`].
     #[must_use]
     pub fn adapter_slots(&self) -> Vec<u32> {
-        adapter_of(&self.rings, &self.parts)
+        self.adapter
+            .as_ref()
+            .map_or_else(Vec::new, |(_, part, _)| part.refs.clone())
     }
 }
 
@@ -357,12 +374,15 @@ impl Roles {
     /// `footprint.slots` of the `Instance` shape (cells are packed whole, so
     /// the engine counts, not the bytes), for each ring of the program no
     /// registered channel covers (`registered`), its slots of the `Channel`
-    /// shape, and its adapter's slots of the `Adapter` shape.
+    /// shape, and for the adapter it lands (`adapter`, its key) the slots
+    /// of the `Adapter` shape another instance already holds for that key,
+    /// else fresh ones.
     pub fn take_instance(
         &mut self,
         program: ProgramId,
         channels: &[ChannelId],
         registered: impl Fn(ChannelId) -> bool,
+        adapter: Option<u128>,
     ) -> Result<Taken, RolesError> {
         let facts = self
             .programs
@@ -415,17 +435,28 @@ impl Roles {
             }
         }
         let footprint = facts.adapter;
-        match self.take(
-            &device,
-            SlotRole::Adapter,
-            footprint.slots,
-            footprint.contiguous,
-        ) {
-            Ok(part) => taken.parts.push(part),
-            Err(error) => {
-                self.give(&device, &taken.parts);
-                return Err(error);
-            }
+        if let Some(key) = adapter.filter(|_| footprint.slots > 0) {
+            taken.adapter = match self.items.get(&Owner::Adapter(key)) {
+                Some(item) if item.tier == Tier::Device => {
+                    Some((key, item.parts[0].clone(), false))
+                }
+                Some(_) => {
+                    self.give(&device, &taken.parts);
+                    return Err(RolesError::AdapterParked);
+                }
+                None => match self.take(
+                    &device,
+                    SlotRole::Adapter,
+                    footprint.slots,
+                    footprint.contiguous,
+                ) {
+                    Ok(part) => Some((key, part, true)),
+                    Err(error) => {
+                        self.give(&device, &taken.parts);
+                        return Err(error);
+                    }
+                },
+            };
         }
         Ok(taken)
     }
@@ -433,6 +464,9 @@ impl Roles {
     /// The bind of `taken` failed: its slots go back.
     pub fn untake(&mut self, taken: Taken) {
         self.give(&self.device, &taken.parts);
+        if let Some((_, part, true)) = taken.adapter {
+            self.give(&self.device, &[part]);
+        }
     }
 
     /// The engine bound `taken` as instance `id`, for `holder`.
@@ -445,7 +479,23 @@ impl Roles {
         let mut item = Item::new(holder, taken.parts);
         item.rings = taken.rings;
         item.channels = taken.channels;
-        if item.parts.iter().all(|part| part.refs.is_empty()) && item.channels.is_empty() {
+        if let Some((key, part, _)) = taken.adapter {
+            let shared = self
+                .items
+                .entry(Owner::Adapter(key))
+                .or_insert_with(|| {
+                    let mut adapter = Item::new(holder, vec![part]);
+                    // Held by its instances alone: freed at the last close.
+                    adapter.open = false;
+                    adapter
+                });
+            shared.attached.insert(id);
+            item.adapter = Some(key);
+        }
+        if item.parts.iter().all(|part| part.refs.is_empty())
+            && item.channels.is_empty()
+            && item.adapter.is_none()
+        {
             return;
         }
         self.items.insert(Owner::Instance(id), item);
@@ -460,10 +510,14 @@ impl Roles {
             return;
         };
         item.open = false;
-        let channels = item.channels.clone();
+        let shared: Vec<Owner> = item
+            .channels
+            .iter()
+            .map(|&channel| Owner::Channel(channel))
+            .chain(item.adapter.map(Owner::Adapter))
+            .collect();
         self.free_if_done(owner);
-        for channel in channels {
-            let owner = Owner::Channel(channel);
+        for owner in shared {
             if let Some(item) = self.items.get_mut(&owner) {
                 item.attached.remove(&id);
             }
@@ -526,20 +580,42 @@ impl Roles {
 
     // ---- parking ----
 
-    /// Whether `owner` parks and unparks with `holder`: an instance it
-    /// holds, or a channel it registered that only its instances are bound
-    /// to.
+    /// Whether `owner` parks with `holder`: an instance it holds, a channel
+    /// it registered that only its instances are bound to, or an adapter
+    /// every holder of which is `holder`'s or parked already.
     fn moves_with(&self, owner: Owner, item: &Item, holder: Holder) -> bool {
-        if item.holder != Some(holder) || !item.open {
-            return false;
-        }
+        let instance = |id: &InstanceId| self.items.get(&Owner::Instance(*id));
         match owner {
-            Owner::Instance(_) => true,
-            Owner::Channel(_) => item.attached.iter().all(|&id| {
+            Owner::Instance(_) => item.holder == Some(holder) && item.open,
+            Owner::Channel(_) => {
+                item.holder == Some(holder)
+                    && item.open
+                    && item.attached.iter().all(|id| {
+                        instance(id).is_some_and(|instance| instance.holder == Some(holder))
+                    })
+            }
+            Owner::Adapter(_) => {
+                item.attached.iter().any(|id| {
+                    instance(id).is_some_and(|instance| instance.holder == Some(holder))
+                }) && item.attached.iter().all(|id| {
+                    instance(id).is_some_and(|instance| {
+                        instance.holder == Some(holder) || instance.tier != Tier::Device
+                    })
+                })
+            }
+        }
+    }
+
+    /// Whether `owner`, parked, unparks with `holder`: what it parked, or
+    /// an adapter one of its instances holds.
+    fn unparks_with(&self, owner: Owner, item: &Item, holder: Holder) -> bool {
+        match owner {
+            Owner::Adapter(_) => item.attached.iter().any(|id| {
                 self.items
-                    .get(&Owner::Instance(id))
+                    .get(&Owner::Instance(*id))
                     .is_some_and(|instance| instance.holder == Some(holder))
             }),
+            _ => item.holder == Some(holder),
         }
     }
 
@@ -578,7 +654,9 @@ impl Roles {
         let owners: Vec<Owner> = self
             .items
             .iter()
-            .filter(|(_, item)| item.tier == Tier::Host && item.holder == Some(holder))
+            .filter(|(owner, item)| {
+                item.tier == Tier::Host && self.unparks_with(**owner, item, holder)
+            })
             .map(|(owner, _)| *owner)
             .collect();
         let device = Arc::clone(&self.device);
@@ -681,31 +759,55 @@ impl Roles {
     /// instance's tables may address their rings).
     #[must_use]
     pub fn stale(&self, holder: Holder) -> Vec<Rebind> {
-        let mut stale: Vec<(Owner, &Item)> = self
-            .items
-            .iter()
-            .filter(|(_, item)| item.stale && item.holder == Some(holder))
-            .map(|(owner, item)| (*owner, item))
-            .collect();
-        stale.sort_by_key(|(owner, _)| match owner {
-            Owner::Channel(id) => (0, id.0),
-            Owner::Instance(id) => (1, id.0),
-        });
-        stale
+        // An adapter that moved rebinds every instance holding it.
+        let mut instances: BTreeSet<InstanceId> = BTreeSet::new();
+        let mut channels: BTreeSet<ChannelId> = BTreeSet::new();
+        for (owner, item) in &self.items {
+            match *owner {
+                Owner::Channel(id) if item.stale && item.holder == Some(holder) => {
+                    channels.insert(id);
+                }
+                Owner::Instance(id) if item.stale && item.holder == Some(holder) => {
+                    instances.insert(id);
+                }
+                // Its holders on the device; a parked one is rebound when it
+                // unparks.
+                Owner::Adapter(_) if item.stale && self.unparks_with(*owner, item, holder) => {
+                    instances.extend(item.attached.iter().copied().filter(|id| {
+                        self.items
+                            .get(&Owner::Instance(*id))
+                            .is_some_and(|instance| instance.tier == Tier::Device)
+                    }));
+                }
+                _ => {}
+            }
+        }
+        channels
             .into_iter()
-            .map(|(owner, item)| match owner {
-                Owner::Channel(id) => Rebind::Channel {
+            .filter_map(|id| {
+                let item = self.items.get(&Owner::Channel(id))?;
+                Some(Rebind::Channel {
                     id,
                     slots: item.refs(),
-                },
-                Owner::Instance(id) => Rebind::Instance {
+                })
+            })
+            .chain(instances.into_iter().filter_map(|id| {
+                let item = self.items.get(&Owner::Instance(id))?;
+                Some(Rebind::Instance {
                     id,
                     instance: item.parts.first().map_or_else(Vec::new, |p| p.refs.clone()),
                     rings: own_rings(&item.rings, &item.parts),
-                    adapter: adapter_of(&item.rings, &item.parts),
-                },
-            })
+                    adapter: self.adapter_refs(item),
+                })
+            }))
             .collect()
+    }
+
+    /// The `Adapter` slots the instance `item` lands its adapter in.
+    fn adapter_refs(&self, item: &Item) -> Vec<u32> {
+        item.adapter
+            .and_then(|key| self.items.get(&Owner::Adapter(key)))
+            .map_or_else(Vec::new, Item::refs)
     }
 
     /// Whether a host write into `instance`'s rings must wait: its own
@@ -748,7 +850,15 @@ impl Roles {
 
     /// The engine took `owner`'s new slots.
     pub fn rebound(&mut self, owner: Owner) {
-        if let Some(item) = self.items.get_mut(&owner) {
+        let adapter = match self.items.get_mut(&owner) {
+            Some(item) => {
+                item.stale = false;
+                item.adapter
+            }
+            None => None,
+        };
+        // An instance rebound names its adapter's new slots too.
+        if let Some(item) = adapter.and_then(|key| self.items.get_mut(&Owner::Adapter(key))) {
             item.stale = false;
         }
     }
@@ -844,11 +954,13 @@ pub fn bind_instance(
         return Ok(engine.bind_instance(binding)?);
     };
     learn_program(roles, engine, binding.program)?;
-    let taken =
-        roles
-            .lock()
-            .unwrap()
-            .take_instance(binding.program, &binding.channels, registered)?;
+    let adapter = engine.adapter_key(binding)?;
+    let taken = roles.lock().unwrap().take_instance(
+        binding.program,
+        &binding.channels,
+        registered,
+        adapter,
+    )?;
     let binding = InstanceBinding {
         instance_slots: taken.instance_slots(),
         ring_slots: taken.ring_slots(),
@@ -909,13 +1021,6 @@ pub fn rebind(
         replay(engine, instance, pump)?;
     }
     Ok(())
-}
-
-/// An instance's adapter slots: the part after its own rings'.
-fn adapter_of(rings: &[u32], parts: &[Part]) -> Vec<u32> {
-    parts
-        .get(1 + rings.len())
-        .map_or_else(Vec::new, |part| part.refs.clone())
 }
 
 /// An instance's own rings as the engine names them: channel `rings[k]` in
