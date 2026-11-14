@@ -1,4 +1,3 @@
-#![allow(unsafe_code)]
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -145,8 +144,6 @@ fn reflect(wgsl: &str) -> std::result::Result<Declared, String> {
     })
 }
 
-type Cache = (Arc<Core>, wgpu::PipelineCache, Option<std::path::PathBuf>);
-
 pub(crate) type View = (wgpu::Buffer, u64, u64);
 
 type BindKey = (usize, Vec<View>, Vec<u8>);
@@ -165,7 +162,6 @@ const UNIFORM_ARENA_CHUNK: u64 = 1 << 20;
 #[derive(Default)]
 pub struct Pipelines {
     built: RefCell<HashMap<&'static str, Arc<Pipeline>>>,
-    cache: RefCell<Option<Cache>>,
     compiles: Cell<u64>,
     binds: RefCell<BindCache>,
     bind_hits: Cell<u64>,
@@ -319,72 +315,16 @@ impl Pipelines {
                 .to_string(),
         })?;
         let wgsl = without_subgroup_enable(&promote_storage(wgsl));
-        let cache = self.cache(device);
-        let pipeline = Arc::new(build(device.core(), cache.as_ref(), file, key, &wgsl)?);
+        let pipeline = Arc::new(build(device.core(), file, key, &wgsl)?);
         self.compiles.set(self.compiles.get() + 1);
         self.built.borrow_mut().insert(key, Arc::clone(&pipeline));
         Ok(pipeline)
-    }
-
-    fn cache(&self, device: &Context) -> Option<wgpu::PipelineCache> {
-        if let Some((_, cache, _)) = self.cache.borrow().as_ref() {
-            return Some(cache.clone());
-        }
-        let core = device.core();
-        if !core.enabled.pipeline_cache {
-            return None;
-        }
-        let path = device
-            .pipeline_cache_path()
-            .map(std::path::Path::to_path_buf);
-        let initial = path.as_ref().and_then(|p| std::fs::read(p).ok());
-
-        // SAFETY: the file at `path` is written only by `persist`, from
-        // `PipelineCache::get_data`; wgpu ignores data keyed to another adapter
-        // or driver, and `fallback` gives an empty cache in place of an error.
-        let cache = unsafe {
-            core.device
-                .create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
-                    label: Some("pie pipelines"),
-                    data: initial.as_deref(),
-                    fallback: true,
-                })
-        };
-        *self.cache.borrow_mut() = Some((Arc::clone(core), cache.clone(), path));
-        Some(cache)
-    }
-
-    pub fn persist(&self) -> Result<()> {
-        let cache = self.cache.borrow();
-        let Some((_, cache, Some(path))) = cache.as_ref() else {
-            return Ok(());
-        };
-        let Some(bytes) = cache.get_data() else {
-            return Ok(());
-        };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| Fault::Device {
-                call: "pipeline cache dir",
-                why: e.to_string(),
-            })?;
-        }
-        std::fs::write(path, bytes).map_err(|e| Fault::Device {
-            call: "pipeline cache write",
-            why: e.to_string(),
-        })
-    }
-}
-
-impl Drop for Pipelines {
-    fn drop(&mut self) {
-        let _ = self.persist();
     }
 }
 
 fn descriptor<'a>(
     name: &'static str,
     module: &'a wgpu::ShaderModule,
-    cache: Option<&'a wgpu::PipelineCache>,
 ) -> wgpu::ComputePipelineDescriptor<'a> {
     wgpu::ComputePipelineDescriptor {
         label: Some(name),
@@ -392,13 +332,12 @@ fn descriptor<'a>(
         module,
         entry_point: Some("main"),
         compilation_options: wgpu::PipelineCompilationOptions::default(),
-        cache,
+        cache: None,
     }
 }
 
 fn compile(
     core: &Arc<Core>,
-    cache: Option<&wgpu::PipelineCache>,
     name: &'static str,
     wgsl: &str,
 ) -> std::result::Result<wgpu::ComputePipeline, String> {
@@ -410,13 +349,12 @@ fn compile(
                 source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(wgsl)),
             });
         core.device
-            .create_compute_pipeline(&descriptor(name, &module, cache))
+            .create_compute_pipeline(&descriptor(name, &module))
     })
 }
 
 fn build(
     core: &Arc<Core>,
-    cache: Option<&wgpu::PipelineCache>,
     file: &'static str,
     name: &'static str,
     wgsl: &str,
@@ -427,7 +365,7 @@ fn build(
         why,
     };
     let declared = reflect(wgsl).map_err(shader)?;
-    let pipeline = compile(core, cache, name, wgsl).map_err(shader)?;
+    let pipeline = compile(core, name, wgsl).map_err(shader)?;
     let layout = pipeline.get_bind_group_layout(0);
     Ok(Pipeline {
         name,

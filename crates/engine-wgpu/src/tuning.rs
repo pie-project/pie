@@ -62,8 +62,8 @@ pub enum DecodeSplit {
         #[constant(range(1..=65_536), default = 128)]
         groups: u32,
     },
-    /// `per` workgroups for each core the engine sizes work by (the count
-    /// the native driver reports, else a fallback).
+    /// `per` workgroups for each core the engine sizes work by (wgpu reports
+    /// no count: [`crate::chip::UNREPORTED_CORES`]).
     PerCore {
         #[constant(range(1..=64), default = 1)]
         per: u32,

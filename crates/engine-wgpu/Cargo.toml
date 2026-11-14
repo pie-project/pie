@@ -29,16 +29,12 @@ tracing = "0.1"
 
 naga = { version = "30", default-features = false, features = ["wgsl-in"], optional = true }
 
+# Native builds exist only for the gate tests, on wgpu's Vulkan backend.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-memmap2 = "0.9"
-libc = "0.2"
 wgpu = { version = "30", default-features = false, features = [
     "wgsl",
     "vulkan",
-    "metal",
-    "dx12",
 ], optional = true }
-ash = { version = "0.38", default-features = false, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-std = { path = "../web-std" }
@@ -57,7 +53,6 @@ default = []
 wgpu = [
     "dep:wgpu",
     "dep:naga",
-    "dep:ash",
     "kernels-slang/wgsl",
     "kernels-slang/probe",
 ]

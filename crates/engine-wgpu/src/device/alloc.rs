@@ -44,18 +44,14 @@ impl Raw {
                 have: core.limits.max_buffer_size,
             });
         }
-        let mappable =
-            kind == Memory::Readback || (kind != Memory::Device && core.enabled.mappable_primary);
-        let mut usage = if kind == Memory::Readback {
+        let mappable = kind == Memory::Readback;
+        let mut usage = if mappable {
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST
         } else {
             wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST
         };
-        if mappable && kind != Memory::Readback {
-            usage |= wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE;
-        }
         // The pool's segments hold guest configs a stage binds as a uniform
         // (`guest::session`), beside everything bound as storage.
         if owner == engine_gpu::books::owners::POOL && kind == Memory::Device {

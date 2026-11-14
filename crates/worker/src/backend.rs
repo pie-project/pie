@@ -652,12 +652,6 @@ pub(crate) fn create_engine_backend(
                     toml::Value::String(backends.clone())
                 ));
             }
-            if let Some(cache) = &opts.pipeline_cache {
-                boot_doc.push_str(&format!(
-                    "pipeline_cache = {}\n",
-                    toml::Value::String(cache.display().to_string())
-                ));
-            }
             boot_doc.push_str(&format!(
                 "profiles = {}\n",
                 toml::Value::String(home.join("profiles").display().to_string())
