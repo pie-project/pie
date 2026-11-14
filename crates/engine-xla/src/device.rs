@@ -17,6 +17,10 @@ pub struct Program {
     pub exe: Option<Executable>,
     pub sig: Signature,
     pub text_bytes: usize,
+    /// What the compiled program takes on the device (default on a dry
+    /// device): its temp shares the runtime's one reservation, which the
+    /// largest loaded program's sizes.
+    pub memory: crate::pjrt::CompiledMemory,
 }
 
 /// Fields drop in order: the compiled programs go before the client that
@@ -27,6 +31,11 @@ pub struct Device {
     /// a serving fire missing the ladder.
     sealed: std::sync::atomic::AtomicBool,
     misses: std::sync::atomic::AtomicU64,
+    /// The largest temp of any program compiled or loaded, and of the
+    /// load's own at its seal: the runtime's one temp reservation is the
+    /// largest loaded program's, so a later program adds only its excess.
+    temp_max: std::sync::atomic::AtomicU64,
+    sealed_temp: std::sync::atomic::AtomicU64,
     ordinal: usize,
     kind: String,
     limit: Option<u64>,
@@ -92,6 +101,8 @@ impl Device {
             cache: Mutex::new(HashMap::new()),
             sealed: std::sync::atomic::AtomicBool::new(false),
             misses: std::sync::atomic::AtomicU64::new(0),
+            temp_max: std::sync::atomic::AtomicU64::new(0),
+            sealed_temp: std::sync::atomic::AtomicU64::new(0),
             dump: std::env::var_os("PIE_XLA_DUMP").map(PathBuf::from),
             disk: disk_cache(),
             _lock: lock,
@@ -128,6 +139,8 @@ impl Device {
             cache: Mutex::new(HashMap::new()),
             sealed: std::sync::atomic::AtomicBool::new(false),
             misses: std::sync::atomic::AtomicU64::new(0),
+            temp_max: std::sync::atomic::AtomicU64::new(0),
+            sealed_temp: std::sync::atomic::AtomicU64::new(0),
             dump: std::env::var_os("PIE_XLA_DUMP").map(PathBuf::from),
             disk: None,
             _lock: lock,
@@ -292,10 +305,15 @@ impl Device {
                     why: e.to_string(),
                 })?),
             };
+            let memory = exe
+                .as_ref()
+                .and_then(|e| e.compiled_memory().ok())
+                .unwrap_or_default();
             let program = Arc::new(Program {
                 exe,
                 sig,
                 text_bytes: text.len(),
+                memory,
             });
             self.cache
                 .lock()
@@ -345,10 +363,14 @@ impl Device {
                 exe
             }
         };
+        let memory = exe.compiled_memory().unwrap_or_default();
+        self.temp_max
+            .fetch_max(memory.temp, std::sync::atomic::Ordering::Relaxed);
         let program = Arc::new(Program {
             exe: Some(exe),
             sig,
             text_bytes: text.len(),
+            memory,
         });
         self.cache
             .lock()
@@ -401,8 +423,23 @@ impl Device {
     /// Marks the warm ladder done: every program wanted from now on is
     /// counted (and logged) as a miss.
     pub fn seal(&self) {
+        self.sealed_temp.store(
+            self.temp_max.load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.sealed
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The largest temp of the load's own programs (those compiled before
+    /// the seal; every one so far where it has not sealed).
+    #[must_use]
+    pub fn load_temp(&self) -> u64 {
+        if self.sealed.load(std::sync::atomic::Ordering::Relaxed) {
+            self.sealed_temp.load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            self.temp_max.load(std::sync::atomic::Ordering::Relaxed)
+        }
     }
 
     /// Programs wanted after [`Device::seal`] that the ladder had not built.

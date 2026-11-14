@@ -851,6 +851,46 @@ impl Executable {
     }
 }
 
+impl Executable {
+    /// The memory the compiled program takes (`GetCompiledMemoryStats`):
+    /// argument, output, alias, temp and generated-code bytes, and its peak.
+    pub fn compiled_memory(&self) -> Result<CompiledMemory> {
+        let mut g = args!(PJRT_LoadedExecutable_GetExecutable_Args {
+            loaded_executable: self.raw
+        });
+        call!(&self.api, PJRT_LoadedExecutable_GetExecutable, &mut g)?;
+        let mut m = args!(PJRT_Executable_GetCompiledMemoryStats_Args {
+            executable: g.executable
+        });
+        let r = call!(&self.api, PJRT_Executable_GetCompiledMemoryStats, &mut m);
+        let mut d = args!(PJRT_Executable_Destroy_Args {
+            executable: g.executable
+        });
+        let _ = call!(&self.api, PJRT_Executable_Destroy, &mut d);
+        r?;
+        let bytes = |v: i64| u64::try_from(v).unwrap_or(0);
+        Ok(CompiledMemory {
+            argument: bytes(m.argument_size_in_bytes),
+            output: bytes(m.output_size_in_bytes),
+            alias: bytes(m.alias_size_in_bytes),
+            temp: bytes(m.temp_size_in_bytes),
+            code: bytes(m.generated_code_size_in_bytes),
+            peak: bytes(m.peak_memory_in_bytes),
+        })
+    }
+}
+
+/// A compiled program's memory (`Executable::compiled_memory`), in bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompiledMemory {
+    pub argument: u64,
+    pub output: u64,
+    pub alias: u64,
+    pub temp: u64,
+    pub code: u64,
+    pub peak: u64,
+}
+
 impl Drop for Executable {
     fn drop(&mut self) {
         let mut a = args!(PJRT_LoadedExecutable_Destroy_Args {

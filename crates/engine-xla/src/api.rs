@@ -469,6 +469,7 @@ impl Engine for Xla {
         self.programs.seat_readouts(shell.readouts());
         let (rows, sink_row) = shell.pool_geometry();
         self.programs.seat_pool(rows, sink_row);
+        self.programs.seat_reads(shell.plane_reads());
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -558,7 +559,8 @@ impl Engine for Xla {
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        self.programs.register(registration).map_err(refusal)
+        let device = self.shell.as_ref().map(|shell| shell.device());
+        self.programs.register(registration, device).map_err(refusal)
     }
 
     /// The rings an instance keeps in the pool's `Channel` slots: its
@@ -578,6 +580,20 @@ impl Engine for Xla {
         self.programs
             .register_channel(registration)
             .map_err(refusal)
+    }
+
+    /// What a fire holding lanes of `program` takes beside the model's own:
+    /// its stages' temp past the load's largest (they share the runtime's
+    /// one reservation) and their outputs, as registration compiled them.
+    /// The same at any extents: every stage was compiled for every rung.
+    fn fire_facts(
+        &self,
+        program: ProgramId,
+        extents: &engine::program::BindExtents,
+    ) -> EngineResult<engine::program::FireFacts> {
+        let _ = extents;
+        let load_temp = self.shell.as_ref().map_or(0, |shell| shell.device().load_temp());
+        Ok(self.programs.fire_facts(program, load_temp))
     }
 
     /// An instance's carried rings moved to fresh `Channel` slots (a park

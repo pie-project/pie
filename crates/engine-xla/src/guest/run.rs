@@ -86,6 +86,9 @@ pub struct Stages {
     /// go.
     pub pool_rows: i64,
     pub sink_row: u32,
+    /// Every plane a fire returns, as a stage reads it (`Shell::plane_reads`):
+    /// output, rows, width, layers, readout flag, dtype.
+    pub plane_reads: Vec<(String, u32, u32, u32, bool, Dtype)>,
 }
 
 /// A rung's stage as a compile thread leaves it.
@@ -127,6 +130,10 @@ fn stage(
 }
 
 impl Stages {
+    /// Stage `at` of `package` for `batch`, as registration compiled it
+    /// (`Stages::compile_all`). A shape registration did not reach
+    /// compiles here, which a load warm-up sealed reports as a program
+    /// outside the ladder (WARM_STRICT refuses it).
     pub fn get(
         &mut self,
         device: &Device,
@@ -140,74 +147,82 @@ impl Stages {
         if let Some(hit) = self.map.get(&slot) {
             return Ok(Arc::clone(hit));
         }
-        // Another package whose stage lowers the same (a guest's prompt
-        // reaches its package, not its sampler) compiled this one already:
-        // it is found, nothing compiles beside it.
-        let lowered =
-            lower::lower(package, at, batch.clone(), carried, self.pool_rows)
-                .map_err(|why| why.to_string())?;
-        if !lowered.layout.runs() || device.holds(&lowered.text) {
-            let staged = stage(device, package, at, batch, carried, self.pool_rows)?;
-            self.map.insert(slot, Arc::clone(&staged));
-            return Ok(staged);
-        }
-        // A stage first seen compiles for every lane rung up to the fire's
-        // widest, side by side: a group grows a lane at a time, and each rung
-        // it reached compiled in its own turn (v6e gpt-oss c256 on a fresh
-        // VM: 26 stage programs at 1.4 s each, 35 s of a 70 s run). One that
-        // reads a readout plane does so at every readout row count the fires
-        // traced too: a fire's readout rows follow its lanes, and each count
-        // first met compiled its rungs in turn (v6e Qwen3-0.6B c256: nine
-        // counts, ~2.4 s each, all inside the measured rounds).
-        let top = padded(self.top as usize).max(batch.lanes);
-        let rungs = |top: u32| -> Vec<u32> {
-            std::iter::successors(Some(1u32), |&r| (r < top).then(|| r.saturating_mul(2))).collect()
-        };
-        let mut shapes: Vec<Batch> = rungs(top)
-            .into_iter()
-            .map(|lanes| Batch {
-                lanes,
-                reads: batch.reads.clone(),
-            })
-            .collect();
-        if !shapes.contains(&batch) {
-            shapes.push(batch.clone());
-        }
-        if batch.reads.iter().any(|r| r.readout) {
-            for &rows in &self.readouts {
-                if batch.reads.iter().any(|r| r.readout && r.rows == rows) {
-                    continue;
-                }
-                let reads: Vec<Read> = (batch.reads.iter())
-                    .map(|r| Read {
-                        rows: if r.readout { rows } else { r.rows },
-                        ..r.clone()
+        let staged = stage(device, package, at, batch, carried, self.pool_rows)?;
+        self.map.insert(slot, Arc::clone(&staged));
+        Ok(staged)
+    }
+
+    /// Compiles every stage of `package` for every shape a pass can take:
+    /// each lane rung up to the widest fire (`top`), each combination of
+    /// the planes its outputs can be read off (the fires the warm ladder
+    /// traced, `plane_reads`), with the `carried` channels in the pool;
+    /// and one lane with none carried (an instance that steps alone).
+    /// Side by side; the first refusal refuses the program.
+    pub fn compile_all(
+        &mut self,
+        device: &Device,
+        package: &LaunchPackage,
+        key: [u8; 32],
+        carried: &[u32],
+    ) -> Result<(), String> {
+        let top = padded(self.top as usize);
+        let rungs: Vec<u32> =
+            std::iter::successors(Some(1u32), |&r| (r < top).then(|| r.saturating_mul(2)))
+                .collect();
+        let mut wanted: Vec<(usize, Batch, Vec<u32>)> = Vec::new();
+        for at in 0..package.stages.len() {
+            let mut combos: Vec<Vec<Read>> = vec![Vec::new()];
+            for (name, lane) in lower::outputs(package, at) {
+                let options: Vec<Read> = (self.plane_reads.iter())
+                    .filter(|p| p.0 == name)
+                    .map(|p| Read {
+                        name: name.clone(),
+                        lane,
+                        rows: p.1,
+                        readout: p.4,
+                        layers: p.3,
+                        width: p.2,
+                        dtype: p.5,
                     })
                     .collect();
-                for lanes in rungs(top.min(padded(rows as usize))) {
-                    shapes.push(Batch {
-                        lanes,
-                        reads: reads.clone(),
-                    });
+                if options.is_empty() {
+                    continue;
                 }
+                combos = combos
+                    .into_iter()
+                    .flat_map(|c| {
+                        options.iter().map(move |o| {
+                            let mut c = c.clone();
+                            c.push(o.clone());
+                            c
+                        })
+                    })
+                    .collect();
+            }
+            for reads in &combos {
+                for &lanes in &rungs {
+                    wanted.push((at, Batch { lanes, reads: reads.clone() }, carried.to_vec()));
+                }
+                wanted.push((at, Batch { lanes: 1, reads: reads.clone() }, Vec::new()));
             }
         }
+        wanted.retain(|(at, batch, c)| !self.map.contains_key(&(key, *at, batch.clone(), c.clone())));
+        wanted.dedup();
         let pool_rows = self.pool_rows;
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
-            .clamp(1, shapes.len().min(8));
+            .clamp(1, wanted.len().clamp(1, 8));
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let built: Vec<Built> = shapes.iter().map(|_| std::sync::Mutex::new(None)).collect();
+        let built: Vec<Built> = wanted.iter().map(|_| std::sync::Mutex::new(None)).collect();
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 scope.spawn(|| {
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(shape) = shapes.get(i) else {
+                        let Some((at, batch, c)) = wanted.get(i) else {
                             break;
                         };
-                        let staged =
-                            stage(device, package, at, shape.clone(), carried, pool_rows);
+                        let staged = stage(device, package, *at, batch.clone(), c, pool_rows);
                         if let Ok(mut slot) = built[i].lock() {
                             *slot = Some(staged);
                         }
@@ -215,22 +230,57 @@ impl Stages {
                 });
             }
         });
-        let mut asked = None;
-        for (shape, built) in shapes.into_iter().zip(built) {
-            let Ok(staged) = built.into_inner().expect("a built rung").ok_or(()) else {
+        for ((at, batch, c), built) in wanted.into_iter().zip(built) {
+            let staged = built
+                .into_inner()
+                .map_err(|_| "a stage compile panicked".to_string())?
+                .ok_or("a stage was never compiled")??;
+            self.map.insert((key, at, batch, c), staged);
+        }
+        Ok(())
+    }
+
+    /// What a pass of the program `key` names takes on the device beyond
+    /// the load's own (`Engine::fire_facts`), from its stages as
+    /// registration compiled them: at each lane rung, the largest temp past
+    /// `load_temp` (the runtime's one temp reservation is the largest loaded
+    /// program's) and the outputs its stages return (not the pool they
+    /// alias). `fixed + lanes · a_lane` covers every rung, up to `top`.
+    /// `carried` names the group variant (the program's carried channels).
+    #[must_use]
+    pub fn fire_facts(
+        &self,
+        key: [u8; 32],
+        carried: &[u32],
+        load_temp: u64,
+    ) -> engine::program::FireFacts {
+        let mut by_lanes: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
+        // A group's passes (the carried variants): what a fire holds.
+        for ((k, _, batch, c), staged) in &self.map {
+            if *k != key || c.as_slice() != carried {
+                continue;
+            }
+            let Some(program) = &staged.program else {
                 continue;
             };
-            let staged = match staged {
-                Ok(staged) => staged,
-                Err(why) if shape == batch => return Err(why),
-                Err(_) => continue,
-            };
-            if shape == batch {
-                asked = Some(Arc::clone(&staged));
-            }
-            self.map.insert((key, at, shape, carried.to_vec()), staged);
+            let m = program.memory;
+            let entry = by_lanes.entry(batch.lanes).or_default();
+            entry.0 = entry.0.max(m.temp.saturating_sub(load_temp));
+            entry.1 += m.output.saturating_sub(m.alias);
         }
-        asked.ok_or_else(|| format!("stage {at} did not compile for {} lanes", batch.lanes))
+        let bytes = |lanes: u32| by_lanes.get(&lanes).map_or(0, |&(t, o)| t + o);
+        let one = bytes(1);
+        let a_lane = by_lanes
+            .keys()
+            .filter(|&&r| r > 1)
+            .map(|&r| bytes(r).saturating_sub(one).div_ceil(u64::from(r - 1)))
+            .max()
+            .unwrap_or(0);
+        engine::program::FireFacts {
+            a_lane,
+            fixed: one.saturating_sub(a_lane),
+            max_lanes: by_lanes.keys().copied().max().unwrap_or(0),
+        }
     }
 
     #[must_use]

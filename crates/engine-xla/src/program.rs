@@ -427,7 +427,21 @@ impl Plane {
         self.stages.sink_row = sink_row;
     }
 
-    pub fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
+    /// Every plane a fire returns, as a guest stage reads it: what
+    /// registration compiles each stage for.
+    pub fn seat_reads(&mut self, reads: Vec<(String, u32, u32, u32, bool, poem_ir::Dtype)>) {
+        self.stages.plane_reads = reads;
+    }
+
+    /// Registers a program; where every stage lowers (its device form),
+    /// compiles every stage for every shape a pass can take on `device`
+    /// (`Stages::compile_all`), so no pass compiles: a stage that does not
+    /// compile refuses the registration.
+    pub fn register(
+        &mut self,
+        registration: &ProgramRegistration,
+        device: Option<&crate::device::Device>,
+    ) -> Result<ProgramId, Refusal> {
         let plan = eta_exec::adopt_launch_package(registration.launch.clone())
             .map_err(|error| Refusal::Program(error.to_string()))?;
         if !plan.executable {
@@ -441,6 +455,18 @@ impl Plane {
         let id = ProgramId(self.next_program);
 
         let admitted = self.forms.admit(id, &plan.package);
+        if admitted
+            && let (Some(device), Some(form)) = (device, self.forms.get(id).cloned())
+            && let Err(why) =
+                self.stages
+                    .compile_all(device, &plan.package, form.key, &form.carried)
+        {
+            self.forms.forget(id);
+            return Err(Refusal::Program(format!(
+                "a stage of program 0x{:016x} does not compile: {why}",
+                registration.program_hash
+            )));
+        }
         tracing::debug!(
             program = id.0,
             device_form = admitted,
@@ -483,6 +509,17 @@ impl Plane {
             held.cells = cells;
         }
         Ok(())
+    }
+
+    /// What a pass of `program` takes on the device beyond the load's own,
+    /// from its stages as registration compiled them; none for a program
+    /// the host interprets.
+    #[must_use]
+    pub fn fire_facts(&self, program: ProgramId, load_temp: u64) -> engine::program::FireFacts {
+        self.forms
+            .get(program)
+            .map(|form| self.stages.fire_facts(form.key, &form.carried, load_temp))
+            .unwrap_or_default()
     }
 
     /// Program `program`'s device form, where its every stage lowers.

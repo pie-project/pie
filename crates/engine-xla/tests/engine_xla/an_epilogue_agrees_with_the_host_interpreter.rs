@@ -1038,6 +1038,123 @@ fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
     a_group_answers_what_each_lane_answers_alone(device, &mut stages);
     carried_cells_answer_what_the_rings_answer(device, &mut stages);
     eprintln!("compiled {} stage program(s)", stages.len());
+    // Last: it seals the device.
+    registration_compiles_every_pass(device);
+}
+
+/// Registration's compile (`Stages::compile_all`, every lane rung and every
+/// plane a fire returns) leaves no pass anything to compile: four passes of
+/// a carrying group after the device seals build no program; and the
+/// program's fire facts cover every rung it compiled.
+fn registration_compiles_every_pass(device: &Device) {
+    let (container, out) = carrying(VOCAB);
+    let plan = plan_of(container, VOCAB);
+    let carried = engine_xla::guest::carried_channels(&plan.package);
+    let key = key_of(&plan);
+    let lanes = 3u32;
+    let probe = kept(device, &logits_plane(lanes, VOCAB, 1), lanes, vec![(0, 1)]);
+    let read = &probe.planes[0];
+    let words = engine_xla::guest::carried_words(&plan.package);
+    let per_lane: u32 = words
+        .iter()
+        .map(|&(_, w)| engine_xla::guest::lower::cell_rows(w as usize) as u32)
+        .sum();
+    let pool_rows = per_lane * lanes + 8;
+    let mut stages = Stages::default();
+    stages.top = lanes;
+    stages.pool_rows = i64::from(pool_rows);
+    stages.sink_row = pool_rows - 8;
+    stages.plane_reads = vec![(
+        read.name.clone(),
+        read.rows,
+        read.width,
+        read.layers,
+        read.readout,
+        read.dtype,
+    )];
+    stages
+        .compile_all(device, &plan.package, key, &carried)
+        .expect("every stage compiles at registration");
+    let compiled = stages.len();
+    let facts = stages.fire_facts(key, &carried, device.load_temp());
+    eprintln!("registration compiled {compiled} stage program(s); fire facts {facts:?}");
+    assert_eq!(facts.max_lanes, 4, "every lane rung up to the widest fire");
+    assert!(
+        facts.fixed + 4 * facts.a_lane > 0,
+        "a pass returns its outputs: {facts:?}"
+    );
+    device.seal();
+    let before = device.misses();
+    let seeds: Vec<Vec<(u32, Value)>> = (0..lanes)
+        .map(|i| {
+            vec![
+                (0, Value::U32(vec![9 + i, 1])),
+                (1, Value::F32(vec![0.0; VOCAB as usize])),
+            ]
+        })
+        .collect();
+    let mut insts: Vec<InterpInstance> = seeds.iter().map(|s| instance(&plan, s)).collect();
+    let cells: Vec<Vec<(u32, u32)>> = (0..lanes)
+        .map(|l| {
+            let mut at = l * per_lane;
+            words
+                .iter()
+                .map(|&(c, w)| {
+                    let first = at;
+                    at += engine_xla::guest::lower::cell_rows(w as usize) as u32;
+                    (c, first)
+                })
+                .collect()
+        })
+        .collect();
+    let mut pool = device
+        .zeros_or_dry(dtype::Dtype::U32, pool_rows, 128)
+        .expect("the pool");
+    let _ = engine_xla::guest::run::cells_program(device, i64::from(pool_rows));
+    let before = before.max(device.misses());
+    {
+        let writes: Vec<(&InterpInstance, &[(u32, u32)])> =
+            insts.iter().zip(&cells).map(|(i, c)| (i, c.as_slice())).collect();
+        engine_xla::guest::run::write_cells(
+            device,
+            &plan,
+            &mut pool,
+            i64::from(pool_rows),
+            stages.sink_row,
+            &writes,
+        )
+        .expect("the seeds land");
+    }
+    for pass in 0..4 {
+        let plane = logits_plane(lanes, VOCAB, 90 + pass);
+        let kept = kept(device, &plane, lanes, (0..lanes).map(|l| (l, 1)).collect());
+        let mut members: Vec<Member<'_>> = insts
+            .iter_mut()
+            .enumerate()
+            .map(|(l, inst)| Member {
+                inst,
+                bound: bound(&plan, &kept, l),
+                cells: cells[l].clone(),
+            })
+            .collect();
+        let outcomes = step_group(
+            device,
+            &mut stages,
+            key,
+            &plan,
+            Some(&kept),
+            &mut members,
+            &carried,
+            &mut pool,
+            eta_ir::registry::Stage::Epilogue,
+        );
+        assert!(outcomes.iter().all(|o| *o == StepOutcome::Committed), "{outcomes:?}");
+        for inst in &insts {
+            let _ = take_all(&plan, inst, &[out]);
+        }
+    }
+    assert_eq!(stages.len(), compiled, "no pass compiled a stage");
+    assert_eq!(device.misses(), before, "no program built after the seal");
 }
 
 fn the_statistics_agree(device: &Device, stages: &mut Stages) {
