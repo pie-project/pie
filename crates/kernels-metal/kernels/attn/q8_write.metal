@@ -14,8 +14,8 @@ kernel void kv_append_paged_q8(
   const ulong src = ulong(row) * (src_stride > 0 ? src_stride : heads * d) + h * d;
   // A row's codes then its scale, 2 * d bytes a head, at the layout's place.
   const ulong in_page = (ulong(offsets[row]) * heads + h) * ulong(2 * d);
-  kp = pie_kv_plane(kp, k_offset) + ulong(pages[row]) * k_page_stride + in_page;
-  vp = pie_kv_plane(vp, v_offset) + ulong(pages[row]) * v_page_stride + in_page;
+  kp = pie_kv_plane(kp, k_offset) + pie_page_at(uint(pages[row]), k_page_stride, 1) + in_page;
+  vp = pie_kv_plane(vp, v_offset) + pie_page_at(uint(pages[row]), v_page_stride, 1) + in_page;
   float km = 0, vm = 0;
   for (uint i = lane; i < uint(d); i += 32) {
     km = max(km, abs(float(k[src + i])));

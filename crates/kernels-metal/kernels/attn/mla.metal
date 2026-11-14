@@ -96,15 +96,15 @@ constant constexpr int kMlaSplit = 8;
     uint2 tid [[thread_position_in_grid]]) {
   const int d = int(tid.x);
   const int row = int(tid.y);
-  const size_t page = size_t(w_page[row]);
+  const uint page = w_page[row];
   const size_t off = size_t(w_off[row]);
   if (d < kv_lora) {
-    pie_kv_plane(ckv_pages, k_offset)[page * (k_page_stride / sizeof(bfloat)) +
+    pie_kv_plane(ckv_pages, k_offset)[pie_page_at(page, k_page_stride / sizeof(bfloat), sizeof(bfloat)) +
                                       off * size_t(kv_lora) + d] =
         kv_c[size_t(row) * size_t(kv_lora) + d];
   }
   if (d < rope) {
-    pie_kv_plane(kpe_pages, v_offset)[page * (v_page_stride / sizeof(bfloat)) +
+    pie_kv_plane(kpe_pages, v_offset)[pie_page_at(page, v_page_stride / sizeof(bfloat), sizeof(bfloat)) +
                                       off * size_t(rope) + d] =
         k_pe[size_t(row) * size_t(rope) + d];
   }
@@ -216,10 +216,10 @@ inline void mla_naive_paged_body(
     const uint page = kv_page_indices[page_base + j / page_size];
     const size_t in_page = size_t(j % page_size);
     const device bfloat* ckv_j = pie_kv_plane(ckv_pages, kvl.k_offset) +
-                                 size_t(page) * (kvl.k_page / sizeof(bfloat)) +
+                                 pie_page_at(page, kvl.k_page / sizeof(bfloat), sizeof(bfloat)) +
                                  in_page * size_t(ckv);
     const device bfloat* kpe_j = pie_kv_plane(kpe_pages, kvl.v_offset) +
-                                 size_t(page) * (kvl.v_page / sizeof(bfloat)) +
+                                 pie_page_at(page, kvl.v_page / sizeof(bfloat), sizeof(bfloat)) +
                                  in_page * size_t(kpe);
 
     float kv[kMaxCkvPer];

@@ -75,7 +75,13 @@ impl Arena {
         }
     }
 
-    /// Where the kernel scratch plane starts in the pool's buffer.
+    /// The bytes the kernel scratch plane takes at the span's top.
+    #[must_use]
+    pub fn scratch_room(&self) -> u64 {
+        self.scratch
+    }
+
+    /// Where the kernel scratch plane starts in the span's buffer.
     #[must_use]
     pub fn scratch_at(&self) -> u64 {
         self.end - self.scratch

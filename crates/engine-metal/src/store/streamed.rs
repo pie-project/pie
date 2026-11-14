@@ -561,6 +561,9 @@ impl Shape {
 /// The byte offset in the pool of a slot ref.
 type SlotAt<'a> = &'a dyn Fn(u32) -> Result<u64>;
 
+/// The buffer byte `offset` of the pool's range lies in, and where in it.
+type PoolAt<'a> = &'a dyn Fn(u64) -> (&'a Buffer, u64);
+
 /// A weight's own copy: where a kernel reads an atom no slot holds.
 #[derive(Debug, Clone)]
 struct Host {
@@ -782,16 +785,16 @@ impl Cache {
     }
 
     /// Rewrites every address table: an atom named a slot reads it through
-    /// `pool` (base address and the byte offset of a slot ref), the others
-    /// read their weight in place. The caller has drained every frame.
-    fn stage(&mut self, pool: Option<(u64, SlotAt<'_>)>) -> Result<()> {
+    /// `pool` (the GPU address of a slot ref), the others read their
+    /// weight in place. The caller has drained every frame.
+    fn stage(&mut self, pool: Option<SlotAt<'_>>) -> Result<()> {
         // Each atom's slot's address in the pool, found once for every
         // plane that reads it.
         let mut placed: Vec<Option<u64>> = vec![None; self.slots.len()];
-        if let Some((base, offset)) = pool {
+        if let Some(address) = pool {
             for (at, slot) in self.slots.iter().enumerate() {
                 if let Some(slot) = *slot {
-                    placed[at] = Some(base + offset(slot)?);
+                    placed[at] = Some(address(slot)?);
                 }
             }
         }
@@ -836,7 +839,7 @@ impl Cache {
         &mut self,
         frame: &mut Frame,
         named: Vec<Option<u32>>,
-        into: &Buffer,
+        into: PoolAt<'_>,
         offset: SlotAt<'_>,
     ) -> Result<Vec<FileFills>> {
         // Each atom newly named a slot, and the slot's byte offset.
@@ -879,11 +882,12 @@ impl Cache {
                     );
                     continue;
                 }
+                let (buffer, local) = into(to + plane.at);
                 frame.copy(
                     host.binding.slab(),
                     host.binding.offset() + plane.entry_at(entry),
-                    into.slab(),
-                    to + plane.at,
+                    buffer.slab(),
+                    local,
                     bytes,
                 )?;
             }
@@ -905,8 +909,8 @@ impl Cache {
 
     /// Rewrites the address tables for the slots the atoms are named now,
     /// through the pool at `base` (see [`Cache::stage`]).
-    pub fn restage(&mut self, base: u64, offset: SlotAt<'_>) -> Result<()> {
-        self.stage(Some((base, offset)))
+    pub fn restage(&mut self, address: SlotAt<'_>) -> Result<()> {
+        self.stage(Some(address))
     }
 
     /// The shape's facts, stating where the load seated it while it holds
