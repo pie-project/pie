@@ -506,6 +506,8 @@ fn the_frame_cache_gathers_and_stores_each_lanes_window() {
     let slab_vals = bf16s(3 * stride, 0xcac, 1.0);
     let slab = gpu.tensor(&slab_vals, 3, stride as u32, Dtype::Bf16);
     let ids = gpu.ints(&slots);
+    // Clip `l` is lane `l`: its row of the pool's lane table.
+    let clip_lanes = gpu.ints(&[0, 1]);
     let ctx = gpu.ctx();
     let mut cache = gpu.zeros(cache_rows as u32, c as u32, Dtype::Bf16);
     let pool = |slab: Tensor| RecurrentPool {
@@ -514,7 +516,8 @@ fn the_frame_cache_gathers_and_stores_each_lanes_window() {
         slot_stride_elems: stride as i64,
         ..STATE
     };
-    cache_gather(&ctx, &pool(slab), ids, g, frames as u32, &mut cache).expect("the gather fires");
+    cache_gather(&ctx, &pool(slab), clip_lanes, 0, g, frames as u32, &mut cache)
+        .expect("the gather fires");
     let mut want_cache = Vec::new();
     for (b, &slot) in boxes.iter().zip(&slots) {
         let n = frames * b.plane() * c;
@@ -531,7 +534,8 @@ fn the_frame_cache_gathers_and_stores_each_lanes_window() {
         gpu.tensor(&x, rows as u32, c as u32, Dtype::Bf16),
         cache,
         &pool(out),
-        ids,
+        clip_lanes,
+        0,
         g,
         frames as u32,
         0,
