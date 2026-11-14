@@ -141,6 +141,7 @@ pub(crate) fn act_x_wt(
             Operand::new(w, sys::BLAS_BF16, k),
             Operand::new(act, sys::BLAS_BF16, k),
             Operand::new(y, sys::BLAS_BF16, n),
+            &mut ctx.blas_workspace(op),
         )
     }
     .map_err(|why| refuse(op, format!("{why} at M={m} N={n} K={k}")))?;
@@ -198,6 +199,7 @@ pub(crate) fn act_x_wt_f32(
             Operand::new(w, sys::BLAS_BF16, k),
             Operand::new(act, sys::BLAS_BF16, k),
             Operand::new(y, sys::BLAS_F32, n),
+            &mut ctx.blas_workspace(op),
         )
     }
     .map_err(|why| refuse(op, format!("{why} at M={m} N={n} K={k}")))

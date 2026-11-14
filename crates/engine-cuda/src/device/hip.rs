@@ -934,7 +934,9 @@ pub mod blas {
         match sys::rocblas() {
             // SAFETY: the caller's `handle` contract, forwarded to rocBLAS's
             // entry of the same signature.
-            Ok(blas) => cublasStatus_t::of(unsafe { (blas.rocblas_create_handle)(handle) }),
+            // A handle holding no workspace of its own: its calls run on laid
+            // slabs (`kernels_cuda::hip::blas::create`).
+            Ok(_) => cublasStatus_t::of(unsafe { kernels_cuda::hip::blas::create(handle) }),
             Err(_) => cublasStatus_t::CUBLAS_STATUS_INTERNAL_ERROR,
         }
     }

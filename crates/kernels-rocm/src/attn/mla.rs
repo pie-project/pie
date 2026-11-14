@@ -235,6 +235,7 @@ pub fn absorb_q(
             heads * rank,
             i64::from(rank),
             heads,
+            &mut ctx.blas_workspace(OP),
         )
         .map_err(|why| refuse(OP, why.to_string()))
     }
@@ -308,6 +309,7 @@ pub fn absorb_out(
             heads * v_dim,
             i64::from(v_dim),
             heads,
+            &mut ctx.blas_workspace(OP),
         )
         .map_err(|why| refuse(OP, why.to_string()))
     }
@@ -342,7 +344,8 @@ unsafe fn absorb(
     ldc: i32,
     stride_c: i64,
     heads: i32,
-) -> Result<(), crate::hip::blas::Refused> {
+    workspace: &mut crate::hip::blas::Workspace<'_>,
+) -> Result<(), crate::Error> {
     use crate::hip::blas::{self, Operand};
     use crate::hip::sys;
 
@@ -361,6 +364,7 @@ unsafe fn absorb(
             Operand::new(b, sys::BLAS_BF16, ldb).strided(stride_b),
             Operand::new(c, sys::BLAS_BF16, ldc).strided(stride_c),
             heads,
+            workspace,
         )
     }
 }

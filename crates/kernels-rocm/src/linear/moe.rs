@@ -1879,6 +1879,7 @@ fn select_grouped_blas(
             Operand::new(act_ptrs, scalar, k),
             Operand::new(out_ptrs, scalar, n),
             max_blocks,
+            &mut ctx.blas_workspace(op),
         )
     }
     .map_err(|why| {
