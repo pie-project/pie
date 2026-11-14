@@ -16,6 +16,7 @@ mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tower_region_reads_the_patch_window;
 mod a_verify_walk_is_the_committed_walk;
 mod an_adapter_in_slots_is_one_landing_through_the_table;
+mod an_operand_past_an_ints_reach_reads_its_last_rows;
 mod an_operator_declared_adapter_is_refused;
 mod each_checked_in_profile_runs_its_familys_old_tuning;
 mod every_catalog_deployment_dispatches;
