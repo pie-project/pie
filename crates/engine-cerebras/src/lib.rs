@@ -35,6 +35,7 @@ pub mod device;
 mod facts;
 pub mod guest;
 pub mod prepare;
+pub mod reading;
 pub mod sdk;
 pub mod wafer;
 
