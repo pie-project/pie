@@ -307,7 +307,7 @@ fn load_alone(
     // the device has, as tests load at once.
     let mut tries = 0;
     let quarter = loop {
-        match Context::bind(&device, engine::Allowance::WHOLE) {
+        match Context::bind(&device, backend::ALLOWANCE) {
             Ok(bound) => break engine_gpu::backend::Context::capacity(&bound) / 4,
             Err(why) => {
                 tries += 1;

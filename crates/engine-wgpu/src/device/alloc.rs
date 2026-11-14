@@ -68,7 +68,7 @@ impl Raw {
                 Fault::Wgpu { why, .. } if why.contains("emory") => Fault::Ceiling {
                     what: "device memory",
                     need: size,
-                    have: core.device_local.saturating_sub(core.books.device()),
+                    have: core.budget.saturating_sub(core.books.device()),
                 },
                 other => other,
             });

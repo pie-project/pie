@@ -381,7 +381,7 @@ fn scratch() -> PathBuf {
 #[test]
 fn a_conv_decoder_fires_over_a_voxel_input() {
     let device = DeviceBoot::default();
-    if Context::bind(&device, engine::Allowance::WHOLE).is_err() {
+    if Context::bind(&device, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return;
     }
@@ -416,7 +416,10 @@ fn a_conv_decoder_fires_over_a_voxel_input() {
         slots: 4,
         runahead: engine::runahead::Runahead::F1,
         device: &device,
-        residency: engine::load::Residency::default(),
+        residency: engine::load::Residency {
+            device: backend::ALLOWANCE,
+            ..engine::load::Residency::default()
+        },
         handed: None,
     })
     .expect("the decoder loads");

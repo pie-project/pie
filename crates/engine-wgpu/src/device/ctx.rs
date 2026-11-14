@@ -166,27 +166,12 @@ pub(crate) struct Core {
     pub(crate) name: String,
     /// `None` without the subgroup feature.
     pub(crate) subgroup_min: Option<u32>,
-    /// The device's bytes as the host states them; else 0.
-    pub(crate) device_local: u64,
-    /// The device's bytes as the host states them (`DeviceBoot::device_memory`).
-    stated: Option<u64>,
+    /// `[engine.memory] budget_device`: what the load takes, all of it
+    /// together. The environment reports no memory size, so it is stated.
+    pub(crate) budget: u64,
 }
 
 impl Core {
-    /// The device bytes free to this process now: the size the host states
-    /// less every reservation, else the pool's own binding ceiling, four
-    /// segments of the largest storage binding.
-    fn free(&self) -> u64 {
-        if let Some(stated) = self.stated {
-            return stated.saturating_sub(engine_gpu::books::process_reserved());
-        }
-        let binding = self
-            .limits
-            .max_buffer_size
-            .min(self.limits.max_storage_buffer_binding_size);
-        binding.saturating_mul(kernels_slang::SEGMENTS as u64)
-    }
-
     pub(crate) fn fault(&self, what: &'static str, why: impl ToString) -> Fault {
         Fault::Wgpu {
             what,
@@ -322,8 +307,6 @@ impl Drop for Held {
 #[derive(Clone)]
 pub struct Context {
     pub(crate) core: Arc<Core>,
-    /// The operator's cap on what the load takes, all of it together.
-    budget: Option<u64>,
     max_buffer: u64,
     pub(crate) dummy: Slab,
     device_index: u32,
@@ -334,7 +317,7 @@ impl std::fmt::Debug for Context {
         f.debug_struct("Context")
             .field("name", &self.core.name)
             .field("backend", &self.core.info.backend)
-            .field("budget", &self.budget)
+            .field("budget", &self.core.budget)
             .finish()
     }
 }
@@ -460,24 +443,36 @@ pub async fn request(boot: &DeviceBoot) -> Result<Handed> {
     })
 }
 
+/// `allowance.budget`, refused where the operator states none.
+fn stated(allowance: engine::Allowance) -> Result<u64> {
+    allowance.budget.ok_or_else(|| {
+        Fault::Residency(
+            "wgpu: the environment reports no memory size; state \
+             `[engine.memory] budget_device` for what the load may take"
+                .to_string(),
+        )
+    })
+}
+
 impl Context {
-    /// The device `boot` names, of which a load takes what it has, no more
-    /// than `allowance.budget` where the operator states one.
+    /// The device `boot` names, of which a load takes `allowance.budget`,
+    /// which must be stated.
     pub fn bind(boot: &DeviceBoot, allowance: engine::Allowance) -> Result<Context> {
+        stated(allowance)?;
         let _gate = gate();
         let handed = host::block_on("request_device", request(boot))??;
         Context::adopt(boot, allowance, handed)
     }
 
-    /// A device the host already holds, of which a load takes what it has,
-    /// no more than `allowance.budget` where stated. wgpu reports no memory
-    /// of its own ([`Core::free`] says what stands in).
+    /// A device the host already holds, of which a load takes
+    /// `allowance.budget`, which must be stated: WebGPU reports no memory
+    /// size.
     pub fn adopt(
         boot: &DeviceBoot,
         allowance: engine::Allowance,
         handed: Handed,
     ) -> Result<Context> {
-        let budget = allowance.budget;
+        let budget = stated(allowance)?;
         let Handed {
             adapter,
             device,
@@ -495,7 +490,6 @@ impl Context {
                 *sink.lock().expect("sink lock poisoned") = Some(text);
             }));
         }
-        let device_local = boot.device_memory.unwrap_or(0);
         let enabled = Enabled {
             subgroups: features.contains(wgpu::Features::SUBGROUP),
             f16: features.contains(wgpu::Features::SHADER_F16),
@@ -522,8 +516,7 @@ impl Context {
             last_error,
             books: Arc::new(engine_gpu::Books::new()),
             subgroup_min,
-            device_local,
-            stated: boot.device_memory,
+            budget,
         });
         let dummy = Raw::new(
             &core,
@@ -532,7 +525,6 @@ impl Context {
             engine_gpu::books::owners::DUMMY,
         )?;
         let context = Context {
-            budget,
             max_buffer,
             core,
             dummy,
@@ -556,14 +548,10 @@ impl Context {
         self.core.info.backend.to_str()
     }
 
-    /// What the device has for this load, measured now: every reservation,
-    /// what the driver holds beside them and what is free, capped by the
-    /// operator's budget.
+    /// What the device has for this load: the operator's budget.
     #[must_use]
     pub fn capacity(&self) -> u64 {
-        let core = &self.core;
-        let measured = core.books.device() + core.free();
-        self.budget.map_or(measured, |budget| measured.min(budget))
+        self.core.budget
     }
 
     /// What the driver holds for this process beside every reservation:
@@ -1050,11 +1038,23 @@ mod tests {
     use crate::device::Buffer;
 
     #[test]
+    fn a_load_without_budget_device_is_refused() {
+        let why = Context::bind(&DeviceBoot::default(), engine::Allowance::WHOLE)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("reports no memory size"), "{why}");
+        assert!(why.contains("[engine.memory] budget_device"), "{why}");
+    }
+
+    #[test]
     fn a_copy_between_two_spans_of_one_buffer_lands() {
         if !present() {
             return;
         }
-        let device = Context::bind(&DeviceBoot::default(), engine::Allowance::WHOLE).unwrap();
+        let allowance = engine::Allowance {
+            budget: Some(1 << 30),
+        };
+        let device = Context::bind(&DeviceBoot::default(), allowance).unwrap();
         let mut buffer = Buffer::zeroed(&device, 64, engine_gpu::books::owners::SCRATCH).unwrap();
         let ramp: Vec<u8> = (1..=24).collect();
         buffer.write(0, &ramp).unwrap();
