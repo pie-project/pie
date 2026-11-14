@@ -466,7 +466,46 @@ pub(crate) fn spawn(
         lease,
         arrival,
         executors,
+        false,
     )
+    .map(|(id, _)| id)
+}
+
+/// [`spawn`], with a watch on the process's full departure taken as its id
+/// is made, before it holds anything or runs: its departure cannot be
+/// missed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one spawn request, as its callers have it"
+)]
+pub(crate) fn spawn_watched(
+    username: String,
+    program: Program,
+    input: String,
+    files: Arc<client_api::Files>,
+    client_id: Option<ClientId>,
+    capture_outputs: bool,
+    result_tx: Option<oneshot::Sender<Result<String, String>>>,
+    lease: Option<crate::handle::Lease>,
+    arrival: Arrival,
+    executors: Vec<String>,
+) -> Result<(ProcessId, crate::planner::DepartureWatch)> {
+    let (id, watch) = spawn_inner(
+        username,
+        program,
+        input,
+        files,
+        client_id,
+        capture_outputs,
+        Arc::new(Mutex::new(result_tx)),
+        None,
+        None,
+        lease,
+        arrival,
+        executors,
+        true,
+    )?;
+    Ok((id, watch.expect("a watch was asked for")))
 }
 
 #[allow(
@@ -486,8 +525,11 @@ fn spawn_inner(
     lease: Option<crate::handle::Lease>,
     arrival: Arrival,
     executors: Vec<String>,
-) -> Result<ProcessId> {
+    watch_departure: bool,
+) -> Result<(ProcessId, Option<crate::planner::DepartureWatch>)> {
     let id = Uuid::new_v4();
+    // Before anything is held under the id, so no departure is missed.
+    let watch = watch_departure.then(|| crate::planner::DepartureWatch::new(id));
     // The workers the cluster names to run its passes, best first: the
     // offload's alone, before the process can run one.
     crate::offload::executors::set(id, executors.clone());
@@ -528,7 +570,7 @@ fn spawn_inner(
         return Err(error);
     }
 
-    Ok(id)
+    Ok((id, watch))
 }
 
 pub async fn attach(process_id: ProcessId, client_id: ClientId) -> Result<()> {
@@ -917,9 +959,13 @@ impl Process {
             None,
             self.arrival.clone(),
             self.executors.clone(),
-        );
+            false,
+        )
+        .map(|(id, _)| id);
         match spawned {
             Ok(new_id) => {
+                // A watch on its departure follows the new run.
+                crate::planner::follow_restart(self.process_id, new_id);
                 RESTART_ALIAS
                     .write()
                     .unwrap()

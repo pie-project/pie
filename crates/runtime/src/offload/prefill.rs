@@ -982,7 +982,7 @@ async fn run_prefill(tokens: &[u32]) -> Result<crate::planner::DepartureWatch> {
     program::load(&name).await?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let input = serde_json::json!({ "tokens": tokens }).to_string();
-    let pid = crate::inferlet::process::spawn(
+    let (_, departure) = crate::inferlet::process::spawn_watched(
         "pie".into(),
         name,
         input,
@@ -994,7 +994,6 @@ async fn run_prefill(tokens: &[u32]) -> Result<crate::planner::DepartureWatch> {
         crate::policy::Arrival::default(),
         Vec::new(),
     )?;
-    let departure = crate::planner::DepartureWatch::new(pid);
     rx.await
         .map_err(|_| anyhow!("the prefill program went away"))?
         .map_err(|why| anyhow!("the prefill program failed: {why}"))?;

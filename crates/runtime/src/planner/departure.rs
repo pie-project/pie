@@ -34,44 +34,81 @@ impl Drop for Departure {
         if let Some(planner) = self.planner.upgrade() {
             planner.departed(self.pid);
         }
-        let mut watched = WATCHED.lock().unwrap();
-        if let Some(gone) = watched.get_mut(&self.pid) {
-            *gone = true;
-            drop(watched);
+        let told = {
+            let mut watched = WATCHED.lock().unwrap();
+            let mut told = false;
+            for watch in watched.values_mut() {
+                // Only the watched process's newest run: a restart's old
+                // run departing is not its departure.
+                if watch.current == self.pid {
+                    watch.gone = true;
+                    told = true;
+                }
+            }
+            told
+        };
+        if told {
             GONE.notify_waiters();
         }
     }
 }
 
+/// One watched process: the id of its newest run (a restart runs it again
+/// under a new id) and whether that run has fully departed.
+struct Watched {
+    current: ProcessId,
+    gone: bool,
+}
+
 /// Processes whose full departure (the last [`Departure`] hold dropped: the
 /// process ended and every working set it held released) someone waits on,
-/// and whether it has come.
-static WATCHED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<ProcessId, bool>>> =
-    std::sync::LazyLock::new(Default::default);
+/// by the id the watch was taken on.
+static WATCHED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<ProcessId, Watched>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// Told when a watched process has fully departed.
 static GONE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
-/// A watch on process `pid`'s full departure, from now: taken while it
-/// still runs, so its departure is not missed. Dropped, the watch goes.
+/// Process `old` is run again as `new` (a restart): a watch on it follows
+/// the new run, and the old one's departure is not the process's.
+pub fn follow_restart(old: ProcessId, new: ProcessId) {
+    for watch in WATCHED.lock().unwrap().values_mut() {
+        if watch.current == old {
+            watch.current = new;
+            watch.gone = false;
+        }
+    }
+}
+
+/// A watch on process `pid`'s full departure, taken as the process is
+/// spawned, before it holds anything, so its departure cannot be missed
+/// (`inferlet::process::spawn_watched`). Dropped, the watch goes.
 pub struct DepartureWatch(ProcessId);
 
 impl DepartureWatch {
+    /// Watches `pid` from now. Taken by the spawn itself, before the
+    /// process can run.
     #[must_use]
     pub fn new(pid: ProcessId) -> Self {
-        WATCHED.lock().unwrap().insert(pid, false);
+        WATCHED.lock().unwrap().insert(
+            pid,
+            Watched {
+                current: pid,
+                gone: false,
+            },
+        );
         Self(pid)
     }
 
-    /// Whether the process has fully departed.
+    /// Whether the process (its newest run) has fully departed.
     #[must_use]
     pub fn gone(&self) -> bool {
         WATCHED
             .lock()
             .unwrap()
             .get(&self.0)
-            .copied()
-            .unwrap_or(true)
+            .is_none_or(|watch| watch.gone)
     }
 
     /// The next departure of a watched process: arm it before looking.
