@@ -239,11 +239,17 @@ impl ResidencyPlanner {
     /// The error waiter `key` fails with when it has stood short of what
     /// only the policy can free past the seat deadline, rather than wait on.
     pub(super) fn short_expired(&self, key: EntryKey) -> Option<super::PlannerError> {
-        let (waited, host) = {
+        let (waited, host, answered) = {
             let short = self.short.lock();
-            (short.since(key.1)?.elapsed(), short.host_short(key.1))
+            (
+                short.since(key.1)?.elapsed(),
+                short.host_short(key.1),
+                short.answered_nothing(key.1),
+            )
         };
-        if waited < crate::pipeline::fire::SEAT_WAIT {
+        // The event, not a clock: the policy answered its pressure and
+        // freed nothing.
+        if !answered {
             return None;
         }
         // Short of device room while processes still run, it is behind

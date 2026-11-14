@@ -30,11 +30,14 @@ pub fn sink(engine: usize) -> Sink {
     Arc::new(move |tier, bytes| pressure::raise(tier, engine, bytes))
 }
 
-/// What one waiter lacks on each tier, and since when it has lacked any.
+/// What one waiter lacks on each tier, since when it has lacked any, and
+/// how many times each tier's pressure had been answered with nothing
+/// freed then ([`pressure::nothing_freed`]).
 #[derive(Debug, Clone, Copy)]
 struct Short {
     bytes: [u64; 2],
     since: Instant,
+    answered: [u64; 2],
 }
 
 /// The shortfalls one planner reports.
@@ -61,6 +64,7 @@ impl Shortfall {
             .or_insert(Short {
                 bytes,
                 since: Instant::now(),
+                answered: Tier::ALL.map(pressure::nothing_freed),
             });
     }
 
@@ -81,12 +85,24 @@ impl Shortfall {
         self.waiters.retain(|&id, _| waiting(id));
     }
 
-    /// Since when waiter `id` has been short, if it is.
-    /// Waiter `id`'s clock runs again from now.
+    /// Waiter `id` starts over: it fails only on an answer of nothing
+    /// after now.
     pub(super) fn restart(&mut self, id: u64) {
         if let Some(short) = self.waiters.get_mut(&id) {
             short.since = Instant::now();
+            short.answered = Tier::ALL.map(pressure::nothing_freed);
         }
+    }
+
+    /// Whether the policy answered the pressure of a tier waiter `id` is
+    /// short on and freed nothing, since it became short (or started over).
+    pub(super) fn answered_nothing(&self, id: u64) -> bool {
+        self.waiters.get(&id).is_some_and(|short| {
+            Tier::ALL.into_iter().any(|tier| {
+                short.bytes[tier.index()] > 0
+                    && pressure::nothing_freed(tier) > short.answered[tier.index()]
+            })
+        })
     }
 
     pub(super) fn since(&self, id: u64) -> Option<Instant> {
@@ -132,5 +148,27 @@ impl Shortfall {
                 (now > 0 || said > 0).then_some((tier, now))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A short waiter fails on the policy's answer of nothing for a tier it
+    /// is short on, after it became short, not on a clock; starting over
+    /// waits for the next such answer.
+    #[test]
+    fn a_short_waiter_fails_on_an_answer_of_nothing_not_on_a_clock() {
+        let mut shortfall = Shortfall::default();
+        shortfall.note(7, [1 << 20, 0]);
+        assert!(!shortfall.answered_nothing(7), "nothing answered yet");
+        pressure::answered_nothing(Tier::Device);
+        assert!(shortfall.answered_nothing(7), "answered with nothing freed");
+        shortfall.restart(7);
+        assert!(!shortfall.answered_nothing(7), "started over");
+        // An answer on a tier it is not short on is not its.
+        pressure::answered_nothing(Tier::Host);
+        assert!(!shortfall.answered_nothing(7));
     }
 }
