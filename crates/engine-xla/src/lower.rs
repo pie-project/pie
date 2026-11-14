@@ -121,12 +121,7 @@ impl Lower<'_, '_> {
             let s = f.dims(staging.val).iter().product::<i64>();
             let staging = f.reshape(staging.val, &[s])?;
             let rows = i64::from(bank.plane_rows);
-            let (next, table) = if std::env::var_os("PIE_XLA_NOSTAGE").is_some() {
-                let _ = (host, rows, staging);
-                (pool, table)
-            } else {
-                f.stage_misses(pool, table, routes, host, rows, staging)?
-            };
+            let (next, table) = f.stage_misses(pool, table, routes, host, rows, staging)?;
             pool = next;
             tables.push((param, table));
         }
