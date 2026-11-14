@@ -1,13 +1,19 @@
 use crate::error::{Fault, Result};
 
+/// What the driver is left beside everything a load places: the safety
+/// floor under the measured capacity (the user's decision, every backend).
+pub const DRIVER_FLOOR: u64 = 64 << 20;
+
 /// What a load may place on the device: the working set Metal recommends
 /// for this process, less what the device already held for it when the
-/// load began (the context, queues and libraries: `outside`), capped by
-/// `[engine.memory] budget_device` where the operator states one. Measured,
-/// not a share of the device.
+/// load began (the context, queues and libraries: `outside`) and the
+/// driver's floor, capped by `[engine.memory] budget_device` where the
+/// operator states one. Measured, not a share of the device.
 #[must_use]
 pub fn capacity(working_set: u64, outside: u64, budget: Option<u64>) -> u64 {
-    let measured = working_set.saturating_sub(outside);
+    let measured = working_set
+        .saturating_sub(outside)
+        .saturating_sub(DRIVER_FLOOR);
     budget.map_or(measured, |budget| measured.min(budget))
 }
 
@@ -109,7 +115,7 @@ impl Accounting {
 
 #[cfg(test)]
 mod tests {
-    use super::Accounting;
+    use super::{Accounting, DRIVER_FLOOR};
 
     const GIB: u64 = 1 << 30;
 
@@ -167,19 +173,28 @@ mod tests {
         let alone = Accounting::of(40 * GIB, 0, None, 16 * GIB, 0, GIB);
         let held = Accounting::of(40 * GIB, GIB, None, 16 * GIB, 0, GIB);
         assert_eq!(held.capacity, alone.capacity - GIB);
+        assert_eq!(
+            alone.capacity,
+            40 * GIB - DRIVER_FLOOR,
+            "the driver keeps its floor"
+        );
         assert_eq!(held.pool, alone.pool - GIB);
     }
 
     fn a_budget_caps_the_capacity() {
         let whole = Accounting::of(40 * GIB, GIB, None, 16 * GIB, 0, GIB);
-        assert_eq!(whole.capacity, 39 * GIB, "no share of the device is taken");
+        assert_eq!(
+            whole.capacity,
+            39 * GIB - DRIVER_FLOOR,
+            "no share of the device is taken, only the floor"
+        );
         let capped = Accounting::of(40 * GIB, GIB, Some(20 * GIB), 16 * GIB, 0, GIB);
         assert_eq!(capped.capacity, 20 * GIB);
         assert_eq!(capped.pool, 4 * GIB);
         let roomy = Accounting::of(40 * GIB, GIB, Some(100 * GIB), 16 * GIB, 0, GIB);
         assert_eq!(
             roomy.capacity,
-            39 * GIB,
+            39 * GIB - DRIVER_FLOOR,
             "a budget past the device caps nothing"
         );
         let over = Accounting::of(40 * GIB, 0, Some(17 * GIB), 16 * GIB, 0, 2 * GIB);

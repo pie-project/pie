@@ -116,6 +116,10 @@ impl Slots {
     }
 }
 
+/// The most activation rungs a layout states: every power of two of tokens
+/// a fire can carry.
+pub const MAX_RUNGS: usize = 32;
+
 /// The pool's chunk size, its shapes and its extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
@@ -142,6 +146,12 @@ pub struct Layout {
     /// working set holds, taken per instance and channel.
     pub instance: Option<Slots>,
     pub channel: Option<Slots>,
+    /// The activation span (REDESIGN 3c): `(rung tokens, chunks)` a fire of
+    /// up to that many tokens takes out of the range's top, ascending, the
+    /// first `act_rungs`; the last is the span. None where activation lives
+    /// apart.
+    pub act: [(u32, u32); MAX_RUNGS],
+    pub act_rungs: usize,
 }
 
 impl Layout {
@@ -173,6 +183,8 @@ impl Layout {
             seats,
             instance: Slots::of(INSTANCE, INSTANCE_SLOT, chunk_bytes),
             channel: Slots::of(CHANNEL, CHANNEL_SLOT, chunk_bytes),
+            act: [(0, 0); MAX_RUNGS],
+            act_rungs: 0,
         };
         if let Some(shape) = layout.shapes().find(|s| s.per_chunk == 0) {
             return Err(Fault::Ceiling {
@@ -248,6 +260,42 @@ impl Layout {
 
     /// This layout with an rs list of `bytes` slots of `tokens` rows; its
     /// seat run, `pages_per_seat` slots a seat, after the others.
+    /// This layout with an activation span of `rungs`, `(tokens, chunks)`
+    /// ascending in both, the last the span; refused where the span leaves
+    /// the range no chunk beside the null one.
+    pub fn with_act(mut self, rungs: &[(u32, u32)]) -> Result<Layout> {
+        if rungs.len() > MAX_RUNGS {
+            return Err(Fault::Ceiling {
+                what: "activation rungs",
+                need: rungs.len() as u64,
+                have: MAX_RUNGS as u64,
+            });
+        }
+        let span = rungs.last().map_or(0, |&(_, chunks)| chunks);
+        if span.saturating_add(1) >= self.total_chunks {
+            return Err(Fault::Ceiling {
+                what: "chunks of the range beside its activation span",
+                need: u64::from(span) + 2,
+                have: u64::from(self.total_chunks),
+            });
+        }
+        self.act[..rungs.len()].copy_from_slice(rungs);
+        self.act_rungs = rungs.len();
+        Ok(self)
+    }
+
+    /// Each rung's `(tokens, chunks)`, ascending.
+    #[must_use]
+    pub fn act(&self) -> &[(u32, u32)] {
+        &self.act[..self.act_rungs]
+    }
+
+    /// The activation span's chunks: the largest rung's.
+    #[must_use]
+    pub fn act_span(&self) -> u32 {
+        self.act().last().map_or(0, |&(_, chunks)| chunks)
+    }
+
     pub fn with_rs(mut self, bytes: u64, tokens: u32, pages_per_seat: u32) -> Result<Layout> {
         let Some(mut rs) = Slots::of(RS, bytes, self.chunk_bytes) else {
             return Ok(self);
@@ -310,7 +358,7 @@ impl Layout {
 
     /// The pool as the runtime counts it: one shared chunk space, chunk 0
     /// null, segments of `segment_chunks` growing from the bottom where the
-    /// pool is sparse; activation lives in the arena apart.
+    /// pool is sparse, the activation span (where stated) the top chunks.
     #[must_use]
     pub fn facts(&self, growth: Growth, committed: u32, rows: &[Vec<u32>; 2]) -> ChunkFacts {
         let segments = self.total_chunks.div_ceil(self.segment_chunks.max(1));
@@ -405,7 +453,7 @@ impl Layout {
                 chunks: 1,
             }],
             shapes,
-            act_chunks: Vec::new(),
+            act_chunks: self.act().to_vec(),
             host_chunks: 0,
             disk_chunks: 0,
             disk_persistent: false,

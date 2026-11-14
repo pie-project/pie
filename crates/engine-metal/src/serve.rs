@@ -273,7 +273,6 @@ pub struct Shell {
     ane: Option<crate::ane::Ane>,
     weights: Weights,
     arena: Arena,
-    arena_ladder: Vec<(FireRows, poem_compiler::ArenaMap)>,
     pools: Pools,
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
     rs_buffers: Option<crate::rs::Buffers>,
@@ -808,7 +807,7 @@ impl PreparedLoad<'_> {
             .map(|w| seated_paging.context().div_ceil(w.tokens.max(1)).max(1))
             .max()
             .unwrap_or(0);
-        let scratch = Scratch::reserve(
+        let mut scratch = Scratch::reserve(
             &device,
             &boot.trace,
             weights.table(),
@@ -905,6 +904,7 @@ impl PreparedLoad<'_> {
                     selections,
                     &bands,
                     window_pages_per_slot,
+                    feeds.ragged.len(),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -988,8 +988,15 @@ impl PreparedLoad<'_> {
             )
             .with_streamable(weights.filed_bytes())
         };
+        // The activation span (REDESIGN 3c): the range's top, the kernel
+        // scratch plane and under it each rung's carve, every power of two
+        // of tokens from 1, the last the whole arena.
+        let rungs = activation_rungs(&boot.trace, &budgets, &compiled)?;
+        let act = crate::arena::act_chunks(&rungs, scratch.bytes(), rows.chunk_bytes);
+        let span = act.last().map_or(0, |&(_, chunks)| chunks);
         // One chunk pool holds every kv page and every record (the rs
-        // buffer's rows inside it), in what the room holds of whole chunks.
+        // buffer's rows inside it), in what the room holds of whole chunks,
+        // and the activation span above them.
         let (paging, pool_bytes, layout) = {
             let seated = paging_at(1, boot.slots)?;
             let bytes = [rows.list_bytes, rows.fixed_bytes];
@@ -1018,13 +1025,14 @@ impl PreparedLoad<'_> {
             // weights until a held set gives them back.
             let room = boot.kv_budget.unwrap_or_else(|| accounting(0).pool);
             let total = engine::chunk::fit(room, chunk, 0, least)
-                .map_err(|short| Fault::Residency(short.to_string()))?;
-            // The pool is one buffer.
+                .map_err(|short| Fault::Residency(short.to_string()))?
+                .saturating_add(span);
+            // The range is one buffer.
             let binds = u32::try_from(device.max_buffer() / chunk).unwrap_or(u32::MAX);
-            if binds < least {
+            if binds < least.saturating_add(span) {
                 return Err(Fault::Residency(format!(
-                    "one working set takes {least} chunks of {chunk} bytes, and this device \
-                     binds one buffer of {} MiB",
+                    "one working set takes {least} chunks of {chunk} bytes and one fire's \
+                     activation {span}, and this device binds one buffer of {} MiB",
                     device.max_buffer() >> 20
                 )));
             }
@@ -1042,11 +1050,13 @@ impl PreparedLoad<'_> {
             for (window, pages) in rows.windows.iter().zip(&window_pages) {
                 layout = layout.with_window(window.bytes, window.rows, window.tokens, *pages)?;
             }
-            let layout = layout.with_rs(
-                rows.rs.as_ref().map_or(0, |rs| rs.bytes),
-                rows.rs.as_ref().map_or(0, |rs| rs.tokens),
-                seated.pages_per_slot,
-            )?;
+            let layout = layout
+                .with_rs(
+                    rows.rs.as_ref().map_or(0, |rs| rs.bytes),
+                    rows.rs.as_ref().map_or(0, |rs| rs.tokens),
+                    seated.pages_per_slot,
+                )?
+                .with_act(&act)?;
             let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
             (
                 paging_at(pages, boot.slots)?,
@@ -1070,10 +1080,10 @@ impl PreparedLoad<'_> {
                 );
             }
         }
-        let arena = Arena::reserve(&device, &compiled.arena)?;
-        let arena_ladder = poem_compiler::arena_ladder(&boot.trace, &budgets, &compiled)?;
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging)?;
+        let arena = Arena::over(pools.view().clone(), pools.span(), scratch.bytes(), rungs);
+        scratch.seat(pools.view().clone(), arena.scratch_at());
         pools.seat_weights(weight_caches);
         // The null chunk and the floor stand from the load on.
         pools.commit_segments(1)?;
@@ -1131,7 +1141,6 @@ impl PreparedLoad<'_> {
             ane,
             weights,
             arena,
-            arena_ladder,
             pools,
             rs_layout,
             rs_buffers,
@@ -1578,9 +1587,17 @@ impl Shell {
             (Model, "weight cache tables", self.pools.table_bytes()),
             (Model, "ngram constants", self.scratch.constant_bytes()),
             (Model, "ane surfaces", ane_model),
-            (State, "pool", self.pools.held_bytes()),
+            (
+                State,
+                "pool",
+                self.pools.held_bytes() - self.pools.span_held_bytes(),
+            ),
             (State, "guest instances", guest_state),
-            (Fire, "arena", self.arena.mapped()),
+            (
+                Fire,
+                "activation span (arena, kernel scratch)",
+                self.pools.span_held_bytes(),
+            ),
             (
                 Fire,
                 "inputs",
@@ -1599,7 +1616,6 @@ impl Shell {
                 "readout",
                 self.readout.iter().map(Buffer::bytes).sum::<u64>(),
             ),
-            (Fire, "scratch", self.scratch.bytes()),
             (
                 Fire,
                 "rs scratch",
@@ -3691,8 +3707,7 @@ impl Shell {
             },
         )?;
         windows.bind(&self.handles, bound.windows)?;
-        let group_masks =
-            self.inputs[arm].stage_group_masks(&self.device, &self.handles, &group_masks)?;
+        let group_masks = self.inputs[arm].stage_group_masks(&self.handles, &group_masks)?;
 
         let fire = FireRows {
             tokens: u64::from(rows),
@@ -3703,13 +3718,7 @@ impl Shell {
             clips: u64::from(composition.clips()),
             readouts: readout_rows.len() as u64,
         };
-        let carve = self
-            .arena_ladder
-            .iter()
-            .find(|(ceiling, _)| covers(ceiling, &fire))
-            .map_or(&self.compiled.arena, |(_, map)| map);
-        self.arena.cover(carve.bytes)?;
-        let slots = self.arena.slots(&self.handles, carve, fire)?;
+        let slots = self.arena.fire_slots(&self.handles, fire)?;
         let caches = self.pools.table(
             &self.handles,
             &self.inputs[arm].seats(&self.handles, &bound, pages, rows, lane_count),
@@ -4474,12 +4483,27 @@ impl Shell {
 }
 
 /// Whether every row count of `fire` fits under `ceiling`.
-fn covers(ceiling: &FireRows, fire: &FireRows) -> bool {
-    fire.tokens <= ceiling.tokens
-        && fire.lanes <= ceiling.lanes
-        && fire.patches <= ceiling.patches
-        && fire.images <= ceiling.images
-        && fire.voxels <= ceiling.voxels
-        && fire.clips <= ceiling.clips
-        && fire.readouts <= ceiling.readouts
+/// Each activation rung's carve, `(tokens, map)` ascending: every power of
+/// two of tokens from 1 under the widest fire whose carve is smaller than
+/// the whole arena, then the whole arena for every fire.
+fn activation_rungs(
+    trace: &poem_ir::Trace,
+    budgets: &Budgets,
+    compiled: &poem_compiler::CompiledModel,
+) -> Result<Vec<(u32, poem_compiler::ArenaMap)>> {
+    let max = budgets.tokens.max_tokens;
+    let mut rungs = Vec::new();
+    for tokens in engine::memory::rungs(1, max) {
+        if tokens >= max {
+            break;
+        }
+        let map = poem_compiler::arena_rung(trace, budgets, compiled, tokens).map_err(|why| {
+            Fault::Residency(format!("the carve of a {tokens}-token rung: {why}"))
+        })?;
+        if map.bytes < compiled.arena.bytes {
+            rungs.push((tokens, map));
+        }
+    }
+    rungs.push((max, compiled.arena.clone()));
+    Ok(rungs)
 }

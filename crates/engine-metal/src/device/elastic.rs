@@ -451,6 +451,12 @@ pub struct Elastic {
     len: u64,
     committed: u64,
     chunks: Vec<Chunk>,
+    /// Where the pinned top starts ([`Elastic::pin_top`]): `virtual_bytes`
+    /// where nothing is pinned. The bottom grows and shrinks below it.
+    top_from: u64,
+    /// The heaps mapped over `[top_from, virtual_bytes)`, in order, kept for
+    /// the buffer's life.
+    top: Vec<Chunk>,
     owner: Weak<Mutex<State>>,
     /// The mapping side this buffer was created on: the device that makes
     /// its heaps, the queue that maps them, and the residency set they are
@@ -493,7 +499,112 @@ impl Elastic {
     /// tiles cost the device, a whole [`CHUNK`] at a time.
     #[must_use]
     pub fn held(&self) -> u64 {
-        self.chunks.iter().map(|chunk| chunk.bytes).sum()
+        self.chunks
+            .iter()
+            .chain(&self.top)
+            .map(|chunk| chunk.bytes)
+            .sum()
+    }
+
+    /// The bytes of the pinned top's heaps.
+    #[must_use]
+    pub fn top_held(&self) -> u64 {
+        self.top.iter().map(|chunk| chunk.bytes).sum()
+    }
+
+    /// Where the bottom stops: the pinned top's start, or the buffer's end.
+    const fn bottom_cap(&self) -> u64 {
+        if self.top_from < self.virtual_bytes {
+            self.top_from
+        } else {
+            self.virtual_bytes
+        }
+    }
+
+    /// Maps `[from, end)` once, zeroed, and keeps it mapped for the buffer's
+    /// life, charged to the arena like any growth: the top of a range whose
+    /// bottom grows and shrinks beneath it ([`grow_all`], [`shrink_all`]
+    /// stop at `from`). `from` is a whole [`CHUNK`] and at or above what the
+    /// bottom has mapped; a buffer pins its top once.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Ceiling`] past the arena's headroom; [`Fault::Device`] for a
+    /// second pin, a `from` off a chunk seam or under the mapped bottom, or a
+    /// heap or the mapping queue refusing.
+    pub fn pin_top(&mut self, from: u64) -> Result<()> {
+        if !self.top.is_empty() || !from.is_multiple_of(CHUNK) || from < self.committed || from >= self.len {
+            return Err(Fault::Device {
+                call: "elastic pinned top",
+                why: format!(
+                    "a top pinned at {from} of a {len}-byte buffer whose bottom maps {committed} \
+                     (pinned already: {pinned}); a top is pinned once, on a {CHUNK}-byte seam, \
+                     above the bottom",
+                    len = self.len,
+                    committed = self.committed,
+                    pinned = !self.top.is_empty(),
+                ),
+            });
+        }
+        let bytes = self.virtual_bytes - from;
+        let Some(arena) = self.arena() else {
+            return Err(Fault::Device {
+                call: "elastic pinned top",
+                why: "the arena this buffer belongs to is gone".to_string(),
+            });
+        };
+        {
+            let mut state = arena.lock();
+            if bytes > state.budget.headroom() {
+                return Err(Fault::Ceiling {
+                    what: "bytes of elastic memory for a pinned top",
+                    need: state.budget.reserved.saturating_add(bytes),
+                    have: state.budget.total,
+                });
+            }
+            state.budget.reserved += bytes;
+        }
+        let target_buffer = self.buffer.clone();
+        let mut at = from;
+        let mut fault = None;
+        while at < self.virtual_bytes {
+            let size = CHUNK.min(self.virtual_bytes - at);
+            match make_chunk(&self.sparse, size) {
+                Ok(mut chunk) => {
+                    self.sparse.issue(
+                        &target_buffer,
+                        Some(&chunk.heap),
+                        MTLSparseTextureMappingMode::Map,
+                        at / TILE,
+                        size / TILE,
+                        0,
+                    );
+                    chunk.mapped = size;
+                    self.top.push(chunk);
+                    at += size;
+                }
+                Err(error) => {
+                    fault = Some(error);
+                    break;
+                }
+            }
+        }
+        let mapped = at - from;
+        {
+            let mut state = arena.lock();
+            state.budget.reserved = state.budget.reserved.saturating_sub(bytes - mapped);
+            state.budget.committed += mapped;
+            state.budget.high_water = state.budget.high_water.max(state.budget.committed);
+        }
+        self.top_from = from;
+        let through = self.sparse.flush()?;
+        self.fence_at(through);
+        if let Some(fault) = fault {
+            return Err(fault);
+        }
+        // SAFETY: just mapped by the flush waited for; no frame has been
+        // encoded against these tiles.
+        unsafe { self.zero(from, self.len - from) }
     }
 
     /// A binding view over the sparse buffer, for encoders and blits.
@@ -533,6 +644,9 @@ impl Elastic {
             need: u64::MAX,
             have: self.committed,
         })?;
+        if offset >= self.top_from {
+            return self.top_span(offset, len, end);
+        }
         if end > self.committed {
             return Err(Fault::Ceiling {
                 what: "bytes mapped under an elastic buffer",
@@ -565,6 +679,41 @@ impl Elastic {
         let base = chunk.alias.contents();
         // SAFETY: `within + len <= chunk.bytes`, and the alias is a buffer
         // over the whole heap, so the offset is inside the allocation.
+        let at = unsafe { base.as_ptr().cast::<u8>().add(usize_of(within)) };
+        NonNull::new(at).ok_or(Fault::Device {
+            call: "elastic host span",
+            why: "the heap alias has no host address".to_string(),
+        })
+    }
+
+    /// [`Elastic::host_span`] inside the pinned top.
+    fn top_span(&self, offset: u64, len: u64, end: u64) -> Result<NonNull<u8>> {
+        if end > self.len {
+            return Err(Fault::Ceiling {
+                what: "bytes of an elastic buffer's pinned top",
+                need: end,
+                have: self.len,
+            });
+        }
+        let within_top = offset - self.top_from;
+        let index = usize_of(within_top / CHUNK);
+        let within = within_top % CHUNK;
+        let chunk = self.top.get(index).ok_or(Fault::Ceiling {
+            what: "bytes of an elastic buffer's pinned top",
+            need: end,
+            have: self.top_from + self.top_held(),
+        })?;
+        if within + len > chunk.bytes {
+            return Err(Fault::Device {
+                call: "elastic host span",
+                why: format!(
+                    "{len} bytes at {offset} cross the end of the top's chunk {index}, which \
+                     is a different heap; ask for the two sides separately"
+                ),
+            });
+        }
+        let base = chunk.alias.contents();
+        // SAFETY: `within + len <= chunk.bytes`, inside the heap's alias.
         let at = unsafe { base.as_ptr().cast::<u8>().add(usize_of(within)) };
         NonNull::new(at).ok_or(Fault::Device {
             call: "elastic host span",
@@ -747,7 +896,7 @@ impl Drop for Elastic {
         if self.drained() {
             let residency = self.sparse.residency();
             residency.removeAllocation(ProtocolObject::from_ref(&*self.buffer));
-            for chunk in &self.chunks {
+            for chunk in self.chunks.iter().chain(&self.top) {
                 residency.removeAllocation(ProtocolObject::from_ref(&*chunk.heap));
             }
             residency.commit();
@@ -757,7 +906,7 @@ impl Drop for Elastic {
             // free them: a leak costs this process memory it was already
             // holding, and the alternative costs the machine.
             leak(self.buffer.clone());
-            for chunk in self.chunks.drain(..) {
+            for chunk in self.chunks.drain(..).chain(self.top.drain(..)) {
                 let Chunk { heap, alias, .. } = chunk;
                 leak(heap);
                 leak(alias);
@@ -770,8 +919,9 @@ impl Drop for Elastic {
             return;
         };
         let mut state = state.lock().expect("state lock poisoned");
-        state.budget.reserved = state.budget.reserved.saturating_sub(self.committed);
-        state.budget.committed = state.budget.committed.saturating_sub(self.committed);
+        let held = self.committed + self.top.iter().map(|chunk| chunk.mapped).sum::<u64>();
+        state.budget.reserved = state.budget.reserved.saturating_sub(held);
+        state.budget.committed = state.budget.committed.saturating_sub(held);
     }
 }
 
@@ -882,6 +1032,8 @@ pub fn create(sparse: &Arc<Sparse>, arena: &Arena, len: u64) -> Result<Elastic> 
         len,
         committed: 0,
         chunks: Vec::new(),
+        top_from: virtual_bytes,
+        top: Vec::new(),
         owner: Arc::downgrade(&arena.state),
         sparse: sparse.clone(),
         fence: None,
@@ -904,7 +1056,7 @@ fn grow(buffer: &mut Elastic, bytes: u64) -> Result<Option<(u64, u64)>> {
             have: buffer.len,
         });
     }
-    let target = tiles_up(bytes).min(buffer.virtual_bytes);
+    let target = tiles_up(bytes).min(buffer.bottom_cap());
     if target <= buffer.committed {
         return Ok(None);
     }
@@ -1019,7 +1171,7 @@ pub fn map_all(targets: &mut [Target<'_>]) -> Result<Vec<Option<(u64, u64)>>> {
                 have: target.buffer.len,
             });
         }
-        let want = tiles_up(target.bytes).min(target.buffer.virtual_bytes);
+        let want = tiles_up(target.bytes).min(target.buffer.bottom_cap());
         delta = delta.saturating_add(want.saturating_sub(target.buffer.committed));
         let Some(mine) = target.buffer.arena() else {
             return Err(Fault::Device {
@@ -1071,7 +1223,7 @@ pub fn map_all(targets: &mut [Target<'_>]) -> Result<Vec<Option<(u64, u64)>>> {
                     .iter()
                     .map(|target| {
                         tiles_up(target.bytes)
-                            .min(target.buffer.virtual_bytes)
+                            .min(target.buffer.bottom_cap())
                             .saturating_sub(target.buffer.committed)
                     })
                     .sum();
@@ -1105,7 +1257,7 @@ pub fn map_all(targets: &mut [Target<'_>]) -> Result<Vec<Option<(u64, u64)>>> {
 /// caller holds those until the unmap has landed.
 #[cfg(target_vendor = "apple")]
 fn shrink(buffer: &mut Elastic, bytes: u64) -> (bool, Vec<Chunk>) {
-    let target = tiles_up(bytes).min(buffer.virtual_bytes);
+    let target = tiles_up(bytes).min(buffer.bottom_cap());
     if target >= buffer.committed {
         return (false, Vec::new());
     }
