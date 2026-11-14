@@ -227,6 +227,7 @@ impl Engine for Spatial {
             pools,
             chunks,
             limits: FireLimits {
+                max_unfolded_rows: 0,
                 // The model holds one sequence's cache; a fire's lanes run one
                 // after another, each cache brought back from its tokens.
                 max_lanes: budgets.max_lanes.max(1),

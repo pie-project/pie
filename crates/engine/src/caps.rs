@@ -37,6 +37,13 @@ pub struct FireLimits {
     /// 0: as many as `max_tokens`.
     #[serde(default)]
     pub max_readouts: u32,
+    /// The most recurrent-state rows one lane may hold unfolded (rows
+    /// written past its fold: `first − folded`), what the engine sizes its
+    /// rs scratch for. A pass that would leave a lane past it is refused
+    /// before anything is submitted; the runtime never folds behind the
+    /// guest's back. 0: unbounded (an engine that does not state it).
+    #[serde(default)]
+    pub max_unfolded_rows: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

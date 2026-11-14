@@ -417,6 +417,7 @@ impl Engine for Xla {
             pools,
             chunks,
             limits: FireLimits {
+                max_unfolded_rows: 0,
                 max_lanes: budgets.max_lanes,
                 max_tokens: budgets.max_tokens,
                 max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
