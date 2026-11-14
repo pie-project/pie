@@ -778,8 +778,9 @@ impl Inputs {
             runs,
             store,
         };
-        // Granted where the slab stands in, as a size-only walk reads them.
-        inputs.lay(crate::sizing::STAND_IN);
+        // Granted where the slab stands in, as a size-only walk reads them;
+        // the slab itself is not laid.
+        inputs.grant_at(crate::sizing::STAND_IN);
         Ok(inputs)
     }
 
@@ -798,6 +799,11 @@ impl Inputs {
     /// span the load holds backed and zeroed, of [`Inputs::bytes`].
     pub fn lay(&mut self, base: u64) {
         self.store.lay(base);
+        self.grant_at(base);
+    }
+
+    /// Each plan's workspace grant, the slab at `base`.
+    fn grant_at(&mut self, base: u64) {
         let grants = &self.grants;
         self.plans = (0..self.runs as usize)
             .flat_map(|run| {
