@@ -318,6 +318,7 @@ fn four_ranks_land_what_one_rank_lands() {
                     },
                     instance_slots: Vec::new(),
                     ring_slots: Vec::new(),
+                    adapter_slots: Vec::new(),
                 },
             )
             .id;

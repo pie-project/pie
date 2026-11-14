@@ -273,7 +273,11 @@ impl Plane {
                 ring_facts(channel as u32, shape, channel_slot, channel_per_chunk)
             })
             .collect();
-        Ok(engine::ProgramFacts { instance, rings })
+        Ok(engine::ProgramFacts {
+            instance,
+            rings,
+            ..engine::ProgramFacts::default()
+        })
     }
 
     /// Points every pooled table and ring at the chunks their slots sit in
@@ -296,6 +300,7 @@ impl Plane {
                 id,
                 instance,
                 rings,
+                ..
             } => self
                 .instances
                 .get_mut(id)
@@ -1068,6 +1073,7 @@ mod tests {
                     id: pooled,
                     instance: fresh_instance,
                     rings: fresh_rings,
+                    adapter: Vec::new(),
                 },
             )
             .expect("the slots rebind");

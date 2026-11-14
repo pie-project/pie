@@ -81,6 +81,11 @@ pub struct InstanceBinding {
     /// with a registered channel in `channels`.
     #[serde(default)]
     pub ring_slots: Vec<RingSlots>,
+    /// The `Adapter` slots the runtime took for the adapter this instance
+    /// lands, as many as [`ProgramFacts::adapter`] states. Empty where the
+    /// program binds none.
+    #[serde(default)]
+    pub adapter_slots: Vec<u32>,
 }
 
 /// What an instance of a registered program holds in the pool, beside the
@@ -95,6 +100,10 @@ pub struct ProgramFacts {
     /// The rings the program declares, by its channel index. A binding
     /// that names a registered channel for one holds no slots for it.
     pub rings: Vec<RingFacts>,
+    /// The adapter an instance lands at bind (the planes its program's
+    /// correction reads), in `Adapter` slots; none where it lands none.
+    #[serde(default)]
+    pub adapter: Footprint,
 }
 
 /// An item's bytes and the slots of its role that hold them.
@@ -140,6 +149,10 @@ pub enum Rebind {
         id: InstanceId,
         instance: Vec<u32>,
         rings: Vec<RingSlots>,
+        /// Its adapter's `Adapter` slots, as
+        /// [`InstanceBinding::adapter_slots`].
+        #[serde(default)]
+        adapter: Vec<u32>,
     },
     /// A registered channel's ring (`Channel` slots, as
     /// [`crate::channel::ChannelRegistration::slots`]).

@@ -275,6 +275,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
             device_resolved: Default::default(),
             instance_slots: Vec::new(),
             ring_slots: Vec::new(),
+            adapter_slots: Vec::new(),
         },
         &channels,
     );

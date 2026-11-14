@@ -1,16 +1,17 @@
-//! An instance's tables and a channel's ring in the shared pool (REDESIGN
-//! 2.6, `new-memory/STATE-ROLES.md` option A).
+//! An instance's tables, a channel's ring and an instance's adapter in the
+//! shared pool (REDESIGN 2.6, `new-memory/STATE-ROLES.md` option A).
 //!
-//! An engine that states a fixed shape of role [`SlotRole::Instance`] or
-//! [`SlotRole::Channel`] places a bound instance's launch tables and a
-//! ring's cells in slots of them, which the runtime takes from the pool on
-//! demand: [`Engine::program_facts`] and [`Engine::ring_facts`] say how
-//! many, and the binding ([`InstanceBinding::instance_slots`],
-//! [`InstanceBinding::ring_slots`]) or registration
-//! ([`ChannelRegistration::slots`]) names them. They are no part of a
-//! record nor of a working set ([`super::shared`]).
+//! An engine that states a fixed shape of role [`SlotRole::Instance`],
+//! [`SlotRole::Channel`] or [`SlotRole::Adapter`] places a bound instance's
+//! launch tables, a ring's cells and the adapter an instance lands in slots
+//! of them, which the runtime takes from the pool on demand:
+//! [`Engine::program_facts`] and [`Engine::ring_facts`] say how many, and
+//! the binding ([`InstanceBinding::instance_slots`],
+//! [`InstanceBinding::ring_slots`], [`InstanceBinding::adapter_slots`]) or
+//! registration ([`ChannelRegistration::slots`]) names them. They are no
+//! part of a record nor of a working set ([`super::shared`]).
 //!
-//! Neither role is replayable ([`SlotRole::replayable`]): no token rebuilds
+//! No such role is replayable ([`SlotRole::replayable`]): no token rebuilds
 //! them, so nothing here drops one. Under pressure the policy may park them
 //! with their process on the host tier, as it parks the process's kv: a
 //! park copies each item to host slots and frees its device slots, an
@@ -30,6 +31,7 @@
 //! [`Engine::rebind_slots`]: ::engine::Engine::rebind_slots
 //! [`InstanceBinding::instance_slots`]: ::engine::InstanceBinding::instance_slots
 //! [`InstanceBinding::ring_slots`]: ::engine::InstanceBinding::ring_slots
+//! [`InstanceBinding::adapter_slots`]: ::engine::InstanceBinding::adapter_slots
 //! [`ChannelRegistration::slots`]: ::engine::ChannelRegistration::slots
 
 use std::collections::{BTreeSet, HashMap};
@@ -129,8 +131,8 @@ struct Part {
 struct Item {
     holder: Option<Holder>,
     tier: Tier,
-    /// An instance: its tables' part, then each ring it holds itself. A
-    /// channel: its ring's part.
+    /// An instance: its tables' part, then each ring it holds itself, then
+    /// its adapter's. A channel: its ring's part.
     parts: Vec<Part>,
     /// An instance: each own ring's channel index, in part order after the
     /// first.
@@ -171,7 +173,7 @@ impl Item {
 /// it: [`Roles::bound`] keeps them, [`Roles::untake`] gives them back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Taken {
-    /// The tables' part, then each own ring's.
+    /// The tables' part, then each own ring's, then the adapter's.
     parts: Vec<Part>,
     /// Each own ring's channel index, in part order after the first.
     rings: Vec<u32>,
@@ -192,6 +194,12 @@ impl Taken {
     #[must_use]
     pub fn ring_slots(&self) -> Vec<RingSlots> {
         own_rings(&self.rings, &self.parts)
+    }
+
+    /// [`::engine::InstanceBinding::adapter_slots`].
+    #[must_use]
+    pub fn adapter_slots(&self) -> Vec<u32> {
+        adapter_of(&self.rings, &self.parts)
     }
 }
 
@@ -347,9 +355,9 @@ impl Roles {
 
     /// The slots an instance of `program` bound to `channels` takes:
     /// `footprint.slots` of the `Instance` shape (cells are packed whole, so
-    /// the engine counts, not the bytes), and for each ring of the program
-    /// no registered channel covers (`registered`), its slots of the
-    /// `Channel` shape.
+    /// the engine counts, not the bytes), for each ring of the program no
+    /// registered channel covers (`registered`), its slots of the `Channel`
+    /// shape, and its adapter's slots of the `Adapter` shape.
     pub fn take_instance(
         &mut self,
         program: ProgramId,
@@ -404,6 +412,19 @@ impl Roles {
                     self.give(&device, &taken.parts);
                     return Err(error);
                 }
+            }
+        }
+        let footprint = facts.adapter;
+        match self.take(
+            &device,
+            SlotRole::Adapter,
+            footprint.slots,
+            footprint.contiguous,
+        ) {
+            Ok(part) => taken.parts.push(part),
+            Err(error) => {
+                self.give(&device, &taken.parts);
+                return Err(error);
             }
         }
         Ok(taken)
@@ -681,6 +702,7 @@ impl Roles {
                     id,
                     instance: item.parts.first().map_or_else(Vec::new, |p| p.refs.clone()),
                     rings: own_rings(&item.rings, &item.parts),
+                    adapter: adapter_of(&item.rings, &item.parts),
                 },
             })
             .collect()
@@ -830,6 +852,7 @@ pub fn bind_instance(
     let binding = InstanceBinding {
         instance_slots: taken.instance_slots(),
         ring_slots: taken.ring_slots(),
+        adapter_slots: taken.adapter_slots(),
         ..binding.clone()
     };
     match engine.bind_instance(&binding) {
@@ -886,6 +909,13 @@ pub fn rebind(
         replay(engine, instance, pump)?;
     }
     Ok(())
+}
+
+/// An instance's adapter slots: the part after its own rings'.
+fn adapter_of(rings: &[u32], parts: &[Part]) -> Vec<u32> {
+    parts
+        .get(1 + rings.len())
+        .map_or_else(Vec::new, |part| part.refs.clone())
 }
 
 /// An instance's own rings as the engine names them: channel `rings[k]` in

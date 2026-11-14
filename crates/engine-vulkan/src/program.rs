@@ -342,7 +342,11 @@ impl Plane {
                 rings.push(facts);
             }
         }
-        Ok(ProgramFacts { instance, rings })
+        Ok(ProgramFacts {
+            instance,
+            rings,
+            ..ProgramFacts::default()
+        })
     }
 
     /// The `Channel` slots a registered channel's device cell takes.
@@ -398,6 +402,7 @@ impl Plane {
                     id,
                     instance,
                     rings,
+                    ..
                 } => {
                     let seat = self.instances.get_mut(id).ok_or(Refusal::Closed {
                         what: "instance",
