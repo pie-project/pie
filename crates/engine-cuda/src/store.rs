@@ -3457,11 +3457,11 @@ impl Pools {
             };
             match self.chunks.commit_segments(&mut self.pool, segments)? {
                 Commit::Committed => break,
-                // The card has less now than the fit measured (the driver
-                // took some since: a context, a module, a body): the pool
-                // is what backs, never a load that fails on its own fit.
-                // Where the runtime is stated more than the fit, what the
-                // fit gives up is kept back with the rest.
+                // The fit measures what the card has free; mapping it takes
+                // a little of that itself. The pool is what the card backs:
+                // as many chunks fewer as came short, before the runtime is
+                // stated any. Where it is stated more than the fit, what
+                // the fit gives up is kept back with the rest.
                 Commit::Exhausted { growth, spare } if fitted > 1 && growth > spare => {
                     let chunk = self.chunks.layout().chunk_bytes.max(1);
                     let short = (growth - spare).saturating_mul(self.pool.page_bytes());

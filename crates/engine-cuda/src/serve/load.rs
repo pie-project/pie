@@ -1648,6 +1648,12 @@ impl Staged {
         // A load that arms later may have had its range reserved anew by
         // this fit: the workspaces are laid where it now lies.
         shell.lay_workspace()?;
+        // The load's last fit backs what it took, here and not later: every
+        // page the load serves is backed before anything else can take the
+        // card's room, so serving maps nothing (a dying process holding the
+        // driver's lock stalls no fire of this one's), and the pool the
+        // runtime is stated is the pool the card backed.
+        shell.back_whole()?;
         if arm_trace {
             eprintln!(
                 "[arm-trace] cache rows sized to {} pages ({} MiB, {} sequences at the declared \
