@@ -807,6 +807,9 @@ struct PendingFrame {
     frame_cell: CellPtr,
     wait_id: u64,
     epoch: u64,
+    /// The frame failed past its submission (the engine took it): each step
+    /// still settles only as it lands, and settles failed.
+    poisoned: bool,
 }
 
 impl PendingFrame {
@@ -830,7 +833,7 @@ impl PendingFrame {
         ));
         Landed {
             steps,
-            failed,
+            failed: failed || self.poisoned,
             frame,
         }
     }
@@ -917,6 +920,21 @@ impl FrameSettlements {
         completion: &SubmissionCompletion,
         broker: &CompletionBroker,
     ) {
+        self.expect_as(frame, steps, completion, broker, false);
+    }
+
+    /// [`Self::expect`], the frame having failed after the engine took it
+    /// (`poisoned`): its fires settle failed, each still only as its step
+    /// lands. Failed at once, they would hand back what the engine has yet
+    /// to run over: their leases, their epochs and so their pages.
+    pub fn expect_as(
+        &self,
+        frame: engine::FrameId,
+        steps: Vec<LandingStep>,
+        completion: &SubmissionCompletion,
+        broker: &CompletionBroker,
+        poisoned: bool,
+    ) {
         let Some(frame_cell) = completion.terminal_cell_ptr() else {
             return;
         };
@@ -929,6 +947,7 @@ impl FrameSettlements {
             frame_cell,
             wait_id: completion.wait_id(),
             epoch: completion.target_epoch(),
+            poisoned,
         };
         let mut landed = Vec::new();
         {

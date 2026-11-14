@@ -711,6 +711,10 @@ impl Lane {
                     .collect(),
             );
         }
+        // The engine has the frame from here: a failure no longer unsubmits
+        // it. Its fires fail, but only as their steps land, so their leases
+        // and epochs (and the pages behind them) stay held until then.
+        let mut taken = Ok(());
         let mut wakes: Vec<Vec<u64>> = vec![Vec::new(); submitted.steps.len()];
         for (step, woken) in submitted.steps.iter().zip(&mut wakes) {
             for attachment in &step.attachments {
@@ -718,13 +722,17 @@ impl Lane {
                 let instance = attachment.instance;
                 if let Err(error) = crate::store::roles::pump(roles, instance, Pump::Out, || {
                     channels.pump_out_with(engine.as_mut(), instance, deferred)
-                }) {
-                    return Err(format!("channel take: {error}"));
+                }) && taken.is_ok()
+                {
+                    taken = Err(format!("channel take: {error}"));
                 }
             }
         }
 
         if !asynchronous {
+            // The engine ran the frame in `submit`: nothing of it is left
+            // in flight to fence.
+            taken?;
             for step in &frame.steps {
                 completion::settle(&step.terminal_cells, completion::TERMINAL_OUTCOME_SUCCESS);
             }
@@ -743,7 +751,14 @@ impl Lane {
                 wakes,
             })
             .collect();
-        settlements.expect(ticket.id, steps, &completion, broker);
+        if let Err(error) = &taken {
+            tracing::error!(
+                frame = ticket.id.0,
+                %error,
+                "a frame failed after the engine took it; its fires fail as its steps land"
+            );
+        }
+        settlements.expect_as(ticket.id, steps, &completion, broker, taken.is_err());
         Ok(completion)
     }
 
@@ -1160,3 +1175,6 @@ impl Lane {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
