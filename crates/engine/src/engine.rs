@@ -221,6 +221,20 @@ pub trait Engine: Send {
         Ok(())
     }
 
+    /// The activation rung moves from `from` to `to` tokens; only where
+    /// [`crate::chunk::ChunkFacts::span_backed_on_demand`], through the
+    /// lane, never on a fire's path. A raise (`to > from`) comes before any
+    /// fire of the wider rung, and before the raise's [`Self::evacuate`]
+    /// where it moves state: the engine backs its carve for `to` here, and
+    /// a refusal (`Error::Exhausted`) takes the raise back, no fire passing
+    /// `from`. A lower (`to < from`) is a notice once every fire wider than
+    /// `to` has retired: the engine may give back the carve above `to`; a
+    /// failed notice is logged, not fatal.
+    fn set_rung(&mut self, from: u32, to: u32) -> Result<()> {
+        let _ = (from, to);
+        Ok(())
+    }
+
     /// Copies each moved chunk's bytes onto its new physical chunk and
     /// updates the engine's [`crate::chunk::ChunkTable`], stream-ordered
     /// before the next fire; the slot refs the runtime holds stand.
