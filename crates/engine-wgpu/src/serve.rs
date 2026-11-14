@@ -58,7 +58,7 @@ impl Serve for Api {
         let measured = device.chip();
         let (chip, report) = crate::chip::resolve(&measured, boot.profiles.as_deref());
         crate::chip::SHELF.tell_untuned(&measured.name, &report);
-        let tuning = crate::tuning::Tuning::new(chip, device.cores(), device.storage_buffers());
+        let tuning = crate::tuning::Tuning::new(chip, device.cores());
         Ok((device, tuning))
     }
 
@@ -72,6 +72,23 @@ impl Serve for Api {
         } else {
             kernels_slang::Tier::Baseline
         }
+    }
+
+    /// The decodes the trace walks are held to the storage buffers the
+    /// adapter binds a shader stage: the load is refused where a decode's
+    /// own kernel does not bind, and splits where the split walk binds.
+    #[cfg(feature = "wgpu")]
+    fn admit(
+        device: &Context,
+        tuning: &mut crate::tuning::Tuning,
+        tier: kernels_slang::Tier,
+        trace: &poem_ir::Trace,
+    ) -> Result<()> {
+        tuning.hold_decodes(
+            tier,
+            &engine_gpu::scratch::decodes(trace),
+            device.storage_buffers(),
+        )
     }
 
     fn compiled(pipelines: &Pipelines) -> u64 {

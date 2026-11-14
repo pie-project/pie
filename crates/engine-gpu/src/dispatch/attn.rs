@@ -115,7 +115,7 @@ impl<B: Backend> Run<'_, B> {
             self.tensor(o),
             lse.map(|l| self.tensor(l)),
             self.split_scratch()
-                .filter(|_| self.tuning().binds_split(lse.is_some())),
+                .filter(|_| self.tuning().binds_split(head_dim, lse.is_some())),
         )
     }
 

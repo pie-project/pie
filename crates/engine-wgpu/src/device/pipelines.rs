@@ -27,6 +27,11 @@ pub struct Pipeline {
 struct Declared {
     bindings: u32,
     used: Vec<bool>,
+    /// The storage buffers `main` reaches, which the pipeline's layout
+    /// binds: those the kernel declares for itself, and the pool segments
+    /// beside them (`pie_seg0..3`, as `prim/pool.slang` declares them).
+    own: u32,
+    pool: u32,
     read_only: Vec<bool>,
     uniform: Option<u32>,
     push_bytes: u32,
@@ -85,6 +90,7 @@ fn reflect(wgsl: &str) -> std::result::Result<Declared, String> {
     let reached = info.get_entry_point(main_at);
 
     let mut storage: Vec<(u32, bool, bool)> = Vec::new();
+    let (mut own, mut pool) = (0u32, 0u32);
     let mut uniform = None;
     let mut push_bytes = 0u32;
     for (handle, var) in module.global_variables.iter() {
@@ -99,6 +105,13 @@ fn reflect(wgsl: &str) -> std::result::Result<Declared, String> {
         }
         match var.space {
             naga::AddressSpace::Storage { access } => {
+                if !reached[handle].is_empty() {
+                    let segment = var
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.starts_with("pie_seg"));
+                    *(if segment { &mut pool } else { &mut own }) += 1;
+                }
                 storage.push((
                     binding.binding,
                     !access.contains(naga::StorageAccess::STORE),
@@ -137,6 +150,8 @@ fn reflect(wgsl: &str) -> std::result::Result<Declared, String> {
     Ok(Declared {
         bindings,
         used,
+        own,
+        pool,
         read_only,
         uniform,
         push_bytes,
@@ -307,19 +322,37 @@ impl Pipelines {
         if let Some(pipeline) = self.built.borrow().get(key) {
             return Ok(Arc::clone(pipeline));
         }
-        let wgsl = kernels_slang::wgsl(key).ok_or(Fault::Shader {
-            file,
-            entrypoint: key,
-            why: "kernels-slang holds no WGSL module by that key (built without \
-                  `kernels-slang/wgsl`, or the instantiation is limited to SPIR-V)"
-                .to_string(),
-        })?;
-        let wgsl = without_subgroup_enable(&promote_storage(wgsl));
+        let wgsl = module(file, key)?;
         let pipeline = Arc::new(build(device.core(), file, key, &wgsl)?);
         self.compiles.set(self.compiles.get() + 1);
         self.built.borrow_mut().insert(key, Arc::clone(&pipeline));
         Ok(pipeline)
     }
+}
+
+/// kernels-slang's module `key` of `file`, as this shell compiles it.
+fn module(file: &'static str, key: &'static str) -> Result<String> {
+    let wgsl = kernels_slang::wgsl(key).ok_or(Fault::Shader {
+        file,
+        entrypoint: key,
+        why: "kernels-slang holds no WGSL module by that key (built without \
+              `kernels-slang/wgsl`, or the instantiation is limited to SPIR-V)"
+            .to_string(),
+    })?;
+    Ok(without_subgroup_enable(&promote_storage(wgsl)))
+}
+
+/// The storage buffers kernel `key` of `file` binds in its shader stage,
+/// read from the module it is compiled from: those it declares for itself,
+/// then the pool segments beside them. Only what `main` reaches counts, as
+/// only that is in the pipeline's layout.
+pub fn storage(file: &'static str, key: &'static str) -> Result<(u32, u32)> {
+    let declared = reflect(&module(file, key)?).map_err(|why| Fault::Shader {
+        file,
+        entrypoint: key,
+        why,
+    })?;
+    Ok((declared.own, declared.pool))
 }
 
 fn descriptor<'a>(
@@ -365,6 +398,15 @@ fn build(
         why,
     };
     let declared = reflect(wgsl).map_err(shader)?;
+    // Every kernel is held here, at the latest: one the adapter cannot
+    // bind is refused by its counts, not as a pipeline that failed to
+    // validate.
+    engine_gpu::storage_buffers(
+        name,
+        declared.own,
+        declared.pool,
+        core.limits.max_storage_buffers_per_shader_stage,
+    )?;
     let pipeline = compile(core, name, wgsl).map_err(shader)?;
     let layout = pipeline.get_bind_group_layout(0);
     Ok(Pipeline {
