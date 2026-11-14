@@ -284,6 +284,22 @@ impl Forward {
         })
     }
 
+    /// A forward of `trace` holding no weights: what the host runs of a reading a device runs
+    /// the rest of ([`Forward::stream_values`]: the entry's and the exit's ops, which read the
+    /// step's inputs and the device's rows, not the checkpoint). A node that reads a weight errs.
+    #[must_use]
+    pub fn host(trace: Trace) -> Forward {
+        let weights = vec![None; trace.values.len()];
+        let lanes = (0..trace.caches.len()).map(|_| Lane::default()).collect();
+        Forward {
+            trace,
+            group: None,
+            weights,
+            lanes,
+            placed: std::collections::BTreeMap::new(),
+        }
+    }
+
     /// The engine's uniform placement of `experts` over `ranks` ranks of
     /// `slots` (expert-parallel `EpRank::new`'s).
     fn place(experts: u32, ranks: u32, slots: u32) -> Result<Placed, String> {

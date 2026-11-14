@@ -162,6 +162,70 @@ impl Forward {
         step: &StreamStep<'_>,
         nodes: &[usize],
     ) -> Result<(Vec<Output>, Vec<Captured>), String> {
+        self.stream_run(step, nodes, &[], None)
+    }
+
+    /// The values `wanted` as one stream step of `step`'s lanes makes them, running only the
+    /// nodes they need, with `given` held already (values a device made, or that a step before
+    /// left). The host's part of a step a device runs the rest of: what the entry's ops make of
+    /// the step's inputs (patches, cells, a timestep's embedding), and what the exit's make of
+    /// the rows the device returns (the velocity unpatchified). A node it needs that reads a
+    /// value neither given nor made from the step's inputs (a weight, on a [`Forward::host`])
+    /// errs. Each value comes back as its maker held it ([`Captured::node`] its node; `usize::MAX`
+    /// for a value no node makes).
+    pub fn stream_values(
+        &mut self,
+        step: &StreamStep<'_>,
+        given: &[Captured],
+        wanted: &[ValueId],
+    ) -> Result<Vec<Captured>, String> {
+        let (_, mut caps) = self.stream_run(step, &[], given, Some(wanted))?;
+        caps.retain(|c| !c.input);
+        Ok(caps)
+    }
+
+    /// The nodes `wanted` needs: each one's maker, back to the step's inputs, the weights and
+    /// the values `given`.
+    fn slice(&self, given: &[Captured], wanted: &[ValueId]) -> Vec<bool> {
+        let mut need = vec![false; self.trace.nodes.len()];
+        let mut seen = vec![false; self.trace.values.len()];
+        let mut work: Vec<ValueId> = wanted.to_vec();
+        let (mut ins, mut aliases) = (Vec::new(), Vec::new());
+        while let Some(v) = work.pop() {
+            if std::mem::replace(&mut seen[v.0 as usize], true)
+                || given.iter().any(|g| g.value == v)
+            {
+                continue;
+            }
+            match &self.trace.values[v.0 as usize].def {
+                Def::Op(node) => {
+                    let n = *node as usize;
+                    if !std::mem::replace(&mut need[n], true) {
+                        ins.clear();
+                        self.trace.nodes[n].op.inputs(&mut ins);
+                        aliases.clear();
+                        self.trace.nodes[n].op.aliases(&mut aliases);
+                        work.extend(ins.iter().copied());
+                        work.extend(aliases.iter().map(|&(_, into)| into));
+                    }
+                }
+                Def::Merge(arms) => work.extend(arms.iter().map(|&(a, _)| a)),
+                _ => {}
+            }
+        }
+        need
+    }
+
+    /// A stream step: every node (`wanted` none: the outputs read out), or only the ones
+    /// `wanted` needs (each read out as captured); `nodes`' values captured on the way.
+    fn stream_run(
+        &mut self,
+        step: &StreamStep<'_>,
+        nodes: &[usize],
+        given: &[Captured],
+        wanted: Option<&[ValueId]>,
+    ) -> Result<(Vec<Output>, Vec<Captured>), String> {
+        let need = wanted.map(|w| self.slice(given, w));
         let mut captured: Vec<Captured> = Vec::new();
         let words: Vec<u64> = step.lanes.iter().map(|l| l.word).collect();
         let (mut token, mut positions, mut voxel, mut clip) = (vec![], vec![], vec![], vec![]);
@@ -258,6 +322,20 @@ impl Forward {
                 _ => continue,
             };
         }
+        for g in given {
+            vals[g.value.0 as usize] = Some(match &g.values {
+                Values::F32(v) => Held::Floats {
+                    rows: g.rows,
+                    width: g.width,
+                    v: v.clone(),
+                },
+                Values::I32(v) => Held::Ints {
+                    rows: g.rows,
+                    width: g.width,
+                    v: v.clone(),
+                },
+            });
+        }
         let mut run = Run {
             trace: &self.trace,
             vals,
@@ -270,6 +348,9 @@ impl Forward {
         };
         let (mut ins, mut outs, mut aliases) = (Vec::new(), Vec::new(), Vec::new());
         for (at, node) in self.trace.nodes.iter().enumerate() {
+            if need.as_ref().is_some_and(|n| !n[at]) {
+                continue;
+            }
             let live: Vec<bool> = rows.words.iter().map(|&w| node.guard.holds(w)).collect();
             ins.clear();
             node.op.inputs(&mut ins);
@@ -307,6 +388,20 @@ impl Forward {
                     captured.extend(run.captured(at, false, o));
                 }
             }
+        }
+        if let Some(wanted) = wanted {
+            for &v in wanted {
+                run.materialize(v)?;
+                let node = match &self.trace.values[v.0 as usize].def {
+                    Def::Op(n) => *n as usize,
+                    _ => usize::MAX,
+                };
+                captured.push(
+                    run.captured(node, false, v)
+                        .ok_or_else(|| format!("value {} holds no rows", v.0))?,
+                );
+            }
+            return Ok((Vec::new(), captured));
         }
         let holds = |g: &poem_ir::Guard| rows.words.iter().any(|&w| g.holds(w));
         let mut out: Vec<Output> = Vec::new();
