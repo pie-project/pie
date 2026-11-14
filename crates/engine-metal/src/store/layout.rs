@@ -434,7 +434,9 @@ impl Layout {
             }
         }
         ChunkFacts {
-            span_backed_on_demand: false,
+            // A mapped placement heap is resident whether touched or not:
+            // the span is backed as fires and lent state need it.
+            span_backed_on_demand: !self.act().is_empty(),
             chunk_bytes: self.chunk_bytes,
             total_chunks: self.total_chunks,
             segment_chunks: self.segment_chunks,
