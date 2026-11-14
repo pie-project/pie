@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 
 use engine::chunk::ShapeId;
 
-use crate::device::{Buffer, Context};
+use crate::device::Buffer;
 use crate::error::{Fault, Result};
 use crate::store::Pools;
 use crate::store::layout::CHANNEL;
@@ -37,8 +37,6 @@ unsafe impl Sync for HostAt {}
 
 #[derive(Debug, Clone)]
 enum Place {
-    /// A buffer of its own, from offset 0.
-    Own,
     /// Bytes `[at, at + bytes)` of slot `slot` of shape `shape`, at view
     /// offset `offset` and host address `host`.
     Slot {
@@ -60,16 +58,6 @@ pub struct Held {
 }
 
 impl Held {
-    /// `bytes` zeroed bytes in a buffer of their own.
-    pub fn own(device: &Context, bytes: u64) -> Result<Held> {
-        Ok(Held {
-            buffer: Buffer::zeroed(device, bytes.max(1))?,
-            offset: 0,
-            bytes,
-            place: Place::Own,
-        })
-    }
-
     /// Bytes `[at, at + bytes)` of slot ref `slot` of `shape`, zeroed.
     pub fn in_slot(pools: &Pools, shape: ShapeId, slot: u32, at: u64, bytes: u64) -> Result<Held> {
         let (offset, host, slot_bytes) = pools.slot_place(shape, slot)?;
@@ -149,46 +137,32 @@ impl Held {
 
     /// Points a pooled region at the chunk its ref sits in now.
     pub fn rebind(&mut self, pools: &Pools) -> Result<()> {
-        if let Place::Slot {
+        let Place::Slot {
             shape,
             slot,
             at,
             host,
-        } = &mut self.place
-        {
-            let (offset, base, _) = pools.slot_place(*shape, *slot)?;
-            self.offset = offset + *at;
-            // SAFETY: as in `in_slot`.
-            *host = HostAt(unsafe { base.add(usize_of(*at)) });
-        }
+        } = &mut self.place;
+        let (offset, base, _) = pools.slot_place(*shape, *slot)?;
+        self.offset = offset + *at;
+        // SAFETY: as in `in_slot`.
+        *host = HostAt(unsafe { base.add(usize_of(*at)) });
         Ok(())
     }
 
     /// The slot ref a pooled region lies in.
     #[must_use]
     pub fn slot(&self) -> Option<u32> {
-        match self.place {
-            Place::Own => None,
-            Place::Slot { slot, .. } => Some(slot),
-        }
+        let Place::Slot { slot, .. } = self.place;
+        Some(slot)
     }
 
     /// Moves a pooled region to slot ref `to` of its shape, whose bytes
     /// the runtime already copied there (`Engine::rebind_slots`).
     pub fn retarget(&mut self, pools: &Pools, to: u32) -> Result<()> {
-        if let Place::Slot { slot, .. } = &mut self.place {
-            *slot = to;
-        }
+        let Place::Slot { slot, .. } = &mut self.place;
+        *slot = to;
         self.rebind(pools)
-    }
-
-    /// The device bytes this region holds apart from the pool.
-    #[must_use]
-    pub fn own_bytes(&self) -> u64 {
-        match self.place {
-            Place::Own => self.buffer.bytes(),
-            Place::Slot { .. } => 0,
-        }
     }
 
     #[must_use]
@@ -238,7 +212,6 @@ impl Held {
     pub fn write(&mut self, at: u64, from: &[u8]) -> Result<()> {
         self.check(at, from.len())?;
         match self.place {
-            Place::Own => self.buffer.write(self.offset + at, from),
             Place::Slot { host, .. } => {
                 // SAFETY: `check` keeps the span inside the region, which
                 // lies inside one slot of a mapped heap.
@@ -257,7 +230,6 @@ impl Held {
     pub fn read(&self, at: u64, into: &mut [u8]) -> Result<()> {
         self.check(at, into.len())?;
         match self.place {
-            Place::Own => self.buffer.read(self.offset + at, into),
             Place::Slot { host, .. } => {
                 // SAFETY: as `write`.
                 unsafe {
@@ -475,19 +447,6 @@ pub fn ring_slots(cells: u64, stride: u64, slot_bytes: u64) -> Option<u32> {
 }
 
 impl Cells {
-    pub fn own(device: &Context, cells: u64, stride: u64) -> Result<Cells> {
-        let bytes = cells
-            .checked_mul(stride)
-            .ok_or_else(|| Fault::program("program::held", "a ring past what a u64 counts"))?;
-        Ok(Cells {
-            spans: vec![Held::own(device, bytes)?],
-            per_span: cells.max(1),
-            stride,
-            cells,
-            run: None,
-        })
-    }
-
     /// The ring in `slots` (`Channel` slot refs), cells packed whole.
     pub fn pooled(
         pools: &Pools,
@@ -627,11 +586,6 @@ impl Cells {
             .iter_mut()
             .zip(slots)
             .try_for_each(|(span, &slot)| span.retarget(pools, slot))
-    }
-
-    #[must_use]
-    pub fn own_bytes(&self) -> u64 {
-        self.spans.iter().map(Held::own_bytes).sum()
     }
 
     #[must_use]

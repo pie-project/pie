@@ -2,7 +2,6 @@
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::device::Context;
 use crate::error::{Fault, Result};
 use crate::store::Pools;
 
@@ -37,24 +36,12 @@ unsafe impl Send for SharedRing {}
 unsafe impl Sync for SharedRing {}
 
 impl SharedRing {
-    /// The device bytes the ring holds apart from the pool.
-    #[must_use]
-    pub fn bytes(&self) -> u64 {
-        self.with_cells(|cells| Ok(cells.own_bytes())).unwrap_or(0)
-    }
-
     /// A ring of `shape` in `slots`, the `Channel` slot refs the runtime
-    /// took for it (none for a ring larger than a chunk, which the engine
-    /// keeps).
-    pub fn open(
-        device: &Context,
-        shape: ChannelShape,
-        pools: &Pools,
-        slots: &[u32],
-    ) -> Result<SharedRing> {
+    /// took for it.
+    pub fn open(shape: ChannelShape, pools: &Pools, slots: &[u32]) -> Result<SharedRing> {
         Ok(SharedRing {
             shape,
-            cells: RwLock::new(shape.cells(device, pools, slots)?),
+            cells: RwLock::new(shape.cells(pools, slots)?),
             counters: Counters::default(),
         })
     }

@@ -105,12 +105,11 @@ impl Plane {
     /// between fires; the batches of lanes launched together are a fire's.
     #[must_use]
     pub fn bytes(&self) -> (u64, u64) {
-        let state = self.channels.values().map(|ring| ring.bytes()).sum::<u64>()
-            + self
-                .instances
-                .values()
-                .map(|bound| bound.session.bytes())
-                .sum::<u64>();
+        let state = self
+            .instances
+            .values()
+            .map(|bound| bound.session.bytes())
+            .sum::<u64>();
         let fire = self.batches.values().map(launch::Batch::bytes).sum();
         (state, fire)
     }
@@ -208,7 +207,6 @@ impl Plane {
 
     pub fn register_channel(
         &mut self,
-        context: &Context,
         id: ChannelId,
         shape: ChannelShape,
         pools: &Pools,
@@ -224,10 +222,8 @@ impl Plane {
                 ),
             ));
         }
-        self.channels.insert(
-            id,
-            Arc::new(SharedRing::open(context, shape, pools, slots)?),
-        );
+        self.channels
+            .insert(id, Arc::new(SharedRing::open(shape, pools, slots)?));
         Ok(())
     }
 
@@ -1179,7 +1175,7 @@ mod tests {
         let per_chunk = pools.slots_per_chunk(CHANNEL).expect("a channel shape");
         let facts = ring_facts(0, shape, slot, per_chunk).expect("the ring fits a chunk");
         assert!(
-            SharedRing::open(&context, shape, &pools, &[]).is_err(),
+            SharedRing::open(shape, &pools, &[]).is_err(),
             "a ring that fits a chunk is placed in slots, never in a buffer of its own"
         );
         assert!(
@@ -1189,15 +1185,24 @@ mod tests {
         assert_eq!(facts.footprint.slots, 16);
         assert_eq!(shape.ring_slots(slot), None);
 
+        // A ring whose run passes a chunk is refused by name, never held
+        // beside the pool.
+        let past = ChannelShape {
+            capacity: (CHUNK / 2048) as u32,
+            ..shape
+        };
+        assert!(ring_facts(0, past, slot, per_chunk).is_none());
+        let refused =
+            SharedRing::open(past, &pools, &[]).expect_err("a ring past a chunk is refused");
+        assert!(
+            format!("{refused}").contains("pass a chunk"),
+            "the refusal says why: {refused}"
+        );
+
         // The run in logical chunk 1, not at its start.
         let first = per_chunk + 100;
         let run: Vec<u32> = (first..first + facts.footprint.slots).collect();
-        let ring = SharedRing::open(&context, shape, &pools, &run).expect("the ring opens");
-        assert_eq!(
-            ring.bytes(),
-            0,
-            "a pooled ring holds nothing apart from the pool"
-        );
+        let ring = SharedRing::open(shape, &pools, &run).expect("the ring opens");
         let cell_bytes = shape.cell_bytes();
         let cells = shape.cell_count();
         let pattern = |cell: u64, salt: u8| -> Vec<u8> {
