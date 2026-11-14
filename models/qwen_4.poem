@@ -36,6 +36,7 @@ NVFP4_A4 = [dtype.bf16, dtype.nvfp4a4]
 
 DEPLOYMENTS = [
     deployment("qwen38-flash-next", weights = dtype.u4g64, kv = dtype.bf16),
+    deployment("qwen38-flash-next", weights = dtype.u4g32, kv = dtype.bf16),
     deployment("qwen38-flash-next", weights = MIXED, kv = dtype.bf16, drafter = "mtp"),
     deployment("qwen38-flash-next", weights = MIXED, kv = dtype.bf16),
     deployment("qwen38-flash-next-mini", weights = MIXED, kv = dtype.bf16),
@@ -250,7 +251,22 @@ HASHES = {
     "micro": hash_constants(MICRO.ple, MICRO.vocab),
 }
 
+# mlx-community's 4-bit release: every projection, the hyper-connections, the
+# embedding, head and n-gram table 4 bits in 32-wide groups; its router and
+# shared-expert gates, 8 bits in 64, read out to bf16.
+MLX_4BIT = struct(
+    embed = dtype.u4g32,
+    head = dtype.u4g32,
+    proj = dtype.u4g32,
+    inject = dtype.u4g32,
+    gdn_ba = dtype.u4g32,
+    experts = dtype.u4g32,
+    table = dtype.u4g32,
+)
+
 def mix_of(w):
+    if w == dtype.u4g32:
+        return MLX_4BIT
     proj = dtype.u8g64 if w == dtype.u4g64 else compute(w)
     return struct(
         embed = proj,
