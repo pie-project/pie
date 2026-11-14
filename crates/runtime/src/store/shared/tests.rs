@@ -103,6 +103,7 @@ enum Call {
     Evacuate(Vec<(u32, u32)>),
     CommitSpan(u32),
     ReleaseSpan(u32),
+    Rung(u32, u32),
 }
 
 /// The engine half: a chunk table, a committed prefix and the top span
@@ -147,6 +148,20 @@ impl FakeEngine {
         assert!(TOTAL / SEGMENT - n <= self.top, "commit_span only widens");
         self.top = TOTAL / SEGMENT - n;
         self.calls.push(Call::CommitSpan(n));
+        Ok(())
+    }
+
+    /// The rung moves (`Engine::set_rung`): a raise backs the carve, and is
+    /// refused as a placement heap the device has no room for is.
+    fn set_rung(&mut self, from: u32, to: u32) -> ::engine::Result<()> {
+        if self.refuse && to > from {
+            return Err(::engine::Error::Exhausted {
+                resource: "placement heap",
+                wanted: u64::from(to),
+                available: 0,
+            });
+        }
+        self.calls.push(Call::Rung(from, to));
         Ok(())
     }
 

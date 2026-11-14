@@ -261,6 +261,13 @@ pub trait Mover {
         evacuation: ::engine::chunk::Evacuation,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 
+    /// `Engine::set_rung(from, to)` through the engine's lane.
+    fn set_rung(
+        &self,
+        from: u32,
+        to: u32,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+
     fn epoch_now(&self) -> u64;
 }
 
@@ -285,17 +292,8 @@ pub async fn take_raise(
     let Some(evacuation) = evacuation else {
         return Ok(None);
     };
-    if shared.lock().unwrap().raise_waits(&evacuation) {
-        if let Err(error) = mover.evacuate(SharedPool::rung_moves(&evacuation)).await {
-            // The engine refused the copy or its carve for the wider rung:
-            // a refused raise, taken back; fires stay at the rung in hand,
-            // and the caller tries again as any waiter does.
-            tracing::warn!(%error, "a raise was refused; fires stay at the rung in hand");
-            shared.lock().unwrap().raise_refused(&evacuation);
-            return Ok(None);
-        }
-        let next = mover.epoch_now().saturating_add(1);
-        shared.lock().unwrap().raise_copied(next);
+    if !carry_raise(shared, &evacuation, mover).await {
+        return Ok(None);
     }
     tracing::info!(
         rung = evacuation.rung,
@@ -303,6 +301,41 @@ pub async fn take_raise(
         "the activation rung is raised"
     );
     Ok(Some(evacuation))
+}
+
+/// Carries a raise `shared` applied ([`SharedPool::raise_applied`]) to the
+/// engine: where the span is backed on demand, `set_rung` first (the engine
+/// backs its carve for the wider rung), then the copy of what it moves.
+/// Either refused, the raise is taken back ([`SharedPool::raise_refused`]),
+/// fires stay at the rung in hand, and an engine that backed the carve is
+/// told the rung went back; `false` then. Nothing faults.
+pub async fn carry_raise(shared: &Shared, evacuation: &RungEvacuation, mover: &impl Mover) -> bool {
+    let (waits, tells) = {
+        let pool = shared.lock().unwrap();
+        (pool.raise_waits(evacuation), pool.tells_rungs())
+    };
+    if !waits {
+        return true;
+    }
+    let (from, to) = (evacuation.from, evacuation.rung);
+    if tells && let Err(error) = mover.set_rung(from, to).await {
+        tracing::warn!(%error, from, to, "a raise's carve was refused; fires stay at the rung in hand");
+        shared.lock().unwrap().raise_refused(evacuation);
+        return false;
+    }
+    if !evacuation.moves.is_empty()
+        && let Err(error) = mover.evacuate(SharedPool::rung_moves(evacuation)).await
+    {
+        tracing::warn!(%error, "a raise's copy was refused; fires stay at the rung in hand");
+        shared.lock().unwrap().raise_refused(evacuation);
+        if tells && let Err(error) = mover.set_rung(to, from).await {
+            tracing::warn!(%error, from = to, to = from, "a rung notice was refused");
+        }
+        return false;
+    }
+    let next = mover.epoch_now().saturating_add(1);
+    shared.lock().unwrap().raise_copied(next);
+    true
 }
 
 /// Waits until `shared`'s activation holds what fires may take now, the
@@ -404,6 +437,15 @@ impl<F: Fn() -> u64 + Sync> Mover for LaneMover<F> {
         crate::scheduler::pool(
             self.engine,
             crate::scheduler::worker::PoolOp::Evacuate(evacuation),
+        )
+        .await
+        .map_err(|error| format!("{error:#}"))
+    }
+
+    async fn set_rung(&self, from: u32, to: u32) -> Result<(), String> {
+        crate::scheduler::pool(
+            self.engine,
+            crate::scheduler::worker::PoolOp::Rung { from, to },
         )
         .await
         .map_err(|error| format!("{error:#}"))

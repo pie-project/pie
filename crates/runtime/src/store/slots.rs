@@ -235,6 +235,8 @@ pub enum SlotError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RungEvacuation {
     pub rung: u32,
+    /// The rung the activation was set aside for when it was planned.
+    pub from: u32,
     /// The activation chunks the rung takes.
     pub act: u32,
     pub moves: Vec<ChunkMove>,
@@ -828,7 +830,12 @@ impl SlotPool {
                 chunks: sources.len() as u32,
             });
         }
-        Ok(RungEvacuation { rung, act, moves })
+        Ok(RungEvacuation {
+            rung,
+            from: self.rung(),
+            act,
+            moves,
+        })
     }
 
     /// The chunks raising the activation to `rung` lacks now: past what is
