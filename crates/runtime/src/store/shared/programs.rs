@@ -45,11 +45,21 @@ pub struct ProgramFires {
 }
 
 impl ProgramFires {
-    /// The terms of the pairs that can be in a fire now.
+    /// The terms of the pairs that can be in a fire now, each capped at
+    /// its live instances: a fire carries no more lanes of a pair than it
+    /// has instances bound (or binding), so `l = min(r, FireLimits::max_lanes,
+    /// the pair's max_lanes, its live instances)`.
     fn open_terms(&self) -> Vec<FireTerm> {
         self.open
-            .keys()
-            .filter_map(|key| self.terms.get(key).copied())
+            .iter()
+            .filter_map(|(key, &live)| {
+                let term = *self.terms.get(key)?;
+                let max_lanes = match term.max_lanes {
+                    0 => live,
+                    own => own.min(live),
+                };
+                Some(FireTerm { max_lanes, ..term })
+            })
             .collect()
     }
 }
@@ -157,10 +167,13 @@ impl SharedPool {
     /// included, cannot fit on the device (past every chunk but the
     /// reserved ones and the weights' pinned slots); a narrower fit cuts
     /// fires to the widest rung that does ([`Self::widest_fit`]).
+    ///
+    /// The term grows with each bind (its live instances cap the lanes it
+    /// takes), so every open refolds, and is refused where the grown term
+    /// leaves no rung room.
     pub fn open_fire(&mut self, key: FireKey) -> Result<(), String> {
-        let first = !self.programs.open.contains_key(&key);
         *self.programs.open.entry(key).or_default() += 1;
-        if first {
+        {
             self.refold();
             if self.term_refused() {
                 let most = self.act_room();
@@ -187,8 +200,10 @@ impl SharedPool {
         *open -= 1;
         if *open == 0 {
             self.programs.open.remove(&key);
-            self.refold();
         }
+        // Each close shrinks the term (one live instance fewer); the next
+        // lower gives the room back.
+        self.refold();
     }
 
     /// The engine bound `instance` as `key`: its term counts until the
@@ -209,11 +224,8 @@ impl SharedPool {
     /// Counts one more of `key` without the room check: the engine already
     /// bound it.
     fn open_or_count(&mut self, key: FireKey) {
-        let first = !self.programs.open.contains_key(&key);
         *self.programs.open.entry(key).or_default() += 1;
-        if first {
-            self.refold();
-        }
+        self.refold();
     }
 
     fn refold(&mut self) {
