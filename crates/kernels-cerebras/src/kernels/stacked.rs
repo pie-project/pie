@@ -128,6 +128,15 @@ pub const S_STORES: u32 = 1;
 pub const S_TOKEN: u32 = 2;
 pub const S_TOP: u32 = 4;
 
+/// The shared-KV line's colour; with no line (no layer reads another's cache) a colour the PE
+/// parks on, which no kernel phase reads.
+fn line(pe: &Pe) -> R<u32> {
+    match pe.c(LINE) {
+        Ok(c) => Ok(c),
+        Err(_) => Ok(pe.parks(1)?[0]),
+    }
+}
+
 fn last_unit(pe: &Pe) -> u32 {
     pe.prog.plan.partition.units - 1
 }
@@ -148,7 +157,7 @@ fn weight(pe: &Pe) -> R<Vec<u32>> {
         | if unit == last_unit(pe) { W_FLUSH } else { 0 };
     let hn = 2 * plan.partition.row_dims[0].dims + 1;
     let relays = [pe.turn(RELAY_PRE), pe.turn(RELAY_POST)];
-    common::weight(pe, 18, row, [fl, pe.c(LINE)?], hn, relays)
+    common::weight(pe, 18, row, [fl, line(pe)?], hn, relays)
 }
 
 /// A CX PE: the shared words, the last unit's flush bits.
@@ -187,7 +196,7 @@ fn cy(pe: &Pe) -> R<Vec<u32>> {
         Some((i, ui, lv)) => (pe.c(bus(i))?, ui, lv),
         None => (0, 0, 0),
     };
-    w.extend_from_slice(&[fl, pb, ui, lv, pe.c(LINE)?]);
+    w.extend_from_slice(&[fl, pb, ui, lv, line(pe)?]);
     Ok(w)
 }
 
