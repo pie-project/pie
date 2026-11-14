@@ -83,8 +83,8 @@ fn run(
     }
     if fused {
         assert!(
-            ssm::gdn_step_fused(
-                &ctx,
+            gpu.laid(&ctx, |ctx| ssm::gdn_step_fused(
+                ctx,
                 qkvz,
                 conv_w,
                 &conv_pool,
@@ -101,7 +101,7 @@ fn run(
                 &mut qkv,
                 &mut z,
                 &mut y,
-            )
+            ))
             .unwrap(),
             "the fused step covers this shape"
         );

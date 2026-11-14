@@ -4,7 +4,7 @@ use core::ffi::c_void;
 
 use kernels_cuda::cudarc::cublas::sys as blas;
 use kernels_cuda::cudarc::runtime::sys as rt;
-use kernels_cuda::jit::{Ctx, Slabs};
+use kernels_cuda::jit::{Ctx, SlabKey, Slabs};
 
 fn check(code: rt::cudaError, call: &str) {
     assert_eq!(
@@ -22,6 +22,9 @@ pub struct Gpu {
     ordinal: i32,
     stream: rt::cudaStream_t,
     slabs: Slabs,
+    /// Each slab laid in `slabs` so far at its bytes, and the memory they
+    /// lie in ([`Gpu::laid`]).
+    laid: std::cell::RefCell<(std::collections::HashMap<SlabKey, usize>, Vec<*mut c_void>)>,
     device: Vec<*mut c_void>,
     edges: Vec<Edge>,
     cublas: blas::cublasHandle_t,
@@ -105,6 +108,7 @@ impl Gpu {
                 ordinal,
                 stream,
                 slabs,
+                laid: std::cell::RefCell::default(),
                 device: Vec::new(),
                 edges: Vec::new(),
                 cublas,
@@ -145,6 +149,41 @@ impl Gpu {
         } else {
             ctx
         }
+    }
+
+    /// `launch` on `ctx` as the engine fires it: walked size-only first
+    /// (`kernels_cuda::sizing`), the slabs it asks for laid zeroed in memory
+    /// this `Gpu` keeps, then fired. A slab laid before at as many bytes
+    /// keeps its place, so a later launch reads what an earlier one left in
+    /// a stream's tile.
+    pub fn laid<T>(&self, ctx: &Ctx, mut launch: impl FnMut(&Ctx) -> T) -> T {
+        kernels_cuda::sizing::begin();
+        let _ = launch(ctx);
+        let walked = kernels_cuda::sizing::end();
+        let mut laid = self.laid.borrow_mut();
+        let fresh: Vec<(SlabKey, usize)> = walked
+            .placed()
+            .into_iter()
+            .filter(|(key, bytes)| laid.0.get(key).is_none_or(|have| have < bytes))
+            .collect();
+        if !fresh.is_empty() {
+            self.bind();
+            let _legacy = legacy();
+            let bytes = Slabs::placed_bytes(&fresh);
+            // SAFETY: `at` is a local out-pointer and the memset covers the
+            // bytes just allocated; the slabs are laid in them, in this
+            // `Gpu`'s arena, and `Drop` frees them after the stream drains.
+            unsafe {
+                let mut at: *mut c_void = core::ptr::null_mut();
+                check(rt::cudaMalloc(&raw mut at, bytes), "cudaMalloc");
+                check(rt::cudaMemset(at, 0, bytes), "cudaMemset");
+                Slabs::place(at, &fresh);
+                laid.1.push(at);
+            }
+            laid.0.extend(fresh);
+        }
+        drop(laid);
+        launch(ctx)
     }
 
     pub fn zeros(&mut self, bytes: usize) -> u64 {
@@ -402,7 +441,8 @@ impl Drop for Gpu {
         // made by this `Gpu` and are freed once, here.
         unsafe {
             rt::cudaStreamSynchronize(self.stream);
-            for at in self.device.drain(..) {
+            self.slabs.release();
+            for at in self.device.drain(..).chain(self.laid.get_mut().1.drain(..)) {
                 rt::cudaFree(at);
             }
             for edge in self.edges.drain(..) {

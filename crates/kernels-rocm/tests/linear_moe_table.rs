@@ -107,7 +107,9 @@ fn same_bits(
     let y_bytes = (c.y.rows * c.y.width) as usize * 2;
     let run = |at: &Ctx, tables: &[ExpertTable]| -> Vec<u16> {
         fill(g, c.y.ptr, 0x7f, y_bytes);
-        let took = fire(at, tables).unwrap_or_else(|why| panic!("{what}: {why}"));
+        let took = g
+            .laid(at, |at| fire(at, tables))
+            .unwrap_or_else(|why| panic!("{what}: {why}"));
         assert!(took, "{what}: the arm declined the fire");
         g.read_as::<u16>(&c.y)
     };
