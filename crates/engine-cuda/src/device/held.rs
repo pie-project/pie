@@ -503,11 +503,36 @@ pub fn heap_bytes() -> usize {
 pub fn heap_mark() {
     HEAP_MARK.store(heap_bytes(), std::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "rocm")]
-    MALLOC_MARK.store(
-        kernels_cuda::hip::rt::malloced_bytes(),
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    {
+        MALLOC_MARK.store(
+            kernels_cuda::hip::rt::malloced_bytes(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        LT_MARK.store(
+            kernels_cuda::hip::lt::held_bytes(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
+
+/// The device bytes hipBLASLt took on its own since the last load began
+/// (its library's code and each handle's state), where the build has it:
+/// what the ledger enters apart from the driver's.
+#[must_use]
+pub fn blas_library_since() -> u64 {
+    #[cfg(feature = "rocm")]
+    {
+        kernels_cuda::hip::lt::held_bytes()
+            .saturating_sub(LT_MARK.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        0
+    }
+}
+
+#[cfg(feature = "rocm")]
+static LT_MARK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The device bytes this process took from the allocator itself since the
 /// last load began, where it can tell (`None` where it cannot): what the

@@ -224,6 +224,12 @@ pub type BlasOp = c_int;
 pub type BlasType = c_int;
 
 pub const BLAS_SUCCESS: BlasStatus = 0;
+/// `rocblas_status_size_increased`: a call made in a device-memory size
+/// query asked for more than the query had collected.
+pub const BLAS_SIZE_INCREASED: BlasStatus = 9;
+/// `rocblas_status_size_unchanged`: a call made in a size query asked for no
+/// more than the query had collected.
+pub const BLAS_SIZE_UNCHANGED: BlasStatus = 10;
 pub const BLAS_OP_N: BlasOp = 111;
 pub const BLAS_OP_T: BlasOp = 112;
 pub const BLAS_F16: BlasType = 150;
@@ -237,6 +243,10 @@ table!(Rocblas from "librocblas.so" {
     fn rocblas_destroy_handle(handle: Blas) -> BlasStatus;
     fn rocblas_set_stream(handle: Blas, stream: Stream) -> BlasStatus;
     fn rocblas_status_to_string(status: BlasStatus) -> *const c_char;
+    fn rocblas_start_device_memory_size_query(handle: Blas) -> BlasStatus;
+    fn rocblas_stop_device_memory_size_query(handle: Blas, size: *mut usize) -> BlasStatus;
+    fn rocblas_set_workspace(handle: Blas, addr: *mut c_void, size: usize) -> BlasStatus;
+    fn rocblas_get_device_memory_size(handle: Blas, size: *mut usize) -> BlasStatus;
     fn rocblas_gemm_ex(
         handle: Blas, trans_a: BlasOp, trans_b: BlasOp, m: c_int, n: c_int, k: c_int,
         alpha: *const c_void,
