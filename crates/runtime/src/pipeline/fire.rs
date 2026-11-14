@@ -588,7 +588,8 @@ fn device_rs_plan(
         let reserved = lanes.cursors[first].lock().unwrap().reserved;
         let fold = group_fold(fold, first, frozen, reserved);
         // The device picks where a lane's rows start: what it carries in is
-        // bounded by what it buffers here ([`LaneSpan::Device`]).
+        // counted where its ports resolve, at the engine's prepare
+        // ([`::engine::fire::rung_rows`], device geometry).
         plans.push(rs::GroupPlan {
             lanes: group.clone(),
             writes: Some(frozen..reserved),
@@ -626,29 +627,15 @@ impl FireRows {
     }
 }
 
-/// Where a lane's rows land in a fire.
-#[derive(Debug, Clone, Copy)]
-enum LaneSpan {
-    /// At the slots the host placed them, `start..end`.
-    Host { start: u32, end: u32 },
-    /// Where the device says, `own` rows inside the slots the lane
-    /// reserved, which end at `reserved`.
-    Device { own: u32, reserved: u32 },
-}
-
-/// A lane's own and carried rows in a fire, its recurrent state folded
-/// through `frozen` (`None`: it has none, and carries nothing). A
-/// host-placed lane carries the rows between its state and its first row;
-/// a device-placed one starts where the device says, so what it carries is
-/// the host's bound: every slot it reserved past its state.
-fn lane_rows(span: LaneSpan, frozen: Option<u32>) -> FireRows {
-    let (own, reach) = match span {
-        LaneSpan::Host { start, end } => (end.saturating_sub(start), start),
-        LaneSpan::Device { own, reserved } => (own, reserved),
-    };
+/// The own and carried rows of a lane the host places at `start..end`, its
+/// recurrent state folded through `frozen` (`None`: it has none, and
+/// carries nothing): it carries the rows between its state and its first
+/// row. A lane the device places has no count here: its first row is its
+/// program's, resolved at the engine's prepare.
+fn lane_rows(start: u32, end: u32, frozen: Option<u32>) -> FireRows {
     FireRows {
-        own,
-        carried: frozen.map_or(0, |frozen| reach.saturating_sub(frozen)),
+        own: end.saturating_sub(start),
+        carried: frozen.map_or(0, |frozen| start.saturating_sub(frozen)),
     }
 }
 
@@ -703,7 +690,7 @@ fn piece_rows(
                     .copied()
                     .flatten()
                     .map(|frozen| if folded_behind { start } else { frozen });
-                Some(lane_rows(LaneSpan::Host { start, end }, frozen))
+                Some(lane_rows(start, end, frozen))
             }),
     )
 }
@@ -723,19 +710,14 @@ fn largest_rung(stores: &crate::store::registry::Stores, engine: usize) -> u32 {
 /// A fire carrying more recurrent rows than the largest rung's tokens is
 /// refused by name, before anything is submitted: no rung's replay scratch
 /// holds them. Up to there it raises the rung as a wider fire does.
-fn check_largest_rung(rows: FireRows, largest: u32, device_placed: bool) -> Result<(), String> {
+fn check_largest_rung(rows: FireRows, largest: u32) -> Result<(), String> {
     if rows.carried <= largest {
         return Ok(());
     }
-    let how = if device_placed {
-        "its rows land where the device says, so it carries every slot its lanes reserved \
-         past their frozen length: reserve less far ahead, or fold"
-    } else {
-        "fold what its lanes have written before they write more"
-    };
     Err(format!(
         "pipeline: a fire would carry {} recurrent rows unfolded into it, past the {largest} \
-         tokens of the largest activation rung, whose replay scratch holds as many; {how}",
+         tokens of the largest activation rung, whose replay scratch holds as many; fold \
+         what its lanes have written before they write more",
         rows.carried
     ))
 }
@@ -3320,7 +3302,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .collect();
         let carried = piece_rows(&full, &whole, &frozen, false).carried;
         let largest = largest_rung(&stores, engine);
-        if let Err(refusal) = check_largest_rung(FireRows { own: 0, carried }, largest, false) {
+        if let Err(refusal) = check_largest_rung(FireRows { own: 0, carried }, largest) {
             return Ok(Err(refusal));
         }
         let wanted = prefill_want(rows_total, engine).max(carried);
@@ -3348,7 +3330,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .map(|(at, piece)| piece_rows(&full, piece, &frozen, folds_each && at > 0))
             .collect();
         for rows in &pieces {
-            if let Err(refusal) = check_largest_rung(*rows, largest, false) {
+            if let Err(refusal) = check_largest_rung(*rows, largest) {
                 return Ok(Err(refusal));
             }
         }
@@ -3492,7 +3474,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // said: it never waits on a rung that does not come. A piece
             // cut again once a raise landed is counted as it is cut now.
             let counted = piece_rows(&full, piece, &frozen, folds_each && at > 0);
-            if let Err(refusal) = check_largest_rung(counted, largest, false) {
+            if let Err(refusal) = check_largest_rung(counted, largest) {
                 return Ok(Err(refusal));
             }
             let width = counted.ask();
@@ -4545,44 +4527,14 @@ async fn fire_device_geometry<C: FireContext>(
     } else {
         vec![0; pass_lanes.places.len() + 1]
     };
-    let rs_ws_ids = match bound_rs_working_sets(ctx, &ws, &rs_reps, &split, &pipeline_scope)? {
-        Ok(ids) => ids,
-        Err(error) => return Ok(Err(error)),
-    };
-    let windowed = crate::model::model().rs_caps().window_tokens > 0;
     // The fire stages its rows whole (the device places them, so it is never
     // cut): it asks the activation rung for them as every pass does
     // ([`RungAsk`]), and is staged once the rung takes them. It asks for
-    // the recurrent rows it may carry in as well: each lane's are bounded
-    // by what it reserved past its frozen length, which is all the host
-    // knows of where its rows start.
-    let frozen = match lanes_frozen(
-        &stores,
-        &rs_ws_ids,
-        &groups,
-        pass_lanes.places.len(),
-        windowed,
-    ) {
-        Ok(frozen) => frozen,
-        Err(error) => return Ok(Err(error)),
-    };
-    let counted = FireRows::of(groups.iter().flat_map(|(_, lanes)| {
-        let reserved = pass_lanes.cursors[lanes[0]].lock().unwrap().reserved;
-        let (split, frozen) = (&resolved_qo_indptr, &frozen);
-        lanes.iter().map(move |&lane| {
-            lane_rows(
-                LaneSpan::Device {
-                    own: split[lane + 1] - split[lane],
-                    reserved,
-                },
-                frozen[lane],
-            )
-        })
-    }));
-    if let Err(refusal) = check_largest_rung(counted, largest_rung(&stores, ws.engine), true) {
-        return Ok(Err(refusal));
-    }
-    let rows = counted.ask();
+    // its own rows only: the rows it carries in start where its program
+    // says, on the device, after the lane's earlier fires have run, so no
+    // count exists here and none is stated in its place; its engine counts
+    // them at prepare ([`::engine::fire::rung_rows`], device geometry).
+    let rows = resolved_qo_indptr.last().copied().unwrap_or(0);
     let rung_ask = ask_rung(
         &stores,
         ws.engine,
@@ -4596,6 +4548,11 @@ async fn fire_device_geometry<C: FireContext>(
     {
         return Ok(Err(refusal));
     }
+    let rs_ws_ids = match bound_rs_working_sets(ctx, &ws, &rs_reps, &split, &pipeline_scope)? {
+        Ok(ids) => ids,
+        Err(error) => return Ok(Err(error)),
+    };
+    let windowed = crate::model::model().rs_caps().window_tokens > 0;
     if windowed && groups.len() > 1 {
         return Ok(Err(
             "pipeline: on a model with window lists, a pass whose rows land where the device \
@@ -4714,7 +4671,6 @@ async fn fire_device_geometry<C: FireContext>(
                 ..::engine::Lane::default()
             })
             .collect(),
-        carried: counted.carried,
         ..crate::engine::FireRequest::default()
     };
     rs_prepared.apply_to(&mut req);
@@ -6125,29 +6081,19 @@ mod unfolded_tests {
 
     /// A lane's rows in a fire: its own, and what it carries in unfolded.
     /// A host-placed lane carries the rows between its state and its first
-    /// row; a device-placed one, every slot it reserved past its state; a
-    /// lane with no recurrent state, nothing.
+    /// row; a lane with no recurrent state, nothing.
     #[test]
     fn a_lane_counts_its_own_rows_and_the_rows_it_carries() {
-        let host = |start, end, frozen| lane_rows(LaneSpan::Host { start, end }, frozen);
+        let host = lane_rows;
         assert_eq!(host(105, 113, Some(100)), FireRows { own: 8, carried: 5 });
         assert_eq!(host(100, 101, Some(100)), FireRows { own: 1, carried: 0 });
         assert_eq!(host(105, 113, None), FireRows { own: 8, carried: 0 });
-        let device = |own, reserved, frozen| lane_rows(LaneSpan::Device { own, reserved }, frozen);
-        assert_eq!(
-            device(5, 184, Some(100)),
-            FireRows {
-                own: 5,
-                carried: 84
-            }
-        );
-        assert_eq!(device(5, 184, None), FireRows { own: 5, carried: 0 });
         // A fire's are its lanes' summed.
         assert_eq!(
-            FireRows::of([host(105, 113, Some(100)), device(5, 184, Some(100))]),
+            FireRows::of([host(105, 113, Some(100)), host(102, 107, Some(100))]),
             FireRows {
                 own: 13,
-                carried: 89
+                carried: 7
             }
         );
     }
@@ -6210,64 +6156,20 @@ mod unfolded_tests {
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
     }
 
-    /// Carried rows raise the rung through the ask every pass makes: the
-    /// fire enqueues once the rung takes them, and holds the ask.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_device_fire_asks_the_rung_for_the_rows_it_carries() {
-        const ENGINE: usize = 48;
-        let stores = pool_of_one_row_rs_pages();
-        let pid = uuid::Uuid::new_v4();
-        crate::store::shared::set_fire_cap_for_test(ENGINE, 8);
-        // Five rows of its own; 84 slots reserved past its frozen length.
-        let counted = lane_rows(
-            LaneSpan::Device {
-                own: 5,
-                reserved: 184,
-            },
-            Some(100),
-        );
-        let rows = counted.ask();
-        assert_eq!(rows, 84);
-        let raise = tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            assert_eq!(crate::store::shared::wanted_rows(ENGINE), 84);
-            crate::store::shared::set_fire_cap_for_test(ENGINE, 128);
-        });
-        let ask =
-            ask_rung(&stores, ENGINE, pid, pid, rows as usize, rows).expect("carried rows ask");
-        tokio::time::timeout(std::time::Duration::from_secs(5), ask.wait(rows))
-            .await
-            .expect("no indefinite wait")
-            .expect("the rung takes it");
-        raise.await.unwrap();
-        assert!(crate::store::shared::fire_cap(ENGINE) >= 84);
-        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 84);
-        drop(ask);
-        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
-    }
-
     /// No rung's replay scratch holds more carried rows than the largest
     /// rung's tokens: a fire carrying more is refused by name, before
     /// anything is submitted, whatever its own rows.
     #[test]
     fn a_fire_carrying_past_the_largest_rung_is_refused_by_name() {
         let carrying = |carried| FireRows { own: 5, carried };
-        assert!(check_largest_rung(carrying(0), 2048, false).is_ok());
-        assert!(check_largest_rung(carrying(2048), 2048, false).is_ok());
-        assert!(check_largest_rung(carrying(2048), 2048, true).is_ok());
-        let host = check_largest_rung(carrying(2049), 2048, false).unwrap_err();
+        assert!(check_largest_rung(carrying(0), 2048).is_ok());
+        assert!(check_largest_rung(carrying(2048), 2048).is_ok());
+        let host = check_largest_rung(carrying(2049), 2048).unwrap_err();
         assert!(
             host.contains("carry 2049 recurrent rows unfolded")
                 && host.contains("past the 2048 tokens of the largest activation rung")
                 && host.contains("fold what its lanes have written before they write more"),
             "{host}"
-        );
-        let device = check_largest_rung(carrying(2049), 2048, true).unwrap_err();
-        assert!(
-            device.contains("carry 2049 recurrent rows unfolded")
-                && device.contains("past the 2048 tokens of the largest activation rung")
-                && device.contains("reserve less far ahead, or fold"),
-            "{device}"
         );
         // Own rows past it are another refusal's (the capacity of a fire).
         assert!(
@@ -6276,8 +6178,7 @@ mod unfolded_tests {
                     own: 4096,
                     carried: 0
                 },
-                2048,
-                false
+                2048
             )
             .is_ok()
         );
@@ -6512,19 +6413,8 @@ mod unfolded_tests {
         assert_eq!(planned[0].writes, Some(13..23));
         assert_eq!(planned[0].fold, rs::GroupFold::Device);
         // The decode reserved its whole extent up front, as the MTP example:
-        // its fire asks a rung of that many tokens.
+        // what it reserved is buffered, and is no count of what it carries.
         let ahead = groups(device(13 + 64).expect("planned whatever it reserved"));
         assert_eq!(ahead[0].writes, Some(13..13 + 64));
-        assert_eq!(
-            lane_rows(
-                LaneSpan::Device {
-                    own: 5,
-                    reserved: 13 + 64
-                },
-                frozen[0]
-            )
-            .ask(),
-            64
-        );
     }
 }

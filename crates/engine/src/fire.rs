@@ -581,11 +581,17 @@ pub enum RsVerb {
 ///   rung as a wider fire does; one carrying more than the largest rung's
 ///   tokens is refused by name, before anything is submitted. The counts
 ///   are a fire's, summed over its lanes.
-/// - Device geometry: the device picks where a lane's rows land, so the
-///   carried count the runtime asks with is the host's bound, the slots the
-///   lane reserved past its frozen length (`reserved - frozen`). An
-///   inferlet that reserves far ahead asks a wider rung than it uses;
-///   tightening that belongs to the reservation API.
+/// - Device geometry: a lane's carried rows are the buffered slots between
+///   its state and its first row that its mask admits (`folded..first`,
+///   [`buffered_reads`]). Where the device says where a lane's rows land,
+///   both ends are its program's (`fold` and `slots`), resolved at the
+///   engine's prepare, after the lane's earlier fires have run: no count
+///   exists when the runtime asks. The runtime asks for such a fire's own
+///   rows and states no carried count for it, nor a bound in its place
+///   (the slots a lane reserved are no measure of what it carries). Its
+///   engine holds it to the contract where the count resolves: a fire whose
+///   lanes replay more than the tokens of the rung it runs at is refused by
+///   name at prepare and writes nothing, never replayed past the scratch.
 #[must_use]
 pub fn rung_rows(own: u32, carried: u32) -> u32 {
     own.max(carried)
