@@ -4082,9 +4082,7 @@ fn price_pipelines<B: Serve>(device: &B::Context, pipelines: &B::Pipelines) -> u
     if !B::measures_outside(device) {
         return 0;
     }
-    let _alone = PRICING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _alone = PRICING.lock().expect("pricing lock poisoned");
     let census: Vec<(&'static str, &'static str)> = kernels_slang::CENSUS
         .iter()
         .filter(|(key, _, tier, _)| B::builds(device, key, tier))

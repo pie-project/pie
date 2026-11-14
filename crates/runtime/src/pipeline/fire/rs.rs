@@ -208,7 +208,6 @@ impl PreparedRs {
         let copy = engine::StateCopy {
             moves: moves(&self.copies),
             pages: moves(&self.page_copies),
-            ..Default::default()
         };
         (!copy.moves.is_empty() || !copy.pages.is_empty()).then_some(copy)
     }

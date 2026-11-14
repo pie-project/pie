@@ -140,6 +140,7 @@ pub(crate) fn handles_settled(
 }
 
 /// The worker policy dropped the handle it knows as `id`.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn discard_handle(client_id: ClientId, id: ProcessId, why: String) {
     let _ = CLIENT_SERVICES.send(&client_id, SessionMessage::DiscardHandle(id, why));
 }
@@ -212,6 +213,7 @@ enum SessionMessage {
     },
     ClientRequest(ClientMessage),
     HandlesSettled(Vec<(client_api::HandleName, crate::handle::Landing)>),
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     DiscardHandle(ProcessId, String),
     /// A turn was cancelled: if its frame is still waiting, it never runs.
     Forget(u32),
