@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use ::engine::live::{ArmingLease, ArmingRoom, Live};
 
-use super::OnPlanner;
+use super::{Lender as _, OnPlanner};
 use crate::planner::{ChunkStats, Demand, PoolPort, ResidencyPlanner};
 use crate::scheduler::lane::{Lane, LaunchReplyRx};
 use crate::scheduler::stats::SchedulerStats;
@@ -614,4 +614,61 @@ async fn a_waiter_short_of_room_proceeds_once_the_limit_rises() {
         parked.await.expect("the parked task"),
         Ok(crate::planner::Acquired::Granted(_))
     ));
+}
+
+/// A step's lease comes from the stores' free slots, through the planner, as
+/// a grant does: never a page a waiter was granted and has yet to bind (the
+/// starving decoder's), and never one a lane let go under a fire still in
+/// flight, until that fire retires.
+#[test]
+fn a_lease_takes_neither_a_waiter_s_grant_nor_a_page_a_fire_in_flight_let_go() {
+    use crate::store::registry::{self, with_kv_lock};
+    let model = registry::register_model(16, &[8], &[2]);
+    let port: Arc<dyn PoolPort> = Arc::new(crate::planner::RegistryPool::new(model, 0, false));
+    let planner = Arc::new(ResidencyPlanner::new(port));
+    let stores = registry::get(model, 0);
+    // A lane held two pages and let them go under a fire still in flight.
+    let (fire, let_go) = with_kv_lock(&stores.kv, "test", |kv| {
+        let ws = kv.create_working_set();
+        kv.reserve(ws, 2).unwrap();
+        let mut granted = kv.reserve_device_pages(2).unwrap();
+        kv.ensure_backed_reserved(ws, 2, &mut granted).unwrap();
+        let pages: HashSet<u32> = kv.flat_table(ws).unwrap().iter().map(|p| p.0).collect();
+        let fire = kv.begin_fire();
+        let epoch = kv.current_epoch();
+        kv.release_working_set(ws, epoch);
+        kv.retire_idle();
+        (fire, pages)
+    });
+    // The decoder's ask was granted four pages it has not yet bound.
+    let grant = planner
+        .try_free(Demand {
+            kv_pages: 4,
+            rs: RsUnits::default(),
+        })
+        .expect("four pages stand free");
+    let promised: HashSet<u32> = grant.kv_pages().iter().map(|p| p.0).collect();
+    let mut lender = OnPlanner(planner.clone());
+    let room = |pages| ArmingRoom { pages, records: 0 };
+    assert!(
+        lender.lend(0, room(4), true).is_none(),
+        "a lease reached past the two pages that stand free"
+    );
+    let lent = lender.lend(0, room(2), true).expect("two stand free");
+    for page in &lent.lease.pages {
+        assert!(!promised.contains(page), "a lease took granted page {page}");
+        assert!(
+            !let_go.contains(page),
+            "a lease took page {page}, which a fire in flight still names"
+        );
+    }
+    drop(lent);
+    with_kv_lock(&stores.kv, "test", |kv| kv.settle(fire));
+    let lent = lender
+        .lend(0, room(4), true)
+        .expect("the fire retired: its pages stand free too");
+    let leased: HashSet<u32> = lent.lease.pages.iter().copied().collect();
+    assert!(leased.is_disjoint(&promised), "a lease took a granted page");
+    assert!(leased.is_superset(&let_go));
+    drop((lent, grant));
 }
