@@ -131,6 +131,26 @@ fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option
     }
     let shared = crate::store::registry::try_get(0, engine_idx)?.shared?;
     let pool = shared.lock().unwrap();
+    // A step wider than the rung applied, or whose carve covers state.
+    let over = frame.steps.iter().enumerate().find_map(|(at, step)| {
+        let lanes = &step.submission.lanes;
+        let tokens: u32 = lanes.iter().map(::engine::Lane::rows).sum();
+        let tables: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = lanes
+            .iter()
+            .flat_map(|lane| {
+                lane.tables.iter().cloned().chain(
+                    lane.fixed
+                        .iter()
+                        .map(|(shape, pairs)| (*shape, pairs.iter().flatten().copied().collect())),
+                )
+            })
+            .collect();
+        pool.over_carve(tokens, &tables)
+            .map(|why| format!("step {at} of {}: {why}", frame.steps.len()))
+    });
+    if over.is_some() {
+        return over;
+    }
     frame.steps.iter().find_map(|step| {
         step.submission
             .lanes

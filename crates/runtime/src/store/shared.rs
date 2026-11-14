@@ -1375,6 +1375,51 @@ impl SharedPool {
         None
     }
 
+    /// Why a step of `tokens` rows naming `tables` would run over state (a
+    /// check, `PIE_CHECK_SLOT_REFS`): its activation takes more chunks than
+    /// the pool sets aside now (a step wider than the rung applied), state
+    /// is held in the span set aside (a chunk lent to state that the carve
+    /// covers), or a slot it names lies where its carve runs.
+    #[must_use]
+    pub fn over_carve(&self, tokens: u32, tables: &[(EngineShape, Vec<u32>)]) -> Option<String> {
+        let need = self.pool.act_chunks(tokens);
+        let have = self.pool.act_reserved();
+        let total = self.pool.total_chunks();
+        if need > have {
+            return Some(format!(
+                "a step of {tokens} rows takes {need} activation chunks and the pool sets \
+                 aside {have} (rung {}): it is wider than the rung applied",
+                self.rung()
+            ));
+        }
+        let carve = total - need;
+        if let Some(&chunk) = self.pool.held_past(carve).first() {
+            return Some(format!(
+                "state is held in physical chunk {chunk}, inside the {need} activation chunks \
+                 a step of {tokens} rows carves from {carve} (set aside: {have})"
+            ));
+        }
+        for (engine, refs) in tables {
+            let Some(shape) = self.pool_shape(*engine) else {
+                continue;
+            };
+            for &slot_ref in refs {
+                let slot = self.slot(shape, slot_ref);
+                if let Some(physical) = self.pool.physical(slot.chunk)
+                    && physical >= carve
+                    && slot.chunk >= self.pool.reserved_chunks()
+                {
+                    return Some(format!(
+                        "slot ref {slot_ref} of shape {engine:?} lies in physical chunk \
+                         {physical}, inside the activation a step of {tokens} rows carves \
+                         from {carve}"
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     /// The pool shape of engine shape `engine`, a state shape's.
     fn pool_shape(&self, engine: EngineShape) -> Option<ShapeId> {
         self.list

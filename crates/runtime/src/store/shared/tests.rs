@@ -1109,6 +1109,47 @@ fn a_raise_is_taken_where_it_is_planned_and_held_until_its_copy() {
     let _ = moved_off;
 }
 
+/// The submit check (`PIE_CHECK_SLOT_REFS`): a step wider than the rung
+/// applied, or naming a slot its carve would cover, is named; a step within
+/// the rung, naming slots below the span, is not.
+#[test]
+fn a_step_wider_than_the_rung_applied_or_carving_over_a_slot_is_named() {
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    pool.lower_rung(16).unwrap();
+    let list = pool.list().expect("a kv list");
+    let low = pool.take_refs(list.pool, 1).expect("a page");
+    let tables = vec![(LIST, low.clone())];
+    assert_eq!(pool.over_carve(16, &tables), None);
+    let wide = pool
+        .over_carve(2048, &[])
+        .expect("a step past the rung is named");
+    assert!(wide.contains("wider than the rung applied"), "{wide}");
+    // State lent the span the lowered rung gave up: a step within the rung
+    // carves past it, and one of the rung that would cover it is named.
+    let available = pool.pool().available(list.pool);
+    let lent = pool.take_refs(list.pool, available).expect("every page");
+    let spc = facts().shapes[0].slots_per_chunk;
+    let span = TOTAL - pool.pool().act_max();
+    let in_span: Vec<u32> = lent
+        .iter()
+        .copied()
+        .filter(|&r| pool.pool().physical(r / spc).is_some_and(|p| p >= span))
+        .collect();
+    assert!(
+        !in_span.is_empty(),
+        "the lowered rung lent the span to state"
+    );
+    assert_eq!(pool.over_carve(16, &[(LIST, lent.clone())]), None);
+    assert!(pool.over_carve(2048, &[(LIST, in_span)]).is_some());
+    pool.give_refs(list.pool, &lent);
+    pool.give_refs(list.pool, &low);
+}
+
 /// While the engine holds part of its range back, a committed chunk past
 /// the ceiling is no room: the walker sees the shortfall and commits ahead
 /// of a waiter, and the ceiling's lift says so, for the planner's waiters

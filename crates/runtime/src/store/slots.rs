@@ -744,6 +744,11 @@ impl SlotPool {
     }
 
     /// State chunks at physical ids `from..to`.
+    /// Physical chunks at or past `from` that hold state.
+    pub fn held_past(&self, from: u32) -> Vec<u32> {
+        self.held_in(from, self.total)
+    }
+
     fn held_in(&self, from: u32, to: u32) -> Vec<u32> {
         (from..to)
             .filter(|&chunk| !self.free.get(chunk) && chunk >= self.reserved)
