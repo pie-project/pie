@@ -134,6 +134,11 @@ pub struct Shell {
     /// The bodies' allowance is a record's figure, not the configured
     /// ceiling: a load that then arms short of whole drops the record.
     bodies_from_record: bool,
+    /// The load's own arming is under way: its pool is not backed yet.
+    arming_at_load: bool,
+    /// What the last arming's captures took, which a re-arm within the
+    /// same load is allowed.
+    bodies_took: u64,
     /// The kernels' workspaces in the activation's span, once a load has
     /// walked what its fires take.
     workspace: Option<load::Workspace>,

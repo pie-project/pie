@@ -261,8 +261,7 @@ impl Shell {
                 // bank's experts lay: the lattice is recorded again over
                 // where they lie now.
                 self.device.synchronize()?;
-                self.cache.forget_bodies();
-                self.arm_bodies()?;
+                self.rearm_bodies()?;
             }
         }
         if self.pools.copied_from_file() {

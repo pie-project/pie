@@ -1323,6 +1323,8 @@ impl Shell {
             bodies_mem: (engine.recording.bodies_mem() as usize).saturating_mul(1 << 20),
             bodies_record: None,
             bodies_from_record: false,
+            arming_at_load: false,
+            bodies_took: 0,
             workspace: None,
             inputs_at: 0,
             decoded_tiles: Vec::new(),
@@ -1684,7 +1686,10 @@ impl Staged {
             // so not where a fire also names windowed pages.
             shell.arm_stepped =
                 shell.arm_stepped && shell.ep.is_none() && !shell.pools.has_windowed();
-            shell.arm_bodies()?;
+            shell.arming_at_load = true;
+            let armed = shell.arm_bodies();
+            shell.arming_at_load = false;
+            armed?;
         }
         let stepping = shell.stepping.is_some();
         let resident = footprint(&shell, device_total, free_before);

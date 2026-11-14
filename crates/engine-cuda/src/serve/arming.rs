@@ -99,6 +99,11 @@ pub(super) struct Arming {
     /// ([`super::measured`]): the lattice arms as recorded, unpriced, and
     /// no headroom estimate stops it.
     from_record: bool,
+    /// The allowance caps arming. Not at load on a record's figure: the
+    /// pool is not backed yet, so the figure is the fit's reservation, and
+    /// the finish fit accounts what the bodies took; only a device failure
+    /// stops arming there.
+    capped: bool,
     /// A capture found no device room on a record's allowance while the
     /// shell served: arming stopped there and the rest walk eagerly.
     record_short: bool,
@@ -1135,6 +1140,19 @@ impl Shell {
         dropped
     }
 
+    /// Forgets the recorded bodies and arms the lattice again within the
+    /// same load, allowed what its last arming took: the pool is backed by
+    /// now and those bodies' memory is what the forgetting frees, whatever
+    /// the record said.
+    pub(super) fn rearm_bodies(&mut self) -> Result<()> {
+        self.cache.forget_bodies();
+        self.bodies_mem = self
+            .bodies_mem
+            .max(usize::try_from(self.bodies_took).unwrap_or(usize::MAX));
+        self.bodies_from_record = false;
+        self.arm_bodies()
+    }
+
     pub(super) fn arm_bodies(&mut self) -> Result<()> {
         let armed = self.arm_lattice(false);
         self.pools.forget_weight_uses(self.device.stream())?;
@@ -1501,6 +1519,7 @@ impl Shell {
             peer_stopped: false,
             unit_margin: self.pools.arming_margin_bytes(),
             from_record: self.bodies_from_record,
+            capped: !(self.bodies_from_record && self.arming_at_load),
             record_short: false,
             took: Some(0),
             profiled: self.budget.buckets.len(),
@@ -1692,7 +1711,7 @@ impl Shell {
         let headroom = !st.from_record && spare < margin;
         let mine = !st.verify
             && (spent.census.bodies >= record::MAX_BODIES
-                || spent.census.bytes >= self.bodies_mem
+                || (st.capped && spent.census.bytes >= self.bodies_mem)
                 || headroom);
         let stop = match self.ep.as_ref() {
             // The group's ranks fire one sequence of steps: the allowance
@@ -1993,6 +2012,9 @@ impl Shell {
         {
             let took = stats.census.bytes as u64;
             let captured = st.took.unwrap_or(took);
+            // What this arming took, the allowance a re-arm within the same
+            // load starts from ([`Shell::rearm_bodies`]).
+            self.bodies_took = captured.max(took);
             let measured = super::measured::Measured {
                 bytes: took,
                 bodies: stats.census.bodies as u64,
@@ -2341,6 +2363,7 @@ mod tests {
             peer_stopped: false,
             unit_margin: 0,
             from_record: false,
+            capped: true,
             record_short: false,
             took: None,
             profiled: 0,

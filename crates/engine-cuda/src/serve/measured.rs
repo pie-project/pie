@@ -112,8 +112,8 @@ pub(crate) fn write(path: &Path, measured: Measured) -> std::io::Result<()> {
 /// load in a process that already holds what an earlier load of it built
 /// (its modules, its graph resources), or a re-arm within one load, costs
 /// less. The larger of the stored and the measured figure is kept, and a
-/// measurement whose captures came to less than the bodies' own census,
-/// something reused, is not written at all.
+/// measurement whose captures came to nothing, or to less than the bodies'
+/// own census, measured nothing or something reused, and is not written.
 pub(crate) fn conclude(
     path: &Path,
     held_from_record: bool,
@@ -123,7 +123,7 @@ pub(crate) fn conclude(
     wanted: usize,
 ) -> std::io::Result<Option<String>> {
     if whole {
-        if measured.bodies == 0 || measured.captured < measured.bytes {
+        if measured.bodies == 0 || measured.captured == 0 || measured.captured < measured.bytes {
             return Ok(None);
         }
         let stored = read(path).map_or(0, |stored| stored.captured);
@@ -202,6 +202,20 @@ mod tests {
         };
         assert_eq!(conclude(&at, true, true, reused, 10, 10).unwrap(), None);
         assert_eq!(read(&at), Some(cold));
+        // A warm process's captures that cost nothing measured nothing.
+        let nothing = Measured {
+            bytes: 0,
+            captured: 0,
+            ..cold
+        };
+        assert_eq!(conclude(&at, true, true, nothing, 10, 10).unwrap(), None);
+        assert_eq!(read(&at), Some(cold));
+        let fresh = path(&dir, "another deployment");
+        assert_eq!(
+            conclude(&fresh, false, true, nothing, 10, 10).unwrap(),
+            None
+        );
+        assert_eq!(read(&fresh), None, "no record of nothing");
         // A colder one costs more: the record grows to it.
         let colder = Measured {
             captured: 9 << 20,
