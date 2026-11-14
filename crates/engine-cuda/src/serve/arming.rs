@@ -103,8 +103,9 @@ pub(super) struct Arming {
     /// shell served: arming stopped there and the rest walk eagerly.
     record_short: bool,
     /// What the device's free memory fell by across each composition's
-    /// fires, summed: what the captures took, and nothing serving or the
-    /// runtime took between them. None where free memory cannot be read.
+    /// fires, less what the pool backed in that window, summed: what the
+    /// captures took, and nothing the pool, serving or the runtime took
+    /// between them. None where free memory cannot be read.
     took: Option<u64>,
     /// The buckets of the profile's lattice, before arming coarsened any
     /// away.
@@ -1727,6 +1728,7 @@ impl Shell {
         let owned = self.synthetic_lanes_with(&lanes, &media);
         self.armed_body = None;
         let free_before = crate::device::free_bytes();
+        let backed_before = self.pools.backed_bytes();
         let idle = matches!(target, BodySynth::Idle);
         for _ in 0..record::WARM_FIRES {
             if idle {
@@ -1772,11 +1774,17 @@ impl Shell {
             }
         }
         self.arm_cold = false;
+        // What the pool backed across the window (a mapped range backs the
+        // activation's holds and segments as the fires first touch them) is
+        // the pool's, not the capture's; a flat range, allocated, backs none.
+        let pool_grew = self.pools.backed_bytes().saturating_sub(backed_before);
         st.took = st
             .took
             .zip(free_before)
             .zip(crate::device::free_bytes())
-            .map(|((took, before), after)| took + before.saturating_sub(after));
+            .map(|((took, before), after)| {
+                took + before.saturating_sub(after).saturating_sub(pool_grew)
+            });
         let key = self.armed_body.take();
         let warmed_ms = began.elapsed().as_secs_f64() * 1000.0;
         let mut golden_ms = (0f64, 0f64);
