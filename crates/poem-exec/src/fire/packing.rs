@@ -220,6 +220,11 @@ pub struct GroupMask {
     pub indptr: Vec<i32>,
 }
 
+/// Byte `at` of a fire's group masks as the kernels' `int` offset holds it.
+fn mask_offset(at: usize) -> Result<i32, Fault> {
+    i32::try_from(at).map_err(|_| Fault::MaskBytes { bytes: at as u64 })
+}
+
 /// `None` when no lane states a mask; a lane stating none attends every row of its group.
 pub fn group_mask(
     lanes: &[LaneRow],
@@ -263,7 +268,7 @@ pub fn group_mask(
     let mut bits: Vec<u8> = Vec::new();
     let mut indptr = Vec::with_capacity(groups + 1);
     for g in 0..groups {
-        indptr.push(i32::try_from(bits.len()).unwrap_or(i32::MAX));
+        indptr.push(mask_offset(bits.len())?);
         let keys: Vec<u64> = kv_chosen
             .iter()
             .filter(|&&(group, _)| group as usize == g)
@@ -304,13 +309,25 @@ pub fn group_mask(
             }
         }
     }
-    indptr.push(i32::try_from(bits.len()).unwrap_or(i32::MAX));
+    indptr.push(mask_offset(bits.len())?);
     Ok(Some(GroupMask { bits, indptr }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fire's group masks past an `int` byte offset are refused by name,
+    /// not clamped to the last offset.
+    #[test]
+    fn group_masks_past_an_int_offset_are_refused_by_name() {
+        assert_eq!(mask_offset(i32::MAX as usize).ok(), Some(i32::MAX));
+        let past = i32::MAX as usize + 1;
+        assert!(matches!(
+            mask_offset(past),
+            Err(Fault::MaskBytes { bytes }) if bytes == past as u64
+        ));
+    }
 
     fn row(source: u32, word: u64, row_offset: u32, rows: u32) -> LaneRow {
         LaneRow {

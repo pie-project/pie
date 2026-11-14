@@ -75,9 +75,9 @@ template <typename T>
   const float costheta = fast::cos(theta);
   const float sintheta = fast::sin(theta);
 
-  const int row_base = (m * n_head + h) * head_dim + offset;
-  const int i1 = interleaved != 0 ? row_base + 2 * i : row_base + i;
-  const int i2 = interleaved != 0 ? i1 + 1 : i1 + rope_half;
+  const long row_base = (long(m) * n_head + h) * head_dim + offset;
+  const long i1 = interleaved != 0 ? row_base + 2 * i : row_base + i;
+  const long i2 = interleaved != 0 ? i1 + 1 : i1 + rope_half;
   const float x1 = static_cast<float>(x[i1]);
   const float x2 = static_cast<float>(x[i2]);
   x[i1] = static_cast<T>(x1 * costheta - x2 * sintheta);
@@ -124,9 +124,9 @@ template <typename T>
   const float costheta = fast::cos(theta) * mscale;
   const float sintheta = fast::sin(theta) * mscale;
 
-  const int row_base = (m * n_head + h) * head_dim;
-  const int i1 = interleaved != 0 ? row_base + 2 * i : row_base + i;
-  const int i2 = interleaved != 0 ? i1 + 1 : i1 + half_hd;
+  const long row_base = (long(m) * n_head + h) * head_dim;
+  const long i1 = interleaved != 0 ? row_base + 2 * i : row_base + i;
+  const long i2 = interleaved != 0 ? i1 + 1 : i1 + half_hd;
   const float x1 = static_cast<float>(x[i1]);
   const float x2 = static_cast<float>(x[i2]);
   x[i1] = static_cast<T>(x1 * costheta - x2 * sintheta);
