@@ -1689,7 +1689,11 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
         3,
         "dropped"
     );
-    assert_eq!(store.available_pages(), 8, "back at once: no fire in flight read it");
+    assert_eq!(
+        store.available_pages(),
+        8,
+        "back at once: no fire in flight read it"
+    );
     store.settle(busy);
     store.settle(other);
 
@@ -1705,8 +1709,86 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
         "dropped"
     );
     store.retire_idle();
-    assert_eq!(store.available_pages(), 5, "the fire that read it is in flight");
+    assert_eq!(
+        store.available_pages(),
+        5,
+        "the fire that read it is in flight"
+    );
     store.settle(read);
     store.retire_idle();
     assert_eq!(store.available_pages(), 8, "and back once it retires");
+}
+
+fn page_set(store: &mut KvStore, ws: WorkingSetId) -> HashSet<u32> {
+    store.flat_table(ws).unwrap().iter().map(|p| p.0).collect()
+}
+
+/// The decoding process fails as the pool's sole holder while a late lane is
+/// mid-prefill: the late lane mapped the decoder's sealed prompt pages in at
+/// admission and has a prefill piece in flight; the decoder's last frame is
+/// in flight too. The decoder's release frees only what it alone holds, and
+/// only once its frame retires; no grant, before or after, takes a page the
+/// late lane names, and the late lane's table stays as it was.
+#[test]
+fn a_sole_holder_failing_under_a_late_prefill_frees_nothing_the_late_lane_names() {
+    let mut store = KvStore::new(16, h(31));
+    store.set_keeps(true);
+    let shared: Vec<u32> = (0..32).map(|t| 700 + t).collect();
+    // The decoder: a two-page prompt the late lane shares, two pages decoded.
+    let decoder = store.create_working_set();
+    store.set_owner(decoder, ProcessId::from_u128(1)).unwrap();
+    commit_opaque(&mut store, decoder, 2);
+    seal(&mut store, decoder, 0, &shared);
+    commit_opaque(&mut store, decoder, 2);
+    // The late lane maps the shared prefix in at admission ...
+    let late = store.create_working_set();
+    let keys = keys_ahead(&store, late, 0, &shared);
+    let run = store.cached_run(&keys);
+    assert_eq!(store.attach_run(late, &run, 2, 16).unwrap(), 2);
+    // ... and a prefill piece writing three pages past it is in flight.
+    store.reserve(late, 3).unwrap();
+    let piece = prepare_write(&mut store, late, &[2, 3, 4]);
+    let commits: Vec<PageCommit> = (0..3).map(|i| pc(2000 + i)).collect();
+    let piece = store.publish_prepared(piece, &commits).unwrap();
+    let named = page_set(&mut store, late);
+    assert_eq!(named.len(), 5);
+    let decoders = page_set(&mut store, decoder);
+    // The decoder's last frame is in flight as it fails.
+    let frame = store.begin_fire();
+    let free_before = store.available_pages();
+    store.release_working_set(decoder, store.current_epoch());
+    store.retire_idle();
+    assert_eq!(
+        store.available_pages(),
+        free_before,
+        "the failing decoder's pages went back under its frame in flight"
+    );
+    let granted = store
+        .reserve_device_pages(store.available_pages())
+        .unwrap_or_default();
+    assert!(
+        granted
+            .iter()
+            .all(|p| !named.contains(&p.0) && !decoders.contains(&p.0)),
+        "a grant took a page a frame in flight names"
+    );
+    store.release_device_reservation(granted);
+    // The decoder's frame retires, then the late piece (which began first).
+    store.settle(frame);
+    store.settle(piece);
+    let granted = store.reserve_device_pages(store.available_pages()).unwrap();
+    assert!(
+        granted.len() > free_before,
+        "the decoder's own pages are back once the fires retire"
+    );
+    assert!(
+        granted.iter().all(|p| !named.contains(&p.0)),
+        "the decoder's release gave away a page the late lane maps"
+    );
+    assert_eq!(
+        page_set(&mut store, late),
+        named,
+        "the late lane's table moved"
+    );
+    store.release_device_reservation(granted);
 }
