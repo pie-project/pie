@@ -502,14 +502,28 @@ fn inject_masks(
         }
         return Ok(());
     }
-    let table: Vec<kernels_cuda::runtime::channel::BitRun> = injects
+    let table = injects
         .iter()
-        .map(|inject| kernels_cuda::runtime::channel::BitRun {
-            src: inject.src,
-            dst_byte: u32::try_from(inject.dst_off).unwrap_or(u32::MAX),
-            bits: inject.bits,
+        .map(|inject| {
+            // The run's offset is 32-bit: a saturated one would pack a
+            // lane's bits over another's.
+            let dst_byte = u32::try_from(inject.dst_off).map_err(|_| {
+                crate::error::Fault::program(
+                    "inputs",
+                    format!(
+                        "a device-carried mask lands {} bytes into the fire's masks, past the \
+                         32-bit offset a bit run states",
+                        inject.dst_off
+                    ),
+                )
+            })?;
+            Ok(kernels_cuda::runtime::channel::BitRun {
+                src: inject.src,
+                dst_byte,
+                bits: inject.bits,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let bytes = table.len() * size_of::<kernels_cuda::runtime::channel::BitRun>();
     if runs.as_ref().is_none_or(|held| held.bytes() < bytes) {
         *runs = Some(Buffer::zeroed(bytes.next_power_of_two())?);

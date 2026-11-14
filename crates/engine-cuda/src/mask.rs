@@ -17,6 +17,21 @@ pub struct Staged {
     pub indptr: Vec<i32>,
 }
 
+/// The offset a lane's mask ends at, as the kernels read it: 32-bit, so a
+/// fire whose masks pass it is refused rather than have a saturated offset
+/// hand every later lane another's bits.
+fn mask_offset(bytes: usize, lane: usize) -> Result<i32> {
+    i32::try_from(bytes).map_err(|_| {
+        Fault::program(
+            "mask",
+            format!(
+                "the fire's attention masks reach {bytes} bytes by lane {lane}, and the \
+                 attention kernels read a lane's mask offset as a 32-bit index"
+            ),
+        )
+    })
+}
+
 pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
     if lanes.iter().all(|lane| lane.mask.is_none() && !lane.wide) {
         return Ok(None);
@@ -111,7 +126,7 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                 }
             }
         }
-        indptr.push(i32::try_from(bits.len()).unwrap_or(i32::MAX));
+        indptr.push(mask_offset(bits.len(), at)?);
     }
     Ok(Some(Staged { bits, indptr }))
 }
@@ -124,6 +139,16 @@ mod tests {
         let base = staged.indptr[lane] as usize;
         let cell = q * kv + k;
         (staged.bits[base + (cell / 8) as usize] >> (cell % 8)) & 1 == 1
+    }
+
+    #[test]
+    fn a_fire_whose_masks_pass_a_32_bit_offset_is_refused() {
+        assert_eq!(super::mask_offset(0, 0).unwrap(), 0);
+        assert_eq!(super::mask_offset(i32::MAX as usize, 3).unwrap(), i32::MAX);
+        let refused = super::mask_offset(i32::MAX as usize + 1, 3)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("by lane 3"), "{refused}");
     }
 
     #[test]
