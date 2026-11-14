@@ -10,6 +10,9 @@ fused, the adaLN projections' (shift, scale) pairs swapped, a single block's out
 The velocity is diffusers' in f32 (bf16 weights and inputs, every activation f32), unpacked and unpatchified as
 the pipeline does, written as the poem's `velocity` output reads out: [voxels (h, w), 32] f32, little-endian.
 --bf16: the same step with the model and inputs in bf16 (torch's own bf16 roundings), for reference.
+--loop <s0,s1,...> <out.f32>: the host's denoise loop from the same latent over sigmas s0, s1, ... then 0 (as the
+poem's schedule gives them: engine-cerebras' `Denoise`), an Euler step a velocity, all in f32; the final latent as
+the `latents` input lays it ([voxels (h, w), 32]).
 
 Needs diffusers >= 0.36 (Flux2Transformer2DModel) and torch. Threads: 8."""
 import math
@@ -158,7 +161,7 @@ def inputs():
     return latents, context
 
 
-def step(m, latents, context, dtype):
+def step(m, latents, context, dtype, sigma=SIGMA):
     x = latents.permute(2, 0, 1)[None]                       # (1, 32, H, W)
     x = P._patchify_latents(x)                               # (1, 128, H/2, W/2)
     ids = P._prepare_latent_ids(x)
@@ -169,10 +172,13 @@ def step(m, latents, context, dtype):
     with torch.no_grad():
         v = m(
             hidden_states=tokens.to(dtype), encoder_hidden_states=ctx.to(dtype),
-            timestep=torch.tensor([SIGMA], dtype=dtype), guidance=torch.tensor([GUIDANCE], dtype=dtype),
+            timestep=torch.tensor([sigma], dtype=dtype), guidance=torch.tensor([GUIDANCE], dtype=dtype),
             img_ids=ids, txt_ids=txt_ids, return_dict=False,
         )[0].float()
-    v = P._unpack_latents_with_ids(v, ids, H // 2, W // 2)   # (1, 128, H/2, W/2)
+    try:
+        v = P._unpack_latents_with_ids(v, ids, H // 2, W // 2)  # (1, 128, H/2, W/2)
+    except TypeError:                                    # diffusers >= 0.37 reads the grid off the ids
+        v = P._unpack_latents_with_ids(v, ids)
     v = P._unpatchify_latents(v)[0]                          # (32, H, W)
     return v.permute(1, 2, 0).reshape(H * W, VAE).contiguous().numpy().astype("<f4")
 
@@ -191,6 +197,17 @@ def main():
         rel = float(np.linalg.norm(b - v) / np.linalg.norm(v))
         cos = float((b * v).sum() / np.linalg.norm(b) / np.linalg.norm(v))
         print(f"bf16 model vs f32: rel L2 {rel:.3e}, cosine {cos:.6f}")
+    if "--loop" in sys.argv:
+        at = sys.argv.index("--loop")
+        sig = [np.float32(x) for x in sys.argv[at + 1].split(",")] + [np.float32(0)]
+        x = latents.clone()
+        for i in range(len(sig) - 1):
+            v = step(m, x, context, torch.float32, float(sig[i]))
+            dt = np.float32(sig[i + 1] - sig[i])
+            x = x + torch.from_numpy(v).reshape(H, W, VAE) * float(dt)
+        x = x.reshape(H * W, VAE).contiguous().numpy().astype("<f4")
+        x.tofile(sys.argv[at + 2])
+        print(f"{sys.argv[at + 2]}: latent after {len(sig) - 1} steps, rms {float(np.sqrt((x ** 2).mean())):.4f}")
 
 
 if __name__ == "__main__":

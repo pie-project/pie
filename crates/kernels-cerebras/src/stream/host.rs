@@ -7,6 +7,13 @@
 //! The P11 permutations are the host's: a root's rows are its own rows in the order the row
 //! stream brings them (its schedule's), each the class's row of the step; the entry's context is
 //! clamped to f16's range in an IEEE build.
+//!
+//! The reading's entries (M1e): an array whose words a step's inputs make (the host's rows, each
+//! row's scalars: what the entry's host ops make of the latents, the context, the timestep) is
+//! also stated as a [`Gather`], each word a value's (row, column), so an engine that computes
+//! those values from its own inputs ([`apply`]) writes the array as the capture does, a step at
+//! a time. `host.json` names the reading's classes (their request words and rows), the entries
+//! and the values the host reads back, so a runner needs nothing else of the compile.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -126,7 +133,6 @@ fn trace_row(p: &Program, unit: usize, t: u32) -> usize {
 
 /// One array's words (f32, or 16-bit words in u32).
 fn fill(p: &Program, vals: &Values, a: &HostArray) -> R<Vec<f32>> {
-    let trace = &p.trace;
     let mut out = vec![0f32; a.len as usize];
     let ieee = !p.round16;
     match &a.fill {
@@ -203,6 +209,78 @@ fn fill(p: &Program, vals: &Values, a: &HostArray) -> R<Vec<f32>> {
                 out[i] = if t.u16 { f32::from_bits(*x as u32) } else { *x };
             }
         }
+        Fill::Resident { .. } | Fill::Scalars { .. } | Fill::HostIn { .. } => {
+            let g = gather(p, a)?.ok_or("an array of no gather")?;
+            out = apply(&g, &|v| {
+                let (s, d) = vals.get(ValueId(v))?;
+                let w = *s.last().unwrap_or(&1);
+                Ok((d.len() / w.max(1), w, d))
+            })?;
+        }
+        Fill::HostOut { .. } | Fill::Stamps => {}
+    }
+    Ok(out)
+}
+
+/// A word of an entry: `value`'s element at (`row`, `col`), or zero where `value` is [`NONE`];
+/// `flags` [`ONE`], [`CLAMP`], [`FLAT`].
+pub type Word = [u32; 4];
+
+/// An array's words, each a value's element: what [`apply`] fills it from.
+pub type Gather = Vec<Word>;
+
+/// No value: the word is zero.
+pub const NONE: u32 = u32::MAX;
+/// A value of one row (a lane vector a step: the timestep's embedding) is read at row 0.
+pub const ONE: u32 = 1;
+/// Clamped to f16's range (an IEEE build's host rows).
+pub const CLAMP: u32 = 2;
+/// `col` indexes the value's elements over every row, modulo its size (a static resident).
+pub const FLAT: u32 = 4;
+
+/// `g`'s words from the values `get` holds: (rows, width, elements) by value id.
+pub fn apply(
+    g: &[Word],
+    get: &dyn Fn(u32) -> R<(usize, usize, std::rc::Rc<Vec<f32>>)>,
+) -> R<Vec<f32>> {
+    let mut held: BTreeMap<u32, (usize, usize, std::rc::Rc<Vec<f32>>)> = BTreeMap::new();
+    let mut out = Vec::with_capacity(g.len());
+    for &[v, row, col, flags] in g {
+        if v == NONE {
+            out.push(0.0);
+            continue;
+        }
+        if !held.contains_key(&v) {
+            held.insert(v, get(v)?);
+        }
+        let (rows, width, d) = &held[&v];
+        let at = if flags & FLAT != 0 {
+            col as usize % d.len().max(1)
+        } else {
+            let r = if flags & ONE != 0 && *rows == 1 {
+                0
+            } else {
+                row as usize
+            };
+            r * width + col as usize
+        };
+        let mut x = *d
+            .get(at)
+            .ok_or_else(|| format!("value %{v}: element {at} of {}", d.len()))?;
+        if flags & CLAMP != 0 {
+            x = x.clamp(-65504.0, 65504.0);
+        }
+        out.push(x);
+    }
+    Ok(out)
+}
+
+/// The words of `a` as values' elements, for an array a step's values fill (a region's
+/// resident, a unit's rows' scalars, a root's host rows); `None` for the rest.
+pub fn gather(p: &Program, a: &HostArray) -> R<Option<Gather>> {
+    let ieee = !p.round16;
+    let mut g: Gather = vec![[NONE, 0, 0, 0]; a.len as usize];
+    match &a.fill {
         Fill::Resident {
             unit,
             step,
@@ -215,61 +293,70 @@ fn fill(p: &Program, vals: &Values, a: &HostArray) -> R<Vec<f32>> {
             };
             let (at, _, _) = &b.regions[step];
             let input = &chain.ins[*param];
-            let (_, v) = vals.get(input.value)?;
-            let wlen = v.len();
             for e in 0..at.chunk {
-                let col = (input.from + r * at.chunk + e) as usize;
-                out[e as usize] = v[col % wlen];
+                g[e as usize] = [input.value.0, 0, input.from + r * at.chunk + e, FLAT];
             }
         }
         Fill::Scalars { unit, of } => {
             let b = &p.units[*unit];
             let ns = of.len();
             for t in 0..b.unit.rows {
-                let tr = trace_row(p, *unit, t);
+                let tr = trace_row(p, *unit, t) as u32;
                 for (i, &(step, param)) in of.iter().enumerate() {
                     let Step::Region { chain, .. } = &b.unit.steps[step] else {
                         return Err("a scalar of no region".into());
                     };
                     let input = &chain.ins[param];
-                    let (s, v) = vals.get(input.value)?;
-                    let w = *s.last().unwrap_or(&1);
-                    let rows = v.len() / w.max(1);
-                    let row = if rows == 1 { 0 } else { tr };
-                    out[t as usize * ns + i] = v[row * w + input.from as usize];
+                    g[t as usize * ns + i] = [input.value.0, tr, input.from, ONE];
                 }
             }
         }
         Fill::HostIn { unit, parts } => {
             let b = &p.units[*unit];
             let width: u32 = parts.iter().map(|x| x.2).sum();
+            let clamp = if ieee { CLAMP } else { 0 };
             for t in 0..b.unit.rows {
-                let tr = trace_row(p, *unit, t);
+                let tr = trace_row(p, *unit, t) as u32;
                 let mut o = 0;
                 for &(base, from, len) in parts {
-                    let (s, v) = vals.get(ValueId(base))?;
-                    let w = *s.last().unwrap_or(&1);
-                    let rows = v.len() / w.max(1);
-                    let row = if rows == 1 || b.unit.classes.is_empty() {
-                        0
+                    // a unit of no class (the lane prologue) reads a lane vector's first row
+                    let (row, one) = if b.unit.classes.is_empty() {
+                        (0, 0)
                     } else {
-                        tr
+                        (tr, ONE)
                     };
                     for e in 0..len {
-                        let mut x = v[row * w + (from + e) as usize];
-                        if ieee {
-                            x = x.clamp(-65504.0, 65504.0);
-                        }
-                        out[(t * width + o + e) as usize] = x;
+                        g[(t * width + o + e) as usize] = [base, row, from + e, one | clamp];
                     }
                     o += len;
                 }
             }
         }
-        Fill::HostOut { .. } | Fill::Stamps => {}
+        _ => return Ok(None),
     }
-    let _ = trace;
-    Ok(out)
+    Ok(Some(g))
+}
+
+/// Whether `v` is made from the step's inputs (so the host writes it each step), not from the
+/// weights alone.
+fn of_step(trace: &poem_ir::Trace, v: ValueId, memo: &mut BTreeMap<u32, bool>) -> bool {
+    use poem_ir::{Def, Operands};
+    if let Some(&m) = memo.get(&v.0) {
+        return m;
+    }
+    memo.insert(v.0, false);
+    let r = match &trace.values[v.0 as usize].def {
+        Def::Input(_) => true,
+        Def::Weight(_) | Def::Cache(_) => false,
+        Def::Merge(arms) => arms.iter().any(|&(a, _)| of_step(trace, a, memo)),
+        Def::Op(n) => {
+            let mut ins = Vec::new();
+            trace.nodes[*n as usize].op.inputs(&mut ins);
+            ins.into_iter().any(|i| of_step(trace, i, memo))
+        }
+    };
+    memo.insert(v.0, r);
+    r
 }
 
 /// The arrays grouped into memcpy rectangles: each group one symbol and length, its PEs a
@@ -325,6 +412,8 @@ pub fn write(p: &Program, arrays: &[HostArray], gold: &Path, out: &Path) -> R<()
         .iter()
         .filter(|a| !matches!(a.fill, Fill::HostOut { .. } | Fill::Stamps))
         .collect();
+    std::fs::create_dir_all(out.join("entries")).map_err(|e| e.to_string())?;
+    let mut memo = BTreeMap::new();
     let mut h2d = Vec::new();
     for (k, (x, y, w, h, members)) in rects(&ins).into_iter().enumerate() {
         let a0 = ins[members[0]];
@@ -347,7 +436,31 @@ pub fn write(p: &Program, arrays: &[HostArray], gold: &Path, out: &Path) -> R<()
                 &data,
             )?;
         }
-        h2d.push(json!({"sym": a0.sym, "x": x, "y": y, "w": w, "h": h, "len": a0.len, "u16": a0.u16, "file": file}));
+        let mut item = json!({"sym": a0.sym, "x": x, "y": y, "w": w, "h": h, "len": a0.len, "u16": a0.u16, "file": file});
+        // an entry: its words gathered from the step's values, a step at a time
+        let mut words: Vec<u32> = Vec::new();
+        let mut step = false;
+        for &m in &members {
+            match gather(p, ins[m])? {
+                Some(g) => {
+                    step |= g
+                        .iter()
+                        .any(|w| w[0] != NONE && of_step(&p.trace, ValueId(w[0]), &mut memo));
+                    words.extend(g.iter().flatten());
+                }
+                None => words.clear(),
+            }
+        }
+        if step && words.len() == members.len() * a0.len as usize * 4 {
+            let gfile = format!("entries/{k}.npy");
+            crate::npy::write_u32(
+                &out.join(&gfile),
+                &[h as usize, w as usize, a0.len as usize, 4],
+                &words,
+            )?;
+            item["entry"] = json!(gfile);
+        }
+        h2d.push(item);
     }
     // what is read back: the host rows out (their trace rows and columns), the stamps
     let mut d2h = Vec::new();
@@ -374,7 +487,30 @@ pub fn write(p: &Program, arrays: &[HostArray], gold: &Path, out: &Path) -> R<()
         .iter()
         .map(|&b| json!({"value": b, "file": vals.files.get(&b)}))
         .collect();
+    // the values read back, whole: the step's rows of each, its columns the parts read
+    let step_rows: u32 = p.class_rows.iter().map(|c| c.0).sum();
+    let mut outs: BTreeMap<u32, u32> = BTreeMap::new();
+    for a in arrays {
+        if let Fill::HostOut { parts, .. } = &a.fill {
+            for &(base, from, len) in parts {
+                let w = outs.entry(base).or_default();
+                *w = (*w).max(from + len);
+            }
+        }
+    }
+    let outs: Vec<serde_json::Value> = outs
+        .iter()
+        .map(|(v, w)| json!({"value": v, "rows": step_rows, "width": w}))
+        .collect();
+    let classes: Vec<serde_json::Value> = p
+        .shape
+        .program
+        .classes
+        .iter()
+        .map(|c| json!({"name": c.name, "word": c.word.to_string(), "rows": c.rows}))
+        .collect();
     let host = json!({
+        "model": p.trace.name, "reading": p.shape.reading, "classes": classes, "outs": outs,
         "w": p.stream.w, "h": p.stream.h, "h2d": h2d, "d2h": d2h, "refs": ref_files,
         "gold": gold.display().to_string(), "round16": p.round16,
         "units": p.units.iter().zip(&p.stream.units).map(|(b, su)| json!({
