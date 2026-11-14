@@ -707,12 +707,9 @@ impl Predicate {
                 take(entries * 4 * u64::from(ids.max(1))),
             ]
         });
-        let mut region = Buffer::zeroed(usize::try_from(at).unwrap_or(usize::MAX))?;
-        region.write(at_one, &1u32.to_le_bytes())?;
-        let identity: Vec<u8> = (0..=max_lanes)
-            .flat_map(|l| (l as i32).to_le_bytes())
-            .collect();
-        region.write(at_indptr, &identity)?;
+        // A run of the activation's span, laid by the load
+        // ([`Predicate::lay`]).
+        let region = Buffer::lent(usize::try_from(at).unwrap_or(usize::MAX));
         Ok(Predicate {
             region,
             at_one,
@@ -725,6 +722,28 @@ impl Predicate {
             snap_dirty: 0,
             lanes: max_lanes,
         })
+    }
+
+    /// The region's bytes.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.region.bytes() as u64
+    }
+
+    /// The region lies at `base` from here on: a run of the activation's
+    /// span the load holds backed and zeroed, of [`Predicate::bytes`]. Its
+    /// constants are written there: the one a fold always takes, and the
+    /// lanes' identity bounds.
+    pub fn lay(&mut self, base: u64) -> Result<()> {
+        self.region.lay(base);
+        self.region.write(self.at_one, &1u32.to_le_bytes())?;
+        let identity: Vec<u8> = (0..=self.lanes)
+            .flat_map(|l| (l as i32).to_le_bytes())
+            .collect();
+        self.region.write(self.at_indptr, &identity)?;
+        // What a fire left of its snapshots' bounds went with the old run.
+        self.snap_dirty = 0;
+        Ok(())
     }
 
     #[must_use]
