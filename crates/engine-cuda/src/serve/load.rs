@@ -58,8 +58,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     };
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     let engine = crate::chip::Engine::of(&chip);
-    let bodies_stated = boot.knobs.chip.is_some()
-        || crate::chip::states_recording(device.name(), boot.knobs.profiles.as_deref());
     if boot.budget.max_tokens == 0 {
         let params: u64 = boot
             .trace
@@ -450,7 +448,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     Ok(Baked {
         device,
         engine,
-        bodies_stated,
         compiled,
         budgets,
         profile,
@@ -755,7 +752,6 @@ impl Shell {
         let Baked {
             mut device,
             engine,
-            bodies_stated,
             compiled,
             budgets,
             profile,
@@ -1281,10 +1277,6 @@ impl Shell {
             golden_arm: Golden::Off,
             bodies: engine.recording.bodies(),
             bodies_mem: (engine.recording.bodies_mem() as usize).saturating_mul(1 << 20),
-            // An operator's allowance (the user's profile, or a pinned one)
-            // is a hard cap; a profile's default may stretch while arming.
-            bodies_stated,
-            bodies_ceiling: 0,
             workspace: None,
             decoded_tiles: Vec::new(),
             arming: false,
@@ -1382,40 +1374,12 @@ impl Shell {
             0
         };
         let resident = footprint(&shell);
-        // On ROCm, arming the tall buckets grows the kernels' scratch slabs
-        // (top-k scores, chunked-recurrence planes, attention partials) after
-        // this fit, by about the activation arena again at a 16K-token
-        // budget; held for them here, the cache rows leave the bodies the
-        // room they were allowed (GLM's mini armed 11 of 49 compositions
-        // without it, its prefill buckets walking eagerly). A hybrid's slots
-        // are cut at this fit for good, and on CUDA its chunked recurrence
-        // grows them the same way (Kimi-K3's mini: 3.1 GB of KDA planes at
-        // 8192 tokens left an RTX 5090's rows short of one sequence).
-        let scratch_growth = if (cfg!(feature = "rocm")
-            || shell.trace.nodes.iter().any(|node| {
-                matches!(
-                    node.op,
-                    poem_ir::Operation::Ssm(poem_ir::Ssm::KdaChunked { .. })
-                )
-            }))
-            && shell.records_bodies()
-        {
-            shell.arena.bytes()
-        } else {
-            0
-        };
-        let mut fitted = shell.pools.fit_the_card(
-            bodies,
-            held_for_fires.saturating_add(scratch_growth),
-            false,
-            !shell.bodies_stated,
-            &resident,
-        )?;
         // What the kernels' scratch slabs take, walked size-only through
         // the compositions the lattice fires before the range is first
         // backed: every slab is laid in the activation's span, past its
         // arenas, at the size the walk asked of it. A take answers its
-        // place, and nothing grows by allocation.
+        // place, and nothing grows by allocation. The fit comes after, so
+        // the cache rows take what the walk leaves.
         if shell.pools.fresh()
             && let Some(walked) = shell.size_arming()?
         {
@@ -1449,23 +1413,6 @@ impl Shell {
                 bytes: workspace,
                 slabs: placed,
             });
-            let first = (fitted.fit, fitted.chunks, fitted.room >> 20);
-            fitted = shell
-                .pools
-                .fit_the_card(bodies, held_for_fires, false, false, &resident)?;
-            if boot.knobs.diagnostics.arm_trace {
-                eprintln!(
-                    "[arm-trace] fit before arming: {} pages, {} chunks, room {} MiB guessed; \
-                     {} pages, {} chunks, room {} MiB walked (fresh {})",
-                    first.0,
-                    first.1,
-                    first.2,
-                    fitted.fit,
-                    fitted.chunks,
-                    fitted.room >> 20,
-                    shell.pools.fresh()
-                );
-            }
         }
         // A load that walked nothing lays the rs scratch for the most any
         // fire may ask.
@@ -1474,13 +1421,23 @@ impl Shell {
         {
             buffers.lay_reach(&mut shell.pools, false)?;
         }
-        // The most a profile's allowance may stretch to while arming.
-        shell.bodies_ceiling = usize::try_from(fitted.bodies).unwrap_or(usize::MAX);
+        let fitted = shell
+            .pools
+            .fit_the_card(bodies, held_for_fires, false, &resident)?;
+        if boot.knobs.diagnostics.arm_trace {
+            eprintln!(
+                "[arm-trace] fit before arming: {} pages, {} chunks, room {} MiB (fresh {})",
+                fitted.fit,
+                fitted.chunks,
+                fitted.room >> 20,
+                shell.pools.fresh()
+            );
+        }
         // The carves laid at the activation's end, backed where the range
         // now lies (the fit may have reserved it anew).
         shell.arena.ensure_rungs(&mut shell.pools)?;
         shell.lay_workspace()?;
-        let afforded = fitted.bodies - fitted.stretch;
+        let afforded = fitted.bodies;
         if afforded < bodies {
             eprintln!(
                 "engine-cuda: [engine] bodies_mem {} MiB is held down to {} MiB on this card: \
@@ -1639,7 +1596,7 @@ impl Staged {
         };
         let fitted = shell
             .pools
-            .fit_the_card(bodies, held_for_fires, settled, false, &resident)?;
+            .fit_the_card(bodies, held_for_fires, settled, &resident)?;
         if stepping {
             // The runtime is stated what the settled fit may come to, and
             // keeps the pool under it by what this fit holds back.
@@ -1771,7 +1728,7 @@ impl Shell {
         let before = (self.pools.declared_bytes(), self.pools.kept_back_bytes());
         let fitted = self
             .pools
-            .fit_the_card(0, self.card.2, true, false, &resident)?;
+            .fit_the_card(0, self.card.2, true, &resident)?;
         self.state_live();
         if super::diag::on().arm_trace {
             eprintln!(
@@ -2100,9 +2057,6 @@ fn adapter_fact(classes: &poem_ir::ClassTable, corrected: &poem_ir::ClassSet) ->
 pub(super) struct Baked {
     pub(super) device: Context,
     pub(super) engine: crate::chip::Engine,
-    /// The bodies' allowance is the operator's (a user or pinned profile
-    /// states `[engine] recording`): a hard cap.
-    pub(super) bodies_stated: bool,
     pub(super) compiled: CompiledModel,
     pub(super) budgets: Budgets,
     pub(super) profile: DeviceProfile,

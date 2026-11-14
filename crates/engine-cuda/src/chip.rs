@@ -423,22 +423,6 @@ pub fn pinned(graphs: Graphs, recording: Option<Recording>) -> Profile {
     profile(&text)
 }
 
-/// Whether the user's profile for `device` states `[engine] recording`: an
-/// operator's bodies allowance, a hard cap, where a checked-in profile's is
-/// a default the fit may stretch.
-#[must_use]
-pub fn states_recording(device: &str, profiles: Option<&Path>) -> bool {
-    let Some(profiles) = profiles else {
-        return false;
-    };
-    let Ok(text) = std::fs::read_to_string(SHELF.user_path(profiles, device)) else {
-        return false;
-    };
-    registry()
-        .parse(&text, "user", profile::Strict::User)
-        .is_ok_and(|file| file.entries.contains_key("engine.recording"))
-}
-
 /// Resolve the profile one load runs under: its compute capability's
 /// family file, the file for this GPU, then the user's.
 #[must_use]

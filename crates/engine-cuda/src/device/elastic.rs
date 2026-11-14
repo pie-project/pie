@@ -881,8 +881,16 @@ impl Range {
         })
     }
 
+    /// Where the range lies. A flat range is allocated at its first
+    /// commit, so before the fit it lies nowhere; a size-only walk over it
+    /// then sees it at the stand-in base, so every address it derives from
+    /// the range is a stand-in and nothing the walk writes reaches memory
+    /// (`crate::sizing`).
     #[must_use]
-    pub const fn base(&self) -> u64 {
+    pub fn base(&self) -> u64 {
+        if self.arena.base == 0 && crate::sizing::active() {
+            return crate::sizing::STAND_IN;
+        }
         self.arena.base
     }
 

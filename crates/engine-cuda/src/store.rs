@@ -114,11 +114,8 @@ pub struct Fitted {
     pub fit: u64,
     pub room: u64,
     pub held: u64,
-    /// What the bodies are held, a stretch included.
+    /// What the bodies are held.
     pub bodies: u64,
-    /// Of `bodies`, what a profile's allowance may stretch into while
-    /// arming, past the allowance the card affords.
-    pub stretch: u64,
     pub spare: u64,
     pub chunks: u32,
 }
@@ -127,10 +124,6 @@ pub struct Fitted {
 /// room: enough for the decode bodies, which are what a serve replays every
 /// step and cost tens of megabytes each.
 pub const BODIES_FLOOR_BYTES: u64 = 512 << 20;
-
-/// The share of the cache rows' room a profile's default bodies allowance
-/// may stretch into while the lattice arms: a twentieth.
-pub const BODIES_STRETCH: u64 = 20;
 
 /// What the graph bodies may take on this card: the configured allowance,
 /// or a quarter of `room` — what is left for them and the cache rows once
@@ -1097,9 +1090,7 @@ impl Pools {
 
     /// What the bodies may still take while the lattice arms: the device's
     /// free bytes past the cache rows' reserve, or `room` where the device
-    /// has that free. A fit before arming that held the bodies more (a
-    /// profile's allowance stretched) declared the cache rows less, so its
-    /// hold shows here.
+    /// has that free.
     pub fn spare_bytes_for_bodies(&self, room: u64) -> Result<u64> {
         let live = self.pool.spare_bytes(0)?;
         Ok(live
@@ -1232,17 +1223,12 @@ impl Pools {
     /// since a pool under it is no deployment. `resident` spells what is on
     /// the device already, for the refusal when not even that fits.
     /// `settled` says the activation has reached its high water: every
-    /// composition fired while the bodies armed. `stretch`: the allowance is
-    /// a profile's default, not the operator's, and the fit before arming
-    /// holds the bodies a twentieth of the cache rows' room past it, so a
-    /// lattice the default does not arm whole may take it
-    /// (`Shell::fit_lattice`); the settled fit gives back what they left.
+    /// composition fired while the bodies armed.
     pub fn fit_the_card(
         &mut self,
         bodies: u64,
         programs: u64,
         settled: bool,
-        stretch: bool,
         resident: &dyn core::fmt::Display,
     ) -> Result<Fitted> {
         // What the load dropped and the process keeps for reuse is free
@@ -1294,15 +1280,6 @@ impl Pools {
                 need
             });
         let (bodies, programs) = holds_within(bodies, programs, live.saturating_sub(claim));
-        let stretch = if stretch && !settled && self.budget.is_none() {
-            live.saturating_sub(claim)
-                .saturating_sub(bodies)
-                .saturating_sub(programs)
-                / BODIES_STRETCH
-        } else {
-            0
-        };
-        let bodies = bodies.saturating_add(stretch);
         let held = programs.saturating_add(bodies);
         let room = live.saturating_sub(held);
         if let Some(budget) = self.budget.filter(|&budget| budget > room) {
@@ -1426,7 +1403,6 @@ impl Pools {
             room,
             held,
             bodies,
-            stretch,
             spare: live.saturating_sub(need).saturating_sub(programs),
             chunks: fitted,
         })
