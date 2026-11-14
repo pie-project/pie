@@ -203,17 +203,18 @@ pub fn group_mask_bytes(ragged: usize, tokens: u32, lanes: u32) -> u64 {
     ragged as u64 * (indptr.next_multiple_of(ALIGN) + bits.next_multiple_of(ALIGN))
 }
 
-/// Where a fire's staged inputs lie: `bytes` from `local` of `view` as
-/// kernels bind them, written on the host through `host` (the bytes'
-/// host address, contiguous runs of it) or, where it is a buffer of its
-/// own, through the buffer.
+/// Where a fire's staged inputs or readout lie in the activation span:
+/// `bytes` from `local` of `view` as kernels bind them, written and read
+/// on the host through `host` (the bytes' host address, contiguous runs
+/// of it), which only the current rung's regions hold.
 #[derive(Debug)]
 pub struct Region {
     view: Buffer,
     local: u64,
     bytes: u64,
     /// `(from, len, address)`: the region's bytes from `from` lie at
-    /// `address` on the host. Empty for a region that is its buffer.
+    /// `address` on the host. Empty off the current rung: nothing writes
+    /// or reads it there.
     host: Vec<(u64, u64, std::ptr::NonNull<u8>)>,
 }
 
@@ -222,31 +223,42 @@ pub struct Region {
 unsafe impl Send for Region {}
 
 impl Region {
-    /// A buffer of its own, the whole of it.
+    /// `bytes` the span has yet to place ([`Region::place`]): nothing
+    /// binds or writes it before.
     #[must_use]
-    pub fn of(buffer: Buffer) -> Region {
+    pub fn unplaced(bytes: u64, empty: Buffer) -> Region {
         Region {
+            view: empty,
             local: 0,
-            bytes: buffer.bytes(),
-            view: buffer,
+            bytes,
             host: Vec::new(),
         }
     }
 
-    /// `bytes` from `local` of `view`, written through `host`.
-    #[must_use]
-    pub fn at_place(
-        view: Buffer,
-        local: u64,
-        bytes: u64,
-        host: Vec<(u64, u64, std::ptr::NonNull<u8>)>,
-    ) -> Region {
-        Region {
-            view,
-            local,
-            bytes,
-            host,
+    /// Lays the region at `local` of `view` (the span's buffer), unhosted
+    /// until [`Region::rehost`].
+    pub fn place(&mut self, view: Buffer, local: u64) {
+        self.view = view;
+        self.local = local;
+        self.host = Vec::new();
+    }
+
+    /// Its host runs once its heaps are mapped (its rung raised to), the
+    /// bytes zeroed as a buffer of its own starts; empty when its rung
+    /// is left, so nothing writes the heaps another rung lays there.
+    pub fn rehost(&mut self, host: Vec<(u64, u64, std::ptr::NonNull<u8>)>) -> Result<()> {
+        let hosted = !host.is_empty();
+        self.host = host;
+        if hosted {
+            self.zero_span(0, self.bytes)?;
         }
+        Ok(())
+    }
+
+    /// Where the region lies in its view, and its bytes.
+    #[must_use]
+    pub fn extent(&self) -> (u64, u64) {
+        (self.local, self.bytes)
     }
 
     /// The buffer kernels bind.
@@ -274,7 +286,7 @@ impl Region {
     ) -> Result<()> {
         if at.saturating_add(len) > self.bytes {
             return Err(Fault::Ceiling {
-                what: "bytes of a fire's staged inputs",
+                what: "bytes of a fire's staged region",
                 need: at.saturating_add(len),
                 have: self.bytes,
             });
@@ -287,7 +299,7 @@ impl Region {
                 .iter()
                 .find(|(from, run, _)| here >= *from && here < from + run)
                 .ok_or(Fault::Ceiling {
-                    what: "host-mapped bytes of a fire's staged inputs",
+                    what: "host-mapped bytes of a fire's staged region (its rung current)",
                     need: here + 1,
                     have: self.bytes,
                 })?;
@@ -301,9 +313,6 @@ impl Region {
     }
 
     pub fn write(&mut self, at: u64, from: &[u8]) -> Result<()> {
-        if self.host.is_empty() {
-            return self.view.write(self.local + at, from);
-        }
         self.walk(at, from.len() as u64, |to, done, take| {
             // SAFETY: `walk` hands `take` mapped bytes at `to`, distinct
             // from `from`'s host allocation.
@@ -318,10 +327,22 @@ impl Region {
         })
     }
 
+    pub fn read(&self, at: u64, into: &mut [u8]) -> Result<()> {
+        let len = into.len() as u64;
+        self.walk(at, len, |from, done, take| {
+            // SAFETY: as `write`, the other way.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    from.as_ptr(),
+                    into.as_mut_ptr()
+                        .add(usize::try_from(done).unwrap_or(usize::MAX)),
+                    usize::try_from(take).unwrap_or(usize::MAX),
+                );
+            }
+        })
+    }
+
     pub fn zero_span(&mut self, at: u64, len: u64) -> Result<()> {
-        if self.host.is_empty() {
-            return self.view.zero_span(self.local + at, len);
-        }
         self.walk(at, len, |to, _, take| {
             // SAFETY: as `write`.
             unsafe {
@@ -364,9 +385,9 @@ pub struct Inputs {
     rs_commit: u64,
     rs_snaps: u64,
     rs_pages: u64,
-    /// Staged apart from the store, sized at the load for the widest fire
-    /// where the model packs attention groups ([`group_mask_bytes`]).
-    group_masks: Option<Buffer>,
+    /// The group masks' room in the store, sized for the widest fire where
+    /// the model packs attention groups ([`group_mask_bytes`]).
+    group_masks: (u64, u64),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -507,11 +528,18 @@ impl Inputs {
             u64::from(kernels_metal::ssm::RS_SNAPSHOTS) * (bands.len().max(1) as u64 + width);
         let rs_snaps = take(lanes * snap_ints.max(u64::from(SNAP_INTS)) * 4);
         let rs_pages = take(lanes * u64::from(crate::rs::PAGE_INTS) * 4);
+        let mask_bytes = if ragged == 0 {
+            0
+        } else {
+            group_mask_bytes(ragged, budget.max_tokens, budget.max_lanes)
+        };
+        let group_masks = (take(mask_bytes), mask_bytes);
         let total = at;
 
-        let store = Buffer::zeroed(device, total)?;
+        // Laid in the activation span with the fire's other staged regions
+        // ([`Region::place`]); nothing of its own.
         Ok(Inputs {
-            store: Region::of(store),
+            store: Region::unplaced(total, Buffer::zeroed(device, 0)?),
             tokens,
             positions,
             windows,
@@ -545,14 +573,7 @@ impl Inputs {
             rs_commit,
             rs_snaps,
             rs_pages,
-            group_masks: if ragged == 0 {
-                None
-            } else {
-                Some(Buffer::zeroed(
-                    device,
-                    group_mask_bytes(ragged, budget.max_tokens, budget.max_lanes),
-                )?)
-            },
+            group_masks,
         })
     }
 
@@ -579,20 +600,16 @@ impl Inputs {
             image.resize((image.len() as u64).next_multiple_of(ALIGN) as usize, 0);
             placed.push((indptr, bits));
         }
-        let have = self.group_masks.as_ref().map_or(0, Buffer::bytes);
-        let Some(buffer) = self
-            .group_masks
-            .as_mut()
-            .filter(|held| held.bytes() >= image.len() as u64)
-        else {
+        let (base, have) = self.group_masks;
+        if image.len() as u64 > have {
             return Err(Fault::Ceiling {
                 what: "bytes of the group masks sized at the load",
                 need: image.len() as u64,
                 have,
             });
-        };
-        buffer.write(0, &image)?;
-        let buffer = &*buffer;
+        }
+        self.store.write(base, &image)?;
+        let buffer = self.store.view();
         masks
             .iter()
             .zip(placed)
@@ -602,7 +619,7 @@ impl Inputs {
                     q: *q,
                     kv: *kv,
                     bits: Tensor::new(
-                        handles.bind(buffer, bits, bytes)?,
+                        handles.bind(buffer, self.store.at(base + bits), bytes)?,
                         u32::try_from(bytes).unwrap_or(u32::MAX),
                         1,
                         Dtype::U8,
@@ -610,7 +627,7 @@ impl Inputs {
                     indptr: i32s(
                         handles,
                         buffer,
-                        indptr,
+                        self.store.at(base + indptr),
                         u32::try_from(mask.indptr.len()).unwrap_or(u32::MAX),
                     )?,
                 })
@@ -642,10 +659,9 @@ impl Inputs {
         self.store.bytes()
     }
 
-    /// The group mask buffer, sized at the load.
-    #[must_use]
-    pub fn group_mask_bytes(&self) -> u64 {
-        self.group_masks.as_ref().map_or(0, Buffer::bytes)
+    /// The store, laid in the span ([`Region::place`]).
+    pub fn store_mut(&mut self) -> &mut Region {
+        &mut self.store
     }
 
     pub fn write(&mut self, handles: &crate::device::Handles, fire: &Fire<'_>) -> Result<Handles> {

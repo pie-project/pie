@@ -602,6 +602,36 @@ impl Pool {
         }
     }
 
+    /// `len` bytes from `offset` of the buffer as host runs `(from, len,
+    /// address)`, `from` counted from `offset`: one per heap they cross,
+    /// valid while those heaps stay mapped; the caller writes through them
+    /// only where no frame in flight reads them.
+    pub fn host_runs(
+        &self,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<(u64, u64, std::ptr::NonNull<u8>)>> {
+        let mut runs = Vec::new();
+        let mut done = 0;
+        while done < len {
+            let here = offset + done;
+            #[cfg(target_vendor = "apple")]
+            let seam = elastic::CHUNK;
+            #[cfg(not(target_vendor = "apple"))]
+            let seam = u64::MAX;
+            let take = (len - done).min(seam - here % seam);
+            let address = match &self.backing {
+                #[cfg(not(target_vendor = "apple"))]
+                Backing::Flat(buffer) => buffer.host_span(here, take)?,
+                #[cfg(target_vendor = "apple")]
+                Backing::Sparse { store, .. } => store.host_span(here, take)?,
+            };
+            runs.push((done, take, address));
+            done += take;
+        }
+        Ok(runs)
+    }
+
     /// `into.len()` bytes from `offset`, read on the host.
     pub fn read(&self, offset: u64, into: &mut [u8]) -> Result<()> {
         match &self.backing {
