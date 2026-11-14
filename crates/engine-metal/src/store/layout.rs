@@ -66,14 +66,6 @@ pub struct WindowList {
 /// The chunk an on-device Metal recipe aims at.
 pub const TARGET_CHUNK: u64 = 2 << 20;
 
-#[must_use]
-pub fn gcd(mut a: u64, mut b: u64) -> u64 {
-    while b != 0 {
-        (a, b) = (b, a % b);
-    }
-    a
-}
-
 /// One slot shape's place in the pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Slots {
@@ -397,13 +389,6 @@ impl Layout {
     #[must_use]
     pub fn seat_chunks(&self) -> u32 {
         self.shapes().map(Slots::seat_chunks).sum()
-    }
-
-    /// What an rs-list page id counts: `gcd(chunk, rs slot)`.
-    #[must_use]
-    pub fn rs_stride(&self) -> u64 {
-        self.rs
-            .map_or(256, |rs| gcd(self.chunk_bytes, rs.slot_bytes))
     }
 
     /// The chunks one working set at `pages` kv pages takes beside the null

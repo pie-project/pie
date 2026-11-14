@@ -34,19 +34,39 @@ constant ulong pie_fc_pool_delta3 [[function_constant(5)]];
 constant bool pie_pool_split =
     is_function_constant_defined(pie_fc_pool_split) && pie_fc_pool_split;
 
+// A page id names a slot (`engine-metal`'s `store::pool::PageIds`): under
+// its buffer, its slot in the buffer where every paged shape's slots tile a
+// chunk, else its chunk in the buffer over `pie_fc_slot_shift` bits and its
+// index in that chunk under them, a chunk being `pie_fc_chunk_bytes`. Load
+// constants: a pool whose slots tile its chunks compiles to `page * stride`.
+constant bool pie_fc_slot_split [[function_constant(6)]];
+constant uint pie_fc_slot_shift [[function_constant(7)]];
+constant ulong pie_fc_chunk_bytes [[function_constant(8)]];
+constant bool pie_slot_split =
+    is_function_constant_defined(pie_fc_slot_split) && pie_fc_slot_split;
+
 // Where page `page` starts, from the plane bound in the first buffer, in
 // units of `unit` bytes (an element's, or 1 for bytes): `stride` units a
-// page.
+// page (a slot).
 inline ulong pie_page_at(uint page, ulong stride, ulong unit) {
-  if (!pie_pool_split) {
+  if (!pie_pool_split && !pie_slot_split) {
     return ulong(page) * stride;
+  }
+  const uint local = pie_pool_split ? page & 0x1fffffffu : page;
+  const ulong at =
+      pie_slot_split
+          ? ulong(local >> pie_fc_slot_shift) * (pie_fc_chunk_bytes / unit) +
+                ulong(local & ((1u << pie_fc_slot_shift) - 1u)) * stride
+          : ulong(local) * stride;
+  if (!pie_pool_split) {
+    return at;
   }
   const uint part = page >> 29;
   const ulong delta = part == 0u   ? 0ul
                       : part == 1u ? pie_fc_pool_delta1
                       : part == 2u ? pie_fc_pool_delta2
                                    : pie_fc_pool_delta3;
-  return ulong(page & 0x1fffffffu) * stride + ulong(long(delta) / long(unit));
+  return at + ulong(long(delta) / long(unit));
 }
 
 struct pie_kv_layout {

@@ -9,7 +9,7 @@ use kernels_metal::{KvPool, RecurrentPool, StateMap, Tensor};
 use poem_compiler::chunk::{ChunkRecipe, RowId, SlotLayout};
 use poem_ir::{CacheRow, Dtype, Trace};
 
-use super::layout::{FIXED, LIST, Layout, MAX_WINDOWS, RS, Slots, WINDOWS, gcd};
+use super::layout::{FIXED, LIST, Layout, MAX_WINDOWS, RS, Slots, WINDOWS};
 use super::pool::Pool;
 use super::{
     STATE_MAP_BYTES, Seats, Spill, TableSeat, compressed_rows, elem_bytes, elem_size, narrow,
@@ -674,7 +674,7 @@ impl Pools {
 
     /// The pool `layout` sizes over `rows`, kv pages of `paging`'s size.
     pub fn reserve(device: &Context, rows: Rows, layout: Layout, paging: Paging) -> Result<Pools> {
-        let pool = Pool::reserve(
+        let mut pool = Pool::reserve(
             device,
             layout.chunk_bytes,
             layout.total_chunks,
@@ -682,23 +682,22 @@ impl Pools {
             layout.act_span(),
             super::pool::part_cap(device),
         )?;
-        // A page id carries its slot in its buffer under the buffer index:
-        // a buffer may hold no more slots of a shape than those bits count.
-        if pool.parts() > 1 {
-            let room = 1u64 << super::pool::PART_SHIFT;
-            if let Some(slots) = layout
-                .shapes()
-                .find(|slots| u64::from(slots.per_chunk) * u64::from(pool.part_chunks()) >= room)
-            {
-                return Err(Fault::Residency(format!(
-                    "a buffer of {} chunks holds {} slots of {} bytes, and a page id \
-                     addresses {room} a buffer",
-                    pool.part_chunks(),
-                    u64::from(slots.per_chunk) * u64::from(pool.part_chunks()),
-                    slots.slot_bytes
-                )));
-            }
-        }
+        // A page id names its slot under its buffer index, by its slot in
+        // the buffer or by its chunk and index (`PageIds`): the paged shapes
+        // (kv list, window lists, rs list) decide which, refused by name
+        // where the bits do not hold them.
+        let paged: Vec<(u32, u64)> = layout
+            .list
+            .iter()
+            .chain(
+                (0..MAX_WINDOWS)
+                    .filter_map(|k| layout.window(k))
+                    .map(|w| &w.slots),
+            )
+            .chain(layout.rs.iter())
+            .map(|slots| (slots.per_chunk, slots.slot_bytes))
+            .collect();
+        pool.split_slots(&paged)?;
         let list_slots = layout.list.map_or(0, |list| {
             u64::from(list.per_chunk) * u64::from(layout.total_chunks)
         });
@@ -867,11 +866,10 @@ impl Pools {
     }
 
     /// A lane's rs-list pages as kernels address them, in token order from
-    /// the verb's base: `refs` (rs-list slot refs) as units of
-    /// [`Layout::rs_stride`], or, seat-addressed, seat `seat`'s run.
+    /// the verb's base: `refs` (rs-list slot refs) as page ids
+    /// ([`super::pool::PageIds`]), or, seat-addressed, seat `seat`'s run.
     pub fn rs_pages(&self, refs: &[u32], seat: Option<u32>) -> Result<Vec<u32>> {
         let rs = *self.shape(RS)?;
-        let stride = self.layout.rs_stride();
         refs.iter()
             .enumerate()
             .map(|(at, &r)| {
@@ -882,10 +880,9 @@ impl Pools {
                     }
                     None => r,
                 };
-                let offset = self.slot_offset(RS, slot)?;
-                self.pool
-                    .admit(u32::try_from(offset / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
-                Ok(self.pool.page_id(offset, stride))
+                let physical = self.physical(RS, slot)?;
+                self.pool.admit(physical / rs.per_chunk.max(1))?;
+                Ok(self.pool.slot_page(physical, rs.per_chunk))
             })
             .collect()
     }
@@ -1181,18 +1178,18 @@ impl Pools {
             .unwrap_or(0)
     }
 
-    /// What window list `k`'s page id counts: `gcd(chunk, window slot)`
-    /// bytes.
+    /// A window list `k` page's bytes: what its page id steps by in a
+    /// chunk ([`super::pool::PageIds`]).
     fn window_stride(&self, k: usize) -> u64 {
-        self.layout.window(k).map_or(256, |window| {
-            gcd(self.layout.chunk_bytes, window.slots.slot_bytes)
-        })
+        self.layout
+            .window(k)
+            .map_or(0, |window| window.slots.slot_bytes)
     }
 
     /// A lane's pages of window list `k` as kernels address them, one a
     /// window slot (`T_w` tokens) in token order: `refs` (window slot refs,
-    /// 0 a slot trimmed behind the window: the null chunk) as units of
-    /// [`Pools::window_stride`], or, seat-addressed, seat `seat`'s run,
+    /// 0 a slot trimmed behind the window: the null chunk) as page ids
+    /// ([`super::pool::PageIds`]), or, seat-addressed, seat `seat`'s run,
     /// `pages` of them.
     pub fn window_pages(
         &self,
@@ -1202,15 +1199,13 @@ impl Pools {
     ) -> Result<Vec<u32>> {
         let id = WINDOWS[k.min(MAX_WINDOWS - 1)];
         let window = *self.shape(id)?;
-        let stride = self.window_stride(k);
         let unit = |slot: u32| -> Result<u32> {
             if slot == 0 {
                 return Ok(0);
             }
-            let at = self.slot_offset(id, slot)?;
-            self.pool
-                .admit(u32::try_from(at / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
-            Ok(self.pool.page_id(at, stride))
+            let physical = self.physical(id, slot)?;
+            self.pool.admit(physical / window.per_chunk.max(1))?;
+            Ok(self.pool.slot_page(physical, window.per_chunk))
         };
         if let Some((slot, pages)) = seat
             && refs.is_empty()
@@ -1429,6 +1424,20 @@ impl Pools {
     #[must_use]
     pub fn deltas(&self) -> Vec<u64> {
         self.pool.deltas()
+    }
+
+    /// How a page id names its slot ([`super::pool::PageIds`]).
+    #[must_use]
+    pub fn page_ids(&self) -> super::pool::PageIds {
+        self.pool.page_ids()
+    }
+
+    /// Each of the range's buffers, the first first.
+    #[must_use]
+    pub fn part_views(&self) -> Vec<Buffer> {
+        (0..self.pool.parts())
+            .map(|at| self.pool.part_view(at).clone())
+            .collect()
     }
 
     /// The buffer the activation span lies in (the last), where in it the
