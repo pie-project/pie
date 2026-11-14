@@ -1100,7 +1100,9 @@ impl PreparedLoad<'_> {
         // them (`span_backed_on_demand`), it counts the span backed from the
         // load, so the load backs it.
         pools.commit_span(pools.span_segments())?;
-        pools.cover(arena.scratch_room())?;
+        // The smallest rung's fire is backed from the load, so a raise the
+        // system refuses always has a rung in hand to cut back to.
+        pools.cover(arena.floor_reach())?;
         pools.zero_span(arena.scratch_at(), scratch.bytes())?;
         scratch.seat(pools.view().clone(), arena.scratch_at());
         pools.seat_weights(weight_caches);
