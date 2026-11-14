@@ -533,7 +533,11 @@ impl Elastic {
     /// second pin, a `from` off a chunk seam or under the mapped bottom, or a
     /// heap or the mapping queue refusing.
     pub fn pin_top(&mut self, from: u64) -> Result<()> {
-        if !self.top.is_empty() || !from.is_multiple_of(CHUNK) || from < self.committed || from >= self.len {
+        if !self.top.is_empty()
+            || !from.is_multiple_of(CHUNK)
+            || from < self.committed
+            || from >= self.len
+        {
             return Err(Fault::Device {
                 call: "elastic pinned top",
                 why: format!(

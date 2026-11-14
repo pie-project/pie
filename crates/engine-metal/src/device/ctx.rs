@@ -107,7 +107,7 @@ pub struct Context {
     /// tile, and a second command queue is a scheduler context in the
     /// driver. `None` inside once opened means the device is not Metal 4.
     #[cfg(target_vendor = "apple")]
-    sparse: std::cell::OnceCell<Option<std::sync::Arc<super::sparse::Sparse>>>,
+    sparse: std::cell::OnceCell<std::sync::Arc<super::sparse::Sparse>>,
     /// What [`Frame::barrier`] signals and waits on, and the value it last set.
     #[cfg(target_vendor = "apple")]
     barrier: (Retained<ProtocolObject<dyn MTLEvent>>, std::cell::Cell<u64>),
@@ -346,23 +346,11 @@ impl Context {
         &self.device
     }
 
-    /// Whether this device can map sparse buffer tiles: `MTLGPUFamilyMetal4`.
-    #[must_use]
-    pub fn supports_elastic(&self) -> bool {
-        #[cfg(target_vendor = "apple")]
-        {
-            super::sparse::Sparse::supported(&self.device)
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            false
-        }
-    }
-
-    /// The mapping side, opened on first ask; `None` when the device is not
-    /// Metal 4. Its residency set is attached to this context's frame queue.
+    /// The mapping side, opened on first ask: every pool and span is a
+    /// placement sparse buffer over it. Its residency set is attached to
+    /// this context's frame queue.
     #[cfg(target_vendor = "apple")]
-    pub fn sparse(&self) -> Result<Option<std::sync::Arc<super::sparse::Sparse>>> {
+    pub fn sparse(&self) -> Result<std::sync::Arc<super::sparse::Sparse>> {
         if let Some(opened) = self.sparse.get() {
             return Ok(opened.clone());
         }
@@ -381,10 +369,7 @@ impl Context {
     ) -> Result<bool> {
         #[cfg(target_vendor = "apple")]
         {
-            let Some(sparse) = self.sparse()? else {
-                return Ok(false);
-            };
-            sparse.hold(slabs, keep);
+            self.sparse()?.hold(slabs, keep);
             Ok(true)
         }
         #[cfg(not(target_vendor = "apple"))]

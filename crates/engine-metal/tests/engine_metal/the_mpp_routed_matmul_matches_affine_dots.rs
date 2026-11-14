@@ -24,9 +24,6 @@ fn every_routed_row_answers_its_experts_exact_affine_reference() {
         return;
     };
     // MPP ships with Metal 4, which is what the elastic pool asks of the device too.
-    if !device.supports_elastic() {
-        return;
-    }
     let handles = Handles::new();
     let pipelines = Pipelines::new();
     // Every pair count sorts, so a lone pair per expert still takes the
