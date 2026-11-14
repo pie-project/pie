@@ -322,6 +322,16 @@ impl Module {
         if cubin.is_empty() {
             return Err(Fault::program("cuModuleLoadData", "the cubin is empty"));
         }
+        // A kernel that asks HIP for a buffer at its first launch would
+        // allocate on the device after the load: refused by name. A guest
+        // kernel's scratch (the fused body's spills) is said instead: ROCr
+        // grows the queue's scratch at its first dispatch.
+        #[cfg(feature = "rocm")]
+        for (kernel, ask) in kernels_cuda::hip::code_object::refuse_late_buffers_but_scratch(cubin)
+            .map_err(|why| Fault::program("cuModuleLoadData", why))?
+        {
+            eprintln!("engine-cuda: guest kernel {kernel} asks the HIP runtime for {ask}");
+        }
         #[cfg(feature = "device")]
         {
             use crate::device::dr;
