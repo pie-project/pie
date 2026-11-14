@@ -77,6 +77,14 @@ impl Mover for Lane {
             .map_err(|error| error.to_string())
     }
 
+    async fn set_rung(&self, from: u32, to: u32) -> Result<(), String> {
+        self.0
+            .lock()
+            .unwrap()
+            .set_rung(from, to)
+            .map_err(|error| error.to_string())
+    }
+
     fn epoch_now(&self) -> u64 {
         0
     }
@@ -395,6 +403,9 @@ async fn a_bind_whose_room_is_refused_fails_its_wait() {
     impl Mover for NoCopy {
         async fn evacuate(&self, _evacuation: EngineEvacuation) -> Result<(), String> {
             Err("the engine refuses".into())
+        }
+        async fn set_rung(&self, _from: u32, _to: u32) -> Result<(), String> {
+            Ok(())
         }
         fn epoch_now(&self) -> u64 {
             0

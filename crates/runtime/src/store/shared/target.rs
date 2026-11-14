@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 
-use super::{RungStep, RungWalk, SegmentMove, Shared, SharedPool};
+use super::{RungStep, RungWalk, SegmentMove, Shared};
 use crate::governor::{Demand, Growth, PATIENCE, PoolTarget, Retarget};
 use crate::scheduler::worker::PoolOp;
 use crate::store::registry;
@@ -183,44 +183,38 @@ impl SharedGrow {
                         }
                         pool.lower_rung(rung)
                     };
-                    if let Err(error) = lowered {
-                        tracing::warn!(engine = self.engine, %error, "the activation rung stays");
-                        return;
-                    }
+                    let notice = match lowered {
+                        Ok(notice) => notice,
+                        Err(error) => {
+                            tracing::warn!(engine = self.engine, %error, "the activation rung stays");
+                            return;
+                        }
+                    };
                     tracing::info!(engine = self.engine, rung, "the activation rung is lowered");
+                    // Past the retire fence: the engine may give back the
+                    // carve above the new rung. A failed notice is no
+                    // fault.
+                    if let Some((from, to)) = notice
+                        && let Err(error) =
+                            crate::scheduler::pool(self.engine, PoolOp::Rung { from, to }).await
+                    {
+                        tracing::warn!(engine = self.engine, %error, from, to, "a lower's notice was refused");
+                    }
                     if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
                         planner.pages_freed();
                     }
                 }
                 RungStep::Raise { rung, evacuation } => {
-                    if self.shared.lock().unwrap().raise_waits(&evacuation) {
-                        tracing::info!(
-                            engine = self.engine,
-                            rung,
-                            moves = evacuation.moves.len(),
-                            "a raise moves state out of the span; fires wait on its copy"
-                        );
-                        let moves = SharedPool::rung_moves(&evacuation);
-                        let copied =
-                            crate::scheduler::pool(self.engine, PoolOp::Evacuate(moves)).await;
-                        if let Err(error) = copied {
-                            // The engine refused the copy or its carve:
-                            // the raise is taken back, fires stay cut to
-                            // the rung in hand, and a later walk may try
-                            // again.
-                            tracing::warn!(
-                                engine = self.engine,
-                                %error,
-                                "a raise was refused; fires stay at the rung in hand"
-                            );
-                            self.shared.lock().unwrap().raise_refused(&evacuation);
-                            return;
-                        }
-                        let (current, _) = self.epochs();
-                        self.shared
-                            .lock()
-                            .unwrap()
-                            .raise_copied(current.saturating_add(1));
+                    // The engine backs its carve (on demand) and copies what
+                    // the raise moves; refused, the raise is taken back,
+                    // fires stay cut to the rung in hand, and a later walk
+                    // may try again.
+                    let mover = super::programs::LaneMover {
+                        engine: self.engine,
+                        epoch_now: || self.epochs().0,
+                    };
+                    if !super::programs::carry_raise(&self.shared, &evacuation, &mover).await {
+                        return;
                     }
                     tracing::info!(
                         engine = self.engine,

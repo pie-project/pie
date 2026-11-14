@@ -1321,15 +1321,26 @@ impl SharedPool {
     }
 
     /// Whether `evacuation`'s raise goes through the engine before fires
-    /// take it: it moves state, which the engine copies first.
+    /// take it: it moves state, which the engine copies first, or the span
+    /// is backed on demand, where the engine backs its carve for the wider
+    /// rung first (`Engine::set_rung`). With the span backed from the load,
+    /// a move-free raise makes no lane trip.
     #[must_use]
     pub fn raise_waits(&self, evacuation: &RungEvacuation) -> bool {
-        !evacuation.moves.is_empty()
+        !evacuation.moves.is_empty() || self.pool.span_on_demand()
     }
 
-    /// The engine refused `evacuation`'s copy: the raise is taken back, the
-    /// state where it lay and the activation the rung in hand's. Fires stay
-    /// cut to it; a later raise may try again. Nothing faults.
+    /// Whether every rung change is told the engine (`Engine::set_rung`):
+    /// the span is backed on demand.
+    #[must_use]
+    pub fn tells_rungs(&self) -> bool {
+        self.pool.span_on_demand()
+    }
+
+    /// The engine refused `evacuation`'s raise (its carve for the wider
+    /// rung, or the copy): the raise is taken back, the state where it lay
+    /// and the activation the rung in hand's. Fires stay cut to it; a later
+    /// raise may try again. Nothing faults.
     pub fn raise_refused(&mut self, evacuation: &RungEvacuation) {
         if let Some(act) = self.raise_from.take() {
             self.pool.undo_rung(evacuation, act);
@@ -1541,12 +1552,18 @@ impl SharedPool {
         self.pool.rung()
     }
 
-    /// Lets state take the span above `rung`'s activation again.
-    pub fn lower_rung(&mut self, rung: u32) -> Result<(), RungError> {
+    /// Lets state take the span above `rung`'s activation again. Where the
+    /// span is backed on demand, the notice the engine is sent
+    /// (`Engine::set_rung(from, to)`), after the walk's retire fence: every
+    /// fire wider than `rung` has retired, so it may give back the carve
+    /// above it.
+    pub fn lower_rung(&mut self, rung: u32) -> Result<Option<(u32, u32)>, RungError> {
         if self.pool.act_chunks(rung) > self.pool.act_reserved() {
             return Err(RungError::Pool(SlotError::Occupied { rung, chunks: 0 }));
         }
-        self.pool.set_rung(rung).map_err(RungError::Pool)
+        let from = self.pool.rung();
+        self.pool.set_rung(rung).map_err(RungError::Pool)?;
+        Ok(self.tells_rungs().then_some((from, rung)))
     }
 
     // ---- segments ----

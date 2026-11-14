@@ -9,6 +9,32 @@
 //! activation 52..64.
 
 use super::*;
+use crate::store::shared::programs::{Mover, take_raise};
+
+/// The engine's lane as a raise meets it: the fake engine, shared.
+struct Lane(Arc<Mutex<FakeEngine>>);
+
+impl Mover for Lane {
+    async fn evacuate(&self, evacuation: EngineEvacuation) -> Result<(), String> {
+        self.0
+            .lock()
+            .unwrap()
+            .evacuate(&evacuation)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn set_rung(&self, from: u32, to: u32) -> Result<(), String> {
+        self.0
+            .lock()
+            .unwrap()
+            .set_rung(from, to)
+            .map_err(|error| error.to_string())
+    }
+
+    fn epoch_now(&self) -> u64 {
+        0
+    }
+}
 
 fn on_demand_pool() -> (SharedPool, FakeEngine) {
     let mut facts = facts();
@@ -260,4 +286,101 @@ fn a_refused_raise_is_taken_back() {
     pool.raise_copied(1);
     assert_eq!(pool.rung(), 2048);
     assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
+}
+
+/// On an on-demand pool a raise that moves nothing still reaches the
+/// engine (`set_rung`), which backs its carve there; refused, the raise is
+/// taken back and fires stay at the rung in hand. With the span backed from
+/// the load, the same raise makes no engine call.
+#[tokio::test(flavor = "current_thread")]
+async fn a_move_free_raise_reaches_an_on_demand_engine_and_can_be_refused() {
+    let (mut pool, mut engine) = on_demand_pool();
+    assert_eq!(
+        walk_segments(&mut pool, 6, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.lower_rung(256).unwrap(), Some((2048, 256)));
+    engine.calls.clear();
+    engine.refuse = true;
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let engine = Arc::new(Mutex::new(engine));
+    let lane = Lane(engine.clone());
+
+    // Refused: taken back.
+    let taken = take_raise(&shared, |_| 2048, &lane).await.unwrap();
+    assert!(taken.is_none());
+    {
+        let pool = shared.lock().unwrap();
+        assert_eq!(pool.rung(), 256, "the rung in hand");
+        assert_eq!(pool.pool().act_reserved(), 4);
+        assert!(pool.copying().is_none());
+        pool.pool().check();
+    }
+    assert!(engine.lock().unwrap().calls.is_empty());
+
+    // Backed: the engine hears it before any fire of the wider rung.
+    engine.lock().unwrap().refuse = false;
+    let taken = take_raise(&shared, |_| 2048, &lane).await.unwrap();
+    let evacuation = taken.expect("raised");
+    assert!(evacuation.moves.is_empty(), "nothing to move");
+    assert_eq!(engine.lock().unwrap().calls, [Call::Rung(256, 2048)]);
+    let pool = shared.lock().unwrap();
+    assert_eq!(pool.rung(), 2048);
+    assert!(pool.copying().is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn with_the_flag_off_a_move_free_raise_makes_no_engine_call() {
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.lower_rung(256).unwrap(), None, "no lower notice");
+    engine.calls.clear();
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let engine = Arc::new(Mutex::new(engine));
+    let taken = take_raise(&shared, |_| 2048, &Lane(engine.clone()))
+        .await
+        .unwrap();
+    assert!(taken.is_some());
+    assert!(engine.lock().unwrap().calls.is_empty(), "no lane trip");
+    assert_eq!(shared.lock().unwrap().rung(), 2048);
+}
+
+/// A lower on an on-demand pool is told the engine only past the walk's
+/// retire fence: once every fire cut to the old rung has retired.
+#[test]
+fn a_lower_notice_comes_after_the_retire_fence() {
+    let (mut pool, mut engine) = on_demand_pool();
+    assert_eq!(
+        walk_segments(&mut pool, 6, 0, &mut engine),
+        Retarget::Reached
+    );
+    let mut walk = RungWalk::default();
+    assert_eq!(
+        walk.step(&pool, 256, u32::MAX, u32::MAX, 5, 5).unwrap(),
+        RungStep::Cap(256)
+    );
+    assert_eq!(
+        walk.step(&pool, 256, 256, u32::MAX, 5, 5).unwrap(),
+        RungStep::Wait,
+        "a wider step still in flight"
+    );
+    assert_eq!(
+        walk.step(&pool, 256, 256, 256, 8, 5).unwrap(),
+        RungStep::Wait
+    );
+    assert_eq!(
+        walk.step(&pool, 256, 256, 256, 8, 7).unwrap(),
+        RungStep::Wait,
+        "fire 8 not retired"
+    );
+    assert_eq!(
+        walk.step(&pool, 256, 256, 256, 8, 8).unwrap(),
+        RungStep::Lower(256)
+    );
+    // Only now is the rung lowered, and the notice it yields sent.
+    assert_eq!(pool.lower_rung(256).unwrap(), Some((2048, 256)));
 }
