@@ -30,9 +30,13 @@ mod backend {
     pub const CHUNK: &str = "PIE_WGPU_CHUNK";
 
     /// What a test's load takes: WebGPU reports no memory size, so
-    /// `[engine.memory] budget_device` is stated.
+    /// `[engine.memory] budget_device` is stated. 16 GiB: a model load takes
+    /// a quarter of it, and 4 GiB holds the largest model the suite loads
+    /// (gemma4-e4b-mini-l6, 2.5 GB of dense bf16 weights) with its working
+    /// set and a pool beside them; a pool is backed whole at the load, so
+    /// four loads at once take all 16 GiB and no more.
     pub const ALLOWANCE: engine::Allowance = engine::Allowance {
-        budget: Some(8 << 30),
+        budget: Some(16 << 30),
     };
 
     /// The narrowest subgroup the adapter runs (0 without subgroups).
