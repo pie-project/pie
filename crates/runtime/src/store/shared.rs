@@ -282,10 +282,13 @@ pub fn cap_for(shared: &Shared, rows: u32) -> u32 {
 /// them, and no wider than the widest rung the engine has armed
 /// ([`::engine::live`]). Every serving fire replays a captured body, so a
 /// raise to a rung whose bodies are still being captured waits on them,
-/// and fires serve at the rungs armed meanwhile.
+/// and fires serve at the rungs armed meanwhile. Widened to the widest
+/// armed rung of its chunk class ([`SharedPool::widest_alike`]): a rung
+/// that sets aside no more than the one asked costs kv nothing.
 #[must_use]
 pub fn rung_goal(pool: &SharedPool, engine: usize, rows: u32) -> u32 {
-    pool.armed_rung_for(rows, crate::engine::live(engine).armed_through())
+    let armed = crate::engine::live(engine).armed_through();
+    pool.widest_alike(pool.armed_rung_for(rows, armed), armed)
 }
 
 /// Raises `shared`'s rung at once to the one fires of `rows` take, where
@@ -1693,6 +1696,24 @@ impl SharedPool {
         let top_start = self.pool.top_segment() * seg;
         let prefix_end = (self.ceiling_for(bytes) / seg * seg).min(top_start);
         u64::from(prefix_end + (total - top_start)) * self.pool.chunk_bytes()
+    }
+
+    /// The widest rung whose activation takes the chunks `rung`'s does: as
+    /// wide as fires go for what the span sets aside, no wider than `armed`
+    /// (a rung's tokens) or the widest that fits with the programs' fire
+    /// terms. Rungs of one chunk class lend kv nothing between them, so a
+    /// pool resting in a class cuts fires to its widest, never narrower.
+    #[must_use]
+    pub fn widest_alike(&self, rung: u32, armed: u32) -> u32 {
+        let chunks = self.pool.act_chunks(rung);
+        let most = armed.min(self.fit_rung());
+        self.pool
+            .rungs()
+            .into_iter()
+            .filter(|&wider| wider >= rung && wider <= most)
+            .filter(|&wider| self.pool.act_chunks(wider) == chunks)
+            .max()
+            .unwrap_or(rung)
     }
 
     /// [`Self::rung_for`], no wider than `armed` (a rung's tokens): the

@@ -917,6 +917,52 @@ fn rungs_sharing_their_chunks_are_one_class_the_walk_never_moves_within() {
     ));
 }
 
+/// A goal is widened to the widest rung of its chunk class, armed: rungs
+/// that set aside as many chunks lend kv nothing between them, so a pool
+/// resting in a class never cuts fires narrower than the class holds.
+#[test]
+fn a_goal_takes_the_widest_armed_rung_of_its_chunk_class() {
+    let facts = ChunkFacts {
+        act_chunks: vec![
+            (1, 1),
+            (2, 1),
+            (4, 1),
+            (8, 1),
+            (16, 1),
+            (32, 2),
+            (64, 2),
+            (128, 2),
+            (256, 4),
+            (512, 4),
+            (1024, 8),
+            (2048, 12),
+        ],
+        ..facts()
+    };
+    facts.validate().unwrap();
+    let mut pool = SharedPool::new(&facts, 256).unwrap();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.widest_alike(1, u32::MAX), 16);
+    assert_eq!(pool.widest_alike(32, u32::MAX), 128);
+    assert_eq!(pool.widest_alike(256, u32::MAX), 512);
+    assert_eq!(pool.widest_alike(2048, u32::MAX), 2048);
+    // Still arming: no wider than the widest rung armed.
+    assert_eq!(pool.widest_alike(1, 8), 8);
+    assert_eq!(pool.widest_alike(32, 64), 64);
+    // The walk then caps fires to the class's widest, and lowers the same
+    // chunks it would for the narrowest.
+    let mut walk = RungWalk::default();
+    assert_eq!(
+        walk.step(&pool, pool.widest_alike(1, u32::MAX), u32::MAX, u32::MAX, 5, 5)
+            .unwrap(),
+        RungStep::Cap(16)
+    );
+}
+
 /// What an arming step is lent comes from the allocators sequences take
 /// from, named as a lane names them: a record by its pieces' slot refs, a
 /// kv page by its list slot ref; none lies in the null chunk, which the
