@@ -280,6 +280,12 @@ impl Sink<'_> {
                 format!("not instantiated at the {} tier", fire.tier.name()),
             )
         })?;
+        let groups = engine_gpu::workgroups(
+            key,
+            fire.groups,
+            self.device.core.limits.max_compute_work_group_count,
+        )
+        .map_err(|fault| Sink::refuse(fire, fault))?;
         let pipeline = self
             .pipelines
             .get(self.device, fire.file, key)
@@ -501,12 +507,7 @@ impl Sink<'_> {
             if let Some((pool, at)) = timed {
                 d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, at * 2);
             }
-            d.cmd_dispatch(
-                cmd,
-                fire.groups[0].max(1),
-                fire.groups[1].max(1),
-                fire.groups[2].max(1),
-            );
+            d.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
             if let Some((pool, at)) = timed {
                 d.cmd_write_timestamp(
                     cmd,

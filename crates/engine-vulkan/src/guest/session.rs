@@ -696,6 +696,11 @@ impl Session {
             at: "guest::session",
             why: format!("stage {at} is past this package's {}", self.stages.len()),
         })?;
+        let [groups, ..] = engine_gpu::workgroups(
+            "guest",
+            [stage.groups, 1, 1],
+            self.core.limits.max_compute_work_group_count,
+        )?;
         let d = &self.core.device;
         // SAFETY: `cmd` is the open frame's buffer, recorded only on this
         // thread (`Frame` is not `Sync`). The set, layout and pipelines are
@@ -741,7 +746,7 @@ impl Session {
                     );
                 }
                 d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-                d.cmd_dispatch(cmd, stage.groups, 1, 1);
+                d.cmd_dispatch(cmd, groups, 1, 1);
             }
 
             let after = vk::MemoryBarrier::default()
