@@ -1,51 +1,75 @@
-//! The registered programs' fire term (REDESIGN §6): what a fire holding a
+//! The bound programs' fire terms (REDESIGN §6): what a fire holding a
 //! guest program's lanes needs beside the model's activation, the
-//! program's per-batch tables and value scratch
-//! ([`::engine::ProgramFacts::fire_bytes`]). A program registers after
-//! load, so the engine cannot state it in [`::engine::chunk::ChunkFacts`];
-//! the pool folds it into every rung's activation instead
-//! ([`super::super::slots::SlotPool::act_chunks`]).
+//! program's per-batch tables and value scratch, sized by the bind's
+//! extents ([`::engine::Engine::fire_facts`]). A program registers and binds
+//! after load, so the engine cannot state it in
+//! [`::engine::chunk::ChunkFacts`]; the pool folds it into every rung's
+//! activation instead ([`super::super::slots::SlotPool::act_chunks`]).
 //!
-//! A program can be in a fire while an instance of it is bound, or about to
-//! be ([`ProgramOpen`]): its term counts from the first of those to the
-//! last. A term that raises the activation the fires may take now is taken
-//! before the bind proceeds, through the raise a pass's wider rung takes,
-//! its room funded as a planner waiter ([`fund_span`]). Once the last
-//! instance closes the term drops, and the walk's next lower gives the room
-//! back.
+//! A term is a live (program, extents) pair ([`FireKey`]): it counts from
+//! the first bind of those extents (under way, [`ProgramOpen`], or bound)
+//! to the last one's close, and the rung arithmetic sums over the live
+//! pairs. A pair that raises the activation the fires may take now is
+//! taken before its first bind is sent, through the raise a pass's wider
+//! rung takes, its room funded as a planner waiter ([`fund_span`]). Once
+//! the pair's last bind closes its term drops, and the walk's next lower
+//! gives the room back, once every fire cut to the old rung has retired.
 
 use std::collections::HashMap;
 
-use ::engine::{InstanceId, ProgramFacts, ProgramId};
+use ::engine::{BindExtents, FireFacts, InstanceId, ProgramId};
 
 use super::{RungEvacuation, Shared, SharedPool};
 use crate::store::slots::FireTerm;
 
-/// Each program's fire term, and who keeps it counted.
+/// A fire term's key: a program bound at given extents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FireKey {
+    pub program: ProgramId,
+    pub extents: BindExtents,
+}
+
+impl std::fmt::Display for FireKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "program {} at {:?}", self.program, self.extents)
+    }
+}
+
+/// Each pair's fire term, and who keeps it counted.
 #[derive(Debug, Default)]
 pub struct ProgramFires {
-    terms: HashMap<ProgramId, FireTerm>,
-    /// Bound instances and binds under way, by program.
-    open: HashMap<ProgramId, u32>,
-    instances: HashMap<InstanceId, ProgramId>,
+    terms: HashMap<FireKey, FireTerm>,
+    /// Bound instances and binds under way, by pair.
+    open: HashMap<FireKey, u32>,
+    instances: HashMap<InstanceId, FireKey>,
 }
 
 impl ProgramFires {
-    /// The terms of the programs that can be in a fire now.
+    /// The terms of the pairs that can be in a fire now, each capped at
+    /// its live instances: a fire carries no more lanes of a pair than it
+    /// has instances bound (or binding), so `l = min(r, FireLimits::max_lanes,
+    /// the pair's max_lanes, its live instances)`.
     fn open_terms(&self) -> Vec<FireTerm> {
         self.open
-            .keys()
-            .filter_map(|program| self.terms.get(program).copied())
+            .iter()
+            .filter_map(|(key, &live)| {
+                let term = *self.terms.get(key)?;
+                let max_lanes = match term.max_lanes {
+                    0 => live,
+                    own => own.min(live),
+                };
+                Some(FireTerm { max_lanes, ..term })
+            })
             .collect()
     }
 }
 
 /// A program's fire term from its facts.
 #[must_use]
-pub fn term_of(facts: &ProgramFacts) -> FireTerm {
+pub fn term_of(facts: &FireFacts) -> FireTerm {
     FireTerm {
-        fixed: facts.fire_bytes_fixed,
-        a_lane: facts.fire_bytes_a_lane,
+        fixed: facts.fixed,
+        a_lane: facts.a_lane,
         max_lanes: facts.max_lanes,
     }
 }
@@ -58,10 +82,17 @@ impl SharedPool {
         self.pool.set_max_lanes(lanes);
     }
 
-    /// The engine registered `program`, whose fires need `facts`' term.
-    pub fn program_registered(&mut self, program: ProgramId, facts: &ProgramFacts) {
-        self.programs.terms.insert(program, term_of(facts));
+    /// The engine said fires of `key` need `facts`' term
+    /// ([`::engine::Engine::fire_facts`]), asked once a pair.
+    pub fn fire_facts_learned(&mut self, key: FireKey, facts: &FireFacts) {
+        self.programs.terms.insert(key, term_of(facts));
         self.refold();
+    }
+
+    /// Whether `key`'s fire facts were asked already.
+    #[must_use]
+    pub fn knows_fire(&self, key: &FireKey) -> bool {
+        self.programs.terms.contains_key(key)
     }
 
     /// The chunks an activation may take at most: every chunk but the
@@ -131,73 +162,68 @@ impl SharedPool {
         self.lifted(self.fit_rung())
     }
 
-    /// One more instance of `program` can be in a fire: its term counts
-    /// from now. Refused where even the smallest rung's activation, the
-    /// term included, cannot fit on the device (past every chunk but the
+    /// One more bind of `key` can be in a fire: its term counts from now.
+    /// Refused where even the smallest rung's activation, the terms
+    /// included, cannot fit on the device (past every chunk but the
     /// reserved ones and the weights' pinned slots); a narrower fit cuts
     /// fires to the widest rung that does ([`Self::widest_fit`]).
-    pub fn open_program(&mut self, program: ProgramId) -> Result<(), String> {
-        let first = !self.programs.open.contains_key(&program);
-        *self.programs.open.entry(program).or_default() += 1;
-        if first {
-            self.refold();
-            if self.term_refused() {
-                let most = self.act_room();
-                let smallest = self.pool.act_chunks(0);
-                let term = self
-                    .programs
-                    .terms
-                    .get(&program)
-                    .copied()
-                    .unwrap_or_default();
-                self.close_program(program);
-                return Err(format!(
-                    "program {program}'s fires need {} bytes and {} bytes a lane beside the \
-                     model's activation, and the smallest rung would then take {smallest} chunks \
-                     of the {most} the device has for it",
-                    term.fixed, term.a_lane
-                ));
-            }
+    ///
+    /// The term grows with each bind (its live instances cap the lanes it
+    /// takes), so every open refolds, and is refused where the grown term
+    /// leaves no rung room.
+    pub fn open_fire(&mut self, key: FireKey) -> Result<(), String> {
+        *self.programs.open.entry(key).or_default() += 1;
+        self.refold();
+        if self.term_refused() {
+            let most = self.act_room();
+            let smallest = self.pool.act_chunks(0);
+            let term = self.programs.terms.get(&key).copied().unwrap_or_default();
+            self.close_fire(key);
+            return Err(format!(
+                "{key}'s fires need {} bytes and {} bytes a lane beside the model's \
+                 activation, and the smallest rung would then take {smallest} chunks of the \
+                 {most} the device has for it",
+                term.fixed, term.a_lane
+            ));
         }
         Ok(())
     }
 
-    /// One instance of `program` less can be in a fire; its term drops with
-    /// the last.
-    pub fn close_program(&mut self, program: ProgramId) {
-        let Some(open) = self.programs.open.get_mut(&program) else {
+    /// One bind of `key` less can be in a fire; its term drops with the
+    /// last.
+    pub fn close_fire(&mut self, key: FireKey) {
+        let Some(open) = self.programs.open.get_mut(&key) else {
             return;
         };
         *open -= 1;
         if *open == 0 {
-            self.programs.open.remove(&program);
-            self.refold();
+            self.programs.open.remove(&key);
         }
+        // Each close shrinks the term (one live instance fewer); the next
+        // lower gives the room back.
+        self.refold();
     }
 
-    /// The engine bound `instance` of `program`: the program's term counts
-    /// until it closes.
-    pub fn instance_bound(&mut self, instance: InstanceId, program: ProgramId) {
-        if self.programs.instances.insert(instance, program).is_none() {
-            self.open_or_count(program);
+    /// The engine bound `instance` as `key`: its term counts until the
+    /// instance closes.
+    pub fn instance_bound(&mut self, instance: InstanceId, key: FireKey) {
+        if self.programs.instances.insert(instance, key).is_none() {
+            self.open_or_count(key);
         }
     }
 
     /// The engine closed `instance`.
     pub fn instance_closed(&mut self, instance: InstanceId) {
-        if let Some(program) = self.programs.instances.remove(&instance) {
-            self.close_program(program);
+        if let Some(key) = self.programs.instances.remove(&instance) {
+            self.close_fire(key);
         }
     }
 
-    /// Counts one more of `program` without the room check: the engine
-    /// already bound it.
-    fn open_or_count(&mut self, program: ProgramId) {
-        let first = !self.programs.open.contains_key(&program);
-        *self.programs.open.entry(program).or_default() += 1;
-        if first {
-            self.refold();
-        }
+    /// Counts one more of `key` without the room check: the engine already
+    /// bound it.
+    fn open_or_count(&mut self, key: FireKey) {
+        *self.programs.open.entry(key).or_default() += 1;
+        self.refold();
     }
 
     fn refold(&mut self) {
@@ -220,28 +246,28 @@ impl SharedPool {
     }
 }
 
-/// A bind of an instance of a program under way: the program's term counts
+/// A bind of a program at given extents under way: the pair's term counts
 /// while it is held. The engine's bind counts the instance itself
 /// ([`SharedPool::instance_bound`]), so the guard is dropped once the bind
 /// is through, either way.
 pub struct ProgramOpen {
     shared: Shared,
-    program: ProgramId,
+    key: FireKey,
 }
 
 impl ProgramOpen {
-    pub fn new(shared: &Shared, program: ProgramId) -> Result<Self, String> {
-        shared.lock().unwrap().open_program(program)?;
+    pub fn new(shared: &Shared, key: FireKey) -> Result<Self, String> {
+        shared.lock().unwrap().open_fire(key)?;
         Ok(Self {
             shared: Shared::clone(shared),
-            program,
+            key,
         })
     }
 }
 
 impl Drop for ProgramOpen {
     fn drop(&mut self) {
-        self.shared.lock().unwrap().close_program(self.program);
+        self.shared.lock().unwrap().close_fire(self.key);
     }
 }
 
@@ -259,6 +285,13 @@ pub trait Mover {
     fn evacuate(
         &self,
         evacuation: ::engine::chunk::Evacuation,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+
+    /// `Engine::set_rung(from, to)` through the engine's lane.
+    fn set_rung(
+        &self,
+        from: u32,
+        to: u32,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 
     fn epoch_now(&self) -> u64;
@@ -285,13 +318,8 @@ pub async fn take_raise(
     let Some(evacuation) = evacuation else {
         return Ok(None);
     };
-    if !evacuation.moves.is_empty() {
-        mover
-            .evacuate(SharedPool::rung_moves(&evacuation))
-            .await
-            .map_err(|error| format!("a raise's copy was refused; the rung stays held: {error}"))?;
-        let next = mover.epoch_now().saturating_add(1);
-        shared.lock().unwrap().raise_copied(next);
+    if !carry_raise(shared, &evacuation, mover).await {
+        return Ok(None);
     }
     tracing::info!(
         rung = evacuation.rung,
@@ -299,6 +327,41 @@ pub async fn take_raise(
         "the activation rung is raised"
     );
     Ok(Some(evacuation))
+}
+
+/// Carries a raise `shared` applied ([`SharedPool::raise_applied`]) to the
+/// engine: where the span is backed on demand, `set_rung` first (the engine
+/// backs its carve for the wider rung), then the copy of what it moves.
+/// Either refused, the raise is taken back ([`SharedPool::raise_refused`]),
+/// fires stay at the rung in hand, and an engine that backed the carve is
+/// told the rung went back; `false` then. Nothing faults.
+pub async fn carry_raise(shared: &Shared, evacuation: &RungEvacuation, mover: &impl Mover) -> bool {
+    let (waits, tells) = {
+        let pool = shared.lock().unwrap();
+        (pool.raise_waits(evacuation), pool.tells_rungs())
+    };
+    if !waits {
+        return true;
+    }
+    let (from, to) = (evacuation.from, evacuation.rung);
+    if tells && let Err(error) = mover.set_rung(from, to).await {
+        tracing::warn!(%error, from, to, "a raise's carve was refused; fires stay at the rung in hand");
+        shared.lock().unwrap().raise_refused(evacuation);
+        return false;
+    }
+    if !evacuation.moves.is_empty()
+        && let Err(error) = mover.evacuate(SharedPool::rung_moves(evacuation)).await
+    {
+        tracing::warn!(%error, "a raise's copy was refused; fires stay at the rung in hand");
+        shared.lock().unwrap().raise_refused(evacuation);
+        if tells && let Err(error) = mover.set_rung(to, from).await {
+            tracing::warn!(%error, from = to, to = from, "a rung notice was refused");
+        }
+        return false;
+    }
+    let next = mover.epoch_now().saturating_add(1);
+    shared.lock().unwrap().raise_copied(next);
+    true
 }
 
 /// Waits until `shared`'s activation holds what fires may take now, the
@@ -400,6 +463,15 @@ impl<F: Fn() -> u64 + Sync> Mover for LaneMover<F> {
         crate::scheduler::pool(
             self.engine,
             crate::scheduler::worker::PoolOp::Evacuate(evacuation),
+        )
+        .await
+        .map_err(|error| format!("{error:#}"))
+    }
+
+    async fn set_rung(&self, from: u32, to: u32) -> Result<(), String> {
+        crate::scheduler::pool(
+            self.engine,
+            crate::scheduler::worker::PoolOp::Rung { from, to },
         )
         .await
         .map_err(|error| format!("{error:#}"))

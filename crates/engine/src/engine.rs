@@ -8,8 +8,8 @@ use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
 use crate::program::{
-    BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, ProgramRegistration,
-    Rebind, RingFacts,
+    BindExtents, BoundInstance, FireFacts, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
+    ProgramRegistration, Rebind, RingFacts,
 };
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
 
@@ -126,6 +126,14 @@ pub trait Engine: Send {
         Ok(ProgramFacts::default())
     }
 
+    /// What a fire holding lanes of `program` bound at `extents` needs
+    /// beside the model's activation, asked before the first bind of those
+    /// extents is sent. The default states none.
+    fn fire_facts(&self, program: ProgramId, extents: &BindExtents) -> Result<FireFacts> {
+        let _ = (program, extents);
+        Ok(FireFacts::default())
+    }
+
     /// The `Channel` slots a registered channel's ring takes, asked before
     /// [`Engine::register_channel`]. `None`: the engine keeps the ring
     /// itself.
@@ -199,6 +207,40 @@ pub trait Engine: Send {
     fn release_segments(&mut self, segments: u32) -> Result<()> {
         let _ = segments;
         Err(self.unsupported("release_segments"))
+    }
+
+    /// Backs the top `segments` segments of the span under the largest
+    /// rung's activation, counted from the top of the pool, ahead of the
+    /// runtime opening any chunk of theirs for state; never on a fire's
+    /// path. Monotone as [`Self::commit_segments`]' prefix, from the other
+    /// end. Only where [`crate::chunk::ChunkFacts::span_backed_on_demand`];
+    /// the engine backs its own activation carve itself.
+    fn commit_span(&mut self, segments: u32) -> Result<()> {
+        let _ = segments;
+        Ok(())
+    }
+
+    /// Keeps the top `segments` span segments backed and gives back the
+    /// span segments below them, which hold no state chunk and which no
+    /// rung lends any more ([`Self::commit_span`]'s counting). Whatever of
+    /// them the engine's own activation carve uses stays its own to back.
+    fn release_span(&mut self, segments: u32) -> Result<()> {
+        let _ = segments;
+        Ok(())
+    }
+
+    /// The activation rung moves from `from` to `to` tokens; only where
+    /// [`crate::chunk::ChunkFacts::span_backed_on_demand`], through the
+    /// lane, never on a fire's path. A raise (`to > from`) comes before any
+    /// fire of the wider rung, and before the raise's [`Self::evacuate`]
+    /// where it moves state: the engine backs its carve for `to` here, and
+    /// a refusal (`Error::Exhausted`) takes the raise back, no fire passing
+    /// `from`. A lower (`to < from`) is a notice once every fire wider than
+    /// `to` has retired: the engine may give back the carve above `to`; a
+    /// failed notice is logged, not fatal.
+    fn set_rung(&mut self, from: u32, to: u32) -> Result<()> {
+        let _ = (from, to);
+        Ok(())
     }
 
     /// Copies each moved chunk's bytes onto its new physical chunk and
