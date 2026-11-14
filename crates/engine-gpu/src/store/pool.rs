@@ -83,7 +83,7 @@ impl<B: Backend> Pool<B> {
         chunk_bytes: u64,
         total_chunks: u32,
         segment_chunks: u32,
-        span: u32,
+        [lent, span]: [u32; 2],
     ) -> Result<Pool<B>> {
         if chunk_bytes == 0 || total_chunks == 0 || segment_chunks == 0 {
             return Err(Fault::Ceiling {
@@ -100,8 +100,10 @@ impl<B: Backend> Pool<B> {
                 have: SEGMENTS as u64,
             });
         }
-        // The kernels index the pool in u32 words, a bf16 at a time.
-        let bytes = chunk_bytes * u64::from(segments * segment_chunks);
+        // The kernels index state in u32 words, a bf16 at a time: every
+        // chunk under the smallest rung's activation (`lent` chunks); what
+        // lies past it is the fire's alone, bound by offset.
+        let bytes = chunk_bytes * u64::from(total_chunks.saturating_sub(lent));
         if bytes / 2 > u64::from(u32::MAX) {
             return Err(Fault::Ceiling {
                 what: "bytes of the state pool (a kernel indexes it a bf16 at a time)",
@@ -109,7 +111,9 @@ impl<B: Backend> Pool<B> {
                 have: 2 * u64::from(u32::MAX),
             });
         }
-        if span >= total_chunks || (span > 0 && (total_chunks - span) / segment_chunks + 1 != segments) {
+        if span >= total_chunks
+            || (span > 0 && (total_chunks - span) / segment_chunks + 1 != segments)
+        {
             return Err(Fault::Ceiling {
                 what: "chunks of the activation span in the pool's last segment",
                 need: u64::from(span),
@@ -155,7 +159,10 @@ impl<B: Backend> Pool<B> {
     /// The segments backed from the first on, without a gap.
     #[must_use]
     pub fn committed_segments(&self) -> u32 {
-        self.segments.iter().take_while(|segment| segment.is_some()).count() as u32
+        self.segments
+            .iter()
+            .take_while(|segment| segment.is_some())
+            .count() as u32
     }
 
     /// The activation span's chunks.
@@ -412,7 +419,10 @@ mod tests {
             let (segment, kept) =
                 segment_chunks(chunk, total, binding, span).expect("a binding holds the span");
             let count = kept.div_ceil(segment);
-            assert!(count <= super::SEGMENTS as u32, "{total} {span}: {count} segments");
+            assert!(
+                count <= super::SEGMENTS as u32,
+                "{total} {span}: {count} segments"
+            );
             assert!(u64::from(segment) * chunk <= binding);
             assert!(kept <= total);
             assert!(kept - (count - 1) * segment >= span, "{total} {span}");

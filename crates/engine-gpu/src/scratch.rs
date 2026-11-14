@@ -38,7 +38,12 @@ impl Room {
         u64::from(self.rows) * u64::from(self.width) * self.dtype.bytes_ceil()
     }
 
-    fn bind<B: Backend>(&self, handles: &Handles<B>, plane: &B::Buffer, base: u64) -> Result<Tensor> {
+    fn bind<B: Backend>(
+        &self,
+        handles: &Handles<B>,
+        plane: &B::Buffer,
+        base: u64,
+    ) -> Result<Tensor> {
         Ok(Tensor::new(
             handles.bind(plane, base + self.at, self.bytes())?,
             self.rows,
@@ -265,12 +270,11 @@ impl Rooms {
             .max(split.map_or(0, |r| r.part_lse.at + r.part_lse.bytes()))
             .max(spatial.map_or(0, |r| r.at + r.bytes()));
 
-        let copy = copy_ceiling(trace, compiled, map, budget, narrow.max_tokens).map(|bytes| {
-            CopyRoom {
+        let copy =
+            copy_ceiling(trace, compiled, map, budget, narrow.max_tokens).map(|bytes| CopyRoom {
                 at: union.next_multiple_of(ALIGN),
                 bytes,
-            }
-        });
+            });
 
         let bytes = copy.map_or(union, |room| room.at + room.bytes);
 
@@ -374,7 +378,9 @@ impl<'a, B: Backend> FireScratch<'a, B> {
             width: groups * 2,
             dtype: Dtype::F32,
         };
-        Some((|| Ok((self.bind(handles, partials)?, self.bind(handles, stats)?)))())
+        Some((|| {
+            Ok((self.bind(handles, partials)?, self.bind(handles, stats)?))
+        })())
     }
 
     #[must_use]
@@ -475,11 +481,7 @@ fn copy_ceiling(
             ) {
                 continue;
             }
-            let Some(rect) = rect(
-                map,
-                *id,
-                FireRows::text_only(u64::from(rows), lanes),
-            ) else {
+            let Some(rect) = rect(map, *id, FireRows::text_only(u64::from(rows), lanes)) else {
                 continue;
             };
             if seen.contains(&rect.offset) {

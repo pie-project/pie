@@ -61,7 +61,9 @@ impl Rung {
                 }
             })?
         };
-        let rooms = Rooms::lay(trace, compiled, &map, budgets, tokens, paging, tuning, routers);
+        let rooms = Rooms::lay(
+            trace, compiled, &map, budgets, tokens, paging, tuning, routers,
+        );
         let rooms_at = map.bytes.next_multiple_of(ALIGN);
         let bytes = (rooms_at + rooms.bytes()).next_multiple_of(ALIGN);
         Ok(Rung {
@@ -141,8 +143,8 @@ impl<B: Backend> Span<B> {
         self.rungs
             .iter()
             .map(|rung| {
-                let chunks = u32::try_from(rung.bytes.div_ceil(chunk_bytes.max(1)))
-                    .unwrap_or(u32::MAX);
+                let chunks =
+                    u32::try_from(rung.bytes.div_ceil(chunk_bytes.max(1))).unwrap_or(u32::MAX);
                 most = most.max(chunks);
                 (rung.tokens, most)
             })
@@ -196,7 +198,13 @@ impl<B: Backend> Span<B> {
     /// A fire's slots at rung `rung`: its carve at its place.
     pub fn slots(&self, handles: &Handles<B>, rung: usize, rows: FireRows) -> Result<SlotTable> {
         let (buffer, _) = self.placed()?;
-        carve(handles, buffer, self.base(rung)?, &self.rungs[rung].map, rows)
+        carve(
+            handles,
+            buffer,
+            self.base(rung)?,
+            &self.rungs[rung].map,
+            rows,
+        )
     }
 
     /// A fire's rooms at rung `rung`.

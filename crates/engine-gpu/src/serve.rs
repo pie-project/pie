@@ -848,7 +848,14 @@ impl<B: Serve> Shell<B> {
         if rung_tokens.last() != Some(&top) {
             rung_tokens.push(top);
         }
-        let mut span = Span::plan(&boot.trace, &compiled, &budgets, &rung_tokens, least, &tuning)?;
+        let mut span = Span::plan(
+            &boot.trace,
+            &compiled,
+            &budgets,
+            &rung_tokens,
+            least,
+            &tuning,
+        )?;
         let device_cap = device
             .left()
             .saturating_sub(u64::from(least_chunks) * chunk)
@@ -1006,11 +1013,13 @@ impl<B: Serve> Shell<B> {
                 readouts: poem_compiler::arena::readouts_ceiling(&boot.budget),
             };
             let rect_of = |value: ValueId, name: &str| {
-                poem_exec::store::arena::rect(&compiled.arena, value, ceiling).ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "value {}, of output `{name}`, which the carve gave no rectangle",
-                        value.0
-                    ),
+                poem_exec::store::arena::rect(&compiled.arena, value, ceiling).ok_or_else(|| {
+                    Fault::Unbound {
+                        what: format!(
+                            "value {}, of output `{name}`, which the carve gave no rectangle",
+                            value.0
+                        ),
+                    }
                 })
             };
             let mut readouts = Vec::new();
@@ -1133,7 +1142,9 @@ impl<B: Serve> Shell<B> {
         let words = u32::try_from(2 * u64::from(u32::MAX) / chunk).unwrap_or(u32::MAX)
             / kernels_slang::SEGMENTS as u32
             * kernels_slang::SEGMENTS as u32;
-        let total = total.min(binds).min(words);
+        // State lies within that index; the span past it is the fire's
+        // alone (bound by offset, never indexed), at every rung.
+        let total = total.min(binds).min(words.saturating_add(act));
         let span_short = || {
             Fault::Residency(format!(
                 "one working set takes {least_chunks} chunks of {chunk} bytes beside a fire's \
@@ -1147,6 +1158,12 @@ impl<B: Serve> Shell<B> {
         if total < least_chunks + act {
             return Err(span_short());
         }
+        // No rung lends a chunk past the kernels' index to state.
+        let unindexed = total.saturating_sub(words);
+        let act_chunks: Vec<(u32, u32)> = act_chunks
+            .into_iter()
+            .map(|(tokens, chunks)| (tokens, chunks.max(unindexed)))
+            .collect();
         let layout = crate::store::layout::Layout::new(
             chunk,
             total,
@@ -1172,7 +1189,8 @@ impl<B: Serve> Shell<B> {
                     asked.context().div_ceil(w.tokens.max(1)),
                 )
             })?;
-        let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
+        let pages =
+            u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total - unindexed);
         let slots = boot.slots;
         tracing::info!(
             chunk,
@@ -1212,9 +1230,10 @@ impl<B: Serve> Shell<B> {
         // The null chunk's segment and the span's stand from the load on.
         pools.commit_segments(&device, 1)?;
         {
-            let (buffer, end): (&B::Buffer, u64) = pools.span_place().ok_or_else(|| Fault::Unbound {
-                what: "the pool's last segment, which its first commit backs".to_string(),
-            })?;
+            let (buffer, end): (&B::Buffer, u64) =
+                pools.span_place().ok_or_else(|| Fault::Unbound {
+                    what: "the pool's last segment, which its first commit backs".to_string(),
+                })?;
             span.place(buffer.clone(), end)?;
         }
         let rs_buffers =

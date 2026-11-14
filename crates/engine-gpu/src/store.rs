@@ -587,7 +587,10 @@ impl<B: Backend> Pools<B> {
             layout.chunk_bytes,
             layout.total_chunks,
             layout.segment_chunks,
-            act_chunks.last().map_or(0, |&(_, chunks)| chunks),
+            [
+                act_chunks.first().map_or(0, |&(_, chunks)| chunks),
+                act_chunks.last().map_or(0, |&(_, chunks)| chunks),
+            ],
         )?;
         let list_slots = layout.list.map_or(0, |list| {
             u64::from(list.per_chunk) * u64::from(layout.total_chunks)
