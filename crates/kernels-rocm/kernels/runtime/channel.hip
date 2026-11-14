@@ -304,11 +304,12 @@ __global__ void gather_bits(const u8* __restrict__ src, u8* __restrict__ dst, u3
 
 struct BitRun {
     const u8* src;
-    u32 dst_byte;
+    u64 dst_byte;
     u32 bits;
+    u32 pad;
 };
 
-static_assert(sizeof(BitRun) == 16, "BitRun: the Rust `channel::BitRun` mirrors this layout");
+static_assert(sizeof(BitRun) == 24, "BitRun: the Rust `channel::BitRun` mirrors this layout");
 
 // Packs each of `run_count` runs, a block a run: run r's `bits` bool bytes
 // at its `src` (a lane's row of a channel cell) into the little-endian bits

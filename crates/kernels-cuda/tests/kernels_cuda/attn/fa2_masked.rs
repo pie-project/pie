@@ -8,7 +8,7 @@ use crate::common::attn_ref::{col, landed, pool, ten};
 use crate::common::host::to_e4m3;
 use crate::common::tc5::e4m3;
 use crate::common::{Gpu, Lcg, to_bf16};
-use dtype::Dtype::{Bf16, E4m3, F32, I32, U8};
+use dtype::Dtype::{Bf16, E4m3, F32, I32, I64, U8};
 use kernels_cuda::attn::plan::{self, Device, Live, Shape, Toggles, Workspace};
 use kernels_cuda::attn::{self, RelBias, fa2::decode_max_grid_size as grid_of};
 use kernels_cuda::tensor::{KvPool, RaggedTensor};
@@ -38,7 +38,7 @@ fn both(
     let (mut qo, mut kv_indptr, mut kv_len, mut last) = (vec![0], vec![0], vec![], vec![]);
     let mut pages: Vec<i32> = Vec::new();
     let (mut next, mut bits) = (1usize, 0usize);
-    let mut mask_indptr = vec![0i32];
+    let mut mask_indptr = vec![0i64];
     for (r, &(new, prefix)) in reqs.iter().enumerate() {
         let len = new + prefix;
         let np = len.div_ceil(PAGE);
@@ -49,7 +49,7 @@ fn both(
         kv_len.push(len as i32);
         last.push(((len - 1) % PAGE + 1) as i32);
         bits += new * len;
-        mask_indptr.push(bits as i32);
+        mask_indptr.push(bits as i64);
     }
     let (rows, cells) = (qo[n] as usize, next * PAGE);
     let mut lcg = Lcg::seeded(0xf8 + d as u64);
@@ -76,7 +76,7 @@ fn both(
     let indptr = col(&mut gpu, &kv_indptr, I32);
     let last_page_lens = col(&mut gpu, &last, I32);
     let mask_t = ten(gpu.up(&mask), mask.len(), 1, U8);
-    let mask_ip = col(&mut gpu, &mask_indptr, I32);
+    let mask_ip = col(&mut gpu, &mask_indptr, I64);
     let bias_t = ten(gpu.up(&bias), rows, qh * 8, F32);
     let data = ten(gpu.up(&q_raw), rows, qw, Bf16);
     let qt = RaggedTensor {

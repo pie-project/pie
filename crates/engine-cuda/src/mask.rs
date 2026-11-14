@@ -14,20 +14,16 @@ pub struct LaneMask<'a> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Staged {
     pub bits: Vec<u8>,
-    pub indptr: Vec<i32>,
+    pub indptr: Vec<i64>,
 }
 
-/// The offset a lane's mask ends at, as the kernels read it: 32-bit, so a
-/// fire whose masks pass it is refused rather than have a saturated offset
-/// hand every later lane another's bits.
-fn mask_offset(bytes: usize, lane: usize) -> Result<i32> {
-    i32::try_from(bytes).map_err(|_| {
+/// The offset a lane's mask ends at, as the kernels read it: 64-bit, so
+/// any fire's masks have one.
+fn mask_offset(bytes: usize, lane: usize) -> Result<i64> {
+    i64::try_from(bytes).map_err(|_| {
         Fault::program(
             "mask",
-            format!(
-                "the fire's attention masks reach {bytes} bytes by lane {lane}, and the \
-                 attention kernels read a lane's mask offset as a 32-bit index"
-            ),
+            format!("the fire's attention masks reach {bytes} bytes by lane {lane}"),
         )
     })
 }
@@ -37,7 +33,7 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
         return Ok(None);
     }
     let mut bits: Vec<u8> = Vec::new();
-    let mut indptr: Vec<i32> = Vec::with_capacity(lanes.len() + 1);
+    let mut indptr: Vec<i64> = Vec::with_capacity(lanes.len() + 1);
     indptr.push(0);
     for (at, lane) in lanes.iter().enumerate() {
         let kv = u64::from(lane.have) + u64::from(lane.rows);
@@ -142,13 +138,14 @@ mod tests {
     }
 
     #[test]
-    fn a_fire_whose_masks_pass_a_32_bit_offset_is_refused() {
+    fn a_fire_whose_masks_pass_a_32_bit_offset_keeps_its_offsets() {
         assert_eq!(super::mask_offset(0, 0).unwrap(), 0);
-        assert_eq!(super::mask_offset(i32::MAX as usize, 3).unwrap(), i32::MAX);
-        let refused = super::mask_offset(i32::MAX as usize + 1, 3)
-            .unwrap_err()
-            .to_string();
-        assert!(refused.contains("by lane 3"), "{refused}");
+        let past = i32::MAX as usize + 1;
+        assert_eq!(
+            super::mask_offset(past, 3).unwrap(),
+            i64::from(i32::MAX) + 1
+        );
+        assert_eq!(super::mask_offset(5 << 30, 3).unwrap(), 5 << 30);
     }
 
     #[test]
