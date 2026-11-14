@@ -599,7 +599,8 @@ fn device_rs_plan(
 /// engine's `max_unfolded_rows`, 0 unbounded), before anything is
 /// submitted. The fold point is the inferlet's (a speculative rollback
 /// lands on it): the runtime never folds more behind its back. A fold the
-/// device computes is the engine's to bound.
+/// device computes is unknown before the fire: it counts as nothing folded,
+/// so no engine ever has to refuse mid-fire.
 fn check_unfolded(
     lane: usize,
     bound: u32,
@@ -608,8 +609,7 @@ fn check_unfolded(
     fold: rs::GroupFold,
 ) -> Result<(), String> {
     let folded = match fold {
-        rs::GroupFold::Device => return Ok(()),
-        rs::GroupFold::None => 0,
+        rs::GroupFold::Device | rs::GroupFold::None => 0,
         rs::GroupFold::Host(count) => count,
     };
     let unfolded = end.saturating_sub(frozen).saturating_sub(folded);
@@ -5666,8 +5666,8 @@ mod unfolded_tests {
 
     /// A lane may hold up to the engine's bound unfolded; one row past it
     /// is refused by name before anything is submitted; 0 is unbounded;
-    /// what the pass folds counts against it; a device fold is the
-    /// engine's to bound.
+    /// what the pass folds counts against it; a fold the device computes
+    /// counts as nothing folded.
     #[test]
     fn a_pass_past_the_unfolded_bound_is_refused() {
         // Folded through 100, writing through 164: 64 unfolded.
@@ -5684,6 +5684,8 @@ mod unfolded_tests {
             "what the pass folds leaves 64"
         );
         assert!(check_unfolded(0, 64, 100, 200, rs::GroupFold::Host(35)).is_err());
-        assert!(check_unfolded(0, 64, 100, 10_000, rs::GroupFold::Device).is_ok());
+        // A device fold counts as nothing folded: checked as if none.
+        assert!(check_unfolded(0, 64, 100, 164, rs::GroupFold::Device).is_ok());
+        assert!(check_unfolded(0, 64, 100, 165, rs::GroupFold::Device).is_err());
     }
 }
