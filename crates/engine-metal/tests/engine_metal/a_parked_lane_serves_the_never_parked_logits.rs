@@ -390,3 +390,18 @@ fn a_parked_windowed_lane_serves_the_never_parked_logits() {
 fn a_parked_hybrid_lane_serves_the_never_parked_logits() {
     check("qwen35-tiny");
 }
+
+/// The dense and hybrid lanes over a range of a segment a buffer: their
+/// pages and record park and come back to fresh chunks in other buffers.
+#[test]
+fn a_parked_lane_over_buffers_serves_the_never_parked_logits() {
+    engine_metal::store::pool::cap_parts(1);
+    let lifted = std::panic::catch_unwind(|| {
+        check("qwen3-micro-text");
+        check("qwen35-tiny");
+    });
+    engine_metal::store::pool::cap_parts(0);
+    if let Err(why) = lifted {
+        std::panic::resume_unwind(why);
+    }
+}
