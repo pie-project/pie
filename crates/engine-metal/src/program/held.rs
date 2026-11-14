@@ -72,7 +72,7 @@ impl Held {
 
     /// Bytes `[at, at + bytes)` of slot ref `slot` of `shape`, zeroed.
     pub fn in_slot(pools: &Pools, shape: ShapeId, slot: u32, at: u64, bytes: u64) -> Result<Held> {
-        let (offset, host, slot_bytes) = pools.slot_place(shape, slot)?;
+        let (buffer, offset, host, slot_bytes) = pools.slot_place(shape, slot)?;
         if at.checked_add(bytes).is_none_or(|end| end > slot_bytes) {
             return Err(Fault::program(
                 "program::held",
@@ -86,7 +86,7 @@ impl Held {
         // SAFETY: `at < slot_bytes`, inside the slot's chunk.
         let host = HostAt(unsafe { host.add(usize_of(at)) });
         let mut region = Held {
-            buffer: pools.view().clone(),
+            buffer,
             offset: offset + at,
             bytes,
             place: Place::Slot {
@@ -128,12 +128,12 @@ impl Held {
                 ),
             ));
         }
-        let (offset, host, _) = pools.slot_place(shape, first)?;
+        let (buffer, offset, host, _) = pools.slot_place(shape, first)?;
         // SAFETY: `at + bytes` lies inside the run, inside the first slot's
         // chunk.
         let host = HostAt(unsafe { host.add(usize_of(at)) });
         let mut region = Held {
-            buffer: pools.view().clone(),
+            buffer,
             offset: offset + at,
             bytes,
             place: Place::Slot {
@@ -156,7 +156,8 @@ impl Held {
             host,
         } = &mut self.place
         {
-            let (offset, base, _) = pools.slot_place(*shape, *slot)?;
+            let (buffer, offset, base, _) = pools.slot_place(*shape, *slot)?;
+            self.buffer = buffer;
             self.offset = offset + *at;
             // SAFETY: as in `in_slot`.
             *host = HostAt(unsafe { base.add(usize_of(*at)) });

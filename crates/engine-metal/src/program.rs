@@ -909,12 +909,32 @@ mod tests {
     /// moved them to other refs.
     #[test]
     fn an_instance_in_pool_slots_fires_through_moves() {
+        fires_through_moves(false);
+    }
+
+    /// As [`an_instance_in_pool_slots_fires_through_moves`] over four
+    /// buffers of a chunk each: the instance's tables, its rings and their
+    /// moves lie in buffers past the first.
+    #[test]
+    fn an_instance_in_pool_slots_past_the_first_buffer_fires_through_moves() {
+        fires_through_moves(true);
+    }
+
+    fn fires_through_moves(over: bool) {
         use crate::store::Pools;
         use crate::store::layout::{CHANNEL, INSTANCE};
         use engine::chunk::Evacuation;
 
         let context = Context::bind().expect("a Metal 4 device");
-        let mut pools = Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+        let mut pools = if over {
+            crate::store::pool::cap_parts(CHUNK);
+            let pools = Pools::guests_over(&context, CHUNK, 4, 1).expect("a pool");
+            crate::store::pool::cap_parts(0);
+            assert_eq!(pools.parts(), 4, "a buffer a chunk");
+            pools
+        } else {
+            Pools::guests_only(&context, CHUNK, 4).expect("a pool")
+        };
         let mut plane = Plane::new();
         let (registration, _, seeds, token) = registration();
         let program = plane

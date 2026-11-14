@@ -142,10 +142,10 @@ inline void sdpa_paged_mma_body(
         const int d  = int(e) - kk * D;
         if (kk < cnt) {
           const int kp = base + kk;
-          const int page = int(kv_page_indices[page_base + kp / page_size]);
+          const uint page = kv_page_indices[page_base + kp / page_size];
           const size_t off = size_t(kp % page_size) * kv_row + size_t(kv_head) * D + d;
-          ktile[d * KT + kk] = half(float(k_pages[size_t(page) * k_page + off]));
-          vtile[e] = half(float(v_pages[size_t(page) * v_page + off]));
+          ktile[d * KT + kk] = half(float(k_pages[pie_page_at(page, k_page, sizeof(T)) + off]));
+          vtile[e] = half(float(v_pages[pie_page_at(page, v_page, sizeof(T)) + off]));
         } else {
 
           ktile[d * KT + kk] = half(0);
@@ -388,8 +388,8 @@ METAL_FUNC void sdpa_wide_fetch(
     w[l] = uint4(0);
     if (kk < cnt) {
       const int kp = base + kk;
-      const int page = int(kv_page_indices[page_base + kp / page_size]);
-      const size_t cell = size_t(page) * page_elems +
+      const uint page = kv_page_indices[page_base + kp / page_size];
+      const size_t cell = pie_page_at(page, page_elems, sizeof(bfloat)) +
                           size_t(kp % page_size) * size_t(n_kv_heads) * size_t(D);
       w[l] = *reinterpret_cast<const device uint4*>(pages + cell + size_t(kv_head) * D + d0);
     }

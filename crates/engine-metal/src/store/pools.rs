@@ -623,7 +623,20 @@ impl Pools {
     /// committed. For tests of what guests place in slots.
     #[cfg(test)]
     pub(crate) fn guests_only(device: &Context, chunk_bytes: u64, chunks: u32) -> Result<Pools> {
-        let layout = Layout::new(chunk_bytes, chunks, chunks, 16, [0, 0], 1, 0, 0)?;
+        Self::guests_over(device, chunk_bytes, chunks, chunks)
+    }
+
+    /// [`Pools::guests_only`] in segments of `segment` chunks, every
+    /// segment committed: under [`super::pool::cap_parts`], a buffer a
+    /// segment.
+    #[cfg(test)]
+    pub(crate) fn guests_over(
+        device: &Context,
+        chunk_bytes: u64,
+        chunks: u32,
+        segment: u32,
+    ) -> Result<Pools> {
+        let layout = Layout::new(chunk_bytes, chunks, segment, 16, [0, 0], 1, 0, 0)?;
         let rows = Rows {
             rows: Vec::new(),
             chunk_bytes,
@@ -640,7 +653,7 @@ impl Pools {
         };
         let paging = super::kv::Paging::of(16, 256, 1, 1)?;
         let mut pools = Pools::reserve(device, rows, layout, paging)?;
-        pools.commit_segments(1)?;
+        pools.commit_segments(chunks.div_ceil(segment))?;
         Ok(pools)
     }
 
@@ -652,6 +665,7 @@ impl Pools {
             layout.total_chunks,
             layout.segment_chunks,
             layout.act_span(),
+            super::pool::part_cap(device),
         )?;
         let list_slots = layout.list.map_or(0, |list| {
             u64::from(list.per_chunk) * u64::from(layout.total_chunks)
@@ -687,7 +701,7 @@ impl Pools {
 
     /// Writes each state row's segment table: the bank is the whole pool,
     /// a chunk `chunk_bytes` apart, a slot the fixed slot apart, the row at
-    /// its offset in each of its pieces' slots; one segment.
+    /// its offset in each of its pieces' slots; a segment a buffer.
     fn write_maps(&mut self, device: &Context) -> Result<()> {
         let Some(fixed) = self.layout.fixed else {
             return Ok(());
@@ -705,14 +719,32 @@ impl Pools {
                 continue;
             };
             let element = u64::from(elem_size(dtype));
+            // A segment a buffer: each base is the buffer's first element
+            // from the first buffer's, where the bank is bound (wrapping, so
+            // a buffer below the first is a negative step).
+            let parts = self.pool.parts();
             let map = StateMap {
                 slot_stride: fixed.slot_bytes / element,
                 chunk_slots: fixed.per_chunk,
                 chunk_stride: self.layout.chunk_bytes / element,
-                seg_chunks: u32::MAX,
+                seg_chunks: if parts == 1 {
+                    u32::MAX
+                } else {
+                    self.pool.part_chunks()
+                },
                 piece_atoms,
                 pieces: pieces.max(1),
-                bases: vec![offset / element],
+                bases: (0..super::pool::MAX_PARTS)
+                    .map(|at| {
+                        let deltas = self.pool.deltas();
+                        deltas[at.min(deltas.len() - 1)]
+                    })
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .map(|&delta| {
+                        (((delta as i64) / element as i64) as u64).wrapping_add(offset / element)
+                    })
+                    .collect(),
             };
             tables.extend(map.bytes());
         }
@@ -771,7 +803,7 @@ impl Pools {
                 let offset = self.slot_offset(RS, slot)?;
                 self.pool
                     .admit(u32::try_from(offset / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
-                Ok(u32::try_from(offset / stride).unwrap_or(u32::MAX))
+                Ok(self.pool.page_id(offset, stride))
             })
             .collect()
     }
@@ -944,9 +976,13 @@ impl Pools {
     }
 
     /// Slot ref `slot` of shape `id` as a guest's table or ring holds it
-    /// (`program::held`): its byte offset in the view, the host address of
+    /// (`program::held`): the buffer it lies in, its byte offset there, the host address of
     /// its first byte (through the heap under it), and its bytes.
-    pub fn slot_place(&self, id: ShapeId, slot: u32) -> Result<(u64, std::ptr::NonNull<u8>, u64)> {
+    pub fn slot_place(
+        &self,
+        id: ShapeId,
+        slot: u32,
+    ) -> Result<(Buffer, u64, std::ptr::NonNull<u8>, u64)> {
         let shape = *self.shape(id)?;
         let (chunk, index) = self.place(&shape, slot)?;
         let inner = u64::from(index) * shape.slot_bytes;
@@ -955,11 +991,10 @@ impl Pools {
         // host address names.
         #[allow(unsafe_code)]
         let host = unsafe { host.add(usize::try_from(inner).unwrap_or(usize::MAX)) };
-        Ok((
-            u64::from(chunk) * self.layout.chunk_bytes + inner,
-            host,
-            shape.slot_bytes,
-        ))
+        let (view, at) = self
+            .pool
+            .view_at(u64::from(chunk) * self.layout.chunk_bytes + inner);
+        Ok((view.clone(), at, host, shape.slot_bytes))
     }
 
     /// The slots of shape `id` one chunk holds.
@@ -995,11 +1030,16 @@ impl Pools {
             return (0..pages)
                 .map(|page| {
                     let id = u32::try_from(first + u64::from(page)).unwrap_or(u32::MAX);
-                    self.physical(LIST, list.seat_ref(id)?)
+                    Ok(self
+                        .pool
+                        .slot_page(self.physical(LIST, list.seat_ref(id)?)?, list.per_chunk))
                 })
                 .collect();
         }
-        refs.iter().map(|&r| self.physical(LIST, r)).collect()
+        let list = *self.shape(LIST)?;
+        refs.iter()
+            .map(|&r| Ok(self.pool.slot_page(self.physical(LIST, r)?, list.per_chunk)))
+            .collect()
     }
 
     /// The page tables a fire stages, by the list each pages: the kv
@@ -1069,7 +1109,7 @@ impl Pools {
             let at = self.slot_offset(id, slot)?;
             self.pool
                 .admit(u32::try_from(at / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
-            Ok(u32::try_from(at / stride).unwrap_or(u32::MAX))
+            Ok(self.pool.page_id(at, stride))
         };
         if let Some((slot, pages)) = seat
             && refs.is_empty()
@@ -1263,6 +1303,44 @@ impl Pools {
         (offset, self.pool.bytes() - offset)
     }
 
+    /// The buffers the range spans.
+    #[must_use]
+    pub fn parts(&self) -> usize {
+        self.pool.parts()
+    }
+
+    /// The physical kv list slot a kernel's page id names (ids carry their
+    /// buffer, [`Pool::slot_page`]).
+    #[must_use]
+    pub fn list_slot(&self, id: u32) -> u32 {
+        let per = self.layout.list.map_or(1, |list| list.per_chunk);
+        self.pool.page_slot(id, per)
+    }
+
+    /// Every buffer of the range past the first, which kernels reach
+    /// through an address in the first.
+    #[must_use]
+    pub fn part_slabs(&self) -> Vec<crate::device::alloc::Slab> {
+        (1..self.pool.parts())
+            .map(|at| self.pool.part_view(at).slab().clone())
+            .collect()
+    }
+
+    /// Each buffer's address less the first's ([`Pool::deltas`]).
+    #[must_use]
+    pub fn deltas(&self) -> Vec<u64> {
+        self.pool.deltas()
+    }
+
+    /// The buffer the activation span lies in (the last), where in it the
+    /// span starts, and its bytes.
+    #[must_use]
+    pub fn span_view(&self) -> (&Buffer, u64, u64) {
+        let (offset, bytes) = self.span();
+        let (view, at) = self.pool.view_at(offset);
+        (view, at, bytes)
+    }
+
     /// The device bytes the span's backed segments hold.
     #[must_use]
     pub fn span_held_bytes(&self) -> u64 {
@@ -1445,7 +1523,7 @@ impl Pools {
                     let segments = Tensor::new(
                         handles.bind(maps, state_row * STATE_MAP_BYTES, STATE_MAP_BYTES)?,
                         1,
-                        (StateMap::HEAD + 1) as u32,
+                        (StateMap::HEAD + super::pool::MAX_PARTS) as u32,
                         Dtype::U64,
                     );
                     state_row += 1;
@@ -1555,7 +1633,6 @@ impl Pools {
         }
         let list = *self.shape(LIST)?;
         let runs = self.kv_runs();
-        let view = self.pool.view();
         for (src, dst, span) in placed {
             if span.tokens == 0 {
                 continue;
@@ -1567,7 +1644,7 @@ impl Pools {
                 let from = src_at + offset + u64::from(span.src_token) * cell;
                 let to = dst_at + offset + u64::from(span.dst_token) * cell;
                 if from != to {
-                    frame.copy_span(view, from, view, to, bytes)?;
+                    self.pool.copy(frame, from, to, bytes)?;
                 }
             }
         }
@@ -1596,7 +1673,6 @@ impl Pools {
     /// Copies whole slots of `id` (slot refs) `(src, dst)` on the device.
     fn copy_whole(&self, frame: &mut Frame, id: ShapeId, moves: &[(u32, u32)]) -> Result<()> {
         let shape = *self.shape(id)?;
-        let view = self.pool.view();
         for &(src, dst) in moves {
             let from = self.slot_offset(id, src)?;
             let to = self.slot_offset(id, dst)?;
@@ -1605,7 +1681,7 @@ impl Pools {
             self.pool
                 .admit(u32::try_from(to / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
             if from != to {
-                frame.copy_span(view, from, view, to, shape.slot_bytes)?;
+                self.pool.copy(frame, from, to, shape.slot_bytes)?;
             }
         }
         Ok(())
@@ -1930,7 +2006,8 @@ impl Pools {
                     *seat = Some(resident.slot);
                 }
                 let offset = |slot: u32| self.weight_slot(shape.per_chunk, shape.slot_bytes, slot);
-                fills.extend(cache.take(frame, named, self.pool.view(), &offset)?);
+                let into = |at: u64| self.pool.view_at(at);
+                fills.extend(cache.take(frame, named, &into, &offset)?);
             }
             Ok(())
         })();
@@ -2143,11 +2220,14 @@ impl Pools {
     /// Rewrites every weight address table for where its blocks lie now.
     /// No frame is in flight.
     pub fn restage_weights(&mut self) -> Result<()> {
-        let base = crate::device::alloc::slab_address(self.pool.view().slab());
         let mut caches = std::mem::take(&mut self.weight_caches);
         let staged = caches.iter_mut().try_for_each(|cache| {
             let (per_chunk, slot_bytes) = (cache.shape.per_chunk, cache.shape.slot_bytes);
-            cache.restage(base, &|slot| self.weight_slot(per_chunk, slot_bytes, slot))
+            cache.restage(&|slot| {
+                Ok(self
+                    .pool
+                    .address(self.weight_slot(per_chunk, slot_bytes, slot)?))
+            })
         });
         self.weight_caches = caches;
         staged

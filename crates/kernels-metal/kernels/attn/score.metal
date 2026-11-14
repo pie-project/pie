@@ -92,7 +92,7 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
     float running_sum = 0.0f;
     for (int j = warp; j < limit; j += SIMDS) {
       const size_t cell =
-          size_t(kv_page_indices[page_first + j / page_size]) * k_page +
+          pie_page_at(kv_page_indices[page_first + j / page_size], k_page, sizeof(T)) +
           size_t(j % page_size) * size_t(row_stride);
       const device T* k_row = k_pages + cell + size_t(kv_head) * size_t(head_dim);
       float dot = 0.0f;
@@ -130,7 +130,7 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
 
     for (int j = warp; j < limit; j += SIMDS) {
       const size_t cell =
-          size_t(kv_page_indices[page_first + j / page_size]) * k_page +
+          pie_page_at(kv_page_indices[page_first + j / page_size], k_page, sizeof(T)) +
           size_t(j % page_size) * size_t(row_stride);
       const device T* k_row = k_pages + cell + size_t(kv_head) * size_t(head_dim);
       float dot = 0.0f;

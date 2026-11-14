@@ -1027,16 +1027,32 @@ impl PreparedLoad<'_> {
             let total = engine::chunk::fit(room, chunk, 0, least)
                 .map_err(|short| Fault::Residency(short.to_string()))?
                 .saturating_add(span);
-            // The range is one buffer.
-            let binds = u32::try_from(device.max_buffer() / chunk).unwrap_or(u32::MAX);
-            if binds < least.saturating_add(span) {
+            // The range spans up to `MAX_PARTS` buffers, each as many whole
+            // segments as one buffer binds; the span lies in the last.
+            let cap = crate::store::pool::part_cap(&device);
+            let per = crate::store::pool::part_chunks(
+                cap,
+                chunk,
+                crate::store::pool::segment_chunks(chunk),
+            );
+            let binds = per.saturating_mul(crate::store::pool::MAX_PARTS as u32);
+            if binds < least.saturating_add(span) || per < span {
                 return Err(Fault::Residency(format!(
                     "one working set takes {least} chunks of {chunk} bytes and one fire's \
-                     activation {span}, and this device binds one buffer of {} MiB",
-                    device.max_buffer() >> 20
+                     activation {span}, and this device binds {} buffers of {} MiB, the \
+                     activation in one",
+                    crate::store::pool::MAX_PARTS,
+                    cap >> 20
                 )));
             }
-            let total = total.min(binds);
+            let mut total = total.min(binds);
+            // The last buffer holds the span: a leftover too small for it
+            // goes, at most one span and segment of state.
+            let left = total % per;
+            let seg = crate::store::pool::segment_chunks(chunk);
+            if total > per && left != 0 && left < span.saturating_add(seg) {
+                total -= left;
+            }
             let mut layout = Layout::new(
                 chunk,
                 total,
@@ -1084,7 +1100,25 @@ impl PreparedLoad<'_> {
         }
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging)?;
-        let arena = Arena::over(pools.view().clone(), pools.span(), scratch.bytes(), rungs);
+        // Kernels reach the pool's buffers past the first through addresses
+        // in it: every compute pass declares them.
+        if pools.parts() > 1 {
+            device.reach_indirectly(pools.part_slabs());
+            if crate::diag::on().tier_trace {
+                eprintln!(
+                    "residency: the range spans {} buffers, each's address less the first's {:?}",
+                    pools.parts(),
+                    pools.deltas().iter().map(|&d| d as i64).collect::<Vec<_>>()
+                );
+            }
+        }
+        let (span_view, span_at, span_bytes) = pools.span_view();
+        let arena = Arena::over(
+            span_view.clone(),
+            (span_at, span_bytes),
+            scratch.bytes(),
+            rungs,
+        );
         if crate::diag::on().tier_trace {
             let layout = pools.layout();
             eprintln!(
@@ -1101,8 +1135,8 @@ impl PreparedLoad<'_> {
         // The smallest rung's fire is backed from the load, so a raise the
         // system refuses always has a rung in hand to cut back to.
         pools.cover(arena.floor_reach())?;
-        pools.zero_span(arena.scratch_at(), scratch.bytes())?;
-        scratch.seat(pools.view().clone(), arena.scratch_at());
+        pools.zero_span(pools.bytes() - arena.scratch_room(), scratch.bytes())?;
+        scratch.seat(arena.store().clone(), arena.scratch_at());
         pools.seat_weights(weight_caches);
         // The null chunk and the floor stand from the load on.
         pools.commit_segments(1)?;
@@ -1152,7 +1186,13 @@ impl PreparedLoad<'_> {
             outside,
             budget: boot.allowance.budget,
             keepalive,
-            pipelines: Pipelines::new(),
+            pipelines: {
+                let pipelines = Pipelines::new();
+                if pools.parts() > 1 {
+                    pipelines.set_pool(&pools.deltas());
+                }
+                pipelines
+            },
             handles,
             trace: boot.trace,
             compiled,
@@ -3289,7 +3329,7 @@ impl Shell {
         let written = writes
             .iter()
             .flatten()
-            .map(|&(page, _)| u64::from(page.max(0) as u32).saturating_add(1))
+            .map(|&(page, _)| u64::from(self.pools.list_slot(page.max(0) as u32)).saturating_add(1))
             .max()
             .unwrap_or(0);
         let demand = Demand {
@@ -3308,7 +3348,7 @@ impl Shell {
                         table
                             .iter()
                             .take(pages as usize)
-                            .copied()
+                            .map(|&page| self.pools.list_slot(page))
                             .max()
                             .map_or(0, |page| u64::from(page).saturating_add(1))
                     }
