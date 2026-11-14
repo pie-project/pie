@@ -1428,7 +1428,7 @@ impl Shell {
             belted: false,
             starved: None,
             peer_stopped: false,
-            unit_margin: self.pools.map_unit_bytes().saturating_mul(16),
+            unit_margin: self.pools.arming_margin_bytes(),
             profiled: self.budget.buckets.len(),
             ballot: Ballot::open(&self.device),
         })
