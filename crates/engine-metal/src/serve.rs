@@ -1945,7 +1945,7 @@ impl Shell {
         slots: &[u32],
     ) -> Result<()> {
         self.programs
-            .register_channel(&self.device, id, shape, &self.pools, slots)
+            .register_channel(id, shape, &self.pools, slots)
     }
 
     pub fn close_shared_channel(&mut self, id: engine::ChannelId) -> bool {

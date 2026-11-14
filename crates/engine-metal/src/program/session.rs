@@ -99,17 +99,15 @@ pub struct Session {
 }
 
 impl Session {
-    /// The device bytes this instance holds: its own rings, and its stages'
-    /// launch tables and scratch.
+    /// The device bytes this instance holds apart from the pool: its
+    /// stages' launch tables and scratch (its rings are the pool's).
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.rings.bytes()
-            + self
-                .prepared
-                .iter()
-                .flatten()
-                .map(Prepared::bytes)
-                .sum::<u64>()
+        self.prepared
+            .iter()
+            .flatten()
+            .map(Prepared::bytes)
+            .sum::<u64>()
     }
 
     /// The bind-time tables an instance of `compiled` takes, every
@@ -146,7 +144,7 @@ impl Session {
 
         let shapes: Vec<ChannelShape> =
             plan.package.channels.iter().map(ChannelShape::of).collect();
-        let rings = Rings::allocate(device, &shapes, adopted, pooled.pools, pooled.rings)?;
+        let rings = Rings::allocate(&shapes, adopted, pooled.pools, pooled.rings)?;
         let sizes = Session::table_sizes(compiled);
         let tables_run = TableLayout::of(&sizes, pooled.pools.slot_bytes(INSTANCE)?).run;
         let mut tables = Tables::pooled(pooled.pools, INSTANCE, pooled.instance, &sizes)?;

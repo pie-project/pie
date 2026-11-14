@@ -100,10 +100,10 @@ impl ChannelShape {
     }
 
     /// Zeroed cells for this ring in `slots`, the `Channel` slot refs the
-    /// runtime took for it. A ring larger than a chunk is the one the
-    /// engine keeps (the contract states no slots for it): a buffer of its
-    /// own.
-    pub fn cells(&self, device: &Context, pools: &Pools, slots: &[u32]) -> Result<Cells> {
+    /// runtime took for it. A ring whose cells pass a slot lies in one run,
+    /// which lies in one chunk: a ring past that is refused, never held
+    /// beside the pool.
+    pub fn cells(&self, pools: &Pools, slots: &[u32]) -> Result<Cells> {
         let stride = self.cell_stride() as u64;
         let slot = pools.slot_bytes(CHANNEL)?;
         let per_chunk = pools.slots_per_chunk(CHANNEL)?;
@@ -112,18 +112,16 @@ impl ChannelShape {
         if fits {
             return Cells::pooled(pools, CHANNEL, slots, self.cell_count(), stride);
         }
-        if !slots.is_empty() {
-            return Err(Fault::program(
-                "program::launch",
-                format!(
-                    "a ring of {} bytes is larger than a chunk, the engine's to keep, and the \
-                     binding names {} channel slot(s) for it",
-                    self.cell_count() * stride,
-                    slots.len()
-                ),
-            ));
-        }
-        Cells::own(device, self.cell_count(), stride)
+        Err(Fault::program(
+            "program::launch",
+            format!(
+                "a ring of {} cells of {stride} bytes: its cells pass a {slot}-byte channel slot, \
+                 so it lies in one run of adjacent slots, and the run's {} bytes pass a chunk \
+                 of {per_chunk} slots; declare fewer cells or a smaller cell",
+                self.cell_count(),
+                self.cell_count() * stride,
+            ),
+        ))
     }
 }
 
@@ -137,18 +135,9 @@ pub struct Rings {
 }
 
 impl Rings {
-    /// The rings this instance holds itself apart from the pool (adopted
-    /// shared rings are the plane's; pooled rings are the pool's).
-    #[must_use]
-    pub fn bytes(&self) -> u64 {
-        self.own.iter().flatten().map(Cells::own_bytes).sum()
-    }
-
     /// `rings`: the `Channel` slots the runtime took for each ring this
-    /// instance holds itself, by channel (none for a ring larger than a
-    /// chunk, which the engine keeps).
+    /// instance holds itself, by channel.
     pub fn allocate(
-        device: &Context,
         shapes: &[ChannelShape],
         adopted: &[Option<Arc<SharedRing>>],
         pools: &Pools,
@@ -183,7 +172,7 @@ impl Rings {
                 .iter()
                 .find(|ring| ring.channel as usize == channel)
                 .map_or(&[][..], |ring| ring.slots.as_slice());
-            own.push(Some(shape.cells(device, pools, slots)?));
+            own.push(Some(shape.cells(pools, slots)?));
             shared.push(None);
         }
         Ok(Rings {
@@ -408,7 +397,6 @@ impl Grouped {
         .chain(&self.layouts)
         .map(Buffer::bytes)
         .sum::<u64>()
-            + self.bindings.own_bytes()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -864,10 +852,6 @@ impl Prepared {
             .into_iter()
             .map(Buffer::bytes)
             .sum::<u64>()
-            + [&self.descriptors, &self.params, &self.offsets]
-                .into_iter()
-                .map(Held::own_bytes)
-                .sum::<u64>()
             + self.scratch.bytes()
             + self.grouped.as_ref().map_or(0, Grouped::bytes)
     }
