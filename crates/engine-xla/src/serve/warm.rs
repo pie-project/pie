@@ -24,6 +24,7 @@ use poem_ir::Request;
 
 use super::{Lane, Seated, Shell};
 use crate::error::Result;
+use crate::device::{Admission, available_memory, compile_need, hold_bytes};
 
 /// One synthetic lane: its word, its rows, and the pages it holds before
 /// them (a decode lane at a page bound holds all but one slot of them).
@@ -322,9 +323,8 @@ impl Shell {
         // 168-program ladder one compile at a time, 73 compile-minutes past
         // the hour a round has). A v5e host's 47 GB stopped answering at four
         // started together.
-        let need_of = |text: &str| ((hold_bytes(text) >> 6) * 3) << 8;
-        let need = texts.iter().map(|(t, _)| need_of(t)).max().unwrap_or(0);
-        let least = texts.iter().map(|(t, _)| need_of(t)).min().unwrap_or(0);
+        let need = texts.iter().map(|(t, _)| compile_need(t)).max().unwrap_or(0);
+        let least = texts.iter().map(|(t, _)| compile_need(t)).min().unwrap_or(0);
         // A compiled program held in host memory costs ~64 bytes a byte of its
         // text (0.5 GB a 9 MiB program; 65 of them 42 GB of a v5e host's 47),
         // and libtpu's allocator keeps what a dropped one freed for its own
@@ -345,9 +345,8 @@ impl Shell {
         // leaves of the free memory. A compile starts once its own need and
         // every running one's fit in it, woken by a compile that ends (no
         // poll of the free memory).
-        let room_for_compiles = available_memory().map_or(u64::MAX, |b| b.saturating_sub(budget));
-        let running = std::sync::Mutex::new(0u64);
-        let ended = std::sync::Condvar::new();
+        let admission =
+            Admission::new(available_memory().map_or(u64::MAX, |b| b.saturating_sub(budget)));
         let room = available_memory().map_or(8, |b| b / least.max(1)) as usize;
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
@@ -384,20 +383,10 @@ impl Shell {
                                 continue;
                             }
                         }
-                        // Admitted one at a time: a compile in flight may
-                        // not have taken its memory yet, so each counts as
-                        // still to come.
-                        let own = need_of(text);
-                        {
-                            let mut busy = running.lock().expect("the warm admission lock poisoned");
-                            while *busy > 0 && *busy + own > room_for_compiles {
-                                busy = ended.wait(busy).expect("the warm admission lock poisoned");
-                            }
-                            *busy += own;
-                        }
-                        let program = device.program(text, (*sig).clone());
-                        *running.lock().expect("the warm admission lock poisoned") -= own;
-                        ended.notify_all();
+                        let program = {
+                            let _admitted = admission.admit(text);
+                            device.prepare(text, (*sig).clone())
+                        };
                         if kept || program.is_err() {
                             if let Ok(mut slot) = slots[at].lock() {
                                 *slot = Some(program);
@@ -461,7 +450,7 @@ impl Shell {
                                 }
                                 loading.fetch_add(hold, SeqCst);
                             }
-                            let program = device.program(text, (*sig).clone());
+                            let program = device.prepare(text, (*sig).clone());
                             loading.fetch_sub(hold, SeqCst);
                             if let Ok(mut slot) = loads[at].lock() {
                                 *slot = Some(program);
@@ -569,28 +558,4 @@ impl Shell {
 /// token lands in the last slot of its `p`-th page; a fresh lane holds none.
 fn held_of(want: &Want, page_size: u32) -> u32 {
     (want.held_pages * page_size).saturating_sub(want.rows.min(1))
-}
-
-/// The host memory free for new allocations (`MemAvailable`), where the host
-/// says.
-fn available_memory() -> Option<u64> {
-    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
-    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kib << 10)
-}
-
-/// The host memory a compiled program holds: ~64 bytes a byte of its text,
-/// less its Mosaic kernels' bodies (`tpu_custom_call` configs, one HLO
-/// instruction each however long its base64), counted at their own size.
-fn hold_bytes(text: &str) -> u64 {
-    const BODY: &str = "\\22body\\22: \\22";
-    let (mut kernels, mut rest) = (0, text);
-    while let Some(at) = rest.find(BODY) {
-        let tail = &rest[at + BODY.len()..];
-        let len = tail.find("\\22").unwrap_or(tail.len());
-        kernels += len;
-        rest = &tail[len..];
-    }
-    (((text.len() - kernels) as u64) << 6) + kernels as u64
 }

@@ -463,7 +463,11 @@ fn a_served_miniature_is_in_the_ledger_whole() {
         return;
     };
     let loaded = shell.device().outside();
-    let unbuilt = shell.device().books().ledger().of(Class::Outside, "unbuilt pipelines");
+    let unbuilt = shell
+        .device()
+        .books()
+        .ledger()
+        .of(Class::Outside, "unbuilt pipelines");
     serve_seats(&mut shell, &fixture.trace, 2);
     let books = shell.device().books();
     let ledger = books.ledger();
@@ -488,6 +492,127 @@ fn a_served_miniature_is_in_the_ledger_whole() {
             "nothing entered as {class:?}: {ledger}"
         );
     }
+}
+
+/// State lent in the activation span under a narrow rung's carve stands
+/// through that rung's fires, the first (recorded where the backend
+/// records) and every replay: no fire writes past the chunks its rung
+/// states.
+#[test]
+fn state_lent_in_the_span_outlives_a_narrow_rungs_fires() {
+    use engine::chunk::{SlotCopy, SlotKind};
+    use engine::transfer::MemoryDomain;
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load_with(
+        &fixture,
+        PAGE,
+        CONTEXT,
+        Some(64 << 10),
+        engine::load::Residency {
+            host_kv_budget: Some(256 << 20),
+            ..engine::load::Residency::default()
+        },
+    ) else {
+        return;
+    };
+    let device = <backend::Api as engine_gpu::api::Host>::domain(&DeviceBoot::default());
+    // The prefills take the top rung; the decodes after them two lanes.
+    let mut fed: [Vec<u32>; 2] = prompts();
+    let mut held = [0u32; 2];
+    for lane in 0..2usize {
+        let seated = Seated {
+            held: Some(held[lane]),
+            ..Seated::of(Lane {
+                slot: lane as u32,
+                word: word(&fixture.trace, fed[lane].len() as u32),
+                tokens: &fed[lane],
+            })
+        };
+        let got = shell.fire_seated(&[seated]).expect("the prefill lands");
+        held[lane] += fed[lane].len() as u32;
+        fed[lane] = vec![argmax(&got[0])];
+    }
+    let facts = shell.pool_chunk_facts();
+    let total = facts.total_chunks;
+    let rung = |tokens: u32| {
+        facts
+            .act_chunks
+            .iter()
+            .find(|&&(rung, _)| rung >= tokens)
+            .map_or(0, |&(_, chunks)| chunks)
+    };
+    let (narrow, widest) = (rung(2), facts.act_chunks_max());
+    assert!(
+        widest > narrow,
+        "a two-lane rung lends span chunks: {:?}",
+        facts.act_chunks
+    );
+    let list = facts
+        .shapes
+        .iter()
+        .find(|shape| shape.id == LIST && matches!(shape.kind, SlotKind::List { .. }))
+        .expect("a kv list");
+    let per = list.slots_per_chunk;
+    // Every chunk of the span the narrow rung lends.
+    let lent: Vec<u32> = (total - widest..total - narrow).collect();
+    let device_refs: Vec<u32> = lent
+        .iter()
+        .flat_map(|&chunk| (0..per).map(move |i| chunk * per + i))
+        .collect();
+    let slots = device_refs.len() as u32;
+    let host_in: Vec<u32> = (0..slots).collect();
+    let host_out: Vec<u32> = (slots..2 * slots).collect();
+    let pattern: Vec<u8> = (0..u64::from(slots) * list.slot_bytes)
+        .map(|at| (at.wrapping_mul(2_654_435_761) >> 13) as u8 | 1)
+        .collect();
+    shell
+        .write_tier_slots(&[(LIST, host_in.clone())], &pattern)
+        .expect("the host slots take the pattern");
+    let pairs = |from: &[u32], to: &[u32]| from.iter().copied().zip(to.iter().copied()).collect();
+    shell
+        .copy_slots(&SlotCopy {
+            shape: LIST,
+            src: MemoryDomain::HostPinned,
+            dst: device,
+            slots: pairs(&host_in, &device_refs),
+            runs: Vec::new(),
+        })
+        .expect("the pattern lands in the lent chunks");
+    for _ in 0..6 {
+        let seated: Vec<Seated<'_>> = (0..2usize)
+            .map(|lane| Seated {
+                held: Some(held[lane]),
+                ..Seated::of(Lane {
+                    slot: lane as u32,
+                    word: word(&fixture.trace, 1),
+                    tokens: &fed[lane],
+                })
+            })
+            .collect();
+        let got = shell.fire_seated(&seated).expect("the decode lands");
+        for lane in 0..2 {
+            held[lane] += 1;
+            fed[lane] = vec![argmax(&got[lane])];
+        }
+    }
+    shell
+        .copy_slots(&SlotCopy {
+            shape: LIST,
+            src: device,
+            dst: MemoryDomain::HostPinned,
+            slots: pairs(&device_refs, &host_out),
+            runs: Vec::new(),
+        })
+        .expect("the lent chunks read back");
+    let back = shell
+        .read_tier_slots(&[(LIST, host_out)])
+        .expect("the host slots read");
+    let first = back.iter().zip(&pattern).position(|(a, b)| a != b);
+    assert_eq!(
+        first, None,
+        "a two-lane fire wrote lent span chunks {lent:?} (rung chunks {narrow} of {widest}, \
+         total {total})"
+    );
 }
 
 /// Panics at the first row whose logits differ in a bit.

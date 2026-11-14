@@ -57,6 +57,25 @@ struct Instance {
     /// there are the instance's current ones (else its rings' fronts are).
     cells: Vec<(u32, u32)>,
     on_device: bool,
+    /// Each fed channel's ring (`embed_tokens`): its first pool row, its
+    /// capacity and a cell's rows. Sequence `q`'s cell lies at `first +
+    /// (q mod capacity) · rows`, where a pass puts it and the next fire
+    /// reads it.
+    fed: Vec<(u32, u32, u32, u32)>,
+}
+
+impl Instance {
+    /// Each pooled channel's row this pass: a carried cell's own, a fed
+    /// ring's at its tail (where the pass's put lands).
+    fn rows(&self) -> Vec<(u32, u32)> {
+        let mut out = self.cells.clone();
+        for &(channel, first, capacity, rows) in &self.fed {
+            let tail = self.inst.channels[channel as usize].tail();
+            let at = u32::try_from(tail % u64::from(capacity.max(1))).unwrap_or(0);
+            out.push((channel, first + at * rows));
+        }
+        out
+    }
 }
 
 impl Instance {
@@ -367,10 +386,11 @@ impl Flights {
 /// indexes of each token in `out`).
 pub enum Tokens {
     Host(Vec<u32>),
-    Device {
-        out: Arc<crate::pjrt::Buffer>,
-        words: Vec<u32>,
-    },
+    /// Where in the pool the last pass put the tokens: each a pool row and
+    /// a lane of it (its fed ring's slots), which the fire gathers. Row and
+    /// lane apart, never one element index over the whole pool (an i32 of
+    /// those reaches 8 GiB).
+    Device { at: Vec<(u32, u32)> },
 }
 
 impl Tokens {
@@ -378,7 +398,7 @@ impl Tokens {
     pub fn len(&self) -> usize {
         match self {
             Tokens::Host(ids) => ids.len(),
-            Tokens::Device { words, .. } => words.len(),
+            Tokens::Device { at } => at.len(),
         }
     }
 
@@ -459,7 +479,7 @@ impl Plane {
             && let (Some(device), Some(form)) = (device, self.forms.get(id).cloned())
             && let Err(why) =
                 self.stages
-                    .compile_all(device, &plan.package, form.key, &form.carried)
+                    .compile_all(device, &plan.package, form.key, &form.pooled())
         {
             self.forms.forget(id);
             return Err(Refusal::Program(format!(
@@ -505,8 +525,17 @@ impl Plane {
                 .unwrap_or_default()
         };
         let cells = cells_of(&carried, rings, cell_row)?;
+        let fed = {
+            let program = self.instances.get(&id).map(|h| h.program);
+            let fed = program
+                .and_then(|p| self.forms.get(p))
+                .map(|c| c.fed.clone())
+                .unwrap_or_default();
+            fed_of(&fed, rings, cell_row)?
+        };
         if let Some(held) = self.instances.get_mut(&id) {
             held.cells = cells;
+            held.fed = fed;
         }
         Ok(())
     }
@@ -518,7 +547,7 @@ impl Plane {
     pub fn fire_facts(&self, program: ProgramId, load_temp: u64) -> engine::program::FireFacts {
         self.forms
             .get(program)
-            .map(|form| self.stages.fire_facts(form.key, &form.carried, load_temp))
+            .map(|form| self.stages.fire_facts(form.key, &form.pooled(), load_temp))
             .unwrap_or_default()
     }
 
@@ -631,6 +660,11 @@ impl Plane {
             .map(|c| c.carried_words.clone())
             .unwrap_or_default();
         let cells = cells_of(&carried, &binding.ring_slots, cell_row)?;
+        let fed = fed_of(
+            &self.forms.get(binding.program).map(|c| c.fed.clone()).unwrap_or_default(),
+            &binding.ring_slots,
+            cell_row,
+        )?;
 
         self.next_instance += 1;
         let id = InstanceId(self.next_instance);
@@ -646,6 +680,7 @@ impl Plane {
                 poisoned,
                 cells,
                 on_device: false,
+                fed,
             },
         );
         Ok(BoundInstance {
@@ -790,19 +825,23 @@ impl Plane {
                 ))
             })?;
         let ring = &seat.inst.channels[binding.channel as usize];
-        // The cell this fire reads is still in the last pass's output on
-        // the device: the fire reads it there, with no trip to the host.
+        // The cell this fire reads is the last pass's, still on its way
+        // to the host: the pass put it in the fed ring's slot too, where the
+        // fire gathers it, with no trip to the host.
         if ring.is_empty()
             && let Some(cell) = self.flights.cell_at(ring, ring.head())
             && let crate::guest::lower::Feed::Value(
                 eta_ir::types::Dtype::I32 | eta_ir::types::Dtype::U32,
                 n,
             ) = cell.slot.feed
+            && let Some(&(_, first, capacity, cell_rows)) =
+                seat.fed.iter().find(|f| f.0 == binding.channel)
         {
             let span = self.lane_span(seat, instance, "embed_tokens", n, rows, lane_at)?;
+            let at = u32::try_from(ring.head() % u64::from(capacity.max(1))).unwrap_or(0);
+            let row = first + at * cell_rows;
             return Ok(Some(Tokens::Device {
-                out: cell.out,
-                words: span.map(|i| (cell.word + i) as u32).collect(),
+                at: span.map(|i| (row + i as u32 / 128, i as u32 % 128)).collect(),
             }));
         }
         self.settle_ring(ring);
@@ -1083,7 +1122,7 @@ impl Plane {
             })?;
             let form = self.forms.get(seat.program).map(|c| c.key);
             if let Some(c) = self.forms.get(seat.program) {
-                carried_of.insert(c.key, c.carried.clone());
+                carried_of.insert(c.key, c.pooled());
             }
             plans.push(match (form, bound(&seat.plan, kept, lane)) {
                 (Some(key), Some(bound)) => Some((Arc::clone(&seat.plan), key, bound)),
@@ -1201,10 +1240,11 @@ impl Plane {
                         continue;
                     };
                     order.push((at, id, held.program));
+                    let cells = held.rows();
                     group.push(Member {
                         inst: &mut held.inst,
                         bound: plans[at].as_ref().map(|p| p.2.clone()).unwrap_or_default(),
-                        cells: held.cells.clone(),
+                        cells,
                     });
                 }
                 let (outcomes, deferred) = if latch.is_some() {
@@ -1573,8 +1613,8 @@ fn cells_of(
                 .and_then(|r| r.slots.first().copied())
                 .ok_or_else(|| {
                     Refusal::Program(format!(
-                        "the program keeps carried channel {channel} in Channel slots and the \
-                         binding names none for it"
+                        "the program keeps channel {channel} in Channel slots and the binding \
+                         names none for it"
                     ))
                 })?;
             let row = cell_row(first).ok_or_else(|| {
@@ -1597,4 +1637,23 @@ fn cells_to_host(held: &mut Instance, pool: Option<&crate::pjrt::Buffer>) -> Res
     crate::guest::run::read_cells(&held.plan, pool, &held.cells, &held.inst)?;
     held.on_device = false;
     Ok(())
+}
+
+/// Each fed channel's ring: its first pool row (the binding's slots for it,
+/// one contiguous run), its capacity and a cell's rows (whole slots).
+fn fed_of(
+    fed: &[(u32, u32, u32)],
+    rings: &[engine::program::RingSlots],
+    cell_row: &dyn Fn(u32) -> Option<u32>,
+) -> Result<Vec<(u32, u32, u32, u32)>, Refusal> {
+    let words: Vec<(u32, u32)> = fed.iter().map(|&(c, w, _)| (c, w)).collect();
+    let firsts = cells_of(&words, rings, cell_row)?;
+    Ok(fed
+        .iter()
+        .zip(firsts)
+        .map(|(&(channel, w, capacity), (_, first))| {
+            let slots = (u64::from(w) * 4).div_ceil(crate::guest::CHANNEL_SLOT);
+            (channel, first, capacity, u32::try_from(slots * 2).unwrap_or(u32::MAX))
+        })
+        .collect())
 }

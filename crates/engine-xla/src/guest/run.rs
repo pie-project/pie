@@ -20,7 +20,7 @@ use eta_ir::registry::Stage;
 use eta_ir::validate::Direction;
 
 use super::lower::{self, Batch, Feed, Layout, Read, Slot};
-use crate::device::{Device, Program};
+use crate::device::{Admission, Device, Program, available_memory};
 use crate::pjrt::{Arg, Buffer};
 use crate::readout::{Kept, Seat};
 
@@ -102,6 +102,7 @@ fn stage(
     batch: Batch,
     carried: &[u32],
     pool_rows: i64,
+    registering: Option<&Admission>,
 ) -> Result<Arc<Staged>, String> {
     let lowered =
         lower::lower(package, at, batch, carried, pool_rows).map_err(|why| why.to_string())?;
@@ -117,11 +118,14 @@ fn stage(
             params: Vec::new(),
             results: Vec::new(),
         };
-        Some(
-            device
-                .program(&lowered.text, sig)
-                .map_err(|e| format!("stage {at} did not compile: {e}"))?,
-        )
+        let program = match registering {
+            Some(admission) => {
+                let _admitted = admission.admit(&lowered.text);
+                device.prepare(&lowered.text, sig)
+            }
+            None => device.program(&lowered.text, sig),
+        };
+        Some(program.map_err(|e| format!("stage {at} did not compile: {e}"))?)
     };
     Ok(Arc::new(Staged {
         program,
@@ -147,7 +151,7 @@ impl Stages {
         if let Some(hit) = self.map.get(&slot) {
             return Ok(Arc::clone(hit));
         }
-        let staged = stage(device, package, at, batch, carried, self.pool_rows)?;
+        let staged = stage(device, package, at, batch, carried, self.pool_rows, None)?;
         self.map.insert(slot, Arc::clone(&staged));
         Ok(staged)
     }
@@ -206,9 +210,16 @@ impl Stages {
                 wanted.push((at, Batch { lanes: 1, reads: reads.clone() }, Vec::new()));
             }
         }
-        wanted.retain(|(at, batch, c)| !self.map.contains_key(&(key, *at, batch.clone(), c.clone())));
-        wanted.dedup();
+        let mut seen = std::collections::HashSet::new();
+        wanted.retain(|(at, batch, c)| {
+            let slot = (key, *at, batch.clone(), c.clone());
+            !self.map.contains_key(&slot) && seen.insert(slot)
+        });
         let pool_rows = self.pool_rows;
+        // Compiles admitted into the host memory free now (held programs
+        // already take theirs), as the warm ladder's are.
+        let admission = Admission::new(available_memory().unwrap_or(u64::MAX));
+        let started = std::time::Instant::now();
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .clamp(1, wanted.len().clamp(1, 8));
@@ -222,7 +233,8 @@ impl Stages {
                         let Some((at, batch, c)) = wanted.get(i) else {
                             break;
                         };
-                        let staged = stage(device, package, *at, batch.clone(), c, pool_rows);
+                        let staged =
+                            stage(device, package, *at, batch.clone(), c, pool_rows, Some(&admission));
                         if let Ok(mut slot) = built[i].lock() {
                             *slot = Some(staged);
                         }
@@ -230,6 +242,7 @@ impl Stages {
                 });
             }
         });
+        let count = wanted.len();
         for ((at, batch, c), built) in wanted.into_iter().zip(built) {
             let staged = built
                 .into_inner()
@@ -237,6 +250,11 @@ impl Stages {
                 .ok_or("a stage was never compiled")??;
             self.map.insert((key, at, batch, c), staged);
         }
+        tracing::info!(
+            programs = count,
+            seconds = started.elapsed().as_secs_f32(),
+            "guest stages compiled at registration"
+        );
         Ok(())
     }
 
@@ -1019,6 +1037,12 @@ fn step_group_with(
                 &members[live[0]].bound,
             );
             let staged = stages.get(device, &plan.package, key, at, batch, carried);
+            // The puts that stay in the pool only (carried cells): the host
+            // sees every other one, a fed channel's included.
+            let pool_only: Vec<u32> = staged.as_ref().map_or_else(
+                |_| Vec::new(),
+                |s| s.layout.carried_out.iter().map(|(c, _)| *c).collect(),
+            );
             let leave = defer
                 && last == Some(at)
                 && staged
@@ -1056,7 +1080,7 @@ fn step_group_with(
                                     vals[m][id as usize] = value;
                                 }
                                 for put in &stage.puts {
-                                    if !carried.contains(&put.channel) {
+                                    if !pool_only.contains(&put.channel) {
                                         overlays[m].pending.insert(
                                             put.channel,
                                             Cell::Known(vals[m][put.value as usize].clone()),
@@ -1070,7 +1094,7 @@ fn step_group_with(
                             let layout = &left.expect("a deferred stage is kept").layout;
                             for (row, &m) in live.iter().enumerate() {
                                 for put in &stage.puts {
-                                    if !carried.contains(&put.channel) {
+                                    if !pool_only.contains(&put.channel) {
                                         let cell = match layout
                                             .outputs
                                             .iter()

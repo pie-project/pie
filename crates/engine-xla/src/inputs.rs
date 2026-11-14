@@ -17,23 +17,12 @@ struct Array {
     bytes: Vec<u8>,
 }
 
-/// A pack word the device supplies: `pack[at]` is word `word` of `src`, a
-/// `u32` array still on the device (a guest pass's output).
-#[derive(Debug, Clone)]
-pub struct Patch {
-    pub at: u32,
-    pub src: std::sync::Arc<Buffer>,
-    pub word: u32,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct Inputs {
     arrays: Vec<Array>,
     /// Every i32 input, back to back: one upload per fire instead of one per
     /// table.
     pack: Vec<i32>,
-    /// Pack words read off the device after the upload.
-    patches: Vec<Patch>,
 }
 
 impl Inputs {
@@ -92,12 +81,6 @@ impl Inputs {
         self.pack.len() as u32
     }
 
-    /// Makes `pack[at]` the device's word `word` of `src`, in place of
-    /// whatever the host staged there.
-    pub fn patch(&mut self, at: u32, src: std::sync::Arc<Buffer>, word: u32) {
-        self.patches.push(Patch { at, src, word });
-    }
-
     /// Elements in the pack.
     #[must_use]
     pub fn pack_len(&self) -> u32 {
@@ -121,32 +104,7 @@ impl Inputs {
                 let _ = std::fs::write(format!("{pre}.in{i}"), &a.bytes);
             }
         }
-        let mut buffer =
-            device.upload_flat(crate::pjrt::ElementType::S32, &bytes, pack.len() as i64)?;
-        // Words the device supplies: one small scatter per source, run in
-        // the device's order behind the pass that writes the source.
-        let mut done = vec![false; self.patches.len()];
-        for first in 0..self.patches.len() {
-            if done[first] {
-                continue;
-            }
-            let src = &self.patches[first].src;
-            let group: Vec<&Patch> = self
-                .patches
-                .iter()
-                .enumerate()
-                .filter(|(at, patch)| {
-                    let same = std::sync::Arc::ptr_eq(&patch.src, src);
-                    if same {
-                        done[*at] = true;
-                    }
-                    same
-                })
-                .map(|(_, patch)| patch)
-                .collect();
-            buffer = patch_pack(device, buffer, pack.len(), src, &group)?;
-        }
-        Ok(buffer)
+        device.upload_flat(crate::pjrt::ElementType::S32, &bytes, pack.len() as i64)
     }
 
     /// `values` as an f32 input.
@@ -208,58 +166,3 @@ impl Inputs {
     }
 }
 
-/// `pack` with each patch's word taken from `src` (`u32 [..]`, any rank):
-/// a scatter of a gather, compiled once per shape.
-fn patch_pack(
-    device: &Device,
-    pack: Buffer,
-    len: usize,
-    src: &Buffer,
-    patches: &[&Patch],
-) -> Result<Buffer> {
-    use kernels_xla::hlo::{Combine, Elem, Func, Ty};
-    let dims = src.dims()?;
-    let words: i64 = dims.iter().product::<i64>().max(1);
-    let k = patches.len().next_power_of_two();
-    let p = len as i64;
-    let mut idx: Vec<i32> = Vec::with_capacity(2 * k);
-    idx.extend(patches.iter().map(|patch| patch.at as i32));
-    // Padding lands past the pack, which a scatter drops.
-    idx.resize(k, p as i32);
-    idx.extend(patches.iter().map(|patch| patch.word as i32));
-    idx.resize(2 * k, 0);
-    let mut f = Func::new("main");
-    let pack_v = f.param(Ty::new(Elem::I32, &[p]), None);
-    let src_v = f.param(Ty::new(Elem::U32, &dims), None);
-    let idx_v = f.param(Ty::new(Elem::I32, &[2 * k as i64]), None);
-    let at = f.slice(idx_v, &[0], &[k as i64], &[1])?;
-    let from = f.slice(idx_v, &[k as i64], &[2 * k as i64], &[1])?;
-    let flat = f.reshape(src_v, &[words, 1])?;
-    let flat = f.bitcast(flat, Elem::I32)?;
-    let rows = f.take_rows(flat, from)?;
-    let table = f.reshape(pack_v, &[p, 1])?;
-    let out = f.put_rows(table, at, rows, Combine::Set)?;
-    let out = f.reshape(out, &[p])?;
-    let text = f.module("patch_pack", &[out]);
-    let program = device.program(
-        &text,
-        crate::trace::Signature {
-            params: Vec::new(),
-            results: Vec::new(),
-        },
-    )?;
-    let bytes: Vec<u8> = idx.iter().flat_map(|x| x.to_le_bytes()).collect();
-    let idx_b = device.upload_flat(crate::pjrt::ElementType::S32, &bytes, 2 * k as i64)?;
-    let mut outs = device.run(
-        &program,
-        vec![
-            crate::pjrt::Arg::Keep(&pack),
-            crate::pjrt::Arg::Keep(src),
-            crate::pjrt::Arg::Keep(&idx_b),
-        ],
-        false,
-    )?;
-    outs.pop().ok_or_else(|| crate::error::Fault::Unbound {
-        what: "the patched pack, which the patch program did not return".to_string(),
-    })
-}

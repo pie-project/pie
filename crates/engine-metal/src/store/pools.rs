@@ -1226,9 +1226,13 @@ impl Pools {
         refs.iter().map(|&r| unit(r)).collect()
     }
 
-    /// The physical page explicit write descriptor page `page` names.
+    /// The page explicit write descriptor page `page` names, as kernels
+    /// address it (its buffer in the high bits, as `kv_pages` states it).
     pub fn kv_page(&self, page: u32) -> Result<u32> {
-        self.physical(LIST, page)
+        let list = *self.shape(LIST)?;
+        Ok(self
+            .pool
+            .slot_page(self.physical(LIST, page)?, list.per_chunk))
     }
 
     /// A lane's record as kernels address it, one physical id a piece:

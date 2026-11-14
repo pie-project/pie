@@ -62,8 +62,12 @@ pub mod owners {
     pub const CHANNELS: Owner = Owner::state("channels");
     pub const GUEST_STATE: Owner = Owner::state("guest state");
 
-    pub const ARENA: Owner = Owner::fire("arena");
-    pub const SCRATCH: Owner = Owner::fire("scratch");
+    /// The activation span at the top of the pool: entered as the fire's,
+    /// out of the pool segment it lies in.
+    pub const SPAN: Owner = Owner::fire("activation span");
+
+    /// A kernel test's operands, outside any load.
+    pub const TEST: Owner = Owner::fire("test operands");
     pub const INPUTS: Owner = Owner::fire("inputs");
     pub const READOUT: Owner = Owner::fire("readout");
     pub const RS_SCRATCH: Owner = Owner::fire("rs scratch");
@@ -134,6 +138,21 @@ impl Books {
         self.with(|ledger| {
             let held = ledger.of(owner.class, owner.name);
             ledger.enter(owner.class, owner.name, held.saturating_sub(bytes));
+        });
+    }
+
+    /// `bytes` of a reservation entered under `from` are `to`'s: the
+    /// device's count stands. A reservation relabelled in part gives back
+    /// under its own owner, so the moved bytes stay under `to` once it is
+    /// gone; only the activation span is, and it stands as long as its
+    /// device.
+    pub fn relabel(&self, from: Owner, to: Owner, bytes: u64) {
+        self.with(|ledger| {
+            let held = ledger.of(from.class, from.name);
+            let moved = bytes.min(held);
+            ledger.enter(from.class, from.name, held - moved);
+            let there = ledger.of(to.class, to.name);
+            ledger.enter(to.class, to.name, there.saturating_add(moved));
         });
     }
 

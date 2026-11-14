@@ -151,10 +151,10 @@ METAL_FUNC void qmv_fast_impl(
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
-  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  x += tid.x * in_vec_size + simd_lid * values_per_thread;
+  ws += int64_t(out_row) * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += int64_t(out_row) * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += int64_t(out_row) * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += int64_t(tid.x) * in_vec_size + simd_lid * values_per_thread;
   y += tid.x * out_vec_size + out_row;
 
   for (int k = 0; k < in_vec_size; k += block_size) {
@@ -235,10 +235,10 @@ METAL_FUNC void qmv_fast_residual_impl(
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
-  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  x += tid.x * in_vec_size + simd_lid * values_per_thread;
+  ws += int64_t(out_row) * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += int64_t(out_row) * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += int64_t(out_row) * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += int64_t(tid.x) * in_vec_size + simd_lid * values_per_thread;
   y += tid.x * out_vec_size + out_row;
   residual += tid.x * out_vec_size + out_row;
 
@@ -455,11 +455,11 @@ METAL_FUNC void qmv_codec_impl(
     }
   }
 
-  const device uint8_t* ws_row = ws + out_row * in_vec_size_w;
-  const device typename Codec::scale_t* sc_row = scales + out_row * in_vec_size_g;
-  const device T* bi_row = Codec::zero_point ? biases + out_row * in_vec_size_g : biases;
+  const device uint8_t* ws_row = ws + int64_t(out_row) * in_vec_size_w;
+  const device typename Codec::scale_t* sc_row = scales + int64_t(out_row) * in_vec_size_g;
+  const device T* bi_row = Codec::zero_point ? biases + int64_t(out_row) * in_vec_size_g : biases;
 
-  const device T* x_row = x + row * x_row_stride + slot * x_slot_stride;
+  const device T* x_row = x + int64_t(row) * x_row_stride + int64_t(slot) * x_slot_stride;
 
   for (int k = 0; k < in_vec_size; k += block_size) {
     const int base = k + int(simd_lid) * values_per_thread;

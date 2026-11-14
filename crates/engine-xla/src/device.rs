@@ -264,13 +264,26 @@ impl Device {
         })
     }
 
-    /// The compiled form of `text`, from the cache or freshly built.
+    /// The compiled form of `text` a serving fire wants, from the cache or
+    /// freshly built: one built after [`Device::seal`] is a fire the warm
+    /// ladder missed.
     pub fn program(&self, text: &str, sig: Signature) -> Result<Arc<Program>> {
+        self.compiled_form(text, sig, true)
+    }
+
+    /// The compiled form of `text` a load or a program's registration
+    /// prepares ahead of every fire that takes it, from the cache or
+    /// freshly built: never a ladder miss, sealed or not.
+    pub fn prepare(&self, text: &str, sig: Signature) -> Result<Arc<Program>> {
+        self.compiled_form(text, sig, false)
+    }
+
+    fn compiled_form(&self, text: &str, sig: Signature, serving: bool) -> Result<Arc<Program>> {
         let key = *blake3::hash(text.as_bytes()).as_bytes();
         if let Some(hit) = self.cache.lock().expect("cache lock poisoned").get(&key) {
             return Ok(Arc::clone(hit));
         }
-        if self.sealed.load(std::sync::atomic::Ordering::Relaxed) {
+        if serving && self.sealed.load(std::sync::atomic::Ordering::Relaxed) {
             // Serving fires run programs the warm ladder prepared: one built
             // now is a fire the ladder missed.
             let n = self
@@ -736,5 +749,81 @@ fn trim(dir: &std::path::Path, cap: u64) {
         if std::fs::remove_file(&path).is_ok() {
             total -= len;
         }
+    }
+}
+
+/// The host memory free for new allocations (`MemAvailable`), where the host
+/// says.
+pub(crate) fn available_memory() -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib << 10)
+}
+
+/// The host memory a compiled program holds: ~64 bytes a byte of its text,
+/// less its Mosaic kernels' bodies (`tpu_custom_call` configs, one HLO
+/// instruction each however long its base64), counted at their own size.
+pub(crate) fn hold_bytes(text: &str) -> u64 {
+    const BODY: &str = "\\22body\\22: \\22";
+    let (mut kernels, mut rest) = (0, text);
+    while let Some(at) = rest.find(BODY) {
+        let tail = &rest[at + BODY.len()..];
+        let len = tail.find("\\22").unwrap_or(tail.len());
+        kernels += len;
+        rest = &tail[len..];
+    }
+    (((text.len() - kernels) as u64) << 6) + kernels as u64
+}
+
+/// The host memory compiling `text` takes while it runs: ~0.55 GiB a MiB
+/// of its text (v5e, Qwen3.6-35B-A3B's 9 MiB pf256 programs: 5 GB each),
+/// counted at 0.75 GiB a MiB.
+pub(crate) fn compile_need(text: &str) -> u64 {
+    ((hold_bytes(text) >> 6) * 3) << 8
+}
+
+/// Admits compiles into a host memory room fixed when it is made: one
+/// starts once its own need and every running one's fit (or none runs),
+/// woken by one that ends, never by a poll of the free memory. A compile
+/// in flight may not have taken its memory yet, so each counts until it
+/// ends.
+pub(crate) struct Admission {
+    room: u64,
+    running: Mutex<u64>,
+    ended: std::sync::Condvar,
+}
+
+/// A compile [`Admission`] let in; its need leaves the room when dropped.
+pub(crate) struct Admitted<'a> {
+    by: &'a Admission,
+    need: u64,
+}
+
+impl Admission {
+    pub(crate) fn new(room: u64) -> Admission {
+        Admission {
+            room,
+            running: Mutex::new(0),
+            ended: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Waits until a compile of `text` fits the room.
+    pub(crate) fn admit(&self, text: &str) -> Admitted<'_> {
+        let need = compile_need(text);
+        let mut busy = self.running.lock().expect("the compile admission lock poisoned");
+        while *busy > 0 && *busy + need > self.room {
+            busy = self.ended.wait(busy).expect("the compile admission lock poisoned");
+        }
+        *busy += need;
+        Admitted { by: self, need }
+    }
+}
+
+impl Drop for Admitted<'_> {
+    fn drop(&mut self) {
+        *self.by.running.lock().expect("the compile admission lock poisoned") -= self.need;
+        self.by.ended.notify_all();
     }
 }

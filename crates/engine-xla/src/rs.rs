@@ -354,6 +354,15 @@ impl WindowMap {
                 }
             }
             let replay = map.from_buffer.len() as i32 - begin;
+            // A lane replays at most the contract's bound: a fire that asks
+            // more fails here, never sizing a replay the warm ladder did not.
+            if replay > engine::fire::UNFOLDED_ROWS as i32 {
+                return Err(Fault::Ceiling {
+                    what: "carried rows a lane replays (engine::fire::UNFOLDED_ROWS)",
+                    need: u64::try_from(replay).unwrap_or(0),
+                    have: u64::from(engine::fire::UNFOLDED_ROWS),
+                });
+            }
             for i in 0..rows {
                 map.from_buffer.push(0);
                 map.buffer_row.push(0);

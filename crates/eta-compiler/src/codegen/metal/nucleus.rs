@@ -60,7 +60,7 @@ pub const SIGNATURE: &str = r#"(
   const device M1ValueDesc* descriptors =
       all_descriptors + dispatch_lane * layout->value_count;
   device uchar* scratch =
-      all_scratch + dispatch_lane * layout->scratch_stride;
+      all_scratch + ulong(dispatch_lane) * ulong(layout->scratch_stride);
 "#;
 
 const BODY: &str = r#"

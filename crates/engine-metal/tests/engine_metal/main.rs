@@ -1,11 +1,14 @@
 //! engine-metal's integration tests, one binary: each module was a test file.
 
+mod a_bank_past_2_gib_reads_its_last_rows;
 mod a_buffered_fold_is_the_fold_it_replaces;
 mod a_column_cut_of_a_bank_multiplies_as_its_copy;
 mod a_copied_window_is_one_encode_over_the_same_rows;
+mod a_device_placed_kv_write_lands_in_its_buffer;
 mod a_fenced_frame_lands_both_sides;
 mod a_forked_lane_serves_the_unforked_logits;
 mod a_gate_and_an_up_apart_land_what_they_land_packed;
+mod a_lane_past_the_unfolded_bound_is_refused;
 mod a_parked_lane_serves_the_never_parked_logits;
 mod a_prompt_scan_lands_its_snapshots;
 mod a_scattered_pool_serves_the_same_logits;
