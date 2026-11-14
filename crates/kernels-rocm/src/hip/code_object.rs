@@ -25,24 +25,69 @@ const LATE_BUFFERS: &[(&str, &str)] = &[
     ("hidden_heap_v1", "heap"),
 ];
 
+/// What a kernel asks the runtime for late.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ask {
+    /// A hostcall, printf or heap buffer, allocated at its first launch.
+    Buffer(&'static str),
+    /// Scratch, this many bytes a lane, grown when a dispatch first needs it.
+    Scratch(u64),
+    /// A dynamic stack in scratch, grown likewise.
+    DynamicStack,
+}
+
+impl std::fmt::Display for Ask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Ask::Buffer(buffer) => write!(
+                f,
+                "a {buffer} buffer, which it allocates at the kernel's first launch"
+            ),
+            Ask::Scratch(bytes) => write!(
+                f,
+                "scratch ({bytes} bytes a lane), which ROCr grows when a dispatch first needs it"
+            ),
+            Ask::DynamicStack => write!(
+                f,
+                "a dynamic stack in scratch, which ROCr grows when a dispatch first needs it"
+            ),
+        }
+    }
+}
+
 /// Refuses `image` where one of its kernels asks the runtime for memory it
 /// allocates late (a buffer at first launch, or scratch), naming the kernel
 /// and what it asks. An image that is not an ELF code object, or carries no
 /// metadata, asks nothing.
 pub fn refuse_late_buffers(image: &[u8]) -> Result<(), String> {
-    let asked = late_buffers(image);
+    refuse(&asked(image))
+}
+
+/// As [`refuse_late_buffers`] for a guest program's code object, whose
+/// kernels the engine generates from the program: a buffer is refused, and
+/// what scratch its kernels ask is returned (kernel, ask) for the caller to
+/// say and count rather than refuse.
+pub fn refuse_late_buffers_but_scratch(image: &[u8]) -> Result<Vec<(String, Ask)>, String> {
+    let (buffers, scratch): (Vec<_>, Vec<_>) = asked(image)
+        .into_iter()
+        .partition(|(_, ask)| matches!(ask, Ask::Buffer(_)));
+    refuse(&buffers)?;
+    Ok(scratch)
+}
+
+fn refuse(asked: &[(String, Ask)]) -> Result<(), String> {
     if asked.is_empty() {
         return Ok(());
     }
     Err(asked
         .iter()
-        .map(|(kernel, asked)| format!("kernel {kernel} asks the HIP runtime for {asked}"))
+        .map(|(kernel, ask)| format!("kernel {kernel} asks the HIP runtime for {ask}"))
         .collect::<Vec<_>>()
         .join("; "))
 }
 
 /// Each kernel of `image` and the late memory it asks for.
-fn late_buffers(image: &[u8]) -> Vec<(String, String)> {
+fn asked(image: &[u8]) -> Vec<(String, Ask)> {
     let mut asked = Vec::new();
     for meta in notes(image).filter_map(msgpack::read) {
         let Some(Mp::Arr(kernels)) = meta.get("amdhsa.kernels") else {
@@ -57,33 +102,19 @@ fn late_buffers(image: &[u8]) -> Vec<(String, String)> {
             for arg in args {
                 let kind = arg.get(".value_kind").and_then(Mp::text);
                 if let Some(&(_, buffer)) = LATE_BUFFERS.iter().find(|(k, _)| Some(*k) == kind) {
-                    asked.push((
-                        name.to_owned(),
-                        format!(
-                            "a {buffer} buffer, which it allocates at the kernel's first launch"
-                        ),
-                    ));
+                    asked.push((name.to_owned(), Ask::Buffer(buffer)));
                 }
             }
             let private = kernel
                 .get(".private_segment_fixed_size")
                 .and_then(Mp::int)
+                .and_then(|bytes| u64::try_from(bytes).ok())
                 .unwrap_or(0);
             if private > 0 {
-                asked.push((
-                    name.to_owned(),
-                    format!(
-                        "scratch ({private} bytes a lane), which ROCr grows when a dispatch \
-                         first needs it"
-                    ),
-                ));
+                asked.push((name.to_owned(), Ask::Scratch(private)));
             }
             if kernel.get(".uses_dynamic_stack").is_some_and(Mp::truth) {
-                asked.push((
-                    name.to_owned(),
-                    "a dynamic stack in scratch, which ROCr grows when a dispatch first needs it"
-                        .to_owned(),
-                ));
+                asked.push((name.to_owned(), Ask::DynamicStack));
             }
         }
     }
@@ -273,6 +304,26 @@ mod tests {
         assert_eq!(refuse_late_buffers(&none), Ok(()));
         let flat = image(&metadata_with("tidy", ".uses_dynamic_stack", &[0xc2]));
         assert_eq!(refuse_late_buffers(&flat), Ok(()));
+    }
+
+    #[test]
+    fn a_guest_kernel_states_its_scratch_and_is_refused_a_buffer() {
+        use super::{Ask, refuse_late_buffers_but_scratch};
+        let spills = image(&metadata_with(
+            "fused",
+            ".private_segment_fixed_size",
+            &[0x4c],
+        ));
+        assert_eq!(
+            refuse_late_buffers_but_scratch(&spills),
+            Ok(vec![("fused".to_owned(), Ask::Scratch(76))])
+        );
+        let prints = image(&metadata("fused", "hidden_printf_buffer"));
+        assert!(refuse_late_buffers_but_scratch(&prints).is_err());
+        assert_eq!(
+            refuse_late_buffers_but_scratch(b"not an elf"),
+            Ok(Vec::new())
+        );
     }
 
     #[test]
