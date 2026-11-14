@@ -2093,9 +2093,9 @@ fn matmul_select_mxfp4(
     // pays only once an expert serves more than `kernel.moe.mxfp4_grouped_reuse`
     // routes on average; routes over experts is a floor on that average.
     let experts = codes.rows.clamp(1, ORDER_EXPERT_CAP);
-    // A table that may name mapped host memory takes the per-route stream.
+    // A table that may name mapped host memory takes these arms too: a bank
+    // streamed or held lands the same bits.
     if x.dtype == Dtype::Bf16
-        && !table.streams()
         && codes.rows <= ORDER_EXPERT_CAP
         && let Some(mt) = batch_items(ctx, &fan, experts, 32, ctx.tuning().moe_batch_until)
         // Short of 32 routes a lane reads its two scale bytes as one.
@@ -2123,10 +2123,7 @@ fn matmul_select_mxfp4(
             &table.args(),
         );
     }
-    if fan.route_count > ctx.tuning().mxfp4_grouped_reuse * experts
-        && ctx.tuning().mxfp4_grouped
-        && !table.streams()
-    {
+    if fan.route_count > ctx.tuning().mxfp4_grouped_reuse * experts && ctx.tuning().mxfp4_grouped {
         let ordered = route_order(ctx, op, routes, &fan, experts, group_routes(&fan, experts))?;
         let wmma = x.dtype == Dtype::Bf16 && ctx.tuning().mxfp4_wmma;
         let entry = if wmma {
@@ -2277,7 +2274,8 @@ pub fn matmul_select_mxfp4_lanes(
     const OP: &str = "linear.moe_select";
     let op = OP;
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
-    located_only(op, table, "a bank in lane order")?;
+    // A table that may name mapped host memory reads as a located one: a
+    // bank streamed lands the bits it does held.
     let fan = selected(op, x, routes, y)?;
     let experts = codes.rows;
     if !x.width.is_multiple_of(128)

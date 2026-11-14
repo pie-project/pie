@@ -301,6 +301,75 @@ impl ExpertShape {
     }
 }
 
+/// Whether ROCm lays MXFP4 bank `codes` in the matrix core's lane order
+/// (`weights::hip::order_mxfp4_banks`): an `[experts, n, ..]` bank of n in
+/// whole 16-row strips and K in whole 128-code units, under e8m0 exponents
+/// alone, that only routed selects of bf16 rows read (the plain quantized
+/// select, or its e4m3-quantized twin). Never on another backend.
+#[must_use]
+pub fn lane_ordered(trace: &poem_ir::Trace, codes: usize) -> bool {
+    use poem_ir::{ActQuant, Def, Dtype, Fused, Linear, Operands, Operation, Ty};
+    if !cfg!(feature = "rocm") {
+        return false;
+    }
+    let Some(param) = trace.params.get(codes) else {
+        return false;
+    };
+    if param.dtype != Dtype::Mxfp4
+        || param.shape.len() < 3
+        || param.shape[1] % 16 != 0
+        || (2 * param.shape[2..].iter().product::<u64>()) % 128 != 0
+        || select_bias(trace, codes).is_some_and(|bias| bias.is_some())
+    {
+        return false;
+    }
+    let reads_it = |id: poem_ir::ValueId| {
+        matches!(trace.values.get(id.0 as usize).map(|decl| &decl.def),
+            Some(Def::Weight(w)) if *w as usize == codes)
+    };
+    let bf16 = |id: poem_ir::ValueId| {
+        matches!(
+            trace.values.get(id.0 as usize).map(|decl| &decl.ty),
+            Some(Ty::Tensor {
+                dtype: Dtype::Bf16,
+                ..
+            })
+        )
+    };
+    let (mut reads, mut selects) = (0u32, 0u32);
+    let mut ins = Vec::new();
+    for node in &trace.nodes {
+        ins.clear();
+        node.op.inputs(&mut ins);
+        reads += ins.iter().filter(|&&id| reads_it(id)).count() as u32;
+        let legs: Vec<&Linear> = match &node.op {
+            Operation::Linear(op) => vec![op],
+            Operation::Fused(
+                Fused::MoeExperts { select, down, .. } | Fused::MoeMega { select, down, .. },
+            ) => vec![&**select, &**down],
+            Operation::Fused(Fused::MoeSelectGlu { select, .. }) => vec![&**select],
+            _ => Vec::new(),
+        };
+        for leg in legs {
+            let x = match leg {
+                Linear::MoeSelect {
+                    x,
+                    bank,
+                    bias: None,
+                    quantized: true,
+                    quant: None | Some(ActQuant::E4m3 { .. }),
+                    ..
+                } if reads_it(*bank) => *x,
+                _ => continue,
+            };
+            if bf16(x) {
+                selects += 1;
+            }
+        }
+    }
+    selects > 0 && selects == reads
+}
+
 /// The planes an expert's entry of a packed bank's table lists
 /// (`kernels_cuda::linear::moe::Planes`), by the bank's codes: a block-FP8
 /// bank's `[codes, atoms]` (its scales laid at load), an MXFP4
@@ -357,6 +426,14 @@ pub fn packed_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<Option<u32>> {
         },
         _ => return Vec::new(),
     };
+    // An MXFP4 bank ROCm lays in the matrix core's lane order: its codes
+    // and exponents, as the lane-order selects read them (`[codes, scales]`).
+    if param.dtype == Dtype::Mxfp4 && third.is_none() && lane_ordered(trace, codes) {
+        return match scales {
+            Some(scales) => vec![Some(codes as u32), Some(scales)],
+            None => Vec::new(),
+        };
+    }
     match scales {
         Some(scales) => vec![Some(codes as u32), Some(scales), third],
         None => Vec::new(),
@@ -434,9 +511,7 @@ pub fn beside_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<u32> {
 /// table: a dense bank, or (off tcgen05, whose grouped GEMM reads no table)
 /// an MXFP4, NVFP4 or affine u4 bank against bf16 activations or (W4A8,
 /// W4A4) against the rows its select quantizes, with the planes its table
-/// lists. The HIP build streams no bank it lays in the matrix core's lane
-/// order (an unbiased MXFP4 bank, `weights::hip::lane_banks`): that order is
-/// laid where the bank lies, and no table names it.
+/// lists (a bank ROCm lays in lane order, its lane-ordered planes).
 #[must_use]
 pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
     use poem_ir::residency::{Residency, residency};
@@ -538,14 +613,6 @@ pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
             }
         }
         if !read {
-            continue;
-        }
-        if cfg!(feature = "rocm")
-            && param.dtype == poem_ir::Dtype::Mxfp4
-            && planes.get(2).is_none_or(Option::is_none)
-            && param.shape.len() >= 3
-            && param.shape[1] % 16 == 0
-        {
             continue;
         }
         // A packed bank streams with every plane of it, each an expert's:
