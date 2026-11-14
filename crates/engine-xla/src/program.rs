@@ -452,7 +452,13 @@ impl Plane {
         self.programs.get(&program).map(|plan| &plan.package)
     }
 
-    pub fn register_channel(
+    /// Program `program`'s device form, where its every stage lowers.
+    #[must_use]
+    pub fn compiled_form(&self, program: ProgramId) -> Option<&Arc<crate::guest::Compiled>> {
+        self.forms.get(program)
+    }
+
+        pub fn register_channel(
         &mut self,
         registration: &ChannelRegistration,
     ) -> Result<RegisteredChannel, Refusal> {

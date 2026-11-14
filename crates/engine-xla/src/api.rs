@@ -556,6 +556,16 @@ impl Engine for Xla {
         self.programs.register(registration).map_err(refusal)
     }
 
+    /// The rings an instance keeps in the pool's `Channel` slots: its
+    /// program's carried channels on the device; every other ring lives on
+    /// the host. No `Instance` slots: the bind-time tables stay host-side.
+    fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
+        Ok(engine::program::ProgramFacts {
+            rings: self.programs.compiled_form(program).map_or_else(Vec::new, |c| c.rings()),
+            ..Default::default()
+        })
+    }
+
     fn register_channel(
         &mut self,
         registration: &ChannelRegistration,

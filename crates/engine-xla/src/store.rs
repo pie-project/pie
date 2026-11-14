@@ -864,6 +864,16 @@ impl Pools {
                     SlotRole::State
                 },
             })
+            .chain(std::iter::once(SlotShape {
+                id: layout::CHANNEL,
+                kind: SlotKind::Fixed { pieces: 1 },
+                slot_bytes: crate::guest::CHANNEL_SLOT,
+                slots_per_chunk: narrow(self.layout.chunk_bytes / crate::guest::CHANNEL_SLOT),
+                sets_per_working_set: 1,
+                rows: Vec::new(),
+                pinned: None,
+                role: SlotRole::Channel,
+            }))
             .collect();
         ChunkFacts {
             span_backed_on_demand: false,

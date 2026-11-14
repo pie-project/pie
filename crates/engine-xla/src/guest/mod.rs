@@ -23,6 +23,56 @@ pub struct Compiled {
     pub stages: usize,
     /// Channels whose cell can stay on the device between passes.
     pub carried: Vec<u32>,
+    /// Each carried channel's cell in u32 words, a lane (an instance) one
+    /// cell: what its `Channel` slots hold.
+    pub carried_words: Vec<(u32, u32)>,
+}
+
+/// The u32 words of each carried channel's cell (`carried_channels`): the
+/// value its one put lands, packed as the stages pack it.
+#[must_use]
+pub fn carried_words(package: &LaunchPackage) -> Vec<(u32, u32)> {
+    carried_channels(package)
+        .into_iter()
+        .filter_map(|c| {
+            let put = package
+                .stages
+                .iter()
+                .flat_map(|s| s.puts.iter())
+                .find(|p| p.channel == c)?;
+            let value = &package.values[put.value as usize];
+            let n = value.shape.iter().map(|&d| d as usize).product::<usize>().max(1);
+            Some((c, u32::try_from(lower::words(value.dtype, n)).unwrap_or(u32::MAX)))
+        })
+        .collect()
+}
+
+/// A `Channel` slot's bytes (`SlotRole::Channel`, the pool's
+/// [`crate::store::layout::CHANNEL`] shape).
+pub const CHANNEL_SLOT: u64 = 1 << 10;
+
+impl Compiled {
+    /// The rings an instance keeps in the pool's `Channel` slots: each
+    /// carried channel, one cell of its words, one contiguous run.
+    #[must_use]
+    pub fn rings(&self) -> Vec<engine::program::RingFacts> {
+        self.carried_words
+            .iter()
+            .map(|&(channel, words)| {
+                let bytes = u64::from(words) * 4;
+                engine::program::RingFacts {
+                    channel,
+                    cell_bytes: bytes,
+                    capacity: 1,
+                    footprint: engine::program::Footprint {
+                        bytes,
+                        slots: u32::try_from(bytes.div_ceil(CHANNEL_SLOT)).unwrap_or(u32::MAX),
+                        contiguous: true,
+                    },
+                }
+            })
+            .collect()
+    }
 }
 
 /// The channels a pass carries to the next one and nobody else sees: a
@@ -101,6 +151,7 @@ impl Forms {
                         key,
                         stages: package.stages.len(),
                         carried: carried_channels(package),
+                        carried_words: carried_words(package),
                     }),
                 );
                 true
