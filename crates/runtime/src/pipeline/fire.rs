@@ -325,16 +325,23 @@ async fn acquire_grant<C: FireContext>(
         // The tail may hold this frame's earlier slots, which fire only once
         // the scheduler stops waiting on this one: park the lane first.
         crate::scheduler::worker::notify_lane_close(pipeline_id, Some(pid));
-        ctx.settle_pipeline_tail()
-            .await
-            .map_err(|error| format!("pipeline: settle for windowed kv: {error:#}"))?;
+        crate::inferlet::process::said(
+            "plan: settle the tail before a windowed ask",
+            pid,
+            ctx.settle_pipeline_tail(),
+        )
+        .await
+        .map_err(|error| format!("pipeline: settle for windowed kv: {error:#}"))?;
     }
     // A yield may have dropped snapshots the demand was quoted against, so
     // the caller quotes it again rather than asking for the same.
-    match planner
-        .acquire(pid, pipeline_id, demand)
-        .await
-        .map_err(|error| format!("pipeline: KV capacity: {error}"))?
+    match crate::inferlet::process::said(
+        "plan: the planner's grant",
+        pid,
+        planner.acquire(pid, pipeline_id, demand),
+    )
+    .await
+    .map_err(|error| format!("pipeline: KV capacity: {error}"))?
     {
         crate::planner::Acquired::Granted(grant) => Ok(Some(grant)),
         crate::planner::Acquired::Yield => {
@@ -352,10 +359,13 @@ async fn settle_and_wait_resident<C: FireContext>(ctx: &mut C) -> Result<(), Str
     ctx.settle_pipeline_tail()
         .await
         .map_err(|error| format!("pipeline: settle for eviction: {error:#}"))?;
-    planner
-        .wait_resident(ctx.process_id())
-        .await
-        .map_err(|error| format!("pipeline: KV residency: {error}"))
+    crate::inferlet::process::said(
+        "plan: resident again",
+        ctx.process_id(),
+        planner.wait_resident(ctx.process_id()),
+    )
+    .await
+    .map_err(|error| format!("pipeline: KV residency: {error}"))
 }
 
 fn bound_rs_working_sets<C: FireContext>(
@@ -2752,7 +2762,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .iter()
             .map(|(_, lanes)| pass_lanes.kv[lanes[0]].clone())
             .collect();
-        if let Err(refusal) = seat_lane_slots(&mut req, &stores, &groups).await {
+        if let Err(refusal) = crate::inferlet::process::said(
+            "seat the lanes",
+            ctx.process_id(),
+            seat_lane_slots(&mut req, &stores, &groups),
+        )
+        .await
+        {
             return Ok(Err(refusal));
         }
         for (group, (_, lanes)) in groups.iter().enumerate() {
@@ -3135,10 +3151,14 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // for the raise its pass funds, or fails with what the planner
             // said: it never waits on a rung that does not come.
             let width: u32 = piece.iter().flatten().map(|&(from, to)| to - from).sum();
-            if let Err(refusal) = wait_for_rung(
-                engine,
-                width,
-                funding.as_ref().map(|funding| move || funding.failed()),
+            if let Err(refusal) = crate::inferlet::process::said(
+                "enqueue: the activation rung",
+                pid,
+                wait_for_rung(
+                    engine,
+                    width,
+                    funding.as_ref().map(|funding| move || funding.failed()),
+                ),
             )
             .await
             {
@@ -4351,7 +4371,13 @@ async fn fire_device_geometry<C: FireContext>(
         device_rows.as_deref(),
     );
     let reads_each_other = reads_each_other(&req);
-    if let Err(refusal) = seat_lane_slots(&mut req, &stores, &groups).await {
+    if let Err(refusal) = crate::inferlet::process::said(
+        "seat the lanes",
+        ctx.process_id(),
+        seat_lane_slots(&mut req, &stores, &groups),
+    )
+    .await
+    {
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
         return Ok(Err(refusal));
     }

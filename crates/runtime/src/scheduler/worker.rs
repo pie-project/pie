@@ -942,12 +942,15 @@ impl SchedulerHandle {
             Some(program_id) => program_id,
             None => {
                 let launch = program.launch.clone();
-                let program_id = self
-                    .request(|response| SchedulerItem::RegisterProgram {
+                let program_id = crate::inferlet::process::said(
+                    "bind: register the program",
+                    pipeline_id.unwrap_or_default(),
+                    self.request(|response| SchedulerItem::RegisterProgram {
                         program: Box::new(program),
                         response,
-                    })
-                    .await??;
+                    }),
+                )
+                .await??;
                 self.inner
                     .program_ids
                     .lock()
@@ -968,14 +971,18 @@ impl SchedulerHandle {
                     .map_err(|why| anyhow!("pipeline: {why}"))?;
                 let engine = bind.engine_id;
                 let pid = pipeline_id.unwrap_or_default();
-                crate::store::shared::programs::fund_span(
-                    &shared,
-                    || crate::store::shared::fire_cap(engine),
-                    &crate::store::shared::programs::Planner { pid, quorum: pid },
-                    &crate::store::shared::programs::LaneMover {
-                        engine,
-                        epoch_now: || crate::store::shared::programs::epoch_of(engine),
-                    },
+                crate::inferlet::process::said(
+                    "bind: the program's fire span",
+                    pid,
+                    crate::store::shared::programs::fund_span(
+                        &shared,
+                        || crate::store::shared::fire_cap(engine),
+                        &crate::store::shared::programs::Planner { pid, quorum: pid },
+                        &crate::store::shared::programs::LaneMover {
+                            engine,
+                            epoch_now: || crate::store::shared::programs::epoch_of(engine),
+                        },
+                    ),
                 )
                 .await
                 .map_err(|why| {
@@ -985,14 +992,17 @@ impl SchedulerHandle {
             }
             None => None,
         };
-        let (registered, _, bound) = self
-            .request(|response| SchedulerItem::RegisterChannelsBind {
+        let (registered, _, bound) = crate::inferlet::process::said(
+            "bind: the lane's bind",
+            pipeline_id.unwrap_or_default(),
+            self.request(|response| SchedulerItem::RegisterChannelsBind {
                 pipeline_id,
                 plans,
                 bind,
                 response,
-            })
-            .await??;
+            }),
+        )
+        .await??;
         Ok((registered, bound))
     }
 

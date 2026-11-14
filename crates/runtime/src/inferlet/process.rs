@@ -176,6 +176,36 @@ pub(crate) fn execution_slot_capacity() -> Option<usize> {
     EXECUTION_SLOT_CAPACITY.get().copied().flatten()
 }
 
+/// How long a process waits at one step of a fire's path before it says
+/// so, and again after each such span.
+const STEP_SAYS_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Awaits `step`, saying every [`STEP_SAYS_AFTER`] that process `pid` still
+/// waits at `stage`: what a stall on the way from a process to the lane is
+/// read from (seats, bind, plan, enqueue). Outside a runtime it only awaits.
+pub(crate) async fn said<F: std::future::Future>(
+    stage: &'static str,
+    pid: ProcessId,
+    step: F,
+) -> F::Output {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return step.await;
+    }
+    tokio::pin!(step);
+    let started = Instant::now();
+    loop {
+        match crate::rt::time::timeout(STEP_SAYS_AFTER, &mut step).await {
+            Ok(output) => return output,
+            Err(_) => tracing::warn!(
+                stage,
+                %pid,
+                waited_s = started.elapsed().as_secs(),
+                "a process waits on its way to a fire"
+            ),
+        }
+    }
+}
+
 pub fn live_count() -> usize {
     SERVICES.len()
 }
