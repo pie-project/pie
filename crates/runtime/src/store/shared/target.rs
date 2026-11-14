@@ -550,14 +550,18 @@ mod tests {
     async fn a_fire_term_past_the_largest_rung_cuts_fires_without_patience() {
         const ENGINE: usize = 57;
         let mut pool = super::super::tests::pool();
-        pool.program_registered(
-            ::engine::ProgramId(1),
-            &::engine::ProgramFacts {
-                fire_bytes_fixed: 55 * pool.pool().chunk_bytes(),
-                ..::engine::ProgramFacts::default()
+        let key = super::super::programs::FireKey {
+            program: ::engine::ProgramId(1),
+            extents: ::engine::BindExtents::default(),
+        };
+        pool.fire_facts_learned(
+            key,
+            &::engine::FireFacts {
+                fixed: 55 * pool.pool().chunk_bytes(),
+                ..::engine::FireFacts::default()
             },
         );
-        pool.instance_bound(::engine::InstanceId(1), ::engine::ProgramId(1));
+        pool.instance_bound(::engine::InstanceId(1), key);
         assert_eq!(pool.fit_cap(), 256);
         let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
         let grow = SharedGrow::new(0, ENGINE, shared);

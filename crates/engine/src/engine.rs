@@ -8,8 +8,8 @@ use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
 use crate::program::{
-    BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, ProgramRegistration,
-    Rebind, RingFacts,
+    BindExtents, BoundInstance, FireFacts, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
+    ProgramRegistration, Rebind, RingFacts,
 };
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
 
@@ -124,6 +124,14 @@ pub trait Engine: Send {
     fn program_facts(&self, program: ProgramId) -> Result<ProgramFacts> {
         let _ = program;
         Ok(ProgramFacts::default())
+    }
+
+    /// What a fire holding lanes of `program` bound at `extents` needs
+    /// beside the model's activation, asked before the first bind of those
+    /// extents is sent. The default states none.
+    fn fire_facts(&self, program: ProgramId, extents: &BindExtents) -> Result<FireFacts> {
+        let _ = (program, extents);
+        Ok(FireFacts::default())
     }
 
     /// The `Channel` slots a registered channel's ring takes, asked before

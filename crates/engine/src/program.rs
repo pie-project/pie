@@ -95,28 +95,34 @@ pub struct ProgramFacts {
     /// The rings the program declares, by its channel index. A binding
     /// that names a registered channel for one holds no slots for it.
     pub rings: Vec<RingFacts>,
-    /// What a fire holding this program's lanes needs beside the model's
-    /// own activation (REDESIGN 2.4, §6): the per-batch tables and value
-    /// scratch of the program's stage. A fire of a rung of `r` tokens
-    /// carries `l = min(r, FireLimits::max_lanes, max_lanes)` lanes of it
-    /// and needs `fire_bytes_fixed + l × fire_bytes_a_lane` for each
-    /// registered program that can be in it; the runtime folds the sum into
-    /// the rung's activation. A program registers after load, so
-    /// `ChunkFacts` cannot state it.
+}
+
+/// What a fire holding lanes of a program bound at given extents needs
+/// beside the model's own activation (REDESIGN 2.4, §6): the per-batch
+/// tables and value scratch of the program's stage, sized by the binding's
+/// [`BindExtents`] (the same program at 256 and 4096 rows differs 16x). A
+/// fire of a rung of `r` tokens carries `l = min(r, FireLimits::max_lanes,
+/// max_lanes)` lanes of it and needs `fixed + l × a_lane` bytes for each
+/// (program, extents) bound that can be in it; the runtime folds the sum
+/// into the rung's activation ([`crate::Engine::fire_facts`]). A program
+/// registers after load, so `ChunkFacts` cannot state it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FireFacts {
     #[serde(default)]
-    pub fire_bytes_a_lane: u64,
+    pub a_lane: u64,
     #[serde(default)]
-    pub fire_bytes_fixed: u64,
-    /// The most lanes one fire of this program flies (CUDA: its flight, a
+    pub fixed: u64,
+    /// The most lanes one fire of the program flies (CUDA: its flight, a
     /// power of two under the SM count); 0: no cap of its own, the fire's
     /// `FireLimits::max_lanes` only.
     #[serde(default)]
     pub max_lanes: u32,
 }
 
-impl ProgramFacts {
-    /// The lanes of this program a fire carrying `lanes` lanes flies:
+impl FireFacts {
+    /// The lanes of the program a fire carrying `lanes` lanes flies:
     /// capped by [`Self::max_lanes`] where it states one.
+    #[must_use]
     pub fn lanes(&self, lanes: u64) -> u64 {
         if self.max_lanes == 0 {
             lanes
@@ -125,10 +131,11 @@ impl ProgramFacts {
         }
     }
 
-    /// The bytes a fire of `lanes` lanes needs for this program.
-    pub fn fire_bytes(&self, lanes: u64) -> u64 {
-        self.fire_bytes_fixed
-            .saturating_add(self.lanes(lanes).saturating_mul(self.fire_bytes_a_lane))
+    /// The bytes a fire of `lanes` lanes needs for the program.
+    #[must_use]
+    pub fn bytes(&self, lanes: u64) -> u64 {
+        self.fixed
+            .saturating_add(self.lanes(lanes).saturating_mul(self.a_lane))
     }
 }
 
