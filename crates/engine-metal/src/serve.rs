@@ -1038,13 +1038,13 @@ impl PreparedLoad<'_> {
         let model_bytes = weights.bytes() + ane_model + u64::from(tables_chunks) * rows.chunk_bytes;
         // Each rung's rs scratch: a fire of the rung's tokens and lanes
         // replays its own rows and, for each lane, the rows it carries
-        // unfolded into the fire (`RS_UNFOLDED_ROWS`, the runtime's bound).
+        // unfolded into the fire (`engine::fire::UNFOLDED_ROWS`, the runtime's bound).
         let rs_room: Vec<u64> = rungs
             .iter()
             .map(|(tokens, _)| match (&rs_layout, &rows.rs) {
                 (Some(layout), Some(_)) => {
                     let lanes = (*tokens).min(boot.budget.max_lanes).max(1);
-                    let unfolded = lanes.saturating_mul(RS_UNFOLDED_ROWS);
+                    let unfolded = lanes.saturating_mul(engine::fire::UNFOLDED_ROWS);
                     crate::rs::Seat::scratch_bytes(
                         layout,
                         (*tokens)
@@ -3595,6 +3595,23 @@ impl Shell {
                 ports.as_ref().and_then(engine::ports::LanePorts::fold),
             )
             .map_err(|error| Fault::program("serve::rs", format!("lane {source}: {error}")))?;
+            // The rows a lane carries in are bounded here, before anything
+            // is encoded: a device-geometry fire's slots are the guest's
+            // (read on the host), so the runtime cannot bound them, and a
+            // lane past the bound is refused by name rather than replayed
+            // past the rung's rs region.
+            if plan.replay > engine::fire::UNFOLDED_ROWS {
+                return Err(Fault::program(
+                    "serve::rs",
+                    format!(
+                        "lane {source} carries {} recurrent rows unfolded into this fire, \
+                         past the {} a lane may carry (engine::fire::UNFOLDED_ROWS); the \
+                         fire is refused and writes nothing",
+                        plan.replay,
+                        engine::fire::UNFOLDED_ROWS
+                    ),
+                ));
+            }
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) && crate::diag::on().rs_trace {
                 eprintln!(
                     "recurrent seat: lane {} rows {} replay {} commit {} gather {:?} scatter {:?}",
@@ -4986,11 +5003,6 @@ fn span_host(pools: &Pools, at: u64, bytes: u64) -> Result<Vec<(u64, u64, std::p
     let (_, span_at, _) = pools.span_view();
     pools.host_runs(pools.span().0 + (at - span_at), bytes)
 }
-
-/// The rows a lane carries unfolded into a fire (its own rows not counted):
-/// the runtime's bound on a pass, `engine::fire::UNFOLDED_ROWS` once the
-/// contract states it (16 there); a fire past it is refused at the lane.
-const RS_UNFOLDED_ROWS: u32 = 16;
 
 /// An adapter landed in `Adapter` slots: its id, its slot refs and the bank
 /// each holds (bank-name order), and the instances holding it.
