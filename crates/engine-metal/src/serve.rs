@@ -1707,7 +1707,11 @@ impl Shell {
             (Model, "weights", self.weights.bytes()),
             (Model, "weight cache tables", self.pools.table_bytes()),
             (Model, "ngram constants", self.scratch.constant_bytes()),
-            (Model, "ane surfaces", ane_model),
+            (
+                Model,
+                "ane surfaces (IOSurfaces the Neural Engine maps itself: outside the pool by the OS)",
+                ane_model,
+            ),
             (
                 State,
                 "pool",
@@ -1743,7 +1747,11 @@ impl Shell {
                 self.rs_scratch.as_ref().map_or(0, Buffer::bytes),
             ),
             (Fire, "guest batches", guest_fire),
-            (Fire, "ane staging", ane_fire),
+            (
+                Fire,
+                "ane staging and surfaces (IOSurfaces outside the pool by the OS)",
+                ane_fire,
+            ),
             (
                 Fire,
                 "nan flags",

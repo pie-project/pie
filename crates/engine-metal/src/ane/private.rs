@@ -90,6 +90,11 @@ pub struct Private {
     buffers: banks::Keep,
 }
 
+/// A Neural Engine surface as the GPU binds it. The one memory outside the
+/// pool on Metal, by the OS: the Neural Engine reads IOSurfaces it maps
+/// itself, and a placement sparse buffer cannot be one, so the surfaces are
+/// laid at the load and entered in the ledger as model and fire class
+/// there (a stated exception, the user's ruling).
 fn view(
     device: &Context,
     handles: &Handles,
