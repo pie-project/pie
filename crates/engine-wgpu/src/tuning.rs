@@ -1,7 +1,9 @@
 //! The hardware-dependent decisions engine-wgpu reads when it fires
 //! kernels-slang's entries, and [`Tuning`], the values one load runs under.
 
-use engine_gpu::tuning::{DecodeSplitMinKeys, MoeTileRows, SdpaTileRowsPerRequest};
+use engine_gpu::tuning::{
+    DecodeSplitMinKeys, MoeTileRows, SdpaTileRowsPerRequest, WorkingSetPercent,
+};
 use profile::{Decision, Domain, Profile, Registry, Var};
 
 pub const FACTS: &[Var] = &[
@@ -76,7 +78,8 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeTileRows>()
         .add::<SdpaTileRowsPerRequest>()
         .add::<DecodeSplit>()
-        .add::<DecodeSplitMinKeys>();
+        .add::<DecodeSplitMinKeys>()
+        .add::<WorkingSetPercent>();
 }
 
 #[derive(Clone, Debug)]

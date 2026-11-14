@@ -95,6 +95,19 @@ pub fn least_state_slots(seated: u32) -> u32 {
     seated.saturating_mul(2).max(3)
 }
 
+/// The largest token budget at or under `max_tokens`, halving toward
+/// `floor`, whose working set (`working`: what a fire of that many tokens
+/// takes of the device, which only grows with them) fits `room`. Halving
+/// keeps the rungs under it a prefix of the asked ladder.
+#[must_use]
+pub fn tokens_within(max_tokens: u32, floor: u32, room: u64, working: impl Fn(u32) -> u64) -> u32 {
+    let mut tokens = max_tokens;
+    while tokens > floor && working(tokens) > room {
+        tokens = (tokens / 2).max(floor);
+    }
+    tokens
+}
+
 /// The largest page count at or under `asked` whose watermark fits `room`,
 /// or zero when not even the first page does. `declared_at` is the watermark
 /// at a page count and only ever grows with it, so this is a bisection over
@@ -216,7 +229,18 @@ pub fn pool_for(
 
 #[cfg(test)]
 mod tests {
-    use super::{Short, balanced_state_slots, pages_for, pool_for, pool_within};
+    use super::{Short, balanced_state_slots, pages_for, pool_for, pool_within, tokens_within};
+
+    /// A fire is halved to the largest rung whose working set fits, never
+    /// under the floor, and one that already fits is kept.
+    #[test]
+    fn a_fire_is_halved_to_the_rung_its_room_holds() {
+        let working = |tokens: u32| u64::from(tokens) * 1024;
+        assert_eq!(tokens_within(32_768, 1, 5000 * 1024, working), 4096);
+        assert_eq!(tokens_within(32_768, 1, u64::MAX, working), 32_768);
+        assert_eq!(tokens_within(32_768, 1024, 0, working), 1024);
+        assert_eq!(tokens_within(3000, 1, 1024 * 1024, working), 750);
+    }
 
     #[test]
     fn a_budget_buys_its_pages_and_none_fills_the_room() {

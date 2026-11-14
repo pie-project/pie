@@ -678,7 +678,16 @@ pub struct Shell<B: Serve> {
 impl<B: Serve> Shell<B> {
     pub fn load(boot: Boot<'_, B>) -> Result<Shell<B>> {
         let mut boot = boot;
-        let (device, mut tuning) = B::open(boot.device, boot.residency.device, boot.handed.take())?;
+        let opened = B::open(boot.device, boot.residency.device, boot.handed.take())?;
+        Shell::load_on(boot, opened)
+    }
+
+    /// The load on a device opened already: a load that fits its fire to
+    /// the device ([`crate::fit`]) reads it before it states its budgets.
+    pub fn load_on(
+        boot: Boot<'_, B>,
+        (device, mut tuning): (B::Context, B::Tuning),
+    ) -> Result<Shell<B>> {
         let tier = B::tier(&device);
         let mut boot = Boot {
             trace: poem_compiler::fuse::fuse(
@@ -708,7 +717,7 @@ impl<B: Serve> Shell<B> {
             }
         };
         let weights: u64 = crate::weights::plane_bytes(&boot.trace)?.iter().sum();
-        let room = device.left().saturating_sub(weights) / 2;
+        let room = tuning.working_share(device.left().saturating_sub(weights));
         let mut budgets = poem_compiler::fit_voxels(&boot.trace, budgets, &profile, room);
         if boot.slots == 0 {
             boot.slots = poem_compiler::fit_frame_slots(
@@ -823,24 +832,7 @@ impl<B: Serve> Shell<B> {
         let rs_tokens = rows.rs.as_ref().map_or(0, |rs| rs.tokens);
         // One working set: its pages, its record and one written
         // copy-on-write, and its rs-list pages, beside the null chunk.
-        let least_chunks = crate::store::layout::Layout::least_chunks(
-            chunk,
-            [rows.list_bytes, rows.fixed_bytes],
-            rows.pieces,
-            asked.pages_per_slot,
-        ) + chunk.checked_div(rs_bytes).map_or(0, |per| {
-            asked
-                .context()
-                .div_ceil(rs_tokens.max(1))
-                .div_ceil(u32::try_from(per).unwrap_or(1).max(1))
-        }) + rows
-            .windows
-            .iter()
-            .map(|w| {
-                let per = u32::try_from(chunk / w.bytes.max(1)).unwrap_or(1).max(1);
-                asked.context().div_ceil(w.tokens.max(1)).div_ceil(per)
-            })
-            .sum::<u32>();
+        let least_chunks = crate::fit::least_chunks(&rows, asked);
         // The most pages a lane's table takes: the narrowest slot's.
         let table_pages = rows
             .windows
@@ -1132,7 +1124,17 @@ impl<B: Serve> Shell<B> {
         // what is left: one built later must find its driver memory free.
         let pipelines = B::Pipelines::default();
         let unbuilt = price_pipelines::<B>(&device, &pipelines);
-        let left = device.left().saturating_sub(unbuilt);
+        // So is the widest fire's replay scratch, a recurrent model's,
+        // which lies outside the pool.
+        let rs_scratch = crate::fit::rs_scratch(
+            rs_layout.as_deref(),
+            boot.budget.max_tokens,
+            boot.budget.max_lanes,
+        );
+        let left = device
+            .left()
+            .saturating_sub(unbuilt)
+            .saturating_sub(rs_scratch);
         if let Some(budget) = kv_budget
             && budget > left
         {
@@ -1144,36 +1146,19 @@ impl<B: Serve> Shell<B> {
         // budget states for state.
         let act_chunks = span.act_chunks(chunk);
         let act = act_chunks.last().map_or(0, |&(_, chunks)| chunks);
-        let room = kv_budget.map_or(left, |budget| {
-            budget.saturating_add(u64::from(act) * chunk).min(left)
-        });
-        let total = engine::chunk::fit(room, chunk, act, least_chunks)
-            .map_err(|short| Fault::Residency(short.to_string()))?;
-        let binds = u32::try_from(
-            (device.max_buffer() / chunk).saturating_mul(kernels_slang::SEGMENTS as u64),
-        )
-        .unwrap_or(u32::MAX);
-        // Whole segments of a quarter of the pool, all four within the
-        // bf16-element index the kernels address the pool by.
-        let words = u32::try_from(2 * u64::from(u32::MAX) / chunk).unwrap_or(u32::MAX)
-            / kernels_slang::SEGMENTS as u32
-            * kernels_slang::SEGMENTS as u32;
-        // State lies within that index; the span past it is the fire's
-        // alone (bound by offset, never indexed), at every rung.
-        let total = total.min(binds).min(words.saturating_add(act));
-        let span_short = || {
-            Fault::Residency(format!(
-                "one working set takes {least_chunks} chunks of {chunk} bytes beside a fire's \
-                 {act}, and this device binds four segments of {} MiB",
-                device.max_buffer() >> 20
-            ))
-        };
-        let segment_chunks =
-            crate::store::pool::segment_chunks(chunk, total, device.max_buffer(), act)
-                .ok_or_else(span_short)?;
-        if total < least_chunks + act {
-            return Err(span_short());
-        }
+        let crate::fit::Pool {
+            room,
+            total,
+            segment_chunks,
+            words,
+        } = crate::fit::pool(
+            left,
+            kv_budget,
+            chunk,
+            act,
+            least_chunks,
+            device.max_buffer(),
+        )?;
         // No rung lends a chunk past the kernels' index to state.
         let unindexed = total.saturating_sub(words);
         // Rungs taking as many chunks are one: each class is stated once,

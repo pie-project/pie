@@ -13,8 +13,6 @@ use kernels_slang::Tensor;
 
 const RING: usize = 2;
 
-const MAX_ROUTES: u64 = 1 << 18;
-
 const COPY_THREADS: usize = 16;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -476,8 +474,13 @@ impl<B: Backend> Seats<B> {
                 crate::books::owners::EXPERT_SEATS,
             )?);
         }
-        let routes = B::Buffer::zeroed(device, MAX_ROUTES * 4, crate::books::owners::EXPERT_SEATS)?;
-        let routes_handle = handles.bind(&routes, 0, MAX_ROUTES * 4)?;
+        // A gather routes each of its rows to a seat, a u32 a row, and no
+        // gather has more rows than there are seats
+        // (`Plan::gathered_demand`).
+        let routes_bytes = u64::from(capacity) * size_of::<u32>() as u64;
+        let routes =
+            B::Buffer::zeroed(device, routes_bytes, crate::books::owners::EXPERT_SEATS)?;
+        let routes_handle = handles.bind(&routes, 0, routes_bytes)?;
         Ok(Some(Seats {
             slabs,
             seat,
@@ -512,11 +515,11 @@ impl<B: Backend> Seats<B> {
     }
 
     pub fn write_routes(&self, seat_of: &[i32]) -> Result<()> {
-        if seat_of.len() as u64 > MAX_ROUTES {
+        if seat_of.len() as u64 > u64::from(self.capacity) {
             return Err(Fault::Ceiling {
                 what: "route entries in one gather",
                 need: seat_of.len() as u64,
-                have: MAX_ROUTES,
+                have: u64::from(self.capacity),
             });
         }
         let mut bytes = Vec::with_capacity(seat_of.len() * 4);

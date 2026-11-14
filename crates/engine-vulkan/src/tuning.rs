@@ -1,7 +1,9 @@
 //! The hardware-dependent decisions engine-vulkan reads when it fires
 //! kernels-slang's entries, and [`Tuning`], the values one load runs under.
 
-use engine_gpu::tuning::{DecodeSplitMinKeys, MoeTileRows, SdpaTileRowsPerRequest};
+use engine_gpu::tuning::{
+    DecodeSplitMinKeys, MoeTileRows, SdpaTileRowsPerRequest, WorkingSetPercent,
+};
 use profile::{Decision, Domain, Profile, Registry, Var};
 
 pub const FACTS: &[Var] = &[
@@ -161,7 +163,8 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeSplit>()
         .add::<DecodeSplitMinKeys>()
         .add::<DecodeThreads>()
-        .add::<SdpaTileRows>();
+        .add::<SdpaTileRows>()
+        .add::<WorkingSetPercent>();
 }
 
 /// The point a dense matmul is chosen at on a device with `cores` cores.

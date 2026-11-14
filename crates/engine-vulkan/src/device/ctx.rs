@@ -992,6 +992,12 @@ impl Context {
         self.max_buffer
     }
 
+    /// The most workgroups one dispatch launches on each axis.
+    #[must_use]
+    pub fn max_workgroups(&self) -> [u32; 3] {
+        self.core.limits.max_compute_work_group_count
+    }
+
     #[must_use]
     pub fn cores(&self) -> u32 {
         self.core.cores.unwrap_or(crate::chip::UNREPORTED_CORES)

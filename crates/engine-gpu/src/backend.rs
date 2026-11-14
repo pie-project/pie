@@ -99,6 +99,9 @@ pub trait Context<B: Backend> {
     /// The bytes one buffer may span.
     fn max_buffer(&self) -> u64;
 
+    /// The most workgroups one dispatch launches on each axis.
+    fn max_workgroups(&self) -> [u32; 3];
+
     fn name(&self) -> &str;
 
     fn cores(&self) -> u32;
@@ -250,6 +253,13 @@ pub trait Tactics: std::fmt::Debug {
 
     fn sdpa_split_min_keys(&self) -> u32 {
         self.profile().get::<crate::tuning::DecodeSplitMinKeys>().0
+    }
+
+    /// What a fire's working set may take of `past_weights`, the bytes the
+    /// device has left past the weights: its
+    /// [`WorkingSetPercent`](crate::tuning::WorkingSetPercent).
+    fn working_share(&self, past_weights: u64) -> u64 {
+        past_weights / 100 * u64::from(self.profile().get::<crate::tuning::WorkingSetPercent>().0)
     }
 }
 

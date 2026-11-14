@@ -148,18 +148,9 @@ pub fn holds_within(configured: u64, programs: u64, spare: u64) -> (u64, u64) {
     (bodies, programs)
 }
 
-/// The largest token budget at or under `max_tokens`, halving toward
-/// `floor`, whose working set (`working`, the activation arena and the
-/// attention workspaces at that budget) fits `room`. Halving keeps the
-/// bucket lattice a prefix of what the operator asked for.
-#[must_use]
-pub fn tokens_within(max_tokens: u32, floor: u32, room: u64, working: impl Fn(u32) -> u64) -> u32 {
-    let mut tokens = max_tokens;
-    while tokens > floor && working(tokens) > room {
-        tokens = (tokens / 2).max(floor);
-    }
-    tokens
-}
+/// The halving fit of a fire's tokens to its room: the engines that size
+/// their fire at load share it.
+pub use engine::fit::tokens_within;
 
 /// What the decoded-weight tiles take on this load: a plane stored in codes
 /// and scales is decoded to bf16 before a prefill's dense gemm reads it,

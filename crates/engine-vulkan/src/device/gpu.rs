@@ -64,6 +64,10 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::max_buffer(self)
     }
 
+    fn max_workgroups(&self) -> [u32; 3] {
+        Context::max_workgroups(self)
+    }
+
     fn name(&self) -> &str {
         Context::name(self)
     }

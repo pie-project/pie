@@ -45,8 +45,6 @@ pub use engine::Capabilities as EngineCapabilities;
 /// the device: the most lanes and tokens one fire carries.
 #[cfg_attr(
     not(any(
-        feature = "vulkan",
-        feature = "wgpu",
         feature = "xla",
         feature = "cerebras",
         all(feature = "metal", target_vendor = "apple")
@@ -61,8 +59,6 @@ struct Fire {
 
 #[cfg_attr(
     not(any(
-        feature = "vulkan",
-        feature = "wgpu",
         feature = "xla",
         feature = "cerebras",
         all(feature = "metal", target_vendor = "apple")
@@ -84,16 +80,6 @@ const METAL_FIRE: Fire = Fire {
 /// The Metal shell has no planner to derive a page from.
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 const METAL_PAGE_SIZE: u32 = 32;
-#[cfg(feature = "vulkan")]
-const VULKAN_FIRE: Fire = Fire {
-    lanes: 512,
-    tokens: 10240,
-};
-#[cfg(feature = "wgpu")]
-const WGPU_FIRE: Fire = Fire {
-    lanes: 512,
-    tokens: 10240,
-};
 #[cfg(feature = "xla")]
 const XLA_FIRE: Fire = Fire {
     lanes: 64,
@@ -133,30 +119,49 @@ fn device_index(devices: &[String], families: &[&str]) -> Result<u32> {
 #[cfg(any(feature = "engine-cuda", test))]
 const CUDA_PAGE_SIZE: u32 = 16;
 
-/// The lanes one fire may carry on the cuda shell; the tokens are the
-/// largest rung its card holds, derived at load.
-#[cfg(any(feature = "engine-cuda", test))]
-const CUDA_FIRE_LANES: u32 = 512;
+/// The lanes asked of an engine that fits its fire to its device at load
+/// (cuda, vulkan, wgpu): the most sequences one fire samples. An ask of
+/// the serving side, the one every such engine had, not a figure of the
+/// device: a lane costs a readout row (the head's planes in the fire's
+/// span and their readback) and its entries of the fire's tables, which
+/// the engine prices with the fire; it carries no more lanes than the rung
+/// it fits has tokens.
+#[cfg(any(
+    feature = "engine-cuda",
+    feature = "vulkan",
+    feature = "wgpu",
+    test
+))]
+const FIRE_LANES: u32 = 512;
 
-#[cfg(any(feature = "engine-cuda", test))]
-fn cuda_budgets(
+/// The budgets of an engine that fits its fire and its context to its
+/// device at load (cuda, vulkan, wgpu): what the config states, and the
+/// rest left for the engine to derive.
+#[cfg(any(
+    feature = "engine-cuda",
+    feature = "vulkan",
+    feature = "wgpu",
+    test
+))]
+fn fitted_budgets(
+    page_size: u32,
     adapter_seats: u32,
     max_context: Option<u32>,
     declared: Option<u32>,
 ) -> engine::Budgets {
-    let page_size = CUDA_PAGE_SIZE;
     let stated = max_context.filter(|&len| len > 0);
     // Unstated: the context the model declares (the engine shortens it to
-    // what the card holds), 4096 where it declares none.
+    // what the device holds), 4096 where it declares none.
     let context_declared = stated.is_none() && declared.is_some();
     let max_context = stated
         .or(declared)
         .unwrap_or_else(|| engine::Budgets::default().max_context)
         .max(page_size);
     engine::Budgets {
-        max_lanes: CUDA_FIRE_LANES,
-        // 0: the engine takes its chip's `engine.forward_tokens`, 8192 where
-        // the profile says nothing, and fits the rungs to the card.
+        max_lanes: FIRE_LANES,
+        // 0: the engine fits the rungs to its device (cuda from its chip's
+        // `engine.forward_tokens`, 8192 where the profile says nothing;
+        // vulkan and wgpu from the most rows the device dispatches).
         max_tokens: 0,
         buckets: Vec::new(),
         max_adapters: adapter_seats,
@@ -306,7 +311,7 @@ fn register_operator_adapters(
     Ok(())
 }
 
-#[cfg(feature = "engine-cuda")]
+#[cfg(any(feature = "engine-cuda", feature = "vulkan", feature = "wgpu"))]
 /// The context the model at `snapshot_dir` declares, stretched by the yarn
 /// factor a deployment turns at past the config.
 fn declared_context(
@@ -383,7 +388,8 @@ pub(crate) fn create_engine_backend_group(
         &mut backend,
         snapshot_dir,
         cache_dir,
-        cuda_budgets(
+        fitted_budgets(
+            CUDA_PAGE_SIZE,
             adapters.seats(),
             max_context,
             declared_context(snapshot_dir, overrides),
@@ -442,7 +448,8 @@ pub(crate) fn create_engine_lockstep(
     }
     let ep = u32::try_from(boots.len()).context("a rank count fits u32")?;
     let backends = runtime::engine::backend::open::cuda_lockstep(boots)?;
-    let budgets = cuda_budgets(
+    let budgets = fitted_budgets(
+        CUDA_PAGE_SIZE,
         adapters.seats(),
         max_context,
         declared_context(snapshot_dir, overrides),
@@ -544,7 +551,8 @@ pub(crate) fn create_engine_backend(
             let backend = runtime::engine::backend::open::cuda(boot)?;
             (
                 backend,
-                cuda_budgets(
+                fitted_budgets(
+                    CUDA_PAGE_SIZE,
                     adapters.seats(),
                     max_context,
                     declared_context(snapshot_dir, overrides),
@@ -618,24 +626,14 @@ pub(crate) fn create_engine_backend(
                 || runtime::engine::backend::open::vulkan(boot_doc.as_bytes()),
                 Ok,
             )?;
-            let defaults = engine::Budgets::default();
-            let (max_lanes, max_tokens) = VULKAN_FIRE.of();
             (
                 backend,
-                engine::Budgets {
-                    max_lanes,
-                    max_tokens,
-                    buckets: Vec::new(),
-                    max_adapters: adapters.seats(),
-                    page_size: defaults.page_size,
-                    max_context: max_context.unwrap_or(defaults.max_context),
-                    context_declared: false,
-                    slots: 0,
-                    max_patches: None,
-                    max_images: None,
-                    max_voxels: None,
-                    max_clips: None,
-                },
+                fitted_budgets(
+                    engine::Budgets::default().page_size,
+                    adapters.seats(),
+                    max_context,
+                    declared_context(snapshot_dir, overrides),
+                ),
                 poem_ir::Platform::Vulkan,
             )
         }
@@ -660,24 +658,14 @@ pub(crate) fn create_engine_backend(
                 || runtime::engine::backend::open::wgpu(boot_doc.as_bytes()),
                 Ok,
             )?;
-            let defaults = engine::Budgets::default();
-            let (max_lanes, max_tokens) = WGPU_FIRE.of();
             (
                 backend,
-                engine::Budgets {
-                    max_lanes,
-                    max_tokens,
-                    buckets: Vec::new(),
-                    max_adapters: adapters.seats(),
-                    page_size: defaults.page_size,
-                    max_context: max_context.unwrap_or(defaults.max_context),
-                    context_declared: false,
-                    slots: 0,
-                    max_patches: None,
-                    max_images: None,
-                    max_voxels: None,
-                    max_clips: None,
-                },
+                fitted_budgets(
+                    engine::Budgets::default().page_size,
+                    adapters.seats(),
+                    max_context,
+                    declared_context(snapshot_dir, overrides),
+                ),
                 poem_ir::Platform::Wgpu,
             )
         }
@@ -874,7 +862,7 @@ mod tests {
     }
 
     fn the_rungs_and_ladders_are_the_engines_to_derive() {
-        let derived = cuda_budgets(0, None, None);
+        let derived = fitted_budgets(CUDA_PAGE_SIZE, 0, None, None);
         assert_eq!(derived.max_tokens, 0, "the card's largest rung");
         assert_eq!(
             (derived.max_patches, derived.max_images),
@@ -885,11 +873,11 @@ mod tests {
     }
 
     fn the_pool_budget_seats_by_state_slots_not_pages() {
-        let budgets = cuda_budgets(0, None, None);
+        let budgets = fitted_budgets(CUDA_PAGE_SIZE, 0, None, None);
         assert_eq!(budgets.page_size, 16);
         assert_eq!(budgets.max_context, 4096);
         assert_eq!(budgets.slots, 0, "the engine's chip sizes the slab");
-        let capped = cuda_budgets(0, Some(2048), Some(32_768));
+        let capped = fitted_budgets(CUDA_PAGE_SIZE, 0, Some(2048), Some(32_768));
         assert_eq!(capped.max_context, 2048, "`[engine] max_context` caps it");
         assert!(!capped.context_declared);
     }

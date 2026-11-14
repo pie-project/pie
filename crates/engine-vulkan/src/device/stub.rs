@@ -55,6 +55,11 @@ impl Context {
     }
 
     #[must_use]
+    pub fn max_workgroups(&self) -> [u32; 3] {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn left(&self) -> u64 {
         match self.never {}
     }

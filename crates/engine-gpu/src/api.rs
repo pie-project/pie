@@ -269,11 +269,11 @@ pub fn fault(fault: Fault) -> Error {
     }
 }
 
-const DEFAULT_STATE_SLOTS: u32 = 256;
+pub(crate) const DEFAULT_STATE_SLOTS: u32 = 256;
 
 /// The load's budgets: its logit readouts sized to what `trace` reads, not a
 /// general figure, so a vocab-wide head carves only the rows a fire can read.
-fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
+pub(crate) fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
         max_tokens: budgets.max_tokens,
@@ -436,6 +436,21 @@ where
         };
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
 
+        // The device is opened first: a load that leaves its fire or its
+        // model's context to the device is fitted to it before anything
+        // is sized.
+        let opened = B::open(&self.boot, residency.device, self.handed.take()).map_err(fault)?;
+        let budgets = crate::fit::budgets::<B>(
+            &trace,
+            budgets,
+            &residency,
+            frames_in_flight,
+            &self.boot,
+            &opened.0,
+            &opened.1,
+        )
+        .map_err(fault)?;
+
         let patches = patch_ladder(&trace, &budgets);
         let voxels = poem_compiler::VoxelLadder::of(
             &trace,
@@ -452,7 +467,7 @@ where
         let budget = bake_budgets(&budgets, &trace);
         let max_readouts =
             u32::try_from(poem_compiler::arena::readouts_ceiling(&budget)).unwrap_or(u32::MAX);
-        let mut shell = Shell::load(Boot {
+        let boot = Boot {
             trace,
             contract: &contract,
             checkpoint: &path,
@@ -468,9 +483,9 @@ where
             voxels,
             residency,
             device: &self.boot,
-            handed: self.handed.take(),
-        })
-        .map_err(fault)?;
+            handed: None,
+        };
+        let mut shell = Shell::load_on(boot, opened).map_err(fault)?;
         let disk_kv_pages = shell
             .seat_disk_kv(
                 disk_kv_budget,
