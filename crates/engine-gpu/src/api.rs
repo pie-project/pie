@@ -263,7 +263,7 @@ pub fn fault(fault: Fault) -> Error {
         | Fault::Blocking { .. } => Error::Device(fault.to_string()),
         Fault::Fire(_) => Error::Invalid(fault.to_string()),
 
-        Fault::Residency(_) => Error::Impossible(fault.to_string()),
+        Fault::Residency(_) | Fault::Workgroups { .. } => Error::Impossible(fault.to_string()),
     }
 }
 

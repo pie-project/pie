@@ -48,6 +48,17 @@ pub enum Fault {
         have: u64,
     },
 
+    /// One dispatch asks more workgroups on an axis than the device takes.
+    Workgroups {
+        kernel: String,
+
+        axis: char,
+
+        count: u32,
+
+        limit: u32,
+    },
+
     PatchPayload {
         lane: u32,
 
@@ -221,6 +232,17 @@ impl fmt::Display for Fault {
             Self::Ceiling { what, need, have } => write!(
                 f,
                 "this fire asks for {need} {what} and the load reserved {have}"
+            ),
+            Self::Workgroups {
+                kernel,
+                axis,
+                count,
+                limit,
+            } => write!(
+                f,
+                "`{kernel}` launches {count} workgroups on its {axis} axis and this device \
+                 takes {limit} on it (Vulkan's `maxComputeWorkGroupCount`, wgpu's \
+                 `max_compute_workgroups_per_dimension`)"
             ),
             Self::PatchPayload {
                 lane,
@@ -430,6 +452,26 @@ impl From<poem_exec::store::Fault> for Fault {
 
 pub type Result<T> = std::result::Result<T, Fault>;
 
+/// The workgroups one dispatch of `kernel` launches on each axis (an axis
+/// it does not spread over launches one), checked where the dispatch is
+/// emitted against `limit`, what the device reports it takes on each
+/// (Vulkan's `maxComputeWorkGroupCount`, wgpu's
+/// `max_compute_workgroups_per_dimension` on all three). A count past it
+/// is refused by the kernel, the axis and the count: on Vulkan such a
+/// dispatch is undefined, not an error the device returns.
+pub fn workgroups(kernel: &str, groups: [u32; 3], limit: [u32; 3]) -> Result<[u32; 3]> {
+    let launched = groups.map(|count| count.max(1));
+    match (0..launched.len()).find(|&axis| launched[axis] > limit[axis]) {
+        Some(axis) => Err(Fault::Workgroups {
+            kernel: kernel.to_string(),
+            axis: ['x', 'y', 'z'][axis],
+            count: launched[axis],
+            limit: limit[axis],
+        }),
+        None => Ok(launched),
+    }
+}
+
 impl From<kernels_slang::Error> for Fault {
     fn from(error: kernels_slang::Error) -> Self {
         Fault::from(kernel(error))
@@ -443,5 +485,46 @@ pub fn kernel(error: kernels_slang::Error) -> KernelError {
             KernelError::DtypeUnsupported { op, dtype }
         }
         kernels_slang::Error::Backend { op, detail } => KernelError::Backend { op, detail },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dispatch past the device's count on an axis is refused by its
+    /// kernel, the axis and the count; one at the count launches, and an
+    /// axis a kernel does not spread over launches one group.
+    #[test]
+    fn a_dispatch_past_the_devices_workgroup_count_is_refused_by_name() {
+        let limit = [65_535, 65_535, 64];
+        assert_eq!(
+            workgroups("gather_embed_bf16", [16, 65_535, 0], limit).unwrap(),
+            [16, 65_535, 1]
+        );
+        let refused = workgroups("gather_embed_bf16", [16, 65_536, 1], limit).unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                Fault::Workgroups { kernel, axis: 'y', count: 65_536, limit: 65_535 }
+                    if kernel == "gather_embed_bf16"
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "`gather_embed_bf16` launches 65536 workgroups on its y axis and this device takes \
+             65535 on it (Vulkan's `maxComputeWorkGroupCount`, wgpu's \
+             `max_compute_workgroups_per_dimension`)"
+        );
+        // Each axis against its own count: z takes fewer here.
+        assert!(matches!(
+            workgroups("k", [1, 1, 65], limit),
+            Err(Fault::Workgroups { axis: 'z', count: 65, limit: 64, .. })
+        ));
+        assert!(matches!(
+            workgroups("k", [u32::MAX, 1, 1], limit),
+            Err(Fault::Workgroups { axis: 'x', count: u32::MAX, .. })
+        ));
     }
 }

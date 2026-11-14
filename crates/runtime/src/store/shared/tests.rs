@@ -1138,3 +1138,35 @@ fn a_segment_straddling_the_ceiling_is_never_mapped() {
         pool.held()
     );
 }
+
+/// An engine's rung gate is its own whatever its id: the 65th engine a
+/// process registers is cut, granted and woken by its own gate, never by
+/// another engine's and never left uncapped.
+#[tokio::test]
+async fn an_engine_past_the_sixty_fourth_has_its_own_rung_gate() {
+    const NEAR: usize = 63;
+    const PAST: usize = 64;
+    const FAR: usize = 4_000_000;
+    crate::store::shared::set_fire_cap_for_test(NEAR, 16);
+    crate::store::shared::set_fire_cap_for_test(PAST, 256);
+    crate::store::shared::set_fire_cap_for_test(FAR, 2048);
+    assert_eq!(crate::store::shared::fire_cap(NEAR), 16);
+    assert_eq!(crate::store::shared::fire_cap(PAST), 256, "its own cap");
+    assert_eq!(crate::store::shared::fire_cap(FAR), 2048, "its own cap");
+    grant_rung(PAST, 256);
+    grant_rung(FAR, 2048);
+    assert_eq!(rung_granted(PAST), 256);
+    assert_eq!(rung_granted(FAR), 2048);
+    // A wait on the 65th engine is woken by its own change, not by the
+    // 64th's.
+    let watch = rung_watch(PAST);
+    tokio::pin!(watch);
+    watch.as_mut().enable();
+    rung_changed(NEAR);
+    assert!(
+        futures::poll!(watch.as_mut()).is_pending(),
+        "another engine's change does not wake it"
+    );
+    rung_changed(PAST);
+    assert!(futures::poll!(watch.as_mut()).is_ready(), "its own does");
+}
