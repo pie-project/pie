@@ -419,6 +419,20 @@ impl Context {
     pub fn synchronize(&self) -> Result<()> {
         #[cfg(feature = "device")]
         {
+            // Every stream this context launches on, the side lanes and the
+            // conditional body first: what forked onto them is joined into
+            // the fire stream, and nothing is still queued on any of them
+            // when this returns. A caller that hands memory on after it (an
+            // arming step its lent slots) relies on that.
+            for side in self.side.iter().chain(self.conditional.as_ref()) {
+                // SAFETY: the handle is live for this context's lifetime.
+                unsafe {
+                    check(
+                        "cudaStreamSynchronize",
+                        crate::device::rt::cudaStreamSynchronize(side.stream.cast()),
+                    )?;
+                }
+            }
             // SAFETY: the handles are live for this context's lifetime.
             unsafe {
                 check(
