@@ -619,6 +619,28 @@ impl ResidencyPlanner {
     }
 
     /// Whether an eviction has this holder's set in hand.
+    /// Waits until `pid` is not being moved off the device: its eviction
+    /// ends (or rolls back) and tells its signal. At once where it is not.
+    pub async fn wait_not_moving(&self, pid: ProcessId) {
+        loop {
+            let Some(signal) = self
+                .lock_inner()
+                .procs
+                .get(&pid)
+                .map(|proc| proc.signal.clone())
+            else {
+                return;
+            };
+            let notified = signal.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.holder_moving(pid) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     pub fn holder_moving(&self, pid: ProcessId) -> bool {
         self.lock_inner()
             .procs

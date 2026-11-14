@@ -19,6 +19,8 @@ impl ResidencyPlanner {
             inner.evicting.remove(&pid);
             debug_assert_eq!(proc.state, Residency::Evicting);
             proc.state = Residency::Evicted;
+            // What waits for its move to end ([`ResidencyPlanner::wait_not_moving`]).
+            proc.signal.notify_waiters();
             let demand = Demand {
                 kv_pages: freed,
                 rs: rs_freed,

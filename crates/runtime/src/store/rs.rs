@@ -307,6 +307,9 @@ pub struct RsStore {
     checkpoints: HashMap<Hash256, RsCheckpoint>,
     /// Slots a suspend or restore has between its prepare and commit.
     moving: HashSet<RsSlotId>,
+    /// Told whenever a move lets slots go: what waits for a set to stop
+    /// moving waits on it.
+    moved: std::sync::Arc<tokio::sync::Notify>,
     /// The tokens an rs list slot holds, where the buffer pages are a
     /// shared pool's rs list (CONTRACT-BC 18): a page holds that many rows,
     /// whatever a set's geometry says, and the buffer starts at a multiple
@@ -480,6 +483,7 @@ impl RsStore {
             pending_touch: Vec::new(),
             checkpoints: HashMap::new(),
             moving: HashSet::new(),
+            moved: std::sync::Arc::new(tokio::sync::Notify::new()),
             rs_tokens: None,
         }
     }
@@ -849,6 +853,12 @@ impl RsStore {
             *self.refs.entry(id).or_insert(1) += 1;
         }
         Ok(self.working_sets.insert(entry))
+    }
+
+    /// Told whenever a move lets slots go ([`Self::in_move`] may have
+    /// turned false): arm it before looking.
+    pub fn moves_ended(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        std::sync::Arc::clone(&self.moved)
     }
 
     /// Whether a move holds a slot `ws` names.
@@ -2162,6 +2172,7 @@ impl RsStore {
         let held = self.held_within(&scope);
         self.cache_holds_in(&scope, false);
         let mut freed = Vec::new();
+        self.moved.notify_waiters();
         for (device, host) in txn.moves {
             self.moving.remove(&device);
             // A set released while the copy ran holds nothing; what it still
@@ -2192,6 +2203,7 @@ impl RsStore {
         for (device, _) in &txn.moves {
             self.moving.remove(device);
         }
+        self.moved.notify_waiters();
         self.release_host(txn.moves.into_iter().map(|(_, host)| host));
     }
 
@@ -2250,6 +2262,7 @@ impl RsStore {
         let scope: HashSet<RsWorkingSetId> = txn.scope.iter().copied().collect();
         self.cache_holds_in(&scope, false);
         let mut restored = 0;
+        self.moved.notify_waiters();
         for (host, device) in txn.moves {
             self.moving.remove(&host);
             let within = self.swap_within(&txn.scope, host, device);
@@ -2278,6 +2291,7 @@ impl RsStore {
         for (host, _) in &txn.moves {
             self.moving.remove(host);
         }
+        self.moved.notify_waiters();
         self.release_device(txn.moves.into_iter().map(|(_, device)| device));
     }
 

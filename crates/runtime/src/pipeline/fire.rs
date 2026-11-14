@@ -2179,8 +2179,10 @@ pub(crate) async fn seat_lane_slots(
     stores: &crate::store::registry::Stores,
     groups: &LaneGroups,
 ) -> Result<(), String> {
-    let deadline = crate::rt::time::Instant::now() + SEAT_WAIT;
     let freed = stores.seats.lock().unwrap().freed();
+    // A working set letting its seats go is the event: it waits for it,
+    // however long, and is refused at once only where no release could
+    // ever seat it.
     loop {
         let mut freed = Box::pin(freed.notified());
         freed.as_mut().enable();
@@ -2193,15 +2195,7 @@ pub(crate) async fn seat_lane_slots(
                 "pipeline: seating this fire's lanes: {refusal}; no release can seat it"
             ));
         }
-        let now = crate::rt::time::Instant::now();
-        if now >= deadline {
-            return Err(format!(
-                "pipeline: seating this fire's lanes: {refusal}; waited {:?} for a peer to \
-                 release seats and none did",
-                SEAT_WAIT
-            ));
-        }
-        let _ = crate::rt::time::timeout(deadline - now, freed).await;
+        freed.await;
     }
 }
 

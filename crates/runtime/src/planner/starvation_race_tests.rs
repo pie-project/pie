@@ -1803,3 +1803,31 @@ async fn a_window_store_tells_the_walker_a_reserve_stated_in_pages() {
         .note_short_shared(RsUnits::default());
     assert_eq!(wanted(), before);
 }
+
+/// What waits for a process to stop being moved off the device (a handle
+/// claiming its sets) wakes when its eviction ends, on no clock.
+#[tokio::test(flavor = "current_thread")]
+async fn a_wait_for_a_move_to_end_wakes_when_the_eviction_ends() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::new(4)) as Arc<dyn PoolPort>
+    ));
+    let agent = ProcessId::new_v4();
+    planner.register(agent);
+    planner.note_admitted(agent);
+    planner.set_idle(agent, true);
+    planner.with_inner(|inner| inner.procs.get_mut(&agent).unwrap().state = Residency::Evicting);
+    let waiting = {
+        let planner = planner.clone();
+        crate::rt::spawn(async move { planner.wait_not_moving(agent).await })
+    };
+    for _ in 0..20 {
+        crate::rt::yield_now().await;
+    }
+    assert!(!waiting.is_finished(), "still being moved: it waits");
+    planner.report_evicted(agent, 3, RsUnits::default());
+    for _ in 0..20 {
+        crate::rt::yield_now().await;
+    }
+    assert!(waiting.is_finished(), "the eviction ended: it wakes");
+}
