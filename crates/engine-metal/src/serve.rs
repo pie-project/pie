@@ -1096,6 +1096,11 @@ impl PreparedLoad<'_> {
         }
         // The span is mapped untouched; the kernel scratch plane is the one
         // part a kernel reads before it writes.
+        // Until the runtime commits span segments before it opens state in
+        // them (`span_backed_on_demand`), it counts the span backed from the
+        // load, so the load backs it.
+        pools.commit_span(pools.span_segments())?;
+        pools.cover(arena.scratch_room())?;
         pools.zero_span(arena.scratch_at(), scratch.bytes())?;
         scratch.seat(pools.view().clone(), arena.scratch_at());
         pools.seat_weights(weight_caches);
@@ -3732,6 +3737,7 @@ impl Shell {
             clips: u64::from(composition.clips()),
             readouts: readout_rows.len() as u64,
         };
+        self.pools.cover(self.arena.reach(fire))?;
         let slots = self.arena.fire_slots(&self.handles, fire)?;
         let caches = self.pools.table(
             &self.handles,

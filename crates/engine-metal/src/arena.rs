@@ -108,6 +108,19 @@ impl Arena {
         &self.rungs[at].1
     }
 
+    /// The bytes from the span's end a fire of `rows` takes: the scratch
+    /// plane and its carve.
+    #[must_use]
+    pub fn reach(&self, rows: FireRows) -> u64 {
+        self.scratch + room(self.carve_for(rows).bytes)
+    }
+
+    /// The bytes from the span's end the scratch plane takes.
+    #[must_use]
+    pub fn scratch_room(&self) -> u64 {
+        self.scratch
+    }
+
     /// A fire's slots: [`Arena::carve_for`]'s carve, laid ending where the
     /// scratch plane starts.
     pub fn fire_slots(&self, handles: &Handles, rows: FireRows) -> Result<SlotTable> {
