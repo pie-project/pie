@@ -1092,6 +1092,17 @@ impl Pools {
         self.pool.map_unit_bytes()
     }
 
+    /// The map units the pool may still take beside the bodies while they
+    /// arm: none once the load backed it whole.
+    #[must_use]
+    pub fn arming_margin_bytes(&self) -> u64 {
+        if self.whole {
+            0
+        } else {
+            self.pool.map_unit_bytes().saturating_mul(16)
+        }
+    }
+
     /// What the cache rows may still take of the device: the bytes the fit
     /// declared them, or the most their segments ever backed, past what
     /// they back now. The activation's held spans are no part of it: they
