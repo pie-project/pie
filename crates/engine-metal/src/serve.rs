@@ -1058,9 +1058,11 @@ impl PreparedLoad<'_> {
                 )?
                 .with_act(&act)?;
             let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
+            // The state's bytes: the span above them is the fire's, which
+            // the accounting already counts.
             (
                 paging_at(pages, boot.slots)?,
-                chunk * u64::from(total),
+                chunk * u64::from(total - span),
                 layout,
             )
         };
