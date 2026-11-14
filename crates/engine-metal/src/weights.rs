@@ -36,6 +36,10 @@ pub struct Weights {
     mapped: Vec<Buffer>,
     table: WeightTable,
     banks: BTreeMap<String, Bank>,
+    /// The registered banks' region of the pool's tables run (adapter
+    /// seats, written as adapters land): laid once the pool is
+    /// ([`Weights::lay_banks`]).
+    bank_region: Option<crate::inputs::Region>,
     decoded: Vec<Buffer>,
     /// The tables the weight cache streams by their rows, each in an
     /// allocation of its own where the load lands them (the cold road), so
@@ -50,6 +54,9 @@ pub struct Weights {
 
 #[derive(Debug, Clone, Copy)]
 struct Bank {
+    /// Its param: the handle its tensor binds.
+    param: usize,
+    /// Where it lies in the banks' region of the pool's tables run.
     offset: u64,
     adapters: u32,
     slot: u64,
@@ -68,7 +75,7 @@ pub struct BankSeat {
     pub elem: u64,
 }
 
-fn banks(trace: &Trace, places: &[Place], seat: impl Fn(usize) -> u64) -> BTreeMap<String, Bank> {
+fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
     trace
         .params
         .iter()
@@ -87,7 +94,8 @@ fn banks(trace: &Trace, places: &[Place], seat: impl Fn(usize) -> u64) -> BTreeM
             (
                 param.name.clone(),
                 Bank {
-                    offset: seat(at),
+                    param: at,
+                    offset: 0,
                     adapters,
                     slot,
                     rows,
@@ -179,7 +187,8 @@ impl Weights {
             let mut at = 0u64;
             for (index, place) in packed.iter_mut().enumerate() {
                 place.offset = at;
-                if own.contains(&index) {
+                // A registered bank lies in the pool's tables run.
+                if own.contains(&index) || trace.params[index].source == ParamSource::Registered {
                     place.reserved = 0;
                 }
                 at += place.reserved;
@@ -212,6 +221,7 @@ impl Weights {
             landed
         };
 
+        let unlaid = Buffer::zeroed(device, 0)?;
         let mut weight_table = Vec::with_capacity(places.len());
         for (at, place) in places.iter().enumerate() {
             if !landed[at] && trace.params[at].source == ParamSource::Checkpoint {
@@ -224,6 +234,9 @@ impl Weights {
                 let place = &places[index];
                 let handle = match hosted.get(&index) {
                     Some(own) => handles.bind(own, 0, place.bytes)?,
+                    None if trace.params[index].source == ParamSource::Registered => {
+                        handles.bind(&unlaid, 0, 0)?
+                    }
                     None => store.bind(handles, place.offset, place.bytes)?,
                 };
                 Ok(Tensor::new(handle, place.rows, place.width, place.dtype))
@@ -261,7 +274,8 @@ impl Weights {
             store,
             mapped: Vec::new(),
             table: WeightTable(weight_table, Vec::new()),
-            banks: banks(trace, &places, |at| places[at].offset),
+            banks: banks(trace, &places),
+            bank_region: None,
             decoded: Vec::new(),
             hosted,
             filed: BTreeMap::new(),
@@ -309,12 +323,54 @@ impl Weights {
                 });
             }
         }
+        let region = self.bank_region.as_mut().ok_or_else(|| Fault::Unbound {
+            what: "the registered banks' region of the pool's tables run, laid at the load"
+                .to_string(),
+        })?;
         for plane in planes {
             let bank = self.banks[plane.bank];
             let at = bank.offset + u64::from(id) * bank.slot;
-            self.store.zero_span(at, bank.slot)?;
-            self.store.write(at, plane.bytes)?;
+            region.zero_span(at, bank.slot)?;
+            region.write(at, plane.bytes)?;
         }
+        Ok(())
+    }
+
+    /// The tables run's bytes the registered banks take: every adapter
+    /// seat of each, each bank on the arena's boundary.
+    #[must_use]
+    pub fn bank_bytes(&self) -> u64 {
+        self.banks
+            .values()
+            .map(|bank| crate::arena::room(u64::from(bank.adapters) * bank.slot))
+            .sum()
+    }
+
+    /// Lays the registered banks in one region `table` hands out of the
+    /// pool's tables run, zeroed (no adapter landed), and points each
+    /// bank's handle there.
+    pub fn lay_banks(
+        &mut self,
+        handles: &Handles,
+        table: impl FnOnce(u64) -> Result<crate::inputs::Region>,
+    ) -> Result<()> {
+        let total = self.bank_bytes();
+        if total == 0 {
+            return Ok(());
+        }
+        let region = table(total)?;
+        let mut at = 0u64;
+        for bank in self.banks.values_mut() {
+            let Some(Some(WeightRow::Dense(plane))) = self.table.0.get(bank.param) else {
+                return Err(Fault::Unbound {
+                    what: format!("registered bank param {}'s plane", bank.param),
+                });
+            };
+            handles.rebind_at(plane.buf, region.view(), region.at(at))?;
+            bank.offset = at;
+            at += crate::arena::room(u64::from(bank.adapters) * bank.slot);
+        }
+        self.bank_region = Some(region);
         Ok(())
     }
 
@@ -833,6 +889,8 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
 enum Seat {
     Artifact(u64),
     Store(u64),
+    /// A registered bank: in the pool's tables run.
+    Tables,
     /// In the artifact at this offset, read through a window of its own.
     Apart(u64),
 }
@@ -890,9 +948,10 @@ fn warm(
     for (index, param) in trace.params.iter().enumerate() {
         let place = &places[index];
         if param.source == ParamSource::Registered {
-            seats.push(Seat::Store(store_bytes));
+            // A registered bank lies in the pool's tables run, laid once
+            // the pool is (`Weights::lay_banks`).
+            seats.push(Seat::Tables);
             objects.push(param.name.as_str());
-            store_bytes += place.reserved;
             continue;
         }
         let object = locate(&param.name)
@@ -1001,7 +1060,7 @@ fn warm(
         .enumerate()
         .filter_map(|(index, place)| match seats[index] {
             Seat::Store(offset) => Some((offset, place.reserved)),
-            Seat::Artifact(_) | Seat::Apart(_) => None,
+            Seat::Artifact(_) | Seat::Apart(_) | Seat::Tables => None,
         })
         .collect();
     debug_assert_eq!(
@@ -1120,7 +1179,7 @@ fn warm(
                 handles.bind(&files[at], view, place.bytes)
             }
             Seat::Store(offset) => store.bind(handles, offset, place.bytes),
-            Seat::Apart(_) => handles.bind(&placeholder, 0, 0),
+            Seat::Apart(_) | Seat::Tables => handles.bind(&placeholder, 0, 0),
         }
         .map_err(|why| {
             Some(format!(
@@ -1168,17 +1227,12 @@ fn warm(
         };
         table.push(Some(entry));
     }
-    let seated: Vec<u64> = seats
-        .iter()
-        .map(|seat| match seat {
-            Seat::Store(offset) | Seat::Artifact(offset) | Seat::Apart(offset) => *offset,
-        })
-        .collect();
     Ok(Weights {
         store,
         mapped: files,
         table: WeightTable(table, Vec::new()),
-        banks: banks(trace, places, |at| seated[at]),
+        banks: banks(trace, places),
+        bank_region: None,
         decoded: Vec::new(),
         hosted,
         filed,

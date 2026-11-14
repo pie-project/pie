@@ -1016,7 +1016,24 @@ impl PreparedLoad<'_> {
         // (the arena, every frame's staged inputs and readout, the kernel
         // scratch), the Neural Engine's surfaces split between the two.
         let (ane_model, ane_fire) = ane.as_ref().map_or((0, 0), crate::ane::Ane::bytes);
-        let model_bytes = weights.bytes() + scratch.constant_bytes() + ane_model;
+        // The engine's own tables (`Reserved::Tables`): a run of whole
+        // chunks right after the null chunk, model bytes in the pool: the
+        // registered adapter banks, the weight caches' atom tables and use
+        // counters and the state maps.
+        let tables_chunks = u32::try_from(
+            (weights.bank_bytes()
+                + weight_caches
+                    .iter()
+                    .map(|cache| crate::store::streamed::Cache::table_bytes_for(&cache.shape))
+                    .sum::<u64>()
+                + Pools::map_bytes(rows.state_rows()))
+            .div_ceil(rows.chunk_bytes.max(1)),
+        )
+        .unwrap_or(u32::MAX);
+        let model_bytes = weights.bytes()
+            + scratch.constant_bytes()
+            + ane_model
+            + u64::from(tables_chunks) * rows.chunk_bytes;
         let fire_bytes = compiled.arena.bytes
             + scratch.bytes()
             + arms as u64 * io.last().copied().map_or(0, crate::arena::io_room)
@@ -1067,7 +1084,8 @@ impl PreparedLoad<'_> {
             let room = boot.kv_budget.unwrap_or_else(|| accounting(0).pool);
             let total = engine::chunk::fit(room, chunk, 0, least)
                 .map_err(|short| Fault::Residency(short.to_string()))?
-                .saturating_add(span);
+                .saturating_add(span)
+                .saturating_add(tables_chunks);
             // The range spans up to `MAX_PARTS` buffers, each as many whole
             // segments as one buffer binds; the span lies in the last.
             let cap = crate::store::pool::part_cap(&device);
@@ -1077,7 +1095,7 @@ impl PreparedLoad<'_> {
                 crate::store::pool::segment_chunks(chunk),
             );
             let binds = per.saturating_mul(crate::store::pool::MAX_PARTS as u32);
-            if binds < least.saturating_add(span) || per < span {
+            if binds < least.saturating_add(span).saturating_add(tables_chunks) || per < span {
                 return Err(Fault::Residency(format!(
                     "one working set takes {least} chunks of {chunk} bytes and one fire's \
                      activation {span}, and this device binds {} buffers of {} MiB, the \
@@ -1103,7 +1121,8 @@ impl PreparedLoad<'_> {
                 rows.pieces,
                 boot.slots,
                 seated.pages_per_slot,
-            )?;
+            )?
+            .with_tables(tables_chunks);
             for (window, pages) in rows.windows.iter().zip(&window_pages) {
                 layout = layout.with_window(window.bytes, window.rows, window.tokens, *pages)?;
             }
@@ -1119,7 +1138,7 @@ impl PreparedLoad<'_> {
             // the accounting already counts.
             (
                 paging_at(pages, boot.slots)?,
-                chunk * u64::from(total - span),
+                chunk * u64::from(total - span - tables_chunks),
                 layout,
             )
         };
@@ -1190,7 +1209,8 @@ impl PreparedLoad<'_> {
         host_rung(&pools, &mut inputs, &mut readout, arena.current(), true)?;
         pools.zero_span(pools.bytes() - arena.scratch_room(), scratch.bytes())?;
         scratch.seat(arena.store().clone(), arena.scratch_at());
-        pools.seat_weights(weight_caches);
+        pools.seat_weights(&device, &handles, weight_caches)?;
+        weights.lay_banks(&handles, |bytes| pools.run_table(&device, bytes))?;
         // The null chunk and the floor stand from the load on.
         pools.commit_segments(1)?;
         // A load whose weights the runtime holds seats every atom in pool
@@ -1852,7 +1872,11 @@ impl Shell {
                 self.pipelines.built_bytes(),
             ),
             (Model, "weights", self.weights.bytes()),
-            (Model, "weight cache tables", self.pools.table_bytes()),
+            (
+                Model,
+                "engine tables run (adapter banks, weight-cache tables, state maps), reserved",
+                self.pools.tables_run_bytes(),
+            ),
             (Model, "ngram constants", self.scratch.constant_bytes()),
             (
                 Model,
@@ -1862,7 +1886,9 @@ impl Shell {
             (
                 State,
                 "pool",
-                self.pools.held_bytes() - self.pools.span_held_bytes(),
+                self.pools.held_bytes()
+                    - self.pools.span_held_bytes()
+                    - self.pools.tables_run_bytes(),
             ),
             (
                 Fire,

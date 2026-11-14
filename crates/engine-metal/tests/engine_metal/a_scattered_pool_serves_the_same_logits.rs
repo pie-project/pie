@@ -621,7 +621,7 @@ fn check_near(model: &str, hybrid: bool, chunk: Option<u64>) -> Vec<Vec<f32>> {
     let facts = shell.pool_chunk_facts();
     let layout = shell.pool_layout();
     let segment = facts.segment_chunks;
-    let low = 1 + layout.seat_chunks();
+    let low = layout.free_chunk();
     let per = |id| facts.shape(id).map_or(1, |s| s.slots_per_chunk);
     let per_list = facts.shape(LIST).map(|s| s.slots_per_chunk);
     // The one window list a windowed model here states: its pages by slot
@@ -799,7 +799,11 @@ fn a_reserved_hybrid_pool_states_shared_chunks() {
         SEATS,
         4,
     )
-    .expect("a layout");
+    .expect("a layout")
+    // The state maps' run of the engine's tables, as a load sizes it.
+    .with_tables(
+        u32::try_from(Pools::map_bytes(rows.state_rows()).div_ceil(chunk)).expect("a chunk count"),
+    );
     let paging = engine_metal::store::kv::Paging::of(rows.tokens, 256, SEATS, 1).expect("a paging");
     let bands = rows.bands.clone();
     let mut pools = Pools::reserve(&device, rows, layout, paging).expect("a pool");
@@ -836,7 +840,12 @@ fn a_reserved_hybrid_pool_states_shared_chunks() {
         assert_eq!(facts.segments.committed, 3);
         return;
     }
-    assert_eq!(facts.segments.committed, 0);
+    // The engine's tables run is backed from the load: its segments, and
+    // no other.
+    assert_eq!(
+        facts.segments.committed,
+        (1 + pools.layout().tables).div_ceil(segment)
+    );
     pools.commit_segments(2).expect("two segments");
     assert_eq!(pools.chunk_facts().segments.committed, 2);
     assert!(pools.committed_bytes() >= 2 * u64::from(segment) * chunk);
@@ -900,8 +909,7 @@ fn trimmed_windows(model: &str, fixture: &Fixture, context: u32, prompt: u32, li
                 .collect::<Vec<_>>()
         );
         let layout = shell.pool_layout();
-        let mut first =
-            (1 + layout.seat_chunks()).div_ceil(facts.segment_chunks) * facts.segment_chunks;
+        let mut first = layout.free_chunk().div_ceil(facts.segment_chunks) * facts.segment_chunks;
         // Each window list: (T_w, window, slots a chunk, first chunk, step).
         let mut windows = Vec::new();
         for id in &WINDOWS[..lists] {
