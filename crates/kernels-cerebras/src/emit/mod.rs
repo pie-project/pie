@@ -7,4 +7,5 @@ pub mod host;
 pub mod layout;
 pub mod params;
 pub mod rcfg;
+pub mod region;
 pub mod stamps;

@@ -1,0 +1,79 @@
+// prims/reg's root (layout.csl). run(phase, a, n): phase 0 the resident chunks (res) and the
+// segment's words (rcfg: [4] / [5] iq6 / iq7's colours between all-reduces, [13] / [15] / [16]
+// the all-reduce's iq7 / oq4 / iq6, [17] its role); 1 the packed tables' n words from a (stage);
+// 2 n rows (rows -> outs). tsc: [0] / [1] the rows' first / last stamps, [2] the cycles inside
+// the region's row() summed (TSC low words).
+param memcpy_params;
+param X: u16;
+param R: u16;
+param TB: u16;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const timestamp = @import_module("<time>");
+const fab = @import_module("ops/fabric.csl");
+const math = @import_module("ops/math.csl");
+var rcfg = @zeros([18]u32);
+const seg = @import_module("ops/seg.csl", .{ .fab = fab, .rcfg = &rcfg, .RQ = 0, .XM = @get_input_queue(6),
+                                             .YM = @get_input_queue(7), .AO = @get_output_queue(4), .UT = @get_ut_id(4) });
+const reg = @import_module("reg.csl", .{ .math = math, .seg = seg });
+
+const REC: u16 = reg.NROW * reg.C + reg.NSC;
+const ROUT: u16 = reg.NOUT * reg.C;
+var rows = @zeros([TB * REC]f32);
+var outs = @zeros([TB * ROUT]f32);
+var res = @zeros([reg.NRES * reg.C + 1]f32);
+var stage = @zeros([1024]f32);
+var tsc = @zeros([3]u32);
+var ts = @zeros([3]u16);
+var rows_p: [*]f32 = &rows;
+var outs_p: [*]f32 = &outs;
+var res_p: [*]f32 = &res;
+var stage_p: [*]f32 = &stage;
+var rcfg_p: [*]u32 = &rcfg;
+var tsc_p: [*]u32 = &tsc;
+fn now() u32 { timestamp.get_timestamp(&ts); return @as(u32, ts[0]) | (@as(u32, ts[1]) << 16); }
+
+var a_phase: u16 = 0;
+var a_a: u16 = 0;
+var a_n: u16 = 0;
+const T_RUN: local_task_id = @get_local_task_id(8);
+task go() void {
+  timestamp.enable_tsc();
+  if (a_phase == 0) {
+    reg.init();
+    reg.load_res(&res);
+    seg.role = @as(u16, rcfg[17]);
+    if (R > 1) { seg.qmode(0); }
+  } else if (a_phase == 1) {
+    reg.load_tabs(&stage, a_a, a_n);
+  } else {
+    tsc[0] = now();
+    var acc: u32 = 0;
+    var t: u16 = 0;
+    while (t < a_n) : (t += 1) {
+      reg.load_row(@ptrcast([*]f32, &rows[t * REC]));
+      const t0 = now();
+      reg.row();
+      acc += now() - t0;
+      reg.store_row(@ptrcast([*]f32, &outs[t * ROUT]));
+    }
+    tsc[1] = now();
+    tsc[2] = acc;
+  }
+  sys_mod.unblock_cmd_stream();
+}
+fn run(phase: u16, a: u16, n: u16) void { a_phase = phase; a_a = a; a_n = n; @activate(T_RUN); }
+
+comptime {
+  @bind_local_task(go, T_RUN);
+  @export_symbol(rows_p, "rows");
+  @export_symbol(outs_p, "outs");
+  @export_symbol(res_p, "res");
+  @export_symbol(stage_p, "stage");
+  @export_symbol(rcfg_p, "rcfg");
+  @export_symbol(tsc_p, "tsc");
+  @export_symbol(run);
+  @initialize_queue(@get_input_queue(6), .{ .color = @get_color(13) });
+  @initialize_queue(@get_input_queue(7), .{ .color = @get_color(14) });
+  @initialize_queue(@get_output_queue(4), .{ .color = @get_color(15) });
+}

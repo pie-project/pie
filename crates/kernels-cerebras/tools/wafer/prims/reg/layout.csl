@@ -1,0 +1,41 @@
+// prims/reg: a printed root region (P4, kernels-cerebras emit::region; reg.csl, written by the
+// prim_region example) on R roots in a row, each holding its chunk of every row. A row reduction
+// is a P3 segment all-reduce (ops/seg.csl) over the roots: a chain east into the last root (its
+// colours alternating), the sum multicast back west.
+param R: u16;
+param TB: u16;
+
+const C_M: color = @get_color(4);
+const C_S0: color = @get_color(2);
+const C_S1: color = @get_color(3);
+const memcpy = @import_module("<memcpy/get_params>", .{ .width = R, .height = 1 });
+fn chain(x: u16) color { return if (x % 2 == 0) C_S0 else C_S1; }
+
+layout {
+  @set_rectangle(R, 1);
+  for (@range(u16, R)) |x| {
+    @set_tile_code(x, 0, "pe.csl", .{ .memcpy_params = memcpy.get_params(x), .X = x, .R = R, .TB = TB });
+    if (R > 1) {
+      if (x + 1 < R) {
+        @set_color_config(x, 0, chain(x), .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } } });
+        if (x > 0) {
+          @set_color_config(x, 0, C_M, .{ .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP, WEST } } });
+        } else {
+          @set_color_config(x, 0, C_M, .{ .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP } } });
+        }
+      } else {
+        @set_color_config(x, 0, C_M, .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ WEST } } });
+      }
+      if (x > 0) {
+        @set_color_config(x, 0, chain(x - 1), .{ .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } } });
+      }
+    }
+  }
+  @export_name("rows", [*]f32, true);
+  @export_name("outs", [*]f32, true);
+  @export_name("res", [*]f32, true);
+  @export_name("stage", [*]f32, true);
+  @export_name("rcfg", [*]u32, true);
+  @export_name("tsc", [*]u32, true);
+  @export_name("run", fn(u16, u16, u16) void);
+}

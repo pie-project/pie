@@ -3027,6 +3027,7 @@ name = "kernels-cerebras"
 version = "0.6.0"
 dependencies = [
  "blake3",
+ "kernels-ir",
  "pie-poem-compiler",
  "pie-poem-ir",
  "serde",

@@ -17,6 +17,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
+kernels-ir = { path = "../kernels-ir" }
 
 [lints]
 workspace = true
