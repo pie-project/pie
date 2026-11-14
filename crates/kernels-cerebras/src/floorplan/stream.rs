@@ -301,7 +301,7 @@ impl Stream {
                 lane_to.extend((0..u.cols()).map(|i| u.cy(i)));
             }
         }
-        let lanes = requests.lanes.then(|| LaneBus {
+        let lanes = requests.lanes.then_some(LaneBus {
             unit: 0,
             to: lane_to,
         });

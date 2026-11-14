@@ -400,9 +400,9 @@ fn held_words(u: &Unit, l: &Layout, col: u32) -> u32 {
     w
 }
 
-/// Words of held rows at a row root of `py` (the host's rows, rows held over the barrier).
-fn row_held_words(r: &Reader, u: &Unit, py: u32) -> u32 {
-    let mut w = 0;
+/// Words of held rows at a row root of `py`: (the host's rows, rows held over the barrier).
+fn row_held_words(r: &Reader, u: &Unit, py: u32) -> (u32, u32) {
+    let (mut host, mut over) = (0, 0);
     let mut hin = Vec::new();
     for s in &u.steps {
         if let Step::In {
@@ -411,44 +411,92 @@ fn row_held_words(r: &Reader, u: &Unit, py: u32) -> u32 {
             host: true,
         } = s
         {
-            w += u.rows * (r.width(*value) / py);
+            host += u.rows * (r.width(*value) / py);
             hin.push(*value);
         }
     }
     for v in &u.held {
         if u.sides.get(v) == Some(&Side::Row) && !hin.contains(v) {
-            w += u.rows * (r.width(*v) / py);
+            over += u.rows * (r.width(*v) / py);
         }
     }
-    w
+    (host, over)
+}
+
+/// Why the rows a unit holds at a root do not fit it: the host's rows (in or out, all a step's
+/// at once) or rows held over the barrier.
+fn held_refusal(u: &Unit, side: &str, host: u32, over: u32) -> String {
+    let what = if host >= over {
+        format!(
+            "the host's {} rows a step held whole at a {side} root ({host} words > \
+             {ROOT_BUDGET}): the host's rows streamed a batch at a time (M2b)",
+            u.rows
+        )
+    } else {
+        format!(
+            "{} rows held over the barrier at a {side} root ({over} words > {ROOT_BUDGET}): a \
+             row store off the roots, in the unit's weight PEs (M2b), or row replicas",
+            u.rows
+        )
+    };
+    format!("{}: {what}", u.name)
+}
+
+/// Words of the host's rows at column root `col` (in and out).
+fn col_host_words(u: &Unit, l: &Layout, col: u32) -> u32 {
+    let held: u32 = u
+        .held
+        .iter()
+        .filter(|v| u.sides.get(*v) == Some(&Side::Col))
+        .map(|v| {
+            u.rows
+                * l.words(
+                    col,
+                    Cols {
+                        base: *v,
+                        from: 0,
+                        width: u32::MAX / 2,
+                    },
+                )
+        })
+        .sum();
+    held_words(u, l, col) - held
 }
 
 /// `u`'s layout: the fewest rest roots whose every tile (at most `tile` words) and held rows
-/// fit.
+/// fit. A unit whose rows outgrow its roots is refused by what it holds.
 pub fn layout(r: &Reader, u: &Unit, py: u32, tile: u32) -> R<Layout> {
-    let held = row_held_words(r, u, py);
-    if held > ROOT_BUDGET {
-        return Err(format!(
-            "{}: {} rows held at a row root ({held} words > {ROOT_BUDGET}): the rows a step \
-             outgrow the roots; a row store off them (M2b) or row replicas",
-            u.name, u.rows
-        ));
+    let (host, over) = row_held_words(r, u, py);
+    if host + over > ROOT_BUDGET {
+        return Err(held_refusal(u, "row", host, over));
     }
+    let mut short: Option<(u32, u32)> = None;
     for rest in 0..=MAX_REST {
         let Some(l) = layout_with(r, u, py, rest) else {
             continue;
         };
-        if l.px() == 0 {
+        if l.px() == 0 || !(0..l.px()).all(|c| tile_words(u, &l, c) < tile) {
             continue;
         }
-        if (0..l.px()).all(|c| tile_words(u, &l, c) < tile && held_words(u, &l, c) <= ROOT_BUDGET) {
+        if (0..l.px()).all(|c| held_words(u, &l, c) <= ROOT_BUDGET) {
             return Ok(l);
         }
+        // the tiles fit, the held rows not: what the fewest roots hold
+        if short.is_none() {
+            let worst = (0..l.px())
+                .max_by_key(|&c| held_words(u, &l, c))
+                .unwrap_or(0);
+            let h = col_host_words(u, &l, worst);
+            short = Some((h, held_words(u, &l, worst) - h));
+        }
     }
-    Err(format!(
-        "{}: no column roots up to {MAX_REST} fit its tiles ({tile} words) and held rows",
-        u.name
-    ))
+    Err(match short {
+        Some((h, o)) => held_refusal(u, "column", h, o),
+        None => format!(
+            "{}: no column roots up to {MAX_REST} fit its tiles ({tile} words)",
+            u.name
+        ),
+    })
 }
 
 /// A run of a row stream's rows: `n` rows of class `class`.
