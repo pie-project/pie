@@ -93,7 +93,7 @@ impl SharedGrow {
                 // The pool stands past what is asked: it comes down only
                 // once it has for the governor's patience, so a pause
                 // between batches moves no rung.
-                let past = pool.pool().act_chunks(goal) < pool.pool().act_chunks(pool.rung());
+                let past = pool.pool().act_chunks(goal) < pool.pool().act_reserved();
                 let tick = self.ticks.load(Ordering::Acquire);
                 let waited = {
                     let mut since = self.idle_since.lock().unwrap();

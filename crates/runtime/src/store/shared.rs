@@ -225,7 +225,7 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
             rung
         }
     };
-    if goal > pool.rung() {
+    if pool.pool().act_chunks(goal) > pool.pool().act_reserved() {
         let Ok(evacuation) = pool.plan_raise(goal) else {
             return;
         };
@@ -314,19 +314,21 @@ impl RungWalk {
             .filter(|&rung| rung <= goal)
             .max()
             .unwrap_or(rungs[0]);
-        let now = pool.rung();
-        // Rungs whose activation takes as many chunks are one class: the
-        // pool sets aside the same span for each, and reports the widest
-        // ([`SlotPool::rung`]). A move within a class sets aside nothing
-        // new, so the walk only caps fires there, never lowers or raises.
-        let chunks = |rung: u32| pool.pool().act_chunks(rung);
-        let moves = chunks(goal) != chunks(now);
-        if goal < now && moves {
-            if cap > goal {
+        // The walk moves by what the goal's activation takes against what
+        // is set aside now. Rungs whose activation takes as many chunks are
+        // one class: the pool sets aside the same span for each, so a move
+        // within a class only caps fires, never lowers or raises. A
+        // program's fire term registered or dropped since moves the span a
+        // rung takes ([`programs`]).
+        let want = pool.pool().act_chunks(goal);
+        let have = pool.pool().act_reserved();
+        let lifted = if goal == largest { u32::MAX } else { goal };
+        if want < have {
+            if cap > lifted {
                 self.lowering = None;
                 return Ok(RungStep::Cap(goal));
             }
-            if granted > goal {
+            if granted > lifted {
                 return Ok(RungStep::Wait);
             }
             return Ok(match self.lowering {
@@ -345,14 +347,13 @@ impl RungWalk {
             });
         }
         self.lowering = None;
-        if goal > now && moves {
+        if want > have {
             let evacuation = pool.plan_raise(goal)?;
             return Ok(RungStep::Raise {
                 rung: goal,
                 evacuation,
             });
         }
-        let lifted = if goal == largest { u32::MAX } else { goal };
         Ok(if cap == lifted {
             RungStep::Wait
         } else {
@@ -552,6 +553,8 @@ pub struct SharedPool {
     /// engine's: no fire is let past the rung held before it
     /// ([`Self::raise_applied`]).
     copying: Option<u32>,
+    /// The registered programs' fire terms ([`programs`]).
+    programs: programs::ProgramFires,
 }
 
 /// The fence epoch a raise's moved-off chunks wait on until the engine has
@@ -761,6 +764,7 @@ impl SharedPool {
             records_most: 0,
             least_chunks: 0,
             copying: None,
+            programs: programs::ProgramFires::default(),
         };
         // Under the smallest rung state may take every chunk but the
         // reserved ones and that rung's activation.
@@ -1610,9 +1614,11 @@ impl SharedPool {
         }
     }
 
-    /// The reserved chunks and the top span, held from the load.
+    /// The reserved chunks and the top span, held from the load; past it,
+    /// what the programs' fire term has the activation take.
     fn fixed_bytes(&self) -> u64 {
-        u64::from(self.pool.reserved_chunks() + self.pool.act_max()) * self.pool.chunk_bytes()
+        let act = self.pool.act_max().max(self.pool.act_reserved());
+        u64::from(self.pool.reserved_chunks() + act) * self.pool.chunk_bytes()
     }
 
     /// Bytes below which one lane cannot run: one working set at the longest
@@ -1657,5 +1663,6 @@ pub enum RungError {
 #[cfg(test)]
 mod tests;
 
+pub mod programs;
 mod target;
 pub use target::SharedGrow;

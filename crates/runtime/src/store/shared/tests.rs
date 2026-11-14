@@ -581,6 +581,7 @@ fn a_window_checkpoint_behind_the_fire_end_holds_what_its_windows_reach() {
     assert_eq!(window_live(&shared), (0, 0), "every reference back");
 }
 
+mod programs;
 mod tiers;
 
 /// SPEC decision 6, the governor's rung shrink: under critical pressure the
