@@ -293,9 +293,9 @@ pub fn emit(p: &Program) -> R<Emitted> {
             files.push((name.clone(), text));
             for row in 0..su.rows() {
                 let c = su.w(col, row);
-                let mut params = weight_params(p, c);
-                params.push(("ROW".into(), row));
-                tiles.insert(c, (name.clone(), params));
+                // (no row index: a column's PEs differ only in their chains' colours, so they
+                // share a few images)
+                tiles.insert(c, (name.clone(), weight_params(p, c)));
                 for (k, (step, a, bb)) in mvs.iter().enumerate() {
                     arrays.push(HostArray {
                         at: c,
@@ -512,7 +512,7 @@ fn weight_file(ui: usize, b: &Built, col: u32) -> R<(String, String, Vec<Tile>)>
         "// {}: weight column {col} (kernels-cerebras emit::stream). Matvecs over the unit's rows,\n// ops/smv.csl's row a step.",
         b.unit.name
     );
-    t.push_str("param memcpy_params;\nparam ROW: u16;\nparam C_XR: u16;\nparam C_XC: u16;\nparam C_CS: u16;\nparam C_CR: u16;\nparam C_RS: u16;\nparam C_RR: u16;\nparam R_COL: u16;\n");
+    t.push_str("param memcpy_params;\nparam C_XR: u16;\nparam C_XC: u16;\nparam C_CS: u16;\nparam C_CR: u16;\nparam C_RS: u16;\nparam C_RR: u16;\nparam R_COL: u16;\n");
     t.push_str(COMMON);
     t.push_str("const q_xr = @get_input_queue(2);\nconst q_xc = @get_input_queue(3);\nconst q_cr = @get_input_queue(4);\nconst q_rr = @get_input_queue(5);\nconst q_cs = @get_output_queue(2);\nconst q_rs = @get_output_queue(3);\n");
     t.push_str("const rs = @import_module(\"ops/schain.csl\", .{ .fab = fab, .IN1 = q_cr, .OUT = q_cs });\n");

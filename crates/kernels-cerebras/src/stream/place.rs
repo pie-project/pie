@@ -423,8 +423,9 @@ fn row_held_words(r: &Reader, u: &Unit, py: u32) -> u32 {
     w
 }
 
-/// `u`'s layout: the fewest rest roots whose every tile and held rows fit.
-pub fn layout(r: &Reader, u: &Unit, py: u32) -> R<Layout> {
+/// `u`'s layout: the fewest rest roots whose every tile (at most `tile` words) and held rows
+/// fit.
+pub fn layout(r: &Reader, u: &Unit, py: u32, tile: u32) -> R<Layout> {
     let held = row_held_words(r, u, py);
     if held > ROOT_BUDGET {
         return Err(format!(
@@ -440,14 +441,12 @@ pub fn layout(r: &Reader, u: &Unit, py: u32) -> R<Layout> {
         if l.px() == 0 {
             continue;
         }
-        if (0..l.px())
-            .all(|c| tile_words(u, &l, c) < TILE_BUDGET && held_words(u, &l, c) <= ROOT_BUDGET)
-        {
+        if (0..l.px()).all(|c| tile_words(u, &l, c) < tile && held_words(u, &l, c) <= ROOT_BUDGET) {
             return Ok(l);
         }
     }
     Err(format!(
-        "{}: no column roots up to {MAX_REST} fit its tiles ({TILE_BUDGET} words) and held rows",
+        "{}: no column roots up to {MAX_REST} fit its tiles ({tile} words) and held rows",
         u.name
     ))
 }

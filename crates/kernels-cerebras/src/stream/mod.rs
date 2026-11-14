@@ -219,8 +219,7 @@ pub fn shape(trace: &Trace, reading: &str, classes: &[RowClass]) -> R<StreamShap
 }
 
 /// What [`compile`] builds: a reading at `rows` rows a class, its roundings the build's 16-bit
-/// type's (`round16`, a bf16 build), the first `upto` stages only, `taps` also read back, `py`
-/// row roots a unit.
+/// type's (`round16`, a bf16 build), the first `upto` stages only, `taps` also read back.
 #[derive(Clone, Debug)]
 pub struct Options {
     pub reading: String,
@@ -228,8 +227,15 @@ pub struct Options {
     pub round16: bool,
     pub upto: Option<usize>,
     pub taps: Vec<u32>,
-    /// Row roots a unit (`None`: the cost model's choice, [`build::program_py`]).
+}
+
+/// What [`compile_pinned`] pins besides [`Options`] (the default: nothing).
+#[derive(Clone, Debug, Default)]
+pub struct Pins {
+    /// Row roots a unit and a weight PE's most tile words (`None`: the cost model's choice,
+    /// [`build::program_py`]; `py 16`, `tile 12288`: flux2-mini as M1d built it).
     pub py: Option<u32>,
+    pub tile: Option<u32>,
     /// Rows of the classes named here in place of `rows` (flux at 1024²: context 512, latents
     /// 4096).
     pub class_rows: Vec<(String, u32)>,
@@ -244,12 +250,26 @@ pub fn compile(
     out: &std::path::Path,
     gold: Option<&std::path::Path>,
 ) -> R<build::Program> {
+    compile_pinned(trace, o, &Pins::default(), out, gold)
+}
+
+/// [`compile`] with `pins`.
+pub fn compile_pinned(
+    trace: &Trace,
+    o: &Options,
+    pins: &Pins,
+    out: &std::path::Path,
+    gold: Option<&std::path::Path>,
+) -> R<build::Program> {
     let s = shape(
         trace,
         &o.reading,
-        &with_rows(program::classes(trace, &o.reading, o.rows), &o.class_rows),
+        &with_rows(
+            program::classes(trace, &o.reading, o.rows),
+            &pins.class_rows,
+        ),
     )?;
-    let p = build::program_py(trace, s, o.round16, o.upto, &o.taps, o.py)?;
+    let p = build::program_py(trace, s, o.round16, o.upto, &o.taps, pins.py, pins.tile)?;
     let e = crate::emit::stream::emit(&p)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     for (name, text) in &e.files {

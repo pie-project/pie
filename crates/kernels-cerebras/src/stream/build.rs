@@ -155,7 +155,7 @@ pub fn program_upto(
     upto: Option<usize>,
     taps: &[u32],
 ) -> R<Program> {
-    program_py(trace, shape, round16, upto, taps, None)
+    program_py(trace, shape, round16, upto, taps, None, None)
 }
 
 /// The row roots a unit may take: the divisors of the hidden width that leave a CX root at
@@ -171,8 +171,14 @@ pub fn py_candidates(hidden: u32, bounds: Bounds) -> Vec<u32> {
 pub const MIN_CHUNK: u32 = 4;
 pub const MIN_PY: u32 = 4;
 
-/// [`program_upto`] at `py` row roots a unit, or (`None`) at the row roots the cost model
-/// prices lowest of those that build within the system fabric ([`py_candidates`]).
+/// The tile budgets a layout is tried at: a weight PE's whole budget, and less (more column
+/// roots a unit, the spare fabric spent on shorter rows).
+pub const TILE_FRACTIONS: [(u32, u32); 3] = [(1, 1), (3, 4), (1, 2)];
+
+/// [`program_upto`] at `py` row roots a unit and `tile` words a weight PE, or (`None`) at the
+/// (row roots, tile budget) the
+/// cost model prices lowest of those that build within the system fabric ([`py_candidates`],
+/// [`TILE_FRACTIONS`]).
 pub fn program_py(
     trace: &Trace,
     shape: StreamShape,
@@ -180,51 +186,84 @@ pub fn program_py(
     upto: Option<usize>,
     taps: &[u32],
     py: Option<u32>,
+    tile: Option<u32>,
 ) -> R<Program> {
     let bounds = Bounds::system();
     let hidden = shape.program.hidden;
-    let cands = match py {
+    let pys = match py {
         Some(p) => vec![p],
         None => py_candidates(hidden, bounds),
     };
-    let tried: Vec<(u32, R<Program>)> = std::thread::scope(|sc| {
-        let hs: Vec<_> = cands
-            .iter()
-            .map(|&p| {
-                let shape = shape.clone();
-                sc.spawn(move || (p, program_at(trace, shape, round16, upto, taps, p, bounds)))
-            })
-            .collect();
-        hs.into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| (0, Err("panicked".into()))))
-            .collect()
-    });
+    let cands: Vec<(u32, u32)> = pys
+        .iter()
+        .flat_map(|&p| {
+            let tiles: Vec<u32> = match tile {
+                Some(t) => vec![t],
+                None => TILE_FRACTIONS
+                    .iter()
+                    .map(|&(a, b)| place::TILE_BUDGET * a / b)
+                    .collect(),
+            };
+            tiles.into_iter().map(move |t| (p, t))
+        })
+        .collect();
+    // built a few at a time (a whole-wafer program is large), the cheapest kept
     let mut best: Option<(f64, Program)> = None;
-    let mut errs = Vec::new();
-    for (p, r) in tried {
-        match r {
-            Ok(prog) => {
-                let c = crate::cost::stream::time(&prog).cycles;
-                if best.as_ref().is_none_or(|(b, _)| c < *b) {
-                    best = Some((c, prog));
+    let mut errs: Vec<(u32, u32, String)> = Vec::new();
+    for group in cands.chunks(8) {
+        let tried: Vec<(u32, u32, R<Program>)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = group
+                .iter()
+                .map(|&(p, tile)| {
+                    let shape = shape.clone();
+                    sc.spawn(move || {
+                        let r = program_at(trace, shape, round16, upto, taps, p, tile, bounds);
+                        (p, tile, r)
+                    })
+                })
+                .collect();
+            hs.into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| (0, 0, Err("panicked".into()))))
+                .collect()
+        });
+        for (p, tile, r) in tried {
+            match r {
+                Ok(prog) => {
+                    let c = crate::cost::stream::time(&prog).cycles;
+                    if best.as_ref().is_none_or(|(b, _)| c < *b) {
+                        best = Some((c, prog));
+                    }
                 }
+                Err(e) => errs.push((p, tile, e)),
             }
-            Err(e) => errs.push(format!("py {p}: {e}")),
         }
     }
     best.map(|(_, p)| p).ok_or_else(|| {
-        if errs.is_empty() {
-            format!(
+        // the farthest a candidate got: the most row roots at the whole tile budget
+        match errs
+            .iter()
+            .filter(|e| e.1 == place::TILE_BUDGET)
+            .max_by_key(|e| e.0)
+            .or(errs.last())
+        {
+            Some((p, _, e)) => format!(
+                "{}: none of {} (row roots, tile budget) builds within {} x {}; at py {p}: {e}",
+                trace.name,
+                cands.len(),
+                bounds.w,
+                bounds.h
+            ),
+            None => format!(
                 "{}: a hidden width of {hidden} cuts over no rows",
                 trace.name
-            )
-        } else {
-            errs.join("; ")
+            ),
         }
     })
 }
 
-/// [`program_upto`] at `py` row roots a unit within `bounds`.
+/// [`program_upto`] at `py` row roots a unit and weight tiles of at most `tile` words, within
+/// `bounds`.
+#[allow(clippy::too_many_arguments)]
 pub fn program_at(
     trace: &Trace,
     shape: StreamShape,
@@ -232,6 +271,7 @@ pub fn program_at(
     upto: Option<usize>,
     taps: &[u32],
     py: u32,
+    tile: u32,
     bounds: Bounds,
 ) -> R<Program> {
     let prog = &shape.program;
@@ -364,7 +404,7 @@ pub fn program_at(
             word,
             prologue: u.classes.is_empty(),
         };
-        let layout = place::layout(&r, &u, py)?;
+        let layout = place::layout(&r, &u, py, tile)?;
         let mut regions = BTreeMap::new();
         for (i, s) in u.steps.iter().enumerate() {
             let Step::Region { side, chain } = s else {

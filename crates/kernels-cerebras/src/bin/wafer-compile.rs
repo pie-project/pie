@@ -43,7 +43,7 @@ const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <
      --build <dir> [--fabric simulator|system]\n       wafer-compile cost --plan <plan.json>\n       \
      wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]\n       \
      wafer-compile stream --model <deployment> [--reading R] [--rows N] [--ieee] --out <dir> \
-     [--values <dir>] [--stages N] [--tap v,..] [--py N] \
+     [--values <dir>] [--stages N] [--tap v,..] [--py N] [--tile W] \
      [--class-rows context=512,latents=4096] [--price context=512,latents=4096]";
 
 fn main() {
@@ -222,7 +222,8 @@ fn search(args: &[String]) -> Result<(), String> {
 }
 
 /// `stream --model <name> [--reading denoise] [--rows 64] [--class-rows name=N,..] [--ieee]
-/// [--py N] --out <dir> [--values <dir>]`:
+/// [--py N] [--tile W] --out <dir> [--values <dir>]` (`--py 16 --tile 12288`: flux2-mini as M1d
+/// built it):
 /// a stream reading's wafer program (kernels-cerebras `stream::compile`); with a step's captured
 /// values, the host's files for a run of it (`tools/wafer/stream/run.py`).
 fn stream(args: &[String]) -> Result<(), String> {
@@ -255,18 +256,26 @@ fn stream(args: &[String]) -> Result<(), String> {
         .map(|s| s.parse::<u32>())
         .transpose()
         .map_err(|e| format!("--py: {e}"))?;
+    let tile = get("--tile")
+        .map(|s| s.parse::<u32>())
+        .transpose()
+        .map_err(|e| format!("--tile: {e}"))?;
     let o = kernels_cerebras::stream::Options {
         reading: reading.clone(),
         rows,
         round16: !ieee,
         upto,
         taps,
+    };
+    let pins = kernels_cerebras::stream::Pins {
         py,
+        tile,
         class_rows: kernels_cerebras::stream::parse_rows(&get("--class-rows").unwrap_or_default())?,
     };
-    let p = kernels_cerebras::stream::compile(
+    let p = kernels_cerebras::stream::compile_pinned(
         &trace,
         &o,
+        &pins,
         std::path::Path::new(&out),
         values.as_deref().map(std::path::Path::new),
     )?;
