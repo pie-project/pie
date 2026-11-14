@@ -800,20 +800,10 @@ impl Lane {
                     let backend = crate::engine::verbs::codegen_backend(engine);
                     let plan = &crate::pipeline::program::with_host_codegen(&program, backend);
                     let program_id = engine.register_program(plan)?;
-                    // What an instance of it holds in the pool, and what
-                    // its fires take beside the model's activation, asked
-                    // once at registration.
+                    // What an instance of it holds in the pool, asked once
+                    // at registration.
                     if let Some(roles) = roles_of(engine_idx) {
                         crate::store::roles::learn_program(&roles, &**engine, program_id)?;
-                    }
-                    if let Some(shared) =
-                        crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared)
-                    {
-                        let facts = engine.program_facts(program_id)?;
-                        shared
-                            .lock()
-                            .unwrap()
-                            .program_registered(program_id, &facts);
                     }
                     Ok(program_id)
                 });

@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use ::engine::{InstanceId, ProgramFacts, ProgramId};
+use ::engine::{FireFacts, InstanceId, ProgramId};
 use tokio::sync::Notify;
 
 use super::*;
@@ -18,11 +18,11 @@ const LANES: u32 = 64;
 
 /// 20 MiB a fire and 256 KiB a lane: a rung of 16 tokens 24 MiB (2
 /// chunks), one of 256 or more 64 lanes, 36 MiB (3 chunks).
-fn fire_facts() -> ProgramFacts {
-    ProgramFacts {
-        fire_bytes_fixed: 20 * MIB,
-        fire_bytes_a_lane: 256 << 10,
-        ..ProgramFacts::default()
+fn fire_facts() -> FireFacts {
+    FireFacts {
+        fixed: 20 * MIB,
+        a_lane: 256 << 10,
+        ..FireFacts::default()
     }
 }
 
@@ -100,7 +100,7 @@ async fn a_zero_fire_term_leaves_the_rung_arithmetic_unchanged() {
         .map(|&rung| pool.pool().act_chunks(rung))
         .collect();
     assert_eq!(before, [1, 1, 4, 4, 12, 12]);
-    pool.program_registered(PROGRAM, &ProgramFacts::default());
+    pool.program_registered(PROGRAM, &FireFacts::default());
     pool.instance_bound(InstanceId(1), PROGRAM);
     let after: Vec<u32> = [0, 16, 17, 256, 2048, u32::MAX]
         .iter()
@@ -164,9 +164,9 @@ fn a_fire_term_past_the_device_is_refused() {
     let (mut pool, _) = pool_at_256();
     pool.program_registered(
         PROGRAM,
-        &ProgramFacts {
-            fire_bytes_fixed: u64::from(TOTAL) * CHUNK,
-            ..ProgramFacts::default()
+        &FireFacts {
+            fixed: u64::from(TOTAL) * CHUNK,
+            ..FireFacts::default()
         },
     );
     let shared: Shared = Arc::new(Mutex::new(pool));
@@ -293,7 +293,7 @@ fn a_program_s_own_lane_cap_bounds_its_term() {
     let (mut pool, _) = pool_at_256();
     pool.program_registered(
         PROGRAM,
-        &ProgramFacts {
+        &FireFacts {
             max_lanes: 16,
             ..fire_facts()
         },
@@ -313,10 +313,10 @@ fn a_program_s_own_lane_cap_bounds_its_term() {
 
 /// 55 chunks a fire: the 2048 rung (12 + 55) no longer fits the 63 chunks
 /// past the reserved one, the 256 rung (4 + 55) does.
-fn wide_facts() -> ProgramFacts {
-    ProgramFacts {
-        fire_bytes_fixed: 55 * CHUNK,
-        ..ProgramFacts::default()
+fn wide_facts() -> FireFacts {
+    FireFacts {
+        fixed: 55 * CHUNK,
+        ..FireFacts::default()
     }
 }
 
@@ -379,9 +379,9 @@ async fn a_term_past_the_largest_rung_funds_the_widest_that_fits_and_cuts_fires_
     const HUGE: ProgramId = ProgramId(9);
     shared.lock().unwrap().program_registered(
         HUGE,
-        &ProgramFacts {
-            fire_bytes_fixed: 63 * CHUNK,
-            ..ProgramFacts::default()
+        &FireFacts {
+            fixed: 63 * CHUNK,
+            ..FireFacts::default()
         },
     );
     assert!(ProgramOpen::new(&shared, HUGE).is_err());

@@ -545,9 +545,9 @@ mod tests {
         let mut pool = super::super::tests::pool();
         pool.program_registered(
             ::engine::ProgramId(1),
-            &::engine::ProgramFacts {
-                fire_bytes_fixed: 55 * pool.pool().chunk_bytes(),
-                ..::engine::ProgramFacts::default()
+            &::engine::FireFacts {
+                fixed: 55 * pool.pool().chunk_bytes(),
+                ..::engine::FireFacts::default()
             },
         );
         pool.instance_bound(::engine::InstanceId(1), ::engine::ProgramId(1));

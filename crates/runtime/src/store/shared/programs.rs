@@ -1,7 +1,7 @@
 //! The registered programs' fire term (REDESIGN §6): what a fire holding a
 //! guest program's lanes needs beside the model's activation, the
 //! program's per-batch tables and value scratch
-//! ([`::engine::ProgramFacts::fire_bytes`]). A program registers after
+//! ([`::engine::FireFacts`]). A program registers after
 //! load, so the engine cannot state it in [`::engine::chunk::ChunkFacts`];
 //! the pool folds it into every rung's activation instead
 //! ([`super::super::slots::SlotPool::act_chunks`]).
@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use ::engine::{InstanceId, ProgramFacts, ProgramId};
+use ::engine::{FireFacts, InstanceId, ProgramId};
 
 use super::{RungEvacuation, Shared, SharedPool};
 use crate::store::slots::FireTerm;
@@ -42,10 +42,10 @@ impl ProgramFires {
 
 /// A program's fire term from its facts.
 #[must_use]
-pub fn term_of(facts: &ProgramFacts) -> FireTerm {
+pub fn term_of(facts: &FireFacts) -> FireTerm {
     FireTerm {
-        fixed: facts.fire_bytes_fixed,
-        a_lane: facts.fire_bytes_a_lane,
+        fixed: facts.fixed,
+        a_lane: facts.a_lane,
         max_lanes: facts.max_lanes,
     }
 }
@@ -59,7 +59,7 @@ impl SharedPool {
     }
 
     /// The engine registered `program`, whose fires need `facts`' term.
-    pub fn program_registered(&mut self, program: ProgramId, facts: &ProgramFacts) {
+    pub fn program_registered(&mut self, program: ProgramId, facts: &FireFacts) {
         self.programs.terms.insert(program, term_of(facts));
         self.refold();
     }
