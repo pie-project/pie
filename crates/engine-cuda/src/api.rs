@@ -1024,54 +1024,15 @@ impl Engine for Cuda {
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
-        frame.validate_for(
-            self.caps
-                .as_ref()
-                .map_or(engine::Serves::NONE, engine::Serves::of),
-        )?;
-        let id = FrameId(self.next_frame);
-        self.next_frame = self.next_frame.wrapping_add(1);
-        self.pending = None;
+        let submitted = self.submit_frame(frame);
+        self.refused(submitted)
+    }
 
-        let mut steps = Vec::with_capacity(frame.steps.len());
-        let mut settled = Vec::with_capacity(frame.steps.len());
-        for (index, step) in frame.steps.iter().enumerate() {
-            let at = engine::StepDone {
-                frame: id,
-                step: index as u32,
-            };
-            // A causal encoder-decoder's long prompts: their leading rows
-            // through the encoder alone first, unannounced, then the step
-            // with each such prompt's last window (`crate::replay`).
-            let split = self
-                .replay
-                .zip(self.shell.as_ref())
-                .and_then(|(replay, shell)| {
-                    replay.split(step, |word| {
-                        shell.trace().facts.plain(word) && !shell.wide(word)
-                    })
-                });
-            if let Some((head, _)) = &split
-                && let Err(error) = self.fire_step(head, at, false)
-            {
-                self.pending = None;
-                let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
-                return Err(attributed(error, airborne));
-            }
-            let step = split.as_ref().map_or(step, |(_, tail)| tail);
-            let (ticket, step_settled) = match self.fire_step(step, at, true) {
-                Ok(both) => both,
-                Err(error) => {
-                    self.pending = None;
-                    let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
-                    return Err(attributed(error, airborne));
-                }
-            };
-            steps.push(ticket);
-            settled.push(step_settled);
-        }
-        self.pending = Some((id, settled));
-        Ok(FrameTicket { id, steps })
+    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+        let registered = self
+            .loaded_mut()
+            .and_then(|shell| shell.register_program(registration).map_err(fault));
+        self.refused(registered)
     }
 
     fn settles_asynchronously(&self) -> bool {
@@ -1131,12 +1092,6 @@ impl Engine for Cuda {
             Some(shell) => shell.reap_landed_guests().map_err(fault),
             None => Ok(()),
         }
-    }
-
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        self.loaded_mut()?
-            .register_program(registration)
-            .map_err(fault)
     }
 
     fn register_channel(
@@ -1344,6 +1299,65 @@ impl Engine for Cuda {
 }
 
 impl Cuda {
+    /// `result`, its refusal counted ([`engine::live::Tally::Refused`]).
+    fn refused<T>(&self, result: EngineResult<T>) -> EngineResult<T> {
+        if result.is_err() {
+            engine::Engine::live(self).tally(engine::live::Tally::Refused, 1);
+        }
+        result
+    }
+
+    fn submit_frame(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
+        frame.validate_for(
+            self.caps
+                .as_ref()
+                .map_or(engine::Serves::NONE, engine::Serves::of),
+        )?;
+        let id = FrameId(self.next_frame);
+        self.next_frame = self.next_frame.wrapping_add(1);
+        self.pending = None;
+
+        let mut steps = Vec::with_capacity(frame.steps.len());
+        let mut settled = Vec::with_capacity(frame.steps.len());
+        for (index, step) in frame.steps.iter().enumerate() {
+            let at = engine::StepDone {
+                frame: id,
+                step: index as u32,
+            };
+            // A causal encoder-decoder's long prompts: their leading rows
+            // through the encoder alone first, unannounced, then the step
+            // with each such prompt's last window (`crate::replay`).
+            let split = self
+                .replay
+                .zip(self.shell.as_ref())
+                .and_then(|(replay, shell)| {
+                    replay.split(step, |word| {
+                        shell.trace().facts.plain(word) && !shell.wide(word)
+                    })
+                });
+            if let Some((head, _)) = &split
+                && let Err(error) = self.fire_step(head, at, false)
+            {
+                self.pending = None;
+                let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
+                return Err(attributed(error, airborne));
+            }
+            let step = split.as_ref().map_or(step, |(_, tail)| tail);
+            let (ticket, step_settled) = match self.fire_step(step, at, true) {
+                Ok(both) => both,
+                Err(error) => {
+                    self.pending = None;
+                    let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
+                    return Err(attributed(error, airborne));
+                }
+            };
+            steps.push(ticket);
+            settled.push(step_settled);
+        }
+        self.pending = Some((id, settled));
+        Ok(FrameTicket { id, steps })
+    }
+
     /// `submission` fired; its completion told the sink where `announce`.
     fn fire_step(
         &mut self,
