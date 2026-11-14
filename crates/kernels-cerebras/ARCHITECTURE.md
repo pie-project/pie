@@ -421,3 +421,15 @@ and each kernel set's tiny (the host's placement, calls and derived values on a 
 build's per-PE kernel and params, evaluated from `layout.csl` by `layout_eval.py`; the tiny cuts),
 and compares two captures. A change that must not change behaviour is checked against the capture
 of the tree before it (README there).
+
+## The stream regime
+
+A reading that runs whole sequences a step (a diffusion transformer's denoise) builds through
+its own path, not the decode blocks: `wafer-compile stream` (`stream::compile`). Its units come
+from the stream program's sides node by node (`stream::unit`), their roots' slices and tiles and
+the row stream's order from `stream::place`, its elements (`floorplan::stream`: a unit a side, a
+K / V column a kv head, the lane bus) from the floorplan's `Requests::{stream, joint, lanes}`,
+their links from `Stream::wiring`, coloured and laid by the same `Palette::allocate` and
+`Fabric::lay`. `emit::stream` writes `layout.csl` and a kernel a PE kind; `stream::host` the
+arrays the host writes. The decode build never reaches any of it (its outputs are unchanged).
+GENERIC.md §4.1 (M1d) has the details and the simulator results; `tools/wafer/stream` runs it.

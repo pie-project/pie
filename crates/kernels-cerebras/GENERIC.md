@@ -1,7 +1,8 @@
 # The generic wafer compiler: design
 
-Status: M1a, M1b and M1c (the stream primitives on the simulator) done (§4.1), and M3 (the decode layouts as points of the Floorplan, §2.5);
-nothing of the wafer's stream regime builds yet. ARCHITECTURE.md is what runs.
+Status: M1a, M1b, M1c (the stream primitives on the simulator) and M1d (flux2-mini's denoise step
+compiled by the generic compiler, no hand layout, on the simulator) done (§4.1), and M3 (the decode
+layouts as points of the Floorplan, §2.5). ARCHITECTURE.md is what runs for decode.
 
 **Goal.** A `.poem` model the compiler has not seen runs on the wafer with no hand code. The
 primary acceptance target is `models/flux_2.poem`: a text encoder, a DiT denoiser run over whole
@@ -295,7 +296,9 @@ scale) and then at `refuse` (the experts' kernels run no sandwich norms, GELU or
 kernel and lowering gaps (M5), not placement. Its floorplan (a MoE column run, a band, KV rows for
 its windows) is expressible as gpt-oss's is.
 
-What M1d / M2 plug in: a stream path (a `UnitLayout` visited by a row stream, one unit a layer, and
+M1d plugged in the stream regime as `floorplan::stream` (§4.1): its own elements (`StreamUnit`,
+`KvColumn`, `LaneBus`), `Requests::{stream, joint, lanes}`, a composer (`Stream::wiring`) and the
+same colouring and laying. What M2 adds on it: a stream path (a `UnitLayout` visited by a row stream, one unit a layer, and
 a token-stream link in `wiring`), replicas of a `UnitShape`, an `Aux` K / V region per attention
 block and a grid region for convolutions, a reading with no head (`Floorplan::head` made optional), and their
 classes coloured by `Palette::allocate` with no preferred colours. Each is a new element, a block
@@ -584,6 +587,95 @@ milestone's tail.
     - The build lists `STREAM_OPS` with `OPS` for stream programs only.
   - The cost model: 0.55 cycles an element a row for P1-stream, and the region and P7 cycles
     above until they are vectorised.
+- **M1d.** `wafer-compile stream --model flux2-mini-bf16-kv-bf16 [--stages N] [--values <capture>]`
+  compiles the denoise reading with no hand layout (`stream::compile`); `tools/wafer/stream/sim.sh`
+  runs it on the simulator (`run.py`: the host's arrays, one launch, the rows read back against the
+  step's own values). The pieces, each generic over the stream program:
+  - **Units** (`stream::unit`). A side of a stage (and the lane prologue) is lowered node by node
+    from its trace nodes (the stream program now records them: `StageProgram::nodes`,
+    `StreamProgram::lane_nodes`): a row in (the stream, or the host's), each run of elementwise
+    nodes one root region (`lower_run`, split where a run does not lower as one), each matmul a
+    P1-stream matvec from the side its input is on, `attn.ragged` a store and an attend, the
+    values read outside a row out. Splits, packs and unpacks are columns of another value. The
+    barrier cuts the steps: what reads nothing the attention makes runs before it (the single
+    block's MLP moves ahead of its attention), and a value made before and read after is held a
+    row at its root. A matmul over a host row takes the direction that lands its output where the
+    stream wants it (the entries' run CY to CX). A lane op over host inputs only (the timestep's
+    sinusoid) is the host's.
+  - **Layout** (`stream::place`). `py = hidden / 16` CX roots everywhere; CY roots: a head root a
+    kv head (its q, k, v and its attention output, so it alone talks to its K / V column), then
+    the fewest rest roots whose every tile fits 12,288 words and held rows 6,144: each region's
+    chunk whole at one root (glu's gate and up halves together), every other column evenly. Tiles
+    follow: a Mr tile its root's output slices, a Mc tile its root's input slices. flux2-mini:
+    lane 8 roots, entries 2, double and single 2 + 4, exit 2.
+  - **Schedule** (`stream::place::schedule`). The path's units in order; each unit's CX roots run
+    the runs of rows as they arrive: its own rows' early steps, others' rows on (or dropped where
+    no later unit runs them), its own rows' late steps. A K / V column stores rows in the order
+    they reach its block's first unit and serves queries unit by unit, so no unit waits on a store
+    another can only send after it (the order is computed, not chosen).
+  - **Floorplan** (`floorplan::stream`, written in §2.5's IR). `Requests` gained `stream`, `joint`,
+    `lanes`. `Stream::of` lays a `StreamUnit` (a `UnitShape`: Attn head columns, Plain columns, one
+    row run) a unit left to right, a `KvColumn` a kv head under each attending block's first unit
+    (root `(x + 1 + h, py + 2 + h)`, `PYA = 8` PEs below it), the `LaneBus`. `Stream::wiring` is the
+    composer: a unit's row chains (+ the row cast) and column chains (+ the column cast), its CX
+    segment where a row region all-reduces (seg.csl as it is, its rcfg words static), the row
+    stream's paths between consecutive units, each K / V column's chain and a path each way to each
+    unit's head root, the lane gather chain into the lane root and the bus (a new `Link::Broadcast`
+    tree). `Palette::allocate` colours them all, no preferred colours (every class its own; colours
+    are reused across disjoint units); `Fabric::lay` / `validate` as for decode.
+  - **Emitter** (`emit::stream`). `layout.csl` states every PE's code, params (queue colours from the
+    laid fabric's endpoints, parks for unused queues) and routes. A kernel a kind: a weight column
+    (its matvecs a row: `smv.row`, a drain where the column holds none of a matvec, zeros on where
+    the chain passes it), a unit's CX roots, each CY root (row ops: chain / stream / K / V / host
+    in, region parameters copied in and `row()`, casts and sends out), a K / V root and its PEs
+    (`cy_satt` / `satt`), the lane root, the filler. Each region is `emit::region`'s print.
+  - **Host** (`stream::host`). Every array a PE takes (tiles, regions' tables and static
+    residents, each row's scalars: positions and lane ids, the host's rows in its own order, the
+    context clamped to f16's range in an IEEE build) from a step's captured values
+    (`flux_2_minis_primitive_goldens` over every node), grouped into memcpy rectangles.
+  - **Simulator lessons.** A PE that runs several matvecs a row into one chain must not issue an
+    async send while its last one is still pending on that microthread (the simulator stops:
+    "overwriting ut_instr"): the stream units' chain members are synchronous (`ops/schain.csl`).
+    Loading is not the cost (about 2.5M simulated cycles for the whole program's arrays, 16
+    memcpy channels); the launch reaches row groups at different times, so the stamps' span
+    includes up to about 2M cycles of that skew.
+  - **Primitives.** `smv.row(t)` and `X32` (an f32 row as two 16-bit halves: the lane matvecs);
+    P7 holds the queries on the column (`satt.store_q` / `query_q`, `cy_satt.query_q`: a row's
+    q is stored with its k / v and fetched up the chain when it queries, so no CY root keeps a
+    q over the barrier); the region printer reads one rotation's tables for q's and k's angles.
+  - **Cost** (`cost::stream`): P1-stream 0.55 cycles an element a row, regions at 2 cycles an op
+    element + 1,200 an all-reduce + 5,000 a rotation, P7 4,613 a store and 3,521 a query, the
+    units' phases along the stream. flux2-mini: 26.3M cycles predicted for the step (v0's terms are
+    pessimistic for the regions; see the measurement below).
+  - **Results** (bf16 build, 64 + 64 rows, against the step's captured values; rel L2 / cosine):
+    - Entry units only (`--stages 1`, 6 x 18 PEs): context_embed 6.2e-5 / 0.999999998, x_embed
+      7.6e-6; 86k cycles.
+    - Entry + lane prologue + double block 0, both sides (`--stages 2`, 29 x 28 PEs, 2 K / V
+      columns): the block's residual out 1.40e-3 / 0.9999990 (text), 1.42e-3 / 0.9999990
+      (image); taps (`--tap`) inside it: layernorm + modulate 9.0e-5, attention + out proj
+      2.9e-3, gated residual 6.2e-4, linear_out 3.4e-3. 6.18M cycles of PE stamps (that includes
+      the launch's row-group skew); 1.7 h of simulator time; no redo pass in the K / V columns.
+    - The full step (60 x 28 PEs, 8 K / V columns, cost model 26.3M cycles): compiles and was
+      running on the simulator when this was written (`tools/wafer/stream/sim.sh` over
+      `wafer-compile stream`, about 2.3k simulated cycles a second): its velocity against the
+      capture and diffusers is M1e's first line.
+  - Decode is unchanged: plan + build `diff -r` identical against a6de5047d's wafer-compile for
+    q35_08b, q35_4b, q35_9b, q3_8b, llama31-8b, gemma_e2b, gemma_e4b, gemma_12b, gptoss_20b, tiny
+    t08, tiny llama, tiny gemma, tiny gpt-oss. tiny_q35_t08 on the simulator (wafer-bench, 5
+    steps): 0 mismatches of 14 tokens in both sequences, rollback and logits argmax as before.
+- **What M1e / M2 need** (from M1d):
+  - Sim time: the simulator runs about 1,000-2,000 cycles a second over this fabric, so the full
+    step is hours; the regions' scalar loops (the chunk sums, P5's digit products) and P7's
+    scalar store are most of a row's cycles: vectorise them (the cost model's region and P7 terms
+    are v0's).
+  - The host: the artifact's entry streams (M1e): `wafer-bench --reading` reading `host.json`'s
+    arrays from a checkpoint and the host's own ops (patchify, cells, the sinusoid of the timestep)
+    computed by the engine from the trace, not taken from a capture; the velocity unpatchified.
+  - Several steps (M2): the lane prologue and the stream re-run a step with new latents and
+    timestep; tiles stay. Replicas of a unit (rows split), and klein's sizes: its units need
+    `PY` above 16 (hidden 3,072) and the K / V columns' entries (T = 4,608) exceed a PE: P7 v1.
+  - Co-resident readings (text encoder, VAE) on one fabric: the floorplan places readings side
+    by side; colours are already allocated per class.
 
 ## 5. Risks
 
