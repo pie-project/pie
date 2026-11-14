@@ -102,6 +102,18 @@ impl Arena {
             .collect()
     }
 
+    /// The rung whose carve a fire of `tokens` tokens lays, in tokens:
+    /// the smallest that holds them and the lanes every fire carves for;
+    /// `u32::MAX` past every rung (the whole arena).
+    #[must_use]
+    pub fn carve_rung(&self, tokens: u32) -> u32 {
+        self.rungs
+            .iter()
+            .map(|(rung, _)| *rung)
+            .find(|rung| *rung >= tokens && *rung >= self.lane_reach)
+            .unwrap_or(u32::MAX)
+    }
+
     /// Backs, for every carve laid at the reservation's end, the part a
     /// fire reads before its scores. Nothing where no rung is stated: every
     /// carve then lies at the span's start, under [`Arena::ensure`]'s

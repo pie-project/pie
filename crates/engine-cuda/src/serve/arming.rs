@@ -528,13 +528,13 @@ impl Shell {
             // One record, every piece of it: a synthetic lane's rows are
             // never read back, so a step's lanes share it.
             records: self.pools.record_pieces(),
-            // The rung the next step's composition carves: its synthetic
-            // fire lays its arena as a served fire of that bucket does, so
-            // it writes inside that rung's activation chunks and no lower.
-            rung: st
-                .targets
-                .front()
-                .map_or(st.rung, |(bucket, _, _)| self.rung_of(*bucket)),
+            // The rung whose carve the next step's composition lays: its
+            // synthetic fire carves as a served fire of that bucket does,
+            // for the body's lane capacity, so it writes inside that
+            // rung's activation chunks and no lower.
+            rung: self
+                .arena
+                .carve_rung(st.targets.front().map_or(st.rung, |(bucket, _, _)| *bucket)),
         }
     }
 
