@@ -274,9 +274,10 @@ impl Plane {
     /// (`engine::Engine::fire_facts`).
     #[must_use]
     pub fn fire_term(&self, lanes: u32) -> u64 {
+        // A pair flies no more lanes than it has instances bound.
         self.pairs
             .iter()
-            .map(|(_, _, bytes, _)| bytes.at(lanes))
+            .map(|(_, _, bytes, bound)| bytes.at(lanes.min(*bound)))
             .sum()
     }
 
