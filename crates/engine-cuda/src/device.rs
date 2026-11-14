@@ -47,6 +47,11 @@ pub mod held {
     }
 
     #[must_use]
+    pub fn blas_library_since() -> u64 {
+        0
+    }
+
+    #[must_use]
     pub fn heap_bytes() -> usize {
         0
     }

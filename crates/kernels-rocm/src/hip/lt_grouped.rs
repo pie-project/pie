@@ -157,16 +157,19 @@ pub fn version() -> Result<i32, String> {
             let mut version: c_int = 0;
             // SAFETY: each call writes the out-pointer it is handed; the
             // handle is destroyed before returning.
-            unsafe {
+            // What the library loads on its first handle stays after this
+            // one is destroyed ([`super::lt::held_bytes`]).
+            super::lt::measured(|| unsafe {
                 if (lt.hipblasLtCreate)(&raw mut handle) != sys::LT_SUCCESS {
-                    return Err("hipblasLtCreate failed".into());
+                    return Err(String::from("hipblasLtCreate failed"));
                 }
                 let status = (lt.hipblasLtGetVersion)(handle, &raw mut version);
                 (lt.hipblasLtDestroy)(handle);
                 if status != sys::LT_SUCCESS {
                     return Err(format!("hipblasLtGetVersion answered {status}"));
                 }
-            }
+                Ok(())
+            })?;
             Ok(version)
         })
         .clone()

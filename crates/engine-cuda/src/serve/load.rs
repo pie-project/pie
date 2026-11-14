@@ -1842,13 +1842,18 @@ fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory:
         crate::device::alloc::free_bytes(),
     ) {
         let in_use = device_total.saturating_sub(free);
+        let library = crate::device::held::blas_library_since();
+        if library > 0 {
+            ledger.enter(Class::Outside, "hipBLASLt", library);
+        }
         ledger.enter(
             Class::Outside,
             "driver",
             in_use
                 .saturating_sub(held.before)
                 .saturating_sub(malloced)
-                .saturating_sub(held.bodies),
+                .saturating_sub(held.bodies)
+                .saturating_sub(library),
         );
     }
     ledger

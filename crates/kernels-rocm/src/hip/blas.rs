@@ -69,6 +69,92 @@ impl Operand {
     }
 }
 
+
+/// Where a rocBLAS call's workspace lies: given the bytes the call asks,
+/// the slab laid for it (`Ctx::blas_workspace`).
+pub type Workspace<'a> = dyn FnMut(usize) -> Result<u64, crate::Error> + 'a;
+
+/// The least workspace a handle is given, so it is always the caller's and
+/// rocBLAS never allocates one of its own.
+const WORKSPACE_LEAST: usize = 256;
+
+/// Creates a rocBLAS handle holding no device memory of its own: rocBLAS
+/// allocates a default workspace with a handle (128 MiB on gfx942) that no
+/// call this crate makes asks for; it is given back at once, and each call
+/// runs on the slab laid for it ([`with_workspace`]).
+///
+/// # Safety
+/// `handle` must be writable.
+pub unsafe fn create(handle: *mut Blas) -> BlasStatus {
+    let Ok(blas) = sys::rocblas() else {
+        return -1;
+    };
+    // SAFETY: the caller's `handle` contract.
+    let created = unsafe { (blas.rocblas_create_handle)(handle) };
+    if created != sys::BLAS_SUCCESS {
+        return created;
+    }
+    // SAFETY: the handle just created; null and zero give its workspace back.
+    unsafe { (blas.rocblas_set_workspace)(*handle, core::ptr::null_mut(), 0) }
+}
+
+/// The workspace `run` asks of `handle`, from rocBLAS's device-memory size
+/// query: the call launches nothing.
+///
+/// # Safety
+/// `handle` must be live; `run` makes one rocBLAS call on it.
+unsafe fn asks(
+    blas: &sys::Rocblas,
+    handle: Blas,
+    call: &'static str,
+    run: &dyn Fn() -> BlasStatus,
+) -> Result<usize, Refused> {
+    const START: &str = "rocblas_start_device_memory_size_query";
+    const STOP: &str = "rocblas_stop_device_memory_size_query";
+    // SAFETY: the caller's handle contract.
+    answered(START, unsafe { (blas.rocblas_start_device_memory_size_query)(handle) })?;
+    let status = run();
+    let mut bytes = 0usize;
+    // SAFETY: as above; `bytes` is a live local.
+    let stopped = unsafe { (blas.rocblas_stop_device_memory_size_query)(handle, &raw mut bytes) };
+    if !matches!(
+        status,
+        sys::BLAS_SUCCESS | sys::BLAS_SIZE_INCREASED | sys::BLAS_SIZE_UNCHANGED
+    ) {
+        return Err(Refused { call, status });
+    }
+    answered(STOP, stopped)?;
+    Ok(bytes)
+}
+
+/// Runs `run` on `handle` over the workspace it asks for, taken through
+/// `workspace`: a size-only walk (`crate::sizing`) asks and runs nothing,
+/// so the slab is laid at what the call takes and rocBLAS never allocates.
+///
+/// # Safety
+/// `handle` must be live and bound to the stream `workspace`'s slab is
+/// taken for; `run` makes one rocBLAS call on it.
+unsafe fn with_workspace(
+    blas: &sys::Rocblas,
+    handle: Blas,
+    call: &'static str,
+    workspace: &mut Workspace<'_>,
+    run: &dyn Fn() -> BlasStatus,
+) -> Result<(), crate::Error> {
+    // SAFETY: the caller's contract.
+    let bytes = unsafe { asks(blas, handle, call, run) }?.max(WORKSPACE_LEAST);
+    let at = workspace(bytes)?;
+    if crate::sizing::active() {
+        return Ok(());
+    }
+    // SAFETY: `at` is a laid slab of at least `bytes`, live while the
+    // context that took it fires.
+    answered("rocblas_set_workspace", unsafe {
+        (blas.rocblas_set_workspace)(handle, at as usize as *mut c_void, bytes)
+    })?;
+    answered(call, run()).map_err(Into::into)
+}
+
 const ALPHA: f32 = 1.0;
 const BETA: f32 = 0.0;
 
@@ -101,17 +187,14 @@ pub unsafe fn gemm(
     a: Operand,
     b: Operand,
     d: Operand,
-) -> Result<(), Refused> {
+    workspace: &mut Workspace<'_>,
+) -> Result<(), crate::Error> {
     const CALL: &str = "rocblas_gemm_ex";
-    // A size-only walk (`crate::sizing`) runs no product.
-    if crate::sizing::active() {
-        return Ok(());
-    }
     let blas = blas(CALL)?;
     // SAFETY: `ALPHA` and `BETA` are statics rocBLAS reads as host f32 scalars;
     // the caller guarantees `handle` is live and each operand covers its shape.
     // `C` is `D` with the same `ld` and type, the in-place form rocBLAS allows.
-    answered(CALL, unsafe {
+    let run = || unsafe {
         (blas.rocblas_gemm_ex)(
             handle,
             op_a,
@@ -138,7 +221,9 @@ pub unsafe fn gemm(
             0,
             0,
         )
-    })
+    };
+    // SAFETY: the caller guarantees `handle` is live and bound.
+    unsafe { with_workspace(blas, handle, CALL, workspace, &run) }
 }
 
 /// [`gemm`] over `batch` problems, each operand stepping by its `stride`.
@@ -157,16 +242,13 @@ pub unsafe fn gemm_strided(
     b: Operand,
     d: Operand,
     batch: i32,
-) -> Result<(), Refused> {
+    workspace: &mut Workspace<'_>,
+) -> Result<(), crate::Error> {
     const CALL: &str = "rocblas_gemm_strided_batched_ex";
-    // A size-only walk (`crate::sizing`) runs no product.
-    if crate::sizing::active() {
-        return Ok(());
-    }
     let blas = blas(CALL)?;
     // SAFETY: as in [`gemm`], for each of the `batch` problems the caller
     // guarantees lie at the given strides.
-    answered(CALL, unsafe {
+    let run = || unsafe {
         (blas.rocblas_gemm_strided_batched_ex)(
             handle,
             op_a,
@@ -198,7 +280,9 @@ pub unsafe fn gemm_strided(
             0,
             0,
         )
-    })
+    };
+    // SAFETY: the caller guarantees `handle` is live and bound.
+    unsafe { with_workspace(blas, handle, CALL, workspace, &run) }
 }
 
 /// [`gemm`] over `batch` problems whose operands are device arrays of
@@ -218,16 +302,13 @@ pub unsafe fn gemm_batched(
     b: Operand,
     d: Operand,
     batch: i32,
-) -> Result<(), Refused> {
+    workspace: &mut Workspace<'_>,
+) -> Result<(), crate::Error> {
     const CALL: &str = "rocblas_gemm_batched_ex";
-    // A size-only walk (`crate::sizing`) runs no product.
-    if crate::sizing::active() {
-        return Ok(());
-    }
     let blas = blas(CALL)?;
     // SAFETY: as in [`gemm`]; the caller guarantees each operand's array holds
     // `batch` live device addresses.
-    answered(CALL, unsafe {
+    let run = || unsafe {
         (blas.rocblas_gemm_batched_ex)(
             handle,
             op_a,
@@ -255,7 +336,9 @@ pub unsafe fn gemm_batched(
             0,
             0,
         )
-    })
+    };
+    // SAFETY: the caller guarantees `handle` is live and bound.
+    unsafe { with_workspace(blas, handle, CALL, workspace, &run) }
 }
 
 /// A rocBLAS handle owned by its creator, destroyed on drop.
@@ -264,13 +347,9 @@ pub struct Handle(Blas);
 impl Handle {
     pub fn new() -> Result<Self, Refused> {
         const CALL: &str = "rocblas_create_handle";
-        let blas = blas(CALL)?;
         let mut handle: Blas = core::ptr::null_mut();
-        // SAFETY: `handle` is a live local; rocBLAS writes the new handle
-        // there.
-        answered(CALL, unsafe {
-            (blas.rocblas_create_handle)(&raw mut handle)
-        })?;
+        // SAFETY: `handle` is the live local rocBLAS writes the new handle to.
+        answered(CALL, unsafe { create(&raw mut handle) })?;
         Ok(Self(handle))
     }
 

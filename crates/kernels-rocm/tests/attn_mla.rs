@@ -1038,28 +1038,32 @@ fn absorb_into_and_out_of_the_latent() {
             .collect();
         let kv_b = gpu.tensor(&kvb, (heads * (nope + v)) as u32, rank as u32, Dtype::Bf16);
         let mut q_latent = gpu.zeros(tokens as u32, (heads * rank) as u32, Dtype::Bf16);
-        mla::absorb_q(
-            &ctx,
-            gpu.tensor(&qn, tokens as u32, (heads * nope) as u32, Dtype::Bf16),
-            kv_b,
-            heads as u32,
-            rank as u32,
-            nope as u32,
-            v as u32,
-            &mut q_latent,
-        )
+        gpu.laid(&ctx, |ctx| {
+            mla::absorb_q(
+                ctx,
+                gpu.tensor(&qn, tokens as u32, (heads * nope) as u32, Dtype::Bf16),
+                kv_b,
+                heads as u32,
+                rank as u32,
+                nope as u32,
+                v as u32,
+                &mut q_latent,
+            )
+        })
         .unwrap();
         let mut o = gpu.zeros(tokens as u32, (heads * v) as u32, Dtype::Bf16);
-        mla::absorb_out(
-            &ctx,
-            gpu.tensor(&lat, tokens as u32, (heads * rank) as u32, Dtype::Bf16),
-            kv_b,
-            heads as u32,
-            rank as u32,
-            v as u32,
-            nope as u32,
-            &mut o,
-        )
+        gpu.laid(&ctx, |ctx| {
+            mla::absorb_out(
+                ctx,
+                gpu.tensor(&lat, tokens as u32, (heads * rank) as u32, Dtype::Bf16),
+                kv_b,
+                heads as u32,
+                rank as u32,
+                v as u32,
+                nope as u32,
+                &mut o,
+            )
+        })
         .unwrap();
         let (gq, go) = (gpu.read(&q_latent), gpu.read(&o));
         let w =
