@@ -68,6 +68,9 @@ pub struct Side {
 pub struct StageProgram {
     pub stage: Stage,
     pub sides: Vec<Side>,
+    /// Each side's trace nodes (its first class's), in trace order: what a target that lowers
+    /// a side node by node (its root regions, [`crate::fuse::chain::lower_run`]) reads.
+    pub nodes: Vec<Vec<u32>>,
 }
 
 /// What a host op does to the step's rows.
@@ -96,6 +99,8 @@ pub struct StreamProgram {
     pub host: Vec<Host>,
     /// The lane vectors' phases, once a step before the rows flow.
     pub lanes: LayerBody,
+    /// The lane vectors' trace nodes, in trace order.
+    pub lane_nodes: Vec<u32>,
     pub bodies: Vec<LayerBody>,
     /// The stages the rows flow through, in order: entry, each layer (and what runs between two
     /// runs of layers), exit.
@@ -376,6 +381,10 @@ pub fn lower(
 
     let any_reader = reader(any.clone());
     let mut lanes = body(&any_reader, u32::MAX);
+    let lane_nodes: Vec<u32> = (0..nodes)
+        .filter(|&at| lane[at])
+        .map(|at| at as u32)
+        .collect();
     for at in (0..nodes).filter(|&at| lane[at]) {
         lanes
             .node(at)
@@ -389,6 +398,7 @@ pub fn lower(
         .iter()
         .map(|r| order.iter().map(|&s| body(r, layer_of(s))).collect())
         .collect();
+    let mut run: Vec<Vec<Vec<u32>>> = vec![vec![Vec::new(); order.len()]; classes.len()];
     for at in 0..nodes {
         let Some(s) = row_stage[at] else {
             continue;
@@ -401,6 +411,7 @@ pub fn lower(
             read[c][i]
                 .node(at)
                 .map_err(|e| format!("{name}: {} {} node {at}: {e}", describe(s), class.name))?;
+            run[c][i].push(at as u32);
         }
     }
 
@@ -410,6 +421,7 @@ pub fn lower(
         .map(|&stage| StageProgram {
             stage,
             sides: Vec::new(),
+            nodes: Vec::new(),
         })
         .collect();
     for (c, class_bodies) in read.into_iter().enumerate() {
@@ -427,13 +439,16 @@ pub fn lower(
                     bodies.len() - 1
                 }
             };
-            let sides = &mut stages[i].sides;
-            match sides.iter_mut().find(|s| s.body == at) {
+            let stage = &mut stages[i];
+            match stage.sides.iter_mut().find(|s| s.body == at) {
                 Some(side) => side.classes.push(c),
-                None => sides.push(Side {
-                    classes: vec![c],
-                    body: at,
-                }),
+                None => {
+                    stage.sides.push(Side {
+                        classes: vec![c],
+                        body: at,
+                    });
+                    stage.nodes.push(std::mem::take(&mut run[c][i]));
+                }
             }
         }
     }
@@ -459,6 +474,7 @@ pub fn lower(
         classes: classes.to_vec(),
         host,
         lanes,
+        lane_nodes,
         bodies,
         stages,
     })
