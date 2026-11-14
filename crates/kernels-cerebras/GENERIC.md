@@ -1,6 +1,6 @@
 # The generic wafer compiler: design
 
-Status: M1a and M1b done (§4.1), and M3 (the decode layouts as points of the Floorplan, §2.5);
+Status: M1a, M1b and M1c (the stream primitives on the simulator) done (§4.1), and M3 (the decode layouts as points of the Floorplan, §2.5);
 nothing of the wafer's stream regime builds yet. ARCHITECTURE.md is what runs.
 
 **Goal.** A `.poem` model the compiler has not seen runs on the wafer with no hand code. The
@@ -436,7 +436,7 @@ milestone's tail.
   out, per-step lane inputs). `wafer-bench` gets a `--reading` mode that feeds a golden's inputs
   and compares outputs. The engine change is generic: it reads entries from the artifact.
 
-### 4.1 M1a / M1b: where they stand
+### 4.1 M1a / M1b / M1c: where they stand
 
 - **M1a.** `spatial::layer::stream::lower(trace, analysis, classes)` reads a stream reading into the
   decode program's phases, a `RowClass` (a request word, its rows) at a time: classes whose bodies
@@ -481,14 +481,118 @@ milestone's tail.
     permutation (identity for one group); `wafer-bench --reading` (M1e) feeds them.
   - Oracles: `kernels_ir::interp` per region; `Forward::stream` for the model, which needs a hook
     that dumps a node's value (an op-level capture) for the per-primitive sim comparisons.
+- **M1c.** Each primitive runs on the fabric simulator on its own (`tools/wafer/prims`: `sim.sh`
+  compiles a prim's layout with `programs/wafer/ops` and runs its `run.py`, one simulator at a
+  time machine-wide). Its inputs and oracles are the host forward's own values of flux2-mini's step
+  (`Forward::stream_capture`; engine-cpu's `flux_2_minis_primitive_goldens` writes them) and
+  `kernels_ir::interp`. The stream modules sit in `programs/wafer/ops` but are listed apart
+  (`sources::STREAM_OPS`): no decode build writes or keys them. Plan and build of the 0.8B,
+  gpt-oss-20b and tiny t08 stay `diff -r` identical. They reuse mv (`tile32`), red (`send`), seg
+  (`all_reduce`), rope (`tables`), math and fabric as they are. The decode modules' text is
+  unchanged: a build copies it verbatim, so a decode module generalised in place is a byte-identity
+  question for the gate.
+  - **P1-stream** (`ops/smv.csl`): a weight PE's tile over the step's rows. Each row is double
+    buffered: its x chunk in, `tile32` (16-bit operands, f32 accumulation), and an async chain send
+    that overlaps the next row's multiply. `prims/mv` has a column of row sources (CX), PX x PY
+    weight PEs and a row of chain roots (CY). Results on flux2-mini's matmuls (64 or 128 rows):
+
+    | matmul | PEs | elements / PE | rel L2 vs held product | vs trace | cycles / row | cycles / element |
+    |---|---|---|---|---|---|---|
+    | qkv 256 -> 768 | 8 x 4 | 6,144 | 6.4e-8 | 1.7e-3 | 3,346 | 0.545 |
+    | out 256 -> 256 | 4 x 4 | 4,096 | 6.1e-8 | — | 2,296 | 0.561 |
+    | linear_in 256 -> 1536 | 16 x 4 | 6,144 | 6.4e-8 | 1.7e-3 | 3,346 | 0.545 |
+    | linear_out 768 -> 256 | 4 x 8 | 6,144 | 1.0e-7 | 1.6e-3 | 3,387 | 0.551 |
+    | single in_proj 256 -> 2304 | 24 x 4 | 6,144 | 6.3e-8 | 1.7e-3 | 3,346 | 0.545 |
+    | entry context 192 -> 256 | 4 x 4 | 3,072 | 5.6e-8 | 1.7e-3 | 1,757 | 0.572 |
+    | entry x_embed 128 -> 256 | 4 x 2 | 4,096 | 5.1e-8 | 1.7e-3 | 2,297 | 0.561 |
+    | exit proj_out 256 -> 128 | 2 x 4 | 4,096 | 6.4e-8 | 1.6e-3 | 2,296 | 0.561 |
+
+    - "Held product" is the rows as the PEs hold them, in f64. "Trace" is the host forward's
+      bf16-rounded output; its distance is that rounding.
+    - IEEE f16 (qkv) gives the same error and cycles. f32 accumulation does not cost the 2x §5
+      feared: 0.55 cycles an element, against decode's 0.46.
+  - **Activation type: IEEE f16 matvec inputs, f32 accumulation, the residual f32 at the roots.**
+    - flux2-mini's values are small (max |x| 11.6). Its trace's activations are bf16, so f16
+      holds them exactly; the mini cannot decide.
+    - FLUX.2-klein-4B's real checkpoint (diffusers, 3 prompts, 4 steps at 512² and 1024², hooks
+      on all 109 Linears; `scratch/cleanup/fluxm1c/klein`) decides:
+      - No Linear input or output passes 65,504. The nearest is `context_embedder`'s input (Qwen3
+        hidden states): 16,392, a 4x margin; clamp before its narrowing.
+      - Rounding every Linear input, the velocity's rel L2 from f32 is 7.2e-3 mean (1.2e-2 max)
+        in bf16 and 9.9e-4 (2.0e-3) in f16. Over 4 free-running steps the final latent is
+        2.4-4.8e-2 in bf16 and 0.55-1.4e-2 in f16.
+      - The bf16 weights cast to f16 lose nothing that matters: rel L2 at most 6.6e-8.
+      - What breaks f16 is the text residual stream: 73k-103k from double block 4 on, in a few
+        channels. Stored f16 it is inf from step 1; clamped it is 0.5-4.7%.
+    - So the residual and the norms' inputs stay f32 at the roots (as the regions hold them),
+      and the build is IEEE: the decode kernels' format, so co-resident readings share one.
+    - P7 in an IEEE build, f16 probabilities: rel L2 1.2e-4 against f64, against 9.9e-4 in bf16.
+  - **P7 v0** (`ops/satt.csl`, `ops/cy_satt.csl`): a column of attention PEs a kv head (a whole
+    head of 128), row r keeping the step's rows p = r (mod PYA). The root multicasts each row's
+    [k | v], then each query. A query's scores are a `tile32` over every entry, then exp against
+    a carried log-sum-exp reference, then the values matvec with a ones column. [o | l] goes up
+    the column chain; the root returns [redo, ln l].
+    - Results on flux2-mini's first double block (128 rows, 2 heads, 8 PEs a column, 16 entries a
+      PE): rel L2 1.2e-4 against f64 (IEEE build), 1.7e-3 against the trace's bf16 output.
+    - No redo pass: the carried reference held across the text and image rows.
+    - 3,521 cycles a query and 4,613 a stored row. The store is a scalar loop: vectorise it.
+  - **P4** (`emit::region`, §3.2's printer). poem-compiler's `fuse::chain::lower_run` gives a run of
+    named ops its region. It also lowers `rope_axes` (kernels-ir `Ops::rotate_axes`, its positions
+    scalar params) and the packed `glu`; no chain forms over either. The printer classes values
+    static (host tables, evaluated by interp), row, scalar or head. It prints DSD ops and `math`
+    scalars. A row sum across roots is a P3 all-reduce (seg.csl). cos / sin of a position x
+    frequency come from P5 tables (rope.csl). It refuses by name what it does not print.
+    Results in `prims/reg` (bf16 build, 64 image rows; error against interp, cycles a row of
+    `row()`):
+
+    | region (flux2-mini nodes) | roots x chunk | vs interp | cycles |
+    |---|---|---|---|
+    | layernorm (no affine) + modulate scale-shift (41, 42) | 4 x 64, 2 all-reduces | 2.8e-5 (bf16 ties) | 3,044 |
+    | per-head rmsnorm with gain + rope_axes 4 x 32, theta 2000 (45, 46) | 2 x 128 | 3.0e-5 (7e-9 vs trace) | 11,791 |
+    | gated residual + layernorm + modulate (57, 64, 65) | 4 x 64 | 8e-11 | 3,281 |
+    | SwiGLU 1536 -> 768 (67) | 6 x 128 | 2.1e-5 | 4,847 |
+    | gated residual (69) | 4 x 64 | exact | 248 |
+    | residual add + gated residual (124, 125) | 4 x 64 | exact | 332 |
+
+    The cycles are v0's. Two costs dominate:
+    - The chunk sums are scalar loops: make them a halving tree.
+    - P5's digit products cost 64 slots x 4 levels of scalar math a row, about 10k cycles: half
+      the pairs' angles repeat across rows of one image row or column, so the tables could be a
+      row's position lookup.
+- **What M1d needs** (Floorplan v0 for stream, on §2.5's IR):
+  - The unit:
+    - CX roots run the Rr regions and source the row multicast; P1-stream weight PEs; CY roots
+      run the Rc regions. This is `prims/mv`'s geometry, with the region modules' I/O wired to
+      the fabric in place of the harness's `load_row` / `store_row`.
+    - A token stream path between units.
+    - The chain colours alternate a row, as the harness's do.
+  - The segment all-reduce of a row's norms across a unit's CX roots: seg.csl as it is, its rcfg
+    words binding static colours in both modes.
+  - A K / V column a kv head under each double block's pair of units and the single block's.
+    The CY roots' Rc output (q / k / v, a head a root) is P7's multicast, and both classes' rows
+    land in one store. The barrier is the stream's order.
+  - The lane prologue: the decode-regime body, plus the multicast of each lane vector to the
+    roots that hold it resident (`ParamAt::Resident`).
+  - The host:
+    - Each root's static tables (`Printed::tables`: masks, frequencies' rotations, slot ranges).
+    - The cell table's positions as each row's scalars.
+    - The P11 permutations and the clamp of the entry's context.
+  - The links:
+    - Each stream link (row stream, chains, segment all-reduce, P7 multicast / chain) is a
+      Requests field, a composer block and a line in `Floorplan::of` (§2.5).
+    - Its colours come from the allocation.
+    - The build lists `STREAM_OPS` with `OPS` for stream programs only.
+  - The cost model: 0.55 cycles an element a row for P1-stream, and the region and P7 cycles
+    above until they are vectorised.
 
 ## 5. Risks
 
 - **Numerics: f16.** The decode kernels hold IEEE f16 tiles and f16 activations, with f16
   accumulation a PE. DiT activations (adaLN-modulated, large residuals) can pass f16's 65,504 range.
-  Stream programs need bf16 activations with f32 accumulation (`MV 0` exists: bf16 tiles, f32
-  accumulation). That costs about 2x matvec cycles. Measure in M1 before committing the
-  replication budget.
+  Measured in M1c (§4.1) on klein-4B:
+  - The matvecs' inputs stay below it.
+  - f16 is 7x more accurate than bf16, at 0.55 cycles an element with f32 accumulation (not 2x).
+  - The text residual passes it (to 103k), so the residual stays f32 at the roots.
 - **Colours and queues.** There are 21 colours and a few queues a PE. A stream program adds:
   - a row stream a unit;
   - a K / V ring an attention block;
