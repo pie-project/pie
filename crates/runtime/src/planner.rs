@@ -33,7 +33,7 @@ mod service_order_tests;
 mod starvation_race_tests;
 
 pub use acquire::Acquired;
-pub use departure::{Departure, DepartureWatch};
+pub use departure::{Departure, DepartureWatch, follow_restart};
 pub use diagnostics::{PlannerDiagnostics, PlannerQueueEntry};
 pub use error::{PlannerError, StarveCause};
 pub use global::{

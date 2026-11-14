@@ -1865,3 +1865,24 @@ async fn a_departure_watch_wakes_when_the_last_hold_drops() {
     }
     assert!(waiting.is_finished(), "the last hold dropped: it wakes");
 }
+
+/// A watch follows a restart: the old run departing is not the process's
+/// departure; the new run's is.
+#[tokio::test(flavor = "current_thread")]
+async fn a_departure_watch_follows_a_restart() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::new(4)) as Arc<dyn PoolPort>
+    ));
+    let (old, new) = (ProcessId::new_v4(), ProcessId::new_v4());
+    planner.register(old);
+    planner.register(new);
+    let watch = crate::planner::DepartureWatch::new(old);
+    let old_hold = super::departure::Departure::new(&planner, old);
+    let new_hold = super::departure::Departure::new(&planner, new);
+    crate::planner::follow_restart(old, new);
+    drop(old_hold);
+    assert!(!watch.gone(), "the old run left; the process runs on");
+    drop(new_hold);
+    assert!(watch.gone(), "its newest run departed");
+}
