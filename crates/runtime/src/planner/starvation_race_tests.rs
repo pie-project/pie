@@ -1831,3 +1831,37 @@ async fn a_wait_for_a_move_to_end_wakes_when_the_eviction_ends() {
     }
     assert!(waiting.is_finished(), "the eviction ended: it wakes");
 }
+
+/// What waits on a process's full departure (a served offload prefill
+/// waiting for its pages to be kept) wakes when its last hold drops.
+#[tokio::test(flavor = "current_thread")]
+async fn a_departure_watch_wakes_when_the_last_hold_drops() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::new(4)) as Arc<dyn PoolPort>
+    ));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    let hold = super::departure::Departure::new(&planner, pid);
+    let watch = crate::planner::DepartureWatch::new(pid);
+    let waiting = crate::rt::spawn(async move {
+        loop {
+            let next = crate::planner::DepartureWatch::next();
+            tokio::pin!(next);
+            next.as_mut().enable();
+            if watch.gone() {
+                return;
+            }
+            next.await;
+        }
+    });
+    for _ in 0..20 {
+        crate::rt::yield_now().await;
+    }
+    assert!(!waiting.is_finished(), "still held: it waits");
+    drop(hold);
+    for _ in 0..20 {
+        crate::rt::yield_now().await;
+    }
+    assert!(waiting.is_finished(), "the last hold dropped: it wakes");
+}

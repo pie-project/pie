@@ -5,64 +5,41 @@
 //! Programs that fork (a search's siblings, a batch of agents on one system
 //! prompt) launch passes over a shared prefix together. The cache holds what
 //! has sealed, and nothing has yet, so each would prefill all of it. Here a
-//! pass claims the pages it is about to compute, by key, until a deadline; a
-//! later pass whose uncached pages begin with pages another has claimed waits
-//! until the last of those is cached, or the deadline passes, and then runs
-//! from what is there. A claimant that fails or stalls costs the waiter that
-//! wait and no more: it computes the pages itself.
+//! pass claims the pages it is about to compute, by key, for as long as the
+//! pass runs ([`ClaimGuard`], released when its last piece settles or it
+//! ends early). A later pass whose uncached pages begin with pages another
+//! has claimed waits on events only: pages joining the cache (the kv store's
+//! `cached`), and claims released ([`RELEASED`]). Once those pages are all
+//! cached it maps them in; once the claims on them are released with some
+//! still uncached (the claimant ended without sealing them), it computes them
+//! itself, on that event, not after a deadline.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
-
-use crate::rt::Instant;
 
 use crate::store::kv::hash::Hash256;
 use crate::store::kv::page_table::WorkingSetId;
 use crate::store::registry::{Stores, with_kv_lock};
 
-/// How often a waiter looks for the pages it waits on.
-const POLL: Duration = Duration::from_millis(5);
-/// A claim's floor and its ceiling: what a claimant may take to seal them.
-const LEAST: Duration = Duration::from_secs(1);
-const MOST: Duration = Duration::from_secs(10);
-/// Tokens a second a claim is expected to prefill at, slow on purpose:
-/// passes under load share the device.
-const TOKENS_PER_SECOND: u64 = 2000;
-
 #[derive(Clone, Copy)]
 struct Claim<By = WorkingSetId> {
     by: By,
-    until: Instant,
 }
 
 static CLAIMS: LazyLock<Mutex<HashMap<Hash256, Claim>>> = LazyLock::new(Default::default);
 
-/// How many of `mine`, from the first, others have claimed and not let
-/// lapse by `now`, and when the last of those claims lapses.
+/// Told whenever a pass's claims are released.
+static RELEASED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// How many of `mine`, from the first, others have claimed.
 fn claimed_run<By: PartialEq>(
     claims: &HashMap<Hash256, Claim<By>>,
     mine: &[Hash256],
     by: By,
-    now: Instant,
-) -> (usize, Option<Instant>) {
-    let mut until = None;
-    let run = mine
-        .iter()
-        .take_while(|key| match claims.get(*key) {
-            Some(claim) if claim.by != by && claim.until > now => {
-                until = until.max(Some(claim.until));
-                true
-            }
-            _ => false,
-        })
-        .count();
-    (run, until)
-}
-
-fn deadline(pages: usize, page_size: u32, now: Instant) -> Instant {
-    let tokens = pages as u64 * u64::from(page_size);
-    now + (LEAST + Duration::from_millis(tokens * 1000 / TOKENS_PER_SECOND)).min(MOST)
+) -> usize {
+    mine.iter()
+        .take_while(|key| claims.get(*key).is_some_and(|claim| claim.by != by))
+        .count()
 }
 
 /// Pages from token 0 cached in any tier, at least the `held` ones.
@@ -73,10 +50,38 @@ fn cached(stores: &Stores, keys: &[Hash256], held_pages: usize) -> usize {
     .max(held_pages)
 }
 
+/// The claims a pass holds while it runs: released (and its waiters told)
+/// when dropped, once its last piece settles or it ends early.
+#[must_use = "the claims stand while the pass runs"]
+pub(crate) struct ClaimGuard {
+    by: WorkingSetId,
+    keys: Vec<Hash256>,
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        {
+            let mut claims = CLAIMS.lock().unwrap();
+            for key in &self.keys {
+                if claims.get(key).is_some_and(|claim| claim.by == self.by) {
+                    claims.remove(key);
+                }
+            }
+        }
+        RELEASED.notify_waiters();
+    }
+}
+
 /// Before a keyed pass over `slots` from row `held` of working set `ws`:
 /// waits out the pages another pass is computing that this one would
-/// compute first, then claims the ones it will compute.
-pub(crate) async fn before_pass(stores: &Stores, ws: WorkingSetId, held: u64, slots: &[Hash256]) {
+/// compute first, then claims the ones it will compute, for as long as the
+/// guard it answers stands.
+pub(crate) async fn before_pass(
+    stores: &Stores,
+    ws: WorkingSetId,
+    held: u64,
+    slots: &[Hash256],
+) -> Option<ClaimGuard> {
     let page_size = stores.kv_page_size;
     let page = u64::from(page_size.max(1));
     let keys = if held == 0 {
@@ -85,51 +90,54 @@ pub(crate) async fn before_pass(stores: &Stores, ws: WorkingSetId, held: u64, sl
         with_kv_lock(&stores.kv, "coalesce", |kv| {
             kv.page_keys(ws, held, slots, page_size).ok().flatten()
         })
-    };
-    let Some(keys) = keys else {
-        return;
-    };
+    }?;
     let held_pages = (held / page) as usize;
-    let mut have = cached(stores, &keys, held_pages);
-    if have >= keys.len() {
-        return;
-    }
-    let now = Instant::now();
-    let (run, until) = {
-        let mut claims = CLAIMS.lock().unwrap();
-        claims.retain(|_, claim| claim.until > now);
-        claimed_run(&claims, &keys[have..], ws, now)
-    };
-    if let Some(until) = until {
-        let want = have + run;
-        let started = Instant::now();
-        while Instant::now() < until {
-            have = cached(stores, &keys[..want], held_pages);
-            if have >= want {
-                break;
-            }
-            let _ = crate::rt::time::timeout(POLL, std::future::pending::<()>()).await;
+    let cached_event = with_kv_lock(&stores.kv, "coalesce", |kv| kv.cached());
+    let started = crate::rt::Instant::now();
+    let mut waited = false;
+    let have = loop {
+        // Armed before the look: a page cached or a claim released between
+        // the look and the wait is not lost.
+        let joined = cached_event.notified();
+        let released = RELEASED.notified();
+        let mut joined = std::pin::pin!(joined);
+        let mut released = std::pin::pin!(released);
+        joined.as_mut().enable();
+        released.as_mut().enable();
+        let have = cached(stores, &keys, held_pages);
+        if have >= keys.len() {
+            return None;
         }
-        have = cached(stores, &keys, held_pages);
+        let run = claimed_run(&CLAIMS.lock().unwrap(), &keys[have..], ws);
+        if run == 0 {
+            break have;
+        }
+        waited = true;
+        tokio::select! {
+            () = &mut joined => {}
+            () = &mut released => {}
+        }
+    };
+    if waited {
         tracing::debug!(
             target: "pie::coalesce",
             waited_ms = started.elapsed().as_millis() as u64,
-            pages = run,
-            found = have >= want,
             "a pass waited on pages another pass was computing"
         );
     }
-    if have < keys.len() {
-        let now = Instant::now();
-        let claim = Claim {
-            by: ws,
-            until: deadline(keys.len() - have, page_size, now),
-        };
-        let mut claims = CLAIMS.lock().unwrap();
-        for key in &keys[have..] {
-            claims.entry(*key).or_insert(claim);
-        }
-    }
+    let mut claims = CLAIMS.lock().unwrap();
+    let mine: Vec<Hash256> = keys[have..]
+        .iter()
+        .copied()
+        .filter(|key| {
+            let free = !claims.contains_key(key);
+            if free {
+                claims.insert(*key, Claim { by: ws });
+            }
+            free
+        })
+        .collect();
+    (!mine.is_empty()).then(|| ClaimGuard { by: ws, keys: mine })
 }
 
 #[cfg(test)]
@@ -143,49 +151,56 @@ mod tests {
     #[test]
     fn a_pass_waits_on_the_run_others_claimed_from_its_first_page() {
         let (a, b) = (1u32, 2u32);
-        let now = Instant::now();
-        let later = now + Duration::from_secs(2);
         let claims: HashMap<Hash256, Claim<u32>> = [
-            (
-                key(1),
-                Claim {
-                    by: a,
-                    until: later,
-                },
-            ),
-            (
-                key(2),
-                Claim {
-                    by: a,
-                    until: now + Duration::from_secs(3),
-                },
-            ),
-            (
-                key(4),
-                Claim {
-                    by: a,
-                    until: later,
-                },
-            ),
+            (key(1), Claim { by: a }),
+            (key(2), Claim { by: a }),
+            (key(4), Claim { by: a }),
         ]
         .into();
         // b's first two pages are a's to compute; its third is no one's,
         // so the run stops there even though a claimed the fourth.
-        let (run, until) = claimed_run(&claims, &[key(1), key(2), key(3), key(4)], b, now);
-        assert_eq!((run, until), (2, Some(now + Duration::from_secs(3))));
-        // A pass does not wait on its own claims, nor on lapsed ones.
-        assert_eq!(claimed_run(&claims, &[key(1)], a, now), (0, None));
-        assert_eq!(claimed_run(&claims, &[key(1)], b, later), (0, None));
+        assert_eq!(
+            claimed_run(&claims, &[key(1), key(2), key(3), key(4)], b),
+            2
+        );
+        // A pass does not wait on its own claims.
+        assert_eq!(claimed_run(&claims, &[key(1)], a), 0);
         // Nothing claimed first: nothing to wait on.
-        assert_eq!(claimed_run(&claims, &[key(3), key(4)], b, now), (0, None));
+        assert_eq!(claimed_run(&claims, &[key(3), key(4)], b), 0);
     }
 
-    #[test]
-    fn a_claim_lasts_for_what_it_prefills_within_bounds() {
-        let now = Instant::now();
-        assert_eq!(deadline(0, 16, now), now + LEAST);
-        // 250 pages of 16 tokens at 2000 a second: two seconds past the floor.
-        assert_eq!(deadline(250, 16, now), now + LEAST + Duration::from_secs(2));
-        assert_eq!(deadline(100_000, 16, now), now + MOST);
+    /// A claim stands until its guard drops, and the drop tells waiters.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_released_claim_wakes_its_waiters() {
+        let model = crate::store::registry::register_model(32, &[1], &[1]);
+        let ws = crate::store::registry::get(model, 0)
+            .kv
+            .lock()
+            .create_working_set();
+        let keys = vec![[0xC5; 32], [0xC6; 32]];
+        {
+            let mut claims = CLAIMS.lock().unwrap();
+            for key in &keys {
+                claims.insert(*key, Claim { by: ws });
+            }
+        }
+        let guard = ClaimGuard {
+            by: ws,
+            keys: keys.clone(),
+        };
+        let waiting = tokio::spawn(async {
+            RELEASED.notified().await;
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!waiting.is_finished());
+        drop(guard);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(waiting.is_finished(), "the release told its waiter");
+        let claims = CLAIMS.lock().unwrap();
+        assert!(keys.iter().all(|key| !claims.contains_key(key)));
     }
 }
