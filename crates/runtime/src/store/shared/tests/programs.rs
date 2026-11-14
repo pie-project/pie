@@ -380,9 +380,9 @@ async fn a_term_past_the_largest_rung_funds_the_widest_that_fits_and_cuts_fires_
     assert_eq!(shared.lock().unwrap().fit_cap(), u32::MAX, "no term counts");
 }
 
-/// A bind that cannot be funded is refused, never sent: the planner's
-/// refusal and a refused copy both end the wait with an error, the span as
-/// it was.
+/// A bind is never sent unfunded: the planner's refusal ends the wait with
+/// an error; a raise the engine refuses is taken back and the wait holds,
+/// the span and the state as they were.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_whose_room_is_refused_fails_its_wait() {
     struct Refusing;
@@ -420,17 +420,38 @@ async fn a_bind_whose_room_is_refused_fails_its_wait() {
     assert!(error.contains("the planner refuses"));
     assert_eq!(shared.lock().unwrap().pool().act_reserved(), 4);
 
-    // Room there, the copy refused: the wait fails rather than let the
-    // bind past state still in the span.
+    // Room there, the copy refused: a refused raise, taken back. The wait
+    // holds the bind (never sent) as any waiter, the span and the state as
+    // they were, and nothing faults.
+    let kept = all[all.len() / 2..].to_vec();
     {
         let mut pool = shared.lock().unwrap();
         pool.give_records(&all[..all.len() / 2]);
         pool.pool_mut().retire_through(u64::MAX);
     }
-    let error = fund_span(&shared, || 256, &Granting, &NoCopy)
-        .await
-        .unwrap_err();
-    assert!(error.contains("the engine refuses"), "{error}");
+    let where_before: Vec<u32> = {
+        let pool = shared.lock().unwrap();
+        kept.iter()
+            .flat_map(|&record| pool.record_slots(record))
+            .map(|slot| pool.pool().physical(slot.chunk).unwrap())
+            .collect()
+    };
+    let waited = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        fund_span(&shared, || 256, &Granting, &NoCopy),
+    )
+    .await;
+    assert!(waited.is_err(), "the bind still waits");
+    let pool = shared.lock().unwrap();
+    assert_eq!(pool.pool().act_reserved(), 4, "the rung in hand");
+    assert!(pool.copying().is_none());
+    let where_after: Vec<u32> = kept
+        .iter()
+        .flat_map(|&record| pool.record_slots(record))
+        .map(|slot| pool.pool().physical(slot.chunk).unwrap())
+        .collect();
+    assert_eq!(where_after, where_before, "the state where it lay");
+    pool.pool().check();
 }
 
 /// A pool that states no rungs (Vulkan, wgpu, XLA, Metal before its span):

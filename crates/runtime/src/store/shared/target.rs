@@ -193,7 +193,7 @@ impl SharedGrow {
                     }
                 }
                 RungStep::Raise { rung, evacuation } => {
-                    if !evacuation.moves.is_empty() {
+                    if self.shared.lock().unwrap().raise_waits(&evacuation) {
                         tracing::info!(
                             engine = self.engine,
                             rung,
@@ -204,13 +204,16 @@ impl SharedGrow {
                         let copied =
                             crate::scheduler::pool(self.engine, PoolOp::Evacuate(moves)).await;
                         if let Err(error) = copied {
-                            // The pool moved the chunks and the engine did
-                            // not: no fire passes the rung held before.
-                            tracing::error!(
+                            // The engine refused the copy or its carve:
+                            // the raise is taken back, fires stay cut to
+                            // the rung in hand, and a later walk may try
+                            // again.
+                            tracing::warn!(
                                 engine = self.engine,
                                 %error,
-                                "a raise's copy was refused; the rung stays held"
+                                "a raise was refused; fires stay at the rung in hand"
                             );
+                            self.shared.lock().unwrap().raise_refused(&evacuation);
                             return;
                         }
                         let (current, _) = self.epochs();

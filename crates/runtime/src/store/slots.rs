@@ -882,6 +882,26 @@ impl SlotPool {
         Ok(())
     }
 
+    /// Takes back `evacuation`, applied with [`Self::apply_rung`] and
+    /// refused by the engine before its copy: each moved chunk goes back to
+    /// where it lay (the engine's table never changed), its fence lifts, and
+    /// the activation is `act` again, the rung in hand.
+    pub fn undo_rung(&mut self, evacuation: &RungEvacuation, act: u32) {
+        for step in evacuation.moves.iter().rev() {
+            for chunks in self.fences.values_mut() {
+                chunks.retain(|&chunk| chunk != step.from);
+            }
+            self.fenced.clear(step.from);
+            self.move_chunk(ChunkMove {
+                logical: step.logical,
+                from: step.to,
+                to: step.from,
+            });
+        }
+        self.fences.retain(|_, chunks| !chunks.is_empty());
+        self.set_act(act);
+    }
+
     /// Moves a held chunk onto free physical chunk `step.to`, as the
     /// engine's `ChunkTable::apply` does: the free logical id there takes the
     /// moved one's old place.

@@ -176,3 +176,88 @@ fn with_the_flag_off_the_span_is_backed_from_the_load_as_before() {
     );
     pool.pool().check();
 }
+
+/// A refused `commit_span` (the device has no room for the placement heap)
+/// is a refused lend: the span chunks stay closed, the rung stays where it
+/// is, and state goes below or waits as any waiter. Nothing faults; a later
+/// walk may try again.
+#[test]
+fn a_refused_commit_span_lends_nothing() {
+    let (mut pool, mut engine) = on_demand_pool();
+    assert_eq!(
+        walk_segments(&mut pool, 6, 0, &mut engine),
+        Retarget::Reached
+    );
+    pool.lower_rung(256).unwrap();
+    engine.refuse = true;
+    assert_eq!(
+        walk_segments(&mut pool, 7, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.pool().span_committed(), 0);
+    assert_eq!(pool.rung(), 256, "the rung stays");
+    assert_eq!(pool.pool().span_to_commit(), Some(1), "asked again later");
+    let all = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
+    assert!(state_chunks(&pool, &all).iter().all(|&chunk| chunk < 48));
+    pool.pool().check();
+    // The device has room again: the next walk lends it.
+    engine.refuse = false;
+    assert_eq!(
+        walk_segments(&mut pool, 7, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.pool().span_committed(), 1);
+}
+
+/// A raise whose copy the engine refuses is taken back: the state where it
+/// lay (the engine's table unchanged), the activation the rung in hand's,
+/// no fence left, and a later raise succeeds.
+#[test]
+fn a_refused_raise_is_taken_back() {
+    let (mut pool, mut engine) = on_demand_pool();
+    assert_eq!(
+        walk_segments(&mut pool, 6, 0, &mut engine),
+        Retarget::Reached
+    );
+    pool.lower_rung(256).unwrap();
+    assert_eq!(
+        walk_segments(&mut pool, 7, 0, &mut engine),
+        Retarget::Reached
+    );
+    let all = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
+    pool.give_records(&all[..all.len() / 2]);
+    pool.pool_mut().retire_through(u64::MAX);
+    let kept = &all[all.len() / 2..];
+    let before = state_chunks(&pool, kept);
+    let evacuation = pool.plan_raise(2048).unwrap();
+    assert!(!evacuation.moves.is_empty());
+    pool.raise_applied(&evacuation).unwrap();
+    assert_eq!(pool.copying(), Some(256));
+    engine.refuse = true;
+    assert!(
+        engine
+            .evacuate(&SharedPool::rung_moves(&evacuation))
+            .is_err()
+    );
+    pool.raise_refused(&evacuation);
+    assert_eq!(pool.rung(), 256, "the rung in hand");
+    assert_eq!(pool.pool().act_reserved(), 4);
+    assert!(pool.copying().is_none());
+    assert_eq!(state_chunks(&pool, kept), before, "the state where it lay");
+    assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
+    pool.pool().check();
+    // Tried again with the engine willing: it lands.
+    engine.refuse = false;
+    let evacuation = pool.plan_raise(2048).unwrap();
+    pool.raise_applied(&evacuation).unwrap();
+    engine
+        .evacuate(&SharedPool::rung_moves(&evacuation))
+        .unwrap();
+    pool.raise_copied(1);
+    assert_eq!(pool.rung(), 2048);
+    assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
+}

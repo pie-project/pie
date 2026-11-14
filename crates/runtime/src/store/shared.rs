@@ -229,7 +229,7 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
         let Ok(evacuation) = pool.plan_raise(goal) else {
             return;
         };
-        if !evacuation.moves.is_empty() || pool.apply_rung(&evacuation, 0).is_err() {
+        if pool.raise_waits(&evacuation) || pool.apply_rung(&evacuation, 0).is_err() {
             return;
         }
         tracing::info!(
@@ -569,6 +569,9 @@ pub struct SharedPool {
     /// engine's: no fire is let past the rung held before it
     /// ([`Self::raise_applied`]).
     copying: Option<u32>,
+    /// The activation set aside before the raise whose copy is the
+    /// engine's to take: what a refused raise goes back to.
+    raise_from: Option<u32>,
     /// The registered programs' fire terms ([`programs`]).
     programs: programs::ProgramFires,
 }
@@ -781,6 +784,7 @@ impl SharedPool {
             records_most: 0,
             least_chunks: 0,
             copying: None,
+            raise_from: None,
             programs: programs::ProgramFires::default(),
         };
         // Under the smallest rung state may take every chunk but the
@@ -1302,14 +1306,35 @@ impl SharedPool {
     /// held before, until the engine has the copy ([`Self::raise_copied`]).
     /// The engine's copy follows ([`Self::rung_moves`]); a raise that moves
     /// nothing needs none.
+    ///
+    /// The engine may refuse the copy ([`Self::raise_refused`]).
     pub fn raise_applied(&mut self, evacuation: &RungEvacuation) -> Result<(), RungError> {
         let before = self.pool.rung();
-        if evacuation.moves.is_empty() {
+        let act = self.pool.act_reserved();
+        if !self.raise_waits(evacuation) {
             return self.apply_rung(evacuation, 0);
         }
         self.apply_rung(evacuation, UNTIL_COPIED)?;
         self.copying = Some(self.copying.map_or(before, |held| held.min(before)));
+        self.raise_from = Some(self.raise_from.map_or(act, |held| held.min(act)));
         Ok(())
+    }
+
+    /// Whether `evacuation`'s raise goes through the engine before fires
+    /// take it: it moves state, which the engine copies first.
+    #[must_use]
+    pub fn raise_waits(&self, evacuation: &RungEvacuation) -> bool {
+        !evacuation.moves.is_empty()
+    }
+
+    /// The engine refused `evacuation`'s copy: the raise is taken back, the
+    /// state where it lay and the activation the rung in hand's. Fires stay
+    /// cut to it; a later raise may try again. Nothing faults.
+    pub fn raise_refused(&mut self, evacuation: &RungEvacuation) {
+        if let Some(act) = self.raise_from.take() {
+            self.pool.undo_rung(evacuation, act);
+        }
+        self.copying = None;
     }
 
     /// The engine has taken a raise's copy, carried by the fire at `epoch`
@@ -1318,6 +1343,7 @@ impl SharedPool {
     pub fn raise_copied(&mut self, epoch: u64) {
         self.pool.refence(UNTIL_COPIED, epoch);
         self.copying = None;
+        self.raise_from = None;
     }
 
     /// The rung fires may not pass while a raise's copy is the engine's to
