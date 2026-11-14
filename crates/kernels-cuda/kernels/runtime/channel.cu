@@ -48,8 +48,6 @@ struct PullLane {
     u32 ticket_count;
 
     u32 initial_commit;
-
-    u32 diagnose;
 };
 
 static_assert(sizeof(PullLane) == 32, "PullLane: the Rust `channel::PullLane` mirrors this layout");
@@ -88,8 +86,6 @@ struct SettleLane {
 };
 
 static_assert(sizeof(SettleLane) == 16, "SettleLane: the Rust `channel::SettleLane` mirrors this layout");
-
-extern "C" __device__ int printf(const char*, ...);
 
 __device__ __forceinline__ u64 load_system_acquire(const u64* word) {
     u64 value;
@@ -198,18 +194,6 @@ __global__ void pull_validate(
             if (ticket_holds(ticket, head, tail)) {
                 atomicOr(&held[threadIdx.x >> 5], 1u << (threadIdx.x & 31u));
             } else {
-                if (lane.diagnose != 0) {
-                    printf(
-                        "[kernels-cuda] pull-validate reject: slot=%u flags=0x%x "
-                        "head=%llu tail=%llu expected_head=%llu expected_tail=%llu cap1=%u\n",
-                        ticket.slot,
-                        static_cast<unsigned>(ticket.flags),
-                        static_cast<unsigned long long>(head),
-                        static_cast<unsigned long long>(tail),
-                        static_cast<unsigned long long>(ticket.expected_head),
-                        static_cast<unsigned long long>(ticket.expected_tail),
-                        ticket.cap1);
-                }
                 atomicOr(&vetoed, 1u);
             }
         }

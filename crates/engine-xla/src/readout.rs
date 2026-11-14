@@ -266,7 +266,13 @@ impl Kept {
         }
         let values = match plane.rows_of(rows.iter().copied())? {
             Value::F32(values) => values,
-            _ => return Ok(None),
+            other => {
+                return Err(format!(
+                    "lane {lane} reads back output `{}`, a {:?} plane; a lane's readout carries f32",
+                    plane.name,
+                    other.dtype()
+                ));
+            }
         };
         Ok(Some((plane.name.as_str(), rows.len() as u32, values)))
     }

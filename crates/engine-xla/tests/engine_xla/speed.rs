@@ -149,3 +149,133 @@ fn speed() {
         eprintln!("SPEED {name} {kind} {n}: {tps:.1} tok/s");
     }
 }
+
+/// `PIE_XLA_SERVE_PROBE=<model>`: what a server meets with the shipped
+/// config (no prewarm unless `PIE_XLA_SPEED_WARM=1`), the disk cache
+/// wherever `PIE_XLA_CACHE` names. Chat traffic in order (c1 twice, c8,
+/// c64; prompts of mixed lengths, greedy decode with a readout a step,
+/// one lane asking prompt logprobs), each fire's wall time reported where
+/// it took a compile's time; then c64's steady decode rate.
+#[test]
+fn serve_probe() {
+    let Ok(name) = std::env::var("PIE_XLA_SERVE_PROBE") else {
+        return;
+    };
+    let on = std::env::var("PIE_XLA_SPEED_WARM").as_deref() == Ok("1");
+    set("PREWARM", u32::from(on));
+    set("SLOTS", 160);
+    set("LANES", 64);
+    set("TOKENS", 512);
+    let t = Instant::now();
+    let mut model = load(&name, 1024);
+    let loaded = t.elapsed().as_secs_f64();
+    let compiled = |m: &Model| m.engine.shell().expect("loaded").device().compiled();
+    eprintln!("PROBE load {loaded:.1} s, {} program(s) held", compiled(&model));
+    let vocab = model.vocab;
+    let mut refs = Refs::of(&model);
+    let mut next = 0u32;
+    let mut spikes: Vec<(String, f64)> = Vec::new();
+    let mut fire = |model: &mut Model, what: String, lanes: Vec<engine::fire::Lane>| -> f64 {
+        let before = compiled(model);
+        let t = Instant::now();
+        model.fire(lanes);
+        let s = t.elapsed().as_secs_f64();
+        let new = compiled(model) - before;
+        if new > 0 || s > 0.5 {
+            eprintln!("PROBE {what}: {:.2} s, {new} new program(s)", s);
+            spikes.push((what, s));
+        }
+        s
+    };
+    // One request: its prompt in one fire, then `steps` decode steps.
+    let mut chat = |model: &mut Model, refs: &mut Refs, tag: &str, c: u32, prompt: u32, steps: u32| {
+        let mut seqs: Vec<Seq> = (0..c).map(|_| {
+            next += 1;
+            Seq::new(next)
+        }).collect();
+        let t = Instant::now();
+        // Prompts of `prompt` .. `prompt` + 3, in fires of at most 512 rows.
+        let len = |i: usize| prompt + (i % 4) as u32;
+        let mut first = 0f64;
+        let mut at = 0;
+        while at < seqs.len() {
+            let mut end = at;
+            let mut rows = 0;
+            while end < seqs.len() && rows + len(end) <= 512 {
+                rows += len(end);
+                end += 1;
+            }
+            let lanes: Vec<_> = (at..end)
+                .map(|i| {
+                    let seed = u64::from(seqs[i].slot) * 31;
+                    seqs[i].lane(model, refs, tokens(seed, len(i) as usize, vocab))
+                })
+                .collect();
+            first += fire(model, format!("{tag} c{c} prefill {} lanes {rows} rows", end - at), lanes);
+            for i in at..end {
+                seqs[i].held += len(i);
+            }
+            at = end;
+        }
+        let mut worst = 0f64;
+        for step in 0..steps {
+            let lanes: Vec<_> = seqs
+                .iter_mut()
+                .enumerate()
+                .map(|(i, s)| s.lane(model, refs, vec![(i as u32 * 7 + s.held) % vocab]))
+                .collect();
+            worst = worst.max(fire(model, format!("{tag} c{c} decode step {step}"), lanes));
+            for s in &mut seqs {
+                s.held += 1;
+            }
+        }
+        eprintln!(
+            "PROBE request {tag} c{c}: {:.2} s (prefill {first:.2} s, worst step {worst:.3} s)",
+            t.elapsed().as_secs_f64()
+        );
+        seqs
+    };
+    chat(&mut model, &mut refs, "first", 1, 40, 32);
+    chat(&mut model, &mut refs, "second", 1, 40, 32);
+    chat(&mut model, &mut refs, "third", 1, 300, 32);
+    chat(&mut model, &mut refs, "c8", 8, 50, 32);
+    let mut seqs = chat(&mut model, &mut refs, "c64", 64, 20, 32);
+    // One lane asking its prompt's logprobs (a readout of every row).
+    {
+        next += 1;
+        let mut s = Seq::new(next);
+        let mut lane = s.lane(&model, &mut refs, tokens(99, 24, vocab));
+        lane.readout = Readout::Rows((0..24).collect());
+        fire(&mut model, "logprobs prefill 24 rows".into(), vec![lane]);
+    }
+    // c64 steady decode, windows of 32 steps.
+    let mut rates = Vec::new();
+    for _ in 0..5 {
+        let t = Instant::now();
+        for st in 0..32 {
+            let lanes: Vec<_> = seqs
+                .iter_mut()
+                .enumerate()
+                .map(|(i, s)| {
+                    let mut l = s.lane(&model, &mut refs, vec![(i as u32 * 7 + s.held) % vocab]);
+                    if st != 31 {
+                        l.readout = Readout::None;
+                    }
+                    l
+                })
+                .collect();
+            model.fire(lanes);
+            for s in &mut seqs {
+                s.held += 1;
+            }
+        }
+        rates.push(f64::from(64 * 32) / t.elapsed().as_secs_f64());
+    }
+    let total: f64 = spikes.iter().map(|s| s.1).sum();
+    eprintln!(
+        "PROBE steady c64 decode {:.0} tok/s; {} spike(s) {total:.1} s; {} program(s) held",
+        median(&mut rates),
+        spikes.len(),
+        compiled(&model)
+    );
+}

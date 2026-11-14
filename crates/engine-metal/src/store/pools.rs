@@ -9,11 +9,11 @@ use kernels_metal::{KvPool, RecurrentPool, StateMap, Tensor};
 use poem_compiler::chunk::{ChunkRecipe, RowId, SlotLayout};
 use poem_ir::{CacheRow, Dtype, Trace};
 
-use super::layout::{FIXED, LIST, Layout, MAX_WINDOWS, RS, Slots, WINDOWS, gcd};
+use super::layout::{FIXED, LIST, Layout, MAX_WINDOWS, RS, Slots, WINDOWS};
 use super::pool::Pool;
 use super::{
-    STATE_MAP_BYTES, Seats, Spill, TableSeat, compressed_rows, elem_bytes, elem_size, narrow,
-    row_stride, split, state_dtype,
+    Seats, Spill, TableSeat, compressed_rows, elem_bytes, elem_size, narrow, row_stride, split,
+    state_dtype,
 };
 use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context, Handles};
@@ -559,6 +559,10 @@ pub struct Pools {
     /// Every state row's segment table, one after another, in the tables
     /// run.
     maps: Option<crate::inputs::Region>,
+    /// Each buffer's address less the first's, one ulong a buffer, in the
+    /// tables run, where the range spans more than one: what kernels reach
+    /// a page in another buffer by (`kv_page.h`'s `pie_fc_part_table`).
+    deltas: Option<crate::inputs::Region>,
     /// Where the next of the engine's own tables lies in the tables run
     /// (`Reserved::Tables`), and where the run ends: range byte offsets.
     table_run: (u64, u64),
@@ -674,7 +678,7 @@ impl Pools {
 
     /// The pool `layout` sizes over `rows`, kv pages of `paging`'s size.
     pub fn reserve(device: &Context, rows: Rows, layout: Layout, paging: Paging) -> Result<Pools> {
-        let pool = Pool::reserve(
+        let mut pool = Pool::reserve(
             device,
             layout.chunk_bytes,
             layout.total_chunks,
@@ -682,23 +686,22 @@ impl Pools {
             layout.act_span(),
             super::pool::part_cap(device),
         )?;
-        // A page id carries its slot in its buffer under the buffer index:
-        // a buffer may hold no more slots of a shape than those bits count.
-        if pool.parts() > 1 {
-            let room = 1u64 << super::pool::PART_SHIFT;
-            if let Some(slots) = layout
-                .shapes()
-                .find(|slots| u64::from(slots.per_chunk) * u64::from(pool.part_chunks()) >= room)
-            {
-                return Err(Fault::Residency(format!(
-                    "a buffer of {} chunks holds {} slots of {} bytes, and a page id \
-                     addresses {room} a buffer",
-                    pool.part_chunks(),
-                    u64::from(slots.per_chunk) * u64::from(pool.part_chunks()),
-                    slots.slot_bytes
-                )));
-            }
-        }
+        // A page id names its slot under its buffer index, by its slot in
+        // the buffer or by its chunk and index (`PageIds`): the paged shapes
+        // (kv list, window lists, rs list) decide which, refused by name
+        // where the bits do not hold them.
+        let paged: Vec<(u32, u64)> = layout
+            .list
+            .iter()
+            .chain(
+                (0..MAX_WINDOWS)
+                    .filter_map(|k| layout.window(k))
+                    .map(|w| &w.slots),
+            )
+            .chain(layout.rs.iter())
+            .map(|slots| (slots.per_chunk, slots.slot_bytes))
+            .collect();
+        pool.split_slots(&paged)?;
         let list_slots = layout.list.map_or(0, |list| {
             u64::from(list.per_chunk) * u64::from(layout.total_chunks)
         });
@@ -708,6 +711,7 @@ impl Pools {
                 ..paging
             },
             maps: None,
+            deltas: None,
             shape_rows: [rows.kv_rows.clone(), rows.state_rows.clone()],
             // A load without state rows still numbers each lane's seat: one
             // band of one id.
@@ -738,7 +742,39 @@ impl Pools {
             pools.pool.commit_segments(segments)?;
         }
         pools.write_maps(device)?;
+        pools.write_deltas(device)?;
         Ok(pools)
+    }
+
+    /// Writes the buffers' delta table where the range spans more than one
+    /// and pages a shape (kv list, window lists, rs list) kernels reach
+    /// through it; a state row reaches the buffers through its own map.
+    fn write_deltas(&mut self, device: &Context) -> Result<()> {
+        let paged = self.layout.list.is_some()
+            || self.layout.rs.is_some()
+            || (0..MAX_WINDOWS).any(|k| self.layout.window(k).is_some());
+        if self.pool.parts() < 2 || !paged {
+            return Ok(());
+        }
+        let words: Vec<u8> = self
+            .pool
+            .deltas()
+            .iter()
+            .flat_map(|delta| delta.to_le_bytes())
+            .collect();
+        let mut region = self.run_table(device, words.len() as u64)?;
+        region.write(0, &words)?;
+        self.deltas = Some(region);
+        Ok(())
+    }
+
+    /// The device address of the buffers' delta table, where the range
+    /// spans more than one buffer.
+    #[must_use]
+    pub fn delta_table(&self) -> Option<u64> {
+        self.deltas.as_ref().map(|region| {
+            crate::device::alloc::slab_address(region.view().slab()).wrapping_add(region.at(0))
+        })
     }
 
     /// Writes each state row's segment table: the bank is the whole pool,
@@ -776,12 +812,9 @@ impl Pools {
                 },
                 piece_atoms,
                 pieces: pieces.max(1),
-                bases: (0..super::pool::MAX_PARTS)
-                    .map(|at| {
-                        let deltas = self.pool.deltas();
-                        deltas[at.min(deltas.len() - 1)]
-                    })
-                    .collect::<Vec<_>>()
+                bases: self
+                    .pool
+                    .deltas()
                     .iter()
                     .map(|&delta| {
                         (((delta as i64) / element as i64) as u64).wrapping_add(offset / element)
@@ -799,11 +832,21 @@ impl Pools {
         Ok(())
     }
 
-    /// The tables run's bytes the state maps of `state_rows` state rows
-    /// take: what a load counts into the run before it lays it.
+    /// The tables run's bytes the state maps of `state_rows` state rows and
+    /// the buffers' delta table take where the range spans at most `parts`
+    /// buffers: what a load counts into the run before it lays it.
     #[must_use]
-    pub fn map_bytes(state_rows: usize) -> u64 {
-        crate::arena::room(state_rows as u64 * STATE_MAP_BYTES)
+    pub fn map_bytes(state_rows: usize, parts: usize) -> u64 {
+        let maps = match state_rows {
+            0 => 0,
+            rows => crate::arena::room(rows as u64 * super::state_map_bytes(parts)),
+        };
+        let deltas = if parts > 1 {
+            crate::arena::room(parts as u64 * 8)
+        } else {
+            0
+        };
+        maps + deltas
     }
 
     /// `bytes` of the tables run (`Reserved::Tables`), zeroed and written
@@ -867,11 +910,10 @@ impl Pools {
     }
 
     /// A lane's rs-list pages as kernels address them, in token order from
-    /// the verb's base: `refs` (rs-list slot refs) as units of
-    /// [`Layout::rs_stride`], or, seat-addressed, seat `seat`'s run.
+    /// the verb's base: `refs` (rs-list slot refs) as page ids
+    /// ([`super::pool::PageIds`]), or, seat-addressed, seat `seat`'s run.
     pub fn rs_pages(&self, refs: &[u32], seat: Option<u32>) -> Result<Vec<u32>> {
         let rs = *self.shape(RS)?;
-        let stride = self.layout.rs_stride();
         refs.iter()
             .enumerate()
             .map(|(at, &r)| {
@@ -882,10 +924,9 @@ impl Pools {
                     }
                     None => r,
                 };
-                let offset = self.slot_offset(RS, slot)?;
-                self.pool
-                    .admit(u32::try_from(offset / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
-                Ok(self.pool.page_id(offset, stride))
+                let physical = self.physical(RS, slot)?;
+                self.pool.admit(physical / rs.per_chunk.max(1))?;
+                Ok(self.pool.slot_page(physical, rs.per_chunk))
             })
             .collect()
     }
@@ -1181,18 +1222,18 @@ impl Pools {
             .unwrap_or(0)
     }
 
-    /// What window list `k`'s page id counts: `gcd(chunk, window slot)`
-    /// bytes.
+    /// A window list `k` page's bytes: what its page id steps by in a
+    /// chunk ([`super::pool::PageIds`]).
     fn window_stride(&self, k: usize) -> u64 {
-        self.layout.window(k).map_or(256, |window| {
-            gcd(self.layout.chunk_bytes, window.slots.slot_bytes)
-        })
+        self.layout
+            .window(k)
+            .map_or(0, |window| window.slots.slot_bytes)
     }
 
     /// A lane's pages of window list `k` as kernels address them, one a
     /// window slot (`T_w` tokens) in token order: `refs` (window slot refs,
-    /// 0 a slot trimmed behind the window: the null chunk) as units of
-    /// [`Pools::window_stride`], or, seat-addressed, seat `seat`'s run,
+    /// 0 a slot trimmed behind the window: the null chunk) as page ids
+    /// ([`super::pool::PageIds`]), or, seat-addressed, seat `seat`'s run,
     /// `pages` of them.
     pub fn window_pages(
         &self,
@@ -1202,15 +1243,13 @@ impl Pools {
     ) -> Result<Vec<u32>> {
         let id = WINDOWS[k.min(MAX_WINDOWS - 1)];
         let window = *self.shape(id)?;
-        let stride = self.window_stride(k);
         let unit = |slot: u32| -> Result<u32> {
             if slot == 0 {
                 return Ok(0);
             }
-            let at = self.slot_offset(id, slot)?;
-            self.pool
-                .admit(u32::try_from(at / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
-            Ok(self.pool.page_id(at, stride))
+            let physical = self.physical(id, slot)?;
+            self.pool.admit(physical / window.per_chunk.max(1))?;
+            Ok(self.pool.slot_page(physical, window.per_chunk))
         };
         if let Some((slot, pages)) = seat
             && refs.is_empty()
@@ -1431,6 +1470,20 @@ impl Pools {
         self.pool.deltas()
     }
 
+    /// How a page id names its slot ([`super::pool::PageIds`]).
+    #[must_use]
+    pub fn page_ids(&self) -> super::pool::PageIds {
+        self.pool.page_ids()
+    }
+
+    /// Each of the range's buffers, the first first.
+    #[must_use]
+    pub fn part_views(&self) -> Vec<Buffer> {
+        (0..self.pool.parts())
+            .map(|at| self.pool.part_view(at).clone())
+            .collect()
+    }
+
     /// The buffer the activation span lies in (the last), where in it the
     /// span starts, and its bytes.
     #[must_use]
@@ -1638,11 +1691,11 @@ impl Pools {
                     let segments = Tensor::new(
                         handles.bind(
                             maps.view(),
-                            maps.at(state_row * STATE_MAP_BYTES),
-                            STATE_MAP_BYTES,
+                            maps.at(state_row * super::state_map_bytes(self.pool.parts())),
+                            super::state_map_bytes(self.pool.parts()),
                         )?,
                         1,
-                        (StateMap::HEAD + super::pool::MAX_PARTS) as u32,
+                        (StateMap::HEAD + self.pool.parts()) as u32,
                         Dtype::U64,
                     );
                     state_row += 1;
@@ -1936,30 +1989,20 @@ impl Pools {
         Ok(Spill::slots(self.disk.as_ref()))
     }
 
-    /// Checks what a fire touches is committed: `demand`'s kv pages and
-    /// state slots are one past the highest physical page and slot it
-    /// names. An unmapped tile read by a kernel faults the whole queue.
-    pub fn admit(&self, demand: engine::frame::Demand) -> Result<()> {
-        if demand.workspace > 0 {
-            return Err(Fault::Ceiling {
-                what: "pool workspace bytes",
-                need: demand.workspace,
-                have: 0,
-            });
+    /// Checks the chunk kv list page id `id` names backed.
+    pub fn admit_list_page(&self, id: u32) -> Result<()> {
+        let list = *self.shape(LIST)?;
+        self.pool
+            .admit(self.pool.page_slot(id, list.per_chunk) / list.per_chunk.max(1))
+    }
+
+    /// Checks the chunk physical fixed slot `slot` lies in backed, where
+    /// the pool holds state.
+    pub fn admit_state_slot(&self, slot: u32) -> Result<()> {
+        match self.layout.fixed {
+            Some(fixed) if self.has_state() => self.pool.admit(slot / fixed.per_chunk.max(1)),
+            _ => Ok(()),
         }
-        if demand.kv_pages > 0
-            && let Some(list) = self.layout.list
-        {
-            self.pool.admit((demand.kv_pages - 1) / list.per_chunk)?;
-        }
-        if demand.state_slots > 0
-            && self.has_state()
-            && let Some(fixed) = self.layout.fixed
-        {
-            self.pool
-                .admit((demand.state_slots - 1) / fixed.per_chunk)?;
-        }
-        Ok(())
     }
 
     /// Backs the pool's first `segments` segments.
@@ -1972,27 +2015,6 @@ impl Pools {
     pub fn commit_seats(&mut self) -> Result<()> {
         let chunks = self.layout.free_chunk();
         let segments = chunks
-            .div_ceil(self.layout.segment_chunks.max(1))
-            .min(self.pool.segments());
-        self.pool.commit_segments(segments)
-    }
-
-    /// Backs every segment up to the highest physical page and slot
-    /// `demand` names (one past each, as [`Pools::admit`] reads them).
-    pub fn commit_for(&mut self, demand: engine::frame::Demand) -> Result<()> {
-        let mut chunk = 0u32;
-        if demand.kv_pages > 0
-            && let Some(list) = self.layout.list
-        {
-            chunk = chunk.max((demand.kv_pages - 1) / list.per_chunk);
-        }
-        if demand.state_slots > 0
-            && self.has_state()
-            && let Some(fixed) = self.layout.fixed
-        {
-            chunk = chunk.max((demand.state_slots - 1) / fixed.per_chunk);
-        }
-        let segments = (chunk + 1)
             .div_ceil(self.layout.segment_chunks.max(1))
             .min(self.pool.segments());
         self.pool.commit_segments(segments)

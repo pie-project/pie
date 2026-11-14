@@ -111,6 +111,16 @@ pub fn forward(
             if !matches!(bits.dtype, Dtype::U8 | Dtype::Bool) || bits.elements() == 0 {
                 return Err(refuse(OP, "a custom mask's bits are u8"));
             }
+            // A key's bit is `8 · byte + offset`, an i32.
+            if bits.elements() > u64::from(i32::MAX as u32 / 8) {
+                return Err(refuse(
+                    OP,
+                    format!(
+                        "a {}-byte custom mask passes the 2^31 bits a fire indexes",
+                        bits.elements()
+                    ),
+                ));
+            }
             if indptr.dtype != Dtype::I32 || indptr.elements() < entries {
                 return Err(refuse(
                     OP,

@@ -32,6 +32,8 @@ pub struct Pool<B: Backend> {
     chunk_bytes: u64,
     total_chunks: u32,
     segment_chunks: u32,
+    /// The u32 words of one whole segment, as kernels are told it.
+    segment_words: u32,
     /// The activation span's chunks, the top ones.
     span: u32,
     /// The first segment holding a chunk of the span (the segment count
@@ -59,6 +61,18 @@ pub fn segment_chunks(chunk_bytes: u64, total_chunks: u32, binding: u64, span: u
     };
     let least = total_chunks.div_ceil(fits);
     (most > 0 && least <= most).then(|| total_chunks.div_ceil(most))
+}
+
+/// The u32 words of a segment of `segment_chunks` chunks of `chunk_bytes`,
+/// which every kernel reading the pool is told: a segment too long for the
+/// count is refused at the load, never stated short.
+fn segment_words(chunk_bytes: u64, segment_chunks: u32) -> Result<u32> {
+    let words = u64::from(segment_chunks) * chunk_bytes / 4;
+    u32::try_from(words).map_err(|_| Fault::Ceiling {
+        what: "words of one segment of the state pool (a kernel is told a segment in u32 words)",
+        need: words,
+        have: u64::from(u32::MAX),
+    })
 }
 
 impl<B: Backend> Pool<B> {
@@ -110,6 +124,7 @@ impl<B: Backend> Pool<B> {
             chunk_bytes,
             total_chunks,
             segment_chunks,
+            segment_words: segment_words(chunk_bytes, segment_chunks)?,
             span,
             top: if span == 0 {
                 segments
@@ -248,10 +263,9 @@ impl<B: Backend> Pool<B> {
                 bufs[at] = handles.bind(buffer, 0, buffer.bytes())?;
             }
         }
-        let words = u64::from(self.segment_chunks) * self.chunk_bytes / 4;
         Ok(Segments {
             bufs,
-            words: u32::try_from(words).unwrap_or(u32::MAX),
+            words: self.segment_words,
         })
     }
 
@@ -386,7 +400,25 @@ impl<B: Backend> Pool<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::segment_chunks;
+    use super::{segment_chunks, segment_words};
+    use crate::error::Fault;
+
+    /// A segment's length in words is stated whole or the load is refused:
+    /// 16 GiB is one word past what a u32 counts.
+    #[test]
+    fn a_segment_past_u32_words_is_refused() {
+        let chunk = 4 << 20;
+        assert_eq!(segment_words(chunk, 1).ok(), Some(1 << 20));
+        assert_eq!(segment_words(chunk, 4095).ok(), Some(4095 << 20));
+        let refused = segment_words(chunk, 4096).expect_err("2^32 words");
+        assert!(
+            matches!(
+                refused,
+                Fault::Ceiling { need, have, .. } if need == 1 << 32 && have == u64::from(u32::MAX)
+            ),
+            "{refused}"
+        );
+    }
 
     /// The last segment holds the span whole, no segment passes a binding,
     /// and the kernels bind four at most.

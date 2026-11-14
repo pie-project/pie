@@ -35,14 +35,15 @@ use crate::error::{Fault, Result};
 /// Bytes a segment aims at: four 16 MiB placement heaps.
 pub const SEGMENT_BYTES: u64 = 64 << 20;
 
-/// The most buffers a pool's range spans: a kv page id carries its
-/// buffer in the two bits over [`PART_SHIFT`] ([`Pool::page_id`]).
-pub const MAX_PARTS: usize = 4;
-
-/// The bits of a kv page id under its buffer index: 29, so an id in the
-/// last buffer stays under `i32::MAX`, as the page tables kernels read
-/// hold it (`kv_page.h`'s `pie_page_at` decodes the same split).
-pub const PART_SHIFT: u32 = 29;
+/// The bits of a page id under its buffer index where the range spans
+/// `parts` buffers: the buffer takes the bits that count them under the
+/// sign bit, so every id stays a non-negative `int`, as the page tables
+/// kernels read hold it (`kv_page.h`'s `pie_page_at` decodes the same split
+/// with this as a load constant).
+#[must_use]
+pub const fn part_shift(parts: u32) -> u32 {
+    31 - bits_for(parts)
+}
 
 thread_local! {
     /// A cap on each buffer's bytes below the device's own, for tests that
@@ -103,6 +104,62 @@ pub struct Pool {
     /// The span's segments from the top the runtime committed for state.
     span: u32,
     table: ChunkTable,
+    /// How a page id splits its slot ([`Pool::split_slots`]): `None` where
+    /// every paged shape's slots tile a chunk, so an id is its slot in its
+    /// buffer; else the bits of a slot's index in its chunk, the chunk in
+    /// its buffer over them.
+    slot_shift: Option<u32>,
+    /// The bits of a page id under its buffer index ([`part_shift`]).
+    part_shift: u32,
+}
+
+/// The low `bits` bits of a word.
+const fn low_bits(bits: u32) -> u32 {
+    if bits >= 32 {
+        u32::MAX
+    } else {
+        (1 << bits) - 1
+    }
+}
+
+/// The bits that count `n` values `0 .. n`.
+const fn bits_for(n: u32) -> u32 {
+    if n <= 1 {
+        0
+    } else {
+        32 - (n - 1).leading_zeros()
+    }
+}
+
+/// How a page id names a slot, as kernels resolve it (`kv_page.h`'s
+/// `pie_page_at`) and the host does ([`PageIds::place`]): its buffer in the
+/// bits over `part_shift` ([`part_shift`]); under them its slot in that
+/// buffer, or, where a
+/// paged shape's slots do not tile a chunk, the chunk in the buffer over
+/// `shift` bits and the slot's index in that chunk under them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageIds {
+    pub shift: Option<u32>,
+    pub chunk_bytes: u64,
+    pub part_shift: u32,
+}
+
+impl PageIds {
+    /// The buffer page id `id` of a shape of `per_chunk` slots of
+    /// `slot_bytes` a chunk lies in, and its first byte in that buffer.
+    #[must_use]
+    pub fn place(&self, id: u32, per_chunk: u32, slot_bytes: u64) -> (usize, u64) {
+        let part = id.checked_shr(self.part_shift).unwrap_or(0) as usize;
+        let local = id & low_bits(self.part_shift);
+        let (chunk, index) = match self.shift {
+            None => (local / per_chunk.max(1), local % per_chunk.max(1)),
+            Some(shift) => (local >> shift, local & ((1 << shift) - 1)),
+        };
+        (
+            part,
+            u64::from(chunk) * self.chunk_bytes + u64::from(index) * slot_bytes,
+        )
+    }
 }
 
 /// The chunks a segment of `chunk_bytes` chunks holds: as many as fill
@@ -133,6 +190,26 @@ pub fn top_first(total: u32, segment_chunks: u32, act: u32) -> u32 {
     }
     let start = total.saturating_sub(act);
     start / segment_chunks.max(1) * segment_chunks.max(1)
+}
+
+/// The bytes a range of `total_chunks` chunks of `chunk_bytes` maps at
+/// most over buffers of `per` chunks: each buffer maps whole tiles of its
+/// own length (`elastic::TILE`), so a buffer whose chunks do not end on a
+/// tile maps past its share of the range. The budget the buffers draw on
+/// and the load's admission count this, not the range's bytes.
+#[must_use]
+pub fn mapped_bytes(chunk_bytes: u64, total_chunks: u32, per: u32) -> u64 {
+    #[cfg(target_vendor = "apple")]
+    let tile = elastic::TILE;
+    #[cfg(not(target_vendor = "apple"))]
+    let tile = 1u64;
+    let per = per.max(1);
+    (0..total_chunks.div_ceil(per))
+        .map(|at| {
+            let chunks = per.min(total_chunks - at * per);
+            (u64::from(chunks) * chunk_bytes).next_multiple_of(tile)
+        })
+        .sum()
 }
 
 /// The chunks each part but the last holds when one buffer binds at most
@@ -173,12 +250,6 @@ impl Pool {
         }
         let per = part_chunks(part_cap, chunk_bytes, segment_chunks);
         let parts = total_chunks.div_ceil(per);
-        if parts as usize > MAX_PARTS {
-            return Err(Fault::Residency(format!(
-                "the pool's {total_chunks} chunks of {chunk_bytes} bytes take {parts} buffers \
-                 of at most {part_cap} bytes, and a kv page id names one of {MAX_PARTS}"
-            )));
-        }
         let last = (parts - 1) * per;
         if act > 0 && top_first(total_chunks, segment_chunks, act) < last {
             return Err(Fault::Residency(format!(
@@ -191,8 +262,11 @@ impl Pool {
         #[cfg(target_vendor = "apple")]
         {
             let sparse = device.sparse()?;
-            let bytes = chunk_bytes.saturating_mul(u64::from(total_chunks));
-            let arena = elastic::Arena::new(elastic::pages_up(bytes));
+            let arena = elastic::Arena::new(elastic::pages_up(mapped_bytes(
+                chunk_bytes,
+                total_chunks,
+                per,
+            )));
             let mut built = Vec::with_capacity(parts as usize);
             for at in 0..parts {
                 let first = at * per;
@@ -221,6 +295,8 @@ impl Pool {
                 carve: 0,
                 span: 0,
                 table: ChunkTable::identity(total_chunks),
+                slot_shift: None,
+                part_shift: part_shift(parts),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -293,44 +369,97 @@ impl Pool {
         &self.parts[at].view
     }
 
-    /// The id a kernel addresses the `unit`-byte page at byte `offset` of
-    /// the range by: its buffer in the top bits, its unit in that buffer
-    /// under them.
-    #[must_use]
-    pub fn page_id(&self, offset: u64, unit: u64) -> u32 {
-        let (at, local) = self.locate(offset);
-        let id = u32::try_from(local / unit.max(1)).unwrap_or(u32::MAX);
-        if self.parts.len() == 1 {
-            return id;
+    /// Splits page ids for the paged shapes `paged` (each's slots a chunk
+    /// and bytes a slot): where every one's slots tile a chunk, an id is its
+    /// slot in its buffer; else its chunk in the buffer over the bits of the
+    /// widest shape's index in a chunk ([`PageIds`]). Refused by name where
+    /// the buffer's chunks and a chunk's slots pass the bits under the
+    /// buffer index.
+    pub fn split_slots(&mut self, paged: &[(u32, u64)]) -> Result<()> {
+        let chunks = self.parts.iter().map(|part| part.chunks).max().unwrap_or(0);
+        let room = 1u64 << self.part_shift;
+        if paged
+            .iter()
+            .all(|&(_, bytes)| bytes > 0 && self.chunk_bytes.is_multiple_of(bytes))
+        {
+            if let Some(&(per, bytes)) = paged
+                .iter()
+                .find(|&&(per, _)| u64::from(per) * u64::from(chunks) >= room)
+            {
+                return Err(Fault::Residency(format!(
+                    "a buffer of {chunks} chunks holds {} slots of {bytes} bytes, and a page \
+                     id names {room} slots a buffer",
+                    u64::from(per) * u64::from(chunks)
+                )));
+            }
+            self.slot_shift = None;
+            return Ok(());
         }
-        ((at as u32) << PART_SHIFT) | id
+        let widest = paged.iter().map(|&(per, _)| per).max().unwrap_or(1);
+        let shift = bits_for(widest);
+        if shift + bits_for(chunks) > self.part_shift {
+            return Err(Fault::Residency(format!(
+                "a page id names a slot by its chunk in its buffer ({chunks} chunks, {} bits) \
+                 and its index in the chunk ({widest} slots, {shift} bits), and holds \
+                 {} bits under its buffer ({} buffers)",
+                bits_for(chunks),
+                self.part_shift,
+                self.parts.len()
+            )));
+        }
+        self.slot_shift = Some(shift);
+        Ok(())
+    }
+
+    /// How page ids name slots ([`PageIds`]).
+    #[must_use]
+    pub fn page_ids(&self) -> PageIds {
+        PageIds {
+            shift: self.slot_shift,
+            chunk_bytes: self.chunk_bytes,
+            part_shift: self.part_shift,
+        }
     }
 
     /// The id a kernel addresses physical slot `slot` of a shape with
-    /// `per_chunk` slots a chunk by, where a page is one slot: its buffer in
-    /// the top bits, its slot in that buffer under them.
+    /// `per_chunk` slots a chunk by, where a page is one slot
+    /// ([`PageIds`]): its buffer in the top bits, its slot in that buffer
+    /// under them, or its chunk in the buffer and index in the chunk.
     #[must_use]
     pub fn slot_page(&self, slot: u32, per_chunk: u32) -> u32 {
-        let chunk = slot / per_chunk.max(1);
+        let per = per_chunk.max(1);
+        let chunk = slot / per;
         let at = ((chunk / self.part_chunks.max(1)) as usize).min(self.parts.len() - 1);
-        let id = slot - self.parts[at].first * per_chunk;
+        let local_chunk = chunk - self.parts[at].first;
+        let id = match self.slot_shift {
+            None => slot - self.parts[at].first * per,
+            Some(shift) => (local_chunk << shift) | (slot % per),
+        };
         if self.parts.len() == 1 {
             return id;
         }
-        ((at as u32) << PART_SHIFT) | id
+        ((at as u32) << self.part_shift) | id
+    }
+
+    /// The bits of a page id under its buffer index ([`part_shift`]).
+    #[must_use]
+    pub fn part_shift(&self) -> u32 {
+        self.part_shift
     }
 
     /// The physical slot a kernel's page id ([`Pool::slot_page`]) names.
     #[must_use]
     pub fn page_slot(&self, id: u32, per_chunk: u32) -> u32 {
-        if self.parts.len() == 1 {
-            return id;
-        }
-        let at = (id >> PART_SHIFT) as usize;
-        let local = id & ((1 << PART_SHIFT) - 1);
+        let per = per_chunk.max(1);
+        let at = id.checked_shr(self.part_shift).unwrap_or(0) as usize;
+        let local = id & low_bits(self.part_shift);
+        let (chunk, index) = match self.slot_shift {
+            None => (local / per, local % per),
+            Some(shift) => (local >> shift, local & ((1 << shift) - 1)),
+        };
         self.parts
             .get(at)
-            .map_or(u32::MAX, |part| part.first * per_chunk + local)
+            .map_or(u32::MAX, |part| (part.first + chunk) * per + index)
     }
 
     /// Each buffer's address less the first's, in bytes (wrapping): what a
@@ -910,7 +1039,7 @@ impl Pool {
 
 #[cfg(all(test, target_vendor = "apple"))]
 mod tests {
-    use super::{PART_SHIFT, Pool, top_first};
+    use super::{Pool, part_shift, top_first};
     use crate::device::Context;
 
     const CHUNK: u64 = 16 << 20;
@@ -1002,6 +1131,48 @@ mod tests {
         assert_eq!(seen, [6u8; 64]);
     }
 
+    /// Buffers whose chunks do not end on a tile each map past their share
+    /// of the range: the budget counts what they map, so backing every
+    /// segment of ten one-segment buffers and the span's segment for state
+    /// fits (it was refused by the heap budget, a range's bytes rounded once).
+    #[test]
+    fn every_segment_of_many_buffers_backs_under_the_budget() {
+        let device = Context::bind().expect("a device");
+        let chunk = 1_092_608u64;
+        let seg = 61u32;
+        let total = 10 * seg;
+        let mut pool =
+            Pool::reserve(&device, chunk, total, seg, 3, u64::from(seg) * chunk).expect("a pool");
+        assert_eq!(pool.parts(), 10);
+        assert!(
+            super::mapped_bytes(chunk, total, seg) > chunk * u64::from(total),
+            "the buffers map past the range's bytes"
+        );
+        pool.cover(3 * chunk).expect("the carve");
+        pool.commit_segments(9)
+            .expect("every segment under the span's");
+        pool.commit_span(1).expect("the span's segment backs state");
+    }
+
+    /// The buffer index takes the bits that count the buffers under the
+    /// sign bit: as many buffers as the range takes, none fixed.
+    #[test]
+    fn a_page_ids_buffer_bits_count_the_buffers() {
+        assert_eq!(part_shift(1), 31);
+        assert_eq!(part_shift(2), 30);
+        assert_eq!(part_shift(4), 29);
+        assert_eq!(part_shift(5), 28);
+        assert_eq!(part_shift(300), 22);
+        let device = Context::bind().expect("a device");
+        // 40 chunks, buffers of 4: ten, past any fixed four.
+        let pool = Pool::reserve(&device, CHUNK, 40, 4, 3, 4 * CHUNK).expect("a pool");
+        assert_eq!(pool.parts(), 10);
+        assert_eq!(pool.part_shift(), 27);
+        assert_eq!(pool.slot_page(37 * 8 + 5, 8), (9 << 27) | 13);
+        assert_eq!(pool.page_slot((9 << 27) | 13, 8), 37 * 8 + 5);
+        assert_eq!(pool.deltas().len(), 10);
+    }
+
     #[test]
     fn a_range_past_one_buffer_spans_several_under_one_budget() {
         let device = Context::bind().expect("a device");
@@ -1011,11 +1182,29 @@ mod tests {
         assert_eq!(pool.part_chunks(), 4);
         assert_eq!(pool.locate(5 * CHUNK + 7), (1, CHUNK + 7));
         assert_eq!(pool.locate(11 * CHUNK), (2, 3 * CHUNK));
+        // Three buffers: their index in the two bits under the sign bit.
+        let ps = pool.part_shift();
+        assert_eq!(ps, 29);
+        // Slots that tile a chunk: an id is the slot in its buffer.
+        pool.split_slots(&[(8, CHUNK / 8)]).expect("whole slots");
+        assert_eq!(pool.slot_page(5 * 8 + 3, 8), (1 << ps) | 11);
+        assert_eq!(pool.page_slot((1 << ps) | 11, 8), 5 * 8 + 3);
+        // Slots that do not (3 of CHUNK / 3 + 64 bytes a chunk): an id is
+        // the chunk in its buffer over two bits of index.
+        let odd = CHUNK / 3 + 64;
+        pool.split_slots(&[(8, CHUNK / 8), (3, odd)])
+            .expect("split slots");
+        assert_eq!(pool.page_ids().shift, Some(3));
+        let id = pool.slot_page(9 * 3 + 2, 3);
+        assert_eq!(id, (2 << ps) | (1 << 3) | 2);
+        assert_eq!(pool.page_slot(id, 3), 9 * 3 + 2);
+        assert_eq!(pool.page_ids().place(id, 3, odd), (2, CHUNK + 2 * odd));
+        let id = pool.slot_page(5 * 8 + 3, 8);
+        assert_eq!(id, (1 << ps) | (1 << 3) | 3);
         assert_eq!(
-            pool.page_id(9 * CHUNK + 2 * 4096, 4096),
-            (2 << PART_SHIFT) | 4098
+            pool.page_ids().place(id, 8, CHUNK / 8),
+            (1, CHUNK + 3 * (CHUNK / 8))
         );
-        assert_eq!(pool.slot_page(5 * 8 + 3, 8), (1 << PART_SHIFT) | 11);
         assert_eq!(pool.deltas().len(), 3);
         assert_eq!(pool.deltas()[0], 0);
         // The bottom grows across buffers under the one budget.
@@ -1043,7 +1232,12 @@ mod tests {
         assert_eq!(pool.held_bytes(), 12 * CHUNK);
         // A span that reaches under the last buffer is refused.
         assert!(Pool::reserve(&device, CHUNK, 9, 4, 3, 4 * CHUNK).is_err());
-        // More buffers than a page id names is refused.
-        assert!(Pool::reserve(&device, CHUNK, 20, 4, 0, 4 * CHUNK).is_err());
+        // Past four buffers: as many as the range takes.
+        assert_eq!(
+            Pool::reserve(&device, CHUNK, 20, 4, 0, 4 * CHUNK)
+                .expect("five buffers")
+                .parts(),
+            5
+        );
     }
 }

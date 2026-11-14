@@ -103,7 +103,7 @@ METAL_FUNC void ptq1_0_qmv_impl(
   const int out_row = int(tid.y) * (num_simdgroups * results_per_simdgroup) +
       int(simd_gid) * results_per_simdgroup;
 
-  const device Ti* x_vec = x + int(tid.x) * in_vec_size;
+  const device Ti* x_vec = x + long(tid.x) * in_vec_size;
 
   float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -114,12 +114,12 @@ METAL_FUNC void ptq1_0_qmv_impl(
       if (r >= out_vec_size) {
         continue;
       }
-      const device uint8_t* blk = w + r * row_bytes + bk * PTQ1_0_BLOCK_BYTES;
+      const device uint8_t* blk = w + long(r) * row_bytes + bk * PTQ1_0_BLOCK_BYTES;
       result[row] += ptq1_0_block_dot<Ti>(blk, xblk);
     }
   }
 
-  device To* y_vec = y + int(tid.x) * out_vec_size + out_row;
+  device To* y_vec = y + long(tid.x) * out_vec_size + out_row;
   for (int row = 0; row < results_per_simdgroup; row++) {
     float v = simd_sum(result[row]);
     if (simd_lid == 0 && out_row + row < out_vec_size) {

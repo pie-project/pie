@@ -716,6 +716,11 @@ impl Frame {
         group: &wgpu::BindGroup,
         groups: [u32; 3],
     ) -> Result<()> {
+        let groups = engine_gpu::workgroups(
+            label,
+            groups,
+            [self.inner.core.limits.max_compute_workgroups_per_dimension; 3],
+        )?;
         let mut pass = self.inner.pass.lock().expect("pass lock poisoned");
         if pass.is_none() {
             let mut guard = self.inner.encoder.lock().expect("encoder lock poisoned");
@@ -733,10 +738,9 @@ impl Frame {
             );
         }
         let pass = pass.as_mut().expect("just opened");
-        let _ = label;
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, group, &[]);
-        pass.dispatch_workgroups(groups[0].max(1), groups[1].max(1), groups[2].max(1));
+        pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
         Ok(())
     }
 

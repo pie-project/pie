@@ -99,6 +99,21 @@ pub trait Serve: Backend {
     /// The highest tier the device runs.
     fn tier(device: &Self::Context) -> kernels_slang::Tier;
 
+    /// Holds the kernels the backend can name from `trace` before any
+    /// fire to what `device` binds, before the load reserves anything: one
+    /// the device cannot bind refuses the load by name here, not at the
+    /// fire that first builds it, and what `tuning` picks between two
+    /// forms of a fire is settled by what binds. A device that binds every
+    /// kernel its build carries holds nothing.
+    fn admit(
+        _device: &Self::Context,
+        _tuning: &mut Self::Tuning,
+        _tier: kernels_slang::Tier,
+        _trace: &Trace,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// The pipelines compiled so far.
     fn compiled(pipelines: &Self::Pipelines) -> u64;
 
@@ -663,16 +678,17 @@ pub struct Shell<B: Serve> {
 impl<B: Serve> Shell<B> {
     pub fn load(boot: Boot<'_, B>) -> Result<Shell<B>> {
         let mut boot = boot;
-        let (device, tuning) = B::open(boot.device, boot.residency.device, boot.handed.take())?;
+        let (device, mut tuning) = B::open(boot.device, boot.residency.device, boot.handed.take())?;
         let tier = B::tier(&device);
-        let chip = tuning.profile();
         let mut boot = Boot {
             trace: poem_compiler::fuse::fuse(
                 boot.trace,
-                poem_compiler::fuse::flags::on(chip, B::FUSIONS),
+                poem_compiler::fuse::flags::on(tuning.profile(), B::FUSIONS),
             ),
             ..boot
         };
+        B::admit(&device, &mut tuning, tier, &boot.trace)?;
+        let chip = tuning.profile();
         let weights_held = boot.residency.weights_held;
         let kv_budget = boot.residency.device_kv_budget;
         let host_kv_budget = boot.residency.host_kv_budget;
@@ -2705,6 +2721,8 @@ impl<B: Serve> Shell<B> {
                 Some(run) if plan.commit == 0 => self.pools.record(Some(run), seat_slot)?,
                 _ => record.clone(),
             };
+            // The record as the slot tables state it, once a lane.
+            let state = crate::store::slot_entries(&state)?;
             let fresh = match seated.rs_reset {
                 engine::fire::RsReset::Inferred => have == 0,
                 engine::fire::RsReset::Fresh => true,
@@ -2812,7 +2830,7 @@ impl<B: Serve> Shell<B> {
                 adapter_routes.extend(std::iter::repeat_n(id, row.rows as usize));
             }
 
-            slot_ids.extend(state.iter().map(|&unit| unit as i32));
+            slot_ids.extend_from_slice(&state);
             {
                 const MAX: usize = kernels_slang::ssm::RS_SNAPSHOTS as usize;
                 let snaps = seated.rs_snapshots;
@@ -2860,7 +2878,7 @@ impl<B: Serve> Shell<B> {
                     }
                     entry[n] = narrow(u64::from(snap.row));
                     for (p, &unit) in units.iter().enumerate() {
-                        entry[MAX + n * pieces + p] = unit as i32;
+                        entry[MAX + n * pieces + p] = crate::store::slot_entry(unit)?;
                         snap_units = snap_units.max(unit.saturating_add(1));
                     }
                 }
@@ -2912,7 +2930,7 @@ impl<B: Serve> Shell<B> {
                         positions.push(if self.states_mrope { row } else { stated });
                         rotations.push(stated);
                         request_of_token.push(at_lane);
-                        slot_of_row.extend(state.iter().map(|&unit| unit as i32));
+                        slot_of_row.extend_from_slice(&state);
                     }
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }

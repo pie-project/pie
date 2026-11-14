@@ -289,6 +289,12 @@ impl Sink<'_> {
             .map_err(|fault| Sink::refuse(fire, fault))?;
         let core = self.device.core();
         let limits = &core.limits;
+        let groups = engine_gpu::workgroups(
+            name,
+            fire.groups,
+            [limits.max_compute_workgroups_per_dimension; 3],
+        )
+        .map_err(|fault| Sink::refuse(fire, fault))?;
         let storage_align = u64::from(limits.min_storage_buffer_offset_alignment);
         let max_binding = limits.max_storage_buffer_binding_size;
 
@@ -529,16 +535,12 @@ impl Sink<'_> {
                     });
                     pass.set_pipeline(&pipeline.pipeline);
                     pass.set_bind_group(0, &group, &[]);
-                    pass.dispatch_workgroups(
-                        fire.groups[0].max(1),
-                        fire.groups[1].max(1),
-                        fire.groups[2].max(1),
-                    );
+                    pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
                 })
                 .map_err(|fault| Sink::refuse(fire, fault))?;
         } else {
             self.frame
-                .dispatch(name, &pipeline.pipeline, &group, fire.groups)
+                .dispatch(name, &pipeline.pipeline, &group, groups)
                 .map_err(|fault| Sink::refuse(fire, fault))?;
         }
         if !staged.is_empty() {

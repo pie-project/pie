@@ -30,6 +30,49 @@ struct Record {
     /// Bytes the engine holds outside the pool's cache rows for fires and
     /// bodies (arming's scratch among them), lowered after the last step.
     held: AtomicU64,
+    /// Counts of [`Tally`] events since load, in its order.
+    tallies: [AtomicU64; Tally::ALL.len()],
+}
+
+/// What an engine counts while it serves, each a per-fire event: a way a
+/// serving fire was served other than its load prepared, or not at all.
+/// Never silent; read by the runtime's model status. A slower arm an
+/// engine chooses at load is no tally: it is a load fact, stated once in
+/// the load's summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tally {
+    /// A program, shape or pipeline built or loaded (from a disk cache)
+    /// while serving: a fire waited on it, its shape not prepared at load.
+    Compiled,
+    /// A legitimate slower path taken for a fire (a guest stage the host
+    /// interprets).
+    Fallback,
+    /// A serving fire that ran with no captured body or program where one
+    /// is required: a bug under the rule that every serving fire replays
+    /// one, kept apart so it is never mistaken for a compile.
+    Unrecorded,
+    /// A frame or registration the engine refused.
+    Refused,
+}
+
+impl Tally {
+    pub const ALL: [Tally; 4] = [
+        Tally::Compiled,
+        Tally::Fallback,
+        Tally::Unrecorded,
+        Tally::Refused,
+    ];
+
+    /// Its name in the model status.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Tally::Compiled => "compiled",
+            Tally::Fallback => "fallback",
+            Tally::Unrecorded => "unrecorded",
+            Tally::Refused => "refused",
+        }
+    }
 }
 
 impl Live {
@@ -52,6 +95,7 @@ impl Live {
             armed: AtomicU32::new(armed),
             outside: AtomicU64::new(0),
             held: AtomicU64::new(0),
+            tallies: Default::default(),
         }))
     }
 
@@ -91,6 +135,17 @@ impl Live {
     pub fn held(&self) -> u64 {
         self.0.held.load(Ordering::Acquire)
     }
+
+    /// `n` more `tally` events.
+    pub fn tally(&self, tally: Tally, n: u64) {
+        self.0.tallies[tally as usize].fetch_add(n, Ordering::AcqRel);
+    }
+
+    /// The `tally` events since load.
+    #[must_use]
+    pub fn tallied(&self, tally: Tally) -> u64 {
+        self.0.tallies[tally as usize].load(Ordering::Acquire)
+    }
 }
 
 impl Default for Live {
@@ -122,7 +177,19 @@ pub struct ArmingLease {
 
 #[cfg(test)]
 mod tests {
-    use super::Live;
+    use super::{Live, Tally};
+
+    #[test]
+    fn a_tally_counts_on_every_clone() {
+        let live = Live::armed();
+        let read = live.clone();
+        live.tally(Tally::Compiled, 2);
+        live.tally(Tally::Refused, 1);
+        assert_eq!(read.tallied(Tally::Compiled), 2);
+        assert_eq!(read.tallied(Tally::Fallback), 0);
+        assert_eq!(read.tallied(Tally::Unrecorded), 0);
+        assert_eq!(read.tallied(Tally::Refused), 1);
+    }
 
     #[test]
     fn arming_is_a_prefix_that_only_widens() {

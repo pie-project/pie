@@ -185,6 +185,16 @@ pub(crate) fn geometry(
     pages: i64,
 ) -> Built<Geom> {
     let lanes = f.dims(indptr)[0] - 1;
+    // A key's place over the fire is `lane · span + position`, an i32.
+    if lanes * pages * ps > i64::from(i32::MAX) {
+        return Err(Malformed {
+            op: "paged attention",
+            detail: format!(
+                "{lanes} lanes of {} key positions each pass the 2^31 key places a fire indexes",
+                pages * ps
+            ),
+        });
+    }
     let start = f.slice(indptr, &[0], &[lanes], &[1])?;
     let end = f.slice(indptr, &[1], &[lanes + 1], &[1])?;
     let count = f.sub(end, start)?;
@@ -1600,7 +1610,6 @@ fn tables_agree<T: Stored>(
 }
 
 /// Validates the fire tables; the plan carries them into the attention.
-/// `kv_len` is not read: the pool's CSR and the positions carry the lengths.
 pub fn plan_decode<T: Stored>(
     kv_len: T,
     positions: T,
@@ -1609,7 +1618,6 @@ pub fn plan_decode<T: Stored>(
     mask_enabled: T,
     mask_stride: u32,
 ) -> Result<DecodePlan<T>, Error> {
-    let _ = kv_len;
     tables_agree(
         "attn.plan_decode",
         positions,
@@ -1618,6 +1626,7 @@ pub fn plan_decode<T: Stored>(
         mask_enabled,
     )?;
     Ok(DecodePlan {
+        kv_len,
         positions,
         request_of_token,
         mask,
@@ -1634,7 +1643,6 @@ pub fn plan_prefill<T: Stored>(
     mask_enabled: T,
     mask_stride: u32,
 ) -> Result<PrefillPlan<T>, Error> {
-    let _ = kv_len;
     tables_agree(
         "attn.plan_prefill",
         positions,
@@ -1643,6 +1651,7 @@ pub fn plan_prefill<T: Stored>(
         mask_enabled,
     )?;
     Ok(PrefillPlan {
+        kv_len,
         positions,
         request_of_token,
         mask,
@@ -1654,6 +1663,8 @@ pub fn plan_prefill<T: Stored>(
 /// The fire tables an attention reads, whichever plan carried them.
 #[derive(Clone, Copy, Debug)]
 pub struct Tables<T> {
+    /// Each lane's keys once the fire lands: a wide row reads to here.
+    pub kv_len: T,
     pub positions: T,
     pub request_of_token: T,
     pub mask: T,
@@ -1664,6 +1675,7 @@ pub struct Tables<T> {
 impl<T: Copy> Tables<T> {
     pub(crate) const fn decode(p: &DecodePlan<T>) -> Self {
         Self {
+            kv_len: p.kv_len,
             positions: p.positions,
             request_of_token: p.request_of_token,
             mask: p.mask,
@@ -1674,6 +1686,7 @@ impl<T: Copy> Tables<T> {
 
     pub(crate) const fn prefill(p: &PrefillPlan<T>) -> Self {
         Self {
+            kv_len: p.kv_len,
             positions: p.positions,
             request_of_token: p.request_of_token,
             mask: p.mask,
@@ -1880,11 +1893,17 @@ impl<T: Stored> Paged<T> {
             None => None,
         };
         let (mask, mask_enabled) = masks.unwrap_or((positions, positions));
+        let kv_len = if !self.causal {
+            read(self.tables.kv_len)?
+        } else {
+            positions
+        };
         Ok((
             Paged {
                 op: self.op,
                 q,
                 tables: Tables {
+                    kv_len,
                     positions,
                     request_of_token,
                     mask,
@@ -2027,6 +2046,16 @@ pub fn attend_fresh(
     }
     if let Some((bias, extent, _, _)) = call.rel {
         nonzero(op, "the relative extent", extent)?;
+        // A bias's place is `(row · q_heads + head) · extent + distance`, an i32.
+        if u64::from(rows) * u64::from(q_heads) * u64::from(extent) > i32::MAX as u64 {
+            return Err(refuse(
+                op,
+                format!(
+                    "{rows} rows of {q_heads} heads x {extent} relative biases pass the 2^31 \
+                     a fire indexes"
+                ),
+            ));
+        }
         if bias.dtype != Dtype::F32
             || bias.rows < rows
             || u64::from(bias.width) != u64::from(q_heads) * u64::from(extent)
@@ -2062,6 +2091,14 @@ pub fn attend_fresh(
         None
     };
     let mask = if call.masked {
+        // A cell's place is `row · pitch + key`, an i32.
+        let pitch = f.dims(t.mask.val)[1];
+        if r * pitch > i64::from(i32::MAX) {
+            return Err(refuse(
+                op,
+                format!("{r} rows of a {pitch}-key mask plane pass the 2^31 cells a fire indexes"),
+            ));
+        }
         Some(f.slice_axis(t.mask.val, 0, 0, r)?)
     } else {
         None
@@ -2081,12 +2118,18 @@ pub fn attend_fresh(
     } else {
         f.like_i(qpos, 0)
     };
-    // Causal end (exclusive), or the lane's whole capacity for a wide
-    // row (non-causal, or a row whose mask flag is 2).
+    // Causal end (exclusive); a non-causal row reads every key its lane
+    // holds once the fire lands (the plan's `kv_len`). A causal row whose
+    // mask flag is 2 (a wide lane's stated mask) reads to the lane's
+    // capacity, its plane bounding it at the lane's keys.
     let upto = with_i(f, qpos, 1, Func::add)?;
     let causal_hi = f.min(upto, cap)?;
     let hi = match (call.causal, enabled) {
-        (false, _) => cap,
+        (false, _) => {
+            let kv = flat_i32(f, t.kv_len.val)?;
+            let kv = take(f, kv, lane)?;
+            f.min(kv, cap)?
+        }
         (true, Some(en)) => {
             let wide = cmp_i(f, Cmp::Eq, en, 2)?;
             f.select(wide, cap, causal_hi)?
@@ -2206,11 +2249,11 @@ pub fn attend_fresh(
                 )
             };
             let cap_v = tuning.vmem_cap();
-            // Causal rows with no relative bias read nothing past themselves
-            // and nothing but their scaled scores; a fire of decodes beside
-            // a prompt (a few rows a lane) walks as it did.
-            let plain = call.causal
-                && rule.rel.is_none()
+            // Rows with no relative bias read their [lo, hi) and nothing but
+            // their scaled scores (causal, or wide to the lane's keys); a
+            // fire of decodes beside a prompt (a few rows a lane) walks as
+            // it did.
+            let plain = rule.rel.is_none()
                 && call.o.dtype == Dtype::Bf16
                 && r >= 4 * geom.lanes;
             // The flash read keeps the table's pages (the fresh rows are
@@ -2520,6 +2563,7 @@ pub fn window_sink<T: Stored>(
     lse: T,
 ) -> Result<Paged<T>, Error> {
     let tables = Tables {
+        kv_len: positions,
         positions,
         request_of_token,
         mask: positions,
@@ -3726,4 +3770,23 @@ pub fn kv_append_shared(
         None,
         [pool.keys_map, pool.values_map],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fire whose lanes × key span passes 2^31 is refused by name, never
+    /// traced with a key place that wraps.
+    #[test]
+    fn a_fire_past_two_to_the_31_key_places_is_refused() {
+        let mut f = Func::new("geometry");
+        let indptr = f.param(Ty::new(Elem::I32, &[257]), None);
+        let indices = f.param(Ty::new(Elem::I32, &[1 << 20]), None);
+        let fits = geometry(&mut f, indptr, indices, 16, (1 << 19) / 16);
+        assert!(fits.is_ok(), "256 lanes of 512K keys fit: {fits:?}");
+        let wide = geometry(&mut f, indptr, indices, 16, (8 << 20) / 16);
+        let why = wide.expect_err("256 lanes of 8M keys pass 2^31").to_string();
+        assert!(why.contains("2^31 key places"), "{why}");
+    }
 }

@@ -7,7 +7,7 @@ use ash::vk;
 use crate::device::Context;
 use crate::device::alloc::{Buffer, Memory};
 use crate::device::ctx::{Core, Frame};
-use engine_gpu::guest::widen::{Cfg, STORAGE_SOURCE, WG, config_bytes};
+use engine_gpu::guest::widen::{Cfg, STORAGE_SOURCE, WG, config_bytes, word};
 
 use engine_gpu::error::Result;
 
@@ -132,17 +132,16 @@ impl Widen {
                 ),
             });
         }
+        let cfg = Cfg {
+            src_word: word(src_at)?,
+            dst_word: word(dst_at)?,
+            lanes,
+            pad: 0,
+        };
         let slot = self.next.get();
         self.next.set((slot + 1) % SLOTS);
-        self.cfg.write_shared(
-            slot * SLOT_BYTES,
-            &config_bytes(Cfg {
-                src_word: u32::try_from(src_at / 4).unwrap_or(u32::MAX),
-                dst_word: u32::try_from(dst_at / 4).unwrap_or(u32::MAX),
-                lanes,
-                pad: 0,
-            }),
-        )?;
+        self.cfg
+            .write_shared(slot * SLOT_BYTES, &config_bytes(cfg))?;
         self.armed.set(true);
 
         let set = frame.descriptor_set(self.set_layout)?;

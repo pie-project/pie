@@ -263,7 +263,9 @@ pub fn fault(fault: Fault) -> Error {
         | Fault::Blocking { .. } => Error::Device(fault.to_string()),
         Fault::Fire(_) => Error::Invalid(fault.to_string()),
 
-        Fault::Residency(_) => Error::Impossible(fault.to_string()),
+        Fault::Residency(_) | Fault::Workgroups { .. } | Fault::StorageBuffers { .. } => {
+            Error::Impossible(fault.to_string())
+        }
     }
 }
 
@@ -484,7 +486,7 @@ where
 
         let paging = shell.paging();
 
-        let pools = shell.pool_facts(disk_kv_pages);
+        let pools = shell.pool_facts(disk_kv_pages).map_err(fault)?;
         let chunks = shell.chunk_facts().map_err(fault)?;
 
         let caps = Capabilities {

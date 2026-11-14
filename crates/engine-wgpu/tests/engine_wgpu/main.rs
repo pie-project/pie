@@ -49,8 +49,7 @@ mod backend {
     pub fn moe_rows(device: &Context, pairs: u32, experts: u32) -> (u32, u32, u32) {
         use engine_gpu::backend::Tactics as _;
         let (profile, _) = engine_wgpu::chip::resolve(&device.chip(), None);
-        let tuning =
-            engine_wgpu::tuning::Tuning::new(profile, device.cores(), device.storage_buffers());
+        let tuning = engine_wgpu::tuning::Tuning::new(profile, device.cores());
         (
             tuning.moe_tile_rows(pairs, experts),
             tuning.moe_sorted_rows(pairs, experts),

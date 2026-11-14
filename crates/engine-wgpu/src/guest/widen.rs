@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::device::Context;
 use crate::device::alloc::Buffer;
 use crate::device::ctx::{Core, Frame};
-use engine_gpu::guest::widen::{Cfg, UNIFORM_SOURCE, WG, config_bytes};
+use engine_gpu::guest::widen::{Cfg, UNIFORM_SOURCE, WG, config_bytes, word};
 
 use engine_gpu::error::{Fault, Result};
 
@@ -111,8 +111,8 @@ impl Widen {
             });
         }
         let bytes = config_bytes(Cfg {
-            src_word: u32::try_from(src_at / 4).unwrap_or(u32::MAX),
-            dst_word: u32::try_from(dst_at / 4).unwrap_or(u32::MAX),
+            src_word: word(src_at)?,
+            dst_word: word(dst_at)?,
             lanes,
             pad: 0,
         });

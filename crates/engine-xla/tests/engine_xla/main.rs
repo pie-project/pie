@@ -10,6 +10,7 @@ mod a_context_input_merged_into_the_stream_lands_its_rows;
 mod a_conv_decoder_fires_over_a_voxel_input;
 mod a_device_geometry_beam_answers_the_host_path;
 mod a_double_block_fires_two_streams_through_the_engine;
+mod a_fire_the_load_did_not_prepare_is_counted;
 mod a_pool_answers_what_the_base_build_answered;
 mod a_prompt_length_reuses_its_programs;
 mod an_epilogue_agrees_with_the_host_interpreter;
