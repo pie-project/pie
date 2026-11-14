@@ -229,10 +229,13 @@ enum SchedulerItem {
     Launch {
         pending: PendingRequest,
     },
+    RegisterProgram {
+        program: Box<ProgramRegistration>,
+        response: tokio::sync::oneshot::Sender<Result<::engine::ProgramId>>,
+    },
     RegisterChannelsBind {
         pipeline_id: Option<ProcessId>,
         plans: Vec<ChannelRegistration>,
-        program: Option<Box<ProgramRegistration>>,
         bind: InstanceBindingPlan,
         response: tokio::sync::oneshot::Sender<
             Result<(Vec<RegisteredChannel>, ::engine::ProgramId, BoundInstance)>,
@@ -424,7 +427,6 @@ impl PreLaunchCopy {
 pub(super) struct BindRespond {
     pub(super) registered: Vec<RegisteredChannel>,
     pub(super) program_id: ::engine::ProgramId,
-    pub(super) program_registered: bool,
     pub(super) response: tokio::sync::oneshot::Sender<
         Result<(Vec<RegisteredChannel>, ::engine::ProgramId, BoundInstance)>,
     >,
@@ -438,10 +440,15 @@ pub(super) enum QueuedItem {
         process_id: Option<ProcessId>,
         pipeline_id: Option<ProcessId>,
     },
+    /// Registers a program with the engine, and learns what an instance
+    /// of it holds in the pool and what its fires take.
+    RegisterProgram {
+        program: Box<ProgramRegistration>,
+        response: tokio::sync::oneshot::Sender<Result<::engine::ProgramId>>,
+    },
     RegisterChannelsBind {
         pipeline_id: Option<ProcessId>,
         plans: Vec<ChannelRegistration>,
-        program: Option<Box<ProgramRegistration>>,
         bind: InstanceBindingPlan,
         response: tokio::sync::oneshot::Sender<
             Result<(Vec<RegisteredChannel>, ::engine::ProgramId, BoundInstance)>,
@@ -931,29 +938,61 @@ impl SchedulerHandle {
                 None => None,
             }
         };
-        let (program_field, cache_fill) = match cached {
-            Some(program_id) => {
-                bind.binding.program = program_id;
-                (None, None)
+        let program_id = match cached {
+            Some(program_id) => program_id,
+            None => {
+                let launch = program.launch.clone();
+                let program_id = self
+                    .request(|response| SchedulerItem::RegisterProgram {
+                        program: Box::new(program),
+                        response,
+                    })
+                    .await??;
+                self.inner
+                    .program_ids
+                    .lock()
+                    .unwrap()
+                    .insert(program_hash, (program_id, launch));
+                program_id
             }
-            None => (Some(Box::new(program.clone())), Some(program.launch)),
         };
-        let (registered, program_id, bound) = self
+        bind.binding.program = program_id;
+        // The program's fire term counts while the bind is under way, and
+        // the activation the fires may take holds it before the bind
+        // proceeds (`store::shared::programs`).
+        let _open = match crate::store::registry::try_get(0, bind.engine_id)
+            .and_then(|stores| stores.shared)
+        {
+            Some(shared) => {
+                let open = crate::store::shared::programs::ProgramOpen::new(&shared, program_id)
+                    .map_err(|why| anyhow!("pipeline: {why}"))?;
+                let engine = bind.engine_id;
+                let pid = pipeline_id.unwrap_or_default();
+                crate::store::shared::programs::fund_span(
+                    &shared,
+                    || crate::store::shared::fire_cap(engine),
+                    &crate::store::shared::programs::Planner { pid, quorum: pid },
+                    &crate::store::shared::programs::LaneMover {
+                        engine,
+                        epoch_now: || crate::store::shared::programs::epoch_of(engine),
+                    },
+                )
+                .await
+                .map_err(|why| {
+                    anyhow!("pipeline: a program's fires need a wider activation span: {why}")
+                })?;
+                Some(open)
+            }
+            None => None,
+        };
+        let (registered, _, bound) = self
             .request(|response| SchedulerItem::RegisterChannelsBind {
                 pipeline_id,
                 plans,
-                program: program_field,
                 bind,
                 response,
             })
             .await??;
-        if let Some(launch) = cache_fill {
-            self.inner
-                .program_ids
-                .lock()
-                .unwrap()
-                .insert(program_hash, (program_id, launch));
-        }
         Ok((registered, bound))
     }
 
@@ -1464,6 +1503,7 @@ impl BatchScheduler {
                 QueuedItem::PreLaunchCopy {
                     plan, pipeline_id, ..
                 } => format!("PreLaunchCopy({}) pipeline {pipeline_id:?}", plan.label()),
+                QueuedItem::RegisterProgram { .. } => "RegisterProgram".to_string(),
                 QueuedItem::RegisterChannelsBind { .. } => "RegisterChannelsBind".to_string(),
                 QueuedItem::CopyTracked { plan, .. } => format!("CopyTracked({})", plan.label()),
                 QueuedItem::HostKv { op, .. } => format!("HostKv({op:?})"),
@@ -1659,10 +1699,12 @@ impl BatchScheduler {
             SchedulerItem::LanePark { lane, seq } => {
                 frame_policy.on_lane_park(lane, seq);
             }
+            SchedulerItem::RegisterProgram { program, response } => {
+                pending.push_back(QueuedItem::RegisterProgram { program, response });
+            }
             SchedulerItem::RegisterChannelsBind {
                 pipeline_id,
                 plans,
-                program,
                 bind,
                 response,
             } => {
@@ -1677,7 +1719,6 @@ impl BatchScheduler {
                 pending.insert_before_closes(QueuedItem::RegisterChannelsBind {
                     pipeline_id,
                     plans,
-                    program,
                     bind,
                     response,
                 });
@@ -1792,7 +1833,10 @@ impl BatchScheduler {
     const fn standalone_copy(item: &QueuedItem) -> bool {
         matches!(
             item,
-            QueuedItem::CopyTracked { .. } | QueuedItem::HostKv { .. } | QueuedItem::Pool { .. }
+            QueuedItem::CopyTracked { .. }
+                | QueuedItem::HostKv { .. }
+                | QueuedItem::Pool { .. }
+                | QueuedItem::RegisterProgram { .. }
         )
     }
 
@@ -2567,7 +2611,6 @@ impl BatchScheduler {
                     BindRespond {
                         registered,
                         program_id,
-                        program_registered,
                         response,
                     },
             } => {
@@ -2592,13 +2635,6 @@ impl BatchScheduler {
                         channel_count = registered.len(),
                         "scheduler cancellation rollback enqueued bound instance and channels"
                     );
-                    if program_registered {
-                        tracing::warn!(
-                            operation = "register_channels_bind",
-                            program_id = program_id.0,
-                            "scheduler RPC cancelled after program registration; retaining engine-lifetime program"
-                        );
-                    }
                     Lane::release_registered_channel_wait_slots(&registered);
                     let instance_id = bound.instance_id;
                     if rollback_tx

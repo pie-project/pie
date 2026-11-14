@@ -181,6 +181,9 @@ fn fail_request(request: LaneRequest, why: &str) {
                 QueuedItem::Pool { response, .. } => {
                     let _ = response.send(Err(anyhow!("{why}")));
                 }
+                QueuedItem::RegisterProgram { response, .. } => {
+                    let _ = response.send(Err(anyhow!("{why}")));
+                }
                 _ => {}
             }
             let _ = reply.send(commit);
@@ -610,7 +613,8 @@ impl Lane {
             QueuedItem::CloseInstance { .. }
             | QueuedItem::CloseChannels { .. }
             | QueuedItem::HostKv { .. }
-            | QueuedItem::Pool { .. } => LaneCommit::None,
+            | QueuedItem::Pool { .. }
+            | QueuedItem::RegisterProgram { .. } => LaneCommit::None,
         }
     }
 
@@ -791,11 +795,35 @@ impl Lane {
                     }
                 }
             }
+            QueuedItem::RegisterProgram { program, response } => {
+                let registered = backend(engine).and_then(|engine| {
+                    let backend = crate::engine::verbs::codegen_backend(engine);
+                    let plan = &crate::pipeline::program::with_host_codegen(&program, backend);
+                    let program_id = engine.register_program(plan)?;
+                    // What an instance of it holds in the pool, and what
+                    // its fires take beside the model's activation, asked
+                    // once at registration.
+                    if let Some(roles) = roles_of(engine_idx) {
+                        crate::store::roles::learn_program(&roles, &**engine, program_id)?;
+                    }
+                    if let Some(shared) =
+                        crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared)
+                    {
+                        let facts = engine.program_facts(program_id)?;
+                        shared
+                            .lock()
+                            .unwrap()
+                            .program_registered(program_id, &facts);
+                    }
+                    Ok(program_id)
+                });
+                let _ = response.send(registered);
+                LaneCommit::None
+            }
             QueuedItem::RegisterChannelsBind {
                 pipeline_id,
                 plans,
-                program,
-                mut bind,
+                bind,
                 response,
             } => {
                 if response.is_closed() {
@@ -844,73 +872,27 @@ impl Lane {
                     Self::release_wait_slots([bind.pacing_wait_id]);
                     return LaneCommit::BindFinished { pipeline_id };
                 }
-                let program_registered = program.is_some();
-                if let Some(plan) = &program {
-                    let backend = crate::engine::verbs::codegen_backend(engine);
-                    let plan = &crate::pipeline::program::with_host_codegen(plan, backend);
-                    let registered_program = engine
-                        .register_program(plan)
-                        .and_then(|program_id| {
-                            // What an instance of it holds in the pool,
-                            // asked once at registration.
-                            if let Some(roles) = &roles {
-                                crate::store::roles::learn_program(roles, &**engine, program_id)?;
-                            }
-                            Ok(program_id)
-                        })
-                        .map_err(anyhow::Error::from);
-                    match registered_program {
-                        Ok(program_id) => bind.binding.program = program_id,
-                        Err(error) => {
-                            tracing::error!(
-                                ?error,
-                                "register_program refused; rolling the bind's channels back"
-                            );
-                            Self::rollback_channel_set(
-                                engine,
-                                channels,
-                                &registered,
-                                "register_channels_bind",
-                                false,
-                            );
-                            if response.send(Err(error)).is_err() {
-                                Lane::release_registered_channel_wait_slots(&registered);
-                                Self::release_wait_slots([bind.pacing_wait_id]);
-                            }
-                            return LaneCommit::BindFinished { pipeline_id };
+                match Self::bind(engine, channels, &bind, roles.as_ref(), pipeline_id) {
+                    Ok(bound) => {
+                        // Its program can be in a fire until it closes.
+                        if let Some(shared) =
+                            crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared)
+                        {
+                            shared
+                                .lock()
+                                .unwrap()
+                                .instance_bound(bound.instance_id, bind.program_id());
+                        }
+                        LaneCommit::BindInstance {
+                            pipeline_id,
+                            bound,
+                            respond: BindRespond {
+                                registered,
+                                program_id: bind.program_id(),
+                                response,
+                            },
                         }
                     }
-                }
-                if response.is_closed() {
-                    Self::rollback_channel_set(
-                        engine,
-                        channels,
-                        &registered,
-                        "register_channels_bind",
-                        true,
-                    );
-                    Self::release_registered_channel_wait_slots(&registered);
-                    Self::release_wait_slots([bind.pacing_wait_id]);
-                    if program_registered {
-                        tracing::warn!(
-                            operation = "register_channels_bind",
-                            program_id = bind.program_id().0,
-                            "scheduler RPC cancelled after program registration; retaining engine-lifetime program"
-                        );
-                    }
-                    return LaneCommit::BindFinished { pipeline_id };
-                }
-                match Self::bind(engine, channels, &bind, roles.as_ref(), pipeline_id) {
-                    Ok(bound) => LaneCommit::BindInstance {
-                        pipeline_id,
-                        bound,
-                        respond: BindRespond {
-                            registered,
-                            program_id: bind.program_id(),
-                            program_registered,
-                            response,
-                        },
-                    },
                     Err(error) => {
                         Self::rollback_channel_set(
                             engine,
@@ -1016,6 +998,11 @@ impl Lane {
                         channels.unbind(id);
                         if let Some(roles) = roles_of(engine_idx) {
                             roles.lock().unwrap().close_instance(id);
+                        }
+                        if let Some(shared) =
+                            crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared)
+                        {
+                            shared.lock().unwrap().instance_closed(id);
                         }
                         LaneCommit::CloseInstance { id }
                     }

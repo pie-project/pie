@@ -106,6 +106,39 @@ pub struct SlotPoolFacts {
     pub act_chunks: Vec<(u32, u32)>,
 }
 
+/// What the registered programs' fires add to every rung's activation
+/// (REDESIGN §6, [`::engine::ProgramFacts::fire_bytes`]): a fire of a rung
+/// of `r` tokens carries `min(r, max_lanes)` lanes and needs
+/// `fixed + lanes × a_lane` bytes beside the model's own activation. The
+/// sums over every program that can be in a fire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FireTerm {
+    pub fixed: u64,
+    pub a_lane: u64,
+}
+
+impl FireTerm {
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.fixed == 0 && self.a_lane == 0
+    }
+
+    #[must_use]
+    pub fn plus(self, other: FireTerm) -> FireTerm {
+        FireTerm {
+            fixed: self.fixed.saturating_add(other.fixed),
+            a_lane: self.a_lane.saturating_add(other.a_lane),
+        }
+    }
+
+    /// Bytes a fire of `lanes` lanes needs.
+    #[must_use]
+    pub fn bytes(&self, lanes: u32) -> u64 {
+        self.fixed
+            .saturating_add(u64::from(lanes).saturating_mul(self.a_lane))
+    }
+}
+
 /// One slot: a logical chunk and the slot's index in it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Slot {
@@ -437,6 +470,12 @@ pub struct SlotPool {
     shapes: Vec<ShapeState>,
     act_chunks: Vec<(u32, u32)>,
     act: u32,
+    /// The registered programs' fire term, on top of every rung's
+    /// activation ([`Self::act_chunks`]).
+    fire: FireTerm,
+    /// The most lanes a fire carries (the engine's `FireLimits::max_lanes`):
+    /// a rung of `r` tokens allows `min(r, max_lanes)`.
+    max_lanes: u32,
     /// The largest rung's activation chunks, the top of the range.
     act_max: u32,
     /// The first segment under the largest rung's activation: it and those
@@ -503,6 +542,8 @@ impl SlotPool {
             shapes: facts.shapes.into_iter().map(ShapeState::new).collect(),
             act_chunks,
             act: 0,
+            fire: FireTerm::default(),
+            max_lanes: u32::MAX,
             act_max,
             top_segment,
             chunks: vec![FREE_CHUNK; total as usize],
@@ -599,13 +640,44 @@ impl SlotPool {
     }
 
     /// Activation chunks a fire at `rung` tokens takes: the smallest rung at
-    /// or above it, else the largest.
+    /// or above it, else the largest; with the chunks the registered
+    /// programs' fire term takes at that rung's lanes ([`Self::set_fire`]).
     pub fn act_chunks(&self, rung: u32) -> u32 {
         self.act_chunks
             .iter()
             .find(|(tokens, _)| *tokens >= rung)
             .or(self.act_chunks.last())
-            .map_or(0, |(_, chunks)| *chunks)
+            .map_or(0, |&(tokens, chunks)| {
+                chunks.saturating_add(self.fire_chunks(tokens))
+            })
+    }
+
+    /// The chunks the fire term takes at a rung of `tokens`: `min(tokens,
+    /// max_lanes)` lanes.
+    fn fire_chunks(&self, tokens: u32) -> u32 {
+        if self.fire.is_zero() {
+            return 0;
+        }
+        let bytes = self.fire.bytes(tokens.min(self.max_lanes));
+        u32::try_from(bytes.div_ceil(self.chunk_bytes.max(1))).unwrap_or(u32::MAX)
+    }
+
+    /// The registered programs' fire term from now on. Nothing moves here:
+    /// a term that raises the rung's need is taken by a raise
+    /// ([`Self::plan_rung`], [`Self::apply_rung`]), and one that drops it
+    /// gives the room back at the next lower ([`Self::set_rung`]).
+    pub fn set_fire(&mut self, fire: FireTerm) {
+        self.fire = fire;
+    }
+
+    /// See [`Self::set_fire`].
+    pub fn fire(&self) -> FireTerm {
+        self.fire
+    }
+
+    /// The most lanes a fire carries: the engine's `FireLimits::max_lanes`.
+    pub fn set_max_lanes(&mut self, lanes: u32) {
+        self.max_lanes = lanes.max(1);
     }
 
     /// The activation chunks set aside now.
@@ -619,12 +691,14 @@ impl SlotPool {
     }
 
     /// The rung the activation is set aside for now: the largest whose
-    /// chunks it holds (0 where no rung is stated).
+    /// chunks it holds, the fire term's included (0 where no rung is
+    /// stated, or where a fire term registered since leaves it holding
+    /// none until a raise).
     pub fn rung(&self) -> u32 {
         self.act_chunks
             .iter()
-            .filter(|&&(_, chunks)| chunks <= self.act)
             .map(|&(tokens, _)| tokens)
+            .filter(|&tokens| self.act_chunks(tokens) <= self.act)
             .max()
             .unwrap_or(0)
     }

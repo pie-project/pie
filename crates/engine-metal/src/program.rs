@@ -273,7 +273,12 @@ impl Plane {
                 ring_facts(channel as u32, shape, channel_slot, channel_per_chunk)
             })
             .collect();
-        Ok(engine::ProgramFacts { instance, rings })
+        Ok(engine::ProgramFacts {
+            instance,
+            rings,
+            fire_bytes_a_lane: 0,
+            fire_bytes_fixed: 0,
+        })
     }
 
     /// Points every pooled table and ring at the chunks their slots sit in
