@@ -1160,10 +1160,16 @@ impl<B: Serve> Shell<B> {
         }
         // No rung lends a chunk past the kernels' index to state.
         let unindexed = total.saturating_sub(words);
-        let act_chunks: Vec<(u32, u32)> = act_chunks
+        // Rungs taking as many chunks are one: each class is stated once,
+        // at its widest, so the runtime walks only where a rung lends (and
+        // a span wholly past the index states a single rung, as no rungs).
+        let mut act_chunks: Vec<(u32, u32)> = act_chunks
             .into_iter()
             .map(|(tokens, chunks)| (tokens, chunks.max(unindexed)))
             .collect();
+        act_chunks.reverse();
+        act_chunks.dedup_by_key(|&mut (_, chunks)| chunks);
+        act_chunks.reverse();
         let layout = crate::store::layout::Layout::new(
             chunk,
             total,
