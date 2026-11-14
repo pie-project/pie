@@ -259,3 +259,20 @@ Hardware: steps 1-5 for CUDA and Vulkan/wgpu can be done on the L40S; ROCm, Meta
 - **Guest state (step 4).** Option A with D for items past a slot (user): `Instance` 4 KiB and `Channel` 1 KiB fixed shapes keyed by role; `Footprint { bytes, slots, contiguous }`; contiguous items get adjacent slots of one chunk; an item past a chunk is refused. Non-replayable slots park to the host tier only; `Engine::rebind_slots(Rebind)` after unpark; the runtime holds and replays host writes (publish / take) to a parked owner. Measured on Metal: paging a 594 KiB cell through 1 KiB slots costs +100-160%, hence D.
 - **XLA expert streaming (A7).** No cut fires: streamed banks are pinned-host PJRT buffers; resident atoms in u32 pool slots as K/128 panels read by a pooled gmm arm; misses staged host->pool inside the fire (zero misses, zero transfer). Held keeps the Slice route at decode 1 unless gmm matches it.
 - **No legacy paths** (user): a replaced path is deleted in the same package, not kept as a fallback.
+
+## 7. North star on every backend (redesign matrix, 2026-11-14)
+
+A step is done only when it holds on every backend (user). ✅ verified on hardware · 🟡 in progress · 🔴 not started · — not applicable (reason given) · ? to be confirmed by the owner.
+
+| Step | CUDA (L40S) | ROCm (AMD) | Metal (Mac) | Vulkan (New Pie) | wgpu (New Pie) | XLA (TPU) |
+|---|---|---|---|---|---|---|
+| 2 Ledger, audit gap ~0 | ✅ | ✅ 0 MiB | ✅ 88 KiB | ✅ 0 | ✅ 0 | 🔴 |
+| 2.2 Measured capacity, no 0.9 share, floor 64 MiB | 🟡 share still read | 🟡 via CUDA path | ✅ (floor ?) | ✅ | ✅ (heap budget where reported) | 🔴 headroom constant |
+| 2.2 Outside priced, nothing allocated after load + arming | 🟡 guest Prepared scratch left | 🟡 same | ? | 🟡 pipelines priced; guest scratch ? | 🟡 same | 🟡 compile-time stats (probe) |
+| 3 Fire footprint declared at load | ✅ size-only walk | ✅ walk | 🟡 scratch.rs static, not in span | 🟡 scratch.rs static, not in span | 🟡 same | ✅ compile stats |
+| 3c Activation in the span, `act_chunks` stated, rungs lend to state | ✅ | ✅ flat | 🔴 | 🔴 | 🔴 | — single u32 pool (fire outside the pool) |
+| 3 Guest program fire footprint (ProgramFacts) | 🟡 contract in work | 🟡 | 🔴 | 🔴 | 🔴 | ? |
+| 4 State stragglers in slots (Instance / Channel) | 🟡 b46d16059 | 🟡 gate | ✅ | ✅ | ✅ (no device channel state) | — proposed none |
+| 5 Derived rungs, background arming | ✅ | ✅ | — encodes live (no capture) | 🔴 rungs; recorded frames per shape ? | 🔴 | 🟡 warm ladder |
+| One budget over N buffers (Span) | ✅ one range | ✅ one range | 🔴 two buffers | ? | ? | ✅ one pool |
+| Legacy paths deleted | 🟡 | 🟡 slab growth | ? | ? | ? | ? |
