@@ -181,6 +181,10 @@ fn extents(stated: &BindExtents) -> eta_exec::Extents {
     }
 }
 
+/// The narrowest forward width a load narrows its fires to
+/// so its arena scratch fits beside resident weights.
+const MIN_FITTED_FORWARD_TOKENS: u32 = 512;
+
 const DEFAULT_STATE_SLOTS: u32 = 256;
 
 /// The load's budgets: its logit readouts sized to what `trace` reads, not a
@@ -412,10 +416,13 @@ impl Engine for Metal {
         };
 
         // Compiled before the residency check, so the check prices the arena
-        // scratch the load will wire beside the weights and the kv pool. A
-        // load whose arena at the configured forward width does not fit is
-        // refused, naming the remedies; it is never retried narrower.
-        let mut prepared = {
+        // scratch the load will wire beside the weights and the kv pool. When
+        // the weights fit resident and only the scratch the forward width
+        // reserves pushes the load past the device (a 12B on a 16 GB Mac),
+        // the width halves until it fits: a narrower prefill fire is slower,
+        // a refused load serves nothing.
+        let mut budgets = budgets;
+        let mut prepared = loop {
             let room = accounting(weights, 0).pool.saturating_sub(kv_pool) / 2;
             let mut fitted = poem_compiler::fit_voxels(
                 &trace,
@@ -461,7 +468,21 @@ impl Engine for Metal {
                 profiles: self.boot.profiles.clone(),
             })
             .map_err(fault)?;
-            prepared
+            let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
+            if narrower >= budgets.max_tokens
+                || accounting(weights, prepared.arena_bytes()).admit().is_ok()
+                || accounting(weights, 0).admit().is_err()
+            {
+                break prepared;
+            }
+            eprintln!(
+                "the arena scratch for {} forward tokens ({} bytes) does not fit beside the \
+                 resident weights on this device: fires narrowed to {narrower} tokens",
+                budgets.max_tokens,
+                prepared.arena_bytes(),
+            );
+            budgets.max_tokens = narrower;
+            budgets.buckets.retain(|&rows| rows <= narrower);
         };
         let scratch = prepared.arena_bytes();
 
