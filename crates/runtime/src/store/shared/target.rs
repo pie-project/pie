@@ -258,8 +258,7 @@ impl SharedGrow {
         // The next segment must be one the engine binds: one at or past
         // what it holds back never commits, and a waiter told the pool
         // grows would wait on it for good.
-        next < top
-            && pool.pool().backs(next)
+        (next < top && pool.pool().backs(next) || pool.pool().span_to_commit().is_some())
             && pool.mapped_segments() < self.target.load(Ordering::Acquire)
     }
 
@@ -344,6 +343,8 @@ impl SharedGrow {
                 Some(SegmentMove::Commit { prefix }) => PoolOp::CommitSegments(prefix),
                 Some(SegmentMove::Evacuate { evacuation }) => PoolOp::Evacuate(evacuation),
                 Some(SegmentMove::Release { prefix }) => PoolOp::ReleaseSegments(prefix),
+                Some(SegmentMove::CommitSpan { n }) => PoolOp::CommitSpan(n),
+                Some(SegmentMove::ReleaseSpan { n }) => PoolOp::ReleaseSpan(n),
             };
             self.no_room.store(false, Ordering::Release);
             tracing::debug!(engine = self.engine, goal, ?op, "a segment move");
@@ -351,9 +352,20 @@ impl SharedGrow {
                 PoolOp::CommitSegments(prefix) => Some(*prefix),
                 _ => None,
             };
+            let span = match &op {
+                PoolOp::CommitSpan(n) => Some(*n),
+                _ => None,
+            };
             let evacuating = matches!(op, PoolOp::Evacuate(_));
             match crate::scheduler::pool(self.engine, op).await {
                 Ok(()) => {
+                    if let Some(n) = span {
+                        self.shared.lock().unwrap().span_committed(n);
+                        if let Some(planner) = crate::planner::planner_for(self.model, self.engine)
+                        {
+                            planner.pages_freed();
+                        }
+                    }
                     if let Some(prefix) = commit {
                         self.shared.lock().unwrap().committed(prefix);
                         if let Some(planner) = crate::planner::planner_for(self.model, self.engine)
@@ -364,7 +376,7 @@ impl SharedGrow {
                 }
                 Err(error) => {
                     tracing::warn!(engine = self.engine, %error, "a segment move was refused");
-                    if commit.is_some() {
+                    if commit.is_some() || span.is_some() {
                         self.refused.store(true, Ordering::Release);
                     }
                     return;
