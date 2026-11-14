@@ -836,10 +836,18 @@ impl<B: Serve> Shell<B> {
             ..asked
         };
 
-        // A fire's arena and kernel scratch, laid at the top fire's width;
-        // they take the pool's top chunks once it is reserved.
+        // A fire's arena and kernel scratch, laid at every rung's width
+        // (every power of two of tokens from 1, then the top fire's, each
+        // by the same static sizing); they take the pool's top chunks once
+        // it is reserved, each rung's carve anchored at the span's end, so
+        // a rung below the top lends the span under its carve to state and
+        // a raise evacuates it (`Engine::evacuate`). A rung is a function of
+        // the fire's rows: a recorded frame binds one rung's place only.
         let top = budgets.tokens.max_tokens;
-        let rung_tokens = vec![top];
+        let mut rung_tokens = engine::memory::rungs(1, top);
+        if rung_tokens.last() != Some(&top) {
+            rung_tokens.push(top);
+        }
         let mut span = Span::plan(&boot.trace, &compiled, &budgets, &rung_tokens, least, &tuning)?;
         let device_cap = device
             .left()
