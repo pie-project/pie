@@ -3489,6 +3489,25 @@ impl Pools {
         Ok(())
     }
 
+    /// Whether an adapter lies landed in `refs`: another instance's of the
+    /// same content, which a binding shares.
+    #[must_use]
+    pub fn adapter_landed(&self, refs: &[u32]) -> bool {
+        self.adapters.landed(refs)
+    }
+
+    /// `instance` holds the adapter landed in `refs`; nothing is written.
+    pub fn join_adapter(&mut self, instance: engine::InstanceId, refs: &[u32]) -> Result<()> {
+        if !self.adapters.landed(refs) {
+            return Err(Fault::program(
+                "store::adapters",
+                format!("instance {instance} joins an adapter in slots {refs:?}, and none lies there"),
+            ));
+        }
+        self.adapters.land(instance, refs.to_vec());
+        Ok(())
+    }
+
     /// `instance`'s adapter now lies in `refs` (a park and unpark moved
     /// it): an id it holds names them from the next fire on.
     pub fn rebind_adapter(
@@ -4878,50 +4897,108 @@ fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64, slots: u32) -
 /// The guest shapes: `Instance` and `Channel`.
 const GUEST_SHAPES: u64 = 2;
 
-/// The adapters landed in `Adapter` slots and the ids fires read them by:
-/// ids under [`layout::ZERO_IDS`] always name the zero plane, each other
-/// one adapter or none. An adapter keeps its id from fire to fire until a
-/// fire with no free id takes the least recently read one no adapter of its
-/// own holds.
+/// The adapters landed in `Adapter` slots, each by its first slot ref, the
+/// instances holding each, and the ids fires read them by: ids under
+/// [`layout::ZERO_IDS`] always name the zero plane, each other one adapter
+/// or none. Instances whose bindings land one adapter (one content key)
+/// hold one set of slots, landed once and read by one id. An adapter keeps
+/// its id from fire to fire until a fire with no free id takes the least
+/// recently read one no adapter of its own holds.
 #[derive(Debug, Default)]
 struct AdapterIds {
-    /// Each landed adapter's slot refs, bank order.
-    refs: std::collections::BTreeMap<engine::InstanceId, Vec<u32>>,
-    /// Who holds each id past the zero ones, and the fire that last read it.
-    ids: std::collections::BTreeMap<u32, (engine::InstanceId, u64)>,
+    /// Each landed adapter by its first slot ref: its slot refs, bank
+    /// order, and the instances holding it.
+    landed: std::collections::BTreeMap<u32, (Vec<u32>, std::collections::BTreeSet<engine::InstanceId>)>,
+    /// Each holder's adapter, by its first slot ref.
+    held_by: std::collections::BTreeMap<engine::InstanceId, u32>,
+    /// The adapter (first slot ref) each id past the zero ones names, and
+    /// the fire that last read it.
+    ids: std::collections::BTreeMap<u32, (u32, u64)>,
     clock: u64,
 }
 
 impl AdapterIds {
-    fn land(&mut self, instance: engine::InstanceId, refs: Vec<u32>) {
-        self.refs.insert(instance, refs);
+    /// Whether an adapter lies landed in `refs` already.
+    fn landed(&self, refs: &[u32]) -> bool {
+        refs.first()
+            .and_then(|first| self.landed.get(first))
+            .is_some_and(|(held, _)| held == refs)
     }
 
-    /// The id `instance` holds, where it holds one, after its slots moved.
+    /// `instance` holds the adapter in `refs`.
+    fn land(&mut self, instance: engine::InstanceId, refs: Vec<u32>) {
+        self.detach(instance);
+        let Some(&first) = refs.first() else {
+            return;
+        };
+        self.landed
+            .entry(first)
+            .or_insert_with(|| (refs, std::collections::BTreeSet::new()))
+            .1
+            .insert(instance);
+        self.held_by.insert(instance, first);
+    }
+
+    /// `instance` holds its adapter no more: the adapter's first slot ref,
+    /// and whether no instance holds it now (it is forgotten).
+    fn detach(&mut self, instance: engine::InstanceId) -> Option<(u32, bool)> {
+        let first = self.held_by.remove(&instance)?;
+        let (_, holders) = self.landed.get_mut(&first)?;
+        holders.remove(&instance);
+        let emptied = holders.is_empty();
+        if emptied {
+            self.landed.remove(&first);
+        }
+        Some((first, emptied))
+    }
+
+    /// `instance`'s adapter lies in `refs` now (its slots moved, and every
+    /// holder is told so in turn): the id to rewrite, where the adapter's
+    /// id now names its new slots.
     fn rebind(&mut self, instance: engine::InstanceId, refs: Vec<u32>) -> Option<u32> {
-        self.refs.insert(instance, refs);
-        self.held(instance)
+        let old = self.detach(instance);
+        self.land(instance, refs.clone());
+        let first = *refs.first()?;
+        let (old, emptied) = old?;
+        if old == first {
+            return self.id_of(first);
+        }
+        if !emptied {
+            // Other holders still name the old slots until they are told.
+            return None;
+        }
+        let moved = self.id_of(old)?;
+        if self.id_of(first).is_some() {
+            self.ids.remove(&moved);
+            return None;
+        }
+        if let Some(entry) = self.ids.get_mut(&moved) {
+            entry.0 = first;
+        }
+        Some(moved)
     }
 
     fn close(&mut self, instance: engine::InstanceId) {
-        self.refs.remove(&instance);
-        self.ids.retain(|_, (holder, _)| *holder != instance);
+        if let Some((first, true)) = self.detach(instance) {
+            self.ids.retain(|_, (named, _)| *named != first);
+        }
     }
 
-    fn held(&self, instance: engine::InstanceId) -> Option<u32> {
+    fn id_of(&self, first: u32) -> Option<u32> {
         self.ids
             .iter()
-            .find(|(_, (holder, _))| *holder == instance)
+            .find(|(_, (named, _))| *named == first)
             .map(|(&id, _)| id)
     }
 
     /// The slots id `id`'s adapter lies in, where an adapter holds it.
     fn of_id(&self, id: u32) -> Option<&[u32]> {
-        let (instance, _) = self.ids.get(&id)?;
-        self.refs.get(instance).map(Vec::as_slice)
+        let (first, _) = self.ids.get(&id)?;
+        self.landed.get(first).map(|(refs, _)| refs.as_slice())
     }
 
-    /// Each instance's id, of `ids` there are, and the ids newly held.
+    /// Each instance's id, of `ids` there are (one an adapter, whatever
+    /// instances hold it), and the ids newly held.
     fn ids_for(
         &mut self,
         instances: &[engine::InstanceId],
@@ -4932,14 +5009,14 @@ impl AdapterIds {
         let mut out = Vec::with_capacity(instances.len());
         let mut fresh = Vec::new();
         for &instance in instances {
-            if !self.refs.contains_key(&instance) {
+            let Some(&first) = self.held_by.get(&instance) else {
                 return Err(Fault::program(
                     "store::adapters",
                     format!("instance {instance} is read with an adapter it never landed"),
                 ));
-            }
-            if let Some(id) = self.held(instance) {
-                self.ids.insert(id, (instance, clock));
+            };
+            if let Some(id) = self.id_of(first) {
+                self.ids.insert(id, (first, clock));
                 out.push(id);
                 continue;
             }
@@ -4958,7 +5035,7 @@ impl AdapterIds {
                         have: u64::from(ids - layout::ZERO_IDS),
                     })?,
             };
-            self.ids.insert(id, (instance, clock));
+            self.ids.insert(id, (first, clock));
             fresh.push(id);
             out.push(id);
         }
@@ -5212,6 +5289,44 @@ mod tests {
     #[test]
     fn store_every_case() {
         a_seat_past_the_slot_count_is_a_row_only_a_slab_can_refuse();
+        a_shared_adapter_is_one_landing_and_one_id();
+    }
+
+    // main's `a_shared_adapter_is_one_slot_and_one_load`, in slots: two
+    // instances of one adapter hold one landing, read by one id, rebound
+    // together, forgotten at the last close.
+    fn a_shared_adapter_is_one_landing_and_one_id() {
+        let (first, second, other) = (
+            engine::InstanceId(1),
+            engine::InstanceId(2),
+            engine::InstanceId(3),
+        );
+        let mut ids = AdapterIds::default();
+        let refs = vec![40, 41, 42];
+        assert!(!ids.landed(&refs));
+        ids.land(first, refs.clone());
+        assert!(ids.landed(&refs), "the second bind finds it landed");
+        ids.land(second, refs.clone());
+        assert_eq!(ids.landed.len(), 1, "one adapter, one landing");
+        ids.land(other, vec![50, 51, 52]);
+        let (read, fresh) = ids.ids_for(&[first, second, other], 8).expect("ids");
+        assert_eq!(read[0], read[1], "one id an adapter, not an instance");
+        assert_ne!(read[0], read[2]);
+        assert!(read.iter().all(|&id| id >= layout::ZERO_IDS));
+        assert_eq!(fresh.len(), 2);
+        let id = read[0];
+        // Unparked elsewhere: the first holder told leaves the id on the old
+        // slots, which the other still names; the last moves it.
+        assert_eq!(ids.rebind(first, vec![60, 61, 62]), None);
+        assert_eq!(ids.of_id(id), Some(&refs[..]));
+        assert_eq!(ids.rebind(second, vec![60, 61, 62]), Some(id));
+        assert_eq!(ids.of_id(id), Some(&[60, 61, 62][..]));
+        assert_eq!(ids.landed.len(), 2);
+        ids.close(first);
+        assert!(ids.landed(&[60, 61, 62]), "a holder is left");
+        ids.close(second);
+        assert!(!ids.landed(&[60, 61, 62]), "forgotten at the last close");
+        assert_eq!(ids.of_id(id), None);
     }
 
     // gemma-4 (no slab) with 256 slots reserved seated a lane at 312.

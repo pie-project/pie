@@ -2533,6 +2533,15 @@ fn golden_adapter() {
     shell
         .land_adapter(instance, &refs, &planes)
         .expect("the adapter lands in its slots");
+    // A second instance of the same adapter (the runtime hands it the same
+    // slots, by content key) joins it: no second landing, one id.
+    let twin = engine::InstanceId(2);
+    assert!(shell.adapter_landed(&refs), "the first bind landed it");
+    shell
+        .join_adapter(twin, &refs)
+        .expect("the twin joins the landed adapter");
+    let read = shell.adapter_ids(&[instance, twin]).expect("ids");
+    assert_eq!(read[0], read[1], "one adapter, one id");
 
     let script = |shell: &mut Shell, adapted: bool| -> Vec<u64> {
         shell.open(0).expect("slot 0 opens");
@@ -2580,6 +2589,9 @@ fn golden_adapter() {
         "{model}: the adapter read where its chunk lay before the evacuation"
     );
     shell.close_adapter(instance);
+    assert!(shell.adapter_landed(&refs), "the twin still holds it");
+    shell.close_adapter(twin);
+    assert!(!shell.adapter_landed(&refs), "gone at the last close");
     assert_eq!(
         script(&mut shell, false),
         base,

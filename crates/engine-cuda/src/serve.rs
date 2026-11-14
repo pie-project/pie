@@ -684,6 +684,19 @@ impl Shell {
             .land_adapter(self.device.stream(), instance, refs, planes)
     }
 
+    /// Whether an adapter lies landed in `refs` already: another instance's
+    /// of the same content ([`engine::Engine::adapter_key`]).
+    #[must_use]
+    pub fn adapter_landed(&self, refs: &[u32]) -> bool {
+        self.pools.adapter_landed(refs)
+    }
+
+    /// `instance` holds the adapter landed in `refs`, which nothing writes
+    /// again.
+    pub fn join_adapter(&mut self, instance: engine::InstanceId, refs: &[u32]) -> Result<()> {
+        self.pools.join_adapter(instance, refs)
+    }
+
     /// `instance`'s adapter lies in `refs` now.
     pub fn rebind_adapter(&mut self, instance: engine::InstanceId, refs: &[u32]) -> Result<()> {
         self.pools

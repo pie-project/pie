@@ -421,6 +421,15 @@ impl Engine for Group {
         }
     }
 
+    fn adapter_key(&self, binding: &InstanceBinding) -> EngineResult<Option<u128>> {
+        match self.ranks.first().and_then(|rank| rank.try_lock().ok()) {
+            Some(rank) => rank.adapter_key(binding),
+            None => Err(Error::Program(
+                "a rank is busy: an adapter's key is asked between frames".to_string(),
+            )),
+        }
+    }
+
     fn ring_facts(
         &self,
         registration: &ChannelRegistration,

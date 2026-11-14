@@ -466,9 +466,47 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
     })
 }
 
+/// The content key of the adapter a binding of `program` lands with
+/// `seeds` (`Engine::adapter_key`): its planes are its sink's seeds read at
+/// its site into this load's banks, so the site and those seeds, in the
+/// sink's plane order, name them. `None` where the program has no sink.
+fn adapter_key_of(
+    shell: &Shell,
+    program: engine::program::ProgramId,
+    seeds: &[engine::channel::ChannelSeed],
+) -> EngineResult<Option<u128>> {
+    let Some(sink) = shell.program_adapter_sink(program).map_err(fault)? else {
+        return Ok(None);
+    };
+    // Two independent 64-bit digests of the same words: FNV-1a and the
+    // standard hasher's SipHash, side by side.
+    let mut fnv: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut sip = std::collections::hash_map::DefaultHasher::new();
+    let mut eat = |bytes: &[u8]| {
+        use std::hash::Hasher;
+        for byte in bytes {
+            fnv = (fnv ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        sip.write(bytes);
+    };
+    eat(&sink.sites.to_le_bytes());
+    for (role, channel) in &sink.planes {
+        eat(role.bank().as_bytes());
+        let wire = seeds
+            .iter()
+            .find(|seed| seed.channel == *channel)
+            .map_or(&[][..], |seed| seed.bytes.as_slice());
+        eat(&(wire.len() as u64).to_le_bytes());
+        eat(wire);
+    }
+    let sip = std::hash::Hasher::finish(&sip);
+    Ok(Some((u128::from(fnv) << 64) | u128::from(sip)))
+}
+
 /// Lands the adapter an instance of `program` carries, its planes the
-/// bind's seeds, in the `Adapter` slots the runtime took (`slots`).
-/// Whether it carries one.
+/// bind's seeds, in the `Adapter` slots the runtime took (`slots`): where
+/// another instance landed the same adapter there, it joins it and nothing
+/// is written. Whether it carries one.
 fn adapter_of(
     shell: &mut Shell,
     program: engine::program::ProgramId,
@@ -479,6 +517,10 @@ fn adapter_of(
     let Some(sink) = shell.program_adapter_sink(program).map_err(fault)? else {
         return Ok(false);
     };
+    if shell.adapter_landed(slots) {
+        shell.join_adapter(instance, slots).map_err(fault)?;
+        return Ok(true);
+    }
     let seats = shell.bank_seats();
     let site = sink.site().map_err(fault)?;
     let mut built: Vec<(String, Vec<u8>)> = Vec::new();
@@ -866,6 +908,13 @@ impl Engine for Cuda {
         match self.shell.as_ref() {
             Some(shell) => shell.program_facts(program).map_err(fault),
             None => Ok(engine::program::ProgramFacts::default()),
+        }
+    }
+
+    fn adapter_key(&self, binding: &InstanceBinding) -> EngineResult<Option<u128>> {
+        match self.shell.as_ref() {
+            Some(shell) => adapter_key_of(shell, binding.program, &binding.seeds),
+            None => Ok(None),
         }
     }
 
