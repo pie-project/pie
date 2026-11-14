@@ -189,7 +189,10 @@ fn run(gpu: &Gpu, c: &Case, seed: u64) {
         .collect();
     let xt = gpu.tensor(&x, c.rows, c.k, c.e.dtype());
     let mut y = gpu.zeros(c.rows, c.n, c.e.dtype());
-    affine::matmul(&ctx, xt, codes, scales, c.offset, offs, c.e.dtype(), &mut y).unwrap();
+    gpu.laid(&ctx, |ctx| {
+        affine::matmul(ctx, xt, codes, scales, c.offset, offs, c.e.dtype(), &mut y)
+    })
+    .unwrap();
     let (want, scale) = reference(&x, &w, c.rows as usize);
     check(
         &format!(
@@ -321,16 +324,18 @@ fn linear_quant_window() {
         let win = gpu.ints(&[live, 0, 0, 0].map(|v| v as i32));
         let mut y = gpu.zeros(rows, n, e.dtype());
         ctx.arm_stage(win.ptr);
-        affine::matmul(
-            &ctx,
-            xt,
-            codes,
-            scales,
-            OffsetKind::Post,
-            offs,
-            Dtype::Bf16,
-            &mut y,
-        )
+        gpu.laid(&ctx, |ctx| {
+            affine::matmul(
+                ctx,
+                xt,
+                codes,
+                scales,
+                OffsetKind::Post,
+                offs,
+                Dtype::Bf16,
+                &mut y,
+            )
+        })
         .unwrap();
         ctx.disarm_stage();
         let got = gpu.read(&y);
@@ -394,8 +399,10 @@ fn linear_quant_decoded() {
             .collect();
         let xt = gpu.tensor(&x, rows, k, Elem::Bf16.dtype());
         let mut y = gpu.zeros(rows, n, Elem::Bf16.dtype());
-        dequant::matmul_via_dense(&ctx, xt, codes, scales, offset, offs, Dtype::Bf16, &mut y)
-            .unwrap();
+        gpu.laid(&ctx, |ctx| {
+            dequant::matmul_via_dense(ctx, xt, codes, scales, offset, offs, Dtype::Bf16, &mut y)
+        })
+        .unwrap();
         let (want, scale) = reference(&x, &w, rows as usize);
         check(
             &format!("via dense u{bits} g{group} {offset:?}"),
@@ -538,7 +545,8 @@ fn linear_quant_tiled() {
             } else {
                 tiled::matmul_gemv
             };
-            entry(&ctx, xt, tc, ts, tb, &mut y).unwrap();
+            gpu.laid(&ctx, |ctx| entry(ctx, xt, tc, ts, tb, &mut y))
+                .unwrap();
             ctx.disarm_stage();
             let (want, scale) = reference(&x, &w, rows as usize);
             let cut = (live.unwrap_or(rows) * n) as usize;

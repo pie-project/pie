@@ -210,13 +210,19 @@ fn mhc_chain(gpu: &Gpu, s: Shape) {
         let fn_h = values(rows_out * m * h, 2, 0.05);
         let hc_fn = gpu.tensor(&fn_h, rows_out as u32, wide, Dtype::F32);
         let mut mixes = gpu.zeros(rows, rows_out as u32, Dtype::F32);
-        hc_project::project(&ctx, normed, hc_fn, m as u32, &mut mixes).unwrap();
+        gpu.laid(&ctx, |ctx| {
+            hc_project::project(ctx, normed, hc_fn, m as u32, &mut mixes)
+        })
+        .unwrap();
         let (want, tol) = host_project(&normed_h, &fn_h, m * h, rows_out);
         close_within(&what("hc_project"), &gpu.read(&mixes), &want, &tol);
 
         // The norm and the projection in one, against the host's norm.
         let mut fused = gpu.zeros(rows, rows_out as u32, Dtype::F32);
-        hc_project::norm_project(&ctx, streams, hc_fn, eps, m as u32, &mut fused).unwrap();
+        gpu.laid(&ctx, |ctx| {
+            hc_project::norm_project(ctx, streams, hc_fn, eps, m as u32, &mut fused)
+        })
+        .unwrap();
         let (want, tol) = host_project(&host_normed(s, &streams_h, eps), &fn_h, m * h, rows_out);
         close_within(&what("hc_norm_project"), &gpu.read(&fused), &want, &tol);
     }

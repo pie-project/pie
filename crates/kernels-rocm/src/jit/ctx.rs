@@ -135,18 +135,9 @@ impl Slabs {
         }
     }
 
-    /// From here on this arena's takes answer only the slabs laid for it
-    /// ([`Slabs::place`]): one past them faults rather than allocate.
-    pub fn seal(&self) {
-        #[cfg(feature = "rocm")]
-        {
-            crate::jit::device::seal(self.id());
-        }
-    }
-
     /// The bytes takes asked past what was placed for them (a slab not
-    /// placed, or placed smaller) since the process began: what still grows
-    /// by allocation.
+    /// placed, or placed smaller) since the process began: each one a
+    /// launch refused.
     #[must_use]
     pub fn unplaced_bytes() -> usize {
         #[cfg(feature = "rocm")]
@@ -156,18 +147,6 @@ impl Slabs {
         #[cfg(not(feature = "rocm"))]
         {
             0
-        }
-    }
-
-    #[must_use]
-    pub fn census() -> Vec<(&'static str, usize)> {
-        #[cfg(feature = "rocm")]
-        {
-            crate::jit::device::census()
-        }
-        #[cfg(not(feature = "rocm"))]
-        {
-            Vec::new()
         }
     }
 
@@ -192,13 +171,15 @@ impl Slabs {
         }
     }
 
-    /// Frees every slab these arenas hold.
+    /// Forgets the slabs laid for these arenas; their memory is the placing
+    /// caller's to free.
     ///
     /// # Safety
     ///
-    /// Nothing reads the slabs again: no `Ctx` carrying them fires after
-    /// this, and no graph captured on their stream is replayed. A `Slabs` is
-    /// `Copy`, so that is the caller's to keep across every copy.
+    /// Nothing reads the slabs again through these arenas: no `Ctx` carrying
+    /// them fires after this, and no graph captured on their stream is
+    /// replayed. A `Slabs` is `Copy`, so that is the caller's to keep across
+    /// every copy.
     pub unsafe fn release(self) {
         #[cfg(feature = "rocm")]
         {
@@ -229,7 +210,7 @@ impl Pad {
 pub const NO_REGION: u32 = u32::MAX;
 
 /// The tickets a stream holds ([`Ctx::tickets`]): every launch that draws
-/// them asks for this many, so the slab never grows past its warm size.
+/// them asks for this many, so one laid slab serves every one.
 pub const TICKETS: u32 = 1 << 16;
 
 #[cfg(feature = "rocm")]
@@ -281,7 +262,7 @@ impl Ctx {
 
     /// Launches that run in `owner`'s order — a conditional body, captured
     /// on its own stream and replayed inside `owner`'s graph — share
-    /// `owner`'s per-stream slabs, so what a load warmed there serves them.
+    /// `owner`'s per-stream slabs, so what a load laid there serves them.
     #[must_use]
     pub const fn in_order_of(mut self, owner: *mut c_void) -> Self {
         self.owner = owner;
@@ -383,7 +364,6 @@ impl Ctx {
             crate::jit::device::take(
                 self.slabs.0,
                 self.stream,
-                self.stream,
                 name,
                 self.region.get(),
                 bytes,
@@ -400,8 +380,7 @@ impl Ctx {
     /// A slab one per stream, whatever region asks: for a tile a launch
     /// fills and the next launch on the same stream consumes, so a model
     /// with hundreds of such regions holds one tile a stream, not one a
-    /// region. A capture sees the slab as it was warmed, so arming fires
-    /// the widest plane eagerly first.
+    /// region.
     pub fn scratch_stream(
         &self,
         op: &'static str,
@@ -412,7 +391,6 @@ impl Ctx {
         {
             crate::jit::device::take(
                 self.slabs.0,
-                self.stream,
                 self.owner,
                 name,
                 NO_REGION,
@@ -427,15 +405,14 @@ impl Ctx {
         }
     }
 
-    /// `count` i32 tickets, zero when first handed out, one slab a stream:
+    /// `count` i32 tickets, zero as laid, one slab a stream:
     /// a launch that draws them puts every one back to zero before it ends
     /// (its last block), so the next launch on the stream finds them zero.
     pub fn tickets(&self, op: &'static str, count: u32) -> Result<u64, Error> {
         #[cfg(feature = "rocm")]
         {
-            crate::jit::device::take_zeroed(
+            crate::jit::device::take(
                 self.slabs.0,
-                self.stream,
                 self.owner,
                 "pie.tickets",
                 NO_REGION,
@@ -460,7 +437,7 @@ impl Ctx {
         #[cfg(feature = "rocm")]
         {
             let region = SHARED_REGION.saturating_sub(self.lane.get().min(1 << 8));
-            crate::jit::device::take(self.slabs.0, self.stream, self.stream, name, region, bytes)
+            crate::jit::device::take(self.slabs.0, self.stream, name, region, bytes)
                 .map_err(|fault| fault.at(op))
         }
         #[cfg(not(feature = "rocm"))]

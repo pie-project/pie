@@ -628,7 +628,7 @@ impl RaiseFunding {
         pid: uuid::Uuid,
         quorum: uuid::Uuid,
         rows: u32,
-        epoch_now: impl Fn() -> u64 + Send + 'static,
+        epoch_now: impl Fn() -> u64 + Send + Sync + 'static,
     ) -> Self {
         let stop = Arc::new(tokio::sync::Notify::new());
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -706,44 +706,20 @@ impl RaiseFunding {
                         // Given back first: its pages go back through the
                         // pool's own lock.
                         drop(grant);
-                        // Planned and taken in one hold of the pool: no
-                        // slot is handed out between, and the engine's
-                        // copy follows.
-                        let evacuation = {
-                            let mut pool = shared.lock().unwrap();
-                            let goal = crate::store::shared::rung_goal(&pool, engine, rows);
-                            (goal > pool.rung() && pool.copying().is_none())
-                                .then(|| pool.plan_raise(goal))
-                                .and_then(Result::ok)
-                                .filter(|evacuation| pool.raise_applied(evacuation).is_ok())
+                        let mover = crate::store::shared::programs::LaneMover {
+                            engine,
+                            epoch_now: &epoch_now,
                         };
-                        if let Some(evacuation) = evacuation {
-                            if !evacuation.moves.is_empty() {
-                                let copied = crate::scheduler::pool(
-                                    engine,
-                                    crate::scheduler::worker::PoolOp::Evacuate(
-                                        crate::store::shared::SharedPool::rung_moves(&evacuation),
-                                    ),
-                                )
-                                .await;
-                                if let Err(error) = copied {
-                                    tracing::error!(
-                                        engine,
-                                        %error,
-                                        "a raise's copy was refused; the rung stays held"
-                                    );
-                                    *failed.lock().unwrap() = Some(error.to_string());
-                                    return;
-                                }
-                                let next = epoch_now().saturating_add(1);
-                                shared.lock().unwrap().raise_copied(next);
-                            }
-                            tracing::info!(
-                                engine,
-                                rung = evacuation.rung,
-                                moved = evacuation.moves.len(),
-                                "the activation rung is raised"
-                            );
+                        let taken = crate::store::shared::programs::take_raise(
+                            &shared,
+                            |pool| crate::store::shared::rung_goal(pool, engine, rows),
+                            &mover,
+                        )
+                        .await;
+                        if let Err(error) = taken {
+                            tracing::error!(engine, %error, "a raise's copy was refused");
+                            *failed.lock().unwrap() = Some(error);
+                            return;
                         }
                         crate::store::shared::raise_now(&shared, engine, rows);
                         tokio::time::sleep(std::time::Duration::from_millis(2)).await;

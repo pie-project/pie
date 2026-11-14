@@ -146,7 +146,8 @@ fn the_sorted_routed_mlp_answers_the_steps() {
     let mut want = m.y;
     let mut have = gpu.zeros(tokens as u32, hidden as u32, dt);
     let steps = gpu.ctx().with_tuning(tuning(0, 0, None));
-    moe::mlp_swiglu(&steps, &m.p, &mut want).unwrap();
+    gpu.laid(&steps, |ctx| moe::mlp_swiglu(ctx, &m.p, &mut want))
+        .unwrap();
     // The leg takes contractions from `lt_deep_k`; these are short of the
     // profile's.
     let sorted = gpu.ctx().with_tuning(Tuning {
@@ -154,7 +155,8 @@ fn the_sorted_routed_mlp_answers_the_steps() {
         ..tuning(1, 0, None)
     });
     let fired = moe::lt_grouped_fires();
-    moe::mlp_swiglu(&sorted, &m.p, &mut have).unwrap();
+    gpu.laid(&sorted, |ctx| moe::mlp_swiglu(ctx, &m.p, &mut have))
+        .unwrap();
     assert_eq!(
         moe::lt_grouped_fires(),
         fired + 2,
@@ -184,8 +186,14 @@ fn the_ordered_routed_mlp_answers_the_steps() {
         m.p.limit = limit;
         let mut want = m.y;
         let mut have = gpu.zeros(tokens as u32, hidden as u32, dt);
-        moe::mlp_swiglu(&gpu.ctx().with_tuning(tuning(0, 0, None)), &m.p, &mut want).unwrap();
-        moe::mlp_swiglu(&gpu.ctx().with_tuning(tuning(0, 1, None)), &m.p, &mut have).unwrap();
+        let (steps, grouped) = (
+            gpu.ctx().with_tuning(tuning(0, 0, None)),
+            gpu.ctx().with_tuning(tuning(0, 1, None)),
+        );
+        gpu.laid(&steps, |ctx| moe::mlp_swiglu(ctx, &m.p, &mut want))
+            .unwrap();
+        gpu.laid(&grouped, |ctx| moe::mlp_swiglu(ctx, &m.p, &mut have))
+            .unwrap();
         let (want, have) = (gpu.read(&want), gpu.read(&have));
         for (i, (&h, &w)) in have.iter().zip(&want).enumerate() {
             assert!(
@@ -227,7 +235,10 @@ fn the_decode_routed_mlp_answers_the_steps() {
         let mut packed = gpu.zeros(rows, 2 * inter as u32, dt);
         let mut h = gpu.zeros(rows, inter as u32, dt);
         let mut by_steps = gpu.zeros(rows, hidden as u32, dt);
-        gemm::matmul(&ctx, m.p.x, banks.gate_up, &mut packed).unwrap();
+        gpu.laid(&ctx, |ctx| {
+            gemm::matmul(ctx, m.p.x, banks.gate_up, &mut packed)
+        })
+        .unwrap();
         glu::swiglu(&ctx, packed, inter as u32, 1, &mut h).unwrap();
         gemm::matmul(&ctx, h, banks.down, &mut by_steps).unwrap();
         let gate_w = gpu.tensor(&values(hidden, 12, 0.05), 1, hidden as u32, dt);
@@ -235,7 +246,8 @@ fn the_decode_routed_mlp_answers_the_steps() {
         gemm::matmul(&ctx, m.p.x, gate_w, &mut gate_steps).unwrap();
         let unlanded = gpu.zeros(rows, 1, dt);
         let mut routed = m.y;
-        moe::mlp_swiglu(&ctx, &m.p, &mut routed).unwrap();
+        gpu.laid(&ctx, |ctx| moe::mlp_swiglu(ctx, &m.p, &mut routed))
+            .unwrap();
         for absorbed in [false, true] {
             let mut want = gpu.zeros(rows, hidden as u32, dt);
             let (input, logits) = if absorbed {
@@ -266,11 +278,17 @@ fn the_decode_routed_mlp_answers_the_steps() {
                         "{tokens} tokens: the batch legs land the shared expert"
                     );
                     if !takes {
-                        assert!(!moe::decode_mlp(&ctx, &m.p, fold, &mut y).unwrap());
+                        assert!(
+                            !gpu.laid(&ctx, |ctx| moe::decode_mlp(ctx, &m.p, fold, &mut y))
+                                .unwrap()
+                        );
                         continue;
                     }
                 }
-                assert!(moe::decode_mlp(&ctx, &m.p, fold, &mut y).unwrap());
+                assert!(
+                    gpu.laid(&ctx, |ctx| moe::decode_mlp(ctx, &m.p, fold, &mut y))
+                        .unwrap()
+                );
                 let (have, want) = if gated {
                     (gpu.read(&out), gpu.read(&want))
                 } else {

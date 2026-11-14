@@ -140,18 +140,20 @@ fn launch(gpu: &Gpu, case: &Case, b: &mut Bound, walk: Walk) {
     } else {
         ssm::gated_delta_chunked
     };
-    run(
-        &ctx,
-        b.qkv,
-        Tensor::ABSENT,
-        b.gates,
-        &b.state,
-        case.k_heads,
-        case.v_heads,
-        D,
-        D,
-        &mut b.y,
-    )
+    gpu.laid(&ctx, |ctx| {
+        run(
+            ctx,
+            b.qkv,
+            Tensor::ABSENT,
+            b.gates,
+            &b.state,
+            case.k_heads,
+            case.v_heads,
+            D,
+            D,
+            &mut b.y,
+        )
+    })
     .unwrap();
 }
 

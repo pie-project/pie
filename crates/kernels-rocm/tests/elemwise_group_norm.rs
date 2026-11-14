@@ -27,18 +27,17 @@ fn check(gpu: &Gpu, boxes: &[Box3], c: usize, groups: usize, silu: bool) {
     let want = group_norm_ref(&x, boxes, c, groups, &weight, &bias, eps, silu);
 
     let mut o = gpu.zeros(rows as u32, c as u32, Dtype::Bf16);
-    group_norm(
-        &gpu.ctx(),
+    let (xt, gt) = (
         gpu.tensor(&x, rows as u32, c as u32, Dtype::Bf16),
         gpu.ints_shaped(&grid, boxes.len() as u32, 4),
-        groups as u32,
+    );
+    let (wt, bt) = (
         gpu.tensor(&weight, c as u32, 1, Dtype::F32),
         gpu.tensor(&bias, c as u32, 1, Dtype::F32),
-        eps,
-        silu,
-        &mut o,
-        0,
-    )
+    );
+    gpu.laid(&gpu.ctx(), |ctx| {
+        group_norm(ctx, xt, gt, groups as u32, wt, bt, eps, silu, &mut o, 0)
+    })
     .expect("the norm fires");
     for (i, (&g, &w)) in gpu.read(&o).iter().zip(&want).enumerate() {
         assert!(

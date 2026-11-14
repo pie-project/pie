@@ -7,6 +7,7 @@
 
 use dtype::Dtype;
 use kernels_rocm::hip::{self, blas};
+use kernels_rocm::jit::{SlabKey, Slabs};
 use kernels_rocm::{Ctx, KvPool, RecurrentPool, Snapshots, Tensor};
 
 pub mod spread;
@@ -15,6 +16,10 @@ pub struct Gpu {
     pub stream: hip::Stream,
     blas: blas::Handle,
     buffers: std::cell::RefCell<Vec<hip::Buffer>>,
+    /// This `Gpu`'s slab arena, and each slab laid in it so far at its
+    /// bytes ([`Gpu::laid`]).
+    slabs: Slabs,
+    laid: std::cell::RefCell<std::collections::HashMap<SlabKey, usize>>,
 }
 
 impl Gpu {
@@ -31,13 +36,47 @@ impl Gpu {
             stream: hip::Stream::new().ok()?,
             blas: blas::Handle::new().ok()?,
             buffers: std::cell::RefCell::new(Vec::new()),
+            slabs: Slabs::open(),
+            laid: std::cell::RefCell::new(std::collections::HashMap::new()),
         })
     }
 
     pub fn ctx(&self) -> Ctx {
         // SAFETY: the stream and handle live as long as `self`, which every
         // test holds past its last fire.
-        unsafe { Ctx::on(self.stream.raw()).with_blas(self.blas.raw()) }
+        unsafe {
+            Ctx::on(self.stream.raw())
+                .with_blas(self.blas.raw())
+                .with_slabs(self.slabs)
+        }
+    }
+
+    /// `launch` on `ctx` as the engine fires it: walked size-only first
+    /// (`kernels_rocm::sizing`), the slabs it asks for laid zeroed in memory
+    /// this `Gpu` keeps, then fired. A slab laid before at as many bytes
+    /// keeps its place, so a later launch reads what an earlier one left in
+    /// a stream's tile.
+    pub fn laid<T>(&self, ctx: &Ctx, mut launch: impl FnMut(&Ctx) -> T) -> T {
+        kernels_rocm::sizing::begin();
+        let _ = launch(ctx);
+        let walked = kernels_rocm::sizing::end();
+        let fresh: Vec<(SlabKey, usize)> = {
+            let laid = self.laid.borrow();
+            walked
+                .placed()
+                .into_iter()
+                .filter(|(key, bytes)| laid.get(key).is_none_or(|have| have < bytes))
+                .collect()
+        };
+        if !fresh.is_empty() {
+            let base = self
+                .keep(hip::Buffer::from_slice(&vec![0u8; Slabs::placed_bytes(&fresh)]).unwrap());
+            // SAFETY: `base` is zeroed device memory of the slabs' bytes,
+            // kept as long as this `Gpu`, whose arena they are laid in.
+            unsafe { Slabs::place(base as *mut core::ffi::c_void, &fresh) };
+            self.laid.borrow_mut().extend(fresh);
+        }
+        launch(ctx)
     }
 
     /// Mean device microseconds per call of `f` over `reps` calls, after one
@@ -96,7 +135,7 @@ impl Gpu {
         assert_eq!(code, hip::sys::HIP_SUCCESS, "hipMemset");
     }
 
-    fn keep(&self, buffer: hip::Buffer) -> u64 {
+    pub fn keep(&self, buffer: hip::Buffer) -> u64 {
         let ptr = buffer.device_ptr();
         self.buffers.borrow_mut().push(buffer);
         ptr
@@ -390,4 +429,13 @@ pub fn report_err(what: &str, got: &[f32], want: &[f32]) {
         "KERR {} max_abs={abs} max_rel={rel}",
         what.replace(' ', "_")
     );
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        let _ = self.stream.synchronize();
+        // SAFETY: the stream is drained and no context over this arena
+        // outlives the `Gpu`.
+        unsafe { self.slabs.release() };
+    }
 }

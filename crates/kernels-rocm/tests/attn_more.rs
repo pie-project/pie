@@ -445,10 +445,13 @@ fn check_selected(gpu: &Gpu, case: Sel) {
         )
         .unwrap();
         built.stage(&ctx).unwrap();
-        let took = attn::prefill_selected_tiled(
-            &ctx, q, &built, selection, &pool, None, d, hk, scale, ratio, per_head, &mut o,
-        )
-        .unwrap();
+        let took = gpu
+            .laid(&ctx, |ctx| {
+                attn::prefill_selected_tiled(
+                    ctx, q, &built, selection, &pool, None, d, hk, scale, ratio, per_head, &mut o,
+                )
+            })
+            .unwrap();
         assert!(took, "the tiled selected prefill refused d{d} {hq}/{hk}");
         gpu.sync();
         let got = gpu.read(&o);
@@ -461,9 +464,11 @@ fn check_selected(gpu: &Gpu, case: Sel) {
         got
     } else if walk == Decode {
         let mut o = o;
-        selected::attention_decode_selected(
-            &ctx, q, selection, &pool, None, d, scale, ratio, per_head, &mut o,
-        )
+        gpu.laid(&ctx, |ctx| {
+            selected::attention_decode_selected(
+                ctx, q, selection, &pool, None, d, scale, ratio, per_head, &mut o,
+            )
+        })
         .unwrap();
         let got = gpu.read(&o);
         spread(&mut |pool, mut o| {
@@ -475,9 +480,11 @@ fn check_selected(gpu: &Gpu, case: Sel) {
         got
     } else {
         let mut o = o;
-        selected::attention_prefill_selected(
-            &ctx, q, selection, &pool, None, d, hk, scale, ratio, per_head, &mut o,
-        )
+        gpu.laid(&ctx, |ctx| {
+            selected::attention_prefill_selected(
+                ctx, q, selection, &pool, None, d, hk, scale, ratio, per_head, &mut o,
+            )
+        })
         .unwrap();
         let got = gpu.read(&o);
         spread(&mut |pool, mut o| {
