@@ -130,13 +130,22 @@ enum ReservedError {
 }
 
 fn stale_demand_error() -> String {
-    format!(
-        "pipeline: resource demand kept drifting under contention \
-         (still stale after {STALE_DEMAND_ATTEMPTS} re-acquisitions)"
-    )
+    "pipeline: resource demand reads stale against a grant quoted for the same demand".to_string()
 }
 
-const STALE_DEMAND_ATTEMPTS: usize = 3;
+/// A grant found stale is quoted again only on the drift event: the demand
+/// read now differs from the one it was quoted for. Stale against the very
+/// demand it was quoted for, no new quote can cover it, and it is refused.
+fn requote_on_drift(
+    stale_at: &mut Option<crate::planner::Demand>,
+    quoted: crate::planner::Demand,
+) -> bool {
+    if *stale_at == Some(quoted) {
+        return false;
+    }
+    *stale_at = Some(quoted);
+    true
+}
 
 /// A kv epoch a fire holds: settled by whoever finishes the fire, or, let go
 /// unsettled, when dropped — at once while the fire was never submitted,
@@ -1560,7 +1569,7 @@ async fn reserve<C: FireContext>(
     rs_plan: impl Fn() -> Result<rs::RsPlan, String>,
     windowed: bool,
 ) -> Result<Reserved, String> {
-    let mut attempts = 0;
+    let mut stale_at = None;
     'grant: loop {
         let mut kv_pages = 0usize;
         for (set, written) in sets {
@@ -1598,7 +1607,7 @@ async fn reserve<C: FireContext>(
                     epoch: FireEpoch::begin(model, engine, stores, ctx.process_id()),
                 });
             }
-            Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => attempts += 1,
+            Err(ReservedError::Stale) if requote_on_drift(&mut stale_at, demand) => {}
             Err(ReservedError::Stale) => return Err(stale_demand_error()),
             Err(ReservedError::Fatal(error)) => return Err(error),
         }
@@ -4732,6 +4741,33 @@ pub(crate) mod lifecycle_tests {
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
+    }
+
+    /// A stale grant is quoted again on drift (the demand changed), not by
+    /// count, and refused when stale against the demand it was quoted for.
+    #[test]
+    fn a_stale_grant_is_quoted_again_only_on_drift() {
+        let demand = |kv_pages| crate::planner::Demand {
+            kv_pages,
+            rs: crate::store::rs::RsUnits::default(),
+        };
+        let mut stale_at = None;
+        assert!(
+            requote_on_drift(&mut stale_at, demand(4)),
+            "first stale: quoted again"
+        );
+        assert!(
+            requote_on_drift(&mut stale_at, demand(6)),
+            "drifted: quoted again"
+        );
+        assert!(
+            requote_on_drift(&mut stale_at, demand(7)),
+            "drifted again: however often"
+        );
+        assert!(
+            !requote_on_drift(&mut stale_at, demand(7)),
+            "stale against the demand it was quoted for: refused"
+        );
     }
 
     /// A piece waiting for a wider rung wakes when the cap is lifted, not
