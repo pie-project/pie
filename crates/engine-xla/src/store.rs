@@ -1241,10 +1241,20 @@ impl Pools {
             let rows = self.shape(id)?.slot_bytes / ROW_BYTES;
             by.entry(rows).or_default().push(self.rows_at(id, q)?);
         }
-        for (rows, mut at) in by {
-            at.sort_unstable();
-            at.dedup();
-            pad_pow2(&mut at, 1);
+        for (rows, mut all) in by {
+            all.sort_unstable();
+            all.dedup();
+            self.zero_rows(device, handles, rows, &all)?;
+        }
+        Ok(())
+    }
+
+    /// Zeros blocks of `rows` pool rows from each of `all`, `SLOT_BATCH` a
+    /// program run.
+    fn zero_rows(&mut self, device: &Device, handles: &Handles, rows: u64, all: &[i64]) -> Result<()> {
+        for chunk in all.chunks(SLOT_BATCH) {
+            let mut at = chunk.to_vec();
+            pad_batch(&mut at, 1);
             let (inputs, list) = indices(handles, &at);
             let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
             let root = self.root;
@@ -1285,25 +1295,34 @@ impl Pools {
         self.copy_rows(device, handles, &spans)
     }
 
-    /// Runs, at load, every whole-record copy program a snapshot lands
-    /// (`crate::snapshot`): a record's pieces of equal rows copy in one
-    /// program, padded to a power of two, so each count up to a record's.
-    /// Each copies the pool's first rows onto themselves.
+    /// Runs, at load, every maintenance program a fire, a snapshot or a
+    /// park lands later: the slot copy, write and zero, `SLOT_BATCH` slots
+    /// a run, at each slot size the pool states (its state shapes, the
+    /// `Channel` slots, a whole chunk for an evacuation). Each lands the
+    /// null chunk's rows (zeros) onto themselves.
     pub fn warm_copies(&mut self, device: &Device, handles: &Handles) -> Result<()> {
-        let mut by_rows: std::collections::BTreeMap<u64, u32> = Default::default();
-        let fixed: Vec<(ShapeId, u32)> = self.fixed_shapes().collect();
-        for (id, pieces) in fixed {
-            *by_rows
-                .entry(self.shape(id)?.slot_bytes / ROW_BYTES)
-                .or_default() += pieces;
+        let mut sizes: std::collections::BTreeSet<u64> = self
+            .layout
+            .shapes
+            .iter()
+            .map(|shape| shape.slot_bytes / ROW_BYTES)
+            .collect();
+        sizes.insert(crate::guest::CHANNEL_SLOT / ROW_BYTES);
+        sizes.insert(self.layout.chunk_bytes / ROW_BYTES);
+        for rows in sizes {
+            self.copy_rows(device, handles, &[(rows, 0, 0)])?;
+            let zeros = vec![0u8; (rows * ROW_BYTES) as usize];
+            self.write_rows(device, handles, rows, vec![0], &zeros)?;
         }
-        for (rows, pieces) in by_rows {
-            let mut n = 1;
-            while n <= pieces.next_power_of_two() {
-                let spans = vec![(rows, 0, 0); n as usize];
-                self.copy_rows(device, handles, &spans)?;
-                n *= 2;
-            }
+        // The zero a fresh record starts from, at each fixed shape's size,
+        // landed on the sink.
+        let sink = i64::from(self.sink_row());
+        let fixed: std::collections::BTreeSet<u64> = self
+            .fixed_shapes()
+            .filter_map(|(id, _)| self.shape(id).ok().map(|s| s.slot_bytes / ROW_BYTES))
+            .collect();
+        for rows in fixed {
+            self.zero_rows(device, handles, rows, &[sink])?;
         }
         Ok(())
     }
@@ -1322,11 +1341,12 @@ impl Pools {
             let end = (at..spans.len())
                 .find(|&i| spans[i].0 != rows)
                 .unwrap_or(spans.len());
-            let mut flat: Vec<i64> = spans[at..end]
+          for chunk in spans[at..end].chunks(SLOT_BATCH) {
+            let mut flat: Vec<i64> = chunk
                 .iter()
                 .flat_map(|&(_, from, to)| [from, to])
                 .collect();
-            pad_pow2(&mut flat, 2);
+            pad_batch(&mut flat, 2);
             let (inputs, list) = indices(handles, &flat);
             let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
             let root = self.root;
@@ -1343,6 +1363,7 @@ impl Pools {
                 cx.write(root, whole)
             })?;
             crate::exec::maintain(device, tracer, self, &inputs)?;
+          }
             at = end;
         }
         Ok(())
@@ -1454,49 +1475,26 @@ impl Pools {
     pub fn read_slots(
         &mut self,
         device: &Device,
-        handles: &Handles,
+        _handles: &Handles,
         id: ShapeId,
         slots: &[u32],
     ) -> Result<Vec<u8>> {
         if slots.is_empty() || device.is_dry() {
             return Ok(Vec::new());
         }
+        // Each slot's rows straight off the pool (no program, no output
+        // buffer), ordered after every program that wrote it.
         let rows = self.slot_rows(id)?;
-        let mut at: Vec<i64> = slots
-            .iter()
-            .map(|&slot| self.slot_row(id, slot))
-            .collect::<Result<_>>()?;
-        let n = at.len();
-        pad_pow2(&mut at, 1);
-        let (inputs, list) = indices(handles, &at);
-        let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
-        let root = self.root;
-        let mut out = None;
-        tracer.emit(&mut |cx| {
-            let whole = cx.read(root)?;
-            let col = cx.const_i(Elem::I32, 0, &[]);
-            let mut blocks = Vec::with_capacity(at.len());
-            for m in 0..at.len() as i64 {
-                let row = index_at(cx, list, m, 1)?;
-                blocks.push(cx.dynamic_slice(whole, &[row, col], &[rows as i64, 128])?);
-            }
-            out = Some(if blocks.len() == 1 {
-                blocks[0]
-            } else {
-                cx.concat(&blocks, 0)?
-            });
-            Ok(())
+        let whole = self.buffer.as_ref().ok_or_else(|| Fault::Unbound {
+            what: "the pool, which a program still holds".to_string(),
         })?;
-        let out = out.expect("the gather emitted");
-        let got = crate::exec::run(device, tracer, &[out], None, self, &inputs, true)?;
-        let bytes = got
-            .first()
-            .ok_or_else(|| Fault::Unbound {
-                what: "the gathered slots, which the program did not return".to_string(),
-            })?
-            .download()?;
-        let len = (n as u64 * rows * ROW_BYTES) as usize;
-        Ok(bytes[..len.min(bytes.len())].to_vec())
+        let len = i64::try_from(rows * ROW_BYTES).unwrap_or(i64::MAX);
+        let mut out = Vec::with_capacity(slots.len() * len as usize);
+        for &slot in slots {
+            let row = self.slot_row(id, slot)?;
+            out.extend(whole.read_raw(row * ROW_BYTES as i64, len)?);
+        }
+        Ok(out)
     }
 
     /// Lands `bytes` (each of `slots` whole, in order, one shape) in the
@@ -1543,9 +1541,18 @@ impl Pools {
         if at.is_empty() || device.is_dry() {
             return Ok(());
         }
+        if at.len() > SLOT_BATCH {
+            let per = (rows * ROW_BYTES) as usize;
+            for (k, chunk) in at.chunks(SLOT_BATCH).enumerate() {
+                let from = k * SLOT_BATCH * per;
+                let bytes = &bytes[from..from + chunk.len() * per];
+                self.write_rows(device, handles, rows, chunk.to_vec(), bytes)?;
+            }
+            return Ok(());
+        }
         // Pads repeat the last slot with its own bytes.
         let n = at.len();
-        pad_pow2(&mut at, 1);
+        pad_batch(&mut at, 1);
         let mut data = bytes.to_vec();
         let last = bytes[bytes.len() - (rows * ROW_BYTES) as usize..].to_vec();
         for _ in n..at.len() {
@@ -1600,10 +1607,16 @@ impl Pools {
 
 /// Pads `list` (pairs when `per` is 2) to a power of two by repeating its
 /// last entry, which lands again what it landed.
-fn pad_pow2(list: &mut Vec<i64>, per: usize) {
-    let n = (list.len() / per).next_power_of_two();
+/// Slots (or slot pairs) a maintenance program moves a run: every slot
+/// read, write, copy and zero runs over this many, so one program a slot
+/// size serves them all and the warm ladder builds it (`warm_copies`).
+pub const SLOT_BATCH: usize = 16;
+
+/// Pads `list` (pairs when `per` is 2) to `SLOT_BATCH` entries by repeating
+/// its last, which lands again what it landed.
+fn pad_batch(list: &mut Vec<i64>, per: usize) {
     let last: Vec<i64> = list[list.len() - per..].to_vec();
-    while list.len() < n * per {
+    while list.len() < SLOT_BATCH * per {
         list.extend_from_slice(&last);
     }
 }
