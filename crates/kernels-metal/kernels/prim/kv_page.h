@@ -20,17 +20,19 @@ constant ulong pie_fc_v_page [[function_constant(1)]];
 constant bool pie_fc_pages = is_function_constant_defined(pie_fc_k_page) &&
                              is_function_constant_defined(pie_fc_v_page);
 
-// A pool past one buffer's length spans up to four (`engine-metal`'s
-// `store::pool`): a page id then names its buffer in bits 29 and 30 and its
-// page in that buffer under them (`PART_SHIFT`), so every id stays a
-// non-negative `int` in the page tables, and a kernel reaches buffer `b` from
-// the plane bound in the first by buffer `b`'s address less the first's
-// (`pie_fc_pool_delta1..3`, bytes, wrapping). Function constants, fixed for
-// a load, so a pool of one buffer compiles to `page * stride`, bit for bit.
+// A pool past one buffer's length spans as many buffers as it takes
+// (`engine-metal`'s `store::pool`): a page id then names its buffer in the
+// bits over `pie_fc_part_shift` (the bits that count the buffers, under the
+// sign bit, so every id stays a non-negative `int` in the page tables) and
+// its page in that buffer under them, and a kernel reaches buffer `b` from
+// the plane bound in the first by buffer `b`'s address less the first's:
+// entry `b` of the delta table at device address `pie_fc_part_table` (bytes,
+// wrapping), which lies in the pool's first buffer. Function constants,
+// fixed for a load, so a pool of one buffer compiles to `page * stride`,
+// bit for bit.
 constant bool pie_fc_pool_split [[function_constant(2)]];
-constant ulong pie_fc_pool_delta1 [[function_constant(3)]];
-constant ulong pie_fc_pool_delta2 [[function_constant(4)]];
-constant ulong pie_fc_pool_delta3 [[function_constant(5)]];
+constant uint pie_fc_part_shift [[function_constant(3)]];
+constant ulong pie_fc_part_table [[function_constant(4)]];
 constant bool pie_pool_split =
     is_function_constant_defined(pie_fc_pool_split) && pie_fc_pool_split;
 
@@ -52,7 +54,7 @@ inline ulong pie_page_at(uint page, ulong stride, ulong unit) {
   if (!pie_pool_split && !pie_slot_split) {
     return ulong(page) * stride;
   }
-  const uint local = pie_pool_split ? page & 0x1fffffffu : page;
+  const uint local = pie_pool_split ? page & ((1u << pie_fc_part_shift) - 1u) : page;
   const ulong at =
       pie_slot_split
           ? ulong(local >> pie_fc_slot_shift) * (pie_fc_chunk_bytes / unit) +
@@ -61,11 +63,9 @@ inline ulong pie_page_at(uint page, ulong stride, ulong unit) {
   if (!pie_pool_split) {
     return at;
   }
-  const uint part = page >> 29;
-  const ulong delta = part == 0u   ? 0ul
-                      : part == 1u ? pie_fc_pool_delta1
-                      : part == 2u ? pie_fc_pool_delta2
-                                   : pie_fc_pool_delta3;
+  const uint part = page >> pie_fc_part_shift;
+  const ulong delta =
+      part == 0u ? 0ul : reinterpret_cast<const device ulong*>(pie_fc_part_table)[part];
   return at + ulong(long(delta) / long(unit));
 }
 

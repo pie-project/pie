@@ -66,10 +66,11 @@ pub struct Seats {
     pub row_bands: Vec<Tensor>,
 }
 
-/// Bytes of one state row's segment table: its head and one segment.
-/// A state row's segment table: the head and a base for each buffer the
-/// range may span (`pool::MAX_PARTS`), the unused ones repeating the last.
-const STATE_MAP_BYTES: u64 = ((StateMap::HEAD + pool::MAX_PARTS) * 8) as u64;
+/// Bytes of one state row's segment table where the range spans `parts`
+/// buffers: the head and a base a buffer.
+const fn state_map_bytes(parts: usize) -> u64 {
+    ((StateMap::HEAD + parts) * 8) as u64
+}
 
 #[derive(Debug)]
 struct Spill {

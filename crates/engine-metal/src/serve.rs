@@ -1023,7 +1023,23 @@ impl PreparedLoad<'_> {
         // The engine's own tables (`Reserved::Tables`): a run of whole
         // chunks right after the null chunk, model bytes in the pool: the
         // registered adapter banks, the weight caches' atom tables and use
-        // counters and the state maps.
+        // counters, the state maps and the buffers' delta table. The maps
+        // and the table take a word a buffer, sized for the most buffers the
+        // device's working set (or the stated kv budget) can take.
+        let part_cap = crate::store::pool::part_cap(&device);
+        let part_chunks = crate::store::pool::part_chunks(
+            part_cap,
+            rows.chunk_bytes,
+            crate::store::pool::segment_chunks(rows.chunk_bytes),
+        );
+        let parts_bound = usize::try_from(
+            device
+                .working_set()
+                .max(boot.kv_budget.unwrap_or(0))
+                .div_ceil(u64::from(part_chunks.max(1)) * rows.chunk_bytes.max(1))
+                + 1,
+        )
+        .unwrap_or(usize::MAX);
         let tables_chunks = u32::try_from(
             (weights.bank_bytes()
                 + crate::arena::room(scratch.constant_bytes())
@@ -1031,7 +1047,7 @@ impl PreparedLoad<'_> {
                     .iter()
                     .map(|cache| crate::store::streamed::Cache::table_bytes_for(&cache.shape))
                     .sum::<u64>()
-                + Pools::map_bytes(rows.state_rows()))
+                + Pools::map_bytes(rows.state_rows(), parts_bound))
             .div_ceil(rows.chunk_bytes.max(1)),
         )
         .unwrap_or(u32::MAX);
@@ -1115,31 +1131,30 @@ impl PreparedLoad<'_> {
                 .map_err(|short| Fault::Residency(short.to_string()))?
                 .saturating_add(span)
                 .saturating_add(tables_chunks);
-            // The range spans up to `MAX_PARTS` buffers, each as many whole
-            // segments as one buffer binds; the span lies in the last.
-            let cap = crate::store::pool::part_cap(&device);
-            let per = crate::store::pool::part_chunks(
-                cap,
-                chunk,
-                crate::store::pool::segment_chunks(chunk),
-            );
-            let binds = per.saturating_mul(crate::store::pool::MAX_PARTS as u32);
-            if binds < least.saturating_add(span).saturating_add(tables_chunks) || per < span {
+            // The range spans as many buffers as it takes, each as many
+            // whole segments as one buffer binds; the span lies in the last.
+            let per = part_chunks;
+            if per < span {
                 return Err(Fault::Residency(format!(
-                    "one working set takes {least} chunks of {chunk} bytes and one fire's \
-                     activation {span}, and this device binds {} buffers of {} MiB, the \
-                     activation in one",
-                    crate::store::pool::MAX_PARTS,
-                    cap >> 20
+                    "one fire's activation takes {span} chunks of {chunk} bytes, and one \
+                     buffer of this device binds {per} ({} MiB): the activation lies in one",
+                    part_cap >> 20
                 )));
             }
-            let mut total = total.min(binds);
+            let mut total = total;
             // The last buffer holds the span: a leftover too small for it
             // goes, at most one span and segment of state.
             let left = total % per;
             let seg = crate::store::pool::segment_chunks(chunk);
             if total > per && left != 0 && left < span.saturating_add(seg) {
                 total -= left;
+            }
+            if total.div_ceil(per) as usize > parts_bound {
+                return Err(Fault::Residency(format!(
+                    "the pool's {total} chunks of {chunk} bytes take {} buffers, and the \
+                     tables run was sized for {parts_bound}",
+                    total.div_ceil(per)
+                )));
             }
             let mut layout = Layout::new(
                 chunk,
@@ -1296,7 +1311,7 @@ impl PreparedLoad<'_> {
             keepalive,
             pipelines: {
                 let pipelines = Pipelines::new();
-                pipelines.set_pool(&pools.deltas(), pools.page_ids());
+                pipelines.set_pool(pools.delta_table(), pools.page_ids());
                 pipelines
             },
             handles,
@@ -1389,6 +1404,11 @@ impl Shell {
     #[must_use]
     pub fn pool_layout(&self) -> Layout {
         *self.pools.layout()
+    }
+
+    /// The page ids kernels address kv list slot refs `refs` by.
+    pub fn kv_page_ids(&self, refs: &[u32]) -> Result<Vec<u32>> {
+        self.pools.kv_pages(refs, None)
     }
 
     /// How the pool's page ids name their slots, and the buffers it spans.
@@ -3336,6 +3356,9 @@ impl Shell {
         let mut lane_bands: Vec<Vec<i32>> = vec![Vec::new(); widths.len()];
         let mut row_bands: Vec<Vec<i32>> = vec![Vec::new(); widths.len()];
         let mut state_top = 0u32;
+        // Every physical fixed slot the fire's records name, each admitted
+        // (checked backed) once the fire's segments are committed.
+        let mut state_ids: Vec<u32> = Vec::new();
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
         let mut rs_active = false;
         // Per fire lane, the rows inside it whose state lands in a slot of its
@@ -3424,6 +3447,7 @@ impl Shell {
                 .iter()
                 .map(|&id| id.saturating_add(1))
                 .fold(state_top, u32::max);
+            state_ids.extend_from_slice(&record);
             if fresh {
                 beginning.push(record.clone());
             }
@@ -3540,6 +3564,7 @@ impl Shell {
                             .iter()
                             .map(|&id| id.saturating_add(1))
                             .fold(snap_slots, u32::max);
+                        state_ids.extend_from_slice(&record);
                         records.push(self.pools.band_ids(&record));
                     }
                     let mut at = 0usize;
@@ -3635,6 +3660,7 @@ impl Shell {
                 .iter()
                 .map(|&id| id.saturating_add(1))
                 .fold(state_top, u32::max);
+            state_ids.extend_from_slice(&state);
             let band_ids = self.pools.band_ids(&state);
             {
                 let mut at = 0usize;
@@ -3751,7 +3777,26 @@ impl Shell {
         if lanes.iter().all(|seated| !seated.refs) {
             self.pools.commit_seats()?;
         }
-        self.pools.admit(demand)?;
+        // Every page and record piece the fire reads or writes is checked
+        // backed, ref by ref: a page in an uncommitted chunk under the
+        // highest one (two-ended growth backs a bottom run and the span's
+        // top, not what lies between) is refused by name, not read.
+        for ((seat, table), &free) in seats.iter().zip(&tables).zip(&kv_less) {
+            if free || table.is_empty() {
+                continue;
+            }
+            let after = u64::from(seat.have).saturating_add(u64::from(seat.rows));
+            let pages = usize::try_from(after.div_ceil(page_size).max(1)).unwrap_or(usize::MAX);
+            for &page in table.iter().take(pages) {
+                self.pools.admit_list_page(page)?;
+            }
+        }
+        for &(page, _) in writes.iter().flatten() {
+            self.pools.admit_list_page(page.max(0) as u32)?;
+        }
+        for &id in &state_ids {
+            self.pools.admit_state_slot(id)?;
+        }
 
         if !beginning.is_empty() && self.pools.has_state() {
             self.drain()?;
