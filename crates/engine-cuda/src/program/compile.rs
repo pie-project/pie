@@ -322,6 +322,11 @@ impl Module {
         if cubin.is_empty() {
             return Err(Fault::program("cuModuleLoadData", "the cubin is empty"));
         }
+        // A kernel that asks HIP for a buffer at its first launch would
+        // allocate on the device after the load: refused by name.
+        #[cfg(feature = "rocm")]
+        kernels_cuda::hip::code_object::refuse_late_buffers(cubin)
+            .map_err(|why| Fault::program("cuModuleLoadData", why))?;
         #[cfg(feature = "device")]
         {
             use crate::device::dr;

@@ -111,6 +111,10 @@ fn load_image(root: &'static str, image: &[u8]) -> Result<sys::Module, Fault> {
             log: "the compile produced an empty image, so there is nothing to load".into(),
         });
     }
+    // A kernel that asks HIP for a buffer at its first launch would
+    // allocate on the device after the load: refused by name.
+    crate::hip::code_object::refuse_late_buffers(image)
+        .map_err(|log| Fault::Compile { unit: root, log })?;
     let api = api("hipModuleLoadData")?;
     let mut module: sys::Module = std::ptr::null_mut();
 

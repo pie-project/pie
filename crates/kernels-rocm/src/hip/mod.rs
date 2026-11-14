@@ -4,8 +4,10 @@
 #![allow(unsafe_code)]
 
 pub mod blas;
+pub mod code_object;
 pub mod lt;
 pub mod lt_grouped;
+mod msgpack;
 pub mod rt;
 pub mod sys;
 
@@ -389,6 +391,12 @@ pub struct Module(sys::Module);
 
 impl Module {
     pub fn load(code: &[u8]) -> Result<Self, Error> {
+        // A kernel that asks HIP for a buffer at its first launch would
+        // allocate on the device after the load: refused by name.
+        code_object::refuse_late_buffers(code).map_err(|detail| Error::Backend {
+            op: "hip.module_load",
+            detail,
+        })?;
         let mut module: sys::Module = core::ptr::null_mut();
         check!(
             "hip.module_load",
