@@ -299,6 +299,12 @@ pub(crate) enum PoolOp {
     CommitSegments(u32),
     /// A shared pool gives back segments `n..` (`Engine::release_segments`).
     ReleaseSegments(u32),
+    /// A shared pool whose span is backed on demand backs its top `n` span
+    /// segments (`Engine::commit_span`).
+    CommitSpan(u32),
+    /// A shared pool whose span is backed on demand keeps its top `n` span
+    /// segments and gives back the rest (`Engine::release_span`).
+    ReleaseSpan(u32),
     /// A shared pool's chunks move, ahead of every fire queued after it
     /// (`Engine::evacuate`).
     Evacuate(::engine::chunk::Evacuation),

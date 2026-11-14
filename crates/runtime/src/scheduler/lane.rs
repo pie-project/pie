@@ -932,6 +932,8 @@ impl Lane {
                     match op {
                         PoolOp::CommitSegments(segments) => engine.commit_segments(segments),
                         PoolOp::ReleaseSegments(segments) => engine.release_segments(segments),
+                        PoolOp::CommitSpan(segments) => engine.commit_span(segments),
+                        PoolOp::ReleaseSpan(segments) => engine.release_span(segments),
                         PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),
                         PoolOp::Rebind(rebind) => crate::store::roles::rebind(
                             roles_of(engine_idx).as_ref(),

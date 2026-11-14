@@ -101,6 +101,8 @@ enum Call {
     Commit(u32),
     Release(u32),
     Evacuate(Vec<(u32, u32)>),
+    CommitSpan(u32),
+    ReleaseSpan(u32),
 }
 
 /// The engine half: a chunk table, a committed prefix and the top span
@@ -122,6 +124,28 @@ impl FakeEngine {
             calls: Vec::new(),
             refuse: false,
         }
+    }
+
+    /// An engine whose span is backed on demand: none of it from the load.
+    fn on_demand() -> Self {
+        Self {
+            top: TOTAL / SEGMENT,
+            ..Self::new()
+        }
+    }
+
+    /// Backs the top `n` span segments: monotone, from the top.
+    fn commit_span(&mut self, n: u32) {
+        assert!(TOTAL / SEGMENT - n <= self.top, "commit_span only widens");
+        self.top = TOTAL / SEGMENT - n;
+        self.calls.push(Call::CommitSpan(n));
+    }
+
+    /// Keeps the top `n` span segments, the rest given back.
+    fn release_span(&mut self, n: u32) {
+        assert!(TOTAL / SEGMENT - n >= self.top, "release_span only narrows");
+        self.top = TOTAL / SEGMENT - n;
+        self.calls.push(Call::ReleaseSpan(n));
     }
 
     fn backed(&self, physical: u32) -> bool {
@@ -222,6 +246,13 @@ fn walk_segments(
             }
             Some(SegmentMove::Release { prefix }) => {
                 engine.release_segments(prefix).unwrap();
+            }
+            Some(SegmentMove::CommitSpan { n }) => {
+                engine.commit_span(n);
+                pool.span_committed(n);
+            }
+            Some(SegmentMove::ReleaseSpan { n }) => {
+                engine.release_span(n);
             }
         }
     }
@@ -582,6 +613,7 @@ fn a_window_checkpoint_behind_the_fire_end_holds_what_its_windows_reach() {
 }
 
 mod programs;
+mod span;
 mod tiers;
 
 /// SPEC decision 6, the governor's rung shrink: under critical pressure the

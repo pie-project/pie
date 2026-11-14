@@ -527,6 +527,14 @@ pub enum SegmentMove {
     /// Give back segments `prefix..` (`release_segments(prefix)`), released
     /// in the pool already.
     Release { prefix: u32 },
+    /// Back the top `n` span segments (`commit_span(n)`), where the span is
+    /// backed on demand: the rung lends a chunk there no segment backs. The
+    /// pool opens their chunks once the engine has, [`SharedPool::span_committed`].
+    CommitSpan { n: u32 },
+    /// Give back the span segments below the top `n` (`release_span(n)`),
+    /// released in the pool already: no state chunk is open there and the
+    /// rung no longer lends them.
+    ReleaseSpan { n: u32 },
     /// The highest committed segment cannot be emptied into the rest.
     NoRoom,
     /// A drained segment waits for the fire carrying its copy.
@@ -750,6 +758,7 @@ impl SharedPool {
             reserved_chunks: reserved,
             shapes,
             act_chunks: facts.act_chunks.clone(),
+            span_on_demand: facts.span_backed_on_demand,
         });
         if let Some(&(rung, _)) = facts.act_chunks.last() {
             pool.set_rung(rung)
@@ -1540,9 +1549,22 @@ impl SharedPool {
         let prefix = (0..top)
             .take_while(|&s| segments.state(s) != SegmentState::Uncommitted)
             .count() as u32;
+        // A span segment backed on demand goes once the rung no longer
+        // lends it and it holds nothing.
+        if let Some(n) = self.pool.span_to_release() {
+            self.pool.release_span(n);
+            return Some(SegmentMove::ReleaseSpan { n });
+        }
         let mapped = self.mapped_segments();
         if mapped < target && prefix < top && self.pool.backs(prefix) {
             return Some(SegmentMove::Commit { prefix: prefix + 1 });
+        }
+        // The prefix is whole: the span a lowered rung lends is backed next,
+        // before state opens a chunk there.
+        if mapped < target
+            && let Some(n) = self.pool.span_to_commit()
+        {
+            return Some(SegmentMove::CommitSpan { n });
         }
         if mapped <= target || prefix == 0 {
             return None;
@@ -1588,6 +1610,12 @@ impl SharedPool {
         self.pool
             .apply_evacuation(evacuation, epoch)
             .expect("an evacuation planned under the lock applies");
+    }
+
+    /// The engine backed the top `n` span segments: the chunks of theirs the
+    /// rung lends go out now.
+    pub fn span_committed(&mut self, n: u32) {
+        self.pool.commit_span(n);
     }
 
     /// The engine backed segments `0..prefix`: their chunks go out now.
