@@ -342,7 +342,12 @@ impl Plane {
                 rings.push(facts);
             }
         }
-        Ok(ProgramFacts { instance, rings })
+        Ok(ProgramFacts {
+            instance,
+            rings,
+            fire_bytes_a_lane: 0,
+            fire_bytes_fixed: 0,
+        })
     }
 
     /// The `Channel` slots a registered channel's device cell takes.

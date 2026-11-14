@@ -1085,6 +1085,8 @@ impl Plane {
         Ok(ProgramFacts {
             instance,
             rings: Vec::new(),
+            fire_bytes_a_lane: 0,
+            fire_bytes_fixed: 0,
         })
     }
 
