@@ -15,6 +15,8 @@ use crate::store::shared::programs::{Funder, Mover, ProgramOpen, fund_span};
 
 const PROGRAM: ProgramId = ProgramId(7);
 const LANES: u32 = 64;
+/// The engine whose rung events these tests' raises tell.
+const TEST_ENGINE: usize = 50;
 
 /// 20 MiB a fire and 256 KiB a lane: a rung of 16 tokens 24 MiB (2
 /// chunks), one of 256 or more 64 lanes, 36 MiB (3 chunks).
@@ -75,6 +77,10 @@ impl Mover for Lane {
             .unwrap()
             .evacuate(&evacuation)
             .map_err(|error| error.to_string())
+    }
+
+    fn engine(&self) -> usize {
+        TEST_ENGINE
     }
 
     fn epoch_now(&self) -> u64 {
@@ -364,6 +370,7 @@ async fn a_term_past_the_largest_rung_funds_the_widest_that_fits_and_cuts_fires_
         .unwrap();
     assert_eq!(step, RungStep::Cap(256));
     cap.store(256, Ordering::Release);
+    crate::store::shared::rung_changed(TEST_ENGINE);
     wait.await.unwrap().unwrap();
     drop(open);
 
@@ -395,6 +402,9 @@ async fn a_bind_whose_room_is_refused_fails_its_wait() {
     impl Mover for NoCopy {
         async fn evacuate(&self, _evacuation: EngineEvacuation) -> Result<(), String> {
             Err("the engine refuses".into())
+        }
+        fn engine(&self) -> usize {
+            TEST_ENGINE
         }
         fn epoch_now(&self) -> u64 {
             0

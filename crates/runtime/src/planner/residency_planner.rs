@@ -1154,6 +1154,7 @@ impl ResidencyPlanner {
     }
 
     pub fn pages_freed(self: &Arc<Self>) {
+        self.port.freed();
         self.re_arm_idle_reclaim();
         if self.waiters.load(Ordering::Acquire) != 0 {
             self.poke();

@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::time::Duration;
 
 use tokio::sync::Notify;
 
@@ -13,10 +12,6 @@ use super::{RungStep, RungWalk, SegmentMove, Shared, SharedPool};
 use crate::governor::{Demand, Growth, PATIENCE, PoolTarget, Retarget};
 use crate::scheduler::worker::PoolOp;
 use crate::store::registry;
-
-/// How often the task looks again while a segment drains or a waiter is
-/// short, beside the wakes a retarget gives it.
-const POLL: Duration = Duration::from_millis(50);
 
 #[derive(Clone)]
 pub struct SharedGrow {
@@ -225,6 +220,7 @@ impl SharedGrow {
                         moved = evacuation.moves.len(),
                         "the activation rung is raised"
                     );
+                    super::rung_changed(self.engine);
                 }
             }
         }
@@ -316,9 +312,13 @@ impl SharedGrow {
         target.min(ahead)
     }
 
+    /// Walks each time something it waits on happens: a retarget or a
+    /// governor tick, a waiter short of room, room freed or a fire retired
+    /// (the planner's `pages_freed`: what drains and fences wait on), never
+    /// on a clock of its own.
     async fn run(self) {
         loop {
-            let _ = tokio::time::timeout(POLL, self.wake.notified()).await;
+            self.wake.notified().await;
             self.walk().await;
         }
     }
