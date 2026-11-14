@@ -396,7 +396,7 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
         page_size: 16,
         context: 64,
         slots: 4,
-        kv_budget: None,
+        kv_budget: Some(crate::POOL),
         allowance: engine::Allowance::WHOLE,
         ordinal: 0,
         knobs: Knobs {
@@ -672,7 +672,7 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
         page_size: 16,
         context: 64,
         slots: 4,
-        kv_budget: None,
+        kv_budget: Some(crate::POOL),
         allowance: engine::Allowance::WHOLE,
         ordinal: 0,
         knobs: Knobs {

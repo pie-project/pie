@@ -67,6 +67,16 @@ pub struct ChunkFacts {
     /// Empty where activation lives in a buffer of its own.
     #[serde(default)]
     pub act_chunks: Vec<(u32, u32)>,
+    /// The span under the largest rung's activation is backed on demand,
+    /// not from the load: the engine backs its own activation carve before
+    /// a fire, and the runtime backs a span segment
+    /// ([`crate::Engine::commit_span`]) before it opens any chunk there for
+    /// state (lent by a lowered rung), giving it back
+    /// ([`crate::Engine::release_span`]) once no state chunk is open there
+    /// and no rung lends it. Where a mapped heap is resident whether touched
+    /// or not (Metal). `false`: the whole span is backed from the load.
+    #[serde(default)]
+    pub span_backed_on_demand: bool,
     /// Host chunks state can be parked in, one id space beside the device's
     /// (CONTRACT-BC 22): chunks of `chunk_bytes`, ids from 0, none reserved,
     /// no table (a host ref names its place), any state shape taking any
@@ -462,6 +472,7 @@ impl ChunkFacts {
             }],
             shapes,
             act_chunks: Vec::new(),
+            span_backed_on_demand: false,
             host_chunks: host,
             disk_chunks,
             disk_persistent: pools.disk_kv_persistent,

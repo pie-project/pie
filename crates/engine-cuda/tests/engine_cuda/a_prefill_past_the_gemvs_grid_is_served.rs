@@ -189,7 +189,7 @@ fn load(fixture: &Fixture, leg: Leg) -> engine_cuda::Result<Shell> {
         page_size: PAGE,
         context: fixture.text.ceiling.next_multiple_of(PAGE),
         slots: 2,
-        kv_budget: None,
+        kv_budget: Some(crate::POOL),
         allowance: engine::Allowance::WHOLE,
         ordinal: 0,
         knobs: engine_cuda::Knobs {

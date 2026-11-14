@@ -888,6 +888,19 @@ impl Engine for Cuda {
         }
     }
 
+    fn fire_facts(
+        &self,
+        program: ProgramId,
+        extents: &engine::program::BindExtents,
+    ) -> EngineResult<engine::program::FireFacts> {
+        match self.shell.as_ref() {
+            Some(shell) => shell
+                .fire_facts(program, self::extents(extents))
+                .map_err(fault),
+            None => Ok(engine::program::FireFacts::default()),
+        }
+    }
+
     fn ring_facts(
         &self,
         registration: &ChannelRegistration,

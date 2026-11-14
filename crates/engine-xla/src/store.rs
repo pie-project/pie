@@ -601,6 +601,7 @@ impl Pools {
             })
             .collect();
         ChunkFacts {
+            span_backed_on_demand: false,
             chunk_bytes: self.layout.chunk_bytes,
             total_chunks: self.chunks,
             segment_chunks: self.chunks,

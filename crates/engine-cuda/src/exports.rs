@@ -47,17 +47,6 @@ impl Exports {
     pub(crate) fn reads_readout_rows(&self) -> bool {
         self.outputs.iter().any(|out| out.decl.readout)
     }
-
-    /// The widest row of an output on the readout rows, in f32.
-    #[must_use]
-    pub(crate) fn readout_row_bytes(&self) -> u64 {
-        self.outputs
-            .iter()
-            .filter(|out| out.decl.readout)
-            .map(|out| u64::from(out.decl.width) * 4)
-            .max()
-            .unwrap_or(0)
-    }
 }
 
 #[must_use]

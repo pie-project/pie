@@ -26,7 +26,6 @@ use std::collections::BTreeSet;
 use engine::{ChannelId, InstanceId, ProgramRegistration};
 use engine_cuda::device::{Buffer, Context};
 use engine_cuda::program::Plane;
-use engine_cuda::program::compile::Disk;
 use engine_cuda::program::launch::INTRINSIC_STORAGE_F32;
 use engine_cuda::program::session::{Fired, Launched};
 use eta_compiler::codegen::program::{Backend, emit_program};
@@ -1055,7 +1054,7 @@ fn every_op_agrees_with_the_host_interpreter() {
     let only = std::env::var("PIE_EVERY_OP_ONLY").ok();
     let mut rig = Rig {
         context: Context::bind(0, None).expect("a CUDA context"),
-        plane: Plane::new(Disk::disabled()),
+        plane: crate::guest::alone_plane(),
     };
     let mut failures: Vec<String> = Vec::new();
     for (index, case) in cases.iter().enumerate() {

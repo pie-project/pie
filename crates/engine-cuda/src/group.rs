@@ -421,6 +421,19 @@ impl Engine for Group {
         }
     }
 
+    fn fire_facts(
+        &self,
+        program: ProgramId,
+        extents: &engine::program::BindExtents,
+    ) -> EngineResult<engine::program::FireFacts> {
+        match self.ranks.first().and_then(|rank| rank.try_lock().ok()) {
+            Some(rank) => rank.fire_facts(program, extents),
+            None => Err(Error::Program(
+                "a rank is busy: a program's fire facts are asked between frames".to_string(),
+            )),
+        }
+    }
+
     fn ring_facts(
         &self,
         registration: &ChannelRegistration,
@@ -556,6 +569,20 @@ impl Engine for Group {
 
     /// Each rank moves its band of every slot to and from its own tiers
     /// (CONTRACT-BC 22).
+    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.lead(move |rank| rank.commit_segments(segments))
+    }
+
+    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.lead(move |rank| rank.release_segments(segments))
+    }
+
+    /// Every rank moves the same chunks and rebases its guests' rings.
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        let evacuation = evacuation.clone();
+        self.lead(move |rank| rank.evacuate(&evacuation))
+    }
+
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         let copy = copy.clone();
         self.lead(move |rank| rank.copy_slots(&copy))

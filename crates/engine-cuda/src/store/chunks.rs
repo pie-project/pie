@@ -64,20 +64,21 @@ impl Chunks {
         act_bytes: u64,
     ) -> Result<Chunks> {
         let act = u32::try_from(act_bytes.div_ceil(layout.chunk_bytes.max(1))).unwrap_or(u32::MAX);
-        // A flat range (no device memory mapped on demand: ROCm) is one
-        // allocation of every chunk at once, so it can hold no more chunks
-        // than the pool's ceiling backs; a mapped range only reserves
-        // addresses, and the fit decides how many chunks are ever backed.
+        // The range is every chunk the pool's ceiling backs beside the
+        // activation: the cache rows' demand is `total`, and what the
+        // guests' instances and rings take of it is known to no load. A
+        // range mapped on demand only reserves addresses, and the fit
+        // decides how many chunks are ever backed; a flat one (ROCm) is one
+        // allocation of every chunk, so it holds no more than that.
+        let backed =
+            pool.hard_pages().saturating_mul(pool.page_bytes()) / layout.chunk_bytes.max(1);
+        let backed = u32::try_from(backed)
+            .unwrap_or(u32::MAX)
+            .saturating_sub(act);
         let total = if crate::device::elastic::mapped_on_demand() {
-            total
+            total.max(backed)
         } else {
-            let backed =
-                pool.hard_pages().saturating_mul(pool.page_bytes()) / layout.chunk_bytes.max(1);
-            total.min(
-                u32::try_from(backed)
-                    .unwrap_or(u32::MAX)
-                    .saturating_sub(act),
-            )
+            total.min(backed)
         };
         let total = total.max(1);
         let bytes = (u64::from(total) + u64::from(act)) * layout.chunk_bytes;
@@ -160,6 +161,22 @@ impl Chunks {
         }
         let chunk = self.layout.chunk_bytes;
         (u64::from(self.act) * chunk).saturating_sub(self.range.held(u64::from(self.total) * chunk))
+    }
+
+    /// Where the chunks the runtime counts as state end: under it lie the
+    /// last of them, in order.
+    #[must_use]
+    pub fn state_end(&self) -> u64 {
+        self.range.base() + u64::from(self.stated()) * self.layout.chunk_bytes
+    }
+
+    /// Backs the last `bytes` under the state's end, and keeps them
+    /// backed: where a fire lays its guests' programs once the activation's
+    /// own span has no room under its carve.
+    pub fn hold_under_state(&mut self, pool: &mut PhysicalPool, bytes: u64) -> Result<Commit> {
+        let end = u64::from(self.stated()) * self.layout.chunk_bytes;
+        let bytes = bytes.min(end);
+        self.range.hold(pool, end - bytes, bytes, false)
     }
 
     /// Where a fire's activation starts: the range's end less its chunks.
@@ -815,6 +832,7 @@ impl Chunks {
         let max = u32::try_from(u64::from(total).div_ceil(u64::from(layout.segment_chunks.max(1))))
             .unwrap_or(u32::MAX);
         ChunkFacts {
+            span_backed_on_demand: false,
             chunk_bytes: layout.chunk_bytes,
             total_chunks: total,
             segment_chunks: layout.segment_chunks,

@@ -240,7 +240,7 @@ fn logits(
         page_size: PAGE,
         context: CEILING,
         slots: 1,
-        kv_budget: None,
+        kv_budget: Some(crate::POOL),
         allowance: engine::Allowance::WHOLE,
         ordinal: 0,
         knobs,

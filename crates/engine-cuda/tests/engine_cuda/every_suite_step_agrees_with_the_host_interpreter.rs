@@ -12,8 +12,6 @@
 
 use engine::{ChannelId, InstanceId, ProgramRegistration};
 use engine_cuda::device::{Buffer, Context};
-use engine_cuda::program::Plane;
-use engine_cuda::program::compile::Disk;
 use engine_cuda::program::launch::INTRINSIC_STORAGE_F32;
 use engine_cuda::program::session::{Fired, Launched};
 use eta_compiler::codegen::program::{Backend, emit_program};
@@ -469,7 +467,7 @@ fn run(context: &Context, suite: &Suite) -> Vec<String> {
         launch: eta_compiler::codegen::launch::build(&bound, &stages),
         ..Default::default()
     };
-    let mut plane = Plane::new(Disk::disabled());
+    let mut plane = crate::guest::alone_plane();
     let program = match plane.register(context, &registration) {
         Ok(program) => program,
         Err(e) => return vec![format!("{}: does not compile: {e:?}", suite.name)],

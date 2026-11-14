@@ -18,6 +18,10 @@ static STRICT_KERNELS: extern "C" fn() = {
     on
 };
 
+/// The pool a test's load states: a served load takes what the card has
+/// left, and the tests of one process load beside each other.
+pub const POOL: u64 = 256 << 20;
+
 mod bound;
 #[cfg(feature = "device")]
 mod common_dit;

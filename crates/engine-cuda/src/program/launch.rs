@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 use kernels_cuda::runtime::channel::MAX_RING;
 
-use crate::device::Buffer;
 use crate::error::{Fault, Result};
 
 use super::compile::{Module, Region};
@@ -584,19 +583,22 @@ pub struct Cursor {
 }
 #[derive(Debug)]
 pub struct Prepared {
-    retired: Vec<Buffer>,
-    table: Buffer,
+    /// Where this stage's tables and scratch lie in the fire's span, laid
+    /// by [`Prepared::lay`]: each an address in it.
+    table: u64,
     table_host: Vec<u8>,
-    descriptors: Buffer,
+    descriptors: u64,
     descriptor_row: Vec<u8>,
     descriptors_host: Vec<u8>,
-    params: Buffer,
-    offsets: Buffer,
-    scratch: Buffer,
+    params: u64,
+    params_host: Vec<u8>,
+    offsets: u64,
+    offsets_host: Vec<u8>,
+    scratch: u64,
     /// The lanes' intrinsic tables (bases, modes, widths, strides,
-    /// offsets) and pending flags, one allocation staged in one copy a
-    /// commit (`cell_at` their offsets, `cells_host` its image).
-    cells: Buffer,
+    /// offsets) and pending flags, one span staged in one copy a commit
+    /// (`cell_at` their offsets, `cells_host` its image).
+    cells: u64,
     cell_at: [usize; 6],
     cells_host: Vec<u8>,
     intrinsic_bases_host: Vec<u64>,
@@ -618,10 +620,16 @@ pub struct Prepared {
     region_rows: Vec<u32>,
     samplers: Vec<bool>,
     lanes: u32,
-    lane_cap: u32,
     filled: u32,
     bindings: Vec<u32>,
 }
+
+/// What every span of a stage starts a whole number of in the fire's span.
+const SPAN_ALIGN: u64 = 256;
+
+/// The spans a stage lays: its params, offsets, table, descriptors, scratch
+/// and cells.
+const SPANS: u64 = 6;
 
 #[must_use]
 pub(crate) fn shell_launches(region: &LaunchRegion) -> bool {
@@ -979,8 +987,6 @@ impl Prepared {
         plan: &LaunchStagePlan,
         shapes: &[ChannelShape],
         extents: Extents,
-        lanes: u32,
-        stream: *mut core::ffi::c_void,
     ) -> Result<Prepared> {
         let channel_count = u32::try_from(plan.channel_bindings.len())
             .map_err(|_| Fault::program("program::launch", "more channels than a u32 can count"))?;
@@ -1036,32 +1042,25 @@ impl Prepared {
             result_base += u32::from(op.result_count);
         }
 
-        let mut params = Buffer::zeroed_on(
-            stream,
-            (records.len() * size_of::<CudaOpParams>()).max(size_of::<CudaOpParams>()),
-        )?;
-        params.stage(stream, 0, &records_bytes(&records))?;
-
-        let offset_bytes: Vec<u8> = scratch_layout
+        let offsets_host: Vec<u8> = scratch_layout
             .values
             .iter()
             .map(|&at| u32::try_from(at).unwrap_or(u32::MAX))
             .flat_map(u32::to_le_bytes)
             .collect();
-        let mut offsets = Buffer::zeroed_on(stream, offset_bytes.len().max(size_of::<u32>()))?;
-        offsets.stage(stream, 0, &offset_bytes)?;
 
-        let mut prepared = Prepared {
-            retired: Vec::new(),
-            table: Buffer::zeroed(0)?,
+        Ok(Prepared {
+            table: 0,
             table_host: Vec::new(),
-            descriptors: Buffer::zeroed(0)?,
+            descriptors: 0,
             descriptor_row: descriptors.iter().flat_map(record_bytes).collect(),
             descriptors_host: Vec::new(),
-            params,
-            offsets,
-            scratch: Buffer::zeroed(0)?,
-            cells: Buffer::zeroed(0)?,
+            params: 0,
+            params_host: records_bytes(&records),
+            offsets: 0,
+            offsets_host,
+            scratch: 0,
+            cells: 0,
             cell_at: [0; 6],
             cells_host: Vec::new(),
             intrinsic_bases_host: Vec::new(),
@@ -1080,27 +1079,51 @@ impl Prepared {
             region_rows,
             samplers,
             lanes: 0,
-            lane_cap: u32::MAX,
             filled: 0,
             bindings: plan.channel_bindings.clone(),
-        };
-        prepared.grow(extents, lanes.max(1), stream)?;
-        Ok(prepared)
+        })
     }
 
-    fn grow(&mut self, extents: Extents, lanes: u32, stream: *mut core::ffi::c_void) -> Result<()> {
-        if lanes <= self.lanes {
-            return Ok(());
-        }
-        // The buffers a growth outgrows stay with this batch until it drops
-        // (at most its own size again, a doubling at a time): freeing one
-        // waits for the whole device, which at a burst's first fires would
-        // stall them; a growth that does not fit frees them first.
-        let lanes = lanes
-            .checked_next_power_of_two()
-            .unwrap_or(lanes)
-            .min(self.lane_ceiling())
-            .max(lanes);
+    /// The bytes of the spans whose size no lane count changes: the params
+    /// and offsets, the table's header, and the room every span's
+    /// alignment may take.
+    #[must_use]
+    pub fn fixed_bytes(&self) -> u64 {
+        (self.params_host.len().max(size_of::<CudaOpParams>())
+            + self.offsets_host.len().max(size_of::<u32>())) as u64
+            + LANE_HEADER_BYTES
+            + SPANS * SPAN_ALIGN
+            + 6 * 16
+    }
+
+    /// The bytes each lane adds: its record and channel slots, its
+    /// descriptor row, its scratch and its intrinsic and pending cells.
+    #[must_use]
+    pub fn lane_bytes(&self) -> u64 {
+        let words = self.pitch as u64;
+        LANE_RECORD_BYTES
+            + u64::from(self.channel_count) * size_of::<LaneChannelSlot>() as u64
+            + self.descriptor_row.len().max(1) as u64
+            + u64::from(self.scratch_stride)
+            + words * (size_of::<u64>() + 4 * size_of::<u32>()) as u64
+            + u64::from(self.channel_count).max(1)
+    }
+
+    /// Lays this stage for `lanes` lanes in the fire's span from `at` up,
+    /// and returns where its bytes end. `fresh`: the span was laid
+    /// otherwise since this stage last lay here, so the tables no lane
+    /// changes are staged again. Nothing is kept there between fires: a
+    /// span is the fire's.
+    pub fn lay(
+        &mut self,
+        extents: Extents,
+        lanes: u32,
+        at: u64,
+        fresh: bool,
+        stream: *mut core::ffi::c_void,
+    ) -> Result<u64> {
+        self.filled = 0;
+        let lanes = lanes.max(1);
         let total = u64::from(self.scratch_stride) * u64::from(lanes);
         if total > eta_exec::SCRATCH_MAX_BYTES {
             return Err(Fault::Ceiling {
@@ -1109,50 +1132,64 @@ impl Prepared {
                 have: eta_exec::SCRATCH_MAX_BYTES,
             });
         }
+        let mut next = at.next_multiple_of(SPAN_ALIGN);
+        let mut take = |bytes: usize| {
+            let here = next;
+            next = (here + bytes as u64).next_multiple_of(SPAN_ALIGN);
+            here
+        };
+        let params = take(self.params_host.len().max(size_of::<CudaOpParams>()));
+        let offsets = take(self.offsets_host.len().max(size_of::<u32>()));
+        let moved = fresh || params != self.params || lanes != self.lanes;
+        self.params = params;
+        self.offsets = offsets;
         let shape = LaneShape::of(lanes, self.channel_count);
         let table_bytes = shape
             .bytes()
             .and_then(|bytes| usize::try_from(bytes).ok())
             .ok_or_else(|| Fault::program("program::launch", "a lane table past what fits"))?;
-        let mut table_host = vec![0u8; table_bytes];
-        write_record(
-            &mut table_host,
-            0,
-            &LaneHeader {
-                abi_version: eta_exec::LANE_ABI_VERSION,
-                lane_count: lanes,
-                channel_slots_per_lane: self.channel_count,
-                flags: 0,
-            },
-        );
-        for lane in 0..lanes {
-            let at = shape
-                .record_offset(lane)
-                .and_then(|at| usize::try_from(at).ok())
-                .ok_or_else(|| Fault::program("program::launch", "a lane record past the table"))?;
+        if lanes != self.lanes {
+            let mut table_host = vec![0u8; table_bytes];
             write_record(
                 &mut table_host,
-                at,
-                &LaneRecord {
-                    row_count: extents.row_count,
-                    token_count: extents.token_count,
-                    sampled_rows: extents.sampled_rows,
-                    query_len: extents.query_len,
-                    key_len: extents.key_len,
-                    channel_slot_offset: shape.slot_index(lane).ok_or_else(|| {
-                        Fault::program("program::launch", "a lane's slot row past the table")
-                    })?,
-                    ..LaneRecord::default()
+                0,
+                &LaneHeader {
+                    abi_version: eta_exec::LANE_ABI_VERSION,
+                    lane_count: lanes,
+                    channel_slots_per_lane: self.channel_count,
+                    flags: 0,
                 },
             );
+            for lane in 0..lanes {
+                let at = shape
+                    .record_offset(lane)
+                    .and_then(|at| usize::try_from(at).ok())
+                    .ok_or_else(|| {
+                        Fault::program("program::launch", "a lane record past the table")
+                    })?;
+                write_record(
+                    &mut table_host,
+                    at,
+                    &LaneRecord {
+                        row_count: extents.row_count,
+                        token_count: extents.token_count,
+                        sampled_rows: extents.sampled_rows,
+                        query_len: extents.query_len,
+                        key_len: extents.key_len,
+                        channel_slot_offset: shape.slot_index(lane).ok_or_else(|| {
+                            Fault::program("program::launch", "a lane's slot row past the table")
+                        })?,
+                        ..LaneRecord::default()
+                    },
+                );
+            }
+            self.table_host = table_host;
         }
-        let table = Buffer::zeroed_on(stream, table_bytes)?;
-        self.retired.push(std::mem::replace(&mut self.table, table));
-        self.table_host = table_host;
+        self.table = take(table_bytes);
 
         let row = self.descriptor_row.len().max(1);
-        let mut descriptors = Buffer::zeroed_on(stream, row * lanes as usize)?;
-        if !self.descriptor_row.is_empty() {
+        self.descriptors = take(row * lanes as usize);
+        if lanes != self.lanes {
             self.descriptors_host = self
                 .descriptor_row
                 .iter()
@@ -1160,51 +1197,12 @@ impl Prepared {
                 .cycle()
                 .take(self.descriptor_row.len() * lanes as usize)
                 .collect();
-            descriptors.stage(stream, 0, &self.descriptors_host)?;
         }
-        self.retired
-            .push(std::mem::replace(&mut self.descriptors, descriptors));
 
-        let scratch_bytes = (self.scratch_stride as usize * lanes as usize)
-            .max(usize::try_from(SCRATCH_ALIGN).unwrap_or(256));
-        // A program arrives after the load declared its pool, so this is the
-        // one allocation the pool's fit could only reserve for, not count.
-        // When it does not fit, the scratch this growth outgrew is freed
-        // first (the free waits for the fires reading it) and the growth is
-        // tried once more; past that the lanes are capped under this width
-        // and the wave flies narrower, and only one lane failing is final,
-        // since a frame past static admission has no retry to answer.
-        let scratch = match Buffer::zeroed_on(stream, scratch_bytes) {
-            Err(Fault::OutOfMemory { .. }) => {
-                self.retired.clear();
-                self.scratch = Buffer::zeroed(0)?;
-                self.lanes = 0;
-                Buffer::zeroed_on(stream, scratch_bytes).map_err(|fault| match fault {
-                    Fault::OutOfMemory { need, have } if lanes > 1 => {
-                        self.lane_cap = lanes / 2;
-                        eprintln!(
-                            "engine-cuda: a guest program's scratch does not fit beside this \
-                             load at {lanes} lanes ({need} bytes wanted, {have} free); its \
-                             fires fly at most {} lanes wide",
-                            self.lane_cap
-                        );
-                        fault
-                    }
-                    Fault::OutOfMemory { need, have } => Fault::Residency(format!(
-                        "a guest program's scratch does not fit beside this load: {} bytes a \
-                         lane at {lanes} lanes wants {need}, and the device has {have} free once \
-                         the weights, the declared kv pool and everything else the load holds \
-                         are resident. Lower `[engine.memory] budget_device` beside another \
-                         process, or free what else holds the device.",
-                        self.scratch_stride
-                    )),
-                    other => other,
-                })?
-            }
-            other => other?,
-        };
-        self.retired
-            .push(std::mem::replace(&mut self.scratch, scratch));
+        self.scratch = take(
+            (self.scratch_stride as usize * lanes as usize)
+                .max(usize::try_from(SCRATCH_ALIGN).unwrap_or(256)),
+        );
         let words = self.pitch * lanes as usize;
         self.intrinsic_bases_host.resize(words, 0u64);
         self.intrinsic_modes_host.resize(words, 0u32);
@@ -1212,7 +1210,7 @@ impl Prepared {
         self.intrinsic_strides_host.resize(words, 0u32);
         self.intrinsic_offsets_host.resize(words, 0u32);
         let pending = (self.channel_count as usize * lanes as usize).max(1);
-        let mut at = 0usize;
+        let mut cell_at = 0usize;
         for (cell, bytes) in [
             words * size_of::<u64>(),
             words * size_of::<u32>(),
@@ -1224,26 +1222,20 @@ impl Prepared {
         .into_iter()
         .enumerate()
         {
-            self.cell_at[cell] = at;
-            at += bytes.div_ceil(16) * 16;
+            self.cell_at[cell] = cell_at;
+            cell_at += bytes.div_ceil(16) * 16;
         }
-        self.cells_host = vec![0u8; at];
-        self.retired.push(std::mem::replace(
-            &mut self.cells,
-            Buffer::zeroed_on(stream, at)?,
-        ));
+        if self.cells_host.len() != cell_at {
+            self.cells_host = vec![0u8; cell_at];
+        }
+        self.cells = take(cell_at);
         self.lanes = lanes;
-        Ok(())
-    }
-
-    pub fn begin(
-        &mut self,
-        extents: Extents,
-        lanes: u32,
-        stream: *mut core::ffi::c_void,
-    ) -> Result<()> {
-        self.filled = 0;
-        self.grow(extents, lanes, stream)
+        if moved {
+            crate::device::stage_raw(stream, self.params, &self.params_host)?;
+            crate::device::stage_raw(stream, self.offsets, &self.offsets_host)?;
+            crate::device::stage_raw(stream, self.descriptors, &self.descriptors_host)?;
+        }
+        Ok(next)
     }
 
     pub fn stage_lane(&mut self, rings: &Rings, cursors: &[Cursor], commit: u64) -> Result<u32> {
@@ -1319,7 +1311,7 @@ impl Prepared {
                 flags: 0,
             },
         );
-        self.table.stage(stream, 0, &self.table_host)?;
+        crate::device::stage_raw(stream, self.table, &self.table_host)?;
         // The intrinsic tables and the pending flags (zeroed) in one copy:
         // seven small ones each cost the stream a few microseconds a fire.
         let at = self.cell_at;
@@ -1337,7 +1329,7 @@ impl Prepared {
             image[at[cell]..at[cell] + bytes.len()].copy_from_slice(bytes);
         }
         image[at[5]..].fill(0);
-        self.cells.stage(stream, 0, image)?;
+        crate::device::stage_raw(stream, self.cells, image)?;
         Ok(())
     }
 
@@ -1383,7 +1375,7 @@ impl Prepared {
     }
 
     fn cell(&self, cell: usize) -> u64 {
-        self.cells.ptr() + self.cell_at[cell] as u64
+        self.cells + self.cell_at[cell] as u64
     }
 
     pub fn launch_region(&self, region: &Region, stream: *mut core::ffi::c_void) -> Result<()> {
@@ -1391,13 +1383,13 @@ impl Prepared {
             return Ok(());
         }
         let mut args = Args::new();
-        args.ptr(self.table.ptr())
+        args.ptr(self.table)
             .ptr(self.lane_records_ptr())
             .ptr(self.channel_slots_ptr())
-            .ptr(self.descriptors.ptr())
-            .ptr(self.params.ptr())
-            .ptr(self.offsets.ptr())
-            .ptr(self.scratch.ptr())
+            .ptr(self.descriptors)
+            .ptr(self.params)
+            .ptr(self.offsets)
+            .ptr(self.scratch)
             .u32(self.value_count)
             .u32(self.scratch_stride)
             .u32(self.temporary_offset)
@@ -1449,11 +1441,10 @@ impl Prepared {
     #[must_use]
     pub fn lane_ceiling(&self) -> u32 {
         if self.scratch_stride == 0 {
-            return self.lane_cap;
+            return u32::MAX;
         }
         u32::try_from(eta_exec::SCRATCH_MAX_BYTES / u64::from(self.scratch_stride))
             .unwrap_or(u32::MAX)
-            .min(self.lane_cap)
             .max(1)
     }
 
@@ -1473,11 +1464,11 @@ impl Prepared {
     }
 
     fn lane_records_ptr(&self) -> u64 {
-        self.table.ptr() + LANE_HEADER_BYTES
+        self.table + LANE_HEADER_BYTES
     }
 
     fn channel_slots_ptr(&self) -> u64 {
-        self.table.ptr() + LANE_HEADER_BYTES + u64::from(self.lanes) * LANE_RECORD_BYTES
+        self.table + LANE_HEADER_BYTES + u64::from(self.lanes) * LANE_RECORD_BYTES
     }
 }
 
@@ -1568,7 +1559,7 @@ impl Prepared {
             // each with its temporary arena at `temporary_offset`.
             let code = unsafe {
                 dr::cuMemsetD2D32Async(
-                    self.scratch.ptr() + u64::from(self.temporary_offset),
+                    self.scratch + u64::from(self.temporary_offset),
                     self.scratch_stride as usize,
                     0,
                     16,
