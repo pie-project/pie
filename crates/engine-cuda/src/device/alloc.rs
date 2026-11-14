@@ -632,6 +632,41 @@ impl Pinned {
         })
     }
 
+    /// As on unix, from a committed reservation Windows zeroes as its pages
+    /// are first touched.
+    #[cfg(windows)]
+    pub fn pageable(bytes: usize) -> Result<Pinned> {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        if bytes == 0 {
+            return Ok(Pinned::empty());
+        }
+        // SAFETY: a fresh committed reservation of a stated length, owned by
+        // this structure and released once in `Drop`.
+        let at = unsafe {
+            VirtualAlloc(
+                core::ptr::null_mut(),
+                bytes,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        if at.is_null() {
+            return Err(Fault::Residency(format!(
+                "this machine would not map {bytes} bytes of host memory for the weights' copy"
+            )));
+        }
+        prefault(at.cast(), bytes);
+        pageable_spans().push((at as usize, bytes));
+        Ok(Pinned {
+            host: at.cast(),
+            device: at as u64,
+            bytes,
+            origin: Origin::Pageable,
+        })
+    }
+
     pub fn mapped_uninit(bytes: usize) -> Result<Pinned> {
         Pinned::alloc(bytes, false)
     }
@@ -1336,7 +1371,6 @@ pub fn free_bytes() -> Option<u64> {
 /// kernel alone it takes 10 s, and huge pages asked for instead stall on
 /// compaction where the page cache has fragmented memory, a boot slower
 /// each run.
-#[cfg(unix)]
 fn prefault(at: *mut u8, bytes: usize) {
     const PAGE: usize = 4096;
     let pages = bytes.div_ceil(PAGE);

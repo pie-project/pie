@@ -359,6 +359,7 @@ pub(crate) fn release_pages(plane: &[u8]) {
     if end > first {
         // SAFETY: whole pages inside a live read-only file mapping; the
         // advice drops their resident copies and changes no contents.
+        #[cfg(unix)]
         unsafe {
             libc::madvise(
                 first as *mut core::ffi::c_void,

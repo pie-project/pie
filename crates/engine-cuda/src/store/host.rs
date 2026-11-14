@@ -123,6 +123,7 @@ impl HostTier {
             usize::try_from(chunk_bytes.saturating_mul(u64::from(chunks))).unwrap_or(usize::MAX);
         // SAFETY: an anonymous private mapping no other code knows of; the
         // kernel commits its pages as they are first written.
+        #[cfg(unix)]
         let base = unsafe {
             libc::mmap(
                 core::ptr::null_mut(),
@@ -133,7 +134,25 @@ impl HostTier {
                 0,
             )
         };
-        if base == libc::MAP_FAILED {
+        // SAFETY: a fresh committed reservation no other code knows of;
+        // Windows makes its pages, zeroed, as they are first written.
+        #[cfg(windows)]
+        let base = unsafe {
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
+            VirtualAlloc(
+                core::ptr::null_mut(),
+                len.max(1),
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        #[cfg(unix)]
+        let failed = base == libc::MAP_FAILED;
+        #[cfg(windows)]
+        let failed = base.is_null();
+        if failed {
             return Err(Fault::Ceiling {
                 what: "bytes of address space for the host tier",
                 need: len as u64,
@@ -144,6 +163,7 @@ impl HostTier {
         // landing in fresh memory faults a page in per 2 MiB, not per 4 KiB.
         // SAFETY: advice on this tier's own mapping; a kernel without
         // transparent huge pages ignores it.
+        #[cfg(target_os = "linux")]
         unsafe {
             libc::madvise(base, len.max(1), libc::MADV_HUGEPAGE);
         }
@@ -428,8 +448,18 @@ impl Drop for HostTier {
             let _ = thread.join();
         }
         // SAFETY: this tier's own mapping, no longer read or written.
+        #[cfg(unix)]
         unsafe {
             libc::munmap(self.base.cast(), self.len.max(1));
+        }
+        // SAFETY: releasing this tier's own reservation, exactly once.
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Memory::VirtualFree(
+                self.base.cast(),
+                0,
+                windows_sys::Win32::System::Memory::MEM_RELEASE,
+            );
         }
     }
 }
