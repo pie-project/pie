@@ -460,7 +460,9 @@ impl Seq {
             lane.tables.push((list.id, table));
         }
         if self.record.is_empty() {
-            for fixed in refs.shapes(|s| matches!(s.kind, SlotKind::Fixed { .. })) {
+            for fixed in refs.shapes(|s| {
+                matches!(s.kind, SlotKind::Fixed { .. }) && s.role == engine::chunk::SlotRole::State
+            }) {
                 let SlotKind::Fixed { pieces } = fixed.kind else {
                     unreachable!()
                 };
