@@ -99,17 +99,6 @@ pub struct Session {
 }
 
 impl Session {
-    /// The device bytes this instance holds apart from the pool: its
-    /// stages' launch tables and scratch (its rings are the pool's).
-    #[must_use]
-    pub fn bytes(&self) -> u64 {
-        self.prepared
-            .iter()
-            .flatten()
-            .map(Prepared::bytes)
-            .sum::<u64>()
-    }
-
     /// The bind-time tables an instance of `compiled` takes, every
     /// launching stage's in order.
     #[must_use]
@@ -128,25 +117,26 @@ impl Session {
         Ok(widest)
     }
 
-    pub fn table_sizes(compiled: &Compiled) -> Vec<u64> {
+    pub fn table_sizes(compiled: &Compiled, channels: usize, rows: u32) -> Vec<u64> {
+        let channels = u32::try_from(channels).unwrap_or(u32::MAX);
         compiled
             .plans
             .iter()
             .enumerate()
             .filter(|(index, _)| launches(compiled, *index))
-            .flat_map(|(_, plan)| Prepared::table_sizes(plan))
+            .flat_map(|(_, plan)| Prepared::table_sizes(plan, channels, rows))
             .collect()
     }
 
     /// The instance's bind-time tables and rings go in `pooled`'s slots.
     pub fn bind(
-        device: &Context,
         compiled: &Compiled,
         plan: &ExecPlan,
         seeds: &[(u32, Vec<u8>)],
         extents: Extents,
         adopted: &[Option<std::sync::Arc<SharedRing>>],
         pooled: Pooled<'_>,
+        rows: u32,
     ) -> Result<Session> {
         stages_and_plans_agree(compiled)?;
         if plan.package.channels.is_empty() {
@@ -160,7 +150,7 @@ impl Session {
         let shapes: Vec<ChannelShape> =
             plan.package.channels.iter().map(ChannelShape::of).collect();
         let rings = Rings::allocate(&shapes, adopted, pooled.pools, pooled.rings)?;
-        let sizes = Session::table_sizes(compiled);
+        let sizes = Session::table_sizes(compiled, shapes.len(), rows);
         let tables_run = TableLayout::of(&sizes, pooled.pools.slot_bytes(INSTANCE)?).run;
         let mut tables = Tables::pooled(pooled.pools, INSTANCE, pooled.instance, &sizes)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
@@ -169,10 +159,10 @@ impl Session {
         for (index, stage_plan) in compiled.plans.iter().enumerate() {
             prepared.push(if launches(compiled, index) {
                 Some(Prepared::build(
-                    device,
                     stage_plan,
                     &shapes,
                     extents,
+                    rows,
                     &mut tables,
                 )?)
             } else {

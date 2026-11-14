@@ -80,6 +80,9 @@ pub struct Plane {
     /// The most lanes one fire flies, and the frames in flight.
     lanes: u32,
     arms: usize,
+    /// The readout rows a lane may take in one fire: what an instance's
+    /// row table is laid for.
+    rows: u32,
     next_program: u64,
     next_instance: u64,
 }
@@ -103,23 +106,17 @@ impl Plane {
             batches: BTreeMap::new(),
             lanes: 64,
             arms: 1,
+            rows: 1,
             next_program: 1,
             next_instance: 1,
         }
     }
 
-    /// The device bytes guest programs hold, as (state, fire): shared
-    /// channel rings and each instance's rings and launch tables are kept
-    /// between fires; the batches of lanes launched together are a fire's.
+    /// The device bytes the batches of lanes launched together hold; an
+    /// instance's tables and rings are all in its pool slots.
     #[must_use]
-    pub fn bytes(&self) -> (u64, u64) {
-        let state = self
-            .instances
-            .values()
-            .map(|bound| bound.session.bytes())
-            .sum::<u64>();
-        let fire = self.batches.values().map(launch::Batch::bytes).sum();
-        (state, fire)
+    pub fn batch_bytes(&self) -> u64 {
+        self.batches.values().map(launch::Batch::bytes).sum()
     }
 
     #[must_use]
@@ -183,13 +180,13 @@ impl Plane {
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
         let adopted = self.seats_for(&program.plan, channels)?;
         let session = match Session::bind(
-            context,
             &program.compiled,
             &program.plan,
             seeds,
             extents,
             &adopted,
             pooled,
+            self.rows,
         ) {
             Ok(session) => session,
             Err(why) => {
@@ -219,11 +216,13 @@ impl Plane {
         Ok(id)
     }
 
-    /// The most lanes one fire flies and the frames in flight: what the
-    /// batch tables a binding opens are laid for.
-    pub fn set_flight(&mut self, lanes: u32, arms: usize) {
+    /// The most lanes one fire flies, the frames in flight and the
+    /// readout rows a lane may take in one fire: what the tables a binding
+    /// opens are laid for.
+    pub fn set_flight(&mut self, lanes: u32, arms: usize, rows: u32) {
         self.lanes = lanes.max(1);
         self.arms = arms.max(1);
+        self.rows = rows.max(1);
     }
 
     /// Lays the batch tables instance `id`'s stages fire with, one set a
@@ -292,7 +291,11 @@ impl Plane {
             .programs
             .get(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {id}")))?;
-        let sizes = Session::table_sizes(&program.compiled);
+        let sizes = Session::table_sizes(
+            &program.compiled,
+            program.plan.package.channels.len(),
+            self.rows,
+        );
         let layout = held::TableLayout::of(&sizes, instance_slot);
         if layout.slots > instance_per_chunk {
             return Err(Fault::program(
@@ -1167,6 +1170,26 @@ mod tests {
             tokens
         };
         assert_eq!(peak(&mut plane, 777), vec![777, 777]);
+        // Each lane table, read back from the pool, names its instance's
+        // status word where it lies now (the address is baked in): what a
+        // grouped kernel writes its verdict through.
+        let names_status = |plane: &mut Plane| {
+            let mut grouped = 0;
+            for id in [own, pooled] {
+                let session = plane.instance_mut(id).expect("bound");
+                for stage in 0..8 {
+                    let Some(prepared) = session.prepared_mut(stage) else {
+                        continue;
+                    };
+                    if let Some(names) = prepared.commit_slot_names_status().expect("the read") {
+                        assert!(names, "{id} stage {stage}'s commit slot is stale");
+                        grouped += 1;
+                    }
+                }
+            }
+            assert!(grouped > 0, "the program has a grouped stage");
+        };
+        names_status(&mut plane);
 
         // Move both chunks; the refs stand, the plane rebinds.
         let mut frame = context.frame().expect("a frame");
@@ -1180,6 +1203,7 @@ mod tests {
             .expect("the evacuation");
         frame.commit().expect("the copies land");
         plane.rebind(&pools).expect("the rebind");
+        names_status(&mut plane);
         assert_eq!(peak(&mut plane, 123), vec![123, 123]);
 
         // Park and unpark: the bytes copied to fresh refs, the old refs
@@ -1231,6 +1255,7 @@ mod tests {
                 },
             )
             .expect("the slots rebind");
+        names_status(&mut plane);
         assert_eq!(peak(&mut plane, 456), vec![456, 456]);
 
         // Park to the host tier and back, as a process parked under pressure
@@ -1306,6 +1331,7 @@ mod tests {
                 },
             )
             .expect("the slots rebind");
+        names_status(&mut plane);
         assert_eq!(peak(&mut plane, 789), vec![789, 789]);
     }
 

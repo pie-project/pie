@@ -366,14 +366,16 @@ struct RowMeta {
 #[derive(Debug)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 struct Grouped {
-    table: Buffer,
+    /// The lane table, the flags, indices and rows, and each fused
+    /// region's layout: the instance's, in its `Instance` slots.
+    table: Held,
     shape: LaneShape,
-    layouts: Vec<Buffer>,
+    layouts: Vec<Held>,
     bindings: Held,
-    pending_flags: Buffer,
-    lane_indices: Buffer,
-    row_meta: Buffer,
-    row_indices: Buffer,
+    pending_flags: Held,
+    lane_indices: Held,
+    row_meta: Held,
+    row_indices: Held,
     readout_rows: u32,
     layout_words: Vec<GroupLayout>,
     record: LaneRecord,
@@ -384,34 +386,65 @@ const GROUPED_LANES: u32 = 1;
 const THE_LANE: u32 = 0;
 
 impl Grouped {
-    fn bytes(&self) -> u64 {
+    /// Every table, in the order [`Prepared::table_sizes`] states them.
+    fn helds(&mut self) -> impl Iterator<Item = &mut Held> {
         [
-            &self.table,
-            &self.pending_flags,
-            &self.lane_indices,
-            &self.row_meta,
-            &self.row_indices,
+            &mut self.bindings,
+            &mut self.table,
+            &mut self.pending_flags,
+            &mut self.lane_indices,
+            &mut self.row_meta,
+            &mut self.row_indices,
         ]
         .into_iter()
-        .chain(&self.layouts)
-        .map(Buffer::bytes)
-        .sum::<u64>()
+        .chain(self.layouts.iter_mut())
+    }
+
+    /// The lane record's commit slot names the status word where it lies
+    /// now, after the instance's slots moved.
+    fn recommit(&mut self, status: &Held) -> Result<()> {
+        self.record.commit_slot = status.address_at(0).ok_or_else(|| {
+            Fault::program(
+                "program::launch",
+                "the status word has no GPU address, so a grouped kernel would have \
+                 nothing to write its verdict through",
+            )
+        })?;
+        self.write_record()
     }
 
     #[allow(clippy::too_many_arguments)]
     fn build(
-        device: &Context,
         plan: &LaunchStagePlan,
         descriptors: &[ValueDesc],
         shape: LaneShape,
-        status: &Buffer,
+        status: &Held,
         extents: Extents,
-        readout_rows: u32,
+        (readout_rows, rows_bound): (u32, u32),
         tables: &mut Tables<'_>,
     ) -> Result<Option<Grouped>> {
         if !plan.needs.grouped_valid {
             return Ok(None);
         }
+        if readout_rows > rows_bound.max(1) {
+            return Err(Fault::program(
+                "program::launch",
+                format!(
+                    "this bind reads {readout_rows} readout rows a lane, and the load lays \
+                     the rows of {} (the readouts a lane may take in one fire)",
+                    rows_bound.max(1)
+                ),
+            ));
+        }
+        let stride = u32::try_from(plan.channel_bindings.len())
+            .map_err(|_| Fault::program("program::launch", "more channels than a u32 can count"))?;
+        let binding_bytes: Vec<u8> = (0..GROUPED_LANES)
+            .flat_map(|_| plan.channel_bindings.iter().copied())
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let mut bindings = tables.take(binding_bytes.len().max(4) as u64)?;
+        bindings.write(0, &binding_bytes)?;
+
         let Some(bytes) = shape.bytes() else {
             return Err(Fault::program(
                 "program::launch",
@@ -419,7 +452,7 @@ impl Grouped {
                  lane count multiply past what an allocation can be",
             ));
         };
-        let mut table = Buffer::zeroed(device, bytes)?;
+        let mut table = tables.take(bytes)?;
         table.write(
             0,
             &record_bytes(&LaneHeader {
@@ -451,28 +484,15 @@ impl Grouped {
         })?;
         table.write(at, &record_bytes(&record))?;
 
-        let stride = u32::try_from(plan.channel_bindings.len())
-            .map_err(|_| Fault::program("program::launch", "more channels than a u32 can count"))?;
-        let binding_bytes: Vec<u8> = (0..GROUPED_LANES)
-            .flat_map(|_| plan.channel_bindings.iter().copied())
-            .flat_map(u32::to_le_bytes)
-            .collect();
-        let mut bindings = tables.take(binding_bytes.len().max(4) as u64)?;
-        bindings.write(0, &binding_bytes)?;
-
         let flags = u64::from(GROUPED_LANES) * u64::from(shape.channel_slots_per_lane);
-        let pending_flags = Buffer::zeroed(device, flags.max(1))?;
+        let pending_flags = tables.take(flags.max(1))?;
 
         let index_bytes: Vec<u8> = (0..GROUPED_LANES).flat_map(u32::to_le_bytes).collect();
-        let mut lane_indices = Buffer::zeroed(device, index_bytes.len() as u64)?;
+        let mut lane_indices = tables.take(index_bytes.len() as u64)?;
         lane_indices.write(0, &index_bytes)?;
 
-        let row_meta =
-            Buffer::zeroed(device, (GROUPED_LANES as u64) * size_of::<RowMeta>() as u64)?;
-        let row_indices = Buffer::zeroed(
-            device,
-            u64::from(readout_rows).max(1) * size_of::<u32>() as u64,
-        )?;
+        let row_meta = tables.take((GROUPED_LANES as u64) * size_of::<RowMeta>() as u64)?;
+        let row_indices = tables.take(u64::from(rows_bound.max(1)) * size_of::<u32>() as u64)?;
 
         let scratch_layout = layout(descriptors).map_err(|why| {
             Fault::program(
@@ -505,7 +525,7 @@ impl Grouped {
                 reserved1: rows,
                 ..base
             };
-            let mut buffer = Buffer::zeroed(device, size_of::<GroupLayout>() as u64)?;
+            let mut buffer = tables.take(size_of::<GroupLayout>() as u64)?;
             buffer.write(0, &record_bytes(&words))?;
             layout_words.push(words);
             layouts.push(buffer);
@@ -598,7 +618,9 @@ pub struct ScratchAt {
 #[derive(Debug)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub struct Prepared {
-    status: Buffer,
+    /// The status word and the output address table: the instance's, in
+    /// its `Instance` slots, as the tables below.
+    status: Held,
     /// The bind-time tables (the instance's state, REDESIGN step 4): in
     /// `Instance` slots where the runtime took them.
     descriptors: Held,
@@ -613,7 +635,7 @@ pub struct Prepared {
     reads: Vec<Option<Read>>,
     outputs: Vec<Option<Slot>>,
     seats: Vec<OutputSeat>,
-    addresses: Buffer,
+    addresses: Held,
     /// The one slot read through the readout plane.
     readout: Option<usize>,
     /// The stage's names and the slots a lane takes in its table.
@@ -832,38 +854,70 @@ pub struct BatchKey {
 impl Prepared {
     /// Moves each pooled table to the ref `to` maps its slot to.
     pub fn retarget(&mut self, pools: &Pools, to: &impl Fn(u32) -> Result<u32>) -> Result<()> {
-        let grouped = self.grouped.as_mut().map(|grouped| &mut grouped.bindings);
-        for held in [&mut self.descriptors, &mut self.params, &mut self.offsets]
-            .into_iter()
-            .chain(grouped)
+        let grouped = self.grouped.as_mut().into_iter().flat_map(Grouped::helds);
+        for held in [
+            &mut self.descriptors,
+            &mut self.params,
+            &mut self.offsets,
+            &mut self.status,
+            &mut self.addresses,
+        ]
+        .into_iter()
+        .chain(grouped)
         {
             if let Some(slot) = held.slot() {
                 held.retarget(pools, to(slot)?)?;
             }
         }
-        Ok(())
+        self.recommit()
     }
 
     /// Points the pooled bind-time tables at the chunks their slots sit in
     /// now.
     pub fn rebind(&mut self, pools: &Pools) -> Result<()> {
-        self.descriptors.rebind(pools)?;
-        self.params.rebind(pools)?;
-        self.offsets.rebind(pools)?;
-        if let Some(grouped) = self.grouped.as_mut() {
-            grouped.bindings.rebind(pools)?;
+        let grouped = self.grouped.as_mut().into_iter().flat_map(Grouped::helds);
+        for held in [
+            &mut self.descriptors,
+            &mut self.params,
+            &mut self.offsets,
+            &mut self.status,
+            &mut self.addresses,
+        ]
+        .into_iter()
+        .chain(grouped)
+        {
+            held.rebind(pools)?;
         }
-        Ok(())
+        self.recommit()
     }
 
-    /// The device bytes this stage's launch holds for its instance.
-    #[must_use]
-    pub fn bytes(&self) -> u64 {
-        [&self.status, &self.addresses]
-            .into_iter()
-            .map(Buffer::bytes)
-            .sum::<u64>()
-            + self.grouped.as_ref().map_or(0, Grouped::bytes)
+    /// Whether the lane table, as the pool holds it, names the status word
+    /// where it lies now; `None` for a stage with no lane table.
+    #[cfg(test)]
+    pub fn commit_slot_names_status(&self) -> Result<Option<bool>> {
+        let Some(grouped) = self.grouped.as_ref() else {
+            return Ok(None);
+        };
+        let at = grouped.shape.record_offset(THE_LANE).ok_or_else(|| {
+            Fault::program("program::launch", "the one lane is outside the lane table")
+        })?;
+        let mut word = [0u8; 8];
+        grouped.table.read(
+            at + std::mem::offset_of!(LaneRecord, commit_slot) as u64,
+            &mut word,
+        )?;
+        Ok(Some(
+            Some(u64::from_le_bytes(word)) == self.status.address_at(0),
+        ))
+    }
+
+    /// The lane record names the status word where it lies now: its GPU
+    /// address is baked into the lane table.
+    fn recommit(&mut self) -> Result<()> {
+        match self.grouped.as_mut() {
+            Some(grouped) => grouped.recommit(&self.status),
+            None => Ok(()),
+        }
     }
 
     /// The value scratch one lane of a stage of `plan` takes in a fire at
@@ -896,30 +950,42 @@ impl Prepared {
     }
 
     /// The bind-time tables a stage of `plan` takes, in the order `build`
-    /// takes them from its [`Tables`]: params, descriptors, offsets and,
-    /// for a grouped stage, the channel bindings. Counts alone size them,
-    /// so a program states them at registration.
+    /// takes them from its [`Tables`]: params, descriptors, offsets, the
+    /// status word and the output addresses and, for a grouped stage, the
+    /// channel bindings, the lane table (`channels` slots a lane), its
+    /// flags, indices, row meta, `rows` readout rows and each fused
+    /// region's layout. Counts alone size them, so a program states them
+    /// at registration.
     #[must_use]
-    pub fn table_sizes(plan: &LaunchStagePlan) -> Vec<u64> {
+    pub fn table_sizes(plan: &LaunchStagePlan, channels: u32, rows: u32) -> Vec<u64> {
         let mut sizes = vec![
             (plan.ops.len() * size_of::<OpParams>()).max(size_of::<OpParams>()) as u64,
             (plan.value_types.len() * size_of::<ValueDesc>()).max(1) as u64,
             (plan.value_types.len() * size_of::<u32>()).max(size_of::<u32>()) as u64,
+            eta_exec::STATUS_BYTES as u64,
+            ((plan.output_pitch as usize).max(1) * size_of::<OutputSeat>()) as u64,
         ];
         if plan.needs.grouped_valid {
-            sizes.push(
+            let shape = LaneShape::of(GROUPED_LANES, channels);
+            sizes.extend([
                 (GROUPED_LANES as usize * plan.channel_bindings.len() * size_of::<u32>()).max(4)
                     as u64,
-            );
+                shape.bytes().unwrap_or(u64::MAX),
+                (u64::from(GROUPED_LANES) * u64::from(shape.channel_slots_per_lane)).max(1),
+                u64::from(GROUPED_LANES) * size_of::<u32>() as u64,
+                u64::from(GROUPED_LANES) * size_of::<RowMeta>() as u64,
+                u64::from(rows.max(1)) * size_of::<u32>() as u64,
+            ]);
+            sizes.extend(plan.fused.iter().map(|_| size_of::<GroupLayout>() as u64));
         }
         sizes
     }
 
     pub fn build(
-        device: &Context,
         plan: &LaunchStagePlan,
         shapes: &[ChannelShape],
         extents: Extents,
+        rows: u32,
         tables: &mut Tables<'_>,
     ) -> Result<Prepared> {
         let channel_count = u32::try_from(plan.channel_bindings.len())
@@ -1042,7 +1108,8 @@ impl Prepared {
         let scratch_bytes = u64::from(scratch_stride)
             .max(SCRATCH_ALIGN)
             .next_multiple_of(SCRATCH_ALIGN);
-        let status = Buffer::zeroed(device, eta_exec::STATUS_BYTES as u64)?;
+        let status = tables.take(eta_exec::STATUS_BYTES as u64)?;
+        let addresses = tables.take((pitch.max(1) * size_of::<OutputSeat>()) as u64)?;
 
         let lanes = LaneShape::of(
             GROUPED_LANES,
@@ -1051,13 +1118,12 @@ impl Prepared {
             })?,
         );
         let grouped = Grouped::build(
-            device,
             plan,
             &descriptors,
             lanes,
             &status,
             extents,
-            readout_rows,
+            (readout_rows, rows),
             tables,
         )?;
 
@@ -1071,7 +1137,7 @@ impl Prepared {
             reads,
             outputs: vec![None; pitch],
             seats: vec![OutputSeat::default(); pitch],
-            addresses: Buffer::zeroed(device, (pitch.max(1) * size_of::<OutputSeat>()) as u64)?,
+            addresses,
             readout,
             names: plan.names.clone(),
             output_slots: plan.output_slots,
@@ -1297,9 +1363,13 @@ impl Prepared {
                 })?;
             let encoder = frame.encoder();
             encoder.setComputePipelineState(region.pipeline());
-            // SAFETY: every reservation is retained by `self`; every offset is zero.
+            // SAFETY: every reservation is retained by `self`; every offset lies inside its slot.
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(grouped.table.raw()), 0, 0);
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.table.raw()),
+                    grouped.table.offset() as usize,
+                    0,
+                );
                 encoder.setBuffer_offset_atIndex(
                     Some(self.descriptors.raw()),
                     self.descriptors.offset() as usize,
@@ -1323,19 +1393,35 @@ impl Prepared {
                         4,
                     );
                 }
-                encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
+                encoder.setBuffer_offset_atIndex(Some(layout.raw()), layout.offset() as usize, 5);
                 encoder.setBuffer_offset_atIndex(
                     Some(grouped.bindings.raw()),
                     grouped.bindings.offset() as usize,
                     6,
                 );
-                encoder.setBuffer_offset_atIndex(Some(grouped.pending_flags.raw()), 0, 7);
-                encoder.setBuffer_offset_atIndex(Some(grouped.lane_indices.raw()), 0, 8);
-                encoder.setBuffer_offset_atIndex(Some(grouped.row_meta.raw()), 0, 9);
-                encoder.setBuffer_offset_atIndex(Some(grouped.row_indices.raw()), 0, 10);
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.pending_flags.raw()),
+                    grouped.pending_flags.offset() as usize,
+                    7,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.lane_indices.raw()),
+                    grouped.lane_indices.offset() as usize,
+                    8,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.row_meta.raw()),
+                    grouped.row_meta.offset() as usize,
+                    9,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.row_indices.raw()),
+                    grouped.row_indices.offset() as usize,
+                    10,
+                );
                 encoder.setBuffer_offset_atIndex(
                     Some(self.addresses.raw()),
-                    0,
+                    self.addresses.offset() as usize,
                     eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
                 );
             }
@@ -1345,7 +1431,7 @@ impl Prepared {
                 encoder.useResource_usage(resource, usage);
             };
             resident(
-                &self.status,
+                self.status.buffer(),
                 MTLResourceUsage::Read | MTLResourceUsage::Write,
             );
             for cell in &self.bound {
@@ -1399,7 +1485,11 @@ impl Prepared {
             let scratch_at = usize::try_from(scratch_at).unwrap_or(usize::MAX);
             // SAFETY: every buffer is retained by `self`/`region`/the batch; every offset was bounds-checked.
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(self.status.raw()), 0, 0);
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.status.raw()),
+                    self.status.offset() as usize,
+                    0,
+                );
                 encoder.setBuffer_offset_atIndex(
                     Some(self.descriptors.raw()),
                     self.descriptors.offset() as usize,
@@ -1435,7 +1525,7 @@ impl Prepared {
                 }
                 encoder.setBuffer_offset_atIndex(
                     Some(self.addresses.raw()),
-                    0,
+                    self.addresses.offset() as usize,
                     eta_compiler::codegen::metal::M2_INTRINSIC_TABLE_BUFFER,
                 );
                 for (local, bound) in self.bound.iter().enumerate() {
@@ -1499,9 +1589,13 @@ impl Prepared {
 
             let encoder = frame.encoder();
             encoder.setComputePipelineState(region.pipeline());
-            // SAFETY: every reservation is retained by `self`; every offset is zero (the kernel strides off `layout`).
+            // SAFETY: every reservation is retained by `self`; every offset lies inside its slot (the kernel strides off `layout`).
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(grouped.table.raw()), 0, 0);
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.table.raw()),
+                    grouped.table.offset() as usize,
+                    0,
+                );
                 encoder.setBuffer_offset_atIndex(
                     Some(self.descriptors.raw()),
                     self.descriptors.offset() as usize,
@@ -1525,19 +1619,35 @@ impl Prepared {
                         4,
                     );
                 }
-                encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
+                encoder.setBuffer_offset_atIndex(Some(layout.raw()), layout.offset() as usize, 5);
                 encoder.setBuffer_offset_atIndex(
                     Some(grouped.bindings.raw()),
                     grouped.bindings.offset() as usize,
                     6,
                 );
-                encoder.setBuffer_offset_atIndex(Some(grouped.pending_flags.raw()), 0, 7);
-                encoder.setBuffer_offset_atIndex(Some(grouped.lane_indices.raw()), 0, 8);
-                encoder.setBuffer_offset_atIndex(Some(grouped.row_meta.raw()), 0, 9);
-                encoder.setBuffer_offset_atIndex(Some(grouped.row_indices.raw()), 0, 10);
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.pending_flags.raw()),
+                    grouped.pending_flags.offset() as usize,
+                    7,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.lane_indices.raw()),
+                    grouped.lane_indices.offset() as usize,
+                    8,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.row_meta.raw()),
+                    grouped.row_meta.offset() as usize,
+                    9,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(grouped.row_indices.raw()),
+                    grouped.row_indices.offset() as usize,
+                    10,
+                );
                 encoder.setBuffer_offset_atIndex(
                     Some(self.addresses.raw()),
-                    0,
+                    self.addresses.offset() as usize,
                     eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
                 );
             }
@@ -1548,7 +1658,7 @@ impl Prepared {
                 encoder.useResource_usage(resource, usage);
             };
             resident(
-                &self.status,
+                self.status.buffer(),
                 MTLResourceUsage::Read | MTLResourceUsage::Write,
             );
             for cell in &self.bound {
@@ -2009,7 +2119,7 @@ impl Batch {
             };
             for member in members {
                 resident(
-                    &member.status,
+                    member.status.buffer(),
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
                 );
                 for cell in &member.bound {
@@ -2150,7 +2260,7 @@ impl Batch {
             };
             for member in members {
                 resident(
-                    &member.status,
+                    member.status.buffer(),
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
                 );
                 for cell in &member.bound {

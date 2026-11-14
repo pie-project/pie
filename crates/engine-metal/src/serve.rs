@@ -1304,7 +1304,7 @@ impl PreparedLoad<'_> {
             held: vec![0; paging.slots as usize],
             programs: {
                 let mut plane = crate::program::Plane::new();
-                plane.set_flight(boot.budget.max_lanes, arms);
+                plane.set_flight(boot.budget.max_lanes, arms, boot.budget.readouts_per_lane);
                 plane
             },
         };
@@ -1812,7 +1812,7 @@ impl Shell {
                 .map_or(self.working_set(), |budget| budget.min(self.working_set())),
         );
         let (ane_model, ane_fire) = self.ane.as_ref().map_or((0, 0), crate::ane::Ane::bytes);
-        let (guest_state, guest_fire) = self.programs.bytes();
+        let guest_fire = self.programs.batch_bytes();
         let entries = [
             (Outside, "before the load", self.outside),
             (
@@ -1833,7 +1833,6 @@ impl Shell {
                 "pool",
                 self.pools.held_bytes() - self.pools.span_held_bytes(),
             ),
-            (State, "guest instances", guest_state),
             (
                 Fire,
                 "activation span (arena, staged inputs, readout, kernel scratch), reserved",
@@ -2024,10 +2023,10 @@ impl Shell {
             return Err(why);
         }
         if crate::diag::on().tier_trace {
-            let (state, fire) = self.programs.bytes();
+            let fire = self.programs.batch_bytes();
             eprintln!(
                 "residency: program {} bound at {extents:?}: its fires lay {} bytes a lane in \
-                 the span; guests hold {state} bytes in slots and {fire} bytes of batch tables; \
+                 the span; guests hold {fire} bytes of batch tables beside their slots; \
                  the span backs {}",
                 program_id.0,
                 self.programs

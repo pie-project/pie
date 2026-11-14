@@ -245,6 +245,14 @@ impl Held {
         }
     }
 
+    /// Zeroes `len` bytes from `at` on the host; as [`Held::write`].
+    pub fn zero_span(&mut self, at: u64, len: u64) -> Result<()> {
+        if len > 0 {
+            self.write(at, &vec![0u8; usize_of(len)])?;
+        }
+        Ok(())
+    }
+
     fn zero(&mut self) -> Result<()> {
         let bytes = usize_of(self.bytes);
         if bytes > 0 {
