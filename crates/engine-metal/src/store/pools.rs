@@ -1353,6 +1353,16 @@ impl Pools {
         self.pool.top_bytes()
     }
 
+    /// `len` bytes at `offset` of the pool's buffer as host runs
+    /// ([`Pool::host_runs`]).
+    pub fn host_runs(
+        &self,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<(u64, u64, std::ptr::NonNull<u8>)>> {
+        self.pool.host_runs(offset, len)
+    }
+
     /// `into.len()` bytes at `offset` of the pool's buffer, read on the host.
     pub fn read_span(&self, offset: u64, into: &mut [u8]) -> Result<()> {
         self.pool.read(offset, into)

@@ -278,8 +278,12 @@ pub struct Shell {
     rs_buffers: Option<crate::rs::Buffers>,
     rs_scratch: Option<Buffer>,
     scratch: Scratch,
-    inputs: Vec<Inputs>,
-    readout: Vec<Buffer>,
+    /// Each rung's staged inputs, a frame in flight each, laid in the
+    /// span under the kernel scratch plane; frames stage in the current
+    /// rung's ([`Arena::current`]).
+    inputs: Vec<Vec<Inputs>>,
+    /// Each rung's readout rows, laid as the inputs are.
+    readout: Vec<Vec<crate::inputs::Region>>,
     /// The widest row a lane reads back, in bytes.
     readout_row_bytes: u64,
     outputs: Vec<poem_exec::feeds::ClassOutput>,
@@ -888,24 +892,41 @@ impl PreparedLoad<'_> {
             }
         });
         let selections = feeds.selections.len();
-        let inputs = (0..arms)
-            .map(|_| {
-                Inputs::reserve(
-                    &device,
-                    &boot.budget,
-                    seated_paging,
-                    page_tables,
-                    compiled.classes.classes.len(),
-                    gathers,
-                    patch_seat,
-                    voxel_seat,
-                    states_mrope,
-                    &seats,
-                    selections,
-                    &bands,
-                    window_pages_per_slot,
-                    feeds.ragged.len(),
-                )
+        // The activation span (REDESIGN 3c): the range's top, the kernel
+        // scratch plane, under it each rung's staged regions (a frame in
+        // flight each) and under them its carve, every power of two of
+        // tokens from 1, the last the whole arena.
+        let rungs = activation_rungs(&boot.trace, &budgets, &compiled)?;
+        // A rung of `tokens` carries fires of at most so many tokens, and
+        // so lanes.
+        let rung_budget = |tokens: u32| Budget {
+            max_tokens: tokens.min(boot.budget.max_tokens),
+            max_lanes: tokens.min(boot.budget.max_lanes),
+            ..boot.budget.clone()
+        };
+        let mut inputs = rungs
+            .iter()
+            .map(|(tokens, _)| {
+                (0..arms)
+                    .map(|_| {
+                        Inputs::reserve(
+                            &device,
+                            &rung_budget(*tokens),
+                            seated_paging,
+                            page_tables,
+                            compiled.classes.classes.len(),
+                            gathers,
+                            patch_seat,
+                            voxel_seat,
+                            states_mrope,
+                            &seats,
+                            selections,
+                            &bands,
+                            window_pages_per_slot,
+                            feeds.ragged.len(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -954,28 +975,44 @@ impl PreparedLoad<'_> {
             .max()
             .unwrap_or(0);
 
-        let readout = (0..arms)
-            .map(|_| {
-                Buffer::zeroed(
-                    &device,
-                    (u64::from(boot.budget.max_lanes) * readout_row_bytes).max(1),
-                )
+        let mut readout = rungs
+            .iter()
+            .map(|(tokens, _)| {
+                let bytes = u64::from(rung_budget(*tokens).max_lanes) * readout_row_bytes;
+                (0..arms)
+                    .map(|_| {
+                        Ok(crate::inputs::Region::unplaced(
+                            bytes,
+                            Buffer::zeroed(&device, 0)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()
             })
             .collect::<Result<Vec<_>>>()?;
+        // One frame's staged regions at each rung.
+        let io: Vec<(u64, u64)> = inputs
+            .iter()
+            .zip(&readout)
+            .map(|(inputs, readout)| {
+                (
+                    inputs.first().map_or(0, Inputs::bytes),
+                    readout.first().map_or(0, crate::inputs::Region::bytes),
+                )
+            })
+            .collect();
 
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
 
         // What the load places beside the pool, by class: the model's
-        // weights and constants, and one fire's arena, staged inputs,
-        // readout and kernel scratch (the Neural Engine's surfaces split
-        // between the two).
+        // weights and constants, and the activation span at its widest
+        // (the arena, every frame's staged inputs and readout, the kernel
+        // scratch), the Neural Engine's surfaces split between the two.
         let (ane_model, ane_fire) = ane.as_ref().map_or((0, 0), crate::ane::Ane::bytes);
         let model_bytes = weights.bytes() + scratch.constant_bytes() + ane_model;
         let fire_bytes = compiled.arena.bytes
             + scratch.bytes()
-            + inputs.iter().map(Inputs::bytes).sum::<u64>()
-            + readout.iter().map(Buffer::bytes).sum::<u64>()
+            + arms as u64 * io.last().copied().map_or(0, crate::arena::io_room)
             + ane_fire;
         let accounting = |pool: u64| {
             crate::store::accounting::Accounting::of(
@@ -988,11 +1025,8 @@ impl PreparedLoad<'_> {
             )
             .with_streamable(weights.filed_bytes())
         };
-        // The activation span (REDESIGN 3c): the range's top, the kernel
-        // scratch plane and under it each rung's carve, every power of two
-        // of tokens from 1, the last the whole arena.
-        let rungs = activation_rungs(&boot.trace, &budgets, &compiled)?;
-        let act = crate::arena::act_chunks(&rungs, scratch.bytes(), rows.chunk_bytes);
+        let act =
+            crate::arena::act_chunks(&rungs, scratch.bytes(), &io, arms as u64, rows.chunk_bytes);
         let span = act.last().map_or(0, |&(_, chunks)| chunks);
         // One chunk pool holds every kv page and every record (the rs
         // buffer's rows inside it), in what the room holds of whole chunks,
@@ -1118,6 +1152,8 @@ impl PreparedLoad<'_> {
             (span_at, span_bytes),
             scratch.bytes(),
             rungs,
+            io,
+            arms as u64,
         );
         if crate::diag::on().tier_trace {
             let layout = pools.layout();
@@ -1135,6 +1171,16 @@ impl PreparedLoad<'_> {
         // The smallest rung's fire is backed from the load, so a raise the
         // system refuses always has a rung in hand to cut back to.
         pools.cover(arena.floor_reach())?;
+        // Every rung's staged regions laid in the span; the floor's hosted,
+        // where frames stage until the runtime raises.
+        for (index, (inputs, readout)) in inputs.iter_mut().zip(&mut readout).enumerate() {
+            for (arm, (inputs, readout)) in inputs.iter_mut().zip(readout.iter_mut()).enumerate() {
+                let ((inputs_at, _), (readout_at, _)) = arena.regions(index, arm as u64);
+                inputs.store_mut().place(arena.store().clone(), inputs_at);
+                readout.place(arena.store().clone(), readout_at);
+            }
+        }
+        host_rung(&pools, &mut inputs, &mut readout, arena.current(), true)?;
         pools.zero_span(pools.bytes() - arena.scratch_room(), scratch.bytes())?;
         scratch.seat(arena.store().clone(), arena.scratch_at());
         pools.seat_weights(weight_caches);
@@ -1420,7 +1466,9 @@ impl Shell {
 
     /// See `Engine::set_rung`: a raise backs the carve of `to` before any
     /// fire of it, refused as [`Fault::Refused`]; a lower gives back the
-    /// carve above it once every frame drains.
+    /// carve above it. Either way, where the rung's staged regions move,
+    /// every frame drains first: the new rung's regions lie over the old
+    /// rung's carve.
     #[allow(unsafe_code)]
     pub fn set_rung(&mut self, from: u32, to: u32) -> Result<()> {
         let reach = self.arena.rung_reach(to);
@@ -1432,11 +1480,37 @@ impl Shell {
             );
         }
         if to >= from {
-            return self.pools.cover(reach);
+            self.pools.cover(reach)?;
         }
-        self.drain()?;
+        let index = self.arena.index(to);
+        let moved = index != self.arena.current();
+        if moved || to < from {
+            self.drain()?;
+        }
+        if moved {
+            let left = self.arena.current();
+            host_rung(
+                &self.pools,
+                &mut self.inputs,
+                &mut self.readout,
+                left,
+                false,
+            )?;
+            self.arena.set_current(to);
+            host_rung(
+                &self.pools,
+                &mut self.inputs,
+                &mut self.readout,
+                index,
+                true,
+            )?;
+        }
+        if to >= from {
+            return Ok(());
+        }
         // SAFETY: drained just above, on the one thread that submits; the
-        // runtime lowers only once every fire wider than `to` retired.
+        // runtime lowers only once every fire wider than `to` retired, and
+        // the rung's regions lie inside what stays.
         unsafe { self.pools.narrow(reach) }
     }
 
@@ -1720,26 +1794,8 @@ impl Shell {
             (State, "guest instances", guest_state),
             (
                 Fire,
-                "activation span (arena, kernel scratch), reserved",
+                "activation span (arena, staged inputs, readout, kernel scratch), reserved",
                 self.pools.span_reserved_bytes(),
-            ),
-            (
-                Fire,
-                "inputs",
-                self.inputs.iter().map(Inputs::bytes).sum::<u64>(),
-            ),
-            (
-                Fire,
-                "group masks",
-                self.inputs
-                    .iter()
-                    .map(Inputs::group_mask_bytes)
-                    .sum::<u64>(),
-            ),
-            (
-                Fire,
-                "readout",
-                self.readout.iter().map(Buffer::bytes).sum::<u64>(),
             ),
             (
                 Fire,
@@ -1877,8 +1933,7 @@ impl Shell {
             self.weights.bytes(),
             self.arena.bytes(),
             self.pools.bytes(),
-            self.inputs.iter().map(Inputs::bytes).sum::<u64>()
-                + self.readout.iter().map(Buffer::bytes).sum::<u64>(),
+            self.arena.io_bytes(),
         )
     }
 
@@ -2270,7 +2325,8 @@ impl Shell {
                 continue;
             };
             let mut raw = vec![0u8; *width as usize * *element as usize];
-            self.readout[flight.arm].read(lane as u64 * self.readout_row_bytes, &mut raw)?;
+            self.readout[self.arena.current()][flight.arm]
+                .read(lane as u64 * self.readout_row_bytes, &mut raw)?;
             rows[lane] = (name.clone(), widen(&raw, *element as usize));
         }
         fire_trace(|| format!("readout-done seq={} rows={}", flight.seq, flight.lanes));
@@ -3803,7 +3859,7 @@ impl Shell {
                 have: readouts_ceiling,
             });
         }
-        let bound = self.inputs[arm].write(
+        let bound = self.inputs[self.arena.current()][arm].write(
             &self.handles,
             &crate::inputs::Fire {
                 tokens: &tokens,
@@ -3839,7 +3895,8 @@ impl Shell {
             },
         )?;
         windows.bind(&self.handles, bound.windows)?;
-        let group_masks = self.inputs[arm].stage_group_masks(&self.handles, &group_masks)?;
+        let group_masks = self.inputs[self.arena.current()][arm]
+            .stage_group_masks(&self.handles, &group_masks)?;
 
         let fire = FireRows {
             tokens: u64::from(rows),
@@ -3865,7 +3922,13 @@ impl Shell {
         let slots = self.arena.fire_slots(&self.handles, fire)?;
         let caches = self.pools.table(
             &self.handles,
-            &self.inputs[arm].seats(&self.handles, &bound, pages, rows, lane_count),
+            &self.inputs[self.arena.current()][arm].seats(
+                &self.handles,
+                &bound,
+                pages,
+                rows,
+                lane_count,
+            ),
             self.tuning.kv_q8(),
         )?;
 
@@ -4005,7 +4068,7 @@ impl Shell {
         let mut casts: Vec<(u32, u32, u32)> = Vec::new();
         for feed in &p.input_feeds {
             let (store, at) = if feed.voxel {
-                self.inputs[p.arm]
+                self.inputs[self.arena.current()][p.arm]
                     .voxel_payload()
                     .ok_or_else(|| Fault::Program {
                         at: "serve::feed_inputs",
@@ -4016,7 +4079,7 @@ impl Shell {
                         ),
                     })?
             } else {
-                self.inputs[p.arm]
+                self.inputs[self.arena.current()][p.arm]
                     .input_seat(feed.id)
                     .ok_or_else(|| Fault::Program {
                         at: "serve::feed_inputs",
@@ -4123,15 +4186,14 @@ impl Shell {
                 frame.fill_zero(&into, into_at, bytes)?;
                 continue;
             }
-            let (store, at) =
-                self.inputs[p.arm]
-                    .input_seat(land.seat.id)
-                    .ok_or_else(|| Fault::Unbound {
-                        what: format!(
-                            "guest input {}'s rectangle, which this load carved none of",
-                            land.seat.id
-                        ),
-                    })?;
+            let (store, at) = self.inputs[self.arena.current()][p.arm]
+                .input_seat(land.seat.id)
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "guest input {}'s rectangle, which this load carved none of",
+                        land.seat.id
+                    ),
+                })?;
             frame.copy(
                 store.slab(),
                 at + u64::from(land.first) * row_bytes,
@@ -4371,7 +4433,7 @@ impl engine::frame::Shell for Shell {
 
         let mut readbacks = vec![None; prepared.lanes.len()];
         if self.host_rows || self.rows_wanted {
-            let seat = self.readout[prepared.arm].slab().clone();
+            let seat = &self.readout[self.arena.current()][prepared.arm];
             for row in prepared.composition.lanes() {
                 let Some((name, offset, width, element)) = self.readback_row(&prepared, row)?
                 else {
@@ -4380,8 +4442,8 @@ impl engine::frame::Shell for Shell {
                 frame.copy(
                     self.arena.store().slab(),
                     offset,
-                    &seat,
-                    u64::from(row.source) * self.readout_row_bytes,
+                    seat.view().slab(),
+                    seat.at(u64::from(row.source) * self.readout_row_bytes),
                     u64::from(width) * element,
                 )?;
                 readbacks[row.source as usize] = Some((name, width, element));
@@ -4630,6 +4692,35 @@ impl Shell {
 /// Each activation rung's carve, `(tokens, map)` ascending: every power of
 /// two of tokens from 1 under the widest fire whose carve is smaller than
 /// the whole arena, then the whole arena for every fire.
+/// Hosts rung `index`'s staged regions, zeroed (`on`), or drops their
+/// host runs once frames leave the rung, so nothing writes the heaps
+/// another rung lays there.
+fn host_rung(
+    pools: &Pools,
+    inputs: &mut [Vec<Inputs>],
+    readout: &mut [Vec<crate::inputs::Region>],
+    index: usize,
+    on: bool,
+) -> Result<()> {
+    for region in inputs[index]
+        .iter_mut()
+        .map(Inputs::store_mut)
+        .chain(readout[index].iter_mut())
+    {
+        let (at, bytes) = region.extent();
+        let host = if on && bytes > 0 {
+            // The region lies at `at` of the span's buffer; the range
+            // counts the span from its own start.
+            let (_, span_at, _) = pools.span_view();
+            pools.host_runs(pools.span().0 + (at - span_at), bytes)?
+        } else {
+            Vec::new()
+        };
+        region.rehost(host)?;
+    }
+    Ok(())
+}
+
 fn activation_rungs(
     trace: &poem_ir::Trace,
     budgets: &Budgets,

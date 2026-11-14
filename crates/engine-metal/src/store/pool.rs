@@ -818,6 +818,37 @@ impl Pool {
         Ok(())
     }
 
+    /// `len` bytes from `offset` of the range as host runs `(from, len,
+    /// address)`, `from` counted from `offset`: one per heap they cross,
+    /// valid while those heaps stay mapped; the caller writes through them
+    /// only where no frame in flight reads them.
+    pub fn host_runs(
+        &self,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<(u64, u64, std::ptr::NonNull<u8>)>> {
+        let mut runs = Vec::new();
+        self.walk(offset, len, |part, local, done, take| {
+            #[cfg(target_vendor = "apple")]
+            {
+                let mut piece = 0;
+                while piece < take {
+                    let here = local + piece;
+                    let run = (take - piece).min(elastic::CHUNK - here % elastic::CHUNK);
+                    runs.push((done + piece, run, part.store.host_span(here, run)?));
+                    piece += run;
+                }
+                Ok(())
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                let _ = (part, local, done, take, &mut runs);
+                Err(Fault::Deviceless)
+            }
+        })?;
+        Ok(runs)
+    }
+
     /// `into.len()` bytes from `offset`, read on the host.
     pub fn read(&self, offset: u64, into: &mut [u8]) -> Result<()> {
         self.walk(offset, into.len() as u64, |part, local, done, take| {
