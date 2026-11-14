@@ -32,6 +32,9 @@ pub struct Chunks {
     total: u32,
     /// The chunks under the range's end a fire's activation takes.
     act: u32,
+    /// The bytes of them asked for: a run laid past these starts in what
+    /// the last chunk has left ([`Chunks::widen_activation`]).
+    act_asked: u64,
     table: ChunkTable,
     seated: [Seating; Kind::COUNT],
     /// The lowest chunk no shape has opened; chunk 0 is the null chunk.
@@ -46,6 +49,10 @@ pub struct Chunks {
     /// never names ([`Chunks::skip_past`]): from `skip.0`, `skip.1` of them.
     skip: (u32, u32),
 }
+
+/// What a run laid in the activation's span past its arenas starts at a
+/// multiple of: a device page of any backend.
+const RUN_ALIGN: u64 = 1 << 16;
 
 impl Chunks {
     /// Reserves `total` chunks of addresses for state and, above them, the
@@ -80,6 +87,7 @@ impl Chunks {
             layout,
             total,
             act,
+            act_asked: act_bytes,
             table: ChunkTable::identity(total.saturating_add(act)),
             seated: Default::default(),
             next: 1,
@@ -316,10 +324,12 @@ impl Chunks {
     }
 
     /// Reserves the range anew with `bytes` more of activation above what
-    /// it had: what a load learns its fires take beside their arena (the
-    /// kernels' workspaces) once it has walked them. Only while no segment
-    /// is backed; the activation it held is laid again.
-    pub fn widen_activation(&mut self, pool: &mut PhysicalPool, bytes: u64) -> Result<()> {
+    /// it was asked: what a load learns its fires take beside their arena
+    /// (the kernels' workspaces) once it has walked them. Only while no
+    /// segment is backed; the activation it held is laid again. Returns
+    /// where the run starts in the span: in what its last chunk had left,
+    /// so a run takes whole chunks only past that.
+    pub fn widen_activation(&mut self, pool: &mut PhysicalPool, bytes: u64) -> Result<u64> {
         if !self.fresh() {
             return Err(Fault::program(
                 "store::chunks",
@@ -329,7 +339,8 @@ impl Chunks {
         let chunk = self.layout.chunk_bytes;
         let held = self.range.held(u64::from(self.total) * chunk);
         self.range.release_all(pool);
-        let act_bytes = (u64::from(self.act) * chunk).saturating_add(bytes);
+        let at = self.act_asked.next_multiple_of(RUN_ALIGN);
+        let act_bytes = at.saturating_add(bytes);
         let mut fresh = Chunks::reserve(pool, self.layout.clone(), self.total, act_bytes)?;
         if held > 0 {
             match fresh.hold_activation(pool, held, true)? {
@@ -343,7 +354,7 @@ impl Chunks {
             }
         }
         *self = fresh;
-        Ok(())
+        Ok(at)
     }
 
     #[must_use]
@@ -379,6 +390,14 @@ impl Chunks {
     #[must_use]
     pub fn segments_for(&self, chunks: u64) -> u32 {
         u32::try_from(chunks.div_ceil(u64::from(self.layout.segment_chunks.max(1))))
+            .unwrap_or(u32::MAX)
+            .min(self.range.segments())
+    }
+
+    /// The segments that lie wholly within the first `chunks` chunks.
+    #[must_use]
+    pub fn segments_under(&self, chunks: u64) -> u32 {
+        u32::try_from(chunks / u64::from(self.layout.segment_chunks.max(1)))
             .unwrap_or(u32::MAX)
             .min(self.range.segments())
     }

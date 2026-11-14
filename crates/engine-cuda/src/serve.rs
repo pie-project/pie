@@ -145,6 +145,19 @@ pub struct Shell {
     /// How the arming fire's lanes treat their recurrent rows: a buffering
     /// treatment is recorded with lanes that land and replay nothing.
     arm_rs: record::RsBody,
+    /// Whether this shell arms its rungs past the smallest while it serves
+    /// ([`Shell::arm_step`]), and the lattice left arming.
+    arm_stepped: bool,
+    stepping: Option<arming::Arming>,
+    /// The slots the step in hand was lent: what its synthetic lanes name.
+    lent: Option<engine::live::ArmingLease>,
+    /// The device's bytes, those in use before this load began, and those
+    /// the fit holds for the guests' programs: what a fit after the load
+    /// is read against ([`Shell::settle`]).
+    card: (u64, u64, u64),
+    /// What the runtime reads of this shell while it serves: the rungs
+    /// armed.
+    live: engine::live::Live,
     /// The lattice waits for the starting weight residency: the load
     /// streams its weights, and bodies armed over the host copy would read
     /// every expert over the bus (`Staged::finish`).
@@ -876,6 +889,17 @@ impl Shell {
         }
     }
 
+    /// The most lanes a fire of prompts alone carries, where the profile
+    /// pads such a fire to fewer than every fire's (`engine.prefill_lanes`):
+    /// its bodies carry no more. 0: as many as any fire.
+    #[must_use]
+    pub fn prefill_lanes(&self) -> u32 {
+        match self.prefill_lanes {
+            0 => 0,
+            cap => cap.min(self.fire_lanes()),
+        }
+    }
+
     pub fn fire(&mut self, lanes: &[Lane<'_>]) -> Result<Vec<Vec<f32>>> {
         // A causal encoder-decoder's long prompts: their leading rows
         // through the encoder alone first (`crate::replay`).
@@ -1113,6 +1137,8 @@ pub struct Prepared<'a> {
     mask_injects: Vec<crate::inputs::MaskInject>,
     kv_reports: Vec<KvReport>,
     bodied: bool,
+    /// Why not, in a load that records bodies: the key and the reason.
+    unbodied: Option<String>,
     admits: std::sync::Arc<[crate::window::Admit]>,
     /// The key's island bits, so the fire records and replays under the key
     /// that was prepared.

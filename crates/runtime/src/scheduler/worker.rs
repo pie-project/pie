@@ -468,6 +468,73 @@ pub(super) enum QueuedItem {
     },
 }
 
+/// The rows the scheduler's queued and in-flight launches ask a fire to
+/// carry, held as a rung want: the most they asked since the scheduler
+/// last slept with nothing to do, so a batch that breathes between its
+/// steps does not move the rung back and forth each step.
+#[derive(Default)]
+struct BatchWant(Option<(usize, crate::store::shared::RungWant)>);
+
+impl BatchWant {
+    fn ask(&mut self, engine: usize, rows: usize) {
+        if rows == 0 || self.0.as_ref().is_some_and(|(held, _)| *held >= rows) {
+            return;
+        }
+        let rows32 = u32::try_from(rows).unwrap_or(u32::MAX);
+        let want = crate::store::shared::want_rows(engine, rows32);
+        self.0 = Some((rows, want));
+        // As a pass's ask does: the rung is raised at once where nothing
+        // moves, and a cap the walker lowered behind a rung still up is
+        // lifted back, so the batch is not cut while the walk catches up.
+        if let Some(shared) = crate::store::registry::try_get(0, engine).and_then(|s| s.shared) {
+            crate::store::shared::raise_now(&shared, engine, rows32);
+        }
+    }
+
+    fn release(&mut self) {
+        self.0 = None;
+    }
+}
+
+/// The distinct lanes a set of launches carries: the rows a fire of them
+/// takes. A lane rides its seat in every launch it is queued or in flight
+/// in, so a lane's pipelined launches count once; a seatless lane counts
+/// in the launch that carries the most of them.
+#[derive(Default)]
+struct LaneCount {
+    seats: Vec<u64>,
+}
+
+impl LaneCount {
+    fn count<'a>(
+        &mut self,
+        fires: impl IntoIterator<Item = &'a crate::engine::FireRequest>,
+    ) -> usize {
+        self.seats.fill(0);
+        let mut seated = 0usize;
+        let mut seatless = 0usize;
+        for fire in fires {
+            let mut here = 0usize;
+            for lane in &fire.lanes {
+                if lane.kv_less {
+                    here += 1;
+                    continue;
+                }
+                let (word, bit) = ((lane.slot / 64) as usize, lane.slot % 64);
+                if word >= self.seats.len() {
+                    self.seats.resize(word + 1, 0);
+                }
+                if self.seats[word] & (1 << bit) == 0 {
+                    self.seats[word] |= 1 << bit;
+                    seated += 1;
+                }
+            }
+            seatless = seatless.max(here);
+        }
+        seated + seatless
+    }
+}
+
 pub(super) struct QueuedLaunch {
     fire_id: u64,
     framed: bool,
@@ -1021,6 +1088,8 @@ impl BatchScheduler {
         let mut slot_buffer = SlotBuffer::new();
         let mut terminated_processes: HashSet<ProcessId> = HashSet::new();
         let mut in_flight_launches = VecDeque::new();
+        let mut batch_want = BatchWant::default();
+        let mut lane_count = LaneCount::default();
         let mut in_flight_control = InFlightControls::default();
         let mut stopping = false;
         let mut frame_policy = FramePolicy::new(
@@ -1072,6 +1141,20 @@ impl BatchScheduler {
             progress |= Self::retire_ready_control(&mut in_flight_control);
             // A step's tokens stay within the pool's activation rung (SPEC
             // decision 6): smaller while the system is critical.
+            // What is queued and in flight asks the rung of its lanes, a
+            // decode batch's lane count (REDESIGN 2.5): it is never cut to a
+            // narrower rung for want of asking. A prompt's rows ask through
+            // its pass ([`crate::store::shared::want_rows`]), not here.
+            let queued = pending.items.iter().filter_map(|item| match item {
+                QueuedItem::Launch(launch) => Some(&launch.request.request),
+                _ => None,
+            });
+            let flying = in_flight_launches
+                .iter()
+                .flat_map(|batch: &PendingLaunchBatch| batch.requests.iter())
+                .map(|request| &request.request);
+            let lanes = lane_count.count(queued.chain(flying));
+            batch_want.ask(engine_id, lanes.min(limits.max_forward_tokens));
             let cap = crate::store::shared::fire_cap(engine_id);
             let mut stepped = limits;
             stepped.max_forward_tokens = stepped.max_forward_tokens.min(cap as usize).max(1);
@@ -1129,6 +1212,9 @@ impl BatchScheduler {
                 && replies.is_empty()
                 && !stopping
             {
+                // Nothing queued or in flight: the batch's ask goes while
+                // the scheduler sleeps.
+                batch_want.release();
                 match rx.recv().await {
                     Some(item) => Some(item),
                     None => {
@@ -2655,6 +2741,54 @@ mod tests {
         }
     }
 
+    /// A batch of decodes asks the rung of its lane count while it is
+    /// queued or in flight, and asks nothing once none is.
+    #[test]
+    fn a_batch_asks_the_rung_of_its_rows_while_it_lasts() {
+        const ENGINE: usize = 9201;
+        let mut want = BatchWant::default();
+        want.ask(ENGINE, 16);
+        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 16);
+        want.ask(ENGINE, 64);
+        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 64);
+        // A batch that breathes keeps what it asked until the scheduler
+        // sleeps with nothing to do.
+        want.ask(ENGINE, 32);
+        want.ask(ENGINE, 0);
+        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 64);
+        want.release();
+        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
+    }
+
+    /// A batch asks the rows its fire carries: a lane queued in several
+    /// pipelined launches, and in flight in another, counts once.
+    #[test]
+    fn a_lane_s_pipelined_launches_ask_its_one_row() {
+        let fire = |seats: std::ops::Range<u32>| crate::engine::FireRequest {
+            lanes: seats
+                .map(|slot| ::engine::Lane {
+                    slot,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let launches: Vec<_> = (0..16).map(|_| fire(0..64)).collect();
+        let mut count = LaneCount::default();
+        assert_eq!(count.count(&launches), 64);
+        // Two batches of 32 lanes each, each pipelined: 64 rows.
+        let halves: Vec<_> = (0..8).flat_map(|_| [fire(0..32), fire(32..64)]).collect();
+        assert_eq!(count.count(&halves), 64);
+        // The count starts fresh each turn.
+        assert_eq!(count.count(&[fire(0..8)]), 8);
+        // Seatless lanes count in the launch carrying the most of them.
+        let mut seatless = fire(0..4);
+        for lane in &mut seatless.lanes {
+            lane.kv_less = true;
+        }
+        assert_eq!(count.count(&[seatless.clone(), seatless, fire(0..8)]), 12);
+    }
+
     #[test]
     fn worker_every_case() {
         a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight();
@@ -2707,6 +2841,7 @@ mod tests {
                 max_page_refs: 64,
                 max_context: 0,
                 prefill_rows: 0,
+                prefill_lanes: 0,
                 max_readouts: 0,
             },
             &stats,

@@ -9,7 +9,7 @@ use engine::transfer::KvRun;
 use kernels_cuda::{KvPool, RecurrentPool, Tensor};
 use poem_ir::{CacheRow, Def, Dtype, Operands, Trace};
 
-use crate::device::elastic::{self, Arena, Commit, PhysicalPool};
+use crate::device::elastic::{self, Commit, PhysicalPool};
 use crate::error::{Fault, Result};
 use crate::run::{CachePool, CacheTable, PoolSlabs};
 use crate::settle::Airborne;
@@ -600,6 +600,12 @@ pub struct Pools {
     budget: Option<u64>,
     /// The chunks the fit left the cache rows, of the range's.
     fitted: u32,
+    /// A graph body names addresses in the range: it is never reserved
+    /// anew ([`Pools::pin`]).
+    pinned: bool,
+    /// The chunks stated to the runtime where the fit may yet give the
+    /// cache rows more than it holds now ([`Pools::state_most`]).
+    stated: Option<u32>,
     /// The range is reserved anew to the fit even where it maps on demand:
     /// the pool's planes then span about what the fit holds, not the asked
     /// count (reserved for the asked count, Qwen3.5-0.8B's c64 ran ~1%
@@ -994,6 +1000,8 @@ impl Pools {
             ceiling: paging.pages(),
             budget,
             fitted: total,
+            pinned: false,
+            stated: None,
             whole_fit: false,
             airborne: None,
             host: None,
@@ -1097,6 +1105,82 @@ impl Pools {
         Ok(live
             .saturating_sub(self.segment_reserve())
             .max(live.min(room)))
+    }
+
+    /// States the pool to the runtime as the chunks the fit holds and
+    /// `more` bytes' worth past them, within the range: what a later fit
+    /// may give the cache rows (the activation no fire has backed, the
+    /// bodies' allowance the bodies do not take). The runtime keeps the
+    /// pool under [`Pools::kept_back_bytes`] less than that meanwhile.
+    pub(crate) fn state_most(&mut self, more: u64) {
+        // A stated budget is the pool's whole: no fit gives it more.
+        if self.budget.is_some() {
+            return;
+        }
+        let chunk = self.chunks.layout().chunk_bytes.max(1);
+        let more = u32::try_from(more / chunk).unwrap_or(u32::MAX);
+        self.stated = Some(
+            self.fitted_chunks()
+                .saturating_add(more)
+                .min(self.chunks.total()),
+        );
+        self.paging.pages = self.paging.pages.max(self.pages_within(self.stated.unwrap_or(0)));
+        self.pledge();
+    }
+
+    /// The kv pages `chunks` chunks hold beside the weights they seat
+    /// whole, as the fit counts them.
+    fn pages_within(&self, chunks: u32) -> u64 {
+        let layout = self.chunks.layout();
+        let weights =
+            u32::try_from(self.weight_pool_bytes() / layout.chunk_bytes.max(1)).unwrap_or(u32::MAX);
+        let kv_chunks = chunks.saturating_sub(if weights <= chunks { weights } else { 0 });
+        let (mut fits, mut over) = (1, self.ceiling.saturating_add(1));
+        while over - fits > 1 {
+            let mid = fits + (over - fits) / 2;
+            if chunks_at(layout, &self.paging, mid, 0) <= kv_chunks {
+                fits = mid;
+            } else {
+                over = mid;
+            }
+        }
+        fits
+    }
+
+    /// Pledges the pool the chunks the runtime is stated, beside what its
+    /// other arenas hold now.
+    fn pledge(&mut self) {
+        let chunks = self
+            .stated
+            .map_or(self.fitted, |stated| stated.max(self.fitted));
+        let others = self
+            .pool
+            .committed_pages()
+            .saturating_sub(elastic::pages_for_bytes(self.committed_bytes()));
+        self.pool
+            .pledge(elastic::pages_for_bytes(self.chunk_bytes(chunks)).saturating_add(others));
+    }
+
+    /// The bytes of the chunks stated to the runtime that the fit does not
+    /// hold for the cache rows now.
+    #[must_use]
+    pub fn kept_back_bytes(&self) -> u64 {
+        self.stated.map_or(0, |stated| {
+            self.chunk_bytes(stated)
+                .saturating_sub(self.chunk_bytes(self.fitted_chunks()))
+        })
+    }
+
+    /// The activation's span no fire has backed.
+    #[must_use]
+    pub fn activation_unheld_bytes(&self) -> u64 {
+        self.chunks.activation_unheld_bytes()
+    }
+
+    /// The range stays where it lies from here on: a body captured over it
+    /// names its addresses.
+    pub(crate) fn pin(&mut self) {
+        self.pinned = true;
     }
 
     /// What a load's synthetic fires may name, inside the chunks the fit
@@ -1232,7 +1316,7 @@ impl Pools {
         // Before arming a fresh range may be reserved anew up to the asked
         // count. Once armed it never moves, fresh or not: the bodies name
         // addresses in it.
-        let most = if !settled && self.chunks.fresh() {
+        let most = if !settled && !self.pinned && self.chunks.fresh() {
             self.asked_chunks.max(self.chunks.total())
         } else {
             self.chunks.total()
@@ -1301,7 +1385,12 @@ impl Pools {
                 over = mid;
             }
         }
-        self.paging.pages = fits;
+        // A pool stated for more than this fit holds keeps the pages of
+        // what it stated: the runtime names them, and a count that moved
+        // under live tables would not be the one they were laid by.
+        if self.stated.is_none() {
+            self.paging.pages = fits;
+        }
         // A flat range is one allocation made on its first commit: of the
         // fitted chunks, not of every chunk the asked count reserved.
         // A range mapped on demand reserved anew before the activation is
@@ -1311,7 +1400,9 @@ impl Pools {
         // settled one could never grow past it.
         let flat = !elastic::mapped_on_demand();
         let reshape = flat || (self.whole_fit && fitted < self.chunks.total());
-        if reshape && self.chunks.fresh() {
+        // Never once a body names the range ([`Pools::pin`]): reshaped, its
+        // planes would lie where the bodies captured over it no longer look.
+        if reshape && !self.pinned && self.chunks.fresh() {
             let reserved = if flat || settled {
                 fitted
             } else {
@@ -1322,17 +1413,13 @@ impl Pools {
             };
             self.chunks.reshape(&mut self.pool, reserved)?;
         }
-        self.chunks.limit(fitted);
+        self.chunks
+            .limit(self.stated.map_or(fitted, |stated| stated.max(fitted)));
         // The runtime admits frames against this watermark, so the pool is
         // pledged it beside what its other arenas hold now: a frame inside
         // it is a frame the fit already sized the card for, and what a fire
         // allocates beside the pool later is not its refusal to answer.
-        let others = self
-            .pool
-            .committed_pages()
-            .saturating_sub(elastic::pages_for_bytes(self.committed_bytes()));
-        self.pool
-            .pledge(elastic::pages_for_bytes(self.chunk_bytes(fitted)).saturating_add(others));
+        self.pledge();
         Ok(Fitted {
             asked: self.asked,
             fit: fits,
@@ -1382,7 +1469,7 @@ impl Pools {
 
     /// Reserves the range anew with `bytes` more of activation
     /// ([`Chunks::widen_activation`]).
-    pub(crate) fn widen_activation(&mut self, bytes: u64) -> Result<()> {
+    pub(crate) fn widen_activation(&mut self, bytes: u64) -> Result<u64> {
         self.chunks.widen_activation(&mut self.pool, bytes)
     }
 
@@ -1400,16 +1487,6 @@ impl Pools {
             Commit::Committed => Ok(()),
             refusal => Err(refuse(&self.pool, refusal)),
         }
-    }
-
-    pub(crate) fn reserve_arena(&self, max_bytes: u64, label: &'static str) -> Result<Arena> {
-        Arena::reserve(&self.pool, max_bytes, label)
-    }
-
-    /// Backs a prefix of `bytes` of an arena beside the pool's budget
-    /// (`elastic::commit_beside`).
-    pub(crate) fn commit_beside(&self, arena: &mut Arena, bytes: u64) -> Result<()> {
-        elastic::commit_beside(&self.pool, arena, &elastic::Want::Prefix(bytes))
     }
 
     #[must_use]
@@ -1766,6 +1843,22 @@ impl Pools {
             .fixed
             .as_ref()
             .map_or(1, |fixed| fixed.ids_a_lane().max(1))
+    }
+
+    /// The slots of the record shape a record takes; none where the load
+    /// lays no record.
+    #[must_use]
+    pub fn record_pieces(&self) -> u32 {
+        self.chunks
+            .layout()
+            .fixed
+            .as_ref()
+            .map_or(0, |fixed| fixed.pieces.max(1))
+    }
+
+    /// Lets go of the name [`Pools::name_record`] gave `key`.
+    pub fn forget_record(&mut self, key: u32) {
+        self.records.remove(&key);
     }
 
     /// Names the record whose pieces lie in the slot refs `pieces`, for the
@@ -3155,7 +3248,9 @@ impl Pools {
         max_tokens: u32,
         rungs: &[(u32, u64)],
     ) -> Result<engine::chunk::ChunkFacts> {
-        let fitted = self.fitted_chunks();
+        let fitted = self
+            .stated
+            .map_or(self.fitted_chunks(), |stated| stated.max(self.fitted_chunks()));
         self.chunks.limit(fitted);
         self.chunks.skip_past(fitted);
         // The state's chunks of the segment the stated activation starts in
@@ -3220,12 +3315,21 @@ impl Pools {
         // Every segment the fitted pool's chunks lie in, the last as far
         // as they reach: the range is reserved for more than the fit left
         // the cache rows.
+        // Backed as far as the fit holds; limited to what the runtime is
+        // stated, where that is more: what the fit keeps back is backed
+        // when the runtime comes to take it.
         let fitted = self.fitted_chunks();
-        self.chunks.limit(fitted);
-        match self
-            .chunks
-            .commit_segments(&mut self.pool, self.chunks.segments_for(u64::from(fitted)))?
-        {
+        let stated = self.stated.map_or(fitted, |stated| stated.max(fitted));
+        self.chunks.limit(stated);
+        // Where the fit keeps chunks back, only the segments wholly under
+        // them: the last the fitted chunks reach into would back some of
+        // what is kept.
+        let segments = if stated > fitted {
+            self.chunks.segments_under(u64::from(fitted))
+        } else {
+            self.chunks.segments_for(u64::from(fitted))
+        };
+        match self.chunks.commit_segments(&mut self.pool, segments)? {
             Commit::Committed => {}
             refusal => return Err(refuse(&self.pool, refusal)),
         }

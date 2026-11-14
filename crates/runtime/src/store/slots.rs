@@ -455,6 +455,9 @@ pub struct SlotPool {
     /// the fire that carries the copy retires, by that fire's epoch.
     fences: BTreeMap<u64, Vec<u32>>,
     fenced: Bits,
+    /// No chunk at or past this physical id is opened: the engine binds
+    /// none there yet ([`Self::set_ceiling`]).
+    ceiling: u32,
     segments: Segments,
     /// Chunks opened for a shape.
     held: u32,
@@ -509,6 +512,7 @@ impl SlotPool {
             open: Bits::new(total, false),
             fences: BTreeMap::new(),
             fenced: Bits::new(total, false),
+            ceiling: total,
             segments,
             held: 0,
             pending: BTreeMap::new(),
@@ -533,7 +537,33 @@ impl SlotPool {
         self.free.get(chunk)
             && !self.fenced.get(chunk)
             && chunk < self.state_limit()
+            && chunk < self.ceiling
             && self.segments.state(self.segments.of(chunk)) == SegmentState::Committed
+    }
+
+    /// No chunk at or past physical id `ceiling` is opened from now on, the
+    /// engine binding none there yet (while it holds back part of the range
+    /// it stated, [`::engine::live::Live::held`]); chunks below it open as
+    /// before. A chunk already open past it stays its holder's.
+    pub fn set_ceiling(&mut self, ceiling: u32) {
+        let ceiling = ceiling.min(self.total);
+        let (from, to) = (ceiling.min(self.ceiling), ceiling.max(self.ceiling));
+        self.ceiling = ceiling;
+        for chunk in from..to {
+            self.reopen(chunk);
+        }
+    }
+
+    /// See [`Self::set_ceiling`].
+    pub fn ceiling(&self) -> u32 {
+        self.ceiling
+    }
+
+    /// Whether `segment` may be committed: it lies wholly under the
+    /// ceiling (all of it, with no ceiling). One that straddles it would map
+    /// chunks the engine holds back, past the pool's hard limit.
+    pub fn backs(&self, segment: u32) -> bool {
+        self.ceiling >= self.total || self.segments.range(segment).end <= self.ceiling
     }
 
     /// Brings `chunk`'s place in [`Self::open`] up to date.
@@ -774,10 +804,25 @@ impl SlotPool {
         self.reopen(step.from);
     }
 
-    /// Committed chunks neither held nor set aside for activation.
+    /// Committed chunks neither held nor set aside for activation, and
+    /// below the ceiling ([`Self::set_ceiling`]): a committed chunk the
+    /// engine binds none of yet is no room, so the walker commits ahead
+    /// of a waiter rather than count it.
     pub fn headroom(&self) -> u32 {
-        self.committed_chunks()
-            .saturating_sub(self.reserved + self.held + self.act)
+        let all = self
+            .committed_chunks()
+            .saturating_sub(self.reserved + self.held + self.act);
+        if self.ceiling >= self.total {
+            return all;
+        }
+        let below: u32 = (0..self.segments.count())
+            .filter(|&segment| self.segments.state(segment) == SegmentState::Committed)
+            .map(|segment| {
+                let range = self.segments.range(segment);
+                range.end.min(self.ceiling).saturating_sub(range.start)
+            })
+            .sum();
+        all.min(below.saturating_sub(self.reserved + self.held))
     }
 
     pub fn shape(&self, shape: ShapeId) -> Option<&SlotShape> {
@@ -800,6 +845,22 @@ impl SlotPool {
     /// logical ids included.
     pub fn chunk_table(&self) -> &[u32] {
         &self.logical_to_physical
+    }
+
+    /// Whether `slot` of `shape` is handed out: its chunk open for the shape
+    /// and the slot not free in it (held, or waiting on a fire's epoch).
+    pub fn is_held(&self, shape: ShapeId, slot: Slot) -> bool {
+        let Some(meta) = self.chunks.get(slot.chunk as usize) else {
+            return false;
+        };
+        let Some(state) = self.shapes.get(shape as usize) else {
+            return false;
+        };
+        if meta.shape != shape || slot.index >= state.spc() {
+            return false;
+        }
+        let word = meta.frame as usize * state.words + (slot.index / WORD) as usize;
+        state.free[word] & (1 << (slot.index % WORD)) == 0
     }
 
     /// The shape logical chunk `chunk` is open for.
@@ -897,8 +958,8 @@ impl SlotPool {
         Some(chunks)
     }
 
-    /// Commits the lowest uncommitted segments below the activation, a
-    /// prefix, until `needs` fit the committed chunks and every chunk below
+    /// Commits the lowest uncommitted segments below the activation and
+    /// the ceiling, a prefix, until `needs` fit the committed chunks and every chunk below
     /// physical chunk `through` lies in a committed segment. The segments
     /// committed, lowest first: the engine backs them (`commit_segments`
     /// of the prefix they end) before anything lands in them. Stops short
@@ -912,10 +973,13 @@ impl SlotPool {
             if covered && self.fits(needs) {
                 return committed;
             }
+            // Never into what the engine holds back (the ceiling): a
+            // segment there is no room the engine binds, and backing it
+            // takes the memory the engine keeps for its bodies.
             let Some(segment) = self
                 .segments
                 .uncommitted()
-                .find(|&segment| segment < self.top_segment)
+                .find(|&segment| segment < self.top_segment && self.backs(segment))
             else {
                 return committed;
             };
@@ -1259,6 +1323,13 @@ impl SlotPool {
     }
 
     /// Every fire through `epoch` has retired: what waited on them is free.
+    /// The chunks fenced until `from` stay fenced until `to` instead.
+    pub fn refence(&mut self, from: u64, to: u64) {
+        if let Some(chunks) = self.fences.remove(&from) {
+            self.fences.entry(to).or_default().extend(chunks);
+        }
+    }
+
     pub fn retire_through(&mut self, epoch: u64) {
         self.retired = self.retired.max(epoch);
         let later = self.fences.split_off(&(epoch.saturating_add(1)));
@@ -1595,7 +1666,11 @@ impl SlotPool {
         let want = bytes.div_ceil(self.chunk_bytes.max(1));
         let mut room = u64::from(self.headroom());
         let mut segments = Vec::new();
-        for segment in self.segments.uncommitted() {
+        for segment in self
+            .segments
+            .uncommitted()
+            .filter(|&segment| self.backs(segment))
+        {
             if room >= want {
                 break;
             }

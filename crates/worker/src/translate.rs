@@ -177,6 +177,7 @@ fn build_model(
                     max_page_refs: g.caps.limits.max_page_refs as usize,
                     max_context: g.caps.limits.max_context as usize,
                     prefill_rows: g.caps.limits.prefill_rows as usize,
+                    prefill_lanes: g.caps.limits.prefill_lanes as usize,
                     max_readouts: g.caps.limits.max_readouts as usize,
                 },
                 engine_backend: g.backend,

@@ -417,6 +417,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     u32::try_from(d.limits.max_context).unwrap_or(u32::MAX),
                 )
                 .map_err(|error| anyhow::anyhow!("engine pools: {error}"))?;
+                let mut pool = pool;
+                // What the engine holds back of the range it stated is no
+                // sequence's from the first page on.
+                pool.hold_back(d.engine_backend.live().held());
                 Some(std::sync::Arc::new(std::sync::Mutex::new(pool)))
             } else {
                 None

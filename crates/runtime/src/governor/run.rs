@@ -68,7 +68,25 @@ impl Steer {
         read: Option<Pressure>,
         signal: &mut impl FnMut(Signal),
     ) -> Turn {
+        // What the engine holds beside the pool moves the limit: the pool
+        // follows it down (and back up) in whole segments.
+        let hard_limit = pool.hard_limit();
+        let limits = *self.governor.limits();
+        let moved = limits.segments(hard_limit) != limits.segments(limits.hard_limit);
+        if moved {
+            self.governor.set_hard_limit(hard_limit);
+            tracing::info!(
+                hard_limit,
+                // The bytes under the pool's mapped segments, not the
+                // engine's `Live::held`.
+                mapped = pool.held(),
+                "the pool's hard limit moves with what the engine holds beside it"
+            );
+        }
         if self.governor.tolerance().dedicated() {
+            if moved && pool.growth() != Growth::Fixed {
+                let _ = pool.retarget(within(self.governor.limits(), self.governor.target()));
+            }
             if read.is_some() {
                 pool.ticked();
             }
@@ -91,7 +109,7 @@ impl Steer {
             }
         };
         let limits = *self.governor.limits();
-        let segments = limits.segments(target);
+        let segments = within(&limits, target);
         match pool.retarget(segments) {
             Retarget::Reached => {
                 if self.short.take().is_some() {
@@ -128,6 +146,11 @@ impl Steer {
     }
 }
 
+/// The segments `target` comes to, the floor's at least.
+fn within(limits: &Limits, target: u64) -> u64 {
+    limits.segments(target.min(limits.hard_limit))
+}
+
 async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
     let mut steer = Steer::new(&pool, tolerance, GROWTH_STEP);
     let (shared, engine) = pool.with(|pool| (pool.inner().is_shared(), pool.inner().locus().1));
@@ -139,6 +162,7 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
         loop {
             interval.tick().await;
             let read = Some(system.read());
+            pool.with(|pool| pool.inner().hold_back());
             steer.turn(&mut pool, read, &mut |signal| {
                 steered::signal(engine, signal);
             });
@@ -150,16 +174,33 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
     // path, and never gives them back.
     if shared && steer.governor().tolerance().dedicated() {
         use crate::governor::PoolTarget;
-        let segment = pool.segment_bytes().max(1);
-        let all = pool.hard_limit().div_ceil(segment);
-        let _ = pool.retarget(all);
+        let _ = pool.retarget(within(steer.governor().limits(), pool.hard_limit()));
     }
     // A dedicated pool's size stands, and a pool that is not shared never
     // moves: the loop only ticks, reading nothing and answering no waiter.
+    let mut warned = false;
     loop {
         interval.tick().await;
+        pool.with(|pool| pool.inner().hold_back());
         steer.turn(&mut pool, Some(Pressure::Calm), &mut |_| {});
         read_ledger(&pool, engine);
+        // Chunks are handed out of mapped segments only: a pool mapped
+        // past its limit is what lets a sequence or a lease onto chunks the
+        // engine still holds.
+        // `mapped`: the bytes under the pool's mapped segments.
+        let (mapped, hard_limit) = (pool.held(), steer.governor().limits().hard_limit);
+        let past = shared && mapped > hard_limit;
+        if past && !warned {
+            tracing::warn!(mapped, hard_limit, "the pool is mapped past its hard limit");
+        }
+        if !past && warned {
+            tracing::info!(
+                mapped,
+                hard_limit,
+                "the pool is mapped within its hard limit again"
+            );
+        }
+        warned = past;
     }
 }
 

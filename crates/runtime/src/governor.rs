@@ -325,6 +325,17 @@ impl Governor {
         &self.limits
     }
 
+    /// The pool can take `hard_limit` now (what the engine holds beside it
+    /// moved): a dedicated target follows it, any other is cut to it.
+    pub fn set_hard_limit(&mut self, hard_limit: u64) {
+        self.limits.hard_limit = hard_limit.max(self.limits.floor);
+        self.target = if self.tolerance.dedicated() {
+            self.limits.hard_limit
+        } else {
+            self.target.min(self.limits.hard_limit)
+        };
+    }
+
     #[must_use]
     pub const fn tolerance(&self) -> Tolerance {
         self.tolerance
@@ -540,6 +551,28 @@ mod tests {
         assert_eq!(governor.target(), 400 * MIB);
         calm_to(&mut governor, 10, 300 * MIB);
         assert_eq!(governor.target(), 400 * MIB, "low demand does not cut");
+    }
+
+    #[test]
+    fn what_the_engine_holds_beside_the_pool_moves_its_limit() {
+        let mut dedicated = Governor::new(LIMITS, Tolerance::DEDICATED, 0);
+        dedicated.set_hard_limit(LIMITS.hard_limit - 300 * MIB);
+        assert_eq!(dedicated.target(), LIMITS.hard_limit - 300 * MIB);
+        dedicated.set_hard_limit(LIMITS.hard_limit);
+        assert_eq!(
+            dedicated.target(),
+            LIMITS.hard_limit,
+            "and back once lowered"
+        );
+        dedicated.set_hard_limit(0);
+        assert_eq!(dedicated.target(), LIMITS.floor, "never under the floor");
+
+        let mut governor = Governor::new(LIMITS, AGGRESSIVE, 0);
+        calm_to(&mut governor, 100, u64::MAX);
+        governor.set_hard_limit(LIMITS.hard_limit - 300 * MIB);
+        assert_eq!(governor.target(), LIMITS.hard_limit - 300 * MIB);
+        calm_to(&mut governor, 100, u64::MAX);
+        assert_eq!(governor.target(), LIMITS.hard_limit - 300 * MIB);
     }
 
     #[test]

@@ -97,6 +97,20 @@ pub(crate) struct StepGroup {
     forward_requests: usize,
     forward_tokens: usize,
     page_refs: usize,
+    /// Lanes taken, and whether any decodes: a step of prompts only holds
+    /// no more than `prefill_lanes`.
+    lanes: usize,
+    decoding: bool,
+}
+
+/// Whether `request` has a lane decoding (a row of its own, or none the
+/// host states), rather than prompts alone.
+fn decodes(request: &PendingRequest) -> bool {
+    request
+        .request
+        .lanes
+        .iter()
+        .any(|lane| lane.tokens.len() <= 1)
 }
 
 impl StepGroup {
@@ -122,6 +136,16 @@ impl StepGroup {
             return false;
         }
         let usage = request_capacity_usage(request, page_size);
+        // Prompts only, past what the engine carries a body for: refused
+        // until a decoding lane joins.
+        let lanes = self.lanes.saturating_add(request.request.lanes.len());
+        if limits.prefill_lanes > 0
+            && !self.decoding
+            && !decodes(request)
+            && lanes > limits.prefill_lanes
+        {
+            return false;
+        }
         self.forward_requests.saturating_add(usage.forward_requests) <= limits.max_forward_requests
             && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
             && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs
@@ -144,7 +168,10 @@ impl StepGroup {
         self.forward_requests = self.forward_requests.saturating_add(usage.forward_requests);
         self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
-        self.forward_requests >= limits.max_forward_requests
+        self.lanes = self.lanes.saturating_add(request.request.lanes.len());
+        self.decoding |= decodes(request);
+        (limits.prefill_lanes > 0 && !self.decoding && self.lanes >= limits.prefill_lanes)
+            || self.forward_requests >= limits.max_forward_requests
             || self.forward_tokens >= limits.max_forward_tokens
             || self.page_refs >= limits.max_page_refs
     }
@@ -378,6 +405,7 @@ mod tests {
             max_page_refs: 64,
             max_context: 0,
             prefill_rows: 0,
+            prefill_lanes: 0,
             max_readouts: 0,
         }
     }
@@ -393,6 +421,54 @@ mod tests {
         a_device_geometry_member_seriates_into_the_suffix();
         a_frames_cells_are_one_per_member_and_never_shared();
         a_device_resolved_lane_counts_against_the_token_cap();
+        a_step_of_prompts_only_stops_at_the_engines_prefill_lanes();
+    }
+
+    /// The engine holds a body for no more than `prefill_lanes` lanes of
+    /// prompts alone: such a step stops there, and a decoding lane lifts it.
+    fn a_step_of_prompts_only_stops_at_the_engines_prefill_lanes() {
+        let stated = SchedulerLimits {
+            prefill_lanes: 2,
+            ..limits()
+        };
+        let prompt = |instance: u64| {
+            pending(
+                FireRequest::one(crate::engine::fire::lane_of(
+                    0,
+                    vec![1, 2, 3, 4],
+                    0,
+                    vec![1],
+                )),
+                InstanceId(instance),
+            )
+        };
+        let mut group = StepGroup::default();
+        assert!(!group.push(&prompt(1), stated, 16));
+        assert!(group.accepts(&prompt(2), stated, 16));
+        assert!(
+            group.push(&prompt(2), stated, 16),
+            "full at two prompt lanes"
+        );
+        assert!(
+            !group.accepts(&prompt(3), stated, 16),
+            "a third prompt lane is past what the engine carries"
+        );
+        let decoding = pending(decode(9, 1), InstanceId(4));
+        assert!(
+            group.accepts(&decoding, stated, 16),
+            "a decoding lane joins"
+        );
+        group.push(&decoding, stated, 16);
+        assert!(
+            group.accepts(&prompt(5), stated, 16),
+            "with a lane decoding the step is no prompts-only one"
+        );
+        // Without the engine stating it, prompts take as many lanes as any.
+        let mut open = StepGroup::default();
+        for at in 1..=4 {
+            assert!(open.accepts(&prompt(at), limits(), 16));
+            open.push(&prompt(at), limits(), 16);
+        }
     }
 
     fn every_member_owns_a_span_of_the_steps_lanes() {

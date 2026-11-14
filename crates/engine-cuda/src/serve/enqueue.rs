@@ -106,20 +106,14 @@ impl Shell {
         let seq = self.airborne.next_seq();
         self.cache.at_step(seq);
         if p.rs.rows_ext > 0 {
-            // The scratch grows in place within its range; past it, it is
-            // reserved anew, and the fires holding the old one land first.
-            if self
-                .buffers
-                .as_ref()
-                .is_some_and(|buffers| !buffers.scratch_reaches(p.rs.rows_ext))
-            {
-                self.drain()?;
-            }
             if let Some(buffers) = self.buffers.as_mut() {
-                buffers.ensure_scratch(&self.pools, p.rs.rows_ext)?;
+                buffers.ensure_scratch(&mut self.pools, p.rs.rows_ext)?;
             }
         }
-        let rs_scratch = self.buffers.as_ref().map(Buffers::scratch);
+        let rs_scratch = self
+            .buffers
+            .as_ref()
+            .map(|buffers| buffers.scratch(&self.pools));
         let tapping = self.tapping(p.lanes)?;
         let mut fire = FireCtx {
             tapping: tapping.as_ref(),
@@ -875,8 +869,11 @@ impl FireCtx<'_> {
                 self.cache.fire_body(&fire, &mut run, &place)
             } else {
                 self.cache.eager_walk(p.rs.body.buffers());
-                self.cache
-                    .eager_unbodied("its composition is one a body does not carry");
+                self.cache.eager_unbodied(
+                    p.unbodied
+                        .as_deref()
+                        .unwrap_or("its composition is one a body does not carry"),
+                );
                 let mut cursor = Cursor::new(&place);
                 walk(
                     self.trace,

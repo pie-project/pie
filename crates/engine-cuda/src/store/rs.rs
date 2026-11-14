@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use poem_ir::{Dim, Dtype, Operands, Operation, Ssm, Trace, Ty, ValueId};
 
 use crate::device::Buffer;
-use crate::device::elastic::{self, Arena};
 use crate::error::{Fault, Result};
 use crate::run::RsScratch;
 use crate::store::Pools;
@@ -12,8 +11,6 @@ use crate::store::kv::Paging;
 pub const PLANE_DTYPE: Dtype = Dtype::Bf16;
 
 const ELEMENT: u64 = 2;
-
-const SCRATCH: &str = "rs extended-run scratch";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Plane {
@@ -42,9 +39,23 @@ impl Planes {
     }
 }
 
-/// The buffered rows a seated lane replays in one fire that the scratch's
-/// range is reserved for; past them it is reserved anew.
+/// The buffered rows a window of a body replays beside its own
+/// (`Run::rs_layout`), and a lane's share of a fire's replay tables
+/// (`inputs`).
 pub const REPLAYED: u32 = 16;
+
+/// The extended run's scratch: a run of the activation's span, a fire's
+/// rows and the buffered slots its lanes replay ahead of them, a row each
+/// at the widest recurrence's width. Its reach is the most a fire asks
+/// ([`Buffers::lay_reach`]); a prefix of it is backed as fires reach
+/// further.
+#[derive(Debug, Clone, Copy)]
+struct Scratch {
+    /// Where it starts in the activation's span.
+    at: u64,
+    reach: u64,
+    held: u64,
+}
 
 /// The rs buffer: the rows a lane lands past its state before they fold. Its
 /// pages are slots of the state pool's rs list ([`Pools::rs_span`]): a page
@@ -52,15 +63,7 @@ pub const REPLAYED: u32 = 16;
 /// run of the slot, each buffered plane `tokens` rows of it.
 #[derive(Debug)]
 pub struct Buffers {
-    /// The extended run's scratch: a fire's rows and the buffered slots its
-    /// lanes replay ahead of them, a row each at the widest recurrence's
-    /// width. Backed beside the pool as fires reach further, as a kernel's
-    /// slab is, and mapped under the base the fires in flight hold, so a
-    /// growth waits for none of them.
-    scratch: Arena,
-    /// Scratches it outgrew, kept mapped: a recorded body launches into the
-    /// scratch it was captured over (what it holds lives only a fire).
-    outgrown: Vec<Arena>,
+    scratch: Scratch,
     planes: Planes,
     /// The rows a page holds.
     tokens: u32,
@@ -70,26 +73,23 @@ pub struct Buffers {
 }
 
 impl Buffers {
-    /// The device bytes the extended run's scratch has backed, outgrown
-    /// scratches included.
+    /// The device bytes the extended run's scratch has backed.
     #[must_use]
     pub fn scratch_bytes(&self) -> u64 {
-        self.outgrown
-            .iter()
-            .fold(self.scratch.committed_bytes(), |sum, arena| {
-                sum.saturating_add(arena.committed_bytes())
-            })
+        self.scratch.held
     }
 
     /// The buffered planes of `trace`, laid as the pool's rs list lays its
-    /// pages, and the scratch's range for fires of up to `max_rows` rows
-    /// beside every seated lane's buffered rows replayed once. A flat arena
-    /// backs its whole range on its first commit, so its scratch is reserved
-    /// when a fire first asks, for what it asks.
+    /// pages, and the scratch in the activation's span, widened by the most
+    /// a fire of up to `max_rows` rows on `max_lanes` lanes asks: its rows
+    /// twice, and what its replay tables hold (`inputs`: every row once
+    /// more and [`REPLAYED`] a lane) beside [`REPLAYED`] a window, a window
+    /// a lane at most.
     pub fn reserve(
         trace: &Trace,
         paging: Paging,
         max_rows: u32,
+        max_lanes: u32,
         pools: &Pools,
     ) -> Result<Option<Buffers>> {
         let layout = pools.rs_layout();
@@ -118,15 +118,18 @@ impl Buffers {
             ));
         }
         let ext_row_bytes = ext_row_bytes(trace)?;
-        let reach = if elastic::mapped_on_demand() {
-            let rows = max_rows.saturating_add(paging.slots.saturating_mul(REPLAYED));
-            RsScratch::need(rows, ext_row_bytes)
-        } else {
-            0
-        };
+        let reach = RsScratch::need(
+            max_rows
+                .saturating_mul(3)
+                .saturating_add(max_lanes.min(paging.slots).saturating_mul(2 * REPLAYED)),
+            ext_row_bytes,
+        );
         Ok(Some(Buffers {
-            scratch: pools.reserve_arena(reach, SCRATCH)?,
-            outgrown: Vec::new(),
+            scratch: Scratch {
+                at: 0,
+                reach,
+                held: 0,
+            },
             planes,
             tokens,
             rows,
@@ -452,35 +455,56 @@ impl Buffers {
         &self.planes
     }
 
-    /// Whether the scratch's range holds an extended run of `rows_ext`
-    /// rows. Past it [`Buffers::ensure_scratch`] reserves the scratch anew,
-    /// at a base the fires in flight do not hold, so they land first.
-    #[must_use]
-    pub fn scratch_reaches(&self, rows_ext: u32) -> bool {
-        RsScratch::need(rows_ext, self.ext_row_bytes) <= self.scratch.max_bytes()
-    }
-
-    /// Backs the scratch for an extended run of `rows_ext` rows: in place
-    /// within its range, anew past it (a flat arena's first fire, or the
-    /// lanes of one group replaying one buffer, more slots between them
-    /// than the pool holds).
-    pub fn ensure_scratch(&mut self, pools: &Pools, rows_ext: u32) -> Result<()> {
+    /// Backs the scratch for an extended run of `rows_ext` rows, in place.
+    pub fn ensure_scratch(&mut self, pools: &mut Pools, rows_ext: u32) -> Result<()> {
         let bytes = RsScratch::need(rows_ext, self.ext_row_bytes);
-        if bytes <= self.scratch.committed_bytes() {
+        if bytes <= self.scratch.held {
             return Ok(());
         }
-        if !self.scratch_reaches(rows_ext) {
-            let grown = pools.reserve_arena(bytes, SCRATCH)?;
-            self.outgrown
-                .push(core::mem::replace(&mut self.scratch, grown));
+        if bytes > self.scratch.reach {
+            return Err(Fault::Ceiling {
+                what: "bytes of rs extended-run scratch",
+                need: bytes,
+                have: self.scratch.reach,
+            });
         }
-        pools.commit_beside(&mut self.scratch, bytes)
+        // A size-only walk backs nothing (`crate::sizing`), and walks
+        // before the scratch has its run: what it asked is the reach, laid
+        // and backed with the span ([`Buffers::lay_reach`]).
+        if !crate::sizing::active() {
+            pools.hold_activation_at(self.scratch.at, bytes, true)?;
+        }
+        self.scratch.held = bytes;
+        Ok(())
+    }
+
+    /// Gives the scratch its run of the activation's span, widened by its
+    /// reach: where a size-only walk fired the load's compositions
+    /// (`walked`), the most one of them asked, a recorded body's windows
+    /// being laid at their ceilings whatever its lanes replay; else the
+    /// most any fire may ask. A fire that walks its plan and replays past
+    /// that is refused.
+    pub fn lay_reach(&mut self, pools: &mut Pools, walked: bool) -> Result<()> {
+        if walked {
+            self.scratch.reach = self.scratch.held;
+        }
+        self.scratch.at = pools.widen_activation(self.scratch.reach)?;
+        Ok(())
+    }
+
+    /// Backs what the scratch held where the range now lies (a fit
+    /// reserves it anew).
+    pub fn lay_scratch(&self, pools: &mut Pools) -> Result<()> {
+        if self.scratch.held == 0 {
+            return Ok(());
+        }
+        pools.hold_activation_at(self.scratch.at, self.scratch.held, true)
     }
 
     /// The scratch's base and the bytes of it backed.
     #[must_use]
-    pub fn scratch(&self) -> (u64, u64) {
-        (self.scratch.base(), self.scratch.committed_bytes())
+    pub fn scratch(&self, pools: &Pools) -> (u64, u64) {
+        (pools.activation_base() + self.scratch.at, self.scratch.held)
     }
 
     /// A row of every extended operand of one recurrent layer, in bytes.

@@ -239,7 +239,11 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
             "the activation rung is raised"
         );
     }
-    // The rung holds `goal` now: fires may take its width.
+    // The rung holds `goal` now: fires may take its width, once a raise's
+    // copy is the engine's.
+    if pool.copying().is_some() {
+        return;
+    }
     let cap = lifted(goal);
     if cap > fire_cap(engine) {
         set_fire_cap(engine, cap);
@@ -311,7 +315,13 @@ impl RungWalk {
             .max()
             .unwrap_or(rungs[0]);
         let now = pool.rung();
-        if goal < now {
+        // Rungs whose activation takes as many chunks are one class: the
+        // pool sets aside the same span for each, and reports the widest
+        // ([`SlotPool::rung`]). A move within a class sets aside nothing
+        // new, so the walk only caps fires there, never lowers or raises.
+        let chunks = |rung: u32| pool.pool().act_chunks(rung);
+        let moves = chunks(goal) != chunks(now);
+        if goal < now && moves {
             if cap > goal {
                 self.lowering = None;
                 return Ok(RungStep::Cap(goal));
@@ -335,7 +345,7 @@ impl RungWalk {
             });
         }
         self.lowering = None;
-        if goal > now {
+        if goal > now && moves {
             let evacuation = pool.plan_raise(goal)?;
             return Ok(RungStep::Raise {
                 rung: goal,
@@ -538,7 +548,15 @@ pub struct SharedPool {
     records_most: u32,
     /// Chunks one working set takes at the longest context.
     least_chunks: u32,
+    /// A raise is applied here and its chunks' copy is not yet the
+    /// engine's: no fire is let past the rung held before it
+    /// ([`Self::raise_applied`]).
+    copying: Option<u32>,
 }
+
+/// The fence epoch a raise's moved-off chunks wait on until the engine has
+/// taken its copy ([`SharedPool::raise_copied`]): no fire retires it.
+const UNTIL_COPIED: u64 = u64::MAX - 1;
 
 /// The engine's moves expressed as `(logical, new physical)`.
 fn engine_moves(moves: &[super::segments::ChunkMove]) -> EngineEvacuation {
@@ -742,6 +760,7 @@ impl SharedPool {
             free_records: BTreeSet::new(),
             records_most: 0,
             least_chunks: 0,
+            copying: None,
         };
         // Under the smallest rung state may take every chunk but the
         // reserved ones and that rung's activation.
@@ -1256,6 +1275,37 @@ impl SharedPool {
             .map_err(RungError::Pool)
     }
 
+    /// Takes `evacuation`'s rung here, in the same hold of the pool it was
+    /// planned in, so no slot is handed out between plan and apply: the
+    /// chunks it moves off stay fenced, and no fire is let past the rung
+    /// held before, until the engine has the copy ([`Self::raise_copied`]).
+    /// The engine's copy follows ([`Self::rung_moves`]); a raise that moves
+    /// nothing needs none.
+    pub fn raise_applied(&mut self, evacuation: &RungEvacuation) -> Result<(), RungError> {
+        let before = self.pool.rung();
+        if evacuation.moves.is_empty() {
+            return self.apply_rung(evacuation, 0);
+        }
+        self.apply_rung(evacuation, UNTIL_COPIED)?;
+        self.copying = Some(self.copying.map_or(before, |held| held.min(before)));
+        Ok(())
+    }
+
+    /// The engine has taken a raise's copy, carried by the fire at `epoch`
+    /// (the next it is handed): its chunks moved off reopen once that fire
+    /// retires, and fires may take the raised rung.
+    pub fn raise_copied(&mut self, epoch: u64) {
+        self.pool.refence(UNTIL_COPIED, epoch);
+        self.copying = None;
+    }
+
+    /// The rung fires may not pass while a raise's copy is the engine's to
+    /// take; `None` when none is.
+    #[must_use]
+    pub fn copying(&self) -> Option<u32> {
+        self.copying
+    }
+
     /// What raising the activation to `rung` moves: the state in its span,
     /// each chunk to a free one below (empty when nothing is in the way).
     pub fn plan_raise(&self, rung: u32) -> Result<RungEvacuation, RungError> {
@@ -1291,6 +1341,110 @@ impl SharedPool {
         let free = self.pool.available(list.pool);
         let pages = u64::from(chunks) * u64::from(spc) + free;
         (chunks, u32::try_from(pages).unwrap_or(u32::MAX))
+    }
+
+    /// The first of `tables`' slot refs (engine shape, refs) that names no
+    /// slot handed out: a chunk not open for its shape, or a free slot in
+    /// one; the null chunk's refs (a window's empty slot) pass.
+    #[must_use]
+    pub fn unassigned(&self, tables: &[(EngineShape, Vec<u32>)]) -> Option<(EngineShape, u32)> {
+        let reserved = self.pool.reserved_chunks();
+        for (engine, refs) in tables {
+            let Some(shape) = self.pool_shape(*engine) else {
+                continue;
+            };
+            for &slot_ref in refs {
+                let slot = self.slot(shape, slot_ref);
+                if slot.chunk >= reserved && !self.pool.is_held(shape, slot) {
+                    return Some((*engine, slot_ref));
+                }
+            }
+        }
+        None
+    }
+
+    /// The pool shape of engine shape `engine`, a state shape's.
+    fn pool_shape(&self, engine: EngineShape) -> Option<ShapeId> {
+        self.list
+            .iter()
+            .chain(&self.rs_list)
+            .chain(&self.windows)
+            .find(|shape| shape.id == engine)
+            .map(|shape| shape.pool)
+            .or_else(|| {
+                self.fixed
+                    .iter()
+                    .find(|shape| shape.id == engine)
+                    .map(|shape| shape.pool)
+            })
+    }
+
+    /// Whether every slot of a lease lies below the activation span: kv
+    /// list refs `pages`, then a record's pieces `records` (fixed shapes
+    /// in order). A lowered rung lends the span's chunks to state, and a
+    /// raise takes them back while a step's capture may run on them.
+    #[must_use]
+    pub fn below_span(&self, pages: &[u32], records: &[u32]) -> bool {
+        let span = self.pool.total_chunks() - self.pool.act_max();
+        let under = |shape: ShapeId, slot_ref: u32| {
+            let chunk = self.slot(shape, slot_ref).chunk;
+            self.pool
+                .physical(chunk)
+                .is_some_and(|physical| physical < span)
+        };
+        let list = self.list.map(|list| list.pool);
+        let pages_under = list.is_none_or(|list| pages.iter().all(|&r| under(list, r)));
+        let mut pieces = records.iter();
+        let records_under = self.fixed.iter().all(|shape| {
+            (0..shape.pieces).all(|_| pieces.next().is_none_or(|&r| under(shape.pool, r)))
+        });
+        pages_under && records_under
+    }
+
+    /// The engine holds `bytes` of the range it stated back
+    /// ([`::engine::live::Live::held`]): no state chunk is opened in the
+    /// top `bytes` of the span below the activation, which the engine binds
+    /// none of yet; all of it again once it holds none.
+    /// Whether the ceiling rose: room opened that a planner waiter may be
+    /// short of, so the caller wakes them.
+    pub fn hold_back(&mut self, bytes: u64) -> bool {
+        let ceiling = self.ceiling_for(bytes);
+        let rose = ceiling > self.pool.ceiling();
+        if ceiling != self.pool.ceiling() {
+            self.pool.set_ceiling(ceiling);
+        }
+        rose
+    }
+
+    /// The chunk the engine binds state below while it holds `bytes` back:
+    /// the held span lies directly under the activation span
+    /// ([fitted, stated)); the whole range when it holds none.
+    fn ceiling_for(&self, bytes: u64) -> u32 {
+        if bytes == 0 {
+            return self.pool.total_chunks();
+        }
+        let act_start = self.pool.total_chunks() - self.pool.act_max();
+        let held =
+            u32::try_from(bytes.div_ceil(self.pool.chunk_bytes().max(1))).unwrap_or(u32::MAX);
+        act_start
+            .saturating_sub(held)
+            .max(self.pool.reserved_chunks())
+    }
+
+    /// The most the pool may map while the engine holds `bytes` back: the
+    /// prefix segments wholly under what it binds
+    /// ([`crate::store::slots::SlotPool::backs`]) and the top span,
+    /// committed from the load; the whole range when it holds none.
+    #[must_use]
+    pub fn bound_bytes(&self, bytes: u64) -> u64 {
+        let total = self.pool.total_chunks();
+        if bytes == 0 {
+            return u64::from(total) * self.pool.chunk_bytes();
+        }
+        let seg = self.pool.segments().segment_chunks().max(1);
+        let top_start = self.pool.top_segment() * seg;
+        let prefix_end = (self.ceiling_for(bytes) / seg * seg).min(top_start);
+        u64::from(prefix_end + (total - top_start)) * self.pool.chunk_bytes()
     }
 
     /// [`Self::rung_for`], no wider than `armed` (a rung's tokens): the
@@ -1371,7 +1525,7 @@ impl SharedPool {
             .take_while(|&s| segments.state(s) != SegmentState::Uncommitted)
             .count() as u32;
         let mapped = self.mapped_segments();
-        if mapped < target && prefix < top {
+        if mapped < target && prefix < top && self.pool.backs(prefix) {
             return Some(SegmentMove::Commit { prefix: prefix + 1 });
         }
         if mapped <= target || prefix == 0 {

@@ -4,13 +4,13 @@
 //! commit, evacuation and release is ordered with the fires around it.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Notify;
 
 use super::{RungStep, RungWalk, SegmentMove, Shared, SharedPool};
-use crate::governor::{Demand, Growth, PoolTarget, Retarget};
+use crate::governor::{Demand, Growth, PATIENCE, PoolTarget, Retarget};
 use crate::scheduler::worker::PoolOp;
 use crate::store::registry;
 
@@ -33,6 +33,11 @@ pub struct SharedGrow {
     /// ask of a fire (SPEC decision 6, by demand): the smallest rung while
     /// none asks past it.
     rung_walk: Arc<std::sync::Mutex<RungWalk>>,
+    /// The governor's ticks, counted ([`PoolTarget::ticked`]).
+    ticks: Arc<AtomicU64>,
+    /// The tick since which the rung has stood past what is asked: a cap
+    /// down or a lower waits the governor's patience from it.
+    idle_since: Arc<std::sync::Mutex<Option<u64>>>,
 }
 
 impl SharedGrow {
@@ -49,6 +54,8 @@ impl SharedGrow {
             refused: Arc::new(AtomicBool::new(false)),
             no_room: Arc::new(AtomicBool::new(false)),
             rung_walk: Arc::new(std::sync::Mutex::new(RungWalk::default())),
+            ticks: Arc::new(AtomicU64::new(0)),
+            idle_since: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -60,13 +67,45 @@ impl SharedGrow {
     /// of room waits on the room the asking pass has the planner free; one
     /// to a rung the engine has not armed waits on its capture
     /// ([`super::rung_goal`]), the walk looking again each poll.
+    /// The rows the walk holds the rung to: what passes ask, and never
+    /// fewer than the widest decode fire (the engine's lane count), whose
+    /// frames the scheduler holds rather than cuts: a rung under it would
+    /// leave a decode batch waiting on a raise nobody funds.
+    fn walk_rows(&self) -> u32 {
+        let lanes = crate::engine::get_spec(self.engine).map_or(0, |spec| {
+            u32::try_from(spec.limits.max_forward_requests).unwrap_or(u32::MAX)
+        });
+        super::wanted_rows(self.engine).max(lanes)
+    }
+
     async fn walk_rung(&self) {
         loop {
             let (current, retired) = self.epochs();
             let (step, goal) = {
                 let mut pool = self.shared.lock().unwrap();
                 pool.pool_mut().retire_through(retired);
-                let goal = super::rung_goal(&pool, self.engine, super::wanted_rows(self.engine));
+                // A raise's copy is still the engine's to take: nothing
+                // moves until it has.
+                if pool.copying().is_some() {
+                    return;
+                }
+                let goal = super::rung_goal(&pool, self.engine, self.walk_rows());
+                // The pool stands past what is asked: it comes down only
+                // once it has for the governor's patience, so a pause
+                // between batches moves no rung.
+                let past = pool.pool().act_chunks(goal) < pool.pool().act_chunks(pool.rung());
+                let tick = self.ticks.load(Ordering::Acquire);
+                let waited = {
+                    let mut since = self.idle_since.lock().unwrap();
+                    if past {
+                        tick >= since
+                            .get_or_insert(tick)
+                            .saturating_add(u64::from(PATIENCE))
+                    } else {
+                        *since = None;
+                        true
+                    }
+                };
                 let step = self.rung_walk.lock().unwrap().step(
                     &pool,
                     goal,
@@ -75,6 +114,21 @@ impl SharedGrow {
                     current,
                     retired,
                 );
+                // A raise is taken in the hold it was planned in: no slot is
+                // handed out between, and the engine's copy follows.
+                let step = match step {
+                    Ok(RungStep::Raise { rung, evacuation }) => pool
+                        .raise_applied(&evacuation)
+                        .map(|()| RungStep::Raise { rung, evacuation }),
+                    // A cap down or a lower before the patience is out.
+                    Ok(RungStep::Lower(_)) if !waited => Ok(RungStep::Wait),
+                    Ok(RungStep::Cap(tokens))
+                        if !waited && tokens < super::fire_cap(self.engine) =>
+                    {
+                        Ok(RungStep::Wait)
+                    }
+                    step => step,
+                };
                 (step, goal)
             };
             let step = match step {
@@ -104,7 +158,7 @@ impl SharedGrow {
                         // is not taken.
                         let _pool = self.shared.lock().unwrap();
                         let now = super::fire_cap(self.engine);
-                        if tokens < now && super::wanted_rows(self.engine) > tokens {
+                        if tokens < now && self.walk_rows() > tokens {
                             continue;
                         }
                         super::set_fire_cap(self.engine, tokens);
@@ -136,23 +190,30 @@ impl SharedGrow {
                 }
                 RungStep::Raise { rung, evacuation } => {
                     if !evacuation.moves.is_empty() {
+                        tracing::info!(
+                            engine = self.engine,
+                            rung,
+                            moves = evacuation.moves.len(),
+                            "a raise moves state out of the span; fires wait on its copy"
+                        );
                         let moves = SharedPool::rung_moves(&evacuation);
                         let copied =
                             crate::scheduler::pool(self.engine, PoolOp::Evacuate(moves)).await;
                         if let Err(error) = copied {
-                            tracing::warn!(engine = self.engine, %error, "a rung's evacuation was refused");
+                            // The pool moved the chunks and the engine did
+                            // not: no fire passes the rung held before.
+                            tracing::error!(
+                                engine = self.engine,
+                                %error,
+                                "a raise's copy was refused; the rung stays held"
+                            );
                             return;
                         }
-                    }
-                    let (current, _) = self.epochs();
-                    let applied = self
-                        .shared
-                        .lock()
-                        .unwrap()
-                        .apply_rung(&evacuation, current.saturating_add(1));
-                    if let Err(error) = applied {
-                        tracing::warn!(engine = self.engine, %error, "the activation rung stays");
-                        return;
+                        let (current, _) = self.epochs();
+                        self.shared
+                            .lock()
+                            .unwrap()
+                            .raise_copied(current.saturating_add(1));
                     }
                     tracing::info!(
                         engine = self.engine,
@@ -189,7 +250,12 @@ impl SharedGrow {
     pub fn can_grow(&self) -> bool {
         let pool = self.shared.lock().unwrap();
         let top = pool.pool().top_segment();
-        pool.pool().prefix_segments() < top
+        let next = pool.pool().prefix_segments();
+        // The next segment must be one the engine binds: one at or past
+        // what it holds back never commits, and a waiter told the pool
+        // grows would wait on it for good.
+        next < top
+            && pool.pool().backs(next)
             && pool.mapped_segments() < self.target.load(Ordering::Acquire)
     }
 
@@ -356,5 +422,67 @@ impl PoolTarget for SharedGrow {
 
     fn take_refused(&mut self) -> bool {
         self.refused.swap(false, Ordering::AcqRel)
+    }
+
+    /// A governor tick: counted for the rung's patience, and the walk looks
+    /// again.
+    fn ticked(&mut self) {
+        self.ticks.fetch_add(1, Ordering::AcqRel);
+        self.wake.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pool says it can grow only where the next segment is one it
+    /// may commit: a waiter told it grows into what the engine holds back
+    /// would wait on a commit that never comes.
+    #[test]
+    fn the_pool_grows_only_into_a_segment_the_engine_binds() {
+        let mut pool = super::super::tests::pool();
+        let top = pool.pool().total_chunks() - pool.pool().act_max();
+        let next = pool.pool().prefix_segments();
+        let next_end = pool.pool().segments().range(next).end;
+        // The ceiling one chunk short of the next segment's end.
+        let held = top - (next_end - 1);
+        pool.hold_back(u64::from(held) * pool.pool().chunk_bytes());
+        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+        let mut grow = SharedGrow::new(0, 58, shared.clone());
+        let _ = grow.retarget(u64::from(u32::MAX));
+        assert!(!grow.can_grow(), "the next segment straddles the ceiling");
+        shared.lock().unwrap().hold_back(0);
+        assert!(grow.can_grow(), "held back no more: it grows");
+    }
+
+    /// A pool that stands past what is asked comes down only once it has
+    /// for the governor's patience: a pause shorter than that moves no rung.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_rung_comes_down_only_after_the_governor_s_patience() {
+        const ENGINE: usize = 59;
+        let pool = super::super::tests::pool();
+        assert_eq!(pool.rung(), 2048);
+        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+        let mut grow = SharedGrow::new(0, ENGINE, shared);
+        super::super::set_fire_cap_for_test(ENGINE, u32::MAX);
+        // Nothing asked: the walk would cap fires to the smallest rung.
+        grow.walk_rung().await;
+        assert_eq!(
+            super::super::fire_cap(ENGINE),
+            u32::MAX,
+            "not before a tick"
+        );
+        for tick in 1..PATIENCE {
+            grow.ticked();
+            grow.walk_rung().await;
+            assert_eq!(super::super::fire_cap(ENGINE), u32::MAX, "tick {tick}");
+        }
+        grow.ticked();
+        grow.walk_rung().await;
+        assert!(
+            super::super::fire_cap(ENGINE) < u32::MAX,
+            "past the patience: fires are cut toward the rung asked"
+        );
     }
 }

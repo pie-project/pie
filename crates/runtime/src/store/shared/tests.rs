@@ -92,7 +92,7 @@ fn facts() -> ChunkFacts {
     facts
 }
 
-fn pool() -> SharedPool {
+pub(super) fn pool() -> SharedPool {
     SharedPool::new(&facts(), 256).unwrap()
 }
 
@@ -761,4 +761,321 @@ fn a_raise_by_demand_says_what_it_lacks_and_moves_the_rest() {
     pool.apply_rung(&evacuation, 1).unwrap();
     assert_eq!(pool.rung(), 2048);
     assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
+}
+
+/// Twelve rungs, every power of two from 1, the small ones sharing their
+/// activation's chunk count: an idle pool lowered to the smallest stays
+/// there, the walk never lowering again within the class it is in.
+#[test]
+fn rungs_sharing_their_chunks_are_one_class_the_walk_never_moves_within() {
+    let facts = ChunkFacts {
+        act_chunks: vec![
+            (1, 1),
+            (2, 1),
+            (4, 1),
+            (8, 1),
+            (16, 1),
+            (32, 2),
+            (64, 2),
+            (128, 2),
+            (256, 4),
+            (512, 4),
+            (1024, 8),
+            (2048, 12),
+        ],
+        ..facts()
+    };
+    facts.validate().unwrap();
+    let mut pool = SharedPool::new(&facts, 256).unwrap();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    let mut walk = RungWalk::default();
+    assert_eq!(pool.rung(), 2048);
+    assert_eq!(
+        walk.step(&pool, 1, u32::MAX, u32::MAX, 5, 5).unwrap(),
+        RungStep::Cap(1)
+    );
+    assert_eq!(walk.step(&pool, 1, 1, 1, 7, 5).unwrap(), RungStep::Wait);
+    assert_eq!(walk.step(&pool, 1, 1, 1, 9, 7).unwrap(), RungStep::Lower(1));
+    pool.lower_rung(1).unwrap();
+    assert_eq!(pool.rung(), 16, "the pool reports its class's widest rung");
+    // Idle at the smallest rung: no repeated lower, ever.
+    for epoch in 10..40 {
+        assert_eq!(
+            walk.step(&pool, 1, 1, 1, epoch, epoch).unwrap(),
+            RungStep::Wait,
+            "a lower within the class the pool is in"
+        );
+    }
+    // A goal inside the class only caps fires; none raises the rung.
+    assert_eq!(
+        walk.step(&pool, 16, 1, 1, 40, 40).unwrap(),
+        RungStep::Cap(16)
+    );
+    assert_eq!(
+        walk.step(&pool, 8, 16, 16, 41, 41).unwrap(),
+        RungStep::Cap(8)
+    );
+    // The next class raises.
+    assert!(matches!(
+        walk.step(&pool, 32, 8, 8, 42, 42).unwrap(),
+        RungStep::Raise { rung: 32, .. }
+    ));
+}
+
+/// What an arming step is lent comes from the allocators sequences take
+/// from, named as a lane names them: a record by its pieces' slot refs, a
+/// kv page by its list slot ref; none lies in the null chunk, which the
+/// engine refuses a ref into.
+#[test]
+fn a_lent_record_and_lent_pages_name_no_slot_in_the_null_chunk() {
+    let mut facts = facts();
+    facts.shapes.retain(|shape| shape.id != RING);
+    facts.validate().unwrap();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let mut rs = crate::store::rs::RsStore::shared(&shared, None);
+    let grant = rs
+        .reserve(crate::store::rs::RsUnits::of(1, 0))
+        .expect("a record");
+    assert_eq!(grant.slots, [crate::store::rs::RsSlotId(0)], "store id 0");
+    let refs = rs.device_refs(&grant.slots);
+    let pool = shared.lock().unwrap();
+    let reserved = pool.pool().reserved_chunks();
+    assert!(reserved >= 1, "chunk 0 is the null chunk");
+    let mut at = 0;
+    for fixed in pool.fixed() {
+        let spc = pool.pool().shape(fixed.pool).unwrap().slots_per_chunk;
+        for _ in 0..fixed.pieces {
+            let chunk = refs[at] / spc;
+            assert!(
+                chunk >= reserved,
+                "piece ref {} lies in chunk {chunk}",
+                refs[at]
+            );
+            at += 1;
+        }
+    }
+    assert_eq!(at, refs.len(), "one record, every piece");
+    let list = pool.list().expect("a kv list");
+    drop(pool);
+    let mut pages =
+        crate::store::chunks::ShapePool::<crate::store::kv::page_table::PhysicalKvPageId>::shared(
+            &shared, list,
+        );
+    let spc = shared
+        .lock()
+        .unwrap()
+        .pool()
+        .shape(list.pool)
+        .unwrap()
+        .slots_per_chunk;
+    for page in pages.try_alloc_n(64).expect("pages") {
+        assert!(
+            page.0 / spc >= reserved,
+            "page {} lies in the null chunk",
+            page.0
+        );
+    }
+    rs.release_reservation(grant);
+}
+
+/// While the engine holds back part of the range it stated, no slot it
+/// binds none of is handed out, to a sequence or an arming lease alike:
+/// every ref lies in a committed segment, past the null chunk and below
+/// the span held back; once it holds none, the rest opens.
+#[test]
+fn no_slot_is_handed_out_past_what_the_engine_binds() {
+    let facts = facts();
+    let shared: Shared = Arc::new(Mutex::new(pool()));
+    let list = shared.lock().unwrap().list().expect("a kv list");
+    let spc = facts.shapes[0].slots_per_chunk;
+    let chunk_of = |pool: &SharedPool, r: u32| pool.pool().physical(r / spc).unwrap();
+    // Two segments committed: refs stay in them.
+    {
+        let mut pool = shared.lock().unwrap();
+        let refs = pool.take_refs(list.pool, 64).expect("refs");
+        for &r in &refs {
+            let chunk = chunk_of(&pool, r);
+            assert!(
+                chunk >= 1 && chunk < 2 * SEGMENT,
+                "ref {r} in chunk {chunk}"
+            );
+        }
+        pool.give_refs(list.pool, &refs);
+    }
+    // Every segment committed, the engine holding back all but 8 chunks
+    // below the activation: refs stay under chunk 8.
+    let mut engine = FakeEngine::new();
+    {
+        let mut pool = shared.lock().unwrap();
+        assert_eq!(
+            walk_segments(&mut pool, 8, 0, &mut engine),
+            Retarget::Reached
+        );
+        let top = TOTAL - pool.pool().act_max();
+        pool.hold_back(u64::from(top - 8) * CHUNK);
+        assert_eq!(pool.pool().ceiling(), 8);
+    }
+    let mut pages =
+        crate::store::chunks::ShapePool::<crate::store::kv::page_table::PhysicalKvPageId>::shared(
+            &shared, list,
+        );
+    let mut taken = Vec::new();
+    while let Some(ids) = pages.try_alloc_n(1) {
+        taken.extend(ids);
+    }
+    {
+        let pool = shared.lock().unwrap();
+        assert!(!taken.is_empty());
+        for page in &taken {
+            let chunk = chunk_of(&pool, page.0);
+            assert!(
+                (1..8).contains(&chunk),
+                "page {} lies in chunk {chunk}, past what the engine binds",
+                page.0
+            );
+        }
+    }
+    // It holds none back: the rest of the span opens.
+    shared.lock().unwrap().hold_back(0);
+    let more = pages.try_alloc_n(1).expect("the span held back opens");
+    let pool = shared.lock().unwrap();
+    assert!(chunk_of(&pool, more[0].0) >= 8);
+}
+
+/// A raise that moves state is taken in the hold it was planned in: no
+/// slot can be handed out between plan and apply (the engine copies after,
+/// never against a pool that moved on), its moved-off chunks stay fenced and
+/// no cap is lifted past the rung held before until the engine has the copy.
+#[test]
+fn a_raise_is_taken_where_it_is_planned_and_held_until_its_copy() {
+    const ENGINE: usize = 60;
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    pool.lower_rung(16).unwrap();
+    let all = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
+    pool.give_records(&all[..all.len() / 2]);
+    pool.pool_mut().retire_through(u64::MAX);
+    let evacuation = pool.plan_raise(2048).unwrap();
+    assert!(!evacuation.moves.is_empty(), "state in the span moves down");
+    pool.raise_applied(&evacuation).unwrap();
+    assert_eq!(pool.rung(), 2048, "taken at once");
+    assert_eq!(pool.copying(), Some(16), "fires held at the rung before");
+    // The engine copies against the table the pool now states.
+    engine
+        .evacuate(&SharedPool::rung_moves(&evacuation))
+        .unwrap();
+    assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
+    // No fire retires the fence while the copy is the engine's.
+    pool.pool_mut().retire_through(1_000_000);
+    let moved_off: Vec<u32> = evacuation.moves.iter().map(|step| step.from).collect();
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    crate::store::shared::set_fire_cap_for_test(ENGINE, 16);
+    crate::store::shared::raise_now(&shared, ENGINE, 2048);
+    assert_eq!(
+        crate::store::shared::fire_cap(ENGINE),
+        16,
+        "no cap lifted before the copy"
+    );
+    let mut pool = shared.lock().unwrap();
+    pool.raise_copied(1_000_001);
+    assert_eq!(pool.copying(), None);
+    pool.pool_mut().retire_through(1_000_001);
+    let _ = moved_off;
+}
+
+/// While the engine holds part of its range back, a committed chunk past
+/// the ceiling is no room: the walker sees the shortfall and commits ahead
+/// of a waiter, and the ceiling's lift says so, for the planner's waiters
+/// to be woken.
+#[test]
+fn room_past_the_ceiling_is_not_headroom_and_its_lift_is_said() {
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    let all = pool.pool().headroom();
+    let top = TOTAL - pool.pool().act_max();
+    assert!(!pool.hold_back(u64::from(top - 8) * CHUNK), "lowered");
+    let held_back = pool.pool().headroom();
+    assert!(
+        held_back <= 8 - pool.pool().reserved_chunks(),
+        "only the chunks under the ceiling count: {held_back} of {all}"
+    );
+    assert!(pool.hold_back(0), "lifted: the caller wakes the waiters");
+    assert_eq!(pool.pool().headroom(), all);
+}
+
+/// The first commit (the weights' at boot, the walker's ahead of a
+/// waiter) never maps a segment into what the engine holds back: however
+/// much it is asked for, it stops at the ceiling, so the range less what the
+/// engine holds is all that is ever backed below the activation.
+#[test]
+fn no_commit_reaches_into_what_the_engine_holds_back() {
+    let mut pool = pool();
+    let top = TOTAL - pool.pool().act_max();
+    // All but the lowest two segments below the activation held back.
+    let ceiling = 2 * SEGMENT;
+    pool.hold_back(u64::from(top - ceiling) * CHUNK);
+    assert_eq!(pool.pool().ceiling(), ceiling);
+    let list = pool.list().expect("a kv list").pool;
+    let committed = pool.pool_mut().commit_for(&[(list, u64::MAX / 2)], 0);
+    assert!(
+        committed.iter().all(|&segment| segment * SEGMENT < ceiling),
+        "committed {committed:?} past the ceiling at chunk {ceiling}"
+    );
+    assert!(
+        pool.pool().commit_ahead(u64::MAX / 2).is_empty(),
+        "nothing ahead past the ceiling"
+    );
+    assert!(pool.mapped_segments() <= 2 + (8 - pool.pool().top_segment()));
+}
+
+/// A segment that straddles the ceiling is not committed while the engine
+/// holds anything back, by the weights' commit, the walker's ahead or its
+/// grow: what is mapped never passes the range less what is held, not for
+/// a moment.
+#[test]
+fn a_segment_straddling_the_ceiling_is_never_mapped() {
+    let mut pool = pool();
+    let top = TOTAL - pool.pool().act_max();
+    // Held back: 19 chunks under the activation, so the ceiling (at 33)
+    // falls inside segment 4.
+    let held = 19;
+    assert!(!pool.hold_back(u64::from(held) * CHUNK));
+    let ceiling = pool.pool().ceiling();
+    assert_eq!(ceiling, top - held);
+    assert_ne!(ceiling % SEGMENT, 0, "the ceiling straddles a segment");
+    let list = pool.list().expect("a kv list").pool;
+    let committed = pool.pool_mut().commit_for(&[(list, u64::MAX / 2)], 0);
+    assert!(
+        committed
+            .iter()
+            .all(|&segment| (segment + 1) * SEGMENT <= ceiling),
+        "committed {committed:?} past the ceiling at chunk {ceiling}"
+    );
+    assert!(pool.pool().commit_ahead(u64::MAX / 2).is_empty());
+    let mut grows = 0;
+    while let Some(SegmentMove::Commit { prefix }) = pool.next_move(u32::MAX, 0) {
+        pool.pool_mut().commit_segment(prefix - 1).unwrap();
+        grows += 1;
+        assert!(grows < 16, "the walk keeps committing");
+    }
+    let bound = pool.bound_bytes(u64::from(held) * CHUNK);
+    assert!(
+        pool.held() <= bound,
+        "mapped {} past what the engine binds {bound}",
+        pool.held()
+    );
 }
