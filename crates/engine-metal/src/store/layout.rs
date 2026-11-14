@@ -37,6 +37,9 @@ pub const RS: ShapeId = ShapeId(3);
 pub const INSTANCE: ShapeId = ShapeId(7);
 /// A ring's cells (`SlotRole::Channel`).
 pub const CHANNEL: ShapeId = ShapeId(8);
+/// One plane of a landed adapter (`SlotRole::Adapter`): a bank's plane a
+/// slot, shared by every instance that lands the same adapter.
+pub const ADAPTER: ShapeId = ShapeId(9);
 
 /// An `Instance` slot's bytes: every measured instance's tables in one
 /// (`new-memory/STATE-ROLES.md` section 3). Structural, not config.
@@ -146,6 +149,9 @@ pub struct Layout {
     /// working set holds, taken per instance and channel.
     pub instance: Option<Slots>,
     pub channel: Option<Slots>,
+    /// Landed adapters' planes, one a slot ([`Layout::with_adapter`]);
+    /// none for a model with no registered banks.
+    pub adapter: Option<Slots>,
     /// The activation span (REDESIGN 3c): `(rung tokens, chunks)` a fire of
     /// up to that many tokens takes out of the range's top, ascending, the
     /// first `act_rungs`; the last is the span. None where activation lives
@@ -188,6 +194,7 @@ impl Layout {
             seats,
             instance: Slots::of(INSTANCE, INSTANCE_SLOT, chunk_bytes),
             channel: Slots::of(CHANNEL, CHANNEL_SLOT, chunk_bytes),
+            adapter: None,
             act: [(0, 0); MAX_RUNGS],
             act_rungs: 0,
             tables: 0,
@@ -302,6 +309,28 @@ impl Layout {
         self.act().last().map_or(0, |&(_, chunks)| chunks)
     }
 
+    /// This layout with `Adapter` slots of `bytes`, the widest plane of a
+    /// registered bank: a landed adapter takes one a bank.
+    pub fn with_adapter(mut self, bytes: u64) -> Result<Layout> {
+        if bytes == 0 {
+            return Ok(self);
+        }
+        let slots = Slots::of(ADAPTER, bytes, self.chunk_bytes).ok_or(Fault::Ceiling {
+            what: "bytes of a pool chunk an adapter plane fits in",
+            need: bytes,
+            have: self.chunk_bytes,
+        })?;
+        if slots.per_chunk == 0 {
+            return Err(Fault::Ceiling {
+                what: "bytes of a pool chunk an adapter plane fits in",
+                need: bytes,
+                have: self.chunk_bytes,
+            });
+        }
+        self.adapter = Some(slots);
+        Ok(self)
+    }
+
     /// This layout with the engine's tables in `chunks` chunks right after
     /// the null chunk: every seat run moves past them.
     #[must_use]
@@ -356,6 +385,7 @@ impl Layout {
             .chain(&self.rs)
             .chain(&self.instance)
             .chain(&self.channel)
+            .chain(&self.adapter)
     }
 
     #[must_use]
@@ -457,6 +487,7 @@ impl Layout {
         for (slots, role) in [
             (&self.instance, SlotRole::Instance),
             (&self.channel, SlotRole::Channel),
+            (&self.adapter, SlotRole::Adapter),
         ] {
             if let Some(slots) = slots {
                 // The role, not the count, keeps these out of a working

@@ -51,7 +51,8 @@ pub struct Metal {
     next_frame: u64,
     sink: Option<engine::CompletionSink>,
     pending: Option<(FrameId, Vec<PendingStep>)>,
-    adapters: BTreeMap<InstanceId, crate::adapter::Binding>,
+    /// The adapter id each instance's lanes route by.
+    adapters: BTreeMap<InstanceId, u32>,
 }
 
 impl Metal {
@@ -265,12 +266,65 @@ fn bf16_bits(value: f32) -> u16 {
     ((bits + rounding) >> 16) as u16
 }
 
+/// The adapter an instance bound with `seeds` lands, by its content: two
+/// independent 64-bit digests (FNV-1a high, SipHash low) of the sink's site
+/// word and, in the sink's plane order, each plane's bank role, its seed's
+/// length and its seed, word for word as CUDA's `adapter_key_of`, so one
+/// adapter keys the same on both. None: the program lands none.
+pub fn adapter_key_of(
+    shell: &Shell,
+    program: engine::program::ProgramId,
+    seeds: &[engine::channel::ChannelSeed],
+) -> EngineResult<Option<u128>> {
+    let Some(sink) = shell.program_adapter_sink(program).map_err(fault)? else {
+        return Ok(None);
+    };
+    Ok(Some(adapter_digest(
+        sink.sites,
+        sink.planes.iter().map(|(role, channel)| {
+            let wire = seeds
+                .iter()
+                .find(|seed| seed.channel == *channel)
+                .map_or(&[][..], |seed| seed.bytes.as_slice());
+            (role.bank(), wire)
+        }),
+    )))
+}
+
+/// The digest [`adapter_key_of`] states, over a sink's site word and its
+/// planes `(bank role, seed)` in order.
+#[must_use]
+pub fn adapter_digest<'a>(sites: u32, planes: impl Iterator<Item = (&'a str, &'a [u8])>) -> u128 {
+    let mut fnv: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut sip = std::collections::hash_map::DefaultHasher::new();
+    let mut eat = |bytes: &[u8]| {
+        use std::hash::Hasher;
+        for byte in bytes {
+            fnv = (fnv ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        sip.write(bytes);
+    };
+    eat(&sites.to_le_bytes());
+    for (bank, wire) in planes {
+        eat(bank.as_bytes());
+        eat(&(wire.len() as u64).to_le_bytes());
+        eat(wire);
+    }
+    let sip = std::hash::Hasher::finish(&sip);
+    (u128::from(fnv) << 64) | u128::from(sip)
+}
+
+/// Lands the adapter an instance of `program` carries, its planes the
+/// bind's seeds, in the `Adapter` slots the runtime took (`slots`): where
+/// another instance landed the same adapter there it joins it. Its adapter
+/// id, what its lanes route by; None where it carries none.
 fn adapter_of(
     shell: &mut Shell,
     program: engine::program::ProgramId,
     instance: InstanceId,
     seeds: &[(u32, Vec<u8>)],
-) -> EngineResult<Option<crate::adapter::Binding>> {
+    slots: &[u32],
+) -> EngineResult<Option<u32>> {
     let Some(sink) = shell.program_adapter_sink(program).map_err(fault)? else {
         return Ok(None);
     };
@@ -301,11 +355,12 @@ fn adapter_of(
             bytes,
         })
         .collect();
+    let planes: Vec<(String, Vec<u8>)> = planes
+        .iter()
+        .map(|plane| (plane.bank.to_string(), plane.bytes.to_vec()))
+        .collect();
     shell
-        .bind_adapter(crate::adapter::Source::Own {
-            instance,
-            planes: &planes,
-        })
+        .land_adapter(instance, slots, planes)
         .map(Some)
         .map_err(fault)
 }
@@ -772,6 +827,10 @@ impl Engine for Metal {
             .map_err(fault)
     }
 
+    fn adapter_key(&self, binding: &engine::InstanceBinding) -> EngineResult<Option<u128>> {
+        adapter_key_of(self.loaded()?, binding.program, &binding.seeds)
+    }
+
     fn program_facts(&self, program: ProgramId) -> EngineResult<engine::ProgramFacts> {
         self.loaded()?.program_facts(program).map_err(fault)
     }
@@ -858,7 +917,7 @@ impl Engine for Metal {
                 &binding.ring_slots,
             )
             .map_err(fault)?;
-        let landed = adapter_of(shell, binding.program, id, &seeds);
+        let landed = adapter_of(shell, binding.program, id, &seeds, &binding.adapter_slots);
         let bound = match landed {
             Ok(bound) => bound,
             Err(why) => {
@@ -877,11 +936,9 @@ impl Engine for Metal {
     }
 
     fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
-        let held = self.adapters.remove(&id);
+        self.adapters.remove(&id);
         let shell = self.loaded_mut()?;
-        if let Some(bound) = held.as_ref() {
-            shell.release_adapter(bound);
-        }
+        shell.detach_adapter(id);
         shell.close_program_instance(id).map_err(fault)
     }
 
@@ -1029,7 +1086,7 @@ impl Metal {
                     continue;
                 };
                 if let Some(slot) = lane_adapters.get_mut(attachment.lane as usize) {
-                    *slot = Some(bound.slot);
+                    *slot = Some(*bound);
                 }
             }
         }

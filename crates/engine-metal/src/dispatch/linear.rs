@@ -1250,6 +1250,10 @@ impl Run<'_> {
                 self.tensor(*bank_b),
                 self.tensor(*routes),
                 self.tensor(*y_out),
+                // A bank is `[ids, rank, in]`: its tensor here is the bank's
+                // address table, one an id, so the rank comes off the
+                // declaration.
+                self.const_dim(*bank_a, 1).unwrap_or(0),
             ),
             Linear::MoeCombine {
                 routed,

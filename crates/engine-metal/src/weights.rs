@@ -30,6 +30,10 @@ pub struct AdapterPlane<'a> {
     pub bytes: &'a [u8],
 }
 
+/// The adapter ids a bank's address table holds: the operator seats first,
+/// then the adapters instances land in `Adapter` slots.
+pub const ADAPTER_IDS: u32 = 256;
+
 #[derive(Debug)]
 pub struct Weights {
     store: Store,
@@ -58,8 +62,12 @@ pub struct Weights {
 struct Bank {
     /// Its param: the handle its tensor binds.
     param: usize,
-    /// Where it lies in the banks' region of the pool's tables run.
+    /// Where its operator seats lie in the banks' region of the pool's
+    /// tables run.
     offset: u64,
+    /// Where its address table lies in the tables region: one GPU address
+    /// an adapter id ([`ADAPTER_IDS`]), what the correction reads through.
+    table_at: u64,
     adapters: u32,
     slot: u64,
     rows: u64,
@@ -98,6 +106,7 @@ fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
                 Bank {
                     param: at,
                     offset: 0,
+                    table_at: 0,
                     adapters,
                     slot,
                     rows,
@@ -342,10 +351,21 @@ impl Weights {
     /// seat of each, each bank on the arena's boundary.
     #[must_use]
     pub fn bank_bytes(&self) -> u64 {
+        self.seat_bytes() + self.table_bytes()
+    }
+
+    /// The operator seats' bytes: every seat of each bank (the operator-
+    /// declared adapters' path, which goes once their place is ruled).
+    fn seat_bytes(&self) -> u64 {
         self.banks
             .values()
             .map(|bank| crate::arena::room(u64::from(bank.adapters) * bank.slot))
             .sum()
+    }
+
+    /// The banks' address tables' bytes: [`ADAPTER_IDS`] GPU addresses each.
+    fn table_bytes(&self) -> u64 {
+        self.banks.len() as u64 * crate::arena::room(u64::from(ADAPTER_IDS) * 8)
     }
 
     /// Lays the registered banks in one region `table` hands out of the
@@ -356,24 +376,88 @@ impl Weights {
         handles: &Handles,
         table: impl FnOnce(u64) -> Result<crate::inputs::Region>,
     ) -> Result<()> {
-        let total = self.bank_bytes();
-        if total == 0 {
+        if self.banks.is_empty() {
             return Ok(());
         }
-        let region = table(total)?;
+        let mut region = table(self.bank_bytes())?;
+        let seats = self.seat_bytes();
         let mut at = 0u64;
+        let mut table_at = seats;
+        let mut entries: Vec<(u64, u64)> = Vec::new();
         for bank in self.banks.values_mut() {
-            let Some(Some(WeightRow::Dense(plane))) = self.table.0.get(bank.param) else {
+            let Some(Some(WeightRow::Dense(plane))) = self.table.0.get(bank.param).copied() else {
                 return Err(Fault::Unbound {
                     what: format!("registered bank param {}'s plane", bank.param),
                 });
             };
-            handles.rebind_at(plane.buf, region.view(), region.at(at))?;
+            // The bank's tensor is its address table: an id a row.
+            handles.rebind_at(plane.buf, region.view(), region.at(table_at))?;
+            self.table.0[bank.param] = Some(WeightRow::Dense(Tensor::new(
+                plane.buf,
+                ADAPTER_IDS,
+                1,
+                Dtype::I64,
+            )));
             bank.offset = at;
+            bank.table_at = table_at;
+            // Ids under the bank's seats read the operator seats.
+            for id in 0..u64::from(bank.adapters.min(ADAPTER_IDS)) {
+                let address = region
+                    .view()
+                    .address_at(region.at(at + id * bank.slot))
+                    .ok_or_else(|| Fault::Unbound {
+                        what: "a GPU address for an operator seat".to_string(),
+                    })?;
+                entries.push((table_at + id * 8, address));
+            }
             at += crate::arena::room(u64::from(bank.adapters) * bank.slot);
+            table_at += crate::arena::room(u64::from(ADAPTER_IDS) * 8);
+        }
+        for (at, address) in entries {
+            region.write(at, &address.to_le_bytes())?;
         }
         self.bank_region = Some(region);
         Ok(())
+    }
+
+    /// Points adapter id `id` of bank `name` at `address` (where that
+    /// adapter's plane of the bank lies): what the correction reads from the
+    /// next fire on.
+    pub fn point(&mut self, name: &str, id: u32, address: u64) -> Result<()> {
+        if id >= ADAPTER_IDS {
+            return Err(Fault::Ceiling {
+                what: "adapter ids a bank's table holds",
+                need: u64::from(id) + 1,
+                have: u64::from(ADAPTER_IDS),
+            });
+        }
+        let bank = self.banks.get(name).ok_or_else(|| Fault::Adapter {
+            bank: name.to_string(),
+            why: "not a bank this plan declares".to_string(),
+        })?;
+        let at = bank.table_at + u64::from(id) * 8;
+        let region = self.bank_region.as_mut().ok_or_else(|| Fault::Unbound {
+            what: "the registered banks' tables, laid at the load".to_string(),
+        })?;
+        region.write(at, &address.to_le_bytes())
+    }
+
+    /// The widest plane of a registered bank: an `Adapter` slot's bytes.
+    #[must_use]
+    pub fn widest_bank_plane(&self) -> u64 {
+        self.banks.values().map(|bank| bank.slot).max().unwrap_or(0)
+    }
+
+    /// The first adapter id past the operator seats: where landed adapters'
+    /// ids start.
+    #[must_use]
+    pub fn first_landed_id(&self) -> u32 {
+        self.banks
+            .values()
+            .map(|bank| bank.adapters)
+            .max()
+            .unwrap_or(0)
+            .min(ADAPTER_IDS)
     }
 
     #[must_use]

@@ -42,10 +42,7 @@ pub mod tune;
 pub mod weights;
 pub mod window;
 
-pub use adapter::{
-    Binding as AdapterBinding, Key as AdapterKey, Role as AdapterRole, Site,
-    Source as AdapterSource,
-};
+pub use adapter::{Role as AdapterRole, Site};
 pub use api::{ContractFor, DeviceBoot, Metal};
 pub use arena::Arena;
 pub use blob::{Layout as AdapterLayout, Manifest as AdapterManifest, Stamp as AdapterStamp};
