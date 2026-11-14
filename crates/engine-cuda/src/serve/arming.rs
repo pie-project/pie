@@ -642,6 +642,25 @@ impl Shell {
             .collect()
     }
 
+    /// The class a lane of `class` lands in once it carries an adapter: the
+    /// one whose requests depart from `class`'s as it does and by the
+    /// adapter besides; `None` where the plan lands no such request.
+    fn adapted_twin(&self, class: usize) -> Option<usize> {
+        let plain = self.landing.get(class)?.first()?;
+        if plain.has_adapter() {
+            return None;
+        }
+        self.landing.iter().position(|requests| {
+            requests.iter().any(|request| {
+                request.has_adapter()
+                    && request.has_media() == plain.has_media()
+                    && request.drafts() == plain.drafts()
+                    && (request.query_len() == 1) == (plain.query_len() == 1)
+                    && request.departures() == plain.departures() + 1
+            })
+        })
+    }
+
     fn representative(&self, class: usize, rows: u32, wants_media: bool) -> poem_ir::Request {
         let landing = &self.landing[class];
         landing
@@ -661,17 +680,8 @@ impl Shell {
             })
     }
 
-    fn fire_synthetic(&mut self, owned: &[Synthetic]) -> Result<()> {
-        self.fire_synthetic_as(owned, crate::serve::Golden::Off)
-            .map(|_| ())
-    }
-
-    fn fire_synthetic_as(
-        &mut self,
-        owned: &[Synthetic],
-        arm: crate::serve::Golden,
-    ) -> Result<Vec<Vec<f32>>> {
-        let seated: Vec<Seated<'_>> = owned
+    fn seated(owned: &[Synthetic]) -> Vec<Seated<'_>> {
+        owned
             .iter()
             .map(|lane| Seated {
                 lane: Lane {
@@ -699,7 +709,20 @@ impl Shell {
                 reports: 0,
                 tap: None,
             })
-            .collect();
+            .collect()
+    }
+
+    fn fire_synthetic(&mut self, owned: &[Synthetic]) -> Result<()> {
+        self.fire_synthetic_as(owned, crate::serve::Golden::Off)
+            .map(|_| ())
+    }
+
+    fn fire_synthetic_as(
+        &mut self,
+        owned: &[Synthetic],
+        arm: crate::serve::Golden,
+    ) -> Result<Vec<Vec<f32>>> {
+        let seated = Self::seated(owned);
 
         let media: Vec<Media<'_>> = owned
             .iter()
@@ -1299,32 +1322,105 @@ impl Shell {
     /// Nothing launches, copies or commits; the slabs are laid at what the
     /// walk asked before any fire runs, and none is allocated later.
     pub(super) fn size_arming(&mut self) -> Result<Option<crate::sizing::Footprint>> {
-        let Some(LatticeTargets { targets, .. }) = self.lattice_targets() else {
+        let targets = self
+            .lattice_targets()
+            .map_or_else(Vec::new, |lattice| lattice.targets);
+        if targets.is_empty() && self.voxels.is_none() {
             return Ok(None);
-        };
+        }
         crate::sizing::begin();
         let mut walked = Ok(());
-        for (bucket, target, rs) in &targets {
+        // Where the load seats adapters, each composition is walked once
+        // more with every lane it can adapt adapted: the lattice names the
+        // plain classes, and a lane with an adapter runs kernels they do
+        // not (the correction's waist, a slab a lane), which a fire must
+        // find laid like any other.
+        let adapts = self.adapters().slots().seats() > 0;
+        'targets: for (bucket, target, rs) in &targets {
             self.arm_rs = *rs;
             let (lanes, media) = target.lanes();
-            let owned = self.synthetic_lanes_with(&lanes, &media);
-            if matches!(target, BodySynth::Idle) {
-                self.at_bucket(*bucket);
+            let adapted: Vec<LaneRows> = lanes
+                .iter()
+                .map(|&(class, rows)| (self.adapted_twin(class).unwrap_or(class), rows))
+                .collect();
+            let walks = if adapts && adapted != lanes {
+                vec![lanes, adapted]
+            } else {
+                vec![lanes]
+            };
+            for lanes in walks {
+                let owned = self.synthetic_lanes_with(&lanes, &media);
+                if matches!(target, BodySynth::Idle) {
+                    self.at_bucket(*bucket);
+                }
+                // Landed as arming lands each fire: its staging slots come
+                // back.
+                if let Err(why) = self
+                    .fire_synthetic(&owned)
+                    .and_then(|()| self.device.synchronize())
+                {
+                    walked = Err(Fault::Unbound {
+                        what: format!("the size-only walk of bucket {bucket}, {target}: {why}"),
+                    });
+                    break 'targets;
+                }
             }
-            // Landed as arming lands each fire: its staging slots come back.
-            if let Err(why) = self
-                .fire_synthetic(&owned)
-                .and_then(|()| self.device.synchronize())
-            {
-                walked = Err(Fault::Unbound {
-                    what: format!("the size-only walk of bucket {bucket}, {target}: {why}"),
-                });
-                break;
-            }
+        }
+        if walked.is_ok() {
+            walked = self.size_voxels();
         }
         let footprint = crate::sizing::end();
         self.arm_rs = record::RsBody::Folds;
         walked.map(|()| Some(footprint))
+    }
+
+    /// The size-only walk of a voxel fire at the ladder's top: the lattice
+    /// names token compositions alone, and a fire over voxels runs kernels
+    /// none of them does (a conv decoder's group norm). Each class is walked
+    /// at the most voxel rows whose widest value the seat holds, in the
+    /// seat's every clip, a row wide: the most rows and the most clips a
+    /// fire states, at the boxes that pad most.
+    fn size_voxels(&mut self) -> Result<()> {
+        let Some(seat) = self.voxels.as_ref().map(crate::voxels::Store::seat) else {
+            return Ok(());
+        };
+        let growth = poem_compiler::arena::voxel_growth(&self.trace, &self.compiled.classes);
+        let clips = u32::try_from(seat.clips.max(1)).unwrap_or(u32::MAX);
+        let row_bytes = seat.payload_bytes() / seat.rows.max(1);
+        for (class, (grown, read)) in growth.into_iter().enumerate() {
+            if self.landing[class].is_empty() {
+                continue;
+            }
+            let rows = seat.rows * u64::from(read) / u64::from(grown.max(1));
+            let rows = u32::try_from(rows).unwrap_or(u32::MAX);
+            let each = rows / clips;
+            if each == 0 {
+                continue;
+            }
+            let boxes: Vec<[u32; 3]> = (0..clips)
+                .map(|at| [each + if at == 0 { rows % clips } else { 0 }, 1, 1])
+                .collect();
+            let payload = vec![0u8; (u64::from(rows) * row_bytes) as usize];
+            let owned = self.synthetic_lanes_with(&[(class, 1)], &[]);
+            let seated = Self::seated(&owned);
+            let shot = [crate::voxels::Clips {
+                lane: 0,
+                clips: &boxes,
+                payload: &payload,
+            }];
+            self.arming = true;
+            let fired = self
+                .fire_voxels(&seated, &shot)
+                .and_then(|_| self.device.synchronize());
+            self.arming = false;
+            fired.map_err(|why| Fault::Unbound {
+                what: format!(
+                    "the size-only walk of a voxel fire, class {class} over {clips} clip(s) of \
+                     {rows} row(s): {why}"
+                ),
+            })?;
+        }
+        Ok(())
     }
 
     /// What arming the lattice starts from, in arming's order; `None`
