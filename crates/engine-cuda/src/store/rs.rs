@@ -41,8 +41,8 @@ impl Planes {
 
 /// The buffered rows a window of a body replays beside its own
 /// (`Run::rs_layout`), and a lane's share of a fire's replay tables
-/// (`inputs`).
-pub const REPLAYED: u32 = 16;
+/// (`inputs`): the contract's [`::engine::fire::UNFOLDED_ROWS`].
+pub const REPLAYED: u32 = ::engine::fire::UNFOLDED_ROWS;
 
 /// The extended run's scratch: a run of the activation's span, a fire's
 /// rows and the buffered slots its lanes replay ahead of them, a row each
