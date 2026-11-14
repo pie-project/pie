@@ -16,6 +16,7 @@
 
 use engine::chunk::ShapeId;
 use poem_compiler::chunk::{ChunkRecipe, RowId, SlotLayout};
+use poem_ir::Trace;
 
 use crate::error::{Fault, Result};
 
@@ -62,6 +63,105 @@ pub const CHANNEL: ShapeId = ShapeId(GUEST + 1);
 pub const INSTANCE_SLOT: u64 = 4 << 10;
 /// A `Channel` slot's bytes.
 pub const CHANNEL_SLOT: u64 = 1 << 10;
+/// An adapter's planes (`SlotRole::Adapter`): one slot a bank.
+pub const ADAPTER: ShapeId = ShapeId(GUEST + 2);
+/// The adapter ids a fire's tables keep naming zero planes: what a load's
+/// own synthetic fires route their adapted rows to.
+pub const ZERO_IDS: u32 = 2;
+
+/// One bank an adapter has a plane of: the trace's param (a `registered`
+/// weight `[rows, ..]`, an adapter's plane its `[..]`), its name, and the
+/// bytes of one adapter's plane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterBank {
+    pub param: u32,
+    pub name: String,
+    pub plane: u64,
+}
+
+/// The load's adapters (`SlotRole::Adapter`): an adapter is one slot a
+/// bank, bank `k`'s plane in slot `k` of its refs, and is read through one
+/// table a bank of `ids` entries, an address an id (the reserved run's).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterShape {
+    pub slot_bytes: u64,
+    pub per_chunk: u32,
+    /// In name order: the order an adapter's slots hold their planes.
+    pub banks: Vec<AdapterBank>,
+    /// [`ZERO_IDS`] ids that name zero planes, then one a lane a fire
+    /// carries.
+    pub ids: u32,
+}
+
+impl AdapterShape {
+    /// The banks of `trace` (its `registered` weights), a slot the largest
+    /// plane's bytes; `None` where it has none.
+    pub fn of(trace: &Trace, chunk_bytes: u64, lanes: u32) -> Result<Option<AdapterShape>> {
+        let mut banks: Vec<AdapterBank> = trace
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(_, param)| param.source == poem_ir::ParamSource::Registered)
+            .map(|(at, param)| {
+                let elems: u64 = param.shape.get(1..).unwrap_or(&[]).iter().product();
+                let elem = poem_compiler::arena::elem_bytes(param.dtype).unwrap_or(0);
+                AdapterBank {
+                    param: at as u32,
+                    name: param.name.clone(),
+                    plane: elems * elem,
+                }
+            })
+            .collect();
+        if banks.is_empty() {
+            return Ok(None);
+        }
+        banks.sort_by(|a, b| a.name.cmp(&b.name));
+        let slot_bytes = banks
+            .iter()
+            .map(|bank| bank.plane)
+            .max()
+            .unwrap_or(0)
+            .max(1)
+            .next_multiple_of(TABLE_ALIGN);
+        if slot_bytes > chunk_bytes {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "an adapter plane of {slot_bytes} bytes, past a chunk of {chunk_bytes}: \
+                     a plane lies in one `Adapter` slot"
+                ),
+            });
+        }
+        Ok(Some(AdapterShape {
+            slot_bytes,
+            per_chunk: u32::try_from(chunk_bytes / slot_bytes).unwrap_or(u32::MAX),
+            banks,
+            ids: ZERO_IDS + lanes.max(1),
+        }))
+    }
+
+    /// What an adapter takes: a slot a bank, anywhere.
+    #[must_use]
+    pub fn footprint(&self) -> engine::program::Footprint {
+        engine::program::Footprint {
+            bytes: self.banks.iter().map(|bank| bank.plane).sum(),
+            slots: self.banks.len() as u32,
+            contiguous: false,
+        }
+    }
+
+    /// The bytes of one bank's table.
+    #[must_use]
+    pub fn table_bytes(&self) -> u64 {
+        table_span(u64::from(self.ids) * 8)
+    }
+
+    /// The adapters' region of the reserved run: a zero plane, then each
+    /// bank's table.
+    #[must_use]
+    pub fn region_bytes(&self) -> u64 {
+        table_span(self.slot_bytes) + self.banks.len() as u64 * self.table_bytes()
+    }
+}
 
 /// One of the two guest shapes: fixed slots an item takes a run of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +373,8 @@ pub struct Layout {
     pub rows: Vec<RowsShape>,
     /// The routed experts the weight cache streams, a shape a layer size.
     pub experts: Vec<ExpertShape>,
+    /// The adapters' planes, where the trace has banks.
+    pub adapter: Option<AdapterShape>,
 }
 
 /// The first weight shape's id; the shapes after it follow.
@@ -1096,6 +1198,7 @@ impl Layout {
             rs,
             rows,
             experts,
+            adapter: None,
         })
     }
 
@@ -1115,6 +1218,7 @@ impl Layout {
         let (id, slot_bytes) = match role {
             engine::chunk::SlotRole::Instance => (INSTANCE, INSTANCE_SLOT),
             engine::chunk::SlotRole::Channel => (CHANNEL, CHANNEL_SLOT),
+            engine::chunk::SlotRole::Adapter => (ADAPTER, self.adapter.as_ref()?.slot_bytes),
             _ => return None,
         };
         Some(GuestShape {
@@ -1127,10 +1231,15 @@ impl Layout {
 
     /// The bytes of the engine's own tables in the pool's reserved run
     /// (`Reserved::Tables`), each region whole: the row caches' tables and
-    /// counters, then the expert caches'.
+    /// counters, then the expert caches', then the adapters'.
     #[must_use]
     pub fn table_bytes(&self) -> u64 {
-        self.row_table_bytes() + self.expert_table_bytes()
+        self.row_table_bytes()
+            + self.expert_table_bytes()
+            + self
+                .adapter
+                .as_ref()
+                .map_or(0, AdapterShape::region_bytes)
     }
 
     /// The row caches' region: a u64 address and a u32 counter a block.

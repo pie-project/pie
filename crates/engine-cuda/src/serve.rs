@@ -51,7 +51,7 @@ use crate::run::{RsMove, WeightRow};
 use crate::store::Pools;
 use crate::store::kv::{self, Seat};
 use crate::store::rs::Buffers;
-use crate::weights::{AdapterPlane, Weights};
+use crate::weights::Weights;
 use crate::window::Windows;
 use enqueue::{GuestBatch, Owed, Reap, reap_guest_fires};
 use segments::Segmented;
@@ -667,29 +667,38 @@ impl Shell {
         self.predicate.lands_snapshots()
     }
 
-    pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
-        self.weights
-            .register_adapter(self.device.stream(), id, planes)
-    }
-
     pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {
         self.adapters.mount(root);
     }
 
-    pub fn bind_adapter(
+    /// Lands `instance`'s adapter, each bank's plane (`planes`, by bank
+    /// name) in its `Adapter` slot of `refs`, ahead of every fire that
+    /// reads it.
+    pub fn land_adapter(
         &mut self,
-        source: crate::blob::Source<'_>,
-    ) -> Result<crate::blob::Binding> {
-        let seats = self.weights.seats();
-        let weights = &mut self.weights;
-        let stream = self.device.stream();
-        self.adapters.bind(source, &seats, |slot, planes| {
-            weights.register_adapter(stream, slot, planes)
-        })
+        instance: engine::InstanceId,
+        refs: &[u32],
+        planes: &[(String, Vec<u8>)],
+    ) -> Result<()> {
+        self.pools
+            .land_adapter(self.device.stream(), instance, refs, planes)
     }
 
-    pub fn release_adapter(&mut self, binding: crate::blob::Binding) {
-        self.adapters.release(binding);
+    /// `instance`'s adapter lies in `refs` now.
+    pub fn rebind_adapter(&mut self, instance: engine::InstanceId, refs: &[u32]) -> Result<()> {
+        self.pools
+            .rebind_adapter(self.device.stream(), instance, refs)
+    }
+
+    /// `instance` closed: no fire reads its adapter.
+    pub fn close_adapter(&mut self, instance: engine::InstanceId) {
+        self.pools.close_adapter(instance);
+    }
+
+    /// The id each of `instances`' adapters is read by in the next fire:
+    /// what its lanes route to ([`Seated::adapted`]).
+    pub fn adapter_ids(&mut self, instances: &[engine::InstanceId]) -> Result<Vec<u32>> {
+        self.pools.adapter_ids(self.device.stream(), instances)
     }
 
     #[must_use]
@@ -819,7 +828,11 @@ impl Shell {
                     })
                 })
                 .collect(),
-            adapter: engine::program::Footprint::default(),
+            // The planes its correction reads, where it carries one.
+            adapter: match self.program_adapter_sink(program)? {
+                Some(_) => self.pools.adapter_footprint().unwrap_or_default(),
+                None => engine::program::Footprint::default(),
+            },
         })
     }
 

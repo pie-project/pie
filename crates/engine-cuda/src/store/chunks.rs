@@ -863,6 +863,7 @@ impl Chunks {
         for role in [
             engine::chunk::SlotRole::Instance,
             engine::chunk::SlotRole::Channel,
+            engine::chunk::SlotRole::Adapter,
         ] {
             if let Some(guest) = layout.guest(role) {
                 let kind = SlotKind::Fixed { pieces: 1 };

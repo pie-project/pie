@@ -941,7 +941,9 @@ impl Shell {
         {
             return Ok(());
         }
-        let row = u32::from(self.adapters().slots().seats() >= 2);
+        // The second of the ids that always name the zero plane: an
+        // adapted row reads past the first entry of its tables.
+        let row = crate::store::layout::ZERO_IDS - 1;
         let real: Vec<Synthetic> = owned
             .iter()
             .map(|lane| {

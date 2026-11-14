@@ -101,10 +101,6 @@ pub enum Fault {
         why: String,
     },
 
-    AdapterSlots {
-        seats: u32,
-    },
-
     Straddled {
         value: u32,
         node: u32,
@@ -288,13 +284,6 @@ impl fmt::Display for Fault {
             Self::Blob { path, why } => {
                 write!(f, "the shared adapter `{path}` {why}")
             }
-            Self::AdapterSlots { seats } => write!(
-                f,
-                "every one of this load's {seats} adapter slots is pinned by a live \
-                 bind, and the only slot left to take would be one some fire in flight \
-                 routes to — `slots` bounds concurrent residency, not the catalog, so \
-                 the fix is fewer live binds or a bank that seats more"
-            ),
             Self::Straddled {
                 value,
                 node,

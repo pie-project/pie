@@ -7,12 +7,13 @@
 // segment, segments) — f32 accumulation in rank order.
 
 #include "prim/device.hip"
+#include "linear/table.hip"
 
 namespace pie::linear {
 
 template <class T>
 __global__ void lora_combine(const i32* __restrict__ routes, const T* __restrict__ t, const T* __restrict__ bank_b,
-                             T* __restrict__ y, const i32* __restrict__ segments, int segs, int rank, int out_width,
+                             const u64* __restrict__ table_b, T* __restrict__ y, const i32* __restrict__ segments, int segs, int rank, int out_width,
                              long long adapter_stride, const u32* __restrict__ win) {
     int row = blockIdx.y;
     if (segments != nullptr) {
@@ -26,7 +27,8 @@ __global__ void lora_combine(const i32* __restrict__ routes, const T* __restrict
     const int adapter = routes[at];
     if (adapter < 0) return;
 
-    const T* b = bank_b + static_cast<long long>(adapter) * adapter_stride;
+    // The adapter's up plane where its table says (its `Adapter` slot).
+    const T* b = expert_plane(bank_b, adapter_stride, table_b, 1, 0, adapter);
     const T* tv = t + at * rank;
     T* out = y + at * out_width;
     for (int n = blockIdx.x * blockDim.x + threadIdx.x; n < out_width; n += gridDim.x * blockDim.x) {

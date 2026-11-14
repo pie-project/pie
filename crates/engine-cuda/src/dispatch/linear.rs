@@ -1362,6 +1362,10 @@ impl Run<'_> {
                 self.tensor(*routes),
                 &mut self.tensor(*y_out),
                 self.segments(),
+                linear::lora::AdapterTables {
+                    a: self.adapter_table(*bank_a),
+                    b: self.adapter_table(*bank_b),
+                },
             ),
             Linear::MoeSigmoidGateAdd {
                 routed,

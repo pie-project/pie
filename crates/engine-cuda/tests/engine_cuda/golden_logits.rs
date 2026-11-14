@@ -2446,3 +2446,118 @@ fn golden_eager_resume() {
         small_pool_arms(&fixture, &cache);
     }
 }
+
+/// The adapter probe: `PIE_GOLDEN_MODELS`' first model (Gemma 4's miniature
+/// by default, whose text declares LoRA banks) lands an adapter in
+/// `Adapter` slots of a high state chunk, fires a prompt and decodes adapted
+/// through it, has the runtime's evacuation move that chunk, and fires the
+/// same script again: the logits are the same bits, and not the base
+/// model's. Closed, the adapter leaves the base model's logits as they were.
+/// Passes under `PIE_GOLDEN_EAGER=1` on sm_120; with graphs on, the first
+/// adapted fire is refused at capture: the correction's waist scratch is
+/// never warmed by the load's arming (no adapted composition is armed).
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_adapter() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let model = std::env::var("PIE_GOLDEN_MODELS").map_or_else(
+        |_| "gemma4-e4b-mini-l6".to_string(),
+        |_| models().remove(0),
+    );
+    let fixture = fixture(&model, &cache);
+    let mut shell = load(&fixture, &cache);
+    let facts = shell.chunk_facts().expect("the pool's facts");
+    let shape = facts
+        .shapes
+        .iter()
+        .find(|shape| shape.role == engine::chunk::SlotRole::Adapter)
+        .unwrap_or_else(|| panic!("{model}'s text declares no adapter bank"))
+        .clone();
+    shell
+        .commit_segments(facts.segments.max)
+        .expect("every segment backed");
+    let seats = shell.bank_seats();
+    assert!(seats.len() as u32 <= shape.slots_per_chunk);
+    // The adapter in the highest state chunk, far from the pages the load
+    // seats from the bottom; the chunk under it is where it moves.
+    let top = facts.total_chunks - facts.act_chunks_max() - 1;
+    let below = top - 1;
+    let refs: Vec<u32> = (0..seats.len() as u32)
+        .map(|bank| top * shape.slots_per_chunk + bank)
+        .collect();
+    // Small, varied planes: each a bank's whole plane, bf16.
+    let planes: Vec<(String, Vec<u8>)> = seats
+        .iter()
+        .enumerate()
+        .map(|(bank, seat)| {
+            let elems = (seat.slot / 2) as usize;
+            let bytes = (0..elems)
+                .flat_map(|at| {
+                    let value = (((at * 31 + bank * 7) % 17) as f32 - 8.0) * 0.004;
+                    ((value.to_bits() >> 16) as u16).to_le_bytes()
+                })
+                .collect();
+            (seat.name.clone(), bytes)
+        })
+        .collect();
+    let instance = engine::InstanceId(1);
+    shell
+        .land_adapter(instance, &refs, &planes)
+        .expect("the adapter lands in its slots");
+
+    let script = |shell: &mut Shell, adapted: bool| -> Vec<u64> {
+        shell.open(0).expect("slot 0 opens");
+        let mut out = Vec::new();
+        let mut tokens: Vec<u32> = (0..37).map(|t| (t * 7 + 11) % 1000).collect();
+        for _ in 0..4 {
+            let rows = u32::try_from(tokens.len()).expect("a count");
+            let word = fixture
+                .trace
+                .facts
+                .word(&Request::new(rows, false).adapted(adapted));
+            let lane = Lane {
+                slot: 0,
+                word,
+                tokens: &tokens,
+            };
+            let seated = if adapted {
+                let id = shell.adapter_ids(&[instance]).expect("an id")[0];
+                Seated::adapted(lane, id)
+            } else {
+                Seated::of(lane)
+            };
+            let mut rows = shell
+                .fire_media(&[seated], &[], &[])
+                .expect("the step fires");
+            let logits = rows.swap_remove(0);
+            out.push(hash_logits(&logits));
+            tokens = vec![argmax(&logits)];
+        }
+        out
+    };
+
+    let base = script(&mut shell, false);
+    let adapted = script(&mut shell, true);
+    assert_ne!(adapted, base, "{model}: the adapter corrects nothing");
+    shell
+        .evacuate(&engine::chunk::Evacuation {
+            moves: vec![(top, below)],
+        })
+        .expect("the adapter's chunk moves");
+    let moved = script(&mut shell, true);
+    println!("golden-adapter {model} base {base:016x?} adapted {adapted:016x?} moved {moved:016x?}");
+    assert_eq!(
+        moved, adapted,
+        "{model}: the adapter read where its chunk lay before the evacuation"
+    );
+    shell.close_adapter(instance);
+    assert_eq!(
+        script(&mut shell, false),
+        base,
+        "{model}: the base model's logits moved"
+    );
+}

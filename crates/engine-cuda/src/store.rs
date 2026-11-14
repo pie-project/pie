@@ -547,6 +547,9 @@ pub struct Pools {
     /// Where the caches' read counters are snapshotted for
     /// [`Pools::weight_uses`].
     use_record: Option<UseRecord>,
+    /// The adapters landed in `Adapter` slots, and the ids fires read them
+    /// by ([`Pools::adapter_ids`]).
+    adapters: AdapterIds,
     /// Each window a windowed kv row is declared with, and the list its
     /// pages are slots of.
     windows_of: Vec<(u32, u8)>,
@@ -978,6 +981,7 @@ impl Pools {
             row_caches: Vec::new(),
             expert_caches: Vec::new(),
             use_record: None,
+            adapters: AdapterIds::default(),
             windows_of,
             weights_held: false,
             hosts_dropped: false,
@@ -2319,9 +2323,11 @@ impl Pools {
     ) -> Result<()> {
         self.fence_all_swaps(stream)?;
         self.chunks.evacuate(stream, evacuation)?;
-        // A cached atom's chunk may have moved: its table entry with it.
+        // A cached atom's chunk may have moved: its table entry with it,
+        // and an adapter's planes with theirs.
         self.stage_row_tables(stream)?;
-        self.stage_expert_tables(stream)
+        self.stage_expert_tables(stream)?;
+        self.stage_adapter_tables(stream)
     }
 
     /// The params of the routed banks streamed an expert at a time.
@@ -3326,13 +3332,232 @@ impl Pools {
     /// is held again and each table written as its atoms lie, the counters
     /// from zero.
     fn relay_tables(&mut self) -> Result<()> {
-        if self.row_caches.is_empty() && self.expert_caches.is_empty() {
+        if !self.chunks.tables_held() {
+            return Ok(());
+        }
+        self.zero_counters()?;
+        self.stage_row_tables(core::ptr::null_mut())?;
+        self.stage_expert_tables(core::ptr::null_mut())?;
+        self.lay_adapter_tables()
+    }
+
+    /// The adapters' shape, where the trace has banks.
+    fn adapter_shape(&self) -> Result<&layout::AdapterShape> {
+        self.chunks.layout().adapter.as_ref().ok_or_else(|| {
+            Fault::program(
+                "store::adapters",
+                "an adapter named in a load whose model text declares no bank",
+            )
+        })
+    }
+
+    /// Where the adapters' region of the reserved run starts: its zero
+    /// plane, the banks' tables after it.
+    fn adapter_region(&self) -> u64 {
+        let layout = self.chunks.layout();
+        layout.row_table_bytes() + layout.expert_table_bytes()
+    }
+
+    /// Bank `bank`'s table, its offset into the reserved run.
+    fn adapter_table(&self, shape: &layout::AdapterShape, bank: usize) -> u64 {
+        self.adapter_region()
+            + layout::table_span(shape.slot_bytes)
+            + bank as u64 * shape.table_bytes()
+    }
+
+    /// The address of `Adapter` slot `slot` (a slot ref), where its chunk
+    /// lies now.
+    fn adapter_slot(&self, shape: &layout::AdapterShape, slot: u32) -> Result<u64> {
+        self.chunks
+            .weight_slot(shape.per_chunk, shape.slot_bytes, slot)
+    }
+
+    /// Bank `bank`'s plane for id `id`: its instance's slot, or the zero
+    /// plane where no adapter holds the id.
+    fn adapter_entry(&self, shape: &layout::AdapterShape, id: u32, bank: usize) -> Result<u64> {
+        match self.adapters.of_id(id) {
+            Some(refs) => self.adapter_slot(shape, refs[bank]),
+            None => self.chunks.table_at(self.adapter_region(), shape.slot_bytes),
+        }
+    }
+
+    /// Lays the adapters' region at once, before any fire: the zero plane
+    /// zeroed and every table's entries as their ids lie. A load whose
+    /// trace has no bank has none.
+    pub fn lay_adapter_tables(&mut self) -> Result<()> {
+        if self.chunks.layout().adapter.is_none() {
             return Ok(());
         }
         self.chunks.hold_tables(&mut self.pool)?;
-        self.zero_counters()?;
-        self.stage_row_tables(core::ptr::null_mut())?;
-        self.stage_expert_tables(core::ptr::null_mut())
+        let shape = self.adapter_shape()?.clone();
+        let zero = self
+            .chunks
+            .table_at(self.adapter_region(), shape.slot_bytes)?;
+        crate::device::zero_span(zero, usize::try_from(shape.slot_bytes).unwrap_or(0))?;
+        self.stage_adapter_tables(core::ptr::null_mut())
+    }
+
+    /// Every bank's table as its ids lie now, behind what `stream` holds (a
+    /// null stream: at once).
+    fn stage_adapter_tables(&self, stream: *mut core::ffi::c_void) -> Result<()> {
+        let Some(shape) = self.chunks.layout().adapter.as_ref() else {
+            return Ok(());
+        };
+        for bank in 0..shape.banks.len() {
+            let mut entries = Vec::with_capacity(shape.ids as usize * 8);
+            for id in 0..shape.ids {
+                entries.extend_from_slice(&self.adapter_entry(shape, id, bank)?.to_le_bytes());
+            }
+            self.put_table(stream, self.adapter_table(shape, bank), &entries)?;
+        }
+        Ok(())
+    }
+
+    /// Writes id `id`'s entry of every bank's table, behind what `stream`
+    /// holds.
+    fn stage_adapter_id(&self, stream: *mut core::ffi::c_void, id: u32) -> Result<()> {
+        let shape = self.adapter_shape()?;
+        for bank in 0..shape.banks.len() {
+            let entry = self.adapter_entry(shape, id, bank)?;
+            self.put_table(
+                stream,
+                self.adapter_table(shape, bank) + u64::from(id) * 8,
+                &entry.to_le_bytes(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The adapter `instance` lands: each bank's plane written into its
+    /// `Adapter` slot of `refs` (bank order, [`layout::AdapterShape`]) on
+    /// `stream`, ahead of every fire that reads it. A bank `planes` does
+    /// not name is zero.
+    pub fn land_adapter(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        instance: engine::InstanceId,
+        refs: &[u32],
+        planes: &[(String, Vec<u8>)],
+    ) -> Result<()> {
+        let shape = self.adapter_shape()?.clone();
+        if refs.len() != shape.banks.len() {
+            return Err(Fault::Adapter {
+                bank: crate::adapter::LORA.to_string(),
+                why: format!(
+                    "lands one plane a bank in an `Adapter` slot each, {} of them, and its                      binding names {} slots: the runtime takes what the program's facts state",
+                    shape.banks.len(),
+                    refs.len()
+                ),
+            });
+        }
+        if let Some((stray, _)) = planes
+            .iter()
+            .find(|(name, _)| !shape.banks.iter().any(|bank| &bank.name == name))
+        {
+            return Err(Fault::Adapter {
+                bank: stray.clone(),
+                why: "is not a bank this load declares; a bank is a weight the model text                       marked `registered`"
+                    .to_string(),
+            });
+        }
+        for (bank, slot) in shape.banks.iter().zip(refs) {
+            let at = self.adapter_slot(&shape, *slot)?;
+            let plane = planes.iter().find(|(name, _)| *name == bank.name);
+            match plane {
+                Some((_, bytes)) if bytes.len() as u64 == bank.plane => {
+                    crate::device::stage_raw(stream, at, bytes)?;
+                }
+                Some((_, bytes)) => {
+                    return Err(Fault::Adapter {
+                        bank: bank.name.clone(),
+                        why: format!(
+                            "holds {} bytes an adapter and this plane carries {}; a plane                              is one whole adapter's, zero-padded past its own rank",
+                            bank.plane,
+                            bytes.len()
+                        ),
+                    });
+                }
+                None => crate::device::zero_span_on(
+                    stream,
+                    at,
+                    usize::try_from(bank.plane).unwrap_or(0),
+                )?,
+            }
+        }
+        self.adapters.land(instance, refs.to_vec());
+        Ok(())
+    }
+
+    /// `instance`'s adapter now lies in `refs` (a park and unpark moved
+    /// it): an id it holds names them from the next fire on.
+    pub fn rebind_adapter(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        instance: engine::InstanceId,
+        refs: &[u32],
+    ) -> Result<()> {
+        let banks = self.adapter_shape()?.banks.len();
+        if refs.len() != banks {
+            return Err(Fault::program(
+                "store::adapters",
+                format!(
+                    "instance {instance}'s adapter rebinds {} slots, and it lies in {banks}",
+                    refs.len()
+                ),
+            ));
+        }
+        if let Some(id) = self.adapters.rebind(instance, refs.to_vec()) {
+            self.stage_adapter_id(stream, id)?;
+        }
+        Ok(())
+    }
+
+    /// `instance` closed: its adapter is no fire's any more, and the
+    /// runtime takes its slots back.
+    pub fn close_adapter(&mut self, instance: engine::InstanceId) {
+        self.adapters.close(instance);
+    }
+
+    /// The id each of `instances` (adapters landed here) is read by in the
+    /// fire about to be staged: the one it holds, else a free one or one
+    /// no instance of this fire holds, its entries written on `stream`
+    /// ahead of the fire.
+    pub fn adapter_ids(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        instances: &[engine::InstanceId],
+    ) -> Result<Vec<u32>> {
+        let ids = self.adapter_shape()?.ids;
+        let (out, fresh) = self.adapters.ids_for(instances, ids)?;
+        for id in fresh {
+            self.stage_adapter_id(stream, id)?;
+        }
+        Ok(out)
+    }
+
+    /// Each bank's table by its param: what a correction reads an
+    /// adapter's plane through, by the id a row routes to.
+    #[must_use]
+    pub fn adapter_tables(&self) -> Vec<(u32, u64)> {
+        let Some(shape) = self.chunks.layout().adapter.as_ref() else {
+            return Vec::new();
+        };
+        shape
+            .banks
+            .iter()
+            .enumerate()
+            .map(|(bank, held)| (held.param, self.table_address(self.adapter_table(shape, bank))))
+            .collect()
+    }
+
+    /// What an instance's adapter takes, where the trace has banks.
+    #[must_use]
+    pub fn adapter_footprint(&self) -> Option<engine::program::Footprint> {
+        self.chunks
+            .layout()
+            .adapter
+            .as_ref()
+            .map(layout::AdapterShape::footprint)
     }
 
     /// See `Engine::weight_uses`: each block's reads since the last call.
@@ -3829,6 +4054,17 @@ impl Pools {
         if pairs.is_empty() || from == to {
             return Ok(());
         }
+        let guest = [
+            engine::chunk::SlotRole::Instance,
+            engine::chunk::SlotRole::Channel,
+            engine::chunk::SlotRole::Adapter,
+        ]
+        .into_iter()
+        .filter_map(|role| self.chunks.layout().guest(role))
+        .find(|guest| guest.id == shape);
+        if let Some(guest) = guest {
+            return self.copy_guest_slots(stream, guest, from, to, pairs);
+        }
         let kind = Self::kind_of(shape)?;
         let bytes = self
             .chunks
@@ -3940,6 +4176,68 @@ impl Pools {
             }
             _ => Ok(()),
         }
+    }
+
+    /// Parks or unparks slots of a guest shape (an instance's tables, a
+    /// ring, an adapter's planes) between the device and the host tier, on
+    /// `stream` behind the fires that wrote them and ahead of the next: a
+    /// host slot is laid as its device slot is, in a chunk of the tier.
+    fn copy_guest_slots(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        guest: layout::GuestShape,
+        from: Tier,
+        to: Tier,
+        pairs: &[(u32, u32)],
+    ) -> Result<()> {
+        let to_host = match (from, to) {
+            (Tier::Device, Tier::Host) => true,
+            (Tier::Host, Tier::Device) => false,
+            _ => {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "{:?} slots to or from disk: they park on the host tier alone",
+                        guest.role
+                    ),
+                });
+            }
+        };
+        let per_chunk = guest.per_chunk.max(1);
+        let have = self.tier_chunks();
+        let len = usize::try_from(guest.slot_bytes).unwrap_or(usize::MAX);
+        let mut slots = Vec::with_capacity(pairs.len());
+        for &(src, dst) in pairs {
+            let (on_device, on_host) = if to_host { (src, dst) } else { (dst, src) };
+            if on_host / per_chunk >= have {
+                return Err(Fault::Ceiling {
+                    what: "chunks of the host tier",
+                    need: u64::from(on_host / per_chunk) + 1,
+                    have: u64::from(have),
+                });
+            }
+            let on_host = u64::from(on_host / per_chunk) * self.chunks.layout().chunk_bytes
+                + u64::from(on_host % per_chunk) * guest.slot_bytes;
+            let on_device = self
+                .chunks
+                .weight_slot(guest.per_chunk, guest.slot_bytes, on_device)?;
+            slots.push(if to_host {
+                (on_device, on_host, len)
+            } else {
+                (on_host, on_device, len)
+            });
+        }
+        self.fence_all_swaps(stream)?;
+        let tier = self.tier.as_mut().ok_or(Fault::Ceiling {
+            what: "chunks of the host tier",
+            need: 1,
+            have: 0,
+        })?;
+        if to_host {
+            tier.to_host(stream, &slots)?;
+        } else {
+            tier.to_device(stream, &slots)?;
+        }
+        Ok(())
     }
 
     /// Moves kv list slots between the slot file's slots `disk` and the
@@ -4543,17 +4841,22 @@ fn lay(
     } else {
         Vec::new()
     };
-    layout::Layout::of(&recipe, &streamed, &banks)
+    let mut layout = layout::Layout::of(&recipe, &streamed, &banks)?;
+    layout.adapter =
+        layout::AdapterShape::of(trace, layout.chunk_bytes, budgets.tokens.max_lanes)?;
+    Ok(layout)
 }
 
 /// The chunks a pool of `pages` kv pages takes: the null chunk, the
 /// reserved run of tables, the pages' and the windowed pages beside them.
 fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64, slots: u32) -> u32 {
     // The null chunk, and a chunk of each guest shape: an instance's
-    // tables and a ring, which every working set served binds.
+    // tables and a ring, which every working set served binds, and an
+    // adapter where the trace has banks.
     let chunks = 1
         + u64::from(layout.table_chunks())
         + GUEST_SHAPES
+        + u64::from(layout.adapter.is_some())
         + layout.chunks_for(Kind::List, pages)
         + (0..layout.windows.len())
             .map(|window| {
@@ -4573,6 +4876,94 @@ fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64, slots: u32) -
 
 /// The guest shapes: `Instance` and `Channel`.
 const GUEST_SHAPES: u64 = 2;
+
+/// The adapters landed in `Adapter` slots and the ids fires read them by:
+/// ids under [`layout::ZERO_IDS`] always name the zero plane, each other
+/// one adapter or none. An adapter keeps its id from fire to fire until a
+/// fire with no free id takes the least recently read one no adapter of its
+/// own holds.
+#[derive(Debug, Default)]
+struct AdapterIds {
+    /// Each landed adapter's slot refs, bank order.
+    refs: std::collections::BTreeMap<engine::InstanceId, Vec<u32>>,
+    /// Who holds each id past the zero ones, and the fire that last read it.
+    ids: std::collections::BTreeMap<u32, (engine::InstanceId, u64)>,
+    clock: u64,
+}
+
+impl AdapterIds {
+    fn land(&mut self, instance: engine::InstanceId, refs: Vec<u32>) {
+        self.refs.insert(instance, refs);
+    }
+
+    /// The id `instance` holds, where it holds one, after its slots moved.
+    fn rebind(&mut self, instance: engine::InstanceId, refs: Vec<u32>) -> Option<u32> {
+        self.refs.insert(instance, refs);
+        self.held(instance)
+    }
+
+    fn close(&mut self, instance: engine::InstanceId) {
+        self.refs.remove(&instance);
+        self.ids.retain(|_, (holder, _)| *holder != instance);
+    }
+
+    fn held(&self, instance: engine::InstanceId) -> Option<u32> {
+        self.ids
+            .iter()
+            .find(|(_, (holder, _))| *holder == instance)
+            .map(|(&id, _)| id)
+    }
+
+    /// The slots id `id`'s adapter lies in, where an adapter holds it.
+    fn of_id(&self, id: u32) -> Option<&[u32]> {
+        let (instance, _) = self.ids.get(&id)?;
+        self.refs.get(instance).map(Vec::as_slice)
+    }
+
+    /// Each instance's id, of `ids` there are, and the ids newly held.
+    fn ids_for(
+        &mut self,
+        instances: &[engine::InstanceId],
+        ids: u32,
+    ) -> Result<(Vec<u32>, Vec<u32>)> {
+        self.clock += 1;
+        let clock = self.clock;
+        let mut out = Vec::with_capacity(instances.len());
+        let mut fresh = Vec::new();
+        for &instance in instances {
+            if !self.refs.contains_key(&instance) {
+                return Err(Fault::program(
+                    "store::adapters",
+                    format!("instance {instance} is read with an adapter it never landed"),
+                ));
+            }
+            if let Some(id) = self.held(instance) {
+                self.ids.insert(id, (instance, clock));
+                out.push(id);
+                continue;
+            }
+            let free = (layout::ZERO_IDS..ids).find(|id| !self.ids.contains_key(id));
+            let id = match free {
+                Some(id) => id,
+                None => self
+                    .ids
+                    .iter()
+                    .filter(|(_, (_, read))| *read != clock)
+                    .min_by_key(|(_, (_, read))| *read)
+                    .map(|(&id, _)| id)
+                    .ok_or(Fault::Ceiling {
+                        what: "adapters one fire reads",
+                        need: u64::from(ids - layout::ZERO_IDS) + 1,
+                        have: u64::from(ids - layout::ZERO_IDS),
+                    })?,
+            };
+            self.ids.insert(id, (instance, clock));
+            fresh.push(id);
+            out.push(id);
+        }
+        Ok((out, fresh))
+    }
+}
 
 /// A bump of the reserved run of tables: each table taken whole, from a
 /// region's start ([`layout::Layout::table_bytes`] sizes the regions).
