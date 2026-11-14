@@ -75,3 +75,31 @@ Rings are written by the host per message (`write_cell`), and the bind-time tabl
 2. Runtime store: takes and returns the two roles, and carries refs in `InstanceBinding` and channel registration.
 3. Per backend: state the two shapes, place tables and rings at slot refs, and rebind after evacuation. Metal first (direct host writes, sparse pool), then CUDA / ROCm, then Vulkan / wgpu. XLA last or never (section 5).
 4. Separately, in step 3b: the value scratch and per-fire tables move into the fire carve. That is where the bytes are (3.7 MB of about 3.7 MB an instance on Metal).
+
+## 7. Vulkan / wgpu: what is allocated after load (audit, 2026-11-14, sc/gpu-span)
+
+Every reservation either backend makes once `Shell::load` has returned, from `crates/engine-gpu`, `crates/engine-vulkan` and `crates/engine-wgpu` at e41113458. "Device" means a device-local heap (entered in the books); "host" means a host-visible type off every device-local heap (NVIDIA picks `HOST_CACHED` system memory first; wgpu books no mappable buffer), which is not in the device ledger. Load-time reservations (weights, pool segments, arena, scratch, inputs, readout, expert seats, weight-cache tables) are not listed except where they regrow.
+
+| What | Where | When | Memory, owner | Size | Class / goes to |
+|---|---|---|---|---|---|
+| Pool segments past the first | `store/pool.rs` `commit_segments` | runtime `commit_segments(n)` off the fire path | device, `pool` | `segment_chunks × chunk` each | state (already in the ledger, released by the runtime) |
+| rs scratch | `serve.rs` `prepare` (`rs_scratch`) | first fire with an rs replay, regrown when a wider one comes (drains first; the old buffer dropped) | device, `rs scratch` | `rs::Seat::scratch_bytes(layout, rows_ext, lanes)` | fire: belongs in the span (FrameMap); not moved here |
+| Group-mask table | `inputs.rs` `group_masks` | a fire whose groups mask outgrows the table; old buffer kept in `outgrown` until the arm is reused | host, `inputs` | next power of two of the masks' image | fire (FrameMap bound by the rung, REDESIGN 2.4) |
+| Snapshot table | `serve.rs` (`snaps`) | a fire with a lane snapshotting rs state; regrown | host, `snapshot table` | next power of two of the entries, 256 B at least | fire |
+| Readout seat | `serve.rs` `enqueue` | a fire reading back more rows than the load sized (`readout_rows(max_lanes)`) | host, `readout`; wgpu also regrows its `Readback` mirror (`Api::grown`) | the fire's readout layout | fire |
+| Weight-cache stage and uploads | `store/rows.rs` `fill`, `store/experts.rs` `fill` / `stage` | each residency change of streamed row tables / experts; uploads live for one fill | host, `weight cache` | one cache's stage; uploads up to `UPLOAD` | model (cache) |
+| Spill stage | `store.rs` `Spill` | each copy to / from the kv slot file where the API maps no host memory (wgpu); one standing stage on Vulkan | host, `spill staging` | 32 MiB batches | state tier |
+| Guest session: stage value heap | `engine-vulkan/src/guest/session.rs` `build_stage`, wgpu `build_stage` | every `bind_instance` (one per instance, per stage) | **device**, `guest state` | the stage plan's `scratch` (vocab-wide values: about 3.7 MB an instance on Qwen3-0.6B) | fire: the large guest item still outside the pool (STATE-ROLES section 6 step 4, `ProgramFacts`) |
+| Guest session: status, staging, landing; wgpu outbox | same | every `bind_instance`; `lend_landing` / outbox grow when a pass lands late or reads more | host, `guest` | status `STATUS_BYTES`; staging and landing the stage scratch | fire (host) |
+| Guest own cell | `engine-vulkan/src/guest/session.rs` `Cell::own` | a channel cell past one chunk | device, `guest state` | the cell | state (Channel slots past a chunk) |
+| Readout widen config | `engine-vulkan/src/guest/widen.rs` | first instance built | host, `guest` | `SLOTS × SLOT_BYTES` | model-like, once |
+| Guest descriptor pool | `engine-vulkan/src/guest/session.rs` | every session | driver (outside) | one set a stage | outside |
+| Descriptor pools of recorded and walked frames | `engine-vulkan/src/device/ctx.rs` `set` | a frame needing a set with no spare: pools of 1024 sets / 8192 storage descriptors, never freed; sets of up to 64 kept recordings (`record.rs` `SHAPES_KEPT`) are held for their life | driver (outside) | per pool | outside, priced by measurement only |
+| Command buffers of kept recordings | `ctx.rs` `frame_with` / segment cuts | each recorded shape (LRU of 64) | driver (outside) | per buffer | outside |
+| Timestamp query pools | `ctx.rs` `frame_with` | only under kernel profiling | driver | — | outside (diagnostic) |
+| wgpu uniform chunks | `engine-wgpu/src/device/ctx.rs` `uniform_chunk`, `pipelines.rs` uniform arena | encoding a frame that runs out of uniform space; returned to a free list, never freed | device, `uniforms` | 1 MiB each | fire (per-frame) |
+| wgpu frame scratch | `ctx.rs` `scratch_chunk` | a binding at an offset the device cannot bind (staged copy), per frame; pooled | device, `frame scratch` | 8 MiB, or the view when larger (not returned) | fire (per-frame) |
+| Pipelines | both backends, built on first use | a kernel's first dispatch | driver (outside) | priced at load as `unbuilt pipelines` | outside |
+| Tuning buffers | `engine-vulkan/src/tune/qmm.rs` | only under `pie tune` | device, `tuning` | — | not serving |
+
+Moved by sc/gpu-span: the arena and the scratch rooms (`scratch.rs`), from buffers of their own into the top of the pool (`act_chunks` per rung). Still outside the span after it: rs scratch, the group-mask and snapshot tables, readout regrowth, the guest stage heaps, and wgpu's per-frame uniform and scratch chunks.

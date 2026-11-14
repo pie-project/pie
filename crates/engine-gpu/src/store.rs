@@ -566,22 +566,31 @@ pub struct Pools<B: Backend> {
     host_chunks: u32,
     disk: Option<Spill<B>>,
     watermark: engine::frame::Demand,
+    /// `(rung tokens, chunks)` of each activation rung, ascending: the top
+    /// chunks a fire of the rung takes ([`crate::arena`]).
+    act_chunks: Vec<(u32, u32)>,
 }
 
 impl<B: Backend> Pools<B> {
     /// The pool `layout` sizes over `rows`, kv pages of `paging`'s size,
-    /// and `host_chunks` host chunks beside it; nothing committed yet.
+    /// and `host_chunks` host chunks beside it, its top chunks the
+    /// activation span of `act_chunks`' rungs; nothing committed yet.
     pub fn reserve(
         device: &B::Context,
         rows: Rows,
         layout: Layout,
         paging: Paging,
         host_chunks: u32,
+        act_chunks: Vec<(u32, u32)>,
     ) -> Result<Pools<B>> {
         let pool = Pool::reserve(
             layout.chunk_bytes,
             layout.total_chunks,
             layout.segment_chunks,
+            [
+                act_chunks.first().map_or(0, |&(_, chunks)| chunks),
+                act_chunks.last().map_or(0, |&(_, chunks)| chunks),
+            ],
         )?;
         let list_slots = layout.list.map_or(0, |list| {
             u64::from(list.per_chunk) * u64::from(layout.total_chunks)
@@ -626,6 +635,7 @@ impl<B: Backend> Pools<B> {
             host_chunks,
             disk: None,
             watermark: engine::frame::Demand::ZERO,
+            act_chunks,
         })
     }
 
@@ -642,7 +652,22 @@ impl<B: Backend> Pools<B> {
             self.pool.committed_segments(),
             &self.shape_rows,
             [self.host_chunks, self.disk_pages()],
+            &self.act_chunks,
         )
+    }
+
+    /// The activation span's buffer (the pool's last segment) and the byte
+    /// in it the span ends at; `None` until the load backs it.
+    #[must_use]
+    pub fn span_place(&self) -> Option<(&B::Buffer, u64)> {
+        self.pool.span_place()
+    }
+
+    /// The activation span's chunks: the pool's top ones, state's only where
+    /// the runtime lowers the rung.
+    #[must_use]
+    pub fn span_chunks(&self) -> u32 {
+        self.pool.span()
     }
 
     fn shape(&self, id: ShapeId) -> Result<&Slots> {
