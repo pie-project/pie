@@ -1,7 +1,8 @@
 # The generic wafer compiler: design
 
 Status: M1a, M1b, M1c (the stream primitives on the simulator) and M1d (flux2-mini's denoise step
-compiled by the generic compiler, no hand layout, on the simulator) done (§4.1), and M3 (the decode
+compiled by the generic compiler, no hand layout, on the simulator) done (§4.1), M2a (klein-4B's
+stream program builds for the system fabric at 1024², §4.1) compile side done, and M3 (the decode
 layouts as points of the Floorplan, §2.5). ARCHITECTURE.md is what runs for decode.
 
 **Goal.** A `.poem` model the compiler has not seen runs on the wafer with no hand code. The
@@ -732,6 +733,101 @@ milestone's tail.
     rewritten); the static arrays (tiles, residents) cut from a checkpoint by the engine, not
     read from the capture (`--values` still names the weights' source); a step's inputs from a
     guest's request (the inferlet's denoise loop driving the reading), not files.
+- **M2a** (klein-4B's stream program, compile side first; the v0 scalar loops vectorised; the
+  cost model fitted). The survey's stream line for `flux2-klein-4b-bf16-kv-bf16`:
+  - before (33ab39681): `STREAM-BUILD lanes: no column roots up to 64 fit its tiles`;
+  - after, 64 + 64 rows: `STREAM-BUILD-OK fabric=715x904 py=192 kv-columns=600x8`
+    (44.2M cycles predicted, 50.5 ms). **It links**: cslc builds its 23,007 ELFs for the
+    737 x 906 memcpy fabric in 55 min and 58 GB of memory, no error;
+  - after, 1024² (`ROWS=context=512,latents=4096`, the poem's 512 text rows and 4,096 image
+    rows): `STREAM-BUILD-OK fabric=741x1143 py=256 kv-columns=600x99` (2,116M cycles
+    predicted, 2.4 s a step: below).
+  - Each blocker the survey showed, in order, and what moved it:
+    - **The lane prologue's tiles** (170M weights over one unit: mod_img, mod_txt,
+      mod_single, norm_out): a unit takes up to 512 column roots (`place::MAX_REST`), not 64.
+    - **Colours: 3,537 classes** (a chain class a row of every unit). `Palette::allocate` reads
+      the footprints in batches of links whose classes fit a route word's colours (one batch
+      up to 255 classes, so decode is unchanged); interference colouring then reuses 21
+      colours across the units.
+    - **Host rows over a barrier.** klein's double blocks read the context straight from the
+      host (no context embedder in the denoise reading): the schedule gives a host unit with a
+      barrier its late run and the emitter reads the host buffer again after the barrier.
+    - **2,293 PEs wide.** `floorplan::stream` fills **bands** of units within the system fabric
+      (`Bounds::system()`: 755 x 1170, the WSE-3's less the memcpy halo), a block never split
+      over two. The row stream into a new band is a staircase (`Stream::wrap`): row `j` runs
+      back west, turns south one column east of row `j - 1`, and enters the band's first unit
+      from the east, so no two rows' wires cross and all `py` of them take one class.
+    - **`py` pinned at hidden / 16.** `build::program_py` searches (row roots, tile budget)
+      pairs: every divisor of the hidden width leaving a CX root at least 4 columns, at a weight
+      PE's whole 12,288 words, 3/4 and 1/2 of them (the spare fabric spent on shorter rows),
+      built eight at a time, the cost model's cheapest kept. `wafer-compile stream --py N
+      --tile W` pins them (`--py 16 --tile 12288`: flux2-mini as M1d built it, 60 x 28; the
+      search's own choice is 80 x 28).
+    - **K / V past one column (P7 v1).** A K / V column takes the attention PEs its block's rows
+      ask for (`build::kv_pya`: 47 entries of a 128-wide head, its q held, a PE), not 8 always:
+      99 PEs a kv head at 4,608 rows. The PEs keep rows `p % PYA` and the chain sums their
+      `[o | l]` against the head's one carried reference, so the merge of the PEs' partials is
+      the sum; a longer column costs the chain's hops (pipelined) and the band's height.
+    - **Rows held over the barrier** (at 1024²: 4,096 latent rows of the residual, 49,152 words
+      at a row root of py 256; the single blocks hold two values). **The row store**
+      (`Layout::spill`): a held chunk is cast along the row as it is made, the weight PE of column
+      `t % px` keeps row `t`'s, and at the start of each late row the keeper sends it up the row
+      chain while the rest send zeros. A weight PE holds its tiles and its share within 20,480
+      words. `wafer-compile stream --spill` (`Pins::spill`) puts every attending unit's held rows
+      there (flux2-mini `--stages 2 --spill`: compiles under cslc; its simulator run, the
+      store's numerics, is queued behind M1e's runs).
+    - Refusals by name where a unit still does not fit: the host's rows held whole (in or out,
+      a step's at once: stream them a batch at a time), rows the row store cannot take beside
+      the tiles, a band too narrow for a block.
+  - **Vectorised primitives** (the prims harnesses, same cases and goldens as M1c; bf16 build
+    but the IEEE P7 line; cycles a row of `row()`, a stored row, a query):
+
+    | case (flux2-mini nodes) | v0 (M1c) | M2a | vs interp |
+    |---|---|---|---|
+    | layernorm + modulate (41, 42), 4 x 64, 2 all-reduces | 3,044 | 1,285 | exact (was 2.8e-5) |
+    | per-head rmsnorm + rope_axes (45, 46), 2 x 128 | 11,791 | 7,011 | exact; 3.0e-5 vs trace as before |
+    | gated residual + layernorm + modulate (57, 64, 65) | 3,281 | 1,526 | 8e-11 |
+    | SwiGLU (67), gated residual (69), residual adds (124, 125) | 4,847 / 248 / 332 | unchanged | as before |
+    | P7 a stored row (node 52, 128 rows, 8 PEs, IEEE) | 4,613 | 508 | rel L2 1.2e-4 vs f64, as before |
+    | P7 a query | 3,521 | 3,513 | (bf16: 9.9e-4, as before) |
+
+    - The chunk sums are a halving tree of DSD adds over a scratch row (`vsum`; an odd run's
+      middle word waits a level).
+    - P5's tables (`ops/srope.csl`, stream-only; `ops/rope.csl` is decode's and unchanged): a
+      position's digit is one for all pairs, so a level is six NROT-wide DSD ops, not a scalar
+      product a pair.
+    - P7's store (`satt.store`, `store_q`, `query_q`): the key narrowed down its entry's column
+      of `kc` by one strided `@fs2h`, the value and the held q by one each.
+  - **The cost model** (`cost::stream`) reads a region off its printed `row()`
+    (`RegionFeatures`: DSD ops and their elements, vector exps and reciprocals, chunk sums,
+    scalar math, all-reduces, P5 tables), a query off its block's entries a PE, and prices a
+    program at other rows a class (`time_at`; `wafer-compile stream --price`). Fitted to the
+    measurements above: a DSD element 0.69 cycles (an op's issue fits to 0), a vector exp or
+    reciprocal element 16.2, an all-reduce over 4 roots 210, a P5 axis (its tables and their use) 1,215, a
+    stored row 508, a query 3,513 at 16 entries a PE (1,100 + 151 an entry: the slope is satt's
+    per-entry work, its runs at 32 and 64 entries are queued). Within 1% on the four regions
+    with norms, rotations or SwiGLU, 11% on the plain residual adds. flux2-mini's step is now
+    6.5M cycles predicted (v0's terms: 26.3M).
+  - **klein-4B at 1024²** (one CS-3, the 1024² build above, 847k of the fabric's 883k PEs,
+    512k of them weight PEs): 2,116M cycles, 2.4 s a step at 875 MHz. The attention
+    barrier serialises the blocks (all of a block's rows store before any queries), so a step
+    is about 25 blocks x 4,608 rows x the slowest root a row, not the pipeline of §1's
+    estimate. The CY roots, not the matvecs (5.7k cycles a row), set that pace: a single block's
+    pre-barrier row is 20.2k cycles (its SwiGLU over few column roots, q / k norms and four P5
+    axes a head), a double block's post-barrier row 19.1k (a query at 47 entries a PE, 8.2k).
+    One CS-3 holds it all (weights, 600 K / V columns, the row store), so the fabric is not the
+    limit; what speeds it, in order: more column roots for the col-side regions (the search
+    already trades tile budget for roots; it does not yet weigh the regions' chunk), P7 over
+    more PEs a head (a column of two or three sub-columns: 16 entries a PE, 3.5k a query),
+    and row replicas of each unit (rows split; R copies of the weights, about 2 on one wafer).
+    Streaming weights would not help: the time is in the roots.
+  - **Link.** Weight PEs no longer take a row index (their code never read it): klein's 64-row
+    program has 21,507 distinct PE images, not 447,918; its `layout.csl` is 462 MB (660k
+    `@set_tile_code`, 3.6M `@set_color_config`). With the memcpy halo the 64-row program is 737 x 906 PEs, and cslc builds it (above):
+    klein-4B's denoise links for the system fabric. The 1024² build is 619 MB of CSL and was
+    not linked (about the same image count; cslc's memory and time scale with it).
+  - Decode is unchanged: plan + build `diff -r` identical against 33ab39681's wafer-compile for
+    qwen35-d0.8b, qwen35-d9b, llama31-8b, gptoss-20b, gemma4-e2b and tiny t08.
 
 ## 5. Risks
 

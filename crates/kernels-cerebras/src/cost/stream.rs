@@ -21,25 +21,25 @@ use crate::stream::unit::{Side, Step};
 /// P1-stream cycles an element a row.
 pub const P1_STREAM: f64 = 0.55;
 /// A region's DSD op: its issue, and an element of it.
-pub const DSD_OP: f64 = 20.0;
-pub const DSD_ELEM: f64 = 1.0;
+pub const DSD_OP: f64 = 0.0;
+pub const DSD_ELEM: f64 = 0.69;
 /// A vector exp's (math.vexp) and reciprocal's (three Newton steps) elements.
-pub const EXP_ELEM: f64 = 12.0;
-pub const RECIP_ELEM: f64 = 12.0;
+pub const EXP_ELEM: f64 = 16.2;
+pub const RECIP_ELEM: f64 = 16.2;
 /// A chunk sum's element (the halving tree) and a level of it.
-pub const SUM_ELEM: f64 = 1.0;
+pub const SUM_ELEM: f64 = 0.69;
 pub const SUM_LEVEL: f64 = 20.0;
 /// A scalar math call (rsqrt, recip, ln, exp of a scalar).
 pub const SCALAR_MATH: f64 = 60.0;
 /// A segment all-reduce over a unit's CX roots.
-pub const ALL_REDUCE: f64 = 1_200.0;
+pub const ALL_REDUCE: f64 = 210.0;
 /// A position's cos / sin from P5 tables (one axis: LV levels of NROT-wide products).
-pub const ROTATION: f64 = 300.0;
+pub const ROTATION: f64 = 1_215.0;
 /// The row store: a held word cast out or summed back, a hop of the row chain.
 pub const STORE_WORD: f64 = 1.0;
 pub const CHAIN_HOP: f64 = 2.0;
 /// P7: a stored row; a query, and an entry a PE keeps.
-pub const STORE: f64 = 800.0;
+pub const STORE: f64 = 508.0;
 pub const QUERY: f64 = 1_100.0;
 pub const QUERY_ENTRY: f64 = 151.0;
 
