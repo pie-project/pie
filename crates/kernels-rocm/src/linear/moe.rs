@@ -1038,6 +1038,9 @@ fn group_launch(items: u32, routes: u32, n: u32) -> Launch {
     Launch::grid([items, n.div_ceil(32 * waves), 1], [64 * waves, 1, 1])
 }
 
+/// The slices of one expert a work item can name: 16 bits of it.
+const ORDER_SLICES: u32 = 65_535;
+
 fn route_order(
     ctx: &Ctx,
     op: &'static str,
@@ -1048,6 +1051,18 @@ fn route_order(
 ) -> Result<RouteOrder, Error> {
     const ROUTE_ORDER: &str = "moe_route_order";
     const ORDER_BLOCK: u32 = 1024;
+    // A work item packs its expert's slice in 16 bits (`e * 65536 + s`,
+    // `linear/quant.hip`): one expert may take every route.
+    if fan.route_count.div_ceil(group.max(1)) > ORDER_SLICES {
+        return Err(refuse(
+            op,
+            format!(
+                "{} routes in items of {group} could give one expert more than the {ORDER_SLICES} \
+                 slices a work item names",
+                fan.route_count
+            ),
+        ));
+    }
     let offsets_at = (fan.route_count as usize).next_multiple_of(64);
     // An expert's last item is its only short one, and only an expert with a
     // route has one.
