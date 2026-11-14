@@ -7,8 +7,6 @@
 
 use engine::{ChannelId, ProgramRegistration};
 use engine_cuda::device::Context;
-use engine_cuda::program::Plane;
-use engine_cuda::program::compile::Disk;
 use engine_cuda::program::session::Fired;
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
@@ -110,7 +108,7 @@ fn a_verify_lands_what_the_point_rule_reads() {
         launch: eta_compiler::codegen::launch::build(&bound, &stages),
         ..Default::default()
     };
-    let mut plane = Plane::new(Disk::disabled());
+    let mut plane = crate::guest::alone_plane();
     let program = plane
         .register(&context, &registration)
         .expect("the epilogue compiles");

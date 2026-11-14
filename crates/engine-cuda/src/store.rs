@@ -161,38 +161,6 @@ pub fn tokens_within(max_tokens: u32, floor: u32, room: u64, working: impl Fn(u3
     tokens
 }
 
-/// The rows a guest program's epilogue is held per lane, each as wide as the
-/// readout rows: the logits it reads. The scaled, probability, mask, noise
-/// and Gumbel rows a top-p sampling program derives from them (6292224
-/// bytes a lane at a 262144 vocabulary, measured) fly it narrower where the
-/// card has no room for them.
-pub const PROGRAM_ROWS_A_LANE: u64 = 1;
-
-/// What one guest program's scratch takes at the admitted lane count. A
-/// program is registered after the load, so its stride is not known when
-/// the cache rows are declared; what is known is that its per-lane scratch
-/// is laid out over readout rows, that the shell sizes it for the
-/// lane count rounded up to a power of two, and that the program contract
-/// caps the whole at `eta_exec::SCRATCH_MAX_BYTES`. The pool leaves this
-/// much on the card so the first program to arrive is not the frame that
-/// finds the pool has taken everything.
-#[must_use]
-pub fn program_scratch_reserve(max_lanes: u32, out_row_bytes: u64) -> u64 {
-    let lanes = u64::from(
-        max_lanes
-            .max(1)
-            .checked_next_power_of_two()
-            .unwrap_or(u32::MAX),
-    );
-    let row = out_row_bytes
-        .checked_next_multiple_of(eta_exec::SCRATCH_ALIGN)
-        .unwrap_or(u64::MAX);
-    lanes
-        .saturating_mul(row)
-        .saturating_mul(PROGRAM_ROWS_A_LANE)
-        .min(eta_exec::SCRATCH_MAX_BYTES)
-}
-
 /// What the decoded-weight tiles take on this load: a plane stored in codes
 /// and scales is decoded to bf16 before a prefill's dense gemm reads it,
 /// into one tile a stream the size of the widest plane fired on it, in the
@@ -1855,6 +1823,34 @@ impl Pools {
     /// Lets go of the name [`Pools::name_record`] gave `key`.
     pub fn forget_record(&mut self, key: u32) {
         self.records.remove(&key);
+    }
+
+    /// Where a fire of `rung` tokens whose carve leaves `under` bytes of the
+    /// span below it lays its guests' programs, of `term` bytes at that
+    /// rung: two spans, each its end and its bytes. The first is in the
+    /// activation's span, right under the fire's own chunks; the second is
+    /// the state's last chunks, for what the first has no room for. Both
+    /// lie in the chunks the runtime keeps free of state at every rung the
+    /// fire may be cut to.
+    #[must_use]
+    pub fn program_span(&self, under: u64, term: u64) -> [(u64, u64); 2] {
+        let chunk = self.chunks.layout().chunk_bytes.max(1);
+        let act = u64::from(self.chunks.act_chunks());
+        let lent = (under / chunk).min(act.saturating_sub(1)) * chunk;
+        let term = term.div_ceil(chunk) * chunk;
+        let above = term.min(lent);
+        [
+            (self.chunks.activation_base() + lent, above),
+            (self.chunks.state_end(), term - above),
+        ]
+    }
+
+    /// Backs `bytes` under the state's end for the guests' programs.
+    pub(crate) fn hold_under_state(&mut self, bytes: u64) -> Result<()> {
+        match self.chunks.hold_under_state(&mut self.pool, bytes)? {
+            Commit::Committed => Ok(()),
+            refusal => Err(refuse(&self.pool, refusal)),
+        }
     }
 
     /// The address of a guest item of `bytes` in `refs`, slot refs of

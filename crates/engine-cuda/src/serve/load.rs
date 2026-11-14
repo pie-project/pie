@@ -593,7 +593,6 @@ fn refit(
     let live = held_beside(boot, live)?;
     let facts = kv::probe(&boot.trace)?;
     let window = crate::store::window_of(&boot.trace)?;
-    let out_row = Exports::of(&boot.trace, &compiled)?.readout_row_bytes();
     let (asked_lanes, asked_tokens) = (boot.budget.max_lanes, boot.budget.max_tokens);
     let budget_at = |lanes: u32, tokens: u32| {
         let mut budget = boot.budget.clone();
@@ -657,10 +656,6 @@ fn refit(
                 &schedule_streams(&boot.trace, &compiled),
             ))
             .saturating_add(tiles)
-            .saturating_add(crate::store::program_scratch_reserve(
-                lanes.min(device.device().num_sm),
-                out_row,
-            ))
             .saturating_add(
                 u64::from(lanes)
                     .saturating_mul(u64::from(tokens))
@@ -1375,10 +1370,10 @@ impl Shell {
         // several, and its scratch is held at this width, not at the lanes.
         let flight = 1 << shell.device.device().num_sm.max(1).ilog2();
         shell.programs.set_flight(flight);
-        let programs = crate::store::program_scratch_reserve(
-            boot.budget.max_lanes.min(flight),
-            shell.exports.readout_row_bytes(),
-        );
+        // A program's fires lay their tables and scratch in the span the
+        // runtime widens for them when it binds (`Shell::fire_facts`):
+        // nothing is held for them here.
+        let programs = 0u64;
         // A plane stored as codes and scales is decoded to bf16 before a
         // prefill's dense gemm, into one tile a stream: a scratch slab like
         // any other, laid with the kernels' workspaces once the lattice is

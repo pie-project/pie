@@ -729,6 +729,19 @@ impl Engine for Rank {
         }
     }
 
+    fn fire_facts(
+        &self,
+        program: ProgramId,
+        extents: &engine::program::BindExtents,
+    ) -> EngineResult<engine::program::FireFacts> {
+        match self.group.ranks[self.rank].try_lock().ok() {
+            Some(rank) => rank.fire_facts(program, extents),
+            None => Err(Error::Program(
+                "a rank is busy: a program's fire facts are asked between frames".to_string(),
+            )),
+        }
+    }
+
     fn ring_facts(
         &self,
         registration: &ChannelRegistration,

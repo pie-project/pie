@@ -163,6 +163,22 @@ impl Chunks {
         (u64::from(self.act) * chunk).saturating_sub(self.range.held(u64::from(self.total) * chunk))
     }
 
+    /// Where the chunks the runtime counts as state end: under it lie the
+    /// last of them, in order.
+    #[must_use]
+    pub fn state_end(&self) -> u64 {
+        self.range.base() + u64::from(self.stated()) * self.layout.chunk_bytes
+    }
+
+    /// Backs the last `bytes` under the state's end, and keeps them
+    /// backed: where a fire lays its guests' programs once the activation's
+    /// own span has no room under its carve.
+    pub fn hold_under_state(&mut self, pool: &mut PhysicalPool, bytes: u64) -> Result<Commit> {
+        let end = u64::from(self.stated()) * self.layout.chunk_bytes;
+        let bytes = bytes.min(end);
+        self.range.hold(pool, end - bytes, bytes, false)
+    }
+
     /// Where a fire's activation starts: the range's end less its chunks.
     #[must_use]
     pub fn activation_base(&self) -> u64 {
