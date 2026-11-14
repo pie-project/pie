@@ -1837,7 +1837,11 @@ impl Batch {
         )?;
         let scratch = self.scratch()?.clone();
         if !scratch_zeroing_skipped() {
-            frame.fill(scratch.buffer.slab(), scratch.offset, u64::from(count) * stride)?;
+            frame.fill(
+                scratch.buffer.slab(),
+                scratch.offset,
+                u64::from(count) * stride,
+            )?;
             frame.next_pass()?;
         }
         let frame: &Frame = frame;

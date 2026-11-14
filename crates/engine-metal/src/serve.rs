@@ -1302,7 +1302,11 @@ impl PreparedLoad<'_> {
             blobs: crate::blob::Store::new(),
             corrected,
             held: vec![0; paging.slots as usize],
-            programs: crate::program::Plane::new(),
+            programs: {
+                let mut plane = crate::program::Plane::new();
+                plane.set_flight(boot.budget.max_lanes, arms);
+                plane
+            },
         };
         shell.settle_ane()?;
         Ok(shell)
@@ -2014,6 +2018,19 @@ impl Shell {
             let _ = self.programs.close_instance(id);
             return Err(why);
         }
+        if crate::diag::on().tier_trace {
+            let (state, fire) = self.programs.bytes();
+            eprintln!(
+                "residency: program {} bound at {extents:?}: its fires lay {} bytes a lane in \
+                 the span; guests hold {state} bytes in slots and {fire} bytes of batch tables; \
+                 the span backs {}",
+                program_id.0,
+                self.programs
+                    .fire_facts(program_id, &extents)
+                    .map_or(0, |facts| facts.a_lane),
+                self.pools.covered()
+            );
+        }
         Ok(id)
     }
 
@@ -2614,7 +2631,7 @@ impl Shell {
         let mut refusal = None;
         for (instance, launched) in
             self.programs
-                .stage_batched(&self.device, frame, &staged, &prepared.guest)?
+                .stage_batched(frame, &staged, &prepared.guest, prepared.arm)?
         {
             match launched {
                 crate::program::Launched::Airborne => owed.push(instance),
