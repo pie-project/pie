@@ -115,10 +115,11 @@ impl Arena {
         self.scratch + room(self.carve_for(rows).bytes)
     }
 
-    /// The bytes from the span's end the scratch plane takes.
+    /// The bytes from the span's end the smallest rung's fire takes: the
+    /// floor a refused raise falls back to.
     #[must_use]
-    pub fn scratch_room(&self) -> u64 {
-        self.scratch
+    pub fn floor_reach(&self) -> u64 {
+        self.scratch + self.rungs.first().map_or(0, |(_, map)| room(map.bytes))
     }
 
     /// A fire's slots: [`Arena::carve_for`]'s carve, laid ending where the
