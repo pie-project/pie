@@ -193,6 +193,16 @@ pub struct PatchFire<'a> {
     pub grids: &'a [i32],
 }
 
+/// The most a fire's group masks take, one each of `ragged` packings: each
+/// a word a group of at most `lanes` and its bit a query row and key row of
+/// one group, `tokens` rows of each at most ([`Inputs::stage_group_masks`]).
+#[must_use]
+pub fn group_mask_bytes(ragged: usize, tokens: u32, lanes: u32) -> u64 {
+    let indptr = (u64::from(lanes) + 1) * 4;
+    let bits = (u64::from(tokens) * u64::from(tokens)).div_ceil(8).max(1);
+    ragged as u64 * (indptr.next_multiple_of(ALIGN) + bits.next_multiple_of(ALIGN))
+}
+
 #[derive(Debug)]
 pub struct Inputs {
     store: Buffer,
@@ -226,10 +236,9 @@ pub struct Inputs {
     rs_commit: u64,
     rs_snaps: u64,
     rs_pages: u64,
-    /// Staged apart from the store: their size is the groups', not the load's.
+    /// Staged apart from the store, sized at the load for the widest fire
+    /// where the model packs attention groups ([`group_mask_bytes`]).
     group_masks: Option<Buffer>,
-    /// Smaller ones it outgrew, kept: an earlier fire may still read them.
-    outgrown: Vec<Buffer>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -274,6 +283,7 @@ impl Inputs {
         selections: usize,
         bands: &[u32],
         pages_per_lane: u32,
+        ragged: usize,
     ) -> Result<Inputs> {
         let width = u64::from(bands.iter().sum::<u32>().max(1));
         let rows = u64::from(budget.max_tokens);
@@ -407,14 +417,19 @@ impl Inputs {
             rs_commit,
             rs_snaps,
             rs_pages,
-            group_masks: None,
-            outgrown: Vec::new(),
+            group_masks: if ragged == 0 {
+                None
+            } else {
+                Some(Buffer::zeroed(
+                    device,
+                    group_mask_bytes(ragged, budget.max_tokens, budget.max_lanes),
+                )?)
+            },
         })
     }
 
     pub fn stage_group_masks(
         &mut self,
-        device: &Context,
         handles: &crate::device::Handles,
         masks: &[(
             poem_ir::Selection,
@@ -436,20 +451,18 @@ impl Inputs {
             image.resize((image.len() as u64).next_multiple_of(ALIGN) as usize, 0);
             placed.push((indptr, bits));
         }
-        if self
-            .group_masks
-            .as_ref()
-            .is_none_or(|held| held.bytes() < image.len() as u64)
-        {
-            let grown = Buffer::zeroed(device, (image.len() as u64).next_power_of_two())?;
-            if let Some(old) = self.group_masks.replace(grown) {
-                self.outgrown.push(old);
-            }
-        }
-        let buffer = self
+        let have = self.group_masks.as_ref().map_or(0, Buffer::bytes);
+        let Some(buffer) = self
             .group_masks
             .as_mut()
-            .expect("the group mask buffer was just sized");
+            .filter(|held| held.bytes() >= image.len() as u64)
+        else {
+            return Err(Fault::Ceiling {
+                what: "bytes of the group masks sized at the load",
+                need: image.len() as u64,
+                have,
+            });
+        };
         buffer.write(0, &image)?;
         let buffer = &*buffer;
         masks
@@ -500,11 +513,10 @@ impl Inputs {
         self.store.bytes()
     }
 
-    /// The group mask buffer and every one it outgrew, which it keeps.
+    /// The group mask buffer, sized at the load.
     #[must_use]
     pub fn group_mask_bytes(&self) -> u64 {
         self.group_masks.as_ref().map_or(0, Buffer::bytes)
-            + self.outgrown.iter().map(Buffer::bytes).sum::<u64>()
     }
 
     pub fn write(&mut self, handles: &crate::device::Handles, fire: &Fire<'_>) -> Result<Handles> {

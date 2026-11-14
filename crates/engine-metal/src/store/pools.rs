@@ -651,6 +651,7 @@ impl Pools {
             layout.chunk_bytes,
             layout.total_chunks,
             layout.segment_chunks,
+            layout.act_span(),
         )?;
         let list_slots = layout.list.map_or(0, |list| {
             u64::from(list.per_chunk) * u64::from(layout.total_chunks)
@@ -1253,6 +1254,24 @@ impl Pools {
     #[must_use]
     pub fn high_water_bytes(&self) -> u64 {
         self.pool.high_water_bytes()
+    }
+
+    /// Where the activation span starts in the pool's buffer, and its bytes.
+    #[must_use]
+    pub fn span(&self) -> (u64, u64) {
+        let offset = self.pool.span_offset();
+        (offset, self.pool.bytes() - offset)
+    }
+
+    /// The device bytes the span's backed segments hold, from the load on.
+    #[must_use]
+    pub fn span_held_bytes(&self) -> u64 {
+        self.pool.top_held_bytes()
+    }
+
+    /// `into.len()` bytes at `offset` of the pool's buffer, read on the host.
+    pub fn read_span(&self, offset: u64, into: &mut [u8]) -> Result<()> {
+        self.pool.read(offset, into)
     }
 
     /// The cache table one fire binds; `q8` reads every kv pool through the
