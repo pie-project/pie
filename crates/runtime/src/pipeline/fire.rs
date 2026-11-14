@@ -45,6 +45,7 @@ use wasmtime::component::Resource;
 
 pub use context::FireContext;
 
+use ::engine::fire::UNFOLDED_ROWS;
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 
 use crate::pipeline::Pipeline;
@@ -513,7 +514,6 @@ fn host_rs_plan(
     req: &crate::engine::FireRequest,
     fold: &geometry::Fold,
     snapshots: &[u32],
-    bound: u32,
 ) -> Result<rs::RsPlan, String> {
     if ids.is_empty() {
         return Ok(rs::RsPlan::Groups(Vec::new()));
@@ -542,7 +542,8 @@ fn host_rs_plan(
         let (start, end) = span(first);
         let fold = group_fold(fold, first, frozen, end);
         for &lane in lanes {
-            check_unfolded(lane, bound, frozen, span(lane).1, fold)?;
+            let (start, end) = span(lane);
+            check_unfolded(lane, frozen, start, end, fold)?;
         }
         let writes =
             if lanes.len() == 1 && start == frozen && fold == rs::GroupFold::Host(end - start) {
@@ -578,7 +579,6 @@ fn device_rs_plan(
     groups: &LaneGroups,
     lanes: &PassLanes,
     fold: &geometry::Fold,
-    bound: u32,
 ) -> Result<rs::RsPlan, String> {
     if ids.is_empty() {
         return Ok(rs::RsPlan::Groups(Vec::new()));
@@ -592,7 +592,9 @@ fn device_rs_plan(
             .map_err(|error| error.to_string())?;
         let reserved = lanes.cursors[first].lock().unwrap().reserved;
         let fold = group_fold(fold, first, frozen, reserved);
-        check_unfolded(first, bound, frozen, reserved, fold)?;
+        // The device picks where a lane's rows start, so the host cannot
+        // bound what it carries in: its engine keeps a replay past
+        // `UNFOLDED_ROWS` inside its scratch or fails the fire.
         plans.push(rs::GroupPlan {
             lanes: group.clone(),
             writes: Some(frozen..reserved),
@@ -603,46 +605,48 @@ fn device_rs_plan(
     Ok(rs::RsPlan::Groups(plans))
 }
 
-/// The rows lane `lane` holds unfolded once a pass writing up to `end`
-/// lands with `fold`, from `frozen` folded: refused past `bound`, one rs
-/// page ([`unfolded_bound`]; 0: no rs list, no bound), before anything is
-/// submitted. The fold point is the inferlet's (a speculative rollback
-/// lands on it): the runtime never folds more behind its back. A fold the
-/// device computes is unknown before the fire: it counts as nothing folded,
-/// so no engine ever has to refuse mid-fire.
+/// Lane `lane`'s pass, writing `start..end` over a state folded through
+/// `frozen` and landing with `fold`, refused by name before anything is
+/// submitted: (a) when it carries more than [`UNFOLDED_ROWS`] unfolded
+/// rows in, `start - frozen`; (b) when a fold the host knows leaves more
+/// than that unfolded behind it, `end - frozen - folded`. The fire's own
+/// rows never count against the bound. A fold the device computes leaves
+/// a count unknown before the fire: (a) checks it at the next fire. The
+/// fold point is the inferlet's (a speculative rollback lands on it): the
+/// runtime never folds more behind its back.
 fn check_unfolded(
     lane: usize,
-    bound: u32,
     frozen: u32,
+    start: u32,
     end: u32,
     fold: rs::GroupFold,
 ) -> Result<(), String> {
-    let folded = match fold {
-        rs::GroupFold::Device | rs::GroupFold::None => 0,
-        rs::GroupFold::Host(count) => count,
+    check_carried(lane, start.saturating_sub(frozen))?;
+    let rs::GroupFold::Host(folded) = fold else {
+        return Ok(());
     };
-    let unfolded = end.saturating_sub(frozen).saturating_sub(folded);
-    if bound == 0 || unfolded <= bound {
+    let left = end.saturating_sub(frozen).saturating_sub(folded);
+    if left <= UNFOLDED_ROWS {
         return Ok(());
     }
     Err(format!(
-        "pipeline: lane {lane} would hold {unfolded} recurrent rows unfolded, past one rs page \
-         ({bound} rows); fold what it has written before it writes more"
+        "pipeline: lane {lane} would leave {left} recurrent rows unfolded behind this fire, \
+         past the {UNFOLDED_ROWS} rows earlier fires may leave unfolded for a lane's next \
+         fire; fold what it has written before it writes more"
     ))
 }
 
-/// The bound on a lane's unfolded recurrent rows: one rs page.
-///
-/// One rule on every backend, derived from the pool, not stated by the
-/// engine: a lane holds at most one rs page unfolded, the rows a slot of
-/// the RsBuffer list shape holds (what every backend pages the rs buffer
-/// by). A pool with no rs list has no bound to apply (0).
-fn unfolded_bound(stores: &crate::store::registry::Stores) -> u32 {
-    stores
-        .shared
-        .as_ref()
-        .and_then(|shared| shared.lock().unwrap().rs_list())
-        .map_or(0, |list| list.tokens)
+/// (a) of [`check_unfolded`]: `carried` rows earlier fires wrote and
+/// nothing folded, which this fire replays ahead of its own.
+fn check_carried(lane: usize, carried: u32) -> Result<(), String> {
+    if carried <= UNFOLDED_ROWS {
+        return Ok(());
+    }
+    Err(format!(
+        "pipeline: lane {lane} carries {carried} recurrent rows unfolded into this fire, past \
+         the {UNFOLDED_ROWS} rows earlier fires may leave unfolded for a lane's next fire; \
+         fold what it has written before it writes more"
+    ))
 }
 
 fn group_fold(fold: &geometry::Fold, first: usize, frozen: u32, end: u32) -> rs::GroupFold {
@@ -3413,15 +3417,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 if windowed {
                     host_window_plan(&req, &fold, &rs_ws_ids, keep)
                 } else {
-                    host_rs_plan(
-                        &stores,
-                        &rs_ws_ids,
-                        &groups,
-                        &req,
-                        &fold,
-                        &inside,
-                        unfolded_bound(&stores),
-                    )
+                    host_rs_plan(&stores, &rs_ws_ids, &groups, &req, &fold, &inside)
                 }
             };
             let reserved = reserve(
@@ -4391,14 +4387,7 @@ async fn fire_device_geometry<C: FireContext>(
         if windowed {
             device_window_plan(&stores, ws.id, &write_indexes[0], &rs_ws_ids)
         } else {
-            device_rs_plan(
-                &stores,
-                &rs_ws_ids,
-                &groups,
-                &pass_lanes,
-                &fold,
-                unfolded_bound(&stores),
-            )
+            device_rs_plan(&stores, &rs_ws_ids, &groups, &pass_lanes, &fold)
         }
     };
     let reserved = reserve(
@@ -5803,36 +5792,39 @@ mod fold_tests {
 #[cfg(test)]
 mod unfolded_tests {
     use super::*;
+    use crate::inferlet::host::working_set::Cursor;
 
-    /// A lane may hold one rs page unfolded; one row past it is refused by
-    /// name before anything is submitted; 0 (no rs list) is unbounded;
-    /// what the pass folds counts against it; a fold the device computes
-    /// counts as nothing folded.
+    /// A lane carries at most `UNFOLDED_ROWS` unfolded rows into a fire,
+    /// whatever its own rows; one past is refused by name; a fold the host
+    /// knows may leave no more behind it; a device fold's leftover waits for
+    /// the next fire.
     #[test]
-    fn a_pass_past_the_unfolded_bound_is_refused() {
-        // Folded through 100, writing through 164: 64 unfolded.
-        assert!(check_unfolded(0, 64, 100, 164, rs::GroupFold::None).is_ok());
-        let refused = check_unfolded(3, 64, 100, 165, rs::GroupFold::None).unwrap_err();
-        assert!(refused.contains("lane 3") && refused.contains("65") && refused.contains("64"));
-        assert!(refused.contains("one rs page (64 rows)"), "{refused}");
+    fn a_pass_past_the_unfolded_rows_is_refused() {
+        let most = UNFOLDED_ROWS;
+        // Folded through 100: carrying `most` in, writing 1000 of its own.
+        assert!(check_unfolded(0, 100, 100 + most, 1100 + most, rs::GroupFold::None).is_ok());
+        let refused =
+            check_unfolded(3, 100, 101 + most, 102 + most, rs::GroupFold::None).unwrap_err();
         assert!(
-            check_unfolded(0, 0, 0, u32::MAX, rs::GroupFold::None).is_ok(),
-            "no rs list: unbounded"
+            refused.contains("lane 3")
+                && refused.contains(&format!("carries {} recurrent rows", most + 1))
+                && refused.contains("fold what it has written before it writes more")
+                && !refused.contains("rs page"),
+            "{refused}"
         );
+        // A host fold leaves `end - frozen - folded`.
+        assert!(check_unfolded(0, 100, 100, 200, rs::GroupFold::Host(100 - most)).is_ok());
+        let left = check_unfolded(0, 100, 100, 200, rs::GroupFold::Host(99 - most)).unwrap_err();
         assert!(
-            check_unfolded(0, 64, 100, 200, rs::GroupFold::Host(36)).is_ok(),
-            "what the pass folds leaves 64"
+            left.contains(&format!("leave {} recurrent rows", most + 1)),
+            "{left}"
         );
-        assert!(check_unfolded(0, 64, 100, 200, rs::GroupFold::Host(35)).is_err());
-        // A device fold counts as nothing folded: checked as if none.
-        assert!(check_unfolded(0, 64, 100, 164, rs::GroupFold::Device).is_ok());
-        assert!(check_unfolded(0, 64, 100, 165, rs::GroupFold::Device).is_err());
+        // A device fold's leftover is unknown now: the next fire checks it.
+        assert!(check_unfolded(0, 100, 100, 1000, rs::GroupFold::Device).is_ok());
+        assert!(check_unfolded(0, 100, 101 + most, 1000, rs::GroupFold::Device).is_err());
     }
 
-    /// The bound is the pool's rs page, the RsBuffer list's rows a slot,
-    /// whatever the engine: none without an rs list.
-    #[test]
-    fn the_bound_is_one_rs_page_of_the_pool() {
+    fn pool_of_one_row_rs_pages() -> crate::store::registry::Stores {
         use ::engine::chunk::{
             ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
             SlotShape,
@@ -5868,7 +5860,8 @@ mod unfolded_tests {
             }],
             shapes: vec![
                 shape(0, list(16), SlotRole::State),
-                shape(1, list(8), SlotRole::RsBuffer),
+                // One recurrent row an rs page, as Qwen3.5's.
+                shape(1, list(1), SlotRole::RsBuffer),
                 shape(2, SlotKind::Fixed { pieces: 1 }, SlotRole::State),
             ],
             ..ChunkFacts::default()
@@ -5883,12 +5876,116 @@ mod unfolded_tests {
                 tiers: crate::store::shared::Tiers::default(),
             }],
         );
-        assert_eq!(unfolded_bound(&crate::store::registry::get(model, 0)), 8);
-        let plain = crate::store::registry::register_model(32, &[1], &[1]);
-        assert_eq!(
-            unfolded_bound(&crate::store::registry::get(plain, 0)),
-            0,
-            "no rs list: no bound"
+        crate::store::registry::get(model, 0)
+    }
+
+    fn lane(held: u32, rows: u32) -> crate::engine::FireRequest {
+        crate::engine::FireRequest {
+            lanes: vec![::engine::Lane {
+                tokens: vec![0; rows as usize],
+                kv: ::engine::KvDelta {
+                    held,
+                    ..Default::default()
+                },
+                ..::engine::Lane::default()
+            }],
+            ..crate::engine::FireRequest::default()
+        }
+    }
+
+    fn groups(plan: rs::RsPlan) -> Vec<rs::GroupPlan> {
+        match plan {
+            rs::RsPlan::Groups(groups) => groups,
+            rs::RsPlan::Window(_) => panic!("a plain recurrent model plans groups"),
+        }
+    }
+
+    /// MTP with k = 4 on a pool whose rs pages hold one row: the draft
+    /// writes a window of five rows unfolded, the next window carries those
+    /// five in and folds the accepted rows, and only a host-placed lane
+    /// carrying past `UNFOLDED_ROWS` is refused; a device-placed one is the
+    /// engine's to hold. Not one rs page: a lane's buffer names several.
+    #[test]
+    fn mtp_k4_rides_one_row_rs_pages() {
+        let stores = pool_of_one_row_rs_pages();
+        let kv = stores.kv.lock().create_working_set();
+        let ws = stores
+            .rs
+            .lock()
+            .unwrap()
+            .create_working_set(crate::store::rs::RsGeometry {
+                state_size: 1 << 10,
+                buffer_page_tokens: 1,
+            });
+        // The prompt is folded through 10.
+        stores.rs.lock().unwrap().fold(ws, 10);
+        let ids = [ws];
+        let groups_of = lane_groups(&[kv]);
+        let host = |held, rows, fold: Vec<u32>| {
+            host_rs_plan(
+                &stores,
+                &ids,
+                &groups_of,
+                &lane(held, rows),
+                &geometry::Fold::Host(fold),
+                &[],
+            )
+        };
+
+        // Draft: five rows (the truth and k = 4 drafts), nothing folded.
+        let draft = groups(host(10, 5, vec![0]).expect("a draft of five rows"));
+        assert_eq!(draft[0].writes, Some(10..15));
+        assert_eq!(draft[0].fold, rs::GroupFold::None);
+
+        // Verify: carries the draft's five in and folds the accepted three.
+        let verify = groups(host(15, 5, vec![3]).expect("carries five in"));
+        assert_eq!(verify[0].writes, Some(15..20));
+        assert_eq!(verify[0].fold, rs::GroupFold::Host(3));
+        stores.rs.lock().unwrap().fold(ws, 3);
+        assert_eq!(stores.rs.lock().unwrap().frozen(ws).unwrap(), 13);
+
+        // A lane that never folds piles up: past 13, carrying 17 in.
+        assert!(host(13 + UNFOLDED_ROWS, 5, vec![0]).is_ok());
+        let refused = host(13 + UNFOLDED_ROWS + 1, 5, vec![0]).unwrap_err();
+        assert!(
+            refused.contains(&format!("carries {} recurrent rows", UNFOLDED_ROWS + 1)),
+            "{refused}"
         );
+        // A host fold that leaves 17 behind is refused before it fires.
+        let left = host(13, 5 + UNFOLDED_ROWS, vec![4]).unwrap_err();
+        assert!(
+            left.contains(&format!("leave {} recurrent rows", UNFOLDED_ROWS + 1)),
+            "{left}"
+        );
+
+        // The device plan: the device picks where the rows start, so the
+        // host refuses nothing it carries in, however far ahead the
+        // inferlet reserved; the engine holds it to `UNFOLDED_ROWS`.
+        let device = |reserved: u32| {
+            let cell = Arc::new(Mutex::new(Cursor {
+                folded: 13,
+                reserved,
+                tail: None,
+                ..Cursor::default()
+            }));
+            let lanes = PassLanes {
+                places: vec![geometry::Place {
+                    folded: 13,
+                    folded_exact: true,
+                    tail: None,
+                    shared: false,
+                    spans: Vec::new(),
+                }],
+                cursors: vec![cell],
+                kv: Vec::new(),
+            };
+            device_rs_plan(&stores, &ids, &groups_of, &lanes, &geometry::Fold::Device)
+        };
+        let planned = groups(device(13 + 5 + 5).unwrap());
+        assert_eq!(planned[0].writes, Some(13..23));
+        assert_eq!(planned[0].fold, rs::GroupFold::Device);
+        // The decode reserved its whole extent up front, as the MTP example.
+        let ahead = groups(device(13 + 4 * UNFOLDED_ROWS).expect("no carried-in refusal"));
+        assert_eq!(ahead[0].writes, Some(13..13 + 4 * UNFOLDED_ROWS));
     }
 }
