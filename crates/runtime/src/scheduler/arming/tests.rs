@@ -21,6 +21,7 @@ const COMPOSITIONS: u32 = 3;
 const ROOM: ArmingRoom = ArmingRoom {
     pages: 4,
     records: 1,
+    rung: u32::MAX,
 };
 
 /// Free kv pages and record slots, as a shared pool's lists hand them out.
@@ -649,7 +650,11 @@ fn a_lease_takes_neither_a_waiter_s_grant_nor_a_page_a_fire_in_flight_let_go() {
         .expect("four pages stand free");
     let promised: HashSet<u32> = grant.kv_pages().iter().map(|p| p.0).collect();
     let mut lender = OnPlanner(planner.clone());
-    let room = |pages| ArmingRoom { pages, records: 0 };
+    let room = |pages| ArmingRoom {
+        pages,
+        records: 0,
+        rung: u32::MAX,
+    };
     assert!(
         lender.lend(0, room(4), true).is_none(),
         "a lease reached past the two pages that stand free"

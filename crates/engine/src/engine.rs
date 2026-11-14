@@ -76,8 +76,9 @@ pub trait Engine: Send {
         crate::live::Live::armed()
     }
 
-    /// The pool slots one [`Engine::arm_step`] writes, stated once at load
-    /// ([`crate::live::ArmingRoom`]). The default writes none.
+    /// The pool slots the next [`Engine::arm_step`] writes and the rung it
+    /// arms ([`crate::live::ArmingRoom`]), asked before every step. The
+    /// default writes no slot and names the full span.
     fn arming_room(&self) -> crate::live::ArmingRoom {
         crate::live::ArmingRoom::default()
     }

@@ -99,14 +99,38 @@ impl Default for Live {
     }
 }
 
-/// The pool slots one [`crate::Engine::arm_step`] writes while it captures:
-/// its synthetic fires' kv pages (slots of the kv list shape) and record
-/// slots (the record shape). Stated once at load; zero for an engine whose
-/// arming writes no pool slot.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// What the next [`crate::Engine::arm_step`] takes of the pool while it
+/// captures: its synthetic fires' kv pages (slots of the kv list shape) and
+/// record slots (the record shape), zero for an engine whose arming writes
+/// no pool slot; and the rung it arms, whose activation span
+/// (`act_chunks(rung)`) its capture writes. Asked before every step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArmingRoom {
     pub pages: u32,
     pub records: u32,
+    /// The rung (tokens) the next step captures bodies of: the runtime
+    /// raises the pool's activation to it, moving any state lent to its
+    /// span out, before the step runs. `u32::MAX` (the default, an engine
+    /// that does not say) is the full span.
+    pub rung: u32,
+}
+
+impl Default for ArmingRoom {
+    fn default() -> Self {
+        Self {
+            pages: 0,
+            records: 0,
+            rung: u32::MAX,
+        }
+    }
+}
+
+impl ArmingRoom {
+    /// No pool slot is lent: the step writes none.
+    #[must_use]
+    pub const fn lends_nothing(&self) -> bool {
+        self.pages == 0 && self.records == 0
+    }
 }
 
 /// The slots the runtime lends one [`crate::Engine::arm_step`], as slot

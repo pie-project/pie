@@ -51,7 +51,7 @@ pub fn unfunded(engine: usize, rows: u32) -> Option<ArmingRoom> {
     }
     let engines = ENGINES.lock().unwrap();
     let state = engines.get(&engine)?;
-    let empty = state.room == ArmingRoom::default();
+    let empty = state.room.lends_nothing();
     (state.arming && !empty && state.funded.is_none()).then_some(state.room)
 }
 
@@ -141,7 +141,7 @@ pub(crate) struct PlannerLender;
 impl Lender for PlannerLender {
     fn lend(&mut self, engine: usize, room: ArmingRoom, idle: bool) -> Option<Lent> {
         let _ = idle;
-        if room == ArmingRoom::default() {
+        if room.lends_nothing() {
             return Some(Lent::empty());
         }
         let shared = crate::store::registry::try_get(0, engine).and_then(|s| s.shared);

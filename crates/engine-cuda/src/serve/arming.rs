@@ -528,6 +528,8 @@ impl Shell {
             // One record, every piece of it: a synthetic lane's rows are
             // never read back, so a step's lanes share it.
             records: self.pools.record_pieces(),
+            // The full span until the engine names the rung it arms.
+            rung: u32::MAX,
         }
     }
 
