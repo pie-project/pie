@@ -1637,6 +1637,9 @@ struct Sorted {
     src: Val,
     /// The pair each row holds (a pad row: `>= p`).
     held: Val,
+    /// Each row's place in that order, where the order was ranked rather
+    /// than sorted ([`ranked`]).
+    pos: Option<Val>,
     /// The weight each row carries (0 for a pad), when the sort carried one.
     ws: Option<Val>,
     /// Each tile's run (its expert's rank among the routed ones) and the
@@ -1804,9 +1807,15 @@ fn sorted(
         let none = f.const_f(Elem::F32, 0.0, &[fill]);
         carried.push(f.concat(&[w, none], 0)?);
     }
-    let by = f.sort(&carried, 0, true, |fq, a, b| {
-        fq.compare(Cmp::Lt, a[0], b[0])
-    })?;
+    let (by, pos) = if rows <= RANKED_ROWS {
+        let (by, pos) = ranked(f, &carried)?;
+        (by, Some(pos))
+    } else {
+        let by = f.sort(&carried, 0, true, |fq, a, b| {
+            fq.compare(Cmp::Lt, a[0], b[0])
+        })?;
+        (by, None)
+    };
     let held = by[1];
     // Padded row `i` holds pair `held[i]` (a pad when `>= p`).
     let src = {
@@ -1837,6 +1846,7 @@ fn sorted(
         xs,
         src,
         held,
+        pos,
         ws: weights.map(|_| by[2]),
         run,
         nxt,
@@ -1846,8 +1856,54 @@ fn sorted(
     })
 }
 
+/// Fires of at most this many padded rows rank their rows instead of
+/// sorting them: two `[rows, rows]` compares in place of XLA's sort, which
+/// costs some 3 us however few the rows (v6e, Qwen3-30B-A3B decode c1: two
+/// sorts a routed matmul, a fifth of its time).
+const RANKED_ROWS: i64 = 256;
+
+/// What a stable ascending sort on `xs[0]` (i32 keys) answers, without the
+/// sort: each row's place is how many rows' keys are smaller, and how many
+/// equal ones come before it. Answers the carried values in that order,
+/// and each row's place.
+fn ranked(f: &mut Func, xs: &[Val]) -> Result<(Vec<Val>, Val), Error> {
+    let n = f.dims(xs[0])[0];
+    let mine = f.broadcast(xs[0], &[n, n], &[0])?;
+    let theirs = f.broadcast(xs[0], &[n, n], &[1])?;
+    let less = f.compare(Cmp::Lt, theirs, mine)?;
+    let same = f.compare(Cmp::Eq, theirs, mine)?;
+    let ri = f.iota(Elem::I32, &[n, n], 0);
+    let ci = f.iota(Elem::I32, &[n, n], 1);
+    let before = f.compare(Cmp::Lt, ci, ri)?;
+    let tie = f.and(same, before)?;
+    let ahead = f.or(less, tie)?;
+    let one = f.const_i(Elem::I32, 1, &[n, n]);
+    let zero = f.const_i(Elem::I32, 0, &[n, n]);
+    let ahead = f.select(ahead, one, zero)?;
+    let pos = f.reduce(ahead, &[1], Fold::Sum)?;
+    // Place `i` holds the row whose place is `i`: one hit a place.
+    let pb = f.broadcast(pos, &[n, n], &[1])?;
+    let at = f.compare(Cmp::Eq, pb, ri)?;
+    let mut out = Vec::with_capacity(xs.len());
+    for &x in xs {
+        let elem = f.elem(x);
+        let xb = f.broadcast(x, &[n, n], &[1])?;
+        let none = if elem.is_float() {
+            f.const_f(elem, 0.0, &[n, n])
+        } else {
+            f.const_i(elem, 0, &[n, n])
+        };
+        let hit = f.select(at, xb, none)?;
+        out.push(f.reduce(hit, &[1], Fold::Sum)?);
+    }
+    Ok((out, pos))
+}
+
 /// Pair `i`'s row of the kernel's result: where the sort put it.
 fn dest(f: &mut Func, sorted: &Sorted, p: i64) -> Result<Val, Error> {
+    if let Some(pos) = sorted.pos {
+        return Ok(f.slice(pos, &[0], &[p], &[1])?);
+    }
     let rows = f.dims(sorted.held)[0];
     let iota = f.iota(Elem::I32, &[rows], 0);
     let back = f.sort(&[sorted.held, iota], 0, true, |fq, a, b| {

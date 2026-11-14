@@ -1502,7 +1502,7 @@ fn time_a_pooled_select() {
     if std::env::var("PIE_XLA_GMM_TIME").is_err() {
         return;
     }
-    for (e, n, k, t, tk) in [(16usize, 1536usize, 2048usize, 64usize, 8usize), (16, 2048, 768, 64, 8), (128, 1536, 2048, 64, 8)] {
+    for (e, n, k, t, tk) in [(128usize, 1536usize, 2048usize, 1usize, 8usize), (128, 2048, 768, 1, 8), (128, 1536, 2048, 8, 8)] {
         let w: Vec<f32> = data(e * n * k, 91).iter().map(|v| round_bf16(v * 0.25)).collect();
         let rows = k / 128 * (n / 2);
         let table: Vec<i32> = (0..e).map(|x| (8 + x * rows) as i32).collect();
@@ -1514,8 +1514,14 @@ fn time_a_pooled_select() {
         let x = data(t * k, 92);
         let routes: Vec<i32> = (0..p).map(|i| (hash(i, 93) % e as u32) as i32).collect();
         let mut times = Vec::new();
-        for pooled in [false, true] {
-            let mut b = Bench::new();
+        // Dense (auto: one token's pairs sliced), dense on the kernel, pooled.
+        for arm in 0..3 {
+            let pooled = arm == 2;
+            let mut tuning = kernels_xla::tuning::Tuning::DEFAULT;
+            if arm == 1 {
+                tuning.moe_costs.slice_pairs = 1;
+            }
+            let mut b = Bench::new().with_tuning(tuning);
             let xt = b.bf16(t as u32, k as u32, &x);
             let rt = b.i32(t as u32, tk as u32, &routes);
             let d = b.bf16((e * n) as u32, k as u32, &w);
@@ -1523,7 +1529,7 @@ fn time_a_pooled_select() {
             let tt = b.i32(1, e as u32, &table);
             let y = b.bf16(p as u32, n as u32, &vec![PREV; p * n]);
             let s = b
-                .time(50, |ctx| {
+                .time_pipelined(200, |ctx| {
                     engine_xla::lower::lower(ctx, |l| {
                         let x_v = l.read(xt)?;
                         let routes_v = l.read(rt)?;
@@ -1553,6 +1559,10 @@ fn time_a_pooled_select() {
             let Some(s) = s else { return };
             times.push(s * 1e6);
         }
-        eprintln!("TIME e{e} n{n} k{k} p{p}: dense {:.1} us, pooled {:.1} us ({:+.1}%)", times[0], times[1], 100.0 * (times[1] / times[0] - 1.0));
+        eprintln!(
+            "TIME e{e} n{n} k{k} p{p}: dense {:.1} us, dense kernel {:.1} us, pooled {:.1} us",
+            times[0], times[1], times[2]
+        );
     }
 }
+
