@@ -774,7 +774,10 @@ fn a_reserved_hybrid_pool_states_shared_chunks() {
     }
     assert_eq!(facts.chunk_bytes % facts.shape(LIST).unwrap().slot_bytes, 0);
     assert_eq!(facts.segments.max, 3);
-    assert!(facts.act_chunks.is_empty(), "activation lives in the arena");
+    assert!(
+        facts.act_chunks.is_empty(),
+        "a layout with no activation span states none"
+    );
     if facts.segments.growth != Growth::Bottom {
         assert_eq!(facts.segments.committed, 3);
         return;

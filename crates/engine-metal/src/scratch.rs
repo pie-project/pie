@@ -43,9 +43,9 @@ impl Room {
         u64::from(self.rows) * u64::from(self.width) * self.dtype.bytes_ceil()
     }
 
-    fn bind(&self, handles: &Handles, plane: &Buffer) -> Result<Tensor> {
+    fn bind(&self, handles: &Handles, plane: &Plane) -> Result<Tensor> {
         Ok(Tensor::new(
-            handles.bind(plane, self.at, self.bytes())?,
+            handles.bind(&plane.buffer, plane.base + self.at, self.bytes())?,
             self.rows,
             self.width,
             self.dtype,
@@ -89,9 +89,19 @@ struct Register {
     grids: Room,
 }
 
+/// Where the plane lies: the pool's buffer, from `base` (the top of the
+/// activation span, REDESIGN 3c), once [`Scratch::seat`] places it.
+#[derive(Debug)]
+struct Plane {
+    buffer: Buffer,
+    base: u64,
+}
+
 #[derive(Debug)]
 pub struct Scratch {
-    plane: Buffer,
+    plane: Plane,
+    /// The plane's bytes.
+    plane_bytes: u64,
     /// The n-gram hash constants (`ple`'s rooms), model bytes.
     constants: Buffer,
 
@@ -382,7 +392,10 @@ impl Scratch {
             ple.push(PleHash { key, room });
         }
 
-        let plane = Buffer::zeroed(device, at)?;
+        let plane = Plane {
+            buffer: Buffer::zeroed(device, 0)?,
+            base: 0,
+        };
         let mut constants = Buffer::zeroed(device, constant_at)?;
         for hashing in &ple {
             let bytes: Vec<u8> = hashing.key.iter().flat_map(|v| v.to_ne_bytes()).collect();
@@ -391,6 +404,7 @@ impl Scratch {
 
         Ok(Scratch {
             plane,
+            plane_bytes: at,
             constants,
             precast,
             partials,
@@ -407,7 +421,13 @@ impl Scratch {
 
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.plane.bytes()
+        self.plane_bytes
+    }
+
+    /// Lays the plane at `base` of `buffer`, the pool's: the top of the
+    /// activation span, zeroed from the load and taken by no carve.
+    pub fn seat(&mut self, buffer: Buffer, base: u64) {
+        self.plane = Plane { buffer, base };
     }
 
     /// The model's constants kept beside the plane.
@@ -510,7 +530,11 @@ impl Scratch {
         if offset.saturating_add(bytes) > room.bytes {
             return None;
         }
-        Some(handles.bind(&self.plane, room.at + offset, bytes))
+        Some(handles.bind(
+            &self.plane.buffer,
+            self.plane.base + room.at + offset,
+            bytes,
+        ))
     }
 
     pub fn routed(&self, handles: &Handles) -> Option<Result<RoutedScratch>> {
@@ -561,7 +585,12 @@ impl Scratch {
     ) -> Option<Result<Tensor>> {
         let want = ngram::hash_constants(mults, primes, offsets);
         let held = self.ple.iter().find(|h| *h.key == *want)?;
-        Some(held.room.bind(handles, &self.constants))
+        let room = held.room;
+        Some(
+            handles
+                .bind(&self.constants, room.at, room.bytes())
+                .map(|buf| Tensor::new(buf, room.rows, room.width, room.dtype)),
+        )
     }
 }
 
