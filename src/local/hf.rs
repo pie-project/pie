@@ -14,7 +14,7 @@ pub fn resolve_cache_dir() -> std::path::PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cache")))
         .unwrap_or_else(|| PathBuf::from(".cache"));
     base.join("huggingface").join("hub")
 }
