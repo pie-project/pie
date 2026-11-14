@@ -115,6 +115,18 @@ impl Arena {
         self.scratch + room(self.carve_for(rows).bytes)
     }
 
+    /// The bytes from the span's end a rung of `tokens` takes: the plane
+    /// and the carve its widest fire lays, never under the floor rung's.
+    #[must_use]
+    pub fn rung_reach(&self, tokens: u32) -> u64 {
+        let rows = FireRows {
+            tokens: u64::from(tokens),
+            lanes: u64::from(tokens),
+            ..FireRows::default()
+        };
+        self.reach(rows).max(self.floor_reach())
+    }
+
     /// The bytes from the span's end the smallest rung's fire takes: the
     /// floor a refused raise falls back to.
     #[must_use]

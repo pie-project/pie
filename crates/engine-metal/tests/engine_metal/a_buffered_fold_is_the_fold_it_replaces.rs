@@ -89,6 +89,7 @@ fn ready() -> Option<Shell> {
         profiles: None,
         residency: engine_metal::ResidencyPlan::default(),
     })
+    .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .expect("the micro shell loads");
     eprintln!(
         "recurrent slot: {} bytes; buffered page slab: {:.1} KiB; serves rs verbs: {}",

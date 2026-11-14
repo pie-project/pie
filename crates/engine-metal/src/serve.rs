@@ -1358,6 +1358,28 @@ impl Shell {
         self.pools.commit_span(segments)
     }
 
+    /// See `Engine::set_rung`: a raise backs the carve of `to` before any
+    /// fire of it, refused as [`Fault::Refused`]; a lower gives back the
+    /// carve above it once every frame drains.
+    #[allow(unsafe_code)]
+    pub fn set_rung(&mut self, from: u32, to: u32) -> Result<()> {
+        let reach = self.arena.rung_reach(to);
+        if to >= from {
+            return self.pools.cover(reach);
+        }
+        self.drain()?;
+        // SAFETY: drained just above, on the one thread that submits; the
+        // runtime lowers only once every fire wider than `to` retired.
+        unsafe { self.pools.narrow(reach) }
+    }
+
+    /// Raises the rung to the widest, backing its carve: what a caller that
+    /// fires this shell itself, with no runtime raising the rung, asks
+    /// first (tuning, the tests).
+    pub fn raise_whole(&mut self) -> Result<()> {
+        self.set_rung(0, u32::MAX)
+    }
+
     /// See `Engine::release_span`: every frame drains first.
     #[allow(unsafe_code)]
     pub fn release_span(&mut self, segments: u32) -> Result<()> {
@@ -3753,7 +3775,18 @@ impl Shell {
             clips: u64::from(composition.clips()),
             readouts: readout_rows.len() as u64,
         };
-        self.pools.cover(self.arena.reach(fire))?;
+        // The rung's carve was backed when the runtime raised to it
+        // (`set_rung`); a fire never backs anything.
+        if !self.pools.covers(self.arena.reach(fire)) {
+            return Err(Fault::Program {
+                at: "serve::stage",
+                why: format!(
+                    "a fire of {} tokens over {} lanes is wider than the rung the runtime \
+                     raised to, whose carve alone is backed",
+                    fire.tokens, fire.lanes
+                ),
+            });
+        }
         let slots = self.arena.fire_slots(&self.handles, fire)?;
         let caches = self.pools.table(
             &self.handles,
