@@ -545,13 +545,25 @@ impl Pool {
     }
 
     /// Backs the top `bytes` of the range for the rung's carve, on a raise;
-    /// a narrower `bytes` is no change ([`Pool::narrow`] gives back).
+    /// a narrower `bytes` is no change ([`Pool::narrow`] gives back). A
+    /// carve past the activation span the load set aside is refused by
+    /// name, the carve unchanged: what it counts (the rung's model carve and
+    /// its guests' terms) has nowhere to lie, and backing less than counted
+    /// would hand a fire a guest region short of its members.
     pub fn cover(&mut self, bytes: u64) -> Result<()> {
         if bytes <= self.carve {
             return Ok(());
         }
+        let span = self.bytes() - self.pinned_from();
+        if bytes > span {
+            return Err(Fault::Ceiling {
+                what: "bytes of the activation span a rung's carve and its guests' terms take",
+                need: bytes,
+                have: span,
+            });
+        }
         let was = self.carve;
-        self.carve = bytes.min(self.bytes() - self.pinned_from());
+        self.carve = bytes;
         let backed = self.back_top();
         if backed.is_err() {
             self.carve = was;
@@ -1152,6 +1164,28 @@ mod tests {
         pool.commit_segments(9)
             .expect("every segment under the span's");
         pool.commit_span(1).expect("the span's segment backs state");
+    }
+
+    /// A carve past the activation span is refused by name and backs
+    /// nothing; one of the whole span is backed.
+    #[test]
+    fn a_carve_past_the_span_is_refused_by_name() {
+        let device = Context::bind().expect("a device");
+        // 12 chunks, segments of 4, the top 3 the span: its segment's 4.
+        let mut pool = Pool::reserve(&device, CHUNK, 12, 4, 3, u64::MAX).expect("a pool");
+        let span = pool.bytes() - pool.pinned_from();
+        pool.cover(CHUNK).expect("a carve under the span");
+        let why = pool
+            .cover(span + 1)
+            .expect_err("a carve past the span is refused")
+            .to_string();
+        assert!(
+            why.contains("activation span") && why.contains(&span.to_string()),
+            "the refusal names the span and its bytes: {why}"
+        );
+        assert_eq!(pool.covered(), CHUNK, "the refused carve backs nothing");
+        pool.cover(span).expect("the whole span is a carve");
+        assert_eq!(pool.covered(), span);
     }
 
     /// The buffer index takes the bits that count the buffers under the
