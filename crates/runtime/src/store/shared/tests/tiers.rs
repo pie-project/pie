@@ -18,6 +18,83 @@ use crate::store::kv::page_table::{KvPageBacking, PhysicalKvPageId};
 const DEVICE: MemoryDomain = MemoryDomain::CudaDevice(0);
 const HOST_CHUNKS: u32 = 8;
 
+/// A host or disk tier with more slots than a `u32` slot ref names is
+/// refused by name at load, as the device pool is: its refs are never
+/// clamped or saturated onto another slot's.
+#[test]
+fn a_tier_past_a_u32_of_slot_refs_is_refused_by_name() {
+    let facts = fixed_facts();
+    let list = facts
+        .shapes
+        .iter()
+        .find(|shape| {
+            shape.role == SlotRole::State
+                && matches!(shape.kind, SlotKind::List { window: None, .. })
+        })
+        .unwrap();
+    assert!(list.slots_per_chunk >= 2, "the kv list packs a chunk");
+    // The widest count the device pool itself would pass is not the
+    // tier's: the tier's own chunks are checked.
+    let chunks = u32::MAX;
+    let wide = facts
+        .shapes
+        .iter()
+        .find(|shape| shape.slots_per_chunk >= 2)
+        .unwrap();
+    assert_eq!(
+        SharedPool::tier(&facts, chunks).unwrap_err(),
+        SharedError::Tier {
+            tier: "host",
+            shape: wide.id.0,
+            chunks,
+            slots_per_chunk: wide.slots_per_chunk,
+        }
+    );
+    let mut host = facts.clone();
+    host.host_chunks = chunks;
+    assert!(matches!(
+        Tiers::of(&host),
+        Err(SharedError::Tier { tier: "host", .. })
+    ));
+    let mut disk = facts.clone();
+    disk.disk_chunks = chunks;
+    let refused = Tiers::of(&disk).unwrap_err();
+    assert_eq!(
+        refused,
+        SharedError::Tier {
+            tier: "disk",
+            shape: list.id.0,
+            chunks,
+            slots_per_chunk: list.slots_per_chunk,
+        }
+    );
+    assert!(
+        refused
+            .to_string()
+            .contains("more slots than a u32 slot ref names"),
+        "{refused}"
+    );
+    // The most a `u32` names is taken whole on disk.
+    let mut most = facts.clone();
+    most.disk_chunks = u32::MAX / list.slots_per_chunk;
+    assert_eq!(
+        Tiers::of(&most).unwrap().disk_slots,
+        most.disk_chunks * list.slots_per_chunk
+    );
+}
+
+/// A tier of facts that do not hang together is refused as the device pool
+/// of them is.
+#[test]
+fn a_tier_of_invalid_facts_is_refused() {
+    let mut facts = fixed_facts();
+    facts.shapes[0].slots_per_chunk = 0;
+    assert!(matches!(
+        SharedPool::tier(&facts, HOST_CHUNKS),
+        Err(SharedError::Facts(_))
+    ));
+}
+
 /// Each tier's slots and the value each holds: what an engine's copies move.
 #[derive(Default)]
 struct Bytes(HashMap<(MemoryDomain, EngineShape, u32), u64>);

@@ -446,6 +446,15 @@ pub enum SharedError {
     #[error("the reserved chunks are not one run from chunk 0")]
     Reserved,
     #[error(
+        "the {tier} tier's {chunks} chunks of shape {shape}'s {slots_per_chunk} slots a chunk are more slots than a u32 slot ref names"
+    )]
+    Tier {
+        tier: &'static str,
+        shape: u32,
+        chunks: u32,
+        slots_per_chunk: u32,
+    },
+    #[error(
         "{kind} shapes {shapes:?}: the stores hold one kv list, one rs list, one window list a distinct window, and one one-piece instance and channel shape"
     )]
     Shapes {
@@ -579,10 +588,20 @@ impl Tiers {
             shape.role == SlotRole::State
                 && matches!(shape.kind, SlotKind::List { window: None, .. })
         });
-        let disk_slots = list.map_or(0, |list| {
-            u32::try_from(u64::from(facts.disk_chunks) * u64::from(list.slots_per_chunk))
-                .unwrap_or(u32::MAX)
-        });
+        // The disk tier's slots are counted in a `u32` and its refs are
+        // below the count: a tier past that is refused, never cut short.
+        let disk_slots = match list {
+            None => 0,
+            Some(list) => {
+                u32::try_from(u64::from(facts.disk_chunks) * u64::from(list.slots_per_chunk))
+                    .map_err(|_| SharedError::Tier {
+                        tier: "disk",
+                        shape: list.id.0,
+                        chunks: facts.disk_chunks,
+                        slots_per_chunk: list.slots_per_chunk,
+                    })?
+            }
+        };
         Ok(Self { host, disk_slots })
     }
 }
@@ -729,12 +748,29 @@ impl SharedPool {
     /// weights', any shape taking any chunk. Whole from the load (one
     /// committed segment, no activation, no reserved chunk: host refs are
     /// physical, ref 0 a slot like any other). `None` for no chunks.
+    ///
+    /// Checked as the device pool is ([`Self::new`]): the facts hang
+    /// together, and every slot ref of the tier's own chunk count is a
+    /// `u32` (the device's count says nothing of the tier's).
     pub fn tier(facts: &ChunkFacts, chunks: u32) -> Result<Option<Self>, SharedError> {
         if chunks == 0 || facts.shapes.is_empty() {
             return Ok(None);
         }
+        facts
+            .validate()
+            .map_err(|error| SharedError::Facts(error.to_string()))?;
         if let Some(shape) = facts.shapes.iter().find(|shape| shape.pinned.is_some()) {
             return Err(SharedError::Pinned(shape.id.0));
+        }
+        if let Some(shape) = facts.shapes.iter().find(|shape| {
+            u64::from(chunks) * u64::from(shape.slots_per_chunk) > u64::from(u32::MAX) + 1
+        }) {
+            return Err(SharedError::Tier {
+                tier: "host",
+                shape: shape.id.0,
+                chunks,
+                slots_per_chunk: shape.slots_per_chunk,
+            });
         }
         let tier = ChunkFacts {
             total_chunks: chunks,
