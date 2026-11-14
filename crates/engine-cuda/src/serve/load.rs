@@ -1527,13 +1527,15 @@ pub(crate) struct Workspace {
 impl Shell {
     /// The runs of the activation's span a fire stages into and reads out
     /// of, in the order they lie from `inputs_at`: the staged inputs' slab,
-    /// the readout rows' table and the voxel store, each to
+    /// the readout rows' table, the voxel store and the rs fold predicates,
+    /// each to
     /// [`INPUTS_ALIGN`].
-    fn staged_runs(&self) -> [u64; 3] {
+    fn staged_runs(&self) -> [u64; 4] {
         [
             self.inputs.bytes(),
             self.readout_rows.bytes() as u64,
             self.voxels.as_ref().map_or(0, crate::voxels::Store::bytes),
+            self.predicate.bytes(),
         ]
         .map(|bytes| bytes.next_multiple_of(INPUTS_ALIGN))
     }
@@ -1544,8 +1546,8 @@ impl Shell {
         if let Some(buffers) = &self.buffers {
             buffers.lay_scratch(&mut self.pools)?;
         }
-        let [inputs, readouts, voxels] = self.staged_runs();
-        let staged = inputs + readouts + voxels;
+        let [inputs, readouts, voxels, predicates] = self.staged_runs();
+        let staged = inputs + readouts + voxels + predicates;
         self.pools
             .hold_activation_at(self.inputs_at, staged, false)?;
         let base = self.pools.activation_base() + self.inputs_at;
@@ -1555,6 +1557,7 @@ impl Shell {
         if let Some(store) = self.voxels.as_mut() {
             store.lay(base + inputs + readouts);
         }
+        self.predicate.lay(base + inputs + readouts + voxels)?;
         let Some(workspace) = &self.workspace else {
             return Ok(());
         };
