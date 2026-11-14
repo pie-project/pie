@@ -1,19 +1,19 @@
 #![cfg(target_vendor = "apple")]
 
 //! An adapter an instance lands lies in `Adapter` slots, one plane a bank,
-//! read through each bank's address table in the tables run. Its lanes'
-//! logits are the logits of the same planes in an operator seat, bit for
-//! bit; a second holder of the same item joins its landing (one id, nothing
-//! written again); after its slots park to other refs and it is rebound
-//! there, its lanes read the same logits; and its content key is the digest
-//! CUDA states for the same sink and seeds.
+//! read through each bank's address table in the tables run. An adapter of
+//! zero planes serves the unadapted logits bit for bit, other planes move
+//! them, and the same planes landed as another item serve the same logits;
+//! a second holder of one item joins its landing (one id, nothing written
+//! again); after its slots park to other refs and it is rebound there, its
+//! lanes read the same logits; a forgotten id reads the zero plane; and its
+//! content key is the digest CUDA states for the same sink and seeds.
 
 use engine::chunk::SlotCopy;
 use engine::program::InstanceId;
 use engine::transfer::MemoryDomain;
 use engine_metal::serve::Seated;
 use engine_metal::store::layout::ADAPTER;
-use engine_metal::weights::AdapterPlane;
 use engine_metal::{Lane, Shell};
 
 use super::a_scattered_pool_serves_the_same_logits::{Fixture, fixture_of, load_with, word};
@@ -43,15 +43,19 @@ fn planes(shell: &Shell, seed: u64) -> Vec<(String, Vec<u8>)> {
     planes
 }
 
-/// The prompt's logits on seat `slot`, read through adapter id `adapter`.
-fn logits(shell: &mut Shell, fixture: &Fixture, slot: u32, adapter: u32) -> Vec<f32> {
+/// The prompt's logits on seat `slot`, read through adapter id `adapter`
+/// (none: the unadapted arm).
+fn logits(shell: &mut Shell, fixture: &Fixture, slot: u32, adapter: Option<u32>) -> Vec<f32> {
     let tokens: Vec<u32> = (0..PROMPT).map(|at| (at * 37 + 11) % 256).collect();
-    let lane_word = shell
-        .adapted_word(word(&fixture.trace, PROMPT))
-        .expect("the model has an adapted arm");
+    let mut lane_word = word(&fixture.trace, PROMPT);
+    if adapter.is_some() {
+        lane_word = shell
+            .adapted_word(lane_word)
+            .expect("the model has an adapted arm");
+    }
     let seated = Seated {
         held: Some(0),
-        adapter: Some(adapter),
+        adapter,
         ..Seated::of(Lane {
             slot,
             word: lane_word,
@@ -109,26 +113,51 @@ fn an_adapter_in_slots_is_one_landing_through_the_table() {
         .map(|at| (first + 1) * adapter.per_chunk + at)
         .collect();
 
-    // The same planes in an operator seat (the interim path) and landed.
-    let seed = 7;
-    let seat_planes = planes(&shell, seed);
-    let seat: Vec<AdapterPlane<'_>> = seat_planes
-        .iter()
-        .map(|(bank, bytes)| AdapterPlane { bank, bytes })
+    let elsewhere: Vec<u32> = (0..banks)
+        .map(|at| (first + 2) * adapter.per_chunk + at)
         .collect();
     shell
-        .register_adapter(2, &seat)
-        .expect("the operator seat lands");
-    let in_seat = logits(&mut shell, &fixture, 0, 2);
+        .commit_segments((first + 2).div_ceil(segment) + 1)
+        .expect("the segments commit");
+    let plain = logits(&mut shell, &fixture, 0, None);
 
+    // Zero planes correct nothing; an adapter's planes move the logits.
+    let zero_planes: Vec<(String, Vec<u8>)> = planes(&shell, 0)
+        .into_iter()
+        .map(|(bank, bytes)| (bank, vec![0u8; bytes.len()]))
+        .collect();
+    let zero = shell
+        .land_adapter(InstanceId(9), &elsewhere, zero_planes)
+        .expect("the zero adapter lands");
+    assert_eq!(
+        logits(&mut shell, &fixture, 0, Some(zero)),
+        plain,
+        "an adapter of zero planes corrects nothing"
+    );
+    shell.detach_adapter(InstanceId(9));
+
+    let seed = 7;
     let id = shell
         .land_adapter(InstanceId(1), &refs, planes(&shell, seed))
         .expect("the adapter lands in its slots");
-    assert!(id >= 2, "a landed id lies past the operator seats: {id}");
-    let landed = logits(&mut shell, &fixture, 1, id);
+    let landed = logits(&mut shell, &fixture, 1, Some(id));
+    assert_ne!(landed, plain, "an adapter's planes move its lanes' logits");
+
+    // The same planes as another item (other slots): the same logits.
+    let twin = shell
+        .land_adapter(InstanceId(5), &elsewhere, planes(&shell, seed))
+        .expect("a second item lands");
+    assert_ne!(twin, id, "another item is another landing");
     assert_eq!(
-        landed, in_seat,
-        "planes in Adapter slots correct as the same planes in a seat"
+        logits(&mut shell, &fixture, 2, Some(twin)),
+        landed,
+        "the same planes read through another item's table entries"
+    );
+    shell.detach_adapter(InstanceId(5));
+    assert_eq!(
+        logits(&mut shell, &fixture, 3, Some(twin)),
+        plain,
+        "a forgotten id reads the zero plane"
     );
 
     // A second holder of the same item joins: one landing, one id.
@@ -137,8 +166,8 @@ fn an_adapter_in_slots_is_one_landing_through_the_table() {
         .expect("the second holder joins");
     assert_eq!(joined, id, "one item is one landing");
     assert_eq!(
-        logits(&mut shell, &fixture, 2, joined),
-        in_seat,
+        logits(&mut shell, &fixture, 2, Some(joined)),
+        landed,
         "joining wrote nothing: the first landing's planes stand"
     );
 
@@ -167,8 +196,8 @@ fn an_adapter_in_slots_is_one_landing_through_the_table() {
             .expect("the holder is rebound");
     }
     assert_eq!(
-        logits(&mut shell, &fixture, 3, id),
-        in_seat,
+        logits(&mut shell, &fixture, 3, Some(id)),
+        landed,
         "after the move its lanes read the planes where they lie now"
     );
 
@@ -179,8 +208,8 @@ fn an_adapter_in_slots_is_one_landing_through_the_table() {
         .land_adapter(InstanceId(3), &refs, planes(&shell, seed))
         .expect("a fresh landing");
     assert_eq!(
-        logits(&mut shell, &fixture, 0, again),
-        in_seat,
+        logits(&mut shell, &fixture, 0, Some(again)),
+        landed,
         "a fresh landing writes its planes"
     );
     eprintln!("an adapter in slots is one landing through the table (id {id})");

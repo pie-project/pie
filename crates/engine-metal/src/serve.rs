@@ -24,7 +24,7 @@ use crate::settle::{Airborne, Arms, Done};
 use crate::store::Pools;
 use crate::store::kv::{self, Paging, Seat};
 use crate::store::layout::Layout;
-use crate::weights::{AdapterPlane, Weights};
+use crate::weights::Weights;
 use crate::window::Windows;
 
 use engine::fire::Masking;
@@ -2204,10 +2204,6 @@ impl Shell {
         Ok(())
     }
 
-    pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
-        self.weights.register_adapter(id, planes)
-    }
-
     #[must_use]
     pub fn bank_seats(&self) -> Vec<crate::weights::BankSeat> {
         self.weights.seats()
@@ -2283,8 +2279,7 @@ impl Shell {
             self.held_landing.insert(instance, slots[0]);
             return Ok(landing.id);
         }
-        let first = self.weights.first_landed_id();
-        let id = (first..crate::weights::ADAPTER_IDS)
+        let id = (0..crate::weights::ADAPTER_IDS)
             .find(|id| !self.landings.values().any(|landing| landing.id == *id))
             .ok_or(Fault::Ceiling {
                 what: "adapter ids a bank's table holds",
@@ -2343,7 +2338,7 @@ impl Shell {
             let address = buffer.address_at(offset).ok_or_else(|| Fault::Unbound {
                 what: format!("a GPU address for `Adapter` slot {slot}"),
             })?;
-            self.weights.point(bank, landing.id, address)?;
+            self.weights.point(bank, landing.id, Some(address))?;
         }
         Ok(())
     }
@@ -2357,7 +2352,12 @@ impl Shell {
         if let Some(landing) = self.landings.get_mut(&first) {
             landing.holders.remove(&instance);
             if landing.holders.is_empty() {
-                self.landings.remove(&first);
+                // Forgotten: its id reads the zero plane until it lands anew.
+                if let Some(landing) = self.landings.remove(&first) {
+                    for bank in &landing.banks {
+                        let _ = self.weights.point(bank, landing.id, None);
+                    }
+                }
             }
         }
     }

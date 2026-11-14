@@ -648,17 +648,13 @@ impl Engine for Metal {
     }
 
     fn register_adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
-        let planes: Vec<AdapterPlane<'_>> = registration
-            .planes
-            .iter()
-            .map(|plane| AdapterPlane {
-                bank: plane.bank.as_str(),
-                bytes: &plane.bytes,
-            })
-            .collect();
-        self.loaded_mut()?
-            .register_adapter(registration.id, &planes)
-            .map_err(fault)
+        Err(Error::Invalid(format!(
+            "adapter {} is operator-declared, and no backend hosts operator-declared \
+             adapters: an adapter arrives through a program's `lora` sink at bind, its \
+             planes the bind's seeds, and lands in `Adapter` slots shared by every \
+             instance that carries the same planes",
+            registration.id
+        )))
     }
 
     fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
