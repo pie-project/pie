@@ -522,6 +522,8 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         residency: crate::ResidencyPlan::default(),
     })
     .map_err(|e| e.to_string())?;
+    // No runtime raises the rung here: the widest carve is backed.
+    shell.raise_whole().map_err(|e| e.to_string())?;
     // Time the load as it serves, not the GPU-alone stretch before the
     // Neural Engine's programs compile.
     let mut refused = None;

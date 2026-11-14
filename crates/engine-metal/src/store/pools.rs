@@ -1291,6 +1291,22 @@ impl Pools {
         self.pool.span_segments()
     }
 
+    /// Whether the range's top `bytes` are backed for a fire's carve.
+    #[must_use]
+    pub fn covers(&self, bytes: u64) -> bool {
+        self.pool.covers(bytes)
+    }
+
+    /// Gives back the carve past the range's top `bytes`.
+    ///
+    /// # Safety
+    ///
+    /// As [`Pool::narrow`].
+    pub unsafe fn narrow(&mut self, bytes: u64) -> Result<()> {
+        // SAFETY: the caller's contract.
+        unsafe { self.pool.narrow(bytes) }
+    }
+
     /// Backs the span's top `segments` for state ([`Pool::commit_span`]).
     pub fn commit_span(&mut self, segments: u32) -> Result<()> {
         self.pool.commit_span(segments)
