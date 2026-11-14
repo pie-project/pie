@@ -82,24 +82,29 @@ fn a_lane_with_a_page_in_every_buffer_serves_the_seats_logits() {
     }
     let fixture = fixture_of("qwen3-micro-text", None);
 
-    // Buffers of two segments each: the last holds a segment of state
-    // under the span's.
-    let probe = load(&fixture, Some(1280 << 20)).pool_chunk_facts();
-    let part_bytes = 2 * u64::from(probe.segment_chunks) * probe.chunk_bytes;
-    engine_metal::store::pool::cap_parts(part_bytes);
-    let mut shell = load(&fixture, Some(1280 << 20));
+    // Buffers of one segment each: the last is the span's, whose state
+    // under the activation is backed from the top.
+    engine_metal::store::pool::cap_parts(1);
+    let mut shell = load(&fixture, Some(640 << 20));
     let (ids, parts) = shell.page_ids();
     let facts = shell.pool_chunk_facts();
     let layout = shell.pool_layout();
-    let segment = 2 * facts.segment_chunks;
+    let segment = facts.segment_chunks;
+    let act = layout.act_span();
     let list = layout.list.expect("a kv list");
     let page = shell.paging().page_size.max(1);
-    // A page in each buffer's lower segment, past the seats' runs.
+    // A page in each buffer's middle, past the seats' runs; the last's under
+    // the activation.
     let chunks: Vec<u32> = (0..parts as u32)
         .map(|b| {
             let first = b * segment;
             let from = first.max(layout.free_chunk());
-            from + (first + segment / 2 - from) / 2
+            let end = if b + 1 == parts as u32 {
+                facts.total_chunks - act
+            } else {
+                first + segment
+            };
+            from + (end - from) / 2
         })
         .collect();
     assert!(
@@ -108,8 +113,13 @@ fn a_lane_with_a_page_in_every_buffer_serves_the_seats_logits() {
         31 - ids.part_shift
     );
     shell
-        .commit_segments(2 * parts as u32 - 1)
+        .commit_segments(parts as u32 - 1)
         .expect("every segment under the span's commits");
+    // Each buffer maps whole tiles of its own length past its share of the
+    // range; the budget counts them, so the span's segment backs state.
+    shell
+        .commit_span(1)
+        .expect("the span's segment backs state");
     let per = facts.shape(LIST).expect("a kv list").slots_per_chunk;
     let pages: Vec<u32> = chunks.iter().map(|&chunk| chunk * per + per / 2).collect();
     // The last buffer's page: its id names that buffer over the part bits

@@ -1142,6 +1142,22 @@ impl PreparedLoad<'_> {
                 )));
             }
             let mut total = total;
+            // Each buffer maps whole tiles of its own length, past its share
+            // of the range where its chunks do not end on a tile: the room
+            // the range fills holds that too, so the range gives up as many
+            // chunks as it takes (fewer chunks map no more).
+            let slack = crate::store::pool::mapped_bytes(chunk, total, per)
+                .saturating_sub(chunk * u64::from(total));
+            total = total
+                .saturating_sub(u32::try_from(slack.div_ceil(chunk.max(1))).unwrap_or(u32::MAX));
+            if total < least.saturating_add(span).saturating_add(tables_chunks) {
+                return Err(Fault::Residency(format!(
+                    "one working set takes {least} chunks of {chunk} bytes beside the \
+                     activation's {span} and the tables' {tables_chunks}, and the room holds \
+                     {total} once the buffers' whole tiles ({slack} bytes past the range) are \
+                     counted"
+                )));
+            }
             // The last buffer holds the span: a leftover too small for it
             // goes, at most one span and segment of state.
             let left = total % per;
@@ -1181,9 +1197,14 @@ impl PreparedLoad<'_> {
             let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
             // The state's bytes: the span above them is the fire's, which
             // the accounting already counts.
+            // Each buffer maps whole tiles of its own length: what the
+            // buffers map past the range's bytes is state memory the load
+            // admits as well.
+            let tiles = crate::store::pool::mapped_bytes(chunk, total, per)
+                .saturating_sub(chunk * u64::from(total));
             (
                 paging_at(pages, boot.slots)?,
-                chunk * u64::from(total - span - tables_chunks),
+                chunk * u64::from(total - span - tables_chunks) + tiles,
                 layout,
             )
         };
