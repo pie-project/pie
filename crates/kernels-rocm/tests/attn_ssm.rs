@@ -357,18 +357,20 @@ fn attn_ssm() {
         indptr: gpu.column(&indptr),
     };
     let mut y = gpu.zeros(total as u32, (vh * g.v_dim) as u32, Dtype::F32);
-    ssm::gated_delta_chunked(
-        &ctx,
-        qkv_t,
-        Tensor::ABSENT,
-        gpu.tensor(&gt, total as u32, 2 * vh as u32, Dtype::F32),
-        &state,
-        g.k_heads as u32,
-        vh as u32,
-        g.k_dim as u32,
-        g.v_dim as u32,
-        &mut y,
-    )
+    gpu.laid(&ctx, |ctx| {
+        ssm::gated_delta_chunked(
+            ctx,
+            qkv_t,
+            Tensor::ABSENT,
+            gpu.tensor(&gt, total as u32, 2 * vh as u32, Dtype::F32),
+            &state,
+            g.k_heads as u32,
+            vh as u32,
+            g.k_dim as u32,
+            g.v_dim as u32,
+            &mut y,
+        )
+    })
     .unwrap();
     let got = gpu.read(&y);
     let got_slab = gpu.read(&slab);

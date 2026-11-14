@@ -275,19 +275,21 @@ fn an_expert_table_costs_a_select_next_to_nothing() {
     let fire = |table: ExpertTable| {
         let (x, r) = (t(f.x, tokens, k, Bf16), t(f.r, tokens, top, I32));
         let mut y = t(f.y, tokens * top, n, Bf16);
-        moe::select_fp8_w8a16(
-            &ctx,
-            "test",
-            x,
-            planes[0].base,
-            planes[1].base,
-            ex as u32,
-            128,
-            r,
-            &mut y,
-            None,
-            table,
-        )
+        g.laid(&ctx, |ctx| {
+            moe::select_fp8_w8a16(
+                ctx,
+                "test",
+                x,
+                planes[0].base,
+                planes[1].base,
+                ex as u32,
+                128,
+                r,
+                &mut y,
+                None,
+                table,
+            )
+        })
         .expect("the W8A16 select fires");
     };
     let time = |g: &Gpu, table: ExpertTable| {

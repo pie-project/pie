@@ -84,7 +84,8 @@ fn linear_matmul() {
             .collect();
         let bt = gpu.tensor(&b, 1, n, Dtype::Bf16);
         let mut y = gpu.zeros(m, n, Dtype::Bf16);
-        gemm::matmul_bias(&ctx, at, wt, bt, &mut y).unwrap();
+        gpu.laid(&ctx, |ctx| gemm::matmul_bias(ctx, at, wt, bt, &mut y))
+            .unwrap();
         // The sum can cancel: hold it to the operands' scale, two bf16
         // roundings (the product's and the sum's) of the larger operand.
         let got = gpu.read(&y);
@@ -178,7 +179,8 @@ fn the_batch_engine_projection() {
         let at = gpu.tensor(&a, m, k, Dtype::Bf16);
         let wt = gpu.tensor(&w, n, k, Dtype::Bf16);
         let mut y = gpu.zeros(m, n, Dtype::Bf16);
-        gemm::matmul(&ctx, at, wt, &mut y).unwrap();
+        gpu.laid(&ctx, |ctx| gemm::matmul(ctx, at, wt, &mut y))
+            .unwrap();
         close_bf16(
             &format!("batch matmul {m}x{n}x{k}"),
             &gpu.read(&y),
@@ -293,7 +295,8 @@ fn the_f32_projection_lands_unrounded() {
         let at = gpu.tensor(&a, m, k, Dtype::Bf16);
         let wt = gpu.tensor(&w, n, k, Dtype::Bf16);
         let mut y = gpu.zeros(m, n, Dtype::F32);
-        gemm::matmul_f32(&ctx, at, wt, &mut y).unwrap();
+        gpu.laid(&ctx, |ctx| gemm::matmul_f32(ctx, at, wt, &mut y))
+            .unwrap();
         let want = reference(&a, &w, None, m as usize, n as usize, k as usize);
         for (i, (h, w)) in gpu.read(&y).iter().zip(&want).enumerate() {
             assert!(
@@ -333,7 +336,10 @@ fn the_live_lm_head_multiplies_the_live_rows() {
     for live in [7u32, 40, 150, 192] {
         let count = gpu.upload(&[live], 1, 1, Dtype::I32);
         let mut y = gpu.tensor(&vec![3.0; (m * n) as usize], m, n, Dtype::Bf16);
-        gemm::lm_head_live(&ctx, at, wt, count.ptr, &mut y).unwrap();
+        gpu.laid(&ctx, |ctx| {
+            gemm::lm_head_live(ctx, at, wt, count.ptr, &mut y)
+        })
+        .unwrap();
         let got = gpu.read(&y);
         let rows = (live * n) as usize;
         close_bf16(&format!("live {live}"), &got[..rows], &want[..rows], 2.0);

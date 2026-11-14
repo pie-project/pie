@@ -229,20 +229,22 @@ fn bind(gpu: &Gpu, g: Geo, inp: &Inputs, rows: usize, seats: &Seats) -> Bound {
 }
 
 fn step(gpu: &Gpu, ctx: &Ctx, g: Geo, bd: &mut Bound) {
-    ssm::kda(
-        ctx,
-        bd.mixed,
-        bd.f,
-        bd.b,
-        bd.dt_bias,
-        bd.a_log,
-        &bd.state,
-        g.heads as u32,
-        g.d as u32,
-        EPS,
-        g.floor,
-        &mut bd.y,
-    )
+    gpu.laid(ctx, |ctx| {
+        ssm::kda(
+            ctx,
+            bd.mixed,
+            bd.f,
+            bd.b,
+            bd.dt_bias,
+            bd.a_log,
+            &bd.state,
+            g.heads as u32,
+            g.d as u32,
+            EPS,
+            g.floor,
+            &mut bd.y,
+        )
+    })
     .unwrap();
     gpu.sync();
 }
@@ -258,23 +260,26 @@ fn chunked(gpu: &Gpu, ctx: &Ctx, g: Geo, bd: &mut Bound, indptr: &[i32], scan: S
         Scan::Serial => ssm::kda_chunked_serial,
         Scan::Chunked => ssm::kda_chunked,
     };
-    run(
-        ctx,
-        RaggedTensor {
-            data: bd.mixed,
-            indptr: gpu.column(indptr),
-        },
-        bd.f,
-        bd.b,
-        bd.dt_bias,
-        bd.a_log,
-        &bd.state,
-        g.heads as u32,
-        g.d as u32,
-        EPS,
-        g.floor,
-        &mut bd.y,
-    )
+    let mixed = RaggedTensor {
+        data: bd.mixed,
+        indptr: gpu.column(indptr),
+    };
+    gpu.laid(ctx, |ctx| {
+        run(
+            ctx,
+            mixed,
+            bd.f,
+            bd.b,
+            bd.dt_bias,
+            bd.a_log,
+            &bd.state,
+            g.heads as u32,
+            g.d as u32,
+            EPS,
+            g.floor,
+            &mut bd.y,
+        )
+    })
     .unwrap();
     gpu.sync();
 }

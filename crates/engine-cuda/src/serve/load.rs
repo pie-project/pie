@@ -1413,16 +1413,12 @@ impl Shell {
         // the compositions the lattice fires before the range is first
         // backed: every slab is laid in the activation's span, past its
         // arenas, at the size the walk asked of it. A take answers its
-        // place, and nothing grows by allocation. The fit comes after, so
+        // place, and nothing is allocated for it. The fit comes after, so
         // the cache rows take what the walk leaves.
         if shell.pools.fresh()
             && let Some(walked) = shell.size_arming()?
         {
-            let placed: Vec<(kernels_cuda::jit::SlabKey, usize)> = walked
-                .keys
-                .iter()
-                .map(|slab| (slab.key, slab.asked))
-                .collect();
+            let placed = walked.placed();
             let workspace = kernels_cuda::jit::Slabs::placed_bytes(&placed) as u64;
             if let Some(buffers) = shell.buffers.as_mut() {
                 buffers.lay_reach(&mut shell.pools, true)?;
@@ -1528,16 +1524,6 @@ impl Shell {
         // the shell drops its contexts' slabs with them.
         unsafe {
             kernels_cuda::jit::Slabs::place(base as *mut core::ffi::c_void, &workspace.slabs);
-        }
-        // Every slab this shell's fires take is laid: none grows.
-        self.device.ctx().slabs().seal();
-        for ctx in self
-            .device
-            .conditional_ctx()
-            .into_iter()
-            .chain(self.device.side_ctx())
-        {
-            ctx.slabs().seal();
         }
         Ok(())
     }
@@ -1668,14 +1654,8 @@ impl Staged {
                 );
             }
             eprintln!(
-                "[arm-trace] after arming: {} MiB asked past the laid workspaces; slabs grown by \
-                 allocation: {}",
+                "[arm-trace] after arming: {} MiB asked past the laid workspaces",
                 kernels_cuda::jit::Slabs::unplaced_bytes() >> 20,
-                kernels_cuda::jit::Slabs::census()
-                    .iter()
-                    .map(|(name, bytes)| format!("{name}={}K", bytes >> 10))
-                    .collect::<Vec<String>>()
-                    .join(" ")
             );
         }
         shell.card = (device_total, free_before, held_for_fires);
@@ -1740,10 +1720,6 @@ fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
         readout: shell.readout_rows.bytes() as u64,
         cache_rows: shell.pools.committed_bytes(),
         bodies: shell.cache.body_stats().census.bytes as u64,
-        scratch: kernels_cuda::jit::Slabs::census()
-            .iter()
-            .map(|(_, bytes)| *bytes as u64)
-            .sum(),
     }
 }
 
@@ -1822,7 +1798,6 @@ fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory:
     }
     ledger.enter(Class::Fire, "inputs", held.inputs);
     ledger.enter(Class::Fire, "readout rows", held.readout);
-    ledger.enter(Class::Fire, "grown slabs", held.scratch);
     // The heaps' chunks are this process's whatever load made them, and a
     // load carves its own cells from them (the readout rows among them),
     // so they are entered whole, less the cells entered by their owners,
@@ -1884,7 +1859,6 @@ struct Footprint {
     readout: u64,
     cache_rows: u64,
     bodies: u64,
-    scratch: u64,
 }
 
 impl core::fmt::Display for Footprint {
@@ -1893,7 +1867,7 @@ impl core::fmt::Display for Footprint {
             f,
             "the device holds {} bytes, {} of them in use before this load began; this load \
              put down weights {}, activation arena {}, inputs {}, buffered activations {}, \
-             readout rows {}, cache rows {}, graph bodies {}, kernel scratch {}",
+             readout rows {}, cache rows {}, graph bodies {}",
             self.total,
             self.before,
             self.weights,
@@ -1903,7 +1877,6 @@ impl core::fmt::Display for Footprint {
             self.readout,
             self.cache_rows,
             self.bodies,
-            self.scratch,
         )
     }
 }

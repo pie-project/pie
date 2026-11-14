@@ -1294,18 +1294,11 @@ impl Shell {
         })
     }
 
-    /// What arming the lattice will grow its kernels' scratch slabs by,
-    /// past what they hold now: each composition arming would capture,
-    /// fired once, size-only (`crate::sizing`), in arming's order, so each
-    /// slab grows as arming will grow it. Nothing launches, copies or
-    /// commits; the fit holds this for arming in place of a guess.
+    /// The scratch slabs this load's fires take: each composition of the
+    /// lattice fired once, size-only (`crate::sizing`), in arming's order.
+    /// Nothing launches, copies or commits; the slabs are laid at what the
+    /// walk asked before any fire runs, and none is allocated later.
     pub(super) fn size_arming(&mut self) -> Result<Option<crate::sizing::Footprint>> {
-        // A load that records no body walks every fire it serves, and a
-        // walked fire's slabs are sized by what it routes: only a recorded
-        // body's are the ceilings this walk states.
-        if !(self.records_bodies() && Self::keyable_units(&self.compiled)) {
-            return Ok(None);
-        }
         let Some(LatticeTargets { targets, .. }) = self.lattice_targets() else {
             return Ok(None);
         };
@@ -1879,8 +1872,6 @@ impl Shell {
             )));
         }
         if super::diag::on().arm_trace {
-            let slabs = kernels_cuda::jit::Slabs::census();
-            let total: usize = slabs.iter().map(|(_, bytes)| *bytes).sum();
             let free = crate::device::free_bytes().unwrap_or(0);
             eprintln!(
                 "[arm-trace] device memory: free {} MiB; arena committed {} MiB, inputs reserve {} MiB, buffered activations {} MiB, readout rows {} MiB, rs scratch {} MiB, pool committed {} MiB",
@@ -1894,16 +1885,6 @@ impl Shell {
                     .map_or(0, |buffers| buffers.scratch_bytes())
                     >> 20,
                 self.pools.committed_bytes() >> 20,
-            );
-            eprintln!(
-                "[arm-trace] scratch slabs {} MiB: {}",
-                total >> 20,
-                slabs
-                    .iter()
-                    .take(12)
-                    .map(|(name, bytes)| format!("{name}={}", bytes >> 20))
-                    .collect::<Vec<String>>()
-                    .join(" ")
             );
         }
         if !st.verify && !matches!(seal, Seal::Open) {

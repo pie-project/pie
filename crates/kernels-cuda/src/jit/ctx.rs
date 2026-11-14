@@ -174,18 +174,9 @@ impl Slabs {
         }
     }
 
-    /// From here on this arena's takes answer only the slabs laid for it
-    /// ([`Slabs::place`]): one past them faults rather than allocate.
-    pub fn seal(&self) {
-        #[cfg(feature = "cuda")]
-        {
-            crate::jit::device::seal(self.id());
-        }
-    }
-
     /// The bytes takes asked past what was placed for them (a slab not
-    /// placed, or placed smaller) since the process began: what still grows
-    /// by allocation.
+    /// placed, or placed smaller) since the process began: each one a
+    /// launch refused.
     #[must_use]
     pub fn unplaced_bytes() -> usize {
         #[cfg(feature = "cuda")]
@@ -195,18 +186,6 @@ impl Slabs {
         #[cfg(not(feature = "cuda"))]
         {
             0
-        }
-    }
-
-    #[must_use]
-    pub fn census() -> Vec<(&'static str, usize)> {
-        #[cfg(feature = "cuda")]
-        {
-            crate::jit::device::census()
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            Vec::new()
         }
     }
 
@@ -231,13 +210,15 @@ impl Slabs {
         }
     }
 
-    /// Frees every slab these arenas hold.
+    /// Forgets the slabs laid for these arenas; their memory is the placing
+    /// caller's to free.
     ///
     /// # Safety
     ///
-    /// Nothing reads the slabs again: no `Ctx` carrying them fires after
-    /// this, and no graph captured on their stream is replayed. A `Slabs` is
-    /// `Copy`, so that is the caller's to keep across every copy.
+    /// Nothing reads the slabs again through these arenas: no `Ctx` carrying
+    /// them fires after this, and no graph captured on their stream is
+    /// replayed. A `Slabs` is `Copy`, so that is the caller's to keep across
+    /// every copy.
     pub unsafe fn release(self) {
         #[cfg(feature = "cuda")]
         {
@@ -316,7 +297,7 @@ impl Ctx {
 
     /// Launches that run in `owner`'s order — a conditional body, captured
     /// on its own stream and replayed inside `owner`'s graph — share
-    /// `owner`'s per-stream slabs, so what a load warmed there serves them.
+    /// `owner`'s per-stream slabs, so what a load laid there serves them.
     #[must_use]
     pub const fn in_order_of(mut self, owner: *mut c_void) -> Self {
         self.owner = owner;
@@ -433,7 +414,6 @@ impl Ctx {
             crate::jit::device::take(
                 self.slabs.0,
                 self.stream,
-                self.stream,
                 name,
                 self.region.get(),
                 bytes,
@@ -450,8 +430,7 @@ impl Ctx {
     /// A slab one per stream, whatever region asks: for a tile a launch
     /// fills and the next launch on the same stream consumes, so a model
     /// with hundreds of such regions holds one tile a stream, not one a
-    /// region. A capture sees the slab as it was warmed, so arming fires
-    /// the widest plane eagerly first.
+    /// region.
     pub fn scratch_stream(
         &self,
         op: &'static str,
@@ -462,7 +441,6 @@ impl Ctx {
         {
             crate::jit::device::take(
                 self.slabs.0,
-                self.stream,
                 self.owner,
                 name,
                 NO_REGION,
@@ -477,8 +455,8 @@ impl Ctx {
         }
     }
 
-    /// [`Ctx::scratch_stream`], zeroed when fresh: for counts a kernel
-    /// leaves at zero between launches.
+    /// [`Ctx::scratch_stream`] for counts a kernel leaves at zero between
+    /// launches: a slab is laid zeroed, so every take finds them zero.
     pub fn scratch_stream_zeroed(
         &self,
         op: &'static str,
@@ -487,9 +465,8 @@ impl Ctx {
     ) -> Result<*mut c_void, Error> {
         #[cfg(feature = "cuda")]
         {
-            crate::jit::device::take_zeroed(
+            crate::jit::device::take(
                 self.slabs.0,
-                self.stream,
                 self.owner,
                 name,
                 NO_REGION,
@@ -513,7 +490,7 @@ impl Ctx {
         #[cfg(feature = "cuda")]
         {
             let region = SHARED_REGION.saturating_sub(self.lane.get().min(1 << 8));
-            crate::jit::device::take(self.slabs.0, self.stream, self.stream, name, region, bytes)
+            crate::jit::device::take(self.slabs.0, self.stream, name, region, bytes)
                 .map_err(|fault| fault.at(op))
         }
         #[cfg(not(feature = "cuda"))]
@@ -646,7 +623,8 @@ impl Ctx {
             eprintln!("fire: {gap} {op} {}", fire.kernel.name);
         }
         self.issue(op, fire.kernel, fire.launch, args)?;
-        if COUNTING.load(std::sync::atomic::Ordering::Relaxed) {
+        // A size-only walk launches nothing.
+        if COUNTING.load(std::sync::atomic::Ordering::Relaxed) && !crate::sizing::active() {
             *FIRES
                 .lock()
                 .expect("fire count lock poisoned")
