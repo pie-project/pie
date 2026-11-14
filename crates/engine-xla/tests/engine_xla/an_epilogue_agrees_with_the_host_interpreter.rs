@@ -1057,7 +1057,7 @@ fn registration_compiles_every_pass(device: &Device) {
     let words = engine_xla::guest::carried_words(&plan.package);
     let per_lane: u32 = words
         .iter()
-        .map(|&(_, w)| engine_xla::guest::lower::cell_rows(w as usize) as u32)
+        .map(|&(_, w)| (engine_xla::guest::lower::cell_rows(w as usize) as u32).next_multiple_of(2))
         .sum();
     let pool_rows = per_lane * lanes + 8;
     let mut stages = Stages::default();
@@ -1101,7 +1101,7 @@ fn registration_compiles_every_pass(device: &Device) {
                 .iter()
                 .map(|&(c, w)| {
                     let first = at;
-                    at += engine_xla::guest::lower::cell_rows(w as usize) as u32;
+                    at += (engine_xla::guest::lower::cell_rows(w as usize) as u32).next_multiple_of(2);
                     (c, first)
                 })
                 .collect()
@@ -1446,7 +1446,7 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
     let words = engine_xla::guest::carried_words(&plan.package);
     let per_lane: u32 = words
         .iter()
-        .map(|&(_, w)| engine_xla::guest::lower::cell_rows(w as usize) as u32)
+        .map(|&(_, w)| (engine_xla::guest::lower::cell_rows(w as usize) as u32).next_multiple_of(2))
         .sum();
     let pool_rows = per_lane * lanes + 8;
     let sink_row = pool_rows - 8;
@@ -1457,7 +1457,7 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
                 .iter()
                 .map(|&(c, w)| {
                     let first = at;
-                    at += engine_xla::guest::lower::cell_rows(w as usize) as u32;
+                    at += (engine_xla::guest::lower::cell_rows(w as usize) as u32).next_multiple_of(2);
                     (c, first)
                 })
                 .collect()
@@ -1561,7 +1561,7 @@ fn a_guest_group_pass_is_timed() {
     let words = engine_xla::guest::carried_words(&plan.package);
     let per_lane: u32 = words
         .iter()
-        .map(|&(_, w)| engine_xla::guest::lower::cell_rows(w as usize) as u32)
+        .map(|&(_, w)| (engine_xla::guest::lower::cell_rows(w as usize) as u32).next_multiple_of(2))
         .sum();
     let pool_rows = per_lane * lanes + 8;
     let mut stages = Stages::default();
@@ -1582,7 +1582,7 @@ fn a_guest_group_pass_is_timed() {
                 .iter()
                 .map(|&(c, w)| {
                     let first = at;
-                    at += engine_xla::guest::lower::cell_rows(w as usize) as u32;
+                    at += (engine_xla::guest::lower::cell_rows(w as usize) as u32).next_multiple_of(2);
                     (c, first)
                 })
                 .collect()
