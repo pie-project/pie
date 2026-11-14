@@ -971,7 +971,19 @@ impl Pools {
                 offset,
             });
         }
-        let total = chunks_at(&layout, &paging, paging.pages(), paging.slots);
+        let asked = chunks_at(&layout, &paging, paging.pages(), paging.slots);
+        // The range is every chunk the pool's ceiling backs: the cache
+        // rows' demand is `asked`, and what the guests' instances and
+        // rings take of the pool is known to no load. A range mapped on
+        // demand only reserves the addresses. A stated budget is the
+        // pool's whole, so its range is what was asked.
+        let total = if budget.is_none() && elastic::mapped_on_demand() {
+            let act =
+                u32::try_from(activation.div_ceil(layout.chunk_bytes.max(1))).unwrap_or(u32::MAX);
+            asked.max(chunks::Chunks::ceiling(&pool, &layout, act))
+        } else {
+            asked
+        };
         let chunks = chunks::Chunks::reserve(&pool, layout, total, activation)?;
         Ok(Pools {
             pool,
@@ -995,7 +1007,7 @@ impl Pools {
             pooled,
             paging,
             asked: paging.pages(),
-            asked_chunks: total,
+            asked_chunks: asked,
             ceiling: paging.pages(),
             budget,
             fitted: total,
@@ -1327,6 +1339,34 @@ impl Pools {
                      model, or free what else holds the device."
                 )));
             }
+        };
+        // The room counts every backed byte as the pool's to reuse, and a
+        // span held elsewhere in the range (the boundary of an earlier fit,
+        // a workspace) is not under the chunks fitted. What backing these
+        // chunks really asks of the card is counted from the range itself,
+        // and the fit is the most chunks whose growth the card holds beside
+        // the activation still to back and what is held for the bodies.
+        let fitted = if elastic::mapped_on_demand() {
+            let page = self.pool.page_bytes().max(1);
+            let unbacked = if settled {
+                0
+            } else {
+                self.chunks.activation_unheld_bytes()
+            };
+            let have = (self.pool.spare_bytes(0)? / page)
+                .saturating_sub(unbacked.saturating_add(held).div_ceil(page));
+            let mut fitted = fitted;
+            while fitted > least {
+                let growth = self.chunks.growth_for(fitted)?;
+                if growth <= have {
+                    break;
+                }
+                let over = (growth - have).saturating_mul(page).div_ceil(chunk);
+                fitted = fitted.saturating_sub(u32::try_from(over).unwrap_or(u32::MAX).max(1));
+            }
+            fitted.max(least)
+        } else {
+            fitted
         };
         self.fitted = fitted;
         // The kv pages the shell's own seats may name: what the chunks hold
