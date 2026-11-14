@@ -511,7 +511,11 @@ impl<I: PoolId> ShapePool<I> {
 #[derive(Debug)]
 pub struct Seats {
     slots: SlotPool,
+    /// The seats there are in all.
     capacity: u32,
+    /// The seats are the model's state slots, not the fixed count a model
+    /// without any gets.
+    of_state_slots: bool,
     held: HashMap<WorkingSetId, Vec<Slot>>,
     /// A working set let its seats go: a fire short of seats looks again.
     freed: Arc<tokio::sync::Notify>,
@@ -524,17 +528,31 @@ const SEATS_UNBOUNDED: u32 = 1 << 16;
 pub struct SeatsShort {
     pub need: u32,
     pub have: u32,
+    /// The seats there are in all.
     pub capacity: u32,
+    /// The seats are the model's state slots; `false` for a model with
+    /// none, whose seats are the fixed count of [`SEATS_UNBOUNDED`].
+    pub of_state_slots: bool,
 }
 
 impl std::fmt::Display for SeatsShort {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "this fire seats {} more sequence(s) than the pools have room for \
-             ({} seat(s) free of the {} the state slots give)",
-            self.need, self.have, self.capacity
-        )
+        if self.of_state_slots {
+            write!(
+                formatter,
+                "this fire seats {} more sequence(s) than the pools have room for \
+                 ({} seat(s) free of the {} the state slots give)",
+                self.need, self.have, self.capacity
+            )
+        } else {
+            write!(
+                formatter,
+                "this fire seats {} more sequence(s) than a model without state \
+                 slots seats at once ({} seat(s) free of {}, a fixed count: such \
+                 a model's seats take no memory)",
+                self.need, self.have, self.capacity
+            )
+        }
     }
 }
 
@@ -562,7 +580,8 @@ impl Seats {
                 act_chunks: Vec::new(),
                 span_on_demand: false,
             }),
-            capacity: state_slots,
+            capacity,
+            of_state_slots: state_slots != 0,
             held: HashMap::new(),
             freed: Arc::new(tokio::sync::Notify::new()),
         }
@@ -581,6 +600,7 @@ impl Seats {
                     need,
                     have: self.slots.available(0) as u32,
                     capacity: self.capacity,
+                    of_state_slots: self.of_state_slots,
                 })?;
             self.held.entry(ws).or_default().extend(fresh);
         }
@@ -857,5 +877,48 @@ impl Meter for SlotMeter {
             };
         }
         Some(sum)
+    }
+}
+
+#[cfg(test)]
+mod seats_tests {
+    use super::{SEATS_UNBOUNDED, Seats};
+    use crate::store::genmap::GenMap;
+    use crate::store::kv::page_table::WorkingSetId;
+
+    fn working_set() -> WorkingSetId {
+        GenMap::<_, ()>::new().insert(())
+    }
+
+    /// A fire past a stateless model's seats is refused with the seats
+    /// there are and why, not "0 of the 0 the state slots give".
+    #[test]
+    fn a_stateless_model_short_of_seats_names_its_real_count() {
+        let mut seats = Seats::new(0);
+        let short = seats
+            .seats(working_set(), SEATS_UNBOUNDED as usize + 1)
+            .unwrap_err();
+        assert_eq!(short.capacity, SEATS_UNBOUNDED);
+        assert_eq!(short.have, SEATS_UNBOUNDED);
+        assert!(!short.of_state_slots);
+        let message = short.to_string();
+        assert!(
+            message.contains(&format!("free of {SEATS_UNBOUNDED}"))
+                && message.contains("without state slots"),
+            "{message}"
+        );
+    }
+
+    /// A model with state slots keeps the message that names them.
+    #[test]
+    fn a_stateful_model_short_of_seats_names_its_state_slots() {
+        let mut seats = Seats::new(4);
+        let short = seats.seats(working_set(), 5).unwrap_err();
+        assert_eq!((short.need, short.have, short.capacity), (5, 4, 4));
+        assert!(
+            short
+                .to_string()
+                .contains("4 seat(s) free of the 4 the state slots give")
+        );
     }
 }
