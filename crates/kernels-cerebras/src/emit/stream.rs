@@ -315,7 +315,8 @@ pub fn emit(p: &Program) -> R<Emitted> {
         // the CX roots
         // a file a root: its lane words are its own chunk's
         for j in 0..su.rows() {
-            let (name, text, cx_arrays, regions) = root_file(p, ui, b, &r, Side::Row, j)?;
+            let (name, text, cx_arrays, regions) = root_file(p, ui, b, &r, Side::Row, j)
+                .map_err(|e| format!("{}: CX root {j}: {e}", b.unit.name))?;
             files.push((name.clone(), text));
             for rg in regions {
                 if !files.iter().any(|(n, _)| *n == rg.0) {
@@ -330,7 +331,8 @@ pub fn emit(p: &Program) -> R<Emitted> {
         }
         // the CY roots
         for i in 0..su.cols() {
-            let (name, text, cy_arrays, regions) = root_file(p, ui, b, &r, Side::Col, i)?;
+            let (name, text, cy_arrays, regions) = root_file(p, ui, b, &r, Side::Col, i)
+                .map_err(|e| format!("{}: CY root {i}: {e}", b.unit.name))?;
             files.push((name.clone(), text));
             files.extend(regions);
             let c = su.cy(i);
@@ -359,7 +361,7 @@ pub fn emit(p: &Program) -> R<Emitted> {
     // the lane root
     if let Some(lb) = &s.lanes {
         let lu = &s.units[lb.unit];
-        let c = Coord::new(lu.x, 1 + s.py);
+        let c = Coord::new(lu.x, lu.y + 1 + s.py);
         let gin = match ep(p, c, LANE_GATHER) {
             Some(Endpoint::Root(r)) => r.hi.map_or(0, |c| c.0),
             _ => return Err("stream: the lane root gathers nothing".into()),
@@ -763,6 +765,10 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                     for (from, len) in mine(*value, w) {
                         hin_parts.push((value.0, from, len));
                         g.loc(*value, from, len, "D_hin", &format!("t * HINW + {hin_w}"));
+                        if held(*value) {
+                            // the host's rows stay whole: read again after the barrier
+                            g.held_loc(*value, from, len, "D_hin", &format!("t * HINW + {hin_w}"));
+                        }
                         hin_w += len;
                     }
                 } else {

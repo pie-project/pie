@@ -43,7 +43,7 @@ const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <
      --build <dir> [--fabric simulator|system]\n       wafer-compile cost --plan <plan.json>\n       \
      wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]\n       \
      wafer-compile stream --model <deployment> [--reading R] [--rows N] [--ieee] --out <dir> \
-     [--values <dir>] [--stages N] [--tap v,..]";
+     [--values <dir>] [--stages N] [--tap v,..] [--py N]";
 
 fn main() {
     if let Err(e) = run() {
@@ -220,7 +220,8 @@ fn search(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `stream --model <name> [--reading denoise] [--rows 64] [--ieee] --out <dir> [--values <dir>]`:
+/// `stream --model <name> [--reading denoise] [--rows 64] [--ieee] [--py N] --out <dir>
+/// [--values <dir>]`:
 /// a stream reading's wafer program (kernels-cerebras `stream::compile`); with a step's captured
 /// values, the host's files for a run of it (`tools/wafer/stream/run.py`).
 fn stream(args: &[String]) -> Result<(), String> {
@@ -249,12 +250,17 @@ fn stream(args: &[String]) -> Result<(), String> {
         .map(|s| s.parse::<usize>())
         .transpose()
         .map_err(|e| format!("--stages: {e}"))?;
+    let py = get("--py")
+        .map(|s| s.parse::<u32>())
+        .transpose()
+        .map_err(|e| format!("--py: {e}"))?;
     let o = kernels_cerebras::stream::Options {
         reading: reading.clone(),
         rows,
         round16: !ieee,
         upto,
         taps,
+        py,
     };
     let p = kernels_cerebras::stream::compile(
         &trace,
@@ -263,11 +269,12 @@ fn stream(args: &[String]) -> Result<(), String> {
         values.as_deref().map(std::path::Path::new),
     )?;
     println!(
-        "{model} {reading}: {} units, {} K / V columns, {} x {} PEs, {} lane words",
+        "{model} {reading}: {} units, {} K / V columns, {} x {} PEs, py {}, {} lane words",
         p.units.len(),
         p.stream.kv.len(),
         p.stream.w,
         p.stream.h,
+        p.stream.py,
         p.lane_words
     );
     Ok(())

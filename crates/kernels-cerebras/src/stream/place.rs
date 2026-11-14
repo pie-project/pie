@@ -21,6 +21,8 @@ type R<T> = Result<T, String>;
 
 /// A tile's 16-bit words a weight PE holds at most.
 pub const TILE_BUDGET: u32 = 12_288;
+/// Column roots a unit takes at most besides its head roots (a CS-3 is 750 PEs wide).
+pub const MAX_REST: u32 = 512;
 /// A root's words of held rows (host rows in and out, rows held across the barrier) at most.
 pub const ROOT_BUDGET: u32 = 6_144;
 
@@ -400,7 +402,7 @@ fn held_words(u: &Unit, l: &Layout, col: u32) -> u32 {
 
 /// `u`'s layout: the fewest rest roots whose every tile and held rows fit.
 pub fn layout(r: &Reader, u: &Unit, py: u32) -> R<Layout> {
-    for rest in 0..=64u32 {
+    for rest in 0..=MAX_REST {
         let Some(l) = layout_with(r, u, py, rest) else {
             continue;
         };
@@ -414,7 +416,7 @@ pub fn layout(r: &Reader, u: &Unit, py: u32) -> R<Layout> {
         }
     }
     Err(format!(
-        "{}: no column roots up to 64 fit its tiles ({TILE_BUDGET} words) and held rows",
+        "{}: no column roots up to {MAX_REST} fit its tiles ({TILE_BUDGET} words) and held rows",
         u.name
     ))
 }
@@ -491,7 +493,9 @@ pub fn schedule(
                 });
                 rows.extend((0..n).map(|k| (c, k)));
                 t += n;
-                if !*keep {
+                if *barrier {
+                    own.push(Block { class: c, n });
+                } else if !*keep {
                     next.push(Block { class: c, n });
                 }
             }
@@ -624,12 +628,17 @@ fn schedule_blocks(
         }
         let mut next = Vec::new();
         let mut own = Vec::new();
-        if *host && !*keep {
+        if *host {
             for &c in classes {
-                next.push(Block {
+                let b = Block {
                     class: c,
                     n: class_rows[c],
-                });
+                };
+                if *barrier {
+                    own.push(b);
+                } else if !*keep {
+                    next.push(b);
+                }
             }
         }
         for b in &stream {

@@ -90,30 +90,71 @@ impl Palette {
             classes.extend(l.classes());
         }
         let ids: Vec<Class> = classes.into_iter().collect();
-        if ids.len() > usize::from(u8::MAX) {
-            return Err(format!("colouring: {} classes", ids.len()));
-        }
-        // each class a colour of its own, to read its footprint off the laid routes
-        let own = Palette {
-            map: ids
-                .iter()
-                .enumerate()
-                .map(|(i, &c)| (c, Colour(i as u8)))
-                .collect(),
-        };
-        let routes = Lay::routes(floor, w, &own, u8::MAX)?;
         let n = ids.len();
+        let index: BTreeMap<Class, usize> = ids.iter().enumerate().map(|(i, &c)| (c, i)).collect();
+        // each class a colour of its own, to read its footprint off the laid routes: the links
+        // in batches whose classes fit a route word's colours (one batch up to 255 classes); a
+        // link's routes read only its own classes' colours
+        let mut batches: Vec<(Wiring, Vec<usize>)> = Vec::new();
+        {
+            let mut cur = Wiring::default();
+            let mut members: Vec<usize> = Vec::new();
+            for l in &w.links {
+                let mut add: Vec<usize> = l.classes().iter().map(|c| index[c]).collect();
+                add.retain(|i| !members.contains(i));
+                add.dedup();
+                if members.len() + add.len() > usize::from(u8::MAX) && !members.is_empty() {
+                    batches.push((std::mem::take(&mut cur), std::mem::take(&mut members)));
+                    add = l.classes().iter().map(|c| index[c]).collect();
+                    add.dedup();
+                }
+                for i in add {
+                    if !members.contains(&i) {
+                        members.push(i);
+                    }
+                }
+                cur.links.push(l.clone());
+            }
+            if !members.is_empty() || batches.is_empty() {
+                batches.push((cur, members));
+            }
+        }
         let mut meets = vec![BTreeSet::<usize>::new(); n];
         let pass = |r: &Route| !r.word.to_ramp() && r.word.0 & 0x80 == 0;
-        for (_, rs) in routes.iter() {
-            for (i, a) in rs.iter().enumerate() {
-                for b in &rs[i + 1..] {
-                    if a.word == b.word && pass(a) {
+        let mut at: BTreeMap<Coord, Vec<(usize, Route)>> = BTreeMap::new();
+        for (bw, members) in &batches {
+            if members.len() > usize::from(u8::MAX) {
+                return Err(format!("colouring: a link of {} classes", members.len()));
+            }
+            let own = Palette {
+                map: members
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &i)| (ids[i], Colour(k as u8)))
+                    .collect(),
+            };
+            let routes = Lay::routes(floor, bw, &own, u8::MAX)?;
+            for (p, rs) in routes.iter() {
+                if rs.is_empty() {
+                    continue;
+                }
+                let v = at.entry(p).or_default();
+                for r in rs {
+                    let g = members[usize::from(r.colour.0)];
+                    if !v.iter().any(|(x, y)| *x == g && y.word == r.word) {
+                        v.push((g, *r));
+                    }
+                }
+            }
+        }
+        for rs in at.values() {
+            for (i, (x, a)) in rs.iter().enumerate() {
+                for (y, b) in &rs[i + 1..] {
+                    if x == y || (a.word == b.word && pass(a)) {
                         continue;
                     }
-                    let (x, y) = (usize::from(a.colour.0), usize::from(b.colour.0));
-                    meets[x].insert(y);
-                    meets[y].insert(x);
+                    meets[*x].insert(*y);
+                    meets[*y].insert(*x);
                 }
             }
         }

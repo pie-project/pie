@@ -12,8 +12,15 @@
 //! chain and its links to each unit's head root; the lane gather and bus), every class its own,
 //! coloured by [`crate::fabric::Palette::allocate`] with no preferred colours.
 //!
-//! Unit `u` at x `x0`: CX root `j` at `(x0, 1 + j)`, weight PE `(i, j)` at `(x0 + 1 + i, 1 + j)`,
-//! CY root `i` at `(x0 + 1 + i, 1 + py)`; row 0 carries the lane bus.
+//! Unit `u` at `(x0, y0)`: CX root `j` at `(x0, y0 + 1 + j)`, weight PE `(i, j)` at
+//! `(x0 + 1 + i, y0 + 1 + j)`, CY root `i` at `(x0 + 1 + i, y0 + 1 + py)`; row 0 carries the lane
+//! bus.
+//!
+//! The units fill bands left to right, a band as high as a unit and its K / V columns, as many
+//! bands as the fabric's width asks for (no block split over two). The row stream from a band's
+//! last unit to the next band's first runs back west along each row `j`, turns south at column
+//! `x0 + 1 + j` of the next band's first unit (a staircase: no two rows' wires cross) and comes
+//! in from the east ([`Stream::wrap`]).
 
 use serde::Serialize;
 
@@ -33,6 +40,8 @@ pub struct StreamUnit {
     pub shape: UnitShape,
     /// Its CX column's x.
     pub x: u32,
+    /// Its band's top row (the lane bus row of band 0).
+    pub y: u32,
     /// Its CX roots all-reduce a row's sums (a row region's norm).
     pub segment: bool,
     /// On the row stream (the lane prologue's unit is not).
@@ -42,17 +51,17 @@ pub struct StreamUnit {
 impl StreamUnit {
     #[must_use]
     pub fn cx(&self, j: u32) -> Coord {
-        Coord::new(self.x, 1 + j)
+        Coord::new(self.x, self.y + 1 + j)
     }
 
     #[must_use]
     pub fn w(&self, i: u32, j: u32) -> Coord {
-        Coord::new(self.x + 1 + i, 1 + j)
+        Coord::new(self.x + 1 + i, self.y + 1 + j)
     }
 
     #[must_use]
     pub fn cy(&self, i: u32) -> Coord {
-        Coord::new(self.x + 1 + i, 1 + self.rows())
+        Coord::new(self.x + 1 + i, self.y + 1 + self.rows())
     }
 
     #[must_use]
@@ -93,6 +102,26 @@ pub struct LaneBus {
     pub to: Vec<Coord>,
 }
 
+/// The fabric a stream may take at most (the program, without the memcpy halo).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Bounds {
+    pub w: u32,
+    pub h: u32,
+}
+
+impl Bounds {
+    /// A WSE-3 system's fabric less the memcpy layouts' halo.
+    #[must_use]
+    pub fn system() -> Bounds {
+        let (w, h) = crate::toolchain::Arch::Wse3.system_fabric();
+        let ((hw, hh), _) = crate::toolchain::memcpy_fabric(0, 0);
+        Bounds {
+            w: w - hw,
+            h: h - hh,
+        }
+    }
+}
+
 /// The stream's elements.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Stream {
@@ -114,6 +143,8 @@ pub struct UnitAsk {
     pub cols: u32,
     pub segment: bool,
     pub on_path: bool,
+    /// It reads lane vectors on its row / column roots.
+    pub lanes: (bool, bool),
 }
 
 impl KvColumn {
@@ -121,7 +152,7 @@ impl KvColumn {
     #[must_use]
     pub fn root(&self, s: &Stream) -> Coord {
         let u = &s.units[self.units[0]];
-        Coord::new(u.x + 1 + self.head, s.py + 2 + self.head)
+        Coord::new(u.x + 1 + self.head, u.y + s.py + 2 + self.head)
     }
 
     /// Attention PE `k` of the column.
@@ -150,7 +181,7 @@ impl KvColumn {
 impl Stream {
     /// The elements `requests` ask for: `asks` the units (the lane prologue's first where
     /// `requests.lanes`), `blocks` the attending blocks (unit indices), `pya` attention PEs a
-    /// K / V column, `lane_to` the roots that hold a lane vector.
+    /// K / V column, within `bounds` (bands of units where one row of them is too wide).
     pub fn of(
         requests: &Requests,
         py: u32,
@@ -158,14 +189,36 @@ impl Stream {
         blocks: &[Vec<usize>],
         heads: u32,
         pya: u32,
-        lane_to: &[Coord],
+        bounds: Bounds,
     ) -> R<Stream> {
         if !requests.stream {
             return Err("stream floorplan: no row stream asked for".into());
         }
+        let band = py
+            + 2
+            + if requests.joint && !blocks.is_empty() {
+                heads + pya
+            } else {
+                0
+            };
+        // the last unit of the block each unit opens (a block's units share a band)
+        let block_end: Vec<usize> = (0..asks.len())
+            .map(|u| {
+                blocks
+                    .iter()
+                    .find(|b| b.first() == Some(&u))
+                    .and_then(|b| b.iter().max().copied())
+                    .unwrap_or(u)
+            })
+            .collect();
         let mut units = Vec::new();
-        let mut x = 0;
-        for a in asks {
+        let (mut x, mut y, mut w) = (0u32, 0u32, 0u32);
+        for (u, a) in asks.iter().enumerate() {
+            let span: u32 = asks[u..=block_end[u]].iter().map(|b| b.cols + 1).sum();
+            if x > 0 && x + span > bounds.w {
+                x = 0;
+                y += band;
+            }
             let mut col_runs = Vec::new();
             if a.heads > 0 {
                 col_runs.push(ColRun {
@@ -194,12 +247,32 @@ impl Stream {
                 name: a.name.clone(),
                 shape,
                 x,
+                y,
                 segment: a.segment,
                 on_path: a.on_path,
             });
             x += a.cols + 1;
+            w = w.max(x);
         }
+        let h = y + band;
         let path: Vec<usize> = (0..units.len()).filter(|&u| units[u].on_path).collect();
+        for p in path.windows(2) {
+            let (a, b) = (&units[p[0]], &units[p[1]]);
+            if a.y != b.y && a.x < b.x + py {
+                return Err(format!(
+                    "stream floorplan: {} ends its band at x {}: the row stream's turn to {} needs {py} columns",
+                    a.name, a.x, b.name
+                ));
+            }
+        }
+        if w > bounds.w || h > bounds.h {
+            return Err(format!(
+                "stream floorplan: {w} x {h} PEs ({} bands of {band} rows) over the {} x {} fabric",
+                y / band + 1,
+                bounds.w,
+                bounds.h
+            ));
+        }
         let mut kv = Vec::new();
         if requests.joint {
             for (b, blk) in blocks.iter().enumerate() {
@@ -218,13 +291,22 @@ impl Stream {
                 }
             }
         }
+        // the lane receivers: every root of a unit that reads lanes on that side
+        let mut lane_to: Vec<Coord> = Vec::new();
+        for (a, u) in asks.iter().zip(&units) {
+            if a.lanes.0 {
+                lane_to.extend((0..py).map(|j| u.cx(j)));
+            }
+            if a.lanes.1 {
+                lane_to.extend((0..u.cols()).map(|i| u.cy(i)));
+            }
+        }
         let lanes = requests.lanes.then(|| LaneBus {
             unit: 0,
-            to: lane_to.to_vec(),
+            to: lane_to,
         });
-        let h = py + 2 + if kv.is_empty() { 0 } else { heads + pya };
         Ok(Stream {
-            w: x,
+            w,
             h,
             py,
             units,
@@ -250,6 +332,20 @@ impl Stream {
             stores: Vec::new(),
             roles: crate::floor::Grid::filled(self.w, self.h, PeRole::IDLE),
         }
+    }
+
+    /// Row `j`'s wire from unit `a`'s CX root to unit `b`'s, `b` the first of a later band: west
+    /// along `a`'s row `j` to column `b.x + 1 + j`, south to `b`'s row `j`, west to its CX root.
+    /// Row `j` turns one column east of row `j - 1` and one row lower at both ends, so no two
+    /// rows' wires cross.
+    #[must_use]
+    pub fn wrap(a: &StreamUnit, b: &StreamUnit, j: u32) -> Vec<Coord> {
+        let turn = b.x + 1 + j;
+        let (ya, yb) = (a.y + 1 + j, b.y + 1 + j);
+        let mut pts: Vec<Coord> = (turn..=a.x).rev().map(|x| Coord::new(x, ya)).collect();
+        pts.extend((ya + 1..=yb).map(|y| Coord::new(turn, y)));
+        pts.extend((b.x..turn).rev().map(|x| Coord::new(x, yb)));
+        pts
     }
 
     /// Every link of the stream (see the module doc).
@@ -298,11 +394,21 @@ impl Stream {
         }
         for (k, pair_) in self.path.windows(2).enumerate() {
             let (a, b) = (&self.units[pair_[0]], &self.units[pair_[1]]);
+            let wrap = a.y != b.y;
             for j in 0..self.py {
-                let pts: Vec<Coord> = (a.x..=b.x).map(|x| Coord::new(x, 1 + j)).collect();
+                let pts = if wrap {
+                    Stream::wrap(a, b, j)
+                } else {
+                    (a.x..=b.x).map(|x| Coord::new(x, a.y + 1 + j)).collect()
+                };
+                let name = if wrap {
+                    format!("SW{k}")
+                } else {
+                    format!("SP{}", k % 2)
+                };
                 w.path(Path {
                     pts,
-                    class: class(&format!("SP{}", k % 2)),
+                    class: class(&name),
                     send: PATH_OUT,
                     recv: PATH_IN,
                 });
@@ -341,7 +447,7 @@ impl Stream {
         }
         if let Some(lb) = &self.lanes {
             let lu = &self.units[lb.unit];
-            let root = Coord::new(lu.x, 1 + self.py);
+            let root = Coord::new(lu.x, lu.y + 1 + self.py);
             let mut pts = vec![root];
             pts.extend((0..lu.cols()).map(|i| lu.cy(i)));
             w.chain(Chain {
@@ -451,4 +557,53 @@ pub fn kv_out(k: usize) -> Slot {
         Slot::io("skvo2"),
         Slot::io("skvo3"),
     ][k.min(3)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ask(name: &str, cols: u32, heads: u32) -> UnitAsk {
+        UnitAsk {
+            name: name.into(),
+            heads,
+            cols,
+            segment: false,
+            on_path: true,
+            lanes: (false, false),
+        }
+    }
+
+    /// Units too wide for one row of the fabric fill bands, a block never split over two; the
+    /// row stream's wires into a new band pass no PE twice and no two rows' wires meet.
+    #[test]
+    fn units_fill_bands_and_the_wraps_do_not_cross() {
+        let asks: Vec<UnitAsk> = (0..7).map(|u| ask(&format!("u{u}"), 9, 2)).collect();
+        let blocks = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
+        let requests = Requests {
+            stream: true,
+            joint: true,
+            ..Requests::default()
+        };
+        let s = Stream::of(&requests, 4, &asks, &blocks, 2, 3, Bounds { w: 32, h: 60 })
+            .unwrap_or_else(|e| panic!("{e}"));
+        let band = 4 + 2 + 2 + 3;
+        let ys: Vec<u32> = s.units.iter().map(|u| u.y).collect();
+        assert_eq!(ys, [0, 0, 0, band, band, 2 * band, 2 * band]);
+        assert_eq!((s.w, s.h), (30, 3 * band));
+        let (a, b) = (&s.units[2], &s.units[3]);
+        let wires: Vec<Vec<Coord>> = (0..4).map(|j| Stream::wrap(a, b, j)).collect();
+        for (j, w) in wires.iter().enumerate() {
+            assert_eq!(w[0], a.cx(j as u32));
+            assert_eq!(*w.last().unwrap(), b.cx(j as u32));
+            for p in w.windows(2) {
+                assert_eq!(p[0].x.abs_diff(p[1].x) + p[0].y.abs_diff(p[1].y), 1);
+            }
+            for v in &wires[j + 1..] {
+                assert!(w.iter().all(|c| !v.contains(c)));
+            }
+        }
+        // too narrow for a block: refused by name
+        assert!(Stream::of(&requests, 4, &asks, &blocks, 2, 3, Bounds { w: 15, h: 60 }).is_err());
+    }
 }

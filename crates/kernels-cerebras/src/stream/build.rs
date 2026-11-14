@@ -13,9 +13,8 @@ use super::place::{self, KvSched, Layout, UnitSched};
 use super::unit::{self, Reader, Side, Step, Unit};
 use crate::emit::region::{self, ParamAt, Place, Printed};
 use crate::fabric::{Fabric, Palette};
-use crate::floor::Coord;
 use crate::floorplan::Requests;
-use crate::floorplan::stream::{Stream, UnitAsk};
+use crate::floorplan::stream::{Bounds, Stream, UnitAsk};
 
 type R<T> = Result<T, String>;
 
@@ -139,12 +138,90 @@ pub fn program_upto(
     upto: Option<usize>,
     taps: &[u32],
 ) -> R<Program> {
+    program_py(trace, shape, round16, upto, taps, None)
+}
+
+/// The row roots a unit may take: the divisors of the hidden width that leave a CX root at
+/// least [`MIN_CHUNK`] columns and a band within the fabric's height.
+#[must_use]
+pub fn py_candidates(hidden: u32, bounds: Bounds) -> Vec<u32> {
+    (1..=hidden / MIN_CHUNK)
+        .filter(|&py| hidden.is_multiple_of(py) && py >= MIN_PY && py + 2 + PYA < bounds.h)
+        .collect()
+}
+
+/// A CX root's fewest columns of the row stream, a unit's fewest row roots.
+pub const MIN_CHUNK: u32 = 4;
+pub const MIN_PY: u32 = 4;
+
+/// [`program_upto`] at `py` row roots a unit, or (`None`) at the row roots the cost model
+/// prices lowest of those that build within the system fabric ([`py_candidates`]).
+pub fn program_py(
+    trace: &Trace,
+    shape: StreamShape,
+    round16: bool,
+    upto: Option<usize>,
+    taps: &[u32],
+    py: Option<u32>,
+) -> R<Program> {
+    let bounds = Bounds::system();
+    let hidden = shape.program.hidden;
+    let cands = match py {
+        Some(p) => vec![p],
+        None => py_candidates(hidden, bounds),
+    };
+    let tried: Vec<(u32, R<Program>)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = cands
+            .iter()
+            .map(|&p| {
+                let shape = shape.clone();
+                sc.spawn(move || (p, program_at(trace, shape, round16, upto, taps, p, bounds)))
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| (0, Err("panicked".into()))))
+            .collect()
+    });
+    let mut best: Option<(f64, Program)> = None;
+    let mut errs = Vec::new();
+    for (p, r) in tried {
+        match r {
+            Ok(prog) => {
+                let c = crate::cost::stream::time(&prog).cycles;
+                if best.as_ref().is_none_or(|(b, _)| c < *b) {
+                    best = Some((c, prog));
+                }
+            }
+            Err(e) => errs.push(format!("py {p}: {e}")),
+        }
+    }
+    best.map(|(_, p)| p).ok_or_else(|| {
+        if errs.is_empty() {
+            format!(
+                "{}: a hidden width of {hidden} cuts over no rows",
+                trace.name
+            )
+        } else {
+            errs.join("; ")
+        }
+    })
+}
+
+/// [`program_upto`] at `py` row roots a unit within `bounds`.
+pub fn program_at(
+    trace: &Trace,
+    shape: StreamShape,
+    round16: bool,
+    upto: Option<usize>,
+    taps: &[u32],
+    py: u32,
+    bounds: Bounds,
+) -> R<Program> {
     let prog = &shape.program;
     let name = &trace.name;
-    let py = prog.hidden / 16;
     if py == 0 || !prog.hidden.is_multiple_of(py) {
         return Err(format!(
-            "{name}: a hidden width of {} cuts over no rows",
+            "{name}: a hidden width of {} cuts over no {py} rows",
             prog.hidden
         ));
     }
@@ -432,21 +509,10 @@ pub fn program_upto(
                     )
                 }),
             on_path: !b.unit.classes.is_empty(),
+            lanes: b.lanes,
         })
         .collect();
-    // the lane receivers: every root of a unit that reads lanes on that side
-    let mut x = 0;
-    let mut lane_to: Vec<Coord> = Vec::new();
-    for b in &built {
-        if b.lanes.0 {
-            lane_to.extend((0..py).map(|j| Coord::new(x, 1 + j)));
-        }
-        if b.lanes.1 {
-            lane_to.extend((0..b.layout.px()).map(|i| Coord::new(x + 1 + i, 1 + py)));
-        }
-        x += b.layout.px() + 1;
-    }
-    let stream = Stream::of(&requests, py, &asks, &blocks, heads, PYA, &lane_to)?;
+    let stream = Stream::of(&requests, py, &asks, &blocks, heads, PYA, bounds)?;
     let wiring = stream.wiring();
     let floor = stream.floor();
     let palette = Palette::allocate(Vec::new(), &floor, &wiring)?;

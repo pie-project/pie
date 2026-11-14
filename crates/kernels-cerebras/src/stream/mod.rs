@@ -219,7 +219,8 @@ pub fn shape(trace: &Trace, reading: &str, classes: &[RowClass]) -> R<StreamShap
 }
 
 /// What [`compile`] builds: a reading at `rows` rows a class, its roundings the build's 16-bit
-/// type's (`round16`, a bf16 build), the first `upto` stages only, `taps` also read back.
+/// type's (`round16`, a bf16 build), the first `upto` stages only, `taps` also read back, `py`
+/// row roots a unit.
 #[derive(Clone, Debug)]
 pub struct Options {
     pub reading: String,
@@ -227,6 +228,8 @@ pub struct Options {
     pub round16: bool,
     pub upto: Option<usize>,
     pub taps: Vec<u32>,
+    /// Row roots a unit (`None`: the cost model's choice, [`build::program_py`]).
+    pub py: Option<u32>,
 }
 
 /// Compiles `trace`'s stream reading (`o`) into `out`: the program's CSL (`layout.csl`, the
@@ -239,7 +242,7 @@ pub fn compile(
     gold: Option<&std::path::Path>,
 ) -> R<build::Program> {
     let s = shape_of(trace, &o.reading, o.rows)?;
-    let p = build::program_upto(trace, s, o.round16, o.upto, &o.taps)?;
+    let p = build::program_py(trace, s, o.round16, o.upto, &o.taps, o.py)?;
     let e = crate::emit::stream::emit(&p)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     for (name, text) in &e.files {
@@ -259,6 +262,7 @@ pub fn compile(
         "kv": p.kv,
         "palette": p.palette.map.iter().map(|(k, c)| (format!("{}{}", k.name, k.index), c.0)).collect::<std::collections::BTreeMap<_, _>>(),
         "lane_words": p.lane_words,
+        "py": p.stream.py,
         "cost": crate::cost::stream::time(&p),
     });
     std::fs::write(
