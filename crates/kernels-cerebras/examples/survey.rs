@@ -108,8 +108,10 @@ fn short(s: &str) -> String {
     }
 }
 
-/// The stream regime's line for a poem with a `denoise` reading: its shape at 64 rows a class,
-/// or where it stops (STREAM-LOWER: the stream program; STREAM-SHAPE: the params).
+/// The stream regime's line for a poem with a `denoise` reading: its program at 64 rows a class
+/// (STREAM-BUILD-OK: units, K / V columns and lane bus laid and coloured, the CSL emitted; its
+/// fabric and the op-derived step cycles), or where it stops (STREAM-LOWER: the stream program;
+/// STREAM-SHAPE: the params; STREAM-BUILD: the units, layouts, floorplan, colours or CSL).
 fn stream(d: &Deployment, trace: &Trace) {
     let reading = "denoise";
     let denoises = trace.facts.table.iter().any(|f| {
@@ -132,22 +134,41 @@ fn stream(d: &Deployment, trace: &Trace) {
     if let Err(e) = poem_compiler::spatial::layer::stream::lower(trace, &an, &classes) {
         return println!("{name}\treading={reading}\tSTREAM-LOWER\t{}", short(&e));
     }
-    match kernels_cerebras::stream::shape(trace, reading, &classes) {
-        Ok(s) => println!(
-            "{name}\treading={reading}\tSTREAM-SHAPE-OK\tclasses={} units={} layer-bodies={} \
-             hidden={} heads={}x{}",
-            s.classes
-                .iter()
-                .map(|(c, r)| format!("{c}:{r}"))
-                .collect::<Vec<_>>()
-                .join(","),
-            s.units,
-            s.layer_bodies,
-            s.hidden,
-            s.attn.q_heads,
-            s.attn.head_dim
+    let s = match kernels_cerebras::stream::shape(trace, reading, &classes) {
+        Ok(s) => s,
+        Err(e) => return println!("{name}\treading={reading}\tSTREAM-SHAPE\t{}", short(&e)),
+    };
+    let what = format!(
+        "classes={} units={} layer-bodies={} hidden={} heads={}x{}",
+        s.classes
+            .iter()
+            .map(|(c, r)| format!("{c}:{r}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        s.units,
+        s.layer_bodies,
+        s.hidden,
+        s.attn.q_heads,
+        s.attn.head_dim
+    );
+    let built = kernels_cerebras::stream::build::program(trace, s, true).and_then(|p| {
+        kernels_cerebras::emit::stream::emit(&p)?;
+        Ok(p)
+    });
+    match built {
+        Ok(p) => println!(
+            "{name}\treading={reading}\tSTREAM-BUILD-OK\t{what} fabric={}x{} kv-columns={} \
+             lane-words={} cycles~{:.1}M",
+            p.stream.w,
+            p.stream.h,
+            p.stream.kv.len(),
+            p.lane_words,
+            kernels_cerebras::cost::stream::time(&p).cycles / 1e6
         ),
-        Err(e) => println!("{name}\treading={reading}\tSTREAM-SHAPE\t{}", short(&e)),
+        Err(e) => println!(
+            "{name}\treading={reading}\tSTREAM-BUILD\t{what} {}",
+            short(&e)
+        ),
     }
 }
 
