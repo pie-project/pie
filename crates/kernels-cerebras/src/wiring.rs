@@ -196,6 +196,18 @@ pub struct Multicast {
     pub slot: Slot,
 }
 
+/// A multicast tree from `pts[src]`'s ramp: `parent[i]` is the point `i` receives from (adjacent;
+/// `None` at the source), and the points `recv` marks take it to their ramp (the rest pass it on).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Broadcast {
+    pub pts: Vec<Coord>,
+    pub src: usize,
+    pub parent: Vec<Option<usize>>,
+    pub recv: Vec<bool>,
+    pub class: Class,
+    pub slot: Slot,
+}
+
 /// A point-to-point path from `pts[0]`'s ramp to the last PE's ramp.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Path {
@@ -230,6 +242,7 @@ pub enum Link {
     Multicast(Multicast),
     Path(Path),
     Turn(Turn),
+    Broadcast(Broadcast),
 }
 
 impl Link {
@@ -252,6 +265,7 @@ impl Link {
             Link::Multicast(m) => vec![m.class],
             Link::Path(p) => vec![p.class],
             Link::Turn(t) => vec![t.class],
+            Link::Broadcast(b) => vec![b.class],
         }
     }
 }

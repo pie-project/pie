@@ -12,8 +12,8 @@ use serde::Serialize;
 use super::floor::{Coord, Dir, Floor, Grid};
 use super::role::Kind;
 use super::wiring::{
-    Chain, Class, LOOPBACK, Link, Multicast, NoteKey, Path, Port, Slot, SlotKind, Tree, Turn,
-    Wiring,
+    Broadcast, Chain, Class, LOOPBACK, Link, Multicast, NoteKey, Path, Port, Slot, SlotKind, Tree,
+    Turn, Wiring,
 };
 
 /// A physical colour (0 .. [`COLOURS`]).
@@ -282,6 +282,7 @@ impl Lay<'_> {
                 Link::Multicast(m) => self.multicast(m)?,
                 Link::Path(p) => self.path(p)?,
                 Link::Turn(t) => self.turn(t)?,
+                Link::Broadcast(b) => self.broadcast(b)?,
             }
         }
         Ok(())
@@ -673,6 +674,39 @@ impl Lay<'_> {
             }
             self.add(p, c, word)?;
             self.bind(p, mc.slot, Endpoint::Recv(c))?;
+        }
+        Ok(())
+    }
+
+    /// A multicast tree: each point receives from its parent (the source from its ramp) and
+    /// passes on to its children, to its own ramp where it is a receiver.
+    fn broadcast(&mut self, b: &Broadcast) -> Result<(), String> {
+        let n = b.pts.len();
+        if b.src >= n || b.parent.len() != n || b.recv.len() != n || b.parent[b.src].is_some() {
+            return Err(format!("fabric: broadcast source {} of {n} points", b.src));
+        }
+        let c = self.colour(b.class)?;
+        for (i, &p) in b.pts.iter().enumerate() {
+            let mut word = match b.parent[i] {
+                None if i == b.src => RX_R,
+                None => return Err(format!("fabric: broadcast point {i} has no parent")),
+                Some(q) => RouteWord::rx(Self::dir(p, b.pts[q])?),
+            };
+            for (j, par) in b.parent.iter().enumerate() {
+                if *par == Some(i) {
+                    word |= RouteWord::tx(Self::dir(p, b.pts[j])?);
+                }
+            }
+            if i == b.src {
+                self.add(p, c, word)?;
+                self.bind(p, b.slot, Endpoint::Send(c))?;
+            } else {
+                if b.recv[i] {
+                    word |= TX_R;
+                    self.bind(p, b.slot, Endpoint::Recv(c))?;
+                }
+                self.add(p, c, word)?;
+            }
         }
         Ok(())
     }

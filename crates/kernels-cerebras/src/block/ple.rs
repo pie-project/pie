@@ -134,6 +134,7 @@ impl Block for Ple {
                 Link::Multicast(m) => &m.pts,
                 Link::Path(p) => &p.pts,
                 Link::Turn(t) => std::slice::from_ref(&t.at),
+                Link::Broadcast(b) => &b.pts,
             };
             for &c in pts {
                 if c.x < hx0
