@@ -642,6 +642,25 @@ impl Shell {
             .collect()
     }
 
+    /// The class a lane of `class` lands in once it carries an adapter: the
+    /// one whose requests depart from `class`'s as it does and by the
+    /// adapter besides; `None` where the plan lands no such request.
+    fn adapted_twin(&self, class: usize) -> Option<usize> {
+        let plain = self.landing.get(class)?.first()?;
+        if plain.has_adapter() {
+            return None;
+        }
+        self.landing.iter().position(|requests| {
+            requests.iter().any(|request| {
+                request.has_adapter()
+                    && request.has_media() == plain.has_media()
+                    && request.drafts() == plain.drafts()
+                    && (request.query_len() == 1) == (plain.query_len() == 1)
+                    && request.departures() == plain.departures() + 1
+            })
+        })
+    }
+
     fn representative(&self, class: usize, rows: u32, wants_media: bool) -> poem_ir::Request {
         let landing = &self.landing[class];
         landing
@@ -1304,22 +1323,40 @@ impl Shell {
         };
         crate::sizing::begin();
         let mut walked = Ok(());
-        for (bucket, target, rs) in &targets {
+        // Where the load seats adapters, each composition is walked once
+        // more with every lane it can adapt adapted: the lattice names the
+        // plain classes, and a lane with an adapter runs kernels they do
+        // not (the correction's waist, a slab a lane), which a fire must
+        // find laid like any other.
+        let adapts = self.adapters().slots().seats() > 0;
+        'targets: for (bucket, target, rs) in &targets {
             self.arm_rs = *rs;
             let (lanes, media) = target.lanes();
-            let owned = self.synthetic_lanes_with(&lanes, &media);
-            if matches!(target, BodySynth::Idle) {
-                self.at_bucket(*bucket);
-            }
-            // Landed as arming lands each fire: its staging slots come back.
-            if let Err(why) = self
-                .fire_synthetic(&owned)
-                .and_then(|()| self.device.synchronize())
-            {
-                walked = Err(Fault::Unbound {
-                    what: format!("the size-only walk of bucket {bucket}, {target}: {why}"),
-                });
-                break;
+            let adapted: Vec<LaneRows> = lanes
+                .iter()
+                .map(|&(class, rows)| (self.adapted_twin(class).unwrap_or(class), rows))
+                .collect();
+            let walks = if adapts && adapted != lanes {
+                vec![lanes, adapted]
+            } else {
+                vec![lanes]
+            };
+            for lanes in walks {
+                let owned = self.synthetic_lanes_with(&lanes, &media);
+                if matches!(target, BodySynth::Idle) {
+                    self.at_bucket(*bucket);
+                }
+                // Landed as arming lands each fire: its staging slots come
+                // back.
+                if let Err(why) = self
+                    .fire_synthetic(&owned)
+                    .and_then(|()| self.device.synchronize())
+                {
+                    walked = Err(Fault::Unbound {
+                        what: format!("the size-only walk of bucket {bucket}, {target}: {why}"),
+                    });
+                    break 'targets;
+                }
             }
         }
         let footprint = crate::sizing::end();
