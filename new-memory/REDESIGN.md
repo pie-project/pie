@@ -267,12 +267,12 @@ A step is done only when it holds on every backend (user). ✅ verified on hardw
 | Step | CUDA (L40S) | ROCm (AMD) | Metal (Mac) | Vulkan (New Pie) | wgpu (New Pie) | XLA (TPU) |
 |---|---|---|---|---|---|---|
 | 2 Ledger, audit gap ~0 | ✅ | ✅ 0 MiB | ✅ 88 KiB | ✅ 0 | ✅ 0 | 🔴 |
-| 2.2 Measured capacity, no 0.9 share, floor 64 MiB | 🟡 share still read | 🟡 via CUDA path | ✅ (floor ?) | ✅ | ✅ (heap budget where reported) | 🔴 headroom constant |
-| 2.2 Outside priced, nothing allocated after load + arming | 🟡 guest Prepared scratch left | 🟡 same | ? | 🟡 pipelines priced; guest scratch ? | 🟡 same | 🟡 compile-time stats (probe) |
+| 2.2 Measured capacity, no 0.9 share, floor 64 MiB | 🟡 share still read | 🟡 via CUDA path | ✅ (floor ?) | ✅ | ✅ (heap budget where reported) | 🔴 memory_share × bytes_limit − held − weights − HBM/16 headroom; both go |
+| 2.2 Outside priced, nothing allocated after load + arming | 🟡 guest Prepared scratch left | 🟡 same | ? | 🟡 pipelines priced; guest scratch ? | 🟡 same | 🟡 temps per run from PJRT's allocator; bytes_in_use/peak after warm-up vs after serving to be measured |
 | 3 Fire footprint declared at load | ✅ size-only walk | ✅ walk | 🟡 scratch.rs static, not in span | 🟡 scratch.rs static, not in span | 🟡 same | ✅ compile stats |
 | 3c Activation in the span, `act_chunks` stated, rungs lend to state | ✅ | ✅ flat | 🔴 | 🔴 | 🔴 | — single u32 pool (fire outside the pool) |
-| 3 Guest program fire footprint (ProgramFacts) | 🟡 contract in work | 🟡 | 🔴 | 🔴 | 🔴 | ? |
+| 3 Guest program fire footprint (ProgramFacts) | 🟡 contract in work | 🟡 | 🔴 | 🔴 | 🔴 | 🔴 guest executables' compiled stats at registration (with measured fire) |
 | 4 State stragglers in slots (Instance / Channel) | 🟡 b46d16059 | 🟡 gate | ✅ | ✅ | ✅ (no device channel state) | — proposed none |
 | 5 Derived rungs, background arming | ✅ | ✅ | — encodes live (no capture) | 🔴 rungs; recorded frames per shape ? | 🔴 | 🟡 warm ladder |
 | One budget over N buffers (Span) | ✅ one range | ✅ one range | 🔴 two buffers | ? | ? | ✅ one pool |
-| Legacy paths deleted | 🟡 | 🟡 slab growth | ? | ? | ? | ? |
+| Legacy paths deleted | 🟡 | 🟡 slab growth | ? | ? | ? | 🟡 cut path gone; A7 debug switches, host expert fill, host token-table misses go with A7; kernel-off switches (MOE_GMM, KV, FLASH_PREFILL, OLDER_DMA, POOL_DMA, NORM, ROPE, GDN, CONV, GUESTS_ON_HOST) go after A7 |
