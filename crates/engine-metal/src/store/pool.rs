@@ -10,10 +10,14 @@
 //! side is committed.
 //!
 //! The activation span is the top `act` chunks (`act_chunks` of the
-//! largest rung): the segments it starts in and above are backed from the
-//! load for the pool's life ([`elastic::Elastic::pin_top`]), and the first
-//! `n` segments grow and shrink only below them. A lower rung lends the
-//! span's bottom chunks to state; they are backed already.
+//! largest rung), from the segment it starts in up: the top of the sparse
+//! buffer ([`elastic::Elastic::reserve_top`]), and the first `n` segments
+//! grow and shrink only below it. The top is backed on demand, from the end
+//! down: as deep as the widest carve a fire has taken ([`Pool::cover`]) and
+//! the span segments the runtime committed to lend state
+//! ([`Pool::commit_span`]), whichever reaches lower. A mapped placement heap
+//! is resident whether or not a kernel touches it, so nothing is backed that
+//! neither needs.
 //!
 //! The runtime names chunks logically; the pool places each on a physical
 //! chunk through its [`ChunkTable`], so emptying the top segment
@@ -54,6 +58,10 @@ pub struct Pool {
     committed: u32,
     /// The activation span's chunks, the top of the range.
     act: u32,
+    /// The bytes from the range's end the widest fire's carve has taken.
+    carve: u64,
+    /// The span's segments from the top the runtime committed for state.
+    span: u32,
     table: ChunkTable,
 }
 
@@ -120,7 +128,7 @@ impl Pool {
             let mut store = elastic::create(&sparse, &arena, bytes)?;
             if act > 0 {
                 let first = top_first(total_chunks, segment_chunks, act);
-                store.pin_top(pinned_from(first, chunk_bytes))?;
+                store.reserve_top(pinned_from(first, chunk_bytes))?;
             }
             Ok(Pool {
                 backing: Backing::Sparse {
@@ -133,6 +141,8 @@ impl Pool {
                 segment_chunks,
                 committed: 0,
                 act,
+                carve: 0,
+                span: 0,
                 table: ChunkTable::identity(total_chunks),
             })
         }
@@ -146,6 +156,8 @@ impl Pool {
             segment_chunks,
             committed: 0,
             act,
+            carve: 0,
+            span: 0,
             table: ChunkTable::identity(total_chunks),
         };
         #[cfg(not(target_vendor = "apple"))]
@@ -218,6 +230,97 @@ impl Pool {
     #[must_use]
     pub fn top_first(&self) -> u32 {
         top_first(self.total_chunks, self.segment_chunks, self.act)
+    }
+
+    /// The span's segments, from the one it starts in to the range's end.
+    #[must_use]
+    pub fn span_segments(&self) -> u32 {
+        self.segments() - self.top_first() / self.segment_chunks.max(1)
+    }
+
+    /// Where the top is to be backed from: the widest carve's start or the
+    /// lowest committed span segment's, whichever is lower.
+    fn top_want(&self) -> u64 {
+        let carve = self.bytes().saturating_sub(self.carve);
+        let span = u64::from(self.segments() - self.span.min(self.span_segments()))
+            * u64::from(self.segment_chunks)
+            * self.chunk_bytes;
+        carve.min(span).max(self.pinned_from())
+    }
+
+    /// Backs the top `bytes` of the range for a fire's carve, kept for the
+    /// widest carve so far.
+    pub fn cover(&mut self, bytes: u64) -> Result<()> {
+        if bytes <= self.carve {
+            return Ok(());
+        }
+        self.carve = bytes.min(self.bytes() - self.pinned_from());
+        self.back_top()
+    }
+
+    /// Backs the top `segments` of the span for state the runtime opens
+    /// there; fewer than are backed is no change.
+    pub fn commit_span(&mut self, segments: u32) -> Result<()> {
+        if segments > self.span_segments() {
+            return Err(Fault::Ceiling {
+                what: "segments of the activation span",
+                need: u64::from(segments),
+                have: u64::from(self.span_segments()),
+            });
+        }
+        if segments <= self.span {
+            return Ok(());
+        }
+        self.span = segments;
+        self.back_top()
+    }
+
+    /// Gives back the span's segments past the top `segments`, down to what
+    /// the widest carve still takes.
+    ///
+    /// # Safety
+    ///
+    /// No frame reads the chunks given back: the caller has drained every
+    /// frame, and the runtime holds no state in them.
+    pub unsafe fn release_span(&mut self, segments: u32) -> Result<()> {
+        if segments >= self.span {
+            return Ok(());
+        }
+        self.span = segments;
+        #[cfg(target_vendor = "apple")]
+        {
+            let want = self.top_want();
+            let Backing::Sparse { store, .. } = &mut self.backing;
+            // SAFETY: the caller's contract above.
+            unsafe { store.unmap_top(want)? };
+        }
+        Ok(())
+    }
+
+    fn back_top(&mut self) -> Result<()> {
+        #[cfg(target_vendor = "apple")]
+        {
+            let want = self.top_want();
+            let Backing::Sparse { store, .. } = &mut self.backing;
+            store.map_top(want)?;
+        }
+        Ok(())
+    }
+
+    /// The span's committed segments from the top.
+    #[must_use]
+    pub fn committed_span(&self) -> u32 {
+        self.span
+    }
+
+    /// Where the top's backed bytes start: the range's end where none are.
+    fn top_mapped_from(&self) -> u64 {
+        match &self.backing {
+            #[cfg(not(target_vendor = "apple"))]
+            Backing::Flat(_) => self.pinned_from(),
+            #[cfg(target_vendor = "apple")]
+            Backing::Sparse { store, .. } => store.top_mapped_from(),
+        }
     }
 
     /// The device bytes the span's backed segments hold.
@@ -330,8 +433,10 @@ impl Pool {
         // is backed from, and the top every chunk from the span's segment
         // on, which lies wholly past that seam.
         let have = self.committed_chunks();
-        let backed =
-            physical < self.total_chunks && (physical < have || physical >= self.top_first());
+        let backed = physical < self.total_chunks
+            && (physical < have
+                || (physical >= self.top_first()
+                    && u64::from(physical) * self.chunk_bytes >= self.top_mapped_from()));
         if !backed {
             return Err(Fault::Ceiling {
                 what: "committed chunks of the state pool",
@@ -491,7 +596,7 @@ mod tests {
     const CHUNK: u64 = 16 << 20;
 
     #[test]
-    fn the_span_is_backed_from_the_load_and_the_bottom_grows_under_it() {
+    fn the_span_is_backed_on_demand_from_the_top_and_the_bottom_grows_under_it() {
         assert_eq!(top_first(12, 4, 3), 8, "the segment the span starts in");
         assert_eq!(top_first(12, 4, 4), 8);
         assert_eq!(top_first(12, 4, 5), 4);
@@ -500,19 +605,25 @@ mod tests {
         let mut pool = Pool::reserve(&device, CHUNK, 12, 4, 3).expect("a pool");
         assert_eq!(pool.growth(), engine::chunk::Growth::TwoEnded);
         assert_eq!(pool.span_offset(), 9 * CHUNK);
-        assert_eq!(
-            pool.top_held_bytes(),
-            4 * CHUNK,
-            "the span's segment, whole"
-        );
-        assert!(
-            pool.admit(1).is_err(),
-            "nothing under the span is backed yet"
-        );
+        assert_eq!(pool.span_segments(), 1);
+        assert_eq!(pool.top_held_bytes(), 0, "nothing is backed at the load");
+        assert!(pool.admit(11).is_err());
+        // A fire's carve backs the top down to itself, and no further.
+        pool.cover(CHUNK + 1).expect("a carve");
+        assert_eq!(pool.top_held_bytes(), 2 * CHUNK);
+        pool.admit(11).expect("under the carve");
+        pool.admit(10).expect("under the carve");
+        assert!(pool.admit(9).is_err());
+        pool.cover(CHUNK)
+            .expect("a narrower carve keeps the widest");
+        assert_eq!(pool.top_held_bytes(), 2 * CHUNK);
+        // The span's segment committed for state backs all of it.
+        pool.commit_span(1).expect("the span segment");
+        assert_eq!(pool.top_held_bytes(), 4 * CHUNK);
         for chunk in 8..12 {
             pool.admit(chunk).expect("the span's segment is backed");
         }
-        // The span reads back what was written.
+        assert!(pool.commit_span(2).is_err(), "the span has one segment");
         let mut seen = [7u8; 64];
         pool.write(10 * CHUNK + 4096, &[9u8; 64]).expect("a write");
         // The bottom grows to the span and no further.
@@ -522,9 +633,14 @@ mod tests {
         // SAFETY: nothing ran on this pool.
         unsafe { pool.release_segments(1) }.expect("the bottom shrinks");
         assert_eq!(pool.held_bytes(), 8 * CHUNK);
-        assert!(pool.admit(5).is_err());
         pool.read(10 * CHUNK + 4096, &mut seen).expect("a read");
         assert_eq!(seen, [9u8; 64], "the span outlives the bottom's shrink");
+        // Releasing the span gives back what the carve does not take.
+        // SAFETY: nothing ran on this pool.
+        unsafe { pool.release_span(0) }.expect("the span goes back");
+        assert_eq!(pool.top_held_bytes(), 2 * CHUNK);
+        assert!(pool.admit(9).is_err());
+        pool.admit(10).expect("still under the carve");
         assert!(
             Pool::reserve(&device, CHUNK, 4, 4, 4).is_err(),
             "a span that leaves no chunk under it"
@@ -534,6 +650,7 @@ mod tests {
         let small = 12 << 20;
         let mut pool = Pool::reserve(&device, small, 10, 3, 2).expect("a pool");
         assert_eq!(pool.top_first(), 6);
+        pool.commit_span(pool.span_segments()).expect("the span");
         for chunk in 6..10 {
             pool.admit(chunk).expect("the span's segment is backed");
         }
@@ -552,7 +669,6 @@ mod tests {
         // 4 MiB, the top the rest.
         pool.write(5 * small + (4 << 20) - 32, &[6u8; 64])
             .expect("across the seam");
-        let mut seen = [0u8; 64];
         pool.read(5 * small + (4 << 20) - 32, &mut seen)
             .expect("a read");
         assert_eq!(seen, [6u8; 64]);
