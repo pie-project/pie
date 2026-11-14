@@ -155,9 +155,6 @@ pub trait Serve: Backend {
     /// What a kept step binds moved: the segments, or a layer's stage.
     fn forget(shelf: &mut Self::Shelf);
 
-    /// Arm `arm`'s readout seat grew to `bytes`.
-    fn grown(shell: &mut Shell<Self>, arm: usize, bytes: u64) -> Result<()>;
-
     /// Replays `prepared` where a kept step answers it, else how it walks.
     fn plan(shell: &mut Shell<Self>, prepared: &mut Prepared<'_, Self>) -> Result<Plan<Self>>;
 
@@ -1100,39 +1097,55 @@ impl<B: Serve> Shell<B> {
             None => Vec::new(),
         };
 
-        // Sized for the host's read back; a fire reading more grows its arm's.
-        let readout = (0..arms)
-            .map(|_| {
-                B::Buffer::host(
-                    &device,
-                    readouts
-                        .iter()
-                        .filter(|plane| plane.hosts())
-                        .map(|plane| {
-                            u64::from(match plane.seam {
-                                Kind::Readout => readout_rows(boot.budget.max_lanes),
-                                _ if plane.voxels => budgets.max_voxels(),
-                                _ => boot.budget.max_tokens,
-                            }) * u64::from(plane.width)
-                                * elem(plane.dtype)
-                        })
-                        .max()
-                        .unwrap_or(0)
-                        .max(1),
-                    crate::books::owners::READOUT,
-                )
+        // Sized for the host's read back: the widest output a lane reads back
+        // at its row ceiling. A fire reading more grows its arm's; where the
+        // load fixes everything it is refused by name (every output of every
+        // layer at its ceiling is more than a load can set aside).
+        let seat = readouts
+            .iter()
+            .filter(|plane| plane.hosts())
+            .map(|plane| {
+                u64::from(match plane.seam {
+                    Kind::Readout => readout_rows(boot.budget.max_lanes),
+                    _ if plane.voxels => budgets.max_voxels(),
+                    _ => boot.budget.max_tokens,
+                }) * u64::from(plane.width)
+                    * elem(plane.dtype)
             })
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let readout = (0..arms)
+            .map(|_| B::Buffer::host(&device, seat, crate::books::owners::READOUT))
             .collect::<Result<Vec<_>>>()?;
 
         // The pool takes the bytes `[model] device_kv_budget` states, or all
         // the weights and the working set leave of the share, in whole
         // chunks; the kernels bind it in at most four segments, none past
         // the device's binding limit.
+        // The weight caches stand before the pool takes what is left: a pool
+        // backed whole at the load leaves them no room after.
+        let row_caches = crate::store::rows::RowCaches::new(
+            &device,
+            &boot.trace,
+            row_shapes,
+            boot.budget.max_tokens,
+            chunk,
+            arms,
+        )?;
+        let expert_caches =
+            crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
         // Every pipeline a fire may yet build is priced before the pool takes
         // what is left: one built later must find its driver memory free.
         let pipelines = B::Pipelines::default();
         let unbuilt = price_pipelines::<B>(&device, &pipelines);
-        let left = device.left().saturating_sub(unbuilt);
+        // The ledger counts every class in whole chunks: the pool takes what
+        // that count leaves, so one backed to its last chunk is within it.
+        let left = device.books().left(
+            chunk,
+            device.capacity(),
+            device.outside().saturating_add(unbuilt),
+        );
         if let Some(budget) = kv_budget
             && budget > left
         {
@@ -1240,18 +1253,16 @@ impl<B: Serve> Shell<B> {
             host_kv_budget.map_or(0, |bytes| u32::try_from(bytes / chunk).unwrap_or(u32::MAX));
         let rs_at = rows.rs.clone();
         let mut pools = Pools::reserve(&device, rows, layout, paging, host_chunks, act_chunks)?;
-        let row_caches = crate::store::rows::RowCaches::new(
+        // The null chunk's segment and the span's stand from the load on;
+        // where the load fixes everything, every segment does.
+        pools.commit_segments(
             &device,
-            &boot.trace,
-            row_shapes,
-            boot.budget.max_tokens,
-            chunk,
-            arms,
+            if B::FIXED {
+                pools.chunk_facts().segments.max
+            } else {
+                1
+            },
         )?;
-        let expert_caches =
-            crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
-        // The null chunk's segment and the span's stand from the load on.
-        pools.commit_segments(&device, 1)?;
         {
             let (buffer, end): (&B::Buffer, u64) =
                 pools.span_place().ok_or_else(|| Fault::Unbound {
@@ -1660,6 +1671,7 @@ impl<B: Serve> Shell<B> {
     /// Gives back every segment at and past `segments`, once every frame
     /// that might read them has landed.
     pub fn release_segments(&mut self, segments: u32) -> Result<()> {
+        self.pools.releasable(segments)?;
         self.drain()?;
         self.handles.rewind();
         B::forget(&mut self.shelf);
@@ -3883,18 +3895,25 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
     where
         Self: 'a,
     {
-        let fed = self.feed(&prepared)?;
         let need = prepared
             .readout_layout
             .iter()
             .map(|span| span.at + span.bytes())
             .max()
             .unwrap_or(0);
-        if need > self.readout[prepared.arm].bytes() {
+        let seat = self.readout[prepared.arm].bytes();
+        if need > seat {
+            if B::FIXED {
+                return Err(Fault::Ceiling {
+                    what: "bytes one fire reads out (the readout seat is fixed at load)",
+                    need,
+                    have: seat,
+                });
+            }
             self.readout[prepared.arm] =
                 B::Buffer::host(&self.device, need, crate::books::owners::READOUT)?;
-            B::grown(self, prepared.arm, need)?;
         }
+        let fed = self.feed(&prepared)?;
         let (keep, split) = match B::plan(self, &mut prepared)? {
             Plan::Replayed {
                 pending,

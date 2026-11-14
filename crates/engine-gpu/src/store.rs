@@ -624,13 +624,27 @@ impl<B: Backend> Pools<B> {
                     .transpose()?,
             )
         } else {
-            HostChunks::Heap(vec![
-                0u8;
-                usize::try_from(
-                    u64::from(host_chunks) * layout.chunk_bytes
-                )
-                .unwrap_or(0)
-            ])
+            HostChunks::Heap {
+                chunks: vec![
+                    0u8;
+                    usize::try_from(u64::from(host_chunks) * layout.chunk_bytes)
+                        .unwrap_or(0)
+                ],
+                stage: (host_chunks > 0)
+                    .then(|| {
+                        B::Buffer::with(
+                            device,
+                            layout
+                                .shapes()
+                                .map(|shape| shape.slot_bytes)
+                                .max()
+                                .unwrap_or(0),
+                            Memory::Readback,
+                            crate::books::owners::HOST_POOL,
+                        )
+                    })
+                    .transpose()?,
+            }
         };
         Ok(Pools {
             paging: Paging {
@@ -1271,17 +1285,26 @@ impl<B: Backend> Pools<B> {
                         need: 1,
                         have: 0,
                     })?,
-                    HostChunks::Heap(_) => {
-                        let bytes = usize::try_from(bytes).unwrap_or(0);
+                    HostChunks::Heap { .. } => {
+                        let len = usize::try_from(bytes).unwrap_or(0);
                         for &(slot, at) in &copy.slots {
                             let from = self.slot_offset(copy.shape, slot)?;
                             let to =
                                 usize::try_from(self.host_offset(copy.shape, at)?).unwrap_or(0);
                             let (buffer, local) = self.pool.locate(from)?;
-                            let HostChunks::Heap(host) = &mut self.host else {
-                                unreachable!("matched above")
+                            let HostChunks::Heap {
+                                chunks,
+                                stage: Some(stage),
+                            } = &mut self.host
+                            else {
+                                unreachable!("a host offset lies in host chunks, staged from load")
                             };
-                            buffer.read(local, &mut host[to..to + bytes])?;
+                            // Through the stage the load laid: no read back
+                            // makes a buffer of its own.
+                            let mut out = device.frame()?;
+                            out.copy(buffer, local, stage, 0, bytes)?;
+                            out.commit()?;
+                            stage.read(0, &mut chunks[to..to + len])?;
                         }
                         return Ok(());
                     }
@@ -1306,16 +1329,16 @@ impl<B: Backend> Pools<B> {
                         need: 1,
                         have: 0,
                     })?,
-                    HostChunks::Heap(_) => {
+                    HostChunks::Heap { .. } => {
                         let bytes = usize::try_from(bytes).unwrap_or(0);
                         for &(at, slot) in &copy.slots {
                             let to = self.slot_offset(copy.shape, slot)?;
                             let from =
                                 usize::try_from(self.host_offset(copy.shape, at)?).unwrap_or(0);
-                            let HostChunks::Heap(host) = &self.host else {
+                            let HostChunks::Heap { chunks, .. } = &self.host else {
                                 unreachable!("matched above")
                             };
-                            self.pool.write(to, &host[from..from + bytes])?;
+                            self.pool.write(to, &chunks[from..from + bytes])?;
                         }
                         return Ok(());
                     }
@@ -1373,7 +1396,7 @@ impl<B: Backend> Pools<B> {
                 need: 1,
                 have: 0,
             })?,
-            HostChunks::Heap(host) => {
+            HostChunks::Heap { chunks: host, .. } => {
                 let mut out = Vec::new();
                 for (offset, len) in spans {
                     let from = usize::try_from(offset).unwrap_or(usize::MAX);
@@ -1421,7 +1444,7 @@ impl<B: Backend> Pools<B> {
                 need: 1,
                 have: 0,
             })?,
-            HostChunks::Heap(host) => {
+            HostChunks::Heap { chunks: host, .. } => {
                 let have = host.len() as u64;
                 if let Some(&(offset, len)) =
                     spans.iter().find(|&&(offset, len)| offset + len > have)
@@ -1558,6 +1581,11 @@ impl<B: Backend> Pools<B> {
             .min(self.pool.segments())
     }
 
+    /// Refuses a release of segments the load backed for good.
+    pub fn releasable(&self, segments: u32) -> Result<()> {
+        self.pool.releasable(segments)
+    }
+
     /// Gives back every segment at and past `segments`. The caller drained
     /// every frame, and the runtime evacuated what they held.
     pub fn release_segments(&mut self, segments: u32) {
@@ -1576,20 +1604,23 @@ impl<B: Backend> Pools<B> {
 
 /// Host chunks laid out like the device's, one id space beside them: a
 /// mapped host buffer frames copy through where the API maps host memory
-/// ([`Backend::MAPS_HOST`]), else process memory the device side is read
-/// and written through the queue.
+/// ([`Backend::MAPS_HOST`]), else process memory: a slot leaves the device
+/// through `stage`, a readback buffer of the widest slot that stands from
+/// the load where there are host chunks, and comes back through the queue.
 #[derive(Debug)]
 enum HostChunks<B: Backend> {
     Mapped(Option<B::Buffer>),
-    Heap(Vec<u8>),
+    Heap {
+        chunks: Vec<u8>,
+        stage: Option<B::Buffer>,
+    },
 }
 
-/// The bytes a batched spill stages at once.
-const STAGE_BYTES: usize = 32 << 20;
-
-/// The kv slot file and how slots reach it: through one mapped stage that
-/// stands for the file's life where the API maps host memory, else through
-/// stages that live for one copy, so an idle tier holds no memory.
+/// The kv slot file and how slots reach it, through one stage that stands
+/// for the file's life: a mapped one where the API maps host memory, else
+/// a readback buffer a leaving slot is copied into, beside the process
+/// memory the file reads and writes; an arriving slot is written through
+/// the queue.
 #[derive(Debug)]
 enum Spill<B: Backend> {
     Mapped {
@@ -1600,8 +1631,12 @@ enum Spill<B: Backend> {
         /// A copy out of the stage may still be in flight.
         landing: Option<B::Pending>,
     },
-    Batched {
+    Queued {
         file: engine::disk::SlotFile,
+        /// One slot, read back.
+        stage: B::Buffer,
+        /// One slot on the boundary direct I/O asks for.
+        host: engine::disk::Aligned,
     },
 }
 
@@ -1619,7 +1654,14 @@ impl<B: Backend> Spill<B> {
             return Ok(None);
         };
         if !B::MAPS_HOST {
-            return Ok(Some(Spill::Batched { file }));
+            let stage = B::Buffer::with(
+                device,
+                file.stride() as u64,
+                Memory::Readback,
+                crate::books::owners::SPILL,
+            )?;
+            let host = engine::disk::Aligned::zeroed(file.stride());
+            return Ok(Some(Spill::Queued { file, stage, host }));
         }
         let stage = B::Buffer::host(
             device,
@@ -1637,7 +1679,7 @@ impl<B: Backend> Spill<B> {
 
     fn file(&self) -> &engine::disk::SlotFile {
         match self {
-            Spill::Mapped { file, .. } | Spill::Batched { file } => file,
+            Spill::Mapped { file, .. } | Spill::Queued { file, .. } => file,
         }
     }
 
@@ -1659,7 +1701,10 @@ impl<B: Backend> Spill<B> {
 
     /// One slot's `bytes` at `local` of `buffer` and file slot `slot`: a
     /// write returns once on disk; a read once its copy onto the device is
-    /// submitted (mapped) or has landed (batched).
+    /// submitted (mapped) or queued. No drain: every frame was submitted
+    /// before the lane took this copy, and the queue runs what it is given
+    /// in order, so a slot leaving reads what those frames wrote and a slot
+    /// arriving is there for the frame after.
     #[allow(unsafe_code)]
     fn copy(
         &mut self,
@@ -1670,102 +1715,59 @@ impl<B: Backend> Spill<B> {
         to_disk: bool,
         slot: u32,
     ) -> Result<()> {
-        let Spill::Mapped {
-            file,
-            stage,
-            at,
-            landing,
-        } = self
-        else {
-            return self.copy_batched(device, &[(buffer, local, bytes)], to_disk, &[0], &[slot]);
-        };
-        let stride = file.stride();
-        let base = stage.mapped_ptr().ok_or(Fault::Deviceless)? + *at;
-        if let Some(landing) = landing.take() {
-            landing.wait()?;
-        }
-        // SAFETY: the stage stays mapped while `self` lives, and no copy in
-        // flight touches it now (waited above, or committed below).
-        let staged = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, stride) };
-        if !to_disk {
-            file.read(slot, staged).map_err(slot_file)?;
-        }
-        let mut frame = device.frame()?;
-        let offset = *at as u64;
-        if to_disk {
-            frame.copy(buffer, local, stage, offset, bytes)?;
-            frame.commit()?;
-            file.write(slot, staged).map_err(slot_file)?;
-        } else {
-            frame.copy(stage, offset, buffer, local, bytes)?;
-            *landing = Some(frame.commit_async(None)?);
-        }
-        Ok(())
-    }
-
-    /// Returns once every row is on disk or on the device. The stages live
-    /// for the call, so an idle tier holds no memory. No drain: every frame
-    /// was submitted before the lane took this copy, and the queue runs
-    /// submissions in order, so a row leaving reads what those frames wrote
-    /// and a row arriving is there for the frame after.
-    fn copy_batched(
-        &self,
-        device: &B::Context,
-        planes: &[(&B::Buffer, u64, u64)],
-        to_disk: bool,
-        ids: &[u32],
-        slots: &[u32],
-    ) -> Result<()> {
-        let file = self.file();
-        let stride = file.stride();
-        let batch = (STAGE_BYTES / stride).max(1).min(ids.len());
-        if batch == 0 {
-            return Ok(());
-        }
-        let kind = if to_disk {
-            Memory::Readback
-        } else {
-            Memory::Staging
-        };
-        let mut stage = B::Buffer::with(
-            device,
-            (batch * stride) as u64,
-            kind,
-            crate::books::owners::SPILL,
-        )?;
-        // A multiple of the stride from an `ALIGN` boundary, so each slot in
-        // it is one aligned stage.
-        let mut host = engine::disk::Aligned::zeroed(batch * stride);
-        for (ids, slots) in ids.chunks(batch).zip(slots.chunks(batch)) {
-            let staged = &mut host.as_mut_slice()[..ids.len() * stride];
-            if !to_disk {
-                for (&slot, row) in slots.iter().zip(staged.chunks_exact_mut(stride)) {
-                    file.read(slot, row).map_err(slot_file)?;
+        match self {
+            Spill::Mapped {
+                file,
+                stage,
+                at,
+                landing,
+            } => {
+                let stride = file.stride();
+                let base = stage.mapped_ptr().ok_or(Fault::Deviceless)? + *at;
+                if let Some(landing) = landing.take() {
+                    landing.wait()?;
                 }
-                stage.write(0, staged)?;
-            }
-            let mut frame = device.frame()?;
-            for (row, &id) in ids.iter().enumerate() {
-                let mut offset = (row * stride) as u64;
-                for &(slab, plane, bytes) in planes {
-                    let on_device = plane + u64::from(id) * bytes;
-                    if to_disk {
-                        frame.copy(slab, on_device, &stage, offset, bytes)?;
-                    } else {
-                        frame.copy(&stage, offset, slab, on_device, bytes)?;
-                    }
-                    offset += bytes;
+                // SAFETY: the stage stays mapped while `self` lives, and no
+                // copy in flight touches it now (waited above, or committed
+                // below).
+                let staged = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, stride) };
+                if !to_disk {
+                    file.read(slot, staged).map_err(slot_file)?;
                 }
+                let mut frame = device.frame()?;
+                let offset = *at as u64;
+                if to_disk {
+                    frame.copy(buffer, local, stage, offset, bytes)?;
+                    frame.commit()?;
+                    file.write(slot, staged).map_err(slot_file)?;
+                } else {
+                    frame.copy(stage, offset, buffer, local, bytes)?;
+                    *landing = Some(frame.commit_async(None)?);
+                }
+                Ok(())
             }
-            frame.commit()?;
-            if to_disk {
-                stage.read(0, staged)?;
-                for (&slot, row) in slots.iter().zip(staged.chunks_exact(stride)) {
-                    file.write(slot, row).map_err(slot_file)?;
+            Spill::Queued { file, stage, host } => {
+                let staged = host.as_mut_slice();
+                let len = usize::try_from(bytes).unwrap_or(usize::MAX);
+                if len > staged.len() {
+                    return Err(Fault::Ceiling {
+                        what: "bytes of one slot in the slot file's stage",
+                        need: bytes,
+                        have: staged.len() as u64,
+                    });
+                }
+                if to_disk {
+                    let mut frame = device.frame()?;
+                    frame.copy(buffer, local, stage, 0, bytes)?;
+                    frame.commit()?;
+                    stage.read(0, &mut staged[..len])?;
+                    file.write(slot, staged).map_err(slot_file)
+                } else {
+                    file.read(slot, staged).map_err(slot_file)?;
+                    buffer.write_shared(local, &staged[..len])
                 }
             }
         }
-        Ok(())
     }
 }
 

@@ -9,7 +9,7 @@ Legend: ✅ verified on hardware · 🟡 in progress / compile-only · 🔴 not 
 | Feature | CUDA | ROCm | Metal | Vulkan | wgpu | XLA/TPU | Cerebras |
 |---|---|---|---|---|---|---|---|
 | Real ChunkFacts, slot-ref lanes, fixed pieces | ✅ M34 | ✅ M43 (MI300X) | ✅ M30 (dsv4 compressor fix M46) | ✅ M48 | ✅ M48 | 🟡 M63 (TPU check by team) | 🟡 M43 host pool (no HW) |
-| Grow / shrink (segments, evacuation) | ✅ M34 | — flat by spec | ✅ M30 | ✅ M48 | ✅ M48 | — fixed at load | 🟡 M43 (host segments) |
+| Grow / shrink (segments, evacuation) | ✅ M34 | — flat by spec | ✅ M30 | ✅ M48 | — fixed at load (evacuation ✅ M48) | — fixed at load | 🟡 M43 (host segments) |
 | rs list + slot_copies | ✅ M34 | ✅ golden_buffered (MI300X) | ✅ M37 | ✅ M53 (rs tail fork, engine) | ✅ M53 | 🟡 M63 | 🟡 M43 (host sim) |
 | Window lists (own T_w, trimmed) | ✅ tables per list M51 (T_w = page; 2-window untested) | ✅ goldens (one list) | ✅ up to 4 lists M50 | ✅ up to 4 lists, own T_w M53 | ✅ M53 | 🟡 M63 (one list, T_w = page) | 🟡 one list, T_w=page |
 | Multi-piece records end to end | ✅ engine (L40S) · ✅ runtime boot (IT r5, 18 pieces) | ✅ records in pieces (chunk goldens); rows cut across pieces kernel-tested | ✅ M50 | ✅ M48 (4 pieces bitwise) | ✅ M48 | 🟡 M63 | 🟡 host sim |
@@ -120,6 +120,24 @@ was ~1 point of the ~12 % gap; the rest is that a fire with misses is not record
 re-encoded each fire. wgpu (no recording): 122.6 / 125.0 / 120.3, no gap. l36 Vulkan (sync path): 57.7 / 54.7 /
 55.4. Next if it matters: stage through a per-fire binding a recording can replay (a ring of stages indexed by an
 input), so misses keep recording.
+
+wgpu fixed at load (gpu-pool piece e; WebGPU reports no memory size and a browser grows nothing safely, so everything
+is taken from `[engine.memory] budget_device` at the load): `Backend::FIXED` (wgpu true, Vulkan false). The chunk
+pool is backed to its last segment at the load (`Growth::Fixed`, `commit_segments(max)`), so no segment is created by
+a later touch and a release is refused by name ("fixed at load"); what the weights, caches and working set leave of
+the budget (or `device_kv_budget`) is real buffers from the load on, counted as the ledger counts (every class in
+whole chunks, `Books::left`, all backends), so the pool backed whole is within the ledger. Each arm's readout seat and its readback mirror
+hold the widest output a lane reads back at its row ceiling, as before (every output of every layer at its ceiling is
+more than one buffer on a real model: 4.37 GB an arm on Qwen3-0.6B), and neither grows: the mirror's grow hook
+(`Serve::grown`) is deleted and a fire reading more is refused by name. The host tier's readback stage stands from the load and the slot
+file's stage and aligned block from its seating (the per-copy stages, `copy_batched`, are deleted). A read of a
+buffer the host does not map goes through the context's one 4 MiB read stage, laid at the bind, a longer read piece
+by piece (the per-read staging buffer and the spent list are deleted); `read_async` is for mapped buffers only.
+Gate (`tests/engine_wgpu/fixed.rs`, ignored: the creation counter is process-wide): prefill, decode, device <-> host
+tier, device <-> slot file and the refusals create no buffer (`device::reservations()`) and leave the ledger where the
+load put it. Not this piece's: the frame uniform / scratch chunks and the bind-group arena (laid at the load by the
+frames piece; until it lands they are booked at first touch, past a pool that took all the load left), group masks,
+the snapshot table and the guest outbox (their own pieces).
 
 Pre-existing parity gaps (not memory, but in scope for parity): ROCm synth codegen, ROCm graph replay with >= 2 MoE layers (AMD d); (concat_cols, FP8 m33 fixed M43);
 sm_100 tcgen05 W4A16 arms read no expert table; Metal MLA prefill unsupported.

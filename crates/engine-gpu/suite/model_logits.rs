@@ -760,6 +760,31 @@ fn scattered(model: &str) -> Vec<Vec<f32>> {
     scattered_at(model, None)
 }
 
+/// Gives the pool's segments above `kept` back. A pool fixed at load keeps
+/// every one of them and refuses the release by name.
+fn give_back(shell: &mut Shell, kept: u32) {
+    let segments = shell.pool_chunk_facts().segments;
+    if segments.growth == engine::chunk::Growth::Fixed {
+        let refused = shell
+            .release_segments(kept)
+            .expect_err("a pool fixed at load keeps its segments");
+        assert!(
+            refused.to_string().contains("fixed at load"),
+            "the refusal names the fixed pool: {refused}"
+        );
+        assert_eq!(
+            shell.pool_chunk_facts().segments.committed,
+            segments.max,
+            "a pool fixed at load stands whole"
+        );
+    } else {
+        shell
+            .release_segments(kept)
+            .expect("the top segments go back");
+        assert_eq!(shell.pool_chunk_facts().segments.committed, kept);
+    }
+}
+
 /// [`scattered`] over a pool whose recipe aims at `chunk`-byte chunks;
 /// the seats' rows.
 fn scattered_at(model: &str, chunk: Option<u64>) -> Vec<Vec<f32>> {
@@ -823,10 +848,7 @@ fn scattered_at(model: &str, chunk: Option<u64>) -> Vec<Vec<f32>> {
             shell
                 .evacuate(&Evacuation { moves })
                 .expect("the evacuation lands");
-            shell
-                .release_segments(kept)
-                .expect("the top segments go back");
-            assert_eq!(shell.pool_chunk_facts().segments.committed, kept);
+            give_back(shell, kept);
         },
     );
     same(
@@ -967,9 +989,7 @@ fn trimmed_window_of(fixture: &Fixture, model: &str, page: u32, context: u32, pr
                 shell
                     .evacuate(&Evacuation { moves })
                     .expect("the evacuation lands");
-                shell
-                    .release_segments(kept)
-                    .expect("the top segments go back");
+                give_back(&mut shell, kept);
             }
             let pieces: Vec<Vec<u32>> = fed.chunks(256).map(<[u32]>::to_vec).collect();
             let mut last = Vec::new();

@@ -163,10 +163,6 @@ impl Serve for Api {
         shelf.recorder.forget();
     }
 
-    fn grown(_shell: &mut Shell<Api>, _arm: usize, _bytes: u64) -> Result<()> {
-        Ok(())
-    }
-
     fn plan(shell: &mut Shell<Api>, prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
         // The custom-mask buffer grows: a recording would keep the one it outgrew.
         // A fire landing snapshots binds a table of its own: not recorded.

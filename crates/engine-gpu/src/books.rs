@@ -179,7 +179,24 @@ impl Books {
         })
     }
 
-    /// The ledger counted in chunks of `chunk_bytes` against `capacity`.
+    /// What a ledger of chunks of `chunk_bytes` over `capacity` has left once
+    /// every class is counted in whole chunks, the driver's class holding
+    /// `outside`: the bytes a pool of whole chunks may take and the ledger
+    /// still hold within the capacity.
+    #[must_use]
+    pub fn left(&self, chunk_bytes: u64, capacity: u64, outside: u64) -> u64 {
+        self.with(|ledger| {
+            let mut counted = Ledger::new(chunk_bytes, capacity);
+            for (class, owner, bytes) in ledger.entries() {
+                if class != Class::Outside {
+                    counted.enter(class, owner, bytes);
+                }
+            }
+            counted.enter(Class::Outside, "driver", outside);
+            counted.room()
+        })
+    }
+
     pub fn settle(&self, chunk_bytes: u64, capacity: u64) {
         self.with(|ledger| {
             let mut settled = Ledger::new(chunk_bytes, capacity);

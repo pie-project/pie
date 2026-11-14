@@ -12,7 +12,9 @@
 //! one of them is backed from the load on (`Growth::TwoEnded`). Below
 //! them, segments come and go as a prefix, a whole buffer at a time and
 //! never on a fire's path ([`Pool::commit_segments`],
-//! [`Pool::release_segments`]). A rung lower than the largest lends the
+//! [`Pool::release_segments`]); where the load fixes everything
+//! ([`Backend::FIXED`]) it backs every segment, and none comes or goes
+//! after (`Growth::Fixed`). A rung lower than the largest lends the
 //! span under its carve to state; raising it moves that state out first
 //! ([`Pool::evacuate`]).
 //! The runtime names chunks logically; the pool places each on a physical
@@ -173,7 +175,9 @@ impl<B: Backend> Pool<B> {
 
     #[must_use]
     pub fn growth(&self) -> Growth {
-        if self.span > 0 {
+        if B::FIXED {
+            Growth::Fixed
+        } else if self.span > 0 {
             Growth::TwoEnded
         } else {
             Growth::Bottom
@@ -303,9 +307,25 @@ impl<B: Backend> Pool<B> {
         Ok(())
     }
 
+    /// Refuses a release that would give a segment back where the load
+    /// backed them all for good ([`Backend::FIXED`]).
+    pub fn releasable(&self, segments: u32) -> Result<()> {
+        if B::FIXED && segments < self.top {
+            return Err(Fault::Program {
+                at: "store::pool::release_segments",
+                why: format!(
+                    "this pool's {} segments are fixed at load and never released; {segments} \
+                     cannot be kept",
+                    self.segments()
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Gives back every segment at and past `segments` below the span's.
-    /// The caller has drained every frame, and the runtime evacuated their
-    /// chunks first.
+    /// The caller has drained every frame, the runtime evacuated their
+    /// chunks first, and the release is [`Pool::releasable`].
     pub fn release_segments(&mut self, segments: u32) {
         for segment in segments..self.top {
             self.segments[segment as usize] = None;

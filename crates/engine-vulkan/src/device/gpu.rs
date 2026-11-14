@@ -11,6 +11,8 @@ impl engine_gpu::Backend for Api {
 
     const MAPS_HOST: bool = true;
 
+    const FIXED: bool = false;
+
     const COPY_GRAIN: u64 = 1;
 
     const STORAGE: checkpoint::types::BackendKind = checkpoint::types::BackendKind::Vulkan;

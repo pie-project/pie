@@ -35,6 +35,12 @@ pub trait Backend:
     /// queue, and host-side copies live in process memory.
     const MAPS_HOST: bool;
 
+    /// Whether everything the load reserves stands whole from it: the pool
+    /// is backed to its last segment and the readout seat holds the most a
+    /// fire reads, so nothing is created or grown once the load returns,
+    /// and a need past what it fixed is refused by name.
+    const FIXED: bool;
+
     /// The bytes a buffer-to-buffer copy's offsets and length are a
     /// multiple of.
     const COPY_GRAIN: u64;

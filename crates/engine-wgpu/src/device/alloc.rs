@@ -17,6 +17,22 @@ const PREAD_CHUNK: u64 = 256 << 20;
 
 pub use engine_gpu::Memory;
 
+/// The bytes of a context's read stage: what one piece of a read of a buffer
+/// the host does not map carries.
+const READ_STAGE: u64 = 4 << 20;
+
+/// A context's read stage, laid once at its bind: host memory the device
+/// copies into and the host maps, so it is in no device book.
+pub(crate) fn read_stage(device: &wgpu::Device) -> wgpu::Buffer {
+    note_reservation();
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("pie read"),
+        size: READ_STAGE,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
 static IDS: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct Raw {
@@ -138,14 +154,74 @@ impl Raw {
         if into.is_empty() {
             return Ok(());
         }
-        let back = Signal::new();
-        let deliver = back.clone();
-        self.read_async(offset, into.len() as u64, move |raw| deliver.notify(raw));
-        let raw = back.park("Buffer::read")??;
-        into.copy_from_slice(&raw[..into.len()]);
+        if self.kind == Memory::Readback {
+            let back = Signal::new();
+            let deliver = back.clone();
+            self.read_async(offset, into.len() as u64, move |raw| deliver.notify(raw));
+            let raw = back.park("Buffer::read")??;
+            into.copy_from_slice(&raw[..into.len()]);
+            return Ok(());
+        }
+        // A buffer the host does not map is read through the context's one
+        // read stage, laid at the bind: one read at a time, a read longer
+        // than the stage piece by piece. Nothing is created for a read.
+        let core = &self.core;
+        let stage = core.read_stage.lock().expect("read stage lock poisoned");
+        let start = offset & !3;
+        let end = (offset + into.len() as u64)
+            .next_multiple_of(4)
+            .min(self.size);
+        let mut at = start;
+        while at < end {
+            let piece = (end - at).min(READ_STAGE);
+            let mut encoder = core
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("pie read"),
+                });
+            encoder.copy_buffer_to_buffer(&self.buffer, at, &stage, 0, Some(piece));
+            core.queue.submit(std::iter::once(encoder.finish()));
+            let back = Signal::new();
+            let deliver = back.clone();
+            stage
+                .slice(..piece)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    deliver.notify(result.map_err(|e| e.to_string()));
+                });
+            core.kick();
+            match back.park("Buffer::read") {
+                Ok(Ok(())) => {}
+                // The map did not land: the stage is not mapped.
+                Ok(Err(why)) => return Err(core.fault("map_async", why)),
+                // This thread may not wait: the map asked for is called off.
+                Err(fault) => {
+                    stage.unmap();
+                    return Err(fault);
+                }
+            }
+            let copied = stage
+                .slice(..piece)
+                .get_mapped_range()
+                .map_err(|e| core.fault("get_mapped_range", e))
+                .map(|view| {
+                    // The bytes of `into` this piece holds: the piece is
+                    // `[at, at + piece)` of the buffer, `into` is
+                    // `[offset, offset + len)`.
+                    let from = at.max(offset);
+                    let to = (at + piece).min(offset + into.len() as u64);
+                    into[(from - offset) as usize..(to - offset) as usize]
+                        .copy_from_slice(&view[(from - at) as usize..(to - at) as usize]);
+                });
+            stage.unmap();
+            copied?;
+            at += piece;
+        }
         Ok(())
     }
 
+    /// Reads `len` bytes at `offset` of a buffer the host maps, without
+    /// blocking: `on_read` runs when the map lands. A buffer the host does
+    /// not map is read by [`Raw::read`], through the context's read stage.
     pub(crate) fn read_async(
         &self,
         offset: u64,
@@ -158,63 +234,35 @@ impl Raw {
         if len == 0 {
             return on_read(Ok(Vec::new()));
         }
-        let core = &self.core;
+        if self.kind != Memory::Readback {
+            return on_read(Err(Fault::Program {
+                at: "Buffer::read_async",
+                why: format!(
+                    "a {} byte {:?} buffer is not one the host maps; it is read through the \
+                     context's read stage",
+                    self.size, self.kind
+                ),
+            }));
+        }
         let start = offset & !3;
         let end = (offset + len).next_multiple_of(4).min(self.size);
-        let span = end - start;
         let skip = (offset - start) as usize;
         let take = len as usize;
-        if self.kind == Memory::Readback {
-            let mapped = self.buffer.clone();
-            let core = Arc::clone(core);
-            self.buffer
-                .slice(start..end)
-                .map_async(wgpu::MapMode::Read, move |result| {
-                    let read = result
-                        .map_err(|e| core.fault("map_async", e))
-                        .and_then(|()| {
-                            let view = mapped
-                                .slice(start..end)
-                                .get_mapped_range()
-                                .map_err(|e| core.fault("get_mapped_range", e))?;
-                            Ok(view[skip..skip + take].to_vec())
-                        });
-                    mapped.unmap();
-                    on_read(read);
-                });
-            self.core.kick();
-            return;
-        }
-        core.destroy_spent();
-        let staging = core.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pie read"),
-            size: span,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut encoder = core
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("pie read"),
-            });
-        encoder.copy_buffer_to_buffer(&self.buffer, start, &staging, 0, Some(span));
-        core.queue.submit(std::iter::once(encoder.finish()));
-        let mapped = staging.clone();
-        let core = Arc::clone(core);
-        staging
-            .slice(..)
+        let mapped = self.buffer.clone();
+        let core = Arc::clone(&self.core);
+        self.buffer
+            .slice(start..end)
             .map_async(wgpu::MapMode::Read, move |result| {
                 let read = result
                     .map_err(|e| core.fault("map_async", e))
                     .and_then(|()| {
                         let view = mapped
-                            .slice(..)
+                            .slice(start..end)
                             .get_mapped_range()
                             .map_err(|e| core.fault("get_mapped_range", e))?;
                         Ok(view[skip..skip + take].to_vec())
                     });
                 mapped.unmap();
-                core.spend(mapped);
                 on_read(read);
             });
         self.core.kick();

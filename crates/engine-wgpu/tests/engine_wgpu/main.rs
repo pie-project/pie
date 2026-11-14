@@ -74,6 +74,7 @@ mod collective;
 mod conv;
 #[path = "../../../engine-gpu/suite/elemwise/mod.rs"]
 mod elemwise;
+mod fixed;
 #[path = "../../../engine-gpu/suite/gather/mod.rs"]
 mod gather;
 #[path = "../../../engine-gpu/suite/gpu.rs"]

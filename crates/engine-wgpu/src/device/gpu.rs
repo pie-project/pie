@@ -11,6 +11,8 @@ impl engine_gpu::Backend for Api {
 
     const MAPS_HOST: bool = false;
 
+    const FIXED: bool = true;
+
     const COPY_GRAIN: u64 = 4;
 
     const STORAGE: checkpoint::types::BackendKind = checkpoint::types::BackendKind::Wgpu;

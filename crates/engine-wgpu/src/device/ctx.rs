@@ -154,7 +154,9 @@ pub(crate) struct Core {
     pub(crate) limits: wgpu::Limits,
     pub(crate) enabled: Enabled,
 
-    pub(crate) spent: Mutex<Vec<wgpu::Buffer>>,
+    /// What a read of a buffer the host does not map goes through
+    /// ([`super::alloc::read_stage`]), one read at a time.
+    pub(crate) read_stage: Mutex<wgpu::Buffer>,
 
     poller: host::Poller,
 
@@ -202,17 +204,6 @@ impl Core {
         self.kick();
         done.park("Device::poll")?;
         self.take_error("submission")
-    }
-
-    pub(crate) fn destroy_spent(&self) {
-        let spent = std::mem::take(&mut *self.spent.lock().expect("spent lock poisoned"));
-        for buffer in spent {
-            buffer.destroy();
-        }
-    }
-
-    pub(crate) fn spend(&self, buffer: wgpu::Buffer) {
-        self.spent.lock().expect("spent lock poisoned").push(buffer);
     }
 
     pub(crate) fn submit_once(&self, encoder: wgpu::CommandEncoder) -> Result<()> {
@@ -503,13 +494,13 @@ impl Context {
         let subgroup_min = enabled.subgroups.then_some(info.subgroup_min_size);
         let poller = host::Poller::start(device.clone());
         let core = Arc::new(Core {
+            read_stage: Mutex::new(super::alloc::read_stage(&device)),
             device,
             queue,
             name: info.name.clone(),
             info,
             limits,
             enabled,
-            spent: Mutex::new(Vec::new()),
             poller,
             uniforms: Mutex::new(Vec::new()),
             scratch: Mutex::new(Vec::new()),

@@ -7,7 +7,8 @@ use engine_gpu::serve::{Launch, Plan, Prepared, Serve, Shell};
 use crate::device::{Api, Buffer, Context, Frame, Pending, Pipelines};
 use engine_gpu::error::Result;
 
-/// What the shell keeps of WebGPU's own: each arm's readback mirror, the
+/// What the shell keeps of WebGPU's own: each arm's readback mirror, as
+/// large as the arm's readout seat and standing with it from the load, the
 /// mailbox landed steps post to, and the worker that lands them.
 pub struct Shelf {
     mirror: Vec<Buffer>,
@@ -149,16 +150,6 @@ impl Serve for Api {
     }
 
     fn forget(_shelf: &mut Shelf) {}
-
-    fn grown(shell: &mut Shell<Api>, arm: usize, bytes: u64) -> Result<()> {
-        shell.shelf.mirror[arm] = Buffer::with(
-            &shell.device,
-            bytes,
-            crate::device::Memory::Readback,
-            engine_gpu::books::owners::READOUT,
-        )?;
-        Ok(())
-    }
 
     fn plan(_shell: &mut Shell<Api>, _prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
         Ok(Plan::Walk {
