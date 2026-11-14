@@ -130,13 +130,22 @@ enum ReservedError {
 }
 
 fn stale_demand_error() -> String {
-    format!(
-        "pipeline: resource demand kept drifting under contention \
-         (still stale after {STALE_DEMAND_ATTEMPTS} re-acquisitions)"
-    )
+    "pipeline: resource demand reads stale against a grant quoted for the same demand".to_string()
 }
 
-const STALE_DEMAND_ATTEMPTS: usize = 3;
+/// A grant found stale is quoted again only on the drift event: the demand
+/// read now differs from the one it was quoted for. Stale against the very
+/// demand it was quoted for, no new quote can cover it, and it is refused.
+fn requote_on_drift(
+    stale_at: &mut Option<crate::planner::Demand>,
+    quoted: crate::planner::Demand,
+) -> bool {
+    if *stale_at == Some(quoted) {
+        return false;
+    }
+    *stale_at = Some(quoted);
+    true
+}
 
 /// A kv epoch a fire holds: settled by whoever finishes the fire, or, let go
 /// unsettled, when dropped — at once while the fire was never submitted,
@@ -376,11 +385,11 @@ async fn ask_while_tail_lands<C: FireContext, A: std::future::Future>(
                         .await
                         .map_err(|error| format!("pipeline: settle for windowed kv: {error:#}"))?;
                 }
+                // A front signals exactly when it reads as settled: none
+                // drained means another finalizer took it, and the next
+                // front is waited on.
                 if any {
                     drained();
-                } else {
-                    // A front that signals before it reads as settled.
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
             }
         }
@@ -758,7 +767,13 @@ impl RaiseFunding {
                 return;
             };
             let target = crate::store::shared::cap_for(&shared, rows);
+            // A step with nothing to do waits on the rung's next change (a
+            // raise, a copy, the cap, room freed), armed at its top, or the
+            // stop.
             while !stopped.load(std::sync::atomic::Ordering::Acquire) {
+                let watch = crate::store::shared::rung_watch(engine);
+                tokio::pin!(watch);
+                watch.as_mut().enable();
                 crate::store::shared::raise_now(&shared, engine, rows);
                 if crate::store::shared::fire_cap(engine) >= target {
                     return;
@@ -784,14 +799,18 @@ impl RaiseFunding {
                             Ok(crate::planner::Acquired::Granted(grant)) => {
                                 crate::scheduler::arming::fund(engine, grant);
                             }
-                            Ok(
-                                crate::planner::Acquired::Requote | crate::planner::Acquired::Yield,
-                            ) => {
-                                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                            // Quoted again: the planner's answer is the event.
+                            Ok(crate::planner::Acquired::Requote) => {}
+                            Ok(crate::planner::Acquired::Yield) => {
+                                tokio::select! {
+                                    _ = planner.wait_resident(pid) => {}
+                                    () = stop.notified() => return,
+                                }
                             }
                             Err(error) => {
                                 tracing::debug!(engine, %error, "a rung's arming room is refused");
                                 *failed.lock().unwrap() = Some(error.to_string());
+                                crate::store::shared::rung_changed(engine);
                                 return;
                             }
                         }
@@ -799,8 +818,12 @@ impl RaiseFunding {
                     }
                     // The room is there and state lies in the span: the
                     // walker moves it out, the engine copying it. Or the
-                    // rung is being armed with room already funded.
-                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    // rung is being armed with room already funded. Either
+                    // tells the rung.
+                    tokio::select! {
+                        () = &mut watch => {}
+                        () = stop.notified() => return,
+                    }
                     continue;
                 }
                 let demand = crate::planner::Demand {
@@ -833,21 +856,25 @@ impl RaiseFunding {
                         if let Err(error) = taken {
                             tracing::error!(engine, %error, "a raise's copy was refused");
                             *failed.lock().unwrap() = Some(error);
+                            crate::store::shared::rung_changed(engine);
                             return;
                         }
                         crate::store::shared::raise_now(&shared, engine, rows);
-                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                     }
                     Ok(crate::planner::Acquired::Requote) => {
                         tracing::debug!(engine, "a raise's room is quoted again");
                     }
                     Ok(crate::planner::Acquired::Yield) => {
                         tracing::debug!(engine, "a raise's process yields");
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        tokio::select! {
+                            _ = planner.wait_resident(pid) => {}
+                            () = stop.notified() => return,
+                        }
                     }
                     Err(error) => {
                         tracing::debug!(engine, %error, "a raise's room is refused");
                         *failed.lock().unwrap() = Some(error.to_string());
+                        crate::store::shared::rung_changed(engine);
                         return;
                     }
                 }
@@ -872,16 +899,21 @@ async fn wait_for_rung(
     let Some(failed) = failed else {
         return Ok(());
     };
-    while crate::store::shared::fire_cap(engine) < width {
-        if let Some(why) = failed() {
-            return Err(format!(
-                "pipeline: a fire of {width} rows needs a wider activation rung, and its room \
-                 was refused: {why}"
-            ));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    // The cap moving and the funding failing both tell the rung.
+    let mut refused = None;
+    crate::store::shared::rung_wait_until(engine, || {
+        refused = failed();
+        refused.is_some() || crate::store::shared::fire_cap(engine) >= width
+    })
+    .await;
+    if crate::store::shared::fire_cap(engine) >= width {
+        return Ok(());
     }
-    Ok(())
+    Err(format!(
+        "pipeline: a fire of {width} rows needs a wider activation rung, and its room was \
+         refused: {}",
+        refused.unwrap_or_default()
+    ))
 }
 
 impl Drop for RaiseFunding {
@@ -1586,7 +1618,7 @@ async fn reserve<C: FireContext>(
     rs_plan: impl Fn() -> Result<rs::RsPlan, String>,
     windowed: bool,
 ) -> Result<Reserved, String> {
-    let mut attempts = 0;
+    let mut stale_at = None;
     'grant: loop {
         let mut kv_pages = 0usize;
         for (set, written) in sets {
@@ -1624,7 +1656,7 @@ async fn reserve<C: FireContext>(
                     epoch: FireEpoch::begin(model, engine, stores, ctx.process_id()),
                 });
             }
-            Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => attempts += 1,
+            Err(ReservedError::Stale) if requote_on_drift(&mut stale_at, demand) => {}
             Err(ReservedError::Stale) => return Err(stale_demand_error()),
             Err(ReservedError::Fatal(error)) => return Err(error),
         }
@@ -2156,8 +2188,10 @@ pub(crate) async fn seat_lane_slots(
     stores: &crate::store::registry::Stores,
     groups: &LaneGroups,
 ) -> Result<(), String> {
-    let deadline = crate::rt::time::Instant::now() + SEAT_WAIT;
     let freed = stores.seats.lock().unwrap().freed();
+    // A working set letting its seats go is the event: it waits for it,
+    // however long, and is refused at once only where no release could
+    // ever seat it.
     loop {
         let mut freed = Box::pin(freed.notified());
         freed.as_mut().enable();
@@ -2170,15 +2204,7 @@ pub(crate) async fn seat_lane_slots(
                 "pipeline: seating this fire's lanes: {refusal}; no release can seat it"
             ));
         }
-        let now = crate::rt::time::Instant::now();
-        if now >= deadline {
-            return Err(format!(
-                "pipeline: seating this fire's lanes: {refusal}; waited {:?} for a peer to \
-                 release seats and none did",
-                SEAT_WAIT
-            ));
-        }
-        let _ = crate::rt::time::timeout(deadline - now, freed).await;
+        freed.await;
     }
 }
 
@@ -2966,6 +2992,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
         } else {
             Attach::No
         };
+        // What this pass claims to compute for others to wait on, held until
+        // its last piece settles.
+        let mut coalesced: Option<crate::pipeline::coalesce::ClaimGuard> = None;
         // Rows no worker here holds may be prefilled on a peer, whose pages
         // land in the host tier for the promote below to find. Media stays
         // here.
@@ -2976,8 +3005,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
             let lane = &full.lanes[0];
             // Pages another pass is computing now are waited for, not
             // computed again.
-            crate::pipeline::coalesce::before_pass(&stores, ws.id, u64::from(lane.kv.held), slots)
-                .await;
+            coalesced = crate::pipeline::coalesce::before_pass(
+                &stores,
+                ws.id,
+                u64::from(lane.kv.held),
+                slots,
+            )
+            .await;
             crate::offload::prefill::before_pass(
                 pid,
                 &stores,
@@ -3221,8 +3255,19 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 let ahead = PIECES_AHEAD.max(frame_size);
                 if at >= ahead && wanted > cut_at {
                     let behind = submitted[at - ahead].clone();
-                    while !behind.is_settled() && crate::store::shared::fire_cap(engine) <= cut_at {
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    // The piece behind settling or the cap rising, each its
+                    // own event.
+                    loop {
+                        let watch = crate::store::shared::rung_watch(engine);
+                        tokio::pin!(watch);
+                        watch.as_mut().enable();
+                        if behind.is_settled() || crate::store::shared::fire_cap(engine) > cut_at {
+                            break;
+                        }
+                        tokio::select! {
+                            () = &mut watch => {}
+                            _ = behind.clone() => {}
+                        }
                     }
                 }
                 let cap = crate::store::shared::fire_cap(engine);
@@ -3573,6 +3618,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
         }
         if let (Some(want), Some(last)) = (rung_want, submitted.last()) {
             last.on_settled(move || drop(want));
+        }
+        // The claims on what this pass computes stand until its last piece
+        // settles (its pages sealed); a pass that ends early drops them.
+        if let (Some(guard), Some(last)) = (coalesced.take(), submitted.last()) {
+            last.on_settled(move || drop(guard));
         }
         advance_cursors(&pass_lanes, Some(&landings), &matched, &fold, &settles);
         crate::probe_fire_record!(submit_probe.total_us, submit_clock.elapsed());
@@ -4770,6 +4820,78 @@ pub(crate) mod lifecycle_tests {
         Ok(())
     }
 
+    /// Yields until `task` has run as far as it can without an event.
+    async fn settle_tasks() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A stale grant is quoted again on drift (the demand changed), not by
+    /// count, and refused when stale against the demand it was quoted for.
+    #[test]
+    fn a_stale_grant_is_quoted_again_only_on_drift() {
+        let demand = |kv_pages| crate::planner::Demand {
+            kv_pages,
+            rs: crate::store::rs::RsUnits::default(),
+        };
+        let mut stale_at = None;
+        assert!(
+            requote_on_drift(&mut stale_at, demand(4)),
+            "first stale: quoted again"
+        );
+        assert!(
+            requote_on_drift(&mut stale_at, demand(6)),
+            "drifted: quoted again"
+        );
+        assert!(
+            requote_on_drift(&mut stale_at, demand(7)),
+            "drifted again: however often"
+        );
+        assert!(
+            !requote_on_drift(&mut stale_at, demand(7)),
+            "stale against the demand it was quoted for: refused"
+        );
+    }
+
+    /// A piece waiting for a wider rung wakes when the cap is lifted, not
+    /// on a clock.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_piece_waiting_on_the_rung_wakes_when_the_cap_lifts() {
+        const ENGINE: usize = 40;
+        crate::store::shared::set_fire_cap_for_test(ENGINE, 16);
+        let waiting = tokio::spawn(wait_for_rung(ENGINE, 256, Some(|| None)));
+        settle_tasks().await;
+        assert!(!waiting.is_finished(), "cut to 16, it waits");
+        crate::store::shared::set_fire_cap_for_test(ENGINE, 256);
+        settle_tasks().await;
+        assert!(waiting.is_finished(), "the cap lifted: it runs");
+        assert!(waiting.await.unwrap().is_ok());
+        crate::store::shared::set_fire_cap_for_test(ENGINE, u32::MAX);
+    }
+
+    /// A piece waiting for a wider rung wakes when its raise's funding is
+    /// refused, and says so.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_piece_waiting_on_the_rung_wakes_when_its_funding_is_refused() {
+        const ENGINE: usize = 41;
+        crate::store::shared::set_fire_cap_for_test(ENGINE, 16);
+        let refused = Arc::new(Mutex::new(None::<String>));
+        let failed = {
+            let refused = refused.clone();
+            move || refused.lock().unwrap().clone()
+        };
+        let waiting = tokio::spawn(wait_for_rung(ENGINE, 256, Some(failed)));
+        settle_tasks().await;
+        assert!(!waiting.is_finished());
+        *refused.lock().unwrap() = Some("no room".into());
+        crate::store::shared::rung_changed(ENGINE);
+        settle_tasks().await;
+        assert!(waiting.is_finished(), "the refusal told the rung: it ends");
+        assert!(waiting.await.unwrap().unwrap_err().contains("no room"));
+        crate::store::shared::set_fire_cap_for_test(ENGINE, u32::MAX);
+    }
+
     pub(crate) fn pending_fire_fixture(
         cells: BoundCells,
     ) -> (
@@ -5142,6 +5264,8 @@ mod rung_wait_tests {
         let refuse = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             *says.lock().unwrap() = Some("the device is short".into());
+            // As a raise's funding tells the rung when it fails.
+            crate::store::shared::rung_changed(REFUSED);
         });
         let waited = tokio::time::timeout(
             std::time::Duration::from_secs(5),

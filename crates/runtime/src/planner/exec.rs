@@ -1,7 +1,6 @@
 use crate::rt::Instant;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::{ProcessId, ResidencyPlanner};
 
@@ -609,8 +608,6 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     planner.report_evicted(pid, freed as u32, rs_freed);
 }
 
-const MOVE_WAIT: Duration = Duration::from_secs(10);
-
 /// Tells the engine where `pid`'s unparked instance tables and rings lie
 /// now, on its lane ahead of any fire of theirs: each item's slots
 /// (`Engine::rebind_slots`). An item it refuses stays stale, to be told
@@ -673,7 +670,6 @@ async fn restore(
         let ended = crate::store::registry::with_kv_lock(&stores.kv, "planner-restore", |kv| {
             kv.moves_ended()
         });
-        let deadline = Instant::now() + MOVE_WAIT;
         loop {
             let notified = ended.notified();
             let mut notified = std::pin::pin!(notified);
@@ -687,13 +683,12 @@ async fn restore(
                     kv = Some(txn);
                     break;
                 }
-                Err(KvStoreError::MoveInFlight) if Instant::now() < deadline => {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    let _ = crate::rt::time::timeout(left, notified).await;
-                }
-                // Still moving, or its pages moved meanwhile: queue again,
+                // Another move holds pages it shares: it waits for that move
+                // to end, the event, however long.
+                Err(KvStoreError::MoveInFlight) => notified.await,
+                // Its pages moved meanwhile: queue again, quoted anew,
                 // which is no failure of this restore.
-                Err(KvStoreError::MoveInFlight | KvStoreError::GrantMismatch { .. }) => {
+                Err(KvStoreError::GrantMismatch { .. }) => {
                     planner.requeue_restore(pid, None);
                     return;
                 }

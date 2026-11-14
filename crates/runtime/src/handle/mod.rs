@@ -20,9 +20,6 @@ pub(crate) use table::{Landing, Table};
 
 use client_api::{HandleErrorCode, HandleName};
 
-const MOVE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-const RS_MOVE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
-
 /// How long a fork holds up its session for a move to end, before it is
 /// refused as `in_use`: the session has output to deliver.
 const FORK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);

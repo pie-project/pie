@@ -295,6 +295,10 @@ pub trait Mover {
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 
     fn epoch_now(&self) -> u64;
+
+    /// The engine whose rung events ([`super::rung_changed`]) a wait on
+    /// this raise waits on.
+    fn engine(&self) -> usize;
 }
 
 /// Raises `shared`'s activation to `goal`'s (a rung's tokens, given the
@@ -318,9 +322,13 @@ pub async fn take_raise(
     let Some(evacuation) = evacuation else {
         return Ok(None);
     };
-    if !carry_raise(shared, &evacuation, mover).await {
-        return Ok(None);
+    if let Err(refused) = carry_raise(shared, &evacuation, mover).await {
+        // Refused and taken back: the rung's waiters look again, and the
+        // caller is told; nothing tries it again on its own wake.
+        super::rung_changed(mover.engine());
+        return Err(refused);
     }
+    super::rung_changed(mover.engine());
     tracing::info!(
         rung = evacuation.rung,
         moved = evacuation.moves.len(),
@@ -334,20 +342,26 @@ pub async fn take_raise(
 /// backs its carve for the wider rung), then the copy of what it moves.
 /// Either refused, the raise is taken back ([`SharedPool::raise_refused`]),
 /// fires stay at the rung in hand, and an engine that backed the carve is
-/// told the rung went back; `false` then. Nothing faults.
-pub async fn carry_raise(shared: &Shared, evacuation: &RungEvacuation, mover: &impl Mover) -> bool {
+/// told the rung went back; the refusal answered. Nothing faults.
+pub async fn carry_raise(
+    shared: &Shared,
+    evacuation: &RungEvacuation,
+    mover: &impl Mover,
+) -> Result<(), String> {
     let (waits, tells) = {
         let pool = shared.lock().unwrap();
         (pool.raise_waits(evacuation), pool.tells_rungs())
     };
     if !waits {
-        return true;
+        return Ok(());
     }
     let (from, to) = (evacuation.from, evacuation.rung);
     if tells && let Err(error) = mover.set_rung(from, to).await {
         tracing::warn!(%error, from, to, "a raise's carve was refused; fires stay at the rung in hand");
         shared.lock().unwrap().raise_refused(evacuation);
-        return false;
+        return Err(format!(
+            "the engine refused the carve for rung {to}: {error}"
+        ));
     }
     if !evacuation.moves.is_empty()
         && let Err(error) = mover.evacuate(SharedPool::rung_moves(evacuation)).await
@@ -357,11 +371,11 @@ pub async fn carry_raise(shared: &Shared, evacuation: &RungEvacuation, mover: &i
         if tells && let Err(error) = mover.set_rung(to, from).await {
             tracing::warn!(%error, from = to, to = from, "a rung notice was refused");
         }
-        return false;
+        return Err(format!("the engine refused a raise's copy: {error}"));
     }
     let next = mover.epoch_now().saturating_add(1);
     shared.lock().unwrap().raise_copied(next);
-    true
+    Ok(())
 }
 
 /// Waits until `shared`'s activation holds what fires may take now, the
@@ -380,7 +394,12 @@ pub async fn fund_span(
     funder: &impl Funder,
     mover: &impl Mover,
 ) -> Result<(), String> {
+    let engine = mover.engine();
     loop {
+        // Armed before the look: a change between the two is not lost.
+        let watch = super::rung_watch(engine);
+        tokio::pin!(watch);
+        watch.as_mut().enable();
         let (short, copying, goal, capped) = {
             let pool = shared.lock().unwrap();
             let rows = cap();
@@ -397,8 +416,8 @@ pub async fn fund_span(
         }
         if copying || short == 0 {
             // A raise's copy is the engine's to take, or the walk is to cut
-            // fires to the widest rung that fits.
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            // fires to the widest rung that fits: either tells the rung.
+            watch.await;
             continue;
         }
         let pages = shared.lock().unwrap().raise_short(goal).1;
@@ -409,7 +428,7 @@ pub async fn fund_span(
                 "a program's fire term asks the planner for room"
             );
             if !funder.fund(pages).await? {
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                // Quoted again: the planner's answer is the event.
                 continue;
             }
         }
@@ -417,8 +436,9 @@ pub async fn fund_span(
             .await?
             .is_none()
         {
-            // The walk is raising it, or the room went to another since.
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            // The walk is raising it, or the room went to another since:
+            // either moves the rung or frees room.
+            watch.await;
         }
     }
 }
@@ -459,6 +479,10 @@ pub struct LaneMover<F> {
 }
 
 impl<F: Fn() -> u64 + Sync> Mover for LaneMover<F> {
+    fn engine(&self) -> usize {
+        self.engine
+    }
+
     async fn evacuate(&self, evacuation: ::engine::chunk::Evacuation) -> Result<(), String> {
         crate::scheduler::pool(
             self.engine,

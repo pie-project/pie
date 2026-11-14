@@ -200,6 +200,34 @@ impl Gauge {
     }
 }
 
+/// Per tier, how many times the policy (or the default responder) answered
+/// a pressure report and freed nothing: what a short waiter fails on, not a
+/// clock ([`answered_nothing`]).
+static NOTHING_FREED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Told on each [`answered_nothing`].
+static ANSWERED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// The policy answered `tier`'s pressure and freed nothing: no discard, no
+/// termination, no new keys. Short waiters it alone could serve fail now.
+pub fn answered_nothing(tier: Tier) {
+    NOTHING_FREED[tier.index()].fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    ANSWERED.notify_waiters();
+}
+
+/// How many times `tier`'s pressure was answered with nothing freed.
+#[must_use]
+pub fn nothing_freed(tier: Tier) -> u64 {
+    NOTHING_FREED[tier.index()].load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The next [`answered_nothing`]: arm it before looking.
+#[must_use]
+pub fn answered() -> tokio::sync::futures::Notified<'static> {
+    ANSWERED.notified()
+}
+
 /// A shortfall that stands unchanged is reported again this often, so the
 /// default responder looks again when its last discard freed too little.
 pub const AGAIN: Duration = Duration::from_millis(100);

@@ -50,6 +50,10 @@ pub trait PoolPort: Send + Sync + 'static {
     fn rs_growth(&self) -> RsUnits {
         RsUnits::default()
     }
+    /// Room was freed or a fire retired: what waits on it beside the
+    /// planner's own waiters (the rung, the segment walk, arming) looks
+    /// again.
+    fn freed(&self) {}
     /// Asks for `need` more of each shape than stands free now; true when
     /// memory is on its way, and `pages_freed` follows it.
     fn grow(&self, need: super::Demand) -> bool {
@@ -301,6 +305,14 @@ impl PoolPort for RegistryPool {
             shared.wake();
         }
         pages
+    }
+
+    fn freed(&self) {
+        crate::store::shared::rung_changed(self.engine);
+        crate::scheduler::arming::room_freed(self.engine);
+        if let Some(shared) = &self.shared {
+            shared.room_freed();
+        }
     }
 
     fn grow(&self, need: super::Demand) -> bool {

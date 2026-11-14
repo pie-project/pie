@@ -1803,3 +1803,86 @@ async fn a_window_store_tells_the_walker_a_reserve_stated_in_pages() {
         .note_short_shared(RsUnits::default());
     assert_eq!(wanted(), before);
 }
+
+/// What waits for a process to stop being moved off the device (a handle
+/// claiming its sets) wakes when its eviction ends, on no clock.
+#[tokio::test(flavor = "current_thread")]
+async fn a_wait_for_a_move_to_end_wakes_when_the_eviction_ends() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::new(4)) as Arc<dyn PoolPort>
+    ));
+    let agent = ProcessId::new_v4();
+    planner.register(agent);
+    planner.note_admitted(agent);
+    planner.set_idle(agent, true);
+    planner.with_inner(|inner| inner.procs.get_mut(&agent).unwrap().state = Residency::Evicting);
+    let waiting = {
+        let planner = planner.clone();
+        crate::rt::spawn(async move { planner.wait_not_moving(agent).await })
+    };
+    for _ in 0..20 {
+        crate::rt::yield_now().await;
+    }
+    assert!(!waiting.is_finished(), "still being moved: it waits");
+    planner.report_evicted(agent, 3, RsUnits::default());
+    for _ in 0..20 {
+        crate::rt::yield_now().await;
+    }
+    assert!(waiting.is_finished(), "the eviction ended: it wakes");
+}
+
+/// What waits on a process's full departure (a served offload prefill
+/// waiting for its pages to be kept) wakes when its last hold drops.
+#[tokio::test(flavor = "current_thread")]
+async fn a_departure_watch_wakes_when_the_last_hold_drops() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::new(4)) as Arc<dyn PoolPort>
+    ));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    let hold = super::departure::Departure::new(&planner, pid);
+    let watch = crate::planner::DepartureWatch::new(pid);
+    let waiting = crate::rt::spawn(async move {
+        loop {
+            let next = crate::planner::DepartureWatch::next();
+            tokio::pin!(next);
+            next.as_mut().enable();
+            if watch.gone() {
+                return;
+            }
+            next.await;
+        }
+    });
+    for _ in 0..20 {
+        crate::rt::yield_now().await;
+    }
+    assert!(!waiting.is_finished(), "still held: it waits");
+    drop(hold);
+    for _ in 0..20 {
+        crate::rt::yield_now().await;
+    }
+    assert!(waiting.is_finished(), "the last hold dropped: it wakes");
+}
+
+/// A watch follows a restart: the old run departing is not the process's
+/// departure; the new run's is.
+#[tokio::test(flavor = "current_thread")]
+async fn a_departure_watch_follows_a_restart() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::new(4)) as Arc<dyn PoolPort>
+    ));
+    let (old, new) = (ProcessId::new_v4(), ProcessId::new_v4());
+    planner.register(old);
+    planner.register(new);
+    let watch = crate::planner::DepartureWatch::new(old);
+    let old_hold = super::departure::Departure::new(&planner, old);
+    let new_hold = super::departure::Departure::new(&planner, new);
+    crate::planner::follow_restart(old, new);
+    drop(old_hold);
+    assert!(!watch.gone(), "the old run left; the process runs on");
+    drop(new_hold);
+    assert!(watch.gone(), "its newest run departed");
+}

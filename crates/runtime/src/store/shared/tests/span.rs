@@ -32,6 +32,10 @@ impl Mover for Lane {
             .map_err(|error| error.to_string())
     }
 
+    fn engine(&self) -> usize {
+        49
+    }
+
     fn epoch_now(&self) -> u64 {
         0
     }
@@ -316,9 +320,9 @@ async fn a_move_free_raise_reaches_an_on_demand_engine_and_can_be_refused() {
     let engine = Arc::new(Mutex::new(engine));
     let lane = Lane(engine.clone());
 
-    // Refused: taken back.
-    let taken = take_raise(&shared, |_| 2048, &lane).await.unwrap();
-    assert!(taken.is_none());
+    // Refused: taken back, and the refusal answered.
+    let refused = take_raise(&shared, |_| 2048, &lane).await.unwrap_err();
+    assert!(refused.contains("refused the carve"), "{refused}");
     {
         let pool = shared.lock().unwrap();
         assert_eq!(pool.rung(), 256, "the rung in hand");
@@ -574,4 +578,32 @@ async fn the_walk_never_lowers_under_the_live_lanes_decode() {
     raise_now(&shared, ENGINE, 300);
     assert_eq!(shared.lock().unwrap().rung(), 2048);
     assert_eq!(fire_cap(ENGINE), u32::MAX);
+}
+
+/// A refused commit_span is not asked again on the walk's next wake, only
+/// once room is freed lifts the block.
+#[test]
+fn a_refused_commit_span_is_asked_again_only_once_room_is_freed() {
+    let (mut pool, mut engine) = on_demand_pool();
+    assert_eq!(
+        walk_segments(&mut pool, 6, 0, &mut engine),
+        Retarget::Reached
+    );
+    pool.lower_rung(256).unwrap();
+    assert!(matches!(
+        pool.next_move(7, 1),
+        Some(SegmentMove::CommitSpan { n: 1 })
+    ));
+    // The engine refused it: blocked.
+    pool.block_span_commit(true);
+    assert!(
+        !matches!(pool.next_move(7, 2), Some(SegmentMove::CommitSpan { .. })),
+        "not asked again on the next wake"
+    );
+    // Room freed lifts it.
+    pool.block_span_commit(false);
+    assert!(matches!(
+        pool.next_move(7, 3),
+        Some(SegmentMove::CommitSpan { n: 1 })
+    ));
 }

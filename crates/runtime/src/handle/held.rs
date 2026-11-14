@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
-use super::{FORK_WAIT, MOVE_WAIT, RS_MOVE_POLL};
+use super::FORK_WAIT;
 use crate::inferlet::ProcessId;
 use crate::inferlet::host::working_set::Cursor;
 use crate::inferlet::process::ProcessResidency;
@@ -94,13 +94,8 @@ impl Held {
             return Ok(());
         };
         planner.claim_holder(self.holder);
-        let deadline = crate::rt::time::Instant::now() + MOVE_WAIT;
-        while planner.holder_moving(self.holder) {
-            if crate::rt::time::Instant::now() >= deadline {
-                return Err("its pages are still moving".to_string());
-            }
-            let _ = crate::rt::time::timeout(RS_MOVE_POLL, std::future::pending::<()>()).await;
-        }
+        // Its eviction ending is the event: no clock, no deadline.
+        planner.wait_not_moving(self.holder).await;
         Ok(())
     }
 
@@ -245,7 +240,7 @@ async fn settled<T>(
     }
 }
 
-/// [`settled`] for recurrent state, whose moves end with no signal.
+/// [`settled`] for recurrent state: woken when a move lets slots go.
 async fn rs_settled<T>(
     rs: &RsWorkingSet,
     mut f: impl FnMut(&mut RsStore) -> T,
@@ -253,16 +248,21 @@ async fn rs_settled<T>(
     let stores = store_registry::get(rs.model, rs.engine);
     let deadline = crate::rt::time::Instant::now() + FORK_WAIT;
     loop {
+        let ended = stores.rs.lock().unwrap().moves_ended();
+        let notified = ended.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
         {
             let mut store = stores.rs.lock().unwrap();
             if !store.in_move(rs.id) {
                 return Ok(f(&mut store));
             }
         }
-        if crate::rt::time::Instant::now() >= deadline {
+        let now = crate::rt::time::Instant::now();
+        if now >= deadline {
             return Err("its state is still moving".to_string());
         }
-        let _ = crate::rt::time::timeout(RS_MOVE_POLL, std::future::pending::<()>()).await;
+        let _ = crate::rt::time::timeout(deadline - now, notified).await;
     }
 }
 
