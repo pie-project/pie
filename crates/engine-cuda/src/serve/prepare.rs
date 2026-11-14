@@ -711,7 +711,7 @@ impl FrameShell for Shell {
                 Some(store) if store.seat().token_patch.is_some() => crate::voxels::Tables {
                     grid: vec![0; 4],
                     token_grid: vec![0; 4],
-                    slots: vec![0],
+                    clip_lanes: vec![0],
                     ..crate::voxels::Tables::default()
                 },
                 _ => crate::voxels::Tables::default(),
@@ -730,16 +730,15 @@ impl FrameShell for Shell {
                            runs over the whole voxel rectangle (M0: one voxel class per fire)",
                 });
             }
-            // A clip's conv caches are State rows: the lane's recurrent-state row.
-            let slot_of: Vec<u32> = lanes
-                .iter()
-                .map(|seated| seated.rs_slot.unwrap_or(seated.lane.slot))
-                .collect();
+            // A clip's conv caches are State rows, read as every recurrent
+            // row is: through the fire's lane table, which names each
+            // lane's record. A clip names its lane.
+            let lane_of: Vec<u32> = (0..lanes.len() as u32).collect();
             crate::voxels::Tables::of(
                 &store.seat(),
                 composition.lanes(),
                 &clips_of,
-                &slot_of,
+                &lane_of,
                 fed_width,
             )?
         };

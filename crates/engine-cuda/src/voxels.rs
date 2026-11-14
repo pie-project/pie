@@ -76,7 +76,7 @@ pub struct Store {
     buffer: Buffer,
     grid: u64,
     token_grid: u64,
-    slots: u64,
+    clip_lanes: u64,
     payload: u64,
 }
 
@@ -85,7 +85,8 @@ pub struct Handles {
     pub grid: Tensor,
     pub token_grid: Option<Tensor>,
     pub voxels: Option<Tensor>,
-    pub slots: Tensor,
+    /// Each clip's lane: its row in the fire's recurrent lane tables.
+    pub clip_lanes: Tensor,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -112,7 +113,8 @@ pub struct Tables {
     pub payload: Vec<u8>,
     pub channels: u32,
     pub rows: u64,
-    pub slots: Vec<i32>,
+    /// Each clip's lane in the fire ([`Handles::clip_lanes`]).
+    pub clip_lanes: Vec<i32>,
 }
 
 impl Tables {
@@ -120,7 +122,7 @@ impl Tables {
         seat: &Seat,
         lanes: &[LaneRow],
         of_lane: &[Option<Clips<'_>>],
-        slot_of: &[u32],
+        lane_of: &[u32],
         fed: u32,
     ) -> Result<Tables> {
         let clips_total: usize = lanes.iter().map(|lane| lane.clips as usize).sum();
@@ -182,7 +184,7 @@ impl Tables {
         } else {
             Vec::new()
         };
-        let mut slots = vec![0i32; clips_total];
+        let mut clip_lanes = vec![0i32; clips_total];
         for lane in lanes {
             let Some(shot) = of_lane.get(lane.source as usize).copied().flatten() else {
                 continue;
@@ -200,9 +202,9 @@ impl Tables {
             }
             let mut row: i64 = i64::from(lane.voxel_offset);
             let mut token_row: i64 = i64::from(lane.row_offset);
-            let slot = slot_of.get(lane.source as usize).copied().unwrap_or(0) as i32;
+            let at_lane = lane_of.get(lane.source as usize).copied().unwrap_or(0) as i32;
             for (c, [t, h, w]) in shot.clips.iter().enumerate() {
-                slots[lane.clip_offset as usize + c] = slot;
+                clip_lanes[lane.clip_offset as usize + c] = at_lane;
                 let at = (lane.clip_offset as usize + c) * 4;
                 grid[at..at + 4].copy_from_slice(&[*t as i32, *h as i32, *w as i32, row as i32]);
                 row += i64::from(*t) * i64::from(*h) * i64::from(*w);
@@ -241,7 +243,7 @@ impl Tables {
             payload,
             channels,
             rows: voxels_total as u64,
-            slots,
+            clip_lanes,
         })
     }
 }
@@ -251,20 +253,20 @@ impl Store {
         let align = |bytes: u64| bytes.next_multiple_of(256);
         let grid = 0u64;
         let token_grid = align(seat.clips * 16);
-        let slots = token_grid
+        let clip_lanes = token_grid
             + if seat.token_patch.is_some() {
                 align(seat.clips * 16)
             } else {
                 0
             };
-        let payload = slots + align(seat.clips * 4);
+        let payload = clip_lanes + align(seat.clips * 4);
         let total = payload + align(seat.rows * seat.row_bytes());
         Ok(Store {
             seat,
             buffer: Buffer::zeroed(total as usize)?,
             grid,
             token_grid,
-            slots,
+            clip_lanes,
             payload,
         })
     }
@@ -304,7 +306,7 @@ impl Store {
                 .stage(stream, self.token_grid, i32_bytes(&tables.token_grid))?;
         }
         self.buffer
-            .stage(stream, self.slots, i32_bytes(&tables.slots))?;
+            .stage(stream, self.clip_lanes, i32_bytes(&tables.clip_lanes))?;
         if !tables.payload.is_empty() {
             self.buffer.stage(stream, self.payload, &tables.payload)?;
         }
@@ -320,7 +322,7 @@ impl Store {
                     self.seat.dtype,
                 )
             }),
-            slots: Tensor::new(base + self.slots, clips as u32, 1, Dtype::I32),
+            clip_lanes: Tensor::new(base + self.clip_lanes, clips as u32, 1, Dtype::I32),
         })
     }
 }

@@ -321,7 +321,7 @@ pub struct FireBindings {
     pub grid: Option<Tensor>,
     pub token_grid: Option<Tensor>,
     pub voxels: Option<Tensor>,
-    pub clip_slots: Option<Tensor>,
+    pub clip_lanes: Option<Tensor>,
 
     pub lane_of_row: Tensor,
     pub group_of_lane: Option<Tensor>,
@@ -2355,14 +2355,18 @@ impl<'c> Run<'c> {
         skip(handle, window.row_offset, window.rows)
     }
 
-    /// Cut to this window's clips, indexed as its grids index lanes.
-    pub(crate) fn clip_slots(&self) -> Option<Tensor> {
-        let slots = self.fire.clip_slots?;
+    /// Each of this window's clips' lane in the fire, cut as its grids
+    /// index lanes, and the lane the recurrent pools' lane tables start at
+    /// in this window ([`Self::recurrent`]): clip `l` reads row
+    /// `lanes[l] - base` of them.
+    pub(crate) fn clip_lanes(&self) -> Option<(Tensor, u32)> {
+        let lanes = self.fire.clip_lanes?;
+        let base = self.window().span().lane_offset;
         if self.window().gathered.is_some() {
-            return Some(slots);
+            return Some((lanes, base));
         }
         let span = self.window().on(poem_ir::RowAxis::Voxels);
-        Some(skip(slots, span.lane_offset, span.lanes))
+        Some((skip(lanes, span.lane_offset, span.lanes), base))
     }
 
     pub(crate) fn recurrent(&self, id: ValueId) -> RecurrentPool {

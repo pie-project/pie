@@ -110,12 +110,12 @@ impl Run<'_> {
                 };
                 let frames = conv.pad[0];
                 let pool = self.recurrent(*state);
-                let slot_ids = self
-                    .clip_slots()
+                let (clip_lanes, lane_base) = self
+                    .clip_lanes()
                     .ok_or_else(|| kernels_cuda::Error::Backend {
                         op: "conv.conv3d",
                         detail:
-                            "a causal convolution with a frame cache needs the fire's clip slot \
+                            "a causal convolution with a frame cache needs the fire's clip lane \
                              table, which no lane of it staged"
                                 .to_string(),
                     })?;
@@ -127,7 +127,15 @@ impl Run<'_> {
                     usize::try_from(bytes).unwrap_or(usize::MAX),
                 )? as u64;
                 let mut frame_cache = Tensor::new(scratch, rows, x.width, x.dtype);
-                conv::cache_gather(self.ctx(), &pool, slot_ids, grid, frames, &mut frame_cache)?;
+                conv::cache_gather(
+                    self.ctx(),
+                    &pool,
+                    clip_lanes,
+                    lane_base,
+                    grid,
+                    frames,
+                    &mut frame_cache,
+                )?;
                 conv::conv3d(
                     self.ctx(),
                     x,
@@ -145,7 +153,8 @@ impl Run<'_> {
                     x,
                     frame_cache,
                     &pool,
-                    slot_ids,
+                    clip_lanes,
+                    lane_base,
                     grid,
                     frames,
                     bases[0],
@@ -249,15 +258,15 @@ impl Run<'_> {
                 let x = self.tensor(*x);
                 let grid = self.tensor(*grid);
                 let pool = self.recurrent(*cache);
-                let slot_ids = self
-                    .clip_slots()
+                let (clip_lanes, lane_base) = self
+                    .clip_lanes()
                     .ok_or_else(|| kernels_cuda::Error::Backend {
                         op: "conv.cache_store",
                         detail:
-                            "a frame-cache store needs the fire's clip slot table, which no lane                              of it staged"
+                            "a frame-cache store needs the fire's clip lane table, which no lane                              of it staged"
                                 .to_string(),
                     })?;
-                conv::cache_store(self.ctx(), x, x, &pool, slot_ids, grid, *frames, base)
+                conv::cache_store(self.ctx(), x, x, &pool, clip_lanes, lane_base, grid, *frames, base)
             }
             Conv::Patchify {
                 x,
