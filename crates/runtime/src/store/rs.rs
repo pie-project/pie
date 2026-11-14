@@ -490,7 +490,10 @@ impl RsStore {
     pub fn note_short_shared(&mut self, need: RsUnits) {
         self.slots.wait(u64::from(need.slots));
         if self.is_window() {
-            self.pages.wait(u64::from(need.windows[0]));
+            // List 0 is the pages: an ask states it in `windows[0]`, and a
+            // seating reserve (`ResidencyPlanner`'s, growth in pages) in
+            // `pages`; the walker grows for the larger.
+            self.pages.wait(u64::from(need.windows[0].max(need.pages)));
             for (at, pool) in self.window_pools.iter_mut().enumerate() {
                 pool.wait(u64::from(need.windows.get(at + 1).copied().unwrap_or(0)));
             }
@@ -509,7 +512,8 @@ impl RsStore {
     /// nothing off, and a waiter's on top.
     pub fn demand(&self) -> (u32, u32) {
         let reach = self.slots.high_end().max(self.pages.high_end());
-        let out = |pool: &ShapePool<RsSlotId>| pool.capacity().saturating_sub(pool.available() as u32);
+        let out =
+            |pool: &ShapePool<RsSlotId>| pool.capacity().saturating_sub(pool.available() as u32);
         let wanted = out(&self.slots).max(out(&self.pages));
         let kept: HashSet<RsSlotId> = self
             .checkpoints

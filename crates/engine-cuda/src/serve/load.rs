@@ -1375,6 +1375,15 @@ impl Shell {
         // several, and its scratch is held at this width, not at the lanes.
         let flight = 1 << shell.device.device().num_sm.max(1).ilog2();
         shell.programs.set_flight(flight);
+        // A fire that replays a recorded body carves for the body's lane
+        // capacity, not its own lanes: the rungs stated to the runtime
+        // follow that carve, so state is never lent under a carve a fire
+        // cut to the rung still lays.
+        if shell.records_bodies() {
+            shell
+                .arena
+                .reach_lanes(crate::window::lane_capacity(shell.budget.max_lanes));
+        }
         let programs = crate::store::program_scratch_reserve(
             boot.budget.max_lanes.min(flight),
             shell.exports.readout_row_bytes(),

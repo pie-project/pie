@@ -432,3 +432,80 @@ async fn a_bind_whose_room_is_refused_fails_its_wait() {
         .unwrap_err();
     assert!(error.contains("the engine refuses"), "{error}");
 }
+
+/// A pool that states no rungs (Vulkan, wgpu, XLA, Metal before its span):
+/// its activation is no part of it.
+fn rungless_pool() -> (SharedPool, FakeEngine) {
+    let mut facts = facts();
+    facts.act_chunks = Vec::new();
+    let mut pool = SharedPool::new(&facts, 256).unwrap();
+    pool.set_max_lanes(LANES);
+    assert!(pool.rungs().is_empty());
+    (pool, FakeEngine::new())
+}
+
+/// The regression: on a pool without rungs every bind was refused, a zero
+/// term included ("fires need 0 bytes ... 0 chunks of the 15173"). A zero
+/// term never refuses, and the bind waits on nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_zero_term_never_refuses_a_bind_on_a_pool_without_rungs() {
+    let (mut pool, engine) = rungless_pool();
+    pool.program_registered(PROGRAM, &ProgramFacts::default());
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let open = ProgramOpen::new(&shared, PROGRAM).expect("a zero term never refuses");
+    fund_span(
+        &shared,
+        || u32::MAX,
+        &NoPlanner,
+        &Lane(Arc::new(Mutex::new(engine))),
+    )
+    .await
+    .unwrap();
+    drop(open);
+}
+
+/// On a pool without rungs a term, however large, is ignored: no bind is
+/// refused for it and none waits on it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pool_without_rungs_skips_the_term_check() {
+    let (mut pool, engine) = rungless_pool();
+    pool.program_registered(PROGRAM, &fire_facts());
+    pool.program_registered(
+        ProgramId(9),
+        &ProgramFacts {
+            fire_bytes_fixed: u64::from(TOTAL) * CHUNK,
+            ..ProgramFacts::default()
+        },
+    );
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let open = ProgramOpen::new(&shared, PROGRAM).expect("the term is ignored");
+    let huge = ProgramOpen::new(&shared, ProgramId(9)).expect("past the device, still ignored");
+    {
+        let pool = shared.lock().unwrap();
+        assert_eq!(
+            pool.pool().act_chunks(16),
+            0,
+            "no activation to fold it into"
+        );
+        assert_eq!(pool.span_short(u32::MAX), 0);
+        assert_eq!(pool.fit_cap(), u32::MAX, "fires uncut");
+    }
+    fund_span(
+        &shared,
+        || u32::MAX,
+        &NoPlanner,
+        &Lane(Arc::new(Mutex::new(engine))),
+    )
+    .await
+    .unwrap();
+    drop((open, huge));
+}
+
+/// On a pool with rungs a zero term never refuses either.
+#[test]
+fn a_zero_term_never_refuses_a_bind_on_a_pool_with_rungs() {
+    let (mut pool, _) = pool_at_256();
+    pool.program_registered(PROGRAM, &ProgramFacts::default());
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    assert!(ProgramOpen::new(&shared, PROGRAM).is_ok());
+}
