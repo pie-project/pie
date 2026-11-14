@@ -218,6 +218,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
             device_resolved: Default::default(),
             instance_slots: Vec::new(),
             ring_slots: Vec::new(),
+            adapter_slots: Vec::new(),
             extents: engine::program::BindExtents {
                 row_count: BEAMS,
                 token_count: BEAMS,

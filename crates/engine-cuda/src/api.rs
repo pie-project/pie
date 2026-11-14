@@ -916,6 +916,7 @@ impl Engine for Cuda {
                 id,
                 instance,
                 rings,
+                ..
             } => self
                 .loaded_mut()?
                 .rebind_program(id, crate::program::Slots { instance, rings })

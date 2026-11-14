@@ -345,6 +345,7 @@ impl Plane {
         Ok(ProgramFacts {
             instance,
             rings,
+            ..ProgramFacts::default()
         })
     }
 
@@ -401,6 +402,7 @@ impl Plane {
                     id,
                     instance,
                     rings,
+                    ..
                 } => {
                     let seat = self.instances.get_mut(id).ok_or(Refusal::Closed {
                         what: "instance",

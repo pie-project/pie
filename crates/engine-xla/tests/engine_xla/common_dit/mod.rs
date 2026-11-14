@@ -703,6 +703,7 @@ impl Rig {
                 device_resolved: Default::default(),
                 instance_slots: Vec::new(),
                 ring_slots: Vec::new(),
+                adapter_slots: Vec::new(),
                 extents: engine::program::BindExtents {
                     row_count: rows,
                     token_count: rows,

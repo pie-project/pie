@@ -17,8 +17,9 @@
 //! - the rs store's state slots are **records**: one working set's fixed
 //!   state, a slot of every fixed shape of role [`SlotRole::State`] for each
 //!   of its pieces;
-//! - the fixed shapes of roles [`SlotRole::Instance`] and
-//!   [`SlotRole::Channel`] (`new-memory/STATE-ROLES.md`) are no part of a
+//! - the fixed shapes of roles [`SlotRole::Instance`],
+//!   [`SlotRole::Channel`] and [`SlotRole::Adapter`]
+//!   (`new-memory/STATE-ROLES.md`) are no part of a
 //!   record nor of a working set: their slots are taken on demand as
 //!   instances bind and channels register ([`super::roles`]), and are left
 //!   out of every record and working-set count here;
@@ -518,6 +519,7 @@ pub struct FixedShape {
 pub struct RoleShapes {
     pub instance: Option<FixedShape>,
     pub channel: Option<FixedShape>,
+    pub adapter: Option<FixedShape>,
 }
 
 impl RoleShapes {
@@ -527,17 +529,21 @@ impl RoleShapes {
         match role {
             SlotRole::Instance => self.instance,
             SlotRole::Channel => self.channel,
+            SlotRole::Adapter => self.adapter,
             SlotRole::State | SlotRole::RsBuffer => None,
         }
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.instance.is_none() && self.channel.is_none()
+        self.instance.is_none() && self.channel.is_none() && self.adapter.is_none()
     }
 
     fn iter(&self) -> impl Iterator<Item = &FixedShape> {
-        self.instance.iter().chain(&self.channel)
+        self.instance
+            .iter()
+            .chain(&self.channel)
+            .chain(&self.adapter)
     }
 }
 
@@ -741,7 +747,7 @@ impl SharedPool {
         let mut shapes = Vec::with_capacity(facts.shapes.len() + facts.weights.len());
         let (mut lists, mut rs_lists, mut windows, mut fixed) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let (mut instances, mut channels) = (Vec::new(), Vec::new());
+        let (mut instances, mut channels, mut adapters) = (Vec::new(), Vec::new(), Vec::new());
         for shape in &facts.shapes {
             let pool = ShapeId::try_from(shapes.len()).expect("shapes fit a shape id");
             let kind = match shape.kind {
@@ -765,6 +771,7 @@ impl SharedPool {
                     let found = match shape.role {
                         SlotRole::Instance => &mut instances,
                         SlotRole::Channel => &mut channels,
+                        SlotRole::Adapter => &mut adapters,
                         SlotRole::State | SlotRole::RsBuffer => &mut fixed,
                     };
                     found.push(FixedShape {
@@ -842,6 +849,7 @@ impl SharedPool {
             roles: RoleShapes {
                 instance: instances.first().copied(),
                 channel: channels.first().copied(),
+                adapter: adapters.first().copied(),
             },
             weights_first,
             records: Vec::new(),

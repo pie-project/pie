@@ -135,6 +135,11 @@ pub enum Reserved {
     /// State of lanes the runtime does not seat (`Lane::kv_less` lanes that
     /// carry state of their own), `lanes` of them.
     Runtimeless { lanes: u32 },
+    /// The engine's own tables, sized at load from the shapes it states
+    /// (REDESIGN 2.6): the weight cache's atom tables and use counters, and
+    /// the tables an adapter's planes are read through. Model bytes, never
+    /// state: no slot ref names them and nothing parks or drops them.
+    Tables,
 }
 
 /// `chunks` chunks from `first`, reserved for `what`.
@@ -244,6 +249,11 @@ pub enum SlotRole {
     /// [`crate::program::RingSlots::slots`] or
     /// [`crate::channel::ChannelRegistration::slots`].
     Channel,
+    /// One adapter's planes (a fixed shape), written once at the bind that
+    /// lands it, in the slots of
+    /// [`crate::program::InstanceBinding::adapter_slots`] as the engine's
+    /// [`crate::program::ProgramFacts::adapter`] states.
+    Adapter,
 }
 
 impl SlotRole {
@@ -255,7 +265,7 @@ impl SlotRole {
     pub fn replayable(self) -> bool {
         match self {
             SlotRole::State | SlotRole::RsBuffer => true,
-            SlotRole::Instance | SlotRole::Channel => false,
+            SlotRole::Instance | SlotRole::Channel | SlotRole::Adapter => false,
         }
     }
 }
