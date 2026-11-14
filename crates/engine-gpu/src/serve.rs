@@ -1170,6 +1170,7 @@ impl<B: Serve> Shell<B> {
         act_chunks.reverse();
         act_chunks.dedup_by_key(|&mut (_, chunks)| chunks);
         act_chunks.reverse();
+        span.widen(&act_chunks, chunk);
         let layout = crate::store::layout::Layout::new(
             chunk,
             total,

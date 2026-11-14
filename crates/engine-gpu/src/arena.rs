@@ -95,6 +95,8 @@ impl Rung {
 pub struct Span<B: Backend> {
     /// Ascending; the last is the top fire's (the compiler's own carve).
     rungs: Vec<Rung>,
+    /// For each rung, the carve its fires take ([`Span::widen`]).
+    widest: Vec<usize>,
     routers: Vec<u32>,
     /// The pool's last segment and the byte in it the span ends at.
     place: Option<(B::Buffer, u64)>,
@@ -118,6 +120,7 @@ impl<B: Backend> Span<B> {
             .map(|&tokens| Rung::lay(trace, compiled, budgets, tokens, paging, tuning, &routers))
             .collect::<Result<Vec<_>>>()?;
         Ok(Span {
+            widest: (0..rungs.len()).collect(),
             rungs,
             routers,
             place: None,
@@ -179,13 +182,41 @@ impl<B: Backend> Span<B> {
         Ok(self.placed()?.0)
     }
 
-    /// The rung a fire of `rows` takes: the narrowest that holds it.
+    /// The carve a fire of `rows` takes: the widest whose bytes lie in the
+    /// chunks stated for the narrowest rung that holds it
+    /// ([`Span::widen`]).
     #[must_use]
     pub fn rung_of(&self, rows: FireRows) -> usize {
-        self.rungs
+        let narrowest = self
+            .rungs
             .iter()
             .position(|rung| rung.holds(rows))
-            .unwrap_or(self.rungs.len().saturating_sub(1))
+            .unwrap_or(self.rungs.len().saturating_sub(1));
+        self.widest.get(narrowest).copied().unwrap_or(narrowest)
+    }
+
+    /// Takes the rungs the pool states, `(tokens, chunks)` of `chunk_bytes`
+    /// each class once: a fire then carves the widest carve that lies in
+    /// its rung's stated chunks, so where rungs share their chunks (all of
+    /// them, where the span lies past the kernels' state index) it lays
+    /// out as at the top fire and lends nothing it would not.
+    pub fn widen(&mut self, stated: &[(u32, u32)], chunk_bytes: u64) {
+        let room = |tokens: u32| {
+            stated
+                .iter()
+                .find(|&&(rung, _)| rung >= tokens)
+                .or(stated.last())
+                .map_or(0, |&(_, chunks)| u64::from(chunks) * chunk_bytes)
+        };
+        self.widest = (0..self.rungs.len())
+            .map(|at| {
+                let room = room(self.rungs[at].tokens);
+                (at..self.rungs.len())
+                    .rev()
+                    .find(|&wide| self.rungs[wide].bytes <= room)
+                    .unwrap_or(at)
+            })
+            .collect();
     }
 
     /// Where rung `rung`'s carve starts in the span's buffer: the span's
