@@ -703,10 +703,6 @@ impl Engine for Cuda {
                 self.boot.world.size * self.expert.size,
             )
             .map_err(fault)?;
-        // Every page the load serves is backed now, so serving maps nothing:
-        // a dying process holding the driver's lock stalls no fire of this
-        // one's.
-        shell.back_whole().map_err(fault)?;
         let kv_handle = if residency.kv_export {
             Some(shell.export_kv(self.boot.world).map_err(fault)?)
         } else {
@@ -885,6 +881,19 @@ impl Engine for Cuda {
         match self.shell.as_ref() {
             Some(shell) => shell.program_facts(program).map_err(fault),
             None => Ok(engine::program::ProgramFacts::default()),
+        }
+    }
+
+    fn fire_facts(
+        &self,
+        program: ProgramId,
+        extents: &engine::program::BindExtents,
+    ) -> EngineResult<engine::program::FireFacts> {
+        match self.shell.as_ref() {
+            Some(shell) => shell
+                .fire_facts(program, self::extents(extents))
+                .map_err(fault),
+            None => Ok(engine::program::FireFacts::default()),
         }
     }
 

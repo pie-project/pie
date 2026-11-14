@@ -327,7 +327,10 @@ impl Rig {
                     max_voxels: None,
                     max_clips: None,
                 },
-                residency: Residency::default(),
+                residency: Residency {
+                    device_kv_budget: Some(crate::POOL),
+                    ..Residency::default()
+                },
                 ordinal: 0,
                 frames_in_flight: 1,
             })
@@ -372,8 +375,9 @@ impl Rig {
     fn channel(&mut self, shape: Vec<u32>, host_role: HostRole) -> ChannelId {
         let id = ChannelId(self.next_channel);
         self.next_channel += 1;
-        self.engine
-            .register_channel(&ChannelRegistration {
+        self.guest.register(
+            &mut self.engine,
+            ChannelRegistration {
                 id,
                 shape,
                 dtype: ChanDType::Concrete(EtaDtype::F32),
@@ -383,8 +387,8 @@ impl Rig {
                 capacity: 2,
                 extern_name: Vec::new(),
                 slots: Vec::new(),
-            })
-            .expect("the channel registers");
+            },
+        );
         id
     }
 

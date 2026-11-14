@@ -71,13 +71,7 @@ impl Chunks {
         let total = if crate::device::elastic::mapped_on_demand() {
             total
         } else {
-            let backed =
-                pool.hard_pages().saturating_mul(pool.page_bytes()) / layout.chunk_bytes.max(1);
-            total.min(
-                u32::try_from(backed)
-                    .unwrap_or(u32::MAX)
-                    .saturating_sub(act),
-            )
+            total.min(Chunks::ceiling(pool, &layout, act))
         };
         let total = total.max(1);
         let bytes = (u64::from(total) + u64::from(act)) * layout.chunk_bytes;
@@ -96,6 +90,17 @@ impl Chunks {
             weights: std::collections::BTreeSet::new(),
             skip: (total, 0),
         })
+    }
+
+    /// The chunks the pool's ceiling backs beside an activation of `act`
+    /// chunks: the most a range of this layout can ever hold.
+    #[must_use]
+    pub fn ceiling(pool: &PhysicalPool, layout: &Layout, act: u32) -> u32 {
+        let backed =
+            pool.hard_pages().saturating_mul(pool.page_bytes()) / layout.chunk_bytes.max(1);
+        u32::try_from(backed)
+            .unwrap_or(u32::MAX)
+            .saturating_sub(act)
     }
 
     #[must_use]
@@ -160,6 +165,22 @@ impl Chunks {
         }
         let chunk = self.layout.chunk_bytes;
         (u64::from(self.act) * chunk).saturating_sub(self.range.held(u64::from(self.total) * chunk))
+    }
+
+    /// Where the chunks the runtime counts as state end: under it lie the
+    /// last of them, in order.
+    #[must_use]
+    pub fn state_end(&self) -> u64 {
+        self.range.base() + u64::from(self.stated()) * self.layout.chunk_bytes
+    }
+
+    /// Backs the last `bytes` under the state's end, and keeps them
+    /// backed: where a fire lays its guests' programs once the activation's
+    /// own span has no room under its carve.
+    pub fn hold_under_state(&mut self, pool: &mut PhysicalPool, bytes: u64) -> Result<Commit> {
+        let end = u64::from(self.stated()) * self.layout.chunk_bytes;
+        let bytes = bytes.min(end);
+        self.range.hold(pool, end - bytes, bytes, false)
     }
 
     /// Where a fire's activation starts: the range's end less its chunks.
@@ -392,6 +413,15 @@ impl Chunks {
         u32::try_from(chunks.div_ceil(u64::from(self.layout.segment_chunks.max(1))))
             .unwrap_or(u32::MAX)
             .min(self.range.segments())
+    }
+
+    /// The pages backing the first `chunks` chunks would take beyond what
+    /// is backed now ([`Range::growth_of`]).
+    pub fn growth_for(&self, chunks: u32) -> Result<u64> {
+        self.range.growth_of(
+            self.segments_for(u64::from(chunks)),
+            u64::from(chunks) * self.layout.chunk_bytes,
+        )
     }
 
     /// The segments that lie wholly within the first `chunks` chunks.

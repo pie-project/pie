@@ -228,7 +228,10 @@ fn four_ranks_land_what_one_rank_lands() {
                 max_voxels: None,
                 max_clips: None,
             },
-            residency: Residency::default(),
+            residency: Residency {
+                device_kv_budget: Some(crate::POOL),
+                ..Residency::default()
+            },
             ordinal: -1,
             frames_in_flight: 1,
         })

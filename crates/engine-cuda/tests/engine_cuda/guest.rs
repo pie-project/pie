@@ -3,7 +3,7 @@
 //! instances and registers channels as a served one is.
 
 use engine::Engine;
-use engine::channel::ChannelId;
+use engine::channel::{ChannelId, ChannelRegistration};
 use engine::chunk::{ChunkFacts, SlotRole};
 use engine::program::{BoundInstance, Footprint, InstanceBinding, ProgramFacts, RingSlots};
 
@@ -39,8 +39,7 @@ impl Shape {
     }
 }
 
-/// The two guest shapes, each in a chunk of its own: the last two the load
-/// committed, which no test's state reaches.
+/// The two guest shapes, each in a chunk of its own.
 #[derive(Debug, Clone, Copy)]
 pub struct Guest {
     instance: Shape,
@@ -59,8 +58,10 @@ impl Guest {
             facts.state_chunks()
         );
         Guest {
-            instance: Shape::of(facts, SlotRole::Instance, committed - 1),
-            channel: Shape::of(facts, SlotRole::Channel, committed - 2),
+            // The middle of what is backed: a test's own state sits in the
+            // first chunks, and a fire lays its programs in the last.
+            instance: Shape::of(facts, SlotRole::Instance, committed / 2 + 1),
+            channel: Shape::of(facts, SlotRole::Channel, committed / 2),
         }
     }
 
@@ -71,6 +72,20 @@ impl Guest {
             .commit_segments(segments)
             .expect("the first segment commits");
         Guest::of(facts, segments * facts.segment_chunks)
+    }
+
+    /// Registers `registration` over the channel slots its ring facts state.
+    pub fn register(&mut self, engine: &mut dyn Engine, registration: ChannelRegistration) {
+        let slots = engine
+            .ring_facts(&registration)
+            .expect("the channel's ring facts")
+            .map_or_else(Vec::new, |facts| self.channel.take(&facts.footprint));
+        engine
+            .register_channel(&ChannelRegistration {
+                slots,
+                ..registration
+            })
+            .expect("the channel registers");
     }
 
     /// The slots an instance of a program with `facts` takes: its tables',
@@ -140,4 +155,15 @@ pub fn alone_slots(
 pub fn alone_span(_: SlotRole, _: &[u32], bytes: u64) -> engine_cuda::Result<u64> {
     let buffer = engine_cuda::device::Buffer::zeroed(bytes as usize)?;
     Ok(Box::leak(Box::new(buffer)).ptr())
+}
+
+/// A plane with no pool: its fires lay their programs' tables and scratch
+/// in a buffer of its own, the test process's until it ends.
+pub fn alone_plane() -> engine_cuda::ProgramPlane {
+    const SPAN: usize = 256 << 20;
+    let buffer = engine_cuda::device::Buffer::zeroed(SPAN).expect("the span's buffer");
+    let end = Box::leak(Box::new(buffer)).ptr() + SPAN as u64;
+    let mut plane = engine_cuda::ProgramPlane::new(engine_cuda::program::compile::Disk::disabled());
+    plane.set_span((end, SPAN as u64));
+    plane
 }
