@@ -386,9 +386,11 @@ impl Flights {
 /// indexes of each token in `out`).
 pub enum Tokens {
     Host(Vec<u32>),
-    /// The pool's u32 words (row `w / 128`, lane `w % 128`) the last pass
-    /// put the tokens in: its fed ring's slots, which the fire gathers.
-    Device { words: Vec<u32> },
+    /// Where in the pool the last pass put the tokens: each a pool row and
+    /// a lane of it (its fed ring's slots), which the fire gathers. Row and
+    /// lane apart, never one element index over the whole pool (an i32 of
+    /// those reaches 8 GiB).
+    Device { at: Vec<(u32, u32)> },
 }
 
 impl Tokens {
@@ -396,7 +398,7 @@ impl Tokens {
     pub fn len(&self) -> usize {
         match self {
             Tokens::Host(ids) => ids.len(),
-            Tokens::Device { words, .. } => words.len(),
+            Tokens::Device { at } => at.len(),
         }
     }
 
@@ -839,7 +841,7 @@ impl Plane {
             let at = u32::try_from(ring.head() % u64::from(capacity.max(1))).unwrap_or(0);
             let row = first + at * cell_rows;
             return Ok(Some(Tokens::Device {
-                words: span.map(|i| row * 128 + i as u32).collect(),
+                at: span.map(|i| (row + i as u32 / 128, i as u32 % 128)).collect(),
             }));
         }
         self.settle_ring(ring);
