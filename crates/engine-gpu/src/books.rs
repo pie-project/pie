@@ -70,7 +70,6 @@ pub mod owners {
     pub const TEST: Owner = Owner::fire("test operands");
     pub const INPUTS: Owner = Owner::fire("inputs");
     pub const READOUT: Owner = Owner::fire("readout");
-    pub const SNAPSHOTS: Owner = Owner::fire("snapshot table");
     pub const EXPERT_SEATS: Owner = Owner::fire("expert seats");
     pub const STAGING: Owner = Owner::fire("staging");
     pub const UNIFORMS: Owner = Owner::fire("uniforms");

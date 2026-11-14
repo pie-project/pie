@@ -100,8 +100,9 @@ lanes snapshot binds a table (a lane: 4 rows into it, 0 ends; then each snapshot
 `RsSnapshot.pieces` or `[slot]`; a seat's record for a seat-addressed lane) and its chunked and committed scans run a
 `PIE_SNAPS` twin (`prim/pool.slang` `PIE_STATE_SNAPSHOTS`) that writes the state as of each row into the snapshot's
 record as it walks (conv: the history rolled to that row; GDN register / memory, KDA: the head state, each lane its
-own cells). Fires without snapshots run the kernels unchanged; a snapshot fire is not recorded (its table is the
-shell's, rewritten after a drain). Refused: more than 4, a row not interior, a lane split across the fire's runs, a
+own cells). Fires without snapshots run the kernels unchanged; a snapshot fire is not recorded (its table lies in
+the staged inputs of the fire's rung, at a place the rung fixes: `lanes × 4 × (1 + pieces)` entries, no buffer of
+its own and no drain). Refused: more than 4, a row not interior, a lane split across the fire's runs, a
 lane not folding. Verified (`tests/*/snapshots.rs`, both engines, qwen35-tiny: GDN r128 + conv): 3 snapshots of a
 150-row prompt = the pass cut at each row (record bytes) bit for bit, in one slot and in 4 pieces (64 KiB chunks),
 alone (chunked arms) and beside a lane buffering its row (committed arms); the lane's own record and logits = the
@@ -123,5 +124,15 @@ input), so misses keep recording.
 
 Pre-existing parity gaps (not memory, but in scope for parity): ROCm synth codegen, ROCm graph replay with >= 2 MoE layers (AMD d); (concat_cols, FP8 m33 fixed M43);
 sm_100 tcgen05 W4A16 arms read no expert table; Metal MLA prefill unsupported.
+
+Vulkan / wgpu staged inputs (sc/gpu-inputs): every table a fire reads off the host (tokens, positions, page tables
+and slot ids, masks and their runs, readout rows' ids, selections, packings, patch / voxel / guest input seats, the
+ragged group masks, the snapshot table) lies in the activation span, a region of each rung past its rs scratch
+(`arena::Rung::io_at`, laid by `inputs::Layout` for the rung's rows and lanes, so `act_chunks` states it). wgpu
+writes the region through the queue; Vulkan, whose pool is device-local, writes a host-visible stage of one rung's
+bytes an arm (laid at load) and the fire's frame copies the written runs into the rung's region before its first
+kernel (a recorded frame is keyed by the runs). Nothing is allocated at a fire: the group-mask and snapshot tables
+are bounded by the rung (a fire past the bound is refused by name), and the readout landing is sized at the load
+to every readout plane at its ceiling (a fire past it is refused by name; `Serve::grown` is gone).
 
 Owners: L40S (CUDA), AMD (ROCm), BM agent (Metal, Mac Studio), VK agent (Vulkan + wgpu), TPU session (XLA/TPU, with hardware; took over sc/xla2), TIER agent (host/disk tiers), CB agent (Cerebras, sc/cb-chunk-pool; no hardware — lib tests + host simulation, rest unverified).

@@ -163,13 +163,10 @@ impl Serve for Api {
         shelf.recorder.forget();
     }
 
-    fn grown(_shell: &mut Shell<Api>, _arm: usize, _bytes: u64) -> Result<()> {
-        Ok(())
-    }
-
     fn plan(shell: &mut Shell<Api>, prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
-        // The custom-mask buffer grows: a recording would keep the one it outgrew.
-        // A fire landing snapshots binds a table of its own: not recorded.
+        // A fire with group masks or a snapshot table is walked: its tables
+        // lie in its rung by its own groups' sizes, which no recording of
+        // one has been keyed by yet.
         let key = (shell.shelf.recorder.records()
             && prepared.bindings.group_masks.is_empty()
             && prepared.bindings.rs_snaps.is_none()
@@ -381,6 +378,9 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
     // The rung names where its carve and rooms lie in the span: a fire of
     // another rung binds other bytes under the same handles.
     key.shown(&p.rung);
+    // The runs the frame copies from the arm's host stage into the rung's
+    // inputs: a recording carries them as it recorded them.
+    key.shown(&p.staged);
     key.hashed(&p.caches);
     key.shown(&p.bindings);
     key.shown(&p.windows);

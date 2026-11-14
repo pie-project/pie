@@ -155,9 +155,6 @@ pub trait Serve: Backend {
     /// What a kept step binds moved: the segments, or a layer's stage.
     fn forget(shelf: &mut Self::Shelf);
 
-    /// Arm `arm`'s readout seat grew to `bytes`.
-    fn grown(shell: &mut Shell<Self>, arm: usize, bytes: u64) -> Result<()>;
-
     /// Replays `prepared` where a kept step answers it, else how it walks.
     fn plan(shell: &mut Shell<Self>, prepared: &mut Prepared<'_, Self>) -> Result<Plan<Self>>;
 
@@ -610,8 +607,11 @@ pub struct Shell<B: Serve> {
     /// The weight cache's routed experts, streamed through pool slots.
     pub expert_caches: crate::store::experts::ExpertCaches<B>,
 
-    inputs: Vec<Inputs<B>>,
+    /// Every rung's staged inputs, laid in the activation span.
+    inputs: Inputs<B>,
 
+    /// An arm's readout seat each, sized at the load for the most a fire
+    /// lands.
     pub readout: Vec<B::Buffer>,
 
     out_width: u32,
@@ -666,8 +666,6 @@ pub struct Shell<B: Serve> {
     held: Vec<u32>,
 
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
-    /// The snapshot table a fire whose lanes snapshot binds (CONTRACT-BC 16).
-    snaps: Option<B::Buffer>,
 
     rs_buffers: Option<crate::rs::Buffers>,
 
@@ -856,47 +854,6 @@ impl<B: Serve> Shell<B> {
             ..asked
         };
 
-        // A fire's arena and kernel scratch, laid at every rung's width
-        // (every power of two of tokens from 1, then the top fire's, each
-        // by the same static sizing); they take the pool's top chunks once
-        // it is reserved, each rung's carve anchored at the span's end, so
-        // a rung below the top lends the span under its carve to state and
-        // a raise evacuates it (`Engine::evacuate`). A rung is a function of
-        // the fire's rows: a recorded frame binds one rung's place only.
-        let top = budgets.tokens.max_tokens;
-        let mut rung_tokens = engine::memory::rungs(1, top);
-        if rung_tokens.last() != Some(&top) {
-            rung_tokens.push(top);
-        }
-        let mut span = Span::plan(
-            &boot.trace,
-            &compiled,
-            &budgets,
-            &rung_tokens,
-            least,
-            &tuning,
-            rs_layout.as_deref().filter(|_| rows.rs.is_some()),
-        )?;
-        let device_cap = device
-            .left()
-            .saturating_sub(u64::from(least_chunks) * chunk)
-            .saturating_sub(span.bytes());
-        let mut weights = Weights::resident(
-            &device,
-            &handles,
-            &boot.trace,
-            boot.contract,
-            boot.checkpoint,
-            device_cap,
-            boot.budget.max_tokens,
-            &streamed,
-        )?;
-
-        weights.decode_absorbed(&device, &handles, &boot.trace)?;
-        weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
-
-        handles.seal();
-
         // A page table a list the kv rows lie in: the kv list's first (the
         // All axis's), then each window list's (CONTRACT-BC 21).
         let page_tables = rows.tables.len();
@@ -982,25 +939,70 @@ impl<B: Serve> Shell<B> {
                 }),
             }
         });
-        let inputs = (0..arms)
-            .map(|_| {
-                Inputs::reserve(
-                    &device,
-                    &boot.budget,
-                    asked,
-                    page_tables,
-                    table_pages,
-                    compiled.classes.classes.len(),
-                    gathers,
-                    patch_seat,
-                    states_mrope,
-                    &feeds.seats(),
-                    feeds.selections.len(),
-                    voxel_seat,
-                    rows.pieces,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // A fire's arena and kernel scratch, laid at every rung's width
+        // (every power of two of tokens from 1, then the top fire's, each
+        // by the same static sizing); they take the pool's top chunks once
+        // it is reserved, each rung's carve anchored at the span's end, so
+        // a rung below the top lends the span under its carve to state and
+        // a raise evacuates it (`Engine::evacuate`). A rung is a function of
+        // the fire's rows: a recorded frame binds one rung's place only.
+        let top = budgets.tokens.max_tokens;
+        let mut rung_tokens = engine::memory::rungs(1, top);
+        if rung_tokens.last() != Some(&top) {
+            rung_tokens.push(top);
+        }
+        // Every table a fire reads off the host lies in its rung too, past
+        // the rs scratch: the rung's bytes are stated with them.
+        let mut inputs = Inputs::<B>::plan(
+            &budgets.tokens,
+            &rung_tokens,
+            &crate::inputs::Shape {
+                paging: asked,
+                page_tables,
+                table_pages,
+                classes: compiled.classes.classes.len(),
+                gathered: gathers,
+                patch: patch_seat,
+                mrope: states_mrope,
+                seats: &feeds.seats(),
+                selections: feeds.selections.len(),
+                ragged: feeds.ragged.len(),
+                voxel: voxel_seat,
+                pieces: rows.pieces,
+                snapshots: rs_layout.is_some(),
+            },
+        );
+        let mut span = Span::plan(
+            &boot.trace,
+            &compiled,
+            &budgets,
+            &rung_tokens,
+            least,
+            &tuning,
+            rs_layout.as_deref().filter(|_| rows.rs.is_some()),
+            &inputs.rung_bytes(),
+        )?;
+        let device_cap = device
+            .left()
+            .saturating_sub(u64::from(least_chunks) * chunk)
+            .saturating_sub(span.bytes());
+        let mut weights = Weights::resident(
+            &device,
+            &handles,
+            &boot.trace,
+            boot.contract,
+            boot.checkpoint,
+            device_cap,
+            boot.budget.max_tokens,
+            &streamed,
+        )?;
+
+        weights.decode_absorbed(&device, &handles, &boot.trace)?;
+        weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
+
+        handles.seal();
+
+        inputs.arm(&device, arms)?;
 
         let class_outputs = poem_exec::feeds::class_outputs(&boot.trace, &compiled)
             .map_err(|why| Fault::Unbound { what: why })?;
@@ -1105,28 +1107,31 @@ impl<B: Serve> Shell<B> {
             None => Vec::new(),
         };
 
-        // Sized for the host's read back; a fire reading more grows its arm's.
-        let readout = (0..arms)
-            .map(|_| {
-                B::Buffer::host(
-                    &device,
-                    readouts
-                        .iter()
-                        .filter(|plane| plane.hosts())
-                        .map(|plane| {
-                            u64::from(match plane.seam {
-                                Kind::Readout => readout_rows(boot.budget.max_lanes),
-                                _ if plane.voxels => budgets.max_voxels(),
-                                _ => boot.budget.max_tokens,
-                            }) * u64::from(plane.width)
-                                * elem(plane.dtype)
-                        })
-                        .max()
-                        .unwrap_or(0)
-                        .max(1),
-                    crate::books::owners::READOUT,
-                )
+        // Sized at the load for the most one fire lands: every plane's rows
+        // at the carve's own ceiling for them, each of its layers. A fire
+        // that lands more is refused by name (`Shell::stage`).
+        let readout_bytes = readouts
+            .iter()
+            .map(|plane| {
+                let element = elem(plane.dtype);
+                let voxels = u64::from(budgets.max_voxels());
+                let rows = match (plane.seam, plane.voxels) {
+                    (Kind::Rows, true) => voxels,
+                    (Kind::Rows, false) => u64::from(budgets.tokens.max_tokens),
+                    (Kind::Lane, _) => u64::from(budgets.tokens.max_lanes),
+                    (Kind::Readout, voxel) => poem_compiler::arena::readout_rows(
+                        u64::from(plane.width),
+                        element,
+                        &budgets.tokens,
+                    )
+                    .max(if voxel { voxels } else { 0 }),
+                };
+                rows * u64::from(plane.width) * plane.values.len() as u64 * element
             })
+            .sum::<u64>()
+            .max(1);
+        let readout = (0..arms)
+            .map(|_| B::Buffer::host(&device, readout_bytes, crate::books::owners::READOUT))
             .collect::<Result<Vec<_>>>()?;
 
         // The pool takes the bytes `[model] device_kv_budget` states, or all
@@ -1315,7 +1320,6 @@ impl<B: Serve> Shell<B> {
             blobs: crate::blob::Store::new(),
             held: vec![0; slots as usize],
             rs_layout,
-            snaps: None,
             rs_buffers,
             out,
             readouts,
@@ -1826,8 +1830,7 @@ impl<B: Serve> Shell<B> {
             self.weights.bytes(),
             self.span.bytes(),
             self.pools.bytes(),
-            self.inputs.iter().map(Inputs::bytes).sum::<u64>()
-                + self.readout.iter().map(B::Buffer::bytes).sum::<u64>(),
+            self.inputs.stage_bytes() + self.readout.iter().map(B::Buffer::bytes).sum::<u64>(),
         )
     }
 
@@ -2092,27 +2095,36 @@ impl<B: Serve> Shell<B> {
         if p.feeds.is_empty() && p.input_copies.is_empty() {
             return Ok(None);
         }
-        let (store, tokens) = self.inputs[p.arm].token_seat();
+        // The fire's landing: its rung's inputs, or the arm's host stage
+        // its frame copies there.
+        let (store, base, room) = self.inputs.landing(&self.span, p.rung, p.arm)?;
+        let tokens = base + self.inputs.token_seat(p.rung);
         let mut frame = self.device.frame()?;
         for &(row, cell) in &p.feeds {
             frame.copy(&cell.buffer, cell.at, store, tokens + u64::from(row) * 4, 4)?;
         }
         for copy in p.input_copies.iter().filter(|copy| !copy.cast) {
-            frame.copy(&copy.cell.buffer, copy.cell.at, store, copy.at, copy.bytes)?;
+            frame.copy(
+                &copy.cell.buffer,
+                copy.cell.at,
+                store,
+                base + copy.at,
+                copy.bytes,
+            )?;
         }
         let casts: Vec<&InputCopy<'_, B>> =
             p.input_copies.iter().filter(|copy| copy.cast).collect();
         if !casts.is_empty() {
-            // A seat may sit at any bf16 element of the store, past what a
-            // descriptor's offset may name: the store binds whole and the
-            // kernel takes the seat's element.
+            // A seat may sit at any bf16 element of the landing, past what
+            // a descriptor's offset may name: the landing binds whole and
+            // the kernel takes the seat's element.
             let sink = B::sink(&self.device, &frame, &self.pipelines, &self.handles);
-            let elements = u32::try_from(store.bytes() / 2).map_err(|_| Fault::Ceiling {
-                what: "bf16 elements of an input store",
-                need: store.bytes() / 2,
+            let elements = u32::try_from(room / 2).map_err(|_| Fault::Ceiling {
+                what: "bf16 elements of a fire's staged inputs",
+                need: room / 2,
                 have: u64::from(u32::MAX),
             })?;
-            let whole = self.handles.bind(store, 0, store.bytes())?;
+            let whole = self.handles.bind(store, base, room)?;
             let into = kernels_slang::Tensor::new(whole, 1, elements, Dtype::Bf16);
             for copy in casts {
                 let values = u32::try_from(copy.bytes / 2).unwrap_or(u32::MAX);
@@ -2278,18 +2290,19 @@ impl<B: Serve> Shell<B> {
                 frame.fill_zero(&into, into_at, bytes)?;
                 continue;
             }
-            let (store, at) =
-                self.inputs[p.arm]
-                    .seat(land.seat.id)
-                    .ok_or_else(|| Fault::Unbound {
-                        what: format!(
-                            "the guest input {} rectangle, which this load carved none of",
-                            land.seat.id
-                        ),
-                    })?;
+            let at = self
+                .inputs
+                .seat(p.rung, land.seat.id)
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "the guest input {} rectangle, which this load carved none of",
+                        land.seat.id
+                    ),
+                })?;
+            let (store, base, _) = self.inputs.landing(&self.span, p.rung, p.arm)?;
             frame.copy(
                 store,
-                at + u64::from(land.first) * row_bytes,
+                base + at + u64::from(land.first) * row_bytes,
                 &into,
                 into_at,
                 bytes,
@@ -2302,6 +2315,7 @@ impl<B: Serve> Shell<B> {
     fn feed_inputs<'a>(
         &mut self,
         arm: usize,
+        rung: usize,
         composition: &Composition,
         lanes: &'a [Seated<'a, B>],
         clips_of: &[Option<&Clips<'_>>],
@@ -2343,11 +2357,11 @@ impl<B: Serve> Shell<B> {
                 };
                 let bytes = cells * seat.row_bytes();
                 let seated_at = if voxel {
-                    self.inputs[arm].voxel_payload()
+                    self.inputs.voxel_payload(rung)
                 } else {
-                    self.inputs[arm].seat(seat.id)
+                    self.inputs.seat(rung, seat.id)
                 };
-                let (_, base) = seated_at.ok_or_else(|| {
+                let base = seated_at.ok_or_else(|| {
                     program(
                         "serve::feed_inputs",
                         format!("this load carved no seat for guest input {}", seat.id),
@@ -2369,7 +2383,8 @@ impl<B: Serve> Shell<B> {
                                 ),
                             )
                         })?;
-                        self.inputs[arm].write_input(at, &landed)?;
+                        self.inputs
+                            .write_input(&self.span, rung, arm, at, &landed)?;
                     }
                     InputCell::Device { cell, dtype } => {
                         let same = matches!(
@@ -2399,6 +2414,7 @@ impl<B: Serve> Shell<B> {
                             bytes,
                             cast,
                         });
+                        self.inputs.fed(arm, at, bytes);
                     }
                 }
             }
@@ -3288,8 +3304,50 @@ impl<B: Serve> Shell<B> {
             readout_table(&composition, lanes, &self.readouts, |class| {
                 self.readout_for(class)
             })?;
-        let bound = self.inputs[arm].write(
+        let landed = readout_layout
+            .iter()
+            .map(|span| span.at + span.bytes())
+            .max()
+            .unwrap_or(0);
+        if landed > self.readout[arm].bytes() {
+            return Err(Fault::Ceiling {
+                what: "bytes of the readout rows one fire lands, sized at the load",
+                need: landed,
+                have: self.readout[arm].bytes(),
+            });
+        }
+        let readouts = u64::from(lane_count).max(readout_rows.len() as u64);
+        let readouts_ceiling = poem_compiler::arena::readouts_ceiling(&self.budgets.tokens);
+        if readouts > readouts_ceiling {
+            return Err(Fault::Ceiling {
+                what: "rows one fire reads logits for",
+                need: readouts,
+                have: readouts_ceiling,
+            });
+        }
+        let fire_rows = FireRows {
+            tokens: u64::from(rows),
+            lanes: u64::from(lane_count),
+            patches: u64::from(composition.patch_rows()),
+            images: u64::from(composition.images()),
+            voxels: u64::from(composition.voxel_widest()),
+            clips: u64::from(composition.clips()),
+            readouts,
+        };
+        // The narrowest rung that holds the fire: its carve at its fixed
+        // place under the span's end.
+        let rung = self.span.rung_of(fire_rows);
+        // The snapshot table, where a lane snapshots: a table of the
+        // fire's rung, as every other it reads.
+        let snapshots: Option<Vec<i32>> = lanes
+            .iter()
+            .any(|seated| !seated.rs_snapshots.is_empty())
+            .then(|| snap_entries.iter().flatten().copied().collect());
+        let bound = self.inputs.write(
             &self.handles,
+            &self.span,
+            rung,
+            arm,
             &crate::inputs::Fire {
                 tokens: &tokens,
                 positions: &positions,
@@ -3319,12 +3377,14 @@ impl<B: Serve> Shell<B> {
                     slots: &voxel_slots,
                     payload: &voxel_payload,
                 }),
+                group_masks: &group_masks,
+                snapshots: snapshots.as_deref(),
             },
         )?;
-        let group_masks =
-            self.inputs[arm].stage_group_masks(&self.device, &self.handles, &group_masks)?;
         windows.bind(&self.handles, bound.windows)?;
-        let input_copies = self.feed_inputs(arm, &composition, lanes, &clips_of)?;
+        let input_copies = self.feed_inputs(arm, rung, &composition, lanes, &clips_of)?;
+        // What the frame carries from the arm's host stage into the rung.
+        let staged = self.inputs.staged(&self.span, rung, arm)?;
         let mut merge_lands: Vec<MergeLand> = Vec::new();
         for (at_lane, row) in composition.lanes().iter().enumerate() {
             let seated = &lanes[row.source as usize];
@@ -3350,31 +3410,12 @@ impl<B: Serve> Shell<B> {
             }
         }
 
-        let readouts = u64::from(lane_count).max(readout_rows.len() as u64);
-        let readouts_ceiling = poem_compiler::arena::readouts_ceiling(&self.budgets.tokens);
-        if readouts > readouts_ceiling {
-            return Err(Fault::Ceiling {
-                what: "rows one fire reads logits for",
-                need: readouts,
-                have: readouts_ceiling,
-            });
-        }
-        let fire_rows = FireRows {
-            tokens: u64::from(rows),
-            lanes: u64::from(lane_count),
-            patches: u64::from(composition.patch_rows()),
-            images: u64::from(composition.images()),
-            voxels: u64::from(composition.voxel_widest()),
-            clips: u64::from(composition.clips()),
-            readouts,
-        };
-        // The narrowest rung that holds the fire: its carve at its fixed
-        // place under the span's end.
-        let rung = self.span.rung_of(fire_rows);
         let slots = self.span.slots(&self.handles, rung, fire_rows)?;
         let caches = self.pools.table(
             &self.handles,
-            &self.inputs[arm].seats(&self.handles, &bound, pages, rows, lane_count),
+            &self
+                .inputs
+                .seats(&self.handles, &bound, pages, rows, lane_count),
         )?;
 
         let mut geometry = Vec::with_capacity(self.page_tables);
@@ -3393,35 +3434,7 @@ impl<B: Serve> Shell<B> {
                 write_offset: Some(seat.write_offset),
             });
         }
-        // The snapshot table, where a lane snapshots: in a buffer of the
-        // shell's, rewritten once every fire that might read it has landed.
-        let rs_snaps = if lanes.iter().any(|seated| !seated.rs_snapshots.is_empty()) {
-            let table: Vec<u8> = snap_entries
-                .iter()
-                .flatten()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
-            self.drain()?;
-            let bytes = table.len() as u64;
-            if self.snaps.as_ref().is_none_or(|held| held.bytes() < bytes) {
-                self.snaps = Some(B::Buffer::host(
-                    &self.device,
-                    bytes.next_power_of_two().max(256),
-                    crate::books::owners::SNAPSHOTS,
-                )?);
-            }
-            let held = self.snaps.as_mut().expect("just made");
-            held.write(0, &table)?;
-            let handle = self.handles.bind(held, 0, bytes)?;
-            Some(kernels_slang::Tensor::new(
-                handle,
-                u32::try_from(table.len() / 4).unwrap_or(u32::MAX),
-                1,
-                Dtype::I32,
-            ))
-        } else {
-            None
-        };
+        let rs_snaps = bound.rs_snaps;
         let patch_seats = bound.patches;
         // The rows a gather of the fire's token ids reads of a block no slot
         // holds are laid in the arm's stage now, where the fire binds buffers
@@ -3444,7 +3457,7 @@ impl<B: Serve> Shell<B> {
             rs_snaps,
             row_ring,
             tokens_host: (!B::RECORDS).then(|| std::sync::Arc::from(tokens.as_slice())),
-            group_masks,
+            group_masks: bound.group_masks,
             tokens: bound.tokens,
             positions: bound.positions,
             readout_rows: bound.readout_rows,
@@ -3523,6 +3536,7 @@ impl<B: Serve> Shell<B> {
             rows: composition.lanes().to_vec(),
             voxel_grid,
             arm,
+            staged,
             readout_rows,
             readout_layout,
             descriptor,
@@ -3543,6 +3557,13 @@ impl<B: Serve> Shell<B> {
         let place = At::new();
 
         let mut frame = Some(B::walk_frame(&self.device, keep)?);
+        if let Some(stage) = self.inputs.stage(p.arm) {
+            frame.as_mut().expect("just opened").copy_regions(
+                stage,
+                self.span.buffer()?,
+                &p.staged,
+            )?;
+        }
         self.land_merges(frame.as_mut().expect("just opened"), p)?;
         // The sink borrows the frame, which leaves in `Walked`, so it ends
         // with this block.
@@ -3658,6 +3679,10 @@ pub struct Prepared<'a, B: Serve> {
     voxel_grid: Vec<i32>,
 
     pub arm: usize,
+    /// The runs the frame copies from the arm's host stage into the rung's
+    /// inputs, `(stage byte, span byte, bytes)`; none where the queue wrote
+    /// them there.
+    pub staged: Vec<(u64, u64, u64)>,
     readout_rows: Vec<i32>,
     readout_layout: Vec<ReadSpan>,
     pub descriptor: FireDescriptor,
@@ -3709,8 +3734,6 @@ pub struct Landed {
 
     pub launches: u32,
 }
-
-pub const READOUT_ROWS_PER_LANE: u32 = 8;
 
 type ReadoutTable = (Vec<i32>, Vec<ReadSpan>);
 
@@ -3837,12 +3860,6 @@ fn readout_table<B: Serve>(
     Ok((table, layout))
 }
 
-fn readout_rows(max_lanes: u32) -> u32 {
-    max_lanes
-        .saturating_mul(READOUT_ROWS_PER_LANE)
-        .max(max_lanes)
-}
-
 /// Lanes' rows of a guest input's seat (zeros where a lane feeds none),
 /// landed in the merge's column.
 #[derive(Debug, Clone, Copy)]
@@ -3894,17 +3911,6 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         Self: 'a,
     {
         let fed = self.feed(&prepared)?;
-        let need = prepared
-            .readout_layout
-            .iter()
-            .map(|span| span.at + span.bytes())
-            .max()
-            .unwrap_or(0);
-        if need > self.readout[prepared.arm].bytes() {
-            self.readout[prepared.arm] =
-                B::Buffer::host(&self.device, need, crate::books::owners::READOUT)?;
-            B::grown(self, prepared.arm, need)?;
-        }
         let (keep, split) = match B::plan(self, &mut prepared)? {
             Plan::Replayed {
                 pending,

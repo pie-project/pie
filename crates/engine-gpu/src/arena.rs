@@ -43,7 +43,12 @@ pub struct Rung {
     /// carry in (0 for a model with no recurrent buffer).
     rs_at: u64,
     rs_bytes: u64,
-    /// The carve, the rooms and the rs scratch.
+    /// Where the staged inputs start, past the rs scratch, and their
+    /// bytes: every table a fire of the rung's tokens and lanes reads off
+    /// the host ([`crate::inputs::Inputs`]).
+    io_at: u64,
+    io_bytes: u64,
+    /// The carve, the rooms, the rs scratch and the staged inputs.
     bytes: u64,
 }
 
@@ -58,6 +63,7 @@ impl Rung {
         tuning: &T,
         routers: &[u32],
         rs: Option<&crate::rs::Layout>,
+        io: u64,
     ) -> Result<Rung> {
         let map = if tokens >= budgets.tokens.max_tokens {
             compiled.arena.clone()
@@ -81,7 +87,8 @@ impl Rung {
                 .saturating_add(lanes.saturating_mul(engine::fire::UNFOLDED_ROWS));
             crate::rs::Seat::scratch_bytes(layout, rows, lanes)
         });
-        let bytes = (rs_at + rs_bytes).next_multiple_of(ALIGN);
+        let io_at = (rs_at + rs_bytes).next_multiple_of(ALIGN);
+        let bytes = (io_at + io).next_multiple_of(ALIGN);
         Ok(Rung {
             tokens,
             capacity: capacities(&map),
@@ -90,11 +97,13 @@ impl Rung {
             rooms_at,
             rs_at,
             rs_bytes,
+            io_at,
+            io_bytes: io,
             bytes,
         })
     }
 
-    /// The carve, the rooms and the rs scratch, aligned.
+    /// The carve, the rooms, the rs scratch and the staged inputs, aligned.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.bytes
@@ -121,9 +130,10 @@ pub struct Span<B: Backend> {
 }
 
 impl<B: Backend> Span<B> {
-    /// The carve, rooms and rs scratch (`rs` the recurrent buffer's
-    /// layout, if any) of every rung of `tokens` (ascending, the last
-    /// `budgets`' own ceiling); nothing placed yet.
+    /// The carve, rooms, rs scratch (`rs` the recurrent buffer's layout,
+    /// if any) and staged inputs (`io` their bytes at each rung) of every
+    /// rung of `tokens` (ascending, the last `budgets`' own ceiling);
+    /// nothing placed yet.
     #[allow(clippy::too_many_arguments)]
     pub fn plan(
         trace: &Trace,
@@ -133,13 +143,23 @@ impl<B: Backend> Span<B> {
         paging: Paging,
         tuning: &B::Tuning,
         rs: Option<&crate::rs::Layout>,
+        io: &[u64],
     ) -> Result<Span<B>> {
         let routers = crate::scratch::routers(trace);
         let rungs = tokens
             .iter()
-            .map(|&tokens| {
+            .enumerate()
+            .map(|(rung, &tokens)| {
                 Rung::lay(
-                    trace, compiled, budgets, tokens, paging, tuning, &routers, rs,
+                    trace,
+                    compiled,
+                    budgets,
+                    tokens,
+                    paging,
+                    tuning,
+                    &routers,
+                    rs,
+                    io.get(rung).copied().unwrap_or(0),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -268,6 +288,16 @@ impl<B: Backend> Span<B> {
         let (buffer, _) = self.placed()?;
         let at = &self.rungs[rung];
         Ok((buffer, self.base(rung)? + at.rs_at, at.rs_bytes))
+    }
+
+    /// Rung `rung`'s staged inputs: the span's buffer, where the region
+    /// starts in it and its bytes.
+    pub fn inputs(&self, rung: usize) -> Result<(&B::Buffer, u64, u64)> {
+        let (buffer, _) = self.placed()?;
+        let at = self.rungs.get(rung).ok_or_else(|| Fault::Unbound {
+            what: format!("rung {rung} of the activation span, which the load laid none of"),
+        })?;
+        Ok((buffer, self.base(rung)? + at.io_at, at.io_bytes))
     }
 
     /// A fire's rooms at rung `rung`.

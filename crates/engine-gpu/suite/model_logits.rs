@@ -1186,3 +1186,102 @@ fn a_buffered_replay_answers_the_fold_it_defers() {
         fire_rs(&mut shell, trace, (0, &[5], 2 * k), &fold, RsReset::Held).expect("slot 0 decodes");
     assert!(again[0].iter().all(|v| v.is_finite()));
 }
+
+/// A lane prefilling in one fire lands its recurrent state as of rows
+/// inside the pass in other seats' records. The table naming those rows
+/// and records lies among the staged inputs of the fire's rung, in the
+/// activation span. Each record then decodes a token to what the pass cut
+/// at its row decodes, bit for bit, and the lane's own logits are the pass
+/// without snapshots'.
+#[test]
+fn a_snapshot_inside_a_pass_decodes_as_the_pass_cut_at_its_row() {
+    use engine::fire::{RsReset, RsSnapshot, RsVerb};
+    const ROWS: [u32; 2] = [37, 101];
+    let fixture = fixture("qwen35-tiny", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    let trace = &fixture.trace;
+    let fold = RsVerb::Fold;
+    let fire = |shell: &mut Shell,
+                (slot, tokens, held): (u32, &[u32], u32),
+                reset: RsReset,
+                snaps: &[RsSnapshot]|
+     -> Vec<f32> {
+        shell
+            .fire_seated(&[Seated {
+                held: Some(held),
+                rs: &fold,
+                rs_reset: reset,
+                rs_snapshots: snaps,
+                ..Seated::of(Lane {
+                    slot,
+                    word: word(trace, tokens.len() as u32),
+                    tokens,
+                })
+            }])
+            .expect("the fire lands")
+            .swap_remove(0)
+    };
+    let prompt: Vec<u32> = (0..150u32).map(|at| (at * 37 + 11) % 256).collect();
+    for slot in 0..SEATS {
+        shell.open(slot).expect("the slot opens");
+    }
+
+    // The passes cut at each row, on seat 3, and the token each decodes.
+    let mut wants = Vec::new();
+    for &row in &ROWS {
+        let cut = &prompt[..row as usize];
+        let last = fire(&mut shell, (3, cut, 0), RsReset::Fresh, &[]);
+        let token = argmax(&last);
+        let want = fire(&mut shell, (3, &[token], row), RsReset::Held, &[]);
+        wants.push((token, want));
+    }
+    // The state a decode reads matters: seat 3, having folded the token
+    // once, decodes it again to other logits.
+    let (token, want) = wants.last().expect("a cut pass");
+    let strayed = fire(&mut shell, (3, &[*token], ROWS[1]), RsReset::Held, &[]);
+    assert!(
+        strayed
+            .iter()
+            .zip(want)
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        "a decode over a strayed state answers the cut pass's logits"
+    );
+
+    // Seats 1 and 2 hold the cut passes' kv rows and a state strayed past
+    // them by one other token.
+    for (seat, (&row, (token, _))) in (1u32..).zip(ROWS.iter().zip(&wants)) {
+        let cut = &prompt[..row as usize];
+        fire(&mut shell, (seat, cut, 0), RsReset::Fresh, &[]);
+        fire(
+            &mut shell,
+            (seat, &[(token + 1) % 256], row),
+            RsReset::Held,
+            &[],
+        );
+    }
+
+    // The whole pass, its state at each row landed in seats 1 and 2.
+    let snaps: Vec<RsSnapshot> = (1u32..)
+        .zip(&ROWS)
+        .map(|(seat, &row)| RsSnapshot {
+            row,
+            slot: seat,
+            pieces: Vec::new(),
+            fixed: Vec::new(),
+        })
+        .collect();
+    let snapped = fire(&mut shell, (0, &prompt, 0), RsReset::Fresh, &snaps);
+    let plain = fire(&mut shell, (3, &prompt, 0), RsReset::Fresh, &[]);
+    same("the pass with snapshots against none", &[snapped], &[plain]);
+
+    for (seat, (&row, (token, want))) in (1u32..).zip(ROWS.iter().zip(wants)) {
+        let got = fire(&mut shell, (seat, &[token], row), RsReset::Held, &[]);
+        same(
+            &format!("a decode from the snapshot at row {row}"),
+            &[got],
+            &[want],
+        );
+    }
+}

@@ -150,16 +150,6 @@ impl Serve for Api {
 
     fn forget(_shelf: &mut Shelf) {}
 
-    fn grown(shell: &mut Shell<Api>, arm: usize, bytes: u64) -> Result<()> {
-        shell.shelf.mirror[arm] = Buffer::with(
-            &shell.device,
-            bytes,
-            crate::device::Memory::Readback,
-            engine_gpu::books::owners::READOUT,
-        )?;
-        Ok(())
-    }
-
     fn plan(_shell: &mut Shell<Api>, _prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
         Ok(Plan::Walk {
             keep: None,
