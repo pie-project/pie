@@ -277,11 +277,15 @@ pub async fn take_raise(
     let Some(evacuation) = evacuation else {
         return Ok(None);
     };
-    if !evacuation.moves.is_empty() {
-        mover
-            .evacuate(SharedPool::rung_moves(&evacuation))
-            .await
-            .map_err(|error| format!("a raise's copy was refused; the rung stays held: {error}"))?;
+    if shared.lock().unwrap().raise_waits(&evacuation) {
+        if let Err(error) = mover.evacuate(SharedPool::rung_moves(&evacuation)).await {
+            // The engine refused the copy or its carve for the wider rung:
+            // a refused raise, taken back; fires stay at the rung in hand,
+            // and the caller tries again as any waiter does.
+            tracing::warn!(%error, "a raise was refused; fires stay at the rung in hand");
+            shared.lock().unwrap().raise_refused(&evacuation);
+            return Ok(None);
+        }
         let next = mover.epoch_now().saturating_add(1);
         shared.lock().unwrap().raise_copied(next);
     }

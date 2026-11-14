@@ -134,11 +134,20 @@ impl FakeEngine {
         }
     }
 
-    /// Backs the top `n` span segments: monotone, from the top.
-    fn commit_span(&mut self, n: u32) {
+    /// Backs the top `n` span segments: monotone, from the top. Refused
+    /// as a placement heap the device has no room for is.
+    fn commit_span(&mut self, n: u32) -> ::engine::Result<()> {
+        if self.refuse {
+            return Err(::engine::Error::Exhausted {
+                resource: "placement heap",
+                wanted: u64::from(n),
+                available: 0,
+            });
+        }
         assert!(TOTAL / SEGMENT - n <= self.top, "commit_span only widens");
         self.top = TOTAL / SEGMENT - n;
         self.calls.push(Call::CommitSpan(n));
+        Ok(())
     }
 
     /// Keeps the top `n` span segments, the rest given back.
@@ -248,7 +257,9 @@ fn walk_segments(
                 engine.release_segments(prefix).unwrap();
             }
             Some(SegmentMove::CommitSpan { n }) => {
-                engine.commit_span(n);
+                if engine.commit_span(n).is_err() {
+                    return Retarget::Reached;
+                }
                 pool.span_committed(n);
             }
             Some(SegmentMove::ReleaseSpan { n }) => {
