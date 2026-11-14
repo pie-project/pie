@@ -1021,6 +1021,7 @@ impl PreparedLoad<'_> {
         // counters and the state maps.
         let tables_chunks = u32::try_from(
             (weights.bank_bytes()
+                + crate::arena::room(scratch.constant_bytes())
                 + weight_caches
                     .iter()
                     .map(|cache| crate::store::streamed::Cache::table_bytes_for(&cache.shape))
@@ -1029,10 +1030,7 @@ impl PreparedLoad<'_> {
             .div_ceil(rows.chunk_bytes.max(1)),
         )
         .unwrap_or(u32::MAX);
-        let model_bytes = weights.bytes()
-            + scratch.constant_bytes()
-            + ane_model
-            + u64::from(tables_chunks) * rows.chunk_bytes;
+        let model_bytes = weights.bytes() + ane_model + u64::from(tables_chunks) * rows.chunk_bytes;
         // Each rung's rs scratch: a fire of the rung's tokens and lanes
         // replays its own rows and, for each lane, the rows it carries
         // unfolded into the fire (`RS_UNFOLDED_ROWS`, the runtime's bound).
@@ -1238,6 +1236,9 @@ impl PreparedLoad<'_> {
         scratch.seat(arena.store().clone(), arena.scratch_at());
         pools.seat_weights(&device, &handles, weight_caches)?;
         weights.lay_banks(&handles, |bytes| pools.run_table(&device, bytes))?;
+        if scratch.constant_bytes() > 0 {
+            scratch.lay_constants(pools.run_table(&device, scratch.constant_bytes())?)?;
+        }
         // The null chunk and the floor stand from the load on.
         pools.commit_segments(1)?;
         // A load whose weights the runtime holds seats every atom in pool
@@ -1881,13 +1882,11 @@ impl Shell {
                 "pipelines and libraries built (measured)",
                 self.pipelines.built_bytes(),
             ),
-            (Model, "weights", self.weights.bytes()),
             (
                 Model,
-                "engine tables run (adapter banks, weight-cache tables, state maps), reserved",
+                "engine tables run (adapter banks, weight-cache tables, state maps, n-gram constants), reserved",
                 self.pools.tables_run_bytes(),
             ),
-            (Model, "ngram constants", self.scratch.constant_bytes()),
             (
                 Model,
                 "ane surfaces (IOSurfaces the Neural Engine maps itself: outside the pool by the OS)",
@@ -1916,6 +1915,9 @@ impl Shell {
                 self.nan_flags.as_ref().map_or(0, Buffer::bytes),
             ),
         ];
+        for (owner, bytes) in self.weights.lines() {
+            ledger.enter(Model, owner, bytes);
+        }
         for (class, owner, bytes) in entries {
             ledger.enter(class, owner, bytes);
         }

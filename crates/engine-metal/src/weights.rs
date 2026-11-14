@@ -40,7 +40,9 @@ pub struct Weights {
     /// seats, written as adapters land): laid once the pool is
     /// ([`Weights::lay_banks`]).
     bank_region: Option<crate::inputs::Region>,
-    decoded: Vec<Buffer>,
+    /// Weights the load derives from the stored ones, each with what it is
+    /// (a ledger line of its own): fixed weights outside the pool.
+    decoded: Vec<(&'static str, Buffer)>,
     /// The tables the weight cache streams by their rows, each in an
     /// allocation of its own where the load lands them (the cold road), so
     /// a held set can give them back (`store::streamed`).
@@ -553,7 +555,7 @@ impl Weights {
                 plane.width,
                 Dtype::Bf16,
             )));
-            self.decoded.push(buffer);
+            self.decoded.push(("relabelled conv weights", buffer));
         }
         Ok(())
     }
@@ -619,7 +621,7 @@ impl Weights {
             )?;
             frame.commit()?;
             bank.mpp_codes = Some(packed);
-            self.decoded.push(buffer);
+            self.decoded.push(("MPP-packed 4-bit banks", buffer));
         }
         Ok(())
     }
@@ -679,7 +681,7 @@ impl Weights {
                 u32::try_from(k).unwrap_or(u32::MAX),
                 Dtype::Bf16,
             )));
-            self.decoded.push(buffer);
+            self.decoded.push(("decoded absorbed weights", buffer));
         }
         if decoded_bytes > 0 && crate::diag::on().tier_trace {
             eprintln!(
@@ -695,8 +697,55 @@ impl Weights {
     pub fn bytes(&self) -> u64 {
         self.store.bytes()
             + self.mapped.iter().map(Buffer::bytes).sum::<u64>()
-            + self.decoded.iter().map(Buffer::bytes).sum::<u64>()
+            + self
+                .decoded
+                .iter()
+                .map(|(_, buffer)| buffer.bytes())
+                .sum::<u64>()
             + self.hosted_bytes()
+    }
+
+    /// The weights by what they are, a ledger line each: the store, the
+    /// serving file's mapped windows, each kind the load derives, and the
+    /// row-streamed tables' own copies. All fixed weights outside the pool.
+    #[must_use]
+    pub fn lines(&self) -> Vec<(&'static str, u64)> {
+        let mut lines = vec![
+            ("weights: the store", self.store.bytes()),
+            (
+                "weights: the serving file's mapped windows",
+                self.mapped.iter().map(Buffer::bytes).sum(),
+            ),
+        ];
+        for kind in [
+            "relabelled conv weights",
+            "MPP-packed 4-bit banks",
+            "decoded absorbed weights",
+        ] {
+            let bytes = self
+                .decoded
+                .iter()
+                .filter(|(of, _)| *of == kind)
+                .map(|(_, buffer)| buffer.bytes())
+                .sum();
+            lines.push((
+                match kind {
+                    "relabelled conv weights" => {
+                        "weights derived at the load: relabelled conv weights"
+                    }
+                    "MPP-packed 4-bit banks" => {
+                        "weights derived at the load: MPP-packed 4-bit banks"
+                    }
+                    _ => "weights derived at the load: decoded absorbed weights",
+                },
+                bytes,
+            ));
+        }
+        lines.push((
+            "weights: row-streamed tables' own copies",
+            self.hosted_bytes(),
+        ));
+        lines
     }
 }
 
@@ -1146,6 +1195,9 @@ fn warm(
     // (`Weights::open_filed`); a slot is filled from the file.
     let hosted = BTreeMap::new();
     let mut filed = BTreeMap::new();
+    // A row of the handle table a weight read apart binds until its window
+    // opens: one of the three tiny fixed buffers outside the pool (this, the
+    // keepalive sink, the shared empty buffer), left there by ruling.
     let placeholder = Buffer::zeroed(device, ALIGN).map_err(|why| Some(why.to_string()))?;
     for (index, seat) in seats.iter().enumerate() {
         let Seat::Apart(offset) = *seat else { continue };

@@ -103,7 +103,11 @@ pub struct Scratch {
     /// The plane's bytes.
     plane_bytes: u64,
     /// The n-gram hash constants (`ple`'s rooms), model bytes.
-    constants: Buffer,
+    /// The model's constants (the n-gram hash tables), laid in the pool's
+    /// tables run once the pool is ([`Scratch::lay_constants`]), and what
+    /// is written there.
+    constants: crate::inputs::Region,
+    constant_image: Vec<u8>,
 
     precast: Option<Room>,
     partials: Option<Room>,
@@ -396,16 +400,19 @@ impl Scratch {
             buffer: Buffer::zeroed(device, 0)?,
             base: 0,
         };
-        let mut constants = Buffer::zeroed(device, constant_at)?;
+        let mut constant_image = vec![0u8; usize::try_from(constant_at).unwrap_or(usize::MAX)];
         for hashing in &ple {
             let bytes: Vec<u8> = hashing.key.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            constants.write(hashing.room.at, &bytes)?;
+            let at = usize::try_from(hashing.room.at).unwrap_or(usize::MAX);
+            constant_image[at..at + bytes.len()].copy_from_slice(&bytes);
         }
+        let constants = crate::inputs::Region::unplaced(constant_at, Buffer::zeroed(device, 0)?);
 
         Ok(Scratch {
             plane,
             plane_bytes: at,
             constants,
+            constant_image,
             precast,
             partials,
             routed,
@@ -430,10 +437,18 @@ impl Scratch {
         self.plane = Plane { buffer, base };
     }
 
-    /// The model's constants kept beside the plane.
+    /// The model's constants' bytes: what the tables run lays for them.
     #[must_use]
     pub fn constant_bytes(&self) -> u64 {
         self.constants.bytes()
+    }
+
+    /// Lays the constants in `region` of the pool's tables run and writes
+    /// them there.
+    pub fn lay_constants(&mut self, mut region: crate::inputs::Region) -> Result<()> {
+        region.write(0, &self.constant_image)?;
+        self.constants = region;
+        Ok(())
     }
 
     #[must_use]
@@ -588,7 +603,11 @@ impl Scratch {
         let room = held.room;
         Some(
             handles
-                .bind(&self.constants, room.at, room.bytes())
+                .bind(
+                    self.constants.view(),
+                    self.constants.at(room.at),
+                    room.bytes(),
+                )
                 .map(|buf| Tensor::new(buf, room.rows, room.width, room.dtype)),
         )
     }
