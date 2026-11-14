@@ -627,6 +627,9 @@ pub struct SharedPool {
     /// The activation set aside before the raise whose copy is the
     /// engine's to take: what a refused raise goes back to.
     raise_from: Option<u32>,
+    /// The engine refused the last `commit_span`: no span segment is asked
+    /// again until room is freed ([`Self::block_span_commit`]).
+    span_commit_blocked: bool,
     /// The registered programs' fire terms ([`programs`]).
     programs: programs::ProgramFires,
 }
@@ -847,6 +850,7 @@ impl SharedPool {
             least_chunks: 0,
             copying: None,
             raise_from: None,
+            span_commit_blocked: false,
             programs: programs::ProgramFires::default(),
         };
         // Under the smallest rung state may take every chunk but the
@@ -1674,7 +1678,9 @@ impl SharedPool {
         }
         // The prefix is whole: the span a lowered rung lends is backed next,
         // before state opens a chunk there.
+        // Not while a refused one waits for room to be freed.
         if mapped < target
+            && !self.span_commit_blocked
             && let Some(n) = self.pool.span_to_commit()
         {
             return Some(SegmentMove::CommitSpan { n });
@@ -1723,6 +1729,13 @@ impl SharedPool {
         self.pool
             .apply_evacuation(evacuation, epoch)
             .expect("an evacuation planned under the lock applies");
+    }
+
+    /// A `commit_span` was refused (`true`): none is asked again until room
+    /// is freed, which lifts it (`false`), the one event that can change the
+    /// answer.
+    pub fn block_span_commit(&mut self, blocked: bool) {
+        self.span_commit_blocked = blocked;
     }
 
     /// The engine backed the top `n` span segments: the chunks of theirs the

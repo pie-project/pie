@@ -5264,6 +5264,8 @@ mod rung_wait_tests {
         let refuse = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             *says.lock().unwrap() = Some("the device is short".into());
+            // As a raise's funding tells the rung when it fails.
+            crate::store::shared::rung_changed(REFUSED);
         });
         let waited = tokio::time::timeout(
             std::time::Duration::from_secs(5),

@@ -322,10 +322,11 @@ pub async fn take_raise(
     let Some(evacuation) = evacuation else {
         return Ok(None);
     };
-    if !carry_raise(shared, &evacuation, mover).await {
-        // Refused and taken back: the rung's waiters look again.
+    if let Err(refused) = carry_raise(shared, &evacuation, mover).await {
+        // Refused and taken back: the rung's waiters look again, and the
+        // caller is told; nothing tries it again on its own wake.
         super::rung_changed(mover.engine());
-        return Ok(None);
+        return Err(refused);
     }
     super::rung_changed(mover.engine());
     tracing::info!(
@@ -341,20 +342,26 @@ pub async fn take_raise(
 /// backs its carve for the wider rung), then the copy of what it moves.
 /// Either refused, the raise is taken back ([`SharedPool::raise_refused`]),
 /// fires stay at the rung in hand, and an engine that backed the carve is
-/// told the rung went back; `false` then. Nothing faults.
-pub async fn carry_raise(shared: &Shared, evacuation: &RungEvacuation, mover: &impl Mover) -> bool {
+/// told the rung went back; the refusal answered. Nothing faults.
+pub async fn carry_raise(
+    shared: &Shared,
+    evacuation: &RungEvacuation,
+    mover: &impl Mover,
+) -> Result<(), String> {
     let (waits, tells) = {
         let pool = shared.lock().unwrap();
         (pool.raise_waits(evacuation), pool.tells_rungs())
     };
     if !waits {
-        return true;
+        return Ok(());
     }
     let (from, to) = (evacuation.from, evacuation.rung);
     if tells && let Err(error) = mover.set_rung(from, to).await {
         tracing::warn!(%error, from, to, "a raise's carve was refused; fires stay at the rung in hand");
         shared.lock().unwrap().raise_refused(evacuation);
-        return false;
+        return Err(format!(
+            "the engine refused the carve for rung {to}: {error}"
+        ));
     }
     if !evacuation.moves.is_empty()
         && let Err(error) = mover.evacuate(SharedPool::rung_moves(evacuation)).await
@@ -364,11 +371,11 @@ pub async fn carry_raise(shared: &Shared, evacuation: &RungEvacuation, mover: &i
         if tells && let Err(error) = mover.set_rung(to, from).await {
             tracing::warn!(%error, from = to, to = from, "a rung notice was refused");
         }
-        return false;
+        return Err(format!("the engine refused a raise's copy: {error}"));
     }
     let next = mover.epoch_now().saturating_add(1);
     shared.lock().unwrap().raise_copied(next);
-    true
+    Ok(())
 }
 
 /// Waits until `shared`'s activation holds what fires may take now, the

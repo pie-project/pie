@@ -437,8 +437,9 @@ async fn a_term_past_the_largest_rung_funds_the_widest_that_fits_and_cuts_fires_
 }
 
 /// A bind is never sent unfunded: the planner's refusal ends the wait with
-/// an error; a raise the engine refuses is taken back and the wait holds,
-/// the span and the state as they were.
+/// an error; a raise the engine refuses is taken back, the span and the
+/// state as they were, and refuses the bind too: nothing tries it again on
+/// its own wake.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_whose_room_is_refused_fails_its_wait() {
     struct Refusing;
@@ -483,9 +484,8 @@ async fn a_bind_whose_room_is_refused_fails_its_wait() {
     assert!(error.contains("the planner refuses"));
     assert_eq!(shared.lock().unwrap().pool().act_reserved(), 4);
 
-    // Room there, the copy refused: a refused raise, taken back. The wait
-    // holds the bind (never sent) as any waiter, the span and the state as
-    // they were, and nothing faults.
+    // Room there, the copy refused: a refused raise, taken back, and the
+    // bind refused (never sent), the span and the state as they were.
     let kept = all[all.len() / 2..].to_vec();
     {
         let mut pool = shared.lock().unwrap();
@@ -499,12 +499,10 @@ async fn a_bind_whose_room_is_refused_fails_its_wait() {
             .map(|slot| pool.pool().physical(slot.chunk).unwrap())
             .collect()
     };
-    let waited = tokio::time::timeout(
-        std::time::Duration::from_millis(50),
-        fund_span(&shared, || 256, &Granting, &NoCopy),
-    )
-    .await;
-    assert!(waited.is_err(), "the bind still waits");
+    let refused = fund_span(&shared, || 256, &Granting, &NoCopy)
+        .await
+        .unwrap_err();
+    assert!(refused.contains("the engine refuses"), "{refused}");
     let pool = shared.lock().unwrap();
     assert_eq!(pool.pool().act_reserved(), 4, "the rung in hand");
     assert!(pool.copying().is_none());

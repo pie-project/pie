@@ -249,13 +249,18 @@ impl SharedGrow {
                 RungStep::Raise { rung, evacuation } => {
                     // The engine backs its carve (on demand) and copies what
                     // the raise moves; refused, the raise is taken back,
-                    // fires stay cut to the rung in hand, and a later walk
-                    // may try again.
+                    // fires stay cut to the rung in hand, and no raise is
+                    // tried again until room is freed.
                     let mover = super::programs::LaneMover {
                         engine: self.engine,
                         epoch_now: || self.epochs().0,
                     };
-                    if !super::programs::carry_raise(&self.shared, &evacuation, &mover).await {
+                    if let Err(refused) =
+                        super::programs::carry_raise(&self.shared, &evacuation, &mover).await
+                    {
+                        tracing::debug!(engine = self.engine, %refused, "the walk's raise waits for room");
+                        self.raise_blocked.store(true, Ordering::Release);
+                        super::rung_changed(self.engine);
                         return;
                     }
                     tracing::info!(
@@ -287,6 +292,7 @@ impl SharedGrow {
     /// room may be tried again, and the walk looks now.
     pub fn room_freed(&self) {
         self.raise_blocked.store(false, Ordering::Release);
+        self.shared.lock().unwrap().block_span_commit(false);
         self.wake.notify_one();
     }
 
@@ -435,6 +441,11 @@ impl SharedGrow {
                     tracing::warn!(engine = self.engine, %error, "a segment move was refused");
                     if commit.is_some() || span.is_some() {
                         self.refused.store(true, Ordering::Release);
+                    }
+                    // A refused lend is not asked again on the next wake,
+                    // only once room is freed.
+                    if span.is_some() {
+                        self.shared.lock().unwrap().block_span_commit(true);
                     }
                     return;
                 }
