@@ -45,7 +45,7 @@ fn token() -> Option<String> {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache").join("huggingface"))
+            dirs::home_dir().map(|h| h.join(".cache").join("huggingface"))
         })?;
     let raw = std::fs::read_to_string(home.join("token")).ok()?;
     let raw = raw.trim().to_string();

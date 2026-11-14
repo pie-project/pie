@@ -5137,6 +5137,7 @@ dependencies = [
  "wasmtime-web",
  "web-std",
  "wgpu",
+ "windows-sys 0.61.2",
  "ztensor",
 ]
 
