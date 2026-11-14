@@ -35,6 +35,9 @@ pub const SCALAR_MATH: f64 = 60.0;
 pub const ALL_REDUCE: f64 = 1_200.0;
 /// A position's cos / sin from P5 tables (one axis: LV levels of NROT-wide products).
 pub const ROTATION: f64 = 300.0;
+/// The row store: a held word cast out or summed back, a hop of the row chain.
+pub const STORE_WORD: f64 = 1.0;
+pub const CHAIN_HOP: f64 = 2.0;
 /// P7: a stored row; a query, and an entry a PE keeps.
 pub const STORE: f64 = 800.0;
 pub const QUERY: f64 = 1_100.0;
@@ -219,6 +222,22 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
                     }
                     _ => {}
                 }
+            }
+            if l.spill {
+                // the row store: each held chunk cast out before the barrier, summed back up
+                // the row chain after it
+                let r = crate::stream::unit::Reader {
+                    trace: &p.trace,
+                    word: b.word,
+                    prologue: false,
+                };
+                let (per, _) = place::store_words(&r, &b.unit, l.py, l.px());
+                row_side += f64::from(per) * STORE_WORD
+                    + if phase {
+                        f64::from(l.px()) * CHAIN_HOP
+                    } else {
+                        0.0
+                    };
             }
             *acc = busiest.max(row_side).max(col_side);
         }

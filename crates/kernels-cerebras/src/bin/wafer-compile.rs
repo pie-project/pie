@@ -43,7 +43,7 @@ const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <
      --build <dir> [--fabric simulator|system]\n       wafer-compile cost --plan <plan.json>\n       \
      wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]\n       \
      wafer-compile stream --model <deployment> [--reading R] [--rows N] [--ieee] --out <dir> \
-     [--values <dir>] [--stages N] [--tap v,..] [--py N] [--tile W] \
+     [--values <dir>] [--stages N] [--tap v,..] [--py N] [--tile W] [--spill] \
      [--class-rows context=512,latents=4096] [--price context=512,latents=4096]";
 
 fn main() {
@@ -270,6 +270,7 @@ fn stream(args: &[String]) -> Result<(), String> {
     let pins = kernels_cerebras::stream::Pins {
         py,
         tile,
+        spill: args.iter().any(|a| a == "--spill"),
         class_rows: kernels_cerebras::stream::parse_rows(&get("--class-rows").unwrap_or_default())?,
     };
     let p = kernels_cerebras::stream::compile_pinned(

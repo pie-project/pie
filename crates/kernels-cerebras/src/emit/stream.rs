@@ -176,6 +176,10 @@ struct Gen {
     exports: Vec<(String, String, bool)>,
     h16: u32,
     drain: bool,
+    /// The row store: held rows cast to the weight PEs, and their fetches up the row chain at
+    /// the start of each late row.
+    cast: bool,
+    fetch: String,
 }
 
 impl Gen {
@@ -289,7 +293,7 @@ pub fn emit(p: &Program) -> R<Emitted> {
         let r = trace_reader(b);
         // the weight columns
         for col in 0..su.cols() {
-            let (name, text, mvs) = weight_file(ui, b, col)?;
+            let (name, text, mvs) = weight_file(ui, b, &r, col)?;
             files.push((name.clone(), text));
             for row in 0..su.rows() {
                 let c = su.w(col, row);
@@ -503,7 +507,31 @@ type RootFile = (String, String, Vec<HostArray>, Vec<(String, String)>);
 type Tiles = BTreeMap<Coord, (String, Vec<(String, u32)>)>;
 
 /// A weight column's file: its matvecs (step, tile rows, tile cols) in step order.
-fn weight_file(ui: usize, b: &Built, col: u32) -> R<(String, String, Vec<Tile>)> {
+/// The values a step makes that its row roots hold over the barrier (in the order the roots
+/// hold them: the row in, a region's results, a matvec's output).
+fn held_rows(b: &Built, st: &Step) -> Vec<ValueId> {
+    let u = &b.unit;
+    let made: Vec<ValueId> = match st {
+        Step::In {
+            value,
+            side: Side::Row,
+            host: false,
+        } => vec![*value],
+        Step::Region {
+            side: Side::Row,
+            chain,
+        } => chain.outs.iter().map(|o| o.value).collect(),
+        Step::Matvec {
+            from: Side::Col,
+            output,
+            ..
+        } => vec![*output],
+        _ => Vec::new(),
+    };
+    made.into_iter().filter(|v| u.held.contains(v)).collect()
+}
+
+fn weight_file(ui: usize, b: &Built, r: &Reader, col: u32) -> R<(String, String, Vec<Tile>)> {
     let name = format!("w_{ui}_{col}.csl");
     let l = &b.layout;
     let mut t = String::new();
@@ -520,11 +548,38 @@ fn weight_file(ui: usize, b: &Built, col: u32) -> R<(String, String, Vec<Tile>)>
     let mut mvs = Vec::new();
     let (mut early, mut late) = (String::new(), String::new());
     let (mut drn, mut zer) = (1u32, 1u32);
+    // the row store: this column keeps rows t with t % px == col, each its held chunks in order
+    let spill = l.spill;
+    let mut kept: Vec<u32> = Vec::new();
+    let mut fetch = String::new();
     for (si, st) in b.unit.steps.iter().enumerate() {
+        // (kept after the step's own matvec: a held matvec output is cast once summed)
+        let mut keep = String::new();
+        if spill && si < b.unit.split {
+            for v in held_rows(b, st) {
+                let len = r.width(v) / l.py;
+                let off: u32 = kept.iter().sum();
+                kept.push(len);
+                drn = drn.max(len);
+                zer = zer.max(len);
+                let _ = writeln!(
+                    keep,
+                    "  if (t % {px} == {col}) {{ @fmovs(@set_dsd_length(@increment_dsd_offset(D_hs, @as(i16, (t / {px}) * HSW + {off}), f32), {len}), fab.fin(q_xr, {len})); }} else {{ @fmovs(@set_dsd_length(D_drn, {len}), fab.fin(q_xr, {len})); }}",
+                    px = l.px()
+                );
+                let _ = writeln!(
+                    fetch,
+                    "  rw.role = {role}; if (t % {px} == {col}) {{ rw.send(@set_dsd_length(@increment_dsd_offset(D_hs, @as(i16, (t / {px}) * HSW + {off}), f32), {len}), {len}); }} else {{ rw.send(@set_dsd_length(D_zer, {len}), {len}); }}",
+                    role = u32::from(col + 1 < l.px()),
+                    px = l.px()
+                );
+            }
+        }
         let Step::Matvec {
             from, x32, n, k, ..
         } = st
         else {
+            early.push_str(&keep);
             continue;
         };
         let body = if si < b.unit.split {
@@ -574,12 +629,18 @@ fn weight_file(ui: usize, b: &Built, col: u32) -> R<(String, String, Vec<Tile>)>
                 }
             },
         }
+        early.push_str(&keep);
     }
     t.push_str(&buf("drn", drn));
     t.push_str(&buf("zer", zer));
+    if !kept.is_empty() {
+        let hsw: u32 = kept.iter().sum();
+        let _ = writeln!(t, "const HSW: u16 = {hsw};");
+        t.push_str(&buf("hs", hsw * b.unit.rows.div_ceil(l.px())));
+    }
     let _ = write!(
         t,
-        "fn early(t: u16) void {{\n{early}}}\nfn late(t: u16) void {{\n{late}}}\n"
+        "fn early(t: u16) void {{\n{early}}}\nfn late(t: u16) void {{\n{fetch}{late}}}\n"
     );
     let ne = b.unit.rows;
     let nl = if b.unit.split < b.unit.steps.len() {
@@ -717,8 +778,21 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
     };
     let _ = my_cols;
     // per-row buffers and held rows
+    let spill = side == Side::Row && l.spill;
     let hold = |g: &mut Gen, late: bool, base: ValueId, from: u32, len: u32, src: &str| {
         let hname = format!("hd{}_{from}", base.0);
+        if spill {
+            // the row store: out to the row's weight PEs now, back up the row chain (the
+            // keeper's chunk, zeros from the rest) at the start of the late row
+            if !g.decls.contains(&format!("var {hname}:")) {
+                g.decls.push_str(&buf(&hname, len));
+                let _ = writeln!(g.fetch, "  @fmovs(D_{hname}, fab.fin(q_ci, {len}));");
+            }
+            g.put(late, &format!("  @fmovs(fab.fout(q_xr, {len}), {src});\n"));
+            g.cast = true;
+            g.held_loc(base, from, len, &format!("D_{hname}"), "0");
+            return;
+        }
         if !g.decls.contains(&format!("var {hname}:")) {
             g.decls.push_str(&buf(&hname, rows * len));
         }
@@ -1157,6 +1231,8 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
     }
     t.push_str(COMMON);
     let (mut iq, mut oq) = (2, 2);
+    sends_cast |= g.cast;
+    chain_in |= !g.fetch.is_empty();
     let used = |q: &str| -> bool {
         match q {
             "q_pi" => g.decls.contains("var pin:"),
@@ -1255,8 +1331,8 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
     t.push_str(&g.decls);
     let _ = write!(
         t,
-        "fn early(t: u16) void {{\n{}}}\nfn late(t: u16) void {{\n{}}}\nfn lanes() void {{\n{}}}\n",
-        g.early, g.late, g.lanes
+        "fn early(t: u16) void {{\n{}}}\nfn late(t: u16) void {{\n{}{}}}\nfn lanes() void {{\n{}}}\n",
+        g.early, g.fetch, g.late, g.lanes
     );
     // the schedule
     let mut body = String::new();

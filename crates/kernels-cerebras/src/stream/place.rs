@@ -54,6 +54,10 @@ pub struct Layout {
     pub py: u32,
     pub heads: u32,
     pub cols: Vec<Vec<Slice>>,
+    /// The row store: the rows a row root holds over the barrier are kept by its row's weight
+    /// PEs (row `t` by column `t % px`), cast to them when made and summed back up the row
+    /// chain after the barrier ([`store_words`]).
+    pub spill: bool,
 }
 
 /// Where a root region runs: the roots `first .. first + roots` of its side, `chunk` columns each.
@@ -224,7 +228,12 @@ fn layout_with(r: &Reader, u: &Unit, py: u32, rest: u32) -> Option<Layout> {
             }
         }
     }
-    let lay = |cols: Vec<Vec<Slice>>| Layout { py, heads, cols };
+    let lay = |cols: Vec<Vec<Slice>>| Layout {
+        py,
+        heads,
+        cols,
+        spill: false,
+    };
     // the column regions, in order
     for s in &u.steps {
         let Step::Region {
@@ -463,14 +472,33 @@ fn col_host_words(u: &Unit, l: &Layout, col: u32) -> u32 {
     held_words(u, l, col) - held
 }
 
+/// 16-bit words a weight PE holds at most: its tiles and its share of the row store.
+pub const WEIGHT_WORDS: u32 = 20_480;
+
+/// The row store's f32 words a row (a row root's held chunks, each value's in step order) and
+/// the rows a weight PE of a `px`-column unit keeps.
+#[must_use]
+pub fn store_words(r: &Reader, u: &Unit, py: u32, px: u32) -> (u32, u32) {
+    let per = row_held_words(r, u, py).1 / u.rows.max(1);
+    (per, u.rows.div_ceil(px.max(1)))
+}
+
 /// `u`'s layout: the fewest rest roots whose every tile (at most `tile` words) and held rows
-/// fit. A unit whose rows outgrow its roots is refused by what it holds.
-pub fn layout(r: &Reader, u: &Unit, py: u32, tile: u32) -> R<Layout> {
+/// fit. Rows held over the barrier that outgrow the row roots go to the row store
+/// ([`Layout::spill`]; `spill`: always, where any are held); a unit whose rows outgrow its roots
+/// otherwise is refused by what it holds.
+pub fn layout(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool) -> R<Layout> {
     let (host, over) = row_held_words(r, u, py);
-    if host + over > ROOT_BUDGET {
+    if host > ROOT_BUDGET {
         return Err(held_refusal(u, "row", host, over));
     }
+    let spill = over > 0 && (spill || host + over > ROOT_BUDGET);
+    let stored = |l: &Layout| -> bool {
+        let (per, n) = store_words(r, u, py, l.px());
+        (0..l.px()).all(|c| tile_words(u, l, c) + 2 * per * n <= WEIGHT_WORDS)
+    };
     let mut short: Option<(u32, u32)> = None;
+    let mut unstored = false;
     for rest in 0..=MAX_REST {
         let Some(l) = layout_with(r, u, py, rest) else {
             continue;
@@ -478,8 +506,12 @@ pub fn layout(r: &Reader, u: &Unit, py: u32, tile: u32) -> R<Layout> {
         if l.px() == 0 || !(0..l.px()).all(|c| tile_words(u, &l, c) < tile) {
             continue;
         }
+        if spill && !stored(&l) {
+            unstored = true;
+            continue;
+        }
         if (0..l.px()).all(|c| held_words(u, &l, c) <= ROOT_BUDGET) {
-            return Ok(l);
+            return Ok(Layout { spill, ..l });
         }
         // the tiles fit, the held rows not: what the fewest roots hold
         if short.is_none() {
@@ -492,6 +524,13 @@ pub fn layout(r: &Reader, u: &Unit, py: u32, tile: u32) -> R<Layout> {
     }
     Err(match short {
         Some((h, o)) => held_refusal(u, "column", h, o),
+        None if unstored => format!(
+            "{}: its row store ({} rows of {} words) fits beside the tiles at no column roots \
+             up to {MAX_REST}",
+            u.name,
+            u.rows,
+            over / u.rows.max(1)
+        ),
         None => format!(
             "{}: no column roots up to {MAX_REST} fit its tiles ({tile} words)",
             u.name

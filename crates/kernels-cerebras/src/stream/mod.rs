@@ -236,6 +236,9 @@ pub struct Pins {
     /// [`build::program_py`]; `py 16`, `tile 12288`: flux2-mini as M1d built it).
     pub py: Option<u32>,
     pub tile: Option<u32>,
+    /// Every unit's rows held over the barrier in its row store, not at its roots (a test of
+    /// the store at rows the roots would hold).
+    pub spill: bool,
     /// Rows of the classes named here in place of `rows` (flux at 1024²: context 512, latents
     /// 4096).
     pub class_rows: Vec<(String, u32)>,
@@ -269,7 +272,9 @@ pub fn compile_pinned(
             &pins.class_rows,
         ),
     )?;
-    let p = build::program_py(trace, s, o.round16, o.upto, &o.taps, pins.py, pins.tile)?;
+    let p = build::program_py(
+        trace, s, o.round16, o.upto, &o.taps, pins.py, pins.tile, pins.spill,
+    )?;
     let e = crate::emit::stream::emit(&p)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     for (name, text) in &e.files {

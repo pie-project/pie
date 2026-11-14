@@ -155,7 +155,7 @@ pub fn program_upto(
     upto: Option<usize>,
     taps: &[u32],
 ) -> R<Program> {
-    program_py(trace, shape, round16, upto, taps, None, None)
+    program_py(trace, shape, round16, upto, taps, None, None, false)
 }
 
 /// The row roots a unit may take: the divisors of the hidden width that leave a CX root at
@@ -175,10 +175,12 @@ pub const MIN_PY: u32 = 4;
 /// roots a unit, the spare fabric spent on shorter rows).
 pub const TILE_FRACTIONS: [(u32, u32); 3] = [(1, 1), (3, 4), (1, 2)];
 
-/// [`program_upto`] at `py` row roots a unit and `tile` words a weight PE, or (`None`) at the
+/// [`program_upto`] at `py` row roots a unit and `tile` words a weight PE (`spill`: rows held over
+/// the barrier in the row store always), or (`None`) at the
 /// (row roots, tile budget) the
 /// cost model prices lowest of those that build within the system fabric ([`py_candidates`],
 /// [`TILE_FRACTIONS`]).
+#[allow(clippy::too_many_arguments)]
 pub fn program_py(
     trace: &Trace,
     shape: StreamShape,
@@ -187,6 +189,7 @@ pub fn program_py(
     taps: &[u32],
     py: Option<u32>,
     tile: Option<u32>,
+    spill: bool,
 ) -> R<Program> {
     let bounds = Bounds::system();
     let hidden = shape.program.hidden;
@@ -217,7 +220,8 @@ pub fn program_py(
                 .map(|&(p, tile)| {
                     let shape = shape.clone();
                     sc.spawn(move || {
-                        let r = program_at(trace, shape, round16, upto, taps, p, tile, bounds);
+                        let r =
+                            program_at(trace, shape, round16, upto, taps, p, tile, spill, bounds);
                         (p, tile, r)
                     })
                 })
@@ -262,7 +266,7 @@ pub fn program_py(
 }
 
 /// [`program_upto`] at `py` row roots a unit and weight tiles of at most `tile` words, within
-/// `bounds`.
+/// `bounds` (`spill`: every unit's rows held over the barrier in its row store).
 #[allow(clippy::too_many_arguments)]
 pub fn program_at(
     trace: &Trace,
@@ -272,6 +276,7 @@ pub fn program_at(
     taps: &[u32],
     py: u32,
     tile: u32,
+    spill: bool,
     bounds: Bounds,
 ) -> R<Program> {
     let prog = &shape.program;
@@ -404,7 +409,7 @@ pub fn program_at(
             word,
             prologue: u.classes.is_empty(),
         };
-        let layout = place::layout(&r, &u, py, tile)?;
+        let layout = place::layout(&r, &u, py, tile, spill)?;
         let mut regions = BTreeMap::new();
         for (i, s) in u.steps.iter().enumerate() {
             let Step::Region { side, chain } = s else {
@@ -632,5 +637,36 @@ mod tests {
         assert_eq!(p.kv.len(), 4);
         assert_eq!(p.stream.kv.len(), 8);
         assert_eq!(p.lane_words, 1536 + 1536 + 768 + 512);
+    }
+
+    /// The row store: flux2-mini's attending units with their held rows in their weight PEs
+    /// (each row root's chunk cast to its row, summed back up the row chain after the barrier)
+    /// build and print: the CX roots hold one row of each, the weight PEs their share.
+    #[test]
+    fn the_row_store_holds_a_units_rows_in_its_weight_pes() {
+        let t = trace();
+        let s = super::super::shape_of(&t, "denoise", 64).unwrap_or_else(|e| panic!("{e}"));
+        let p = program_py(
+            &t,
+            s,
+            true,
+            None,
+            &[],
+            Some(16),
+            Some(place::TILE_BUDGET),
+            true,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let spilled: Vec<&str> = p
+            .units
+            .iter()
+            .filter(|b| b.layout.spill)
+            .map(|b| b.unit.name.as_str())
+            .collect();
+        assert_eq!(spilled.len(), 6, "{spilled:?}");
+        let e = crate::emit::stream::emit(&p).unwrap_or_else(|e| panic!("{e}"));
+        let file = |n: &str| &e.files.iter().find(|(f, _)| f == n).expect(n).1;
+        assert!(file("w_3_0.csl").contains("const HSW: u16 = 16;"));
+        assert!(file("cx_3_0.csl").contains("fab.fin(q_ci, 16)"));
     }
 }
