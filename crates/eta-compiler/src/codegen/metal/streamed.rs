@@ -813,7 +813,7 @@ pub(super) fn kernel_head(
          dispatch_lane * layout->reserved2;\n",
     );
     source.push_str(
-        "  device uchar* scratch = all_scratch + dispatch_lane * layout->scratch_stride;\n",
+        "  device uchar* scratch = all_scratch + ulong(dispatch_lane) * ulong(layout->scratch_stride);\n",
     );
     source.push_str("  device uchar* temporary = scratch + layout->temporary_offset;\n");
     source.push_str(
