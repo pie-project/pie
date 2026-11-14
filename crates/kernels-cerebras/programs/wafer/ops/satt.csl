@@ -1,0 +1,118 @@
+// wafer/ops/satt.csl: P7 v0 (GENERIC.md §3.1), an attention PE's side of attention over a
+// step's own rows (the stream regime: non-causal, no cache across steps). A column of these PEs
+// holds one kv head (Dc dims, a whole head): row r of the column keeps rows p = r (mod PYA) of
+// the step as entry p / PYA, keys 16-bit dim-major [d][e], values entry-major [e][d | 1] with a
+// ones column (the values matvec also gives the softmax sum), as ops/att.csl keeps a cache.
+//
+// store(p): the column root's multicast [k | v] of row p (2 Dc f32); the row that keeps p lands
+// it, the others drain it. The attend phase may start only once every row is stored: the
+// barrier is the root's, which streams no query before its last store.
+// query(): the root's multicast q (Qh heads of Dc, f32); per pass the Qh heads' scores (a keys
+// matvec over every entry; an unwritten entry scores 0 and adds 0: its ones column is 0), times
+// SC, exp against the head's carried reference mref (math.vexp), clamped to PMAX and narrowed to
+// 16 bits, the values matvec into [o | l] a head, sent into the column chain (ops/red.csl); then
+// the root's word pair a head [redo, step]: mref += step, and a redo pass when any head's sum
+// left the probabilities' window (ops/cy_satt.csl decides).
+//
+// Params: fab (ops/fabric.csl), math (ops/math.csl), red (the column chain), YM (the root's
+// multicast input queue), Qh (q heads on the kv head), Dc (the head's dims), NE (entries a row),
+// PYA (the column's rows), SC (the scores' scale), PMAX (the 16-bit probabilities' ceiling: f16's
+// max for IEEE builds).
+param fab: imported_module;
+param math: imported_module;
+param red: imported_module;
+param YM: input_queue;
+param Qh: u16;
+param Dc: u16;
+param NE: u16;
+param PYA: u16;
+param SC: f32;
+param PMAX: f32 = 65504.0;
+
+const matvec = @import_module("ops/mv.csl");
+
+fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
+const KCW: u16 = Dc * NE;
+const VCW: u16 = NE * (Dc + 1);
+const XW: u16 = mx(Qh * Dc, Qh * NE);
+const YW: u16 = mx(Qh * NE, Qh * (Dc + 1));
+var kc = @zeros([KCW]u16);
+var vc = @zeros([VCW]u16);
+var xh = @zeros([XW]@fp16());
+var y: [YW]f32 align(16) = @zeros([YW]f32);
+var sx: [2 * Dc]f32 align(16) = @zeros([2 * Dc]f32);
+var pp = @zeros([Qh * NE]f32);
+var kk = @zeros([Qh * NE]u16);
+var mref = @zeros([Qh]f32);
+var myrow: u16 = 0;
+const xh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XW} -> xh[i] });
+const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YW} -> y[i] });
+const sx_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * Dc} -> sx[i] });
+const kc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NE} -> kc[i] });
+const vc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc + 1} -> vc[i] });
+const sc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * NE} -> y[i] });
+const p_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * NE} -> pp[i] });
+const k_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * NE} -> kk[i] });
+var pl_d = k_d;
+
+fn init(row: u16) void {
+  myrow = row;
+  pl_d = @set_dsd_stride(@set_dsd_base_addr(k_d, @ptrcast([*]u16, &pp)), 2);
+  var e: u16 = 0;
+  while (e < VCW) : (e += 1) { vc[e] = 0; }
+  e = 0;
+  while (e < KCW) : (e += 1) { kc[e] = 0; }
+  var h: u16 = 0;
+  while (h < Qh) : (h += 1) { mref[h] = 0.0; }
+}
+
+// Row p's [k | v] from the root's multicast; kept by row p % PYA as entry p / PYA.
+fn store(p: u16) void {
+  @fmovs(sx_d, fab.fin(YM, 2 * Dc));
+  if (p % PYA != myrow) { return; }
+  const e = p / PYA;
+  var d: u16 = 0;
+  while (d < Dc) : (d += 1) {
+    kc[d * NE + e] = @bitcast(u16, @as(@fp16(), sx[d]));
+    vc[e * (Dc + 1) + d] = @bitcast(u16, @as(@fp16(), sx[Dc + d]));
+  }
+  vc[e * (Dc + 1) + Dc] = @bitcast(u16, @as(@fp16(), 1.0));
+}
+
+// One query: q in, passes until no head's sum left the window.
+fn query() void {
+  const QD: u16 = Qh * Dc;
+  @fs2h(@set_dsd_length(xh_d, QD), fab.fin(YM, QD));
+  var pass: u16 = 0;
+  while (pass < 8) : (pass += 1) {
+    var h: u16 = 0;
+    while (h < Qh) : (h += 1) {
+      matvec.tile32(@set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * NE), f32), NE), kc_d,
+                    @set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, h * Dc), @fp16()), Dc));
+    }
+    @fmuls(sc_d, sc_d, SC);
+    h = 0;
+    while (h < Qh) : (h += 1) {
+      const sh = @set_dsd_length(@increment_dsd_offset(sc_d, @as(i16, h * NE), f32), NE);
+      @fsubs(sh, sh, mref[h]);
+    }
+    math.vexp(sc_d, p_d, k_d, pl_d, 88.0, true);
+    @fnegs(sc_d, sc_d);
+    @fmaxs(sc_d, sc_d, -PMAX);
+    @fnegs(sc_d, sc_d);
+    // (q is spent: the probabilities take xh; a redo pass gets q again from the root)
+    @fs2h(@set_dsd_length(xh_d, Qh * NE), sc_d);
+    h = 0;
+    while (h < Qh) : (h += 1) {
+      matvec.tile32(@set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * (Dc + 1)), f32), Dc + 1), vc_d,
+                    @set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, h * NE), @fp16()), NE));
+    }
+    red.send(@set_dsd_length(y_d, Qh * (Dc + 1)), Qh * (Dc + 1));
+    @fmovs(@set_dsd_length(sx_d, 1 + Qh), fab.fin(YM, 1 + Qh));
+    h = 0;
+    while (h < Qh) : (h += 1) { mref[h] += sx[1 + h]; }
+    if (sx[0] == 0.0) { pass = 8; } else {
+      @fs2h(@set_dsd_length(xh_d, QD), fab.fin(YM, QD));
+    }
+  }
+}

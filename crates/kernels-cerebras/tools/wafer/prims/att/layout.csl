@@ -1,0 +1,49 @@
+// prims/att: P7 v0 (ops/satt.csl, ops/cy_satt.csl) on its own. NH columns, a kv head each: PYA
+// attention PEs (y 0..PYA-1) under the column's root (y = PYA). The root multicasts north up its
+// column ([k | v] rows, then queries); the PEs' [o | l] partials chain south into it.
+param NH: u16;
+param PYA: u16;
+param Dc: u16;
+param NE: u16;
+param TB: u16;
+param SCB: u32;   // the scores' scale, its f32 bits (cslc takes integer params only)
+param WIN: u16;   // 1: the f16 probabilities' window; 0: bf16's (no ceiling short of overflow)
+
+const C_M: color = @get_color(1);
+const C_CH0: color = @get_color(2);
+const C_CH1: color = @get_color(3);
+
+const memcpy = @import_module("<memcpy/get_params>", .{ .width = NH, .height = PYA + 1 });
+
+fn chain(y: u16) color { return if (y % 2 == 0) C_CH0 else C_CH1; }
+
+layout {
+  @set_rectangle(NH, PYA + 1);
+  for (@range(u16, NH)) |x| {
+    const mp = memcpy.get_params(x);
+    for (@range(u16, PYA + 1)) |y| {
+      const root = y == PYA;
+      @set_tile_code(x, y, "pe.csl", .{
+        .memcpy_params = mp, .ROOT = root, .ROW = y, .PYA = PYA, .Dc = Dc, .NE = NE, .TB = TB, .SC = @bitcast(f32, SCB), .WIN = WIN,
+        .C_M = C_M, .CIN = if (y == 0) C_CH0 else chain(y - 1), .COUT = chain(y),
+      });
+      if (root) {
+        @set_color_config(x, y, C_M, .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ NORTH } } });
+        @set_color_config(x, y, chain(y - 1), .{ .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP } } });
+      } else {
+        if (y > 0) {
+          @set_color_config(x, y, C_M, .{ .routes = .{ .rx = .{ SOUTH }, .tx = .{ RAMP, NORTH } } });
+          @set_color_config(x, y, chain(y - 1), .{ .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP } } });
+        } else {
+          @set_color_config(x, y, C_M, .{ .routes = .{ .rx = .{ SOUTH }, .tx = .{ RAMP } } });
+        }
+        @set_color_config(x, y, chain(y), .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ SOUTH } } });
+      }
+    }
+  }
+  @export_name("kvb", [*]f32, true);
+  @export_name("qb", [*]f32, true);
+  @export_name("ob", [*]f32, true);
+  @export_name("tsc", [*]u32, true);
+  @export_name("run", fn(u16, u16, u16) void);
+}

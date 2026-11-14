@@ -1,0 +1,50 @@
+// wafer/ops/cy_satt.csl: P7 v0 (GENERIC.md §3.1), a column root's side of attention over a
+// step's own rows (the attention PEs' side: ops/satt.csl). Store phase: each row's [k | v] (a kv
+// head, 2 Dc f32) multicast up the column. Attend phase, a query a call: q (Qh heads of Dc)
+// multicast; from the column chain [o | l] a head; o / l; [redo, ln l a head] multicast (the PEs'
+// reference steps), and q again while any l is outside [LO, HI): the 16-bit probabilities'
+// window (f16: [2^-8, 2^15), as ops/cy_att.csl's).
+//
+// Params: fab (ops/fabric.csl), math (ops/math.csl), YO (the column multicast's output queue),
+// IN (the chain's input queue), Qh, Dc, LO / HI (the window).
+param fab: imported_module;
+param math: imported_module;
+param YO: output_queue;
+param IN: input_queue;
+param Qh: u16;
+param Dc: u16;
+param LO: f32 = 0.00390625;
+param HI: f32 = 32768.0;
+
+const QD: u16 = Qh * Dc;
+const TW: u16 = Qh * (Dc + 1);
+var t: [TW]f32 align(16) = @zeros([TW]f32);
+var u = @zeros([1 + Qh]f32);
+const t_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{TW} -> t[i] });
+const u_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1 + Qh} -> u[i] });
+var passes: u32 = 0;   // every query's passes, summed (a redo is one more)
+
+// Row's [k | v] (kv, 2 Dc f32) to the column.
+fn store(kv: mem1d_dsd) void { @fmovs(fab.fout(YO, 2 * Dc), kv); }
+
+// One query: q (QD f32) in, o (QD f32) out.
+fn query(q: mem1d_dsd, o: mem1d_dsd) void {
+  var pass: u16 = 0;
+  while (pass < 8) : (pass += 1) {
+    passes += 1;
+    @fmovs(fab.fout(YO, QD), q);
+    @fmovs(t_d, fab.fin(IN, TW));
+    var bad: f32 = 0.0;
+    var h: u16 = 0;
+    while (h < Qh) : (h += 1) {
+      const l = t[h * (Dc + 1) + Dc];
+      if (l < LO or l >= HI) { bad = 1.0; }
+      @fmuls(@set_dsd_length(@increment_dsd_offset(o, @as(i16, h * Dc), f32), Dc),
+             @set_dsd_length(@increment_dsd_offset(t_d, @as(i16, h * (Dc + 1)), f32), Dc), math.recip(l));
+      u[1 + h] = math.ln1(l);
+    }
+    u[0] = bad;
+    @fmovs(fab.fout(YO, 1 + Qh), u_d);
+    if (bad == 0.0) { pass = 8; }
+  }
+}

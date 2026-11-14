@@ -1,0 +1,92 @@
+// prims/att's PEs (layout.csl): an attention PE (ops/satt.csl) or a column's root (ROOT,
+// ops/cy_satt.csl). run(phase, p0, n): phase 0 stores rows p0 .. p0 + n (the root's kvb), 1
+// attends n queries (the root's qb into ob). tsc: [0] / [1] the phase's first and last stamps
+// (TSC low words), [2] the root's passes so far.
+param memcpy_params;
+param ROOT: bool;
+param ROW: u16;
+param PYA: u16;
+param Dc: u16;
+param NE: u16;
+param TB: u16;
+param SC: f32;
+param WIN: u16;
+param C_M: color;
+param CIN: color;
+param COUT: color;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const timestamp = @import_module("<time>");
+const fab = @import_module("ops/fabric.csl");
+const math = @import_module("ops/math.csl");
+
+const q_in1 = @get_input_queue(2);
+const q_in2 = @get_input_queue(3);
+const q_ym = @get_input_queue(4);
+const q_out = @get_output_queue(5);
+const q_yo = @get_output_queue(2);
+const red = @import_module("ops/red.csl", .{ .fab = fab, .IN1 = q_in1, .IN2 = q_in2, .OUT = q_out,
+                                             .UT1 = @get_ut_id(2), .UT2 = @get_ut_id(3) });
+const att = @import_module("ops/satt.csl", .{ .fab = fab, .math = math, .red = red, .YM = q_ym, .Qh = 1,
+                                              .Dc = if (ROOT) 1 else Dc, .NE = if (ROOT) 1 else NE, .PYA = PYA, .SC = SC,
+                                              .PMAX = if (WIN == 1) 65504.0 else 1.0e30 });
+const cy = @import_module("ops/cy_satt.csl", .{ .fab = fab, .math = math, .YO = q_yo, .IN = q_in1, .Qh = 1,
+                                               .Dc = if (ROOT) Dc else 1,
+                                               .LO = if (WIN == 1) 0.00390625 else 1.0e-30,
+                                               .HI = if (WIN == 1) 32768.0 else 1.0e30 });
+
+const BN: u16 = if (ROOT) TB * Dc else 1;
+var kvb = @zeros([2 * BN]f32);
+var qb = @zeros([BN]f32);
+var ob = @zeros([BN]f32);
+var tsc = @zeros([3]u32);
+var ts = @zeros([3]u16);
+var kvb_ptr: [*]f32 = &kvb;
+var qb_ptr: [*]f32 = &qb;
+var ob_ptr: [*]f32 = &ob;
+var tsc_ptr: [*]u32 = &tsc;
+fn stamp(i: u16) void { timestamp.get_timestamp(&ts); tsc[i] = @as(u32, ts[0]) | (@as(u32, ts[1]) << 16); }
+
+var a_phase: u16 = 0;
+var a_p0: u16 = 0;
+var a_n: u16 = 0;
+const T_RUN: local_task_id = @get_local_task_id(8);
+task go() void {
+  timestamp.enable_tsc();
+  const n = a_n;
+  if (!ROOT and a_phase == 0 and a_p0 == 0) { att.init(ROW); red.role = if (ROW == 0) 0 else 1; }
+  stamp(0);
+  var t: u16 = 0;
+  while (t < n) : (t += 1) {
+    if (ROOT) {
+      if (a_phase == 0) {
+        const kv = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * Dc} -> kvb[i] });
+        cy.store(@increment_dsd_offset(kv, @as(i16, t * 2 * Dc), f32));
+      } else {
+        const q = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> qb[i] });
+        const o = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> ob[i] });
+        cy.query(@increment_dsd_offset(q, @as(i16, t * Dc), f32), @increment_dsd_offset(o, @as(i16, t * Dc), f32));
+      }
+    } else {
+      if (a_phase == 0) { att.store(a_p0 + t); } else { att.query(); }
+    }
+  }
+  stamp(1);
+  if (ROOT) { tsc[2] = cy.passes; }
+  sys_mod.unblock_cmd_stream();
+}
+fn run(phase: u16, p0: u16, n: u16) void { a_phase = phase; a_p0 = p0; a_n = n; @activate(T_RUN); }
+
+comptime {
+  @bind_local_task(go, T_RUN);
+  @export_symbol(kvb_ptr, "kvb");
+  @export_symbol(qb_ptr, "qb");
+  @export_symbol(ob_ptr, "ob");
+  @export_symbol(tsc_ptr, "tsc");
+  @export_symbol(run);
+  @initialize_queue(q_in1, .{ .color = if (ROOT or ROW > 0) CIN else @get_color(16) });
+  @initialize_queue(q_in2, .{ .color = @get_color(17) });
+  @initialize_queue(q_ym, .{ .color = if (!ROOT) C_M else @get_color(18) });
+  @initialize_queue(q_out, .{ .color = if (!ROOT) COUT else @get_color(19) });
+  @initialize_queue(q_yo, .{ .color = if (ROOT) C_M else @get_color(20) });
+}

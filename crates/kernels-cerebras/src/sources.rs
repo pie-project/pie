@@ -67,10 +67,17 @@ pub const OPS: &[(&str, &str)] = &[
 ];
 
 /// The stream regime's op modules (GENERIC.md §3.1, M1c), `programs/wafer/ops` too: P1-stream (the
-/// matvec over a row stream). No decode kind imports them, and a decode build neither writes nor
-/// keys them, so the shipping programs stay byte-identical; the stream build (M1d) takes them
-/// with [`OPS`].
-pub const STREAM_OPS: &[(&str, &str)] = &[("smv.csl", include_str!("../programs/wafer/ops/smv.csl"))];
+/// matvec over a row stream) and P7 v0 (attention over a step's rows, its PEs' and its root's
+/// sides). No decode kind imports them, and a decode build neither writes nor keys them, so the
+/// shipping programs stay byte-identical; the stream build (M1d) takes them with [`OPS`].
+pub const STREAM_OPS: &[(&str, &str)] = &[
+    (
+        "cy_satt.csl",
+        include_str!("../programs/wafer/ops/cy_satt.csl"),
+    ),
+    ("satt.csl", include_str!("../programs/wafer/ops/satt.csl")),
+    ("smv.csl", include_str!("../programs/wafer/ops/smv.csl")),
+];
 
 /// The source of the kernel file `name`.
 pub fn get(name: &str) -> Option<&'static str> {
