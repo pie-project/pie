@@ -201,6 +201,26 @@ pub trait Engine: Send {
         Err(self.unsupported("release_segments"))
     }
 
+    /// Backs the top `segments` segments of the span under the largest
+    /// rung's activation, counted from the top of the pool, ahead of the
+    /// runtime opening any chunk of theirs for state; never on a fire's
+    /// path. Monotone as [`Self::commit_segments`]' prefix, from the other
+    /// end. Only where [`crate::chunk::ChunkFacts::span_backed_on_demand`];
+    /// the engine backs its own activation carve itself.
+    fn commit_span(&mut self, segments: u32) -> Result<()> {
+        let _ = segments;
+        Ok(())
+    }
+
+    /// Keeps the top `segments` span segments backed and gives back the
+    /// span segments below them, which hold no state chunk and which no
+    /// rung lends any more ([`Self::commit_span`]'s counting). Whatever of
+    /// them the engine's own activation carve uses stays its own to back.
+    fn release_span(&mut self, segments: u32) -> Result<()> {
+        let _ = segments;
+        Ok(())
+    }
+
     /// Copies each moved chunk's bytes onto its new physical chunk and
     /// updates the engine's [`crate::chunk::ChunkTable`], stream-ordered
     /// before the next fire; the slot refs the runtime holds stand.
