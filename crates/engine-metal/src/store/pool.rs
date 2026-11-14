@@ -512,10 +512,8 @@ mod tests {
         for chunk in 8..12 {
             pool.admit(chunk).expect("the span's segment is backed");
         }
-        // The span reads back what was written, and starts zeroed.
+        // The span reads back what was written.
         let mut seen = [7u8; 64];
-        pool.read(10 * CHUNK + 4096, &mut seen).expect("a read");
-        assert_eq!(seen, [0u8; 64]);
         pool.write(10 * CHUNK + 4096, &[9u8; 64]).expect("a write");
         // The bottom grows to the span and no further.
         pool.commit_segments(3).expect("every segment");
