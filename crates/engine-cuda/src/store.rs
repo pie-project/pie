@@ -1120,7 +1120,10 @@ impl Pools {
                 .saturating_add(more)
                 .min(self.chunks.total()),
         );
-        self.paging.pages = self.paging.pages.max(self.pages_within(self.stated.unwrap_or(0)));
+        self.paging.pages = self
+            .paging
+            .pages
+            .max(self.pages_within(self.stated.unwrap_or(0)));
         self.pledge();
     }
 
@@ -1852,6 +1855,31 @@ impl Pools {
     /// Lets go of the name [`Pools::name_record`] gave `key`.
     pub fn forget_record(&mut self, key: u32) {
         self.records.remove(&key);
+    }
+
+    /// The address of a guest item of `bytes` in `refs`, slot refs of
+    /// `role`'s shape, where their chunk lies now.
+    pub fn guest_span(
+        &self,
+        role: engine::chunk::SlotRole,
+        refs: &[u32],
+        bytes: u64,
+    ) -> Result<u64> {
+        self.chunks.guest_span(role, refs, bytes)
+    }
+
+    /// The slots a guest item of `bytes` takes of `role`'s shape.
+    #[must_use]
+    pub fn guest_footprint(
+        &self,
+        role: engine::chunk::SlotRole,
+        bytes: u64,
+    ) -> engine::program::Footprint {
+        self.chunks
+            .layout()
+            .guest(role)
+            .map(|shape| shape.footprint(bytes))
+            .unwrap_or_default()
     }
 
     /// Names the record whose pieces lie in the slot refs `pieces`, for the
@@ -2766,7 +2794,9 @@ impl Pools {
                 if self.weights_filed {
                     for lane in &self.lanes {
                         let at_of = |param: u32| {
-                            banks().find(|bank| bank.plane.param == param).map(|b| to + b.plane.offset)
+                            banks()
+                                .find(|bank| bank.plane.param == param)
+                                .map(|b| to + b.plane.offset)
                         };
                         if let (Some(codes), Some(exps)) = (at_of(lane.codes), at_of(lane.scales)) {
                             laid.push((codes, exps, lane.rows, lane.k));
@@ -2865,7 +2895,11 @@ impl Pools {
 
     /// Each `(codes, exponents)` span of `rows` rows of K `k` laid in lane
     /// order where it lies, host or device, through the device.
-    fn lay_lanes(&self, stream: *mut core::ffi::c_void, spans: &[(u64, u64, u64, u64)]) -> Result<()> {
+    fn lay_lanes(
+        &self,
+        stream: *mut core::ffi::c_void,
+        spans: &[(u64, u64, u64, u64)],
+    ) -> Result<()> {
         #[cfg(feature = "rocm")]
         {
             let Some(widest) = spans.iter().map(|&(_, _, rows, k)| rows * k).max() else {
@@ -2873,7 +2907,8 @@ impl Pools {
             };
             let codes_span = (widest / 2).next_multiple_of(16);
             let span = codes_span + widest / 32;
-            let staging = crate::device::Buffer::zeroed(usize::try_from(2 * span).unwrap_or(usize::MAX))?;
+            let staging =
+                crate::device::Buffer::zeroed(usize::try_from(2 * span).unwrap_or(usize::MAX))?;
             // SAFETY: `stream` is the caller's live stream.
             let ctx = unsafe { kernels_cuda::Ctx::on(stream.cast()) };
             let (in_c, in_e) = (staging.ptr() + span, staging.ptr() + span + codes_span);
@@ -3091,10 +3126,16 @@ impl Pools {
         let mut laid = Vec::new();
         for cache in &self.expert_caches {
             for lane in &self.lanes {
-                for codes in cache.planes.iter().filter(|bank| bank.plane.param == lane.codes) {
-                    let Some(exps) = cache.planes.iter().find(|bank| {
-                        bank.plane.param == lane.scales && bank.layer == codes.layer
-                    }) else {
+                for codes in cache
+                    .planes
+                    .iter()
+                    .filter(|bank| bank.plane.param == lane.codes)
+                {
+                    let Some(exps) = cache
+                        .planes
+                        .iter()
+                        .find(|bank| bank.plane.param == lane.scales && bank.layer == codes.layer)
+                    else {
                         continue;
                     };
                     for expert in 0..u64::from(cache.shape.experts) {
@@ -3332,9 +3373,9 @@ impl Pools {
         max_tokens: u32,
         rungs: &[(u32, u64)],
     ) -> Result<engine::chunk::ChunkFacts> {
-        let fitted = self
-            .stated
-            .map_or(self.fitted_chunks(), |stated| stated.max(self.fitted_chunks()));
+        let fitted = self.stated.map_or(self.fitted_chunks(), |stated| {
+            stated.max(self.fitted_chunks())
+        });
         self.chunks.limit(fitted);
         self.chunks.skip_past(fitted);
         // The state's chunks of the segment the stated activation starts in
@@ -4440,7 +4481,10 @@ fn lay(
 /// The chunks a pool of `pages` kv pages takes: the null chunk, the pages'
 /// and the windowed pages beside them.
 fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64, slots: u32) -> u32 {
+    // The null chunk, and a chunk of each guest shape: an instance's
+    // tables and a ring, which every working set served binds.
     let chunks = 1
+        + GUEST_SHAPES
         + layout.chunks_for(Kind::List, pages)
         + (0..layout.windows.len())
             .map(|window| {
@@ -4457,6 +4501,9 @@ fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64, slots: u32) -
         );
     u32::try_from(chunks).unwrap_or(u32::MAX)
 }
+
+/// The guest shapes: `Instance` and `Channel`.
+const GUEST_SHAPES: u64 = 2;
 
 /// A row-streamed table's cache: where each block of its rows lies (a pool
 /// slot the runtime named, or the mapped host copy), the device table its

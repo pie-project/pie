@@ -258,6 +258,10 @@ fn four_ranks_land_what_one_rank_lands() {
     let mut attachments = Vec::new();
     let mut instances = Vec::new();
     let mut next_channel = 1u64;
+    let mut guest = crate::guest::Guest::of(
+        &loaded.caps.chunks,
+        loaded.caps.chunks.segments.committed * loaded.caps.chunks.segment_chunks,
+    );
     for (at, &n) in rows.iter().enumerate() {
         let bound = crate::bound::loaded(epilogue(n), &loaded.caps).expect("the epilogue binds");
         let stages = compile_bound(&bound);
@@ -296,24 +300,26 @@ fn four_ranks_land_what_one_rank_lands() {
         };
         let latent = channel(HostRole::Writer);
         let out = channel(HostRole::Reader);
-        let instance = group
-            .bind_instance(&InstanceBinding {
-                program,
-                channels: vec![latent, out],
-                seeds: Vec::new(),
-                geometry: GeometryClass::Host,
-                device_resolved: Default::default(),
-                instance_slots: Vec::new(),
-                ring_slots: Vec::new(),
-                extents: BindExtents {
-                    row_count: n,
-                    token_count: n,
-                    sampled_rows: n,
-                    query_len: n,
-                    ..BindExtents::default()
+        let instance = guest
+            .bind(
+                &mut group,
+                InstanceBinding {
+                    program,
+                    channels: vec![latent, out],
+                    seeds: Vec::new(),
+                    geometry: GeometryClass::Host,
+                    device_resolved: Default::default(),
+                    extents: BindExtents {
+                        row_count: n,
+                        token_count: n,
+                        sampled_rows: n,
+                        query_len: n,
+                        ..BindExtents::default()
+                    },
+                    instance_slots: Vec::new(),
+                    ring_slots: Vec::new(),
                 },
-            })
-            .expect("the instance binds on every rank")
+            )
             .id;
         let bytes: Vec<u8> = inputs[at].iter().flat_map(|v| v.to_le_bytes()).collect();
         assert!(

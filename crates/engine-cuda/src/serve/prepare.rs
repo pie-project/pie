@@ -1614,8 +1614,8 @@ impl FrameShell for Shell {
         let lanes_fit = composition.lane_count() <= crate::window::lane_capacity(max_lanes);
         // Why a fire of a load that records bodies walks its plan, for the
         // warning it raises (`Bodies::eager_unbodied`).
-        let unbodied = (records_bodies && !arming && !(bodied && readouts_fit && lanes_fit))
-            .then(|| {
+        let unbodied =
+            (records_bodies && !arming && !(bodied && readouts_fit && lanes_fit)).then(|| {
                 let why = if tapped {
                     "it is tapped"
                 } else if !replays_fit {

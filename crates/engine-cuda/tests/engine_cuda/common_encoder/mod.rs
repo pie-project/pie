@@ -291,6 +291,7 @@ pub struct Rig {
     pub facts: poem_ir::Facts,
     pub programs: BTreeMap<u32, ProgramId>,
     next_channel: u64,
+    guest: crate::guest::Guest,
     _dir: tempfile::TempDir,
 }
 
@@ -332,6 +333,7 @@ impl Rig {
             })
             .expect("the layer loads");
         Rig {
+            guest: crate::guest::Guest::on(&mut engine, &loaded.caps.chunks),
             engine,
             loaded,
             facts,
@@ -390,16 +392,14 @@ impl Rig {
         let program = self.program(rows);
         let latent = self.channel(vec![rows, WIDTH], HostRole::Writer);
         let out = self.channel(vec![rows, WIDTH], HostRole::Reader);
-        let bound = self
-            .engine
-            .bind_instance(&InstanceBinding {
+        let bound = self.guest.bind(
+            &mut self.engine,
+            InstanceBinding {
                 program,
                 channels: vec![latent, out],
                 seeds: Vec::new(),
                 geometry: GeometryClass::Host,
                 device_resolved: Default::default(),
-                instance_slots: Vec::new(),
-                ring_slots: Vec::new(),
                 extents: engine::program::BindExtents {
                     row_count: rows,
                     token_count: rows,
@@ -407,8 +407,10 @@ impl Rig {
                     query_len: rows,
                     ..engine::program::BindExtents::default()
                 },
-            })
-            .expect("the instance binds");
+                instance_slots: Vec::new(),
+                ring_slots: Vec::new(),
+            },
+        );
         LaneHandles {
             instance: bound.id,
             latent,

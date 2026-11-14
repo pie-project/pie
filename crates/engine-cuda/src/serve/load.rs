@@ -524,7 +524,7 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
     };
     let in_file = !params.iter().any(|&param| relaid(param))
         && crate::checkpoint_serving::Serving::open(boot.checkpoint, &boot.trace)
-        .is_some_and(|serving| serving.holds(params, &bytes));
+            .is_some_and(|serving| serving.holds(params, &bytes));
     let pinned: u64 = params.iter().map(|&param| bytes[param]).sum();
     if boot.knobs.weights_held {
         if in_file {
@@ -1036,14 +1036,13 @@ impl Shell {
             );
         }
         let mut pools = pools;
-        let buffers =
-            Buffers::reserve(
-                &boot.trace,
-                paging,
-                budgets.tokens.max_tokens,
-                budgets.tokens.max_lanes,
-                &pools,
-            )?;
+        let buffers = Buffers::reserve(
+            &boot.trace,
+            paging,
+            budgets.tokens.max_tokens,
+            budgets.tokens.max_lanes,
+            &pools,
+        )?;
         // Each row-streamed table's cache opens over its host copy.
         let hosts: Vec<(u32, u64)> = pools
             .row_params()
@@ -1532,7 +1531,12 @@ impl Shell {
         }
         // Every slab this shell's fires take is laid: none grows.
         self.device.ctx().slabs().seal();
-        for ctx in self.device.conditional_ctx().into_iter().chain(self.device.side_ctx()) {
+        for ctx in self
+            .device
+            .conditional_ctx()
+            .into_iter()
+            .chain(self.device.side_ctx())
+        {
             ctx.slabs().seal();
         }
         Ok(())
@@ -1602,9 +1606,8 @@ impl Staged {
             // The rungs past the smallest arm in the lane time the caller
             // gives, over slots it lends: of the kv list and the records,
             // so not where a fire also names windowed pages.
-            shell.arm_stepped = shell.arm_stepped
-                && shell.ep.is_none()
-                && !shell.pools.has_windowed();
+            shell.arm_stepped =
+                shell.arm_stepped && shell.ep.is_none() && !shell.pools.has_windowed();
             shell.arm_bodies()?;
         }
         let stepping = shell.stepping.is_some();
@@ -1636,7 +1639,10 @@ impl Staged {
         if stepping {
             // The runtime is stated what the settled fit may come to, and
             // keeps the pool under it by what this fit holds back.
-            let more = shell.pools.activation_unheld_bytes().saturating_add(fitted.bodies);
+            let more = shell
+                .pools
+                .activation_unheld_bytes()
+                .saturating_add(fitted.bodies);
             shell.pools.state_most(more);
         }
         // A load that arms later may have had its range reserved anew by
@@ -1762,9 +1768,7 @@ impl Shell {
     pub(super) fn settle(&mut self) -> Result<()> {
         let resident = footprint(self, self.card.0, self.card.1);
         let before = (self.pools.declared_bytes(), self.pools.kept_back_bytes());
-        let fitted = self
-            .pools
-            .fit_the_card(0, self.card.2, true, &resident)?;
+        let fitted = self.pools.fit_the_card(0, self.card.2, true, &resident)?;
         self.state_live();
         if super::diag::on().arm_trace {
             eprintln!(
@@ -1786,8 +1790,14 @@ fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory:
     let held = footprint(shell, device_total, free_before);
     let mut ledger = Ledger::new(shell.pools.chunk_bytes(1), device_total);
     ledger.enter(Class::Model, "weights", held.weights);
-    let workspaces = shell.workspace.as_ref().map_or(0, |workspace| workspace.bytes);
-    let rs_scratch = shell.buffers.as_ref().map_or(0, |buffers| buffers.scratch_bytes());
+    let workspaces = shell
+        .workspace
+        .as_ref()
+        .map_or(0, |workspace| workspace.bytes);
+    let rs_scratch = shell
+        .buffers
+        .as_ref()
+        .map_or(0, |buffers| buffers.scratch_bytes());
     ledger.enter(Class::Fire, "activation", held.arena);
     ledger.enter(Class::Fire, "workspaces", workspaces);
     ledger.enter(Class::Fire, "rs scratch", rs_scratch);

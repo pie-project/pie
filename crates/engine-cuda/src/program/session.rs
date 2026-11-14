@@ -92,6 +92,7 @@ impl Session {
         seeds: &[(u32, Vec<u8>)],
         extents: Extents,
         endpoints: Vec<Option<Arc<Endpoint>>>,
+        place: &super::launch::Place,
         shadow: bool,
         stream: *mut core::ffi::c_void,
     ) -> Result<Session> {
@@ -106,7 +107,13 @@ impl Session {
 
         let shapes: Vec<ChannelShape> =
             plan.package.channels.iter().map(ChannelShape::of).collect();
-        let rings = Rings::allocate(&shapes, endpoints, stream)?;
+        let rings = Rings::allocate(
+            &shapes,
+            endpoints,
+            super::launch::Held::of(&plan.package.channels),
+            place,
+            stream,
+        )?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
 
         let commit_key = crate::device::held::pool::commit_key(2 * size_of::<u32>());
@@ -165,6 +172,11 @@ impl Session {
         let seeded = session.cursors_now();
         session.rings.seed_registry(&seeded, stream)?;
         Ok(session)
+    }
+
+    /// Points the rings at `place`, where their pool slots lie now.
+    pub fn rebase(&mut self, place: &super::launch::Place) -> Result<()> {
+        self.rings.rebase(place)
     }
 
     #[must_use]

@@ -412,6 +412,32 @@ impl Engine for Group {
         self.lead(move |rank| rank.register_program(&registration))
     }
 
+    fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
+        match self.ranks.first().and_then(|rank| rank.try_lock().ok()) {
+            Some(rank) => rank.program_facts(program),
+            None => Err(Error::Program(
+                "a rank is busy: its program's facts are asked between frames".to_string(),
+            )),
+        }
+    }
+
+    fn ring_facts(
+        &self,
+        registration: &ChannelRegistration,
+    ) -> EngineResult<Option<engine::program::RingFacts>> {
+        match self.ranks.first().and_then(|rank| rank.try_lock().ok()) {
+            Some(rank) => rank.ring_facts(registration),
+            None => Err(Error::Program(
+                "a rank is busy: a ring's facts are asked between frames".to_string(),
+            )),
+        }
+    }
+
+    fn rebind_slots(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
+        let rebind = rebind.clone();
+        self.lead(move |rank| rank.rebind_slots(rebind.clone()))
+    }
+
     fn register_channel(
         &mut self,
         registration: &ChannelRegistration,

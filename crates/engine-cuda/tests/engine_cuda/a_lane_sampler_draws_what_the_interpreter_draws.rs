@@ -199,6 +199,8 @@ fn draw_all(rank: bool, cases: &[(&str, Vec<f32>, f32, [u32; 2])]) -> (usize, us
                 false,
                 &vec![None; count],
                 &ids,
+                crate::guest::alone_slots(&plane, program),
+                &crate::guest::alone_span,
                 context.stream(),
             )
             .expect("the sampler binds an instance");

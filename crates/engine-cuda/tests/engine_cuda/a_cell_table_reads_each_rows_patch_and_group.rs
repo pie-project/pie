@@ -159,7 +159,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
     let path = weights.write(dir.path());
     let mut engine = engine_cuda::open(engine_cuda::DeviceBoot::default(), contract_for)
         .expect("the engine opens");
-    engine
+    let loaded = engine
         .load(LoadRequest {
             trace,
             checkpoint: Checkpoint::Path(path),
@@ -182,6 +182,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
             frames_in_flight: 1,
         })
         .expect("the cell plan loads");
+    let mut guest = crate::guest::Guest::on(&mut engine, &loaded.caps.chunks);
 
     let clips = [[2u32, 4, 6], [1, 2, 4]];
     let text_rows = [3u32, 5];
@@ -265,24 +266,26 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
                 slots: Vec::new(),
             })
             .expect("the channel registers");
-        let instance = engine
-            .bind_instance(&InstanceBinding {
-                program,
-                channels: vec![channel],
-                seeds: Vec::new(),
-                geometry: GeometryClass::Host,
-                device_resolved: Default::default(),
-                instance_slots: Vec::new(),
-                ring_slots: Vec::new(),
-                extents: engine::program::BindExtents {
-                    row_count: rows,
-                    token_count: rows,
-                    sampled_rows: rows,
-                    query_len: rows,
-                    ..engine::program::BindExtents::default()
+        let instance = guest
+            .bind(
+                &mut engine,
+                InstanceBinding {
+                    program,
+                    channels: vec![channel],
+                    seeds: Vec::new(),
+                    geometry: GeometryClass::Host,
+                    device_resolved: Default::default(),
+                    extents: engine::program::BindExtents {
+                        row_count: rows,
+                        token_count: rows,
+                        sampled_rows: rows,
+                        query_len: rows,
+                        ..engine::program::BindExtents::default()
+                    },
+                    instance_slots: Vec::new(),
+                    ring_slots: Vec::new(),
                 },
-            })
-            .expect("the instance binds")
+            )
             .id;
         attachments.push(Attachment {
             lane: at as u32,

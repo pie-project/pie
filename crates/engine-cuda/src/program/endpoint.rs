@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use eta_ir::container::HostRole;
 
-use crate::device::{Buffer, Pinned};
+use crate::device::Pinned;
 use crate::error::{Fault, Result};
 
 const HEAD_WORD: usize = 0;
@@ -19,7 +19,11 @@ pub struct Endpoint {
     mirror: Pinned,
     wire_bytes: u32,
     cap1: u32,
-    device_cells: Option<Buffer>,
+    /// Where the cells of a ring only the device touches lie in the pool
+    /// now (0: the ring's cells are each instance's own), and the
+    /// `Channel` slots they lie in.
+    cells: AtomicU64,
+    slots: std::sync::Mutex<Vec<u32>>,
     attachments: AtomicU32,
     predicted_head: AtomicU64,
     predicted_tail: AtomicU64,
@@ -29,12 +33,21 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    /// Opens an endpoint, its device cells zeroed on `stream` ahead of the fires
-    /// that read them.
+    /// The bytes of the cells a ring of `capacity` cells of `wire_bytes`
+    /// keeps on the device.
+    #[must_use]
+    pub fn cell_span(wire_bytes: u32, capacity: u32) -> u64 {
+        (u64::from(wire_bytes) * (u64::from(capacity) + 1)).max(1)
+    }
+
+    /// Opens an endpoint. A ring only the device touches (`HostRole::None`)
+    /// has its cells at `cells`, the address of the `Channel` slots `slots`,
+    /// zeroed on `stream` ahead of the fires that read them.
     pub fn open(
         role: HostRole,
         wire_bytes: u32,
         capacity: u32,
+        cells: Option<(u64, Vec<u32>)>,
         stream: *mut core::ffi::c_void,
     ) -> Result<Endpoint> {
         let cap1 = capacity.checked_add(1).ok_or_else(|| {
@@ -58,18 +71,28 @@ impl Endpoint {
                 ),
             ));
         }
-        let cells = (wire_bytes as usize).saturating_mul(cap1 as usize);
-        let pooled = pool::key(matches!(role, HostRole::None), cells.max(1));
+        let span = usize::try_from(Endpoint::cell_span(wire_bytes, capacity)).unwrap_or(usize::MAX);
+        let (at, slots) = match (role, cells) {
+            (HostRole::None, Some((at, slots))) => {
+                crate::device::zero_span_on(stream, at, span)?;
+                (at, slots)
+            }
+            (HostRole::None, None) => {
+                return Err(Fault::program(
+                    "program::endpoint",
+                    "a registered ring only the device touches names no `Channel` slots: \
+                     its cells lie in the pool",
+                ));
+            }
+            _ => (0, Vec::new()),
+        };
+        let pooled = pool::key(matches!(role, HostRole::None), span);
         let held = pooled.and_then(|key| pool::take(key, Some(stream)));
-        let (words, mirror, device_cells) = match held {
-            Some(held) => held,
+        let (words, mirror) = match held {
+            Some((words, mirror, _)) => (words, mirror),
             None => (
                 Pinned::mapped(WORDS * size_of::<u64>())?,
-                Pinned::mapped(cells.max(1))?,
-                match role {
-                    HostRole::None => Some(Buffer::zeroed_on(stream, cells.max(1))?),
-                    _ => None,
-                },
+                Pinned::mapped(span)?,
             ),
         };
         Ok(Endpoint {
@@ -78,7 +101,8 @@ impl Endpoint {
             mirror,
             wire_bytes,
             cap1,
-            device_cells,
+            cells: AtomicU64::new(at),
+            slots: std::sync::Mutex::new(slots),
             predicted_head: AtomicU64::new(0),
             predicted_tail: AtomicU64::new(0),
             attachments: AtomicU32::new(0),
@@ -89,7 +113,26 @@ impl Endpoint {
 
     #[must_use]
     pub fn device_cells(&self) -> Option<u64> {
-        self.device_cells.as_ref().map(Buffer::ptr)
+        Some(self.cells.load(Ordering::Acquire)).filter(|&at| at != 0)
+    }
+
+    /// The `Channel` slots the cells lie in; empty where the ring's cells
+    /// are each instance's own.
+    #[must_use]
+    pub fn slots(&self) -> Vec<u32> {
+        self.slots.lock().expect("slots lock poisoned").clone()
+    }
+
+    /// The cells lie in `slots` now, at `at`, where the runtime copied
+    /// them.
+    pub fn rebind(&self, at: u64, slots: Vec<u32>) {
+        *self.slots.lock().expect("slots lock poisoned") = slots;
+        self.rebase(at);
+    }
+
+    /// The cells lie at `at` now: their slots' chunk moved.
+    pub fn rebase(&self, at: u64) {
+        self.cells.store(at, Ordering::Release);
     }
 
     pub fn attach(&self) -> Result<u32> {
@@ -271,8 +314,7 @@ impl Drop for Endpoint {
         };
         let words = core::mem::replace(&mut self.words, Pinned::empty());
         let mirror = core::mem::replace(&mut self.mirror, Pinned::empty());
-        let cells = self.device_cells.take();
-        pool::give(key, (words, mirror, cells));
+        pool::give(key, (words, mirror, None));
     }
 }
 

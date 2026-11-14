@@ -946,6 +946,8 @@ impl Rig {
                     false,
                     &vec![None; count],
                     &ids,
+                    crate::guest::alone_slots(&self.plane, program),
+                    &crate::guest::alone_span,
                     self.context.stream(),
                 )
                 .unwrap_or_else(|e| panic!("{}: the instance binds: {e:?}", case.name));

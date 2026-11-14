@@ -619,6 +619,46 @@ impl Chunks {
         )
     }
 
+    /// The address of a guest item of `bytes` in `refs`, slot refs of
+    /// `role`'s shape: its one slot, or its run of adjacent slots of one
+    /// chunk, where the chunk lies now.
+    pub fn guest_span(
+        &self,
+        role: engine::chunk::SlotRole,
+        refs: &[u32],
+        bytes: u64,
+    ) -> Result<u64> {
+        let shape = self.layout.guest(role).ok_or_else(|| {
+            Fault::program("store::chunks", format!("{role:?} is not a guest role"))
+        })?;
+        let want = shape.footprint(bytes).slots as usize;
+        let run = refs.windows(2).all(|pair| pair[1] == pair[0] + 1)
+            && refs.first().map(|first| first / shape.per_chunk)
+                == refs.last().map(|last| last / shape.per_chunk);
+        if refs.len() != want || refs.is_empty() || !run {
+            return Err(Fault::program(
+                "store::chunks",
+                format!(
+                    "a guest item of {bytes} bytes takes one run of {want} {role:?} slot(s) \
+                     of {} bytes in one chunk, and its binding names {refs:?}",
+                    shape.slot_bytes
+                ),
+            ));
+        }
+        let first = refs[0];
+        let logical = first / shape.per_chunk;
+        let physical = self.table.physical(logical).ok_or(Fault::Ceiling {
+            what: "chunks of the state pool",
+            need: u64::from(logical) + 1,
+            have: u64::from(self.total),
+        })?;
+        self.range.span(
+            u64::from(self.at(physical)) * self.layout.chunk_bytes
+                + u64::from(first % shape.per_chunk) * shape.slot_bytes,
+            bytes,
+        )
+    }
+
     /// The id a paged kernel reads page `id`'s slot by.
     pub fn page_id(&self, kind: Kind, id: u32) -> Result<i32> {
         let (chunk, index) = self.place(kind, id)?;
@@ -752,6 +792,24 @@ impl Chunks {
                     pieces: fixed.pieces,
                 },
             ));
+        }
+        for role in [
+            engine::chunk::SlotRole::Instance,
+            engine::chunk::SlotRole::Channel,
+        ] {
+            if let Some(guest) = layout.guest(role) {
+                let kind = SlotKind::Fixed { pieces: 1 };
+                shapes.push(SlotShape {
+                    id: guest.id,
+                    kind,
+                    slot_bytes: guest.slot_bytes,
+                    slots_per_chunk: guest.per_chunk,
+                    sets_per_working_set: kind.sets_per_working_set(),
+                    rows: Vec::new(),
+                    pinned: None,
+                    role,
+                });
+            }
         }
         let total = self.stated().saturating_add(self.act);
         let max = u32::try_from(u64::from(total).div_ceil(u64::from(layout.segment_chunks.max(1))))

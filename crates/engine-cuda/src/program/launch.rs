@@ -221,12 +221,75 @@ impl ChannelShape {
     }
 }
 
+/// What an instance of a program keeps in the pool
+/// (`new-memory/STATE-ROLES.md`): its own item, the rings' registry and
+/// then the native cells of each ring the host reads or writes, and the
+/// rings only the device touches, an item each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    /// The instance's item, whole.
+    pub instance_bytes: u64,
+    /// Where each channel's native cells lie in the instance's item;
+    /// `None` for a ring that is an item of its own.
+    pub native_at: Vec<Option<u64>>,
+    /// The bytes of each ring that is an item of its own; `None` for the
+    /// channels above.
+    pub ring_bytes: Vec<Option<u64>>,
+}
+
+/// What every cell span in an item starts a whole number of.
+const CELL_ALIGN: u64 = 64;
+
+impl Held {
+    #[must_use]
+    pub fn of(channels: &[eta_compiler::codegen::launch::LaunchChannel]) -> Held {
+        let mut at = registry_bytes(channels.len()).next_multiple_of(CELL_ALIGN);
+        let mut native_at = Vec::with_capacity(channels.len());
+        let mut ring_bytes = Vec::with_capacity(channels.len());
+        for declared in channels {
+            let shape = ChannelShape::of(declared);
+            let bytes = shape.cell_bytes() as u64 * shape.ring();
+            if declared.host_role == HostRole::None {
+                native_at.push(None);
+                ring_bytes.push(Some(bytes));
+            } else {
+                native_at.push(Some(at));
+                ring_bytes.push(None);
+                at = (at + bytes).next_multiple_of(CELL_ALIGN);
+            }
+        }
+        Held {
+            instance_bytes: at,
+            native_at,
+            ring_bytes,
+        }
+    }
+}
+
+/// The registry of `slots` rings: their head, tail and ring words, then
+/// each ring's full bytes.
+const fn registry_bytes(slots: usize) -> u64 {
+    (3 * slots * size_of::<u32>() + slots * MAX_RING as usize) as u64
+}
+
+/// Where an instance's items lie on the device now: the instance's item,
+/// and each ring that is an item of its own (0 for a channel whose cells
+/// are in the instance's item or its endpoint's).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    pub instance: u64,
+    pub rings: Vec<u64>,
+}
+
 #[derive(Debug)]
 pub struct Rings {
-    cells: Vec<Buffer>,
+    /// Each channel's native cells in the pool; 0 where its endpoint
+    /// carries them.
+    cells: Vec<u64>,
     shapes: Vec<ChannelShape>,
     endpoints: Vec<Option<Arc<Endpoint>>>,
-    registry: Buffer,
+    held: Held,
+    registry: u64,
     device: kernels_cuda::runtime::channel::Rings,
     /// The stream the cells are staged and fired on, where a read of one
     /// waits behind what wrote it.
@@ -234,11 +297,14 @@ pub struct Rings {
 }
 
 impl Rings {
-    /// The rings of `shapes`, their registry staged on `stream` ahead of
-    /// any fire that reads it.
+    /// The rings of `shapes` at `place`, their cells zeroed and their
+    /// registry staged on `stream` ahead of any fire that reads it: a pool
+    /// slot holds what its last holder left.
     pub fn allocate(
         shapes: &[ChannelShape],
         endpoints: Vec<Option<Arc<Endpoint>>>,
+        held: Held,
+        place: &Place,
         stream: *mut core::ffi::c_void,
     ) -> Result<Rings> {
         if endpoints.len() != shapes.len() {
@@ -252,29 +318,38 @@ impl Rings {
                 ),
             ));
         }
-        let mut cells = Vec::with_capacity(shapes.len());
         for (index, shape) in shapes.iter().enumerate() {
-            let bytes = shape.cell_bytes();
-            if bytes == 0 {
+            if shape.cell_bytes() == 0 {
                 return Err(Fault::program(
                     "program::launch",
                     format!("channel {index}'s cell is zero bytes, so it can never be ready"),
                 ));
             }
-            let shared = endpoints
-                .get(index)
-                .and_then(Option::as_ref)
-                .and_then(|endpoint| endpoint.device_cells());
-            cells.push(match shared {
-                Some(_) => Buffer::zeroed(0)?,
-                None => Buffer::zeroed_on(stream, bytes * shape.ring() as usize)?,
-            });
         }
-
-        let slots = shapes.len();
-        let words = slots * size_of::<u32>();
-        let full_at = 3 * words;
-        let mut registry = Buffer::zeroed_on(stream, full_at + slots * MAX_RING as usize)?;
+        let mut rings = Rings {
+            cells: Vec::new(),
+            shapes: shapes.to_vec(),
+            endpoints,
+            held,
+            registry: 0,
+            device: kernels_cuda::runtime::channel::Rings::new(0, 0, 0, 0, 0),
+            stream: stream as usize,
+        };
+        rings.rebase(place)?;
+        crate::device::zero_span_on(
+            stream,
+            rings.registry,
+            usize::try_from(rings.held.instance_bytes).unwrap_or(usize::MAX),
+        )?;
+        for (channel, shape) in shapes.iter().enumerate() {
+            if rings.held.ring_bytes[channel].is_some() && rings.shared_slab(channel).is_none() {
+                crate::device::zero_span_on(
+                    stream,
+                    rings.cells[channel],
+                    shape.cell_bytes() * shape.ring() as usize,
+                )?;
+            }
+        }
         let cap1: Vec<u8> = shapes
             .iter()
             .flat_map(|shape| {
@@ -283,23 +358,44 @@ impl Rings {
                     .to_le_bytes()
             })
             .collect();
-        registry.stage(stream, 2 * words as u64, &cap1)?;
-        let device = kernels_cuda::runtime::channel::Rings::new(
-            registry.at(full_at as u64)?,
-            registry.ptr(),
-            registry.at(words as u64)?,
-            registry.at(2 * words as u64)?,
+        let words = (shapes.len() * size_of::<u32>()) as u64;
+        crate::device::stage_raw(stream, rings.registry + 2 * words, &cap1)?;
+        Ok(rings)
+    }
+
+    /// Points the rings at `place`: where the pool's slots they lie in are
+    /// now. Every fire staged after addresses them there.
+    pub fn rebase(&mut self, place: &Place) -> Result<()> {
+        let slots = self.shapes.len();
+        let mut cells = Vec::with_capacity(slots);
+        for channel in 0..slots {
+            let own = place.rings.get(channel).copied().unwrap_or(0);
+            cells.push(match self.held.native_at[channel] {
+                Some(at) => place.instance + at,
+                None if self.shared_slab(channel).is_some() => 0,
+                None if own != 0 => own,
+                None => {
+                    return Err(Fault::program(
+                        "program::launch",
+                        format!(
+                            "channel {channel} is a ring only the device touches, and its \
+                             binding names neither a registered channel nor slots for it"
+                        ),
+                    ));
+                }
+            });
+        }
+        let words = (slots * size_of::<u32>()) as u64;
+        self.cells = cells;
+        self.registry = place.instance;
+        self.device = kernels_cuda::runtime::channel::Rings::new(
+            place.instance + 3 * words,
+            place.instance,
+            place.instance + words,
+            place.instance + 2 * words,
             u32::try_from(slots).unwrap_or(u32::MAX),
         );
-
-        Ok(Rings {
-            cells,
-            shapes: shapes.to_vec(),
-            endpoints,
-            registry,
-            device,
-            stream: stream as usize,
-        })
+        Ok(())
     }
 
     #[must_use]
@@ -340,9 +436,9 @@ impl Rings {
                 }
             }
         }
-        self.registry.stage(stream, 0, &head)?;
-        self.registry.stage(stream, words as u64, &tail)?;
-        self.registry.stage(stream, (3 * words) as u64, &full)?;
+        crate::device::stage_raw(stream, self.registry, &head)?;
+        crate::device::stage_raw(stream, self.registry + words as u64, &tail)?;
+        crate::device::stage_raw(stream, self.registry + (3 * words) as u64, &full)?;
         Ok(())
     }
 
@@ -366,7 +462,7 @@ impl Rings {
         let at = (sequence % shape.ring()) * shape.cell_bytes() as u64;
         match self.shared_slab(channel) {
             Some(base) => Ok(base + at),
-            None => self.cells[channel].at(at),
+            None => Ok(self.cells[channel] + at),
         }
     }
 
@@ -386,7 +482,7 @@ impl Rings {
             let cell = (sequence % u64::from(endpoint.cap1())) * u64::from(endpoint.wire_bytes());
             return Ok(endpoint.mirror_device() + cell);
         }
-        self.cells[channel].at(at)
+        Ok(self.cells[channel] + at)
     }
 
     #[must_use]
@@ -448,7 +544,7 @@ impl Rings {
             return Ok(());
         }
         let at = (sequence % shape.ring()) * shape.cell_bytes() as u64;
-        self.cells[channel].stage(stream, at, native)
+        crate::device::stage_raw(stream, self.cells[channel] + at, native)
     }
 
     pub fn read_cell(&self, channel: usize, sequence: u64) -> Result<Vec<u8>> {
@@ -463,7 +559,11 @@ impl Rings {
         }
         let at = (sequence % shape.ring()) * shape.cell_bytes() as u64;
         let mut out = vec![0u8; shape.cell_bytes()];
-        self.cells[channel].read_on(self.stream as *mut core::ffi::c_void, at, &mut out)?;
+        crate::device::copy_d2h_on(
+            self.stream as *mut core::ffi::c_void,
+            self.cells[channel] + at,
+            &mut out,
+        )?;
         Ok(out)
     }
 

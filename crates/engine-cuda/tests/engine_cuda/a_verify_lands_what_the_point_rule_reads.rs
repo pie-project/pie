@@ -150,6 +150,8 @@ fn a_verify_lands_what_the_point_rule_reads() {
                 false,
                 &vec![None; count],
                 &ids,
+                crate::guest::alone_slots(&plane, program),
+                &crate::guest::alone_span,
                 context.stream(),
             )
             .expect("the epilogue binds an instance");

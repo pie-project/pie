@@ -758,6 +758,7 @@ impl Shell {
         device: eta_ir::registry::PortMask,
         adopted: &[Option<std::sync::Arc<crate::program::Endpoint>>],
         ids: &[engine::ChannelId],
+        slots: crate::program::Slots,
     ) -> Result<engine::InstanceId> {
         let reads_scores = self.programs.program(program_id).is_some_and(|program| {
             program
@@ -771,9 +772,93 @@ impl Shell {
         }
         let stream = self.device.stream();
         let buffers_rs = self.buffers.is_some();
+        let pools = &self.pools;
         self.programs.bind(
-            program_id, seeds, extents, geometry, device, buffers_rs, adopted, ids, stream,
+            program_id,
+            seeds,
+            extents,
+            geometry,
+            device,
+            buffers_rs,
+            adopted,
+            ids,
+            slots,
+            &|role, refs, bytes| pools.guest_span(role, refs, bytes),
+            stream,
         )
+    }
+
+    /// What an instance of `program` keeps in the pool's `Instance` and
+    /// `Channel` slots.
+    pub fn program_facts(
+        &self,
+        program: engine::ProgramId,
+    ) -> Result<engine::program::ProgramFacts> {
+        use engine::chunk::SlotRole;
+        let held = self.programs.held(program)?;
+        let footprint = |role, bytes| self.pools.guest_footprint(role, bytes);
+        let declared = self
+            .programs
+            .program(program)
+            .map(|program| &program.plan.package.channels);
+        Ok(engine::program::ProgramFacts {
+            instance: footprint(SlotRole::Instance, held.instance_bytes),
+            rings: held
+                .ring_bytes
+                .iter()
+                .enumerate()
+                .filter_map(|(channel, bytes)| {
+                    let bytes = (*bytes)?;
+                    let declared = declared?.get(channel)?;
+                    let shape = crate::program::ChannelShape::of(declared);
+                    Some(engine::program::RingFacts {
+                        channel: channel as u32,
+                        cell_bytes: shape.cell_bytes() as u64,
+                        capacity: shape.capacity,
+                        footprint: footprint(SlotRole::Channel, bytes),
+                    })
+                })
+                .collect(),
+        })
+    }
+
+    /// The address of a guest item of `bytes` in `refs`, where they lie now.
+    pub fn guest_span(
+        &self,
+        role: engine::chunk::SlotRole,
+        refs: &[u32],
+        bytes: u64,
+    ) -> Result<u64> {
+        self.pools.guest_span(role, refs, bytes)
+    }
+
+    /// The slots a guest item of `bytes` takes.
+    #[must_use]
+    pub fn guest_footprint(
+        &self,
+        role: engine::chunk::SlotRole,
+        bytes: u64,
+    ) -> engine::program::Footprint {
+        self.pools.guest_footprint(role, bytes)
+    }
+
+    /// Points every instance's rings at where their pool slots lie now.
+    pub fn rebase_programs(&mut self) -> Result<()> {
+        let pools = &self.pools;
+        self.programs
+            .rebase(&|role, refs, bytes| pools.guest_span(role, refs, bytes))
+    }
+
+    /// Instance `id`'s items lie in `slots` now.
+    pub fn rebind_program(
+        &mut self,
+        id: engine::InstanceId,
+        slots: crate::program::Slots,
+    ) -> Result<()> {
+        let pools = &self.pools;
+        self.programs.rebind(id, slots, &|role, refs, bytes| {
+            pools.guest_span(role, refs, bytes)
+        })
     }
 
     #[must_use]
