@@ -671,8 +671,6 @@ pub struct Shell<B: Serve> {
 
     rs_buffers: Option<crate::rs::Buffers>,
 
-    rs_scratch: Option<B::Buffer>,
-
     out: Option<ValueId>,
     readouts: Vec<ReadoutPlane>,
     feeds: poem_exec::feeds::Feeds,
@@ -877,6 +875,7 @@ impl<B: Serve> Shell<B> {
             &rung_tokens,
             least,
             &tuning,
+            rs_layout.as_deref().filter(|_| rows.rs.is_some()),
         )?;
         let device_cap = device
             .left()
@@ -1318,7 +1317,6 @@ impl<B: Serve> Shell<B> {
             rs_layout,
             snaps: None,
             rs_buffers,
-            rs_scratch: None,
             out,
             readouts,
             feeds,
@@ -3188,26 +3186,25 @@ impl<B: Serve> Shell<B> {
 
         let rs_replay: Vec<i32> = rs_plans.iter().map(|plan| plan.replay as i32).collect();
         let rs_commit: Vec<i32> = rs_plans.iter().map(|plan| plan.commit as i32).collect();
-        let rows_ext = rows.saturating_add(rs_plans.iter().map(|plan| plan.replay).sum::<u32>());
-        if rs_active {
-            let layout = self
-                .rs_layout
-                .as_ref()
-                .expect("rs_active implies a layout, checked at the lane");
-            let need = crate::rs::Seat::scratch_bytes(layout, rows_ext, lane_count);
-            if self
-                .rs_scratch
-                .as_ref()
-                .is_none_or(|scratch| scratch.bytes() < need)
-            {
-                self.drain()?;
-                self.rs_scratch = Some(B::Buffer::zeroed(
-                    &self.device,
-                    need,
-                    crate::books::owners::RS_SCRATCH,
-                )?);
-            }
+        // A lane replays at most the rows `UNFOLDED_ROWS` bounds, which is
+        // what its rung's rs scratch in the span holds a lane: one past it
+        // fails the fire here, before anything is written.
+        if let Some((lane, plan)) = rs_plans
+            .iter()
+            .enumerate()
+            .find(|(_, plan)| plan.replay > engine::fire::UNFOLDED_ROWS)
+        {
+            return Err(program(
+                "serve::rs",
+                format!(
+                    "lane {lane} replays {} recurrent rows carried in, past the {} a lane's rs \
+                     scratch holds",
+                    plan.replay,
+                    engine::fire::UNFOLDED_ROWS
+                ),
+            ));
         }
+        let rows_ext = rows.saturating_add(rs_plans.iter().map(|plan| plan.replay).sum::<u32>());
 
         let (group_of_lane, packings) = if self.feeds.selections.is_empty() {
             (Vec::new(), Vec::new())
@@ -3482,9 +3479,7 @@ impl<B: Serve> Shell<B> {
             inputs: bound.inputs,
             voxels: bound.voxels,
             rs: if rs_active {
-                let (Some(layout), Some(buffers), Some(scratch)) =
-                    (&self.rs_layout, &self.rs_buffers, &self.rs_scratch)
-                else {
+                let (Some(layout), Some(buffers)) = (&self.rs_layout, &self.rs_buffers) else {
                     return Err(Fault::Unbound {
                         what: "the recurrent seat of a fire whose plan buffers nothing".to_string(),
                     });
@@ -3501,7 +3496,7 @@ impl<B: Serve> Shell<B> {
                     layout,
                     buffers,
                     self.pools.segments(&self.handles)?,
-                    scratch,
+                    self.span.rs(rung)?,
                     rs_plans,
                     replay,
                     commit,

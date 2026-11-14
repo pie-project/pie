@@ -1080,3 +1080,109 @@ fn two_trimmed_window_lists_read_as_the_whole_ones() {
     );
     trimmed_window_of(&fixture, MODEL, 32, 1024, 700);
 }
+
+/// One lane's fire of `tokens` at slot `slot`, `held` rows before them,
+/// under rs verb `rs`.
+fn fire_rs(
+    shell: &mut Shell,
+    trace: &Trace,
+    (slot, tokens, held): (u32, &[u32], u32),
+    rs: &engine::fire::RsVerb,
+    reset: engine::fire::RsReset,
+) -> engine_gpu::error::Result<Vec<Vec<f32>>> {
+    shell.fire_seated(&[Seated {
+        held: Some(held),
+        rs,
+        rs_reset: reset,
+        ..Seated::of(Lane {
+            slot,
+            word: word(trace, tokens.len() as u32),
+            tokens,
+        })
+    }])
+}
+
+/// A lane buffering its recurrent rows replays them, in its rung's rs
+/// scratch in the activation span, ahead of its next window and answers
+/// what folding them plainly answers; a lane carrying more unfolded rows
+/// into a fire than `UNFOLDED_ROWS` is refused before anything is written.
+#[test]
+fn a_buffered_replay_answers_the_fold_it_defers() {
+    use engine::fire::{FoldLen, RsReset, RsVerb};
+    let fixture = fixture("qwen35-tiny", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    assert!(
+        shell.serves_rs_verbs(),
+        "a hybrid plan buffers its recurrent rows"
+    );
+    let trace = &fixture.trace;
+    let window =
+        |seed: u32, n: u32| -> Vec<u32> { (0..n).map(|at| (seed + at * 37) % 256).collect() };
+    let pages: Vec<u32> = (0..CONTEXT / PAGE).collect();
+    let buffer = |folded: u32, fold: u32| RsVerb::Buffer {
+        pages: pages.clone(),
+        base: 0,
+        folded,
+        fold: FoldLen::Host(fold),
+    };
+    let fold = RsVerb::Fold;
+    let k = 6u32;
+    let (a, b) = (window(11, k), window(101, k));
+
+    shell.open(0).expect("slot 0 opens");
+    fire_rs(&mut shell, trace, (0, &a, 0), &fold, RsReset::Fresh).expect("A folds");
+    let plain = fire_rs(&mut shell, trace, (0, &b, k), &fold, RsReset::Held).expect("B folds");
+
+    shell.open(1).expect("slot 1 opens");
+    fire_rs(&mut shell, trace, (1, &a, 0), &buffer(0, 0), RsReset::Fresh).expect("A buffers");
+    let replayed = fire_rs(
+        &mut shell,
+        trace,
+        (1, &b, k),
+        &buffer(0, 2 * k),
+        RsReset::Held,
+    )
+    .expect("B replays A");
+    let spread = plain[0]
+        .iter()
+        .zip(&replayed[0])
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("B after replaying A vs B after folding A: logit spread {spread}");
+    assert!(
+        spread <= 0.05,
+        "a replay answers other logits than the fold it defers: {spread}"
+    );
+    assert_eq!(argmax(&plain[0]), argmax(&replayed[0]));
+
+    // One row past what a lane may carry in unfolded.
+    let past = engine::fire::UNFOLDED_ROWS + 1;
+    let long = window(7, past);
+    shell.open(2).expect("slot 2 opens");
+    fire_rs(
+        &mut shell,
+        trace,
+        (2, &long, 0),
+        &buffer(0, 0),
+        RsReset::Fresh,
+    )
+    .expect("a window buffers its own rows, however many");
+    let refused = fire_rs(
+        &mut shell,
+        trace,
+        (2, &[3], past),
+        &buffer(0, 0),
+        RsReset::Held,
+    )
+    .expect_err("a lane carrying past UNFOLDED_ROWS in is refused");
+    assert!(
+        refused.to_string().contains("recurrent rows carried in"),
+        "{refused}"
+    );
+    // The shell serves on after the refusal.
+    let again =
+        fire_rs(&mut shell, trace, (0, &[5], 2 * k), &fold, RsReset::Held).expect("slot 0 decodes");
+    assert!(again[0].iter().all(|v| v.is_finite()));
+}

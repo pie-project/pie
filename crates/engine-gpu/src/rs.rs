@@ -6,7 +6,7 @@ use engine::rs::{LanePlan, Run};
 use kernels_slang::{Segments, Tensor};
 use poem_ir::{Def, Dim, Dtype, Gather, Operation, Ssm, Trace, Ty, ValueId};
 
-use crate::backend::{Backend, Buffer as _};
+use crate::backend::Backend;
 use crate::error::{Fault, Result};
 use crate::handles::Handles;
 
@@ -348,7 +348,7 @@ impl Seat {
         layout: &Arc<Layout>,
         buffers: &Buffers,
         pool: Segments,
-        scratch: &B::Buffer,
+        (scratch, base, have): (&B::Buffer, u64, u64),
         lanes: Vec<LanePlan>,
         replay: Tensor,
         commit: Tensor,
@@ -357,11 +357,11 @@ impl Seat {
     ) -> Result<Seat> {
         let lane_count = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
         let need = Seat::scratch_bytes(layout, rows_ext, lane_count);
-        if scratch.bytes() < need {
+        if have < need {
             return Err(Fault::Ceiling {
-                what: "recurrent buffer scratch bytes",
+                what: "bytes of the rung's rs scratch in the span (its rows and the unfolded rows a lane may carry in)",
                 need,
-                have: scratch.bytes(),
+                have,
             });
         }
         let rows = u64::from(rows_ext.max(1));
@@ -371,7 +371,7 @@ impl Seat {
             let here = at;
             at += bytes.next_multiple_of(256);
             Ok(Tensor::new(
-                handles.bind(scratch, here, bytes.max(4))?,
+                handles.bind(scratch, base + here, bytes.max(4))?,
                 rows_ext.max(1),
                 width,
                 dtype,
@@ -387,7 +387,7 @@ impl Seat {
         }
         let work_bytes = u64::from(lane_count.max(1)) * layout.work_elems * 4;
         let work = Tensor::new(
-            handles.bind(scratch, at, work_bytes.max(4))?,
+            handles.bind(scratch, base + at, work_bytes.max(4))?,
             lane_count.max(1),
             u32::try_from(layout.work_elems).unwrap_or(u32::MAX),
             Dtype::F32,

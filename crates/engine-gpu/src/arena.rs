@@ -37,11 +37,18 @@ pub struct Rung {
     capacity: Vec<u32>,
     /// Where the rooms start, past the carve.
     rooms_at: u64,
-    /// The carve and the rooms.
+    /// Where the rs scratch starts, past the rooms, and its bytes: what a
+    /// fire of the rung's tokens and lanes replays its recurrent rows in,
+    /// its own rows and, a lane, the [`engine::fire::UNFOLDED_ROWS`] it may
+    /// carry in (0 for a model with no recurrent buffer).
+    rs_at: u64,
+    rs_bytes: u64,
+    /// The carve, the rooms and the rs scratch.
     bytes: u64,
 }
 
 impl Rung {
+    #[allow(clippy::too_many_arguments)]
     fn lay<T: Tactics + ?Sized>(
         trace: &Trace,
         compiled: &CompiledModel,
@@ -50,6 +57,7 @@ impl Rung {
         paging: Paging,
         tuning: &T,
         routers: &[u32],
+        rs: Option<&crate::rs::Layout>,
     ) -> Result<Rung> {
         let map = if tokens >= budgets.tokens.max_tokens {
             compiled.arena.clone()
@@ -65,18 +73,28 @@ impl Rung {
             trace, compiled, &map, budgets, tokens, paging, tuning, routers,
         );
         let rooms_at = map.bytes.next_multiple_of(ALIGN);
-        let bytes = (rooms_at + rooms.bytes()).next_multiple_of(ALIGN);
+        let rs_at = (rooms_at + rooms.bytes()).next_multiple_of(ALIGN);
+        let rs_bytes = rs.map_or(0, |layout| {
+            let lanes = tokens.min(budgets.tokens.max_lanes).max(1);
+            let rows = tokens
+                .min(budgets.tokens.max_tokens)
+                .saturating_add(lanes.saturating_mul(engine::fire::UNFOLDED_ROWS));
+            crate::rs::Seat::scratch_bytes(layout, rows, lanes)
+        });
+        let bytes = (rs_at + rs_bytes).next_multiple_of(ALIGN);
         Ok(Rung {
             tokens,
             capacity: capacities(&map),
             map,
             rooms,
             rooms_at,
+            rs_at,
+            rs_bytes,
             bytes,
         })
     }
 
-    /// The carve and the rooms, aligned.
+    /// The carve, the rooms and the rs scratch, aligned.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.bytes
@@ -103,7 +121,8 @@ pub struct Span<B: Backend> {
 }
 
 impl<B: Backend> Span<B> {
-    /// The carve and rooms of every rung of `tokens` (ascending, the last
+    /// The carve, rooms and rs scratch (`rs` the recurrent buffer's
+    /// layout, if any) of every rung of `tokens` (ascending, the last
     /// `budgets`' own ceiling); nothing placed yet.
     #[allow(clippy::too_many_arguments)]
     pub fn plan(
@@ -113,11 +132,16 @@ impl<B: Backend> Span<B> {
         tokens: &[u32],
         paging: Paging,
         tuning: &B::Tuning,
+        rs: Option<&crate::rs::Layout>,
     ) -> Result<Span<B>> {
         let routers = crate::scratch::routers(trace);
         let rungs = tokens
             .iter()
-            .map(|&tokens| Rung::lay(trace, compiled, budgets, tokens, paging, tuning, &routers))
+            .map(|&tokens| {
+                Rung::lay(
+                    trace, compiled, budgets, tokens, paging, tuning, &routers, rs,
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Span {
             widest: (0..rungs.len()).collect(),
@@ -236,6 +260,14 @@ impl<B: Backend> Span<B> {
             &self.rungs[rung].map,
             rows,
         )
+    }
+
+    /// Rung `rung`'s rs scratch: the span's buffer, where the region
+    /// starts in it and its bytes.
+    pub fn rs(&self, rung: usize) -> Result<(&B::Buffer, u64, u64)> {
+        let (buffer, _) = self.placed()?;
+        let at = &self.rungs[rung];
+        Ok((buffer, self.base(rung)? + at.rs_at, at.rs_bytes))
     }
 
     /// A fire's rooms at rung `rung`.
