@@ -1234,11 +1234,12 @@ impl Shell {
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
-        let readout_rows = crate::device::Buffer::zeroed(
+        // A run of the activation's span, laid with the staged inputs.
+        let readout_rows = crate::device::Buffer::lent(
             (boot.budget.max_lanes as usize)
                 .saturating_mul(boot.budget.max_tokens as usize)
                 .saturating_mul(size_of::<u64>()),
-        )?;
+        );
         let adapter_seats = weights.adapter_seats();
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let compiled_towered = compiled.order_for(poem_ir::RowAxis::Patches).is_some();
@@ -1435,9 +1436,8 @@ impl Shell {
             buffers.lay_reach(&mut shell.pools, true)?;
         }
         let staged = workspace.next_multiple_of(INPUTS_ALIGN);
-        let at = shell
-            .pools
-            .widen_activation(staged.saturating_add(shell.inputs.bytes()))?;
+        let runs: u64 = shell.staged_runs().iter().sum();
+        let at = shell.pools.widen_activation(staged.saturating_add(runs))?;
         shell.inputs_at = at + staged;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
@@ -1525,18 +1525,36 @@ pub(crate) struct Workspace {
 }
 
 impl Shell {
+    /// The runs of the activation's span a fire stages into and reads out
+    /// of, in the order they lie from `inputs_at`: the staged inputs' slab,
+    /// the readout rows' table and the voxel store, each to
+    /// [`INPUTS_ALIGN`].
+    fn staged_runs(&self) -> [u64; 3] {
+        [
+            self.inputs.bytes(),
+            self.readout_rows.bytes() as u64,
+            self.voxels.as_ref().map_or(0, crate::voxels::Store::bytes),
+        ]
+        .map(|bytes| bytes.next_multiple_of(INPUTS_ALIGN))
+    }
+
     /// Backs the workspaces where the range now lies, zeroes them, and has
     /// every take of their slabs answer its place there.
     fn lay_workspace(&mut self) -> Result<()> {
         if let Some(buffers) = &self.buffers {
             buffers.lay_scratch(&mut self.pools)?;
         }
-        let staged = self.inputs.bytes();
+        let [inputs, readouts, voxels] = self.staged_runs();
+        let staged = inputs + readouts + voxels;
         self.pools
             .hold_activation_at(self.inputs_at, staged, false)?;
         let base = self.pools.activation_base() + self.inputs_at;
         crate::device::zero_span(base, usize::try_from(staged).unwrap_or(0))?;
         self.inputs.lay(base);
+        self.readout_rows.lay(base + inputs);
+        if let Some(store) = self.voxels.as_mut() {
+            store.lay(base + inputs + readouts);
+        }
         let Some(workspace) = &self.workspace else {
             return Ok(());
         };
@@ -1823,7 +1841,9 @@ fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory:
         ledger.enter(
             Class::Fire,
             "activation span spare",
-            span.saturating_sub(held.arena + workspaces + rs_scratch),
+            span.saturating_sub(
+                held.arena + workspaces + rs_scratch + shell.staged_runs().iter().sum::<u64>(),
+            ),
         );
     }
     ledger.enter(Class::Fire, "inputs", held.inputs);

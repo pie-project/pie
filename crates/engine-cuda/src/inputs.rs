@@ -728,10 +728,7 @@ impl Inputs {
         // The slab is a run of the activation's span, laid once the load
         // knows what else its fires take there ([`Inputs::lay`]); till then
         // it stands in, as every span of a size-only walk does.
-        let store = Buffer::over(
-            crate::sizing::STAND_IN,
-            usize::try_from(total).unwrap_or(usize::MAX),
-        );
+        let store = Buffer::lent(usize::try_from(total).unwrap_or(usize::MAX));
         let depth = runahead.staging_depth();
         let slot_bytes = usize::try_from(stage_bytes).unwrap_or(usize::MAX);
         let mut staging = Vec::with_capacity(depth);
@@ -800,7 +797,7 @@ impl Inputs {
     /// The slab lies at `base` from here on: a run of the activation's
     /// span the load holds backed and zeroed, of [`Inputs::bytes`].
     pub fn lay(&mut self, base: u64) {
-        self.store = Buffer::over(base, self.store.bytes());
+        self.store.lay(base);
         let grants = &self.grants;
         self.plans = (0..self.runs as usize)
             .flat_map(|run| {

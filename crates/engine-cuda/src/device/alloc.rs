@@ -209,6 +209,19 @@ impl Buffer {
         ))
     }
 
+    /// `bytes` of a run of the activation's span the load has yet to lay:
+    /// it stands in till [`Buffer::lay`].
+    #[must_use]
+    pub fn lent(bytes: usize) -> Buffer {
+        Buffer::over(crate::sizing::STAND_IN, bytes)
+    }
+
+    /// The lent run lies at `ptr` from here on.
+    pub fn lay(&mut self, ptr: u64) {
+        debug_assert!(self.lent, "only a lent run is laid");
+        self.ptr = ptr;
+    }
+
     #[must_use]
     pub fn ptr(&self) -> u64 {
         self.ptr

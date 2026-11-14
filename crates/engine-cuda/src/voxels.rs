@@ -261,7 +261,8 @@ impl Store {
         let total = payload + align(seat.rows * seat.row_bytes());
         Ok(Store {
             seat,
-            buffer: Buffer::zeroed(total as usize)?,
+            // A run of the activation's span, laid by the load.
+            buffer: Buffer::lent(total as usize),
             grid,
             token_grid,
             slots,
@@ -277,6 +278,12 @@ impl Store {
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.buffer.bytes() as u64
+    }
+
+    /// The store lies at `base` from here on: a run of the activation's
+    /// span the load holds backed and zeroed, of [`Store::bytes`].
+    pub fn lay(&mut self, base: u64) {
+        self.buffer.lay(base);
     }
 
     pub fn stage(&mut self, stream: *mut core::ffi::c_void, tables: &Tables) -> Result<Handles> {
