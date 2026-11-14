@@ -478,29 +478,42 @@ fn adapter_key_of(
     let Some(sink) = shell.program_adapter_sink(program).map_err(fault)? else {
         return Ok(None);
     };
-    // Two independent 64-bit digests of the same words: FNV-1a and the
-    // standard hasher's SipHash, side by side.
+    let planes: Vec<(&str, &[u8])> = sink
+        .planes
+        .iter()
+        .map(|(role, channel)| {
+            let wire = seeds
+                .iter()
+                .find(|seed| seed.channel == *channel)
+                .map_or(&[][..], |seed| seed.bytes.as_slice());
+            (role.bank(), wire)
+        })
+        .collect();
+    Ok(Some(adapter_digest(sink.sites, &planes)))
+}
+
+/// An adapter's content key from its sink's placement constant and its
+/// planes' seeds, `(bank role, seed)` in the sink's plane order: FNV-1a 64
+/// the high half and SipHash 64 (the standard hasher's) the low half, both
+/// over `sites` little-endian, then each plane's role name, its seed's
+/// length as a little-endian u64, and the seed.
+pub fn adapter_digest(sites: u32, planes: &[(&str, &[u8])]) -> u128 {
+    use std::hash::Hasher;
     let mut fnv: u64 = 0xcbf2_9ce4_8422_2325;
     let mut sip = std::collections::hash_map::DefaultHasher::new();
     let mut eat = |bytes: &[u8]| {
-        use std::hash::Hasher;
         for byte in bytes {
             fnv = (fnv ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
         }
         sip.write(bytes);
     };
-    eat(&sink.sites.to_le_bytes());
-    for (role, channel) in &sink.planes {
-        eat(role.bank().as_bytes());
-        let wire = seeds
-            .iter()
-            .find(|seed| seed.channel == *channel)
-            .map_or(&[][..], |seed| seed.bytes.as_slice());
+    eat(&sites.to_le_bytes());
+    for (role, wire) in planes {
+        eat(role.as_bytes());
         eat(&(wire.len() as u64).to_le_bytes());
         eat(wire);
     }
-    let sip = std::hash::Hasher::finish(&sip);
-    Ok(Some((u128::from(fnv) << 64) | u128::from(sip)))
+    (u128::from(fnv) << 64) | u128::from(sip.finish())
 }
 
 /// Lands the adapter an instance of `program` carries, its planes the
@@ -1948,5 +1961,20 @@ mod serving_stamp_tests {
         refuse(&artifact(&dir, "cuda", "qwen_3"), "cuda", "qwen_3")
             .expect("a cuda artifact serves on cuda");
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod adapter_key_tests {
+    use super::adapter_digest;
+
+    /// The key vector every engine pins: engines that key one adapter
+    /// differently could not agree on what is shared.
+    #[test]
+    fn the_adapter_key_is_the_shared_vector() {
+        let a: Vec<u8> = (0x00..=0x0f).collect();
+        let b: Vec<u8> = (100..=123).collect();
+        let key = adapter_digest(5, &[("lora_a", &a), ("lora_b", &b)]);
+        assert_eq!(key, 0x48d3_ea2e_650c_f1e9_8eff_b3e0_9bc8_eb41, "{key:#034x}");
     }
 }
