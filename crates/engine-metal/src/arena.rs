@@ -1,109 +1,132 @@
-#![allow(unsafe_code)]
 use kernels_metal::Tensor;
 use poem_compiler::{ArenaMap, FireRows};
 use poem_exec::store::arena::rect;
 use poem_ir::ValueId;
 
-use crate::device::{Buffer, Context, Handles};
+use crate::device::{Buffer, Handles};
 use crate::error::Result;
 use crate::run::SlotTable;
 
-/// Scratch is sized for the widest fire and most fires are narrow. Held in
-/// sparse heaps, it costs the widest carve a fire has used: a smaller carve
-/// is a prefix of the store, and a heap costs nothing until a frame uses it,
-/// then all of itself. A device with no sparse buffers holds it whole.
+/// Where a carve's bytes and the kernel scratch plane start inside the span
+/// are kept on this boundary, so every value's offset keeps the alignment it
+/// was carved with.
+pub const ALIGN: u64 = 64 << 10;
+
+/// A fire's activation: the top of the pool's range (REDESIGN 3c), the
+/// activation span the runtime keeps state out of at each rung.
+///
+/// The kernel scratch plane takes the span's top `scratch` bytes for every
+/// fire; under it, a fire carves the smallest rung's arena that holds it,
+/// laid so it ends where the plane starts. A rung's activation is the plane
+/// and its carve, so a lower rung touches only the span's top and state may
+/// take the chunks under it. The place each carve takes is fixed, so a fire
+/// stays good at every rung it fits.
 #[derive(Debug)]
 pub struct Arena {
+    /// The pool's buffer.
     store: Buffer,
-    #[cfg(target_vendor = "apple")]
-    sparse: Option<(
-        crate::device::elastic::Elastic,
-        crate::device::elastic::Arena,
-    )>,
+    /// The span's end in the pool's buffer, where the plane ends.
+    end: u64,
+    /// The bytes the kernel scratch plane takes at the span's top.
+    scratch: u64,
+    /// For fires of up to so many tokens (and lanes), the carve laid for
+    /// them, ascending; the last the whole arena, for every fire.
+    rungs: Vec<(u32, ArenaMap)>,
+}
+
+/// `bytes` on the [`ALIGN`] boundary.
+#[must_use]
+pub fn room(bytes: u64) -> u64 {
+    bytes.next_multiple_of(ALIGN)
+}
+
+/// The span's chunks of `chunk_bytes` each rung takes: its carve under the
+/// `scratch` plane, `(tokens, chunks)` ascending.
+#[must_use]
+pub fn act_chunks(rungs: &[(u32, ArenaMap)], scratch: u64, chunk_bytes: u64) -> Vec<(u32, u32)> {
+    rungs
+        .iter()
+        .map(|(tokens, map)| {
+            let bytes = room(scratch) + room(map.bytes);
+            (
+                *tokens,
+                u32::try_from(bytes.div_ceil(chunk_bytes.max(1))).unwrap_or(u32::MAX),
+            )
+        })
+        .collect()
 }
 
 impl Arena {
-    #[cfg(target_vendor = "apple")]
-    pub fn reserve(device: &Context, map: &ArenaMap) -> Result<Arena> {
-        use crate::device::elastic;
-        let sparse = device.sparse()?.filter(|_| map.bytes > 0);
-        let Some(sparse) = sparse else {
-            return Ok(Arena {
-                store: Buffer::zeroed(device, map.bytes)?,
-                sparse: None,
-            });
-        };
-        let budget = elastic::Arena::new(elastic::pages_up(map.bytes));
-        let store = elastic::create(&sparse, &budget, map.bytes)?;
-        Ok(Arena {
-            store: store.view(),
-            sparse: Some((store, budget)),
-        })
-    }
-
-    #[cfg(not(target_vendor = "apple"))]
-    pub fn reserve(device: &Context, map: &ArenaMap) -> Result<Arena> {
-        Ok(Arena {
-            store: Buffer::zeroed(device, map.bytes)?,
-        })
-    }
-
-    /// Maps the store up to `bytes`, the carve the next fire uses. Nothing
-    /// reads scratch before a kernel writes it, so nothing is zeroed.
-    #[cfg(target_vendor = "apple")]
-    pub fn cover(&mut self, bytes: u64) -> Result<()> {
-        if let Some((store, _)) = self.sparse.as_mut() {
-            crate::device::elastic::map_all(&mut [crate::device::elastic::Target {
-                bytes,
-                buffer: store,
-            }])?;
-        }
-        Ok(())
-    }
-
-    #[cfg(not(target_vendor = "apple"))]
-    pub fn cover(&mut self, _bytes: u64) -> Result<()> {
-        Ok(())
-    }
-
-    /// The device bytes behind the store now: the placement heaps the widest
-    /// carve a fire has mapped holds, or the whole store where it is not
-    /// sparse.
+    /// The arena over the span `[offset, offset + bytes)` of `store`, the
+    /// pool's buffer: `scratch` plane bytes at its top and `rungs` laid
+    /// under them, the last the whole arena.
     #[must_use]
-    pub fn mapped(&self) -> u64 {
-        #[cfg(target_vendor = "apple")]
-        if let Some((store, _)) = self.sparse.as_ref() {
-            return store.held();
+    pub fn over(
+        store: Buffer,
+        (offset, bytes): (u64, u64),
+        scratch: u64,
+        rungs: Vec<(u32, ArenaMap)>,
+    ) -> Arena {
+        Arena {
+            store,
+            end: offset + bytes,
+            scratch: room(scratch),
+            rungs,
         }
-        self.store.bytes()
     }
 
+    /// Where the kernel scratch plane starts in the pool's buffer.
+    #[must_use]
+    pub fn scratch_at(&self) -> u64 {
+        self.end - self.scratch
+    }
+
+    /// The pool's buffer, every carve's.
     #[must_use]
     pub fn store(&self) -> &Buffer {
         &self.store
     }
 
+    /// The whole arena's bytes: the widest carve.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.store.bytes()
+        self.rungs.last().map_or(0, |(_, map)| map.bytes)
     }
 
-    pub fn slots(&self, handles: &Handles, map: &ArenaMap, rows: FireRows) -> Result<SlotTable> {
-        carve(handles, &self.store, map, rows)
+    /// The carve a fire of `rows` takes: the smallest rung that holds its
+    /// tokens and lanes, else the whole arena.
+    #[must_use]
+    pub fn carve_for(&self, rows: FireRows) -> &ArenaMap {
+        let last = self.rungs.len().saturating_sub(1);
+        let at = self
+            .rungs
+            .iter()
+            .position(|(tokens, _)| {
+                u64::from(*tokens) >= rows.tokens && u64::from(*tokens) >= rows.lanes
+            })
+            .unwrap_or(last);
+        &self.rungs[at].1
     }
 
-    pub fn read(&self, offset: u64, into: &mut [u8]) -> Result<()> {
-        #[cfg(target_vendor = "apple")]
-        if let Some((sparse, _)) = &self.sparse {
-            return sparse.read_into(offset, into);
-        }
-        self.store.read(offset, into)
+    /// A fire's slots: [`Arena::carve_for`]'s carve, laid ending where the
+    /// scratch plane starts.
+    pub fn fire_slots(&self, handles: &Handles, rows: FireRows) -> Result<SlotTable> {
+        let map = self.carve_for(rows);
+        carve(
+            handles,
+            &self.store,
+            self.scratch_at() - room(map.bytes),
+            map,
+            rows,
+        )
     }
 }
 
+/// `map`'s rectangles for `fire`, laid from `base` in `store`.
 pub fn carve(
     handles: &Handles,
     store: &Buffer,
+    base: u64,
     map: &ArenaMap,
     fire: FireRows,
 ) -> Result<SlotTable> {
@@ -112,7 +135,7 @@ pub fn carve(
         let value = ValueId(value as u32);
         rows.push(match rect(map, value, fire) {
             Some(rect) => Some(Tensor::new(
-                handles.bind(store, rect.offset, rect.bytes)?,
+                handles.bind(store, base + rect.offset, rect.bytes)?,
                 rect.rows,
                 rect.width,
                 rect.dtype,

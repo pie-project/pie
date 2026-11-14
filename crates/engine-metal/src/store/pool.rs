@@ -10,6 +10,12 @@
 //! side is committed. A device without sparse buffers holds the pool flat,
 //! whole from the load.
 //!
+//! The activation span is the top `act` chunks (`act_chunks` of the
+//! largest rung): the segments it starts in and above are backed from the
+//! load for the pool's life ([`elastic::Elastic::pin_top`]), and the first
+//! `n` segments grow and shrink only below them. A lower rung lends the
+//! span's bottom chunks to state; they are backed already.
+//!
 //! The runtime names chunks logically; the pool places each on a physical
 //! chunk through its [`ChunkTable`], so emptying the top segment
 //! ([`Pool::evacuate`]) moves bytes and never renames a held slot.
@@ -46,6 +52,8 @@ pub struct Pool {
     segment_chunks: u32,
     /// Segments backed, the first ones.
     committed: u32,
+    /// The activation span's chunks, the top of the range.
+    act: u32,
     table: ChunkTable,
 }
 
@@ -56,16 +64,47 @@ pub fn segment_chunks(chunk_bytes: u64) -> u32 {
     u32::try_from((SEGMENT_BYTES / chunk_bytes.max(1)).max(1)).unwrap_or(u32::MAX)
 }
 
+/// Where the backed top starts in bytes: chunk `first`'s start, down to a
+/// placement heap's seam (a pool chunk need not be one heap).
+#[must_use]
+pub fn pinned_from(first: u32, chunk_bytes: u64) -> u64 {
+    #[cfg(target_vendor = "apple")]
+    let heap = elastic::CHUNK;
+    #[cfg(not(target_vendor = "apple"))]
+    let heap = 16 << 20;
+    u64::from(first) * chunk_bytes / heap * heap
+}
+
+/// The first chunk of the segment the top `act` chunks start in, or `total`
+/// where `act` is none.
+#[must_use]
+pub fn top_first(total: u32, segment_chunks: u32, act: u32) -> u32 {
+    if act == 0 {
+        return total;
+    }
+    let start = total.saturating_sub(act);
+    start / segment_chunks.max(1) * segment_chunks.max(1)
+}
+
 impl Pool {
     /// A pool of `total_chunks` chunks of `chunk_bytes`, segments of
-    /// `segment_chunks`: placement sparse with nothing committed where
-    /// `device` maps sparse buffers, else flat and whole.
+    /// `segment_chunks`, the top `act` of them the activation span:
+    /// placement sparse with only the span's segments backed where `device`
+    /// maps sparse buffers, else flat and whole.
     pub fn reserve(
         device: &Context,
         chunk_bytes: u64,
         total_chunks: u32,
         segment_chunks: u32,
+        act: u32,
     ) -> Result<Pool> {
+        if act >= total_chunks {
+            return Err(Fault::Ceiling {
+                what: "chunks of the state pool beside the activation span",
+                need: u64::from(act) + 1,
+                have: u64::from(total_chunks),
+            });
+        }
         if chunk_bytes == 0 || total_chunks == 0 || segment_chunks == 0 {
             return Err(Fault::Ceiling {
                 what: "chunks of the state pool",
@@ -77,7 +116,11 @@ impl Pool {
         #[cfg(target_vendor = "apple")]
         if let Some(sparse) = device.sparse()? {
             let arena = elastic::Arena::new(elastic::pages_up(bytes));
-            let store = elastic::create(&sparse, &arena, bytes)?;
+            let mut store = elastic::create(&sparse, &arena, bytes)?;
+            if act > 0 {
+                let first = top_first(total_chunks, segment_chunks, act);
+                store.pin_top(pinned_from(first, chunk_bytes))?;
+            }
             return Ok(Pool {
                 backing: Backing::Sparse {
                     view: store.view(),
@@ -88,6 +131,7 @@ impl Pool {
                 total_chunks,
                 segment_chunks,
                 committed: 0,
+                act,
                 table: ChunkTable::identity(total_chunks),
             });
         }
@@ -97,6 +141,7 @@ impl Pool {
             total_chunks,
             segment_chunks,
             committed: 0,
+            act,
             table: ChunkTable::identity(total_chunks),
         };
         pool.committed = pool.segments();
@@ -129,21 +174,63 @@ impl Pool {
         self.committed
     }
 
-    /// The chunks with memory behind them: the first ones, a whole number
-    /// of segments (the last one short where the pool ends).
+    /// The bottom's chunks the runtime committed: the first ones, a whole
+    /// number of segments, up to the span's backed segments.
     #[must_use]
     pub fn committed_chunks(&self) -> u32 {
         self.committed
             .saturating_mul(self.segment_chunks)
-            .min(self.total_chunks)
+            .min(self.top_first())
+    }
+
+    /// Where the backed top starts in bytes ([`pinned_from`]); the range's
+    /// end where there is no span.
+    fn pinned_from(&self) -> u64 {
+        if self.act == 0 {
+            return self.bytes();
+        }
+        pinned_from(self.top_first(), self.chunk_bytes)
+    }
+
+    /// The activation span's chunks.
+    #[must_use]
+    pub fn act_chunks(&self) -> u32 {
+        self.act
+    }
+
+    /// Where the activation span starts, in bytes from the pool's base.
+    #[must_use]
+    pub fn span_offset(&self) -> u64 {
+        u64::from(self.total_chunks - self.act) * self.chunk_bytes
+    }
+
+    /// The first chunk of the segment the span starts in: it and every one
+    /// above are backed from the load (the runtime counts that segment
+    /// committed and opens state below the span inside it). The range's end
+    /// where there is no span.
+    #[must_use]
+    pub fn top_first(&self) -> u32 {
+        top_first(self.total_chunks, self.segment_chunks, self.act)
+    }
+
+    /// The device bytes the span's backed segments hold.
+    #[must_use]
+    pub fn top_held_bytes(&self) -> u64 {
+        match &self.backing {
+            Backing::Flat(_) => u64::from(self.total_chunks - self.top_first()) * self.chunk_bytes,
+            #[cfg(target_vendor = "apple")]
+            Backing::Sparse { store, .. } => store.top_held(),
+        }
     }
 
     #[must_use]
     pub fn growth(&self) -> Growth {
-        if self.is_sparse() {
-            Growth::Bottom
-        } else {
+        if !self.is_sparse() {
             Growth::Fixed
+        } else if self.act > 0 {
+            Growth::TwoEnded
+        } else {
+            Growth::Bottom
         }
     }
 
@@ -226,8 +313,13 @@ impl Pool {
     /// Refuses a physical chunk with no memory behind it: a kernel that
     /// reads an unmapped tile faults the whole queue.
     pub fn admit(&self, physical: u32) -> Result<()> {
+        // The bottom maps its committed chunks up to the heap seam the top
+        // is backed from, and the top every chunk from the span's segment
+        // on, which lies wholly past that seam.
         let have = self.committed_chunks();
-        if physical >= have {
+        let backed =
+            physical < self.total_chunks && (physical < have || physical >= self.top_first());
+        if !backed {
             return Err(Fault::Ceiling {
                 what: "committed chunks of the state pool",
                 need: u64::from(physical) + 1,
@@ -253,11 +345,11 @@ impl Pool {
             return Ok(());
         }
         #[cfg(target_vendor = "apple")]
+        let (top, pinned) = (self.top_first(), self.pinned_from());
+        #[cfg(target_vendor = "apple")]
         if let Backing::Sparse { store, .. } = &mut self.backing {
-            let chunks = segments
-                .saturating_mul(self.segment_chunks)
-                .min(self.total_chunks);
-            let bytes = u64::from(chunks) * self.chunk_bytes;
+            let chunks = segments.saturating_mul(self.segment_chunks).min(top);
+            let bytes = (u64::from(chunks) * self.chunk_bytes).min(pinned);
             elastic::grow_all(&mut [elastic::Target {
                 buffer: store,
                 bytes,
@@ -278,8 +370,12 @@ impl Pool {
             return Ok(());
         }
         #[cfg(target_vendor = "apple")]
+        let (top, pinned) = (self.top_first(), self.pinned_from());
+        #[cfg(target_vendor = "apple")]
         if let Backing::Sparse { store, .. } = &mut self.backing {
-            let bytes = u64::from(segments.saturating_mul(self.segment_chunks)) * self.chunk_bytes;
+            let bytes = (u64::from(segments.saturating_mul(self.segment_chunks).min(top))
+                * self.chunk_bytes)
+                .min(pinned);
             // SAFETY: the caller's contract above.
             unsafe {
                 elastic::shrink_all(&mut [elastic::Target {
@@ -365,5 +461,86 @@ impl Pool {
             // SAFETY: as `write`.
             Backing::Sparse { store, .. } => unsafe { store.zero(offset, len) },
         }
+    }
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod tests {
+    use super::{Pool, top_first};
+    use crate::device::Context;
+
+    const CHUNK: u64 = 16 << 20;
+
+    #[test]
+    fn the_span_is_backed_from_the_load_and_the_bottom_grows_under_it() {
+        assert_eq!(top_first(12, 4, 3), 8, "the segment the span starts in");
+        assert_eq!(top_first(12, 4, 4), 8);
+        assert_eq!(top_first(12, 4, 5), 4);
+        assert_eq!(top_first(12, 4, 0), 12, "no span, no top");
+        let device = Context::bind().expect("a device");
+        if device.sparse().expect("the sparse side").is_none() {
+            return;
+        }
+        let mut pool = Pool::reserve(&device, CHUNK, 12, 4, 3).expect("a pool");
+        assert_eq!(pool.growth(), engine::chunk::Growth::TwoEnded);
+        assert_eq!(pool.span_offset(), 9 * CHUNK);
+        assert_eq!(
+            pool.top_held_bytes(),
+            4 * CHUNK,
+            "the span's segment, whole"
+        );
+        assert!(
+            pool.admit(1).is_err(),
+            "nothing under the span is backed yet"
+        );
+        for chunk in 8..12 {
+            pool.admit(chunk).expect("the span's segment is backed");
+        }
+        // The span reads back what was written, and starts zeroed.
+        let mut seen = [7u8; 64];
+        pool.read(10 * CHUNK + 4096, &mut seen).expect("a read");
+        assert_eq!(seen, [0u8; 64]);
+        pool.write(10 * CHUNK + 4096, &[9u8; 64]).expect("a write");
+        // The bottom grows to the span and no further.
+        pool.commit_segments(3).expect("every segment");
+        assert_eq!(pool.committed_chunks(), 8);
+        assert_eq!(pool.held_bytes(), 12 * CHUNK);
+        // SAFETY: nothing ran on this pool.
+        unsafe { pool.release_segments(1) }.expect("the bottom shrinks");
+        assert_eq!(pool.held_bytes(), 8 * CHUNK);
+        assert!(pool.admit(5).is_err());
+        pool.read(10 * CHUNK + 4096, &mut seen).expect("a read");
+        assert_eq!(seen, [9u8; 64], "the span outlives the bottom's shrink");
+        assert!(
+            Pool::reserve(&device, CHUNK, 4, 4, 4).is_err(),
+            "a span that leaves no chunk under it"
+        );
+        // Chunks of 12 MiB: the span's segment starts mid-heap, and the top
+        // is backed from the heap seam under it.
+        let small = 12 << 20;
+        let mut pool = Pool::reserve(&device, small, 10, 3, 2).expect("a pool");
+        assert_eq!(pool.top_first(), 6);
+        for chunk in 6..10 {
+            pool.admit(chunk).expect("the span's segment is backed");
+        }
+        assert!(
+            pool.admit(5).is_err(),
+            "under the span's segment, uncommitted"
+        );
+        pool.write(9 * small, &[5u8; 64]).expect("a write");
+        pool.write(5 * small, &[5u8; 64])
+            .expect_err("chunk 5's bottom half is unmapped");
+        pool.commit_segments(4).expect("every segment");
+        for chunk in 0..10 {
+            pool.admit(chunk).expect("all of it is backed");
+        }
+        // Chunk 5 straddles the seam at 64 MiB: the bottom maps its first
+        // 4 MiB, the top the rest.
+        pool.write(5 * small + (4 << 20) - 32, &[6u8; 64])
+            .expect("across the seam");
+        let mut seen = [0u8; 64];
+        pool.read(5 * small + (4 << 20) - 32, &mut seen)
+            .expect("a read");
+        assert_eq!(seen, [6u8; 64]);
     }
 }
