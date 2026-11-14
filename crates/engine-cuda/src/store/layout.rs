@@ -50,6 +50,42 @@ pub const FIXED: ShapeId = ShapeId(2);
 /// The rs list's.
 pub const RS: ShapeId = ShapeId(3);
 
+/// The guest shapes' ids start here, clear of the weight shapes' and the
+/// window lists'.
+const GUEST: u32 = 1 << 17;
+/// A guest instance's own tables (`SlotRole::Instance`): its rings'
+/// registry and the native cells of the rings the host reads or writes.
+pub const INSTANCE: ShapeId = ShapeId(GUEST);
+/// A ring only the device reads and writes (`SlotRole::Channel`).
+pub const CHANNEL: ShapeId = ShapeId(GUEST + 1);
+/// An `Instance` slot's bytes (`new-memory/STATE-ROLES.md` 3).
+pub const INSTANCE_SLOT: u64 = 4 << 10;
+/// A `Channel` slot's bytes.
+pub const CHANNEL_SLOT: u64 = 1 << 10;
+
+/// One of the two guest shapes: fixed slots an item takes a run of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestShape {
+    pub id: ShapeId,
+    pub role: engine::chunk::SlotRole,
+    pub slot_bytes: u64,
+    pub per_chunk: u32,
+}
+
+impl GuestShape {
+    /// The slots an item of `bytes` takes: one, or one run of adjacent
+    /// slots it is addressed through as a span.
+    #[must_use]
+    pub fn footprint(&self, bytes: u64) -> engine::program::Footprint {
+        let slots = u32::try_from(bytes.div_ceil(self.slot_bytes)).unwrap_or(u32::MAX);
+        engine::program::Footprint {
+            bytes,
+            slots,
+            contiguous: slots > 1,
+        }
+    }
+}
+
 /// Which of a load's slot shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -1071,6 +1107,22 @@ impl Layout {
             Kind::Fixed => self.fixed.as_ref().map(|fixed| &fixed.slot),
             Kind::Rs => self.rs.as_ref().map(|rs| &rs.slot),
         }
+    }
+
+    /// The guest shape of `role`; `None` for a role that is not a guest's.
+    #[must_use]
+    pub fn guest(&self, role: engine::chunk::SlotRole) -> Option<GuestShape> {
+        let (id, slot_bytes) = match role {
+            engine::chunk::SlotRole::Instance => (INSTANCE, INSTANCE_SLOT),
+            engine::chunk::SlotRole::Channel => (CHANNEL, CHANNEL_SLOT),
+            _ => return None,
+        };
+        Some(GuestShape {
+            id,
+            role,
+            slot_bytes,
+            per_chunk: u32::try_from(self.chunk_bytes / slot_bytes).unwrap_or(u32::MAX),
+        })
     }
 
     /// The chunks `slots` slots of a shape take.

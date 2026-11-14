@@ -348,6 +348,7 @@ pub struct Rig {
     /// The plan's guest inputs by name, in id order.
     pub inputs: Vec<String>,
     next_channel: u64,
+    guest: crate::guest::Guest,
     _dir: tempfile::TempDir,
 }
 
@@ -388,6 +389,7 @@ impl Rig {
             })
             .expect("the two-axis miniature loads");
         Rig {
+            guest: crate::guest::Guest::on(&mut engine, &loaded.caps.chunks),
             engine,
             loaded,
             facts,
@@ -517,24 +519,26 @@ impl Rig {
     }
 
     pub fn bind(&mut self, program: ProgramId, channels: Vec<ChannelId>, rows: u32) -> InstanceId {
-        self.engine
-            .bind_instance(&InstanceBinding {
-                program,
-                channels,
-                seeds: Vec::new(),
-                geometry: GeometryClass::Host,
-                device_resolved: Default::default(),
-                instance_slots: Vec::new(),
-                ring_slots: Vec::new(),
-                extents: engine::program::BindExtents {
-                    row_count: rows,
-                    token_count: rows,
-                    sampled_rows: rows,
-                    query_len: rows,
-                    ..engine::program::BindExtents::default()
+        self.guest
+            .bind(
+                &mut self.engine,
+                InstanceBinding {
+                    program,
+                    channels,
+                    seeds: Vec::new(),
+                    geometry: GeometryClass::Host,
+                    device_resolved: Default::default(),
+                    extents: engine::program::BindExtents {
+                        row_count: rows,
+                        token_count: rows,
+                        sampled_rows: rows,
+                        query_len: rows,
+                        ..engine::program::BindExtents::default()
+                    },
+                    instance_slots: Vec::new(),
+                    ring_slots: Vec::new(),
                 },
-            })
-            .expect("the instance binds")
+            )
             .id
     }
 

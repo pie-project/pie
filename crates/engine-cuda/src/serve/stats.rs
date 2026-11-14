@@ -144,7 +144,9 @@ impl Shell {
     /// See `Engine::evacuate`: the copy and the table change are ordered on
     /// the stream behind every fire enqueued so far and before the next.
     pub fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> crate::Result<()> {
-        self.pools.evacuate(self.device.stream(), evacuation)
+        self.pools.evacuate(self.device.stream(), evacuation)?;
+        // A guest's rings bind their slots' chunks by place.
+        self.rebase_programs()
     }
 
     /// The state pool as the runtime counts it

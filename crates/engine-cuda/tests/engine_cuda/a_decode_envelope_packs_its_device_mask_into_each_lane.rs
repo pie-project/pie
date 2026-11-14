@@ -203,6 +203,15 @@ fn bind(shell: &mut Shell, beams: u32, device: PortMask) -> engine::InstanceId {
     let positions: Vec<u8> = (0..beams).flat_map(|_| 999u32.to_le_bytes()).collect();
     let count = bound.container.channels.len();
     let ids: Vec<engine::ChannelId> = (1..=count as u64).map(engine::ChannelId).collect();
+    let facts = shell.chunk_facts().expect("the chunk facts");
+    let segments = facts.segments.committed.max(1);
+    shell
+        .commit_segments(segments)
+        .expect("the first segment commits");
+    let slots = crate::guest::Guest::of(&facts, segments * facts.segment_chunks).slots(
+        &shell.program_facts(program).expect("the program's facts"),
+        |_| false,
+    );
     shell
         .bind_program(
             program,
@@ -218,6 +227,10 @@ fn bind(shell: &mut Shell, beams: u32, device: PortMask) -> engine::InstanceId {
             device,
             &vec![None; count],
             &ids,
+            engine_cuda::program::Slots {
+                instance: slots.0,
+                rings: slots.1,
+            },
         )
         .expect("the instance binds")
 }

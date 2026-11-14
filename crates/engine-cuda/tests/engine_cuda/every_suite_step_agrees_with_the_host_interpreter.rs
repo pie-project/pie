@@ -504,6 +504,8 @@ fn run(context: &Context, suite: &Suite) -> Vec<String> {
                         false,
                         &vec![None; count],
                         &ids,
+                        crate::guest::alone_slots(&plane, program),
+                        &crate::guest::alone_span,
                         context.stream(),
                     )
                     .unwrap_or_else(|e| panic!("{}: the instance binds: {e:?}", suite.name));

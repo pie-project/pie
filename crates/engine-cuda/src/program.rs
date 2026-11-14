@@ -20,7 +20,8 @@ use crate::error::{Fault, Result};
 pub use compile::{Cache, Compiled, Disk, Module, Region, Stage, Target};
 pub use endpoint::Endpoint;
 pub use launch::{
-    ChannelShape, Cursor, Prepared, Rings, describe_values, scratch_bytes, scratch_offsets,
+    ChannelShape, Cursor, Held, Place, Prepared, Rings, describe_values, scratch_bytes,
+    scratch_offsets,
 };
 pub use session::{Fired, Launched, Session};
 pub use wave::Wave;
@@ -246,6 +247,8 @@ impl Plane {
         buffers_rs: bool,
         adopted: &[Option<std::sync::Arc<Endpoint>>],
         ids: &[ChannelId],
+        slots: Slots,
+        span: Span<'_>,
         stream: *mut core::ffi::c_void,
     ) -> Result<InstanceId> {
         let program = self
@@ -254,6 +257,7 @@ impl Plane {
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
         program.batch(extents, 1, stream)?;
         let program = &*program;
+        let place = slots.place(&Held::of(&program.plan.package.channels), span)?;
         let endpoints = endpoints_for(&program.plan, adopted, stream)?;
         let held = endpoints.clone();
         let mut session = match Session::bind(
@@ -262,6 +266,7 @@ impl Plane {
             seeds,
             extents,
             endpoints,
+            &place,
             self.shadow,
             stream,
         ) {
@@ -282,9 +287,49 @@ impl Plane {
                 endpoints: held,
                 geometry,
                 ids: ids.to_vec(),
+                slots,
             },
         );
         Ok(id)
+    }
+
+    /// What an instance of `program_id` keeps in the pool.
+    pub fn held(&self, program_id: ProgramId) -> Result<Held> {
+        self.programs
+            .get(&program_id)
+            .map(|program| Held::of(&program.plan.package.channels))
+            .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))
+    }
+
+    /// Points every instance's rings at where their pool slots lie now:
+    /// after an evacuation moved chunks, ahead of the next fire staged.
+    pub fn rebase(&mut self, span: Span<'_>) -> Result<()> {
+        for bound in self.instances.values_mut() {
+            let Some(program) = self.programs.get(&bound.program_id) else {
+                continue;
+            };
+            let place = bound
+                .slots
+                .place(&Held::of(&program.plan.package.channels), span)?;
+            bound.session.rebase(&place)?;
+        }
+        Ok(())
+    }
+
+    /// Instance `id`'s items lie in `slots` now, where the runtime copied
+    /// them (`Engine::rebind_slots`).
+    pub fn rebind(&mut self, id: InstanceId, slots: Slots, span: Span<'_>) -> Result<()> {
+        let bound = self
+            .instances
+            .get_mut(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let program = self.programs.get(&bound.program_id).ok_or_else(|| {
+            Fault::program("program::plane", format!("instance {id}'s program is gone"))
+        })?;
+        let place = slots.place(&Held::of(&program.plan.package.channels), span)?;
+        bound.session.rebase(&place)?;
+        bound.slots = slots;
+        Ok(())
     }
 
     pub fn envelope(&self, id: InstanceId) -> Result<Option<Envelope>> {
@@ -852,6 +897,49 @@ struct Bound {
     endpoints: Vec<Option<std::sync::Arc<Endpoint>>>,
     geometry: GeometryClass,
     ids: Vec<ChannelId>,
+    slots: Slots,
+}
+
+/// The address of a guest item of the stated bytes in the named slots of a
+/// role, where they lie now (`store::Pools::guest_span`).
+pub type Span<'a> = &'a dyn Fn(engine::chunk::SlotRole, &[u32], u64) -> Result<u64>;
+
+/// The pool slots an instance's items lie in, as its binding names them.
+#[derive(Debug, Clone, Default)]
+pub struct Slots {
+    pub instance: Vec<u32>,
+    pub rings: Vec<engine::program::RingSlots>,
+}
+
+impl Slots {
+    /// Where the items of an instance that keeps `held` lie now.
+    fn place(&self, held: &Held, span: Span<'_>) -> Result<Place> {
+        let instance = span(
+            engine::chunk::SlotRole::Instance,
+            &self.instance,
+            held.instance_bytes,
+        )?;
+        let mut rings = vec![0u64; held.ring_bytes.len()];
+        for ring in &self.rings {
+            let bytes = held
+                .ring_bytes
+                .get(ring.channel as usize)
+                .copied()
+                .flatten()
+                .ok_or_else(|| {
+                    Fault::program(
+                        "program::plane",
+                        format!(
+                            "a binding names slots for channel {}, which is no ring of its own",
+                            ring.channel
+                        ),
+                    )
+                })?;
+            rings[ring.channel as usize] =
+                span(engine::chunk::SlotRole::Channel, &ring.slots, bytes)?;
+        }
+        Ok(Place { instance, rings })
+    }
 }
 
 fn endpoints_for(
@@ -940,6 +1028,7 @@ fn gather_endpoints(
                 declared.host_role,
                 wire_bytes,
                 capacity,
+                None,
                 stream,
             )?))),
         }

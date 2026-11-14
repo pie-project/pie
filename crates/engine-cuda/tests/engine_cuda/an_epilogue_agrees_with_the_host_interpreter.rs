@@ -215,6 +215,8 @@ fn device_outputs(
             false,
             &vec![None; count],
             &ids,
+            crate::guest::alone_slots(&plane, program),
+            &crate::guest::alone_span,
             context.stream(),
         )
         .expect("the instance binds");

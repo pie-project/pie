@@ -1375,7 +1375,9 @@ impl Shell {
             targets.sort_by_key(|(bucket, _, _)| self.rung_of(*bucket));
         }
         Some(Arming {
-            rung: targets.first().map_or(u32::MAX, |(bucket, _, _)| self.rung_of(*bucket)),
+            rung: targets
+                .first()
+                .map_or(u32::MAX, |(bucket, _, _)| self.rung_of(*bucket)),
             targets: targets.into(),
             top,
             topped: top.is_none() || !stepped,
@@ -1479,7 +1481,10 @@ impl Shell {
             pages: lent.pages.clone(),
             records: named.clone(),
         });
-        let rung = st.targets.front().map_or(st.rung, |(bucket, _, _)| self.rung_of(*bucket));
+        let rung = st
+            .targets
+            .front()
+            .map_or(st.rung, |(bucket, _, _)| self.rung_of(*bucket));
         let stepped = self.arm_next(&mut st);
         self.device.synchronize()?;
         self.lent = None;
@@ -1494,7 +1499,11 @@ impl Shell {
     }
 
     fn arm_stepped_on(&mut self, st: Arming, rung: u32) -> Result<bool> {
-        match st.targets.front().map(|(bucket, _, _)| self.rung_of(*bucket)) {
+        match st
+            .targets
+            .front()
+            .map(|(bucket, _, _)| self.rung_of(*bucket))
+        {
             Some(next) => {
                 if next != rung {
                     self.live.arm(rung);
@@ -1668,17 +1677,17 @@ impl Shell {
                 && let Some(key) = key.as_ref()
                 && key.to_string().contains(wanted)
             {
-                let mut shapes: Vec<(&str, Vec<(usize, u32)>)> =
-                    vec![("lattice", lanes.clone())];
-                let classes: Vec<usize> = lanes.iter().map(|(class, _)| *class).fold(
-                    Vec::new(),
-                    |mut seen, class| {
-                        if !seen.contains(&class) {
-                            seen.push(class);
-                        }
-                        seen
-                    },
-                );
+                let mut shapes: Vec<(&str, Vec<(usize, u32)>)> = vec![("lattice", lanes.clone())];
+                let classes: Vec<usize> =
+                    lanes
+                        .iter()
+                        .map(|(class, _)| *class)
+                        .fold(Vec::new(), |mut seen, class| {
+                            if !seen.contains(&class) {
+                                seen.push(class);
+                            }
+                            seen
+                        });
                 let decoders: Vec<usize> = classes
                     .iter()
                     .copied()
@@ -1720,8 +1729,7 @@ impl Shell {
                     let us = began.elapsed().as_secs_f64() * 1e6 / f64::from(FIRES);
                     let after = self.cache.body_stats().tally;
                     let replayed = after.hits - before.hits;
-                    let lanes_of =
-                        |class: usize| shape.iter().filter(|(c, _)| *c == class).count();
+                    let lanes_of = |class: usize| shape.iter().filter(|(c, _)| *c == class).count();
                     let layout: Vec<String> = shape
                         .iter()
                         .map(|(class, _)| *class)

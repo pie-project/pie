@@ -446,7 +446,9 @@ fn land(jobs: &Receiver<Job>, shared: &Shared, ordinal: i32, ring_bytes: usize, 
         shared.moved.notify_all();
     };
     if let Err(why) = crate::device::ctx::bind_thread(ordinal) {
-        refuse(format!("the host tier's landing thread bound no device: {why}"));
+        refuse(format!(
+            "the host tier's landing thread bound no device: {why}"
+        ));
         return;
     }
     let ring = match pin_ring(ring_bytes) {

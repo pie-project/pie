@@ -90,6 +90,8 @@ fn an_output_of_ids_reads_as_stored() {
             false,
             &[None],
             &[ChannelId(1)],
+            crate::guest::alone_slots(&plane, program),
+            &crate::guest::alone_span,
             context.stream(),
         )
         .expect("the instance binds");

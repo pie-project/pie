@@ -134,6 +134,29 @@ impl Cuda {
     }
 
     #[must_use]
+    /// Points every registered ring's cells at where their `Channel` slots
+    /// lie now, after an evacuation moved chunks.
+    fn rebase_channels(&mut self) -> EngineResult<()> {
+        let Some(shell) = self.shell.as_ref() else {
+            return Ok(());
+        };
+        for endpoint in self.channels.values() {
+            let slots = endpoint.slots();
+            if slots.is_empty() {
+                continue;
+            }
+            let at = shell
+                .guest_span(
+                    engine::chunk::SlotRole::Channel,
+                    &slots,
+                    crate::program::Endpoint::cell_span(endpoint.wire_bytes(), endpoint.cap1() - 1),
+                )
+                .map_err(fault)?;
+            endpoint.rebase(at);
+        }
+        Ok(())
+    }
+
     pub fn endpoint(&self, id: ChannelId) -> Option<Arc<crate::program::Endpoint>> {
         self.channels.get(&id).cloned()
     }
@@ -492,6 +515,30 @@ fn adapter_of(
         .map_err(fault)
 }
 
+/// A registered channel's cell bytes, as its ring holds them, and its
+/// capacity.
+fn cell_of(registration: &ChannelRegistration) -> EngineResult<(u32, u32)> {
+    let numel = registration
+        .shape
+        .iter()
+        .map(|&dim| dim as usize)
+        .product::<usize>()
+        .max(1);
+    let dtype = registration.dtype.program_dtype();
+    let bytes = if registration.host_role == eta_ir::container::HostRole::None {
+        crate::program::launch::native_cell_bytes(dtype, numel)
+    } else {
+        eta_exec::wire_cell_bytes(dtype, numel)
+    };
+    let bytes = u32::try_from(bytes).map_err(|_| {
+        Error::Program(format!(
+            "channel {}'s cell is wider than a u32 counts",
+            registration.id
+        ))
+    })?;
+    Ok((bytes, registration.capacity.max(1)))
+}
+
 impl Engine for Cuda {
     fn kind(&self) -> &'static str {
         "cuda"
@@ -830,7 +877,65 @@ impl Engine for Cuda {
     }
 
     fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
-        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+        self.loaded_mut()?.evacuate(evacuation).map_err(fault)?;
+        self.rebase_channels()
+    }
+
+    fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
+        match self.shell.as_ref() {
+            Some(shell) => shell.program_facts(program).map_err(fault),
+            None => Ok(engine::program::ProgramFacts::default()),
+        }
+    }
+
+    fn ring_facts(
+        &self,
+        registration: &ChannelRegistration,
+    ) -> EngineResult<Option<engine::program::RingFacts>> {
+        let Some(shell) = self.shell.as_ref() else {
+            return Ok(None);
+        };
+        if registration.host_role != eta_ir::container::HostRole::None {
+            return Ok(None);
+        }
+        let (cell_bytes, capacity) = cell_of(registration)?;
+        Ok(Some(engine::program::RingFacts {
+            channel: 0,
+            cell_bytes: u64::from(cell_bytes),
+            capacity,
+            footprint: shell.guest_footprint(
+                engine::chunk::SlotRole::Channel,
+                crate::program::Endpoint::cell_span(cell_bytes, capacity),
+            ),
+        }))
+    }
+
+    fn rebind_slots(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
+        match rebind {
+            engine::program::Rebind::Instance {
+                id,
+                instance,
+                rings,
+            } => self
+                .loaded_mut()?
+                .rebind_program(id, crate::program::Slots { instance, rings })
+                .map_err(fault),
+            engine::program::Rebind::Channel { id, slots } => {
+                let old = self.channels.get(&id).cloned().ok_or_else(|| {
+                    Error::Program(format!("channel {id} is not registered on this engine"))
+                })?;
+                let shell = self.loaded_mut()?;
+                let at = shell
+                    .guest_span(
+                        engine::chunk::SlotRole::Channel,
+                        &slots,
+                        crate::program::Endpoint::cell_span(old.wire_bytes(), old.cap1() - 1),
+                    )
+                    .map_err(fault)?;
+                old.rebind(at, slots);
+                Ok(())
+            }
+        }
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
@@ -1034,29 +1139,31 @@ impl Engine for Cuda {
                 registration.id
             )));
         }
-        let numel = registration
-            .shape
-            .iter()
-            .map(|&dim| dim as usize)
-            .product::<usize>()
-            .max(1);
         let device_only = registration.host_role == eta_ir::container::HostRole::None;
-        let cell_bytes = u32::try_from(if device_only {
-            crate::program::launch::native_cell_bytes(registration.dtype.program_dtype(), numel)
-        } else {
-            eta_exec::wire_cell_bytes(registration.dtype.program_dtype(), numel)
-        })
-        .map_err(|_| {
-            Error::Program(format!(
-                "channel {}'s cell is wider than a u32 counts",
-                registration.id
-            ))
-        })?;
-        let capacity = registration.capacity.max(1);
-        let stream = self.loaded_mut()?.stream();
+        let (cell_bytes, capacity) = cell_of(registration)?;
+        let shell = self.loaded_mut()?;
+        let stream = shell.stream();
+        let cells = device_only
+            .then(|| {
+                shell
+                    .guest_span(
+                        engine::chunk::SlotRole::Channel,
+                        &registration.slots,
+                        crate::program::Endpoint::cell_span(cell_bytes, capacity),
+                    )
+                    .map(|at| (at, registration.slots.clone()))
+            })
+            .transpose()
+            .map_err(fault)?;
         let endpoint = Arc::new(
-            crate::program::Endpoint::open(registration.host_role, cell_bytes, capacity, stream)
-                .map_err(fault)?,
+            crate::program::Endpoint::open(
+                registration.host_role,
+                cell_bytes,
+                capacity,
+                cells,
+                stream,
+            )
+            .map_err(fault)?,
         );
         let mirror = (!device_only).then(|| HostMirror {
             mirror: endpoint.mirror_host(),
@@ -1105,6 +1212,10 @@ impl Engine for Cuda {
                 binding.device_resolved,
                 &adopted,
                 &binding.channels,
+                crate::program::Slots {
+                    instance: binding.instance_slots.clone(),
+                    rings: binding.ring_slots.clone(),
+                },
             )
             .map_err(fault)?;
         let landed = adapter_of(shell, binding.program, id, &seeds);

@@ -25,6 +25,7 @@ mod common_dit;
 mod common_encoder;
 #[cfg(feature = "device")]
 mod common_two_axis;
+mod guest;
 
 mod a_bank_says_which_site_it_corrects;
 mod a_beam_reads_up_to_its_slot_what_its_mask_admits;

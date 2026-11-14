@@ -425,6 +425,7 @@ pub struct Rig {
     /// The plan's guest inputs by name, in id order.
     pub inputs: Vec<String>,
     next_channel: u64,
+    guest: crate::guest::Guest,
     _dir: tempfile::TempDir,
 }
 
@@ -484,6 +485,7 @@ impl Rig {
             })
             .expect("the miniature loads");
         Rig {
+            guest: crate::guest::Guest::on(&mut engine, &loaded.caps.chunks),
             engine,
             loaded,
             facts,
@@ -571,16 +573,14 @@ impl Rig {
         let timestep = self.channel(vec![1, 1], HostRole::Writer);
         let positions = self.channel(vec![rows, 2], HostRole::Writer);
         let out = self.channel(vec![rows, width], HostRole::Reader);
-        let bound = self
-            .engine
-            .bind_instance(&InstanceBinding {
+        let bound = self.guest.bind(
+            &mut self.engine,
+            InstanceBinding {
                 program,
                 channels: vec![latent, timestep, positions, out],
                 seeds: Vec::new(),
                 geometry: GeometryClass::Host,
                 device_resolved: Default::default(),
-                instance_slots: Vec::new(),
-                ring_slots: Vec::new(),
                 extents: engine::program::BindExtents {
                     row_count: rows,
                     token_count: rows,
@@ -588,8 +588,10 @@ impl Rig {
                     query_len: rows,
                     ..engine::program::BindExtents::default()
                 },
-            })
-            .expect("the instance binds");
+                instance_slots: Vec::new(),
+                ring_slots: Vec::new(),
+            },
+        );
         LaneHandles {
             instance: bound.id,
             latent,
