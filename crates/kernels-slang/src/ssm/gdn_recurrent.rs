@@ -4,7 +4,9 @@
 use dtype::Dtype;
 
 use super::{Committed, StatePool, head_width, requests, rows, window_lanes};
-use crate::encode::{Arg, Ctx, Fire, Grid, Tier, dtype_dispatch, nonzero, refuse, stated};
+use crate::encode::{
+    Arg, Ctx, Fire, Grid, Tier, dtype_dispatch, every, nonzero, refuse, stated,
+};
 use crate::error::Error;
 use crate::tensor::{RaggedTensor, Tensor};
 
@@ -138,6 +140,26 @@ pub fn gated_delta(
     )
 }
 
+/// The row counts a scan's kernel changes at: one row, and the fewest that
+/// hold their state in registers.
+fn scan_breaks(tactic: Tactic) -> [u32; 2] {
+    [1, tactic.register_min_rows.max(1)]
+}
+
+/// A scan's kernel over `state`: `registers` where its rows hold their state
+/// in registers, else `memory`.
+fn scan_kernel(
+    op: &'static str,
+    tactic: Tactic,
+    state: &StatePool,
+    in_registers: bool,
+    registers: &'static str,
+    memory: &'static str,
+) -> Result<Fire, Error> {
+    let entry = if in_registers { registers } else { memory };
+    Ok(Fire::at(GDN_RECURRENT, state.entry(op, entry)?).tier(tactic.tier))
+}
+
 /// Each request's rows of the query CSR, in order over its slot.
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_chunked(
@@ -155,16 +177,22 @@ pub fn gated_delta_chunked(
     const OP: &str = "ssm.gated_delta_chunked";
     dtype_dispatch!(OP, qkv.data.dtype, { Bf16 => () });
     let heads = Heads::of(OP, qkv.data, gates, y, k_heads, v_heads, k_dim, v_dim)?;
-    let entry = if heads.registers() && qkv.data.rows >= tactic.register_min_rows {
-        "ssm_gdn_recurrent_chunked_r128_bf16"
-    } else {
-        "ssm_gdn_recurrent_chunked_bf16"
+    let kernel = |rows: u32| {
+        scan_kernel(
+            OP,
+            tactic,
+            state,
+            heads.registers() && rows >= tactic.register_min_rows,
+            "ssm_gdn_recurrent_chunked_r128_bf16",
+            "ssm_gdn_recurrent_chunked_bf16",
+        )
     };
+    if let Some(names) = ctx.naming() {
+        return names.either(&every(&scan_breaks(tactic), kernel)?);
+    }
     let [kh, vh, kd, vd] = heads.args(OP)?;
     ctx.fire(
-        Fire::at(GDN_RECURRENT, state.entry(OP, entry)?)
-            .tier(tactic.tier)
-            .apply(heads.grid(requests(OP, qkv)?)),
+        kernel(qkv.data.rows)?.apply(heads.grid(requests(OP, qkv)?)),
         &[
             &[
                 qkv.data.arg(),
@@ -203,16 +231,22 @@ pub fn gated_delta_committed(
     const OP: &str = "ssm.gated_delta_committed";
     dtype_dispatch!(OP, qkv.dtype, { Bf16 => () });
     let heads = Heads::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
-    let entry = if heads.registers() && qkv.rows >= tactic.register_min_rows {
-        "ssm_gdn_recurrent_committed_r128_bf16"
-    } else {
-        "ssm_gdn_recurrent_committed_bf16"
+    let kernel = |rows: u32| {
+        scan_kernel(
+            OP,
+            tactic,
+            state,
+            heads.registers() && rows >= tactic.register_min_rows,
+            "ssm_gdn_recurrent_committed_r128_bf16",
+            "ssm_gdn_recurrent_committed_bf16",
+        )
     };
+    if let Some(names) = ctx.naming() {
+        return names.either(&every(&scan_breaks(tactic), kernel)?);
+    }
     let [kh, vh, kd, vd] = heads.args(OP)?;
     ctx.fire(
-        Fire::at(GDN_RECURRENT, state.entry(OP, entry)?)
-            .tier(tactic.tier)
-            .apply(heads.grid(window_lanes(OP, indptr)?)),
+        kernel(qkv.rows)?.apply(heads.grid(window_lanes(OP, indptr)?)),
         &[
             &[
                 qkv.arg(),

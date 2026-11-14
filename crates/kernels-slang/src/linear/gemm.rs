@@ -8,7 +8,7 @@
 
 use dtype::Dtype;
 
-use crate::encode::{Arg, Ctx, Fire, Target, Tier, dtype_dispatch, refuse, stated};
+use crate::encode::{Arg, Ctx, Fire, Target, Tier, dtype_dispatch, every, refuse, stated};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
@@ -73,7 +73,49 @@ pub fn act_x_wt(
     if m == 0 {
         return Ok(());
     }
-    let fire = match ctx.target() {
+    let target = ctx.target();
+    if let Some(names) = ctx.naming() {
+        return names.either(&kernels(target, tactic, op, n, k)?);
+    }
+    ctx.fire(
+        kernel(target, tactic, op, m, n, k)?,
+        &[
+            act.arg(),
+            w.arg(),
+            y.arg_mut(),
+            stated(op, m)?.arg(),
+            stated(op, n)?.arg(),
+            stated(op, k)?.arg(),
+        ],
+    )
+}
+
+/// The rows at which the kernel a projection takes changes: [`kernel`]'s
+/// own thresholds, so its answers at these are every answer it has.
+const ROW_BREAKS: [u32; 4] = [1, VECTOR_MAX_ROWS, NARROW_MAX_ROWS, RT_MIN_ROWS];
+
+/// Every kernel a projection of `n` columns over a contraction of `k`
+/// takes at some row count.
+pub fn kernels(
+    target: Target,
+    tactic: Tactic,
+    op: &'static str,
+    n: u32,
+    k: u32,
+) -> Result<Vec<Fire>, Error> {
+    every(&ROW_BREAKS, |m| kernel(target, tactic, op, m, n, k))
+}
+
+/// The kernel a projection of `m` rows takes, at its grid.
+fn kernel(
+    target: Target,
+    tactic: Tactic,
+    op: &'static str,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> Result<Fire, Error> {
+    Ok(match target {
         Target::Spirv if m < VECTOR_MAX_ROWS && k.is_multiple_of(8) => {
             Fire::at(GEMM, "linear_gemm_gemv_v_bf16")
                 .groups([n.div_ceil(8), 1, 1])
@@ -137,18 +179,7 @@ pub fn act_x_wt(
                     .group([16, 16, 1])
             }
         }
-    };
-    ctx.fire(
-        fire,
-        &[
-            act.arg(),
-            w.arg(),
-            y.arg_mut(),
-            stated(op, m)?.arg(),
-            stated(op, n)?.arg(),
-            stated(op, k)?.arg(),
-        ],
-    )
+    })
 }
 
 /// `y = act * w^T` for an f32 activation, an invocation an output:

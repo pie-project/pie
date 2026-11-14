@@ -322,6 +322,16 @@ pub fn decode(
 ) -> Result<(), Error> {
     const OP: &str = "attn.decode";
     let shape = shape(OP, q, pool, window, head_dim)?;
+    if let Some(names) = ctx.naming() {
+        // The rows and the keys a fire holds say whether it splits: where
+        // the planes are there to split into, either walk, then the fold.
+        let [whole, ranges] = decode_kernels(ctx.target(), tactic, head_dim, lse.is_some())?;
+        if split.is_none() {
+            return names.either(&[whole]);
+        }
+        names.either(&[whole, ranges])?;
+        return names.either(&[fold_kernel(lse.is_some())]);
+    }
     if let Some(planes) = split {
         let ceiling = split_ceiling(&planes, &shape, head_dim);
         // Every page the fire's tables name: the walker splits no row past
@@ -429,14 +439,23 @@ fn decode_split(
         stated(OP, shape.q_heads)?.arg(),
         stated(OP, head_dim)?.arg(),
     ]);
-    let entry = if lse.is_some() {
-        "attn_sdpa_fold_lse_bf16"
-    } else {
-        "attn_sdpa_fold_bf16"
-    };
     ctx.fire(
-        Fire::at(SDPA, entry).apply(Grid::of([o.width / 2, shape.rows, 1], [FOLD_GROUP, 1, 1])),
+        fold_kernel(lse.is_some())
+            .apply(Grid::of([o.width / 2, shape.rows, 1], [FOLD_GROUP, 1, 1])),
         &fold,
+    )
+}
+
+/// The kernel that weighs a split decode's partials into its rows, landing
+/// their LSE where `lse`.
+fn fold_kernel(lse: bool) -> Fire {
+    Fire::at(
+        SDPA,
+        if lse {
+            "attn_sdpa_fold_lse_bf16"
+        } else {
+            "attn_sdpa_fold_bf16"
+        },
     )
 }
 

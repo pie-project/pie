@@ -109,6 +109,45 @@ pub trait Encode {
     fn rendezvous(&self, _op: &'static str) -> Result<(), Error> {
         Ok(())
     }
+
+    /// The sink's naming side, where it names kernels and fires none: a
+    /// host that picks its kernel by the rows of a fire then states every
+    /// kernel its widths allow ([`Naming::either`]) and fires nothing.
+    fn naming(&self) -> Option<&dyn Naming> {
+        None
+    }
+}
+
+/// A sink that takes the kernels a load can fire, before any fire states
+/// its rows.
+pub trait Naming {
+    /// One dispatch a host makes with whichever of `alternatives` its rows
+    /// pick.
+    fn either(&self, alternatives: &[Fire]) -> Result<(), Error>;
+}
+
+/// Every kernel `pick` answers over `breaks`, the row counts its answer
+/// changes at: each once, in the order first met.
+pub fn every(
+    breaks: &[u32],
+    pick: impl Fn(u32) -> Result<Fire, Error>,
+) -> Result<Vec<Fire>, Error> {
+    let mut all: Vec<Fire> = Vec::with_capacity(breaks.len());
+    for &rows in breaks {
+        distinct(&mut all, pick(rows)?);
+    }
+    Ok(all)
+}
+
+/// `fire` joins `all` unless its kernel is already there: a kernel is its
+/// entry at its tier, whatever grid it launches.
+pub(crate) fn distinct(all: &mut Vec<Fire>, fire: Fire) {
+    if !all
+        .iter()
+        .any(|held| held.entrypoint == fire.entrypoint && held.tier == fire.tier)
+    {
+        all.push(fire);
+    }
 }
 
 pub type Ctx<'a> = dyn Encode + 'a;

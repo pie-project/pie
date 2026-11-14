@@ -5,7 +5,9 @@
 //! WGSL, which lands whole words; the register-tiled rung is
 //! `qmm_register.slang` (SPIR-V); the vector rungs are `linear::qmv`'s.
 
-use crate::encode::{Arg, Ctx, Fire, Target, Tier, dtype_dispatch, instantiated, refuse, stated};
+use crate::encode::{
+    Arg, Ctx, Fire, Target, Tier, distinct, dtype_dispatch, instantiated, refuse, stated,
+};
 use crate::error::Error;
 use crate::tensor::{Bank, Tensor};
 
@@ -58,6 +60,7 @@ pub enum Qmm {
 }
 
 /// A matmul's operands and extents, checked once for every rung.
+#[derive(Clone, Copy)]
 pub(crate) struct Bounds {
     pub act: Tensor,
     pub w: Bank,
@@ -162,27 +165,87 @@ fn fire(
     if b.m == 0 {
         return Ok(());
     }
+    let target = ctx.target();
+    if let Some(names) = ctx.naming() {
+        return names.either(&kernels(target, op, ladder, &b, capacity_rows)?);
+    }
     for rung in ladder {
-        match *rung {
-            Qmm::Coopmat => return coopmat(ctx, op, &b),
-            Qmm::RegisterTiled { bm, k16 } => return register(ctx, op, &b, bm, k16),
-            Qmm::Tiled { crossover_tg } => {
-                if let Some((bm, padded)) = row_tile(b.m, capacity_rows)
-                    && let Some(bn) = column_tile(b.n, padded / bm, crossover_tg)
-                {
-                    return tiled(ctx, op, &b, bm, bn, padded);
-                }
-            }
-            Qmm::OneRow { lanes, rows } => {
-                return crate::linear::qmv::fire_row(ctx, op, &b, lanes, rows);
-            }
-            Qmm::Qmv { vecs } => return crate::linear::qmv::fire(ctx, op, &b, vecs),
+        if let Some(kernel) = kernel(target, op, *rung, &b, capacity_rows)? {
+            return ctx.fire(kernel, &args(op, &b)?);
         }
     }
     Err(refuse(
         op,
         "no `kernel.qmm` rung fits: a ladder ends on the vector kernel, which fits every shape",
     ))
+}
+
+/// The kernel `rung` runs the batch with, at its grid; `None` where the rung
+/// declines the batch.
+fn kernel(
+    target: Target,
+    op: &'static str,
+    rung: Qmm,
+    b: &Bounds,
+    capacity_rows: u32,
+) -> Result<Option<Fire>, Error> {
+    Ok(match rung {
+        Qmm::Coopmat => Some(coopmat(op, b)?),
+        Qmm::RegisterTiled { bm, k16 } => Some(register(op, b, bm, k16)?),
+        Qmm::Tiled { crossover_tg } => {
+            let tiles = row_tile(b.m, capacity_rows).and_then(|(bm, padded)| {
+                column_tile(b.n, padded / bm, crossover_tg).map(|bn| (bm, bn, padded))
+            });
+            match tiles {
+                Some((bm, bn, padded)) => Some(tiled(target, op, b, bm, bn, padded)?),
+                None => None,
+            }
+        }
+        Qmm::OneRow { lanes, rows } => Some(crate::linear::qmv::row_kernel(op, b, lanes, rows)?),
+        Qmm::Qmv { vecs } => Some(crate::linear::qmv::kernel(target, op, b, vecs)?),
+    })
+}
+
+/// Every kernel a rung of `ladder` runs some batch the capacity holds with,
+/// whatever its rows: `ladder` is every rung some row count reaches.
+fn kernels(
+    target: Target,
+    op: &'static str,
+    ladder: &[Qmm],
+    b: &Bounds,
+    capacity_rows: u32,
+) -> Result<Vec<Fire>, Error> {
+    let mut all = Vec::new();
+    for rung in ladder {
+        for m in breaks(*rung, capacity_rows) {
+            if let Some(kernel) = kernel(target, op, *rung, &Bounds { m, ..*b }, capacity_rows)? {
+                distinct(&mut all, kernel);
+            }
+        }
+    }
+    Ok(all)
+}
+
+/// Row counts at which the kernel `rung` runs changes: [`kernel`]'s answers
+/// at these are every answer it has over the batches the capacity holds.
+fn breaks(rung: Qmm, capacity_rows: u32) -> Vec<u32> {
+    match rung {
+        // Each row tile's first batch, the first that pads to a second
+        // tile, and the last whose padding the capacity holds. A tile below
+        // the largest pads to no other count (a larger tile takes the rows
+        // between), the largest pads to every count between these, and the
+        // column tile only widens with the count.
+        Qmm::Tiled { .. } => BM_RUNGS
+            .iter()
+            .flat_map(|&bm| [bm, bm + 1, capacity_rows / bm * bm])
+            .filter(|&m| m > 0 && m <= capacity_rows)
+            .collect(),
+        // The one-row rung reads one row; the others run every batch with
+        // one kernel.
+        Qmm::Coopmat | Qmm::RegisterTiled { .. } | Qmm::OneRow { .. } | Qmm::Qmv { .. } => {
+            vec![1]
+        }
+    }
 }
 
 /// The tiled rung's arguments, in binding order.
@@ -228,15 +291,15 @@ fn column_tile(n: u32, row_tiles: u32, crossover_tg: u32) -> Option<u32> {
 }
 
 fn tiled(
-    ctx: &Ctx<'_>,
+    target: Target,
     op: &'static str,
     b: &Bounds,
     bm: u32,
     bn: u32,
     padded: u32,
-) -> Result<(), Error> {
+) -> Result<Fire, Error> {
     let (g, bits) = (b.group, b.bits);
-    let (unit, name) = match ctx.target() {
+    let (unit, name) = match target {
         Target::Spirv => (
             TILED,
             format!("linear_qmm_tiled_bf16_gs_{g}_b_{bits}_bm_{bm}_bn_{bn}"),
@@ -246,16 +309,12 @@ fn tiled(
             format!("linear_qmm_quad_bf16_gs_{g}_b_{bits}_bm_{bm}_bn_{bn}"),
         ),
     };
-    let entry = instantiated(op, name)?;
-    ctx.fire(
-        Fire::at(unit, entry)
-            .groups([b.n.div_ceil(bn), padded / bm, 1])
-            .group([32, 2, if bm < 16 { 1 } else { 2 }]),
-        &args(op, b)?,
-    )
+    Ok(Fire::at(unit, instantiated(op, name)?)
+        .groups([b.n.div_ceil(bn), padded / bm, 1])
+        .group([32, 2, if bm < 16 { 1 } else { 2 }]))
 }
 
-fn coopmat(ctx: &Ctx<'_>, op: &'static str, b: &Bounds) -> Result<(), Error> {
+fn coopmat(op: &'static str, b: &Bounds) -> Result<Fire, Error> {
     let entry = instantiated(
         op,
         format!(
@@ -263,16 +322,13 @@ fn coopmat(ctx: &Ctx<'_>, op: &'static str, b: &Bounds) -> Result<(), Error> {
             b.group, b.bits
         ),
     )?;
-    ctx.fire(
-        Fire::at(TILED, entry)
-            .tier(Tier::Coopmat)
-            .groups([b.n.div_ceil(COOPMAT_TILE), b.m.div_ceil(COOPMAT_TILE), 1])
-            .group([32, 4, 1]),
-        &args(op, b)?,
-    )
+    Ok(Fire::at(TILED, entry)
+        .tier(Tier::Coopmat)
+        .groups([b.n.div_ceil(COOPMAT_TILE), b.m.div_ceil(COOPMAT_TILE), 1])
+        .group([32, 4, 1]))
 }
 
-fn register(ctx: &Ctx<'_>, op: &'static str, b: &Bounds, bm: u32, k16: bool) -> Result<(), Error> {
+fn register(op: &'static str, b: &Bounds, bm: u32, k16: bool) -> Result<Fire, Error> {
     if !matches!(bm, 32 | 64) {
         return Err(refuse(
             op,
@@ -288,12 +344,9 @@ fn register(ctx: &Ctx<'_>, op: &'static str, b: &Bounds, bm: u32, k16: bool) -> 
             b.bits
         ),
     )?;
-    ctx.fire(
-        Fire::at(REGISTER, entry)
-            .groups([b.n.div_ceil(REGISTER_COLS), b.m.div_ceil(bm), 1])
-            .group([REGISTER_COLS / 4, bm / 4, 1]),
-        &args(op, b)?,
-    )
+    Ok(Fire::at(REGISTER, entry)
+        .groups([b.n.div_ceil(REGISTER_COLS), b.m.div_ceil(bm), 1])
+        .group([REGISTER_COLS / 4, bm / 4, 1]))
 }
 
 /// The `kernel.qmm` rung a fired module key belongs to, for a tuner that
@@ -312,5 +365,93 @@ pub fn ran(key: &str) -> Option<&'static str> {
         Some("qmv")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use dtype::Dtype;
+
+    use super::*;
+
+    fn batch(n: u32, k: u32, group: u32, bits: u32) -> Bounds {
+        let t = |rows, width, dtype| Tensor::new(0, rows, width, dtype);
+        let bank = Bank {
+            codes: t(n, k, Dtype::U8),
+            scales: t(n, k / group, Dtype::Bf16),
+            biases: Some(t(n, k / group, Dtype::Bf16)),
+            group,
+            bits,
+        };
+        bounds(
+            "linear.matmul",
+            t(1, k, Dtype::Bf16),
+            bank,
+            t(1, n, Dtype::Bf16),
+        )
+        .unwrap()
+    }
+
+    /// The kernels `ladder`'s rungs run batches of every row count up to
+    /// `capacity` with, asked a row count at a time.
+    fn asked(target: Target, ladder: &[Qmm], b: &Bounds, capacity: u32) -> Vec<Fire> {
+        let mut all = Vec::new();
+        for rung in ladder {
+            for m in 1..=capacity {
+                if matches!(rung, Qmm::OneRow { .. }) && m != 1 {
+                    continue;
+                }
+                let at = Bounds { m, ..*b };
+                if let Some(fire) = kernel(target, "linear.matmul", *rung, &at, capacity).unwrap() {
+                    distinct(&mut all, fire);
+                }
+            }
+        }
+        all
+    }
+
+    fn names(mut fires: Vec<Fire>) -> Vec<(&'static str, Tier)> {
+        fires.sort_by_key(|f| f.entrypoint);
+        fires.iter().map(|f| (f.entrypoint, f.tier)).collect()
+    }
+
+    #[test]
+    fn the_kernels_a_ladder_names_are_the_kernels_its_rows_pick() {
+        let ladders: [(Target, Vec<Qmm>); 3] = [
+            (
+                Target::Spirv,
+                vec![
+                    Qmm::OneRow { lanes: 32, rows: 1 },
+                    Qmm::Tiled { crossover_tg: 160 },
+                    Qmm::Qmv { vecs: 4 },
+                ],
+            ),
+            (
+                Target::Spirv,
+                vec![
+                    Qmm::Coopmat,
+                    Qmm::RegisterTiled { bm: 32, k16: true },
+                    Qmm::Tiled { crossover_tg: 1 },
+                    Qmm::Qmv { vecs: 2 },
+                ],
+            ),
+            (
+                Target::Wgsl,
+                vec![Qmm::Tiled { crossover_tg: 24 }, Qmm::Qmv { vecs: 2 }],
+            ),
+        ];
+        for (target, ladder) in &ladders {
+            for n in [16, 48, 64, 1024, 1030] {
+                let b = batch(n, 128, 64, 4);
+                for capacity in (1..=70).chain([95, 96, 97, 127, 128, 129, 191, 192, 193, 300]) {
+                    let named = kernels(*target, "linear.matmul", ladder, &b, capacity).unwrap();
+                    assert_eq!(
+                        names(named),
+                        names(asked(*target, ladder, &b, capacity)),
+                        "{target:?} {ladder:?}: {n} columns, capacity {capacity}"
+                    );
+                }
+            }
+        }
     }
 }
