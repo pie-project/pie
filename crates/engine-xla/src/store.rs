@@ -967,6 +967,10 @@ impl Pools {
 
     /// The pool buffer itself, for programs that take it beside the
     /// tracer's (guest stages carrying cells).
+    pub fn buffer(&self) -> Option<&Buffer> {
+        self.buffer.as_ref()
+    }
+
     pub fn buffer_mut(&mut self) -> &mut Option<Buffer> {
         &mut self.buffer
     }

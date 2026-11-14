@@ -101,6 +101,10 @@ pub struct Layout {
     /// `carried`: the pool row the lane's cell starts at.
     pub carried_in: Vec<(u32, Slot)>,
     pub carried_out: Vec<(u32, Slot)>,
+    /// Puts to a channel the next fire reads off the device (`embed_tokens`):
+    /// packed for the host as any output, and written to the lane's slot
+    /// of the ring too (its row at `carried_rows_at`, as a carried cell's).
+    pub fed_out: Vec<(u32, Slot)>,
     pub carried: Vec<(u32, usize)>,
     pub carried_rows_at: usize,
 }
@@ -302,7 +306,21 @@ pub fn lower(
         let value = &package.values[put.value as usize];
         let n = numel(&value.shape);
         let w = words(value.dtype, n);
-        if carried.contains(&put.channel) {
+        let fed = package
+            .ports
+            .iter()
+            .any(|p| !p.is_const && p.port == eta_ir::registry::Port::EmbedTokens && p.channel == put.channel);
+        if carried.contains(&put.channel) && fed {
+            layout.fed_out.push((
+                put.channel,
+                Slot {
+                    value: put.value,
+                    feed: Feed::Value(value.dtype, n),
+                    at: 0,
+                    words: w,
+                },
+            ));
+        } else if carried.contains(&put.channel) {
             layout.carried_out.push((
                 put.channel,
                 Slot {
@@ -328,7 +346,12 @@ pub fn lower(
 
     // One pack word a carried channel: the lane's cell's first pool row.
     let mut chans: Vec<(u32, usize)> = Vec::new();
-    for (c, slot) in layout.carried_in.iter().chain(&layout.carried_out) {
+    for (c, slot) in layout
+        .carried_in
+        .iter()
+        .chain(&layout.carried_out)
+        .chain(&layout.fed_out)
+    {
         if !chans.iter().any(|(k, _)| k == c) {
             chans.push((*c, slot.words));
         }
@@ -445,7 +468,7 @@ pub fn lower(
         results.push(l.f.concat(&packed, 1)?);
     }
     if let Some(mut pool) = pool {
-        for (c, slot) in &layout.carried_out {
+        for (c, slot) in layout.carried_out.iter().chain(&layout.fed_out) {
             let v = l.get(slot.value)?;
             let Feed::Value(dtype, n) = slot.feed else {
                 unreachable!("carried cells are values");
