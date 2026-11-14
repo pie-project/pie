@@ -99,6 +99,21 @@ pub trait Serve: Backend {
     /// The highest tier the device runs.
     fn tier(device: &Self::Context) -> kernels_slang::Tier;
 
+    /// Holds the kernels the backend can name from `trace` before any
+    /// fire to what `device` binds, before the load reserves anything: one
+    /// the device cannot bind refuses the load by name here, not at the
+    /// fire that first builds it, and what `tuning` picks between two
+    /// forms of a fire is settled by what binds. A device that binds every
+    /// kernel its build carries holds nothing.
+    fn admit(
+        _device: &Self::Context,
+        _tuning: &mut Self::Tuning,
+        _tier: kernels_slang::Tier,
+        _trace: &Trace,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// The pipelines compiled so far.
     fn compiled(pipelines: &Self::Pipelines) -> u64;
 
@@ -663,16 +678,17 @@ pub struct Shell<B: Serve> {
 impl<B: Serve> Shell<B> {
     pub fn load(boot: Boot<'_, B>) -> Result<Shell<B>> {
         let mut boot = boot;
-        let (device, tuning) = B::open(boot.device, boot.residency.device, boot.handed.take())?;
+        let (device, mut tuning) = B::open(boot.device, boot.residency.device, boot.handed.take())?;
         let tier = B::tier(&device);
-        let chip = tuning.profile();
         let mut boot = Boot {
             trace: poem_compiler::fuse::fuse(
                 boot.trace,
-                poem_compiler::fuse::flags::on(chip, B::FUSIONS),
+                poem_compiler::fuse::flags::on(tuning.profile(), B::FUSIONS),
             ),
             ..boot
         };
+        B::admit(&device, &mut tuning, tier, &boot.trace)?;
+        let chip = tuning.profile();
         let weights_held = boot.residency.weights_held;
         let kv_budget = boot.residency.device_kv_budget;
         let host_kv_budget = boot.residency.host_kv_budget;

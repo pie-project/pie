@@ -83,28 +83,77 @@ pub fn register(registry: &mut Registry) {
 pub struct Tuning {
     profile: Profile,
     cores: u32,
-    /// Storage buffers a shader stage may bind; 0 where unknown.
-    storage_buffers: u32,
+    /// The decodes (head width, LSE) whose split walk the adapter binds,
+    /// as the load held them ([`Tuning::hold_decodes`]).
+    splits: Vec<(u32, bool)>,
 }
 
 impl Tuning {
     #[must_use]
-    pub fn new(profile: Profile, cores: u32, storage_buffers: u32) -> Tuning {
+    pub fn new(profile: Profile, cores: u32) -> Tuning {
         Tuning {
             profile,
             cores,
-            storage_buffers,
+            splits: Vec::new(),
         }
+    }
+
+    /// Holds the decodes a load walks (`decodes`: head width, LSE) to
+    /// `limit`, the storage buffers the adapter binds a shader stage, each
+    /// kernel's count read from the module it is compiled from. A decode
+    /// whose walk of a row's keys whole does not bind refuses the load by
+    /// that kernel, its buffers and the limit; its split walk is taken
+    /// where that binds too, which the load states.
+    #[cfg(feature = "wgpu")]
+    pub fn hold_decodes(
+        &mut self,
+        tier: kernels_slang::Tier,
+        decodes: &[(u32, bool)],
+        limit: u32,
+    ) -> engine_gpu::Result<()> {
+        use engine_gpu::backend::Tactics as _;
+        self.splits.clear();
+        for &(head_dim, lse) in decodes {
+            let [whole, split] = kernels_slang::attn::sdpa::decode_kernels(
+                kernels_slang::Target::Wgsl,
+                self.sdpa(tier, head_dim),
+                head_dim,
+                lse,
+            )?
+            .map(|fire| {
+                let key = kernels_slang::key(fire.entrypoint, fire.tier).ok_or(
+                    engine_gpu::Fault::Shader {
+                        file: fire.file,
+                        entrypoint: fire.entrypoint,
+                        why: format!("not instantiated at the {} tier", fire.tier.name()),
+                    },
+                )?;
+                let (own, pool) = crate::device::pipelines::storage(fire.file, key)?;
+                Ok::<_, engine_gpu::Fault>((key, own, pool))
+            });
+            let (key, own, pool) = whole?;
+            engine_gpu::storage_buffers(key, own, pool, limit)?;
+            let (key, own, pool) = split?;
+            let binds = engine_gpu::storage_buffers(key, own, pool, limit).is_ok();
+            tracing::info!(
+                kernel = key,
+                own,
+                pool,
+                limit,
+                split = binds,
+                "a decode splits a row's keys where the adapter binds the split walk's storage \
+                 buffers"
+            );
+            if binds {
+                self.splits.push((head_dim, lse));
+            }
+        }
+        Ok(())
     }
 
     #[must_use]
     pub fn profile(&self) -> &Profile {
         &self.profile
-    }
-
-    #[must_use]
-    pub fn storage_buffers(&self) -> u32 {
-        self.storage_buffers
     }
 
     #[must_use]
@@ -143,10 +192,6 @@ const KQUANT: kernels_slang::linear::kquant::Tactic = kernels_slang::linear::kqu
     tier: kernels_slang::Tier::Baseline,
     slices: 4,
 };
-
-/// Storage buffers a split decode binds (its LSE form one more); a device
-/// offering fewer (SwiftShader: 10) walks each row whole.
-const SPLIT_STORAGE_BUFFERS: u32 = 12;
 
 /// A tab's prefill dispatches, in rows times keys. A GPU cannot leave a
 /// dispatch to draw the screen, and macOS ends a command buffer once that has
@@ -232,9 +277,10 @@ impl engine_gpu::backend::Tactics for Tuning {
         }
     }
 
-    fn binds_split(&self, lse: bool) -> bool {
-        let buffers = self.storage_buffers();
-        buffers == 0 || buffers >= SPLIT_STORAGE_BUFFERS + u32::from(lse)
+    /// As the load held it: the split walk's storage buffers are within
+    /// what the adapter binds a stage.
+    fn binds_split(&self, head_dim: u32, lse: bool) -> bool {
+        self.splits.contains(&(head_dim, lse))
     }
 
     /// The recurrences fold their norms through workgroup memory, as WGSL
@@ -249,5 +295,79 @@ impl engine_gpu::backend::Tactics for Tuning {
 
     fn sdpa_split_groups(&self) -> u32 {
         Tuning::sdpa_split_groups(self)
+    }
+}
+
+#[cfg(all(test, feature = "wgpu"))]
+mod tests {
+    use engine_gpu::backend::Tactics as _;
+
+    use super::*;
+
+    fn tuning() -> Tuning {
+        let adapter = crate::chip::Device {
+            name: "an adapter".to_string(),
+            vendor: "intel",
+            subgroup_min: None,
+            cores: None,
+            f16: true,
+        };
+        let (profile, _) = crate::chip::resolve(&adapter, None);
+        Tuning::new(profile, crate::chip::UNREPORTED_CORES)
+    }
+
+    /// An adapter binding a stage 10 storage buffers (Chrome on macOS,
+    /// SwiftShader) cannot bind the plain decode, 8 buffers of its own and
+    /// the pool's 4 segments as its module declares them: the load is
+    /// refused by that kernel, both counts and the limit.
+    #[test]
+    fn an_adapter_of_10_storage_buffers_refuses_the_plain_decode_by_name() {
+        let mut tuning = tuning();
+        let refused = tuning
+            .hold_decodes(kernels_slang::Tier::Baseline, &[(64, false)], 10)
+            .unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "`attn_sdpa_decode_bf16_d_64` binds 12 storage buffers in its shader stage (8 of \
+             its own and 4 pool segments) and this adapter binds a stage 10 \
+             (`maxStorageBuffersPerShaderStage`)"
+        );
+        assert!(!tuning.binds_split(64, false));
+    }
+
+    /// At 16 the load is taken and every decode splits; between the whole
+    /// walk's count and the split's the load is taken with the rows walked
+    /// whole, each form by its own count.
+    #[test]
+    fn an_adapter_of_16_storage_buffers_loads_and_splits_by_the_same_count() {
+        let decodes = [(64, false), (64, true)];
+        let mut tuning = tuning();
+        tuning
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, 16)
+            .unwrap();
+        assert!(tuning.binds_split(64, false) && tuning.binds_split(64, true));
+        // A decode the load did not hold is not split.
+        assert!(!tuning.binds_split(128, false));
+
+        // The split walk binds 14, its LSE form 15; the whole LSE walk 13.
+        tuning
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, 14)
+            .unwrap();
+        assert!(tuning.binds_split(64, false) && !tuning.binds_split(64, true));
+        tuning
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, 13)
+            .unwrap();
+        assert!(!tuning.binds_split(64, false) && !tuning.binds_split(64, true));
+        let refused = tuning
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, 12)
+            .unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                engine_gpu::Fault::StorageBuffers { kernel, own: 9, pool: 4, limit: 12 }
+                    if kernel == "attn_sdpa_decode_lse_bf16_d_64"
+            ),
+            "{refused:?}"
+        );
     }
 }

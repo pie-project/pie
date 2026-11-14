@@ -59,6 +59,20 @@ pub enum Fault {
         limit: u32,
     },
 
+    /// A kernel binds more storage buffers in its shader stage than the
+    /// device binds one.
+    StorageBuffers {
+        kernel: String,
+
+        /// The buffers the kernel declares for itself.
+        own: u32,
+
+        /// The pool segments it binds beside them.
+        pool: u32,
+
+        limit: u32,
+    },
+
     PatchPayload {
         lane: u32,
 
@@ -243,6 +257,18 @@ impl fmt::Display for Fault {
                 "`{kernel}` launches {count} workgroups on its {axis} axis and this device \
                  takes {limit} on it (Vulkan's `maxComputeWorkGroupCount`, wgpu's \
                  `max_compute_workgroups_per_dimension`)"
+            ),
+            Self::StorageBuffers {
+                kernel,
+                own,
+                pool,
+                limit,
+            } => write!(
+                f,
+                "`{kernel}` binds {} storage buffers in its shader stage ({own} of its own and \
+                 {pool} pool segments) and this adapter binds a stage {limit} \
+                 (`maxStorageBuffersPerShaderStage`)",
+                own + pool
             ),
             Self::PatchPayload {
                 lane,
@@ -472,6 +498,24 @@ pub fn workgroups(kernel: &str, groups: [u32; 3], limit: [u32; 3]) -> Result<[u3
     }
 }
 
+/// The storage buffers `kernel` binds in its shader stage (`own` it
+/// declares for itself, `pool` segments beside them, both as its module
+/// states them), held to `limit`, what the adapter binds a stage
+/// (`maxStorageBuffersPerShaderStage`): a kernel past it is refused by its
+/// name, both counts and the limit, where it would otherwise fail as a
+/// pipeline the device does not validate.
+pub fn storage_buffers(kernel: &str, own: u32, pool: u32, limit: u32) -> Result<()> {
+    if own + pool > limit {
+        return Err(Fault::StorageBuffers {
+            kernel: kernel.to_string(),
+            own,
+            pool,
+            limit,
+        });
+    }
+    Ok(())
+}
+
 impl From<kernels_slang::Error> for Fault {
     fn from(error: kernels_slang::Error) -> Self {
         Fault::from(kernel(error))
@@ -526,5 +570,20 @@ mod tests {
             workgroups("k", [u32::MAX, 1, 1], limit),
             Err(Fault::Workgroups { axis: 'x', count: u32::MAX, .. })
         ));
+    }
+
+    /// A kernel binding more storage buffers than the adapter binds a
+    /// stage is refused by its name, its own buffers, the pool's and the
+    /// limit; one at the limit binds.
+    #[test]
+    fn a_kernel_past_the_adapters_storage_buffers_is_refused_by_name() {
+        storage_buffers("attn_sdpa_decode_bf16_d_64", 8, 4, 12).unwrap();
+        let refused = storage_buffers("attn_sdpa_decode_bf16_d_64", 8, 4, 10).unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "`attn_sdpa_decode_bf16_d_64` binds 12 storage buffers in its shader stage (8 of \
+             its own and 4 pool segments) and this adapter binds a stage 10 \
+             (`maxStorageBuffersPerShaderStage`)"
+        );
     }
 }
