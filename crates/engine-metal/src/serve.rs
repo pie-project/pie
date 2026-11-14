@@ -1096,10 +1096,6 @@ impl PreparedLoad<'_> {
         }
         // The span is mapped untouched; the kernel scratch plane is the one
         // part a kernel reads before it writes.
-        // Until the runtime commits span segments before it opens state in
-        // them (`span_backed_on_demand`), it counts the span backed from the
-        // load, so the load backs it.
-        pools.commit_span(pools.span_segments())?;
         // The smallest rung's fire is backed from the load, so a raise the
         // system refuses always has a rung in hand to cut back to.
         pools.cover(arena.floor_reach())?;
@@ -1354,6 +1350,21 @@ impl Shell {
             .iter()
             .map(crate::store::streamed::Cache::atoms)
             .fold((0, 0), |(a, b), (c, d)| (a + c, b + d))
+    }
+
+    /// See `Engine::commit_span`: the top `segments` span segments are
+    /// backed before the runtime opens state in them.
+    pub fn commit_span(&mut self, segments: u32) -> Result<()> {
+        self.pools.commit_span(segments)
+    }
+
+    /// See `Engine::release_span`: every frame drains first.
+    #[allow(unsafe_code)]
+    pub fn release_span(&mut self, segments: u32) -> Result<()> {
+        self.drain()?;
+        // SAFETY: drained just above, on the one thread that submits; the
+        // runtime holds no state chunk in what goes back.
+        unsafe { self.pools.release_span(segments) }
     }
 
     /// See `Engine::release_segments`: every frame drains first.
