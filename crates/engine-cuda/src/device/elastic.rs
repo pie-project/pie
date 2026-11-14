@@ -974,6 +974,21 @@ impl Range {
         )
     }
 
+    /// The pages backing the first `segments` segments under `limit` bytes
+    /// would take beyond what is backed now, the held spans standing: what
+    /// a commit of them would ask the pool for. Counted, nothing backed.
+    pub fn growth_of(&self, segments: u32, limit: u64) -> Result<u64> {
+        let bytes = self.arena.max_bytes.min(limit);
+        let bottom = (u64::from(segments.min(self.segments())) * self.segment_bytes).min(bytes);
+        let want = Want::Ranges(
+            core::iter::once((0, bottom))
+                .chain(self.held.iter().copied())
+                .collect(),
+        );
+        let units = self.arena.target_units(&want)?;
+        Ok(self.arena.growth_pages(&units))
+    }
+
     /// Holds the segments to the first `bytes` of the range: a segment that
     /// reaches past them backs only its part under them. For a range
     /// reserved for more than its pool may come to take; set before a

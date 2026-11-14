@@ -971,7 +971,19 @@ impl Pools {
                 offset,
             });
         }
-        let total = chunks_at(&layout, &paging, paging.pages(), paging.slots);
+        let asked = chunks_at(&layout, &paging, paging.pages(), paging.slots);
+        // The range is every chunk the pool's ceiling backs: the cache
+        // rows' demand is `asked`, and what the guests' instances and
+        // rings take of the pool is known to no load. A range mapped on
+        // demand only reserves the addresses. A stated budget is the
+        // pool's whole, so its range is what was asked.
+        let total = if budget.is_none() && elastic::mapped_on_demand() {
+            let act =
+                u32::try_from(activation.div_ceil(layout.chunk_bytes.max(1))).unwrap_or(u32::MAX);
+            asked.max(chunks::Chunks::ceiling(&pool, &layout, act))
+        } else {
+            asked
+        };
         let chunks = chunks::Chunks::reserve(&pool, layout, total, activation)?;
         Ok(Pools {
             pool,
@@ -995,7 +1007,7 @@ impl Pools {
             pooled,
             paging,
             asked: paging.pages(),
-            asked_chunks: total,
+            asked_chunks: asked,
             ceiling: paging.pages(),
             budget,
             fitted: total,
@@ -1078,6 +1090,17 @@ impl Pools {
     #[must_use]
     pub fn map_unit_bytes(&self) -> u64 {
         self.pool.map_unit_bytes()
+    }
+
+    /// The map units the pool may still take beside the bodies while they
+    /// arm: none once the load backed it whole.
+    #[must_use]
+    pub fn arming_margin_bytes(&self) -> u64 {
+        if self.whole {
+            0
+        } else {
+            self.pool.map_unit_bytes().saturating_mul(16)
+        }
     }
 
     /// What the cache rows may still take of the device: the bytes the fit
@@ -1327,6 +1350,34 @@ impl Pools {
                      model, or free what else holds the device."
                 )));
             }
+        };
+        // The room counts every backed byte as the pool's to reuse, and a
+        // span held elsewhere in the range (the boundary of an earlier fit,
+        // a workspace) is not under the chunks fitted. What backing these
+        // chunks really asks of the card is counted from the range itself,
+        // and the fit is the most chunks whose growth the card holds beside
+        // the activation still to back and what is held for the bodies.
+        let fitted = if elastic::mapped_on_demand() {
+            let page = self.pool.page_bytes().max(1);
+            let unbacked = if settled {
+                0
+            } else {
+                self.chunks.activation_unheld_bytes()
+            };
+            let have = (self.pool.spare_bytes(0)? / page)
+                .saturating_sub(unbacked.saturating_add(held).div_ceil(page));
+            let mut fitted = fitted;
+            while fitted > least {
+                let growth = self.chunks.growth_for(fitted)?;
+                if growth <= have {
+                    break;
+                }
+                let over = (growth - have).saturating_mul(page).div_ceil(chunk);
+                fitted = fitted.saturating_sub(u32::try_from(over).unwrap_or(u32::MAX).max(1));
+            }
+            fitted.max(least)
+        } else {
+            fitted
         };
         self.fitted = fitted;
         // The kv pages the shell's own seats may name: what the chunks hold
@@ -3455,6 +3506,9 @@ impl Pools {
         } else {
             self.chunks.segments_for(u64::from(fitted))
         };
+        // The fit that sized these chunks ran in this same step of the
+        // load, so the card holds them: a refusal here is a fit that
+        // counted wrong, and the load says so.
         match self.chunks.commit_segments(&mut self.pool, segments)? {
             Commit::Committed => {}
             refusal => return Err(refuse(&self.pool, refusal)),
@@ -3478,6 +3532,8 @@ impl Pools {
         if !self.whole {
             self.back_whole()?;
         }
+        // What the fit backs: the range reserves addresses past it.
+        let backed = self.chunk_bytes(self.fitted_chunks());
         let mut regions = Vec::new();
         // A kv plane's region is the pool from the plane's offset in a
         // slot on: the page a slot ref `r` names starts `r` strides in,
@@ -3490,7 +3546,7 @@ impl Pools {
         for (plane, _) in self.paged_planes() {
             regions.push(engine::KvRegion {
                 base: self.chunks.base() + plane.offset,
-                len: self.chunks.bytes().saturating_sub(plane.offset),
+                len: backed.saturating_sub(plane.offset),
                 page_stride: grain,
                 domain: engine::MemoryDomain::CudaDevice(ordinal),
             });

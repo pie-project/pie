@@ -842,6 +842,19 @@ impl Engine for Rank {
         self.with(|cuda| cuda.copy_kv(copy))
     }
 
+    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.with(|cuda| cuda.commit_segments(segments))
+    }
+
+    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.with(|cuda| cuda.release_segments(segments))
+    }
+
+    /// Every rank moves the same chunks and rebases its guests' rings.
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.with(|cuda| cuda.evacuate(evacuation))
+    }
+
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         self.with(|cuda| cuda.copy_slots(copy))
     }
