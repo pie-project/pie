@@ -947,6 +947,121 @@ fn no_slot_is_handed_out_past_what_the_engine_binds() {
     assert!(chunk_of(&pool, more[0].0) >= 8);
 }
 
+/// Cold start: arming steps lease pages while decoders take theirs, the
+/// engine holding part of the range back; arming settles (the hold drops,
+/// the ceiling lifts); then the pool runs dry and a holder fails with a fire
+/// in flight. Through all of it no page is ever had by two owners (a lane,
+/// a lease, a fire's pending recycle), and nothing handed out is handed out
+/// again before it comes back.
+#[test]
+fn leases_grants_a_settle_and_a_failed_holder_never_give_a_page_two_owners() {
+    use crate::store::kv::page_table::PhysicalKvPageId;
+    use std::collections::{HashMap, HashSet};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Owner {
+        Lane(u32),
+        Lease,
+        /// Let go under a fire in flight until that epoch retires.
+        Pending(u64),
+    }
+
+    let shared: Shared = Arc::new(Mutex::new(pool()));
+    let list = shared.lock().unwrap().list().expect("a kv list");
+    let mut engine = FakeEngine::new();
+    {
+        let mut pool = shared.lock().unwrap();
+        assert_eq!(
+            walk_segments(&mut pool, 8, 0, &mut engine),
+            Retarget::Reached
+        );
+        // Arming: the engine holds back all but 16 chunks below activation.
+        let top = TOTAL - pool.pool().act_max();
+        pool.hold_back(u64::from(top - 16) * CHUNK);
+    }
+    let mut pages = crate::store::chunks::ShapePool::<PhysicalKvPageId>::shared(&shared, list);
+    let mut owners: HashMap<u32, Owner> = HashMap::new();
+    let take = |owners: &mut HashMap<u32, Owner>,
+                pages: &mut crate::store::chunks::ShapePool<PhysicalKvPageId>,
+                n: usize,
+                owner: Owner|
+     -> Option<Vec<PhysicalKvPageId>> {
+        let got = pages.try_alloc_n(n)?;
+        let mut seen = HashSet::new();
+        for page in &got {
+            assert!(
+                seen.insert(page.0),
+                "page {} handed out twice at once",
+                page.0
+            );
+            if let Some(had) = owners.insert(page.0, owner) {
+                panic!("page {} given to {owner:?} while {had:?} has it", page.0);
+            }
+        }
+        Some(got)
+    };
+    let mut rng = 0x9e37_79b9_u64;
+    let mut next = |below: u64| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng % below.max(1)
+    };
+    let mut epoch = 1u64;
+    let mut retired = 0u64;
+    let mut lanes: HashMap<u32, Vec<PhysicalKvPageId>> = HashMap::new();
+    for step in 0..4000 {
+        if step == 1500 {
+            // Every rung armed: the hold drops and the ceiling lifts.
+            shared.lock().unwrap().hold_back(0);
+        }
+        match next(10) {
+            // A decoder lane grows.
+            0..=3 => {
+                let lane = next(32) as u32;
+                if let Some(got) = take(
+                    &mut owners,
+                    &mut pages,
+                    1 + next(3) as usize,
+                    Owner::Lane(lane),
+                ) {
+                    lanes.entry(lane).or_default().extend(got);
+                }
+            }
+            // An arming step (before the settle) is lent room and gives it
+            // back once it returns.
+            4..=5 if step < 1500 => {
+                if let Some(lent) = take(&mut owners, &mut pages, 4, Owner::Lease) {
+                    for page in &lent {
+                        assert_eq!(owners.remove(&page.0), Some(Owner::Lease));
+                    }
+                    pages.release_reserved(lent);
+                }
+            }
+            // A lane fails (the pool's sole holder, a fire in flight): its
+            // pages come back once that fire retires.
+            6 => {
+                let lane = next(32) as u32;
+                if let Some(held) = lanes.remove(&lane) {
+                    for page in &held {
+                        owners.insert(page.0, Owner::Pending(epoch));
+                    }
+                    pages.recycle_after_epoch(held, epoch);
+                    epoch += 1;
+                }
+            }
+            // Fires retire.
+            _ => {
+                retired = (retired + 1).min(epoch - 1);
+                pages.retire_through(retired);
+                owners.retain(|_, owner| !matches!(owner, Owner::Pending(at) if *at <= retired));
+            }
+        }
+    }
+    let held: usize = lanes.values().map(Vec::len).sum();
+    assert!(held > 0, "the lanes hold pages at the end");
+}
+
 /// A raise that moves state is taken in the hold it was planned in: no
 /// slot can be handed out between plan and apply (the engine copies after,
 /// never against a pool that moved on), its moved-off chunks stay fenced and
