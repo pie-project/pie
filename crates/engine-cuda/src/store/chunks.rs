@@ -37,8 +37,15 @@ pub struct Chunks {
     act_asked: u64,
     table: ChunkTable,
     seated: [Seating; Kind::COUNT],
-    /// The lowest chunk no shape has opened; chunk 0 is the null chunk.
+    /// The lowest chunk no shape has opened; chunk 0 is the null chunk,
+    /// the reserved run of tables follows it.
     next: u32,
+    /// The chunks of the reserved run of the engine's own tables
+    /// (`Reserved::Tables`), from chunk 1: the layout's
+    /// ([`Layout::table_chunks`]).
+    tables: u32,
+    /// The run is held backed ([`Chunks::hold_tables`]).
+    tables_held: bool,
     null_zeroed: bool,
     /// Lanes name slot refs: nothing is seated here any more.
     refs: bool,
@@ -82,6 +89,7 @@ impl Chunks {
         let total = total.max(1);
         let bytes = (u64::from(total) + u64::from(act)) * layout.chunk_bytes;
         let segment = u64::from(layout.segment_chunks) * layout.chunk_bytes;
+        let tables = layout.table_chunks();
         Ok(Chunks {
             range: Range::reserve(pool, bytes, segment, "bytes of the state pool")?,
             layout,
@@ -90,7 +98,9 @@ impl Chunks {
             act_asked: act_bytes,
             table: ChunkTable::identity(total.saturating_add(act)),
             seated: Default::default(),
-            next: 1,
+            next: 1 + tables,
+            tables,
+            tables_held: false,
             null_zeroed: false,
             refs: false,
             weights: std::collections::BTreeSet::new(),
@@ -319,6 +329,9 @@ impl Chunks {
                 }
             }
         }
+        if self.tables_held {
+            fresh.hold_tables(pool)?;
+        }
         *self = fresh;
         Ok(())
     }
@@ -353,8 +366,62 @@ impl Chunks {
                 }
             }
         }
+        if self.tables_held {
+            fresh.hold_tables(pool)?;
+        }
         *self = fresh;
         Ok(at)
+    }
+
+    /// The lowest chunk a shape may open: past the null chunk and the
+    /// reserved run of tables.
+    #[must_use]
+    pub fn first_free(&self) -> u32 {
+        1 + self.tables
+    }
+
+    /// Backs the reserved run of tables and keeps it backed whatever
+    /// segments are committed or released: the tables are the load's, and
+    /// a fire reads them before the runtime has committed anything.
+    pub fn hold_tables(&mut self, pool: &mut PhysicalPool) -> Result<()> {
+        if self.tables == 0 || self.tables_held {
+            return Ok(());
+        }
+        let chunk = self.layout.chunk_bytes;
+        match self
+            .range
+            .hold(pool, chunk, u64::from(self.tables) * chunk, true)?
+        {
+            Commit::Committed => {
+                self.tables_held = true;
+                Ok(())
+            }
+            _ => Err(Fault::program(
+                "store::chunks",
+                "the reserved run of tables was refused its chunks",
+            )),
+        }
+    }
+
+    /// Whether the reserved run of tables is held backed: false after the
+    /// range was reserved anew under tables never held, so they are laid
+    /// again.
+    #[must_use]
+    pub fn tables_held(&self) -> bool {
+        self.tables_held
+    }
+
+    /// The address of `len` bytes `offset` into the reserved run of tables.
+    pub fn table_at(&self, offset: u64, len: u64) -> Result<u64> {
+        let run = u64::from(self.tables) * self.layout.chunk_bytes;
+        if offset.saturating_add(len) > run {
+            return Err(Fault::Ceiling {
+                what: "bytes of the reserved run of tables",
+                need: offset.saturating_add(len),
+                have: run,
+            });
+        }
+        self.range.span(self.layout.chunk_bytes + offset, len)
     }
 
     #[must_use]
@@ -472,7 +539,7 @@ impl Chunks {
     pub fn keep_clear(&mut self, chunks: std::collections::BTreeSet<u32>) {
         if self.seated_in(&chunks) {
             self.seated = Default::default();
-            self.next = 1;
+            self.next = self.first_free();
         }
         self.weights = chunks;
     }
@@ -502,7 +569,7 @@ impl Chunks {
             // it had backed ahead of this fire.
             let chunk = id / per_chunk;
             let named = self.stated().saturating_add(self.act);
-            if chunk == 0 || chunk >= named {
+            if chunk < self.first_free() || chunk >= named {
                 return Err(Fault::Ceiling {
                     what: "chunks of the state pool a slot ref may name",
                     need: u64::from(chunk) + 1,
@@ -827,11 +894,17 @@ impl Chunks {
                     Growth::TwoEnded
                 },
             },
-            reserved: vec![ReservedRun {
+            reserved: std::iter::once(ReservedRun {
                 what: Reserved::Null,
                 first: 0,
                 chunks: 1,
-            }],
+            })
+            .chain((self.tables > 0).then_some(ReservedRun {
+                what: Reserved::Tables,
+                first: 1,
+                chunks: self.tables,
+            }))
+            .collect(),
             shapes,
             act_chunks: rungs
                 .iter()

@@ -1397,6 +1397,7 @@ impl Pools {
                     .min(self.chunks.total())
             };
             self.chunks.reshape(&mut self.pool, reserved)?;
+            self.relay_tables()?;
         }
         self.chunks
             .limit(self.stated.map_or(fitted, |stated| stated.max(fitted)));
@@ -1454,7 +1455,9 @@ impl Pools {
     /// Reserves the range anew with `bytes` more of activation
     /// ([`Chunks::widen_activation`]).
     pub(crate) fn widen_activation(&mut self, bytes: u64) -> Result<u64> {
-        self.chunks.widen_activation(&mut self.pool, bytes)
+        let at = self.chunks.widen_activation(&mut self.pool, bytes)?;
+        self.relay_tables()?;
+        Ok(at)
     }
 
     /// Backs `bytes` of the activation's span from `offset` into it.
@@ -2347,6 +2350,9 @@ impl Pools {
         groups: &[(u32, Vec<Option<u32>>)],
     ) -> Result<()> {
         self.expert_caches.clear();
+        self.chunks.hold_tables(&mut self.pool)?;
+        // The expert caches' region of the run follows the row caches'.
+        let mut run = TableRun::from(self.chunks.layout().row_table_bytes());
         for shape in &self.chunks.layout().experts {
             let experts = shape.experts as usize;
             let mut planes: Vec<ExpertBank> = Vec::new();
@@ -2377,6 +2383,17 @@ impl Pools {
                         Some((_, members)) => members.clone(),
                         None => vec![Some(plane.param)],
                     };
+                    if members.len() > 3 {
+                        return Err(Fault::program(
+                            "store::experts",
+                            format!(
+                                "param {} lists {} planes an expert, and a table's entry \
+                                 lists at most three",
+                                plane.param,
+                                members.len()
+                            ),
+                        ));
+                    }
                     planes.push(ExpertBank {
                         plane: *plane,
                         layer: layer as u32,
@@ -2386,10 +2403,12 @@ impl Pools {
                             .iter()
                             .map(|member| member.map(|param| param as usize))
                             .collect(),
-                        table: crate::device::Buffer::zeroed(experts * members.len().max(1) * 8)?,
+                        // Every plane's room is the most a table lists
+                        // ([`layout::Layout::expert_table_bytes`]).
+                        table: run.take(experts as u64 * 3 * 8),
                         // A layer's reads are counted at its first bank.
                         hits: if head && !std::mem::replace(&mut counted, true) {
-                            Some(crate::device::Buffer::zeroed(experts * 4)?)
+                            Some(run.take(experts as u64 * 4))
                         } else {
                             None
                         },
@@ -2423,12 +2442,16 @@ impl Pools {
                     }
                 }
             }
+            // A layer's counter span is laid whether its first bank counts
+            // or not: the run is sized so.
+            run.align_layers(&planes, experts as u64);
             self.expert_caches.push(ExpertCache {
                 shape: shape.clone(),
                 planes,
                 slots: vec![None; shape.count() as usize],
             });
         }
+        self.zero_counters()?;
         self.stage_expert_tables(core::ptr::null_mut())
     }
 
@@ -2481,11 +2504,8 @@ impl Pools {
                 }
                 let held = &mut self.expert_caches[at].planes[bank];
                 held.whole_rows = whole_rows;
-                if stream.is_null() {
-                    held.table.write(0, &entries)?;
-                } else {
-                    held.table.stage(stream, 0, &entries)?;
-                }
+                let table = held.table;
+                self.put_table(stream, table, &entries)?;
             }
         }
         Ok(())
@@ -2527,8 +2547,8 @@ impl Pools {
                         (
                             bank.plane.param,
                             kernels_cuda::linear::moe::ExpertTable {
-                                table: bank.table.ptr(),
-                                hits: bank.hits.as_ref().map_or(0, crate::device::Buffer::ptr),
+                                table: self.table_address(bank.table),
+                                hits: bank.hits.map_or(0, |hits| self.table_address(hits)),
                                 located,
                                 window: if located { window } else { (0, 0) },
                             },
@@ -2543,6 +2563,9 @@ impl Pools {
     /// copy has it, read in place until the runtime names a slot for it.
     pub fn seat_rows(&mut self, hosts: &[(u32, u64)]) -> Result<()> {
         self.row_caches.clear();
+        self.chunks.hold_tables(&mut self.pool)?;
+        // The row caches' region opens the run.
+        let mut run = TableRun::from(0);
         for shape in &self.chunks.layout().rows {
             let Some(&(_, host)) = hosts.iter().find(|(param, _)| *param == shape.param) else {
                 return Err(Fault::program(
@@ -2557,12 +2580,13 @@ impl Pools {
             let cache = RowCache {
                 shape: shape.clone(),
                 host,
-                table: crate::device::Buffer::zeroed(blocks * 8)?,
-                hits: crate::device::Buffer::zeroed(blocks * 4)?,
+                table: run.take(blocks as u64 * 8),
+                hits: run.take(blocks as u64 * 4),
                 slots: vec![None; blocks],
             };
             self.row_caches.push(cache);
         }
+        self.zero_counters()?;
         self.stage_row_tables(core::ptr::null_mut())
     }
 
@@ -2584,12 +2608,8 @@ impl Pools {
                 };
                 entries.extend_from_slice(&address.to_le_bytes());
             }
-            let cache = &mut self.row_caches[at];
-            if stream.is_null() {
-                cache.table.write(0, &entries)?;
-            } else {
-                cache.table.stage(stream, 0, &entries)?;
-            }
+            let table = self.row_caches[at].table;
+            self.put_table(stream, table, &entries)?;
         }
         Ok(())
     }
@@ -2615,10 +2635,10 @@ impl Pools {
                 (
                     cache.shape.param,
                     kernels_cuda::linear::moe::RowTable::located(
-                        cache.table.ptr(),
+                        self.table_address(cache.table),
                         cache.shape.block_rows,
                     )
-                    .counting(cache.hits.ptr()),
+                    .counting(self.table_address(cache.hits)),
                 )
             })
             .collect()
@@ -2995,7 +3015,7 @@ impl Pools {
 
     /// The residency a load seats its weights by before the runtime names
     /// any slot: every atom of every shape, each shape's in chunks of its
-    /// own from the pool's first on. `None` where the pool cannot hold them
+    /// own from the pool's first free one on (past the reserved run). `None` where the pool cannot hold them
     /// all with a chunk to spare: the load then keeps a copy its fires read
     /// in place ([`Pools::pin_weight_hosts`]), and the runtime decides what
     /// a pool that small may serve.
@@ -3010,7 +3030,7 @@ impl Pools {
                     .iter()
                     .map(|cache| (cache.shape.id, cache.shape.per_chunk, cache.slots.len())),
             );
-        let mut first = 1u32;
+        let mut first = self.chunks.first_free();
         let mut resident = Vec::new();
         for (shape, per_chunk, atoms) in shapes {
             let per_chunk = per_chunk.max(1);
@@ -3257,14 +3277,62 @@ impl Pools {
     fn counters(&self) -> Vec<(u64, usize)> {
         self.row_caches
             .iter()
-            .map(|cache| (cache.hits.ptr(), cache.slots.len() * 4))
+            .map(|cache| (self.table_address(cache.hits), cache.slots.len() * 4))
             .chain(self.expert_caches.iter().flat_map(|cache| {
                 let experts = cache.shape.experts as usize;
                 cache.planes.iter().filter_map(move |bank| {
-                    bank.hits.as_ref().map(|hits| (hits.ptr(), experts * 4))
+                    bank.hits
+                        .map(|hits| (self.table_address(hits), experts * 4))
                 })
             }))
             .collect()
+    }
+
+    /// The address of `offset` into the reserved run of tables. The run is
+    /// held from the first cache seated on, so an offset a cache was given
+    /// lies in it.
+    fn table_address(&self, offset: u64) -> u64 {
+        self.chunks
+            .table_at(offset, 0)
+            .expect("a cache's table lies in the reserved run, held since it was seated")
+    }
+
+    /// Writes `entries` at `offset` into the reserved run of tables, behind
+    /// what `stream` holds (a null stream: at once, before any fire).
+    fn put_table(
+        &self,
+        stream: *mut core::ffi::c_void,
+        offset: u64,
+        entries: &[u8],
+    ) -> Result<()> {
+        let at = self.chunks.table_at(offset, entries.len() as u64)?;
+        if stream.is_null() {
+            crate::device::write_raw(at, entries)
+        } else {
+            crate::device::stage_raw(stream, at, entries)
+        }
+    }
+
+    /// Zeroes every read counter, at once.
+    fn zero_counters(&self) -> Result<()> {
+        for (at, bytes) in self.counters() {
+            crate::device::zero_span(at, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Lays the tables again where the range was reserved anew under them
+    /// (a fit or a wider activation before any fire is recorded): the run
+    /// is held again and each table written as its atoms lie, the counters
+    /// from zero.
+    fn relay_tables(&mut self) -> Result<()> {
+        if self.row_caches.is_empty() && self.expert_caches.is_empty() {
+            return Ok(());
+        }
+        self.chunks.hold_tables(&mut self.pool)?;
+        self.zero_counters()?;
+        self.stage_row_tables(core::ptr::null_mut())?;
+        self.stage_expert_tables(core::ptr::null_mut())
     }
 
     /// See `Engine::weight_uses`: each block's reads since the last call.
@@ -4478,12 +4546,13 @@ fn lay(
     layout::Layout::of(&recipe, &streamed, &banks)
 }
 
-/// The chunks a pool of `pages` kv pages takes: the null chunk, the pages'
-/// and the windowed pages beside them.
+/// The chunks a pool of `pages` kv pages takes: the null chunk, the
+/// reserved run of tables, the pages' and the windowed pages beside them.
 fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64, slots: u32) -> u32 {
     // The null chunk, and a chunk of each guest shape: an instance's
     // tables and a ring, which every working set served binds.
     let chunks = 1
+        + u64::from(layout.table_chunks())
         + GUEST_SHAPES
         + layout.chunks_for(Kind::List, pages)
         + (0..layout.windows.len())
@@ -4505,6 +4574,39 @@ fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64, slots: u32) -
 /// The guest shapes: `Instance` and `Channel`.
 const GUEST_SHAPES: u64 = 2;
 
+/// A bump of the reserved run of tables: each table taken whole, from a
+/// region's start ([`layout::Layout::table_bytes`] sizes the regions).
+struct TableRun {
+    next: u64,
+}
+
+impl TableRun {
+    fn from(at: u64) -> Self {
+        Self { next: at }
+    }
+
+    /// The offset of a table of `bytes`.
+    fn take(&mut self, bytes: u64) -> u64 {
+        let at = self.next;
+        self.next += layout::table_span(bytes);
+        at
+    }
+
+    /// Past a layer's counter span where none of its banks took one: the
+    /// region gives each layer one ([`layout::Layout::expert_table_bytes`]).
+    fn align_layers(&mut self, planes: &[ExpertBank], experts: u64) {
+        let layers = planes.iter().map(|bank| bank.layer).max().map_or(0, |l| l + 1);
+        for layer in 0..layers {
+            let counted = planes
+                .iter()
+                .any(|bank| bank.layer == layer && bank.hits.is_some());
+            if !counted {
+                self.take(experts * 4);
+            }
+        }
+    }
+}
+
 /// A row-streamed table's cache: where each block of its rows lies (a pool
 /// slot the runtime named, or the mapped host copy), the device table its
 /// gather reads them through, and each block's reads since last asked.
@@ -4513,10 +4615,10 @@ struct RowCache {
     shape: layout::RowsShape,
     /// The table's mapped host copy.
     host: u64,
-    /// A u64 address a block.
-    table: crate::device::Buffer,
-    /// A u32 counter a block.
-    hits: crate::device::Buffer,
+    /// A u64 address a block, this far into the reserved run of tables.
+    table: u64,
+    /// A u32 counter a block, this far into the run.
+    hits: u64,
     /// The slot ref each block is cached in.
     slots: Vec<Option<u32>>,
 }
@@ -4545,10 +4647,11 @@ struct ExpertBank {
     /// The planes an expert's table entry lists, as places among the
     /// cache's planes; `None` one the bank lacks.
     members: Vec<Option<usize>>,
-    /// A u64 address an expert.
-    table: crate::device::Buffer,
-    /// A u32 counter an expert.
-    hits: Option<crate::device::Buffer>,
+    /// A u64 address an expert of each member, this far into the reserved
+    /// run of tables.
+    table: u64,
+    /// A u32 counter an expert, this far into the run.
+    hits: Option<u64>,
     /// Whether, as the table was last written, every entry lay in the pool a
     /// whole number of its plane's rows past the pool's base: what a TMA map
     /// of the window indexes it by.

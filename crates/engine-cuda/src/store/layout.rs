@@ -1125,12 +1125,71 @@ impl Layout {
         })
     }
 
+    /// The bytes of the engine's own tables in the pool's reserved run
+    /// (`Reserved::Tables`), each region whole: the row caches' tables and
+    /// counters, then the expert caches'.
+    #[must_use]
+    pub fn table_bytes(&self) -> u64 {
+        self.row_table_bytes() + self.expert_table_bytes()
+    }
+
+    /// The row caches' region: a u64 address and a u32 counter a block.
+    #[must_use]
+    pub fn row_table_bytes(&self) -> u64 {
+        self.rows
+            .iter()
+            .map(|rows| {
+                let blocks = u64::from(rows.blocks);
+                table_span(blocks * 8) + table_span(blocks * 4)
+            })
+            .sum()
+    }
+
+    /// The expert caches' region: each bank an address an expert of each
+    /// plane its select lists (at most three: codes, scales, a bias), and a
+    /// u32 counter an expert a layer.
+    #[must_use]
+    pub fn expert_table_bytes(&self) -> u64 {
+        self.experts
+            .iter()
+            .map(|shape| {
+                let experts = u64::from(shape.experts);
+                shape
+                    .banks
+                    .iter()
+                    .map(|layer| {
+                        layer.len() as u64 * table_span(experts * TABLE_PLANES * 8)
+                            + table_span(experts * 4)
+                    })
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
+    /// The chunks the reserved run of tables takes.
+    #[must_use]
+    pub fn table_chunks(&self) -> u32 {
+        u32::try_from(self.table_bytes().div_ceil(self.chunk_bytes.max(1))).unwrap_or(u32::MAX)
+    }
+
     /// The chunks `slots` slots of a shape take.
     #[must_use]
     pub fn chunks_for(&self, kind: Kind, slots: u64) -> u64 {
         self.shape(kind)
             .map_or(0, |shape| slots.div_ceil(u64::from(shape.per_chunk.max(1))))
     }
+}
+
+/// The boundary each table of the reserved run starts on.
+pub const TABLE_ALIGN: u64 = 256;
+
+/// The planes an expert table's entry lists at most.
+const TABLE_PLANES: u64 = 3;
+
+/// The bytes a table of `bytes` takes in the reserved run.
+#[must_use]
+pub fn table_span(bytes: u64) -> u64 {
+    bytes.next_multiple_of(TABLE_ALIGN)
 }
 
 fn gcd(mut a: u64, mut b: u64) -> u64 {
