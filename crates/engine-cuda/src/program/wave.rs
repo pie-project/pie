@@ -1,6 +1,6 @@
 use kernels_cuda::runtime::channel::{self, BumpLane, PublishLane, PullLane, SettleLane, Ticket};
 
-use crate::device::{Buffer, Context};
+use crate::device::Context;
 use crate::error::Result;
 
 use super::launch::slice_bytes;
@@ -17,7 +17,8 @@ struct Span {
 
 #[derive(Debug, Default)]
 pub struct Wave {
-    arena: Option<Buffer>,
+    /// Where the wave's tables lie in the fire's span, laid at each fly.
+    arena: u64,
     tickets: Vec<Ticket>,
     taken: Vec<u32>,
     put: Vec<u32>,
@@ -26,7 +27,6 @@ pub struct Wave {
     publish: Vec<PublishLane>,
     settle: Vec<SettleLane>,
     spans: Vec<Span>,
-    retired: Vec<Buffer>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -82,14 +82,14 @@ impl Wave {
         self.pull.len()
     }
 
-    pub(super) fn fly(&mut self, context: &Context) -> Result<()> {
+    /// Stages the wave's tables at `base`, in the fire's span.
+    pub(super) fn fly(&mut self, context: &Context, base: u64) -> Result<()> {
         let lanes = self.pull.len();
         if lanes == 0 {
             return Ok(());
         }
         let regions = self.regions();
-        self.reserve(regions.bytes)?;
-        let base = self.arena.as_ref().map_or(0, Buffer::ptr);
+        self.arena = base;
 
         for (lane, span) in self.spans.iter().enumerate() {
             let bump = &mut self.bump[lane];
@@ -112,9 +112,7 @@ impl Wave {
         put_at(regions.settle, &slice_bytes(&self.settle));
 
         let stream = context.stream();
-        if let Some(arena) = self.arena.as_mut() {
-            arena.stage(stream, 0, &image)?;
-        }
+        crate::device::stage_raw(stream, base, &image)?;
         let lane_count = u32::try_from(lanes).unwrap_or(u32::MAX);
         channel::pull_validate(
             context.ctx(),
@@ -131,7 +129,7 @@ impl Wave {
             return Ok(());
         }
         let regions = self.regions();
-        let base = self.arena.as_ref().map_or(0, Buffer::ptr);
+        let base = self.arena;
         let lane_count = u32::try_from(lanes).unwrap_or(u32::MAX);
         channel::commit_bump(context.ctx(), base + regions.bump as u64, lane_count)?;
         channel::scatter_publish(
@@ -187,19 +185,25 @@ impl Wave {
         }
     }
 
-    fn reserve(&mut self, bytes: usize) -> Result<()> {
-        if self
-            .arena
-            .as_ref()
-            .is_some_and(|arena| arena.bytes() >= bytes)
-        {
-            return Ok(());
+    /// The bytes the staged wave's tables take of the fire's span.
+    pub(super) fn bytes(&self) -> u64 {
+        if self.pull.is_empty() {
+            0
+        } else {
+            self.regions().bytes as u64
         }
-        if let Some(outgrown) = self.arena.take() {
-            self.retired.push(outgrown);
-        }
-        self.arena = Some(Buffer::zeroed(bytes.next_power_of_two())?);
-        Ok(())
+    }
+
+    /// The most a lane that names `channels` channels adds to a wave's
+    /// tables, and what the tables take whatever their lanes: the room
+    /// each of them is aligned in.
+    pub(super) fn lane_bytes(channels: usize) -> (u64, u64) {
+        let lane = channels * (size_of::<Ticket>() + 2 * size_of::<u32>())
+            + size_of::<PullLane>()
+            + size_of::<BumpLane>()
+            + size_of::<PublishLane>()
+            + size_of::<SettleLane>();
+        (lane as u64, (8 * ALIGN) as u64)
     }
 }
 

@@ -1,7 +1,5 @@
 use engine::{ChannelId, ProgramRegistration};
 use engine_cuda::device::{Buffer, Context};
-use engine_cuda::program::Plane;
-use engine_cuda::program::compile::Disk;
 use engine_cuda::program::launch::INTRINSIC_STORAGE_F32;
 use engine_cuda::program::session::Fired;
 use eta_compiler::codegen::program::{Backend, emit_program};
@@ -191,7 +189,7 @@ fn device_outputs(
         launch,
         ..Default::default()
     };
-    let mut plane = Plane::new(Disk::disabled());
+    let mut plane = crate::guest::alone_plane();
     let program = plane
         .register(&context, &registration)
         .expect("the program compiles for the device");

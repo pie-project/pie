@@ -1,12 +1,10 @@
 use engine::Allowance;
-use engine::fit::pages_within;
 use engine_cuda::device::elastic::map_unit_for;
 use engine_cuda::device::elastic::{budget_bytes, safety_floor_bytes};
 use engine_cuda::store::kv::Paging;
 use engine_cuda::store::{
-    Accounting, BODIES_FLOOR_BYTES, PROGRAM_ROWS_A_LANE, bodies_allowance, decoded_weight_reserve,
-    holds_within, one_slot_bytes, program_scratch_reserve, tokens_within, window_fire_bytes,
-    window_of,
+    Accounting, BODIES_FLOOR_BYTES, bodies_allowance, decoded_weight_reserve, holds_within,
+    one_slot_bytes, tokens_within, window_fire_bytes, window_of,
 };
 
 const CARD: u64 = 48_305_799_168;
@@ -18,7 +16,6 @@ fn the_operators_fraction_sizes_the_pool_every_case() {
     the_share_is_of_the_card_and_charges_what_is_already_on_it();
     a_stated_budget_caps_what_the_load_takes();
     the_card_does_not_hold_a_deployment_whose_weights_leave_no_context();
-    the_pool_leaves_room_for_the_programs_guests_register();
     the_reservations_scale_to_a_twenty_four_gigabyte_card();
     the_decoded_weight_tiles_are_held_out_of_the_pool();
     the_bodies_keep_their_floor_and_the_tile_is_taken_before_any_capture();
@@ -54,8 +51,11 @@ fn a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes() {
     // The program reserve the load held then: six out-seam rows a lane (since
     // #1265 the pool holds one and a sampler's derived rows fly narrower), kept
     // here so the boot stays the one the issue saw.
-    let issue_reserve =
-        |lanes: u32| program_scratch_reserve(lanes, VOCAB * 4) * 6 / PROGRAM_ROWS_A_LANE;
+    let issue_reserve = |lanes: u32| {
+        (u64::from(lanes.next_power_of_two()) * (VOCAB * 4).next_multiple_of(256))
+            .min(eta_exec::SCRATCH_MAX_BYTES)
+            * 6
+    };
     let live = budget_bytes(CARD - BEFORE, CARD, Allowance::WHOLE) - WEIGHTS;
     let lm_head = decoded_weight_reserve(VOCAB * HIDDEN * 2, 1);
     let mlp = decoded_weight_reserve(INTERMEDIATE * HIDDEN * 2, 1);
@@ -334,73 +334,6 @@ fn the_reservations_scale_to_a_twenty_four_gigabyte_card() {
         seats(fine(4096)) >= 3,
         "and a 4k one seats a few: {}",
         seats(fine(4096))
-    );
-}
-
-fn the_pool_leaves_room_for_the_programs_guests_register() {
-    // pie-evals nightly 35971363958 on an RTX 5090: gpt-oss-20b at 256 lanes,
-    // the card handing out 9765 MiB for the cache rows once the load was
-    // resident. text-completion-bench's sampling epilogue holds three f32 rows
-    // of the 201088-wide out seam per lane, so its scratch at 256 lanes was
-    // 617840640 bytes, allocated at the first fire past static admission —
-    // and the pool, fitted to the room, had left 549 MiB.
-    const PLANES: u64 = 48;
-    const PLANE_PAGE: u64 = 16 * 1024;
-    const MAP_UNIT: u64 = 32 << 20;
-    const ROOM: u64 = 9765 << 20;
-    const LANES: u32 = 256;
-    const VOCAB: u64 = 201_088;
-    const BENCH_SCRATCH: u64 = 617_840_640;
-    let declared_at = |pages: u64| PLANES * (pages * PLANE_PAGE).div_ceil(MAP_UNIT) * MAP_UNIT;
-    let asked = 65536;
-
-    let blind = pages_within(asked, ROOM, declared_at);
-    assert_eq!(
-        blind, 12288,
-        "the fit without a program reserve, as the nightly saw it"
-    );
-    assert!(
-        ROOM - declared_at(blind) < BENCH_SCRATCH,
-        "and what it left ({}) is under the program's scratch, the c64/c256 refusal",
-        ROOM - declared_at(blind)
-    );
-
-    // The reserve holds the logits row a program reads, one a lane. The
-    // rows a sampler derives from it (three here, six at top-p) are not held
-    // back from the pool: a wave whose scratch does not fit flies again
-    // narrower (`program::fire`), so the pool keeps the room for sequences.
-    let reserve = program_scratch_reserve(LANES, VOCAB * 4);
-    assert_eq!(
-        reserve,
-        256 * 804_352 * PROGRAM_ROWS_A_LANE,
-        "one out-seam row a lane at 256 lanes (201088 f32, to the scratch alignment)"
-    );
-
-    let fit = pages_within(asked, ROOM - reserve, declared_at);
-    assert_eq!(
-        fit, blind,
-        "the room the nightly's fit left (549 MiB) already holds every lane's logits row, \
-         so the pool keeps its size"
-    );
-    assert!(
-        ROOM - declared_at(fit) >= reserve,
-        "what the fitted pool leaves holds every lane's logits row"
-    );
-
-    assert_eq!(
-        program_scratch_reserve(300, VOCAB * 4),
-        program_scratch_reserve(512, VOCAB * 4),
-        "the shell grows a program's scratch by doublings, so the reserve rounds the lanes up"
-    );
-    assert_eq!(
-        program_scratch_reserve(LANES, 0),
-        0,
-        "a plan with no out seam registers no sampler"
-    );
-    assert_eq!(
-        program_scratch_reserve(u32::MAX, u64::MAX),
-        eta_exec::SCRATCH_MAX_BYTES,
-        "and never past what the program contract lets one program take"
     );
 }
 

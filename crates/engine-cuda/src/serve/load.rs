@@ -593,7 +593,6 @@ fn refit(
     let live = held_beside(boot, live)?;
     let facts = kv::probe(&boot.trace)?;
     let window = crate::store::window_of(&boot.trace)?;
-    let out_row = Exports::of(&boot.trace, &compiled)?.readout_row_bytes();
     let (asked_lanes, asked_tokens) = (boot.budget.max_lanes, boot.budget.max_tokens);
     let budget_at = |lanes: u32, tokens: u32| {
         let mut budget = boot.budget.clone();
@@ -657,10 +656,6 @@ fn refit(
                 &schedule_streams(&boot.trace, &compiled),
             ))
             .saturating_add(tiles)
-            .saturating_add(crate::store::program_scratch_reserve(
-                lanes.min(device.device().num_sm),
-                out_row,
-            ))
             .saturating_add(
                 u64::from(lanes)
                     .saturating_mul(u64::from(tokens))
@@ -739,7 +734,7 @@ fn refit(
     eprintln!(
         "engine-cuda: a fire of {} tokens and {asked_lanes} lanes is served at {tokens} \
          and {lanes}: at the asked budgets a fire's working set (activation arena, attention \
-         workspaces, decoded-weight tiles, guest programs) takes {} MiB of the {} MiB this \
+         workspaces, decoded-weight tiles) takes {} MiB of the {} MiB this \
          card has after the weight tier under the load's allowance, past the half the cache \
          rows are owed and what one sequence at the declared context and the bodies' floor \
          need.",
@@ -1375,6 +1370,7 @@ impl Shell {
         // several, and its scratch is held at this width, not at the lanes.
         let flight = 1 << shell.device.device().num_sm.max(1).ilog2();
         shell.programs.set_flight(flight);
+        shell.programs.set_fire_lanes(shell.fire_lanes());
         // A fire that replays a recorded body carves for the body's lane
         // capacity, not its own lanes: the rungs stated to the runtime
         // follow that carve, so state is never lent under a carve a fire
@@ -1384,10 +1380,10 @@ impl Shell {
                 .arena
                 .reach_lanes(crate::window::lane_capacity(shell.budget.max_lanes));
         }
-        let programs = crate::store::program_scratch_reserve(
-            boot.budget.max_lanes.min(flight),
-            shell.exports.readout_row_bytes(),
-        );
+        // A program's fires lay their tables and scratch in the span the
+        // runtime widens for them when it binds (`Shell::fire_facts`):
+        // nothing is held for them here.
+        let programs = 0u64;
         // A plane stored as codes and scales is decoded to bf16 before a
         // prefill's dense gemm, into one tile a stream: a scratch slab like
         // any other, laid with the kernels' workspaces once the lattice is
@@ -1399,10 +1395,7 @@ impl Shell {
         let held_for_fires = programs;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
-                "[arm-trace] held for fires: guest programs {} MiB at {} lanes; decoded-weight \
-                 tiles over {} stream(s) ({})",
-                programs >> 20,
-                boot.budget.max_lanes,
+                "[arm-trace] decoded-weight tiles over {} stream(s) ({})",
                 tiles.len(),
                 tiles
                     .iter()
@@ -1631,14 +1624,13 @@ impl Staged {
         let fitted = shell
             .pools
             .fit_the_card(bodies, held_for_fires, settled, &resident)?;
-        if stepping {
-            // The runtime is stated what the settled fit may come to, and
-            // keeps the pool under it by what this fit holds back.
-            let more = shell
-                .pools
-                .activation_unheld_bytes()
-                .saturating_add(fitted.bodies);
-            shell.pools.state_most(more);
+        if stepping || shell.arena.has_rungs() {
+            // The runtime is stated the range whole, what a later fit may
+            // yet give the cache rows with it, and keeps the pool under it
+            // by what this fit holds back. The state's chunks then end
+            // where the activation starts, so what a rung lends and what
+            // lies under it are one span.
+            shell.pools.state_whole();
         }
         // A load that arms later may have had its range reserved anew by
         // this fit: the workspaces are laid where it now lies.

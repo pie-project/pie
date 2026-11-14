@@ -39,8 +39,7 @@ impl Shape {
     }
 }
 
-/// The two guest shapes, each in a chunk of its own: the last two the load
-/// committed, which no test's state reaches.
+/// The two guest shapes, each in a chunk of its own.
 #[derive(Debug, Clone, Copy)]
 pub struct Guest {
     instance: Shape,
@@ -59,8 +58,10 @@ impl Guest {
             facts.state_chunks()
         );
         Guest {
-            instance: Shape::of(facts, SlotRole::Instance, committed - 1),
-            channel: Shape::of(facts, SlotRole::Channel, committed - 2),
+            // The middle of what is backed: a test's own state sits in the
+            // first chunks, and a fire lays its programs in the last.
+            instance: Shape::of(facts, SlotRole::Instance, committed / 2 + 1),
+            channel: Shape::of(facts, SlotRole::Channel, committed / 2),
         }
     }
 
@@ -154,4 +155,15 @@ pub fn alone_slots(
 pub fn alone_span(_: SlotRole, _: &[u32], bytes: u64) -> engine_cuda::Result<u64> {
     let buffer = engine_cuda::device::Buffer::zeroed(bytes as usize)?;
     Ok(Box::leak(Box::new(buffer)).ptr())
+}
+
+/// A plane with no pool: its fires lay their programs' tables and scratch
+/// in a buffer of its own, the test process's until it ends.
+pub fn alone_plane() -> engine_cuda::ProgramPlane {
+    const SPAN: usize = 256 << 20;
+    let buffer = engine_cuda::device::Buffer::zeroed(SPAN).expect("the span's buffer");
+    let end = Box::leak(Box::new(buffer)).ptr() + SPAN as u64;
+    let mut plane = engine_cuda::ProgramPlane::new(engine_cuda::program::compile::Disk::disabled());
+    plane.set_span((end, SPAN as u64));
+    plane
 }

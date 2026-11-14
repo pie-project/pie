@@ -102,6 +102,32 @@ impl Arena {
             .collect()
     }
 
+    /// The rung a fire of `tokens` tokens and `lanes` lanes carves (its
+    /// tokens; `top` where it carves the whole arena) and the bytes of the
+    /// span under that carve, as [`Arena::rungs`] states them.
+    #[must_use]
+    pub fn rung_of(
+        &self,
+        forked: Option<&ArenaMap>,
+        tokens: u64,
+        lanes: u64,
+        top: u32,
+    ) -> (u32, u64) {
+        self.rungs(forked)
+            .into_iter()
+            .find(|&(rung, _)| u64::from(rung) >= tokens && u64::from(rung) >= lanes)
+            .unwrap_or((top, 0))
+    }
+
+    /// Every rung's tokens and the bytes under its carve, the whole arena's
+    /// (`top` tokens, nothing under it) last.
+    #[must_use]
+    pub fn every_rung(&self, forked: Option<&ArenaMap>, top: u32) -> Vec<(u32, u64)> {
+        let mut rungs = self.rungs(forked);
+        rungs.push((top, 0));
+        rungs
+    }
+
     /// Backs, for every carve laid at the reservation's end, the part a
     /// fire reads before its scores. Nothing where no rung is stated: every
     /// carve then lies at the span's start, under [`Arena::ensure`]'s

@@ -3,8 +3,6 @@
 
 use engine::{ChannelId, ProgramRegistration};
 use engine_cuda::device::{Buffer, Context};
-use engine_cuda::program::Plane;
-use engine_cuda::program::compile::Disk;
 use engine_cuda::program::launch::INTRINSIC_STORAGE_RAW_I32;
 use engine_cuda::program::session::Fired;
 use eta_compiler::codegen::program::{Backend, emit_program};
@@ -70,7 +68,7 @@ fn an_output_of_ids_reads_as_stored() {
         launch: eta_compiler::codegen::launch::build(&bound, &stages),
         ..Default::default()
     };
-    let mut plane = Plane::new(Disk::disabled());
+    let mut plane = crate::guest::alone_plane();
     let program = plane
         .register(&context, &registration)
         .expect("the program compiles for the device");
