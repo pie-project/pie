@@ -963,7 +963,7 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
     facts.validate().expect("the engine's chunk facts hold");
     assert!(facts.host_chunks > 0, "a host tier is stated");
     assert!(facts.disk_chunks > 0, "a disk tier is stated");
-    let mut refs = Refs::of(facts.clone(), 1);
+    let mut refs = Refs::of(facts.clone(), facts.reserved_chunks());
     let mut host = HostRefs {
         next: 0,
         open: vec![None; facts.shapes.len()],
@@ -1539,7 +1539,7 @@ fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     engine
         .commit_segments(facts.segments.committed.max(1))
         .expect("the first segment commits");
-    let mut refs = Refs::of(facts.clone(), 1);
+    let mut refs = Refs::of(facts.clone(), facts.reserved_chunks());
     let record: Vec<[u32; 2]> = (0..pieces)
         .map(|_| {
             let slot = refs.take(fixed);
@@ -1757,12 +1757,13 @@ fn served_rows(fixture: &Fixture, cache: &Path, rows: Rows) -> (Vec<(u64, u32)>,
     // What the load's own fires read is not the script's.
     let _ = shell.weight_uses().expect("the use record reads");
     if rows != Rows::Host {
-        // The table's slots from the pool's first chunk on, as a runtime's
-        // allocator lays them: where this load's own fires seated pages.
+        // The table's slots from the pool's first chunk past its reserved
+        // runs on, as a runtime's allocator lays them: where this load's
+        // own fires seated pages.
         let cached: Vec<u32> = (0..table.count)
             .filter(|atom| rows == Rows::Cached || atom % 2 == 0)
             .collect();
-        let first = 1;
+        let first = facts.reserved_chunks();
         let chunks = (cached.len() as u32).div_ceil(table.slots_per_chunk);
         shell
             .commit_segments((first + chunks).div_ceil(facts.segment_chunks))
@@ -1913,13 +1914,15 @@ fn served_experts_as(fixture: &Fixture, cache: &Path, rows: Rows, told: bool) ->
     let mut want = Vec::new();
     let mut resident = Vec::new();
     // Each shape's slots in chunks of its own, from the pool's first chunk
-    // on, as a runtime's allocator lays them: where this load's own fires
+    // past its reserved runs on, as a runtime's allocator lays them: where
+    // this load's own fires
     // seated their pages. A load told its weights are held seated them
     // itself and says where (`WeightShape::seated`): a held set adopts
     // that, or ([`MOVED`]) starts a chunk on, so every atom moves into a
     // slot another may lie in.
     let moved = MOVED.load(std::sync::atomic::Ordering::Relaxed);
-    let mut first = if told && moved { 2 } else { 1 };
+    let reserved = facts.reserved_chunks();
+    let mut first = if told && moved { reserved + 1 } else { reserved };
     // A deployment that streams nothing holds every weight shape whole, the
     // row-streamed tables' too; the other two lay the experts alone.
     let named: Vec<_> = facts
@@ -2358,7 +2361,7 @@ fn served_two_sets(
     let facts = shell.chunk_facts().expect("the pool states its chunks");
     facts.validate().expect("the engine's chunk facts hold");
     shell.take_refs();
-    let mut refs = Refs::of(facts.clone(), 1);
+    let mut refs = Refs::of(facts.clone(), facts.reserved_chunks());
     let list = refs
         .shape(|kind| matches!(kind, SlotKind::List { window: None, .. }))
         .expect("a kv list");
