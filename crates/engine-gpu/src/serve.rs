@@ -1172,10 +1172,6 @@ impl<B: Serve> Shell<B> {
                     asked.context().div_ceil(w.tokens.max(1)),
                 )
             })?;
-        // The seats' runs lie under the span.
-        if 1 + layout.seat_chunks() > total - act {
-            return Err(span_short());
-        }
         let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
         let slots = boot.slots;
         tracing::info!(
