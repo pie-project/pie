@@ -420,6 +420,8 @@ pub struct Plane {
     next_instance: u64,
 
     tally: Arc<Tally>,
+    /// Where a pass the host interprets is counted ([`Plane::report_to`]).
+    live: Option<engine::live::Live>,
 
     /// Compiled guest stages, by program content and batch shape.
     stages: crate::guest::run::Stages,
@@ -429,6 +431,11 @@ pub struct Plane {
 }
 
 impl Plane {
+    /// From now on every pass the host interprets is counted in `live`.
+    pub fn report_to(&mut self, live: engine::live::Live) {
+        self.live = Some(live);
+    }
+
     /// The most lanes a fire seats, which a stage first seen compiles up to.
     pub fn seat(&mut self, lanes: u32) {
         self.stages.top = lanes;
@@ -1349,6 +1356,9 @@ impl Plane {
         let outcome =
             eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut Interpreted, at);
         self.tally.interpreted.fetch_add(1, Ordering::AcqRel);
+        if let Some(live) = &self.live {
+            live.tally(engine::live::Tally::Fallback, 1);
+        }
         let program = seat.program;
         match outcome {
             StepOutcome::Committed => Ok(()),

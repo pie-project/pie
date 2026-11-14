@@ -115,6 +115,8 @@ pub struct Xla {
     next_frame: u64,
     sink: Option<engine::CompletionSink>,
     adapters: BTreeMap<InstanceId, crate::adapter::Binding>,
+    /// What the engine counts while it serves, read by the runtime.
+    live: engine::live::Live,
 }
 
 /// What a step's readouts are made from once it settles.
@@ -145,6 +147,7 @@ impl Xla {
             programs: crate::program::Plane::default(),
             adapters: BTreeMap::new(),
             pending: None,
+            live: engine::live::Live::armed(),
         }
     }
 
@@ -332,9 +335,66 @@ fn adapter_of(
         .map_err(fault)
 }
 
+impl Xla {
+    /// [`Engine::submit`]'s frame, fired.
+    fn submit_frame(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
+        frame.validate_for(
+            self.caps
+                .as_ref()
+                .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
+        )?;
+        let id = FrameId(self.next_frame);
+        self.next_frame = self.next_frame.wrapping_add(1);
+        self.pending = None;
+        tracing::debug!(
+            frame = id.0,
+            steps = frame.steps.len(),
+            airborne = self.programs.airborne(),
+            "xla submit"
+        );
+        let mut steps = Vec::with_capacity(frame.steps.len());
+        let mut settles = Vec::with_capacity(frame.steps.len());
+        for (index, step) in frame.steps.iter().enumerate() {
+            let at = engine::StepDone {
+                frame: id,
+                step: index as u32,
+            };
+            let latch = crate::program::Latch::new(at, self.sink.clone());
+            let (ticket, settle) = if step.lanes.iter().any(|l| !l.rs_snapshots.is_empty()) {
+                self.fire_snapshotting(step, &latch)?
+            } else {
+                self.fire_step(step, &latch)?
+            };
+            // The submitter's hold: the step is done once its passes land.
+            latch.release(Ok(()));
+            steps.push(ticket);
+            settles.push(settle);
+        }
+        let mut ticket = FrameTicket { id, steps };
+        self.pending = Some((id, settles));
+        tracing::debug!(frame = id.0, "xla submitted");
+        if !self.settles_asynchronously() {
+            self.settle_frame(&mut ticket)?;
+        }
+        Ok(ticket)
+    }
+
+    /// `result`, its refusal counted ([`engine::live::Tally::Refused`]).
+    fn refused<T>(&self, result: EngineResult<T>) -> EngineResult<T> {
+        if result.is_err() {
+            self.live.tally(engine::live::Tally::Refused, 1);
+        }
+        result
+    }
+}
+
 impl Engine for Xla {
     fn kind(&self) -> &'static str {
         "xla"
+    }
+
+    fn live(&self) -> engine::live::Live {
+        self.live.clone()
     }
 
     fn device_facts(&self) -> Option<&DeviceFacts> {
@@ -470,6 +530,10 @@ impl Engine for Xla {
         let (rows, sink_row) = shell.pool_geometry();
         self.programs.seat_pool(rows, sink_row);
         self.programs.seat_reads(shell.plane_reads());
+        // From here a program a fire waits on, a pass the host interprets,
+        // is served worse than the load prepared: counted.
+        shell.device().report_to(self.live.clone());
+        self.programs.report_to(self.live.clone());
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -489,45 +553,8 @@ impl Engine for Xla {
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
-        frame.validate_for(
-            self.caps
-                .as_ref()
-                .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
-        )?;
-        let id = FrameId(self.next_frame);
-        self.next_frame = self.next_frame.wrapping_add(1);
-        self.pending = None;
-        tracing::debug!(
-            frame = id.0,
-            steps = frame.steps.len(),
-            airborne = self.programs.airborne(),
-            "xla submit"
-        );
-        let mut steps = Vec::with_capacity(frame.steps.len());
-        let mut settles = Vec::with_capacity(frame.steps.len());
-        for (index, step) in frame.steps.iter().enumerate() {
-            let at = engine::StepDone {
-                frame: id,
-                step: index as u32,
-            };
-            let latch = crate::program::Latch::new(at, self.sink.clone());
-            let (ticket, settle) = if step.lanes.iter().any(|l| !l.rs_snapshots.is_empty()) {
-                self.fire_snapshotting(step, &latch)?
-            } else {
-                self.fire_step(step, &latch)?
-            };
-            // The submitter's hold: the step is done once its passes land.
-            latch.release(Ok(()));
-            steps.push(ticket);
-            settles.push(settle);
-        }
-        let mut ticket = FrameTicket { id, steps };
-        self.pending = Some((id, settles));
-        tracing::debug!(frame = id.0, "xla submitted");
-        if !self.settles_asynchronously() {
-            self.settle_frame(&mut ticket)?;
-        }
-        Ok(ticket)
+        let submitted = self.submit_frame(frame);
+        self.refused(submitted)
     }
 
     fn settles_asynchronously(&self) -> bool {
@@ -560,7 +587,11 @@ impl Engine for Xla {
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
         let device = self.shell.as_ref().map(|shell| shell.device());
-        self.programs.register(registration, device).map_err(refusal)
+        let registered = self
+            .programs
+            .register(registration, device)
+            .map_err(refusal);
+        self.refused(registered)
     }
 
     /// The rings an instance keeps in the pool's `Channel` slots: its

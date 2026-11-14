@@ -50,6 +50,16 @@ impl Session {
                         serde_json::Value::from(total),
                     );
 
+                    // Every way a fire was served worse than the load
+                    // prepared, or refused, as the engine counted it.
+                    let live = crate::engine::backend::live(0);
+                    for tally in ::engine::live::Tally::ALL {
+                        stats.insert(
+                            format!("{}.engine.{}", model_name, tally.name()),
+                            serde_json::Value::from(live.tallied(tally)),
+                        );
+                    }
+
                     let inf = crate::scheduler::get_stats().await;
                     stats.insert(
                         format!("{}.total_batches", model_name),
