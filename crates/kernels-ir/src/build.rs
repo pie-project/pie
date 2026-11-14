@@ -116,7 +116,12 @@ impl Ops {
     /// pair's first `a cos - b sin`, its second `b cos + a sin`, each one
     /// fused multiply-add over the other's product.
     #[allow(clippy::cast_precision_loss)]
-    pub fn rotate_axes(&mut self, x: ValueId, head_dim: u32, axes: &[(u32, f32, ValueId)]) -> ValueId {
+    pub fn rotate_axes(
+        &mut self,
+        x: ValueId,
+        head_dim: u32,
+        axes: &[(u32, f32, ValueId)],
+    ) -> ValueId {
         let col = self.push(Op::Column);
         let head = self.u32(head_dim);
         let i = self.bin(Binary::Rem, col, head);
