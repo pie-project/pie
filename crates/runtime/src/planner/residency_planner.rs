@@ -69,6 +69,23 @@ pub struct ResidencyPlanner {
     weight_shed: Option<WeightShed>,
 }
 
+/// How long a process waits at admission before it says why, and again
+/// after each such span: what a stall at the gates is read from.
+const ADMIT_SAYS_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Waits on `wait` for [`ADMIT_SAYS_AFTER`] at most: `false` once that
+/// passed, for the caller to say why it waits and look again. With no
+/// timer to wait on (a future polled outside a runtime), waits it out.
+async fn waits_said(wait: impl std::future::Future<Output = ()>) -> bool {
+    if tokio::runtime::Handle::try_current().is_err() {
+        wait.await;
+        return true;
+    }
+    crate::rt::time::timeout(ADMIT_SAYS_AFTER, wait)
+        .await
+        .is_ok()
+}
+
 impl ResidencyPlanner {
     pub fn new(port: Arc<dyn PoolPort>) -> Self {
         let sink = super::short::sink(port.locus().1);
@@ -653,7 +670,27 @@ impl ResidencyPlanner {
                 Some(notify)
             });
             match notify {
-                Some(notify) => notify.notified().await,
+                Some(notify) => {
+                    if !waits_said(notify.notified()).await {
+                        let holders: Vec<String> = self.with_inner(|inner| {
+                            inner
+                                .procs
+                                .iter()
+                                .filter(|(holder, proc)| {
+                                    (proc.state != Residency::Resident && proc.parked.is_none())
+                                        || proc.respawn
+                                        || inner.killing.contains(holder)
+                                })
+                                .map(|(holder, proc)| format!("{holder}: {:?}", proc.state))
+                                .collect()
+                        });
+                        tracing::warn!(
+                            %pid,
+                            ?holders,
+                            "a process waits at admission behind a preempted one"
+                        );
+                    }
+                }
                 None => break,
             }
         }
@@ -701,7 +738,16 @@ impl ResidencyPlanner {
             if passed {
                 return;
             }
-            notified.await;
+            if !waits_said(notified).await {
+                let charged = self
+                    .with_inner(|inner| inner.procs.values().filter(|proc| proc.charged).count());
+                tracing::warn!(
+                    %pid,
+                    seats,
+                    charged,
+                    "a process waits at admission for a state seat"
+                );
+            }
         }
     }
 

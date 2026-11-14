@@ -269,13 +269,14 @@ pub fn get_runtime_stats() -> RuntimeProcessStats {
 pub fn init_admission(max_concurrent: Option<usize>) {
     let limit = max_concurrent.filter(|&n| n > 0);
     // Only the first gate, prewarm, holds below the floor.
-    let sem = limit.map(|n| OrderedSemaphore::new(n, false));
+    let sem = limit.map(|n| OrderedSemaphore::new("execution", n, false));
     let prewarm = Some(OrderedSemaphore::new(
+        "prewarm",
         limit.unwrap_or(UNCAPPED_PREWARM_PROCESSES),
         true,
     ));
     const STAGED_COHORTS: usize = 1;
-    let bind_ahead = limit.map(|n| OrderedSemaphore::new(n, false));
+    let bind_ahead = limit.map(|n| OrderedSemaphore::new("bind", n, false));
     BIND_STAGED_RESERVE.store(
         limit.map_or(0, |n| n.saturating_mul(STAGED_COHORTS)),
         Relaxed,
