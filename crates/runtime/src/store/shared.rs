@@ -311,9 +311,17 @@ impl RungWalk {
         let goal = rungs
             .iter()
             .copied()
-            .filter(|&rung| rung <= goal)
+            .filter(|&rung| rung <= goal.min(pool.fit_rung()))
             .max()
             .unwrap_or(rungs[0]);
+        // Fires cut wider than the widest rung that fits with the programs'
+        // fire terms are cut to it first, whatever else the walk does: no
+        // span holds a wider fire with the terms.
+        let fit_cap = pool.fit_cap();
+        if cap > fit_cap {
+            self.lowering = None;
+            return Ok(RungStep::Cap(fit_cap));
+        }
         // The walk moves by what the goal's activation takes against what
         // is set aside now. Rungs whose activation takes as many chunks are
         // one class: the pool sets aside the same span for each, so a move
@@ -1472,14 +1480,18 @@ impl SharedPool {
     /// The smallest rung whose fires carry `rows`, the largest past every
     /// rung's; the smallest where `rows` is 0.
     #[must_use]
+    ///
+    /// No wider than the widest rung that fits with the programs' fire
+    /// terms ([`Self::widest_fit`]): past it, fires are cut to it.
     pub fn rung_for(&self, rows: u32) -> u32 {
         let rungs = self.pool.rungs();
-        rungs
+        let goal = rungs
             .iter()
             .copied()
             .find(|&rung| rung >= rows)
             .or_else(|| rungs.last().copied())
-            .unwrap_or(u32::MAX)
+            .unwrap_or(u32::MAX);
+        goal.min(self.fit_rung())
     }
 
     /// Every activation rung's tokens, ascending.

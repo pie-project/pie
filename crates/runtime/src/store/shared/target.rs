@@ -95,7 +95,8 @@ impl SharedGrow {
                 // between batches moves no rung.
                 let past = pool.pool().act_chunks(goal) < pool.pool().act_reserved();
                 let tick = self.ticks.load(Ordering::Acquire);
-                let waited = {
+                let forced = super::fire_cap(self.engine) > pool.fit_cap();
+                let waited = forced || {
                     let mut since = self.idle_since.lock().unwrap();
                     if past {
                         tick >= since
@@ -121,6 +122,9 @@ impl SharedGrow {
                         .raise_applied(&evacuation)
                         .map(|()| RungStep::Raise { rung, evacuation }),
                     // A cap down or a lower before the patience is out.
+                    // Fires wider than the widest rung that fits with the
+                    // programs' fire terms are cut at once: the span holds
+                    // no wider fire.
                     Ok(RungStep::Lower(_)) if !waited => Ok(RungStep::Wait),
                     Ok(RungStep::Cap(tokens))
                         if !waited && tokens < super::fire_cap(self.engine) =>
@@ -156,9 +160,9 @@ impl SharedGrow {
                         // Under the pool's lock, as a pass's `raise_now`
                         // lifts it: a cap down past what a pass asks since
                         // is not taken.
-                        let _pool = self.shared.lock().unwrap();
+                        let pool = self.shared.lock().unwrap();
                         let now = super::fire_cap(self.engine);
-                        if tokens < now && self.walk_rows() > tokens {
+                        if tokens < now && self.walk_rows().min(pool.fit_cap()) > tokens {
                             continue;
                         }
                         super::set_fire_cap(self.engine, tokens);
@@ -483,6 +487,33 @@ mod tests {
         assert!(
             super::super::fire_cap(ENGINE) < u32::MAX,
             "past the patience: fires are cut toward the rung asked"
+        );
+    }
+
+    /// A program's fire term the largest rung cannot hold cuts fires to
+    /// the widest rung that fits at once, without the governor's patience:
+    /// a fire wider would take more than the span.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fire_term_past_the_largest_rung_cuts_fires_without_patience() {
+        const ENGINE: usize = 57;
+        let mut pool = super::super::tests::pool();
+        pool.program_registered(
+            ::engine::ProgramId(1),
+            &::engine::ProgramFacts {
+                fire_bytes_fixed: 55 * pool.pool().chunk_bytes(),
+                ..::engine::ProgramFacts::default()
+            },
+        );
+        pool.instance_bound(::engine::InstanceId(1), ::engine::ProgramId(1));
+        assert_eq!(pool.fit_cap(), 256);
+        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+        let grow = SharedGrow::new(0, ENGINE, shared);
+        super::super::set_fire_cap_for_test(ENGINE, u32::MAX);
+        grow.walk_rung().await;
+        assert!(
+            super::super::fire_cap(ENGINE) <= 256,
+            "cut before any tick: {}",
+            super::super::fire_cap(ENGINE)
         );
     }
 }

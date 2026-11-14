@@ -31,12 +31,12 @@ pub struct ProgramFires {
 }
 
 impl ProgramFires {
-    /// The sum over the programs that can be in a fire now.
-    fn sum(&self) -> FireTerm {
+    /// The terms of the programs that can be in a fire now.
+    fn open_terms(&self) -> Vec<FireTerm> {
         self.open
             .keys()
-            .filter_map(|program| self.terms.get(program))
-            .fold(FireTerm::default(), |sum, &term| sum.plus(term))
+            .filter_map(|program| self.terms.get(program).copied())
+            .collect()
     }
 }
 
@@ -46,6 +46,7 @@ pub fn term_of(facts: &ProgramFacts) -> FireTerm {
     FireTerm {
         fixed: facts.fire_bytes_fixed,
         a_lane: facts.fire_bytes_a_lane,
+        max_lanes: facts.max_lanes,
     }
 }
 
@@ -63,21 +64,78 @@ impl SharedPool {
         self.refold();
     }
 
+    /// The chunks an activation may take at most: every chunk but the
+    /// reserved ones and the weights' pinned slots, which no move frees.
+    fn act_room(&self) -> u32 {
+        let room = self.room();
+        room.total_chunks
+            .saturating_sub(room.reserved_chunks)
+            .saturating_sub(room.weight_chunks)
+    }
+
+    /// The widest rung whose activation, the fire terms of the programs
+    /// that can be in a fire included, fits on the device; `None` where
+    /// even the smallest does not. Without a term, the largest.
+    #[must_use]
+    pub fn widest_fit(&self) -> Option<u32> {
+        let rungs = self.pool.rungs();
+        if self.pool.fire().is_empty() {
+            return rungs.last().copied();
+        }
+        let most = self.act_room();
+        rungs
+            .into_iter()
+            .filter(|&rung| self.pool.act_chunks(rung) <= most)
+            .max()
+    }
+
+    /// The widest rung fires may take: [`Self::widest_fit`], the smallest
+    /// where none fits (a bind is refused then), `u32::MAX` without rungs.
+    pub(super) fn fit_rung(&self) -> u32 {
+        if self.pool.fire().is_empty() {
+            return u32::MAX;
+        }
+        self.widest_fit()
+            .or_else(|| self.pool.rungs().first().copied())
+            .unwrap_or(u32::MAX)
+    }
+
+    /// The cap fires may take at a rung of `rung` tokens: `u32::MAX` at the
+    /// largest.
+    #[must_use]
+    pub fn lifted(&self, rung: u32) -> u32 {
+        if self
+            .pool
+            .rungs()
+            .last()
+            .is_none_or(|&largest| rung >= largest)
+        {
+            u32::MAX
+        } else {
+            rung
+        }
+    }
+
+    /// The widest cap fires may take with the programs' fire terms: the
+    /// widest rung that fits, lifted; `u32::MAX` without a term.
+    #[must_use]
+    pub fn fit_cap(&self) -> u32 {
+        self.lifted(self.fit_rung())
+    }
+
     /// One more instance of `program` can be in a fire: its term counts
-    /// from now. Refused where the term leaves no rung room on the device
-    /// at all (the smallest rung's activation past every chunk but the
-    /// reserved ones and the weights' pinned slots).
+    /// from now. Refused where even the smallest rung's activation, the
+    /// term included, cannot fit on the device (past every chunk but the
+    /// reserved ones and the weights' pinned slots); a narrower fit cuts
+    /// fires to the widest rung that does ([`Self::widest_fit`]).
     pub fn open_program(&mut self, program: ProgramId) -> Result<(), String> {
         let first = !self.programs.open.contains_key(&program);
         *self.programs.open.entry(program).or_default() += 1;
         if first {
             self.refold();
-            let room = self.room();
-            let most = room
-                .total_chunks
-                .saturating_sub(room.reserved_chunks)
-                .saturating_sub(room.weight_chunks);
-            if room.act_chunks > most {
+            if self.widest_fit().is_none() {
+                let most = self.act_room();
+                let smallest = self.pool.act_chunks(0);
                 let term = self
                     .programs
                     .terms
@@ -87,9 +145,9 @@ impl SharedPool {
                 self.close_program(program);
                 return Err(format!(
                     "program {program}'s fires need {} bytes and {} bytes a lane beside the \
-                     model's activation, and the smallest rung would then take {} chunks of the \
-                     {most} the device has for it",
-                    term.fixed, term.a_lane, room.act_chunks
+                     model's activation, and the smallest rung would then take {smallest} chunks \
+                     of the {most} the device has for it",
+                    term.fixed, term.a_lane
                 ));
             }
         }
@@ -135,9 +193,11 @@ impl SharedPool {
     }
 
     fn refold(&mut self) {
-        let sum = self.programs.sum();
-        if sum != self.pool.fire() {
-            self.pool.set_fire(sum);
+        let mut terms = self.programs.open_terms();
+        terms.retain(|term| !term.is_zero());
+        terms.sort_unstable();
+        if terms != self.pool.fire() {
+            self.pool.set_fire(terms);
         }
     }
 
@@ -233,11 +293,16 @@ pub async fn take_raise(
     Ok(Some(evacuation))
 }
 
-/// Waits until `shared`'s activation holds what fires may take now (fires
-/// cut to `cap()` rows), the registered programs' fire term included:
-/// where it falls short, the room is asked of `funder` as a rung raise's is,
-/// then the raise taken. What a bind of a program whose term raised the
-/// span waits on before it proceeds.
+/// Waits until `shared`'s activation holds what fires may take now, the
+/// fire terms of the programs that can be in a fire included: fires cut to
+/// `cap()` rows, and no wider than the widest rung that fits with the terms
+/// ([`SharedPool::widest_fit`]). Where the span falls short, the room is
+/// asked of `funder` as a rung raise's is, then the raise taken: every
+/// state chunk in the widened span moved below it and the engine's copy
+/// done before this returns. Where fires are cut wider than the widest
+/// rung that fits, it waits on the walk to cut them
+/// ([`super::SharedGrow`]). What a bind of a program whose term raised the
+/// span waits on before it is sent; an `Err` refuses the bind.
 pub async fn fund_span(
     shared: &Shared,
     cap: impl Fn() -> u32,
@@ -245,19 +310,23 @@ pub async fn fund_span(
     mover: &impl Mover,
 ) -> Result<(), String> {
     loop {
-        let (short, copying, goal) = {
+        let (short, copying, goal, capped) = {
             let pool = shared.lock().unwrap();
             let rows = cap();
+            let goal = pool.rung_for(rows);
             (
                 pool.span_short(rows),
                 pool.copying().is_some(),
-                pool.rung_for(rows),
+                goal,
+                rows <= pool.lifted(goal),
             )
         };
-        if short == 0 && !copying {
+        if short == 0 && !copying && capped {
             return Ok(());
         }
-        if copying {
+        if copying || short == 0 {
+            // A raise's copy is the engine's to take, or the walk is to cut
+            // fires to the widest rung that fits.
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             continue;
         }
