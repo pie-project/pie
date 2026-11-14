@@ -117,6 +117,9 @@ pub struct Context {
     /// bound buffer's.
     #[cfg(target_vendor = "apple")]
     indirect: RefCell<Vec<super::alloc::Slab>>,
+    /// The shared empty binding ([`Context::empty`]).
+    #[cfg(target_vendor = "apple")]
+    empty: std::cell::OnceCell<super::alloc::Slab>,
 }
 
 // SAFETY: `MTLDevice` and `MTLCommandQueue` are documented thread-safe.
@@ -188,6 +191,7 @@ impl Context {
                 sparse: std::cell::OnceCell::new(),
                 barrier: (barrier, std::cell::Cell::new(0)),
                 indirect: RefCell::new(Vec::new()),
+                empty: std::cell::OnceCell::new(),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -335,14 +339,20 @@ impl Context {
         }
     }
 
+    /// The one empty binding every zero-byte buffer shares, made on first
+    /// ask: an empty bind allocates nothing after that.
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     pub(crate) fn empty(&self) -> super::alloc::Slab {
-        RESERVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(target_vendor = "apple")]
         {
-            self.device
-                .newBufferWithLength_options(1, MTLResourceOptions::StorageModeShared)
-                .expect("one byte of shared storage")
+            self.empty
+                .get_or_init(|| {
+                    RESERVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.device
+                        .newBufferWithLength_options(1, MTLResourceOptions::StorageModeShared)
+                        .expect("one byte of shared storage")
+                })
+                .clone()
         }
         #[cfg(not(target_vendor = "apple"))]
         {}

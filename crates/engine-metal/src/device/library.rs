@@ -29,6 +29,10 @@ pub struct Pipelines {
     libraries: RefCell<HashMap<(&'static str, &'static str), Library>>,
     pipelines: RefCell<HashMap<PipelineKey, Pipeline>>,
     compiles: std::cell::Cell<u64>,
+    /// What the device's allocation grew by across every library and
+    /// pipeline build: the driver's share of them, measured (an `outside`
+    /// line of the ledger).
+    built: std::cell::Cell<u64>,
     /// The pool's buffers past the first, each's address less the first's
     /// (`kv_page.h`'s `pie_fc_pool_delta1..3`); none where the pool is one
     /// buffer. Fixed before the first pipeline is built.
@@ -61,6 +65,13 @@ impl Pipelines {
         *self.pool.borrow_mut() = deltas.iter().skip(1).copied().collect();
     }
 
+    /// The device bytes building this shell's libraries and pipelines took,
+    /// measured across each build.
+    #[must_use]
+    pub fn built_bytes(&self) -> u64 {
+        self.built.get()
+    }
+
     #[must_use]
     pub fn compiled(&self) -> u64 {
         self.compiles.get()
@@ -76,6 +87,7 @@ impl Pipelines {
         if let Some(pipeline) = self.pipelines.borrow().get(&key) {
             return Ok(pipeline.clone());
         }
+        let before = device.currentAllocatedSize() as u64;
         let library = self.library(device, fire)?;
         let name = super::ctx::nsstring(fire.entrypoint);
         // Function constants every library may declare (`kv_page.h`): set
@@ -149,6 +161,11 @@ impl Pipelines {
                 why: error.localizedDescription().to_string(),
             })?;
         self.compiles.set(self.compiles.get() + 1);
+        self.built.set(
+            self.built
+                .get()
+                .saturating_add((device.currentAllocatedSize() as u64).saturating_sub(before)),
+        );
         self.pipelines.borrow_mut().insert(key, pipeline.clone());
         Ok(pipeline)
     }
