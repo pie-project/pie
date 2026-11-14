@@ -59,17 +59,6 @@ pub struct Boot<'a> {
 
 const PATCH_ROUTE_DROP: i32 = -1;
 
-/// The rows a lane carries unfolded into a fire (its own rows not counted),
-/// by which a rung's rs scratch is sized and past which a lane is refused.
-///
-/// Compile-only shim (owner: Mac). `engine::fire::UNFOLDED_ROWS` is gone:
-/// the contract ([`engine::fire::rung_rows`]) has a rung's replay scratch
-/// hold the rung's tokens of carried rows, summed over a fire's lanes, and
-/// the runtime asks the rung for max(own, carried). This keeps the value
-/// the constant had until the rs scratch and the refusal follow the rung's
-/// tokens; it goes with that change.
-pub const UNFOLDED_ROWS: u32 = 16;
-
 /// Whether a lane can be read back on the host through `out`.
 fn read_back(out: &poem_exec::feeds::ClassOutput) -> bool {
     out.decl.axis != poem_ir::InputAxis::Lane && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32)
@@ -1064,21 +1053,16 @@ impl PreparedLoad<'_> {
         .unwrap_or(u32::MAX);
         let model_bytes = weights.bytes() + ane_model + u64::from(tables_chunks) * rows.chunk_bytes;
         // Each rung's rs scratch: a fire of the rung's tokens and lanes
-        // replays its own rows and, for each lane, the rows it carries
-        // unfolded into the fire ([`UNFOLDED_ROWS`]).
+        // replays its own rows and the rows its lanes carry in, which the
+        // contract holds to the rung's tokens summed over the lanes
+        // ([`engine::fire::rung_rows`]): its own rows and as many again.
         let rs_room: Vec<u64> = rungs
             .iter()
             .map(|(tokens, _)| match (&rs_layout, &rows.rs) {
                 (Some(layout), Some(_)) => {
                     let lanes = (*tokens).min(boot.budget.max_lanes).max(1);
-                    let unfolded = lanes.saturating_mul(UNFOLDED_ROWS);
-                    crate::rs::Seat::scratch_bytes(
-                        layout,
-                        (*tokens)
-                            .min(boot.budget.max_tokens)
-                            .saturating_add(unfolded),
-                        lanes,
-                    )
+                    let own = (*tokens).min(boot.budget.max_tokens);
+                    crate::rs::Seat::scratch_bytes(layout, own.saturating_add(*tokens), lanes)
                 }
                 _ => 0,
             })
@@ -1568,6 +1552,12 @@ impl Shell {
     /// backed before the runtime opens state in them.
     pub fn commit_span(&mut self, segments: u32) -> Result<()> {
         self.pools.commit_span(segments)
+    }
+
+    /// Each rung's tokens and the bytes of its rs scratch in the span.
+    #[must_use]
+    pub fn rs_rooms(&self) -> Vec<(u32, u64)> {
+        self.arena.rs_rooms()
     }
 
     /// See `Engine::set_rung`: a raise backs the carve of `to` before any
@@ -3657,23 +3647,6 @@ impl Shell {
                 ports.as_ref().and_then(engine::ports::LanePorts::fold),
             )
             .map_err(|error| Fault::program("serve::rs", format!("lane {source}: {error}")))?;
-            // The rows a lane carries in are bounded here, before anything
-            // is encoded: a device-geometry fire's slots are the guest's
-            // (read on the host), so the runtime cannot bound them, and a
-            // lane past the bound is refused by name rather than replayed
-            // past the rung's rs region.
-            if plan.replay > UNFOLDED_ROWS {
-                return Err(Fault::program(
-                    "serve::rs",
-                    format!(
-                        "lane {source} carries {} recurrent rows unfolded into this fire, \
-                         past the {} a lane may carry (engine_metal::serve::UNFOLDED_ROWS); the \
-                         fire is refused and writes nothing",
-                        plan.replay,
-                        UNFOLDED_ROWS
-                    ),
-                ));
-            }
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) && crate::diag::on().rs_trace {
                 eprintln!(
                     "recurrent seat: lane {} rows {} replay {} commit {} gather {:?} scatter {:?}",
@@ -4000,7 +3973,25 @@ impl Shell {
 
         let rs_replay: Vec<i32> = rs_plans.iter().map(|plan| plan.replay as i32).collect();
         let rs_commit: Vec<i32> = rs_plans.iter().map(|plan| plan.commit as i32).collect();
-        let rows_ext = rows.saturating_add(rs_plans.iter().map(|plan| plan.replay).sum::<u32>());
+        let carried = rs_plans.iter().map(|plan| plan.replay).sum::<u32>();
+        // The rows the lanes carry in, summed, are no more than the tokens of
+        // the rung the fire stages in (`engine::fire::rung_rows`): the
+        // runtime asks the rung for them, and its rs scratch holds that many
+        // beside the fire's own rows. Where the device places a lane's rows
+        // only the engine counts them; a count past the rung is a wrong
+        // count, refused by name before anything is encoded.
+        let rung_tokens = self.arena.current_tokens();
+        if rs_active && carried > rung_tokens {
+            return Err(Fault::program(
+                "serve::rs",
+                format!(
+                    "this fire's lanes carry {carried} recurrent rows into it, past the \
+                     {rung_tokens} tokens of the rung it stages in (engine::fire::rung_rows); \
+                     the fire is refused and writes nothing"
+                ),
+            ));
+        }
+        let rows_ext = rows.saturating_add(carried);
         let rs_pages = if rs_active {
             self.rs_buffers
                 .as_ref()
@@ -4017,7 +4008,7 @@ impl Shell {
             let have = self.arena.rs_region().1;
             if need > have {
                 return Err(Fault::Ceiling {
-                    what: "bytes of the rung's rs scratch in the span (its rows and the unfolded rows a lane may hold)",
+                    what: "bytes of the rung's rs scratch in the span (its rows and the rows its lanes carry in)",
                     need,
                     have,
                 });
