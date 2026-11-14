@@ -519,17 +519,22 @@ impl Shell {
     /// ([`Shell::arm_step`]); none where nothing is left.
     #[must_use]
     pub fn arming_room(&self) -> engine::live::ArmingRoom {
-        if self.stepping.is_none() {
+        let Some(st) = self.stepping.as_ref() else {
             return engine::live::ArmingRoom::default();
-        }
+        };
         let (_, pages, _) = self.synthetic_room();
         engine::live::ArmingRoom {
             pages: u32::try_from(pages).unwrap_or(u32::MAX),
             // One record, every piece of it: a synthetic lane's rows are
             // never read back, so a step's lanes share it.
             records: self.pools.record_pieces(),
-            // The full span until the engine names the rung it arms.
-            rung: u32::MAX,
+            // The rung the next step's composition carves: its synthetic
+            // fire lays its arena as a served fire of that bucket does, so
+            // it writes inside that rung's activation chunks and no lower.
+            rung: st
+                .targets
+                .front()
+                .map_or(st.rung, |(bucket, _, _)| self.rung_of(*bucket)),
         }
     }
 
