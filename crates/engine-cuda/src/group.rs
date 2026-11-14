@@ -556,6 +556,20 @@ impl Engine for Group {
 
     /// Each rank moves its band of every slot to and from its own tiers
     /// (CONTRACT-BC 22).
+    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.lead(move |rank| rank.commit_segments(segments))
+    }
+
+    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
+        self.lead(move |rank| rank.release_segments(segments))
+    }
+
+    /// Every rank moves the same chunks and rebases its guests' rings.
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        let evacuation = evacuation.clone();
+        self.lead(move |rank| rank.evacuate(&evacuation))
+    }
+
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         let copy = copy.clone();
         self.lead(move |rank| rank.copy_slots(&copy))

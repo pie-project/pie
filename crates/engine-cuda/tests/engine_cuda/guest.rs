@@ -3,7 +3,7 @@
 //! instances and registers channels as a served one is.
 
 use engine::Engine;
-use engine::channel::ChannelId;
+use engine::channel::{ChannelId, ChannelRegistration};
 use engine::chunk::{ChunkFacts, SlotRole};
 use engine::program::{BoundInstance, Footprint, InstanceBinding, ProgramFacts, RingSlots};
 
@@ -71,6 +71,20 @@ impl Guest {
             .commit_segments(segments)
             .expect("the first segment commits");
         Guest::of(facts, segments * facts.segment_chunks)
+    }
+
+    /// Registers `registration` over the channel slots its ring facts state.
+    pub fn register(&mut self, engine: &mut dyn Engine, registration: ChannelRegistration) {
+        let slots = engine
+            .ring_facts(&registration)
+            .expect("the channel's ring facts")
+            .map_or_else(Vec::new, |facts| self.channel.take(&facts.footprint));
+        engine
+            .register_channel(&ChannelRegistration {
+                slots,
+                ..registration
+            })
+            .expect("the channel registers");
     }
 
     /// The slots an instance of a program with `facts` takes: its tables',

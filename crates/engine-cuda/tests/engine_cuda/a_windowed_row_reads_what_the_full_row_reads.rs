@@ -26,7 +26,7 @@ fn logits(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec<Vec<f3
         page_size: 16,
         context: 1024,
         slots: 1,
-        kv_budget: None,
+        kv_budget: Some(crate::POOL),
         allowance: engine::Allowance::WHOLE,
         ordinal: 0,
         knobs: engine_cuda::Knobs {

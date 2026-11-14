@@ -177,7 +177,10 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
                 max_voxels: Some(128),
                 max_clips: Some(4),
             },
-            residency: Residency::default(),
+            residency: Residency {
+                device_kv_budget: Some(crate::POOL),
+                ..Residency::default()
+            },
             ordinal: 0,
             frames_in_flight: 1,
         })
