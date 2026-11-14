@@ -107,6 +107,80 @@ fn set_fire_cap(engine: usize, tokens: u32) {
     }
 }
 
+/// Per engine, the rung (tokens) an arming step captures bodies of, 0 while
+/// none arms: the pool's activation holds it for as long as it is set (its
+/// capture writes `act_chunks` of it), never lowered under it.
+static ARMING_RUNG: [std::sync::atomic::AtomicU32; RUNG_ENGINES] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; RUNG_ENGINES];
+
+/// `engine`'s lane arms bodies of `rung` (tokens; `u32::MAX` the largest),
+/// or, 0, arms none: the walker raises the pool to it and lowers it no
+/// further until it is moved on.
+pub fn hold_for_arming(engine: usize, rung: u32) {
+    if let Some(held) = ARMING_RUNG.get(engine) {
+        held.store(rung, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The rung `engine`'s arming holds the activation at, 0 where none.
+#[must_use]
+pub fn arming_rung(engine: usize) -> u32 {
+    ARMING_RUNG
+        .get(engine)
+        .map_or(0, |held| held.load(std::sync::atomic::Ordering::Acquire))
+}
+
+/// Of `goal` (the rung fires take) and `arming` (the rung an arming step
+/// captures, 0 none), the one whose activation is wider: what the pool's
+/// activation must hold.
+#[must_use]
+pub fn act_goal(pool: &SharedPool, goal: u32, arming: u32) -> u32 {
+    if arming == 0 {
+        return goal;
+    }
+    let arming = pool.armed_target(arming);
+    if pool.pool().act_chunks(arming) > pool.pool().act_chunks(goal) {
+        arming
+    } else {
+        goal
+    }
+}
+
+/// Whether an arming step of `rung` (tokens) may run over `shared` now: the
+/// activation set aside holds its carve and no state lies in it. Raised in
+/// place where nothing lies in the wider span; where state does, the walker
+/// moves it out first ([`hold_for_arming`]) and the step waits.
+pub fn arm_gate(shared: &Shared, rung: u32) -> Result<(), String> {
+    let mut pool = shared.lock().unwrap();
+    let rung = pool.armed_target(rung);
+    let need = pool.pool().act_chunks(rung);
+    if need > pool.pool().act_reserved() {
+        let raised = pool.copying().is_none()
+            && pool
+                .plan_raise(rung)
+                .ok()
+                .filter(|evacuation| evacuation.moves.is_empty())
+                .is_some_and(|evacuation| pool.apply_rung(&evacuation, 0).is_ok());
+        if !raised {
+            return Err(format!(
+                "an arming step of rung {rung} takes {need} activation chunks and {} are set \
+                 aside; the raise moves state out first",
+                pool.pool().act_reserved()
+            ));
+        }
+    }
+    if pool.copying().is_some() {
+        return Err("a raise's copy is still the engine's".to_string());
+    }
+    let carve = pool.pool().total_chunks() - need;
+    if let Some(&chunk) = pool.pool().held_past(carve).first() {
+        return Err(format!(
+            "state is held in physical chunk {chunk}, inside the carve of rung {rung}"
+        ));
+    }
+    Ok(())
+}
+
 /// The scheduler of `engine` has no step wider than `cap` in flight, and
 /// submits none from here.
 pub fn grant_rung(engine: usize, cap: u32) {
@@ -304,6 +378,24 @@ impl RungWalk {
         current: u64,
         retired: u64,
     ) -> Result<RungStep, RungError> {
+        self.step_arming(pool, goal, 0, cap, granted, current, retired)
+    }
+
+    /// [`Self::step`] while the lane arms bodies of rung `arming` (tokens,
+    /// 0 none, [`arming_rung`]): the activation is raised to it, its state
+    /// moved out first, and never lowered under it, while fires are still
+    /// cut to `goal`'s width.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_arming(
+        &mut self,
+        pool: &SharedPool,
+        goal: u32,
+        arming: u32,
+        cap: u32,
+        granted: u32,
+        current: u64,
+        retired: u64,
+    ) -> Result<RungStep, RungError> {
         let rungs = pool.rungs();
         let Some(&largest) = rungs.last() else {
             return Ok(RungStep::Wait);
@@ -328,7 +420,10 @@ impl RungWalk {
         // within a class only caps fires, never lowers or raises. A
         // program's fire term registered or dropped since moves the span a
         // rung takes ([`programs`]).
-        let want = pool.pool().act_chunks(goal);
+        // What the activation holds: the goal's, or an arming step's where
+        // that is wider (its capture writes its rung's whole span).
+        let target = act_goal(pool, goal, arming);
+        let want = pool.pool().act_chunks(target);
         let have = pool.pool().act_reserved();
         let lifted = if goal == largest { u32::MAX } else { goal };
         if want < have {
@@ -340,25 +435,25 @@ impl RungWalk {
                 return Ok(RungStep::Wait);
             }
             return Ok(match self.lowering {
-                Some((rung, epoch)) if rung == goal => {
+                Some((rung, epoch)) if rung == target => {
                     if retired >= epoch {
                         self.lowering = None;
-                        RungStep::Lower(goal)
+                        RungStep::Lower(target)
                     } else {
                         RungStep::Wait
                     }
                 }
                 _ => {
-                    self.lowering = Some((goal, current));
+                    self.lowering = Some((target, current));
                     RungStep::Wait
                 }
             });
         }
         self.lowering = None;
         if want > have {
-            let evacuation = pool.plan_raise(goal)?;
+            let evacuation = pool.plan_raise(target)?;
             return Ok(RungStep::Raise {
-                rung: goal,
+                rung: target,
                 evacuation,
             });
         }
@@ -1537,6 +1632,21 @@ impl SharedPool {
             .or_else(|| rungs.last().copied())
             .unwrap_or(u32::MAX);
         goal.min(self.fit_rung())
+    }
+
+    /// The pool rung an arming step of `rung` (tokens, `u32::MAX` the full
+    /// span) captures over: the narrowest that holds it, else the largest.
+    /// Not cut to what fits with the programs' fire terms: a capture writes
+    /// its rung's whole span.
+    #[must_use]
+    pub fn armed_target(&self, rung: u32) -> u32 {
+        let rungs = self.pool.rungs();
+        rungs
+            .iter()
+            .copied()
+            .find(|&r| r >= rung)
+            .or_else(|| rungs.last().copied())
+            .unwrap_or(u32::MAX)
     }
 
     /// Every activation rung's tokens, ascending.

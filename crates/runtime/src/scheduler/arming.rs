@@ -209,6 +209,10 @@ pub(crate) const GAP_BUDGET: std::time::Duration = std::time::Duration::from_mil
 /// again, so an idle lane does not take the planner's lock each spin.
 const ROOM_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
 
+/// How long a step whose rung is not yet raised waits before it looks
+/// again: the walker raises it on its own poll.
+const RAISE_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+
 enum State {
     Arming,
     /// `arm_step` answered `false`: never called again for this load.
@@ -250,6 +254,8 @@ impl Arming {
         let arming = matches!(state, State::Arming);
         if arming {
             set(engine_idx, room, true);
+            // The walker raises the pool to the first step's rung now.
+            crate::store::shared::hold_for_arming(engine_idx, room.rung);
             tracing::info!(
                 engine = engine_idx,
                 armed_through = live.armed_through(),
@@ -311,6 +317,21 @@ impl Arming {
         if busy && self.owed_until.is_some_and(|at| now < at) {
             return Step::Waiting;
         }
+        // The room and the rung of this step: the capture writes the rung's
+        // whole activation span, so the pool is raised to it (any state
+        // lent to that span moved out) before the step, and held there
+        // until the rung is armed; no step while it is not.
+        self.room = engine.arming_room();
+        set(self.engine_idx, self.room, true);
+        crate::store::shared::hold_for_arming(self.engine_idx, self.room.rung);
+        if let Some(shared) =
+            crate::store::registry::try_get(0, self.engine_idx).and_then(|stores| stores.shared)
+            && let Err(why) = crate::store::shared::arm_gate(&shared, self.room.rung)
+        {
+            tracing::debug!(engine = self.engine_idx, rung = self.room.rung, %why, "an arming step waits on its rung's raise");
+            self.retry_at = Some(crate::rt::Instant::now() + RAISE_RETRY);
+            return Step::Waiting;
+        }
         let Some(lent) = self.lender.lend(self.engine_idx, self.room, idle) else {
             self.retry_at = Some(crate::rt::Instant::now() + ROOM_RETRY);
             return Step::Waiting;
@@ -356,6 +377,7 @@ impl Arming {
     fn finish(&mut self, state: State) {
         self.state = state;
         set(self.engine_idx, self.room, false);
+        crate::store::shared::hold_for_arming(self.engine_idx, 0);
     }
 }
 
@@ -363,6 +385,7 @@ impl Drop for Arming {
     fn drop(&mut self) {
         if matches!(self.state, State::Arming) {
             set(self.engine_idx, self.room, false);
+            crate::store::shared::hold_for_arming(self.engine_idx, 0);
         }
     }
 }

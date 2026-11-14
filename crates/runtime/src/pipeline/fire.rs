@@ -649,10 +649,23 @@ impl RaiseFunding {
                 if crate::store::shared::fire_cap(engine) >= target {
                     return;
                 }
+                // A rung not armed yet is armed over its own span first:
+                // the raise its capture needs is this pass's to fund too.
+                let target = |pool: &crate::store::shared::SharedPool| {
+                    let goal = crate::store::shared::rung_goal(pool, engine, rows);
+                    if rows > crate::engine::live(engine).armed_through() {
+                        crate::store::shared::act_goal(
+                            pool,
+                            goal,
+                            crate::store::shared::arming_rung(engine),
+                        )
+                    } else {
+                        goal
+                    }
+                };
                 let pages = {
                     let pool = shared.lock().unwrap();
-                    pool.raise_short(crate::store::shared::rung_goal(&pool, engine, rows))
-                        .1
+                    pool.raise_short(target(&pool)).1
                 };
                 if pages == 0 {
                     // The rung is not armed yet: the lane arms it between
@@ -710,12 +723,9 @@ impl RaiseFunding {
                             engine,
                             epoch_now: &epoch_now,
                         };
-                        let taken = crate::store::shared::programs::take_raise(
-                            &shared,
-                            |pool| crate::store::shared::rung_goal(pool, engine, rows),
-                            &mover,
-                        )
-                        .await;
+                        let taken =
+                            crate::store::shared::programs::take_raise(&shared, target, &mover)
+                                .await;
                         if let Err(error) = taken {
                             tracing::error!(engine, %error, "a raise's copy was refused");
                             *failed.lock().unwrap() = Some(error);

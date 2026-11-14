@@ -708,6 +708,113 @@ fn the_rung_walk_caps_fires_then_lowers_and_raises_back_with_an_evacuation() {
     );
 }
 
+/// Cold arming: a lowered rung has lent the span to state (the decoders'
+/// first pages) and the lane arms a wider rung, whose capture writes that
+/// rung's whole span. No step runs while state lies there: the walk raises
+/// the pool to the arming rung (fires still cut narrow), the state moved out
+/// first and its slots untouched, and only then may the step run.
+#[test]
+fn an_arming_step_of_a_wider_rung_waits_for_the_raise_that_moves_state_out() {
+    let facts = facts();
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    pool.lower_rung(16).unwrap();
+    let all = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
+    let kept: Vec<u32> = all[all.len() - 6..].to_vec();
+    pool.give_records(&all[..all.len() - 6]);
+    pool.pool_mut().retire_through(u64::MAX);
+    let span = TOTAL - pool.pool().act_chunks(2048);
+    let in_way = |pool: &SharedPool| {
+        kept.iter()
+            .flat_map(|&r| pool.record_slots(r))
+            .filter(|slot| pool.pool().physical(slot.chunk).unwrap() >= span)
+            .count()
+    };
+    assert!(in_way(&pool) > 0, "state lies in the wider rung's span");
+    let refs_before: Vec<_> = kept.iter().map(|&r| pool.record_refs(r)).collect();
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    assert!(
+        crate::store::shared::arm_gate(&shared, 2048).is_err(),
+        "an arming step ran over state lent to its span"
+    );
+    let mut pool = Arc::try_unwrap(shared).unwrap().into_inner().unwrap();
+    // Fires ask the smallest rung; the lane arms the largest.
+    let mut walk = RungWalk::default();
+    let RungStep::Raise { rung, evacuation } =
+        walk.step_arming(&pool, 16, 2048, 16, 16, 9, 9).unwrap()
+    else {
+        panic!("the arming rung's raise comes first");
+    };
+    assert_eq!(rung, 2048);
+    assert!(!evacuation.moves.is_empty(), "state in the span moves out");
+    engine
+        .evacuate(&SharedPool::rung_moves(&evacuation))
+        .unwrap();
+    pool.apply_rung(&evacuation, 10).unwrap();
+    pool.pool_mut().retire_through(u64::MAX);
+    assert_eq!(in_way(&pool), 0);
+    let refs_after: Vec<_> = kept.iter().map(|&r| pool.record_refs(r)).collect();
+    assert_eq!(
+        refs_before, refs_after,
+        "the state's slots are its own still"
+    );
+    for &record in &kept {
+        let lane = Lane {
+            tokens: vec![1],
+            fixed: pool.lane_fixed(record, record),
+            ..Lane::default()
+        };
+        engine.fire(&facts, &lane, pool.pool().act_chunks(2048));
+    }
+    // Fires stay cut to the rung they asked: no cap lifts for arming.
+    assert_eq!(
+        walk.step_arming(&pool, 16, 2048, 16, 16, 10, 10).unwrap(),
+        RungStep::Wait
+    );
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    crate::store::shared::arm_gate(&shared, 2048).expect("the step may run now");
+}
+
+/// Between two steps of the rung being armed the pool is never lowered
+/// under it, however long fires ask only the smallest rung: no state is
+/// lent back to a span a later step of the rung captures over.
+#[test]
+fn no_lower_lends_the_span_back_between_steps_of_the_rung_being_armed() {
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.rung(), 2048);
+    let mut walk = RungWalk::default();
+    for epoch in 10..40 {
+        let step = walk
+            .step_arming(&pool, 16, 2048, 16, 16, epoch, epoch)
+            .unwrap();
+        assert!(
+            !matches!(step, RungStep::Lower(_)),
+            "lowered under the rung being armed: {step:?}"
+        );
+    }
+    // The rung armed: the hold goes and the walk lowers as before.
+    let mut walk = RungWalk::default();
+    let lowered = (10..40).any(|epoch| {
+        matches!(
+            walk.step_arming(&pool, 16, 0, 16, 16, epoch, epoch)
+                .unwrap(),
+            RungStep::Lower(16)
+        )
+    });
+    assert!(lowered, "with no arming hold the walk lowers");
+}
+
 /// Rungs by demand: the rung a pass's rows ask for, and what a raise lacks
 /// while state fills the span the larger rung's fires take; once some of it
 /// goes, the raise moves what is left in the span down.

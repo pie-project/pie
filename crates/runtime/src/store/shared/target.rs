@@ -107,9 +107,10 @@ impl SharedGrow {
                         true
                     }
                 };
-                let step = self.rung_walk.lock().unwrap().step(
+                let step = self.rung_walk.lock().unwrap().step_arming(
                     &pool,
                     goal,
+                    super::arming_rung(self.engine),
                     super::fire_cap(self.engine),
                     super::rung_granted(self.engine),
                     current,
@@ -177,8 +178,15 @@ impl SharedGrow {
                 RungStep::Lower(rung) => {
                     let lowered = {
                         let mut pool = self.shared.lock().unwrap();
-                        // A pass lifted the cap since the walk capped it.
-                        if super::fire_cap(self.engine) > rung {
+                        // A pass lifted the cap since the walk capped it,
+                        // or an arming step holds a wider span since.
+                        if super::fire_cap(self.engine) > rung
+                            || pool.pool().act_chunks(super::act_goal(
+                                &pool,
+                                rung,
+                                super::arming_rung(self.engine),
+                            )) > pool.pool().act_chunks(rung)
+                        {
                             continue;
                         }
                         pool.lower_rung(rung)
