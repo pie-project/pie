@@ -520,7 +520,8 @@ pub(super) enum QueuedItem {
 /// last slept with nothing to do, so a batch that breathes between its
 /// steps does not move the rung back and forth each step. A raise the ask
 /// cannot take at once is funded under one of the batch's passes, and the
-/// batch's launches wider than a row wait for it ([`Self::waits`]).
+/// pipelines it carries wider than a row wait for it, before admission
+/// ([`Self::waits`]).
 #[derive(Default)]
 struct BatchWant {
     /// The rows asked, the ask, and the cap the raise toward them reaches.
@@ -600,11 +601,14 @@ impl BatchWant {
         }
     }
 
-    /// Whether the batch's launches wider than a row wait for the raise its
-    /// ask is funded for: a wave arriving at a lowered rung is cut at the
-    /// rung it asked, never at the narrower one standing, as a pass waits
-    /// for its own raise. A raise whose room is refused holds nothing (the
-    /// passes' own asks say so by name).
+    /// Whether the batch's wider launches wait for the raise the ask is
+    /// funded for: a wave arriving at a lowered rung is cut at the rung it
+    /// asked, never at the narrower one standing, as a pass waits for its
+    /// own raise. They wait at the gate, before admission, each pipeline
+    /// whole and in order (`scan_queue`): an admitted launch held back
+    /// while one behind it in its pipeline went would advance its channels'
+    /// cursors out of order. A raise whose room is refused holds nothing
+    /// (the passes' own asks say so by name).
     fn waits(&self, engine: usize) -> bool {
         self.funding
             .as_ref()
@@ -914,7 +918,7 @@ impl FromIterator<QueuedItem> for PendingQueue {
 #[derive(Default)]
 struct ScanCache {
     scan: QueueScan,
-    taken_at: Option<(u64, bool)>,
+    taken_at: Option<(u64, bool, bool)>,
 }
 
 type SlotBuffer = Vec<Vec<Option<Box<PendingRequest>>>>;
@@ -1377,8 +1381,9 @@ impl BatchScheduler {
                 limits.max_forward_tokens,
             );
             // A raise the ask cannot take at once is funded under a queued
-            // pass's process, and the wave's launches wider than a row wait
-            // for it rather than be cut at the rung standing; decodes go on.
+            // pass's process, and the pipelines it carries wider than a row
+            // wait for it at the gate rather than be cut at the rung
+            // standing; decodes and controls (the raise's own) go on.
             batch_want.fund(engine_id, || {
                 pending.items.iter().find_map(|item| match item {
                     QueuedItem::Launch(launch) if launch.request.request.rung_rows() > 1 => {
@@ -1388,7 +1393,6 @@ impl BatchScheduler {
                 })
             });
             let raise_waits = batch_want.waits(engine_id);
-            let held_past = if raise_waits { 1 } else { usize::MAX };
             let cap = crate::store::shared::fire_cap(engine_id);
             let mut stepped = limits;
             stepped.max_forward_tokens = stepped.max_forward_tokens.min(cap as usize).max(1);
@@ -1415,7 +1419,7 @@ impl BatchScheduler {
                 &mut scan_cache,
                 &mut slot_buffer,
                 stopping,
-                held_past,
+                raise_waits,
             );
             progress |= dispatched;
             if stopping
@@ -2130,7 +2134,7 @@ impl BatchScheduler {
         scan_cache: &mut ScanCache,
         slot_buffer: &mut SlotBuffer,
         stopping: bool,
-        held_past: usize,
+        raise_waits: bool,
     ) -> (bool, Option<Duration>) {
         let (mut progress, wait_hint) = Self::dispatch_frame_work(
             scan_cache,
@@ -2146,7 +2150,7 @@ impl BatchScheduler {
             limits,
             stats,
             stopping,
-            held_past,
+            raise_waits,
         );
         let mut close_rotations = 0usize;
         let mut rotated = false;
@@ -2328,8 +2332,9 @@ impl BatchScheduler {
         cache: &'a mut ScanCache,
         pending: &PendingQueue,
         stopping: bool,
+        raise_waits: bool,
     ) -> &'a QueueScan {
-        if cache.taken_at == Some((pending.epoch(), stopping)) {
+        if cache.taken_at == Some((pending.epoch(), stopping, raise_waits)) {
             return &cache.scan;
         }
         let scan = &mut cache.scan;
@@ -2339,6 +2344,17 @@ impl BatchScheduler {
                 QueuedItem::Launch(launch) => {
                     if stopping {
                         scan.drain_eligible.push(launch.fire_id);
+                    }
+                    // While the batch's funded raise is pending, a launch
+                    // wider than a row is not admitted, nor anything its
+                    // pipeline queued behind it: the pipeline waits whole and
+                    // in order, before admission, and is cut at the raised
+                    // rung once it lands. Other pipelines go on.
+                    if raise_waits
+                        && launch.request.request.rung_rows() > 1
+                        && let Some(pipeline) = launch.pipeline_id
+                    {
+                        scan.blocked_lanes.insert(pipeline);
                     }
                     // A launch never overtakes a copy its pipeline queued
                     // ahead of it: the copy fills what the launch reads.
@@ -2363,7 +2379,7 @@ impl BatchScheduler {
             }
         }
         scan.queued_ids.seal();
-        cache.taken_at = Some((pending.epoch(), stopping));
+        cache.taken_at = Some((pending.epoch(), stopping, raise_waits));
         &cache.scan
     }
 
@@ -2382,7 +2398,7 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
         stopping: bool,
-        held_past: usize,
+        raise_waits: bool,
     ) -> (bool, Option<Duration>) {
         let mut progress = false;
         let mut wait_hint: Option<Duration> = None;
@@ -2426,7 +2442,7 @@ impl BatchScheduler {
                 break;
             }
             let now = Instant::now();
-            let scan = Self::scan_queue(scan_cache, pending, stopping);
+            let scan = Self::scan_queue(scan_cache, pending, stopping, raise_waits);
             if wave_trace() {
                 wave_trace_emit(format!(
                     "[wave-trace] t={}us plan in_flight={}",
@@ -2498,7 +2514,6 @@ impl BatchScheduler {
                 limits,
                 stats,
                 &waves,
-                held_past,
             );
             progress |= frame_progress;
             if !posted {
@@ -2555,7 +2570,6 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
         waves: &[Vec<u64>],
-        held_past: usize,
     ) -> (bool, bool) {
         let mut progress = false;
         let mut slot_of: HashMap<u64, (usize, usize)> =
@@ -2577,11 +2591,9 @@ impl BatchScheduler {
         while let Some(item) = pending.pop_front() {
             match item {
                 // Past the pool's activation rung (SPEC decision 6): it waits
-                // until the rung is back; wider than `held_past` (a row while
-                // the batch's funded raise is pending), until the raise lands.
+                // until the rung is back.
                 QueuedItem::Launch(launch)
-                    if launch.request.request.rung_rows()
-                        > limits.max_forward_tokens.min(held_past) =>
+                    if launch.request.request.rung_rows() > limits.max_forward_tokens =>
                 {
                     kept.push_back(QueuedItem::Launch(launch));
                 }
@@ -3202,13 +3214,70 @@ mod tests {
             &mut ScanCache::default(),
             &mut SlotBuffer::new(),
             false,
-            usize::MAX,
+            false,
         );
         assert!(!progress, "nothing left the queue");
         assert_eq!(pending.len(), 2);
         lane.shutdown();
     }
 
+    /// The poisoned channel of 200e89ccd: a pipeline's prompt launch was
+    /// admitted to a frame and then held for the batch's pending raise, while
+    /// the one-row launch queued behind it went, advancing its channels'
+    /// cursors between the engine's gate and the prompt's epilogue. The wait
+    /// is now at the gate: the pipeline is not admitted at all, whole and in
+    /// order, while other pipelines' decodes are.
+    #[test]
+    fn a_pipeline_behind_a_pending_raise_waits_whole_and_in_order() {
+        let (wide, other) = (ProcessId::from_u128(5), ProcessId::from_u128(6));
+        let launch = |id: u64, pipeline: ProcessId, rows: usize, framed: bool| {
+            QueuedItem::Launch(QueuedLaunch::new(Box::new(PendingRequest {
+                lora_program: false,
+                logical_fire_id: id,
+                request: fire_of(id as u32..id as u32 + 1, rows),
+                instance_id: ::engine::InstanceId(id),
+                completion: crate::engine::WorkItemCompletion::new(1, 0),
+                process_id: Some(pipeline),
+                pipeline_id: Some(pipeline),
+                prelaunch_copy: None,
+                prelaunch_state_copy: None,
+                frame: framed.then_some(FrameStamp {
+                    lane: pipeline,
+                    seq: id,
+                    slot: 0,
+                    fires: 1,
+                }),
+            })))
+        };
+        for framed in [false, true] {
+            let mut pending = PendingQueue::default();
+            pending.push_back(launch(1, wide, 125, framed));
+            pending.push_back(launch(2, wide, 1, framed));
+            pending.push_back(launch(3, other, 1, framed));
+            let mut cache = ScanCache::default();
+            let scan = BatchScheduler::scan_queue(&mut cache, &pending, false, true);
+            assert!(
+                scan.blocked_lanes.contains(&wide),
+                "the wide pipeline waits at the gate (framed {framed})"
+            );
+            assert!(!scan.blocked_lanes.contains(&other), "a decode goes on");
+            if !framed {
+                assert_eq!(
+                    scan.untracked,
+                    [3],
+                    "nothing of the wide pipeline is admitted"
+                );
+            }
+            // The raise lands: the pipeline is admitted in order.
+            let scan = BatchScheduler::scan_queue(&mut cache, &pending, false, false);
+            assert!(!scan.blocked_lanes.contains(&wide));
+            if !framed {
+                assert_eq!(scan.untracked, [1, 3], "its head first");
+            }
+        }
+    }
+
+    #[test]
     fn a_launch_waits_for_the_copy_queued_ahead_of_it() {
         let pipeline = ProcessId::from_u128(5);
         let request = PendingRequest {
@@ -3226,13 +3295,13 @@ mod tests {
         let mut pending = PendingQueue::default();
         BatchScheduler::queue_attempt(&mut pending, request);
         let mut cache = ScanCache::default();
-        let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
+        let scan = BatchScheduler::scan_queue(&mut cache, &pending, false, false);
         assert!(scan.untracked.is_empty(), "behind its copy");
         // The copy is dispatched: the launch rides.
         let copy = pending.pop_front();
         assert!(matches!(copy, Some(QueuedItem::PreLaunchCopy { .. })));
         let mut cache = ScanCache::default();
-        let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
+        let scan = BatchScheduler::scan_queue(&mut cache, &pending, false, false);
         assert_eq!(scan.untracked, [9]);
     }
 
