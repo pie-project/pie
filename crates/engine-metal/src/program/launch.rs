@@ -914,7 +914,7 @@ impl Prepared {
             return Ok(());
         }
         let scratch = self.scratch.get()?;
-        frame.fill(scratch.slab(), 0, scratch.bytes())?;
+        frame.fill(scratch.slab(), 0, probe_fill_len(scratch.bytes()))?;
         frame.next_pass()?;
         Ok(())
     }
@@ -1505,7 +1505,7 @@ impl Batch {
         if !scratch_zeroing_skipped() {
             #[cfg(target_vendor = "apple")]
             {
-                frame.fill(self.scratch.slab(), 0, u64::from(count) * stride)?;
+                frame.fill(self.scratch.slab(), 0, probe_fill_len(u64::from(count) * stride))?;
                 frame.next_pass()?;
             }
             #[cfg(not(target_vendor = "apple"))]
@@ -2010,5 +2010,16 @@ mod tests {
                  {LIBRARY_SAMPLER_THREADS}, so this dispatch's width is a guess"
             );
         }
+    }
+}
+
+/// PROBE (M5 fill): with `PIE_TINY_FILL` set, a scratch zero fill keeps its
+/// blit pass where it was but fills only its first 256 bytes.
+fn probe_fill_len(len: u64) -> u64 {
+    static TINY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *TINY.get_or_init(|| std::env::var_os("PIE_TINY_FILL").is_some()) {
+        len.min(256)
+    } else {
+        len
     }
 }
