@@ -486,8 +486,31 @@ pub fn store_words(r: &Reader, u: &Unit, py: u32, px: u32) -> (u32, u32) {
 /// `u`'s layout: the fewest rest roots whose every tile (at most `tile` words) and held rows
 /// fit. Rows held over the barrier that outgrow the row roots go to the row store
 /// ([`Layout::spill`]; `spill`: always, where any are held); a unit whose rows outgrow its roots
-/// otherwise is refused by what it holds.
-pub fn layout(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool) -> R<Layout> {
+/// otherwise is refused by what it holds. With `widen` (quarters), a unit whose column regions
+/// run on its rest roots takes the fewest that fit at least `widen / 4` more than the fewest.
+pub fn layout(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool, widen: u32) -> R<Layout> {
+    let l0 = layout_fewest(r, u, py, tile, spill, 0)?;
+    let rest0 = l0.px() - l0.heads;
+    let on_rest = u.steps.iter().any(|s| match s {
+        Step::Region {
+            side: Side::Col,
+            chain,
+        } => {
+            l0.region_at(Side::Col, chain.region.width, &region_cols(r, chain))
+                .first
+                == l0.heads
+        }
+        _ => false,
+    });
+    if widen == 0 || !on_rest || rest0 == 0 {
+        return Ok(l0);
+    }
+    let want = rest0 + (rest0 * widen).div_ceil(4);
+    Ok(layout_fewest(r, u, py, tile, spill, want).unwrap_or(l0))
+}
+
+/// [`layout`]'s fewest rest roots from `from` on.
+fn layout_fewest(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool, from: u32) -> R<Layout> {
     let (host, over) = row_held_words(r, u, py);
     if host > ROOT_BUDGET {
         return Err(held_refusal(u, "row", host, over));
@@ -499,7 +522,7 @@ pub fn layout(r: &Reader, u: &Unit, py: u32, tile: u32, spill: bool) -> R<Layout
     };
     let mut short: Option<(u32, u32)> = None;
     let mut unstored = false;
-    for rest in 0..=MAX_REST {
+    for rest in from..=MAX_REST {
         let Some(l) = layout_with(r, u, py, rest) else {
             continue;
         };

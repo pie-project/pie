@@ -236,6 +236,8 @@ pub struct Pins {
     /// [`build::program_py`]; `py 16`, `tile 12288`: flux2-mini as M1d built it).
     pub py: Option<u32>,
     pub tile: Option<u32>,
+    /// The K / V columns' cut (`None`: the cost model's choice of [`build::KV_SPLITS`]).
+    pub kv: Option<build::KvSplit>,
     /// Every unit's rows held over the barrier in its row store, not at its roots (a test of
     /// the store at rows the roots would hold).
     pub spill: bool,
@@ -273,7 +275,7 @@ pub fn compile_pinned(
         ),
     )?;
     let p = build::program_py(
-        trace, s, o.round16, o.upto, &o.taps, pins.py, pins.tile, pins.spill,
+        trace, s, o.round16, o.upto, &o.taps, pins.py, pins.tile, pins.kv, pins.spill,
     )?;
     let e = crate::emit::stream::emit(&p)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;

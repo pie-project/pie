@@ -44,7 +44,8 @@ const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <
      wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]\n       \
      wafer-compile stream --model <deployment> [--reading R] [--rows N] [--ieee] --out <dir> \
      [--values <dir>] [--stages N] [--tap v,..] [--py N] [--tile W] [--spill] \
-     [--class-rows context=512,latents=4096] [--price context=512,latents=4096]";
+     [--cut THIN,SUB,WIDEN] [--class-rows context=512,latents=4096] \
+     [--price context=512,latents=4096 [--parts]]";
 
 fn main() {
     if let Err(e) = run() {
@@ -267,9 +268,24 @@ fn stream(args: &[String]) -> Result<(), String> {
         upto,
         taps,
     };
+    // `--cut T,S,W`: K / V PEs at 1 / T of their entries over S columns a head, W quarters more
+    // rest roots
+    let kv = get("--cut")
+        .map(|v| -> Result<_, String> {
+            let n: Vec<u32> = v
+                .split(',')
+                .map(|x| x.parse().map_err(|e| format!("--cut {v}: {e}")))
+                .collect::<Result<_, _>>()?;
+            let [thin, sub, widen] = n[..] else {
+                return Err(format!("--cut {v}: THIN,SUB,WIDEN"));
+            };
+            Ok(kernels_cerebras::stream::build::KvSplit { thin, sub, widen })
+        })
+        .transpose()?;
     let pins = kernels_cerebras::stream::Pins {
         py,
         tile,
+        kv,
         spill: args.iter().any(|a| a == "--spill"),
         class_rows: kernels_cerebras::stream::parse_rows(&get("--class-rows").unwrap_or_default())?,
     };

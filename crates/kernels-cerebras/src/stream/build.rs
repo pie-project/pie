@@ -35,7 +35,58 @@ pub fn kv_entries(q_heads: u32, head_dim: u32) -> u32 {
 /// entries ask, rows `p` kept by PE `p % pya`).
 #[must_use]
 pub fn kv_pya(rows: u32, q_heads: u32, head_dim: u32) -> u32 {
-    rows.div_ceil(kv_entries(q_heads, head_dim)).max(PYA)
+    kv_pya_split(rows, q_heads, head_dim, KvSplit::default())
+}
+
+/// How a program's roots and K / V columns are cut past the fewest that fit: a K / V column's
+/// PEs keep at most `1 / thin` of the entries a PE can hold (more PEs a head, a query's work
+/// over more of them), over `sub` columns a head; a unit whose column regions run on its rest
+/// roots takes `widen` quarters more of them than the fewest its tiles fit (smaller chunks: the
+/// spare fabric spent on the regions).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct KvSplit {
+    pub thin: u32,
+    pub sub: u32,
+    pub widen: u32,
+}
+
+impl Default for KvSplit {
+    fn default() -> KvSplit {
+        KvSplit {
+            thin: 1,
+            sub: 1,
+            widen: 0,
+        }
+    }
+}
+
+/// The cuts the search tries: the fewest rest roots, a quarter and a half more of them. (A K /
+/// V column over several columns, `wafer-compile stream --cut`, builds for flux2-mini;
+/// at klein's 24 heads the links from the head roots to columns two wide meet more K / V
+/// chains than the palette's colours, so the search does not try it.)
+pub const KV_SPLITS: [KvSplit; 3] = [
+    KvSplit {
+        thin: 1,
+        sub: 1,
+        widen: 0,
+    },
+    KvSplit {
+        thin: 1,
+        sub: 1,
+        widen: 1,
+    },
+    KvSplit {
+        thin: 1,
+        sub: 1,
+        widen: 2,
+    },
+];
+
+/// [`kv_pya`] at a cut.
+#[must_use]
+pub fn kv_pya_split(rows: u32, q_heads: u32, head_dim: u32, kv: KvSplit) -> u32 {
+    let per = (kv_entries(q_heads, head_dim) / kv.thin.max(1)).max(1);
+    rows.div_ceil(per).max(PYA)
 }
 
 /// A unit as built: its steps, layout, printed regions (by step index) and place on the stream.
@@ -155,7 +206,7 @@ pub fn program_upto(
     upto: Option<usize>,
     taps: &[u32],
 ) -> R<Program> {
-    program_py(trace, shape, round16, upto, taps, None, None, false)
+    program_py(trace, shape, round16, upto, taps, None, None, None, false)
 }
 
 /// The row roots a unit may take: the divisors of the hidden width that leave a CX root at
@@ -189,27 +240,35 @@ pub fn program_py(
     taps: &[u32],
     py: Option<u32>,
     tile: Option<u32>,
+    kv: Option<KvSplit>,
     spill: bool,
 ) -> R<Program> {
     let bounds = Bounds::system();
+    // (row roots and tiles both pinned: the program as pinned, its cut the plain one unless
+    // pinned too; flux2-mini's `--py 16 --tile 12288` is M1d's full step)
+    let kvs: Vec<KvSplit> = match kv {
+        Some(k) => vec![k],
+        None if py.is_some() && tile.is_some() => vec![KvSplit::default()],
+        None => KV_SPLITS.to_vec(),
+    };
     let hidden = shape.program.hidden;
     let pys = match py {
         Some(p) => vec![p],
         None => py_candidates(hidden, bounds),
     };
-    let cands: Vec<(u32, u32)> = pys
-        .iter()
-        .flat_map(|&p| {
-            let tiles: Vec<u32> = match tile {
-                Some(t) => vec![t],
-                None => TILE_FRACTIONS
-                    .iter()
-                    .map(|&(a, b)| place::TILE_BUDGET * a / b)
-                    .collect(),
-            };
-            tiles.into_iter().map(move |t| (p, t))
-        })
-        .collect();
+    let tiles: Vec<u32> = match tile {
+        Some(t) => vec![t],
+        None => TILE_FRACTIONS
+            .iter()
+            .map(|&(a, b)| place::TILE_BUDGET * a / b)
+            .collect(),
+    };
+    let mut cands: Vec<(u32, u32, KvSplit)> = Vec::new();
+    for &p in &pys {
+        for &t in &tiles {
+            cands.extend(kvs.iter().map(|&k| (p, t, k)));
+        }
+    }
     // built a few at a time (a whole-wafer program is large), the cheapest kept
     let mut best: Option<(f64, Program)> = None;
     let mut errs: Vec<(u32, u32, String)> = Vec::new();
@@ -217,11 +276,12 @@ pub fn program_py(
         let tried: Vec<(u32, u32, R<Program>)> = std::thread::scope(|sc| {
             let hs: Vec<_> = group
                 .iter()
-                .map(|&(p, tile)| {
+                .map(|&(p, tile, kv)| {
                     let shape = shape.clone();
                     sc.spawn(move || {
-                        let r =
-                            program_at(trace, shape, round16, upto, taps, p, tile, spill, bounds);
+                        let r = program_at(
+                            trace, shape, round16, upto, taps, p, tile, kv, spill, bounds,
+                        );
                         (p, tile, r)
                     })
                 })
@@ -276,6 +336,7 @@ pub fn program_at(
     taps: &[u32],
     py: u32,
     tile: u32,
+    split: KvSplit,
     spill: bool,
     bounds: Bounds,
 ) -> R<Program> {
@@ -412,7 +473,7 @@ pub fn program_at(
             word,
             prologue: u.classes.is_empty(),
         };
-        let layout = place::layout(&r, &u, py, tile, spill)?;
+        let layout = place::layout(&r, &u, py, tile, spill, split.widen)?;
         let mut regions = BTreeMap::new();
         for (i, s) in u.steps.iter().enumerate() {
             let Step::Region { side, chain } = s else {
@@ -580,10 +641,17 @@ pub fn program_at(
     let qh = shape.attn.q_heads / shape.attn.kv_heads.max(1);
     let pya = kv
         .iter()
-        .map(|k| kv_pya(k.stores.iter().map(|s| s.1).sum(), qh, shape.attn.head_dim))
+        .map(|k| {
+            kv_pya_split(
+                k.stores.iter().map(|s| s.1).sum(),
+                qh,
+                shape.attn.head_dim,
+                split,
+            )
+        })
         .max()
         .unwrap_or(PYA);
-    let stream = Stream::of(&requests, py, &asks, &blocks, heads, pya, bounds)?;
+    let stream = Stream::of(&requests, py, &asks, &blocks, heads, pya, split.sub, bounds)?;
     let wiring = stream.wiring();
     let floor = stream.floor();
     let palette = Palette::allocate(Vec::new(), &floor, &wiring)?;
@@ -658,6 +726,7 @@ mod tests {
             &[],
             Some(16),
             Some(place::TILE_BUDGET),
+            None,
             true,
         )
         .unwrap_or_else(|e| panic!("{e}"));
@@ -674,7 +743,7 @@ mod tests {
         assert!(file("cx_3_0.csl").contains("fab.fin(q_ci, 16)"));
     }
 
-    /// The PEs of one kind share their images: a unit's CX roots one file, a K / V column's PEs
+    /// The PEs of one kind share their images: a unit's CX roots a few files, a K / V column's PEs
     /// one file and colours, their differences (lane drains, a PE's index in its column) the
     /// config words the host writes; identical kernels across units one file.
     #[test]
@@ -694,9 +763,11 @@ mod tests {
             let at = layout.find(&pre).expect("a PE's code") + pre.len();
             &layout[at..at + layout[at..].find('"').expect("a file")]
         };
+        // (a unit's lane words may fall on its roots' chunks unevenly: a few files then)
         for su in &p.stream.units {
-            let f = code(su.cx(0));
-            assert!((1..su.rows()).all(|j| code(su.cx(j)) == f), "{}", su.name);
+            let files: std::collections::BTreeSet<&str> =
+                (0..su.rows()).map(|j| code(su.cx(j))).collect();
+            assert!(files.len() <= 4, "{}: {files:?}", su.name);
         }
         // (file, params): an image; the memcpy params' column aside
         let images: std::collections::BTreeSet<(&str, &str)> = layout

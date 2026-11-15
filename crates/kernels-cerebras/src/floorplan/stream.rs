@@ -84,7 +84,8 @@ impl StreamUnit {
 }
 
 /// A K / V column a kv head of one attending block: its root under the first unit's head
-/// column, `pya` attention PEs below it.
+/// columns (`sub` of them a head), `pya` attention PEs below it, a snake over `sub` columns
+/// (down the first, up the next, ...) so a long column takes `pya / sub` rows of the band.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct KvColumn {
     pub block: u32,
@@ -92,6 +93,7 @@ pub struct KvColumn {
     /// The block's units, the first on the path first.
     pub units: Vec<usize>,
     pub pya: u32,
+    pub sub: u32,
 }
 
 /// The lane bus: from the lane root (the lane unit's corner) up its CX column, along row 0, and
@@ -152,17 +154,29 @@ impl KvColumn {
     #[must_use]
     pub fn root(&self, s: &Stream) -> Coord {
         let u = &s.units[self.units[0]];
-        Coord::new(u.x + 1 + self.head, u.y + s.py + 2 + self.head)
+        Coord::new(
+            u.x + 1 + self.head * self.sub.max(1),
+            u.y + s.py + 2 + self.head,
+        )
     }
 
-    /// Attention PE `k` of the column.
+    /// The rows its PEs take below its root.
+    #[must_use]
+    pub fn rows(&self) -> u32 {
+        self.pya.div_ceil(self.sub.max(1))
+    }
+
+    /// Attention PE `k` of the column: down its first sub-column, up the next, ...
     #[must_use]
     pub fn pe(&self, s: &Stream, k: u32) -> Coord {
         let r = self.root(s);
-        Coord::new(r.x, r.y + 1 + k)
+        let n = self.rows();
+        let (c, i) = (k / n, k % n);
+        let dy = if c % 2 == 0 { i } else { n - 1 - i };
+        Coord::new(r.x + c, r.y + 1 + dy)
     }
 
-    /// The route from unit `k`'s head root down (and west) to the column's root.
+    /// The route from unit `k`'s head root down, and west or east, to the column's root.
     #[must_use]
     pub fn link(&self, s: &Stream, k: usize) -> Vec<Coord> {
         let root = self.root(s);
@@ -170,8 +184,8 @@ impl KvColumn {
         let top = u.cy(self.head);
         let mut pts: Vec<Coord> = (top.y..=root.y).map(|y| Coord::new(top.x, y)).collect();
         let mut x = top.x;
-        while x > root.x {
-            x -= 1;
+        while x != root.x {
+            x = if x > root.x { x - 1 } else { x + 1 };
             pts.push(Coord::new(x, root.y));
         }
         pts
@@ -181,7 +195,9 @@ impl KvColumn {
 impl Stream {
     /// The elements `requests` ask for: `asks` the units (the lane prologue's first where
     /// `requests.lanes`), `blocks` the attending blocks (unit indices), `pya` attention PEs a
-    /// K / V column, within `bounds` (bands of units where one row of them is too wide).
+    /// K / V column over `sub` columns a head, within `bounds` (bands of units where one row of
+    /// them is too wide).
+    #[allow(clippy::too_many_arguments)]
     pub fn of(
         requests: &Requests,
         py: u32,
@@ -189,15 +205,17 @@ impl Stream {
         blocks: &[Vec<usize>],
         heads: u32,
         pya: u32,
+        sub: u32,
         bounds: Bounds,
     ) -> R<Stream> {
+        let sub = sub.max(1);
         if !requests.stream {
             return Err("stream floorplan: no row stream asked for".into());
         }
         let band = py
             + 2
             + if requests.joint && !blocks.is_empty() {
-                heads + pya
+                heads + pya.div_ceil(sub)
             } else {
                 0
             };
@@ -282,11 +300,20 @@ impl Stream {
                             "stream floorplan: block {b}'s units hold fewer than {heads} head columns"
                         ));
                     }
+                    if blk.first().is_some_and(|&u| units[u].cols() < heads * sub) {
+                        return Err(format!(
+                            "stream floorplan: block {b}'s K / V columns over {sub} columns a \
+                             head ({}) outgrow its first unit's {} columns",
+                            heads * sub,
+                            blk.first().map_or(0, |&u| units[u].cols())
+                        ));
+                    }
                     kv.push(KvColumn {
                         block: b as u32,
                         head: h,
                         units: blk.clone(),
                         pya,
+                        sub,
                     });
                 }
             }
@@ -585,8 +612,17 @@ mod tests {
             joint: true,
             ..Requests::default()
         };
-        let s = Stream::of(&requests, 4, &asks, &blocks, 2, 3, Bounds { w: 32, h: 60 })
-            .unwrap_or_else(|e| panic!("{e}"));
+        let s = Stream::of(
+            &requests,
+            4,
+            &asks,
+            &blocks,
+            2,
+            3,
+            1,
+            Bounds { w: 32, h: 60 },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         let band = 4 + 2 + 2 + 3;
         let ys: Vec<u32> = s.units.iter().map(|u| u.y).collect();
         assert_eq!(ys, [0, 0, 0, band, band, 2 * band, 2 * band]);
@@ -604,6 +640,59 @@ mod tests {
             }
         }
         // too narrow for a block: refused by name
-        assert!(Stream::of(&requests, 4, &asks, &blocks, 2, 3, Bounds { w: 15, h: 60 }).is_err());
+        assert!(
+            Stream::of(
+                &requests,
+                4,
+                &asks,
+                &blocks,
+                2,
+                3,
+                1,
+                Bounds { w: 15, h: 60 }
+            )
+            .is_err()
+        );
+    }
+
+    /// A K / V column over two columns a head: a snake (each PE next to the one before it, the
+    /// first under the root), the band shorter by half the column, no PE of two heads.
+    #[test]
+    fn a_kv_column_folds_over_two_columns() {
+        let asks: Vec<UnitAsk> = (0..3).map(|u| ask(&format!("u{u}"), 9, 2)).collect();
+        let blocks = vec![vec![1, 2]];
+        let requests = Requests {
+            stream: true,
+            joint: true,
+            ..Requests::default()
+        };
+        let at = |sub| {
+            Stream::of(
+                &requests,
+                4,
+                &asks,
+                &blocks,
+                2,
+                7,
+                sub,
+                Bounds { w: 40, h: 60 },
+            )
+        };
+        let s = at(2).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.h, 4 + 2 + 2 + 4);
+        let mut seen = std::collections::BTreeSet::new();
+        for kc in &s.kv {
+            let mut pts = vec![kc.root(&s)];
+            pts.extend((0..kc.pya).map(|k| kc.pe(&s, k)));
+            for p in pts.windows(2) {
+                assert_eq!(p[0].x.abs_diff(p[1].x) + p[0].y.abs_diff(p[1].y), 1);
+            }
+            assert!(pts.iter().all(|&c| seen.insert(c) && c.y < s.h));
+            for k in 0..kc.units.len() {
+                assert_eq!(kc.link(&s, k).last(), Some(&kc.root(&s)));
+            }
+        }
+        // wider than the block's first unit: refused
+        assert!(at(5).is_err());
     }
 }

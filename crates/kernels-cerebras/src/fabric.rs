@@ -431,7 +431,16 @@ impl Lay<'_> {
             let k = if low { root - i } else { i - root };
             let kmax = if low { root } else { n - 1 - root };
             let tow = Self::dir(p, if low { pts[i + 1] } else { pts[i - 1] })?;
-            let awy = tow.opposite();
+            // away from the root: the next point out (a chain may turn), straight on at the end
+            let out = if low {
+                i.checked_sub(1)
+            } else {
+                Some(i + 1).filter(|&o| o < n)
+            };
+            let awy = match out {
+                Some(o) => Self::dir(p, pts[o])?,
+                None => tow.opposite(),
+            };
             let send = l1(low, k % 2 == 1);
             let recv = l1(low, (k + 1) % 2 == 1);
             let member = match c2 {
