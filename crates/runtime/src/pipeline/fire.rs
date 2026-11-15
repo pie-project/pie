@@ -654,7 +654,7 @@ impl RaiseFunding {
                 if pages == 0 {
                     // The room is there and state lies in the span: the
                     // walker moves it out, the engine copying it.
-                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    crate::rt::time::sleep(std::time::Duration::from_millis(2)).await;
                     continue;
                 }
                 let demand = crate::planner::Demand {
@@ -705,14 +705,14 @@ impl RaiseFunding {
                             }
                         }
                         crate::store::shared::raise_now(&shared, engine, rows);
-                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        crate::rt::time::sleep(std::time::Duration::from_millis(2)).await;
                     }
                     Ok(crate::planner::Acquired::Requote) => {
                         tracing::debug!(engine, "a raise's room is quoted again");
                     }
                     Ok(crate::planner::Acquired::Yield) => {
                         tracing::debug!(engine, "a raise's process yields");
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        crate::rt::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                     Err(error) => {
                         tracing::debug!(engine, %error, "a raise's room is refused");
@@ -748,7 +748,7 @@ async fn wait_for_rung(
                  was refused: {why}"
             ));
         }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        crate::rt::time::sleep(std::time::Duration::from_millis(1)).await;
     }
     Ok(())
 }
@@ -3079,7 +3079,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 if at >= ahead && wanted > cut_at {
                     let behind = submitted[at - ahead].clone();
                     while !behind.is_settled() && crate::store::shared::fire_cap(engine) <= cut_at {
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        crate::rt::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
                 }
                 let cap = crate::store::shared::fire_cap(engine);
