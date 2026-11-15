@@ -116,9 +116,9 @@ pub struct RuntimeConfig {
 }
 
 pub struct ModelConfig {
-    /// How this process yields memory to the system around it
-    /// (`[engine.memory] governor_*`).
-    pub memory_tolerance: crate::governor::Tolerance,
+    /// How far this process yields device memory to the system's pressure,
+    /// in `[0, 1]` (`[engine.memory] yield`): 0 never yields.
+    pub memory_yield: f64,
     pub name: String,
     pub model_id: String,
     pub kv_page_size: usize,
@@ -249,7 +249,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let bound_port = config.port;
 
     let ModelConfig {
-        memory_tolerance,
+        memory_yield,
         name,
         model_id,
         kv_page_size,
@@ -722,7 +722,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         grow.start();
     }
     for steered in governed {
-        crate::governor::run::start(steered, memory_tolerance);
+        crate::governor::run::start(steered, memory_yield);
     }
     active_guard.disarm();
     Ok(BootstrapHandle {

@@ -6372,7 +6372,7 @@ mod rung_wait_tests {
 
         // The pool idles past the walker's patience with the fire queued:
         // fires are cut to what is asked, never under the staged fire.
-        for _ in 0..2 * crate::governor::PATIENCE + 2 {
+        for _ in 0..2 * crate::store::shared::PATIENCE + 2 {
             grow.ticked_for_test();
             grow.walk_rung().await;
             assert!(
@@ -6394,7 +6394,7 @@ mod rung_wait_tests {
         tokio::task::yield_now().await;
         assert!(fire.is_settled());
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
-        for _ in 0..2 * crate::governor::PATIENCE + 2 {
+        for _ in 0..2 * crate::store::shared::PATIENCE + 2 {
             grow.ticked_for_test();
             grow.walk_rung().await;
         }

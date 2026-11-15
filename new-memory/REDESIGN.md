@@ -166,7 +166,7 @@ What PLEX may be asked to give up:
 
 So the redesign defines no valuation of its own. An earlier draft proposed a common unit ("expected time lost"); that is a policy's business and is dropped.
 
-Not addressed here: the governor's own loop constants (`FIRST_HOLD`, `IDLE_AFTER`, `CUT_SHARE`, and the tolerance table), which its header says were measured on one 16 GB machine. They act only when the process is not dedicated, and they size nothing; FOLLOWUPS F2 turns the tolerance into `governor_*` keys.
+The governor has no loop constants of its own: the target is `floor + (budget_device - floor) * (1 - yield * pressure)`, `pressure` the system's own reading in [0, 1] (Linux PSI `some` avg10 / 100, system-wide; macOS's pressure level by rank, normal 0 / warn 0.5 / critical 1), read when the system says it changed (a PSI trigger where the kernel grants one, the dispatch source), and on Linux each 2 s, the kernel's update period, while the reading is above 0 or no trigger is granted. `floor` is what running requests need: the reserved chunks, the activation the span cannot give back (the smallest rung's where the engine backs its span on demand, the top span where it backs it from the load), the live state with idle cache out of it and never under one working set at the declared context, and the weights' pinned staging bytes. Pressed with no room to shrink, the pool gives back in a fixed order, the policy's keys ordering each kind: droppable idle prefixes and checkpoints, the weight cache above its staging floor, demotion of prefixes keyed above the floor, then the rung (Metal only today: CUDA and Vulkan back the span from the load). Live state is never given back, and the governor raises no tier pressure.
 
 ### 2.9 Metal: ANE
 
@@ -193,9 +193,9 @@ Memory sizing reads **no key by default**. Everything below is optional; an empt
 | `budget_host` | what the governor allows | same, for host memory |
 | `budget_disk` | none without `disk_path` | same, for disk |
 | `disk_path`, `disk_persistent` | no disk tier | where files go is the operator's |
-| `governor_backoff`, `governor_release_idle` | dedicated: `1.0`, `false` | how much to yield when the system is congested, and whether idle memory goes back |
+| `yield` | `0`: never yields | how far the system's memory pressure may press the pool in, in [0, 1] |
 
-Seven keys, none required. `governor_patience` (F2) goes (user decision, 2026-11-13): in `Governor::tick` it is the count of congested ticks before the backoff acts, a debounce of the pressure signal rather than an intent, so it becomes one fixed value ( today's profiles tie it to the backoff: 0.9 → 4 ticks, 0.8 → 2, 0.7 → 1). Limits that are product decisions rather than memory (`max_context`, and F2's `max_batch_tokens` / `max_batch_sequences`) stay outside `[engine.memory]` as optional caps; when absent the context is the model's and the batch is the largest rung.
+Six keys, none required. `governor_patience` (F2) never ships, and `governor_backoff` / `governor_release_idle` go (user decision: one continuous `yield`): the pressure is the system's own reading, with no window or debounce of the runtime's, and nothing goes back for being idle. Limits that are product decisions rather than memory (`max_context`, and F2's `max_batch_tokens` / `max_batch_sequences`) stay outside `[engine.memory]` as optional caps; when absent the context is the model's and the batch is the largest rung.
 
 Removed, each refused with a message naming what replaced it:
 
@@ -204,7 +204,7 @@ Removed, each refused with a message naming what replaced it:
 | `device_memory_share`, `[wgpu] device_memory` | measured capacity; `budget_device` to cap |
 | `device_kv_budget`, `host_kv_budget`, `disk_kv_budget` | the ledger; `budget_*` to cap a tier |
 | `disk_kv_dir`, `disk_kv_persistent` | `disk_path`, `disk_persistent` |
-| `memory_tolerance` | `governor_*` |
+| `memory_tolerance`, `governor_backoff`, `governor_release_idle` | `yield` |
 | `weight_streaming` | weights are holders (2.7, F1) |
 | `snapshot_budget` | snapshots are disk-tier holders (F1) |
 | `max_forward_tokens`, `max_forward_requests` | the derived largest rung (2.5) |

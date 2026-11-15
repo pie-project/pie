@@ -9,9 +9,14 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::Notify;
 
 use super::{GrowFor, RungStep, RungWalk, SegmentMove, Shared, SharedPool};
-use crate::governor::{Demand, Growth, PATIENCE, PoolTarget, Retarget};
+use crate::governor::{Give, Growth, PoolTarget, Retarget};
 use crate::scheduler::worker::PoolOp;
 use crate::store::registry;
+
+/// Governor ticks the rung stands past what is asked before the walk
+/// lowers it: a debounce of the asks, so a pause between batches moves no
+/// rung. One tick's ask is one reading; two in a row are a stretch.
+pub(crate) const PATIENCE: u32 = 2;
 
 #[derive(Clone)]
 pub struct SharedGrow {
@@ -21,6 +26,7 @@ pub struct SharedGrow {
     /// The governor's target, in mapped segments.
     target: Arc<AtomicU32>,
     wake: Arc<Notify>,
+    /// The system refused a commit, and no room was freed since.
     refused: Arc<AtomicBool>,
     /// The last shrink found no room.
     no_room: Arc<AtomicBool>,
@@ -32,9 +38,8 @@ pub struct SharedGrow {
     ticks: Arc<AtomicU64>,
     /// The lanes live now that may decode ([`Self::walk_rows`]).
     live_lanes: Arc<dyn Fn() -> u32 + Send + Sync>,
-    /// The tick since which the rung has stood past what is asked: the
-    /// lower that frees its chunks, and the cap down before it, wait the
-    /// governor's patience from it.
+    /// The tick since which the rung has stood past what is asked: a cap
+    /// down or a lower waits the walk's patience from it.
     idle_since: Arc<std::sync::Mutex<Option<u64>>>,
     /// The last raise found no room: none is tried again until room is
     /// freed ([`Self::room_freed`]), the one event that can change that.
@@ -157,7 +162,7 @@ impl SharedGrow {
                 let goal = pool.rung_for(self.walk_rows());
                 let cap = super::fire_cap(self.engine);
                 // The pool stands past what is asked: it comes down only
-                // once it has for the governor's patience, so a pause
+                // once it has for the walk's patience, so a pause
                 // between batches moves no rung. On a span backed on
                 // demand an idle pool always comes down after it: the
                 // carve held costs resident memory there.
@@ -362,6 +367,7 @@ impl SharedGrow {
     /// room may be tried again, and the walk looks now.
     pub fn room_freed(&self) {
         self.raise_blocked.store(false, Ordering::Release);
+        self.refused.store(false, Ordering::Release);
         self.shared.lock().unwrap().block_span_commit(false);
         self.wake.notify_one();
     }
@@ -571,17 +577,76 @@ fn pinned_segments() -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-impl PoolTarget for SharedGrow {
-    fn demand(&mut self) -> Demand {
-        self.shared.lock().unwrap().demand()
+impl SharedGrow {
+    /// Drops idle cache whose keys say it may go, lowest key first, until
+    /// `bytes` came free or none is left: the kv store's sealed prefixes,
+    /// then the rs store's checkpoints. The bytes freed.
+    fn drop_idle(&self, bytes: u64) -> u64 {
+        let Some(stores) = registry::try_get(self.model, self.engine) else {
+            return 0;
+        };
+        use crate::policy::retention::Installed;
+        let mut freed = 0;
+        while freed < bytes {
+            let pages = registry::with_kv_lock(&stores.kv, "governor-give", |kv| {
+                let epoch = kv.current_epoch();
+                kv.reclaim_droppable(epoch, Installed) as u64 * kv.page_pool().slot_bytes()
+            });
+            if pages == 0 {
+                break;
+            }
+            freed += pages;
+        }
+        while freed < bytes {
+            let mut rs = stores.rs.lock().unwrap();
+            let rows = |rs: &crate::store::rs::RsStore| {
+                let (slot, page) = rs.unit_bytes();
+                let units = rs.cache_only();
+                u64::from(units.slots) * slot + u64::from(units.pages) * page
+            };
+            let before = rows(&rs);
+            if rs.reclaim_droppable(Installed) == 0 {
+                break;
+            }
+            freed += before.saturating_sub(rows(&rs));
+        }
+        freed
     }
 
+    /// Moves idle cache keyed above the floor down a tier, `bytes` of it at
+    /// most: the bytes on their way.
+    fn demote_idle(&self, bytes: u64) -> u64 {
+        let (Some(planner), Some(stores)) = (
+            crate::planner::planner_for(self.model, self.engine),
+            registry::try_get(self.model, self.engine),
+        ) else {
+            return 0;
+        };
+        let page = registry::with_kv_lock(&stores.kv, "governor-give", |kv| {
+            kv.page_pool().slot_bytes()
+        })
+        .max(1);
+        let pages = u32::try_from(bytes.div_ceil(page)).unwrap_or(u32::MAX);
+        if planner.demote_for_governor(pages) {
+            u64::from(pages) * page
+        } else {
+            0
+        }
+    }
+}
+
+impl PoolTarget for SharedGrow {
     fn segment_bytes(&self) -> u64 {
         self.shared.lock().unwrap().segment_bytes()
     }
 
+    /// The pool's floor with the live state counted, the idle cache the
+    /// policy's ledger takes out of what is live taken out of it too.
     fn floor(&self) -> u64 {
-        self.shared.lock().unwrap().floor()
+        let idle = registry::try_get(self.model, self.engine)
+            .map_or(0, |stores| crate::store::chunks::idle_cache_bytes(&stores));
+        let pool = self.shared.lock().unwrap();
+        pool.floor(pool.state_bytes().saturating_sub(idle))
     }
 
     fn hard_limit(&self) -> u64 {
@@ -599,8 +664,13 @@ impl PoolTarget for SharedGrow {
     fn retarget(&mut self, segments: u64) -> Retarget {
         let segments = u32::try_from(segments).unwrap_or(u32::MAX);
         self.target.store(segments, Ordering::Release);
+        let mapped = {
+            let mut pool = self.shared.lock().unwrap();
+            let bytes = u64::from(segments) * pool.segment_bytes();
+            pool.ease(bytes);
+            pool.mapped_segments()
+        };
         self.wake.notify_one();
-        let mapped = self.shared.lock().unwrap().mapped_segments();
         if self.no_room.load(Ordering::Acquire) && segments < mapped {
             Retarget::NoRoom {
                 held: u64::from(mapped),
@@ -610,8 +680,28 @@ impl PoolTarget for SharedGrow {
         }
     }
 
-    fn take_refused(&mut self) -> bool {
-        self.refused.swap(false, Ordering::AcqRel)
+    fn refused(&self) -> bool {
+        self.refused.load(Ordering::Acquire)
+    }
+
+    fn give(&mut self, what: Give, bytes: u64) -> u64 {
+        let given = match what {
+            Give::Cache => self.drop_idle(bytes),
+            Give::Demote => self.demote_idle(bytes),
+            Give::Rung => {
+                let mut pool = self.shared.lock().unwrap();
+                let target = u64::from(self.target.load(Ordering::Acquire)) * pool.segment_bytes();
+                pool.press(target)
+            }
+            Give::Weights => 0,
+        };
+        if given > 0 {
+            self.room_freed();
+            if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
+                planner.pages_freed();
+            }
+        }
+        given
     }
 
     /// A governor tick: counted for the rung's patience, and the walk looks
@@ -709,7 +799,7 @@ mod tests {
     }
 
     /// A pool that stands past what is asked comes down only once it has
-    /// for the governor's patience: a pause shorter than that moves no rung.
+    /// for the walk's patience: a pause shorter than that moves no rung.
     #[tokio::test(flavor = "current_thread")]
     async fn the_rung_comes_down_only_after_the_governor_s_patience() {
         const ENGINE: usize = 59;
@@ -739,7 +829,7 @@ mod tests {
     }
 
     /// A program's fire term the largest rung cannot hold cuts fires to
-    /// the widest rung that fits at once, without the governor's patience:
+    /// the widest rung that fits at once, without the walk's patience:
     /// a fire wider would take more than the span.
     #[tokio::test(flavor = "current_thread")]
     async fn a_fire_term_past_the_largest_rung_cuts_fires_without_patience() {

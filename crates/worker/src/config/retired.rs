@@ -106,9 +106,8 @@ pub const RETIRED: &[Retired] = &[
     ),
     gone(
         "memory_tolerance",
-        "state `[engine.memory] governor_backoff` (the share of memory kept each congested \
-         stretch: dedicated 1.0, aggressive 0.9, balanced 0.8, polite 0.7) and \
-         `governor_release_idle = true` to give back memory demand stopped asking for",
+        "state `[engine.memory] yield` (0 to 1: how far the system's memory pressure \
+         presses the device pool in; 0, the default, never yields)",
     ),
     gone(
         "weight_streaming",

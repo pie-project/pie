@@ -496,7 +496,7 @@ fn the_record_math_is_the_same_with_the_role_shapes_as_without() {
     assert_eq!(a.records_most(), b.records_most());
     assert_eq!(a.records_capacity(), b.records_capacity());
     assert_eq!(a.records_available(), b.records_available());
-    assert_eq!(a.floor(), b.floor(), "one working set's chunks");
+    assert_eq!(a.floor(0), b.floor(0), "one working set's chunks");
     let units = crate::store::rs::RsUnits {
         slots: 3,
         ..Default::default()

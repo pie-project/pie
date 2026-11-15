@@ -1,22 +1,35 @@
 //! What macOS says about its memory.
 //!
-//! No system call says how much another process would like. The kernel's
-//! pressure level and its paging counters say whether it is struggling, and
-//! that is all [`Governor`](super::Governor) asks.
+//! The kernel states one of three pressure levels, and a dispatch source of
+//! `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` fires on every change of it, either
+//! way: the reading follows it with no poll. Each level reads as its rank
+//! among the kernel's three: normal 0, warn 0.5, critical 1.
 #![allow(unsafe_code)]
 
-use std::mem::{MaybeUninit, size_of};
+use std::ffi::c_void;
+use std::mem::size_of;
 
-use super::{Pressure, System, refaulting};
+use super::Reading;
 
-const NORMAL: u32 = 1;
-const WARN: u32 = 2;
-const CRITICAL: u32 = 4;
+const NORMAL: usize = 0x1;
+const WARN: usize = 0x2;
+const CRITICAL: usize = 0x4;
 
-/// `kern.memorystatus_vm_pressure_level`: what the dispatch source reports,
-/// without a dispatch queue to run on.
-fn pressure_level() -> u32 {
-    let mut level: u32 = NORMAL;
+/// The pressure a kernel level reads as.
+fn pressure(level: usize) -> f64 {
+    if level & CRITICAL != 0 {
+        1.0
+    } else if level & WARN != 0 {
+        0.5
+    } else {
+        0.0
+    }
+}
+
+/// `kern.memorystatus_vm_pressure_level`: the level now, what the source
+/// reports on its next change.
+fn pressure_level() -> usize {
+    let mut level: u32 = NORMAL as u32;
     let mut size = size_of::<u32>();
     // SAFETY: the name is a nul-terminated literal and `level` holds `size`
     // bytes; the kernel writes at most that.
@@ -29,90 +42,79 @@ fn pressure_level() -> u32 {
             0,
         )
     };
-    if status == 0 { level } else { NORMAL }
+    if status == 0 { level as usize } else { NORMAL }
 }
 
-#[derive(Clone, Copy, Default)]
-struct Paging {
-    evicted: u64,
-    returned: u64,
+#[repr(C)]
+struct SourceType {
+    _private: [u8; 0],
 }
 
-fn paging(host: libc::mach_port_t) -> Option<Paging> {
-    let mut stats = MaybeUninit::<libc::vm_statistics64>::zeroed();
-    let mut count = (size_of::<libc::vm_statistics64>() / size_of::<libc::integer_t>()) as u32;
-    // SAFETY: `count` states `stats`' size in the kernel's units; the call
-    // writes no more, and answers how much it did.
-    let status = unsafe {
-        #[allow(deprecated, reason = "the mach crate is not a dependency for one call")]
-        libc::host_statistics64(
-            host,
-            libc::HOST_VM_INFO64,
-            stats.as_mut_ptr().cast(),
-            &raw mut count,
-        )
-    };
-    if status != 0 {
-        return None;
-    }
-    // SAFETY: the call succeeded, so the counters are written; those it did
-    // not reach are the zeroes above.
-    let stats = unsafe { stats.assume_init() };
-    Some(Paging {
-        evicted: stats.compressions + stats.swapouts,
-        returned: stats.decompressions + stats.swapins,
-    })
+unsafe extern "C" {
+    static _dispatch_source_type_memorypressure: SourceType;
+    fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut c_void;
+    fn dispatch_source_create(
+        kind: *const SourceType,
+        handle: usize,
+        mask: usize,
+        queue: *mut c_void,
+    ) -> *mut c_void;
+    fn dispatch_set_context(object: *mut c_void, context: *mut c_void);
+    fn dispatch_source_set_event_handler_f(
+        source: *mut c_void,
+        handler: extern "C" fn(*mut c_void),
+    );
+    fn dispatch_source_get_data(source: *mut c_void) -> usize;
+    fn dispatch_resume(object: *mut c_void);
 }
 
-/// Reads the system a tick at a time: the paging counters only say anything
-/// as a rate.
-pub struct Watch {
-    /// Each `mach_host_self` adds a reference to the port: one is taken.
-    host: libc::mach_port_t,
-    last: Option<Paging>,
+/// `QOS_CLASS_UTILITY`: the queue the source's handler runs on.
+const UTILITY: isize = 0x11;
+
+/// What the handler reaches: the source it reads and where it tells.
+struct Context {
+    source: *mut c_void,
+    tell: tokio::sync::watch::Sender<f64>,
 }
 
-impl Default for Watch {
-    fn default() -> Self {
-        Self {
-            host: host_port(),
-            last: None,
-        }
-    }
+extern "C" fn changed(context: *mut c_void) {
+    // SAFETY: the context is the `Context` [`watch`] leaked for the
+    // source, which lives as long as the process.
+    let context = unsafe { &*context.cast::<Context>() };
+    // SAFETY: the source is the one this handler is set on.
+    let level = unsafe { dispatch_source_get_data(context.source) };
+    let now = pressure(level);
+    context.tell.send_if_modified(|last| {
+        let changed = *last != now;
+        *last = now;
+        changed
+    });
 }
 
-fn host_port() -> libc::mach_port_t {
-    // SAFETY: no arguments; the call answers this task's host port.
-    #[allow(deprecated, reason = "the mach crate is not a dependency for one call")]
+/// Starts following the kernel's pressure level; `None` where the source
+/// cannot be made.
+pub fn watch() -> Option<Reading> {
+    let (tell, reading) = tokio::sync::watch::channel(pressure(pressure_level()));
+    // SAFETY: the global queue is the system's; the source type is the
+    // kernel's static; the context is leaked, never freed, as the source
+    // is never cancelled.
     unsafe {
-        libc::mach_host_self()
-    }
-}
-
-impl System for Watch {
-    fn read(&mut self) -> Pressure {
-        let now = paging(self.host);
-        let refault = match (self.last, now) {
-            (Some(last), Some(now)) => refaulting(
-                now.evicted.saturating_sub(last.evicted),
-                now.returned.saturating_sub(last.returned),
-            ),
-            _ => false,
-        };
-        self.last = now.or(self.last);
-        match pressure_level() {
-            CRITICAL => Pressure::Critical,
-            WARN => {
-                tracing::debug!("the kernel says warn");
-                Pressure::Congested
-            }
-            _ if refault => {
-                tracing::debug!("pages are coming back");
-                Pressure::Congested
-            }
-            _ => Pressure::Calm,
+        let queue = dispatch_get_global_queue(UTILITY, 0);
+        let source = dispatch_source_create(
+            &raw const _dispatch_source_type_memorypressure,
+            0,
+            NORMAL | WARN | CRITICAL,
+            queue,
+        );
+        if source.is_null() {
+            return None;
         }
+        let context = Box::into_raw(Box::new(Context { source, tell }));
+        dispatch_set_context(source, context.cast());
+        dispatch_source_set_event_handler_f(source, changed);
+        dispatch_resume(source);
     }
+    Some(reading)
 }
 
 #[cfg(test)]
@@ -120,12 +122,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_counters_read_and_only_rise() {
-        let host = host_port();
-        let first = paging(host).expect("the host answers");
-        let second = paging(host).expect("the host answers");
-        assert!(second.evicted >= first.evicted);
-        assert!(second.returned >= first.returned);
+    fn each_level_reads_as_its_rank() {
+        assert_eq!(pressure(NORMAL), 0.0);
+        assert_eq!(pressure(WARN), 0.5);
+        assert_eq!(pressure(CRITICAL), 1.0);
     }
 
     #[test]

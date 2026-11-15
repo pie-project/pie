@@ -79,10 +79,9 @@ class MemoryConfig:
     # Keep the disk tier for the next run (cuda): a restart takes back the
     # sealed pages it holds as cache.
     disk_persistent: Optional[bool] = None
-    # The share of memory kept each congested stretch (1.0: never yield).
-    governor_backoff: Optional[float] = None
-    # Give back memory demand stopped asking for.
-    governor_release_idle: Optional[bool] = None
+    # How far the system's memory pressure presses the device pool in, 0 to
+    # 1 (0, the default: never yield). Written `yield`, a Python keyword.
+    yield_: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.budget_host is None and os.environ.get("PIE_HOST_KV_BUDGET_DEFAULT", "1") == "1":
@@ -251,7 +250,8 @@ _RETIRED_ENV = {
 def _block(obj) -> dict:
     """A dataclass as `{key: value}` without its `None`s. `*_mb` fields are
     counts here and size strings in the file (`warm_memory_mb=64` ->
-    `warm_memory="64MiB"`)."""
+    `warm_memory="64MiB"`); a field named for a Python keyword drops its
+    trailing `_` (`yield_` -> `yield`)."""
     out = {}
     if not is_dataclass(obj):
         return out
@@ -261,6 +261,8 @@ def _block(obj) -> dict:
             continue
         if f.name.endswith("_mb"):
             out[f.name[: -len("_mb")]] = _mib(v)
+        elif f.name.endswith("_"):
+            out[f.name[:-1]] = v
         else:
             out[f.name] = v
     return out

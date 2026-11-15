@@ -773,9 +773,24 @@ impl StorePools {
     }
 }
 
+/// What a cache entry alone holds on the device, in bytes: the kv store's
+/// idle cache pages and the rs checkpoints' rows. Their slots are the
+/// stores' own, so a slot count holds them as live: this is what the
+/// policy's ledger and the governor's floor both take out of it.
+#[must_use]
+pub(crate) fn idle_cache_bytes(stores: &registry::Stores) -> u64 {
+    let kv = registry::with_kv_lock(&stores.kv, "idle-cache", |kv| {
+        u64::from(kv.reclaimable_cache_pages()) * kv.page_pool().slot_bytes()
+    });
+    let rs = stores.rs.lock().unwrap();
+    let (slot_bytes, page_bytes) = rs.unit_bytes();
+    let rows = rs.cache_only();
+    kv + u64::from(rows.slots) * slot_bytes + u64::from(rows.pages) * page_bytes
+}
+
 /// The worker policy's byte attrs, read from the stores' slot pools: each
-/// shape's slots at its own size. What a cache entry alone holds is cache:
-/// the kv store's idle cache pages, the rs checkpoints' rows.
+/// shape's slots at its own size. What a cache entry alone holds is cache
+/// ([`idle_cache_bytes`]).
 pub struct SlotMeter;
 
 impl SlotMeter {
@@ -802,14 +817,13 @@ impl SlotMeter {
                 act: 0,
             });
         }
-        let (kv, kv_page_bytes, capacity, cached, host_free, host_capacity, host_cache) =
+        let (kv, kv_page_bytes, capacity, host_free, host_capacity, host_cache) =
             registry::with_kv_lock(&stores.kv, "policy-pressure", |kv| {
                 let pool = kv.page_pool();
                 (
                     pool.demand(),
                     pool.slot_bytes(),
                     u64::from(pool.capacity()),
-                    u64::from(kv.reclaimable_cache_pages()),
                     kv.host_swap_available() as u64,
                     u64::from(kv.host_swap_capacity()),
                     host_cached(kv),
@@ -819,6 +833,11 @@ impl SlotMeter {
         if capacity > 0 && kv_page_bytes == 0 {
             return None;
         }
+        let idle = if tier == Tier::Device {
+            idle_cache_bytes(stores)
+        } else {
+            0
+        };
         let rs = stores.rs.lock().unwrap();
         let (slot_bytes, page_bytes) = rs.unit_bytes();
         let rows = |units: super::rs::RsUnits| {
@@ -828,7 +847,6 @@ impl SlotMeter {
             Tier::Device => {
                 let state = rs.device_demand();
                 let total = kv_page_bytes * capacity + rows(rs.capacity());
-                let kv_cached = cached * kv_page_bytes;
                 // Instance tables and rings on the device: state, none of
                 // it cache (no token rebuilds them).
                 let roles = stores
@@ -838,9 +856,7 @@ impl SlotMeter {
                 Bytes {
                     total,
                     state: kv.live + state.live + roles,
-                    live: kv.live.saturating_sub(kv_cached)
-                        + state.live.saturating_sub(rows(rs.cache_only()))
-                        + roles,
+                    live: (kv.live + state.live).saturating_sub(idle) + roles,
                     wanted: kv.wanted + state.wanted + roles,
                     act: 0,
                 }

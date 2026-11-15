@@ -302,12 +302,22 @@ impl SharedPool {
     }
 
     /// The chunks an activation may take at most: every chunk but the
-    /// reserved ones and the weights' pinned slots, which no move frees.
+    /// reserved ones and the weights' pinned slots, which no move frees;
+    /// no more than a governor's press leaves it ([`Self::press`]).
     fn act_room(&self) -> u32 {
         let room = self.room();
-        room.total_chunks
+        let most = room
+            .total_chunks
             .saturating_sub(room.reserved_chunks)
-            .saturating_sub(room.weight_chunks)
+            .saturating_sub(room.weight_chunks);
+        self.pressed_act.map_or(most, |pressed| most.min(pressed))
+    }
+
+    /// Whether anything bounds the rung but the device: a guest term or a
+    /// span the engine states ([`Self::fits_unasked`]), or a governor's
+    /// press.
+    fn rung_bound(&self) -> bool {
+        !self.fits_unasked() || self.pressed_act.is_some()
     }
 
     /// The chunks a rung's activation may take at most, its guest term
@@ -340,7 +350,7 @@ impl SharedPool {
     #[must_use]
     pub fn widest_fit(&self) -> Option<u32> {
         let rungs = self.pool.rungs();
-        if self.fits_unasked() {
+        if !self.rung_bound() {
             return rungs.last().copied();
         }
         let most = self.act_most();
@@ -361,7 +371,7 @@ impl SharedPool {
     /// The widest rung fires may take: [`Self::widest_fit`], the smallest
     /// where none fits (a bind is refused then), `u32::MAX` without rungs.
     pub(super) fn fit_rung(&self) -> u32 {
-        if self.fits_unasked() {
+        if !self.rung_bound() {
             return u32::MAX;
         }
         self.widest_fit()

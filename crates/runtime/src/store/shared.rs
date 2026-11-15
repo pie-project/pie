@@ -61,7 +61,7 @@ use super::slots::{
     Demand, Holder, RungEvacuation, ShapeId, ShapeKind, Slot, SlotError, SlotPool, SlotPoolFacts,
     SlotShape,
 };
-use crate::governor::{Demand as Asked, Growth};
+use crate::governor::Growth;
 
 /// The pool behind an engine's stores, shared by every store and the
 /// governor; each call takes the lock for itself, innermost of every store
@@ -725,6 +725,10 @@ pub struct SharedPool {
     span_commit_blocked: bool,
     /// The registered programs' fire terms ([`programs`]).
     programs: programs::ProgramFires,
+    /// The chunks the activation may take while the governor presses the
+    /// pool past all it could give back but the rung ([`Self::press`]);
+    /// `None` while it does not.
+    pressed_act: Option<u32>,
 }
 
 /// The fence epoch a raise's moved-off chunks wait on until the engine has
@@ -970,6 +974,7 @@ impl SharedPool {
             told_from: None,
             span_commit_blocked: false,
             programs: programs::ProgramFires::default(),
+            pressed_act: None,
         };
         // The engine holds the rung the pool starts at.
         shared.told = shared.pool.rung();
@@ -2050,10 +2055,10 @@ impl SharedPool {
     /// What is asked of the pool, in bytes: the slots held and wanted, the
     /// reserved chunks, and the top span, committed from the load.
     #[must_use]
-    pub fn demand(&self) -> Asked {
+    pub fn demand(&self) -> Demand {
         let Demand { live, wanted } = self.pool.demand();
         let fixed = self.fixed_bytes();
-        Asked {
+        Demand {
             wanted: wanted + fixed,
             live: live + fixed,
         }
@@ -2066,11 +2071,120 @@ impl SharedPool {
         u64::from(self.pool.reserved_chunks() + act) * self.pool.chunk_bytes()
     }
 
-    /// Bytes below which one lane cannot run: one working set at the longest
-    /// context, the reserved chunks and the top span.
+    /// Bytes the running requests need to make progress, `state` what their
+    /// state holds (idle cache out of it), as the segments that hold it: the
+    /// prefix segments under the reserved chunks and the state, never under
+    /// one working set at the longest context, so a request can always
+    /// start; and the span segments the activation cannot give back. Where
+    /// the engine backs its span on demand, that is the smallest rung's;
+    /// where it backs it from the load, a narrower rung frees nothing and
+    /// the whole top span stays.
     #[must_use]
-    pub fn floor(&self) -> u64 {
-        u64::from(self.least_chunks) * self.pool.chunk_bytes() + self.fixed_bytes()
+    pub fn floor(&self, state: u64) -> u64 {
+        let pool = &self.pool;
+        let chunk = pool.chunk_bytes().max(1);
+        let segments = pool.segments();
+        let top = pool.top_segment().min(segments.count());
+        let state_chunks = u32::try_from(state.div_ceil(chunk))
+            .unwrap_or(u32::MAX)
+            .max(self.least_chunks);
+        let wanted = pool.reserved_chunks().saturating_add(state_chunks);
+        let mut prefix = 0;
+        for segment in 0..top {
+            if prefix >= wanted {
+                break;
+            }
+            prefix += segments.len(segment);
+        }
+        let span_start = if pool.span_on_demand() {
+            let least = pool
+                .rungs()
+                .first()
+                .map_or(0, |&rung| pool.act_chunks(rung));
+            pool.total_chunks().saturating_sub(least)
+        } else {
+            0
+        };
+        let span: u32 = (top..segments.count())
+            .filter(|&segment| segments.range(segment).end > span_start)
+            .map(|segment| segments.len(segment))
+            .sum();
+        u64::from(prefix + span) * chunk
+    }
+
+    /// The bytes the state shapes' live slots hold: kv, recurrent state and
+    /// the fixed shapes, the weights not among them. Idle cache is in it:
+    /// its pages are the stores'.
+    #[must_use]
+    pub fn state_bytes(&self) -> u64 {
+        (0..self.weights_first)
+            .map(|shape| {
+                let bytes = self.pool.shape(shape).map_or(0, |facts| facts.slot_bytes);
+                self.pool.shape_demand(shape).live * bytes
+            })
+            .sum()
+    }
+
+    /// The governor presses the pool to `target` bytes with nothing left to
+    /// give back but the rung: the activation may take what the target
+    /// leaves past everything else held, never less than the smallest
+    /// rung's. Only where the engine backs its span on demand, the one place
+    /// a narrower rung frees memory. The bytes on their way: the activation
+    /// set aside now past the widest rung that fits.
+    pub fn press(&mut self, target: u64) -> u64 {
+        if !self.pool.span_on_demand() {
+            return 0;
+        }
+        let room = self.act_room_under(target);
+        if self.pressed_act.is_some_and(|pressed| pressed <= room) {
+            return 0;
+        }
+        self.pressed_act = Some(room);
+        let fits = self.fit_rung();
+        let freed = self
+            .pool
+            .act_reserved()
+            .saturating_sub(self.pool.act_chunks(fits));
+        u64::from(freed) * self.pool.chunk_bytes()
+    }
+
+    /// The target is `target` bytes now: a press lets the activation take
+    /// what it leaves, never less than it let before, and lifts once the
+    /// widest rung fits.
+    pub fn ease(&mut self, target: u64) {
+        let Some(pressed) = self.pressed_act else {
+            return;
+        };
+        let room = self.act_room_under(target);
+        let widest = self
+            .pool
+            .rungs()
+            .last()
+            .map_or(0, |&rung| self.pool.act_chunks(rung));
+        self.pressed_act = (room < widest).then_some(room.max(pressed));
+    }
+
+    /// Whether the governor presses the activation ([`Self::press`]).
+    #[must_use]
+    pub fn pressed(&self) -> Option<u32> {
+        self.pressed_act
+    }
+
+    /// The chunks `target` bytes leave the activation past all the pool
+    /// holds besides it, the smallest rung's at least.
+    fn act_room_under(&self, target: u64) -> u32 {
+        let chunk = self.pool.chunk_bytes().max(1);
+        let held = u32::try_from(self.held() / chunk).unwrap_or(u32::MAX);
+        let besides = held.saturating_sub(self.pool.act_reserved());
+        let least = self
+            .pool
+            .rungs()
+            .first()
+            .map_or(0, |&rung| self.pool.act_chunks(rung));
+        u32::try_from(target / chunk)
+            .unwrap_or(u32::MAX)
+            .saturating_sub(besides)
+            .max(least)
     }
 
     #[must_use]
@@ -2092,9 +2206,7 @@ impl SharedPool {
     pub fn growth(&self) -> Growth {
         match self.growth {
             SegmentGrowth::Fixed => Growth::Fixed,
-            SegmentGrowth::Bottom | SegmentGrowth::TwoEnded => Growth::Elastic {
-                least_cut: self.segment_bytes(),
-            },
+            SegmentGrowth::Bottom | SegmentGrowth::TwoEnded => Growth::Elastic,
         }
     }
 }
@@ -2110,4 +2222,6 @@ pub(crate) mod tests;
 
 pub mod programs;
 mod target;
+#[cfg(test)]
+pub(crate) use target::PATIENCE;
 pub use target::SharedGrow;

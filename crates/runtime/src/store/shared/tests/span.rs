@@ -9,8 +9,9 @@
 //! activation 52..64.
 
 use super::*;
-use crate::governor::{PATIENCE, PoolTarget};
+use crate::governor::PoolTarget;
 use crate::store::shared::programs::{Mover, take_raise};
+use crate::store::shared::target::PATIENCE;
 
 /// The engine's lane as a raise meets it: the fake engine, shared.
 struct Lane(Arc<Mutex<FakeEngine>>);
@@ -476,7 +477,7 @@ fn fine_on_demand() -> (SharedPool, FakeEngine) {
 /// Mac's footprint at rest: on an on-demand pool with one live lane, a
 /// 5-token pass raises the rung to the smallest that covers it (8), not to
 /// the engine's whole lane count; idle again, the pool comes back down
-/// after the governor's patience, the carve held costing resident memory.
+/// after the walk's patience, the carve held costing resident memory.
 #[tokio::test(flavor = "current_thread")]
 async fn a_small_pass_raises_to_the_rung_covering_it_and_an_idle_pool_lowers_after_patience() {
     const ENGINE: usize = 54;
@@ -737,4 +738,41 @@ async fn a_promised_grow_the_walk_does_not_make_is_told_as_no_grow() {
         1,
         "nothing promised: nothing told"
     );
+}
+
+/// The governor's last kind to give ([`crate::governor::Give::Rung`]): with
+/// the span backed on demand, a press past everything else the pool holds
+/// narrows the rung fires may take to what the target leaves the
+/// activation, and lifts as the target rises again. With the span backed
+/// from the load a narrower rung frees nothing, and a press is no press.
+#[test]
+fn a_press_narrows_the_rung_to_what_the_target_leaves_and_lifts_as_it_rises() {
+    let (mut pool, _) = on_demand_pool();
+    let mut from_load = super::pool();
+    loop {
+        match pool.next_move(u32::MAX, 0) {
+            Some(SegmentMove::Commit { prefix }) => pool.committed(prefix),
+            Some(SegmentMove::CommitSpan { n }) => pool.span_committed(n),
+            _ => break,
+        }
+    }
+    let held = u32::try_from(pool.held() / CHUNK).unwrap();
+    assert_eq!(pool.rung_for(2048), 2048);
+    // The target leaves the activation four chunks past all else: the
+    // 256-token rung's.
+    let besides = held - pool.pool().act_reserved();
+    let at = |chunks: u32| u64::from(besides + chunks) * CHUNK;
+    assert_eq!(pool.press(at(4)), (12 - 4) * CHUNK);
+    assert_eq!(pool.rung_for(2048), 256);
+    assert_eq!(pool.press(at(5)), 0, "pressed past it already");
+    pool.ease(at(6));
+    assert_eq!(pool.pressed(), Some(6));
+    assert_eq!(pool.rung_for(2048), 256, "six chunks hold no wider rung");
+    pool.ease(at(12));
+    assert_eq!(pool.pressed(), None, "the widest fits: the press lifts");
+    assert_eq!(pool.rung_for(2048), 2048);
+
+    assert_eq!(from_load.press(0), 0);
+    assert_eq!(from_load.pressed(), None);
+    assert_eq!(from_load.rung_for(2048), 2048);
 }
