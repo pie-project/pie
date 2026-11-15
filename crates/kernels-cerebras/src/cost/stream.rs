@@ -132,6 +132,20 @@ pub struct UnitCost {
     pub late_row: f64,
     /// The weight PEs' share of them.
     pub matvec_row: f64,
+    /// Each root-side step's cycles a row: (step, `col` / `row` / `store` / `query`, after the
+    /// barrier, its roots, its chunk, cycles).
+    pub parts: Vec<Part>,
+}
+
+/// One root-side step of a unit, priced a row.
+#[derive(Clone, Debug, Serialize)]
+pub struct Part {
+    pub step: usize,
+    pub what: &'static str,
+    pub late: bool,
+    pub roots: u32,
+    pub chunk: u32,
+    pub cycles: f64,
 }
 
 /// The step's priced units and the step's cycles.
@@ -180,6 +194,7 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
     for (ui, b) in p.units.iter().enumerate() {
         let l = &b.layout;
         let (mut e, mut lt, mut mv) = (0.0f64, 0.0f64, 0.0f64);
+        let mut parts = Vec::new();
         // the weight PEs: the busiest column a row, by phase
         for (phase, acc) in [(false, &mut e), (true, &mut lt)] {
             let busiest = (0..l.px())
@@ -202,14 +217,34 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
                 if (i >= b.unit.split) != phase {
                     continue;
                 }
+                let at = b.regions.get(&i).map(|r| r.0);
+                let part = |what, cycles| Part {
+                    step: i,
+                    what,
+                    late: phase,
+                    roots: at.map_or(l.heads, |a| a.roots),
+                    chunk: at.map_or(0, |a| a.chunk),
+                    cycles,
+                };
                 match s {
                     Step::Region {
                         side: Side::Row, ..
-                    } => row_side += region_cycles(p, ui, i),
+                    } => {
+                        let c = region_cycles(p, ui, i);
+                        row_side += c;
+                        parts.push(part("row", c));
+                    }
                     Step::Region {
                         side: Side::Col, ..
-                    } => col_side += region_cycles(p, ui, i),
-                    Step::Store { .. } => col_side += STORE,
+                    } => {
+                        let c = region_cycles(p, ui, i);
+                        col_side += c;
+                        parts.push(part("col", c));
+                    }
+                    Step::Store { .. } => {
+                        col_side += STORE;
+                        parts.push(part("store", STORE));
+                    }
                     Step::Attend { .. } => {
                         let block: u32 =
                             p.kv.iter().find(|k| k.units.contains(&ui)).map_or(0, |k| {
@@ -218,7 +253,9 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
                                     .map(|&v| rows_of(&p.units[v].unit.classes, class_rows))
                                     .sum()
                             });
-                        col_side += query_cycles(block, qh, a.head_dim);
+                        let c = query_cycles(block, qh, a.head_dim);
+                        col_side += c;
+                        parts.push(part("query", c));
                     }
                     _ => {}
                 }
@@ -251,6 +288,7 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
             early_row: e,
             late_row: lt,
             matvec_row: mv,
+            parts,
         });
     }
     // along the stream: a unit starts its rows once the unit before it has started its own

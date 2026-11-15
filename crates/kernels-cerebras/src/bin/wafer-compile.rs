@@ -300,6 +300,19 @@ fn stream(args: &[String]) -> Result<(), String> {
                 "  {} rows {} early {:.0} late {:.0} matvec {:.0} cycles a row",
                 u.name, u.rows, u.early_row, u.late_row, u.matvec_row
             );
+            if args.iter().any(|a| a == "--parts") {
+                for q in &u.parts {
+                    println!(
+                        "    step {} {}{} roots {} chunk {}: {:.0}",
+                        q.step,
+                        q.what,
+                        if q.late { " (late)" } else { "" },
+                        q.roots,
+                        q.chunk,
+                        q.cycles
+                    );
+                }
+            }
         }
     }
     println!(
