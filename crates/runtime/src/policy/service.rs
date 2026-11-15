@@ -88,6 +88,7 @@ fn withdraw() {
     schedule::install(None);
     retention::install(None);
     super::offload::install(None);
+    super::batch::install(None);
     super::withdraw_published();
 }
 
@@ -329,6 +330,9 @@ fn enact(registry: &mut Registry, commit: Commit, policy: &str) {
             default: table.default.map(by_rule),
         }));
     }
+    if let Some(tokens) = commit.batch {
+        super::batch::install(tokens);
+    }
     if let Some(table) = commit.retention {
         retention::install(Some(by_owner(table)));
         crate::planner::rekey_holders();
@@ -448,6 +452,8 @@ struct Cache {
     bytes: fn(Tier) -> Option<pressure::Bytes>,
     /// What a kv page and a state slot take.
     scale: fn() -> Option<pressure::Scale>,
+    /// The most tokens, then lanes, one fire carries on every engine.
+    fire: fn() -> Option<(usize, usize)>,
 }
 
 const STORES: Cache = Cache {
@@ -526,6 +532,7 @@ const STORES: Cache = Cache {
     resident: |holder| crate::planner::planner_of(holder)?.holder_resident(holder),
     bytes: pressure::meter_bytes,
     scale: pressure::common_scale,
+    fire: crate::engine::fire_limits,
     discard: |owner| {
         let mut freed = 0;
         for stores in store_registry::all_for_model(0) {
@@ -1232,6 +1239,10 @@ impl Plane for Snapshot {
                     crate::scheduler::last_batch_us().map(|us| Value::Int(us.div_ceil(1000) as i64))
                 }
                 "batch-size" => Some(Value::Int(crate::scheduler::last_batch_size() as i64)),
+                // What one step of the engine carries, the bound a batch of
+                // passes has while no policy states one (`install-batch`).
+                "fire-tokens" => (self.cache.fire)().map(|(tokens, _)| Value::Int(tokens as i64)),
+                "fire-lanes" => (self.cache.fire)().map(|(_, lanes)| Value::Int(lanes as i64)),
                 // Pages cached for later processes are reclaimable, so
                 // they do not count as used, as in vLLM and SGLang.
                 "capacity-tokens" | "used-tokens" => {
@@ -1335,6 +1346,7 @@ mod tests {
         resident: |_| None,
         bytes: |_| None,
         scale: || None,
+        fire: || None,
     };
 
     fn arrive(registry: &mut Registry, tenant: &str, session: Option<&str>) -> ProcessId {
@@ -1451,6 +1463,7 @@ mod tests {
         resident: |_| None,
         bytes: |_| None,
         scale: || None,
+        fire: || Some((5120, 256)),
     };
 
     #[test]
@@ -1701,6 +1714,9 @@ mod tests {
         // 100 of 400 pages below the device hold suspended kv.
         assert_eq!(worker("swap-capacity-tokens"), show(Some(Value::Int(6400))));
         assert_eq!(worker("swap-used-tokens"), show(Some(Value::Int(1600))));
+        // What one fire carries on every engine.
+        assert_eq!(worker("fire-tokens"), show(Some(Value::Int(5120))));
+        assert_eq!(worker("fire-lanes"), show(Some(Value::Int(256))));
         assert!(plane.discardable(&gone.to_string()));
         assert!(!plane.discardable(&live.to_string()), "live");
         assert!(!plane.discardable(&uncached.to_string()), "not cached");

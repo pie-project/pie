@@ -191,6 +191,21 @@ pub fn live(engine_id: usize) -> ::engine::live::Live {
         .unwrap_or_default()
 }
 
+/// What one fire carries at most on every registered engine: the fewest
+/// tokens, then the fewest lanes, any of them states. None before an engine
+/// is registered.
+#[must_use]
+pub fn fire_limits() -> Option<(usize, usize)> {
+    let engines = registry().lock().unwrap();
+    smallest_fire(engines.iter().flatten().map(|r| r.spec.limits))
+}
+
+fn smallest_fire(limits: impl Iterator<Item = SchedulerLimits>) -> Option<(usize, usize)> {
+    limits
+        .map(|limits| (limits.max_forward_tokens, limits.max_forward_requests))
+        .reduce(|(tokens, lanes), (t, l)| (tokens.min(t), lanes.min(l)))
+}
+
 pub fn get_spec(engine_id: usize) -> Result<EngineSpec> {
     registry()
         .lock()
@@ -218,4 +233,32 @@ pub fn unregister_engine(engine_id: usize) -> Result<()> {
     };
     slot.take();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fire_is_what_every_engine_carries() {
+        let limits = |tokens, lanes| SchedulerLimits {
+            max_forward_requests: lanes,
+            max_forward_tokens: tokens,
+            max_page_refs: 0,
+            max_context: 0,
+            prefill_rows: 0,
+            prefill_lanes: 0,
+            max_readouts: 0,
+        };
+        assert_eq!(smallest_fire(std::iter::empty()), None, "no engine yet");
+        assert_eq!(
+            smallest_fire([limits(5120, 256)].into_iter()),
+            Some((5120, 256))
+        );
+        assert_eq!(
+            smallest_fire([limits(5120, 64), limits(2048, 256)].into_iter()),
+            Some((2048, 64)),
+            "each the smallest any engine states"
+        );
+    }
 }

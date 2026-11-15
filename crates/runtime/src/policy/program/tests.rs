@@ -283,3 +283,34 @@ fn an_overrun_is_cut_off_at_the_deadline() {
         );
     }
 }
+
+#[test]
+fn a_batch_bound_is_staged_only_under_its_grant_and_none_withdraws_it() {
+    use worker_writes::Host;
+    let state = |grants: &str| {
+        let manifest: Manifest =
+            toml::from_str(&format!("plane = \"worker\"\ngrants = [{grants}]")).unwrap();
+        let mut state = HostState::new("bound", &manifest);
+        state.call = Some(Call::new(Box::new(Fake::default())));
+        state
+    };
+    let staged = |state: &HostState| state.call.as_ref().unwrap().staged.batch;
+
+    let mut granted = state("\"batch\"");
+    assert_eq!(staged(&granted), None, "no call installs nothing");
+    granted.install_batch(Some(8192));
+    assert_eq!(staged(&granted), Some(Some(8192)));
+    granted.install_batch(None);
+    assert_eq!(staged(&granted), Some(None), "none withdraws the bound");
+
+    // Every other grant together does not carry it.
+    let mut refused = state("\"schedule\", \"retention\", \"offload\", \"publish\"");
+    refused.install_batch(Some(8192));
+    assert_eq!(staged(&refused), None, "the manifest does not grant it");
+
+    // Outside a call nothing is staged.
+    let mut idle = state("\"batch\"");
+    idle.call = None;
+    idle.install_batch(Some(8192));
+    assert!(idle.call.is_none());
+}
