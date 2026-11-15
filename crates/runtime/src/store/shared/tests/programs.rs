@@ -156,7 +156,11 @@ async fn a_zero_fire_term_leaves_the_rung_arithmetic_unchanged() {
     assert_eq!(after, before);
     assert_eq!(pool.rung(), 256);
     assert_eq!(pool.span_short(256), 0);
-    assert_eq!(pool.room().act_chunks, 1);
+    assert_eq!(
+        pool.room().act_chunks,
+        12,
+        "the top rung's span: live state's room lies below it at every rung"
+    );
     let mut walk = RungWalk::default();
     assert_eq!(
         walk.step(&pool, 256, 256, 256, 1, 1).unwrap(),
@@ -288,12 +292,13 @@ fn a_fire_term_past_the_device_is_refused() {
     );
 }
 
-/// The bind's wait: with state filling the pool, registering a program
-/// whose term raises the 256 rung's span leaves the wait pending on the
-/// planner; once the room is freed and granted, the raise moves the state
-/// in the wider span down (the engine copying it) and takes the span 3
-/// chunks wider. Closing the program drops the term, and the walk's next
-/// lower gives the room back.
+/// The bind's wait: with live state filling the pool (below the top rung's
+/// span, all it may take) and the weight cache the span the 256 rung
+/// leaves, registering a program whose term raises the 256 rung's span
+/// leaves the wait pending, on the cache's clear and not on the planner
+/// (cache is no room to fund); once it is let go, the raise moves nothing
+/// and takes the span 3 chunks wider. Closing the program drops the term,
+/// and the walk's next lower gives the room back.
 #[tokio::test(flavor = "current_thread")]
 async fn a_program_s_fire_term_widens_the_span_before_its_bind_and_its_close_gives_it_back() {
     let (mut pool, engine) = pool_at_256();
@@ -301,6 +306,7 @@ async fn a_program_s_fire_term_widens_the_span_before_its_bind_and_its_close_giv
     let all = pool
         .take_records(pool.records_available() as usize)
         .unwrap();
+    let cached = span_cache(&mut pool, 16);
     let shared: Shared = Arc::new(Mutex::new(pool));
     let engine = Arc::new(Mutex::new(engine));
     let planner = Arc::new(Planner::default());
@@ -314,24 +320,26 @@ async fn a_program_s_fire_term_widens_the_span_before_its_bind_and_its_close_giv
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
-    assert!(!wait.is_finished(), "the bind waits on the raise's room");
-    let asked = planner.asked.load(Ordering::Acquire);
-    let (short, pages) = shared.lock().unwrap().raise_short(256);
-    assert!(short > 0);
-    assert_eq!(asked, pages, "the room a raise lacks, asked as a waiter");
+    assert!(!wait.is_finished(), "the bind waits on the cache's clear");
+    assert_eq!(
+        planner.asked.load(Ordering::Acquire),
+        0,
+        "nothing asked of the planner"
+    );
+    assert_eq!(shared.lock().unwrap().raise_short(256), (0, 0));
     assert_eq!(
         shared.lock().unwrap().pool().act_reserved(),
         4,
-        "nothing taken before it is funded"
+        "nothing taken before the span is clear"
     );
 
-    // The planner frees room (half the state goes), then grants.
+    // The cache's owner lets it go (the walk has it), the fire reading it
+    // retires, and the rung is told.
     {
         let mut pool = shared.lock().unwrap();
-        pool.give_records(&all[..all.len() / 2]);
-        pool.pool_mut().retire_through(u64::MAX);
+        clear_span_cache(&mut pool, &cached, 1);
     }
-    planner.granted.notify_one();
+    crate::store::shared::rung_changed(TEST_ENGINE);
     wait.await.unwrap().unwrap();
     {
         let pool = shared.lock().unwrap();
@@ -342,13 +350,12 @@ async fn a_program_s_fire_term_widens_the_span_before_its_bind_and_its_close_giv
         assert_eq!(
             engine.lock().unwrap().table.as_slice(),
             pool.pool().chunk_table(),
-            "the engine copied what the raise moved"
+            "nothing moved"
         );
         assert!(pool.copying().is_none());
         // What the engine relies on when it backs its own span: no state
-        // slot lies in the widened span once the wait is through, and the
-        // copy that moved them is done (the wait awaited it).
-        let in_span: Vec<u32> = all[all.len() / 2..]
+        // slot lies in the widened span once the wait is through.
+        let in_span: Vec<u32> = all
             .iter()
             .flat_map(|&record| pool.record_slots(record))
             .map(|slot| pool.pool().physical(slot.chunk).unwrap())
@@ -356,13 +363,13 @@ async fn a_program_s_fire_term_widens_the_span_before_its_bind_and_its_close_giv
             .collect();
         assert!(in_span.is_empty(), "state left in the span: {in_span:?}");
         assert!(
-            engine
+            !engine
                 .lock()
                 .unwrap()
                 .calls
                 .iter()
-                .any(|call| matches!(call, Call::Evacuate(moves) if !moves.is_empty())),
-            "the raise moved state out through the engine's copy"
+                .any(|call| matches!(call, Call::Evacuate(_))),
+            "the raise moved no state"
         );
     }
 
@@ -506,7 +513,9 @@ async fn a_term_past_the_largest_rung_funds_the_widest_that_fits_and_cuts_fires_
 /// A bind is never sent unfunded: the planner's refusal ends the wait with
 /// an error; a raise the engine refuses is taken back, the span and the
 /// state as they were, and refuses the bind too: nothing tries it again on
-/// its own wake.
+/// its own wake. The term here carries the 256 rung's activation far past
+/// the top rung's span's base (20 chunks over its 4: from 40), into live
+/// state: the one raise that moves any.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_whose_room_is_refused_fails_its_wait() {
     struct Refusing;
@@ -539,12 +548,23 @@ async fn a_bind_whose_room_is_refused_fails_its_wait() {
     }
 
     let (mut pool, _) = pool_at_256();
-    pool.fire_facts_learned(key(PROGRAM), &fire_facts());
+    pool.fire_facts_learned(
+        key(PROGRAM),
+        &FireFacts {
+            fixed: 20 * CHUNK,
+            ..FireFacts::default()
+        },
+    );
     let all = pool
         .take_records(pool.records_available() as usize)
         .unwrap();
     let shared: Shared = Arc::new(Mutex::new(pool));
     let _open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
+    assert_eq!(shared.lock().unwrap().pool().act_chunks(256), 24);
+    assert!(
+        shared.lock().unwrap().raise_short(256).0 > 0,
+        "live state in its way"
+    );
     let error = fund_span(&shared, || 256, &Refusing, &NoCopy)
         .await
         .unwrap_err();
@@ -1168,15 +1188,6 @@ fn notices(engine: &FakeEngine) -> Vec<(u32, u32)> {
         .collect()
 }
 
-/// A planner that grants what it is asked.
-struct Grants;
-
-impl Funder for Grants {
-    async fn fund(&self, _pages: u32) -> Result<bool, String> {
-        Ok(true)
-    }
-}
-
 /// `Engine::set_rung(from, to)` is sent only where the rung the engine
 /// holds differs. Each of 64 binds at a standing rung grows the guest
 /// term (twice by a chunk); the room is set aside before the bind is sent,
@@ -1225,28 +1236,25 @@ async fn binds_at_a_standing_rung_send_the_engine_no_notice() {
     assert!(notices(&engine.lock().unwrap()).is_empty());
 }
 
-/// A growth at a standing rung that finds state in the chunks it takes
-/// still sends no notice: the copy of that state goes as its own message,
-/// before the bind, fenced as any raise's.
+/// A growth at a standing rung that finds idle cache in the chunks it
+/// takes (live state never lies in the top rung's span) sends no notice and
+/// no copy: the cache is let go first, and the room set aside moves
+/// nothing, before the bind.
 #[tokio::test(flavor = "current_thread")]
-async fn a_growth_at_a_standing_rung_over_state_sends_the_copy_alone() {
+async fn a_growth_at_a_standing_rung_over_the_span_s_cache_sends_nothing_once_it_is_cleared() {
     let (mut pool, mut engine) = on_demand_at(256);
     let below = pool
         .take_records(pool.records_available() as usize)
         .unwrap();
-    // The 256 rung lends 48..60; span segment 7 backed, state enters 56..60.
+    // The 256 rung leaves 52..60 to cache; span segment 7 backed, the
+    // weight cache takes 56..60.
     assert_eq!(
         walk_segments(&mut pool, 7, 0, &mut engine),
         Retarget::Reached
     );
     assert_eq!(engine.calls.last(), Some(&Call::CommitSpan(1)));
-    let lent = pool
-        .take_records(pool.records_available() as usize)
-        .unwrap();
-    assert!(!lent.is_empty(), "state in the lent span");
-    // Room below for what a wider span moves out.
-    pool.give_records(&below[..below.len() / 2]);
-    pool.pool_mut().retire_through(u64::MAX);
+    assert_eq!(pool.records_available(), 0, "live state takes none of it");
+    let cached = span_cache(&mut pool, 8);
     pool.fire_facts_learned(key(PROGRAM), &fire_facts());
     let sent = engine.calls.len();
     let shared: Shared = Arc::new(Mutex::new(pool));
@@ -1254,27 +1262,38 @@ async fn a_growth_at_a_standing_rung_over_state_sends_the_copy_alone() {
 
     let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
     {
-        let pool = shared.lock().unwrap();
+        let mut pool = shared.lock().unwrap();
+        assert!(
+            pool.plan_raise(256).is_err_and(|error| error.span_cached()),
+            "57..60 holds cache"
+        );
+        assert_eq!(pool.raise_short(256), (0, 0), "nothing to fund");
+        clear_span_cache(&mut pool, &cached, 1);
         let planned = pool.plan_raise(256).unwrap();
-        assert!(!planned.moves.is_empty(), "57..60 holds state");
-        assert!(pool.raise_waits(&planned), "the copy is the engine's first");
+        assert!(planned.moves.is_empty(), "no state moves");
+        assert!(!pool.raise_waits(&planned), "no trip through the lane");
     }
-    fund_span(&shared, || 256, &Grants, &Lane(engine.clone()))
+    fund_span(&shared, || 256, &NoPlanner, &Lane(engine.clone()))
         .await
         .unwrap();
     {
         let engine = engine.lock().unwrap();
         assert!(
-            matches!(&engine.calls[sent..], [Call::Evacuate(moves)] if !moves.is_empty()),
-            "one message, the copy: {:?}",
+            engine.calls[sent..].is_empty(),
+            "nothing sent: {:?}",
             &engine.calls[sent..]
         );
-        assert!(notices(&engine).is_empty());
         let pool = shared.lock().unwrap();
         assert_eq!(pool.pool().act_reserved(), 4 + 3);
         assert_eq!(pool.told(), 256);
         assert!(pool.copying().is_none());
         assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
+        assert!(
+            below
+                .iter()
+                .flat_map(|&record| pool.record_slots(record))
+                .all(|slot| pool.pool().physical(slot.chunk).unwrap() < 52)
+        );
         pool.pool().check();
     }
     drop(open);

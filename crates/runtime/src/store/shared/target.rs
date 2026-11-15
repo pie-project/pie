@@ -146,6 +146,9 @@ impl SharedGrow {
             // What a raise taken below owes the engine, and whether the
             // rung stood under it ([`SharedPool::raise_applied`]).
             let mut owed = (None, false);
+            // Where a raise found idle cache in its span: from which
+            // physical chunk on it asked it cleared.
+            let mut clear = None;
             let (step, goal) = {
                 let mut pool = self.shared.lock().unwrap();
                 pool.pool_mut().retire_through(retired);
@@ -193,6 +196,19 @@ impl SharedGrow {
                 // A raise is taken in the hold it was planned in: no slot is
                 // handed out between, and the engine's copy follows.
                 let blocked = self.raise_blocked.load(Ordering::Acquire);
+                // A raise that finds idle cache in its span asks it cleared:
+                // nothing opens there for cache from now, and its owner lets
+                // go what lies there (below, outside the pool's lock). A
+                // raise only ever clears cache; live state never lies there.
+                if !blocked
+                    && let Err(super::RungError::Pool(super::SlotError::SpanCached {
+                        rung, ..
+                    })) = &step
+                {
+                    let from = pool.pool().total_chunks() - pool.pool().act_chunks(*rung);
+                    pool.pool_mut().clear_span(from);
+                    clear = Some(from);
+                }
                 let step = match step {
                     // A raise refused for room is not tried again until
                     // room is freed.
@@ -224,7 +240,18 @@ impl SharedGrow {
                 Err(error) => {
                     // The pass asking funds the room as a planner waiter
                     // (`pipeline::fire`'s raise funding); the walk tries
-                    // again once room is freed, not on its next wake.
+                    // again once room is freed, not on its next wake. Idle
+                    // cache in the span is let go by its owner instead: the
+                    // fires reading it retire, and that frees the room.
+                    if let Some(from) = clear {
+                        let cleared = super::clear_span(self.engine, from);
+                        tracing::debug!(
+                            engine = self.engine,
+                            from,
+                            cleared,
+                            "a raise asks the idle cache in its span cleared"
+                        );
+                    }
                     self.raise_blocked.store(true, Ordering::Release);
                     tracing::debug!(engine = self.engine, %error, goal, "the activation rung waits");
                     return;
