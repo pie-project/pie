@@ -69,56 +69,6 @@ fn velocity(outs: &[Output]) -> Vec<f32> {
     }
 }
 
-fn npy(rows: usize, width: usize, v: &[f32]) -> Vec<u8> {
-    let mut header =
-        format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({rows}, {width}), }}");
-    while (10 + header.len() + 1) % 64 != 0 {
-        header.push(' ');
-    }
-    header.push('\n');
-    let mut out = b"\x93NUMPY\x01\x00".to_vec();
-    out.extend_from_slice(&(header.len() as u16).to_le_bytes());
-    out.extend_from_slice(header.as_bytes());
-    out.extend(v.iter().flat_map(|x| x.to_le_bytes()));
-    out
-}
-
-/// Every node's values of the step, as `wafer-compile stream --values` reads a capture
-/// (`nodes.json`, `n<node>_{in,out}<k>.npy`; ints as floats).
-fn capture(forward: &mut Forward, trace: &Trace, step: &StreamStep<'_>, dir: &Path) {
-    let all: Vec<usize> = (0..trace.nodes.len()).collect();
-    let (_, caps) = forward.stream_capture(step, &all).expect("the step runs");
-    std::fs::create_dir_all(dir).expect("a capture directory");
-    let mut index = Vec::new();
-    for &node in &all {
-        let (mut ins, mut outs) = (0, 0);
-        let mut files = Vec::new();
-        for c in caps.iter().filter(|c| c.node == node) {
-            let k = if c.input { &mut ins } else { &mut outs };
-            let name = format!("n{node}_{}{k}.npy", if c.input { "in" } else { "out" });
-            *k += 1;
-            let v: Vec<f32> = match &c.values {
-                Values::F32(v) => v.clone(),
-                Values::I32(v) => v.iter().map(|&x| x as f32).collect(),
-            };
-            std::fs::write(dir.join(&name), npy(c.rows, c.width, &v)).expect("a capture file");
-            files.push(format!("\"{name}\": {}", c.value.0));
-        }
-        if !files.is_empty() {
-            index.push(format!(
-                "\"{node}\": {{\"op\": \"{}\", \"values\": {{{}}}}}",
-                trace.nodes[node].op.name(),
-                files.join(", ")
-            ));
-        }
-    }
-    std::fs::write(
-        dir.join("nodes.json"),
-        format!("{{{}}}\n", index.join(",\n")),
-    )
-    .expect("the capture's index");
-}
-
 /// The program's directory, compiled with the capture's values (as M1d's runs were).
 fn compile(trace: &Trace, gold: &Path, out: &Path) {
     let o = kernels_cerebras::stream::Options {
@@ -165,7 +115,7 @@ fn flux_2_minis_entries_are_the_captures() {
     let tmp = tempfile::tempdir().expect("a scratch directory");
     let (gold, prog) = (tmp.path().join("gold"), tmp.path().join("prog"));
     let step = engine_cpu_step(&trace, &inputs);
-    capture(&mut forward, &trace, &step, &gold);
+    common::capture(&mut forward, &trace, &step, &gold);
     compile(&trace, &gold, &prog);
 
     let reading = Reading::open(&prog).expect("host.json states the reading");
@@ -227,7 +177,7 @@ fn flux_2_minis_denoise_loop_answers_diffusers() {
     let (gold, prog) = (tmp.path().join("gold"), tmp.path().join("prog"));
     {
         let step = engine_cpu_step(&trace, &inputs);
-        capture(&mut forward, &trace, &step, &gold);
+        common::capture(&mut forward, &trace, &step, &gold);
     }
     compile(&trace, &gold, &prog);
     let reading = Reading::open(&prog).expect("host.json states the reading");
@@ -281,7 +231,7 @@ fn flux_2_minis_reading_files() {
     let (gold, prog) = (out.join("gold"), out.join("prog"));
     {
         let step = engine_cpu_step(&trace, &inputs);
-        capture(&mut forward, &trace, &step, &gold);
+        common::capture(&mut forward, &trace, &step, &gold);
     }
     compile(&trace, &gold, &prog);
     std::fs::create_dir_all(out.join("inputs")).expect("inputs");

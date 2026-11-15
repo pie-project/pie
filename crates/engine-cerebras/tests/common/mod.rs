@@ -9,7 +9,9 @@ pub mod guest;
 
 use std::path::Path;
 
-use poem_ir::Trace;
+use engine_cpu::Forward;
+use engine_cpu::forward::{StreamStep, Values};
+use poem_ir::{Operands, Trace};
 
 pub const MINI: &str = "flux2-mini-bf16-kv-bf16";
 pub const CHANNELS: usize = 32;
@@ -431,4 +433,69 @@ pub fn contract_for(
         .ok_or_else(|| format!("no catalog deployment {}", trace.name))?
         .contract(&src, trace.platform)
         .map_err(|e| format!("{e:?}"))
+}
+
+pub fn npy(rows: usize, width: usize, v: &[f32]) -> Vec<u8> {
+    let mut header =
+        format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({rows}, {width}), }}");
+    while (10 + header.len() + 1) % 64 != 0 {
+        header.push(' ');
+    }
+    header.push('\n');
+    let mut out = b"\x93NUMPY\x01\x00".to_vec();
+    out.extend_from_slice(&(header.len() as u16).to_le_bytes());
+    out.extend_from_slice(header.as_bytes());
+    out.extend(v.iter().flat_map(|x| x.to_le_bytes()));
+    out
+}
+
+/// Every node's values of the step, as `wafer-compile stream --values` reads a capture
+/// (`nodes.json`, `n<node>_{in,out}<k>.npy`; ints as floats).
+pub fn capture(forward: &mut Forward, trace: &Trace, step: &StreamStep<'_>, dir: &Path) {
+    let all: Vec<usize> = (0..trace.nodes.len()).collect();
+    let (_, caps) = forward.stream_capture(step, &all).expect("the step runs");
+    std::fs::create_dir_all(dir).expect("a capture directory");
+    let mut index = Vec::new();
+    for &node in &all {
+        let (mut ins, mut outs) = (0, 0);
+        let mut files = Vec::new();
+        for c in caps.iter().filter(|c| c.node == node) {
+            let k = if c.input { &mut ins } else { &mut outs };
+            let name = format!("n{node}_{}{k}.npy", if c.input { "in" } else { "out" });
+            *k += 1;
+            let v: Vec<f32> = match &c.values {
+                Values::F32(v) => v.clone(),
+                Values::I32(v) => v.iter().map(|&x| x as f32).collect(),
+            };
+            std::fs::write(dir.join(&name), npy(c.rows, c.width, &v)).expect("a capture file");
+            files.push(format!("\"{name}\": {}", c.value.0));
+        }
+        if !files.is_empty() {
+            index.push(format!(
+                "\"{node}\": {{\"op\": \"{}\", \"values\": {{{}}}}}",
+                trace.nodes[node].op.name(),
+                files.join(", ")
+            ));
+        }
+    }
+    std::fs::write(
+        dir.join("nodes.json"),
+        format!("{{{}}}\n", index.join(",\n")),
+    )
+    .expect("the capture's index");
+}
+
+/// The relative L2 distance of `a` from `b`, and their cosine.
+pub fn rel_cos(a: &[f32], b: &[f32]) -> (f64, f64) {
+    let dot = |x: &[f32], y: &[f32]| {
+        x.iter()
+            .zip(y)
+            .map(|(p, q)| f64::from(*p) * f64::from(*q))
+            .sum::<f64>()
+    };
+    let d: Vec<f32> = a.iter().zip(b).map(|(x, y)| x - y).collect();
+    (
+        (dot(&d, &d) / dot(b, b)).sqrt(),
+        dot(a, b) / (dot(a, a) * dot(b, b)).sqrt(),
+    )
 }

@@ -12,12 +12,14 @@ TOKENIZER = tokenizer(markers = [QWEN_STOP])
 MODELS = [
     model("flux2-klein-4b", template = NO_THINKING, tokenizer = TOKENIZER, arch = "flux_2", layers = 27, vocab = 151936),
     model("flux2-mini", mini = True, template = NO_THINKING, tokenizer = TOKENIZER, arch = "flux_2", layers = 4, vocab = 0),
+    model("flux2-mini-gqa", mini = True, template = NO_THINKING, tokenizer = TOKENIZER, arch = "flux_2", layers = 4, vocab = 0),
 ]
 
 DEPLOYMENTS = [
     deployment("flux2-klein-4b", weights = dtype.bf16, kv = dtype.bf16),
     deployment("flux2-klein-4b", weights = dtype.u4g64, kv = dtype.bf16),
     deployment("flux2-mini", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("flux2-mini-gqa", weights = dtype.bf16, kv = dtype.bf16),
 ]
 
 # The weights of FLUX.2: double-stream blocks over text and image, then
@@ -39,6 +41,16 @@ TRAIN_STEPS = 1000
 TE_TAPS = [9, 18, 27]
 TE_MAX_TOKENS = 512
 
+MINI_DIMS = struct(
+    dim = 256,
+    heads = 2,
+    inter = 256 * MLP_RATIO,
+    context_in = 192,
+    double_blocks = 2,
+    single_blocks = 2,
+    guidance_embeds = True,
+)
+
 DIMS = {
     "flux2-klein-4b": struct(
         dim = 3072,
@@ -49,15 +61,8 @@ DIMS = {
         single_blocks = 20,
         guidance_embeds = False,
     ),
-    "flux2-mini": struct(
-        dim = 256,
-        heads = 2,
-        inter = 256 * MLP_RATIO,
-        context_in = 192,
-        double_blocks = 2,
-        single_blocks = 2,
-        guidance_embeds = True,
-    ),
+    "flux2-mini": MINI_DIMS,
+    "flux2-mini-gqa": MINI_DIMS,
 }
 
 # The miniature's text encoder: a Qwen3 of two layers on the tokenizer's
@@ -75,6 +80,28 @@ QWEN3_MINI = struct(
     eps = QWEN3_4B.eps,
 )
 MINI_TE_TAPS = [2]
+
+# klein's encoder in miniature: grouped-query attention (4 q heads over 2 kv heads), three
+# tapped layers projected into the context as klein's are.
+QWEN3_MINI_GQA = struct(
+    hidden = 256,
+    vocab = QWEN3_4B.vocab,
+    q_heads = 4,
+    kv_heads = 2,
+    head_dim = HEAD_DIM,
+    inter = 384,
+    theta = QWEN3_4B.theta,
+    eps = QWEN3_4B.eps,
+)
+
+# Each model's text encoder: its config, its tapped layers, and whether the taps are projected
+# into the context here (klein's: its context embedder's column blocks) or handed to the
+# denoiser's context embedder side by side (the miniature's).
+TEXT = {
+    "flux2-klein-4b": struct(config = QWEN3_4B, taps = TE_TAPS, project = True),
+    "flux2-mini": struct(config = QWEN3_MINI, taps = MINI_TE_TAPS, project = False),
+    "flux2-mini-gqa": struct(config = QWEN3_MINI_GQA, taps = [1, 2, 3], project = True),
+}
 MINI_VAE = struct(blocks = [32, 32, 32, 32], layers_per_block = 1, groups = 8)
 
 def attn(d, banks):
@@ -131,12 +158,13 @@ def layout(id, deploy):
         fail("plain MHA over 128-wide heads: heads × 128 is the width")
     dim = d.dim
     klein = id == "flux2-klein-4b"
-    taps = TE_TAPS if klein else MINI_TE_TAPS
-    te = encoder(QWEN3_4B if klein else QWEN3_MINI, taps[-1], banks)
+    text = TEXT[id]
+    taps = text.taps
+    te = encoder(text.config, taps[-1], banks)
     te_context = [
-        weight([dim, QWEN3_4B.hidden], banks)
-        for i in range(len(TE_TAPS))
-    ] if klein else None
+        weight([dim, text.config.hidden], banks)
+        for i in range(len(taps))
+    ] if text.project else None
     return struct(
         dims = d,
         kv = dtype.bf16,

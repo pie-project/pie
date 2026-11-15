@@ -9,6 +9,10 @@ diffusers' and transformers' modules, its weights drawn by name as engine-cerebr
                                     (--tokenizer <dir>)
   --text <id,id,...> <out.f32>      the text encoder's rows for those token ids: hidden_states[2] of
                                     Qwen3ForCausalLM (no padding), [T, 192] f32
+  --gqa                             `flux2-mini-gqa`'s encoder instead (klein's in miniature: hidden 256, 4 q
+                                    heads over 2 kv heads, three layers, all tapped): --text gives
+                                    hidden_states[1..3] side by side through the context embedder (the poem's
+                                    `te_context.<i>` column blocks), [T, 256] f32
   --vae <latent.f32> <h>,<w> <out.f32>
                                     AutoencoderKLFlux2's decode of a [h * w, 32] latent (the poem's `latents`
                                     input), the batch norm undone as Flux2KleinPipeline does; [8h * 8w, 3]
@@ -177,7 +181,21 @@ def write_ckpt(out, tokenizer):
 def text_rows(te, ids):
     with torch.no_grad():
         o = te(input_ids=torch.tensor([ids]), output_hidden_states=True, use_cache=False)
-    return o.hidden_states[TE["layers"]][0].float()
+    taps = TE.get("taps")
+    if not taps:
+        return o.hidden_states[TE["layers"]][0].float()
+    # each tapped layer's rows through its column block of the context embedder, summed
+    out = 0
+    for i, l in enumerate(taps):
+        w = torch.as_tensor(plane(f"te_context.{i}", [256, TE["hidden"]])).float()
+        out = out + o.hidden_states[l][0].float() @ w.T
+    return out
+
+
+def use_gqa():
+    """`flux2-mini-gqa`'s encoder: four layers in the state dict (the poem reads three, its last tap
+    before transformers' final norm)."""
+    TE.update(hidden=256, heads=4, kv_heads=2, layers=3, held=4, taps=[1, 2, 3])
 
 
 def decode(vae, latent, h, w):
@@ -198,6 +216,8 @@ def decode(vae, latent, h, w):
 def main():
     a = sys.argv
     tok = a[a.index("--tokenizer") + 1] if "--tokenizer" in a else None
+    if "--gqa" in a:
+        use_gqa()
     if "--ckpt" in a:
         write_ckpt(a[a.index("--ckpt") + 1], tok)
     if "--text" in a:
