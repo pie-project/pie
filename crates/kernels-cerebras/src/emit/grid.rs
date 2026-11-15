@@ -19,7 +19,7 @@ use crate::fabric::Endpoint;
 use crate::floor::Coord;
 use crate::floorplan::stream::{self as fs, COL_CHAIN, KV_CHAIN, KV_RECV, KV_SEND, ROW_CHAIN};
 use crate::stream::grid::{GridProgram, Kind, MvIn, RegIn, Res, Step};
-use crate::stream::host::{BF16, FLAT, HALF, NONE, Span, Word};
+use crate::stream::host::{BF16, FLAT, HALF, NONE, Span, UNIT, Word};
 use crate::stream::unit::Side;
 use crate::wiring::Slot;
 
@@ -1207,6 +1207,20 @@ pub fn tile_spans(g: &GridProgram, m: usize, i: u32, j: u32) -> Vec<Span> {
     let none = |n: u32| [NONE, 0, 0, n, 0, 0, 1, 0];
     let mut s: Vec<Span> = Vec::new();
     let flags = FLAT | cast16(g);
+    if mv.ident {
+        // the identity: one where the input is the output
+        for r in 0..kc {
+            let ki = ins.get(r as usize).copied();
+            for c in 0..nc {
+                let o = outs.get(c as usize).copied().flatten();
+                s.push(match (ki, o) {
+                    (Some(a), Some(b)) if a == b && a < mv.k => [UNIT, 0, 0, 1, 0, flags, 1, 0],
+                    _ => none(1),
+                });
+            }
+        }
+        return s;
+    }
     for r in 0..kc {
         let ki = ins.get(r as usize).copied().filter(|&k| k < mv.k);
         let mut c = 0u32;

@@ -308,7 +308,11 @@ impl Reading {
             ),
             rd: host["rd"].as_u64().map(|r| r as u32),
             clip: host["clip"].as_array().and_then(|c| {
-                let v: Vec<u32> = c.iter().filter_map(|x| x.as_u64()).map(|x| x as u32).collect();
+                let v: Vec<u32> = c
+                    .iter()
+                    .filter_map(|x| x.as_u64())
+                    .map(|x| x as u32)
+                    .collect();
                 <[u32; 3]>::try_from(v).ok()
             }),
         })
@@ -556,7 +560,9 @@ impl Reading {
         for a in self.h2d.iter().filter(|a| a.entry.is_none()) {
             for s in a.statics.iter().flatten() {
                 let v = ValueId(s[0]);
-                if s[0] != kernels_cerebras::stream::host::NONE && !wanted.contains(&v) {
+                let constant = s[0] == kernels_cerebras::stream::host::NONE
+                    || s[0] == kernels_cerebras::stream::host::UNIT;
+                if !constant && !wanted.contains(&v) {
                     wanted.push(v);
                 }
             }

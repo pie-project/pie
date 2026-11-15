@@ -197,7 +197,9 @@ pub enum MvIn {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Mv {
     pub node: u32,
+    /// The weight (none for a move: an identity, its tile the constant one on the diagonal).
     pub weight: ValueId,
+    pub ident: bool,
     pub k: u32,
     pub n: u32,
     pub from: Side,
@@ -741,6 +743,22 @@ impl B<'_> {
             }
         }
         self.avail(&rows)?;
+        // values on both sides (a resnet's shortcut convolution, one matvec off its main
+        // branch's two): each off the last one's side moved across, an identity matvec
+        if self.side_of(&rows).is_err() {
+            let to = self.vals[&rows[rows.len() - 1]].side;
+            for (k, v) in rows.clone().into_iter().enumerate() {
+                if self.vals[&v].side != to {
+                    let m = self.moved(v, to)?;
+                    rows[k] = m;
+                    for i in &mut ins {
+                        if *i == RegIn::Row(v) {
+                            *i = RegIn::Row(m);
+                        }
+                    }
+                }
+            }
+        }
         let side = self.side_of(&rows)?;
         let head = rows.iter().any(|v| self.vals[v].head);
         if head && !rows.iter().all(|v| self.vals[v].head) {
@@ -773,6 +791,36 @@ impl B<'_> {
         });
         self.push(false, Step::Region(r));
         Ok(())
+    }
+
+    /// `v` (made in the current pass's tail) on the other side `to`: an identity matvec.
+    fn moved(&mut self, v: ValueId, to: Side) -> R<ValueId> {
+        let x = self.vals[&v].clone();
+        if x.head {
+            return Err(format!(
+                "value %{}: a move of a value whole at one root",
+                v.0
+            ));
+        }
+        let m = self.pseudo(Val {
+            side: to,
+            ..x.clone()
+        });
+        let cur = self.cur();
+        self.made.insert(m, (cur, false));
+        let i = self.mvs.len();
+        self.mvs.push(Mv {
+            node: u32::MAX,
+            weight: v,
+            ident: true,
+            k: x.width,
+            n: x.width,
+            from: x.side,
+            input: MvIn::Value(v),
+            output: m,
+        });
+        self.push(false, Step::Matvec(i));
+        Ok(m)
     }
 
     /// A region of the program's own (a bias, a group norm's apply): `region` over `ins`.
@@ -961,6 +1009,7 @@ impl B<'_> {
                 self.mvs.push(Mv {
                     node: at,
                     weight: *w,
+                    ident: false,
                     k: taps * c_in,
                     n: c_out,
                     from,
@@ -1138,6 +1187,7 @@ impl B<'_> {
                 self.mvs.push(Mv {
                     node: at,
                     weight: *w,
+                    ident: false,
                     k: width(t, *act),
                     n: width(t, *y),
                     from,
@@ -2010,7 +2060,11 @@ pub fn emulate(g: &GridProgram, get: &dyn Fn(u32) -> R<Rows>) -> R<BTreeMap<u32,
                     };
                     let n = width(mv.output);
                     let mut out = vec![0f32; rows * n];
-                    let w = weight(mv.weight)?;
+                    let w = if mv.ident {
+                        std::rc::Rc::new(Vec::new())
+                    } else {
+                        weight(mv.weight)?
+                    };
                     let wget = |v: u32| -> R<Rows> {
                         if v == mv.weight.0 {
                             Ok((1, w.len(), std::rc::Rc::clone(&w)))

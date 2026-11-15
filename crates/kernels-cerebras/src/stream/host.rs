@@ -286,6 +286,10 @@ pub type Rows = (usize, usize, std::rc::Rc<Vec<f32>>);
 /// `[value, row, col, len, stride, flags, count, step]`.
 pub type Span = [u32; 8];
 
+/// No value but the constant one: `len · count` words of 1.0, cast as `flags` say (an identity
+/// tile's diagonal).
+pub const UNIT: u32 = u32::MAX - 1;
+
 /// The word is the element's IEEE f16 bits (a tile of an IEEE build).
 pub const HALF: u32 = 8;
 /// The word is the element's bf16 bits, rounded to nearest even (a tile of a bf16 build).
@@ -298,6 +302,17 @@ pub fn apply_spans(s: &[Span], get: &dyn Fn(u32) -> R<Rows>) -> R<Vec<u32>> {
     for &[v, row, col, len, stride, flags, count, step] in s {
         if v == NONE {
             out.extend(std::iter::repeat_n(0, len as usize * count as usize));
+            continue;
+        }
+        if v == UNIT {
+            let one = if flags & HALF != 0 {
+                u32::from(half_bits(1.0))
+            } else if flags & BF16 != 0 {
+                bits16(1.0, false)
+            } else {
+                1f32.to_bits()
+            };
+            out.extend(std::iter::repeat_n(one, len as usize * count as usize));
             continue;
         }
         let (rows, width, d) = match held.entry(v) {
