@@ -399,13 +399,13 @@ pub fn stream_programs(
         };
         let dir = stage.path().join(slug(reading));
         let t0 = std::time::Instant::now();
-        match stream::compile(trace, &o, &dir, None) {
-            Ok(p) => {
+        match stream::compile_reading(trace, &o, &dir) {
+            Ok((w, h)) => {
                 tracing::info!(
                     reading = %reading,
                     rows,
-                    w = p.stream.w,
-                    h = p.stream.h,
+                    w,
+                    h,
                     s = t0.elapsed().as_secs_f64(),
                     "cerebras: a stream reading compiled"
                 );

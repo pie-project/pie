@@ -275,7 +275,12 @@ impl CerebrasEngine {
                 let pad = lane.tokens.last().copied().unwrap_or(0);
                 tokens.resize(tokens.len() + class.rows as usize - lane.tokens.len(), pad);
             }
-            if !reading.host_only && lane.tokens.len() != class.rows as usize && !short {
+            // (a grid reading's rows are its clip's voxels: its lane's tokens are none of them)
+            if !reading.host_only
+                && reading.clip.is_none()
+                && lane.tokens.len() != class.rows as usize
+                && !short
+            {
                 return Err(invalid(format!(
                     "lane {at} is word {:#x} of {} rows; the program's lane {at} is `{}` (word \
                      {:#x}) of {} rows",
@@ -301,6 +306,14 @@ impl CerebrasEngine {
                     )));
                 }
             };
+            if let (Some(want), Some(got)) = (reading.clip, clip)
+                && want != got
+            {
+                return Err(invalid(format!(
+                    "lane {at}'s clip is {got:?}; the `{}` program is compiled for {want:?}",
+                    reading.reading
+                )));
+            }
             lanes.push(StreamLane {
                 word: lane.word,
                 rows: if reading.host_only {
@@ -686,7 +699,7 @@ impl CerebrasEngine {
                     host: Forward::host_for(trace.clone(), &of, &all).map_err(load)?,
                     link: std::path::PathBuf::new(),
                     statics: Some(Arc::new(Vec::new())),
-                    steps: 0,
+                        steps: 0,
                 });
             }
         }

@@ -159,6 +159,9 @@ pub struct Reading {
     pub causal: bool,
     /// No program runs it: the host's forward makes its outputs whole ([`Reading::host_only`]).
     pub host_only: bool,
+    /// The clip a grid reading's program is compiled for (its rows are the clip's voxels, not
+    /// token rows).
+    pub clip: Option<[u32; 3]>,
 }
 
 fn num(v: &Value, k: &str) -> R<u64> {
@@ -295,6 +298,10 @@ impl Reading {
             h: num(&host, "h")? as u32,
             causal: host["causal"].as_bool().unwrap_or(false),
             host_only: false,
+            clip: host["clip"].as_array().and_then(|c| {
+                let v: Vec<u32> = c.iter().filter_map(|x| x.as_u64()).map(|x| x as u32).collect();
+                <[u32; 3]>::try_from(v).ok()
+            }),
         })
     }
 
@@ -327,6 +334,7 @@ impl Reading {
             h: 0,
             causal: false,
             host_only: true,
+            clip: None,
         }
     }
 
