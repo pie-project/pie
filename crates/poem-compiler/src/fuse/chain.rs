@@ -686,8 +686,9 @@ fn lowers(op: &Operation) -> bool {
 
 /// Whether this module lowers `op` when a run names it ([`lower_run`]),
 /// though no chain forms over it: a rotation over position axes (a
-/// diffusion transformer's), whose positions are a row's elements, and a
-/// gated MLP's activation over its packed `[gate | up]` row.
+/// diffusion transformer's), whose positions are a row's elements, a
+/// gated MLP's activation over its packed `[gate | up]` row, and a VAE
+/// latent's standardisation (`(x - mean) * rscale` a channel).
 fn lowers_explicitly(op: &Operation) -> bool {
     matches!(
         op,
@@ -707,7 +708,7 @@ fn lowers_explicitly(op: &Operation) -> bool {
             limit: None,
             act: GluAct::Swiglu | GluAct::GegluTanh,
             ..
-        })
+        }) | Operation::Elemwise(Elemwise::Standardize { .. })
     )
 }
 
@@ -1318,6 +1319,16 @@ impl Builder {
             Elemwise::AddBias { bias, out, out_out } => {
                 let z = self.push(Op::Binary(Binary::Add, self.get(*out)?, self.get(*bias)?));
                 self.set(*out_out, z);
+            }
+            Elemwise::Standardize {
+                x,
+                bias,
+                scale,
+                x_out,
+            } => {
+                let d = self.push(Op::Binary(Binary::Sub, self.get(*x)?, self.get(*bias)?));
+                let z = self.push(Op::Binary(Binary::Mul, d, self.get(*scale)?));
+                self.set(*x_out, z);
             }
             Elemwise::Binary { x, y, op, z } => {
                 let (x, y) = (self.get(*x)?, self.get(*y)?);
