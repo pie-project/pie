@@ -1771,7 +1771,7 @@ impl FrameShell for Shell {
                 let fold = rs_folded[row.source as usize].or_else(|| {
                     envelope_of[row.source as usize].and_then(|(held, at)| {
                         let cells = resolved[held].fold.as_ref()?;
-                        cells.get(at).or_else(|| cells.first()).copied()
+                        fold_cell(cells, at)
                     })
                 });
                 let report = super::KvReport {
@@ -1911,7 +1911,7 @@ fn stated_fold(len: FoldLen, lane: usize, port: Option<&[u32]>) -> Result<u32> {
                     ),
                 )
             })?;
-            *cells.get(lane).or_else(|| cells.first()).ok_or_else(|| {
+            fold_cell(cells, lane).ok_or_else(|| {
                 Fault::program(
                     "serve::rs",
                     format!(
@@ -1923,6 +1923,15 @@ fn stated_fold(len: FoldLen, lane: usize, port: Option<&[u32]>) -> Result<u32> {
             })?
         }
     })
+}
+
+/// Lane `lane`'s fold in a `fold` port's cell: a cell of one entry states
+/// every lane's fold, a longer one a fold a lane, and a lane past it none.
+fn fold_cell(cells: &[u32], lane: usize) -> Option<u32> {
+    match cells {
+        [every] => Some(*every),
+        cells => cells.get(lane).copied(),
+    }
 }
 
 /// The slots the state in record `slot` holds as a lane's fire finds it.
@@ -2092,7 +2101,16 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::{fold_held, readout_extent};
+    use super::{fold_cell, fold_held, readout_extent};
+
+    #[test]
+    fn a_fold_cell_states_every_lanes_fold_or_a_fold_a_lane() {
+        assert_eq!(fold_cell(&[3], 0), Some(3));
+        assert_eq!(fold_cell(&[3], 5), Some(3));
+        assert_eq!(fold_cell(&[3, 4], 1), Some(4));
+        assert_eq!(fold_cell(&[3, 4], 2), None);
+        assert_eq!(fold_cell(&[], 0), None);
+    }
 
     #[test]
     fn a_readout_as_tall_as_the_fire_holds_the_bucket() {
