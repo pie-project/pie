@@ -6,6 +6,8 @@ mod link;
 pub mod peer;
 
 pub use controller_api::StateReport;
+
+pub const LINK_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub use data::{Accepted, BlobRef, Control, Priority, Request, Tokens};
 pub use link::{
     ChannelOrIoError, TwoWayMessage, accept_gateway_link, connect_gateway_link, dispatch_codec,
