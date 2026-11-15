@@ -100,6 +100,12 @@ impl Plane {
 /// state them.
 pub const CHANNEL: engine::chunk::ShapeId = engine::chunk::ShapeId((1 << 17) + 1);
 
+/// The pool's `Adapter` slots (`SlotRole::Adapter`): one plane of one
+/// adapter (a LoRA bank's row: one site, layer and side) a slot, as many a
+/// chunk as fit, the slot the largest such plane in whole pool rows. Stated
+/// only in the load's facts, as `CHANNEL` is.
+pub const ADAPTER: engine::chunk::ShapeId = engine::chunk::ShapeId((1 << 17) + 2);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// The kv list.

@@ -118,7 +118,8 @@ pub struct Xla {
     next_fire: u64,
     next_frame: u64,
     sink: Option<engine::CompletionSink>,
-    adapters: BTreeMap<InstanceId, crate::adapter::Binding>,
+    /// The adapter each instance bound: its id (first `Adapter` slot).
+    adapters: BTreeMap<InstanceId, u32>,
     /// What the engine counts while it serves, read by the runtime: a
     /// program a fire waited on (Compiled), a guest pass the host
     /// interprets (Fallback), a frame or registration refused (Refused).
@@ -223,8 +224,7 @@ pub(crate) fn fault(fault: Fault) -> Error {
         | Fault::Unaffine { .. }
         | Fault::Unstructured { .. }
         | Fault::Straddled { .. }
-        | Fault::Adapter { .. }
-        | Fault::Blob { .. } => Error::Load(fault.to_string()),
+        | Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Ceiling { what, need, have } => Error::Impossible(format!(
             "this fire wants {need} {what} and the load reserved {have}"
         )),
@@ -236,11 +236,6 @@ pub(crate) fn fault(fault: Fault) -> Error {
         | Fault::Adapterless { .. }
         | Fault::AdapterWord { .. }
         | Fault::Fire(_) => Error::Invalid(fault.to_string()),
-        Fault::AdapterSlots { .. } => Error::Exhausted {
-            resource: "adapter slots",
-            wanted: 1,
-            available: 0,
-        },
         Fault::Program { .. } => Error::Program(fault.to_string()),
         Fault::Residency(_) => Error::Impossible(fault.to_string()),
     }
@@ -301,12 +296,17 @@ fn patch_bytes(
     }
 }
 
+/// Lands the adapter an instance of `program` carries, its planes the
+/// bind's seeds, in the `Adapter` slots the runtime took (`slots`): where
+/// another instance landed the same adapter there it joins it. Its adapter
+/// id, what its lanes route by; None where it carries none.
 fn adapter_of(
     shell: &mut Shell,
     package: &eta_compiler::codegen::launch::LaunchPackage,
     instance: InstanceId,
     seeds: &[(u32, Vec<u8>)],
-) -> EngineResult<Option<crate::adapter::Binding>> {
+    slots: &[u32],
+) -> EngineResult<Option<u32>> {
     let Some(sink) = crate::adapter::sink_of(package).map_err(fault)? else {
         return Ok(None);
     };
@@ -327,18 +327,8 @@ fn adapter_of(
             })?;
         built.extend(crate::adapter::planes_of(*role, site, wire, &seats).map_err(fault)?);
     }
-    let planes: Vec<crate::weights::AdapterPlane<'_>> = built
-        .iter()
-        .map(|(bank, bytes)| crate::weights::AdapterPlane {
-            bank: bank.as_str(),
-            bytes,
-        })
-        .collect();
     shell
-        .bind_adapter(crate::adapter::Source::Own {
-            instance,
-            planes: &planes,
-        })
+        .land_adapter(instance, slots, &built)
         .map(Some)
         .map_err(fault)
 }
@@ -535,7 +525,7 @@ impl Engine for Xla {
             rs_verbs: shell.serves_rs_verbs(),
             rs_snapshots: shell.snapshots(),
             bidirectional_attention: true,
-            adapter_attachments: false,
+            adapter_attachments: true,
             facts: shell.trace().facts.clone(),
             inputs: shell.input_decls(),
             classes: shell.classes(),
@@ -613,10 +603,53 @@ impl Engine for Xla {
     /// program's carried channels on the device; every other ring lives on
     /// the host. No `Instance` slots: the bind-time tables stay host-side.
     fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
+        // The adapter its `lora` sink lands: one plane a bank row, an
+        // `Adapter` slot each, taken once a content key and shared by
+        // every holder.
+        let sink = match self.programs.package(program) {
+            Some(package) => crate::adapter::sink_of(package).map_err(fault)?,
+            None => None,
+        };
+        let adapter = match (sink, self.shell.as_ref()) {
+            (Some(sink), Some(shell)) => {
+                let banks =
+                    crate::adapter::plane_banks(&sink, &shell.bank_seats()).map_err(fault)?;
+                engine::program::Footprint {
+                    bytes: banks.len() as u64 * shell.pools().adapter_slot(),
+                    slots: u32::try_from(banks.len()).unwrap_or(u32::MAX),
+                    contiguous: false,
+                }
+            }
+            _ => engine::program::Footprint::default(),
+        };
         Ok(engine::program::ProgramFacts {
             rings: self.programs.compiled_form(program).map_or_else(Vec::new, |c| c.rings()),
+            adapter,
             ..Default::default()
         })
+    }
+
+    /// The adapter a binding lands, keyed by its content
+    /// ([`crate::adapter::adapter_digest`]): its sink's site word and, in
+    /// the sink's plane order, each plane's bank role and seed.
+    fn adapter_key(&self, binding: &InstanceBinding) -> EngineResult<Option<u128>> {
+        let Some(package) = self.programs.package(binding.program) else {
+            return Ok(None);
+        };
+        let Some(sink) = crate::adapter::sink_of(package).map_err(fault)? else {
+            return Ok(None);
+        };
+        Ok(Some(crate::adapter::adapter_digest(
+            sink.sites,
+            sink.planes.iter().map(|(role, channel)| {
+                let wire = binding
+                    .seeds
+                    .iter()
+                    .find(|seed| seed.channel == *channel)
+                    .map_or(&[][..], |seed| seed.bytes.as_slice());
+                (role.bank(), wire)
+            }),
+        )))
     }
 
     fn register_channel(
@@ -647,7 +680,19 @@ impl Engine for Xla {
     /// XLA keeps no registered channel's ring in the pool.
     fn rebind_slots(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
         match rebind {
-            engine::program::Rebind::Instance { id, rings, .. } => {
+            engine::program::Rebind::Instance {
+                id, rings, adapter, ..
+            } => {
+                if let (Some(held), Some(shell)) = (self.adapters.get_mut(&id), self.shell.as_mut())
+                    && !adapter.is_empty()
+                {
+                    *held = shell.rebind_adapter(*held, &adapter).ok_or_else(|| {
+                        Error::Program(format!(
+                            "instance {id:?}'s adapter moved to slots {adapter:?}, which \
+                             hold no adapter it landed"
+                        ))
+                    })?;
+                }
                 let shell = self.shell.as_ref();
                 let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));
                 self.programs.rebind(id, &rings, &cell_row).map_err(refusal)
@@ -677,7 +722,9 @@ impl Engine for Xla {
             .collect();
         let package = self.programs.package(binding.program).cloned();
         let landed = match (package, self.shell.as_mut()) {
-            (Some(package), Some(shell)) => adapter_of(shell, &package, bound.id, &seeds),
+            (Some(package), Some(shell)) => {
+                adapter_of(shell, &package, bound.id, &seeds, &binding.adapter_slots)
+            }
             _ => Ok(None),
         };
         match landed {
@@ -695,23 +742,20 @@ impl Engine for Xla {
 
     fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
         if let (Some(held), Some(shell)) = (self.adapters.remove(&id), self.shell.as_mut()) {
-            shell.release_adapter(&held);
+            shell.release_adapter(id, held);
         }
         self.programs.close_instance(id).map_err(refusal)
     }
 
+    /// Refused: an adapter is an instance's, landed at its bind in the
+    /// pool's `Adapter` slots, never one the operator seats by id.
     fn register_adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
-        let planes: Vec<crate::weights::AdapterPlane<'_>> = registration
-            .planes
-            .iter()
-            .map(|plane| crate::weights::AdapterPlane {
-                bank: plane.bank.as_str(),
-                bytes: &plane.bytes,
-            })
-            .collect();
-        self.loaded_mut()?
-            .register_adapter(registration.id, &planes)
-            .map_err(fault)
+        Err(Error::Invalid(format!(
+            "adapter {} registered by id: an adapter lands at the bind of the program \
+             instance that carries it, in the pool's Adapter slots, keyed by its \
+             content; this engine seats none by id",
+            registration.id
+        )))
     }
 
     fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
@@ -1382,7 +1426,7 @@ impl Xla {
             if let Some(bound) = self.adapters.get(&attachment.instance)
                 && let Some(slot) = lane_adapters.get_mut(attachment.lane as usize)
             {
-                *slot = Some(bound.slot);
+                *slot = Some(*bound);
             }
         }
         let (kv_shape, window_shape) = self.shell.as_ref().map_or((None, None), |shell| {

@@ -32,7 +32,7 @@ impl Shell {
             state_slots: 0,
             buffer_pages: 0,
             state_slot_bytes: pools.state_slot_bytes(),
-            adapter_banks: u32::try_from(self.banks().len()).unwrap_or(u32::MAX),
+            adapter_banks: u32::try_from(self.bank_seats().len()).unwrap_or(u32::MAX),
             window_tokens: paging.window.map_or(0, |window| window.tokens),
             seated_first: self.seats()[0],
             seat_to_end: self.seats()[1],

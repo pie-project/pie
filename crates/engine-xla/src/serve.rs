@@ -273,8 +273,7 @@ pub struct Shell {
     wide: poem_ir::ClassSet,
     corrected: poem_ir::ClassSet,
     adapter_fact: Option<u32>,
-    adapters: crate::adapter::Slots,
-    blobs: crate::blob::Store,
+    adapters: crate::adapter::Landings,
     held: Vec<u32>,
     states_mrope: bool,
     patch_seat: Option<PatchSeat>,
@@ -923,7 +922,7 @@ impl Shell {
             )
         });
         let adapter_fact = compiled.classes.adapter_fact(&corrected);
-        let adapters = crate::adapter::Slots::new(weights.adapter_seats());
+        let adapters = crate::adapter::Landings::default();
         let readout_rowed = (
             std::sync::Arc::new(crate::rows::readout_rowed(&boot.trace)),
             crate::rows::readout_probe(&boot.trace),
@@ -956,7 +955,6 @@ impl Shell {
             corrected,
             adapter_fact,
             adapters,
-            blobs: crate::blob::Store::new(),
             held: vec![0; slots as usize],
             states_mrope,
             patch_seat,
@@ -1361,88 +1359,115 @@ impl Shell {
         Ok(())
     }
 
-    pub fn register_adapter(
-        &mut self,
-        id: u32,
-        planes: &[crate::weights::AdapterPlane<'_>],
-    ) -> Result<()> {
-        self.weights
-            .register_adapter(&self.device, &self.trace, id, planes)
-    }
-
     #[must_use]
     pub fn bank_seats(&self) -> Vec<crate::weights::BankSeat> {
         self.weights.bank_seats()
     }
 
-    #[must_use]
-    pub fn banks(&self) -> Vec<(&str, u32, u64)> {
-        self.weights.banks()
-    }
-
-    pub fn bind_adapter(
+    /// Lands the adapter `instance` carries: `planes` (bank, bytes), in
+    /// [`crate::adapter::plane_banks`] order, one an `Adapter` slot of
+    /// `slots`. Where the runtime handed slots another instance landed (the
+    /// same content key) it joins that landing. Its id, what its lanes route
+    /// by: the first slot.
+    pub fn land_adapter(
         &mut self,
-        source: crate::adapter::Source<'_>,
-    ) -> Result<crate::adapter::Binding> {
-        let key = match source {
-            crate::adapter::Source::Own { instance, .. } => crate::adapter::Key::Instance(instance),
-            crate::adapter::Source::Shared { name } => {
-                crate::adapter::Key::Shared(self.blobs.stamp(name)?)
-            }
-        };
-        let shared = matches!(source, crate::adapter::Source::Shared { .. });
-        let grant = self.adapters.acquire(key.clone())?;
-        if !grant.fresh {
-            return Ok(crate::adapter::Binding {
-                slot: grant.slot,
-                shared,
-                landed: false,
-                key,
+        instance: engine::program::InstanceId,
+        slots: &[u32],
+        planes: &[(String, Vec<u8>)],
+    ) -> Result<u32> {
+        if slots.len() != planes.len() || slots.is_empty() {
+            return Err(Fault::Adapter {
+                bank: planes.first().map_or_else(String::new, |(name, _)| name.clone()),
+                why: format!(
+                    "lands {} planes and the runtime took {} `Adapter` slots for it; the \
+                     facts state one slot a plane",
+                    planes.len(),
+                    slots.len()
+                ),
             });
         }
-        let landed = match source {
-            crate::adapter::Source::Own { planes, .. } => {
-                self.weights
-                    .register_adapter(&self.device, &self.trace, grant.slot, planes)
-            }
-            crate::adapter::Source::Shared { name } => {
-                let seats = self.weights.bank_seats();
-                match self.blobs.planes(name, &seats) {
-                    Ok((built, _fingerprint)) => {
-                        let planes: Vec<crate::weights::AdapterPlane<'_>> = built
-                            .iter()
-                            .map(|(bank, bytes)| crate::weights::AdapterPlane {
-                                bank: bank.as_str(),
-                                bytes,
-                            })
-                            .collect();
-                        self.weights.register_adapter(
-                            &self.device,
-                            &self.trace,
-                            grant.slot,
-                            &planes,
-                        )
-                    }
-                    Err(why) => Err(why),
-                }
-            }
-        };
-        match landed {
-            Ok(()) => Ok(crate::adapter::Binding {
-                slot: grant.slot,
-                shared,
-                landed: true,
-                key,
-            }),
-            Err(why) => {
-                self.adapters.abandon(&key);
-                Err(why)
-            }
+        if let Some(id) = self.adapters.join(instance, slots) {
+            return Ok(id);
         }
+        let slot_bytes = self.pools.adapter_slot();
+        if let Some((bank, bytes)) = planes.iter().find(|(_, b)| b.len() as u64 > slot_bytes) {
+            return Err(Fault::Adapter {
+                bank: bank.clone(),
+                why: format!(
+                    "a plane of {} bytes past an `Adapter` slot of {slot_bytes}",
+                    bytes.len()
+                ),
+            });
+        }
+        let fills: Vec<(u32, &[u8])> = slots
+            .iter()
+            .zip(planes)
+            .map(|(&slot, (_, bytes))| (slot, bytes.as_slice()))
+            .collect();
+        self.pools
+            .write_adapter(&self.device, &self.handles, &fills)?;
+        let banks: Vec<String> = planes.iter().map(|(bank, _)| bank.clone()).collect();
+        Ok(self.adapters.land(instance, slots, banks))
     }
 
-    pub fn release_adapter(&mut self, binding: &crate::adapter::Binding) {
-        self.adapters.release(&binding.key);
+    /// The planes a fire of `adapters` (its distinct adapters, as its lanes
+    /// route) reads: the pool, and for each registered bank the first pool
+    /// row of each adapter's plane of it, `k` of them, `k` the power of two
+    /// at or past the count (the padding repeats the first: no lane routes
+    /// to it).
+    fn adapter_planes(
+        &self,
+        handles: &Handles,
+        inputs: &mut crate::inputs::Inputs,
+        adapters: &[u32],
+    ) -> Result<crate::run::AdapterPlanes> {
+        let pool = self.pools.root();
+        let k = adapters.len().max(1).next_power_of_two();
+        let mut banks = Vec::new();
+        for (param, p) in self.trace.params.iter().enumerate() {
+            if p.source != poem_ir::ParamSource::Registered {
+                continue;
+            }
+            let plane: u64 = p.shape.get(1..).unwrap_or(&[]).iter().product();
+            let mut starts = Vec::with_capacity(k);
+            for &id in adapters {
+                let slot = self.adapters.slot_of(id, &p.name).ok_or_else(|| Fault::Adapter {
+                    bank: p.name.clone(),
+                    why: format!(
+                        "a lane routes to adapter {id}, which landed no plane of this bank"
+                    ),
+                })?;
+                let row = self.pools.adapter_row(slot).ok_or_else(|| Fault::Unbound {
+                    what: format!("Adapter slot {slot}, which lies past the pool"),
+                })?;
+                starts.push(i32::try_from(row).map_err(|_| Fault::Ceiling {
+                    what: "pool rows an adapter view row names",
+                    need: u64::from(row),
+                    have: i32::MAX as u64,
+                })?);
+            }
+            let first = starts.first().copied().unwrap_or(0);
+            starts.resize(k, first);
+            banks.push((
+                param,
+                u32::try_from(plane).unwrap_or(u32::MAX),
+                inputs.i32s(handles, &starts, 1),
+            ));
+        }
+        Ok((pool, banks))
+    }
+
+    /// `instance` lets go of adapter `id`.
+    pub fn release_adapter(&mut self, instance: engine::program::InstanceId, id: u32) {
+        self.adapters.release(instance, id);
+    }
+
+    /// Adapter `id` moved to `slots`; its id now.
+    pub fn rebind_adapter(&mut self, id: u32, slots: &[u32]) -> Option<u32> {
+        match self.adapters.slots(id) {
+            Some(_) => self.adapters.rebind(id, slots),
+            None => slots.first().copied().filter(|&first| self.adapters.slots(first).is_some()),
+        }
     }
 
     #[must_use]
@@ -1869,6 +1894,14 @@ impl Shell {
         let mut record_rows: Vec<Vec<i32>> = vec![Vec::with_capacity(rows as usize); records.len()];
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(submitted.len());
         let any_adapter = lanes.iter().any(|s| s.adapter.is_some());
+        // The fire's distinct adapters, in lane order: a lane routes by its
+        // adapter's place here, and the fire gathers these planes alone.
+        let mut fire_adapters: Vec<u32> = Vec::new();
+        for id in lanes.iter().filter_map(|s| s.adapter) {
+            if !fire_adapters.contains(&id) {
+                fire_adapters.push(id);
+            }
+        }
         let mut adapter_routes: Vec<i32> = Vec::new();
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(submitted.len());
         let mut rs_active = false;
@@ -1974,10 +2007,13 @@ impl Shell {
                 return Err(Fault::Adapterless { lane: row.source });
             }
             if any_adapter {
-                let id = seated
-                    .adapter
-                    .map_or(-1, |id| i32::try_from(id).unwrap_or(-1));
-                adapter_routes.extend(std::iter::repeat_n(id, row.rows as usize));
+                let route = seated.adapter.map_or(-1, |id| {
+                    fire_adapters
+                        .iter()
+                        .position(|&a| a == id)
+                        .map_or(-1, |at| i32::try_from(at).unwrap_or(-1))
+                });
+                adapter_routes.extend(std::iter::repeat_n(route, row.rows as usize));
             }
             let _ = runs_correction;
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
@@ -2286,6 +2322,10 @@ impl Shell {
             .map(|rows| inputs.i32s(handles, rows, 1))
             .collect();
         let adapter_t = any_adapter.then(|| inputs.i32s(handles, &adapter_routes, 1));
+        let adapter_planes = match any_adapter {
+            true => Some(self.adapter_planes(handles, &mut inputs, &fire_adapters)?),
+            false => None,
+        };
         let mrope_t = self.states_mrope.then(|| {
             let mut triples = vec![0i32; rows as usize * 3];
             for row in composition.lanes() {
@@ -2477,6 +2517,7 @@ impl Shell {
             readout_rows: readout_t,
             readout_indptr,
             adapter_routes: adapter_t,
+            adapter_planes,
             mrope_positions: mrope_t,
             patches: patch_bindings,
             clip_slots,
