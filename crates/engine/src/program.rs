@@ -274,4 +274,10 @@ pub struct BoundInstance {
     pub id: InstanceId,
     pub program: ProgramId,
     pub geometry: GeometryClass,
+    /// The engine's standing guest bytes once this instance is bound
+    /// ([`crate::Engine::standing_after`]): its total over every live
+    /// instance, a set shared by instances counted once. 0 where the
+    /// engine keeps none.
+    #[serde(default)]
+    pub standing_guest_bytes: u64,
 }

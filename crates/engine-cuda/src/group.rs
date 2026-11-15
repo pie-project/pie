@@ -482,7 +482,7 @@ impl Engine for Group {
         self.lead(move |rank| rank.bind_instance(&binding))
     }
 
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
+    fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
         self.lead(move |rank| rank.close_instance(id))
     }
 

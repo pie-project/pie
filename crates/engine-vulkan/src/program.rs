@@ -275,6 +275,7 @@ impl Plane {
             id,
             program: binding.program,
             geometry: binding.geometry,
+            standing_guest_bytes: 0,
         })
     }
 

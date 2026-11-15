@@ -391,9 +391,10 @@ impl Engine for Spatial {
         self.programs.bind(binding).map_err(refusal)
     }
 
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
+    fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
         self.drain();
-        self.programs.close_instance(id).map_err(refusal)
+        self.programs.close_instance(id).map_err(refusal)?;
+        Ok(0)
     }
 
     fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {

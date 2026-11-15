@@ -453,6 +453,9 @@ pub struct SlotPool {
     /// every rung's activation ([`Self::act_chunks`]): the term of the
     /// pairs that can be in a fire ([`::engine::GuestTerm`]).
     fire: ::engine::GuestTerm,
+    /// The engine's standing guest bytes, beside the fire term below every
+    /// rung's carve ([`Self::set_standing`]).
+    standing: u64,
     /// The most lanes a fire carries (the engine's `FireLimits::max_lanes`):
     /// a rung of `r` tokens allows `min(r, max_lanes)`.
     max_lanes: u32,
@@ -530,6 +533,7 @@ impl SlotPool {
             act_chunks,
             act: 0,
             fire: ::engine::GuestTerm::default(),
+            standing: 0,
             max_lanes: u32::MAX,
             act_max,
             top_segment,
@@ -650,7 +654,8 @@ impl SlotPool {
 
     /// Activation chunks a fire at `rung` tokens takes: the smallest rung at
     /// or above it, else the largest; with the chunks the guest term takes
-    /// at that rung's lanes ([`Self::set_fire`]).
+    /// at that rung's lanes ([`Self::set_fire`]) and the engine's standing
+    /// guest bytes ([`Self::set_standing`]), one ceil over the two.
     pub fn act_chunks(&self, rung: u32) -> u32 {
         self.act_chunks
             .iter()
@@ -661,11 +666,15 @@ impl SlotPool {
             })
     }
 
-    /// The chunks the guest term takes at a rung of `tokens`: what the
-    /// worst fire of `min(tokens, max_lanes)` lanes lays for the pairs
-    /// open ([`::engine::GuestTerm::bytes`]).
+    /// The chunks the guests take at a rung of `tokens`: what the worst
+    /// fire of `min(tokens, max_lanes)` lanes lays for the pairs open
+    /// ([`::engine::GuestTerm::bytes`]), and beside it what the engine
+    /// keeps standing for every live instance whatever the fire.
     fn fire_chunks(&self, tokens: u32) -> u32 {
-        let bytes = self.fire.bytes(tokens.min(self.max_lanes));
+        let bytes = self
+            .fire
+            .bytes(tokens.min(self.max_lanes))
+            .saturating_add(self.standing);
         u32::try_from(bytes.div_ceil(self.chunk_bytes.max(1))).unwrap_or(u32::MAX)
     }
 
@@ -695,6 +704,29 @@ impl SlotPool {
     /// See [`Self::set_fire`].
     pub fn fire(&self) -> &::engine::GuestTerm {
         &self.fire
+    }
+
+    /// The engine's standing guest bytes from now on
+    /// ([`::engine::Engine::standing_after`]): the span bytes it keeps for
+    /// the live instances of registered programs beside every fire, with
+    /// what the binds under way may add. Set aside below the carve at
+    /// every rung ([`Self::act_chunks`]); nothing moves here, as with
+    /// [`Self::set_fire`]. The bytes it replaces are handed back.
+    pub fn set_standing(&mut self, bytes: u64) -> u64 {
+        std::mem::replace(&mut self.standing, bytes)
+    }
+
+    /// See [`Self::set_standing`].
+    #[must_use]
+    pub fn standing(&self) -> u64 {
+        self.standing
+    }
+
+    /// Whether the guests take nothing of the span at any rung: no fire
+    /// term and nothing standing.
+    #[must_use]
+    pub fn guests_zero(&self) -> bool {
+        self.fire.is_zero() && self.standing == 0
     }
 
     /// The most lanes a fire carries: the engine's `FireLimits::max_lanes`.

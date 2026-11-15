@@ -769,7 +769,7 @@ impl Engine for Rank {
         self.with(|cuda| cuda.bind_instance(binding))
     }
 
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
+    fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
         self.with(|cuda| cuda.close_instance(id))
     }
 

@@ -147,6 +147,22 @@ pub trait Engine: Send {
         Ok(FireFacts::default())
     }
 
+    /// The standing guest bytes the engine would hold once `binding` is
+    /// bound: the span bytes it keeps for the live instances of registered
+    /// programs beside every fire (Metal: the batch tables it lays once a
+    /// set, every set together), computed without changing any state. The
+    /// total changes only at a bind and a close; a set shared by instances
+    /// counts once, so a bind that joins a set already laid adds nothing.
+    /// Asked before every bind is sent: the runtime backs the total below
+    /// the carve, beside the fire term, before the engine lays it. The
+    /// total a bind leaves is [`BoundInstance::standing_guest_bytes`], the
+    /// one a close leaves what [`Engine::close_instance`] returns. The
+    /// default keeps none.
+    fn standing_after(&self, binding: &InstanceBinding) -> Result<u64> {
+        let _ = binding;
+        Ok(0)
+    }
+
     /// The `Channel` slots a registered channel's ring takes, asked before
     /// [`Engine::register_channel`]. `None`: the engine keeps the ring
     /// itself.
@@ -179,7 +195,10 @@ pub trait Engine: Send {
         Err(self.unsupported("bind_instance"))
     }
 
-    fn close_instance(&mut self, id: InstanceId) -> Result<()> {
+    /// Closes instance `id`: the engine's standing guest bytes after the
+    /// close ([`Engine::standing_after`]), less any set no live instance
+    /// shares any more.
+    fn close_instance(&mut self, id: InstanceId) -> Result<u64> {
         let _ = id;
         Err(self.unsupported("close_instance"))
     }

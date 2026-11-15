@@ -928,6 +928,7 @@ impl Engine for Metal {
                 &binding.ring_slots,
             )
             .map_err(fault)?;
+        let standing_guest_bytes = shell.standing_guest_bytes();
         let landed = adapter_of(shell, binding.program, id, &seeds, &binding.adapter_slots);
         let bound = match landed {
             Ok(bound) => bound,
@@ -943,14 +944,26 @@ impl Engine for Metal {
             id,
             program: binding.program,
             geometry: binding.geometry,
+            standing_guest_bytes,
         })
     }
 
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
+    fn standing_after(&self, binding: &InstanceBinding) -> EngineResult<u64> {
+        self.loaded()?
+            .standing_after(
+                binding.program,
+                &extents(&binding.extents),
+                &binding.channels,
+            )
+            .map_err(fault)
+    }
+
+    fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
         self.adapters.remove(&id);
         let shell = self.loaded_mut()?;
         shell.detach_adapter(id);
-        shell.close_program_instance(id).map_err(fault)
+        shell.close_program_instance(id).map_err(fault)?;
+        Ok(shell.standing_guest_bytes())
     }
 
     fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {

@@ -744,11 +744,14 @@ where
         Ok(bound)
     }
 
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
+    fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
         if let (Some(held), Some(shell)) = (self.adapters.remove(&id), self.shell.as_mut()) {
             shell.release_adapter(&held);
         }
-        self.programs.close_instance(id).map_err(refusal)
+        // A guest's tables lie in its slots and its scratch in a buffer of
+        // its own: nothing standing in the span.
+        self.programs.close_instance(id).map_err(refusal)?;
+        Ok(0)
     }
 
     fn register_adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
