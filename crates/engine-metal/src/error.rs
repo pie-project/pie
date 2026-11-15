@@ -139,6 +139,10 @@ pub enum Fault {
 
     Residency(String),
 
+    /// The state pool does not seat one working set beside the widest
+    /// fire's activation under the device's allowance: the load's fit.
+    FitShort(engine::chunk::FitShort),
+
     Backing {
         step: &'static str,
         bytes: u64,
@@ -339,6 +343,7 @@ impl fmt::Display for Fault {
                 "the plan names {what}, which this shell binds no seat for"
             ),
             Self::Residency(why) => write!(f, "{why}"),
+            Self::FitShort(short) => write!(f, "{short}"),
         }
     }
 }
