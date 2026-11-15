@@ -42,12 +42,14 @@
 //! alone (the weight cache's resident atoms above their floor), so raising
 //! the rung only ever clears cache there ([`RungWalk`],
 //! [`SharedPool::plan_raise`], [`SlotError::SpanCached`]): its owner lets
-//! it go, and the fires reading it retire, before the rung is taken. Only a
-//! guest term that carries the activation past the span's base moves live
-//! state out of its way, the engine copying it by
-//! [`::engine::Engine::evacuate`] before the next fire
-//! ([`SharedPool::apply_rung`] once it has). The top `act_chunks_max` span
-//! is committed from the load (unless backed on demand). Segments commit as a prefix (`commit_segments(n)`) ahead of need,
+//! it go, and the fires reading it retire, before the rung is taken. No
+//! raise moves live state: no rung's activation, a guest term's included,
+//! is set aside past the span ([`SlotError::PastSpan`]); a guest fire is
+//! cut to the widest rung whose activation and term fit it
+//! ([`SharedPool::widest_fit`]), and a program whose term fits at no rung
+//! is refused by name at its bind ([`programs::ProgramOpen`]). The top
+//! `act_chunks_max` span is committed from the load (unless backed on
+//! demand). Segments commit as a prefix (`commit_segments(n)`) ahead of need,
 //! off the fire path; a shrink evacuates the highest committed segment of
 //! the prefix (the only one `release_segments` can give back without the
 //! ones above it) and releases it once the fire carrying the copy retires.
@@ -63,7 +65,7 @@ use ::engine::chunk::{
 use super::chunks::STORE;
 use super::segments::{Evacuation, SegmentState};
 use super::slots::{
-    Demand, Holder, RungEvacuation, ShapeId, ShapeKind, Slot, SlotError, SlotPool, SlotPoolFacts,
+    Demand, Holder, RungRaise, ShapeId, ShapeKind, Slot, SlotError, SlotPool, SlotPoolFacts,
     SlotShape,
 };
 use crate::governor::{Demand as Asked, Growth};
@@ -306,22 +308,18 @@ pub fn cap_for(shared: &Shared, rows: u32) -> u32 {
 
 /// One line for a raise taken: at debug where the rung stood (a guest term
 /// that grew under it, once a bind), at info where the rung moved.
-pub(crate) fn raise_said(engine: usize, rung: u32, moved: usize, stood: bool) {
+pub(crate) fn raise_said(engine: usize, rung: u32, stood: bool) {
     if stood {
-        tracing::debug!(
-            engine,
-            rung,
-            moved,
-            "the activation at a standing rung is raised"
-        );
+        tracing::debug!(engine, rung, "the activation at a standing rung is raised");
     } else {
-        tracing::info!(engine, rung, moved, "the activation rung is raised");
+        tracing::info!(engine, rung, "the activation rung is raised");
     }
 }
 
 /// Raises `shared`'s rung at once to the one fires of `rows` take, where
-/// nothing lies in the larger span and the room is there (a raise that must
-/// move state is the walker's, through the engine's copy): the pass asking
+/// nothing lies in the larger span, the room is there and the engine is
+/// owed no carve notice (idle cache in the span is the walker's to have
+/// cleared; a notice goes through the engine's lane): the pass asking
 /// is cut at the raised width from its first piece. A cap the walker
 /// lowered behind a rung still up is lifted back to it.
 pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
@@ -339,8 +337,8 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
         let Some(at) = pool.raise_at(goal) else {
             return;
         };
-        let evacuation = match pool.plan_raise(at) {
-            Ok(evacuation) => evacuation,
+        let raise = match pool.plan_raise(at) {
+            Ok(raise) => raise,
             Err(error) => {
                 // Idle cache lies in the span: the walk has its owner clear
                 // it, and raises then.
@@ -351,15 +349,15 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
             }
         };
         let stood = pool.stands_at(at);
-        if pool.raise_waits(&evacuation) || pool.raise_applied(&evacuation).is_err() {
+        if pool.raise_waits(&raise) || pool.raise_applied(&raise).is_err() {
             return;
         }
-        raise_said(engine, at, 0, stood);
+        raise_said(engine, at, stood);
         rung_changed(engine);
     }
     // The rung holds `goal` now: fires may take its width, once a raise's
-    // copy is the engine's.
-    if pool.copying().is_some() {
+    // carve is the engine's.
+    if pool.raising().is_some() {
         return;
     }
     let cap = lifted(goal);
@@ -390,12 +388,8 @@ pub enum RungStep {
     /// wider is in flight.
     Lower(u32),
     /// Raise the activation to this rung: nothing but idle cache lies in
-    /// its span, cleared first; the engine copies only live state a guest
-    /// term's activation past the span's base takes.
-    Raise {
-        rung: u32,
-        evacuation: RungEvacuation,
-    },
+    /// its span, cleared first, and nothing moves.
+    Raise { rung: u32, raise: RungRaise },
     /// Nothing more until a fire retires or the scheduler grants.
     Wait,
 }
@@ -485,8 +479,8 @@ impl RungWalk {
             // Never under the rung the engine holds: only a lower, above,
             // brings it down ([`SharedPool::raise_at`]).
             let rung = pool.raise_at(goal).unwrap_or(goal);
-            let evacuation = pool.plan_raise(rung)?;
-            return Ok(RungStep::Raise { rung, evacuation });
+            let raise = pool.plan_raise(rung)?;
+            return Ok(RungStep::Raise { rung, raise });
         }
         Ok(if cap == lifted {
             RungStep::Wait
@@ -750,7 +744,7 @@ pub struct SharedPool {
     /// A raise is applied here and its chunks' copy is not yet the
     /// engine's: no fire is let past the rung held before it
     /// ([`Self::raise_applied`]).
-    copying: Option<u32>,
+    raising: Option<u32>,
     /// The activation set aside before the raise whose copy is the
     /// engine's to take: what a refused raise goes back to.
     raise_from: Option<u32>,
@@ -769,10 +763,6 @@ pub struct SharedPool {
     /// The registered programs' fire terms ([`programs`]).
     programs: programs::ProgramFires,
 }
-
-/// The fence epoch a raise's moved-off chunks wait on until the engine has
-/// taken its copy ([`SharedPool::raise_copied`]): no fire retires it.
-const UNTIL_COPIED: u64 = u64::MAX - 1;
 
 /// The engine's moves expressed as `(logical, new physical)`.
 fn engine_moves(moves: &[super::segments::ChunkMove]) -> EngineEvacuation {
@@ -1007,7 +997,7 @@ impl SharedPool {
             free_records: BTreeSet::new(),
             records_most: 0,
             least_chunks: 0,
-            copying: None,
+            raising: None,
             raise_from: None,
             told: 0,
             told_from: None,
@@ -1549,59 +1539,47 @@ impl SharedPool {
 
     // ---- rungs ----
 
-    /// Carries out `evacuation` (planned by [`Self::plan_raise`], copied by
-    /// the engine) and takes its rung; the chunks moved off stay closed
-    /// until the fire at `epoch` retires.
-    pub fn apply_rung(&mut self, evacuation: &RungEvacuation, epoch: u64) -> Result<(), RungError> {
-        self.pool
-            .apply_rung(evacuation, epoch)
-            .map_err(RungError::Pool)
+    /// Takes `raise`'s rung (planned by [`Self::plan_raise`]).
+    pub fn apply_rung(&mut self, raise: &RungRaise) -> Result<(), RungError> {
+        self.pool.apply_rung(raise).map_err(RungError::Pool)
     }
 
-    /// Takes `evacuation`'s rung here, in the same hold of the pool it was
-    /// planned in, so no slot is handed out between plan and apply: the
-    /// chunks it moves off stay fenced, and no fire is let past the rung
-    /// held before, until the engine has the copy ([`Self::raise_copied`]).
-    /// The engine's copy follows ([`Self::rung_moves`]); a raise that moves
-    /// nothing needs none.
-    ///
-    /// The engine may refuse the copy ([`Self::raise_refused`]).
+    /// Takes `raise`'s rung here, in the same hold of the pool it was
+    /// planned in, so no slot is handed out between plan and apply. Nothing
+    /// moves: live state never lies in the top rung's span, and no rung's
+    /// activation reaches past it.
     ///
     /// The notice the engine is sent first (`Engine::set_rung(from, to)`),
     /// where the raise leaves it another rung than it holds and it is told
     /// rungs ([`Self::tells_rungs`]): decided here, in the hold that takes
-    /// the raise. A raise at the rung the engine holds (a guest term grew
-    /// under it) owes none.
-    pub fn raise_applied(
-        &mut self,
-        evacuation: &RungEvacuation,
-    ) -> Result<Option<(u32, u32)>, RungError> {
+    /// the raise. No fire is let past the rung held before until the engine
+    /// has backed the wider rung's carve ([`Self::raise_carved`]); it may
+    /// refuse ([`Self::raise_refused`]). A raise at the rung the engine
+    /// holds (a guest term grew under it) owes none.
+    pub fn raise_applied(&mut self, raise: &RungRaise) -> Result<Option<(u32, u32)>, RungError> {
         let before = self.pool.rung();
         let act = self.pool.act_reserved();
-        if !self.raise_waits(evacuation) {
-            self.apply_rung(evacuation, 0)?;
-            self.tell(evacuation.rung);
+        self.apply_rung(raise)?;
+        if !self.raise_waits(raise) {
+            self.tell(raise.rung);
             return Ok(None);
         }
-        self.apply_rung(evacuation, UNTIL_COPIED)?;
-        self.copying = Some(self.copying.map_or(before, |held| held.min(before)));
+        self.raising = Some(self.raising.map_or(before, |held| held.min(before)));
         self.raise_from = Some(self.raise_from.map_or(act, |held| held.min(act)));
         self.told_from.get_or_insert(self.told);
-        Ok(self.tell(evacuation.rung))
+        Ok(self.tell(raise.rung))
     }
 
-    /// Whether `evacuation`'s raise goes through the engine before fires
-    /// take it: it moves state, which the engine copies first, or it
+    /// Whether `raise` goes through the engine before fires take it: it
     /// leaves an engine that is told rungs (the span backed on demand)
-    /// another rung than it holds, where the engine backs its carve for
-    /// the wider rung first (`Engine::set_rung`). A move-free raise makes
-    /// no lane trip with the span backed from the load, nor at the rung
-    /// the engine holds: a guest term that grew under it is covered by the
-    /// engine inside the bind that grew it.
+    /// another rung than it holds, where the engine backs its carve for the
+    /// wider rung first (`Engine::set_rung`). No lane trip with the span
+    /// backed from the load, nor at the rung the engine holds: a guest term
+    /// that grew under it is covered by the engine inside the bind that
+    /// grew it.
     #[must_use]
-    pub fn raise_waits(&self, evacuation: &RungEvacuation) -> bool {
-        !evacuation.moves.is_empty()
-            || (self.tells_rungs() && self.pool.rung_of(evacuation.rung) != self.told)
+    pub fn raise_waits(&self, raise: &RungRaise) -> bool {
+        self.tells_rungs() && self.pool.rung_of(raise.rung) != self.told
     }
 
     /// The rung the engine holds: the one it was last told.
@@ -1677,47 +1655,39 @@ impl SharedPool {
         self.pool.span_on_demand()
     }
 
-    /// The engine refused `evacuation`'s raise (its carve for the wider
-    /// rung, or the copy): the raise is taken back, the state where it lay
-    /// and the activation the rung in hand's. Fires stay cut to it; a later
-    /// raise may try again. Nothing faults.
-    pub fn raise_refused(&mut self, evacuation: &RungEvacuation) {
+    /// The engine refused a raise (its carve for the wider rung): the raise
+    /// is taken back, the activation the rung in hand's. Fires stay cut to
+    /// it; a later raise may try again. Nothing faults.
+    pub fn raise_refused(&mut self) {
         if let Some(act) = self.raise_from.take() {
-            self.pool.undo_rung(evacuation, act);
+            self.pool.undo_rung(act);
         }
         if let Some(told) = self.told_from.take() {
             self.told = told;
         }
-        self.copying = None;
+        self.raising = None;
     }
 
-    /// The engine has taken a raise's copy, carried by the fire at `epoch`
-    /// (the next it is handed): its chunks moved off reopen once that fire
-    /// retires, and fires may take the raised rung.
-    pub fn raise_copied(&mut self, epoch: u64) {
-        self.pool.refence(UNTIL_COPIED, epoch);
-        self.copying = None;
+    /// The engine backed a raise's carve: fires may take the raised rung.
+    pub fn raise_carved(&mut self) {
+        self.raising = None;
         self.raise_from = None;
         self.told_from = None;
     }
 
-    /// The rung fires may not pass while a raise's copy is the engine's to
-    /// take; `None` when none is.
+    /// The rung fires may not pass while a raise's carve is the engine's to
+    /// back; `None` when none is.
     #[must_use]
-    pub fn copying(&self) -> Option<u32> {
-        self.copying
+    pub fn raising(&self) -> Option<u32> {
+        self.raising
     }
 
-    /// What raising the activation to `rung` moves: the state in its span,
-    /// each chunk to a free one below (empty when nothing is in the way).
-    pub fn plan_raise(&self, rung: u32) -> Result<RungEvacuation, RungError> {
+    /// What raising the activation to `rung` takes: nothing moves; refused
+    /// while idle cache lies in its span ([`SlotError::SpanCached`]) or
+    /// where its activation reaches past the top rung's span
+    /// ([`SlotError::PastSpan`]).
+    pub fn plan_raise(&self, rung: u32) -> Result<RungRaise, RungError> {
         self.pool.plan_rung(rung).map_err(RungError::Pool)
-    }
-
-    /// `evacuation`'s moves as the engine takes them (`Engine::evacuate`).
-    #[must_use]
-    pub fn rung_moves(evacuation: &RungEvacuation) -> EngineEvacuation {
-        engine_moves(&evacuation.moves)
     }
 
     /// The chunks raising the activation to `rung` lacks now, and the kv

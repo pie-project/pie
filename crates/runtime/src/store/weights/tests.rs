@@ -220,8 +220,7 @@ fn a_raise_drops_the_weight_cache_in_its_span_and_moves_nothing() {
     assert_eq!(resident(&cache, 16), Vec::<u32>::new());
     slots.retire_through(7);
     let raise = slots.plan_rung(256).unwrap();
-    assert!(raise.moves.is_empty());
-    slots.apply_rung(&raise, 8).unwrap();
+    slots.apply_rung(&raise).unwrap();
     slots.check();
     slots.release(Holder::WorkingSet(1), &kv, 0);
 }

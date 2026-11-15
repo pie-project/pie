@@ -841,7 +841,6 @@ impl RaiseFunding {
         pid: uuid::Uuid,
         quorum: uuid::Uuid,
         rows: u32,
-        epoch_now: impl Fn() -> u64 + Send + Sync + 'static,
     ) -> Self {
         let stop = Arc::new(tokio::sync::Notify::new());
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -888,10 +887,8 @@ impl RaiseFunding {
                     continue;
                 };
                 if pages == 0 {
-                    // The room is there and idle cache lies in the span
-                    // (or live state a guest term's activation takes): the
-                    // walker has the cache cleared (moves the state, the
-                    // engine copying it) and tells the rung.
+                    // The room is there and idle cache lies in the span:
+                    // the walker has it cleared and tells the rung.
                     tokio::select! {
                         () = &mut watch => {}
                         () = stop.notified() => return,
@@ -910,15 +907,11 @@ impl RaiseFunding {
                 match asked {
                     Ok(crate::planner::Acquired::Granted(grant)) => {
                         // The room is given back and the rung takes it at
-                        // once, the state in its span moved down first,
-                        // before the pass's own pieces open it again.
+                        // once, before the pass's own pieces open it again.
                         // Given back first: its pages go back through the
                         // pool's own lock.
                         drop(grant);
-                        let mover = crate::store::shared::programs::LaneMover {
-                            engine,
-                            epoch_now: &epoch_now,
-                        };
+                        let mover = crate::store::shared::programs::LaneMover { engine };
                         let taken = crate::store::shared::programs::take_raise(
                             &shared,
                             |pool| pool.rung_for(rows),
@@ -926,7 +919,7 @@ impl RaiseFunding {
                         )
                         .await;
                         if let Err(error) = taken {
-                            tracing::error!(engine, %error, "a raise's copy was refused");
+                            tracing::error!(engine, %error, "a raise's carve was refused");
                             *failed.lock().unwrap() = Some(error);
                             crate::store::shared::rung_changed(engine);
                             return;
@@ -1032,16 +1025,8 @@ fn ask_rung(
     let want = crate::store::shared::want_rows(engine, rows);
     let funding = stores.shared.as_ref().and_then(|shared| {
         crate::store::shared::raise_now(shared, engine, rows);
-        (crate::store::shared::fire_cap(engine) < crate::store::shared::cap_for(shared, rows)).then(
-            || {
-                let kv = stores.kv.clone();
-                RaiseFunding::start(shared.clone(), engine, pid, quorum, rows, move || {
-                    crate::store::registry::with_kv_lock(&kv, "raise-funding", |kv| {
-                        kv.current_epoch()
-                    })
-                })
-            },
-        )
+        (crate::store::shared::fire_cap(engine) < crate::store::shared::cap_for(shared, rows))
+            .then(|| RaiseFunding::start(shared.clone(), engine, pid, quorum, rows))
     });
     Some(RungAsk {
         engine,

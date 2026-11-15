@@ -22,15 +22,17 @@
 //! physical chunks of the range, so state chunks lie only below
 //! `total - act_chunks(rung)` ([`SlotPool::state_limit`]). The segments under
 //! the largest rung's activation are committed from the load and never
-//! evacuated or released. Raising the rung first moves whatever state sits
-//! in the new activation span down ([`SlotPool::plan_rung`],
-//! [`SlotPool::apply_rung`]); opening lowest first keeps the top free.
+//! evacuated or released. Live state opens only below the top rung's span
+//! ([`SlotPool::live_limit`]) and no activation is set aside past it
+//! ([`SlotError::PastSpan`]), so raising the rung moves nothing; it only
+//! clears the idle cache a lowered rung left in the span
+//! ([`SlotPool::plan_rung`], [`SlotError::SpanCached`]).
 //!
 //! Logical ids mirror the engine's `ChunkTable`: logical and physical ids are
-//! a permutation of `0..total`, the identity at load, and only an evacuation
-//! changes it, the way `ChunkTable::apply` does (the moved chunk takes the
-//! target's place, the free logical id there takes the moved one's old
-//! place). Opening physical chunk `p` hands out the logical id the table maps
+//! a permutation of `0..total`, the identity at load, and only a segment's
+//! evacuation (a shrink) changes it, the way `ChunkTable::apply` does (the
+//! moved chunk takes the target's place, the free logical id there takes
+//! the moved one's old place). Opening physical chunk `p` hands out the logical id the table maps
 //! to `p`, so the runtime's slot refs and the engine's table always agree.
 //!
 //! The local types stand in for package E1's `engine::chunk` until it lands:
@@ -182,10 +184,14 @@ pub enum SlotError {
     },
     #[error("{needed} chunks do not fit in {committed} committed")]
     Budget { needed: u32, committed: u32 },
-    #[error("rung {rung}'s activation takes {chunks} chunks state holds; evacuate them first")]
+    #[error("rung {rung}'s activation takes {chunks} chunks state holds")]
     Occupied { rung: u32, chunks: u32 },
-    #[error("no free chunk below rung {rung}'s activation for {chunks} chunks in its way")]
-    NoRoom { rung: u32, chunks: u32 },
+    /// A rung whose activation, the guest term's included, takes more than
+    /// the top rung's span: never set aside (live state lies below the
+    /// span), so a guest fire is cut to the widest rung that fits
+    /// (`SharedPool::widest_fit`).
+    #[error("rung {rung}'s activation takes {chunks} chunks, past the top rung's span of {span}")]
+    PastSpan { rung: u32, chunks: u32, span: u32 },
     #[error("a rung evacuation no longer matches the pool")]
     StaleRung,
     /// A claim named a chunk that cannot be taken whole as it stands.
@@ -215,17 +221,16 @@ pub enum SlotError {
     },
 }
 
-/// The state chunks in the way of a rung's activation, each moved to a free
-/// chunk below it; logical ids stand. The engine copies `from` -> `to` and
-/// rewrites its chunk table before the first fire at the rung.
+/// A raise of the activation, as planned: nothing moves, live state never
+/// lying in the top rung's span and no rung's activation reaching past it
+/// ([`SlotPool::plan_rung`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RungEvacuation {
+pub struct RungRaise {
     pub rung: u32,
     /// The rung the activation was set aside for when it was planned.
     pub from: u32,
     /// The activation chunks the rung takes.
     pub act: u32,
-    pub moves: Vec<ChunkMove>,
 }
 
 /// A word bitmap with a count and a hint below which no bit is set.
@@ -496,13 +501,9 @@ pub struct SlotPool {
     physical_to_logical: Vec<u32>,
     /// Free physical chunks.
     free: Bits,
-    /// Free physical chunks of committed segments below the activation, not
-    /// fenced: what may be opened.
+    /// Free physical chunks of committed segments below the activation:
+    /// what may be opened.
     open: Bits,
-    /// Physical chunks a rung evacuation moved state off, kept closed until
-    /// the fire that carries the copy retires, by that fire's epoch.
-    fences: BTreeMap<u64, Vec<u32>>,
-    fenced: Bits,
     /// No chunk at or past this physical id is opened: the engine binds
     /// none there yet ([`Self::set_ceiling`]).
     ceiling: u32,
@@ -570,8 +571,6 @@ impl SlotPool {
             physical_to_logical: (0..total).collect(),
             free,
             open: Bits::new(total, false),
-            fences: BTreeMap::new(),
-            fenced: Bits::new(total, false),
             ceiling: total,
             clearing: total,
             segments,
@@ -593,10 +592,9 @@ impl SlotPool {
     }
 
     /// Whether physical chunk `chunk` may be opened: free, in a committed
-    /// segment, below the activation and not fenced.
+    /// segment, below the activation.
     fn openable(&self, chunk: u32) -> bool {
         self.free.get(chunk)
-            && !self.fenced.get(chunk)
             && chunk < self.state_limit()
             && chunk < self.ceiling
             && self.segments.state(self.segments.of(chunk)) == SegmentState::Committed
@@ -892,7 +890,7 @@ impl SlotPool {
     /// span the rung's activation takes (raise it with [`Self::plan_rung`]
     /// and [`Self::apply_rung`] then).
     pub fn set_rung(&mut self, rung: u32) -> Result<(), SlotError> {
-        let act = self.act_chunks(rung);
+        let act = self.act_in_span(rung)?;
         self.rung_budget(act)?;
         let in_way = self.held_in(self.total - act, self.state_limit()).len() as u32;
         if in_way > 0 {
@@ -916,20 +914,32 @@ impl SlotPool {
         }
     }
 
-    /// The chunks in the way of an activation from physical `limit`, split
-    /// by what lies there: live state below the top rung's span (where a
-    /// guest term carries the activation past the span's base), which a
-    /// raise moves, and idle cache in the span, which it only clears.
-    fn in_way(&self, limit: u32) -> (Vec<u32>, Vec<u32>) {
-        let base = self.live_limit();
+    /// The chunks in the way of an activation from physical `limit`: idle
+    /// cache in the top rung's span, which a raise only clears. Nothing
+    /// else lies there: live state opens below the span's base, and no
+    /// activation set aside reaches past it ([`SlotError::PastSpan`]).
+    fn in_way(&self, limit: u32) -> Vec<u32> {
+        debug_assert!(limit >= self.live_limit(), "an activation past the span");
         let held = self.held_in(limit, self.state_limit());
-        let (live, cached): (Vec<u32>, Vec<u32>) =
-            held.into_iter().partition(|&chunk| chunk < base);
         debug_assert!(
-            cached.iter().all(|&chunk| !self.holds_live(chunk)),
+            held.iter().all(|&chunk| !self.holds_live(chunk)),
             "live state lies in the top rung's span"
         );
-        (live, cached)
+        held
+    }
+
+    /// The activation chunks rung `rung` takes, refused where they reach
+    /// past the top rung's span.
+    fn act_in_span(&self, rung: u32) -> Result<u32, SlotError> {
+        let act = self.act_chunks(rung);
+        if act > self.act_max {
+            return Err(SlotError::PastSpan {
+                rung,
+                chunks: act,
+                span: self.act_max,
+            });
+        }
+        Ok(act)
     }
 
     /// Whether any slot of physical chunk `physical` has a live reference.
@@ -944,17 +954,14 @@ impl SlotPool {
         state.refs[at..at + spc].iter().any(|refs| refs.live > 0)
     }
 
-    /// What raising the activation to rung `rung` takes: nothing of the
-    /// top rung's span moves, live state never lying there
-    /// ([`Self::live_limit`]); idle cache there is cleared first (refused
-    /// with [`SlotError::SpanCached`] while it lies there). Only where a
-    /// guest term carries the activation below the span's base does live
-    /// state move, each chunk to the lowest free chunk below it. Empty
-    /// when nothing is in the way (or the rung takes no more than now).
-    pub fn plan_rung(&self, rung: u32) -> Result<RungEvacuation, SlotError> {
-        let act = self.act_chunks(rung);
-        let limit = self.total - act;
-        let (sources, cached) = self.in_way(limit);
+    /// What raising the activation to rung `rung` takes: nothing moves,
+    /// live state never lying in the top rung's span ([`Self::live_limit`])
+    /// and no rung's activation reaching past it ([`SlotError::PastSpan`]);
+    /// idle cache there is cleared first (refused with
+    /// [`SlotError::SpanCached`] while it lies there).
+    pub fn plan_rung(&self, rung: u32) -> Result<RungRaise, SlotError> {
+        let act = self.act_in_span(rung)?;
+        let cached = self.in_way(self.total - act);
         if !cached.is_empty() {
             return Err(SlotError::SpanCached {
                 rung,
@@ -962,49 +969,28 @@ impl SlotPool {
             });
         }
         self.rung_budget(act)?;
-        let moves: Vec<ChunkMove> = sources
-            .iter()
-            .zip(self.open.iter_in(0, limit))
-            .map(|(&from, to)| ChunkMove {
-                logical: self.physical_to_logical[from as usize],
-                from,
-                to,
-            })
-            .collect();
-        if moves.len() < sources.len() {
-            return Err(SlotError::NoRoom {
-                rung,
-                chunks: sources.len() as u32,
-            });
-        }
-        Ok(RungEvacuation {
+        Ok(RungRaise {
             rung,
             from: self.rung(),
             act,
-            moves,
         })
     }
 
     /// The chunks raising the activation to `rung` lacks now: past what is
-    /// committed, and in free chunks below its span for the live state in
-    /// it. Idle cache in the span is no room to fund: it is cleared
+    /// committed. Idle cache in the span is no room to fund: it is cleared
     /// ([`Self::span_cached`]). 0 when the raise fits.
     pub fn rung_short(&self, rung: u32) -> u32 {
-        let act = self.act_chunks(rung);
-        let limit = self.total - act;
-        let (sources, cached) = self.in_way(limit);
-        let (sources, cached) = (sources.len() as u32, cached.len() as u32);
-        let budget =
-            (self.reserved + self.held - cached + act).saturating_sub(self.committed_for(act));
-        let targets = self.open.iter_in(0, limit).take(sources as usize).count() as u32;
-        budget.max(sources - targets)
+        let act = self.act_chunks(rung).min(self.act_max);
+        let cached = self.in_way(self.total - act).len() as u32;
+        (self.reserved + self.held - cached + act).saturating_sub(self.committed_for(act))
     }
 
     /// The chunks of idle cache in the span raising the activation to
     /// `rung` takes: what its owner clears before the raise
     /// ([`Self::clear_span`]).
     pub fn span_cached(&self, rung: u32) -> u32 {
-        self.in_way(self.total - self.act_chunks(rung)).1.len() as u32
+        let act = self.act_chunks(rung).min(self.act_max);
+        self.in_way(self.total - act).len() as u32
     }
 
     /// A raise asks the span from physical chunk `from` clear: idle cache
@@ -1021,67 +1007,28 @@ impl SlotPool {
         self.clearing
     }
 
-    /// Carries out `evacuation` and takes its rung; the fire at `epoch`
-    /// carries the copy, and the chunks moved off stay closed until it
-    /// retires. All or nothing.
-    pub fn apply_rung(&mut self, evacuation: &RungEvacuation, epoch: u64) -> Result<(), SlotError> {
-        let act = self.act_chunks(evacuation.rung);
-        let limit = self.total - act;
-        let (sources, cached) = self.in_way(limit);
+    /// Takes `raise`'s rung. All or nothing.
+    pub fn apply_rung(&mut self, raise: &RungRaise) -> Result<(), SlotError> {
+        let act = self.act_in_span(raise.rung)?;
+        let cached = self.in_way(self.total - act);
         if !cached.is_empty() {
             return Err(SlotError::SpanCached {
-                rung: evacuation.rung,
+                rung: raise.rung,
                 chunks: cached.len() as u32,
             });
         }
         self.rung_budget(act)?;
-        if act != evacuation.act || evacuation.moves.len() != sources.len() {
+        if act != raise.act {
             return Err(SlotError::StaleRung);
-        }
-        let mut targets = BTreeSet::new();
-        for step in &evacuation.moves {
-            let fits = (step.logical as usize) < self.logical_to_physical.len()
-                && self.chunks[step.logical as usize].shape != NO_SHAPE
-                && self.logical_to_physical[step.logical as usize] == step.from
-                && step.from >= limit
-                && step.to < limit
-                && self.open.get(step.to)
-                && targets.insert(step.to);
-            if !fits {
-                return Err(SlotError::StaleRung);
-            }
-        }
-        for step in &evacuation.moves {
-            self.move_chunk(*step);
-            self.fenced.set(step.from);
-        }
-        if !evacuation.moves.is_empty() {
-            self.fences
-                .entry(epoch)
-                .or_default()
-                .extend(evacuation.moves.iter().map(|step| step.from));
         }
         self.set_act(act);
         Ok(())
     }
 
-    /// Takes back `evacuation`, applied with [`Self::apply_rung`] and
-    /// refused by the engine before its copy: each moved chunk goes back to
-    /// where it lay (the engine's table never changed), its fence lifts, and
-    /// the activation is `act` again, the rung in hand.
-    pub fn undo_rung(&mut self, evacuation: &RungEvacuation, act: u32) {
-        for step in evacuation.moves.iter().rev() {
-            for chunks in self.fences.values_mut() {
-                chunks.retain(|&chunk| chunk != step.from);
-            }
-            self.fenced.clear(step.from);
-            self.move_chunk(ChunkMove {
-                logical: step.logical,
-                from: step.to,
-                to: step.from,
-            });
-        }
-        self.fences.retain(|_, chunks| !chunks.is_empty());
+    /// Takes back a raise applied with [`Self::apply_rung`] and refused by
+    /// the engine (its carve): the activation is `act` again, the rung in
+    /// hand.
+    pub fn undo_rung(&mut self, act: u32) {
         self.set_act(act);
     }
 
@@ -1285,7 +1232,6 @@ impl SlotPool {
         let free = (0..limit)
             .filter(|&chunk| {
                 self.free.get(chunk)
-                    && !self.fenced.get(chunk)
                     && !matches!(
                         self.segments.state(self.segments.of(chunk)),
                         SegmentState::Draining { .. }
@@ -1619,7 +1565,7 @@ impl SlotPool {
             return Some("open for a shape already");
         }
         let physical = self.logical_to_physical[chunk as usize];
-        if !self.free.get(physical) || self.fenced.get(physical) {
+        if !self.free.get(physical) {
             Some("not free")
         } else if physical >= self.state_limit() {
             Some("in the activation span")
@@ -1732,25 +1678,8 @@ impl SlotPool {
         }
     }
 
-    /// Every fire through `epoch` has retired: what waited on them is free.
-    /// The chunks fenced until `from` stay fenced until `to` instead.
-    pub fn refence(&mut self, from: u64, to: u64) {
-        if let Some(chunks) = self.fences.remove(&from) {
-            self.fences.entry(to).or_default().extend(chunks);
-        }
-    }
-
     pub fn retire_through(&mut self, epoch: u64) {
         self.retired = self.retired.max(epoch);
-        let later = self.fences.split_off(&(epoch.saturating_add(1)));
-        let mut due = std::mem::replace(&mut self.fences, later);
-        if epoch == u64::MAX {
-            due.append(&mut self.fences);
-        }
-        for chunk in due.into_values().flatten() {
-            self.fenced.clear(chunk);
-            self.reopen(chunk);
-        }
         let later = self.pending.split_off(&(epoch.saturating_add(1)));
         let due = std::mem::replace(&mut self.pending, later);
         if epoch == u64::MAX {
@@ -2003,9 +1932,9 @@ impl SlotPool {
     }
 
     /// The `n` of the next `release_span(n)`: the lowest span segments
-    /// committed here that the rung no longer lends (wholly in the
-    /// activation, the rung raised past them), hold no state chunk and no
-    /// chunk a raise's copy still reads, given back from the bottom up.
+    /// committed here that the rung no longer leaves to cache (wholly in
+    /// the activation, the rung raised past them) and hold no state chunk,
+    /// given back from the bottom up.
     /// `None` where none is.
     pub fn span_to_release(&self) -> Option<u32> {
         let committed = self.span_committed();
@@ -2014,9 +1943,7 @@ impl SlotPool {
         while keep > 0 {
             let segment = self.span_segment(keep);
             let range = self.segments.range(segment);
-            let idle = range.start >= limit
-                && self.segments.used(segment) == 0
-                && range.clone().all(|chunk| !self.fenced.get(chunk));
+            let idle = range.start >= limit && self.segments.used(segment) == 0;
             if !idle {
                 break;
             }
@@ -2537,6 +2464,12 @@ mod tests {
                     model.retired = model.retired.max(through);
                 }
                 10 => {
+                    // Now and then the guests' standing bytes change: no
+                    // rung whose activation they carry past the span is
+                    // set aside.
+                    if rng.below(4) == 0 {
+                        pool.set_standing(rng.below(4) << 20);
+                    }
                     let rung = [0, 200, 1000, 5000][rng.below(4) as usize];
                     if pool.set_rung(rung).is_err()
                         && let Err(SlotError::SpanCached { .. }) = pool.plan_rung(rung)
@@ -2573,7 +2506,7 @@ mod tests {
                         assert_eq!(pool.span_cached(rung), 0, "the raise's span is clear");
                     }
                     if pool.set_rung(rung).is_err()
-                        && let Ok(evacuation) = pool.plan_rung(rung)
+                        && let Ok(raise) = pool.plan_rung(rung)
                     {
                         let refs: Vec<(Slot, u32)> = model
                             .held
@@ -2581,16 +2514,11 @@ mod tests {
                             .flatten()
                             .map(|&slot| (slot, pool.slot_ref(slot)))
                             .collect();
-                        // No live state lies in the top rung's span: a raise
-                        // moves none of it.
-                        assert!(
-                            evacuation
-                                .moves
-                                .iter()
-                                .all(|step| step.from < pool.live_limit()),
-                            "a raise moves live state out of the top rung's span"
-                        );
-                        pool.apply_rung(&evacuation, epoch).unwrap();
+                        // No live state lies in the top rung's span and no
+                        // activation reaches past it: a raise moves nothing.
+                        let table = pool.chunk_table().to_vec();
+                        pool.apply_rung(&raise).unwrap();
+                        assert_eq!(pool.chunk_table(), table.as_slice(), "a raise moved state");
                         for (slot, engine) in refs {
                             assert_eq!(pool.slot_ref(slot), engine);
                             assert!(pool.physical(slot.chunk).unwrap() < pool.state_limit());
@@ -2769,9 +2697,8 @@ mod tests {
         assert!(pool.plan_rung(4096).is_err(), "not before the fire retires");
         pool.retire_through(3);
         let raise = pool.plan_rung(4096).unwrap();
-        assert!(raise.moves.is_empty(), "no live state moves");
         let table = pool.chunk_table().to_vec();
-        pool.apply_rung(&raise, 4).unwrap();
+        pool.apply_rung(&raise).unwrap();
         assert_eq!(pool.chunk_table(), table.as_slice(), "nothing moved");
         assert_eq!(pool.clearing(), 96, "the ask is taken");
         assert_eq!(pool.state_limit(), 90);
@@ -2783,30 +2710,35 @@ mod tests {
         pool.release(Holder::WorkingSet(1), &live, 0);
     }
 
-    /// A guest term that carries the activation below the top rung's
-    /// span's base is the one raise that moves live state: what lies in
-    /// the chunks it takes past the span, to free chunks below.
+    /// No rung whose activation, a guest term's included, reaches past the
+    /// top rung's span is set aside: neither raised to nor lowered to, so
+    /// no raise ever has live state in its way (a guest fire is cut to the
+    /// widest rung that fits instead, `SharedPool::widest_fit`).
     #[test]
-    fn a_guest_term_past_the_span_is_the_one_raise_that_moves_live_state() {
+    fn a_rung_whose_activation_reaches_past_the_span_is_never_set_aside() {
         let mut pool = SlotPool::new(facts(96, 16, 6, &[(ShapeKind::List, 4)]));
         pool.set_rung(16).unwrap();
         let live = pool.acquire(Holder::WorkingSet(1), 0, 89 * 4).unwrap();
-        let some: Vec<Slot> = live
-            .iter()
-            .copied()
-            .filter(|slot| pool.physical(slot.chunk).unwrap() < 10)
-            .collect();
-        pool.release(Holder::WorkingSet(1), &some, 0);
         // Two chunks' standing guest bytes at every rung: the top rung's
-        // activation reaches 88.
+        // activation would reach 88, past the span's base at 90.
         pool.set_standing(2 << 20);
         assert_eq!(pool.act_chunks(4096), 8);
-        let raise = pool.plan_rung(4096).unwrap();
-        let froms: Vec<u32> = raise.moves.iter().map(|step| step.from).collect();
-        assert_eq!(froms, [88, 89], "live state below the span's base moves");
-        assert!(raise.moves.iter().all(|step| step.to < 88));
-        pool.apply_rung(&raise, 1).unwrap();
+        let past = SlotError::PastSpan {
+            rung: 4096,
+            chunks: 8,
+            span: 6,
+        };
+        assert_eq!(pool.plan_rung(4096).unwrap_err(), past);
+        assert_eq!(pool.set_rung(4096).unwrap_err(), past);
+        // The rung under it fits with the term: taken, nothing moved.
+        assert_eq!(pool.act_chunks(256), 5);
+        let table = pool.chunk_table().to_vec();
+        let raise = pool.plan_rung(256).unwrap();
+        pool.apply_rung(&raise).unwrap();
+        assert_eq!(pool.chunk_table(), table.as_slice());
+        assert_eq!(pool.state_limit(), 91);
         pool.check();
+        pool.release(Holder::WorkingSet(1), &live, 0);
     }
 
     #[test]

@@ -814,13 +814,18 @@ fn the_rung_walk_caps_fires_then_lowers_and_raises_back_clearing_the_span_s_cach
         })
     );
     clear_span_cache(&mut pool, &cached, 9);
-    let RungStep::Raise { rung, evacuation } = walk.step(&pool, u32::MAX, 256, 256, 9, 9).unwrap()
+    let table = pool.pool().chunk_table().to_vec();
+    let RungStep::Raise { rung, raise } = walk.step(&pool, u32::MAX, 256, 256, 9, 9).unwrap()
     else {
         panic!("a raise");
     };
     assert_eq!(rung, 2048);
-    assert!(evacuation.moves.is_empty(), "no state moves");
-    pool.apply_rung(&evacuation, 10).unwrap();
+    pool.apply_rung(&raise).unwrap();
+    assert_eq!(
+        pool.pool().chunk_table(),
+        table.as_slice(),
+        "no state moves"
+    );
     assert_eq!(pool.rung(), 2048);
     assert_eq!(
         (pool.state_chunks_now(), pool.records_capacity()),
@@ -898,11 +903,14 @@ fn a_raise_by_demand_lacks_nothing_live_state_fills_and_clears_the_span_s_cache(
         "cache in the span: cleared first"
     );
     clear_span_cache(&mut pool, &cached, 1);
-    let evacuation = pool.plan_raise(2048).unwrap();
-    assert!(evacuation.moves.is_empty(), "no state moves");
-    pool.apply_rung(&evacuation, 1).unwrap();
+    let raise = pool.plan_raise(2048).unwrap();
+    pool.apply_rung(&raise).unwrap();
     assert_eq!(pool.rung(), 2048);
-    assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
+    assert_eq!(
+        engine.table.as_slice(),
+        pool.pool().chunk_table(),
+        "no state moves"
+    );
     pool.pool().check();
 }
 
@@ -1220,15 +1228,13 @@ fn no_slot_is_handed_out_past_what_the_engine_binds() {
     assert!(chunk_of(&pool, more[0].0) >= 8);
 }
 
-/// A raise that moves state (live state below the top rung's span, which a
-/// guest term carries the activation over: the one raise that moves any)
-/// is taken in the hold it was planned in: no slot can be handed out
-/// between plan and apply (the engine copies after, never against a pool
-/// that moved on), its moved-off chunks stay fenced and no cap is lifted
-/// past the rung held before until the engine has the copy.
+/// A guest term past the top rung's span is cut as the readout term is:
+/// no rung whose activation, the term's included, reaches past the span is
+/// set aside, so fires are cut to the widest rung that fits it, and the
+/// raise there moves nothing (live state lies below the span at every
+/// rung).
 #[test]
-fn a_raise_is_taken_where_it_is_planned_and_held_until_its_copy() {
-    const ENGINE: usize = 60;
+fn a_guest_term_past_the_top_rung_s_span_cuts_fires_and_moves_nothing() {
     let mut pool = pool();
     let mut engine = FakeEngine::new();
     assert_eq!(
@@ -1236,41 +1242,35 @@ fn a_raise_is_taken_where_it_is_planned_and_held_until_its_copy() {
         Retarget::Reached
     );
     // Three chunks the guests keep standing at every rung: the largest
-    // rung's activation reaches 49, past the span's base at 52.
+    // rung's activation would take 15 of the span's 12.
     pool.pool_mut().set_standing(3 * CHUNK);
-    assert_eq!(pool.pool().act_chunks(2048), 15);
     pool.lower_rung(16).unwrap();
     let all = pool
         .take_records(pool.records_available() as usize)
         .unwrap();
-    pool.give_records(&all[..all.len() / 2]);
-    pool.pool_mut().retire_through(u64::MAX);
-    let evacuation = pool.plan_raise(2048).unwrap();
-    assert!(!evacuation.moves.is_empty(), "state in the span moves down");
-    pool.raise_applied(&evacuation).unwrap();
-    assert_eq!(pool.rung(), 2048, "taken at once");
-    assert_eq!(pool.copying(), Some(16), "fires held at the rung before");
-    // The engine copies against the table the pool now states.
-    engine
-        .evacuate(&SharedPool::rung_moves(&evacuation))
-        .unwrap();
-    assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
-    // No fire retires the fence while the copy is the engine's.
-    pool.pool_mut().retire_through(1_000_000);
-    let moved_off: Vec<u32> = evacuation.moves.iter().map(|step| step.from).collect();
-    let shared: Shared = Arc::new(Mutex::new(pool));
-    crate::store::shared::set_fire_cap_for_test(ENGINE, 16);
-    crate::store::shared::raise_now(&shared, ENGINE, 2048);
+    assert_eq!(pool.pool().act_chunks(2048), 15);
+    assert_eq!(pool.widest_fit(), Some(256), "256 takes 7");
+    assert_eq!(pool.fit_cap(), 256);
+    assert_eq!(pool.rung_for(5000), 256, "fires cut to it");
     assert_eq!(
-        crate::store::shared::fire_cap(ENGINE),
-        16,
-        "no cap lifted before the copy"
+        pool.plan_raise(2048).unwrap_err(),
+        RungError::Pool(SlotError::PastSpan {
+            rung: 2048,
+            chunks: 15,
+            span: 12
+        })
     );
-    let mut pool = shared.lock().unwrap();
-    pool.raise_copied(1_000_001);
-    assert_eq!(pool.copying(), None);
-    pool.pool_mut().retire_through(1_000_001);
-    let _ = moved_off;
+    let table = pool.pool().chunk_table().to_vec();
+    let raise = pool.plan_raise(256).unwrap();
+    assert_eq!(pool.raise_applied(&raise).unwrap(), None);
+    assert_eq!(pool.rung(), 256);
+    assert_eq!(pool.pool().chunk_table(), table.as_slice(), "nothing moved");
+    assert!(
+        all.iter()
+            .flat_map(|&record| pool.record_slots(record))
+            .all(|slot| pool.pool().physical(slot.chunk).unwrap() < TOTAL - 12)
+    );
+    pool.pool().check();
 }
 
 /// While the engine holds part of its range back, a committed chunk past
