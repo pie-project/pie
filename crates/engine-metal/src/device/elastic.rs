@@ -503,6 +503,16 @@ impl Elastic {
         self.chunks.iter().map(|chunk| chunk.bytes).sum::<u64>() + self.top_held()
     }
 
+    /// The bytes the top maps at most, every heap of it mapped: from its
+    /// start to the buffer's tile-rounded end, which its last heap reaches.
+    #[must_use]
+    pub fn top_capacity(&self) -> u64 {
+        if self.top.is_empty() {
+            return 0;
+        }
+        self.virtual_bytes - self.top_from
+    }
+
     /// The bytes of the top's mapped heaps.
     #[must_use]
     pub fn top_held(&self) -> u64 {

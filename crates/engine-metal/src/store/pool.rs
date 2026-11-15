@@ -678,10 +678,24 @@ impl Pool {
     }
 
     /// The top's bytes, backed or not: the span from the heap seam under
-    /// the segment it starts in, which the ledger holds reserved.
+    /// the segment it starts in, which the ledger holds reserved. On a
+    /// device, what the top's heaps map at most: the last one reaches the
+    /// buffer's tile-rounded end, past the range's last byte, so the range's
+    /// bytes alone are short of what the top holds once fully backed (the
+    /// ledger's audit then subtracted more held than reserved).
     #[must_use]
     pub fn top_bytes(&self) -> u64 {
-        self.bytes() - self.pinned_from()
+        #[cfg(target_vendor = "apple")]
+        {
+            if self.act == 0 {
+                return 0;
+            }
+            self.last().store.top_capacity()
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            self.bytes() - self.pinned_from()
+        }
     }
 
     /// Where the top's backed bytes start in the range: its end where none
