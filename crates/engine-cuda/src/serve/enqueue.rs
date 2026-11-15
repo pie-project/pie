@@ -1001,8 +1001,12 @@ impl FireCtx<'_> {
         let mut epilogues = AirborneFires::default();
         for attached in p.attachments.iter().filter(|a| !a.adapter_only) {
             let reads = self.programs.reads(attached.instance)?;
+            let end = attached.lane as usize + attached.lanes as usize;
+            let pass_reads =
+                pass_readouts(&first_row, &lane_rows, attached.lane as usize, end).len();
             for k in 0..attached.lanes {
                 let at = attached.lane as usize + k as usize;
+                let run = pass_readouts(&first_row, &lane_rows, at, end);
                 for (index, out) in self.exports.outputs.iter().enumerate() {
                     if !out.classes.contains(lane_class[at])
                         || !reads
@@ -1020,6 +1024,7 @@ impl FireCtx<'_> {
                         &plane_of,
                         &storage_of,
                         (first_row[at], last_row[at], lane_rows[at]),
+                        (&run, pass_reads),
                         lane_row[at],
                         first_voxel(index, at),
                     )?;
@@ -1096,6 +1101,7 @@ impl FireCtx<'_> {
         plane_of: &dyn Fn(poem_ir::ValueId, &str) -> Result<kernels_cuda::Tensor>,
         storage_of: &dyn Fn(Dtype) -> Result<u32>,
         (first_row, last_row, owned): (u32, u32, u32),
+        (run, reads): (&[u32], usize),
         lane_row: u32,
         first_voxel: u32,
     ) -> Result<()> {
@@ -1137,18 +1143,19 @@ impl FireCtx<'_> {
                 )
             }
             poem_ir::InputAxis::Row if out.decl.readout => {
-                let wanted: Vec<u32> = match p.lanes.get(at).and_then(|seated| seated.readout) {
-                    None | Some([]) => vec![last_row],
-                    Some(rows) => {
-                        if rows.len() as u32 > owned {
-                            return Err(Fault::Ceiling {
-                                what: "rows in the lane a readout names",
-                                need: rows.len() as u64,
-                                have: u64::from(owned),
-                            });
-                        }
-                        (0..rows.len() as u32).map(|i| first_row + i).collect()
-                    }
+                if let Some(rows) = p.lanes.get(at).and_then(|seated| seated.readout)
+                    && rows.len() as u32 > owned
+                {
+                    return Err(Fault::Ceiling {
+                        what: "rows in the lane a readout names",
+                        need: rows.len() as u64,
+                        have: u64::from(owned),
+                    });
+                }
+                let wanted: Vec<u32> = if run.is_empty() {
+                    vec![last_row]
+                } else {
+                    run.to_vec()
                 };
                 let consecutive = wanted
                     .windows(2)
@@ -1168,9 +1175,13 @@ impl FireCtx<'_> {
                     });
                 }
                 let row_bytes = u64::from(width) * 2;
+                let last = *wanted.last().expect("a readout run holds a row");
+                let pad = reads.saturating_sub(wanted.len());
                 let table: Vec<u8> = wanted
                     .iter()
-                    .flat_map(|row| (plane.ptr + u64::from(*row) * row_bytes).to_le_bytes())
+                    .copied()
+                    .chain(std::iter::repeat_n(last, pad))
+                    .flat_map(|row| (plane.ptr + u64::from(row) * row_bytes).to_le_bytes())
                     .collect();
                 let staged_at = u64::from(self.budget.max_tokens)
                     .saturating_mul(8)
@@ -1362,6 +1373,15 @@ fn settle_batch(
     }
 }
 
+fn pass_readouts(first: &[u32], count: &[u32], from: usize, end: usize) -> Vec<u32> {
+    (from..end.min(first.len()))
+        .flat_map(|lane| {
+            let at = first[lane];
+            at..at + count.get(lane).copied().unwrap_or(0)
+        })
+        .collect()
+}
+
 fn committed_or(fired: Fired, instance: engine::InstanceId, at: &str) -> Result<()> {
     match fired {
         Fired::Committed => Ok(()),
@@ -1388,8 +1408,17 @@ fn committed_or(fired: Fired, instance: engine::InstanceId, at: &str) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{Fired, committed_or};
+    use super::{Fired, committed_or, pass_readouts};
     use crate::serve::Attached;
+
+    #[test]
+    fn a_mixed_pass_reads_its_lanes_in_its_own_order() {
+        let (first, count) = ([1, 0, 2, 3], [1, 1, 1, 1]);
+        assert_eq!(pass_readouts(&first, &count, 0, 4), [1, 0, 2, 3]);
+        assert_eq!(pass_readouts(&first, &count, 2, 4), [2, 3]);
+        assert_eq!(pass_readouts(&[0, 1, 3], &[1, 2, 1], 0, 3), [0, 1, 2, 3]);
+        assert_eq!(pass_readouts(&[4, 0], &[2, 3], 0, 2), [4, 5, 0, 1, 2]);
+    }
 
     #[test]
     fn a_pass_that_does_not_commit_on_an_admitted_fire_errors_by_name() {
