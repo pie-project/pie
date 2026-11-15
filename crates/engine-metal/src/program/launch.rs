@@ -1291,6 +1291,13 @@ impl Prepared {
         Ok(())
     }
 
+    /// PROBE (M5): a 256-byte blit fill of this member's scratch.
+    #[cfg(target_vendor = "apple")]
+    pub fn probe_touch(&self, frame: &mut Frame) -> Result<()> {
+        let scratch = self.scratch()?.clone();
+        frame.fill(scratch.buffer.slab(), scratch.offset, 256.min(self.scratch_bytes))
+    }
+
     /// Test builds (`test-slot-fill`): the bytes every hollow value points
     /// at, the lane's dummy, poisoned after the zero fill.
     #[cfg(target_vendor = "apple")]

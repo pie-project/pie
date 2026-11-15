@@ -720,6 +720,11 @@ impl Plane {
                             if probe_member_pass() {
                                 frame.next_pass()?;
                             }
+                            #[cfg(target_vendor = "apple")]
+                            if std::env::var_os("PIE_MEMBER_BLIT").is_some() {
+                                prepared.probe_touch(frame)?;
+                                frame.next_pass()?;
+                            }
                             for region in stage.regions.iter() {
                                 prepared.encode_into(frame, region)?;
                             }

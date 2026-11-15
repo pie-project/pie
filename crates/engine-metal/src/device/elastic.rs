@@ -1047,7 +1047,12 @@ fn make_chunk(sparse: &Sparse, bytes: u64) -> Result<Chunk> {
     // Untracked: the sparse buffer over these tiles is the resource the
     // encoders bind and track; a second set of hazards on the heap would be
     // a dependency already expressed, per allocation, forever.
-    descriptor.setHazardTrackingMode(MTLHazardTrackingMode::Untracked);
+    // PROBE (M5): PIE_TRACKED_HEAPS asks the placement heaps tracked.
+    descriptor.setHazardTrackingMode(if std::env::var_os("PIE_TRACKED_HEAPS").is_some() {
+        MTLHazardTrackingMode::Tracked
+    } else {
+        MTLHazardTrackingMode::Untracked
+    });
     descriptor.setSize(usize_of(bytes));
     descriptor.setMaxCompatiblePlacementSparsePageSize(MTLSparsePageSize::Size256);
 
