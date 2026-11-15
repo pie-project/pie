@@ -577,7 +577,7 @@ impl SlotPool {
 
     /// No chunk at or past physical id `ceiling` is opened from now on, the
     /// engine binding none there yet (while it holds back part of the range
-    /// it stated, [`::engine::live::Live::held`]); chunks below it open as
+    /// it stated, [`::engine::chunk::ChunkFacts::held_bytes`]); chunks below it open as
     /// before. A chunk already open past it stays its holder's.
     pub fn set_ceiling(&mut self, ceiling: u32) {
         let ceiling = ceiling.min(self.total);

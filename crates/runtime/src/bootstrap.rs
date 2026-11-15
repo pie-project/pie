@@ -419,8 +419,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 .map_err(|error| anyhow::anyhow!("engine pools: {error}"))?;
                 let mut pool = pool;
                 // What the engine holds back of the range it stated is no
-                // sequence's from the first page on.
-                pool.hold_back(d.engine_backend.live().held());
+                // sequence's from the first page on: a load fact, seeded
+                // here once.
+                pool.hold_back(d.chunks.held_bytes);
                 // A rung of `r` tokens carries `min(r, max_lanes)` lanes, as
                 // the engine counts them: what a program's fire term takes.
                 pool.set_max_lanes(u32::try_from(d.limits.max_forward_requests).unwrap_or(u32::MAX));
@@ -482,14 +483,19 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let engines: Vec<usize> = engine_configs
         .into_iter()
         .map(|d| {
-            engine::register_engine_backend(
+            let engine = engine::register_engine_backend(
                 engine::EngineSpec {
                     device_domain: ::engine::MemoryDomain::HostPinned,
                     limits: d.limits,
                     device_geometry_port_mask: d.device_geometry_port_mask,
                 },
                 d.engine_backend,
-            )
+                d.chunks.eager_rungs,
+            );
+            // What the driver holds outside the engine's span is a load
+            // fact: the policy's ledger takes it once.
+            crate::policy::pressure::set_outside(engine, d.chunks.outside_bytes);
+            engine
         })
         .collect();
 

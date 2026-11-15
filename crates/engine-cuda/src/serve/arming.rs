@@ -71,12 +71,7 @@ type LaneRows = (usize, u32);
 /// A lattice being armed: the targets left, and what arming has counted.
 pub(super) struct Arming {
     targets: std::collections::VecDeque<(u32, BodySynth, record::RsBody)>,
-    /// The rung whose targets are arming.
-    rung: u32,
     top: Option<u32>,
-    /// Whether a narrower target may capture cold: the top bucket's fires
-    /// have made what its warm fire would.
-    topped: bool,
     unfireable: Vec<String>,
     verify: bool,
     group: bool,
@@ -104,9 +99,6 @@ pub(super) struct Arming {
     /// the finish fit accounts what the bodies took; only a device failure
     /// stops arming there.
     capped: bool,
-    /// A capture found no device room on a record's allowance while the
-    /// shell served: arming stopped there and the rest walk eagerly.
-    record_short: bool,
     /// What the device's free memory fell by across each composition's
     /// fires, less what the pool backed in that window, summed: what the
     /// captures took, and nothing the pool, serving or the runtime took
@@ -119,26 +111,6 @@ pub(super) struct Arming {
 }
 
 impl Arming {
-    /// Whether every composition the lattice planned holds a body: those
-    /// it fired for one (`wanted`) and those the allowance stopped before
-    /// their fire (`never`) alike. A bucket the lattice coarsened away is
-    /// not planned: its fires pad to a wider bucket's body.
-    fn whole(&self) -> Result<()> {
-        let planned = self.wanted + self.never;
-        if self.armed < planned {
-            return Err(Fault::Residency(format!(
-                "arming ended with {} of {planned} compositions holding a body ({} the \
-                 allowance stopped{}): the rungs past the last armed stay unarmed",
-                self.armed,
-                self.never,
-                self.refused
-                    .as_ref()
-                    .map_or_else(String::new, |why| format!("; last refusal: {why}")),
-            )));
-        }
-        Ok(())
-    }
-
     fn narrower(&self, bucket: u32, target: &BodySynth) -> bool {
         Some(bucket) != self.top && target.kind() != Kind::Decode
     }
@@ -532,22 +504,6 @@ impl Shell {
         self.live.clone()
     }
 
-    /// The slots a step of the lattice left arming writes
-    /// ([`Shell::arm_step`]); none where nothing is left.
-    #[must_use]
-    pub fn arming_room(&self) -> engine::live::ArmingRoom {
-        if self.stepping.is_none() {
-            return engine::live::ArmingRoom::default();
-        }
-        let (_, pages, _) = self.synthetic_room();
-        engine::live::ArmingRoom {
-            pages: u32::try_from(pages).unwrap_or(u32::MAX),
-            // One record, every piece of it: a synthetic lane's rows are
-            // never read back, so a step's lanes share it.
-            records: self.pools.record_pieces(),
-        }
-    }
-
     fn synthetic_lanes_with(&self, lanes: &[LaneRows], media: &[LaneMedia]) -> Vec<Synthetic> {
         let page_size = u64::from(self.pools.paging().page_size).max(1);
         // What the lanes name, inside the chunks the fit left the pool: a
@@ -557,24 +513,8 @@ impl Shell {
         // fire names for good, so every fire of the lattice folds into one
         // room: the widest fire's.
         let (slots, room, windowed) = self.synthetic_room();
-        // A step arming while the shell serves names the slots it was lent,
-        // by ref.
-        let lent = self.lent.as_ref();
-        let slot_of = |at: u32| match lent {
-            Some(lent) => lent.records.get(at as usize).copied().unwrap_or(0),
-            None => at,
-        };
-        let page_of = |at: u64| match lent {
-            Some(lent) => lent.pages.get(at as usize).copied().unwrap_or(u32::MAX),
-            None => u32::try_from(at).unwrap_or(u32::MAX),
-        };
-        let (slots, room) = match lent {
-            Some(lent) => (
-                (lent.records.len() as u32).clamp(1, slots.max(1)),
-                (lent.pages.len() as u64).clamp(1, room.max(1)),
-            ),
-            None => (slots, room),
-        };
+        let slot_of = |at: u32| at;
+        let page_of = |at: u64| u32::try_from(at).unwrap_or(u32::MAX);
         let mut next_page = 0u64;
         let row_bytes = self.patch_seat.map_or(0, |seat| seat.row_bytes) as usize;
         let fold = (self.patch_fold as usize).max(1);
@@ -1143,7 +1083,7 @@ impl Shell {
     /// Forgets the recorded bodies and arms the lattice again within the
     /// same load, allowed what its last arming took: the pool is backed by
     /// now and those bodies' memory is what the forgetting frees, whatever
-    /// the record said. Capped by that figure, as stepped arming is.
+    /// the record said. Capped by that figure.
     pub(super) fn rearm_bodies(&mut self) -> Result<()> {
         self.cache.forget_bodies();
         self.bodies_mem = self
@@ -1484,27 +1424,17 @@ impl Shell {
             }
         }
         let LatticeTargets {
-            mut targets,
+            targets,
             top,
             unfireable,
         } = self.lattice_targets()?;
         // The top bucket's bodies and every decode body arm first; the
         // narrower prefill, mixed and wide ones after them are what the
         // lattice coarsens to fit the allowance, each priced at what its
-        // kind's bodies armed so far weigh. A shell that arms while it
-        // serves arms its rungs smallest first instead, each rung's targets
-        // in that order.
-        let stepped = self.arm_stepped && !verify && !group;
-        if stepped {
-            targets.sort_by_key(|(bucket, _, _)| self.rung_of(*bucket));
-        }
+        // kind's bodies armed so far weigh.
         Some(Arming {
-            rung: targets
-                .first()
-                .map_or(u32::MAX, |(bucket, _, _)| self.rung_of(*bucket)),
             targets: targets.into(),
             top,
-            topped: top.is_none() || !stepped,
             unfireable,
             verify,
             group,
@@ -1525,148 +1455,20 @@ impl Shell {
             unit_margin: self.pools.arming_margin_bytes(),
             from_record: self.bodies_from_record || self.rearming,
             capped: !(self.bodies_from_record && self.arming_at_load),
-            record_short: false,
             took: Some(0),
             profiled: self.budget.buckets.len(),
             ballot: Ballot::open(&self.device),
         })
     }
 
-    /// The activation rung a fire of `bucket` rows carves: the smallest
-    /// that holds it, `u32::MAX` past every rung stated (the whole arena).
-    fn rung_of(&self, bucket: u32) -> u32 {
-        self.arena
-            .rungs(None)
-            .into_iter()
-            .map(|(tokens, _)| tokens)
-            .find(|tokens| bucket <= *tokens)
-            .unwrap_or(u32::MAX)
-    }
-
     fn arm_lattice_fenced(&mut self, verify: bool) -> Result<()> {
         let Some(mut st) = self.arm_begin(verify) else {
             return Ok(());
         };
-        // At load: everything, or the rungs through the widest decode
-        // fire's (a row a lane) where the rest arm while the shell serves
-        // ([`Shell::arm_step`]): a load that is ready decodes at full
-        // width, and only a prefill wider than that waits on a step.
-        let first = self.rung_of(self.lane_ceiling());
-        while let Some(&(bucket, _, _)) = st.targets.front() {
-            if self.arm_stepped && self.rung_of(bucket) > first {
-                break;
-            }
-            self.arm_next(&mut st)?;
+        while let Some((bucket, target, rs)) = st.targets.pop_front() {
+            self.arm_target(&mut st, bucket, target, rs)?;
         }
-        if st.targets.is_empty() {
-            return self.arm_end(st);
-        }
-        eprintln!(
-            "engine-cuda: bodies armed through rung {first} ({} of {} compositions); {} arm \
-             while it serves",
-            st.armed,
-            st.wanted,
-            st.targets.len()
-        );
-        self.live = engine::live::Live::arming(first);
-        self.stepping = Some(st);
-        Ok(())
-    }
-
-    /// Arms one more composition of a lattice left arming at load, and says
-    /// whether more are left. A rung is stated armed ([`engine::live`]) once
-    /// its last composition is.
-    pub fn arm_step(&mut self, lent: &engine::live::ArmingLease) -> Result<bool> {
-        let room = self.arming_room();
-        let Some(mut st) = self.stepping.take() else {
-            return Ok(false);
-        };
-        // The records the step's lanes name, each by the slots lent for its
-        // pieces: by ref once lanes name refs, else by the state slot those
-        // slots are.
-        let pieces = self.pools.record_pieces() as usize;
-        if lent.records.len() < pieces || lent.pages.len() < room.pages as usize {
-            return Err(Fault::program(
-                "serve::arming",
-                format!(
-                    "a step lent {} kv pages and {} record slots, and it writes {} and {}",
-                    lent.pages.len(),
-                    lent.records.len(),
-                    room.pages,
-                    room.records
-                ),
-            ));
-        }
-        let mut named = Vec::new();
-        for record in lent.records.chunks_exact(pieces.max(1)) {
-            named.push(if self.pools.by_refs() {
-                self.pools.name_record(record)?
-            } else {
-                record[0] / pieces as u32
-            });
-        }
-        self.lent = Some(engine::live::ArmingLease {
-            pages: lent.pages.clone(),
-            records: named.clone(),
-        });
-        let rung = st
-            .targets
-            .front()
-            .map_or(st.rung, |(bucket, _, _)| self.rung_of(*bucket));
-        let stepped = self.arm_next(&mut st);
-        self.device.synchronize()?;
-        self.lent = None;
-        if self.pools.by_refs() {
-            for key in named {
-                self.pools.forget_record(key);
-            }
-        }
-        self.pools.forget_weight_uses(self.device.stream())?;
-        stepped?;
-        self.arm_stepped_on(st, rung)
-    }
-
-    fn arm_stepped_on(&mut self, st: Arming, rung: u32) -> Result<bool> {
-        match st
-            .targets
-            .front()
-            .map(|(bucket, _, _)| self.rung_of(*bucket))
-        {
-            Some(next) => {
-                if next != rung {
-                    self.live.arm(rung);
-                }
-                self.stepping = Some(st);
-                Ok(true)
-            }
-            None => {
-                // Every rung is stated armed only where every composition
-                // the lattice planned holds a body: a fire past that would
-                // walk eagerly.
-                // A record's allowance that fell short stopped arming on
-                // purpose: the line is said and the record dropped.
-                let whole = if st.record_short { Ok(()) } else { st.whole() };
-                self.arm_end(st)?;
-                whole?;
-                self.settle()?;
-                self.live.arm(u32::MAX);
-                Ok(false)
-            }
-        }
-    }
-
-    /// Arms the next target; a rung's targets are priced anew as the rung
-    /// starts, at what the bodies armed by then weigh.
-    fn arm_next(&mut self, st: &mut Arming) -> Result<()> {
-        let Some((bucket, target, rs)) = st.targets.pop_front() else {
-            return Ok(());
-        };
-        let rung = self.rung_of(bucket);
-        if self.arm_stepped && rung != st.rung {
-            st.rung = rung;
-            st.priced = st.verify || st.group || self.lattice.is_none();
-        }
-        self.arm_target(st, bucket, target, rs)
+        self.arm_end(st)
     }
 
     fn arm_target(
@@ -1701,8 +1503,7 @@ impl Shell {
         self.arm_rs = rs;
         // Past its kind's widest bucket a target captures cold: the top
         // bucket's fires made what its warm fire would.
-        self.arm_cold = st.topped && st.narrower(bucket, &target) && !st.verify;
-        st.topped |= Some(bucket) == st.top;
+        self.arm_cold = st.narrower(bucket, &target) && !st.verify;
         let spent = self.cache.body_stats();
         let room = (self.bodies_mem as u64).saturating_sub(spent.census.bytes as u64);
         let spare = self.pools.spare_bytes_for_bodies(room).unwrap_or(u64::MAX);
@@ -1763,26 +1564,6 @@ impl Shell {
             if let Err(why) = fired.and(landed) {
                 if super::diag::on().arm_trace {
                     eprintln!("[arm-trace] refused bucket {bucket}, {target}: {why}");
-                }
-                // On a record's allowance a capture short of device room
-                // stops arming here, not the load: the rest walk eagerly,
-                // and arming's end drops the record and says so.
-                if self.lent.is_some() && st.from_record && why.out_of_room() {
-                    st.refused = Some(format!("bucket {bucket}, {target}: {why}"));
-                    if st.never == 0 {
-                        st.never_from = bucket;
-                    }
-                    st.never += st.targets.len();
-                    st.targets.clear();
-                    st.record_short = true;
-                    break;
-                }
-                // A lattice arming while the shell serves leaves no key to
-                // walk eagerly: a refusal there is the step's fault.
-                if self.lent.is_some() {
-                    return Err(Fault::Unbound {
-                        what: format!("arming bucket {bucket}, {target}: {why}"),
-                    });
                 }
                 st.refused = Some(format!("bucket {bucket}, {target}: {why}"));
                 break;
@@ -2337,53 +2118,4 @@ struct LatticeTargets {
     targets: Vec<(u32, BodySynth, record::RsBody)>,
     top: Option<u32>,
     unfireable: Vec<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn lattice(armed: usize, wanted: usize, never: usize) -> Arming {
-        Arming {
-            targets: std::collections::VecDeque::new(),
-            rung: u32::MAX,
-            top: None,
-            topped: true,
-            unfireable: Vec::new(),
-            verify: false,
-            group: false,
-            records: true,
-            priced: true,
-            dropped: std::collections::BTreeSet::new(),
-            weighed: [(0, 0); Kind::COUNT],
-            armed,
-            wanted,
-            tally: [(0, 0); Kind::COUNT],
-            refused: None,
-            never,
-            warmed_only: 0,
-            never_from: 0,
-            belted: false,
-            starved: None,
-            peer_stopped: false,
-            unit_margin: 0,
-            from_record: false,
-            capped: true,
-            record_short: false,
-            took: None,
-            profiled: 0,
-            ballot: Ballot { slip: None },
-        }
-    }
-
-    #[test]
-    fn a_lattice_is_whole_only_where_every_planned_composition_holds_a_body() {
-        assert!(lattice(178, 178, 0).whole().is_ok());
-        // A composition fired and refused its body.
-        assert!(lattice(177, 178, 0).whole().is_err());
-        // Compositions the allowance stopped before their fire are planned
-        // too: a fire at one would walk eagerly.
-        let short = lattice(41, 41, 137).whole().unwrap_err().to_string();
-        assert!(short.contains("41 of 178"), "{short}");
-    }
 }

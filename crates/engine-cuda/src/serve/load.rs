@@ -1332,10 +1332,7 @@ impl Shell {
             arm_cold: false,
             arm_rs: crate::record::RsBody::Folds,
             arm_deferred: false,
-            arm_stepped: boot.knobs.arm_stepped,
-            stepping: None,
-            lent: None,
-            card: (0, 0, 0),
+            card: (0, 0),
             live: engine::live::Live::armed(),
             segments: std::collections::HashMap::new(),
             windows_memo: Vec::new(),
@@ -1680,43 +1677,28 @@ impl Staged {
                  weight residency, over the slots the cache holds then"
             );
         } else {
-            // The rungs past the smallest arm in the lane time the caller
-            // gives, over slots it lends: of the kv list and the records,
-            // so not where a fire also names windowed pages.
-            shell.arm_stepped =
-                shell.arm_stepped && shell.ep.is_none() && !shell.pools.has_windowed();
             shell.arming_at_load = true;
             let armed = shell.arm_bodies();
             shell.arming_at_load = false;
             armed?;
         }
-        let stepping = shell.stepping.is_some();
         let resident = footprint(&shell, device_total, free_before);
         // Arming fired every composition, so the activation is at its high
         // water; a load that records no bodies, or arms at its starting
         // weight residency, has fired none yet, and keeps the bodies'
         // allowance out of the cache rows till it arms.
-        // One whose rungs past the smallest arm later keeps what is left of
-        // the allowance out likewise, and its range where the bodies armed
-        // name it.
         // Whatever armed a body, the range stays where it lies: the bodies
         // name addresses in it, and a fit that reserved it anew (a flat
         // range's does) would leave them naming the old one.
         if shell.cache.body_stats().census.bodies > 0 {
             shell.pools.pin();
         }
-        let settled = shell.records_bodies() && !deferred && !stepping;
-        let bodies = if deferred {
-            shell.bodies_mem as u64
-        } else if stepping {
-            (shell.bodies_mem as u64).saturating_sub(shell.cache.body_stats().census.bytes as u64)
-        } else {
-            0
-        };
+        let settled = shell.records_bodies() && !deferred;
+        let bodies = if deferred { shell.bodies_mem as u64 } else { 0 };
         let fitted = shell
             .pools
             .fit_the_card(bodies, held_for_fires, settled, &resident)?;
-        if stepping || shell.arena.has_rungs() {
+        if shell.arena.has_rungs() {
             // The runtime is stated the range whole, what a later fit may
             // yet give the cache rows with it, and keeps the pool under it
             // by what this fit holds back. The state's chunks then end
@@ -1757,8 +1739,7 @@ impl Staged {
                 kernels_cuda::jit::Slabs::unplaced_bytes() >> 20,
             );
         }
-        shell.card = (device_total, free_before, held_for_fires);
-        shell.state_live();
+        shell.card = (device_total, free_before);
         if rank != 0 {
             shell.programs.set_shadow(true);
         }
@@ -1822,44 +1803,30 @@ fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
     }
 }
 
-/// The device's memory as this load holds it ([`engine::memory`]): each
-/// owner under its class, over what the device has for this process (all of
-/// it but what others held before the load began).
 impl Shell {
-    /// States what the runtime reads of this shell ([`engine::live::Live`]):
-    /// what the fit holds back of the chunks it stated while rungs are left
-    /// to arm (none once it has settled), and the ledger's outside class.
-    pub(super) fn state_live(&self) {
-        self.live.set_held(self.pools.kept_back_bytes());
-        // What the driver holds outside the engine's span, as the ledger
-        // enters it: read by the policy, taken out of no range.
-        let ledger = ledger(self, self.card.0, self.card.1);
-        self.live
-            .set_outside(ledger.bytes(engine::memory::Class::Outside));
+    /// The device's memory as this load holds it now ([`ledger`]).
+    #[must_use]
+    pub fn ledger(&self) -> engine::memory::Ledger {
+        ledger(self, self.card.0, self.card.1)
     }
 
-    /// The fit once the last rung is armed: the activation at its high
-    /// water and the bodies at what they take, the rest the cache rows'.
-    pub(super) fn settle(&mut self) -> Result<()> {
-        let resident = footprint(self, self.card.0, self.card.1);
-        let before = (self.pools.declared_bytes(), self.pools.kept_back_bytes());
-        let fitted = self.pools.fit_the_card(0, self.card.2, true, &resident)?;
-        self.state_live();
-        if super::diag::on().arm_trace {
-            eprintln!(
-                "[arm-trace] settled after the last step: cache rows {} -> {} MiB of the {} MiB \
-                 the card hands out for them, {} -> {} MiB of the stated chunks held back",
-                before.0 >> 20,
-                self.pools.declared_bytes() >> 20,
-                fitted.room >> 20,
-                before.1 >> 20,
-                self.pools.kept_back_bytes() >> 20,
-            );
-        }
-        Ok(())
+    /// Two load facts of this shell
+    /// ([`engine::chunk::ChunkFacts::held_bytes`] and `outside_bytes`):
+    /// what the fit holds back of the chunks it stated, and what the driver
+    /// holds outside the engine's span, as the ledger enters it (read by
+    /// the policy, taken out of no range).
+    #[must_use]
+    pub fn held_and_outside(&self) -> (u64, u64) {
+        (
+            self.pools.kept_back_bytes(),
+            self.ledger().bytes(engine::memory::Class::Outside),
+        )
     }
 }
 
+/// The device's memory as this load holds it ([`engine::memory`]): each
+/// owner under its class, over what the device has for this process (all of
+/// it but what others held before the load began).
 fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory::Ledger {
     use engine::memory::{Class, Ledger};
     let held = footprint(shell, device_total, free_before);
