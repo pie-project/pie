@@ -16,10 +16,3 @@ bf16_flops_per_ns = 202000.0
 # 896 GB/s of GDDR7 (nvidia.com, RTX PRO 4500 Blackwell specifications).
 bytes_per_ns = 896.0
 
-[fire_ns]
-# `pie tune vulkan --fire-only` at ad9bd7295 on this card: a fire at each
-# rung width a served load lays (512 lanes, 10240 tokens), one lane on a
-# fresh slot, the median of three after one not kept (box load 39,
-# nr_throttled +795 over the run).
-"qwen3-0.6b-bf16-kv-bf16" = [[1, 10375599], [2, 2489342], [4, 20524467], [8, 20453376], [16, 20444876], [32, 20431347], [64, 20421557], [128, 20520957], [256, 30559425], [512, 41953518], [1024, 90975979], [2048, 241892543], [4096, 745797063], [8192, 2568336054], [10240, 3916682745]]
-"qwen3-8b-bf16-kv-bf16" = [[1, 20635558], [2, 19562473], [4, 81128423], [8, 81088233], [16, 83173583], [32, 89127801], [64, 101650440], [128, 138578564], [256, 208697866], [512, 414391508], [1024, 826007142], [2048, 1763417471], [4096, 4163107720], [8192, 11136650038], [10240, 15776252208]]
