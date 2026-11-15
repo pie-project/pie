@@ -48,7 +48,6 @@ pub struct Diagnostics {
     pub kernel_profile: Profile,
     pub kernel_dump: Option<PathBuf>,
     pub keepalive: bool,
-    pub scratch_no_zero: bool,
     pub host_rows: bool,
     pub nan_check: bool,
 
@@ -75,7 +74,6 @@ impl Default for Diagnostics {
             kernel_profile: Profile::Off,
             kernel_dump: None,
             keepalive: true,
-            scratch_no_zero: false,
             host_rows: false,
             nan_check: false,
             nan_limit: 3.0e38,
@@ -118,7 +116,7 @@ fn number<T: std::str::FromStr>(word: &str, value: &str) -> std::result::Result<
 const WORDS: &str = "`tier-trace`, `rs-trace`, `fire-trace`, \
      `region-trace`, `streamed-trace`, `kernel-profile[=1|2]`, \
      `nan-check`, `nan-limit=<float>`, `kernel-dump=<dir>`, \
-     `keepalive=off`, `scratch-no-zero`, `host-rows`, `prefault`, `copy-resident`, \
+     `keepalive=off`, `host-rows`, `prefault`, `copy-resident`, \
      `keepalive-iters=<n>`, \
      `window-ceiling=<bytes>`, `streamed-groups=<n>`, `streamed-repeat=<n>`, \
      `streamed-repeat-kind=<wide|partial|single|reduce|argmax>`, \
@@ -145,7 +143,6 @@ impl std::str::FromStr for Diagnostics {
                 "region-trace" => diag.region_trace = switch(word, value)?,
                 "streamed-trace" => diag.streamed_trace = switch(word, value)?,
                 "keepalive" => diag.keepalive = switch(word, value)?,
-                "scratch-no-zero" => diag.scratch_no_zero = switch(word, value)?,
                 "host-rows" => diag.host_rows = switch(word, value)?,
                 "nan-check" => diag.nan_check = switch(word, value)?,
                 "nan-limit" => {
