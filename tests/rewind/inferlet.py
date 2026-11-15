@@ -81,6 +81,7 @@ async def main(input):
     prompt, over, keep, nxt = input["prompt"], input["overshoot"], input["keep"], input["next"]
     probe, watch = input["probe"], input["watch"]
     pipe = E.Pipeline()
+    await fill(pipe, prompt, [], True)
 
     rewound = await fill(pipe, prompt, over, False)
     got = [await read(pipe, rewound, nxt, at(len(prompt) + keep, len(nxt)), watch),
