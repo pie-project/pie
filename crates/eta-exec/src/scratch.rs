@@ -1,8 +1,25 @@
 use super::extent::ValueDesc;
 
+mod lifetime;
+
+pub use lifetime::{
+    Launch, Launches, describe_launched, lay_out, read_only_unlaunched, region_rows,
+    value_lifetimes,
+};
+
 pub const ALIGN: u64 = 256;
 
+/// A lane's first bytes, no value's: where a value that takes no bytes is
+/// stated to lie.
 pub const DUMMY_BYTES: u64 = ALIGN;
+
+/// What an engine built to fill test slots writes over [`DUMMY_BYTES`]
+/// before a launch,
+/// so a kernel that reads a value stated to take no bytes answers wrongly
+/// where a test can see it: one byte repeated, which a device's byte fill
+/// writes; a float above any logit, which decides a maximum, an argmax or a
+/// sum that reads it; an index past any table; a state no draw starts from.
+pub const POISON: u32 = 0x7f7f_7f7f;
 
 pub const MAX_BYTES: u64 = (4 << 30) - ALIGN;
 
@@ -10,7 +27,7 @@ const TEMPORARIES_PER_ELEMENT: u64 = 4;
 
 /// The WGSL runtime's one-row select keeps its state just below the
 /// temporary area, out of reach of the sort ladder that reuses all of it.
-const SELECT_BYTES: u64 = eta_compiler::codegen::wgsl::SELECT_WORDS as u64 * 4;
+pub const SELECT_RESERVE: u64 = eta_compiler::codegen::wgsl::SELECT_WORDS as u64 * 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TooLarge {
@@ -38,23 +55,18 @@ pub fn layout(descriptors: &[ValueDesc]) -> Result<Layout, TooLarge> {
     let mut values = Vec::with_capacity(descriptors.len());
     let mut at = DUMMY_BYTES;
 
-    let mut widest: u64 = 1;
-
     for descriptor in descriptors {
         at = align_up(at).ok_or(TooLarge::Overflow)?;
         values.push(at);
         let span = align_up(descriptor.device_bytes()).ok_or(TooLarge::Overflow)?;
         at = at.checked_add(span).ok_or(TooLarge::Overflow)?;
-        widest = widest.max(u64::from(descriptor.len));
     }
 
     let temporary = at
-        .checked_add(SELECT_BYTES)
+        .checked_add(SELECT_RESERVE)
         .and_then(align_up)
         .ok_or(TooLarge::Overflow)?;
-    let temporary_bytes = widest
-        .checked_mul(size_of::<u32>() as u64)
-        .and_then(|bytes| bytes.checked_mul(TEMPORARIES_PER_ELEMENT))
+    let temporary_bytes = whole_value_temporaries(descriptors)
         .and_then(align_up)
         .ok_or(TooLarge::Overflow)?;
     let total = temporary
@@ -73,6 +85,19 @@ pub fn layout(descriptors: &[ValueDesc]) -> Result<Layout, TooLarge> {
         temporary_bytes,
         total,
     })
+}
+
+/// The temporaries a launch that sorts or reduces a whole value takes:
+/// [`TEMPORARIES_PER_ELEMENT`] words an element of the widest of
+/// `descriptors`. `None` past a `u64`.
+#[must_use]
+pub fn whole_value_temporaries(descriptors: &[ValueDesc]) -> Option<u64> {
+    descriptors
+        .iter()
+        .map(|descriptor| u64::from(descriptor.len))
+        .fold(1, u64::max)
+        .checked_mul(size_of::<u32>() as u64)
+        .and_then(|bytes| bytes.checked_mul(TEMPORARIES_PER_ELEMENT))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,10 +167,15 @@ fn release(free: &mut Vec<Vacant>, vacant: Vacant) {
     }
 }
 
+/// `descriptors` laid by `lifetimes`: a value takes the bytes of one whose
+/// last reader ran before it is written. `reserve` bytes lie clear below
+/// the temporary area, which holds `temporary` bytes: what the kernels keep
+/// there, as the engine that runs them states it.
 pub fn layout_reusing(
     descriptors: &[ValueDesc],
     lifetimes: &[Lifetime],
-    temporary_floor: u64,
+    reserve: u64,
+    temporary: u64,
 ) -> Result<Layout, TooLarge> {
     if lifetimes.len() != descriptors.len() {
         return layout(descriptors);
@@ -167,7 +197,6 @@ pub fn layout_reusing(
     let mut values = vec![0u64; count];
     let mut spans = vec![0u64; count];
     let mut at = DUMMY_BYTES;
-    let mut widest: u64 = 1;
     let mut step: Option<u32> = None;
 
     for &i in &by_def {
@@ -195,9 +224,7 @@ pub fn layout_reusing(
             spans[i] = 0;
             continue;
         }
-        let descriptor = &descriptors[i];
-        widest = widest.max(u64::from(descriptor.last.max(1)));
-        let span = align_up(descriptor.device_bytes()).ok_or(TooLarge::Overflow)?;
+        let span = align_up(descriptors[i].device_bytes()).ok_or(TooLarge::Overflow)?;
         let taken = if life.reusable {
             take(&mut free, span, life.launch_def, life.class_def)
         } else {
@@ -216,11 +243,9 @@ pub fn layout_reusing(
         spans[i] = span;
     }
 
-    let temporary = align_up(at).ok_or(TooLarge::Overflow)?;
-    let temporary_bytes = widest
-        .checked_mul(size_of::<u32>() as u64)
-        .and_then(|bytes| bytes.checked_mul(TEMPORARIES_PER_ELEMENT))
-        .map(|bytes| bytes.max(temporary_floor))
+    let temporary_bytes = align_up(temporary).ok_or(TooLarge::Overflow)?;
+    let temporary = at
+        .checked_add(reserve)
         .and_then(align_up)
         .ok_or(TooLarge::Overflow)?;
     let total = temporary
@@ -289,8 +314,8 @@ mod tests {
         within_a_many_block_launch_only_one_class_shares();
         a_result_that_may_go_unwritten_keeps_a_fresh_slot();
         a_wider_taker_gets_a_coalesced_pair_of_slots();
-        the_temporary_arena_is_sized_by_the_widest_row();
-        the_temporary_floor_lifts_the_arena();
+        the_temporary_area_holds_what_is_stated();
+        a_reserve_lies_below_the_temporary_arena();
         mismatched_lifetimes_fall_back_to_the_naive_layout();
         a_dead_value_takes_no_slot();
     }
@@ -298,7 +323,7 @@ mod tests {
     fn a_value_dead_before_the_next_region_hands_its_slot_on() {
         let descriptors = [desc(1024), desc(1024), desc(1024)];
         let lifetimes = [life(0, 1), life(1, 2), life(2, 2)];
-        let reused = layout_reusing(&descriptors, &lifetimes, 0).unwrap();
+        let reused = layout_reusing(&descriptors, &lifetimes, 0, 0).unwrap();
         let naive = layout(&descriptors).unwrap();
         assert_eq!(reused.values[2], reused.values[0]);
         assert_ne!(reused.values[1], reused.values[0]);
@@ -308,7 +333,7 @@ mod tests {
     fn a_value_last_read_where_another_is_defined_does_not_share() {
         let descriptors = [desc(1024), desc(1024)];
         let lifetimes = [life(0, 1), life(1, 1)];
-        let reused = layout_reusing(&descriptors, &lifetimes, 0).unwrap();
+        let reused = layout_reusing(&descriptors, &lifetimes, 0, 0).unwrap();
         assert_ne!(reused.values[0], reused.values[1]);
     }
 
@@ -321,7 +346,7 @@ mod tests {
             rowed(3, 3, 0, 0),
             rowed(4, 4, 1, 0),
         ];
-        let reused = layout_reusing(&descriptors, &lifetimes, 0).unwrap();
+        let reused = layout_reusing(&descriptors, &lifetimes, 0, 0).unwrap();
         assert_eq!(
             reused.values[1], reused.values[0],
             "same class, same launch"
@@ -347,18 +372,18 @@ mod tests {
                 ..life(1, 1)
             },
         ];
-        let reused = layout_reusing(&descriptors, &lifetimes, 0).unwrap();
+        let reused = layout_reusing(&descriptors, &lifetimes, 0, 0).unwrap();
         assert_ne!(reused.values[0], reused.values[1]);
     }
 
     fn a_wider_taker_gets_a_coalesced_pair_of_slots() {
         let descriptors = [desc(1024), desc(1024), desc(2048)];
         let lifetimes = [life(0, 0), life(0, 0), life(1, 1)];
-        let reused = layout_reusing(&descriptors, &lifetimes, 0).unwrap();
+        let reused = layout_reusing(&descriptors, &lifetimes, 0, 0).unwrap();
         assert_eq!(reused.values[2], reused.values[0].min(reused.values[1]));
     }
 
-    fn the_temporary_arena_is_sized_by_the_widest_row() {
+    fn the_temporary_area_holds_what_is_stated() {
         let wide = ValueDesc {
             len: 4 * 1024,
             rows: 4,
@@ -367,23 +392,44 @@ mod tests {
             dtype: 0,
             dims: [0; MAX_RANK],
         };
-        let reused = layout_reusing(&[wide], &[life(0, 0)], 0).unwrap();
-        assert_eq!(reused.temporary_bytes, 1024 * 4 * TEMPORARIES_PER_ELEMENT);
+        let none = layout_reusing(&[wide], &[life(0, 0)], 0, 0).unwrap();
+        assert_eq!(none.temporary_bytes, 0, "nothing stated, nothing held");
+        assert_eq!(none.total, none.temporary);
+        let stated = layout_reusing(&[wide], &[life(0, 0)], 0, 1000).unwrap();
+        assert_eq!(stated.values, none.values);
+        assert_eq!(stated.temporary, none.temporary);
+        assert_eq!(stated.temporary_bytes, align_up(1000).unwrap());
         assert_eq!(
             layout(&[wide]).unwrap().temporary_bytes,
-            4 * 1024 * 4 * TEMPORARIES_PER_ELEMENT
+            4 * 1024 * 4 * TEMPORARIES_PER_ELEMENT,
+            "each value its own bytes holds the widest value's words"
+        );
+        assert_eq!(
+            layout_reusing(&[wide], &[life(0, 0)], 0, u64::MAX),
+            Err(TooLarge::Overflow)
         );
     }
 
-    fn the_temporary_floor_lifts_the_arena() {
-        let reused = layout_reusing(&[desc(1024)], &[life(0, 0)], 1 << 20).unwrap();
-        assert_eq!(reused.temporary_bytes, 1 << 20);
+    fn a_reserve_lies_below_the_temporary_arena() {
+        let bare = layout_reusing(&[desc(1024)], &[life(0, 0)], 0, 0).unwrap();
+        let held = layout_reusing(&[desc(1024)], &[life(0, 0)], SELECT_RESERVE, 0).unwrap();
+        assert_eq!(held.values, bare.values);
+        assert_eq!(
+            held.temporary,
+            align_up(bare.temporary + SELECT_RESERVE).unwrap()
+        );
+        assert_eq!(held.temporary_bytes, bare.temporary_bytes);
+        assert_eq!(
+            held.temporary,
+            layout(&[desc(1024)]).unwrap().temporary,
+            "what each value its own bytes holds clear"
+        );
     }
 
     fn mismatched_lifetimes_fall_back_to_the_naive_layout() {
         let descriptors = [desc(1024), desc(1024)];
         assert_eq!(
-            layout_reusing(&descriptors, &[life(0, 0)], 0).unwrap(),
+            layout_reusing(&descriptors, &[life(0, 0)], 0, 0).unwrap(),
             layout(&descriptors).unwrap()
         );
     }
@@ -391,9 +437,9 @@ mod tests {
     fn a_dead_value_takes_no_slot() {
         let descriptors = [desc(1024), desc(1024), desc(1024)];
         let mut lifetimes = [life(0, 2), life(1, 2), life(2, 2)];
-        let with = layout_reusing(&descriptors, &lifetimes, 0).expect("fits");
+        let with = layout_reusing(&descriptors, &lifetimes, 0, 0).expect("fits");
         lifetimes[1].dead = true;
-        let without = layout_reusing(&descriptors, &lifetimes, 0).expect("fits");
+        let without = layout_reusing(&descriptors, &lifetimes, 0, 0).expect("fits");
         assert_eq!(
             without.values[1], 0,
             "a dead value's offset is the dummy region's"

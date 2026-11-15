@@ -221,10 +221,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             boot.trace.nodes.len()
         );
     }
-    if !boot.knobs.diagnostics.gumbel_direct {
-        eta_compiler::codegen::cuda::fused::GUMBEL_DIRECT
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-    }
     // The activation arena and the attention workspaces are sized from
     // `max_forward_tokens`, and on a wide model at a long envelope they are
     // gigabytes before a sequence seats. The card's share after the weight

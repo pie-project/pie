@@ -3,13 +3,13 @@ use eta_compiler::codegen::launch::{LaunchRegion, LaunchStagePlan};
 use eta_compiler::plan::{LibraryOp, RegionKind};
 use eta_exec::{
     Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LaneChannelSlot, LaneHeader, LaneRecord,
-    LaneShape, Layout, Lifetime, NO_TICKET, OpParams, SCRATCH_ALIGN, ValueDesc, describe, layout,
-    layout_reusing,
+    LaneShape, Launch, Launches, Layout, NO_TICKET, OpParams, SCRATCH_ALIGN, SCRATCH_DUMMY_BYTES,
+    SCRATCH_POISON, ValueDesc, describe_launched, region_rows,
 };
 use eta_ir::Dtype;
 use eta_ir::container::HostRole;
 use eta_ir::op::tags;
-use eta_ir::types::{MAX_RANK, name_or_unknown};
+use eta_ir::types::name_or_unknown;
 
 use std::sync::Arc;
 
@@ -636,281 +636,26 @@ pub(crate) fn shell_launches(region: &LaunchRegion) -> bool {
     region.kind != RegionKind::Library(LibraryOp::SecondParty)
 }
 
-#[must_use]
-fn read_only_by_skipped_regions(plan: &LaunchStagePlan) -> Vec<bool> {
-    let values = plan.value_types.len();
-
-    let mut producer = vec![usize::MAX; values];
-    let mut result_base = 0u32;
-    for (node, op) in plan.ops.iter().enumerate() {
-        for result in 0..u32::from(op.result_count) {
-            if let Some(slot) = producer.get_mut((result_base + result) as usize) {
-                *slot = node;
-            }
-        }
-        result_base += u32::from(op.result_count);
-    }
-
-    let mut skipped = vec![false; plan.ops.len()];
-    let mut unread = vec![false; values];
-    for region in plan.fused.iter().filter(|region| !shell_launches(region)) {
-        for &node in &region.nodes {
-            if let Some(node) = skipped.get_mut(node as usize) {
-                *node = true;
-            }
-        }
-        for value in region.inputs.iter().copied().chain(
-            region
-                .nodes
-                .iter()
-                .filter_map(|&node| plan.ops.get(node as usize))
-                .flat_map(|op| op.reads()),
-        ) {
-            if let Some(value) = unread.get_mut(value as usize) {
-                *value = true;
-            }
-        }
-    }
-
-    for (node, op) in plan.ops.iter().enumerate() {
-        if skipped.get(node).copied().unwrap_or(false) {
-            continue;
-        }
-        for value in op.reads() {
-            if let Some(value) = unread.get_mut(value as usize) {
-                *value = false;
-            }
-        }
-    }
-    for region in plan.fused.iter().filter(|region| shell_launches(region)) {
-        for sink in &region.sinks {
-            if let Some(value) = unread.get_mut(sink.value as usize) {
-                *value = false;
-            }
-        }
-    }
-
-    for (value, drop) in unread.iter_mut().enumerate() {
-        let tag = producer
-            .get(value)
-            .and_then(|&node| plan.ops.get(node))
-            .map(|op| op.tag);
-        if !matches!(tag, Some(tags::CHAN_READ | tags::CHAN_TAKE)) {
-            *drop = false;
-        }
-    }
-    unread
-}
-
 pub fn describe_values(plan: &LaunchStagePlan, extents: Extents) -> Result<Vec<ValueDesc>> {
-    let empty = read_only_by_skipped_regions(plan);
-    plan.value_types
-        .iter()
-        .enumerate()
-        .map(|(value, declared)| {
-            let described = describe(declared, &extents).map_err(|why| {
-                Fault::program(
-                    "program::launch",
-                    format!("a value's shape does not resolve against this fire: {why:?}"),
-                )
-            })?;
-            Ok(if empty.get(value).copied().unwrap_or(false) {
-                ValueDesc {
-                    len: 0,
-                    rows: 0,
-                    last: 0,
-                    dims: [0; MAX_RANK],
-                    ..described
-                }
-            } else {
-                described
-            })
-        })
-        .collect()
+    describe_launched(plan, &extents, shell_launches).map_err(|why| {
+        Fault::program(
+            "program::launch",
+            format!("a value's shape does not resolve against this fire: {why:?}"),
+        )
+    })
 }
 
-fn value_lifetimes(plan: &LaunchStagePlan, rows: &[u32]) -> Option<Vec<Lifetime>> {
-    let mut step_of = vec![u32::MAX; plan.ops.len()];
-    let mut region_of = vec![u32::MAX; plan.ops.len()];
-    let mut region_first = Vec::with_capacity(plan.fused.len());
-    let mut region_last = Vec::with_capacity(plan.fused.len());
-    let mut step = 0u32;
-    for (index, region) in plan.fused.iter().enumerate() {
-        let per_node = region.kind == RegionKind::Generated;
-        region_first.push(step);
-        let run = if region.order.is_empty() {
-            &region.nodes
-        } else {
-            &region.order
-        };
-        for &node in run {
-            *step_of.get_mut(node as usize)? = step;
-            *region_of.get_mut(node as usize)? = u32::try_from(index).ok()?;
-            if per_node {
-                step = step.checked_add(1)?;
-            }
-        }
-        if !per_node {
-            step = step.checked_add(1)?;
-        }
-        region_last.push(step.saturating_sub(1));
-    }
-    if step_of.contains(&u32::MAX) {
-        return None;
-    }
-    let region_of_step = |step: u32| -> u32 {
-        region_first
-            .partition_point(|&first| first <= step)
-            .saturating_sub(1) as u32
-    };
-    let class_of = |region: u32, value: u32| -> u64 {
-        let Some(fused) = plan.fused.get(region as usize) else {
-            return Lifetime::SEQUENTIAL;
-        };
-        if rows.get(region as usize).copied().unwrap_or(1) <= 1 {
-            return Lifetime::SEQUENTIAL;
-        }
-        let geometry = fused
-            .row_value
-            .and_then(|witness| plan.value_types.get(witness as usize))
-            .and_then(|ty| eta_compiler::plan::value_rows(&ty.axes));
-        let Some(geometry) = geometry else {
-            return 0;
-        };
-        let Some(ty) = plan.value_types.get(value as usize) else {
-            return 0;
-        };
-        let elem: u64 = if ty.dtype == Dtype::Bool { 1 } else { 4 };
-        let alias = fused.row_alias;
-        if ty.axes.len() >= 2
-            && eta_compiler::plan::value_rows(&ty.axes)
-                .is_some_and(|shape| eta_compiler::plan::same_rows(shape, geometry, alias))
-        {
-            let width = match ty.axes.last() {
-                Some(eta_compiler::plan::Dimension::Static(width)) => u64::from(*width),
-                _ => return 0,
-            };
-            (1u64 << 40) | (width * elem)
-        } else if eta_compiler::plan::is_row_vector(&ty.axes, geometry.0, geometry.1, alias) {
-            (2u64 << 40) | elem
-        } else {
-            0
-        }
-    };
-    let values = plan.value_types.len();
-    let mut lifetimes = vec![
-        Lifetime {
-            dead: false,
-            def: 0,
-            last: 0,
-            reusable: false,
-            launch_def: 0,
-            launch_last: 0,
-            class_def: Lifetime::SEQUENTIAL,
-            class_last: Lifetime::SEQUENTIAL,
-        };
-        values
-    ];
-    let mut alias_of = vec![u32::MAX; values];
-    let bump = |lifetimes: &mut Vec<Lifetime>, alias_of: &[u32], mut value: u32, step: u32| {
-        for _ in 0..=alias_of.len() {
-            let Some(life) = lifetimes.get_mut(value as usize) else {
-                return;
-            };
-            life.last = life.last.max(step);
-            match alias_of.get(value as usize).copied() {
-                Some(source) if source != u32::MAX => value = source,
-                _ => return,
-            }
-        }
-    };
-    let mut result_base = 0u32;
-    for (node, op) in plan.ops.iter().enumerate() {
-        let step = step_of[node];
-        let written_in_full = !matches!(
-            op.tag,
-            tags::PIVOT_THRESHOLD | tags::CHAN_READ | tags::CHAN_TAKE
-        );
-        for result in 0..u32::from(op.result_count) {
-            if let Some(life) = lifetimes.get_mut((result_base + result) as usize) {
-                life.def = step;
-                life.last = life.last.max(step);
-                life.reusable = written_in_full;
-                life.launch_def = region_of[node];
-            }
-        }
-        if op.tag == tags::RESHAPE
-            && let Some(&source) = op.args.first()
-            && let Some(slot) = alias_of.get_mut(result_base as usize)
-        {
-            *slot = source;
-        }
-        result_base += u32::from(op.result_count);
-        let region = region_of[node];
-        let generated = plan
-            .fused
-            .get(region as usize)
-            .is_some_and(|fused| fused.kind == RegionKind::Generated);
-        for value in op.reads() {
-            bump(&mut lifetimes, &alias_of, value, step);
-            if generated
-                && lifetimes
-                    .get(value as usize)
-                    .is_some_and(|life| life.launch_def == region && life.last >= life.def)
-                && let Some(&last) = region_last.get(region as usize)
-            {
-                bump(&mut lifetimes, &alias_of, value, last);
-            }
-        }
-    }
-    for (region, fused) in plan.fused.iter().enumerate() {
-        let step = region_last[region];
-        let named = fused
-            .inputs
-            .iter()
-            .chain(fused.outputs.iter())
-            .copied()
-            .chain(fused.sinks.iter().map(|sink| sink.value));
-        for value in named {
-            bump(&mut lifetimes, &alias_of, value, step);
-        }
-    }
-    for (value, life) in lifetimes.iter_mut().enumerate() {
-        let value = value as u32;
-        life.launch_last = region_of_step(life.last);
-        life.class_def = class_of(life.launch_def, value);
-        life.class_last = class_of(life.launch_last, value);
-        if life.class_last == 0 {
-            life.last = life.last.max(region_last[life.launch_last as usize]);
-        }
-    }
-    for fused in &plan.fused {
-        for &value in &fused.spent {
-            if let Some(life) = lifetimes.get_mut(value as usize) {
-                life.dead = true;
-            }
-        }
-    }
-    Some(lifetimes)
-}
-
-fn region_rows(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> {
+/// The blocks each region runs across.
+fn region_blocks(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> {
     plan.fused
         .iter()
-        .map(|region| {
-            let rows = region
-                .row_value
-                .and_then(|value| descriptors.get(value as usize))
-                .map_or(1, |descriptor| descriptor.rows.max(1));
-            match region.kind {
-                RegionKind::Generated => rows,
-                kind if lane_sampler(kind) => LANE_SAMPLER_BLOCKS,
-                RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => rows,
-                RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => {
-                    rows.min(ORDER_ROW_BLOCKS)
-                }
-                RegionKind::Library(_) => 1,
-            }
+        .zip(region_rows(plan, descriptors))
+        .map(|(region, rows)| match region.kind {
+            RegionKind::Generated => rows,
+            kind if lane_sampler(kind) => LANE_SAMPLER_BLOCKS,
+            RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => rows,
+            RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => rows.min(ORDER_ROW_BLOCKS),
+            RegionKind::Library(_) => 1,
         })
         .collect()
 }
@@ -926,45 +671,94 @@ fn selects(plan: &LaunchStagePlan, region: &LaunchRegion) -> bool {
         })
 }
 
-fn temporary_floor(plan: &LaunchStagePlan, descriptors: &[ValueDesc], rows: &[u32]) -> u64 {
-    let align = |bytes: u64| bytes.next_multiple_of(SCRATCH_ALIGN);
+/// The bytes a lane's temporary area holds: the most a region's blocks keep
+/// there between them (a launch hands each block its share,
+/// `launch_region`).
+fn temporary_bytes(plan: &LaunchStagePlan, descriptors: &[ValueDesc], blocks: &[u32]) -> u64 {
+    plan.fused
+        .iter()
+        .zip(blocks)
+        .map(|(region, &blocks)| {
+            block_temporary(plan, descriptors, region)
+                .checked_next_multiple_of(SCRATCH_ALIGN)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(u64::from(blocks.max(1)))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The bytes a block of `region` keeps in the temporary area: what its
+/// kernel does, by the emitter that writes it.
+fn block_temporary(
+    plan: &LaunchStagePlan,
+    descriptors: &[ValueDesc],
+    region: &LaunchRegion,
+) -> u64 {
     let widest = descriptors
         .iter()
         .map(|d| u64::from(d.last))
         .max()
         .unwrap_or(1)
         .max(1);
-    plan.fused
-        .iter()
-        .zip(rows)
-        .map(|(region, &blocks)| {
-            let per_block = match region.kind {
-                // Each block of a generated region, a lone one too, keeps
-                // its reductions' levels here.
-                RegionKind::Generated => align(
-                    eta_compiler::codegen::launch::generated_temporary_bytes(plan, region, widest),
-                ),
-                _ if blocks <= 1 => 0,
-                kind if lane_sampler(kind) => align(LANE_SAMPLER_ARENA),
-                RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => 0,
-                RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => align(8 * widest + 256),
-                RegionKind::Library(_) => 0,
-            };
-            per_block * u64::from(blocks.max(1))
-        })
-        .max()
-        .unwrap_or(0)
+    match region.kind {
+        // A generated region's block keeps its reductions' levels here and
+        // nothing else.
+        RegionKind::Generated => {
+            eta_compiler::codegen::launch::generated_temporary_bytes(plan, region, widest)
+        }
+        // A sampler block's arena (`sample_lane.cuh`).
+        kind if lane_sampler(kind) => LANE_SAMPLER_ARENA,
+        // A select keeps its candidates in the block's shared memory.
+        RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => 0,
+        // An order block sorts through two rows of indices (`order_a`,
+        // `order_b`).
+        RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => {
+            8 * order_width(plan, descriptors, region).unwrap_or(widest)
+        }
+        // A scan and a matmul keep nothing here.
+        RegionKind::Library(_) => 0,
+    }
+}
+
+/// The width of the rows an order region sorts: its one node's input's.
+fn order_width(
+    plan: &LaunchStagePlan,
+    descriptors: &[ValueDesc],
+    region: &LaunchRegion,
+) -> Option<u64> {
+    let op = plan.ops.get(*region.nodes.first()? as usize)?;
+    let input = descriptors.get(*op.args.first()? as usize)?;
+    Some(u64::from(input.last))
+}
+
+/// The stage as this engine runs it: a launch a region across its blocks,
+/// a value a region's kernel never touches (what it streams through
+/// registers, what a scan of the model's row leaves unwritten, a reshape
+/// read as its source, a sampler's interior) taking no bytes, the temporary
+/// area what its kernels keep there.
+fn launches<'a>(plan: &'a LaunchStagePlan, blocks: &[u32], temporary: u64) -> Launches<'a> {
+    Launches {
+        each: plan
+            .fused
+            .iter()
+            .zip(blocks)
+            .map(|(region, &blocks)| Launch::of_region(region, blocks))
+            .collect(),
+        hollow: plan
+            .fused
+            .iter()
+            .flat_map(|region| region.spent.iter().copied())
+            .collect(),
+        temporary,
+        ..Launches::default()
+    }
 }
 
 fn lay_out(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Result<Layout> {
-    let rows = region_rows(plan, descriptors);
-    let lifetimes = value_lifetimes(plan, &rows);
-    let floor = temporary_floor(plan, descriptors, &rows);
-    match lifetimes {
-        Some(lifetimes) => layout_reusing(descriptors, &lifetimes, floor),
-        None => layout(descriptors),
-    }
-    .map_err(|why| {
+    let blocks = region_blocks(plan, descriptors);
+    let temporary = temporary_bytes(plan, descriptors, &blocks);
+    eta_exec::lay_out(plan, descriptors, &launches(plan, &blocks, temporary)).map_err(|why| {
         Fault::program(
             "program::launch",
             format!("this fire's scratch does not fit: {why:?}"),
@@ -1001,7 +795,7 @@ impl Prepared {
             .map_err(|_| Fault::program("program::launch", "a temporary offset past a u32"))?;
         let temporary_bytes = u32::try_from(scratch_layout.temporary_bytes)
             .map_err(|_| Fault::program("program::launch", "a temporary arena past a u32"))?;
-        let region_rows = region_rows(plan, &descriptors);
+        let region_rows = region_blocks(plan, &descriptors);
         let samplers = plan
             .fused
             .iter()
@@ -1421,6 +1215,13 @@ impl Prepared {
             rows
         };
         args.u32(rows).u32(stride);
+        // A value stated to take no bytes lies on the lane's dummy bytes: a
+        // build with `test-slot-fill` poisons them before every launch, so a
+        // kernel that reads one answers wrongly where a golden sees it.
+        // Without the feature no build writes anything here.
+        if cfg!(feature = "test-slot-fill") {
+            self.poison_dummy(stream)?;
+        }
         launch(
             &region.module,
             self.filled.saturating_mul(rows),
@@ -1578,6 +1379,37 @@ impl Prepared {
         let _ = stream;
         Ok(())
     }
+
+    /// The fire's lanes' dummy bytes (the first [`SCRATCH_DUMMY_BYTES`] of
+    /// each lane's scratch, where every value that takes no bytes lies)
+    /// filled with [`SCRATCH_POISON`].
+    fn poison_dummy(&self, stream: *mut core::ffi::c_void) -> Result<()> {
+        #[cfg(feature = "device")]
+        {
+            use crate::device::dr;
+            // SAFETY: the scratch holds `filled` lanes `scratch_stride` apart,
+            // each no shorter than its dummy bytes.
+            let code = unsafe {
+                dr::cuMemsetD2D32Async(
+                    self.scratch,
+                    self.scratch_stride as usize,
+                    SCRATCH_POISON,
+                    (SCRATCH_DUMMY_BYTES / 4) as usize,
+                    self.filled as usize,
+                    stream.cast(),
+                )
+            };
+            if code != dr::CUresult::CUDA_SUCCESS {
+                return Err(Fault::Device {
+                    call: "cuMemsetD2D32Async",
+                    code: code as i32,
+                });
+            }
+        }
+        #[cfg(not(feature = "device"))]
+        let _ = (stream, SCRATCH_POISON, SCRATCH_DUMMY_BYTES);
+        Ok(())
+    }
 }
 
 /// The device's multiprocessors, which a sampler fire's blocks may fill.
@@ -1678,6 +1510,7 @@ pub fn launch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eta_ir::types::MAX_RANK;
 
     /// A take its region runs after a constant cannot hand the constant its
     /// slot: the scratch is laid out in the order the emitter runs the ops,
@@ -1722,8 +1555,7 @@ mod tests {
             dims: [0; MAX_RANK],
         };
         let offsets = |plan: &LaunchStagePlan| {
-            let lifetimes = value_lifetimes(plan, &[1]).expect("every node is in a region");
-            layout_reusing(&[one, one], &lifetimes, 0)
+            eta_exec::lay_out(plan, &[one, one], &launches(plan, &[1], 0))
                 .expect("fits")
                 .values
         };
@@ -1737,6 +1569,438 @@ mod tests {
         assert_eq!(
             stated[0], stated[1],
             "in the stated order the constant may reuse the dead take's slot"
+        );
+    }
+
+    /// Guest programs as inferlets ship them, traced here: the scratch
+    /// they are laid is read off these.
+    mod shipped {
+        use eta_compiler::codegen::launch::LaunchPackage;
+        use eta_compiler::plan::{CompiledStage, compile_bound};
+        use eta_dsl::Traced;
+        use eta_dsl::prelude::*;
+        use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port};
+
+        pub const QWEN_VOCAB: u32 = 151_936;
+
+        fn leak(channel: Channel) -> &'static Channel {
+            Box::leak(Box::new(channel))
+        }
+
+        fn logits(vocab: u32) -> Vec<Vec<OutputDecl>> {
+            vec![vec![OutputDecl {
+                name: "logits".into(),
+                axis: Axis::Row,
+                width: vocab,
+                dtype: eta_ir::Dtype::F32,
+                layers: 0,
+                readout: true,
+            }]]
+        }
+
+        fn builder(vocab: u32) -> (Builder<'static>, &'static Channel) {
+            let tok_in = leak(Channel::from([42i32]));
+            let mut b = Builder::new(vocab, 16);
+            b.outputs(logits(vocab));
+            b.bind_port(Port::EmbedTokens, tok_in);
+            b.bind_port(Port::EmbedIndptr, leak(Channel::from([0u32, 1])));
+            b.bind_port(Port::Fold, leak(Channel::from([u32::MAX])));
+            (b, tok_in)
+        }
+
+        /// `text-completion-bench`'s decode epilogue: a temperature-scaled
+        /// top-p Gumbel-max draw.
+        pub fn top_p(vocab: u32) -> Traced {
+            let (temperature, top_p) = (0.6f32, 0.95f32);
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = intrinsics::output(0, "logits");
+                let scaled = logits / temperature;
+                let probs = softmax(&scaled);
+                let keep = pivot_threshold(probs, cummass_le(top_p));
+                let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
+                let masked = select(&keep, &scaled, &neg_inf);
+                let r = rng.take();
+                let g = gumbel(&r, [vocab]);
+                let r_next = &r + iota(2);
+                rng.put(&r_next);
+                let t = reshape(reduce_argmax(masked + g), [1]);
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            out.note_host_take();
+            b.build().expect("the top-p epilogue traces")
+        }
+
+        /// The `compat` generate step's sampler with a top-k and a top-p
+        /// cut: both pivots, their `and`, the mask and a Gumbel-max draw.
+        pub fn top_k_top_p(vocab: u32) -> Traced {
+            let temperature = 0.8f32;
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let r = rng.take();
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let scaled = &logits / temperature;
+                let probs = softmax(&scaled);
+                let ranked = pivot_threshold(&probs, rank_le(40u32));
+                let nucleus = pivot_threshold(&probs, cummass_le(0.9f32));
+                let keep = and(&ranked, &nucleus);
+                let token = reshape(gumbel_max(mask_apply(&scaled, keep), &r), [1]);
+                rng.put(&r + iota(2));
+                tok_in.put(&token);
+                out.put(&token);
+            });
+            out.note_host_take();
+            b.build().expect("the top-k top-p epilogue traces")
+        }
+
+        /// A temperature Gumbel-max draw with no cut.
+        pub fn gumbel_max_only(vocab: u32) -> Traced {
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let r = rng.take();
+                let scaled = intrinsics::output(0, "logits") / 0.7f32;
+                let token = reshape(gumbel_max(scaled, &r), [1]);
+                rng.put(&r + iota(2));
+                tok_in.put(&token);
+                out.put(&token);
+            });
+            out.note_host_take();
+            b.build().expect("the gumbel-max epilogue traces")
+        }
+
+        /// The greedy decode epilogue.
+        pub fn greedy(vocab: u32) -> Traced {
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let t = reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]);
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            out.note_host_take();
+            b.build().expect("the greedy epilogue traces")
+        }
+
+        /// A greedy step that lands its top logprobs: a top-k region.
+        pub fn top_logprobs(vocab: u32) -> Traced {
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let values_out = leak(Channel::new([5], dtype::f32).capacity(8));
+            let ids_out = leak(Channel::new([5], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let t = reshape(reduce_argmax(&logits), [1]);
+                let (values, ids) = top_k(log_softmax(&logits), 5);
+                values_out.put(&values);
+                ids_out.put(cast(&ids, dtype::i32));
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            values_out.note_host_take();
+            ids_out.note_host_take();
+            out.note_host_take();
+            b.build().expect("the top-logprobs epilogue traces")
+        }
+
+        /// A greedy step that lands the whole row in order: a sort region.
+        pub fn sorted(vocab: u32) -> Traced {
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let ids_out = leak(Channel::new([vocab], dtype::i32).capacity(2));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let t = reshape(reduce_argmax(&logits), [1]);
+                let (_, ids) = sort_desc(softmax(&logits));
+                ids_out.put(cast(&ids, dtype::i32));
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            ids_out.note_host_take();
+            out.note_host_take();
+            b.build().expect("the sorted epilogue traces")
+        }
+
+        /// Every program here, by name.
+        pub fn all(vocab: u32) -> Vec<(&'static str, Traced)> {
+            vec![
+                ("top-p", top_p(vocab)),
+                ("top-k + top-p", top_k_top_p(vocab)),
+                ("gumbel-max", gumbel_max_only(vocab)),
+                ("greedy", greedy(vocab)),
+                ("top logprobs", top_logprobs(vocab)),
+                ("sorted", sorted(vocab)),
+            ]
+        }
+
+        pub fn package(traced: &Traced, vocab: u32) -> LaunchPackage {
+            compiled(traced, vocab).1
+        }
+
+        /// The program's stages as compiled, and the package built of them.
+        pub fn compiled(traced: &Traced, vocab: u32) -> (Vec<CompiledStage>, LaunchPackage) {
+            let caps = EngineCaps {
+                lora: true,
+                attn_page_mask: true,
+            };
+            let bound = eta_ir::validate::bind(traced.container().clone(), logits(vocab), caps)
+                .expect("the program binds");
+            let stages = compile_bound(&bound);
+            let package = eta_compiler::codegen::launch::build(&bound, &stages);
+            (stages, package)
+        }
+    }
+
+    /// What a lane's scratch is for the programs inferlets ship, at a
+    /// vocabulary of 151,936: each value its own bytes; as laid here, with
+    /// the temporary area's share of it; and what it was while the rows a
+    /// scan of the model's row leaves unwritten, and the reshapes read as
+    /// their sources, held bytes.
+    #[test]
+    fn a_shipped_programs_scratch_a_lane() {
+        const WAS: [u64; 6] = [
+            3_505_408, 4_265_984, 3_040_512, 1_216_256, 2_508_544, 3_647_744,
+        ];
+        let vocab = shipped::QWEN_VOCAB;
+        let totals: Vec<(&str, u64, u64, u64)> = shipped::all(vocab)
+            .iter()
+            .map(|(name, traced)| {
+                let package = shipped::package(traced, vocab);
+                let [plan] = &package.plans[..] else {
+                    panic!("{name}: one stage");
+                };
+                let descriptors = describe_values(plan, Extents::default()).expect("static shapes");
+                let own = eta_exec::layout(&descriptors).expect("fits").total;
+                let laid = lay_out(plan, &descriptors).expect("fits");
+                (*name, own, laid.total, laid.temporary_bytes)
+            })
+            .collect();
+        assert_eq!(
+            totals,
+            [
+                ("top-p", 9_312_512, 2_898_432, 921_600),
+                ("top-k + top-p", 9_616_896, 3_658_240, 921_600),
+                ("gumbel-max", 5_512_960, 1_792, 0),
+                ("greedy", 3_688_704, 768, 0),
+                ("top logprobs", 6_728_960, 1_900_800, 76_032),
+                ("sorted", 8_551_168, 3_040_000, 1_215_488),
+            ]
+        );
+        for ((name, _, now, _), was) in totals.iter().zip(WAS) {
+            assert!(*now < was, "{name}: {now} bytes a lane, {was} before");
+        }
+    }
+
+    /// No generated kernel of the programs inferlets ship names the bytes
+    /// of a value its stage states to take none (a generated kernel
+    /// addresses a value as `offsets[<its id>]` and no other way), and no
+    /// such value is one a region is handed, hands on or puts. A greedy or
+    /// a Gumbel-max lane, whose one argmax scans the model's row, holds no
+    /// row of the vocabulary at all.
+    #[test]
+    fn no_kernel_names_a_value_that_takes_no_bytes() {
+        let vocab = shipped::QWEN_VOCAB;
+        let mut unwritten_rows = Vec::new();
+        for (name, traced) in shipped::all(vocab) {
+            let (stages, package) = shipped::compiled(&traced, vocab);
+            let ([stage], [plan]) = (&stages[..], &package.plans[..]) else {
+                panic!("{name}: one stage");
+            };
+            let descriptors = describe_values(plan, Extents::default()).expect("static shapes");
+            let laid = lay_out(plan, &descriptors).expect("fits");
+            let hollow: Vec<u32> = plan
+                .fused
+                .iter()
+                .flat_map(|region| region.spent.iter().copied())
+                .collect();
+            for &value in &hollow {
+                assert_eq!(laid.values[value as usize], 0, "{name}: value {value}");
+                for region in &plan.fused {
+                    assert!(
+                        !region.inputs.contains(&value)
+                            && !region.outputs.contains(&value)
+                            && region.sinks.iter().all(|sink| sink.value != value),
+                        "{name}: value {value} takes no bytes and a region holds it"
+                    );
+                }
+            }
+            for (index, (region, lowered)) in
+                stage.fused.regions.iter().zip(&plan.fused).enumerate()
+            {
+                if lowered.kind != RegionKind::Generated {
+                    continue;
+                }
+                let source = eta_compiler::codegen::cuda::emit_region("kernel", stage, region)
+                    .unwrap_or_else(|why| panic!("{name}: region {index}: {why:?}"))
+                    .replace("intrinsic_offsets[", "");
+                for &value in &hollow {
+                    assert!(
+                        !source.contains(&format!("offsets[{value}]")),
+                        "{name}: region {index} names value {value}, which takes no bytes"
+                    );
+                }
+            }
+            let rows = descriptors
+                .iter()
+                .zip(&laid.values)
+                .filter(|(descriptor, at)| descriptor.last == vocab && **at != 0)
+                .count();
+            if rows == 0 {
+                unwritten_rows.push(name);
+            }
+        }
+        assert_eq!(unwritten_rows, ["gumbel-max", "greedy"]);
+    }
+
+    /// The kernel of a region this engine states no temporary bytes for
+    /// names no temporary area, and one it states bytes for does: the
+    /// statement follows the emitters over the programs inferlets ship.
+    /// (An op the interpreter runs is handed the area whatever it is; the
+    /// interpreter goes to it for a reduction alone,
+    /// `ptir_m1_runtime_body.cuh`.)
+    #[test]
+    fn a_kernel_names_the_temporary_area_only_where_bytes_are_stated() {
+        // What every kernel's preamble says of the area, and a stream's
+        // pointer to it, which only its reductions go through.
+        const UNUSED: [&str; 3] = [
+            "m1_u8* temporary = scratch + temporary_offset + (m1_u64)lane_row * temporary_stride;",
+            "(void)temporary;",
+            "float* stream_work = reinterpret_cast<float*>(temporary);",
+        ];
+        // The tag of the op a line hands the interpreter, if it does.
+        let interpreted = |line: &str| -> Option<u8> {
+            let (_, call) = line.split_once("ptir_m1_execute(")?;
+            call.split_once('u')?.0.parse().ok()
+        };
+        let reduces =
+            |tag: u8| matches!(tag, tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN);
+        let vocab = shipped::QWEN_VOCAB;
+        let mut stated_some = 0;
+        let mut stated_none = 0;
+        for (name, traced) in shipped::all(vocab) {
+            let (stages, package) = shipped::compiled(&traced, vocab);
+            let ([stage], [plan]) = (&stages[..], &package.plans[..]) else {
+                panic!("{name}: one stage");
+            };
+            let descriptors = describe_values(plan, Extents::default()).expect("static shapes");
+            assert_eq!(stage.fused.regions.len(), plan.fused.len());
+            for (index, (region, lowered)) in
+                stage.fused.regions.iter().zip(&plan.fused).enumerate()
+            {
+                let source = eta_compiler::codegen::cuda::emit_region("kernel", stage, region)
+                    .unwrap_or_else(|why| panic!("{name}: region {index}: {why:?}"));
+                let entry = source
+                    .rfind("extern \"C\" __global__ void ")
+                    .expect("a kernel has its entry");
+                let (_, block) = source[entry..]
+                    .split_once(") {")
+                    .expect("its parameters end where its block opens");
+                let mut body: String = block
+                    .lines()
+                    .filter(|line| interpreted(line).is_none_or(reduces))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                for unused in UNUSED {
+                    body = body.replace(unused, "");
+                }
+                let names: Vec<&str> = body
+                    .lines()
+                    .filter(|line| line.contains("temporary") || line.contains("stream_work"))
+                    .collect();
+                let stated = block_temporary(plan, &descriptors, lowered);
+                assert_eq!(
+                    !names.is_empty(),
+                    stated != 0,
+                    "{name}: region {index} ({:?}): {stated} bytes a block stated, named by {names:#?}",
+                    lowered.kind
+                );
+                if stated == 0 {
+                    stated_none += 1;
+                } else {
+                    stated_some += 1;
+                }
+            }
+        }
+        assert!(stated_some != 0 && stated_none != 0, "both kinds were seen");
+    }
+
+    /// A sampler region's kernel reads its logits, threshold and state and
+    /// writes its probabilities, kept flags and token: what its nodes
+    /// compute between those takes no bytes, what it touches keeps its own.
+    #[test]
+    fn a_samplers_untouched_values_take_no_bytes() {
+        let vocab = shipped::QWEN_VOCAB;
+        let package = shipped::package(&shipped::top_p(vocab), vocab);
+        let [plan] = &package.plans[..] else {
+            panic!("one stage");
+        };
+        let descriptors = describe_values(plan, Extents::default()).expect("static shapes");
+        let laid = lay_out(plan, &descriptors).expect("fits");
+        let bases: Vec<u32> = plan
+            .ops
+            .iter()
+            .scan(0u32, |next, op| {
+                let base = *next;
+                *next += u32::from(op.result_count);
+                Some(base)
+            })
+            .collect();
+        let sampler = plan
+            .fused
+            .iter()
+            .find(|region| lane_sampler(region.kind))
+            .expect("top-p's cut and draw are a sampler region");
+
+        let rows = sampler
+            .spent
+            .iter()
+            .filter(|&&value| descriptors[value as usize].last == vocab)
+            .count();
+        assert_eq!(rows, 7, "rows of the vocabulary the kernel never touches");
+        for &value in &sampler.spent {
+            assert_eq!(
+                laid.values[value as usize], 0,
+                "value {value} takes no bytes"
+            );
+            assert!(!sampler.inputs.contains(&value));
+            assert!(!sampler.outputs.contains(&value));
+            assert!(sampler.sinks.iter().all(|sink| sink.value != value));
+        }
+
+        let node = |tag: u8| {
+            sampler
+                .nodes
+                .iter()
+                .copied()
+                .find(|&node| plan.ops[node as usize].tag == tag)
+                .expect("a sampler region holds its cut and its draw") as usize
+        };
+        let cut = node(tags::PIVOT_THRESHOLD);
+        let touched = [
+            plan.ops[node(tags::REDUCE_MAX)].args[0],
+            plan.ops[cut].args[0],
+            bases[cut],
+            plan.ops[node(tags::RNG_KEYED)].args[0],
+            bases[node(tags::REDUCE_ARGMAX)],
+        ];
+        let mut at: Vec<u64> = touched
+            .iter()
+            .map(|&value| laid.values[value as usize])
+            .collect();
+        assert!(at.iter().all(|&offset| offset != 0));
+        at.sort_unstable();
+        at.dedup();
+        assert_eq!(at.len(), touched.len(), "each its own bytes");
+        assert_eq!(
+            laid.temporary_bytes,
+            u64::from(LANE_SAMPLER_BLOCKS) * LANE_SAMPLER_ARENA.next_multiple_of(SCRATCH_ALIGN),
+            "the sampler's blocks' arenas and nothing else"
         );
     }
 
