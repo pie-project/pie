@@ -101,6 +101,9 @@ pub(crate) struct Latch {
     sink: Option<engine::CompletionSink>,
     holds: std::sync::atomic::AtomicUsize,
     fault: std::sync::Mutex<Option<String>>,
+    /// The step's outcome once every hold is released: `Some(fault)`.
+    landed: std::sync::Mutex<Option<Option<String>>>,
+    done: std::sync::Condvar,
 }
 
 impl Latch {
@@ -111,7 +114,18 @@ impl Latch {
             sink,
             holds: std::sync::atomic::AtomicUsize::new(1),
             fault: std::sync::Mutex::new(None),
+            landed: std::sync::Mutex::new(None),
+            done: std::sync::Condvar::new(),
         })
+    }
+
+    /// Waits until every hold is released; the first fault any reported.
+    pub(crate) fn wait(&self) -> Option<String> {
+        let mut landed = self.landed.lock().expect("landed lock poisoned");
+        while landed.is_none() {
+            landed = self.done.wait(landed).expect("landed lock poisoned");
+        }
+        landed.clone().flatten()
     }
 
     pub(crate) fn hold(&self) {
@@ -134,6 +148,8 @@ impl Latch {
             "xla step landed"
         );
         let fault = self.fault.lock().expect("fault lock poisoned").take();
+        *self.landed.lock().expect("landed lock poisoned") = Some(fault.clone());
+        self.done.notify_all();
         if let Some(sink) = &self.sink {
             sink(
                 self.at,
@@ -1666,4 +1682,29 @@ fn fed_of(
             (channel, first, capacity, u32::try_from(slots * 2).unwrap_or(u32::MAX))
         })
         .collect())
+}
+
+#[cfg(test)]
+mod latch_tests {
+    use super::Latch;
+
+    /// A fault a device event reports after the submitter let go is the
+    /// step's, waited for (`PIE_XLA_SYNC`'s settle).
+    #[test]
+    fn a_fault_released_late_is_the_steps() {
+        let at = engine::StepDone {
+            frame: engine::fire::FrameId(1),
+            step: 0,
+        };
+        let latch = Latch::new(at, None);
+        latch.hold();
+        latch.release(Ok(()));
+        let late = std::sync::Arc::clone(&latch);
+        let event = std::thread::spawn(move || late.release(Err("the fire failed".into())));
+        assert_eq!(latch.wait().as_deref(), Some("the fire failed"));
+        event.join().expect("the event thread");
+        let clean = Latch::new(at, None);
+        clean.release(Ok(()));
+        assert_eq!(clean.wait(), None);
+    }
 }
