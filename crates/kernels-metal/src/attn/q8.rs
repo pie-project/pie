@@ -14,6 +14,12 @@ pub fn enabled(pool: &KvPool, dim: u32) -> bool {
         && u64::from(pool.keys.width) == pool.seq_stride
 }
 
+/// Whether the MPP kernel serves a `dim`-wide head over pages of
+/// `page_size` tokens at all: what no row count or mask changes.
+pub(super) fn mpp_serves(dim: u32, page_size: i32) -> bool {
+    matches!(dim, 64 | 128 | 256) && page_size == super::arbiter::MPP_PAGE_SIZE
+}
+
 /// Whether the MPP kernel serves these rows over a pool stored as it was written.
 pub(super) fn mpp_fits(
     q: Tensor,
@@ -26,8 +32,7 @@ pub(super) fn mpp_fits(
     causal
         && (!lse || dim == 64)
         && q.rows >= rows.from
-        && matches!(dim, 64 | 128 | 256)
-        && pool.page_size == 32
+        && mpp_serves(dim, pool.page_size)
         && pool.keys.dtype == Dtype::Bf16
         && pool.values.dtype == Dtype::Bf16
         && pool.head_stride == u64::from(dim)
