@@ -18,7 +18,7 @@ use super::batch::{self, AdmissionLimits};
 use super::frame::{self, FramePlan, FramePolicy, FrameStamp};
 use super::stats::{self, SchedulerStats};
 
-use super::lane::{ControlReplyRx, Lane, LaneCommit, LaunchReplyRx, LaunchResult};
+use super::lane::{ControlReplyRx, Lane, LaneCommit, LaunchRefusal, LaunchReplyRx, LaunchResult};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,7 +380,9 @@ impl std::future::Future for ReplyWait {
         match self.get_mut() {
             ReplyWait::Launch(reply) => std::pin::Pin::new(reply).poll(cx).map(|answer| {
                 LaneReply::Launch(answer.unwrap_or_else(|_| {
-                    Err("the engine lane dropped this launch unanswered".to_string())
+                    Err("the engine lane dropped this launch unanswered"
+                        .to_string()
+                        .into())
                 }))
             }),
             ReplyWait::Control { id, reply } => {
@@ -495,7 +497,7 @@ impl std::ops::Deref for QueuedLaunch {
 enum LaunchState {
     Posted,
     Accepted(SubmissionCompletion),
-    Failed(String),
+    Failed(LaunchRefusal),
 }
 
 struct PendingLaunchBatch {
@@ -508,6 +510,7 @@ struct PendingLaunchBatch {
                   of those moves 8 bytes. Matches that function's signature"
     )]
     requests: Vec<Box<PendingRequest>>,
+    lanes_of: Vec<u32>,
     started: Instant,
     batch_size: u64,
     total_tokens: usize,
@@ -1060,12 +1063,26 @@ impl BatchScheduler {
                     item,
                 );
             }
+            let mut apart = Vec::new();
             progress |= Self::retire_ready_launches(
                 &mut in_flight_launches,
                 &mut instances,
                 &stats,
                 &mut frame_policy,
+                &mut apart,
             );
+            if !apart.is_empty() {
+                progress |= Self::launch_apart(
+                    apart,
+                    &lane,
+                    &mut replies,
+                    &mut instances,
+                    &mut in_flight_launches,
+                    page_size,
+                    limits,
+                    &stats,
+                );
+            }
             progress |= Self::retire_ready_control(&mut in_flight_control);
             // A step's tokens stay within the pool's activation rung (SPEC
             // decision 6): smaller while the system is critical.
@@ -1389,7 +1406,7 @@ impl BatchScheduler {
             let state = match &batch.state {
                 LaunchState::Posted => "posted".to_string(),
                 LaunchState::Accepted(c) => format!("settled={}", c.is_settled()),
-                LaunchState::Failed(msg) => format!("failed({msg})"),
+                LaunchState::Failed(refused) => format!("failed({})", refused.message),
             };
             let _ = writeln!(
                 out,
@@ -2267,14 +2284,45 @@ impl BatchScheduler {
         if survivors.iter().all(Vec::is_empty) {
             return (progress, false);
         }
+        Self::launch(
+            survivors,
+            engine_loop,
+            replies,
+            instances,
+            in_flight_launches,
+            page_size,
+            limits,
+            stats,
+        );
+        (true, true)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the worker loop's state, borrowed piece by piece as `post_frame` borrows it"
+    )]
+    fn launch(
+        waves: Vec<Vec<Box<PendingRequest>>>,
+        engine_loop: &Lane,
+        replies: &mut LaneReplies,
+        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
+        in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
+        page_size: u32,
+        limits: SchedulerLimits,
+        stats: &Arc<SchedulerStats>,
+    ) {
         // Counted before the build moves the lanes into the fire.
-        let total_tokens = survivors
+        let total_tokens = waves
             .iter()
             .flatten()
             .map(|req| req.request.tokens())
             .sum::<usize>();
-        let (submission, requests) =
-            batch::build_frame_submission(survivors, limits, page_size, stats);
+        let (submission, requests) = batch::build_frame_submission(waves, limits, page_size, stats);
+        let lanes_of = submission
+            .steps
+            .iter()
+            .flat_map(|step| step.member_lanes.iter().copied())
+            .collect();
         let batch_size = requests.len() as u64;
         for request in &requests {
             if let Some(instance) = instances.get_mut(&request.instance_id) {
@@ -2285,11 +2333,45 @@ impl BatchScheduler {
         in_flight_launches.push_back(PendingLaunchBatch {
             state: LaunchState::Posted,
             requests,
+            lanes_of,
             started: Instant::now(),
             batch_size,
             total_tokens,
         });
-        (true, true)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the worker loop's state, borrowed piece by piece as `post_frame` borrows it"
+    )]
+    fn launch_apart(
+        refused: Vec<Box<PendingRequest>>,
+        engine_loop: &Lane,
+        replies: &mut LaneReplies,
+        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
+        in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
+        page_size: u32,
+        limits: SchedulerLimits,
+        stats: &Arc<SchedulerStats>,
+    ) -> bool {
+        let mut launched = false;
+        for request in refused {
+            if !Self::admits_to_frame(&request, instances) {
+                continue;
+            }
+            Self::launch(
+                vec![vec![request]],
+                engine_loop,
+                replies,
+                instances,
+                in_flight_launches,
+                page_size,
+                limits,
+                stats,
+            );
+            launched = true;
+        }
+        launched
     }
 
     fn retire_ready_launches(
@@ -2297,24 +2379,21 @@ impl BatchScheduler {
         instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
         stats: &Arc<SchedulerStats>,
         frame_policy: &mut FramePolicy,
+        apart: &mut Vec<Box<PendingRequest>>,
     ) -> bool {
         let mut progress = false;
         while let Some(front) = in_flight_launches.front() {
-            let launch_failure = match &front.state {
-                LaunchState::Posted => break,
-                LaunchState::Failed(message) => Some(message.clone()),
-                LaunchState::Accepted(_) => None,
-            };
             let result = match &front.state {
+                LaunchState::Posted => break,
+                LaunchState::Failed(_) => None,
                 LaunchState::Accepted(completion) => {
                     let Some(result) = completion.check() else {
                         break;
                     };
                     Some(result)
                 }
-                _ => None,
             };
-            let retired = in_flight_launches.pop_front().expect("front batch exists");
+            let mut retired = in_flight_launches.pop_front().expect("front batch exists");
             if wave_trace() {
                 wave_trace_emit(format!(
                     "[wave-trace] t={}us retire lanes={}",
@@ -2322,20 +2401,47 @@ impl BatchScheduler {
                     retired.requests.len()
                 ));
             }
-            frame_policy.on_frame_retired(retired.requests.iter().filter_map(|r| r.pipeline_id));
             for request in &retired.requests {
                 if let Some(instance) = instances.get_mut(&request.instance_id) {
                     instance.in_flight = instance.in_flight.saturating_sub(1);
                 }
             }
-            if let Some(message) = launch_failure {
-                let message = format!("direct launch rejected: {message}");
-                for request in &retired.requests {
+            if let LaunchState::Failed(refused) =
+                std::mem::replace(&mut retired.state, LaunchState::Posted)
+            {
+                let message = format!("direct launch rejected: {}", refused.message);
+                let unsettled = refused.unlaunched.is_some();
+                let again = refused.unlaunched.is_some_and(|steps| {
+                    retired.requests.len() > 1
+                        && batch::unbuild_frame(steps, &mut retired.requests, &retired.lanes_of)
+                });
+                for request in retired.requests {
+                    let overtaken = || {
+                        in_flight_launches.iter().any(|later| {
+                            later.requests.iter().any(|other| {
+                                other.instance_id == request.instance_id
+                                    || (request.pipeline_id.is_some()
+                                        && other.pipeline_id == request.pipeline_id)
+                            })
+                        })
+                    };
+                    if again && !overtaken() {
+                        apart.push(request);
+                        continue;
+                    }
+                    frame_policy.on_frame_retired(request.pipeline_id);
+                    if unsettled {
+                        crate::engine::completion::settle(
+                            &[request.completion.terminal_cell_ptr()],
+                            crate::engine::completion::TERMINAL_OUTCOME_FAILED,
+                        );
+                    }
                     request.completion.reject_unsubmitted(message.clone());
                 }
                 progress = true;
                 continue;
             }
+            frame_policy.on_frame_retired(retired.requests.iter().filter_map(|r| r.pipeline_id));
             let result = result.expect("accepted batch carries a settled result");
             match result {
                 Ok(()) => {
@@ -2658,6 +2764,181 @@ mod tests {
         a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying();
         a_launch_waits_for_the_copy_queued_ahead_of_it();
         a_pass_that_only_reorders_lets_the_worker_park();
+        a_refused_pass_fails_alone_and_its_frame_mates_land();
+    }
+
+    struct RefusingEngine {
+        offender: ::engine::InstanceId,
+        frames: Arc<Mutex<Vec<Vec<u64>>>>,
+        next: u64,
+    }
+
+    impl engine::Engine for RefusingEngine {
+        fn kind(&self) -> &'static str {
+            "refusing"
+        }
+
+        fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
+            Err(engine::Error::Load("no model".into()))
+        }
+
+        fn submit(
+            &mut self,
+            frame: &engine::FrameSubmission,
+        ) -> engine::Result<engine::FrameTicket> {
+            let passes: Vec<u64> = frame
+                .steps
+                .iter()
+                .flat_map(|step| step.attachments.iter().map(|a| a.instance.0))
+                .collect();
+            let refused = passes.contains(&self.offender.0);
+            self.frames.lock().unwrap().push(passes);
+            if refused {
+                return Err(engine::Error::Program(
+                    "serve::prepare refused: lane 0 states a readout list that is not one \
+                     ascending run"
+                        .into(),
+                ));
+            }
+            self.next += 1;
+            Ok(engine::FrameTicket {
+                id: engine::FrameId(self.next),
+                steps: frame
+                    .steps
+                    .iter()
+                    .map(|_| engine::FireTicket {
+                        id: engine::FireId(self.next),
+                        readouts: Vec::new(),
+                    })
+                    .collect(),
+            })
+        }
+
+        fn refused_unlaunched(&self) -> bool {
+            true
+        }
+    }
+
+    fn a_refused_pass_fails_alone_and_its_frame_mates_land() {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let stats = Arc::new(SchedulerStats::default());
+        let mut lane = Lane::spawn(
+            0,
+            Some(Box::new(RefusingEngine {
+                offender: ::engine::InstanceId(2),
+                frames: Arc::clone(&frames),
+                next: 0,
+            })),
+            Arc::clone(&stats),
+        );
+        let limits = SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+            max_context: 0,
+            prefill_rows: 0,
+            max_readouts: 0,
+        };
+        let mut instances = HashMap::new();
+        let mut passes = Vec::new();
+        for id in 1..=3u64 {
+            let bound = crate::engine::BoundInstance::new(
+                &::engine::BoundInstance {
+                    id: ::engine::InstanceId(id),
+                    program: ::engine::ProgramId(id),
+                    geometry: eta_ir::registry::GeometryClass::Host,
+                },
+                id,
+            );
+            instances.insert(
+                ::engine::InstanceId(id),
+                TrackedInstance::from_bound(&bound),
+            );
+            let mut request = crate::engine::FireRequest::one(crate::engine::fire::lane_of(
+                id as u32,
+                vec![7],
+                0,
+                vec![id as u32],
+            ));
+            request.boundary_program = true;
+            passes.push(Box::new(PendingRequest {
+                lora_program: false,
+                logical_fire_id: id,
+                request,
+                instance_id: ::engine::InstanceId(id),
+                completion: crate::engine::WorkItemCompletion::new(id, 0),
+                process_id: None,
+                pipeline_id: Some(ProcessId::from_u128(u128::from(id))),
+                prelaunch_copy: None,
+                prelaunch_state_copy: None,
+                frame: None,
+            }));
+        }
+        let completions: Vec<_> = passes.iter().map(|p| p.completion.clone()).collect();
+        let mut replies = LaneReplies::default();
+        let mut in_flight = VecDeque::new();
+        let mut policy = FramePolicy::new(1, 64, 4096, None);
+        BatchScheduler::launch(
+            vec![passes],
+            &lane,
+            &mut replies,
+            &mut instances,
+            &mut in_flight,
+            16,
+            limits,
+            &stats,
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !in_flight.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "every launch retires, the refused frame's passes fired again apart"
+            );
+            while let Some(LaneReply::Launch(result)) = replies.try_next() {
+                let batch = in_flight
+                    .iter_mut()
+                    .find(|batch| matches!(batch.state, LaunchState::Posted))
+                    .expect("an answer arrives for a posted launch");
+                BatchScheduler::accept_launch_reply(batch, &mut instances, result);
+            }
+            let mut apart = Vec::new();
+            BatchScheduler::retire_ready_launches(
+                &mut in_flight,
+                &mut instances,
+                &stats,
+                &mut policy,
+                &mut apart,
+            );
+            BatchScheduler::launch_apart(
+                apart,
+                &lane,
+                &mut replies,
+                &mut instances,
+                &mut in_flight,
+                16,
+                limits,
+                &stats,
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(completions.iter().all(|c| c.is_settled()));
+        let landed: Vec<std::result::Result<(), String>> = completions
+            .iter()
+            .map(|c| crate::rt::block_on(c.clone()).map_err(|error| error.to_string()))
+            .collect();
+        assert!(landed[0].is_ok() && landed[2].is_ok(), "{landed:?}");
+        assert!(
+            landed[1]
+                .as_ref()
+                .is_err_and(|error| error.contains("not one ascending run")),
+            "the refused pass fails with its refusal: {landed:?}"
+        );
+        assert_eq!(
+            *frames.lock().unwrap(),
+            [vec![1, 2, 3], vec![1], vec![2], vec![3]],
+            "the frame is offered once, then each of its passes alone, in order"
+        );
+        let _ = lane.shutdown();
     }
 
     /// A browser's single thread lands the batch a close waits on only after
@@ -2765,6 +3046,7 @@ mod tests {
                         terminal_cells: Vec::new(),
                         completions: Vec::new(),
                         instances: vec![::engine::InstanceId(0)],
+                        member_lanes: vec![1],
                     }],
                 },
                 false,
@@ -2782,9 +3064,10 @@ mod tests {
                 panic!("a panicking engine cannot have launched anything");
             };
             assert!(
-                err.contains("panic"),
+                err.message.contains("panic"),
                 "the failure must say what happened, so an operator restarts \
-                 rather than retries: {err}"
+                 rather than retries: {}",
+                err.message
             );
         }
 
@@ -2841,6 +3124,7 @@ mod tests {
                     terminal_cells: Vec::new(),
                     completions: Vec::new(),
                     instances: vec![::engine::InstanceId(0)],
+                    member_lanes: vec![1],
                 }],
             },
             false,
@@ -2855,11 +3139,16 @@ mod tests {
             panic!("an engine that refuses everything cannot have admitted a frame");
         };
         assert!(
-            error.contains("frame contract forbids"),
+            error.message.contains("frame contract forbids"),
             "the failure must say which promise was broken, so the fix is to \
-             static admission rather than to the retry budget: {error}"
+             static admission rather than to the retry budget: {}",
+            error.message
         );
-        assert!(error.contains("guest channel cells"), "{error}");
+        assert!(
+            error.message.contains("guest channel cells"),
+            "{}",
+            error.message
+        );
         assert_eq!(
             submits.load(Ordering::Relaxed),
             1,

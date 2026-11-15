@@ -335,11 +335,72 @@ pub(crate) fn build_frame_submission(
             terminal_cells: build.terminal_cells,
             completions: build.completions,
             instances,
+            member_lanes: build
+                .member_lane_indptr
+                .windows(2)
+                .map(|span| span[1] - span[0])
+                .collect(),
         });
         flattened.extend(group);
     }
 
     (FrameFire { steps }, flattened)
+}
+
+pub(crate) fn unbuild_frame(
+    steps: Vec<::engine::Step>,
+    requests: &mut [Box<PendingRequest>],
+    lanes_of: &[u32],
+) -> bool {
+    let held: usize = steps.iter().map(|step| step.lanes.len()).sum();
+    if lanes_of.len() != requests.len()
+        || lanes_of.iter().map(|&lanes| lanes as usize).sum::<usize>() != held
+    {
+        return false;
+    }
+    let mut lanes = Vec::with_capacity(held);
+    let mut media = Vec::new();
+    let mut voxels = Vec::new();
+    for step in steps {
+        let base = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
+        lanes.extend(step.lanes);
+        media.extend(step.media.into_iter().map(|mut row| {
+            row.lane = row.lane.saturating_add(base);
+            row
+        }));
+        voxels.extend(step.voxels.into_iter().map(|mut row| {
+            row.lane = row.lane.saturating_add(base);
+            row
+        }));
+    }
+    let mut lanes = lanes.into_iter();
+    let mut first = 0u32;
+    for (req, &count) in requests.iter_mut().zip(lanes_of) {
+        let own = first..first + count;
+        req.request.lanes = lanes.by_ref().take(count as usize).collect();
+        let (mine, rest): (Vec<_>, Vec<_>) =
+            media.into_iter().partition(|row| own.contains(&row.lane));
+        req.request.media = mine
+            .into_iter()
+            .map(|mut row| {
+                row.lane -= first;
+                row
+            })
+            .collect();
+        media = rest;
+        let (mine, rest): (Vec<_>, Vec<_>) =
+            voxels.into_iter().partition(|row| own.contains(&row.lane));
+        req.request.voxels = mine
+            .into_iter()
+            .map(|mut row| {
+                row.lane -= first;
+                row
+            })
+            .collect();
+        voxels = rest;
+        first += count;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -393,6 +454,7 @@ mod tests {
         a_device_geometry_member_seriates_into_the_suffix();
         a_frames_cells_are_one_per_member_and_never_shared();
         a_device_resolved_lane_counts_against_the_token_cap();
+        a_frame_unbuilt_gives_each_member_its_own_lanes_back();
     }
 
     fn every_member_owns_a_span_of_the_steps_lanes() {
@@ -624,6 +686,67 @@ mod tests {
             cells.iter().collect::<std::collections::HashSet<_>>().len(),
             cells.len(),
             "no cell is owned by two members"
+        );
+    }
+
+    fn a_frame_unbuilt_gives_each_member_its_own_lanes_back() {
+        let mut two = FireRequest {
+            lanes: vec![
+                crate::engine::fire::lane_of(0, vec![11], 0, vec![3]),
+                crate::engine::fire::lane_of(1, vec![12], 0, vec![4]),
+            ],
+            ..FireRequest::default()
+        };
+        two.media.push(engine::fire::StepMedia {
+            lane: 1,
+            ..Default::default()
+        });
+        let mut later = decode(33, 6);
+        later.media.push(engine::fire::StepMedia::default());
+        let (mut frame, mut flattened) = build_frame_submission(
+            vec![
+                vec![
+                    pending(two, InstanceId(1)),
+                    pending(decode(22, 5), InstanceId(2)),
+                ],
+                vec![pending(later, InstanceId(3))],
+            ],
+            limits(),
+            16,
+            &SchedulerStats::default(),
+        );
+        let lanes_of: Vec<u32> = frame
+            .steps
+            .iter()
+            .flat_map(|step| step.member_lanes.iter().copied())
+            .collect();
+        assert_eq!(lanes_of, [2, 1, 1]);
+        let steps: Vec<_> = frame
+            .steps
+            .iter_mut()
+            .map(|step| std::mem::take(&mut step.submission))
+            .collect();
+        assert!(flattened.iter().all(|req| req.request.lanes.is_empty()));
+        assert!(unbuild_frame(steps, &mut flattened, &lanes_of));
+        let tokens: Vec<Vec<Vec<u32>>> = flattened
+            .iter()
+            .map(|req| {
+                req.request
+                    .lanes
+                    .iter()
+                    .map(|lane| lane.tokens.clone())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(tokens, [vec![vec![11], vec![12]], vec![vec![22]], vec![vec![33]]]);
+        let media: Vec<Vec<u32>> = flattened
+            .iter()
+            .map(|req| req.request.media.iter().map(|row| row.lane).collect())
+            .collect();
+        assert_eq!(media, [vec![1], vec![], vec![0]]);
+        assert!(
+            !unbuild_frame(Vec::new(), &mut flattened, &lanes_of),
+            "steps that do not hold the members' lanes give nothing back"
         );
     }
 }

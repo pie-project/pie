@@ -116,6 +116,10 @@ pub trait Engine: Send {
 
     fn submit(&mut self, frame: &FrameSubmission) -> Result<FrameTicket>;
 
+    fn refused_unlaunched(&self) -> bool {
+        false
+    }
+
     /// Backs the pool's first `segments` segments
     /// ([`crate::chunk::ChunkFacts::segments`]), ahead of the runtime
     /// handing out any of their chunks; never on a fire's path. A refusal
