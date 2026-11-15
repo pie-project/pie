@@ -917,12 +917,10 @@ device = "Apple M9"
 [rates]
 bf16_flops_per_ns = 50000.0  # 50 TFLOP/s
 bytes_per_ns = 400           # 400 GB/s
-[fire_ns]
-"qwen3-8b-bf16-kv-bf16" = [[1, 20000000], [2, 20100000]]
 "#;
 
 #[test]
-fn a_device_file_states_its_rates_and_fire_times_and_a_layer_above_replaces_them() {
+fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
     let r = registry();
     let shelf = profile::Shelf {
         backend: "toy",
@@ -950,30 +948,15 @@ fn a_device_file_states_its_rates_and_fire_times_and_a_layer_above_replaces_them
             launch_ns: None,
         }
     );
-    assert_eq!(
-        p.fire_ns("qwen3-8b-bf16-kv-bf16"),
-        &[(1, 20_000_000), (2, 20_100_000)]
-    );
-    assert!(p.fire_ns("qwen3-0-6b").is_empty());
 
     let dir = std::env::temp_dir().join(format!("pie-shelf-rates-{}", std::process::id()));
     let path = shelf.user_path(&dir, "Apple M9");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &path,
-        "api = 1\n[rates]\nlaunch_ns = 9000\n[fire_ns]\n\"qwen3-0-6b\" = [[1, 5000000]]\n",
-    )
-    .unwrap();
+    std::fs::write(&path, "api = 1\n[rates]\nlaunch_ns = 9000\n").unwrap();
     let (p, _) = shelf.resolve(&r, "Apple M9", &facts(11, true), Some(&dir));
     std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(p.rates().bytes_per_ns, Some(400.0), "kept key by key");
     assert_eq!(p.rates().launch_ns, Some(9000));
-    assert_eq!(p.fire_ns("qwen3-0-6b"), &[(1, 5_000_000)]);
-    assert_eq!(
-        p.fire_ns("qwen3-8b-bf16-kv-bf16").len(),
-        2,
-        "kept model by model"
-    );
 
     // A dump carries them, and reads back.
     let text = profile::render::dump(&p);
@@ -994,7 +977,7 @@ fn a_device_file_states_its_rates_and_fire_times_and_a_layer_above_replaces_them
 }
 
 #[test]
-fn rates_and_fire_times_are_refused_where_they_do_not_read() {
+fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
     for (body, says) in [
         (
             "[rates]\nbytes_per_ns = -1\n",
@@ -1008,11 +991,7 @@ fn rates_and_fire_times_are_refused_where_they_do_not_read() {
             "[rates]\nlaunch_ns = 1.5\n",
             "`rates.launch_ns` is a whole number",
         ),
-        (
-            "[fire_ns]\n\"m\" = [[2, 10], [1, 10]]\n",
-            "`fire_ns.m` is a list of `[tokens, ns]` pairs, ascending in tokens",
-        ),
-        ("[fire_ns]\n\"m\" = [[1]]\n", "`fire_ns.m` is a list"),
+        ("[fire_ns]\n\"m\" = [[1, 10]]\n", "fire_ns"),
     ] {
         let e = refusal(&format!("api = 1\n{body}"));
         assert!(e.contains(says), "{body}: {e}");

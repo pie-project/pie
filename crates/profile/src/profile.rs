@@ -220,7 +220,7 @@ impl Profile {
         &self.0.target
     }
 
-    /// The rates and fire times the layers state ([`crate::fire`]).
+    /// The rates the layers state ([`crate::fire`]).
     #[must_use]
     pub fn tuned(&self) -> &crate::fire::Tuned {
         &self.1
@@ -232,22 +232,7 @@ impl Profile {
         self.1.rates
     }
 
-    /// The fire times measured of `model` (a model class) on this device.
-    #[must_use]
-    pub fn fire_ns(&self, model: &str) -> &[(u32, u64)] {
-        self.1.fire_ns(model)
-    }
-
-    /// This profile with `model`'s fire times replaced by `table`: what
-    /// `pie tune` writes.
-    #[must_use]
-    pub fn with_fire_ns(&self, model: &str, table: crate::fire::FireTable) -> Profile {
-        let mut tuned = (*self.1).clone();
-        tuned.fire_ns.insert(model.to_string(), table);
-        Profile(self.0.clone(), Arc::new(tuned))
-    }
-
-    /// This profile with the rates and fire times `tuned` states.
+    /// This profile with the rates `tuned` states.
     #[must_use]
     pub fn with_tuned(&self, tuned: crate::fire::Tuned) -> Profile {
         Profile(self.0.clone(), Arc::new(tuned))

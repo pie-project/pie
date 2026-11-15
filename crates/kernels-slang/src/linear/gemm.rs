@@ -39,6 +39,24 @@ pub struct Tactic {
     pub tier: Tier,
 }
 
+/// The rows a matmul of `rows` computes on `target` under `tactic`: `rows`
+/// padded to the row tile [`act_x_wt`] picks at that width (a vector
+/// kernel below [`VECTOR_MAX_ROWS`] pads nothing). What a fire's estimate
+/// counts a narrow fire's matmuls by, as it pays for the tile it under-fills.
+#[must_use]
+pub fn padded_rows(target: Target, tactic: Tactic, rows: u32) -> u32 {
+    let tile = match target {
+        _ if rows < VECTOR_MAX_ROWS => 1,
+        Target::Spirv if tactic.tier == Tier::Coopmat => 64,
+        // The register kernel's tile: 256 / (64 / 8) lanes of 8 rows.
+        Target::Spirv if rows >= RT_MIN_ROWS => 256,
+        Target::Spirv => 32,
+        Target::Wgsl if rows < NARROW_MAX_ROWS => 16,
+        Target::Wgsl => 64,
+    };
+    rows.div_ceil(tile).saturating_mul(tile)
+}
+
 pub fn matmul(
     ctx: &Ctx<'_>,
     tactic: Tactic,
