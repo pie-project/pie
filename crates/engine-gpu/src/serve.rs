@@ -910,13 +910,14 @@ impl<B: Serve> Shell<B> {
         match chosen.flatten() {
             Some(rung) => tracing::info!(
                 "{}",
-                crate::top::line(
+                crate::top::line_of(
                     &rung,
                     budgets.tokens.max_tokens,
                     span.bytes(),
                     live,
                     &device_name,
                     &model_key,
+                    device_profile.tuned(),
                 )
             ),
             None => tracing::info!(

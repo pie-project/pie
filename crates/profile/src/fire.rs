@@ -57,12 +57,17 @@ pub struct Tuned {
     pub rates: Rates,
     /// By model class.
     pub fire_ns: BTreeMap<String, FireTable>,
+    /// The rates were measured on the device by this load (a browser's,
+    /// whose masked adapter no profile names), not read from a layer: they
+    /// are this load's alone and are never written.
+    pub measured_this_load: bool,
 }
 
 impl Tuned {
     /// `upper` laid over `self`.
     pub fn lay(&mut self, upper: &Tuned) {
         self.rates = upper.rates.over(self.rates);
+        self.measured_this_load |= upper.measured_this_load;
         for (model, table) in &upper.fire_ns {
             self.fire_ns.insert(model.clone(), table.clone());
         }
@@ -79,7 +84,7 @@ impl Tuned {
     #[must_use]
     pub fn toml(&self) -> String {
         let mut out = String::new();
-        if !self.rates.is_empty() {
+        if !self.rates.is_empty() && !self.measured_this_load {
             let _ = writeln!(out, "\n[rates]");
             if let Some(v) = self.rates.bf16_flops_per_ns {
                 let _ = writeln!(out, "bf16_flops_per_ns = {v:?}");
@@ -127,6 +132,7 @@ mod tests {
                 ("a".to_string(), vec![(1, 10)]),
                 ("b".to_string(), vec![(1, 20)]),
             ]),
+            measured_this_load: false,
         };
         let up = Tuned {
             rates: Rates {
@@ -135,6 +141,7 @@ mod tests {
                 ..Rates::default()
             },
             fire_ns: BTreeMap::from([("b".to_string(), vec![(1, 30), (2, 40)])]),
+            measured_this_load: false,
         };
         low.lay(&up);
         assert_eq!(

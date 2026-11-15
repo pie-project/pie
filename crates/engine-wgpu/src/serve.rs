@@ -59,6 +59,21 @@ impl Serve for Api {
         let (chip, report) = crate::chip::resolve(&measured, boot.profiles.as_deref());
         crate::chip::SHELF.tell_untuned(&measured.name, &report);
         let tuning = crate::tuning::Tuning::new(chip, device.cores());
+        // A browser masks its adapter, so no profile states its rates: the
+        // load measures them on the device, for itself alone.
+        #[cfg(all(feature = "wgpu", target_family = "wasm"))]
+        let tuning = {
+            let chip = tuning.profile().clone();
+            let rates = chip.rates();
+            if rates.bf16_flops_per_ns.is_some() && rates.bytes_per_ns.is_some() {
+                tuning
+            } else {
+                let mut tuned = chip.tuned().clone();
+                tuned.rates = crate::rates::measure(&device, &tuning)?;
+                tuned.measured_this_load = true;
+                crate::tuning::Tuning::new(chip.with_tuned(tuned), device.cores())
+            }
+        };
         Ok((device, tuning))
     }
 
