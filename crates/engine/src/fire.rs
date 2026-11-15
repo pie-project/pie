@@ -571,12 +571,14 @@ pub enum RsVerb {
 /// folded yet, which the fire replays ahead of its own.
 ///
 /// The contract on carried rows, with no stated limit: a rung's replay
-/// scratch holds the rung's tokens of carried rows; a fire carries at most
-/// its rung's tokens; the runtime asks the rung for max(own, carried) and
-/// refuses past the largest rung.
+/// scratch holds at least the rung's tokens of carried rows; a fire carries
+/// at most its rung's tokens; the runtime asks the rung for max(own,
+/// carried) and refuses past the largest rung.
 ///
-/// - The engine: at rung `r` a fire's replay scratch holds `r` own rows and
-///   `r` carried rows, in extended rows (the recurrent layers' rows only).
+/// - The engine: at rung `r` a fire's replay scratch holds at least `r` own
+///   rows and `r` carried rows, in extended rows (the recurrent layers' rows
+///   only). It is a floor, what the runtime relies on (a fire granted rung
+///   `r` may carry `r`); an engine may lay more.
 /// - The runtime: a fire carrying more than its rung's tokens raises the
 ///   rung as a wider fire does; one carrying more than the largest rung's
 ///   tokens is refused by name, before anything is submitted. The counts
