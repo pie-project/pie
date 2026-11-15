@@ -11,6 +11,7 @@ mod a_conv_decoder_fires_over_a_voxel_input;
 mod a_device_geometry_beam_answers_the_host_path;
 mod a_device_fold_replays_what_a_host_fold_replays;
 mod a_double_block_fires_two_streams_through_the_engine;
+mod a_dry_load_traces_the_real_load_programs;
 mod a_maintenance_write_is_timed;
 mod a_fire_the_load_did_not_prepare_is_counted;
 mod a_pool_answers_what_the_base_build_answered;
