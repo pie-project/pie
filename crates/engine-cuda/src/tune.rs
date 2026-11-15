@@ -21,16 +21,18 @@ pub struct Outcome {
     pub seconds: f64,
 }
 
-/// Serve `artifact` under `chip`: a prompt, then steps at each lane count.
-/// The products it times land in the user's tactic table under `profiles`.
-fn serve(
+/// Load `artifact` under `chip` for `slots` lanes and `budget`: the
+/// products its arming times land in the user's tactic table under
+/// `profiles`.
+fn load(
     artifact: &Path,
     deployment: &str,
-    chip: Profile,
+    chip: &Profile,
     profiles: Option<&Path>,
-) -> Result<Serving, String> {
-    use poem::{Platform, Request};
-    let slots = *LANES.iter().max().expect("lanes") as u32;
+    slots: u32,
+    budget: poem_compiler::Budget,
+) -> Result<(crate::Shell, poem_ir::Trace), String> {
+    use poem::Platform;
     let row = poem_compiler::catalog::deployment(deployment)
         .ok_or_else(|| format!("no catalog row `{deployment}`"))?;
     let trace = row.trace(Platform::Cuda);
@@ -44,12 +46,12 @@ fn serve(
     let prospect =
         crate::weights::prospect(&trace, &contract, artifact, target).map_err(|e| e.to_string())?;
     let residency = crate::experts::Plan::cut(&prospect.ranking);
-    let mut shell = crate::Shell::load(crate::Boot {
+    let shell = crate::Shell::load(crate::Boot {
         voxels: None,
         trace: trace.clone(),
         contract: &contract,
         checkpoint: artifact,
-        budget: poem_compiler::Budget::new(slots, CONTEXT),
+        budget,
         patches: patches(&trace, slots),
         page_size: 16,
         context: CONTEXT,
@@ -71,6 +73,52 @@ fn serve(
         comm: core::ptr::null_mut(),
     })
     .map_err(|e| e.to_string())?;
+    Ok((shell, trace))
+}
+
+/// Load `artifact` as `pie serve` does with no budget stated: the default
+/// lanes, and the forward tokens the engine picks. Its arming walks every
+/// composition of the lattice a served load records, so the products it
+/// times are the ones serving runs, rung by rung; the tune's own servings
+/// ([`serve`]) cover only their prompt and lane counts.
+#[cfg(feature = "cuda")]
+fn arm_served(
+    artifact: &Path,
+    deployment: &str,
+    chip: &Profile,
+    profiles: Option<&Path>,
+) -> Result<(), String> {
+    let lanes = engine::load::Budgets::default().max_lanes;
+    let (shell, _) = load(
+        artifact,
+        deployment,
+        chip,
+        profiles,
+        lanes,
+        poem_compiler::Budget::new(lanes, 0),
+    )?;
+    drop(shell);
+    Ok(())
+}
+
+/// Serve `artifact` under `chip`: a prompt, then steps at each lane count.
+/// The products it times land in the user's tactic table under `profiles`.
+fn serve(
+    artifact: &Path,
+    deployment: &str,
+    chip: Profile,
+    profiles: Option<&Path>,
+) -> Result<Serving, String> {
+    use poem::Request;
+    let slots = *LANES.iter().max().expect("lanes") as u32;
+    let (mut shell, trace) = load(
+        artifact,
+        deployment,
+        &chip,
+        profiles,
+        slots,
+        poem_compiler::Budget::new(slots, CONTEXT),
+    )?;
     let token = |i: u32| 100 + (i * 7919) % 5000;
     let prompt: Vec<u32> = (0..PROMPT).map(token).collect();
     let fire =
@@ -303,6 +351,15 @@ pub fn run(
     let tuned = search::render_overrides(&chosen);
     let today = bench.file(&[])?;
     let draft = bench.file(&chosen)?;
+    // The dense GEMM tactics of the lattice a served load arms, under the
+    // tuned profile: a product the tables lack is timed here or nowhere.
+    #[cfg(feature = "cuda")]
+    for (artifact, deployment) in models {
+        say(&format!(
+            "timing the dense GEMM tactics {deployment}'s served lattice arms"
+        ));
+        arm_served(artifact, deployment, &Cuda::profile_of(&draft)?, profiles)?;
+    }
     let mut checks = Vec::new();
     // A file that changes nothing serves as today's does.
     let unchanged = draft == today;
