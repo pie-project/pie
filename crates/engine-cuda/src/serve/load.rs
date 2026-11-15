@@ -1544,8 +1544,8 @@ impl Shell {
                 "engine-cuda: [engine] bodies_mem {} MiB is held down to {} MiB on this card: \
                  with the weights, activations and inputs resident, one sequence at the declared \
                  context and the guests' programs seated, {} MiB is left for the graph bodies \
-                 and the cache rows together, and the bodies take at most a quarter of it. \
-                 State a smaller bodies_mem to choose it.",
+                 and the cache rows together; the rows take what the bodies leave of it once \
+                 they are captured.",
                 bodies >> 20,
                 afforded >> 20,
                 fitted.spare >> 20,

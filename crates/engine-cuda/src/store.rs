@@ -133,19 +133,24 @@ struct WorkingSet {
     limit: u64,
 }
 
-/// The least `[engine] bodies_mem` is held down to on a card with little
-/// room: enough for the decode bodies, which are what a serve replays every
-/// step and cost tens of megabytes each.
+/// What of `[engine] bodies_mem` comes before the guests' programs on a
+/// card with little room past one sequence: enough for the decode bodies,
+/// which are what a serve replays every step and cost tens of megabytes
+/// each.
 pub const BODIES_FLOOR_BYTES: u64 = 512 << 20;
 
-/// What the graph bodies may take on this card: the configured allowance,
-/// or a quarter of `room` — what is left for them and the cache rows once
-/// one sequence and the guests' programs are seated — whichever is less,
-/// but not under the floor while the room affords it. A fixed 4 GiB on a
-/// 24 GB card is a sixth of the device before a second sequence seats.
+/// What the graph bodies may take while they arm: the configured allowance
+/// (or what they took when this deployment last armed whole), within `room`,
+/// what is left for them and the cache rows once one sequence and the
+/// guests' programs are seated. It bounds arming and no more: the load's
+/// last fit comes after the bodies are captured and gives the cache rows
+/// everything they left ([`Pools::fit_and_state`]), so no part of the room
+/// is kept from the bodies for rows' sake. A load arms every composition or
+/// is refused, and a lattice held under its allowance for the rows' sake
+/// was a load refused with room on the card.
 #[must_use]
 pub fn bodies_allowance(configured: u64, room: u64) -> u64 {
-    configured.min(room).min((room / 4).max(BODIES_FLOOR_BYTES))
+    configured.min(room)
 }
 
 /// What is held for the bodies and the guests' programs together on a
@@ -1285,9 +1290,9 @@ impl Pools {
     /// this load puts on the device is resident, and again after arming,
     /// when the bodies have taken what they take and the rest is the pool's.
     /// `programs` is held for the guests' programs throughout; `bodies` is
-    /// the configured allowance, which `bodies_allowance` holds down to what
-    /// the room affords, and both yield before that one working set does,
-    /// since a pool under it is no deployment. `resident` spells what is on
+    /// the allowance arming is bounded by, which `bodies_allowance` holds
+    /// within what the room affords, and both yield before that one working
+    /// set does, since a pool under it is no deployment. `resident` spells what is on
     /// the device already, for the refusal when not even that fits.
     /// `settled` says the activation has reached its high water: every
     /// composition fired while the bodies armed.

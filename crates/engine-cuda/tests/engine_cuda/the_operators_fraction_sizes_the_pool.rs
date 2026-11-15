@@ -312,12 +312,14 @@ fn the_reservations_scale_to_a_twenty_four_gigabyte_card() {
         "4 GiB of bodies_mem leaves under one coarse slot: {fixed}"
     );
 
+    // The bodies' allowance bounds arming at what one sequence leaves: the
+    // cache rows take what the bodies leave of it once they are captured.
     let bodies = bodies_allowance(4 << 30, room - fine(8192));
     assert!(
         (BODIES_FLOOR_BYTES..4 << 30).contains(&bodies),
-        "held to a quarter: {bodies}"
+        "held to what one sequence leaves: {bodies}"
     );
-    assert_eq!(bodies, (room - fine(8192)) / 4);
+    assert_eq!(bodies, room - fine(8192));
     assert_eq!(
         bodies_allowance(4 << 30, 40 << 30),
         4 << 30,
@@ -325,8 +327,8 @@ fn the_reservations_scale_to_a_twenty_four_gigabyte_card() {
     );
     assert_eq!(
         bodies_allowance(4 << 30, 1 << 30),
-        BODIES_FLOOR_BYTES,
-        "the floor holds"
+        1 << 30,
+        "a short card gives them what it has: no part of it is kept for rows' sake"
     );
     assert_eq!(
         bodies_allowance(4 << 30, 300 << 20),
@@ -341,10 +343,11 @@ fn the_reservations_scale_to_a_twenty_four_gigabyte_card() {
 
     let seats = |slot: u64| (room - bodies) / slot;
     assert!(seats(fine(8192)) >= 1, "the 8k envelope seats a sequence");
-    assert!(
-        seats(fine(4096)) >= 3,
-        "and a 4k one seats a few: {}",
-        seats(fine(4096))
+    assert_eq!(
+        room - bodies,
+        fine(8192),
+        "the claim before arming is that one sequence; the rows' others come of what the bodies \
+         leave"
     );
 }
 
