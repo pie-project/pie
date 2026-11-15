@@ -42,11 +42,16 @@ fn an_exported_kv_stays_mapped() {
     let facts = kv::probe(&trace).expect("the micro trace's cache rows probe");
     let paging = Paging::of(PAGE, CONTEXT, SLOTS, u64::from(SLOTS * CONTEXT / PAGE))
         .expect("a pool of four full sequences");
+    let (free, total) = engine_cuda::store::device_memory().expect("the card reports its memory");
     let mut pools = Pools::reserve(
         0,
-        engine::Allowance {
-            budget: Some(4 << 30),
-        },
+        engine_cuda::device::elastic::ceiling_of(
+            total,
+            total - free,
+            engine::Allowance {
+                budget: Some(4 << 30),
+            },
+        ),
         &trace,
         paging,
         None,

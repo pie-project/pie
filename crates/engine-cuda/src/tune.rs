@@ -50,6 +50,7 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
         slots,
         kv_budget: None,
         allowance: engine::Allowance::WHOLE,
+        context_declared: false,
         ordinal: 0,
         knobs: crate::Knobs {
             chip: Some(chip.clone()),

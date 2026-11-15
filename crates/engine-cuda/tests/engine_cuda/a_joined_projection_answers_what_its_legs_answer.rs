@@ -154,6 +154,7 @@ fn load(trace: &Trace, joins: &[Join], unjoined: &Trace, tag: &str) -> (Shell, S
         slots: 1,
         kv_budget: Some(crate::POOL),
         allowance: engine::Allowance::WHOLE,
+        context_declared: false,
         ordinal: 0,
         // Eager: what a joined weight answers is the question, not how a
         // body records it, and capturing every composition of eleven rows

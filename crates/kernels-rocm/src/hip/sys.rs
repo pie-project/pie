@@ -89,6 +89,7 @@ table!(Hip from "libamdhip64.so" {
     fn hipMemcpyAsync(dst: *mut c_void, src: *const c_void, bytes: usize, kind: c_int, stream: Stream) -> HipError;
     fn hipStreamIsCapturing(stream: Stream, status: *mut c_int) -> HipError;
     fn hipDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> HipError;
+    fn hipDeviceGetPCIBusId(bus: *mut c_char, len: c_int, device: c_int) -> HipError;
     fn hipMalloc(ptr: *mut *mut c_void, bytes: usize) -> HipError;
     fn hipFree(ptr: *mut c_void) -> HipError;
     fn hipMemcpy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: c_int) -> HipError;
@@ -393,6 +394,29 @@ fn open_library(name: &str) -> Result<libloading::Library, String> {
 pub struct Api {
     pub hip: Hip,
     pub rtc: Hiprtc,
+}
+
+/// Whether this process copies through the device's copy (SDMA) queues:
+/// HIP's default (on) unless the operator's `HSA_ENABLE_SDMA` states
+/// otherwise. Each copy queue holds a save area of device memory
+/// ([`super::kfd`]), made at a stream's first copy past HIP's blit
+/// threshold; a load makes the queues it copies on before its pools
+/// ([`super::warm_copies`]). Off, every copy runs as a blit kernel on the
+/// compute queues, which on gfx942 slows the decode bodies a load captures
+/// about 2.6 times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyQueues {
+    On,
+    Off,
+}
+
+/// [`CopyQueues`] for this process.
+pub fn copy_queues() -> CopyQueues {
+    static CHOSEN: OnceLock<CopyQueues> = OnceLock::new();
+    *CHOSEN.get_or_init(|| match std::env::var("HSA_ENABLE_SDMA") {
+        Ok(stated) if stated.trim() == "0" => CopyQueues::Off,
+        _ => CopyQueues::On,
+    })
 }
 
 /// The loaded runtime, opened once per process. `Err` carries why the ROCm

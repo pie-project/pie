@@ -77,6 +77,7 @@ fn load(trace: &Trace, contract: &ModelContract, container: &Path) -> Shell {
         slots: 1,
         kv_budget: Some(crate::POOL),
         allowance: engine::Allowance::WHOLE,
+        context_declared: false,
         ordinal: 0,
         knobs: engine_cuda::Knobs::default(),
         cache_dir: None,

@@ -859,7 +859,7 @@ impl RaiseFunding {
                 // (`SharedPool::raise_at`).
                 let pages = {
                     let pool = shared.lock().unwrap();
-                    let goal = crate::store::shared::rung_goal(&pool, engine, rows);
+                    let goal = pool.rung_for(rows);
                     pool.raise_at(goal).map(|at| pool.raise_short(at).1)
                 };
                 let Some(pages) = pages else {
@@ -874,41 +874,8 @@ impl RaiseFunding {
                     continue;
                 };
                 if pages == 0 {
-                    // The rung is not armed yet: the lane arms it between
-                    // fires, each step lent room this pass funds as a
-                    // waiter (PLEX frees it), handed to the lane's next
-                    // step and free again after it.
-                    if let Some(room) = crate::scheduler::arming::unfunded(engine, rows) {
-                        let demand = crate::scheduler::arming::demand(room);
-                        tracing::debug!(engine, rows, ?room, "a raise funds a rung's arming");
-                        let asked = tokio::select! {
-                            asked = planner.acquire(pid, quorum, demand) => asked,
-                            () = stop.notified() => return,
-                        };
-                        match asked {
-                            Ok(crate::planner::Acquired::Granted(grant)) => {
-                                crate::scheduler::arming::fund(engine, grant);
-                            }
-                            // Quoted again: the planner's answer is the event.
-                            Ok(crate::planner::Acquired::Requote) => {}
-                            Ok(crate::planner::Acquired::Yield) => {
-                                tokio::select! {
-                                    _ = planner.wait_resident(pid) => {}
-                                    () = stop.notified() => return,
-                                }
-                            }
-                            Err(error) => {
-                                tracing::debug!(engine, %error, "a rung's arming room is refused");
-                                *failed.lock().unwrap() = Some(error.to_string());
-                                crate::store::shared::rung_changed(engine);
-                                return;
-                            }
-                        }
-                        continue;
-                    }
                     // The room is there and state lies in the span: the
-                    // walker moves it out, the engine copying it. Or the
-                    // rung is being armed with room already funded. Either
+                    // walker moves it out, the engine copying it, and
                     // tells the rung.
                     tokio::select! {
                         () = &mut watch => {}
@@ -939,7 +906,7 @@ impl RaiseFunding {
                         };
                         let taken = crate::store::shared::programs::take_raise(
                             &shared,
-                            |pool| crate::store::shared::rung_goal(pool, engine, rows),
+                            |pool| pool.rung_for(rows),
                             &mover,
                         )
                         .await;
@@ -1014,10 +981,10 @@ async fn wait_for_rung(
 /// row the cap covers asks nothing, no cap being narrower than it.
 ///
 /// The scheduler keeps a fire past the cap queued until the rung is back,
-/// and the walker cuts fires to what is asked, the live lanes' one row
-/// each otherwise: a fire wider than a row staged under a cap that covered
-/// it, asking nothing, sat queued for good once the walker took the cap
-/// down under it.
+/// and the walker, bringing the rung down, cuts fires to what is asked, the
+/// live lanes' one row each otherwise: a fire wider than a row staged under
+/// a cap that covered it, asking nothing, sat queued for good once the
+/// walker took the cap down under it.
 struct RungAsk {
     engine: usize,
     pid: uuid::Uuid,

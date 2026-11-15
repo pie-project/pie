@@ -135,6 +135,7 @@ fn logits(trace: &Trace, container: &Path, fused: bool, prompt: &[u32]) -> Vec<f
         slots: 1,
         kv_budget: Some(crate::POOL),
         allowance: engine::Allowance::WHOLE,
+        context_declared: false,
         ordinal: 0,
         knobs: Knobs {
             chip: Some(chip),

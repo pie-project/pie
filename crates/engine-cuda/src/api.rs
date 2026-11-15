@@ -78,10 +78,8 @@ pub(crate) type BeforeArming = Box<dyn FnMut(&mut Shell) -> std::result::Result<
 
 impl Cuda {
     #[must_use]
-    pub fn new(mut boot: DeviceBoot, contract_for: ContractFor) -> Cuda {
+    pub fn new(boot: DeviceBoot, contract_for: ContractFor) -> Cuda {
         crate::serve::diag::publish(&boot.knobs.diagnostics);
-        // The runtime's lane steps the arming (`Engine::arm_step`).
-        boot.knobs.arm_stepped = true;
         Cuda {
             boot,
             contract_for,
@@ -310,7 +308,7 @@ fn fault(fault: Fault) -> Error {
             wanted: need,
             available: have,
         },
-        Fault::Residency(_) => Error::Impossible(fault.to_string()),
+        Fault::Residency(_) | Fault::Card(_) => Error::Impossible(fault.to_string()),
         Fault::Ceiling { what, need, have } => Error::Impossible(format!(
             "this fire wants {need} {what} and the load reserved {have}"
         )),
@@ -558,19 +556,6 @@ impl Engine for Cuda {
             .map_or_else(engine::live::Live::armed, Shell::live)
     }
 
-    fn arming_room(&self) -> engine::live::ArmingRoom {
-        self.shell
-            .as_ref()
-            .map_or_else(Default::default, Shell::arming_room)
-    }
-
-    fn arm_step(&mut self, lent: &engine::live::ArmingLease) -> EngineResult<bool> {
-        match self.shell.as_mut() {
-            Some(shell) => shell.arm_step(lent).map_err(fault),
-            None => Ok(false),
-        }
-    }
-
     fn bind_thread(&mut self) -> EngineResult<()> {
         match self.shell.as_ref() {
             Some(shell) => shell.bind_thread().map_err(fault),
@@ -663,6 +648,7 @@ impl Engine for Cuda {
             voxels,
             page_size: budgets.page_size,
             context: budgets.max_context,
+            context_declared: budgets.context_declared && residency.device_kv_budget.is_none(),
             slots: budgets.slots,
             kv_budget: residency.device_kv_budget,
             allowance: residency.device,
@@ -689,6 +675,11 @@ impl Engine for Cuda {
         .map_err(fault)?;
         if let Some(hook) = self.before_arming.as_mut() {
             hook(&mut staged.shell).map_err(Error::Load)?;
+        }
+        // Another worker reads the kv pages in place: the pool's chunks lie
+        // in one run from its base.
+        if residency.kv_export {
+            staged.shell.keep_contiguous();
         }
         let mut shell = staged.finish().map_err(fault)?;
 
@@ -861,7 +852,10 @@ impl Engine for Cuda {
         self.loaded_mut()?.release_segments(segments).map_err(fault)
     }
 
-    fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
+    fn weight_residency(
+        &mut self,
+        residency: &engine::chunk::WeightResidency,
+    ) -> EngineResult<u64> {
         self.loaded_mut()?
             .weight_residency(residency)
             .map_err(fault)

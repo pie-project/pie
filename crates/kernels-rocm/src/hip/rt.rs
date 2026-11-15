@@ -160,6 +160,14 @@ pub unsafe fn hipDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_in
     }
 }
 
+pub unsafe fn hipDeviceGetPCIBusId(bus: *mut c_char, len: c_int, device: c_int) -> HipError {
+    match sys::api() {
+        // SAFETY: forwarded unchanged; the caller holds HIP's contract.
+        Ok(api) => unsafe { (api.hip.hipDeviceGetPCIBusId)(bus, len, device) },
+        Err(_) => hipErrorNotInitialized,
+    }
+}
+
 pub unsafe fn hipDeviceCanAccessPeer(can: *mut c_int, device: c_int, peer: c_int) -> HipError {
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.

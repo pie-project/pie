@@ -506,7 +506,7 @@ async fn a_small_pass_raises_to_the_rung_covering_it_and_an_idle_pool_lowers_aft
     let engine = Arc::new(Mutex::new(engine));
     let taken = take_raise(
         &shared,
-        |pool| rung_goal(pool, ENGINE, wanted_rows(ENGINE)),
+        |pool| pool.rung_for(wanted_rows(ENGINE)),
         &Lane(engine.clone()),
     )
     .await

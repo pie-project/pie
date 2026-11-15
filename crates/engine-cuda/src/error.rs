@@ -35,6 +35,9 @@ pub enum Fault {
     },
 
     Residency(String),
+    /// The card cannot hold what the load sized for it: the driver's own
+    /// holdings beside the pool, or a range it refused.
+    Card(String),
 
     Recipe(String),
 
@@ -163,6 +166,7 @@ impl fmt::Display for Fault {
             Self::Unsupported(why) => write!(f, "this device is not served: {why}"),
             Self::Bake(refusal) => write!(f, "this plan does not bake: {refusal:?}"),
             Self::Residency(why) => write!(f, "weight residency: {why}"),
+            Self::Card(why) => write!(f, "the card: {why}"),
             Self::Recipe(refusal) => f.write_str(refusal),
             Self::Load(error) => write!(f, "this checkpoint does not land: {error}"),
             Self::Fire(error) => write!(f, "{error}"),
@@ -377,19 +381,6 @@ impl From<poem_exec::Error> for Fault {
 }
 
 impl Fault {
-    /// Whether the device had no room for an allocation the call made.
-    #[must_use]
-    pub(crate) fn out_of_room(&self) -> bool {
-        match self {
-            Self::OutOfMemory { .. } => true,
-            #[cfg(feature = "device")]
-            Self::Device { code, .. } => {
-                *code == crate::device::rt::cudaError::cudaErrorMemoryAllocation as i32
-            }
-            _ => false,
-        }
-    }
-
     pub(crate) fn program(at: &'static str, why: impl Into<String>) -> Fault {
         Fault::Program {
             at,

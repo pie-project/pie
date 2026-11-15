@@ -9,7 +9,7 @@ use ::engine::chunk::{
 use ::engine::fire::Lane;
 
 use super::*;
-use crate::governor::Retarget;
+use crate::governor::{PATIENCE, Retarget};
 
 const MIB: u64 = 1 << 20;
 const CHUNK: u64 = 16 * MIB;
@@ -828,18 +828,6 @@ fn a_raise_by_demand_says_what_it_lacks_and_moves_the_rest() {
     assert_eq!(pool.rung_for(16), 16);
     assert_eq!(pool.rung_for(17), 256);
     assert_eq!(pool.rung_for(5000), 2048, "past every rung: the largest");
-    assert_eq!(
-        pool.armed_rung_for(5000, 256),
-        256,
-        "a rung still being captured is not offered"
-    );
-    assert_eq!(pool.armed_rung_for(17, 256), 256);
-    assert_eq!(
-        pool.armed_rung_for(17, 0),
-        16,
-        "the smallest is always served"
-    );
-    assert_eq!(pool.armed_rung_for(5000, u32::MAX), 2048);
     pool.lower_rung(16).unwrap();
     assert_eq!(
         pool.raise_short(2048),
@@ -870,10 +858,8 @@ fn a_raise_by_demand_says_what_it_lacks_and_moves_the_rest() {
 }
 
 /// Twelve rungs, every power of two from 1, the small ones sharing their
-/// activation's chunk count: an idle pool lowered to the smallest stays
-/// there, the walk never lowering again within the class it is in.
-#[test]
-fn rungs_sharing_their_chunks_are_one_class_the_walk_never_moves_within() {
+/// activation's chunk count (1 to 16 one class of one chunk).
+fn classed() -> SharedPool {
     let facts = ChunkFacts {
         act_chunks: vec![
             (1, 1),
@@ -892,7 +878,14 @@ fn rungs_sharing_their_chunks_are_one_class_the_walk_never_moves_within() {
         ..facts()
     };
     facts.validate().unwrap();
-    let mut pool = SharedPool::new(&facts, 256).unwrap();
+    SharedPool::new(&facts, 256).unwrap()
+}
+
+/// An idle pool lowered to the smallest rung stays there, the walk never
+/// lowering again within the class it is in.
+#[test]
+fn rungs_sharing_their_chunks_are_one_class_the_walk_never_moves_within() {
+    let mut pool = classed();
     let mut engine = FakeEngine::new();
     assert_eq!(
         walk_segments(&mut pool, 8, 0, &mut engine),
@@ -932,66 +925,124 @@ fn rungs_sharing_their_chunks_are_one_class_the_walk_never_moves_within() {
     ));
 }
 
-/// What an arming step is lent comes from the allocators sequences take
-/// from, named as a lane names them: a record by its pieces' slot refs, a
-/// kv page by its list slot ref; none lies in the null chunk, which the
-/// engine refuses a ref into.
-#[test]
-fn a_lent_record_and_lent_pages_name_no_slot_in_the_null_chunk() {
-    let mut facts = facts();
-    facts.shapes.retain(|shape| shape.id != RING);
-    facts.validate().unwrap();
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
-    let mut rs = crate::store::rs::RsStore::shared(&shared, None);
-    let grant = rs
-        .reserve(crate::store::rs::RsUnits::of(1, 0))
-        .expect("a record");
-    assert_eq!(grant.slots, [crate::store::rs::RsSlotId(0)], "store id 0");
-    let refs = rs.device_refs(&grant.slots);
-    let pool = shared.lock().unwrap();
-    let reserved = pool.pool().reserved_chunks();
-    assert!(reserved >= 1, "chunk 0 is the null chunk");
-    let mut at = 0;
-    for fixed in pool.fixed() {
-        let spc = pool.pool().shape(fixed.pool).unwrap().slots_per_chunk;
-        for _ in 0..fixed.pieces {
-            let chunk = refs[at] / spc;
-            assert!(
-                chunk >= reserved,
-                "piece ref {} lies in chunk {chunk}",
-                refs[at]
-            );
-            at += 1;
-        }
+/// The cap thrash of a host-paced decode: each two-row pass lifted the cap
+/// to 2 and its settle had the walker cut it back to the live lane's one
+/// row, a cut a fire, the pool's span the same before and after. A cut
+/// within a class frees no chunk, so the walker takes none: the pass gone
+/// and nobody short, the cap stays where the pass left it, for any time.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cap_down_that_frees_no_chunk_is_not_taken_however_long_it_stands() {
+    const ENGINE: usize = 9301;
+    let mut pool = classed();
+    pool.lower_rung(1).unwrap();
+    assert_eq!(pool.pool().act_reserved(), 1);
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+    set_fire_cap_for_test(ENGINE, 1);
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), 1, "one live lane, nothing asked");
+
+    // A two-row pass asks, and is cut at its width at once.
+    let want = want_rows(ENGINE, 2);
+    raise_now(&shared, ENGINE, 2);
+    assert_eq!(fire_cap(ENGINE), 2);
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), 2);
+
+    // Its last fire settled: the ask is gone, one lane lives, none is short.
+    drop(want);
+    assert_eq!(wanted_rows(ENGINE), 0);
+    for tick in 0..32 * PATIENCE {
+        grow.walk_rung().await;
+        assert_eq!(fire_cap(ENGINE), 2, "no cut at tick {tick}");
+        grow.ticked_for_test();
     }
-    assert_eq!(at, refs.len(), "one record, every piece");
-    let list = pool.list().expect("a kv list");
-    drop(pool);
-    let mut pages =
-        crate::store::chunks::ShapePool::<crate::store::kv::page_table::PhysicalKvPageId>::shared(
-            &shared, list,
-        );
-    let spc = shared
-        .lock()
-        .unwrap()
-        .pool()
-        .shape(list.pool)
-        .unwrap()
-        .slots_per_chunk;
-    for page in pages.try_alloc_n(64).expect("pages") {
-        assert!(
-            page.0 / spc >= reserved,
-            "page {} lies in the null chunk",
-            page.0
-        );
+    assert_eq!(
+        shared.lock().unwrap().pool().act_reserved(),
+        1,
+        "the span set aside never moved"
+    );
+    // The next pass finds its width standing: nothing to lift.
+    let _want = want_rows(ENGINE, 2);
+    raise_now(&shared, ENGINE, 2);
+    assert_eq!(fire_cap(ENGINE), 2);
+}
+
+/// The lower that frees chunks is still taken once the pool has stood past
+/// what is asked for the governor's patience, the cap down before it: a
+/// taker short of records while the largest rung holds its span is seated
+/// from the span the lower lends.
+#[tokio::test(flavor = "current_thread")]
+async fn a_lower_past_the_patience_seats_a_taker_short_of_records() {
+    const ENGINE: usize = 9302;
+    let mut pool = classed();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.rung(), 2048);
+    // Every record that fits under the largest rung is out: one more is
+    // short.
+    let n = pool.records_available() as usize;
+    let _held = pool.take_records(n).unwrap();
+    assert!(pool.take_records(1).is_none(), "short of a record");
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+    assert_eq!(fire_cap(ENGINE), u32::MAX);
+    for _ in 0..PATIENCE {
+        grow.ticked_for_test();
+        grow.walk_rung().await;
+        assert_eq!(fire_cap(ENGINE), u32::MAX, "not before the patience");
     }
-    rs.release_reservation(grant);
+    grow.ticked_for_test();
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), 1, "past the patience: fires cut");
+    grant_rung(ENGINE, 1);
+    grow.walk_rung().await;
+    grow.walk_rung().await;
+    let mut pool = shared.lock().unwrap();
+    assert_eq!(pool.pool().act_reserved(), 1, "lowered: the span lent");
+    assert!(pool.take_records(1).is_some(), "the taker is seated");
+}
+
+/// A fire term appearing that the rung in hand cannot seat beside cuts
+/// fires at once, under a pass still asking the width and before any tick:
+/// the fit, not the patience, decides it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_fire_term_appearing_under_a_standing_ask_cuts_fires_at_once() {
+    const ENGINE: usize = 9303;
+    let shared: Shared = Arc::new(Mutex::new(classed()));
+    let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+    let _want = want_rows(ENGINE, 2048);
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), u32::MAX, "asked and held");
+    let fit = {
+        let mut pool = shared.lock().unwrap();
+        let key = crate::store::shared::programs::FireKey {
+            program: ::engine::ProgramId(1),
+            extents: ::engine::BindExtents::default(),
+        };
+        let fixed = 55 * pool.pool().chunk_bytes();
+        pool.fire_facts_learned(
+            key,
+            &::engine::FireFacts {
+                fixed,
+                ..::engine::FireFacts::default()
+            },
+        );
+        pool.instance_bound(::engine::InstanceId(1), key);
+        pool.fit_cap()
+    };
+    assert!(fit < u32::MAX, "the largest rung no longer fits");
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), fit, "cut to the fit before any tick");
 }
 
 /// While the engine holds back part of the range it stated, no slot it
-/// binds none of is handed out, to a sequence or an arming lease alike:
-/// every ref lies in a committed segment, past the null chunk and below
-/// the span held back; once it holds none, the rest opens.
+/// binds none of is handed out: every ref lies in a committed segment,
+/// past the null chunk and below the span held back; once it holds none,
+/// the rest opens.
 #[test]
 fn no_slot_is_handed_out_past_what_the_engine_binds() {
     let facts = facts();
@@ -1178,7 +1229,7 @@ fn a_segment_straddling_the_ceiling_is_never_mapped() {
         grows += 1;
         assert!(grows < 16, "the walk keeps committing");
     }
-    let bound = pool.bound_bytes(u64::from(held) * CHUNK);
+    let bound = pool.bound_bytes();
     assert!(
         pool.held() <= bound,
         "mapped {} past what the engine binds {bound}",
@@ -1209,7 +1260,7 @@ fn the_room_counts_only_what_can_be_backed_under_what_the_engine_holds() {
     assert!(ceiling < top_start);
     let backable = ceiling / SEGMENT * SEGMENT;
     // The same chunks the pool may map below the span.
-    let bound = pool.bound_bytes(u64::from(held) * CHUNK) / CHUNK;
+    let bound = pool.bound_bytes() / CHUNK;
     assert_eq!(u64::from(backable), bound - u64::from(TOTAL - top_start));
     let room = pool.room();
     assert_eq!(

@@ -53,16 +53,12 @@ pub enum Checkpoint {
     None,
 }
 
-/// The share of a device's memory a load takes for itself; the rest is left
-/// to what the driver allocates beside it after load (graph bodies, modules
-/// loaded on first use, library workspaces). Provisional: it stands until
-/// that `outside` term is measured into the ledger (REDESIGN 2.2).
-pub const DEVICE_SHARE: f64 = 0.9;
-
-/// What a load may take of its device: [`DEVICE_SHARE`] of it, less what is
-/// held already, and no more than `[engine.memory] budget_device` when the
+/// What a load may take of its device: all of it, less what is held
+/// already, and no more than `[engine.memory] budget_device` when the
 /// operator states one (sharing a device with another process is the one
-/// thing a load cannot derive).
+/// thing a load cannot derive). No share of the device is set aside for
+/// what a backend's driver allocates beside the load: an engine sizes its
+/// pool once that is on the device, or keeps a share of its own.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Allowance {
     /// `[engine.memory] budget_device`, in bytes.
@@ -77,15 +73,7 @@ impl Allowance {
     /// this process or another): what this load may still take.
     #[must_use]
     pub fn room(self, total: u64, held: u64) -> u64 {
-        #[expect(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "a device's byte count is far inside f64's exact integer range, and \
-                      the product is floored back into u64 deliberately"
-        )]
-        let share = (total as f64 * DEVICE_SHARE) as u64;
-        let room = share.saturating_sub(held);
+        let room = total.saturating_sub(held);
         self.budget.map_or(room, |budget| room.min(budget))
     }
 
