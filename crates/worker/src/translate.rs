@@ -104,6 +104,7 @@ fn runtime_config(
             network_allowed_hosts: user.sandbox.network_allowed_hosts.clone(),
             max_upload_mb: user.server.max_upload.as_mib() as usize,
             allow_upload: user.server.allow_upload,
+            allow_weight_reload: user.server.allow_weight_reload,
             languages_dir: home.join("languages"),
             compile_cache_dir: Some(home.join("cache").join("wasmtime")),
         },

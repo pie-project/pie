@@ -93,6 +93,37 @@ fn tests_every_case() {
     idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
     pages_another_worker_sealed_are_found_in_the_host_tier();
+    new_weights_find_no_page_the_old_ones_sealed();
+}
+
+fn new_weights_find_no_page_the_old_ones_sealed() {
+    let mut store = KvStore::new(16, h(41));
+    let tokens: Vec<u32> = (0..40).map(|t| 1300 + t).collect();
+    let owner = ProcessId::from_u128(41);
+    sealed_and_gone(&mut store, &tokens, owner);
+    let reader = store.create_working_set();
+    let old = keys_ahead(&store, reader, 0, &tokens);
+    assert_eq!(store.cached_run(&old).len(), 2);
+    assert_eq!(store.live_working_sets(), 1);
+    store.release_working_set(reader, store.current_epoch());
+    assert_eq!(store.live_working_sets(), 0);
+
+    assert_eq!(store.rekey(h(42)), 2, "the two kept pages go back");
+    assert_eq!(store.available_pages(), 16);
+    assert!(store.cached_working_sets().is_empty());
+    assert!(store.cached_run(&old).is_empty());
+    let reader = store.create_working_set();
+    let new = keys_ahead(&store, reader, 0, &tokens);
+    assert_ne!(
+        new, old,
+        "the same tokens key otherwise under the new weights"
+    );
+    assert!(store.cached_run(&new).is_empty());
+    store.release_working_set(reader, store.current_epoch());
+
+    sealed_and_gone(&mut store, &tokens, owner);
+    assert_eq!(store.cached_run(&new).len(), 2);
+    assert!(store.cached_run(&old).is_empty());
 }
 
 /// Pages that came from another worker, whose keys this worker computes from

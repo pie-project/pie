@@ -10,6 +10,7 @@ use checkpoint::error::Error as LoadError;
 use checkpoint::executor::{Execution, sink::TensorSink};
 use checkpoint::file::read::parse_metadata;
 use checkpoint::file::zt;
+use checkpoint::overwrite::{Held, Overwrite};
 use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
 use checkpoint::types::{ScaleForm, TensorId};
 use kernels_cuda::Tensor;
@@ -37,6 +38,7 @@ pub struct Weights {
     experts: Option<crate::experts::Tier>,
     from_cache: bool,
     decoded: Vec<Buffer>,
+    places: Vec<Place>,
 }
 
 pub(crate) fn decodes_at_load(param: &poem_ir::Param) -> bool {
@@ -910,6 +912,7 @@ impl Weights {
             experts,
             from_cache,
             decoded,
+            places,
         })
     }
 
@@ -1569,6 +1572,96 @@ impl Weights {
             self.store.write(at, plane.bytes)?;
         }
         Ok(())
+    }
+
+    pub fn unreloadable(&self, trace: &Trace) -> Option<&'static str> {
+        let table = &self.table;
+        if self.experts.is_some() {
+            return Some(
+                "streams planes from a host copy (routed experts or embedding rows the \
+                 weight cache takes)",
+            );
+        }
+        if !self.decoded.is_empty()
+            || !table.1.is_empty()
+            || !table.2.is_empty()
+            || !table.3.is_empty()
+            || !table.4.is_empty()
+        {
+            return Some(
+                "derives planes from the checkpoint's at load (decoded or requantized copies)",
+            );
+        }
+        let laid = table.0.iter().any(|row| {
+            !matches!(
+                row,
+                None | Some(WeightRow::Dense(_))
+                    | Some(WeightRow::Planes {
+                        atoms: false,
+                        lanes: false,
+                        ..
+                    })
+            )
+        });
+        if laid {
+            return Some("lays quantized scales in its products' own order at load");
+        }
+        if cfg!(feature = "rocm")
+            && trace.params.iter().any(|param| {
+                param.source == ParamSource::Checkpoint
+                    && !matches!(param.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32)
+            })
+        {
+            return Some("serves quantized planes, which the HIP build reorders at load");
+        }
+        None
+    }
+
+    pub fn reload(
+        &mut self,
+        trace: &Trace,
+        contract: &ModelContract,
+        path: &Path,
+        target: StorageTarget,
+        stream: *mut core::ffi::c_void,
+        torn: &mut bool,
+    ) -> Result<(u32, u64)> {
+        if let Some(why) = self.unreloadable(trace) {
+            return Err(Fault::Load(LoadError::Unsupported(format!(
+                "this load {why}, which a reload does not redo: restart the server on the \
+                 new checkpoint instead"
+            ))));
+        }
+        let held: Vec<Option<Held<'_>>> = trace
+            .params
+            .iter()
+            .zip(&self.places)
+            .map(|(param, place)| {
+                (param.source == ParamSource::Checkpoint && place.reserved > 0).then_some(Held {
+                    name: &param.name,
+                    shape: &param.shape,
+                    bytes: place.bytes,
+                })
+            })
+            .collect();
+        let overwrite = Overwrite::plan(path, contract, target, &held)?;
+        let arena = usize::try_from(overwrite.arena_bytes()).unwrap_or(0);
+        let mut scratch = Scratch::fitting(arena, 0, overwrite.snapshot())?;
+        let mut backing: &mut [u8] = scratch.as_mut();
+        let (store, places) = (&mut self.store, &self.places);
+        *torn = true;
+        let written = overwrite.run(Some(&mut backing), |at, plane| {
+            store
+                .write(places[at].offset, plane)
+                .map_err(|fault| LoadError::Internal(fault.to_string()))
+        })?;
+        drop(scratch);
+        #[cfg(feature = "cuda")]
+        share_input_scales(trace, &self.table.0, stream)?;
+        #[cfg(not(feature = "cuda"))]
+        let _ = stream;
+        *torn = false;
+        Ok(written)
     }
 
     #[must_use]

@@ -719,7 +719,8 @@ fn corr_id_of(m: &ClientMessage) -> Option<u32> {
         | AttachProcess { corr_id, .. }
         | TerminateProcess { corr_id, .. }
         | ListProcesses { corr_id }
-        | Ping { corr_id } => Some(*corr_id),
+        | Ping { corr_id }
+        | ReloadWeights { corr_id, .. } => Some(*corr_id),
         SignalProcess { .. } | TransferFile { .. } => None,
     }
 }

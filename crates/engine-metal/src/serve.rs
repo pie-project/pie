@@ -1675,6 +1675,23 @@ impl Shell {
         self.weights.register_adapter(id, planes)
     }
 
+    pub fn reload_weights(
+        &mut self,
+        contract: &checkpoint::contract::ModelContract,
+        path: &std::path::Path,
+        torn: &mut bool,
+    ) -> Result<(u32, u64)> {
+        if self.ane.is_some() {
+            return Err(Fault::Load(checkpoint::error::Error::Unsupported(
+                "this load runs part of the model on the Neural Engine, which holds its own \
+                 copy of those weights; restart the server on the new checkpoint instead"
+                    .into(),
+            )));
+        }
+        self.drain()?;
+        self.weights.reload(&self.trace, contract, path, torn)
+    }
+
     #[must_use]
     pub fn bank_seats(&self) -> Vec<crate::weights::BankSeat> {
         self.weights.seats()

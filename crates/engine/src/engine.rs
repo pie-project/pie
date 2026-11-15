@@ -6,7 +6,7 @@ use crate::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use crate::chunk::{Evacuation, SlotCopy, WeightResidency, WeightUses};
 use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
-use crate::load::{LoadRequest, Loaded};
+use crate::load::{LoadRequest, Loaded, Reload, Reloaded};
 use crate::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
 
@@ -70,6 +70,11 @@ pub trait Engine: Send {
     }
 
     fn load(&mut self, request: LoadRequest) -> Result<Loaded>;
+
+    fn reload_weights(&mut self, reload: &Reload) -> Result<Reloaded> {
+        let _ = reload;
+        Err(self.unsupported("reload_weights"))
+    }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> Result<ProgramId> {
         let _ = registration;

@@ -26,7 +26,11 @@ static SESSION_OUTBOX: LazyLock<
     DashMap<ClientId, Arc<TokioMutex<mpsc::Receiver<WireServerMessage>>>>,
 > = LazyLock::new(DashMap::new);
 
-fn install_state(max_upload_bytes: usize, allow_upload: bool) -> Arc<ServerState> {
+fn install_state(
+    max_upload_bytes: usize,
+    allow_upload: bool,
+    allow_weight_reload: bool,
+) -> Arc<ServerState> {
     if let Some(state) = STATE.get() {
         return Arc::clone(state);
     }
@@ -35,6 +39,7 @@ fn install_state(max_upload_bytes: usize, allow_upload: bool) -> Arc<ServerState
         next_client_id: AtomicU32::new(1),
         max_upload_bytes,
         allow_upload,
+        allow_weight_reload,
     });
     let _ = STATE.set(Arc::clone(&state));
     STATE.get().cloned().unwrap_or(state)
@@ -49,8 +54,8 @@ fn get_state() -> Result<Arc<ServerState>> {
 
 /// `allow_upload` false refuses every client's program: the system's alone
 /// run.
-pub(crate) fn init(max_upload_bytes: usize, allow_upload: bool) {
-    let _ = install_state(max_upload_bytes, allow_upload);
+pub(crate) fn init(max_upload_bytes: usize, allow_upload: bool, allow_weight_reload: bool) {
+    let _ = install_state(max_upload_bytes, allow_upload, allow_weight_reload);
     inbox::spawn();
 }
 
@@ -196,6 +201,7 @@ struct ServerState {
     next_client_id: AtomicU32,
     pub(super) max_upload_bytes: usize,
     pub(super) allow_upload: bool,
+    pub(super) allow_weight_reload: bool,
 }
 
 #[derive(Debug)]
@@ -546,6 +552,12 @@ impl Session {
             ClientMessage::Ping { corr_id } => {
                 self.send_response(corr_id, true, "Pong".to_string()).await;
             }
+
+            ClientMessage::ReloadWeights {
+                corr_id,
+                path,
+                version,
+            } => self.handle_reload_weights(corr_id, path, version).await,
         }
     }
 }
@@ -576,7 +588,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let mut session = Session::new_inproc(
             9,
-            install_state(0, true),
+            install_state(0, true, false),
             tx,
             "acme".to_string(),
             "al".to_string(),
@@ -608,6 +620,7 @@ mod tests {
             next_client_id: AtomicU32::new(1),
             max_upload_bytes: 1024,
             allow_upload: false,
+            allow_weight_reload: false,
         });
         let mut session = Session::new_inproc(9, state, tx, "acme".into(), "al".into());
         let chunk = |chunk_index| ClientMessage::AddProgram {
@@ -708,7 +721,7 @@ mod tests {
     async fn a_session_owns_only_its_own_tenant_and_users_processes() {
         let session = Session::new_inproc(
             8,
-            install_state(0, true),
+            install_state(0, true, false),
             mpsc::channel(1).0,
             "acme".to_string(),
             "alice".to_string(),
@@ -733,7 +746,7 @@ mod tests {
 
         let mut session = Session::new_inproc(
             7,
-            install_state(0, true),
+            install_state(0, true, false),
             mpsc::channel(1).0,
             DEFAULT_TENANT.to_string(),
             DEFAULT_USER.to_string(),

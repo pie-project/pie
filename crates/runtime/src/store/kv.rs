@@ -705,6 +705,17 @@ impl KvStore {
         sets.into_values().collect()
     }
 
+    pub fn live_working_sets(&self) -> usize {
+        self.table.live_working_sets()
+    }
+
+    pub fn rekey(&mut self, domain: Hash256) -> usize {
+        let keys: Vec<u64> = self.cache.keys().copied().collect();
+        let freed = self.drop_entries(keys, By::Client, self.current_epoch());
+        self.domain = domain;
+        freed
+    }
+
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn owns_cache(&self, owner: ProcessId) -> bool {
         self.owners.contains_key(&owner)

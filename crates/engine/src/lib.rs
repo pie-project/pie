@@ -44,7 +44,7 @@ pub use fire::{
     Attachment, FireId, FireTicket, FoldLen, FrameId, FrameSubmission, FrameTicket, KvDelta, Lane,
     LaneReadout, Mask, Masking, MediaEncode, Readout, RsReset, RsSnapshot, RsVerb, Serves, Step,
 };
-pub use load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
+pub use load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Reload, Reloaded, Residency};
 pub use program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };

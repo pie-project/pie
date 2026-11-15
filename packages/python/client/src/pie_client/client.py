@@ -789,6 +789,13 @@ class PieClient:
                 return []
         raise Exception(f"List processes failed: {result}")
 
+    async def reload_weights(self, path: "str | Path", version: int | None = None) -> dict:
+        msg = {"type": "reload_weights", "path": str(Path(path).absolute()), "version": version}
+        ok, result = await self._send_msg_and_wait(msg)
+        if not ok:
+            raise Exception(f"Reload weights failed: {result}")
+        return json.loads(result)
+
     async def ping(self) -> None:
         """Ping the server to check connectivity."""
         msg = {"type": "ping"}

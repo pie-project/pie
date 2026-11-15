@@ -52,6 +52,7 @@ pub struct Metal {
     sink: Option<engine::CompletionSink>,
     pending: Option<(FrameId, Vec<PendingStep>)>,
     adapters: BTreeMap<InstanceId, crate::adapter::Binding>,
+    torn: bool,
 }
 
 impl Metal {
@@ -67,6 +68,7 @@ impl Metal {
             sink: None,
             pending: None,
             adapters: BTreeMap::new(),
+            torn: false,
         }
     }
 
@@ -579,6 +581,22 @@ impl Engine for Metal {
         })
     }
 
+    fn reload_weights(
+        &mut self,
+        reload: &engine::load::Reload,
+    ) -> EngineResult<engine::load::Reloaded> {
+        let path = reload.checkpoint.as_path();
+        let shell = self
+            .shell
+            .as_mut()
+            .ok_or_else(|| Error::Load("the metal engine has no model loaded".into()))?;
+        let contract = (self.contract_for)(shell.trace(), path).map_err(Error::Load)?;
+        let (planes, bytes) = shell
+            .reload_weights(&contract, path, &mut self.torn)
+            .map_err(fault)?;
+        Ok(engine::load::Reloaded { planes, bytes })
+    }
+
     fn register_adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
         let planes: Vec<AdapterPlane<'_>> = registration
             .planes
@@ -637,6 +655,13 @@ impl Engine for Metal {
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
+        if self.torn {
+            return Err(Error::Load(
+                "a weight reload failed partway, so this engine's weights are part old and \
+                 part new; reload them again before anything runs"
+                    .into(),
+            ));
+        }
         frame.validate_for(
             self.caps
                 .as_ref()

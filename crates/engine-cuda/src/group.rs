@@ -473,6 +473,17 @@ impl Engine for Group {
         self.lead(move |rank| rank.register_adapter(&registration))
     }
 
+    fn reload_weights(&mut self, reload: &engine::Reload) -> EngineResult<engine::Reloaded> {
+        let reload = reload.clone();
+        let ranks = self.each(move |rank| rank.reload_weights(&reload))?;
+        Ok(ranks
+            .iter()
+            .fold(engine::Reloaded::default(), |sum, rank| engine::Reloaded {
+                planes: sum.planes.max(rank.planes),
+                bytes: sum.bytes + rank.bytes,
+            }))
+    }
+
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         let frame = frame.clone();
         self.each(move |rank| rank.submit(&frame))
