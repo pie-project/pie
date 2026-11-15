@@ -325,7 +325,10 @@ impl SharedGrow {
         // The next segment must be one the engine binds: one at or past
         // what it holds back never commits, and a waiter told the pool
         // grows would wait on it for good.
-        (next < top && pool.pool().backs(next) || pool.pool().span_to_commit().is_some())
+        // A span the lowered rung lends grows it too, unless the engine
+        // refused its commit and no room has been freed since.
+        (next < top && pool.pool().backs(next)
+            || !pool.span_commit_blocked() && pool.pool().span_to_commit().is_some())
             && pool.mapped_segments() < self.target.load(Ordering::Acquire)
     }
 
@@ -379,7 +382,18 @@ impl SharedGrow {
             headroom = pool.pool().headroom(),
             "segment goal"
         );
-        target.min(ahead)
+        // The prefix whole, what commits ahead stops at the top span, yet
+        // a span the lowered rung lends still backs on demand: a waiter
+        // short of room is what it is backed for, and `can_grow` told the
+        // waiter it grows. Without this step the walk stood at the prefix
+        // while the planner waited on it, and nothing was ever evicted.
+        let span = u32::from(
+            short > 0
+                && ahead <= mapped
+                && !pool.span_commit_blocked()
+                && pool.pool().span_to_commit().is_some(),
+        );
+        target.min(ahead + span)
     }
 
     /// Walks each time something it waits on happens: a retarget or a

@@ -1956,6 +1956,12 @@ impl SharedPool {
         self.span_commit_blocked = blocked;
     }
 
+    /// Whether a refused `commit_span` waits for room to be freed.
+    #[must_use]
+    pub fn span_commit_blocked(&self) -> bool {
+        self.span_commit_blocked
+    }
+
     /// The engine backed the top `n` span segments: the chunks of theirs the
     /// rung lends go out now.
     pub fn span_committed(&mut self, n: u32) {

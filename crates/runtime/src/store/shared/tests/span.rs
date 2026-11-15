@@ -9,7 +9,7 @@
 //! activation 52..64.
 
 use super::*;
-use crate::governor::PATIENCE;
+use crate::governor::{PATIENCE, PoolTarget};
 use crate::store::shared::programs::{Mover, take_raise};
 
 /// The engine's lane as a raise meets it: the fake engine, shared.
@@ -612,4 +612,45 @@ fn a_refused_commit_span_is_asked_again_only_once_room_is_freed() {
         pool.next_move(7, 3),
         Some(SegmentMove::CommitSpan { n: 1 })
     ));
+}
+
+/// The prefix whole and a lowered rung lending span that no segment backs
+/// yet, a waiter short of room has the walk back that span: the goal takes
+/// one step past the prefix, as `can_grow` told the waiter. The walk stood
+/// at the prefix before, the planner waiting on a grow that never came,
+/// and nothing was evicted. A refused span commit grows nothing until room
+/// is freed, by either's account.
+#[test]
+fn a_waiter_short_of_room_has_the_lent_span_backed() {
+    const ENGINE: usize = 48;
+    let (mut pool, mut engine) = on_demand_pool();
+    assert_eq!(
+        walk_segments(&mut pool, 6, 0, &mut engine),
+        Retarget::Reached
+    );
+    pool.lower_rung(256).unwrap();
+    assert_eq!(pool.pool().span_to_commit(), Some(1));
+    let mapped = pool.mapped_segments();
+    let _held = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
+    pool.pool_mut().wait(1, 0, 64);
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let mut grow = SharedGrow::new(0, ENGINE, shared.clone());
+    let _ = grow.retarget(u64::from(u32::MAX));
+    assert!(grow.can_grow(), "the waiter is told the pool grows");
+    assert_eq!(
+        grow.goal_for_test(),
+        mapped + 1,
+        "and the walk goes past the prefix to back the lent span"
+    );
+    assert!(matches!(
+        shared.lock().unwrap().next_move(mapped + 1, 1),
+        Some(SegmentMove::CommitSpan { n: 1 })
+    ));
+    shared.lock().unwrap().block_span_commit(true);
+    assert!(!grow.can_grow(), "a refused span commit grows nothing");
+    assert_eq!(grow.goal_for_test(), mapped, "nor does the walk ask it again");
+    shared.lock().unwrap().block_span_commit(false);
+    assert!(grow.can_grow(), "room freed: it grows again");
 }
