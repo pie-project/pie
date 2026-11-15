@@ -80,7 +80,7 @@ impl ForwardHybrid for Tiny {
     }
 }
 
-fn plan() -> Trace {
+pub(crate) fn plan() -> Trace {
     trace_hybrid("tiny-paged", &Tiny, Platform::Xla)
 }
 
@@ -151,7 +151,7 @@ fn words(values: &[u32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
-fn host_lane(slot: u32, tokens: Vec<u32>, pages: Vec<u32>, held: u32) -> Lane {
+pub(crate) fn host_lane(slot: u32, tokens: Vec<u32>, pages: Vec<u32>, held: u32) -> Lane {
     let mut lane = Lane {
         slot,
         word: 0,

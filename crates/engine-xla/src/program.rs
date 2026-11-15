@@ -49,6 +49,9 @@ struct Instance {
     geometry: GeometryClass,
 
     channels: Vec<ChannelId>,
+    /// The `Channel` slots of the rings the instance holds itself, as its
+    /// binding (or the last rebind) names them.
+    own_rings: Vec<engine::program::RingSlots>,
 
     poisoned: Arc<AtomicBool>,
 
@@ -419,6 +422,11 @@ pub struct Plane {
     forms: crate::guest::Forms,
 
     channels: BTreeMap<ChannelId, Arc<ChannelState>>,
+    /// Each registered channel's `Channel` slots, as its registration names
+    /// them ([`Plane::ring_facts`]): where an instance that carries or feeds
+    /// it on the device keeps its cells, the same rows for every instance
+    /// bound to it.
+    channel_slots: BTreeMap<ChannelId, Vec<u32>>,
     instances: BTreeMap<InstanceId, Instance>,
     next_program: u64,
     next_instance: u64,
@@ -525,28 +533,172 @@ impl Plane {
         rings: &[engine::program::RingSlots],
         cell_row: &dyn Fn(u32) -> Option<u32>,
     ) -> Result<(), Refusal> {
-        let carried = {
-            let held = self.instances.get(&id).ok_or(Refusal::Closed {
-                what: "instance",
-                id: id.0,
-            })?;
-            self.forms
-                .get(held.program)
-                .map(|c| c.carried_words.clone())
-                .unwrap_or_default()
-        };
-        let cells = cells_of(&carried, rings, cell_row)?;
-        let fed = {
-            let program = self.instances.get(&id).map(|h| h.program);
-            let fed = program
-                .and_then(|p| self.forms.get(p))
-                .map(|c| c.fed.clone())
-                .unwrap_or_default();
-            fed_of(&fed, rings, cell_row)?
-        };
+        let held = self.instances.get(&id).ok_or(Refusal::Closed {
+            what: "instance",
+            id: id.0,
+        })?;
+        let (cells, fed) = self.rows_of(held.program, &held.channels, rings, cell_row)?;
         if let Some(held) = self.instances.get_mut(&id) {
             held.cells = cells;
             held.fed = fed;
+            held.own_rings = rings.to_vec();
+        }
+        Ok(())
+    }
+
+    /// A registered channel's ring moved to fresh `Channel` slots (a park
+    /// and its return): every instance bound to it reads and writes its
+    /// cells there from now on.
+    pub fn rebind_channel(
+        &mut self,
+        id: ChannelId,
+        slots: &[u32],
+        cell_row: &dyn Fn(u32) -> Option<u32>,
+    ) -> Result<(), Refusal> {
+        let Some(held) = self.channel_slots.get_mut(&id) else {
+            return Err(Refusal::Closed {
+                what: "channel",
+                id: id.0,
+            });
+        };
+        *held = slots.to_vec();
+        let bound: Vec<InstanceId> = (self.instances.iter())
+            .filter(|(_, seat)| seat.channels.contains(&id))
+            .map(|(&at, _)| at)
+            .collect();
+        for at in bound {
+            let seat = &self.instances[&at];
+            let (cells, fed) =
+                self.rows_of(seat.program, &seat.channels, &seat.own_rings, cell_row)?;
+            let seat = self.instances.get_mut(&at).expect("listed above");
+            seat.cells = cells;
+            seat.fed = fed;
+        }
+        Ok(())
+    }
+
+    /// The `Channel` slots a registered channel's ring takes in the pool:
+    /// one ring of whole-slot cells, for a channel an instance may keep on
+    /// the device (`guest::carried_channels`, `guest::fed_channels`: no host
+    /// role, no extern). `None` for one the host alone reads or writes: the
+    /// plane keeps its ring itself.
+    #[must_use]
+    pub fn ring_facts(registration: &ChannelRegistration) -> Option<engine::program::RingFacts> {
+        if registration.host_role != eta_ir::container::HostRole::None
+            || registration.extern_dir.is_some()
+        {
+            return None;
+        }
+        let dtype = eta_exec::concrete_dtype(registration.dtype);
+        let words = crate::guest::lower::words(dtype, numel_of(&registration.shape));
+        let bytes = words as u64 * 4;
+        let capacity = registration.capacity.max(1);
+        let slots = bytes.div_ceil(crate::guest::CHANNEL_SLOT).max(1) * u64::from(capacity);
+        Some(engine::program::RingFacts {
+            channel: 0,
+            cell_bytes: bytes,
+            capacity,
+            footprint: engine::program::Footprint {
+                bytes: slots * crate::guest::CHANNEL_SLOT,
+                slots: u32::try_from(slots).unwrap_or(u32::MAX),
+                contiguous: true,
+            },
+        })
+    }
+
+    /// An instance of `program` bound to `channels`: each carried and fed
+    /// channel's pool rows, from the rings it holds itself (`own`) or, for
+    /// a channel the binding names a registered one for, that channel's.
+    fn rows_of(
+        &self,
+        program: ProgramId,
+        channels: &[ChannelId],
+        own: &[engine::program::RingSlots],
+        cell_row: &dyn Fn(u32) -> Option<u32>,
+    ) -> Result<(Cells, Fed), Refusal> {
+        let Some(form) = self.forms.get(program) else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let mut rings = own.to_vec();
+        for ring in form.rings() {
+            if rings.iter().any(|r| r.channel == ring.channel) {
+                continue;
+            }
+            let Some(id) = channels.get(ring.channel as usize) else {
+                continue;
+            };
+            let Some(slots) = self.channel_slots.get(id) else {
+                continue;
+            };
+            if (slots.len() as u64) < u64::from(ring.footprint.slots) {
+                return Err(Refusal::Program(format!(
+                    "program {program} keeps channel {} in {} Channel slot(s) and registered \
+                     channel {id} holds {}",
+                    ring.channel,
+                    ring.footprint.slots,
+                    slots.len()
+                )));
+            }
+            rings.push(engine::program::RingSlots {
+                channel: ring.channel,
+                slots: slots.clone(),
+            });
+        }
+        let cells = cells_of(&form.carried_words, &rings, cell_row)?;
+        let fed = fed_of(&form.fed, &rings, cell_row)?;
+        Ok((cells, fed))
+    }
+
+    /// Every other instance whose cells on the device are those of a ring
+    /// one of `instances` shares (a registered channel two programs are
+    /// bound to) puts them back in the ring first: the ring's front is then
+    /// the channel's current cell, wherever the next pass reads it.
+    fn flush_sharers(
+        &mut self,
+        instances: &[InstanceId],
+        pool: Option<&crate::pjrt::Buffer>,
+    ) -> Result<(), Refusal> {
+        let mut touched = std::collections::HashSet::new();
+        for id in instances {
+            if let Some(seat) = self.instances.get(id) {
+                touched.extend(seat.inst.channels.iter().map(|r| Arc::as_ptr(r) as usize));
+            }
+        }
+        for (id, held) in &mut self.instances {
+            if instances.contains(id) || !held.on_device || held.cells.is_empty() {
+                continue;
+            }
+            let shares = (held.cells.iter()).any(|&(c, _)| {
+                touched.contains(&(Arc::as_ptr(&held.inst.channels[c as usize]) as usize))
+            });
+            if shares {
+                cells_to_host(held, pool).map_err(|why| {
+                    held.inst.poisoned = true;
+                    Refusal::Program(format!("instance {id}'s cells back to its rings: {why}"))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Before instance `id` closes: its cells on the device of a registered
+    /// channel (one that outlives it) back in the channel's ring.
+    pub fn flush_for_close(
+        &mut self,
+        id: InstanceId,
+        pool: Option<&crate::pjrt::Buffer>,
+    ) -> Result<(), Refusal> {
+        self.flights.wait_all();
+        let registered: std::collections::HashSet<usize> =
+            self.channels.values().map(|r| Arc::as_ptr(r) as usize).collect();
+        let Some(held) = self.instances.get_mut(&id) else {
+            return Ok(());
+        };
+        let keeps = (held.cells.iter()).any(|&(c, _)| {
+            registered.contains(&(Arc::as_ptr(&held.inst.channels[c as usize]) as usize))
+        });
+        if keeps {
+            cells_to_host(held, pool).map_err(Refusal::Program)?;
         }
         Ok(())
     }
@@ -593,6 +745,10 @@ impl Plane {
                 capacity: registration.capacity,
             });
         self.channels.insert(registration.id, ring);
+        if !registration.slots.is_empty() {
+            self.channel_slots
+                .insert(registration.id, registration.slots.clone());
+        }
         Ok(RegisteredChannel {
             id: registration.id,
 
@@ -603,6 +759,7 @@ impl Plane {
     }
 
     pub fn close_channel(&mut self, id: ChannelId) -> Result<(), Refusal> {
+        self.channel_slots.remove(&id);
         self.channels
             .remove(&id)
             .map(|_| ())
@@ -665,17 +822,8 @@ impl Plane {
             seeds.insert(seed.channel, value);
         }
         let inst = eta_exec::make_host_instance(&plan, &externs, &seeds);
-        let carried = self
-            .forms
-            .get(binding.program)
-            .map(|c| c.carried_words.clone())
-            .unwrap_or_default();
-        let cells = cells_of(&carried, &binding.ring_slots, cell_row)?;
-        let fed = fed_of(
-            &self.forms.get(binding.program).map(|c| c.fed.clone()).unwrap_or_default(),
-            &binding.ring_slots,
-            cell_row,
-        )?;
+        let (cells, fed) =
+            self.rows_of(binding.program, &binding.channels, &binding.ring_slots, cell_row)?;
 
         self.next_instance += 1;
         let id = InstanceId(self.next_instance);
@@ -688,6 +836,7 @@ impl Plane {
                 inst,
                 geometry: binding.geometry,
                 channels: binding.channels.clone(),
+                own_rings: binding.ring_slots.clone(),
                 poisoned,
                 cells,
                 on_device: false,
@@ -1062,6 +1211,8 @@ impl Plane {
     ) -> Result<Vec<bool>, Refusal> {
         use crate::guest::run::{Member, OnDevice, bound, step_group, step_group_deferred};
         self.flights.wait_all();
+        let members: Vec<InstanceId> = attachments.iter().map(|&(id, _)| id).collect();
+        self.flush_sharers(&members, pool.as_ref())?;
         for &(instance, _) in attachments {
             if let Some(seat) = self.instances.get_mut(&instance)
                 && seat.poisoned.load(Ordering::Acquire)
@@ -1556,6 +1707,12 @@ impl Plane {
         Ok(ring.front())
     }
 }
+
+/// Each carried channel's cell: its channel and the pool row it lies at.
+type Cells = Vec<(u32, u32)>;
+/// Each fed channel's ring: its channel, first pool row, capacity and a
+/// cell's rows.
+type Fed = Vec<(u32, u32, u32, u32)>;
 
 /// Each carried channel's first pool row, from the `Channel` slots the
 /// binding names for it (`ProgramFacts::rings`, one contiguous run each).
