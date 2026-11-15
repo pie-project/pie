@@ -101,6 +101,8 @@ pub(crate) struct Latch {
     sink: Option<engine::CompletionSink>,
     holds: std::sync::atomic::AtomicUsize,
     fault: std::sync::Mutex<Option<String>>,
+    /// What the step's reported lanes wrote, told when it lands.
+    writes: std::sync::Mutex<Vec<engine::KvWrites>>,
 }
 
 impl Latch {
@@ -111,11 +113,20 @@ impl Latch {
             sink,
             holds: std::sync::atomic::AtomicUsize::new(1),
             fault: std::sync::Mutex::new(None),
+            writes: std::sync::Mutex::new(Vec::new()),
         })
     }
 
     pub(crate) fn hold(&self) {
         self.holds.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The step's reported lanes wrote `writes`: told with its landing.
+    pub(crate) fn report(&self, writes: Vec<engine::KvWrites>) {
+        self.writes
+            .lock()
+            .expect("writes lock poisoned")
+            .extend(writes);
     }
 
     pub(crate) fn release(&self, outcome: Result<(), String>) {
@@ -138,7 +149,15 @@ impl Latch {
             sink(
                 self.at,
                 match fault {
-                    None => engine::StepOutcome::Committed,
+                    None => {
+                        let writes =
+                            std::mem::take(&mut *self.writes.lock().expect("writes lock poisoned"));
+                        if writes.is_empty() {
+                            engine::StepOutcome::Committed
+                        } else {
+                            engine::StepOutcome::Wrote(writes)
+                        }
+                    }
                     Some(why) => engine::StepOutcome::Faulted(why),
                 },
             );
