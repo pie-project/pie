@@ -2051,6 +2051,12 @@ pub(crate) fn record_kv_writes(writes: Vec<::engine::KvWrites>) {
     }
 }
 
+/// What is kept under `tag`, taken.
+#[cfg(test)]
+pub(crate) fn kept_kv_writes(tag: u64) -> Option<::engine::KvWrites> {
+    ReportTag(tag).take()
+}
+
 struct ReportTag(u64);
 
 impl ReportTag {
