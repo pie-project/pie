@@ -300,6 +300,9 @@ pub struct Shell {
     inflight: VecDeque<Flight>,
     grafted: Option<Pending>,
     landed: BTreeMap<u64, Vec<(String, Vec<f32>)>>,
+    /// Steps let go before they landed ([`Shell::forget`]): their rows are
+    /// dropped as they land rather than held.
+    forgotten: std::collections::BTreeSet<u64>,
     host_rows: bool,
     rows_wanted: bool,
     nan_flags: Option<Buffer>,
@@ -1358,6 +1361,7 @@ impl PreparedLoad<'_> {
             inflight: VecDeque::new(),
             grafted: None,
             landed: BTreeMap::new(),
+            forgotten: std::collections::BTreeSet::new(),
             host_rows: crate::diag::on().host_rows,
             rows_wanted: false,
             nan_flags,
@@ -2533,12 +2537,21 @@ impl Shell {
             .remove(&landed.seq)
             .ok_or_else(|| Fault::Unbound {
                 what: format!(
-                    "step {}'s rows, which have already been taken or have aged out of the \
-                 settled ring — a step's answer lives until the frames behind it have \
-                 pushed it out",
+                    "step {}'s rows, which have already been taken, or were let go when \
+                     the frame after its own was submitted",
                     landed.seq
                 ),
             })
+    }
+
+    /// Lets step `landed`'s rows go, landed or not: a frame no one will ask
+    /// the rows of.
+    pub fn forget(&mut self, landed: &Landed) {
+        if self.landed.remove(&landed.seq).is_none()
+            && self.inflight.iter().any(|flight| flight.seq == landed.seq)
+        {
+            self.forgotten.insert(landed.seq);
+        }
     }
 
     pub fn reap(&mut self) -> Result<()> {
@@ -2656,10 +2669,8 @@ impl Shell {
         }
         fire_trace(|| format!("readout-done seq={} rows={}", flight.seq, flight.lanes));
         self.arms.give(flight.arm);
-        self.landed.insert(flight.seq, rows);
-        while self.landed.len() > SETTLED_RING {
-            let oldest = *self.landed.keys().next().expect("non-empty");
-            self.landed.remove(&oldest);
+        if !self.forgotten.remove(&flight.seq) {
+            self.landed.insert(flight.seq, rows);
         }
         match refusal {
             Some(fault) => Err(fault),
@@ -4636,8 +4647,6 @@ impl Shell {
         }
     }
 }
-
-const SETTLED_RING: usize = 2 * Runahead::STEPS_MAX as usize;
 
 struct Walked {
     frame: Frame,
