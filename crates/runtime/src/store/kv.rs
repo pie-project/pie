@@ -168,9 +168,7 @@ pub struct KvStore {
     /// Per trie node, the epoch through which a fire may still read its
     /// pages: the last a working set holding it was let go at (or a copy
     /// into it was handed out at). An idle entry's pages go back after the
-    /// latest of its path's nodes, not after every fire in flight: a waiter
-    /// short of a prompt's pages waited behind ~1600 handed-out epochs (a
-    /// second) for cache last read long before ([`Self::fence_of`]).
+    /// latest of its path's nodes and every fire in flight ([`Self::fence_of`]).
     node_epochs: HashMap<NodeId, u64>,
     /// Entries already split at a step, by the entry and the pages kept.
     splits: HashSet<(u64, u64)>,
@@ -641,7 +639,7 @@ impl KvStore {
     }
 
     /// The epoch after which the pages an idle entry ending at `terminal`
-    /// holds alone may go back: the latest stamp on its path, at most
+    /// holds alone may go back: the latest stamp on its path, at least
     /// `epoch` (now). Stamps every fire has retired through are dropped.
     fn fence_of(&mut self, terminal: NodeId, epoch: u64) -> u64 {
         let retired = self.retired_through();
@@ -652,7 +650,7 @@ impl KvStore {
             .filter_map(|node| self.node_epochs.get(node).copied())
             .max()
             .unwrap_or(0)
-            .min(epoch)
+            .max(epoch)
     }
 
     fn release_entry(&mut self, entry: KeptEntry, epoch: u64) -> usize {
