@@ -1639,7 +1639,28 @@ impl Shell {
             })
             .collect();
         let guests = engine::GuestTerm::new(&pairs, most).bytes(to.min(most));
-        Ok((model + guests.div_ceil(chunk)) * chunk)
+        // The batch tables stand under the carve beside the fire term: one
+        // ceil over the two, as the runtime backs them.
+        let standing = self.programs.batch_bytes();
+        Ok((model + (guests + standing).div_ceil(chunk)) * chunk)
+    }
+
+    /// See `Engine::standing_after`: the batch tables' bytes once an
+    /// instance of `program_id` at `extents` over `channels` is bound.
+    pub fn standing_after(
+        &self,
+        program_id: engine::ProgramId,
+        extents: &eta_exec::Extents,
+        channels: &[engine::ChannelId],
+    ) -> Result<u64> {
+        self.programs.standing_after(program_id, extents, channels)
+    }
+
+    /// The batch tables' bytes the live instances hold now: what a bind and
+    /// a close leave (`engine::BoundInstance::standing_guest_bytes`).
+    #[must_use]
+    pub fn standing_guest_bytes(&self) -> u64 {
+        self.programs.batch_bytes()
     }
 
     /// The guest region a fire whose model carve ends at `top` lays its
@@ -1664,14 +1685,14 @@ impl Shell {
             .lay_batches(self.arena.store(), top, &|at, bytes| {
                 span_host(pools, at, bytes)
             })?;
-        let floor = self.arena.end() - self.pools.covered();
-        if bottom < floor {
-            return Err(Fault::Ceiling {
-                what: "bytes of the backed span the guests' batch tables take",
-                need: top - bottom,
-                have: top.saturating_sub(floor),
-            });
-        }
+        // The runtime backed the tables below the carve before the bind
+        // (`engine::Engine::standing_after`), and the span covers them.
+        debug_assert!(
+            bottom >= self.arena.end() - self.pools.covered(),
+            "the guests' batch tables take {} bytes under the carve, past the {} the span backs",
+            top - bottom,
+            top.saturating_sub(self.arena.end() - self.pools.covered()),
+        );
         self.batch_bottom = bottom;
         Ok(())
     }
@@ -2137,6 +2158,10 @@ impl Shell {
             instance: instance_slots,
             rings: ring_slots,
         };
+        #[cfg(debug_assertions)]
+        let predicted = self
+            .programs
+            .standing_after(program_id, &extents, channels)?;
         let id = self.programs.bind(
             &self.device,
             program_id,
@@ -2147,6 +2172,12 @@ impl Shell {
             channels,
             pooled,
         )?;
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            self.programs.batch_bytes() <= predicted,
+            "a bind laid {} bytes of batch tables, past the {predicted} standing_after stated",
+            self.programs.batch_bytes()
+        );
         // A pair the bind opens widens what the rung's fires lay under their
         // carve: backed here, and the bind refused (`Fault::Refused`) where
         // the system refuses the heap.

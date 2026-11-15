@@ -123,6 +123,65 @@ impl Plane {
         self.batches.values().map(launch::Batch::bytes).sum()
     }
 
+    /// The span bytes the batch tables would take once an instance of
+    /// `program_id` at `extents` over the shared `channels` is bound
+    /// (`engine::Engine::standing_after`), changing nothing. A bound
+    /// instance of the same program, extents and channels prepared the same
+    /// tables, so the binding joins its sets and adds only a frame's set it
+    /// lacks; with none such it adds every launching stage's set a frame in
+    /// flight, as a fresh key would. Never under what the bind lays: a set
+    /// it might share but cannot be shown to is counted its own.
+    pub fn standing_after(
+        &self,
+        program_id: ProgramId,
+        extents: &Extents,
+        channels: &[ChannelId],
+    ) -> Result<u64> {
+        let program = self
+            .programs
+            .get(&program_id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
+        let lanes = self.lanes.next_power_of_two();
+        let set = |stage: usize| {
+            program.compiled.plans.get(stage).map_or(0, |plan| {
+                launch::Batch::bytes_for(
+                    plan,
+                    u32::try_from(program.plan.package.channels.len()).unwrap_or(u32::MAX),
+                    lanes,
+                    self.rows,
+                )
+            })
+        };
+        let twin = self.instances.values().find(|bound| {
+            bound.program_id == program_id && bound.extents == *extents && bound.ids == channels
+        });
+        let added = match twin {
+            Some(twin) => (0..twin.session.stages())
+                .filter_map(|stage| {
+                    let key = twin.session.prepared(stage)?.batch_key()?;
+                    Some(
+                        (0..self.arms)
+                            .filter(|&arm| {
+                                !self.batches.contains_key(&(program_id, stage, key, arm))
+                            })
+                            .map(|_| set(stage))
+                            .sum::<u64>(),
+                    )
+                })
+                .sum(),
+            None => {
+                self.arms as u64
+                    * Session::batch_bytes_for(
+                        &program.compiled,
+                        program.plan.package.channels.len(),
+                        lanes,
+                        self.rows,
+                    )
+            }
+        };
+        Ok(self.batch_bytes() + added)
+    }
+
     #[must_use]
     pub const fn stats(&self) -> eta_exec::CacheStats {
         self.cache.stats()
@@ -586,17 +645,12 @@ impl Plane {
             .programs
             .get(&program)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program}")))?;
-        let batches = Session::batch_bytes_for(
-            &program.compiled,
-            program.plan.package.channels.len(),
-            self.lanes.next_power_of_two(),
-            self.rows,
-        );
         Ok(engine::FireFacts {
             a_lane: Session::scratch_for(&program.compiled, extents)?,
-            // Its batch tables, a set a frame in flight, laid once a pair
-            // under the model's carve.
-            fixed: self.arms as u64 * batches,
+            // Its batch tables stand beside every fire, laid once a set
+            // under the model's carve and counted at bind and close
+            // (`engine::Engine::standing_after`), not in a fire's term.
+            fixed: 0,
             max_lanes: 0,
             laid: engine::LaidLanes::Exact,
         })

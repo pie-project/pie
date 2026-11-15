@@ -499,6 +499,11 @@ impl Session {
         Ok(None)
     }
 
+    #[must_use]
+    pub fn prepared(&self, stage: usize) -> Option<&Prepared> {
+        self.prepared.get(stage).and_then(Option::as_ref)
+    }
+
     pub fn prepared_mut(&mut self, stage: usize) -> Option<&mut Prepared> {
         self.prepared.get_mut(stage).and_then(Option::as_mut)
     }
