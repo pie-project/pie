@@ -760,11 +760,12 @@ impl Engine for Xla {
         Ok(bound)
     }
 
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
+    fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
         if let (Some(held), Some(shell)) = (self.adapters.remove(&id), self.shell.as_mut()) {
             shell.release_adapter(id, held);
         }
-        self.programs.close_instance(id).map_err(refusal)
+        self.programs.close_instance(id).map_err(refusal)?;
+        Ok(0)
     }
 
     /// Refused: an adapter is an instance's, landed at its bind in the

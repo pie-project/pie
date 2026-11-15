@@ -943,14 +943,16 @@ impl Engine for Metal {
             id,
             program: binding.program,
             geometry: binding.geometry,
+            standing_guest_bytes: 0,
         })
     }
 
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
+    fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
         self.adapters.remove(&id);
         let shell = self.loaded_mut()?;
         shell.detach_adapter(id);
-        shell.close_program_instance(id).map_err(fault)
+        shell.close_program_instance(id).map_err(fault)?;
+        Ok(0)
     }
 
     fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {

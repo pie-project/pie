@@ -18,6 +18,22 @@
 //! next lower gives the room back, once every fire cut to the old rung has
 //! retired.
 //!
+//! Beside the term, the engine keeps standing guest bytes in the span for
+//! the live instances of registered programs, whatever the fire (Metal:
+//! the batch tables it lays once a set, every set together;
+//! [`::engine::Engine::standing_after`]). They change only at a bind and a
+//! close, a set shared by instances counted once. A bind asks the engine,
+//! on the lane, what the total would be once it is bound, and holds what
+//! that adds to the total booked ([`ProgramOpen`]) while it is under way:
+//! a total that does not fit the span with the term at the smallest rung
+//! refuses the bind by name before the engine is asked to bind, and one
+//! that does is backed below the carve, at every rung, before the bind is
+//! sent ([`fund_span`]), so the engine lays it in room set aside. The
+//! engine's total after each bind and each close is booked on the lane
+//! ([`SharedPool::standing_stated`]). Programs are never unregistered, but
+//! a set that no live instance shares any more is given back at the close
+//! that leaves it so.
+//!
 //! The term is a table, built when the pairs change and never in a fire.
 //! No build runs under the pool's lock on a task that waits on nothing
 //! else there, and none on the engine's lane: a bind builds the table it
@@ -63,6 +79,11 @@ pub struct ProgramFires {
     /// `fitted`.
     generation: u64,
     fitted: u64,
+    /// The engine's standing guest bytes as it last stated them, after a
+    /// bind or a close; and what the binds under way may add to them, each
+    /// held by its [`ProgramOpen`].
+    standing_booked: u64,
+    standing_pending: u64,
 }
 
 impl ProgramFires {
@@ -181,6 +202,7 @@ pub fn impossible_submission(engine: usize, error: &::engine::Error) {
         act_reserved = pool.pool().act_reserved(),
         act_chunks = pool.pool().act_chunks(rung),
         term_bytes = pool.pool().fire_bytes(rung),
+        standing_bytes = pool.pool().standing(),
         act_span_chunks = %span,
         act_most = pool.act_most(),
         max_lanes = pool.pool().max_lanes(),
@@ -243,7 +265,7 @@ impl SharedPool {
     /// engine states no span of its own, so a rung's activation is the
     /// model's, which the pool was built to hold.
     fn fits_unasked(&self) -> bool {
-        self.pool.fire().is_zero() && self.pool.act_span().is_none()
+        self.pool.guests_zero() && self.pool.act_span().is_none()
     }
 
     /// The widest rung whose activation, the guest term of the programs
@@ -271,7 +293,7 @@ impl SharedPool {
     /// a pool that states no rungs, whose activation is no part of it, so
     /// the term is ignored there.
     fn term_refused(&self) -> bool {
-        !self.pool.fire().is_zero() && !self.pool.rungs().is_empty() && self.widest_fit().is_none()
+        !self.pool.guests_zero() && !self.pool.rungs().is_empty() && self.widest_fit().is_none()
     }
 
     /// The widest rung fires may take: [`Self::widest_fit`], the smallest
@@ -369,8 +391,42 @@ impl SharedPool {
         self.programs.fitted = self.programs.generation;
     }
 
+    /// What a bind that would leave the engine's standing guest bytes at
+    /// `total` ([`::engine::Engine::standing_after`], asked on the lane)
+    /// adds to the total booked: what its [`ProgramOpen`] holds. Read on
+    /// the lane, where the booked total is the engine's as it stands.
+    #[must_use]
+    pub fn standing_added(&self, total: u64) -> u64 {
+        total.saturating_sub(self.programs.standing_booked)
+    }
+
+    /// The engine stated its standing guest bytes after a bind or a close
+    /// (`BoundInstance::standing_guest_bytes`, `Engine::close_instance`):
+    /// booked as the engine's, beside what the binds under way hold.
+    pub fn standing_stated(&mut self, total: u64) {
+        self.programs.standing_booked = total;
+        self.sync_standing();
+    }
+
+    /// The engine's standing guest bytes booked, as it last stated them.
+    #[must_use]
+    pub fn standing_booked(&self) -> u64 {
+        self.programs.standing_booked
+    }
+
+    /// The span sets aside the booked total and what every bind under way
+    /// may add to it.
+    fn sync_standing(&mut self) {
+        let standing = self
+            .programs
+            .standing_booked
+            .saturating_add(self.programs.standing_pending);
+        self.pool.set_standing(standing);
+    }
+
     /// Why a bind of `key` is refused: the smallest rung's activation with
-    /// the term the bind would leave, read while the pool holds that term.
+    /// the term the bind would leave and the standing bytes it would hold,
+    /// read while the pool holds both.
     fn refusal(&self, key: FireKey) -> String {
         let most = self.act_most();
         let smallest = self.pool.act_chunks(0);
@@ -383,9 +439,11 @@ impl SharedPool {
         };
         format!(
             "{key}'s fires need {} bytes and {} bytes a lane beside the model's \
-             activation, and the smallest rung would then take {smallest} chunks of the \
-             {of}",
-            facts.fixed, facts.a_lane
+             activation, the engine's standing guest bytes would be {} beside every \
+             fire, and the smallest rung would then take {smallest} chunks of the {of}",
+            facts.fixed,
+            facts.a_lane,
+            self.pool.standing()
         )
     }
 
@@ -436,12 +494,17 @@ pub fn fit_fire(shared: &Shared) {
 pub struct ProgramOpen {
     shared: Shared,
     key: FireKey,
+    /// What the bind may add to the engine's standing guest bytes, held
+    /// beside the booked total until the bind is through.
+    standing: u64,
 }
 
 impl ProgramOpen {
-    /// One more bind of `key` can be in a fire: the pair counts from now.
-    /// Refused where even the smallest rung's activation, the term
-    /// included, is more than a rung may take ([`SharedPool::act_most`]:
+    /// One more bind of `key` can be in a fire: the pair counts from now,
+    /// and the `standing` bytes the bind may add to the engine's standing
+    /// guest bytes ([`SharedPool::standing_added`]) are held beside the
+    /// booked total. Refused where even the smallest rung's activation, the
+    /// term and the standing bytes included, is more than a rung may take ([`SharedPool::act_most`]:
     /// every chunk but the reserved ones and the weights' pinned slots,
     /// and no more than the engine states its span covers); a narrower fit
     /// cuts fires to the widest rung that does
@@ -453,7 +516,7 @@ impl ProgramOpen {
     /// the count, in one hold of the pool and only where nothing it was
     /// built from changed since; a bind refused leaves the pool as it
     /// found it, its term never seen by a fire.
-    pub fn new(shared: &Shared, key: FireKey) -> Result<Self, String> {
+    pub fn new(shared: &Shared, key: FireKey, standing: u64) -> Result<Self, String> {
         loop {
             let (pairs, most, generation, mut term) = {
                 let pool = shared.lock().unwrap();
@@ -470,9 +533,13 @@ impl ProgramOpen {
                 continue;
             }
             let before = pool.pool.set_fire(term);
+            pool.programs.standing_pending += standing;
+            pool.sync_standing();
             if pool.term_refused() {
                 let why = pool.refusal(key);
                 pool.pool.set_fire(before);
+                pool.programs.standing_pending -= standing;
+                pool.sync_standing();
                 return Err(why);
             }
             let first = !pool.programs.open.contains_key(&key);
@@ -493,6 +560,7 @@ impl ProgramOpen {
             return Ok(Self {
                 shared: Shared::clone(shared),
                 key,
+                standing,
             });
         }
     }
@@ -500,7 +568,14 @@ impl ProgramOpen {
 
 impl Drop for ProgramOpen {
     fn drop(&mut self) {
-        let dropped = self.shared.lock().unwrap().guard_back(self.key);
+        let dropped = {
+            let mut pool = self.shared.lock().unwrap();
+            // What the bind added is the engine's total now, booked on the
+            // lane; a bind refused added nothing.
+            pool.programs.standing_pending -= self.standing;
+            pool.sync_standing();
+            pool.guard_back(self.key)
+        };
         if dropped {
             fit_fire(&self.shared);
         }

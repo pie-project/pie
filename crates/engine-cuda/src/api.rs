@@ -1198,16 +1198,20 @@ impl Engine for Cuda {
             id,
             program: binding.program,
             geometry: binding.geometry,
+            standing_guest_bytes: 0,
         })
     }
 
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
+    fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
         let held = self.adapters.remove(&id);
         let shell = self.loaded_mut()?;
         if let Some(held) = held {
             shell.release_adapter(held);
         }
-        shell.close_program_instance(id).map_err(fault)
+        // CUDA lays its guests' tables in the fire's span: it keeps none
+        // standing.
+        shell.close_program_instance(id).map_err(fault)?;
+        Ok(0)
     }
 
     fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {

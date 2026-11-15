@@ -165,7 +165,7 @@ async fn a_zero_fire_term_leaves_the_rung_arithmetic_unchanged() {
     );
     // A bind waits on nothing, and asks no planner.
     let shared: Shared = Arc::new(Mutex::new(pool));
-    let open = ProgramOpen::new(&shared, key(PROGRAM)).unwrap();
+    let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
     fund_span(
         &shared,
         || 256,
@@ -280,7 +280,7 @@ fn a_fire_term_past_the_device_is_refused() {
         },
     );
     let shared: Shared = Arc::new(Mutex::new(pool));
-    assert!(ProgramOpen::new(&shared, key(PROGRAM)).is_err());
+    assert!(ProgramOpen::new(&shared, key(PROGRAM), 0).is_err());
     assert_eq!(
         shared.lock().unwrap().pool().act_chunks(256),
         4,
@@ -305,7 +305,7 @@ async fn a_program_s_fire_term_widens_the_span_before_its_bind_and_its_close_giv
     let engine = Arc::new(Mutex::new(engine));
     let planner = Arc::new(Planner::default());
 
-    let open = ProgramOpen::new(&shared, key(PROGRAM)).unwrap();
+    let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
     assert_eq!(shared.lock().unwrap().span_short(256), 3);
     let wait = tokio::spawn({
         let (shared, planner, engine) = (shared.clone(), planner.clone(), engine.clone());
@@ -450,7 +450,7 @@ async fn a_term_past_the_largest_rung_funds_the_widest_that_fits_and_cuts_fires_
     assert_eq!(pool.rung(), 2048);
     pool.fire_facts_learned(key(PROGRAM), &wide_facts());
     let shared: Shared = Arc::new(Mutex::new(pool));
-    let open = ProgramOpen::new(&shared, key(PROGRAM)).unwrap();
+    let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
     {
         let pool = shared.lock().unwrap();
         assert_eq!(pool.widest_fit(), Some(256));
@@ -499,7 +499,7 @@ async fn a_term_past_the_largest_rung_funds_the_widest_that_fits_and_cuts_fires_
             ..FireFacts::default()
         },
     );
-    assert!(ProgramOpen::new(&shared, key(HUGE)).is_err());
+    assert!(ProgramOpen::new(&shared, key(HUGE), 0).is_err());
     assert_eq!(shared.lock().unwrap().fit_cap(), u32::MAX, "no term counts");
 }
 
@@ -544,7 +544,7 @@ async fn a_bind_whose_room_is_refused_fails_its_wait() {
         .take_records(pool.records_available() as usize)
         .unwrap();
     let shared: Shared = Arc::new(Mutex::new(pool));
-    let _open = ProgramOpen::new(&shared, key(PROGRAM)).unwrap();
+    let _open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
     let error = fund_span(&shared, || 256, &Refusing, &NoCopy)
         .await
         .unwrap_err();
@@ -601,7 +601,7 @@ async fn a_zero_term_never_refuses_a_bind_on_a_pool_without_rungs() {
     let (mut pool, engine) = rungless_pool();
     pool.fire_facts_learned(key(PROGRAM), &FireFacts::default());
     let shared: Shared = Arc::new(Mutex::new(pool));
-    let open = ProgramOpen::new(&shared, key(PROGRAM)).expect("a zero term never refuses");
+    let open = ProgramOpen::new(&shared, key(PROGRAM), 0).expect("a zero term never refuses");
     fund_span(
         &shared,
         || u32::MAX,
@@ -627,9 +627,9 @@ async fn a_pool_without_rungs_skips_the_term_check() {
         },
     );
     let shared: Shared = Arc::new(Mutex::new(pool));
-    let open = ProgramOpen::new(&shared, key(PROGRAM)).expect("the term is ignored");
+    let open = ProgramOpen::new(&shared, key(PROGRAM), 0).expect("the term is ignored");
     let huge =
-        ProgramOpen::new(&shared, key(ProgramId(9))).expect("past the device, still ignored");
+        ProgramOpen::new(&shared, key(ProgramId(9)), 0).expect("past the device, still ignored");
     {
         let pool = shared.lock().unwrap();
         assert_eq!(
@@ -657,7 +657,7 @@ fn a_zero_term_never_refuses_a_bind_on_a_pool_with_rungs() {
     let (mut pool, _) = pool_at_256();
     pool.fire_facts_learned(key(PROGRAM), &FireFacts::default());
     let shared: Shared = Arc::new(Mutex::new(pool));
-    assert!(ProgramOpen::new(&shared, key(PROGRAM)).is_ok());
+    assert!(ProgramOpen::new(&shared, key(PROGRAM), 0).is_ok());
 }
 
 /// One program at two extents is two pairs, and a fire that carries both
@@ -726,7 +726,7 @@ async fn a_larger_extent_bind_widens_the_span_before_it_is_sent() {
     let shared: Shared = Arc::new(Mutex::new(pool));
     let engine = Arc::new(Mutex::new(engine));
 
-    let open = ProgramOpen::new(&shared, at(PROGRAM, 4096)).unwrap();
+    let open = ProgramOpen::new(&shared, at(PROGRAM, 4096), 0).unwrap();
     assert_eq!(shared.lock().unwrap().span_short(256), 8);
     fund_span(&shared, || 256, &Granting, &Lane(engine.clone()))
         .await
@@ -868,7 +868,7 @@ async fn a_bind_the_engine_refuses_closes_its_term_as_if_it_never_happened() {
     let engine = Arc::new(Mutex::new(engine));
 
     // The bind: its pair opened and funded, then the engine refuses it.
-    let open = ProgramOpen::new(&shared, at(PROGRAM, 4096)).unwrap();
+    let open = ProgramOpen::new(&shared, at(PROGRAM, 4096), 0).unwrap();
     fund_span(&shared, || 256, &Granting, &Lane(engine.clone()))
         .await
         .unwrap();
@@ -891,7 +891,7 @@ async fn a_bind_the_engine_refuses_closes_its_term_as_if_it_never_happened() {
     }
     // A later bind of the same extents opens the pair anew, and its close
     // leaves nothing behind either.
-    let open = ProgramOpen::new(&shared, at(PROGRAM, 4096)).unwrap();
+    let open = ProgramOpen::new(&shared, at(PROGRAM, 4096), 0).unwrap();
     shared
         .lock()
         .unwrap()
@@ -924,7 +924,7 @@ async fn each_bind_grows_the_term_and_each_close_shrinks_it() {
     let shared: Shared = Arc::new(Mutex::new(pool));
 
     // A third bind: its guard grows the term before it is sent.
-    let open = ProgramOpen::new(&shared, key(PROGRAM)).unwrap();
+    let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
     assert_eq!(
         shared.lock().unwrap().span_short(256),
         1,
@@ -1042,7 +1042,7 @@ fn the_lane_s_bind_takes_over_the_guard_s_count_and_a_close_is_built_at_its_comm
     let shared: Shared = Arc::new(Mutex::new(pool));
     let act = || shared.lock().unwrap().pool().act_chunks(256);
 
-    let open = ProgramOpen::new(&shared, key(PROGRAM)).unwrap();
+    let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
     assert_eq!(act(), 4 + 1, "one binding");
     shared
         .lock()
@@ -1055,8 +1055,8 @@ fn the_lane_s_bind_takes_over_the_guard_s_count_and_a_close_is_built_at_its_comm
     // Two binds under way, one bound, the other refused by the engine:
     // its guard's count goes, the bound one's stays.
     let (first, second) = (
-        ProgramOpen::new(&shared, key(PROGRAM)).unwrap(),
-        ProgramOpen::new(&shared, key(PROGRAM)).unwrap(),
+        ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap(),
+        ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap(),
     );
     assert_eq!(act(), 4 + 3);
     shared
@@ -1069,7 +1069,7 @@ fn the_lane_s_bind_takes_over_the_guard_s_count_and_a_close_is_built_at_its_comm
 
     // A bind whose task was dropped before the lane reached it: no guard
     // is left, and the lane counts the instance itself.
-    drop(ProgramOpen::new(&shared, key(PROGRAM)).unwrap());
+    drop(ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap());
     assert_eq!(act(), 4 + 2);
     shared
         .lock()
@@ -1085,7 +1085,7 @@ fn the_lane_s_bind_takes_over_the_guard_s_count_and_a_close_is_built_at_its_comm
     // A bind that follows a close not yet committed builds from what is
     // open: the closed instance is gone from its table.
     shared.lock().unwrap().instance_closed(InstanceId(2));
-    let open = ProgramOpen::new(&shared, key(PROGRAM)).unwrap();
+    let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
     assert_eq!(act(), 4 + 2, "one bound, one binding");
     drop(open);
     shared.lock().unwrap().instance_closed(InstanceId(1));
@@ -1111,7 +1111,7 @@ fn a_refused_bind_leaves_the_term_of_the_pairs_open() {
     pool.instance_bound(InstanceId(1), key(PROGRAM));
     let shared: Shared = Arc::new(Mutex::new(pool));
     let before = shared.lock().unwrap().pool().fire().clone();
-    let refused = ProgramOpen::new(&shared, key(HUGE))
+    let refused = ProgramOpen::new(&shared, key(HUGE), 0)
         .err()
         .expect("past the device");
     assert!(
@@ -1192,7 +1192,7 @@ async fn binds_at_a_standing_rung_send_the_engine_no_notice() {
     let before = engine.lock().unwrap().calls.clone();
     let mut reserved = Vec::new();
     for id in 1..=u64::from(LANES) {
-        let open = ProgramOpen::new(&shared, key(PROGRAM)).unwrap();
+        let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
         {
             // A growth that moves nothing waits on nothing.
             let pool = shared.lock().unwrap();
@@ -1252,7 +1252,7 @@ async fn a_growth_at_a_standing_rung_over_state_sends_the_copy_alone() {
     let shared: Shared = Arc::new(Mutex::new(pool));
     let engine = Arc::new(Mutex::new(engine));
 
-    let open = ProgramOpen::new(&shared, key(PROGRAM)).unwrap();
+    let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
     {
         let pool = shared.lock().unwrap();
         let planned = pool.plan_raise(256).unwrap();
@@ -1294,7 +1294,7 @@ async fn a_bind_the_engine_cannot_cover_at_a_standing_rung_gives_its_room_back_u
     let engine = Arc::new(Mutex::new(engine));
     let before = engine.lock().unwrap().calls.clone();
 
-    let open = ProgramOpen::new(&shared, key(PROGRAM)).unwrap();
+    let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
     fund_span(&shared, || 256, &NoPlanner, &Lane(engine.clone()))
         .await
         .unwrap();
@@ -1349,7 +1349,7 @@ async fn a_bind_under_a_wider_rung_the_engine_holds_is_funded_at_that_rung() {
     let shared: Shared = Arc::new(Mutex::new(pool));
     let engine = Arc::new(Mutex::new(engine));
     let before = engine.lock().unwrap().calls.clone();
-    let open = ProgramOpen::new(&shared, key(PROGRAM)).unwrap();
+    let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
     {
         let pool = shared.lock().unwrap();
         assert_eq!(pool.widest_fit(), Some(2048), "12 + 3 of the span's 16");
@@ -1389,7 +1389,7 @@ async fn a_term_past_the_rung_the_engine_holds_brings_it_down_before_the_bind() 
     );
     let shared: Shared = Arc::new(Mutex::new(pool));
     let engine = Arc::new(Mutex::new(engine));
-    let open = ProgramOpen::new(&shared, key(PROGRAM)).unwrap();
+    let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
     {
         let pool = shared.lock().unwrap();
         assert_eq!(pool.widest_fit(), Some(256));
@@ -1627,7 +1627,7 @@ async fn a_wave_past_the_span_the_engine_states_is_cut_to_the_widest_rung_it_cov
         );
     }
     // One more bind of a pair open is funded at 128 and waits on nothing.
-    let open = ProgramOpen::new(&shared, at(PROGRAM, 256)).unwrap();
+    let open = ProgramOpen::new(&shared, at(PROGRAM, 256), 0).unwrap();
     fund_span(&shared, || 128, &NoPlanner, &Lane(engine.clone()))
         .await
         .unwrap();
@@ -1643,7 +1643,7 @@ async fn a_wave_past_the_span_the_engine_states_is_cut_to_the_widest_rung_it_cov
             ..FireFacts::default()
         },
     );
-    let why = ProgramOpen::new(&shared, key(HUGE))
+    let why = ProgramOpen::new(&shared, key(HUGE), 0)
         .err()
         .expect("past the span at the smallest rung");
     assert!(
@@ -1661,4 +1661,294 @@ async fn a_wave_past_the_span_the_engine_states_is_cut_to_the_widest_rung_it_cov
     pool.pool_mut().set_act_span(None);
     assert_eq!(pool.widest_fit(), Some(2048), "every lendable chunk");
     assert_eq!(pool.fit_cap(), u32::MAX);
+}
+
+/// Two chunks of batch tables a set: what [`SetEngine`] keeps standing for
+/// every program with a live instance.
+const SET: u64 = 2 * CHUNK;
+
+/// An engine that keeps one set of tables standing a program, shared by
+/// every live instance of it (Metal's batch tables), and states the total
+/// as `Engine::standing_after`, `BoundInstance::standing_guest_bytes` and
+/// `Engine::close_instance` do.
+#[derive(Default)]
+struct SetEngine {
+    /// The bytes of each program's set.
+    sets: std::collections::HashMap<ProgramId, u64>,
+    live: std::collections::HashMap<InstanceId, ProgramId>,
+    next: u64,
+    /// The binds the engine was asked for.
+    binds: u32,
+}
+
+impl SetEngine {
+    fn with(sets: &[(ProgramId, u64)]) -> Self {
+        Self {
+            sets: sets.iter().copied().collect(),
+            ..Self::default()
+        }
+    }
+
+    /// The total over the programs `live` holds an instance of, each set
+    /// once.
+    fn total(&self, live: impl Iterator<Item = ProgramId>) -> u64 {
+        let programs: std::collections::HashSet<ProgramId> = live.collect();
+        programs.iter().map(|program| self.sets[program]).sum()
+    }
+}
+
+impl ::engine::Engine for SetEngine {
+    fn kind(&self) -> &'static str {
+        "fake-sets"
+    }
+
+    fn load(&mut self, _request: ::engine::LoadRequest) -> ::engine::Result<::engine::Loaded> {
+        Err(::engine::Error::Load("no model".into()))
+    }
+
+    fn submit(
+        &mut self,
+        _frame: &::engine::FrameSubmission,
+    ) -> ::engine::Result<::engine::FrameTicket> {
+        unreachable!("nothing fires here")
+    }
+
+    fn standing_after(&self, binding: &::engine::InstanceBinding) -> ::engine::Result<u64> {
+        Ok(self.total(
+            self.live
+                .values()
+                .copied()
+                .chain(std::iter::once(binding.program)),
+        ))
+    }
+
+    fn bind_instance(
+        &mut self,
+        binding: &::engine::InstanceBinding,
+    ) -> ::engine::Result<::engine::BoundInstance> {
+        self.binds += 1;
+        self.next += 1;
+        let id = InstanceId(self.next);
+        self.live.insert(id, binding.program);
+        Ok(::engine::BoundInstance {
+            id,
+            program: binding.program,
+            geometry: binding.geometry,
+            standing_guest_bytes: self.total(self.live.values().copied()),
+        })
+    }
+
+    fn close_instance(&mut self, id: InstanceId) -> ::engine::Result<u64> {
+        self.live.remove(&id);
+        Ok(self.total(self.live.values().copied()))
+    }
+}
+
+fn binding(program: ProgramId) -> ::engine::InstanceBinding {
+    ::engine::InstanceBinding {
+        program,
+        extents: key(program).extents,
+        ..::engine::InstanceBinding::default()
+    }
+}
+
+/// A bind as the scheduler orders it: the engine asked the total it would
+/// hold (on the lane), the pair and what the bind adds held, then the bind,
+/// its total booked. Refused by name before the engine's bind where the
+/// smallest rung cannot hold the total with the term.
+fn bind_through(
+    shared: &Shared,
+    engine: &mut SetEngine,
+    program: ProgramId,
+) -> Result<InstanceId, String> {
+    use ::engine::Engine as _;
+    let total = engine
+        .standing_after(&binding(program))
+        .map_err(|error| error.to_string())?;
+    let added = shared.lock().unwrap().standing_added(total);
+    let open = ProgramOpen::new(shared, key(program), added)?;
+    let bound = engine
+        .bind_instance(&binding(program))
+        .map_err(|error| error.to_string())?;
+    {
+        let mut pool = shared.lock().unwrap();
+        pool.instance_bound(bound.id, key(program));
+        pool.standing_stated(bound.standing_guest_bytes);
+    }
+    drop(open);
+    Ok(bound.id)
+}
+
+/// A close as the lane books it: the engine's total after it, then the
+/// term built at the close's commit.
+fn close_through(shared: &Shared, engine: &mut SetEngine, id: InstanceId) {
+    use ::engine::Engine as _;
+    let total = engine.close_instance(id).unwrap();
+    {
+        let mut pool = shared.lock().unwrap();
+        pool.instance_closed(id);
+        pool.standing_stated(total);
+    }
+    fit_fire(shared);
+}
+
+/// Instances of one program share its set: a second bind adds nothing. A
+/// distinct program adds its own set, and the close that leaves no instance
+/// of a set gives it back; one that leaves an instance gives nothing.
+#[test]
+fn a_set_shared_by_instances_stands_once_and_a_close_that_empties_it_gives_it_back() {
+    const OTHER: ProgramId = ProgramId(8);
+    let (pool, _) = pool_at_256();
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let mut engine = SetEngine::with(&[(PROGRAM, SET), (OTHER, SET)]);
+    let at_256 = |shared: &Shared| shared.lock().unwrap().pool().act_chunks(256);
+    assert_eq!(at_256(&shared), 4);
+
+    let first = bind_through(&shared, &mut engine, PROGRAM).unwrap();
+    assert_eq!(shared.lock().unwrap().standing_booked(), SET);
+    assert_eq!(at_256(&shared), 4 + 2);
+    let second = bind_through(&shared, &mut engine, PROGRAM).unwrap();
+    assert_eq!(shared.lock().unwrap().standing_booked(), SET, "one set");
+    assert_eq!(at_256(&shared), 4 + 2);
+
+    let other = bind_through(&shared, &mut engine, OTHER).unwrap();
+    assert_eq!(shared.lock().unwrap().standing_booked(), 2 * SET);
+    assert_eq!(at_256(&shared), 4 + 4);
+
+    close_through(&shared, &mut engine, first);
+    assert_eq!(at_256(&shared), 4 + 4, "an instance still shares the set");
+    close_through(&shared, &mut engine, second);
+    assert_eq!(shared.lock().unwrap().standing_booked(), SET);
+    assert_eq!(at_256(&shared), 4 + 2);
+    close_through(&shared, &mut engine, other);
+    assert_eq!(shared.lock().unwrap().pool().standing(), 0);
+    assert_eq!(at_256(&shared), 4);
+}
+
+/// At every rung the span backs the standing total and the fire term at
+/// the rung's lanes, one ceil over the two; a total the largest rung cannot
+/// hold with its carve lowers the widest fit rather than hand out a span
+/// short of the tables.
+#[test]
+fn the_span_backs_the_standing_total_and_the_fire_term_at_every_rung() {
+    let (mut pool, _) = pool_at_256();
+    pool.fire_facts_learned(key(PROGRAM), &lane_facts());
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let mut engine = SetEngine::with(&[(PROGRAM, SET + MIB)]);
+    for _ in 0..3 {
+        bind_through(&shared, &mut engine, PROGRAM).unwrap();
+    }
+    {
+        let pool = shared.lock().unwrap();
+        // A fire at `rung` takes the rung at or above it: its model chunks
+        // and the term at that rung's lanes.
+        let model = [
+            (0, 16, 1),
+            (16, 16, 1),
+            (17, 256, 4),
+            (256, 256, 4),
+            (2048, 2048, 12),
+            (u32::MAX, 2048, 12),
+        ];
+        for (rung, tokens, chunks) in model {
+            let fire = pool.pool().fire().bytes(u32::min(tokens, LANES));
+            assert_eq!(
+                u64::from(pool.pool().act_chunks(rung)),
+                chunks + (fire + SET + MIB).div_ceil(CHUNK),
+                "rung {rung}"
+            );
+        }
+        assert_eq!(pool.widest_fit(), Some(2048));
+    }
+
+    // 52 chunks standing: 2048's 12 and its term no longer fit the 63
+    // past the reserved one, 256's do.
+    const WIDE: ProgramId = ProgramId(11);
+    engine.sets.insert(WIDE, 52 * CHUNK - SET - MIB);
+    shared
+        .lock()
+        .unwrap()
+        .fire_facts_learned(key(WIDE), &FireFacts::default());
+    bind_through(&shared, &mut engine, WIDE).unwrap();
+    let pool = shared.lock().unwrap();
+    assert_eq!(pool.widest_fit(), Some(256));
+    assert_eq!(pool.rung_for(u32::MAX), 256, "fires are asked no wider");
+    assert!(pool.pool().act_chunks(256) <= pool.act_most());
+}
+
+/// A bind's standing bytes are backed below the carve before the engine is
+/// asked to bind, and a total no rung can hold refuses the bind by name
+/// before the engine's bind is entered, the pool as it was.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_s_standing_bytes_are_backed_before_its_bind_and_a_total_past_the_span_is_refused() {
+    use ::engine::Engine as _;
+    let (pool, fake) = pool_at_256();
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let mut engine = SetEngine::with(&[(PROGRAM, SET), (ProgramId(9), 63 * CHUNK)]);
+
+    // Backed first: the span widens by the set while the bind is held.
+    let total = engine.standing_after(&binding(PROGRAM)).unwrap();
+    let added = shared.lock().unwrap().standing_added(total);
+    assert_eq!(added, SET);
+    let open = ProgramOpen::new(&shared, key(PROGRAM), added).unwrap();
+    fund_span(
+        &shared,
+        || 256,
+        &NoPlanner,
+        &Lane(Arc::new(Mutex::new(fake))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(shared.lock().unwrap().pool().act_reserved(), 4 + 2);
+    assert_eq!(engine.binds, 0, "backed before the engine binds");
+    let bound = engine.bind_instance(&binding(PROGRAM)).unwrap();
+    {
+        let mut pool = shared.lock().unwrap();
+        pool.instance_bound(bound.id, key(PROGRAM));
+        pool.standing_stated(bound.standing_guest_bytes);
+    }
+    drop(open);
+    assert_eq!(shared.lock().unwrap().pool().standing(), SET);
+
+    // 63 chunks more: the smallest rung's one and the 65 standing are past
+    // the 63 the device has.
+    let why = bind_through(&shared, &mut engine, ProgramId(9))
+        .err()
+        .expect("a total past the span is refused");
+    assert!(why.contains("standing guest bytes"), "{why}");
+    assert_eq!(engine.binds, 1, "the engine's bind was not entered");
+    let pool = shared.lock().unwrap();
+    assert_eq!(pool.pool().standing(), SET, "a refused bind holds nothing");
+    assert_eq!(pool.pool().act_chunks(256), 4 + 2);
+}
+
+/// Negative control: the same two sets stated as each pair's `fixed` (the
+/// form before the standing total) are counted for the pair a fire carries
+/// alone. With one lane a fire, the floor rung holds one set where the
+/// engine lays both; stated as the standing total, it holds both.
+#[test]
+fn tables_stated_as_a_fires_fixed_back_one_set_where_two_lie() {
+    const OTHER: ProgramId = ProgramId(8);
+    let (mut pool, _) = pool_at_256();
+    pool.set_max_lanes(1);
+    for program in [PROGRAM, OTHER] {
+        pool.fire_facts_learned(
+            key(program),
+            &FireFacts {
+                fixed: SET,
+                ..FireFacts::default()
+            },
+        );
+        pool.instance_bound(InstanceId(program.0), key(program));
+    }
+    assert_eq!(pool.pool().act_chunks(16), 1 + 2, "one set of the two");
+
+    let (mut pool, _) = pool_at_256();
+    pool.set_max_lanes(1);
+    for program in [PROGRAM, OTHER] {
+        pool.fire_facts_learned(key(program), &FireFacts::default());
+        pool.instance_bound(InstanceId(program.0), key(program));
+    }
+    pool.standing_stated(2 * SET);
+    assert_eq!(pool.pool().act_chunks(16), 1 + 4, "both sets");
 }

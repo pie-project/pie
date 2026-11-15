@@ -187,6 +187,9 @@ fn fail_request(request: LaneRequest, why: &str) {
                 QueuedItem::FireFacts { response, .. } => {
                     let _ = response.send(Err(anyhow!("{why}")));
                 }
+                QueuedItem::StandingAfter { response, .. } => {
+                    let _ = response.send(Err(anyhow!("{why}")));
+                }
                 _ => {}
             }
             let _ = reply.send(commit);
@@ -637,7 +640,8 @@ impl Lane {
             | QueuedItem::HostKv { .. }
             | QueuedItem::Pool { .. }
             | QueuedItem::RegisterProgram { .. }
-            | QueuedItem::FireFacts { .. } => LaneCommit::None,
+            | QueuedItem::FireFacts { .. }
+            | QueuedItem::StandingAfter { .. } => LaneCommit::None,
         }
     }
 
@@ -854,6 +858,18 @@ impl Lane {
                 let _ = response.send(asked);
                 LaneCommit::None
             }
+            QueuedItem::StandingAfter { binding, response } => {
+                let asked = backend(engine).and_then(|engine| {
+                    let total = engine.standing_after(&binding)?;
+                    // The booked total is the engine's as it stands: every
+                    // bind and close books its total on this lane.
+                    Ok(crate::store::registry::try_get(0, engine_idx)
+                        .and_then(|s| s.shared)
+                        .map_or(0, |shared| shared.lock().unwrap().standing_added(total)))
+                });
+                let _ = response.send(asked);
+                LaneCommit::None
+            }
             QueuedItem::RegisterChannelsBind {
                 pipeline_id,
                 plans,
@@ -907,18 +923,21 @@ impl Lane {
                     return LaneCommit::BindFinished { pipeline_id };
                 }
                 match Self::bind(engine, channels, &bind, roles.as_ref(), pipeline_id) {
-                    Ok(bound) => {
-                        // Its program can be in a fire until it closes.
+                    Ok((bound, standing)) => {
+                        // Its program can be in a fire until it closes, and
+                        // the engine's standing guest bytes are its total.
                         if let Some(shared) =
                             crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared)
                         {
-                            shared.lock().unwrap().instance_bound(
+                            let mut pool = shared.lock().unwrap();
+                            pool.instance_bound(
                                 bound.instance_id,
                                 crate::store::shared::programs::FireKey {
                                     program: bind.program_id(),
                                     extents: bind.binding.extents,
                                 },
                             );
+                            pool.standing_stated(standing);
                         }
                         LaneCommit::BindInstance {
                             pipeline_id,
@@ -1034,7 +1053,7 @@ impl Lane {
                 match backend(engine)
                     .and_then(|engine| engine.close_instance(id).map_err(anyhow::Error::from))
                 {
-                    Ok(()) => {
+                    Ok(standing) => {
                         channels.unbind(id);
                         if let Some(roles) = roles_of(engine_idx) {
                             roles.lock().unwrap().close_instance(id);
@@ -1042,7 +1061,9 @@ impl Lane {
                         if let Some(shared) =
                             crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared)
                         {
-                            shared.lock().unwrap().instance_closed(id);
+                            let mut pool = shared.lock().unwrap();
+                            pool.instance_closed(id);
+                            pool.standing_stated(standing);
                         }
                         LaneCommit::CloseInstance { id }
                     }
@@ -1081,7 +1102,7 @@ impl Lane {
         plan: &crate::engine::InstanceBindingPlan,
         roles: Option<&crate::store::roles::RolesHandle>,
         holder: Option<ProcessId>,
-    ) -> Result<BoundInstance> {
+    ) -> Result<(BoundInstance, u64)> {
         let bound = crate::store::roles::bind_instance(
             roles,
             &mut **engine,
@@ -1089,9 +1110,10 @@ impl Lane {
             holder,
             |id| channels.engine_registered(id),
         )?;
+        let standing = bound.standing_guest_bytes;
         let bound = BoundInstance::new(&bound, plan.pacing_wait_id);
         channels.bind(bound.instance_id, plan.binding.channels.clone());
-        Ok(bound)
+        Ok((bound, standing))
     }
 
     fn close_channel(engine: &mut EngineBox, id: ::engine::ChannelId) -> Result<()> {

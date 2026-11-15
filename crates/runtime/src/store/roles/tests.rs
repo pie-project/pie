@@ -264,6 +264,7 @@ impl Engine for FakeEngine {
             id: InstanceId(self.next),
             program: binding.program,
             geometry: binding.geometry,
+            standing_guest_bytes: 0,
         })
     }
 

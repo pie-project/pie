@@ -237,6 +237,13 @@ enum SchedulerItem {
         key: crate::store::shared::programs::FireKey,
         response: tokio::sync::oneshot::Sender<Result<()>>,
     },
+    /// Asks the engine what its standing guest bytes would be once a
+    /// binding is bound, and answers what that adds to the pool's booked
+    /// total (`store::shared::programs`).
+    StandingAfter {
+        binding: Box<::engine::InstanceBinding>,
+        response: tokio::sync::oneshot::Sender<Result<u64>>,
+    },
     RegisterChannelsBind {
         pipeline_id: Option<ProcessId>,
         plans: Vec<ChannelRegistration>,
@@ -470,6 +477,13 @@ pub(super) enum QueuedItem {
     FireFacts {
         key: crate::store::shared::programs::FireKey,
         response: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    /// Asks the engine what its standing guest bytes would be once a
+    /// binding is bound, and answers what that adds to the pool's booked
+    /// total (`store::shared::programs`).
+    StandingAfter {
+        binding: Box<::engine::InstanceBinding>,
+        response: tokio::sync::oneshot::Sender<Result<u64>>,
     },
     RegisterChannelsBind {
         pipeline_id: Option<ProcessId>,
@@ -1001,7 +1015,17 @@ impl SchedulerHandle {
                     self.request(|response| SchedulerItem::FireFacts { key, response })
                         .await??;
                 }
-                let open = crate::store::shared::programs::ProgramOpen::new(&shared, key)
+                // What the bind adds to the engine's standing guest bytes,
+                // asked on the lane before anything is bound: held with the
+                // term, refused with it by name, and backed with it below
+                // the carve before the bind is sent.
+                let standing = self
+                    .request(|response| SchedulerItem::StandingAfter {
+                        binding: Box::new(bind.binding.clone()),
+                        response,
+                    })
+                    .await??;
+                let open = crate::store::shared::programs::ProgramOpen::new(&shared, key, standing)
                     .map_err(|why| anyhow!("pipeline: {why}"))?;
                 let engine = bind.engine_id;
                 let pid = pipeline_id.unwrap_or_default();
@@ -1551,6 +1575,9 @@ impl BatchScheduler {
                 } => format!("PreLaunchCopy({}) pipeline {pipeline_id:?}", plan.label()),
                 QueuedItem::RegisterProgram { .. } => "RegisterProgram".to_string(),
                 QueuedItem::FireFacts { key, .. } => format!("FireFacts({key})"),
+                QueuedItem::StandingAfter { binding, .. } => {
+                    format!("StandingAfter(program {})", binding.program)
+                }
                 QueuedItem::RegisterChannelsBind { .. } => "RegisterChannelsBind".to_string(),
                 QueuedItem::CopyTracked { plan, .. } => format!("CopyTracked({})", plan.label()),
                 QueuedItem::HostKv { op, .. } => format!("HostKv({op:?})"),
@@ -1752,6 +1779,9 @@ impl BatchScheduler {
             SchedulerItem::FireFacts { key, response } => {
                 pending.push_back(QueuedItem::FireFacts { key, response });
             }
+            SchedulerItem::StandingAfter { binding, response } => {
+                pending.push_back(QueuedItem::StandingAfter { binding, response });
+            }
             SchedulerItem::RegisterChannelsBind {
                 pipeline_id,
                 plans,
@@ -1888,6 +1918,7 @@ impl BatchScheduler {
                 | QueuedItem::Pool { .. }
                 | QueuedItem::RegisterProgram { .. }
                 | QueuedItem::FireFacts { .. }
+                | QueuedItem::StandingAfter { .. }
         )
     }
 
