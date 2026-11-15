@@ -2,10 +2,11 @@
 
 //! A lane that buffers recurrent rows with a device-resident fold length
 //! (`FoldLen::Device`) folds what its attached program's `fold` port states
-//! for that lane, and the fire reports it at settle. The runtime takes a
-//! successful device-fold fire's report as that lane's own count, so a lane
-//! the port states nothing for is refused at prepare, by name: a lane past
-//! the port's list (never the first lane's length in its place, a silent
+//! for that lane, and the fire reports it at settle: a one-entry list states
+//! it for every lane, a longer one each lane's own entry. The runtime takes
+//! a successful device-fold fire's report as that lane's own count, so a
+//! lane the port states nothing for is refused at prepare, by name: a lane
+//! past a per-lane list (never another lane's length in its place, a silent
 //! wrong fold), and a lane with no attached program at all.
 
 use eta_compiler::codegen::program::{Backend, emit_program};
@@ -37,10 +38,9 @@ fn const_port(port: Port, words: &[u32]) -> PortBinding {
     }
 }
 
-/// A program describing two lanes of `ROWS` tokens each, whose `fold` port
-/// states one lane's fold length only; its epilogue puts the logits'
-/// argmax in a ring.
-fn two_lanes_one_fold(vocab: u32, tokens: &[u32]) -> ProgramRegistration {
+/// A program describing `lanes` lanes of `ROWS` tokens each, whose `fold`
+/// port carries `fold`; its epilogue puts the logits' argmax in a ring.
+fn lanes_with_fold(vocab: u32, tokens: &[u32], lanes: u32, fold: &[u32]) -> ProgramRegistration {
     let logits = OutputDecl {
         name: "logits".into(),
         axis: Axis::Row,
@@ -51,14 +51,17 @@ fn two_lanes_one_fold(vocab: u32, tokens: &[u32]) -> ProgramRegistration {
     };
     let mut ports = vec![
         const_port(Port::EmbedTokens, tokens),
-        const_port(Port::EmbedIndptr, &[0, ROWS, 2 * ROWS]),
-        const_port(Port::Fold, &[3]),
+        const_port(
+            Port::EmbedIndptr,
+            &(0..=lanes).map(|lane| lane * ROWS).collect::<Vec<_>>(),
+        ),
+        const_port(Port::Fold, fold),
     ];
     ports.sort_by_key(|binding| binding.port);
     let container = TraceContainer {
         names: vec!["logits".to_string()],
         channels: vec![ChannelDecl {
-            shape: Shape::vector(2),
+            shape: Shape::vector(lanes),
             dtype: ChanDType::Concrete(EtaDtype::I32),
             capacity: 4,
             host_role: HostRole::Reader,
@@ -71,7 +74,7 @@ fn two_lanes_one_fold(vocab: u32, tokens: &[u32]) -> ProgramRegistration {
                 Op::Output {
                     index: 0,
                     lane: 0,
-                    shape: Shape::matrix(2, vocab),
+                    shape: Shape::matrix(lanes, vocab),
                     dtype: EtaDtype::F32,
                 },
                 Op::ReduceArgmax(0),
@@ -103,7 +106,7 @@ fn two_lanes_one_fold(vocab: u32, tokens: &[u32]) -> ProgramRegistration {
 
 fn buffering(shell: &Shell) -> RsVerb {
     let layout = shell.pool_layout();
-    let pages = (2 * ROWS).div_ceil(layout.rs_tokens.max(1)) + 1;
+    let pages = ROWS.div_ceil(layout.rs_tokens.max(1)) + 1;
     RsVerb::Buffer {
         pages: (0..pages).collect(),
         base: 0,
@@ -121,23 +124,21 @@ fn refusal(why: impl std::fmt::Display) -> String {
     why
 }
 
-#[test]
-fn a_lane_past_the_fold_ports_list_is_refused() {
-    if !engine_metal::device::present() {
-        eprintln!("skipping: no Metal device");
-        return;
-    }
+/// Fires `lanes` device-fold lanes under one attached program whose
+/// `fold` port carries `fold`.
+fn fire_with_fold(lanes: u32, fold: &[u32]) -> Option<String> {
     let fixture = fixture_of("qwen35-tiny", None);
     let mut shell = load_with(&fixture, 1024);
     assert!(shell.serves_rs_verbs(), "a hybrid model buffers recurrent rows");
-    let tokens: Vec<u32> = (0..2 * ROWS).map(|at| (7 + at * 37) % 256).collect();
+    let tokens: Vec<u32> = (0..lanes * ROWS).map(|at| (7 + at * 37) % 256).collect();
     // The logits' width, from one plain fire of a spare slot.
-    shell.open(3).expect("slot 3 opens");
+    let spare = lanes;
+    shell.open(spare).expect("the spare slot opens");
     let vocab = shell
         .fire_seated(&[Seated {
             held: Some(0),
             ..Seated::of(Lane {
-                slot: 3,
+                slot: spare,
                 word: word(&fixture.trace, ROWS),
                 tokens: &tokens[..ROWS as usize],
             })
@@ -145,7 +146,7 @@ fn a_lane_past_the_fold_ports_list_is_refused() {
         .expect("a plain fire lands")[0]
         .len() as u32;
     let program = shell
-        .register_program(&two_lanes_one_fold(vocab, &tokens))
+        .register_program(&lanes_with_fold(vocab, &tokens, lanes, fold))
         .expect("the program registers");
     let facts = shell.program_facts(program).expect("the program's facts");
     let layout = shell.pool_layout();
@@ -170,9 +171,9 @@ fn a_lane_past_the_fold_ports_list_is_refused() {
             program,
             &[],
             eta_exec::Extents {
-                row_count: 2 * ROWS,
-                token_count: 2 * ROWS,
-                sampled_rows: 2,
+                row_count: lanes * ROWS,
+                token_count: lanes * ROWS,
+                sampled_rows: lanes,
                 query_len: ROWS,
                 ..eta_exec::Extents::default()
             },
@@ -183,13 +184,14 @@ fn a_lane_past_the_fold_ports_list_is_refused() {
             &rings,
         )
         .expect("the device-geometry instance binds");
-    shell.open(0).expect("slot 0 opens");
-    shell.open(1).expect("slot 1 opens");
-    let first = buffering(&shell);
-    let second = buffering(&shell);
-    let lanes: Vec<Seated> = [(0u32, &first), (1, &second)]
-        .into_iter()
-        .map(|(slot, verb)| Seated {
+    let verbs: Vec<RsVerb> = (0..lanes).map(|_| buffering(&shell)).collect();
+    for slot in 0..lanes {
+        shell.open(slot).expect("the lane's slot opens");
+    }
+    let seated: Vec<Seated> = verbs
+        .iter()
+        .zip(0u32..)
+        .map(|(verb, slot)| Seated {
             held: Some(0),
             rs: verb,
             reports: 1 + u64::from(slot),
@@ -200,20 +202,42 @@ fn a_lane_past_the_fold_ports_list_is_refused() {
             })
         })
         .collect();
-    let refused = shell
+    shell
         .fire_attached(
-            &lanes,
+            &seated,
             &[Attached {
                 lane: 0,
-                lanes: 2,
+                lanes,
                 instance: id,
                 adapter_only: false,
             }],
         )
-        .expect_err("a lane the fold port states nothing for is refused");
+        .err()
+        .map(|refused| refused.to_string())
+}
+
+#[test]
+fn a_lane_past_the_fold_ports_list_is_refused() {
+    if !engine_metal::device::present() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let refused = fire_with_fold(3, &[3, 2])
+        .expect("a lane past a per-lane fold list is refused");
     let why = refusal(&refused);
-    assert!(why.contains("lane 1"), "the refusal names the second lane: {why}");
+    assert!(why.contains("lane 2"), "the refusal names the third lane: {why}");
     eprintln!("refused by name: {why}");
+}
+
+#[test]
+fn a_one_entry_fold_port_serves_every_lane() {
+    if !engine_metal::device::present() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    if let Some(why) = fire_with_fold(2, &[3]) {
+        panic!("a one-entry fold states every lane's fold: {why}");
+    }
 }
 
 #[test]
