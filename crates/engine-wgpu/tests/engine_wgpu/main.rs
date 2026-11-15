@@ -29,15 +29,22 @@ mod backend {
     pub const FIXTURES: &str = "PIE_WGPU_FIXTURES";
     pub const CHUNK: &str = "PIE_WGPU_CHUNK";
 
-    /// What a test's load takes: WebGPU reports no memory size, so
-    /// `[engine.memory] budget_device` is stated. 16 GiB: a model load takes
-    /// a quarter of it, and 4 GiB holds the largest model the suite loads
-    /// (gemma4-e4b-mini-l6, 2.5 GB of dense bf16 weights) with its working
-    /// set and a pool beside them; a pool is backed whole at the load, so
-    /// four loads at once take all 16 GiB and no more.
-    pub const ALLOWANCE: engine::Allowance = engine::Allowance {
-        budget: Some(16 << 30),
+    /// What a context no load is sized from states (a kernel test's, a
+    /// probe's, the one a load's need is asked on): WebGPU reports no
+    /// memory size, so `[engine.memory] budget_device` is stated, here as
+    /// no ceiling.
+    pub const UNSIZED: engine::Allowance = engine::Allowance {
+        budget: Some(u64::MAX),
     };
+
+    /// What a context a load is sized from states: the bytes `need` asks
+    /// of the load's own fit (`room::of`). A pool is backed whole at the
+    /// load, so the load takes what it states and no more.
+    pub fn allowance(need: impl FnOnce() -> u64) -> engine::Allowance {
+        engine::Allowance {
+            budget: Some(need()),
+        }
+    }
 
     /// The narrowest subgroup the adapter runs (0 without subgroups).
     pub fn subgroup(device: &Context) -> u32 {
@@ -87,6 +94,8 @@ mod gpu;
 mod linear;
 #[path = "../../../engine-gpu/suite/model_logits.rs"]
 mod model_logits;
+#[path = "../../../engine-gpu/suite/room.rs"]
+mod room;
 #[path = "../../../engine-gpu/suite/runtime/mod.rs"]
 mod runtime;
 #[path = "../../../engine-gpu/suite/sampling/mod.rs"]

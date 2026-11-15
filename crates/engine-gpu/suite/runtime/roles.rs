@@ -168,7 +168,7 @@ impl Bound {
 #[test]
 fn an_instance_in_pool_slots_fires_through_moves() {
     let boot = backend::DeviceBoot::default();
-    if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
+    if backend::Context::bind(&boot, backend::UNSIZED).is_err() {
         eprintln!("not asked: no device");
         return;
     }
@@ -199,33 +199,41 @@ fn an_instance_in_pool_slots_fires_through_moves() {
         .position(|input| input.name == "t")
         .expect("the plan reads `t`") as u32;
     let mut engine = backend::Engine::new(boot, contract_for);
-    let loaded = engine
-        .load(LoadRequest {
-            trace,
-            checkpoint: Checkpoint::Path(path),
-            budgets: Budgets {
-                max_lanes: 4,
-                max_tokens: 16,
-                buckets: vec![16],
-                max_adapters: 0,
-                page_size: 16,
-                max_context: 64,
-                context_declared: false,
-                slots: 4,
-                max_patches: None,
-                max_images: None,
-                max_voxels: None,
-                max_clips: None,
-            },
-            residency: Residency {
-                device: backend::ALLOWANCE,
-                host_kv_budget: Some(64 << 20),
-                ..Residency::default()
-            },
-            ordinal: 0,
-            frames_in_flight: 1,
-        })
-        .expect("the miniature loads");
+    const SEATS: u32 = 4;
+    // The guests' chunks, placed by hand at the top of segment 0.
+    const GUESTS: u32 = 8;
+    let request = |allowance: engine::Allowance| LoadRequest {
+        trace: trace.clone(),
+        checkpoint: Checkpoint::Path(path.clone()),
+        budgets: Budgets {
+            max_lanes: SEATS,
+            max_tokens: 16,
+            buckets: vec![16],
+            max_adapters: 0,
+            page_size: 16,
+            max_context: 64,
+            context_declared: false,
+            slots: SEATS,
+            max_patches: None,
+            max_images: None,
+            max_voxels: None,
+            max_clips: None,
+        },
+        residency: Residency {
+            device: allowance,
+            host_kv_budget: Some(64 << 20),
+            ..Residency::default()
+        },
+        ordinal: 0,
+        frames_in_flight: 1,
+    };
+    let stated = backend::allowance(|| {
+        let need = engine
+            .need(request(backend::UNSIZED))
+            .expect("the load is fitted");
+        crate::room::of(need, SEATS, GUESTS)
+    });
+    let loaded = engine.load(request(stated)).expect("the miniature loads");
     let chunks = loaded.caps.chunks.clone();
     let top = chunks.segment_chunks;
     assert!(top >= 10, "segment 0 holds the test's chunks: {top}");

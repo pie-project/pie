@@ -273,6 +273,61 @@ pub struct Boot<'a, B: Serve> {
     pub handed: Option<B::Handed>,
 }
 
+/// What a load fits before anything of the model is on its device
+/// ([`Shell::fit`]): the opened device, the compiled plan, the pool's
+/// rows and the activation span at every rung.
+struct Fitted<'a, B: Serve> {
+    device: B::Context,
+    tuning: B::Tuning,
+    tier: kernels_slang::Tier,
+    /// The load's descriptors, its trace fused.
+    boot: Boot<'a, B>,
+    budgets: Budgets,
+    /// The bytes of every weight plane the trace names.
+    weights: u64,
+    compiled: poem_compiler::CompiledModel,
+    token_gridded: poem_ir::ClassSet,
+    masked: poem_ir::ClassSet,
+    corrected: poem_ir::ClassSet,
+    handles: Handles<B>,
+    rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
+    rows: crate::store::Rows,
+    row_shapes: Vec<crate::store::rows::RowsShape>,
+    expert_shapes: Vec<crate::store::experts::ExpertShape>,
+    /// The params the weight caches stream: they stay on the host.
+    streamed: Vec<usize>,
+    page_size: u32,
+    asked: Paging,
+    chunk: u64,
+    rs_bytes: u64,
+    rs_tokens: u32,
+    /// The chunks one working set takes at the load's context.
+    least_chunks: u32,
+    table_pages: u32,
+    span: Span<B>,
+}
+
+/// What a load takes of its device at the least, as its own fit counts
+/// it ([`Shell::need`]): the pool is sized to what the device has left
+/// and refused under one working set beside the fire
+/// ([`engine::chunk::fit`]). What the load lays outside the pool beside
+/// the weights (its seats, the weight caches) is on the books before the
+/// pool is sized, and is not in these figures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Need {
+    /// The bytes of every weight plane the model names.
+    pub weights: u64,
+    /// One chunk of the pool.
+    pub chunk: u64,
+    /// The chunks one working set takes at the load's context: a
+    /// sequence's pages, its record and one written copy-on-write, its
+    /// rs-list pages and its window lists'.
+    pub working_set: u32,
+    /// The chunks a fire's activation span takes at the load's top rung
+    /// (its `max_tokens`): the pool keeps them at every rung.
+    pub fire: u32,
+}
+
 const PATCH_ROUTE_DROP: i32 = -1;
 
 fn declared_width(trace: &Trace, want: RuntimeInput) -> u64 {
@@ -673,7 +728,9 @@ pub struct Shell<B: Serve> {
 }
 
 impl<B: Serve> Shell<B> {
-    pub fn load(boot: Boot<'_, B>) -> Result<Shell<B>> {
+    /// Opens the device and fits `boot` to it: everything the load sizes
+    /// before a byte of the model is on the device.
+    fn fit(boot: Boot<'_, B>) -> Result<Fitted<'_, B>> {
         let mut boot = boot;
         let (device, mut tuning) = B::open(boot.device, boot.residency.device, boot.handed.take())?;
         let tier = B::tier(&device);
@@ -686,12 +743,10 @@ impl<B: Serve> Shell<B> {
         };
         B::admit(&device, &mut tuning, tier, &boot.trace)?;
         let chip = tuning.profile();
-        let weights_held = boot.residency.weights_held;
-        let kv_budget = boot.residency.device_kv_budget;
-        let host_kv_budget = boot.residency.host_kv_budget;
 
         let profile = boot
             .profile
+            .take()
             .unwrap_or_else(|| DeviceProfile::of(chip, device.cores(), &[], &[]));
 
         let budgets = {
@@ -861,7 +916,7 @@ impl<B: Serve> Shell<B> {
         if rung_tokens.last() != Some(&top) {
             rung_tokens.push(top);
         }
-        let mut span = Span::plan(
+        let span = Span::plan(
             &boot.trace,
             &compiled,
             &budgets,
@@ -869,6 +924,78 @@ impl<B: Serve> Shell<B> {
             least,
             &tuning,
         )?;
+        Ok(Fitted {
+            device,
+            tuning,
+            tier,
+            boot,
+            budgets,
+            weights,
+            compiled,
+            token_gridded,
+            masked,
+            corrected,
+            handles,
+            rs_layout,
+            rows,
+            row_shapes,
+            expert_shapes,
+            streamed,
+            page_size,
+            asked,
+            chunk,
+            rs_bytes,
+            rs_tokens,
+            least_chunks,
+            table_pages,
+            span,
+        })
+    }
+
+    /// What a load of `boot` takes of its device at the least, by the
+    /// load's own fit ([`Shell::fit`]): nothing of the model is read or
+    /// reserved. A ladder or a slot count `boot` leaves to the device is
+    /// fitted to the device asked, as the load fits it.
+    pub fn need(boot: Boot<'_, B>) -> Result<Need> {
+        let plan = Self::fit(boot)?;
+        Ok(Need {
+            weights: plan.weights,
+            chunk: plan.chunk,
+            working_set: plan.least_chunks,
+            fire: plan.span.top_chunks(plan.chunk),
+        })
+    }
+
+    pub fn load(boot: Boot<'_, B>) -> Result<Shell<B>> {
+        let Fitted {
+            device,
+            tuning,
+            tier,
+            boot,
+            budgets,
+            compiled,
+            token_gridded,
+            masked,
+            corrected,
+            handles,
+            rs_layout,
+            rows,
+            row_shapes,
+            expert_shapes,
+            streamed,
+            page_size,
+            asked,
+            chunk,
+            rs_bytes,
+            rs_tokens,
+            least_chunks,
+            table_pages,
+            mut span,
+            ..
+        } = Self::fit(boot)?;
+        let weights_held = boot.residency.weights_held;
+        let kv_budget = boot.residency.device_kv_budget;
+        let host_kv_budget = boot.residency.host_kv_budget;
         let device_cap = device
             .left()
             .saturating_sub(u64::from(least_chunks) * chunk)
@@ -1156,7 +1283,7 @@ impl<B: Serve> Shell<B> {
         // The activation span takes the pool's top chunks beside what the
         // budget states for state.
         let act_chunks = span.act_chunks(chunk);
-        let act = act_chunks.last().map_or(0, |&(_, chunks)| chunks);
+        let act = span.top_chunks(chunk);
         let room = kv_budget.map_or(left, |budget| {
             budget.saturating_add(u64::from(act) * chunk).min(left)
         });

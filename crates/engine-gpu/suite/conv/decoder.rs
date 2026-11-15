@@ -381,7 +381,7 @@ fn scratch() -> PathBuf {
 #[test]
 fn a_conv_decoder_fires_over_a_voxel_input() {
     let device = DeviceBoot::default();
-    if Context::bind(&device, backend::ALLOWANCE).is_err() {
+    if Context::bind(&device, backend::UNSIZED).is_err() {
         eprintln!("not asked: no device");
         return;
     }
@@ -403,26 +403,31 @@ fn a_conv_decoder_fires_over_a_voxel_input() {
     drop(source);
 
     let max_voxels: u32 = (BOXES.iter().map(|b| voxels(*b) as u32).sum::<u32>() + 8) * 16;
-    let mut shell = Shell::load(Boot {
-        trace,
+    const SEATS: u32 = 4;
+    let boot = |allowance: engine::Allowance| Boot {
+        trace: trace.clone(),
         contract: &contract,
         checkpoint: &container,
-        budget: Budget::new(4, 16),
+        budget: Budget::new(SEATS, 16),
         patches: None,
         voxels: Some(VoxelLadder::new(max_voxels, 4)),
         profile: None,
         page_size: 16,
         context: 64,
-        slots: 4,
+        slots: SEATS,
         runahead: engine::runahead::Runahead::F1,
         device: &device,
         residency: engine::load::Residency {
-            device: backend::ALLOWANCE,
+            device: allowance,
             ..engine::load::Residency::default()
         },
         handed: None,
-    })
-    .expect("the decoder loads");
+    };
+    let stated = backend::allowance(|| {
+        let need = Shell::need(boot(backend::UNSIZED)).expect("the decoder's load is fitted");
+        crate::room::of(need, SEATS, 0)
+    });
+    let mut shell = Shell::load(boot(stated)).expect("the decoder loads");
     assert_eq!(
         shell.pixels_width(),
         Some(4),

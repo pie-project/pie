@@ -29,8 +29,15 @@ mod backend {
     pub const FIXTURES: &str = "PIE_VK_FIXTURES";
     pub const CHUNK: &str = "PIE_VK_CHUNK";
 
-    /// What a test's load takes: the whole device.
-    pub const ALLOWANCE: engine::Allowance = engine::Allowance::WHOLE;
+    /// What a context no load is sized from states: nothing, the device
+    /// reports what it has.
+    pub const UNSIZED: engine::Allowance = engine::Allowance::WHOLE;
+
+    /// What a context a load is sized from states: nothing either, so the
+    /// load's need is not asked.
+    pub fn allowance(_need: impl FnOnce() -> u64) -> engine::Allowance {
+        engine::Allowance::WHOLE
+    }
 
     /// The narrowest subgroup the device runs.
     pub fn subgroup(device: &Context) -> u32 {
@@ -79,6 +86,8 @@ mod gpu;
 mod linear;
 #[path = "../../../engine-gpu/suite/model_logits.rs"]
 mod model_logits;
+#[path = "../../../engine-gpu/suite/room.rs"]
+mod room;
 #[path = "../../../engine-gpu/suite/runtime/mod.rs"]
 mod runtime;
 #[path = "../../../engine-gpu/suite/sampling/mod.rs"]

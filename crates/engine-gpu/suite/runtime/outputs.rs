@@ -150,7 +150,7 @@ fn epilogue() -> TraceContainer {
 #[test]
 fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
     let boot = backend::DeviceBoot::default();
-    if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
+    if backend::Context::bind(&boot, backend::UNSIZED).is_err() {
         eprintln!("not asked: no device");
         return;
     }
@@ -173,32 +173,40 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
         .position(|input| input.name == "t")
         .expect("the plan reads `t`") as u32;
     let mut engine = backend::Engine::new(boot, contract_for);
-    let loaded = engine
-        .load(LoadRequest {
-            trace,
-            checkpoint: Checkpoint::Path(path),
-            budgets: Budgets {
-                max_lanes: 4,
-                max_tokens: 16,
-                buckets: vec![16],
-                max_adapters: 0,
-                page_size: 16,
-                max_context: 64,
-                context_declared: false,
-                slots: 4,
-                max_patches: None,
-                max_images: None,
-                max_voxels: None,
-                max_clips: None,
-            },
-            residency: Residency {
-                device: backend::ALLOWANCE,
-                ..Residency::default()
-            },
-            ordinal: 0,
-            frames_in_flight: 1,
-        })
-        .expect("the miniature loads");
+    const SEATS: u32 = 4;
+    // The guest's tables and cells take the top two chunks of segment 0.
+    const GUESTS: u32 = 2;
+    let request = |allowance: engine::Allowance| LoadRequest {
+        trace: trace.clone(),
+        checkpoint: Checkpoint::Path(path.clone()),
+        budgets: Budgets {
+            max_lanes: SEATS,
+            max_tokens: 16,
+            buckets: vec![16],
+            max_adapters: 0,
+            page_size: 16,
+            max_context: 64,
+            context_declared: false,
+            slots: SEATS,
+            max_patches: None,
+            max_images: None,
+            max_voxels: None,
+            max_clips: None,
+        },
+        residency: Residency {
+            device: allowance,
+            ..Residency::default()
+        },
+        ordinal: 0,
+        frames_in_flight: 1,
+    };
+    let stated = backend::allowance(|| {
+        let need = engine
+            .need(request(backend::UNSIZED))
+            .expect("the load is fitted");
+        crate::room::of(need, SEATS, GUESTS)
+    });
+    let loaded = engine.load(request(stated)).expect("the miniature loads");
 
     let mut decls: Vec<OutputDecl> = Vec::new();
     for decl in loaded.caps.classes.classes.iter().flat_map(|c| &c.outputs) {

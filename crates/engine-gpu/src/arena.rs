@@ -154,6 +154,15 @@ impl<B: Backend> Span<B> {
             .collect()
     }
 
+    /// The chunks of `chunk_bytes` the top rung takes: what the pool keeps
+    /// for a fire.
+    #[must_use]
+    pub fn top_chunks(&self, chunk_bytes: u64) -> u32 {
+        self.act_chunks(chunk_bytes)
+            .last()
+            .map_or(0, |&(_, chunks)| chunks)
+    }
+
     /// Lays the span in `buffer`, ending at its byte `end`.
     pub fn place(&mut self, buffer: B::Buffer, end: u64) -> Result<()> {
         let end = end - end % ALIGN;

@@ -133,6 +133,80 @@ impl<B: Host> Gpu<B> {
         }
     }
 
+    /// Hands `then` the load `request` states as the shell takes it, on the
+    /// device `boot` names (adopting what `handed` holds, taken once the
+    /// request is one the shell loads).
+    fn lower<R>(
+        boot: &B::DeviceBoot,
+        contract_for: ContractFor,
+        request: LoadRequest,
+        handed: &mut Option<B::Handed>,
+        then: impl FnOnce(Boot<'_, B>) -> crate::error::Result<R>,
+    ) -> EngineResult<R> {
+        let LoadRequest {
+            trace,
+            checkpoint,
+            budgets,
+            residency,
+            ordinal,
+            frames_in_flight,
+        } = request;
+
+        if ordinal > 0 {
+            return Err(Error::unsupported(B::KIND, "device ordinal selection"));
+        }
+
+        let Checkpoint::Path(path) = checkpoint else {
+            return Err(Error::Load(format!(
+                "the {} shell lands a checkpoint or nothing runs; `Checkpoint::None` has no \
+                 weightless path here",
+                B::KIND
+            )));
+        };
+        let contract = contract_for(&trace, &path).map_err(Error::Load)?;
+
+        let patches = patch_ladder(&trace, &budgets);
+        let voxels = poem_compiler::VoxelLadder::of(
+            &trace,
+            budgets.max_voxels,
+            budgets.max_clips,
+            budgets.max_lanes,
+        );
+        let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
+        let budget = bake_budgets(&budgets, &trace);
+        then(Boot {
+            trace,
+            contract: &contract,
+            checkpoint: &path,
+            budget,
+            patches,
+
+            profile: None::<DeviceProfile>,
+            page_size: budgets.page_size,
+            context: budgets.max_context,
+            slots,
+
+            runahead: engine::runahead::Runahead::of(frames_in_flight),
+            voxels,
+            residency,
+            device: boot,
+            handed: handed.take(),
+        })
+        .map_err(fault)
+    }
+
+    /// What a load of `request` takes of this engine's device at the least,
+    /// by the load's own fit ([`Shell::need`]): nothing is loaded.
+    pub fn need(&self, request: LoadRequest) -> EngineResult<crate::serve::Need> {
+        Self::lower(
+            &self.boot,
+            self.contract_for,
+            request,
+            &mut None,
+            Shell::need,
+        )
+    }
+
     /// An engine over a device the host already opened.
     #[must_use]
     pub fn with_device(
@@ -414,63 +488,24 @@ where
                 B::KIND
             )));
         }
-        let LoadRequest {
-            trace,
-            checkpoint,
-            budgets,
-            residency,
-            ordinal,
-            frames_in_flight,
-        } = request;
-
-        if ordinal > 0 {
-            return Err(Error::unsupported(B::KIND, "device ordinal selection"));
-        }
-
-        let Checkpoint::Path(path) = checkpoint else {
-            return Err(Error::Load(format!(
-                "the {} shell lands a checkpoint or nothing runs; `Checkpoint::None` has no \
-                 weightless path here",
-                B::KIND
-            )));
-        };
-        let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
-
-        let patches = patch_ladder(&trace, &budgets);
-        let voxels = poem_compiler::VoxelLadder::of(
-            &trace,
-            budgets.max_voxels,
-            budgets.max_clips,
-            budgets.max_lanes,
-        );
-        let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
+        let budgets = request.budgets.clone();
         let (disk_kv_budget, disk_kv_dir, seats) = (
-            residency.disk_kv_budget,
-            residency.disk_kv_dir.clone(),
-            residency.kv_seats.unwrap_or(budgets.max_lanes),
+            request.residency.disk_kv_budget,
+            request.residency.disk_kv_dir.clone(),
+            request.residency.kv_seats.unwrap_or(budgets.max_lanes),
         );
-        let budget = bake_budgets(&budgets, &trace);
-        let max_readouts =
-            u32::try_from(poem_compiler::arena::readouts_ceiling(&budget)).unwrap_or(u32::MAX);
-        let mut shell = Shell::load(Boot {
-            trace,
-            contract: &contract,
-            checkpoint: &path,
-            budget,
-            patches,
-
-            profile: None::<DeviceProfile>,
-            page_size: budgets.page_size,
-            context: budgets.max_context,
-            slots,
-
-            runahead: engine::runahead::Runahead::of(frames_in_flight),
-            voxels,
-            residency,
-            device: &self.boot,
-            handed: self.handed.take(),
-        })
-        .map_err(fault)?;
+        let (mut shell, max_readouts) = Self::lower(
+            &self.boot,
+            self.contract_for,
+            request,
+            &mut self.handed,
+            |boot| {
+                let max_readouts =
+                    u32::try_from(poem_compiler::arena::readouts_ceiling(&boot.budget))
+                        .unwrap_or(u32::MAX);
+                Shell::load(boot).map(|shell| (shell, max_readouts))
+            },
+        )?;
         let disk_kv_pages = shell
             .seat_disk_kv(
                 disk_kv_budget,
