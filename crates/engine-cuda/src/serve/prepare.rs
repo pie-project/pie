@@ -1562,16 +1562,28 @@ impl FrameShell for Shell {
         // A tapped fire is walked, so the walk can mark where each layer
         // ends on the stream.
         // A body's window holds its own rows twice and at least `REPLAYED`
-        // replayed (`Run::rs_layout`): a fire whose lanes replay more in a
-        // window than its rows or `REPLAYED` walks.
-        let replays_fit = windows.spans().all(|span| {
-            rs_replays
+        // replayed (`Run::rs_layout`). A window whose lanes replay more
+        // than its rows or `REPLAYED` has no body that holds it: the fire
+        // is refused here, before anything is written, where it used to
+        // walk. The bound stands until the windows' places are data and
+        // the scratch is the fire's (`store::rs::REPLAYED`).
+        for span in windows.spans() {
+            let replayed: u32 = rs_replays
                 .iter()
                 .skip(span.lane_offset as usize)
                 .take(span.lanes as usize)
-                .sum::<u32>()
-                <= span.rows.max(crate::store::rs::REPLAYED)
-        });
+                .sum();
+            let held = span.rows.max(crate::store::rs::REPLAYED);
+            if records_bodies && replayed > held {
+                return Err(Fault::Ceiling {
+                    what: "buffered rows one window of a fire replays (a body's window \
+                           holds its own rows or `store::rs::REPLAYED`, whichever is more)",
+                    need: u64::from(replayed),
+                    have: u64::from(held),
+                });
+            }
+        }
+        let replays_fit = true;
         let snapshots_fit = snapshots.rows.len() <= crate::store::rs::SNAPSHOTS as usize;
         let bodied = records_bodies
             && !tapped
