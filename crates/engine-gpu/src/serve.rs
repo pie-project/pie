@@ -739,6 +739,7 @@ impl<B: Serve> Shell<B> {
         }
         tracing::info!(
             kernels = asks.kernels.len(),
+            named = ?asks.kernels.iter().map(|kernel| kernel.key).collect::<Vec<_>>(),
             dispatches = asks.dispatches,
             driver = device.outside().saturating_sub(held),
             "every pipeline a fire of this load asks for is named by a walk that fires \

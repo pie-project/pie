@@ -592,10 +592,13 @@ fn every_rung_names_what_the_largest_names(model: &str) {
             "{model}: the unservable classes at rung {rung}"
         );
     }
+    let keys: Vec<&str> = largest.kernels.iter().map(|kernel| kernel.key).collect();
     eprintln!(
-        "{model}: rungs {:?} each name {} kernels, {} dispatches a fire at most, unservable {:?}",
+        "{model}: rungs {:?} each name {} kernels (set {:016x}), {} dispatches a fire at most, \
+         unservable {:?}",
         largest.rungs,
         largest.kernels.len(),
+        fnv(&keys.join(" ")),
         largest.dispatches,
         classes(&largest)
     );

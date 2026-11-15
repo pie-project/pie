@@ -285,6 +285,10 @@ impl<B: Serve> Backend for Named<B> {
 
     const STORAGE: checkpoint::types::BackendKind = B::STORAGE;
 
+    /// A naming load reserves nothing to land bytes in: its weights are
+    /// where the plan lays them, and the walk reads none.
+    const LANDS: bool = false;
+
     type Context = Facts;
 
     type Buffer = NoBuffer;

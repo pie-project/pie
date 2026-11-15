@@ -42,6 +42,11 @@ pub trait Backend:
     /// The storage target a checkpoint lands for.
     const STORAGE: checkpoint::types::BackendKind;
 
+    /// Whether a load lands the checkpoint's bytes in what it reserves.
+    /// One that reserves nothing takes where each plane lies and which the
+    /// checkpoint publishes from the load plan, and reads no byte.
+    const LANDS: bool = true;
+
     /// The device one load binds.
     type Context: Context<Self>;
 
