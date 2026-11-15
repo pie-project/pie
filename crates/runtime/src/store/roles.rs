@@ -995,6 +995,11 @@ pub fn bind_instance(
 /// never refuses it. A channel parks with `pid` only while `pid` is not
 /// resident, so each bind again follows a restore. A wait that ends
 /// otherwise (the process failed or ended) is the bind's refusal.
+///
+/// This is not a retry: nothing is attempted again on the chance it now
+/// fits, and nothing is degraded or made smaller. The bind is sent again
+/// only after the planner has restored `pid`, the event the refusal named,
+/// exactly as a fire held back by a suspension is sent after its restore.
 pub async fn bind_when_resident<T, E, B, W>(
     pid: Holder,
     mut bind: impl FnMut() -> B,
