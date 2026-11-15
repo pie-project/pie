@@ -12,6 +12,9 @@ pub struct Run {
 pub struct LanePlan {
     pub replay: u32,
     pub commit: u32,
+    /// The slots a buffering lane's fold froze this fire, after the clamp
+    /// to the fire's end: its state holds the slots below `folded + froze`.
+    pub froze: u32,
     pub gather: Option<Run>,
     pub gathers: Vec<Run>,
     pub scatter: Option<Run>,
@@ -78,6 +81,7 @@ impl LanePlan {
         Ok(LanePlan {
             replay,
             commit,
+            froze: to - folded,
             gather: gathers.first().cloned(),
             gathers,
             scatter: (rows > 0).then(|| Run {

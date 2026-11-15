@@ -22,10 +22,12 @@ impl Spatial {
         self.cfg.asynchronous.unwrap_or(false)
     }
 
-    /// Whether this engine runs asynchronously now: the runtime asked
-    /// [`Spatial::asynchronous`] and gave it a completion sink.
+    /// Whether this engine runs asynchronously now: it is set to
+    /// ([`Spatial::asynchronous`]) and the runtime gave it a completion
+    /// sink. A synchronous engine is given one too, and still settles
+    /// inside `submit`.
     pub(super) fn settling(&self) -> bool {
-        self.sink.is_some()
+        self.asynchronous() && self.sink.is_some()
     }
 
     /// Runs the posted steps in order, reporting each landed.

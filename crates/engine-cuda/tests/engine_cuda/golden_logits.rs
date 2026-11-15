@@ -1353,6 +1353,137 @@ fn golden_buffered() {
     }
 }
 
+/// The rows the carrying probe's lane leaves unfolded before one decode
+/// replays them all: more than a page of the rs buffer, and than the
+/// decode's own bucket.
+const CARRIED: u32 = 40;
+
+/// A prefill folded as it lands, then `CARRIED + 1` decodes of a fixed
+/// script: with `buffer` each buffers its row past the state and folds
+/// nothing, until the last replays the `CARRIED` rows before it and folds
+/// them all; without, each folds as it lands. Each step's logits, and the
+/// bodies the last decode replayed and the fires it walked with none.
+fn served_carrying(fixture: &Fixture, cache: &Path, buffer: bool) -> (Vec<Vec<f32>>, u64, u64) {
+    use engine::fire::{FoldLen, RsVerb};
+    let mut shell = Shell::load(Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(1, TOKENS),
+        patches: None,
+        voxels: None,
+        page_size: PAGE,
+        context: CONTEXT,
+        slots: 4,
+        kv_budget: None,
+        allowance: engine::Allowance::WHOLE,
+        ordinal: 0,
+        knobs: buffering(knobs()),
+        cache_dir: Some(cache),
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    shell.back_whole().expect("the fitted pool is backed whole");
+    let page = rs_page(&mut shell);
+    shell.open(0).expect("slot 0 opens");
+    let mut steps = Vec::new();
+    let mut step = |shell: &mut Shell, tokens: &[u32], rs: RsVerb| {
+        let word = fixture.trace.facts.word(&Request::new(
+            u32::try_from(tokens.len()).expect("a count"),
+            false,
+        ));
+        let seated = engine_cuda::Seated {
+            rs,
+            ..engine_cuda::Seated::of(Lane {
+                slot: 0,
+                word,
+                tokens,
+            })
+        };
+        let mut rows = shell
+            .fire_media(&[seated], &[], &[])
+            .expect("the step fires");
+        steps.push(rows.swap_remove(0));
+    };
+    let prompt: Vec<u32> = (0..37).map(|t| (t * 7 + 11) % 1000).collect();
+    let folded = prompt.len() as u32;
+    step(&mut shell, &prompt, RsVerb::Fold);
+    let base = folded / page * page;
+    let mut before = shell.body_stats().tally;
+    for at in 0..=CARRIED {
+        let end = folded + at + 1;
+        before = shell.body_stats().tally;
+        let rs = if buffer {
+            RsVerb::Buffer {
+                pages: (base / page..end.div_ceil(page)).collect(),
+                base,
+                folded,
+                fold: FoldLen::Host(if at == CARRIED { CARRIED + 1 } else { 0 }),
+            }
+        } else {
+            RsVerb::Fold
+        };
+        step(&mut shell, &[((folded + at) * 7 + 11) % 1000], rs);
+    }
+    let after = shell.body_stats().tally;
+    (
+        steps,
+        after.hits - before.hits,
+        after.eager_unbodied - before.eager_unbodied,
+    )
+}
+
+/// One lane replaying `CARRIED` buffered rows ahead of its one row is
+/// served by a body, and every step answers what the same rows folded as
+/// they land answer, to the tolerance of the two kernels that run them.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_buffered_carrying() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
+    let (folded, _, _) = served_carrying(&fixture, &cache, false);
+    let (buffered, hits, unbodied) = served_carrying(&fixture, &cache, true);
+    assert_eq!(buffered.len(), folded.len());
+    let mut worst = 0f32;
+    for (buffered, folded) in buffered.iter().zip(&folded) {
+        let scale = folded.iter().fold(0f32, |most, v| most.max(v.abs()));
+        let apart = buffered
+            .iter()
+            .zip(folded)
+            .fold(0f32, |most, (a, b)| most.max((a - b).abs()));
+        worst = worst.max(apart / scale.max(f32::MIN_POSITIVE));
+    }
+    println!(
+        "golden {model}-buffered-carrying: {} steps, logits apart by {worst:e} of their scale, \
+         the last decode replayed {hits} body(ies) and walked {unbodied}",
+        buffered.len()
+    );
+    // A replay's extended tensors state the whole run's rows
+    // (`store::rs::Buffers::rows_ext`), past `ssm_gdn_scan_until`, so its
+    // gated-delta recurrence is the chunked kernel; a fold of one row takes
+    // the scan. The two sum in other orders: on this miniature the logits
+    // lie 0.013 to 0.035 of their scale apart at every carried count from 1
+    // to 40 (0 where nothing is replayed). Past 0.05 is another cause.
+    assert!(
+        worst < 0.05,
+        "the buffered lane's logits lie {worst:e} of their scale from the folded lane's"
+    );
+    assert!(
+        hits > 0 && unbodied == 0,
+        "the decode replaying {CARRIED} buffered rows replayed {hits} body(ies) and walked \
+         {unbodied} fire(s) with none"
+    );
+}
+
 /// Two lanes of two seats that buffer their rows past the state in one fire
 /// a step: a 12-row prefill each folded as it lands, then decodes folded
 /// late (none, two, or all a step), the lanes out of step with each other.

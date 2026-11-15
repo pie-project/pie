@@ -185,6 +185,9 @@ pub struct Seated<'a> {
     /// trimmed behind the window), for the windowed rows; a missing or empty
     /// seat-addresses them.
     pub windows: &'a [Vec<u32>],
+    /// The runtime's report tag for this lane (`engine::fire` lane
+    /// `reports`); 0: no report asked.
+    pub reports: u64,
 }
 
 impl<'a> Seated<'a> {
@@ -211,6 +214,7 @@ impl<'a> Seated<'a> {
             record: None,
             record_run: None,
             windows: &[],
+            reports: 0,
         }
     }
 
@@ -258,6 +262,12 @@ pub struct Shell {
     /// The load's pipeline walk is running ([`Shell::warm_pipelines`]): a
     /// seat-addressed fire backs only what the walk backed for it.
     warming: bool,
+    /// Per record (its first slot ref), the slot its last fold froze it
+    /// through where the runtime's stated `folded` may not know it yet: a
+    /// device-counted fold is learned at settle, and a fire staged before
+    /// that states the length before it. A fire replays from the larger;
+    /// an entry goes once the stated length reaches it.
+    frozen_ahead: std::collections::HashMap<u32, u32>,
     tuning: kernels_metal::Tuning,
     device: Context,
     /// What the device held for this process before the load: the ledger's
@@ -1060,21 +1070,16 @@ impl PreparedLoad<'_> {
         .unwrap_or(u32::MAX);
         let model_bytes = weights.bytes() + ane_model + u64::from(tables_chunks) * rows.chunk_bytes;
         // Each rung's rs scratch: a fire of the rung's tokens and lanes
-        // replays its own rows and, for each lane, the rows it carries
-        // unfolded into the fire (`engine::fire::UNFOLDED_ROWS`, the runtime's bound).
+        // replays its own rows and the rows its lanes carry in, which the
+        // contract holds to the rung's tokens summed over the lanes
+        // ([`engine::fire::rung_rows`]): its own rows and as many again.
         let rs_room: Vec<u64> = rungs
             .iter()
             .map(|(tokens, _)| match (&rs_layout, &rows.rs) {
                 (Some(layout), Some(_)) => {
                     let lanes = (*tokens).min(boot.budget.max_lanes).max(1);
-                    let unfolded = lanes.saturating_mul(engine::fire::UNFOLDED_ROWS);
-                    crate::rs::Seat::scratch_bytes(
-                        layout,
-                        (*tokens)
-                            .min(boot.budget.max_tokens)
-                            .saturating_add(unfolded),
-                        lanes,
-                    )
+                    let own = (*tokens).min(boot.budget.max_tokens);
+                    crate::rs::Seat::scratch_bytes(layout, own.saturating_add(*tokens), lanes)
                 }
                 _ => 0,
             })
@@ -1135,7 +1140,7 @@ impl PreparedLoad<'_> {
             // weights until a held set gives them back.
             let room = boot.kv_budget.unwrap_or_else(|| accounting(0).pool);
             let total = engine::chunk::fit(room, chunk, 0, least)
-                .map_err(|short| Fault::Residency(short.to_string()))?
+                .map_err(Fault::FitShort)?
                 .saturating_add(span)
                 .saturating_add(tables_chunks);
             // The range spans as many buffers as it takes, each as many
@@ -1350,6 +1355,7 @@ impl PreparedLoad<'_> {
             weights,
             rung: arena.floor_tokens(),
             warming: false,
+            frozen_ahead: std::collections::HashMap::new(),
             batch_bottom: arena.rung_guest_top(arena.floor_tokens()),
             arena,
             pools,
@@ -1568,6 +1574,12 @@ impl Shell {
         self.pools.commit_span(segments)
     }
 
+    /// Each rung's tokens and the bytes of its rs scratch in the span.
+    #[must_use]
+    pub fn rs_rooms(&self) -> Vec<(u32, u64)> {
+        self.arena.rs_rooms()
+    }
+
     /// See `Engine::set_rung`: a raise backs the carve of `to` before any
     /// fire of it, refused as [`Fault::Refused`]; a lower gives back the
     /// carve above it. Either way, where the rung's staged regions move,
@@ -1759,6 +1771,14 @@ impl Shell {
         self.drain()?;
         let mut frame = self.device.frame()?;
         for (shape, pairs) in copies {
+            if *shape == crate::store::layout::FIXED {
+                for &[src, dst] in pairs {
+                    match self.frozen_ahead.get(&src).copied() {
+                        Some(at) => self.frozen_ahead.insert(dst, at),
+                        None => self.frozen_ahead.remove(&dst),
+                    };
+                }
+            }
             let moves: Vec<(u32, u32)> = pairs.iter().map(|&[src, dst]| (src, dst)).collect();
             self.pools.copy_shape(&mut frame, *shape, &moves)?;
         }
@@ -1772,6 +1792,16 @@ impl Shell {
             return Ok(());
         }
         self.drain()?;
+        // Every fold has landed and been told once drained: a record moved
+        // between tiers carries no length ahead of the runtime's, and the
+        // slot it lands in starts from what its verb states, never from
+        // a count its last occupant left.
+        if copy.shape == crate::store::layout::FIXED && copy.src != copy.dst {
+            for &(src, dst) in &copy.slots {
+                self.frozen_ahead.remove(&src);
+                self.frozen_ahead.remove(&dst);
+            }
+        }
         let mut frame = self.device.frame()?;
         self.pools.copy_slots(&mut frame, copy)?;
         self.grafted = Some(frame.commit_async(None)?);
@@ -2800,6 +2830,11 @@ impl Shell {
             return Ok(());
         };
         let waited = flight.pending.wait();
+        // Settling inside submit: the sink hears the fire here, the buffer
+        // complete, before the harvest (and so the submit) returns.
+        if let Some(told) = flight.told.as_ref() {
+            told(waited.as_ref().err().map(ToString::to_string));
+        }
         if let Some(keepalive) = &self.keepalive {
             keepalive.end();
         }
@@ -3611,6 +3646,9 @@ impl Shell {
         // (checked backed) once the fire's segments are committed.
         let mut state_ids: Vec<u32> = Vec::new();
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
+        // Per reporting lane whose rows a port places, one past the last
+        // slot they land at, in the set's own numbering (`KvWrites::end`).
+        let mut ends: Vec<engine::KvWrites> = Vec::new();
         let mut rs_active = false;
         // Per fire lane, the rows inside it whose state lands in a slot of its
         // own and then those slots (`kernels_metal::ssm::Snapshots`).
@@ -3847,25 +3885,45 @@ impl Shell {
                 Some(ports) => ports.slots(row.rows as usize)?,
                 None => None,
             };
+            let placed = stated.is_some();
             let first = stated
                 .and_then(|slots| slots.first().copied())
                 .unwrap_or(have);
             // The buffer's rows live in the rs list: the verb's pages, in
             // token order from its base (CONTRACT-BC 18).
+            // Where the record stands: the stated frozen length, or past it
+            // where this engine's last fold of the record froze more than
+            // the runtime has yet been told.
+            let held_key = record.first().copied();
+            if fresh && let Some(key) = held_key {
+                self.frozen_ahead.remove(&key);
+            }
             let rs = match seated.rs {
                 engine::fire::RsVerb::Buffer {
                     pages,
                     base,
                     folded,
                     fold,
-                } => engine::fire::RsVerb::Buffer {
-                    pages: self
-                        .pools
-                        .rs_pages(pages, (!seated.refs).then_some(lane.slot))?,
-                    base: *base,
-                    folded: *folded,
-                    fold: *fold,
-                },
+                } => {
+                    let ahead = held_key.and_then(|key| self.frozen_ahead.get(&key).copied());
+                    let folded = match ahead {
+                        Some(ahead) if ahead > *folded => ahead,
+                        _ => {
+                            if let Some(key) = held_key {
+                                self.frozen_ahead.remove(&key);
+                            }
+                            *folded
+                        }
+                    };
+                    engine::fire::RsVerb::Buffer {
+                        pages: self
+                            .pools
+                            .rs_pages(pages, (!seated.refs).then_some(lane.slot))?,
+                        base: *base,
+                        folded,
+                        fold: *fold,
+                    }
+                }
                 verb => verb.clone(),
             };
             let plan = engine::rs::LanePlan::of(
@@ -3876,22 +3934,50 @@ impl Shell {
                 ports.as_ref().and_then(engine::ports::LanePorts::fold),
             )
             .map_err(|error| Fault::program("serve::rs", format!("lane {source}: {error}")))?;
-            // The rows a lane carries in are bounded here, before anything
-            // is encoded: a device-geometry fire's slots are the guest's
-            // (read on the host), so the runtime cannot bound them, and a
-            // lane past the bound is refused by name rather than replayed
-            // past the rung's rs region.
-            if plan.replay > engine::fire::UNFOLDED_ROWS {
-                return Err(Fault::program(
-                    "serve::rs",
-                    format!(
-                        "lane {source} carries {} recurrent rows unfolded into this fire, \
-                         past the {} a lane may carry (engine::fire::UNFOLDED_ROWS); the \
-                         fire is refused and writes nothing",
-                        plan.replay,
-                        engine::fire::UNFOLDED_ROWS
-                    ),
-                ));
+            // A reporting lane that buffers tells, where the fire settles,
+            // how many slots past its state's frozen length this fire froze
+            // (as `LanePlan::of` reckons it) and, where a port places its
+            // rows, one past the last slot they landed at.
+            if seated.reports != 0 {
+                let end = first.saturating_add(row.rows);
+                let fold = match &rs {
+                    engine::fire::RsVerb::Buffer { folded, fold, .. } => {
+                        let fold = match fold {
+                            engine::fire::FoldLen::Host(n) => Some(*n),
+                            engine::fire::FoldLen::Device => ports
+                                .as_ref()
+                                .and_then(engine::ports::LanePorts::fold),
+                        };
+                        fold.map(|n| folded.saturating_add(n).min(end) - folded)
+                    }
+                    // A lane with no recurrent state to buffer (a kv-only
+                    // model's): its fold is what its program's `fold` port
+                    // states for it, the count the runtime adds to the set's
+                    // frozen length when the fire settles, as for a buffering
+                    // lane. Unreported, the set's cursor never comes to rest
+                    // and a fork or a save of it is refused.
+                    _ => ports.as_ref().and_then(engine::ports::LanePorts::fold),
+                };
+                ends.push(engine::KvWrites {
+                    tag: seated.reports,
+                    fold,
+                    end: placed.then_some(end),
+                    ..engine::KvWrites::default()
+                });
+            }
+            if let (engine::fire::RsVerb::Buffer { folded, fold, .. }, Some(key)) = (&rs, held_key) {
+                let n = match fold {
+                    engine::fire::FoldLen::Host(n) => Some(*n),
+                    engine::fire::FoldLen::Device => {
+                        ports.as_ref().and_then(engine::ports::LanePorts::fold)
+                    }
+                };
+                let to = n.map_or(*folded, |n| {
+                    folded.saturating_add(n).min(first.saturating_add(row.rows))
+                });
+                if to > *folded {
+                    self.frozen_ahead.insert(key, to);
+                }
             }
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) && crate::diag::on().rs_trace {
                 eprintln!(
@@ -4219,7 +4305,25 @@ impl Shell {
 
         let rs_replay: Vec<i32> = rs_plans.iter().map(|plan| plan.replay as i32).collect();
         let rs_commit: Vec<i32> = rs_plans.iter().map(|plan| plan.commit as i32).collect();
-        let rows_ext = rows.saturating_add(rs_plans.iter().map(|plan| plan.replay).sum::<u32>());
+        let carried = rs_plans.iter().map(|plan| plan.replay).sum::<u32>();
+        // The rows the lanes carry in, summed, are no more than the tokens of
+        // the rung the fire stages in (`engine::fire::rung_rows`): the
+        // runtime asks the rung for them, and its rs scratch holds that many
+        // beside the fire's own rows. Where the device places a lane's rows
+        // only the engine counts them; a count past the rung is a wrong
+        // count, refused by name before anything is encoded.
+        let rung_tokens = self.arena.current_tokens();
+        if rs_active && carried > rung_tokens {
+            return Err(Fault::program(
+                "serve::rs",
+                format!(
+                    "this fire's lanes carry {carried} recurrent rows into it, past the \
+                     {rung_tokens} tokens of the rung it stages in (engine::fire::rung_rows); \
+                     the fire is refused and writes nothing"
+                ),
+            ));
+        }
+        let rows_ext = rows.saturating_add(carried);
         let rs_pages = if rs_active {
             self.rs_buffers
                 .as_ref()
@@ -4236,7 +4340,7 @@ impl Shell {
             let have = self.arena.rs_region().1;
             if need > have {
                 return Err(Fault::Ceiling {
-                    what: "bytes of the rung's rs scratch in the span (its rows and the unfolded rows a lane may hold)",
+                    what: "bytes of the rung's rs scratch in the span (its rows and the rows its lanes carry in)",
                     need,
                     have,
                 });
@@ -4641,6 +4745,7 @@ impl Shell {
         let guest = self.guest_carve();
         Ok(Prepared {
             guest,
+            ends,
             lanes,
             input_feeds,
             merge_lands,
@@ -4903,6 +5008,9 @@ pub struct Clips<'a> {
 pub struct Prepared<'a> {
     /// The guest region under this fire's model carve.
     guest: crate::program::GuestCarve,
+    /// What the fire reports where it settles: each port-placed reporting
+    /// lane's written end.
+    ends: Vec<engine::KvWrites>,
     lanes: &'a [Seated<'a>],
     input_feeds: Vec<InputFeedPlan>,
     merge_lands: Vec<MergeLand>,
@@ -4938,6 +5046,9 @@ pub struct Enqueued<'a> {
     attached: Vec<engine::InstanceId>,
     /// Each lane's read-back row: its output's name, width and element bytes.
     readbacks: Vec<Option<(String, u32, u64)>>,
+    /// What the harvest tells the completion sink, where the engine settles
+    /// inside submit.
+    told: Option<Told>,
     step: PhantomData<&'a ()>,
 }
 
@@ -4980,7 +5091,11 @@ struct Flight {
     pending: Pending,
     attached: Vec<engine::InstanceId>,
     readbacks: Vec<Option<(String, u32, u64)>>,
+    told: Option<Told>,
 }
+
+/// A fire's word to its completion sink, given why its buffer failed.
+type Told = Box<dyn Fn(Option<String>) + Send>;
 
 impl engine::frame::Shell for Shell {
     type Step<'a> = StepView<'a>;
@@ -5072,19 +5187,37 @@ impl engine::frame::Shell for Shell {
         let seq = self.airborne.enter();
         let counts = self.airborne.clone();
         let done = prepared.done.take();
+        let ends = std::mem::take(&mut prepared.ends);
         let verdict = self.ane.as_ref().and_then(crate::ane::Ane::verdict);
-        let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
-            counts.leave();
+        // What the fire tells its completion sink once its buffer completed:
+        // its folds and ends, or why it failed.
+        let tell: Told = Box::new(move |refused: Option<String>| {
             let refused = refused.or_else(|| verdict.as_ref().and_then(|verdict| verdict()));
             if let Some(done) = done.as_ref() {
                 let outcome = match &refused {
-                    None => engine::StepOutcome::Committed,
+                    None if ends.is_empty() => engine::StepOutcome::Committed,
+                    None => engine::StepOutcome::Wrote(ends.clone()),
                     Some(why) => engine::StepOutcome::Faulted(format!(
                         "metal command buffer for frame {} step {}: {why}",
                         done.at.frame, done.at.step
                     )),
                 };
                 (done.sink)(done.at, outcome);
+            }
+        });
+        // One frame in flight: the engine settles inside submit, and the sink
+        // has each step's reports before submit returns, told from the
+        // harvest on this thread once the buffer completed. More: the
+        // completion handler tells it.
+        let (in_handler, at_harvest) = if self.arms.depth() == 1 {
+            (None, Some(tell))
+        } else {
+            (Some(tell), None)
+        };
+        let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
+            counts.leave();
+            if let Some(tell) = in_handler.as_ref() {
+                tell(refused);
             }
         })));
         let pending = match pending {
@@ -5106,6 +5239,7 @@ impl engine::frame::Shell for Shell {
             launches: walked.launches,
             attached,
             readbacks,
+            told: at_harvest,
             step: PhantomData,
         })
     }
@@ -5122,6 +5256,7 @@ impl engine::frame::Shell for Shell {
             launches,
             attached,
             readbacks,
+            told,
             step: _,
         } = enqueued;
         self.arms.take(arm);
@@ -5133,6 +5268,7 @@ impl engine::frame::Shell for Shell {
             pending,
             attached,
             readbacks,
+            told,
         });
         Ok(Landed {
             seq,

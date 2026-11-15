@@ -33,9 +33,7 @@ impl Pipeline {
         Self {
             fires,
             scope: crate::store::PipelineScope::failing_as(failure.clone(), move || {
-                weak_fires
-                    .upgrade()
-                    .is_none_or(|fires| fires.lock().unwrap().is_empty())
+                weak_fires.upgrade().is_none_or(|fires| fires.drained())
             }),
             failure,
             frame_seq: std::sync::atomic::AtomicU64::new(0),

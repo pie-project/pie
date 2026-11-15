@@ -139,6 +139,30 @@ pub(crate) fn handles_settled(
     let _ = CLIENT_SERVICES.send(&client_id, SessionMessage::HandlesSettled(settled));
 }
 
+/// A session that only hears where a process's end left its handles.
+#[cfg(test)]
+pub(crate) fn hear_handles_settled(
+    client_id: ClientId,
+) -> mpsc::UnboundedReceiver<Vec<(client_api::HandleName, crate::handle::Landing)>> {
+    struct Hearing(mpsc::UnboundedSender<Vec<(client_api::HandleName, crate::handle::Landing)>>);
+
+    impl ServiceHandler for Hearing {
+        type Message = SessionMessage;
+
+        async fn handle(&mut self, msg: SessionMessage) {
+            if let SessionMessage::HandlesSettled(settled) = msg {
+                let _ = self.0.send(settled);
+            }
+        }
+    }
+
+    let (heard, hears) = mpsc::unbounded_channel();
+    CLIENT_SERVICES
+        .spawn(client_id, || Hearing(heard))
+        .expect("no session has this id");
+    hears
+}
+
 /// The worker policy dropped the handle it knows as `id`.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn discard_handle(client_id: ClientId, id: ProcessId, why: String) {

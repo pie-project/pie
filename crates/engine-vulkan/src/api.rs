@@ -73,7 +73,8 @@ impl Host for Api {
             // The sampler lands on its own and reports the step;
             // the next frame's forward reads its token on the
             // device, so nothing here waits.
-            defer_attachment(gpu, step, at, &landed)?;
+            let wrote = std::mem::take(&mut step_pending.wrote);
+            defer_attachment(gpu, step, at, &landed, wrote)?;
             let shell = gpu.loaded_mut()?;
             shell.leave_unread(&landed);
             shell.forget_seat(&landed);
@@ -101,7 +102,13 @@ impl Host for Api {
         }
         if defers && let Some(sink) = gpu.sink.as_ref() {
             // The forward's own report was held for the sampler.
-            (sink)(at, engine::StepOutcome::Committed);
+            let wrote = std::mem::take(&mut step_pending.wrote);
+            let outcome = if wrote.is_empty() {
+                engine::StepOutcome::Committed
+            } else {
+                engine::StepOutcome::Wrote(wrote)
+            };
+            (sink)(at, outcome);
         }
         Ok((ticket, step_pending))
     }
@@ -226,6 +233,7 @@ fn defer_attachment(
     step: &Step,
     at: engine::StepDone,
     landed: &Landed,
+    wrote: Vec<engine::KvWrites>,
 ) -> EngineResult<()> {
     #[cfg(feature = "vulkan")]
     {
@@ -240,14 +248,14 @@ fn defer_attachment(
             .ok_or_else(|| Error::Load("the vulkan engine has no model loaded".into()))?;
         let attachment = &step.attachments[0];
         let seats = lane_seats(shell, landed, attachment);
-        let done = sink.clone().map(|sink| Done { at, sink });
+        let done = sink.clone().map(|sink| Done { at, sink, wrote });
         programs
             .fire_deferred(attachment.instance, shell.device(), seats, done)
             .map_err(refusal)
     }
     #[cfg(not(feature = "vulkan"))]
     {
-        let _ = (gpu, step, at, landed);
+        let _ = (gpu, step, at, landed, wrote);
         Err(Error::unsupported("vulkan", "a deferred guest pass"))
     }
 }

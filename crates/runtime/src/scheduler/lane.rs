@@ -445,6 +445,15 @@ impl Lane {
                         outcome,
                     });
                 }));
+            } else {
+                // A frame settled inside `submit` answers through its
+                // result. What its lanes wrote is told here before `submit`
+                // returns, so it is kept before the frame's cells settle.
+                engine.on_complete(std::sync::Arc::new(|_, outcome| {
+                    if let engine::StepOutcome::Wrote(writes) = outcome {
+                        crate::pipeline::fire::record_kv_writes(writes);
+                    }
+                }));
             }
         }
         let mut stash: Option<LaneRequest> = None;

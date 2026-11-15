@@ -146,6 +146,23 @@ impl Arena {
         self.current
     }
 
+    /// Each rung's tokens and the bytes of its rs scratch.
+    #[must_use]
+    pub fn rs_rooms(&self) -> Vec<(u32, u64)> {
+        self.rungs
+            .iter()
+            .zip(&self.rs)
+            .map(|((tokens, _), &bytes)| (*tokens, bytes))
+            .collect()
+    }
+
+    /// The tokens of the rung frames stage in now: what its rs scratch
+    /// holds of the rows a fire's lanes carry in.
+    #[must_use]
+    pub fn current_tokens(&self) -> u32 {
+        self.rungs.get(self.current).map_or(0, |(tokens, _)| *tokens)
+    }
+
     /// The staged regions' bytes at rung `index`, every frame's.
     fn io_total(&self, index: usize) -> u64 {
         self.arms * self.io.get(index).copied().map_or(0, io_room)

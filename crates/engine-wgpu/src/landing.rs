@@ -131,7 +131,7 @@ impl Landing {
         );
         if let Some(done) = done {
             let outcome = match refused {
-                None => engine::StepOutcome::Committed,
+                None => done.settled(),
                 Some(why) => engine::StepOutcome::Faulted(format!(
                     "wgpu command buffer for frame {} step {}: {why}",
                     done.at.frame, done.at.step

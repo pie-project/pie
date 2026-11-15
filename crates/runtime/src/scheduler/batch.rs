@@ -23,6 +23,10 @@ pub(crate) struct StepBuild {
 pub(crate) struct RequestCapacityUsage {
     pub(crate) forward_requests: usize,
     pub(crate) forward_tokens: usize,
+    /// The recurrent rows the request carries unfolded into its fire: a
+    /// step carries no more than its rung's tokens of them, as of its own
+    /// rows ([`::engine::fire::rung_rows`]).
+    pub(crate) carried_rows: usize,
     pub(crate) page_refs: usize,
 }
 
@@ -33,6 +37,7 @@ pub(crate) fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> Re
     RequestCapacityUsage {
         forward_requests,
         forward_tokens: req.request.tokens(),
+        carried_rows: req.request.carried as usize,
         page_refs: req.request.pages().count(),
     }
 }
@@ -99,6 +104,7 @@ pub(crate) struct StepGroup {
     ring_ends: HashSet<RingEnd>,
     forward_requests: usize,
     forward_tokens: usize,
+    carried_rows: usize,
     page_refs: usize,
     /// Lanes taken, and whether any decodes: a step of prompts only holds
     /// no more than `prefill_lanes`.
@@ -174,6 +180,7 @@ impl StepGroup {
         }
         self.forward_requests.saturating_add(usage.forward_requests) <= limits.max_forward_requests
             && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
+            && self.carried_rows.saturating_add(usage.carried_rows) <= limits.max_forward_tokens
             && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs
     }
 
@@ -194,12 +201,14 @@ impl StepGroup {
         self.ring_ends.extend(ring_ends(request));
         self.forward_requests = self.forward_requests.saturating_add(usage.forward_requests);
         self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
+        self.carried_rows = self.carried_rows.saturating_add(usage.carried_rows);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
         self.lanes = self.lanes.saturating_add(request.request.lanes.len());
         self.decoding |= decodes(request);
         (limits.prefill_lanes > 0 && !self.decoding && self.lanes >= limits.prefill_lanes)
             || self.forward_requests >= limits.max_forward_requests
             || self.forward_tokens >= limits.max_forward_tokens
+            || self.carried_rows >= limits.max_forward_tokens
             || self.page_refs >= limits.max_page_refs
     }
 }
@@ -451,6 +460,7 @@ mod tests {
         a_step_of_prompts_only_stops_at_the_engines_prefill_lanes();
         fires_moving_one_ring_end_go_a_step_apart_in_the_order_they_stand();
         a_seal_that_dispatches_the_later_putter_first_gives_it_the_earlier_cell();
+        a_step_carries_no_more_than_its_rungs_tokens();
     }
 
     /// The fires of `dispatch`'s frames, each fire id standing for the
@@ -617,6 +627,42 @@ mod tests {
             group.accepts(&ring_fire(3, &[(7, true, false)]), limits(), 16),
             "the other end"
         );
+    }
+
+    /// A step's lanes share one rung's replay scratch, which holds the
+    /// rung's tokens of carried rows: requests carrying more between them
+    /// take steps of their own, and ones carrying none step as before.
+    fn a_step_carries_no_more_than_its_rungs_tokens() {
+        let carrying = |instance: u64, carried: u32| {
+            let mut request = decode(9, 1);
+            request.carried = carried;
+            pending(request, InstanceId(instance))
+        };
+        let cap = u32::try_from(limits().max_forward_tokens).unwrap();
+        let mut group = StepGroup::default();
+        assert!(!group.push(&carrying(1, cap - 10), limits(), 16));
+        assert!(
+            group.accepts(&carrying(2, 0), limits(), 16),
+            "carrying none"
+        );
+        assert!(
+            group.accepts(&carrying(2, 10), limits(), 16),
+            "up to the rung"
+        );
+        assert!(
+            !group.accepts(&carrying(2, 11), limits(), 16),
+            "past the rung's tokens of carried rows"
+        );
+        assert!(
+            group.push(&carrying(2, 10), limits(), 16),
+            "full at the rung's tokens carried"
+        );
+        // Carrying none, a step fills by its rows alone.
+        let mut plain = StepGroup::default();
+        for at in 1..=4 {
+            assert!(plain.accepts(&carrying(at, 0), limits(), 16));
+            assert!(!plain.push(&carrying(at, 0), limits(), 16));
+        }
     }
 
     /// The engine holds a body for no more than `prefill_lanes` lanes of
