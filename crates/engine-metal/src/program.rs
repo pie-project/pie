@@ -702,7 +702,16 @@ impl Plane {
                             prepared.seat_scratch(room.take(prepared.scratch_bytes())?);
                         }
                         #[cfg(target_vendor = "apple")]
-                        room.zero_since(mark, frame)?;
+                        {
+                            room.zero_since(mark, frame)?;
+                            #[cfg(feature = "test-slot-fill")]
+                            {
+                                for prepared in group.iter() {
+                                    prepared.poison_hollow(frame)?;
+                                }
+                                frame.next_pass()?;
+                            }
+                        }
                         for prepared in group {
                             for region in stage.regions.iter() {
                                 prepared.encode_into(frame, region)?;

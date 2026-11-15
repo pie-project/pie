@@ -243,6 +243,10 @@ pub struct Region {
     pub steps: Arc<Vec<StreamedStep>>,
     pub form: Form,
     pub module: Arc<Module>,
+    /// A streamed region's nodes as its dispatches compute them, a group a
+    /// run of steps that share a node (`launch::launches`); empty where the
+    /// emitter published no node lists or the region is one dispatch.
+    pub launches: Arc<Vec<Vec<u32>>>,
 }
 
 impl Region {
@@ -510,6 +514,7 @@ impl Cache {
                 steps: Arc::new(Vec::new()),
                 form: Form::Fused,
                 module,
+                launches: Arc::new(Vec::new()),
             });
         }
         Ok(Stage {
@@ -625,6 +630,7 @@ impl Cache {
                 Form::Grouped
             },
             module,
+            launches: Arc::new(Vec::new()),
         }))
     }
 
@@ -652,6 +658,10 @@ impl Cache {
                 } => (source, entry, steps),
                 _ => return Ok(None),
             };
+        let (table, step_nodes) = eta_compiler::codegen::metal::step_node_table(table);
+        let launches = step_nodes
+            .map(|nodes| launch_groups(&nodes, &plan.fused[region_index as usize].nodes))
+            .unwrap_or_default();
         let mut steps = Vec::with_capacity(table.len());
         for &word in table {
             let value = eta_compiler::codegen::metal::step_value(word);
@@ -682,6 +692,7 @@ impl Cache {
             steps: Arc::new(steps),
             form: Form::Streamed,
             module,
+            launches: Arc::new(launches),
         }))
     }
 
@@ -706,6 +717,49 @@ impl Cache {
             })
         }
     }
+}
+
+/// A streamed region's launches from the nodes each of its steps computes:
+/// a run of steps any of whose nodes another step of the run also computes
+/// is one launch (a node's bytes live from its first step to its last).
+/// Empty, and the region one launch, where a node of `region` is in no
+/// step's list: what the emitter did not account for gets no reuse.
+fn launch_groups(step_nodes: &[Vec<u32>], region: &[u32]) -> Vec<Vec<u32>> {
+    let listed = |node: u32| step_nodes.iter().any(|nodes| nodes.contains(&node));
+    if !region.iter().all(|&node| listed(node)) {
+        return Vec::new();
+    }
+    let last_of = |node: u32| {
+        step_nodes
+            .iter()
+            .rposition(|nodes| nodes.contains(&node))
+            .unwrap_or(0)
+    };
+    let mut groups = Vec::new();
+    let mut step = 0;
+    while step < step_nodes.len() {
+        let mut end = step;
+        let mut at = step;
+        while at <= end {
+            for &node in &step_nodes[at] {
+                end = end.max(last_of(node));
+            }
+            at += 1;
+        }
+        let mut group: Vec<u32> = Vec::new();
+        for nodes in &step_nodes[step..=end] {
+            for &node in nodes {
+                if !group.contains(&node) {
+                    group.push(node);
+                }
+            }
+        }
+        if !group.is_empty() {
+            groups.push(group);
+        }
+        step = end + 1;
+    }
+    groups
 }
 
 #[cfg(test)]
@@ -762,3 +816,4 @@ mod tests {
         );
     }
 }
+

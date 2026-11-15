@@ -638,6 +638,19 @@ impl Frame {
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     pub(crate) fn fill(&mut self, slab: &super::alloc::Slab, at: u64, len: u64) -> Result<()> {
+        self.fill_with(slab, at, len, 0)
+    }
+
+    /// `len` bytes of `slab` from `at` set to `value`, in a blit pass.
+    #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    pub(crate) fn fill_with(
+        &mut self,
+        slab: &super::alloc::Slab,
+        at: u64,
+        len: u64,
+        value: u8,
+    ) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
             if len == 0 {
@@ -661,7 +674,7 @@ impl Frame {
                     location: at as usize,
                     length: len as usize,
                 },
-                0,
+                value,
             );
             Ok(())
         }

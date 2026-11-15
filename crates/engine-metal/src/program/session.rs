@@ -111,7 +111,7 @@ impl Session {
         let mut widest = 0;
         for (index, plan) in compiled.plans.iter().enumerate() {
             if launches(compiled, index) {
-                widest = widest.max(Prepared::scratch_for(plan, extents)?);
+                widest = widest.max(Prepared::scratch_for(plan, &compiled.stages[index].regions, extents)?);
             }
         }
         Ok(widest)
@@ -180,6 +180,7 @@ impl Session {
             prepared.push(if launches(compiled, index) {
                 Some(Prepared::build(
                     stage_plan,
+                    &compiled.stages[index].regions,
                     &shapes,
                     extents,
                     rows,
