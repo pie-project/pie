@@ -64,6 +64,8 @@ impl Serve for Api {
     /// (`guest::session::Kept`).
     const CHANNEL_CELLS: bool = true;
 
+    const TARGET: kernels_slang::Target = kernels_slang::Target::Spirv;
+
     fn table_align(device: &Context) -> u64 {
         device.table_align()
     }
@@ -97,19 +99,12 @@ impl Serve for Api {
         pipelines.compiled()
     }
 
-    fn measures_outside(device: &Context) -> bool {
-        device.enabled().memory_budget
+    fn built_since(pipelines: &Pipelines, from: u64) -> Vec<&'static str> {
+        pipelines.built_since(from)
     }
 
-    fn builds(device: &Context, key: &str, tier: &str) -> bool {
-        // A tactic fires at the baseline, the subgroup tier or, where the
-        // device has them, cooperative matrices.
-        let runs = match tier {
-            "baseline" | "subgroup" => true,
-            "coopmat" => device.enabled().coopmat,
-            _ => false,
-        };
-        runs && kernels_slang::spirv(key).is_some()
+    fn hold(device: &Context, unit: &'static str, key: &'static str) -> Result<()> {
+        Pipelines::hold(device, unit, key)
     }
 
     fn build(

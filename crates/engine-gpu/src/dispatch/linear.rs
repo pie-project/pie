@@ -3,6 +3,7 @@ use poem_ir::{Linear, Operands};
 
 use crate::backend::{Backend, Tactics as _};
 use crate::run::Run;
+use kernels_slang::linear::moe::select;
 
 impl<B: Backend> DispatchLinear for Run<'_, B> {
     fn dispatch(&mut self, op: &Linear) -> Result<(), KernelError> {
@@ -41,7 +42,7 @@ impl<B: Backend> Run<'_, B> {
                 Some(bank) => {
                     let capacity = self.capacity(*act).min(self.capacity(*y));
                     let (act, y) = (self.tensor(*act), self.tensor(*y));
-                    let ladder = self.tuning().qmm_ladder(act.rows, y.width, act.width, bank);
+                    let ladder = self.qmm_ladder(act, y, bank, capacity);
                     kernels_slang::linear::qmm::matmul(self.ctx, &ladder, act, bank, y, capacity)
                 }
 
@@ -73,7 +74,7 @@ impl<B: Backend> Run<'_, B> {
                 Some(bank) => {
                     let capacity = self.capacity(*act).min(self.capacity(*y));
                     let (act, y) = (self.tensor(*act), self.tensor(*y));
-                    let ladder = self.tuning().qmm_ladder(act.rows, y.width, act.width, bank);
+                    let ladder = self.qmm_ladder(act, y, bank, capacity);
                     kernels_slang::linear::qmm::lm_head(self.ctx, &ladder, act, bank, y, capacity)
                 }
 
@@ -516,67 +517,76 @@ impl<B: Backend> Run<'_, B> {
                 let routed = self.tensor(*routes);
                 if let Some(table) = self.expert_table(OP, Some(*bank), *bias, routed)? {
                     let scheme = self.scheme(*bank);
-                    if let Some(scratch) = self.routed_scratch()
-                        && self.batched_tabled(
-                            OP,
-                            self.tensor(*x),
-                            scheme,
-                            bias.is_some(),
-                            &table,
-                            routed,
-                            self.experts(*routes),
-                            scratch,
-                            self.tensor(*y),
-                        )?
-                    {
-                        return Ok(());
-                    }
-                    return kernels_slang::linear::moe::select::matmul_select_quant_tabled(
-                        self.ctx,
-                        self.tuning().routed_tier(self.tier()),
-                        self.tensor(*x),
-                        scheme,
-                        bias.is_some(),
-                        &table,
-                        routed,
-                        self.tensor(*y),
+                    let experts = self.experts(*routes);
+                    let capacity = self.capacity(*y);
+                    let (x, y) = (self.tensor(*x), self.tensor(*y));
+                    return self.routed(
+                        capacity,
+                        y.rows,
+                        experts,
+                        |scratch, batch| {
+                            select::matmul_select_batched_tabled(
+                                self.ctx,
+                                OP,
+                                x,
+                                scheme,
+                                bias.is_some(),
+                                &table,
+                                routed,
+                                experts,
+                                scratch,
+                                y,
+                                batch,
+                            )
+                        },
+                        || {
+                            select::matmul_select_quant_tabled(
+                                self.ctx,
+                                self.tuning().routed_tier(self.tier()),
+                                x,
+                                scheme,
+                                bias.is_some(),
+                                &table,
+                                routed,
+                                y,
+                            )
+                        },
                     );
                 }
                 let planes = self.planes(*bank);
                 let bias_plane = bias.map(|b| self.tensor(b));
-                if let Some(scratch) = self.routed_scratch()
-                    && self.batched(
-                        OP,
-                        self.tensor(*x),
-                        planes,
-                        bias_plane,
-                        routed,
-                        self.experts(*routes),
-                        scratch,
-                        self.tensor(*y),
-                    )?
-                {
-                    return Ok(());
-                }
-                match bias_plane {
-                    Some(bias_plane) => kernels_slang::linear::moe::select::matmul_select_bias(
-                        self.ctx,
-                        self.tuning().routed_tier(self.tier()),
-                        self.tensor(*x),
-                        planes,
-                        bias_plane,
-                        routed,
-                        self.tensor(*y),
-                    ),
-                    None => kernels_slang::linear::moe::select::matmul_select_quant(
-                        self.ctx,
-                        self.tuning().routed_tier(self.tier()),
-                        self.tensor(*x),
-                        planes,
-                        routed,
-                        self.tensor(*y),
-                    ),
-                }
+                let experts = self.experts(*routes);
+                let capacity = self.capacity(*y);
+                let (x, y) = (self.tensor(*x), self.tensor(*y));
+                self.routed(
+                    capacity,
+                    y.rows,
+                    experts,
+                    |scratch, batch| {
+                        select::matmul_select_batched(
+                            self.ctx, OP, x, planes, bias_plane, routed, experts, scratch, y, batch,
+                        )
+                    },
+                    || match bias_plane {
+                        Some(bias_plane) => select::matmul_select_bias(
+                            self.ctx,
+                            self.tuning().routed_tier(self.tier()),
+                            x,
+                            planes,
+                            bias_plane,
+                            routed,
+                            y,
+                        ),
+                        None => select::matmul_select_quant(
+                            self.ctx,
+                            self.tuning().routed_tier(self.tier()),
+                            x,
+                            planes,
+                            routed,
+                            y,
+                        ),
+                    },
+                )
             }
 
             // The forms no builder makes.
@@ -660,52 +670,63 @@ impl<B: Backend> Run<'_, B> {
     fn gemm_tactic(&self) -> kernels_slang::linear::gemm::Tactic {
         self.tuning().gemm(self.tier())
     }
+
+    /// The `kernel.qmm` rungs a matmul tries, in order, at its rows; to a
+    /// naming sink every rung a batch the capacity holds reaches.
+    fn qmm_ladder(
+        &self,
+        act: kernels_slang::Tensor,
+        y: kernels_slang::Tensor,
+        bank: kernels_slang::Bank,
+        capacity: u32,
+    ) -> Vec<kernels_slang::linear::qmm::Qmm> {
+        match self.ctx.naming() {
+            Some(_) => self.tuning().qmm_rungs(capacity, y.width, act.width, bank),
+            None => self.tuning().qmm_ladder(act.rows, y.width, act.width, bank),
+        }
+    }
 }
 
 impl<B: Backend> Run<'_, B> {
-    /// The tiles and sort a batched route runs at on this device.
-    fn batch(&self, pairs: u32, experts: u32) -> kernels_slang::linear::moe::select::Batch {
-        self.tuning().batch(pairs, experts)
-    }
-
-    /// [`Run::batched`] over a bank read through `table`.
-    #[allow(clippy::too_many_arguments)]
-    fn batched_tabled(
+    /// A routed matmul of `pairs` pairs: `batched` over sorted expert tiles
+    /// at the device's tile rows, sort width and tier where the load
+    /// reserved the routed scratch and the shape serves it (it answers
+    /// whether it fired), else `select`, a pair a row. A naming sink is told
+    /// every way a route of up to `capacity` pairs goes: `batched` at each
+    /// tile some count of them sorts into, over the fewest rows it sorts,
+    /// and `select`.
+    fn routed(
         &self,
-        op: &'static str,
-        x: kernels_slang::Tensor,
-        scheme: kernels_slang::Bank,
-        biased: bool,
-        table: &kernels_slang::linear::moe::select::ExpertTable,
-        routes: kernels_slang::Tensor,
+        capacity: u32,
+        pairs: u32,
         experts: u32,
-        scratch: kernels_slang::linear::moe::select::RoutedScratch,
-        y: kernels_slang::Tensor,
-    ) -> Result<bool, kernels_slang::Error> {
-        let batch = self.batch(y.rows, experts);
-        kernels_slang::linear::moe::select::matmul_select_batched_tabled(
-            self.ctx, op, x, scheme, biased, table, routes, experts, scratch, y, batch,
-        )
-    }
-
-    /// The routed matmul over sorted expert tiles, at the device's tile
-    /// rows, sort width and tier; `Ok(false)` where it declines.
-    #[allow(clippy::too_many_arguments)]
-    fn batched(
-        &self,
-        op: &'static str,
-        x: kernels_slang::Tensor,
-        bank: kernels_slang::Bank,
-        bias: Option<kernels_slang::Tensor>,
-        routes: kernels_slang::Tensor,
-        experts: u32,
-        scratch: kernels_slang::linear::moe::select::RoutedScratch,
-        y: kernels_slang::Tensor,
-    ) -> Result<bool, kernels_slang::Error> {
-        let pairs = y.rows;
-        let batch = self.batch(pairs, experts);
-        kernels_slang::linear::moe::select::matmul_select_batched(
-            self.ctx, op, x, bank, bias, routes, experts, scratch, y, batch,
-        )
+        batched: impl Fn(select::RoutedScratch, select::Batch) -> Result<bool, kernels_slang::Error>,
+        select: impl FnOnce() -> Result<(), kernels_slang::Error>,
+    ) -> Result<(), kernels_slang::Error> {
+        let Some(scratch) = self.routed_scratch() else {
+            return select();
+        };
+        let batch = self.tuning().batch(pairs, experts);
+        let Some(names) = self.ctx.naming() else {
+            if batched(scratch, batch)? {
+                return Ok(());
+            }
+            return select();
+        };
+        names.fork();
+        for tile in self.tuning().moe_tiles(capacity, experts) {
+            batched(
+                scratch,
+                select::Batch {
+                    tile,
+                    padded: tile,
+                    ..batch
+                },
+            )?;
+            names.or();
+        }
+        select()?;
+        names.join();
+        Ok(())
     }
 }

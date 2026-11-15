@@ -109,6 +109,61 @@ pub trait Encode {
     fn rendezvous(&self, _op: &'static str) -> Result<(), Error> {
         Ok(())
     }
+
+    /// The sink's naming side, where it names kernels and fires none: a
+    /// host that picks its kernel by the rows of a fire then states every
+    /// kernel its widths allow ([`Naming::either`]) and fires nothing.
+    fn naming(&self) -> Option<&dyn Naming> {
+        None
+    }
+}
+
+/// A sink that takes the kernels a load can fire, before any fire states
+/// its rows.
+pub trait Naming {
+    /// One dispatch a host makes with whichever of `alternatives` its rows
+    /// pick.
+    fn either(&self, alternatives: &[Fire]) -> Result<(), Error>;
+
+    /// Opens the ways a host goes by a fire's rows, each a run of
+    /// dispatches: what is named until [`Naming::or`] or [`Naming::join`]
+    /// is the first way.
+    fn fork(&self);
+
+    /// Ends one way and opens the next.
+    fn or(&self);
+
+    /// Ends the last way: a fire makes the dispatches of one of them, so
+    /// the host counts as the longest and names the kernels of all.
+    fn join(&self);
+
+    /// The most rows a fire of the load may bring: a host whose dispatches
+    /// grow with a fire's rows counts at these, not at the naming fire's.
+    fn most_rows(&self) -> u32;
+}
+
+/// Every kernel `pick` answers over `breaks`, the row counts its answer
+/// changes at: each once, in the order first met.
+pub fn every(
+    breaks: &[u32],
+    pick: impl Fn(u32) -> Result<Fire, Error>,
+) -> Result<Vec<Fire>, Error> {
+    let mut all: Vec<Fire> = Vec::with_capacity(breaks.len());
+    for &rows in breaks {
+        distinct(&mut all, pick(rows)?);
+    }
+    Ok(all)
+}
+
+/// `fire` joins `all` unless its kernel is already there: a kernel is its
+/// entry at its tier, whatever grid it launches.
+pub(crate) fn distinct(all: &mut Vec<Fire>, fire: Fire) {
+    if !all
+        .iter()
+        .any(|held| held.entrypoint == fire.entrypoint && held.tier == fire.tier)
+    {
+        all.push(fire);
+    }
 }
 
 pub type Ctx<'a> = dyn Encode + 'a;

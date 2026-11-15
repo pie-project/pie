@@ -131,6 +131,19 @@ impl<T: Decision> Ladder<T> {
             .map(|(_, value)| value)
     }
 
+    /// Every rung whose region meets `cell`, a set per declared variable,
+    /// in order and before its value is asked whether it fits: the rungs
+    /// some shape of the cell can reach, for code that must know every
+    /// value a range of shapes picks before any of them is stated.
+    pub fn meeting<'a>(&'a self, cell: &[Set]) -> impl Iterator<Item = &'a T> {
+        self.mark();
+        let cell = Region::full(cell);
+        self.rungs
+            .iter()
+            .filter(move |(region, _)| !region.intersect(&cell).is_empty())
+            .map(|(_, value)| value)
+    }
+
     /// Every value the ladder can pick, for sizing an envelope.
     pub fn values(&self) -> impl Iterator<Item = &T> {
         self.rungs.iter().map(|(_, v)| v)

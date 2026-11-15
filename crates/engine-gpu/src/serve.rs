@@ -22,6 +22,7 @@ use crate::backend::{Backend, Buffer as _, Context as _, Frame as _, Pending as 
 use crate::error::{Fault, Result};
 use crate::handles::Handles;
 use crate::inputs::Inputs;
+use crate::named::Named;
 use crate::run::{CacheGeometry, CacheTable, FireBindings, FireTables, Run, Scored, SlotTable};
 use crate::settle::{Airborne, Arms, Done};
 use crate::store::Pools;
@@ -79,6 +80,9 @@ pub trait Serve: Backend {
     /// of a ring lies on the host.
     const CHANNEL_CELLS: bool;
 
+    /// The target the backend's kernels are instantiated for.
+    const TARGET: kernels_slang::Target;
+
     /// The bytes a guest's launch table is aligned to in its `Instance`
     /// slot: 16 at least, and whatever the device asks of a buffer
     /// binding's offset.
@@ -118,15 +122,15 @@ pub trait Serve: Backend {
     /// The pipelines compiled so far.
     fn compiled(pipelines: &Self::Pipelines) -> u64;
 
-    /// Whether the device reports what the driver holds beside the
-    /// reservations ([`Context::outside`](crate::backend::Context::outside)),
-    /// so a pipeline's share of it can be measured.
-    fn measures_outside(device: &Self::Context) -> bool;
+    /// The kernels whose pipelines were built after the first `from`, in
+    /// the order built.
+    fn built_since(pipelines: &Self::Pipelines, from: u64) -> Vec<&'static str>;
 
-    /// Whether `pipelines` could build instantiation `key` (at `tier`, as
-    /// [`kernels_slang::CENSUS`] names it) on `device`: this build carries
-    /// its module and a fire on the device may name that tier.
-    fn builds(device: &Self::Context, key: &str, tier: &str) -> bool;
+    /// Holds instantiation `key` of `unit` to what `device` binds a shader
+    /// stage, before it is built and before the load reserves anything: one
+    /// the device cannot bind is refused by its name, its count and the
+    /// limit, never as a pipeline that failed to build.
+    fn hold(device: &Self::Context, unit: &'static str, key: &'static str) -> Result<()>;
 
     /// Builds instantiation `key` of `unit` into `pipelines`.
     fn build(
@@ -275,6 +279,22 @@ pub struct Boot<'a, B: Serve> {
     pub residency: engine::load::Residency,
 
     pub handed: Option<B::Handed>,
+}
+
+/// A load fitted to its device: the device, its tuning and tier, and the
+/// budgets and profile the fit left. One fit serves the naming load and the
+/// real one, each of which compiles from it at the top its device binds
+/// ([`Shell::raise`]), so neither can pick a rung the other does not.
+struct Fitted<B: Serve> {
+    device: B::Context,
+    tuning: B::Tuning,
+    tier: kernels_slang::Tier,
+    budgets: Budgets,
+    profile: DeviceProfile,
+    /// Every pipeline a fire of the load asks for, built.
+    pipelines: B::Pipelines,
+    /// What they were named from.
+    asks: Asks,
 }
 
 const PATCH_ROUTE_DROP: i32 = -1;
@@ -600,6 +620,21 @@ pub struct Shell<B: Serve> {
 
     pipelines: B::Pipelines,
 
+    /// What the load named of its fires before it built or reserved.
+    asks: Asks,
+
+    /// The pipelines built as of the last count ([`Shell::built_serving`]).
+    built: u64,
+
+    /// The steps walked to be kept since the last count
+    /// ([`Shell::recorded_serving`]).
+    recorded: u64,
+
+    /// The most dispatches a walked fire's frame encoded, and the most
+    /// launches a walked fire made of its regions, since the last count
+    /// ([`Shell::walked_serving`]).
+    walked: (u64, u32),
+
     pub handles: Handles<B>,
     trace: Trace,
     compiled: CompiledModel,
@@ -687,6 +722,48 @@ pub struct Shell<B: Serve> {
 
 impl<B: Serve> Shell<B> {
     pub fn load(boot: Boot<'_, B>) -> Result<Shell<B>> {
+        let (boot, mut fitted) = Shell::fit(boot)?;
+        let asks = Shell::name(&boot, &fitted, None)?;
+        let device = &fitted.device;
+
+        // Each is held to what the device binds a stage, by name, and then
+        // built, before the load reserves anything: what the device has
+        // left is then past every pipeline a fire of this load asks for.
+        for kernel in &asks.kernels {
+            B::hold(device, kernel.unit, kernel.key)?;
+        }
+        let pipelines = B::Pipelines::default();
+        let held = device.outside();
+        for kernel in &asks.kernels {
+            B::build(device, &pipelines, kernel.unit, kernel.key)?;
+        }
+        tracing::info!(
+            kernels = asks.kernels.len(),
+            named = ?asks.kernels.iter().map(|kernel| kernel.key).collect::<Vec<_>>(),
+            dispatches = asks.dispatches,
+            driver = device.outside().saturating_sub(held),
+            "every pipeline a fire of this load asks for is named by a walk that fires \
+             nothing, and built before the load reserves"
+        );
+        fitted.pipelines = pipelines;
+        fitted.asks = asks;
+        Shell::raise(boot, fitted)
+    }
+
+    /// What a load of `boot` names from its fires at `rung` alone, or where
+    /// [`Shell::load`] names them where `None`: a fire of
+    /// each class and of every mix that cuts a region, staged and walked
+    /// into a sink that fires nothing. Nothing is reserved.
+    pub fn named_at(boot: Boot<'_, B>, rung: Option<u32>) -> Result<Asks> {
+        let (boot, fitted) = Shell::fit(boot)?;
+        Shell::name(&boot, &fitted, rung)
+    }
+
+    /// Opens the device `boot` names and fits the load to it: the trace
+    /// fused for the device, admitted, its budgets and slots fitted. Nothing
+    /// is compiled, built or reserved: each raise compiles at the top its
+    /// device binds.
+    fn fit(boot: Boot<'_, B>) -> Result<(Boot<'_, B>, Fitted<B>)> {
         let mut boot = boot;
         let (device, mut tuning) = B::open(boot.device, boot.residency.device, boot.handed.take())?;
         let tier = B::tier(&device);
@@ -698,14 +775,11 @@ impl<B: Serve> Shell<B> {
             ..boot
         };
         B::admit(&device, &mut tuning, tier, &boot.trace)?;
-        let chip = tuning.profile();
-        let weights_held = boot.residency.weights_held;
-        let kv_budget = boot.residency.device_kv_budget;
-        let host_kv_budget = boot.residency.host_kv_budget;
 
         let profile = boot
             .profile
-            .unwrap_or_else(|| DeviceProfile::of(chip, device.cores(), &[], &[]));
+            .take()
+            .unwrap_or_else(|| DeviceProfile::of(tuning.profile(), device.cores(), &[], &[]));
 
         let budgets = {
             let base = match boot.patches.clone() {
@@ -729,6 +803,81 @@ impl<B: Serve> Shell<B> {
                 boot.runahead.frames_in_flight,
             );
         }
+        Ok((
+            boot,
+            Fitted {
+                device,
+                tuning,
+                tier,
+                budgets,
+                profile,
+                pipelines: B::Pipelines::default(),
+                asks: Asks::default(),
+            },
+        ))
+    }
+
+    /// The load's own code against a backend that reserves nothing: the
+    /// shell it raises is walked for every kernel a fire of this load can
+    /// ask for, at `rung` or where a load names them, before the device
+    /// holds a byte of the model.
+    fn name(boot: &Boot<'_, B>, fitted: &Fitted<B>, rung: Option<u32>) -> Result<Asks> {
+        let Fitted {
+            device,
+            tuning,
+            tier,
+            budgets,
+            profile,
+            ..
+        } = fitted;
+        let named = Shell::<Named<B>>::raise(
+            Boot {
+                trace: boot.trace.clone(),
+                contract: boot.contract,
+                checkpoint: boot.checkpoint,
+                budget: boot.budget.clone(),
+                patches: boot.patches.clone(),
+                voxels: boot.voxels.clone(),
+                profile: None,
+                page_size: boot.page_size,
+                context: boot.context,
+                slots: boot.slots,
+                runahead: boot.runahead,
+                device: boot.device,
+                residency: boot.residency.clone(),
+                handed: None,
+            },
+            Fitted {
+                device: crate::named::Facts::of::<B>(device),
+                tuning: tuning.clone(),
+                tier: *tier,
+                budgets: budgets.clone(),
+                profile: profile.clone(),
+                pipelines: Default::default(),
+                asks: Asks::default(),
+            },
+        )?;
+        named.asks(rung)
+    }
+
+    /// Raises the shell of a load fitted to its device: every reservation
+    /// the model serves from, in the one order, on whatever backend `B` is.
+    /// A naming load ([`Named`]) runs this same code and reserves nothing.
+    fn raise(boot: Boot<'_, B>, fitted: Fitted<B>) -> Result<Shell<B>> {
+        let Fitted {
+            device,
+            tuning,
+            tier,
+            mut budgets,
+            profile,
+            pipelines,
+            asks,
+        } = fitted;
+        let mut boot = boot;
+        let weights_held = boot.residency.weights_held;
+        let kv_budget = boot.residency.device_kv_budget;
+        let host_kv_budget = boot.residency.host_kv_budget;
+
         let facts = kv::probe(&boot.trace)?;
 
         let handles = Handles::new();
@@ -1199,11 +1348,9 @@ impl<B: Serve> Shell<B> {
         // the weights and the working set leave of the share, in whole
         // chunks; the kernels bind it in at most four segments, none past
         // the device's binding limit.
-        // Every pipeline a fire may yet build is priced before the pool takes
-        // what is left: one built later must find its driver memory free.
-        let pipelines = B::Pipelines::default();
-        let unbuilt = price_pipelines::<B>(&device, &pipelines);
-        let left = device.left().saturating_sub(unbuilt);
+        // Every pipeline a fire asks for is built by now: what is left is
+        // past what the driver took for them.
+        let left = device.left();
         if let Some(budget) = kv_budget
             && budget > left
         {
@@ -1283,7 +1430,6 @@ impl<B: Serve> Shell<B> {
         // context, the weights and every load-time reservation are up;
         // what the driver holds by then is its own entry.
         device.books().outside("driver", device.outside());
-        device.books().outside("unbuilt pipelines", unbuilt);
         device.books().settle(chunk, device.capacity());
         let paging = Paging {
             pages: pages.max(1),
@@ -1327,7 +1473,11 @@ impl<B: Serve> Shell<B> {
             tuning,
             device,
             tier,
+            built: B::compiled(&pipelines),
+            recorded: 0,
+            walked: (0, 0),
             pipelines,
+            asks,
             handles,
             trace: boot.trace,
             compiled,
@@ -1823,6 +1973,40 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn compiled(&self) -> u64 {
         B::compiled(&self.pipelines)
+    }
+
+    /// What the load named of its fires: the kernels its pipelines were
+    /// built from, and the most dispatches one fire makes.
+    #[must_use]
+    pub fn named(&self) -> &Asks {
+        &self.asks
+    }
+
+    /// The kernels whose pipelines were built since the last count. The
+    /// load built every one its walks named, so each of these is one a
+    /// fire asked for that no walk named: a bug, counted and named by
+    /// whoever serves the shell.
+    pub fn built_serving(&mut self) -> Vec<&'static str> {
+        let now = B::compiled(&self.pipelines);
+        let from = std::mem::replace(&mut self.built, now);
+        if now == from {
+            return Vec::new();
+        }
+        B::built_since(&self.pipelines, from)
+    }
+
+    /// The steps walked to be kept since the last count: each is a shape a
+    /// fire waited on, recorded at its first fire and replayed after.
+    pub fn recorded_serving(&mut self) -> u64 {
+        std::mem::take(&mut self.recorded)
+    }
+
+    /// The most dispatches one walked fire's frame encoded, and the most
+    /// launches one walked fire made of its regions, since the last count.
+    /// The load named a fire's dispatches at most ([`Asks::dispatches`]),
+    /// which the first holds within.
+    pub fn walked_serving(&mut self) -> (u64, u32) {
+        std::mem::take(&mut self.walked)
     }
 
     #[must_use]
@@ -3698,7 +3882,19 @@ impl<B: Serve> Shell<B> {
 
     fn walk_once(&self, p: &Prepared<'_, B>, keep: bool, split: bool) -> Result<Walked<B>> {
         let place = At::new();
+        self.walk_with(p, keep, split, &place, &mut Cursor::new(&place))
+    }
 
+    /// [`Shell::walk_once`] with the walk's sink the caller's: `cursor` moves
+    /// `place`, which the walk's dispatches read.
+    fn walk_with<S: poem_exec::fire::Sink>(
+        &self,
+        p: &Prepared<'_, B>,
+        keep: bool,
+        split: bool,
+        place: &At,
+        cursor: &mut S,
+    ) -> Result<Walked<B>> {
         let mut frame = Some(B::walk_frame(&self.device, keep)?);
         self.land_merges(frame.as_mut().expect("just opened"), p)?;
         // The sink borrows the frame, which leaves in `Walked`, so it ends
@@ -3720,7 +3916,7 @@ impl<B: Serve> Shell<B> {
                 &p.caches,
                 p.bindings.clone(),
                 &p.windows,
-                &place,
+                place,
                 self.span.scratch(p.rung)?,
                 self.weights.hashes(),
                 &self.tuning,
@@ -3744,7 +3940,7 @@ impl<B: Serve> Shell<B> {
                 &self.compiled,
                 &p.descriptor,
                 &mut run,
-                &mut Cursor::new(&place),
+                cursor,
                 Filter::default(),
             )?;
             run.take_cuts()
@@ -4111,6 +4307,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             }
             Plan::Walk { keep, split } => (keep, split),
         };
+        self.recorded += u64::from(keep.is_some());
         let walked = self.walk_once(&prepared, keep.is_some(), split)?;
         let mut frame = walked.frame.expect("the walk opened a frame");
 
@@ -4175,6 +4372,10 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         }
 
         let pixels = self.copy_pixels(&mut frame, &prepared)?;
+        self.walked = (
+            self.walked.0.max(frame.dispatches()),
+            self.walked.1.max(walked.launches),
+        );
 
         let seq = self.airborne.enter();
         let launch = Launch {
@@ -4242,96 +4443,8 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
     }
 }
 
-/// The fewest pipelines a load builds to price one: a driver grows the heap
-/// it keeps shader code in by whole blocks, so a build's price is read over
-/// several.
-const PRICED_FROM: usize = 16;
-
-/// The fewest builds that moved the driver's holding a price is read from.
-const PRICED_MOVES: usize = 3;
-
-/// The most it builds while the driver's holding stands still; past them a
-/// pipeline is priced at what they took.
-const PRICED_FROM_MOST: usize = 64;
-
-/// One load of the process prices at a time: a driver reports what it holds
-/// a process, so another load's builds would be read as this one's.
-static PRICING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// What the driver would take beside the reservations for every pipeline a
-/// fire on `device` could still build (REDESIGN 2.2, `outside`), priced by
-/// measurement before the pool is fit. Which instantiation a kernel fires
-/// hangs on the rows of its fire, so the set a load will build is known only
-/// as every instantiation the device can run: some of them, spread over the
-/// census, are built now into `pipelines` (and kept, for any fire that names
-/// them), and the rest are priced at what those took each.
-///
-/// What the driver holds is read across each build: most builds fit in a
-/// block the driver already has and move nothing, some take a new block.
-/// A build's price is the median move times the share of builds that moved:
-/// a driver reports what it holds a process, so a move another thread's
-/// allocation made (a frame's, a staging belt's) is one large reading that
-/// the median passes over, where a mean would take it whole. A build during
-/// which the process reserved or gave back device memory is not read at all.
-/// The builds go on past [`PRICED_FROM`] until [`PRICED_MOVES`] have moved,
-/// up to [`PRICED_FROM_MOST`]. A device that does not report the driver's
-/// holding prices nothing.
-fn price_pipelines<B: Serve>(device: &B::Context, pipelines: &B::Pipelines) -> u64 {
-    if !B::measures_outside(device) {
-        return 0;
-    }
-    let _alone = PRICING.lock().expect("pricing lock poisoned");
-    let census: Vec<(&'static str, &'static str)> = kernels_slang::CENSUS
-        .iter()
-        .filter(|(key, _, tier, _)| B::builds(device, key, tier))
-        .map(|&(key, _, _, unit)| (key, unit))
-        .collect();
-    let stride = (census.len() / PRICED_FROM).max(1);
-    let spread = (0..stride).flat_map(|offset| census.iter().skip(offset).step_by(stride));
-    let (mut built, mut read) = (0u64, 0u64);
-    let mut moves: Vec<u64> = Vec::new();
-    for &(key, unit) in spread {
-        if built as usize >= PRICED_FROM_MOST
-            || (read as usize >= PRICED_FROM && moves.len() >= PRICED_MOVES)
-        {
-            break;
-        }
-        let reserved = crate::books::process_reserved();
-        let before = device.outside();
-        // One the device refuses is priced with the rest; a fire naming
-        // it meets the refusal itself.
-        if B::build(device, pipelines, unit, key).is_err() {
-            continue;
-        }
-        built += 1;
-        let after = device.outside();
-        if crate::books::process_reserved() == reserved {
-            read += 1;
-            if after > before {
-                moves.push(after - before);
-            }
-        }
-    }
-    moves.sort_unstable();
-    let median = moves.get(moves.len() / 2).copied().unwrap_or(0);
-    let each = (median * moves.len() as u64).checked_div(read).unwrap_or(0);
-    let unbuilt = census.len() as u64 - built;
-    let priced = each * unbuilt;
-    tracing::info!(
-        built,
-        read,
-        moved = moves.len(),
-        median,
-        each,
-        unbuilt,
-        priced,
-        "the pipelines a fire may yet build are priced at what building some took"
-    );
-    priced
-}
-
-/// The walk's sink: a kernel's fire, its absent argument and the target,
-/// and nothing else of the backend's sink.
+/// The walk's sink: a kernel's fire, its absent argument, the target and
+/// whether it names, and nothing else of the backend's sink.
 struct Encoded<S>(S);
 
 impl<S: kernels_slang::Encode> kernels_slang::Encode for Encoded<S> {
@@ -4349,6 +4462,10 @@ impl<S: kernels_slang::Encode> kernels_slang::Encode for Encoded<S> {
 
     fn target(&self) -> kernels_slang::Target {
         self.0.target()
+    }
+
+    fn naming(&self) -> Option<&dyn kernels_slang::Naming> {
+        self.0.naming()
     }
 }
 
@@ -4570,6 +4687,586 @@ impl<B: Serve> Shell<B> {
             }
         }
         Ok(staged)
+    }
+}
+
+/// What a load's fires can ask of its device, named before the device holds
+/// a byte of the model: every kernel a walk of it asks for, the most
+/// dispatches one fire makes, whatever classes its lanes mix, and the
+/// classes the kernels refuse a fire of, which no bind is served by.
+#[derive(Debug, Clone, Default)]
+pub struct Asks {
+    pub kernels: Vec<crate::naming::Kernel>,
+    pub dispatches: u32,
+    pub unservable: Vec<crate::naming::Unservable>,
+    /// The rungs of the load's span, the one named from among them.
+    pub rungs: Vec<u32>,
+}
+
+/// What a rung's naming fires found of the regions: which ran, which a fire
+/// cut into runs, what one launch of each dispatches, the most a fire made
+/// of each whole, and the most a fire dispatches outside them.
+struct Found {
+    walked: Vec<bool>,
+    cut: Vec<bool>,
+    launch: Vec<u32>,
+    whole: Vec<u32>,
+    rest: u32,
+}
+
+impl Found {
+    fn new(regions: usize) -> Found {
+        Found {
+            walked: vec![false; regions],
+            cut: vec![false; regions],
+            launch: vec![0; regions],
+            whole: vec![0; regions],
+            rest: 0,
+        }
+    }
+
+    /// The most dispatches a fire makes: what it makes outside its regions,
+    /// and each region at the most of its launch once a run of `runs` and
+    /// what a fire that cut it made of it.
+    fn most(&self, runs: &[u32]) -> u32 {
+        let regions = self.launch.iter().zip(&self.whole).zip(runs);
+        self.rest
+            + regions
+                .map(|((launch, whole), runs)| (launch * runs).max(*whole))
+                .sum::<u32>()
+    }
+}
+
+/// The walk's cursor, noting what each region dispatched into the naming
+/// sink.
+struct Counting<'a> {
+    cursor: Cursor<'a>,
+    names: &'a crate::naming::Names,
+    began: u32,
+    made: Vec<u32>,
+}
+
+impl poem_exec::fire::Sink for Counting<'_> {
+    fn region_begin(&mut self, region: &poem_compiler::Region) {
+        self.began = self.names.dispatched();
+        self.cursor.region_begin(region);
+    }
+
+    fn region_end(&mut self, region: &poem_compiler::Region) {
+        self.cursor.region_end(region);
+        self.made.push(self.names.dispatched() - self.began);
+    }
+
+    fn run(&mut self, run: u32, runs: u32) {
+        self.cursor.run(run, runs);
+    }
+
+    fn cond_begin(&mut self, lowering: &poem_compiler::Lowering) {
+        self.cursor.cond_begin(lowering);
+    }
+
+    fn cond_arm(&mut self, arm: u8) {
+        self.cursor.cond_arm(arm);
+    }
+
+    fn cond_end(&mut self) {
+        self.cursor.cond_end();
+    }
+
+    fn tail(&mut self, in_tail: bool) {
+        self.cursor.tail(in_tail);
+    }
+
+    fn fork(&mut self, event: poem_exec::fire::EventId) {
+        self.cursor.fork(event);
+    }
+
+    fn join(&mut self, event: poem_exec::fire::EventId) {
+        self.cursor.join(event);
+    }
+}
+
+/// One lane of a naming fire: what its class has a lane carry, all zeros.
+struct NamingLane<B: Serve> {
+    word: u64,
+    tokens: Vec<u32>,
+    mask: Option<Masking>,
+    adapter: Option<u32>,
+    media: Option<NamingMedia>,
+    boxes: Vec<[u32; 3]>,
+    payload: Vec<u8>,
+    inputs: Vec<(engine::fire::InputFeed, InputCell<Named<B>>)>,
+}
+
+struct NamingMedia {
+    rows: Vec<u32>,
+    patches: Vec<u8>,
+    routes: Vec<i32>,
+    positions: Vec<i32>,
+    grids: Vec<i32>,
+}
+
+impl<B: Serve> Shell<Named<B>> {
+    /// Whether a lane of `class` runs a region of `axis`.
+    fn class_runs(&self, class: usize, axis: poem_ir::RowAxis) -> bool {
+        self.compiled
+            .template()
+            .iter()
+            .enumerate()
+            .any(|(at, region)| self.compiled.axis_of(at) == axis && region.mask.contains(class))
+    }
+
+    /// A lane of `class` over `rows` token rows, carrying what a lane of
+    /// the class must: its mask, its adapter, an image where the class runs
+    /// the patch tower, a clip where it runs the voxel plane, and a cell for
+    /// every guest input its class reads.
+    fn naming_lane(&self, class: usize, rows: u32) -> Result<NamingLane<B>> {
+        let word = self.compiled.classes.classes[class].word();
+        let media = self
+            .patch_seat
+            .filter(|_| self.class_runs(class, poem_ir::RowAxis::Patches))
+            .map(|seat| {
+                // One image of one folded row, routed to the lane's first.
+                let patches = self.patch_fold.max(1);
+                let mut routes = vec![
+                    if self.drops_patch_rows {
+                        PATCH_ROUTE_DROP
+                    } else {
+                        0
+                    };
+                    patches as usize
+                ];
+                routes[0] = 0;
+                NamingMedia {
+                    rows: vec![patches],
+                    patches: vec![0u8; patches as usize * seat.row_bytes as usize],
+                    routes,
+                    positions: vec![0i32; patches as usize * 3],
+                    grids: vec![1, patches as i32, 1],
+                }
+            });
+        let clip = self
+            .voxel_seat
+            .filter(|_| self.class_runs(class, poem_ir::RowAxis::Voxels));
+        let boxes: Vec<[u32; 3]> = clip
+            .iter()
+            .map(|seat| seat.token_patch.unwrap_or([1, 1, 1]))
+            .collect();
+        let voxels: u64 = boxes
+            .iter()
+            .map(|b| u64::from(b[0]) * u64::from(b[1]) * u64::from(b[2]))
+            .sum();
+        let payload = clip.map_or_else(Vec::new, |seat| {
+            vec![0u8; (voxels * elem(seat.dtype) * seat.channels) as usize]
+        });
+        let mut inputs = Vec::new();
+        for (seat, readers) in &self.feeds.inputs {
+            if !readers.contains(class) || (seat.voxel() && !payload.is_empty()) {
+                continue;
+            }
+            let cells = if seat.per_lane() {
+                1
+            } else if seat.voxel() {
+                voxels
+            } else {
+                u64::from(rows)
+            };
+            let bytes = cells * seat.row_bytes();
+            // A cell the device keeps arrives f32 and is cast where the
+            // seat is bf16: the one kernel a fire asks for beside its walk.
+            let cell = if Named::<B>::CHANNEL_CELLS && seat.dtype == Dtype::Bf16 {
+                InputCell::Device {
+                    cell: DeviceCell {
+                        buffer: crate::backend::Buffer::<Named<B>>::host(
+                            &self.device,
+                            bytes * 2,
+                            crate::books::owners::CHANNELS,
+                        )?,
+                        at: 0,
+                        bytes: bytes * 2,
+                    },
+                    dtype: eta_ir::types::Dtype::F32,
+                }
+            } else {
+                InputCell::Host {
+                    bytes: vec![0u8; bytes as usize],
+                    dtype: eta_ir::types::Dtype::I32,
+                }
+            };
+            inputs.push((
+                engine::fire::InputFeed {
+                    id: seat.id,
+                    channel: engine::channel::ChannelId(0),
+                },
+                cell,
+            ));
+        }
+        Ok(NamingLane {
+            word,
+            tokens: vec![0u32; rows as usize],
+            mask: self
+                .masked
+                .contains(class)
+                .then(|| Masking::Extent(engine::fire::Mask::new(vec![0, rows], u64::from(rows)))),
+            adapter: self.corrected.contains(class).then_some(0),
+            media,
+            boxes,
+            payload,
+            inputs,
+        })
+    }
+
+    /// The lanes of a fire of `rows` rows of `class` alone: as many as its
+    /// seats take.
+    fn alone(&self, class: usize, rows: u64) -> Vec<(usize, u32)> {
+        let seat = self.seat_rows().unwrap_or(rows);
+        let slots = (self.held.len() as u64).max(1);
+        let lanes = rows.div_ceil(seat).clamp(1, slots);
+        (0..lanes)
+            .map(|at| {
+                let rows = (rows.saturating_sub(at * seat)).clamp(1, seat);
+                (class, u32::try_from(rows).unwrap_or(u32::MAX))
+            })
+            .collect()
+    }
+
+    /// The rows one seat holds, where the pool pages them.
+    fn seat_rows(&self) -> Option<u64> {
+        let paging = self.pools.paging();
+        match u64::from(paging.pages_per_slot) * u64::from(paging.page_size) {
+            0 => None,
+            seat => Some(seat),
+        }
+    }
+
+    /// The fires that cut a mask into runs. A fire's rows go in the class
+    /// order, so a mask the order leaves in more than one run is cut by
+    /// three lanes in the order's turn, the middle one outside the mask.
+    /// Each such mask gives one with no lane masked, where the shell may
+    /// move the mask's rows together and launch once, and one with a lane
+    /// masked, where it launches a run at a time. Token rows only: a patch
+    /// or voxel mask in runs is a fire the shell refuses.
+    ///
+    /// A mask's three are classes whose fires the kernels admit where there
+    /// are such: a class in `refused` only where no other three cut it.
+    fn cuts(&self, refused: &[bool]) -> Vec<[usize; 3]> {
+        let axis = poem_ir::RowAxis::Tokens;
+        let Some(order) = self.compiled.order_for(axis) else {
+            return Vec::new();
+        };
+        let classes = self.compiled.classes.classes.len();
+        let order = order.class_order(&poem_ir::ClassSet::of(0..classes));
+        let mut seen: Vec<&poem_ir::ClassSet> = Vec::new();
+        let mut cuts: Vec<[usize; 3]> = Vec::new();
+        for (at, region) in self.compiled.template().iter().enumerate() {
+            // A region the compiler promised whole comes in one run under
+            // every fire it admits; a fire that cut it is refused.
+            if self.compiled.axis_of(at) != axis
+                || seen.contains(&&region.mask)
+                || fallback::promised(&self.compiled, axis, region)
+                || fallback::bound(&self.compiled, axis, &region.mask) <= 1
+            {
+                continue;
+            }
+            seen.push(&region.mask);
+            for masked in [false, true] {
+                let three = |admitted: bool| {
+                    for (first, &a) in order.iter().enumerate() {
+                        if !region.mask.contains(a as usize) {
+                            continue;
+                        }
+                        for (between, &b) in order.iter().enumerate().skip(first + 1) {
+                            if region.mask.contains(b as usize) {
+                                continue;
+                            }
+                            for &c in &order[between + 1..] {
+                                let trio = [a as usize, b as usize, c as usize];
+                                if region.mask.contains(c as usize)
+                                    && trio.iter().any(|class| self.masked.contains(*class))
+                                        == masked
+                                    && !(admitted && trio.iter().any(|class| refused[*class]))
+                                {
+                                    return Some(trio);
+                                }
+                            }
+                        }
+                    }
+                    None
+                };
+                if let Some(trio) = three(true).or_else(|| three(false))
+                    && !cuts.contains(&trio)
+                {
+                    cuts.push(trio);
+                }
+            }
+        }
+        cuts
+    }
+
+    /// Stages and walks one fire of `lanes`, each a class and its rows, and
+    /// notes into `found` the regions it ran and what each dispatched.
+    ///
+    /// A fire the kernels refuse is answered with the refusal: a serving
+    /// fire of these classes is refused in the same words at the same
+    /// kernel, before it asks for a pipeline past it, so its regions count
+    /// as run and nothing of it is counted.
+    fn name_fire(
+        &mut self,
+        lanes: &[(usize, u32)],
+        found: &mut Found,
+    ) -> Result<Option<poem_exec::KernelError>> {
+        let owned = lanes
+            .iter()
+            .map(|&(class, rows)| self.naming_lane(class, rows))
+            .collect::<Result<Vec<NamingLane<B>>>>()?;
+        let seated: Vec<Seated<'_, Named<B>>> = owned
+            .iter()
+            .enumerate()
+            .map(|(at, lane)| Seated {
+                mask: lane.mask.as_ref(),
+                adapter: lane.adapter,
+                inputs: &lane.inputs,
+                ..Seated::of(Lane {
+                    slot: at as u32,
+                    word: lane.word,
+                    tokens: &lane.tokens,
+                })
+            })
+            .collect();
+        let media: Vec<Media<'_>> = owned
+            .iter()
+            .enumerate()
+            .filter_map(|(at, lane)| {
+                lane.media.as_ref().map(|shot| Media {
+                    lane: at as u32,
+                    rows: &shot.rows,
+                    patches: &shot.patches,
+                    routes: &shot.routes,
+                    positions: &shot.positions,
+                    grids: &shot.grids,
+                    token_positions: &[],
+                })
+            })
+            .collect();
+        let clips: Vec<Clips<'_>> = owned
+            .iter()
+            .enumerate()
+            .filter(|(_, lane)| !lane.boxes.is_empty())
+            .map(|(at, lane)| Clips {
+                lane: at as u32,
+                boxes: &lane.boxes,
+                payload: &lane.payload,
+            })
+            .collect();
+        let prepared = self.stage(StepView {
+            lanes: &seated,
+            attachments: &[],
+            media: &media,
+            clips: &clips,
+            folds: &[],
+            done: None,
+            guests: None,
+        })?;
+        let mut whole = Vec::with_capacity(self.compiled.template().len());
+        for (at, region) in self.compiled.template().iter().enumerate() {
+            let spans = prepared
+                .descriptor
+                .table(self.compiled.axis_of(at))
+                .spans(&region.mask);
+            found.walked[at] |= spans.iter().any(|span| span.rows > 0);
+            found.cut[at] |= spans.len() > 1;
+            whole.push(spans.len() <= 1);
+        }
+        self.feed(&prepared)?;
+        let place = At::new();
+        let mut sink = Counting {
+            cursor: Cursor::new(&place),
+            names: &self.pipelines.0,
+            began: 0,
+            made: Vec::with_capacity(whole.len()),
+        };
+        match self.walk_with(&prepared, false, false, &place, &mut sink) {
+            Ok(_) => {}
+            Err(Fault::Fire(poem_exec::Error::Kernel(refusal))) => {
+                self.pipelines.0.abandon();
+                return Ok(Some(refusal));
+            }
+            Err(fault) => return Err(fault),
+        }
+        let Counting { made, .. } = sink;
+        let fire = self.pipelines.0.take_dispatches();
+        for (at, &made) in made.iter().enumerate() {
+            if whole[at] {
+                found.launch[at] = found.launch[at].max(made);
+            }
+            found.whole[at] = found.whole[at].max(made);
+        }
+        found.rest = found.rest.max(fire - made.iter().sum::<u32>());
+        Ok(None)
+    }
+
+    /// Names what this load's fires ask for from fires at one rung of the
+    /// span, `rung` or the smallest where every mix runs: a fire of each
+    /// class alone, and a fire
+    /// for each way a mix of classes cuts a mask into runs
+    /// ([`Shell::cuts`]), staged and walked as a serving fire is, into the
+    /// sink that fires nothing. One rung names what every rung does: a host
+    /// that picks its kernel by a fire's rows names every kernel its widths
+    /// allow and the longest way it can take, so neither the kernels nor
+    /// the dispatches of a fire change with its rows (the suite holds every
+    /// rung to this one's), but a prefill under a work budget, which counts
+    /// at the most rows a fire of the load brings, as the naming sink states
+    /// them ([`kernels_slang::Naming::most_rows`]). A mix runs at three
+    /// lanes of a row or more each. A fire makes at
+    /// most what the rung's fires made outside their regions and of each
+    /// region, a region the walk launches a run at a time counted at every
+    /// run its mask can come in. A region no such fire runs, or one in runs
+    /// that no fire cut, has kernels this cannot name, and refuses the load
+    /// here.
+    ///
+    /// A class whose fire alone the kernels refuse is held unservable: said
+    /// once, here, and the load stands; a bind that only such classes serve
+    /// is refused at the bind ([`crate::naming::refuses`]). A mix the
+    /// kernels refuse of classes they admit alone refuses the load.
+    fn asks(mut self, rung: Option<u32>) -> Result<Asks> {
+        let regions = self.compiled.template().len();
+        let span: Vec<u32> = self.span.rungs().iter().map(|rung| rung.tokens).collect();
+        let mixes = self.held.len() >= 3;
+        let rungs: Vec<u32> = rung
+            .or_else(|| {
+                span.iter()
+                    .copied()
+                    .filter(|&tokens| !mixes || tokens >= 3)
+                    .min()
+            })
+            .or_else(|| span.iter().copied().max())
+            .into_iter()
+            .collect();
+        self.pipelines
+            .0
+            .bound_rows(span.iter().copied().max().unwrap_or(1));
+        let classes = self.compiled.classes.classes.len();
+        let mut unservable: Vec<crate::naming::Unservable> = Vec::new();
+        let mut mixes: Vec<([usize; 3], poem_exec::KernelError)> = Vec::new();
+        // The launches the walk makes of a region at most: its mask's runs
+        // in the class order, or one where it launches a cut region once.
+        let runs: Vec<u32> = self
+            .compiled
+            .template()
+            .iter()
+            .enumerate()
+            .map(|(at, region)| {
+                let axis = self.compiled.axis_of(at);
+                if fallback::promised(&self.compiled, axis, region)
+                    || fallback::grouped(&self.compiled, axis, region.nodes.clone())
+                {
+                    1
+                } else {
+                    fallback::bound(&self.compiled, axis, &region.mask)
+                }
+            })
+            .collect();
+        let mut walked = vec![false; regions];
+        let mut cut = vec![false; regions];
+        let mut mixed = false;
+        let mut dispatches = 0;
+        for tokens in rungs {
+            let tokens = tokens.max(1);
+            let mut found = Found::new(regions);
+            for class in 0..classes {
+                let lanes = self.alone(class, u64::from(tokens));
+                if let Some(refusal) = self.name_fire(&lanes, &mut found)?
+                    && !unservable.iter().any(|held| held.class == class)
+                {
+                    tracing::warn!(
+                        class,
+                        rung = tokens,
+                        "the kernels refuse a fire of this lane class, so the load holds it \
+                         unservable and refuses a bind that only such classes serve: {refusal}"
+                    );
+                    unservable.push(crate::naming::Unservable {
+                        class,
+                        why: refusal.to_string(),
+                    });
+                }
+            }
+            // Three lanes of a row or more each.
+            if tokens >= 3 && self.held.len() >= 3 {
+                mixed = true;
+                let third = u64::from(tokens / 3);
+                let rows = self.seat_rows().map_or(third, |seat| third.min(seat)) as u32;
+                let refused: Vec<bool> = (0..classes)
+                    .map(|class| unservable.iter().any(|held| held.class == class))
+                    .collect();
+                for trio in self.cuts(&refused) {
+                    let lanes = trio.map(|class| (class, rows));
+                    if let Some(refusal) = self.name_fire(&lanes, &mut found)? {
+                        mixes.push((trio, refusal));
+                    }
+                }
+            }
+            dispatches = dispatches.max(found.most(&runs));
+            for at in 0..regions {
+                walked[at] |= found.walked[at];
+                cut[at] |= found.cut[at];
+            }
+        }
+        // A refused mix is its unservable class's refusal, said above; one
+        // of classes the kernels admit alone is a fire of servable binds
+        // the load cannot name, whatever rung the classes were found at.
+        let admitted = mixes.into_iter().find(|(trio, _)| {
+            !trio
+                .iter()
+                .any(|class| unservable.iter().any(|held| held.class == *class))
+        });
+        if let Some((_, refusal)) = admitted {
+            return Err(Fault::Fire(poem_exec::Error::Kernel(refusal)));
+        }
+        if let Some(region) = walked.iter().position(|walked| !walked) {
+            let nodes = &self.compiled.template()[region].nodes;
+            return Err(program(
+                "serve::asks",
+                format!(
+                    "region {region} (nodes {}..{}) runs in no fire the load could name its \
+                     kernels from, so a fire of it would ask for a pipeline the load did not \
+                     build",
+                    nodes.start, nodes.end
+                ),
+            ));
+        }
+        let uncut = (0..regions).find(|&at| {
+            mixed
+                && !cut[at]
+                && self.compiled.axis_of(at) == poem_ir::RowAxis::Tokens
+                && !fallback::promised(
+                    &self.compiled,
+                    poem_ir::RowAxis::Tokens,
+                    &self.compiled.template()[at],
+                )
+                && fallback::bound(
+                    &self.compiled,
+                    poem_ir::RowAxis::Tokens,
+                    &self.compiled.template()[at].mask,
+                ) > 1
+        });
+        if let Some(region) = uncut {
+            let nodes = &self.compiled.template()[region].nodes;
+            return Err(program(
+                "serve::asks",
+                format!(
+                    "region {region} (nodes {}..{}) comes in more than one run under the class \
+                     order and no fire the load named cut it, so a fire that does would ask \
+                     for what the load did not name",
+                    nodes.start, nodes.end
+                ),
+            ));
+        }
+        Ok(Asks {
+            kernels: self.pipelines.0.kernels(),
+            dispatches,
+            unservable,
+            rungs: span,
+        })
     }
 }
 

@@ -62,6 +62,11 @@ pub trait Programs<B: Serve>: Default {
 
     fn package(&self, program: ProgramId) -> Option<&LaunchPackage>;
 
+    /// Builds what every instance's device half shares (the readout
+    /// widen's pipeline and its config), at the load: binding an instance
+    /// then builds its own stages and nothing else.
+    fn load(&mut self, place: &Place<'_, B>) -> Result<(), Refusal>;
+
     /// What an instance of `program` holds in the pool's `Instance` and
     /// `Channel` slots (`Engine::program_facts`).
     fn facts(&self, program: ProgramId, place: &Place<'_, B>) -> Result<ProgramFacts, Refusal>;

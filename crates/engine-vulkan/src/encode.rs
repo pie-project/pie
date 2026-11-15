@@ -592,20 +592,37 @@ pub(crate) fn qmm_ladder(
     contraction: u32,
     bank: kernels_slang::Bank,
 ) -> Vec<kernels_slang::linear::qmm::Qmm> {
+    let at = tuning.qmm_at(rows, columns, contraction, bank.bits, bank.group);
+    tuning.qmm(&at).into_iter().map(qmm_rung).collect()
+}
+
+/// Every rung of the device's `kernel.qmm` ladder a batch of 1 to
+/// `capacity` rows reaches at this shape, as kernels-slang's rungs.
+pub(crate) fn qmm_rungs(
+    tuning: &crate::tuning::Tuning,
+    capacity: u32,
+    columns: u32,
+    contraction: u32,
+    bank: kernels_slang::Bank,
+) -> Vec<kernels_slang::linear::qmm::Qmm> {
+    let at = |rows| tuning.qmm_at(rows, columns, contraction, bank.bits, bank.group);
+    tuning
+        .qmm_between(&at(1), &at(capacity.max(1)))
+        .into_iter()
+        .map(qmm_rung)
+        .collect()
+}
+
+fn qmm_rung(rung: crate::tuning::Qmm) -> kernels_slang::linear::qmm::Qmm {
     use crate::tuning::Qmm;
     use kernels_slang::linear::qmm::Qmm as Rung;
-    let at = tuning.qmm_at(rows, columns, contraction, bank.bits, bank.group);
-    tuning
-        .qmm(&at)
-        .iter()
-        .map(|q| match *q {
-            Qmm::Coopmat => Rung::Coopmat,
-            Qmm::RegisterTiled { bm, k16 } => Rung::RegisterTiled { bm, k16 },
-            Qmm::Tiled { crossover_tg } => Rung::Tiled { crossover_tg },
-            Qmm::OneRow { lanes, rows } => Rung::OneRow { lanes, rows },
-            Qmm::Qmv { vecs } => Rung::Qmv { vecs },
-        })
-        .collect()
+    match rung {
+        Qmm::Coopmat => Rung::Coopmat,
+        Qmm::RegisterTiled { bm, k16 } => Rung::RegisterTiled { bm, k16 },
+        Qmm::Tiled { crossover_tg } => Rung::Tiled { crossover_tg },
+        Qmm::OneRow { lanes, rows } => Rung::OneRow { lanes, rows },
+        Qmm::Qmv { vecs } => Rung::Qmv { vecs },
+    }
 }
 
 /// The range argument `at` binds: the `remaining` bytes of its slab from its

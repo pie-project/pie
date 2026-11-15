@@ -42,6 +42,8 @@ impl Serve for Api {
     /// takes from there and lands its puts there.
     const CHANNEL_CELLS: bool = false;
 
+    const TARGET: kernels_slang::Target = kernels_slang::Target::Wgsl;
+
     fn table_align(device: &Context) -> u64 {
         device.table_align()
     }
@@ -95,17 +97,12 @@ impl Serve for Api {
         pipelines.compiled()
     }
 
-    fn measures_outside(device: &Context) -> bool {
-        device.measures_outside()
+    fn built_since(pipelines: &Pipelines, from: u64) -> Vec<&'static str> {
+        pipelines.built_since(from)
     }
 
-    fn builds(device: &Context, key: &str, tier: &str) -> bool {
-        let runs = match tier {
-            "baseline" => true,
-            "subgroup" => Self::tier(device) == kernels_slang::Tier::Subgroup,
-            _ => false,
-        };
-        runs && kernels_slang::wgsl(key).is_some()
+    fn hold(device: &Context, unit: &'static str, key: &'static str) -> Result<()> {
+        Pipelines::hold(device, unit, key)
     }
 
     fn build(
