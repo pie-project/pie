@@ -81,6 +81,14 @@ prefill_lattice_steps = 8
 dag_streams = true
 dag_streams_until = 256
 
+[rates]
+# 165.2 TFLOPS dense bf16 with FP32 accumulation, as pie's products
+# accumulate (NVIDIA Ada Lovelace architecture whitepaper; 330.3
+# accumulating in FP16).
+bf16_flops_per_ns = 165200.0
+# 1008 GB/s of GDDR6X (Ada whitepaper).
+bytes_per_ns = 1008.0
+
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 35.9 -> 35.2 ms, 1-lane step 3.55 -> 3.48 ms, 4-lane step 5.23 -> 5.17 ms, 8-lane step 7.52 -> 7.47 ms, readout cosine 1.0000"
 measured = [
