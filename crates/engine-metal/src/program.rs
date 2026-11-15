@@ -713,6 +713,13 @@ impl Plane {
                             }
                         }
                         for prepared in group {
+                            // PROBE (M5): with `PIE_MEMBER_PASS` set, a pass
+                            // boundary before each member's kernels, where
+                            // main's per-instance fill puts one.
+                            #[cfg(target_vendor = "apple")]
+                            if probe_member_pass() {
+                                frame.next_pass()?;
+                            }
                             for region in stage.regions.iter() {
                                 prepared.encode_into(frame, region)?;
                             }
@@ -1605,3 +1612,10 @@ mod tests {
         assert_eq!(gpu_reads(&ring), want(2), "the unparked run reads the same");
     }
 }
+/// PROBE (M5 fill): whether `PIE_MEMBER_PASS` asks a pass boundary before
+/// each unbatched member's kernels.
+fn probe_member_pass() -> bool {
+    static MEMBER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MEMBER.get_or_init(|| std::env::var_os("PIE_MEMBER_PASS").is_some())
+}
+
