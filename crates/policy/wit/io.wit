@@ -69,6 +69,15 @@ interface worker-writes {
     /// Where passes run: `default` for every process no entry names.
     install-offload: func(entries: list<tuple<id, offload>>, default: option<offload>);
 
+    /// The most tokens of passes one step of a batch carries. Prompts that
+    /// arrive together share a batch up to it, and are done sooner for it;
+    /// every process that is generating waits for the batch, and so does
+    /// the first token of each prompt in it. `none`, like no call, leaves
+    /// the host's own bound, what its engine runs in one fire (the worker's
+    /// attr `fire-tokens`): a long prompt then runs by itself, with the
+    /// others' tokens between.
+    install-batch: func(tokens: option<u32>);
+
     /// A value for the cluster plane to read, as this worker's attr
     /// `published/@worker/<name>`. Level-triggered; `none` withdraws it. The
     /// one way a worker policy speaks to the cluster.

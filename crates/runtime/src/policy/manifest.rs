@@ -27,6 +27,7 @@ const EDGES: &[&str] = &[
 
 const GRANTS: &[&str] = &[
     "schedule",
+    "batch",
     "retention",
     "offload",
     "terminate",
@@ -197,5 +198,18 @@ mod tests {
             let got = format!("{:?}", parse(text).unwrap_err());
             assert!(got.starts_with(want), "{text:?}: {got}");
         }
+    }
+
+    #[test]
+    fn every_worker_write_has_its_grant() {
+        let manifest = parse(
+            "plane = \"worker\"\ngrants = [\"schedule\", \"batch\", \"retention\", \
+             \"offload\", \"terminate\", \"discard\", \"publish\"]",
+        )
+        .unwrap();
+        for write in GRANTS {
+            assert!(manifest.grants(write), "{write}");
+        }
+        assert!(!parse(r#"plane = "worker""#).unwrap().grants("batch"));
     }
 }

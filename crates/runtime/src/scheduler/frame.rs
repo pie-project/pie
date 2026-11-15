@@ -178,6 +178,10 @@ impl FromIterator<u64> for QueuedFireIds {
 pub(crate) struct FramePolicy {
     k: usize,
     max_wave_tokens: usize,
+    /// The tokens a wave takes where the worker policy stated them
+    /// (`install-batch`), in place of the engine's one fire's: prompts past
+    /// one fire then share a frame, and the worker cuts the wave into fires.
+    batch_tokens: Option<usize>,
     max_wave_rows: usize,
     /// The rows a wave may read out, the engine's `max_readouts`; 0 bounds
     /// nothing.
@@ -228,6 +232,12 @@ impl FramePolicy {
         self
     }
 
+    /// The worker policy's bound on a batch of passes, as it stands now;
+    /// none leaves a wave the engine's one fire's tokens.
+    pub fn bound_batch(&mut self, tokens: Option<usize>) {
+        self.batch_tokens = tokens;
+    }
+
     pub fn new(
         k: usize,
         max_wave_rows: usize,
@@ -237,6 +247,7 @@ impl FramePolicy {
         Self {
             k,
             max_wave_tokens,
+            batch_tokens: None,
             max_wave_rows,
             max_wave_readouts: 0,
             lanes: BTreeMap::new(),
@@ -700,7 +711,8 @@ impl FramePolicy {
         let mid_boundary = self.boundary_open();
 
         let k = self.k;
-        let (max_wave_rows, max_wave_tokens) = (self.max_wave_rows, self.max_wave_tokens);
+        let max_wave_rows = self.max_wave_rows;
+        let max_wave_tokens = self.batch_tokens.unwrap_or(self.max_wave_tokens);
         let max_wave_readouts = self.max_wave_readouts;
         // One frame of prompts on the card at a time: prompts arriving behind
         // it bind together into the next, while decodes keep running ahead.
@@ -1347,6 +1359,81 @@ mod tests {
         consumed_release_leaves_no_phantom_hold_for_bystander();
         a_burst_of_cut_prefills_seals_its_pieces_step_by_step();
         a_wave_reads_out_no_more_than_the_engine_carves();
+        a_policys_bound_packs_prompts_into_a_frame_up_to_it_and_no_further();
+    }
+
+    /// Prompts past half a fire's tokens take a frame each, the lane's
+    /// first decode row riding its prompt's, while no policy bounds a batch.
+    /// With the worker policy's bound standing they share a frame up to it
+    /// and no further, on either side of the engine's fire; a prompt past
+    /// the bound alone still takes a frame; and with the bound withdrawn a
+    /// frame is one fire's again.
+    fn a_policys_bound_packs_prompts_into_a_frame_up_to_it_and_no_further() {
+        const LANES: usize = 64;
+        const FIRE: usize = 5120;
+        // The lanes each sealed frame took, as the frames retire in turn.
+        fn frames(policy: &mut FramePolicy, lanes: usize, prompt: usize) -> Vec<usize> {
+            let ids: Vec<ProcessId> = (0..lanes).map(|_| pid()).collect();
+            for (at, &lane) in ids.iter().enumerate() {
+                let at = at as u64;
+                policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 1000 + at, prompt, 1);
+                policy.on_fire_enqueued(stamp(lane, 0, 1, 2), Some(lane), 2000 + at, 1, 1);
+            }
+            let every: Vec<u64> = (0..lanes as u64)
+                .flat_map(|at| [1000 + at, 2000 + at])
+                .collect();
+            let mut sealed: Vec<u64> = Vec::new();
+            let mut sizes = Vec::new();
+            while sealed.len() < every.len() {
+                let queued: QueuedFireIds = every
+                    .iter()
+                    .copied()
+                    .filter(|id| !sealed.contains(id))
+                    .collect();
+                let FramePlan::Dispatch(waves) = plan(policy, &queued, Instant::now()) else {
+                    panic!("prompts of {prompt} tokens: expected a whole-frame dispatch");
+                };
+                assert_eq!(waves.len(), 2);
+                let mut prompts: Vec<u64> = waves[0].iter().map(|id| id - 1000).collect();
+                let mut decodes: Vec<u64> = waves[1].iter().map(|id| id - 2000).collect();
+                prompts.sort_unstable();
+                decodes.sort_unstable();
+                assert_eq!(
+                    decodes, prompts,
+                    "a lane's first decode row rides the wave after its prompt"
+                );
+                sizes.push(prompts.len());
+                sealed.extend(waves.iter().flatten().copied());
+                policy.on_frame_retired(prompts.iter().map(|&at| ids[at as usize]));
+            }
+            sizes
+        }
+        let long = FIRE / 2 + 1;
+
+        let mut policy = FramePolicy::new(2, LANES, FIRE, None);
+        assert_eq!(frames(&mut policy, 6, long), vec![1; 6], "a frame a prompt");
+
+        // Four prompts' tokens: four a frame, the fifth waits for the next.
+        policy.bound_batch(Some(4 * long));
+        assert_eq!(frames(&mut policy, 10, long), vec![4, 4, 2]);
+        // One token short of four holds three.
+        policy.bound_batch(Some(4 * long - 1));
+        assert_eq!(frames(&mut policy, 7, long), vec![3, 3, 1]);
+        // The engine's lanes bound a frame whatever the tokens stated.
+        policy.bound_batch(Some(u32::MAX as usize));
+        assert_eq!(frames(&mut policy, LANES + 6, long), vec![LANES, 6]);
+        // A bound under one fire holds short prompts to it too.
+        policy.bound_batch(Some(64));
+        assert_eq!(frames(&mut policy, 5, 32), vec![2, 2, 1]);
+        // A prompt past the bound alone takes a frame of its own.
+        assert_eq!(frames(&mut policy, 3, long), vec![1; 3]);
+        policy.bound_batch(Some(0));
+        assert_eq!(frames(&mut policy, 3, 32), vec![1; 3]);
+
+        // Withdrawn, a frame is one fire's tokens again.
+        policy.bound_batch(None);
+        assert_eq!(frames(&mut policy, 4, long), vec![1; 4]);
+        assert_eq!(frames(&mut policy, 6, FIRE / 4), vec![4, 2]);
     }
 
     /// Lanes that read out several rows each (a verified draft block) share

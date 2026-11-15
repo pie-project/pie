@@ -2342,6 +2342,7 @@ impl BatchScheduler {
                 }
                 vec![scan.untracked.clone()]
             } else {
+                frame_policy.bound_batch(crate::policy::batch::tokens());
                 match frame_policy.plan_dispatch(
                     &scan.queued_ids,
                     &scan.blocked_lanes,

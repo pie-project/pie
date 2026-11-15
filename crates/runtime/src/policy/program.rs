@@ -146,6 +146,8 @@ pub struct Commit {
     pub terminate: Vec<(String, String)>,
     pub discard: Vec<String>,
     pub offload: Option<Offloads>,
+    /// The tokens one batch of passes carries; `Some(None)` withdraws them.
+    pub batch: Option<Option<u32>>,
     /// `(subject, name, value)`, in call order; `None` withdraws.
     pub publish: Vec<(String, Option<Value>)>,
 }
@@ -285,6 +287,7 @@ impl Program {
             terminate: staged.terminate,
             discard: staged.discard,
             offload: staged.offload,
+            batch: staged.batch,
             publish: staged.publish,
         }
     }
@@ -418,6 +421,7 @@ fn edge_name(edge: &Edge) -> &'static str {
 
 struct Grants {
     schedule: bool,
+    batch: bool,
     retention: bool,
     terminate: bool,
     discard: bool,
@@ -443,6 +447,7 @@ impl HostState {
             limits: StoreLimitsBuilder::new().memory_size(MEMORY_BYTES).build(),
             grants: Grants {
                 schedule: manifest.grants("schedule"),
+                batch: manifest.grants("batch"),
                 retention: manifest.grants("retention"),
                 terminate: manifest.grants("terminate"),
                 discard: manifest.grants("discard"),
@@ -497,6 +502,7 @@ struct Staged {
     terminate: Vec<(String, String)>,
     discard: Vec<String>,
     offload: Option<Offloads>,
+    batch: Option<Option<u32>>,
     publish: Vec<(String, Option<Value>)>,
     alarm: Option<u64>,
 }
@@ -603,6 +609,16 @@ impl worker_writes::Host for HostState {
                 entries: table,
                 default,
             });
+            Ok(())
+        });
+    }
+
+    fn install_batch(&mut self, tokens: Option<u32>) {
+        self.write("install-batch", |state| {
+            if !state.grants.batch {
+                return Err(Refusal::NotGranted);
+            }
+            state.call()?.staged.batch = Some(tokens);
             Ok(())
         });
     }

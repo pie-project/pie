@@ -6,6 +6,7 @@
 //! reports here, and nothing listens.
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
+pub mod batch;
 pub mod offload;
 pub mod pressure;
 pub mod retention;
