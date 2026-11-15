@@ -479,6 +479,40 @@ impl<B: Backend> Span<B> {
     }
 }
 
+/// The top rung among `rungs` (`(tokens, span bytes)`): the widest whose
+/// span lies in one `binding`, as the span lies in the pool's last segment
+/// and no segment is past a binding. `None`: not even the least does.
+#[must_use]
+pub fn bound_top(rungs: &[(u32, u64)], binding: u64) -> Option<u32> {
+    rungs
+        .iter()
+        .filter(|&&(_, bytes)| bytes <= binding)
+        .map(|&(tokens, _)| tokens)
+        .max()
+}
+
+/// `budget` with its fires cut to `top` tokens: the buckets past it go,
+/// and where any were stated, `top` is the last; a lane carries a token,
+/// so no more lanes than `top`.
+#[must_use]
+pub fn bounded_budget(budget: &poem_compiler::Budget, top: u32) -> poem_compiler::Budget {
+    let mut buckets: Vec<u32> = budget
+        .buckets
+        .iter()
+        .copied()
+        .filter(|&bucket| bucket < top)
+        .collect();
+    if !budget.buckets.is_empty() {
+        buckets.push(top);
+    }
+    poem_compiler::Budget {
+        max_lanes: budget.max_lanes.min(top),
+        max_tokens: top,
+        buckets,
+        ..budget.clone()
+    }
+}
+
 #[must_use]
 pub fn capacities(map: &ArenaMap) -> Vec<u32> {
     (0..map.placements.len())

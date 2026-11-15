@@ -447,8 +447,6 @@ where
             residency.kv_seats.unwrap_or(budgets.max_lanes),
         );
         let budget = bake_budgets(&budgets, &trace);
-        let max_readouts =
-            u32::try_from(poem_compiler::arena::readouts_ceiling(&budget)).unwrap_or(u32::MAX);
         let mut shell = Shell::load(Boot {
             trace,
             contract: &contract,
@@ -468,6 +466,11 @@ where
             handed: self.handed.take(),
         })
         .map_err(fault)?;
+        // The fire the shell took, which a binding may have bounded below
+        // the one asked.
+        let (max_lanes, max_tokens) = (shell.budget().max_lanes, shell.budget().max_tokens);
+        let max_readouts = u32::try_from(poem_compiler::arena::readouts_ceiling(shell.budget()))
+            .unwrap_or(u32::MAX);
         let disk_kv_pages = shell
             .seat_disk_kv(
                 disk_kv_budget,
@@ -505,9 +508,9 @@ where
             pools,
             chunks,
             limits: FireLimits {
-                max_lanes: budgets.max_lanes,
-                max_tokens: budgets.max_tokens,
-                max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
+                max_lanes,
+                max_tokens,
+                max_page_refs: paging.pages_per_slot.saturating_mul(max_lanes),
                 max_context: paging.context(),
                 prefill_rows: 0,
                 prefill_lanes: 0,

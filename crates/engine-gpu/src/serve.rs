@@ -728,61 +728,7 @@ impl<B: Serve> Shell<B> {
                 boot.runahead.frames_in_flight,
             );
         }
-        let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
-
         let facts = kv::probe(&boot.trace)?;
-
-        crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
-
-        let token_gridded = poem_exec::feeds::classes_reading(&boot.trace, &compiled, |def| {
-            matches!(def, poem_ir::Def::Input(RuntimeInput::TokenGrid { .. }))
-        });
-
-        let mut masked = poem_ir::ClassSet::default();
-        for region in compiled.template() {
-            let runs_masked = region.nodes.clone().any(|node| {
-                matches!(
-                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(poem_ir::Operation::Attn(
-                        poem_ir::Attn::Prefill {
-                            mask: Some(_),
-                            selection: None,
-                            bias: None,
-                            lse: None,
-                            ..
-                        } | poem_ir::Attn::Prefill {
-                            mask: Some(_),
-                            selection: None,
-                            bias: None,
-                            lse: Some(_),
-                            ..
-                        }
-                    ))
-                )
-            });
-            if runs_masked {
-                for class in region.mask.iter() {
-                    masked.insert(class);
-                }
-            }
-        }
-
-        let mut corrected = poem_ir::ClassSet::default();
-        for region in compiled.template() {
-            let runs_correction = region.nodes.clone().any(|node| {
-                matches!(
-                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(poem_ir::Operation::Linear(
-                        poem_ir::Linear::LoraCorrect { .. }
-                    ))
-                )
-            });
-            if runs_correction {
-                for class in region.mask.iter() {
-                    corrected.insert(class);
-                }
-            }
-        }
 
         let handles = Handles::new();
 
@@ -868,19 +814,108 @@ impl<B: Serve> Shell<B> {
         // a rung below the top lends the span under its carve to state and
         // a raise evacuates it (`Engine::evacuate`). A rung is a function of
         // the fire's rows: a recorded frame binds one rung's place only.
-        let top = budgets.tokens.max_tokens;
-        let mut rung_tokens = engine::memory::rungs(1, top);
-        if rung_tokens.last() != Some(&top) {
-            rung_tokens.push(top);
+        //
+        // A rung whose span cannot lie in one binding is no rung of this
+        // device: the span lies in the pool's last segment, and no segment
+        // is past a binding. The top is the widest rung that can; a fire
+        // wider than it has no carve, so the load's fires are cut to it and
+        // the model compiled again at it (its own carve is laid again, as
+        // it may differ from the rung's laid under the wider top).
+        let binding = device.max_buffer();
+        // The top asked and its rungs' `(tokens, span bytes)`, once bounded.
+        let mut unbounded: Option<(u32, Vec<(u32, u64)>)> = None;
+        let (compiled, mut span) = loop {
+            let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
+            let top = budgets.tokens.max_tokens;
+            let mut rung_tokens = engine::memory::rungs(1, top);
+            if rung_tokens.last() != Some(&top) {
+                rung_tokens.push(top);
+            }
+            let span = Span::plan(
+                &boot.trace,
+                &compiled,
+                &budgets,
+                &rung_tokens,
+                least,
+                &tuning,
+            )?;
+            let spans: Vec<(u32, u64)> = span
+                .rungs()
+                .iter()
+                .map(|rung| (rung.tokens, rung.bytes()))
+                .collect();
+            match crate::arena::bound_top(&spans, binding) {
+                Some(widest) if widest < top => {
+                    unbounded.get_or_insert((top, spans));
+                    budgets.tokens = crate::arena::bounded_budget(&budgets.tokens, widest);
+                    boot.budget = budgets.tokens.clone();
+                }
+                // None: not even the least rung lies in one binding, and
+                // the pool refuses the load below.
+                _ => break (compiled, span),
+            }
+        };
+        if let Some((asked, spans)) = unbounded {
+            tracing::info!(
+                asked,
+                top = budgets.tokens.max_tokens,
+                spans = ?spans,
+                "the top rung is bounded by this device's largest binding: {} MiB",
+                binding >> 20
+            );
         }
-        let mut span = Span::plan(
-            &boot.trace,
-            &compiled,
-            &budgets,
-            &rung_tokens,
-            least,
-            &tuning,
-        )?;
+
+        crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
+
+        let token_gridded = poem_exec::feeds::classes_reading(&boot.trace, &compiled, |def| {
+            matches!(def, poem_ir::Def::Input(RuntimeInput::TokenGrid { .. }))
+        });
+
+        let mut masked = poem_ir::ClassSet::default();
+        for region in compiled.template() {
+            let runs_masked = region.nodes.clone().any(|node| {
+                matches!(
+                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
+                    Some(poem_ir::Operation::Attn(
+                        poem_ir::Attn::Prefill {
+                            mask: Some(_),
+                            selection: None,
+                            bias: None,
+                            lse: None,
+                            ..
+                        } | poem_ir::Attn::Prefill {
+                            mask: Some(_),
+                            selection: None,
+                            bias: None,
+                            lse: Some(_),
+                            ..
+                        }
+                    ))
+                )
+            });
+            if runs_masked {
+                for class in region.mask.iter() {
+                    masked.insert(class);
+                }
+            }
+        }
+
+        let mut corrected = poem_ir::ClassSet::default();
+        for region in compiled.template() {
+            let runs_correction = region.nodes.clone().any(|node| {
+                matches!(
+                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
+                    Some(poem_ir::Operation::Linear(
+                        poem_ir::Linear::LoraCorrect { .. }
+                    ))
+                )
+            });
+            if runs_correction {
+                for class in region.mask.iter() {
+                    corrected.insert(class);
+                }
+            }
+        }
         let device_cap = device
             .left()
             .saturating_sub(u64::from(least_chunks) * chunk)
@@ -1179,36 +1214,19 @@ impl<B: Serve> Shell<B> {
         // budget states for state.
         let act_chunks = span.act_chunks(chunk);
         let act = act_chunks.last().map_or(0, |&(_, chunks)| chunks);
-        let room = kv_budget.map_or(left, |budget| {
-            budget.saturating_add(u64::from(act) * chunk).min(left)
-        });
-        let total = engine::chunk::fit(room, chunk, act, least_chunks)
-            .map_err(|short| Fault::Residency(short.to_string()))?;
-        let binds = u32::try_from(
-            (device.max_buffer() / chunk).saturating_mul(kernels_slang::SEGMENTS as u64),
-        )
-        .unwrap_or(u32::MAX);
-        // Whole segments of a quarter of the pool, all four within the
-        // bf16-element index the kernels address the pool by.
-        let words = u32::try_from(2 * u64::from(u32::MAX) / chunk).unwrap_or(u32::MAX)
-            / kernels_slang::SEGMENTS as u32
-            * kernels_slang::SEGMENTS as u32;
-        // State lies within that index; the span past it is the fire's
-        // alone (bound by offset, never indexed), at every rung.
-        let total = total.min(binds).min(words.saturating_add(act));
-        let span_short = || {
-            Fault::Residency(format!(
-                "one working set takes {least_chunks} chunks of {chunk} bytes beside a fire's \
-                 {act}, and this device binds four segments of {} MiB",
-                device.max_buffer() >> 20
-            ))
-        };
-        let segment_chunks =
-            crate::store::pool::segment_chunks(chunk, total, device.max_buffer(), act)
-                .ok_or_else(span_short)?;
-        if total < least_chunks + act {
-            return Err(span_short());
-        }
+        let crate::store::pool::Sized {
+            room,
+            total,
+            segment_chunks,
+            words,
+        } = crate::store::pool::sized(
+            left,
+            kv_budget,
+            chunk,
+            act,
+            least_chunks,
+            device.max_buffer(),
+        )?;
         // No rung lends a chunk past the kernels' index to state.
         let unindexed = total.saturating_sub(words);
         // Rungs taking as many chunks are one: each class is stated once,
