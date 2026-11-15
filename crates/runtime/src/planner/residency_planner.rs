@@ -361,6 +361,13 @@ impl ResidencyPlanner {
     /// `wanted`: the pages the head lacks. No more than that moves: a head
     /// short of one prompt's pages waited behind the copy of every idle page
     /// on the device.
+    /// [`Self::demote_idle`] for the governor's press: `pages` of idle
+    /// cache keyed above the floor move down a tier, as a waiter short of
+    /// that many would have them.
+    pub fn demote_for_governor(self: &Arc<Self>, pages: u32) -> bool {
+        self.demote_idle(pages)
+    }
+
     pub(super) fn demote_idle(self: &Arc<Self>, wanted: u32) -> bool {
         if !self.port.suspend_capable() {
             return false;

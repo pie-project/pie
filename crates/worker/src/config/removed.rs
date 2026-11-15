@@ -121,7 +121,11 @@ removed_keys! {
     DiskKvPersistent = "disk_kv_persistent":
         "keeping the disk tier is `[engine.memory] disk_persistent` now: move the value there";
     MemoryTolerance = "memory_tolerance":
-        "state `[engine.memory] governor_backoff` (the share of memory kept each congested stretch: dedicated 1.0, aggressive 0.9, balanced 0.8, polite 0.7) and `governor_release_idle = true` to give back memory demand stopped asking for";
+        "state `[engine.memory] yield` (0 to 1: how far the system's memory pressure presses the device pool in; 0, the default, never yields)";
+    GovernorBackoff = "governor_backoff":
+        "how far this process yields is `[engine.memory] yield` now (0 to 1: how far the system's memory pressure presses the device pool in; 0, the default, never yields)";
+    GovernorReleaseIdle = "governor_release_idle":
+        "memory goes back only under the system's pressure now, as far as `[engine.memory] yield` (0 to 1) lets; nothing is given back for being idle";
     WeightStreaming = "weight_streaming":
         "the weight cache has no mode: every streamable weight stays resident while the device has room, and live demand takes chunks from it before any kv or state gives way";
     MaxPatches = "max_patches":

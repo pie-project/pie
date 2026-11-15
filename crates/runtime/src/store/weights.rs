@@ -11,7 +11,7 @@
 //! 1. **Live demand before cache.** When every atom fits the pool at load,
 //!    every atom is resident and pinned (a *held* set: nothing misses,
 //!    nothing streams through a staging slot). When live demand needs the
-//!    chunks (a kv or state waiter short, or a governor cut with no room),
+//!    chunks (a kv or state waiter short, or the governor pressing the pool),
 //!    the cache leaves held: each shape keeps its staging slots (the
 //!    **floor**: the top-k experts of this layer and the next, this fire's
 //!    rows; pinned, live demand, never evicted) and gives the rest up. The
@@ -44,7 +44,7 @@ use std::collections::{BTreeMap, HashMap};
 use super::slots::{
     Holder, ShapeId, ShapeKind, Slot, SlotError, SlotPool, SlotPoolFacts, SlotShape,
 };
-use crate::governor::{Demand, Growth, PoolTarget, Retarget};
+use crate::governor::{Give, Growth, PoolTarget, Retarget};
 use ::engine::chunk::{
     ChunkFacts, ResidentWeight, WeightAtom, WeightResidency, WeightShape, WeightUses,
 };
@@ -768,14 +768,11 @@ pub trait SlotAccess {
     fn with_slots(&mut self, f: &mut dyn FnMut(&mut SlotPool, u64));
 }
 
-/// A pool target with a weight cache in it, shed first.
+/// A pool target with a weight cache in it.
 ///
-/// - Demand: the floor is live (its holder is), resident atoms above it
-///   are wanted (theirs is not), and atoms read but not resident are
-///   wanted too.
-/// - A shrink the inner pool has no room for sheds the cache to its floor
-///   and tries again; only with the cache at its floor does a shortfall
-///   come back as [`Retarget::NoRoom`], the governor's `tier-pressure`.
+/// - Floor: the inner pool's, and the weights' pinned staging bytes.
+/// - Pressed ([`Give::Weights`]), the cache sheds to its floor and does not
+///   refill while the target stays under what the pool holds.
 /// - At each tick: a kv or state waiter short sheds the cache; with none
 ///   short the atoms past break-even come back into what room is left. The
 ///   engine hears the resident set whenever it changed.
@@ -789,6 +786,9 @@ pub struct WeightFirst<P, W> {
     port: W,
     /// The cache was shed since the last tick: it does not refill on it.
     shed: bool,
+    /// The governor took the cache to its floor and the target is still
+    /// under what the pool holds: it does not refill until it is not.
+    pressed: bool,
 }
 
 impl<P: PoolTarget + SlotAccess, W: WeightPort> WeightFirst<P, W> {
@@ -798,6 +798,7 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> WeightFirst<P, W> {
             cache,
             port,
             shed: false,
+            pressed: false,
         }
     }
 
@@ -932,14 +933,6 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> WeightFirst<P, W> {
 }
 
 impl<P: PoolTarget + SlotAccess, W: WeightPort> PoolTarget for WeightFirst<P, W> {
-    fn demand(&mut self) -> Demand {
-        let demand = self.inner.demand();
-        Demand {
-            wanted: demand.wanted.saturating_add(self.cache.unmet_bytes()),
-            live: demand.live,
-        }
-    }
-
     fn segment_bytes(&self) -> u64 {
         self.inner.segment_bytes()
     }
@@ -966,28 +959,27 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> PoolTarget for WeightFirst<P, W>
     }
 
     fn retarget(&mut self, segments: u64) -> Retarget {
-        let first = self.inner.retarget(segments);
-        if !matches!(first, Retarget::NoRoom { .. }) {
-            return first;
+        if segments.saturating_mul(self.inner.segment_bytes()) >= self.inner.held() {
+            self.pressed = false;
         }
-        if !self.cache.streaming() {
-            self.leave_held();
-            return first;
-        }
-        if self.shed() == 0 {
-            return first;
-        }
-        match self.inner.retarget(segments) {
-            // What was shed comes back as the fires reading it retire: the
-            // pool is on its way, and the next tick tries again with the
-            // cache at its floor.
-            Retarget::NoRoom { .. } => Retarget::Reached,
-            reached => reached,
-        }
+        self.inner.retarget(segments)
     }
 
-    fn take_refused(&mut self) -> bool {
-        self.inner.take_refused()
+    fn refused(&self) -> bool {
+        self.inner.refused()
+    }
+
+    /// The weight cache above its staging floor goes at once (held, it
+    /// first offers the engine the streaming set); the rest is the inner
+    /// pool's to give.
+    fn give(&mut self, what: Give, bytes: u64) -> u64 {
+        if what != Give::Weights {
+            return self.inner.give(what, bytes);
+        }
+        let before = self.cache.cache_bytes();
+        self.shed();
+        self.pressed = true;
+        before.saturating_sub(self.cache.cache_bytes())
     }
 
     fn ticked(&mut self) {
@@ -998,13 +990,13 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> PoolTarget for WeightFirst<P, W>
         }
         let mut short = false;
         let cache = &mut self.cache;
-        let shed = self.shed;
+        let (shed, pressed) = (self.shed, self.pressed);
         self.inner.with_slots(&mut |pool, epoch| {
             short = kv_short(pool, cache);
             if short {
                 cache.shed(pool, epoch);
             }
-            cache.tick(pool, epoch, !short && !shed);
+            cache.tick(pool, epoch, !short && !shed && !pressed);
         });
         if short && !self.cache.streaming() {
             self.leave_held();

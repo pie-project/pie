@@ -1,25 +1,26 @@
-//! How much of its kv pool this process may hold while the system around it
-//! is under load.
+//! How much of its device pool this process holds while the system around
+//! it is pressed for memory.
 //!
-//! One congestion loop: the system is watched, not estimated. A process
-//! cannot read how much memory other work would like, only whether the
-//! system is struggling, so it probes upward while the system is calm and
-//! backs off when it is not. It watches demand as well: memory the process
-//! stopped asking for goes back a little at a time, with or without anyone
-//! else wanting it. The loop answers in bytes alone; which pages go is the
-//! planner's to decide.
+//! The pool is a balloon held taut against its ceiling (`[engine.memory]
+//! budget_device`, what the load measured): with demand it takes all of
+//! it, and the system's pressure presses it in as far as the deployment's
+//! `yield` lets, one continuous figure:
+//!
+//! ```text
+//! target = floor + (ceiling - floor) * (1 - yield * pressure)
+//! ```
+//!
+//! `pressure` is the system's own reading in `[0, 1]` ([`pressure`]),
+//! read when the system says it changed; `floor` is what the running
+//! requests need to make progress ([`PoolTarget::floor`]). Nothing goes
+//! back on its own: memory leaves only under pressure, and what leaves goes
+//! in the order [`Give::ORDER`] states, the policy's keys ordering it
+//! within each. What running requests hold is never given back.
 //!
 //! The loop decides how much, never what: the pool behind [`PoolTarget`]
-//! decides how its segments move, and what stays is the policy's. Short of
-//! room to give a segment back, the pool keeps it and the loop raises
-//! [`Signal::TierPressure`]; nothing here drops state.
-//!
-//! A platform supplies two things and no policy: the hard limit, and whether
-//! the system is congested ([`Pressure`]). A platform that cannot tell reads
-//! as calm, so demand alone moves the target there. A deployment states two
-//! things ([`Tolerance`]): how much to yield when the system is congested,
-//! and whether memory demand stopped asking for goes back. Every threshold
-//! here was measured on one 16 GB machine; none is claimed for a larger one.
+//! decides how its segments move, and which entries go is the policy's.
+//! At `yield = 0`, and wherever nothing reads the system (a browser tab),
+//! the target is the ceiling and the loop decides nothing.
 
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -27,151 +28,63 @@ pub mod psi;
 pub mod run;
 pub mod steered;
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
-/// What the platform says about the system right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pressure {
-    /// Nothing is struggling.
-    Calm,
-    /// The system is working to make room, or what it pushed out is coming
-    /// straight back.
-    Congested,
-    /// Hand memory back now: the next step is the system killing something.
-    Critical,
-}
+/// The system's memory pressure as it last said it, in `[0, 1]`: 0 where
+/// nothing stalls, 1 where the system can give no more.
+pub type Reading = tokio::sync::watch::Receiver<f64>;
 
-/// A platform's reader of how the system is doing, a tick at a time.
-pub trait System: Send {
-    fn read(&mut self) -> Pressure;
-}
-
-/// Where nothing says how the system is doing, as in a browser tab.
-#[cfg(not(target_os = "macos"))]
-struct Silent;
-
-#[cfg(not(target_os = "macos"))]
-impl System for Silent {
-    fn read(&mut self) -> Pressure {
-        Pressure::Calm
-    }
-}
-
-/// A test hook: while the file `PIE_PRESSURE_FILE` names says `critical`,
-/// `congested` or `calm`, that is how the system is read, so a test can
-/// induce pressure mid-run; anything else reads calm.
-struct Told(std::path::PathBuf);
-
-impl System for Told {
-    fn read(&mut self) -> Pressure {
-        match std::fs::read_to_string(&self.0).as_deref().map(str::trim) {
-            Ok("critical") => Pressure::Critical,
-            Ok("congested") => Pressure::Congested,
-            _ => Pressure::Calm,
-        }
-    }
-}
-
-/// This platform's reader.
+/// This platform's pressure reading, one for every engine's loop; `None`
+/// where the platform offers none (a browser tab, a kernel without PSI),
+/// so pressure reads 0 there.
 #[must_use]
-pub fn system() -> Box<dyn System> {
-    if let Some(path) = std::env::var_os("PIE_PRESSURE_FILE") {
-        return Box::new(Told(path.into()));
-    }
-    #[cfg(target_os = "macos")]
-    return Box::<macos::Watch>::default();
-    #[cfg(not(target_os = "macos"))]
-    psi::Watch::open().map_or_else(
-        || Box::new(Silent) as Box<dyn System>,
-        |watch| Box::new(watch) as Box<dyn System>,
-    )
+pub fn pressure() -> Option<Reading> {
+    static READING: OnceLock<Option<Reading>> = OnceLock::new();
+    READING.get_or_init(watch).clone()
 }
 
-/// How this process yields memory to the system around it
-/// (`[engine.memory] governor_backoff` and `governor_release_idle`).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Tolerance {
-    /// The share of the target kept each time the system stays congested
-    /// for [`PATIENCE`] ticks; `1.0` never yields to pressure.
-    pub backoff: f64,
-    /// Whether memory demand stopped asking for goes back, a little at a
-    /// time, with or without anyone else wanting it.
-    pub release_idle: bool,
+#[cfg(target_os = "linux")]
+fn watch() -> Option<Reading> {
+    psi::watch()
 }
 
-impl Tolerance {
-    /// The machine is this process's: the loop never lowers the target and
-    /// growth is unlimited. What a server has always done.
-    pub const DEDICATED: Tolerance = Tolerance {
-        backoff: 1.0,
-        release_idle: false,
-    };
-
-    /// Whether it yields to pressure: a backoff under the whole target.
-    #[must_use]
-    pub fn yields(self) -> bool {
-        self.backoff < 1.0
-    }
-
-    /// Whether the loop moves the target at all.
-    #[must_use]
-    pub fn dedicated(self) -> bool {
-        !self.yields() && !self.release_idle
-    }
+#[cfg(target_os = "macos")]
+fn watch() -> Option<Reading> {
+    macos::watch()
 }
 
-impl Default for Tolerance {
-    fn default() -> Self {
-        Self::DEDICATED
-    }
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn watch() -> Option<Reading> {
+    None
 }
-
-/// Congested ticks in a row before a backoff acts: a debounce of the
-/// pressure signal, not an intent. One congested tick is a single reading
-/// of a noisy signal; two in a row are a stretch.
-pub const PATIENCE: u32 = 2;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    /// Below this the process cannot make progress.
-    pub floor: u64,
+    /// The pool's ceiling: what the load may take of the device.
     pub hard_limit: u64,
-    /// The most one calm tick adds.
-    pub step: u64,
-    /// The least one idle cut takes: a pool that moves by copying pays for
-    /// every cut, so small ones are not worth making. Never less than a
-    /// segment, since a cut smaller than one gives nothing back.
-    pub shrink_step: u64,
     /// The pool's grow and shrink unit.
     pub segment_bytes: u64,
 }
 
 impl Limits {
-    /// The limits `pool` puts on a loop that adds at most `step` a tick. A
-    /// fixed pool never cuts.
+    /// The limits of `pool`.
     #[must_use]
-    pub fn of(pool: &impl PoolTarget, step: u64) -> Self {
-        let segment_bytes = pool.segment_bytes().max(1);
+    pub fn of(pool: &impl PoolTarget) -> Self {
         Self {
-            floor: pool.floor(),
             hard_limit: pool.hard_limit(),
-            step,
-            shrink_step: match pool.growth() {
-                Growth::Fixed => u64::MAX,
-                Growth::Elastic { least_cut } => least_cut.max(segment_bytes),
-            },
-            segment_bytes,
+            segment_bytes: pool.segment_bytes().max(1),
         }
     }
 
-    /// The segments `target` bytes come to: rounded up, and never fewer than
-    /// the floor takes.
+    /// The segments `target` bytes come to, rounded up, never past the
+    /// ceiling's.
     #[must_use]
     pub const fn segments(&self, target: u64) -> u64 {
-        let target = if target > self.floor {
+        let target = if target < self.hard_limit {
             target
         } else {
-            self.floor
+            self.hard_limit
         };
         target.div_ceil(self.segment_bytes)
     }
@@ -180,11 +93,10 @@ impl Limits {
 /// How a pool's memory can move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Growth {
-    /// All of it is there from load and stays: the process is dedicated.
+    /// All of it is there from load and stays: nothing can be given back.
     Fixed,
-    /// Segments commit and release; a cut takes at least `least_cut` bytes,
-    /// and at least a segment whatever this says.
-    Elastic { least_cut: u64 },
+    /// Segments commit and release.
+    Elastic,
 }
 
 /// What a pool made of a retarget.
@@ -197,16 +109,39 @@ pub enum Retarget {
     NoRoom { held: u64 },
 }
 
-/// The pool a governor steers: it says how much is asked of it and takes a
-/// number of segments; how they move is its own. It offers no way to drop
-/// state, and the governor asks for none.
+/// What a pressed pool gives back, in [`Give::ORDER`]: the runtime fixes
+/// the order of the kinds, the policy's keys the order within each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Give {
+    /// Idle sealed prefixes and checkpoint rows whose keys say they may go
+    /// (at the retention floor), lowest key first; with no policy, least
+    /// recently hit first, decoded prefixes before prompt-only ones.
+    Cache,
+    /// The weight cache above its staging floor.
+    Weights,
+    /// Idle prefixes keyed above the floor, moved down a tier rather than
+    /// dropped.
+    Demote,
+    /// The activation rung: fires narrower, where the engine backs its span
+    /// on demand. Where the span is backed from the load, a narrower rung
+    /// frees nothing.
+    Rung,
+}
+
+impl Give {
+    pub const ORDER: [Give; 4] = [Give::Cache, Give::Weights, Give::Demote, Give::Rung];
+}
+
+/// The pool a governor steers: it says what it can and must hold and
+/// takes a number of segments; how they move is its own.
 pub trait PoolTarget {
-    /// What is asked of the pool now, in bytes.
-    fn demand(&mut self) -> Demand;
     /// The pool's grow and shrink unit, in bytes.
     fn segment_bytes(&self) -> u64;
-    /// Bytes below which one lane cannot run: one working set at the
-    /// declared context, and the activation of the smallest rung.
+    /// Bytes the running requests need to make progress: the reserved
+    /// chunks, the least the activation can come down to, the live state
+    /// (and never less than one working set at the declared context, so a
+    /// request can always start), and the weights' pinned staging bytes.
+    /// Idle cache is no part of it.
     fn floor(&self) -> u64;
     /// The whole of what the pool can take, in bytes.
     fn hard_limit(&self) -> u64;
@@ -216,111 +151,33 @@ pub trait PoolTarget {
     /// Moves the pool toward `segments`. A shrink evacuates the emptiest
     /// segment and then releases it, and stops where there is no room.
     fn retarget(&mut self, segments: u64) -> Retarget;
-    /// Whether the system refused memory since this last asked: the system
-    /// pushing back, read as [`Pressure::Critical`].
-    fn take_refused(&mut self) -> bool {
+    /// Whether a commit the system refused stands: until room is freed, the
+    /// target stays at what the pool holds.
+    fn refused(&self) -> bool {
         false
     }
-    /// A tick's turn is done (not a waiter's): what changes only once a
-    /// tick, as which weights are resident, changes now.
+    /// Gives back up to `bytes` of `what`: the bytes freed, or on their way.
+    fn give(&mut self, _what: Give, _bytes: u64) -> u64 {
+        0
+    }
+    /// A tick's turn is done: what changes only once a tick, as which
+    /// weights are resident, changes now.
     fn ticked(&mut self) {}
 }
 
-/// What the loop tells the runtime, which maps it to the policy's
-/// `tier-pressure`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Signal {
-    /// The pool holds `held_bytes` against a target of `target_bytes` and
-    /// has no room to give the difference back.
-    TierPressure { held_bytes: u64, target_bytes: u64 },
-    /// The pool reached its target again.
-    Eased,
-}
-
-/// What the process could use right now, in bytes.
+/// One pool's governor: the target its ceiling, floor, `yield` and the
+/// pressure come to.
 #[derive(Debug, Clone, Copy)]
-pub struct Demand {
-    /// All of it: what is live and, past it, the weights resident above their
-    /// staging floor, those the weight cache would hold with room, and what
-    /// parked waiters are short. The target grows this far.
-    pub wanted: u64,
-    /// What a sequence, a store or the weights' staging floor holds: all that
-    /// is wanted but the weights above that floor, the weight cache's unmet
-    /// bytes and the waiters' shortfall. The sealed prefixes and the
-    /// checkpoints the stores keep are in it, whatever the policy keys them:
-    /// no cut reaches them, and which of them goes is the policy's ranking,
-    /// when a request needs the room. An idle target comes back this far.
-    pub live: u64,
-}
-
-/// Calm ticks to wait after a backoff before probing up again. A push-back
-/// quadruples it and a calm stretch halves it, so a probe that keeps failing
-/// waits longer each round and a run of calm forgets it.
-const FIRST_HOLD: u32 = 4;
-const LONGEST_HOLD: u32 = 256;
-
-/// Calm ticks a hold of [`FIRST_HOLD`] takes to count as settled; a longer
-/// hold takes as many times longer.
-const SETTLED: u32 = 64;
-
-/// Calm ticks with `live` not rising before the target starts back down:
-/// long enough that a pause between requests keeps its memory.
-const IDLE_AFTER: u32 = 120;
-
-/// Ticks between cuts once idle, and the share of the gap each one takes.
-const CUT_EVERY: u32 = 4;
-const CUT_SHARE: u64 = 8;
-
 pub struct Governor {
     limits: Limits,
-    tolerance: Tolerance,
-    target: u64,
-    congested_ticks: u32,
-    hold: u32,
-    held: u32,
-    calm_ticks: u32,
-    yielding: bool,
-    idle_ticks: u32,
-    last_live: u64,
+    share: f64,
 }
 
 impl Governor {
-    /// `held` is what the process has now: a pool that starts whole starts
-    /// the target there, and one that starts empty at the floor.
+    /// `share` is the deployment's `yield`, in `[0, 1]`.
     #[must_use]
-    ///
-    /// # Panics
-    ///
-    /// If a cut can be smaller than a segment.
-    pub fn new(limits: Limits, tolerance: Tolerance, held: u64) -> Self {
-        assert!(
-            limits.shrink_step >= limits.segment_bytes && limits.segment_bytes > 0,
-            "a cut of {} bytes is smaller than a segment of {}",
-            limits.shrink_step,
-            limits.segment_bytes,
-        );
-        let target = if tolerance.dedicated() {
-            limits.hard_limit
-        } else {
-            held.clamp(limits.floor, limits.hard_limit)
-        };
-        Self {
-            limits,
-            tolerance,
-            target,
-            congested_ticks: 0,
-            hold: 0,
-            held: 0,
-            calm_ticks: 0,
-            yielding: false,
-            idle_ticks: 0,
-            last_live: 0,
-        }
-    }
-
-    #[must_use]
-    pub const fn target(&self) -> u64 {
-        self.target
+    pub const fn new(limits: Limits, share: f64) -> Self {
+        Self { limits, share }
     }
 
     #[must_use]
@@ -328,503 +185,80 @@ impl Governor {
         &self.limits
     }
 
+    /// Whether pressure moves the target at all.
     #[must_use]
-    pub const fn tolerance(&self) -> Tolerance {
-        self.tolerance
+    pub fn yields(&self) -> bool {
+        self.share > 0.0
     }
 
-    /// Whether the system has pushed back and not yet stayed calm. While it
-    /// is, the process holds to less than it could use.
+    /// `floor + (ceiling - floor) * (1 - yield * pressure)`, never under the
+    /// floor nor past the ceiling.
     #[must_use]
-    pub const fn yielding(&self) -> bool {
-        self.yielding
-    }
-
-    /// Whether the system is calm and nothing has asked for more in a while.
-    #[must_use]
-    pub const fn idle(&self) -> bool {
-        self.idle_ticks >= IDLE_AFTER
-    }
-
-    /// One tick. The target rises only toward demand, so memory nothing asked
-    /// for is not taken on the strength of a calm system, and it falls back
-    /// toward demand once that stops rising.
-    pub fn tick(&mut self, pressure: Pressure, demand: Demand) -> u64 {
-        if self.tolerance.dedicated() {
-            return self.target;
-        }
-        // A process that does not yield reads every tick as calm.
-        let pressure = if self.tolerance.yields() {
-            pressure
-        } else {
-            Pressure::Calm
-        };
-        if pressure != Pressure::Calm {
-            self.idle_ticks = 0;
-        }
-        match pressure {
-            Pressure::Critical => {
-                self.target = self.limits.floor;
-                self.backed_off();
-            }
-            Pressure::Congested => {
-                self.calm_ticks = 0;
-                self.congested_ticks += 1;
-                if self.congested_ticks >= PATIENCE {
-                    self.congested_ticks = 0;
-                    self.target = ((self.target as f64 * self.tolerance.backoff) as u64)
-                        .max(self.limits.floor);
-                    self.backed_off();
-                }
-            }
-            Pressure::Calm => self.calm(demand),
-        }
-        self.target
-    }
-
-    /// One stretch of pressure is one failure, however many ticks it lasts;
-    /// only a push-back after calm has been counted makes the wait longer.
-    fn backed_off(&mut self) {
-        if self.held > 0 || self.hold == 0 {
-            self.hold = (self.hold * 4).clamp(FIRST_HOLD, LONGEST_HOLD);
-        }
-        self.held = 0;
-        self.calm_ticks = 0;
-        self.yielding = true;
-    }
-
-    fn calm(&mut self, demand: Demand) {
-        self.congested_ticks = 0;
-        self.calm_ticks = self.calm_ticks.saturating_add(1);
-        if self.calm_ticks >= SETTLED.saturating_mul(self.hold / FIRST_HOLD).max(SETTLED) {
-            self.hold /= 2;
-            self.calm_ticks = 0;
-            self.yielding = false;
-        }
-        self.idle_ticks = if demand.live > self.last_live {
-            0
-        } else {
-            self.idle_ticks.saturating_add(1)
-        };
-        self.last_live = demand.live;
-        let rest = self.rest(demand);
-        if self.releasing() && (self.idle_ticks - IDLE_AFTER).is_multiple_of(CUT_EVERY) {
-            self.cut(rest);
-        }
-        if self.held < self.hold {
-            self.held += 1;
-            return;
-        }
-        self.rise(rest);
-    }
-
-    /// Whether a waiter can be served by a rise instead of an eviction.
-    #[must_use]
-    pub const fn can_rise(&self) -> bool {
-        !self.yielding && self.held >= self.hold && self.target < self.limits.hard_limit
-    }
-
-    /// A waiter is short now: the rise the next calm tick would make, without
-    /// waiting for it. A tick reads the system; this only spends what the
-    /// last one allowed.
-    pub fn asked(&mut self, demand: Demand) -> u64 {
-        if self.can_rise() {
-            self.idle_ticks = 0;
-            self.rise(demand.wanted);
-        }
-        self.target
-    }
-
-    /// Whether idle memory is on its way back.
-    const fn releasing(&self) -> bool {
-        self.tolerance.release_idle && self.idle()
-    }
-
-    /// Where a calm tick takes the target: to all that is wanted, and to
-    /// what is live alone while idle memory goes back. No count of ticks
-    /// lowers it further: what is live stays under the target however long
-    /// the idle lasts.
-    const fn rest(&self, demand: Demand) -> u64 {
-        if self.releasing() {
-            demand.live
-        } else {
-            demand.wanted
-        }
-    }
-
-    fn rise(&mut self, demand: u64) {
-        if demand > self.target {
-            let room = demand
-                .min(self.limits.hard_limit)
-                .saturating_sub(self.target);
-            self.target += room.min(self.limits.step);
-        }
-    }
-
-    fn cut(&mut self, rest: u64) {
-        let gap = self.target.saturating_sub(rest.max(self.limits.floor));
-        self.target -= (gap / CUT_SHARE).max(self.limits.shrink_step).min(gap);
+    pub fn target(&self, floor: u64, pressure: f64) -> u64 {
+        let ceiling = self.limits.hard_limit;
+        let floor = floor.min(ceiling);
+        let kept = 1.0 - self.share * pressure.clamp(0.0, 1.0);
+        let room = (ceiling - floor) as f64 * kept;
+        floor + (room as u64).min(ceiling - floor)
     }
 }
 
-/// How often the loop looks. Critical waits for no more than this.
+/// How often the loop ticks: what settles on it is the weight cache's
+/// windows, the rung walk's patience and the ledger's reading; a yielding
+/// pool re-reads its floor on it while pressed. No yield is paced by it.
 pub const TICK: Duration = Duration::from_millis(250);
-
-/// Whether what the system pushed out is coming back: decompressions and
-/// swap-ins against compressions and swap-outs over a tick. Paging out alone
-/// is health, memory going idle to make room; paging back in what just went
-/// out is congestion. Below `MIN_EVICTED` pages a tick the ratio is noise.
-#[must_use]
-pub fn refaulting(evicted: u64, returned: u64) -> bool {
-    const MIN_EVICTED: u64 = 2_000;
-    const THRASHING: f64 = 0.5;
-    evicted >= MIN_EVICTED && returned as f64 / evicted as f64 >= THRASHING
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const MIB: u64 = 1 << 20;
-
-    /// The four profiles the old `memory_tolerance` named, as the two keys
-    /// state them.
-    const AGGRESSIVE: Tolerance = Tolerance {
-        backoff: 0.9,
-        release_idle: true,
-    };
-    const BALANCED: Tolerance = Tolerance {
-        backoff: 0.8,
-        release_idle: true,
-    };
-    const POLITE: Tolerance = Tolerance {
-        backoff: 0.7,
-        release_idle: true,
-    };
     const LIMITS: Limits = Limits {
-        floor: 100 * MIB,
         hard_limit: 1000 * MIB,
-        step: 50 * MIB,
-        shrink_step: 10 * MIB,
         segment_bytes: MIB,
     };
+    const FLOOR: u64 = 200 * MIB;
 
-    const fn all(bytes: u64) -> Demand {
-        Demand {
-            wanted: bytes,
-            live: bytes,
+    #[test]
+    fn the_target_is_the_floor_plus_what_yield_and_pressure_leave_of_the_room() {
+        // (yield, pressure, target): the room above the floor is 800 MiB.
+        for (share, pressure, target) in [
+            (0.0, 0.0, 1000.0),
+            (0.0, 0.5, 1000.0),
+            (0.0, 1.0, 1000.0),
+            (0.3, 0.0, 1000.0),
+            (0.3, 0.5, 200.0 + 800.0 * 0.85),
+            (0.3, 1.0, 200.0 + 800.0 * 0.7),
+            (1.0, 0.0, 1000.0),
+            (1.0, 0.5, 600.0),
+            (1.0, 1.0, 200.0),
+        ] {
+            let governor = Governor::new(LIMITS, share);
+            let got = governor.target(FLOOR, pressure);
+            // A byte either way is the float's rounding.
+            assert!(
+                got.abs_diff((target * MIB as f64) as u64) <= 1,
+                "yield {share}, pressure {pressure}: {got}"
+            );
         }
     }
 
-    fn calm_to(governor: &mut Governor, ticks: u32, demand: u64) {
-        for _ in 0..ticks {
-            governor.tick(Pressure::Calm, all(demand));
-        }
+    #[test]
+    fn a_reading_past_its_range_is_its_bound() {
+        let governor = Governor::new(LIMITS, 1.0);
+        assert_eq!(governor.target(FLOOR, 2.0), FLOOR);
+        assert_eq!(governor.target(FLOOR, -1.0), LIMITS.hard_limit);
     }
 
     #[test]
-    fn a_dedicated_process_holds_the_hard_limit_whatever_happens() {
-        let mut governor = Governor::new(LIMITS, Tolerance::DEDICATED, 0);
-        assert_eq!(governor.tick(Pressure::Critical, all(0)), LIMITS.hard_limit);
-        assert_eq!(
-            governor.tick(Pressure::Congested, all(0)),
-            LIMITS.hard_limit
-        );
-        assert_eq!(governor.tick(Pressure::Calm, all(0)), LIMITS.hard_limit);
+    fn a_floor_past_the_ceiling_is_the_ceiling() {
+        let governor = Governor::new(LIMITS, 1.0);
+        assert_eq!(governor.target(2000 * MIB, 1.0), LIMITS.hard_limit);
     }
 
     #[test]
-    fn a_pool_that_starts_whole_starts_the_target_there() {
-        let governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
-        assert_eq!(governor.target(), LIMITS.hard_limit);
-    }
-
-    #[test]
-    fn calm_grows_by_a_step_toward_demand_and_no_further() {
-        let mut governor = Governor::new(LIMITS, BALANCED, 0);
-        assert_eq!(governor.tick(Pressure::Calm, all(400 * MIB)), 150 * MIB);
-        calm_to(&mut governor, 100, 400 * MIB);
-        assert_eq!(governor.target(), 400 * MIB);
-        calm_to(&mut governor, 10, 300 * MIB);
-        assert_eq!(governor.target(), 400 * MIB, "low demand does not cut");
-    }
-
-    #[test]
-    fn growth_stops_at_the_hard_limit() {
-        let mut governor = Governor::new(LIMITS, AGGRESSIVE, 0);
-        calm_to(&mut governor, 100, u64::MAX);
-        assert_eq!(governor.target(), LIMITS.hard_limit);
-    }
-
-    #[test]
-    fn critical_cuts_to_the_floor_at_once() {
-        let mut governor = Governor::new(LIMITS, AGGRESSIVE, 0);
-        calm_to(&mut governor, 100, u64::MAX);
-        assert_eq!(
-            governor.tick(Pressure::Critical, all(u64::MAX)),
-            LIMITS.floor
-        );
-    }
-
-    #[test]
-    fn congestion_backs_off_by_the_tolerance_and_stops_at_the_floor() {
-        let mut governor = Governor::new(LIMITS, POLITE, 0);
-        calm_to(&mut governor, 100, u64::MAX);
-        assert_eq!(
-            governor.tick(Pressure::Congested, all(u64::MAX)),
-            LIMITS.hard_limit,
-            "one congested tick is a reading, not a stretch"
-        );
-        assert_eq!(
-            governor.tick(Pressure::Congested, all(u64::MAX)),
-            700 * MIB,
-            "two are: the backoff keeps its share"
-        );
-        for _ in 0..64 {
-            governor.tick(Pressure::Congested, all(u64::MAX));
-        }
-        assert_eq!(governor.target(), LIMITS.floor);
-    }
-
-    #[test]
-    fn a_balanced_process_waits_out_one_congested_tick() {
-        let mut governor = Governor::new(LIMITS, BALANCED, 0);
-        calm_to(&mut governor, 100, u64::MAX);
-        assert_eq!(
-            governor.tick(Pressure::Congested, all(0)),
-            LIMITS.hard_limit
-        );
-        governor.tick(Pressure::Calm, all(0));
-        assert_eq!(
-            governor.tick(Pressure::Congested, all(0)),
-            LIMITS.hard_limit
-        );
-        assert_eq!(governor.tick(Pressure::Congested, all(0)), 800 * MIB);
-    }
-
-    #[test]
-    fn a_probe_that_fails_soon_waits_longer_before_the_next() {
-        let mut governor = Governor::new(LIMITS, POLITE, 0);
-        calm_to(&mut governor, 100, u64::MAX);
-        let held_for = |governor: &mut Governor| {
-            governor.tick(Pressure::Congested, all(u64::MAX));
-            let backed = governor.tick(Pressure::Congested, all(u64::MAX));
-            let mut ticks = 0;
-            while governor.tick(Pressure::Calm, all(u64::MAX)) == backed {
-                ticks += 1;
-            }
-            ticks
-        };
-        let first = held_for(&mut governor);
-        let second = held_for(&mut governor);
-        assert!(second > first);
-    }
-
-    #[test]
-    fn one_stretch_of_pressure_is_one_failure() {
-        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
-        for _ in 0..8 {
-            governor.tick(Pressure::Critical, all(u64::MAX));
-        }
-        assert_eq!(governor.hold, FIRST_HOLD);
-    }
-
-    #[test]
-    fn yielding_ends_only_after_a_calm_as_long_as_the_failures_earned() {
-        let mut governor = Governor::new(LIMITS, POLITE, 0);
-        governor.tick(Pressure::Congested, all(0));
-        governor.tick(Pressure::Congested, all(0));
-        assert!(governor.yielding());
-        calm_to(&mut governor, SETTLED - 1, 0);
-        assert!(governor.yielding());
-        calm_to(&mut governor, 1, 0);
-        assert!(!governor.yielding(), "one round settles in one stretch");
-
-        governor.tick(Pressure::Congested, all(0));
-        governor.tick(Pressure::Congested, all(0));
-        calm_to(&mut governor, SETTLED, 0);
-        assert!(governor.yielding(), "a second round in a row takes longer");
-    }
-
-    #[test]
-    fn a_long_calm_forgets_the_backoff() {
-        let mut governor = Governor::new(LIMITS, POLITE, 0);
-        governor.tick(Pressure::Congested, all(u64::MAX));
-        governor.tick(Pressure::Congested, all(u64::MAX));
-        calm_to(&mut governor, 1000, u64::MAX);
-        assert_eq!(governor.hold, 0);
-    }
-
-    /// A process that kept `wanted`, of which only `live` is in use, over
-    /// `ticks` calm ticks.
-    fn kept(governor: &mut Governor, ticks: u32, wanted: u64, live: u64) -> u64 {
-        for _ in 0..ticks {
-            governor.tick(Pressure::Calm, Demand { wanted, live });
-        }
-        governor.target()
-    }
-
-    #[test]
-    fn a_pause_keeps_its_memory() {
-        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
-        assert_eq!(kept(&mut governor, IDLE_AFTER - 1, 0, 0), LIMITS.hard_limit);
-    }
-
-    #[test]
-    fn idle_memory_goes_back_a_little_at_a_time_as_far_as_the_floor() {
-        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
-        kept(&mut governor, IDLE_AFTER, 0, 0);
-        let first = governor.target();
-        assert_eq!(first, LIMITS.hard_limit - 900 * MIB / CUT_SHARE);
-        let next = kept(&mut governor, CUT_EVERY, 0, 0);
-        assert!(next < first && first - next <= 900 * MIB / CUT_SHARE);
-        assert_eq!(kept(&mut governor, 2000, 0, 0), LIMITS.floor);
-    }
-
-    #[test]
-    fn what_is_past_live_goes_with_the_first_idle_cuts() {
-        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
-        let (wanted, live) = (600 * MIB, 300 * MIB);
-        assert_eq!(
-            kept(&mut governor, IDLE_AFTER - 1, wanted, live),
-            LIMITS.hard_limit,
-            "a pause keeps all of it"
-        );
-        // The first tick saw `live` rise from nothing: one more ends the pause.
-        let first = kept(&mut governor, 2, wanted, live);
-        assert_eq!(first, LIMITS.hard_limit - 700 * MIB / CUT_SHARE);
-        assert!(kept(&mut governor, 8 * CUT_EVERY, wanted, live) < wanted);
-    }
-
-    #[test]
-    fn a_cut_stops_at_what_is_live_however_long_the_idle() {
-        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
-        let (wanted, live) = (600 * MIB, 300 * MIB);
-        let settled = kept(&mut governor, IDLE_AFTER + 400, wanted, live);
-        assert_eq!(settled, live);
-        assert_eq!(kept(&mut governor, 100_000, wanted, live), live);
-    }
-
-    #[test]
-    fn an_idle_target_does_not_rise_for_what_is_only_wanted() {
-        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.floor);
-        kept(&mut governor, IDLE_AFTER + 1, 0, 0);
-        assert!(governor.idle());
-        assert_eq!(kept(&mut governor, 100, 600 * MIB, 0), LIMITS.floor);
-        // What is live rising ends the idle: the target rises for all of it.
-        let risen = kept(&mut governor, 1, 600 * MIB, MIB);
-        assert!(!governor.idle());
-        assert_eq!(risen, LIMITS.floor + LIMITS.step);
-    }
-
-    #[test]
-    fn a_process_that_keeps_idle_memory_rises_to_all_that_is_wanted_however_idle() {
-        let keeps = Tolerance {
-            backoff: 0.8,
-            release_idle: false,
-        };
-        let mut governor = Governor::new(LIMITS, keeps, LIMITS.floor);
-        let (wanted, live) = (600 * MIB, 300 * MIB);
-        assert_eq!(kept(&mut governor, 100_000, wanted, live), wanted);
-    }
-
-    #[test]
-    fn a_pool_that_moves_by_copying_cuts_once() {
-        let limits = Limits {
-            shrink_step: u64::MAX,
-            ..LIMITS
-        };
-        let mut governor = Governor::new(limits, BALANCED, limits.hard_limit);
-        assert_eq!(kept(&mut governor, IDLE_AFTER, 0, 0), limits.floor);
-    }
-
-    #[test]
-    fn a_waiter_gets_the_rise_at_once_and_ends_the_idle() {
-        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.floor);
-        // The first tick sees `live` rise from nothing.
-        kept(&mut governor, IDLE_AFTER + 1, LIMITS.floor, LIMITS.floor);
-        assert!(governor.idle());
-        assert_eq!(
-            governor.asked(all(LIMITS.floor + 20 * MIB)),
-            LIMITS.floor + 20 * MIB
-        );
-        assert!(!governor.idle());
-    }
-
-    #[test]
-    fn a_waiter_gets_no_rise_while_the_system_pushes_back() {
-        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
-        governor.tick(Pressure::Critical, all(0));
-        assert!(!governor.can_rise());
-        assert_eq!(governor.asked(all(900 * MIB)), LIMITS.floor);
-    }
-
-    #[test]
-    fn a_dedicated_process_is_never_asked() {
-        let governor = Governor::new(LIMITS, Tolerance::DEDICATED, 0);
-        assert!(!governor.can_rise());
-    }
-
-    #[test]
-    fn a_request_ends_the_idle_and_the_target_grows_again() {
-        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
-        kept(&mut governor, 2000, 0, 0);
-        assert!(governor.idle());
-        governor.tick(Pressure::Calm, all(400 * MIB));
-        assert!(!governor.idle());
-        assert_eq!(governor.target(), LIMITS.floor + LIMITS.step);
-    }
-
-    #[test]
-    fn pressure_ends_the_idle() {
-        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
-        kept(&mut governor, IDLE_AFTER, 0, 0);
-        assert!(governor.idle());
-        governor.tick(Pressure::Congested, all(0));
-        assert!(!governor.idle());
-    }
-
-    #[test]
-    fn a_dedicated_process_gives_nothing_back_however_idle() {
-        let mut governor = Governor::new(LIMITS, Tolerance::DEDICATED, 0);
-        assert_eq!(kept(&mut governor, 2000, 0, 0), LIMITS.hard_limit);
-    }
-
-    #[test]
-    fn a_process_that_keeps_idle_memory_gives_none_back() {
-        let keeps = Tolerance {
-            backoff: 0.8,
-            release_idle: false,
-        };
-        let mut governor = Governor::new(LIMITS, keeps, LIMITS.hard_limit);
-        assert_eq!(kept(&mut governor, 2000, 0, 0), LIMITS.hard_limit);
-        governor.tick(Pressure::Congested, all(0));
-        assert_eq!(governor.tick(Pressure::Congested, all(0)), 800 * MIB);
-    }
-
-    #[test]
-    fn a_process_that_does_not_yield_still_releases_idle_memory() {
-        let releases = Tolerance {
-            backoff: 1.0,
-            release_idle: true,
-        };
-        let mut governor = Governor::new(LIMITS, releases, LIMITS.hard_limit);
-        for _ in 0..8 {
-            governor.tick(Pressure::Critical, all(LIMITS.hard_limit));
-        }
-        assert_eq!(
-            governor.target(),
-            LIMITS.hard_limit,
-            "pressure moves nothing"
-        );
-        assert_eq!(kept(&mut governor, 2000, 0, 0), LIMITS.floor);
-    }
-
-    #[test]
-    fn refault_needs_real_eviction_and_real_return() {
-        assert!(!refaulting(0, 0));
-        assert!(!refaulting(100, 100), "too few pages to mean anything");
-        assert!(!refaulting(10_000, 1_000), "pushed out and stays out");
-        assert!(refaulting(10_000, 8_000));
+    fn the_segments_round_up_and_stop_at_the_ceiling() {
+        assert_eq!(LIMITS.segments(MIB + 1), 2);
+        assert_eq!(LIMITS.segments(u64::MAX), 1000);
     }
 }

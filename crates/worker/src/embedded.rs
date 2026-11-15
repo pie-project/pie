@@ -25,10 +25,9 @@ pub struct Settings {
     /// See [`crate::config::MemoryConfig::budget_device`]: on a phone, what
     /// the app leaves the model of the memory it may wire.
     pub budget_device: Option<ByteSize>,
-    /// See [`crate::config::MemoryConfig::governor_backoff`].
-    pub governor_backoff: f64,
-    /// See [`crate::config::MemoryConfig::governor_release_idle`].
-    pub governor_release_idle: bool,
+    /// See [`crate::config::MemoryConfig::yield_share`] (`yield`).
+    #[serde(rename = "yield")]
+    pub yield_share: f64,
     pub sandbox_memory_mb: u64,
     pub max_concurrent_processes: Option<usize>,
     /// See [`crate::config::RuntimeConfig::frame_size`]. An app serves few
@@ -53,6 +52,10 @@ pub struct Settings {
     #[serde(skip_serializing)]
     pub memory_tolerance: Removed<removed::MemoryTolerance>,
     #[serde(skip_serializing)]
+    pub governor_backoff: Removed<removed::GovernorBackoff>,
+    #[serde(skip_serializing)]
+    pub governor_release_idle: Removed<removed::GovernorReleaseIdle>,
+    #[serde(skip_serializing)]
     pub max_voxels: Removed<removed::MaxVoxels>,
     #[serde(skip_serializing)]
     pub max_clips: Removed<removed::MaxClips>,
@@ -64,8 +67,7 @@ impl Default for Settings {
             engine: true,
             max_context: 4096,
             budget_device: None,
-            governor_backoff: 1.0,
-            governor_release_idle: false,
+            yield_share: 0.0,
             sandbox_memory_mb: 512,
             max_concurrent_processes: None,
             frame_size: u32::from(Runahead::STEPS_MAX),
@@ -78,6 +80,8 @@ impl Default for Settings {
             device_kv_budget: Removed::default(),
             device_memory_share: Removed::default(),
             memory_tolerance: Removed::default(),
+            governor_backoff: Removed::default(),
+            governor_release_idle: Removed::default(),
             max_voxels: Removed::default(),
             max_clips: Removed::default(),
         }
@@ -121,8 +125,7 @@ impl Settings {
         config.engine.options = self.engine_options(kind, home);
         config.engine.max_context = Some(self.max_context);
         config.engine.memory.budget_device = self.budget_device;
-        config.engine.memory.governor_backoff = self.governor_backoff;
-        config.engine.memory.governor_release_idle = self.governor_release_idle;
+        config.engine.memory.yield_share = self.yield_share;
         config.server.worker_threads = 2;
         config.server.verbose = self.verbose;
         config.server.max_upload = ByteSize::from_mib(256);

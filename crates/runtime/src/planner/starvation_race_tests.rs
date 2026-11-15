@@ -1640,8 +1640,8 @@ fn growing_window_model() -> usize {
 /// a turn at a time, the engine committing what it is told.
 #[tokio::test(flavor = "current_thread")]
 async fn sixty_four_windowed_prompts_grow_a_pool_that_starts_at_one_segment() {
-    use crate::governor::run::Steer;
-    use crate::governor::{PoolTarget, Pressure, Tolerance};
+    use crate::governor::PoolTarget;
+    use crate::governor::run::{Steer, step};
     use crate::store::shared::SegmentMove;
 
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -1655,14 +1655,10 @@ async fn sixty_four_windowed_prompts_grow_a_pool_that_starts_at_one_segment() {
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(
         RegistryPool::new(model, 0, false).with_shared_grow(grow.clone()),
     )));
-    let mut steer = Steer::new(
-        &grow,
-        Tolerance {
-            backoff: 0.5,
-            release_idle: true,
-        },
-        512 << 20,
-    );
+    let mut steer = Steer::new(&grow, 0.5);
+    // The governor's loop starts a shared pool at all its range holds; the
+    // walk commits toward it only as waiters ask.
+    let _ = grow.retarget(steer.governor().limits().segments(grow.hard_limit()));
     let geom = crate::store::rs::RsGeometry {
         state_size: 0,
         buffer_page_tokens: 16,
@@ -1692,7 +1688,7 @@ async fn sixty_four_windowed_prompts_grow_a_pool_that_starts_at_one_segment() {
             break;
         }
         // The governor's tick, then the walk toward its target.
-        steer.turn(&mut grow, Some(Pressure::Calm), &mut |_| {});
+        step(&mut steer, &mut grow, Some(0.0), true);
         loop {
             let goal = grow.goal_for_test();
             epoch += 1;
@@ -1715,7 +1711,7 @@ async fn sixty_four_windowed_prompts_grow_a_pool_that_starts_at_one_segment() {
     }
     let done = tasks.iter().filter(|task| task.is_finished()).count();
     let mapped = shared.lock().unwrap().mapped_segments();
-    let demand = grow.demand();
+    let demand = shared.lock().unwrap().demand();
     assert_eq!(
         done, PROCESSES,
         "{done} of {PROCESSES} served; mapped {mapped} segments, demand {demand:?}"
@@ -1731,12 +1727,11 @@ async fn sixty_four_windowed_prompts_grow_a_pool_that_starts_at_one_segment() {
 /// short of the head is never asked to grow.
 #[tokio::test(flavor = "current_thread")]
 async fn a_window_head_short_of_slots_asks_the_walker_for_its_whole_ask() {
-    use crate::governor::PoolTarget;
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let model = growing_window_model();
     let stores = crate::store::registry::get(model, 0);
     let shared = stores.shared.clone().expect("a shared pool");
-    let mut grow = crate::store::shared::SharedGrow::new(model, 0, shared.clone());
+    let grow = crate::store::shared::SharedGrow::new(model, 0, shared.clone());
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(
         RegistryPool::new(model, 0, false).with_shared_grow(grow.clone()),
     )));
@@ -1762,7 +1757,7 @@ async fn a_window_head_short_of_slots_asks_the_walker_for_its_whole_ask() {
     }
     let free = stores.rs.lock().unwrap().free().pages;
     assert!((1..3).contains(&free), "{free} free");
-    let before = grow.demand();
+    let before = shared.lock().unwrap().demand();
     let (pid, ws) = start(&stores);
     let demand = window_demand(&stores, ws, 0, 48);
     let p = planner.clone();
@@ -1771,7 +1766,7 @@ async fn a_window_head_short_of_slots_asks_the_walker_for_its_whole_ask() {
         crate::rt::yield_now().await;
     }
     assert!(!parked.is_finished(), "{free} free, three asked: it parks");
-    let after = grow.demand();
+    let after = shared.lock().unwrap().demand();
     assert_eq!(
         after.wanted - before.wanted,
         3 << 20,

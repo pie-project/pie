@@ -83,8 +83,7 @@ const MEMORY: &str = r#"
 # budget_disk           = "200GiB"  # the tier is always on
 # disk_path             = "/nvme/pie"  # omit for $PIE_HOME/cache/kv/<digest>
 # disk_persistent       = false     # keep the disk tier as cache for the next run
-# governor_backoff      = 1.0       # share kept each congested stretch; 1.0 never yields
-# governor_release_idle = false     # give back memory demand stopped asking for
+# yield                 = 0.0       # 0..1: how far memory pressure presses the pool in; 0 never yields
 "#;
 
 const RUNTIME: &str = r#"

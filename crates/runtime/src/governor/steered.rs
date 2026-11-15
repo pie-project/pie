@@ -5,14 +5,13 @@
 
 use std::sync::Arc;
 
-use crate::policy::pressure::{self, Tier};
 use crate::store::registry;
 use crate::store::shared::SharedGrow;
 use crate::store::slots::SlotPool;
 use crate::store::weights::port::EnginePort;
 use crate::store::weights::{SlotAccess, WeightFirst};
 
-use super::{Demand, Growth, PoolTarget, Retarget, Signal};
+use super::{Give, Growth, PoolTarget, Retarget};
 
 /// Today's pools of one engine, and the slots its weight shapes take; or
 /// the shared pool an engine that states one runs on, the weight shapes'
@@ -61,6 +60,15 @@ impl EnginePool {
     pub const fn locus(&self) -> (usize, usize) {
         (self.model, self.engine)
     }
+
+    /// Whether the engine backs its activation span on demand: the one
+    /// place a narrower rung gives memory back.
+    #[must_use]
+    pub fn span_on_demand(&self) -> bool {
+        self.shared
+            .as_ref()
+            .is_some_and(|shared| shared.shared().lock().unwrap().tells_rungs())
+    }
 }
 
 impl SlotAccess for EnginePool {
@@ -99,11 +107,6 @@ impl EnginePool {
 }
 
 impl PoolTarget for EnginePool {
-    fn demand(&mut self) -> Demand {
-        self.target_mut()
-            .map_or(Demand { wanted: 0, live: 0 }, PoolTarget::demand)
-    }
-
     fn segment_bytes(&self) -> u64 {
         self.target().map_or(1, PoolTarget::segment_bytes)
     }
@@ -123,8 +126,8 @@ impl PoolTarget for EnginePool {
     /// (`outside`, a ledger term the policy reads).
     fn hard_limit(&self) -> u64 {
         self.shared.as_ref().map_or(0, |shared| {
-            let bound = shared.shared().lock().unwrap().bound_bytes();
-            bound.max(shared.floor())
+            let pool = shared.shared().lock().unwrap();
+            pool.bound_bytes().max(pool.floor(0))
         })
     }
 
@@ -141,8 +144,12 @@ impl PoolTarget for EnginePool {
             .map_or(Retarget::Reached, |grow| grow.retarget(segments))
     }
 
-    fn take_refused(&mut self) -> bool {
-        self.target_mut().is_some_and(PoolTarget::take_refused)
+    fn refused(&self) -> bool {
+        self.target().is_some_and(PoolTarget::refused)
+    }
+
+    fn give(&mut self, what: Give, bytes: u64) -> u64 {
+        self.target_mut().map_or(0, |grow| grow.give(what, bytes))
     }
 
     fn ticked(&mut self) {
@@ -235,10 +242,6 @@ impl<P: PoolTarget + SlotAccess, W: crate::store::weights::WeightPort> Shared<We
 }
 
 impl<P: PoolTarget> PoolTarget for Shared<P> {
-    fn demand(&mut self) -> Demand {
-        self.0.lock().demand()
-    }
-
     fn segment_bytes(&self) -> u64 {
         self.0.lock().segment_bytes()
     }
@@ -263,55 +266,15 @@ impl<P: PoolTarget> PoolTarget for Shared<P> {
         self.0.lock().retarget(segments)
     }
 
-    fn take_refused(&mut self) -> bool {
-        self.0.lock().take_refused()
+    fn refused(&self) -> bool {
+        self.0.lock().refused()
+    }
+
+    fn give(&mut self, what: Give, bytes: u64) -> u64 {
+        self.0.lock().give(what, bytes)
     }
 
     fn ticked(&mut self) {
         self.0.lock().ticked();
     }
-}
-
-/// The gauge entry the governor of `engine` speaks under: apart from its
-/// planner's (which is `engine`), so neither clears what the other said.
-#[must_use]
-pub const fn source(engine: usize) -> usize {
-    usize::MAX - engine
-}
-
-/// What `signal` tells the device tier: the bytes the pool holds past its
-/// target with no room to give back, or 0 once it reached it.
-#[must_use]
-pub const fn short_bytes(signal: Signal) -> u64 {
-    match signal {
-        Signal::TierPressure {
-            held_bytes,
-            target_bytes,
-        } => held_bytes.saturating_sub(target_bytes),
-        Signal::Eased => 0,
-    }
-}
-
-/// Tells the policy of `signal` through `raise` ([`pressure::raise`] in
-/// the runtime): `tier-pressure` on the device, or its relief.
-pub fn tell(engine: usize, signal: Signal, raise: &mut impl FnMut(Tier, usize, u64)) {
-    let bytes = short_bytes(signal);
-    if bytes == 0 && signal != Signal::Eased {
-        // A pool short of nothing it could say in bytes is still short.
-        raise(Tier::Device, source(engine), 1);
-    } else {
-        raise(Tier::Device, source(engine), bytes);
-    }
-}
-
-/// [`tell`], to the policy's gauge.
-pub fn signal(engine: usize, signal: Signal) {
-    tracing::debug!(engine, ?signal, "governor pool short of its target");
-    tell(engine, signal, &mut |tier, from, bytes| {
-        if bytes == 0 {
-            pressure::relieve(tier, from);
-        } else {
-            pressure::raise(tier, from, bytes);
-        }
-    });
 }

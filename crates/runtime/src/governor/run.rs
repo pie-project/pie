@@ -1,56 +1,33 @@
 //! The loop, on a pool: read the system, move the target.
 
-use super::steered::{self, Shared, Steered};
-use super::{
-    Governor, Growth, Limits, PoolTarget, Pressure, Retarget, Signal, System, TICK, Tolerance,
-};
+use super::steered::{Shared, Steered};
+use super::{Give, Governor, Growth, Limits, PoolTarget, Reading, Retarget, TICK};
 
-/// Steers `pool`, an engine's: a dedicated or fixed pool keeps its size,
-/// but its loop still ticks, since the weight cache in front of it settles
-/// its windows on the governor's tick.
-pub fn start(pool: Shared<Steered>, tolerance: Tolerance) {
-    crate::rt::spawn(watch(pool, tolerance));
+/// Steers `pool`, an engine's, at the deployment's `yield`: a fixed pool
+/// keeps its size, but its loop still ticks, since the weight cache in
+/// front of it settles its windows on the governor's tick.
+pub fn start(pool: Shared<Steered>, share: f64) {
+    crate::rt::spawn(watch(pool, share));
 }
-
-/// What one calm tick may add. A unified memory machine has no budget to
-/// stop a burst but this: the system's complaint arrives after the damage.
-const GROWTH_STEP: u64 = 512 * 1024 * 1024;
 
 /// One governor on one pool, a turn at a time: the loop without its clock,
 /// so a test can drive it.
 pub struct Steer {
     governor: Governor,
-    /// The segments held short of the target, while a shrink has no room.
-    short: Option<u64>,
-    yielded: bool,
-    idled: bool,
-}
-
-/// What one turn leaves the caller to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Turn {
-    pub target: u64,
-    /// The governor started (`true`) or stopped yielding.
-    pub yielding: Option<bool>,
-    /// The process just went idle.
-    pub idled: bool,
 }
 
 impl Steer {
-    /// A fixed pool has nothing to give back, so it is steered as dedicated
+    /// A fixed pool has nothing to give back, so it is steered at `yield = 0`
     /// whatever the deployment asked.
     #[must_use]
-    pub fn new(pool: &impl PoolTarget, tolerance: Tolerance, step: u64) -> Self {
-        let tolerance = if pool.growth() == Growth::Fixed {
-            Tolerance::DEDICATED
+    pub fn new(pool: &impl PoolTarget, share: f64) -> Self {
+        let share = if pool.growth() == Growth::Fixed {
+            0.0
         } else {
-            tolerance
+            share
         };
         Self {
-            governor: Governor::new(Limits::of(pool, step), tolerance, pool.held()),
-            short: None,
-            yielded: false,
-            idled: false,
+            governor: Governor::new(Limits::of(pool), share),
         }
     }
 
@@ -59,103 +36,112 @@ impl Steer {
         &self.governor
     }
 
-    /// One turn: `read` is the system's state on a tick, or `None` when a
-    /// waiter asked between ticks. A dedicated pool's size is left as it
-    /// is; its tick still comes.
-    pub fn turn(
-        &mut self,
-        pool: &mut impl PoolTarget,
-        read: Option<Pressure>,
-        signal: &mut impl FnMut(Signal),
-    ) -> Turn {
-        if self.governor.tolerance().dedicated() {
-            if read.is_some() {
-                pool.ticked();
-            }
-            return Turn {
-                target: self.governor.target(),
-                yielding: None,
-                idled: false,
-            };
-        }
-        let demand = pool.demand();
-        let target = match read {
-            None => self.governor.asked(demand),
-            Some(read) => {
-                let pressure = if pool.take_refused() {
-                    Pressure::Critical
-                } else {
-                    read
-                };
-                self.governor.tick(pressure, demand)
-            }
-        };
+    /// One turn at `pressure`: the target, which the pool is moved to. A
+    /// commit the system refused holds it at what the pool has; a shrink
+    /// with no room has the pool give back what it can ([`give_back`]). At
+    /// `yield = 0` the pool is left as it is and the target is its ceiling.
+    pub fn turn(&mut self, pool: &mut impl PoolTarget, pressure: f64) -> u64 {
         let limits = *self.governor.limits();
-        let segments = within(&limits, target);
-        match pool.retarget(segments) {
-            Retarget::Reached => {
-                if self.short.take().is_some() {
-                    signal(Signal::Eased);
-                }
-            }
-            Retarget::NoRoom { held } => {
-                if self.short != Some(held) {
-                    self.short = Some(held);
-                    signal(Signal::TierPressure {
-                        held_bytes: held.saturating_mul(limits.segment_bytes),
-                        target_bytes: segments.saturating_mul(limits.segment_bytes),
-                    });
-                }
-            }
+        if !self.governor.yields() {
+            return limits.hard_limit;
         }
-        if read.is_some() {
-            pool.ticked();
+        let mut target = self.governor.target(pool.floor(), pressure);
+        if pool.refused() {
+            target = target.min(pool.held());
         }
-        let mut turn = Turn {
-            target,
-            yielding: None,
-            idled: false,
-        };
-        if self.governor.yielding() != self.yielded {
-            self.yielded = self.governor.yielding();
-            turn.yielding = Some(self.yielded);
+        let segments = limits.segments(target);
+        if let Retarget::NoRoom { held } = pool.retarget(segments) {
+            let short = held
+                .saturating_sub(segments)
+                .saturating_mul(limits.segment_bytes);
+            give_back(pool, short);
         }
-        if self.governor.idle() != self.idled {
-            self.idled = self.governor.idle();
-            turn.idled = self.idled;
-        }
-        turn
+        target
     }
 }
 
-/// The segments `target` comes to, the floor's at least.
-fn within(limits: &Limits, target: u64) -> u64 {
-    limits.segments(target.min(limits.hard_limit))
+/// One event of the loop: a tick (`ticked`), or the reading changed.
+/// `pressure` is the reading, `None` where nothing is read (`yield = 0`, a
+/// fixed pool, a system with no reading): the pool is then left as it is
+/// and only ticks. A change turns at once; a tick turns only while the
+/// pressure stands or a refusal does, re-reading the floor. The target the
+/// step leaves.
+pub fn step(
+    steer: &mut Steer,
+    pool: &mut impl PoolTarget,
+    pressure: Option<f64>,
+    ticked: bool,
+) -> u64 {
+    let mut target = steer.governor().limits().hard_limit;
+    if let Some(pressure) = pressure
+        && (!ticked || pressure > 0.0 || pool.refused())
+    {
+        target = steer.turn(pool, pressure);
+    }
+    if ticked {
+        pool.ticked();
+    }
+    target
 }
 
-async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
-    let mut steer = Steer::new(&pool, tolerance, GROWTH_STEP);
-    let (shared, engine) = pool.with(|pool| (pool.inner().is_shared(), pool.inner().locus().1));
-    let mut interval = crate::rt::time::interval(TICK);
-    // A shared pool moves its own segments off the fire path; the loop reads
-    // the system each tick and hands it the target.
-    if shared && !steer.governor().tolerance().dedicated() {
-        let mut system: Box<dyn System> = super::system();
-        loop {
-            interval.tick().await;
-            let read = Some(system.read());
-            steer.turn(&mut pool, read, &mut |signal| {
-                steered::signal(engine, signal);
-            });
-            read_ledger(&pool, engine);
+/// Has `pool` give back `short` bytes in [`Give::ORDER`], each kind only
+/// past what the ones before it gave: the bytes given. Past the last kind
+/// the pool keeps what it holds: what running requests hold is never
+/// given back, and nothing is raised for it.
+pub fn give_back(pool: &mut impl PoolTarget, short: u64) -> u64 {
+    let mut given = 0;
+    for what in Give::ORDER {
+        if given >= short {
+            break;
         }
+        given += pool.give(what, short - given);
     }
-    // A dedicated shared pool may take every segment its range holds: its
-    // walker commits them ahead of the waiters that need them, off the fire
-    // path, and never gives them back.
-    if shared && steer.governor().tolerance().dedicated() {
-        use crate::governor::PoolTarget;
-        let _ = pool.retarget(within(steer.governor().limits(), pool.hard_limit()));
+    given
+}
+
+/// What `yield` can give back on this engine, said once at load where it
+/// cannot give back every kind.
+fn say_what_yield_sheds(share: f64, fixed: bool, span_on_demand: bool, reading: bool) {
+    if share <= 0.0 {
+        return;
+    }
+    if fixed {
+        tracing::warn!(
+            share,
+            "yield: this engine's pool is fixed from the load; yield sheds nothing here"
+        );
+    } else if !reading {
+        tracing::warn!(
+            share,
+            "yield: this system offers no memory pressure reading; yield sheds nothing here"
+        );
+    } else if !span_on_demand {
+        tracing::info!(
+            share,
+            "yield: this engine backs its activation span from the load; yield sheds cache only \
+             (idle prefixes, checkpoints, the weight cache), never the rung"
+        );
+    }
+}
+
+async fn watch(mut pool: Shared<Steered>, share: f64) {
+    let mut steer = Steer::new(&pool, share);
+    let (shared, engine, span_on_demand) = pool.with(|pool| {
+        let inner = pool.inner();
+        (inner.is_shared(), inner.locus().1, inner.span_on_demand())
+    });
+    let mut reading: Option<Reading> = if shared && steer.governor().yields() {
+        super::pressure()
+    } else {
+        None
+    };
+    let fixed = !shared || pool.growth() == Growth::Fixed;
+    say_what_yield_sheds(share, fixed, span_on_demand, reading.is_some());
+    // A shared pool may take every segment its range holds: its walker
+    // commits them ahead of the waiters that need them, off the fire path,
+    // and gives them back only under pressure.
+    if shared {
+        let _ = pool.retarget(steer.governor().limits().segments(pool.hard_limit()));
     }
     // Chunks are handed out of mapped segments only: a pool mapped past its
     // limit is what lets a sequence onto chunks the engine holds back. The
@@ -166,12 +152,31 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
     if shared && mapped > hard_limit {
         tracing::warn!(mapped, hard_limit, "the pool is mapped past its hard limit");
     }
-    // A dedicated pool's size stands, and a pool that is not shared never
-    // moves: the loop only ticks, reading nothing and answering no waiter.
+    let mut interval = crate::rt::time::interval(TICK);
     loop {
-        interval.tick().await;
-        steer.turn(&mut pool, Some(Pressure::Calm), &mut |_| {});
-        read_ledger(&pool, engine);
+        // A tick settles the weight cache and the rung walk; a pressed
+        // pool's floor moves with its live state, so a tick re-reads it
+        // while the pressure stands. A change in the reading turns at once.
+        let ticked = match reading.as_mut() {
+            None => {
+                interval.tick().await;
+                true
+            }
+            Some(watched) => tokio::select! {
+                _ = interval.tick() => true,
+                changed = watched.changed() => {
+                    if changed.is_err() {
+                        reading = None;
+                    }
+                    false
+                }
+            },
+        };
+        let pressure = reading.as_mut().map(|watched| *watched.borrow_and_update());
+        step(&mut steer, &mut pool, pressure, ticked);
+        if ticked {
+            read_ledger(&pool, engine);
+        }
     }
 }
 
@@ -182,3 +187,6 @@ fn read_ledger(pool: &Shared<Steered>, engine: usize) {
     let model = pool.with(|pool| pool.cache().cache_bytes());
     crate::policy::pressure::set_model(engine, model);
 }
+
+#[cfg(test)]
+mod tests;
