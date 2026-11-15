@@ -9,7 +9,9 @@ use objc2::rc::Retained;
 #[cfg(target_vendor = "apple")]
 use objc2::runtime::ProtocolObject;
 #[cfg(target_vendor = "apple")]
-use objc2_metal::{MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDevice, MTLLibrary};
+use objc2_metal::{
+    MTLBinaryArchive, MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDevice, MTLLibrary,
+};
 
 #[cfg(target_vendor = "apple")]
 type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
@@ -29,6 +31,15 @@ pub struct Pipelines {
     libraries: RefCell<HashMap<(&'static str, &'static str), Library>>,
     pipelines: RefCell<HashMap<PipelineKey, Pipeline>>,
     compiles: std::cell::Cell<u64>,
+    /// Built before ready, then sealed ([`Pipelines::seal`]): a key met
+    /// after is refused by name, never compiled in a fire.
+    sealed: std::cell::Cell<bool>,
+    /// Fires refused for a key the load did not build.
+    unbuilt: std::cell::Cell<u64>,
+    /// The binary archive every pipeline is built against and recorded
+    /// into ([`Pipelines::use_archive`]): a cache, never needed.
+    #[cfg(target_vendor = "apple")]
+    archive: RefCell<Option<Retained<ProtocolObject<dyn objc2_metal::MTLBinaryArchive>>>>,
     /// What the device's allocation grew by across every library and
     /// pipeline build: the driver's share of them, measured (an `outside`
     /// line of the ledger).
@@ -86,6 +97,51 @@ impl Pipelines {
         self.compiles.get()
     }
 
+    /// Every pipeline this load dispatches is built: a key met from now on
+    /// is a fire the load did not prepare for.
+    pub fn seal(&self) {
+        self.sealed.set(true);
+    }
+
+    /// The fires refused for an unbuilt key since the last call.
+    pub fn take_unbuilt(&self) -> u64 {
+        self.unbuilt.replace(0)
+    }
+
+    /// Every key built so far: what a later boot of the same load builds
+    /// before ready without walking.
+    #[must_use]
+    pub fn keys(&self) -> Vec<PipelineKey> {
+        let mut keys: Vec<PipelineKey> = self.pipelines.borrow().keys().copied().collect();
+        keys.sort();
+        keys
+    }
+
+    /// Builds the pipelines against the binary archive at `path`, or, where
+    /// none can be read there, records them into a new one. A missing or
+    /// unreadable archive only costs the compiles.
+    #[cfg(target_vendor = "apple")]
+    pub fn use_archive(&self, device: &ProtocolObject<dyn MTLDevice>, path: &std::path::Path) {
+        use objc2_metal::MTLBinaryArchiveDescriptor;
+        let open = |url: Option<&objc2_foundation::NSURL>| {
+            let descriptor = MTLBinaryArchiveDescriptor::new();
+            descriptor.setUrl(url);
+            device.newBinaryArchiveWithDescriptor_error(&descriptor).ok()
+        };
+        let url = objc2_foundation::NSURL::fileURLWithPath(&super::ctx::nsstring(&path.to_string_lossy()));
+        let archive = if path.exists() { open(Some(&url)).or_else(|| open(None)) } else { open(None) };
+        *self.archive.borrow_mut() = archive;
+    }
+
+    /// Writes the archive to `path`; a failed write leaves the next boot to
+    /// compile.
+    #[cfg(target_vendor = "apple")]
+    pub fn save_archive(&self, path: &std::path::Path) -> bool {
+        let Some(archive) = self.archive.borrow().clone() else { return false };
+        let url = objc2_foundation::NSURL::fileURLWithPath(&super::ctx::nsstring(&path.to_string_lossy()));
+        archive.serializeToURL_error(&url).is_ok()
+    }
+
     #[cfg(target_vendor = "apple")]
     pub(crate) fn at(
         &self,
@@ -95,6 +151,14 @@ impl Pipelines {
         let key = (fire.file, fire.entrypoint, fire.stamp, fire.page_strides);
         if let Some(pipeline) = self.pipelines.borrow().get(&key) {
             return Ok(pipeline.clone());
+        }
+        if self.sealed.get() {
+            self.unbuilt.set(self.unbuilt.get() + 1);
+            return Err(Fault::Unprepared {
+                file: fire.file,
+                entrypoint: fire.entrypoint,
+                stamp: fire.stamp,
+            });
         }
         let before = device.currentAllocatedSize() as u64;
         let library = self.library(device, fire)?;
@@ -185,6 +249,10 @@ impl Pipelines {
             })?;
         let descriptor = MTLComputePipelineDescriptor::new();
         descriptor.setComputeFunction(Some(&function));
+        let archive = self.archive.borrow().clone();
+        if let Some(archive) = archive.as_ref() {
+            descriptor.setBinaryArchives(Some(&objc2_foundation::NSArray::from_slice(&[&**archive])));
+        }
         descriptor.setSupportIndirectCommandBuffers(true);
         descriptor.setLabel(Some(&super::ctx::nsstring(fire.entrypoint)));
         let pipeline = device
@@ -199,6 +267,9 @@ impl Pipelines {
                 why: error.localizedDescription().to_string(),
             })?;
         self.compiles.set(self.compiles.get() + 1);
+        if let Some(archive) = archive.as_ref() {
+            let _ = archive.addComputePipelineFunctionsWithDescriptor_error(&descriptor);
+        }
         self.built.set(
             self.built
                 .get()

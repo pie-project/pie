@@ -255,6 +255,9 @@ pub struct Attached {
 }
 
 pub struct Shell {
+    /// The load's pipeline walk is running ([`Shell::warm_pipelines`]): a
+    /// seat-addressed fire backs only what the walk backed for it.
+    warming: bool,
     tuning: kernels_metal::Tuning,
     device: Context,
     /// What the device held for this process before the load: the ledger's
@@ -1345,6 +1348,7 @@ impl PreparedLoad<'_> {
             ane,
             weights,
             rung: arena.floor_tokens(),
+            warming: false,
             batch_bottom: arena.rung_guest_top(arena.floor_tokens()),
             arena,
             pools,
@@ -1790,6 +1794,184 @@ impl Shell {
     ) -> Result<()> {
         self.drain()?;
         self.pools.write_tier_slots(slots, bytes)
+    }
+
+    /// Builds, before ready, every compute pipeline a fire of this load
+    /// can meet: at each rung, a prefill fire of the rung's rows (one lane)
+    /// and a decode fire of as many one-row lanes as the rung and the seats
+    /// take, each prepared and encoded and its frame dropped uncommitted,
+    /// so nothing runs and no seat, slot or rung changes. Returns the fires
+    /// walked and
+    /// the pipelines built.
+    /// What decides the pipelines this load builds: the device, its OS
+    /// build, this binary, the model's graph, the rungs, the token and lane
+    /// budgets, the paging and the kernels' tuning. A later boot with the
+    /// same key builds the same keys; any change and it walks again.
+    #[must_use]
+    pub fn pipeline_cache_key(&self) -> String {
+        let fnv = |bytes: &[u8]| {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+        };
+        #[cfg(target_vendor = "apple")]
+        let os = objc2_foundation::NSProcessInfo::processInfo()
+            .operatingSystemVersionString()
+            .to_string();
+        #[cfg(not(target_vendor = "apple"))]
+        let os = String::new();
+        let binary = std::env::current_exe()
+            .and_then(std::fs::metadata)
+            .map(|meta| {
+                let at = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_nanos());
+                format!("{}:{at}", meta.len())
+            })
+            .unwrap_or_default();
+        let trace = fnv(format!("{:?}", self.trace).as_bytes());
+        let paging = self.paging();
+        let shape = format!(
+            "{:?}|{:?}|{}:{}:{}|{:?}",
+            self.arena.rung_tokens(),
+            self.budgets.tokens,
+            paging.page_size,
+            paging.pages_per_slot,
+            paging.context(),
+            self.tuning
+        );
+        format!(
+            "metal-pipelines-1|{}|{os}|{binary}|{trace:016x}|{:016x}",
+            self.device.name(),
+            fnv(shape.as_bytes())
+        )
+    }
+
+    /// The keys of every pipeline built: file, entrypoint, stamp and page
+    /// strides.
+    #[must_use]
+    pub fn pipeline_keys(&self) -> Vec<(String, String, String, Option<[u64; 2]>)> {
+        self.pipelines
+            .keys()
+            .into_iter()
+            .map(|(file, entry, stamp, strides)| (file.into(), entry.into(), stamp.into(), strides))
+            .collect()
+    }
+
+    /// Builds `keys` (a list an earlier boot of the same load wrote): the
+    /// pipelines, before ready, without walking. Returns how many it built.
+    pub fn build_pipelines(&self, keys: &[(String, String, String, Option<[u64; 2]>)]) -> Result<u64> {
+        let before = self.pipelines.compiled();
+        for (file, entry, stamp, strides) in keys {
+            let leak = |text: &str| -> &'static str { Box::leak(text.to_owned().into_boxed_str()) };
+            let fire = kernels_metal::Fire {
+                stamp: leak(stamp),
+                page_strides: *strides,
+                ..kernels_metal::Fire::at(leak(file), leak(entry))
+            };
+            self.pipelines.warm(&self.device, fire)?;
+        }
+        Ok(self.pipelines.compiled() - before)
+    }
+
+    /// Builds against (or records into) the binary archive at `path`.
+    #[cfg(target_vendor = "apple")]
+    pub fn use_pipeline_archive(&self, path: &std::path::Path) {
+        self.pipelines.use_archive(self.device.device(), path);
+    }
+
+    /// Writes the binary archive to `path`.
+    #[cfg(target_vendor = "apple")]
+    pub fn save_pipeline_archive(&self, path: &std::path::Path) -> bool {
+        self.pipelines.save_archive(path)
+    }
+
+    /// Seals the pipelines built ([`Shell::warm_pipelines`]).
+    pub fn seal_pipelines(&self) {
+        self.pipelines.seal();
+    }
+
+    /// Fires refused for an unbuilt pipeline since the last call.
+    pub fn take_unbuilt_pipelines(&self) -> u64 {
+        self.pipelines.take_unbuilt()
+    }
+
+    pub fn warm_pipelines(&mut self) -> Result<(u32, u64)> {
+        use engine::frame::Shell as FrameShell;
+        let before = self.pipelines.compiled();
+        // The seats the pool lays runs for: a seat-addressed lane past them
+        // names chunks the pool does not hold. A fire's matmul tiles follow
+        // its rows (the prefill fires walk every rung's), its attention one
+        // row a lane (one decode lane reaches it).
+        // One seat: a fire's matmul tiles follow its rows (the prefill fires
+        // walk every rung's), its attention one row a lane, its readout the
+        // rows it reads; no key turns on how many seats carry them, so the
+        // walk backs one seat run, not every seat's.
+        let seats = 1u32;
+        let context = self.paging().context().max(1);
+        let standing = self.rung;
+        let committed = self.pools.committed_segments();
+        // The walk's lanes lie in the first `seats` seat runs: those
+        // segments, not every seat's.
+        {
+            let facts = self.pool_chunk_facts();
+            let per = facts
+                .shape(crate::store::layout::LIST)
+                .map_or(1, |shape| shape.slots_per_chunk.max(1));
+            let run = self.paging().pages_per_slot.div_ceil(per).max(1);
+            let chunks = 1 + seats.saturating_mul(run);
+            let segments = chunks.div_ceil(facts.segment_chunks.max(1));
+            if segments > committed {
+                self.commit_segments(segments)?;
+            }
+        }
+        self.warming = true;
+        let walked = (|| -> Result<u32> {
+            let mut fires = 0u32;
+            for rung in self.arena.rung_tokens() {
+                self.set_rung(self.rung, rung)?;
+                let prompt = rung.min(self.budgets.tokens.max_tokens).min(context).max(1);
+                let lanes = rung.min(self.budgets.tokens.max_lanes).min(seats).max(1);
+                let prompt_tokens = vec![0u32; prompt as usize];
+                let one = [0u32];
+                let prefill = [Seated {
+                    held: Some(0),
+                    ..Seated::of(Lane {
+                        slot: 0,
+                        word: self.trace.facts.word(&poem::Request::new(prompt, false)),
+                        tokens: &prompt_tokens,
+                    })
+                }];
+                let word = self.trace.facts.word(&poem::Request::new(1, false));
+                let decode: Vec<Seated<'_>> = (0..lanes)
+                    .map(|slot| Seated {
+                        held: Some(0),
+                        ..Seated::of(Lane { slot, word, tokens: &one })
+                    })
+                    .collect();
+                for lanes in [&prefill[..], &decode[..]] {
+                    let prepared = FrameShell::prepare(
+                        self,
+                        StepView { lanes, attachments: &[], media: &[], clips: &[], done: None },
+                        None,
+                    )?;
+                    drop(self.walk(&prepared, true)?);
+                    fires += 1;
+                }
+            }
+            Ok(fires)
+        })();
+        self.warming = false;
+        let fires = walked?;
+        // What the walk backed goes back, and the rung stands where it
+        // stood.
+        if self.rung != standing {
+            self.set_rung(self.rung, standing)?;
+        }
+        if self.pools.committed_segments() > committed {
+            self.release_segments(committed)?;
+        }
+        Ok((fires, self.pipelines.compiled() - before))
     }
 
     pub fn open(&mut self, slot: u32) -> Result<()> {
@@ -3842,7 +4024,7 @@ impl Shell {
         };
         // A caller firing directly (every lane seat-addressed) has no
         // runtime to commit ahead of it: the segments its seats touch back now.
-        if lanes.iter().all(|seated| !seated.refs) {
+        if lanes.iter().all(|seated| !seated.refs) && !self.warming {
             self.pools.commit_seats()?;
         }
         // Every page and record piece the fire reads or writes is checked
@@ -4626,6 +4808,13 @@ impl Shell {
     }
 
     fn walk_once(&self, p: &Prepared<'_>) -> Result<Walked> {
+        self.walk(p, false)
+    }
+
+    /// The forward encoded; `dry`, for a frame that is dropped uncommitted
+    /// (the load's pipeline walk): no early head is flushed to run and no
+    /// Neural Engine hand-off is armed, so nothing of it reaches a queue.
+    fn walk(&self, p: &Prepared<'_>, dry: bool) -> Result<Walked> {
         let place = At::new();
         let mut frame = self.device.frame()?;
         if let Some(plane) = self.nan_flags.as_ref() {
@@ -4639,8 +4828,13 @@ impl Shell {
             let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
             #[cfg(target_vendor = "apple")]
             let sink = sink
-                .with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff))
-                .flushing_after(HEAD_LAUNCHES);
+                .with_handoff(
+                    self.ane
+                        .as_ref()
+                        .filter(|_| !dry)
+                        .map(crate::ane::Ane::handoff),
+                )
+                .flushing_after(if dry { 0 } else { HEAD_LAUNCHES });
             let mut run = Run::new(
                 &sink,
                 &self.handles,
