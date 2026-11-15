@@ -27,7 +27,8 @@
 //!
 //! ```text
 //! wafer-bench --reading <stream program dir> --program <compiled out dir> --inputs <dir>
-//!             [--grid T,H,W] [--steps N] [--golden <dir>] [--cmaddr <addr>]
+//!             [--grid T,H,W] [--steps N] [--golden <dir>] [--save <dir>] [--reload 1]
+//!             [--cmaddr <addr>]
 //! wafer-bench --reading <stream program dir> --inputs <dir> --entries <out dir> [--grid T,H,W]
 //! ```
 //!
@@ -35,12 +36,15 @@
 //! `--grid` is the latent's voxel grid (`T,H,W`). The engine computes every entry from them
 //! (`engine_cerebras::reading`), loads the program, writes its arrays, runs the step, reads the
 //! rows back and runs the exit's ops; `--steps` steps of the poem's flow schedule, an Euler step
-//! each (the program is loaded afresh a step). With `--golden`, each step's velocity is held to
-//! `cpu_velocity<i>.f32` and the latent after it to `cpu_latent<i + 1>.f32` (relative L2 1e-2,
-//! cosine 0.999). `--entries` writes the first step's entries as the h2d files they replace
-//! (`<k>.npy`) and runs nothing: `tools/wafer/stream/run.py --entries` takes them. `--rows 1`:
-//! one step at the inputs' own timestep, the rows read back held to the capture the program was
-//! compiled from (`host.json`'s refs; a program cut at `--stages` reads back no velocity).
+//! each. The program is loaded and its static arrays (tiles, tables) written once; a step is its
+//! entries and a launch (`--reload 1`: the program loaded afresh a step). With `--golden`, each
+//! step's velocity is held to `cpu_velocity<i>.f32` and the latent after it to
+//! `cpu_latent<i + 1>.f32` (relative L2 1e-2, cosine 0.999); `--save` writes them
+//! (`velocity<i>.f32`, `latent<i + 1>.f32`). `--entries` writes the first step's entries as the
+//! h2d files they replace (`<k>.npy`) and runs nothing: `tools/wafer/stream/run.py --entries`
+//! takes them. `--rows 1`: one step at the inputs' own timestep, the rows read back held to the
+//! capture the program was compiled from (`host.json`'s refs; a program cut at `--stages` reads
+//! back no velocity).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -53,7 +57,7 @@ use serde_json::{Value, json};
 const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix>] --golden \
                      <golden.json> [--steps N] [--tokens N] [--cmaddr <addr>] [--logits <out.json>] \
                      [--times <out.json>] [--forced N]\n       wafer-bench --reading <dir> --program <dir> \
-                     --inputs <dir> [--grid T,H,W] [--steps N] [--golden <dir>] [--cmaddr <addr>]";
+                     --inputs <dir> [--grid T,H,W] [--steps N] [--golden <dir>] [--save <dir>] [--reload 1] [--cmaddr <addr>]";
 
 fn main() {
     match run() {
@@ -397,10 +401,10 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
         .find(|(n, _)| *n == d.latent)
         .map(|(_, v)| v.clone())
         .ok_or("no latent input")?;
-    let (_, vs) = d.run(&mut inputs, lanes, |i, ins| {
-        let step = reading.step(&trace, grid, ins);
-        let entries = reading.entries(&mut host, &step)?;
-        let t0 = std::time::Instant::now();
+    // the program loaded once, its static arrays written once: a step is its entries and a
+    // launch (`--reload`: the program loaded afresh a step, as M1e ran it)
+    let reload = get.contains_key("reload");
+    let load = || -> Result<Runtime, String> {
         let mut rt = Runtime::new(
             sdk.clone(),
             Path::new(&program),
@@ -410,9 +414,23 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
         .map_err(|e| e.to_string())?;
         rt.load();
         rt.run();
-        let (got, cycles) = reading.fire(&mut rt, &entries)?;
-        rt.stop();
-        drop(rt);
+        reading.write_static(&mut rt)?;
+        Ok(rt)
+    };
+    let mut kept = if reload { None } else { Some(load()?) };
+    let (_, vs) = d.run(&mut inputs, lanes, |i, ins| {
+        let step = reading.step(&trace, grid, ins);
+        let entries = reading.entries(&mut host, &step)?;
+        let t0 = std::time::Instant::now();
+        let (got, cycles) = match kept.as_mut() {
+            Some(rt) => reading.launch(rt, &entries)?,
+            None => {
+                let mut rt = load()?;
+                let r = reading.launch(&mut rt, &entries)?;
+                rt.stop();
+                r
+            }
+        };
         let back = reading.rows_back(&got)?;
         let v = reading
             .finish(&mut host, &trace, &step, &back, &[d.velocity.as_str()])?
@@ -430,12 +448,27 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
         println!("READING_STEP {line}");
         Ok(v)
     })?;
+    if let Some(mut rt) = kept {
+        rt.stop();
+    }
     // each step's latent, from the velocities the program gave
     let mut x = x0;
     for (i, v) in vs.iter().enumerate() {
         let dt = d.sigmas[i + 1] - d.sigmas[i];
         for (x, v) in x.iter_mut().zip(v) {
             *x += dt * v;
+        }
+        if let Some(dir) = get.get("save") {
+            // the program's velocity and the latent after it, as the golden files lay them
+            let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+            std::fs::create_dir_all(dir).map_err(|e| format!("{dir}: {e}"))?;
+            for (name, v) in [
+                (format!("velocity{i}.f32"), v),
+                (format!("latent{}.f32", i + 1), &x),
+            ] {
+                let p = Path::new(dir).join(name);
+                std::fs::write(&p, bytes(v)).map_err(|e| format!("{}: {e}", p.display()))?;
+            }
         }
         if let Some(g) = &golden {
             let p = g.join(format!("cpu_latent{}.f32", i + 1));

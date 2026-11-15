@@ -374,27 +374,55 @@ impl Reading {
         self.outs.iter().map(|o| ValueId(o.0)).collect()
     }
 
+    /// Every array no step's inputs make (the tiles, the regions' tables and static residents),
+    /// from its file: written once on a loaded program, before its first [`Reading::launch`].
+    pub fn write_static(&self, rt: &mut Runtime) -> R<()> {
+        for a in self.h2d.iter().filter(|a| a.entry.is_none()) {
+            Self::write(rt, a, &npy_words(&a.file)?.1)?;
+        }
+        Ok(())
+    }
+
+    fn write(rt: &mut Runtime, a: &Array, data: &[u32]) -> R<()> {
+        let dt = if a.u16 {
+            DataType::Bits16
+        } else {
+            DataType::Bits32
+        };
+        rt.memcpy_h2d(&a.sym, data, a.rect, a.len, Order::RowMajor, dt)
+            .map_err(|x| x.to_string())
+    }
+
     /// One step on a loaded program: every array written (an entry's words from `entries`, the
-    /// rest from its file), `run` launched, the rows read back (each [`Back`]'s words) and the
-    /// step's cycles off the PEs' stamps (`tsc`: start, end, passes a PE).
+    /// rest from its file), then [`Reading::launch`].
     pub fn fire(
+        &self,
+        rt: &mut Runtime,
+        entries: &[Option<Vec<f32>>],
+    ) -> R<(Vec<Vec<f32>>, Option<u64>)> {
+        self.write_static(rt)?;
+        self.launch(rt, entries)
+    }
+
+    /// One step on a program whose static arrays are written ([`Reading::write_static`], once:
+    /// the program re-runs a step a launch, its tiles kept): the step's entries written from
+    /// `entries`, `run` launched, the rows read back (each [`Back`]'s words) and the step's
+    /// cycles off the PEs' stamps (`tsc`: start, end, passes a PE).
+    pub fn launch(
         &self,
         rt: &mut Runtime,
         entries: &[Option<Vec<f32>>],
     ) -> R<(Vec<Vec<f32>>, Option<u64>)> {
         let e = |x: crate::sdk::Error| x.to_string();
         for (a, words) in self.h2d.iter().zip(entries) {
+            if a.entry.is_none() {
+                continue;
+            }
             let data: Vec<u32> = match words {
                 Some(w) => w.iter().map(|x| x.to_bits()).collect(),
                 None => npy_words(&a.file)?.1,
             };
-            let dt = if a.u16 {
-                DataType::Bits16
-            } else {
-                DataType::Bits32
-            };
-            rt.memcpy_h2d(&a.sym, &data, a.rect, a.len, Order::RowMajor, dt)
-                .map_err(e)?;
+            Self::write(rt, a, &data)?;
         }
         rt.launch("run", &[]).map_err(e)?;
         let mut got = Vec::new();
