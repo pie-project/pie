@@ -43,8 +43,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let mut device = Context::bind(boot.ordinal, unsafe { boot.comm.as_ref() })?;
     // What the card may hold while this load runs, resolved here before the
     // load takes anything: every later reading of its room is under it.
-    let (free, total) = crate::store::device_memory()?;
-    let ceiling = crate::device::elastic::ceiling_of(total, total - free, boot.allowance);
+    let ceiling = crate::store::load_ceiling(boot.allowance, true)?;
     let chip = match boot.knobs.chip.clone() {
         Some(chip) => chip,
         None => {

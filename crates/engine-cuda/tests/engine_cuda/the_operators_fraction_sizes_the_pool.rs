@@ -407,6 +407,17 @@ fn a_stated_budget_counts_the_weights_the_load_took() {
         0,
         "a load holding its budget has no room"
     );
+    // What the process took before its loads (its context) is on the card
+    // when the ceiling is resolved and is not held before: the budget
+    // counts it.
+    const CONTEXT: u64 = 800 << 20;
+    let held = BEFORE + CONTEXT;
+    let ceiling = ceiling_of(CARD, held - CONTEXT, stated);
+    assert_eq!(
+        room_under(ceiling, CARD - held - WEIGHTS, CARD),
+        BUDGET - CONTEXT - WEIGHTS - floor,
+        "the pool has what the budget leaves past the context and the weights"
+    );
     assert_eq!(
         ceiling_of(
             CARD,
