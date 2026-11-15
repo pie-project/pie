@@ -968,10 +968,14 @@ impl FrameShell for Shell {
                 pending_mask_injects.push((masks.len(), src, have.saturating_add(row.rows)));
             }
             let runs_masked_arm = self.masked.contains(row.class as usize);
-            if masking.is_some() && self.masked.is_empty() {
+            let reads_group_mask = self.group_masked.contains(row.class as usize);
+            if masking.is_some() && self.masked.is_empty() && self.group_masked.is_empty() {
                 return Err(Fault::Maskless { lane: row.source });
             }
-            if masking.is_some() != runs_masked_arm {
+            // A masked kv prefill's class is the masked word's, and only
+            // its; a group's mask is the lane's to state on any class that
+            // reads one.
+            if masking.is_some() != runs_masked_arm && !(reads_group_mask && !runs_masked_arm) {
                 return Err(Fault::MaskWord {
                     lane: row.source,
                     word: lane.word,
@@ -979,7 +983,9 @@ impl FrameShell for Shell {
                 });
             }
             masks.push(crate::mask::LaneMask {
-                mask: masking,
+                // A mask a group's rows read only is staged with the group
+                // masks (`group_masks`), not over the lane's keys.
+                mask: masking.filter(|_| runs_masked_arm),
                 have,
                 rows: row.rows,
                 wide: self.wide.contains(row.class as usize),

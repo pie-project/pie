@@ -7,7 +7,7 @@
 mod common;
 
 use common::{Gpu, bf16s, close_abs, indptr_of};
-use dtype::Dtype::{Bf16, F32, U8};
+use dtype::Dtype::{Bf16, F32, I64, U8};
 use kernels_rocm::attn::ragged::{RaggedMask, ragged};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -125,9 +125,9 @@ fn check(
     let vp = gpu.tensor(&v, kr.max(1) as u32, (kvh * hd) as u32, Bf16);
     let (qtab, ktab) = (gpu.column(&qt), gpu.column(&kt));
     // Each group's bits, query-major, from a byte of its own.
-    let (mut bits, mut starts) = (Vec::<u8>::new(), Vec::<i32>::new());
+    let (mut bits, mut starts) = (Vec::<u8>::new(), Vec::<i64>::new());
     for g in 0..qt.len() - 1 {
-        starts.push(bits.len() as i32);
+        starts.push(bits.len() as i64);
         let (q0, q1) = (qt[g] as usize, qt[g + 1] as usize);
         let (k0, k1) = (kt[g] as usize, kt[g + 1] as usize);
         let base = bits.len();
@@ -141,7 +141,7 @@ fn check(
             }
         }
     }
-    starts.push(bits.len() as i32);
+    starts.push(bits.len() as i64);
     bits.push(0);
     let arm = match mask {
         Mask::None => RaggedMask::None,
@@ -151,7 +151,7 @@ fn check(
         },
         Mask::Custom => RaggedMask::Custom {
             bits: gpu.upload(&bits, bits.len() as u32, 1, U8),
-            indptr: gpu.column(&starts),
+            indptr: gpu.upload(&starts, starts.len() as u32, 1, I64),
         },
     };
     let mut out = o;

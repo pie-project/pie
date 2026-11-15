@@ -378,9 +378,11 @@ impl FireCtx<'_> {
                     .stage_mrope_positions(self.device.stream(), &p.mrope_positions)?,
             )
         };
-        let group_masks = self
-            .inputs
-            .stage_group_masks(self.device.stream(), &p.group_masks)?;
+        let group_masks = self.inputs.stage_group_masks(
+            self.device.stream(),
+            &p.group_masks,
+            p.lengths.table_lanes(),
+        )?;
         let voxels = if p.voxel_tables.grid.is_empty() {
             None
         } else {
