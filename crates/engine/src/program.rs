@@ -37,6 +37,8 @@ pub struct ProgramRegistration {
     pub reference_ptir: Vec<u8>,
 }
 
+pub type ProgramCompiler = std::sync::Arc<dyn Fn(&ProgramRegistration) + Send + Sync>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BindExtents {
     pub row_count: u32,

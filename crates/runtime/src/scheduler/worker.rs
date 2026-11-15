@@ -740,6 +740,7 @@ struct SchedulerControl {
     accepting: AtomicBool,
     stats: Arc<SchedulerStats>,
     device_domain: ::engine::MemoryDomain,
+    compiler: Arc<std::sync::OnceLock<(::engine::ProgramCompiler, Option<String>)>>,
 }
 
 #[derive(Clone)]
@@ -865,6 +866,23 @@ impl SchedulerHandle {
                 None => None,
             }
         };
+        if cached.is_none()
+            && let Some((compile, backend)) = self.inner.compiler.get().cloned()
+        {
+            let plan = program.clone();
+            let (done, compiled) = tokio::sync::oneshot::channel::<()>();
+            let spawned = crate::rt::thread::Builder::new()
+                .name("pie-compile".to_string())
+                .spawn(move || {
+                    let plan =
+                        crate::pipeline::program::with_host_codegen(&plan, backend.as_deref());
+                    compile(&plan);
+                    let _ = done.send(());
+                });
+            if spawned.is_ok() {
+                let _ = compiled.await;
+            }
+        }
         let (program_field, cache_fill) = match cached {
             Some(program_id) => {
                 bind.binding.program = program_id;
@@ -954,6 +972,8 @@ impl BatchScheduler {
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SchedulerItem>();
         let stats = Arc::new(SchedulerStats::default());
+        let compiler = Arc::new(std::sync::OnceLock::new());
+        let compiler_for_loop = Arc::clone(&compiler);
         let handle = SchedulerHandle {
             inner: Arc::new(SchedulerControl {
                 tx,
@@ -964,6 +984,7 @@ impl BatchScheduler {
                 accepting: AtomicBool::new(true),
                 stats: Arc::clone(&stats),
                 device_domain: crate::scheduler::device_domain(engine_idx),
+                compiler,
             }),
         };
         crate::scheduler::install_scheduler_handle(engine_id, handle.clone());
@@ -980,6 +1001,7 @@ impl BatchScheduler {
                     limits,
                     stats_for_loop,
                     frame_size,
+                    compiler_for_loop,
                 ));
             })
             .expect("spawn pie-sched thread");
@@ -1004,6 +1026,10 @@ impl BatchScheduler {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the scheduler thread's whole start, handed over once from `new`"
+    )]
     async fn run(
         engine_id: EngineId,
         mut rx: SchedRx,
@@ -1012,8 +1038,15 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: Arc<SchedulerStats>,
         frame_size: usize,
+        compiler: Arc<std::sync::OnceLock<(::engine::ProgramCompiler, Option<String>)>>,
     ) {
         let engine = crate::engine::take_engine_backend(engine_id).ok();
+        if let Some(engine) = engine.as_ref()
+            && let Some(compile) = engine.program_compiler()
+        {
+            let backend = crate::engine::verbs::codegen_backend(engine).map(str::to_owned);
+            let _ = compiler.set((compile, backend));
+        }
         let mut lane = Lane::spawn(engine_id, engine, Arc::clone(&stats));
         let mut replies = LaneReplies::default();
         let mut instances = HashMap::new();
