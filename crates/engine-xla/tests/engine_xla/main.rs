@@ -13,6 +13,7 @@ mod a_double_block_fires_two_streams_through_the_engine;
 mod a_maintenance_write_is_timed;
 mod a_fire_the_load_did_not_prepare_is_counted;
 mod a_pool_answers_what_the_base_build_answered;
+mod a_pool_view_reads_the_packed_rows_order;
 mod a_prompt_length_reuses_its_programs;
 mod an_epilogue_agrees_with_the_host_interpreter;
 mod host_bank;
