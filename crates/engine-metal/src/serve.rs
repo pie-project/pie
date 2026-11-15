@@ -47,8 +47,8 @@ pub struct Boot<'a> {
     /// states them (`Residency::device_kv_budget`); `None` fills what the
     /// measured capacity leaves.
     pub kv_budget: Option<u64>,
-    /// `[engine.memory] budget_device`: a cap on the measured capacity. Its
-    /// stand-in share of the device is not read here: Metal measures.
+    /// `[engine.memory] budget_device`: a cap on the measured capacity.
+    /// Nothing else of it is read here: Metal measures.
     pub allowance: engine::Allowance,
     pub runahead: Runahead,
     pub residency: Plan,

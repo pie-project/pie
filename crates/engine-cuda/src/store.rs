@@ -120,19 +120,37 @@ pub struct Fitted {
     pub chunks: u32,
 }
 
-/// The least `[engine] bodies_mem` is held down to on a card with little
-/// room: enough for the decode bodies, which are what a serve replays every
-/// step and cost tens of megabytes each.
+/// What `Pools::fit_the_card` takes of the card's room for one working set:
+/// its chunks and their bytes backed, what is held for the bodies and the
+/// guests' programs beside it, the room past those holds, and the whole map
+/// units of it the chunks are fitted in.
+struct WorkingSet {
+    least: u32,
+    need: u64,
+    bodies: u64,
+    programs: u64,
+    room: u64,
+    limit: u64,
+}
+
+/// What of `[engine] bodies_mem` comes before the guests' programs on a
+/// card with little room past one sequence: enough for the decode bodies,
+/// which are what a serve replays every step and cost tens of megabytes
+/// each.
 pub const BODIES_FLOOR_BYTES: u64 = 512 << 20;
 
-/// What the graph bodies may take on this card: the configured allowance,
-/// or a quarter of `room` — what is left for them and the cache rows once
-/// one sequence and the guests' programs are seated — whichever is less,
-/// but not under the floor while the room affords it. A fixed 4 GiB on a
-/// 24 GB card is a sixth of the device before a second sequence seats.
+/// What the graph bodies may take while they arm: the configured allowance
+/// (or what they took when this deployment last armed whole), within `room`,
+/// what is left for them and the cache rows once one sequence and the
+/// guests' programs are seated. It bounds arming and no more: the load's
+/// last fit comes after the bodies are captured and gives the cache rows
+/// everything they left ([`Pools::fit_and_state`]), so no part of the room
+/// is kept from the bodies for rows' sake. A load arms every composition or
+/// is refused, and a lattice held under its allowance for the rows' sake
+/// was a load refused with room on the card.
 #[must_use]
 pub fn bodies_allowance(configured: u64, room: u64) -> u64 {
-    configured.min(room).min((room / 4).max(BODIES_FLOOR_BYTES))
+    configured.min(room)
 }
 
 /// What is held for the bodies and the guests' programs together on a
@@ -255,7 +273,8 @@ pub fn page_ceiling(trace: &Trace, page_size: u32, context: u32, bytes: u64) -> 
 /// longest whole number of pages, at most `declared`, at which one sequence
 /// takes no more than half of what the `allowance` of the card, less what others
 /// already hold, leaves past the weight tier: the activations and a second
-/// sequence have the other half.
+/// sequence have the other half. The most a declared context is served at:
+/// the fit shortens it to what it seats (`Pools::declare_context`).
 /// Never under one page.
 pub fn declared_context_that_fits(
     trace: &Trace,
@@ -272,8 +291,9 @@ pub fn declared_context_that_fits(
             .windowed(window, max_tokens);
         one_slot_bytes(trace, paging)
     };
+    let ceiling = load_ceiling(allowance, false)?;
     let (free, total) = device_memory()?;
-    let room = elastic::budget_bytes(free, total, allowance)
+    let room = elastic::room_under(ceiling, free, total)
         .saturating_sub(weight_tier_bytes(trace, weights, 0)?)
         / 2;
     let most = declared.div_ceil(page_size).max(1);
@@ -393,6 +413,19 @@ pub fn weight_tier_bytes(trace: &Trace, stated: u64, extra_resident: u64) -> Res
         stated => stated.min(full),
     }
     .saturating_add(extra_resident))
+}
+
+/// What the bound card may hold in all while a load under `allowance` runs
+/// ([`elastic::ceiling_of`]), resolved on the card as it is now, before the
+/// load takes anything. What this process took before its loads
+/// ([`crate::device::own::before_loads`]) is not held before: a stated
+/// budget counts it, and only what other processes and this one's earlier
+/// loads hold lies outside it. `latch` says a load is resolving its one
+/// ceiling, not a reading ahead of it.
+pub fn load_ceiling(allowance: engine::Allowance, latch: bool) -> Result<u64> {
+    let (free, total) = device_memory()?;
+    let held = (total - free).saturating_sub(crate::device::own::before_loads(latch));
+    Ok(elastic::ceiling_of(total, held, allowance))
 }
 
 /// The device's free and total bytes, as the driver reports them now.
@@ -555,6 +588,10 @@ pub struct Pools {
     shapes: Vec<Shape>,
     pooled: Vec<PoolRow>,
     paging: Paging,
+    /// The context is the model's declared one, which the operator did not
+    /// state: the fit before arming shortens it to what it seats
+    /// ([`Pools::declare_context`]).
+    declared: bool,
     asked: u64,
     /// The chunks the range was first reserved for, the asked count's: a
     /// fit may reserve a fresh range anew up to them, whatever an earlier
@@ -569,14 +606,18 @@ pub struct Pools {
     /// A graph body names addresses in the range: it is never reserved
     /// anew ([`Pools::pin`]).
     pinned: bool,
-    /// The chunks stated to the runtime where the fit may yet give the
-    /// cache rows more than it holds now ([`Pools::state_most`]).
+    /// The chunks stated to the runtime where a fit after the load may yet
+    /// give the cache rows more than it holds now ([`Pools::state_whole`]):
+    /// only a load that arms its bodies after it has stated its pool.
     stated: Option<u32>,
-    /// The range is reserved anew to the fit even where it maps on demand:
-    /// the pool's planes then span about what the fit holds, not the asked
-    /// count (reserved for the asked count, Qwen3.5-0.8B's c64 ran ~1%
-    /// slower on sm_120).
+    /// The range is reserved anew to what the card could back even where
+    /// it maps on demand: the pool's planes then span about what the fit
+    /// holds, not the asked count (reserved for the asked count,
+    /// Qwen3.5-0.8B's c64 ran ~1% slower on sm_120).
     whole_fit: bool,
+    /// The pool's chunks lie in one run from its base
+    /// ([`Pools::keep_contiguous`]).
+    contiguous: bool,
     airborne: Option<Airborne>,
     host: Option<HostKv>,
     disk: Option<DiskKv>,
@@ -753,7 +794,7 @@ impl Pools {
     #[allow(clippy::too_many_arguments)]
     pub fn reserve(
         device: i32,
-        allowance: engine::Allowance,
+        ceiling: u64,
         trace: &Trace,
         paging: Paging,
         budget: Option<u64>,
@@ -765,7 +806,7 @@ impl Pools {
         rows: bool,
         one_window: bool,
     ) -> Result<Pools> {
-        let pool = PhysicalPool::open(device, allowance)?;
+        let pool = PhysicalPool::open(device, ceiling)?;
         let layout = lay(
             trace,
             &paging,
@@ -974,6 +1015,7 @@ impl Pools {
             shapes,
             pooled,
             paging,
+            declared: false,
             asked: paging.pages(),
             asked_chunks: asked,
             ceiling: paging.pages(),
@@ -982,6 +1024,7 @@ impl Pools {
             pinned: false,
             stated: None,
             whole_fit: false,
+            contiguous: false,
             airborne: None,
             host: None,
             disk: None,
@@ -1129,7 +1172,10 @@ impl Pools {
     }
 
     /// The bytes of the chunks stated to the runtime that the fit does not
-    /// hold for the cache rows now.
+    /// hold for the cache rows now. None but on a load that arms its bodies
+    /// at the starting weight residency, after it stated its pool
+    /// ([`Pools::state_whole`]): every other load states the chunks its
+    /// last fit backed ([`Pools::fit_and_state`]).
     #[must_use]
     pub fn kept_back_bytes(&self) -> u64 {
         self.stated.map_or(0, |stated| {
@@ -1142,6 +1188,13 @@ impl Pools {
     #[must_use]
     pub fn activation_unheld_bytes(&self) -> u64 {
         self.chunks.activation_unheld_bytes()
+    }
+
+    /// Whether the range is stated whole, past what the fit holds
+    /// ([`Pools::state_whole`]).
+    #[must_use]
+    pub fn stated_whole(&self) -> bool {
+        self.stated.is_some()
     }
 
     /// The range stays where it lies from here on: a body captured over it
@@ -1187,58 +1240,19 @@ impl Pools {
         (records, pages, self.paging.window_pages_at(pages))
     }
 
-    /// Sizes the pool to the card: every whole chunk the card has room for,
-    /// each any shape's to take, provided they seat one working set at the
-    /// declared context ([`engine::chunk::fit`]). The room is the elastic
-    /// budget as it stands now, so the fit is called once everything else
-    /// this load puts on the device is resident, and again after arming,
-    /// when the bodies have taken what they take and the rest is the pool's.
-    /// `programs` is held for the guests' programs throughout; `bodies` is
-    /// the configured allowance, which `bodies_allowance` holds down to what
-    /// the room affords, and both yield before that one working set does,
-    /// since a pool under it is no deployment. `resident` spells what is on
-    /// the device already, for the refusal when not even that fits.
-    /// `settled` says the activation has reached its high water: every
-    /// composition fired while the bodies armed.
-    pub fn fit_the_card(
-        &mut self,
-        bodies: u64,
-        programs: u64,
-        settled: bool,
-        resident: &dyn core::fmt::Display,
-    ) -> Result<Fitted> {
-        // What the load dropped and the process keeps for reuse is free
-        // room, not the card's use.
-        crate::device::held::release_idle();
-        // The room is what the card has free plus every byte the range has
-        // backed (its committed segments and held spans; a flat range, once
-        // allocated, the whole of it: the chunks the kv rows have not yet
-        // taken are backed too, and so not free), less the activation the
-        // cache rows never take. Until the activation is settled that is its
-        // whole span, held or still to be (the first fire's activation, and
-        // the room held for the bodies, must find it); once settled (every
-        // composition armed, the activation at its high water), only the
-        // span a fire backed: what no fire backed is no fire's, and the cache
-        // rows take it.
-        let activation = if settled {
-            self.chunks
-                .activation_bytes()
-                .saturating_sub(self.chunks.activation_unheld_bytes())
-        } else {
-            self.chunks.activation_bytes()
-        };
-        let live = self
-            .pool
-            .spare_bytes(0)?
-            .saturating_add(self.chunks.backed_bytes())
-            .saturating_sub(activation);
-        let layout = self.chunks.layout();
-        let chunk = layout.chunk_bytes;
-        // One working set at the declared context beside the null chunk:
-        // its kv pages, its windowed pages and its recurrent record.
-        let one_slot = u64::from(self.paging.pages_per_slot).min(self.ceiling);
+    /// The model's declared context stands unstated by the operator: the fit
+    /// before arming shortens it to what it seats.
+    pub fn declare_context(&mut self) {
+        self.declared = true;
+    }
+
+    /// What the fit takes of `live` for one working set of `pages` kv pages
+    /// beside the null chunk (its kv pages, its windowed pages and its
+    /// recurrent record), and what it holds for the bodies and the guests'
+    /// programs beside it.
+    fn working_set(&self, pages: u64, bodies: u64, programs: u64, live: u64) -> WorkingSet {
         let slots = u32::from(self.has_state());
-        let least = chunks_at(layout, &self.paging, one_slot, slots);
+        let least = chunks_at(self.chunks.layout(), &self.paging, pages, slots);
         let need = self.chunk_bytes(least);
         // A stated budget is the pool's before the bodies and programs are
         // held anything; with none, one working set is, and beside it every
@@ -1256,16 +1270,174 @@ impl Pools {
                 need
             });
         let (bodies, programs) = holds_within(bodies, programs, live.saturating_sub(claim));
+        let room = live.saturating_sub(programs.saturating_add(bodies));
+        // Whole map units of the room, in whole chunks, of the range's.
+        let unit = self.chunks.map_unit().max(1);
+        WorkingSet {
+            least,
+            need,
+            bodies,
+            programs,
+            room,
+            limit: self.budget.unwrap_or(room) / unit * unit,
+        }
+    }
+
+    /// Sizes the pool to the card: every whole chunk the card has room for,
+    /// each any shape's to take, provided they seat one working set at the
+    /// declared context ([`engine::chunk::fit`]). The room is the elastic
+    /// budget as it stands now, so the fit is called once everything else
+    /// this load puts on the device is resident, and again after arming,
+    /// when the bodies have taken what they take and the rest is the pool's.
+    /// `programs` is held for the guests' programs throughout; `bodies` is
+    /// the allowance arming is bounded by, which `bodies_allowance` holds
+    /// within what the room affords, and both yield before that one working
+    /// set does, since a pool under it is no deployment. `resident` spells what is on
+    /// the device already, for the refusal when not even that fits.
+    /// `settled` says the activation has reached its high water: every
+    /// composition fired while the bodies armed.
+    ///
+    /// This fit claims the pool's room and states nothing: before the
+    /// bodies arm it is what arming's fires seat their rows in and what
+    /// the bodies are kept out of, and the load's last fit is
+    /// [`Pools::fit_and_state`]. Only a load that arms after it stated its
+    /// pool keeps this one's chunks, and settles them with another.
+    pub fn fit_the_card(
+        &mut self,
+        bodies: u64,
+        programs: u64,
+        settled: bool,
+        resident: &dyn core::fmt::Display,
+    ) -> Result<Fitted> {
+        self.fit(bodies, programs, settled, false, resident)
+    }
+
+    /// The load's last fit, once everything it puts on the device is there
+    /// (its bodies captured, where it records any): the pool is the chunks
+    /// the card backs now, and the range is stated as exactly those
+    /// ([`chunks::Chunks::state_fitted`]). The range was reserved for every chunk
+    /// the card could have backed, since a body names its base and the
+    /// activation above it and neither may move; the chunks it holds past
+    /// this fit are skipped, named by no chunk id and never backed. So the
+    /// chunks stated are the chunks [`Pools::back_whole`] backs, whatever
+    /// the bodies took: nothing is held back, and nothing was held for a
+    /// figure the bodies did not use.
+    ///
+    /// `bodies` is held out of it only for a load whose bodies arm after
+    /// it has stated its pool and that states no more than it backs.
+    pub fn fit_and_state(
+        &mut self,
+        bodies: u64,
+        programs: u64,
+        settled: bool,
+        resident: &dyn core::fmt::Display,
+    ) -> Result<Fitted> {
+        // What the load's own fires seated past where the pool parts goes
+        // back first: the fit reads the card without it.
+        self.chunks
+            .clear_past_parting(&mut self.pool, self.contiguous)?;
+        let fitted = self.fit(bodies, programs, settled, true, resident)?;
+        self.chunks.state_fitted(self.fitted_chunks(), self.contiguous)?;
+        Ok(fitted)
+    }
+
+    /// The pool's chunks stay in one run from the range's base, where
+    /// another worker reads its pages in place ([`Pools::export_kv`]): the
+    /// chunks skipped past the fit are those right under the activation,
+    /// and no rung lends its span to state.
+    pub fn keep_contiguous(&mut self) {
+        self.contiguous = true;
+    }
+
+    fn fit(
+        &mut self,
+        bodies: u64,
+        programs: u64,
+        settled: bool,
+        placed: bool,
+        resident: &dyn core::fmt::Display,
+    ) -> Result<Fitted> {
+        // What the load dropped and the process keeps for reuse is free
+        // room, not the card's use.
+        crate::device::held::release_idle();
+        // The room is what the card has free plus every byte the range has
+        // backed (its committed segments and held spans; a flat range, once
+        // allocated, the whole of it: the chunks the kv rows have not yet
+        // taken are backed too, and so not free), less the activation the
+        // cache rows never take. Until the activation is settled that is its
+        // whole span, held or still to be (the first fire's activation, and
+        // the room held for the bodies, must find it); once settled (every
+        // composition armed, the activation at its high water), only the
+        // spans held backed in it (the arena's prefix a fire backed, the
+        // carves laid at its end, the workspaces, the staged runs): what
+        // nothing holds is no fire's, and the cache rows take it. A flat
+        // range's one allocation backs the whole span.
+        let activation = if settled && elastic::mapped_on_demand() {
+            self.chunks.activation_held_bytes()
+        } else {
+            self.chunks.activation_bytes()
+        };
+        let live = self
+            .pool
+            .spare_bytes(0)?
+            .saturating_add(self.chunks.backed_bytes())
+            .saturating_sub(activation);
+        let layout = self.chunks.layout();
+        let chunk = layout.chunk_bytes;
+        // One working set at the declared context beside the null chunk:
+        // its kv pages, its windowed pages and its recurrent record.
+        let mut one_slot = u64::from(self.paging.pages_per_slot).min(self.ceiling);
+        // A declared context is the model's, not the operator's: where this
+        // fit does not seat one working set at it beside the programs and
+        // the bodies' floor, it is served at the longest the fit does.
+        if self.declared && !settled {
+            let floor = bodies.min(BODIES_FLOOR_BYTES);
+            let seats = |pages: u64| {
+                let set = self.working_set(pages, bodies, programs, live);
+                set.bodies >= floor
+                    && set.programs >= programs
+                    && engine::chunk::fit(set.limit, chunk, 0, set.least).is_ok()
+            };
+            // Never down to a window the rows are read through.
+            let shortest = self.paging.window.map_or(1, |window| {
+                u64::from(window.tokens / self.paging.page_size.max(1)) + 1
+            });
+            if shortest < one_slot && !seats(one_slot) && seats(shortest) {
+                let (mut fits, mut over) = (shortest, one_slot);
+                while over - fits > 1 {
+                    let mid = fits + (over - fits) / 2;
+                    if seats(mid) {
+                        fits = mid;
+                    } else {
+                        over = mid;
+                    }
+                }
+                let declared = self.paging.context();
+                one_slot = fits;
+                self.paging.pages_per_slot = u32::try_from(fits).unwrap_or(u32::MAX);
+                eprintln!(
+                    "engine-cuda: the model declares a {declared}-token context and, with \
+                     everything else this load puts on the device resident, the card does not \
+                     seat one sequence at it beside the guests' programs and the graph bodies' \
+                     floor; serving {} tokens. State `[engine] max_context` to choose.",
+                    self.paging.context()
+                );
+            }
+        }
+        let WorkingSet {
+            least,
+            need,
+            bodies,
+            programs,
+            room,
+            limit,
+        } = self.working_set(one_slot, bodies, programs, live);
         let held = programs.saturating_add(bodies);
-        let room = live.saturating_sub(held);
         if let Some(budget) = self.budget.filter(|&budget| budget > room) {
             return Err(Fault::Residency(
                 engine::fit::Short::Budget { budget, room }.to_string(),
             ));
         }
-        // Whole map units of the room, in whole chunks, of the range's.
-        let unit = self.chunks.map_unit().max(1);
-        let limit = self.budget.unwrap_or(room) / unit * unit;
         // Before arming a fresh range may be reserved anew up to the asked
         // count. Once armed it never moves, fresh or not: the bodies name
         // addresses in it.
@@ -1312,7 +1484,9 @@ impl Pools {
                 .saturating_sub(unbacked.saturating_add(held).div_ceil(page));
             let mut fitted = fitted;
             while fitted > least {
-                let growth = self.chunks.growth_for(fitted)?;
+                let growth = self
+                    .chunks
+                    .growth_for(fitted, placed.then_some(self.contiguous))?;
                 if growth <= have {
                     break;
                 }
@@ -1374,24 +1548,37 @@ impl Pools {
         }
         // A flat range is one allocation made on its first commit: of the
         // fitted chunks, not of every chunk the asked count reserved.
-        // A range mapped on demand reserved anew before the activation is
-        // settled keeps room for what the settled fit may yet give the cache
-        // rows: the activation's span no fire backs, and the bodies'
-        // allowance past what arming holds. Reserved to this fit alone, the
-        // settled one could never grow past it.
+        // A range mapped on demand only reserves addresses, and a body
+        // recorded over it names its base and the activation above it, so
+        // it is reserved before the bodies arm for every chunk the card
+        // could back were nothing more to arrive: what it has free and
+        // what the range has backed, less the activation's prefix a fire
+        // backed. The load's last fit backs what the card then has and
+        // skips the rest ([`Pools::fit_and_state`]); reserved to this fit
+        // alone, that one could never grow past it.
         let flat = !elastic::mapped_on_demand();
-        let reshape = flat || (self.whole_fit && fitted < self.chunks.total());
+        let reserved = if flat || settled {
+            fitted
+        } else {
+            let backable = self
+                .pool
+                .spare_bytes(0)?
+                .saturating_add(self.chunks.backed_bytes())
+                .saturating_sub(
+                    self.chunks
+                        .activation_bytes()
+                        .saturating_sub(self.chunks.activation_unheld_bytes()),
+                )
+                .div_ceil(chunk);
+            u32::try_from(backable)
+                .unwrap_or(u32::MAX)
+                .max(fitted)
+                .min(most)
+        };
+        let reshape = flat || (self.whole_fit && reserved != self.chunks.total());
         // Never once a body names the range ([`Pools::pin`]): reshaped, its
         // planes would lie where the bodies captured over it no longer look.
         if reshape && !self.pinned && self.chunks.fresh() {
-            let reserved = if flat || settled {
-                fitted
-            } else {
-                let more = self.chunks.activation_unheld_bytes().saturating_add(bodies) / chunk;
-                fitted
-                    .saturating_add(u32::try_from(more).unwrap_or(u32::MAX))
-                    .min(self.chunks.total())
-            };
             self.chunks.reshape(&mut self.pool, reserved)?;
         }
         self.chunks
@@ -1837,17 +2024,6 @@ impl Pools {
             .map_or(1, |fixed| fixed.ids_a_lane().max(1))
     }
 
-    /// The slots of the record shape a record takes; none where the load
-    /// lays no record.
-    #[must_use]
-    pub fn record_pieces(&self) -> u32 {
-        self.chunks
-            .layout()
-            .fixed
-            .as_ref()
-            .map_or(0, |fixed| fixed.pieces.max(1))
-    }
-
     /// Lets go of the name [`Pools::name_record`] gave `key`.
     pub fn forget_record(&mut self, key: u32) {
         self.records.remove(&key);
@@ -1858,28 +2034,23 @@ impl Pools {
     /// its end and its bytes, right under the fire's own chunks and on
     /// down through the state's last chunks. It lies in the chunks the
     /// runtime keeps free of state at every rung the fire may be cut to.
-    /// The state's chunks end where the activation starts wherever any of
-    /// the span is lent ([`Pools::state_whole`]), so the span is one.
+    /// The span is lent only where the state's chunks end where the
+    /// activation starts (`Pools::lent_bytes`), so the span is one.
     pub fn program_span(&self, under: u64, term: u64) -> Result<(u64, u64)> {
         let chunk = self.chunks.layout().chunk_bytes.max(1);
-        let lent = self.lent_bytes(under);
         let term = term.div_ceil(chunk) * chunk;
-        if lent == 0 {
-            return Ok((self.chunks.state_end(), term));
-        }
-        if self.chunks.state_end() != self.chunks.activation_base() {
-            return Err(Fault::program(
-                "store::chunks",
-                "the activation lends its span to state and does not start where the \
-                 state's chunks end",
-            ));
-        }
-        Ok((self.chunks.activation_base() + lent, term))
+        Ok((self.chunks.state_end() + self.lent_bytes(under), term))
     }
 
     /// The whole chunks of the span under a carve that leaves `under`
-    /// bytes below it, as the rungs state them lent.
+    /// bytes below it, as the rungs state them lent: none where the
+    /// state's chunks do not end where the activation starts
+    /// ([`chunks::Chunks::state_fitted`]), since what is lent and the state's last
+    /// chunks would not be one span.
     fn lent_bytes(&self, under: u64) -> u64 {
+        if !self.chunks.state_meets_activation() {
+            return 0;
+        }
         let chunk = self.chunks.layout().chunk_bytes.max(1);
         let act = u64::from(self.chunks.act_chunks());
         (under / chunk).min(act.saturating_sub(1)) * chunk
@@ -1894,9 +2065,12 @@ impl Pools {
     }
 
     /// States the range whole to the runtime: every chunk it reserved, the
-    /// fit's and those a later fit may give the cache rows, which the
-    /// runtime keeps the pool under by [`Pools::kept_back_bytes`]
-    /// meanwhile. The state's chunks then end where the activation starts.
+    /// fit's and those the fit after the bodies arm may give the cache
+    /// rows, which the runtime keeps the pool under by
+    /// [`Pools::kept_back_bytes`] meanwhile. For a load that arms at its
+    /// starting weight residency, after the runtime read its pool: any
+    /// other states what its last fit backed ([`Pools::fit_and_state`]).
+    /// The state's chunks then end where the activation starts.
     pub(crate) fn state_whole(&mut self) {
         self.stated = Some(self.chunks.total());
         self.paging.pages = self
@@ -3420,7 +3594,7 @@ impl Pools {
     /// The state pool as the runtime counts it, for fires of up to
     /// `max_tokens`: the chunks the fit left the cache rows, and the
     /// activation's right above them, the chunks past the fit skipped
-    /// ([`chunks::Chunks::skip_past`]).
+    /// ([`chunks::Chunks::state_fitted`]).
     ///
     /// `rungs`, each smaller rung's tokens and the bytes at the bottom of
     /// the activation's span state may take at it (backed already), each
@@ -3433,8 +3607,7 @@ impl Pools {
         let fitted = self.stated.map_or(self.fitted_chunks(), |stated| {
             stated.max(self.fitted_chunks())
         });
-        self.chunks.limit(fitted);
-        self.chunks.skip_past(fitted);
+        self.chunks.state_fitted(fitted, self.contiguous)?;
         // The state's chunks of the segment the stated activation starts in
         // are backed from here on, as the runtime counts them.
         match self.chunks.hold_boundary(&mut self.pool)? {
@@ -3446,8 +3619,8 @@ impl Pools {
         let rungs: Vec<(u32, u32)> = rungs
             .iter()
             .map(|&(tokens, under)| {
-                let under = u32::try_from(under / chunk).unwrap_or(u32::MAX);
-                (tokens, act.saturating_sub(under).max(1))
+                let lent = u32::try_from(self.lent_bytes(under) / chunk).unwrap_or(u32::MAX);
+                (tokens, act - lent)
             })
             .collect();
         let mut facts = self
@@ -3532,6 +3705,13 @@ impl Pools {
                 "a windowed kv row names its pages by its own window list, so it cannot be \
                  handed to another worker by the kv pages it reads"
                     .to_string(),
+            ));
+        }
+        if !self.chunks.in_one_run() {
+            return Err(Fault::program(
+                "store::chunks",
+                "a kv pool exported whose chunks do not lie in one run from its base: say it is \
+                 exported before the load's last fit (`Pools::keep_contiguous`)",
             ));
         }
         if !self.whole {

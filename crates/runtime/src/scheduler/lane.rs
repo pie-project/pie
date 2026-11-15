@@ -243,31 +243,12 @@ impl Lane {
         engine: Option<EngineBox>,
         stats: Arc<SchedulerStats>,
     ) -> Self {
-        Self::spawn_lending(
-            engine_idx,
-            engine,
-            stats,
-            Box::new(super::arming::PlannerLender),
-        )
-    }
-
-    /// [`Self::spawn`], arming steps lent their room by `lender`.
-    pub(super) fn spawn_lending(
-        engine_idx: usize,
-        engine: Option<EngineBox>,
-        stats: Arc<SchedulerStats>,
-        lender: Box<dyn super::arming::Lender>,
-    ) -> Self {
         let (launch_tx, launch_rx) = crate::rt::channel::unbounded::<LaneRequest>();
         let (control_tx, control_rx) = crate::rt::channel::unbounded::<LaneRequest>();
         let landed_tx = control_tx.clone();
         let thread = crate::rt::thread::Builder::new()
             .name(format!("pie-engine-{engine_idx}"))
-            .spawn(move || {
-                Self::run(
-                    engine_idx, engine, launch_rx, control_rx, landed_tx, stats, lender,
-                )
-            })
+            .spawn(move || Self::run(engine_idx, engine, launch_rx, control_rx, landed_tx, stats))
             .expect("spawn pie-engine lane thread");
         Self {
             launch_tx,
@@ -321,16 +302,11 @@ impl Lane {
         state
     }
 
-    /// The next request, `idle` called while none waits for as long as it
-    /// answers there is more to do (one bounded piece a call).
     fn next_request(
-        #[cfg_attr(target_arch = "wasm32", allow(unused_variables))] engine_idx: usize,
         launch_rx: &crate::rt::channel::Receiver<LaneRequest>,
         control_rx: &crate::rt::channel::Receiver<LaneRequest>,
         turn: &mut LaneTurn,
-        idle: &mut dyn FnMut() -> super::arming::Step,
     ) -> std::result::Result<LaneRequest, ()> {
-        use super::arming::Step;
         use crate::rt::channel::TryRecvError;
         #[cfg(target_arch = "wasm32")]
         const ENGINE_LANE_HOT_US: u64 = 0;
@@ -371,37 +347,14 @@ impl Lane {
                 }
                 Err(TryRecvError::Empty) => {}
             }
-            let idle = idle();
-            if idle == Step::Stepped {
-                spin_until = Instant::now() + hot_window;
-                continue;
-            }
             if Instant::now() < spin_until {
                 std::hint::spin_loop();
                 continue;
             }
-            // Arming waits on room to free: the lane wakes on a request or
-            // on room freed, whichever comes first.
             let mut select = crate::rt::channel::Select::new();
             select.recv(launch_rx);
             select.recv(control_rx);
-            #[cfg(not(target_arch = "wasm32"))]
-            let room = (idle == Step::Waiting)
-                .then(|| super::arming::room_wake(engine_idx))
-                .flatten();
-            #[cfg(not(target_arch = "wasm32"))]
-            if let Some(room) = room {
-                select.recv(room);
-            }
-            let ready = select.ready();
-            #[cfg(not(target_arch = "wasm32"))]
-            if ready == 2
-                && let Some(room) = room
-            {
-                let _ = room.try_recv();
-            }
-            #[cfg(target_arch = "wasm32")]
-            let _ = ready;
+            select.ready();
             spin_until = Instant::now() + hot_window;
         }
     }
@@ -413,7 +366,6 @@ impl Lane {
         control_rx: crate::rt::channel::Receiver<LaneRequest>,
         landed_tx: crate::rt::channel::Sender<LaneRequest>,
         stats: Arc<SchedulerStats>,
-        lender: Box<dyn super::arming::Lender>,
     ) {
         let mut channels = ChannelJoin::new();
         // The pool's instance and channel slots, looked up at the first
@@ -458,50 +410,16 @@ impl Lane {
         }
         let mut stash: Option<LaneRequest> = None;
         let mut lane_turn = LaneTurn::default();
-        let mut arming = super::arming::Arming::new(engine_idx, engine.as_ref(), lender);
         loop {
-            // Between fires: a raise waiting on a rung not armed gets steps
-            // toward it, however busy the lane (REDESIGN 2.5,
-            // `super::arming`): half the lane's time at most, a gap running
-            // steps while its budget lasts. Its pass never waits on them: it
-            // fires at the widest rung armed meanwhile, cut to it, and takes
-            // a wider one as it arms. A step short of room ends the gap's run
-            // until the raise funds it.
-            if arming.raise_waits() {
-                let until = Instant::now() + super::arming::GAP_BUDGET;
-                loop {
-                    let stepped = arming.step(&mut engine, false, true);
-                    if stepped != super::arming::Step::Stepped
-                        || !arming.raise_waits()
-                        || Instant::now() >= until
-                    {
-                        break;
-                    }
-                }
-            } else {
-                arming.unfund();
-            }
             let request = match stash.take() {
                 Some(stashed) => {
                     lane_turn.took_launch();
                     stashed
                 }
-                None => {
-                    match Self::next_request(
-                        engine_idx,
-                        &launch_rx,
-                        &control_rx,
-                        &mut lane_turn,
-                        &mut || {
-                            // Frames still in flight: the lane is between
-                            // fires, not idle.
-                            arming.step(&mut engine, true, !landed_instances.is_empty())
-                        },
-                    ) {
-                        Ok(request) => request,
-                        Err(()) => break,
-                    }
-                }
+                None => match Self::next_request(&launch_rx, &control_rx, &mut lane_turn) {
+                    Ok(request) => request,
+                    Err(()) => break,
+                },
             };
             let work = match &request {
                 LaneRequest::Control { .. } => Some(LaneWork::Control),
@@ -528,14 +446,10 @@ impl Lane {
                     ..
                 } => {
                     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let fault = arming
-                            .fault()
-                            .map(str::to_string)
-                            .or_else(|| unassigned_ref(engine_idx, &frame));
+                        let fault = unassigned_ref(engine_idx, &frame);
                         let result = match engine.as_mut() {
-                            // A load fault in arming fails every fire after
-                            // it, and a fire naming a slot nobody was handed
-                            // is refused before the engine reads it.
+                            // A fire naming a slot nobody was handed is
+                            // refused before the engine reads it.
                             _ if fault.is_some() => Err(fault.unwrap_or_default()),
                             Some(engine) => {
                                 crate::probe_fire!(stats.fire.execute.engine_fire_us, {
@@ -663,11 +577,7 @@ impl Lane {
         std::mem::forget(engine);
         drop(channels);
         let mut turn = LaneTurn::default();
-        while let Ok(request) =
-            Self::next_request(usize::MAX, launch_rx, control_rx, &mut turn, &mut || {
-                super::arming::Step::Over
-            })
-        {
+        while let Ok(request) = Self::next_request(launch_rx, control_rx, &mut turn) {
             if let LaneRequest::Shutdown { response } = request {
                 let _ = response.send((None, ChannelJoin::new()));
                 return;
@@ -1044,7 +954,7 @@ impl Lane {
                     }
                     HostKvOp::WeightResidency(residency) => engine
                         .weight_residency(&residency)
-                        .map(|()| Vec::new())
+                        .map(|held| serde_json::to_vec(&held).unwrap_or_default())
                         .map_err(Into::into),
                     HostKvOp::WeightUses => engine
                         .weight_uses()
