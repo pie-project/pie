@@ -3974,34 +3974,22 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 .as_deref()
                 .expect("every read plane has a base");
             let row_bytes = u64::from(plane.width) * elem(plane.dtype);
-            if span.direct {
-                let bytes = u64::from(span.rows) * row_bytes;
-                for (layer, base) in layers.iter().enumerate() {
-                    frame.copy(
-                        self.span.buffer()?,
-                        base + u64::from(span.first) * row_bytes,
-                        &self.readout[prepared.arm],
-                        span.at + layer as u64 * bytes,
-                        bytes,
-                    )?;
-                }
-                continue;
-            }
             let gathered = self.gathers_readout && plane.seam == Kind::Readout;
-            for k in 0..span.rows {
+            let source_row = |k: u32| {
                 let cursor = u64::from(span.first + k);
-                let token_row = prepared.readout_rows[cursor as usize];
-                let at = if gathered {
+                if gathered {
                     cursor
                 } else {
-                    u64::try_from(token_row).unwrap_or(0)
-                };
+                    u64::try_from(prepared.readout_rows[cursor as usize]).unwrap_or(0)
+                }
+            };
+            for copy in span_copies(span, layers, row_bytes, source_row) {
                 frame.copy(
                     self.span.buffer()?,
-                    layers[0] + at * row_bytes,
+                    copy.from,
                     &self.readout[prepared.arm],
-                    span.at + u64::from(k) * row_bytes,
-                    row_bytes,
+                    copy.to,
+                    copy.bytes,
                 )?;
             }
         }
@@ -4244,6 +4232,53 @@ fn bf16(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
 
+/// One copy of a read: `bytes` from byte `from` of the span's buffer to
+/// byte `to` of the arm's readout seat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpanCopy {
+    from: u64,
+    to: u64,
+    bytes: u64,
+}
+
+/// The copies that land `span` in the seat, `layers` each layer's base in
+/// the span's buffer and `row_bytes` a row's: every layer's rows after the
+/// last from `span.at`, as [`ReadSpan::bytes`] counts and a reader takes
+/// them. A direct span's rows run from `span.first`; a table span's `k`th
+/// row is the layer's row `source_row(k)`.
+fn span_copies(
+    span: &ReadSpan,
+    layers: &[u64],
+    row_bytes: u64,
+    source_row: impl Fn(u32) -> u64,
+) -> Vec<SpanCopy> {
+    let bytes = u64::from(span.rows) * row_bytes;
+    if span.direct {
+        return layers
+            .iter()
+            .enumerate()
+            .map(|(layer, base)| SpanCopy {
+                from: base + u64::from(span.first) * row_bytes,
+                to: span.at + layer as u64 * bytes,
+                bytes,
+            })
+            .collect();
+    }
+    (0..span.rows)
+        .flat_map(|k| {
+            let row = source_row(k);
+            layers
+                .iter()
+                .enumerate()
+                .map(move |(layer, base)| SpanCopy {
+                    from: base + row * row_bytes,
+                    to: span.at + layer as u64 * bytes + u64::from(k) * row_bytes,
+                    bytes: row_bytes,
+                })
+        })
+        .collect()
+}
+
 fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }
@@ -4356,5 +4391,150 @@ impl<B: Serve> Shell<B> {
             }
         }
         Ok(staged)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReadSpan, SpanCopy, span_copies};
+    use poem_ir::Dtype;
+
+    const SENTINEL: u8 = 0xAA;
+    const ROW_BYTES: u64 = 16;
+    const LAYERS: [u64; 2] = [1000, 5000];
+    const PICKS: [u64; 3] = [7, 2, 9];
+
+    /// A span's buffer whose every byte names its place: no row of one
+    /// layer reads like a row of another.
+    fn source() -> Vec<u8> {
+        (0..8000).map(|at| (at % 251) as u8).collect()
+    }
+
+    /// The seat after `copies` land in one filled with [`SENTINEL`].
+    fn landed(copies: &[SpanCopy], from: &[u8]) -> Vec<u8> {
+        let mut seat = vec![SENTINEL; 256];
+        for copy in copies {
+            let (f, t, n) = (copy.from as usize, copy.to as usize, copy.bytes as usize);
+            seat[t..t + n].copy_from_slice(&from[f..f + n]);
+        }
+        seat
+    }
+
+    /// Two layers of three picked rows, four f32 wide, at byte 32.
+    fn table_span() -> ReadSpan {
+        ReadSpan {
+            lane: 0,
+            first: 0,
+            rows: 3,
+            plane: 0,
+            at: 32,
+            width: 4,
+            layers: 2,
+            dtype: Dtype::F32,
+            direct: false,
+            host: true,
+        }
+    }
+
+    /// Whether every byte a reader takes of `span` in `seat` is the layer's
+    /// own picked row, layer after layer, and nothing past it was touched.
+    fn reads_whole(span: &ReadSpan, seat: &[u8], from: &[u8]) -> bool {
+        let (at, end) = (span.at as usize, (span.at + span.bytes()) as usize);
+        let read = &seat[at..end];
+        let rows = PICKS.len();
+        let each = LAYERS.iter().enumerate().all(|(layer, base)| {
+            PICKS.iter().enumerate().all(|(k, row)| {
+                let to = (layer * rows + k) * ROW_BYTES as usize;
+                let want = (base + row * ROW_BYTES) as usize;
+                read[to..to + ROW_BYTES as usize] == from[want..want + ROW_BYTES as usize]
+            })
+        });
+        each && seat[..at].iter().all(|&b| b == SENTINEL)
+            && seat[end..].iter().all(|&b| b == SENTINEL)
+    }
+
+    /// A table span lands each layer's picked rows, layer after layer:
+    /// every byte a reader takes of it (`ReadSpan::bytes` from `at`) is one
+    /// the copies wrote.
+    #[test]
+    fn a_table_span_lands_every_layer_of_its_rows() {
+        let span = table_span();
+        let from = source();
+        let copies = span_copies(&span, &LAYERS, ROW_BYTES, |k| PICKS[k as usize]);
+        assert_eq!(span.bytes(), 2 * 3 * ROW_BYTES);
+        assert!(reads_whole(&span, &landed(&copies, &from), &from));
+    }
+
+    /// The negative control: the copies the walk laid before, layer 0's
+    /// picked rows only, leave the span's later layer unwritten, and the
+    /// check refuses them.
+    #[test]
+    fn layer_zero_alone_leaves_a_table_spans_later_layer_unwritten() {
+        let span = table_span();
+        let from = source();
+        let layer_zero: Vec<SpanCopy> = (0..span.rows)
+            .map(|k| SpanCopy {
+                from: LAYERS[0] + PICKS[k as usize] * ROW_BYTES,
+                to: span.at + u64::from(k) * ROW_BYTES,
+                bytes: ROW_BYTES,
+            })
+            .collect();
+        let seat = landed(&layer_zero, &from);
+        assert!(!reads_whole(&span, &seat, &from));
+        let later = (span.at + 3 * ROW_BYTES) as usize..(span.at + span.bytes()) as usize;
+        assert!(seat[later].iter().all(|&b| b == SENTINEL));
+    }
+
+    /// A direct span is one copy a layer, its rows from `first`.
+    #[test]
+    fn a_direct_span_is_one_copy_a_layer() {
+        let span = ReadSpan {
+            direct: true,
+            first: 5,
+            rows: 2,
+            ..table_span()
+        };
+        let copies = span_copies(&span, &[100, 200], ROW_BYTES, |_| unreachable!());
+        assert_eq!(
+            copies,
+            vec![
+                SpanCopy {
+                    from: 100 + 5 * 16,
+                    to: 32,
+                    bytes: 32
+                },
+                SpanCopy {
+                    from: 200 + 5 * 16,
+                    to: 64,
+                    bytes: 32
+                },
+            ]
+        );
+    }
+
+    /// A one-layer table span lands its picked rows in order, as before.
+    #[test]
+    fn a_one_layer_table_span_lands_its_rows_in_order() {
+        let span = ReadSpan {
+            rows: 2,
+            layers: 1,
+            ..table_span()
+        };
+        let copies = span_copies(&span, &[1000], ROW_BYTES, |k| [4u64, 1][k as usize]);
+        assert_eq!(
+            copies,
+            vec![
+                SpanCopy {
+                    from: 1000 + 64,
+                    to: 32,
+                    bytes: 16
+                },
+                SpanCopy {
+                    from: 1000 + 16,
+                    to: 48,
+                    bytes: 16
+                },
+            ]
+        );
     }
 }
