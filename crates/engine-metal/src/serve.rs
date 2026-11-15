@@ -185,6 +185,9 @@ pub struct Seated<'a> {
     /// trimmed behind the window), for the windowed rows; a missing or empty
     /// seat-addresses them.
     pub windows: &'a [Vec<u32>],
+    /// The runtime's report tag for this lane (`engine::fire` lane
+    /// `reports`); 0: no report asked.
+    pub reports: u64,
 }
 
 impl<'a> Seated<'a> {
@@ -211,6 +214,7 @@ impl<'a> Seated<'a> {
             record: None,
             record_run: None,
             windows: &[],
+            reports: 0,
         }
     }
 
@@ -3382,6 +3386,9 @@ impl Shell {
         // (checked backed) once the fire's segments are committed.
         let mut state_ids: Vec<u32> = Vec::new();
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
+        // Per reporting lane whose rows a port places, one past the last
+        // slot they land at, in the set's own numbering (`KvWrites::end`).
+        let mut ends: Vec<engine::KvWrites> = Vec::new();
         let mut rs_active = false;
         // Per fire lane, the rows inside it whose state lands in a slot of its
         // own and then those slots (`kernels_metal::ssm::Snapshots`).
@@ -3618,9 +3625,17 @@ impl Shell {
                 Some(ports) => ports.slots(row.rows as usize)?,
                 None => None,
             };
+            let placed = stated.is_some();
             let first = stated
                 .and_then(|slots| slots.first().copied())
                 .unwrap_or(have);
+            if placed && seated.reports != 0 {
+                ends.push(engine::KvWrites {
+                    tag: seated.reports,
+                    end: Some(first.saturating_add(row.rows)),
+                    ..engine::KvWrites::default()
+                });
+            }
             // The buffer's rows live in the rs list: the verb's pages, in
             // token order from its base (CONTRACT-BC 18).
             let rs = match seated.rs {
@@ -4413,6 +4428,7 @@ impl Shell {
         let guest = self.guest_carve();
         Ok(Prepared {
             guest,
+            ends,
             lanes,
             input_feeds,
             merge_lands,
@@ -4664,6 +4680,9 @@ pub struct Clips<'a> {
 pub struct Prepared<'a> {
     /// The guest region under this fire's model carve.
     guest: crate::program::GuestCarve,
+    /// What the fire reports where it settles: each port-placed reporting
+    /// lane's written end.
+    ends: Vec<engine::KvWrites>,
     lanes: &'a [Seated<'a>],
     input_feeds: Vec<InputFeedPlan>,
     merge_lands: Vec<MergeLand>,
@@ -4833,13 +4852,15 @@ impl engine::frame::Shell for Shell {
         let seq = self.airborne.enter();
         let counts = self.airborne.clone();
         let done = prepared.done.take();
+        let ends = std::mem::take(&mut prepared.ends);
         let verdict = self.ane.as_ref().and_then(crate::ane::Ane::verdict);
         let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
             counts.leave();
             let refused = refused.or_else(|| verdict.as_ref().and_then(|verdict| verdict()));
             if let Some(done) = done.as_ref() {
                 let outcome = match &refused {
-                    None => engine::StepOutcome::Committed,
+                    None if ends.is_empty() => engine::StepOutcome::Committed,
+                    None => engine::StepOutcome::Wrote(ends.clone()),
                     Some(why) => engine::StepOutcome::Faulted(format!(
                         "metal command buffer for frame {} step {}: {why}",
                         done.at.frame, done.at.step

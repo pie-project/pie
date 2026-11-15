@@ -1204,6 +1204,7 @@ impl Metal {
                     record: record_of[at].as_deref(),
                     record_run: run_of[at].as_deref(),
                     windows: &window_of[at],
+                    reports: lane.reports,
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;
