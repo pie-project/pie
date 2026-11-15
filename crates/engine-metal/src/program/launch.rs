@@ -734,7 +734,7 @@ pub struct Prepared {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-struct StepWord {
+pub(crate) struct StepWord {
     index: u32,
     level: u32,
     groups: u32,
@@ -1432,6 +1432,29 @@ impl Prepared {
     fn encode_streamed(&self, frame: &Frame, region: &Region) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
+            let encoder = frame.encoder();
+            let (dispatches, threads) = self.bind_streamed(&encoder, region)?;
+            dispatch_streamed(&encoder, &dispatches, threads, GROUPED_LANES as usize);
+            Ok(())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = (frame, region);
+            Err(Fault::Deviceless)
+        }
+    }
+
+    /// Binds this member's state for a streamed region on `encoder` and
+    /// returns its steps' dispatches (step word, threadgroups) and threads
+    /// a threadgroup, for the caller to dispatch: all at once, or one step
+    /// at a time interleaved with other members' ([`dispatch_streamed_step`]).
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn bind_streamed(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+        region: &Region,
+    ) -> Result<(Vec<(StepWord, u32)>, usize)> {
+        {
             use objc2::runtime::ProtocolObject;
             use objc2_metal::{
                 MTLComputeCommandEncoder, MTLComputePipelineState, MTLResource, MTLResourceUsage,
@@ -1452,7 +1475,6 @@ impl Prepared {
                         format!("region {} has no group layout", region.region_index),
                     )
                 })?;
-            let encoder = frame.encoder();
             encoder.setComputePipelineState(region.pipeline());
             // SAFETY: every reservation is retained by `self`; every offset lies inside its slot.
             unsafe {
@@ -1534,22 +1556,15 @@ impl Prepared {
             let threads = streamed_threads(region.pipeline().maxTotalThreadsPerThreadgroup());
             let temporary_bytes =
                 u64::from(self.scratch_stride.saturating_sub(self.temporary_offset));
-            dispatch_streamed(
-                &encoder,
-                &streamed_dispatches(
+            Ok((
+                streamed_dispatches(
                     &region.steps,
                     &self.descriptor_table,
                     u32::try_from(threads).unwrap_or(1),
                     temporary_bytes,
                 ),
                 threads,
-                GROUPED_LANES as usize,
-            );
-            Ok(())
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            Err(Fault::Deviceless)
+            ))
         }
     }
 
@@ -2616,6 +2631,16 @@ impl Batch {
 }
 
 #[cfg(target_vendor = "apple")]
+/// One streamed step of a member bound on `encoder` ([`Prepared::bind_streamed`]).
+#[cfg(target_vendor = "apple")]
+pub(crate) fn dispatch_streamed_step(
+    encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    step: (StepWord, u32),
+    threads: usize,
+) {
+    dispatch_streamed(encoder, &[step], threads, GROUPED_LANES as usize);
+}
+
 fn dispatch_streamed(
     encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
     dispatches: &[(StepWord, u32)],
