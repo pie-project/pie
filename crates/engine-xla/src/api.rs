@@ -119,11 +119,14 @@ pub struct Xla {
     next_frame: u64,
     sink: Option<engine::CompletionSink>,
     adapters: BTreeMap<InstanceId, crate::adapter::Binding>,
-    /// Per recurrent state slot, how far a device-counted fold this engine
-    /// resolved has frozen it: the runtime's `RsVerb::Buffer::folded` lags
-    /// such a fold until its fire settles, so a fire staged before then
-    /// replays from here, not from the stale count.
-    rs_ahead: BTreeMap<u32, u32>,
+    /// Per state record (its first piece's slot ref, [`record_key`]), how
+    /// far a device-counted fold this engine resolved has frozen it: the
+    /// runtime's `RsVerb::Buffer::folded` lags such a fold until its fire
+    /// settles, so a fire staged before then replays from here, not from
+    /// the stale count. A fork reads the record its parent wrote, so it
+    /// finds the parent's; a device slot copy carries it; leaving the
+    /// device with one unsettled is the runtime's to wait out.
+    rs_ahead: BTreeMap<u64, u32>,
     /// What the engine counts while it serves, read by the runtime: a
     /// program a fire waited on (Compiled), a guest pass the host
     /// interprets (Fallback), a frame or registration refused (Refused).
@@ -831,6 +834,13 @@ impl Engine for Xla {
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         use crate::serve::Tier;
+        // A state record copied carries where a device fold left it.
+        for &(src, dst) in &copy.slots {
+            match self.rs_ahead.get(&ref_key(copy.shape, src)).copied() {
+                Some(at) => self.rs_ahead.insert(ref_key(copy.shape, dst), at),
+                None => self.rs_ahead.remove(&ref_key(copy.shape, dst)),
+            };
+        }
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
         let tier = |domain| match domain {
             MemoryDomain::HostPinned => Some(Tier::Host),
@@ -1381,23 +1391,26 @@ impl Xla {
         // A state a device-counted fold froze past what the runtime counts
         // replays from where the fold left it.
         for (lane, verb) in submission.lanes.iter().zip(verbs.iter_mut()) {
+            let Some((read, write)) = record_key(lane) else {
+                continue;
+            };
             // A state starting afresh holds nothing an earlier fold froze.
             let fresh = match lane.rs_reset {
                 engine::fire::RsReset::Fresh => true,
                 engine::fire::RsReset::Inferred => lane.kv.held == 0,
-                _ => false,
+                engine::fire::RsReset::Held => false,
             };
-            if let (true, Some(slot)) = (fresh, lane.rs_slot) {
-                self.rs_ahead.remove(&slot);
+            if fresh {
+                self.rs_ahead.remove(&write);
                 continue;
             }
-            if let (engine::fire::RsVerb::Buffer { folded, .. }, Some(slot)) = (verb, lane.rs_slot) {
-                match self.rs_ahead.get(&slot) {
-                    Some(&ahead) if ahead > *folded => *folded = ahead,
-                    Some(_) => {
-                        self.rs_ahead.remove(&slot);
+            if let engine::fire::RsVerb::Buffer { folded, .. } = verb {
+                match self.rs_ahead.get(&read).copied() {
+                    Some(ahead) if ahead > *folded => *folded = ahead,
+                    Some(_) if read == write => {
+                        self.rs_ahead.remove(&read);
                     }
-                    None => {}
+                    _ => {}
                 }
             }
         }
@@ -1422,9 +1435,9 @@ impl Xla {
                     fold: engine::fire::FoldLen::Host(n),
                     ..
                 },
-                Some(slot),
+                Some((_, slot)),
                 true,
-            ) = (&verbs[at], lane.rs_slot, device_folds[at])
+            ) = (&verbs[at], record_key(lane), device_folds[at])
             {
                 let first = device
                     .get(at)
@@ -1724,4 +1737,19 @@ fn table_of(lane: &engine::fire::Lane, id: engine::chunk::ShapeId) -> Option<&[u
         .iter()
         .find(|(held, _)| *held == id)
         .map(|(_, table)| table.as_slice())
+}
+
+/// A slot ref of shape `shape` as one key.
+fn ref_key(shape: engine::chunk::ShapeId, slot: u32) -> u64 {
+    (u64::from(shape.0) << 32) | u64::from(slot)
+}
+
+/// The state record a lane reads and the one it writes: its first fixed
+/// shape's first piece, `[run, cow]` (a fork's `cow` differs), else the
+/// recurrent-state row the runtime assigned it.
+fn record_key(lane: &engine::fire::Lane) -> Option<(u64, u64)> {
+    match lane.fixed.first().and_then(|(id, pieces)| Some((*id, pieces.first()?))) {
+        Some((id, &[run, cow])) => Some((ref_key(id, run), ref_key(id, cow))),
+        None => lane.rs_slot.map(|slot| (u64::from(slot), u64::from(slot))),
+    }
 }
