@@ -720,7 +720,15 @@ impl Engine for Metal {
         )?;
         let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
-        self.pending = None;
+        // A frame's rows are held while it is the open one: the steps of one
+        // its caller never settled are let go now.
+        if let Some((_, unsettled)) = self.pending.take()
+            && let Some(shell) = self.shell.as_mut()
+        {
+            for step in unsettled.iter().filter(|step| step.rows.is_none()) {
+                shell.forget(&step.landed);
+            }
+        }
 
         let mut steps = Vec::with_capacity(frame.steps.len());
         let mut pending = Vec::with_capacity(frame.steps.len());
@@ -739,6 +747,13 @@ impl Engine for Metal {
                 }
                 Err(error) => {
                     self.pending = None;
+                    // The steps this frame fired before the one that failed:
+                    // no one asks their rows.
+                    if let Some(shell) = self.shell.as_mut() {
+                        for step in &pending {
+                            shell.forget(&step.landed);
+                        }
+                    }
                     return Err(error);
                 }
             }
