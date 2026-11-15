@@ -112,8 +112,6 @@ pub struct Capabilities {
     pub geometry: GeometryClass,
     pub kv_handle: Option<KvHandle>,
     pub media_encode: bool,
-    #[serde(default)]
-    pub device_channel_commit: bool,
 
     #[serde(default)]
     pub rs_verbs: bool,

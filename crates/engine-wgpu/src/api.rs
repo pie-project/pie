@@ -45,7 +45,6 @@ pub type Wgpu = engine_gpu::api::Gpu<Api>;
 impl Host for Api {
     const KIND: &'static str = "wgpu";
 
-    const DEVICE_CHANNEL_COMMIT: bool = true;
 
     type Programs = crate::program::Plane;
 

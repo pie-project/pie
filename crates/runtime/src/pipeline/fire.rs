@@ -1083,7 +1083,6 @@ fn rows_of_lanes(
                 }
             } else {
                 lane.readout = ::engine::Readout::None;
-                lane.channels.clear();
             }
             Some(lane)
         })
@@ -5168,7 +5167,6 @@ mod static_admission_tests {
                 ));
                 request.single_token_mode = true;
                 reservations[instance as usize - 1].apply_to(&mut request);
-                assert!(request.lanes[0].channels.is_empty(), "no ticket reaches the engine");
                 assert_eq!(
                     request.ring_moves,
                     [crate::engine::fire::RingMove {

@@ -528,7 +528,6 @@ impl Engine for Xla {
             geometry: GeometryClass::DeviceGeometry,
             kv_handle: None,
             media_encode: false,
-            device_channel_commit: true,
             rs_verbs: shell.serves_rs_verbs(),
             rs_snapshots: shell.snapshots(),
             bidirectional_attention: true,

@@ -247,7 +247,6 @@ impl Engine for Spatial {
             geometry: GeometryClass::DeviceGeometry,
             kv_handle: None,
             media_encode: false,
-            device_channel_commit: true,
             rs_verbs: false,
             rs_snapshots: 0,
             bidirectional_attention: false,

@@ -619,7 +619,6 @@ impl Engine for Metal {
             geometry: GeometryClass::DeviceGeometry,
             kv_handle: None,
             media_encode: false,
-            device_channel_commit: false,
             rs_verbs: shell.serves_rs_verbs(),
             rs_snapshots: crate::rs::snapshots(shell.trace()),
             bidirectional_attention: true,

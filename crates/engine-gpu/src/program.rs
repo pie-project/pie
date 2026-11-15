@@ -44,6 +44,18 @@ impl From<String> for Refusal {
     }
 }
 
+/// The ring ends `package`'s stages move, as (its dense channel, whether the
+/// end is the tail), each once.
+#[must_use]
+pub fn moved_ends(package: &LaunchPackage) -> std::collections::BTreeSet<(u32, bool)> {
+    let mut ends = std::collections::BTreeSet::new();
+    for stage in &package.stages {
+        ends.extend(stage.takes.iter().map(|&channel| (channel, false)));
+        ends.extend(stage.puts.iter().map(|put| (put.channel, true)));
+    }
+    ends
+}
+
 /// A backend's program plane.
 pub trait Programs<B: Serve>: Default {
     fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal>;
@@ -97,6 +109,11 @@ pub trait Programs<B: Serve>: Default {
     fn rebind_slots(&mut self, pools: &Pools<B>, rebind: &Rebind) -> Result<(), Refusal>;
 
     fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal>;
+
+    /// The ring ends `instance`'s stages move, as (channel, whether the end
+    /// is the tail), each once; none for an instance the plane holds no
+    /// longer.
+    fn moved_ends(&self, instance: InstanceId) -> Vec<(ChannelId, bool)>;
 
     /// The oldest cell guest input channel `id` of `instance` holds.
     fn input_cell(&self, instance: InstanceId, id: ChannelId) -> Result<InputCell<B>, Refusal>;

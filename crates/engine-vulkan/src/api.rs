@@ -44,7 +44,6 @@ pub type Vulkan = engine_gpu::api::Gpu<Api>;
 impl Host for Api {
     const KIND: &'static str = "vulkan";
 
-    const DEVICE_CHANNEL_COMMIT: bool = false;
 
     type Programs = crate::program::Plane;
 
