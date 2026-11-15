@@ -91,13 +91,21 @@ pub fn fill(rows: u32, n: u32, cores: u32) -> i64 {
     i64::try_from(tiles * 8 / u64::from(cores.max(1))).unwrap_or(i64::MAX)
 }
 
+/// Whether a GPU of Apple `family` is Apple10 or later (M5 on): per-core
+/// neural accelerators behind the Metal 4 tensor ops, and their register
+/// layout.
+#[must_use]
+pub fn apple10(family: u32) -> bool {
+    family >= 10
+}
+
 impl Qmm {
     /// Whether this kernel answers right on a GPU of `family`: the staged
     /// tile fills its operands in Apple10's register layout, which earlier
     /// families with the same tensor ops lay otherwise.
     #[must_use]
     pub fn runs_on(&self, family: u32) -> bool {
-        !matches!(self, Qmm::Staged) || family >= 10
+        !matches!(self, Qmm::Staged) || apple10(family)
     }
 
     fn fits_shape(&self, at: &QmmAt) -> bool {
@@ -335,6 +343,7 @@ pub struct Tuning {
     profile: Profile,
     wide_range: bool,
     cores: Option<u32>,
+    family: u32,
 }
 
 impl Tuning {
@@ -347,7 +356,22 @@ impl Tuning {
             profile,
             wide_range,
             cores,
+            family: 0,
         }
+    }
+
+    /// The GPU's Apple family, where the device says: 0, the default, is a
+    /// device with no tensor-op matmul.
+    #[must_use]
+    pub fn with_family(self, family: u32) -> Tuning {
+        Tuning { family, ..self }
+    }
+
+    /// Whether the GPU multiplies on the tensor ops' neural accelerators
+    /// ([`apple10`]): a fact of the device, not a tuned choice.
+    #[must_use]
+    pub fn tensor_ops(&self) -> bool {
+        apple10(self.family)
     }
 
     #[must_use]

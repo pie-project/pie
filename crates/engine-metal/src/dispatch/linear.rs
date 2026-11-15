@@ -642,6 +642,7 @@ impl Run<'_> {
                 }
                 None => linear::gemm::matmul(
                     self.ctx(),
+                    self.tuning(),
                     self.tensor(*act),
                     self.tensor(*w),
                     self.tensor(*y),
@@ -672,6 +673,7 @@ impl Run<'_> {
                 ),
                 None => linear::gemm::lm_head(
                     self.ctx(),
+                    self.tuning(),
                     self.tensor(*act),
                     self.tensor(*w),
                     self.tensor(*y),

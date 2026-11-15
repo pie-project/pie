@@ -567,7 +567,8 @@ impl Shell {
                 why: "names the staged tile, which answers right only on an Apple10 GPU",
             });
         }
-        let tuning = kernels_metal::Tuning::new(chip.clone(), wide_range, device.cores());
+        let tuning = kernels_metal::Tuning::new(chip.clone(), wide_range, device.cores())
+            .with_family(device.family());
         let boot = Boot {
             trace: poem_compiler::fuse::fuse(
                 boot.trace,

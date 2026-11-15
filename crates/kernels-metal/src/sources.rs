@@ -189,6 +189,10 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/linear/gemm.metal")),
     ),
     (
+        "linear/gemm_mpp.metal",
+        include_str!(concat!(source_root!(), "/linear/gemm_mpp.metal")),
+    ),
+    (
         "linear/glu_packed.metal",
         include_str!(concat!(source_root!(), "/linear/glu_packed.metal")),
     ),
