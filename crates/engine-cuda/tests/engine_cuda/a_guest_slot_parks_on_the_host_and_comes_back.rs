@@ -100,11 +100,66 @@ fn pairs(src: &[u32], dst: &[u32]) -> Vec<(u32, u32)> {
     src.iter().copied().zip(dst.iter().copied()).collect()
 }
 
-/// For each guest shape: known bytes written through the host tier into a
-/// run of device slots lie where a guest's item of that run is addressed;
-/// they park on the host (a suspend), the device slots are overwritten, and
-/// they come back into fresh slots of another chunk (a restore), byte for
-/// byte.
+/// Host refs handed out as the runtime's host tier hands them
+/// (`SharedPool::tier`): one chunk id space from 0, a chunk opened for one
+/// shape, a run its lowest free adjacent slots.
+#[derive(Default)]
+struct HostRefs {
+    next: u32,
+    open: Vec<(engine::chunk::ShapeId, u32, u32)>,
+}
+
+impl HostRefs {
+    fn take_run(&mut self, shape: &engine::chunk::SlotShape) -> Vec<u32> {
+        let at = match self.open.iter().position(|&(id, ..)| id == shape.id) {
+            Some(at) => at,
+            None => {
+                self.open.push((shape.id, self.next, 0));
+                self.next += 1;
+                self.open.len() - 1
+            }
+        };
+        let (_, chunk, used) = self.open[at];
+        assert!(
+            used + RUN <= shape.slots_per_chunk,
+            "a test's runs fit a chunk"
+        );
+        self.open[at].2 += RUN;
+        run(shape.slots_per_chunk, chunk, used)
+    }
+}
+
+/// One guest shape's item through the test.
+struct Item {
+    role: SlotRole,
+    id: engine::chunk::ShapeId,
+    bytes: u64,
+    /// The device slots it is written in, and those it comes back to.
+    device: Vec<u32>,
+    fresh: Vec<u32>,
+    /// The host slots its bytes are written through, and those it parks in.
+    seed: Vec<u32>,
+    parked: Vec<u32>,
+    pattern: Vec<u8>,
+}
+
+fn on_device(shell: &mut Shell, item: &Item, refs: &[u32]) -> Vec<u8> {
+    let at = shell
+        .guest_span(item.role, refs, item.bytes)
+        .expect("the run is a guest item's span");
+    let mut held = vec![0u8; item.pattern.len()];
+    engine_cuda::device::alloc::copy_d2h_on(shell.stream(), at, &mut held)
+        .expect("the device slots read");
+    held
+}
+
+/// An `Instance` item and a `Channel` item, both parked at once in host
+/// refs the runtime's host tier would hand out: known bytes written through
+/// the host tier into a run of device slots lie where a guest's item of
+/// that run is addressed; they park on the host (a suspend), the device
+/// slots are overwritten, and they come back into fresh slots of another
+/// chunk (a restore), byte for byte, neither shape's host slots touched by
+/// the other's.
 #[test]
 fn a_guest_slot_parks_on_the_host_and_comes_back() {
     if !engine_cuda::device::present() {
@@ -115,12 +170,8 @@ fn a_guest_slot_parks_on_the_host_and_comes_back() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let path = Weights::random(&trace, 7717).write(dir.path());
     let mut shell = shell(trace, &path);
-    shell
-        .seat_host_kv(Some(crate::POOL), 1, 256, 1)
-        .expect("the host tier seats");
-    let facts = shell.chunk_facts().expect("the pool states its chunks");
-    assert!(facts.host_chunks >= 6, "three host chunks a guest shape");
     shell.take_refs();
+    let facts = shell.chunk_facts().expect("the pool states its chunks");
     let segments = facts.segments.max.min(4);
     shell
         .commit_segments(segments)
@@ -129,77 +180,155 @@ fn a_guest_slot_parks_on_the_host_and_comes_back() {
         segments * facts.segment_chunks > 4,
         "two committed chunks a guest shape past the null chunk"
     );
-    let stream = shell.stream();
-    for (at, role) in [SlotRole::Instance, SlotRole::Channel]
-        .into_iter()
-        .enumerate()
-    {
-        let at = at as u32;
-        let shape = facts
+    let guest = |role| {
+        facts
             .shapes
             .iter()
             .find(|shape| shape.role == role)
-            .expect("the load states the guest shapes");
-        let (id, per_chunk) = (shape.id, shape.slots_per_chunk);
-        let bytes = u64::from(RUN) * shape.slot_bytes;
-        // A shape's chunks are its own on either tier, as the runtime's
-        // pools hand them out.
-        let device = run(per_chunk, 1 + 2 * at, 5);
-        let fresh = run(per_chunk, 2 + 2 * at, 11);
-        let seed = run(per_chunk, 3 * at, 7);
-        let parked = run(per_chunk, 3 * at + 1, 2);
-        let pattern: Vec<u8> = (0..bytes)
-            .map(|byte| (byte * 31 + 17 + u64::from(at) * 101) as u8 ^ (byte >> 8) as u8)
-            .collect();
-        let other = vec![0xa5u8; pattern.len()];
-        let on_device = |shell: &mut Shell, refs: &[u32]| {
-            let item = shell
-                .guest_span(role, refs, bytes)
-                .expect("the run is a guest item's span");
-            let mut held = vec![0u8; pattern.len()];
-            engine_cuda::device::alloc::copy_d2h_on(stream, item, &mut held)
-                .expect("the device slots read");
-            held
-        };
+            .expect("the load states the guest shapes")
+    };
 
+    // No host tier yet: the runtime parks nothing (its roles have no host
+    // pool), and a copy asked all the same is refused by name.
+    assert_eq!(facts.host_chunks, 0, "no host tier is seated at the load");
+    let instance = guest(SlotRole::Instance);
+    let refused = shell
+        .copy_tier_slots(
+            instance.id,
+            Tier::Device,
+            Tier::Host,
+            &[(instance.slots_per_chunk, 0)],
+        )
+        .expect_err("a copy to a host tier of no chunks");
+    println!("no host tier: {refused}");
+    assert!(
+        refused.to_string().contains("chunks of the host tier"),
+        "{refused}"
+    );
+
+    shell
+        .seat_host_kv(Some(crate::POOL), 1, 256, 1)
+        .expect("the host tier seats");
+    let facts = shell.chunk_facts().expect("the pool states its chunks");
+    assert!(facts.host_chunks >= 2, "a host chunk a guest shape");
+
+    let mut host = HostRefs::default();
+    let mut items: Vec<Item> = [SlotRole::Instance, SlotRole::Channel]
+        .into_iter()
+        .enumerate()
+        .map(|(at, role)| {
+            let at = at as u32;
+            let shape = guest(role);
+            let bytes = u64::from(RUN) * shape.slot_bytes;
+            Item {
+                role,
+                id: shape.id,
+                bytes,
+                // A shape's chunks are its own on the device too.
+                device: run(shape.slots_per_chunk, 1 + 2 * at, 5),
+                fresh: run(shape.slots_per_chunk, 2 + 2 * at, 11),
+                seed: host.take_run(shape),
+                parked: Vec::new(),
+                pattern: (0..bytes)
+                    .map(|byte| (byte * 31 + 17 + u64::from(at) * 101) as u8 ^ (byte >> 8) as u8)
+                    .collect(),
+            }
+        })
+        .collect();
+    for item in &mut items {
+        item.parked = host.take_run(guest(item.role));
+    }
+    // Both shapes' host refs start at their chunk's first slots: the same
+    // ref numbers a shape apart would be the same bytes.
+    println!(
+        "host refs: instance seed {:?} parked {:?}, channel seed {:?} parked {:?}",
+        items[0].seed, items[0].parked, items[1].seed, items[1].parked
+    );
+
+    // Onto the device, then both parked.
+    for item in &items {
         shell
-            .write_tier_slots(&[(id, seed.clone())], &pattern)
+            .write_tier_slots(&[(item.id, item.seed.clone())], &item.pattern)
             .expect("the host slots are written");
         shell
-            .copy_tier_slots(id, Tier::Host, Tier::Device, &pairs(&seed, &device))
+            .copy_tier_slots(
+                item.id,
+                Tier::Host,
+                Tier::Device,
+                &pairs(&item.seed, &item.device),
+            )
             .expect("the slots land on the device");
+    }
+    for item in &items {
         shell
-            .copy_tier_slots(id, Tier::Device, Tier::Host, &pairs(&device, &parked))
+            .copy_tier_slots(
+                item.id,
+                Tier::Device,
+                Tier::Host,
+                &pairs(&item.device, &item.parked),
+            )
             .expect("the slots park");
+    }
+    for item in &items {
         let held = shell
-            .read_tier_slots(&[(id, parked.clone())])
+            .read_tier_slots(&[(item.id, item.parked.clone())])
             .expect("the parked slots read");
-        assert!(held == pattern, "{role:?}: the host tier holds the slots");
         assert!(
-            on_device(&mut shell, &device) == pattern,
-            "{role:?}: the copy wrote where a guest's item lies"
+            held == item.pattern,
+            "{:?}: the host tier holds the slots",
+            item.role
         );
+        assert!(
+            on_device(&mut shell, item, &item.device) == item.pattern,
+            "{:?}: the copy wrote where a guest's item lies",
+            item.role
+        );
+    }
 
+    // The device slots overwritten, then both restored to fresh slots.
+    for item in &items {
+        let other = vec![0xa5u8; item.pattern.len()];
         shell
-            .write_tier_slots(&[(id, seed.clone())], &other)
+            .write_tier_slots(&[(item.id, item.seed.clone())], &other)
             .expect("the host slots are written");
         shell
-            .copy_tier_slots(id, Tier::Host, Tier::Device, &pairs(&seed, &device))
+            .copy_tier_slots(
+                item.id,
+                Tier::Host,
+                Tier::Device,
+                &pairs(&item.seed, &item.device),
+            )
             .expect("the device slots are overwritten");
+    }
+    for item in &items {
         shell
-            .copy_tier_slots(id, Tier::Host, Tier::Device, &pairs(&parked, &fresh))
+            .copy_tier_slots(
+                item.id,
+                Tier::Host,
+                Tier::Device,
+                &pairs(&item.parked, &item.fresh),
+            )
             .expect("the slots come back");
+    }
+    for item in &items {
         // Every move landed: a byte read of host slots waits for them.
-        shell
-            .read_tier_slots(&[(id, parked.clone())])
+        let held = shell
+            .read_tier_slots(&[(item.id, item.parked.clone())])
             .expect("the parked slots read");
         assert!(
-            on_device(&mut shell, &device) == other,
-            "{role:?}: the slots the item left were overwritten"
+            held == item.pattern,
+            "{:?}: its parked slots stand through the other shape's moves",
+            item.role
         );
         assert!(
-            on_device(&mut shell, &fresh) == pattern,
-            "{role:?}: the item came back to its fresh slots"
+            on_device(&mut shell, item, &item.device) == vec![0xa5u8; item.pattern.len()],
+            "{:?}: the slots the item left were overwritten",
+            item.role
+        );
+        assert!(
+            on_device(&mut shell, item, &item.fresh) == item.pattern,
+            "{:?}: the item came back to its fresh slots",
+            item.role
         );
     }
 }
