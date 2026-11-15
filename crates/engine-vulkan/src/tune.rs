@@ -486,6 +486,19 @@ fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rat
             .map_err(|e| e.to_string())?;
     let tuning = crate::tuning::Tuning::new(base.clone(), device.limits());
     let rates = crate::rates::measure(&device, &tuning).map_err(|e| e.to_string())?;
+    // The matmul path the profile selects on this card, which the rates
+    // step measures through.
+    let tier = <crate::device::Api as engine_gpu::serve::Serve>::tier(&device);
+    let path = kernels_slang::linear::gemm::tile_for(
+        kernels_slang::Target::Spirv,
+        engine_gpu::backend::Tactics::gemm(&tuning, tier),
+        engine_gpu::rates::GEMM,
+        engine_gpu::rates::GEMM,
+        engine_gpu::rates::GEMM,
+    );
+    say(&format!(
+        "[rates]: the matmul runs {path:?} (tier {tier:?})"
+    ));
     say(&format!(
         "[rates]: {:.1} TFLOP/s bf16, {:.0} GB/s, launch {} us",
         rates.bf16_flops_per_ns.unwrap_or(0.0) / 1e3,
