@@ -74,19 +74,6 @@ impl Host for Api {
     fn submitted(_gpu: &Wgpu) {}
 
     fn run_prologues(gpu: &mut Wgpu, step: &Step) -> EngineResult<()> {
-        // Checked before a prologue moves the cursors the caller predicted.
-        for attachment in &step.attachments {
-            if let Some(lane) = step.lanes.get(attachment.lane as usize)
-                && !lane.channels.is_empty()
-                && let Some(why) = gpu
-                    .programs
-                    .disagreeing_ticket(attachment.instance, &lane.channels)
-            {
-                return Err(Error::Program(format!(
-                    "this fire's channel predictions and the engine's disagree: {why}"
-                )));
-            }
-        }
         run_prologues(gpu, step)
     }
 

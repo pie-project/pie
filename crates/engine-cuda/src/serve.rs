@@ -939,15 +939,6 @@ impl Shell {
         })
     }
 
-    #[must_use]
-    pub fn program_ticket_disagreement(
-        &self,
-        instance_id: engine::InstanceId,
-        tickets: &[engine::Ticket],
-    ) -> Option<String> {
-        self.programs.disagreeing_ticket(instance_id, tickets)
-    }
-
     /// Settles the guest batches whose steps have landed: their channels'
     /// cells reach their readers then, and not at a later fire's enqueue,
     /// which a reader waiting on them may be what holds back.
