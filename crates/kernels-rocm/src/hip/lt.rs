@@ -295,6 +295,7 @@ pub unsafe fn matmul(
         Some(plan) => plan,
         None => {
             let plan = Plan::build(lt, handle, s)?;
+            crate::tally::built();
             dev.plans.entry(s).or_insert(plan)
         }
     };

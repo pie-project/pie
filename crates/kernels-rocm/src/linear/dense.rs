@@ -352,6 +352,7 @@ fn took(route: &'static str, fired: Result<(), Error>) -> bool {
     let Err(why) = fired else {
         return true;
     };
+    crate::tally::declined();
     static DECLINED: Mutex<Option<HashMap<&'static str, u64>>> = Mutex::new(None);
     let mut declined = DECLINED.lock().expect("declined lock poisoned");
     let count = declined
