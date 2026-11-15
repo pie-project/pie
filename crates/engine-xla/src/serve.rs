@@ -2150,8 +2150,16 @@ impl Shell {
         let mask = inputs.raw(handles, Dtype::U8, rows, columns, mask_bytes);
         let mask_enabled = inputs.raw(handles, Dtype::U8, rows, 1, enabled_bytes);
 
-        let (readout_rows, readout_layout, readout_indptr) =
+        let (mut readout_rows, readout_layout, readout_indptr) =
             readout_table(&composition, lanes, real)?;
+        // The fire's readout count at a rung, so the program is keyed by the
+        // rung and not by how many rows its lanes read (prompt logprobs, a
+        // draft block): the rows past the count repeat the last, read by no
+        // lane.
+        let want = poem_exec::fire::rung_of(&self.budgets.tokens.buckets, readout_rows.len() as u32);
+        if let Some(&last) = readout_rows.last() {
+            readout_rows.resize((want as usize).max(readout_rows.len()), last);
+        }
         self.readouts.insert(readout_rows.len() as u32);
         let tokens_t = inputs.i32s(handles, &tokens, 1);
         // Tokens a guest pass put on the device: the pool row and lane the
