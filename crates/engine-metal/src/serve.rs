@@ -836,12 +836,11 @@ impl PreparedLoad<'_> {
                     tracing::info!(
                         head_dim,
                         page_size,
-                        mpp_page_size = kernels_metal::attn::arbiter::MPP_PAGE_SIZE,
                         runs = ?form,
                         "the profile asks sdpa.prefill = mpp; this load's kv pages are \
-                         {page_size} tokens and mpp serves {} (heads 64, 128 and 256): \
-                         {head_dim}-wide prompt attention runs {form:?}",
-                        kernels_metal::attn::arbiter::MPP_PAGE_SIZE
+                         {page_size} tokens and mpp serves pages of {:?} tokens and heads \
+                         of 64, 128 and 256: {head_dim}-wide prompt attention runs {form:?}",
+                        kernels_metal::attn::arbiter::MPP_PAGE_SIZES
                     );
                 }
             }
