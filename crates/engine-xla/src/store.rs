@@ -188,8 +188,8 @@ pub struct Pools {
 }
 
 /// One readout output's planes: `[rows, width]` of `dtype` each, as many
-/// as fires a frame holds (`Runahead::STEPS_MAX`), so a fire never comes
-/// round to a plane a reader still holds.
+/// as fires can be outstanding (`Runahead::staging_depth`), so a fire never
+/// comes round to a plane a reader still holds.
 #[derive(Debug)]
 pub struct ReadoutRing {
     pub root: Tensor,
@@ -1376,6 +1376,12 @@ impl Pools {
         &self.readouts
     }
 
+    /// The planes each readout ring holds.
+    #[must_use]
+    pub fn readout_depth(&self) -> usize {
+        self.readouts.first().map_or(0, |ring| ring.slots.len())
+    }
+
     /// The bytes every readout ring takes on the device.
     #[must_use]
     pub fn readout_bytes(&self) -> u64 {
@@ -1387,8 +1393,8 @@ impl Pools {
 
     /// The next plane of readout ring `index`, for a fire to write into and
     /// return. Refused when a reader still holds it: a fire's readouts are
-    /// read before the ring comes round (a frame's at most, `STEPS_MAX`
-    /// fires), never past it.
+    /// read before the ring comes round (the fires that can be outstanding,
+    /// `Runahead::staging_depth`), never past it.
     pub fn readout_take(&mut self, device: &Device, index: u16) -> Result<Buffer> {
         let _ = device;
         let ring = self

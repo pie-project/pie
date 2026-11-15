@@ -697,12 +697,16 @@ impl Shell {
         let readout_exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled)
             .map_err(|why| Fault::Unbound { what: why })?;
         let readout_specs = fixed_readouts(&readout_exports, readout_cap);
-        // A served frame's readouts are held only while it is the pending
-        // frame (`Xla::submit_frame` drops the last frame's before it fires
-        // the next), and a frame is at most `STEPS_MAX` fires: a ring that
-        // deep never comes round to a plane still held. The device orders a
-        // plane's reuse after its last reader by the donation itself.
-        let readout_depth = usize::from(engine::runahead::Runahead::STEPS_MAX);
+        // As many fires as can be outstanding: the frames in flight of at
+        // most `STEPS_MAX` fires each, and the one being written
+        // (`Runahead::staging_depth`, the staging ring's own count). A ring
+        // that deep never comes round to a plane a fire still outstanding
+        // holds; the device orders a plane's reuse after its last reader by
+        // the donation itself. (Four deep, a fire four back was still read
+        // when two frames were in flight across a compile stall.)
+        let frames_in_flight = u8::try_from(boot.device.staging_slots.saturating_sub(1).max(1))
+            .unwrap_or(u8::MAX);
+        let readout_depth = engine::runahead::Runahead::of(frames_in_flight).staging_depth();
         let readout_bytes: u64 = readout_specs
             .iter()
             .map(|spec| readout_depth as u64 * u64::from(spec.rows) * u64::from(spec.width) * 4)
