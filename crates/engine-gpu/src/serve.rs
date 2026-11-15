@@ -2767,7 +2767,8 @@ impl<B: Serve> Shell<B> {
                 held,
             )
             .map_err(|error| program("serve::rs", format!("lane {}: {error}", row.source)))?;
-            if device_fire && let Some(report) = fold.report(device.reports) {
+            let report = crate::store::frozen::lane_report(&verb, &fold, device, device_fire);
+            if let Some(report) = report {
                 wrote.push(report);
             }
             if let Some(pieces) = record_refs {

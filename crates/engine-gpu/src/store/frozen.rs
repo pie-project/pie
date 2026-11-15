@@ -117,6 +117,40 @@ pub fn counted_on_device(verb: &RsVerb) -> bool {
     )
 }
 
+/// Whether a lane takes the count its program's `fold` port holds at the
+/// fire: a lane whose recurrent buffer leaves its fold length to the
+/// device, and a lane with no recurrent buffer (a set that keeps only kv)
+/// that asks a report, for its set's fold is then the count the runtime
+/// waits on.
+#[must_use]
+pub fn reads_count(verb: &RsVerb, reports: u64) -> bool {
+    counted_on_device(verb) || (!matches!(verb, RsVerb::Buffer { .. }) && reports != 0)
+}
+
+/// What a lane reports of its fold on a fire. A lane with a recurrent
+/// buffer reports the slots its fold froze where the fire's fold length is
+/// the device's ([`LaneFold::report`]); a lane with none reports the count
+/// its program put, as it read it: the runtime clamps it to the fire's end.
+#[must_use]
+pub fn lane_report(
+    verb: &RsVerb,
+    fold: &LaneFold,
+    device: DeviceFold,
+    device_fire: bool,
+) -> Option<engine::KvWrites> {
+    match verb {
+        RsVerb::Buffer { .. } => fold.report(device.reports).filter(|_| device_fire),
+        _ => (device.reports != 0)
+            .then_some(device.count)
+            .flatten()
+            .map(|count| engine::KvWrites {
+                tag: device.reports,
+                fold: Some(count),
+                ..engine::KvWrites::default()
+            }),
+    }
+}
+
 /// The slot each record's last fold left it at, by the slot each of its
 /// pieces stands in. A record with no entry stands where its verb states.
 #[derive(Debug, Default)]
@@ -184,7 +218,9 @@ pub fn merged(left: Vec<(Vec<u32>, Option<u32>)>) -> Vec<(Vec<u32>, Option<u32>)
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceFold, Frozen, LaneFold, Tier, counted_on_device, merged};
+    use super::{
+        DeviceFold, Frozen, LaneFold, Tier, counted_on_device, lane_report, merged, reads_count,
+    };
     use engine::fire::{FoldLen, RsVerb};
 
     fn buffer(folded: u32, fold: FoldLen) -> RsVerb {
@@ -368,5 +404,54 @@ mod tests {
             (vec![1, 2], Some(4)),
         ]);
         assert_eq!(left, vec![(vec![1, 2], Some(5)), (vec![3], None)]);
+    }
+
+    /// A set that keeps only kv folds by the count its program put on a
+    /// fire whose fold length is the device's: the lane has no recurrent
+    /// buffer, so no plan states what it froze, and the count is what the
+    /// runtime waits on. The lane takes the count and reports it, as read,
+    /// under its tag; one that asks no report takes none.
+    #[test]
+    fn a_lane_with_no_recurrent_buffer_reports_its_device_count() {
+        let kv = RsVerb::Fold;
+        assert!(reads_count(&kv, 41));
+        assert!(!reads_count(&kv, 0));
+        let lane = LaneFold::of(&kv, 1, 6, None, Some(1), None).unwrap();
+        assert_eq!(lane.plan.froze, 0);
+        let device = DeviceFold {
+            count: Some(1),
+            reports: 41,
+        };
+        // No lane of the fire has a recurrent buffer: it is still the
+        // device's count the runtime waits on.
+        let report = lane_report(&kv, &lane, device, false).expect("the lane asks a report");
+        assert_eq!((report.tag, report.fold), (41, Some(1)));
+        assert!(report.tokens.is_empty() && report.pages.is_empty());
+        let device = DeviceFold {
+            count: Some(0),
+            reports: 41,
+        };
+        assert_eq!(
+            lane_report(&kv, &lane, device, false).unwrap().fold,
+            Some(0)
+        );
+        assert!(lane_report(&kv, &lane, DeviceFold::default(), false).is_none());
+
+        // A lane with a recurrent buffer reads as it did, and reports what
+        // its fold froze, on a fire whose fold length is the device's only.
+        assert!(reads_count(&buffer(4, FoldLen::Device), 0));
+        assert!(!reads_count(&buffer(4, FoldLen::Host(1)), 41));
+        let lane = LaneFold::of(&buffer(4, FoldLen::Device), 3, 6, None, Some(3), None).unwrap();
+        let device = DeviceFold {
+            count: Some(3),
+            reports: 41,
+        };
+        assert_eq!(
+            lane_report(&buffer(4, FoldLen::Device), &lane, device, true)
+                .unwrap()
+                .fold,
+            Some(3)
+        );
+        assert!(lane_report(&buffer(4, FoldLen::Device), &lane, device, false).is_none());
     }
 }

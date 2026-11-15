@@ -988,7 +988,9 @@ impl<B: Host> Gpu<B> {
         // A lane whose fold length is the device's takes the count its
         // program's `fold` port holds at the fire; the lane stays stated as
         // it came, so its record keeps its own frozen position and the
-        // lane reports what the fold froze (`store::frozen`).
+        // lane reports what the fold froze (`store::frozen`). A lane with
+        // no recurrent buffer that asks a report takes it too, and reports
+        // it as read.
         let mut folds: Vec<crate::store::frozen::DeviceFold> = submission
             .lanes
             .iter()
@@ -999,7 +1001,8 @@ impl<B: Host> Gpu<B> {
             .collect();
         for attachment in &submission.attachments {
             let lane = attachment.lane as usize;
-            if crate::store::frozen::counted_on_device(&submission.lanes[lane].rs) {
+            let stated = &submission.lanes[lane];
+            if crate::store::frozen::reads_count(&stated.rs, stated.reports) {
                 folds[lane].count = self
                     .programs
                     .envelope_fold(attachment.instance)
