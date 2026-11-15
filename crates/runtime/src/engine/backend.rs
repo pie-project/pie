@@ -24,9 +24,10 @@ pub struct SchedulerLimits {
     /// `max_forward_tokens`.
     pub max_readouts: usize,
     /// The rows the engine's fixed readout store holds
-    /// ([`::engine::ReadoutFacts::store_rows`]; 0: no store). A request
-    /// that alone reads out more is refused at admission, by name: no cut
-    /// of fires seats it (`scheduler::batch::AdmissionLimits`).
+    /// ([`::engine::ReadoutFacts::store_rows`]; 0: no store). A request whose
+    /// sequence lanes alone read out more is refused at admission, by name
+    /// (`scheduler::batch::AdmissionLimits`); a float lane's rows are not
+    /// held to the store (`FireRequest::sequence_readouts`).
     pub readout_store: usize,
 }
 

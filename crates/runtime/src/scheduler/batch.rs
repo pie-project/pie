@@ -28,8 +28,11 @@ pub(crate) struct RequestCapacityUsage {
     /// rows ([`::engine::fire::rung_rows`]).
     pub(crate) carried_rows: usize,
     pub(crate) page_refs: usize,
-    /// The rows the request reads out: a step reads out no more than the
-    /// engine's `max_readouts` of them, a fire bound.
+    /// The rows the request's sequence lanes read out
+    /// ([`crate::engine::FireRequest::sequence_readouts`]): a step reads out
+    /// no more than the engine's `max_readouts` of them, a fire bound. A
+    /// float lane's rows land through the engine's readout landing and are
+    /// not counted.
     pub(crate) readouts: usize,
 }
 
@@ -42,7 +45,7 @@ pub(crate) fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> Re
         forward_tokens: req.request.tokens(),
         carried_rows: req.request.carried as usize,
         page_refs: req.request.pages().count(),
-        readouts: req.request.readouts(),
+        readouts: req.request.sequence_readouts(),
     }
 }
 
@@ -70,9 +73,12 @@ impl AdmissionLimits {
                 usage.forward_tokens, self.limits.max_forward_tokens
             ));
         }
-        // A float lane (an encoder's, an embedding's) reads out every row
-        // it embeds (`pipeline::fire::float`), past what its bind's extents
-        // state: refused here where no fire, however narrow, holds them.
+        // Sequence lanes reading out more than the readout store holds: no
+        // fire, however narrow, seats them. Their bind refuses them first
+        // (`SharedPool::readouts_refused`); this names a request that came
+        // past it. A float lane's rows (an encoder's, an embedding's every
+        // row) are not counted: they land through the engine's readout
+        // landing whatever the store holds.
         if self.limits.readout_store > 0 && usage.readouts > self.limits.readout_store {
             return Some(format!(
                 "forward request of instance {} reads out {} rows, more than the {} rows \
@@ -591,55 +597,80 @@ mod tests {
         assert_eq!(open.max_readouts, 0);
     }
 
-    /// A float pass (an embedding's) reads out every row it embeds, which
-    /// its bind's extents do not state: one that alone reads out more than
-    /// the engine's readout store holds is refused at admission, naming its
-    /// instance; one the store holds, or any on an engine with no store,
-    /// is admitted.
-    #[test]
-    fn a_float_pass_past_the_readout_store_is_refused_at_admission_by_name() {
-        let embedding = |instance: u64, rows: u32| {
-            let lane = ::engine::Lane {
-                tokens: vec![0; rows as usize],
-                readout: ::engine::Readout::Rows((0..rows).collect()),
-                kv_less: true,
-                ..::engine::Lane::default()
-            };
-            pending(FireRequest::one(lane), InstanceId(instance))
+    /// A float lane (an embedding's, a cacheless encoder's) of `rows`
+    /// rows, every one read out.
+    fn embedding(instance: u64, rows: u32) -> Box<PendingRequest> {
+        let lane = ::engine::Lane {
+            tokens: vec![0; rows as usize],
+            readout: ::engine::Readout::Rows((0..rows).collect()),
+            kv_less: true,
+            ..::engine::Lane::default()
         };
+        pending(FireRequest::one(lane), InstanceId(instance))
+    }
+
+    /// A float pass reads out every row it embeds through the engine's
+    /// readout landing, not its fixed store: a 512-row embedding against a
+    /// 128-row store is admitted and fires whole, one lane in one fire (a
+    /// cacheless encoder attends over all its rows). A sequence request
+    /// reading out more than the store holds is still refused, by name.
+    #[test]
+    fn a_float_pass_past_the_readout_store_fires_whole() {
         let store = ::engine::ReadoutFacts {
             store_rows: Some(128),
             ..::engine::ReadoutFacts::default()
         };
-        let admission = AdmissionLimits::new(reading(&store), 16);
+        let limits = reading(&store);
+        let admission = AdmissionLimits::new(limits, 16);
+        assert_eq!(
+            admission.single_request_limit_error(&embedding(42, 512)),
+            None,
+            "a float pass is not held to the store"
+        );
+        let (readouts, lanes) = read_out(vec![embedding(42, 512)], limits);
+        assert_eq!(readouts, vec![512], "one fire, every row read out");
+        assert_eq!(lanes, 1);
+
+        let mut lane = crate::engine::fire::lane_of(0, (0..200).collect(), 0, vec![1]);
+        lane.readout = ::engine::Readout::Rows((0..200).collect());
         let refused = admission
-            .single_request_limit_error(&embedding(42, 512))
-            .expect("512 rows past a store of 128 are refused");
+            .single_request_limit_error(&pending(FireRequest::one(lane), InstanceId(43)))
+            .expect("200 sequence readouts past a store of 128 are refused");
         assert!(
-            refused.contains("instance 42")
-                && refused.contains("512 rows")
+            refused.contains("instance 43")
+                && refused.contains("200 rows")
                 && refused.contains("128 rows the engine's readout store holds"),
             "refused by name: {refused}"
         );
-        assert_eq!(
-            admission.single_request_limit_error(&embedding(43, 128)),
-            None,
-            "the store's own rows are admitted"
-        );
-        for readouts in [
-            ::engine::ReadoutFacts::default(),
-            ::engine::ReadoutFacts {
-                landing: ::engine::ReadoutLanding::Beside { row_bytes: 4096 },
-                store_rows: None,
-            },
-        ] {
-            let open = AdmissionLimits::new(reading(&readouts), 16);
-            assert_eq!(
-                open.single_request_limit_error(&embedding(44, 512)),
-                None,
-                "{readouts:?}: no store, nothing refused"
-            );
+    }
+
+    /// Two unframed float requests whose rows together pass the readout
+    /// bound share a step, as before the step counted readouts: their rows
+    /// are no sequence readouts, whether the bound is the engine's ceiling
+    /// or a fixed store's.
+    #[test]
+    fn two_unframed_float_requests_share_a_step_again() {
+        let ceiling = SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 4096,
+            max_page_refs: 4096,
+            max_readouts: 8 * 16,
+            ..limits()
+        };
+        let store = reading(&::engine::ReadoutFacts {
+            store_rows: Some(128),
+            ..::engine::ReadoutFacts::default()
+        });
+        for limits in [ceiling, store] {
+            assert_eq!(limits.max_readouts, 128);
+            let (readouts, lanes) = read_out(vec![embedding(1, 100), embedding(2, 100)], limits);
+            assert_eq!(readouts, vec![200], "one step of both: {readouts:?}");
+            assert_eq!(lanes, 2);
         }
+        // Sequence lanes past the same bound are cut, as they were.
+        let (readouts, _) = read_out((0..10).map(verifying).collect(), ceiling);
+        assert!(readouts.iter().all(|&rows| rows <= 128), "{readouts:?}");
+        assert!(readouts.len() > 1);
     }
 
     /// The fires of `dispatch`'s frames, each fire id standing for the

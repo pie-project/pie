@@ -1976,6 +1976,7 @@ fn a_lane_past_the_readout_store_is_refused_at_bind_by_name() {
             ..::engine::ReadoutFacts::default()
         },
         0,
+        false,
     );
     for rows in [16, 128, 129, 4096] {
         pool.fire_facts_learned(reading(PROGRAM, rows), &FireFacts::default());
@@ -1996,6 +1997,10 @@ fn a_lane_past_the_readout_store_is_refused_at_bind_by_name() {
         .expect("sixteen rows a lane the store holds");
     let _whole = ProgramOpen::new(&shared, reading(PROGRAM, 128), 0)
         .expect("a lane of the store's own rows");
+    // A float pass's bind: its rows land through the readout landing, not
+    // the store, so its extents refuse nothing.
+    let _float = ProgramOpen::float(&shared, reading(PROGRAM, 4096), 0)
+        .expect("a float pass's bind is not held to the store");
 }
 
 /// Readout rows that land beside the activation are counted at every rung
@@ -2022,7 +2027,7 @@ fn readout_rows_beside_the_activation_are_counted_at_every_rung() {
             store_rows: Some(128),
         },
     ] {
-        pool.set_readouts(&unchanged, 2048);
+        pool.set_readouts(&unchanged, 2048, false);
         assert_eq!(chunks(&pool), before, "{unchanged:?}");
         assert_eq!(pool.widest_fit(), widest, "{unchanged:?}");
     }
@@ -2034,6 +2039,18 @@ fn readout_rows_beside_the_activation_are_counted_at_every_rung() {
             store_rows: Some(128),
         },
         2048,
+        false,
     );
     assert_eq!(chunks(&pool), [2, 2, 12, 12, 20, 20]);
+    // With float lanes a fire may read out every token through the
+    // landing, past the store: the term counts the rung's tokens.
+    pool.set_readouts(
+        &::engine::ReadoutFacts {
+            landing: ::engine::ReadoutLanding::Beside { row_bytes: MIB },
+            store_rows: Some(128),
+        },
+        2048,
+        true,
+    );
+    assert_eq!(chunks(&pool), [2, 2, 20, 20, 140, 140]);
 }

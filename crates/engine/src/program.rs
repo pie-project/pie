@@ -225,18 +225,24 @@ pub enum ReadoutLanding {
 /// programs a fire carries: every fire reads out (a plain decode its last
 /// row), so they are no (program, extents) pair's [`FireFacts`].
 ///
-/// The rows one fire reads out are at most its tokens, at most the
-/// engine's `FireLimits::max_readouts` where it states one, and at most
+/// The rows one fire's sequence lanes read out (sampled rows: a decode's
+/// last, a verify's block) are at most its tokens, at most the engine's
+/// `FireLimits::max_readouts` where it states one, and at most
 /// [`Self::store_rows`] where a fixed store holds them
-/// ([`Self::fire_rows`]). The runtime cuts fires to that many rows and
-/// counts, for a fire of a rung, that many rows of the term
-/// ([`Self::row_bytes`]).
+/// ([`Self::fire_rows`]): the runtime cuts fires to that many. A float
+/// lane's rows (a kv-less lane: an encoder's, an embedding's, every row it
+/// embeds) are no sequence readouts: they land through [`Self::landing`]
+/// whatever the store holds, at most the fire's tokens, and are never cut
+/// or refused against the store (a cacheless encoder attends over all its
+/// rows in one fire). The term counts, for a fire of a rung, the rows it
+/// may read out of either kind ([`Self::row_bytes`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadoutFacts {
     #[serde(default)]
     pub landing: ReadoutLanding,
-    /// The rows a fixed readout store holds (XLA: its ring): no fire reads
-    /// out more, and a lane that alone reads more is refused at its bind.
+    /// The rows a fixed readout store holds (XLA: its ring): no fire's
+    /// sequence lanes read out more, and a sequence lane that alone reads
+    /// more is refused at its bind. Float lanes' rows are not held here.
     /// `None`: no store of the engine's bounds them.
     #[serde(default)]
     pub store_rows: Option<u32>,

@@ -231,11 +231,24 @@ impl SharedPool {
     /// (`FireLimits::max_readouts`, 0: none): every rung counts the rows a
     /// fire of it reads out beside the guest term where they land beside
     /// the activation, so fires are cut to the widest rung that holds
-    /// them; and a fixed store's rows bound every fire's and refuse a lane
-    /// that alone reads more ([`Self::readouts_refused`]).
-    pub fn set_readouts(&mut self, facts: &::engine::ReadoutFacts, ceiling: u32) {
-        self.pool
-            .set_readouts(facts.row_bytes(), facts.fire_rows(ceiling));
+    /// them; and a fixed store's rows bound every fire's sequence readouts
+    /// and refuse a sequence lane that alone reads more
+    /// ([`Self::readouts_refused`]). With `float_lanes` (the model has a
+    /// class that reads no kv: an encoder's, an embedding's), a fire may
+    /// read out every token it holds through the landing, past the store
+    /// and the ceiling, so the term counts up to the rung's tokens.
+    pub fn set_readouts(
+        &mut self,
+        facts: &::engine::ReadoutFacts,
+        ceiling: u32,
+        float_lanes: bool,
+    ) {
+        let rows = if float_lanes {
+            0
+        } else {
+            facts.fire_rows(ceiling)
+        };
+        self.pool.set_readouts(facts.row_bytes(), rows);
         self.programs.readout_store = facts.store_rows;
     }
 
@@ -251,9 +264,13 @@ impl SharedPool {
     /// elements, which are `sampled_rows` (`pipeline::program::price`). A
     /// float pass (an encoder's, an embedding's) reads out every row it
     /// embeds (`pipeline::fire::float`), which its extents do not state
-    /// (`sampled_rows` is then its lanes, or its outputs' rows): that
-    /// request is refused at admission instead, by name, against the same
-    /// store (`SchedulerLimits::readout_store`, `AdmissionLimits`).
+    /// (`sampled_rows` is then its lanes, or its outputs' rows); those rows
+    /// are no sequence readouts and land through the engine's readout
+    /// landing whatever the store holds, so its bind is not asked
+    /// ([`ProgramOpen::float`]) and its fires are neither cut nor refused
+    /// against the store (`FireRequest::sequence_readouts`). A sequence
+    /// request that came past its bind is named at admission
+    /// (`AdmissionLimits`).
     #[must_use]
     pub fn readouts_refused(&self, key: &FireKey) -> Option<String> {
         let rows = self.programs.readout_store?.max(1);
@@ -567,6 +584,18 @@ impl ProgramOpen {
         if let Some(why) = shared.lock().unwrap().readouts_refused(&key) {
             return Err(why);
         }
+        Self::open(shared, key, standing)
+    }
+
+    /// [`Self::new`] for a float pass's bind (a kv-less encoder's or
+    /// embedding's): its lanes read out every row they embed through the
+    /// engine's readout landing, not its fixed store, so the store refuses
+    /// nothing of it; the term and the standing bytes are held as for any.
+    pub fn float(shared: &Shared, key: FireKey, standing: u64) -> Result<Self, String> {
+        Self::open(shared, key, standing)
+    }
+
+    fn open(shared: &Shared, key: FireKey, standing: u64) -> Result<Self, String> {
         loop {
             let (pairs, most, generation, mut term) = {
                 let pool = shared.lock().unwrap();

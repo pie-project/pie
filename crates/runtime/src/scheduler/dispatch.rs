@@ -52,6 +52,7 @@ pub(crate) async fn register_channels_bind_classified(
     geometry_class: GeometryClass,
     extents: BindExtents,
     device_resolved: eta_ir::registry::PortMask,
+    float: bool,
 ) -> Result<(
     Vec<Arc<ChannelEndpoint>>,
     BoundInstance,
@@ -67,7 +68,7 @@ pub(crate) async fn register_channels_bind_classified(
             return Err(error);
         }
     };
-    let bind = InstanceBindingPlan::new(
+    let mut bind = InstanceBindingPlan::new(
         engine_idx,
         pacing_wait_id,
         ::engine::ProgramId(0),
@@ -77,6 +78,7 @@ pub(crate) async fn register_channels_bind_classified(
         extents,
         device_resolved,
     );
+    bind.float = float;
     match handle
         .register_channels_bind(pipeline_id, plans, program, bind)
         .await

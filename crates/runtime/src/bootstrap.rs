@@ -369,6 +369,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             "the engines of one model read different guest inputs; they run different traces"
         );
     }
+    // A class that reads no kv is a float lane's (an encoder's, an
+    // embedding's): it reads out every row through the readout landing.
+    let float_lanes = engine_configs
+        .first()
+        .is_some_and(|engine| engine.classes.classes.iter().any(|class| !class.reads_kv));
     let classes = engine_configs
         .first()
         .map(|engine| engine.classes.clone())
@@ -447,6 +452,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 pool.set_readouts(
                     readouts,
                     u32::try_from(d.limits.max_readouts).unwrap_or(u32::MAX),
+                    float_lanes,
                 );
                 Some(std::sync::Arc::new(std::sync::Mutex::new(pool)))
             } else {

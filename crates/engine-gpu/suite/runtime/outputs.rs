@@ -51,7 +51,7 @@ impl ForwardHybrid for Outputs {
 
 /// The miniature's table read alone: a lane of it feeds no guest input, so
 /// it fires without an attachment and the host reads its rows.
-struct Rows;
+pub(super) struct Rows;
 
 impl ForwardHybrid for Rows {
     fn states(&self) -> StateRows {
@@ -182,16 +182,16 @@ const T: f32 = 0.375;
 const ROWS: u32 = 3;
 
 /// A model loaded one frame in flight over the miniature's table.
-struct Loaded {
-    engine: backend::Engine,
-    caps: engine::load::Loaded,
-    trace: Trace,
-    planes: BTreeMap<String, (Vec<u64>, Vec<f32>)>,
-    dir: std::path::PathBuf,
+pub(super) struct Loaded {
+    pub(super) engine: backend::Engine,
+    pub(super) caps: engine::load::Loaded,
+    pub(super) trace: Trace,
+    pub(super) planes: BTreeMap<String, (Vec<u64>, Vec<f32>)>,
+    pub(super) dir: std::path::PathBuf,
 }
 
 /// `None` without a device. `tag` names the scratch directory.
-fn loaded(tag: &str, model: &impl ForwardHybrid) -> Option<Loaded> {
+pub(super) fn loaded(tag: &str, model: &impl ForwardHybrid) -> Option<Loaded> {
     let boot = backend::DeviceBoot::default();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
