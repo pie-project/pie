@@ -22,7 +22,13 @@ pub struct Outcome {
 }
 
 /// Serve `artifact` under `chip`: a prompt, then steps at each lane count.
-fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, String> {
+/// The products it times land in the user's tactic table under `profiles`.
+fn serve(
+    artifact: &Path,
+    deployment: &str,
+    chip: Profile,
+    profiles: Option<&Path>,
+) -> Result<Serving, String> {
     use poem::{Platform, Request};
     let slots = *LANES.iter().max().expect("lanes") as u32;
     let row = poem_compiler::catalog::deployment(deployment)
@@ -54,6 +60,7 @@ fn serve(artifact: &Path, deployment: &str, chip: Profile) -> Result<Serving, St
         ordinal: 0,
         knobs: crate::Knobs {
             chip: Some(chip.clone()),
+            profiles: profiles.map(Path::to_path_buf),
             ..crate::Knobs::default()
         },
         cache_dir: None,
@@ -184,12 +191,24 @@ fn patches(trace: &poem_ir::Trace, slots: u32) -> Option<poem_compiler::PatchLad
     )
 }
 
+/// Stops timing tactics when the tune ends, however it ends.
+#[cfg(feature = "cuda")]
+struct Untime;
+
+#[cfg(feature = "cuda")]
+impl Drop for Untime {
+    fn drop(&mut self) {
+        kernels_cuda::linear::gemm::time_tactics(false);
+    }
+}
+
 struct Cuda<'a> {
     models: &'a [(PathBuf, String)],
     device: &'a str,
     base: &'a Profile,
     facts: &'a Facts,
     sms: u32,
+    profiles: Option<&'a Path>,
 }
 
 impl Cuda<'_> {
@@ -219,7 +238,7 @@ impl Bench for Cuda<'_> {
 
     fn serve(&mut self, model: usize, file: &str) -> Result<Serving, String> {
         let (artifact, deployment) = &self.models[model];
-        serve(artifact, deployment, Self::profile_of(file)?)
+        serve(artifact, deployment, Self::profile_of(file)?, self.profiles)
     }
 
     fn plan(&self, model: usize, file: &str) -> Option<u64> {
@@ -240,6 +259,12 @@ pub fn run(
 ) -> Result<Outcome, String> {
     let began = Instant::now();
     let (name, facts) = crate::chip::probe(0).ok_or("no CUDA device answers")?;
+    // The one place dense GEMM tactics are timed: each serving below adds
+    // the products it meets to the user's table beside their profile.
+    #[cfg(feature = "cuda")]
+    kernels_cuda::linear::gemm::time_tactics(true);
+    #[cfg(feature = "cuda")]
+    let _untime = Untime;
     let sms = facts
         .get("sms")
         .and_then(|v| u32::try_from(v).ok())
@@ -253,6 +278,7 @@ pub fn run(
         base: &base,
         facts: &facts,
         sms,
+        profiles,
     };
     let mut lines = Vec::new();
     let mut chosen = Vec::new();

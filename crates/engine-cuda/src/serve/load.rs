@@ -61,6 +61,29 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         }
     };
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
+    #[cfg(feature = "cuda")]
+    {
+        let user = boot
+            .knobs
+            .profiles
+            .as_deref()
+            .map(|profiles| crate::chip::user_gemm_table(profiles, device.name()));
+        let tactics = kernels_cuda::linear::gemm::install_tactics(
+            crate::chip::gemm_table(device.name()),
+            user,
+        );
+        if let Some((table, here)) = &tactics.stale {
+            eprintln!(
+                "engine-cuda: a dense GEMM tactic table is not read: it was timed under \
+                 `{table}`, and this is `{here}`; `pie tune` on this machine times it again"
+            );
+        }
+        eprintln!(
+            "engine-cuda: dense GEMM tactics from the profile's tables: {} checked in, {} the \
+             user's; a product they lack runs cuBLAS's own pick, and nothing is timed",
+            tactics.from_profile, tactics.from_user,
+        );
+    }
     let engine = crate::chip::Engine::of(&chip);
     if boot.budget.max_tokens == 0 {
         let params: u64 = boot
@@ -1466,10 +1489,8 @@ impl Shell {
             let copies = format!("|{:?}", kernels_cuda::hip::sys::copy_queues());
             #[cfg(not(feature = "rocm"))]
             let copies = String::new();
-            let record = super::measured::path(
-                dir,
-                &format!("{bodies_shape}|{:?}{copies}", shell.budget),
-            );
+            let record =
+                super::measured::path(dir, &format!("{bodies_shape}|{:?}{copies}", shell.budget));
             if let Some(measured) = super::measured::read(&record) {
                 recorded = true;
                 let held = usize::try_from(measured.hold()).unwrap_or(usize::MAX);
@@ -1492,9 +1513,8 @@ impl Shell {
         // A flat range cannot grow after its bodies name it, so a load that
         // has no record of what they take measures it: no estimate stands
         // in for the figure.
-        shell.measuring = shell.records_bodies()
-            && !crate::device::elastic::mapped_on_demand()
-            && !recorded;
+        shell.measuring =
+            shell.records_bodies() && !crate::device::elastic::mapped_on_demand() && !recorded;
         let bodies = if shell.measuring {
             crate::store::MEASURING
         } else if shell.records_bodies() {

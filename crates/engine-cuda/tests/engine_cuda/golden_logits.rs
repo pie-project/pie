@@ -8,14 +8,13 @@
 //! that must not move a logit (a memory layout, an address) is proven by
 //! the same hashes before and after it.
 //!
-//! cuBLAS picks a dense product's algorithm by timing it once a process, so
-//! two processes may sum a product in two orders. The probe pins those picks
-//! in a GEMM algorithm cache shared across runs (`PIE_GOLDEN_CACHE`, by
-//! default `pie-golden-cache` under the system's temp dir): the first run
-//! times and records each pick, every later one reads it back. Each model is
-//! served twice in its process, the first serving only warming the picks,
-//! so a product first met inside a graph capture (left untimed there) has
-//! been timed before the hashed serving, in every run and every order.
+//! A dense product's cuBLAS algorithm is the one the profile's tactic tables
+//! name, or cuBLAS's own pick where they name none; nothing is timed at load,
+//! so every run sums each product in the same order. The probe reads the
+//! user's table under the cache shared across runs (`PIE_GOLDEN_CACHE/profiles`,
+//! the cache by default `pie-golden-cache` under the system's temp dir) over
+//! the device profile's checked-in one. Each model is served twice in its
+//! process, and the second serving is the one hashed.
 //!
 //! Run by hand (both are ignored in the suite): first `golden_fixtures`,
 //! which seeds each model's checkpoint into the cache's `fixtures` without a
@@ -459,6 +458,7 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
 /// full model's are. The logits are the same either way.
 fn knobs() -> engine_cuda::Knobs {
     let mut knobs = engine_cuda::Knobs::default();
+    knobs.profiles = Some(cache_dir().join("profiles"));
     if let Ok(bytes) = std::env::var("PIE_GOLDEN_CHUNK") {
         knobs.diagnostics.chunk_bytes = Some(bytes.parse().expect("PIE_GOLDEN_CHUNK is bytes"));
     }
