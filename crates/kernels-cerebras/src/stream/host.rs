@@ -536,6 +536,8 @@ pub fn write(p: &Program, arrays: &[HostArray], gold: &Path, out: &Path) -> R<()
         .iter()
         .map(|c| json!({"name": c.name, "word": c.word.to_string(), "rows": c.rows}))
         .collect();
+    // (absolute: the runners read it from another directory)
+    let gold = std::fs::canonicalize(gold).unwrap_or_else(|_| gold.to_path_buf());
     let host = json!({
         "model": p.trace.name, "reading": p.shape.reading, "classes": classes, "outs": outs,
         "w": p.stream.w, "h": p.stream.h, "h2d": h2d, "d2h": d2h, "refs": ref_files,

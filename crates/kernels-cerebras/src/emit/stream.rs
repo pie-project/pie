@@ -2053,7 +2053,7 @@ fn kv_root_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String
     let sw = qd + 2 * dc;
     t.push_str(&buf("sx", sw));
     t.push_str(&buf("ob", qd));
-    let mut body = String::from("  stamp(0);\n");
+    let mut body = String::from("  stamp(0);\n  cy.passes = 0;\n");
     for &(u, rows, _) in &ks.stores {
         let _ = writeln!(
             body,
