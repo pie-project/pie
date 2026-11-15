@@ -48,7 +48,7 @@ use std::collections::HashMap;
 
 use ::engine::{BindExtents, FireFacts, FirePair, InstanceId, ProgramId};
 
-use super::{RungEvacuation, Shared, SharedPool};
+use super::{RungRaise, Shared, SharedPool};
 
 /// A fire term's key: a program bound at given extents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -301,26 +301,18 @@ impl SharedPool {
         self.programs.facts.contains_key(key)
     }
 
-    /// The chunks an activation may take at most: every chunk but the
-    /// reserved ones and the weights' pinned slots, which no move frees.
-    fn act_room(&self) -> u32 {
-        let room = self.room();
-        room.total_chunks
-            .saturating_sub(room.reserved_chunks)
-            .saturating_sub(room.weight_chunks)
-    }
-
     /// The chunks a rung's activation may take at most, its guest term
-    /// included: what the device has for it ([`Self::act_room`]), and no
-    /// more than the engine states its span covers as it stands
-    /// (`ChunkFacts::act_span_chunks`). Both read here, at each fit:
-    /// nothing is kept of either, so pinned weights that come or go and a
-    /// span the engine states anew ([`SlotPool::set_act_span`]) count from
-    /// the next.
+    /// included: the top rung's span (`act_chunks_max`, below which live
+    /// state lies at every rung, so no raise ever moves it), and no more
+    /// than the engine states its span covers as it stands
+    /// (`ChunkFacts::act_span_chunks`), read here at each fit: a span the
+    /// engine states anew ([`SlotPool::set_act_span`]) counts from the
+    /// next. A guest fire is cut as the readout term is: to the widest rung
+    /// whose activation and term fit it ([`Self::widest_fit`]).
     #[must_use]
     pub fn act_most(&self) -> u32 {
-        let room = self.act_room();
-        self.pool.act_span().map_or(room, |span| span.min(room))
+        let span = self.pool.act_max();
+        self.pool.act_span().map_or(span, |stated| stated.min(span))
     }
 
     /// Whether every rung fits unasked: no pair takes anything and the
@@ -350,7 +342,7 @@ impl SharedPool {
             .max()
     }
 
-    /// Whether the guest term leaves no rung room on the device: never
+    /// Whether the guest term leaves no rung room in the top rung's span: never
     /// where no pair takes anything (a zero term is no term), and never on
     /// a pool that states no rungs, whose activation is no part of it, so
     /// the term is ignored there.
@@ -497,7 +489,7 @@ impl SharedPool {
             Some(span) if span <= most => {
                 format!("{span} chunks the engine's activation span covers")
             }
-            _ => format!("{most} the device has for it"),
+            _ => format!("{most} of the top rung's span"),
         };
         format!(
             "{key}'s fires need {} bytes and {} bytes a lane beside the model's \
@@ -566,9 +558,9 @@ impl ProgramOpen {
     /// and the `standing` bytes the bind may add to the engine's standing
     /// guest bytes ([`SharedPool::standing_added`]) are held beside the
     /// booked total. Refused where even the smallest rung's activation, the
-    /// term and the standing bytes included, is more than a rung may take ([`SharedPool::act_most`]:
-    /// every chunk but the reserved ones and the weights' pinned slots,
-    /// and no more than the engine states its span covers); a narrower fit
+    /// term and the standing bytes included, is more than a rung may take
+    /// ([`SharedPool::act_most`]: the top rung's span, and no more than the
+    /// engine states its span covers), by the pair's name; a narrower fit
     /// cuts fires to the widest rung that does
     /// ([`SharedPool::widest_fit`]).
     ///
@@ -668,23 +660,16 @@ pub trait Funder {
     fn fund(&self, pages: u32) -> impl std::future::Future<Output = Result<bool, String>> + Send;
 }
 
-/// The engine's side of a raise: the copy of what it moves out of the span
-/// (`Engine::evacuate` through the engine's lane), and the fire epoch handed
-/// out last.
+/// The engine's side of a raise: the notice of a rung it does not hold
+/// (`Engine::set_rung` through the engine's lane), where it backs its carve
+/// for the wider rung. Nothing moves in a raise.
 pub trait Mover {
-    fn evacuate(
-        &self,
-        evacuation: ::engine::chunk::Evacuation,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
-
     /// `Engine::set_rung(from, to)` through the engine's lane.
     fn set_rung(
         &self,
         from: u32,
         to: u32,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
-
-    fn epoch_now(&self) -> u64;
 
     /// The engine whose rung events ([`super::rung_changed`]) a wait on
     /// this raise waits on.
@@ -694,15 +679,14 @@ pub trait Mover {
 /// Raises `shared`'s activation to `goal`'s (a rung's tokens, given the
 /// pool; the rung the engine holds where that is wider,
 /// [`SharedPool::raise_at`]) where it falls short and nothing else is
-/// raising it: planned and
-/// taken in one hold of the pool, so no slot is handed out between, and the
-/// engine's copy of what it moves follows before fires pass the rung held
-/// before. The raise taken, if any.
+/// raising it: planned and taken in one hold of the pool, so no slot is
+/// handed out between, and the engine's notice follows before fires pass
+/// the rung held before. The raise taken, if any.
 pub async fn take_raise(
     shared: &Shared,
     goal: impl FnOnce(&SharedPool) -> u32,
     mover: &impl Mover,
-) -> Result<Option<RungEvacuation>, String> {
+) -> Result<Option<RungRaise>, String> {
     let taken = {
         let mut pool = shared.lock().unwrap();
         let goal = goal(&pool);
@@ -717,17 +701,17 @@ pub async fn take_raise(
             }
             Some(at)
                 if pool.pool().act_chunks(at) <= pool.pool().act_reserved()
-                    || pool.copying().is_some() =>
+                    || pool.raising().is_some() =>
             {
                 None
             }
             Some(at) => {
                 let stood = pool.stands_at(at);
                 match pool.plan_raise(at) {
-                    Ok(evacuation) => pool
-                        .raise_applied(&evacuation)
+                    Ok(raise) => pool
+                        .raise_applied(&raise)
                         .ok()
-                        .map(|notice| (evacuation, notice, stood)),
+                        .map(|notice| (raise, notice, stood)),
                     Err(error) => {
                         // Idle cache lies in the span: the walk has its
                         // owner clear it, and raises then.
@@ -740,67 +724,44 @@ pub async fn take_raise(
             }
         }
     };
-    let Some((evacuation, notice, stood)) = taken else {
+    let Some((raise, notice, stood)) = taken else {
         return Ok(None);
     };
-    if let Err(refused) = carry_raise(shared, &evacuation, notice, mover).await {
+    if let Err(refused) = carry_raise(shared, notice, mover).await {
         // Refused and taken back: the rung's waiters look again, and the
         // caller is told; nothing tries it again on its own wake.
         super::rung_changed(mover.engine());
         return Err(refused);
     }
     super::rung_changed(mover.engine());
-    super::raise_said(
-        mover.engine(),
-        evacuation.rung,
-        evacuation.moves.len(),
-        stood,
-    );
-    Ok(Some(evacuation))
+    super::raise_said(mover.engine(), raise.rung, stood);
+    Ok(Some(raise))
 }
 
 /// Carries a raise `shared` applied to the engine, with the notice the
-/// apply said it owes ([`SharedPool::raise_applied`]): `set_rung` first
-/// where the raise leaves the engine another rung than it holds (it backs
-/// its carve for the wider rung), then the copy of what the raise moves, a
-/// message of its own. A raise at the rung the engine holds sends no
-/// notice, and none at all where it moves nothing: the engine covers a
-/// guest term that grew under its rung inside the bind that grew it.
-/// Either refused, the raise is taken back ([`SharedPool::raise_refused`]),
-/// fires stay at the rung in hand, and an engine that backed the carve is
-/// told the rung went back; the refusal answered. Nothing faults.
+/// apply said it owes ([`SharedPool::raise_applied`]): `set_rung` where the
+/// raise leaves the engine another rung than it holds (it backs its carve
+/// for the wider rung). A raise at the rung the engine holds sends none:
+/// the engine covers a guest term that grew under its rung inside the bind
+/// that grew it. Refused, the raise is taken back
+/// ([`SharedPool::raise_refused`]) and fires stay at the rung in hand; the
+/// refusal answered. Nothing faults.
 pub async fn carry_raise(
     shared: &Shared,
-    evacuation: &RungEvacuation,
     notice: Option<(u32, u32)>,
     mover: &impl Mover,
 ) -> Result<(), String> {
-    if notice.is_none() && evacuation.moves.is_empty() {
+    let Some((from, to)) = notice else {
         return Ok(());
-    }
-    if let Some((from, to)) = notice
-        && let Err(error) = mover.set_rung(from, to).await
-    {
+    };
+    if let Err(error) = mover.set_rung(from, to).await {
         tracing::warn!(%error, from, to, "a raise's carve was refused; fires stay at the rung in hand");
-        shared.lock().unwrap().raise_refused(evacuation);
+        shared.lock().unwrap().raise_refused();
         return Err(format!(
             "the engine refused the carve for rung {to}: {error}"
         ));
     }
-    if !evacuation.moves.is_empty()
-        && let Err(error) = mover.evacuate(SharedPool::rung_moves(evacuation)).await
-    {
-        tracing::warn!(%error, "a raise's copy was refused; fires stay at the rung in hand");
-        shared.lock().unwrap().raise_refused(evacuation);
-        if let Some((from, to)) = notice
-            && let Err(error) = mover.set_rung(to, from).await
-        {
-            tracing::warn!(%error, from = to, to = from, "a rung notice was refused");
-        }
-        return Err(format!("the engine refused a raise's copy: {error}"));
-    }
-    let next = mover.epoch_now().saturating_add(1);
-    shared.lock().unwrap().raise_copied(next);
+    shared.lock().unwrap().raise_carved();
     Ok(())
 }
 
@@ -808,9 +769,9 @@ pub async fn carry_raise(
 /// fire terms of the programs that can be in a fire included: fires cut to
 /// `cap()` rows, and no wider than the widest rung that fits with the terms
 /// ([`SharedPool::widest_fit`]). Where the span falls short, the room is
-/// asked of `funder` as a rung raise's is, then the raise taken: every
-/// state chunk in the widened span moved below it and the engine's copy
-/// done before this returns. Where fires are cut wider than the widest
+/// asked of `funder` as a rung raise's is, then the raise taken (nothing
+/// moves: idle cache in the widened span is cleared first, and live state
+/// never lies there) and the engine's carve backed before this returns. Where fires are cut wider than the widest
 /// rung that fits, or the engine holds a wider rung than that
 /// ([`SharedPool::told_unfit`]), it waits on the walk to cut them and
 /// bring the engine down ([`super::SharedGrow`], asked to look at once:
@@ -821,8 +782,7 @@ pub async fn carry_raise(
 /// raised the span waits on before it is sent; an `Err` refuses the bind.
 ///
 /// At a rung the engine holds, the raise the term asks sends the engine
-/// no notice ([`carry_raise`]); state it moves out of the span goes as its
-/// own message.
+/// no notice ([`carry_raise`]).
 pub async fn fund_span(
     shared: &Shared,
     cap: impl Fn() -> u32,
@@ -835,7 +795,7 @@ pub async fn fund_span(
         let watch = super::rung_watch(engine);
         tokio::pin!(watch);
         watch.as_mut().enable();
-        let (short, copying, goal, cut) = {
+        let (short, raising, goal, cut) = {
             let pool = shared.lock().unwrap();
             let rows = cap();
             let fires = pool.rung_for(rows);
@@ -849,7 +809,7 @@ pub async fn fund_span(
             });
             (
                 short,
-                pool.copying().is_some(),
+                pool.raising().is_some(),
                 goal,
                 rows <= pool.lifted(fires),
             )
@@ -861,11 +821,11 @@ pub async fn fund_span(
             watch.await;
             continue;
         };
-        if short == 0 && !copying && cut {
+        if short == 0 && !raising && cut {
             return Ok(());
         }
-        if copying || short == 0 {
-            // A raise's copy is the engine's to take, or the walk is to cut
+        if raising || short == 0 {
+            // A raise's carve is the engine's to back, or the walk is to cut
             // fires to the widest rung that fits: either tells the rung.
             if !cut {
                 super::ask_walk(engine);
@@ -924,25 +884,14 @@ impl Funder for Planner {
     }
 }
 
-/// The runtime's [`Mover`]: engine `engine`'s lane, and its stores' fire
-/// epoch.
-pub struct LaneMover<F> {
+/// The runtime's [`Mover`]: engine `engine`'s lane.
+pub struct LaneMover {
     pub engine: usize,
-    pub epoch_now: F,
 }
 
-impl<F: Fn() -> u64 + Sync> Mover for LaneMover<F> {
+impl Mover for LaneMover {
     fn engine(&self) -> usize {
         self.engine
-    }
-
-    async fn evacuate(&self, evacuation: ::engine::chunk::Evacuation) -> Result<(), String> {
-        crate::scheduler::pool(
-            self.engine,
-            crate::scheduler::worker::PoolOp::Evacuate(evacuation),
-        )
-        .await
-        .map_err(|error| format!("{error:#}"))
     }
 
     async fn set_rung(&self, from: u32, to: u32) -> Result<(), String> {
@@ -953,16 +902,4 @@ impl<F: Fn() -> u64 + Sync> Mover for LaneMover<F> {
         .await
         .map_err(|error| format!("{error:#}"))
     }
-
-    fn epoch_now(&self) -> u64 {
-        (self.epoch_now)()
-    }
-}
-
-/// Engine `engine`'s stores' fire epoch handed out last (model 0's).
-#[must_use]
-pub fn epoch_of(engine: usize) -> u64 {
-    crate::store::registry::try_get(0, engine).map_or(0, |stores| {
-        crate::store::registry::with_kv_lock(&stores.kv, "program-fire", |kv| kv.current_epoch())
-    })
 }

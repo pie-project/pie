@@ -1061,10 +1061,7 @@ impl SchedulerHandle {
                         &shared,
                         || crate::store::shared::fire_cap(engine),
                         &crate::store::shared::programs::Planner { pid, quorum: pid },
-                        &crate::store::shared::programs::LaneMover {
-                            engine,
-                            epoch_now: || crate::store::shared::programs::epoch_of(engine),
-                        },
+                        &crate::store::shared::programs::LaneMover { engine },
                     ),
                 )
                 .await

@@ -108,18 +108,10 @@ impl Funder for NoPlanner {
     }
 }
 
-/// The engine's copy of a raise, on the fake engine.
+/// The engine's side of a raise, on the fake engine.
 struct Lane(Arc<Mutex<FakeEngine>>);
 
 impl Mover for Lane {
-    async fn evacuate(&self, evacuation: EngineEvacuation) -> Result<(), String> {
-        self.0
-            .lock()
-            .unwrap()
-            .evacuate(&evacuation)
-            .map_err(|error| error.to_string())
-    }
-
     async fn set_rung(&self, from: u32, to: u32) -> Result<(), String> {
         self.0
             .lock()
@@ -130,10 +122,6 @@ impl Mover for Lane {
 
     fn engine(&self) -> usize {
         TEST_ENGINE
-    }
-
-    fn epoch_now(&self) -> u64 {
-        0
     }
 }
 
@@ -352,7 +340,7 @@ async fn a_program_s_fire_term_widens_the_span_before_its_bind_and_its_close_giv
             pool.pool().chunk_table(),
             "nothing moved"
         );
-        assert!(pool.copying().is_none());
+        assert!(pool.raising().is_none());
         // What the engine relies on when it backs its own span: no state
         // slot lies in the widened span once the wait is through.
         let in_span: Vec<u32> = all
@@ -432,11 +420,11 @@ fn a_program_s_own_lane_cap_bounds_its_term() {
     assert_eq!(pool.pool().fire().bytes(LANES), 56 * MIB);
 }
 
-/// 55 chunks a fire: the 2048 rung (12 + 55) no longer fits the 63 chunks
-/// past the reserved one, the 256 rung (4 + 55) does.
+/// 8 chunks a fire: the 2048 rung (12 + 8) no longer fits the top rung's
+/// span of 12, the 256 rung (4 + 8) does.
 fn wide_facts() -> FireFacts {
     FireFacts {
-        fixed: 55 * CHUNK,
+        fixed: 8 * CHUNK,
         ..FireFacts::default()
     }
 }
@@ -483,7 +471,7 @@ async fn a_term_past_the_largest_rung_funds_the_widest_that_fits_and_cuts_fires_
     }
     assert_eq!(
         shared.lock().unwrap().pool().act_reserved(),
-        4 + 55,
+        4 + 8,
         "the 256 rung with its term is taken"
     );
     assert!(!wait.is_finished(), "fires are still cut wider than it");
@@ -510,96 +498,93 @@ async fn a_term_past_the_largest_rung_funds_the_widest_that_fits_and_cuts_fires_
     assert_eq!(shared.lock().unwrap().fit_cap(), u32::MAX, "no term counts");
 }
 
-/// A bind is never sent unfunded: the planner's refusal ends the wait with
-/// an error; a raise the engine refuses is taken back, the span and the
-/// state as they were, and refuses the bind too: nothing tries it again on
-/// its own wake. The term here carries the 256 rung's activation far past
-/// the top rung's span's base (20 chunks over its 4: from 40), into live
-/// state: the one raise that moves any.
+/// A guest term is cut as the readout term is, against the top rung's span
+/// (below which live state lies at every rung, so no raise ever moves it):
+/// a term that fits only under a narrower rung cuts fires to the widest
+/// rung whose activation and term fit the span, and the raise there moves
+/// nothing; a term that fits at no rung is refused at its bind, by name,
+/// the pool as it was.
 #[tokio::test(flavor = "current_thread")]
-async fn a_bind_whose_room_is_refused_fails_its_wait() {
-    struct Refusing;
-    impl Funder for Refusing {
-        async fn fund(&self, _pages: u32) -> Result<bool, String> {
-            Err("the planner refuses".into())
-        }
-    }
-    struct NoCopy;
-    impl Mover for NoCopy {
-        async fn evacuate(&self, _evacuation: EngineEvacuation) -> Result<(), String> {
-            Err("the engine refuses".into())
-        }
-        async fn set_rung(&self, _from: u32, _to: u32) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn engine(&self) -> usize {
-            TEST_ENGINE
-        }
-        fn epoch_now(&self) -> u64 {
-            0
-        }
-    }
-    struct Granting;
-    impl Funder for Granting {
-        async fn fund(&self, _pages: u32) -> Result<bool, String> {
-            Ok(true)
-        }
-    }
-
+async fn a_guest_term_is_cut_to_the_top_rung_s_span_and_one_past_every_rung_is_refused() {
+    const WIDE: ProgramId = ProgramId(71);
+    const PAST: ProgramId = ProgramId(72);
     let (mut pool, _) = pool_at_256();
-    pool.fire_facts_learned(
-        key(PROGRAM),
-        &FireFacts {
-            fixed: 20 * CHUNK,
-            ..FireFacts::default()
-        },
-    );
     let all = pool
         .take_records(pool.records_available() as usize)
         .unwrap();
-    let shared: Shared = Arc::new(Mutex::new(pool));
-    let _open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
-    assert_eq!(shared.lock().unwrap().pool().act_chunks(256), 24);
-    assert!(
-        shared.lock().unwrap().raise_short(256).0 > 0,
-        "live state in its way"
+    // 9 chunks a fire: the 16 rung takes 10 of the span's 12, 256 would
+    // take 13.
+    pool.fire_facts_learned(
+        key(WIDE),
+        &FireFacts {
+            fixed: 9 * CHUNK,
+            ..FireFacts::default()
+        },
     );
-    let error = fund_span(&shared, || 256, &Refusing, &NoCopy)
-        .await
-        .unwrap_err();
-    assert!(error.contains("the planner refuses"));
-    assert_eq!(shared.lock().unwrap().pool().act_reserved(), 4);
+    // 12 chunks a fire: even the 16 rung would take 13.
+    pool.fire_facts_learned(
+        key(PAST),
+        &FireFacts {
+            fixed: 12 * CHUNK,
+            ..FireFacts::default()
+        },
+    );
+    let table = pool.pool().chunk_table().to_vec();
+    let shared: Shared = Arc::new(Mutex::new(pool));
 
-    // Room there, the copy refused: a refused raise, taken back, and the
-    // bind refused (never sent), the span and the state as they were.
-    let kept = all[all.len() / 2..].to_vec();
+    let refused = ProgramOpen::new(&shared, key(PAST), 0)
+        .map(|_| ())
+        .unwrap_err();
+    assert!(refused.contains(&key(PAST).to_string()), "{refused}");
+    assert!(refused.contains("of the top rung's span"), "{refused}");
+    {
+        let pool = shared.lock().unwrap();
+        assert!(
+            pool.pool().fire().is_zero(),
+            "the refused term is never seen"
+        );
+        assert_eq!(pool.fit_cap(), u32::MAX);
+    }
+
+    let open = ProgramOpen::new(&shared, key(WIDE), 0).unwrap();
+    let mut walk = RungWalk::default();
     {
         let mut pool = shared.lock().unwrap();
-        pool.give_records(&all[..all.len() / 2]);
-        pool.pool_mut().retire_through(u64::MAX);
+        assert_eq!(pool.pool().act_chunks(16), 10);
+        assert_eq!(pool.pool().act_chunks(256), 13);
+        assert_eq!(pool.widest_fit(), Some(16), "the widest rung the span fits");
+        assert_eq!(pool.fit_cap(), 16);
+        assert_eq!(pool.rung_for(5000), 16, "fires cut to it");
+        assert_eq!(
+            pool.plan_raise(256).unwrap_err(),
+            RungError::Pool(SlotError::PastSpan {
+                rung: 256,
+                chunks: 13,
+                span: 12
+            }),
+            "never set aside past the span"
+        );
+        // The walk cuts fires to it, then takes its activation, the term's
+        // included: nothing moves.
+        assert_eq!(
+            walk.step(&pool, 256, 256, 256, 1, 1).unwrap(),
+            RungStep::Cap(16)
+        );
+        let RungStep::Raise { rung, raise } = walk.step(&pool, 256, 16, 16, 1, 1).unwrap() else {
+            panic!("a raise to the cut rung");
+        };
+        assert_eq!(rung, 16);
+        assert_eq!(pool.raise_applied(&raise).unwrap(), None);
+        assert_eq!(pool.pool().act_reserved(), 10);
+        assert_eq!(pool.pool().chunk_table(), table.as_slice(), "nothing moved");
+        assert!(
+            all.iter()
+                .flat_map(|&record| pool.record_slots(record))
+                .all(|slot| pool.pool().physical(slot.chunk).unwrap() < TOTAL - 12)
+        );
+        pool.pool().check();
     }
-    let where_before: Vec<u32> = {
-        let pool = shared.lock().unwrap();
-        kept.iter()
-            .flat_map(|&record| pool.record_slots(record))
-            .map(|slot| pool.pool().physical(slot.chunk).unwrap())
-            .collect()
-    };
-    let refused = fund_span(&shared, || 256, &Granting, &NoCopy)
-        .await
-        .unwrap_err();
-    assert!(refused.contains("the engine refuses"), "{refused}");
-    let pool = shared.lock().unwrap();
-    assert_eq!(pool.pool().act_reserved(), 4, "the rung in hand");
-    assert!(pool.copying().is_none());
-    let where_after: Vec<u32> = kept
-        .iter()
-        .flat_map(|&record| pool.record_slots(record))
-        .map(|slot| pool.pool().physical(slot.chunk).unwrap())
-        .collect();
-    assert_eq!(where_after, where_before, "the state where it lay");
-    pool.pool().check();
+    drop(open);
 }
 
 /// A pool that states no rungs (Vulkan, wgpu, XLA, Metal before its span):
@@ -730,11 +715,11 @@ async fn a_larger_extent_bind_widens_the_span_before_it_is_sent() {
     }
     let (mut pool, engine) = pool_at_256();
     pool.fire_facts_learned(at(PROGRAM, 256), &rows_facts(256));
-    pool.fire_facts_learned(at(PROGRAM, 4096), &rows_facts(4096));
+    pool.fire_facts_learned(at(PROGRAM, 2048), &rows_facts(2048));
     // The 256-row pair live and funded: 5 chunks at the 256 rung.
     pool.instance_bound(InstanceId(1), at(PROGRAM, 256));
-    let evacuation = pool.plan_raise(256).unwrap();
-    pool.apply_rung(&evacuation, 0).unwrap();
+    let raise = pool.plan_raise(256).unwrap();
+    pool.apply_rung(&raise).unwrap();
     assert_eq!(pool.pool().act_reserved(), 5);
     // State right under the span.
     let all = pool
@@ -746,19 +731,19 @@ async fn a_larger_extent_bind_widens_the_span_before_it_is_sent() {
     let shared: Shared = Arc::new(Mutex::new(pool));
     let engine = Arc::new(Mutex::new(engine));
 
-    let open = ProgramOpen::new(&shared, at(PROGRAM, 4096), 0).unwrap();
-    assert_eq!(shared.lock().unwrap().span_short(256), 8);
+    let open = ProgramOpen::new(&shared, at(PROGRAM, 2048), 0).unwrap();
+    assert_eq!(shared.lock().unwrap().span_short(256), 4);
     fund_span(&shared, || 256, &Granting, &Lane(engine.clone()))
         .await
         .unwrap();
     // What the bind is sent after.
     let pool = shared.lock().unwrap();
-    assert_eq!(pool.pool().act_reserved(), 4 + 9);
+    assert_eq!(pool.pool().act_reserved(), 4 + 5);
     let in_span = kept
         .iter()
         .flat_map(|&record| pool.record_slots(record))
         .map(|slot| pool.pool().physical(slot.chunk).unwrap())
-        .filter(|&physical| physical >= TOTAL - 13)
+        .filter(|&physical| physical >= TOTAL - 9)
         .count();
     assert_eq!(in_span, 0, "no state in the widened span");
     assert_eq!(
@@ -837,8 +822,8 @@ fn a_lower_lends_only_after_every_fire_cut_to_the_old_rung_has_retired() {
     let (mut pool, _) = pool_at_256();
     pool.fire_facts_learned(key(PROGRAM), &fire_facts());
     pool.instance_bound(InstanceId(1), key(PROGRAM));
-    let evacuation = pool.plan_raise(256).unwrap();
-    pool.apply_rung(&evacuation, 0).unwrap();
+    let raise = pool.plan_raise(256).unwrap();
+    pool.apply_rung(&raise).unwrap();
     assert_eq!(pool.pool().act_reserved(), 7);
     closed(&mut pool, 1);
     assert_eq!(pool.pool().act_chunks(256), 4);
@@ -938,8 +923,8 @@ async fn each_bind_grows_the_term_and_each_close_shrinks_it() {
         },
     );
     bind_live(&mut pool, key(PROGRAM), 1, 2);
-    let evacuation = pool.plan_raise(256).unwrap();
-    pool.apply_rung(&evacuation, 0).unwrap();
+    let raise = pool.plan_raise(256).unwrap();
+    pool.apply_rung(&raise).unwrap();
     assert_eq!(pool.pool().act_reserved(), 4 + 1);
     let shared: Shared = Arc::new(Mutex::new(pool));
 
@@ -1141,7 +1126,11 @@ fn a_refused_bind_leaves_the_term_of_the_pairs_open() {
     let pool = shared.lock().unwrap();
     assert_eq!(pool.pool().fire(), &before);
     assert_eq!(pool.pool().act_chunks(256), 4 + 3);
-    assert_eq!(pool.fit_cap(), u32::MAX);
+    assert_eq!(
+        pool.fit_cap(),
+        256,
+        "the open pair's term fits the span to 256"
+    );
 }
 
 // ---- ruling 2: the rung the engine holds, and the span it states ----
@@ -1162,16 +1151,17 @@ fn on_demand_loaded() -> (SharedPool, FakeEngine) {
         Retarget::Reached
     );
     assert_eq!(pool.told(), 16, "the load's rung");
-    assert_eq!(pool.act_most(), 2 * SEGMENT);
+    // The top rung's span bounds it, under the 16 the engine states.
+    assert_eq!(pool.act_most(), 12);
     (pool, engine)
 }
 
 /// [`on_demand_loaded`], the engine told `rung` by a raise from the load's.
 fn on_demand_at(rung: u32) -> (SharedPool, FakeEngine) {
     let (mut pool, engine) = on_demand_loaded();
-    let evacuation = pool.plan_raise(rung).unwrap();
-    assert_eq!(pool.raise_applied(&evacuation).unwrap(), Some((16, rung)));
-    pool.raise_copied(0);
+    let raise = pool.plan_raise(rung).unwrap();
+    assert_eq!(pool.raise_applied(&raise).unwrap(), Some((16, rung)));
+    pool.raise_carved();
     assert_eq!(pool.told(), rung);
     (pool, engine)
 }
@@ -1208,14 +1198,13 @@ async fn binds_at_a_standing_rung_send_the_engine_no_notice() {
             // A growth that moves nothing waits on nothing.
             let pool = shared.lock().unwrap();
             let planned = pool.plan_raise(256).unwrap();
-            assert!(planned.moves.is_empty());
             assert!(!pool.raise_waits(&planned), "bind {id}");
         }
         fund_span(&shared, || 256, &NoPlanner, &Lane(engine.clone()))
             .await
             .unwrap();
         let mut pool = shared.lock().unwrap();
-        assert!(pool.copying().is_none(), "bind {id}");
+        assert!(pool.raising().is_none(), "bind {id}");
         assert_eq!(pool.told(), 256, "bind {id}");
         assert_eq!(pool.span_short(256), 0, "funded before bind {id} is sent");
         pool.instance_bound(InstanceId(id), key(PROGRAM));
@@ -1270,7 +1259,6 @@ async fn a_growth_at_a_standing_rung_over_the_span_s_cache_sends_nothing_once_it
         assert_eq!(pool.raise_short(256), (0, 0), "nothing to fund");
         clear_span_cache(&mut pool, &cached, 1);
         let planned = pool.plan_raise(256).unwrap();
-        assert!(planned.moves.is_empty(), "no state moves");
         assert!(!pool.raise_waits(&planned), "no trip through the lane");
     }
     fund_span(&shared, || 256, &NoPlanner, &Lane(engine.clone()))
@@ -1286,7 +1274,7 @@ async fn a_growth_at_a_standing_rung_over_the_span_s_cache_sends_nothing_once_it
         let pool = shared.lock().unwrap();
         assert_eq!(pool.pool().act_reserved(), 4 + 3);
         assert_eq!(pool.told(), 256);
-        assert!(pool.copying().is_none());
+        assert!(pool.raising().is_none());
         assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
         assert!(
             below
@@ -1357,13 +1345,13 @@ async fn a_bind_the_engine_cannot_cover_at_a_standing_rung_gives_its_room_back_u
     );
 }
 
-/// A raise never brings the engine down: with fires cut to 256 under an
-/// engine that still holds 2048 (the walk's lower waits on its fence), a
-/// bind's term is set aside at 2048, where the engine covers it, and the
+/// A raise never brings the engine down: with fires cut to 16 under an
+/// engine that still holds 256 (the walk's lower waits on its fence), a
+/// bind's term is set aside at 256, where the engine covers it, and the
 /// engine is sent nothing.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_under_a_wider_rung_the_engine_holds_is_funded_at_that_rung() {
-    let (mut pool, engine) = on_demand_at(2048);
+    let (mut pool, engine) = on_demand_at(256);
     pool.fire_facts_learned(key(PROGRAM), &fire_facts());
     let shared: Shared = Arc::new(Mutex::new(pool));
     let engine = Arc::new(Mutex::new(engine));
@@ -1371,17 +1359,20 @@ async fn a_bind_under_a_wider_rung_the_engine_holds_is_funded_at_that_rung() {
     let open = ProgramOpen::new(&shared, key(PROGRAM), 0).unwrap();
     {
         let pool = shared.lock().unwrap();
-        assert_eq!(pool.widest_fit(), Some(2048), "12 + 3 of the span's 16");
+        assert_eq!(
+            pool.widest_fit(),
+            Some(256),
+            "4 + 3 of the top rung's 12; 12 + 3 is past it"
+        );
         assert!(!pool.told_unfit());
-        assert_eq!(pool.raise_at(256), Some(2048), "no narrower than it holds");
-        assert_eq!(pool.raise_at(16), Some(2048));
+        assert_eq!(pool.raise_at(16), Some(256), "no narrower than it holds");
     }
-    fund_span(&shared, || 256, &NoPlanner, &Lane(engine.clone()))
+    fund_span(&shared, || 16, &NoPlanner, &Lane(engine.clone()))
         .await
         .unwrap();
     let pool = shared.lock().unwrap();
-    assert_eq!(pool.pool().act_reserved(), 12 + 3, "the 2048 rung's");
-    assert_eq!(pool.told(), 2048);
+    assert_eq!(pool.pool().act_reserved(), 4 + 3, "the 256 rung's");
+    assert_eq!(pool.told(), 256);
     assert_eq!(engine.lock().unwrap().calls, before);
     drop(pool);
     drop(open);
@@ -1390,19 +1381,19 @@ async fn a_bind_under_a_wider_rung_the_engine_holds_is_funded_at_that_rung() {
 /// A term the rung the engine holds no longer fits with: the bind is not
 /// sent, and nothing is set aside, until the walk has brought the engine
 /// down to the widest rung that fits, as a lower is (fires cut, the grant,
-/// the retire fence, then the notice). The term's room at that rung is
-/// then a standing rung's: set aside with no notice. The engine is never
+/// the retire fence, then the notice). The term's room at that rung lies
+/// within the top rung's span, so the lower sets it aside. The engine is never
 /// asked for a rung, nor to cover a bind at one, whose term was not held
 /// against its span first.
 #[tokio::test(flavor = "current_thread")]
 async fn a_term_past_the_rung_the_engine_holds_brings_it_down_before_the_bind() {
     let (mut pool, engine) = on_demand_at(2048);
     assert_eq!(pool.pool().act_reserved(), 12);
-    // 10 chunks a fire: 12 + 10 is past the span's 16, 4 + 10 is not.
+    // 7 chunks a fire: 12 + 7 is past the top rung's 12, 4 + 7 is not.
     pool.fire_facts_learned(
         key(PROGRAM),
         &FireFacts {
-            fixed: 10 * CHUNK,
+            fixed: 7 * CHUNK,
             ..FireFacts::default()
         },
     );
@@ -1461,7 +1452,11 @@ async fn a_term_past_the_rung_the_engine_holds_brings_it_down_before_the_bind() 
             RungStep::Lower(256)
         );
         let notice = pool.lower_rung(256).unwrap();
-        assert_eq!(pool.pool().act_reserved(), 12, "what is set aside stays");
+        assert_eq!(
+            pool.pool().act_reserved(),
+            4 + 7,
+            "the 256 rung's, its term included: within the top rung's span"
+        );
         assert!(!pool.told_unfit());
         notice
     };
@@ -1471,9 +1466,9 @@ async fn a_term_past_the_rung_the_engine_holds_brings_it_down_before_the_bind() 
     wait.await.unwrap().unwrap();
     {
         let pool = shared.lock().unwrap();
-        assert_eq!(pool.pool().act_reserved(), 4 + 10, "the 256 rung's term");
+        assert_eq!(pool.pool().act_reserved(), 4 + 7, "the 256 rung's term");
         assert_eq!(pool.told(), 256);
-        assert!(pool.copying().is_none());
+        assert!(pool.raising().is_none());
         assert_eq!(
             walk.step(&pool, u32::MAX, 256, 256, 6, 6).unwrap(),
             RungStep::Wait
@@ -1500,14 +1495,13 @@ fn a_steady_one_row_decode_moves_no_rung_and_no_cap() {
     let goal = pool.rung_for(1);
     assert_eq!(goal, 16);
     let mut walk = RungWalk::default();
-    let RungStep::Raise { rung, evacuation } = walk.step(&pool, goal, cap, cap, 1, 1).unwrap()
-    else {
+    let RungStep::Raise { rung, raise } = walk.step(&pool, goal, cap, cap, 1, 1).unwrap() else {
         panic!("the first step sets the term's room aside");
     };
     assert_eq!(rung, 16);
     assert!(pool.stands_at(rung));
-    assert_eq!(pool.raise_applied(&evacuation).unwrap(), None, "no notice");
-    assert!(pool.copying().is_none());
+    assert_eq!(pool.raise_applied(&raise).unwrap(), None, "no notice");
+    assert!(pool.raising().is_none());
     assert_eq!(pool.pool().act_reserved(), 1 + 2);
     for epoch in 2..200 {
         assert_eq!(
@@ -1516,7 +1510,9 @@ fn a_steady_one_row_decode_moves_no_rung_and_no_cap() {
             RungStep::Wait,
             "step {epoch}"
         );
-        assert_eq!(pool.fit_cap(), u32::MAX);
+        // The term takes 12 + 3 at 2048, past the top rung's span: fires
+        // are cut to 256 at most, the cap here under it.
+        assert_eq!(pool.fit_cap(), 256);
         assert_eq!(pool.told(), 16);
         assert_eq!(pool.pool().act_reserved(), 1 + 2);
     }
@@ -1599,7 +1595,11 @@ async fn a_wave_past_the_span_the_engine_states_is_cut_to_the_widest_rung_it_cov
     assert_eq!(pool.pool().act_chunks(256), 1911, "what the wave wanted");
     assert_eq!(pool.pool().act_chunks(128), 320 + 662);
     assert_eq!(pool.pool().act_span(), Some(1758));
-    assert_eq!(pool.act_most(), 1758, "the span, not the device's room");
+    assert_eq!(
+        pool.act_most(),
+        1740,
+        "the top rung's span, under the 1758 Metal states and the device's room"
+    );
 
     // The fit: 128, by construction the rung of every goal.
     assert_eq!(pool.widest_fit(), Some(128));
@@ -1613,23 +1613,18 @@ async fn a_wave_past_the_span_the_engine_states_is_cut_to_the_widest_rung_it_cov
         RungStep::Cap(128),
         "the wave is cut to 128"
     );
-    let RungStep::Raise { rung, evacuation } = walk.step(&pool, u32::MAX, 128, 128, 1, 1).unwrap()
+    let RungStep::Raise { rung, raise } = walk.step(&pool, u32::MAX, 128, 128, 1, 1).unwrap()
     else {
         panic!("the walk raises to the widest rung that fits");
     };
     assert_eq!(rung, 128);
-    let notice = pool.raise_applied(&evacuation).unwrap();
+    let notice = pool.raise_applied(&raise).unwrap();
     assert_eq!(notice, Some((16, 128)));
     let shared: Shared = Arc::new(Mutex::new(pool));
     let engine = Arc::new(Mutex::new(FakeEngine::on_demand()));
-    crate::store::shared::programs::carry_raise(
-        &shared,
-        &evacuation,
-        notice,
-        &Lane(engine.clone()),
-    )
-    .await
-    .unwrap();
+    crate::store::shared::programs::carry_raise(&shared, notice, &Lane(engine.clone()))
+        .await
+        .unwrap();
     assert_eq!(
         engine.lock().unwrap().calls,
         [Call::Rung(16, 128)],
@@ -1665,21 +1660,24 @@ async fn a_wave_past_the_span_the_engine_states_is_cut_to_the_widest_rung_it_cov
     let why = ProgramOpen::new(&shared, key(HUGE), 0)
         .err()
         .expect("past the span at the smallest rung");
-    assert!(
-        why.contains("1758 chunks the engine's activation span covers"),
-        "{why}"
-    );
+    assert!(why.contains("1740 of the top rung's span"), "{why}");
     assert_eq!(shared.lock().unwrap().widest_fit(), Some(128));
 
-    // The span is the engine's statement in force, read at each fit: one
-    // stated anew counts from the next, and none stated bounds nothing.
+    // The span is the engine's statement in force, read at each fit, and
+    // never past the top rung's span: one stated anew counts from the
+    // next, one wider than the top rung's span or none stated leaves the
+    // top rung's span the bound.
     let mut pool = shared.lock().unwrap();
+    pool.pool_mut().set_act_span(Some(900));
+    assert_eq!(pool.act_most(), 900);
+    assert!(pool.widest_fit() < Some(128), "128 takes 982 of 900");
     pool.pool_mut().set_act_span(Some(1911));
-    assert_eq!(pool.widest_fit(), Some(256));
-    assert_eq!(pool.rung_for(256), 256);
+    assert_eq!(pool.act_most(), 1740);
+    assert_eq!(pool.widest_fit(), Some(128), "256 takes 1911 of 1740");
     pool.pool_mut().set_act_span(None);
-    assert_eq!(pool.widest_fit(), Some(2048), "every lendable chunk");
-    assert_eq!(pool.fit_cap(), u32::MAX);
+    assert_eq!(pool.act_most(), 1740);
+    assert_eq!(pool.widest_fit(), Some(128));
+    assert_eq!(pool.fit_cap(), 128);
 }
 
 /// Two chunks of batch tables a set: what [`SetEngine`] keeps standing for
@@ -1877,22 +1875,27 @@ fn the_span_backs_the_standing_total_and_the_fire_term_at_every_rung() {
                 "rung {rung}"
             );
         }
-        assert_eq!(pool.widest_fit(), Some(2048));
+        assert_eq!(
+            pool.widest_fit(),
+            Some(256),
+            "2048's 12 and the term's 5 are past the top rung's span; 256's 4 and 5 fit it"
+        );
     }
 
-    // 52 chunks standing: 2048's 12 and its term no longer fit the 63
-    // past the reserved one, 256's do.
+    // 7 chunks standing: 256's 4 and its term no longer fit the top rung's
+    // span of 12, 16's 1 and its term do.
     const WIDE: ProgramId = ProgramId(11);
-    engine.sets.insert(WIDE, 52 * CHUNK - SET - MIB);
+    engine.sets.insert(WIDE, 7 * CHUNK - SET - MIB);
     shared
         .lock()
         .unwrap()
         .fire_facts_learned(key(WIDE), &FireFacts::default());
     bind_through(&shared, &mut engine, WIDE).unwrap();
     let pool = shared.lock().unwrap();
-    assert_eq!(pool.widest_fit(), Some(256));
-    assert_eq!(pool.rung_for(u32::MAX), 256, "fires are asked no wider");
-    assert!(pool.pool().act_chunks(256) <= pool.act_most());
+    assert!(pool.pool().act_chunks(256) > pool.act_most());
+    assert_eq!(pool.widest_fit(), Some(16));
+    assert_eq!(pool.rung_for(u32::MAX), 16, "fires are asked no wider");
+    assert!(pool.pool().act_chunks(16) <= pool.act_most());
 }
 
 /// A bind's standing bytes are backed below the carve before the engine is
