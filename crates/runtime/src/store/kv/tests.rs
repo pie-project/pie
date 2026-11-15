@@ -363,7 +363,7 @@ fn reader(store: &mut KvStore, tokens: &[u32], pages: u64) -> WorkingSetId {
     let ws = store.create_working_set();
     let keys = keys_ahead(store, ws, 0, tokens);
     let run = store.cached_run(&keys);
-    assert_eq!(store.attach_run(ws, &run, pages, 16).unwrap(), pages);
+    assert_eq!(store.attach_run(ws, &run, pages).unwrap(), pages);
     ws
 }
 
@@ -897,7 +897,7 @@ fn a_working_set_maps_in_what_another_sealed() {
     let run = store.cached_run(&keys);
     assert_eq!(run.len(), 4);
     assert_eq!(
-        store.attach_run(ws, &run, 3, 16).unwrap(),
+        store.attach_run(ws, &run, 3).unwrap(),
         3,
         "short of the limit"
     );
@@ -913,8 +913,15 @@ fn a_working_set_maps_in_what_another_sealed() {
     // What follows chains on what was mapped in, as on the sealer's.
     let keys_after = keys_ahead(&store, ws, 48, &tokens[48..]);
     assert_eq!(keys_after, keys);
-    // A write into a mapped-in page copies it.
+    // Mapping freezes nothing: the set has folded what its passes state.
+    assert_eq!(store.folded(ws).unwrap(), 0);
+    assert!(store.folded_exact(ws).unwrap());
+    // A write into a mapped-in page copies it, and every mapped page
+    // after it.
     assert!(!store.privately_writable(ws, 2).unwrap());
+    assert_eq!(store.write_demand(ws, &[2]).unwrap(), 1);
+    assert_eq!(store.write_demand(ws, &[1]).unwrap(), 2);
+    assert_eq!(store.write_demand(ws, &[3]).unwrap(), 1, "a fresh page");
 }
 
 fn a_pass_maps_in_more_after_what_it_mapped_in() {
@@ -924,10 +931,10 @@ fn a_pass_maps_in_more_after_what_it_mapped_in() {
     let ws = store.create_working_set();
     let keys = keys_ahead(&store, ws, 0, &tokens);
     let run = store.cached_run(&keys);
-    assert_eq!(store.attach_run(ws, &run, 1, 16).unwrap(), 1);
+    assert_eq!(store.attach_run(ws, &run, 1).unwrap(), 1);
     let keys = keys_ahead(&store, ws, 16, &tokens[16..]);
     let run = store.cached_run(&keys);
-    assert_eq!(store.attach_run(ws, &run, 4, 16).unwrap(), 3);
+    assert_eq!(store.attach_run(ws, &run, 4).unwrap(), 3);
     assert_eq!(store.mapped_len(ws).unwrap(), 4);
 
     // Its own first page, computed, is not the path's: nothing maps in.
@@ -937,7 +944,7 @@ fn a_pass_maps_in_more_after_what_it_mapped_in() {
     let keys = keys_ahead(&store, own, 16, &tokens[16..]);
     let run = store.cached_run(&keys);
     assert_eq!(run.len(), 4);
-    assert_eq!(store.attach_run(own, &run, 4, 16).unwrap(), 0);
+    assert_eq!(store.attach_run(own, &run, 4).unwrap(), 0);
 }
 
 fn a_page_no_one_else_reads_is_written_in_place() {
@@ -950,7 +957,7 @@ fn a_page_no_one_else_reads_is_written_in_place() {
     let reader = store.create_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens[..32]);
     let run = store.cached_run(&keys);
-    assert_eq!(store.attach_run(reader, &run, 2, 16).unwrap(), 2);
+    assert_eq!(store.attach_run(reader, &run, 2).unwrap(), 2);
     assert!(!store.privately_writable(live, 1).unwrap(), "read by both");
     assert!(store.privately_writable(live, 2).unwrap(), "its open page");
     assert!(
@@ -1050,7 +1057,7 @@ fn a_hit_refreshes_only_the_entries_it_used_whole() {
     store.set_owner(ws, long).unwrap();
     let keys = keys_ahead(&store, ws, 0, &tokens[..32]);
     let run = store.cached_run(&keys);
-    assert_eq!(store.attach_run(ws, &run, 2, 16).unwrap(), 2);
+    assert_eq!(store.attach_run(ws, &run, 2).unwrap(), 2);
     commit_opaque(&mut store, ws, 1);
     store.set_page_size(16);
     store.log_rows(ws, 0, &tokens).unwrap();
@@ -1068,7 +1075,7 @@ fn a_hit_refreshes_only_the_entries_it_used_whole() {
     let reader = store.create_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens[..32]);
     let run = store.cached_run(&keys);
-    assert_eq!(store.attach_run(reader, &run, 2, 16).unwrap(), 2);
+    assert_eq!(store.attach_run(reader, &run, 2).unwrap(), 2);
     assert!(
         last_use(&store, short) > last_use(&store, long),
         "used whole"
@@ -1127,7 +1134,7 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
     let pin = store.commit_promote(txn).unwrap();
     assert_eq!(on_device(&mut store, &tokens), 3);
     let run = store.cached_run(&keys);
-    assert_eq!(store.attach_run(reader, &run, 3, 16).unwrap(), 3);
+    assert_eq!(store.attach_run(reader, &run, 3).unwrap(), 3);
     store.release_reader(pin);
     store.release_working_set(reader, store.current_epoch());
     store.retire_idle();
@@ -1634,7 +1641,7 @@ fn a_persist_hint_of_a_process_that_mapped_in_a_cached_run_goes_out() {
     store.reserve(ws, 4).unwrap();
     let keys = keys_ahead(&store, ws, 0, &tokens);
     let run = store.cached_run(&keys);
-    assert_eq!(store.attach_run(ws, &run, 4, 16).unwrap(), 4);
+    assert_eq!(store.attach_run(ws, &run, 4).unwrap(), 4);
     store.release_working_set(ws, store.current_epoch());
     assert_eq!(store.persist_hints(), vec![(keys[3], 32)]);
 }

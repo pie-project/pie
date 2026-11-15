@@ -118,9 +118,11 @@ struct Spent {
     bytes: u64,
 }
 
+/// Where the rows end. What is folded is the manifest's `folded`, the one
+/// length there is; a manifest written before that carries it here as well,
+/// and it is not read.
 #[derive(Serialize, Deserialize)]
 struct SavedCursor {
-    folded: u32,
     tail: Option<u32>,
     reserved: u32,
     /// One past the highest slot written ([`Cursor::written`]); a manifest
@@ -786,7 +788,7 @@ async fn finish(
         Some((saved, bytes)) => (Some(saved), bytes),
         None => (None, Vec::new()),
     };
-    let tokens = u64::from(cursor.tail.unwrap_or(cursor.folded));
+    let tokens = cursor.tail.map_or(set.folded, u64::from);
     let bytes = spent.bytes + state_bytes.len() as u64;
     let manifest = Manifest {
         version: VERSION,
@@ -796,7 +798,6 @@ async fn finish(
         tokens,
         bytes,
         cursor: SavedCursor {
-            folded: cursor.folded,
             tail: cursor.tail,
             reserved: cursor.reserved,
             written: Some(cursor.written_end()),
@@ -952,9 +953,6 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
     .map_err(|error| failed("taking the pages in", error))?;
     let kv = KvWorkingSet::new(0, engine, id, stores.kv_page_size);
     let cursor = Cursor {
-        folded: cursor.folded,
-        folded_exact: true,
-        unsettled: 0,
         tail: cursor.tail,
         reserved: cursor.reserved,
         written: cursor.written.unwrap_or(cursor.reserved),

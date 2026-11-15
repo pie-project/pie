@@ -16,14 +16,10 @@ use crate::store::rs::RsGeometry;
 use crate::store::rs::working_set::RsWorkingSet;
 
 #[derive(Clone, Debug)]
+/// Where a working set's rows end. What it folded is not here, nor whether
+/// that is known: both are its KV working set's, one length the recurrent
+/// state follows.
 pub struct Cursor {
-    pub folded: u32,
-    /// False while a fold the host could not place at submit is on its
-    /// way: `folded` is then a lower bound.
-    pub folded_exact: bool,
-    /// Fires in flight whose fold is placed when they settle; the last to
-    /// settle makes `folded` exact again.
-    pub unsettled: u32,
     pub tail: Option<u32>,
     pub reserved: u32,
     /// One past the highest slot a fire is known to have written: a mark
@@ -124,9 +120,6 @@ pub fn lag(spans: &[(u32, u32, u32)], slot: u32) -> u32 {
 impl Default for Cursor {
     fn default() -> Self {
         Cursor {
-            folded: 0,
-            folded_exact: true,
-            unsettled: 0,
             tail: Some(0),
             reserved: 0,
             written: 0,
@@ -253,7 +246,12 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
     }
 
     async fn folded(&mut self, this: Resource<WorkingSet>) -> Result<u32> {
-        Ok(self.ctx().table.get(&this)?.cursor().folded)
+        let kv_rep = self.ctx().table.get(&this)?.kv;
+        let kv = kv_of(self, kv_rep)?;
+        let stores = store_registry::get(kv.model, kv.engine);
+        let folded =
+            store_registry::with_kv_lock(&stores.kv, "host-working-set", |s| s.folded(kv.id))?;
+        Ok(u32::try_from(folded).unwrap_or(u32::MAX))
     }
 
     async fn fork(
@@ -289,28 +287,35 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
             Some(rs) => rs.claim_pipeline_scope(&scope),
             None => Ok(()),
         });
-        if let Err(owner) = claimed {
+        if let Err(refusal) = claimed {
             return Ok(Err(format!(
-                "working set is scoped to pipeline {owner:#x}, not supplied pipeline {:#x}",
+                "working set {refusal}, not supplied pipeline {:#x}",
                 scope.id()
             )));
         }
-        // A fire on its way that folds the recurrent state by a count the
-        // device computes leaves the frozen length behind the record until
-        // it settles, and a child takes both. Those fires are this
-        // pipeline's, and only this task settles them: the fork runs them
-        // to their end first, woken as each completes. One that fails ends
-        // the wait as the pipeline's failure. A fold still unsettled then
-        // is none this task can settle (a fire the planner is finalizing,
-        // or one dropped that the engine still holds): its end wakes the
-        // fork.
+        // A fold placed when its fire settles leaves the folded length
+        // behind the device's until then, and a child takes the parent's:
+        // the fork waits for those fires. They are this pipeline's, and
+        // only this task settles them: the fork runs them to their end
+        // first, woken as each completes. One that fails ends the wait as
+        // the pipeline's failure. A fire the planner took off the queue to
+        // finalize holds the pipeline's finalize guard until it has
+        // settled: the fork takes the guard once behind it. A fold of the
+        // recurrent state still unsettled then is one dropped that the
+        // engine still holds: its end wakes the fork.
         let stores = store_registry::get(kv.model, kv.engine);
-        let unsettled = |rs: &RsWorkingSet| {
+        let unsettled =
+            store_registry::with_kv_lock(&stores.kv, "host-working-set", |s| s.unsettled(kv.id))?;
+        let device_fold = |rs: &RsWorkingSet| {
             stores.rs.lock().unwrap().device_fold_gate(rs.id)
                 == Err(crate::store::rs::RsError::DeviceFoldUnsettled)
         };
-        if let Some(rs) = rs.as_ref().filter(|rs| unsettled(rs)) {
+        let rs_unsettled = rs.as_ref().filter(|rs| device_fold(rs));
+        if unsettled > 0 || rs_unsettled.is_some() {
             crate::pipeline::fire::drain_pipeline_fires(self, &fires).await?;
+            drop(fires.finalize_guard().await);
+        }
+        if let Some(rs) = rs_unsettled {
             crate::store::rs::device_folds_settled(&stores.rs, &[rs.id]).await;
         }
         if let Some(reason) = failure.lock().unwrap().clone() {

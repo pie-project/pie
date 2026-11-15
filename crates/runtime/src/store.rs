@@ -90,20 +90,49 @@ impl PipelineScope {
     pub(crate) fn claim(
         &self,
         owner: &std::sync::Mutex<Option<PipelineScope>>,
-    ) -> Result<(), PipelineScopeId> {
+    ) -> Result<(), ScopeRefusal> {
         let mut owner = owner.lock().unwrap();
         match owner.as_ref() {
             Some(existing) if existing.id() == self.id() => Ok(()),
+            // What a fire folds is frozen from its prepare: a set whose
+            // pipeline failed holds a fold whose fire never ran.
+            Some(existing) if existing.failure().is_some() => {
+                Err(ScopeRefusal::Failed(existing.failure().unwrap_or_default()))
+            }
             Some(existing) if !self.is_closed() && existing.is_releasable() => {
                 *owner = Some(self.clone());
                 Ok(())
             }
-            Some(existing) => Err(existing.id()),
-            None if self.is_closed() => Err(self.id()),
+            Some(existing) => Err(ScopeRefusal::Held(existing.id())),
+            None if self.is_closed() => Err(ScopeRefusal::Held(self.id())),
             None => {
                 *owner = Some(self.clone());
                 Ok(())
             }
+        }
+    }
+}
+
+/// Why a working set does not join a pipeline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ScopeRefusal {
+    /// It is another pipeline's until that one closes and its fires settle.
+    Held(PipelineScopeId),
+    /// The pipeline it last fired on failed.
+    Failed(String),
+}
+
+impl std::fmt::Display for ScopeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScopeRefusal::Held(owner) => {
+                write!(formatter, "is already scoped to pipeline {owner:032x}")
+            }
+            ScopeRefusal::Failed(why) => write!(
+                formatter,
+                "last fired on a pipeline that failed ({why}): what that pipeline's fires \
+                 folded is frozen and did not run, so the set fires no more"
+            ),
         }
     }
 }

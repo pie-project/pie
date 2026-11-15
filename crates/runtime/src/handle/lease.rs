@@ -395,7 +395,7 @@ fn take_out(
             held.rs_working_sets.remove(&(rs.model, rs.engine, rs.id));
         }
     }
-    // A fire that failed left the cursor ahead of what was written.
+    // What a failed pipeline's fires folded is frozen, and they did not run.
     if let Some(why) = kv.pipeline_failure() {
         kv.release();
         if let Some(rs) = rs {

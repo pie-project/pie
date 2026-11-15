@@ -174,11 +174,17 @@ impl Held {
             let held = stores.rs.lock().unwrap().held([rs.id]);
             held.slots
         });
-        (
-            u64::from(cursor.tail.unwrap_or(cursor.folded)),
-            u64::from(cursor.folded),
-            slots,
-        )
+        let folded = self.folded();
+        (cursor.tail.map_or(folded, u64::from), folded, slots)
+    }
+
+    /// What it has folded: its KV working set's folded length.
+    fn folded(&self) -> u64 {
+        let kv = &self.parts().kv;
+        let stores = store_registry::get(kv.model, kv.engine);
+        store_registry::with_kv_lock(&stores.kv, "handle-stat", |store| {
+            store.folded(kv.id).unwrap_or(0)
+        })
     }
 
     pub(super) fn stat(&self) -> Value {
@@ -189,10 +195,11 @@ impl Held {
                 .swapped_page_count(&HashSet::from([kv.id]))
                 .unwrap_or(0)
         });
+        let folded = self.folded();
         json!({
             "state": "parked",
-            "tokens": cursor.tail.unwrap_or(cursor.folded),
-            "folded": cursor.folded,
+            "tokens": cursor.tail.map_or(folded, u64::from),
+            "folded": folded,
             "engine": kv.engine,
             "resident": swapped == 0,
             "swapped_pages": swapped,
