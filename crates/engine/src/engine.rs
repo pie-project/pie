@@ -37,6 +37,10 @@ pub struct KvWrites {
     pub pages: Vec<u32>,
     pub offsets: Vec<u32>,
     pub fold: Option<u32>,
+    /// One past the last slot the lane's rows landed at, in the set's own
+    /// slot numbering; `None` where the engine does not tell it
+    /// ([`crate::fire::rung_rows`], device geometry).
+    pub end: Option<u32>,
 }
 
 pub type CompletionSink = std::sync::Arc<dyn Fn(StepDone, StepOutcome) + Send + Sync>;

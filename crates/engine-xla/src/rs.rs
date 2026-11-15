@@ -306,6 +306,17 @@ pub struct WindowMap {
 /// Out of every buffer's range: a write there is dropped.
 pub const DROP: i32 = i32::MAX;
 
+/// The carried rows a lane replays ahead of its own, past which its window
+/// map is refused.
+///
+/// Compile-only shim (owner: XLA). `engine::fire::UNFOLDED_ROWS` is gone:
+/// the contract ([`engine::fire::rung_rows`]) has a rung's replay scratch
+/// hold the rung's tokens of carried rows, summed over a fire's lanes, and
+/// the runtime asks the rung for max(own, carried). This keeps the value
+/// the constant had until the warm ladder sizes a replay by the rung's
+/// tokens; it goes with that change.
+const UNFOLDED_ROWS: u32 = 16;
+
 impl WindowMap {
     /// The map of the window covering lanes `lane0..lane0 + lanes` whose own
     /// rows are cut by `indptr` (window-local), for rs list slots of
@@ -356,11 +367,11 @@ impl WindowMap {
             let replay = map.from_buffer.len() as i32 - begin;
             // A lane replays at most the contract's bound: a fire that asks
             // more fails here, never sizing a replay the warm ladder did not.
-            if replay > engine::fire::UNFOLDED_ROWS as i32 {
+            if replay > UNFOLDED_ROWS as i32 {
                 return Err(Fault::Ceiling {
-                    what: "carried rows a lane replays (engine::fire::UNFOLDED_ROWS)",
+                    what: "carried rows a lane replays (engine_xla UNFOLDED_ROWS)",
                     need: u64::try_from(replay).unwrap_or(0),
-                    have: u64::from(engine::fire::UNFOLDED_ROWS),
+                    have: u64::from(UNFOLDED_ROWS),
                 });
             }
             for i in 0..rows {

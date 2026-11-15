@@ -26,11 +26,85 @@ pub struct Cursor {
     pub unsettled: u32,
     pub tail: Option<u32>,
     pub reserved: u32,
+    /// One past the highest slot a fire is known to have written: a mark
+    /// that only rises, since a lane that rewinds leaves the rows it wrote
+    /// further on in its buffer, where a mask may still admit them.
+    pub written: u32,
+    /// The fires staged on the set whose rows land where the device says,
+    /// and which have not settled: where they land is not known until they
+    /// do. A fork shares them, as it does the rows they write.
+    pub staged: Vec<Arc<StagedRows>>,
     /// M-RoPE spans `(start_slot, end_slot, lag)`, `lag = token_count - position_span`.
     pub spans: Vec<(u32, u32, u32)>,
 }
 
+/// The rows of one fire on a working set that land where the device says,
+/// from its staging until it settles.
+#[derive(Debug)]
+pub struct StagedRows {
+    rows: u32,
+    settled: std::sync::OnceLock<Option<u32>>,
+}
+
+impl StagedRows {
+    #[must_use]
+    pub fn new(rows: u32) -> Arc<StagedRows> {
+        Arc::new(StagedRows {
+            rows,
+            settled: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The fire settled: its rows ended at `end`, one past the last slot
+    /// they landed at, as its engine reported; `None` where none was
+    /// reported (a fire that failed, or never ran).
+    pub fn settle(&self, end: Option<u32>) {
+        let _ = self.settled.set(end);
+    }
+}
+
 impl Cursor {
+    /// `fire` is staged on the set, its rows to land where the device says.
+    pub fn stage(&mut self, fire: Arc<StagedRows>) {
+        let (written, _) = self.standing();
+        self.written = written;
+        self.staged.retain(|fire| fire.settled.get().is_none());
+        self.staged.push(fire);
+    }
+
+    /// The written end as far as settled fires tell it, and the rows of
+    /// the fires still to settle. A fire that settled with no end reported
+    /// wrote inside what the set reserved, as every such fire does.
+    pub fn standing(&self) -> (u32, u32) {
+        let (mut written, mut staged) = (self.written, 0u32);
+        for fire in &self.staged {
+            match fire.settled.get() {
+                Some(end) => written = written.max(end.unwrap_or(self.reserved)),
+                None => staged = staged.saturating_add(fire.rows),
+            }
+        }
+        (written, staged)
+    }
+
+    /// No more than this many rows stand unfolded in the set's buffer when
+    /// a fire staged now runs, its recurrent state folded through `frozen`:
+    /// those written past `frozen` by fires that settled, and every row of
+    /// the fires still to settle ([`engine::fire::rung_rows`], device
+    /// geometry).
+    pub fn unfolded(&self, frozen: u32) -> u32 {
+        let (written, staged) = self.standing();
+        written.saturating_sub(frozen).saturating_add(staged)
+    }
+
+    /// The written end a snapshot states: what the set reserved while a
+    /// fire is still to settle.
+    pub fn written_end(&self) -> u32 {
+        match self.standing() {
+            (written, 0) => written,
+            _ => self.reserved.max(self.written),
+        }
+    }
+
     /// The last write wins from `start` on.
     pub fn rewrite(&mut self, start: u32, spans: impl IntoIterator<Item = (u32, u32, u32)>) {
         self.spans.retain(|&(from, _, _)| from < start);
@@ -55,6 +129,8 @@ impl Default for Cursor {
             unsettled: 0,
             tail: Some(0),
             reserved: 0,
+            written: 0,
+            staged: Vec::new(),
             spans: Vec::new(),
         }
     }

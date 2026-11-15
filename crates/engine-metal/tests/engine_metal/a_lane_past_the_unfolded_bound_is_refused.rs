@@ -1,6 +1,6 @@
 #![cfg(target_vendor = "apple")]
 
-//! A lane carrying more than `engine::fire::UNFOLDED_ROWS` recurrent rows
+//! A lane carrying more than `engine_metal::serve::UNFOLDED_ROWS` recurrent rows
 //! into a fire (as a device-geometry fire may: its slots are the guest's,
 //! which the runtime cannot bound) is refused by name before anything is
 //! encoded, so nothing past the rung's rs region is written: its state reads
@@ -56,7 +56,7 @@ fn a_lane_past_the_unfolded_bound_is_refused() {
         shell.serves_rs_verbs(),
         "a hybrid model buffers recurrent rows"
     );
-    let bound = engine::fire::UNFOLDED_ROWS;
+    let bound = engine_metal::serve::UNFOLDED_ROWS;
     let rows: Vec<u32> = (0..=bound).map(|at| (7 + at * 37) % 256).collect();
     let next = [42u32];
     let pages = 6;

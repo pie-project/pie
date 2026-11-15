@@ -41,8 +41,15 @@ impl Planes {
 
 /// The buffered rows a window of a body replays beside its own
 /// (`Run::rs_layout`), and a lane's share of a fire's replay tables
-/// (`inputs`): the contract's [`::engine::fire::UNFOLDED_ROWS`].
-pub const REPLAYED: u32 = ::engine::fire::UNFOLDED_ROWS;
+/// (`inputs`).
+///
+/// Compile-only shim (owner: Pie Leader). `engine::fire::UNFOLDED_ROWS` is
+/// gone: the contract ([`::engine::fire::rung_rows`]) has a rung's replay
+/// scratch hold the rung's tokens of carried rows, and the runtime asks
+/// the rung for max(own, carried). This keeps the value the constant had
+/// until the scratch, body-or-walk and the per-window regions are sized by
+/// the rung's tokens; it goes with that change.
+pub const REPLAYED: u32 = 16;
 
 /// The extended run's scratch: a run of the activation's span, a fire's
 /// rows and the buffered slots its lanes replay ahead of them, a row each
