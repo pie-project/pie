@@ -833,7 +833,7 @@ pub fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
         .collect()
 }
 
-fn rectangle(shape: &[u64]) -> (u64, u64) {
+pub(crate) fn rectangle(shape: &[u64]) -> (u64, u64) {
     match shape.split_first() {
         Some((rows, rest)) => (*rows, rest.iter().product()),
         None => (1, 1),
