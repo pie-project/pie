@@ -264,16 +264,6 @@ pub fn cap_for(shared: &Shared, rows: u32) -> u32 {
     }
 }
 
-/// The rung fires of `rows` take on `engine` now: the narrowest that holds
-/// them, and no wider than the widest rung the engine has armed
-/// ([`::engine::live`]). Every serving fire replays a captured body, so a
-/// raise to a rung whose bodies are still being captured waits on them,
-/// and fires serve at the rungs armed meanwhile.
-#[must_use]
-pub fn rung_goal(pool: &SharedPool, engine: usize, rows: u32) -> u32 {
-    pool.armed_rung_for(rows, crate::engine::live(engine).armed_through())
-}
-
 /// Raises `shared`'s rung at once to the one fires of `rows` take, where
 /// nothing lies in the larger span and the room is there (a raise that must
 /// move state is the walker's, through the engine's copy): the pass asking
@@ -282,7 +272,7 @@ pub fn rung_goal(pool: &SharedPool, engine: usize, rows: u32) -> u32 {
 pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
     let mut pool = shared.lock().unwrap();
     let rungs = pool.rungs();
-    let goal = rung_goal(&pool, engine, rows);
+    let goal = pool.rung_for(rows);
     let lifted = |rung: u32| {
         if rungs.last() == Some(&rung) {
             u32::MAX
@@ -1565,28 +1555,6 @@ impl SharedPool {
             })
     }
 
-    /// Whether every slot of a lease lies below the activation span: kv
-    /// list refs `pages`, then a record's pieces `records` (fixed shapes
-    /// in order). A lowered rung lends the span's chunks to state, and a
-    /// raise takes them back while a step's capture may run on them.
-    #[must_use]
-    pub fn below_span(&self, pages: &[u32], records: &[u32]) -> bool {
-        let span = self.pool.total_chunks() - self.pool.act_max();
-        let under = |shape: ShapeId, slot_ref: u32| {
-            let chunk = self.slot(shape, slot_ref).chunk;
-            self.pool
-                .physical(chunk)
-                .is_some_and(|physical| physical < span)
-        };
-        let list = self.list.map(|list| list.pool);
-        let pages_under = list.is_none_or(|list| pages.iter().all(|&r| under(list, r)));
-        let mut pieces = records.iter();
-        let records_under = self.fixed.iter().all(|shape| {
-            (0..shape.pieces).all(|_| pieces.next().is_none_or(|&r| under(shape.pool, r)))
-        });
-        pages_under && records_under
-    }
-
     /// The engine holds `bytes` of the range it stated back
     /// ([`::engine::live::Live::held`]): no state chunk is opened in the
     /// top `bytes` of the span below the activation, which the engine binds
@@ -1631,24 +1599,6 @@ impl SharedPool {
         let top_start = self.pool.top_segment() * seg;
         let prefix_end = (self.ceiling_for(bytes) / seg * seg).min(top_start);
         u64::from(prefix_end + (total - top_start)) * self.pool.chunk_bytes()
-    }
-
-    /// [`Self::rung_for`], no wider than `armed` (a rung's tokens): the
-    /// widest rung armed at or under it, else the smallest.
-    #[must_use]
-    pub fn armed_rung_for(&self, rows: u32, armed: u32) -> u32 {
-        let goal = self.rung_for(rows);
-        if goal <= armed {
-            return goal;
-        }
-        let rungs = self.pool.rungs();
-        rungs
-            .iter()
-            .copied()
-            .filter(|&rung| rung <= armed)
-            .max()
-            .or_else(|| rungs.first().copied())
-            .unwrap_or(goal)
     }
 
     /// The smallest rung whose fires carry `rows`, the largest past every

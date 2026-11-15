@@ -95,9 +95,8 @@ impl SharedGrow {
     /// past it, until there or until a step has to wait: caps fires, lowers
     /// the pool's rung once no wider fire is in flight, or raises it, the
     /// engine first copying the state out of the larger span. A raise short
-    /// of room waits on the room the asking pass has the planner free; one
-    /// to a rung the engine has not armed waits on its capture
-    /// ([`super::rung_goal`]), the walk looking again each poll.
+    /// of room waits on the room the asking pass has the planner free, the
+    /// walk looking again each poll.
     /// The rows the walk holds the rung to: what passes and decode batches
     /// ask ([`super::wanted_rows`]), and never fewer than the lanes live now
     /// (a live process each, at most the engine's lane count), whose decode
@@ -123,7 +122,7 @@ impl SharedGrow {
                 if pool.copying().is_some() {
                     return;
                 }
-                let goal = super::rung_goal(&pool, self.engine, self.walk_rows());
+                let goal = pool.rung_for(self.walk_rows());
                 // The pool stands past what is asked: it comes down only
                 // once it has for the governor's patience, so a pause
                 // between batches moves no rung. On a span backed on

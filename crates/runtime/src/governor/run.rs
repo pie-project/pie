@@ -185,8 +185,8 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
         steer.turn(&mut pool, Some(Pressure::Calm), &mut |_| {});
         read_ledger(&pool, engine);
         // Chunks are handed out of mapped segments only: a pool mapped
-        // past its limit is what lets a sequence or a lease onto chunks the
-        // engine still holds.
+        // past its limit is what lets a sequence onto chunks the engine
+        // still holds.
         // `mapped`: the bytes under the pool's mapped segments.
         let (mapped, hard_limit) = (pool.held(), steer.governor().limits().hard_limit);
         let past = shared && mapped > hard_limit;

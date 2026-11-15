@@ -781,18 +781,6 @@ fn a_raise_by_demand_says_what_it_lacks_and_moves_the_rest() {
     assert_eq!(pool.rung_for(16), 16);
     assert_eq!(pool.rung_for(17), 256);
     assert_eq!(pool.rung_for(5000), 2048, "past every rung: the largest");
-    assert_eq!(
-        pool.armed_rung_for(5000, 256),
-        256,
-        "a rung still being captured is not offered"
-    );
-    assert_eq!(pool.armed_rung_for(17, 256), 256);
-    assert_eq!(
-        pool.armed_rung_for(17, 0),
-        16,
-        "the smallest is always served"
-    );
-    assert_eq!(pool.armed_rung_for(5000, u32::MAX), 2048);
     pool.lower_rung(16).unwrap();
     assert_eq!(
         pool.raise_short(2048),
@@ -885,66 +873,10 @@ fn rungs_sharing_their_chunks_are_one_class_the_walk_never_moves_within() {
     ));
 }
 
-/// What an arming step is lent comes from the allocators sequences take
-/// from, named as a lane names them: a record by its pieces' slot refs, a
-/// kv page by its list slot ref; none lies in the null chunk, which the
-/// engine refuses a ref into.
-#[test]
-fn a_lent_record_and_lent_pages_name_no_slot_in_the_null_chunk() {
-    let mut facts = facts();
-    facts.shapes.retain(|shape| shape.id != RING);
-    facts.validate().unwrap();
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
-    let mut rs = crate::store::rs::RsStore::shared(&shared, None);
-    let grant = rs
-        .reserve(crate::store::rs::RsUnits::of(1, 0))
-        .expect("a record");
-    assert_eq!(grant.slots, [crate::store::rs::RsSlotId(0)], "store id 0");
-    let refs = rs.device_refs(&grant.slots);
-    let pool = shared.lock().unwrap();
-    let reserved = pool.pool().reserved_chunks();
-    assert!(reserved >= 1, "chunk 0 is the null chunk");
-    let mut at = 0;
-    for fixed in pool.fixed() {
-        let spc = pool.pool().shape(fixed.pool).unwrap().slots_per_chunk;
-        for _ in 0..fixed.pieces {
-            let chunk = refs[at] / spc;
-            assert!(
-                chunk >= reserved,
-                "piece ref {} lies in chunk {chunk}",
-                refs[at]
-            );
-            at += 1;
-        }
-    }
-    assert_eq!(at, refs.len(), "one record, every piece");
-    let list = pool.list().expect("a kv list");
-    drop(pool);
-    let mut pages =
-        crate::store::chunks::ShapePool::<crate::store::kv::page_table::PhysicalKvPageId>::shared(
-            &shared, list,
-        );
-    let spc = shared
-        .lock()
-        .unwrap()
-        .pool()
-        .shape(list.pool)
-        .unwrap()
-        .slots_per_chunk;
-    for page in pages.try_alloc_n(64).expect("pages") {
-        assert!(
-            page.0 / spc >= reserved,
-            "page {} lies in the null chunk",
-            page.0
-        );
-    }
-    rs.release_reservation(grant);
-}
-
 /// While the engine holds back part of the range it stated, no slot it
-/// binds none of is handed out, to a sequence or an arming lease alike:
-/// every ref lies in a committed segment, past the null chunk and below
-/// the span held back; once it holds none, the rest opens.
+/// binds none of is handed out: every ref lies in a committed segment,
+/// past the null chunk and below the span held back; once it holds none,
+/// the rest opens.
 #[test]
 fn no_slot_is_handed_out_past_what_the_engine_binds() {
     let facts = facts();

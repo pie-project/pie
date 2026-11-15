@@ -179,7 +179,7 @@ pub fn lives() -> Vec<::engine::live::Live> {
 }
 
 /// What engine `engine_id` learns of itself while it serves
-/// ([`::engine::Engine::live`]); every rung armed for an engine not
+/// ([`::engine::Engine::live`]); nothing measured for an engine not
 /// registered.
 #[must_use]
 pub fn live(engine_id: usize) -> ::engine::live::Live {
