@@ -645,6 +645,10 @@ where
         self.next_frame = self.next_frame.wrapping_add(1);
 
         self.pending = None;
+        // The frame before can no longer be asked for its rows.
+        if let Some(shell) = self.shell.as_mut() {
+            shell.open_frame();
+        }
 
         let mut steps = Vec::with_capacity(frame.steps.len());
         tracing::debug!(

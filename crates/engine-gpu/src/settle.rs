@@ -22,6 +22,12 @@ impl Airborne {
         self.counts.issued.fetch_add(1, Ordering::AcqRel)
     }
 
+    /// The steps entered so far: the sequence the next one takes.
+    #[must_use]
+    pub fn entered(&self) -> u64 {
+        self.counts.issued.load(Ordering::Acquire)
+    }
+
     pub fn leave(&self) {
         self.counts.settled.fetch_add(1, Ordering::Release);
     }
