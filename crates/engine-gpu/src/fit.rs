@@ -21,8 +21,11 @@
 //!
 //! A context the model declares, where the operator states none, is
 //! shortened to the longest at which one sequence's working set fits the
-//! same share ([`engine::fit::pages_within`]); a stated one is taken as it
-//! is, and refused by name where it does not fit.
+//! same share ([`engine::fit::pages_within`]) and the load's own pool seats
+//! it beside the least fire the load may take (the floor's, or the stated
+//! rung's): what the pool's segments bind and its index addresses holds a
+//! context as it holds a rung. A stated one is taken as it is, and refused
+//! by name where it does not fit.
 //!
 //! This is the load's alone: nothing shrinks a fire or a context once the
 //! load has them. The load says once what it fitted and what held each
@@ -280,14 +283,14 @@ pub fn rung(
 /// where the load states it (`declared` false) or its state is budgeted
 /// (`fitted` false); else the longest at or under `asked`, in pages of
 /// `page` tokens and never under one, at which one sequence's working set
-/// (`probe`, `None` where it is not planned) fits `share`.
+/// (`probe`: its bytes, or why the load does not lay it) fits `share`.
 pub fn context(
     asked: u32,
     declared: bool,
     fitted: bool,
     page: u32,
     share: u64,
-    probe: impl Fn(u32) -> Option<u64>,
+    probe: impl Fn(u32) -> Probe,
 ) -> (u32, Stop) {
     if !declared {
         return (asked, Stop::Stated);
@@ -298,15 +301,17 @@ pub fn context(
     let page = u64::from(page.max(1));
     let tokens = |pages: u64| u32::try_from(pages.saturating_mul(page)).unwrap_or(u32::MAX);
     let whole = u64::from(asked).div_ceil(page);
-    let pages = engine::fit::pages_within(whole, share, |pages| {
-        probe(tokens(pages)).unwrap_or(u64::MAX)
+    let pages = engine::fit::pages_within(whole, share, |pages| match probe(tokens(pages)) {
+        Probe::Takes(bytes) => bytes,
+        Probe::Pool | Probe::Plan => u64::MAX,
     });
     if pages >= whole {
         return (asked, Stop::Model);
     }
     let stop = match probe(tokens(pages + 1)) {
-        Some(_) => Stop::Share,
-        None => Stop::Plan,
+        Probe::Takes(_) => Stop::Share,
+        Probe::Pool => Stop::Pool,
+        Probe::Plan => Stop::Plan,
     };
     // Never under one page: a device with no room for that is refused by
     // the load, by what one working set takes.
@@ -362,7 +367,7 @@ pub fn budgets<B: Serve>(
             false,
             budgets.page_size,
             0,
-            |_| None,
+            |_| Probe::Plan,
         );
         say(
             device.name(),
@@ -487,28 +492,6 @@ pub fn budgets<B: Serve>(
         ..budgets.clone()
     };
 
-    let (context, context_stop) = context(
-        budgets.max_context,
-        budgets.context_declared,
-        fits_context,
-        budgets.page_size,
-        share,
-        |context| {
-            state(&at(asked_tokens, context))
-                .ok()
-                .map(|(.., least)| least)
-        },
-    );
-    if context < budgets.max_context {
-        tracing::warn!(
-            declared = budgets.max_context,
-            serving = context,
-            "the model declares a context one sequence of which takes more than a fire's \
-             share of what the device has left past the weights; serving a shorter one. \
-             State `[engine] max_context` to choose."
-        );
-    }
-
     // The widest run a fire of `tokens` carries whole, in token rows: one
     // where the model reads text alone, else the widest image the patch
     // ladder admits there, a token row a patch at most (how many patches
@@ -516,9 +499,45 @@ pub fn budgets<B: Serve>(
     // read it). A clip's rows are its request's: the voxel ladder is
     // fitted to memory and states no widest one.
     let run = |tokens: u32| {
-        crate::api::patch_ladder(trace, &at(tokens, context)).map_or(1, |ladder| ladder.max_patches)
+        crate::api::patch_ladder(trace, &at(tokens, budgets.max_context))
+            .map_or(1, |ladder| ladder.max_patches)
     };
     let carried = floor(asked_tokens, run);
+    // The least fire the load may take: the floor's where the rung is
+    // fitted, the stated rung's where it is not.
+    let least_tokens = if fits_tokens { carried } else { asked_tokens };
+
+    // One sequence's working set fits the share, and the load's own pool
+    // seats it beside the least fire: a context the pool does not hold is
+    // no rung's to make up.
+    let (context, context_stop) = context(
+        budgets.max_context,
+        budgets.context_declared,
+        fits_context,
+        budgets.page_size,
+        share,
+        |context| {
+            let Ok((.., least)) = state(&at(asked_tokens, context)) else {
+                return Probe::Plan;
+            };
+            match fire(&at(least_tokens, context)) {
+                Probe::Takes(_) => Probe::Takes(least),
+                held => held,
+            }
+        },
+    );
+    if context < budgets.max_context {
+        tracing::warn!(
+            declared = budgets.max_context,
+            serving = context,
+            held = %context_stop,
+            "the model declares a context one sequence of which this device does not hold \
+             (`held`: a fire's share of what it has left past the weights, or what the \
+             load's pool seats); serving a shorter one. State `[engine] max_context` to \
+             choose."
+        );
+    }
+
     // A fire has its share of what the weights leave, as on the cuda
     // shell; a device that does not hold the floor's is refused by the
     // load, by name.
@@ -596,7 +615,7 @@ mod tests {
     /// it is shortened, why the next page was not taken.
     #[test]
     fn a_context_names_what_stopped_it() {
-        let takes = |context: u32| Some(u64::from(context) * 1000);
+        let takes = |context: u32| Probe::Takes(u64::from(context) * 1000);
         assert_eq!(
             context(4096, false, true, 16, 0, takes),
             (4096, Stop::Stated)
@@ -613,12 +632,82 @@ mod tests {
             context(40_960, true, true, 16, 8200 * 1000, takes),
             (8192, Stop::Share)
         );
-        let planned = |context: u32| if context > 4096 { None } else { takes(context) };
+        let planned = |context: u32| {
+            if context > 4096 {
+                Probe::Plan
+            } else {
+                takes(context)
+            }
+        };
         assert_eq!(
             context(40_960, true, true, 16, ROOMY, planned),
             (4096, Stop::Plan)
         );
+        let seated = |context: u32| {
+            if context > 2048 {
+                Probe::Pool
+            } else {
+                takes(context)
+            }
+        };
+        assert_eq!(
+            context(40_960, true, true, 16, ROOMY, seated),
+            (2048, Stop::Pool)
+        );
         assert_eq!(context(40_960, true, true, 16, 0, takes), (16, Stop::Share));
+    }
+
+    /// A model that declares a context one sequence of which fits a fire's
+    /// share and not the pool (the kernels' index addresses 8 GiB of state,
+    /// the share is 16 GiB): the context is shortened to the longest the
+    /// load's pool seats beside the least fire, the load's pool stands
+    /// there, and a rung is fitted beside it. Fitted to the share alone the
+    /// context holds no rung: the halving reaches one token and the load is
+    /// refused.
+    #[test]
+    fn a_context_the_pool_does_not_seat_is_shortened_to_one_it_does() {
+        const CHUNK: u64 = 2_304_000;
+        const BINDING: u64 = 4095 * MIB;
+        const PAGE: u32 = 16;
+        let left = 32 * 1024 * MIB;
+        let share = left / 2;
+        // A chunk holds one sequence's state of 9 tokens; a token of a fire
+        // takes 64 KiB of span.
+        let least = |context: u32| context.div_ceil(9) + 2;
+        let act =
+            |tokens: u32| u32::try_from((u64::from(tokens) * 65_536).div_ceil(CHUNK)).unwrap();
+        let fire = |tokens: u32, context: u32| {
+            takes(left, None, CHUNK, act(tokens), 0, least(context), BINDING)
+        };
+        let set = |context: u32| u64::from(least(context)) * CHUNK;
+
+        // The share alone: 16 GiB of one sequence, which no rung's pool
+        // seats, so the halving ends at one token and the load refuses.
+        let (by_share, stop) = context(262_144, true, true, PAGE, share, |context| {
+            Probe::Takes(set(context))
+        });
+        assert_eq!(stop, Stop::Share);
+        assert!(set(by_share) > 8 * 1024 * MIB);
+        assert_eq!(
+            rung(0, 32_768, 1, share, |tokens| fire(tokens, by_share)),
+            (1, Stop::Pool)
+        );
+        assert!(pool(left, None, CHUNK, act(1), least(by_share), BINDING).is_err());
+
+        // Beside the least fire (one token): the longest the pool seats.
+        let seated = |context: u32| match fire(1, context) {
+            Probe::Takes(_) => Probe::Takes(set(context)),
+            held => held,
+        };
+        let (fitted, stop) = context(262_144, true, true, PAGE, share, seated);
+        assert_eq!(stop, Stop::Pool);
+        assert!(fitted < by_share);
+        assert!(pool(left, None, CHUNK, act(1), least(fitted), BINDING).is_ok());
+        assert!(pool(left, None, CHUNK, act(1), least(fitted + PAGE), BINDING).is_err());
+        // A rung is fitted beside it, and the load's pool stands there.
+        let (tokens, _) = rung(0, 32_768, 1, share, |tokens| fire(tokens, fitted));
+        assert!(tokens > 1, "{tokens}");
+        assert!(pool(left, None, CHUNK, act(tokens), least(fitted), BINDING).is_ok());
     }
 
     /// A hybrid whose replay scratch is ten times its span, on a device
