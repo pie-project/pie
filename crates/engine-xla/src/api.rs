@@ -178,6 +178,13 @@ impl Xla {
         self.shell.as_mut()
     }
 
+    /// Guest passes so far: those run on the device, those the host
+    /// interpreted.
+    #[must_use]
+    pub fn guest_passes(&self) -> (u64, u64) {
+        self.programs.tally()
+    }
+
     #[must_use]
     pub fn capabilities(&self) -> Option<&Capabilities> {
         self.caps.as_ref()
@@ -672,6 +679,19 @@ impl Engine for Xla {
         )))
     }
 
+    /// A registered channel an instance may carry or feed on the device
+    /// keeps its ring in the pool's `Channel` slots, the rows every instance
+    /// bound to it reads; one only the host reads or writes takes none.
+    fn ring_facts(
+        &self,
+        registration: &ChannelRegistration,
+    ) -> EngineResult<Option<engine::program::RingFacts>> {
+        if self.shell.is_none() {
+            return Ok(None);
+        }
+        Ok(crate::program::Plane::ring_facts(registration))
+    }
+
     fn register_channel(
         &mut self,
         registration: &ChannelRegistration,
@@ -695,9 +715,9 @@ impl Engine for Xla {
         Ok(self.programs.fire_facts(program, load_temp))
     }
 
-    /// An instance's carried rings moved to fresh `Channel` slots (a park
-    /// and its return): its cells are read and written there from now on.
-    /// XLA keeps no registered channel's ring in the pool.
+    /// An instance's carried rings, or a registered channel's ring, moved to
+    /// fresh `Channel` slots (a park and its return): the cells are read and
+    /// written there from now on, by every instance bound to them.
     fn rebind_slots(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
         match rebind {
             engine::program::Rebind::Instance {
@@ -717,7 +737,13 @@ impl Engine for Xla {
                 let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));
                 self.programs.rebind(id, &rings, &cell_row).map_err(refusal)
             }
-            engine::program::Rebind::Channel { .. } => Ok(()),
+            engine::program::Rebind::Channel { id, slots } => {
+                let shell = self.shell.as_ref();
+                let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));
+                (self.programs)
+                    .rebind_channel(id, &slots, &cell_row)
+                    .map_err(refusal)
+            }
         }
     }
 
@@ -763,6 +789,12 @@ impl Engine for Xla {
     fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
         if let (Some(held), Some(shell)) = (self.adapters.remove(&id), self.shell.as_mut()) {
             shell.release_adapter(id, held);
+        }
+        if let Some(shell) = self.shell.as_mut() {
+            let (_, pool) = shell.device_and_pool();
+            self.programs
+                .flush_for_close(id, pool.as_ref())
+                .map_err(refusal)?;
         }
         self.programs.close_instance(id).map_err(refusal)?;
         Ok(0)
