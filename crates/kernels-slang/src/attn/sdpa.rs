@@ -559,11 +559,8 @@ pub fn prefill(
     let keys = window
         .map_or(keys, |window| keys.min(u64::from(window)))
         .max(1);
-    let rows = match tactic.prefill_work {
-        0 => shape.rows,
-        work => (work / keys).min(u64::from(shape.rows)) as u32,
-    };
-    let step = (rows / tile).max(1);
+    let keys = Keys::Held(keys).or_most(ctx.naming().is_some());
+    let step = prefill_step(tactic.prefill_work, shape.rows, tile, keys);
     for first in (0..tiles).step_by(step as usize) {
         let mut args = args.clone();
         args.push(stated(OP, first)?.arg());
@@ -578,9 +575,87 @@ pub fn prefill(
     Ok(())
 }
 
+/// The keys a prefill's rows attend: what the fire's tables hold, or the
+/// most a fire may bring, which a naming sink is told.
+#[derive(Clone, Copy, Debug)]
+enum Keys {
+    Held(u64),
+    Most,
+}
+
+impl Keys {
+    fn or_most(self, naming: bool) -> Keys {
+        if naming { Keys::Most } else { self }
+    }
+}
+
+/// Tiles of `tile` rows one prefill dispatch holds, of a fire's `rows`:
+/// every one where `work` (rows times keys a dispatch may take; 0 for no
+/// bound) holds the fire's rows at `keys`, else as many whole tiles as it
+/// holds rows, one at least. At the most keys a fire may bring a budget past
+/// 0 holds one tile a dispatch: the longest way its rows can take.
+fn prefill_step(work: u64, rows: u32, tile: u32, keys: Keys) -> u32 {
+    let tiles = rows.div_ceil(tile).max(1);
+    let held = match (work, keys) {
+        (0, _) => return tiles,
+        (_, Keys::Most) => return 1,
+        (work, Keys::Held(keys)) => work / keys.max(1),
+    };
+    if held >= u64::from(rows) {
+        tiles
+    } else {
+        (held as u32 / tile).max(1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dispatches a prefill of `rows` makes at `step` tiles each.
+    fn dispatches(rows: u32, tile: u32, step: u32) -> u32 {
+        rows.div_ceil(tile).max(1).div_ceil(step)
+    }
+
+    /// With no work budget a prefill holds its rows in one dispatch, at
+    /// every row count and keys, a tile filled or not; with one, the
+    /// dispatches grow with the rows and never past what a naming sink is
+    /// told, the longest way the rows can take.
+    #[test]
+    fn a_prefill_dispatches_as_its_budget_says_and_names_its_longest_way() {
+        for tile in [8, 16, 32] {
+            for rows in 1..=4096 {
+                for keys in [1, 512, 40_960] {
+                    let step = prefill_step(0, rows, tile, Keys::Held(keys));
+                    assert_eq!(dispatches(rows, tile, step), 1, "{rows} rows of {tile}");
+                }
+                assert_eq!(
+                    dispatches(rows, tile, prefill_step(0, rows, tile, Keys::Most)),
+                    1
+                );
+            }
+        }
+        let work = 1 << 20;
+        for tile in [8, 16, 32] {
+            for keys in [1u64, 64, 512, 4096, 40_960, 1 << 21] {
+                let mut before = 0;
+                for rows in 1..=4096 {
+                    let made =
+                        dispatches(rows, tile, prefill_step(work, rows, tile, Keys::Held(keys)));
+                    let named = dispatches(rows, tile, prefill_step(work, rows, tile, Keys::Most));
+                    assert!(
+                        made >= before,
+                        "{rows} rows at {keys} keys: {made} after {before}"
+                    );
+                    assert!(
+                        made <= named,
+                        "{rows} rows at {keys} keys: {made} past {named}"
+                    );
+                    before = made;
+                }
+            }
+        }
+    }
 
     /// A decode's kernels are named before any fire, as the fire names
     /// them: the whole walk and the split one, their LSE forms, at the
