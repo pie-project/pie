@@ -117,6 +117,42 @@ pub fn sampler_values(stage: &CompiledStage, region: &Region) -> Option<SamplerV
     })
 }
 
+/// The results of a sampler region's nodes that its kernel never touches:
+/// it reads and writes its [`SamplerValues`] alone, so a value its nodes
+/// compute between them that is none of those, and that nothing past the
+/// region reads, is neither written nor read.
+#[must_use]
+pub fn untouched_values(stage: &CompiledStage, region: &Region) -> alloc::vec::Vec<u32> {
+    let mut untouched = alloc::vec::Vec::new();
+    let Some(values) = sampler_values(stage, region) else {
+        return untouched;
+    };
+    let touched = [
+        values.logits,
+        values.threshold,
+        values.state,
+        values.probs,
+        values.keep,
+        values.token,
+    ];
+    let ops: alloc::vec::Vec<OpView> = OpView::of_all(&stage.normalized.ops);
+    let bases = result_bases(&ops);
+    for node in &region.nodes {
+        let index = node.index();
+        let (Some(op), Some(&base)) = (ops.get(index), bases.get(index)) else {
+            continue;
+        };
+        for value in base..base.saturating_add(op.results) {
+            let read_past = region.outputs.contains(&value)
+                || region.sinks.iter().any(|sink| sink.value == value);
+            if !touched.contains(&value) && !read_past {
+                untouched.push(value);
+            }
+        }
+    }
+    untouched
+}
+
 pub fn emit_sampler_region(
     dialect: Dialect,
     entry_name: &str,

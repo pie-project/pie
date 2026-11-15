@@ -52,8 +52,10 @@ pub use registry::{
     Program, Registry,
 };
 pub use scratch::{
-    ALIGN as SCRATCH_ALIGN, Layout, Lifetime, MAX_BYTES as SCRATCH_MAX_BYTES, layout,
-    layout_reusing,
+    ALIGN as SCRATCH_ALIGN, DUMMY_BYTES as SCRATCH_DUMMY_BYTES, Launch, Launches, Layout, Lifetime,
+    MAX_BYTES as SCRATCH_MAX_BYTES, POISON as SCRATCH_POISON, SELECT_RESERVE, TooLarge,
+    describe_launched, lay_out, layout, layout_reusing, read_only_unlaunched, region_rows,
+    value_lifetimes, whole_value_temporaries,
 };
 pub use stage_cache::{Lookup, Stages};
 pub use status::{

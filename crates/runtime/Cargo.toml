@@ -145,6 +145,8 @@ wgpu = ["dep:engine-wgpu", "engine-wgpu/wgpu", "dep:wgpu"]
 xla = ["dep:engine-xla"]
 cerebras = ["dep:engine-cerebras"]
 profile-fire = []
+# Test fills of memory nothing should read (engine-cuda's).
+test-slot-fill = ["engine-cuda?/test-slot-fill"]
 
 [dev-dependencies]
 tempfile = "3"

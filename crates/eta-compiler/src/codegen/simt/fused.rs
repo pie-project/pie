@@ -139,13 +139,6 @@ pub(crate) struct GumbelChain {
     pub(crate) noise: u32,
 }
 
-pub static GUMBEL_DIRECT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(true);
-
-fn gumbel_direct_enabled() -> bool {
-    GUMBEL_DIRECT.load(core::sync::atomic::Ordering::Relaxed)
-}
-
 pub(crate) fn analyze_direct_argmax(
     stage: &CompiledStage,
     region: &Region,
@@ -198,8 +191,7 @@ pub(crate) fn analyze_direct_argmax(
         let mut expected_consumer = node as u32;
         let mut chain: Vec<u32> = Vec::new();
         let mut gumbel: Option<(u32, Option<u32>, u32)> = None;
-        if gumbel_direct_enabled()
-            && single_consumer(value, node as u32)
+        if single_consumer(value, node as u32)
             && ops[producers[value as usize] as usize].tag == tags::ADD
         {
             let add = producers[value as usize];
@@ -354,18 +346,12 @@ pub(crate) fn row_kinds(stage: &CompiledStage, region: &Region, geometry: (u64, 
 /// small vector (an RNG state, a top-k list), not a row.
 const SINGLE_ROW_WIDTH: u32 = 64;
 
-/// Whether a single-row region streams (off: op by op, as before).
-pub static SINGLE_ROW_STREAMS: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(true);
-
 /// Row kinds of a region that is one row — a decode lane's sampler, its
 /// values vocabulary-wide rows and scalars: every value `[1, .., 1, W]` of a
 /// wide static `W` is the row, every one-element value a scalar. `None` if
 /// the region has no such row.
 fn single_row_kinds(stage: &CompiledStage, region: &Region) -> Option<Vec<u8>> {
-    if region.kind != crate::plan::RegionKind::Generated
-        || !SINGLE_ROW_STREAMS.load(core::sync::atomic::Ordering::Relaxed)
-    {
+    if region.kind != crate::plan::RegionKind::Generated {
         return None;
     }
     // These index a value's leading axes, which a row's descriptor drops.
@@ -415,6 +401,30 @@ pub(crate) fn stream_rows(stage: &CompiledStage, region: &Region) -> Option<Vec<
         Some(geometry) => Some(row_kinds(stage, region, geometry)),
         None => single_row_kinds(stage, region),
     }
+}
+
+/// Whether a region's kernel leaves `node` out: an operand of an argmax
+/// that scans the model's row where it lies (`skipped`), so nothing writes
+/// its result. A reshape among them is still met, the view or the copy it
+/// is.
+pub(super) fn left_out(skipped: &[u8], ops: &[OpView], node: usize) -> bool {
+    skipped[node] != 0 && ops[node].tag != tags::RESHAPE
+}
+
+/// Whether `op` is a reshape `region`'s kernel copies nothing for: its
+/// result (`base`) is its source's bytes, and the kernel reads them there.
+pub(super) fn is_view(stage: &CompiledStage, region: &Region, op: &OpView, base: u32) -> bool {
+    op.tag == tags::RESHAPE
+        && !op.args.is_empty()
+        && !region.outputs.contains(&base)
+        && crate::codegen::alias::covers(&stage.normalized.value_types, op.args[0], base)
+}
+
+/// Whether `node` is an argmax `region`'s kernel scans from the model's
+/// row, its operand's bytes in scratch unread.
+pub(super) fn scans_model_row(direct: &ArgmaxScan, ops: &[OpView], node: usize) -> bool {
+    ops[node].tag == tags::REDUCE_ARGMAX
+        && (direct.gumbel[node].is_some() || direct.intrinsic[node] != u16::MAX)
 }
 
 pub fn emit_fused_region(
@@ -567,7 +577,7 @@ pub fn emit_fused_region(
         at += 1;
         let op = &ops[node];
         let base = bases[node];
-        if skipped[node] != 0 && op.tag != tags::RESHAPE {
+        if left_out(&skipped, &ops, node) {
             continue;
         }
         if let Some(streams) = &streams {
@@ -582,11 +592,7 @@ pub fn emit_fused_region(
                 continue;
             }
         }
-        if op.tag == tags::RESHAPE
-            && !op.args.is_empty()
-            && !region.outputs.contains(&base)
-            && crate::codegen::alias::covers(&stage.normalized.value_types, op.args[0], base)
-        {
+        if is_view(stage, region, op, base) {
             aliases.elide(base, op.args[0]);
             continue;
         }

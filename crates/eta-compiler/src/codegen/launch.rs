@@ -272,31 +272,49 @@ pub const fn reduction_floats(width: u64) -> u64 {
 }
 
 /// The bytes a block of the generated region `region` keeps in its
-/// temporary arena over rows at most `widest` wide: [`reduction_floats`] for
-/// each f32 reduction it holds, which a row stream may hold all at once,
-/// each at its own slot.
+/// temporary arena over rows at most `widest` wide, which only its sums,
+/// maxima and minima do: [`reduction_floats`] for each over f32, which a
+/// row stream may hold all at once, each at its own slot; the row's own
+/// words for one over integers, which the interpreter folds in place, one
+/// after another.
 #[must_use]
 pub fn generated_temporary_bytes(
     plan: &LaunchStagePlan,
     region: &LaunchRegion,
     widest: u64,
 ) -> u64 {
-    let reductions = region
+    let (mut floats, mut integers) = (0u64, false);
+    for op in region
         .nodes
         .iter()
         .filter_map(|&node| plan.ops.get(node as usize))
-        .filter(|op| {
-            matches!(
-                op.tag,
-                tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN
-            ) && op
-                .args
-                .first()
-                .and_then(|&value| plan.value_types.get(value as usize))
-                .is_some_and(|value| value.dtype == Dtype::F32)
-        })
-        .count() as u64;
-    4 * reduction_floats(widest) * reductions.max(1)
+    {
+        if !matches!(
+            op.tag,
+            tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN
+        ) {
+            continue;
+        }
+        let float = op
+            .args
+            .first()
+            .and_then(|&value| plan.value_types.get(value as usize))
+            .is_some_and(|value| value.dtype == Dtype::F32);
+        if float {
+            floats += 1;
+        } else {
+            integers = true;
+        }
+    }
+    let streamed = 4u64
+        .saturating_mul(reduction_floats(widest))
+        .saturating_mul(floats);
+    let folded = if integers {
+        widest.saturating_mul(4)
+    } else {
+        0
+    };
+    streamed.max(folded)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

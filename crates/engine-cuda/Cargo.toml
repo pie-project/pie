@@ -60,6 +60,11 @@ rocm = ["device", "dep:kernels-rocm", "kernels-rocm/rocm"]
 # A device runtime, either one; enable `cuda` or `rocm`.
 device = []
 
+# Fills memory nothing should read before a launch (a guest lane's dummy
+# bytes), so a kernel that does read it answers wrongly where a golden
+# sees it. Off, no build writes those bytes.
+test-slot-fill = []
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
 

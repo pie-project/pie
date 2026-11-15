@@ -29,5 +29,8 @@ tracing = "0.1"
 memmap2 = "0.9"
 libc = "0.2"
 
+[dev-dependencies]
+eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }
+
 [lints]
 workspace = true

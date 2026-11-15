@@ -42,6 +42,7 @@ cerebras = ["runtime/cerebras"]
 nixl = ["dep:transport", "transport/nixl", "engine-cpu?/nixl"]
 
 profile-fire = ["runtime/profile-fire"]
+test-slot-fill = ["runtime/test-slot-fill"]
 
 [dependencies]
 units = { path = "../units" }
