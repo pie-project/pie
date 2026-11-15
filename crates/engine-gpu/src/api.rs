@@ -581,6 +581,25 @@ where
         self.programs.facts(program, &place(shell)).map_err(refusal)
     }
 
+    /// A program reading captured attention scores takes the capture
+    /// planes' rows for its lanes beside the fire's carve, in the span.
+    fn fire_facts(
+        &self,
+        program: ProgramId,
+        _extents: &engine::BindExtents,
+    ) -> EngineResult<engine::FireFacts> {
+        let (Some(shell), Some(package)) = (self.shell.as_ref(), self.programs.package(program))
+        else {
+            return Ok(engine::FireFacts::default());
+        };
+        Ok(shell.capture_term(
+            package
+                .values
+                .iter()
+                .filter_map(|value| Some((value.output.as_deref()?, value.lane))),
+        ))
+    }
+
     fn ring_facts(
         &self,
         registration: &ChannelRegistration,

@@ -22,7 +22,7 @@ use crate::backend::{Backend, Buffer as _, Context as _, Frame as _, Pending as 
 use crate::error::{Fault, Result};
 use crate::handles::Handles;
 use crate::inputs::Inputs;
-use crate::run::{CacheGeometry, CacheTable, FireBindings, FireTables, Run, SlotTable};
+use crate::run::{CacheGeometry, CacheTable, FireBindings, FireTables, Run, Scored, SlotTable};
 use crate::settle::{Airborne, Arms, Done};
 use crate::store::Pools;
 use crate::store::kv::{self, Paging, Seat};
@@ -519,6 +519,9 @@ struct ReadoutPlane {
     width: u32,
     dtype: Dtype,
     voxels: bool,
+    /// Whether its values are capture planes, which hold a row for each of
+    /// a fire's capturing lanes and none for the others ([`Scored`]).
+    captured: bool,
 }
 
 impl ReadoutPlane {
@@ -1091,6 +1094,7 @@ impl<B: Serve> Shell<B> {
                     width: rect.width,
                     dtype: rect.dtype,
                     voxels: output.decl.axis == poem_ir::InputAxis::Voxel,
+                    captured: span.captured(output.values[0]),
                 });
             }
             let out_width = match out {
@@ -1099,6 +1103,31 @@ impl<B: Serve> Shell<B> {
             };
             (out_width, pixels, readouts)
         };
+        // A fire is seated the capture planes' rows for its capturing lanes
+        // beside its carve, and cut to a rung they fit beside by the term
+        // its programs' reads state (`Shell::capture_term`): a class writes
+        // a capture plane only under the switch such a read sets.
+        for plane in readouts.iter().filter(|plane| plane.captured) {
+            for class in plane.classes.iter() {
+                let switched = compiled.classes.classes.get(class).is_some_and(|class| {
+                    class
+                        .words
+                        .iter()
+                        .all(|&word| boot.trace.facts.holds(word, poem_ir::Builtin::Scores))
+                });
+                if !switched {
+                    return Err(Fault::Program {
+                        at: "Shell::load",
+                        why: format!(
+                            "class {class} writes the capture planes of output `{}` in a word \
+                             that does not hold the scores switch, so no read states the \
+                             planes its lanes take",
+                            plane.output
+                        ),
+                    });
+                }
+            }
+        }
         let pixel_out = match pixels.iter().map(|plane| plane.4).max() {
             Some(bytes) => (0..arms)
                 .map(|_| B::Buffer::host(&device, bytes, crate::books::owners::READOUT))
@@ -1780,6 +1809,58 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn voxel_element(&self) -> Option<Dtype> {
         self.voxel_seat.map(|seat| seat.dtype)
+    }
+
+    /// Whether lanes of `class` capture: the class writes a capture plane.
+    fn captures(&self, class: usize) -> bool {
+        self.readouts
+            .iter()
+            .any(|plane| plane.captured && plane.classes.contains(class))
+    }
+
+    /// What a fire takes beside its rung's carve for the lanes of one
+    /// instance of a program reading `reads` (`(output, lane)` each): a row
+    /// of every capture plane for each lane a read of which switches score
+    /// capture on, and the planes' alignment once. The switch is the
+    /// runtime's rule: a read sets it where every class writing the output
+    /// holds it in every word.
+    #[must_use]
+    pub fn capture_term<'a>(
+        &self,
+        reads: impl IntoIterator<Item = (&'a str, u32)>,
+    ) -> engine::FireFacts {
+        let (a_lane, aligned) = self.span.capture_term();
+        if a_lane == 0 {
+            return engine::FireFacts::default();
+        }
+        let classes = self.classes();
+        let switches = |name: &str| {
+            let mut writers = classes
+                .classes
+                .iter()
+                .filter(|class| class.outputs.iter().any(|decl| decl.name == name))
+                .peekable();
+            writers.peek().is_some()
+                && writers.all(|class| {
+                    class
+                        .words
+                        .iter()
+                        .all(|&word| self.trace.facts.holds(word, poem_ir::Builtin::Scores))
+                })
+        };
+        let lanes: std::collections::BTreeSet<u32> = reads
+            .into_iter()
+            .filter(|&(name, _)| switches(name))
+            .map(|(_, lane)| lane)
+            .collect();
+        if lanes.is_empty() {
+            return engine::FireFacts::default();
+        }
+        engine::FireFacts {
+            a_lane: lanes.len() as u64 * a_lane,
+            fixed: aligned,
+            ..engine::FireFacts::default()
+        }
     }
 
     /// Its class's readout rows, else its last float row output, else the `out` output's.
@@ -3287,8 +3368,16 @@ impl<B: Serve> Shell<B> {
             })
             .collect();
 
+        // The lanes whose class captures: a capture plane holds a row for
+        // each, in lane order.
+        let scored = Scored::of(
+            composition
+                .lanes()
+                .iter()
+                .map(|row| self.captures(row.class as usize)),
+        );
         let (readout_rows, readout_layout) =
-            readout_table(&composition, lanes, &self.readouts, |class| {
+            readout_table(&composition, lanes, &self.readouts, &scored, |class| {
                 self.readout_for(class)
             })?;
         let bound = self.inputs[arm].write(
@@ -3374,7 +3463,7 @@ impl<B: Serve> Shell<B> {
         // The narrowest rung that holds the fire: its carve at its fixed
         // place under the span's end.
         let rung = self.span.rung_of(fire_rows);
-        let slots = self.span.slots(&self.handles, rung, fire_rows)?;
+        let slots = self.span.slots(&self.handles, rung, fire_rows, scored)?;
         let caches = self.pools.table(
             &self.handles,
             &self.inputs[arm].seats(&self.handles, &bound, pages, rows, lane_count),
@@ -3725,6 +3814,7 @@ fn readout_table<B: Serve>(
     composition: &Composition,
     lanes: &[Seated<'_, B>],
     planes: &[ReadoutPlane],
+    scored: &Scored,
     host_of: impl Fn(usize) -> Option<usize>,
 ) -> Result<ReadoutTable> {
     let span_of = |plane: usize, first: u32, rows: u32, at: u64, direct: bool, lane: u32| {
@@ -3827,7 +3917,17 @@ fn readout_table<B: Serve>(
                     });
                 }
                 Kind::Readout => (host.first, host.rows, false),
-                Kind::Lane => (u32::try_from(lane_row).unwrap_or(u32::MAX), 1, true),
+                Kind::Lane => {
+                    let lane = u32::try_from(lane_row).unwrap_or(u32::MAX);
+                    // A capture plane's row is the lane's among the
+                    // capturing ones.
+                    let first = if plane.captured {
+                        scored.row(lane)
+                    } else {
+                        lane
+                    };
+                    (first, 1, true)
+                }
                 Kind::Rows if plane.voxels => (row.voxel_offset, row.voxels, true),
                 Kind::Rows => (row.row_offset, row.rows, true),
             };
