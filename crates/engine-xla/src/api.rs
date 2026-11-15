@@ -119,6 +119,11 @@ pub struct Xla {
     next_frame: u64,
     sink: Option<engine::CompletionSink>,
     adapters: BTreeMap<InstanceId, crate::adapter::Binding>,
+    /// Per recurrent state slot, how far a device-counted fold this engine
+    /// resolved has frozen it: the runtime's `RsVerb::Buffer::folded` lags
+    /// such a fold until its fire settles, so a fire staged before then
+    /// replays from here, not from the stale count.
+    rs_ahead: BTreeMap<u32, u32>,
     /// What the engine counts while it serves, read by the runtime: a
     /// program a fire waited on (Compiled), a guest pass the host
     /// interprets (Fallback), a frame or registration refused (Refused).
@@ -154,6 +159,7 @@ impl Xla {
             sink: None,
             programs: crate::program::Plane::default(),
             adapters: BTreeMap::new(),
+            rs_ahead: BTreeMap::new(),
             pending: None,
             live: engine::live::Live::armed(),
         }
@@ -921,6 +927,10 @@ struct DeviceLane {
     mask: Option<engine::fire::Masking>,
     /// The lane's windowed ids for `pages`, when the runtime handed any.
     window: Option<Vec<u32>>,
+    /// One past the last slot the lane's rows land at, in its set's own
+    /// slot numbering: its stated slots' highest, else what it held and its
+    /// rows (`engine::KvWrites::end`).
+    end: Option<u32>,
 }
 
 impl Xla {
@@ -1076,6 +1086,10 @@ impl Xla {
                         .map(<[u32]>::to_vec),
                     None => None,
                 };
+                let end = match slots {
+                    Some(slots) => slots.iter().max().map(|&slot| slot + 1),
+                    None => have.map(|have| have + rows as u32),
+                };
                 out[source] = Some(DeviceLane {
                     tokens,
                     positions,
@@ -1085,6 +1099,7 @@ impl Xla {
                     first,
                     mask,
                     window,
+                    end,
                 });
             }
         }
@@ -1361,6 +1376,31 @@ impl Xla {
             .iter()
             .map(|lane| lane.rs.clone())
             .collect();
+        // The lanes whose fold length was the device's, resolved here.
+        let mut device_folds = vec![false; submission.lanes.len()];
+        // A state a device-counted fold froze past what the runtime counts
+        // replays from where the fold left it.
+        for (lane, verb) in submission.lanes.iter().zip(verbs.iter_mut()) {
+            // A state starting afresh holds nothing an earlier fold froze.
+            let fresh = match lane.rs_reset {
+                engine::fire::RsReset::Fresh => true,
+                engine::fire::RsReset::Inferred => lane.kv.held == 0,
+                _ => false,
+            };
+            if let (true, Some(slot)) = (fresh, lane.rs_slot) {
+                self.rs_ahead.remove(&slot);
+                continue;
+            }
+            if let (engine::fire::RsVerb::Buffer { folded, .. }, Some(slot)) = (verb, lane.rs_slot) {
+                match self.rs_ahead.get(&slot) {
+                    Some(&ahead) if ahead > *folded => *folded = ahead,
+                    Some(_) => {
+                        self.rs_ahead.remove(&slot);
+                    }
+                    None => {}
+                }
+            }
+        }
         for attachment in &submission.attachments {
             if let engine::fire::RsVerb::Buffer { fold, .. } = &mut verbs[attachment.lane as usize]
                 && *fold == engine::fire::FoldLen::Device
@@ -1370,8 +1410,75 @@ impl Xla {
                     .map_err(refusal)?
             {
                 *fold = engine::fire::FoldLen::Host(n);
+                device_folds[attachment.lane as usize] = true;
             }
         }
+        // Where each device-counted fold leaves its state, for the fires
+        // staged before this one settles.
+        for (at, lane) in submission.lanes.iter().enumerate() {
+            if let (
+                engine::fire::RsVerb::Buffer {
+                    folded,
+                    fold: engine::fire::FoldLen::Host(n),
+                    ..
+                },
+                Some(slot),
+                true,
+            ) = (&verbs[at], lane.rs_slot, device_folds[at])
+            {
+                let first = device
+                    .get(at)
+                    .and_then(Option::as_ref)
+                    .and_then(|p| p.first.or(p.have))
+                    .unwrap_or(lane.kv.held);
+                let to = folded
+                    .saturating_add(*n)
+                    .min(first + lane.tokens.len() as u32);
+                self.rs_ahead.insert(slot, to);
+            }
+        }
+        // What each reported lane wrote, told when the step lands: one past
+        // the last slot its rows landed at (the runtime bounds what a
+        // device-placed lane carries by it, `engine::fire::rung_rows`), and
+        // where its fold length was the device's, the slots this fire's fold
+        // froze, clamped to its rows' end as the plan clamps it
+        // (`engine::rs::LanePlan::of`).
+        latch.report(
+            submission
+                .lanes
+                .iter()
+                .enumerate()
+                .filter(|(_, lane)| lane.reports != 0)
+                .map(|(at, lane)| {
+                    let rows = lane.tokens.len() as u32;
+                    let placed = device.get(at).and_then(Option::as_ref);
+                    let first = placed
+                        .and_then(|p| p.first.or(p.have))
+                        .unwrap_or(lane.kv.held);
+                    let end = match placed {
+                        Some(placed) => placed.end,
+                        None => (!lane.kv_less).then_some(first + rows),
+                    };
+                    let fold = match &verbs[at] {
+                        engine::fire::RsVerb::Buffer {
+                            folded,
+                            fold: engine::fire::FoldLen::Host(n),
+                            ..
+                        } if device_folds[at] => {
+                            let to = folded.saturating_add(*n).min(first + rows);
+                            Some(to.saturating_sub(*folded))
+                        }
+                        _ => None,
+                    };
+                    engine::KvWrites {
+                        tag: lane.reports,
+                        fold,
+                        end,
+                        ..engine::KvWrites::default()
+                    }
+                })
+                .collect(),
+        );
 
         let mut lane_adapters: Vec<Option<u32>> = vec![None; submission.lanes.len()];
         for attachment in &submission.attachments {

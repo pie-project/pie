@@ -17,8 +17,8 @@
 //!   stride a lane's keys can reach;
 //! - device-fed token tables: every lane's every row fed off the device;
 //! - recurrent replay maps (a load with recurrent state): every lane
-//!   buffers its rows and replays the most a lane may carry unfolded
-//!   (`engine::fire::UNFOLDED_ROWS`);
+//!   buffers its rows and the fire replays its rung's carried room
+//!   (`crate::rs::carried_room`), spread over its lanes;
 //! - streamed-expert staging tables (a load streaming experts): every fire
 //!   staged as one whose experts are in no slot (`Shell::stage_all`);
 //! - guest input planes: every declared input fed on every lane, a plane
@@ -30,7 +30,7 @@
 //! fire. A real fire past its slab is refused by name
 //! (`crate::store::stage::Ring::write`), the proof none does.
 
-use engine::fire::{FoldLen, Mask, Masking, RsVerb, UNFOLDED_ROWS};
+use engine::fire::{FoldLen, Mask, Masking, RsVerb};
 use poem_ir::Request;
 
 use super::{Lane, Seated, Shell, TokenFeed};
@@ -139,11 +139,15 @@ impl Shell {
             })
             .collect();
         let replays = self.pools.rs_shape().is_some();
-        let carried = carried_rows(rung);
+        // The rung's carried room, spread over the lanes.
+        let room = crate::rs::carried_room(rung);
+        let carried_of = |at: u32| room / lanes + u32::from(at < room % lanes);
         let verbs: Vec<RsVerb> = owned
             .iter()
-            .map(|(tokens, _, scratch, _)| {
+            .enumerate()
+            .map(|(at, (tokens, _, scratch, _))| {
                 let first = context - tokens.len() as u32;
+                let carried = carried_of(at as u32);
                 if replays {
                     RsVerb::Buffer {
                         pages: scratch.rs.clone(),
@@ -215,12 +219,4 @@ impl Shell {
         self.fire_full(&seated)?;
         Ok(self.sizing.unwrap_or(0))
     }
-}
-
-/// The most recurrent rows a lane of a `rung`-token fire carries unfolded
-/// into it: what its replay maps are sized for (the one place this bound is
-/// read).
-fn carried_rows(rung: u32) -> u32 {
-    let _ = rung;
-    UNFOLDED_ROWS
 }
