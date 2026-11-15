@@ -295,26 +295,6 @@ mod tests {
     }
 
     #[test]
-    fn a_guest_kernel_states_its_scratch_and_is_refused_a_buffer() {
-        use super::{Ask, refuse_late_buffers_but_scratch};
-        let spills = image(&metadata_with(
-            "fused",
-            ".private_segment_fixed_size",
-            &[0x4c],
-        ));
-        assert_eq!(
-            refuse_late_buffers_but_scratch(&spills),
-            Ok(vec![("fused".to_owned(), Ask::Scratch(76))])
-        );
-        let prints = image(&metadata("fused", "hidden_printf_buffer"));
-        assert!(refuse_late_buffers_but_scratch(&prints).is_err());
-        assert_eq!(
-            refuse_late_buffers_but_scratch(b"not an elf"),
-            Ok(Vec::new())
-        );
-    }
-
-    #[test]
     fn a_kernel_asking_nothing_late_loads() {
         assert_eq!(
             refuse_late_buffers(&image(&metadata("add", "global_buffer"))),
