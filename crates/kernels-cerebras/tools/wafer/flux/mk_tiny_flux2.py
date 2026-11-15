@@ -13,6 +13,8 @@ the pipeline does, written as the poem's `velocity` output reads out: [voxels (h
 --loop <s0,s1,...> <out.f32>: the host's denoise loop from the same latent over sigmas s0, s1, ... then 0 (as the
 poem's schedule gives them: engine-cerebras' `Denoise`), an Euler step a velocity, all in f32; the final latent as
 the `latents` input lays it ([voxels (h, w), 32]).
+--rows <n>: n text rows and a square latent of n image rows (2 x 2 patches) in place of 64 and 16 x 16 (the
+inputs drawn as engine-cerebras' `flux_2_minis_reading_files` draws them at `READING_ROWS=n`).
 
 Needs diffusers >= 0.36 (Flux2Transformer2DModel) and torch. Threads: 8."""
 import math
@@ -184,7 +186,11 @@ def step(m, latents, context, dtype, sigma=SIGMA):
 
 
 def main():
+    global TXT, H, W
     out = sys.argv[1]
+    if "--rows" in sys.argv:
+        TXT = int(sys.argv[sys.argv.index("--rows") + 1])
+        H = W = 2 * round(math.sqrt(TXT))
     p = poem_params()
     m = model(state_dict(p))
     latents, context = inputs()

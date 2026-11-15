@@ -15,8 +15,19 @@ use engine_cpu::forward::{Captured, Output, StreamStep, Values};
 use poem_ir::{Operands, Request, Trace};
 
 const MINI: &str = "flux2-mini-bf16-kv-bf16";
-const TEXT: usize = 64;
-const GRID: [u32; 3] = [1, 16, 16];
+/// The text lane's rows and the latent's grid: 64 rows a lane (a 16 x 16 latent), or
+/// `READING_ROWS` a lane (a square latent of 2 x 2 patches) for `flux_2_minis_reading_files`.
+fn rows() -> usize {
+    std::env::var("READING_ROWS")
+        .ok()
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(64)
+}
+
+fn grid() -> [u32; 3] {
+    let side = 2 * (rows() as f64).sqrt().round() as u32;
+    [1, side, side]
+}
 const CHANNELS: usize = 32;
 const CONTEXT: usize = 192;
 /// diffusers' latent after the 2-step loop (`mk_tiny_flux2.py --loop`), f32 [256, 32].
@@ -71,13 +82,13 @@ fn setup(trace: &Trace) -> (Forward, Vec<(String, Vec<f32>)>) {
         let s = (12.0 / fan_in).sqrt();
         u.iter().map(|u| u * s).collect()
     };
-    let voxels = (GRID[1] * GRID[2]) as usize;
+    let voxels = (grid()[1] * grid()[2]) as usize;
     let s = 12f32.sqrt();
-    let mut context: Vec<f32> = units("input.context", TEXT * CONTEXT)
+    let mut context: Vec<f32> = units("input.context", rows() * CONTEXT)
         .iter()
         .map(|u| bf16(u * s))
         .collect();
-    context.resize((TEXT + voxels / 4) * CONTEXT, 0.0);
+    context.resize((rows() + voxels / 4) * CONTEXT, 0.0);
     let latents: Vec<f32> = units("input.latents", voxels * CHANNELS)
         .iter()
         .map(|u| bf16(u * s))
@@ -95,7 +106,7 @@ fn setup(trace: &Trace) -> (Forward, Vec<(String, Vec<f32>)>) {
 /// The step the engine-cpu test runs: its lanes are the reading's classes.
 fn engine_cpu_step<'a>(trace: &Trace, inputs: &'a [(String, Vec<f32>)]) -> StreamStep<'a> {
     let word = |stream: &str| {
-        let r = Request::new(TEXT as u32, false)
+        let r = Request::new(rows() as u32, false)
             .switched("reading", "denoise")
             .switched("stream", stream);
         trace.facts.word(&r)
@@ -104,13 +115,13 @@ fn engine_cpu_step<'a>(trace: &Trace, inputs: &'a [(String, Vec<f32>)]) -> Strea
         lanes: vec![
             engine_cpu::forward::StreamLane {
                 word: word("context"),
-                rows: TEXT,
+                rows: rows(),
                 clip: None,
             },
             engine_cpu::forward::StreamLane {
                 word: word("latents"),
-                rows: (GRID[1] * GRID[2] / 4) as usize,
-                clip: Some(GRID),
+                rows: (grid()[1] * grid()[2] / 4) as usize,
+                clip: Some(grid()),
             },
         ],
         inputs: inputs
@@ -184,7 +195,7 @@ fn capture(forward: &mut Forward, trace: &Trace, step: &StreamStep<'_>, dir: &Pa
 fn compile(trace: &Trace, gold: &Path, out: &Path) {
     let o = kernels_cerebras::stream::Options {
         reading: "denoise".into(),
-        rows: TEXT as u32,
+        rows: rows() as u32,
         round16: true,
         upto: None,
         taps: Vec::new(),
@@ -231,7 +242,7 @@ fn flux_2_minis_entries_are_the_captures() {
 
     let reading = Reading::open(&prog).expect("host.json states the reading");
     assert_eq!(reading.model, MINI);
-    let mine = reading.step(&trace, Some(GRID), &inputs);
+    let mine = reading.step(&trace, Some(grid()), &inputs);
     assert_eq!(
         (mine.lanes.iter())
             .map(|l| (l.word, l.rows, l.clip))
@@ -289,12 +300,12 @@ fn flux_2_minis_denoise_loop_answers_diffusers() {
     compile(&trace, &gold, &prog);
     let reading = Reading::open(&prog).expect("host.json states the reading");
     let mut host = Forward::host(trace.clone());
-    let image_rows = GRID[1] * GRID[2] / 4;
+    let image_rows = grid()[1] * grid()[2] / 4;
     let d = Denoise::of(MINI, 2, Some(image_rows)).expect("the poem states a flow schedule");
     eprintln!("sigmas {:?}", d.sigmas);
     let (latent, _) = d
         .run(&mut inputs, reading.classes.len(), |_, ins| {
-            let step = reading.step(&trace, Some(GRID), ins);
+            let step = reading.step(&trace, Some(grid()), ins);
             let back = device(&mut forward, &reading, &step);
             let split = reading
                 .finish(&mut host, &trace, &step, &back, &["velocity"])?
@@ -321,7 +332,7 @@ fn flux_2_minis_denoise_loop_answers_diffusers() {
 /// compiled from a capture (`prog/`), the step's inputs (`inputs/<name>.f32`, as
 /// `wafer-bench --reading` reads them), and engine-cpu's answers through the same host loop
 /// (`cpu_velocity<i>.f32`, `cpu_latent<n>.f32` after `n` steps, for `READING_STEPS` steps,
-/// default 2).
+/// default 2), at `READING_ROWS` rows a lane (default 64).
 #[test]
 #[ignore = "writes a reading's run files; run with READING_OUT"]
 fn flux_2_minis_reading_files() {
@@ -348,14 +359,14 @@ fn flux_2_minis_reading_files() {
     }
     let reading = Reading::open(&prog).expect("host.json states the reading");
     let mut host = Forward::host(trace.clone());
-    let d = Denoise::of(MINI, steps, Some(GRID[1] * GRID[2] / 4)).expect("a flow schedule");
+    let d = Denoise::of(MINI, steps, Some(grid()[1] * grid()[2] / 4)).expect("a flow schedule");
     let write = |name: String, v: &[f32]| {
         let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
         std::fs::write(out.join(name), b).expect("a golden");
     };
     let (_, vs) = d
         .run(&mut inputs, reading.classes.len(), |_, ins| {
-            let step = reading.step(&trace, Some(GRID), ins);
+            let step = reading.step(&trace, Some(grid()), ins);
             let back = device(&mut forward, &reading, &step);
             let v = reading
                 .finish(&mut host, &trace, &step, &back, &["velocity"])?
