@@ -209,7 +209,10 @@ fn fill(p: &Program, vals: &Values, a: &HostArray) -> R<Vec<f32>> {
                 out[i] = if t.u16 { f32::from_bits(*x as u32) } else { *x };
             }
         }
-        Fill::Resident { .. } | Fill::Scalars { .. } | Fill::HostIn { .. } => {
+        Fill::Resident { .. }
+        | Fill::Scalars { .. }
+        | Fill::RowScalars { .. }
+        | Fill::HostIn { .. } => {
             let g = gather(p, a)?.ok_or("an array of no gather")?;
             out = apply(&g, &|v| {
                 let (s, d) = vals.get(ValueId(v))?;
@@ -310,6 +313,29 @@ pub fn gather(p: &Program, a: &HostArray) -> R<Option<Gather>> {
                     let input = &chain.ins[param];
                     g[t as usize * ns + i] = [input.value.0, tr, input.from, ONE];
                 }
+            }
+        }
+        Fill::RowScalars {
+            unit,
+            of,
+            from,
+            step,
+        } => {
+            let b = &p.units[*unit];
+            let ns = of.len();
+            let mut t = *from;
+            let mut k = 0;
+            while t < b.unit.rows && (k + 1) * ns <= g.len() {
+                let tr = trace_row(p, *unit, t) as u32;
+                for (i, &(st, param)) in of.iter().enumerate() {
+                    let Step::Region { chain, .. } = &b.unit.steps[st] else {
+                        return Err("a scalar of no region".into());
+                    };
+                    let input = &chain.ins[param];
+                    g[k * ns + i] = [input.value.0, tr, input.from, ONE];
+                }
+                t += step.max(&1);
+                k += 1;
             }
         }
         Fill::HostIn { unit, parts } => {

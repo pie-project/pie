@@ -60,6 +60,14 @@ pub enum Fill {
         unit: usize,
         of: Vec<(usize, usize)>,
     },
+    /// The scalars of the own rows `from, from + step, ...` of `unit`, in a weight PE that adds
+    /// them into its column chain for the CY root (row `t` by the PE of row `t % py`).
+    RowScalars {
+        unit: usize,
+        of: Vec<(usize, usize)>,
+        from: u32,
+        step: u32,
+    },
     /// The host rows a root takes in, a row of its own after another: its parts of `values`.
     HostIn {
         unit: usize,
@@ -348,7 +356,7 @@ pub fn emit(p: &Program) -> R<Emitted> {
         let r = trace_reader(b);
         // the weight columns
         for col in 0..su.cols() {
-            let (name, text, mvs, cfg) = weight_file(ui, b, &r, col)?;
+            let (name, text, mvs, cfg, wsc) = weight_file(p, ui, b, &r, col)?;
             files.push((name.clone(), text));
             for row in 0..su.rows() {
                 let c = su.w(col, row);
@@ -357,7 +365,24 @@ pub fn emit(p: &Program) -> R<Emitted> {
                 tiles.insert(c, (name.clone(), weight_params(p, c)));
                 let mut words = cfg.clone();
                 words[0] = weight_role(p, c);
+                if !wsc.is_empty() {
+                    words[1] = row;
+                }
                 arrays.extend(cfg_array(c, &words));
+                for (sym, len, of) in &wsc {
+                    arrays.push(HostArray {
+                        at: c,
+                        sym: sym.clone(),
+                        u16: false,
+                        len: *len,
+                        fill: Fill::RowScalars {
+                            unit: ui,
+                            of: of.clone(),
+                            from: row,
+                            step: su.rows(),
+                        },
+                    });
+                }
                 for (k, (step, a, bb)) in mvs.iter().enumerate() {
                     arrays.push(HostArray {
                         at: c,
@@ -647,15 +672,97 @@ fn held_rows(b: &Built, st: &Step) -> Vec<ValueId> {
     made.into_iter().filter(|v| u.held.contains(v)).collect()
 }
 
+/// A root's per-row scalars it holds for every row at most (f32 words); past it the CY roots'
+/// scalars come down the column chains with a matvec's output instead ([`carry`]).
+pub const SCAL_WORDS: u32 = 2_048;
+
+/// Whether region `printed`'s row reads its scalar parameter `pk` (a scalar it never reads,
+/// such as a lane id that picked its lane vector, is not held).
+fn reads_scalar(printed: &str, pk: usize) -> bool {
+    let Some(at) = printed.find("fn row() void {") else {
+        return true;
+    };
+    let name = format!("sc{pk}");
+    printed[at..].match_indices(&name).any(|(i, _)| {
+        let after = printed[at + i + name.len()..].chars().next();
+        !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !printed[..at + i]
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// The CY roots' scalars carried down the column chains, a phase each (before the barrier,
+/// after it): the matvec whose output carries them (the phase's first from the row side) and
+/// the (step, param)s of the column regions after it that read one, in order. Empty where the
+/// unit's CY roots hold their scalars for every row within [`SCAL_WORDS`].
+fn carry(p: &Program, b: &Built) -> Vec<(usize, Vec<(usize, usize)>)> {
+    let u = &b.unit;
+    let col_scalars = |lo: usize, hi: usize| -> Vec<(usize, usize)> {
+        let mut v = Vec::new();
+        for si in lo..hi {
+            let Step::Region {
+                side: Side::Col,
+                chain,
+            } = &u.steps[si]
+            else {
+                continue;
+            };
+            let Some((_, printed, params)) = b.regions.get(&si) else {
+                continue;
+            };
+            for (pk, at) in params.iter().enumerate().take(chain.ins.len()) {
+                if *at == ParamAt::Scalar && reads_scalar(&printed.csl, pk) {
+                    v.push((si, pk));
+                }
+            }
+        }
+        v
+    };
+    let all = col_scalars(0, u.steps.len()).len() as u32;
+    if all * u.rows <= SCAL_WORDS || u.classes.is_empty() {
+        return Vec::new();
+    }
+    let _ = p;
+    let mut out = Vec::new();
+    for (lo, hi) in [(0, u.split), (u.split, u.steps.len())] {
+        let Some(m) = (lo..hi).find(|&i| {
+            matches!(
+                u.steps[i],
+                Step::Matvec {
+                    from: Side::Row,
+                    ..
+                }
+            )
+        }) else {
+            continue;
+        };
+        let v = col_scalars(m + 1, hi);
+        if !v.is_empty() {
+            out.push((m, v));
+        }
+    }
+    out
+}
+
 /// A weight column's file, its matvecs and its config words after the first (`pcfg[0]` is each
 /// PE's column-chain role, [`weight_params`]'s `R_COL`): the column's index in the row store and
 /// its chains' roles, so the columns of a unit share a few files.
+#[allow(clippy::type_complexity)]
 fn weight_file(
+    p: &Program,
     ui: usize,
     b: &Built,
     r: &Reader,
     col: u32,
-) -> R<(String, String, Vec<Tile>, Vec<u32>)> {
+) -> R<(
+    String,
+    String,
+    Vec<Tile>,
+    Vec<u32>,
+    Vec<(String, u32, Vec<(usize, usize)>)>,
+)> {
     let name = format!("w_{ui}_{col}.csl");
     let l = &b.layout;
     let mut t = String::new();
@@ -676,8 +783,24 @@ fn weight_file(
     let spill = l.spill;
     let mut kept: Vec<u32> = Vec::new();
     let mut fetch = String::new();
-    // pcfg[0] the PE's R_COL; the column's words after it
-    let mut cfg: Vec<u32> = vec![0];
+    // pcfg[0] the PE's R_COL (and pcfg[1] its row where it carries the CY roots' scalars); the
+    // column's words after it
+    let carried = carry(p, b);
+    let mut cfg: Vec<u32> = if carried.is_empty() {
+        vec![0]
+    } else {
+        vec![0, 0]
+    };
+    let mut wsc = Vec::new();
+    for (ph, (_, of)) in carried.iter().enumerate() {
+        let n = of.len() as u32;
+        let len = b.unit.rows.div_ceil(l.py) * n;
+        let _ = writeln!(
+            t,
+            "var wsc{ph} = @zeros([{len}]f32);\nvar wsc{ph}_p: [*]f32 = &wsc{ph};"
+        );
+        wsc.push((format!("wsc{ph}"), len, of.clone()));
+    }
     let mut word = |v: u32| {
         cfg.push(v);
         format!("@as(u16, pcfg[{}])", cfg.len() - 1)
@@ -740,6 +863,23 @@ fn weight_file(
                     let _ = writeln!(body, "  rw.role = {};", word(u32::from(!leaf)));
                 }
                 let _ = writeln!(body, "  m{m}.row(t);");
+                if let Some(ph) = carried.iter().position(|c| c.0 == si) {
+                    // the row's scalars: this PE's where it keeps row t, zeros from the rest
+                    let n = carried[ph].1.len() as u32;
+                    zer = zer.max(n);
+                    let _ = writeln!(
+                        body,
+                        "  if (t % {py} == @as(u16, pcfg[1])) {{ rs.send(@set_dsd_length(@increment_dsd_offset(D_wsc{ph}, @as(i16, (t / {py}) * {n}), f32), {n}), {n}); }} else {{ rs.send(@set_dsd_length(D_zer, {n}), {n}); }}",
+                        py = l.py
+                    );
+                    if !t.contains(&format!("const D_wsc{ph}")) {
+                        let _ = writeln!(
+                            t,
+                            "const D_wsc{ph} = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{{}}} -> wsc{ph}[i] }});",
+                            wsc[ph].1
+                        );
+                    }
+                }
                 mvs.push((si, a, bb));
             }
             None => match from {
@@ -792,8 +932,11 @@ fn weight_file(
     for m in 0..mvs.len() {
         let _ = writeln!(t, "  @export_symbol(w{m}_p, \"w{m}\");");
     }
+    for (sym, _, _) in &wsc {
+        let _ = writeln!(t, "  @export_symbol({sym}_p, \"{sym}\");");
+    }
     t.push_str("  @initialize_queue(q_xr, .{ .color = @get_color(C_XR) });\n  @initialize_queue(q_xc, .{ .color = @get_color(C_XC) });\n  @initialize_queue(q_cr, .{ .color = @get_color(C_CR) });\n  @initialize_queue(q_rr, .{ .color = @get_color(C_RR) });\n  @initialize_queue(q_cs, .{ .color = @get_color(C_CS) });\n  @initialize_queue(q_rs, .{ .color = @get_color(C_RS) });\n}\n");
-    Ok((name, t, mvs, cfg))
+    Ok((name, t, mvs, cfg, wsc))
 }
 
 /// Every kernel's opening: memcpy, the stamps, the fabric and math modules, the run task.
@@ -952,6 +1095,11 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
     let mut hout_w = 0u32;
     let mut hout_parts: Vec<(u32, u32, u32)> = Vec::new();
     let mut scal: Vec<(usize, usize)> = Vec::new();
+    let carried = if side == Side::Col {
+        carry(p, b)
+    } else {
+        Vec::new()
+    };
     let mut lane_pieces: Vec<(u32, u32, String)> = Vec::new(); // (bus off, n, dst dsd)
     let mut sends_cast = false;
     let mut kv_io = false;
@@ -1030,14 +1178,32 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                                 );
                             }
                         }
+                        ParamAt::Scalar if !reads_scalar(&printed.csl, pk) => {}
                         ParamAt::Scalar => {
-                            scal.push((si, pk));
                             let _ = nsc;
                             nsc += 1;
-                            g.put(
-                                late,
-                                &format!("  rg{k}.sc{pk} = scal[t * NSC + {}];\n", scal.len() - 1),
-                            );
+                            let carried = carried.iter().enumerate().find_map(|(ph, c)| {
+                                c.1.iter().position(|&x| x == (si, pk)).map(|i| (ph, i))
+                            });
+                            if let Some((ph, i)) = carried {
+                                if !g.decls.contains(&format!("var csc{ph}:")) {
+                                    return Err(format!(
+                                        "{}: step {si}'s scalars come with a matvec this root \
+                                         does not take",
+                                        u.name
+                                    ));
+                                }
+                                g.put(late, &format!("  rg{k}.sc{pk} = csc{ph}[{i}];\n"));
+                            } else {
+                                scal.push((si, pk));
+                                g.put(
+                                    late,
+                                    &format!(
+                                        "  rg{k}.sc{pk} = scal[t * NSC + {}];\n",
+                                        scal.len() - 1
+                                    ),
+                                );
+                            }
                         }
                         ParamAt::Resident => {
                             let lane = input.by.is_some() || r.lane(input.value);
@@ -1155,6 +1321,14 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                     let bn = format!("mb{si}");
                     g.decls.push_str(&buf(&bn, tot));
                     g.put(late, &format!("  @fmovs(D_{bn}, fab.fin(q_ci, {tot}));\n"));
+                    if side == Side::Col
+                        && let Some(ph) = carried.iter().position(|c| c.0 == si)
+                    {
+                        // the row's scalars after it, summed down the column (one PE's, zeros)
+                        let n = carried[ph].1.len() as u32;
+                        g.decls.push_str(&buf(&format!("csc{ph}"), n));
+                        g.put(late, &format!("  @fmovs(D_csc{ph}, fab.fin(q_ci, {n}));\n"));
+                    }
                     if *round {
                         g.round(late, &format!("D_{bn}"), tot);
                     }
