@@ -7,8 +7,6 @@ use crate::engine::{ChannelBinding, ChannelEndpoint};
 use eta_ir::container::{self, ChanDType, ChannelDecl, ExternDir, HostRole};
 use eta_ir::types::Dtype;
 
-pub const TICKET_NONE: u64 = u64::MAX;
-
 static NEXT_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn next_channel_id() -> engine::ChannelId {
@@ -263,41 +261,18 @@ impl ChannelCell {
         self.endpoint.clone()
     }
 
-    pub fn reserve_device_ticket(&mut self, consume: bool, publish: bool) -> (u64, u64) {
-        let expected_head = if consume {
-            let expected = self.device_reserved_head;
-            self.device_reserved_head += 1;
-            expected
-        } else {
-            TICKET_NONE
-        };
-        let expected_tail = if publish {
-            let expected = self.device_reserved_tail;
-            self.device_reserved_tail += 1;
-            expected
-        } else {
-            TICKET_NONE
-        };
-        (expected_head, expected_tail)
+    /// A fire that will move this device ring counts its moves here; the
+    /// engine, not the runtime, picks the cell each one touches.
+    pub fn reserve_device_moves(&mut self, consume: bool, publish: bool) {
+        self.device_reserved_head += u64::from(consume);
+        self.device_reserved_tail += u64::from(publish);
     }
 
-    pub fn rollback_device_ticket(&mut self, expected_head: u64, expected_tail: u64) -> bool {
-        let mut complete = true;
-        if expected_tail != TICKET_NONE {
-            if self.device_reserved_tail == expected_tail + 1 {
-                self.device_reserved_tail = expected_tail;
-            } else {
-                complete = false;
-            }
-        }
-        if expected_head != TICKET_NONE {
-            if self.device_reserved_head == expected_head + 1 {
-                self.device_reserved_head = expected_head;
-            } else {
-                complete = false;
-            }
-        }
-        complete
+    /// A fire that never reached the engine gives its moves back, whichever
+    /// fire reserved after it.
+    pub fn release_device_moves(&mut self, consume: bool, publish: bool) {
+        self.device_reserved_head -= u64::from(consume);
+        self.device_reserved_tail -= u64::from(publish);
     }
 
     pub fn reader_wait_state(&self) -> Option<(Arc<ChannelEndpoint>, u64)> {

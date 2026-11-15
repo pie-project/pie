@@ -88,7 +88,6 @@ impl Replay {
             lead.word |= self.bit;
             lead.tokens.truncate(skipped);
             lead.readout = Readout::None;
-            lead.channels.clear();
             head.lanes.push(lead);
 
             lane.tokens.drain(..skipped);

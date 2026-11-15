@@ -70,3 +70,14 @@ A fire lays one set of wave tables (a row of channels x 72 + 136 bytes per membe
 `FireFacts.fixed` counts it, an upper bound by (pairs carried - 1) x that table: ~1.4 MB at 14 pairs x 256 lanes x 4
 channels. Kept (two more contract fields and a third GuestTerm term cost more than they return); reopened if the
 measured figures come out much larger than the arithmetic.
+
+## F12 — No order on a ring a guest shares across two of its own pipelines
+The engine gives each move of a ring the cell its cursor stands at as it builds the step, in dispatch order; a step
+carries at most one fire moving a given end. Fires of two pipelines moving one ring carry no order between them, and a
+take that finds no cell is refused by name on every engine (CUDA's enqueue "blocked on channel … AFTER the gate";
+wgpu, Vulkan and XLA eta-exec Blocked "blocked on channel"; Metal's gate and device readiness guard): a named refusal,
+guest-ordered, never a stale read. Every shipped program (text-to-media, qwen3-tts, compat) keeps putter and taker on
+one pipeline, whose fires a step seats one at a time and in order. Not built: a take that waits for its put. Built, it
+would hold forever: sealed frames dispatch front-first and the front holds while a member lane is blocked
+(scheduler/frame.rs plan_dispatch), so a waiting take at the front keeps its put sealed behind it; the take would
+have to leave its sealed frame, which a frame dispatching whole forbids.

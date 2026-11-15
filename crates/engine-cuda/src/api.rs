@@ -795,7 +795,6 @@ impl Engine for Cuda {
             geometry: GeometryClass::DeviceGeometry,
             kv_handle,
             media_encode: false,
-            device_channel_commit: true,
             rs_verbs: true,
             rs_snapshots: if state_rows && shell.lands_snapshots() {
                 crate::store::rs::SNAPSHOTS
@@ -1535,22 +1534,6 @@ impl Cuda {
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;
-
-        for attachment in &submission.attachments {
-            let Some(lane) = submission.lanes.get(attachment.lane as usize) else {
-                continue;
-            };
-            if lane.channels.is_empty() {
-                continue;
-            }
-            if let Some(why) =
-                shell.program_ticket_disagreement(attachment.instance, &lane.channels)
-            {
-                return Err(Error::Program(format!(
-                    "this fire's channel predictions and the engine's disagree: {why}"
-                )));
-            }
-        }
 
         let attached: Vec<Attached> = submission
             .attachments

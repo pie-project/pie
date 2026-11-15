@@ -69,13 +69,3 @@ pub struct RegisteredChannel {
     pub mirror: Option<HostMirror>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Ticket {
-    pub channel: ChannelId,
-    pub expected_head: u64,
-    pub expected_tail: u64,
-}
-
-impl Ticket {
-    pub const NONE: u64 = u64::MAX;
-}

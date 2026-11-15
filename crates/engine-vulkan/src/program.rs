@@ -1084,6 +1084,15 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         Plane::bind(self, binding, place)
     }
 
+    fn moved_ends(&self, instance: InstanceId) -> Vec<(ChannelId, bool)> {
+        self.instances.get(&instance).map_or_else(Vec::new, |seat| {
+            engine_gpu::program::moved_ends(&seat.plan.package)
+                .into_iter()
+                .filter_map(|(dense, tail)| Some((*seat.ids.get(dense as usize)?, tail)))
+                .collect()
+        })
+    }
+
     fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {
         Plane::close_instance(self, id)
     }

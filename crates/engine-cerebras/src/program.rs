@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel, Ticket};
+use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use eta_exec::{
     ChannelState, ExecPlan, HostOp, InterpInstance, Interpreted, PassInputs, StepOutcome, Value,
@@ -228,61 +228,6 @@ impl Plane {
             geometry: binding.geometry,
             standing_guest_bytes: 0,
         })
-    }
-
-    #[must_use]
-    pub fn disagreeing_ticket(&self, instance: InstanceId, tickets: &[Ticket]) -> Option<String> {
-        let seat = self.instances.get(&instance)?;
-        let airborne = 0u64;
-        for ticket in tickets {
-            let Some(dense) = seat.channels.iter().position(|id| *id == ticket.channel) else {
-                return Some(format!(
-                    "instance {instance} predicted about channel {}, which it does not carry",
-                    ticket.channel
-                ));
-            };
-            let Some(ring) = seat.inst.channels.get(dense) else {
-                return Some(format!(
-                    "instance {instance} carries channel {} as its {dense}th, past its rings",
-                    ticket.channel
-                ));
-            };
-            let (takes, puts) =
-                seat.plan
-                    .package
-                    .stages
-                    .iter()
-                    .fold((0u64, 0u64), |(takes, puts), stage| {
-                        (
-                            takes
-                                + stage.takes.iter().filter(|&&c| c as usize == dense).count()
-                                    as u64,
-                            puts + stage
-                                .puts
-                                .iter()
-                                .filter(|p| p.channel as usize == dense)
-                                .count() as u64,
-                        )
-                    });
-            let head = ring.head() + airborne * takes;
-            let tail = ring.tail() + airborne * puts;
-            let stated = |claim: u64, held: u64, end: &str| {
-                (claim != Ticket::NONE && claim != held).then(|| {
-                    format!(
-                        "instance {instance}'s channel {} stands at {end} {held} and the caller \
-                         predicted {claim}",
-                        ticket.channel
-                    )
-                })
-            };
-            if let Some(why) = stated(ticket.expected_head, head, "head") {
-                return Some(why);
-            }
-            if let Some(why) = stated(ticket.expected_tail, tail, "tail") {
-                return Some(why);
-            }
-        }
-        None
     }
 
     pub fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {

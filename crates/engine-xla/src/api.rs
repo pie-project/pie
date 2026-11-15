@@ -528,7 +528,6 @@ impl Engine for Xla {
             geometry: GeometryClass::DeviceGeometry,
             kv_handle: None,
             media_encode: false,
-            device_channel_commit: true,
             rs_verbs: shell.serves_rs_verbs(),
             rs_snapshots: shell.snapshots(),
             bidirectional_attention: true,
@@ -1305,19 +1304,6 @@ impl Xla {
         latch: &std::sync::Arc<crate::program::Latch>,
     ) -> EngineResult<(FireTicket, StepSettle)> {
         capture(submission);
-        // Checked before a prologue moves the cursors the caller predicted.
-        for attachment in &submission.attachments {
-            if let Some(lane) = submission.lanes.get(attachment.lane as usize)
-                && !lane.channels.is_empty()
-                && let Some(why) = self
-                    .programs
-                    .disagreeing_ticket(attachment.instance, &lane.channels)
-            {
-                return Err(Error::Program(format!(
-                    "this fire's channel predictions and the engine's disagree: {why}"
-                )));
-            }
-        }
         self.run_prologues(submission)?;
         let fed = self.lane_feeds(submission)?;
         let input_cells: Vec<Vec<crate::serve::InputCell<'_>>> = fed

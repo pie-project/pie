@@ -44,9 +44,6 @@ pub trait Host: Serve {
     /// The engine's name, as the runtime and a message state it.
     const KIND: &'static str;
 
-    /// Whether a guest's device channel commits on the device.
-    const DEVICE_CHANNEL_COMMIT: bool;
-
     type Programs: Programs<Self>;
 
     /// The memory domain of the device `boot` opens.
@@ -527,7 +524,6 @@ where
 
             kv_handle: None,
             media_encode: false,
-            device_channel_commit: B::DEVICE_CHANNEL_COMMIT,
             rs_verbs: shell.serves_rs_verbs(),
             // The prompt scans land the state as of rows inside a lane, a
             // record a snapshot in pieces (CONTRACT-BC 16).
@@ -871,6 +867,25 @@ where
     }
 }
 
+/// A ring end that two of `step`'s fires move, if any: the contract has a
+/// step carry at most one fire moving a given end of a ring, since the cell
+/// each move takes is the one the ring's cursor stands at as the step is built.
+fn second_mover<B: Host>(programs: &B::Programs, step: &Step) -> Option<(ChannelId, bool)> {
+    let mut moved = std::collections::BTreeSet::new();
+    let mut instances = std::collections::BTreeSet::new();
+    for attachment in step.attachments.iter().filter(|a| !a.adapter_only) {
+        if !instances.insert(attachment.instance) {
+            continue;
+        }
+        for end in programs.moved_ends(attachment.instance) {
+            if !moved.insert(end) {
+                return Some(end);
+            }
+        }
+    }
+    None
+}
+
 impl<B: Host> Gpu<B> {
     /// Fires `submission`'s forward; with `defers` its completion is left
     /// for the guest pass behind it to report.
@@ -880,6 +895,11 @@ impl<B: Host> Gpu<B> {
         at: engine::StepDone,
         defers: bool,
     ) -> EngineResult<(FireTicket, PendingStep)> {
+        debug_assert_eq!(
+            second_mover::<B>(&self.programs, submission),
+            None,
+            "a step carries at most one fire moving a given end of a ring"
+        );
         B::run_prologues(self, submission)?;
         let mut staged: Vec<Vec<u8>> = Vec::new();
         if !submission.media.is_empty() {

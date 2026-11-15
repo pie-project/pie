@@ -74,13 +74,12 @@ pub fn pieces(
         }
         if lane.mask.is_some()
             || !lane.inputs.is_empty()
-            || !lane.channels.is_empty()
             || lane.tap.is_some()
             || matches!(lane.readout, Readout::Rows(_))
         {
             return Err(refuse(
                 at,
-                "carries a mask, inputs, channels, a tap or reads rows out: a piece cannot \
+                "carries a mask, inputs, a tap or reads rows out: a piece cannot \
                  carry them",
             ));
         }

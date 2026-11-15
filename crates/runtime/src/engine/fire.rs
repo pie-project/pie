@@ -12,6 +12,17 @@ pub struct FireRequest {
     pub boundary_program: bool,
     pub voxels: Vec<engine::fire::StepVoxels>,
     pub media: Vec<engine::fire::StepMedia>,
+    /// The ring ends this fire moves. Two fires moving one end never share
+    /// a step; the engine picks each move's cell from its ring's cursor.
+    pub ring_moves: Vec<RingMove>,
+}
+
+/// A fire takes from (`takes`) or puts to (`puts`) a ring's cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingMove {
+    pub channel: engine::ChannelId,
+    pub takes: bool,
+    pub puts: bool,
 }
 
 impl FireRequest {

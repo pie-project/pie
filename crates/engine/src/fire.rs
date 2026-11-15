@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
-use crate::channel::{ChannelId, Ticket};
+use crate::channel::ChannelId;
 use crate::chunk::{ChunkFacts, ShapeId, SlotKind};
 use crate::error::{Error, Result};
 use crate::program::InstanceId;
@@ -208,8 +208,6 @@ pub struct Lane {
     /// in slots of their own as it runs.
     #[serde(default)]
     pub rs_snapshots: Vec<RsSnapshot>,
-    #[serde(default)]
-    pub channels: Vec<Ticket>,
     pub readout: Readout,
     /// Unique to its pass in a fire, so two passes' lanes never attend each other.
     #[serde(default)]
@@ -331,9 +329,6 @@ impl Lane {
                 self.slot,
                 self.rows()
             )));
-        }
-        if !self.channels.is_empty() && !serves.device_channel_commit {
-            return Err(Error::unsupported("engine", F3_CHANNEL_TICKETS));
         }
         if !matches!(self.rs, RsVerb::Fold) && !serves.rs_verbs {
             return Err(Error::unsupported("engine", RS_VERBS_WITHOUT_DEVICE_HALF));
@@ -487,15 +482,11 @@ impl Lane {
 const CHUNK_REFS_WITHOUT_CHUNKS: &str =
     "Lane::tables and Lane::fixed against an engine that states no chunks";
 
-const F3_CHANNEL_TICKETS: &str =
-    "Lane::channels against an engine without the pull-validate and commit-bump kernels";
-
 const RS_VERBS_WITHOUT_DEVICE_HALF: &str =
     "Lane::rs beyond RsVerb::Fold: this engine has no device half for it";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Serves {
-    pub device_channel_commit: bool,
     pub rs_verbs: bool,
     pub adapter_attachments: bool,
     pub rs_snapshots: u32,
@@ -506,7 +497,6 @@ pub struct Serves {
 
 impl Serves {
     pub const NONE: Serves = Serves {
-        device_channel_commit: false,
         rs_verbs: false,
         adapter_attachments: false,
         rs_snapshots: 0,
@@ -516,7 +506,6 @@ impl Serves {
     #[must_use]
     pub fn of(caps: &crate::Capabilities) -> Serves {
         Serves {
-            device_channel_commit: caps.device_channel_commit,
             rs_verbs: caps.rs_verbs,
             adapter_attachments: caps.adapter_attachments,
             rs_snapshots: caps.rs_snapshots,
@@ -718,6 +707,10 @@ impl StepVoxels {
     }
 }
 
+/// One step of a fire. A step carries at most one fire moving a given end of
+/// a ring (its takes, or its puts): the engine gives each move the cell the
+/// ring's cursor stands at as it builds the step, and reads no order among the
+/// fires of one step.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Step {
     pub lanes: Vec<Lane>,

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel, Ticket};
+use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::program::{
     BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, ProgramRegistration,
     Rebind, RingFacts,
@@ -487,64 +487,6 @@ impl Plane {
             geometry: binding.geometry,
             standing_guest_bytes: 0,
         })
-    }
-
-    #[must_use]
-    pub fn disagreeing_ticket(&self, instance: InstanceId, tickets: &[Ticket]) -> Option<String> {
-        let seat = self.instances.get(&instance)?;
-        #[cfg(feature = "wgpu")]
-        let airborne = u64::from(seat.gate.airborne());
-        #[cfg(not(feature = "wgpu"))]
-        let airborne = 0u64;
-        for ticket in tickets {
-            let Some(dense) = seat.channels.iter().position(|id| *id == ticket.channel) else {
-                return Some(format!(
-                    "instance {instance} predicted about channel {}, which it does not carry",
-                    ticket.channel
-                ));
-            };
-            let Some(ring) = seat.inst.channels.get(dense) else {
-                return Some(format!(
-                    "instance {instance} carries channel {} as its {dense}th, past its rings",
-                    ticket.channel
-                ));
-            };
-            let (takes, puts) =
-                seat.plan
-                    .package
-                    .stages
-                    .iter()
-                    .fold((0u64, 0u64), |(takes, puts), stage| {
-                        (
-                            takes
-                                + stage.takes.iter().filter(|&&c| c as usize == dense).count()
-                                    as u64,
-                            puts + stage
-                                .puts
-                                .iter()
-                                .filter(|p| p.channel as usize == dense)
-                                .count() as u64,
-                        )
-                    });
-            let head = ring.head() + airborne * takes;
-            let tail = ring.tail() + airborne * puts;
-            let stated = |claim: u64, held: u64, end: &str| {
-                (claim != Ticket::NONE && claim != held).then(|| {
-                    format!(
-                        "instance {instance}'s channel {} stands at {end} {held} and the caller \
-                         predicted {claim}",
-                        ticket.channel
-                    )
-                })
-            };
-            if let Some(why) = stated(ticket.expected_head, head, "head") {
-                return Some(why);
-            }
-            if let Some(why) = stated(ticket.expected_tail, tail, "tail") {
-                return Some(why);
-            }
-        }
-        None
     }
 
     #[must_use]
@@ -1250,6 +1192,15 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         place: Option<&Place<'_, crate::device::Api>>,
     ) -> Result<BoundInstance, Refusal> {
         Plane::bind(self, binding, place)
+    }
+
+    fn moved_ends(&self, instance: InstanceId) -> Vec<(ChannelId, bool)> {
+        self.instances.get(&instance).map_or_else(Vec::new, |seat| {
+            engine_gpu::program::moved_ends(&seat.plan.package)
+                .into_iter()
+                .filter_map(|(dense, tail)| Some((*seat.channels.get(dense as usize)?, tail)))
+                .collect()
+        })
     }
 
     fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {

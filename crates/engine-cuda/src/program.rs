@@ -676,36 +676,6 @@ impl Plane {
         Ok(bound.session.blocked_channel(&program.plan))
     }
 
-    #[must_use]
-    pub fn disagreeing_ticket(&self, id: InstanceId, tickets: &[engine::Ticket]) -> Option<String> {
-        let bound = self.instances.get(&id)?;
-        for ticket in tickets {
-            let Some(dense) = bound.ids.iter().position(|held| *held == ticket.channel) else {
-                return Some(format!(
-                    "instance {id} predicted about channel {}, which it does not carry",
-                    ticket.channel
-                ));
-            };
-            let cursor = bound.session.cursor(dense as u32)?;
-            let stated = |claim: u64, held: u64, end: &str| {
-                (claim != engine::Ticket::NONE && claim != held).then(|| {
-                    format!(
-                        "instance {id}'s channel {} stands at {end} {held} and the caller \
-                         predicted {claim}",
-                        ticket.channel
-                    )
-                })
-            };
-            if let Some(why) = stated(ticket.expected_head, cursor.head, "head") {
-                return Some(why);
-            }
-            if let Some(why) = stated(ticket.expected_tail, cursor.tail, "tail") {
-                return Some(why);
-            }
-        }
-        None
-    }
-
     pub fn fire(&mut self, context: &Context, id: InstanceId) -> Result<Fired> {
         if self.prologue_runs(id) {
             let fired = self.fire_at(context, id, Attach::Prologue)?;
