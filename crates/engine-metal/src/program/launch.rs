@@ -2183,6 +2183,7 @@ impl Batch {
             u64::from(count) * u64::from(self.shape.channel_slots_per_lane),
         )?;
         let scratch = self.scratch()?.clone();
+        #[cfg(target_vendor = "apple")]
         poison_scratch(frame, scratch.buffer.slab(), scratch.offset, u64::from(count) * stride)?;
         let frame: &Frame = frame;
         let vocab = members[0]
@@ -2618,7 +2619,6 @@ impl Batch {
     }
 }
 
-#[cfg(target_vendor = "apple")]
 /// One streamed step of a member bound on `encoder` ([`Prepared::bind_streamed`]).
 #[cfg(target_vendor = "apple")]
 pub(crate) fn dispatch_streamed_step(
@@ -2629,6 +2629,7 @@ pub(crate) fn dispatch_streamed_step(
     dispatch_streamed(encoder, &[step], threads, GROUPED_LANES as usize);
 }
 
+#[cfg(target_vendor = "apple")]
 fn dispatch_streamed(
     encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
     dispatches: &[(StepWord, u32)],

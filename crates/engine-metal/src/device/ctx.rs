@@ -548,6 +548,7 @@ impl Frame {
 
     /// No device off Apple: no pass to open.
     #[cfg(not(target_vendor = "apple"))]
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     pub(crate) fn next_pass(&mut self) -> Result<()> {
         Err(Fault::Deviceless)
     }

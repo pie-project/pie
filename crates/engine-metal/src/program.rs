@@ -323,6 +323,7 @@ impl Plane {
 
     /// Test builds: the form each region of `id`'s stages compiled to.
     #[cfg(test)]
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     pub(crate) fn region_forms(&self, id: ProgramId) -> Vec<compile::Form> {
         self.programs
             .get(&id)
@@ -798,6 +799,7 @@ impl Plane {
                         // one concurrent pass, step k of every member, then a
                         // barrier, then step k + 1, so the GPU may run them
                         // together. Members sharing a ring keep their order.
+                        #[cfg(target_vendor = "apple")]
                         let rings = rings_of.get(&None).map(Vec::as_slice).unwrap_or(&[]);
                         #[cfg(target_vendor = "apple")]
                         if group.len() > 1
@@ -2007,6 +2009,7 @@ fn ring_ends_moved_once(
 
 /// Whether no ring is two members': members that share one are ordered
 /// through its cursor, so they fire one after another.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 fn rings_disjoint(rings: &[Vec<usize>]) -> bool {
     let mut seen = std::collections::BTreeSet::new();
     rings.iter().all(|member| {

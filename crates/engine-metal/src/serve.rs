@@ -4814,6 +4814,7 @@ impl Shell {
     /// The forward encoded; `dry`, for a frame that is dropped uncommitted
     /// (the load's pipeline walk): no early head is flushed to run and no
     /// Neural Engine hand-off is armed, so nothing of it reaches a queue.
+    #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     fn walk(&self, p: &Prepared<'_>, dry: bool) -> Result<Walked> {
         let place = At::new();
         let mut frame = self.device.frame()?;
