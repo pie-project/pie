@@ -32,6 +32,9 @@ const OUTBOX_FLOOR: u64 = 256;
 
 const OUTBOX_KIND: Memory = Memory::Host;
 
+/// What a program's fires dispatch through: the layout its stages bind and
+/// every stage's pipelines, built once at the program's registration and
+/// shared by every session that runs it.
 pub struct Code {
     binds: wgpu::BindGroupLayout,
     _layout: wgpu::PipelineLayout,
@@ -52,21 +55,41 @@ impl std::fmt::Debug for Code {
     }
 }
 
+// A program's entry shares its code with whichever thread built it.
+const _: fn() = || {
+    fn shared<T: Send + Sync>() {}
+    shared::<Code>();
+};
+
 impl Code {
-    pub fn new(device: &Context, code: &[engine_gpu::guest::Lowered<String>]) -> Result<Code> {
-        let core = device.core().clone();
-        let binds = bind_layout(&core);
-        let layout = core
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("pie guest"),
-                bind_group_layouts: &[Some(&binds)],
-                immediate_size: 0,
-            });
-        core.take_error("create_pipeline_layout")?;
+    /// Builds every stage of a lowered program. It takes the device's
+    /// shared core and nothing of the plane, so it runs on any thread that
+    /// may block.
+    pub(crate) fn build(
+        core: &Arc<Core>,
+        code: &[engine_gpu::guest::Lowered<String>],
+    ) -> Result<Code> {
+        // Under its own error scope, as every pipeline below: the build
+        // reads and raises nothing in the device's one uncaptured-error
+        // slot, which stays the lane's.
+        let (binds, layout) = crate::guest::validated(core, "create_pipeline_layout", || {
+            let binds = bind_layout(core);
+            let layout = core
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("pie guest"),
+                    bind_group_layouts: &[Some(&binds)],
+                    immediate_size: 0,
+                });
+            (binds, layout)
+        })
+        .map_err(|why| Fault::Wgpu {
+            what: "create_pipeline_layout",
+            why,
+        })?;
         let stages = code
             .iter()
-            .map(|lowered| build_pipelines(&core, &layout, lowered))
+            .map(|lowered| build_pipelines(core, &layout, lowered))
             .collect::<Result<Vec<_>>>()?;
         Ok(Code {
             binds,
@@ -82,6 +105,12 @@ impl Code {
     #[must_use]
     pub fn stages(&self) -> usize {
         self.stages.len()
+    }
+
+    /// The pipelines built for each stage, one for each step it dispatches.
+    #[must_use]
+    pub fn pipelines(&self) -> Vec<usize> {
+        self.stages.iter().map(Vec::len).collect()
     }
 }
 

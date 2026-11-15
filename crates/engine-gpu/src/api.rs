@@ -109,6 +109,10 @@ pub struct Gpu<B: Host> {
 
     pub programs: B::Programs,
 
+    /// What the engine counts while it serves: a bind or a fire that met
+    /// something unbuilt.
+    live: engine::live::Live,
+
     adapters: BTreeMap<InstanceId, crate::adapter::Binding>,
 
     /// A device the host handed over, adopted at the load.
@@ -128,6 +132,7 @@ impl<B: Host> Gpu<B> {
             sink: None,
             pending: None,
             programs: B::Programs::default(),
+            live: engine::live::Live::armed(),
             adapters: BTreeMap::new(),
             handed: None,
         }
@@ -212,7 +217,7 @@ fn kv_copy_direction(src: MemoryDomain, dst: MemoryDomain) -> &'static str {
 pub fn refusal(refusal: Refusal) -> Error {
     match refusal {
         Refusal::Closed { what, id } => Error::Closed { what, id },
-        Refusal::Program(why) => Error::Program(why),
+        Refusal::Program(why) | Refusal::Unbuilt(why) => Error::Program(why),
     }
 }
 
@@ -407,6 +412,10 @@ where
         }
     }
 
+    fn live(&self) -> engine::live::Live {
+        self.live.clone()
+    }
+
     fn load(&mut self, request: LoadRequest) -> EngineResult<Loaded> {
         if self.shell.is_some() {
             return Err(Error::Load(format!(
@@ -539,6 +548,9 @@ where
             classes: shell.classes(),
         };
 
+        self.programs
+            .loaded(shell.device(), &self.live)
+            .map_err(refusal)?;
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -690,9 +702,15 @@ where
         registration: &ProgramRegistration,
         built: engine::ProgramBuilt,
     ) -> EngineResult<ProgramId> {
-        let id = self.programs.register(registration).map_err(refusal)?;
-        built(Ok(()));
-        Ok(id)
+        // What the program's fires dispatch through is built on the loaded
+        // device; `built` is told from wherever that build ends.
+        let shell = self
+            .shell
+            .as_ref()
+            .ok_or_else(|| Error::Program("register_program before load".to_string()))?;
+        self.programs
+            .register(registration, shell.device(), built)
+            .map_err(refusal)
     }
 
     fn register_channel(

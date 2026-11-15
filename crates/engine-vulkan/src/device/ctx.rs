@@ -1045,7 +1045,7 @@ impl Context {
     }
 
     #[must_use]
-    pub fn pipeline_cache(&self) -> &PipelineCache {
+    pub fn pipeline_cache(&self) -> &Arc<PipelineCache> {
         &self.pipeline_cache
     }
 

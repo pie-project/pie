@@ -3,7 +3,9 @@
 //! reads of an instance. Each backend's plane runs its device halves its own
 //! way.
 
+use engine::ProgramBuilt;
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
+use engine::live::Live;
 use engine::program::{
     BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, ProgramRegistration,
     Rebind, RingFacts,
@@ -24,16 +26,23 @@ pub struct Place<'a, B: Serve> {
 
 #[derive(Debug)]
 pub enum Refusal {
-    Closed { what: &'static str, id: u64 },
+    Closed {
+        what: &'static str,
+        id: u64,
+    },
 
     Program(String),
+
+    /// A bind or a fire met something its program's registration was to
+    /// have built.
+    Unbuilt(String),
 }
 
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Refusal::Closed { what, id } => write!(f, "{what} {id} is closed"),
-            Refusal::Program(why) => f.write_str(why),
+            Refusal::Program(why) | Refusal::Unbuilt(why) => f.write_str(why),
         }
     }
 }
@@ -46,7 +55,24 @@ impl From<String> for Refusal {
 
 /// A backend's program plane.
 pub trait Programs<B: Serve>: Default {
-    fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal>;
+    /// Builds, at the load, what the plane's fires dispatch through that
+    /// follows from no program (the readout widen its instances share), and
+    /// starts what its programs are built on. `live` is where a bind or a
+    /// fire that meets something unbuilt is counted.
+    fn loaded(&mut self, device: &B::Context, live: &Live) -> Result<(), Refusal>;
+
+    /// Registers a program (`Engine::register_program`). The call adopts
+    /// and lowers it and has everything its fires dispatch through built on
+    /// `device`, off the caller's thread where the backend has one; `built`
+    /// is told once, when that build ends. Refused, the call drops `built`
+    /// untold. A hash already registered starts no build. A bind and a fire
+    /// find the program built and build nothing.
+    fn register(
+        &mut self,
+        registration: &ProgramRegistration,
+        device: &B::Context,
+        built: ProgramBuilt,
+    ) -> Result<ProgramId, Refusal>;
 
     fn package(&self, program: ProgramId) -> Option<&LaunchPackage>;
 

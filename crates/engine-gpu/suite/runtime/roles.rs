@@ -280,16 +280,14 @@ fn an_instance_in_pool_slots_fires_through_moves() {
     let bound = eta_ir::validate::bind(program(), vec![decls], EngineCaps::default())
         .expect("the program binds");
     let stages = eta_compiler::plan::compile_bound(&bound);
-    let program = engine
-        .register_program(
-            &ProgramRegistration {
-                program_hash: 0x5107,
-                launch: eta_compiler::codegen::launch::build(&bound, &stages),
-                ..Default::default()
-            },
-            Box::new(|built| built.expect("the program builds")),
-        )
-        .expect("the program registers");
+    let program = super::registered(
+        &mut engine,
+        &ProgramRegistration {
+            program_hash: 0x5107,
+            launch: eta_compiler::codegen::launch::build(&bound, &stages),
+            ..Default::default()
+        },
+    );
     // Channel 3 (`last`) is the instance's own; the rest are registered.
     let channels: Vec<ChannelId> = (1..=5).map(ChannelId).collect();
     let registered: Vec<ChannelId> = [0usize, 1, 2, 4].map(|k| channels[k]).to_vec();

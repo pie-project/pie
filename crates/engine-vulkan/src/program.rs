@@ -43,22 +43,41 @@ struct Instance {
 
 use engine_gpu::serve::InputCell;
 
+/// What a program's registration builds for its fires.
+#[cfg(feature = "vulkan")]
+type Code = crate::guest::session::Code;
+#[cfg(not(feature = "vulkan"))]
+type Code = ();
+
+type Ready = engine_gpu::guest::Ready<crate::device::Api, Code>;
+
+/// A program's build as the build thread takes it: the job, and the
+/// device's shared handles it builds over. Nothing of the plane.
+#[cfg(feature = "vulkan")]
+struct Build {
+    job: engine_gpu::guest::Job<crate::device::Api, Code>,
+    core: Arc<crate::device::ctx::Core>,
+    cache: Arc<crate::device::ctx::PipelineCache>,
+}
+
 #[derive(Default)]
 pub struct Plane {
-    programs: BTreeMap<ProgramId, Arc<ExecPlan>>,
-
-    forms: engine_gpu::guest::Forms<crate::device::Api>,
+    /// The programs registered, each with the pipelines its registration
+    /// built.
+    programs: engine_gpu::guest::Registry<crate::device::Api, Code>,
 
     channels: BTreeMap<ChannelId, Arc<ChannelState>>,
     instances: BTreeMap<InstanceId, Instance>,
-    next_program: u64,
     next_instance: u64,
 
+    /// The readout widen every instance's fires share, built at the load.
     #[cfg(feature = "vulkan")]
     widen: Option<crate::guest::widen::Widen>,
 
+    /// The queue of the thread programs are built on, started at the load.
+    /// The thread ends when the plane drops this.
     #[cfg(feature = "vulkan")]
-    built: crate::guest::session::BuiltStages,
+    builder: Option<std::sync::mpsc::Sender<Build>>,
 
     #[cfg(feature = "vulkan")]
     kept: crate::guest::session::Kept,
@@ -68,27 +87,95 @@ pub struct Plane {
 }
 
 impl Plane {
-    pub fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
-        let plan = eta_exec::adopt_launch_package(registration.launch.clone())
-            .map_err(|error| Refusal::Program(error.to_string()))?;
-        if !plan.executable {
-            return Err(Refusal::Program(format!(
-                "program 0x{:016x} does not interpret: {}",
-                registration.program_hash,
-                plan.reject_reason.as_deref().unwrap_or("no reason given")
-            )));
+    /// Builds the readout widen and starts the thread programs are built
+    /// on, at the load: the widen follows from no program, and fires on
+    /// the lane arm it. `live` is where a bind or a fire that meets
+    /// something unbuilt is counted.
+    pub fn loaded(
+        &mut self,
+        device: &crate::device::Context,
+        live: &engine::live::Live,
+    ) -> Result<(), Refusal> {
+        self.programs.counts_into(live);
+        #[cfg(feature = "vulkan")]
+        {
+            if self.widen.is_none() {
+                let widen = crate::guest::widen::Widen::new(device).map_err(|why| {
+                    Refusal::Program(format!("the readout widen did not build: {why}"))
+                })?;
+                self.widen = Some(widen);
+            }
+            if self.builder.is_none() {
+                let (builder, builds) = std::sync::mpsc::channel::<Build>();
+                std::thread::Builder::new()
+                    .name("pie-vk-programs".to_owned())
+                    .spawn(move || {
+                        // Woken by a registration; ends with the plane,
+                        // whose drop closes the queue.
+                        while let Ok(Build { job, core, cache }) = builds.recv() {
+                            job.run(|compiled| {
+                                Code::build(&core, &cache, compiled.all())
+                                    .map_err(|fault| fault.to_string())
+                            });
+                        }
+                    })
+                    .map_err(|why| {
+                        Refusal::Program(format!(
+                            "the thread guest programs are built on did not start: {why}"
+                        ))
+                    })?;
+                self.builder = Some(builder);
+            }
         }
-        self.next_program += 1;
-        let id = ProgramId(self.next_program);
+        #[cfg(not(feature = "vulkan"))]
+        let _ = device;
+        Ok(())
+    }
 
-        let admitted = self.forms.admit(id, &plan.package);
-        tracing::debug!(
-            program = id.0,
-            device_form = admitted,
-            why = self.forms.refusal(id).map(ToString::to_string),
-            "guest program registered"
-        );
-        self.programs.insert(id, Arc::new(plan));
+    /// Registers a program. The call adopts and lowers it and hands its
+    /// build to the plane's build thread, which builds every pipeline its
+    /// stages dispatch through over the device's shared handles while the
+    /// lane goes on firing; `built` is told when that build ends. A bind
+    /// and a fire find the program built and build nothing. A program that
+    /// does not lower is refused by the call and not registered; a hash
+    /// already registered starts no build.
+    pub fn register(
+        &mut self,
+        registration: &ProgramRegistration,
+        device: &crate::device::Context,
+        built: engine::ProgramBuilt,
+    ) -> Result<ProgramId, Refusal> {
+        use engine_gpu::guest::Adopted;
+        let (id, job) = match self.programs.adopt(registration, built)? {
+            Adopted::Known(id) => return Ok(id),
+            Adopted::New { id, job } => (id, job),
+        };
+        #[cfg(feature = "vulkan")]
+        {
+            let build = Build {
+                job,
+                core: Arc::clone(device.core()),
+                cache: Arc::clone(device.pipeline_cache()),
+            };
+            let unsent = match &self.builder {
+                Some(builder) => builder.send(build).err().map(|unsent| unsent.0),
+                None => Some(build),
+            };
+            if let Some(build) = unsent {
+                build.job.abandon();
+                self.programs.forget(id);
+                return Err(Refusal::Program(format!(
+                    "program 0x{:016x} is not registered: the thread guest programs are built \
+                     on is gone",
+                    registration.program_hash
+                )));
+            }
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            let _ = device;
+            job.run(|_| Ok(()));
+        }
         Ok(id)
     }
 
@@ -97,7 +184,23 @@ impl Plane {
         &self,
         program: ProgramId,
     ) -> Option<&eta_compiler::codegen::launch::LaunchPackage> {
-        self.programs.get(&program).map(|plan| &plan.package)
+        self.programs.package(program)
+    }
+
+    /// The pipelines built for each stage of `program`, where its
+    /// registration built them.
+    #[must_use]
+    pub fn built_pipelines(&self, program: ProgramId) -> Option<Vec<usize>> {
+        #[cfg(feature = "vulkan")]
+        return self.programs.built(program).map(|code| code.pipelines());
+        #[cfg(not(feature = "vulkan"))]
+        return self.programs.built(program).map(|_| Vec::new());
+    }
+
+    /// Builds started.
+    #[must_use]
+    pub fn builds(&self) -> u64 {
+        self.programs.builds()
     }
 
     pub fn register_channel(
@@ -174,14 +277,9 @@ impl Plane {
         binding: &InstanceBinding,
         place: Option<&Place<'_, crate::device::Api>>,
     ) -> Result<BoundInstance, Refusal> {
-        let plan = self
-            .programs
-            .get(&binding.program)
-            .cloned()
-            .ok_or(Refusal::Closed {
-                what: "program",
-                id: binding.program.0,
-            })?;
+        // Built at its registration, or refused: a bind builds nothing.
+        let ready = self.programs.ready(binding.program)?;
+        let plan = Arc::clone(&ready.plan);
         let declared = plan.package.channels.len();
         if binding.channels.len() != declared {
             return Err(Refusal::Program(format!(
@@ -222,9 +320,21 @@ impl Plane {
         let inst = eta_exec::make_host_instance(&plan, &externs, &seeds);
 
         #[cfg(feature = "vulkan")]
-        let session = self.build_session(place, binding, &plan).map_err(|why| {
+        #[cfg(feature = "vulkan")]
+        if ready.built.stages() != plan.package.plans.len() {
+            return Err(self.programs.refuse_unbuilt(format!(
+                "program {} does not bind: {} of the {} stage(s) it plans are built",
+                binding.program,
+                ready.built.stages(),
+                plan.package.plans.len()
+            )));
+        }
+        #[cfg(feature = "vulkan")]
+        let session = self.build_session(place, binding, &ready).map_err(|why| {
             Refusal::Program(format!("program {} does not bind: {why}", binding.program))
         })?;
+        #[cfg(not(feature = "vulkan"))]
+        let _: &Ready = &ready;
         // The device cells of the channels this instance holds itself.
         #[cfg_attr(not(feature = "vulkan"), allow(unused_mut))]
         let mut own_cells = Vec::new();
@@ -278,14 +388,6 @@ impl Plane {
         })
     }
 
-    #[must_use]
-    pub fn device_form(&self, program: ProgramId) -> (bool, Option<String>) {
-        (
-            self.forms.get(program).is_some(),
-            self.forms.refusal(program).map(ToString::to_string),
-        )
-    }
-
     pub fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {
         let seat = self.instances.remove(&id).ok_or(Refusal::Closed {
             what: "instance",
@@ -313,14 +415,7 @@ impl Plane {
         program: ProgramId,
         place: &Place<'_, crate::device::Api>,
     ) -> Result<ProgramFacts, Refusal> {
-        let plan = self.programs.get(&program).ok_or(Refusal::Closed {
-            what: "program",
-            id: program.0,
-        })?;
-        if self.forms.get(program).is_none() {
-            // No device half: the bind refuses it.
-            return Ok(ProgramFacts::default());
-        }
+        let plan = &self.programs.get(program)?.plan;
         let sizes = engine_gpu::guest::session::program_table_sizes(&plan.package.plans);
         let instance =
             engine_gpu::guest::held::table_footprint(place.pools, INSTANCE, &sizes, place.align)
@@ -715,6 +810,8 @@ impl Plane {
             tally,
             #[cfg(feature = "vulkan")]
             widen,
+            #[cfg(feature = "vulkan")]
+            programs,
             ..
         } = self;
         let seat = instances.get_mut(&instance).ok_or(Refusal::Closed {
@@ -734,7 +831,7 @@ impl Plane {
                 )));
             }
             (_, false) => {
-                return Err(Refusal::Program(format!(
+                return Err(programs.refuse_unbuilt(format!(
                     "instance {instance} has a device half, but the plane built no readout widen"
                 )));
             }
@@ -832,6 +929,7 @@ impl Plane {
             instances,
             tally,
             widen,
+            programs,
             ..
         } = self;
         let seat = instances.get_mut(&instance).ok_or(Refusal::Closed {
@@ -839,7 +937,7 @@ impl Plane {
             id: instance.0,
         })?;
         let widen = widen.as_ref().ok_or_else(|| {
-            Refusal::Program(format!(
+            programs.refuse_unbuilt(format!(
                 "instance {instance} has a device half, but the plane built no readout widen"
             ))
         })?;
@@ -956,39 +1054,19 @@ impl Plane {
         Ok(())
     }
 
+    /// An instance's device half over the pipelines its program's
+    /// registration built: tables, descriptors and buffers, no pipeline.
     #[cfg(feature = "vulkan")]
     fn build_session(
-        &mut self,
+        &self,
         place: Option<&Place<'_, crate::device::Api>>,
         binding: &InstanceBinding,
-        plan: &ExecPlan,
+        ready: &Ready,
     ) -> Result<crate::guest::session::Session, String> {
         let place = place.ok_or_else(|| {
             "this engine bound no device, so a guest pass has nowhere to run".to_owned()
         })?;
         let device = place.device;
-        let compiled = self
-            .forms
-            .get(binding.program)
-            .ok_or_else(|| match self.device_form(binding.program).1 {
-                Some(why) => format!("its stages do not lower to a shader: {why}"),
-                None => "its stages do not lower to a shader".to_owned(),
-            })?
-            .clone();
-        if compiled.len() != plan.package.plans.len() {
-            return Err(format!(
-                "it lowered {} stage(s) against the {} it plans",
-                compiled.len(),
-                plan.package.plans.len()
-            ));
-        }
-
-        if self.widen.is_none() {
-            match crate::guest::widen::Widen::new(device) {
-                Ok(widen) => self.widen = Some(widen),
-                Err(why) => return Err(format!("the readout widen did not build: {why}")),
-            }
-        }
         let extents = eta_exec::Extents {
             row_count: binding.extents.row_count,
             token_count: binding.extents.token_count,
@@ -998,10 +1076,10 @@ impl Plane {
         };
         crate::guest::session::Session::new(
             device,
-            &plan.package.plans,
-            compiled.all(),
+            &ready.plan.package.plans,
+            ready.compiled.all(),
             &extents,
-            &mut self.built,
+            &ready.built,
             Arc::clone(&self.kept),
             binding.channels.clone(),
             &crate::guest::session::Tables {
@@ -1027,8 +1105,21 @@ impl Plane {
 }
 
 impl engine_gpu::program::Programs<crate::device::Api> for Plane {
-    fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
-        Plane::register(self, registration)
+    fn loaded(
+        &mut self,
+        device: &crate::device::Context,
+        live: &engine::live::Live,
+    ) -> Result<(), Refusal> {
+        Plane::loaded(self, device, live)
+    }
+
+    fn register(
+        &mut self,
+        registration: &ProgramRegistration,
+        device: &crate::device::Context,
+        built: engine::ProgramBuilt,
+    ) -> Result<ProgramId, Refusal> {
+        Plane::register(self, registration, device, built)
     }
 
     fn package(&self, program: ProgramId) -> Option<&eta_compiler::codegen::launch::LaunchPackage> {

@@ -7,7 +7,7 @@ use eta_exec::{Extents, ValueDesc};
 
 use crate::device::Context;
 use crate::device::alloc::{Buffer, Memory};
-use crate::device::ctx::{Core, Frame, Pending};
+use crate::device::ctx::{Core, Frame, Pending, PipelineCache};
 use engine_gpu::error::{Fault, Result};
 use engine_gpu::store::Pools;
 use engine_gpu::store::layout::{CHANNEL, INSTANCE};
@@ -18,9 +18,8 @@ use engine_gpu::guest::session::{BINDINGS, StageTables, groups_for, stage_tables
 /// A span of a pool slot (or run) a guest holds.
 pub type Held = held::Held<crate::device::Api>;
 
-/// A stage's pipelines, which follow from its SPIR-V alone: built once per
-/// distinct stage and shared by every session that runs it, since a mobile
-/// driver takes seconds to build a sampler's worth of them.
+/// A stage's pipelines and the layouts they bind through, which follow from
+/// its SPIR-V alone.
 pub struct Built {
     core: Arc<Core>,
     layout: vk::PipelineLayout,
@@ -31,9 +30,10 @@ pub struct Built {
 impl Drop for Built {
     fn drop(&mut self) {
         let d = &self.core.device;
-        // SAFETY: the last `Arc<Built>` is gone with the last session that ran
-        // it; each session settles its frames before it drops, so no pending
-        // command uses these pipelines or layouts.
+        // SAFETY: the last `Arc<Built>` is gone with the program's entry and
+        // the last session that ran it; each session settles its frames
+        // before it drops, so no pending command uses these pipelines or
+        // layouts.
         unsafe {
             for &pipeline in &self.pipelines {
                 d.destroy_pipeline(pipeline, None);
@@ -44,15 +44,47 @@ impl Drop for Built {
     }
 }
 
-/// Built stages by the hash of their SPIR-V and entry points.
-pub type BuiltStages = std::collections::HashMap<u64, Arc<Built>>;
+/// What a program's fires dispatch through: every stage's pipelines, built
+/// once at the program's registration and shared by every session that runs
+/// it, since a mobile driver takes seconds to build a sampler's worth of
+/// them.
+pub struct Code {
+    stages: Vec<Arc<Built>>,
+}
 
-fn stage_key(lowered: &engine_gpu::guest::Lowered<Vec<u32>>) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    lowered.code.hash(&mut hasher);
-    lowered.entries.hash(&mut hasher);
-    hasher.finish()
+// A program's entry shares its code with whichever thread built it.
+const _: fn() = || {
+    fn shared<T: Send + Sync>() {}
+    shared::<Code>();
+};
+
+impl Code {
+    /// Builds every stage of a lowered program. It takes the device's
+    /// shared handles and nothing of the plane, so it runs on any thread.
+    pub(crate) fn build(
+        core: &Arc<Core>,
+        cache: &PipelineCache,
+        lowered: &[engine_gpu::guest::Lowered<Vec<u32>>],
+    ) -> Result<Code> {
+        let stages = lowered
+            .iter()
+            .map(|stage| build_pipelines(core, cache, stage).map(Arc::new))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Code { stages })
+    }
+
+    #[must_use]
+    pub fn stages(&self) -> usize {
+        self.stages.len()
+    }
+
+    /// The pipelines built for each stage, one for each step it dispatches.
+    #[must_use]
+    pub fn pipelines(&self) -> Vec<usize> {
+        (self.stages.iter())
+            .map(|stage| stage.pipelines.len())
+            .collect()
+    }
 }
 
 struct Stage {
@@ -235,18 +267,20 @@ impl Session {
         plans: &[LaunchStagePlan],
         code: &[engine_gpu::guest::Lowered<Vec<u32>>],
         extents: &Extents,
-        built: &mut BuiltStages,
+        built: &Code,
         kept: Kept,
         channels: Vec<engine::channel::ChannelId>,
         tables: &Tables<'_>,
     ) -> Result<Session> {
-        if code.len() != plans.len() {
+        if code.len() != plans.len() || built.stages() != plans.len() {
             return Err(Fault::Program {
                 at: "guest::session",
                 why: format!(
-                    "{} stage plans but {} compiled forms; a session runs every stage or none",
+                    "{} stage plans but {} compiled forms and {} built; a session runs every \
+                     stage or none",
                     plans.len(),
-                    code.len()
+                    code.len(),
+                    built.stages()
                 ),
             });
         }
@@ -278,18 +312,17 @@ impl Session {
             held::place_tables(tables.pools, INSTANCE, tables.slots, &bytes, tables.align)?;
         let mut placed = placed.into_iter();
         let mut stages = Vec::with_capacity(plans.len());
-        for ((plan, lowered), resolved) in plans.iter().zip(code).zip(resolved) {
-            let pipelines = match built.get(&stage_key(lowered)) {
-                Some(pipelines) => Arc::clone(pipelines),
-                None => {
-                    let pipelines = Arc::new(build_pipelines(device, lowered)?);
-                    built.insert(stage_key(lowered), Arc::clone(&pipelines));
-                    pipelines
-                }
-            };
+        for (((plan, lowered), pipelines), resolved) in
+            plans.iter().zip(code).zip(&built.stages).zip(resolved)
+        {
             let tables = [(); 4].map(|()| placed.next().expect("four tables a stage"));
             stages.push(build_stage(
-                device, plan, lowered, resolved, tables, pipelines,
+                device,
+                plan,
+                lowered,
+                resolved,
+                tables,
+                Arc::clone(pipelines),
             )?);
         }
 
@@ -844,10 +877,10 @@ fn build_stage(
 }
 
 fn build_pipelines(
-    device: &Context,
+    core: &Arc<Core>,
+    cache: &PipelineCache,
     lowered: &engine_gpu::guest::Lowered<Vec<u32>>,
 ) -> Result<Built> {
-    let core = device.core();
     // The layout the stage's SPIR-V was checked against when it lowered.
     let bindings: Vec<vk::DescriptorSetLayoutBinding> = crate::guest::stage_layout()
         .into_iter()
@@ -925,7 +958,6 @@ fn build_pipelines(
                 pipelines: Vec::new(),
             });
         }
-        let cache = device.pipeline_cache();
         let built = d.create_compute_pipelines(cache.handle(), &infos, None);
         d.destroy_shader_module(module, None);
         match built {
