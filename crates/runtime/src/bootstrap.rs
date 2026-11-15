@@ -463,7 +463,17 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let seat_to_end = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seat_to_end);
     let seat_spread = seat_to_end && engine_configs.iter().all(|d| d.seat_spread);
     if let Some(d) = engine_configs.first() {
-        if kv_swap_capable {
+        if kv_swap_capable && crate::store::shared::SharedPool::states_shared(&d.chunks) {
+            // A shared pool states its tiers in chunks, not in the page
+            // fields its engine leaves at 0.
+            tracing::info!(
+                device_pages = d.total_pages,
+                host_chunks = d.chunks.host_chunks,
+                disk_chunks = d.chunks.disk_chunks,
+                chunk_bytes = d.chunks.chunk_bytes,
+                "kv tiers: suspended kv goes to the host, then the disk"
+            );
+        } else if kv_swap_capable {
             tracing::info!(
                 device_pages = d.total_pages,
                 host_pages = d.cpu_pages,
