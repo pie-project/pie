@@ -275,6 +275,17 @@ impl<P: PoolTarget + SlotAccess, W: crate::store::weights::WeightPort> Shared<We
         let shared = self.clone();
         Arc::new(move || shared.shed())
     }
+
+    /// What a raise calls to have the weight cache let go its atoms in the
+    /// span it takes ([`WeightFirst::clear_span`]).
+    pub fn span_clear_hook(&self) -> crate::store::shared::SpanClear
+    where
+        P: Send + 'static,
+        W: Send + 'static,
+    {
+        let shared = self.clone();
+        Arc::new(move |from| shared.with(|pool| pool.clear_span(from)))
+    }
 }
 
 impl<P: PoolTarget> PoolTarget for Shared<P> {

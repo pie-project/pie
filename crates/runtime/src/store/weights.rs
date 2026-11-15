@@ -575,6 +575,37 @@ impl WeightCache {
         shed
     }
 
+    /// Lets every resident atom above the floor whose slot lies at or past
+    /// physical chunk `from` go, the fire at `epoch` the last that may read
+    /// them: what a raise asks cleared of the span ([`SlotPool::clear_span`];
+    /// live state never lies there, so cache is all a raise clears). The
+    /// atoms stream again, and come back at break-even into room below
+    /// what the raise asked. The slots it gives back.
+    pub fn clear_span(&mut self, pool: &mut SlotPool, from: u32, epoch: u64) -> u64 {
+        let mut cleared = 0;
+        for at in 0..self.shapes.len() {
+            let kept = &mut self.shapes[at];
+            let gone: Vec<u32> = kept
+                .resident
+                .iter()
+                .filter(|(_, slot)| pool.physical(slot.chunk).is_some_and(|at| at >= from))
+                .map(|(&atom, _)| atom)
+                .collect();
+            if gone.is_empty() {
+                continue;
+            }
+            let slots: Vec<Slot> = gone
+                .iter()
+                .filter_map(|atom| kept.resident.remove(atom))
+                .collect();
+            pool.release(kept.holder(false), &slots, epoch);
+            cleared += slots.len() as u64;
+            self.left(at, gone);
+        }
+        self.changed |= cleared > 0;
+        cleared
+    }
+
     /// Held, the streaming set live demand asks for (rule 1): each shape
     /// stages through `floor_slots` of the slots its highest atoms hold,
     /// and every other atom stays resident until a shed lets it go. `None`
@@ -682,8 +713,10 @@ impl WeightCache {
             .filter(|&(_, read)| read < last)
             .collect();
         idle.sort_unstable_by_key(|a| (a.1, a.0));
+        // Cache room: the span a lowered rung leaves counts, which live
+        // state never opens.
         let room = if refill {
-            usize::try_from(pool.available(kept.pool)).unwrap_or(usize::MAX)
+            usize::try_from(pool.available_cache(kept.pool)).unwrap_or(usize::MAX)
         } else {
             0
         };
@@ -844,6 +877,24 @@ impl<P: PoolTarget + SlotAccess, W: WeightPort> WeightFirst<P, W> {
             self.publish();
         }
         shed
+    }
+
+    /// Lets go the resident atoms above the floor in the span a raise asks
+    /// clear from physical chunk `from` on ([`WeightCache::clear_span`]),
+    /// the engine told the resident set before the next fire; the slots
+    /// given back. Nothing while held: every atom is pinned, live, and
+    /// none lies in the span.
+    pub fn clear_span(&mut self, from: u32) -> u64 {
+        let mut cleared = 0;
+        let cache = &mut self.cache;
+        self.inner.with_slots(&mut |pool, epoch| {
+            pool.clear_span(from);
+            cleared = cache.clear_span(pool, from, epoch);
+        });
+        if cleared > 0 {
+            self.publish();
+        }
+        cleared
     }
 
     /// Held, offers the engine the streaming set live demand asks for

@@ -651,6 +651,38 @@ pub(crate) enum Short {
     State,
 }
 
+/// The weight cache's resident atoms above its floor, `n` of them, as it
+/// takes them back into the span a lowered rung leaves: idle cache, the one
+/// holder that opens a chunk there.
+pub(crate) fn span_cache(pool: &mut SharedPool, n: u64) -> Vec<Slot> {
+    let shape = pool.weights_first();
+    let holder = Holder::Weights {
+        shape,
+        pinned: false,
+    };
+    let slots = pool.pool_mut().acquire(holder, shape, n).unwrap();
+    let base = pool.pool().live_limit();
+    for slot in &slots {
+        assert!(
+            pool.pool().physical(slot.chunk).unwrap() >= base,
+            "cache opens in the top rung's span first"
+        );
+    }
+    slots
+}
+
+/// What a raise has the weight cache do with `cached` ([`span_cache`]):
+/// let it go behind the fire at `epoch`, which then retires.
+pub(crate) fn clear_span_cache(pool: &mut SharedPool, cached: &[Slot], epoch: u64) {
+    let shape = pool.weights_first();
+    let holder = Holder::Weights {
+        shape,
+        pinned: false,
+    };
+    pool.pool_mut().release(holder, cached, epoch);
+    pool.pool_mut().retire_through(epoch);
+}
+
 /// For the walk's and the planner's tests: an on-demand pool at the largest
 /// rung, the engine told, its prefix committed whole (`prefix_whole`) or as
 /// loaded, every record held. With `lent`, the 256 rung lends span no
@@ -692,11 +724,12 @@ pub(crate) fn wait_short(pool: &mut SharedPool, short: Short) {
 /// SPEC decision 6, the governor's rung shrink: under critical pressure the
 /// walk caps fires to the smaller rung first, lowers the pool's rung only
 /// once the scheduler has no wider step in flight and every fire handed out
-/// by then has retired, and state may then take the span above it. Settled,
-/// it moves that state back out (the engine copying it before the next
-/// fire), takes the largest rung and lifts the cap.
+/// by then has retired, and the span above it is then idle cache's alone
+/// (live state never opens in the top rung's span). Settled, the raise
+/// finds the cache there and has it cleared, moves no state, takes the
+/// largest rung and lifts the cap.
 #[test]
-fn the_rung_walk_caps_fires_then_lowers_and_raises_back_with_an_evacuation() {
+fn the_rung_walk_caps_fires_then_lowers_and_raises_back_clearing_the_span_s_cache() {
     let facts = facts();
     let mut pool = pool();
     let mut engine = FakeEngine::new();
@@ -707,14 +740,14 @@ fn the_rung_walk_caps_fires_then_lowers_and_raises_back_with_an_evacuation() {
     let mut walk = RungWalk::default();
     assert_eq!(pool.rungs(), [16, 256, 2048]);
     assert_eq!(pool.rung(), 2048);
-    // What may be out counts the room under the rung the pool is at: a
-    // smaller rung's only once it is lowered.
+    // What may be out counts the room below the top rung's span, at every
+    // rung.
     let at_largest = (pool.state_chunks_now(), pool.records_capacity());
     assert_eq!(
         at_largest.0,
-        TOTAL - pool.pool().reserved_chunks() - pool.pool().act_reserved()
+        TOTAL - pool.pool().reserved_chunks() - pool.pool().act_max()
     );
-    assert!(at_largest.1 < pool.records_most());
+    assert_eq!(at_largest.1, pool.records_most());
     // Down to 256: the cap comes first.
     assert_eq!(
         walk.step(&pool, 256, u32::MAX, u32::MAX, 5, 5).unwrap(),
@@ -740,18 +773,23 @@ fn the_rung_walk_caps_fires_then_lowers_and_raises_back_with_an_evacuation() {
     );
     pool.lower_rung(256).unwrap();
     assert_eq!(pool.rung(), 256);
-    assert!(pool.state_chunks_now() > at_largest.0, "lowered: more room");
-    assert!(pool.records_capacity() > at_largest.1);
+    assert_eq!(
+        (pool.state_chunks_now(), pool.records_capacity()),
+        at_largest,
+        "lowered: no more live room"
+    );
     assert_eq!(
         pool.pool().state_limit(),
         TOTAL - 4,
-        "state may take the span above"
+        "the span above is idle cache's"
     );
     assert_eq!(
         walk.step(&pool, 256, 256, 256, 9, 9).unwrap(),
         RungStep::Wait
     );
-    // State takes the span the larger rung's fires would touch.
+    // Every record live state may take lies below the span the larger
+    // rung's fires would touch; the weight cache's atoms above its floor
+    // take the span.
     let all = pool
         .take_records(pool.records_available() as usize)
         .unwrap();
@@ -763,17 +801,25 @@ fn the_rung_walk_caps_fires_then_lowers_and_raises_back_with_an_evacuation() {
             .filter(|slot| pool.pool().physical(slot.chunk).unwrap() >= TOTAL - 12)
             .count()
     };
-    assert!(in_way(&pool) > 0);
-    // Settled: raise, the evacuation first, then lift the cap.
+    assert_eq!(in_way(&pool), 0, "no live state in the top rung's span");
+    let cached = span_cache(&mut pool, 4);
+    // Settled: the raise finds the cache in its span; its owner lets it go
+    // and the fire reading it retires; then the raise, nothing moved, then
+    // lift the cap.
+    assert_eq!(
+        walk.step(&pool, u32::MAX, 256, 256, 9, 9).unwrap_err(),
+        RungError::Pool(SlotError::SpanCached {
+            rung: 2048,
+            chunks: 2
+        })
+    );
+    clear_span_cache(&mut pool, &cached, 9);
     let RungStep::Raise { rung, evacuation } = walk.step(&pool, u32::MAX, 256, 256, 9, 9).unwrap()
     else {
         panic!("a raise");
     };
     assert_eq!(rung, 2048);
-    assert!(!evacuation.moves.is_empty(), "state in the span moves out");
-    engine
-        .evacuate(&SharedPool::rung_moves(&evacuation))
-        .unwrap();
+    assert!(evacuation.moves.is_empty(), "no state moves");
     pool.apply_rung(&evacuation, 10).unwrap();
     assert_eq!(pool.rung(), 2048);
     assert_eq!(
@@ -813,11 +859,12 @@ fn the_rung_walk_caps_fires_then_lowers_and_raises_back_with_an_evacuation() {
     );
 }
 
-/// Rungs by demand: the rung a pass's rows ask for, and what a raise lacks
-/// while state fills the span the larger rung's fires take; once some of it
-/// goes, the raise moves what is left in the span down.
+/// Rungs by demand: the rung a pass's rows ask for, and what a raise lacks:
+/// nothing, however full live state is, since it never fills the span the
+/// larger rung's fires take; idle cache there is no room to fund either,
+/// but is cleared, and the raise then moves nothing.
 #[test]
-fn a_raise_by_demand_says_what_it_lacks_and_moves_the_rest() {
+fn a_raise_by_demand_lacks_nothing_live_state_fills_and_clears_the_span_s_cache() {
     let mut pool = pool();
     let mut engine = FakeEngine::new();
     assert_eq!(
@@ -837,24 +884,88 @@ fn a_raise_by_demand_says_what_it_lacks_and_moves_the_rest() {
     let all = pool
         .take_records(pool.records_available() as usize)
         .unwrap();
-    let (chunks, pages) = pool.raise_short(2048);
-    assert!(chunks > 0, "state fills the span: the raise lacks room");
-    assert!(
-        pages >= chunks * 16,
-        "16 kv pages a chunk, and the partly filled chunks' free slots on top"
+    assert!(!all.is_empty());
+    assert_eq!(
+        pool.raise_short(2048),
+        (0, 0),
+        "live state never fills the span: the raise lacks nothing"
     );
-    assert!(pool.plan_raise(2048).is_err());
-    pool.give_records(&all[..all.len() / 2]);
-    pool.pool_mut().retire_through(u64::MAX);
-    assert_eq!(pool.raise_short(2048), (0, 0));
+    let cached = span_cache(&mut pool, 6);
+    assert_eq!(pool.raise_short(2048), (0, 0), "cache is no room to fund");
+    assert!(
+        pool.plan_raise(2048)
+            .is_err_and(|error| error.span_cached()),
+        "cache in the span: cleared first"
+    );
+    clear_span_cache(&mut pool, &cached, 1);
     let evacuation = pool.plan_raise(2048).unwrap();
-    assert!(!evacuation.moves.is_empty(), "the span's state moves down");
-    engine
-        .evacuate(&SharedPool::rung_moves(&evacuation))
-        .unwrap();
+    assert!(evacuation.moves.is_empty(), "no state moves");
     pool.apply_rung(&evacuation, 1).unwrap();
     assert_eq!(pool.rung(), 2048);
     assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
+    pool.pool().check();
+}
+
+/// The walk's raise over the span's cache: it asks the cache's owner (the
+/// weight cache, through the engine's [`SpanClear`]) to let go what lies
+/// there and waits for room freed, the fires reading it retired; then it
+/// raises, nothing moved.
+#[tokio::test(flavor = "current_thread")]
+async fn the_walk_has_the_span_s_cache_cleared_and_then_raises_moving_nothing() {
+    const ENGINE: usize = 9304;
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    pool.lower_rung(256).unwrap();
+    let records = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
+    let cached = span_cache(&mut pool, 4);
+    let table = pool.pool().chunk_table().to_vec();
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    crate::store::shared::set_span_clear(ENGINE, {
+        let (shared, asked) = (shared.clone(), asked.clone());
+        Arc::new(move |from| {
+            asked.lock().unwrap().push(from);
+            let mut pool = shared.lock().unwrap();
+            assert_eq!(pool.pool().clearing(), from, "asked before the owner");
+            // The owner lets go behind the fire at epoch 1; not yet retired.
+            let holder = Holder::Weights {
+                shape: pool.weights_first(),
+                pinned: false,
+            };
+            pool.pool_mut().release(holder, &cached, 1);
+            cached.len() as u64
+        })
+    });
+    let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+    let _want = want_rows(ENGINE, 2048);
+    grow.walk_rung().await;
+    assert_eq!(
+        *asked.lock().unwrap(),
+        [TOTAL - 12],
+        "the span from 52 asked clear"
+    );
+    assert_eq!(shared.lock().unwrap().rung(), 256, "not raised over cache");
+    // The fire reading it retires and room is freed: the walk raises.
+    shared.lock().unwrap().pool_mut().retire_through(1);
+    grow.room_freed();
+    grow.walk_rung().await;
+    let pool = shared.lock().unwrap();
+    assert_eq!(pool.rung(), 2048);
+    assert_eq!(pool.pool().chunk_table(), table.as_slice(), "nothing moved");
+    assert_eq!(asked.lock().unwrap().len(), 1);
+    assert!(
+        records
+            .iter()
+            .flat_map(|&record| pool.record_slots(record))
+            .all(|slot| pool.pool().physical(slot.chunk).unwrap() < TOTAL - 12)
+    );
+    pool.pool().check();
 }
 
 /// Twelve rungs, every power of two from 1, the small ones sharing their
@@ -969,11 +1080,12 @@ async fn a_cap_down_that_frees_no_chunk_is_not_taken_however_long_it_stands() {
 }
 
 /// The lower that frees chunks is still taken once the pool has stood past
-/// what is asked for the governor's patience, the cap down before it: a
-/// taker short of records while the largest rung holds its span is seated
-/// from the span the lower lends.
+/// what is asked for the governor's patience, the cap down before it; a
+/// taker short of records while the largest rung holds its span stays
+/// short (live state never opens in the top rung's span), and the span the
+/// lower leaves is idle cache's.
 #[tokio::test(flavor = "current_thread")]
-async fn a_lower_past_the_patience_seats_a_taker_short_of_records() {
+async fn a_lower_past_the_patience_leaves_the_span_to_cache_not_to_a_taker_short_of_records() {
     const ENGINE: usize = 9302;
     let mut pool = classed();
     let mut engine = FakeEngine::new();
@@ -1002,8 +1114,13 @@ async fn a_lower_past_the_patience_seats_a_taker_short_of_records() {
     grow.walk_rung().await;
     grow.walk_rung().await;
     let mut pool = shared.lock().unwrap();
-    assert_eq!(pool.pool().act_reserved(), 1, "lowered: the span lent");
-    assert!(pool.take_records(1).is_some(), "the taker is seated");
+    assert_eq!(pool.pool().act_reserved(), 1, "lowered");
+    assert!(pool.take_records(1).is_none(), "the taker stays short");
+    let weights = pool.weights_first();
+    assert!(
+        pool.pool().available_cache(weights) > 0,
+        "the span the lower leaves is idle cache's"
+    );
 }
 
 /// A fire term appearing that the rung in hand cannot seat beside cuts
@@ -1103,10 +1220,12 @@ fn no_slot_is_handed_out_past_what_the_engine_binds() {
     assert!(chunk_of(&pool, more[0].0) >= 8);
 }
 
-/// A raise that moves state is taken in the hold it was planned in: no
-/// slot can be handed out between plan and apply (the engine copies after,
-/// never against a pool that moved on), its moved-off chunks stay fenced and
-/// no cap is lifted past the rung held before until the engine has the copy.
+/// A raise that moves state (live state below the top rung's span, which a
+/// guest term carries the activation over: the one raise that moves any)
+/// is taken in the hold it was planned in: no slot can be handed out
+/// between plan and apply (the engine copies after, never against a pool
+/// that moved on), its moved-off chunks stay fenced and no cap is lifted
+/// past the rung held before until the engine has the copy.
 #[test]
 fn a_raise_is_taken_where_it_is_planned_and_held_until_its_copy() {
     const ENGINE: usize = 60;
@@ -1116,6 +1235,10 @@ fn a_raise_is_taken_where_it_is_planned_and_held_until_its_copy() {
         walk_segments(&mut pool, 8, 0, &mut engine),
         Retarget::Reached
     );
+    // Three chunks the guests keep standing at every rung: the largest
+    // rung's activation reaches 49, past the span's base at 52.
+    pool.pool_mut().set_standing(3 * CHUNK);
+    assert_eq!(pool.pool().act_chunks(2048), 15);
     pool.lower_rung(16).unwrap();
     let all = pool
         .take_records(pool.records_available() as usize)
