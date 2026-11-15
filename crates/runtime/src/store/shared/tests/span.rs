@@ -685,6 +685,122 @@ async fn a_lane_decoding_two_rows_a_fire_keeps_its_rung_between_fires() {
     assert_eq!(grow.walk_rows(), 0);
 }
 
+/// The patience runs from the last moment an ask stood above the goal, for
+/// each goal. A pool resting at its prompt's rung of 32 with one live lane,
+/// and asks of 2 rows made and dropped fire after fire, so the rows asked
+/// flip between 2 and 1, both under where the pool rests, on a ladder where
+/// the rungs of 1 and 2 take different chunks. Fires are cut to the rung
+/// of 2 once no ask above it has stood for the patience, and never to the
+/// rung of 1 while an ask of 2 stood within it: the cap does not flip, and
+/// the lowering to the rung of 2, once begun, is not begun again by a look
+/// that finds the ask gone. PATIENCE ticks after the last ask, and not a
+/// tick sooner, exactly one cut: to the rung of the lane.
+#[tokio::test(flavor = "current_thread")]
+async fn the_patience_runs_from_the_last_ask_above_the_goal() {
+    const ENGINE: usize = 68;
+    const FIRES: u64 = 4 * PATIENCE as u64;
+    /// One look of the walk at `tick`; a move of the cap or of the rung
+    /// is kept with the tick it came at.
+    async fn look(grow: &SharedGrow, tick: u64, moves: &mut Vec<(u64, u32, u32)>) {
+        grow.walk_rung().await;
+        let now = (fire_cap(ENGINE), grow.shared().lock().unwrap().rung());
+        if moves.last().map(|&(_, cap, rung)| (cap, rung)) != Some(now) {
+            moves.push((tick, now.0, now.1));
+        }
+    }
+    let (mut pool, mut engine) = fine_on_demand();
+    pool.set_max_lanes(512);
+    assert_eq!(
+        walk_segments(&mut pool, 6, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_ne!(
+        pool.pool().act_chunks(1),
+        pool.pool().act_chunks(2),
+        "no chunk class hides a goal of 1 behind a rung of 2"
+    );
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+    grant_rung(ENGINE, u32::MAX);
+    let engine = Arc::new(Mutex::new(engine));
+    let mut moves = Vec::new();
+    let mut tick = 0u64;
+
+    // The prompt: its pass asks 32 rows a fire, and is done at tick 0.
+    let want = want_rows(ENGINE, 32);
+    take_raise(
+        &shared,
+        |pool| rung_seatable(pool, ENGINE, asked_rows(ENGINE)),
+        &Lane(engine.clone()),
+    )
+    .await
+    .unwrap();
+    raise_now(&shared, ENGINE, 32);
+    look(&grow, tick, &mut moves).await;
+    drop(want);
+    look(&grow, tick, &mut moves).await;
+    assert_eq!(moves, [(0, 32, 32)]);
+
+    // The decode: a fire a tick, each asking 2 rows until it settles. The
+    // walk looks while the ask stands and again once it is gone.
+    for _ in 0..FIRES {
+        grow.ticked_for_test();
+        tick += 1;
+        let want = want_rows(ENGINE, 2);
+        raise_now(&shared, ENGINE, 2);
+        look(&grow, tick, &mut moves).await;
+        drop(want);
+        assert_eq!(grow.walk_rows(), 1, "the ask is gone: the lane's row");
+        look(&grow, tick, &mut moves).await;
+        grant_rung(ENGINE, fire_cap(ENGINE));
+    }
+    let patience = u64::from(PATIENCE);
+    let caps = |moves: &[(u64, u32, u32)]| {
+        let mut caps: Vec<(u64, u32)> = Vec::new();
+        for &(tick, cap, _) in moves {
+            if caps.last().map(|&(_, last)| last) != Some(cap) {
+                caps.push((tick, cap));
+            }
+        }
+        caps
+    };
+    assert_eq!(
+        caps(&moves),
+        [(0, 32), (patience, 2)],
+        "one cut, PATIENCE ticks after the prompt's ask, to the rung still asked"
+    );
+    assert_eq!(
+        shared.lock().unwrap().rung(),
+        2,
+        "the lowering to the rung of 2 completes between the asks"
+    );
+
+    // No ask from here: the last stood at tick FIRES.
+    for _ in 1..PATIENCE {
+        grow.ticked_for_test();
+        tick += 1;
+        look(&grow, tick, &mut moves).await;
+        grant_rung(ENGINE, fire_cap(ENGINE));
+        assert_eq!(fire_cap(ENGINE), 2, "inside the patience of the last ask");
+    }
+    grow.ticked_for_test();
+    tick += 1;
+    assert_eq!(tick, FIRES + patience);
+    for _ in 0..3 {
+        look(&grow, tick, &mut moves).await;
+        grant_rung(ENGINE, fire_cap(ENGINE));
+    }
+    assert_eq!(
+        caps(&moves),
+        [(0, 32), (patience, 2), (FIRES + patience, 1)],
+        "exactly one cut, PATIENCE ticks after the last ask"
+    );
+    let rungs: Vec<u32> = moves.iter().map(|&(_, _, rung)| rung).collect();
+    let mut steps = rungs.clone();
+    steps.dedup();
+    assert_eq!(steps, [32, 2, 1], "each lowering begun once and completed");
+}
+
 /// A process waiting for room contributes no rows to what the walk holds
 /// the rung for: 64 lanes decoding beside a pass of 32 lanes that waits on
 /// the planner's grant hold the rung of 64, not of 96, so the span past it

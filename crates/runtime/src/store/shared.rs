@@ -92,6 +92,8 @@ struct RungGate {
     walk: tokio::sync::Notify,
     /// The lanes live now ([`live_lanes`]).
     lanes: std::sync::atomic::AtomicU32,
+    /// The most rows asked since the walker last looked ([`asked_peak`]).
+    peak: std::sync::atomic::AtomicU32,
 }
 
 /// Every engine's rung gate by its id: one for each engine named here,
@@ -113,6 +115,7 @@ fn rung_gate(engine: usize) -> &'static RungGate {
             event: tokio::sync::Notify::new(),
             walk: tokio::sync::Notify::new(),
             lanes: std::sync::atomic::AtomicU32::new(0),
+            peak: std::sync::atomic::AtomicU32::new(0),
         }))
     })
 }
@@ -213,6 +216,7 @@ pub struct RungWant {
 /// Asks that fires on `engine` carry `rows`; the pool's walker raises the
 /// rung that holds them where room allows ([`RungWalk`]).
 pub fn want_rows(engine: usize, rows: u32) -> RungWant {
+    note_asked(engine, rows);
     let key = RUNG_WANT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     RUNG_WANTS
         .lock()
@@ -401,6 +405,25 @@ pub(crate) fn set_live_lanes(engine: usize, lanes: u32) {
     rung_gate(engine)
         .lanes
         .store(lanes, std::sync::atomic::Ordering::Release);
+    note_asked(engine, lanes);
+}
+
+/// `rows` were asked of `engine` ([`asked_rows`]: a pass's or the
+/// scheduler's ask, or the live lanes' rows): kept until the walker's next
+/// look, however soon the ask is dropped.
+fn note_asked(engine: usize, rows: u32) {
+    rung_gate(engine)
+        .peak
+        .fetch_max(rows, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// The most rows asked of `engine` since this was last read (0 where none
+/// were), an ask made and dropped between two looks of the walker among
+/// them: the walker's, once a look, for its patience.
+pub(crate) fn asked_peak(engine: usize) -> u32 {
+    rung_gate(engine)
+        .peak
+        .swap(0, std::sync::atomic::Ordering::AcqRel)
 }
 
 /// The rows `engine` is being asked for: what queued and flying fires ask
@@ -1833,6 +1856,20 @@ impl SharedPool {
     #[must_use]
     pub fn rungs(&self) -> Vec<u32> {
         self.pool.rungs()
+    }
+
+    /// The widest rung at or under `asked` (a rung's tokens) the activation
+    /// set aside holds now, with no raise; 0 where it holds none.
+    #[must_use]
+    pub fn standing(&self, asked: u32) -> u32 {
+        let have = self.pool.act_reserved();
+        self.pool
+            .rungs()
+            .into_iter()
+            .rev()
+            .filter(|&rung| rung <= asked)
+            .find(|&rung| self.pool.act_chunks(rung) <= have)
+            .unwrap_or(0)
     }
 
     /// The widest rung at or under `asked` (a rung's tokens) that can be

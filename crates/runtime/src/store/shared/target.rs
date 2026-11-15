@@ -32,12 +32,63 @@ pub struct SharedGrow {
     ticks: Arc<AtomicU64>,
     /// The lanes live now that may decode ([`Self::walk_rows`]).
     live_lanes: Arc<dyn Fn() -> u32 + Send + Sync>,
-    /// The tick since which the rung has stood past what is asked: a cap
-    /// down or a lower waits the governor's patience from it.
-    idle_since: Arc<std::sync::Mutex<Option<u64>>>,
+    /// The rows asked within the governor's patience ([`Stood`]): a cap
+    /// down or a lower goes no further than the rung they take.
+    stood: Arc<std::sync::Mutex<Stood>>,
     /// The last raise found no room: none is tried again until room is
     /// freed ([`Self::room_freed`]), the one event that can change that.
     raise_blocked: Arc<AtomicBool>,
+}
+
+/// The rows asked of an engine, kept for the governor's patience
+/// ([`PATIENCE`] ticks): the walk brings fires' cap and the rung down only
+/// to the rung of the most rows asked within it. So the patience before a
+/// cut to a rung runs from the last moment an ask stood above that rung,
+/// for each rung, not from when the pool first stood past what was asked:
+/// asks that come and go (a decode fire's, dropped as it settles) hold the
+/// rung they ask while they keep coming, and cut nothing under themselves.
+#[derive(Debug)]
+struct Stood {
+    /// The rows asked at the last look: they stood until some moment since.
+    /// Before the first look, every row: the rung the pool was loaded at
+    /// stands as asked until the walk first looks, so it is held for the
+    /// patience from there, as one an ask left is.
+    last: u32,
+    /// The tick and rows of looks within the patience, the rows descending:
+    /// each the most asked from its tick on.
+    within: std::collections::VecDeque<(u64, u32)>,
+}
+
+impl Default for Stood {
+    fn default() -> Self {
+        Self {
+            last: u32::MAX,
+            within: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl Stood {
+    /// A look at `tick` finding `rows` asked, `peak` the most asked since
+    /// the last look: the most rows that stood within the patience. What
+    /// stood at the last look counts as standing until this one, so the
+    /// patience is never shorter than [`PATIENCE`] ticks from an ask's end.
+    fn most(&mut self, tick: u64, rows: u32, peak: u32) -> u32 {
+        let stood = rows.max(peak).max(self.last);
+        self.last = rows;
+        while self.within.back().is_some_and(|&(_, back)| back <= stood) {
+            self.within.pop_back();
+        }
+        self.within.push_back((tick, stood));
+        while self
+            .within
+            .front()
+            .is_some_and(|&(at, _)| at.saturating_add(u64::from(PATIENCE)) <= tick)
+        {
+            self.within.pop_front();
+        }
+        self.within.front().map_or(rows, |&(_, most)| most)
+    }
 }
 
 impl SharedGrow {
@@ -61,7 +112,7 @@ impl SharedGrow {
             no_room: Arc::new(AtomicBool::new(false)),
             rung_walk: Arc::new(std::sync::Mutex::new(RungWalk::default())),
             ticks: Arc::new(AtomicU64::new(0)),
-            idle_since: Arc::new(std::sync::Mutex::new(None)),
+            stood: Arc::new(std::sync::Mutex::new(Stood::default())),
             live_lanes: Arc::new(move || super::live_lanes(engine)),
             raise_blocked: Arc::new(AtomicBool::new(false)),
         }
@@ -124,26 +175,26 @@ impl SharedGrow {
                 if pool.copying().is_some() {
                     return;
                 }
-                let goal = super::rung_seatable(&pool, self.engine, self.walk_rows());
-                // The pool stands past what is asked: it comes down only
-                // once it has for the governor's patience, so a pause
-                // between batches moves no rung. On a span backed on
-                // demand an idle pool always comes down after it: the
-                // carve held costs resident memory there.
-                let past = pool.pool().act_chunks(goal) < pool.pool().act_reserved();
+                // What was asked since the last look first: an ask made
+                // from here on is the next look's.
+                let peak = super::asked_peak(self.engine);
+                let rows = self.walk_rows();
+                let asked = super::rung_seatable(&pool, self.engine, rows);
+                // The pool stands past what is asked: it comes down (a cap
+                // down, a lower) only to the rung of the most rows asked
+                // within the governor's patience, of those it holds now
+                // (nothing is raised for an ask that is gone). So a pause
+                // between batches moves no rung, and the patience before a
+                // cut to a rung runs from the last ask above it ([`Stood`]).
+                // On a span backed on demand an idle pool always comes down
+                // after it: the carve held costs resident memory there.
+                // Fires wider than the widest rung that fits with the
+                // programs' fire terms are cut at once whatever was asked
+                // (the step's own first move): the span holds no wider fire.
                 let tick = self.ticks.load(Ordering::Acquire);
-                let forced = super::fire_cap(self.engine) > pool.fit_cap();
-                let waited = forced || {
-                    let mut since = self.idle_since.lock().unwrap();
-                    if past {
-                        tick >= since
-                            .get_or_insert(tick)
-                            .saturating_add(u64::from(PATIENCE))
-                    } else {
-                        *since = None;
-                        true
-                    }
-                };
+                let most = self.stood.lock().unwrap().most(tick, rows, peak);
+                let goal =
+                    asked.max(pool.standing(super::rung_goal(&pool, self.engine, most)));
                 let step = self.rung_walk.lock().unwrap().step(
                     &pool,
                     goal,
@@ -162,16 +213,6 @@ impl SharedGrow {
                     Ok(RungStep::Raise { rung, evacuation }) => pool
                         .raise_applied(&evacuation)
                         .map(|()| RungStep::Raise { rung, evacuation }),
-                    // A cap down or a lower before the patience is out.
-                    // Fires wider than the widest rung that fits with the
-                    // programs' fire terms are cut at once: the span holds
-                    // no wider fire.
-                    Ok(RungStep::Lower(_)) if !waited => Ok(RungStep::Wait),
-                    Ok(RungStep::Cap(tokens))
-                        if !waited && tokens < super::fire_cap(self.engine) =>
-                    {
-                        Ok(RungStep::Wait)
-                    }
                     step => step,
                 };
                 (step, goal)
