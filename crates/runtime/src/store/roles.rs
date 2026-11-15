@@ -271,6 +271,9 @@ pub struct Roles {
     /// The host writes held while their instance's slots are parked or
     /// not yet rebound, in the order they were asked.
     held: Vec<(InstanceId, Pump)>,
+    /// Items a park left on the device for want of host room, since the
+    /// count was last taken ([`Self::take_kept_on_device`]).
+    kept_on_device: u64,
 }
 
 impl Roles {
@@ -289,6 +292,7 @@ impl Roles {
             programs: HashMap::new(),
             items: HashMap::new(),
             held: Vec::new(),
+            kept_on_device: 0,
         })
     }
 
@@ -641,11 +645,18 @@ impl Roles {
                     items.push((owner, to));
                 }
                 Err(error) => {
+                    self.kept_on_device += 1;
                     tracing::debug!(?owner, %error, "an item stays on the device: host short");
                 }
             }
         }
         (!items.is_empty()).then(|| self.moving(true, items))
+    }
+
+    /// The items parks have left on the device for want of host room since
+    /// this was last asked; the count starts again from 0.
+    pub fn take_kept_on_device(&mut self) -> u64 {
+        std::mem::take(&mut self.kept_on_device)
     }
 
     /// Unparks `holder`'s parked items: device slots taken for each, all or

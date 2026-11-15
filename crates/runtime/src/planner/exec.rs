@@ -543,10 +543,17 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     }
     // The process's instance tables and rings park with its state where the
     // host has room; what it lacks stays on the device, never dropped.
-    let roles = stores
-        .roles
-        .as_ref()
-        .and_then(|roles| roles.lock().unwrap().prepare_park(pid));
+    let roles = stores.roles.as_ref().and_then(|roles| {
+        let mut roles = roles.lock().unwrap();
+        let parked = roles.prepare_park(pid);
+        // What the host had no room for stays on the device: counted, so a
+        // run shows it (`roles_kept_on_device` on the planner trace).
+        planner.stats.roles_kept_on_device.fetch_add(
+            roles.take_kept_on_device(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        parked
+    });
     let prepared_at = began.elapsed();
     let mut guard = MoveGuard::new(model, engine, Move::Suspend { kv, rs, roles });
     if let Err(error) = guard.copy(&planner, pid).await {

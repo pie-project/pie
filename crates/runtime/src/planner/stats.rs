@@ -15,6 +15,9 @@ pub struct PlannerStats {
     /// each fails its process by name, never queued again
     /// ([`super::ResidencyPlanner::restore_faulted`]).
     pub restore_faults: AtomicU64,
+    /// Role items (instance tables, rings, adapters) a park left on the
+    /// device for want of host room.
+    pub roles_kept_on_device: AtomicU64,
     pub restores: AtomicU64,
     pub restore_failures: AtomicU64,
     pub gate_parks: AtomicU64,

@@ -1001,3 +1001,44 @@ fn a_shared_adapter_parks_only_once_every_holder_has() {
     assert_eq!(held(&device), before);
     assert_eq!(held(&host), 0);
 }
+
+/// What the host has no room for stays on the device, nothing dropped, and
+/// is counted so a run shows it; with room, nothing is counted.
+#[test]
+fn an_item_the_host_has_no_room_for_stays_and_is_counted() {
+    let Pools {
+        device,
+        host,
+        roles,
+    } = pools();
+    let mut engine = FakeEngine::default();
+    let instance = bind(&roles, &mut engine, Vec::new(), 1);
+    let was = roles.lock().unwrap().slots(Owner::Instance(instance));
+    let resident = held(&device);
+    // The host's instance slots all taken.
+    let instance_pool = host.lock().unwrap().roles().instance.unwrap().pool;
+    let mut taken = Vec::new();
+    while let Some(refs) = host.lock().unwrap().take_refs(instance_pool, 1) {
+        taken.extend(refs);
+    }
+    assert!(!taken.is_empty());
+
+    assert!(
+        roles.lock().unwrap().prepare_park(holder(1)).is_none(),
+        "nothing moves"
+    );
+    assert_eq!(roles.lock().unwrap().take_kept_on_device(), 1, "counted");
+    assert_eq!(roles.lock().unwrap().take_kept_on_device(), 0, "taken once");
+    assert_eq!(held(&device), resident, "it stays on the device");
+    assert_eq!(roles.lock().unwrap().slots(Owner::Instance(instance)), was);
+
+    // Negative control: with room, it parks and nothing is counted.
+    host.lock().unwrap().give_refs(instance_pool, &taken);
+    let park = roles
+        .lock()
+        .unwrap()
+        .prepare_park(holder(1))
+        .expect("the host has room");
+    assert_eq!(roles.lock().unwrap().take_kept_on_device(), 0);
+    roles.lock().unwrap().commit(park);
+}
