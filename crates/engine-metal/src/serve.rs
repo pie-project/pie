@@ -1966,53 +1966,138 @@ impl Shell {
         let seats = 1u32;
         let context = self.paging().context().max(1);
         let standing = self.rung;
-        let committed = self.pools.committed_segments();
-        // The walk's lanes lie in the first `seats` seat runs: those
-        // segments, not every seat's.
-        {
-            let facts = self.pool_chunk_facts();
-            let per = facts
-                .shape(crate::store::layout::LIST)
-                .map_or(1, |shape| shape.slots_per_chunk.max(1));
-            let run = self.paging().pages_per_slot.div_ceil(per).max(1);
-            let chunks = 1 + seats.saturating_mul(run);
-            let segments = chunks.div_ceil(facts.segment_chunks.max(1));
-            if segments > committed {
-                self.commit_segments(segments)?;
-            }
-        }
         self.warming = true;
+        // The forms the walk fires, from the plan: every word a request
+        // reaches that serving arms (a plain one, and a drafter's verify:
+        // plain but for reading its pass's drafts), at each rung's prompt
+        // and at one row; and on a model serving rs verbs, each under every
+        // verb a lane takes (a fold, a buffer folding nothing, a buffer
+        // replaying what it held and folding it), so its verify and drain
+        // kernels are built too. A guest program's pipelines are built at
+        // its registration, not here.
+        let facts = self.trace.facts.clone();
+        let mut drafting: Vec<bool> = facts
+            .requests()
+            .iter()
+            .filter(|request| {
+                request.plain()
+                    || (request.drafts()
+                        && request.departures() == usize::from(request.query_len() != 1) + 1)
+            })
+            .map(poem::Request::drafts)
+            .collect();
+        drafting.sort_unstable();
+        drafting.dedup();
+        let word = |rows: u32, drafts: bool| {
+            facts.word(&poem::Request::new(rows, false).drafting(drafts))
+        };
+        // The walk's lanes name slot refs, as the runtime's do: each shape's
+        // first slot past the null chunk, inside the pool whatever the seat
+        // count (seat 0's own runs, laid shape by shape for every seat, can
+        // lie past the pool's last chunk). No kernel reads them.
+        let layout = *self.pools.layout();
+        let first = |shape: Option<crate::store::layout::Slots>| shape.map_or(0, |s| s.per_chunk);
+        let page_size = self.paging().page_size.max(1);
+        let kv_pages = vec![first(layout.list); context.div_ceil(page_size) as usize];
+        let record = vec![first(layout.fixed); layout.pieces as usize];
+        let windows: Vec<Vec<u32>> = layout
+            .window_lists()
+            .map(|window| vec![window.slots.per_chunk; context.div_ceil(window.tokens.max(1)) as usize])
+            .collect();
+        let verbs: Vec<(engine::fire::RsVerb, u32)> = if self.serves_rs_verbs() {
+            let per = layout.rs_tokens.max(1);
+            let rs_ref = first(layout.rs);
+            let pages = |tokens: u32| vec![rs_ref; tokens.div_ceil(per).max(1) as usize];
+            let held = 1u32;
+            vec![
+                (engine::fire::RsVerb::Fold, 0),
+                (
+                    engine::fire::RsVerb::Buffer {
+                        pages: pages(context),
+                        base: 0,
+                        folded: 0,
+                        fold: engine::fire::FoldLen::Host(0),
+                    },
+                    0,
+                ),
+                (
+                    engine::fire::RsVerb::Buffer {
+                        pages: pages(context),
+                        base: 0,
+                        folded: 0,
+                        fold: engine::fire::FoldLen::Host(held),
+                    },
+                    held,
+                ),
+            ]
+        } else {
+            vec![(engine::fire::RsVerb::Fold, 0)]
+        };
         let walked = (|| -> Result<u32> {
             let mut fires = 0u32;
             for rung in self.arena.rung_tokens() {
                 self.set_rung(self.rung, rung)?;
-                let prompt = rung.min(self.budgets.tokens.max_tokens).min(context).max(1);
-                let lanes = rung.min(self.budgets.tokens.max_lanes).min(seats).max(1);
-                let prompt_tokens = vec![0u32; prompt as usize];
-                let one = [0u32];
-                let prefill = [Seated {
-                    held: Some(0),
-                    ..Seated::of(Lane {
-                        slot: 0,
-                        word: self.trace.facts.word(&poem::Request::new(prompt, false)),
-                        tokens: &prompt_tokens,
-                    })
-                }];
-                let word = self.trace.facts.word(&poem::Request::new(1, false));
-                let decode: Vec<Seated<'_>> = (0..lanes)
-                    .map(|slot| Seated {
-                        held: Some(0),
-                        ..Seated::of(Lane { slot, word, tokens: &one })
-                    })
-                    .collect();
-                for lanes in [&prefill[..], &decode[..]] {
-                    let prepared = FrameShell::prepare(
-                        self,
-                        StepView { lanes, attachments: &[], media: &[], clips: &[], done: None },
-                        None,
-                    )?;
-                    drop(self.walk(&prepared, true)?);
-                    fires += 1;
+                for &drafts in &drafting {
+                    for (verb, held) in &verbs {
+                        let prompt = rung
+                            .min(self.budgets.tokens.max_tokens)
+                            .min(context.saturating_sub(*held))
+                            .max(1);
+                        let lanes = rung.min(self.budgets.tokens.max_lanes).min(seats).max(1);
+                        let prompt_tokens = vec![0u32; prompt as usize];
+                        let one = [0u32];
+                        let prefill = [Seated {
+                            held: Some(*held),
+                            rs: verb,
+                            refs: true,
+                            pages: &kv_pages,
+                            record: (!record.is_empty()).then_some(&record[..]),
+                            windows: &windows,
+                            ..Seated::of(Lane {
+                                slot: 0,
+                                word: word(prompt, drafts),
+                                tokens: &prompt_tokens,
+                            })
+                        }];
+                        let decode: Vec<Seated<'_>> = (0..lanes)
+                            .map(|slot| Seated {
+                                held: Some(*held),
+                                rs: verb,
+                                refs: true,
+                                pages: &kv_pages,
+                                record: (!record.is_empty()).then_some(&record[..]),
+                                windows: &windows,
+                                ..Seated::of(Lane {
+                                    slot,
+                                    word: word(1, drafts),
+                                    tokens: &one,
+                                })
+                            })
+                            .collect();
+                        for lanes in [&prefill[..], &decode[..]] {
+                            // Each dropped fire's command buffer goes back
+                            // with its own pool: left to the thread's, a
+                            // walk of more fires than the queue holds
+                            // command buffers blocks making the next one.
+                            let walked = pooled(|| -> Result<()> {
+                                let prepared = FrameShell::prepare(
+                                    self,
+                                    StepView {
+                                        lanes,
+                                        attachments: &[],
+                                        media: &[],
+                                        clips: &[],
+                                        done: None,
+                                    },
+                                    None,
+                                )?;
+                                drop(self.walk(&prepared, true)?);
+                                Ok(())
+                            });
+                            walked?;
+                            fires += 1;
+                        }
+                    }
                 }
             }
             Ok(fires)
@@ -2023,9 +2108,6 @@ impl Shell {
         // stood.
         if self.rung != standing {
             self.set_rung(self.rung, standing)?;
-        }
-        if self.pools.committed_segments() > committed {
-            self.release_segments(committed)?;
         }
         Ok((fires, self.pipelines.compiled() - before))
     }
@@ -4143,8 +4225,15 @@ impl Shell {
         // backed, ref by ref: a page in an uncommitted chunk under the
         // highest one (two-ended growth backs a bottom run and the span's
         // top, not what lies between) is refused by name, not read.
+        // The load's pipeline walk (`warming`) stages fires it drops
+        // uncommitted: no kernel reads or writes what they name, so nothing
+        // is checked backed and no record is zeroed for them. Its lanes are
+        // seat 0's, and a recurrent model's seat-0 record lies past every
+        // seat's kv run (seat runs follow one another shape by shape): the
+        // walk refused such a load ("this fire wants 13113 committed chunks
+        // of the state pool and the load reserved 58").
         for ((seat, table), &free) in seats.iter().zip(&tables).zip(&kv_less) {
-            if free || table.is_empty() {
+            if free || table.is_empty() || self.warming {
                 continue;
             }
             let after = u64::from(seat.have).saturating_add(u64::from(seat.rows));
@@ -4153,18 +4242,18 @@ impl Shell {
                 self.pools.admit_list_page(page)?;
             }
         }
-        for &(page, _) in writes.iter().flatten() {
+        for &(page, _) in writes.iter().flatten().filter(|_| !self.warming) {
             self.pools.admit_list_page(page.max(0) as u32)?;
         }
-        for &id in &state_ids {
+        for &id in state_ids.iter().filter(|_| !self.warming) {
             self.pools.admit_state_slot(id)?;
         }
 
-        if !beginning.is_empty() && self.pools.has_state() {
+        if !beginning.is_empty() && self.pools.has_state() && !self.warming {
             self.drain()?;
         }
-        for record in beginning {
-            self.pools.clear(&record)?;
+        for record in beginning.iter().filter(|_| !self.warming) {
+            self.pools.clear(record)?;
         }
         let slot_ids: Vec<i32> = lane_bands.concat();
         let rs_snaps: Vec<i32> = snap_bands.concat();
@@ -5530,4 +5619,16 @@ fn activation_rungs(
     }
     rungs.push((max, compiled.arena.clone()));
     Ok(rungs)
+}
+
+/// `f` under an autorelease pool of its own on Apple: what it autoreleases
+/// (a dropped frame's command buffer) goes back when it returns.
+#[cfg(target_vendor = "apple")]
+fn pooled<T>(f: impl FnOnce() -> T) -> T {
+    objc2::rc::autoreleasepool(|_| f())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn pooled<T>(f: impl FnOnce() -> T) -> T {
+    f()
 }
