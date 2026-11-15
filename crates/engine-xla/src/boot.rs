@@ -35,6 +35,7 @@ fn device_boot(doc: &toml::Table) -> DeviceBoot {
         window_pool: true,
         stream_weights: false,
         pool_extra_chunks: 0,
+        staging_slots: DeviceBoot::default().staging_slots,
         headroom: t
             .and_then(|t| t.get("headroom"))
             .and_then(toml::Value::as_integer)

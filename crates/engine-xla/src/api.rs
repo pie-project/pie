@@ -80,6 +80,9 @@ pub struct DeviceBoot {
     /// compares it with a streaming load at one pool size (the streamed
     /// weights' chunks).
     pub pool_extra_chunks: u32,
+    /// The staging ring's pinned host slots: the frames a load keeps in
+    /// flight, and one (`crate::store::stage`).
+    pub staging_slots: u32,
 }
 
 impl Default for DeviceBoot {
@@ -94,6 +97,7 @@ impl Default for DeviceBoot {
             seat_tokens: None,
             stream_weights: false,
             pool_extra_chunks: 0,
+            staging_slots: 2,
         }
     }
 }
@@ -417,9 +421,12 @@ impl Engine for Xla {
             budgets,
             residency,
             ordinal,
-            frames_in_flight: _,
+            frames_in_flight,
         } = request;
         let mut boot = self.boot.clone();
+        // A fire's inputs wait in the staging ring until it runs: one slot
+        // for each frame in flight, and the one being written.
+        boot.staging_slots = u32::from(frames_in_flight.max(1)) + 1;
         boot.stream_weights = !residency.weights_held;
         if ordinal > 0 {
             boot.ordinal = u32::try_from(ordinal).unwrap_or(0);

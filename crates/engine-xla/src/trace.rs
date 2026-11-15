@@ -36,13 +36,16 @@ pub enum Source {
     },
     /// A pool plane, persistent across fires and updated in place.
     Pool { row: u32, plane: u8 },
-    /// A per-fire input the shell uploads; `input` indexes the fire's inputs.
-    Input { input: u32 },
-    /// A per-fire i32 input packed with the others into one upload, starting
-    /// at element `offset` of the pack.
-    Packed { offset: u32 },
-    /// The pack itself: every packed input, one i32 vector.
-    Pack,
+    /// A per-fire input, from word `word` of the fire's staged image
+    /// (`crate::inputs::Inputs`): read off the staging ring's slot the fire
+    /// copies into the pool's slab at its start.
+    Staged { word: u32 },
+    /// The staging ring's slot itself: u32 `[slab rows, 128]` in pinned
+    /// host memory (`crate::store::Pools::stage_at`).
+    Stage,
+    /// Bulk data a maintenance program lands, uploaded with it
+    /// (`crate::inputs::Inputs::bulk`).
+    Bulk { input: u32 },
     /// An activation computed by this fire; zeros until written.
     Temp,
     /// A streamed weight (`crate::store::streamed`): it lives in the pool,
@@ -59,7 +62,7 @@ impl Source {
     pub const fn on_device(self) -> bool {
         !matches!(
             self,
-            Source::Temp | Source::Packed { .. } | Source::Streamed { .. }
+            Source::Temp | Source::Staged { .. } | Source::Streamed { .. }
         )
     }
 
@@ -267,11 +270,21 @@ pub struct Tracer<'h> {
     tuning: kernels_xla::tuning::Tuning,
 }
 
-/// Where the pack's own parameter is kept among the traced roots.
-const PACK_ROOT: u32 = u32::MAX;
+/// Where the staged image's device value is kept among the traced roots.
+const STAGE_ROOT: u32 = u32::MAX;
+
+/// Where a fire's staged image lies: the ring slot's rows (the slab's, a
+/// load constant), the rows this fire's image takes, and the slab's first
+/// pool row. No rows: the program stages nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageAt {
+    pub slab_rows: u32,
+    pub used_rows: u32,
+    pub slab_row: u32,
+}
 
 struct State {
-    pack_len: u32,
+    stage: StageAt,
     func: Func,
     current: BTreeMap<u32, Val>,
     params: Vec<(u32, Source)>,
@@ -293,7 +306,7 @@ impl<'h> Tracer<'h> {
             tuning: kernels_xla::tuning::Tuning::DEFAULT,
             handles,
             state: RefCell::new(State {
-                pack_len: 0,
+                stage: StageAt::default(),
                 func: Func::new("main"),
                 current: BTreeMap::new(),
                 params: Vec::new(),
@@ -319,10 +332,10 @@ impl<'h> Tracer<'h> {
         self
     }
 
-    /// Declares how long the fire's input pack is (see `Source::Packed`).
+    /// Declares where the fire's staged image lies (see `Source::Staged`).
     #[must_use]
-    pub fn with_pack(self, len: u32) -> Self {
-        self.state.borrow_mut().pack_len = len;
+    pub fn with_stage(self, stage: StageAt) -> Self {
+        self.state.borrow_mut().stage = stage;
         self
     }
 
@@ -334,11 +347,12 @@ impl<'h> Tracer<'h> {
             func,
             current,
             params,
-            pack_len,
+            stage,
+            written,
             ..
         } = &mut *state;
         let (root, _) = self.locate(t)?;
-        root_value(self.handles, func, current, params, *pack_len, root)
+        root_value(self.handles, func, current, params, *stage, written, root)
     }
 
     /// Runs `f` against the function under construction.
@@ -415,7 +429,8 @@ fn root_value(
     func: &mut Func,
     current: &mut BTreeMap<u32, Val>,
     params: &mut Vec<(u32, Source)>,
-    pack_len: u32,
+    stage: StageAt,
+    written: &mut BTreeMap<u32, ()>,
     root: u32,
 ) -> Result<Val, kernels_xla::Error> {
     if let Some(&v) = current.get(&root) {
@@ -435,19 +450,10 @@ fn root_value(
         op: "trace",
         detail: format!("root {root} is {:?}, which has no storage form", r.dtype),
     })?;
-    if let Source::Packed { offset } = r.source {
-        let pack = match current.get(&PACK_ROOT) {
-            Some(&v) => v,
-            None => {
-                params.push((PACK_ROOT, Source::Pack));
-                let v = func.param(Ty::new(Elem::I32, &[i64::from(pack_len)]), None);
-                current.insert(PACK_ROOT, v);
-                v
-            }
-        };
-        let n = ty.elements();
-        let flat = func.slice_axis(pack, 0, i64::from(offset), i64::from(offset) + n)?;
-        let v = func.reshape(flat, &ty.dims)?;
+    if let Source::Staged { word } = r.source {
+        let image = stage_rows(func, current, params, stage)?;
+        let flat = func.reshape(image, &[i64::from(stage.used_rows) * ROW_WORDS])?;
+        let v = from_words(func, flat, i64::from(word), &ty)?;
         current.insert(root, v);
         return Ok(v);
     }
@@ -483,7 +489,17 @@ fn root_value(
         if r.source.persistent() {
             func.pin_row_major(p);
         }
-        p
+        if is_pool(r) && stage.used_rows > 0 {
+            // The fire's staged image lands in the pool's slab before the
+            // pool is read or written: a start-of-fire write.
+            let image = stage_rows(func, current, params, stage)?;
+            let at = func.const_i(Elem::I32, i64::from(stage.slab_row), &[]);
+            let zero = func.const_i(Elem::I32, 0, &[]);
+            written.insert(root, ());
+            func.dynamic_update_slice(p, image, &[at, zero])?
+        } else {
+            p
+        }
     } else {
         func.const_i(ty.elem, 0, &ty.dims)
     };
@@ -491,11 +507,71 @@ fn root_value(
     Ok(v)
 }
 
+const ROW_WORDS: i64 = crate::inputs::ROW_WORDS as i64;
+
+/// The fire's staged image on the device, u32 `[used rows, 128]`: the
+/// staging ring's slot (a pinned host parameter) cut to the rows this fire
+/// wrote, moved to the device once.
+fn stage_rows(
+    func: &mut Func,
+    current: &mut BTreeMap<u32, Val>,
+    params: &mut Vec<(u32, Source)>,
+    stage: StageAt,
+) -> Result<Val, kernels_xla::Error> {
+    if let Some(&v) = current.get(&STAGE_ROOT) {
+        return Ok(v);
+    }
+    if stage.used_rows == 0 || stage.used_rows > stage.slab_rows {
+        return Err(kernels_xla::Error::Backend {
+            op: "trace",
+            detail: format!(
+                "a staged input in a fire staging {} of a {}-row slab",
+                stage.used_rows, stage.slab_rows
+            ),
+        });
+    }
+    params.push((STAGE_ROOT, Source::Stage));
+    let slot = func.param(
+        Ty::new(Elem::U32, &[i64::from(stage.slab_rows), ROW_WORDS]),
+        None,
+    );
+    func.pin_host(slot);
+    let used = func.slice_axis(slot, 0, 0, i64::from(stage.used_rows))?;
+    let v = func.to_device(used);
+    current.insert(STAGE_ROOT, v);
+    Ok(v)
+}
+
+/// The `ty` array laid from word `word` of the flat image `words` (u32): a
+/// 32-bit element a word, narrower ones packed low first, 64-bit ones two
+/// words each.
+fn from_words(func: &mut Func, words: Val, word: i64, ty: &Ty) -> Result<Val, kernels_xla::Error> {
+    let n = ty.elements();
+    let bits = i64::from(ty.elem.bits());
+    let v = if bits == 32 {
+        let w = func.slice_axis(words, 0, word, word + n)?;
+        func.bitcast(w, ty.elem)?
+    } else if bits < 32 {
+        let k = 32 / bits;
+        let count = (n + k - 1) / k;
+        let w = func.slice_axis(words, 0, word, word + count)?;
+        let lanes = func.bitcast(w, ty.elem)?;
+        let flat = func.reshape(lanes, &[count * k])?;
+        func.slice_axis(flat, 0, 0, n)?
+    } else {
+        let k = bits / 32;
+        let w = func.slice_axis(words, 0, word, word + n * k)?;
+        let pairs = func.reshape(w, &[n, k])?;
+        func.bitcast(pairs, ty.elem)?
+    };
+    Ok(func.reshape(v, &ty.dims)?)
+}
+
 /// The tracer's `Env`: the handle tables plus the state's maps, split off the
 /// function so a `Cx` can hold both.
 struct Lens<'a> {
     handles: &'a Handles,
-    pack_len: u32,
+    stage: StageAt,
     current: &'a mut BTreeMap<u32, Val>,
     params: &'a mut Vec<(u32, Source)>,
     written: &'a mut BTreeMap<u32, ()>,
@@ -527,7 +603,8 @@ impl Env for Lens<'_> {
             f,
             self.current,
             self.params,
-            self.pack_len,
+            self.stage,
+            self.written,
             root,
         )?;
         if r.source.persistent() {
@@ -602,7 +679,8 @@ impl Env for Lens<'_> {
                 f,
                 self.current,
                 self.params,
-                self.pack_len,
+                self.stage,
+                self.written,
                 root,
             )?;
             let at = f.const_i(Elem::I32, i64::from(offset), &[]);
@@ -776,14 +854,14 @@ impl Emit for Tracer<'_> {
             current,
             params,
             written,
-            pack_len,
+            stage,
             sums,
             view_reads,
             views,
         } = &mut *state;
         let mut lens = Lens {
             handles: self.handles,
-            pack_len: *pack_len,
+            stage: *stage,
             current,
             params,
             written,
