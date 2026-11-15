@@ -72,6 +72,8 @@ pub struct Cuda {
     /// Run between a load's staging and its arming: an expert-parallel
     /// group wires its ranks there, since arming fires their collectives.
     before_arming: Option<BeforeArming>,
+    refused_unlaunched: bool,
+    enqueued: bool,
 }
 
 pub(crate) type BeforeArming = Box<dyn FnMut(&mut Shell) -> std::result::Result<(), String> + Send>;
@@ -95,7 +97,13 @@ impl Cuda {
             replay: None,
             expert: World::default(),
             before_arming: None,
+            refused_unlaunched: false,
+            enqueued: false,
         }
+    }
+
+    fn refused_in_prepare(&self, error: &Error) -> bool {
+        !self.enqueued && !matches!(error, Error::Device(_) | Error::Disconnected(_))
     }
 
     pub(crate) fn before_arming(&mut self, hook: BeforeArming) {
@@ -892,6 +900,7 @@ impl Engine for Cuda {
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
+        self.refused_unlaunched = true;
         frame.validate_for(
             self.caps
                 .as_ref()
@@ -919,22 +928,26 @@ impl Engine for Cuda {
                         shell.trace().facts.plain(word) && !shell.wide(word)
                     })
                 });
-            if let Some((head, _)) = &split
-                && let Err(error) = self.fire_step(head, at, false)
-            {
-                self.pending = None;
-                let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
-                return Err(attributed(error, airborne));
+            if let Some((head, _)) = &split {
+                if let Err(error) = self.fire_step(head, at, false) {
+                    self.pending = None;
+                    self.refused_unlaunched &= self.refused_in_prepare(&error);
+                    let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
+                    return Err(attributed(error, airborne));
+                }
+                self.refused_unlaunched = false;
             }
             let step = split.as_ref().map_or(step, |(_, tail)| tail);
             let (ticket, step_settled) = match self.fire_step(step, at, true) {
                 Ok(both) => both,
                 Err(error) => {
                     self.pending = None;
+                    self.refused_unlaunched &= self.refused_in_prepare(&error);
                     let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
                     return Err(attributed(error, airborne));
                 }
             };
+            self.refused_unlaunched = false;
             steps.push(ticket);
             settled.push(step_settled);
         }
@@ -944,6 +957,10 @@ impl Engine for Cuda {
 
     fn settles_asynchronously(&self) -> bool {
         true
+    }
+
+    fn refused_unlaunched(&self) -> bool {
+        self.refused_unlaunched
     }
 
     fn on_complete(&mut self, sink: engine::CompletionSink) {
@@ -1215,6 +1232,7 @@ impl Cuda {
     ) -> EngineResult<(FireTicket, PendingStep)> {
         let id = FireId(self.next_fire);
         self.next_fire = self.next_fire.wrapping_add(1);
+        self.enqueued = false;
 
         let done = self
             .sink
@@ -1470,6 +1488,7 @@ impl Cuda {
             })
             .collect();
 
+        let mut enqueued = false;
         let settled = crate::serve::diag::guarded(|| {
             use engine::frame::Shell as FrameShell;
             let prepared = FrameShell::prepare(
@@ -1483,9 +1502,12 @@ impl Cuda {
                 None,
             )
             .map_err(fault)?;
+            enqueued = true;
             let enqueued = FrameShell::enqueue(shell, prepared).map_err(fault)?;
             shell.settle_step(enqueued, done).map_err(fault)
-        })?;
+        });
+        self.enqueued = enqueued;
+        let settled = settled?;
 
         Ok((
             FireTicket {

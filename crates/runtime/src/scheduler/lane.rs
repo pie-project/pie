@@ -15,7 +15,21 @@ use super::stats::SchedulerStats;
 
 use super::worker::{BindRespond, HostKvOp, PoolOp, PreLaunchCopy, QueuedItem};
 
-pub(super) type LaunchResult = std::result::Result<SubmissionCompletion, String>;
+pub(super) type LaunchResult = std::result::Result<SubmissionCompletion, LaunchRefusal>;
+
+pub(super) struct LaunchRefusal {
+    pub(super) message: String,
+    pub(super) unlaunched: Option<Vec<::engine::Step>>,
+}
+
+impl From<String> for LaunchRefusal {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            unlaunched: None,
+        }
+    }
+}
 
 type LaunchReplyTx = tokio::sync::oneshot::Sender<LaunchResult>;
 
@@ -120,7 +134,7 @@ fn backend(engine: &mut Option<EngineBox>) -> Result<&mut EngineBox> {
 fn fail_request(request: LaneRequest, why: &str) {
     match request {
         LaneRequest::Launch { reply, .. } => {
-            let _ = reply.send(Err(why.to_string()));
+            let _ = reply.send(Err(why.to_string().into()));
         }
         LaneRequest::Control { item, reply } => {
             match &*item {
@@ -399,9 +413,12 @@ impl Lane {
                                     )
                                 })
                             }
-                            None => Err(NO_BACKEND.to_string()),
+                            None => Err(NO_BACKEND.to_string().into()),
                         };
-                        if result.is_err() {
+                        if result
+                            .as_ref()
+                            .is_err_and(|refused| refused.unlaunched.is_none())
+                        {
                             let cells: Vec<_> = frame.terminal_cells().collect();
                             crate::engine::completion::settle(
                                 &cells,
@@ -411,7 +428,9 @@ impl Lane {
                         result
                     }));
                     let panicked = served.is_err();
-                    let _ = reply.send(served.unwrap_or_else(|_| Err(LANE_PANICKED.to_string())));
+                    let _ = reply.send(
+                        served.unwrap_or_else(|_| Err(LANE_PANICKED.to_string().into())),
+                    );
                     panicked
                 }
                 LaneRequest::Control { item, reply } => {
@@ -520,7 +539,7 @@ impl Lane {
         broker: &crate::engine::CompletionBroker,
         settlements: &std::sync::Arc<crate::engine::completion::FrameSettlements>,
         landed: &mut HashMap<::engine::FrameId, Vec<Vec<::engine::InstanceId>>>,
-    ) -> std::result::Result<SubmissionCompletion, String> {
+    ) -> LaunchResult {
         use crate::engine::completion;
 
         if stash.is_none()
@@ -545,7 +564,7 @@ impl Lane {
         for step in &submitted.steps {
             for attachment in &step.attachments {
                 if let Err(error) = channels.pump_in(engine.as_mut(), attachment.instance) {
-                    return Err(format!("channel publish: {error}"));
+                    return Err(format!("channel publish: {error}").into());
                 }
             }
         }
@@ -559,9 +578,17 @@ impl Lane {
                 return Err(format!(
                     "frame admission answered a retryable refusal past static \
                      admission, which the frame contract forbids: {error}"
-                ));
+                )
+                .into());
             }
-            Err(error) => return Err(format!("{error}")),
+            Err(error) => {
+                let passes: usize = submitted.steps.iter().map(|s| s.attachments.len()).sum();
+                let unlaunched = engine.refused_unlaunched() && passes > 1;
+                return Err(LaunchRefusal {
+                    message: format!("{error}"),
+                    unlaunched: unlaunched.then_some(submitted.steps),
+                });
+            }
         };
 
         let asynchronous = engine.settles_asynchronously();
@@ -582,7 +609,7 @@ impl Lane {
                 if let Err(error) =
                     channels.pump_out_with(engine.as_mut(), attachment.instance, deferred)
                 {
-                    return Err(format!("channel take: {error}"));
+                    return Err(format!("channel take: {error}").into());
                 }
             }
         }
