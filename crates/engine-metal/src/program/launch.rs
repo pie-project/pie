@@ -914,7 +914,9 @@ impl Prepared {
             return Ok(());
         }
         let scratch = self.scratch.get()?;
-        frame.fill(scratch.slab(), 0, probe_fill_len(scratch.bytes()))?;
+        if !probe_bare_pass() {
+            frame.fill(scratch.slab(), 0, probe_fill_len(scratch.bytes()))?;
+        }
         frame.next_pass()?;
         Ok(())
     }
@@ -1505,7 +1507,9 @@ impl Batch {
         if !scratch_zeroing_skipped() {
             #[cfg(target_vendor = "apple")]
             {
-                frame.fill(self.scratch.slab(), 0, probe_fill_len(u64::from(count) * stride))?;
+                if !probe_bare_pass() {
+                    frame.fill(self.scratch.slab(), 0, probe_fill_len(u64::from(count) * stride))?;
+                }
                 frame.next_pass()?;
             }
             #[cfg(not(target_vendor = "apple"))]
@@ -2022,4 +2026,11 @@ fn probe_fill_len(len: u64) -> u64 {
     } else {
         len
     }
+}
+
+/// PROBE (M5 fill): with `PIE_BARE_PASS` set, a scratch zero fill is
+/// replaced by its pass boundary alone (no blit).
+fn probe_bare_pass() -> bool {
+    static BARE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BARE.get_or_init(|| std::env::var_os("PIE_BARE_PASS").is_some())
 }
