@@ -101,7 +101,7 @@ queue for that long after the last request, then parks.
 
 Where the number came from: commit bdc52ec75 (2026-07-19, "Make generated
 pivot_threshold(cummass_le) run in parallel", no body). Before it the spin window was
-`quorum::wave_window()`, a value the scheduler derives. The commit replaced that with
+`quorum::wave_window()` (not a derived value: see 1.2a). The commit replaced that with
 `DRIVER_LANE_HOT_US = 1_000_000` and the comment that the lane "parks only after true
 idleness (between requests / at shutdown). This is a lane wake optimization, independent of
 the fire policy." Renamed in 8d8f449f0 (2026-08-28); the wasm32 zero came in 9cb4d315b
@@ -117,6 +117,104 @@ What measurement would set it: the distribution of the gap between one request's
 next post on a serving lane (per backend, at token cadence and between turns), beside the
 park-to-run wake latency of the lane thread on the same machine, and the core time the spin
 costs at each candidate window. The number is set where a longer window stops removing wakes.
+
+### 1.2a What `wave_window()` was, and whether it can be restored
+
+Read with `git show` / `git log` only. Paths before the commit are under `runtime/engine/src/`.
+
+**Correction first.** Section 1.2 called `quorum::wave_window()` a value the scheduler
+derives. It was not derived. It returned a constant with an environment override and a floor.
+"Derived" is the old lane comment's own word ("the scheduler's own derived wave-window
+constant", `scheduler/worker.rs:868-869` at bdc52ec75^). So there is no derived form to
+restore; restoring it as it was restores a tuned number.
+
+**Inputs and formula** (`scheduler/quorum.rs` at bdc52ec75^):
+- `WAVE_WINDOW_US = 6_000` (`:63`), replaced by `PIE_SCHED_WAVE_WINDOW_US` when set and
+  parseable (`:74-78`, `:89`).
+- Floor `cold_hold()`: `COLD_HOLD_US = 2_000` (`:38`), replaced by `PIE_SCHED_COLD_HOLD_US`
+  when set (`:40-51`).
+- `wave_window() = max(requested, cold_hold())`, read once per process (`:86-102`); a request
+  below the floor is clamped with a warning.
+- Nothing measured at run time enters it. The one run-time estimate nearby, an EWMA of the
+  wave retire-to-retire cadence, was added to the window for straggler demotion only
+  (`:183-190`); the lane spin did not read it.
+
+**Values recorded.**
+- The constant's own measurement (`quorum.rs:54-63`): dense-wave cadence about 3 ms on the
+  reference RTX 4090 decode workload; at 2 ms, 915 waves instead of about 520 and 35% less
+  throughput; dense throughout at 6 ms; regressing again by 12 ms. This measures the
+  scheduler's barrier, not the lane spin.
+- The test `wave_window_floors_at_cold_hold` (`quorum.rs:915-937`): unset or unparseable
+  gives 6000 us; anything under 2000 us gives the 2000 us floor; 12000 us passes through.
+- The lane's own record (`worker.rs:860-869`): a parked lane "measurably broke run-ahead
+  pipelining (81 % to ~30 % of transitions enqueued ahead on the parked variant)", and "at
+  wave cadence the spin window always covers the next post". This supports spinning against
+  parking, and gives the condition a window has to meet (cover the next post). It gives no
+  figure for a window length. That comment is not in the tree at 3e4e78300.
+
+**Callers at bdc52ec75^.**
+- `scheduler/quorum.rs:671`: `WaitAllPolicy`, straggler demotion. A gathering wave held the
+  barrier for the window, then fired narrow without the absentees.
+- `scheduler/worker.rs:870` and `:900`: the lane's spin before parking.
+- Tests only: `quorum.rs:1152`, `:1187`, `:1203`, `:1304`, `:1319`, `:1378`, `:1425`, `:1448`.
+
+**Why it was dropped.** bdc52ec75 deleted the function's module, not only the lane's use.
+- The commit: 284 files, +38607 / -14201, empty body, a direct commit on the line (parent
+  6aa2d550e, child 0aaa9ba2a which is PR #487); no PR number or merge of its own.
+- It deletes `scheduler/quorum.rs` (1790 lines) and adds `scheduler/frame.rs` (1466 lines).
+  Its note says so: "every deployment ... runs `FramePolicy` (scheduler/quorum.rs deleted)"
+  (`vesuvius-phase2.md:240-243` at bdc52ec75), under the rule "quorum infinite wait-all
+  (watchdog 1 s, report-only)" (`vesuvius-phase1-report.md:13`).
+- So straggler demotion went, and the wave window with it. The frame policy waits without
+  bound; its one clock is `STRICT_WATCHDOG_US = 1_000_000`, report-only (`scheduler/frame.rs:132`
+  at bdc52ec75). The lane spin lost the function it borrowed and got a constant in its place.
+- The new constant has the watchdog's value, one second. No link is stated; the comment says
+  the spin is "independent of the fire policy". From 6 ms to 1 s is a factor of 167.
+- No figure for the one second: not in the commit, not in the notes it adds (no mention of
+  the lane's spin or parking in any `*.md` at bdc52ec75), not in the bodies around it
+  (6aa2d550e empty; e2201dadb and 0aaa9ba2a are CUDA model work).
+- `git log -S wave_window` finds two code commits only: 6aa2d550e (2026-07-19, 2190 files,
+  which brings the scheduler in) and bdc52ec75 (same day). The window's own history (the
+  runs its comments cite) is not in this repository.
+- `git log -S LANE_HOT_US`: bdc52ec75 introduces it; later hits are moves and the wasm32 zero
+  (9cb4d315b). No commit changes the native value.
+
+**At 3e4e78300: do the inputs still exist?** None does.
+
+| Input at bdc52ec75^ | At 3e4e78300 | What stands in its place |
+|---|---|---|
+| `WAVE_WINDOW_US`, `wave_window()` | gone | nothing: the seal waits without bound |
+| `PIE_SCHED_WAVE_WINDOW_US` | gone (no `PIE_SCHED_` variable is read) | nothing |
+| `COLD_HOLD_US`, `cold_hold()` | gone (last in the tree at 0e2ee887a^, 2026-08-02) | nothing |
+| cadence EWMA | gone | no cadence is estimated anywhere in the scheduler |
+| `scheduler/quorum.rs` | gone | `crates/runtime/src/scheduler/frame.rs`; its one clock is `STRICT_WATCHDOG_US` (`:57`) |
+
+The derived form cannot be restored as it was, for two reasons: the function and the policy
+it belonged to are gone, and what it returned was a constant tuned to a 3 ms cadence on one
+card. What the scheduler knows today that a derived window could read: it stamps each retire
+and records the idle gap to the next dispatch as a statistic
+(`crates/runtime/src/scheduler/frame.rs:1074-1083`, `stats.rs:38`), and it declares an
+inter-fire time (`scheduler/probe.rs:5`, exported at `server/handler.rs:104-105`) for which no
+writer was found. The condition the old comment states, that the window covers the next
+post, is a statement about that gap. Nothing in the lane reads it today.
+
+**GAP_BUDGET (9d90f9d51): no derived predecessor.** Confirmed. The commit (parent 244401d23,
+9 files, +203 / -11, no body, a direct commit) adds the constant and the `Instant::now() >=
+until` test to a loop that existed. Before it, a gap ran a waiting raise's steps with no time
+bound, until the raise was armed or a step did not step; the removed comment gives the
+reason ("every gap a step is left out costs it far more fires than the step costs the
+others"). So the predecessor was unbounded, not a derived value and not another number. The
+two older `git log -S GAP_BUDGET` hits (8d8f449f0, fb5325c5a) are an unrelated test constant,
+`GAP_BUDGET: f32 = 0.25` in `crates/engine-cuda/tests/two_frames_in_flight.rs:94`, added and
+then deleted. One thing beside it is derived: 1fbedd22d (2026-11-13) makes a busy lane owe
+each step's time back to its requests, so arming takes at most half the lane's time
+(`crates/runtime/src/scheduler/arming.rs:259-262`, `:344-345`, `:371` at 3e4e78300). The
+20 ms stands on top of that share and is unchanged at 3e4e78300 (`arming.rs:206`).
+
+Not verified for 1.2a: the runs the old comments cite (they are outside this repository);
+which commit removed the lane's measurement comment; whether the idle-gap statistic is
+recorded in every build or only with the probes on; whether the 1 s was chosen to match the
+watchdog.
 
 ### 1.3 GAP_BUDGET (stays; owner: runtime)
 
