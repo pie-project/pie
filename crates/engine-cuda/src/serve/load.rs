@@ -1052,6 +1052,9 @@ impl Shell {
             );
         }
         let mut pools = pools;
+        if boot.context_declared {
+            pools.declare_context();
+        }
         let buffers = Buffers::reserve(
             &boot.trace,
             paging,

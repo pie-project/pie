@@ -242,6 +242,7 @@ fn logits(
         slots: 1,
         kv_budget: Some(crate::POOL),
         allowance: engine::Allowance::WHOLE,
+        context_declared: false,
         ordinal: 0,
         knobs,
         cache_dir: None,

@@ -663,6 +663,7 @@ impl Engine for Cuda {
             voxels,
             page_size: budgets.page_size,
             context: budgets.max_context,
+            context_declared: budgets.context_declared && residency.device_kv_budget.is_none(),
             slots: budgets.slots,
             kv_budget: residency.device_kv_budget,
             allowance: residency.device,

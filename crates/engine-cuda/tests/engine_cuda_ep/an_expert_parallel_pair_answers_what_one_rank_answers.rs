@@ -95,6 +95,7 @@ fn stage(
         slots: 2,
         kv_budget: Some(KV),
         allowance: ALLOWANCE,
+        context_declared: false,
         ordinal,
         knobs: engine_cuda::Knobs {
             chip: Some(chip),
