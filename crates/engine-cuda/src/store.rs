@@ -133,6 +133,11 @@ struct WorkingSet {
     limit: u64,
 }
 
+/// The bodies' hold on a load that measures it: everything the card has
+/// past the least range that serves, so arming cannot come short; the
+/// range is fitted again to what the arming took ([`Pools::fit_the_card`]).
+pub const MEASURING: u64 = u64::MAX;
+
 /// What of `[engine] bodies_mem` comes before the guests' programs on a
 /// card with little room past one sequence: enough for the decode bodies,
 /// which are what a serve replays every step and cost tens of megabytes
@@ -1269,7 +1274,13 @@ impl Pools {
             } else {
                 need
             });
-        let (bodies, programs) = holds_within(bodies, programs, live.saturating_sub(claim));
+        let spare = live.saturating_sub(claim);
+        let (bodies, programs) = if bodies == MEASURING {
+            let programs = programs.min(spare);
+            (spare - programs, programs)
+        } else {
+            holds_within(bodies, programs, spare)
+        };
         let room = live.saturating_sub(programs.saturating_add(bodies));
         // Whole map units of the room, in whole chunks, of the range's.
         let unit = self.chunks.map_unit().max(1);

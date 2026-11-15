@@ -308,7 +308,7 @@ fn fault(fault: Fault) -> Error {
             wanted: need,
             available: have,
         },
-        Fault::Residency(_) => Error::Impossible(fault.to_string()),
+        Fault::Residency(_) | Fault::Card(_) => Error::Impossible(fault.to_string()),
         Fault::Ceiling { what, need, have } => Error::Impossible(format!(
             "this fire wants {need} {what} and the load reserved {have}"
         )),

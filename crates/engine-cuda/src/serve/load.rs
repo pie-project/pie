@@ -1029,6 +1029,32 @@ impl Shell {
             .as_ref()
             .map_or(0, |forked| forked.bytes);
         let arena_bytes = compiled.arena.bytes.max(forked_bytes);
+        // What allocates on the device beside the pools allocates before
+        // they read the card: the guests' fan streams, and on ROCm what the
+        // runtime and its libraries take at their first use. A flat range
+        // is sized to what the card then has free, and nothing allocates
+        // beside it after but arming, which the bodies record holds.
+        #[cfg(feature = "rocm")]
+        kernels_cuda::hip::open().map_err(|why| Fault::Unbound {
+            what: format!("the HIP runtime's first use: {why}"),
+        })?;
+        // The streams a serving load copies on: synchronous copies on the
+        // null stream (the weights' upload among them), fires and read-backs
+        // on the device's, taps on its tap stream, tier moves on its swap.
+        #[cfg(feature = "rocm")]
+        kernels_cuda::hip::warm_copies(&[
+            core::ptr::null_mut(),
+            device.stream().cast(),
+            device.tap_stream().cast(),
+            device.swap_stream().cast(),
+        ])
+        .map_err(|why| Fault::Unbound {
+            what: format!("a copying stream's first copy: {why}"),
+        })?;
+        let mut programs = ProgramPlane::new(crate::program::compile::Disk::rooted(
+            boot.cache_dir.map(|dir| dir.join(CODE_DIR)),
+        ));
+        programs.open_fan()?;
         let pools = Pools::reserve(
             device.ordinal(),
             ceiling,
@@ -1330,6 +1356,7 @@ impl Shell {
             arming_at_load: false,
             rearming: false,
             bodies_took: 0,
+            measuring: false,
             workspace: None,
             inputs_at: 0,
             decoded_tiles: Vec::new(),
@@ -1348,9 +1375,7 @@ impl Shell {
                 cache.watch(airborne.clone());
                 cache
             },
-            programs: ProgramPlane::new(crate::program::compile::Disk::rooted(
-                boot.cache_dir.map(|dir| dir.join(CODE_DIR)),
-            )),
+            programs,
             settlement: crate::settle::Settlement::open(boot.runahead.staging_depth())?,
             taps: Vec::new(),
             kv_taps,
@@ -1361,9 +1386,6 @@ impl Shell {
             rs_ahead: std::collections::HashMap::new(),
             _released: Released,
         };
-        // The guests' fan streams open with the load, before the fit reads
-        // the card, so a serving fire never creates one.
-        shell.programs.open_fan()?;
         if !shell.graphs.records() {
             eprintln!(
                 "engine-cuda: engine.graphs is {}, a diagnostic mode — every fire \
@@ -1434,11 +1456,22 @@ impl Shell {
         // armed whole, where it is recorded; the configured `bodies_mem` is
         // the ceiling and what a first boot holds. One number: arming's
         // allowance is the hold.
+        let mut recorded = false;
         if shell.records_bodies()
             && let Some(dir) = boot.cache_dir
         {
-            let record = super::measured::path(dir, &format!("{bodies_shape}|{:?}", shell.budget));
+            // A record measured with the device's copy queues is not this
+            // process's when they are off (each holds memory of its own).
+            #[cfg(feature = "rocm")]
+            let copies = format!("|{:?}", kernels_cuda::hip::sys::copy_queues());
+            #[cfg(not(feature = "rocm"))]
+            let copies = String::new();
+            let record = super::measured::path(
+                dir,
+                &format!("{bodies_shape}|{:?}{copies}", shell.budget),
+            );
             if let Some(measured) = super::measured::read(&record) {
+                recorded = true;
                 let held = usize::try_from(measured.hold()).unwrap_or(usize::MAX);
                 if boot.knobs.diagnostics.arm_trace {
                     eprintln!(
@@ -1456,7 +1489,15 @@ impl Shell {
             }
             shell.bodies_record = Some(record);
         }
-        let bodies = if shell.records_bodies() {
+        // A flat range cannot grow after its bodies name it, so a load that
+        // has no record of what they take measures it: no estimate stands
+        // in for the figure.
+        shell.measuring = shell.records_bodies()
+            && !crate::device::elastic::mapped_on_demand()
+            && !recorded;
+        let bodies = if shell.measuring {
+            crate::store::MEASURING
+        } else if shell.records_bodies() {
             shell.bodies_mem as u64
         } else {
             0
@@ -1533,7 +1574,10 @@ impl Shell {
         shell.arena.ensure_rungs(&mut shell.pools)?;
         shell.lay_workspace()?;
         let afforded = fitted.bodies;
-        if afforded < bodies {
+        if shell.measuring {
+            // Arming is allowed all the card has past the least range.
+            shell.bodies_mem = usize::try_from(afforded).unwrap_or(usize::MAX);
+        } else if afforded < bodies {
             eprintln!(
                 "engine-cuda: [engine] bodies_mem {} MiB is held down to {} MiB on this card: \
                  with the weights, activations and inputs resident, one sequence at the declared \
@@ -1686,6 +1730,9 @@ impl Staged {
             let armed = shell.arm_bodies();
             shell.arming_at_load = false;
             armed?;
+            if shell.measuring {
+                shell.measured_refit(device_total, free_before)?;
+            }
         }
         let resident = footprint(&shell, device_total, free_before);
         // Whatever armed a body, the range stays where it lies: the bodies
@@ -1833,6 +1880,39 @@ impl Shell {
     #[must_use]
     pub fn ledger(&self) -> engine::memory::Ledger {
         ledger(self, self.card.0, self.card.1)
+    }
+
+    /// A measuring load's second fit: the bodies armed over the least range
+    /// took `bodies_took`; they are forgotten, the range is fitted to what
+    /// the card has past that hold, and the lattice armed again over it.
+    /// Its record holds the figure, so a later boot fits once.
+    fn measured_refit(&mut self, device_total: u64, free_before: u64) -> Result<()> {
+        let started = std::time::Instant::now();
+        let hold = self.bodies_took;
+        self.cache.forget_bodies();
+        let resident = footprint(self, device_total, free_before);
+        let fitted = self
+            .pools
+            .fit_the_card(hold, self.held_for_fires, false, &resident)?;
+        self.arena.ensure_rungs(&mut self.pools)?;
+        self.lay_workspace()?;
+        self.bodies_mem = usize::try_from(hold).unwrap_or(usize::MAX);
+        self.rearming = true;
+        self.arming_at_load = true;
+        let armed = self.arm_bodies();
+        self.arming_at_load = false;
+        self.rearming = false;
+        armed?;
+        eprintln!(
+            "engine-cuda: a measuring boot: with no record of what this deployment's bodies \
+             take, they armed over the least range that serves and took {} MiB; the range was \
+             fitted again to the rest ({} chunks) and the lattice armed over it in {:.1} s. \
+             Later boots hold the measured figure and fit once",
+            hold >> 20,
+            fitted.chunks,
+            started.elapsed().as_secs_f64(),
+        );
+        Ok(())
     }
 
     /// Two load facts of this shell

@@ -24,8 +24,18 @@ pub const fn mapped_on_demand() -> bool {
     !cfg!(feature = "rocm")
 }
 
+/// What the pool holds back from the card for the driver: on a mapped pool,
+/// what the driver allocates beside it on its own while serving. A flat
+/// range holds back nothing: it is one allocation made once the load has
+/// taken what it takes beside it (side streams, library handles), and what
+/// arming allocates after is the bodies record's hold, which the fit leaves
+/// out of the range by name; once arming ends nothing allocates on the
+/// device.
 #[must_use]
 pub const fn safety_floor_bytes(total: u64) -> u64 {
+    if !mapped_on_demand() {
+        return 0;
+    }
     let tenth = total / 10;
     if SAFETY_FLOOR_BYTES < tenth {
         SAFETY_FLOOR_BYTES
@@ -95,6 +105,59 @@ pub struct PhysicalPool {
     /// when the load began ([`ceiling_of`]).
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     ceiling: u64,
+    /// What the driver holds on the card beside the pool that the device's
+    /// free figure does not count: on a flat range, the wave save areas of
+    /// this process's compute queues, read when the pool opens (every queue
+    /// a load makes is made before: `kernels_rocm::hip::open`, the fan).
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
+    beside: Beside,
+}
+
+/// What the driver holds beside a pool: the device's free figure already
+/// leaves it out (engine-cuda's `cudaMemGetInfo` on ROCm); the pool states
+/// it, for the load's line and a refusal.
+#[derive(Debug, Clone)]
+pub struct Beside {
+    pub said: String,
+}
+
+impl Beside {
+    const NONE: Beside = Beside {
+        said: String::new(),
+    };
+
+    /// On a flat range, the save areas of this process's compute queues;
+    /// a mapped pool holds back its safety floor instead.
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
+    fn read() -> Result<Beside> {
+        if mapped_on_demand() {
+            return Ok(Beside::NONE);
+        }
+        #[cfg(feature = "rocm")]
+        {
+            // A load opens its fan's side streams before its pools, past the
+            // hardware queues HIP makes a device: its rule counts them all.
+            let areas = kernels_cuda::hip::kfd::save_areas(u32::MAX).map_err(|why| {
+                Fault::Card(format!(
+                    "the flat range cannot be sized: the driver's wave save areas for this \
+                     process's queues are not readable ({why})"
+                ))
+            })?;
+            if areas.counted == kernels_cuda::hip::kfd::Counted::Driver && areas.queues != areas.rule {
+                eprintln!(
+                    "engine-cuda: KFD lists {} queues for this process where HIP's rule \
+                     counts {}: a load in another PID namespace, which counts by the rule, would \
+                     hold the wrong figure",
+                    areas.queues, areas.rule
+                );
+            }
+            Ok(Beside {
+                said: format!("the driver holds {areas}"),
+            })
+        }
+        #[cfg(not(feature = "rocm"))]
+        Ok(Beside::NONE)
+    }
 }
 
 impl PhysicalPool {
@@ -109,6 +172,10 @@ impl PhysicalPool {
             // SAFETY: two live locals; the call only writes them.
             let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
             crate::device::ctx::check("cudaMemGetInfo", asked)?;
+            let beside = Beside::read()?;
+            if !beside.said.is_empty() {
+                eprintln!("engine-cuda: outside the pool, {}", beside.said);
+            }
             let budget = room_under(ceiling, free as u64, total as u64);
             let handle_bytes = align_up(MAP_UNIT_BYTES.max(granularity), granularity);
             let pages = budget / LOGICAL_PAGE_BYTES;
@@ -122,6 +189,7 @@ impl PhysicalPool {
                 held_pages: 0,
                 committed_pages: 0,
                 ceiling,
+                beside,
             })
         }
         #[cfg(not(feature = "device"))]
@@ -144,6 +212,7 @@ impl PhysicalPool {
             held_pages: 0,
             committed_pages: 0,
             ceiling: u64::MAX,
+            beside: Beside::NONE,
         }
     }
 
@@ -511,7 +580,7 @@ impl Arena {
     }
 
     /// A flat arena's one allocation, backing every unit.
-    fn grow_flat(&mut self) -> Result<()> {
+    fn grow_flat(&mut self, pool: &PhysicalPool) -> Result<()> {
         if self.base != 0 {
             return Ok(());
         }
@@ -523,6 +592,14 @@ impl Arena {
             // SAFETY: a live out-parameter; freed exactly once, in `Drop`.
             crate::device::ctx::check("cudaMalloc", unsafe {
                 rt::cudaMalloc(&raw mut base, self.virtual_bytes as usize)
+            })
+            .map_err(|why| {
+                Fault::Card(format!(
+                    "the flat range of {} bytes was sized to what the card had free less what \
+                     the driver holds beside it ({}), and the device refused it: {why}",
+                    self.virtual_bytes,
+                    if pool.beside.said.is_empty() { "nothing" } else { &pool.beside.said },
+                ))
             })?;
             self.base = base as u64;
             self.units.fill(Some(FLAT));
@@ -539,7 +616,7 @@ impl Arena {
     fn grow(&mut self, pool: &PhysicalPool, units: &[usize]) -> Result<()> {
         if self.flat {
             return if units.iter().any(|&u| self.unbacked(u)) {
-                self.grow_flat()
+                self.grow_flat(pool)
             } else {
                 Ok(())
             };
@@ -869,6 +946,10 @@ pub struct Range {
     /// Where the segments part, and by how many bytes ([`Range::part`]):
     /// those from the first lie that many bytes further up the range.
     parted: (u64, u64),
+    /// A flat range before its fit: its holds are noted, not backed, so the
+    /// one allocation is made at the size the fit gives it
+    /// ([`Range::undefer`]), not at the estimate it was reserved with.
+    deferred: bool,
 }
 
 /// The spans the first `bottom` bytes of a range's segments lie in, parted
@@ -898,7 +979,14 @@ impl Range {
             limit: u64::MAX,
             segment_high: 0,
             parted: (u64::MAX, 0),
+            deferred: !mapped_on_demand(),
         })
+    }
+
+    /// Ends a flat range's deferral: its holds are backed, so it is
+    /// allocated at its first.
+    pub fn undefer(&mut self) {
+        self.deferred = false;
     }
 
     /// Where the range lies. A flat range is allocated at its first
@@ -1087,6 +1175,10 @@ impl Range {
             Some(span) => span.1 = span.1.max(bytes),
             None => held.push((from, bytes)),
         }
+        if self.deferred && !self.flat_allocated() {
+            self.held = held;
+            return Ok(Commit::Committed);
+        }
         let want = self.wanted(self.committed, &held);
         let mut targets = [Target {
             arena: &mut self.arena,
@@ -1146,6 +1238,23 @@ impl Range {
     /// dropped for another, so the pool's count of what is backed stands.
     pub fn release_all(&mut self, pool: &mut PhysicalPool) {
         self.arena.shrink_to(pool, &[]);
+        self.committed = 0;
+        self.held.clear();
+    }
+
+    /// Whether this is a flat range already allocated: its one allocation
+    /// stands for the range's life ([`Range::unhold`]).
+    #[must_use]
+    pub fn flat_allocated(&self) -> bool {
+        self.arena.flat && self.arena.base != 0
+    }
+
+    /// Forgets what is committed and held on a flat range already
+    /// allocated, keeping the allocation: the range is laid out anew inside
+    /// it. Allocating a flat range costs the driver clearing it (about five
+    /// seconds for 150 GiB on gfx942), so a load allocates it once.
+    pub fn unhold(&mut self) {
+        debug_assert!(self.flat_allocated());
         self.committed = 0;
         self.held.clear();
     }
@@ -1339,6 +1448,7 @@ mod tests {
             limit: u64::MAX,
             segment_high: 0,
             parted: (u64::MAX, 0),
+            deferred: false,
         }
     }
 

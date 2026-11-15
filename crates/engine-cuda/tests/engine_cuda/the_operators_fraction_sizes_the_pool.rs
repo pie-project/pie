@@ -1,6 +1,8 @@
 use engine::Allowance;
 use engine_cuda::device::elastic::map_unit_for;
-use engine_cuda::device::elastic::{budget_bytes, ceiling_of, room_under, safety_floor_bytes};
+use engine_cuda::device::elastic::{
+    budget_bytes, ceiling_of, mapped_on_demand, room_under, safety_floor_bytes,
+};
 use engine_cuda::store::kv::Paging;
 use engine_cuda::store::{
     Accounting, BODIES_FLOOR_BYTES, bodies_allowance, decoded_weight_reserve, holds_within,
@@ -23,14 +25,20 @@ fn nine_tenths(card: u64, before: u64) -> Allowance {
 
 #[test]
 fn the_operators_fraction_sizes_the_pool_every_case() {
-    the_load_takes_the_card_and_charges_what_is_already_on_it();
-    a_stated_budget_caps_what_the_load_takes();
-    a_stated_budget_counts_the_weights_the_load_took();
-    the_card_does_not_hold_a_deployment_whose_weights_leave_no_context();
-    the_reservations_scale_to_a_twenty_four_gigabyte_card();
+    // The floor is the mapped pool's: the cards these cases record served
+    // on it. A flat range (ROCm) takes what the card has left.
+    if mapped_on_demand() {
+        the_load_takes_the_card_and_charges_what_is_already_on_it();
+        a_stated_budget_caps_what_the_load_takes();
+        a_stated_budget_counts_the_weights_the_load_took();
+        the_card_does_not_hold_a_deployment_whose_weights_leave_no_context();
+        the_reservations_scale_to_a_twenty_four_gigabyte_card();
+        a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes();
+    } else {
+        a_flat_range_takes_what_the_card_has_left();
+    }
     the_decoded_weight_tiles_are_held_out_of_the_pool();
     the_bodies_keep_their_floor_and_the_tile_is_taken_before_any_capture();
-    a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes();
     a_sliding_row_holds_its_window_and_not_the_context();
 }
 
@@ -349,6 +357,28 @@ fn the_reservations_scale_to_a_twenty_four_gigabyte_card() {
         "the claim before arming is that one sequence; the rows' others come of what the bodies \
          leave"
     );
+}
+
+fn a_flat_range_takes_what_the_card_has_left() {
+    assert_eq!(safety_floor_bytes(CARD), 0, "a flat range holds nothing back");
+    let free = CARD - WEIGHTS;
+    assert_eq!(
+        budget_bytes(free, CARD, Allowance::WHOLE),
+        free,
+        "all the card has left, no share of it"
+    );
+    assert_eq!(ceiling_of(CARD, WEIGHTS, Allowance::WHOLE), CARD, "the card itself");
+    let budget = Allowance {
+        budget: Some(8 << 30),
+    };
+    assert_eq!(
+        budget_bytes(free, CARD, budget),
+        8 << 30,
+        "a stated budget still caps it"
+    );
+    let accounting = Accounting::of(CARD, Allowance::WHOLE, WEIGHTS, 2 << 30);
+    assert_eq!(accounting.pool, CARD - WEIGHTS);
+    assert_eq!(accounting.floor, 0);
 }
 
 fn the_load_takes_the_card_and_charges_what_is_already_on_it() {

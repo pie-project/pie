@@ -415,6 +415,48 @@ impl Chunks {
             .is_ok()
     }
 
+    /// The chunks a flat range's standing allocation holds.
+    fn room_chunks(&self) -> u64 {
+        self.range.bytes() / self.layout.chunk_bytes.max(1)
+    }
+
+    /// Lays a flat range's chunks out anew inside its standing allocation:
+    /// `total` of state and `act` (asked `act_bytes`) of activation above
+    /// them, as a fresh reservation would, the activation's span held again
+    /// where it then lies.
+    fn relay(
+        &mut self,
+        pool: &mut PhysicalPool,
+        total: u32,
+        act: u32,
+        act_bytes: u64,
+        held: u64,
+    ) -> Result<()> {
+        self.range.unhold();
+        self.total = total.max(1);
+        self.act = act;
+        self.act_asked = act_bytes;
+        self.table = ChunkTable::identity(self.total.saturating_add(act));
+        self.seated = Default::default();
+        self.next = 1;
+        self.null_zeroed = false;
+        self.refs = false;
+        self.weights = std::collections::BTreeSet::new();
+        self.skip = (self.total, 0);
+        if held > 0 {
+            match self.hold_activation(pool, held, true)? {
+                Commit::Committed => {}
+                _ => {
+                    return Err(Fault::program(
+                        "store::chunks",
+                        "the activation's span was refused the room it held",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Reserves the range anew for `total` chunks of state, before any
     /// segment is backed: the activation's span is backed again where it
     /// then lies.
@@ -428,9 +470,18 @@ impl Chunks {
         let held = self
             .range
             .held(u64::from(self.total) * self.layout.chunk_bytes);
-        self.range.release_all(pool);
         let act_bytes = u64::from(self.act) * self.layout.chunk_bytes;
+        // A flat range is allocated once, here at the fit, and laid out
+        // anew inside that allocation by every fit after that fits in it;
+        // only a fit that needs more (a measuring load's, past the least
+        // range it armed over) allocates it again.
+        if self.range.flat_allocated() && u64::from(total) + u64::from(self.act) <= self.room_chunks()
+        {
+            return self.relay(pool, total, self.act, self.act_asked, held);
+        }
+        self.range.release_all(pool);
         let mut fresh = Chunks::reserve(pool, self.layout.clone(), total, act_bytes)?;
+        fresh.range.undefer();
         if held > 0 {
             match fresh.hold_activation(pool, held, true)? {
                 Commit::Committed => {}
@@ -461,10 +512,19 @@ impl Chunks {
         }
         let chunk = self.layout.chunk_bytes;
         let held = self.range.held(u64::from(self.total) * chunk);
-        self.range.release_all(pool);
         let at = self.act_asked.next_multiple_of(RUN_ALIGN);
         let act_bytes = at.saturating_add(bytes);
+        let act = u32::try_from(act_bytes.div_ceil(chunk.max(1))).unwrap_or(u32::MAX);
+        let allocated = self.range.flat_allocated();
+        if allocated && u64::from(self.total) + u64::from(act) <= self.room_chunks() {
+            self.relay(pool, self.total, act, act_bytes, held)?;
+            return Ok(at);
+        }
+        self.range.release_all(pool);
         let mut fresh = Chunks::reserve(pool, self.layout.clone(), self.total, act_bytes)?;
+        if allocated {
+            fresh.range.undefer();
+        }
         if held > 0 {
             match fresh.hold_activation(pool, held, true)? {
                 Commit::Committed => {}

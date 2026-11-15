@@ -1,0 +1,315 @@
+//! What the kernel driver holds on the device for this process's queues:
+//! each queue has a wave save area (CWSR, its control stack within it) and
+//! a debugger area on every XCC, in device memory the runtime allocates
+//! for the driver when the queue is made, sized as KFD sizes it
+//! (`kfd_queue_ctx_save_restore_size`, `kfd_queue_acquire_buffers`). The
+//! HIP runtime's free figure does not count them, so a load that sizes one
+//! allocation to the card's free bytes holds them back by name.
+//!
+//! The area a queue takes is read from KFD's topology for the device. The
+//! queues are KFD's own list for this process where that list is ours to
+//! read (the host's PID namespace); in a container's PID namespace it is
+//! not, and the count is HIP's rule instead: one utility queue, and a
+//! hardware queue for each stream up to HIP's limit. The rule counts no
+//! copy queue, so it holds only while the copy queues are off
+//! ([`super::sys::copy_queues`]).
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const TOPOLOGY: &str = "/sys/class/kfd/kfd/topology/nodes";
+const PROCESSES: &str = "/sys/class/kfd/kfd/proc";
+
+/// HIP's limit on hardware queues a device, where `GPU_MAX_HW_QUEUES` does
+/// not state one (CLR's default).
+const HIP_HW_QUEUES: u32 = 4;
+
+/// Where the queue count came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Counted {
+    /// KFD's list of this process's queues.
+    Driver,
+    /// HIP's rule, KFD's list being another PID namespace's.
+    HipRule,
+}
+
+/// The device memory the driver holds for this process's queues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SaveAreas {
+    pub queues: u32,
+    pub counted: Counted,
+    /// What HIP's rule counts, beside KFD's list where both are read.
+    pub rule: u32,
+    pub xcc: u32,
+    /// Bytes a queue's wave save area takes on one XCC, its control stack
+    /// within it (topology's `cwsr_size`).
+    pub cwsr: u64,
+    /// Bytes a queue's debugger area takes on one XCC: 32 a wave the XCC
+    /// can hold, 64-aligned.
+    pub debug: u64,
+}
+
+impl SaveAreas {
+    /// What one queue holds, over every XCC.
+    #[must_use]
+    pub fn area(&self) -> u64 {
+        ((self.cwsr + self.debug) * u64::from(self.xcc)).next_multiple_of(PAGE)
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        u64::from(self.queues) * self.area()
+    }
+}
+
+impl core::fmt::Display for SaveAreas {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{} MiB for {} queues' wave save areas ({} XCC x ({} save + {} debugger) bytes a \
+             queue; queues {})",
+            self.bytes() >> 20,
+            self.queues,
+            self.xcc,
+            self.cwsr,
+            self.debug,
+            match self.counted {
+                Counted::Driver => "from KFD's list for this process",
+                Counted::HipRule => {
+                    "by HIP's rule: one utility queue and a hardware queue a stream up to \
+                     GPU_MAX_HW_QUEUES, KFD's list being another PID namespace's"
+                }
+            },
+        )
+    }
+}
+
+/// The save areas the current device holds for this process, which has
+/// opened at least `streams` streams on it.
+pub fn save_areas(streams: u32) -> Result<SaveAreas, String> {
+    let node = node_of_current_device()?;
+    let read = |name: &str| -> Result<u64, String> {
+        property(&node, name)?.ok_or_else(|| {
+            format!(
+                "KFD's topology for the device ({}) states no `{name}`",
+                node.display()
+            )
+        })
+    };
+    let xcc = u32::try_from(read("num_xcc")?).map_err(|_| "num_xcc past u32".to_owned())?;
+    let cwsr = read("cwsr_size")?;
+    let debug = debug_bytes(
+        read("gfx_target_version")?,
+        read("simd_count")? / read("simd_per_cu")?.max(1) / u64::from(xcc.max(1)),
+        read("array_count")? / read("simd_arrays_per_engine")?.max(1),
+    )
+    .ok_or_else(|| {
+        format!(
+            "KFD sizes no debugger area for this device ({}): its gfx version is past what \
+             this crate knows",
+            node.display()
+        )
+    })?;
+    let gpu = fs::read_to_string(node.join("gpu_id"))
+        .map_err(|why| format!("{}: {why}", node.join("gpu_id").display()))?;
+    let limit = std::env::var("GPU_MAX_HW_QUEUES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(HIP_HW_QUEUES);
+    // Compute queues by HIP's rule, and a copy queue for each stream
+    // `warm_copies` made one on.
+    let rule = 1 + streams.min(limit) + warmed();
+    let (queues, counted) = match own_queues(gpu.trim()) {
+        Some(queues) => (queues, Counted::Driver),
+        None => (rule, Counted::HipRule),
+    };
+    Ok(SaveAreas {
+        queues,
+        counted,
+        rule,
+        xcc,
+        cwsr,
+        debug,
+    })
+}
+
+const PAGE: u64 = 4096;
+
+static WARMED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The streams [`warm_copies`] made a copy queue on.
+#[must_use]
+pub fn warmed() -> u32 {
+    WARMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Makes each of `streams`' copy queue now: one host-to-device copy a stream
+/// past HIP's blit threshold (`GPU_FORCE_BLIT_COPY_SIZE`, 16 KiB where unset;
+/// a copy at or under it runs as a blit kernel and makes no queue), so the
+/// queue a stream's first copy would make while serving, with its save
+/// area, is made before the load sizes its pools. Device memory for the
+/// copy's target is the caller's `scratch`, at least one byte past the
+/// threshold.
+pub fn warm_copies(streams: &[super::sys::Stream], scratch: *mut core::ffi::c_void) -> Result<(), String> {
+    let bytes = blit_threshold() + 1;
+    let mut host: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: a live out-parameter; freed below.
+    let code = unsafe { super::rt::hipHostMalloc(&raw mut host, bytes, 0) };
+    if code != super::sys::HIP_SUCCESS {
+        return Err(format!("hipHostMalloc answered {code}"));
+    }
+    let mut outcome = Ok(());
+    for &stream in streams {
+        // SAFETY: `scratch` holds `bytes` (the caller's contract) and `host`
+        // was just allocated with them; the stream is the caller's, live.
+        let code = unsafe {
+            super::rt::hipMemcpyAsync(scratch, host, bytes, super::sys::MEMCPY_HOST_TO_DEVICE, stream)
+        };
+        // SAFETY: as above.
+        let synced = unsafe { super::rt::hipStreamSynchronize(stream) };
+        if code != super::sys::HIP_SUCCESS || synced != super::sys::HIP_SUCCESS {
+            outcome = Err(format!("a stream's first copy answered {code} / {synced}"));
+            break;
+        }
+        WARMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    // SAFETY: allocated above, freed once.
+    unsafe { super::rt::hipHostFree(host) };
+    outcome
+}
+
+/// HIP's blit threshold: a copy of more bytes runs on a copy queue.
+#[must_use]
+pub fn blit_threshold() -> usize {
+    std::env::var("GPU_FORCE_BLIT_COPY_SIZE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(16 << 10, |kib| kib << 10)
+}
+
+/// A queue's debugger area on one XCC of `cus` compute units and
+/// `arrays_per_engine` shader arrays an engine, as KFD sizes it: 32 bytes
+/// for each wave it counts the XCC holding (`get_num_waves`), 64-aligned.
+fn debug_bytes(gfx: u64, cus: u64, arrays: u64) -> Option<u64> {
+    let waves = if gfx < 100_100 {
+        (cus * 40).min(arrays * 512)
+    } else if gfx < 120_500 {
+        cus * 32
+    } else if gfx <= 120_501 {
+        cus * 64
+    } else {
+        return None;
+    };
+    Some((waves * 32).next_multiple_of(64))
+}
+
+/// This process's queues on the GPU KFD names `gpu`, compute and copy
+/// alike (each holds a save area), where KFD's list under this PID is this
+/// process's: it holds a queue on that GPU.
+fn own_queues(gpu: &str) -> Option<u32> {
+    let dir = Path::new(PROCESSES)
+        .join(std::process::id().to_string())
+        .join("queues");
+    let mut queues = 0u32;
+    for entry in fs::read_dir(dir).ok()? {
+        let queue = entry.ok()?.path();
+        if fs::read_to_string(queue.join("gpuid")).ok().as_deref().map(str::trim) == Some(gpu) {
+            queues += 1;
+        }
+    }
+    (queues > 0).then_some(queues)
+}
+
+/// The KFD topology node of the current device, matched by PCI location.
+fn node_of_current_device() -> Result<PathBuf, String> {
+    let (domain, location) = pci_location()?;
+    let nodes = fs::read_dir(TOPOLOGY).map_err(|why| format!("{TOPOLOGY}: {why}"))?;
+    for entry in nodes {
+        let node = entry.map_err(|why| format!("{TOPOLOGY}: {why}"))?.path();
+        if property(&node, "domain")? == Some(domain)
+            && property(&node, "location_id")? == Some(location)
+        {
+            return Ok(node);
+        }
+    }
+    Err(format!(
+        "no KFD topology node under {TOPOLOGY} is the device at PCI {domain:04x}:{:02x}:{:02x}.{}",
+        location >> 8,
+        (location >> 3) & 0x1f,
+        location & 7
+    ))
+}
+
+/// The current device's PCI domain and KFD location id (bus << 8 | device
+/// << 3 | function).
+fn pci_location() -> Result<(u64, u64), String> {
+    let mut device = 0;
+    // SAFETY: writes one int.
+    unsafe { super::rt::hipGetDevice(&raw mut device) };
+    let mut bus = [0 as core::ffi::c_char; 32];
+    // SAFETY: `bus` is a live buffer of the length passed.
+    let code = unsafe {
+        super::rt::hipDeviceGetPCIBusId(bus.as_mut_ptr(), bus.len() as core::ffi::c_int, device)
+    };
+    if code != super::sys::HIP_SUCCESS {
+        return Err(format!("hipDeviceGetPCIBusId answered {code}"));
+    }
+    // SAFETY: HIP wrote a NUL-terminated string into `bus`.
+    let id = unsafe { core::ffi::CStr::from_ptr(bus.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    parse_bus_id(&id)
+        .ok_or_else(|| format!("HIP's PCI bus id `{id}` is not domain:bus:device.function"))
+}
+
+fn parse_bus_id(id: &str) -> Option<(u64, u64)> {
+    let mut parts = id.trim().split(':');
+    let domain = u64::from_str_radix(parts.next()?, 16).ok()?;
+    let bus = u64::from_str_radix(parts.next()?, 16).ok()?;
+    let (device, function) = parts.next()?.split_once('.')?;
+    let device = u64::from_str_radix(device, 16).ok()?;
+    let function = u64::from_str_radix(function, 16).ok()?;
+    Some((domain, bus << 8 | device << 3 | function))
+}
+
+/// A `name value` line of a topology node's properties.
+fn property(node: &Path, name: &str) -> Result<Option<u64>, String> {
+    let path = node.join("properties");
+    let text = fs::read_to_string(&path).map_err(|why| format!("{}: {why}", path.display()))?;
+    Ok(text.lines().find_map(|line| {
+        let (key, value) = line.split_once(' ')?;
+        (key == name).then(|| value.trim().parse().ok()).flatten()
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_queue_holds_what_kfd_sizes_on_gfx942() {
+        // MI300X: 38 CUs and 32 arrays an XCC, 8 XCC; measured 186,019,840
+        // bytes of device memory a queue past what HIP counts.
+        let debug = debug_bytes(90_402, 38, 32).unwrap();
+        assert_eq!(debug, 48_640);
+        let areas = SaveAreas {
+            queues: 1,
+            counted: Counted::Driver,
+            rule: 1,
+            xcc: 8,
+            cwsr: 23_203_840,
+            debug,
+        };
+        assert_eq!(areas.area(), 186_019_840);
+    }
+
+    #[test]
+    fn a_bus_id_is_its_kfd_location() {
+        assert_eq!(parse_bus_id("0000:83:00.0"), Some((0, 0x8300)));
+        assert_eq!(
+            parse_bus_id("0001:0a:1f.7"),
+            Some((1, 0x0a << 8 | 0x1f << 3 | 7))
+        );
+        assert_eq!(parse_bus_id("83:00.0"), None);
+    }
+}

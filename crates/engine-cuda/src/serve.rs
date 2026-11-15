@@ -145,6 +145,10 @@ pub struct Shell {
     /// What the last arming's captures took, which a re-arm within the
     /// same load is allowed.
     bodies_took: u64,
+    /// A load on a flat range with no record of what its bodies take: it
+    /// arms over the least range that serves, measures, and fits the range
+    /// again to what arming took ([`super::serve::Staged::finish`]).
+    measuring: bool,
     /// The kernels' workspaces in the activation's span, once a load has
     /// walked what its fires take.
     workspace: Option<load::Workspace>,
