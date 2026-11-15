@@ -243,6 +243,17 @@ impl SharedPool {
     /// reads out `extents.sampled_rows` rows, more than the engine's fixed
     /// readout store holds, so no fire, however narrow, seats it. `None`
     /// where it fits, or no store bounds them.
+    ///
+    /// What the bind guards, and what it does not: every fire is of a bound
+    /// instance (`pipeline::fire`), and a sequence pass reads out the rows
+    /// of its program's `Readout` port (`pipeline::fire::geometry`, its
+    /// last row a lane where the port is absent), no more than the port's
+    /// elements, which are `sampled_rows` (`pipeline::program::price`). A
+    /// float pass (an encoder's, an embedding's) reads out every row it
+    /// embeds (`pipeline::fire::float`), which its extents do not state
+    /// (`sampled_rows` is then its lanes, or its outputs' rows): that
+    /// request is refused at admission instead, by name, against the same
+    /// store (`SchedulerLimits::readout_store`, `AdmissionLimits`).
     #[must_use]
     pub fn readouts_refused(&self, key: &FireKey) -> Option<String> {
         let rows = self.programs.readout_store?.max(1);

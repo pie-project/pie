@@ -70,6 +70,16 @@ impl AdmissionLimits {
                 usage.forward_tokens, self.limits.max_forward_tokens
             ));
         }
+        // A float lane (an encoder's, an embedding's) reads out every row
+        // it embeds (`pipeline::fire::float`), past what its bind's extents
+        // state: refused here where no fire, however narrow, holds them.
+        if self.limits.readout_store > 0 && usage.readouts > self.limits.readout_store {
+            return Some(format!(
+                "forward request of instance {} reads out {} rows, more than the {} rows \
+                 the engine's readout store holds for a fire",
+                req.instance_id.0, usage.readouts, self.limits.readout_store
+            ));
+        }
         if usage.page_refs > self.limits.max_page_refs {
             return Some(format!(
                 "forward request has {} page refs, exceeding engine limit {}",
@@ -455,6 +465,7 @@ mod tests {
             prefill_rows: 0,
             prefill_lanes: 0,
             max_readouts: 0,
+            readout_store: 0,
         }
     }
 
@@ -578,6 +589,57 @@ mod tests {
         }
         .read_out_by(&::engine::ReadoutFacts::default());
         assert_eq!(open.max_readouts, 0);
+    }
+
+    /// A float pass (an embedding's) reads out every row it embeds, which
+    /// its bind's extents do not state: one that alone reads out more than
+    /// the engine's readout store holds is refused at admission, naming its
+    /// instance; one the store holds, or any on an engine with no store,
+    /// is admitted.
+    #[test]
+    fn a_float_pass_past_the_readout_store_is_refused_at_admission_by_name() {
+        let embedding = |instance: u64, rows: u32| {
+            let lane = ::engine::Lane {
+                tokens: vec![0; rows as usize],
+                readout: ::engine::Readout::Rows((0..rows).collect()),
+                kv_less: true,
+                ..::engine::Lane::default()
+            };
+            pending(FireRequest::one(lane), InstanceId(instance))
+        };
+        let store = ::engine::ReadoutFacts {
+            store_rows: Some(128),
+            ..::engine::ReadoutFacts::default()
+        };
+        let admission = AdmissionLimits::new(reading(&store), 16);
+        let refused = admission
+            .single_request_limit_error(&embedding(42, 512))
+            .expect("512 rows past a store of 128 are refused");
+        assert!(
+            refused.contains("instance 42")
+                && refused.contains("512 rows")
+                && refused.contains("128 rows the engine's readout store holds"),
+            "refused by name: {refused}"
+        );
+        assert_eq!(
+            admission.single_request_limit_error(&embedding(43, 128)),
+            None,
+            "the store's own rows are admitted"
+        );
+        for readouts in [
+            ::engine::ReadoutFacts::default(),
+            ::engine::ReadoutFacts {
+                landing: ::engine::ReadoutLanding::Beside { row_bytes: 4096 },
+                store_rows: None,
+            },
+        ] {
+            let open = AdmissionLimits::new(reading(&readouts), 16);
+            assert_eq!(
+                open.single_request_limit_error(&embedding(44, 512)),
+                None,
+                "{readouts:?}: no store, nothing refused"
+            );
+        }
     }
 
     /// The fires of `dispatch`'s frames, each fire id standing for the

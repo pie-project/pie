@@ -3004,6 +3004,7 @@ mod tests {
                 prefill_rows: 0,
                 prefill_lanes: 0,
                 max_readouts: 0,
+                readout_store: 0,
             },
             &stats,
             &mut FramePolicy::new(1, 64, 4096, None),

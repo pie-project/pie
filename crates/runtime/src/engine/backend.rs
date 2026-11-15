@@ -23,6 +23,11 @@ pub struct SchedulerLimits {
     /// rows its fixed readout store holds ([`Self::read_out_by`]). 0: up to
     /// `max_forward_tokens`.
     pub max_readouts: usize,
+    /// The rows the engine's fixed readout store holds
+    /// ([`::engine::ReadoutFacts::store_rows`]; 0: no store). A request
+    /// that alone reads out more is refused at admission, by name: no cut
+    /// of fires seats it (`scheduler::batch::AdmissionLimits`).
+    pub readout_store: usize,
 }
 
 impl SchedulerLimits {
@@ -35,6 +40,7 @@ impl SchedulerLimits {
     pub fn read_out_by(mut self, readouts: &::engine::ReadoutFacts) -> Self {
         let ceiling = u32::try_from(self.max_readouts).unwrap_or(u32::MAX);
         self.max_readouts = readouts.fire_rows(ceiling) as usize;
+        self.readout_store = readouts.store_rows.map_or(0, |rows| rows.max(1) as usize);
         self
     }
 }
