@@ -148,7 +148,7 @@ No table of fire time by rung exists in `runtime`, `engine`, any engine crate or
 ## Not verified
 
 - Line numbers for `planner/stats.rs`, `report.rs`, `exec.rs`, `diagnostics.rs`, `scheduler/dispatch.rs`, and the T-side `shared.rs`, `slots.rs`, `target.rs`, `fire.rs:745-1169` were read earlier in this study and not re-read at the end.
-- What the planner's copy clock really covers per engine. Metal's `copy_slots` commits asynchronously; whether `completion.wait()` waits for the copy to land was not traced. The same doubt applies to `retired.started.elapsed()` as device time when several frames are in flight, and to lane time on engines that settle asynchronously.
+- What the planner's copy clock really covers per engine: now traced, see "Metal and the copy clock" below. The same doubt applies to `retired.started.elapsed()` as device time when several frames are in flight, and to lane time on engines that settle asynchronously.
 - Whether `disk_write_us`/`disk_read_us` cover the same window as the copy clock.
 - How much a whole-process suspend really moves: `prepare_suspend` takes `movable_resident_pages` (`store/kv.rs:2381 @T`); pages shared with kept processes may stay. Not traced.
 - The restore after an offload on O (order, who returns first, whether a returning process can land back in lent chunks and be offloaded again). Only the doc comment was read; no test was read (`store/shared/tests.rs` on O, +78 lines, unread).
@@ -160,3 +160,114 @@ No table of fire time by rung exists in `runtime`, `engine`, any engine crate or
 - `engine-xla` and `engine-cerebras` were not studied.
 - L's `slots.rs` changes were read through grep hits, not in full; F's `programs.rs` changes likewise.
 - Nothing was built or run.
+
+## Metal and the copy clock
+
+Follow-up to the unverified item above. Ref: `3e4e78300` (T) only, every citation below is `@T`. Read with `git show` / `git grep`; nothing checked out, built or run.
+
+### Short answer
+
+- **The runtime clock stops when the engine call returns, on every engine.** The lane turns the verb's `Ok(())` into a completion that is already ready. Nothing awaits an engine-side landing.
+- **On Metal the tier moves and the evacuation are complete when the call returns.** Disk and host moves are host memcpy plus synchronous pread/pwrite; evacuation commits with `waitUntilCompleted`. Only a same-device `copy_slots` returns on enqueue, and that is not a planner tier move.
+- **So the asynchronous commit does not distort Metal's tier clock.** What the clock adds to the copy is lane queue time and `drain()`, which waits for every frame in flight.
+- **Metal is not the odd one.** CUDA/ROCm return on enqueue for device↔host and for evacuation; Vulkan/wgpu for evacuation; XLA for every write to the device. Each engine has at least one direction where a clock around the call measures an enqueue.
+- **No engine reports bytes or time back.** No existing report has a field for either.
+
+### How the runtime clock ends (all engines)
+
+- Start: `Instant::now()` before `copy_tier_tracked` (`runtime/src/planner/exec.rs:388-389`). Every copy of a move is submitted before any is awaited (:386-393), so a later copy's window includes the earlier copies of the same move.
+- The lane runs the verb and wraps its result: `verbs::settled(engine.copy_slots(&plan))` (`runtime/src/scheduler/lane.rs:942-952`), where `settled` maps `Ok(())` to `SubmissionCompletion::ready()` (`runtime/src/engine.rs:59-63`).
+- The scheduler worker stores it as `ControlSlotState::Ready` (`scheduler/worker.rs:2722-2734`) and resolves the tracked completion on its next retire pass (:2562-2578).
+- Stop: after `completion.wait()` (`planner/exec.rs:395-402`), then `record_tier_copy` (`planner/report.rs:194-220`).
+- `settles_asynchronously` governs fire frames only (`lane.rs:727-771`); the copy path does not consult it.
+- `set_rung` and `evacuate` are `PoolOp`s answered on a response channel (`lane.rs:960-968`); no clock is on them.
+
+### 1. Metal: return of the call vs completion of the copy
+
+| Move | Path | The call's return is | Completion known at |
+|---|---|---|---|
+| device → disk | `copy_slots` → `drain()` → `Pools::spill(to_disk)` | the copy, done: per slot `pool.read` into the stage then `file.write` | the return |
+| disk → device | same, `spill(!to_disk)` | the copy, done: `file.read` then `pool.write` | the return |
+| device ↔ host (budget stated) | `copy_slots` → `drain()` → `Pools::park` | the copy, done: one host memcpy a slot | the return |
+| evacuation (device → device chunks) | `evacuate` → `drain()` → blits → `frame.commit()` | the copy, done: `waitUntilCompleted` | the return |
+| same-device slot copy | `copy_slots` → blits → `commit_async(None)` | an enqueue | the next `drain()` |
+
+- Entry: `engine-metal/src/serve.rs:1735-1744` (`copy_slots`), :1697-1712 (`evacuate`).
+- Tier branches encode nothing into the frame: `engine-metal/src/store/pools.rs:1899-1912`; `spill` :1924-1968 (loop :1950-1966); `park` :983-1005. The frame committed afterwards (`serve.rs:1742`) is empty for them.
+- Slot file IO is `write_all_at` / `read_exact_at` (`engine/src/disk.rs:70-78`), opened with `F_NOCACHE` on Apple (`engine/src/disk/native.rs:167-177`). No fsync on the path; `SlotFile::sync` exists (`disk.rs:59-62`) and `spill` does not call it.
+- `commit()` waits: `engine-metal/src/device/ctx.rs:772-786`. `commit_async` returns a `Pending` after committing (:822-866).
+- The async handle is `self.grafted` (`serve.rs:301`), waited only in `drain()` (:2496-2503), which first harvests every frame in flight (`harvest_one` → `pending.wait()`, :2566-2570).
+- `drain()` is called by the next copy, evacuation, tier read/write and others (`serve.rs:1454, 1583, 1650, 1680, 1689, 1701, 1724, 1739, 1751, 1761, 2179, 2524, 3823`). A fire does not wait for it; it is ordered behind it on the queue.
+- Host tier: seated only where a budget is stated (`engine-metal/src/api.rs:550-554`); otherwise suspended slots go straight to disk.
+- `Engine::copy_kv` on Metal refuses any tier side (`api.rs:967-979`), so tier moves reach Metal only through `copy_slots`.
+
+### 2. What `PlannerStats`' microseconds measure on Metal today
+
+- **`disk_write_us`** (device → disk): lane queue wait, plus earlier copies of the same move, plus `drain()` (every frame in flight lands), plus memcpy and uncached pwrite per slot, plus the enqueue of an empty command buffer, plus the worker's retire and wake.
+- **`disk_read_us`** (disk → device): the same with pread and a memcpy into the pool.
+- **`d2h_copy_us` / `h2d_copy_us`** (host tier, only with a budget): the same with one memcpy a slot. The first touch of a tier chunk allocates and zero-fills the whole chunk (`store/pools.rs:613-619`).
+- **rs and role slots**: counted, no time (`planner/report.rs:207-208`).
+- **Evacuation and `set_rung`**: not on this clock.
+- **Same-device slot copies**: never a `TierMove` (`scheduler/dispatch.rs:161-185` always has a tier side), so the one asynchronous commit never enters `PlannerStats`.
+
+### 3. Where a clock would start and stop on Metal; a report to carry it
+
+- **Disk and host moves.** The bytes move on the lane thread inside `pools.copy_slots` (`serve.rs:1741`), after `drain()` returns (:1739). A host clock from :1739's return to :1741's return covers the copy alone. No command buffer carries these bytes, so `GPUStartTime` / `GPUEndTime` do not apply. IO completion is the return of pwrite / pread.
+- **Evacuation.** The blits are in the frame committed at `serve.rs:1704`. `Frame::commit_timed` already returns `GPUEndTime - GPUStartTime` for a frame (`device/ctx.rs:794-812`); the wall alternative is :1702-1704, after the drain at :1701.
+- **Same-device slot copy.** The `Pending` in `self.grafted` has `gpu_span_us()` (`device/ctx.rs:928-939`), readable once `grafted.wait()` returns in `drain()` (`serve.rs:2500-2502`); today the handle is dropped there unread. `commit_async` also takes a completed handler (`ctx.rs:829-855`), which today carries only an error string.
+- **Timestamps in use today.** `GPUStartTime` / `GPUEndTime` appear only at `device/ctx.rs:811-812, 936-937`. Consumers: the `device-done … gpu_us` fire trace (`serve.rs:2574-2581`), kernel profiling (`encode.rs:125-126`), `tune.rs:1227`. `kernelStartTime` / `kernelEndTime`: no use anywhere in `engine-metal` (grep, no hit).
+- **Existing engine → runtime reports.** None has a bytes or a time field:
+  - the verbs answer `Result<()>` (`engine/src/engine.rs:251, 259, 282`);
+  - `CompletionSink` is per fire step, `(StepDone, StepOutcome)` (`engine.rs:17-42`);
+  - `weight_uses()` is a polled answer of read counts (`engine.rs:299-306`, `engine/src/chunk/weight.rs:112-121`);
+  - `engine::live::Live` is the one record an engine writes and the runtime reads without asking the lane: `armed`, `outside`, `held`, four event tallies (`engine/src/live.rs:20-35, 43-56`). CUDA and XLA keep one (`engine-cuda/src/serve/arming.rs:1571`, `serve/load.rs:1343`; `engine-xla/src/api.rs:158, 404`). Metal, Vulkan and wgpu do not override `live()`; the default builds a fresh `Live::armed()` per call (`engine.rs:75-77`).
+
+### 4. The other engines
+
+**CUDA.** The same three answers differ by direction.
+- Device ↔ host returns on enqueue: the copy rides the swap stream, a `landed` event is kept in `self.swaps`, and the bytes reach the tier on a landing thread (`engine-cuda/src/store.rs:3857-3907`, `store/host.rs:288-382, 437-440`). A later fire naming those pages waits through `fence_swaps` (`store.rs:4202-4220`); `settle_swaps` is the host wait (:4223-4228).
+- Device → disk is complete on return: per slot `copy_any` to the stage, `ctx::sync(stream)`, `file.write` (`store.rs:4015-4018`). The sync also waits for every fire on the stream.
+- Disk → device: `file.read` then an enqueued `copy_any`; the last slot is left landing (`store.rs:4010-4013, 4020-4022`).
+- Evacuation returns on enqueue: `copy_batch_d2d(stream, …)` then the table (`store/chunks.rs:720-749`, `store.rs:2369-2379`, `serve/stats.rs:146-150`).
+- So `d2h_copy_us` / `h2d_copy_us` measure an enqueue on CUDA, and `disk_write_us` includes a stream sync. No timing around these paths was found in `engine-cuda`.
+
+**ROCm.** The same crate and paths: `cudaMemcpyAsync` → `hipMemcpyAsync`, `cudaStreamSynchronize` → `hipStreamSynchronize` (`engine-cuda/src/device/hip.rs:340-349, 434-437`). Same answers as CUDA as far as read.
+
+**Vulkan / wgpu** (`engine-gpu`).
+- Tier moves are complete on return: `drain()` then `frame.commit()` (`engine-gpu/src/serve.rs:1433-1449`), and `commit` is submit plus wait on both (`engine-vulkan/src/device/ctx.rs:1708-1714`, `engine-wgpu/src/device/ctx.rs:964-970`). Host copies are blits in that frame for mapped host chunks, or host reads for heap ones (`engine-gpu/src/store.rs:1266-1300`).
+- Same-device slot copies return on enqueue (`serve.rs:1443-1444`).
+- Evacuation returns on enqueue (`serve.rs:1687`), unless weight caches exist: then `commit()` and `drain()` first (:1680-1685).
+- Both have `commit_timed`, a host clock around submit and wait (`engine-vulkan/src/device/ctx.rs:1716-1724`, `engine-wgpu/src/device/ctx.rs:972-980`). No device timestamps seen.
+
+**XLA.**
+- Device → host or disk is complete on return: `copy_tier` reads every source slot into a host buffer first, the device through a raw readback (`engine-xla/src/serve.rs:1211-1279`, `store.rs:1591-1613`).
+- Host or disk → device returns on enqueue: `write_slots` → `exec::maintain`, which runs with `wait = false` (`store.rs:1618-1645, 1698`, `exec.rs:65-72`); `Device::run` waits only when asked or profiled (`device.rs:495-504`).
+- Evacuation is the same maintenance path (`store.rs:1481, 1489-1511`), and the pool is `Growth::Fixed`: "the runtime does not ask it of a `Growth::Fixed` pool" (`api.rs:789-793`, `store.rs:970`).
+
+**Verdict.** Every engine needs an engine-side clock for at least one direction. Metal needs it least for tier moves (they are synchronous) and has device timestamps ready for the evacuation.
+
+### 5. A probe move at load
+
+- **The runtime's own quiet point** is the lane's idle hook: `next_request(…, || arming.step(&mut engine, true, !landed_instances.is_empty()))` (`runtime/src/scheduler/lane.rs:478-487`). It runs with no request on hand, and the last argument says whether frames are still in flight.
+- **"Beside arming" exists only on CUDA/ROCm.** `Arming::step` runs only in `State::Arming` (`scheduler/arming.rs:329-331`), entered only when the engine's `Live` is not fully armed (:275-279). Only `engine-cuda` overrides `arm_step` (`engine-cuda/src/api.rs:561-567`, `serve/arming.rs:1571-1579`). On Metal, Vulkan, wgpu and XLA the lane's arming is `Done` from construction and never calls the engine.
+- **CUDA/ROCm.** Each `arm_step` ends with `device.synchronize()` (`serve/arming.rs:1617`), so nothing is in flight when it returns. Inside `load`, load-time arming (`staged.finish()`, `api.rs:693`, `serve/load.rs:1640-1641`) runs before the tiers are seated (`api.rs:696-718`); the in-load point with tiers seated is `api.rs:718-725`.
+- **Metal.** In `load`, after `seat_tier` and `seat_disk_kv` (`engine-metal/src/api.rs:554-562`) and before the facts are read (:573-583): no frame has been submitted.
+- **Vulkan / wgpu.** In `load`, after `seat_disk_kv` (`engine-gpu/src/api.rs:474-481`) and before the facts (:489-490).
+- **XLA.** In `load`, after `seat_tiers` (`engine-xla/src/api.rs:479-490`) and before `tiered_facts` (:491). The way back to the device is an enqueue there too (section 4).
+- **What the arming lease lends** is free kv list slots and record slots (`engine/src/live.rs:157-170`), not a chunk and not tier slots.
+- **A tier move is by slot of a shape, not by chunk** (`engine-metal/src/store/pools.rs:1899-1912`). Metal's slot files hold kv list and fixed record slots only (:1925-1933); CUDA's holds kv list slots only (`engine-cuda/src/store.rs:3839-3846`).
+- **A cold probe pays first-touch costs.** Metal allocates and zero-fills a host tier chunk on its first write (`store/pools.rs:613-619`). CUDA pins host kv pages a chunk at a time on first touch (`engine-cuda/src/store.rs:4031-4037`).
+
+### Not verified (this section)
+
+- Whether the device slots a probe would name are backed at the in-load point. Metal's `spill` and `park` call `pool.admit` on the slot's chunk (`store/pools.rs:988-989, 1938-1941`); the runtime commits segments later through `PoolOp::CommitSegments` (`lane.rs:963`). `admit` and the segments committed at load were not read.
+- Who allocates tier slot refs for a probe. The runtime's stores own them; that side was not traced for a move with no process.
+- `engine-gpu`'s `spill` body (`store.rs:1456`) was not read; "complete on return" for its disk moves rests on the `drain()` and `commit()` around it.
+- wgpu's `Pending::wait` in a browser (whether it can block) was not read; only the native poll was seen (`engine-wgpu/src/device/host.rs:188`).
+- CUDA's `copy_batch` / `copy_any` bodies were not read; "enqueue" rests on their doc comments and on the events recorded after them.
+- CUDA's `HostTier` landing thread: whether its ring-to-tier memcpy is counted anywhere was not checked.
+- ROCm was read only as the HIP mapping of the two calls; no ROCm-specific tier code was looked for.
+- XLA's `read_raw` was assumed to block (it returns bytes); `synchronous()` (`engine-xla/src/api.rs:571-573`) was not read.
+- The worker's retire latency between the lane's reply and `completion.wait()` returning was not sized.
+- Whether `drain()` on Metal is usually short at a tier move (how many frames are in flight then) cannot be read from code.
+- Nothing was built or run; no timing was observed.
