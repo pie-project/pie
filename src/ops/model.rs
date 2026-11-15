@@ -12,6 +12,7 @@ use crate::ui::{Align, Answer, Mark, Palette, Row, Table};
 
 pub mod facts;
 pub mod import;
+pub mod reload;
 
 #[derive(Subcommand, Debug)]
 pub enum ModelCmd {
@@ -21,6 +22,8 @@ pub enum ModelCmd {
         name: String,
     },
     Import(import::ImportArgs),
+    /// Writes a checkpoint's weights over a running server's model, in place.
+    Reload(reload::ReloadArgs),
     Remove {
         name: String,
         #[arg(long, short = 'y')]
@@ -33,6 +36,7 @@ pub fn run(cmd: ModelCmd, global: &crate::args::GlobalArgs) -> Result<Answer> {
         ModelCmd::List => list(),
         ModelCmd::Info { name } => info(name),
         ModelCmd::Import(args) => import::run(args, global),
+        ModelCmd::Reload(args) => reload::run(args, global),
         ModelCmd::Remove { name, yes } => remove(name, yes),
     }
 }
