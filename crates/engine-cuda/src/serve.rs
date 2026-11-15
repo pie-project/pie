@@ -760,6 +760,13 @@ impl Shell {
         self.programs.register(&self.device, registration)
     }
 
+    pub fn program_compiler(&self) -> Option<engine::ProgramCompiler> {
+        if cfg!(feature = "rocm") {
+            return None;
+        }
+        self.programs.compiler(&self.device).ok()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn bind_program(
         &mut self,

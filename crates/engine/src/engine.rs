@@ -7,7 +7,9 @@ use crate::chunk::{Evacuation, SlotCopy, WeightResidency, WeightUses};
 use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded, Reload, Reloaded};
-use crate::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
+use crate::program::{
+    BoundInstance, InstanceBinding, InstanceId, ProgramCompiler, ProgramId, ProgramRegistration,
+};
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -79,6 +81,10 @@ pub trait Engine: Send {
     fn register_program(&mut self, registration: &ProgramRegistration) -> Result<ProgramId> {
         let _ = registration;
         Err(self.unsupported("register_program"))
+    }
+
+    fn program_compiler(&self) -> Option<ProgramCompiler> {
+        None
     }
 
     fn register_channel(

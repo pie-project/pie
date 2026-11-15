@@ -230,6 +230,27 @@ impl Plane {
         Ok(id)
     }
 
+    pub fn compiler(&self, context: &Context) -> Result<engine::ProgramCompiler> {
+        let target = Target::of(context)?;
+        let (disk, ahead) = self.cache.ahead();
+        Ok(std::sync::Arc::new(
+            move |registration: &ProgramRegistration| {
+                let Ok(plan) =
+                    adopt_launch_package_with(registration.launch.clone(), Boundaries::CUDA)
+                else {
+                    return;
+                };
+                compile::compile_ahead(
+                    &plan,
+                    &registration.emitted_kernels,
+                    Versions::from_compiler(registration.emitter_version),
+                    target,
+                    (&disk, &ahead),
+                );
+            },
+        ))
+    }
+
     #[must_use]
     pub fn program(&self, id: ProgramId) -> Option<&Program> {
         self.programs.get(&id)

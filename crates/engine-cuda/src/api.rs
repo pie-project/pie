@@ -1052,6 +1052,10 @@ impl Engine for Cuda {
         }
     }
 
+    fn program_compiler(&self) -> Option<engine::ProgramCompiler> {
+        self.shell.as_ref()?.program_compiler()
+    }
+
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
         self.loaded_mut()?
             .register_program(registration)

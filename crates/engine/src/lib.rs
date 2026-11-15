@@ -46,7 +46,8 @@ pub use fire::{
 };
 pub use load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Reload, Reloaded, Residency};
 pub use program::{
-    BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
+    BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramCompiler, ProgramId,
+    ProgramRegistration,
 };
 pub use transfer::{
     KvCopy, KvHandle, KvLayout, KvLayoutKind, KvMove, KvRegion, MemoryDomain, StateCopy, StateMove,

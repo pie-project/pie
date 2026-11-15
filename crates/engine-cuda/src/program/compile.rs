@@ -1,10 +1,11 @@
 #![allow(unsafe_code)]
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use eta_compiler::codegen::launch::LaunchStagePlan;
 use eta_compiler::codegen::program::KernelKind;
@@ -18,6 +19,13 @@ use crate::error::{Fault, Result};
 use eta_ir::registry::Stage as Attach;
 
 const KERNEL_FUSED: KernelKind = KernelKind::Fused;
+
+#[cfg(not(feature = "rocm"))]
+const PARALLEL_COMPILES: usize = 16;
+#[cfg(feature = "rocm")]
+const PARALLEL_COMPILES: usize = 1;
+
+type Ahead = HashMap<(String, u32), Vec<u8>>;
 
 #[cfg_attr(not(feature = "device"), allow(dead_code))]
 const DEFAULT_BLOCK_THREADS: u32 = 256;
@@ -641,6 +649,7 @@ pub struct Cache {
     stages: Stages<Stage>,
     negative: Bounded<u64, String>,
     disk: Disk,
+    ahead: Arc<Mutex<Ahead>>,
     stats: CacheStats,
 }
 
@@ -658,8 +667,14 @@ impl Cache {
             stages: Stages::new(MAX_STAGE_ENTRIES),
             negative: Bounded::new(MAX_NEGATIVE_ENTRIES),
             disk,
+            ahead: Arc::new(Mutex::new(Ahead::new())),
             stats: CacheStats::default(),
         }
+    }
+
+    #[must_use]
+    pub fn ahead(&self) -> (Disk, Arc<Mutex<Ahead>>) {
+        (self.disk.clone(), Arc::clone(&self.ahead))
     }
 
     #[must_use]
@@ -735,7 +750,7 @@ impl Cache {
         })?;
         let architecture = target.architecture();
 
-        let mut stages = Vec::with_capacity(plan.package.plans.len());
+        let mut walk = Vec::with_capacity(plan.package.plans.len());
         for (stage_index, stage_plan) in plan.package.plans.iter().enumerate() {
             let stage_index = u32::try_from(stage_index).map_err(|_| Failure::Deterministic {
                 reason: "a program with more than four billion stages is not a program".into(),
@@ -750,19 +765,39 @@ impl Cache {
                 ],
             );
             let (lookup, hit) = self.stages.lookup(key, stage_plan.identity);
-            match lookup {
-                Lookup::Hit => {
-                    self.stats.memory_hits += 1;
-                    if let Some(stage) = hit {
-                        stages.push(stage);
-                        continue;
-                    }
+            if lookup == Lookup::Hit {
+                self.stats.memory_hits += 1;
+                if let Some(stage) = hit {
+                    walk.push(Err(stage));
+                    continue;
                 }
-                Lookup::Collided | Lookup::Miss => {}
             }
+            walk.push(Ok((stage_index, stage_plan, identity, key, lookup)));
+        }
+        let built = walk.iter().filter_map(|stage| stage.as_ref().ok());
+        let mut ahead = self.build_ahead(
+            built.map(|(at, plan, identity, _, _)| (*at, *plan, identity.as_str())),
+            &index,
+            &architecture,
+        );
 
-            let compiled =
-                self.build_stage(stage_index, stage_plan, &index, &identity, &architecture)?;
+        let mut stages = Vec::with_capacity(walk.len());
+        for stage in walk {
+            let (stage_index, stage_plan, identity, key, lookup) = match stage {
+                Err(held) => {
+                    stages.push(held);
+                    continue;
+                }
+                Ok(build) => build,
+            };
+            let compiled = self.build_stage(
+                stage_index,
+                stage_plan,
+                &index,
+                &identity,
+                &architecture,
+                &mut ahead,
+            )?;
             if lookup == Lookup::Miss {
                 self.stages
                     .stage(key, stage_plan.identity, compiled.clone());
@@ -776,6 +811,15 @@ impl Cache {
         })
     }
 
+    fn build_ahead<'p>(
+        &self,
+        stages: impl Iterator<Item = (u32, &'p LaunchStagePlan, &'p str)>,
+        index: &Emitted<'_>,
+        architecture: &str,
+    ) -> Ahead {
+        side_by_side(&regions_to_build(stages, index, &self.disk), architecture)
+    }
+
     fn build_stage(
         &mut self,
         stage_index: u32,
@@ -783,6 +827,7 @@ impl Cache {
         index: &Emitted<'_>,
         identity: &str,
         architecture: &str,
+        ahead: &mut Ahead,
     ) -> std::result::Result<Stage, Failure> {
         let mut regions = Vec::new();
         for region_index in 0..plan.fused.len() {
@@ -826,7 +871,8 @@ impl Cache {
                 }
             };
 
-            let module = self.region_module(identity, region_index, entry, source, architecture)?;
+            let module =
+                self.region_module(identity, region_index, entry, source, architecture, ahead)?;
             regions.push(Region {
                 region_index,
                 module,
@@ -845,6 +891,7 @@ impl Cache {
         entry: &str,
         source: &str,
         architecture: &str,
+        ahead: &mut Ahead,
     ) -> std::result::Result<Arc<Module>, Failure> {
         let key = disk_key(identity, source);
         // CUDA keeps the exact cut's state in dynamic shared memory; HIP's
@@ -866,7 +913,16 @@ impl Cache {
             }
         }
 
-        let cubin = compile(source, architecture)?;
+        let built = ahead.remove(&(key.clone(), region_index)).or_else(|| {
+            self.ahead
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&(key.clone(), region_index))
+        });
+        let cubin = match built {
+            Some(cubin) => cubin,
+            None => compile(source, architecture)?,
+        };
         self.stats.compilations += 1;
         let module = Module::load(&cubin, entry, dynamic).map_err(|error| Failure::Retryable {
             reason: format!("loading `{entry}`: {error}"),
@@ -874,6 +930,121 @@ impl Cache {
         self.disk.store(&key, region_index, entry, &cubin);
         Ok(Arc::new(module))
     }
+}
+
+fn regions_to_build<'s, 'p>(
+    stages: impl Iterator<Item = (u32, &'p LaunchStagePlan, &'p str)>,
+    index: &Emitted<'s>,
+    disk: &Disk,
+) -> Vec<(String, u32, &'s str, &'s str)> {
+    let mut jobs: Vec<(String, u32, &str, &str)> = Vec::new();
+    for (stage_index, plan, identity) in stages {
+        for (region_index, region) in plan.fused.iter().enumerate() {
+            let Ok(region_index) = u32::try_from(region_index) else {
+                break;
+            };
+            if !super::launch::shell_launches(region) {
+                continue;
+            }
+            let Slot::Kernel { source, entry, .. } =
+                index.get(KERNEL_FUSED, stage_index, region_index)
+            else {
+                continue;
+            };
+            let key = disk_key(identity, source);
+            if jobs
+                .iter()
+                .any(|(held, at, _, _)| *held == key && *at == region_index)
+                || disk.load(&key, region_index, entry).is_some()
+            {
+                continue;
+            }
+            jobs.push((key, region_index, source, entry));
+        }
+    }
+    jobs
+}
+
+fn side_by_side(jobs: &[(String, u32, &str, &str)], architecture: &str) -> Ahead {
+    let width = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(PARALLEL_COMPILES)
+        .min(jobs.len());
+    let built = Mutex::new(Ahead::with_capacity(jobs.len()));
+    let next = AtomicUsize::new(0);
+    let work = || {
+        while let Some((key, region_index, source, _)) =
+            jobs.get(next.fetch_add(1, Ordering::Relaxed))
+        {
+            if let Ok(cubin) = compile(source, architecture) {
+                built
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert((key.clone(), *region_index), cubin);
+            }
+        }
+    };
+    if width < 2 {
+        work();
+    } else {
+        std::thread::scope(|scope| {
+            for _ in 0..width {
+                scope.spawn(work);
+            }
+        });
+    }
+    built
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+const MAX_AHEAD: usize = 4096;
+
+pub fn compile_ahead(
+    plan: &ExecPlan,
+    kernels: &[EmittedKernel],
+    versions: Versions,
+    target: Target,
+    (disk, ahead): (&Disk, &Mutex<Ahead>),
+) {
+    let Ok(index) = Emitted::index(kernels) else {
+        return;
+    };
+    let identities: Vec<String> = plan
+        .package
+        .plans
+        .iter()
+        .map(|stage| cache_identity(BACKEND, target.device, stage.signature_hash, versions))
+        .collect();
+    let stages = plan
+        .package
+        .plans
+        .iter()
+        .zip(&identities)
+        .enumerate()
+        .filter_map(|(at, (stage, identity))| {
+            Some((u32::try_from(at).ok()?, stage, identity.as_str()))
+        });
+    let jobs = regions_to_build(stages, &index, disk);
+    if jobs.is_empty() {
+        return;
+    }
+    let mut built = side_by_side(&jobs, &target.architecture());
+    if disk.is_enabled() {
+        for (key, region_index, _, entry) in &jobs {
+            if let Some(cubin) = built.remove(&(key.clone(), *region_index)) {
+                disk.store(key, *region_index, entry, &cubin);
+            }
+        }
+        return;
+    }
+    let mut held = ahead
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.len() + built.len() > MAX_AHEAD {
+        held.clear();
+    }
+    held.extend(built);
 }
 
 fn fnv1a64_with(bytes: &[u8], tails: &[&[u8]]) -> u64 {
