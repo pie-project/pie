@@ -138,16 +138,6 @@ pub enum Fault {
         why: String,
     },
 
-    Blob {
-        path: String,
-
-        why: String,
-    },
-
-    AdapterSlots {
-        seats: u32,
-    },
-
     Unaffine {
         slot: u32,
 
@@ -335,15 +325,6 @@ impl fmt::Display for Fault {
             ),
             Self::Recipe(refusal) => f.write_str(refusal),
             Self::Adapter { bank, why } => write!(f, "adapter bank `{bank}`: {why}"),
-            Self::Blob { path, why } => write!(f, "the shared adapter `{path}` {why}"),
-            Self::AdapterSlots { seats } => write!(
-                f,
-                "this load's banks seat {seats} adapters and every slot is pinned by a \
-                 live bind; a slot is never taken back from under one, because a fire \
-                 reading it would answer another instance's adapter under this one's \
-                 name. Close an instance that is done, or state a model text that seats \
-                 more"
-            ),
             Self::Program { at, why } => write!(f, "`{at}` refused: {why}"),
             Self::Unaffine {
                 slot,
