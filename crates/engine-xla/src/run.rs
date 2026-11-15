@@ -97,6 +97,10 @@ pub struct DitBindings {
     pub group_masks: Vec<GroupMask>,
 }
 
+/// A fire's adapters' planes ([`FireBindings::adapter_planes`]): the pool,
+/// and each registered bank's param, plane elements and first pool rows.
+pub type AdapterPlanes = (Tensor, Vec<(usize, u32, Tensor)>);
+
 #[derive(Clone, Debug)]
 pub struct FireBindings {
     pub tokens: Tensor,
@@ -121,6 +125,10 @@ pub struct FireBindings {
     pub readout_indptr: Vec<u32>,
 
     pub adapter_routes: Option<Tensor>,
+    /// The fire's adapters' planes: the pool, and for each registered bank
+    /// (by param) its plane's elements and the first pool row of each
+    /// fire-local adapter's plane of it, i32 `[k]`.
+    pub adapter_planes: Option<AdapterPlanes>,
 
     pub mrope_positions: Option<Tensor>,
 
@@ -292,6 +300,17 @@ impl<'c> Run<'c> {
             Def::Weight(w) => Some(*w as usize),
             _ => None,
         }
+    }
+
+    /// A registered bank's planes this fire reads: the pool, its plane's
+    /// elements and the first pool row of each fire-local adapter's plane.
+    pub(crate) fn adapter_plane(&self, bank: ValueId) -> Option<(Tensor, u32, Tensor)> {
+        let param = self.weight_param(bank)?;
+        let (view, banks) = self.fire.adapter_planes.as_ref()?;
+        banks
+            .iter()
+            .find(|(p, ..)| *p == param)
+            .map(|&(_, plane, starts)| (*view, plane, starts))
     }
 
     /// A streamed table's pool view and the fire's row of it for each of

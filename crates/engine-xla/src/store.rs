@@ -178,6 +178,26 @@ pub struct Pools {
     /// The bulk ring: pinned host slots of a chunk each, the bytes a
     /// maintenance program lands (none on a dry device).
     bulk: Option<stage::Ring>,
+    /// An `Adapter` slot's bytes (whole pool rows): the largest plane of one
+    /// adapter the model's registered banks hold; 0 where it has none.
+    adapter_slot: u64,
+}
+
+/// The bytes one adapter's largest plane takes in whole pool rows: a
+/// registered bank `[slots, ..]` holds one plane of `..` an adapter. 0 where
+/// the model registers none.
+fn adapter_slot_bytes(trace: &Trace) -> u64 {
+    trace
+        .params
+        .iter()
+        .filter(|p| p.source == poem_ir::ParamSource::Registered)
+        .map(|p| {
+            let cells: u64 = p.shape.get(1..).unwrap_or(&[]).iter().product();
+            let bytes = cells * poem_compiler::arena::elem_bytes(p.dtype).unwrap_or(0);
+            bytes.div_ceil(ROW_BYTES) * ROW_BYTES
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// The bulk ring's slots: one a write fills while the write before it,
@@ -657,6 +677,7 @@ impl Pools {
             act_chunks,
             ring,
             bulk,
+            adapter_slot: adapter_slot_bytes(trace),
         })
     }
 
@@ -945,6 +966,16 @@ impl Pools {
                 pinned: None,
                 role: SlotRole::Channel,
             }))
+            .chain((self.adapter_slot > 0).then(|| SlotShape {
+                id: layout::ADAPTER,
+                kind: SlotKind::Fixed { pieces: 1 },
+                slot_bytes: self.adapter_slot,
+                slots_per_chunk: narrow(self.layout.chunk_bytes / self.adapter_slot),
+                sets_per_working_set: 1,
+                rows: Vec::new(),
+                pinned: None,
+                role: SlotRole::Adapter,
+            }))
             .collect();
         ChunkFacts {
             span_backed_on_demand: false,
@@ -1048,13 +1079,33 @@ impl Pools {
     /// ([`layout::CHANNEL`], 1 KiB slots).
     #[must_use]
     pub fn channel_row(&self, slot: u32) -> Option<u32> {
-        let per = u32::try_from(self.layout.chunk_bytes / crate::guest::CHANNEL_SLOT).ok()?;
+        self.carved_row(crate::guest::CHANNEL_SLOT, slot)
+    }
+
+    /// The pool row `Adapter` slot ref `slot` starts at
+    /// ([`layout::ADAPTER`]).
+    #[must_use]
+    pub fn adapter_row(&self, slot: u32) -> Option<u32> {
+        (self.adapter_slot > 0)
+            .then(|| self.carved_row(self.adapter_slot, slot))
+            .flatten()
+    }
+
+    /// An `Adapter` slot's bytes (0: the model registers no adapter bank).
+    #[must_use]
+    pub fn adapter_slot(&self) -> u64 {
+        self.adapter_slot
+    }
+
+    /// The first pool row of slot ref `slot` of a shape carved `bytes` a
+    /// slot out of whole chunks (`Channel`, `Adapter`).
+    fn carved_row(&self, bytes: u64, slot: u32) -> Option<u32> {
+        let per = u32::try_from(self.layout.chunk_bytes / bytes.max(1)).ok()?;
         let chunk = self.table.physical(slot / per.max(1))?;
         if chunk == NULL_CHUNK || chunk >= self.sink_chunk() {
             return None;
         }
-        let at = u64::from(chunk) * self.layout.chunk_bytes
-            + u64::from(slot % per.max(1)) * crate::guest::CHANNEL_SLOT;
+        let at = u64::from(chunk) * self.layout.chunk_bytes + u64::from(slot % per.max(1)) * bytes;
         u32::try_from(at / ROW_BYTES).ok()
     }
 
@@ -1349,6 +1400,9 @@ impl Pools {
         if id == layout::CHANNEL {
             return Ok(crate::guest::CHANNEL_SLOT / ROW_BYTES);
         }
+        if id == layout::ADAPTER && self.adapter_slot > 0 {
+            return Ok(self.adapter_slot / ROW_BYTES);
+        }
         Ok(self.shape(id)?.slot_bytes / ROW_BYTES)
     }
 
@@ -1357,6 +1411,11 @@ impl Pools {
         if id == layout::CHANNEL {
             return self.channel_row(slot).map(i64::from).ok_or_else(|| Fault::Unbound {
                 what: format!("Channel slot {slot}, which lies past the pool"),
+            });
+        }
+        if id == layout::ADAPTER {
+            return self.adapter_row(slot).map(i64::from).ok_or_else(|| Fault::Unbound {
+                what: format!("Adapter slot {slot}, which lies past the pool"),
             });
         }
         self.rows_at(id, self.grain(id, slot)?)
@@ -1449,6 +1508,9 @@ impl Pools {
             .map(|shape| shape.slot_bytes / ROW_BYTES)
             .collect();
         sizes.insert(crate::guest::CHANNEL_SLOT / ROW_BYTES);
+        if self.adapter_slot > 0 {
+            sizes.insert(self.adapter_slot / ROW_BYTES);
+        }
         sizes.insert(self.layout.chunk_bytes / ROW_BYTES);
         for rows in sizes {
             self.copy_rows(device, handles, &[(rows, 0, 0)])?;
@@ -1720,6 +1782,24 @@ impl Pools {
                 cx.write(root, whole)
             })?;
             crate::exec::maintain(device, tracer, self, &inputs)?;
+        }
+        Ok(())
+    }
+
+    /// Lands `planes`, each `(Adapter slot ref, bytes)`, in their slots:
+    /// one adapter's planes, written once at the bind that lands it.
+    pub fn write_adapter(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        planes: &[(u32, &[u8])],
+    ) -> Result<()> {
+        let rows = self.adapter_slot / ROW_BYTES;
+        for &(slot, bytes) in planes {
+            let at = self.slot_row(layout::ADAPTER, slot)?;
+            let mut whole = bytes.to_vec();
+            whole.resize(self.adapter_slot as usize, 0);
+            self.write_rows(device, handles, rows, vec![at], &whole)?;
         }
         Ok(())
     }
