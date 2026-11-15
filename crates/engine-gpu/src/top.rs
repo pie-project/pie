@@ -71,9 +71,9 @@ impl Counts {
 /// once, beside its launches, then its tokens' and row-keys' flops. `None`
 /// where the device states no compute rate or no bandwidth.
 #[must_use]
-pub fn estimate(counts: &Counts, rates: &profile::fire::DeviceRates) -> Option<FireEstimate> {
-    let flops = rates.flops_per_ns.filter(|&r| r > 0.0)?;
-    let bytes = rates.bytes_per_ns.filter(|&r| r > 0.0)?;
+pub fn estimate(counts: &Counts, rates: &profile::fire::Rates) -> Option<FireEstimate> {
+    let flops = rates.bf16_flops_per_ns?;
+    let bytes = rates.bytes_per_ns?;
     let read = (counts.weight_bytes as f64 / bytes).ceil() as u64;
     Some(FireEstimate {
         fixed_ns: read.saturating_add(rates.launch_ns.unwrap_or(0)),
@@ -99,133 +99,69 @@ pub fn rung_facts(spans: &[(u32, u64)], max_lanes: u32, binding: u64) -> Vec<Run
         .collect()
 }
 
-/// Where a load's top rung came from.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Chosen {
-    /// The ruling's pick.
-    Ruled(TopRung),
-    /// Nothing to weigh the rungs by (no measured entry, and no rates to
-    /// estimate from): the widest rung one binding holds, of those the
-    /// requested fire size offers.
-    Requested { tokens: u32 },
-}
-
-impl Chosen {
-    #[must_use]
-    pub fn tokens(&self) -> u32 {
-        match self {
-            Chosen::Ruled(top) => top.tokens,
-            Chosen::Requested { tokens } => *tokens,
-        }
-    }
-}
-
-/// The top rung of `rungs` for the model filed as `model` on the device
-/// filed as `device`, over a live range of `live` bytes.
+/// The top rung of `rungs` for the model filed as `model` on `device`,
+/// whose profile is `profile`, over a live range of `live` bytes: by the
+/// fire times the profile measured where they cover every feasible rung,
+/// else by the estimate from its rates. A device whose profile states no
+/// rates and no covering table has nothing to weigh the rungs by, and the
+/// load is refused, naming it.
 pub fn choose(
     rungs: &[RungFacts],
     live: u64,
+    profile: &profile::Profile,
     device: &str,
     model: &str,
     counts: &Counts,
     binding: u64,
-) -> Result<Chosen> {
-    let measured = profile::fire::fire_ns(device, model);
-    let estimate = profile::fire::rates(device).and_then(|rates| estimate(counts, &rates));
-    let refuse = |no: NoRung| {
-        Fault::Residency(format!(
-            "{no}; this device binds no more than {} MiB",
-            binding >> 20
-        ))
-    };
+) -> Result<TopRung> {
+    let measured = profile.fire_ns(model);
     let covered = !measured.is_empty()
         && rungs
             .iter()
             .filter(|r| r.infeasible.is_none())
             .all(|r| measured.iter().any(|&(tokens, _)| tokens == r.tokens));
-    match estimate {
-        Some(estimate) => engine::load::top_rung(rungs, live, &FireTimes { measured, estimate })
-            .map(Chosen::Ruled)
-            .map_err(refuse),
-        // A measured table covering every feasible rung needs no estimate.
-        None if covered => {
-            let unused = FireEstimate {
-                fixed_ns: 0,
-                per_token_ns: 0.0,
-                per_row_key_ns: 0.0,
-            };
-            engine::load::top_rung(
-                rungs,
-                live,
-                &FireTimes {
-                    measured,
-                    estimate: unused,
-                },
-            )
-            .map(Chosen::Ruled)
-            .map_err(refuse)
+    let estimate = match estimate(counts, &profile.rates()) {
+        Some(estimate) => estimate,
+        // A covering table weighs every rung measured: no estimate is read.
+        None if covered => FireEstimate {
+            fixed_ns: 0,
+            per_token_ns: 0.0,
+            per_row_key_ns: 0.0,
+        },
+        None => {
+            return Err(Fault::Residency(format!(
+                "device {device} has no rates in its profile (`[rates] bf16_flops_per_ns` and \
+                 `bytes_per_ns`) and no measured fire times of {model} covering its rungs, so \
+                 nothing weighs its top rung; `pie tune` measures them"
+            )));
         }
-        None => rungs
-            .iter()
-            .filter(|r| r.infeasible.is_none())
-            .map(|r| r.tokens)
-            .max()
-            .map(|tokens| Chosen::Requested { tokens })
-            .ok_or_else(|| {
-                refuse(NoRung {
-                    refused: rungs
-                        .iter()
-                        .map(|r| {
-                            (
-                                r.tokens,
-                                r.span_bytes,
-                                r.infeasible.unwrap_or("not feasible"),
-                            )
-                        })
-                        .collect(),
-                })
-            }),
-    }
+    };
+    engine::load::top_rung(rungs, live, &FireTimes { measured, estimate }).map_err(|no: NoRung| {
+        Fault::Residency(format!(
+            "{no}; this device binds no more than {} MiB",
+            binding >> 20
+        ))
+    })
 }
 
 /// The load's one line on its top rung: which, by what, and the span it
 /// reserves of the live range.
 #[must_use]
-pub fn line(
-    chosen: &Chosen,
-    top: u32,
-    asked: u32,
-    span: u64,
-    live: u64,
-    device: &str,
-    model: &str,
-) -> String {
+pub fn line(rung: &TopRung, top: u32, span: u64, live: u64, device: &str, model: &str) -> String {
     let key = format!("{device} / {model}");
-    let by = match chosen {
-        Chosen::Ruled(rung) => {
-            let times = match rung.times {
-                TimesUsed::Measured => format!("the measured fire times of {key}"),
-                TimesUsed::Estimate => format!("the estimate (no measured entry for {key})"),
-                TimesUsed::PartialMeasuredIgnored => format!(
-                    "the estimate (the measured entry for {key} misses a feasible rung, so it \
-                     is set aside)"
-                ),
-            };
-            match rung.why {
-                TopWhy::Argmax { eff, live_share } => {
-                    format!("by {times}: eff {eff:.3} at a live share of {live_share:.3}")
-                }
-                TopWhy::OnlyFeasible => format!("as the one feasible rung ({times})"),
-            }
+    let times = match rung.times {
+        TimesUsed::Measured => format!("the measured fire times of {key}"),
+        TimesUsed::Estimate => format!("the estimate (no measured entry for {key})"),
+        TimesUsed::PartialMeasuredIgnored => format!(
+            "the estimate (the measured entry for {key} misses a feasible rung, so it is set \
+             aside)"
+        ),
+    };
+    let by = match rung.why {
+        TopWhy::Argmax { eff, live_share } => {
+            format!("by {times}: eff {eff:.3} at a live share of {live_share:.3}")
         }
-        Chosen::Requested { tokens } if *tokens < asked => format!(
-            "by the requested fire size {asked}, cut to the widest rung one binding holds (no \
-             measured entry for {key}, and no compute rate or bandwidth for it to estimate by)"
-        ),
-        Chosen::Requested { .. } => format!(
-            "by the requested fire size (no measured entry for {key}, and no compute rate or \
-             bandwidth for it to estimate by)"
-        ),
+        TopWhy::OnlyFeasible => format!("as the one feasible rung ({times})"),
     };
     let gib = live as f64 / f64::from(1u32 << 30);
     format!(
@@ -248,21 +184,54 @@ mod tests {
         assert_eq!(rungs[1].infeasible, Some(PAST_ONE_BINDING));
     }
 
-    #[test]
-    fn without_times_the_top_is_the_widest_rung_one_binding_holds() {
-        let rungs = rung_facts(&[(1024, 100 * MIB), (2048, 300 * MIB)], 256, 200 * MIB);
-        let counts = Counts {
+    fn counts() -> Counts {
+        Counts {
             weight_bytes: 1 << 30,
             flops_per_token: 1 << 30,
             attn_flops_per_row_key: 1 << 10,
-        };
-        let chosen = choose(&rungs, 1 << 33, "no-such-device", "m", &counts, 200 * MIB).unwrap();
-        assert_eq!(chosen, Chosen::Requested { tokens: 1024 });
-        let none = rung_facts(&[(1024, 300 * MIB)], 256, 200 * MIB);
-        let err = choose(&none, 1 << 33, "no-such-device", "m", &counts, 200 * MIB).unwrap_err();
+        }
+    }
+
+    fn profile(text: &str) -> profile::Profile {
+        let registry = profile::Registry::new("test", &[], &[]);
+        registry.load_user(text, "test").unwrap()
+    }
+
+    #[test]
+    fn without_rates_or_a_covering_table_the_load_is_refused_by_name() {
+        let rungs = rung_facts(&[(1024, 100 * MIB), (2048, 150 * MIB)], 256, 200 * MIB);
+        let bare = profile("api = 1\n");
+        let err = choose(&rungs, 1 << 33, &bare, "Card X", "m", &counts(), 200 * MIB).unwrap_err();
         assert!(
             err.to_string()
-                .contains("1024 tokens (span 300 MiB): past one binding")
+                .contains("device Card X has no rates in its profile"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("`pie tune` measures them"),
+            "{err}"
+        );
+        // A table covering every feasible rung needs no rates.
+        let measured = profile("api = 1\n[fire_ns]\n\"m\" = [[1024, 1000], [2048, 1000]]\n");
+        let top = choose(
+            &rungs,
+            1 << 33,
+            &measured,
+            "Card X",
+            "m",
+            &counts(),
+            200 * MIB,
+        )
+        .unwrap();
+        assert_eq!((top.tokens, top.times), (2048, TimesUsed::Measured));
+        // No feasible rung at all: the ruling's refusal, with the binding.
+        let none = rung_facts(&[(1024, 300 * MIB)], 256, 200 * MIB);
+        let rated = profile("api = 1\n[rates]\nbf16_flops_per_ns = 1.0\nbytes_per_ns = 1.0\n");
+        let err = choose(&none, 1 << 33, &rated, "Card X", "m", &counts(), 200 * MIB).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("1024 tokens (span 300 MiB): past one binding"),
+            "{err}"
         );
     }
 
@@ -273,9 +242,8 @@ mod tests {
             flops_per_token: 2_000,
             attn_flops_per_row_key: 40,
         };
-        let rates = profile::fire::DeviceRates {
-            device: "d",
-            flops_per_ns: Some(10.0),
+        let rates = profile::fire::Rates {
+            bf16_flops_per_ns: Some(10.0),
             bytes_per_ns: Some(100.0),
             launch_ns: Some(5),
         };
@@ -287,7 +255,7 @@ mod tests {
                 per_row_key_ns: 4.0,
             })
         );
-        let unstated = profile::fire::DeviceRates {
+        let unstated = profile::fire::Rates {
             bytes_per_ns: None,
             ..rates
         };

@@ -1,5 +1,6 @@
 //! The wgpu registry and the profile one load resolves. A browser masks the
-//! adapter, so there are no checked-in profiles.
+//! adapter, so no family profile is checked in; a native adapter named by
+//! a file under `profiles/derived/` carries its rates and fire times there.
 
 use std::path::Path;
 use std::sync::LazyLock;
@@ -22,7 +23,10 @@ pub fn registry() -> &'static Registry {
 
 pub static SHELF: Shelf = Shelf {
     backend: "wgpu",
-    seeded: &[],
+    seeded: &[(
+        "derived/nvidia-rtx-pro-4500-blackwell.toml",
+        include_str!("../profiles/derived/nvidia-rtx-pro-4500-blackwell.toml"),
+    )],
     derived: None,
 };
 
@@ -77,6 +81,14 @@ mod tests {
     #[test]
     fn the_registry_holds_together() {
         assert_eq!(registry().check(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_checked_in_profiles_hold_together() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
+        SHELF
+            .check(registry(), &dir)
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[test]

@@ -41,6 +41,9 @@ pub struct TuneRequest<'a> {
     pub cache: &'a Path,
     /// Fit the kept measurements again instead of measuring.
     pub refit: bool,
+    /// Run the `[fire_ns]` step alone: time the check models' fires at each
+    /// rung width, every decision left as it is.
+    pub fire_only: bool,
 }
 
 /// What a tune produced.
@@ -157,7 +160,7 @@ macro_rules! tuned {
 }
 
 /// `pie tune` on a backend that measures a kernel grid at a depth.
-#[cfg(any(feature = "vulkan", all(feature = "metal", target_vendor = "apple")))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 macro_rules! tune_grid {
     ($name:ident, $engine:ident, $backend:literal) => {
         fn $name(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
@@ -170,8 +173,24 @@ macro_rules! tune_grid {
     };
 }
 
+/// `pie tune` on Vulkan: the kernel grid and the search, then the
+/// `[fire_ns]` step (or that step alone).
 #[cfg(feature = "vulkan")]
-tune_grid!(tune_vulkan, engine_vulkan, "vulkan");
+fn tune_vulkan(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
+    use engine_vulkan::tune::{Depth, run};
+    let depth = if req.full { Depth::Full } else { Depth::Quick };
+    let models = pick_models("vulkan", req)?;
+    let out = run(
+        depth,
+        Some(req.profiles),
+        req.cache,
+        req.refit,
+        req.fire_only,
+        &models,
+        say,
+    )?;
+    Ok(tuned!(out, wrong: out.wrong))
+}
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 tune_grid!(tune_metal, engine_metal, "metal");

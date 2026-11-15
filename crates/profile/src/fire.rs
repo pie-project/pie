@@ -1,58 +1,114 @@
-//! Tuned results a load reads to choose its top rung of fires: the measured
-//! fire times of a model class on a device, and the rates a device's fire
-//! time is estimated from where nothing was measured. Both are keyed by the
-//! device's profile id ([`crate::id_of`] of its name); the fire times also
-//! by the model class (the deployment, as `engine::load::model_class` names
-//! it). Checked in, and empty until a device is measured: a lookup that finds
-//! nothing returns an empty table, or no rates.
+//! What a device profile states for choosing a load's top rung of fires:
+//! the device's rates (`[rates]`), which a fire's time is estimated from,
+//! and the fire times `pie tune` measured of a model class on it
+//! (`[fire_ns]`). Both live in the backend's device file (or the user's
+//! layer above it); a higher layer replaces a lower one's rates key by key
+//! and its fire times model by model.
 //!
-//! The device's own file under a backend's `profiles/` is where these move
-//! once the GEMM tuning lands in the profile under the same device key: one
-//! file a device holds both.
+//! ```toml
+//! [rates]
+//! bf16_flops_per_ns = 383000.0   # dense bf16 flops a ns (1 TFLOP/s = 1000)
+//! bytes_per_ns = 896.0           # device memory bytes a ns (GB/s)
+//! launch_ns = 4000               # a fire's launch cost beside its work
+//!
+//! [fire_ns]
+//! "qwen3-8b-bf16-kv-bf16" = [[1, 21000000], [2, 21100000]]
+//! ```
+//!
+//! A model class is the deployment less any tensor-parallel suffix
+//! (`engine::load::model_class`).
 
-/// The measured fire times of `model` on `device`: `(tokens, ns)` of a fire
-/// at each rung width.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FireTable {
-    pub device: &'static str,
-    pub model: &'static str,
-    pub fire_ns: &'static [(u32, u64)],
-}
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
-/// What `device` computes and moves a nanosecond, where it was measured or
-/// stated: bf16 flops, bytes of device memory, and the time a fire's
-/// launches cost beside its work.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct DeviceRates {
-    pub device: &'static str,
-    pub flops_per_ns: Option<f64>,
+/// A device's rates, each where a layer states it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Rates {
+    /// Dense bf16 flops a nanosecond.
+    pub bf16_flops_per_ns: Option<f64>,
+    /// Device memory bytes a nanosecond.
     pub bytes_per_ns: Option<f64>,
+    /// What a fire's launches cost beside its work, in nanoseconds.
     pub launch_ns: Option<u64>,
 }
 
-/// Every measured fire table.
-pub const FIRE_NS: &[FireTable] = &[];
+impl Rates {
+    /// `self` laid over `below`: each key `self` states replaces `below`'s.
+    #[must_use]
+    pub fn over(self, below: Rates) -> Rates {
+        Rates {
+            bf16_flops_per_ns: self.bf16_flops_per_ns.or(below.bf16_flops_per_ns),
+            bytes_per_ns: self.bytes_per_ns.or(below.bytes_per_ns),
+            launch_ns: self.launch_ns.or(below.launch_ns),
+        }
+    }
 
-/// Every device's rates.
-pub const RATES: &[DeviceRates] = &[];
-
-/// The fire times measured of `model` on `device`, or none.
-#[must_use]
-pub fn fire_ns(device: &str, model: &str) -> &'static [(u32, u64)] {
-    lookup(FIRE_NS, device, model)
+    fn is_empty(&self) -> bool {
+        *self == Rates::default()
+    }
 }
 
-/// The rates of `device`, where any are known.
-#[must_use]
-pub fn rates(device: &str) -> Option<DeviceRates> {
-    RATES.iter().copied().find(|r| r.device == device)
+/// `(tokens, ns)` of a fire at each rung width, ascending in tokens.
+pub type FireTable = Vec<(u32, u64)>;
+
+/// What a profile states beside its decisions: rates and fire times.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Tuned {
+    pub rates: Rates,
+    /// By model class.
+    pub fire_ns: BTreeMap<String, FireTable>,
 }
 
-fn lookup(table: &[FireTable], device: &str, model: &str) -> &'static [(u32, u64)] {
-    table
+impl Tuned {
+    /// `upper` laid over `self`.
+    pub fn lay(&mut self, upper: &Tuned) {
+        self.rates = upper.rates.over(self.rates);
+        for (model, table) in &upper.fire_ns {
+            self.fire_ns.insert(model.clone(), table.clone());
+        }
+    }
+
+    /// The fire times of `model`, or none.
+    #[must_use]
+    pub fn fire_ns(&self, model: &str) -> &[(u32, u64)] {
+        self.fire_ns.get(model).map_or(&[], Vec::as_slice)
+    }
+
+    /// `[rates]` and `[fire_ns]` as profile TOML, nothing where nothing is
+    /// stated.
+    #[must_use]
+    pub fn toml(&self) -> String {
+        let mut out = String::new();
+        if !self.rates.is_empty() {
+            let _ = writeln!(out, "\n[rates]");
+            if let Some(v) = self.rates.bf16_flops_per_ns {
+                let _ = writeln!(out, "bf16_flops_per_ns = {v:?}");
+            }
+            if let Some(v) = self.rates.bytes_per_ns {
+                let _ = writeln!(out, "bytes_per_ns = {v:?}");
+            }
+            if let Some(v) = self.rates.launch_ns {
+                let _ = writeln!(out, "launch_ns = {v}");
+            }
+        }
+        if !self.fire_ns.is_empty() {
+            let _ = writeln!(out, "\n[fire_ns]");
+            for (model, table) in &self.fire_ns {
+                let _ = writeln!(out, "{}", table_line(model, table));
+            }
+        }
+        out
+    }
+}
+
+/// One `[fire_ns]` line: `"model" = [[tokens, ns], …]`.
+#[must_use]
+pub fn table_line(model: &str, table: &[(u32, u64)]) -> String {
+    let rows: Vec<String> = table
         .iter()
-        .find(|t| t.device == device && t.model == model)
-        .map_or(&[], |t| t.fire_ns)
+        .map(|(tokens, ns)| format!("[{tokens}, {ns}]"))
+        .collect();
+    format!("\"{model}\" = [{}]", rows.join(", "))
 }
 
 #[cfg(test)]
@@ -60,40 +116,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_lookup_finds_its_entry_or_nothing() {
-        const TABLE: &[FireTable] = &[FireTable {
-            device: "nvidia-rtx-pro-4500-blackwell",
-            model: "qwen3-8b-bf16-kv-bf16",
-            fire_ns: &[(1024, 50_000_000), (2048, 90_000_000)],
-        }];
+    fn an_upper_layer_replaces_by_key_and_by_model() {
+        let mut low = Tuned {
+            rates: Rates {
+                bf16_flops_per_ns: Some(1.0),
+                bytes_per_ns: Some(2.0),
+                launch_ns: None,
+            },
+            fire_ns: BTreeMap::from([
+                ("a".to_string(), vec![(1, 10)]),
+                ("b".to_string(), vec![(1, 20)]),
+            ]),
+        };
+        let up = Tuned {
+            rates: Rates {
+                bytes_per_ns: Some(3.0),
+                launch_ns: Some(7),
+                ..Rates::default()
+            },
+            fire_ns: BTreeMap::from([("b".to_string(), vec![(1, 30), (2, 40)])]),
+        };
+        low.lay(&up);
         assert_eq!(
-            lookup(
-                TABLE,
-                "nvidia-rtx-pro-4500-blackwell",
-                "qwen3-8b-bf16-kv-bf16"
-            ),
-            &[(1024, 50_000_000), (2048, 90_000_000)]
+            low.rates,
+            Rates {
+                bf16_flops_per_ns: Some(1.0),
+                bytes_per_ns: Some(3.0),
+                launch_ns: Some(7),
+            }
         );
-        assert!(lookup(TABLE, "nvidia-rtx-pro-4500-blackwell", "qwen3-0-6b").is_empty());
-        assert!(fire_ns("nvidia-rtx-pro-4500-blackwell", "qwen3-8b-bf16-kv-bf16").is_empty());
-        assert_eq!(rates("nvidia-rtx-pro-4500-blackwell"), None);
-    }
-
-    #[test]
-    fn every_checked_in_table_is_one_entry_a_key_ascending() {
-        for (k, t) in FIRE_NS.iter().enumerate() {
-            assert!(
-                FIRE_NS[..k]
-                    .iter()
-                    .all(|o| (o.device, o.model) != (t.device, t.model)),
-                "{} / {} twice",
-                t.device,
-                t.model
-            );
-            assert!(t.fire_ns.windows(2).all(|w| w[0].0 < w[1].0));
-        }
-        for (k, r) in RATES.iter().enumerate() {
-            assert!(RATES[..k].iter().all(|o| o.device != r.device));
-        }
+        assert_eq!(low.fire_ns("a"), &[(1, 10)]);
+        assert_eq!(low.fire_ns("b"), &[(1, 30), (2, 40)]);
+        assert!(low.fire_ns("c").is_empty());
     }
 }

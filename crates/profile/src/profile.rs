@@ -185,9 +185,10 @@ struct Inner {
     entries: BTreeMap<&'static str, Entry>,
 }
 
-/// The resolved profile a load runs under. Cheap to clone.
+/// The resolved profile a load runs under, and the rates and fire times its
+/// layers state. Cheap to clone.
 #[derive(Clone)]
-pub struct Profile(Arc<Inner>);
+pub struct Profile(Arc<Inner>, Arc<crate::fire::Tuned>);
 
 impl std::fmt::Debug for Profile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -217,6 +218,39 @@ impl Profile {
     #[must_use]
     pub fn target(&self) -> &crate::registry::Target {
         &self.0.target
+    }
+
+    /// The rates and fire times the layers state ([`crate::fire`]).
+    #[must_use]
+    pub fn tuned(&self) -> &crate::fire::Tuned {
+        &self.1
+    }
+
+    /// The device's rates, each where a layer states it.
+    #[must_use]
+    pub fn rates(&self) -> crate::fire::Rates {
+        self.1.rates
+    }
+
+    /// The fire times measured of `model` (a model class) on this device.
+    #[must_use]
+    pub fn fire_ns(&self, model: &str) -> &[(u32, u64)] {
+        self.1.fire_ns(model)
+    }
+
+    /// This profile with `model`'s fire times replaced by `table`: what
+    /// `pie tune` writes.
+    #[must_use]
+    pub fn with_fire_ns(&self, model: &str, table: crate::fire::FireTable) -> Profile {
+        let mut tuned = (*self.1).clone();
+        tuned.fire_ns.insert(model.to_string(), table);
+        Profile(self.0.clone(), Arc::new(tuned))
+    }
+
+    /// This profile with the rates and fire times `tuned` states.
+    #[must_use]
+    pub fn with_tuned(&self, tuned: crate::fire::Tuned) -> Profile {
+        Profile(self.0.clone(), Arc::new(tuned))
     }
 
     fn entry(&self, id: &str) -> &Entry {
@@ -356,13 +390,16 @@ impl Registry {
                 )
             })
             .collect();
-        Profile(Arc::new(Inner {
-            backend: self.backend,
-            facts: self.facts,
-            source,
-            target,
-            entries,
-        }))
+        Profile(
+            Arc::new(Inner {
+                backend: self.backend,
+                facts: self.facts,
+                source,
+                target,
+                entries,
+            }),
+            Arc::default(),
+        )
     }
 
     /// Every decision at its registry default.
@@ -379,11 +416,13 @@ impl Registry {
     /// checking facts: for tests and tools that hold a known-good file.
     pub fn load(&self, text: &str, origin: &str) -> Result<Profile, crate::registry::Refusal> {
         let file = self.parse(text, origin, Strict::CheckedIn)?;
-        Ok(self.assemble(
-            &file.entries,
-            file.target,
-            Source::Seeded(origin.to_string()),
-        ))
+        Ok(self
+            .assemble(
+                &file.entries,
+                file.target,
+                Source::Seeded(origin.to_string()),
+            )
+            .with_tuned(file.tuned))
     }
 
     /// Read a partial file, filling what it leaves out from the registry,
@@ -391,7 +430,9 @@ impl Registry {
     /// exercise.
     pub fn load_user(&self, text: &str, origin: &str) -> Result<Profile, crate::registry::Refusal> {
         let file = self.parse(text, origin, Strict::User)?;
-        Ok(self.assemble(&file.entries, file.target, Source::User(origin.to_string())))
+        Ok(self
+            .assemble(&file.entries, file.target, Source::User(origin.to_string()))
+            .with_tuned(file.tuned))
     }
 
     /// The registry defaults with `overrides` (profile TOML after `api = 1`)
@@ -437,7 +478,9 @@ impl Registry {
         for (id, rungs) in over.entries {
             entries.insert(id, rungs);
         }
-        Ok(self.assemble(&entries, target, source))
+        let mut tuned = base.tuned().clone();
+        tuned.lay(&over.tuned);
+        Ok(self.assemble(&entries, target, source).with_tuned(tuned))
     }
 
     /// Admit a parsed layer on the device: every fact it assumes holds,
@@ -601,6 +644,7 @@ impl Registry {
 
     fn resolve_with(&self, layers: &[Candidate], facts: Option<&Facts>) -> (Profile, Report) {
         let mut entries: BTreeMap<&'static str, Vec<Rung>> = BTreeMap::new();
+        let mut tuned = crate::fire::Tuned::default();
         let mut measured: BTreeMap<&'static str, bool> = BTreeMap::new();
         let mut target = crate::registry::Target::default();
         // What the checked-in layers below assume, which a checked-in
@@ -654,6 +698,7 @@ impl Registry {
             if !file.target.name_contains.is_empty() {
                 target.name_contains = file.target.name_contains;
             }
+            tuned.lay(&file.tuned);
             used.push(layer.source.clone());
         }
         let top = used.last().cloned().unwrap_or(Source::Defaults);
@@ -667,7 +712,10 @@ impl Registry {
                 .map(|(id, _)| id)
                 .collect(),
         };
-        (self.assemble(&entries, target, top), report)
+        (
+            self.assemble(&entries, target, top).with_tuned(tuned),
+            report,
+        )
     }
 }
 

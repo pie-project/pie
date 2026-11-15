@@ -346,6 +346,7 @@ fn load_alone(
             device: &device,
             residency,
             handed: None,
+            top: engine_gpu::serve::Top::EveryRung,
         })
         .unwrap_or_else(|why| panic!("the shell loads: {why}")),
     )
