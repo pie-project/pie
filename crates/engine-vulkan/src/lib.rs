@@ -6,6 +6,7 @@ pub mod device;
 pub mod encode;
 pub mod guest;
 pub mod program;
+pub mod rates;
 pub(crate) mod record;
 pub mod serve;
 pub mod tune;

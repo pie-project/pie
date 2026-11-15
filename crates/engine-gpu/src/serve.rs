@@ -156,6 +156,12 @@ pub trait Serve: Backend {
     /// What a kept step binds moved: the segments, or a layer's stage.
     fn forget(shelf: &mut Self::Shelf);
 
+    /// The steps replayed and recorded so far, where the backend records:
+    /// what `pie tune` reads to time only fires that replay, as served.
+    fn recordings(_shelf: &Self::Shelf) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Arm `arm`'s readout seat grew to `bytes`.
     fn grown(shell: &mut Shell<Self>, arm: usize, bytes: u64) -> Result<()>;
 
@@ -1859,6 +1865,12 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn tuning(&self) -> &B::Tuning {
         &self.tuning
+    }
+
+    /// The steps replayed and recorded so far, where the backend records.
+    #[must_use]
+    pub fn recordings(&self) -> Option<(u64, u64)> {
+        B::recordings(&self.shelf)
     }
 
     /// The widths, in tokens, of the rungs the load laid, narrowest first:

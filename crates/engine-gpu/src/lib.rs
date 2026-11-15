@@ -22,6 +22,7 @@ pub mod mask;
 pub mod pread;
 pub mod probe;
 pub mod program;
+pub mod rates;
 pub mod rs;
 pub mod run;
 pub mod scratch;

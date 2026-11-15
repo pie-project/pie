@@ -44,6 +44,11 @@ pub struct TuneArgs {
     /// each rung width, leaving every decision as it is.
     #[arg(long)]
     pub fire_only: bool,
+
+    /// Run the `[rates]` step alone: measure the device's bf16 matmul rate,
+    /// its memory bandwidth and a fire's launch cost on it.
+    #[arg(long)]
+    pub rates: bool,
 }
 
 pub fn run(args: TuneArgs) -> Result<Answer> {
@@ -90,6 +95,7 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         cache: &cache,
         refit: args.refit,
         fire_only: args.fire_only,
+        rates: args.rates,
     };
     let tuned = tune(&req, &mut say).map_err(|e| anyhow!(e))?;
 
