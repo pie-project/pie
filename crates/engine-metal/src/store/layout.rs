@@ -484,9 +484,9 @@ impl Layout {
             }
         }
         ChunkFacts {
-            // A mapped placement heap is resident whether touched or not:
-            // the span is backed as fires and lent state need it.
-            span_backed_on_demand: !self.act().is_empty(),
+            // The whole span is backed at the load (`Pool::back_whole_span`):
+            // no rung raise or lend makes a device allocation after ready.
+            span_backed_on_demand: false,
             // The load pins the range below the segment the largest rung's
             // carve starts in (`Pool::reserve`): a carve reaches no lower
             // (`Pool::cover`), with its guests' terms.
