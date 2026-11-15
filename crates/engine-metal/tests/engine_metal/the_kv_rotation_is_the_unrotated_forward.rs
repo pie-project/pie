@@ -211,7 +211,13 @@ pub(crate) fn try_load(dir: &Path, w: Dtype, rotate: bool) -> Result<Shell, Stri
     } else {
         "qwen3-micro-text"
     };
-    let trace = trace_of(id, w, Dtype::Bf16, Platform::Metal);
+    // The trace the import lays its contract out for: the lowered one a load
+    // serves (its projections of one activation joined), not the package's own.
+    let trace = poem_compiler::catalog::lowered(
+        trace_of(id, w, Dtype::Bf16, Platform::Metal),
+        &poem_compiler::catalog::one_rank(w, Dtype::Bf16),
+    )
+    .expect("the micro text lowers");
     let source = ztensor_compat::index(dir.join("model.safetensors")).map_err(|e| e.to_string())?;
     let contract =
         import_of(id, w, Dtype::Bf16, &source, Platform::Metal).map_err(|e| e.to_string())?;
@@ -240,6 +246,33 @@ pub(crate) fn try_load(dir: &Path, w: Dtype, rotate: bool) -> Result<Shell, Stri
 /// The bf16 path is the shipped one — it must load.
 fn load(dir: &Path, w: Dtype, rotate: bool) -> Shell {
     try_load(dir, w, rotate).expect("the micro_text shell loads")
+}
+
+/// [`run`], a refusal returned rather than panicked on: whether a dtype's
+/// forward runs end to end is known at its first fire, not at its load.
+fn try_run(shell: &mut Shell, slot: u32) -> Result<Vec<Vec<f32>>, String> {
+    shell.open(slot).map_err(|e| e.to_string())?;
+    let mut rows = Vec::with_capacity(STEPS + 1);
+    let got = shell
+        .fire(&[Lane {
+            slot,
+            word: word(PROMPT.len() as u32),
+            tokens: PROMPT,
+        }])
+        .map_err(|e| e.to_string())?;
+    rows.push(got.into_iter().next().ok_or("no prefill row")?);
+    for _ in 0..STEPS {
+        let fed = [argmax(rows.last().ok_or("no row")?) as u32];
+        let got = shell
+            .fire(&[Lane {
+                slot,
+                word: word(1),
+                tokens: &fed,
+            }])
+            .map_err(|e| e.to_string())?;
+        rows.push(got.into_iter().next().ok_or("no decode row")?);
+    }
+    Ok(rows)
 }
 
 /// Prefill the prompt then greedily decode `STEPS`, returning every logit row.
@@ -378,13 +411,11 @@ fn the_kv_rotation_is_the_unrotated_forward() {
     let _ = std::fs::remove_dir_all(&f32_dir);
     std::fs::create_dir_all(&f32_dir).expect("the f32 fixture dir exists");
     synth_fixture(&f32_dir);
-    match (
-        try_load(&f32_dir, Dtype::F32, false),
-        try_load(&f32_dir, Dtype::F32, true),
-    ) {
-        (Ok(mut off_shell), Ok(mut on_shell)) => {
-            let off = run(&mut off_shell, 0);
-            let on = run(&mut on_shell, 1);
+    let ran = |rotate: bool, slot: u32| {
+        try_load(&f32_dir, Dtype::F32, rotate).and_then(|mut shell| try_run(&mut shell, slot))
+    };
+    match (ran(false, 0), ran(true, 1)) {
+        (Ok(off), Ok(on)) => {
             let (f32_max, f32_mean, f32_spread) = deviation(&off, &on);
             eprintln!(
                 "[f32 ] logit spread {f32_spread:.4}; on-vs-off deviation max {f32_max:.6}, mean {f32_mean:.7}"
@@ -400,14 +431,15 @@ fn the_kv_rotation_is_the_unrotated_forward() {
             );
         }
         (off, on) => {
-            // Both paths refusing f32 is legitimate — the Metal forward may not run
-            // this text end-to-end in f32. But exactly one loading is an asymmetry
+            // Both paths refusing f32 (at the load or at the first fire) is
+            // legitimate — the Metal forward may not run this text end-to-end in
+            // f32. But exactly one running is an asymmetry
             // between the rotated and unrotated f32 forwards, a rotation-specific
             // defect we must not swallow as "not reached".
             assert!(
                 off.is_err() && on.is_err(),
-                "f32 load is asymmetric (off_ok={}, on_ok={}): the rotated and unrotated \
-                 forwards disagree on whether f32 is supported",
+                "f32 is asymmetric (off_ok={}, on_ok={}): the rotated and unrotated \
+                 forwards disagree on whether f32 runs",
                 off.is_ok(),
                 on.is_ok(),
             );
