@@ -19,10 +19,14 @@
 // row p's q up the chain from the PE that keeps it (the others send zeros), the root multicasts
 // it back, and the query runs as query()'s.
 //
+// CAUSAL (a prefill's mask; QH only): query_q(p) attends the rows stored at or before p alone,
+// the probabilities of the entries after it zeroed before the values matvec (the step one request,
+// its rows stored in their order).
+//
 // Params: fab (ops/fabric.csl), math (ops/math.csl), red (the column chain), YM (the root's
 // multicast input queue), Qh (q heads on the kv head), Dc (the head's dims), NE (entries a row),
 // PYA (the column's rows), SC (the scores' scale), PMAX (the 16-bit probabilities' ceiling: f16's
-// max for IEEE builds), QH (queries held).
+// max for IEEE builds), QH (queries held), CAUSAL.
 param fab: imported_module;
 param math: imported_module;
 param red: imported_module;
@@ -34,6 +38,7 @@ param PYA: u16;
 param SC: f32;
 param PMAX: f32 = 65504.0;
 param QH: bool = false;
+param CAUSAL: bool = false;
 
 const matvec = @import_module("ops/mv.csl");
 
@@ -57,6 +62,7 @@ var pp = @zeros([Qh * NE]f32);
 var kk = @zeros([Qh * NE]u16);
 var mref = @zeros([Qh]f32);
 var myrow: u16 = 0;
+var qpos: u16 = 0;
 const xh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XW} -> xh[i] });
 const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YW} -> y[i] });
 const sx_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * Dc} -> sx[i] });
@@ -120,7 +126,21 @@ fn query_q(p: u16) void {
     @fmovs(qf_d, @as(f32, 0.0));
   }
   red.send(qf_d, QD);
+  qpos = p;
   query();
+}
+
+// The causal mask: of the entries kept here (rows e * PYA + myrow), those after row qpos score
+// no probability.
+fn mask() void {
+  var n: u16 = 0;
+  if (qpos >= myrow) { n = (qpos - myrow) / PYA + 1; }
+  if (n >= NE) { return; }
+  var h: u16 = 0;
+  while (h < Qh) : (h += 1) {
+    var e: u16 = n;
+    while (e < NE) : (e += 1) { y[h * NE + e] = 0.0; }
+  }
 }
 
 // One query: q in, passes until no head's sum left the window.
@@ -144,6 +164,7 @@ fn query() void {
     @fnegs(sc_d, sc_d);
     @fmaxs(sc_d, sc_d, -PMAX);
     @fnegs(sc_d, sc_d);
+    if (CAUSAL) { mask(); }
     // (q is spent: the probabilities take xh; a redo pass gets q again from the root)
     @fs2h(@set_dsd_length(xh_d, Qh * NE), sc_d);
     h = 0;

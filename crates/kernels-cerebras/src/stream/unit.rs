@@ -97,6 +97,8 @@ pub struct Joint {
     pub kv_heads: u32,
     pub head_dim: u32,
     pub scale: f32,
+    /// A row attends the rows stored before it alone (a prefill's mask).
+    pub causal: bool,
 }
 
 use serde::Serialize;
@@ -362,6 +364,7 @@ pub fn lower(
         };
 
     let mut pending: Vec<u32> = Vec::new();
+    let mut appended: Vec<(ValueId, Cols, Cols)> = Vec::new();
     let mut ins = Vec::new();
     let mut i = 0;
     while i <= nodes.len() {
@@ -475,6 +478,56 @@ pub fn lower(
                     kv_heads: *kv_heads,
                     head_dim: *head_dim,
                     scale: *sm_scale,
+                    causal: false,
+                });
+                steps.push(Step::Store { q, k, v });
+                sides.insert(*o, Side::Col);
+                steps.push(Step::Attend {
+                    out: *o,
+                    round: r.round(*o),
+                });
+            }
+            // the step's keys and values into the pages its prefill reads: stored with the
+            // row's query when the prefill comes
+            Operation::Attn(Attn::KvAppend {
+                k,
+                v: Some(v),
+                cache,
+                ..
+            }) => {
+                appended.push((*cache, r.cols(*k), r.cols(*v)));
+            }
+            Operation::Attn(Attn::Prefill {
+                q,
+                cache,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                causal,
+                o,
+                ..
+            }) => {
+                let Some(&(_, k, v)) = appended.iter().find(|(c, _, _)| c == cache) else {
+                    return Err(refuse(
+                        at,
+                        "attn.prefill reads pages no step of its unit appends".into(),
+                    ));
+                };
+                let q = r.cols(*q);
+                for c in [q, k, v] {
+                    if side_of(&sides, c) != Some(Side::Col) {
+                        return Err(refuse(
+                            at,
+                            "attn.prefill reads a q / k / v not at the column roots".into(),
+                        ));
+                    }
+                }
+                joint = Some(Joint {
+                    q_heads: q.width / head_dim,
+                    kv_heads: *kv_heads,
+                    head_dim: *head_dim,
+                    scale: *sm_scale,
+                    causal: *causal,
                 });
                 steps.push(Step::Store { q, k, v });
                 sides.insert(*o, Side::Col);
@@ -496,7 +549,7 @@ pub fn lower(
         ins.clear();
         trace.nodes[*at as usize].op.outputs(&mut ins);
         for &v in &ins {
-            if reads_outside(trace, words, v, &own) {
+            if reads_outside(trace, words, v, &own) || read_out(trace, v) {
                 let c = r.cols(v);
                 if sides.contains_key(&c.base) && !outs.contains(&c) {
                     outs.push(c);
@@ -506,14 +559,16 @@ pub fn lower(
     }
     for c in outs {
         let side = sides[&c.base];
+        // to the host: what a host op reads, or what the reading reads out itself
         let host_out = !lane
-            && trace.nodes.iter().enumerate().any(|(n, node)| {
-                host.contains(&(n as u32)) && {
-                    let mut i = Vec::new();
-                    node.op.inputs(&mut i);
-                    i.iter().any(|x| r.cols(*x).base == c.base)
-                }
-            });
+            && (read_out(trace, c.base)
+                || trace.nodes.iter().enumerate().any(|(n, node)| {
+                    host.contains(&(n as u32)) && {
+                        let mut i = Vec::new();
+                        node.op.inputs(&mut i);
+                        i.iter().any(|x| r.cols(*x).base == c.base)
+                    }
+                }));
         if !lane && !host_out && side != Side::Row {
             return Err(format!(
                 "{name}: value %{} leaves from the column roots: the row stream runs on the CX roots",
@@ -565,6 +620,15 @@ pub fn lower(
         joint,
         held,
         sides,
+    })
+}
+
+/// Whether the trace reads `v` out (one of its outputs, or an arm of one).
+fn read_out(trace: &Trace, v: ValueId) -> bool {
+    trace.outputs.iter().any(|o| {
+        o.value == v
+            || matches!(trace.values.get(o.value.0 as usize).map(|d| &d.def),
+                Some(Def::Merge(arms)) if arms.iter().any(|(a, _)| *a == v))
     })
 }
 

@@ -20,60 +20,63 @@ def vae_conv(c_out, c_in, taps):
         taps = taps,
     )
 
-def group_norm(c):
+def group_norm(c, groups = GN_GROUPS):
     return struct(
         weight = weight([c], dtype.f32),
         bias = weight([c], dtype.f32),
+        groups = groups,
     )
 
-def resnet(c_in, c_out):
+def resnet(c_in, c_out, groups = GN_GROUPS):
     return struct(
-        norm1 = group_norm(c_in),
+        norm1 = group_norm(c_in, groups),
         conv1 = vae_conv(c_out, c_in, TAPS3),
-        norm2 = group_norm(c_out),
+        norm2 = group_norm(c_out, groups),
         conv2 = vae_conv(c_out, c_out, TAPS3),
         shortcut = vae_conv(c_out, c_in, 1) if c_in != c_out else None,
     )
 
-def mid(c):
+def mid(c, groups = GN_GROUPS):
     return struct(
-        res0 = resnet(c, c),
+        res0 = resnet(c, c, groups),
         attn = struct(
-            norm = group_norm(c),
+            norm = group_norm(c, groups),
             q = linear(c, c, dtype.bf16),
             k = linear(c, c, dtype.bf16),
             v = linear(c, c, dtype.bf16),
             out = linear(c, c, dtype.bf16),
             width = c,
         ),
-        res1 = resnet(c, c),
+        res1 = resnet(c, c, groups),
     )
 
-def flux_vae(channels, encoder_out, latent):
+def flux_vae(channels, encoder_out, latent, blocks = BLOCKS, layers_per_block = LAYERS_PER_BLOCK, groups = GN_GROUPS):
     """The VAE whose decoder takes `channels` and whose encoder gives
     `encoder_out`; `latent()` lays out what carries a latent to and from
-    them."""
-    top = BLOCKS[-1]
+    them. `blocks` is its channel ladder, `layers_per_block` an encoder
+    block's resnets (a decoder block's one more) and `groups` its group
+    norms' groups."""
+    top = blocks[-1]
     up = []
     c_prev = top
-    for i, c in enumerate(reversed(BLOCKS)):
+    for i, c in enumerate(reversed(blocks)):
         resnets = []
-        for r in range(LAYERS_PER_BLOCK + 1):
-            resnets.append(resnet(c_prev, c))
+        for r in range(layers_per_block + 1):
+            resnets.append(resnet(c_prev, c, groups))
             c_prev = c
-        last = i + 1 == len(BLOCKS)
+        last = i + 1 == len(blocks)
         up.append(struct(
             resnets = resnets,
             upsample = vae_conv(c, c, TAPS3) if not last else None,
         ))
     down = []
-    c_prev = BLOCKS[0]
-    for i, c in enumerate(BLOCKS):
+    c_prev = blocks[0]
+    for i, c in enumerate(blocks):
         resnets = []
-        for r in range(LAYERS_PER_BLOCK):
-            resnets.append(resnet(c_prev, c))
+        for r in range(layers_per_block):
+            resnets.append(resnet(c_prev, c, groups))
             c_prev = c
-        last = i + 1 == len(BLOCKS)
+        last = i + 1 == len(blocks)
         down.append(struct(
             resnets = resnets,
             downsample = vae_conv(c, c, TAPS3) if not last else None,
@@ -82,16 +85,16 @@ def flux_vae(channels, encoder_out, latent):
         latent = latent(),
         decoder = struct(
             conv_in = vae_conv(top, channels, TAPS3),
-            mid = mid(top),
+            mid = mid(top, groups),
             up = up,
-            norm_out = group_norm(BLOCKS[0]),
-            conv_out = vae_conv(RGB, BLOCKS[0], TAPS3),
+            norm_out = group_norm(blocks[0], groups),
+            conv_out = vae_conv(RGB, blocks[0], TAPS3),
         ),
         encoder = struct(
-            conv_in = vae_conv(BLOCKS[0], RGB, TAPS3),
+            conv_in = vae_conv(blocks[0], RGB, TAPS3),
             down = down,
-            mid = mid(top),
-            norm_out = group_norm(top),
+            mid = mid(top, groups),
+            norm_out = group_norm(top, groups),
             conv_out = vae_conv(encoder_out, top, TAPS3),
         ),
     )
@@ -175,7 +178,7 @@ def convolve(x, grid, c):
     return ops.conv.conv3d(x, grid, c.w, c.bias, shape, None)[0]
 
 def run_group_norm(x, grid, n, silu):
-    return ops.conv.group_norm(x, grid, GN_GROUPS, n.weight, n.bias, GN_EPS, silu)
+    return ops.conv.group_norm(x, grid, n.groups, n.weight, n.bias, GN_EPS, silu)
 
 def run_resnet(x, grid, r):
     h = run_group_norm(x, grid, r.norm1, True)

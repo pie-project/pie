@@ -694,6 +694,11 @@ fn lowers_explicitly(op: &Operation) -> bool {
         Operation::Elemwise(Elemwise::RopeAxes {
             form: RopeForm::Interleaved,
             ..
+        }) | Operation::Elemwise(Elemwise::Rope {
+            k: Some(_),
+            freqs: None,
+            turn: Turn::Full { .. } | Turn::Partial { .. } | Turn::Last { .. },
+            ..
         }) | Operation::Linear(Linear::Glu {
             packed: Some(_),
             gate: None,
@@ -1051,6 +1056,9 @@ fn part(trace: &Trace, run: &[u32], width: u32) -> Option<u32> {
     for &node in run {
         let op = &trace.nodes[node as usize].op;
         let head = match op {
+            // q and k turned together: two rows, each cut where its own heads are, so the
+            // region's row stays whole
+            Operation::Elemwise(Elemwise::Rope { k: Some(_), .. }) => return None,
             Operation::Elemwise(Elemwise::Rmsnorm {
                 axis: NormAxis::Head(head),
                 ..
@@ -1397,6 +1405,26 @@ impl Builder {
                 let turn = rotation(self.width, *head_dim, *theta, turn)?;
                 let out = self.b.rotate(self.get(*q)?, self.get(*positions)?, &turn);
                 self.set(*q_out, out);
+            }
+            // q and k turned together (a run named outright: no chain forms over it), each
+            // its own rotation at the same positions
+            Elemwise::Rope {
+                q,
+                k: Some(k),
+                positions,
+                head_dim,
+                theta,
+                turn,
+                freqs: None,
+                q_out,
+                k_out: Some(k_out),
+            } => {
+                let turn = rotation(self.width, *head_dim, *theta, turn)?;
+                let pos = self.get(*positions)?;
+                let qo = self.b.rotate(self.get(*q)?, pos, &turn);
+                let ko = self.b.rotate(self.get(*k)?, pos, &turn);
+                self.set(*q_out, qo);
+                self.set(*k_out, ko);
             }
             // a rotation over position axes, pairs interleaved, each
             // axis's position a row's element (a scalar parameter)

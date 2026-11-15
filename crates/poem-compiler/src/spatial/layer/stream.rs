@@ -213,22 +213,62 @@ impl Body<'_, '_> {
                 };
                 // the stored keys and values are the store phase's; every row's is in before
                 // any query reads them
-                match self.phases.last_mut() {
-                    Some(Phase::Mixer { mixer, .. }) => *mixer = kind.clone(),
-                    _ => return Err(format!("{} attends no stored rows", op.op)),
+                self.joint(op, kind, outs)
+            }
+            // a prefill over the pages its own layer appends this step: the step's rows attend
+            // each other (under the causal mask where it is one), as a joint attention does
+            Operation::Attn(Attn::Prefill {
+                q,
+                cache,
+                mask: None,
+                selection: None,
+                bias: None,
+                floor: None,
+                window: None,
+                head_dim,
+                kv_heads,
+                causal,
+                selected: None,
+                rel: None,
+                ..
+            }) => {
+                if self.r.owner.get(cache).is_some_and(|&l| l != self.layer) {
+                    return Err(format!(
+                        "{} reads a cache another layer appends: a stream step holds no cache",
+                        op.op
+                    ));
                 }
-                self.push(Phase::Barrier);
-                self.push(Phase::Mixer {
-                    mixer: kind,
-                    ops: vec![op],
-                });
-                for &o in outs {
-                    self.set(o, At::Tiles(Axis::Col));
-                }
-                Ok(())
+                self.joint(
+                    op,
+                    Mixer::Joint {
+                        q_heads: self.r.width(*q) / (*head_dim).max(1),
+                        kv_heads: *kv_heads,
+                        head_dim: *head_dim,
+                        causal: *causal,
+                    },
+                    outs,
+                )
             }
             _ => Err(format!("{} has no spatial lowering", op.op)),
         }
+    }
+
+    /// The attend phase of a joint attention `kind` after its store phase (the last mixer
+    /// phase: the stored keys and values), a barrier between.
+    fn joint(&mut self, op: Op, kind: Mixer, outs: &[poem_ir::ValueId]) -> R<()> {
+        match self.phases.last_mut() {
+            Some(Phase::Mixer { mixer, .. }) => *mixer = kind.clone(),
+            _ => return Err(format!("{} attends no stored rows", op.op)),
+        }
+        self.push(Phase::Barrier);
+        self.push(Phase::Mixer {
+            mixer: kind,
+            ops: vec![op],
+        });
+        for &o in outs {
+            self.set(o, At::Tiles(Axis::Col));
+        }
+        Ok(())
     }
 }
 
@@ -307,9 +347,21 @@ pub fn lower(
             _ => false,
         };
         let matmul = matches!(node.op, Operation::Linear(Linear::Matmul { .. }));
+        // a token embedding is a lookup of the table's rows by the host's ids: the rows it
+        // makes enter the units as a host input's do (no arithmetic; the table stays host-side)
+        let embed = matches!(
+            node.op,
+            Operation::Gather(Gather::Embed { weights: None, .. })
+        ) && ins.iter().all(|v| {
+            own(v)
+                || matches!(
+                    trace.values.get(v.0 as usize).map(|d| &d.def),
+                    Some(Def::Weight(_))
+                )
+        });
         // a permutation of a unit's rows (the velocity out) is the host's too
-        if permutes || (!matmul && ins.iter().all(own)) {
-            host[at] = Some(permutes);
+        if permutes || embed || (!matmul && ins.iter().all(own)) {
+            host[at] = Some(permutes || embed);
         }
     }
 
@@ -482,7 +534,8 @@ pub fn lower(
 
 /// The conventional row classes of a diffusion poem's `reading` = `reading` step: one a value
 /// of its `stream` switch among `context` (the text rows) and `latents` (the image rows), each
-/// `rows` rows; a poem with no `stream` switch, one class of the reading alone.
+/// `rows` rows; a poem with no `stream` switch, or a reading whose nodes no `stream` value
+/// changes (a text encoder's), one class of the reading alone.
 #[must_use]
 pub fn classes(trace: &Trace, reading: &str, rows: u32) -> Vec<RowClass> {
     let request = |stream: Option<&str>| {
@@ -503,7 +556,12 @@ pub fn classes(trace: &Trace, reading: &str, rows: u32) -> Vec<RowClass> {
                 .is_some_and(|d| d.values.iter().any(|x| x == v))
         })
         .collect();
-    if streams.is_empty() {
+    let runs = |s: Option<&str>| -> Vec<bool> {
+        let w = trace.facts.word(&request(s));
+        trace.nodes.iter().map(|n| n.guard.holds(w)).collect()
+    };
+    let alone = runs(None);
+    if streams.is_empty() || streams.iter().all(|s| runs(Some(s)) == alone) {
         return vec![RowClass {
             name: reading.to_string(),
             word: trace.facts.word(&request(None)),

@@ -273,7 +273,17 @@ impl Gen {
                 .find(|l| {
                     l.late == self.now_late && l.base == base.0 && c >= l.from && c < l.from + l.len
                 })
-                .ok_or_else(|| format!("value %{} column {c} is at no root buffer", base.0))?;
+                .ok_or_else(|| {
+                    format!(
+                        "value %{} column {c} is at no root buffer (late {}; locs {:?})",
+                        base.0,
+                        self.now_late,
+                        self.locs
+                            .iter()
+                            .map(|l| (l.base, l.from, l.len, l.late))
+                            .collect::<Vec<_>>()
+                    )
+                })?;
             let m = (l.from + l.len).min(from + n) - c;
             let off = if l.off == "0" {
                 format!("{}", c - l.from)
@@ -2086,6 +2096,12 @@ fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)>
     let pya = p.stream.kv[k].pya;
     let ne = total.div_ceil(pya);
     let pmax = if p.round16 { "1.0e30" } else { "65504.0" };
+    if p.shape.attn.causal && (ks.stores.len() != 1 || ks.stores[0].2 != 0) {
+        return Err(format!(
+            "K / V column {k}: a causal attention over {} stores: its rows' order is one unit's",
+            ks.stores.len()
+        ));
+    }
     let name = format!("kp_{k}.csl");
     let mut t = String::new();
     let _ = writeln!(
@@ -2100,8 +2116,13 @@ fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)>
     t.push_str("const red = @import_module(\"ops/schain.csl\", .{ .fab = fab, .IN1 = q_r, .OUT = q_s });\n");
     let _ = writeln!(
         t,
-        "const att = @import_module(\"ops/satt.csl\", .{{ .fab = fab, .math = math, .red = red, .YM = q_am, .Qh = {qh}, .Dc = {dc}, .NE = {ne}, .PYA = {}, .SC = {sc:?}, .PMAX = {pmax}, .QH = true }});",
-        pya
+        "const att = @import_module(\"ops/satt.csl\", .{{ .fab = fab, .math = math, .red = red, .YM = q_am, .Qh = {qh}, .Dc = {dc}, .NE = {ne}, .PYA = {}, .SC = {sc:?}, .PMAX = {pmax}, .QH = true{} }});",
+        pya,
+        if p.shape.attn.causal {
+            ", .CAUSAL = true"
+        } else {
+            ""
+        }
     );
     let mut body = String::from(
         "  stamp(0);\n  att.init(@as(u16, pcfg[0]));\n  red.role = @as(u16, pcfg[1]);\n",

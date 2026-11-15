@@ -32,6 +32,8 @@ pub struct JointSpec {
     pub sm_scale: f32,
     /// q and k RMS-normed per head before the rotation.
     pub qk_norm: bool,
+    /// A row attends the rows before it alone (a prefill's mask): the step is one request.
+    pub causal: bool,
 }
 
 /// A rotation of up to four position axes, each a run of a head's dims.
@@ -93,28 +95,41 @@ pub fn shape(trace: &Trace, reading: &str, classes: &[RowClass]) -> R<StreamShap
                         "attn.ragged under a relative bias: no stream attention adds one".into(),
                     ));
                 }
-                let width = match trace.values.get(q.0 as usize).map(|d| &d.ty) {
-                    Some(poem_ir::Ty::Tensor { shape, .. }) => match shape.last() {
-                        Some(poem_ir::Dim::Const(n)) => *n as u32,
-                        _ => 0,
-                    },
-                    _ => 0,
-                };
+                let width = width_of(trace, *q);
                 let spec = JointSpec {
                     q_heads: width / (*head_dim).max(1),
                     kv_heads: *kv_heads,
                     head_dim: *head_dim,
                     sm_scale: *sm_scale,
                     qk_norm: false,
+                    causal: false,
                 };
-                match &attn {
-                    Some(a) if *a != spec => {
-                        return Err(refuse(format!(
-                            "attn.ragged of {spec:?} beside {a:?}: one attention shape a reading"
-                        )));
-                    }
-                    _ => attn = Some(spec),
+                one_attention(&mut attn, spec).map_err(refuse)?;
+            }
+            Operation::Attn(Attn::Prefill {
+                q,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                causal,
+                ..
+            }) => {
+                if *causal && classes.len() > 1 {
+                    return Err(refuse(format!(
+                        "attn.prefill, causal, over {} row classes: the stream's causal mask is \
+                         one request's",
+                        classes.len()
+                    )));
                 }
+                let spec = JointSpec {
+                    q_heads: width_of(trace, *q) / (*head_dim).max(1),
+                    kv_heads: *kv_heads,
+                    head_dim: *head_dim,
+                    sm_scale: *sm_scale,
+                    qk_norm: false,
+                    causal: *causal,
+                };
+                one_attention(&mut attn, spec).map_err(refuse)?;
             }
             Operation::Elemwise(Elemwise::RopeAxes {
                 dims,
@@ -216,6 +231,30 @@ pub fn shape(trace: &Trace, reading: &str, classes: &[RowClass]) -> R<StreamShap
         layer_bodies: prog.layer_bodies().len(),
         program: prog,
     })
+}
+
+/// `v`'s row width.
+fn width_of(trace: &Trace, v: poem_ir::ValueId) -> u32 {
+    match trace.values.get(v.0 as usize).map(|d| &d.ty) {
+        Some(poem_ir::Ty::Tensor { shape, .. }) => match shape.last() {
+            Some(poem_ir::Dim::Const(n)) => *n as u32,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// `spec`, the reading's one attention shape.
+fn one_attention(attn: &mut Option<JointSpec>, spec: JointSpec) -> R<()> {
+    match attn {
+        Some(a) if *a != spec => Err(format!(
+            "an attention of {spec:?} beside {a:?}: one attention shape a reading"
+        )),
+        _ => {
+            *attn = Some(spec);
+            Ok(())
+        }
+    }
 }
 
 /// What [`compile`] builds: a reading at `rows` rows a class, its roundings the build's 16-bit
@@ -369,6 +408,7 @@ mod tests {
                 head_dim: 128,
                 sm_scale: 0.088_388_35,
                 qk_norm: true,
+                causal: false,
             }
         );
         assert_eq!(

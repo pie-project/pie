@@ -747,7 +747,7 @@ pub fn write(p: &Program, arrays: &[HostArray], gold: Option<&Path>, out: &Path)
     let mut host = json!({
         "model": p.trace.name, "reading": p.shape.reading, "classes": classes, "outs": outs,
         "w": p.stream.w, "h": p.stream.h, "h2d": h2d, "d2h": d2h, "refs": ref_files,
-        "round16": p.round16,
+        "round16": p.round16, "causal": p.shape.attn.causal,
         "units": p.units.iter().zip(&p.stream.units).map(|(b, su)| json!({
             "name": b.unit.name, "x": su.x, "cols": su.cols(), "rows": p.stream.py,
         })).collect::<Vec<_>>(),

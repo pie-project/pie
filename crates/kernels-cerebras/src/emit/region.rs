@@ -481,7 +481,8 @@ impl Printer<'_> {
             return refuse(format!("op {k}: heads of {size} straddle chunks of {c}"));
         }
         let nh = c / size;
-        let name = format!("h{v}");
+        // (`hd`: `h16` is the 16-bit scratch row)
+        let name = format!("hd{v}");
         let _ = writeln!(self.decls, "var {name} = @zeros([{nh}]f32);");
         let el = |p: &mut Self, x: ValueId| -> R<String> {
             if let Some((h, _)) = p.is_head(x) {
@@ -671,10 +672,41 @@ impl Printer<'_> {
                     .iter()
                     .enumerate()
                     .all(|(e, &m)| m as usize == (e ^ 1) && c.is_multiple_of(2));
-                if !swap {
+                // the mate `hop` columns on in the first half of each `2 hop` block, back in
+                // the second (NeoX's halves of a head)
+                let hop = idx.first().map_or(0, |&m| m as usize);
+                let halves = !swap
+                    && hop > 1
+                    && c.is_multiple_of(2 * hop)
+                    && idx.iter().enumerate().all(|(e, &m)| {
+                        m as usize
+                            == if e % (2 * hop) < hop {
+                                e + hop
+                            } else {
+                                e - hop
+                            }
+                    });
+                if !swap && !halves {
                     return refuse(format!("op {k}: a gather other than a pair's mate"));
                 }
                 let s = self.row_of(src)?;
+                if halves {
+                    let part = |t: &str, o: usize| {
+                        format!("@increment_dsd_offset(@set_dsd_length({t}, {hop}), {o}, f32)")
+                    };
+                    for b in (0..c).step_by(2 * hop) {
+                        let _ = writeln!(
+                            self.body,
+                            "  @fmovs({}, {}); @fmovs({}, {});",
+                            part(&d, b),
+                            part(&s, b + hop),
+                            part(&d, b + hop),
+                            part(&s, b)
+                        );
+                    }
+                    self.vals.insert(v, Val::Buf(dst));
+                    return Ok(());
+                }
                 let h = c / 2;
                 let half = |t: &str, o: u32| {
                     format!(
