@@ -554,13 +554,18 @@ pub fn prefill(
     };
     let mut args = args(OP, q, pool, tables, &shape, sm_scale, o, &extra)?;
     args.push(stated(OP, shape.rows)?.arg());
-    let tiles = shape.rows.div_ceil(tile);
     let keys = u64::from(pool.page_indices.rows) * pool.page_size.max(1) as u64;
     let keys = window
         .map_or(keys, |window| keys.min(u64::from(window)))
         .max(1);
-    let keys = Keys::Held(keys).or_most(ctx.naming().is_some());
-    let step = prefill_step(tactic.prefill_work, shape.rows, tile, keys);
+    // A naming sink is told the longest way: at the most rows and keys a
+    // fire of the load may bring.
+    let (rows, keys) = match ctx.naming() {
+        Some(names) => (names.most_rows().max(shape.rows), Keys::Most),
+        None => (shape.rows, Keys::Held(keys)),
+    };
+    let tiles = rows.div_ceil(tile);
+    let step = prefill_step(tactic.prefill_work, rows, tile, keys);
     for first in (0..tiles).step_by(step as usize) {
         let mut args = args.clone();
         args.push(stated(OP, first)?.arg());
@@ -581,12 +586,6 @@ pub fn prefill(
 enum Keys {
     Held(u64),
     Most,
-}
-
-impl Keys {
-    fn or_most(self, naming: bool) -> Keys {
-        if naming { Keys::Most } else { self }
-    }
 }
 
 /// Tiles of `tile` rows one prefill dispatch holds, of a fire's `rows`:
@@ -655,6 +654,112 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A naming sink of the most rows a fire may bring, counting what is
+    /// fired into it.
+    struct Counted {
+        most: u32,
+        fired: std::cell::Cell<u32>,
+    }
+
+    impl crate::Encode for Counted {
+        fn fire(&self, _fire: Fire, _args: &[ArgValue]) -> Result<(), Error> {
+            self.fired.set(self.fired.get() + 1);
+            Ok(())
+        }
+
+        fn absent(&self) -> Result<ArgValue, Error> {
+            Ok(ArgValue::Buffer(crate::ABSENT))
+        }
+
+        fn target(&self) -> Target {
+            Target::Wgsl
+        }
+
+        fn naming(&self) -> Option<&dyn crate::Naming> {
+            Some(self)
+        }
+    }
+
+    impl crate::Naming for Counted {
+        fn either(&self, _alternatives: &[Fire]) -> Result<(), Error> {
+            self.fired.set(self.fired.get() + 1);
+            Ok(())
+        }
+
+        fn fork(&self) {}
+
+        fn or(&self) {}
+
+        fn join(&self) {}
+
+        fn most_rows(&self) -> u32 {
+            self.most
+        }
+    }
+
+    /// A budgeted prefill a naming sink walks counts at the most rows the
+    /// sink states, a tile a dispatch, whatever rows the naming fire holds;
+    /// unbudgeted, one dispatch. The negative control: a prefill of the
+    /// naming fire's own rows makes fewer.
+    #[test]
+    fn a_budgeted_prefill_counts_at_the_most_rows_a_naming_sink_states() {
+        let tactic = |prefill_work| Tactic {
+            tier: Tier::Baseline,
+            narrow: false,
+            decode_threads: 256,
+            tile_rows: 16,
+            tile_lanes: 16,
+            split_groups: 1,
+            split_min_keys: 1,
+            prefill_work,
+        };
+        let tensor = |buf, rows, width, dtype| Tensor::new(buf, rows, width, dtype);
+        let (heads, head_dim, staged, most) = (2u32, 64u32, 3u32, 4096u32);
+        let q = tensor(1, staged, heads * head_dim, Dtype::Bf16);
+        let o = tensor(2, staged, heads * head_dim, Dtype::Bf16);
+        let tables = Tables {
+            positions: tensor(3, staged, 1, Dtype::I32),
+            request_of_token: tensor(4, staged, 1, Dtype::I32),
+            mask: tensor(5, 1, 1, Dtype::U8),
+            mask_enabled: tensor(6, staged, 1, Dtype::U8),
+            mask_stride: 1,
+        };
+        let plane = tensor(7, 64, heads * head_dim, Dtype::Bf16);
+        let pool = KvPool::planes(
+            plane,
+            plane,
+            tensor(8, 4, 1, Dtype::I32),
+            tensor(9, 2, 1, Dtype::I32),
+            16,
+            u64::from(heads * head_dim),
+            u64::from(head_dim),
+        );
+        let fired = |prefill_work, most| {
+            let sink = Counted {
+                most,
+                fired: std::cell::Cell::new(0),
+            };
+            prefill(
+                &sink,
+                tactic(prefill_work),
+                q,
+                &tables,
+                &pool,
+                None,
+                head_dim,
+                1.0,
+                o,
+                None,
+            )
+            .unwrap_or_else(|why| panic!("the prefill names its fires: {why}"));
+            sink.fired.get()
+        };
+        assert_eq!(fired(1 << 20, most), most.div_ceil(16));
+        assert_eq!(fired(0, most), 1);
+        assert_eq!(fired(1 << 20, 0), staged.div_ceil(16));
+        assert!(fired(1 << 20, 0) < fired(1 << 20, most));
     }
 
     /// A decode's kernels are named before any fire, as the fire names

@@ -750,8 +750,8 @@ impl<B: Serve> Shell<B> {
         Shell::raise(boot, fitted)
     }
 
-    /// What a load of `boot` names from its fires at `rung` alone, or at
-    /// its largest where `None`, as [`Shell::load`] names them: a fire of
+    /// What a load of `boot` names from its fires at `rung` alone, or where
+    /// [`Shell::load`] names them where `None`: a fire of
     /// each class and of every mix that cuts a region, staged and walked
     /// into a sink that fires nothing. Nothing is reserved.
     pub fn named_at(boot: Boot<'_, B>, rung: Option<u32>) -> Result<Asks> {
@@ -819,8 +819,8 @@ impl<B: Serve> Shell<B> {
 
     /// The load's own code against a backend that reserves nothing: the
     /// shell it raises is walked for every kernel a fire of this load can
-    /// ask for, at `rung` or the largest, before the device holds a byte of
-    /// the model.
+    /// ask for, at `rung` or where a load names them, before the device
+    /// holds a byte of the model.
     fn name(boot: &Boot<'_, B>, fitted: &Fitted<B>, rung: Option<u32>) -> Result<Asks> {
         let Fitted {
             device,
@@ -5106,14 +5106,17 @@ impl<B: Serve> Shell<Named<B>> {
     }
 
     /// Names what this load's fires ask for from fires at one rung of the
-    /// span, `rung` or the largest: a fire of each class alone, and a fire
+    /// span, `rung` or the smallest where every mix runs: a fire of each
+    /// class alone, and a fire
     /// for each way a mix of classes cuts a mask into runs
     /// ([`Shell::cuts`]), staged and walked as a serving fire is, into the
     /// sink that fires nothing. One rung names what every rung does: a host
     /// that picks its kernel by a fire's rows names every kernel its widths
     /// allow and the longest way it can take, so neither the kernels nor
     /// the dispatches of a fire change with its rows (the suite holds every
-    /// rung to the largest's). The largest is where every mix runs, three
+    /// rung to this one's), but a prefill under a work budget, which counts
+    /// at the most rows a fire of the load brings, as the naming sink states
+    /// them ([`kernels_slang::Naming::most_rows`]). A mix runs at three
     /// lanes of a row or more each. A fire makes at
     /// most what the rung's fires made outside their regions and of each
     /// region, a region the walk launches a run at a time counted at every
@@ -5128,10 +5131,20 @@ impl<B: Serve> Shell<Named<B>> {
     fn asks(mut self, rung: Option<u32>) -> Result<Asks> {
         let regions = self.compiled.template().len();
         let span: Vec<u32> = self.span.rungs().iter().map(|rung| rung.tokens).collect();
+        let mixes = self.held.len() >= 3;
         let rungs: Vec<u32> = rung
+            .or_else(|| {
+                span.iter()
+                    .copied()
+                    .filter(|&tokens| !mixes || tokens >= 3)
+                    .min()
+            })
             .or_else(|| span.iter().copied().max())
             .into_iter()
             .collect();
+        self.pipelines
+            .0
+            .bound_rows(span.iter().copied().max().unwrap_or(1));
         let classes = self.compiled.classes.classes.len();
         let mut unservable: Vec<crate::naming::Unservable> = Vec::new();
         let mut mixes: Vec<([usize; 3], poem_exec::KernelError)> = Vec::new();

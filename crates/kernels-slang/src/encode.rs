@@ -136,6 +136,10 @@ pub trait Naming {
     /// Ends the last way: a fire makes the dispatches of one of them, so
     /// the host counts as the longest and names the kernels of all.
     fn join(&self);
+
+    /// The most rows a fire of the load may bring: a host whose dispatches
+    /// grow with a fire's rows counts at these, not at the naming fire's.
+    fn most_rows(&self) -> u32;
 }
 
 /// Every kernel `pick` answers over `breaks`, the row counts its answer

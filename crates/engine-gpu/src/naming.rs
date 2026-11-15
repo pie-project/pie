@@ -53,6 +53,8 @@ struct Named {
 pub struct Names {
     target: Target,
     named: RefCell<Named>,
+    /// The most rows a fire of the load may bring ([`Names::bound_rows`]).
+    most_rows: std::cell::Cell<u32>,
 }
 
 impl Names {
@@ -61,7 +63,14 @@ impl Names {
         Names {
             target,
             named: RefCell::new(Named::default()),
+            most_rows: std::cell::Cell::new(0),
         }
+    }
+
+    /// States the most rows a fire of the load may bring, which a host
+    /// whose dispatches grow with the rows counts at.
+    pub fn bound_rows(&self, rows: u32) {
+        self.most_rows.set(rows);
     }
 
     /// Every kernel named so far, in order.
@@ -172,6 +181,10 @@ impl kernels_slang::Naming for Names {
             .expect("a way ends inside the fork that opened it");
         fork.longest = fork.longest.max(at - fork.before);
         named.dispatches = fork.before;
+    }
+
+    fn most_rows(&self) -> u32 {
+        self.most_rows.get()
     }
 
     fn join(&self) {
