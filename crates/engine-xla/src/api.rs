@@ -1477,16 +1477,31 @@ impl Xla {
                 }
             }
         }
+        // A reporting lane with no recurrent state to fold (a KV-only set)
+        // is folded by the count its program's `fold` port states just the
+        // same: the count, as read, is its report's fold.
+        let mut kv_folds: Vec<Option<u32>> = vec![None; submission.lanes.len()];
         for attachment in &submission.attachments {
-            if let engine::fire::RsVerb::Buffer { fold, .. } = &mut verbs[attachment.lane as usize]
-                && *fold == engine::fire::FoldLen::Device
-                && let Some(n) = self
-                    .programs
-                    .envelope_fold(attachment.instance)
-                    .map_err(refusal)?
-            {
-                *fold = engine::fire::FoldLen::Host(n);
-                device_folds[attachment.lane as usize] = true;
+            let at = attachment.lane as usize;
+            match &mut verbs[at] {
+                engine::fire::RsVerb::Buffer { fold, .. } if *fold == engine::fire::FoldLen::Device => {
+                    if let Some(n) = self
+                        .programs
+                        .envelope_fold(attachment.instance)
+                        .map_err(refusal)?
+                    {
+                        *fold = engine::fire::FoldLen::Host(n);
+                        device_folds[at] = true;
+                    }
+                }
+                engine::fire::RsVerb::Buffer { .. } => {}
+                _ if submission.lanes.get(at).is_some_and(|lane| lane.reports != 0) => {
+                    kv_folds[at] = self
+                        .programs
+                        .envelope_fold(attachment.instance)
+                        .map_err(refusal)?;
+                }
+                _ => {}
             }
         }
         // Where each device-counted fold leaves its state, for the fires
@@ -1544,7 +1559,7 @@ impl Xla {
                             let to = folded.saturating_add(*n).min(first + rows);
                             Some(to.saturating_sub(*folded))
                         }
-                        _ => None,
+                        _ => kv_folds[at],
                     };
                     engine::KvWrites {
                         tag: lane.reports,
