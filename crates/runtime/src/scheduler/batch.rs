@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::engine::completion::CellPtr;
 use crate::engine::{FrameFire, SchedulerLimits, StepFire};
@@ -94,6 +94,9 @@ pub(crate) struct StepGroup {
     instances: HashSet<::engine::InstanceId>,
     verifies: Vec<usize>,
     pipelines: HashSet<ProcessId>,
+    /// The ring ends its fires move: a second fire moving one of them goes
+    /// a step later, so a ring's cursor moves once a step at each end.
+    ring_ends: HashSet<RingEnd>,
     forward_requests: usize,
     forward_tokens: usize,
     page_refs: usize,
@@ -113,6 +116,95 @@ fn decodes(request: &PendingRequest) -> bool {
         .any(|lane| lane.tokens.len() <= 1)
 }
 
+/// One end of a ring: where its fires take (the head) or put (the tail).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RingEnd {
+    channel: ::engine::ChannelId,
+    tail: bool,
+}
+
+/// The ring ends `request` moves, each with the place it reserved in that
+/// end's order.
+fn ring_ends(request: &PendingRequest) -> impl Iterator<Item = (RingEnd, u64)> + '_ {
+    request.request.ring_moves.iter().flat_map(|ticket| {
+        [
+            (false, ticket.expected_head),
+            (true, ticket.expected_tail),
+        ]
+        .into_iter()
+        .filter(|&(_, place)| place != ::engine::Ticket::NONE)
+        .map(|(tail, place)| {
+            (
+                RingEnd {
+                    channel: ticket.channel,
+                    tail,
+                },
+                place,
+            )
+        })
+    })
+}
+
+/// The places the fires not yet seated hold at each ring end.
+#[derive(Default)]
+struct RingOrder {
+    waiting: HashMap<RingEnd, BTreeSet<u64>>,
+}
+
+impl RingOrder {
+    fn of<'a>(requests: impl Iterator<Item = &'a PendingRequest>) -> RingOrder {
+        let mut order = RingOrder::default();
+        for request in requests {
+            for (end, place) in ring_ends(request) {
+                order.waiting.entry(end).or_default().insert(place);
+            }
+        }
+        order
+    }
+
+    /// Whether every end `request` moves has no earlier mover still to seat.
+    fn is_next(&self, request: &PendingRequest) -> bool {
+        ring_ends(request).all(|(end, place)| {
+            self.waiting
+                .get(&end)
+                .and_then(BTreeSet::first)
+                .is_none_or(|&first| first >= place)
+        })
+    }
+
+    fn seated(&mut self, request: &PendingRequest) {
+        for (end, place) in ring_ends(request) {
+            if let Some(places) = self.waiting.get_mut(&end) {
+                places.remove(&place);
+            }
+        }
+    }
+}
+
+/// The instances and pipelines with a fire left for a later step: a later
+/// fire of one of them goes behind it.
+#[derive(Default)]
+struct Held {
+    instances: HashSet<::engine::InstanceId>,
+    pipelines: HashSet<ProcessId>,
+}
+
+impl Held {
+    fn holds(&self, request: &PendingRequest) -> bool {
+        self.instances.contains(&request.instance_id)
+            || request
+                .pipeline_id
+                .is_some_and(|pid| self.pipelines.contains(&pid))
+    }
+
+    fn hold(&mut self, request: &PendingRequest) {
+        self.instances.insert(request.instance_id);
+        if let Some(pid) = request.pipeline_id {
+            self.pipelines.insert(pid);
+        }
+    }
+}
+
 impl StepGroup {
     pub(crate) fn accepts(
         &self,
@@ -127,6 +219,9 @@ impl StepGroup {
             .pipeline_id
             .is_some_and(|pid| self.pipelines.contains(&pid))
         {
+            return false;
+        }
+        if ring_ends(request).any(|(end, _)| self.ring_ends.contains(&end)) {
             return false;
         }
         if self.forward_requests == 0 {
@@ -165,6 +260,7 @@ impl StepGroup {
         if let Some(pid) = request.pipeline_id {
             self.pipelines.insert(pid);
         }
+        self.ring_ends.extend(ring_ends(request).map(|(end, _)| end));
         self.forward_requests = self.forward_requests.saturating_add(usage.forward_requests);
         self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
@@ -259,31 +355,73 @@ pub(crate) fn build_frame_submission(
     stats: &SchedulerStats,
 ) -> (FrameFire, Vec<Box<PendingRequest>>) {
     let mut step_groups: Vec<Vec<Box<PendingRequest>>> = Vec::new();
-    for wave in waves {
-        if wave.is_empty() {
-            continue;
+    // A fire moving a ring end is seated once every earlier mover of that end
+    // in the submission is: by the place it reserved, not by where its lane
+    // stands in the wave.
+    let mut order = RingOrder::of(waves.iter().flatten().map(|request| &**request));
+    let mut waves = waves.into_iter().filter(|wave| !wave.is_empty());
+    let mut deferred: Vec<Box<PendingRequest>> = Vec::new();
+    // Whether `deferred` holds fires of more than one wave: a wave holds one
+    // fire of an instance and of a pipeline, and two waves hold its fires in
+    // their order.
+    let mut joined = false;
+    loop {
+        if deferred.is_empty() {
+            match waves.next() {
+                Some(wave) => deferred = wave,
+                None => break,
+            }
+            joined = false;
         }
-        let mut deferred = wave;
-        while !deferred.is_empty() {
-            let mut grouping = StepGroup::default();
-            let mut group: Vec<Box<PendingRequest>> = Vec::new();
-            let mut rest: Vec<Box<PendingRequest>> = Vec::new();
-            let mut closed = false;
-            for req in deferred {
-                if closed || !grouping.accepts(&req, limits, page_size) {
-                    rest.push(req);
+        let mut grouping = StepGroup::default();
+        let mut group: Vec<Box<PendingRequest>> = Vec::new();
+        let mut rest: Vec<Box<PendingRequest>> = Vec::new();
+        let mut held = Held::default();
+        let mut closed = false;
+        for req in deferred {
+            if (joined && held.holds(&req)) || !order.is_next(&req) {
+                held.hold(&req);
+                rest.push(req);
+                continue;
+            }
+            if closed || !grouping.accepts(&req, limits, page_size) {
+                if joined {
+                    held.hold(&req);
+                }
+                rest.push(req);
+                continue;
+            }
+            closed = grouping.push(&req, limits, page_size);
+            order.seated(&req);
+            group.push(req);
+        }
+        if group.is_empty() {
+            // An empty step admits any fire that is next at its ring ends, so
+            // the first fire left waits on an earlier mover, and the others
+            // on one or behind one.
+            match waves.next() {
+                // It stands in a later wave: these fires go in that wave's
+                // steps, behind it, and that wave's fires of their instances
+                // and pipelines behind them.
+                Some(wave) => {
+                    rest.extend(wave);
+                    deferred = rest;
+                    joined = true;
                     continue;
                 }
-                closed = grouping.push(&req, limits, page_size);
-                group.push(req);
+                // No wave holds it: two rings' orders ask opposite things of
+                // these fires, which reservations made one after another
+                // never do. The first goes as it stands, and an engine that
+                // hears tickets refuses it by name.
+                None => {
+                    let req = rest.remove(0);
+                    order.seated(&req);
+                    group.push(req);
+                }
             }
-            debug_assert!(!group.is_empty(), "grouping always admits the head");
-            if group.is_empty() {
-                group.push(rest.remove(0));
-            }
-            step_groups.push(group);
-            deferred = rest;
         }
+        step_groups.push(group);
+        deferred = rest;
     }
 
     let mut steps: Vec<StepFire> = Vec::new();
@@ -422,6 +560,122 @@ mod tests {
         a_frames_cells_are_one_per_member_and_never_shared();
         a_device_resolved_lane_counts_against_the_token_cap();
         a_step_of_prompts_only_stops_at_the_engines_prefill_lanes();
+        fires_moving_one_ring_end_go_a_step_apart_in_the_order_they_reserved();
+    }
+
+    /// A fire that reserved `head` and `tail` (either `Ticket::NONE`) of
+    /// `channel`, as instance `instance` of a pipeline of its own.
+    fn ring_fire(instance: u64, moves: &[(u64, u64, u64)]) -> Box<PendingRequest> {
+        let mut request = decode(instance as u32, instance as u32);
+        request.ring_moves = moves
+            .iter()
+            .map(|&(channel, head, tail)| ::engine::Ticket {
+                channel: ::engine::ChannelId(channel),
+                expected_head: head,
+                expected_tail: tail,
+            })
+            .collect();
+        let mut pending = pending(request, InstanceId(instance));
+        pending.pipeline_id = Some(uuid::Uuid::from_u128(u128::from(instance)));
+        pending
+    }
+
+    /// The instances of each step of the submission `waves` make.
+    fn stepped(waves: Vec<Vec<Box<PendingRequest>>>) -> Vec<Vec<u64>> {
+        let (frame, flattened) =
+            build_frame_submission(waves, limits(), 16, &SchedulerStats::default());
+        let steps: Vec<Vec<u64>> = frame
+            .steps
+            .iter()
+            .map(|step| {
+                let mut instances: Vec<u64> = step.instances.iter().map(|id| id.0).collect();
+                instances.sort_unstable();
+                instances
+            })
+            .collect();
+        assert_eq!(
+            flattened.len(),
+            steps.iter().map(Vec::len).sum::<usize>(),
+            "every fire is seated once"
+        );
+        steps
+    }
+
+    /// A ring's cursor moves once a step at each end, in the order its fires
+    /// reserved: the engine reads no order among the fires of one step, and a
+    /// wave stands in its lanes' order, not in the order they reserved.
+    fn fires_moving_one_ring_end_go_a_step_apart_in_the_order_they_reserved() {
+        const NONE: u64 = ::engine::Ticket::NONE;
+        // Two pipelines put one ring: the earlier reservation is a step
+        // ahead, whichever stands first in the wave.
+        let first = || ring_fire(1, &[(7, NONE, 0)]);
+        let second = || ring_fire(2, &[(7, NONE, 1)]);
+        assert_eq!(stepped(vec![vec![first(), second()]]), [vec![1], vec![2]]);
+        assert_eq!(stepped(vec![vec![second(), first()]]), [vec![1], vec![2]]);
+        // Two takers likewise.
+        assert_eq!(
+            stepped(vec![vec![
+                ring_fire(2, &[(7, 1, NONE)]),
+                ring_fire(1, &[(7, 0, NONE)]),
+            ]]),
+            [vec![1], vec![2]]
+        );
+        // A fire with no ring joins either step; one taking the ring and one
+        // putting it move different ends and share a step, as do fires
+        // moving two rings.
+        assert_eq!(
+            stepped(vec![vec![
+                second(),
+                pending(decode(9, 9), InstanceId(9)),
+                ring_fire(3, &[(7, 0, NONE)]),
+                ring_fire(4, &[(8, NONE, 0)]),
+                first(),
+            ]]),
+            [vec![1, 3, 4, 9], vec![2]]
+        );
+        // The earlier reservation in a later wave: the later one waits for
+        // it there and goes the step behind it.
+        assert_eq!(
+            stepped(vec![
+                vec![second(), pending(decode(9, 9), InstanceId(9))],
+                vec![first()],
+            ]),
+            [vec![9], vec![1], vec![2]]
+        );
+        // A pipeline's own next fire stands in that later wave too: it stays
+        // behind the fire that waited.
+        let mut next = pending(decode(3, 3), InstanceId(3));
+        next.pipeline_id = second().pipeline_id;
+        assert_eq!(
+            stepped(vec![vec![second()], vec![next, first()]]),
+            [vec![1], vec![2], vec![3]]
+        );
+        // Three in a row, the wave reversed.
+        assert_eq!(
+            stepped(vec![vec![
+                ring_fire(3, &[(7, NONE, 2)]),
+                second(),
+                first(),
+            ]]),
+            [vec![1], vec![2], vec![3]]
+        );
+        // Two rings whose orders ask opposite things: every fire is still
+        // seated, one a step, as the wave stands.
+        assert_eq!(
+            stepped(vec![vec![
+                ring_fire(1, &[(7, NONE, 0), (8, NONE, 1)]),
+                ring_fire(2, &[(7, NONE, 1), (8, NONE, 0)]),
+            ]]),
+            [vec![1], vec![2]]
+        );
+        // What one step refuses, by the group's own answer.
+        let mut group = StepGroup::default();
+        group.push(&first(), limits(), 16);
+        assert!(!group.accepts(&second(), limits(), 16), "the same end");
+        assert!(
+            group.accepts(&ring_fire(3, &[(7, 0, NONE)]), limits(), 16),
+            "the other end"
+        );
     }
 
     /// The engine holds a body for no more than `prefill_lanes` lanes of

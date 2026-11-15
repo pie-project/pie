@@ -1090,6 +1090,7 @@ fn rows_of_lanes(
         .collect();
     if !last {
         req.boundary_program = false;
+        req.ring_moves.clear();
     }
     // A cut ends before the first media span ([`first_media_row`]): only
     // the last piece carries media, at its own rows.
@@ -2387,6 +2388,10 @@ impl TicketReservation {
                 }
             })
             .collect();
+        // The step builder orders the fire by its reservation whatever the
+        // engine hears; the engine hears it where it published the ring the
+        // runtime reads.
+        request.ring_moves.clone_from(&tickets);
         if let Some(lane) = request.lanes.first_mut()
             && adopted
         {
@@ -5122,6 +5127,80 @@ mod static_admission_tests {
         a_latest_value_word_with_no_committed_cell_is_refused();
         a_reader_ring_too_small_for_the_frames_writes_is_refused();
         a_slot_that_consumes_what_an_earlier_slot_published_is_admitted();
+        two_pipelines_putting_one_ring_are_stepped_as_they_reserved();
+    }
+
+    /// A channel is its process's: two pipelines of the process put one
+    /// device ring, each a fire of its own lane. The fires go a step apart
+    /// in the order they reserved, whichever lane the wave stands first, and
+    /// the same where the engine hears no ticket (a ring the runtime does
+    /// not read from what the engine published).
+    fn two_pipelines_putting_one_ring_are_stepped_as_they_reserved() {
+        use crate::scheduler::worker::PendingRequest;
+        let ring = channel(HostRole::None, 4, false);
+        let cells: BoundCells = vec![Arc::clone(&ring)];
+        let earlier = TicketReservation::new(&cells, &[(false, true)]);
+        let later = TicketReservation::new(&cells, &[(false, true)]);
+        let fire = |reservation: &TicketReservation, instance: u64| {
+            let mut request = crate::engine::FireRequest::one(crate::engine::fire::lane_of(
+                0,
+                vec![instance as u32],
+                0,
+                vec![instance as u32],
+            ));
+            request.single_token_mode = true;
+            reservation.apply_to(&mut request);
+            assert!(
+                request.lanes[0].channels.is_empty(),
+                "no ticket reaches the engine for a ring it published no mirror of"
+            );
+            assert_eq!(request.ring_moves.len(), 1, "the reservation is carried");
+            Box::new(PendingRequest {
+                lora_program: false,
+                logical_fire_id: instance,
+                request,
+                instance_id: ::engine::InstanceId(instance),
+                completion: crate::engine::WorkItemCompletion::new(instance, 0),
+                process_id: Some(uuid::Uuid::from_u128(1)),
+                pipeline_id: Some(uuid::Uuid::from_u128(u128::from(instance))),
+                prelaunch_copy: None,
+                prelaunch_state_copy: None,
+                frame: None,
+            })
+        };
+        let limits = crate::engine::SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+            max_context: 0,
+            prefill_rows: 0,
+            prefill_lanes: 0,
+            max_readouts: 0,
+        };
+        for reversed in [false, true] {
+            let mut wave = vec![fire(&earlier, 1), fire(&later, 2)];
+            if reversed {
+                wave.reverse();
+            }
+            let (frame, _) = crate::scheduler::batch::build_frame_submission(
+                vec![wave],
+                limits,
+                16,
+                &crate::scheduler::stats::SchedulerStats::default(),
+            );
+            let steps: Vec<Vec<u64>> = frame
+                .steps
+                .iter()
+                .map(|step| step.instances.iter().map(|id| id.0).collect())
+                .collect();
+            assert_eq!(
+                steps,
+                [vec![1], vec![2]],
+                "the earlier reservation's fire is a step ahead (wave reversed: {reversed})"
+            );
+        }
+        later.commit();
+        earlier.commit();
     }
 
     fn a_device_ring_frame_that_overflows_is_refused_by_name() {

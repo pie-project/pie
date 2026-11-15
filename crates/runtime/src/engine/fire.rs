@@ -12,6 +12,11 @@ pub struct FireRequest {
     pub boundary_program: bool,
     pub voxels: Vec<engine::fire::StepVoxels>,
     pub media: Vec<engine::fire::StepMedia>,
+    /// The ring ends this fire moves, each with its place in that end's
+    /// order: what the fire reserved, whether or not the engine hears it as
+    /// a lane's tickets. Two fires moving one end never share a step, and
+    /// the earlier place is seated first.
+    pub ring_moves: Vec<engine::Ticket>,
 }
 
 impl FireRequest {
