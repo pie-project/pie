@@ -158,6 +158,10 @@ impl Serve for Api {
         shelf.recorder.forget();
     }
 
+    fn recordings(shelf: &Shelf) -> Option<(u64, u64)> {
+        Some(shelf.recorder.counts())
+    }
+
     fn grown(_shell: &mut Shell<Api>, _arm: usize, _bytes: u64) -> Result<()> {
         Ok(())
     }

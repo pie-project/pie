@@ -44,6 +44,8 @@ pub struct TuneRequest<'a> {
     /// Run the `[fire_ns]` step alone: time the check models' fires at each
     /// rung width, every decision left as it is.
     pub fire_only: bool,
+    /// Run the `[rates]` step alone: the device's rates measured on it.
+    pub rates: bool,
 }
 
 /// What a tune produced.
@@ -177,7 +179,7 @@ macro_rules! tune_grid {
 /// `[fire_ns]` step (or that step alone).
 #[cfg(feature = "vulkan")]
 fn tune_vulkan(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
-    use engine_vulkan::tune::{Depth, run};
+    use engine_vulkan::tune::{Depth, Steps, run};
     let depth = if req.full { Depth::Full } else { Depth::Quick };
     let models = pick_models("vulkan", req)?;
     let out = run(
@@ -185,7 +187,10 @@ fn tune_vulkan(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned
         Some(req.profiles),
         req.cache,
         req.refit,
-        req.fire_only,
+        Steps {
+            rates: req.rates,
+            fire_ns: req.fire_only,
+        },
         &models,
         say,
     )?;

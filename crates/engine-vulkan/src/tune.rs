@@ -238,11 +238,24 @@ fn fire_ns(
                 word: trace.facts.word(&Request::new(width, false)),
                 tokens: &prompt,
             };
+            let before = shell.recordings();
             let began = Instant::now();
             shell
                 .fire(std::slice::from_ref(&lane))
                 .map_err(|e| e.to_string())?;
-            Ok(u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX))
+            let ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            // Served fires replay what they recorded: a fire walked here
+            // times the host's encoding beside the device's work, and is no
+            // fire time of this model.
+            let replayed = |c: Option<(u64, u64)>| c.map_or(0, |(replayed, _)| replayed);
+            if replayed(shell.recordings()) <= replayed(before) {
+                return Err(format!(
+                    "a fire of {width} tokens of {model} was walked, not replayed (it records {:?}): \
+                     its time is not what serving runs, so no [fire_ns] entry is written",
+                    shell.recordings()
+                ));
+            }
+            Ok(ns)
         },
         say,
     )?;
@@ -373,17 +386,53 @@ fn measure(_: &Profile, _: &qmm::Grid, _: &mut dyn FnMut(&str)) -> Result<qmm::M
     Err("this build carries no Vulkan device code".to_string())
 }
 
-/// Tune the device a load opens. `say` hears progress. `fire_only` runs the
-/// `[fire_ns]` step alone, every decision left as it is.
+/// The steps a `pie tune` run takes: every decision's search, then the
+/// `[fire_ns]` step, by default; one step alone, or the two named, else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Steps {
+    /// The `[rates]` step alone ([`crate::rates::measure`]).
+    pub rates: bool,
+    /// The `[fire_ns]` step alone.
+    pub fire_ns: bool,
+}
+
+impl Steps {
+    fn search(self) -> bool {
+        !self.rates && !self.fire_ns
+    }
+
+    fn fires(self) -> bool {
+        self.fire_ns || !self.rates
+    }
+}
+
+/// The `[rates]` step: the device's rates measured on it under `base`.
+fn rates(base: &Profile, say: &mut dyn FnMut(&str)) -> Result<profile::fire::Rates, String> {
+    let device =
+        crate::device::Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
+            .map_err(|e| e.to_string())?;
+    let tuning = crate::tuning::Tuning::new(base.clone(), device.limits());
+    let rates = crate::rates::measure(&device, &tuning).map_err(|e| e.to_string())?;
+    say(&format!(
+        "[rates]: {:.1} TFLOP/s bf16, {:.0} GB/s, launch {} us",
+        rates.bf16_flops_per_ns.unwrap_or(0.0) / 1e3,
+        rates.bytes_per_ns.unwrap_or(0.0),
+        rates.launch_ns.unwrap_or(0) / 1000
+    ));
+    Ok(rates)
+}
+
+/// Tune the device a load opens. `say` hears progress.
 pub fn run(
     depth: Depth,
     profiles: Option<&Path>,
     cache: &Path,
     refit: bool,
-    fire_only: bool,
+    steps: Steps,
     models: &[(PathBuf, String)],
     say: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
+    let fire_only = !steps.search();
     let began = Instant::now();
     let (name, facts) = crate::chip::probe().ok_or("no Vulkan device answers")?;
     let cores = facts
@@ -450,11 +499,20 @@ pub fn run(
         lines.extend(searched);
     }
     let mut tuned = search::render_overrides(&chosen);
+    if steps.rates {
+        let r = rates(&base, say)?;
+        tuned.push_str(&format!(
+            "[rates]\nbf16_flops_per_ns = {:?}\nbytes_per_ns = {:?}\nlaunch_ns = {}\n",
+            r.bf16_flops_per_ns.unwrap_or(1.0),
+            r.bytes_per_ns.unwrap_or(1.0),
+            r.launch_ns.unwrap_or(0)
+        ));
+    }
     let today = bench.file(&[])?;
     let draft = bench.file(&chosen)?;
     // The fire times of each model under the file this writes.
     let mut fires = Vec::new();
-    for (artifact, deployment) in models {
+    for (artifact, deployment) in models.iter().filter(|_| steps.fires()) {
         say(&format!("[fire_ns]: {deployment}"));
         fires.push(fire_ns(artifact, deployment, &name, &draft, say)?);
     }
