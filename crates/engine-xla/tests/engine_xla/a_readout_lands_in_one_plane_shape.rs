@@ -4,8 +4,9 @@
 //! fire of one lane and a fire of three hand back planes of one shape, and
 //! the guest stages and host gathers reading them take one shape too. A
 //! fire's plane stays what it wrote while it is read: the fires after it
-//! write the ring's other planes, and one that comes round to a plane still
-//! read is handed a fresh one. Skipped without a PJRT plugin.
+//! write the ring's other planes (a frame's fires at most), and a fire that
+//! would come round to a plane still read is refused by name, nothing laid.
+//! Skipped without a PJRT plugin.
 
 use engine_xla::{Lane, Seated, Shell};
 use poem::Request;
@@ -76,15 +77,32 @@ fn a_readout_lands_in_one_plane_shape() {
         assert!(rings.contains(&s), "a readout plane is a ring's: {s:?} of {rings:?}");
     }
 
-    // Held across more fires than the ring holds: still what it wrote.
+    // Held across the fires a ring holds (`STEPS_MAX`, a frame's most; the
+    // three-lane fire was one of them): still what it wrote.
     let first = lane(&one, 0);
-    for k in 0..5 {
-        let _ = fire(shell, &pages, &[2 + k, 7], 10 + k);
+    drop(three);
+    let depth = usize::from(engine::runahead::Runahead::STEPS_MAX);
+    let mut held = Vec::new();
+    for k in 0..depth - 2 {
+        held.push(fire(shell, &pages, &[2 + k as u32, 7], 10 + k as u32));
     }
-    let again = fire(shell, &pages, &[5], 1);
     assert_eq!(lane(&one, 0), first, "a held plane is not written over");
+    // One more would come round to it: refused by name, nothing laid.
+    let refused = {
+        let facts = shell.trace().facts.clone();
+        let tokens = vec![3u32; 4];
+        let word = facts.word(&Request::new(4, false));
+        let mut s = Seated::of(Lane { slot: 0, word, tokens: &tokens });
+        s.pages = &pages[..1];
+        s.held = Some(0);
+        shell.open(0).expect("opens");
+        shell.fire_kept_with(&[s], &[]).err().expect("a fire coming round to a held plane")
+    };
+    assert!(refused.to_string().contains("still read"), "refused by name: {refused}");
+    // Read, released: the ring serves again.
+    drop(one);
+    drop(held);
+    let again = fire(shell, &pages, &[5], 1);
     assert_eq!(lane(&again, 0), first, "the same lane fired again reads the same row");
-    let fresh: u64 = shell.pools().readouts().iter().map(|r| r.fresh).sum();
-    assert!(fresh > 0, "a fire that came round to the held plane was handed a fresh one");
-    eprintln!("readout planes {rings:?}; {fresh} laid fresh while one was held");
+    eprintln!("readout planes {rings:?}, {depth} deep; a fire past a held plane: {refused}");
 }

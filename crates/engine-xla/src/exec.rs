@@ -107,6 +107,13 @@ fn bind_and_run(
         .iter()
         .filter_map(|r| r.map(|(_, param)| param))
         .collect();
+    // A readout ring's next plane, still read, refuses the fire before it
+    // takes the pool or anything else.
+    for (at, source) in sig.params.iter().enumerate() {
+        if let (true, Source::Readout { index }) = (donated.contains(&at), source) {
+            pools.readout_ready(*index)?;
+        }
+    }
     let mut taken: Vec<(usize, Buffer)> = Vec::new();
     for (at, source) in sig.params.iter().enumerate() {
         match (donated.contains(&at), source) {

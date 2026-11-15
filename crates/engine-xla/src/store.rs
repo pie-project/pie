@@ -188,8 +188,8 @@ pub struct Pools {
 }
 
 /// One readout output's planes: `[rows, width]` of `dtype` each, as many
-/// as a fire's readouts can be held for (the frames in flight and one), so
-/// a fire never writes over a plane a frame before it still reads.
+/// as fires a frame holds (`Runahead::STEPS_MAX`), so a fire never comes
+/// round to a plane a reader still holds.
 #[derive(Debug)]
 pub struct ReadoutRing {
     pub root: Tensor,
@@ -198,8 +198,6 @@ pub struct ReadoutRing {
     pub width: u32,
     slots: Vec<Option<std::sync::Arc<Buffer>>>,
     at: usize,
-    /// Planes laid afresh because the ring's next one was still read.
-    pub fresh: u64,
 }
 
 /// The bytes one adapter's largest plane takes in whole pool rows: a
@@ -1365,7 +1363,6 @@ impl Pools {
                 width,
                 slots,
                 at: 0,
-                fresh: 0,
             });
         }
         Ok(())
@@ -1386,26 +1383,65 @@ impl Pools {
     }
 
     /// The next plane of readout ring `index`, for a fire to write into and
-    /// return: the ring's own when nothing reads it any more, else a fresh
-    /// one of its shape.
+    /// return. Refused when a reader still holds it: a fire's readouts are
+    /// read before the ring comes round (a frame's at most, `STEPS_MAX`
+    /// fires), never past it.
     pub fn readout_take(&mut self, device: &Device, index: u16) -> Result<Buffer> {
+        let _ = device;
         let ring = self
             .readouts
             .get_mut(usize::from(index))
             .ok_or_else(|| Fault::Unbound {
                 what: format!("readout ring {index}, which this load did not lay"),
             })?;
-        ring.at = (ring.at + 1) % ring.slots.len().max(1);
-        match ring.slots[ring.at].take().map(std::sync::Arc::try_unwrap) {
-            Some(Ok(buffer)) => Ok(buffer),
-            _ => {
-                ring.fresh += 1;
-                device
-                    .zeros_or_dry(ring.dtype, ring.rows, ring.width)?
-                    .ok_or_else(|| Fault::Unbound {
-                        what: "a readout plane, on a device that runs nothing".to_string(),
-                    })
+        let depth = ring.slots.len().max(1);
+        let next = (ring.at + 1) % depth;
+        let plane = ring.slots[next].take().ok_or_else(|| Fault::Unbound {
+            what: format!("readout ring {index}'s plane {next}, which a fire still holds"),
+        })?;
+        match std::sync::Arc::try_unwrap(plane) {
+            Ok(buffer) => {
+                ring.at = next;
+                Ok(buffer)
             }
+            Err(held) => {
+                ring.slots[next] = Some(held);
+                Err(Fault::Program {
+                    at: "store::readout_take",
+                    why: format!(
+                        "readout ring {index}'s plane {next}, which a fire {depth} fires back is \
+                         still read from: a fire's readouts are read before {depth} more fires \
+                         run"
+                    ),
+                })
+            }
+        }
+    }
+
+    /// Refused when readout ring `index`'s next plane is still read: asked
+    /// before a fire takes anything, so a refused fire leaves every buffer
+    /// where it was.
+    pub fn readout_ready(&self, index: u16) -> Result<()> {
+        let ring = self
+            .readouts
+            .get(usize::from(index))
+            .ok_or_else(|| Fault::Unbound {
+                what: format!("readout ring {index}, which this load did not lay"),
+            })?;
+        let depth = ring.slots.len().max(1);
+        let next = (ring.at + 1) % depth;
+        match &ring.slots[next] {
+            Some(plane) if std::sync::Arc::strong_count(plane) == 1 => Ok(()),
+            Some(_) => Err(Fault::Program {
+                at: "store::readout_ready",
+                why: format!(
+                    "readout ring {index}'s plane {next}, which a fire {depth} fires back is still \
+                     read from: a fire's readouts are read before {depth} more fires run"
+                ),
+            }),
+            None => Err(Fault::Unbound {
+                what: format!("readout ring {index}'s plane {next}, which a fire still holds"),
+            }),
         }
     }
 
