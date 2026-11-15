@@ -44,6 +44,39 @@ impl ResidencyPlanner {
         self.eviction_failed_inner(pid, false, false);
     }
 
+    /// An eviction whose copy to the host failed: `pid`'s state could not
+    /// be moved, and a second try moves it no more than the first, so it is
+    /// never tried again. The process is failed by name, the copy's reason
+    /// given; it stands among the kills in flight, which are no victims and
+    /// free its pages as it ends, and the planner looks for the next one.
+    pub(super) fn eviction_copy_failed(self: &Arc<Self>, pid: ProcessId, error: &str) {
+        let signal = self.with_inner(|inner| {
+            // One that left meanwhile is settled by its departure.
+            if !inner.procs.contains_key(&pid) {
+                return None;
+            }
+            inner.settle_eviction(pid);
+            inner.killing.insert(pid);
+            let proc = inner.procs.get_mut(&pid)?;
+            if proc.state == Residency::Evicting {
+                proc.state = Residency::Resident;
+            }
+            Some(proc.signal.clone())
+        });
+        self.stats.eviction_faults.fetch_add(1, Ordering::Relaxed);
+        crate::scheduler::worker::notify_process_resume(pid);
+        if let Some(signal) = signal {
+            signal.notify_waiters();
+        }
+        let reason = format!(
+            "planner: this process's state could not be moved off the device to make room, \
+             so it is failed rather than tried again: {error}"
+        );
+        tracing::error!(pid = %pid, %reason, "planner: failing a process whose eviction could not land");
+        crate::inferlet::process::terminate_by(pid, Err(reason), crate::policy::By::Host);
+        self.poke();
+    }
+
     pub(super) fn eviction_found_nothing(self: &Arc<Self>, pid: ProcessId) {
         self.eviction_failed_inner(pid, false, true);
     }
@@ -112,7 +145,6 @@ impl ResidencyPlanner {
             let proc = inner.procs.get_mut(&pid)?;
             debug_assert_eq!(proc.state, Residency::Restoring);
             proc.state = Residency::Resident;
-            proc.restore_retried = false;
             proc.progressed = false;
             Some(proc.signal.clone())
         });
@@ -123,6 +155,15 @@ impl ResidencyPlanner {
             signal.notify_waiters();
         }
         self.poke();
+    }
+
+    /// A restore that failed at a step of its own (its kv, its state or its
+    /// role slots prepared, or its copy back): a second try fails as the
+    /// first did, so it is never queued again. The process is failed by
+    /// name, `reason` given, and counted as a restore fault.
+    pub(super) fn restore_faulted(self: &Arc<Self>, pid: ProcessId, reason: &str) {
+        self.stats.restore_faults.fetch_add(1, Ordering::Relaxed);
+        self.restore_failed(pid, reason);
     }
 
     pub(super) fn restore_failed(self: &Arc<Self>, pid: ProcessId, reason: &str) {
@@ -144,38 +185,25 @@ impl ResidencyPlanner {
         }
     }
 
-    /// A `failure` spends its one retry; none (pages it shares moved since its
-    /// grant) is no failure.
-    pub(super) fn requeue_restore(self: &Arc<Self>, pid: ProcessId, failure: Option<&str>) {
-        let spent = self.with_inner(|inner| {
+    /// More of `pid`'s pages were swapped out since its restore was quoted:
+    /// it is queued again, to be quoted anew when served. No failure.
+    pub(super) fn requeue_restore(self: &Arc<Self>, pid: ProcessId) {
+        self.with_inner(|inner| {
             let Some(proc) = inner.procs.get_mut(&pid) else {
-                return false;
+                return;
             };
             if proc.state != Residency::Restoring {
-                return false;
+                return;
             }
             proc.state = Residency::Evicted;
-            if failure.is_some() {
-                if proc.restore_retried {
-                    return true;
-                }
-                proc.restore_retried = true;
-            }
             inner.enqueue(
                 pid,
                 WaitKind::Restore {
                     demand: Demand::default(),
                 },
             );
-            false
         });
-        if failure.is_some() {
-            self.stats.restore_failures.fetch_add(1, Ordering::Relaxed);
-        }
-        match failure {
-            Some(reason) if spent => self.fail_restore_loud(pid, reason),
-            _ => self.poke(),
-        }
+        self.poke();
     }
 
     fn fail_restore_loud(self: &Arc<Self>, pid: ProcessId, reason: &str) {

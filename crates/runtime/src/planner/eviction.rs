@@ -307,6 +307,8 @@ impl ResidencyPlanner {
                         && proc.state == Residency::Resident
                         && !inner.host_swap_blocked.contains(*pid)
                         && !inner.prepare_blocked.contains(*pid)
+                        // Being failed: it frees its pages as it ends.
+                        && !inner.killing.contains(*pid)
                 })
                 .map(|(pid, proc)| Victim {
                     pid: *pid,

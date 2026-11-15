@@ -1886,3 +1886,143 @@ async fn a_departure_watch_follows_a_restart() {
     drop(new_hold);
     assert!(watch.gone(), "its newest run departed");
 }
+
+/// An eviction whose copy to the host fails is never tried again: the
+/// process is failed by name (a kill in flight, counted as an eviction
+/// fault, not a rollback) and leaves the victims, so the next round moves
+/// another. An eviction that found nothing to move faults nobody.
+#[test]
+fn an_eviction_whose_copy_fails_faults_its_process_and_the_next_is_moved() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    // A full pool: the head's page is a deficit only an eviction funds.
+    let pool = Arc::new(RacePool::new(64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, first, second) = (
+        ProcessId::new_v4(),
+        ProcessId::new_v4(),
+        ProcessId::new_v4(),
+    );
+    for pid in [head, first, second] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        inner.enqueue(
+            head,
+            allocation(Demand {
+                kv_pages: 1,
+                rs: RsUnits::default(),
+            }),
+        );
+    });
+    let members = |planner: &Arc<ResidencyPlanner>| -> HashSet<ProcessId> {
+        planner
+            .victim_set()
+            .expect("the head is short")
+            .members
+            .iter()
+            .map(|victim| victim.pid)
+            .collect()
+    };
+    assert_eq!(members(&planner), HashSet::from([first, second]));
+
+    // Negative control: an eviction that found nothing to move keeps its
+    // process out of this round but fails nobody.
+    planner.eviction_found_nothing(second);
+    assert_eq!(planner.stats.eviction_faults.load(Ordering::Relaxed), 0);
+    assert!(!planner.with_inner(|inner| inner.killing.contains(&second)));
+    planner.clear_host_swap_blocks();
+    assert_eq!(members(&planner), HashSet::from([first, second]));
+
+    // The copy fails: the process is failed once, by name, and never
+    // picked again; the other is the round's victim.
+    let rollbacks = planner.stats.eviction_rollbacks.load(Ordering::Relaxed);
+    planner.eviction_copy_failed(
+        first,
+        "role-slots to HostPinned copy: a slot copy names shape 131072",
+    );
+    assert_eq!(planner.stats.eviction_faults.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        planner.stats.eviction_rollbacks.load(Ordering::Relaxed),
+        rollbacks,
+        "a fault is no rollback"
+    );
+    assert!(planner.with_inner(|inner| inner.killing.contains(&first)));
+    for _ in 0..3 {
+        assert_eq!(
+            members(&planner),
+            HashSet::from([second]),
+            "the failed process is not tried again"
+        );
+    }
+    assert_eq!(planner.stats.eviction_faults.load(Ordering::Relaxed), 1);
+}
+
+/// A restore that fails at a step of its own, its copy back or a prepare,
+/// is never queued again: the process is failed by name, once, counted as
+/// a restore fault. A restore queued again because more of its pages were
+/// swapped out since its quote is no failure and no fault.
+#[test]
+fn a_restore_that_fails_a_step_is_failed_once_not_queued_again() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let pool = Arc::new(RacePool::new(64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (copying, preparing, moved) = (
+        ProcessId::new_v4(),
+        ProcessId::new_v4(),
+        ProcessId::new_v4(),
+    );
+    for pid in [copying, preparing, moved] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let restoring = |planner: &Arc<ResidencyPlanner>, pid: ProcessId| {
+        planner.with_inner(|inner| {
+            inner.procs.get_mut(&pid).expect("registered").state = Residency::Restoring;
+        });
+    };
+    let queued = |planner: &Arc<ResidencyPlanner>, pid: ProcessId| {
+        planner.with_inner(|inner| {
+            inner
+                .queue
+                .values()
+                .any(|waiter| waiter.pid == pid && matches!(waiter.kind, WaitKind::Restore { .. }))
+        })
+    };
+    let faults =
+        |planner: &Arc<ResidencyPlanner>| planner.stats.restore_faults.load(Ordering::Relaxed);
+
+    // Negative control: more of its pages were swapped out since its quote;
+    // queued again, to be quoted anew.
+    restoring(&planner, moved);
+    planner.requeue_restore(moved);
+    assert!(queued(&planner, moved), "queued again, quoted anew");
+    assert_eq!(faults(&planner), 0);
+
+    // Its copy back fails: failed once by name, never queued again.
+    restoring(&planner, copying);
+    planner.restore_faulted(
+        copying,
+        "its state could not be copied back to the device: role-slots from HostPinned copy",
+    );
+    assert!(
+        !queued(&planner, copying),
+        "a failed copy is not tried again"
+    );
+    assert_eq!(faults(&planner), 1);
+
+    // A prepare fails (here its state's): the same, at once, no retry.
+    restoring(&planner, preparing);
+    planner.restore_faulted(preparing, "rs prepare: no device rows");
+    assert!(
+        !queued(&planner, preparing),
+        "a failed prepare is not tried again"
+    );
+    assert_eq!(faults(&planner), 2);
+    for pid in [copying, preparing] {
+        assert_eq!(
+            planner.with_inner(|inner| inner.procs[&pid].state),
+            Residency::Evicted
+        );
+    }
+}

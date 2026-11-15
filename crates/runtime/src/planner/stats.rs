@@ -8,6 +8,13 @@ pub struct PlannerStats {
     pub eviction_deferrals: AtomicU64,
     pub evictions: AtomicU64,
     pub eviction_rollbacks: AtomicU64,
+    /// Evictions whose copy failed: each fails its process by name, never
+    /// retried ([`super::ResidencyPlanner::eviction_copy_failed`]).
+    pub eviction_faults: AtomicU64,
+    /// Restores that failed at a step of their own (prepare or copy back):
+    /// each fails its process by name, never queued again
+    /// ([`super::ResidencyPlanner::restore_faulted`]).
+    pub restore_faults: AtomicU64,
     pub restores: AtomicU64,
     pub restore_failures: AtomicU64,
     pub gate_parks: AtomicU64,
