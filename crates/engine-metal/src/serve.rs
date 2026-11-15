@@ -1762,6 +1762,86 @@ impl Shell {
         self.pools.write_tier_slots(slots, bytes)
     }
 
+    /// Builds, before ready, every compute pipeline a fire of this load
+    /// can meet: at each rung, a prefill fire of the rung's rows (one lane)
+    /// and a decode fire of as many one-row lanes as the rung and the seats
+    /// take, each prepared and encoded and its frame dropped uncommitted,
+    /// so nothing runs and no seat, slot or rung changes. Returns the fires
+    /// walked and
+    /// the pipelines built.
+    /// Seals the pipelines built ([`Shell::warm_pipelines`]).
+    pub fn seal_pipelines(&self) {
+        self.pipelines.seal();
+    }
+
+    /// Fires refused for an unbuilt pipeline since the last call.
+    pub fn take_unbuilt_pipelines(&self) -> u64 {
+        self.pipelines.take_unbuilt()
+    }
+
+    pub fn warm_pipelines(&mut self) -> Result<(u32, u64)> {
+        use engine::frame::Shell as FrameShell;
+        let before = self.pipelines.compiled();
+        // The seats the pool lays runs for: a seat-addressed lane past them
+        // names chunks the pool does not hold. A fire's matmul tiles follow
+        // its rows (the prefill fires walk every rung's), its attention one
+        // row a lane (one decode lane reaches it).
+        let seats = {
+            let layout = self.pools.layout();
+            let facts = self.pool_chunk_facts();
+            let per = facts
+                .shape(crate::store::layout::LIST)
+                .map_or(1, |shape| shape.slots_per_chunk.max(1));
+            let run = self.paging().pages_per_slot.div_ceil(per).max(1);
+            let below = facts.total_chunks.saturating_sub(layout.act_span()).saturating_sub(1);
+            layout.seats.min(below / run).max(1)
+        };
+        let context = self.paging().context().max(1);
+        let standing = self.rung;
+        let committed = self.pools.committed_segments();
+        let mut fires = 0u32;
+        for rung in self.arena.rung_tokens() {
+            self.set_rung(self.rung, rung)?;
+            let prompt = rung.min(self.budgets.tokens.max_tokens).min(context).max(1);
+            let lanes = rung.min(self.budgets.tokens.max_lanes).min(seats).max(1);
+            let prompt_tokens = vec![0u32; prompt as usize];
+            let one = [0u32];
+            let prefill = [Seated {
+                held: Some(0),
+                ..Seated::of(Lane {
+                    slot: 0,
+                    word: self.trace.facts.word(&poem::Request::new(prompt, false)),
+                    tokens: &prompt_tokens,
+                })
+            }];
+            let word = self.trace.facts.word(&poem::Request::new(1, false));
+            let decode: Vec<Seated<'_>> = (0..lanes)
+                .map(|slot| Seated {
+                    held: Some(0),
+                    ..Seated::of(Lane { slot, word, tokens: &one })
+                })
+                .collect();
+            for lanes in [&prefill[..], &decode[..]] {
+                let prepared = FrameShell::prepare(
+                    self,
+                    StepView { lanes, attachments: &[], media: &[], clips: &[], done: None },
+                    None,
+                )?;
+                drop(self.walk(&prepared, true)?);
+                fires += 1;
+            }
+        }
+        // Seat-addressed fires back the seats' segments: what the walk
+        // backed goes back, and the rung stands where it stood.
+        if self.rung != standing {
+            self.set_rung(self.rung, standing)?;
+        }
+        if self.pools.committed_segments() > committed {
+            self.release_segments(committed)?;
+        }
+        Ok((fires, self.pipelines.compiled() - before))
+    }
+
     pub fn open(&mut self, slot: u32) -> Result<()> {
         if self.pools.has_state() {
             self.drain()?;
@@ -4579,6 +4659,13 @@ impl Shell {
     }
 
     fn walk_once(&self, p: &Prepared<'_>) -> Result<Walked> {
+        self.walk(p, false)
+    }
+
+    /// The forward encoded; `dry`, for a frame that is dropped uncommitted
+    /// (the load's pipeline walk): no early head is flushed to run and no
+    /// Neural Engine hand-off is armed, so nothing of it reaches a queue.
+    fn walk(&self, p: &Prepared<'_>, dry: bool) -> Result<Walked> {
         let place = At::new();
         let mut frame = self.device.frame()?;
         if let Some(plane) = self.nan_flags.as_ref() {
@@ -4592,8 +4679,13 @@ impl Shell {
             let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
             #[cfg(target_vendor = "apple")]
             let sink = sink
-                .with_handoff(self.ane.as_ref().map(crate::ane::Ane::handoff))
-                .flushing_after(HEAD_LAUNCHES);
+                .with_handoff(
+                    self.ane
+                        .as_ref()
+                        .filter(|_| !dry)
+                        .map(crate::ane::Ane::handoff),
+                )
+                .flushing_after(if dry { 0 } else { HEAD_LAUNCHES });
             let mut run = Run::new(
                 &sink,
                 &self.handles,

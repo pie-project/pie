@@ -2020,6 +2020,12 @@ impl Pools {
         self.pool.commit_segments(segments)
     }
 
+    /// The bottom run of segments backed for state.
+    #[must_use]
+    pub fn committed_segments(&self) -> u32 {
+        self.pool.committed_segments()
+    }
+
     /// Gives back every segment at and past `segments`.
     ///
     /// # Safety

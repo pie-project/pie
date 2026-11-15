@@ -53,9 +53,22 @@ pub struct Metal {
     pending: Option<(FrameId, Vec<PendingStep>)>,
     /// The adapter id each instance's lanes route by.
     adapters: BTreeMap<InstanceId, u32>,
+    /// What the load armed and what its fires tallied (`engine::live`).
+    live: engine::live::Live,
 }
 
 impl Metal {
+    /// Fires refused for a pipeline the load did not build, counted as
+    /// `Tally::Compiled` (the load should have prepared them).
+    fn tally_unbuilt(&self) {
+        if let Some(shell) = self.shell.as_ref() {
+            let missed = shell.take_unbuilt_pipelines();
+            if missed > 0 {
+                self.live.tally(engine::live::Tally::Compiled, missed);
+            }
+        }
+    }
+
     #[must_use]
     pub fn new(boot: DeviceBoot, contract_for: ContractFor) -> Metal {
         Metal {
@@ -68,6 +81,7 @@ impl Metal {
             sink: None,
             pending: None,
             adapters: BTreeMap::new(),
+            live: engine::live::Live::armed(),
         }
     }
 
@@ -144,6 +158,7 @@ fn fault(fault: Fault) -> Error {
         | Fault::Param { .. }
         | Fault::Recipe(_)
         | Fault::Shader { .. }
+        | Fault::Unprepared { .. }
         | Fault::Unbound { .. } => Error::Load(fault.to_string()),
         Fault::Ceiling { what, need, have } => Error::Impossible(format!(
             "this fire wants {need} {what} and the load reserved {have}"
@@ -629,6 +644,17 @@ impl Engine for Metal {
             classes: shell.classes(),
         };
 
+        // Every pipeline the load's rungs dispatch is built now, before
+        // ready; a key met after is refused by name and tallied.
+        let began = std::time::Instant::now();
+        let (fires, built) = shell.warm_pipelines().map_err(fault)?;
+        shell.seal_pipelines();
+        tracing::info!(
+            fires,
+            built,
+            ms = began.elapsed().as_millis() as u64,
+            "metal: every pipeline the load dispatches is built before ready"
+        );
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -739,10 +765,12 @@ impl Engine for Metal {
                 }
                 Err(error) => {
                     self.pending = None;
+                    self.tally_unbuilt();
                     return Err(error);
                 }
             }
         }
+        self.tally_unbuilt();
         let mut ticket = FrameTicket { id, steps };
         self.pending = Some((id, pending));
         if !self.settles_asynchronously() {
@@ -755,6 +783,10 @@ impl Engine for Metal {
         self.shell
             .as_ref()
             .is_some_and(|shell| shell.frames_in_flight() > 1)
+    }
+
+    fn live(&self) -> engine::live::Live {
+        self.live.clone()
     }
 
     fn on_complete(&mut self, sink: engine::CompletionSink) {

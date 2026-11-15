@@ -118,6 +118,12 @@ impl Arena {
         self.scratch
     }
 
+    /// Every rung's tokens, narrowest first.
+    #[must_use]
+    pub fn rung_tokens(&self) -> Vec<u32> {
+        self.rungs.iter().map(|(tokens, _)| *tokens).collect()
+    }
+
     /// The rung that carries a fire of `tokens`: the smallest at or above
     /// it, else the widest.
     #[must_use]

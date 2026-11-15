@@ -29,6 +29,11 @@ pub struct Pipelines {
     libraries: RefCell<HashMap<(&'static str, &'static str), Library>>,
     pipelines: RefCell<HashMap<PipelineKey, Pipeline>>,
     compiles: std::cell::Cell<u64>,
+    /// Built before ready, then sealed ([`Pipelines::seal`]): a key met
+    /// after is refused by name, never compiled in a fire.
+    sealed: std::cell::Cell<bool>,
+    /// Fires refused for a key the load did not build.
+    unbuilt: std::cell::Cell<u64>,
     /// What the device's allocation grew by across every library and
     /// pipeline build: the driver's share of them, measured (an `outside`
     /// line of the ledger).
@@ -86,6 +91,17 @@ impl Pipelines {
         self.compiles.get()
     }
 
+    /// Every pipeline this load dispatches is built: a key met from now on
+    /// is a fire the load did not prepare for.
+    pub fn seal(&self) {
+        self.sealed.set(true);
+    }
+
+    /// The fires refused for an unbuilt key since the last call.
+    pub fn take_unbuilt(&self) -> u64 {
+        self.unbuilt.replace(0)
+    }
+
     #[cfg(target_vendor = "apple")]
     pub(crate) fn at(
         &self,
@@ -95,6 +111,14 @@ impl Pipelines {
         let key = (fire.file, fire.entrypoint, fire.stamp, fire.page_strides);
         if let Some(pipeline) = self.pipelines.borrow().get(&key) {
             return Ok(pipeline.clone());
+        }
+        if self.sealed.get() {
+            self.unbuilt.set(self.unbuilt.get() + 1);
+            return Err(Fault::Unprepared {
+                file: fire.file,
+                entrypoint: fire.entrypoint,
+                stamp: fire.stamp,
+            });
         }
         let before = device.currentAllocatedSize() as u64;
         let library = self.library(device, fire)?;

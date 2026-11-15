@@ -139,6 +139,13 @@ pub enum Fault {
 
     Residency(String),
 
+    /// A fire met a pipeline the load did not build before ready.
+    Unprepared {
+        file: &'static str,
+        entrypoint: &'static str,
+        stamp: &'static str,
+    },
+
     Backing {
         step: &'static str,
         bytes: u64,
@@ -339,6 +346,13 @@ impl fmt::Display for Fault {
                 "the plan names {what}, which this shell binds no seat for"
             ),
             Self::Residency(why) => write!(f, "{why}"),
+            Self::Unprepared { file, entrypoint, stamp } => write!(
+                f,
+                "this fire meets pipeline `{entrypoint}` of `{file}` ({stamp}), which the load \
+                 did not build before ready: a load builds every pipeline its rungs dispatch, so \
+                 this key is one the load's walk does not reach, and the fire is refused rather \
+                 than compiled while serving"
+            ),
         }
     }
 }
