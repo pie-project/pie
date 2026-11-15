@@ -864,10 +864,25 @@ impl<B: Serve> Shell<B> {
             least,
             &tuning,
         )?;
+        // What the pool seats (`fit::Beside`): the top rung's span beside
+        // what its own fire writes, and the least rung's beside one
+        // working set at the context.
+        let beside = {
+            let classes = span.act_chunks(chunk);
+            let least_tokens = crate::fit::least_rung(top, budgets.max_patches());
+            crate::fit::Beside {
+                act: classes.last().map_or(0, |&(_, chunks)| chunks),
+                fired: crate::fit::fired_chunks(&rows, asked, top),
+                least_act: classes
+                    .iter()
+                    .find(|&&(tokens, _)| tokens >= least_tokens)
+                    .map_or(0, |&(_, chunks)| chunks),
+                context: least_chunks,
+            }
+        };
         let device_cap = device
             .left()
-            .saturating_sub(u64::from(least_chunks) * chunk)
-            .saturating_sub(span.bytes());
+            .saturating_sub(u64::from(beside.chunks()) * chunk);
         let mut weights = Weights::resident(
             &device,
             &handles,
@@ -1145,20 +1160,12 @@ impl<B: Serve> Shell<B> {
         // The activation span takes the pool's top chunks beside what the
         // budget states for state.
         let act_chunks = span.act_chunks(chunk);
-        let act = act_chunks.last().map_or(0, |&(_, chunks)| chunks);
         let crate::fit::Pool {
             room,
             total,
             segment_chunks,
             words,
-        } = crate::fit::pool(
-            left,
-            kv_budget,
-            chunk,
-            act,
-            least_chunks,
-            device.max_buffer(),
-        )?;
+        } = crate::fit::pool(left, kv_budget, chunk, beside, device.max_buffer())?;
         // No rung lends a chunk past the kernels' index to state.
         let unindexed = total.saturating_sub(words);
         // Rungs taking as many chunks are one: each class is stated once,
