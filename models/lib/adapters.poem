@@ -37,6 +37,13 @@ def peft_banks(hidden, q_width, kv_width, inter):
     })
 
 def peft(w, routes):
-    def adapt(site, x, y):
+    adapted = fact.has(fact.Adapter)
+
+    def correct(site, x, y):
         return corrected(x, y, getattr(w.lora, site), routes)
-    return adapt
+
+    def split(x, arm):
+        within = lambda site, x, y: correct(site, x, y).on(adapted)
+        return branch(x, [(adapted, lambda x: arm(x, within))], otherwise = lambda x: arm(x, None))
+
+    return struct(correct = correct, split = split)

@@ -525,7 +525,7 @@ impl<'r, 't> Walk<'r, 't> {
         }
         let rule = rules::rule_of(op, |v| self.width(v));
         // Partial sums any op but a sum reads are reduced first.
-        if !matches!(rule, Rule::Linear { .. }) {
+        if !matches!(rule, Rule::Linear { .. } | Rule::Correct) {
             for v in &ins {
                 self.reduce(*v);
             }
@@ -659,6 +659,48 @@ impl<'r, 't> Walk<'r, 't> {
             Rule::Heads(heads) => {
                 let others = read(heads.follow);
                 self.heads(op, &t, heads, &field, &others, &outs)
+            }
+            Rule::Correct => {
+                let (x, y) = (field("x")[0], field("y")[0]);
+                for v in field("routes") {
+                    self.read_whole(v);
+                }
+                let a = self
+                    .param(field("bank_a")[0])
+                    .expect("a correction reads its banks");
+                let b = self
+                    .param(field("bank_b")[0])
+                    .expect("a correction reads its banks");
+                let held = match (self.held(x), self.held(y)) {
+                    (Held::Whole, Held::Split(origins)) => {
+                        self.decide(a, Cut::Whole);
+                        if self.decide(b, Cut::Beside(1, origins.clone())) {
+                            self.cut_with(b, &origins);
+                            Held::Split(origins)
+                        } else {
+                            self.reject(&origins)
+                        }
+                    }
+                    (Held::Split(over), Held::Partial(sums)) => {
+                        self.decide(b, Cut::Whole);
+                        if self.decide(a, Cut::Beside(2, over.clone())) {
+                            self.cut_with(a, &over);
+                            Held::Partial(sums)
+                        } else {
+                            self.reject(&over)
+                        }
+                    }
+                    _ => {
+                        for v in [x, y] {
+                            self.reduce(v);
+                            self.read_whole(v);
+                        }
+                        self.decide(a, Cut::Whole);
+                        self.decide(b, Cut::Whole);
+                        Held::Whole
+                    }
+                };
+                vec![held; outs.len()]
             }
         };
         for (o, h) in outs.into_iter().zip(held) {

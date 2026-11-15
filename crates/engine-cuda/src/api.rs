@@ -465,12 +465,19 @@ fn adapter_of(
     program: engine::program::ProgramId,
     instance: InstanceId,
     seeds: &[(u32, Vec<u8>)],
+    ranks: u32,
 ) -> EngineResult<Option<crate::Binding>> {
     let sinks = shell.program_adapter_sinks(program).map_err(fault)?;
     if sinks.is_empty() {
         return Ok(None);
     }
     let seats = shell.bank_seats();
+    if ranks > 1 && seats.iter().any(|seat| seat.name.contains(".lora.")) {
+        return Err(Error::Load(format!(
+            "this load cuts its PEFT banks across {ranks} ranks, and an adapter's planes \
+             are seeded whole; serve PEFT adapters on one rank"
+        )));
+    }
     let mut built: Vec<(String, Vec<u8>)> = Vec::new();
     for (sink, (role, channel)) in sinks
         .iter()
@@ -1138,6 +1145,7 @@ impl Engine for Cuda {
             .iter()
             .map(|id| self.channels.get(id).cloned())
             .collect();
+        let ranks = self.boot.world.size;
         let shell = self.loaded_mut()?;
         let id = shell
             .bind_program(
@@ -1150,7 +1158,7 @@ impl Engine for Cuda {
                 &binding.channels,
             )
             .map_err(fault)?;
-        let landed = adapter_of(shell, binding.program, id, &seeds);
+        let landed = adapter_of(shell, binding.program, id, &seeds, ranks);
         let bound = match landed {
             Ok(bound) => bound,
             Err(why) => {

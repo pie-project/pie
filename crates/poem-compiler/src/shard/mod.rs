@@ -380,6 +380,20 @@ impl Pass {
         if let Some(seen) = self.whole.get(&v) {
             return Ok(*seen);
         }
+        if let Def::Merge(arms) = self.trace.values[v.0 as usize].def.clone() {
+            let arms = arms
+                .into_iter()
+                .map(|(arm, guard)| Ok((self.whole(arm)?, guard)))
+                .collect::<Result<Vec<_>, String>>()?;
+            let out = ValueId(self.trace.values.len() as u32);
+            self.trace.values.push(ValueDecl {
+                def: Def::Merge(arms),
+                ty: self.trace.values[v.0 as usize].ty.clone(),
+            });
+            self.dists.push(Some(Dist::Whole));
+            self.whole.insert(v, out);
+            return Ok(out);
+        }
         let Def::Op(at) = self.trace.values[v.0 as usize].def else {
             return Err(format!("value {} is held {dist:?} and no op makes it", v.0));
         };

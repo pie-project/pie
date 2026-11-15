@@ -52,7 +52,11 @@ fn a_deployment_stretched_by_yarn_turns_at_the_scaled_frequencies() {
     assert_eq!(stretched.name, "qwen3-0.6b-bf16-kv-bf16-yarn4");
     let trace = stretched.trace(Platform::Cuda);
     let turned = tables(&trace);
-    assert_eq!(turned.len(), 28, "one stated table a layer");
+    assert_eq!(
+        turned.len(),
+        2 * 28,
+        "one stated table a layer, with an adapter and without"
+    );
     let table = turned[0];
     assert_eq!(table.inv_freq.len(), 64);
     assert!((table.mscale - (0.1 * 4f32.ln() + 1.0)).abs() < 1e-6);
