@@ -9,6 +9,7 @@ mod fire;
 mod kv;
 mod launch;
 mod posted;
+mod stream;
 
 use engine::Engine;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
@@ -58,6 +59,8 @@ pub struct CerebrasEngine {
     pending: Option<(FrameId, Vec<Vec<LaneReadout>>)>,
     /// Steps posted and not yet run (an asynchronous engine).
     posted: std::collections::VecDeque<posted::Posted>,
+    /// A stream reading's program (a diffusion transformer's denoise), when the load is one.
+    stream: Option<stream::Stream>,
 }
 
 impl CerebrasEngine {
@@ -83,6 +86,23 @@ impl CerebrasEngine {
             sink: None,
             pending: None,
             posted: std::collections::VecDeque::new(),
+            stream: None,
+        }
+    }
+
+    /// The system the program runs on: the configured CS system, else the simulator.
+    fn platform(&self) -> crate::sdk::Platform {
+        match &self.cfg.cmaddr {
+            Some(cmaddr) => crate::sdk::Platform::System {
+                cmaddr: cmaddr.clone(),
+            },
+            None => crate::sdk::Platform::Simulator(crate::sdk::Simulator {
+                num_threads: self.cfg.num_threads,
+                ..crate::sdk::Simulator::new(match self.cfg.target {
+                    Target::Wse2 => crate::sdk::Target::Wse2,
+                    Target::Wse3 => crate::sdk::Target::Wse3,
+                })
+            }),
         }
     }
 
@@ -125,6 +145,10 @@ impl Engine for CerebrasEngine {
             ));
         };
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
+        // a stream reading's program (`wafer-compile stream`'s: its host.json)
+        if let Some(dir) = (self.debug.program.clone()).filter(|d| d.join("host.json").is_file()) {
+            return self.load_stream(trace, &path, &contract, &budgets, &dir);
+        }
         // the program serves the context the config states (else as many positions as it holds)
         let positions = budgets.context_declared.then_some(budgets.max_context);
         let prepared = prepare::prepare(&self.cfg, &trace, &contract, &path, positions)
@@ -132,18 +156,7 @@ impl Engine for CerebrasEngine {
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
         let facts = Facts::of(trace, &budgets, slots).map_err(Error::Load)?;
         self.readout = facts.readout();
-        let platform = match &self.cfg.cmaddr {
-            Some(cmaddr) => crate::sdk::Platform::System {
-                cmaddr: cmaddr.clone(),
-            },
-            None => crate::sdk::Platform::Simulator(crate::sdk::Simulator {
-                num_threads: self.cfg.num_threads,
-                ..crate::sdk::Simulator::new(match self.cfg.target {
-                    Target::Wse2 => crate::sdk::Target::Wse2,
-                    Target::Wse3 => crate::sdk::Target::Wse3,
-                })
-            }),
-        };
+        let platform = self.platform();
         let vocab = self
             .readout
             .as_ref()

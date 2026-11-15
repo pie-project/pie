@@ -95,8 +95,15 @@ pub enum Tiles {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Debug {
-    /// Open this linked program (its `artifact/`) instead of building one.
+    /// Open this linked program (its `artifact/`) instead of building one; or a stream
+    /// reading's program (`wafer-compile stream`'s directory: its `host.json`), linked in
+    /// `link`.
     pub program: Option<PathBuf>,
+    /// A stream program's link (cslc's output), else `<program>/out`.
+    pub link: Option<PathBuf>,
+    /// `"host"`: a stream reading's steps on the host forward over the checkpoint
+    /// (`reading::HostFabric`), no fabric; else the configured system or the simulator.
+    pub stream_fabric: Option<String>,
     /// Place these staged tiles (`<dir>` or `<dir>:<file prefix>`) instead of cutting the
     /// checkpoint.
     pub weights: Option<String>,

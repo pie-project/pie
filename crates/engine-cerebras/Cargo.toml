@@ -35,6 +35,8 @@ tracing = "0.1"
 blake3 = "1"
 
 [dev-dependencies]
+eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 sha2 = "0.11"
 
 [lints]

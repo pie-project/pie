@@ -334,6 +334,9 @@ impl CerebrasEngine {
         &mut self,
         step: &engine::fire::Step,
     ) -> EngineResult<Vec<LaneReadout>> {
+        if self.stream.is_some() {
+            return self.fire_stream(step);
+        }
         let fire_t0 = std::time::Instant::now();
         self.next_fire = self.next_fire.wrapping_add(1);
         for attachment in &step.attachments {

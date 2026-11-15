@@ -40,8 +40,18 @@ impl Facts {
                 .chain(std::iter::once(budget.max_tokens))
                 .collect();
         }
-        let compiled = compile_axes(&trace, &Budgets::of(budget), &DeviceProfile::default())
-            .map_err(|e| e.to_string())?;
+        let mut axes = Budgets::of(budget);
+        // a trace reading a voxel axis (a stream reading's latent) sizes it by the budgets
+        if let Some(voxels) = poem_compiler::VoxelLadder::of(
+            &trace,
+            budgets.max_voxels,
+            budgets.max_clips,
+            budgets.max_lanes,
+        ) {
+            axes = axes.with_voxels(voxels);
+        }
+        let compiled =
+            compile_axes(&trace, &axes, &DeviceProfile::default()).map_err(|e| e.to_string())?;
         let exports = poem_exec::feeds::class_outputs(&trace, &compiled)?;
         if exports.is_empty() {
             return Err("the trace has no output, so a fire would compute nothing".into());

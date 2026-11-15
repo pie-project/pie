@@ -15,7 +15,15 @@
 //!   gathered into the arrays' words with the same [`apply`] the capture-fed compile uses;
 //! - after the step, the trace's own exit ops over the rows read back ([`Reading::finish`]: the
 //!   velocity unpatchified);
-//! - between steps, the poem's schedule ([`Denoise`]: its flow sigmas, an Euler step a velocity).
+//! - between steps, the poem's schedule ([`Denoise`]: its flow sigmas, an Euler step a velocity);
+//! - the static arrays (the weight tiles, the regions' shared residents) from the checkpoint
+//!   ([`Reading::statics`]): the values each array's spans read, made by an
+//!   [`engine_cpu::Forward`] over the checkpoint's planes, cast to the array's words with the
+//!   compile's own [`apply_spans`]. A program compiled with no capture runs on any checkpoint.
+//!
+//! A step runs on a [`Fabric`]: the SDK runtime (a CS system or the simulator), or
+//! [`HostFabric`], the rows a program returns as engine-cpu's forward makes them (no fabric: the
+//! engine's request path checked on the host).
 //!
 //! Nothing here names a model's op: the values are the trace's, by id, and the runner is the
 //! same for any stream reading the compile states.
@@ -26,7 +34,7 @@ use std::rc::Rc;
 
 use engine_cpu::Forward;
 use engine_cpu::forward::{Captured, StreamLane, StreamStep, Values};
-use kernels_cerebras::stream::host::{Word, apply};
+use kernels_cerebras::stream::host::{Span, Word, apply, apply_spans};
 use poem_ir::{Def, InputAxis, Operands, RuntimeInput, Trace, ValueId};
 use serde_json::Value;
 
@@ -42,16 +50,38 @@ pub struct Class {
     pub rows: u32,
 }
 
-/// A memcpy rectangle the host writes: its words from `file`, or, for an entry, gathered from
-/// the step's values each step.
+/// A memcpy rectangle the host writes: its words from `file` (a program's own array, or any
+/// array of a program compiled from a capture), from `statics` (spans over values the
+/// checkpoint makes), or, for an entry, gathered from the step's values each step.
 #[derive(Clone, Debug)]
 pub struct Array {
     pub sym: String,
     pub rect: Rect,
     pub len: usize,
     pub u16: bool,
-    pub file: PathBuf,
+    pub file: Option<PathBuf>,
     pub entry: Option<Vec<Word>>,
+    pub statics: Option<Vec<Span>>,
+}
+
+impl Array {
+    fn file(&self) -> R<&Path> {
+        self.file.as_deref().ok_or_else(|| {
+            format!(
+                "`{}` at ({}, {}): no words on file (a program compiled with no capture)",
+                self.sym, self.rect.x, self.rect.y
+            )
+        })
+    }
+}
+
+/// Where a step's arrays are written and run: the SDK runtime, or [`HostFabric`].
+pub trait Fabric {
+    /// Writes array `a`'s words (each an f32's bits, or a 16-bit word).
+    fn write(&mut self, a: &Array, words: &[u32]) -> R<()>;
+    /// Runs `step` on the arrays written: the rows back (each [`Back`]'s words) and the step's
+    /// cycles where the program stamps them.
+    fn run(&mut self, reading: &Reading, step: &StreamStep<'_>) -> R<(Vec<Vec<f32>>, Option<u64>)>;
 }
 
 /// A root's rows read back: each of its own rows (the step's row `rows[i]`) the `parts`
@@ -134,6 +164,13 @@ impl Reading {
                 }
                 None => None,
             };
+            let statics = match a["static"].as_str() {
+                Some(f) => {
+                    let (_, w) = npy_words(&dir.join(f))?;
+                    Some(w.as_chunks::<8>().0.to_vec())
+                }
+                None => None,
+            };
             h2d.push(Array {
                 sym: text(&a, "sym")?,
                 rect: Rect {
@@ -144,8 +181,9 @@ impl Reading {
                 },
                 len: num(&a, "len")? as usize,
                 u16: a["u16"].as_bool().unwrap_or(false),
-                file: dir.join(text(&a, "file")?),
+                file: a["file"].as_str().map(|f| dir.join(f)),
                 entry,
+                statics,
             });
         }
         let mut d2h = Vec::new();
@@ -375,22 +413,83 @@ impl Reading {
     }
 
     /// Every array no step's inputs make (the tiles, the regions' tables and static residents),
-    /// from its file: written once on a loaded program, before its first [`Reading::launch`].
-    pub fn write_static(&self, rt: &mut Runtime) -> R<()> {
+    /// from its file (a program compiled from a capture): written once on a loaded program,
+    /// before its first [`Reading::launch`].
+    pub fn write_static(&self, rt: &mut dyn Fabric) -> R<()> {
         for a in self.h2d.iter().filter(|a| a.entry.is_none()) {
-            Self::write(rt, a, &npy_words(&a.file)?.1)?;
+            rt.write(a, &npy_words(a.file()?)?.1)?;
         }
         Ok(())
     }
 
-    fn write(rt: &mut Runtime, a: &Array, data: &[u32]) -> R<()> {
-        let dt = if a.u16 {
-            DataType::Bits16
-        } else {
-            DataType::Bits32
+    /// The words of every array no step's inputs make, from the checkpoint: each array's spans
+    /// over the values `weights` (a forward holding the checkpoint's planes) makes of them, at
+    /// `step` (any step: these values are the weights' alone); an array with no spans (a table,
+    /// a PE's config words) its file's. `None` for an entry.
+    pub fn statics(
+        &self,
+        weights: &mut Forward,
+        step: &StreamStep<'_>,
+    ) -> R<Vec<Option<Vec<u32>>>> {
+        let mut wanted: Vec<ValueId> = Vec::new();
+        for a in self.h2d.iter().filter(|a| a.entry.is_none()) {
+            for s in a.statics.iter().flatten() {
+                let v = ValueId(s[0]);
+                if s[0] != kernels_cerebras::stream::host::NONE && !wanted.contains(&v) {
+                    wanted.push(v);
+                }
+            }
+        }
+        let held: BTreeMap<u32, (usize, usize, Rc<Vec<f32>>)> = weights
+            .stream_values(step, &[], &wanted)?
+            .into_iter()
+            .map(|c| {
+                let v = match c.values {
+                    Values::F32(v) => v,
+                    Values::I32(v) => v.into_iter().map(|x| x as f32).collect(),
+                };
+                (c.value.0, (c.rows, c.width, Rc::new(v)))
+            })
+            .collect();
+        let get = |v: u32| {
+            held.get(&v)
+                .cloned()
+                .ok_or_else(|| format!("value %{v}: not made"))
         };
-        rt.memcpy_h2d(&a.sym, data, a.rect, a.len, Order::RowMajor, dt)
-            .map_err(|x| x.to_string())
+        self.h2d
+            .iter()
+            .map(|a| {
+                if a.entry.is_some() {
+                    return Ok(None);
+                }
+                let words = match &a.statics {
+                    Some(s) => apply_spans(s, &get)?,
+                    None => npy_words(a.file()?)?.1,
+                };
+                if words.len() != a.len * (a.rect.w * a.rect.h) as usize {
+                    return Err(format!(
+                        "`{}` at ({}, {}): {} words for {} PEs of {}",
+                        a.sym,
+                        a.rect.x,
+                        a.rect.y,
+                        words.len(),
+                        a.rect.w * a.rect.h,
+                        a.len
+                    ));
+                }
+                Ok(Some(words))
+            })
+            .collect()
+    }
+
+    /// The static arrays' words ([`Reading::statics`]) written, once a load.
+    pub fn write_statics(&self, rt: &mut dyn Fabric, words: &[Option<Vec<u32>>]) -> R<()> {
+        for (a, w) in self.h2d.iter().zip(words) {
+            if let Some(w) = w {
+                rt.write(a, w)?;
+            }
+        }
+        Ok(())
     }
 
     /// One step on a loaded program: every array written (an entry's words from `entries`, the
@@ -413,20 +512,55 @@ impl Reading {
         rt: &mut Runtime,
         entries: &[Option<Vec<f32>>],
     ) -> R<(Vec<Vec<f32>>, Option<u64>)> {
-        let e = |x: crate::sdk::Error| x.to_string();
+        let step = StreamStep {
+            lanes: Vec::new(),
+            inputs: Vec::new(),
+        };
+        self.launch_on(rt, &step, entries)
+    }
+
+    /// [`Reading::launch`] on any [`Fabric`]: `step` is the step the entries are of (what a
+    /// [`HostFabric`] runs).
+    pub fn launch_on(
+        &self,
+        rt: &mut dyn Fabric,
+        step: &StreamStep<'_>,
+        entries: &[Option<Vec<f32>>],
+    ) -> R<(Vec<Vec<f32>>, Option<u64>)> {
         for (a, words) in self.h2d.iter().zip(entries) {
             if a.entry.is_none() {
                 continue;
             }
             let data: Vec<u32> = match words {
                 Some(w) => w.iter().map(|x| x.to_bits()).collect(),
-                None => npy_words(&a.file)?.1,
+                None => npy_words(a.file()?)?.1,
             };
-            Self::write(rt, a, &data)?;
+            rt.write(a, &data)?;
         }
-        rt.launch("run", &[]).map_err(e)?;
+        rt.run(self, step)
+    }
+}
+
+impl Fabric for Runtime {
+    fn write(&mut self, a: &Array, words: &[u32]) -> R<()> {
+        let dt = if a.u16 {
+            DataType::Bits16
+        } else {
+            DataType::Bits32
+        };
+        self.memcpy_h2d(&a.sym, words, a.rect, a.len, Order::RowMajor, dt)
+            .map_err(|x| x.to_string())
+    }
+
+    fn run(
+        &mut self,
+        reading: &Reading,
+        _step: &StreamStep<'_>,
+    ) -> R<(Vec<Vec<f32>>, Option<u64>)> {
+        let e = |x: crate::sdk::Error| x.to_string();
+        self.launch("run", &[]).map_err(e)?;
         let mut got = Vec::new();
-        for b in &self.d2h {
+        for b in &reading.d2h {
             let mut out = vec![0u32; b.len];
             let rect = Rect {
                 x: b.x,
@@ -434,7 +568,7 @@ impl Reading {
                 w: 1,
                 h: 1,
             };
-            rt.memcpy_d2h(
+            self.memcpy_d2h(
                 &b.sym,
                 &mut out,
                 rect,
@@ -445,8 +579,8 @@ impl Reading {
             .map_err(e)?;
             got.push(out.into_iter().map(f32::from_bits).collect());
         }
-        let cycles = if rt.rpc().symbols().contains_key("tsc") {
-            let (w, h) = (self.w as usize, self.h as usize);
+        let cycles = if self.rpc().symbols().contains_key("tsc") {
+            let (w, h) = (reading.w as usize, reading.h as usize);
             let mut ts = vec![0u32; w * h * 3];
             let rect = Rect {
                 x: 0,
@@ -454,7 +588,7 @@ impl Reading {
                 w: w as i32,
                 h: h as i32,
             };
-            rt.memcpy_d2h("tsc", &mut ts, rect, 3, Order::RowMajor, DataType::Bits32)
+            self.memcpy_d2h("tsc", &mut ts, rect, 3, Order::RowMajor, DataType::Bits32)
                 .map_err(e)?;
             let live = ts.chunks(3).filter(|s| s[0] != 0 || s[1] != 0);
             let (lo, hi) = live.fold((u64::MAX, 0u64), |(lo, hi), s| {
@@ -465,6 +599,63 @@ impl Reading {
             None
         };
         Ok((got, cycles))
+    }
+}
+
+/// A fabric with no wafer: a step's rows as engine-cpu's forward over the checkpoint makes the
+/// values the program returns ([`Reading::out_values`]), laid into each [`Back`]'s words as the
+/// program's roots would. What it is written is kept (`written`, by array), not run.
+pub struct HostFabric {
+    pub forward: Forward,
+    pub written: BTreeMap<(String, i32, i32), Vec<u32>>,
+}
+
+impl HostFabric {
+    #[must_use]
+    pub fn new(forward: Forward) -> HostFabric {
+        HostFabric {
+            forward,
+            written: BTreeMap::new(),
+        }
+    }
+}
+
+impl Fabric for HostFabric {
+    fn write(&mut self, a: &Array, words: &[u32]) -> R<()> {
+        self.written
+            .insert((a.sym.clone(), a.rect.x, a.rect.y), words.to_vec());
+        Ok(())
+    }
+
+    fn run(&mut self, reading: &Reading, step: &StreamStep<'_>) -> R<(Vec<Vec<f32>>, Option<u64>)> {
+        let made: BTreeMap<u32, Captured> = self
+            .forward
+            .stream_values(step, &[], &reading.out_values())?
+            .into_iter()
+            .map(|c| (c.value.0, c))
+            .collect();
+        let mut got = Vec::new();
+        for b in &reading.d2h {
+            let width: usize = b.parts.iter().map(|p| p.2 as usize).sum();
+            let mut buf = vec![0f32; b.len];
+            for (i, &tr) in b.rows.iter().enumerate() {
+                let mut off = 0;
+                for &(base, from, n) in &b.parts {
+                    let c = made
+                        .get(&base)
+                        .ok_or_else(|| format!("value %{base} is read back but not made"))?;
+                    let Values::F32(v) = &c.values else {
+                        return Err(format!("value %{base}: not a float"));
+                    };
+                    let (from, n) = (from as usize, n as usize);
+                    let at = tr * c.width + from;
+                    buf[i * width + off..i * width + off + n].copy_from_slice(&v[at..at + n]);
+                    off += n;
+                }
+            }
+            got.push(buf);
+        }
+        Ok((got, None))
     }
 }
 

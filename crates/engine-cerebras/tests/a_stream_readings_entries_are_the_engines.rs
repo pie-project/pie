@@ -14,93 +14,20 @@ use engine_cpu::Forward;
 use engine_cpu::forward::{Captured, Output, StreamStep, Values};
 use poem_ir::{Operands, Request, Trace};
 
-const MINI: &str = "flux2-mini-bf16-kv-bf16";
-/// The text lane's rows and the latent's grid: 64 rows a lane (a 16 x 16 latent), or
-/// `READING_ROWS` a lane (a square latent of 2 x 2 patches) for `flux_2_minis_reading_files`.
-fn rows() -> usize {
-    std::env::var("READING_ROWS")
-        .ok()
-        .and_then(|r| r.parse().ok())
-        .unwrap_or(64)
-}
+mod common;
 
-fn grid() -> [u32; 3] {
-    let side = 2 * (rows() as f64).sqrt().round() as u32;
-    [1, side, side]
-}
-const CHANNELS: usize = 32;
-const CONTEXT: usize = 192;
+use common::{MINI, grid, rows, trace};
+
 /// diffusers' latent after the 2-step loop (`mk_tiny_flux2.py --loop`), f32 [256, 32].
 const LOOP_GOLDEN: &[u8] = include_bytes!("flux_2_mini_loop2_latent.f32");
 
-fn fnv(name: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in name.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// `count` values in [-1/2, 1/2), each exact in f32: what mk_tiny_flux2.py draws for `name`.
-fn units(name: &str, count: usize) -> Vec<f32> {
-    let mut seed = fnv(name);
-    (0..count)
-        .map(|_| {
-            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            ((seed >> 40) as i64 - (1 << 23)) as f32 / (1u64 << 24) as f32
-        })
-        .collect()
-}
-
-fn bf16(x: f32) -> f32 {
-    let bits = x.to_bits();
-    f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff_0000)
-}
-
-fn trace() -> Trace {
-    poem_compiler::catalog::repository()
-        .parse(MINI)
-        .expect("the catalog holds flux2-mini")
-        .trace(poem_ir::Platform::Cerebras)
-}
-
 /// flux2-mini with mk_tiny_flux2.py's weights, and its step's guest inputs by name.
 fn setup(trace: &Trace) -> (Forward, Vec<(String, Vec<f32>)>) {
-    let shapes: Vec<(String, Vec<u64>)> = (trace.params.iter())
-        .map(|p| (p.name.clone(), p.shape.clone()))
-        .collect();
-    let plane = |name: &str, count: usize| -> Vec<f32> {
-        let u = units(name, count);
-        if name.ends_with("norm") {
-            return u.iter().map(|u| 1.0 + 0.5 * u).collect();
-        }
-        let fan_in = (shapes.iter())
-            .find(|(n, _)| n == name)
-            .and_then(|(_, s)| s.last().copied())
-            .unwrap_or(1) as f32;
-        let s = (12.0 / fan_in).sqrt();
-        u.iter().map(|u| u * s).collect()
-    };
-    let voxels = (grid()[1] * grid()[2]) as usize;
-    let s = 12f32.sqrt();
-    let mut context: Vec<f32> = units("input.context", rows() * CONTEXT)
-        .iter()
-        .map(|u| bf16(u * s))
-        .collect();
-    context.resize((rows() + voxels / 4) * CONTEXT, 0.0);
-    let latents: Vec<f32> = units("input.latents", voxels * CHANNELS)
-        .iter()
-        .map(|u| bf16(u * s))
-        .collect();
-    let inputs = vec![
-        ("timestep".to_string(), vec![500.0; 2]),
-        ("guidance".to_string(), vec![4.0; 2]),
-        ("context".to_string(), context),
-        ("latents".to_string(), latents),
-    ];
-    let forward = Forward::new(trace.clone(), None, &plane).expect("flux2-mini loads");
-    (forward, inputs)
+    let forward = Forward::new(trace.clone(), None, &|n: &str, c: usize| {
+        common::plane(trace, n, c)
+    })
+    .expect("flux2-mini loads");
+    (forward, common::inputs())
 }
 
 /// The step the engine-cpu test runs: its lanes are the reading's classes.
@@ -259,7 +186,11 @@ fn flux_2_minis_entries_are_the_captures() {
     let mut n = 0;
     for (a, e) in reading.h2d.iter().zip(&entries) {
         let Some(e) = e else { continue };
-        let want = words(&a.file);
+        let want = words(
+            a.file
+                .as_deref()
+                .expect("a capture's compile writes every array"),
+        );
         let got: Vec<u32> = e.iter().map(|x| x.to_bits()).collect();
         assert_eq!(
             got, want,

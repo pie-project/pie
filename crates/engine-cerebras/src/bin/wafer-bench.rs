@@ -307,11 +307,11 @@ fn reading(get: &HashMap<String, String>) -> Result<bool, String> {
         let step = reading.step(&trace, grid, &inputs);
         let entries = reading.entries(&mut host, &step)?;
         std::fs::create_dir_all(out).map_err(|e| format!("{out}: {e}"))?;
-        for (a, e) in reading.h2d.iter().zip(&entries) {
+        for (k, (a, e)) in reading.h2d.iter().zip(&entries).enumerate() {
             let Some(e) = e else { continue };
-            let name = a.file.file_name().ok_or("an h2d file")?;
+            // (the h2d file it replaces: `h2d/<k>.npy`, the k-th array)
             let shape = [a.rect.h as usize, a.rect.w as usize, a.len];
-            kernels_cerebras::npy::write_f32(&Path::new(out).join(name), &shape, e)?;
+            kernels_cerebras::npy::write_f32(&Path::new(out).join(format!("{k}.npy")), &shape, e)?;
         }
         println!("READING entries written to {out}");
         return Ok(true);
