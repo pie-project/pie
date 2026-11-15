@@ -476,6 +476,12 @@ impl Shell {
         self.arena.drop_rungs();
     }
 
+    /// See [`crate::store::Pools::keep_contiguous`]: before the load's
+    /// last fit.
+    pub fn keep_contiguous(&mut self) {
+        self.pools.keep_contiguous();
+    }
+
     /// Backs every page the pools declare ([`crate::store::Pools::back_whole`]).
     pub fn back_whole(&mut self) -> Result<()> {
         self.pools.back_whole()

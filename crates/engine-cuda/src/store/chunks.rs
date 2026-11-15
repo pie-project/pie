@@ -45,8 +45,9 @@ pub struct Chunks {
     /// The chunks the runtime named weight slots in: no page is seated in
     /// one ([`Chunks::keep_clear`]).
     weights: std::collections::BTreeSet<u32>,
-    /// The chunks past the fit, under the activation's span, the runtime
-    /// never names ([`Chunks::skip_past`]): from `skip.0`, `skip.1` of them.
+    /// The chunks of the range the runtime never names, what it was
+    /// reserved for past what the card came to back ([`Chunks::state_fitted`]):
+    /// from `skip.0`, `skip.1` of them.
     skip: (u32, u32),
 }
 
@@ -167,19 +168,50 @@ impl Chunks {
         (u64::from(self.act) * chunk).saturating_sub(self.range.held(u64::from(self.total) * chunk))
     }
 
+    /// The bytes of the activation's span held backed, wherever in it: the
+    /// arena's prefix, the carves laid at its end, the workspaces and the
+    /// staged runs.
+    #[must_use]
+    pub fn activation_held_bytes(&self) -> u64 {
+        self.range
+            .held_past(u64::from(self.total) * self.layout.chunk_bytes)
+            .min(self.activation_bytes())
+    }
+
+    /// The range's chunks under the state's end, and how many of the
+    /// state's last chunks lie in one run under it.
+    fn under_state(&self) -> (u32, u32) {
+        let stated = self.stated();
+        if self.skip.0 < stated {
+            (self.total, stated - self.skip.0)
+        } else {
+            (stated, stated)
+        }
+    }
+
     /// Where the chunks the runtime counts as state end: under it lie the
     /// last of them, in order.
     #[must_use]
     pub fn state_end(&self) -> u64 {
-        self.range.base() + u64::from(self.stated()) * self.layout.chunk_bytes
+        self.range.base() + u64::from(self.under_state().0) * self.layout.chunk_bytes
     }
 
     /// Backs the last `bytes` under the state's end, and keeps them
     /// backed: where a fire lays its guests' programs once the activation's
-    /// own span has no room under its carve.
+    /// own span has no room under its carve. No further down than the
+    /// state's last chunks lie in one run ([`Chunks::state_fitted`]).
     pub fn hold_under_state(&mut self, pool: &mut PhysicalPool, bytes: u64) -> Result<Commit> {
-        let end = u64::from(self.stated()) * self.layout.chunk_bytes;
-        let bytes = bytes.min(end);
+        let (end, run) = self.under_state();
+        let end = u64::from(end) * self.layout.chunk_bytes;
+        let run = u64::from(run) * self.layout.chunk_bytes;
+        if self.skip.0 < self.stated() && bytes > run {
+            return Err(Fault::Ceiling {
+                what: "bytes of the state pool in one run under the activation's span",
+                need: bytes,
+                have: run,
+            });
+        }
+        let bytes = bytes.min(run);
         self.range.hold(pool, end - bytes, bytes, false)
     }
 
@@ -248,9 +280,11 @@ impl Chunks {
         if first >= start {
             return Ok(Commit::Committed);
         }
+        // The boundary's chunks lie in one run: the pool parts at a whole
+        // segment at or under them, or past them all.
         let outcome = self.range.hold(
             pool,
-            u64::from(first) * chunk,
+            u64::from(self.at(first)) * chunk,
             u64::from(start - first) * chunk,
             false,
         )?;
@@ -271,27 +305,95 @@ impl Chunks {
             .limit(u64::from(chunks) * self.layout.chunk_bytes);
     }
 
-    /// States the pool to the runtime as its first `fitted` chunks and the
-    /// activation's right above them: the chunks past the fit (what the
-    /// range was reserved for beyond the settled fit) lie under no chunk id
-    /// the runtime names. Its chunk `fitted + i` is the activation's chunk
-    /// `i`, so a smaller rung hands state the bottom of the activation's
-    /// span, backed already, and never a chunk past the fit. The
-    /// activation keeps its addresses: the armed bodies stay good.
-    pub fn skip_past(&mut self, fitted: u32) {
+    /// The chunk a pool of `fitted` chunks parts at ([`Chunks::state_fitted`]):
+    /// the first whole segment past the null chunk and every chunk the
+    /// load seated weights in, which stay where they lie; `fitted` itself
+    /// where that leaves no chunk above it, or the pool is to lie in one
+    /// run from its base (`contiguous`: another worker reads it in place).
+    #[must_use]
+    pub fn parting(&self, fitted: u32, contiguous: bool) -> u32 {
         let fitted = fitted.min(self.total);
-        self.skip = (fitted, self.total - fitted);
+        if contiguous || fitted == self.total {
+            return fitted;
+        }
+        self.kept().min(fitted)
     }
 
-    /// The state chunks the runtime counts: the range's but those past the
-    /// fit ([`Chunks::skip_past`]).
+    /// The chunks that stay where they lie whatever the pool comes to hold,
+    /// in whole segments: the null chunk's and those the load seated
+    /// weights in.
+    fn kept(&self) -> u32 {
+        let segment = self.layout.segment_chunks.max(1);
+        let kept = self.weights.last().map_or(1, |last| last + 1);
+        kept.div_ceil(segment).saturating_mul(segment)
+    }
+
+    /// Gives back the segments past where the pool parts whatever it comes
+    /// to hold ([`Chunks::parting`]): what the load's own fires seated
+    /// there is read by nothing, and the chunks from there on are placed
+    /// under the activation ([`Chunks::state_fitted`]).
+    pub fn clear_past_parting(&mut self, pool: &mut PhysicalPool, contiguous: bool) -> Result<()> {
+        if contiguous || self.skip.1 > 0 {
+            return Ok(());
+        }
+        let segment = self.layout.segment_chunks.max(1);
+        self.range.release_segments(pool, self.kept() / segment)
+    }
+
+    /// States the pool to the runtime as the `fitted` chunks the card
+    /// backs, of a range reserved for more, with the activation's right
+    /// above them. The range's base and the activation's span stay where
+    /// they lie (a body recorded over them names both), so the chunks the
+    /// range holds past `fitted` are skipped in its middle: the pool's
+    /// chunks up to where it parts ([`Chunks::parting`]) lie from the
+    /// base, the rest in one run that ends where the activation starts.
+    /// The runtime's chunk `fitted + i` is the activation's chunk `i`, so
+    /// what a smaller rung lends and the state's last chunks are one span.
+    /// The skipped chunks lie under no chunk id the runtime names, and are
+    /// never backed. Where the pool is `contiguous`, or too small to part,
+    /// the skipped chunks are those right under the activation.
+    pub fn state_fitted(&mut self, fitted: u32, contiguous: bool) -> Result<()> {
+        let fitted = fitted.min(self.total);
+        if self.skip.1 > 0 && self.stated() == fitted {
+            return Ok(());
+        }
+        let parting = self.parting(fitted, contiguous);
+        let chunk = self.layout.chunk_bytes;
+        if parting < fitted {
+            self.range.part(
+                u64::from(parting) * chunk,
+                u64::from(self.total - fitted) * chunk,
+            )?;
+        }
+        self.skip = (parting, self.total - fitted);
+        self.range.limit(u64::from(fitted) * chunk);
+        Ok(())
+    }
+
+    /// Whether the pool's chunks lie in one run from the range's base: none
+    /// skipped under any of them.
+    #[must_use]
+    pub fn in_one_run(&self) -> bool {
+        self.skip.0 >= self.stated()
+    }
+
+    /// Whether the state's chunks end where the activation starts: only
+    /// then is what a smaller rung lends one span with them.
+    #[must_use]
+    pub fn state_meets_activation(&self) -> bool {
+        self.under_state().0 == self.total
+    }
+
+    /// The state chunks the runtime counts: the range's but those skipped
+    /// ([`Chunks::state_fitted`]).
     #[must_use]
     pub fn stated(&self) -> u32 {
         self.total - self.skip.1
     }
 
     /// Where the runtime's physical chunk `physical` lies in the range: the
-    /// same chunk under the fit, past the skipped chunks from there.
+    /// same chunk under where the pool parts, past the skipped chunks from
+    /// there.
     #[must_use]
     fn at(&self, physical: u32) -> u32 {
         if physical >= self.skip.0 {
@@ -416,11 +518,30 @@ impl Chunks {
     }
 
     /// The pages backing the first `chunks` chunks would take beyond what
-    /// is backed now ([`Range::growth_of`]).
-    pub fn growth_for(&self, chunks: u32) -> Result<u64> {
+    /// is backed now ([`Range::growth_of`]): as the range lays them now,
+    /// or (`placed`, with whether the pool lies in one run) as a pool of
+    /// that many would be placed ([`Chunks::state_fitted`]).
+    pub fn growth_for(&self, chunks: u32, placed: Option<bool>) -> Result<u64> {
+        let chunk = self.layout.chunk_bytes;
+        let parted = match placed {
+            Some(contiguous) => {
+                let chunks = chunks.min(self.total);
+                let parting = self.parting(chunks, contiguous);
+                if parting < chunks {
+                    (
+                        u64::from(parting) * chunk,
+                        u64::from(self.total - chunks) * chunk,
+                    )
+                } else {
+                    (u64::MAX, 0)
+                }
+            }
+            None => self.range.parted(),
+        };
         self.range.growth_of(
             self.segments_for(u64::from(chunks)),
-            u64::from(chunks) * self.layout.chunk_bytes,
+            u64::from(chunks) * chunk,
+            parted,
         )
     }
 

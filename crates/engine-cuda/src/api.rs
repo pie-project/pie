@@ -676,6 +676,11 @@ impl Engine for Cuda {
         if let Some(hook) = self.before_arming.as_mut() {
             hook(&mut staged.shell).map_err(Error::Load)?;
         }
+        // Another worker reads the kv pages in place: the pool's chunks lie
+        // in one run from its base.
+        if residency.kv_export {
+            staged.shell.keep_contiguous();
+        }
         let mut shell = staged.finish().map_err(fault)?;
 
         shell.mount_adapters(self.boot.adapter_dir.clone());

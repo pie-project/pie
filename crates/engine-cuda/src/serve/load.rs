@@ -1527,7 +1527,7 @@ impl Shell {
             .fit_the_card(bodies, shell.held_for_fires, false, &resident)?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
-                "[arm-trace] fit before arming: {} pages, {} chunks, room {} MiB (fresh {})",
+                "[arm-trace] claim before arming: {} pages, {} chunks, room {} MiB (fresh {})",
                 fitted.fit,
                 fitted.chunks,
                 fitted.room >> 20,
@@ -1694,31 +1694,51 @@ impl Staged {
             armed?;
         }
         let resident = footprint(&shell, device_total, free_before);
-        // Arming fired every composition, so the activation is at its high
-        // water; a load that records no bodies, or arms at its starting
-        // weight residency, has fired none yet, and keeps the bodies'
-        // allowance out of the cache rows till it arms.
         // Whatever armed a body, the range stays where it lies: the bodies
         // name addresses in it, and a fit that reserved it anew (a flat
         // range's does) would leave them naming the old one.
         if shell.cache.body_stats().census.bodies > 0 {
             shell.pools.pin();
         }
-        let settled = shell.records_bodies() && !deferred;
-        let bodies = if deferred { shell.bodies_mem as u64 } else { 0 };
-        let fitted = shell
-            .pools
-            .fit_the_card(bodies, shell.held_for_fires, settled, &resident)?;
-        if shell.arena.has_rungs() {
-            // The runtime is stated the range whole, what a later fit may
-            // yet give the cache rows with it, and keeps the pool under it
-            // by what this fit holds back. The state's chunks then end
-            // where the activation starts, so what a rung lends and what
-            // lies under it are one span.
+        // No fire of the load's own is still in flight over the chunks the
+        // last fit lets go and lays again.
+        shell.device.synchronize()?;
+        let fitted = if deferred && shell.arena.has_rungs() {
+            // The bodies arm after the runtime has read the pool, so the
+            // fit that follows them cannot be the one it is stated: it is
+            // stated the range whole, what that fit may yet give the cache
+            // rows with it, and keeps the pool under it by what this fit
+            // holds back for the bodies' allowance and the activation no
+            // fire has backed yet (`Shell::settle_fit` lifts it). The
+            // state's chunks then end where the activation starts, so what
+            // a rung lends and what lies under it are one span.
+            let fitted = shell.pools.fit_the_card(
+                shell.bodies_mem as u64,
+                shell.held_for_fires,
+                false,
+                &resident,
+            )?;
+            // The fit may have reserved the range anew: the carves laid at
+            // the activation's end are backed where it now lies.
+            shell.arena.ensure_rungs(&mut shell.pools)?;
             shell.pools.state_whole();
-        }
+            fitted
+        } else {
+            // Everything the load puts on the device is there, its bodies
+            // among it: the pool is what the card has left, and the range
+            // is stated as exactly the chunks backed below. Arming fired
+            // every composition, so the activation is at its high water; a
+            // load that records no bodies has fired none, and keeps the
+            // whole span for its fires; one that arms later and lends no
+            // rung keeps the bodies' allowance out as well.
+            let bodies = if deferred { shell.bodies_mem as u64 } else { 0 };
+            let settled = shell.records_bodies() && !deferred;
+            shell
+                .pools
+                .fit_and_state(bodies, shell.held_for_fires, settled, &resident)?
+        };
         // A load that arms later may have had its range reserved anew by
-        // this fit: the workspaces are laid where it now lies.
+        // its fit: the workspaces are laid where it now lies.
         shell.lay_workspace()?;
         // The load's last fit backs what it took, here and not later: every
         // page the load serves is backed before anything else can take the
@@ -1849,6 +1869,11 @@ impl Shell {
     /// before the load returns.
     pub(super) fn settle_fit(&mut self) -> Result<()> {
         self.pools.pin();
+        // A pool stated as the chunks it backs has nothing held back to
+        // lift: its load held the bodies' allowance out of it.
+        if !self.pools.stated_whole() {
+            return Ok(());
+        }
         let resident = footprint(self, self.card.0, self.card.1);
         let before = (self.pools.declared_bytes(), self.pools.kept_back_bytes());
         let fitted = self

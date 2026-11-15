@@ -601,14 +601,18 @@ pub struct Pools {
     /// A graph body names addresses in the range: it is never reserved
     /// anew ([`Pools::pin`]).
     pinned: bool,
-    /// The chunks stated to the runtime where the fit may yet give the
-    /// cache rows more than it holds now ([`Pools::state_most`]).
+    /// The chunks stated to the runtime where a fit after the load may yet
+    /// give the cache rows more than it holds now ([`Pools::state_whole`]):
+    /// only a load that arms its bodies after it has stated its pool.
     stated: Option<u32>,
-    /// The range is reserved anew to the fit even where it maps on demand:
-    /// the pool's planes then span about what the fit holds, not the asked
-    /// count (reserved for the asked count, Qwen3.5-0.8B's c64 ran ~1%
-    /// slower on sm_120).
+    /// The range is reserved anew to what the card could back even where
+    /// it maps on demand: the pool's planes then span about what the fit
+    /// holds, not the asked count (reserved for the asked count,
+    /// Qwen3.5-0.8B's c64 ran ~1% slower on sm_120).
     whole_fit: bool,
+    /// The pool's chunks lie in one run from its base
+    /// ([`Pools::keep_contiguous`]).
+    contiguous: bool,
     airborne: Option<Airborne>,
     host: Option<HostKv>,
     disk: Option<DiskKv>,
@@ -1015,6 +1019,7 @@ impl Pools {
             pinned: false,
             stated: None,
             whole_fit: false,
+            contiguous: false,
             airborne: None,
             host: None,
             disk: None,
@@ -1162,7 +1167,10 @@ impl Pools {
     }
 
     /// The bytes of the chunks stated to the runtime that the fit does not
-    /// hold for the cache rows now.
+    /// hold for the cache rows now. None but on a load that arms its bodies
+    /// at the starting weight residency, after it stated its pool
+    /// ([`Pools::state_whole`]): every other load states the chunks its
+    /// last fit backed ([`Pools::fit_and_state`]).
     #[must_use]
     pub fn kept_back_bytes(&self) -> u64 {
         self.stated.map_or(0, |stated| {
@@ -1175,6 +1183,13 @@ impl Pools {
     #[must_use]
     pub fn activation_unheld_bytes(&self) -> u64 {
         self.chunks.activation_unheld_bytes()
+    }
+
+    /// Whether the range is stated whole, past what the fit holds
+    /// ([`Pools::state_whole`]).
+    #[must_use]
+    pub fn stated_whole(&self) -> bool {
+        self.stated.is_some()
     }
 
     /// The range stays where it lies from here on: a body captured over it
@@ -1276,11 +1291,65 @@ impl Pools {
     /// the device already, for the refusal when not even that fits.
     /// `settled` says the activation has reached its high water: every
     /// composition fired while the bodies armed.
+    ///
+    /// This fit claims the pool's room and states nothing: before the
+    /// bodies arm it is what arming's fires seat their rows in and what
+    /// the bodies are kept out of, and the load's last fit is
+    /// [`Pools::fit_and_state`]. Only a load that arms after it stated its
+    /// pool keeps this one's chunks, and settles them with another.
     pub fn fit_the_card(
         &mut self,
         bodies: u64,
         programs: u64,
         settled: bool,
+        resident: &dyn core::fmt::Display,
+    ) -> Result<Fitted> {
+        self.fit(bodies, programs, settled, false, resident)
+    }
+
+    /// The load's last fit, once everything it puts on the device is there
+    /// (its bodies captured, where it records any): the pool is the chunks
+    /// the card backs now, and the range is stated as exactly those
+    /// ([`chunks::Chunks::state_fitted`]). The range was reserved for every chunk
+    /// the card could have backed, since a body names its base and the
+    /// activation above it and neither may move; the chunks it holds past
+    /// this fit are skipped, named by no chunk id and never backed. So the
+    /// chunks stated are the chunks [`Pools::back_whole`] backs, whatever
+    /// the bodies took: nothing is held back, and nothing was held for a
+    /// figure the bodies did not use.
+    ///
+    /// `bodies` is held out of it only for a load whose bodies arm after
+    /// it has stated its pool and that states no more than it backs.
+    pub fn fit_and_state(
+        &mut self,
+        bodies: u64,
+        programs: u64,
+        settled: bool,
+        resident: &dyn core::fmt::Display,
+    ) -> Result<Fitted> {
+        // What the load's own fires seated past where the pool parts goes
+        // back first: the fit reads the card without it.
+        self.chunks
+            .clear_past_parting(&mut self.pool, self.contiguous)?;
+        let fitted = self.fit(bodies, programs, settled, true, resident)?;
+        self.chunks.state_fitted(self.fitted_chunks(), self.contiguous)?;
+        Ok(fitted)
+    }
+
+    /// The pool's chunks stay in one run from the range's base, where
+    /// another worker reads its pages in place ([`Pools::export_kv`]): the
+    /// chunks skipped past the fit are those right under the activation,
+    /// and no rung lends its span to state.
+    pub fn keep_contiguous(&mut self) {
+        self.contiguous = true;
+    }
+
+    fn fit(
+        &mut self,
+        bodies: u64,
+        programs: u64,
+        settled: bool,
+        placed: bool,
         resident: &dyn core::fmt::Display,
     ) -> Result<Fitted> {
         // What the load dropped and the process keeps for reuse is free
@@ -1294,12 +1363,12 @@ impl Pools {
         // whole span, held or still to be (the first fire's activation, and
         // the room held for the bodies, must find it); once settled (every
         // composition armed, the activation at its high water), only the
-        // span a fire backed: what no fire backed is no fire's, and the cache
-        // rows take it.
-        let activation = if settled {
-            self.chunks
-                .activation_bytes()
-                .saturating_sub(self.chunks.activation_unheld_bytes())
+        // spans held backed in it (the arena's prefix a fire backed, the
+        // carves laid at its end, the workspaces, the staged runs): what
+        // nothing holds is no fire's, and the cache rows take it. A flat
+        // range's one allocation backs the whole span.
+        let activation = if settled && elastic::mapped_on_demand() {
+            self.chunks.activation_held_bytes()
         } else {
             self.chunks.activation_bytes()
         };
@@ -1410,7 +1479,9 @@ impl Pools {
                 .saturating_sub(unbacked.saturating_add(held).div_ceil(page));
             let mut fitted = fitted;
             while fitted > least {
-                let growth = self.chunks.growth_for(fitted)?;
+                let growth = self
+                    .chunks
+                    .growth_for(fitted, placed.then_some(self.contiguous))?;
                 if growth <= have {
                     break;
                 }
@@ -1472,24 +1543,37 @@ impl Pools {
         }
         // A flat range is one allocation made on its first commit: of the
         // fitted chunks, not of every chunk the asked count reserved.
-        // A range mapped on demand reserved anew before the activation is
-        // settled keeps room for what the settled fit may yet give the cache
-        // rows: the activation's span no fire backs, and the bodies'
-        // allowance past what arming holds. Reserved to this fit alone, the
-        // settled one could never grow past it.
+        // A range mapped on demand only reserves addresses, and a body
+        // recorded over it names its base and the activation above it, so
+        // it is reserved before the bodies arm for every chunk the card
+        // could back were nothing more to arrive: what it has free and
+        // what the range has backed, less the activation's prefix a fire
+        // backed. The load's last fit backs what the card then has and
+        // skips the rest ([`Pools::fit_and_state`]); reserved to this fit
+        // alone, that one could never grow past it.
         let flat = !elastic::mapped_on_demand();
-        let reshape = flat || (self.whole_fit && fitted < self.chunks.total());
+        let reserved = if flat || settled {
+            fitted
+        } else {
+            let backable = self
+                .pool
+                .spare_bytes(0)?
+                .saturating_add(self.chunks.backed_bytes())
+                .saturating_sub(
+                    self.chunks
+                        .activation_bytes()
+                        .saturating_sub(self.chunks.activation_unheld_bytes()),
+                )
+                .div_ceil(chunk);
+            u32::try_from(backable)
+                .unwrap_or(u32::MAX)
+                .max(fitted)
+                .min(most)
+        };
+        let reshape = flat || (self.whole_fit && reserved != self.chunks.total());
         // Never once a body names the range ([`Pools::pin`]): reshaped, its
         // planes would lie where the bodies captured over it no longer look.
         if reshape && !self.pinned && self.chunks.fresh() {
-            let reserved = if flat || settled {
-                fitted
-            } else {
-                let more = self.chunks.activation_unheld_bytes().saturating_add(bodies) / chunk;
-                fitted
-                    .saturating_add(u32::try_from(more).unwrap_or(u32::MAX))
-                    .min(self.chunks.total())
-            };
             self.chunks.reshape(&mut self.pool, reserved)?;
         }
         self.chunks
@@ -1945,28 +2029,23 @@ impl Pools {
     /// its end and its bytes, right under the fire's own chunks and on
     /// down through the state's last chunks. It lies in the chunks the
     /// runtime keeps free of state at every rung the fire may be cut to.
-    /// The state's chunks end where the activation starts wherever any of
-    /// the span is lent ([`Pools::state_whole`]), so the span is one.
+    /// The span is lent only where the state's chunks end where the
+    /// activation starts (`Pools::lent_bytes`), so the span is one.
     pub fn program_span(&self, under: u64, term: u64) -> Result<(u64, u64)> {
         let chunk = self.chunks.layout().chunk_bytes.max(1);
-        let lent = self.lent_bytes(under);
         let term = term.div_ceil(chunk) * chunk;
-        if lent == 0 {
-            return Ok((self.chunks.state_end(), term));
-        }
-        if self.chunks.state_end() != self.chunks.activation_base() {
-            return Err(Fault::program(
-                "store::chunks",
-                "the activation lends its span to state and does not start where the \
-                 state's chunks end",
-            ));
-        }
-        Ok((self.chunks.activation_base() + lent, term))
+        Ok((self.chunks.state_end() + self.lent_bytes(under), term))
     }
 
     /// The whole chunks of the span under a carve that leaves `under`
-    /// bytes below it, as the rungs state them lent.
+    /// bytes below it, as the rungs state them lent: none where the
+    /// state's chunks do not end where the activation starts
+    /// ([`chunks::Chunks::state_fitted`]), since what is lent and the state's last
+    /// chunks would not be one span.
     fn lent_bytes(&self, under: u64) -> u64 {
+        if !self.chunks.state_meets_activation() {
+            return 0;
+        }
         let chunk = self.chunks.layout().chunk_bytes.max(1);
         let act = u64::from(self.chunks.act_chunks());
         (under / chunk).min(act.saturating_sub(1)) * chunk
@@ -1981,9 +2060,12 @@ impl Pools {
     }
 
     /// States the range whole to the runtime: every chunk it reserved, the
-    /// fit's and those a later fit may give the cache rows, which the
-    /// runtime keeps the pool under by [`Pools::kept_back_bytes`]
-    /// meanwhile. The state's chunks then end where the activation starts.
+    /// fit's and those the fit after the bodies arm may give the cache
+    /// rows, which the runtime keeps the pool under by
+    /// [`Pools::kept_back_bytes`] meanwhile. For a load that arms at its
+    /// starting weight residency, after the runtime read its pool: any
+    /// other states what its last fit backed ([`Pools::fit_and_state`]).
+    /// The state's chunks then end where the activation starts.
     pub(crate) fn state_whole(&mut self) {
         self.stated = Some(self.chunks.total());
         self.paging.pages = self
@@ -3507,7 +3589,7 @@ impl Pools {
     /// The state pool as the runtime counts it, for fires of up to
     /// `max_tokens`: the chunks the fit left the cache rows, and the
     /// activation's right above them, the chunks past the fit skipped
-    /// ([`chunks::Chunks::skip_past`]).
+    /// ([`chunks::Chunks::state_fitted`]).
     ///
     /// `rungs`, each smaller rung's tokens and the bytes at the bottom of
     /// the activation's span state may take at it (backed already), each
@@ -3520,8 +3602,7 @@ impl Pools {
         let fitted = self.stated.map_or(self.fitted_chunks(), |stated| {
             stated.max(self.fitted_chunks())
         });
-        self.chunks.limit(fitted);
-        self.chunks.skip_past(fitted);
+        self.chunks.state_fitted(fitted, self.contiguous)?;
         // The state's chunks of the segment the stated activation starts in
         // are backed from here on, as the runtime counts them.
         match self.chunks.hold_boundary(&mut self.pool)? {
@@ -3533,8 +3614,8 @@ impl Pools {
         let rungs: Vec<(u32, u32)> = rungs
             .iter()
             .map(|&(tokens, under)| {
-                let under = u32::try_from(under / chunk).unwrap_or(u32::MAX);
-                (tokens, act.saturating_sub(under).max(1))
+                let lent = u32::try_from(self.lent_bytes(under) / chunk).unwrap_or(u32::MAX);
+                (tokens, act - lent)
             })
             .collect();
         let mut facts = self
@@ -3619,6 +3700,13 @@ impl Pools {
                 "a windowed kv row names its pages by its own window list, so it cannot be \
                  handed to another worker by the kv pages it reads"
                     .to_string(),
+            ));
+        }
+        if !self.chunks.in_one_run() {
+            return Err(Fault::program(
+                "store::chunks",
+                "a kv pool exported whose chunks do not lie in one run from its base: say it is \
+                 exported before the load's last fit (`Pools::keep_contiguous`)",
             ));
         }
         if !self.whole {
