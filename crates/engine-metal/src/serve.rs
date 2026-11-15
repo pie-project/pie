@@ -255,6 +255,9 @@ pub struct Attached {
 }
 
 pub struct Shell {
+    /// PROBE (M5 fill): with `PIE_PLAIN_GUEST_SCRATCH` set, the guests'
+    /// value scratch lies in this plain buffer, not the span.
+    plain_scratch: std::cell::RefCell<Option<crate::device::Buffer>>,
     tuning: kernels_metal::Tuning,
     device: Context,
     /// What the device held for this process before the load: the ledger's
@@ -1342,6 +1345,7 @@ impl PreparedLoad<'_> {
             ane,
             weights,
             rung: arena.floor_tokens(),
+            plain_scratch: std::cell::RefCell::new(None),
             batch_bottom: arena.rung_guest_top(arena.floor_tokens()),
             arena,
             pools,
@@ -1636,6 +1640,19 @@ impl Shell {
     /// The guest region a fire whose model carve ends at `top` lays its
     /// guests' scratch in: down to the backed span's bottom.
     fn guest_carve(&self) -> crate::program::GuestCarve {
+        static PLAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *PLAIN.get_or_init(|| std::env::var_os("PIE_PLAIN_GUEST_SCRATCH").is_some()) {
+            let bytes = self
+                .batch_bottom
+                .saturating_sub(self.arena.end() - self.pools.covered());
+            let mut held = self.plain_scratch.borrow_mut();
+            if held.as_ref().is_none_or(|buffer| buffer.bytes() < bytes) {
+                *held = crate::device::Buffer::zeroed(&self.device, bytes.max(1)).ok();
+            }
+            if let Some(buffer) = held.as_ref() {
+                return crate::program::GuestCarve::new(buffer.clone(), bytes, 0);
+            }
+        }
         crate::program::GuestCarve::new(
             self.arena.store().clone(),
             self.batch_bottom,
