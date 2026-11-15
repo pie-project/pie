@@ -306,17 +306,32 @@ pub struct WindowMap {
 /// Out of every buffer's range: a write there is dropped.
 pub const DROP: i32 = i32::MAX;
 
+/// The carried rows a fire of a `rung`-token rung replays at most, summed
+/// over its lanes (`engine::fire::rung_rows`): its rung's tokens. The one
+/// place the bound is read: a fire past it is refused at prepare, and a
+/// fire that replays lays each window's scratch for it.
+#[must_use]
+pub fn carried_room(rung: u32) -> u32 {
+    rung
+}
+
 impl WindowMap {
     /// The map of the window covering lanes `lane0..lane0 + lanes` whose own
     /// rows are cut by `indptr` (window-local), for rs list slots of
     /// `page_tokens` rows. A buffer row is `q · page_tokens + token` of the
     /// slot's grain index `q` (each plane maps `q` to its own block before
     /// it reads or writes, `dispatch/rs.rs`).
+    ///
+    /// `rung`: the fire's rung where it replays carried rows: the window's
+    /// scratch holds the rung's own rows and its carried room
+    /// ([`carried_room`]), one size at every such fire of the rung. `None`:
+    /// the fire replays nothing, the scratch holds the window's own rows.
     pub fn of(
         plans: &[LanePlan],
         indptr: &[i32],
         lane0: u32,
         page_tokens: u32,
+        rung: Option<u32>,
     ) -> Result<WindowMap> {
         let mut map = WindowMap::default();
         let rows_own = indptr.last().copied().unwrap_or(0).max(0) as usize;
@@ -354,15 +369,6 @@ impl WindowMap {
                 }
             }
             let replay = map.from_buffer.len() as i32 - begin;
-            // A lane replays at most the contract's bound: a fire that asks
-            // more fails here, never sizing a replay the warm ladder did not.
-            if replay > engine::fire::UNFOLDED_ROWS as i32 {
-                return Err(Fault::Ceiling {
-                    what: "carried rows a lane replays (engine::fire::UNFOLDED_ROWS)",
-                    need: u64::try_from(replay).unwrap_or(0),
-                    have: u64::from(engine::fire::UNFOLDED_ROWS),
-                });
-            }
             for i in 0..rows {
                 map.from_buffer.push(0);
                 map.buffer_row.push(0);
@@ -375,7 +381,22 @@ impl WindowMap {
                 }
             }
         }
-        let ext = map.from_buffer.len().max(16).next_power_of_two();
+        let laid = map.from_buffer.len();
+        let ext = match rung {
+            Some(rung) => {
+                let room = rung as usize + carried_room(rung) as usize;
+                if laid > room {
+                    return Err(Fault::Ceiling {
+                        what: "carried rows a fire's lanes replay (the tokens of the rung it runs at)",
+                        need: laid as u64,
+                        have: room as u64,
+                    });
+                }
+                room
+            }
+            None => laid,
+        };
+        let ext = ext.max(16).next_power_of_two();
         map.from_buffer.resize(ext, 0);
         map.buffer_row.resize(ext, 0);
         map.own_row.resize(ext, 0);

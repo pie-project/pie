@@ -104,6 +104,8 @@ pub(crate) struct Latch {
     sink: Option<engine::CompletionSink>,
     holds: std::sync::atomic::AtomicUsize,
     fault: std::sync::Mutex<Option<String>>,
+    /// What the step's reported lanes wrote, told when it lands.
+    writes: std::sync::Mutex<Vec<engine::KvWrites>>,
     /// The step's outcome once every hold is released: `Some(fault)`.
     landed: std::sync::Mutex<Option<Option<String>>>,
     done: std::sync::Condvar,
@@ -117,6 +119,7 @@ impl Latch {
             sink,
             holds: std::sync::atomic::AtomicUsize::new(1),
             fault: std::sync::Mutex::new(None),
+            writes: std::sync::Mutex::new(Vec::new()),
             landed: std::sync::Mutex::new(None),
             done: std::sync::Condvar::new(),
         })
@@ -135,6 +138,14 @@ impl Latch {
         self.holds.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// The step's reported lanes wrote `writes`: told with its landing.
+    pub(crate) fn report(&self, writes: Vec<engine::KvWrites>) {
+        self.writes
+            .lock()
+            .expect("writes lock poisoned")
+            .extend(writes);
+    }
+
     pub(crate) fn release(&self, outcome: Result<(), String>) {
         if let Err(why) = outcome {
             self.fault
@@ -151,17 +162,28 @@ impl Latch {
             "xla step landed"
         );
         let fault = self.fault.lock().expect("fault lock poisoned").take();
-        *self.landed.lock().expect("landed lock poisoned") = Some(fault.clone());
-        self.done.notify_all();
+        // The sink hears the step (its fold reports with it) before a
+        // waiting settle wakes: an engine that settles inside submit tells
+        // the sink before submit returns.
         if let Some(sink) = &self.sink {
             sink(
                 self.at,
-                match fault {
-                    None => engine::StepOutcome::Committed,
+                match fault.clone() {
+                    None => {
+                        let writes =
+                            std::mem::take(&mut *self.writes.lock().expect("writes lock poisoned"));
+                        if writes.is_empty() {
+                            engine::StepOutcome::Committed
+                        } else {
+                            engine::StepOutcome::Wrote(writes)
+                        }
+                    }
                     Some(why) => engine::StepOutcome::Faulted(why),
                 },
             );
         }
+        *self.landed.lock().expect("landed lock poisoned") = Some(fault);
+        self.done.notify_all();
     }
 }
 
@@ -1797,5 +1819,41 @@ mod latch_tests {
         let clean = Latch::new(at, None);
         clean.release(Ok(()));
         assert_eq!(clean.wait(), None);
+    }
+
+    /// A settle waiting on the latch wakes only after the sink heard the
+    /// step, its fold reports with it: what submit returns after under
+    /// `PIE_XLA_SYNC` the sink already knows.
+    #[test]
+    fn the_sink_hears_the_step_before_a_settle_wakes() {
+        use std::sync::{Arc, Mutex};
+        let at = engine::StepDone {
+            frame: engine::fire::FrameId(2),
+            step: 0,
+        };
+        let heard: Arc<Mutex<Vec<engine::StepOutcome>>> = Arc::default();
+        let into = Arc::clone(&heard);
+        let sink: engine::CompletionSink = Arc::new(move |_, outcome| {
+            // Slow on purpose: a settle woken first would pass the check
+            // below before this lands.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            into.lock().expect("heard lock").push(outcome);
+        });
+        let latch = Latch::new(at, Some(sink));
+        latch.hold();
+        latch.report(vec![engine::KvWrites::default()]);
+        latch.release(Ok(()));
+        let late = Arc::clone(&latch);
+        let event = std::thread::spawn(move || late.release(Ok(())));
+        assert_eq!(latch.wait(), None);
+        let heard = heard.lock().expect("heard lock");
+        assert_eq!(heard.len(), 1, "the sink heard the step before the settle woke");
+        assert!(
+            matches!(heard[0], engine::StepOutcome::Wrote(_)),
+            "with its fold reports: {:?}",
+            heard[0]
+        );
+        drop(heard);
+        event.join().expect("the event thread");
     }
 }

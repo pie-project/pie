@@ -145,6 +145,9 @@ pub enum Fault {
         entrypoint: &'static str,
         stamp: &'static str,
     },
+    /// The state pool does not seat one working set beside the widest
+    /// fire's activation under the device's allowance: the load's fit.
+    FitShort(engine::chunk::FitShort),
 
     Backing {
         step: &'static str,
@@ -353,6 +356,7 @@ impl fmt::Display for Fault {
                  this key is one the load's walk does not reach, and the fire is refused rather \
                  than compiled while serving"
             ),
+            Self::FitShort(short) => write!(f, "{short}"),
         }
     }
 }

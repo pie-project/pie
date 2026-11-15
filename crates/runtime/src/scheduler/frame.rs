@@ -133,7 +133,7 @@ struct SealedFrame {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum FramePlan {
+pub(crate) enum FramePlan {
     Dispatch(Vec<Vec<u64>>),
     Hold(Duration),
     Park,
@@ -175,7 +175,7 @@ impl FromIterator<u64> for QueuedFireIds {
     }
 }
 
-pub(super) struct FramePolicy {
+pub(crate) struct FramePolicy {
     k: usize,
     max_wave_tokens: usize,
     max_wave_rows: usize,

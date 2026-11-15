@@ -14,6 +14,9 @@ use engine_metal::{Lane, Shell};
 use super::a_scattered_pool_serves_the_same_logits::{Fixture, fixture_of, load_near, same, word};
 
 const CONTEXT: u32 = 1024;
+/// The rows the walk carries into its second fire: past one rs slot's
+/// tokens, so its pages span slots.
+const CARRIED: u32 = 16;
 
 fn buffer(pages: &[u32], folded: u32, fold: u32) -> RsVerb {
     RsVerb::Buffer {
@@ -32,10 +35,10 @@ struct Refs {
     rs: Vec<u32>,
 }
 
-/// Buffers `UNFOLDED_ROWS + 1` rows, folding one, then carries the rest
+/// Buffers `CARRIED + 1` rows, folding one, then carries the rest
 /// into a one-token fire: both fires' logits.
 fn walk(shell: &mut Shell, fixture: &Fixture, rs_pages: u32, refs: Option<&Refs>) -> Vec<Vec<f32>> {
-    let bound = engine::fire::UNFOLDED_ROWS;
+    let bound = CARRIED;
     let rows: Vec<u32> = (0..=bound).map(|at| (7 + at * 37) % 256).collect();
     let next = [42u32];
     let seat_pages: Vec<u32> = (0..rs_pages).collect();
@@ -97,7 +100,7 @@ fn an_rs_page_past_the_first_buffer_holds_its_rows() {
     let segment = facts.segment_chunks;
     let per = |id| facts.shape(id).map_or(1, |s| s.slots_per_chunk);
     // The walk's rows (the bound and one more) over the rs slot's tokens.
-    let rs_pages = (engine::fire::UNFOLDED_ROWS + 2).div_ceil(layout.rs_tokens.max(1)) + 1;
+    let rs_pages = (CARRIED + 2).div_ceil(layout.rs_tokens.max(1)) + 1;
     // A chunk a shape, from the first segment past the seats: under the
     // buffer cap, a buffer past the first.
     let first = layout.free_chunk().div_ceil(segment).max(1) * segment;

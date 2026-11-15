@@ -470,7 +470,7 @@ async fn drain_detachable(pid: ProcessId) {
     }
 }
 
-async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
+pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     let (model, engine) = planner.locus();
     let handles = crate::inferlet::process::residency::kv_suspend_handles(pid, model, engine);
     let working_sets: HashSet<WorkingSetId> =
@@ -490,8 +490,14 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     for handle in fence.handles.iter() {
         handle.quiesce().await;
     }
-    let quiesced = began.elapsed();
     let stores = crate::store::registry::get(model, engine);
+    // A set a fire still folds by a count the device computes keeps its
+    // state where the engine holds the record, whose length is the engine's
+    // alone until that fold settles: the suspend waits for it, as it waits
+    // for the fires themselves, and every way a fire ends wakes it.
+    let rs_sets: Vec<_> = rs_working_sets.iter().copied().collect();
+    crate::store::rs::device_folds_settled(&stores.rs, &rs_sets).await;
+    let quiesced = began.elapsed();
     // Host room is for what is paused before what is cached: idle cache on
     // a host short of room goes on down to disk first, not dropped.
     let spilling = crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {

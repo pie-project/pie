@@ -193,6 +193,8 @@ pub struct RsHandles {
     pub replay_tok: u64,
 }
 
+const RS_LANE_BYTES: u64 = size_of::<kernels_cuda::runtime::channel::RsLane>() as u64;
+
 /// A buffering fire's rs tables, as `write_host` stages them.
 #[derive(Debug, Clone, Copy)]
 pub struct RsFire<'a> {
@@ -667,14 +669,14 @@ impl Inputs {
                 permutation: take(rows * 4),
             })
             .collect();
-        // A lane's replayed rows past `REPLAYED` widen no body and are rare:
-        // the tables hold every staged row replayed once more and that many
-        // a lane beside, and the pages they lie in.
+        // A fire replays no more rows than the widest bucket's tokens
+        // (`engine::fire::rung_rows`): the tables hold those, and the pages
+        // they and its own rows lie in.
         let rs = rs_page_tokens.map(|tokens| {
-            let replay_cap = rows + lanes * u64::from(crate::store::rs::REPLAYED);
+            let replay_cap = rows;
             let pages_cap = (replay_cap + rows).div_ceil(u64::from(tokens.max(1))) + 2 * lanes;
             RsAt {
-                lanes: take(lanes * 16),
+                lanes: take(lanes * RS_LANE_BYTES),
                 pages: take(pages_cap * 8),
                 pages_cap,
                 replay_tok: take(replay_cap * 4),
@@ -1117,7 +1119,7 @@ impl Inputs {
                 let raw = unsafe {
                     core::slice::from_raw_parts(
                         lanes_tab.as_ptr().cast::<u8>(),
-                        lanes_tab.len() * 16,
+                        lanes_tab.len() * RS_LANE_BYTES as usize,
                     )
                 };
                 put(at.lanes, raw, "staged rs lanes")?;

@@ -1784,6 +1784,8 @@ impl Shell {
         // record piece, its rs verb's pages.
         let mut lane_records: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         let mut lane_verbs: Vec<engine::fire::RsVerb> = Vec::with_capacity(lanes.len());
+        // Carried rows the fire's lanes replay, summed over them.
+        let mut carried: u32 = 0;
         let mut lane_pages: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         let mut lane_windows: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         for (at, seated) in lanes.iter().enumerate() {
@@ -1867,6 +1869,27 @@ impl Shell {
                     }
                 }
                 engine::fire::RsVerb::Fold => engine::fire::RsVerb::Fold,
+            });
+            if let engine::fire::RsVerb::Buffer { folded, .. } = seated.rs {
+                let rows = seated.lane.tokens.len() as u32;
+                let first = seated.first.unwrap_or(have);
+                let reads = engine::fire::buffered_reads(seated.mask, *folded, first, rows)
+                    .map_err(|e| Fault::Program {
+                        at: "serve::rs",
+                        why: format!("lane {at}: {e}"),
+                    })?;
+                carried += reads.iter().map(|r| r.len() as u32).sum::<u32>();
+            }
+        }
+        // A fire carries at most its rung's tokens of carried rows, summed
+        // over its lanes (`engine::fire::rung_rows`): one past it is refused
+        // here, before the fire writes anything.
+        let rung = crate::rs::carried_room(descriptor.bucket);
+        if carried > rung {
+            return Err(Fault::Ceiling {
+                what: "carried rows a fire's lanes replay (the tokens of the rung it runs at)",
+                need: u64::from(carried),
+                have: u64::from(rung),
             });
         }
         if !copies.is_empty() {
@@ -2411,6 +2434,10 @@ impl Shell {
             (Some(layout), true) => {
                 let replay: Vec<i32> = rs_plans.iter().map(|p| p.replay as i32).collect();
                 let commit: Vec<i32> = rs_plans.iter().map(|p| p.commit as i32).collect();
+                // A fire that replays lays each window's scratch for the
+                // rung's own rows and its carried room; one that replays
+                // nothing, for its own rows alone.
+                let replays = carried > 0;
                 let mut maps = std::collections::HashMap::new();
                 for window in windows.all() {
                     if window.indptr_host.is_empty() {
@@ -2426,6 +2453,7 @@ impl Shell {
                         &window.indptr_host,
                         span.lane_offset,
                         paging.page_size.max(1),
+                        replays.then_some(descriptor.bucket),
                     )?;
                     maps.insert(
                         key,

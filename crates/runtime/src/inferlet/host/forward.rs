@@ -279,7 +279,7 @@ async fn materialize_channel(
                         continue;
                     }
                     ChannelPoll::Finalize(op) => {
-                        let finalized = crate::pipeline::fire::finalize_op_await(op).await?;
+                        let finalized = crate::pipeline::fire::finalize_op_await(op).await;
                         accessor.with(|mut access| {
                             crate::pipeline::fire::complete_finalize(access.get(), finalized);
                         });
@@ -331,7 +331,7 @@ pub(crate) async fn materialize_channel_blocking(
                         continue;
                     }
                     ChannelPoll::Finalize(op) => {
-                        let finalized = crate::pipeline::fire::finalize_op_await(op).await?;
+                        let finalized = crate::pipeline::fire::finalize_op_await(op).await;
                         crate::pipeline::fire::complete_finalize(ctx, finalized);
                         settle_ready_take = false;
                         continue;
