@@ -190,11 +190,22 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
         window_reach(window_left, cta_tile_q, group).div_ceil(u64::from(req.page_size))
             <= WINDOW_WHOLE * min_kv_chunk_size
     });
-    // Query tiles that already fill the grid (the graph's bound on them,
-    // under capture) read each request's kv whole: a split would only add
-    // partials and their fold. The tiles alone decide, so a captured plan
-    // keeps its layout across replays.
-    let filled = total_num_tiles_q >= u64::from(max_batch_size_if_split);
+    // Query tiles that already fill the grid read each request's kv whole:
+    // a split would only add partials and their fold. Under capture the
+    // graph's rows decide, packed and cut at the tile (as CUDA's plan,
+    // `kernels_cuda::attn::plan::prefill`), not the tiles it is padded to:
+    // those count a tile a lane past the first, the bound of a replay whose
+    // every lane is its own request, and would leave one long request's few
+    // tiles walking its whole prefix on a fraction of the grid. A replay
+    // whose lanes do fill the grid is still split, one chunk a tile
+    // (`search_kv_chunk_size`), and the fold has one partial to take. The
+    // rows alone decide, so a captured plan keeps its layout across replays.
+    let filling_tiles = if req.enable_cuda_graph {
+        (u64::from(req.total_num_rows) * group).div_ceil(u64::from(cta_tile_q))
+    } else {
+        total_num_tiles_q
+    };
+    let filled = filling_tiles >= u64::from(max_batch_size_if_split);
     let (split_kv, kv_chunk_size_in_pages) = if whole || filled {
         (
             false,
@@ -450,6 +461,54 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn captured<'a>(qo_indptr: &'a [i32], kv_indptr: &'a [i32], rows: u32, lanes: u32) -> Request<'a> {
+        let requests = qo_indptr.len() as u32 - 1;
+        Request {
+            qo_indptr,
+            kv_indptr,
+            total_num_rows: rows,
+            batch_size: lanes,
+            lane_offset: 0,
+            live: Live {
+                requests,
+                lane_offset: 0,
+                row_offset: 0,
+                rows: *qo_indptr.last().unwrap() as u32,
+            },
+            num_qo_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            page_size: 16,
+            enable_cuda_graph: true,
+            window_left: None,
+            ctas_per_sm: 2,
+        }
+    }
+
+    #[test]
+    fn a_rung_of_many_lanes_splits_one_long_request_and_still_fills_with_many() {
+        // A 256-row rung that may hold 256 lanes, fired by one request of
+        // 256 rows over 16384 keys: its eight query tiles split the prefix.
+        let one = captured(&[0, 256], &[0, 1024 + 16], 256, 256);
+        let sched = schedule("test", &one, &Device::L40S).unwrap();
+        assert!(sched.split_kv, "one long request on a wide rung splits its prefix");
+        assert!(
+            sched.new_batch_size > 8,
+            "its {} work items spread past its eight query tiles",
+            sched.new_batch_size
+        );
+        // The same rung fired by 256 one-row requests fills the grid with
+        // their tiles: still split (the layout is the rung's), one chunk a
+        // tile, so the fold has one partial a row to take.
+        let qo: Vec<i32> = (0..=256).collect();
+        let kv: Vec<i32> = (0..=256).map(|lane| lane * 64).collect();
+        let many = captured(&qo, &kv, 256, 256);
+        let sched = schedule("test", &many, &Device::L40S).unwrap();
+        assert!(sched.split_kv, "the rung's layout stands across replays");
+        assert_eq!(sched.new_batch_size, 256, "one work item a request: one chunk a tile");
+        assert!(sched.new_batch_size as usize <= sched.padded_batch_size);
+    }
 
     #[test]
     fn the_partials_hold_every_row_the_split_writes() {
