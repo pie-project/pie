@@ -1428,13 +1428,25 @@ impl Shell {
             }
             let rows = seat.rows * u64::from(read) / u64::from(grown.max(1));
             let rows = u32::try_from(rows).unwrap_or(u32::MAX);
-            let each = rows / clips;
-            if each == 0 {
+            // A clip's box divides by the plan's token patch, as a fire's
+            // clips must: each clip is whole patches (`[pt, ph, pw]`, a
+            // single voxel without one) laid along t, the first taking what
+            // the even split leaves, at most the seat's clips of them.
+            let [pt, ph, pw] = seat.token_patch.unwrap_or([1, 1, 1]).map(|p| p.max(1));
+            let patch = pt.saturating_mul(ph).saturating_mul(pw);
+            let patches = rows / patch;
+            let clips = clips.min(patches);
+            if clips == 0 {
                 continue;
             }
+            let each = patches / clips;
             let boxes: Vec<[u32; 3]> = (0..clips)
-                .map(|at| [each + if at == 0 { rows % clips } else { 0 }, 1, 1])
+                .map(|at| {
+                    let units = each + if at == 0 { patches % clips } else { 0 };
+                    [units * pt, ph, pw]
+                })
                 .collect();
+            let rows = patches * patch;
             let payload = vec![0u8; (u64::from(rows) * row_bytes) as usize];
             let owned = self.synthetic_lanes_with(&[(class, 1)], &[]);
             let seated = Self::seated(&owned);
