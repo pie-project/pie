@@ -85,3 +85,39 @@ pass on average.
   on the device, as `text-completion-py` does, is the obvious next step.
 - Episodes run as separate processes. Running many episodes in one inferlet
   would put more lanes in each pass.
+
+## Against an HTTP orchestrator
+
+`baseline.py` runs the same episodes the way s3 and vLLM-based trainers do: an
+outside orchestrator re-sends each running agent's whole context to
+`/v1/completions` in chunks of up to 1,024 tokens and adds messages between
+chunks. It takes vLLM (launch it with `--logprobs-mode processed_logprobs`, so
+logprobs are after temperature, as here) or pie's own `/v1/completions`.
+`bench.py` runs both drivers on the same seeds and prints team episodes per hour,
+the pie / http ratio, and whether both generated about the same number of tokens
+(within 15%; otherwise the ratio is marked not comparable).
+
+```bash
+pip install httpx tokenizers
+python bench.py --task maze --n-agents 4 --episodes 2 --concurrency 2 --budget-tokens 1024 --out-dir bench-out
+python bench.py --task aggregate --n-agents 4 --episodes 32 --concurrency 8 --out-dir bench-out
+```
+
+Same M5, same server: the http side is pie's own `/v1/completions`, so engine
+and model are identical and only the driver differs.
+
+| task | pie | http | pie / http | tokens per episode |
+| --- | --- | --- | --- | --- |
+| maze, depth 2, 2 episodes, budget 1,024 | 79.6 episodes/h, 74 tok/s | 57.1 episodes/h, 50 tok/s | 1.39x | 3,356 vs 3,144, matched |
+| aggregate, 32 episodes, 8 at a time | 2,375 episodes/h, 139 tok/s | 6,579 episodes/h, 270 tok/s | 0.36x | 210 vs 148, not matched |
+
+Long episodes favour the inferlet: the http side re-sent 567k prompt tokens per
+maze episode, while the inferlet never re-reads context. Short episodes favour
+the request path: the server batches every agent's request into each pass and
+serves most re-sent context from its prefix cache, while the inferlet makes a
+host round trip per token at about 1.3 lanes per pass.
+
+pie's `/v1/completions` drops `<tool_call>` markup from raw completions and never
+fires the `</tool_call>` stop, so `baseline.py` rebuilds each chunk's text from
+the returned tokens and cuts it at the first stop itself; token ids come from the
+local Qwen3 tokenizer.
