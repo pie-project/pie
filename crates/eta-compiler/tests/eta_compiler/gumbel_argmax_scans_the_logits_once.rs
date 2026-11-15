@@ -184,6 +184,93 @@ fn gumbel_argmax_scans_the_logits_once_every_case() {
     an_unscaled_gumbel_max_folds_too_with_no_divisor();
     a_uniform_draw_is_not_a_gumbel_max_and_stays_as_traced();
     no_row_stream_takes_the_argmax_a_gumbel_scan_owns();
+    what_a_scan_leaves_unwritten_is_stated_spent();
+}
+
+/// The values a region states spent, and those its kernel names bytes of on
+/// some SIMT backend: a generated kernel addresses a value as
+/// `offsets[<its id>]` and no other way.
+fn spent_and_named(container: TraceContainer, vocab: u32) -> (Vec<u32>, Vec<u32>) {
+    let served = Served::of(vocab);
+    let bound = served.bind(container).expect("the subject binds");
+    let stages = compile_bound(&bound);
+    let stage = stages.first().expect("one stage");
+    let region = stage.fused.regions.first().expect("one fused region");
+    let mut spent = eta_compiler::codegen::cuda::spent_values(stage, region);
+    spent.sort_unstable();
+    let sources = [
+        eta_compiler::codegen::cuda::emit_region("gumbel", stage, region)
+            .expect("the CUDA emitter serves it"),
+        eta_compiler::codegen::hip::emit_region("gumbel", stage, region)
+            .expect("the HIP emitter serves it"),
+    ]
+    .map(|source| {
+        let entry = source
+            .find("__global__ void gumbel")
+            .expect("the entry point is in the source");
+        source[entry..].replace("intrinsic_offsets[", "")
+    });
+    let values = stage.normalized.value_types.len() as u32;
+    let named = (0..values)
+        .filter(|value| {
+            sources
+                .iter()
+                .any(|source| source.contains(&format!("offsets[{value}]")))
+        })
+        .collect();
+    (spent, named)
+}
+
+/// A scan of the model's row leaves the ops between the row and the argmax
+/// out of the kernel, and a reshape that changes no bytes is read as its
+/// source: those results are stated spent, so a lane holds no bytes for
+/// rows nothing writes. What the kernel does address is never among them:
+/// the random stream's state and the divisor the scan reads, the token, and
+/// a reshape a put reads.
+fn what_a_scan_leaves_unwritten_is_stated_spent() {
+    const QWEN: u32 = 151_936;
+    // (the subject, its vocabulary, its spent values, values it must name)
+    let subjects: [(TraceContainer, u32, &[u32], &[u32]); 5] = [
+        // logits, their row, the scaled row, the noise, their sum.
+        (
+            subject(true, RngKind::Gumbel),
+            VOCAB,
+            &[0, 1, 4, 5, 6],
+            &[2, 3, 7],
+        ),
+        (
+            subject(false, RngKind::Gumbel),
+            VOCAB,
+            &[0, 1, 3, 4],
+            &[2, 5],
+        ),
+        (
+            decode_subject(true, QWEN),
+            QWEN,
+            &[0, 1, 4, 5, 6],
+            &[2, 3, 7],
+        ),
+        (decode_subject(false, QWEN), QWEN, &[0, 1, 3, 4], &[2, 5]),
+        // No scan: every op runs, and the row's reshape alone is a view.
+        (subject(true, RngKind::Uniform), VOCAB, &[1], &[0, 2, 3, 7]),
+    ];
+    for (index, (container, vocab, want, addressed)) in subjects.into_iter().enumerate() {
+        let (spent, named) = spent_and_named(container, vocab);
+        assert_eq!(spent, want, "subject {index}: spent");
+        for value in &spent {
+            assert!(
+                !named.contains(value),
+                "subject {index}: value {value} is stated spent and the kernel names it \
+                 (named {named:?})"
+            );
+        }
+        for value in addressed {
+            assert!(
+                named.contains(value),
+                "subject {index}: the kernel addresses value {value} (named {named:?})"
+            );
+        }
+    }
 }
 
 /// The region as each SIMT backend that serves it emits it, whichever kind

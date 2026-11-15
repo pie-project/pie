@@ -9,7 +9,17 @@ pub use lifetime::{
 
 pub const ALIGN: u64 = 256;
 
+/// A lane's first bytes, no value's: where a value that takes no bytes is
+/// stated to lie.
 pub const DUMMY_BYTES: u64 = ALIGN;
+
+/// What an engine built to fill test slots writes over [`DUMMY_BYTES`]
+/// before a launch,
+/// so a kernel that reads a value stated to take no bytes answers wrongly
+/// where a test can see it: one byte repeated, which a device's byte fill
+/// writes; a float above any logit, which decides a maximum, an argmax or a
+/// sum that reads it; an index past any table; a state no draw starts from.
+pub const POISON: u32 = 0x7f7f_7f7f;
 
 pub const MAX_BYTES: u64 = (4 << 30) - ALIGN;
 

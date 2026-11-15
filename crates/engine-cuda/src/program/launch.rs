@@ -3,8 +3,8 @@ use eta_compiler::codegen::launch::{LaunchRegion, LaunchStagePlan};
 use eta_compiler::plan::{LibraryOp, RegionKind};
 use eta_exec::{
     Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LaneChannelSlot, LaneHeader, LaneRecord,
-    LaneShape, Launch, Launches, Layout, NO_TICKET, OpParams, SCRATCH_ALIGN, ValueDesc,
-    describe_launched, region_rows,
+    LaneShape, Launch, Launches, Layout, NO_TICKET, OpParams, SCRATCH_ALIGN, SCRATCH_DUMMY_BYTES,
+    SCRATCH_POISON, ValueDesc, describe_launched, region_rows,
 };
 use eta_ir::Dtype;
 use eta_ir::container::HostRole;
@@ -733,7 +733,9 @@ fn order_width(
 }
 
 /// The stage as this engine runs it: a launch a region across its blocks,
-/// a value a region's kernel never touches taking no bytes, the temporary
+/// a value a region's kernel never touches (what it streams through
+/// registers, what a scan of the model's row leaves unwritten, a reshape
+/// read as its source, a sampler's interior) taking no bytes, the temporary
 /// area what its kernels keep there.
 fn launches<'a>(plan: &'a LaunchStagePlan, blocks: &[u32], temporary: u64) -> Launches<'a> {
     Launches {
@@ -1213,6 +1215,13 @@ impl Prepared {
             rows
         };
         args.u32(rows).u32(stride);
+        // A value stated to take no bytes lies on the lane's dummy bytes: a
+        // build with `test-slot-fill` poisons them before every launch, so a
+        // kernel that reads one answers wrongly where a golden sees it.
+        // Without the feature no build writes anything here.
+        if cfg!(feature = "test-slot-fill") {
+            self.poison_dummy(stream)?;
+        }
         launch(
             &region.module,
             self.filled.saturating_mul(rows),
@@ -1368,6 +1377,37 @@ impl Prepared {
         }
         #[cfg(not(feature = "device"))]
         let _ = stream;
+        Ok(())
+    }
+
+    /// The fire's lanes' dummy bytes (the first [`SCRATCH_DUMMY_BYTES`] of
+    /// each lane's scratch, where every value that takes no bytes lies)
+    /// filled with [`SCRATCH_POISON`].
+    fn poison_dummy(&self, stream: *mut core::ffi::c_void) -> Result<()> {
+        #[cfg(feature = "device")]
+        {
+            use crate::device::dr;
+            // SAFETY: the scratch holds `filled` lanes `scratch_stride` apart,
+            // each no shorter than its dummy bytes.
+            let code = unsafe {
+                dr::cuMemsetD2D32Async(
+                    self.scratch,
+                    self.scratch_stride as usize,
+                    SCRATCH_POISON,
+                    (SCRATCH_DUMMY_BYTES / 4) as usize,
+                    self.filled as usize,
+                    stream.cast(),
+                )
+            };
+            if code != dr::CUresult::CUDA_SUCCESS {
+                return Err(Fault::Device {
+                    call: "cuMemsetD2D32Async",
+                    code: code as i32,
+                });
+            }
+        }
+        #[cfg(not(feature = "device"))]
+        let _ = (stream, SCRATCH_POISON, SCRATCH_DUMMY_BYTES);
         Ok(())
     }
 }
@@ -1719,13 +1759,13 @@ mod tests {
 
     /// What a lane's scratch is for the programs inferlets ship, at a
     /// vocabulary of 151,936: each value its own bytes; as laid here, with
-    /// the temporary area's share of it; and what it was while the area
-    /// held sixteen bytes an element of the widest row whatever ran and a
-    /// sampler's untouched values held bytes.
+    /// the temporary area's share of it; and what it was while the rows a
+    /// scan of the model's row leaves unwritten, and the reshapes read as
+    /// their sources, held bytes.
     #[test]
     fn a_shipped_programs_scratch_a_lane() {
         const WAS: [u64; 6] = [
-            9_268_992, 5_775_360, 5_471_488, 3_647_232, 4_863_488, 4_863_232,
+            3_505_408, 4_265_984, 3_040_512, 1_216_256, 2_508_544, 3_647_744,
         ];
         let vocab = shipped::QWEN_VOCAB;
         let totals: Vec<(&str, u64, u64, u64)> = shipped::all(vocab)
@@ -1744,17 +1784,78 @@ mod tests {
         assert_eq!(
             totals,
             [
-                ("top-p", 9_312_512, 3_505_408, 921_600),
-                ("top-k + top-p", 9_616_896, 4_265_984, 921_600),
-                ("gumbel-max", 5_512_960, 3_040_512, 0),
-                ("greedy", 3_688_704, 1_216_256, 0),
-                ("top logprobs", 6_728_960, 2_508_544, 76_032),
-                ("sorted", 8_551_168, 3_647_744, 1_215_488),
+                ("top-p", 9_312_512, 2_898_432, 921_600),
+                ("top-k + top-p", 9_616_896, 3_658_240, 921_600),
+                ("gumbel-max", 5_512_960, 1_792, 0),
+                ("greedy", 3_688_704, 768, 0),
+                ("top logprobs", 6_728_960, 1_900_800, 76_032),
+                ("sorted", 8_551_168, 3_040_000, 1_215_488),
             ]
         );
         for ((name, _, now, _), was) in totals.iter().zip(WAS) {
-            assert!(*now <= was, "{name}: {now} bytes a lane, {was} before");
+            assert!(*now < was, "{name}: {now} bytes a lane, {was} before");
         }
+    }
+
+    /// No generated kernel of the programs inferlets ship names the bytes
+    /// of a value its stage states to take none (a generated kernel
+    /// addresses a value as `offsets[<its id>]` and no other way), and no
+    /// such value is one a region is handed, hands on or puts. A greedy or
+    /// a Gumbel-max lane, whose one argmax scans the model's row, holds no
+    /// row of the vocabulary at all.
+    #[test]
+    fn no_kernel_names_a_value_that_takes_no_bytes() {
+        let vocab = shipped::QWEN_VOCAB;
+        let mut unwritten_rows = Vec::new();
+        for (name, traced) in shipped::all(vocab) {
+            let (stages, package) = shipped::compiled(&traced, vocab);
+            let ([stage], [plan]) = (&stages[..], &package.plans[..]) else {
+                panic!("{name}: one stage");
+            };
+            let descriptors = describe_values(plan, Extents::default()).expect("static shapes");
+            let laid = lay_out(plan, &descriptors).expect("fits");
+            let hollow: Vec<u32> = plan
+                .fused
+                .iter()
+                .flat_map(|region| region.spent.iter().copied())
+                .collect();
+            for &value in &hollow {
+                assert_eq!(laid.values[value as usize], 0, "{name}: value {value}");
+                for region in &plan.fused {
+                    assert!(
+                        !region.inputs.contains(&value)
+                            && !region.outputs.contains(&value)
+                            && region.sinks.iter().all(|sink| sink.value != value),
+                        "{name}: value {value} takes no bytes and a region holds it"
+                    );
+                }
+            }
+            for (index, (region, lowered)) in
+                stage.fused.regions.iter().zip(&plan.fused).enumerate()
+            {
+                if lowered.kind != RegionKind::Generated {
+                    continue;
+                }
+                let source = eta_compiler::codegen::cuda::emit_region("kernel", stage, region)
+                    .unwrap_or_else(|why| panic!("{name}: region {index}: {why:?}"))
+                    .replace("intrinsic_offsets[", "");
+                for &value in &hollow {
+                    assert!(
+                        !source.contains(&format!("offsets[{value}]")),
+                        "{name}: region {index} names value {value}, which takes no bytes"
+                    );
+                }
+            }
+            let rows = descriptors
+                .iter()
+                .zip(&laid.values)
+                .filter(|(descriptor, at)| descriptor.last == vocab && **at != 0)
+                .count();
+            if rows == 0 {
+                unwritten_rows.push(name);
+            }
+        }
+        assert_eq!(unwritten_rows, ["gumbel-max", "greedy"]);
     }
 
     /// The kernel of a region this engine states no temporary bytes for

@@ -707,8 +707,9 @@ pub mod dr {
             )
         })
     }
-    /// Only a value whose four bytes are one byte repeated (zero, as the
-    /// engine sets): HIP has no 32-bit 2D memset, so the rows go as bytes.
+    /// Only a value whose four bytes are one byte repeated (zero, and the
+    /// scratch poison of a test fill, as the engine sets): HIP has no 32-bit
+    /// 2D memset, so the rows go as bytes.
     pub unsafe fn cuMemsetD2D32Async(
         dst: CUdeviceptr,
         pitch: usize,

@@ -1219,9 +1219,73 @@ pub fn emitted_order(stage: &CompiledStage, region: &Region) -> Vec<u32> {
     streams.order.into_iter().map(|node| node as u32).collect()
 }
 
+/// The results of a generated `region`'s nodes whose bytes its kernel
+/// names nowhere, streams aside: what a node it leaves out
+/// ([`super::fused::left_out`]) would have written, and a reshape it reads
+/// as its source ([`super::fused::is_view`]). One a sink or another region
+/// reads keeps its bytes, and so does a left-out node's result that a node
+/// the kernel does run reads where it lies.
+fn unnamed_values(
+    stage: &CompiledStage,
+    region: &Region,
+    ops: &[OpView],
+    bases: &[u32],
+    direct: &super::fused::ArgmaxScan,
+) -> Vec<u32> {
+    let within = |node: usize| region.nodes.iter().any(|n| n.index() == node);
+    let mut readers: Vec<Vec<usize>> = vec![Vec::new(); stage.normalized.value_types.len()];
+    for (node, op) in ops.iter().enumerate() {
+        for arg in op.reads() {
+            if let Some(list) = readers.get_mut(arg as usize) {
+                list.push(node);
+            }
+        }
+    }
+    let view = |node: usize| super::fused::is_view(stage, region, &ops[node], bases[node]);
+    let left_out = |node: usize| super::fused::left_out(&direct.skipped, ops, node);
+    // Whether a node the kernel runs reads `value`'s own bytes: a view of
+    // it is read as it is.
+    let read_where_it_lies = |value: u32| -> bool {
+        let mut pending = vec![value];
+        while let Some(value) = pending.pop() {
+            for &reader in readers.get(value as usize).map_or(&[][..], Vec::as_slice) {
+                if !within(reader) {
+                    return true;
+                }
+                if left_out(reader) || super::fused::scans_model_row(direct, ops, reader) {
+                    continue;
+                }
+                if !view(reader) {
+                    return true;
+                }
+                pending.push(bases[reader]);
+            }
+        }
+        false
+    };
+    let read_past = crate::codegen::alias::escaping_values(region);
+    let mut unnamed = Vec::new();
+    for node in region.nodes.iter().map(|n| n.index()) {
+        let base = bases[node];
+        if view(node) {
+            if !read_past.contains(&base) {
+                unnamed.push(base);
+            }
+        } else if left_out(node) {
+            unnamed.extend(
+                (base..base + ops[node].results)
+                    .filter(|value| !read_past.contains(value) && !read_where_it_lies(*value)),
+            );
+        }
+    }
+    unnamed
+}
+
 /// The values of `region` its kernel neither reads nor writes in scratch,
 /// which so take no bytes there: what a generated region streams through
-/// registers, and what a sampler region's kernel leaves untouched.
+/// registers, the results of the nodes it leaves out and the reshapes it
+/// reads as their sources, and what a sampler region's kernel leaves
+/// untouched.
 #[must_use]
 pub fn spent_values(stage: &CompiledStage, region: &Region) -> Vec<u32> {
     if region.kind != crate::plan::RegionKind::Generated {
@@ -1230,12 +1294,13 @@ pub fn spent_values(stage: &CompiledStage, region: &Region) -> Vec<u32> {
     if super::validate::validate_generated_region(stage, region).is_err() {
         return Vec::new();
     }
-    let Some(kinds) = super::fused::stream_rows(stage, region) else {
-        return Vec::new();
-    };
     let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
     let bases = crate::codegen::op_view::result_bases(&ops);
     let direct = super::fused::analyze_direct_argmax(stage, region, &bases);
+    let mut spent = unnamed_values(stage, region, &ops, &bases, &direct);
+    let Some(kinds) = super::fused::stream_rows(stage, region) else {
+        return spent;
+    };
     let direct_topk = super::fused::analyze_direct_topk(stage);
     let claimed = direct.claimed();
     let streams = Streams::new(
@@ -1248,7 +1313,6 @@ pub fn spent_values(stage: &CompiledStage, region: &Region) -> Vec<u32> {
         &direct.skipped,
         &direct_topk,
     );
-    let mut spent = Vec::new();
     let mut at = 0usize;
     while at < streams.order.len() {
         let node = streams.order[at];

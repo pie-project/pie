@@ -417,6 +417,30 @@ pub(crate) fn stream_rows(stage: &CompiledStage, region: &Region) -> Option<Vec<
     }
 }
 
+/// Whether a region's kernel leaves `node` out: an operand of an argmax
+/// that scans the model's row where it lies (`skipped`), so nothing writes
+/// its result. A reshape among them is still met, the view or the copy it
+/// is.
+pub(super) fn left_out(skipped: &[u8], ops: &[OpView], node: usize) -> bool {
+    skipped[node] != 0 && ops[node].tag != tags::RESHAPE
+}
+
+/// Whether `op` is a reshape `region`'s kernel copies nothing for: its
+/// result (`base`) is its source's bytes, and the kernel reads them there.
+pub(super) fn is_view(stage: &CompiledStage, region: &Region, op: &OpView, base: u32) -> bool {
+    op.tag == tags::RESHAPE
+        && !op.args.is_empty()
+        && !region.outputs.contains(&base)
+        && crate::codegen::alias::covers(&stage.normalized.value_types, op.args[0], base)
+}
+
+/// Whether `node` is an argmax `region`'s kernel scans from the model's
+/// row, its operand's bytes in scratch unread.
+pub(super) fn scans_model_row(direct: &ArgmaxScan, ops: &[OpView], node: usize) -> bool {
+    ops[node].tag == tags::REDUCE_ARGMAX
+        && (direct.gumbel[node].is_some() || direct.intrinsic[node] != u16::MAX)
+}
+
 pub fn emit_fused_region(
     dialect: Dialect,
     entry_name: &str,
@@ -567,7 +591,7 @@ pub fn emit_fused_region(
         at += 1;
         let op = &ops[node];
         let base = bases[node];
-        if skipped[node] != 0 && op.tag != tags::RESHAPE {
+        if left_out(&skipped, &ops, node) {
             continue;
         }
         if let Some(streams) = &streams {
@@ -582,11 +606,7 @@ pub fn emit_fused_region(
                 continue;
             }
         }
-        if op.tag == tags::RESHAPE
-            && !op.args.is_empty()
-            && !region.outputs.contains(&base)
-            && crate::codegen::alias::covers(&stage.normalized.value_types, op.args[0], base)
-        {
+        if is_view(stage, region, op, base) {
             aliases.elide(base, op.args[0]);
             continue;
         }
