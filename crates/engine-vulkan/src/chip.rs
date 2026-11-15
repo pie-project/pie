@@ -38,7 +38,11 @@ macro_rules! seeded {
     };
 }
 
-seeded!("qualcomm.toml", "imagination.toml");
+seeded!(
+    "qualcomm.toml",
+    "imagination.toml",
+    "derived/nvidia-rtx-pro-4500-blackwell.toml",
+);
 
 /// What a device no family file applies to runs.
 pub const DERIVED: &str = include_str!("derived.toml");

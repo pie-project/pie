@@ -9,6 +9,10 @@ pub mod program;
 pub(crate) mod record;
 pub mod serve;
 pub mod tune;
+
+/// The fire a served Vulkan load is asked, `(lanes, tokens)`: the ladder's
+/// upper bound, whose rungs `pie tune` times.
+pub const FIRE: (u32, u32) = (512, 10240);
 pub mod tuning;
 
 pub use boot::open;
