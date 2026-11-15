@@ -1,7 +1,6 @@
 use crate::rt::Instant;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use ::engine::ChannelRegistration;
 
@@ -299,18 +298,14 @@ impl Lane {
         state
     }
 
+    /// The next request. With nothing queued the lane parks at once, on
+    /// every target: a request posted from then on wakes it.
     fn next_request(
         launch_rx: &crate::rt::channel::Receiver<LaneRequest>,
         control_rx: &crate::rt::channel::Receiver<LaneRequest>,
         turn: &mut LaneTurn,
     ) -> std::result::Result<LaneRequest, ()> {
         use crate::rt::channel::TryRecvError;
-        #[cfg(target_arch = "wasm32")]
-        const ENGINE_LANE_HOT_US: u64 = 0;
-        #[cfg(not(target_arch = "wasm32"))]
-        const ENGINE_LANE_HOT_US: u64 = 1_000_000;
-        let hot_window = Duration::from_micros(ENGINE_LANE_HOT_US);
-        let mut spin_until = Instant::now() + hot_window;
         loop {
             if turn.control_due() {
                 match control_rx.try_recv() {
@@ -344,15 +339,10 @@ impl Lane {
                 }
                 Err(TryRecvError::Empty) => {}
             }
-            if Instant::now() < spin_until {
-                std::hint::spin_loop();
-                continue;
-            }
             let mut select = crate::rt::channel::Select::new();
             select.recv(launch_rx);
             select.recv(control_rx);
             select.ready();
-            spin_until = Instant::now() + hot_window;
         }
     }
 
@@ -1103,3 +1093,6 @@ impl Lane {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
