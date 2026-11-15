@@ -137,13 +137,15 @@ const NVRTC_OPTIONS: [&std::ffi::CStr; 5] = [
     c"--maxrregcount=64",
 ];
 
-/// The options [`compile`] passes the runtime compiler, as bytes.
-fn compile_options() -> impl Iterator<Item = &'static [u8]> {
+/// The options [`compile`] passes the runtime compiler, as bytes; none in
+/// a build with no runtime compiler, which compiles nothing.
+fn compile_options() -> Vec<&'static [u8]> {
     #[cfg(feature = "rocm")]
-    let options = HIPRTC_OPTIONS.iter().map(|option| option.as_bytes());
+    return HIPRTC_OPTIONS.iter().map(|option| option.as_bytes()).collect();
     #[cfg(feature = "cuda")]
-    let options = NVRTC_OPTIONS.iter().map(|option| option.to_bytes());
-    options
+    return NVRTC_OPTIONS.iter().map(|option| option.to_bytes()).collect();
+    #[cfg(not(any(feature = "rocm", feature = "cuda")))]
+    Vec::new()
 }
 
 pub fn compile(source: &str, architecture: &str) -> std::result::Result<Vec<u8>, Failure> {
@@ -585,8 +587,7 @@ impl Disk {
 /// but for where they sit share one build.
 #[must_use]
 pub fn region_key(target: &Target, source: &str) -> String {
-    let options: Vec<&[u8]> = compile_options().collect();
-    let hash = fnv1a64_with(source.as_bytes(), &options);
+    let hash = fnv1a64_with(source.as_bytes(), &compile_options());
     let (major, minor) = target.rtc;
     format!(
         "{BACKEND:?}-{}-rtc{major}.{minor}-{hash:016x}",
