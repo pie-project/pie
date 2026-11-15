@@ -180,16 +180,16 @@ impl LanePorts<'_> {
         Ok(Some(stated))
     }
 
-    /// The fold length the `fold` port states for this lane: its own entry,
-    /// or none. Never another lane's, which would be a wrong count told as
-    /// this lane's own.
+    /// The fold length the `fold` port states for this lane: a one-entry
+    /// list states it for every lane, a longer one only its own entry, or
+    /// none past its end. Never another lane's entry of a per-lane list,
+    /// which would be a wrong count told as this lane's own.
     #[must_use]
     pub fn fold(&self) -> Option<u32> {
-        self.envelope
-            .fold
-            .as_ref()
-            .and_then(|lens| lens.get(self.at))
-            .copied()
+        match self.envelope.fold.as_deref()? {
+            [every] => Some(*every),
+            lens => lens.get(self.at).copied(),
+        }
     }
 
     #[must_use]
@@ -361,6 +361,33 @@ mod tests {
         a_row_is_roped_at_its_slot_unless_the_program_says_otherwise();
         a_decode_envelope_resolves_its_tokens_and_not_where_they_land();
         an_engine_resolves_only_what_the_program_computes_on_the_device();
+        a_one_entry_fold_states_every_lane_and_a_longer_one_its_own();
+    }
+
+    /// A one-entry `fold` port states the fold for every lane; a longer one
+    /// only each lane's own entry, and none past its end (never a
+    /// neighbour's entry, a wrong count told as the lane's own).
+    fn a_one_entry_fold_states_every_lane_and_a_longer_one_its_own() {
+        let three = |fold: Vec<u32>| Envelope {
+            qo_indptr: Some(vec![0, 1, 2, 3]),
+            tokens: Some(vec![11, 22, 33]),
+            slots: Some(vec![40, 41, 42]),
+            fold: Some(fold),
+            ..Envelope::default()
+        };
+        let folds = |envelope: &Envelope| -> Vec<Option<u32>> {
+            (0..3)
+                .map(|at| envelope.lane(at, at).expect("a lane").fold())
+                .collect()
+        };
+        assert_eq!(folds(&three(vec![4])), [Some(4); 3], "one entry, every lane");
+        assert_eq!(
+            folds(&three(vec![4, 5])),
+            [Some(4), Some(5), None],
+            "a per-lane list: its own entry, none past the end"
+        );
+        assert_eq!(folds(&three(vec![4, 5, 6])), [Some(4), Some(5), Some(6)]);
+        assert_eq!(folds(&Envelope { fold: None, ..three(vec![]) }), [None; 3]);
     }
 
     /// One source a port: what a decode envelope's program computes on the
