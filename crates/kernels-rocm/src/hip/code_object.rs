@@ -63,18 +63,6 @@ pub fn refuse_late_buffers(image: &[u8]) -> Result<(), String> {
     refuse(&asked(image))
 }
 
-/// As [`refuse_late_buffers`] for a guest program's code object, whose
-/// kernels the engine generates from the program: a buffer is refused, and
-/// what scratch its kernels ask is returned (kernel, ask) for the caller to
-/// say and count rather than refuse.
-pub fn refuse_late_buffers_but_scratch(image: &[u8]) -> Result<Vec<(String, Ask)>, String> {
-    let (buffers, scratch): (Vec<_>, Vec<_>) = asked(image)
-        .into_iter()
-        .partition(|(_, ask)| matches!(ask, Ask::Buffer(_)));
-    refuse(&buffers)?;
-    Ok(scratch)
-}
-
 fn refuse(asked: &[(String, Ask)]) -> Result<(), String> {
     if asked.is_empty() {
         return Ok(());

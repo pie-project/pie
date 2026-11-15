@@ -1,4 +1,12 @@
 
+// The shared runtime's callees: inlined where the dialect asks
+// (`M1_INLINE_CALLS`, CDNA), calls on CUDA.
+#ifdef M1_INLINE_CALLS
+#define M1_CALLEE __forceinline__
+#else
+#define M1_CALLEE
+#endif
+
 
 struct PtirLaneTableHeader {
   m1_u32 abi_version;
@@ -847,7 +855,7 @@ __device__ __forceinline__ void m1_bucket_find(
 }
 
 template <class G>
-__device__ void m1_cut_select_key(
+__device__ M1_CALLEE void m1_cut_select_key(
     const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype,
     m1_u64 low, m1_u64 high, m1_u64 need, int eu, M1CutShared& cut, G& g,
     bool gather_ties = false) {
@@ -930,7 +938,7 @@ __device__ void m1_cut_select_key(
 // The `rank`-th (from 0) least index among the live elements of key `key`
 // past `low`.
 template <class G>
-__device__ m1_u32 m1_cut_select_index(
+__device__ M1_CALLEE m1_u32 m1_cut_select_index(
     const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype,
     m1_u32 key, m1_u64 low, m1_u64 rank, M1CutShared& cut, G& g) {
   int bits = 0;
@@ -975,7 +983,7 @@ __device__ m1_u32 m1_cut_select_index(
   return index;
 }
 
-__device__ void m1_cut_sort(m1_u64* items, m1_u32 count) {
+__device__ M1_CALLEE void m1_cut_sort(m1_u64* items, m1_u32 count) {
   m1_u32 n = 1u;
   while (n < count) n <<= 1;
   for (m1_u32 i = count + threadIdx.x; i < n; i += blockDim.x)
@@ -1004,7 +1012,7 @@ __device__ void m1_cut_sort(m1_u64* items, m1_u32 count) {
 // at the first element whose exclusive mass reaches the cutoff; any other
 // row is walked to its end, each element's verdict stored as it is reached.
 template <class G>
-__device__ void m1_cut_chunk(
+__device__ M1_CALLEE void m1_cut_chunk(
     const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype,
     float cutoff, bool monotone, m1_u8* output, M1CutShared& cut, G& g) {
   const m1_u64 low = cut.cursor;
@@ -1113,7 +1121,7 @@ __device__ void m1_cut_chunk(
 // finds the element at which the sum reaches the cutoff or its next binade,
 // adds it in f32, and either stops there or moves the cursor past it.
 template <class G>
-__device__ void m1_cut_phase(
+__device__ M1_CALLEE void m1_cut_phase(
     const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype,
     float cutoff, M1CutShared& cut, G& g) {
   const float mass = cut.mass;
@@ -1381,7 +1389,7 @@ __device__ __forceinline__ void m1_cut_note(
 }
 
 template <class G>
-__device__ void m1_cut_enter(M1CutShared& cut, G& g, m1_u32 least, m1_u32 most) {
+__device__ M1_CALLEE void m1_cut_enter(M1CutShared& cut, G& g, m1_u32 least, m1_u32 most) {
   if (least <= most) {
     atomicMin(&cut.key_least, least);
     atomicMax(&cut.key_most, most);
@@ -1434,7 +1442,7 @@ __device__ __forceinline__ bool m1_cut_kept(const M1CutShared& cut, m1_u32 i, fl
 }
 
 template <class G>
-__device__ void m1_cut_mark(
+__device__ M1_CALLEE void m1_cut_mark(
     const m1_u8* input, m1_u32 base, m1_u32 dtype, m1_u8* output, M1CutShared& cut, G& g) {
   const bool monotone = cut.negative == 0u;
   m1_cut_scan_range(input, base, g.lo, g.hi, dtype, [&](m1_u32 i, float y) {
@@ -1487,7 +1495,7 @@ __device__ __forceinline__ void ptir_parallel_pivot_cummass(
 // The top-k cut of one row (`k` already clamped to 1..len) on the group
 // `grp`: the verdicts of the group's stretch land in `output`.
 template <class G>
-__device__ m1_u32 m1_rank_row(
+__device__ M1_CALLEE m1_u32 m1_rank_row(
     const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype, m1_u32 k,
     m1_u8* output, G& grp, bool mark = true) {
   __shared__ m1_u32 rank_hist[2048];
