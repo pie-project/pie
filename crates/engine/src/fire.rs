@@ -555,7 +555,7 @@ pub enum RsVerb {
     #[default]
     Fold,
     /// Replays the buffered slots `folded..first` its mask admits, then freezes
-    /// `fold` slots past `folded` into the state.
+    /// `fold` slots past the row the record stands at into the state.
     Buffer {
         /// The buffer's pages: token `t` of page `p` holds slot
         /// `base + p * page + t`.
