@@ -94,7 +94,7 @@ None of the four goes to PLEX. KEEP_CACHE alone does (section 3).
   IDLE_AFTER is also the lifetime of cache at the floor in a process with release-idle on.
   Today that lifetime is KEEP_CACHE.
 
-### 1.2 ENGINE_LANE_HOT_US (stays; owner: runtime)
+### 1.2 ENGINE_LANE_HOT_US (superseded: the 1 s constant goes, see 1.2a and 1.2b)
 
 Site: `runtime/src/scheduler/lane.rs:333-336`, 1 s native, 0 on wasm32; the lane spins on its
 queue for that long after the last request, then parks.
@@ -216,7 +216,194 @@ which commit removed the lane's measurement comment; whether the idle-gap statis
 recorded in every build or only with the probes on; whether the 1 s was chosen to match the
 watchdog.
 
-### 1.3 GAP_BUDGET (stays; owner: runtime)
+### 1.2b The measured gap as the lane's window: what is stamped, what the lane can read, and GAP_BUDGET
+
+Read at 3e4e78300 with git show / git grep only. Nothing was built or run: every statement about
+behaviour below is read off the code, none is measured. Paths are under crates/runtime/src/scheduler/
+unless given in full. This section supersedes the "(stays)" in the headings of 1.2 and 1.3.
+
+Naming. In frame.rs a "lane" is a pipeline (a `ProcessId`). The thread that spins is the engine's
+`Lane` (lane.rs:198, spawned :261-265), one per engine however many pipelines decode. Below, "1 and
+64 pipelines" is the coordinator's "1 lane and 64 lanes", and "the lane thread" is the engine's thread.
+
+#### (1) What is stamped, where, and what the lane thread can read
+
+- Every build: yes. The gap is recorded with plain `fetch_add` (frame.rs:1080-1082), not through
+  `probe_fire!` (the `profile-fire` gate, probe.rs:92-116). It needs `self.stats` to be `Some`,
+  which serving always passes (worker.rs:1178-1183; only a test passes `None`, worker.rs:2933). The
+  one diagnostic switch near it, `PIE_IDLE_DUMP_US`, gates a print only (frame.rs:39-47).
+- Every dispatch: no. It is recorded only when `!self.executing_now` (frame.rs:1074), that is when
+  the scheduler has no launch batch in flight as it plans (`!in_flight_launches.is_empty()`,
+  worker.rs:2289). The default dispatch depth is 2 (frame.rs:10, checked at worker.rs:2242), so
+  when run-ahead works the next frame is dispatched while the previous one executes and nothing is
+  stamped. The statistic samples the transitions that did not run ahead.
+- From what to what: from `last_retire_at` (frame.rs:459, set in `on_frame_retired`, called at
+  worker.rs:2507 once the front in-flight batch's completion checks settled, :2492) to `now`
+  (taken at worker.rs:2260, passed in at :2290) when the next sealed frame is popped
+  (frame.rs:1068). Last frame retired by this scheduler -> next frame dispatched by this scheduler:
+  per scheduler (one `FramePolicy` per worker), not per pipeline.
+- What is kept: a running sum, a count and a 16-bucket histogram (probe.rs:42-43, stats.rs:33,
+  :38-40). The last gap itself is stored nowhere.
+- Thread: both stamps are taken on the scheduler worker thread. The lane thread holds the same
+  `Arc<SchedulerStats>` (lane.rs:241, :255, :412) and already writes atomics into it (`LaneCharge`,
+  lane.rs:36-60). So no lock and no message is needed, but one new atomic is (the last gap, stored
+  beside frame.rs:1080); nothing published today gives the lane that figure.
+- Per pipeline, the scheduler also computes turnaround = that pipeline's retire -> its next frame
+  complete (frame.rs:856-858; `retired_at` :465, `complete_at` :399), published only as a sum, a
+  count and a lifetime maximum (:861-863).
+
+Two things the code shows about using this stamp as the lane's window:
+
+- (i) It is shorter than the lane thread's wait by construction. The lane's wait starts when it
+  finishes its last request (lane.rs:337). The retire stamp is taken later, after the scheduler
+  thread has seen the settle (worker.rs:2492 -> :2507). The dispatch stamp is taken at
+  worker.rs:2260, before the frame is planned, admitted and built (`build_frame_submission`,
+  :2459); the post to the lane is at :2466. A window equal to the stamped gap, started at the
+  lane's own :337, ends before the post by one thread hop plus plan and build, every time the gap
+  did not shrink.
+- (ii) It is not the only post the lane waits for. On engines that settle asynchronously (CUDA
+  crates/engine-cuda/src/api.rs:1038 and wgpu crates/engine-wgpu/src/api.rs:62 always; Vulkan,
+  Metal, XLA and Cerebras conditionally) the lane thread also waits for `Landed`, sent by the
+  engine's completion callback (lane.rs:439) once per step of each frame in flight, and it is the
+  lane thread that publishes, pumps the channels out and settles (lane.rs:571-603). That wait is
+  the device's time, and a parked lane there delays the retire itself. No scheduler stamp measures it.
+
+#### (2) Which statistic, with no new constant
+
+Candidates. S1: the last idle gap as stamped today. S2: the same stamp taken at every dispatch
+(without the `!executing_now` condition). S3: the largest turnaround among the dispatched frame's
+pipelines (the maximum of frame.rs:858's `us` over the members). L: the lane thread's own last wait,
+from entry (lane.rs:337) to the request returned (:343, :354, :364), read on its own clock with no
+shared state. Lmax: the largest such wait since the last `Launch` the lane took (one frame's cycle;
+the grouping is the frame, not a count).
+
+| case | S1 | S2 / S3 | L / Lmax |
+|---|---|---|---|
+| steady decode, device idle at each dispatch (depth 1, a synchronous engine, or guests slower than the device), 1 pipeline | the host turnaround, every frame; short of the post by (i) | as S1 | the wait itself, hops included. On asynchronous engines waits alternate (for `Landed`, then for `Launch`); L parks on each wait longer than the one before it, Lmax covers the pair |
+| the same at 64 pipelines | one scheduler, one lane thread, one frame for all: the time until the slowest awaited pipeline completes the frame | S3 is the same number as S2 (wait-all dispatches on the last awaited member): "largest among the wave's lanes" adds nothing | unchanged in kind |
+| pipelined (depth 2, next dispatch before the retire) | never stamped: the figure stays what the last idle dispatch left, normally the first dispatch after a client pause, so the pause | zero (`saturating_duration_since`, never negative): window zero, the lane never spins. That is the parked variant of the old record (1.2a) | both waits lie inside one frame's time; as steady |
+| stall (one long gap) | becomes the figure; the next stamped short gap brings it down, but under pipelining there is no next stamp | becomes the figure, down at the next dispatch | the wait outlasts the window, the lane parks, the figure is dropped (item 3), the next wait parks at once and is measured: it does not stay long |
+| client pauses between requests | the first dispatch after the pause stamps the pause as the newest gap; item 3 does not stop it, the stamp is new | as S1 | as the stall |
+| isolated posts a pause apart (one-frame requests on a synchronous engine; a control op on an idle server) | every gap is a pause: the lane spins the length of the previous pause, with no 1 s cap | as S1 | every wait is a pause: park at once, measure it, spin that long the next time, so every other pause is spun through |
+
+What the table says:
+
+- No scheduler-stamped form covers the next post: (i) makes it short, (ii) leaves the `Landed` wait
+  out, S1 goes stale exactly when run-ahead works, and S2/S3 read zero exactly then.
+- The lane's own wait is the one measure here that is the ruling's sentence by construction ("the
+  window covers the next post"). Of its two forms Lmax is the one that survives the alternation.
+- No pure statistic of past gaps tells a decode gap from a pause (last row). What tells them apart
+  is state the runtime already holds, not a time: a frame in flight on the lane (`landed_instances`,
+  lane.rs:484-486, "the lane is between fires, not idle"), and the scheduler's wait-set (`awaited`,
+  frame.rs:95; any awaited, :665; cleared when the guest parks its frame, crates/runtime/src/
+  pipeline/fire.rs:3752-3763 -> frame.rs:432, :475; on leave :573; on suspend :619; by the watchdog
+  :1142, :1149). "A post is owed" = a frame in flight or a pipeline awaited. The wait-set lives on
+  the scheduler thread; publishing "any awaited" is one more atomic, no lock, no message.
+- So the constant-free rule the code supports is: spin only while a post is owed, for as long as
+  Lmax; a park drops the figure. There is no number in it.
+- What it cannot do: a window equal to a past wait parks whenever the next wait is longer. How often
+  that happens is jitter, which is not in the code; it is what the gate measures. If it fails there,
+  nothing constant-free is left in this list, and a margin or smoothing factor (a new constant)
+  comes back to the leader.
+
+#### (3) No figure: where the lane parks, what wakes it, what the wake costs
+
+- Park: `select.ready()` (lane.rs:393) over the launch and control queues (:382-384) and, native
+  only and only when the idle arming step answered `Waiting`, the room wake (:385-392;
+  arming.rs:237). It is reached when both queues are empty (:339-369), the idle arming step did not
+  step (:371-375) and the window has run out (:376). Today the window restarts at entry (:337),
+  after each idle arming step (:373) and after each wake (:402).
+- With no figure the window is zero and the first empty pass falls through :376 to the park. That
+  is the path wasm32 already takes (constant 0, :333), so it is exercised code.
+- Before the first retire: a lane with arming steps to run does not reach the park while they step
+  (:372-375 `continue`), whatever the window; arming at load does not depend on it.
+- Wakes: a send on the launch queue (the scheduler worker's `engine_loop.fire`, worker.rs:2466 ->
+  lane.rs:284-290 -> :281); a send on the control queue (the scheduler's control ops, :278-281; the
+  engine's completion callback from the engine's own thread, :439; shutdown, :309); `room_freed`
+  (arming.rs:224-232).
+- Cost: the queues are crossbeam channels (crates/runtime/src/rt.rs:10). The sender (scheduler
+  worker or engine callback thread) pays the unpark; the lane pays the kernel's delay before it
+  runs. No figure for either is in the tree at 3e4e78300; the deleted comment (1.2a: 81 % -> ~30 %
+  of transitions enqueued ahead on the parked variant) is the only record.
+- New parks the rule adds: every wait from a park until the next figure exists (one frame's cycle
+  under Lmax), on top of the `Launch` after a pause (parked today too once the pause passes 1 s).
+- What the gate can read, all recorded in every build: `seal_while_executing` over `seal_events`
+  (frame.rs:940-942; served at crates/runtime/src/server/handler.rs:244-245), the nearest live
+  counter to "transitions enqueued ahead"; `device_idle_us`, `device_idle_gaps` and the bubble
+  histogram (handler.rs:252-257); the lane's own timings (`LaneCharge`, lane.rs:36-60). There is
+  no counter of lane parks (`idle_park_control_us`, worker.rs:1417, is the scheduler's own park).
+
+#### (4) Every reader of ENGINE_LANE_HOT_US
+
+- One definition with two cfg variants (lane.rs:332-335: 0 on wasm32, 1_000_000 otherwise), one
+  reader (`hot_window`, :336, used at :337, :373, :402), all inside `Lane::next_request` (:323).
+  `git grep` over crates/ finds no other reader.
+- `next_request` has two callers. The run loop (lane.rs:478): there is one `Lane` implementation
+  for every engine, so every backend reads the same value; each would read the figure of item 2.
+  `drain_poisoned` (lane.rs:653): a lane that panicked draining its queues, its idle closure
+  answering `Over`; today it too spins 1 s per wait; it has no figure and would park.
+- wasm32 never spins today and would keep reading nothing: the spin branch is absent there by cfg,
+  a fact about the platform rather than a number. Why it is 0 is not recorded at 3e4e78300.
+- Not a reader, but the other spinner in the tree: crates/engine-cuda/src/inputs.rs:829-831 spins
+  on a staging slot until `CLAIM_DEADLINE` = 10 s (:142) and then faults (:838-845). That bare
+  time is in none of passes 1 to 3.
+
+#### (5) GAP_BUDGET against the half-time rule
+
+- The gap loop (lane.rs:458-468) always calls `arming.step(&mut engine, false, true)`, so `busy` is
+  true (:461). A busy step is refused while `now < owed_until` (arming.rs:344-345), and each busy
+  step ends by setting `owed_until = after + took` (:371).
+- So after any step of measured length T > 0 the loop's next call, made at about `after`, is before
+  `after + T`, answers `Waiting`, and the loop breaks (lane.rs:462-466). One gap runs at most one step,
+  whatever the budget. The 20 ms test (`Instant::now() >= until`, :464) is only reached after a
+  step, and cannot interrupt one.
+- Half-time binds, 20 ms does not: every step with T > 0. At T = 5 ms the budget would allow three
+  more steps and :345 allows none. At T = 25 ms (the test, arming/tests.rs:515) both say stop, and
+  only after the step.
+- 20 ms binds, half-time does not: this needs steps each shorter than the loop's own turn between
+  them (so :345 has already expired at the next call), repeated for 20 ms. A step is a lend plus
+  one composition's capture (arming.rs:325, :352-368). No such case was found.
+- History: 9d90f9d51 (2026-11-13 16:55) added the budget when `step` took no `busy` argument (lane.rs:399 at 1fbedd22d^) and
+  the budget did bound the loop. 1fbedd22d (17:18 the same day) added :344-345 and left it dead.
+- So it goes too. lane.rs:458-468 becomes one `arming.step(&mut engine, false, true)` while a raise
+  waits; arming.rs:204-206 is deleted; the comments at lane.rs:451-457 ("a gap running steps while
+  its budget lasts") and arming.rs:204-205 are reworded. arming/tests.rs:515 uses the constant only
+  to size its step; what that test asserts (:547-550, fires between steps) is the half-time rule.
+
+#### Build brief
+
+1. lane.rs:332-337, :373, :402: constant deleted; window = the lane's figure, zero with none; wasm32 no spin by cfg.
+2. lane.rs:323-404: time each wait; figure = largest since the last `Launch`; dropped at the park (:393).
+3. Post owed = `landed_instances` (lane.rs:486) or "any awaited" (frame.rs:665, one new atomic); spin only then.
+4. Only if a scheduler stamp is kept: one atomic beside frame.rs:1080; settle :1074 first (see (i), (ii), pipelined row).
+5. GAP_BUDGET: arming.rs:204-206 deleted, lane.rs:458-468 one step, arming/tests.rs:515 a literal; :502 must still pass.
+6. Tests on the harness in arming/tests.rs (:259, :268, :290, `fire_sleep` :147; lane.rs has none), with a park
+   counter added (none exists): even posts park only in the first cycle; a long wait parks and the next short one
+   brings the window down; nothing owed or no figure parks at once; posts a pause apart never spin through one.
+7. Gate, separate target directories, sm_120 and L40S, 1 and 64 pipelines against the 1 s constant: tokens/s,
+   `seal_while_executing`/`seal_events`, `device_idle_us`/`_gaps`, first frame after a pause, idle lane CPU.
+
+#### Not verified (1.2b)
+
+- Nothing was measured: wake cost, wait lengths, jitter, and so whether a window equal to a past
+  wait covers the next post often enough. That is the gate's question.
+- Whether `seal_while_executing` / `seal_events` is the quantity the old comment called
+  "transitions enqueued ahead". `submit_ahead_fires` is served (handler.rs:204-205) but no writer
+  was found in crates/runtime/src.
+- Whether `awaited` drops in every client pause: `park_frame` returns early when the frame size is
+  1 (crates/runtime/src/pipeline/fire.rs:3756-3758), and the watchdog path (frame.rs:1142, :1149) was
+  not traced.
+- The conditions under which Vulkan, Metal, XLA and Cerebras settle asynchronously (only the first
+  lines of each `settles_asynchronously` were read).
+- How long the hop from the lane's settle to the scheduler's `completion.check()` is, and what
+  wakes the scheduler thread for it.
+- Whether a metrics poll or any periodic control op reaches the lane on an idle server.
+- Whether any engine's `arm_step` can answer `true` in less time than the gap loop's own turn (the
+  one construction in which the 20 ms would bind); the engines' `arm_step` bodies were not read.
+- crossbeam's park and unpark internals, the wasm32 clock's resolution, and `CLAIM_DEADLINE`
+  beyond the lines cited.
+
+### 1.3 GAP_BUDGET (superseded: it goes, see 1.2b item 5)
 
 Site: `runtime/src/scheduler/arming.rs:206`, 20 ms; used at `runtime/src/scheduler/lane.rs:452-466`:
 in a gap between two requests a waiting raise runs steps while the budget lasts.
