@@ -463,6 +463,10 @@ impl Engine for Xla {
         )
         .map_err(fault)?;
         let mut shell = shell;
+        // Every maintenance program a fire, a fork or a park runs later, one
+        // a slot size, compiled now whether or not the ladder runs: none is
+        // built after the load.
+        shell.warm_maintenance().map_err(fault)?;
         if boot.prewarm {
             shell.prewarm().map_err(fault)?;
             // The program a bind or a host pass lands guest cells with.

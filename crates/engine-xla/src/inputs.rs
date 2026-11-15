@@ -22,9 +22,10 @@ pub struct Inputs {
     /// Every input, back to back, each from a whole word.
     image: Vec<u32>,
     /// Bulk data a maintenance program lands in the pool (a weight atom
-    /// run, a parked slot's bytes): u32 rows uploaded with the program, not
-    /// staged, since the slab is sized for fire inputs.
-    bulk: Vec<(u32, Vec<u8>)>,
+    /// run, a parked slot's bytes): written into the bulk ring's next slot
+    /// (pinned host memory) when the program runs, not staged, since the
+    /// slab is sized for fire inputs.
+    bulk: Vec<Vec<u8>>,
     /// What each input is, in staging order: with the fire's windows, what
     /// the traced program's text depends on.
     shapes: Vec<(Dtype, u32, u32)>,
@@ -96,12 +97,13 @@ impl Inputs {
         self.root(handles, dtype, rows, width, word)
     }
 
-    /// `bytes` as u32 `[rows, 128]` bulk data, uploaded with the program
-    /// that lands it (see [`Inputs`]'s `bulk`).
+    /// `bytes` as bulk data, read by its program as a bulk ring slot of
+    /// `rows` rows, u32 `[rows, 128]`, the bytes first (see [`Inputs`]'s
+    /// `bulk`).
     pub fn bulk(&mut self, handles: &Handles, rows: u32, bytes: Vec<u8>) -> Tensor {
         let input = self.bulk.len() as u32;
         self.shapes.push((Dtype::U32, rows, ROW_WORDS as u32));
-        self.bulk.push((rows, bytes));
+        self.bulk.push(bytes);
         handles.root(Root {
             source: Source::Bulk { input },
             dtype: Dtype::U32,
@@ -110,10 +112,10 @@ impl Inputs {
         })
     }
 
-    /// Uploads bulk input `input`.
-    pub fn upload_bulk(&self, device: &crate::device::Device, input: u32) -> crate::error::Result<crate::pjrt::Buffer> {
-        let (rows, bytes) = &self.bulk[input as usize];
-        device.upload(Dtype::U32, *rows, ROW_WORDS as u32, bytes)
+    /// Bulk input `input`'s bytes.
+    #[must_use]
+    pub fn bulk_bytes(&self, input: u32) -> &[u8] {
+        &self.bulk[input as usize]
     }
 
     /// The image, every input's words.

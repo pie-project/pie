@@ -635,12 +635,25 @@ impl Shell {
             target,
         )?;
         // The staging slab is pool bytes past the pages, as the null and
-        // sink are; a bulk write's transient lands beside the pool, as XLA's
-        // scratch does: both counted before the pages are fit.
+        // sink are: counted before the pages are fit. It holds a fire's
+        // inputs and a maintenance program's index list, a chunk's worth of
+        // entries and their count (`Pools::units`): a pair a one-row unit at
+        // most.
         let fit_paging = paging_at(
             u64::from(boot.context.div_ceil(boot.page_size.max(1))),
             boot.slots,
         )?;
+        let chunk_rows = crate::store::layout_of(&boot.trace, fit_paging, rs_layout.as_deref(), target)?
+            .chunk_bytes
+            / crate::store::layout::ROW_BYTES;
+        let listed_rows = u32::try_from(
+            (2 * chunk_rows + 1)
+                .div_ceil(crate::inputs::ROW_WORDS as u64)
+                .next_multiple_of(u64::from(crate::inputs::TILE_ROWS)),
+        )
+        .unwrap_or(u32::MAX);
+        let mut staging = staging;
+        staging.rows = staging.rows.max(listed_rows);
         let slab = crate::store::slab_bytes(
             &boot.trace,
             fit_paging,
@@ -648,20 +661,7 @@ impl Shell {
             target,
             staging.rows,
         )?;
-        let bulk = crate::store::bulk_bytes(
-            &boot.trace,
-            fit_paging,
-            rs_layout.as_deref(),
-            target,
-            boot.device.stream_weights,
-        )?;
-        tracing::info!(
-            slab_bytes = slab,
-            bulk_transient_bytes = bulk,
-            "xla staging fit: the slab in the pool, the largest bulk write beside it"
-        );
         let reserved = reserved + slab;
-        let headroom = headroom + bulk;
         let staging_facts = StagingFacts {
             pass_ms,
             slab_rows: staging.rows,
@@ -671,7 +671,9 @@ impl Shell {
                 * crate::store::layout::ROW_BYTES
                 * u64::from(staging.slots),
             rungs: staging.rungs.clone(),
-            bulk_bytes: bulk,
+            // The bulk ring's pinned host bytes, once the pool lays it.
+            bulk_bytes: 0,
+            maintenance: (0, 0.0),
         };
         // The pool buffers are program parameters, so the pages are fixed
         // before anything traces: what the budget buys, or with none what
@@ -824,6 +826,8 @@ impl Shell {
             &staging,
         )?;
         let mut pools = pools;
+        let mut staging_facts = staging_facts;
+        staging_facts.bulk_bytes = pools.bulk_ring().1;
         streamed.renumber(narrow(pools.layout().shapes.len() as u64) as u32);
         pools.view_weights(&handles, &streamed)?;
         pools.land_host_banks(&device, &handles, &streamed)?;
@@ -977,6 +981,25 @@ impl Shell {
     #[must_use]
     pub fn trace(&self) -> &Trace {
         &self.trace
+    }
+
+    /// Compiles (and runs on the null chunk) every maintenance program:
+    /// the slot copy, write and zero at each slot size the pool states.
+    pub fn warm_maintenance(&mut self) -> Result<()> {
+        let started = std::time::Instant::now();
+        let before = self.device.compiled();
+        self.pools.warm_copies(&self.device, &self.handles)?;
+        self.staging_facts.maintenance = (
+            self.device.compiled() - before,
+            started.elapsed().as_secs_f64() * 1e3,
+        );
+        tracing::info!(
+            programs = self.staging_facts.maintenance.0,
+            ms = self.staging_facts.maintenance.1,
+            bulk_ring_bytes = self.staging_facts.bulk_bytes,
+            "xla maintenance programs warmed: one a slot size, any count"
+        );
+        Ok(())
     }
 
     /// What this load stages its fires' inputs in.
@@ -3453,8 +3476,12 @@ pub struct StagingFacts {
     pub ring_bytes: u64,
     /// `(rung tokens, rows)` each rung's fires stage.
     pub rungs: Vec<(u32, u32)>,
-    /// The largest bulk write's transient beside the pool.
+    /// The bulk ring's pinned host bytes (slots of a chunk each): what a
+    /// maintenance program lands comes from there, nothing beside the
+    /// pool on the device.
     pub bulk_bytes: u64,
+    /// The maintenance programs the load compiled, and the time it took.
+    pub maintenance: (usize, f64),
 }
 
 /// Lane `lane` of the next fire reads its tokens off the device
