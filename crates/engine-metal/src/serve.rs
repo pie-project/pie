@@ -3719,19 +3719,29 @@ impl Shell {
             // how many slots past its state's frozen length this fire froze
             // (as `LanePlan::of` reckons it) and, where a port places its
             // rows, one past the last slot they landed at.
-            if seated.reports != 0
-                && let engine::fire::RsVerb::Buffer { folded, fold, .. } = &rs
-            {
-                let fold = match fold {
-                    engine::fire::FoldLen::Host(n) => Some(*n),
-                    engine::fire::FoldLen::Device => ports
-                        .as_ref()
-                        .and_then(engine::ports::LanePorts::fold),
-                };
+            if seated.reports != 0 {
                 let end = first.saturating_add(row.rows);
+                let fold = match &rs {
+                    engine::fire::RsVerb::Buffer { folded, fold, .. } => {
+                        let fold = match fold {
+                            engine::fire::FoldLen::Host(n) => Some(*n),
+                            engine::fire::FoldLen::Device => ports
+                                .as_ref()
+                                .and_then(engine::ports::LanePorts::fold),
+                        };
+                        fold.map(|n| folded.saturating_add(n).min(end) - folded)
+                    }
+                    // A lane with no recurrent state to buffer (a kv-only
+                    // model's): its fold is what its program's `fold` port
+                    // states for it, the count the runtime adds to the set's
+                    // frozen length when the fire settles, as for a buffering
+                    // lane. Unreported, the set's cursor never comes to rest
+                    // and a fork or a save of it is refused.
+                    _ => ports.as_ref().and_then(engine::ports::LanePorts::fold),
+                };
                 ends.push(engine::KvWrites {
                     tag: seated.reports,
-                    fold: fold.map(|n| folded.saturating_add(n).min(end) - folded),
+                    fold,
                     end: placed.then_some(end),
                     ..engine::KvWrites::default()
                 });
