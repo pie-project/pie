@@ -224,7 +224,7 @@ __device__ __forceinline__ m1_u32 m1_fast_units(float y, int eu, bool* tie) {
 // each thread sums a run of consecutive values, the runs scan across their
 // 32-lane chunk, the chunks' totals in order.
 template <class T>
-__device__ void m1_fast_scan(T* values, m1_u32 n) {
+__device__ M1_CALLEE void m1_fast_scan(T* values, m1_u32 n) {
   __shared__ T chunk_total[32];
   const m1_u32 per = (n + blockDim.x - 1u) / blockDim.x;
   const m1_u32 from = threadIdx.x * per;
@@ -867,7 +867,11 @@ struct M1Lane {
     __shared__ T shares[M1_LANE_MAX_SLICES];
     __shared__ T merged;
     m1_u8* out = buffer(slice);
-    if (threadIdx.x < WORDS) put32(out, threadIdx.x, reinterpret_cast<const m1_u32*>(&mine)[threadIdx.x]);
+    // Word by word, each at a constant offset: a share indexed by the thread
+    // is a share in memory.
+#pragma unroll
+    for (m1_u32 w = 0u; w < WORDS; ++w)
+      if (threadIdx.x == w) put32(out, w, reinterpret_cast<const m1_u32*>(&mine)[w]);
     publish();
     for (m1_u32 at = threadIdx.x; at < slices * WORDS; at += blockDim.x)
       reinterpret_cast<m1_u32*>(shares)[at] = get32(at / WORDS, 0u, at % WORDS);
@@ -1319,7 +1323,7 @@ __device__ __forceinline__ M1Range m1_range_combine(M1Range a, M1Range b) {
 // probabilities and the cut land in, `token` the i32 out. RANK picks the
 // top-k cut.
 template <bool RANK>
-__device__ void ptir_lane_sample(
+__device__ M1_CALLEE void ptir_lane_sample(
     M1Lane& g,
     const m1_u8* logits,
     const m1_u8* threshold,
@@ -1501,7 +1505,7 @@ __device__ void ptir_lane_sample(
 // A lone top-p or top-k cut (`PivotThreshold`) of each row on the lane's
 // blocks: the verdicts land in `output` as the one-block cut lands them.
 template <bool RANK>
-__device__ void ptir_lane_cut(
+__device__ M1_CALLEE void ptir_lane_cut(
     M1Lane& g,
     const m1_u8* input,
     const M1ValueDesc input_desc,

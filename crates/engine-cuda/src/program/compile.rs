@@ -322,16 +322,6 @@ impl Module {
         if cubin.is_empty() {
             return Err(Fault::program("cuModuleLoadData", "the cubin is empty"));
         }
-        // A kernel that asks HIP for a buffer at its first launch would
-        // allocate on the device after the load: refused by name. A guest
-        // kernel's scratch (the fused body's spills) is said instead: ROCr
-        // grows the queue's scratch at its first dispatch.
-        #[cfg(feature = "rocm")]
-        for (kernel, ask) in kernels_cuda::hip::code_object::refuse_late_buffers_but_scratch(cubin)
-            .map_err(|why| Fault::program("cuModuleLoadData", why))?
-        {
-            eprintln!("engine-cuda: guest kernel {kernel} asks the HIP runtime for {ask}");
-        }
         #[cfg(feature = "device")]
         {
             use crate::device::dr;
@@ -650,6 +640,10 @@ pub struct Cache {
     programs: Bounded<u64, Compiled>,
     stages: Stages<Stage>,
     negative: Bounded<u64, String>,
+    /// The code each region source built, by its key under the region
+    /// symbol: stages whose regions are the same text but for their entry
+    /// names (a sampler region in every stage that samples) build it once.
+    built: Bounded<String, Arc<[u8]>>,
     disk: Disk,
     stats: CacheStats,
 }
@@ -667,6 +661,7 @@ impl Cache {
             programs: Bounded::new(MAX_PROGRAM_ENTRIES),
             stages: Stages::new(MAX_STAGE_ENTRIES),
             negative: Bounded::new(MAX_NEGATIVE_ENTRIES),
+            built: Bounded::new(MAX_STAGE_ENTRIES),
             disk,
             stats: CacheStats::default(),
         }
@@ -856,7 +851,11 @@ impl Cache {
         source: &str,
         architecture: &str,
     ) -> std::result::Result<Arc<Module>, Failure> {
-        let key = disk_key(identity, source);
+        // The region is built under one symbol, so its code is keyed by
+        // what it computes, never by the stage it sits in; the module keeps
+        // the region's own name.
+        let source = source.replace(entry, REGION_SYMBOL);
+        let key = disk_key(identity, &source);
         // CUDA keeps the exact cut's state in dynamic shared memory; HIP's
         // text keeps it static.
         let dynamic = if !cfg!(feature = "rocm")
@@ -866,24 +865,65 @@ impl Cache {
         } else {
             0
         };
-        if let Some(cubin) = self.disk.load(&key, region_index, entry) {
-            match Module::load(&cubin, entry, dynamic) {
-                Ok(module) => {
-                    self.stats.persistent_hits += 1;
-                    return Ok(Arc::new(module));
+        let named = |mut module: Module| {
+            module.entry_name = entry.to_owned();
+            Arc::new(module)
+        };
+        if let Some(cubin) = self.built.get(&key).cloned() {
+            let module = Module::load(&cubin, REGION_SYMBOL, dynamic).map_err(|error| {
+                Failure::Retryable {
+                    reason: format!("loading `{entry}`: {error}"),
                 }
-                Err(_) => self.disk.invalidate(&key, region_index),
+            })?;
+            return Ok(named(module));
+        }
+        if let Some(cubin) = self.disk.load(&key, region_index, REGION_SYMBOL) {
+            // One that asks for late memory was compiled before that was
+            // refused: compiled again, and refused below if it still asks.
+            let loaded = late_memory(&cubin)
+                .ok()
+                .and_then(|()| Module::load(&cubin, REGION_SYMBOL, dynamic).ok());
+            match loaded {
+                Some(module) => {
+                    self.stats.persistent_hits += 1;
+                    self.built.insert(key, cubin.into());
+                    return Ok(named(module));
+                }
+                None => self.disk.invalidate(&key, region_index),
             }
         }
 
-        let cubin = compile(source, architecture)?;
+        let cubin = compile(&source, architecture)?;
         self.stats.compilations += 1;
-        let module = Module::load(&cubin, entry, dynamic).map_err(|error| Failure::Retryable {
-            reason: format!("loading `{entry}`: {error}"),
+        late_memory(&cubin).map_err(|why| Failure::Deterministic {
+            reason: format!("region {region_index} (`{entry}`): {why}"),
         })?;
-        self.disk.store(&key, region_index, entry, &cubin);
-        Ok(Arc::new(module))
+        let module = Module::load(&cubin, REGION_SYMBOL, dynamic).map_err(|error| {
+            Failure::Retryable {
+                reason: format!("loading `{entry}`: {error}"),
+            }
+        })?;
+        self.disk.store(&key, region_index, REGION_SYMBOL, &cubin);
+        self.built.insert(key, cubin.into());
+        Ok(named(module))
     }
+}
+
+/// The symbol every region's kernel is built under.
+const REGION_SYMBOL: &str = "ptir_region";
+
+/// Refuses a region's code object whose kernel asks the HIP runtime for
+/// memory it allocates late: a buffer at its first launch, or scratch, which
+/// ROCr grows at the first dispatch that needs it. Either is a device
+/// allocation after the load, so a region is refused at registration, as the
+/// engine's own kernels are at theirs, never at its first fire. CUDA's
+/// modules ask for neither.
+fn late_memory(cubin: &[u8]) -> std::result::Result<(), String> {
+    #[cfg(feature = "rocm")]
+    kernels_cuda::hip::code_object::refuse_late_buffers(cubin)?;
+    #[cfg(not(feature = "rocm"))]
+    let _ = cubin;
+    Ok(())
 }
 
 fn fnv1a64_with(bytes: &[u8], tails: &[&[u8]]) -> u64 {
@@ -910,6 +950,57 @@ mod tests {
         editing_the_source_changes_the_disk_key_with_no_version_bump();
         a_corrupt_entry_is_a_miss_and_is_deleted();
         a_disabled_cache_is_a_miss_and_not_a_failure();
+        #[cfg(feature = "rocm")]
+        {
+            regions_the_same_but_for_their_names_are_built_once();
+            a_region_that_asks_for_scratch_is_refused_by_name();
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    fn device_arch() -> &'static str {
+        kernels_cuda::jit::cache::arch(0).expect("a gfx device")
+    }
+
+    #[cfg(feature = "rocm")]
+    fn regions_the_same_but_for_their_names_are_built_once() {
+        let region = |entry: &str| {
+            format!(
+                "extern \"C\" __global__ void {entry}(unsigned* out) {{ out[threadIdx.x] = 1u; }}"
+            )
+        };
+        let mut cache = Cache::new(Disk::disabled());
+        let (a, b) = ("ptir_fused_00000000000000aa_r0", "ptir_fused_00000000000000bb_r0");
+        let first = cache
+            .region_module("identity", 0, a, &region(a), device_arch())
+            .expect("builds");
+        let second = cache
+            .region_module("identity", 0, b, &region(b), device_arch())
+            .expect("builds");
+        assert_eq!(cache.stats().compilations, 1, "the second stage's region is the first's code");
+        assert_eq!((first.entry_name(), second.entry_name()), (a, b), "each keeps its name");
+    }
+
+    #[cfg(feature = "rocm")]
+    fn a_region_that_asks_for_scratch_is_refused_by_name() {
+        // A local array read at a lane's own index lives in private memory.
+        let entry = "ptir_fused_00000000000000cc_r1";
+        let source = format!(
+            "extern \"C\" __global__ void {entry}(const unsigned* in, unsigned* out) {{\n\
+             \x20 unsigned local[1024];\n\
+             \x20 for (unsigned i = 0; i < 1024u; ++i) local[i] = in[i];\n\
+             \x20 out[threadIdx.x] = local[in[threadIdx.x] & 1023u];\n\
+             }}"
+        );
+        let mut cache = Cache::new(Disk::disabled());
+        match cache.region_module("identity", 1, entry, &source, device_arch()) {
+            Err(Failure::Deterministic { reason }) => assert!(
+                reason.contains(entry) && reason.contains("scratch"),
+                "the refusal names the region and what it asks: {reason}"
+            ),
+            Err(other) => panic!("refused as retryable, which would compile it again: {other:?}"),
+            Ok(_) => panic!("a region that asks for scratch was registered"),
+        }
     }
 
     fn editing_the_source_changes_the_disk_key_with_no_version_bump() {
