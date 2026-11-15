@@ -1,6 +1,7 @@
 [package]
 name = "web-std"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The runtime substrate a browser tab offers pie: a single-threaded executor the page ticks, timers over performance.now(), a channel whose blocking receive parks a green thread, and green threads on wasmtime's fibers, and files in the origin's private file system. Stands in for tokio's runtime, std::thread, crossbeam and std::fs on wasm32."

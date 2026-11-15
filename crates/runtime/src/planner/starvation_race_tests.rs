@@ -116,7 +116,7 @@ impl PoolPort for RacePool {
         self.pulls.lock().push(count);
         if self
             .stall
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             return Vec::new();
@@ -1384,7 +1384,7 @@ impl PoolPort for RingPool {
     fn release_device(&self, _pages: Vec<PhysicalKvPageId>) {}
     fn reserve_rs(&self, need: RsUnits) -> Option<crate::store::rs::RsGrant> {
         self.free
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |free| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |free| {
                 free.checked_sub(need.pages)
             })
             .ok()

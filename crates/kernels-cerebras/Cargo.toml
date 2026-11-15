@@ -1,6 +1,7 @@
 [package]
 name = "kernels-cerebras"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The Cerebras wafer program compiler: plans a model's trace onto the wafer (poem's spatial pass), builds the program (blocks, floor, fabric, kernel ABI, the CSL kernels), links it with the SDK toolchain and cuts the checkpoint into its tiles, as an artifact the engine runs."

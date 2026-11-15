@@ -682,8 +682,12 @@ impl Run<'_> {
         let kv_max = kv_max as usize;
         let mut out = vec![0.0; heads * kv_max];
         let observed = (observe as usize).min(q.rows);
-        for t in q.rows - observed..q.rows {
-            let p = self.positions[t] as usize;
+        for (t, &p) in self.positions[..q.rows]
+            .iter()
+            .enumerate()
+            .skip(q.rows - observed)
+        {
+            let p = p as usize;
             for h in 0..heads {
                 let qh = &q.row(t)[h * hd..(h + 1) * hd];
                 let kh = h / group;
@@ -760,8 +764,8 @@ impl Run<'_> {
                     NormWeight::PlusOne(w) => (Some(self.floats(w)?), 1.0),
                 };
                 let mut out = Vec::with_capacity(xs.v.len());
-                for t in 0..xs.rows {
-                    let inv = 1.0 / (sums.v[t] / width as f32 + eps).sqrt();
+                for (t, sum) in sums.v[..xs.rows].iter().enumerate() {
+                    let inv = 1.0 / (sum / width as f32 + eps).sqrt();
                     for (i, v) in xs.row(t).iter().enumerate() {
                         let g = w.as_ref().map_or(1.0, |w| w.v[i] + plus);
                         out.push(v * inv * g);

@@ -361,7 +361,7 @@ impl Shell {
                         let hold = hold_bytes(text);
                         let kept = (!parks || device.on_disk(text))
                             && held
-                                .fetch_update(SeqCst, SeqCst, |h| {
+                                .try_update(SeqCst, SeqCst, |h| {
                                     (h + hold <= budget).then_some(h + hold)
                                 })
                                 .is_ok();

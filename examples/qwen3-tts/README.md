@@ -14,7 +14,7 @@ then build the guest and run it:
 
 ```bash
 pie model import <checkpoint> --deployment qwen3-tts-0.6b-u8g64-u4g64-kv-bf16
-cargo build -p qwen3-tts --release --target wasm32-wasip3   # from examples
+cargo build -p qwen3-tts --release   # from examples
 pie run qwen3-tts -o ./out -- --text "Hello there." --speaker ryan --stream
 ```
 

@@ -1,6 +1,7 @@
 [package]
 name = "engine-cerebras"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The Cerebras engine: PIE's engine over a wafer program. A load plans the model's trace, builds and links the program (kernels-cerebras) and cuts the checkpoint for it, both cached, then drives it through a pure-Rust binding of the Cerebras SDK runtime (libsdkruntime, dlopened at runtime) on a CS system or the fabric simulator; guest programs run in the host interpreter."

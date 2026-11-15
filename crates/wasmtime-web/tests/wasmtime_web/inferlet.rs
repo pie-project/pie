@@ -53,7 +53,7 @@ fn text_completion_links_and_instantiates() {
     let path = guest_path();
     let Ok(bytes) = std::fs::read(&path) else {
         eprintln!(
-            "skipping: {} not built (cd examples && cargo build -p text-completion --release --target wasm32-wasip3)",
+            "skipping: {} not built (cd examples && cargo build -p text-completion --release)",
             path.display()
         );
         return;

@@ -1,6 +1,7 @@
 [package]
 name = "pie-poem-exec"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "The model forward substrate, in Rust: lane composition, the fire descriptor, the artifact walk, the paged kv geometry and the seat law. Device-free — the CUDA and Metal shells both read it."

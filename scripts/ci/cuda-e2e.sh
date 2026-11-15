@@ -10,7 +10,7 @@ port=${PIE_E2E_PORT:-18517}
 pie=${CARGO_TARGET_DIR:-target}/debug/pie
 
 cargo build -p pie --features cuda --bin pie
-(cd examples && cargo build -q --release --target wasm32-wasip3 -p text-completion -p naive-baseline)
+(cd examples && cargo build -q --release -p text-completion -p naive-baseline)
 
 # A current artifact is a no-op, a stale one is rebuilt: pie decides, not a path.
 "$pie" model import Qwen/Qwen3.5-0.8B

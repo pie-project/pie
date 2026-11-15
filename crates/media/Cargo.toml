@@ -1,6 +1,7 @@
 [package]
 name = "media"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "Media coding for Pie: still images (PNG/JPEG/GIF/WebP), WAV audio, Y4M and MP4 containers, RGB→I420/NV12 colour conversion, and optional NVENC hardware H.264/HEVC encode."

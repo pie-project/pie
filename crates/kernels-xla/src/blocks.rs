@@ -231,9 +231,9 @@ fn gather_planes(
         let rest = bd.i32(groups * UNROLL);
         bd.for_range(rest, n, one, |bd, j| copy(bd, j, false))?;
         if whole_tiles {
-            for x in 0..planes.len() {
+            for (x, &out) in blk.outs[..planes.len()].iter().enumerate() {
                 let sem = sem_of(bd, x as i64)?;
-                bd.dma_wait(sem, blk.outs[x], blk.outs[x])?;
+                bd.dma_wait(sem, out, out)?;
             }
             Ok(())
         } else {
