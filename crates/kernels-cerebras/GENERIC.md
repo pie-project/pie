@@ -5,7 +5,8 @@ compiled by the generic compiler, no hand layout, on the simulator) done (§4.1)
 stream program builds for the system fabric at 1024², §4.1) compile side done, M2b (it links:
 1,065 ELFs; 1.52 s a step predicted, §4.1), M1f / M1g (flux2-mini's denoise loop re-launched on
 the simulator, driven through the engine by a guest, its static arrays from a checkpoint, §4.1)
-and M3 (the decode
+M1h (flux2-mini's text encoder on the simulator through the engine, compiled on load; `pie run
+text-to-media` making an image on the host fabric, §4.1) and M3 (the decode
 layouts as points of the Floorplan, §2.5). ARCHITECTURE.md is what runs for decode.
 
 **Goal.** A `.poem` model the compiler has not seen runs on the wafer with no hand code. The
@@ -1002,6 +1003,99 @@ milestone's tail.
     reading (flux2-mini has none) and the VAE readings, and the runtime's boot of a stream
     deployment on the cerebras engine is untried; the 64-row and klein programs re-launched on the
     simulator; the statics' host memory at klein (an f32 forward of the whole checkpoint).
+
+- **M1h** (flux2-mini's whole pipeline through Pie: its text encoder on the wafer, compiled on
+  load; `pie run text-to-media` making an image on the host fabric).
+  - **The miniature's pipeline** (`models/flux_2.poem`). flux2-mini gained a text encoder and a
+    VAE, its DiT unchanged: a Qwen3 of two layers (hidden 192, 2 heads of 128, MHA, SwiGLU 384,
+    theta 1e6) on the tokenizer's vocabulary, tapped at its second layer (192 wide: the context
+    embedder's input, so the denoise reading is M1g's, node for node); a VAE of four 32-channel
+    blocks (a resnet an encoder block, 8 groups; `lib/vae.poem`'s ladder, groups and depth are
+    now arguments, klein's trace unchanged). Its checkpoint is a diffusers pipeline's (`dit.`,
+    `te.`, `vae.`); `tools/wafer/flux/mk_tiny_flux2_pipe.py` draws it as the tests do and gives
+    transformers' / diffusers' goldens (`--text`, `--vae`, `--pipe`; `--ckpt` writes it with the
+    Qwen3 tokenizer's files).
+  - **The `text` reading on the stream compiler**, no per-model code. What it took, each generic:
+    - Row classes: a reading whose nodes no `stream` value changes is one class
+      (`stream::classes`).
+    - `attn.prefill` over the pages its own layer appends (`attn.kv_append`) is a joint attention
+      (`Mixer::Joint { causal }`, the unit's `Store` / `Attend`), causal as the trace says.
+      P7's PEs mask a query's later entries (`satt.csl` `CAUSAL`: entry `e` of PE `r` is row
+      `e * PYA + r`; the query's index is its row's, the step one request; the emitter refuses
+      a causal column storing more than one unit's rows).
+    - The token embedding is the host's (a row lookup by the step's ids, no arithmetic: its
+      rows enter the first unit as a host input's; `Forward::host_for` holds the table alone).
+    - `rope` of q and k together (NeoX halves) lowers when a run names it (`fuse::chain`, the
+      explicit arm, so CUDA's chains are untouched) as two rotations; the region printer's
+      peer gather takes a head's halves swap (`hop`-wide blocks) besides the pair swap.
+    - A value the reading reads out (a trace output no node reads) leaves its unit for the host.
+  - Program: 2 units, 4 K / V columns, 10 x 36 PEs at 16 rows. On the simulator (`stream/run.py`,
+    capture-fed, `--stages 1`): layer 0's residual 5.6e-3 / 0.999984 against the capture, 0.75M
+    cycles.
+  - **Compile on load** (`prepare::stream_programs`). A load with no `[cerebras.debug] program`
+    whose decode plan fails (it does for flux: no decode lowering) compiles every reading of the
+    trace's `reading` switch the stream compiler lowers, at `[cerebras.wafer] stream_rows` rows
+    a class, into the cache (`wafer/s-<model>-<key>/<reading>/`, the key a hash of every
+    emitted file, the op modules, the fabric and cslc), and links each with cslc for the
+    simulator or the system (none for the host fabric). A reading the compiler refuses is
+    logged and not served. A second load finds them (`a_text_reading_feeds_the_denoiser`).
+    LLM loads are unchanged: the decode path runs first, as before.
+  - **The engine serves several readings** (`backend::stream::Streams`): a step picks its
+    program by its lanes' words (a lane's word may set a switch its reading does not read: the
+    nodes the words run decide), each reading's static arrays made from the checkpoint at its
+    first step and written when its program opens; the SDK's programs open one at a time on one
+    thread (the SDK wants every runtime of a process made on one). A causal reading's lane may
+    bring fewer tokens than the program's rows: the rest are padding no earlier row reads, and
+    the rows read out are the lane's own. The runtime's checkpoint contract for Cerebras now
+    admits a bias and a unary map (the VAE's batch-norm statistics; the cerebras engine lands
+    on the host, which runs them).
+  - **Results, the text reading** (16 tokens: "a red fox sleeping" in the chat template):
+    | | vs engine-cpu | vs transformers' `Qwen3ForCausalLM` |
+    |---|---|---|
+    | engine-cpu (`Forward::stream`, bf16 trunk) | | 9.18e-3 / 0.9999578 |
+    | host fabric, through `CerebrasEngine::submit`, compiled on load | bit for bit | 9.18e-3 |
+    | **simulator**, through the engine, compiled + linked on load | 7.86e-3 / 0.9999691 | **8.74e-3 / 0.9999619** |
+
+    The simulator's text step is 1.38M cycles of stamps (the first launch, start-up included),
+    4.8 min of simulator time.
+  - **The text rows feed the denoiser** (host fabric, `the_text_rows_feed_the_denoise_loop`):
+    the guest's text pass, then its 2-step loop over those rows, bit for bit the host's own loop
+    over engine-cpu's text rows; against diffusers' pipeline (the prompt through transformers'
+    Qwen3, then the same 2 Euler steps from the same latent): 3.88e-3 / 0.9999925.
+    **On the simulator**, the denoise loop over the simulator's own text rows (a second
+    process: the simulator holds one program a process), through the engine, both programs
+    compiled and linked on load: latent after step 1 1.40e-3 / 0.9999990, after step 2
+    4.06e-3 / 0.9999918 against the host's loop over engine-cpu's text rows, and **3.88e-3 /
+    0.9999925 against diffusers' pipeline** from the prompt. Step 0 (the first launch) 7.90M
+    cycles, step 1 1.27M cycles of stamps (M1g's, the same program); 76 + 15 min.
+  - **The VAE** (`vae.decode`): engine-cpu's stream forward now runs a grid reading's ops
+    (`conv.conv3d` over each clip, `conv.group_norm`, `conv.upsample`, `conv.pixel_(un)shuffle`,
+    `conv.grid`, `elemwise.standardize`, `attn.voxel`; a convolution's kernel relabelled taps
+    major as every engine lays it): the decode of the pipeline's latent against diffusers'
+    `AutoencoderKLFlux2` 1.08e-2 / 0.9999419, **PSNR 50.4 dB**. **On the wafer it is not
+    lowered yet**: the stream compiler refuses it ("the stream step runs no layers": a grid
+    reading has no layer stack). The host fabric serves a reading no program runs whole on
+    its forward, as a debug fallback, never a wafer's (the VAE is not negligible).
+  - **`pie run text-to-media` on the host fabric** (`stream_fabric = "host"`, `stream_rows =
+    16`, the checkpoint `mk_tiny_flux2_pipe.py --ckpt`'s): the inferlet's own text pass, 2
+    denoise steps and the VAE decode through the runtime's standard path, no scheduler or
+    runtime change; a 64 x 64 PNG. Against diffusers' pipeline from the inferlet's own noise
+    (eta's keyed normal, seed 7) and sigmas: **PSNR 48.2 dB** (8-bit images, max |diff| 5/255).
+  - Decode is unchanged: plan + build `diff -r` identical against 0d1cbe4fd's wafer-compile for
+    qwen35-d0.8b, qwen35-d9b, llama31-8b, gptoss-20b, gemma4-e2b and tiny t08.
+  - Left:
+    - The VAE on the wafer (the grid regime): a `conv.conv3d` is an im2col (P11, the row order)
+      into a P1 matvec, so the convolution's arithmetic is the existing modules', but a row
+      needs its 3 x 3 neighbours (a line buffer of `2w + 3` rows at the CX roots, P9) and
+      `conv.group_norm` is a reduction over every row of a clip (a barrier and a P2 over rows,
+      as the joint attention's store); a stage per conv, the upsamplings as the row stream's
+      order. None of it is built.
+    - Co-resident readings: the simulator runs one program a process (a second
+      `Simfabric::Create` aborts), so the denoise loop over the simulator's text rows ran in a
+      second process; one program holding text, DiT (and VAE) side by side is the fix.
+    - GQA in the stream attention (the mini's encoder is MHA; klein's Qwen3-4B is GQA 32 / 8:
+      a head root's q heads a kv head), and more than one tap (klein's three: a second value
+      on the row stream).
 
 ## 5. Risks
 
