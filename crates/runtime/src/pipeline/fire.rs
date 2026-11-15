@@ -981,10 +981,10 @@ async fn wait_for_rung(
 /// row the cap covers asks nothing, no cap being narrower than it.
 ///
 /// The scheduler keeps a fire past the cap queued until the rung is back,
-/// and the walker cuts fires to what is asked, the live lanes' one row
-/// each otherwise: a fire wider than a row staged under a cap that covered
-/// it, asking nothing, sat queued for good once the walker took the cap
-/// down under it.
+/// and the walker, bringing the rung down, cuts fires to what is asked, the
+/// live lanes' one row each otherwise: a fire wider than a row staged under
+/// a cap that covered it, asking nothing, sat queued for good once the
+/// walker took the cap down under it.
 struct RungAsk {
     engine: usize,
     pid: uuid::Uuid,

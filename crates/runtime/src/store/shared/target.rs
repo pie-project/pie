@@ -32,8 +32,9 @@ pub struct SharedGrow {
     ticks: Arc<AtomicU64>,
     /// The lanes live now that may decode ([`Self::walk_rows`]).
     live_lanes: Arc<dyn Fn() -> u32 + Send + Sync>,
-    /// The tick since which the rung has stood past what is asked: a cap
-    /// down or a lower waits the governor's patience from it.
+    /// The tick since which the rung has stood past what is asked: the
+    /// lower that frees its chunks, and the cap down before it, wait the
+    /// governor's patience from it.
     idle_since: Arc<std::sync::Mutex<Option<u64>>>,
     /// The last raise found no room: none is tried again until room is
     /// freed ([`Self::room_freed`]), the one event that can change that.
@@ -119,6 +120,12 @@ impl SharedGrow {
     /// engine first copying the state out of the larger span. A raise short
     /// of room waits on the room the asking pass has the planner free, the
     /// walk looking again each poll.
+    ///
+    /// Fires are cut narrower only for what the cut is needed for: the
+    /// chunks a lower after it frees, or the fit. A cut within a chunk
+    /// class frees nothing, so none is taken there however long nothing
+    /// asks the width: the cap stays where the last pass left it, and the
+    /// pause between two passes of one process moves no cap.
     /// The rows the walk holds the rung to: what passes and decode batches
     /// ask ([`super::wanted_rows`]), and never fewer than the lanes live now
     /// (a live process each, at most the engine's lane count), whose decode
@@ -148,16 +155,22 @@ impl SharedGrow {
                     return;
                 }
                 let goal = pool.rung_for(self.walk_rows());
+                let cap = super::fire_cap(self.engine);
                 // The pool stands past what is asked: it comes down only
                 // once it has for the governor's patience, so a pause
                 // between batches moves no rung. On a span backed on
                 // demand an idle pool always comes down after it: the
                 // carve held costs resident memory there.
+                //
+                // Interim: the patience decides this lower, the one move
+                // down that frees chunks, only until the governor's `yield`
+                // does; it goes with the governor's other debounce
+                // constants then.
                 let past = pool.pool().act_chunks(goal) < pool.pool().act_reserved();
                 let tick = self.ticks.load(Ordering::Acquire);
                 // An engine holding a rung the terms no longer fit is
                 // brought down at once too: a bind waits on it.
-                let forced = super::fire_cap(self.engine) > pool.fit_cap() || pool.told_unfit();
+                let forced = cap > pool.fit_cap() || pool.told_unfit();
                 let waited = forced || {
                     let mut since = self.idle_since.lock().unwrap();
                     if past {
@@ -172,7 +185,7 @@ impl SharedGrow {
                 let step = self.rung_walk.lock().unwrap().step(
                     &pool,
                     goal,
-                    super::fire_cap(self.engine),
+                    cap,
                     super::rung_granted(self.engine),
                     current,
                     retired,
@@ -191,14 +204,15 @@ impl SharedGrow {
                             RungStep::Raise { rung, evacuation }
                         })
                     }
-                    // A cap down or a lower before the patience is out.
-                    // Fires wider than the widest rung that fits with the
-                    // programs' fire terms are cut at once: the span holds
-                    // no wider fire.
+                    // A lower before the patience is out.
                     Ok(RungStep::Lower(_)) if !waited => Ok(RungStep::Wait),
-                    Ok(RungStep::Cap(tokens))
-                        if !waited && tokens < super::fire_cap(self.engine) =>
-                    {
+                    // A cap down is taken for the chunks the lower after it
+                    // frees, once the patience is out, and at once for the
+                    // fit (the span holds no fire wider than the widest
+                    // rung that fits with the programs' fire terms). Within
+                    // a class it frees nothing and is not taken, however
+                    // long the cap stands above what is asked.
+                    Ok(RungStep::Cap(tokens)) if tokens < cap && !(forced || (past && waited)) => {
                         Ok(RungStep::Wait)
                     }
                     step => step,
@@ -231,15 +245,17 @@ impl SharedGrow {
                     {
                         // Under the pool's lock, as a pass's `raise_now`
                         // lifts it: a cap down past what a pass asks since
-                        // is not taken.
+                        // is not taken. What it asks as fires take it: the
+                        // rung those rows take.
                         let pool = self.shared.lock().unwrap();
                         let now = super::fire_cap(self.engine);
-                        if tokens < now && self.walk_rows().min(pool.fit_cap()) > tokens {
+                        let asked = pool.rung_for(self.walk_rows());
+                        if tokens < now && pool.lifted(asked).min(pool.fit_cap()) > tokens {
                             continue;
                         }
                         super::set_fire_cap(self.engine, tokens);
                     }
-                    tracing::info!(
+                    tracing::debug!(
                         engine = self.engine,
                         tokens,
                         "fires cut to the activation rung"

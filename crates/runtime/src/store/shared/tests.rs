@@ -9,7 +9,7 @@ use ::engine::chunk::{
 use ::engine::fire::Lane;
 
 use super::*;
-use crate::governor::Retarget;
+use crate::governor::{PATIENCE, Retarget};
 
 const MIB: u64 = 1 << 20;
 const CHUNK: u64 = 16 * MIB;
@@ -858,10 +858,8 @@ fn a_raise_by_demand_says_what_it_lacks_and_moves_the_rest() {
 }
 
 /// Twelve rungs, every power of two from 1, the small ones sharing their
-/// activation's chunk count: an idle pool lowered to the smallest stays
-/// there, the walk never lowering again within the class it is in.
-#[test]
-fn rungs_sharing_their_chunks_are_one_class_the_walk_never_moves_within() {
+/// activation's chunk count (1 to 16 one class of one chunk).
+fn classed() -> SharedPool {
     let facts = ChunkFacts {
         act_chunks: vec![
             (1, 1),
@@ -880,7 +878,14 @@ fn rungs_sharing_their_chunks_are_one_class_the_walk_never_moves_within() {
         ..facts()
     };
     facts.validate().unwrap();
-    let mut pool = SharedPool::new(&facts, 256).unwrap();
+    SharedPool::new(&facts, 256).unwrap()
+}
+
+/// An idle pool lowered to the smallest rung stays there, the walk never
+/// lowering again within the class it is in.
+#[test]
+fn rungs_sharing_their_chunks_are_one_class_the_walk_never_moves_within() {
+    let mut pool = classed();
     let mut engine = FakeEngine::new();
     assert_eq!(
         walk_segments(&mut pool, 8, 0, &mut engine),
@@ -918,6 +923,120 @@ fn rungs_sharing_their_chunks_are_one_class_the_walk_never_moves_within() {
         walk.step(&pool, 32, 8, 8, 42, 42).unwrap(),
         RungStep::Raise { rung: 32, .. }
     ));
+}
+
+/// The cap thrash of a host-paced decode: each two-row pass lifted the cap
+/// to 2 and its settle had the walker cut it back to the live lane's one
+/// row, a cut a fire, the pool's span the same before and after. A cut
+/// within a class frees no chunk, so the walker takes none: the pass gone
+/// and nobody short, the cap stays where the pass left it, for any time.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cap_down_that_frees_no_chunk_is_not_taken_however_long_it_stands() {
+    const ENGINE: usize = 9301;
+    let mut pool = classed();
+    pool.lower_rung(1).unwrap();
+    assert_eq!(pool.pool().act_reserved(), 1);
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+    set_fire_cap_for_test(ENGINE, 1);
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), 1, "one live lane, nothing asked");
+
+    // A two-row pass asks, and is cut at its width at once.
+    let want = want_rows(ENGINE, 2);
+    raise_now(&shared, ENGINE, 2);
+    assert_eq!(fire_cap(ENGINE), 2);
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), 2);
+
+    // Its last fire settled: the ask is gone, one lane lives, none is short.
+    drop(want);
+    assert_eq!(wanted_rows(ENGINE), 0);
+    for tick in 0..32 * PATIENCE {
+        grow.walk_rung().await;
+        assert_eq!(fire_cap(ENGINE), 2, "no cut at tick {tick}");
+        grow.ticked_for_test();
+    }
+    assert_eq!(
+        shared.lock().unwrap().pool().act_reserved(),
+        1,
+        "the span set aside never moved"
+    );
+    // The next pass finds its width standing: nothing to lift.
+    let _want = want_rows(ENGINE, 2);
+    raise_now(&shared, ENGINE, 2);
+    assert_eq!(fire_cap(ENGINE), 2);
+}
+
+/// The lower that frees chunks is still taken once the pool has stood past
+/// what is asked for the governor's patience, the cap down before it: a
+/// taker short of records while the largest rung holds its span is seated
+/// from the span the lower lends.
+#[tokio::test(flavor = "current_thread")]
+async fn a_lower_past_the_patience_seats_a_taker_short_of_records() {
+    const ENGINE: usize = 9302;
+    let mut pool = classed();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.rung(), 2048);
+    // Every record that fits under the largest rung is out: one more is
+    // short.
+    let n = pool.records_available() as usize;
+    let _held = pool.take_records(n).unwrap();
+    assert!(pool.take_records(1).is_none(), "short of a record");
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+    assert_eq!(fire_cap(ENGINE), u32::MAX);
+    for _ in 0..PATIENCE {
+        grow.ticked_for_test();
+        grow.walk_rung().await;
+        assert_eq!(fire_cap(ENGINE), u32::MAX, "not before the patience");
+    }
+    grow.ticked_for_test();
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), 1, "past the patience: fires cut");
+    grant_rung(ENGINE, 1);
+    grow.walk_rung().await;
+    grow.walk_rung().await;
+    let mut pool = shared.lock().unwrap();
+    assert_eq!(pool.pool().act_reserved(), 1, "lowered: the span lent");
+    assert!(pool.take_records(1).is_some(), "the taker is seated");
+}
+
+/// A fire term appearing that the rung in hand cannot seat beside cuts
+/// fires at once, under a pass still asking the width and before any tick:
+/// the fit, not the patience, decides it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_fire_term_appearing_under_a_standing_ask_cuts_fires_at_once() {
+    const ENGINE: usize = 9303;
+    let shared: Shared = Arc::new(Mutex::new(classed()));
+    let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+    let _want = want_rows(ENGINE, 2048);
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), u32::MAX, "asked and held");
+    let fit = {
+        let mut pool = shared.lock().unwrap();
+        let key = crate::store::shared::programs::FireKey {
+            program: ::engine::ProgramId(1),
+            extents: ::engine::BindExtents::default(),
+        };
+        let fixed = 55 * pool.pool().chunk_bytes();
+        pool.fire_facts_learned(
+            key,
+            &::engine::FireFacts {
+                fixed,
+                ..::engine::FireFacts::default()
+            },
+        );
+        pool.instance_bound(::engine::InstanceId(1), key);
+        pool.fit_cap()
+    };
+    assert!(fit < u32::MAX, "the largest rung no longer fits");
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), fit, "cut to the fit before any tick");
 }
 
 /// While the engine holds back part of the range it stated, no slot it

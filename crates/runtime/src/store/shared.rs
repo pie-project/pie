@@ -403,7 +403,9 @@ impl RungWalk {
         // The walk moves by what the goal's activation takes against what
         // is set aside now. Rungs whose activation takes as many chunks are
         // one class: the pool sets aside the same span for each, so a move
-        // within a class only caps fires, never lowers or raises. A
+        // within a class only caps fires, never lowers or raises (and a
+        // cap down there, freeing nothing, is one the walker leaves:
+        // `SharedGrow::walk_rung`). A
         // program's fire term registered or dropped since moves the span a
         // rung takes ([`programs`]).
         let want = pool.pool().act_chunks(goal);
