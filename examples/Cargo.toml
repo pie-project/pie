@@ -34,6 +34,7 @@ members = [
     "snapkv-eviction",
     "tail-free-sampling",
     "text-completion",
+    "device-fold-gate",
     "text-completion-bench",
     "token-healing",
     "top-a-sampling",
