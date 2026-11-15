@@ -24,6 +24,18 @@ struct M1ValueDesc {
   m1_u32 dims[4];
 };
 
+// A descriptor's extent at a runtime index, read by selects: an array read
+// at a runtime index is kept in private memory, which on AMDGPU is scratch
+// the HIP runtime allocates at the first dispatch that needs it. Past the
+// rank a descriptor has no extent; 1 reads as one.
+__device__ __forceinline__ m1_u32 m1_dim(const M1ValueDesc& desc, m1_u32 index) {
+  return index == 0u ? desc.dims[0]
+       : index == 1u ? desc.dims[1]
+       : index == 2u ? desc.dims[2]
+       : index == 3u ? desc.dims[3]
+       : 1u;
+}
+
 struct M1OpParams {
   m1_u32 tag;
   m1_u32 a0;
