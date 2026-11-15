@@ -2239,11 +2239,7 @@ pub(crate) fn stamp_lane_slots(
                 .filter_map(|&lane| whole.get(lane))
                 .fold(0u32, |rows, &lane| rows.saturating_add(lane))
         });
-        let seats = stores
-            .seats
-            .lock()
-            .unwrap()
-            .seats(*ws, lanes.len(), rows)?;
+        let seats = stores.seats.lock().unwrap().seats(*ws, lanes.len(), rows)?;
         for (&lane, &seat) in lanes.iter().zip(&seats) {
             if let Some(lane) = req.lanes.get_mut(lane) {
                 lane.slot = seat;

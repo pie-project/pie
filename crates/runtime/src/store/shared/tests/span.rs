@@ -801,6 +801,81 @@ async fn the_patience_runs_from_the_last_ask_above_the_goal() {
     assert_eq!(steps, [32, 2, 1], "each lowering begun once and completed");
 }
 
+/// A lift of fires' cap (a pass's, at its ask) and a cut (the walk's) are
+/// one move of the cap, logged once, when the cap changes, and at one
+/// level: info where fires move to a rung of another chunk class, debug
+/// within a class. A ladder whose small rungs share their activation's
+/// chunks (1 to 16 take 1, 32 to 128 take 2).
+#[tokio::test(flavor = "current_thread")]
+async fn a_lift_and_a_cut_of_the_cap_are_each_logged_once_at_one_level() {
+    use tracing::Level;
+    const ENGINE: usize = 69;
+    const LIFTED: &str = "fires lifted to the activation rung";
+    const CUT: &str = "fires cut to the activation rung";
+    let facts = ChunkFacts {
+        act_chunks: vec![
+            (1, 1),
+            (2, 1),
+            (4, 1),
+            (8, 1),
+            (16, 1),
+            (32, 2),
+            (64, 2),
+            (128, 2),
+            (256, 4),
+            (512, 4),
+            (1024, 8),
+            (2048, 12),
+        ],
+        ..facts()
+    };
+    facts.validate().unwrap();
+    let pool = SharedPool::new(&facts, 256).unwrap();
+    assert_eq!(pool.rung(), 2048);
+    // The line and the level of each move: a lift and a cut between the
+    // same two caps are logged at the same level.
+    for (from, tokens, level) in [
+        (u32::MAX, 16, Level::INFO),
+        (16, 128, Level::INFO),
+        (128, 32, Level::DEBUG),
+        (32, 64, Level::DEBUG),
+        (2048, u32::MAX, Level::DEBUG),
+        (1, 2048, Level::INFO),
+    ] {
+        let (down, up) = if tokens < from {
+            (CUT, LIFTED)
+        } else {
+            (LIFTED, CUT)
+        };
+        assert_eq!(cap_move(&pool, from, tokens), Some((down, level)));
+        assert_eq!(cap_move(&pool, tokens, from), Some((up, level)));
+        assert_eq!(cap_move(&pool, tokens, tokens), None, "no change: no line");
+    }
+
+    // The walk's cut and a pass's lift both move the cap through it.
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let grow = SharedGrow::new(0, ENGINE, shared.clone());
+    assert_eq!(fire_cap(ENGINE), u32::MAX);
+    // Nothing asked: past the patience the walk cuts fires to the widest
+    // rung of the smallest class.
+    for _ in 0..=PATIENCE {
+        grow.walk_rung().await;
+        grow.ticked_for_test();
+    }
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), 16);
+    // A pass asks 64 rows: lifted to the widest rung of their class, which
+    // the rung in hand holds.
+    raise_now(&shared, ENGINE, 64);
+    assert_eq!(fire_cap(ENGINE), 128);
+    {
+        let pool = shared.lock().unwrap();
+        move_fire_cap(&pool, ENGINE, 32);
+        assert_eq!(fire_cap(ENGINE), 32);
+        assert_eq!(cap_move(&pool, fire_cap(ENGINE), 32), None);
+    }
+}
+
 /// A process waiting for room contributes no rows to what the walk holds
 /// the rung for: 64 lanes decoding beside a pass of 32 lanes that waits on
 /// the planner's grant hold the rung of 64, not of 96, so the span past it
@@ -1001,7 +1076,11 @@ async fn an_ask_the_call_cannot_take_wakes_the_walk_at_the_ask() {
     let shared: Shared = Arc::new(Mutex::new(pool));
     let mut lane = LaneStandIn::install(ENGINE);
     let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
-    assert_eq!(fire_cap(ENGINE), 1, "at rest: fires cut to the smallest rung");
+    assert_eq!(
+        fire_cap(ENGINE),
+        1,
+        "at rest: fires cut to the smallest rung"
+    );
     grant_rung(ENGINE, 1);
     grow.start();
     let settle = || async {
@@ -1017,7 +1096,11 @@ async fn an_ask_the_call_cannot_take_wakes_the_walk_at_the_ask() {
     // raise tried in the call.
     let _want = want_rows(ENGINE, 64);
     raise_now(&shared, ENGINE, 64);
-    assert_eq!(fire_cap(ENGINE), 1, "not in the call: the engine comes first");
+    assert_eq!(
+        fire_cap(ENGINE),
+        1,
+        "not in the call: the engine comes first"
+    );
     // No tick and no room freed: the ask alone woke the walk.
     settle().await;
     let Some((PoolOp::Rung { from: 1, to: 64 }, answer)) = lane.pool_op() else {

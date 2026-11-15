@@ -108,16 +108,20 @@ fn rung_gate(engine: usize) -> &'static RungGate {
     if let Some(gate) = RUNG_GATES.read().unwrap().get(&engine) {
         return gate;
     }
-    RUNG_GATES.write().unwrap().entry(engine).or_insert_with(|| {
-        Box::leak(Box::new(RungGate {
-            cap: std::sync::atomic::AtomicU32::new(u32::MAX),
-            grant: std::sync::atomic::AtomicU32::new(u32::MAX),
-            event: tokio::sync::Notify::new(),
-            walk: tokio::sync::Notify::new(),
-            lanes: std::sync::atomic::AtomicU32::new(0),
-            peak: std::sync::atomic::AtomicU32::new(0),
-        }))
-    })
+    RUNG_GATES
+        .write()
+        .unwrap()
+        .entry(engine)
+        .or_insert_with(|| {
+            Box::leak(Box::new(RungGate {
+                cap: std::sync::atomic::AtomicU32::new(u32::MAX),
+                grant: std::sync::atomic::AtomicU32::new(u32::MAX),
+                event: tokio::sync::Notify::new(),
+                walk: tokio::sync::Notify::new(),
+                lanes: std::sync::atomic::AtomicU32::new(0),
+                peak: std::sync::atomic::AtomicU32::new(0),
+            }))
+        })
 }
 
 /// Wakes every wait on `engine`'s rung: what it waits on may have changed.
@@ -180,6 +184,54 @@ fn set_fire_cap(engine: usize, tokens: u32) {
         .cap
         .store(tokens, std::sync::atomic::Ordering::Release);
     rung_changed(engine);
+}
+
+/// Moves `engine`'s cap to `tokens` where it is not there already; `pool`
+/// is its pool, held (a pass's lift and the walker's cut are each taken
+/// under its lock). A lift and a cut are each logged once, when the cap
+/// changes, and at one level: info where fires move to a rung of another
+/// chunk class (the span they may take changes with it), debug within a
+/// class.
+pub(crate) fn move_fire_cap(pool: &SharedPool, engine: usize, tokens: u32) {
+    let from = fire_cap(engine);
+    let Some((moved, level)) = cap_move(pool, from, tokens) else {
+        return;
+    };
+    set_fire_cap(engine, tokens);
+    if level == tracing::Level::INFO {
+        tracing::info!(engine, tokens, from, "{moved}");
+    } else {
+        tracing::debug!(engine, tokens, from, "{moved}");
+    }
+}
+
+/// The line a move of fires' cap from `from` to `tokens` is logged with on
+/// `pool`, and its level ([`move_fire_cap`]); `None` where the cap does
+/// not change: nothing is logged.
+fn cap_move(pool: &SharedPool, from: u32, tokens: u32) -> Option<(&'static str, tracing::Level)> {
+    if from == tokens {
+        return None;
+    }
+    let rungs = pool.rungs();
+    let chunks = |cap: u32| {
+        rungs
+            .iter()
+            .copied()
+            .filter(|&rung| rung <= cap)
+            .max()
+            .map(|rung| pool.pool().act_chunks(rung))
+    };
+    let moved = if tokens > from {
+        "fires lifted to the activation rung"
+    } else {
+        "fires cut to the activation rung"
+    };
+    let level = if chunks(from) == chunks(tokens) {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::INFO
+    };
+    Some((moved, level))
 }
 
 /// The scheduler of `engine` has no step wider than `cap` in flight, and
@@ -360,7 +412,7 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
     }
     let cap = lifted(goal);
     if cap > fire_cap(engine) {
-        set_fire_cap(engine, cap);
+        move_fire_cap(&pool, engine, cap);
     }
     drop(pool);
 }

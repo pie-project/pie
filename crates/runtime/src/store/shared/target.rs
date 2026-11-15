@@ -193,8 +193,7 @@ impl SharedGrow {
                 // (the step's own first move): the span holds no wider fire.
                 let tick = self.ticks.load(Ordering::Acquire);
                 let most = self.stood.lock().unwrap().most(tick, rows, peak);
-                let goal =
-                    asked.max(pool.standing(super::rung_goal(&pool, self.engine, most)));
+                let goal = asked.max(pool.standing(super::rung_goal(&pool, self.engine, most)));
                 let step = self.rung_walk.lock().unwrap().step(
                     &pool,
                     goal,
@@ -249,13 +248,8 @@ impl SharedGrow {
                         if tokens < now && self.walk_rows().min(pool.fit_cap()) > tokens {
                             continue;
                         }
-                        super::set_fire_cap(self.engine, tokens);
+                        super::move_fire_cap(&pool, self.engine, tokens);
                     }
-                    tracing::info!(
-                        engine = self.engine,
-                        tokens,
-                        "fires cut to the activation rung"
-                    );
                     crate::scheduler::nudge(self.engine);
                 }
                 RungStep::Lower(rung) => {
