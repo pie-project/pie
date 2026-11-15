@@ -103,3 +103,85 @@ fn a_recurrent_load_walks_its_pipelines() {
     assert!(fires > 0, "the walk fired");
     assert_eq!(fire(&mut shell), want, "a prompt after the walk answers as without it");
 }
+
+/// Every form the plan serves is built by the walk: after it, with the
+/// pipelines sealed (a key met after is refused, not compiled), a recurrent
+/// load serves a plain prompt, a buffering one (`RsVerb::Buffer` folding
+/// nothing: the verify conv), a replay folding what a lane held (the decode
+/// drain), and a drafter's word where the plan has one. The walk fired plain
+/// folds alone before, so MTP and a device fold on Qwen3.5 were refused at
+/// their first fire ("... which the load did not build before ready").
+#[test]
+fn every_form_a_recurrent_load_serves_is_built_by_its_walk() {
+    use engine::fire::{FoldLen, RsVerb};
+    if !engine_metal::device::present() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let fixture = fixture_of("qwen35-tiny", None);
+    let mut shell = load(&fixture);
+    shell.warm_pipelines().expect("the walk runs");
+    shell.seal_pipelines();
+    let end = shell
+        .pool_layout()
+        .shapes()
+        .map(|shape| shape.seat_chunk + shape.seat_slots.div_ceil(shape.per_chunk.max(1)))
+        .max()
+        .unwrap_or(0);
+    let per = shell.pool_chunk_facts().segment_chunks.max(1);
+    shell.commit_segments(end.div_ceil(per)).expect("the seats back");
+    let per_page = shell.pool_layout().rs_tokens.max(1);
+    let pages: Vec<u32> = (0..16u32.div_ceil(per_page)).collect();
+    let tokens: Vec<u32> = (0..6u32).map(|at| (11 + at * 37) % 256).collect();
+    let next = [5u32];
+    let fold = RsVerb::Fold;
+    let buffer = |fold: u32| RsVerb::Buffer {
+        pages: pages.clone(),
+        base: 0,
+        folded: 0,
+        fold: FoldLen::Host(fold),
+    };
+    let (hold, replay) = (buffer(0), buffer(1));
+    let lane = |slot: u32, tokens: &'static [u32], word: u64, rs: &'static RsVerb, held: u32| Seated {
+        held: Some(held),
+        rs,
+        ..Seated::of(Lane { slot, word, tokens })
+    };
+    let leak = |v: Vec<u32>| -> &'static [u32] { Box::leak(v.into_boxed_slice()) };
+    let (tokens, next) = (leak(tokens), leak(next.to_vec()));
+    let (fold, hold, replay): (&'static RsVerb, &'static RsVerb, &'static RsVerb) = (
+        Box::leak(Box::new(fold)),
+        Box::leak(Box::new(hold)),
+        Box::leak(Box::new(replay)),
+    );
+    let prompt = word(&fixture.trace, tokens.len() as u32);
+    let one = word(&fixture.trace, 1);
+    for slot in 1..4 {
+        shell.open(slot).expect("a slot opens");
+    }
+    shell
+        .fire_seated(&[lane(1, tokens, prompt, fold, 0)])
+        .expect("a folding prompt is served");
+    shell
+        .fire_seated(&[lane(2, tokens, prompt, hold, 0)])
+        .expect("a buffering prompt is served");
+    shell
+        .fire_seated(&[lane(2, next, one, replay, tokens.len() as u32)])
+        .expect("a decode replaying what the lane held is served");
+    let drafter = fixture
+        .trace
+        .facts
+        .requests()
+        .into_iter()
+        .any(|request| request.drafts() && request.query_len() == 1);
+    if drafter {
+        let drafts = fixture
+            .trace
+            .facts
+            .word(&poem::Request::new(1, false).drafting(true));
+        shell
+            .fire_seated(&[lane(3, next, drafts, fold, 0)])
+            .expect("a drafter's word is served");
+    }
+    eprintln!("every form served after the sealed walk (drafter: {drafter})");
+}
