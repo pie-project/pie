@@ -4630,6 +4630,10 @@ async fn fire_device_geometry<C: FireContext>(
     // A recurrent state a device-counted fold left unsettled is read where
     // the engine left it: the fire goes ahead of the settle.
     let pass_lanes = pass_lanes(ctx, &fwd)?;
+    // A fold list the host states leaves no lane without a count.
+    if let Err(error) = fold.states(pass_lanes.kv.len()) {
+        return Ok(Err(format!("pipeline: fire geometry: {error}")));
+    }
     let ws = pass_lanes.kv[0].clone();
     let groups = lane_groups(&pass_lanes.kv.iter().map(|ws| ws.id).collect::<Vec<_>>());
     let group_sets: Vec<KvWorkingSet> = groups
