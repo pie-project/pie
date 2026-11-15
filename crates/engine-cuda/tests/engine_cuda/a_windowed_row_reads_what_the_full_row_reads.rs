@@ -28,6 +28,7 @@ fn logits(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec<Vec<f3
         slots: 1,
         kv_budget: Some(crate::POOL),
         allowance: engine::Allowance::WHOLE,
+        context_declared: false,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
             chip: Some(engine_cuda::chip::pinned(engine_cuda::Graphs::Off, None)),

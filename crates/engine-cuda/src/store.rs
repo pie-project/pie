@@ -120,6 +120,19 @@ pub struct Fitted {
     pub chunks: u32,
 }
 
+/// What `Pools::fit_the_card` takes of the card's room for one working set:
+/// its chunks and their bytes backed, what is held for the bodies and the
+/// guests' programs beside it, the room past those holds, and the whole map
+/// units of it the chunks are fitted in.
+struct WorkingSet {
+    least: u32,
+    need: u64,
+    bodies: u64,
+    programs: u64,
+    room: u64,
+    limit: u64,
+}
+
 /// The least `[engine] bodies_mem` is held down to on a card with little
 /// room: enough for the decode bodies, which are what a serve replays every
 /// step and cost tens of megabytes each.
@@ -255,7 +268,8 @@ pub fn page_ceiling(trace: &Trace, page_size: u32, context: u32, bytes: u64) -> 
 /// longest whole number of pages, at most `declared`, at which one sequence
 /// takes no more than half of what the `allowance` of the card, less what others
 /// already hold, leaves past the weight tier: the activations and a second
-/// sequence have the other half.
+/// sequence have the other half. The most a declared context is served at:
+/// the fit shortens it to what it seats (`Pools::declare_context`).
 /// Never under one page.
 pub fn declared_context_that_fits(
     trace: &Trace,
@@ -569,6 +583,10 @@ pub struct Pools {
     shapes: Vec<Shape>,
     pooled: Vec<PoolRow>,
     paging: Paging,
+    /// The context is the model's declared one, which the operator did not
+    /// state: the fit before arming shortens it to what it seats
+    /// ([`Pools::declare_context`]).
+    declared: bool,
     asked: u64,
     /// The chunks the range was first reserved for, the asked count's: a
     /// fit may reserve a fresh range anew up to them, whatever an earlier
@@ -988,6 +1006,7 @@ impl Pools {
             shapes,
             pooled,
             paging,
+            declared: false,
             asked: paging.pages(),
             asked_chunks: asked,
             ceiling: paging.pages(),
@@ -1201,6 +1220,49 @@ impl Pools {
         (records, pages, self.paging.window_pages_at(pages))
     }
 
+    /// The model's declared context stands unstated by the operator: the fit
+    /// before arming shortens it to what it seats.
+    pub fn declare_context(&mut self) {
+        self.declared = true;
+    }
+
+    /// What the fit takes of `live` for one working set of `pages` kv pages
+    /// beside the null chunk (its kv pages, its windowed pages and its
+    /// recurrent record), and what it holds for the bodies and the guests'
+    /// programs beside it.
+    fn working_set(&self, pages: u64, bodies: u64, programs: u64, live: u64) -> WorkingSet {
+        let slots = u32::from(self.has_state());
+        let least = chunks_at(self.chunks.layout(), &self.paging, pages, slots);
+        let need = self.chunk_bytes(least);
+        // A stated budget is the pool's before the bodies and programs are
+        // held anything; with none, one working set is, and beside it every
+        // weight the pool would hold wherever the card holds them with the
+        // programs (the activation's span already out of `live`): the
+        // bodies are held out of what is left after the weights, so their
+        // allowance never turns weights that fit into weights that stream.
+        // A card short of that streams them (the runtime's call).
+        let whole = need.saturating_add(self.weight_pool_bytes());
+        let claim = self
+            .budget
+            .unwrap_or(if live >= whole.saturating_add(programs) {
+                whole
+            } else {
+                need
+            });
+        let (bodies, programs) = holds_within(bodies, programs, live.saturating_sub(claim));
+        let room = live.saturating_sub(programs.saturating_add(bodies));
+        // Whole map units of the room, in whole chunks, of the range's.
+        let unit = self.chunks.map_unit().max(1);
+        WorkingSet {
+            least,
+            need,
+            bodies,
+            programs,
+            room,
+            limit: self.budget.unwrap_or(room) / unit * unit,
+        }
+    }
+
     /// Sizes the pool to the card: every whole chunk the card has room for,
     /// each any shape's to take, provided they seat one working set at the
     /// declared context ([`engine::chunk::fit`]). The room is the elastic
@@ -1250,36 +1312,58 @@ impl Pools {
         let chunk = layout.chunk_bytes;
         // One working set at the declared context beside the null chunk:
         // its kv pages, its windowed pages and its recurrent record.
-        let one_slot = u64::from(self.paging.pages_per_slot).min(self.ceiling);
-        let slots = u32::from(self.has_state());
-        let least = chunks_at(layout, &self.paging, one_slot, slots);
-        let need = self.chunk_bytes(least);
-        // A stated budget is the pool's before the bodies and programs are
-        // held anything; with none, one working set is, and beside it every
-        // weight the pool would hold wherever the card holds them with the
-        // programs (the activation's span already out of `live`): the
-        // bodies are held out of what is left after the weights, so their
-        // allowance never turns weights that fit into weights that stream.
-        // A card short of that streams them (the runtime's call).
-        let whole = need.saturating_add(self.weight_pool_bytes());
-        let claim = self
-            .budget
-            .unwrap_or(if live >= whole.saturating_add(programs) {
-                whole
-            } else {
-                need
+        let mut one_slot = u64::from(self.paging.pages_per_slot).min(self.ceiling);
+        // A declared context is the model's, not the operator's: where this
+        // fit does not seat one working set at it beside the programs and
+        // the bodies' floor, it is served at the longest the fit does.
+        if self.declared && !settled {
+            let floor = bodies.min(BODIES_FLOOR_BYTES);
+            let seats = |pages: u64| {
+                let set = self.working_set(pages, bodies, programs, live);
+                set.bodies >= floor
+                    && set.programs >= programs
+                    && engine::chunk::fit(set.limit, chunk, 0, set.least).is_ok()
+            };
+            // Never down to a window the rows are read through.
+            let shortest = self.paging.window.map_or(1, |window| {
+                u64::from(window.tokens / self.paging.page_size.max(1)) + 1
             });
-        let (bodies, programs) = holds_within(bodies, programs, live.saturating_sub(claim));
+            if shortest < one_slot && !seats(one_slot) && seats(shortest) {
+                let (mut fits, mut over) = (shortest, one_slot);
+                while over - fits > 1 {
+                    let mid = fits + (over - fits) / 2;
+                    if seats(mid) {
+                        fits = mid;
+                    } else {
+                        over = mid;
+                    }
+                }
+                let declared = self.paging.context();
+                one_slot = fits;
+                self.paging.pages_per_slot = u32::try_from(fits).unwrap_or(u32::MAX);
+                eprintln!(
+                    "engine-cuda: the model declares a {declared}-token context and, with \
+                     everything else this load puts on the device resident, the card does not \
+                     seat one sequence at it beside the guests' programs and the graph bodies' \
+                     floor; serving {} tokens. State `[engine] max_context` to choose.",
+                    self.paging.context()
+                );
+            }
+        }
+        let WorkingSet {
+            least,
+            need,
+            bodies,
+            programs,
+            room,
+            limit,
+        } = self.working_set(one_slot, bodies, programs, live);
         let held = programs.saturating_add(bodies);
-        let room = live.saturating_sub(held);
         if let Some(budget) = self.budget.filter(|&budget| budget > room) {
             return Err(Fault::Residency(
                 engine::fit::Short::Budget { budget, room }.to_string(),
             ));
         }
-        // Whole map units of the room, in whole chunks, of the range's.
-        let unit = self.chunks.map_unit().max(1);
-        let limit = self.budget.unwrap_or(room) / unit * unit;
         // Before arming a fresh range may be reserved anew up to the asked
         // count. Once armed it never moves, fresh or not: the bodies name
         // addresses in it.

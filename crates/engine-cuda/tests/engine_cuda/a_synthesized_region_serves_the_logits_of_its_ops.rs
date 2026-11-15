@@ -166,6 +166,7 @@ fn load(fixture: &Fixture, overrides: &str, tokens: u32) -> Shell {
         slots: 1,
         kv_budget: Some(crate::POOL),
         allowance: engine::Allowance::WHOLE,
+        context_declared: false,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
             chip: Some(engine_cuda::chip::profile(overrides)),
