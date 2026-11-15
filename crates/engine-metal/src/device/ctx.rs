@@ -406,7 +406,8 @@ impl Context {
                 call: "commandBuffer",
                 why: "the queue would not open a command buffer".to_string(),
             })?;
-            let encoder = buffer.computeCommandEncoder().ok_or(Fault::Device {
+            let mut samples = gputs::samples(&self.device);
+            let encoder = gputs::compute(&buffer, &mut samples).ok_or(Fault::Device {
                 call: "computeCommandEncoder",
                 why: "the command buffer would not open a compute pass".to_string(),
             })?;
@@ -416,6 +417,7 @@ impl Context {
                 blit: None,
                 committed: RefCell::new(Vec::new()),
                 flushed: RefCell::new(Vec::new()),
+                samples: RefCell::new(samples),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -451,6 +453,8 @@ pub struct Frame {
     /// the order the queue runs them.
     #[cfg(target_vendor = "apple")]
     flushed: RefCell<Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
+    #[cfg(target_vendor = "apple")]
+    samples: RefCell<Option<gputs::Samples>>,
 }
 
 // SAFETY: a `Frame` is created, encoded into and committed on one thread —
@@ -493,7 +497,13 @@ impl Frame {
         if let Some(encoder) = self.encoder.borrow_mut().take() {
             encoder.endEncoding();
         }
-        let encoder = tail.computeCommandEncoder().ok_or(Fault::Device {
+        let taken = self.samples.borrow_mut().take();
+        if let Some(samples) = taken {
+            let device = samples.device.clone();
+            gputs::report(&head, samples);
+            *self.samples.borrow_mut() = gputs::samples(&device);
+        }
+        let encoder = gputs::compute(&tail, &mut self.samples.borrow_mut()).ok_or(Fault::Device {
             call: "computeCommandEncoder",
             why: "the command buffer would not open a compute pass".to_string(),
         })?;
@@ -511,6 +521,9 @@ impl Frame {
     fn commit_buffer(&mut self) -> Retained<ProtocolObject<dyn MTLCommandBuffer>> {
         self.end_pass();
         let buffer = self.buffer.get_mut().clone();
+        if let Some(samples) = self.samples.get_mut().take() {
+            gputs::report(&buffer, samples);
+        }
         buffer.commit();
         for then in self.committed.get_mut().drain(..) {
             then();
@@ -531,10 +544,8 @@ impl Frame {
     #[cfg(target_vendor = "apple")]
     pub(crate) fn next_pass(&mut self) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>> {
         self.end_pass();
-        let encoder = self
-            .buffer
-            .get_mut()
-            .computeCommandEncoder()
+        let buffer = self.buffer.get_mut().clone();
+        let encoder = gputs::compute(&buffer, self.samples.get_mut())
             .ok_or(Fault::Device {
                 call: "computeCommandEncoder",
                 why: "the command buffer would not open a second compute pass".to_string(),
@@ -555,7 +566,7 @@ impl Frame {
         let buffer = self.buffer.get_mut();
         buffer.encodeSignalEvent_value(event, value);
         buffer.encodeWaitForEvent_value(event, value);
-        let encoder = buffer.computeCommandEncoder().ok_or(Fault::Device {
+        let encoder = gputs::compute(&buffer, &mut self.samples.borrow_mut()).ok_or(Fault::Device {
             call: "computeCommandEncoder",
             why: "the command buffer would not open a compute pass after a barrier".to_string(),
         })?;
@@ -595,10 +606,7 @@ impl Frame {
         } else {
             current.encodeWaitForEvent_value(event, value);
         }
-        let reopened = self
-            .buffer
-            .borrow()
-            .computeCommandEncoder()
+        let reopened = gputs::compute(&current, &mut self.samples.borrow_mut())
             .ok_or(Fault::Device {
                 call: "computeCommandEncoder",
                 why: "the command buffer would not reopen a compute pass after a fence".to_string(),
@@ -618,7 +626,7 @@ impl Frame {
             if let Some(encoder) = self.encoder.get_mut().take() {
                 encoder.endEncoding();
             }
-            self.blit = Some(self.buffer.get_mut().blitCommandEncoder().ok_or(Fault::Device {
+            self.blit = Some(gputs::blit(&self.buffer.borrow(), &mut self.samples.borrow_mut()).ok_or(Fault::Device {
                 call: "blitCommandEncoder",
                 why: "the command buffer would not open a blit pass".to_string(),
             })?);
@@ -636,7 +644,7 @@ impl Frame {
                 if let Some(encoder) = self.encoder.get_mut().take() {
                     encoder.endEncoding();
                 }
-                self.blit = Some(self.buffer.get_mut().blitCommandEncoder().ok_or(
+                self.blit = Some(gputs::blit(&self.buffer.borrow(), &mut self.samples.borrow_mut()).ok_or(
                     Fault::Device {
                         call: "blitCommandEncoder",
                         why: "the command buffer would not open a blit pass".to_string(),
@@ -676,7 +684,7 @@ impl Frame {
                 if let Some(encoder) = self.encoder.get_mut().take() {
                     encoder.endEncoding();
                 }
-                self.blit = Some(self.buffer.get_mut().blitCommandEncoder().ok_or(
+                self.blit = Some(gputs::blit(&self.buffer.borrow(), &mut self.samples.borrow_mut()).ok_or(
                     Fault::Device {
                         call: "blitCommandEncoder",
                         why: "the command buffer would not open a blit pass".to_string(),
@@ -730,7 +738,7 @@ impl Frame {
                 if let Some(encoder) = self.encoder.get_mut().take() {
                     encoder.endEncoding();
                 }
-                self.blit = Some(self.buffer.get_mut().blitCommandEncoder().ok_or(
+                self.blit = Some(gputs::blit(&self.buffer.borrow(), &mut self.samples.borrow_mut()).ok_or(
                     Fault::Device {
                         call: "blitCommandEncoder",
                         why: "the command buffer would not open a blit pass".to_string(),
@@ -1077,5 +1085,107 @@ mod tests {
             cores >= 7,
             "no Apple Silicon GPU has fewer than 7 cores: {cores}"
         );
+    }
+}
+
+/// PROBE (M5): per-encoder GPU timestamps (`PIE_GPU_TIMESTAMPS`), sampled at
+/// each encoder's start and end; not for merge.
+#[cfg(target_vendor = "apple")]
+pub(crate) mod gputs {
+    use std::cell::Cell;
+    use objc2::Message;
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::*;
+    thread_local! {
+        static LABEL: Cell<&'static str> = const { Cell::new("forward") };
+    }
+    pub fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("PIE_GPU_TIMESTAMPS").is_some())
+    }
+    pub fn label(label: &'static str) {
+        LABEL.with(|cell| cell.set(label));
+    }
+    pub fn current() -> &'static str {
+        LABEL.with(Cell::get)
+    }
+    pub const CAPACITY: usize = 1024;
+    pub struct Samples {
+        pub device: Retained<ProtocolObject<dyn MTLDevice>>,
+        pub buffer: Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>,
+        pub next: usize,
+        pub encoders: Vec<(&'static str, &'static str)>,
+    }
+    // SAFETY: read on the completion thread only after the buffer retired.
+    unsafe impl Send for Samples {}
+    pub fn samples(device: &ProtocolObject<dyn MTLDevice>) -> Option<Samples> {
+        if !on() {
+            return None;
+        }
+        let sets = device.counterSets()?;
+        let set = (0..sets.count()).map(|i| sets.objectAtIndex(i)).find(|set| set.name().to_string() == "timestamp")?;
+        let descriptor = MTLCounterSampleBufferDescriptor::new();
+        descriptor.setCounterSet(Some(&set));
+        descriptor.setStorageMode(MTLStorageMode::Shared);
+        unsafe { descriptor.setSampleCount(CAPACITY) };
+        let buffer = device.newCounterSampleBufferWithDescriptor_error(&descriptor).ok()?;
+        Some(Samples { device: device.retain(), buffer, next: 0, encoders: Vec::new() })
+    }
+    pub fn compute(
+        buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        samples: &mut Option<Samples>,
+    ) -> Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>> {
+        if let Some(s) = samples.as_mut().filter(|s| s.next + 2 <= CAPACITY) {
+            let descriptor = MTLComputePassDescriptor::computePassDescriptor();
+            let attachment = unsafe { descriptor.sampleBufferAttachments().objectAtIndexedSubscript(0) };
+            attachment.setSampleBuffer(Some(&s.buffer));
+            unsafe {
+                attachment.setStartOfEncoderSampleIndex(s.next);
+                attachment.setEndOfEncoderSampleIndex(s.next + 1);
+            }
+            s.next += 2;
+            s.encoders.push(("compute", current()));
+            return buffer.computeCommandEncoderWithDescriptor(&descriptor);
+        }
+        buffer.computeCommandEncoder()
+    }
+    pub fn blit(
+        buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        samples: &mut Option<Samples>,
+    ) -> Option<Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>> {
+        if let Some(s) = samples.as_mut().filter(|s| s.next + 2 <= CAPACITY) {
+            let descriptor = MTLBlitPassDescriptor::blitPassDescriptor();
+            let attachment = unsafe { descriptor.sampleBufferAttachments().objectAtIndexedSubscript(0) };
+            attachment.setSampleBuffer(Some(&s.buffer));
+            unsafe {
+                attachment.setStartOfEncoderSampleIndex(s.next);
+                attachment.setEndOfEncoderSampleIndex(s.next + 1);
+            }
+            s.next += 2;
+            s.encoders.push(("blit", current()));
+            return buffer.blitCommandEncoderWithDescriptor(&descriptor);
+        }
+        buffer.blitCommandEncoder()
+    }
+    /// Prints the buffer's encoders once it retires.
+    pub fn report(buffer: &ProtocolObject<dyn MTLCommandBuffer>, samples: Samples) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cell = std::sync::Mutex::new(Some(samples));
+        let handler = block2::RcBlock::new(move |_: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            let Some(s) = cell.lock().unwrap().take() else { return };
+            let (mut cpu, mut gpu) = (0u64, 0u64);
+            unsafe { s.device.sampleTimestamps_gpuTimestamp(core::ptr::NonNull::from(&mut cpu), core::ptr::NonNull::from(&mut gpu)) };
+            let Some(data) = (unsafe { s.buffer.resolveCounterRange(objc2_foundation::NSRange::new(0, s.next)) }) else { return };
+            let bytes = unsafe { data.as_bytes_unchecked() };
+            let stamp = |i: usize| bytes.get(i * 8..i * 8 + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+            let mut line = format!("gputs buf {id} pair {cpu} {gpu}");
+            for (at, (kind, label)) in s.encoders.iter().enumerate() {
+                line.push_str(&format!(" | {kind} {label} {} {}", stamp(2 * at), stamp(2 * at + 1)));
+            }
+            eprintln!("{line}");
+        });
+        unsafe { buffer.addCompletedHandler(block2::RcBlock::as_ptr(&handler)) };
     }
 }

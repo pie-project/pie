@@ -4048,6 +4048,8 @@ impl engine::frame::Shell for Shell {
                 lanes.join(" ")
             )
         });
+        #[cfg(target_vendor = "apple")]
+        crate::device::ctx::gputs::label("forward");
         let walked = self.walk_once(&prepared)?;
         fire_trace(|| "forward-encoded".to_string());
         let profile = crate::encode::kernel_profile();

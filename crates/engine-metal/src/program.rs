@@ -381,6 +381,8 @@ impl Plane {
         frame: &mut Frame,
         ids: &[InstanceId],
     ) -> Result<Vec<(InstanceId, Launched)>> {
+        #[cfg(target_vendor = "apple")]
+        crate::device::ctx::gputs::label("guest");
         let mut results = Vec::with_capacity(ids.len());
         let mut by_program: BTreeMap<ProgramId, Vec<InstanceId>> = BTreeMap::new();
         let mut refused = false;
