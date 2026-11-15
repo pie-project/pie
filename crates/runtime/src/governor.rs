@@ -240,9 +240,16 @@ pub enum Signal {
 /// What the process could use right now, in bytes.
 #[derive(Debug, Clone, Copy)]
 pub struct Demand {
-    /// All of it, what it merely keeps included: the target grows this far.
+    /// All of it: what is live and, past it, the weights resident above their
+    /// staging floor, those the weight cache would hold with room, and what
+    /// parked waiters are short. The target grows this far.
     pub wanted: u64,
-    /// Without the idle cache: the target comes back this far.
+    /// What a sequence, a store or the weights' staging floor holds: all that
+    /// is wanted but the weights above that floor, the weight cache's unmet
+    /// bytes and the waiters' shortfall. The sealed prefixes and the
+    /// checkpoints the stores keep are in it, whatever the policy keys them:
+    /// no cut reaches them, and which of them goes is the policy's ranking,
+    /// when a request needs the room. An idle target comes back this far.
     pub live: u64,
 }
 
@@ -263,10 +270,6 @@ const IDLE_AFTER: u32 = 120;
 /// Ticks between cuts once idle, and the share of the gap each one takes.
 const CUT_EVERY: u32 = 4;
 const CUT_SHARE: u64 = 8;
-
-/// Calm ticks with `live` not rising before the idle cache goes too. What it
-/// keeps costs a prompt's prefill to lose, which a pause is no reason to pay.
-const KEEP_CACHE: u32 = 2400;
 
 pub struct Governor {
     limits: Limits,
@@ -404,18 +407,15 @@ impl Governor {
             self.idle_ticks.saturating_add(1)
         };
         self.last_live = demand.live;
-        let kept = self.kept(demand);
-        if self.tolerance.release_idle
-            && self.idle()
-            && (self.idle_ticks - IDLE_AFTER).is_multiple_of(CUT_EVERY)
-        {
-            self.cut(kept);
+        let rest = self.rest(demand);
+        if self.releasing() && (self.idle_ticks - IDLE_AFTER).is_multiple_of(CUT_EVERY) {
+            self.cut(rest);
         }
         if self.held < self.hold {
             self.held += 1;
             return;
         }
-        self.rise(kept);
+        self.rise(rest);
     }
 
     /// Whether a waiter can be served by a rise instead of an eviction.
@@ -435,10 +435,17 @@ impl Governor {
         self.target
     }
 
-    /// How far the target stays up: what the cache keeps is on its way out
-    /// only once it has gone unused for long.
-    const fn kept(&self, demand: Demand) -> u64 {
-        if self.idle_ticks >= KEEP_CACHE {
+    /// Whether idle memory is on its way back.
+    const fn releasing(&self) -> bool {
+        self.tolerance.release_idle && self.idle()
+    }
+
+    /// Where a calm tick takes the target: to all that is wanted, and to
+    /// what is live alone while idle memory goes back. No count of ticks
+    /// lowers it further: what is live stays under the target however long
+    /// the idle lasts.
+    const fn rest(&self, demand: Demand) -> u64 {
+        if self.releasing() {
             demand.live
         } else {
             demand.wanted
@@ -454,8 +461,8 @@ impl Governor {
         }
     }
 
-    fn cut(&mut self, kept: u64) {
-        let gap = self.target.saturating_sub(kept.max(self.limits.floor));
+    fn cut(&mut self, rest: u64) {
+        let gap = self.target.saturating_sub(rest.max(self.limits.floor));
         self.target -= (gap / CUT_SHARE).max(self.limits.shrink_step).min(gap);
     }
 }
@@ -675,11 +682,50 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_stops_at_what_the_cache_keeps_until_it_has_gone_unused_for_long() {
+    fn what_is_past_live_goes_with_the_first_idle_cuts() {
         let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
-        let (keeps, in_use) = (600 * MIB, 300 * MIB);
-        assert_eq!(kept(&mut governor, KEEP_CACHE - 1, keeps, in_use), keeps);
-        assert_eq!(kept(&mut governor, 400, keeps, in_use), in_use);
+        let (wanted, live) = (600 * MIB, 300 * MIB);
+        assert_eq!(
+            kept(&mut governor, IDLE_AFTER - 1, wanted, live),
+            LIMITS.hard_limit,
+            "a pause keeps all of it"
+        );
+        // The first tick saw `live` rise from nothing: one more ends the pause.
+        let first = kept(&mut governor, 2, wanted, live);
+        assert_eq!(first, LIMITS.hard_limit - 700 * MIB / CUT_SHARE);
+        assert!(kept(&mut governor, 8 * CUT_EVERY, wanted, live) < wanted);
+    }
+
+    #[test]
+    fn a_cut_stops_at_what_is_live_however_long_the_idle() {
+        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.hard_limit);
+        let (wanted, live) = (600 * MIB, 300 * MIB);
+        let settled = kept(&mut governor, IDLE_AFTER + 400, wanted, live);
+        assert_eq!(settled, live);
+        assert_eq!(kept(&mut governor, 100_000, wanted, live), live);
+    }
+
+    #[test]
+    fn an_idle_target_does_not_rise_for_what_is_only_wanted() {
+        let mut governor = Governor::new(LIMITS, BALANCED, LIMITS.floor);
+        kept(&mut governor, IDLE_AFTER + 1, 0, 0);
+        assert!(governor.idle());
+        assert_eq!(kept(&mut governor, 100, 600 * MIB, 0), LIMITS.floor);
+        // What is live rising ends the idle: the target rises for all of it.
+        let risen = kept(&mut governor, 1, 600 * MIB, MIB);
+        assert!(!governor.idle());
+        assert_eq!(risen, LIMITS.floor + LIMITS.step);
+    }
+
+    #[test]
+    fn a_process_that_keeps_idle_memory_rises_to_all_that_is_wanted_however_idle() {
+        let keeps = Tolerance {
+            backoff: 0.8,
+            release_idle: false,
+        };
+        let mut governor = Governor::new(LIMITS, keeps, LIMITS.floor);
+        let (wanted, live) = (600 * MIB, 300 * MIB);
+        assert_eq!(kept(&mut governor, 100_000, wanted, live), wanted);
     }
 
     #[test]

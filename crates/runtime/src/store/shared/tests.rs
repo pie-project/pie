@@ -638,6 +638,65 @@ fn a_window_checkpoint_behind_the_fire_end_holds_what_its_windows_reach() {
     assert_eq!(window_live(&shared), (0, 0), "every reference back");
 }
 
+/// A sealed prefix whose working set is gone is the store's still: every kv
+/// page is taken under the store's holder, a live one, and a cache entry
+/// takes none of its own. Its bytes are in the demand the governor reads as
+/// `live`, where an idle cut stops, and none of them is past it; they leave
+/// when a reclaim takes the entry, by the policy's keys.
+#[test]
+fn an_idle_sealed_prefix_is_live_demand_until_a_reclaim_takes_it() {
+    use crate::policy::retention::FLOOR;
+    use crate::store::chunks::ShapePool;
+    use crate::store::kv::KvStore;
+    use crate::store::kv::write::PageCommit;
+    let facts = fixed_facts();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let list = shared.lock().unwrap().list().unwrap();
+    let mut kv = KvStore::with_pool(ShapePool::shared(&shared, list), 0, 0, [9; 32]);
+    kv.set_page_size(16);
+    let demand = || shared.lock().unwrap().demand();
+    let page_bytes = kv.page_pool().slot_bytes();
+    let empty = demand();
+
+    // A prompt of three pages is written and sealed, and its prefix kept.
+    let ws = kv.create_working_set();
+    kv.reserve(ws, 3).unwrap();
+    let need = kv.write_demand(ws, &[0, 1, 2]).unwrap();
+    let mut granted = kv.reserve_device_pages(need).unwrap();
+    let prepared = kv
+        .prepare_write_reserved(ws, &[0, 1, 2], &mut granted)
+        .unwrap();
+    let commit = PageCommit {
+        token_hashes: Vec::new(),
+        page_hash: None,
+    };
+    let seq = kv.publish_prepared(prepared, &vec![commit; 3]).unwrap();
+    kv.settle(seq);
+    let tokens: Vec<u32> = (0..48).collect();
+    let slots = kv.slot_hashes(ws, 0, &tokens, 16).unwrap().unwrap();
+    assert_eq!(kv.seal_rows(ws, 0, &slots, 16).unwrap(), 3);
+    kv.keep_checkpoint(ws, 3, None);
+    let running = demand();
+    assert_eq!(running.live - empty.live, 3 * page_bytes);
+
+    // The working set goes: nothing reads the prefix, and it is idle cache.
+    kv.release_working_set(ws, kv.current_epoch());
+    kv.retire_idle();
+    assert_eq!(kv.reclaimable_cache_pages(), 3, "idle cache");
+    let idle = demand();
+    assert_eq!(idle.live, running.live, "live, as while it was read");
+    assert_eq!(
+        idle.wanted - idle.live,
+        empty.wanted - empty.live,
+        "none of it is past what is live"
+    );
+
+    // Keyed at the floor, it goes when its room is wanted, and only then.
+    assert_eq!(kv.reclaim_droppable(kv.current_epoch(), |_| FLOOR), 3);
+    kv.retire_idle();
+    assert_eq!(demand().live, empty.live);
+}
+
 mod programs;
 mod span;
 mod tiers;

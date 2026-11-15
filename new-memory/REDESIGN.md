@@ -166,7 +166,7 @@ What PLEX may be asked to give up:
 
 So the redesign defines no valuation of its own. An earlier draft proposed a common unit ("expected time lost"); that is a policy's business and is dropped.
 
-Not addressed here: the governor's own loop constants (`FIRST_HOLD`, `IDLE_AFTER`, `KEEP_CACHE`, `CUT_SHARE`, and the tolerance table), which its header says were measured on one 16 GB machine. They act only when the process is not dedicated, and they size nothing; FOLLOWUPS F2 turns the tolerance into `governor_*` keys.
+Not addressed here: the governor's own loop constants (`FIRST_HOLD`, `IDLE_AFTER`, `CUT_SHARE`, and the tolerance table), which its header says were measured on one 16 GB machine. They act only when the process is not dedicated, and they size nothing; FOLLOWUPS F2 turns the tolerance into `governor_*` keys.
 
 ### 2.9 Metal: ANE
 
