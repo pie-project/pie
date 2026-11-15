@@ -36,8 +36,8 @@ fn f32s(v: &[u8]) -> Vec<f32> {
 
 /// Times a 128-wide causal prompt through the MPP kernel against the form
 /// `sdpa.prefill = "tiled"` takes (the simdgroup-matrix kernel at 128), over
-/// a bf16 pool of 32-token pages (the only pages MPP serves), at 2048 and
-/// 8190 rows, Qwen3-0.6B's heads (16 query, 8 kv). Prints the best GPU time
+/// a bf16 pool of 32-token pages and of the 16-token pages serving builds,
+/// at 2048 and 8190 rows, Qwen3-0.6B's heads (16 query, 8 kv). Prints the best GPU time
 /// of three fires each and how far the two outputs lie apart. Ignored: a
 /// measurement for the M5 (where MPP runs on the tensor units) to decide
 /// whether MPP is worth bringing to the 16-token pages serving builds.
@@ -56,8 +56,8 @@ fn the_mpp_and_mma_prompt_kernels_time_at_128() {
         ("mpp", engine_metal::chip::tuning("[kernel]\nsdpa.prefill = \"mpp\"", false)),
         ("tiled (mma at 128)", engine_metal::chip::tuning("[kernel]\nsdpa.prefill = \"tiled\"", false)),
     ];
-    let (d, qh, kh, page) = (128usize, 16usize, 8usize, 32usize);
-    for m in [2048usize, 8190] {
+    let (d, qh, kh) = (128usize, 16usize, 8usize);
+    for (page, m) in [(32usize, 2048usize), (32, 8190), (16, 2048), (16, 8190)] {
         let np = m.div_ceil(page);
         let slots = np * page;
         let k = vals(slots * kh * d, 7);
@@ -130,7 +130,10 @@ fn the_mpp_and_mma_prompt_kernels_time_at_128() {
                 .unwrap();
                 best = best.min(frame.commit_timed().unwrap());
             }
-            eprintln!("d=128 rows={m}: {name} ({form:?}) best of 4: {:.2} ms", best * 1e3);
+            eprintln!(
+                "d=128 rows={m} pages of {page}: {name} ({form:?}) best of 4: {:.2} ms",
+                best * 1e3
+            );
             outs.push(f32s(&handles.read(bind(&y), y.bytes()).unwrap()));
         }
         let apart = outs[0]
@@ -138,6 +141,6 @@ fn the_mpp_and_mma_prompt_kernels_time_at_128() {
             .zip(&outs[1])
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
-        eprintln!("d=128 rows={m}: the two outputs lie at most {apart:.4} apart");
+        eprintln!("d=128 rows={m} pages of {page}: the two outputs lie at most {apart:.4} apart");
     }
 }

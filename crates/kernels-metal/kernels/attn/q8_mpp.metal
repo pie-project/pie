@@ -5,8 +5,10 @@ using namespace mpp::tensor_ops;
 #include "../prim/mpp.h"
 #include "../prim/kv_page.h"
 // KV is int8_t over a q8 pool, whose cells carry their own scale, and bfloat over a pool
-// stored as it was written.
-template <int D, bool DIRECT, typename KV, bool LSE = false>
+// stored as it was written. P is the pool's tokens a page: a 32-key tile is one page of 32,
+// or two pages of 16 gathered by their own addresses, each half scored and summed into the
+// tile's output by its own matmuls (the second accumulating onto the first), never copied.
+template <int D, bool DIRECT, typename KV, bool LSE = false, int P = 32>
 kernel void
 q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]],
        const device KV *values [[buffer(2)]], device bfloat *out [[buffer(3)]],
@@ -24,6 +26,8 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
        uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
        uint sg [[simdgroup_index_in_threadgroup]]) {
   constexpr int M = 32, N = 32, SG = 8;
+  constexpr int T = N / P;
+  static_assert(P * T == N && (T == 1 || T == 2), "a tile is one page of 32 or two of 16");
   constexpr bool Q8 = sizeof(KV) == 1;
   constexpr int W = Q8 ? 2 * D : D;
   const device KV *kplane = pie_kv_plane(keys, k_offset);
@@ -61,6 +65,15 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
   constexpr auto pvd = matmul2d_descriptor(M, D, N, false, false, false);
   matmul2d<qkd, execution_simdgroups<SG>> qkop;
   matmul2d<pvd, execution_simdgroups<SG>> pvop;
+  // A page's half of the tile: its scores, and its share of the output, the second half
+  // accumulating onto the first.
+  constexpr auto qkh = matmul2d_descriptor(M, P, D, false, true, false);
+  constexpr auto pvh = matmul2d_descriptor(M, D, P, false, false, false);
+  constexpr auto pvh_acc = matmul2d_descriptor(M, D, P, false, false, false,
+                                               matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<qkh, execution_simdgroups<SG>> qkhop;
+  matmul2d<pvh, execution_simdgroups<SG>> pvhop;
+  matmul2d<pvh_acc, execution_simdgroups<SG>> pvhaccop;
   auto acc = pvop.template get_destination_cooperative_tensor<decltype(p), decltype(v0), float>();
   const ulong valid = mpp_valid_mask(acc);
 #pragma unroll
@@ -75,21 +88,39 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
     int last = 0, first = 0x7fffffff;
     for (int r = sub; r < end; ++r) {
       const int pos = positions[row0 + r];
-      last = max(last, enabled[row0 + r] == 2 ? int(ptr[req + 1] - ptr[req]) * N - 1 : pos);
+      last = max(last, enabled[row0 + r] == 2 ? int(ptr[req + 1] - ptr[req]) * P - 1 : pos);
       first = min(first, window > 0 ? max(0, pos - window + 1) : 0);
     }
     for (int base = (first / N) * N; base <= last; base += N) {
-      const uint physical = pages[ptr[req] + base / N];
-      const ulong k_at = pie_page_at(physical, k_page_stride / sizeof(KV), sizeof(KV)) + ulong(kv) * W;
-      const ulong v_at = pie_page_at(physical, v_page_stride / sizeof(KV), sizeof(KV)) + ulong(kv) * W;
-      auto b = tensor(const_cast<device KV *>(kplane) + k_at, dextents<int, 2>{D, N},
-                      array<int, 2>{1, kv_heads * W});
-      auto score =
-          qkop.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
-      qkop.run(a, b, score);
-      score.store(score_view);
-      auto v = tensor(const_cast<device KV *>(vplane) + v_at, dextents<int, 2>{D, N},
-                      array<int, 2>{1, kv_heads * W});
+      // The tile's pages: a half wholly past the last key read takes the first page's
+      // address, so no lane reads a page the request does not hold (its keys are masked).
+      ulong k_at[T], v_at[T];
+#pragma unroll
+      for (int t = 0; t < T; ++t) {
+        const bool held = t == 0 || base + t * P <= last;
+        const uint physical = pages[ptr[req] + base / P + (held ? t : 0)];
+        k_at[t] = pie_page_at(physical, k_page_stride / sizeof(KV), sizeof(KV)) + ulong(kv) * W;
+        v_at[t] = pie_page_at(physical, v_page_stride / sizeof(KV), sizeof(KV)) + ulong(kv) * W;
+      }
+      if constexpr (T == 1) {
+        auto b = tensor(const_cast<device KV *>(kplane) + k_at[0], dextents<int, 2>{D, N},
+                        array<int, 2>{1, kv_heads * W});
+        auto score =
+            qkop.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
+        qkop.run(a, b, score);
+        score.store(score_view);
+      } else {
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+          auto b = tensor(const_cast<device KV *>(kplane) + k_at[t], dextents<int, 2>{D, P},
+                          array<int, 2>{1, kv_heads * W});
+          auto half_view = tensor(scores + t * P, extents<int, P, M>{}, array<int, 2>{1, N});
+          auto score =
+              qkhop.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
+          qkhop.run(a, b, score);
+          score.store(half_view);
+        }
+      }
       threadgroup_barrier(mem_flags::mem_threadgroup);
       for (uint r = sg; r < M; r += SG) {
         const int row = row0 + r, pos = row < rows ? positions[row] : 0, kpos = base + lane;
@@ -97,11 +128,11 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
                     (enabled[row] == 2 || kpos <= pos) && (window <= 0 || kpos >= pos - window + 1);
         if (keep && enabled[row])
           keep = uint(kpos) < mask_stride && mask[ulong(row) * mask_stride + kpos] != 0;
-        const ulong cell = ulong(lane) * kv_heads * W;
+        const ulong cell = ulong(lane % P) * kv_heads * W;
         float ks = 1, vs = 1;
         if constexpr (Q8) {
-          ks = *reinterpret_cast<const device float *>(kplane + k_at + cell + D);
-          vs = *reinterpret_cast<const device float *>(vplane + v_at + cell + D);
+          ks = *reinterpret_cast<const device float *>(kplane + k_at[lane / P] + cell + D);
+          vs = *reinterpret_cast<const device float *>(vplane + v_at[lane / P] + cell + D);
         }
         const float s = keep ? scores[r * N + lane] * scale * ks : -1e30f;
         const float newmax = max(maxima[r], simd_max(s));
@@ -116,9 +147,22 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
         }
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
+      auto v = tensor(const_cast<device KV *>(vplane) + v_at[0], dextents<int, 2>{D, N},
+                      array<int, 2>{1, kv_heads * W});
       auto partial =
           pvop.template get_destination_cooperative_tensor<decltype(p), decltype(v), float>();
-      pvop.run(p, v, partial);
+      if constexpr (T == 1) {
+        pvop.run(p, v, partial);
+      } else {
+        auto p0 = tensor(probs, extents<int, P, M>{}, array<int, 2>{1, N});
+        auto p1 = tensor(probs + P, extents<int, P, M>{}, array<int, 2>{1, N});
+        auto v0h = tensor(const_cast<device KV *>(vplane) + v_at[0], dextents<int, 2>{D, P},
+                          array<int, 2>{1, kv_heads * W});
+        auto v1h = tensor(const_cast<device KV *>(vplane) + v_at[1], dextents<int, 2>{D, P},
+                          array<int, 2>{1, kv_heads * W});
+        pvhop.run(p0, v0h, partial);
+        pvhaccop.run(p1, v1h, partial);
+      }
       mpp_for_each(acc, valid, [&](ushort i) __attribute__((always_inline)) {
         auto ix = acc.get_multidimensional_index(i);
         acc[i] = acc[i] * factors[ix[1]] + partial[i];
@@ -141,13 +185,14 @@ q8_mpp(const device bfloat *q [[buffer(0)]], const device KV *keys [[buffer(1)]]
   });
 }
 
-#define Q8_MPP_LSE(DIM, DIRECT, KV, LSE, NAME)                                                     \
-  template [[host_name(NAME)]] kernel void q8_mpp<DIM, DIRECT, KV, LSE>(                           \
+#define Q8_MPP_PAGE(DIM, DIRECT, KV, LSE, PAGE, NAME)                                              \
+  template [[host_name(NAME)]] kernel void q8_mpp<DIM, DIRECT, KV, LSE, PAGE>(                     \
       const device bfloat *, const device KV *, const device KV *, device bfloat *,                \
       constant int &, const device int *, const device int *, const device uint *,                 \
       const device uint *, constant int &, constant int &, constant float &, const device uchar *, \
       constant uint &, const device uchar *, constant int &, const device bfloat *,                \
       constant int &, device float *, PIE_KV_LAYOUT_TYPES uint2, uint2, uint, uint, uint);
+#define Q8_MPP_LSE(DIM, DIRECT, KV, LSE, NAME) Q8_MPP_PAGE(DIM, DIRECT, KV, LSE, 32, NAME)
 #define Q8_MPP(DIM, DIRECT, KV, NAME) Q8_MPP_LSE(DIM, DIRECT, KV, false, NAME)
 Q8_MPP(128, false, int8_t, "q8_mpp_d128")
 Q8_MPP(256, false, int8_t, "q8_mpp_d256")
@@ -157,3 +202,9 @@ Q8_MPP(256, false, bfloat, "sdpa_mpp_d256")
 Q8_MPP(256, true, bfloat, "sdpa_visit_direct")
 Q8_MPP(64, false, bfloat, "sdpa_mpp_d64")
 Q8_MPP_LSE(64, false, bfloat, true, "sdpa_mpp_lse_d64")
+// Over pools of 16-token pages, as a served model's chunk plan builds them.
+Q8_MPP_PAGE(128, false, bfloat, false, 16, "sdpa_mpp_d128_p16")
+Q8_MPP_PAGE(256, false, bfloat, false, 16, "sdpa_mpp_d256_p16")
+Q8_MPP_PAGE(256, true, bfloat, false, 16, "sdpa_visit_direct_p16")
+Q8_MPP_PAGE(64, false, bfloat, false, 16, "sdpa_mpp_d64_p16")
+Q8_MPP_PAGE(64, false, bfloat, true, 16, "sdpa_mpp_lse_d64_p16")

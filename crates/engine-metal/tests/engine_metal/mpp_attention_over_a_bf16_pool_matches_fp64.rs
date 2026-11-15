@@ -44,10 +44,9 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
     let pipes = Pipelines::new();
     let tuning = engine_metal::chip::tuning("[kernel]\nsdpa.prefill = \"mpp\"", false);
     // (head dim, rows, query heads, kv heads, requests, pages per request, first
-    // position, tokens a page). The MPP kernel serves 32-token pages only; the
-    // 16-token cases are the page size a served model's chunk plan builds,
-    // where the arbiter falls through to the next form: a pass at 32 says
-    // nothing of a served path.
+    // position, tokens a page). The 16-token cases are the page size a served
+    // model's chunk plan builds: the kernel reads a tile's two pages by their
+    // own addresses, and the arbiter takes MPP at both sizes.
     for (d, m, qh, kh, requests, np, base, page) in [
         (128usize, 35usize, 6usize, 2usize, 3usize, 3usize, 65usize, 32usize),
         (256, 35, 6, 2, 3, 3, 65, 32),
@@ -61,9 +60,9 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
     ] {
         let form = attn::arbiter::prefill_form(d as u32, page as i32, &tuning);
         assert_eq!(
-            form == attn::arbiter::PrefillForm::Mpp,
-            page == 32,
-            "d={d}, {page}-token pages: the arbiter's form is {form:?}"
+            form,
+            attn::arbiter::PrefillForm::Mpp,
+            "d={d}, {page}-token pages: the arbiter's form"
         );
         let slots = np * requests * page;
         let k = vals(slots * kh * d, 7);
