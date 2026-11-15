@@ -2,7 +2,7 @@ use wasmtime::component::Resource;
 
 use super::context::FireContext;
 use super::{
-    FireWs, PendingFire, PendingOp, Reserved, Switched, TicketReservation, advance_shadow,
+    FireWs, PendingFire, Reserved, Switched, TicketReservation, advance_shadow,
     bound_rs_working_sets, every_lane, lora_program_of, open_pipeline, record_submit_failure,
     reserve, rs, settle_and_wait_resident, stamp_lane_facts, stamp_lane_words,
 };
@@ -336,7 +336,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
     }
-    unfired.submitted();
+    let unqueued = unfired.submitted();
     epoch.retire_on(&completion);
     ticket_reservation.commit();
     advance_shadow(ctx, &fwd)?;
@@ -360,10 +360,9 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         cursor.reserved = cursor.reserved.max(folded);
         cursor.written = cursor.written.max(folded);
     }
-    pipe_fires
-        .lock()
-        .unwrap()
-        .push_back(PendingOp::Fire(PendingFire {
+    unqueued.queue(
+        &pipe_fires,
+        PendingFire {
             completion,
             checkpoints: Vec::new(),
             kv: kvs
@@ -387,7 +386,8 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
             cells,
             failure: pipeline_failure,
             retired: None,
-        }));
+        },
+    );
     Ok(Ok(()))
 }
 
