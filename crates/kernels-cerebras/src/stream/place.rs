@@ -60,12 +60,23 @@ pub struct Layout {
     pub spill: bool,
 }
 
-/// Where a root region runs: the roots `first .. first + roots` of its side, `chunk` columns each.
+/// Where a root region runs: the roots `first .. first + roots` of its side, `chunk` columns each,
+/// `reps` times over consecutive chunks (a head region, narrower than the values it reads: a
+/// head at a time over the root's heads).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct RegionAt {
     pub first: u32,
     pub roots: u32,
     pub chunk: u32,
+    pub reps: u32,
+}
+
+impl RegionAt {
+    /// The columns of each value a root's region runs over.
+    #[must_use]
+    pub fn cover(&self) -> u32 {
+        self.chunk * self.reps
+    }
 }
 
 impl Layout {
@@ -110,11 +121,37 @@ impl Layout {
     /// rest.
     #[must_use]
     pub fn region_at(&self, side: Side, width: u32, cands: &[Cols]) -> RegionAt {
+        // a head region (its values wider than it): a head at a time, at the head roots
+        let span = cands
+            .iter()
+            .map(|c| c.width)
+            .max()
+            .unwrap_or(width)
+            .max(width);
+        if span > width {
+            let on = self.heads > 0
+                && side == Side::Col
+                && span.is_multiple_of(self.heads * width)
+                && cands.iter().any(|c| {
+                    (0..self.heads).all(|h| {
+                        self.cols[h as usize]
+                            .iter()
+                            .any(|s| s.covers(c.base, c.from + h * (span / self.heads)))
+                    })
+                });
+            return RegionAt {
+                first: 0,
+                roots: if on { self.heads } else { 0 },
+                chunk: width,
+                reps: span / self.heads.max(1) / width,
+            };
+        }
         if side == Side::Row {
             return RegionAt {
                 first: 0,
                 roots: self.py,
                 chunk: width / self.py,
+                reps: 1,
             };
         }
         if self.heads > 0 && width.is_multiple_of(self.heads) {
@@ -130,6 +167,7 @@ impl Layout {
                     first: 0,
                     roots: self.heads,
                     chunk,
+                    reps: 1,
                 };
             }
         }
@@ -138,6 +176,7 @@ impl Layout {
             first: self.heads,
             roots: rest,
             chunk: width / rest.max(1),
+            reps: 1,
         }
     }
 }
@@ -145,13 +184,40 @@ impl Layout {
 /// A region step's row parameters' and results' columns (where its chunks are).
 #[must_use]
 pub fn region_cols(r: &Reader, chain: &poem_compiler::fuse::chain::Chain) -> Vec<Cols> {
-    let mut v: Vec<Cols> = row_params(r, chain).into_iter().map(|(_, c)| c).collect();
+    let span = region_span(r, chain);
+    let mut v: Vec<Cols> = row_params(r, chain)
+        .into_iter()
+        .map(|(_, c)| Cols { width: span, ..c })
+        .collect();
     v.extend(chain.outs.iter().map(|o| Cols {
         base: o.value,
         from: 0,
-        width: chain.region.width,
+        width: span,
     }));
     v
+}
+
+/// The columns of a row a region step runs over: its own width, or, for a head region (a
+/// head's ops over values of several heads), its row parameters' whole width.
+#[must_use]
+pub fn region_span(r: &Reader, chain: &poem_compiler::fuse::chain::Chain) -> u32 {
+    let w = chain.region.width;
+    // every row parameter a whole value of one width (not halves of a packed row)
+    let widths: Vec<Option<u32>> = row_params(r, chain)
+        .iter()
+        .map(|(k, _)| {
+            let i = &chain.ins[*k];
+            (i.from == 0).then(|| r.cols(i.value).width)
+        })
+        .collect();
+    match widths.first() {
+        Some(&Some(span))
+            if span > w && span.is_multiple_of(w) && widths.iter().all(|x| *x == Some(span)) =>
+        {
+            span
+        }
+        _ => w,
+    }
 }
 
 /// The row parameters of a region step: (param index, columns).
@@ -245,20 +311,21 @@ fn layout_with(r: &Reader, u: &Unit, py: u32, rest: u32) -> Option<Layout> {
         };
         let w = chain.region.width;
         let at = lay(cols.clone()).region_at(Side::Col, w, &region_cols(r, chain));
-        if at.roots == 0 || !w.is_multiple_of(at.roots) {
+        if at.roots == 0 || (at.reps == 1 && !w.is_multiple_of(at.roots)) {
             return None;
         }
+        let cover = at.cover();
         for i in 0..at.roots {
             let root = (at.first + i) as usize;
             for (_, c) in row_params(r, chain) {
                 push(
                     &mut cols,
                     root,
-                    Slice::of(c.base, c.from + i * at.chunk, at.chunk),
+                    Slice::of(c.base, c.from + i * cover, cover),
                 );
             }
             for o in &chain.outs {
-                push(&mut cols, root, Slice::of(o.value, i * at.chunk, at.chunk));
+                push(&mut cols, root, Slice::of(o.value, i * cover, cover));
             }
         }
     }
@@ -409,19 +476,28 @@ fn held_words(u: &Unit, l: &Layout, col: u32) -> u32 {
     w
 }
 
-/// Words of held rows at a row root of `py`: (the host's rows, rows held over the barrier).
+/// Words of held rows at a row root of `py`: (the host's rows in and out, rows held over the
+/// barrier).
 fn row_held_words(r: &Reader, u: &Unit, py: u32) -> (u32, u32) {
     let (mut host, mut over) = (0, 0);
     let mut hin = Vec::new();
     for s in &u.steps {
-        if let Step::In {
-            value,
-            side: Side::Row,
-            host: true,
-        } = s
-        {
-            host += u.rows * (r.width(*value) / py);
-            hin.push(*value);
+        match s {
+            Step::In {
+                value,
+                side: Side::Row,
+                host: true,
+            } => {
+                host += u.rows * (r.width(*value) / py);
+                hin.push(*value);
+            }
+            Step::Out {
+                value,
+                side: Side::Row,
+                host: true,
+                lane: false,
+            } => host += u.rows * (value.width / py),
+            _ => {}
         }
     }
     for v in &u.held {

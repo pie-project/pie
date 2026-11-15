@@ -222,6 +222,17 @@ fn fill(p: &Program, vals: Option<&Values>, a: &HostArray) -> R<Vec<f32>> {
             row,
         } => {
             let (rows, cols, kk, weight) = tile_cells(p, *unit, *step, *col, *row)?;
+            if weight.0 == UNIT {
+                // an identity's tile: one where the input column is the output's
+                for (ri, &xr) in rows.iter().enumerate() {
+                    for (ci, &oc) in cols.iter().enumerate() {
+                        if xr == oc {
+                            out[1 + ri * cols.len() + ci] = f32::from_bits(bits16(1.0, ieee));
+                        }
+                    }
+                }
+                return Ok(out);
+            }
             let (_, w) = held()?.get(weight)?;
             // tile[r][c] = W[out c, in r]
             for (ri, &xr) in rows.iter().enumerate() {
@@ -406,6 +417,29 @@ pub fn spans(p: &Program, a: &HostArray) -> R<Option<Vec<Span>>> {
     }
     let flags = FLAT | cast;
     let mut s: Vec<Span> = vec![[NONE, 0, 0, 1, 0, 0, 1, 0]];
+    if weight.0 == UNIT {
+        // an identity's tile: one where the input column is the output's, runs of zeros between
+        let mut zeros = 0u32;
+        for &xr in &rows {
+            for &oc in &cols {
+                if xr == oc {
+                    if zeros > 0 {
+                        s.push([NONE, 0, 0, zeros, 0, 0, 1, 0]);
+                        zeros = 0;
+                    }
+                    s.push([UNIT, 0, 0, 1, 0, flags, 1, 0]);
+                } else {
+                    zeros += 1;
+                }
+            }
+        }
+        let used = 1 + rows.len() * cols.len() - zeros as usize;
+        let rest = a.len as usize - used;
+        if rest > 0 {
+            s.push([NONE, 0, 0, rest as u32, 0, 0, 1, 0]);
+        }
+        return Ok(Some(s));
+    }
     let consecutive = rows.windows(2).all(|r| r[1] == r[0] + 1);
     if let ([(c, n)], true, Some(&r0)) = (&stretches[..], consecutive, rows.first()) {
         s.push([

@@ -176,7 +176,7 @@ fn region_cycles(p: &Program, u: usize, step: usize) -> f64 {
                 + (np * c + np * q + 2.0 * nout * q) * DSD_ELEM
                 + (np + nout) * (c - q) * FABRIC_WORD
         }
-        _ => RegionFeatures::of(&printed.csl, at.chunk).cycles(at.chunk),
+        _ => f64::from(at.reps) * RegionFeatures::of(&printed.csl, at.chunk).cycles(at.chunk),
     }
 }
 

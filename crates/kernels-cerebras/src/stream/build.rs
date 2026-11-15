@@ -24,11 +24,15 @@ pub const PYA: u32 = 8;
 pub const KV_WORDS: u32 = 18_432;
 
 /// Entries an attention PE keeps at most (ops/satt.csl with QH): a key, a value and its ones
-/// column, the held q, and the scores' f32, 16-bit and probability words a q head.
+/// column, the held q, and the scores' f32, 16-bit and probability words a q head; less what
+/// its row buffers take past one q head's (a kv head of several q heads: grouped-query).
 #[must_use]
 pub fn kv_entries(q_heads: u32, head_dim: u32) -> u32 {
     let per = head_dim + (head_dim + 1) + q_heads * head_dim + q_heads * 6;
-    (KV_WORDS / per).max(1)
+    // 16-bit words of satt's per-query buffers (xh, y, sx, qf) at `q` q heads a kv head
+    let rows = |q: u32| q * head_dim + 2 * q * (head_dim + 1) + 2 * (q + 2) * head_dim + 2 * q * head_dim;
+    let extra = rows(q_heads.max(1)) - rows(1);
+    (KV_WORDS.saturating_sub(extra) / per).max(1)
 }
 
 /// The attention PEs a K / V column of `rows` stored rows takes (P7 v1: a column as long as its
@@ -204,6 +208,65 @@ fn tap(trace: &Trace, u: &mut Unit, taps: &[u32]) {
         }
         i += 1;
     }
+}
+
+/// What each of `units` (the stream's, in path order; the first unit index `first`) must
+/// carry on the row stream past itself: a value it takes in, or that reaches it from the unit
+/// before it of its classes, that a later unit of its classes takes in and that it does not
+/// send on itself. (Rows of other classes pass a unit by the schedule's forwarding.)
+fn carried(units: &[(Unit, u64)], first: usize) -> BTreeMap<usize, Vec<ValueId>> {
+    let ins = |u: &Unit| -> Vec<ValueId> {
+        u.steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::In {
+                    value,
+                    side: Side::Row,
+                    host: false,
+                } => Some(unit::unmoved(*value)),
+                _ => None,
+            })
+            .collect()
+    };
+    let outs = |u: &Unit| -> Vec<ValueId> {
+        u.steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Out {
+                    value,
+                    side: Side::Row,
+                    host: false,
+                    lane: false,
+                } => Some(unit::unmoved(value.base)),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut out = BTreeMap::new();
+    let mut arriving: BTreeMap<Vec<usize>, Vec<ValueId>> = BTreeMap::new();
+    for (i, (u, _)) in units.iter().enumerate() {
+        let later: Vec<ValueId> = units[i + 1..]
+            .iter()
+            .filter(|(v, _)| v.classes == u.classes)
+            .flat_map(|(v, _)| ins(v))
+            .collect();
+        let sent = outs(u);
+        let mut have = arriving.remove(&u.classes).unwrap_or_default();
+        have.extend(ins(u));
+        let mut thr: Vec<ValueId> = Vec::new();
+        for v in have {
+            if later.contains(&v) && !sent.contains(&v) && !thr.contains(&v) {
+                thr.push(v);
+            }
+        }
+        let mut next = sent;
+        next.extend(thr.iter().copied());
+        arriving.insert(u.classes.clone(), next);
+        if !thr.is_empty() {
+            out.insert(first + i, thr);
+        }
+    }
+    out
 }
 
 /// Whether `s` reads a lane vector (a resident picked by the row's lane).
@@ -445,50 +508,71 @@ pub fn program_at(
     }
     let mut blocks: Vec<Vec<usize>> = Vec::new();
     let kept = upto.unwrap_or(prog.stages.len()).min(prog.stages.len());
-    for (si, st) in prog.stages[..kept].iter().enumerate() {
-        let tag = match st.stage {
-            Stage::Entry => "entry".to_string(),
-            Stage::Layer { stack, layer } => format!("s{stack}l{layer}"),
-            Stage::Between { stack } => format!("after{stack}"),
-            Stage::Exit => "exit".to_string(),
-        };
-        let mut blk = Vec::new();
-        for (side, nodes) in st.sides.iter().zip(&st.nodes) {
-            let word = prog.classes[side.classes[0]].word;
-            // a side of several classes leaves what any of them reads after it (the last
-            // single block's rows reach the exit by the image class alone)
-            let words: Vec<u64> = side.classes.iter().map(|&c| prog.classes[c].word).collect();
-            let cname: Vec<&str> = side
-                .classes
-                .iter()
-                .map(|&c| prog.classes[c].name.as_str())
-                .collect();
-            let rows = side.classes.iter().map(|&c| prog.classes[c].rows).sum();
-            let mut u = unit::lower(
-                trace,
-                &words,
-                &format!("{tag}.{}", cname.join("+")),
-                nodes,
-                &host,
-                rows,
-                false,
-            )?;
-            u.classes = side.classes.clone();
-            tap(trace, &mut u, taps);
-            if si + 1 == kept && kept < prog.stages.len() {
-                for s in &mut u.steps {
-                    if let Step::Out { host, .. } = s {
-                        *host = true;
+    // the stages' units, again with what each carries past itself where a later unit reads a
+    // value the row stream must bring it (an encoder's earlier tapped layers)
+    let first = units.len();
+    let mut through: BTreeMap<usize, Vec<ValueId>> = BTreeMap::new();
+    for pass in 0..2 {
+        units.truncate(first);
+        blocks.clear();
+        for (si, st) in prog.stages[..kept].iter().enumerate() {
+            let tag = match st.stage {
+                Stage::Entry => "entry".to_string(),
+                Stage::Layer { stack, layer } => format!("s{stack}l{layer}"),
+                Stage::Between { stack } => format!("after{stack}"),
+                Stage::Exit => "exit".to_string(),
+            };
+            let mut blk = Vec::new();
+            for (side, nodes) in st.sides.iter().zip(&st.nodes) {
+                let word = prog.classes[side.classes[0]].word;
+                // a side of several classes leaves what any of them reads after it (the last
+                // single block's rows reach the exit by the image class alone)
+                let words: Vec<u64> = side.classes.iter().map(|&c| prog.classes[c].word).collect();
+                let cname: Vec<&str> = side
+                    .classes
+                    .iter()
+                    .map(|&c| prog.classes[c].name.as_str())
+                    .collect();
+                let rows = side.classes.iter().map(|&c| prog.classes[c].rows).sum();
+                let mut u = unit::lower_through(
+                    trace,
+                    &words,
+                    &format!("{tag}.{}", cname.join("+")),
+                    nodes,
+                    &host,
+                    rows,
+                    false,
+                    through.get(&units.len()).map_or(&[][..], |v| &v[..]),
+                )?;
+                u.classes = side.classes.clone();
+                tap(trace, &mut u, taps);
+                if si + 1 == kept && kept < prog.stages.len() {
+                    for s in &mut u.steps {
+                        if let Step::Out { host, .. } = s {
+                            *host = true;
+                        }
                     }
                 }
+                if u.joint.is_some() {
+                    blk.push(units.len());
+                }
+                units.push((u, word));
             }
-            if u.joint.is_some() {
-                blk.push(units.len());
+            if !blk.is_empty() {
+                blocks.push(blk);
             }
-            units.push((u, word));
         }
-        if !blk.is_empty() {
-            blocks.push(blk);
+        if pass > 0 {
+            break;
+        }
+        through = carried(&units[first..], first);
+        if through.is_empty() {
+            break;
+        }
+        if prog.classes.len() > 1 {
+            return Err(format!(
+                "{name}: the row stream carries a value past a unit in a step of several row classes"
+            ));
         }
     }
 
@@ -500,6 +584,38 @@ pub fn program_at(
             word,
             prologue: u.classes.is_empty(),
         };
+        // every row-side value cuts evenly over the row roots
+        for st in &u.steps {
+            let w = match st {
+                Step::In {
+                    value,
+                    side: Side::Row,
+                    ..
+                } => r.width(*value),
+                Step::Out {
+                    value,
+                    side: Side::Row,
+                    ..
+                } => value.width,
+                Step::Matvec {
+                    from: Side::Col, n, ..
+                } => *n,
+                Step::Matvec {
+                    from: Side::Row, k, ..
+                } => *k,
+                Step::Region {
+                    side: Side::Row,
+                    chain,
+                } => chain.region.width,
+                _ => 0,
+            };
+            if !w.is_multiple_of(py) {
+                return Err(format!(
+                    "{name}: {}: a row-side value of {w} columns cuts over no {py} rows",
+                    u.name
+                ));
+            }
+        }
         let layout = place::layout(&r, &u, py, tile, spill, split.widen)?;
         let mut regions = BTreeMap::new();
         for (i, s) in u.steps.iter().enumerate() {
@@ -528,7 +644,12 @@ pub fn program_at(
                 &chain.region,
                 &Place {
                     chunk: at.chunk,
-                    roots: at.roots,
+                    // a head region is whole at each root it runs at
+                    roots: if at.reps > 1 || at.chunk == chain.region.width && at.roots > 1 {
+                        1
+                    } else {
+                        at.roots
+                    },
                     params: params.clone(),
                     round16,
                     rope_lv: lv.max(1),

@@ -145,14 +145,31 @@ pub enum Src {
     Static,
 }
 
+/// A value's copy on the other side of its unit, moved across by an identity matvec (a root
+/// region over values of both sides runs where the row stream is; a column value the row
+/// stream takes on leaves from the rows): its id is the value's with this bit set.
+pub const MOVED: u32 = 1 << 30;
+
+/// The copy of `v` moved across its unit ([`MOVED`]).
+#[must_use]
+pub fn moved(v: ValueId) -> ValueId {
+    ValueId(v.0 | MOVED)
+}
+
+/// The value `v` is (itself, or what it is a moved copy of).
+#[must_use]
+pub fn unmoved(v: ValueId) -> ValueId {
+    ValueId(v.0 & !MOVED)
+}
+
 impl Reader<'_> {
     fn def(&self, v: ValueId) -> Option<&Def> {
-        self.trace.values.get(v.0 as usize).map(|d| &d.def)
+        self.trace.values.get(unmoved(v).0 as usize).map(|d| &d.def)
     }
 
     #[must_use]
     pub fn width(&self, v: ValueId) -> u32 {
-        match self.trace.values.get(v.0 as usize).map(|d| &d.ty) {
+        match self.trace.values.get(unmoved(v).0 as usize).map(|d| &d.ty) {
             Some(Ty::Tensor { shape, .. }) => match shape.last() {
                 Some(Dim::Const(n)) => *n as u32,
                 _ => 0,
@@ -163,7 +180,7 @@ impl Reader<'_> {
 
     #[must_use]
     pub fn dtype(&self, v: ValueId) -> Option<Dtype> {
-        match self.trace.values.get(v.0 as usize).map(|d| &d.ty) {
+        match self.trace.values.get(unmoved(v).0 as usize).map(|d| &d.ty) {
             Some(Ty::Tensor { dtype, .. }) => Some(*dtype),
             _ => None,
         }
@@ -173,7 +190,7 @@ impl Reader<'_> {
     #[must_use]
     pub fn lane(&self, v: ValueId) -> bool {
         !self.prologue
-            && matches!(self.trace.values.get(v.0 as usize).map(|d| &d.ty),
+            && matches!(self.trace.values.get(unmoved(v).0 as usize).map(|d| &d.ty),
             Some(Ty::Tensor { shape, .. }) if matches!(shape.first(), Some(Dim::Lanes | Dim::LanesPlus(_))))
     }
 
@@ -290,8 +307,8 @@ fn regions(trace: &Trace, run: &[u32]) -> R<Vec<Chain>> {
     if run.is_empty() {
         return Ok(Vec::new());
     }
-    if let Some(c) = chain::lower_run(trace, run) {
-        return Ok(vec![c]);
+    if let Some(c) = chain::lower_run_parts(trace, run) {
+        return Ok(c);
     }
     if run.len() == 1 {
         return Err(format!(
@@ -319,6 +336,23 @@ pub fn lower(
     host: &BTreeSet<u32>,
     rows: u32,
     lane: bool,
+) -> R<Unit> {
+    lower_through(trace, words, name, nodes, host, rows, lane, &[])
+}
+
+/// [`lower`], the unit also taking `through` in on the row stream and sending them on, read
+/// or not (values a later unit reads that the row stream carries past this one: an
+/// encoder's earlier tapped layers).
+#[allow(clippy::too_many_arguments)]
+pub fn lower_through(
+    trace: &Trace,
+    words: &[u64],
+    name: &str,
+    nodes: &[u32],
+    host: &BTreeSet<u32>,
+    rows: u32,
+    lane: bool,
+    through: &[ValueId],
 ) -> R<Unit> {
     let word = words[0];
     let r = Reader {
@@ -348,12 +382,9 @@ pub fn lower(
                 _ if lane => true,
                 _ => return Ok(()),
             };
-            if !host_in && at != Side::Row {
-                return Err(format!(
-                    "{name}: value %{} enters on the columns: the row stream runs on the CX roots",
-                    c.base.0
-                ));
-            }
+            // the row stream runs on the CX roots: what it brings enters there (an op over it
+            // and a column value moves the column value across)
+            let at = if host_in { at } else { Side::Row };
             sides.insert(c.base, at);
             steps.push(Step::In {
                 value: c.base,
@@ -363,6 +394,16 @@ pub fn lower(
             Ok(())
         };
 
+    for &v in through {
+        if !sides.contains_key(&v) {
+            sides.insert(v, Side::Row);
+            steps.push(Step::In {
+                value: v,
+                side: Side::Row,
+                host: false,
+            });
+        }
+    }
     let mut pending: Vec<u32> = Vec::new();
     let mut appended: Vec<(ValueId, Cols, Cols)> = Vec::new();
     let mut ins = Vec::new();
@@ -382,9 +423,10 @@ pub fn lower(
         }
         // flush the run of root ops before the next step
         if !pending.is_empty() {
-            for c in regions(trace, &pending)? {
+            for mut c in regions(trace, &pending)? {
                 // the side its row inputs are on (a lane prologue's sinusoid: the rows)
                 let mut side = None;
+                let mut on: Vec<(usize, Cols, Side)> = Vec::new();
                 for (k, input) in c.ins.iter().enumerate() {
                     if c.region.params[k] == kernels_ir::Shape::Scalar
                         || input.shared
@@ -403,13 +445,26 @@ pub fn lower(
                             }
                         }
                     };
-                    if side.is_some_and(|x| x != s) {
-                        return Err(refuse(
-                            c.nodes[0],
-                            "a root region over values on both sides (no transpose)".into(),
-                        ));
+                    on.push((k, cc, s));
+                    side = side.or(Some(s));
+                }
+                // over values of both sides: it runs on the rows, each column value moved
+                // across first (an identity matvec)
+                if on.iter().any(|x| x.2 != side.unwrap_or(Side::Row)) {
+                    for &(k, cc, s) in &on {
+                        if s == Side::Row {
+                            continue;
+                        }
+                        if cc.from != 0 || cc.width != r.width(cc.base) {
+                            return Err(refuse(
+                                c.nodes[0],
+                                "a root region over values on both sides reads part of a column value".into(),
+                            ));
+                        }
+                        move_across(&r, &mut steps, &mut sides, cc.base, c.nodes[0]);
+                        c.ins[k].value = moved(cc.base);
                     }
-                    side = Some(s);
+                    side = Some(Side::Row);
                 }
                 let side = side.unwrap_or(Side::Row);
                 for o in &c.outs {
@@ -557,6 +612,16 @@ pub fn lower(
             }
         }
     }
+    for &v in through {
+        let c = Cols {
+            base: v,
+            from: 0,
+            width: r.width(v),
+        };
+        if !outs.iter().any(|o| unmoved(o.base) == v) {
+            outs.push(c);
+        }
+    }
     for c in outs {
         let side = sides[&c.base];
         // to the host: what a host op reads, or what the reading reads out itself
@@ -569,12 +634,25 @@ pub fn lower(
                         i.iter().any(|x| r.cols(*x).base == c.base)
                     }
                 }));
-        if !lane && !host_out && side != Side::Row {
-            return Err(format!(
-                "{name}: value %{} leaves from the column roots: the row stream runs on the CX roots",
-                c.base.0
-            ));
-        }
+        // a column value the row stream takes on leaves from the rows, moved across first
+        let (c, side) = if !lane && !host_out && side != Side::Row {
+            if c.from != 0 || c.width != r.width(c.base) {
+                return Err(format!(
+                    "{name}: part of value %{} leaves from the column roots: the row stream runs on the CX roots",
+                    c.base.0
+                ));
+            }
+            move_across(&r, &mut steps, &mut sides, c.base, u32::MAX);
+            (
+                Cols {
+                    base: moved(c.base),
+                    ..c
+                },
+                Side::Row,
+            )
+        } else {
+            (c, side)
+        };
         steps.push(Step::Out {
             value: c,
             side,
@@ -582,13 +660,72 @@ pub fn lower(
             lane,
         });
     }
+    // several values on the row stream: in and out in one order (by value), each row's in at
+    // its start and out at its end
+    let streamed_in = |s: &Step| {
+        matches!(
+            s,
+            Step::In {
+                side: Side::Row,
+                host: false,
+                ..
+            }
+        )
+    };
+    let streamed_out = |s: &Step| {
+        matches!(
+            s,
+            Step::Out {
+                side: Side::Row,
+                host: false,
+                lane: false,
+                ..
+            }
+        )
+    };
+    if steps.iter().filter(|s| streamed_in(s)).count() > 1 {
+        let mut ins: Vec<Step> = Vec::new();
+        steps.retain(|s| {
+            if streamed_in(s) {
+                ins.push(s.clone());
+                false
+            } else {
+                true
+            }
+        });
+        ins.sort_by_key(|s| match s {
+            Step::In { value, .. } => unmoved(*value).0,
+            _ => 0,
+        });
+        steps.splice(0..0, ins);
+    }
+    if steps.iter().filter(|s| streamed_out(s)).count() > 1 {
+        let mut outs: Vec<Step> = Vec::new();
+        steps.retain(|s| {
+            if streamed_out(s) {
+                outs.push(s.clone());
+                false
+            } else {
+                true
+            }
+        });
+        outs.sort_by_key(|s| match s {
+            Step::Out { value, .. } => unmoved(value.base).0,
+            _ => 0,
+        });
+        steps.extend(outs);
+    }
 
+    let several_out = steps.iter().filter(|s| streamed_out(s)).count() > 1;
     // the barrier: what reads the attention's output (or what does) runs after it
     let mut late: BTreeSet<ValueId> = BTreeSet::new();
     let mut is_late = vec![false; steps.len()];
     for (i, s) in steps.iter().enumerate() {
         let reads: Vec<ValueId> = step_reads(&r, s);
-        let l = matches!(s, Step::Attend { .. }) || reads.iter().any(|v| late.contains(v));
+        // what a unit with a barrier sends on, it sends after it (each row's values together)
+        let l = matches!(s, Step::Attend { .. })
+            || reads.iter().any(|v| late.contains(v))
+            || (joint.is_some() && streamed_out(s) && several_out);
         is_late[i] = l;
         if l {
             late.extend(step_makes(s));
@@ -621,6 +758,38 @@ pub fn lower(
         held,
         sides,
     })
+}
+
+/// `v` (a column value) moved onto the rows by an identity matvec, where it is not yet: the
+/// step before the one that reads it (made for node `node`).
+fn move_across(
+    r: &Reader,
+    steps: &mut Vec<Step>,
+    sides: &mut BTreeMap<ValueId, Side>,
+    v: ValueId,
+    node: u32,
+) {
+    let m = moved(v);
+    if sides.contains_key(&m) {
+        return;
+    }
+    let w = r.width(v);
+    steps.push(Step::Matvec {
+        node,
+        from: Side::Col,
+        input: Cols {
+            base: v,
+            from: 0,
+            width: w,
+        },
+        weight: ValueId(super::host::UNIT),
+        output: m,
+        k: w,
+        n: w,
+        x32: r.dtype(v) == Some(Dtype::F32),
+        round: r.round(v),
+    });
+    sides.insert(m, Side::Row);
 }
 
 /// Whether the trace reads `v` out (one of its outputs, or an arm of one).

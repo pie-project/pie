@@ -586,11 +586,16 @@ fn rebind(a: &HostArray, c: Coord, idx: u32, b: &Built) -> HostArray {
     } = a.fill
     {
         let first = b.regions.get(&step).map_or(0, |(at, _, _)| at.first);
+        // a region whole at each root (a head region) has one chunk's tables
+        let one = b
+            .regions
+            .get(&step)
+            .is_some_and(|(_, pr, _)| pr.tables.get(table).is_some_and(|t| t.of_chunk.len() == 1));
         out.fill = Fill::Table {
             unit,
             step,
             table,
-            r: idx - first,
+            r: if one { 0 } else { idx - first },
         };
     }
     if let Fill::Resident {
@@ -1152,9 +1157,43 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
     let mut kv_io = false;
     let mut chain_in = false;
     let mut path_out = false;
+    let mut path_in = false;
     let mut slot = 0usize;
     // the region slots, by step
     let mut slot_of: BTreeMap<usize, usize> = BTreeMap::new();
+    // head regions alike at this side's roots (q's heads and k's: one rotation's tables) share
+    // one module, each taking its residents in before its heads: step -> the first's step
+    let mut alike: BTreeMap<usize, usize> = BTreeMap::new();
+    {
+        let mut firsts: Vec<usize> = Vec::new();
+        for (si, st) in u.steps.iter().enumerate() {
+            let Step::Region { side: s2, chain } = st else {
+                continue;
+            };
+            let Some((ra, _, params)) = b.regions.get(&si) else {
+                continue;
+            };
+            let whole = ra.reps > 1 || (ra.chunk == chain.region.width && ra.roots > 1);
+            if *s2 != side || !whole {
+                continue;
+            }
+            let same = firsts.iter().copied().find(|&f| {
+                let (fa, _, fp) = &b.regions[&f];
+                matches!(&u.steps[f], Step::Region { chain: c, .. } if c.region == chain.region)
+                    && fa.first == ra.first
+                    && fa.roots == ra.roots
+                    && fa.chunk == ra.chunk
+                    && fp == params
+            });
+            match same {
+                Some(f) => {
+                    alike.insert(si, f);
+                    alike.insert(f, f);
+                }
+                None => firsts.push(si),
+            }
+        }
+    }
 
     for (si, st) in u.steps.iter().enumerate() {
         let late = si >= u.split;
@@ -1178,11 +1217,33 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                     }
                 } else {
                     let n = hc(w);
-                    g.decls.push_str(&buf("pin", n));
-                    g.put(late, &format!("  @fmovs(D_pin, fab.fin(q_pi, {n}));\n"));
-                    g.loc(*value, idx * n, n, "D_pin", "0");
+                    // a buffer a value the row stream brings (one: `pin`)
+                    let several = u
+                        .steps
+                        .iter()
+                        .filter(|s| {
+                            matches!(
+                                s,
+                                Step::In {
+                                    side: Side::Row,
+                                    host: false,
+                                    ..
+                                }
+                            )
+                        })
+                        .count()
+                        > 1;
+                    let pin = if several {
+                        format!("pin{}", value.0)
+                    } else {
+                        "pin".to_string()
+                    };
+                    path_in = true;
+                    g.decls.push_str(&buf(&pin, n));
+                    g.put(late, &format!("  @fmovs(D_{pin}, fab.fin(q_pi, {n}));\n"));
+                    g.loc(*value, idx * n, n, &format!("D_{pin}"), "0");
                     if held(*value) {
-                        hold(&mut g, late, *value, idx * n, n, "D_pin");
+                        hold(&mut g, late, *value, idx * n, n, &format!("D_{pin}"));
                     }
                 }
             }
@@ -1193,8 +1254,20 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                 }
                 let ri = idx - ra.first;
                 let c = ra.chunk;
-                let k = slot;
-                slot += 1;
+                // a head region: a head at a time over the root's `reps` heads
+                let reps = ra.reps;
+                let mut rowp: Vec<(usize, Cols)> = Vec::new();
+                let shared = alike.get(&si).copied();
+                // a head at a time (and a shared module's results out of it before its next use)
+                let heads = reps > 1 || shared.is_some();
+                let later = shared.is_some_and(|f| f != si);
+                let k = match shared.filter(|_| later) {
+                    Some(f) => slot_of[&f],
+                    None => {
+                        slot += 1;
+                        slot - 1
+                    }
+                };
                 slot_of.insert(si, k);
                 // split over this root's helpers: the root computes the chunk's first q
                 // columns, helper h the h-th q after them
@@ -1205,7 +1278,7 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                 };
                 let q = help.map_or(c, |h| c / (h.1 + 1));
                 let rname = format!("rg_{ui}_{si}.csl");
-                if !regions.iter().any(|(n, _)| *n == rname) {
+                if !later && !regions.iter().any(|(n, _)| *n == rname) {
                     regions.push((
                         rname.clone(),
                         help.map_or(&printed.csl, |h| &h.2.csl).clone(),
@@ -1225,13 +1298,26 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                 } else {
                     "math"
                 };
-                let _ = writeln!(
-                    g.imports,
-                    "const rg{k} = @import_module(\"{rname}\", .{{ .math = math, .seg = {seg} }});"
-                );
+                if !later {
+                    let _ = writeln!(
+                        g.imports,
+                        "const rg{k} = @import_module(\"{rname}\", .{{ .math = math, .seg = {seg} }});"
+                    );
+                }
                 let mut nsc = 0;
                 for (pk, input) in chain.ins.iter().enumerate() {
                     match params[pk] {
+                        ParamAt::Row if heads => {
+                            let cc = r.cols(input.value);
+                            rowp.push((
+                                pk,
+                                Cols {
+                                    base: cc.base,
+                                    from: cc.from + input.from + ri * c * reps,
+                                    width: c,
+                                },
+                            ));
+                        }
                         ParamAt::Row => {
                             let cc = r.cols(input.value);
                             let from = cc.from + input.from + ri * c;
@@ -1266,15 +1352,21 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                                 g.put(late, &format!("  rg{k}.sc{pk} = csc{ph}[{i}];\n"));
                                 hsc.push(format!("csc{ph}[{i}]"));
                             } else {
-                                scal.push((si, pk));
-                                g.put(
-                                    late,
-                                    &format!(
-                                        "  rg{k}.sc{pk} = scal[t * NSC + {}];\n",
+                                // a row's scalar another region at this root reads too (q's
+                                // and k's positions) is held once
+                                let same = scal.iter().position(|&(s0, p0)| {
+                                    matches!(&u.steps[s0], Step::Region { chain: c0, .. }
+                                        if c0.ins[p0].value == input.value && c0.ins[p0].from == input.from)
+                                });
+                                let at = match same {
+                                    Some(i) => i,
+                                    None => {
+                                        scal.push((si, pk));
                                         scal.len() - 1
-                                    ),
-                                );
-                                hsc.push(format!("scal[t * NSC + {}]", scal.len() - 1));
+                                    }
+                                };
+                                g.put(late, &format!("  rg{k}.sc{pk} = scal[t * NSC + {at}];\n"));
+                                hsc.push(format!("scal[t * NSC + {at}]"));
                             }
                             if help.is_some() {
                                 hscal.push(pk);
@@ -1310,6 +1402,25 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                                     ));
                                     e += m;
                                 }
+                            } else if shared.is_some() {
+                                // its own resident, into the shared module before its heads
+                                let sym = format!("r{k}_{pk}_{si}");
+                                g.decls.push_str(&buf(&format!("rs{si}_{pk}"), c));
+                                let _ = writeln!(g.decls, "var {sym}_p: [*]f32 = &rs{si}_{pk};");
+                                g.put(late, &format!("  @fmovs(rg{k}.IN{pk}, D_rs{si}_{pk});\n"));
+                                g.exports.push((format!("{sym}_p"), sym.clone(), false));
+                                arrays.push(HostArray {
+                                    at: Coord::new(0, 0),
+                                    sym,
+                                    u16: false,
+                                    len: c,
+                                    fill: Fill::Resident {
+                                        unit: ui,
+                                        step: si,
+                                        param: pk,
+                                        r: ri,
+                                    },
+                                });
                             } else {
                                 let sym = format!("r{k}_{pk}");
                                 let _ = writeln!(g.decls, "var {sym}_p: [*]f32 = &rg{k}.in{pk};");
@@ -1330,7 +1441,7 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                         }
                     }
                 }
-                for (ti, tb) in printed.tables.iter().enumerate() {
+                for (ti, tb) in printed.tables.iter().enumerate().filter(|_| !later) {
                     let n = tb.of_chunk.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32;
                     let ty = if tb.u16 { "u16" } else { "f32" };
                     let sym = format!("t{k}_{}", tb.name);
@@ -1345,7 +1456,11 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                             unit: ui,
                             step: si,
                             table: ti,
-                            r: ri,
+                            r: if printed.tables[ti].of_chunk.len() == 1 {
+                                0
+                            } else {
+                                ri
+                            },
                         },
                     });
                 }
@@ -1376,6 +1491,39 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                         );
                     }
                     g.put(late, &t2);
+                }
+                if heads {
+                    if help.is_some() {
+                        return Err(format!("{}: step {si}: a head region over helpers", u.name));
+                    }
+                    // each head's row in, the region, its results into the root's heads
+                    for o in 0..chain.outs.len() {
+                        g.decls.push_str(&buf(&format!("rp{si}_{o}"), c * reps));
+                    }
+                    for j in 0..reps {
+                        for &(pk, cc) in &rowp {
+                            for (o, src, n) in g.pieces(cc.base, cc.from + j * c, c)? {
+                                let dst = at(&format!("rg{k}.IN{pk}"), &o.to_string(), n);
+                                g.put(late, &format!("  @fmovs({dst}, {src});\n"));
+                            }
+                        }
+                        g.put(late, &format!("  rg{k}.row();\n"));
+                        for o in 0..chain.outs.len() {
+                            let dst = at(&format!("D_rp{si}_{o}"), &(j * c).to_string(), c);
+                            let src = at(&format!("rg{k}.OUT{o}"), "0", c);
+                            g.put(late, &format!("  @fmovs({dst}, {src});\n"));
+                        }
+                    }
+                    for (o, out) in chain.outs.iter().enumerate() {
+                        let b = format!("D_rp{si}_{o}");
+                        g.loc(out.value, ri * c * reps, c * reps, &b, "0");
+                        if held(out.value) {
+                            hold(&mut g, late, out.value, ri * c * reps, c * reps, &b);
+                        }
+                    }
+                    hrow.clear();
+                    hscal.clear();
+                    continue;
                 }
                 g.put(late, &format!("  rg{k}.row();\n"));
                 for (o, out) in chain.outs.iter().enumerate() {
@@ -1671,7 +1819,7 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
     chain_in |= !g.fetch.is_empty();
     let used = |q: &str| -> bool {
         match q {
-            "q_pi" => g.decls.contains("var pin:"),
+            "q_pi" => path_in,
             "q_ci" => chain_in,
             "q_lb" => lanes_in,
             "q_gr" | "q_gs" => gather,
