@@ -165,7 +165,10 @@ pub struct Shell {
     live: engine::live::Live,
     /// The lattice waits for the starting weight residency: the load
     /// streams its weights, and bodies armed over the host copy would read
-    /// every expert over the bus (`Staged::finish`).
+    /// every expert over the bus (`Staged::finish`). It arms at the
+    /// starting residency the runtime sends at bootstrap, before ready; a
+    /// later flip never arms once lanes name slot refs (it is refused by
+    /// name, or the bodies stay as recorded).
     arm_deferred: bool,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
     windows_memo: Vec<prepare::WindowsMemo>,

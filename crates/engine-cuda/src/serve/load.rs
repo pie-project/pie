@@ -1807,24 +1807,30 @@ fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
     }
 }
 
-/// The device's memory as this load holds it ([`engine::memory`]): each
-/// owner under its class, over what the device has for this process (all of
-/// it but what others held before the load began).
 impl Shell {
+    /// The device's memory as this load holds it now ([`ledger`]).
+    #[must_use]
+    pub fn ledger(&self) -> engine::memory::Ledger {
+        ledger(self, self.card.0, self.card.1)
+    }
+
     /// Two load facts of this shell
     /// ([`engine::chunk::ChunkFacts::held_bytes`] and `outside_bytes`):
     /// what the fit holds back of the chunks it stated, and what the driver
     /// holds outside the engine's span, as the ledger enters it (read by
     /// the policy, taken out of no range).
-    pub(super) fn held_and_outside(&self) -> (u64, u64) {
-        let ledger = ledger(self, self.card.0, self.card.1);
+    #[must_use]
+    pub fn held_and_outside(&self) -> (u64, u64) {
         (
             self.pools.kept_back_bytes(),
-            ledger.bytes(engine::memory::Class::Outside),
+            self.ledger().bytes(engine::memory::Class::Outside),
         )
     }
 }
 
+/// The device's memory as this load holds it ([`engine::memory`]): each
+/// owner under its class, over what the device has for this process (all of
+/// it but what others held before the load began).
 fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory::Ledger {
     use engine::memory::{Class, Ledger};
     let held = footprint(shell, device_total, free_before);

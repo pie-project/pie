@@ -407,7 +407,7 @@ fn load(fixture: &Fixture, cache: &Path) -> Shell {
 static SMALL_POOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shell {
-    Shell::load(Boot {
+    let shell = Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
         checkpoint: &fixture.container,
@@ -442,7 +442,24 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
     })
-    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model))
+    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    let (held, outside) = shell.held_and_outside();
+    // A load that armed its bodies fitted the card once more after them:
+    // settled, it holds back none of the chunks it states.
+    if shell.body_stats().census.bodies > 0 {
+        assert_eq!(
+            held, 0,
+            "{}: a settled load holds back no chunk it stated",
+            fixture.model
+        );
+    }
+    assert_eq!(
+        outside,
+        shell.ledger().bytes(engine::memory::Class::Outside),
+        "{}: the load states outside its span what its ledger enters there",
+        fixture.model
+    );
+    shell
 }
 
 /// The load's knobs: `PIE_GOLDEN_CHUNK` (bytes) sets the chunk size the
