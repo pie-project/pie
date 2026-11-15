@@ -696,7 +696,6 @@ fn lowers_explicitly(op: &Operation) -> bool {
             form: RopeForm::Interleaved,
             ..
         }) | Operation::Elemwise(Elemwise::Rope {
-            k: Some(_),
             freqs: None,
             turn: Turn::Full { .. } | Turn::Partial { .. } | Turn::Last { .. },
             ..
@@ -912,6 +911,95 @@ pub fn lower_run(trace: &Trace, run: &[u32]) -> Option<Chain> {
     lower_with(trace, run, &Escapes::of(trace), true)
 }
 
+/// [`lower_run`]'s regions for `run`, cut where one region cannot hold it: where q and k turn
+/// together at different widths (grouped-query attention, fewer kv heads than q heads), the
+/// run is a region a side, q's ops with q's rotation and k's with k's, at the same positions
+/// (a head's region where each of its ops is a head's alone, as a chain's is); otherwise the
+/// run's one region. `None` where it does not lower.
+#[must_use]
+pub fn lower_run_parts(trace: &Trace, run: &[u32]) -> Option<Vec<Chain>> {
+    let escapes = Escapes::of(trace);
+    let width = |v: ValueId| match form(trace, v) {
+        Some(Form::Rows { width, .. }) => Some(width),
+        _ => None,
+    };
+    let pair = run.iter().position(|&n| {
+        matches!(&trace.nodes[n as usize].op,
+            Operation::Elemwise(Elemwise::Rope { q, k: Some(k), .. }) if width(*q) != width(*k))
+    });
+    let Some(at) = pair else {
+        return lower_with(trace, run, &escapes, true).map(|c| vec![c]);
+    };
+    let node = run[at];
+    let Operation::Elemwise(Elemwise::Rope {
+        q,
+        k: Some(k),
+        positions,
+        head_dim,
+        theta,
+        turn,
+        freqs,
+        q_out,
+        k_out: Some(k_out),
+    }) = trace.nodes[node as usize].op.clone()
+    else {
+        return None;
+    };
+    // each side's nodes: the run's nodes its rotated input is made by (transitively), then
+    // what reads its rotated output; a node of neither side does not lower here
+    let lineage = |root: ValueId, out: ValueId| -> Vec<u32> {
+        let mut want = vec![root];
+        let mut mine = Vec::new();
+        for &n in run[..at].iter().rev() {
+            let outs = outs_of(&trace.nodes[n as usize].op);
+            if outs.iter().any(|o| want.contains(o)) {
+                want.extend(ins_of(&trace.nodes[n as usize].op));
+                mine.push(n);
+            }
+        }
+        mine.reverse();
+        mine.push(node);
+        let mut have = vec![out];
+        for &n in &run[at + 1..] {
+            let op = &trace.nodes[n as usize].op;
+            if ins_of(op).iter().any(|i| have.contains(i)) {
+                have.extend(outs_of(op));
+                mine.push(n);
+            }
+        }
+        mine
+    };
+    let (qs, ks) = (lineage(q, q_out), lineage(k, k_out));
+    if run
+        .iter()
+        .any(|n| *n != node && qs.contains(n) == ks.contains(n))
+    {
+        return None;
+    }
+    let half = |x: ValueId, out: ValueId, nodes: &[u32]| -> Option<Chain> {
+        let mut t = trace.clone();
+        t.nodes[node as usize].op = Operation::Elemwise(Elemwise::Rope {
+            q: x,
+            k: None,
+            positions,
+            head_dim,
+            theta,
+            turn: turn.clone(),
+            freqs: freqs.clone(),
+            q_out: out,
+            k_out: None,
+        });
+        lower_with(&t, nodes, &escapes, true)
+    };
+    Some(vec![half(q, q_out, &qs)?, half(k, k_out, &ks)?])
+}
+
+fn outs_of(op: &Operation) -> Vec<ValueId> {
+    let mut outs = Vec::new();
+    op.outputs(&mut outs);
+    outs
+}
+
 fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
     lower_with(trace, run, escapes, false)
 }
@@ -925,6 +1013,16 @@ fn lower_with(trace: &Trace, run: &[u32], escapes: &Escapes, explicit: bool) -> 
             &trace.nodes[node as usize].op
             && !matches!(&trace.values[table.0 as usize].ty,
                 Ty::Tensor { shape, .. } if matches!(shape.as_slice(), [Dim::Const(rows), _] if *rows == u64::from(*vocab)))
+        {
+            return None;
+        }
+    }
+    // q and k turned together are rows of one width ([`lower_run_parts`] cuts them apart)
+    for &node in run {
+        if let Operation::Elemwise(Elemwise::Rope { q, k: Some(k), .. }) =
+            &trace.nodes[node as usize].op
+            && !matches!((form(trace, *q), form(trace, *k)),
+                (Some(Form::Rows { width: a, .. }), Some(Form::Rows { width: b, .. })) if a == b)
         {
             return None;
         }

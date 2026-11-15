@@ -512,6 +512,12 @@ impl Body<'_, '_> {
                 At::Any => continue,
             };
             if axis.is_some_and(|b| b != a) {
+                // a stream unit moves a column value onto the rows (the row stream's side) for
+                // an op over both: the op runs at the row roots
+                if self.r.stream {
+                    axis = Some(Axis::Row);
+                    continue;
+                }
                 return Err(format!(
                     "{}: value %{} is needed on rows and columns (no transpose route)",
                     op.op, v.0
