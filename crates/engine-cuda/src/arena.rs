@@ -62,15 +62,16 @@ impl Arena {
         !self.rungs.is_empty()
     }
 
-    /// Each rung's tokens and the bytes of the span under what a fire of
+    /// Each rung holding `lanes` lanes, its tokens and the bytes of the span under what a fire of
     /// it takes at the top (its carve, or `forked`'s where a fire that forks
     /// is wider) that state may take at that rung: no more than the prefix
     /// backed from the span's start ([`Arena::ensure`]), so state never
     /// lands where nothing is backed.
     #[must_use]
-    pub fn rungs(&self, forked: Option<&ArenaMap>) -> Vec<(u32, u64)> {
+    pub fn rungs(&self, forked: Option<&ArenaMap>, lanes: u64) -> Vec<(u32, u64)> {
         self.rungs
             .iter()
+            .filter(|(tokens, _)| u64::from(*tokens) >= lanes)
             .map(|(tokens, map)| {
                 let bytes = map.bytes.max(forked.map_or(0, |forked| forked.bytes));
                 (
@@ -257,6 +258,22 @@ mod tests {
         let compiled = compile(&trace, &Budget::new(4, 64), &DeviceProfile::default())
             .expect("the smoke's deployment bakes");
         (trace, compiled)
+    }
+
+    #[test]
+    fn a_rung_too_narrow_for_the_lanes_lends_state_nothing() {
+        let map = |bytes| ArenaMap {
+            placements: Vec::new(),
+            spans: Vec::new(),
+            live_in: Vec::new(),
+            bytes,
+        };
+        let mut arena =
+            Arena::reserve(3000).with_rungs(vec![(256, map(1000)), (1024, map(2000))], Vec::new());
+        arena.committed = 3000;
+        assert_eq!(arena.rungs(None, 256), vec![(256, 2000), (1024, 1000)]);
+        assert_eq!(arena.rungs(None, 1024), vec![(1024, 1000)]);
+        assert!(arena.rungs(None, 2048).is_empty());
     }
 
     #[test]

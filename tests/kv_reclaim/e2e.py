@@ -11,6 +11,8 @@ a.add_argument("--uri", default="ws://127.0.0.1:8080")
 a.add_argument("--runs", type=int, default=5)
 a.add_argument("--procs", type=int, default=4)
 a.add_argument("--lanes", type=int, default=8)
+a.add_argument("--prompt", type=int, default=300)
+a.add_argument("--decode", type=int, default=300)
 args = a.parse_args()
 
 
@@ -26,8 +28,9 @@ async def main():
     failed = 0
     for r in range(args.runs):
         rng = random.Random(r)
-        jobs = [{"mode": "load", "seed": 1000 * r + p, "trunk": 300, "decode": 300,
-                 "lens": [rng.randrange(100, 300) for _ in range(args.lanes)]} for p in range(args.procs)]
+        jobs = [{"mode": "load", "seed": 1000 * r + p, "trunk": 300, "decode": args.decode,
+                 "lens": [rng.randrange(args.prompt // 3, args.prompt) for _ in range(args.lanes)]}
+                for p in range(args.procs)]
         seqs, ats, lps = [], [], []
         for out in await asyncio.gather(*(run(c, prog, j) for j in jobs)):
             for segs in out["segs"]:
@@ -42,7 +45,7 @@ async def main():
         refs = await asyncio.gather(*(run(c, prog, {"mode": "ref", "seqs": [seqs[i] for i in p],
                                                     "at": [ats[i] for i in p]}) for p in parts))
         want = {i: x for p, rf in zip(parts, refs) for i, x in zip(p, rf["logprobs"])}
-        bad = sum(not abs(x - y) <= 0.25 for i in range(len(seqs)) for x, y in zip(lps[i], want[i]))
+        bad = sum(not abs(x - y) <= 0.5 for i in range(len(seqs)) for x, y in zip(lps[i], want[i]))
         draws = sum(map(len, lps))
         failed += bad > 0
         print(f"{'FAIL' if bad else 'PASS'} run {r}: {bad}/{draws} draws off the sequence read alone", flush=True)

@@ -151,7 +151,14 @@ impl Shell {
     /// ([`crate::store::Pools::chunk_facts`]).
     pub fn chunk_facts(&mut self) -> crate::Result<engine::chunk::ChunkFacts> {
         let max_tokens = self.budget().max_tokens;
-        let rungs = self.arena.rungs(self.compiled.arena_forked.as_ref());
+        let lanes = if self.records_bodies() {
+            crate::window::lane_capacity(self.budget().max_lanes)
+        } else {
+            0
+        };
+        let rungs = self
+            .arena
+            .rungs(self.compiled.arena_forked.as_ref(), u64::from(lanes));
         self.pools.chunk_facts(max_tokens, &rungs)
     }
 
