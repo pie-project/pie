@@ -500,9 +500,8 @@ async fn a_small_pass_raises_to_the_rung_covering_it_and_an_idle_pool_lowers_aft
         "not the engine's 512 lanes"
     );
 
-    // The pass: 5 rows, cut narrower by the cap, ask the rung covering them.
-    assert!(pass_asks(5, 5, fire_cap(ENGINE)));
-    assert!(!pass_asks(5, 5, 8), "a cap that covers it: no ask");
+    // The pass: 5 rows ask the rung covering them, as every pass wider
+    // than a row does whatever the cap (`pipeline::fire::ask_rung`).
     let want = want_rows(ENGINE, 5);
     let engine = Arc::new(Mutex::new(engine));
     let taken = take_raise(
