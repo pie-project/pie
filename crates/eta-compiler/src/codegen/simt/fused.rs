@@ -346,18 +346,12 @@ pub(crate) fn row_kinds(stage: &CompiledStage, region: &Region, geometry: (u64, 
 /// small vector (an RNG state, a top-k list), not a row.
 const SINGLE_ROW_WIDTH: u32 = 64;
 
-/// Whether a single-row region streams (off: op by op, as before).
-pub static SINGLE_ROW_STREAMS: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(true);
-
 /// Row kinds of a region that is one row — a decode lane's sampler, its
 /// values vocabulary-wide rows and scalars: every value `[1, .., 1, W]` of a
 /// wide static `W` is the row, every one-element value a scalar. `None` if
 /// the region has no such row.
 fn single_row_kinds(stage: &CompiledStage, region: &Region) -> Option<Vec<u8>> {
-    if region.kind != crate::plan::RegionKind::Generated
-        || !SINGLE_ROW_STREAMS.load(core::sync::atomic::Ordering::Relaxed)
-    {
+    if region.kind != crate::plan::RegionKind::Generated {
         return None;
     }
     // These index a value's leading axes, which a row's descriptor drops.
