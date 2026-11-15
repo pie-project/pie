@@ -96,8 +96,13 @@ pub enum RolesError {
     Short { role: SlotRole, slots: u32 },
     #[error("program {0} was never registered here")]
     Program(ProgramId),
-    #[error("channel {0} is parked with its process")]
-    Parked(ChannelId),
+    /// `holder` is the process it parked with: a bind of that process's
+    /// waits for it to be resident again ([`bind_when_resident`]).
+    #[error("channel {channel} is parked with its process")]
+    Parked {
+        channel: ChannelId,
+        holder: Option<Holder>,
+    },
     #[error("the adapter this binding lands is parked with the instances that hold it")]
     AdapterParked,
     #[error(
@@ -393,7 +398,10 @@ impl Roles {
         for &id in channels {
             if let Some(item) = self.items.get(&Owner::Channel(id)) {
                 if item.tier != Tier::Device {
-                    return Err(RolesError::Parked(id));
+                    return Err(RolesError::Parked {
+                        channel: id,
+                        holder: item.holder,
+                    });
                 }
                 shared.push(id);
             }
@@ -979,6 +987,50 @@ pub fn bind_instance(
     }
 }
 
+/// Runs `bind`, a register+bind of process `pid`'s, until it lands or is
+/// refused by name. Refused because a channel it binds is parked with
+/// `pid` (suspended, its rings with it), it waits by `resident`, the wait a
+/// fire takes for `pid` to be resident again (the planner's restore), and
+/// binds again: a suspension holds a bind back as it holds a fire, and
+/// never refuses it. A channel parks with `pid` only while `pid` is not
+/// resident, so each bind again follows a restore. A wait that ends
+/// otherwise (the process failed or ended) is the bind's refusal.
+///
+/// This is not a retry: nothing is attempted again on the chance it now
+/// fits, and nothing is degraded or made smaller. The bind is sent again
+/// only after the planner has restored `pid`, the event the refusal named,
+/// exactly as a fire held back by a suspension is sent after its restore.
+pub async fn bind_when_resident<T, E, B, W>(
+    pid: Holder,
+    mut bind: impl FnMut() -> B,
+    resident: impl Fn() -> W,
+) -> anyhow::Result<T>
+where
+    E: std::fmt::Display,
+    B: std::future::Future<Output = anyhow::Result<T>>,
+    W: std::future::Future<Output = Result<(), E>>,
+{
+    loop {
+        let error = match bind().await {
+            Ok(bound) => return Ok(bound),
+            Err(error) => error,
+        };
+        let parked_with_it = matches!(
+            error.downcast_ref::<RolesError>(),
+            Some(RolesError::Parked { holder: Some(holder), .. }) if *holder == pid
+        );
+        if !parked_with_it {
+            return Err(error);
+        }
+        tracing::debug!(%pid, %error, "a bind waits for its process to be resident again");
+        if let Err(why) = resident().await {
+            return Err(error.context(format!(
+                "its process was suspended and is not resident again: {why}"
+            )));
+        }
+    }
+}
+
 /// Runs `write`, a host write into `instance`'s rings, unless its slots
 /// are away ([`Roles::writes_held`]): then it is held, to be replayed in
 /// order once they are rebound ([`rebind`]).
@@ -1037,4 +1089,4 @@ fn own_rings(rings: &[u32], parts: &[Part]) -> Vec<RingSlots> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

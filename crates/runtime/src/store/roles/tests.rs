@@ -35,7 +35,7 @@ const RECORD: EngineShape = EngineShape(1);
 const INSTANCE: EngineShape = EngineShape(2);
 const CHANNEL: EngineShape = EngineShape(3);
 const ADAPTER: EngineShape = EngineShape(4);
-const PROGRAM: ProgramId = ProgramId(7);
+pub(crate) const PROGRAM: ProgramId = ProgramId(7);
 
 fn shape(id: EngineShape, kind: SlotKind, slot_bytes: u64, role: SlotRole) -> SlotShape {
     SlotShape {
@@ -115,13 +115,13 @@ fn facts(roles: bool) -> ChunkFacts {
     facts
 }
 
-struct Pools {
-    device: Shared,
-    host: Shared,
-    roles: RolesHandle,
+pub(crate) struct Pools {
+    pub(crate) device: Shared,
+    pub(crate) host: Shared,
+    pub(crate) roles: RolesHandle,
 }
 
-fn pools() -> Pools {
+pub(crate) fn pools() -> Pools {
     let facts = facts(true);
     let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let host = Arc::new(Mutex::new(
@@ -147,9 +147,9 @@ fn held(pool: &Shared) -> u64 {
 /// own on channel index 1, and a channel ring of two slots; records what it
 /// is bound with and rebound to.
 #[derive(Default)]
-struct FakeEngine {
+pub(crate) struct FakeEngine {
     next: u64,
-    bindings: Vec<InstanceBinding>,
+    pub(crate) bindings: Vec<InstanceBinding>,
     registrations: Vec<ChannelRegistration>,
     rebinds: Vec<Rebind>,
     /// What `ring_facts` states in place of the two-slot ring.
@@ -274,11 +274,16 @@ impl Engine for FakeEngine {
     }
 }
 
-fn holder(n: u128) -> super::Holder {
+pub(crate) fn holder(n: u128) -> super::Holder {
     uuid::Uuid::from_u128(n)
 }
 
-fn registered(roles: &RolesHandle, engine: &mut FakeEngine, id: u64, by: u128) -> ChannelId {
+pub(crate) fn registered(
+    roles: &RolesHandle,
+    engine: &mut FakeEngine,
+    id: u64,
+    by: u128,
+) -> ChannelId {
     let plan = ChannelRegistration {
         id: ChannelId(id),
         capacity: 20,
