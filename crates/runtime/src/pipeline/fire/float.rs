@@ -263,11 +263,12 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         None => Vec::new(),
     };
     let plan = fold_one_plan(&rs_ids);
-    let (rs_prepared, epoch) = match reserve(
+    let (rs_prepared, epoch, unfired) = match reserve(
         ctx,
         (model, engine),
         &stores,
         quorum_pipeline_id,
+        &pipeline_failure,
         &[],
         &rs_ids,
         || Ok(plan.clone()),
@@ -275,13 +276,15 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
     )
     .await
     {
-        Ok(Reserved { rs, epoch, .. }) => (rs, epoch),
+        Ok(Reserved {
+            rs, epoch, unfired, ..
+        }) => (rs, epoch, unfired),
         Err(error) => return Ok(Err(error)),
     };
     // `reserve` ended by committing the fold of one slot into each recurrent
     // state: the folded length that state follows moves in the same step,
     // nothing awaited between. A fire that does not follow fails the
-    // pipeline, and its sets with it.
+    // pipeline, and its sets with it, however this call ends (`unfired`).
     let ids: Vec<_> = kvs.iter().map(|ws| ws.id).collect();
     let folded = match (!rs_ids.is_empty())
         .then(|| fold_one(&stores, &ids))
@@ -333,6 +336,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
     }
+    unfired.submitted();
     epoch.retire_on(&completion);
     ticket_reservation.commit();
     advance_shadow(ctx, &fwd)?;
