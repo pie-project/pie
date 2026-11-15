@@ -259,6 +259,12 @@ pub struct Attached {
 }
 
 pub struct Shell {
+    /// Per record (its first slot ref), the slot its last fold froze it
+    /// through where the runtime's stated `folded` may not know it yet: a
+    /// device-counted fold is learned at settle, and a fire staged before
+    /// that states the length before it. A fire replays from the larger;
+    /// an entry goes once the stated length reaches it.
+    frozen_ahead: std::collections::HashMap<u32, u32>,
     tuning: kernels_metal::Tuning,
     device: Context,
     /// What the device held for this process before the load: the ledger's
@@ -1341,6 +1347,7 @@ impl PreparedLoad<'_> {
             ane,
             weights,
             rung: arena.floor_tokens(),
+            frozen_ahead: std::collections::HashMap::new(),
             batch_bottom: arena.rung_guest_top(arena.floor_tokens()),
             arena,
             pools,
@@ -1729,6 +1736,14 @@ impl Shell {
         self.drain()?;
         let mut frame = self.device.frame()?;
         for (shape, pairs) in copies {
+            if *shape == crate::store::layout::FIXED {
+                for &[src, dst] in pairs {
+                    match self.frozen_ahead.get(&src).copied() {
+                        Some(at) => self.frozen_ahead.insert(dst, at),
+                        None => self.frozen_ahead.remove(&dst),
+                    };
+                }
+            }
             let moves: Vec<(u32, u32)> = pairs.iter().map(|&[src, dst]| (src, dst)).collect();
             self.pools.copy_shape(&mut frame, *shape, &moves)?;
         }
@@ -3631,20 +3646,39 @@ impl Shell {
                 .unwrap_or(have);
             // The buffer's rows live in the rs list: the verb's pages, in
             // token order from its base (CONTRACT-BC 18).
+            // Where the record stands: the stated frozen length, or past it
+            // where this engine's last fold of the record froze more than
+            // the runtime has yet been told.
+            let held_key = record.first().copied();
+            if fresh && let Some(key) = held_key {
+                self.frozen_ahead.remove(&key);
+            }
             let rs = match seated.rs {
                 engine::fire::RsVerb::Buffer {
                     pages,
                     base,
                     folded,
                     fold,
-                } => engine::fire::RsVerb::Buffer {
-                    pages: self
-                        .pools
-                        .rs_pages(pages, (!seated.refs).then_some(lane.slot))?,
-                    base: *base,
-                    folded: *folded,
-                    fold: *fold,
-                },
+                } => {
+                    let ahead = held_key.and_then(|key| self.frozen_ahead.get(&key).copied());
+                    let folded = match ahead {
+                        Some(ahead) if ahead > *folded => ahead,
+                        _ => {
+                            if let Some(key) = held_key {
+                                self.frozen_ahead.remove(&key);
+                            }
+                            *folded
+                        }
+                    };
+                    engine::fire::RsVerb::Buffer {
+                        pages: self
+                            .pools
+                            .rs_pages(pages, (!seated.refs).then_some(lane.slot))?,
+                        base: *base,
+                        folded,
+                        fold: *fold,
+                    }
+                }
                 verb => verb.clone(),
             };
             let plan = engine::rs::LanePlan::of(
@@ -3675,6 +3709,20 @@ impl Shell {
                     end: placed.then_some(end),
                     ..engine::KvWrites::default()
                 });
+            }
+            if let (engine::fire::RsVerb::Buffer { folded, fold, .. }, Some(key)) = (&rs, held_key) {
+                let n = match fold {
+                    engine::fire::FoldLen::Host(n) => Some(*n),
+                    engine::fire::FoldLen::Device => {
+                        ports.as_ref().and_then(engine::ports::LanePorts::fold)
+                    }
+                };
+                let to = n.map_or(*folded, |n| {
+                    folded.saturating_add(n).min(first.saturating_add(row.rows))
+                });
+                if to > *folded {
+                    self.frozen_ahead.insert(key, to);
+                }
             }
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) && crate::diag::on().rs_trace {
                 eprintln!(
