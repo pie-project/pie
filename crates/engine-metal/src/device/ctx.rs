@@ -610,6 +610,22 @@ impl Frame {
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    /// PROBE (M5): a blit pass opened and left with no command (the next
+    /// pass closes it).
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn empty_blit(&mut self) -> Result<()> {
+        if self.blit.is_none() {
+            if let Some(encoder) = self.encoder.get_mut().take() {
+                encoder.endEncoding();
+            }
+            self.blit = Some(self.buffer.get_mut().blitCommandEncoder().ok_or(Fault::Device {
+                call: "blitCommandEncoder",
+                why: "the command buffer would not open a blit pass".to_string(),
+            })?);
+        }
+        Ok(())
+    }
+
     pub(crate) fn fill(&mut self, slab: &super::alloc::Slab, at: u64, len: u64) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {

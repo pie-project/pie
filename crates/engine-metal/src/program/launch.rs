@@ -914,7 +914,9 @@ impl Prepared {
             return Ok(());
         }
         let scratch = self.scratch.get()?;
-        if !probe_bare_pass() {
+        if std::env::var_os("PIE_EMPTY_BLIT").is_some() {
+            frame.empty_blit()?;
+        } else if !probe_bare_pass() {
             frame.fill(scratch.slab(), 0, probe_fill_len(scratch.bytes()))?;
         }
         frame.next_pass()?;
@@ -1507,7 +1509,9 @@ impl Batch {
         if !scratch_zeroing_skipped() {
             #[cfg(target_vendor = "apple")]
             {
-                if !probe_bare_pass() {
+                if std::env::var_os("PIE_EMPTY_BLIT").is_some() {
+                    frame.empty_blit()?;
+                } else if !probe_bare_pass() {
                     frame.fill(self.scratch.slab(), 0, probe_fill_len(u64::from(count) * stride))?;
                 }
                 frame.next_pass()?;
