@@ -6114,7 +6114,7 @@ mod cut_tests {
 }
 
 #[cfg(test)]
-mod fold_tests {
+pub(crate) mod fold_tests {
     use super::*;
     use crate::inferlet::host::working_set::Cursor;
 
@@ -6543,6 +6543,106 @@ mod fold_tests {
             }));
         advance_cursors(&pass, None, &[], fold, &settles);
         (completion, req.lanes[0].reports)
+    }
+
+    /// A process at its end, as the SDK's `run_ahead` leaves it: its
+    /// pipeline closed with its last fire still in flight, a fire that folds
+    /// by a count the device computes a set that keeps no recurrent state,
+    /// frozen at 4 and still in the process's table.
+    pub(crate) struct Ending {
+        resources: wasmtime::component::ResourceTable,
+        pub(crate) residency: Arc<Mutex<crate::inferlet::process::ProcessResidency>>,
+        /// The set's rep in the table.
+        pub(crate) ws: u32,
+        pub(crate) cursor: CursorCell,
+        pub(crate) stores: crate::store::registry::Stores,
+        completion: crate::engine::WorkItemCompletion,
+        tag: u64,
+        /// Stands where the pass does. A pass dropped with a fire on its way
+        /// is handed to its last pending fire ([`retire_pass`]) and keeps
+        /// its pipeline's queue until that fire is finalized; no pass can
+        /// be bound without an engine.
+        _pass: PendingFires,
+    }
+
+    impl Ending {
+        /// The process's table, as its end hands it to the teardown.
+        pub(crate) fn table(&mut self) -> wasmtime::component::ResourceTable {
+            std::mem::replace(
+                &mut self.resources,
+                wasmtime::component::ResourceTable::new(),
+            )
+        }
+
+        /// The device ran the fire to its end and counted `fold` more
+        /// slots frozen.
+        pub(crate) fn settle(&self, fold: u32) {
+            record_kv_writes(vec![report(self.tag, fold)]);
+            resolve_test_completion(&self.completion, false);
+        }
+    }
+
+    /// `dropped` is whether the guest dropped its pipeline too, as the end
+    /// of its `main` does, or only closed it.
+    pub(crate) async fn ending(dropped: bool) -> Anyhow<Ending> {
+        use crate::inferlet::process::residency::ResidentPipeline;
+        let model = crate::store::registry::register_model(4, &[8], &[1]);
+        let stores = crate::store::registry::get(model, 0);
+        let id = {
+            let mut kv = stores.kv.lock();
+            let id = kv.create_working_set();
+            kv.fold(id, 4, false).unwrap();
+            id
+        };
+        let kv = KvWorkingSet::new(model, 0, id, 8);
+        let cell = cursor(4, 12);
+        let mut ctx = Flight::context();
+        let pipeline = ctx.resources.push(Pipeline::new())?;
+        let rep = pipeline.rep();
+        let (fires, failure, scope) = {
+            let pipeline = ctx.resources.get(&pipeline)?;
+            (
+                pipeline.fires.clone(),
+                pipeline.failure.clone(),
+                pipeline.scope.clone(),
+            )
+        };
+        // As the host registers a pipeline its guest makes.
+        let residency = Arc::new(Mutex::new(
+            crate::inferlet::process::ProcessResidency::default(),
+        ));
+        residency.lock().unwrap().pipelines.push(ResidentPipeline {
+            scope: scope.clone(),
+            fires: Arc::downgrade(&fires),
+        });
+        assert_eq!(kv.claim_pipeline_scope(&scope), Ok(()));
+        let fold = geometry::Fold::Device;
+        let (completion, tag) = submit(&kv, None, &cell, &fires, &failure, &fold, None);
+        pipeline_close(&mut ctx, Resource::new_borrow(rep)).await?;
+        if dropped {
+            pipeline_drop(&mut ctx, pipeline).await?;
+        }
+        assert!(
+            !fires.lock().unwrap().is_empty() && cell.lock().unwrap().at_rest().is_err(),
+            "a close does not wait for a fire in flight"
+        );
+        let kv = ctx.resources.push(kv)?.rep();
+        let ws = crate::inferlet::host::working_set::WorkingSet {
+            kv,
+            rs: None,
+            cursor: cell.clone(),
+        };
+        let ws = ctx.resources.push(ws)?.rep();
+        Ok(Ending {
+            resources: ctx.resources,
+            residency,
+            ws,
+            cursor: cell,
+            stores,
+            completion,
+            tag,
+            _pass: fires,
+        })
     }
 
     /// The in-pass fork: the guest forks a set between its own pipelined

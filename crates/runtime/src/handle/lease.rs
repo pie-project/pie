@@ -405,3 +405,108 @@ fn take_out(
     }
     Ok(Slot::Parked(Box::new(Held::park(holder, kv, rs, cursor))))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handle::snapshot;
+    use crate::pipeline::fire::fold_tests::ending;
+
+    /// What the session heard of `name`: a set parked.
+    fn parked(settled: Vec<(HandleName, Landing)>, name: HandleName) -> Box<Held> {
+        let landed = settled.into_iter().find(|(landed, _)| *landed == name);
+        let (_, landing) = landed.expect("the session hears of what the process gave");
+        match landing {
+            Landing::At(Slot::Parked(held)) => held,
+            Landing::At(Slot::Dead(why)) => panic!("the set is lost: {why}"),
+            _ => panic!("the set did not come back"),
+        }
+    }
+
+    /// The ordinary end of a guest that folds by a count the device
+    /// computes: the SDK's `run_ahead` closes the pipeline once its budget
+    /// is submitted, the guest gives its set and ends, and the last fire is
+    /// still in flight. A close does not wait, so the cursor is not at rest
+    /// when the process ends; its teardown runs every fire to its end before
+    /// it takes what the guest gave. The session hears of the set only then,
+    /// at the length the fold left, and a fork and a save of it are taken
+    /// there: neither is refused as a set whose frozen length is not known.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_set_given_with_its_last_fold_in_flight_lands_at_the_length_the_fold_leaves()
+    -> anyhow::Result<()> {
+        let kept = std::env::temp_dir().join(format!("pie-snapshots-{}", uuid::Uuid::new_v4()));
+        snapshot::configure(kept.clone(), u64::MAX);
+        for dropped in [false, true] {
+            let mut ending = ending(dropped).await?;
+            let session = uuid::Uuid::new_v4().as_u128() as ClientId;
+            let name: HandleName = 7;
+            let mut hears = crate::server::hear_handles_settled(session);
+            let bag = Bag {
+                session,
+                taken: HashMap::new(),
+                lent: vec![name],
+                lost: Vec::new(),
+                given: vec![(
+                    "ws".to_string(),
+                    Moved {
+                        kind: Kind::WorkingSet,
+                        rep: ending.ws,
+                    },
+                )],
+                returns: Handles::from([("ws".to_string(), name)]),
+                ids: HashMap::from([(name, ProcessId::new_v4())]),
+            };
+            crate::inferlet::process::teardown::defer_resource_teardown(
+                ProcessId::new_v4(),
+                ending.table(),
+                ending.residency.clone(),
+                None,
+                None,
+                None,
+                Some(bag),
+            );
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            if let Ok(early) = hears.try_recv() {
+                let held = parked(early, name);
+                let fork = held.fork(ProcessId::new_v4()).await.err();
+                let save = snapshot::save(&held, "tenant", "early").await;
+                panic!(
+                    "the set landed with its last fire in flight ({dropped}): {:?}; its fork: \
+                     {fork:?}; its save: {:?}",
+                    held.parts().cursor,
+                    save.err().map(|refused| refused.message),
+                );
+            }
+            assert!(ending.cursor.lock().unwrap().at_rest().is_err());
+
+            ending.settle(3);
+            let landed = tokio::time::timeout(std::time::Duration::from_secs(5), hears.recv());
+            let landed = landed.await.expect("the process's end gets to its handles");
+            let held = parked(landed.expect("the session hears"), name);
+            let cursor = &held.parts().cursor;
+            assert!(
+                cursor.at_rest().is_ok() && cursor.unsettled == 0 && cursor.folded == 7,
+                "{dropped}: {cursor:?}"
+            );
+            let child = held.fork(ProcessId::new_v4()).await;
+            let child = child.expect("a set at rest forks");
+            let pages = ending.stores.kv.lock().folded(child.parts().kv.id);
+            assert_eq!(
+                (child.parts().cursor.folded, pages.unwrap()),
+                (7, 7),
+                "{dropped}"
+            );
+            let label = format!("ordinary-{dropped}");
+            let saved = snapshot::save(&held, "tenant", &label).await;
+            let saved = saved.unwrap_or_else(|refused| panic!("{dropped}: {}", refused.message));
+            assert_eq!(saved["tokens"], 7, "{dropped}: {saved}");
+            snapshot::delete("tenant", &label)
+                .await
+                .unwrap_or_else(|refused| panic!("{dropped}: {}", refused.message));
+        }
+        let _ = std::fs::remove_dir_all(kept);
+        Ok(())
+    }
+}
