@@ -272,8 +272,9 @@ pub fn declared_context_that_fits(
             .windowed(window, max_tokens);
         one_slot_bytes(trace, paging)
     };
+    let ceiling = load_ceiling(allowance, false)?;
     let (free, total) = device_memory()?;
-    let room = elastic::budget_bytes(free, total, allowance)
+    let room = elastic::room_under(ceiling, free, total)
         .saturating_sub(weight_tier_bytes(trace, weights, 0)?)
         / 2;
     let most = declared.div_ceil(page_size).max(1);
@@ -393,6 +394,19 @@ pub fn weight_tier_bytes(trace: &Trace, stated: u64, extra_resident: u64) -> Res
         stated => stated.min(full),
     }
     .saturating_add(extra_resident))
+}
+
+/// What the bound card may hold in all while a load under `allowance` runs
+/// ([`elastic::ceiling_of`]), resolved on the card as it is now, before the
+/// load takes anything. What this process took before its loads
+/// ([`crate::device::own::before_loads`]) is not held before: a stated
+/// budget counts it, and only what other processes and this one's earlier
+/// loads hold lies outside it. `latch` says a load is resolving its one
+/// ceiling, not a reading ahead of it.
+pub fn load_ceiling(allowance: engine::Allowance, latch: bool) -> Result<u64> {
+    let (free, total) = device_memory()?;
+    let held = (total - free).saturating_sub(crate::device::own::before_loads(latch));
+    Ok(elastic::ceiling_of(total, held, allowance))
 }
 
 /// The device's free and total bytes, as the driver reports them now.
