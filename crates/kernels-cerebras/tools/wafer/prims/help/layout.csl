@@ -1,0 +1,39 @@
+// prims/help: a column region over helper PEs (kernels-cerebras emit::stream, Built::helper): R
+// columns, a root (y 0) and H helpers below it (y 1 .. H). The root casts its helpers' parts of
+// every row parameter down the column (colour 5), each helper (hp.csl: the emitted helper kernel,
+// copied in by run.sh) runs the region at Q columns and sends its results in its place of a zero
+// vector up a sum chain (colours 6 / 7 alternating a hop) into the root.
+param R: u16;
+param H: u16;
+param T: u16;
+param Q: u16;
+
+const C_HM: color = @get_color(5);
+const memcpy = @import_module("<memcpy/get_params>", .{ .width = R, .height = H + 1 });
+fn ch(y: u16) color { return if (y % 2 == 0) @get_color(6) else @get_color(7); }
+fn chn(y: u16) u16 { return if (y % 2 == 0) 6 else 7; }
+
+layout {
+  @set_rectangle(R, H + 1);
+  for (@range(u16, R)) |x| {
+    @set_tile_code(x, 0, "root.csl", .{ .memcpy_params = memcpy.get_params(x), .T = T, .Q = Q, .H = H, .C_HR = chn(1) });
+    @set_color_config(x, 0, C_HM, .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ SOUTH } } });
+    @set_color_config(x, 0, ch(1), .{ .routes = .{ .rx = .{ SOUTH }, .tx = .{ RAMP } } });
+    for (@range(u16, 1, H + 1, 1)) |y| {
+      const leaf = y == H;
+      @set_tile_code(x, y, "hp.csl", .{ .memcpy_params = memcpy.get_params(x), .C_HM = 5, .C_HS = chn(y), .C_HR = if (leaf) 9 else chn(y + 1) });
+      if (leaf) {
+        @set_color_config(x, y, C_HM, .{ .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP } } });
+      } else {
+        @set_color_config(x, y, C_HM, .{ .routes = .{ .rx = .{ NORTH }, .tx = .{ RAMP, SOUTH } } });
+        @set_color_config(x, y, ch(y + 1), .{ .routes = .{ .rx = .{ SOUTH }, .tx = .{ RAMP } } });
+      }
+      @set_color_config(x, y, ch(y), .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ NORTH } } });
+    }
+  }
+  @export_name("rows", [*]f32, true);
+  @export_name("outs", [*]f32, true);
+  @export_name("pcfg", [*]u32, true);
+  @export_name("tsc", [*]u32, true);
+  @export_name("run", fn() void);
+}

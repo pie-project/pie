@@ -1,0 +1,67 @@
+// prims/help's root: the emitted root's step over helpers (emit::stream root_file), its rows from
+// the host. Each row: the row parameters' whole chunk staged (hx), the helpers' parts cast down,
+// its own Q columns into the region, row(), its results and the helpers' sums into ho.
+param memcpy_params;
+param T: u16;
+param Q: u16;
+param H: u16;
+param C_HR: u16;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const timestamp = @import_module("<time>");
+const fab = @import_module("ops/fabric.csl");
+const math = @import_module("ops/math.csl");
+const rg0 = @import_module("reg.csl", .{ .math = math, .seg = math });
+const C: u16 = Q * (H + 1);
+const CQ: u16 = C - Q;
+const q_hr = @get_input_queue(3);
+const q_hm = @get_output_queue(3);
+var rows = @zeros([T * 2 * C]f32);
+var outs = @zeros([T * C]f32);
+var rows_p: [*]f32 = &rows;
+var outs_p: [*]f32 = &outs;
+var pcfg = @zeros([2]u32);
+var pcfg_p: [*]u32 = &pcfg;
+var tsc = @zeros([3]u32);
+var ts = @zeros([3]u16);
+var tsc_p: [*]u32 = &tsc;
+fn now() u32 { timestamp.get_timestamp(&ts); return @as(u32, ts[0]) | (@as(u32, ts[1]) << 16); }
+var hx: [2 * C]f32 align(16) = @zeros([2 * C]f32);
+const D_hx = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * C} -> hx[i] });
+var ho: [C]f32 align(16) = @zeros([C]f32);
+const D_ho = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{C} -> ho[i] });
+const D_rows = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{T * 2 * C} -> rows[i] });
+const D_outs = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{T * C} -> outs[i] });
+fn at(d: mem1d_dsd, off: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(d, @as(i16, off), f32), n); }
+
+fn step(t: u16) void {
+  @fmovs(D_hx, at(D_rows, t * 2 * C, 2 * C));
+  @fmovs(fab.fout(q_hm, CQ), at(D_hx, Q, CQ));
+  @fmovs(fab.fout(q_hm, CQ), at(D_hx, C + Q, CQ));
+  @fmovs(at(rg0.IN0, 0, Q), at(D_hx, 0, Q));
+  @fmovs(at(rg0.IN1, 0, Q), at(D_hx, C, Q));
+  rg0.row();
+  @fmovs(at(D_ho, 0, Q), at(rg0.OUT0, 0, Q));
+  @fmovs(at(D_ho, Q, CQ), fab.fin(q_hr, CQ));
+  @fmovs(at(D_outs, t * C, C), D_ho);
+}
+const T_GO: local_task_id = @get_local_task_id(8);
+task go() void {
+  tsc[0] = now();
+  rg0.init();
+  var t: u16 = 0;
+  while (t < T) : (t += 1) { step(t); }
+  tsc[1] = now();
+  sys_mod.unblock_cmd_stream();
+}
+fn run() void { timestamp.enable_tsc(); @activate(T_GO); }
+comptime {
+  @bind_local_task(go, T_GO);
+  @export_symbol(rows_p, "rows");
+  @export_symbol(outs_p, "outs");
+  @export_symbol(pcfg_p, "pcfg");
+  @export_symbol(tsc_p, "tsc");
+  @export_symbol(run);
+  @initialize_queue(q_hr, .{ .color = @get_color(C_HR) });
+  @initialize_queue(q_hm, .{ .color = @get_color(5) });
+}

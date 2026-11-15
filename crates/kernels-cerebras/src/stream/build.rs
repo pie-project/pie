@@ -48,6 +48,8 @@ pub struct KvSplit {
     pub thin: u32,
     pub sub: u32,
     pub widen: u32,
+    /// Helper PEs a rest root at most for its costliest column region ([`Built::helper`]).
+    pub help: u32,
 }
 
 impl Default for KvSplit {
@@ -56,6 +58,7 @@ impl Default for KvSplit {
             thin: 1,
             sub: 1,
             widen: 0,
+            help: 0,
         }
     }
 }
@@ -64,21 +67,42 @@ impl Default for KvSplit {
 /// V column over several columns, `wafer-compile stream --cut`, builds for flux2-mini;
 /// at klein's 24 heads the links from the head roots to columns two wide meet more K / V
 /// chains than the palette's colours, so the search does not try it.)
-pub const KV_SPLITS: [KvSplit; 3] = [
+pub const KV_SPLITS: [KvSplit; 6] = [
     KvSplit {
         thin: 1,
         sub: 1,
         widen: 0,
+        help: 0,
     },
     KvSplit {
         thin: 1,
         sub: 1,
         widen: 1,
+        help: 0,
     },
     KvSplit {
         thin: 1,
         sub: 1,
         widen: 2,
+        help: 0,
+    },
+    KvSplit {
+        thin: 1,
+        sub: 1,
+        widen: 0,
+        help: 3,
+    },
+    KvSplit {
+        thin: 1,
+        sub: 1,
+        widen: 0,
+        help: 7,
+    },
+    KvSplit {
+        thin: 1,
+        sub: 1,
+        widen: 0,
+        help: 15,
     },
 ];
 
@@ -101,6 +125,9 @@ pub struct Built {
     pub sched: Option<UnitSched>,
     /// It reads lane vectors on its row / column roots.
     pub lanes: (bool, bool),
+    /// A column region on its rest roots split over helper PEs below each root: (step, helpers
+    /// a root, the region printed at the chunk each PE computes, `chunk / (helpers + 1)`).
+    pub helper: Option<(usize, u32, Printed)>,
 }
 
 /// The whole program.
@@ -511,6 +538,63 @@ pub fn program_at(
             .map_err(|e| format!("{}: step {i}: {e}", u.name))?;
             regions.insert(i, (at, printed, params));
         }
+        // helpers: the costliest column region on the rest roots that splits evenly (rows and
+        // scalars only: no tables, reductions or rotations), at most `help` PEs a root
+        let mut helper = None;
+        if split.help > 0 && !u.classes.is_empty() {
+            let best = regions
+                .iter()
+                .filter(|(_, (at, pr, ps))| {
+                    at.first == layout.heads
+                        && at.roots > 0
+                        && pr.tables.is_empty()
+                        && pr.all_reduces == 0
+                        && !pr.csl.contains("rp.tables(")
+                        && ps.iter().all(|x| *x != ParamAt::Resident)
+                })
+                .filter(|(i, _)| {
+                    matches!(
+                        u.steps[**i],
+                        Step::Region {
+                            side: Side::Col,
+                            ..
+                        }
+                    )
+                })
+                .max_by(|a, b| {
+                    let c = |(at, pr, _): &(place::RegionAt, Printed, Vec<ParamAt>)| {
+                        crate::cost::stream::RegionFeatures::of(&pr.csl, at.chunk).cycles(at.chunk)
+                    };
+                    c(a.1).total_cmp(&c(b.1))
+                })
+                .map(|(i, (at, _, ps))| (*i, *at, ps.clone()));
+            if let Some((i, at, ps)) = best {
+                // the most PEs (root and helpers) up to help + 1 that cut the chunk evenly
+                let d = (1..=split.help + 1)
+                    .rev()
+                    .find(|d| at.chunk.is_multiple_of(*d) && at.chunk / d >= 4)
+                    .unwrap_or(1);
+                if d > 1
+                    && let Step::Region { chain, .. } = &u.steps[i]
+                {
+                    let top = class_rows.iter().map(|c| c.0).max().unwrap_or(1).max(2) - 1;
+                    let lv = (32 - top.leading_zeros()).div_ceil(3);
+                    let pr = region::print(
+                        &chain.region,
+                        &Place {
+                            chunk: at.chunk / d,
+                            roots: at.roots * d,
+                            params: ps,
+                            round16,
+                            rope_lv: lv.max(1),
+                            rope_bits: 3,
+                        },
+                    )
+                    .map_err(|e| format!("{}: step {i} (helpers): {e}", u.name))?;
+                    helper = Some((i, d - 1, pr));
+                }
+            }
+        }
         let lanes = (
             u.steps.iter().any(|s| {
                 matches!(
@@ -538,6 +622,7 @@ pub fn program_at(
             regions,
             sched: None,
             lanes,
+            helper,
         });
     }
 
@@ -615,6 +700,32 @@ pub fn program_at(
         lanes: lane_unit,
         ..Requests::default()
     };
+    let qh = shape.attn.q_heads / shape.attn.kv_heads.max(1);
+    let pya = kv
+        .iter()
+        .map(|k| {
+            kv_pya_split(
+                k.stores.iter().map(|s| s.1).sum(),
+                qh,
+                shape.attn.head_dim,
+                split,
+            )
+        })
+        .max()
+        .unwrap_or(PYA);
+    // helpers below a unit's rest roots: within the band's K / V rows, and not under a block
+    // whose later units' links pass west below its first unit
+    let space = if blocks.is_empty() {
+        0
+    } else {
+        heads + pya.div_ceil(split.sub.max(1))
+    };
+    for (bi, b) in built.iter_mut().enumerate() {
+        let under = kv.iter().any(|k| k.units.len() > 1 && k.units[0] == bi);
+        if under || b.helper.as_ref().is_some_and(|h| h.1 >= space) {
+            b.helper = None;
+        }
+    }
     let asks: Vec<UnitAsk> = built
         .iter()
         .map(|b| UnitAsk {
@@ -636,21 +747,9 @@ pub fn program_at(
                 }),
             on_path: !b.unit.classes.is_empty(),
             lanes: b.lanes,
+            helpers: b.helper.as_ref().map_or(0, |h| h.1),
         })
         .collect();
-    let qh = shape.attn.q_heads / shape.attn.kv_heads.max(1);
-    let pya = kv
-        .iter()
-        .map(|k| {
-            kv_pya_split(
-                k.stores.iter().map(|s| s.1).sum(),
-                qh,
-                shape.attn.head_dim,
-                split,
-            )
-        })
-        .max()
-        .unwrap_or(PYA);
     let stream = Stream::of(&requests, py, &asks, &blocks, heads, pya, split.sub, bounds)?;
     let wiring = stream.wiring();
     let floor = stream.floor();

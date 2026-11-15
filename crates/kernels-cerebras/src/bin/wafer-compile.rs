@@ -44,7 +44,7 @@ const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <
      wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]\n       \
      wafer-compile stream --model <deployment> [--reading R] [--rows N] [--ieee] --out <dir> \
      [--values <dir>] [--stages N] [--tap v,..] [--py N] [--tile W] [--spill] \
-     [--cut THIN,SUB,WIDEN] [--class-rows context=512,latents=4096] \
+     [--cut THIN,SUB,WIDEN,HELP] [--class-rows context=512,latents=4096] \
      [--price context=512,latents=4096 [--parts]]";
 
 fn main() {
@@ -268,18 +268,23 @@ fn stream(args: &[String]) -> Result<(), String> {
         upto,
         taps,
     };
-    // `--cut T,S,W`: K / V PEs at 1 / T of their entries over S columns a head, W quarters more
-    // rest roots
+    // `--cut T,S,W,H`: K / V PEs at 1 / T of their entries over S columns a head, W quarters more
+    // rest roots, up to H helper PEs a rest root
     let kv = get("--cut")
         .map(|v| -> Result<_, String> {
             let n: Vec<u32> = v
                 .split(',')
                 .map(|x| x.parse().map_err(|e| format!("--cut {v}: {e}")))
                 .collect::<Result<_, _>>()?;
-            let [thin, sub, widen] = n[..] else {
-                return Err(format!("--cut {v}: THIN,SUB,WIDEN"));
+            let [thin, sub, widen, help] = n[..] else {
+                return Err(format!("--cut {v}: THIN,SUB,WIDEN,HELP"));
             };
-            Ok(kernels_cerebras::stream::build::KvSplit { thin, sub, widen })
+            Ok(kernels_cerebras::stream::build::KvSplit {
+                thin,
+                sub,
+                widen,
+                help,
+            })
         })
         .transpose()?;
     let pins = kernels_cerebras::stream::Pins {

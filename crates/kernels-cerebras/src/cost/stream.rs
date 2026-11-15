@@ -155,12 +155,29 @@ pub struct StreamCost {
     pub cycles: f64,
 }
 
+/// A word a root sends to or takes from the fabric (a helper's cast, its sums back).
+pub const FABRIC_WORD: f64 = 1.0;
+
 fn region_cycles(p: &Program, u: usize, step: usize) -> f64 {
     let b = &p.units[u];
-    let Some((at, printed, _)) = b.regions.get(&step) else {
+    let Some((at, printed, params)) = b.regions.get(&step) else {
         return 0.0;
     };
-    RegionFeatures::of(&printed.csl, at.chunk).cycles(at.chunk)
+    match &b.helper {
+        Some((si, h, hp)) if *si == step => {
+            // the root's part, its staging and copies, the helpers' parts out and back
+            let (c, q) = (f64::from(at.chunk), f64::from(at.chunk / (h + 1)));
+            let np = params
+                .iter()
+                .filter(|x| **x == crate::emit::region::ParamAt::Row)
+                .count() as f64;
+            let nout = hp.results.len() as f64;
+            RegionFeatures::of(&hp.csl, at.chunk / (h + 1)).cycles(at.chunk / (h + 1))
+                + (np * c + np * q + 2.0 * nout * q) * DSD_ELEM
+                + (np + nout) * (c - q) * FABRIC_WORD
+        }
+        _ => RegionFeatures::of(&printed.csl, at.chunk).cycles(at.chunk),
+    }
 }
 
 /// A query's cycles over a K / V column of `rows` stored rows at `pya` attention PEs.

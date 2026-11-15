@@ -21,8 +21,8 @@ use crate::emit::region::ParamAt;
 use crate::fabric::{Colour, Endpoint, RouteWord};
 use crate::floor::{Coord, Dir};
 use crate::floorplan::stream::{
-    self as fs, COL_CHAIN, KV_CHAIN, KV_RECV, KV_SEND, LANE_BUS, LANE_GATHER, PATH_IN, PATH_OUT,
-    ROW_CHAIN, SEGMENT,
+    self as fs, COL_CHAIN, HELP_CHAIN, KV_CHAIN, KV_RECV, KV_SEND, LANE_BUS, LANE_GATHER, PATH_IN,
+    PATH_OUT, ROW_CHAIN, SEGMENT,
 };
 use crate::stream::build::{Built, Program};
 use crate::stream::place::{self, Seg};
@@ -426,6 +426,29 @@ pub fn emit(p: &Program) -> R<Emitted> {
             tiles.insert(c, (name, root_params(p, ui, c, Side::Col)));
             for a in &cy_arrays {
                 arrays.push(rebind(a, c, i, b));
+            }
+        }
+        // the helpers below its rest roots
+        if su.helpers > 0 {
+            let (name, text) = helper_file(ui, b, &r)?;
+            files.push((name.clone(), text));
+            for i in su.heads()..su.cols() {
+                for k in 0..su.helpers {
+                    let c = su.helper(i, k);
+                    let (send, recv, role) = chain_cols(p, c, HELP_CHAIN);
+                    let hm = colour_of(p, &format!("HM{ui}")).map_or(0xff, u32::from);
+                    let params = parked(
+                        p,
+                        c,
+                        vec![
+                            ("C_HM".into(), hm),
+                            ("C_HS".into(), send),
+                            ("C_HR".into(), recv),
+                        ],
+                    );
+                    tiles.insert(c, (name.clone(), params));
+                    arrays.extend(cfg_array(c, &[k + 1, role]));
+                }
             }
         }
     }
@@ -992,7 +1015,7 @@ fn root_params(p: &Program, ui: usize, c: Coord, side: Side) -> Vec<(String, u32
             };
             let xc = colour_of(p, &format!("XC{ui}")).map_or(0xff, u32::from);
             let (gs, gr, _) = chain_cols(p, c, LANE_GATHER);
-            vec![
+            let mut v = vec![
                 ("C_CR".into(), cr),
                 ("C_XC".into(), xc),
                 ("C_KS".into(), opt(ep(p, c, KV_SEND), true)),
@@ -1000,7 +1023,17 @@ fn root_params(p: &Program, ui: usize, c: Coord, side: Side) -> Vec<(String, u32
                 ("C_LB".into(), lb),
                 ("C_GS".into(), gs),
                 ("C_GR".into(), gr),
-            ]
+            ];
+            // a rest root over helpers: their chain's cast out, their sums in
+            if let Some(Endpoint::Root(r)) = ep(p, c, HELP_CHAIN) {
+                let hm = colour_of(p, &format!("HM{ui}")).map_or(0xff, u32::from);
+                v.push(("C_HM".into(), hm));
+                v.push((
+                    "C_HR".into(),
+                    r.lo.or(r.hi).map_or(0xff, |c| u32::from(c.0)),
+                ));
+            }
+            v
         }
     };
     parked(p, c, v)
@@ -1101,6 +1134,10 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
         Vec::new()
     };
     let mut lane_pieces: Vec<(u32, u32, String)> = Vec::new(); // (bus off, n, dst dsd)
+    // a region over helpers: its row params (index, row of hx) and read scalars
+    let mut hrow: Vec<(usize, u32)> = Vec::new();
+    let mut hscal: Vec<usize> = Vec::new();
+    let mut helped = false;
     let mut sends_cast = false;
     let mut kv_io = false;
     let mut chain_in = false;
@@ -1149,9 +1186,29 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                 let k = slot;
                 slot += 1;
                 slot_of.insert(si, k);
+                // split over this root's helpers: the root computes the chunk's first q
+                // columns, helper h the h-th q after them
+                let help = if side == Side::Col {
+                    b.helper.as_ref().filter(|h| h.0 == si)
+                } else {
+                    None
+                };
+                let q = help.map_or(c, |h| c / (h.1 + 1));
                 let rname = format!("rg_{ui}_{si}.csl");
                 if !regions.iter().any(|(n, _)| *n == rname) {
-                    regions.push((rname.clone(), printed.csl.clone()));
+                    regions.push((
+                        rname.clone(),
+                        help.map_or(&printed.csl, |h| &h.2.csl).clone(),
+                    ));
+                }
+                let mut nrow = 0u32;
+                let mut hsc: Vec<String> = Vec::new();
+                if help.is_some() {
+                    let np = params.iter().filter(|x| **x == ParamAt::Row).count() as u32;
+                    g.decls.push_str(&buf(&format!("hx{k}"), np * c));
+                    g.decls
+                        .push_str(&buf(&format!("ho{k}"), chain.outs.len() as u32 * c));
+                    helped = true;
                 }
                 let seg = if printed.all_reduces > 0 {
                     "seg"
@@ -1169,14 +1226,17 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                             let cc = r.cols(input.value);
                             let from = cc.from + input.from + ri * c;
                             for (o, src, n) in g.pieces(cc.base, from, c)? {
-                                g.put(
-                                    late,
-                                    &format!(
-                                        "  @fmovs({}, {src});\n",
-                                        at(&format!("rg{k}.IN{pk}"), &o.to_string(), n)
-                                    ),
-                                );
+                                let dst = if help.is_some() {
+                                    at(&format!("D_hx{k}"), &(nrow * c + o).to_string(), n)
+                                } else {
+                                    at(&format!("rg{k}.IN{pk}"), &o.to_string(), n)
+                                };
+                                g.put(late, &format!("  @fmovs({dst}, {src});\n"));
                             }
+                            if help.is_some() {
+                                hrow.push((pk, nrow));
+                            }
+                            nrow += 1;
                         }
                         ParamAt::Scalar if !reads_scalar(&printed.csl, pk) => {}
                         ParamAt::Scalar => {
@@ -1194,6 +1254,7 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                                     ));
                                 }
                                 g.put(late, &format!("  rg{k}.sc{pk} = csc{ph}[{i}];\n"));
+                                hsc.push(format!("csc{ph}[{i}]"));
                             } else {
                                 scal.push((si, pk));
                                 g.put(
@@ -1203,6 +1264,10 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                                         scal.len() - 1
                                     ),
                                 );
+                                hsc.push(format!("scal[t * NSC + {}]", scal.len() - 1));
+                            }
+                            if help.is_some() {
+                                hscal.push(pk);
                             }
                         }
                         ParamAt::Resident => {
@@ -1274,13 +1339,63 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                         },
                     });
                 }
+                if help.is_some() {
+                    // the helpers' parts down their chain, the root's own into the region
+                    let mut t2 = String::new();
+                    for &(_, r0) in &hrow {
+                        let _ = writeln!(
+                            t2,
+                            "  @fmovs(fab.fout(q_hm, {}), {});",
+                            c - q,
+                            at(&format!("D_hx{k}"), &(r0 * c + q).to_string(), c - q)
+                        );
+                    }
+                    if !hsc.is_empty() {
+                        for (j, e) in hsc.iter().enumerate() {
+                            let _ = writeln!(t2, "  hsc{k}[{j}] = {e};");
+                        }
+                        let _ = writeln!(t2, "  @fmovs(fab.fout(q_hm, {}), D_hsc{k});", hsc.len());
+                        g.decls.push_str(&buf(&format!("hsc{k}"), hsc.len() as u32));
+                    }
+                    for &(pk, r0) in &hrow {
+                        let _ = writeln!(
+                            t2,
+                            "  @fmovs({}, {});",
+                            at(&format!("rg{k}.IN{pk}"), "0", q),
+                            at(&format!("D_hx{k}"), &(r0 * c).to_string(), q)
+                        );
+                    }
+                    g.put(late, &t2);
+                }
                 g.put(late, &format!("  rg{k}.row();\n"));
                 for (o, out) in chain.outs.iter().enumerate() {
+                    if help.is_some() {
+                        let o32 = o as u32;
+                        g.put(
+                            late,
+                            &format!(
+                                "  @fmovs({}, {});\n  @fmovs({}, fab.fin(q_hr, {}));\n",
+                                at(&format!("D_ho{k}"), &(o32 * c).to_string(), q),
+                                at(&format!("rg{k}.OUT{o}"), "0", q),
+                                at(&format!("D_ho{k}"), &(o32 * c + q).to_string(), c - q),
+                                c - q
+                            ),
+                        );
+                        let off = (o32 * c).to_string();
+                        g.loc(out.value, ri * c, c, &format!("D_ho{k}"), &off);
+                        if held(out.value) {
+                            let src = at(&format!("D_ho{k}"), &off, c);
+                            hold(&mut g, late, out.value, ri * c, c, &src);
+                        }
+                        continue;
+                    }
                     g.loc(out.value, ri * c, c, &format!("rg{k}.OUT{o}"), "0");
                     if held(out.value) {
                         hold(&mut g, late, out.value, ri * c, c, &format!("rg{k}.OUT{o}"));
                     }
                 }
+                hrow.clear();
+                hscal.clear();
             }
             Step::Matvec {
                 from,
@@ -1524,11 +1639,16 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
             ("C_XC", "q_xc", false),
             ("C_KS", "q_ks", false),
             ("C_GS", "q_gs", false),
+            ("C_HR", "q_hr", true),
+            ("C_HM", "q_hm", false),
         ],
     };
     let pnames: Vec<&str> = match side {
         Side::Row => vec![
             "C_PI", "C_PO", "C_RR", "C_XR", "C_LB", "C_SA", "C_SM", "C_SS", "S_ROLE",
+        ],
+        Side::Col if helped => vec![
+            "C_CR", "C_XC", "C_KS", "C_KR", "C_LB", "C_GS", "C_GR", "C_HM", "C_HR",
         ],
         Side::Col => vec!["C_CR", "C_XC", "C_KS", "C_KR", "C_LB", "C_GS", "C_GR"],
     };
@@ -1548,6 +1668,7 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
             "q_po" => path_out,
             "q_xr" | "q_xc" => sends_cast,
             "q_kr" | "q_ks" => kv_io,
+            "q_hr" | "q_hm" => helped,
             _ => false,
         }
     };
@@ -1749,6 +1870,92 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
         );
     }
     Ok((name, t, arrays, regions))
+}
+
+/// A unit's helper PE (below a rest root): each own row, its part of the region's row
+/// parameters off the root's cast (`pcfg[0]` its place `k`: columns `k q .. (k + 1) q` of the
+/// root's chunk), the row's scalars after them, the region at `q` columns, its results into
+/// its part of a zero vector summed up the helpers' chain to the root (`pcfg[1]` its role).
+fn helper_file(ui: usize, b: &Built, r: &Reader) -> R<(String, String)> {
+    let Some((si, h, printed)) = &b.helper else {
+        return Err(format!("{}: helpers of no region", b.unit.name));
+    };
+    let Step::Region { chain, .. } = &b.unit.steps[*si] else {
+        return Err(format!("{}: helpers of no region", b.unit.name));
+    };
+    let (ra, full, params) = &b.regions[si];
+    let c = ra.chunk;
+    let q = c / (h + 1);
+    let cq = c - q;
+    let name = format!("hp_{ui}.csl");
+    let mut t = String::new();
+    let _ = writeln!(
+        t,
+        "// {}: the helpers below its rest roots, step {si}'s region over {q} of a root's {c} columns \
+         (kernels-cerebras emit::stream).",
+        b.unit.name
+    );
+    t.push_str("param memcpy_params;\nparam C_HM: u16;\nparam C_HS: u16;\nparam C_HR: u16;\n");
+    t.push_str(COMMON);
+    t.push_str("const q_hm = @get_input_queue(2);\nconst q_hr = @get_input_queue(3);\nconst q_hs = @get_output_queue(2);\n");
+    t.push_str("const red = @import_module(\"ops/schain.csl\", .{ .fab = fab, .IN1 = q_hr, .OUT = q_hs });\n");
+    let _ = writeln!(
+        t,
+        "const rg = @import_module(\"rg_{ui}_{si}.csl\", .{{ .math = math, .seg = math }});"
+    );
+    t.push_str(&cfg_decl(&[0, 0]));
+    t.push_str(&buf("drn", 64));
+    let nout = chain.outs.len() as u32;
+    t.push_str(&buf("ov", nout * cq));
+    let scalars: Vec<usize> = (0..chain.ins.len())
+        .filter(|&pk| params[pk] == ParamAt::Scalar && reads_scalar(&full.csl, pk))
+        .collect();
+    if !scalars.is_empty() {
+        t.push_str(&buf("hsc", scalars.len() as u32));
+    }
+    let _ = r;
+    let mut row = String::from("  const hk: u16 = @as(u16, pcfg[0]);\n");
+    let _ = writeln!(
+        row,
+        "  const before: u16 = (hk - 1) * {q};\n  const after: u16 = {cq} - before - {q};"
+    );
+    for (pk, _) in params
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| **x == ParamAt::Row)
+    {
+        row.push_str(&drain("before", "q_hm", ""));
+        let _ = writeln!(
+            row,
+            "  @fmovs({}, fab.fin(q_hm, {q}));",
+            at(&format!("rg.IN{pk}"), "0", q)
+        );
+        row.push_str(&drain("after", "q_hm", ""));
+    }
+    if !scalars.is_empty() {
+        let _ = writeln!(row, "  @fmovs(D_hsc, fab.fin(q_hm, {}));", scalars.len());
+        for (j, pk) in scalars.iter().enumerate() {
+            let _ = writeln!(row, "  rg.sc{pk} = hsc[{j}];");
+        }
+    }
+    row.push_str("  rg.row();\n");
+    for o in 0..nout {
+        let _ = writeln!(
+            row,
+            "  @fmovs(@set_dsd_length(@increment_dsd_offset(D_ov, @as(i16, before + {}), f32), {q}), {});",
+            o * cq,
+            at(&format!("rg.OUT{o}"), "0", q)
+        );
+    }
+    let _ = writeln!(row, "  red.send(D_ov, {});", nout * cq);
+    let _ = write!(
+        t,
+        "fn row() void {{\n{row}}}\ntask go() void {{\n  stamp(0);\n  rg.init();\n  red.role = @as(u16, pcfg[1]);\n  {{ var t: u16 = 0; while (t < {}) : (t += 1) {{ row(); }} }}\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n}}\n",
+        b.unit.rows
+    );
+    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @initialize_queue(q_hm, .{ .color = @get_color(C_HM) });\n  @initialize_queue(q_hr, .{ .color = @get_color(C_HR) });\n  @initialize_queue(q_hs, .{ .color = @get_color(C_HS) });\n}\n");
+    let _ = printed;
+    Ok((name, t))
 }
 
 /// Whether unit `ui`'s CX roots all-reduce.

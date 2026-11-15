@@ -46,6 +46,8 @@ pub struct StreamUnit {
     pub segment: bool,
     /// On the row stream (the lane prologue's unit is not).
     pub on_path: bool,
+    /// Helper PEs below each rest root (`cy(i)` for `i >= heads`): [`StreamUnit::helper`].
+    pub helpers: u32,
 }
 
 impl StreamUnit {
@@ -67,6 +69,13 @@ impl StreamUnit {
     #[must_use]
     pub fn rows(&self) -> u32 {
         self.shape.rows()
+    }
+
+    /// Helper `k` of column root `i`: straight below it.
+    #[must_use]
+    pub fn helper(&self, i: u32, k: u32) -> Coord {
+        let c = self.cy(i);
+        Coord::new(c.x, c.y + 1 + k)
     }
 
     #[must_use]
@@ -147,6 +156,8 @@ pub struct UnitAsk {
     pub on_path: bool,
     /// It reads lane vectors on its row / column roots.
     pub lanes: (bool, bool),
+    /// Helper PEs below each of its rest roots (a column region split over them).
+    pub helpers: u32,
 }
 
 impl KvColumn {
@@ -268,11 +279,18 @@ impl Stream {
                 y,
                 segment: a.segment,
                 on_path: a.on_path,
+                helpers: a.helpers,
             });
             x += a.cols + 1;
             w = w.max(x);
         }
         let h = y + band;
+        if let Some(a) = asks.iter().find(|a| py + 2 + a.helpers > band) {
+            return Err(format!(
+                "stream floorplan: {}'s {} helpers a root outgrow its band of {band} rows",
+                a.name, a.helpers
+            ));
+        }
         let path: Vec<usize> = (0..units.len()).filter(|&u| units[u].on_path).collect();
         for p in path.windows(2) {
             let (a, b) = (&units[p[0]], &units[p[1]]);
@@ -406,6 +424,21 @@ impl Stream {
                     loopback: false,
                     slot: COL_CHAIN,
                 });
+            }
+            if unit.helpers > 0 {
+                for i in unit.heads()..unit.cols() {
+                    let mut pts = vec![unit.cy(i)];
+                    pts.extend((0..unit.helpers).map(|k| unit.helper(i, k)));
+                    w.chain(Chain {
+                        pts,
+                        root: 0,
+                        l1: pair(&format!("HL{u}")),
+                        l2: None,
+                        cast: class(&format!("HM{u}")),
+                        loopback: false,
+                        slot: HELP_CHAIN,
+                    });
+                }
             }
             if unit.segment {
                 w.chain(Chain {
@@ -559,6 +592,7 @@ pub const SEGMENT: Slot = Slot::segment("sseg");
 pub const PATH_IN: Slot = Slot::io("spin");
 pub const PATH_OUT: Slot = Slot::io("spout");
 pub const KV_CHAIN: Slot = Slot::reduce("skv", false);
+pub const HELP_CHAIN: Slot = Slot::reduce("shelp", false);
 pub const KV_SEND: Slot = Slot::io("skvs");
 pub const KV_RECV: Slot = Slot::io("skvr");
 pub const LANE_GATHER: Slot = Slot::reduce("slg", false);
@@ -598,6 +632,7 @@ mod tests {
             segment: false,
             on_path: true,
             lanes: (false, false),
+            helpers: 0,
         }
     }
 
