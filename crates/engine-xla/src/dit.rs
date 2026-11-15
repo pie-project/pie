@@ -148,6 +148,17 @@ pub fn cell_bytes(
 }
 
 impl Dit {
+    /// Every guest input a fire may stage: the id, whether a lane's row or
+    /// a row a token, and the bytes a row takes.
+    #[must_use]
+    pub fn input_seats(&self) -> Vec<(u32, bool, usize)> {
+        self.feeds
+            .seats()
+            .into_iter()
+            .map(|seat| (seat.id, seat.per_lane(), seat.row_bytes() as usize))
+            .collect()
+    }
+
     pub fn of(trace: &Trace, compiled: &CompiledModel) -> Result<Dit> {
         let mut dit = Dit {
             feeds: Feeds::of(trace, compiled),

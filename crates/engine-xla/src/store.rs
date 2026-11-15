@@ -20,6 +20,7 @@
 
 pub mod kv;
 pub mod layout;
+pub mod stage;
 pub mod streamed;
 pub mod tier;
 
@@ -118,6 +119,8 @@ pub struct CacheTable(pub Vec<CachePool>, pub Vec<Option<usize>>);
 pub struct Scratch {
     pub pages: Vec<u32>,
     pub window: Vec<u32>,
+    /// The rs list's slots, as many as `pages`.
+    pub rs: Vec<u32>,
     pub fixed: Vec<(ShapeId, Vec<[u32; 2]>)>,
 }
 
@@ -166,6 +169,24 @@ pub struct Pools {
     /// Each streamed bank's miss copy in pinned host memory: `(param, pool
     /// rows an expert's plane takes, root, buffer)`.
     host_banks: Vec<(u32, u32, Tensor, Buffer)>,
+    /// The staging slab: its first pool row and its rows (none on a shell
+    /// the load did not size).
+    slab: (u32, u32),
+    /// `(rung tokens, chunks)`: what each rung's staged inputs take of the
+    /// slab ([`ChunkFacts::act_chunks`]).
+    act_chunks: Vec<(u32, u32)>,
+    /// The staging ring's pinned host slots (none on a dry device).
+    ring: Option<stage::Ring>,
+}
+
+/// What a load stages a fire's inputs in: the slab's rows (the largest
+/// staged set any fire of the load can take), the ring's slots (frames in
+/// flight + 1), and each rung's own set `(rung tokens, rows)`, ascending.
+#[derive(Debug, Clone, Default)]
+pub struct Staging {
+    pub rows: u32,
+    pub slots: u32,
+    pub rungs: Vec<(u32, u32)>,
 }
 
 impl std::fmt::Debug for Pools {
@@ -414,6 +435,42 @@ pub fn reserved_bytes(
     Ok(u64::from(RESERVED_CHUNKS) * layout_of(trace, paging, rs, target)?.chunk_bytes)
 }
 
+/// The staging slab's bytes in the pool at `paging`: `rows` pool rows in
+/// whole chunks.
+pub fn slab_bytes(
+    trace: &Trace,
+    paging: Paging,
+    rs: Option<&crate::rs::Layout>,
+    target: u64,
+    rows: u32,
+) -> Result<u64> {
+    let chunk = layout_of(trace, paging, rs, target)?.chunk_bytes.max(1);
+    Ok((u64::from(rows) * ROW_BYTES).div_ceil(chunk) * chunk)
+}
+
+/// The most device memory one bulk write (`crate::inputs::Inputs::bulk`)
+/// takes beside the pool while it lands: the largest of a zeroed chunk
+/// (the load's warm copies), a batch of the largest slot (a tier move) and
+/// a run of streamed weight atoms (`STREAMED_RUN`, where weights stream).
+pub fn bulk_bytes(
+    trace: &Trace,
+    paging: Paging,
+    rs: Option<&crate::rs::Layout>,
+    target: u64,
+    streams: bool,
+) -> Result<u64> {
+    let layout = layout_of(trace, paging, rs, target)?;
+    let slot = layout.shapes.iter().map(|s| s.slot_bytes).max().unwrap_or(0);
+    let run = if streams { STREAMED_RUN } else { 0 };
+    Ok(layout
+        .chunk_bytes
+        .max(slot * SLOT_BATCH as u64)
+        .max(run))
+}
+
+/// The most bytes one bulk write lands of streamed weight atoms.
+pub const STREAMED_RUN: u64 = 256 << 20;
+
 /// The layout `trace` lays at `paging`, its chunk near `target` bytes.
 pub fn layout_of(
     trace: &Trace,
@@ -441,6 +498,7 @@ impl Pools {
         target: u64,
         streamed: Option<&mut streamed::Streamed>,
         extra_chunks: u32,
+        staging: &Staging,
     ) -> Result<Pools> {
         let (rows, heads) = layout_rows(trace, paging, facts, rs)?;
         let layout = match &streamed {
@@ -451,17 +509,37 @@ impl Pools {
         // past them ([`reserved_bytes`]).
         let least = RESERVED_CHUNKS + narrow(layout.shapes.len() as u64);
         let chunks = (RESERVED_CHUNKS + narrow(bytes / layout.chunk_bytes.max(1))).max(least);
+        // The staging slab: the top of the stated range, just below the
+        // sink, where the runtime keeps a fire's activation span. Counted
+        // once, not once a frame in flight: fires reach the device in order
+        // through the donated pool and each copies its own ring slot into
+        // the slab at its start, so one slab is every fire's; the frames in
+        // flight hold their copies in the host ring.
+        let chunk_rows = layout.chunk_bytes / ROW_BYTES;
+        let slab_chunks = narrow(u64::from(staging.rows).div_ceil(chunk_rows.max(1)));
+        let chunks = chunks + slab_chunks;
         // The streamed weights seated whole, in chunks of their own just
-        // below the sink: the state chunks the pool would have had stay
+        // below the slab: the state chunks the pool would have had stay
         // below them.
         let (chunks, weight_chunks) = match streamed {
             Some(s) if !s.is_empty() => {
                 let weight_chunks = s.chunks(layout.chunk_bytes);
                 let chunks = chunks + weight_chunks;
-                s.seat(layout.chunk_bytes, chunks - 1 - weight_chunks)?;
+                s.seat(layout.chunk_bytes, chunks - 1 - slab_chunks - weight_chunks)?;
                 (chunks, weight_chunks)
             }
             _ => (chunks + extra_chunks, 0),
+        };
+        let slab_row = narrow(u64::from(chunks - 1 - slab_chunks) * chunk_rows);
+        let act_chunks: Vec<(u32, u32)> = staging
+            .rungs
+            .iter()
+            .map(|&(tokens, rows)| (tokens, narrow(u64::from(rows).div_ceil(chunk_rows.max(1)))))
+            .collect();
+        let ring = if device.is_dry() || staging.rows == 0 {
+            None
+        } else {
+            Some(stage::Ring::lay(device, staging.slots, staging.rows)?)
         };
         layout.check_reach(chunks)?;
         let pool_rows = u64::from(chunks) * layout.chunk_bytes / ROW_BYTES;
@@ -587,6 +665,9 @@ impl Pools {
             weight_chunks,
             weight_views: Vec::new(),
             host_banks: Vec::new(),
+            slab: (slab_row, staging.rows),
+            act_chunks,
+            ring,
         })
     }
 
@@ -721,7 +802,7 @@ impl Pools {
         // shape's atoms in a row), up to a few hundred MiB an upload; lone
         // slots land a few dozen to a program (one update each), so the
         // programs are few and small.
-        let most = i64::try_from(((256u64 << 20) / shape.slot_bytes.max(1)).max(1)).unwrap_or(1);
+        let most = i64::try_from((STREAMED_RUN / shape.slot_bytes.max(1)).max(1)).unwrap_or(1);
         let step = i64::try_from(rows).unwrap_or(i64::MAX);
         let mut runs: Vec<(i64, Vec<&[u8]>)> = Vec::new();
         for (at, bytes) in placed {
@@ -802,7 +883,7 @@ impl Pools {
             let from = inputs.i32s(handles, &from, 1);
             let to = inputs.i32s(handles, &to, 1);
             let count = inputs.i32s(handles, &[batch.len() as i32], 1);
-            let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
+            let tracer = Tracer::new(handles).with_stage(self.stage_at(inputs.rows()));
             let root = self.root;
             let w = width as i64;
             tracer.emit(&mut |cx| {
@@ -894,7 +975,7 @@ impl Pools {
                 chunks: 1,
             }],
             shapes,
-            act_chunks: Vec::new(),
+            act_chunks: self.act_chunks.clone(),
             host_chunks: 0,
             disk_chunks: 0,
             disk_persistent: false,
@@ -989,6 +1070,37 @@ impl Pools {
         u32::try_from(at / ROW_BYTES).ok()
     }
 
+    /// Where a fire whose staged image takes `used` rows stages it. On a
+    /// shell the load did not size (the stage-only pass's), the slab is the
+    /// image's own rows.
+    #[must_use]
+    pub fn stage_at(&self, used: u32) -> crate::trace::StageAt {
+        let (slab_row, rows) = self.slab;
+        crate::trace::StageAt {
+            slab_rows: if rows == 0 { used } else { rows },
+            used_rows: used,
+            slab_row,
+        }
+    }
+
+    /// The slab's first row and rows, and the ring's slots.
+    #[must_use]
+    pub fn staging(&self) -> (u32, u32, u32) {
+        let slots = self.ring.as_ref().map_or(0, |r| r.shape().0);
+        (self.slab.0, self.slab.1, slots)
+    }
+
+    /// The staging ring's slot `at`.
+    #[must_use]
+    pub fn ring_buffer(&self, at: usize) -> Option<&Buffer> {
+        self.ring.as_ref().map(|r| r.buffer(at))
+    }
+
+    /// The staging ring, where the load laid one.
+    pub fn ring(&mut self) -> Option<&mut stage::Ring> {
+        self.ring.as_mut()
+    }
+
     /// The sink chunk: the pool's top one.
     #[must_use]
     pub fn sink_chunk(&self) -> u32 {
@@ -1032,6 +1144,10 @@ impl Pools {
             window: self
                 .layout
                 .window()
+                .map_or_else(Vec::new, |s| refs(s, pages, from)),
+            rs: self
+                .layout
+                .rs()
                 .map_or_else(Vec::new, |s| refs(s, pages, from)),
             fixed: self
                 .layout
@@ -1256,7 +1372,7 @@ impl Pools {
             let mut at = chunk.to_vec();
             pad_batch(&mut at, 1);
             let (inputs, list) = indices(handles, &at);
-            let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
+            let tracer = Tracer::new(handles).with_stage(self.stage_at(inputs.rows()));
             let root = self.root;
             let n = at.len() as i64;
             tracer.emit(&mut |cx| {
@@ -1348,7 +1464,7 @@ impl Pools {
                 .collect();
             pad_batch(&mut flat, 2);
             let (inputs, list) = indices(handles, &flat);
-            let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
+            let tracer = Tracer::new(handles).with_stage(self.stage_at(inputs.rows()));
             let root = self.root;
             let n = flat.len() as i64 / 2;
             tracer.emit(&mut |cx| {
@@ -1451,7 +1567,7 @@ impl Pools {
             let mut flat = src.clone();
             flat.extend_from_slice(&dst);
             let (inputs, at) = indices(handles, &flat);
-            let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
+            let tracer = Tracer::new(handles).with_stage(self.stage_at(inputs.rows()));
             let len = flat.len() as i64;
             let n = n as i64;
             tracer.emit(&mut |cx| {
@@ -1559,19 +1675,13 @@ impl Pools {
             data.extend_from_slice(&last);
         }
         let mut inputs = crate::inputs::Inputs::new();
-        let landed = inputs.raw(
-            handles,
-            Dtype::U32,
-            narrow(at.len() as u64 * rows),
-            128,
-            data,
-        );
+        let landed = inputs.bulk(handles, narrow(at.len() as u64 * rows), data);
         let values: Vec<i32> = at
             .iter()
             .map(|&v| i32::try_from(v).unwrap_or(i32::MAX))
             .collect();
         let list = inputs.i32s(handles, &values, 1);
-        let tracer = Tracer::new(handles).with_pack(inputs.pack_len());
+        let tracer = Tracer::new(handles).with_stage(self.stage_at(inputs.rows()));
         let root = self.root;
         let count = at.len() as i64;
         tracer.emit(&mut |cx| {
