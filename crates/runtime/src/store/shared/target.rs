@@ -115,6 +115,9 @@ impl SharedGrow {
     pub(crate) async fn walk_rung(&self) {
         loop {
             let (current, retired) = self.epochs();
+            // What a raise taken below owes the engine, and whether the
+            // rung stood under it ([`SharedPool::raise_applied`]).
+            let mut owed = (None, false);
             let (step, goal) = {
                 let mut pool = self.shared.lock().unwrap();
                 pool.pool_mut().retire_through(retired);
@@ -131,7 +134,9 @@ impl SharedGrow {
                 // carve held costs resident memory there.
                 let past = pool.pool().act_chunks(goal) < pool.pool().act_reserved();
                 let tick = self.ticks.load(Ordering::Acquire);
-                let forced = super::fire_cap(self.engine) > pool.fit_cap();
+                // An engine holding a rung the terms no longer fit is
+                // brought down at once too: a bind waits on it.
+                let forced = super::fire_cap(self.engine) > pool.fit_cap() || pool.told_unfit();
                 let waited = forced || {
                     let mut since = self.idle_since.lock().unwrap();
                     if past {
@@ -158,9 +163,13 @@ impl SharedGrow {
                     // A raise refused for room is not tried again until
                     // room is freed.
                     Ok(RungStep::Raise { .. }) | Err(_) if blocked => Ok(RungStep::Wait),
-                    Ok(RungStep::Raise { rung, evacuation }) => pool
-                        .raise_applied(&evacuation)
-                        .map(|()| RungStep::Raise { rung, evacuation }),
+                    Ok(RungStep::Raise { rung, evacuation }) => {
+                        let stood = pool.stands_at(rung);
+                        pool.raise_applied(&evacuation).map(|notice| {
+                            owed = (notice, stood);
+                            RungStep::Raise { rung, evacuation }
+                        })
+                    }
                     // A cap down or a lower before the patience is out.
                     // Fires wider than the widest rung that fits with the
                     // programs' fire terms are cut at once: the span holds
@@ -234,14 +243,17 @@ impl SharedGrow {
                     };
                     tracing::info!(engine = self.engine, rung, "the activation rung is lowered");
                     // Past the retire fence: the engine may give back the
-                    // carve above the new rung. A failed notice is no
-                    // fault.
+                    // carve above the new rung, where it holds another (a
+                    // lower that returns a dropped term's room at the rung
+                    // it holds sends nothing). A failed notice is no fault.
                     if let Some((from, to)) = notice
                         && let Err(error) =
                             crate::scheduler::pool(self.engine, PoolOp::Rung { from, to }).await
                     {
                         tracing::warn!(engine = self.engine, %error, from, to, "a lower's notice was refused");
                     }
+                    // A bind waiting on the engine to come down looks again.
+                    super::rung_changed(self.engine);
                     if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
                         planner.pages_freed();
                     }
@@ -256,19 +268,15 @@ impl SharedGrow {
                         epoch_now: || self.epochs().0,
                     };
                     if let Err(refused) =
-                        super::programs::carry_raise(&self.shared, &evacuation, &mover).await
+                        super::programs::carry_raise(&self.shared, &evacuation, owed.0, &mover)
+                            .await
                     {
                         tracing::debug!(engine = self.engine, %refused, "the walk's raise waits for room");
                         self.raise_blocked.store(true, Ordering::Release);
                         super::rung_changed(self.engine);
                         return;
                     }
-                    tracing::info!(
-                        engine = self.engine,
-                        rung,
-                        moved = evacuation.moves.len(),
-                        "the activation rung is raised"
-                    );
+                    super::raise_said(self.engine, rung, evacuation.moves.len(), owed.1);
                     super::rung_changed(self.engine);
                 }
             }
@@ -376,11 +384,15 @@ impl SharedGrow {
 
     /// Walks each time something it waits on happens: a retarget or a
     /// governor tick, a waiter short of room, room freed or a fire retired
-    /// (the planner's `pages_freed`: what drains and fences wait on), never
-    /// on a clock of its own.
+    /// (the planner's `pages_freed`: what drains and fences wait on), or a
+    /// bind or a raise that waits on a step of the rung's
+    /// ([`super::ask_walk`]); never on a clock of its own.
     async fn run(self) {
         loop {
-            self.wake.notified().await;
+            tokio::select! {
+                () = self.wake.notified() => {}
+                () = super::walk_asked(self.engine) => {}
+            }
             self.walk().await;
         }
     }

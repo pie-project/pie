@@ -528,6 +528,7 @@ impl Lane {
                             Some(engine) => {
                                 crate::probe_fire!(stats.fire.execute.engine_fire_us, {
                                     Self::fire_frame(
+                                        engine_idx,
                                         engine,
                                         &channels,
                                         roles.get_or_init(|| roles_of(engine_idx)).as_ref(),
@@ -668,6 +669,7 @@ impl Lane {
         reason = "the lane's state a frame reads, each its own"
     )]
     fn fire_frame(
+        engine_idx: usize,
         engine: &mut EngineBox,
         channels: &ChannelJoin,
         roles: Option<&crate::store::roles::RolesHandle>,
@@ -721,7 +723,12 @@ impl Lane {
                      admission, which the frame contract forbids: {error}"
                 ));
             }
-            Err(error) => return Err(format!("{error}")),
+            Err(error) => {
+                if matches!(error, ::engine::Error::Impossible(_)) {
+                    crate::store::shared::programs::impossible_submission(engine_idx, &error);
+                }
+                return Err(format!("{error}"));
+            }
         };
 
         let asynchronous = engine.settles_asynchronously();

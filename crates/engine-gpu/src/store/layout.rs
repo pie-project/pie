@@ -441,6 +441,7 @@ impl Layout {
         }
         ChunkFacts {
             span_backed_on_demand: false,
+            act_span_chunks: None,
             chunk_bytes: self.chunk_bytes,
             total_chunks: self.total_chunks,
             segment_chunks: self.segment_chunks,

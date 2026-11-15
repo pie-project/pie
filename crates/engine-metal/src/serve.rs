@@ -1620,20 +1620,25 @@ impl Shell {
     }
 
     /// The span's bytes from its end a rung of `to` tokens takes, as the
-    /// runtime counts it: the model's chunks, then one ceil over every live
-    /// (program, extents) pair's term at the lanes such a fire flies.
+    /// runtime counts it: the model's chunks, then one ceil over the guest
+    /// term at the lanes such a fire flies. The term is a fire's
+    /// (`engine::GuestTerm`): what the worst fire of those lanes lays for
+    /// the live (program, extents) pairs, each paying for the members the
+    /// fire gives it and nothing where it gives none.
     fn span_for(&self, to: u32) -> Result<u64> {
         let chunk = self.pools.layout().chunk_bytes.max(1);
         let model = self.arena.rung_reach(to).div_ceil(chunk);
-        let lanes = u64::from(to.min(self.budgets.tokens.max_lanes));
-        // A pair's lanes are no more than its live instances, as the runtime
-        // counts its term: `min(r, max_lanes, the pair's own cap, live)`.
-        let guests: u64 = self
+        let most = self.budgets.tokens.max_lanes;
+        let pairs: Vec<engine::FirePair> = self
             .programs
             .live_terms()?
-            .iter()
-            .map(|(term, live)| term.bytes(lanes.min(*live)))
-            .sum();
+            .into_iter()
+            .map(|(facts, live)| engine::FirePair {
+                facts,
+                live: u32::try_from(live).unwrap_or(u32::MAX),
+            })
+            .collect();
+        let guests = engine::GuestTerm::new(&pairs, most).bytes(to.min(most));
         Ok((model + guests.div_ceil(chunk)) * chunk)
     }
 

@@ -138,7 +138,10 @@ pub trait Engine: Send {
 
     /// What a fire holding lanes of `program` bound at `extents` needs
     /// beside the model's activation, asked before the first bind of those
-    /// extents is sent. The default states none.
+    /// extents is sent. The facts are the pair's; what a rung backs is a
+    /// fire's ([`crate::GuestTerm`]): the worst fire of the rung's lanes
+    /// over the pairs bound, each paying for the members the fire gives it
+    /// and nothing where it gives none. The default states none.
     fn fire_facts(&self, program: ProgramId, extents: &BindExtents) -> Result<FireFacts> {
         let _ = (program, extents);
         Ok(FireFacts::default())
@@ -239,15 +242,24 @@ pub trait Engine: Send {
         Ok(())
     }
 
-    /// The activation rung moves from `from` to `to` tokens; only where
+    /// The activation rung moves from `from`, the rung the engine was last
+    /// told (the smallest, from the load), to `to` tokens; only where
     /// [`crate::chunk::ChunkFacts::span_backed_on_demand`], through the
-    /// lane, never on a fire's path. A raise (`to > from`) comes before any
-    /// fire of the wider rung, and before the raise's [`Self::evacuate`]
-    /// where it moves state: the engine backs its carve for `to` here, and
-    /// a refusal (`Error::Exhausted`) takes the raise back, no fire passing
-    /// `from`. A lower (`to < from`) is a notice once every fire wider than
-    /// `to` has retired: the engine may give back the carve above `to`; a
-    /// failed notice is logged, not fatal.
+    /// lane, never on a fire's path, and only where the two differ. A raise
+    /// (`to > from`) comes before any fire of the wider rung, and before
+    /// the raise's [`Self::evacuate`] where it moves state: the engine
+    /// backs its carve for `to` here, and a refusal (`Error::Exhausted`)
+    /// takes the raise back, no fire passing `from`. A lower (`to < from`)
+    /// is a notice once every fire wider than `to` has retired: the engine
+    /// may give back the carve above `to`; a failed notice is logged, not
+    /// fatal.
+    ///
+    /// A guest term that grows at a standing rung is no rung change and
+    /// sends none: the runtime sets the room aside before it sends the bind
+    /// that grows it, and the engine covers it inside that bind, both
+    /// counting the same [`crate::GuestTerm`]. An engine that cannot cover
+    /// it answers the bind with what it lacks (`Error::Impossible`), and
+    /// the runtime gives the room back when the bind is through.
     fn set_rung(&mut self, from: u32, to: u32) -> Result<()> {
         let _ = (from, to);
         Ok(())

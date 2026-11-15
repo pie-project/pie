@@ -110,39 +110,10 @@ pub struct SlotPoolFacts {
     /// committed here ([`SlotPool::commit_span`]) before state opens a
     /// chunk in it.
     pub span_on_demand: bool,
-}
-
-/// What one registered program's fires add to every rung's activation
-/// (REDESIGN §6, [`::engine::ProgramFacts::fire_bytes`]): a fire of a rung
-/// of `r` tokens carries `min(r, FireLimits::max_lanes, max_lanes)` lanes
-/// of it and needs `fixed + lanes × a_lane` bytes beside the model's own
-/// activation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub struct FireTerm {
-    pub fixed: u64,
-    pub a_lane: u64,
-    /// The most lanes one fire of the program flies; 0: no cap of its own.
-    pub max_lanes: u32,
-}
-
-impl FireTerm {
-    #[must_use]
-    pub fn is_zero(&self) -> bool {
-        self.fixed == 0 && self.a_lane == 0
-    }
-
-    /// Bytes a fire carrying `lanes` lanes needs for the program: its own
-    /// lane cap taken.
-    #[must_use]
-    pub fn bytes(&self, lanes: u32) -> u64 {
-        let lanes = if self.max_lanes == 0 {
-            lanes
-        } else {
-            lanes.min(self.max_lanes)
-        };
-        self.fixed
-            .saturating_add(u64::from(lanes).saturating_mul(self.a_lane))
-    }
+    /// The chunks a rung's activation may take as the engine stands
+    /// (`ChunkFacts::act_span_chunks`); `None`: nothing of the engine's
+    /// own bounds it.
+    pub act_span: Option<u32>,
 }
 
 /// One slot: a logical chunk and the slot's index in it.
@@ -478,9 +449,10 @@ pub struct SlotPool {
     shapes: Vec<ShapeState>,
     act_chunks: Vec<(u32, u32)>,
     act: u32,
-    /// The fire terms of the programs that can be in a fire, on top of
-    /// every rung's activation ([`Self::act_chunks`]).
-    fire: Vec<FireTerm>,
+    /// What a fire takes for the guest programs it carries, on top of
+    /// every rung's activation ([`Self::act_chunks`]): the term of the
+    /// pairs that can be in a fire ([`::engine::GuestTerm`]).
+    fire: ::engine::GuestTerm,
     /// The most lanes a fire carries (the engine's `FireLimits::max_lanes`):
     /// a rung of `r` tokens allows `min(r, max_lanes)`.
     max_lanes: u32,
@@ -492,6 +464,9 @@ pub struct SlotPool {
     top_segment: u32,
     /// See [`SlotPoolFacts::span_on_demand`].
     span_on_demand: bool,
+    /// What the engine states its activation span covers as it stands
+    /// ([`Self::set_act_span`]): the statement itself, nothing derived.
+    act_span: Option<u32>,
     chunks: Vec<ChunkMeta>,
     /// A permutation of `0..total`, as the engine's chunk table.
     logical_to_physical: Vec<u32>,
@@ -554,11 +529,12 @@ impl SlotPool {
             shapes: facts.shapes.into_iter().map(ShapeState::new).collect(),
             act_chunks,
             act: 0,
-            fire: Vec::new(),
+            fire: ::engine::GuestTerm::default(),
             max_lanes: u32::MAX,
             act_max,
             top_segment,
             span_on_demand: facts.span_on_demand,
+            act_span: facts.act_span,
             chunks: vec![FREE_CHUNK; total as usize],
             logical_to_physical: (0..total).collect(),
             physical_to_logical: (0..total).collect(),
@@ -673,8 +649,8 @@ impl SlotPool {
     }
 
     /// Activation chunks a fire at `rung` tokens takes: the smallest rung at
-    /// or above it, else the largest; with the chunks the registered
-    /// programs' fire term takes at that rung's lanes ([`Self::set_fire`]).
+    /// or above it, else the largest; with the chunks the guest term takes
+    /// at that rung's lanes ([`Self::set_fire`]).
     pub fn act_chunks(&self, rung: u32) -> u32 {
         self.act_chunks
             .iter()
@@ -685,35 +661,77 @@ impl SlotPool {
             })
     }
 
-    /// The chunks the fire terms take at a rung of `tokens`: `min(tokens,
-    /// max_lanes)` lanes, each program's own cap taken.
+    /// The chunks the guest term takes at a rung of `tokens`: what the
+    /// worst fire of `min(tokens, max_lanes)` lanes lays for the pairs
+    /// open ([`::engine::GuestTerm::bytes`]).
     fn fire_chunks(&self, tokens: u32) -> u32 {
-        let lanes = tokens.min(self.max_lanes);
-        let bytes = self
-            .fire
-            .iter()
-            .fold(0u64, |sum, term| sum.saturating_add(term.bytes(lanes)));
+        let bytes = self.fire.bytes(tokens.min(self.max_lanes));
         u32::try_from(bytes.div_ceil(self.chunk_bytes.max(1))).unwrap_or(u32::MAX)
     }
 
-    /// The fire terms of the programs that can be in a fire from now on.
-    /// Nothing moves here: terms that raise the rung's need are taken by a
-    /// raise ([`Self::plan_rung`], [`Self::apply_rung`]), and terms that
-    /// drop give the room back at the next lower ([`Self::set_rung`]).
-    pub fn set_fire(&mut self, mut fire: Vec<FireTerm>) {
-        fire.retain(|term| !term.is_zero());
-        fire.sort_unstable();
-        self.fire = fire;
+    /// The bytes the guest term takes at the rung fires of `rung` tokens
+    /// take, before they are rounded to chunks.
+    #[must_use]
+    pub fn fire_bytes(&self, rung: u32) -> u64 {
+        self.fire.bytes(self.rung_of(rung).min(self.max_lanes))
+    }
+
+    /// The guest term of the pairs that can be in a fire from now on,
+    /// built for fires of up to [`Self::max_lanes`] lanes. Nothing moves
+    /// here: a term that raises the rung's need is taken by a raise
+    /// ([`Self::plan_rung`], [`Self::apply_rung`]), and one that drops
+    /// gives the room back at the next lower ([`Self::set_rung`]).
+    /// The term it replaces is handed back.
+    pub fn set_fire(&mut self, fire: ::engine::GuestTerm) -> ::engine::GuestTerm {
+        std::mem::replace(&mut self.fire, fire)
+    }
+
+    /// Makes the guest term the one of `pairs` in place
+    /// ([`::engine::GuestTerm::fit`]): whether it changed.
+    pub fn fit_fire(&mut self, pairs: &[::engine::FirePair]) -> bool {
+        self.fire.fit(pairs, self.max_lanes)
     }
 
     /// See [`Self::set_fire`].
-    pub fn fire(&self) -> &[FireTerm] {
+    pub fn fire(&self) -> &::engine::GuestTerm {
         &self.fire
     }
 
     /// The most lanes a fire carries: the engine's `FireLimits::max_lanes`.
     pub fn set_max_lanes(&mut self, lanes: u32) {
         self.max_lanes = lanes.max(1);
+    }
+
+    /// See [`Self::set_max_lanes`].
+    #[must_use]
+    pub fn max_lanes(&self) -> u32 {
+        self.max_lanes
+    }
+
+    /// The engine states its activation span covers `chunks` from the
+    /// range's end as it stands (`ChunkFacts::act_span_chunks`), `None`
+    /// where nothing of its own bounds it: the statement in force from
+    /// here, read where a rung is fitted ([`Self::act_span`]). Nothing is
+    /// kept that an earlier statement decided.
+    pub fn set_act_span(&mut self, chunks: Option<u32>) {
+        self.act_span = chunks;
+    }
+
+    /// See [`Self::set_act_span`].
+    #[must_use]
+    pub fn act_span(&self) -> Option<u32> {
+        self.act_span
+    }
+
+    /// The rung fires of `rung` tokens take: the smallest at or above it,
+    /// else the largest (`rung` itself where no rung is stated).
+    #[must_use]
+    pub fn rung_of(&self, rung: u32) -> u32 {
+        self.act_chunks
+            .iter()
+            .find(|(tokens, _)| *tokens >= rung)
+            .or(self.act_chunks.last())
+            .map_or(rung, |&(tokens, _)| tokens)
     }
 
     /// The activation chunks set aside now.
@@ -2065,6 +2083,7 @@ mod tests {
                 .collect(),
             act_chunks: act_chunks.to_vec(),
             span_on_demand: false,
+            act_span: None,
         }
     }
 

@@ -1197,6 +1197,7 @@ impl BatchScheduler {
                     &mut in_flight_control,
                     &mut frame_policy,
                     &nudge_tx,
+                    engine_id,
                 );
                 progress = true;
             }
@@ -1380,6 +1381,7 @@ impl BatchScheduler {
                         &mut in_flight_control,
                         &mut frame_policy,
                         &nudge_tx,
+                        engine_id,
                     );
                 }
                 tracing::debug!(
@@ -2620,6 +2622,7 @@ impl BatchScheduler {
         in_flight_control: &mut InFlightControls,
         frame_policy: &mut FramePolicy,
         rollback_tx: &SchedTx,
+        engine_id: EngineId,
     ) {
         match reply {
             LaneReply::Launch(result) => {
@@ -2636,6 +2639,7 @@ impl BatchScheduler {
                 instances,
                 frame_policy,
                 rollback_tx,
+                engine_id,
             ),
         }
     }
@@ -2647,6 +2651,7 @@ impl BatchScheduler {
         instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
         frame_policy: &mut FramePolicy,
         rollback_tx: &SchedTx,
+        engine_id: EngineId,
     ) {
         match commit {
             LaneCommit::None => {}
@@ -2717,6 +2722,13 @@ impl BatchScheduler {
             LaneCommit::CloseInstance { id } => {
                 if let Some(instance) = instances.remove(&id) {
                     instance.close_wait_slots();
+                }
+                // The lane dropped the instance's count; the guest term is
+                // built here, off the lane and outside the pool's lock.
+                if let Some(shared) =
+                    crate::store::registry::try_get(0, engine_id).and_then(|stores| stores.shared)
+                {
+                    crate::store::shared::programs::fit_fire(&shared);
                 }
             }
             LaneCommit::AsyncControl { result } => {

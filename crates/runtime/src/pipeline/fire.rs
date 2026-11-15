@@ -782,10 +782,24 @@ impl RaiseFunding {
                 if crate::store::shared::fire_cap(engine) >= target {
                     return;
                 }
+                // Quoted at the rung the raise is taken at: the one the
+                // engine holds where that is wider
+                // (`SharedPool::raise_at`).
                 let pages = {
                     let pool = shared.lock().unwrap();
-                    pool.raise_short(crate::store::shared::rung_goal(&pool, engine, rows))
-                        .1
+                    let goal = crate::store::shared::rung_goal(&pool, engine, rows);
+                    pool.raise_at(goal).map(|at| pool.raise_short(at).1)
+                };
+                let Some(pages) = pages else {
+                    // The engine holds a rung the guest terms no longer
+                    // fit: the walk brings it down first, and tells the
+                    // rung.
+                    crate::store::shared::ask_walk(engine);
+                    tokio::select! {
+                        () = &mut watch => {}
+                        () = stop.notified() => return,
+                    }
+                    continue;
                 };
                 if pages == 0 {
                     // The rung is not armed yet: the lane arms it between

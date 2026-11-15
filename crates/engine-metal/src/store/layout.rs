@@ -487,6 +487,17 @@ impl Layout {
             // A mapped placement heap is resident whether touched or not:
             // the span is backed as fires and lent state need it.
             span_backed_on_demand: !self.act().is_empty(),
+            // The load pins the range below the segment the largest rung's
+            // carve starts in (`Pool::reserve`): a carve reaches no lower
+            // (`Pool::cover`), with its guests' terms.
+            act_span_chunks: (!self.act().is_empty()).then(|| {
+                self.total_chunks
+                    - super::pool::top_first(
+                        self.total_chunks,
+                        self.segment_chunks,
+                        self.act_span(),
+                    )
+            }),
             chunk_bytes: self.chunk_bytes,
             total_chunks: self.total_chunks,
             segment_chunks: self.segment_chunks,

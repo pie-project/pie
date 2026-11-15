@@ -855,6 +855,7 @@ impl Chunks {
             .unwrap_or(u32::MAX);
         ChunkFacts {
             span_backed_on_demand: false,
+            act_span_chunks: None,
             chunk_bytes: layout.chunk_bytes,
             total_chunks: total,
             segment_chunks: layout.segment_chunks,

@@ -41,6 +41,7 @@ fn pool(chunks: u32, weights: &WeightShape) -> SlotPool {
         shapes,
         act_chunks: Vec::new(),
         span_on_demand: false,
+        act_span: None,
     })
 }
 

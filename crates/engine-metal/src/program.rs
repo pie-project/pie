@@ -598,6 +598,7 @@ impl Plane {
             // under the model's carve.
             fixed: self.arms as u64 * batches,
             max_lanes: 0,
+            laid: engine::LaidLanes::Exact,
         })
     }
 

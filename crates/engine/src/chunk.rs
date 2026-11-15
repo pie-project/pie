@@ -77,6 +77,18 @@ pub struct ChunkFacts {
     /// or not (Metal). `false`: the whole span is backed from the load.
     #[serde(default)]
     pub span_backed_on_demand: bool,
+    /// The chunks from the range's end a rung's activation may take as the
+    /// engine stands, the guest term of its fires included
+    /// ([`crate::GuestTerm`]). `None`: nothing of the engine's own bounds
+    /// it, and the activation may take every chunk state can move out of.
+    /// The runtime sets aside no rung whose activation with the term is
+    /// over it (fires are cut to the widest rung under it), and reads it
+    /// where it fits a rung, keeping nothing derived from it: a later
+    /// statement replaces it. An interim: the end state is `None` on every
+    /// engine, and the field goes with the last engine that pins its span's
+    /// bottom at load.
+    #[serde(default)]
+    pub act_span_chunks: Option<u32>,
     /// Host chunks state can be parked in, one id space beside the device's
     /// (CONTRACT-BC 22): chunks of `chunk_bytes`, ids from 0, none reserved,
     /// no table (a host ref names its place), any state shape taking any
@@ -480,6 +492,7 @@ impl ChunkFacts {
             shapes,
             act_chunks: Vec::new(),
             span_backed_on_demand: false,
+            act_span_chunks: None,
             host_chunks: host,
             disk_chunks,
             disk_persistent: pools.disk_kv_persistent,

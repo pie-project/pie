@@ -87,6 +87,9 @@ struct RungGate {
     /// moved, a raise was applied, copied or refused, the rung was lowered,
     /// segments were committed, or room was freed (a fire retired).
     event: tokio::sync::Notify,
+    /// The pool's walker is asked to look now ([`ask_walk`]): a bind or a
+    /// raise waits on a cut or a lower that is the walk's to take.
+    walk: tokio::sync::Notify,
 }
 
 /// Every engine's rung gate by its id: one for each engine named here,
@@ -101,13 +104,32 @@ fn rung_gate(engine: usize) -> &'static RungGate {
     if let Some(gate) = RUNG_GATES.read().unwrap().get(&engine) {
         return gate;
     }
-    RUNG_GATES.write().unwrap().entry(engine).or_insert_with(|| {
-        Box::leak(Box::new(RungGate {
-            cap: std::sync::atomic::AtomicU32::new(u32::MAX),
-            grant: std::sync::atomic::AtomicU32::new(u32::MAX),
-            event: tokio::sync::Notify::new(),
-        }))
-    })
+    RUNG_GATES
+        .write()
+        .unwrap()
+        .entry(engine)
+        .or_insert_with(|| {
+            Box::leak(Box::new(RungGate {
+                cap: std::sync::atomic::AtomicU32::new(u32::MAX),
+                grant: std::sync::atomic::AtomicU32::new(u32::MAX),
+                event: tokio::sync::Notify::new(),
+                walk: tokio::sync::Notify::new(),
+            }))
+        })
+}
+
+/// Asks `engine`'s walker to look now: what waits on it (a bind whose term
+/// the engine's rung no longer fits, fires cut wider than the widest rung
+/// that fits) waits on its next step, not on the governor's next tick. Kept
+/// where no walker waits yet: the next wait takes it.
+pub fn ask_walk(engine: usize) {
+    rung_gate(engine).walk.notify_one();
+}
+
+/// The next [`ask_walk`] of `engine`: what its walker waits on beside its
+/// own events.
+pub(crate) fn walk_asked(engine: usize) -> tokio::sync::futures::Notified<'static> {
+    rung_gate(engine).walk.notified()
 }
 
 /// Wakes every wait on `engine`'s rung: what it waits on may have changed.
@@ -274,6 +296,21 @@ pub fn rung_goal(pool: &SharedPool, engine: usize, rows: u32) -> u32 {
     pool.armed_rung_for(rows, crate::engine::live(engine).armed_through())
 }
 
+/// One line for a raise taken: at debug where the rung stood (a guest term
+/// that grew under it, once a bind), at info where the rung moved.
+pub(crate) fn raise_said(engine: usize, rung: u32, moved: usize, stood: bool) {
+    if stood {
+        tracing::debug!(
+            engine,
+            rung,
+            moved,
+            "the activation at a standing rung is raised"
+        );
+    } else {
+        tracing::info!(engine, rung, moved, "the activation rung is raised");
+    }
+}
+
 /// Raises `shared`'s rung at once to the one fires of `rows` take, where
 /// nothing lies in the larger span and the room is there (a raise that must
 /// move state is the walker's, through the engine's copy): the pass asking
@@ -291,18 +328,17 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
         }
     };
     if pool.pool().act_chunks(goal) > pool.pool().act_reserved() {
-        let Ok(evacuation) = pool.plan_raise(goal) else {
+        let Some(at) = pool.raise_at(goal) else {
             return;
         };
-        if pool.raise_waits(&evacuation) || pool.apply_rung(&evacuation, 0).is_err() {
+        let Ok(evacuation) = pool.plan_raise(at) else {
+            return;
+        };
+        let stood = pool.stands_at(at);
+        if pool.raise_waits(&evacuation) || pool.raise_applied(&evacuation).is_err() {
             return;
         }
-        tracing::info!(
-            engine,
-            rung = goal,
-            moved = 0,
-            "the activation rung is raised"
-        );
+        raise_said(engine, at, 0, stood);
         rung_changed(engine);
     }
     // The rung holds `goal` now: fires may take its width, once a raise's
@@ -397,7 +433,12 @@ impl RungWalk {
         let want = pool.pool().act_chunks(goal);
         let have = pool.pool().act_reserved();
         let lifted = if goal == largest { u32::MAX } else { goal };
-        if want < have {
+        // The engine holds a rung the terms no longer fit
+        // ([`SharedPool::told_unfit`]): it is told the goal as a lower is,
+        // behind the retire fence, whatever the goal's activation takes
+        // against what is set aside; a raise at the goal follows where it
+        // takes more.
+        if want < have || pool.told_unfit() {
             if cap > lifted {
                 self.lowering = None;
                 return Ok(RungStep::Cap(goal));
@@ -422,11 +463,11 @@ impl RungWalk {
         }
         self.lowering = None;
         if want > have {
-            let evacuation = pool.plan_raise(goal)?;
-            return Ok(RungStep::Raise {
-                rung: goal,
-                evacuation,
-            });
+            // Never under the rung the engine holds: only a lower, above,
+            // brings it down ([`SharedPool::raise_at`]).
+            let rung = pool.raise_at(goal).unwrap_or(goal);
+            let evacuation = pool.plan_raise(rung)?;
+            return Ok(RungStep::Raise { rung, evacuation });
         }
         Ok(if cap == lifted {
             RungStep::Wait
@@ -662,6 +703,15 @@ pub struct SharedPool {
     /// The activation set aside before the raise whose copy is the
     /// engine's to take: what a refused raise goes back to.
     raise_from: Option<u32>,
+    /// The rung the engine holds: the one it was last told
+    /// (`Engine::set_rung`), set in the hold of the pool that decides the
+    /// move, so whatever is decided next reads it, and put back where the
+    /// engine refuses a raise. A notice goes only where a move leaves it
+    /// another rung ([`Self::raise_applied`], [`Self::lower_rung`]).
+    told: u32,
+    /// [`Self::told`] before the raise whose copy is the engine's to take:
+    /// what a refused raise goes back to.
+    told_from: Option<u32>,
     /// The engine refused the last `commit_span`: no span segment is asked
     /// again until room is freed ([`Self::block_span_commit`]).
     span_commit_blocked: bool,
@@ -875,6 +925,7 @@ impl SharedPool {
             shapes,
             act_chunks: facts.act_chunks.clone(),
             span_on_demand: facts.span_backed_on_demand,
+            act_span: facts.act_span_chunks,
         });
         // The span backed from the load: the pool starts at the largest
         // rung. Backed on demand: at the smallest, the one the engine backs
@@ -904,9 +955,13 @@ impl SharedPool {
             least_chunks: 0,
             copying: None,
             raise_from: None,
+            told: 0,
+            told_from: None,
             span_commit_blocked: false,
             programs: programs::ProgramFires::default(),
         };
+        // The engine holds the rung the pool starts at.
+        shared.told = shared.pool.rung();
         // Under the smallest rung state may take every chunk but the
         // reserved ones and that rung's activation.
         let state_chunks = facts
@@ -923,6 +978,7 @@ impl SharedPool {
             shapes = facts.shapes.len(),
             records = shared.records_most,
             rungs = ?facts.act_chunks,
+            act_span = ?facts.act_span_chunks,
             "a shared pool"
         );
         Ok(shared)
@@ -1428,26 +1484,99 @@ impl SharedPool {
     /// nothing needs none.
     ///
     /// The engine may refuse the copy ([`Self::raise_refused`]).
-    pub fn raise_applied(&mut self, evacuation: &RungEvacuation) -> Result<(), RungError> {
+    ///
+    /// The notice the engine is sent first (`Engine::set_rung(from, to)`),
+    /// where the raise leaves it another rung than it holds and it is told
+    /// rungs ([`Self::tells_rungs`]): decided here, in the hold that takes
+    /// the raise. A raise at the rung the engine holds (a guest term grew
+    /// under it) owes none.
+    pub fn raise_applied(
+        &mut self,
+        evacuation: &RungEvacuation,
+    ) -> Result<Option<(u32, u32)>, RungError> {
         let before = self.pool.rung();
         let act = self.pool.act_reserved();
         if !self.raise_waits(evacuation) {
-            return self.apply_rung(evacuation, 0);
+            self.apply_rung(evacuation, 0)?;
+            self.tell(evacuation.rung);
+            return Ok(None);
         }
         self.apply_rung(evacuation, UNTIL_COPIED)?;
         self.copying = Some(self.copying.map_or(before, |held| held.min(before)));
         self.raise_from = Some(self.raise_from.map_or(act, |held| held.min(act)));
-        Ok(())
+        self.told_from.get_or_insert(self.told);
+        Ok(self.tell(evacuation.rung))
     }
 
     /// Whether `evacuation`'s raise goes through the engine before fires
-    /// take it: it moves state, which the engine copies first, or the span
-    /// is backed on demand, where the engine backs its carve for the wider
-    /// rung first (`Engine::set_rung`). With the span backed from the load,
-    /// a move-free raise makes no lane trip.
+    /// take it: it moves state, which the engine copies first, or it
+    /// leaves an engine that is told rungs (the span backed on demand)
+    /// another rung than it holds, where the engine backs its carve for
+    /// the wider rung first (`Engine::set_rung`). A move-free raise makes
+    /// no lane trip with the span backed from the load, nor at the rung
+    /// the engine holds: a guest term that grew under it is covered by the
+    /// engine inside the bind that grew it.
     #[must_use]
     pub fn raise_waits(&self, evacuation: &RungEvacuation) -> bool {
-        !evacuation.moves.is_empty() || self.pool.span_on_demand()
+        !evacuation.moves.is_empty()
+            || (self.tells_rungs() && self.pool.rung_of(evacuation.rung) != self.told)
+    }
+
+    /// The rung the engine holds: the one it was last told.
+    #[must_use]
+    pub fn told(&self) -> u32 {
+        self.told
+    }
+
+    /// Whether the engine holds the rung fires of `rung` take: a raise to
+    /// it moves no rung.
+    #[must_use]
+    pub fn stands_at(&self, rung: u32) -> bool {
+        self.pool.rung_of(rung) == self.told
+    }
+
+    /// Whether an engine that is told rungs holds one wider than the
+    /// widest that fits with the programs' guest terms
+    /// ([`Self::widest_fit`]): a term grew past it. The walk brings it
+    /// down at once ([`RungWalk::step`]), and a bind that grew the term is
+    /// not sent before ([`programs::fund_span`]): the engine covers a
+    /// bind's term at the rung it holds, so it is never asked to at one
+    /// whose term was not held against its span here.
+    #[must_use]
+    pub fn told_unfit(&self) -> bool {
+        self.tells_rungs() && self.told > self.fit_rung()
+    }
+
+    /// The rung a raise for fires of `rung` is taken at: `rung`, and on an
+    /// engine that is told rungs no narrower than the one it holds. A
+    /// raise never brings the engine down (it would give back a carve
+    /// fires in flight still take; that is the walk's lower, behind the
+    /// retire fence), and the engine covers a bind's term at the rung it
+    /// holds, so that rung's activation is what is set aside. `None` where
+    /// the rung it holds no longer fits ([`Self::told_unfit`]): the walk
+    /// brings it down first.
+    #[must_use]
+    pub fn raise_at(&self, rung: u32) -> Option<u32> {
+        if !self.tells_rungs() {
+            return Some(rung);
+        }
+        if self.told_unfit() {
+            return None;
+        }
+        Some(if self.told > self.pool.rung_of(rung) {
+            self.told
+        } else {
+            rung
+        })
+    }
+
+    /// The engine holds the rung of `rung` from here; the notice it is
+    /// owed (`Engine::set_rung(from, to)`) where that is another rung than
+    /// it held and it is told rungs.
+    fn tell(&mut self, rung: u32) -> Option<(u32, u32)> {
+        let to = self.pool.rung_of(rung);
+        let from = std::mem::replace(&mut self.told, to);
+        (from != to && self.tells_rungs()).then_some((from, to))
     }
 
     /// The cap fires start at: the rung the pool starts at, lifted. The
@@ -1459,7 +1588,8 @@ impl SharedPool {
     }
 
     /// Whether every rung change is told the engine (`Engine::set_rung`):
-    /// the span is backed on demand.
+    /// the span is backed on demand. A change is a move to another rung
+    /// than the engine holds ([`Self::told`]).
     #[must_use]
     pub fn tells_rungs(&self) -> bool {
         self.pool.span_on_demand()
@@ -1473,6 +1603,9 @@ impl SharedPool {
         if let Some(act) = self.raise_from.take() {
             self.pool.undo_rung(evacuation, act);
         }
+        if let Some(told) = self.told_from.take() {
+            self.told = told;
+        }
         self.copying = None;
     }
 
@@ -1483,6 +1616,7 @@ impl SharedPool {
         self.pool.refence(UNTIL_COPIED, epoch);
         self.copying = None;
         self.raise_from = None;
+        self.told_from = None;
     }
 
     /// The rung fires may not pass while a raise's copy is the engine's to
@@ -1681,17 +1815,25 @@ impl SharedPool {
     }
 
     /// Lets state take the span above `rung`'s activation again. Where the
-    /// span is backed on demand, the notice the engine is sent
-    /// (`Engine::set_rung(from, to)`), after the walk's retire fence: every
-    /// fire wider than `rung` has retired, so it may give back the carve
-    /// above it.
+    /// span is backed on demand and the engine holds another rung, the
+    /// notice it is sent (`Engine::set_rung(from, to)`), after the walk's
+    /// retire fence: every fire wider than `rung` has retired, so it may
+    /// give back the carve above it. A lower that only gives back what a
+    /// dropped guest term took, the rung standing, sends none.
+    ///
+    /// Where `rung`'s activation takes more than is set aside, only an
+    /// engine holding a wider rung is brought down to it (a guest term
+    /// grew past the rung it holds, [`Self::told_unfit`]): what is set
+    /// aside stays, and a raise at `rung` follows.
     pub fn lower_rung(&mut self, rung: u32) -> Result<Option<(u32, u32)>, RungError> {
         if self.pool.act_chunks(rung) > self.pool.act_reserved() {
-            return Err(RungError::Pool(SlotError::Occupied { rung, chunks: 0 }));
+            if !self.tells_rungs() || self.told <= self.pool.rung_of(rung) {
+                return Err(RungError::Pool(SlotError::Occupied { rung, chunks: 0 }));
+            }
+            return Ok(self.tell(rung));
         }
-        let from = self.pool.rung();
         self.pool.set_rung(rung).map_err(RungError::Pool)?;
-        Ok(self.tells_rungs().then_some((from, rung)))
+        Ok(self.tell(rung))
     }
 
     // ---- segments ----
