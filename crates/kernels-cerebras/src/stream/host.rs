@@ -217,6 +217,7 @@ fn fill(p: &Program, vals: &Values, a: &HostArray) -> R<Vec<f32>> {
                 Ok((d.len() / w.max(1), w, d))
             })?;
         }
+        Fill::Words(w) => out = w.iter().map(|&x| f32::from_bits(x)).collect(),
         Fill::HostOut { .. } | Fill::Stamps => {}
     }
     Ok(out)

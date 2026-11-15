@@ -607,6 +607,7 @@ pub fn program_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::floor::Coord;
 
     fn trace() -> Trace {
         poem_compiler::catalog::repository()
@@ -671,5 +672,50 @@ mod tests {
         let file = |n: &str| &e.files.iter().find(|(f, _)| f == n).expect(n).1;
         assert!(file("w_3_0.csl").contains("const HSW: u16 = 16;"));
         assert!(file("cx_3_0.csl").contains("fab.fin(q_ci, 16)"));
+    }
+
+    /// The PEs of one kind share their images: a unit's CX roots one file, a K / V column's PEs
+    /// one file and colours, their differences (lane drains, a PE's index in its column) the
+    /// config words the host writes; identical kernels across units one file.
+    #[test]
+    fn pes_of_a_kind_share_an_image() {
+        let t = trace();
+        let s = super::super::shape_of(&t, "denoise", 64).unwrap_or_else(|e| panic!("{e}"));
+        let p = program(&t, s, true).unwrap_or_else(|e| panic!("{e}"));
+        let e = crate::emit::stream::emit(&p).unwrap_or_else(|e| panic!("{e}"));
+        let layout = &e
+            .files
+            .iter()
+            .find(|(f, _)| f == "layout.csl")
+            .expect("layout")
+            .1;
+        let code = |c: Coord| -> &str {
+            let pre = format!("@set_tile_code({}, {}, \"", c.x, c.y);
+            let at = layout.find(&pre).expect("a PE's code") + pre.len();
+            &layout[at..at + layout[at..].find('"').expect("a file")]
+        };
+        for su in &p.stream.units {
+            let f = code(su.cx(0));
+            assert!((1..su.rows()).all(|j| code(su.cx(j)) == f), "{}", su.name);
+        }
+        // (file, params): an image; the memcpy params' column aside
+        let images: std::collections::BTreeSet<(&str, &str)> = layout
+            .lines()
+            .filter(|l| l.contains("@set_tile_code("))
+            .filter_map(|l| {
+                let (_, rest) = l.split_once(", \"")?;
+                let (file, rest) = rest.split_once('"')?;
+                Some((file, rest.split_once(')').map_or(rest, |x| x.1)))
+            })
+            .collect();
+        let files = e.files.iter().filter(|(f, _)| f != "layout.csl").count();
+        eprintln!(
+            "{} PEs, {} images, {files} files",
+            p.stream.w * p.stream.h,
+            images.len()
+        );
+        assert!(images.len() < 120, "{} images", images.len());
+        let pcfg = e.arrays.iter().filter(|a| a.sym == "pcfg").count();
+        assert!(pcfg > 0);
     }
 }

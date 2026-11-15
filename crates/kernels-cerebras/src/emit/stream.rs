@@ -72,6 +72,9 @@ pub enum Fill {
     },
     /// The stamps.
     Stamps,
+    /// A PE's runtime config words (`pcfg`): what differs between PEs sharing one image (a
+    /// root's lane drains, a weight column's index in the row store, a chain role).
+    Words(Vec<u32>),
 }
 
 /// One PE array the host fills or reads.
@@ -143,6 +146,36 @@ fn buf(name: &str, n: u32) -> String {
     )
 }
 
+/// A drain of `n` words (a `u16` expression) off queue `q` through `D_drn`, 64 at a time, each
+/// piece then `then` (with `m` its length).
+fn drain(n: &str, q: &str, then: &str) -> String {
+    format!(
+        "  {{ const nd: u16 = {n}; var k: u16 = 0; while (k < nd) : (k += 64) {{ const m = if (nd - k > 64) 64 else nd - k; @fmovs(@set_dsd_length(D_drn, m), fab.fin({q}, m));{then} }} }}\n"
+    )
+}
+
+/// The runtime config words' declaration and export (`pcfg`), empty where none.
+fn cfg_decl(cfg: &[u32]) -> String {
+    if cfg.is_empty() {
+        return String::new();
+    }
+    format!(
+        "var pcfg = @zeros([{}]u32);\nvar pcfg_p: [*]u32 = &pcfg;\n",
+        cfg.len()
+    )
+}
+
+/// The host array of a PE's config words, `None` where none.
+fn cfg_array(at: Coord, cfg: &[u32]) -> Option<HostArray> {
+    (!cfg.is_empty()).then(|| HostArray {
+        at,
+        sym: "pcfg".into(),
+        u16: false,
+        len: cfg.len() as u32,
+        fill: Fill::Words(cfg.to_vec()),
+    })
+}
+
 /// `n` words of DSD `d` from `off` (an expression).
 fn at(d: &str, off: &str, n: u32) -> String {
     format!("@set_dsd_length(@increment_dsd_offset({d}, @as(i16, {off}), f32), {n})")
@@ -180,6 +213,11 @@ struct Gen {
     /// the start of each late row.
     cast: bool,
     fetch: String,
+    /// The PE's runtime config words (`pcfg`), so roots that differ only in them share a file.
+    cfg: Vec<u32>,
+    /// The held buffers by (value, column): their names, numbered a value, not by column, so
+    /// every root of a unit names them alike.
+    holds: Vec<(u32, u32, String)>,
 }
 
 impl Gen {
@@ -240,6 +278,23 @@ impl Gen {
         Ok(out)
     }
 
+    /// A runtime config word: `v` at this PE, a `u16` expression in the file.
+    fn word(&mut self, v: u32) -> String {
+        self.cfg.push(v);
+        format!("@as(u16, pcfg[{}])", self.cfg.len() - 1)
+    }
+
+    /// The name of `base`'s held buffer from column `from` (`true` when new).
+    fn hold_name(&mut self, base: ValueId, from: u32) -> (String, bool) {
+        if let Some(h) = self.holds.iter().find(|h| h.0 == base.0 && h.1 == from) {
+            return (h.2.clone(), false);
+        }
+        let n = self.holds.iter().filter(|h| h.0 == base.0).count();
+        let name = format!("hd{}_{n}", base.0);
+        self.holds.push((base.0, from, name.clone()));
+        (name, true)
+    }
+
     fn round(&mut self, late: bool, d: &str, n: u32) {
         self.h16 = self.h16.max(n);
         self.put(
@@ -293,13 +348,16 @@ pub fn emit(p: &Program) -> R<Emitted> {
         let r = trace_reader(b);
         // the weight columns
         for col in 0..su.cols() {
-            let (name, text, mvs) = weight_file(ui, b, &r, col)?;
+            let (name, text, mvs, cfg) = weight_file(ui, b, &r, col)?;
             files.push((name.clone(), text));
             for row in 0..su.rows() {
                 let c = su.w(col, row);
-                // (no row index: a column's PEs differ only in their chains' colours, so they
-                // share a few images)
+                // (no row index: a column's PEs differ only in their chains' colours and their
+                // config words, so they share a few images)
                 tiles.insert(c, (name.clone(), weight_params(p, c)));
+                let mut words = cfg.clone();
+                words[0] = weight_role(p, c);
+                arrays.extend(cfg_array(c, &words));
                 for (k, (step, a, bb)) in mvs.iter().enumerate() {
                     arrays.push(HostArray {
                         at: c,
@@ -357,9 +415,9 @@ pub fn emit(p: &Program) -> R<Emitted> {
         files.push((pname.clone(), ptext));
         for i in 0..kc.pya {
             let c = kc.pe(s, i);
-            let mut params = kv_pe_params(p, c);
-            params.push(("K".into(), i));
+            let (params, role) = kv_pe_params(p, c);
             tiles.insert(c, (pname.clone(), params));
+            arrays.extend(cfg_array(c, &[i, role]));
         }
     }
     // the lane root
@@ -398,6 +456,7 @@ pub fn emit(p: &Program) -> R<Emitted> {
             });
         }
     }
+    dedup(&mut files, &mut tiles);
     files.push(("layout.csl".into(), layout_file(p, &tiles, &arrays)));
     Ok(Emitted {
         files,
@@ -405,6 +464,59 @@ pub fn emit(p: &Program) -> R<Emitted> {
         w: s.w,
         h: s.h,
     })
+}
+
+/// One file a text: files that differ only in their comments (a unit's name, a column's index)
+/// become the first of them, the regions first (the roots import them by name), then the PE
+/// kernels, every PE's code renamed. cslc builds an image a distinct (file, params), so this is
+/// what keeps a large program's image count to its kinds of PE, not its PEs.
+fn dedup(files: &mut Vec<(String, String)>, tiles: &mut Tiles) {
+    let key = |t: &str| -> String {
+        t.lines()
+            .filter(|l| !l.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let merge = |files: &mut Vec<(String, String)>, pick: &dyn Fn(&str) -> bool| {
+        let mut first: BTreeMap<String, String> = BTreeMap::new();
+        let mut to: BTreeMap<String, String> = BTreeMap::new();
+        files.retain(|(n, t)| {
+            if !pick(n) {
+                return true;
+            }
+            match first.entry(key(t)) {
+                std::collections::btree_map::Entry::Occupied(e) => {
+                    to.insert(n.clone(), e.get().clone());
+                    false
+                }
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(n.clone());
+                    true
+                }
+            }
+        });
+        to
+    };
+    let regions = merge(files, &|n| n.starts_with("rg_"));
+    if !regions.is_empty() {
+        for (n, t) in files.iter_mut() {
+            if n.starts_with("rg_") || !t.contains("\"rg_") {
+                continue;
+            }
+            for (from, to) in &regions {
+                let q = format!("\"{from}\"");
+                if t.contains(&q) {
+                    *t = t.replace(&q, &format!("\"{to}\""));
+                }
+            }
+        }
+    }
+    let kernels = merge(files, &|n| !n.starts_with("rg_"));
+    for (f, _) in tiles.values_mut() {
+        if let Some(to) = kernels.get(f) {
+            f.clone_from(to);
+        }
+    }
 }
 
 /// An array a root file declares, at root `idx` of its side.
@@ -478,7 +590,7 @@ fn weight_params(p: &Program, c: Coord) -> Vec<(String, u32)> {
         .iter()
         .position(|u| c.x > u.x && c.x <= u.x + u.cols())
         .unwrap_or(0);
-    let (cs, cr, crole) = chain_cols(p, c, COL_CHAIN);
+    let (cs, cr, _) = chain_cols(p, c, COL_CHAIN);
     let (rs, rr, _) = chain_cols(p, c, ROW_CHAIN);
     let xr = colour_of(p, &format!("XR{u}")).map_or(0xff, u32::from);
     let xc = colour_of(p, &format!("XC{u}")).map_or(0xff, u32::from);
@@ -492,9 +604,13 @@ fn weight_params(p: &Program, c: Coord) -> Vec<(String, u32)> {
             ("C_CR".into(), cr),
             ("C_RS".into(), rs),
             ("C_RR".into(), rr),
-            ("R_COL".into(), crole),
         ],
     )
+}
+
+/// A weight PE's column-chain role (its `pcfg[0]`).
+fn weight_role(p: &Program, c: Coord) -> u32 {
+    chain_cols(p, c, COL_CHAIN).2
 }
 
 /// A weight PE's matvec: (step, tile rows, tile columns).
@@ -531,7 +647,15 @@ fn held_rows(b: &Built, st: &Step) -> Vec<ValueId> {
     made.into_iter().filter(|v| u.held.contains(v)).collect()
 }
 
-fn weight_file(ui: usize, b: &Built, r: &Reader, col: u32) -> R<(String, String, Vec<Tile>)> {
+/// A weight column's file, its matvecs and its config words after the first (`pcfg[0]` is each
+/// PE's column-chain role, [`weight_params`]'s `R_COL`): the column's index in the row store and
+/// its chains' roles, so the columns of a unit share a few files.
+fn weight_file(
+    ui: usize,
+    b: &Built,
+    r: &Reader,
+    col: u32,
+) -> R<(String, String, Vec<Tile>, Vec<u32>)> {
     let name = format!("w_{ui}_{col}.csl");
     let l = &b.layout;
     let mut t = String::new();
@@ -540,7 +664,7 @@ fn weight_file(ui: usize, b: &Built, r: &Reader, col: u32) -> R<(String, String,
         "// {}: weight column {col} (kernels-cerebras emit::stream). Matvecs over the unit's rows,\n// ops/smv.csl's row a step.",
         b.unit.name
     );
-    t.push_str("param memcpy_params;\nparam C_XR: u16;\nparam C_XC: u16;\nparam C_CS: u16;\nparam C_CR: u16;\nparam C_RS: u16;\nparam C_RR: u16;\nparam R_COL: u16;\n");
+    t.push_str("param memcpy_params;\nparam C_XR: u16;\nparam C_XC: u16;\nparam C_CS: u16;\nparam C_CR: u16;\nparam C_RS: u16;\nparam C_RR: u16;\n");
     t.push_str(COMMON);
     t.push_str("const q_xr = @get_input_queue(2);\nconst q_xc = @get_input_queue(3);\nconst q_cr = @get_input_queue(4);\nconst q_rr = @get_input_queue(5);\nconst q_cs = @get_output_queue(2);\nconst q_rs = @get_output_queue(3);\n");
     t.push_str("const rs = @import_module(\"ops/schain.csl\", .{ .fab = fab, .IN1 = q_cr, .OUT = q_cs });\n");
@@ -552,6 +676,18 @@ fn weight_file(ui: usize, b: &Built, r: &Reader, col: u32) -> R<(String, String,
     let spill = l.spill;
     let mut kept: Vec<u32> = Vec::new();
     let mut fetch = String::new();
+    // pcfg[0] the PE's R_COL; the column's words after it
+    let mut cfg: Vec<u32> = vec![0];
+    let mut word = |v: u32| {
+        cfg.push(v);
+        format!("@as(u16, pcfg[{}])", cfg.len() - 1)
+    };
+    let keeper = if spill { word(col) } else { String::new() };
+    let fetch_role = if spill {
+        word(u32::from(col + 1 < l.px()))
+    } else {
+        String::new()
+    };
     for (si, st) in b.unit.steps.iter().enumerate() {
         // (kept after the step's own matvec: a held matvec output is cast once summed)
         let mut keep = String::new();
@@ -564,13 +700,12 @@ fn weight_file(ui: usize, b: &Built, r: &Reader, col: u32) -> R<(String, String,
                 zer = zer.max(len);
                 let _ = writeln!(
                     keep,
-                    "  if (t % {px} == {col}) {{ @fmovs(@set_dsd_length(@increment_dsd_offset(D_hs, @as(i16, (t / {px}) * HSW + {off}), f32), {len}), fab.fin(q_xr, {len})); }} else {{ @fmovs(@set_dsd_length(D_drn, {len}), fab.fin(q_xr, {len})); }}",
+                    "  if (t % {px} == {keeper}) {{ @fmovs(@set_dsd_length(@increment_dsd_offset(D_hs, @as(i16, (t / {px}) * HSW + {off}), f32), {len}), fab.fin(q_xr, {len})); }} else {{ @fmovs(@set_dsd_length(D_drn, {len}), fab.fin(q_xr, {len})); }}",
                     px = l.px()
                 );
                 let _ = writeln!(
                     fetch,
-                    "  rw.role = {role}; if (t % {px} == {col}) {{ rw.send(@set_dsd_length(@increment_dsd_offset(D_hs, @as(i16, (t / {px}) * HSW + {off}), f32), {len}), {len}); }} else {{ rw.send(@set_dsd_length(D_zer, {len}), {len}); }}",
-                    role = u32::from(col + 1 < l.px()),
+                    "  rw.role = {fetch_role}; if (t % {px} == {keeper}) {{ rw.send(@set_dsd_length(@increment_dsd_offset(D_hs, @as(i16, (t / {px}) * HSW + {off}), f32), {len}), {len}); }} else {{ rw.send(@set_dsd_length(D_zer, {len}), {len}); }}",
                     px = l.px()
                 );
             }
@@ -602,7 +737,7 @@ fn weight_file(ui: usize, b: &Built, r: &Reader, col: u32) -> R<(String, String,
                 if *from == Side::Col {
                     // the leaf: the easternmost column holding the matvec
                     let leaf = (col + 1..l.px()).all(|c2| place::tile_dims(st, l, c2).is_none());
-                    let _ = writeln!(body, "  rw.role = {};", u32::from(!leaf));
+                    let _ = writeln!(body, "  rw.role = {};", word(u32::from(!leaf)));
                 }
                 let _ = writeln!(body, "  m{m}.row(t);");
                 mvs.push((si, a, bb));
@@ -633,6 +768,7 @@ fn weight_file(ui: usize, b: &Built, r: &Reader, col: u32) -> R<(String, String,
     }
     t.push_str(&buf("drn", drn));
     t.push_str(&buf("zer", zer));
+    t.push_str(&cfg_decl(&cfg));
     if !kept.is_empty() {
         let hsw: u32 = kept.iter().sum();
         let _ = writeln!(t, "const HSW: u16 = {hsw};");
@@ -650,14 +786,14 @@ fn weight_file(ui: usize, b: &Built, r: &Reader, col: u32) -> R<(String, String,
     };
     let _ = write!(
         t,
-        "task go() void {{\n  stamp(0);\n  rs.role = R_COL;\n  var t: u16 = 0;\n  while (t < {ne}) : (t += 1) {{ early(t); }}\n  t = 0;\n  while (t < {nl}) : (t += 1) {{ late(t); }}\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n}}\n"
+        "task go() void {{\n  stamp(0);\n  rs.role = @as(u16, pcfg[0]);\n  var t: u16 = 0;\n  while (t < {ne}) : (t += 1) {{ early(t); }}\n  t = 0;\n  while (t < {nl}) : (t += 1) {{ late(t); }}\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n}}\n"
     );
-    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n");
+    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n");
     for m in 0..mvs.len() {
         let _ = writeln!(t, "  @export_symbol(w{m}_p, \"w{m}\");");
     }
     t.push_str("  @initialize_queue(q_xr, .{ .color = @get_color(C_XR) });\n  @initialize_queue(q_xc, .{ .color = @get_color(C_XC) });\n  @initialize_queue(q_cr, .{ .color = @get_color(C_CR) });\n  @initialize_queue(q_rr, .{ .color = @get_color(C_RR) });\n  @initialize_queue(q_cs, .{ .color = @get_color(C_CS) });\n  @initialize_queue(q_rs, .{ .color = @get_color(C_RS) });\n}\n");
-    Ok((name, t, mvs))
+    Ok((name, t, mvs, cfg))
 }
 
 /// Every kernel's opening: memcpy, the stamps, the fabric and math modules, the run task.
@@ -780,11 +916,11 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
     // per-row buffers and held rows
     let spill = side == Side::Row && l.spill;
     let hold = |g: &mut Gen, late: bool, base: ValueId, from: u32, len: u32, src: &str| {
-        let hname = format!("hd{}_{from}", base.0);
+        let (hname, new) = g.hold_name(base, from);
         if spill {
             // the row store: out to the row's weight PEs now, back up the row chain (the
             // keeper's chunk, zeros from the rest) at the start of the late row
-            if !g.decls.contains(&format!("var {hname}:")) {
+            if new {
                 g.decls.push_str(&buf(&hname, len));
                 let _ = writeln!(g.fetch, "  @fmovs(D_{hname}, fab.fin(q_ci, {len}));");
             }
@@ -793,7 +929,7 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
             g.held_loc(base, from, len, &format!("D_{hname}"), "0");
             return;
         }
-        if !g.decls.contains(&format!("var {hname}:")) {
+        if new {
             g.decls.push_str(&buf(&hname, rows * len));
         }
         g.put(
@@ -1141,13 +1277,15 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
             .sum();
         if own > 0 || farther > 0 {
             gather = true;
-            if farther > 0 {
-                g.drain = true;
-                let _ = writeln!(
-                    g.early,
-                    "  {{ var k: u16 = 0; while (k < {farther}) : (k += 64) {{ const m = if ({farther} - k > 64) 64 else {farther} - k; @fmovs(@set_dsd_length(D_drn, m), fab.fin(q_gr, m)); @fmovs(fab.fout(q_gs, m), @set_dsd_length(D_drn, m)); }} }}"
-                );
-            }
+            // (a runtime count, zero at the farthest root: every root of the unit one file)
+            g.drain = true;
+            let n = g.word(farther);
+            let d = drain(
+                &n,
+                "q_gr",
+                " @fmovs(fab.fout(q_gs, m), @set_dsd_length(D_drn, m));",
+            );
+            g.early.push_str(&d);
         }
     }
     // the lane words off the bus: drained between, copied where two read one
@@ -1158,14 +1296,12 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
         let mut got: Vec<(u32, u32, String)> = Vec::new();
         for (off, n, dst) in &lane_pieces {
             if *off >= cur {
-                if *off > cur {
-                    g.drain = true;
-                    let gap = off - cur;
-                    let _ = writeln!(
-                        g.lanes,
-                        "  {{ var k: u16 = 0; while (k < {gap}) : (k += 64) {{ const m = if ({gap} - k > 64) 64 else {gap} - k; @fmovs(@set_dsd_length(D_drn, m), fab.fin(q_lb, m)); }} }}"
-                    );
-                }
+                // the gap before it a runtime count (zero where none): a unit's roots differ
+                // in their lane words' offsets only, so they share one file
+                g.drain = true;
+                let gap = g.word(off - cur);
+                let d = drain(&gap, "q_lb", "");
+                g.lanes.push_str(&d);
                 let _ = writeln!(g.lanes, "  @fmovs({dst}, fab.fin(q_lb, {n}));");
                 got.push((*off, *n, dst.clone()));
                 cur = off + n;
@@ -1179,14 +1315,10 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
                 let _ = writeln!(g.lanes, "  @fmovs({dst}, @set_dsd_length({src}, {n}));");
             }
         }
-        if cur < p.lane_words {
-            g.drain = true;
-            let gap = p.lane_words - cur;
-            let _ = writeln!(
-                g.lanes,
-                "  {{ var k: u16 = 0; while (k < {gap}) : (k += 64) {{ const m = if ({gap} - k > 64) 64 else {gap} - k; @fmovs(@set_dsd_length(D_drn, m), fab.fin(q_lb, m)); }} }}"
-            );
-        }
+        g.drain = true;
+        let n = g.word(p.lane_words - cur);
+        let d = drain(&n, "q_lb", "");
+        g.lanes.push_str(&d);
     }
     let _ = &mut lanes_in;
 
@@ -1328,6 +1460,11 @@ fn root_file(p: &Program, ui: usize, b: &Built, r: &Reader, side: Side, idx: u32
     if g.drain {
         t.push_str(&buf("drn", 64));
     }
+    t.push_str(&cfg_decl(&g.cfg));
+    if let Some(a) = cfg_array(Coord::new(0, 0), &g.cfg) {
+        g.exports.push(("pcfg_p".into(), "pcfg".into(), false));
+        arrays.push(a);
+    }
     t.push_str(&g.decls);
     let _ = write!(
         t,
@@ -1466,7 +1603,8 @@ fn kv_root_params(p: &Program, kc: &fs::KvColumn, c: Coord) -> Vec<(String, u32)
     parked(p, c, v)
 }
 
-fn kv_pe_params(p: &Program, c: Coord) -> Vec<(String, u32)> {
+/// A K / V PE's colours and its chain role (a config word).
+fn kv_pe_params(p: &Program, c: Coord) -> (Vec<(String, u32)>, u32) {
     let (s, r, role) = chain_cols(p, c, KV_CHAIN);
     // the cast colour: the column's
     let am = p
@@ -1476,15 +1614,13 @@ fn kv_pe_params(p: &Program, c: Coord) -> Vec<(String, u32)> {
         .find(|k| (0..k.pya).any(|i| k.pe(&p.stream, i) == c))
         .and_then(|k| colour_of(p, &format!("AM{}_{}", k.block, k.head)))
         .map_or(0xff, u32::from);
-    parked(
-        p,
-        c,
-        vec![
-            ("C_AM".into(), am),
-            ("C_S".into(), s),
-            ("C_R".into(), r),
-            ("ROLE".into(), role),
-        ],
+    (
+        parked(
+            p,
+            c,
+            vec![("C_AM".into(), am), ("C_S".into(), s), ("C_R".into(), r)],
+        ),
+        role,
     )
 }
 
@@ -1575,8 +1711,10 @@ fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)>
         t,
         "// K / V column {k}'s attention PEs (kernels-cerebras emit::stream; ops/satt.csl)."
     );
-    t.push_str("param memcpy_params;\nparam K: u16;\nparam C_AM: u16;\nparam C_S: u16;\nparam C_R: u16;\nparam ROLE: u16;\n");
+    t.push_str("param memcpy_params;\nparam C_AM: u16;\nparam C_S: u16;\nparam C_R: u16;\n");
     t.push_str(COMMON);
+    // pcfg: the PE's index in the column, its chain role (the column's PEs one image)
+    t.push_str(&cfg_decl(&[0, 0]));
     t.push_str("const q_am = @get_input_queue(2);\nconst q_r = @get_input_queue(3);\nconst q_s = @get_output_queue(2);\n");
     t.push_str("const red = @import_module(\"ops/schain.csl\", .{ .fab = fab, .IN1 = q_r, .OUT = q_s });\n");
     let _ = writeln!(
@@ -1584,7 +1722,9 @@ fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)>
         "const att = @import_module(\"ops/satt.csl\", .{{ .fab = fab, .math = math, .red = red, .YM = q_am, .Qh = {qh}, .Dc = {dc}, .NE = {ne}, .PYA = {}, .SC = {sc:?}, .PMAX = {pmax}, .QH = true }});",
         pya
     );
-    let mut body = String::from("  stamp(0);\n  att.init(K);\n  red.role = ROLE;\n");
+    let mut body = String::from(
+        "  stamp(0);\n  att.init(@as(u16, pcfg[0]));\n  red.role = @as(u16, pcfg[1]);\n",
+    );
     for &(_, rows, p0) in &ks.stores {
         let _ = writeln!(
             body,
@@ -1597,7 +1737,7 @@ fn kv_pe_file(p: &Program, k: usize, ks: &place::KvSched) -> R<(String, String)>
     );
     body.push_str("  stamp(1);\n  sys_mod.unblock_cmd_stream();\n");
     let _ = write!(t, "task go() void {{\n{body}}}\n");
-    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n  @initialize_queue(q_r, .{ .color = @get_color(C_R) });\n  @initialize_queue(q_s, .{ .color = @get_color(C_S) });\n}\n");
+    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n  @initialize_queue(q_r, .{ .color = @get_color(C_R) });\n  @initialize_queue(q_s, .{ .color = @get_color(C_S) });\n}\n");
     Ok((name, t))
 }
 
@@ -1661,7 +1801,7 @@ fn layout_file(p: &Program, tiles: &Tiles, arrays: &[HostArray]) -> String {
         names.insert(a.sym.clone(), a.u16);
     }
     for (n, u16) in &names {
-        let ty = if n == "tsc" {
+        let ty = if n == "tsc" || n == "pcfg" {
             "u32"
         } else if *u16 {
             "u16"
