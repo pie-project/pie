@@ -13,7 +13,9 @@
 //! ([`engine::fit::tokens_within`], `engine.working_set_percent`). A
 //! recurrent model's fire replays its rows in a scratch outside the pool
 //! ([`rs_scratch`]), which is the fire's too: it counts against the share
-//! with the span, and the pool is laid in what it leaves ([`takes`]). A fire
+//! with the span, and the pool is laid in what it leaves ([`takes`]). The
+//! halving stops at the smallest rung that carries whole the widest run its
+//! own ladders admit ([`floor`]): one token for a model of text alone. A fire
 //! carries the lanes the load asks, no more than its rung has tokens: the
 //! span is priced with them.
 //!
@@ -115,8 +117,8 @@ pub fn pool(
             binding >> 20
         ))
     };
-    let segment_chunks = crate::store::pool::segment_chunks(chunk, total, binding, act)
-        .ok_or_else(span_short)?;
+    let segment_chunks =
+        crate::store::pool::segment_chunks(chunk, total, binding, act).ok_or_else(span_short)?;
     if total < least_chunks + act {
         return Err(span_short());
     }
@@ -221,34 +223,56 @@ pub enum Probe {
     Plan,
 }
 
+/// The lowest rung the halving from `dispatched` reaches: the smallest
+/// whose fire carries whole the widest run its own ladders admit (`run`,
+/// in token rows at a rung: one for a model of text alone, else the widest
+/// image, clip or audio item, whose rows no cut divides across fires).
+/// `dispatched` itself where no rung under it does.
+#[must_use]
+pub fn floor(dispatched: u32, run: impl Fn(u32) -> u32) -> u32 {
+    let mut tokens = dispatched.max(1);
+    while tokens > 1 && run(tokens / 2) <= tokens / 2 {
+        tokens /= 2;
+    }
+    tokens
+}
+
 /// The rung a load fires and what held it there: `stated` where the load
-/// states one, else the largest at or under `dispatched`, halving, whose
-/// fire (`probe`) takes no more than `share` and is laid. The floor of one
-/// token is not probed: a device that holds no rung is refused by the
-/// load, by name.
-pub fn rung(stated: u32, dispatched: u32, share: u64, probe: impl Fn(u32) -> Probe) -> (u32, Stop) {
+/// states one, else the largest at or under `dispatched`, halving and
+/// never under `floor` ([`floor`]), whose fire (`probe`) takes no more than
+/// `share` and is laid. The floor is not probed: a device that does not
+/// hold it is refused by the load, by name.
+pub fn rung(
+    stated: u32,
+    dispatched: u32,
+    floor: u32,
+    share: u64,
+    probe: impl Fn(u32) -> Probe,
+) -> (u32, Stop) {
     if stated != 0 {
         return (stated, Stop::Stated);
     }
     // Each refusal halves, so the last one is of the rung next above the
     // one taken.
     let refused = std::cell::Cell::new(Stop::DispatchAxis);
-    let tokens = engine::fit::tokens_within(dispatched, 1, share, |tokens| match probe(tokens) {
-        Probe::Takes(bytes) => {
-            if bytes > share {
-                refused.set(Stop::Share);
+    let floor = floor.clamp(1, dispatched.max(1));
+    let tokens =
+        engine::fit::tokens_within(dispatched, floor, share, |tokens| match probe(tokens) {
+            Probe::Takes(bytes) => {
+                if bytes > share {
+                    refused.set(Stop::Share);
+                }
+                bytes
             }
-            bytes
-        }
-        Probe::Pool => {
-            refused.set(Stop::Pool);
-            u64::MAX
-        }
-        Probe::Plan => {
-            refused.set(Stop::Plan);
-            u64::MAX
-        }
-    });
+            Probe::Pool => {
+                refused.set(Stop::Pool);
+                u64::MAX
+            }
+            Probe::Plan => {
+                refused.set(Stop::Plan);
+                u64::MAX
+            }
+        });
     (tokens, refused.get())
 }
 
@@ -296,6 +320,7 @@ fn say(
     weights: Option<u64>,
     fitted: &LoadBudgets,
     asked: (u32, u32),
+    floor: Option<u32>,
     stops: (Stop, Stop),
 ) {
     tracing::info!(
@@ -307,6 +332,7 @@ fn say(
         max_context = fitted.max_context,
         asked_tokens = asked.0,
         asked_context = asked.1,
+        floor_tokens = floor,
         tokens_stop = %stops.0,
         context_stop = %stops.1,
         "the fire and the context are fitted to the device"
@@ -329,7 +355,7 @@ pub fn budgets<B: Serve>(
     let fits_tokens = budgets.max_tokens == 0;
     let fits_context = budgets.context_declared && residency.device_kv_budget.is_none();
     if !fits_tokens && !fits_context {
-        let (_, tokens_stop) = rung(budgets.max_tokens, 0, 0, |_| Probe::Plan);
+        let (_, tokens_stop) = rung(budgets.max_tokens, 0, 1, 0, |_| Probe::Plan);
         let (_, context_stop) = context(
             budgets.max_context,
             budgets.context_declared,
@@ -344,6 +370,7 @@ pub fn budgets<B: Serve>(
             None,
             &budgets,
             (budgets.max_tokens, budgets.max_context),
+            None,
             (tokens_stop, context_stop),
         );
         return Ok(budgets);
@@ -482,9 +509,20 @@ pub fn budgets<B: Serve>(
         );
     }
 
+    // The widest run a fire of `tokens` carries whole, in token rows: one
+    // where the model reads text alone, else the widest image the patch
+    // ladder admits there, a token row a patch at most (how many patches
+    // fold into a token is the package's to state, and the load does not
+    // read it). A clip's rows are its request's: the voxel ladder is
+    // fitted to memory and states no widest one.
+    let run = |tokens: u32| {
+        crate::api::patch_ladder(trace, &at(tokens, context)).map_or(1, |ladder| ladder.max_patches)
+    };
+    let carried = floor(asked_tokens, run);
     // A fire has its share of what the weights leave, as on the cuda
-    // shell; a device that holds no rung is refused by the load, by name.
-    let (tokens, tokens_stop) = rung(budgets.max_tokens, asked_tokens, share, |tokens| {
+    // shell; a device that does not hold the floor's is refused by the
+    // load, by name.
+    let (tokens, tokens_stop) = rung(budgets.max_tokens, asked_tokens, carried, share, |tokens| {
         fire(&at(tokens, context))
     });
     let fitted = at(tokens, context);
@@ -494,6 +532,7 @@ pub fn budgets<B: Serve>(
         Some(weights),
         &fitted,
         (asked_tokens, budgets.max_context),
+        fits_tokens.then_some(carried),
         (tokens_stop, context_stop),
     );
     Ok(fitted)
@@ -501,7 +540,9 @@ pub fn budgets<B: Serve>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Pool, Probe, Stop, context, dispatched_rung, pool, rs_scratch, rung, takes};
+    use super::{
+        Pool, Probe, Stop, context, dispatched_rung, floor, pool, rs_scratch, rung, takes,
+    };
 
     const MIB: u64 = 1 << 20;
     /// A share no fixture's fire reaches.
@@ -513,20 +554,41 @@ mod tests {
     #[test]
     fn a_rung_names_what_stopped_it() {
         let takes = |tokens: u32| Probe::Takes(u64::from(tokens) * 1024);
-        assert_eq!(rung(10_240, 32_768, 0, takes), (10_240, Stop::Stated));
-        assert_eq!(rung(0, 32_768, ROOMY, takes), (32_768, Stop::DispatchAxis));
-        assert_eq!(rung(0, 32_768, 5000 * 1024, takes), (4096, Stop::Share));
-        let pooled = |tokens: u32| if tokens > 8192 { Probe::Pool } else { takes(tokens) };
-        assert_eq!(rung(0, 32_768, ROOMY, pooled), (8192, Stop::Pool));
-        let planned = |tokens: u32| if tokens > 2048 { Probe::Plan } else { takes(tokens) };
-        assert_eq!(rung(0, 32_768, ROOMY, planned), (2048, Stop::Plan));
+        assert_eq!(rung(10_240, 32_768, 1, 0, takes), (10_240, Stop::Stated));
+        assert_eq!(
+            rung(0, 32_768, 1, ROOMY, takes),
+            (32_768, Stop::DispatchAxis)
+        );
+        assert_eq!(rung(0, 32_768, 1, 5000 * 1024, takes), (4096, Stop::Share));
+        let pooled = |tokens: u32| {
+            if tokens > 8192 {
+                Probe::Pool
+            } else {
+                takes(tokens)
+            }
+        };
+        assert_eq!(rung(0, 32_768, 1, ROOMY, pooled), (8192, Stop::Pool));
+        let planned = |tokens: u32| {
+            if tokens > 2048 {
+                Probe::Plan
+            } else {
+                takes(tokens)
+            }
+        };
+        assert_eq!(rung(0, 32_768, 1, ROOMY, planned), (2048, Stop::Plan));
         // The share stops a rung the pool would have laid, and the last
         // refusal is the one named.
-        let both = |tokens: u32| if tokens > 16_384 { Probe::Pool } else { takes(tokens) };
-        assert_eq!(rung(0, 32_768, 5000 * 1024, both), (4096, Stop::Share));
+        let both = |tokens: u32| {
+            if tokens > 16_384 {
+                Probe::Pool
+            } else {
+                takes(tokens)
+            }
+        };
+        assert_eq!(rung(0, 32_768, 1, 5000 * 1024, both), (4096, Stop::Share));
         // A device that holds no rung is left at one token for the load to
         // refuse.
-        assert_eq!(rung(0, 32_768, 0, takes), (1, Stop::Share));
+        assert_eq!(rung(0, 32_768, 1, 0, takes), (1, Stop::Share));
     }
 
     /// A context names what held it: the load's statement, the model where
@@ -535,8 +597,14 @@ mod tests {
     #[test]
     fn a_context_names_what_stopped_it() {
         let takes = |context: u32| Some(u64::from(context) * 1000);
-        assert_eq!(context(4096, false, true, 16, 0, takes), (4096, Stop::Stated));
-        assert_eq!(context(40_960, true, false, 16, 0, takes), (40_960, Stop::Model));
+        assert_eq!(
+            context(4096, false, true, 16, 0, takes),
+            (4096, Stop::Stated)
+        );
+        assert_eq!(
+            context(40_960, true, false, 16, 0, takes),
+            (40_960, Stop::Model)
+        );
         assert_eq!(
             context(40_960, true, true, 16, ROOMY, takes),
             (40_960, Stop::Model)
@@ -577,7 +645,7 @@ mod tests {
         // 8192 tokens are laid and take more than the share (5632 MiB);
         // 4096 take 2816 MiB of it.
         assert_eq!(fire(8192), Probe::Takes(5632 * MIB));
-        assert_eq!(rung(0, 32_768, share, fire), (4096, Stop::Share));
+        assert_eq!(rung(0, 32_768, 1, share, fire), (4096, Stop::Share));
         // The load at the fitted rung: the pool in what the scratch leaves
         // holds the span and far more than one working set.
         let laid = pool(left - rs(4096), None, CHUNK, act(4096), 64, BINDING).unwrap();
@@ -587,7 +655,10 @@ mod tests {
         // The span alone would have fitted at the asked rung: the scratch
         // is what the halving saw.
         let spans = |tokens: u32| takes(left, None, CHUNK, act(tokens), 0, 64, BINDING);
-        assert_eq!(rung(0, 32_768, share, spans), (32_768, Stop::DispatchAxis));
+        assert_eq!(
+            rung(0, 32_768, 1, share, spans),
+            (32_768, Stop::DispatchAxis)
+        );
     }
 
     /// A fire within its share that leaves the pool no working set is
@@ -608,11 +679,60 @@ mod tests {
         // pool, 16 chunks of it the span's: 4 short of the working set's 340.
         assert_eq!(fire(2048), Probe::Pool);
         assert_eq!(fire(1024), Probe::Takes(176 * MIB));
-        assert_eq!(rung(0, 32_768, left / 2, fire), (1024, Stop::Pool));
-        let none =
-            |tokens: u32| takes(512 * MIB, None, CHUNK, act(tokens), rs(tokens), 340, BINDING);
-        assert_eq!(rung(0, 32_768, 256 * MIB, none), (1, Stop::Pool));
+        assert_eq!(rung(0, 32_768, 1, left / 2, fire), (1024, Stop::Pool));
+        let none = |tokens: u32| {
+            takes(
+                512 * MIB,
+                None,
+                CHUNK,
+                act(tokens),
+                rs(tokens),
+                340,
+                BINDING,
+            )
+        };
+        assert_eq!(rung(0, 32_768, 1, 256 * MIB, none), (1, Stop::Pool));
         assert!(pool(512 * MIB - rs(1), None, CHUNK, act(1), 340, BINDING).is_err());
+    }
+
+    /// A model whose fire carries a run of rows whole is halved no lower
+    /// than the smallest rung that holds the run: one token for a model of
+    /// text alone, and where the ladder follows the rung, the smallest rung
+    /// its own widest item fits. A device that does not seat that rung is
+    /// refused by the load, by name.
+    #[test]
+    fn a_rung_is_halved_no_lower_than_the_run_it_carries_whole() {
+        const CHUNK: u64 = 2 * MIB;
+        const BINDING: u64 = 4096 * MIB;
+        assert_eq!(floor(32_768, |_| 1), 1);
+        assert_eq!(floor(32_768, |_| 600), 1024);
+        assert_eq!(floor(32_768, |_| 1024), 1024);
+        assert_eq!(floor(32_768, |_| 1025), 2048);
+        // A ladder that follows the rung down to a least item of 64 rows.
+        assert_eq!(floor(32_768, |tokens| tokens.clamp(64, 4096)), 64);
+        // A run no rung holds leaves the asked one.
+        assert_eq!(floor(32_768, |_| 100_000), 32_768);
+
+        // The device of `a_fire_that_leaves_no_state_is_halved_to_one_that_does`:
+        // a model of text alone is halved to 1024 tokens there, and so is one
+        // that carries 600 rows whole.
+        let left = 1024 * MIB;
+        let act =
+            |tokens: u32| u32::try_from((u64::from(tokens) * 16_384).div_ceil(CHUNK)).unwrap();
+        let rs = |tokens: u32| u64::from(tokens) * 163_840;
+        let fire = |tokens: u32| takes(left, None, CHUNK, act(tokens), rs(tokens), 340, BINDING);
+        let share = left / 2;
+        let carried = floor(32_768, |_| 600);
+        assert_eq!(rung(0, 32_768, carried, share, fire), (1024, Stop::Pool));
+        // One that carries 1500 rows whole is halved no lower than 2048,
+        // which this device does not seat: the load refuses it, by name.
+        let carried = floor(32_768, |_| 1500);
+        assert_eq!(carried, 2048);
+        assert_eq!(rung(0, 32_768, carried, share, fire), (2048, Stop::Pool));
+        let refused = pool(left - rs(2048), None, CHUNK, act(2048), 340, BINDING)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("state pool"), "{refused}");
     }
 
     /// A recurrent model's scratch is priced at the rung's own rows and
@@ -661,7 +781,9 @@ mod tests {
         let (left, binding) = (15_360 * MIB, 4096 * MIB);
         let refused = pool(left, None, MIB, 4096, 8, binding).expect_err("three segments");
         assert!(
-            refused.to_string().contains("binds four segments of 4096 MiB"),
+            refused
+                .to_string()
+                .contains("binds four segments of 4096 MiB"),
             "{refused}"
         );
         let laid = pool(left, None, MIB, 2048, 8, binding).expect("four segments");
