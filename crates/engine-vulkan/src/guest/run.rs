@@ -176,7 +176,7 @@ impl<'a> OnDevice<'a> {
             let channel = put.channel;
             let bytes = self.session.span(at, local).map_or(0, |(_, l)| l);
             let on_device = if deferring {
-                host_reads_not(package, channel)
+                super::host_reads_not(package, channel)
             } else {
                 keeps(package, channel, bytes)
             };
@@ -329,21 +329,6 @@ fn keeps(package: &LaunchPackage, channel: u32, bytes: u64) -> bool {
             && decl.host_role != eta_ir::container::HostRole::Reader
             && bytes >= KEEP_BYTES
     })
-}
-
-/// Whether a deferred pass keeps `channel`'s puts on the device: every one the
-/// host does not read.
-fn host_reads_not(package: &LaunchPackage, channel: u32) -> bool {
-    let read_at_fire = package.ports.iter().any(|binding| {
-        binding.channel == channel
-            && !binding.is_const
-            && binding.port == eta_ir::registry::Port::Fold
-    });
-    !read_at_fire
-        && package
-            .channels
-            .get(channel as usize)
-            .is_some_and(|decl| decl.host_role != eta_ir::container::HostRole::Reader)
 }
 
 /// The value a landed read-back holds.

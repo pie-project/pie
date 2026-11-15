@@ -37,8 +37,57 @@ struct Instance {
 
     /// Ring cells a pass on the queue has yet to land, as (channel, sequence).
     landing: Arc<Mutex<Vec<(u32, u64)>>>,
+    /// Whether every cell a pass recorded to land later would land into a
+    /// ring nothing reads before the host takes it ([`lands_unread`]).
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+    lands_unread: bool,
     /// Set by a pass that faulted after its fire returned.
     faulted: Arc<AtomicBool>,
+}
+
+impl Instance {
+    /// Whether this instance's pass can be recorded to land later: one
+    /// stage, and no cell it lands read before it does.
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+    fn deferrable(&self) -> bool {
+        self.plan.package.plans.len() == 1
+            && self.lands_unread
+            && !self.inst.poisoned
+            && !self.faulted.load(Ordering::Acquire)
+    }
+
+    /// The first channel a stage at `at` takes or reads whose oldest cell
+    /// a pass on the queue put but has yet to land.
+    fn landing_at(&self, at: Stage) -> Option<u32> {
+        let landing = self.landing.lock().expect("landing lock poisoned");
+        landing.iter().find_map(|&(channel, sequence)| {
+            let wanted =
+                self.plan.takes_channel(channel, at) || self.plan.reads_channel(channel, at);
+            (wanted && self.inst.channels[channel as usize].head() == sequence).then_some(channel)
+        })
+    }
+}
+
+/// Whether every put a deferred pass of `plan` lands into its ring
+/// ([`crate::guest::host_reads_not`] false) is one only the host takes: no
+/// fold the next fire reads, nor a channel a stage takes or reads back.
+/// A landing ring holds the cell empty until the frame lands, so a pass
+/// putting one of those runs undeferred.
+fn lands_unread(plan: &ExecPlan) -> bool {
+    let package = &plan.package;
+    (0..u32::try_from(package.channels.len()).unwrap_or(u32::MAX))
+        .filter(|&channel| {
+            [Stage::Prologue, Stage::Epilogue]
+                .into_iter()
+                .any(|at| plan.puts_channel(channel, at))
+                && !crate::guest::host_reads_not(package, channel)
+        })
+        .all(|channel| {
+            !crate::guest::fold_port(package, channel)
+                && [Stage::Prologue, Stage::Epilogue]
+                    .into_iter()
+                    .all(|at| !plan.takes_channel(channel, at) && !plan.reads_channel(channel, at))
+        })
 }
 
 use engine_gpu::serve::InputCell;
@@ -220,6 +269,7 @@ impl Plane {
             seeds.insert(seed.channel, value);
         }
         let inst = eta_exec::make_host_instance(&plan, &externs, &seeds);
+        let lands_unread = lands_unread(&plan);
 
         #[cfg(feature = "vulkan")]
         let session = self.build_session(place, binding, &plan).map_err(|why| {
@@ -268,6 +318,7 @@ impl Plane {
                 session,
                 own_cells,
                 landing: Arc::default(),
+                lands_unread,
                 faulted: Arc::default(),
             },
         );
@@ -543,6 +594,14 @@ impl Plane {
                 "instance {instance}: the `fold` ring is empty at the fire"
             )));
         }
+        debug_assert!(
+            !seat
+                .landing
+                .lock()
+                .expect("landing lock poisoned")
+                .contains(&(binding.channel, ring.head())),
+            "instance {instance}: the fire read a fold cell a deferred pass has yet to land"
+        );
         let len = match ring.front() {
             Value::U32(cells) => cells.first().copied(),
             Value::I32(cells) => cells.first().map(|&n| n.max(0) as u32),
@@ -724,6 +783,11 @@ impl Plane {
         if seat.faulted.load(Ordering::Acquire) {
             return Err(Refusal::Program(format!("instance {instance} is poisoned")));
         }
+        debug_assert_eq!(
+            seat.landing_at(at),
+            None,
+            "instance {instance}: a stage takes a cell a deferred pass has yet to land"
+        );
 
         #[cfg(feature = "vulkan")]
         let device_half = match (device, widen.is_some()) {
@@ -804,16 +868,16 @@ impl Plane {
     }
 
     /// Whether `instance`'s pass can be recorded to land later: one stage,
-    /// reading its logits on the device.
+    /// reading its logits on the device, no cell it lands read before it
+    /// lands.
     #[cfg(feature = "vulkan")]
     #[must_use]
     pub fn defers(&self, instance: InstanceId) -> bool {
         self.widen.is_some()
-            && self.instances.get(&instance).is_some_and(|seat| {
-                seat.plan.package.plans.len() == 1
-                    && !seat.inst.poisoned
-                    && !seat.faulted.load(Ordering::Acquire)
-            })
+            && self
+                .instances
+                .get(&instance)
+                .is_some_and(Instance::deferrable)
     }
 
     /// Runs `instance`'s pass behind the forward on the queue and returns
@@ -843,6 +907,11 @@ impl Plane {
                 "instance {instance} has a device half, but the plane built no readout widen"
             ))
         })?;
+        debug_assert_eq!(
+            seat.landing_at(Stage::Epilogue),
+            None,
+            "instance {instance}: a stage takes a cell a deferred pass has yet to land"
+        );
         let inputs = PassInputs::none();
         let mut runner =
             crate::guest::run::OnDevice::new(device, &mut seat.session, widen, seats).deferred();
@@ -1176,4 +1245,129 @@ fn cell_facts(
             },
         ),
     )
+}
+
+#[cfg(all(test, not(feature = "vulkan")))]
+mod tests {
+    use engine::channel::{ChannelId, ChannelSeed};
+    use engine::program::{InstanceBinding, InstanceId, ProgramRegistration};
+    use eta_ir::container::{
+        ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
+    };
+    use eta_ir::op::Op;
+    use eta_ir::registry::{EngineCaps, GeometryClass, Port, Stage};
+    use eta_ir::types::{Dtype, Shape};
+
+    use super::Plane;
+
+    fn decl(host_role: HostRole, seeded: bool) -> ChannelDecl {
+        ChannelDecl {
+            shape: Shape::vector(1),
+            dtype: ChanDType::Concrete(Dtype::U32),
+            capacity: 2,
+            host_role,
+            seeded,
+        }
+    }
+
+    /// Binds `container`, channel 0 seeded with `seed`.
+    fn bound(plane: &mut Plane, container: TraceContainer, seed: u32) -> InstanceId {
+        let channels = container.channels.len() as u64;
+        let bound = eta_ir::validate::bind(container, vec![Vec::new()], EngineCaps::default())
+            .expect("the epilogue binds");
+        let stages = eta_compiler::plan::compile_bound(&bound);
+        let program = plane
+            .register(&ProgramRegistration {
+                launch: eta_compiler::codegen::launch::build(&bound, &stages),
+                ..Default::default()
+            })
+            .expect("the program registers");
+        let next = plane.instances.len() as u64 * channels;
+        plane
+            .bind(
+                &InstanceBinding {
+                    program,
+                    channels: (1..=channels).map(|id| ChannelId(next + id)).collect(),
+                    seeds: vec![ChannelSeed {
+                        channel: 0,
+                        bytes: seed.to_le_bytes().to_vec(),
+                    }],
+                    geometry: GeometryClass::default(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("the instance binds")
+            .id
+    }
+
+    /// The fold count the next fire reads, which the epilogue drains and
+    /// puts again (what a put to a peeked port records): the mtp
+    /// speculative decoder's shape.
+    fn fold_put() -> TraceContainer {
+        TraceContainer {
+            names: Vec::new(),
+            channels: vec![decl(HostRole::None, true)],
+            ports: vec![PortBinding {
+                port: Port::Fold,
+                source: PortSource::Channel(0),
+            }],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![Op::ChanTake(0), Op::ChanPut { chan: 0, value: 0 }],
+            }],
+            externs: Vec::new(),
+            inputs: Vec::new(),
+        }
+    }
+
+    /// A count only the host reads back: no stage takes it.
+    fn host_read() -> TraceContainer {
+        TraceContainer {
+            names: Vec::new(),
+            channels: vec![decl(HostRole::None, true), decl(HostRole::Reader, false)],
+            ports: Vec::new(),
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![
+                    Op::ChanTake(0),
+                    Op::ChanPut { chan: 1, value: 0 },
+                    Op::ChanPut { chan: 0, value: 0 },
+                ],
+            }],
+            externs: Vec::new(),
+            inputs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_fold_put_lands_before_the_next_fire_reads_it() {
+        let mut plane = Plane::default();
+        let seed = 7;
+        let folding = bound(&mut plane, fold_put(), seed);
+        let reading = bound(&mut plane, host_read(), seed);
+
+        // A fold the next fire reads runs undeferred: the pass lands before
+        // the fire returns, so the next forward reads what it put.
+        assert!(
+            !plane.instances[&folding].deferrable(),
+            "a pass putting the fold the next fire reads is deferred"
+        );
+        assert!(
+            plane.instances[&folding]
+                .landing_at(Stage::Epilogue)
+                .is_none(),
+            "an undeferred pass owes no landing"
+        );
+        let fold = plane
+            .envelope_fold(folding)
+            .expect("the fold the fire reads has landed");
+        assert_eq!(fold, Some(seed));
+
+        // A put only the host takes back still defers.
+        assert!(
+            plane.instances[&reading].deferrable(),
+            "a pass landing only host-read cells does not defer"
+        );
+    }
 }

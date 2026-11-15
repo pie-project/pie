@@ -93,6 +93,30 @@ pub fn lower(stage: usize, _source: &str, _layout: &[(u32, Slot)]) -> Result<Vec
     })
 }
 
+/// Whether a deferred pass keeps `channel`'s puts on the device: every one the
+/// host does not read.
+#[must_use]
+pub fn host_reads_not(
+    package: &eta_compiler::codegen::launch::LaunchPackage,
+    channel: u32,
+) -> bool {
+    !fold_port(package, channel)
+        && package
+            .channels
+            .get(channel as usize)
+            .is_some_and(|decl| decl.host_role != eta_ir::container::HostRole::Reader)
+}
+
+/// Whether `channel` is the fold the next fire reads before its forward.
+#[must_use]
+pub fn fold_port(package: &eta_compiler::codegen::launch::LaunchPackage, channel: u32) -> bool {
+    package.ports.iter().any(|binding| {
+        binding.channel == channel
+            && !binding.is_const
+            && binding.port == eta_ir::registry::Port::Fold
+    })
+}
+
 #[cfg(feature = "vulkan")]
 pub mod run;
 #[cfg(feature = "vulkan")]
