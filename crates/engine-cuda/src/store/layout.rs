@@ -99,6 +99,10 @@ pub enum Kind {
     /// A page of the rs buffer: the rows a lane lands past its state before
     /// they fold, every recurrent layer's.
     Rs,
+    /// A slot of a guest instance's tables ([`INSTANCE`]).
+    Instance,
+    /// A slot of a ring only the device reads and writes ([`CHANNEL`]).
+    Channel,
 }
 
 impl Kind {
@@ -111,6 +115,8 @@ impl Kind {
         Kind::Window(1),
         Kind::Window(2),
         Kind::Window(3),
+        Kind::Instance,
+        Kind::Channel,
     ];
 
     /// The shape the pages of a kv row of list `list` are slots of: 0 the
@@ -124,6 +130,24 @@ impl Kind {
         }
     }
 
+    /// The guest shape items of `role` take slots of; `None` for a role
+    /// that is not a guest's.
+    #[must_use]
+    pub const fn guest(role: engine::chunk::SlotRole) -> Option<Kind> {
+        match role {
+            engine::chunk::SlotRole::Instance => Some(Kind::Instance),
+            engine::chunk::SlotRole::Channel => Some(Kind::Channel),
+            _ => None,
+        }
+    }
+
+    /// A guest shape: its slots are the runtime's from the load on, named
+    /// by slot ref, never seated by the pool.
+    #[must_use]
+    pub const fn is_guest(self) -> bool {
+        matches!(self, Kind::Instance | Kind::Channel)
+    }
+
     /// A place of its own among the kinds, for a table a kind.
     #[must_use]
     pub const fn index(self) -> usize {
@@ -132,11 +156,13 @@ impl Kind {
             Kind::Fixed => 1,
             Kind::Rs => 2,
             Kind::Window(at) => 3 + at as usize,
+            Kind::Instance => 3 + MOST_WINDOWS,
+            Kind::Channel => 4 + MOST_WINDOWS,
         }
     }
 
     /// The kinds [`Kind::index`] numbers.
-    pub const COUNT: usize = 3 + MOST_WINDOWS;
+    pub const COUNT: usize = 5 + MOST_WINDOWS;
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -145,6 +171,8 @@ impl Kind {
             Kind::Window(_) => "windowed page",
             Kind::Fixed => "state slot",
             Kind::Rs => "rs buffer page",
+            Kind::Instance => "guest instance slot",
+            Kind::Channel => "guest channel slot",
         }
     }
 }
@@ -221,6 +249,33 @@ impl SlotShape {
         })
     }
 
+    /// A guest shape: `bytes` a slot, as many as a chunk holds, no row of
+    /// the model's laid in it.
+    fn guest(id: ShapeId, bytes: u64, chunk_bytes: u64) -> SlotShape {
+        SlotShape {
+            id,
+            tokens: 0,
+            slot_bytes: bytes,
+            per_chunk: u32::try_from(chunk_bytes / bytes).unwrap_or(u32::MAX),
+            grain: gcd(chunk_bytes, bytes),
+            window: None,
+            rows: Vec::new(),
+            pools: Vec::new(),
+        }
+    }
+
+    /// Where slot ref `slot` lies in a tier whose chunk ids are their
+    /// places (the host tier, CONTRACT-BC 22): its chunk, and its bytes
+    /// from the chunk's start.
+    #[must_use]
+    pub fn tier_place(&self, slot: u32) -> (u32, u64) {
+        let per_chunk = self.per_chunk.max(1);
+        (
+            slot / per_chunk,
+            u64::from(slot % per_chunk) * self.slot_bytes,
+        )
+    }
+
     /// Where the compressor state keyed by cache row `row` starts in a slot.
     #[must_use]
     pub fn pool_of(&self, row: u32) -> Option<u64> {
@@ -269,6 +324,9 @@ pub struct Layout {
     pub windows: Vec<SlotShape>,
     pub fixed: Option<FixedShape>,
     pub rs: Option<RsShape>,
+    /// The guest shapes: an instance's tables, a device ring.
+    pub instance: SlotShape,
+    pub channel: SlotShape,
     /// The tables the weight cache streams by their rows, a shape each.
     pub rows: Vec<RowsShape>,
     /// The routed experts the weight cache streams, a shape a layer size.
@@ -1094,6 +1152,8 @@ impl Layout {
             windows,
             fixed,
             rs,
+            instance: SlotShape::guest(INSTANCE, INSTANCE_SLOT, chunk_bytes),
+            channel: SlotShape::guest(CHANNEL, CHANNEL_SLOT, chunk_bytes),
             rows,
             experts,
         })
@@ -1106,22 +1166,20 @@ impl Layout {
             Kind::Window(at) => self.windows.get(at as usize),
             Kind::Fixed => self.fixed.as_ref().map(|fixed| &fixed.slot),
             Kind::Rs => self.rs.as_ref().map(|rs| &rs.slot),
+            Kind::Instance => Some(&self.instance),
+            Kind::Channel => Some(&self.channel),
         }
     }
 
     /// The guest shape of `role`; `None` for a role that is not a guest's.
     #[must_use]
     pub fn guest(&self, role: engine::chunk::SlotRole) -> Option<GuestShape> {
-        let (id, slot_bytes) = match role {
-            engine::chunk::SlotRole::Instance => (INSTANCE, INSTANCE_SLOT),
-            engine::chunk::SlotRole::Channel => (CHANNEL, CHANNEL_SLOT),
-            _ => return None,
-        };
+        let shape = self.shape(Kind::guest(role)?)?;
         Some(GuestShape {
-            id,
+            id: shape.id,
             role,
-            slot_bytes,
-            per_chunk: u32::try_from(self.chunk_bytes / slot_bytes).unwrap_or(u32::MAX),
+            slot_bytes: shape.slot_bytes,
+            per_chunk: shape.per_chunk,
         })
     }
 
@@ -1138,4 +1196,68 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
         (a, b) = (b, a % b);
     }
     a.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHUNK: u64 = 2 << 20;
+
+    /// The bytes of the host tier slot ref `slot` of `shape` takes.
+    fn place(shape: &SlotShape, slot: u32) -> std::ops::Range<u64> {
+        let (chunk, offset) = shape.tier_place(slot);
+        let at = u64::from(chunk) * CHUNK + offset;
+        at..at + shape.slot_bytes
+    }
+
+    /// Whether every slot of host chunk `chunk` lies inside the chunk: what
+    /// keeps a shape's slots off the chunks other shapes took.
+    fn keeps_to_its_chunk(shape: &SlotShape, chunk: u32) -> bool {
+        (0..shape.per_chunk).all(|index| {
+            let held = place(shape, chunk * shape.per_chunk + index);
+            u64::from(chunk) * CHUNK <= held.start && held.end <= u64::from(chunk + 1) * CHUNK
+        })
+    }
+
+    #[test]
+    fn a_guest_slot_has_a_place_of_its_own_in_the_host_tier() {
+        let instance = SlotShape::guest(INSTANCE, INSTANCE_SLOT, CHUNK);
+        let channel = SlotShape::guest(CHANNEL, CHANNEL_SLOT, CHUNK);
+        assert_eq!((instance.per_chunk, channel.per_chunk), (512, 2048));
+        for shape in [&instance, &channel] {
+            // Any host chunk a shape takes holds its slots and nothing of
+            // the chunks beside it, so two shapes in two chunks never meet.
+            for chunk in [0, 1, 7] {
+                assert!(keeps_to_its_chunk(shape, chunk), "{:?}", shape.id);
+            }
+            // A run of adjacent slots (an item's span) lies in adjacent
+            // places, as it does on the device.
+            let first = 3 * shape.per_chunk + 5;
+            for slot in first..first + 8 {
+                assert_eq!(place(shape, slot).end, place(shape, slot + 1).start);
+            }
+            // The chunk's last slot ends where the next chunk starts.
+            assert_eq!(place(shape, shape.per_chunk - 1).end, CHUNK);
+            assert_eq!(place(shape, shape.per_chunk).start, CHUNK);
+        }
+        // The control: a shape that counts one slot more a chunk than fits
+        // runs into the chunk after.
+        let over = SlotShape {
+            per_chunk: instance.per_chunk + 1,
+            ..instance.clone()
+        };
+        assert!(!keeps_to_its_chunk(&over, 0));
+    }
+
+    #[test]
+    fn every_kind_has_its_own_index() {
+        let mut seen = [false; Kind::COUNT];
+        for kind in Kind::ALL {
+            assert!(!std::mem::replace(&mut seen[kind.index()], true));
+        }
+        assert_eq!(Kind::guest(engine::chunk::SlotRole::Instance), Some(Kind::Instance));
+        assert_eq!(Kind::guest(engine::chunk::SlotRole::Channel), Some(Kind::Channel));
+        assert_eq!(Kind::guest(engine::chunk::SlotRole::State), None);
+    }
 }
