@@ -688,7 +688,11 @@ async fn restore(
     if let Some(txn) = rs {
         stores.rs.lock().unwrap().commit_restore(txn);
     }
-    ptrace!("restore-done pid={} ms={}", pid, began.elapsed().as_millis());
+    ptrace!(
+        "restore-done pid={} ms={}",
+        pid,
+        began.elapsed().as_millis()
+    );
     planner.report_restored(pid);
     crate::scheduler::nudge(engine);
 }

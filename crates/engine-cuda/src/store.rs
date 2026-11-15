@@ -3013,10 +3013,9 @@ impl Pools {
             .map(|cache| (cache.hits.ptr(), cache.slots.len() * 4))
             .chain(self.expert_caches.iter().flat_map(|cache| {
                 let experts = cache.shape.experts as usize;
-                cache
-                    .planes
-                    .iter()
-                    .filter_map(move |bank| bank.hits.as_ref().map(|hits| (hits.ptr(), experts * 4)))
+                cache.planes.iter().filter_map(move |bank| {
+                    bank.hits.as_ref().map(|hits| (hits.ptr(), experts * 4))
+                })
             }))
             .collect()
     }
@@ -3043,7 +3042,10 @@ impl Pools {
                 base: vec![0; bytes / 4],
             });
         }
-        let record = self.use_record.as_mut().expect("the use record was just made");
+        let record = self
+            .use_record
+            .as_mut()
+            .expect("the use record was just made");
         let mut reads = Vec::with_capacity(record.base.len());
         for (at, base) in record.base.iter_mut().enumerate() {
             // SAFETY: inside the record's mapped host span; a snapshot copy

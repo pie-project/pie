@@ -321,8 +321,9 @@ impl Forward {
                         Vec::new()
                     },
                 },
-                Def::Input(RuntimeInput::Mask | RuntimeInput::Geometry { .. })
-                | Def::Cache(_) => Held::Opaque,
+                Def::Input(RuntimeInput::Mask | RuntimeInput::Geometry { .. }) | Def::Cache(_) => {
+                    Held::Opaque
+                }
                 Def::Input(other) => return Err(format!("no input {other:?} here")),
                 _ => continue,
             };

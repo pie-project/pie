@@ -677,7 +677,9 @@ impl RaiseFunding {
                         let evacuation = {
                             let pool = shared.lock().unwrap();
                             let goal = pool.rung_for(rows);
-                            (goal > pool.rung()).then(|| pool.plan_raise(goal)).and_then(Result::ok)
+                            (goal > pool.rung())
+                                .then(|| pool.plan_raise(goal))
+                                .and_then(Result::ok)
                         };
                         if let Some(evacuation) = evacuation {
                             let copied = evacuation.moves.is_empty()
@@ -753,7 +755,8 @@ async fn wait_for_rung(
 
 impl Drop for RaiseFunding {
     fn drop(&mut self) {
-        self.stopped.store(true, std::sync::atomic::Ordering::Release);
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
         self.stop.notify_one();
     }
 }
@@ -2963,7 +2966,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // A piece that would not cut to the rung asks for its own width.
         let widest = cuts
             .iter()
-            .map(|piece| piece.iter().flatten().map(|&(from, to)| to - from).sum::<u32>())
+            .map(|piece| {
+                piece
+                    .iter()
+                    .flatten()
+                    .map(|&(from, to)| to - from)
+                    .sum::<u32>()
+            })
             .max()
             .unwrap_or(0);
         let (wanted, rung_want) = if widest > wanted && rows_total > RUNG_WANT_FROM {
@@ -3069,8 +3078,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 let ahead = PIECES_AHEAD.max(frame_size);
                 if at >= ahead && wanted > cut_at {
                     let behind = submitted[at - ahead].clone();
-                    while !behind.is_settled() && crate::store::shared::fire_cap(engine) <= cut_at
-                    {
+                    while !behind.is_settled() && crate::store::shared::fire_cap(engine) <= cut_at {
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
                 }
@@ -3100,12 +3108,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     };
                     let pipeline = ctx.resources().get(&this)?;
                     frames.truncate(at);
-                    frames.extend(piece_frames(
-                        stamp,
-                        cuts.len() - at,
-                        frame_size,
-                        || pipeline.next_frame_seq(),
-                    ));
+                    frames.extend(piece_frames(stamp, cuts.len() - at, frame_size, || {
+                        pipeline.next_frame_seq()
+                    }));
                 }
             }
             let piece = cuts[at].clone();
@@ -3114,9 +3119,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // for the raise its pass funds, or fails with what the planner
             // said: it never waits on a rung that does not come.
             let width: u32 = piece.iter().flatten().map(|&(from, to)| to - from).sum();
-            if let Err(refusal) = wait_for_rung(engine, width, funding.as_ref().map(|funding| {
-                move || funding.failed()
-            }))
+            if let Err(refusal) = wait_for_rung(
+                engine,
+                width,
+                funding.as_ref().map(|funding| move || funding.failed()),
+            )
             .await
             {
                 return Ok(Err(refusal));
@@ -4648,7 +4655,10 @@ pub(crate) mod lifecycle_tests {
             let drain_waker = std::task::Waker::from(flags[3].clone());
             for (wait, waker) in &mut lanes {
                 let mut cx = std::task::Context::from_waker(waker);
-                assert!(wait.as_mut().poll(&mut cx).is_pending(), "nothing settled yet");
+                assert!(
+                    wait.as_mut().poll(&mut cx).is_pending(),
+                    "nothing settled yet"
+                );
             }
             let mut cx = std::task::Context::from_waker(&drain_waker);
             assert!(std::pin::Pin::new(&mut drain).poll(&mut cx).is_pending());

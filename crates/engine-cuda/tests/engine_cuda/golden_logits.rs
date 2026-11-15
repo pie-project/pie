@@ -708,7 +708,11 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             Some(replay) => {
                 let skipped = tokens.len() - replay.window as usize;
                 shell
-                    .fire_media(&[seated(word | replay.bit, &tokens[..skipped], fed)], &[], &[])
+                    .fire_media(
+                        &[seated(word | replay.bit, &tokens[..skipped], fed)],
+                        &[],
+                        &[],
+                    )
                     .expect("the encoder-only rows fire");
                 (skipped, fed + u32::try_from(skipped).expect("a count"))
             }

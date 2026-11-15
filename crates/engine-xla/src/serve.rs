@@ -551,7 +551,10 @@ impl Shell {
         // budget of kv pages and state slots does not pay for: off the room.
         let reserved = crate::store::reserved_bytes(
             &boot.trace,
-            paging_at(u64::from(boot.context.div_ceil(boot.page_size.max(1))), boot.slots)?,
+            paging_at(
+                u64::from(boot.context.div_ceil(boot.page_size.max(1))),
+                boot.slots,
+            )?,
             rs_layout.as_deref(),
             target,
         )?;

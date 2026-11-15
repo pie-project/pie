@@ -657,7 +657,8 @@ pub fn count_routes(ctx: &Ctx<'_>, routes: Tensor, hits: Tensor) -> Result<(), E
         return Ok(());
     }
     ctx.fire(
-        Fire::at(ROUTE_FILE, "moe_count_routes").apply(Grid::of([n.div_ceil(256) * 256, 1, 1], [256, 1, 1])),
+        Fire::at(ROUTE_FILE, "moe_count_routes")
+            .apply(Grid::of([n.div_ceil(256) * 256, 1, 1], [256, 1, 1])),
         &[
             routes.arg(),
             hits.arg_mut(),

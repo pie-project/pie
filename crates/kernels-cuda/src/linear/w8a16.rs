@@ -132,7 +132,13 @@ pub fn matmul(
             let (bm, most) = if m <= 128 { (64u32, 4u32) } else { (128, 3) };
             (2..=most)
                 .rev()
-                .map(|stages| (bm, stages, stages * (bm * 64 * 2 + 128 * 64) + 128 * (k / gran)))
+                .map(|stages| {
+                    (
+                        bm,
+                        stages,
+                        stages * (bm * 64 * 2 + 128 * 64) + 128 * (k / gran),
+                    )
+                })
                 .find(|&(.., smem)| ctx.smem_fits(smem))
         })
         .flatten();

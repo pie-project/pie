@@ -107,7 +107,13 @@ impl Run<'_> {
             // takes the landing.
             let wv = l.read(wt)?.val;
             let wv = l.f().transpose(wv, &[1, 0])?;
-            match kernels_xla::linear::glu_gemm::geglu(l.f(), x, wv, o_y.rows, i64::from(intermediate))? {
+            match kernels_xla::linear::glu_gemm::geglu(
+                l.f(),
+                x,
+                wv,
+                o_y.rows,
+                i64::from(intermediate),
+            )? {
                 Some(v) => {
                     fused = true;
                     l.land(o_y, v)

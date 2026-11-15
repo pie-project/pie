@@ -355,5 +355,4 @@ impl PoolTarget for SharedGrow {
     fn take_refused(&mut self) -> bool {
         self.refused.swap(false, Ordering::AcqRel)
     }
-
 }

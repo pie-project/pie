@@ -424,9 +424,11 @@ fn gather_mb_4bit(
                 None => ctx.absent()?,
             },
             match rows {
-                Some(rows) => {
-                    stated(op, nonzero(op, "a row table's rows a block", rows.block_rows)?)?.arg()
-                }
+                Some(rows) => stated(
+                    op,
+                    nonzero(op, "a row table's rows a block", rows.block_rows)?,
+                )?
+                .arg(),
                 None => 0i32.arg(),
             },
             match rows.and_then(|rows| rows.hits) {

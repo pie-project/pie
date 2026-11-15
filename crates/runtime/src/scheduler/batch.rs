@@ -182,27 +182,40 @@ pub(crate) fn build_batch_request(
             completions.push(req.completion.clone());
             let base = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
             let mut own: Vec<u32> = Vec::new();
-            lanes.extend(std::mem::take(&mut req.request.lanes).into_iter().map(|mut lane| {
-                lane.fires_after = fires_after;
-                lane.group = lane.group.map(|id| {
-                    let local = own.iter().position(|&seen| seen == id).unwrap_or_else(|| {
-                        own.push(id);
-                        own.len() - 1
-                    });
-                    groups + u32::try_from(local).unwrap_or(u32::MAX)
-                });
-                lane
-            }));
+            lanes.extend(
+                std::mem::take(&mut req.request.lanes)
+                    .into_iter()
+                    .map(|mut lane| {
+                        lane.fires_after = fires_after;
+                        lane.group = lane.group.map(|id| {
+                            let local =
+                                own.iter().position(|&seen| seen == id).unwrap_or_else(|| {
+                                    own.push(id);
+                                    own.len() - 1
+                                });
+                            groups + u32::try_from(local).unwrap_or(u32::MAX)
+                        });
+                        lane
+                    }),
+            );
             groups = groups.saturating_add(u32::try_from(own.len()).unwrap_or(u32::MAX));
             member_lane_indptr.push(u32::try_from(lanes.len()).unwrap_or(u32::MAX));
-            media.extend(std::mem::take(&mut req.request.media).into_iter().map(|mut row| {
-                row.lane = row.lane.saturating_add(base);
-                row
-            }));
-            voxels.extend(std::mem::take(&mut req.request.voxels).into_iter().map(|mut row| {
-                row.lane = row.lane.saturating_add(base);
-                row
-            }));
+            media.extend(
+                std::mem::take(&mut req.request.media)
+                    .into_iter()
+                    .map(|mut row| {
+                        row.lane = row.lane.saturating_add(base);
+                        row
+                    }),
+            );
+            voxels.extend(
+                std::mem::take(&mut req.request.voxels)
+                    .into_iter()
+                    .map(|mut row| {
+                        row.lane = row.lane.saturating_add(base);
+                        row
+                    }),
+            );
         }
         StepBuild {
             lanes,
