@@ -170,6 +170,30 @@ pub fn line(rung: &TopRung, top: u32, span: u64, live: u64, device: &str, model:
     )
 }
 
+/// `line`, and the rates where this load measured them.
+#[must_use]
+pub fn line_of(
+    rung: &TopRung,
+    top: u32,
+    span: u64,
+    live: u64,
+    device: &str,
+    model: &str,
+    tuned: &profile::fire::Tuned,
+) -> String {
+    let mut out = line(rung, top, span, live, device, model);
+    if tuned.measured_this_load {
+        let r = tuned.rates;
+        out.push_str(&format!(
+            "; rates measured this load: {:.1} TFLOP/s bf16, {:.0} GB/s, launch {} us",
+            r.bf16_flops_per_ns.unwrap_or(0.0) / 1e3,
+            r.bytes_per_ns.unwrap_or(0.0),
+            r.launch_ns.unwrap_or(0) / 1000
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

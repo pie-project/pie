@@ -6,6 +6,8 @@ pub mod encode;
 pub mod guest;
 mod landing;
 pub mod program;
+#[cfg(feature = "wgpu")]
+pub mod rates;
 pub mod serve;
 pub mod tuning;
 
