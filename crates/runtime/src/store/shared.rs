@@ -36,13 +36,18 @@
 //! out of a reserve of one set per lane a fire runs, which the planner keeps
 //! back from admission (`ResidencyPlanner::cow_lanes`).
 //!
-//! Position (CONTRACT-BC item 2): state lies below `total - act_chunks(rung)`;
-//! raising the rung first moves state out of the new activation span
-//! ([`RungWalk`], [`SharedPool::plan_raise`]), the engine copying it by
+//! Position (CONTRACT-BC item 2): live state lies below the top rung's span,
+//! `total - act_chunks_max`, at every rung ([`SlotPool::live_limit`]); a
+//! lowered rung leaves the span below its own activation to idle cache
+//! alone (the weight cache's resident atoms above their floor), so raising
+//! the rung only ever clears cache there ([`RungWalk`],
+//! [`SharedPool::plan_raise`], [`SlotError::SpanCached`]): its owner lets
+//! it go, and the fires reading it retire, before the rung is taken. Only a
+//! guest term that carries the activation past the span's base moves live
+//! state out of its way, the engine copying it by
 //! [`::engine::Engine::evacuate`] before the next fire
-//! ([`SharedPool::apply_rung`] once it has). The top
-//! `act_chunks_max` span is committed from the load and counts as held from
-//! then on. Segments commit as a prefix (`commit_segments(n)`) ahead of need,
+//! ([`SharedPool::apply_rung`] once it has). The top `act_chunks_max` span
+//! is committed from the load (unless backed on demand). Segments commit as a prefix (`commit_segments(n)`) ahead of need,
 //! off the fire path; a shrink evacuates the highest committed segment of
 //! the prefix (the only one `release_segments` can give back without the
 //! ones above it) and releases it once the fire carrying the copy retires.
@@ -130,6 +135,33 @@ pub fn ask_walk(engine: usize) {
 /// own events.
 pub(crate) fn walk_asked(engine: usize) -> tokio::sync::futures::Notified<'static> {
     rung_gate(engine).walk.notified()
+}
+
+/// What lets go the idle cache lying in the span from a physical chunk on
+/// that a raise asks clear: the slots it gave back. A raise only ever
+/// clears cache there (live state never opens in the top rung's span), and
+/// the cache's owner is the one to let it go: the weight cache drops its
+/// resident atoms there, which stream again
+/// ([`crate::store::weights::WeightFirst::clear_span`]).
+pub type SpanClear = Arc<dyn Fn(u32) -> u64 + Send + Sync>;
+
+/// Every engine's [`SpanClear`] by its id, set once its weight cache is up.
+static SPAN_CLEARS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<usize, SpanClear>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// `engine`'s idle cache in a span a raise asks clear is let go by `clear`
+/// from here on.
+pub fn set_span_clear(engine: usize, clear: SpanClear) {
+    SPAN_CLEARS.write().unwrap().insert(engine, clear);
+}
+
+/// Asks `engine`'s cache to let go what it holds in the span from physical
+/// chunk `from` on; the slots it gave back (0 where nothing is set to). Not
+/// under the pool's lock: the cache takes it for itself.
+pub(crate) fn clear_span(engine: usize, from: u32) -> u64 {
+    let clear = SPAN_CLEARS.read().unwrap().get(&engine).cloned();
+    clear.map_or(0, |clear| clear(from))
 }
 
 /// Wakes every wait on `engine`'s rung: what it waits on may have changed.
@@ -307,8 +339,16 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
         let Some(at) = pool.raise_at(goal) else {
             return;
         };
-        let Ok(evacuation) = pool.plan_raise(at) else {
-            return;
+        let evacuation = match pool.plan_raise(at) {
+            Ok(evacuation) => evacuation,
+            Err(error) => {
+                // Idle cache lies in the span: the walk has its owner clear
+                // it, and raises then.
+                if error.span_cached() {
+                    ask_walk(engine);
+                }
+                return;
+            }
         };
         let stood = pool.stands_at(at);
         if pool.raise_waits(&evacuation) || pool.raise_applied(&evacuation).is_err() {
@@ -346,11 +386,12 @@ pub fn wanted_rows(engine: usize) -> u32 {
 pub enum RungStep {
     /// Cut and step fires to this many tokens (`u32::MAX`: no cap).
     Cap(u32),
-    /// Let state take the span above this rung's activation: no fire wider
-    /// is in flight.
+    /// Leave the span above this rung's activation to idle cache: no fire
+    /// wider is in flight.
     Lower(u32),
-    /// Raise the activation to this rung, the engine first copying what
-    /// the evacuation moves out of its span.
+    /// Raise the activation to this rung: nothing but idle cache lies in
+    /// its span, cleared first; the engine copies only live state a guest
+    /// term's activation past the span's base takes.
     Raise {
         rung: u32,
         evacuation: RungEvacuation,
@@ -361,9 +402,9 @@ pub enum RungStep {
 
 /// The walk of the activation rung (SPEC decision 6). Down: cap fires
 /// first, then, once the scheduler has no wider step in flight and every
-/// fire handed out by then has retired, lower the pool's rung. Up: move
-/// state out of the larger rung's span (the engine copying it before the
-/// next fire), take the rung, then lift the cap.
+/// fire handed out by then has retired, lower the pool's rung. Up: have the
+/// idle cache in the larger rung's span cleared (live state never lies
+/// there), take the rung, then lift the cap.
 #[derive(Debug, Default)]
 pub struct RungWalk {
     lowering: Option<(u32, u64)>,
@@ -487,7 +528,9 @@ pub struct PoolRoom {
     pub chunk_bytes: u64,
     pub total_chunks: u32,
     pub reserved_chunks: u32,
-    /// The activation set aside under the smallest rung.
+    /// The top rung's span (the largest rung's activation, a guest term at
+    /// the smallest rung past it included): live state never opens there,
+    /// whatever rung is set aside; a lowered rung leaves it to idle cache.
     pub act_chunks: u32,
     /// The chunks the weights' pinned slots take.
     pub weight_chunks: u32,
@@ -973,12 +1016,9 @@ impl SharedPool {
         };
         // The engine holds the rung the pool starts at.
         shared.told = shared.pool.rung();
-        // Under the smallest rung state may take every chunk but the
-        // reserved ones and that rung's activation.
-        let state_chunks = facts
-            .total_chunks
-            .saturating_sub(reserved)
-            .saturating_sub(facts.act_chunks.first().map_or(0, |&(_, chunks)| chunks));
+        // At every rung live state may take every chunk but the reserved
+        // ones and the top rung's span.
+        let state_chunks = shared.state_chunks_now();
         shared.records_most = shared.records_fitting(state_chunks);
         shared.least_chunks = shared.working_set_chunks(max_context);
         tracing::debug!(
@@ -1121,23 +1161,16 @@ impl SharedPool {
                 u32::try_from(slots.div_ceil(u64::from(spc.max(1)))).unwrap_or(u32::MAX)
             })
             .sum();
-        let act_chunks = pool.act_chunks(0);
-        // What state can ever be backed in, not the range: below the span,
-        // the chunks under what the engine binds that lie in segments the
-        // pool may map ([`Self::backable_below_span`]); in the span, what
-        // the smallest rung leaves, where it is backed while the engine
-        // holds anything back.
-        let span_backable = !pool.span_on_demand() || pool.ceiling() >= pool.total_chunks();
-        let lent = if span_backable {
-            pool.act_max()
-        } else {
-            act_chunks
-        };
+        // Live state never opens in the top rung's span, at any rung: what
+        // it can ever be backed in is below the span, the chunks under what
+        // the engine binds that lie in segments the pool may map
+        // ([`Self::backable_below_span`]); a guest term past the span at
+        // the smallest rung takes its excess below it too.
+        let act_chunks = pool.act_max().max(pool.act_chunks(0));
         let state_chunks = self
             .backable_below_span()
-            .saturating_add(lent)
             .saturating_sub(pool.reserved_chunks())
-            .saturating_sub(act_chunks)
+            .saturating_sub(act_chunks - pool.act_max())
             .saturating_sub(weight_chunks);
         PoolRoom {
             chunk_bytes: pool.chunk_bytes(),
@@ -1266,33 +1299,35 @@ impl SharedPool {
 
     // ---- records ----
 
-    /// Records the pool's state chunks hold under the current rung: a
-    /// smaller rung's room counts once the rung is lowered, not before.
+    /// Records the pool's state chunks hold: the same at every rung, live
+    /// state never opening in the top rung's span.
     #[must_use]
     pub fn records_capacity(&self) -> u32 {
         self.records_fitting(self.state_chunks_now())
             .min(self.records_most)
     }
 
-    /// The most record ids there may be: what the state chunks hold under
-    /// the smallest rung.
+    /// The most record ids there may be: what the state chunks hold below
+    /// the top rung's span.
     #[must_use]
     pub fn records_most(&self) -> u32 {
         self.records_most
     }
 
-    /// The chunks state may take under the current rung: every chunk but
-    /// the reserved ones and the activation set aside now.
+    /// The chunks live state may take: every chunk but the reserved ones
+    /// and the top rung's span ([`SlotPool::live_limit`]), at every rung,
+    /// and none the activation set aside now takes past the span's base (a
+    /// guest term).
     #[must_use]
     pub fn state_chunks_now(&self) -> u32 {
         self.pool
-            .total_chunks()
+            .live_limit()
+            .min(self.pool.state_limit())
             .saturating_sub(self.pool.reserved_chunks())
-            .saturating_sub(self.pool.act_reserved())
     }
 
-    /// Slots of pool shape `shape` the state chunks hold under the current
-    /// rung, were every one that shape's.
+    /// Slots of pool shape `shape` the state chunks hold, were every one
+    /// that shape's.
     #[must_use]
     pub fn shape_capacity(&self, shape: ShapeId) -> u32 {
         let spc = self.pool.shape(shape).map_or(0, |s| s.slots_per_chunk);
@@ -1690,9 +1725,10 @@ impl SharedPool {
     #[must_use]
     ///
     /// The pages are what a grant of them leaves that many chunks freed past
-    /// what stands free now: every free slot of the kv list (the span the
-    /// smaller rung lends included) comes first, so it counts on top (a
-    /// grant it covers frees nothing).
+    /// what stands free now: every free slot of the kv list below the top
+    /// rung's span comes first, so it counts on top (a grant it covers frees
+    /// nothing). Idle cache in the span is no room to fund: it is cleared
+    /// ([`SlotPool::span_cached`]).
     pub fn raise_short(&self, rung: u32) -> (u32, u32) {
         let chunks = self.pool.rung_short(rung);
         if chunks == 0 {
@@ -2103,6 +2139,15 @@ impl SharedPool {
 pub enum RungError {
     #[error("{0}")]
     Pool(SlotError),
+}
+
+impl RungError {
+    /// Whether the raise found idle cache in its span
+    /// ([`SlotError::SpanCached`]): the walk has its owner clear it.
+    #[must_use]
+    pub fn span_cached(&self) -> bool {
+        matches!(self, Self::Pool(SlotError::SpanCached { .. }))
+    }
 }
 
 #[cfg(test)]

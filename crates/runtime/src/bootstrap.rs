@@ -577,7 +577,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     crate::store::shared::SharedGrow::new(arena_model_idx, engine, shared.clone());
                 shared_grows.push(grow.clone());
                 pool = pool.with_shared_grow(grow.clone());
-                shared_steered_pool(arena_model_idx, engine, chunk_facts.get(engine), grow)?
+                let steered =
+                    shared_steered_pool(arena_model_idx, engine, chunk_facts.get(engine), grow)?;
+                // A raise has the weight cache let go what lies in its span.
+                crate::store::shared::set_span_clear(engine, steered.span_clear_hook());
+                steered
             }
             None => steered_pool(arena_model_idx, engine, chunk_facts.get(engine))?,
         };

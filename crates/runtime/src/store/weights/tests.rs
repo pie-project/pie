@@ -149,6 +149,83 @@ fn a_held_set_leaves_for_the_floor_only_once_the_engine_took_it() {
     );
 }
 
+// ---- the top rung's span ----
+
+/// [`pool`] with rungs: the top rung's span is the top four chunks
+/// (12..16), the smallest rung's activation the last one, and the pool is
+/// lowered to it.
+fn lowered_pool(weights: &WeightShape) -> SlotPool {
+    let mut shapes = vec![SlotShape {
+        kind: ShapeKind::List,
+        slot_bytes: MIB,
+        slots_per_chunk: 1,
+    }];
+    shapes.extend(pool_shapes(std::slice::from_ref(weights)));
+    let mut pool = SlotPool::new(SlotPoolFacts {
+        chunk_bytes: MIB,
+        total_chunks: 16,
+        segment_chunks: SEGMENT,
+        committed_segments: 4,
+        reserved_chunks: 1,
+        shapes,
+        act_chunks: vec![(16, 1), (256, 4)],
+        span_on_demand: false,
+        act_span: None,
+    });
+    pool.set_rung(16).unwrap();
+    assert_eq!((pool.live_limit(), pool.state_limit()), (12, 15));
+    pool
+}
+
+/// The weight cache above its floor is the idle cache the span a lowered
+/// rung leaves holds: its floor (live) lies below the span, the atoms
+/// that come back at break-even open in the span, which kv never takes,
+/// and a raise has them dropped (they stream again), moving nothing.
+#[test]
+fn a_raise_drops_the_weight_cache_in_its_span_and_moves_nothing() {
+    let shape = experts(16, 2);
+    let mut slots = lowered_pool(&shape);
+    let mut cache = WeightCache::new(&[shape], WEIGHTS, true, &mut slots).unwrap();
+    let kv_room = slots.available(KV);
+    assert_eq!(kv_room, 12 - 1 - 2, "below the span, short of the floor");
+    let kv = slots.acquire(Holder::WorkingSet(1), KV, kv_room).unwrap();
+    cache.record(&uses(&[(1, 5), (2, 5), (3, 5)]));
+    tick(&mut cache, &mut slots, true);
+    assert_eq!(resident(&cache, 16), [1, 2, 3], "the span takes them");
+    for atom_id in [1, 2, 3] {
+        let slot = cache.resident(atom(atom_id)).unwrap();
+        assert!((12..15).contains(&slots.physical(slot.chunk).unwrap()));
+    }
+    assert!(slots.acquire(Holder::WorkingSet(2), KV, 1).is_err());
+
+    // The raise to 256 finds them in its span: refused by name, nothing to
+    // fund; the cache lets them go, and once the fire reading them retires
+    // the raise moves nothing.
+    assert_eq!(
+        slots.plan_rung(256).unwrap_err(),
+        SlotError::SpanCached {
+            rung: 256,
+            chunks: 3
+        }
+    );
+    assert_eq!(slots.rung_short(256), 0);
+    slots.clear_span(12);
+    assert_eq!(cache.clear_span(&mut slots, 12, 7), 3);
+    assert_eq!(resident(&cache, 16), Vec::<u32>::new(), "they stream again");
+    let residency = cache.take_changed(&slots).expect("the engine is told");
+    assert!(residency.resident.is_empty());
+    // Not refilled into the span the raise asks clear.
+    cache.record(&uses(&[(4, 5)]));
+    tick(&mut cache, &mut slots, true);
+    assert_eq!(resident(&cache, 16), Vec::<u32>::new());
+    slots.retire_through(7);
+    let raise = slots.plan_rung(256).unwrap();
+    assert!(raise.moves.is_empty());
+    slots.apply_rung(&raise, 8).unwrap();
+    slots.check();
+    slots.release(Holder::WorkingSet(1), &kv, 0);
+}
+
 // ---- the governor's view ----
 
 // ---- the load ----

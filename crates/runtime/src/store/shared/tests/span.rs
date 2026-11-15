@@ -1,7 +1,8 @@
 //! The activation span backed on demand (`ChunkFacts::span_backed_on_demand`,
 //! where a mapped heap is resident whether touched or not): no span segment
-//! is committed at load; a span chunk a lowered rung lends is opened for
-//! state only once `commit_span` backs its segment; a span segment goes back
+//! is committed at load; a span chunk a lowered rung leaves is opened, for
+//! idle cache only (live state never opens in the top rung's span), only
+//! once `commit_span` backs its segment; a span segment goes back
 //! (`release_span`) once the rung is raised past it and it holds nothing.
 //! With the flag off, the span is backed from the load as before.
 //!
@@ -66,6 +67,17 @@ pub(super) fn on_demand_pool() -> (SharedPool, FakeEngine) {
     (pool, engine)
 }
 
+/// The physical chunks `slots` lie in, ascending.
+fn chunks_of(pool: &SharedPool, slots: &[Slot]) -> Vec<u32> {
+    let mut chunks: Vec<u32> = slots
+        .iter()
+        .map(|slot| pool.pool().physical(slot.chunk).unwrap())
+        .collect();
+    chunks.sort_unstable();
+    chunks.dedup();
+    chunks
+}
+
 fn state_chunks(pool: &SharedPool, records: &[u32]) -> Vec<u32> {
     let mut chunks: Vec<u32> = records
         .iter()
@@ -94,7 +106,7 @@ fn no_span_segment_is_committed_at_load() {
 }
 
 #[test]
-fn a_lent_span_chunk_opens_only_once_its_segment_is_committed() {
+fn a_span_chunk_opens_for_cache_only_once_its_segment_is_committed() {
     let (mut pool, mut engine) = on_demand_pool();
     // The whole prefix, no more: the span stays unbacked.
     assert_eq!(
@@ -107,7 +119,7 @@ fn a_lent_span_chunk_opens_only_once_its_segment_is_committed() {
             .iter()
             .any(|call| matches!(call, Call::CommitSpan(_)))
     );
-    // The 256 rung lends 48..60 to state; none of it is backed yet.
+    // The 256 rung leaves 52..60 to idle cache; none of it is backed yet.
     pool.lower_rung(256).unwrap();
     assert_eq!(
         pool.pool().span_to_commit(),
@@ -128,17 +140,16 @@ fn a_lent_span_chunk_opens_only_once_its_segment_is_committed() {
     );
     assert_eq!(engine.calls.last(), Some(&Call::CommitSpan(1)));
     assert_eq!(pool.pool().span_committed(), 1);
-    let second = pool
-        .take_records(pool.records_available() as usize)
-        .unwrap();
-    let lent = state_chunks(&pool, &second);
-    assert!(lent.iter().any(|&chunk| (56..60).contains(&chunk)));
-    assert!(
-        lent.iter()
-            .all(|&chunk| chunk < 48 || (56..60).contains(&chunk))
+    assert_eq!(
+        pool.records_available(),
+        0,
+        "live state takes nothing of the span once backed"
     );
+    let cached = span_cache(&mut pool, 4);
+    let lent = chunks_of(&pool, &cached);
+    assert_eq!(lent, [56, 57], "cache opens in the backed span segment");
     for &chunk in &lent {
-        assert!(engine.backed(chunk), "state on unbacked chunk {chunk}");
+        assert!(engine.backed(chunk), "cache on unbacked chunk {chunk}");
     }
     pool.pool().check();
 }
@@ -158,29 +169,25 @@ fn a_span_segment_goes_back_once_the_rung_is_raised_past_it() {
     let all = pool
         .take_records(pool.records_available() as usize)
         .unwrap();
-    assert!(state_chunks(&pool, &all).iter().any(|&chunk| chunk >= 56));
-    // Lent and holding state: it stays.
+    assert!(state_chunks(&pool, &all).iter().all(|&chunk| chunk < 52));
+    let cached = span_cache(&mut pool, 4);
+    assert!(chunks_of(&pool, &cached).iter().all(|&chunk| chunk >= 56));
+    // Left to cache and holding it: it stays.
     assert_eq!(pool.pool().span_to_release(), None);
-    // Room below, the rung raised past segment 7: its state moves down.
-    pool.give_records(&all[..all.len() / 2]);
-    pool.pool_mut().retire_through(u64::MAX);
-    let evacuation = pool.plan_raise(2048).unwrap();
-    assert!(!evacuation.moves.is_empty());
-    engine
-        .evacuate(&SharedPool::rung_moves(&evacuation))
-        .unwrap();
-    pool.apply_rung(&evacuation, 10).unwrap();
+    // The rung raised past segment 7: its cache is let go, nothing moves.
     assert!(
-        state_chunks(&pool, &all[all.len() / 2..])
-            .iter()
-            .all(|&chunk| chunk < 52)
+        pool.plan_raise(2048)
+            .is_err_and(|error| error.span_cached())
     );
-    // Not while the fire carrying the copy may still read the old chunks.
-    assert_eq!(pool.pool().span_to_release(), None);
-    pool.pool_mut().retire_through(10);
+    clear_span_cache(&mut pool, &cached, 10);
+    let evacuation = pool.plan_raise(2048).unwrap();
+    assert!(evacuation.moves.is_empty(), "no state moves");
+    pool.apply_rung(&evacuation, 11).unwrap();
+    assert!(state_chunks(&pool, &all).iter().all(|&chunk| chunk < 52));
+    // Nothing fenced: no copy reads the span.
     assert_eq!(pool.pool().span_to_release(), Some(0));
     assert_eq!(
-        walk_segments(&mut pool, 6, 11, &mut engine),
+        walk_segments(&mut pool, 6, 12, &mut engine),
         Retarget::Reached
     );
     assert_eq!(engine.calls.last(), Some(&Call::ReleaseSpan(0)));
@@ -218,8 +225,14 @@ fn with_the_flag_off_the_span_is_backed_from_the_load_as_before() {
         .take_records(pool.records_available() as usize)
         .unwrap();
     assert!(
-        state_chunks(&pool, &all).iter().any(|&chunk| chunk >= 48),
-        "the lent span opens at once"
+        state_chunks(&pool, &all).iter().all(|&chunk| chunk < 52),
+        "live state never opens in the top rung's span"
+    );
+    let cached = span_cache(&mut pool, 2);
+    assert_eq!(
+        chunks_of(&pool, &cached),
+        [52],
+        "the span the lower leaves opens for cache at once"
     );
     pool.pool().check();
 }
@@ -258,9 +271,11 @@ fn a_refused_commit_span_lends_nothing() {
     assert_eq!(pool.pool().span_committed(), 1);
 }
 
-/// A raise whose copy the engine refuses is taken back: the state where it
-/// lay (the engine's table unchanged), the activation the rung in hand's,
-/// no fence left, and a later raise succeeds.
+/// A raise whose copy the engine refuses (the live state a guest term's
+/// activation takes below the top rung's span: the one raise that moves
+/// any) is taken back: the state where it lay (the engine's table
+/// unchanged), the activation the rung in hand's, no fence left, and a
+/// later raise succeeds.
 #[test]
 fn a_refused_raise_is_taken_back() {
     let (mut pool, mut engine) = on_demand_pool();
@@ -268,6 +283,10 @@ fn a_refused_raise_is_taken_back() {
         walk_segments(&mut pool, 6, 0, &mut engine),
         Retarget::Reached
     );
+    // Six chunks the guests keep standing: the largest rung's activation
+    // reaches 46, past the span's base at 52 and into the prefix (the span
+    // segment under 52 is backed on demand, so no state lies in 48..52).
+    pool.pool_mut().set_standing(6 * CHUNK);
     pool.lower_rung(256).unwrap();
     assert_eq!(
         walk_segments(&mut pool, 7, 0, &mut engine),
@@ -292,7 +311,7 @@ fn a_refused_raise_is_taken_back() {
     );
     pool.raise_refused(&evacuation);
     assert_eq!(pool.rung(), 256, "the rung in hand");
-    assert_eq!(pool.pool().act_reserved(), 4);
+    assert_eq!(pool.pool().act_reserved(), 4 + 6);
     assert!(pool.copying().is_none());
     assert_eq!(state_chunks(&pool, kept), before, "the state where it lay");
     assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());

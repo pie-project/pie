@@ -723,10 +723,20 @@ pub async fn take_raise(
             }
             Some(at) => {
                 let stood = pool.stands_at(at);
-                pool.plan_raise(at).ok().and_then(|evacuation| {
-                    let notice = pool.raise_applied(&evacuation).ok()?;
-                    Some((evacuation, notice, stood))
-                })
+                match pool.plan_raise(at) {
+                    Ok(evacuation) => pool
+                        .raise_applied(&evacuation)
+                        .ok()
+                        .map(|notice| (evacuation, notice, stood)),
+                    Err(error) => {
+                        // Idle cache lies in the span: the walk has its
+                        // owner clear it, and raises then.
+                        if error.span_cached() {
+                            super::ask_walk(mover.engine());
+                        }
+                        None
+                    }
+                }
             }
         }
     };

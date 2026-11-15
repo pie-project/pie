@@ -888,9 +888,10 @@ impl RaiseFunding {
                     continue;
                 };
                 if pages == 0 {
-                    // The room is there and state lies in the span: the
-                    // walker moves it out, the engine copying it, and
-                    // tells the rung.
+                    // The room is there and idle cache lies in the span
+                    // (or live state a guest term's activation takes): the
+                    // walker has the cache cleared (moves the state, the
+                    // engine copying it) and tells the rung.
                     tokio::select! {
                         () = &mut watch => {}
                         () = stop.notified() => return,
