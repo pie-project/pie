@@ -1795,6 +1795,34 @@ impl KvStore {
         Ok(self.table.log_end(ws, seq, rows)?)
     }
 
+    /// What a fire folds is frozen from its prepare, before its rows are
+    /// written: the one folded length a working set has. [`KvStore::fold`]
+    /// seals the pages once the fire has settled.
+    pub fn freeze(&mut self, ws: WorkingSetId, to: u64) -> Result<u64, KvStoreError> {
+        Ok(self.table.freeze(ws, to)?)
+    }
+
+    /// A fire on its way folds `ws` by a count placed when it settles: it
+    /// is not forked or exported until [`Self::fold_settled`].
+    pub fn unsettle(&mut self, ws: WorkingSetId) -> Result<(), KvStoreError> {
+        Ok(self.table.unsettle(ws)?)
+    }
+
+    /// That fire settled, `placed` when its count was: a fold never told
+    /// leaves the folded length a lower bound.
+    pub fn fold_settled(&mut self, ws: WorkingSetId, placed: bool) -> Result<(), KvStoreError> {
+        Ok(self.table.fold_settled(ws, placed)?)
+    }
+
+    pub fn unsettled(&self, ws: WorkingSetId) -> Result<u32, KvStoreError> {
+        Ok(self.table.unsettled(ws)?)
+    }
+
+    /// Whether [`Self::folded`] is all `ws` has folded.
+    pub fn folded_exact(&self, ws: WorkingSetId) -> Result<bool, KvStoreError> {
+        Ok(self.table.folded_exact(ws)?)
+    }
+
     /// `decoded` when a decode wrote them, which the cache lets go before a
     /// prompt.
     pub fn fold(&mut self, ws: WorkingSetId, to: u64, decoded: bool) -> Result<u64, KvStoreError> {
@@ -1838,13 +1866,15 @@ impl KvStore {
         Ok(self.table.set_owner(ws, owner)?)
     }
 
-    /// Maps in only when the pages `ws` holds are the run's first.
+    /// Maps in only when the pages `ws` holds are the run's first. What is
+    /// mapped in is sealed and not frozen: the folded length is what a pass
+    /// states, whatever the cache held, and a row written into a mapped
+    /// page copies it first, as any write to a sealed page does.
     pub fn attach_run(
         &mut self,
         ws: WorkingSetId,
         run: &[TriePageLocation],
         limit: u64,
-        page_size: u32,
     ) -> Result<u64, KvStoreError> {
         let held = self.table.mapped_len(ws)?;
         let found = run.len();
@@ -1875,9 +1905,7 @@ impl KvStore {
             Err(error) => return Err(error.into()),
         }
         let pages = run.len() as u64 - held;
-        // What was mapped in is sealed, so frozen: a prompt's.
-        self.table
-            .freeze(ws, run.len() as u64 * u64::from(page_size.max(1)))?;
+        // What was mapped in is a prompt's.
         self.table.reach_prompt(ws, run.len() as u64)?;
         self.refresh_flat(ws);
         // The cache's entries that were used whole go last; one that holds

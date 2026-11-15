@@ -125,13 +125,8 @@ impl Held {
             None => None,
         };
         // Parked, the set has no fire on its way: a frozen length a fold
-        // left unknown stays so, and the child would state the bound.
-        if let Err(why) = cursor.at_rest() {
-            if let Some(rs) = rs_child {
-                rs.release();
-            }
-            return Err(why.to_string());
-        }
+        // left unknown stays so, and the KV store refuses the fork rather
+        // than have the child state the bound.
         let child = settled(kv, "handle-fork", |store| store.fork(kv.id)).await;
         match child {
             Ok(child) => Ok(Held::park(
@@ -182,11 +177,17 @@ impl Held {
             let held = stores.rs.lock().unwrap().held([rs.id]);
             held.slots
         });
-        (
-            u64::from(cursor.tail.unwrap_or(cursor.folded)),
-            u64::from(cursor.folded),
-            slots,
-        )
+        let folded = self.folded();
+        (cursor.tail.map_or(folded, u64::from), folded, slots)
+    }
+
+    /// What it has folded: its KV working set's folded length.
+    fn folded(&self) -> u64 {
+        let kv = &self.parts().kv;
+        let stores = store_registry::get(kv.model, kv.engine);
+        store_registry::with_kv_lock(&stores.kv, "handle-stat", |store| {
+            store.folded(kv.id).unwrap_or(0)
+        })
     }
 
     pub(super) fn stat(&self) -> Value {
@@ -197,10 +198,11 @@ impl Held {
                 .swapped_page_count(&HashSet::from([kv.id]))
                 .unwrap_or(0)
         });
+        let folded = self.folded();
         json!({
             "state": "parked",
-            "tokens": cursor.tail.unwrap_or(cursor.folded),
-            "folded": cursor.folded,
+            "tokens": cursor.tail.map_or(folded, u64::from),
+            "folded": folded,
             "engine": kv.engine,
             "resident": swapped == 0,
             "swapped_pages": swapped,
@@ -351,14 +353,17 @@ pub(super) mod tests {
         )
     }
 
-    /// A cursor whose frozen length a fold left unknown: the fire that was
-    /// to place it never did.
-    pub(in crate::handle) fn unplaced() -> Cursor {
-        Cursor {
-            folded_exact: false,
-            unsettled: 1,
-            ..Cursor::default()
-        }
+    /// A parked set whose frozen length a fold left unknown: the fire that
+    /// was to place it settled and never told its count.
+    pub(in crate::handle) fn unplaced() -> Held {
+        let held = parked(Cursor::default());
+        let kv = &held.parts().kv;
+        let stores = store_registry::get(kv.model, kv.engine);
+        let mut store = stores.kv.lock();
+        store.unsettle(kv.id).unwrap();
+        store.fold_settled(kv.id, false).unwrap();
+        drop(store);
+        held
     }
 
     /// A parked set has no fire on its way, so a frozen length a fold left
@@ -366,16 +371,18 @@ pub(super) mod tests {
     /// bound. One at rest forks.
     #[tokio::test(flavor = "current_thread")]
     async fn a_fork_of_a_set_whose_frozen_length_is_not_known_is_refused_by_name() {
-        let bound = parked(unplaced());
+        let bound = unplaced();
         let refused = bound
             .fork(ProcessId::new_v4())
             .now_or_never()
             .expect("there is nothing to wait for")
             .expect_err("the child would state a bound");
-        assert_eq!(refused, Cursor::UNPLACED);
+        assert_eq!(refused, crate::store::kv::page_table::UNPLACED);
         let child = parked(Cursor::default()).fork(ProcessId::new_v4()).await;
         let child = child.expect("its frozen length is known");
-        assert!(child.parts().cursor.at_rest().is_ok());
+        let kv = &child.parts().kv;
+        let stores = store_registry::get(kv.model, kv.engine);
+        assert!(stores.kv.lock().folded_exact(kv.id).unwrap());
     }
 
     #[tokio::test(flavor = "current_thread")]

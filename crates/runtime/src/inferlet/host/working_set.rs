@@ -16,14 +16,10 @@ use crate::store::rs::RsGeometry;
 use crate::store::rs::working_set::RsWorkingSet;
 
 #[derive(Clone, Debug)]
+/// Where a working set's rows end. What it folded is not here, nor whether
+/// that is known: both are its KV working set's, one length the recurrent
+/// state follows.
 pub struct Cursor {
-    pub folded: u32,
-    /// False while a fold the host could not place at submit is on its
-    /// way: `folded` is then a lower bound.
-    pub folded_exact: bool,
-    /// Fires in flight whose fold is placed when they settle; the last to
-    /// settle makes `folded` exact again.
-    pub unsettled: u32,
     pub tail: Option<u32>,
     pub reserved: u32,
     /// One past the highest slot a fire is known to have written: a mark
@@ -64,23 +60,6 @@ impl StagedRows {
 }
 
 impl Cursor {
-    /// What a set whose frozen length is not known is refused with.
-    pub const UNPLACED: &str = "its frozen length is not known: a fire that was to place \
-                                its fold when it settled never did (dropped before it \
-                                settled, or run with no count reported)";
-
-    /// Whether the frozen length is known. It is not while a fire that
-    /// places its fold when it settles is on its way, and it stays unknown
-    /// where no fire is left to place one: `folded` is then a bound, which
-    /// what copies or keeps the set must not state as its length.
-    pub fn at_rest(&self) -> Result<(), &'static str> {
-        if self.folded_exact {
-            Ok(())
-        } else {
-            Err(Self::UNPLACED)
-        }
-    }
-
     /// `fire` is staged on the set, its rows to land where the device says.
     pub fn stage(&mut self, fire: Arc<StagedRows>) {
         let (written, _) = self.standing();
@@ -141,9 +120,6 @@ pub fn lag(spans: &[(u32, u32, u32)], slot: u32) -> u32 {
 impl Default for Cursor {
     fn default() -> Self {
         Cursor {
-            folded: 0,
-            folded_exact: true,
-            unsettled: 0,
             tail: Some(0),
             reserved: 0,
             written: 0,
@@ -270,7 +246,12 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
     }
 
     async fn folded(&mut self, this: Resource<WorkingSet>) -> Result<u32> {
-        Ok(self.ctx().table.get(&this)?.cursor().folded)
+        let kv_rep = self.ctx().table.get(&this)?.kv;
+        let kv = kv_of(self, kv_rep)?;
+        let stores = store_registry::get(kv.model, kv.engine);
+        let folded =
+            store_registry::with_kv_lock(&stores.kv, "host-working-set", |s| s.folded(kv.id))?;
+        Ok(u32::try_from(folded).unwrap_or(u32::MAX))
     }
 
     async fn fork(

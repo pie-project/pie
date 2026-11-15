@@ -131,7 +131,16 @@ struct WorkingSetEntry {
     page_len: u64,
     mapped_len: u64,
     suspended: bool,
+    /// What it has folded: the one such length a working set has, which its
+    /// recurrent state follows.
     folded: u64,
+    /// Fires on their way that fold it by a count placed when they settle.
+    /// Until they do `folded` is behind what they fold, so the set is not
+    /// forked or exported.
+    unsettled: u32,
+    /// A fold settled and its count was never told: `folded` is a lower
+    /// bound from then on.
+    bound: bool,
     /// Past them a decode wrote, and the cache lets that go first.
     prompt_pages: u64,
     owner: Option<ProcessId>,
@@ -149,6 +158,8 @@ impl WorkingSetEntry {
             mapped_len,
             suspended: false,
             folded: 0,
+            unsettled: 0,
+            bound: false,
             prompt_pages: 0,
             owner: None,
             logged: Vec::new(),
@@ -162,6 +173,12 @@ pub(super) struct KeptPath {
     pub(super) terminal: NodeId,
     pub(super) pages: u64,
 }
+
+/// What a set whose folded length is a bound is refused with, where it
+/// would be copied or kept: a child or an image states its length as exact.
+pub const UNPLACED: &str = "its frozen length is not known: a fire that was to place \
+                            its fold when it settled never did (dropped before it \
+                            settled, or run with no count reported)";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum KvTableError {
@@ -188,6 +205,15 @@ pub enum KvTableError {
     NonResident { index: u64 },
     #[error("page backing changed while a residency transaction was in flight")]
     BackingChanged,
+    #[error(
+        "a fire on its way folds this working set by a count placed when it settles; it is \
+         not forked or exported until then"
+    )]
+    FoldUnsettled,
+    /// A fold settled untold: `folded` is a bound, which a copy would state
+    /// as its length.
+    #[error("{}", UNPLACED)]
+    FoldUnplaced,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -225,8 +251,17 @@ impl KvPageTable {
         self.working_sets.insert(WorkingSetEntry::new(None, 0, 0))
     }
 
+    /// Not while a fire on its way folds `ws` by a count placed when it
+    /// settles, nor once such a fold settled untold: the child would take a
+    /// folded length behind the device's.
     pub fn fork(&mut self, ws: WorkingSetId) -> Result<WorkingSetId, KvTableError> {
         let entry = self.entry(ws)?;
+        if entry.unsettled > 0 {
+            return Err(KvTableError::FoldUnsettled);
+        }
+        if entry.bound {
+            return Err(KvTableError::FoldUnplaced);
+        }
         let (terminal, page_len, mapped_len) = (entry.terminal, entry.page_len, entry.mapped_len);
         // The child holds what the parent's log knows, short of what the
         // parent's fires on their way may still change, and what it froze.
@@ -482,6 +517,32 @@ impl KvPageTable {
         let entry = self.entry_mut(ws)?;
         entry.folded = entry.folded.max(to);
         Ok(entry.folded)
+    }
+
+    /// A fire on its way folds `ws` by a count placed when it settles.
+    pub fn unsettle(&mut self, ws: WorkingSetId) -> Result<(), KvTableError> {
+        self.entry_mut(ws)?.unsettled += 1;
+        Ok(())
+    }
+
+    /// That fire settled, `placed` when its count was.
+    pub fn fold_settled(&mut self, ws: WorkingSetId, placed: bool) -> Result<(), KvTableError> {
+        let entry = self.entry_mut(ws)?;
+        entry.unsettled = entry.unsettled.saturating_sub(1);
+        entry.bound |= !placed;
+        Ok(())
+    }
+
+    /// How many fires on their way fold `ws` by a count not placed yet.
+    pub fn unsettled(&self, ws: WorkingSetId) -> Result<u32, KvTableError> {
+        Ok(self.entry(ws)?.unsettled)
+    }
+
+    /// Whether `folded` is all `ws` has folded: no fold is on its way
+    /// unplaced, and none settled untold.
+    pub fn folded_exact(&self, ws: WorkingSetId) -> Result<bool, KvTableError> {
+        let entry = self.entry(ws)?;
+        Ok(entry.unsettled == 0 && !entry.bound)
     }
 
     pub fn prompt_pages(&self, ws: WorkingSetId) -> Result<u64, KvTableError> {
@@ -1857,6 +1918,12 @@ impl KvPageTable {
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn exported(&self, ws: WorkingSetId) -> Result<ExportedSet, KvTableError> {
         let entry = self.entry(ws)?;
+        if entry.unsettled > 0 {
+            return Err(KvTableError::FoldUnsettled);
+        }
+        if entry.bound {
+            return Err(KvTableError::FoldUnplaced);
+        }
         let mut locations = Vec::with_capacity(entry.mapped_len as usize);
         self.visit_working_set_locations(ws, |location| locations.push(location))?;
         let mut pages = Vec::with_capacity(locations.len());

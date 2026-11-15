@@ -35,8 +35,9 @@ impl std::fmt::Display for ScopeRefusal {
             }
             ScopeRefusal::Failed { owner, reason } => write!(
                 formatter,
-                "ended with its pipeline {owner:032x}, which failed ({reason}); no \
-                 pipeline takes it"
+                "ended with its pipeline {owner:032x}, which failed ({reason}): what \
+                 that pipeline's fires folded is frozen and did not run, so no pipeline \
+                 takes it"
             ),
         }
     }
@@ -129,6 +130,8 @@ impl PipelineScope {
         let mut owner = owner.lock().unwrap();
         match owner.as_ref() {
             Some(existing) if existing.id() == self.id() => Ok(()),
+            // What a fire folds is frozen from its prepare: a set whose
+            // pipeline failed holds a fold whose fire never ran.
             Some(existing) => {
                 // Read ahead of the failure: a pipeline that is drained has
                 // written every failure of its fires.
