@@ -2007,6 +2007,12 @@ impl RsDeviceFold {
     /// it may have folded, and nothing read by how much.
     const DROPPED: &str = "pipeline: the fire was dropped before it settled";
 
+    /// What a fire that ran to its end and brought no count leaves its set
+    /// refused with: the engine folded by a count of its own and its
+    /// record stands where that left it, which the frozen length the
+    /// runtime states never reaches.
+    const UNREPORTED: &str = "pipeline: the fire ran and its engine did not report what it folded";
+
     fn planned(ws: crate::store::rs::RsWorkingSetId) -> Self {
         Self {
             ws,
@@ -2121,6 +2127,25 @@ impl ReportTag {
     fn take(&self) -> Option<::engine::KvWrites> {
         KV_WRITES.lock().unwrap().remove(&self.0)
     }
+}
+
+/// The lane of `req` whose fold length is the device's
+/// ([`::engine::fire::FoldLen::Device`]) and which asks no report: none in
+/// a request staged whole. The engine answers such a lane's fold under its
+/// tag, and a fire that brings none is taken to have gone unreported
+/// ([`RsDeviceFold::UNREPORTED`]), so a lane staged without one would fail
+/// its set for what the runtime never asked.
+fn untagged_device_fold(req: &crate::engine::FireRequest) -> Option<usize> {
+    req.lanes.iter().position(|lane| {
+        lane.reports == 0
+            && matches!(
+                lane.rs,
+                ::engine::fire::RsVerb::Buffer {
+                    fold: ::engine::fire::FoldLen::Device,
+                    ..
+                }
+            )
+    })
 }
 
 fn report_on(req: &mut crate::engine::FireRequest, lane: usize, tags: &mut Vec<ReportTag>) -> u64 {
@@ -3807,6 +3832,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
             crate::offload::stream::tap(pid, &stores, &mut req);
             rs_prepared.apply_to(&mut req);
+            debug_assert_eq!(
+                untagged_device_fold(&req),
+                None,
+                "a lane whose fold the device counts asks for its report"
+            );
             rs::apply_shared(&mut req, stores.shared.as_ref(), Some(&rs_prepared));
             checkpoints_here.extend(
                 rs_prepared
@@ -4313,7 +4343,11 @@ pub(crate) async fn finalize_op_detached(op: PendingOp) -> Anyhow<()> {
 /// The last fold of the working set to settle makes its cursor exact.
 /// `failure` is why the fire did not run to its end, when it did not: what
 /// it was to freeze stays unfrozen, and a recurrent state it folded by a
-/// count the device computes is left refused by that name.
+/// count the device computes is left refused by that name. One whose fire
+/// ran to its end and brought no count is left refused too
+/// ([`RsDeviceFold::UNREPORTED`]): the engine's record went on by a count
+/// the frozen length never takes, and what copies or moves the set would
+/// state a length behind it.
 fn settle_fold(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
@@ -4323,10 +4357,22 @@ fn settle_fold(
 ) {
     let success = failure.is_none();
     let FoldAt { mut by, decoded } = fold;
-    // Taken before the kv lock: ending it takes the rs store's.
-    let device_fold = match &mut by {
-        FoldBy::Settled { rs, .. } => rs.take(),
-        FoldBy::To(_) => None,
+    // Taken before the kv lock: ending it takes the rs store's. The count
+    // is the host's, or what the engine reported under the lanes' tags; a
+    // fire that ran and brought neither went unreported.
+    let (device_fold, unreported) = match &mut by {
+        FoldBy::Settled {
+            count, tags, rs, ..
+        } => {
+            *count = count.or_else(|| {
+                tags.iter()
+                    .map(|tag| reported.get(tag).and_then(|written| written.fold))
+                    .collect::<Option<Vec<u32>>>()
+                    .and_then(|counts| counts.into_iter().max())
+            });
+            (rs.take(), success && count.is_none())
+        }
+        FoldBy::To(_) => (None, false),
     };
     let mut device_slots = None;
     let folded = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
@@ -4335,17 +4381,11 @@ fn settle_fold(
             FoldBy::To(to) => (Some(to), None),
             FoldBy::Settled {
                 count,
-                tags,
+                tags: _,
                 reach,
                 cursor,
                 rs: _,
             } => {
-                let count = count.or_else(|| {
-                    tags.iter()
-                        .map(|tag| reported.get(tag).and_then(|written| written.fold))
-                        .collect::<Option<Vec<u32>>>()
-                        .and_then(|counts| counts.into_iter().max())
-                });
                 let to = count.map(|count| frozen.saturating_add(u64::from(count)).min(reach));
                 // The recurrent state froze the same slots on the device.
                 device_slots = to
@@ -4382,6 +4422,7 @@ fn settle_fold(
     // The count lands and the mark lifts together, whichever way the fire
     // ended: what waited on the set reads the frozen length this leaves.
     if let Some(device_fold) = device_fold {
+        let failure = failure.or(unreported.then_some(RsDeviceFold::UNREPORTED));
         device_fold.settle(device_slots, failure);
     }
 }
@@ -4968,6 +5009,11 @@ async fn fire_device_geometry<C: FireContext>(
         });
     }
     let settles = settling(&parts);
+    debug_assert_eq!(
+        untagged_device_fold(&req),
+        None,
+        "a lane whose fold the device counts asks for its report"
+    );
     rs::apply_shared(&mut req, stores.shared.as_ref(), Some(&rs_prepared));
     let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         &scheduler,
@@ -6504,6 +6550,91 @@ mod fold_tests {
         Ok(())
     }
 
+    /// A fire that ran to its end on a set whose fold the device counts
+    /// owes the count: the engine's record went on by it. One that brings
+    /// none, or its rows' end without it, lifts the mark and leaves the set
+    /// refused by name, where a count of nothing is a count. A fire that
+    /// failed keeps its own failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fire_that_ran_and_reported_no_fold_fails_its_set_by_name() -> Anyhow<()> {
+        type Brought = fn(u64) -> Option<::engine::KvWrites>;
+        let unreported = || RsError::DeviceFoldFailed(RsDeviceFold::UNREPORTED.to_string());
+        // What the engine brought under the lane's tag, whether its fire
+        // ran, and where the fold left the set frozen, where it is known.
+        let cases: [(&str, Brought, bool, Option<u32>); 5] = [
+            ("no report", |_| None, true, None),
+            (
+                "the rows' end alone",
+                |tag| {
+                    Some(::engine::KvWrites {
+                        tag,
+                        end: Some(9),
+                        ..::engine::KvWrites::default()
+                    })
+                },
+                true,
+                None,
+            ),
+            (
+                "a fold of nothing",
+                |tag| Some(report(tag, 0)),
+                true,
+                Some(4),
+            ),
+            ("a fold of three", |tag| Some(report(tag, 3)), true, Some(7)),
+            ("no report from a fire that failed", |_| None, false, None),
+        ];
+        for (what, brought, ran, left) in cases {
+            let flight = in_flight(&geometry::Fold::Device, true, None);
+            let mut ctx = Flight::context();
+            let sets = [flight.rs];
+            let mut waiting = Box::pin(device_folds_settled(&flight.stores.rs, &sets));
+            assert!(waiting.as_mut().now_or_never().is_none(), "{what}");
+            if let Some(written) = brought(flight.tag) {
+                record_kv_writes(vec![written]);
+            }
+            resolve_test_completion(&flight.completion, !ran);
+            drain_pipeline_fires(&mut ctx, &flight.fires).await?;
+            assert!(
+                waiting.as_mut().now_or_never().is_some(),
+                "{what}: the mark lifts however the fire ended"
+            );
+            let failed = flight.failure.lock().unwrap().clone();
+            assert_eq!(
+                failed.is_none(),
+                ran,
+                "{what}: the pass fails only by its fire"
+            );
+            match (left, failed) {
+                (Some(left), _) => {
+                    assert_eq!(flight.frozen(), (u64::from(left), left), "{what}");
+                    assert_eq!(flight.fork(), Ok(left), "{what}");
+                    assert_eq!(flight.exported(), Ok(left), "{what}");
+                    assert!(flight.cursor.lock().unwrap().folded_exact, "{what}");
+                }
+                (None, None) => {
+                    assert_eq!(flight.frozen(), (4, 4), "{what}: nothing is frozen");
+                    assert_eq!(flight.fork(), Err(unreported()), "{what}");
+                    assert_eq!(flight.exported(), Err(unreported()), "{what}");
+                    let now = flight.cursor.lock().unwrap().clone();
+                    assert!(
+                        !now.folded_exact && now.unsettled == 1,
+                        "{what}: its fires go on from the bound"
+                    );
+                }
+                (None, Some(reason)) => {
+                    assert_ne!(reason, RsDeviceFold::UNREPORTED, "{what}");
+                    assert_eq!(
+                        flight.fork(),
+                        Err(RsError::DeviceFoldFailed(reason)),
+                        "{what}: the fire's own failure names it"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A fold the host counts states the frozen length at submit: nothing
     /// waits on its fire.
     #[tokio::test(flavor = "current_thread")]
@@ -7186,6 +7317,92 @@ mod unfolded_tests {
         match plan {
             rs::RsPlan::Groups(groups) => groups,
             rs::RsPlan::Window(_) => panic!("a plain recurrent model plans groups"),
+        }
+    }
+
+    /// A lane staged to fold by the device's count asks for its report,
+    /// whichever pass stages it: the one whose rows the host places and the
+    /// one whose rows the device places. The fold's verb is the store's and
+    /// the tag is the fold's placing, so the verb alone carries none; a
+    /// fold the host counts asks for nothing.
+    #[test]
+    fn a_lane_the_device_folds_is_staged_asking_for_its_report() {
+        use ::engine::fire::{FoldLen, RsVerb};
+        let device = geometry::Fold::Device;
+        let host = geometry::Fold::Host(vec![2]);
+        for (device_places, fold) in [(false, &device), (true, &device), (true, &host)] {
+            let what = format!("device_places {device_places}, {fold:?}");
+            let stores = pool_of_one_row_rs_pages();
+            let kv = stores.kv.lock().create_working_set();
+            let ws = stores
+                .rs
+                .lock()
+                .unwrap()
+                .create_working_set(crate::store::rs::RsGeometry {
+                    state_size: 1 << 10,
+                    buffer_page_tokens: 1,
+                });
+            stores.rs.lock().unwrap().fold(ws, 10);
+            let ids = [ws];
+            let groups_of = lane_groups(&[kv]);
+            let pass = PassLanes {
+                places: vec![geometry::Place {
+                    folded: 10,
+                    folded_exact: true,
+                    tail: None,
+                    shared: false,
+                    spans: Vec::new(),
+                }],
+                cursors: vec![Arc::new(Mutex::new(Cursor {
+                    folded: 10,
+                    reserved: 14,
+                    tail: None,
+                    ..Cursor::default()
+                }))],
+                kv: Vec::new(),
+            };
+            let mut req = lane(10, 4);
+            let plan = if device_places {
+                device_rs_plan(&stores, &ids, &groups_of, &pass, fold)
+            } else {
+                host_rs_plan(&stores, &ids, &groups_of, &req, fold, &[])
+            }
+            .expect(&what);
+            let prepared =
+                rs::prepare_many(&mut stores.rs.lock().unwrap(), &ids, &plan, None).expect(&what);
+            prepared.apply_to(&mut req);
+            let counts = matches!(fold, geometry::Fold::Device);
+            assert_eq!(
+                matches!(
+                    req.lanes[0].rs,
+                    RsVerb::Buffer {
+                        fold: FoldLen::Device,
+                        ..
+                    }
+                ),
+                counts,
+                "{what}"
+            );
+            assert_eq!(
+                untagged_device_fold(&req),
+                counts.then_some(0),
+                "{what}: the verb alone asks for nothing"
+            );
+            let mut tags = Vec::new();
+            let by = fold_at(
+                &pass,
+                &groups_of[0].1,
+                None,
+                fold,
+                u64::MAX,
+                true,
+                Some(ws),
+                &mut req,
+                &mut tags,
+            );
+            assert!(matches!(by, Some(FoldBy::Settled { .. })), "{what}");
+            assert_eq!(req.lanes[0].reports != 0, counts, "{what}");
+            assert_eq!(untagged_device_fold(&req), None, "{what}");
         }
     }
 

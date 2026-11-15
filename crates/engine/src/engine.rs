@@ -42,9 +42,11 @@ pub struct KvWrites {
     /// adds it to the set's frozen length when the fire settles, for its
     /// kv and its recurrent state alike. An engine reports it for every
     /// lane that asks a report on a fire whose fold length is the device's
-    /// ([`crate::fire::FoldLen::Device`]). `None` there freezes nothing:
-    /// the runtime fails the pass by name when the fire settles, since
-    /// every later fire of the set would carry all the lane wrote since.
+    /// ([`crate::fire::FoldLen::Device`]). `None` there freezes nothing,
+    /// and the runtime fails the set by name when the fire settles: the
+    /// engine's record went on by a count the runtime never takes, so the
+    /// set is not forked, checkpointed, exported or moved from then on, and
+    /// every later fire of it carries all the lane wrote since.
     pub fold: Option<u32>,
     /// One past the last slot the lane's rows landed at, in the set's own
     /// slot numbering: a position. `None` where the engine does not tell
