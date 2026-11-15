@@ -40,6 +40,169 @@ impl FrameShell for Shell {
         Self: 'a,
     {
         let _ = prev;
+        // A step refused here fires nothing: what its lanes' device-counted
+        // folds left ahead goes back to where the step found it.
+        let ahead = self.rs_ahead.clone();
+        let prepared = self.prepare_step(step);
+        if prepared.is_err() {
+            self.rs_ahead = ahead;
+        }
+        prepared
+    }
+
+    fn enqueue<'a>(&mut self, prepared: Prepared<'a>) -> Result<Enqueued<'a>>
+    where
+        Self: 'a,
+    {
+        let mut p = prepared;
+        let slot = p
+            .slot
+            .take()
+            .expect("a `Prepared` holds its staging slot until `enqueue` borrows it");
+        match self.enqueue_on(&mut p, &slot) {
+            Ok((launches, readback)) => {
+                p.slot = Some(slot);
+                Ok(Enqueued {
+                    prepared: p,
+                    launches,
+                    readback,
+                })
+            }
+            Err(fault) => {
+                let _ = self.device.synchronize();
+                drop(slot);
+                Err(fault)
+            }
+        }
+    }
+
+    fn settle<'a>(&mut self, enqueued: Enqueued<'a>) -> Result<Settled>
+    where
+        Self: 'a,
+    {
+        self.settle_step(enqueued, None)
+    }
+}
+
+fn stated_fold(len: FoldLen, lane: usize, port: Option<&[u32]>) -> Result<u32> {
+    Ok(match len {
+        FoldLen::Host(n) => n,
+        FoldLen::Device => {
+            let cells = port.ok_or_else(|| {
+                Fault::program(
+                    "serve::rs",
+                    format!(
+                        "lane {lane} states a device-resident fold length, and the program \
+                         attached to it resolved no `fold` port"
+                    ),
+                )
+            })?;
+            fold_cell(cells, lane).ok_or_else(|| {
+                Fault::program(
+                    "serve::rs",
+                    format!(
+                        "lane {lane} states a device-resident fold length on a `fold` port \
+                         whose cell carries {} entries",
+                        cells.len()
+                    ),
+                )
+            })?
+        }
+    })
+}
+
+/// Lane `lane`'s fold in a `fold` port's cell: a cell of one entry states
+/// every lane's fold, a longer one a fold a lane, and a lane past it none.
+fn fold_cell(cells: &[u32], lane: usize) -> Option<u32> {
+    match cells {
+        [every] => Some(*every),
+        cells => cells.get(lane).copied(),
+    }
+}
+
+/// The slots the state in record `slot` holds as a lane's fire finds it.
+/// A buffered lane states `folded`, which a device-counted fold not yet
+/// settled has left behind what `ahead` holds; a lane that starts fresh, or
+/// folds its rows itself (`None`: a working set new to the record starts
+/// with such a fire), leaves nothing ahead.
+fn fold_held(
+    ahead: &mut std::collections::HashMap<u32, u32>,
+    slot: u32,
+    folded: Option<u32>,
+    fresh: bool,
+) -> u32 {
+    match (ahead.get(&slot), folded) {
+        (Some(&at), Some(folded)) if at > folded && !fresh => at,
+        (_, folded) => {
+            ahead.remove(&slot);
+            folded.unwrap_or(0)
+        }
+    }
+}
+
+/// A lane's table of a window list retaining `retained` tokens, where it
+/// names the list's slot refs: a page wholly behind the window of the lane's
+/// first row reads the null slot, the rest the refs the lane was handed, one
+/// a page of its table.
+fn window_refs(
+    paging: &kv::Paging,
+    retained: Option<u32>,
+    seat: &kv::Seat,
+    refs: &[u32],
+) -> Result<Vec<u32>> {
+    let Some(retained) = retained.filter(|_| paging.window.is_some()) else {
+        return Ok(refs.to_vec());
+    };
+    let page_size = u64::from(paging.page_size);
+    let pages = (u64::from(seat.have) + u64::from(seat.rows))
+        .div_ceil(page_size)
+        .max(1);
+    let first = u64::from(seat.have.saturating_sub(retained)) / page_size;
+    (0..pages)
+        .map(|page| {
+            if page < first {
+                return Ok(0);
+            }
+            match refs.get(page as usize) {
+                Some(&slot) if slot != 0 => Ok(slot),
+                Some(_) => Err(Fault::Unbound {
+                    what: format!(
+                        "windowed page {page} of a lane holding {} tokens, which its window \
+                         still reads and the runtime has released",
+                        seat.have
+                    ),
+                }),
+                None => Err(Fault::Ceiling {
+                    what: "window list slot refs this lane stated",
+                    need: page + 1,
+                    have: refs.len() as u64,
+                }),
+            }
+        })
+        .collect()
+}
+
+fn narrow(n: u64) -> i32 {
+    i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+/// The rows a fire's kernels write through its readout plane: a readout as
+/// tall as the fire is launched at the fire's bucket, so the plane must
+/// hold the bucket, not only the rows read out.
+/// A fire that reads nothing out (an idle expert-parallel rank's) writes
+/// nothing through it.
+fn readout_extent(rows: u32, bucket: u32, readouts: usize) -> u64 {
+    if readouts == 0 {
+        return 0;
+    }
+    let pad = kernels_cuda::Pad { rows, bucket };
+    u64::from(pad.extent(u32::try_from(readouts).unwrap_or(u32::MAX)))
+}
+
+impl Shell {
+    /// Prepares a step: its lanes' pages, records and tables, ahead of its
+    /// fire.
+    fn prepare_step<'a>(&mut self, step: StepView<'a>) -> Result<Prepared<'a>> {
         let StepView {
             lanes,
             attachments,
@@ -1864,156 +2027,6 @@ impl FrameShell for Shell {
         })
     }
 
-    fn enqueue<'a>(&mut self, prepared: Prepared<'a>) -> Result<Enqueued<'a>>
-    where
-        Self: 'a,
-    {
-        let mut p = prepared;
-        let slot = p
-            .slot
-            .take()
-            .expect("a `Prepared` holds its staging slot until `enqueue` borrows it");
-        match self.enqueue_on(&mut p, &slot) {
-            Ok((launches, readback)) => {
-                p.slot = Some(slot);
-                Ok(Enqueued {
-                    prepared: p,
-                    launches,
-                    readback,
-                })
-            }
-            Err(fault) => {
-                let _ = self.device.synchronize();
-                drop(slot);
-                Err(fault)
-            }
-        }
-    }
-
-    fn settle<'a>(&mut self, enqueued: Enqueued<'a>) -> Result<Settled>
-    where
-        Self: 'a,
-    {
-        self.settle_step(enqueued, None)
-    }
-}
-
-fn stated_fold(len: FoldLen, lane: usize, port: Option<&[u32]>) -> Result<u32> {
-    Ok(match len {
-        FoldLen::Host(n) => n,
-        FoldLen::Device => {
-            let cells = port.ok_or_else(|| {
-                Fault::program(
-                    "serve::rs",
-                    format!(
-                        "lane {lane} states a device-resident fold length, and the program \
-                         attached to it resolved no `fold` port"
-                    ),
-                )
-            })?;
-            fold_cell(cells, lane).ok_or_else(|| {
-                Fault::program(
-                    "serve::rs",
-                    format!(
-                        "lane {lane} states a device-resident fold length on a `fold` port \
-                         whose cell carries {} entries",
-                        cells.len()
-                    ),
-                )
-            })?
-        }
-    })
-}
-
-/// Lane `lane`'s fold in a `fold` port's cell: a cell of one entry states
-/// every lane's fold, a longer one a fold a lane, and a lane past it none.
-fn fold_cell(cells: &[u32], lane: usize) -> Option<u32> {
-    match cells {
-        [every] => Some(*every),
-        cells => cells.get(lane).copied(),
-    }
-}
-
-/// The slots the state in record `slot` holds as a lane's fire finds it.
-/// A buffered lane states `folded`, which a device-counted fold not yet
-/// settled has left behind what `ahead` holds; a lane that starts fresh, or
-/// folds its rows itself (`None`: a working set new to the record starts
-/// with such a fire), leaves nothing ahead.
-fn fold_held(
-    ahead: &mut std::collections::HashMap<u32, u32>,
-    slot: u32,
-    folded: Option<u32>,
-    fresh: bool,
-) -> u32 {
-    match (ahead.get(&slot), folded) {
-        (Some(&at), Some(folded)) if at > folded && !fresh => at,
-        (_, folded) => {
-            ahead.remove(&slot);
-            folded.unwrap_or(0)
-        }
-    }
-}
-
-/// A lane's table of a window list retaining `retained` tokens, where it
-/// names the list's slot refs: a page wholly behind the window of the lane's
-/// first row reads the null slot, the rest the refs the lane was handed, one
-/// a page of its table.
-fn window_refs(
-    paging: &kv::Paging,
-    retained: Option<u32>,
-    seat: &kv::Seat,
-    refs: &[u32],
-) -> Result<Vec<u32>> {
-    let Some(retained) = retained.filter(|_| paging.window.is_some()) else {
-        return Ok(refs.to_vec());
-    };
-    let page_size = u64::from(paging.page_size);
-    let pages = (u64::from(seat.have) + u64::from(seat.rows))
-        .div_ceil(page_size)
-        .max(1);
-    let first = u64::from(seat.have.saturating_sub(retained)) / page_size;
-    (0..pages)
-        .map(|page| {
-            if page < first {
-                return Ok(0);
-            }
-            match refs.get(page as usize) {
-                Some(&slot) if slot != 0 => Ok(slot),
-                Some(_) => Err(Fault::Unbound {
-                    what: format!(
-                        "windowed page {page} of a lane holding {} tokens, which its window \
-                         still reads and the runtime has released",
-                        seat.have
-                    ),
-                }),
-                None => Err(Fault::Ceiling {
-                    what: "window list slot refs this lane stated",
-                    need: page + 1,
-                    have: refs.len() as u64,
-                }),
-            }
-        })
-        .collect()
-}
-
-fn narrow(n: u64) -> i32 {
-    i32::try_from(n).unwrap_or(i32::MAX)
-}
-
-/// The rows a fire's kernels write through its readout plane: a readout as
-/// tall as the fire is launched at the fire's bucket, so the plane must
-/// hold the bucket, not only the rows read out.
-/// A fire that reads nothing out (an idle expert-parallel rank's) writes
-/// nothing through it.
-fn readout_extent(rows: u32, bucket: u32, readouts: usize) -> u64 {
-    if readouts == 0 {
-        return 0;
-    }
-    let pad = kernels_cuda::Pad { rows, bucket };
-    u64::from(pad.extent(u32::try_from(readouts).unwrap_or(u32::MAX)))
-}
-
-impl Shell {
     fn group_masks_of(
         &self,
         lanes: &[super::lanes::Seated<'_>],
