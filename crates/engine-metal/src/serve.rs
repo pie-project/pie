@@ -2598,6 +2598,11 @@ impl Shell {
             return Ok(());
         };
         let waited = flight.pending.wait();
+        // Settling inside submit: the sink hears the fire here, the buffer
+        // complete, before the harvest (and so the submit) returns.
+        if let Some(told) = flight.told.as_ref() {
+            told(waited.as_ref().err().map(ToString::to_string));
+        }
         if let Some(keepalive) = &self.keepalive {
             keepalive.end();
         }
@@ -4790,6 +4795,9 @@ pub struct Enqueued<'a> {
     attached: Vec<engine::InstanceId>,
     /// Each lane's read-back row: its output's name, width and element bytes.
     readbacks: Vec<Option<(String, u32, u64)>>,
+    /// What the harvest tells the completion sink, where the engine settles
+    /// inside submit.
+    told: Option<Told>,
     step: PhantomData<&'a ()>,
 }
 
@@ -4832,7 +4840,11 @@ struct Flight {
     pending: Pending,
     attached: Vec<engine::InstanceId>,
     readbacks: Vec<Option<(String, u32, u64)>>,
+    told: Option<Told>,
 }
+
+/// A fire's word to its completion sink, given why its buffer failed.
+type Told = Box<dyn Fn(Option<String>) + Send>;
 
 impl engine::frame::Shell for Shell {
     type Step<'a> = StepView<'a>;
@@ -4926,8 +4938,9 @@ impl engine::frame::Shell for Shell {
         let done = prepared.done.take();
         let ends = std::mem::take(&mut prepared.ends);
         let verdict = self.ane.as_ref().and_then(crate::ane::Ane::verdict);
-        let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
-            counts.leave();
+        // What the fire tells its completion sink once its buffer completed:
+        // its folds and ends, or why it failed.
+        let tell: Told = Box::new(move |refused: Option<String>| {
             let refused = refused.or_else(|| verdict.as_ref().and_then(|verdict| verdict()));
             if let Some(done) = done.as_ref() {
                 let outcome = match &refused {
@@ -4939,6 +4952,21 @@ impl engine::frame::Shell for Shell {
                     )),
                 };
                 (done.sink)(done.at, outcome);
+            }
+        });
+        // One frame in flight: the engine settles inside submit, and the sink
+        // has each step's reports before submit returns, told from the
+        // harvest on this thread once the buffer completed. More: the
+        // completion handler tells it.
+        let (in_handler, at_harvest) = if self.arms.depth() == 1 {
+            (None, Some(tell))
+        } else {
+            (Some(tell), None)
+        };
+        let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
+            counts.leave();
+            if let Some(tell) = in_handler.as_ref() {
+                tell(refused);
             }
         })));
         let pending = match pending {
@@ -4960,6 +4988,7 @@ impl engine::frame::Shell for Shell {
             launches: walked.launches,
             attached,
             readbacks,
+            told: at_harvest,
             step: PhantomData,
         })
     }
@@ -4976,6 +5005,7 @@ impl engine::frame::Shell for Shell {
             launches,
             attached,
             readbacks,
+            told,
             step: _,
         } = enqueued;
         self.arms.take(arm);
@@ -4987,6 +5017,7 @@ impl engine::frame::Shell for Shell {
             pending,
             attached,
             readbacks,
+            told,
         });
         Ok(Landed {
             seq,
