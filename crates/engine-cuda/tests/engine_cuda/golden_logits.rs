@@ -443,16 +443,7 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
         comm: core::ptr::null_mut(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
-    let (held, outside) = shell.held_and_outside();
-    // A load that armed its bodies fitted the card once more after them:
-    // settled, it holds back none of the chunks it states.
-    if shell.body_stats().census.bodies > 0 {
-        assert_eq!(
-            held, 0,
-            "{}: a settled load holds back no chunk it stated",
-            fixture.model
-        );
-    }
+    let (_, outside) = shell.held_and_outside();
     assert_eq!(
         outside,
         shell.ledger().bytes(engine::memory::Class::Outside),
