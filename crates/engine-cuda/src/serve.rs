@@ -163,15 +163,22 @@ pub struct Shell {
     /// The device's bytes and those in use before this load began: what
     /// the load's ledger is read against.
     card: (u64, u64),
+    /// What every fit of this load holds for the guests' programs
+    /// (`Pools::fit_the_card`): the fit a load that arms at its starting
+    /// weight residency settles there holds what the load's fits held.
+    held_for_fires: u64,
     /// What the runtime reads of this shell while it serves: the fires it
     /// counts.
     live: engine::live::Live,
     /// The lattice waits for the starting weight residency: the load
     /// streams its weights, and bodies armed over the host copy would read
     /// every expert over the bus (`Staged::finish`). It arms at the
-    /// starting residency the runtime sends at bootstrap, before ready; a
-    /// later flip never arms once lanes name slot refs (it is refused by
-    /// name, or the bodies stay as recorded).
+    /// starting residency the runtime sends at bootstrap, before ready,
+    /// and settles its fit there ([`Shell::settle_fit`]): what the load's
+    /// last fit held back for bodies still to arm is the cache rows' from
+    /// then on, and the residency answers what is still held. A later flip
+    /// never arms once lanes name slot refs (it is refused by name, or the
+    /// bodies stay as recorded).
     arm_deferred: bool,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
     windows_memo: Vec<prepare::WindowsMemo>,

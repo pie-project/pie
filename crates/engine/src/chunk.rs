@@ -80,9 +80,12 @@ pub struct ChunkFacts {
     pub eager_rungs: Vec<u32>,
     /// Bytes of the chunks stated here that the engine holds back for its
     /// fires and bodies: the runtime's pool takes no more than the range
-    /// less this. Fixed at load, as the rungs are; the runtime seeds the
-    /// pool's hold-back from it once. Zero, the default: the pool may take
-    /// every chunk stated.
+    /// less this. A load fact the runtime seeds the pool's hold-back from;
+    /// an engine that arms at the weight residency the load starts with
+    /// answers there what it holds from then on
+    /// (`Engine::weight_residency`), before the load returns, and nothing
+    /// moves it while serving. Zero, the default: the pool may take every
+    /// chunk stated.
     #[serde(default)]
     pub held_bytes: u64,
     /// Bytes the driver holds on the device beside the engine's span when

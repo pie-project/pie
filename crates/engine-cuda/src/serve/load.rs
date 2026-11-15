@@ -1336,6 +1336,7 @@ impl Shell {
             arm_rs: crate::record::RsBody::Folds,
             arm_deferred: false,
             card: (0, 0),
+            held_for_fires: 0,
             live: engine::live::Live::armed(),
             segments: std::collections::HashMap::new(),
             windows_memo: Vec::new(),
@@ -1413,7 +1414,7 @@ impl Shell {
             .iter()
             .map(|plane| crate::store::decoded_weight_reserve(*plane, 1))
             .collect();
-        let held_for_fires = programs;
+        shell.held_for_fires = programs;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] decoded-weight tiles over {} stream(s) ({})",
@@ -1514,7 +1515,7 @@ impl Shell {
         }
         let fitted = shell
             .pools
-            .fit_the_card(bodies, held_for_fires, false, &resident)?;
+            .fit_the_card(bodies, shell.held_for_fires, false, &resident)?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] fit before arming: {} pages, {} chunks, room {} MiB (fresh {})",
@@ -1544,7 +1545,6 @@ impl Shell {
         }
         Ok(Staged {
             shell,
-            held_for_fires,
             rank: boot.world.rank,
             arm_trace: boot.knobs.diagnostics.arm_trace,
             weights_held: boot.knobs.weights_held,
@@ -1623,7 +1623,6 @@ impl Shell {
 /// A shell whose load stopped short of arming its bodies ([`Shell::stage`]).
 pub struct Staged {
     pub shell: Shell,
-    held_for_fires: u64,
     rank: u32,
     arm_trace: bool,
     /// The load was told its weights are held (`Knobs::weights_held`).
@@ -1637,7 +1636,6 @@ impl Staged {
     pub fn finish(self) -> Result<Shell> {
         let Staged {
             mut shell,
-            held_for_fires,
             rank,
             arm_trace,
             weights_held,
@@ -1670,7 +1668,8 @@ impl Staged {
         // armed now, its bodies would read every expert from the host copy,
         // over the bus, fire after fire. It arms at the starting weight
         // residency instead, over the slots the cache then holds, and the
-        // fit keeps the bodies' allowance out of the cache rows till then.
+        // fit keeps the bodies' allowance out of the cache rows till then,
+        // when it settles ([`Shell::settle_fit`]).
         let deferred =
             shell.ep.is_none() && shell.records_bodies() && !shell.pools.weights_seated_whole();
         if deferred {
@@ -1700,7 +1699,7 @@ impl Staged {
         let bodies = if deferred { shell.bodies_mem as u64 } else { 0 };
         let fitted = shell
             .pools
-            .fit_the_card(bodies, held_for_fires, settled, &resident)?;
+            .fit_the_card(bodies, shell.held_for_fires, settled, &resident)?;
         if shell.arena.has_rungs() {
             // The runtime is stated the range whole, what a later fit may
             // yet give the cache rows with it, and keeps the pool under it
@@ -1824,6 +1823,42 @@ impl Shell {
             self.pools.kept_back_bytes(),
             self.ledger().bytes(engine::memory::Class::Outside),
         )
+    }
+
+    /// Settles the fit of a load that armed at its starting weight
+    /// residency. Its last fit ran with nothing fired: it kept the bodies'
+    /// allowance and the activation's whole span out of the cache rows
+    /// ([`Staged::finish`]). The lattice has fired now, so the activation
+    /// is at its high water and the bodies hold what they take: the rest is
+    /// the cache rows', as on a load that armed before its last fit.
+    ///
+    /// The range stays where it lies (the bodies name it) and the chunks
+    /// stated to the runtime stand: what moves is how many of them the fit
+    /// holds back ([`Self::held_and_outside`]), which the residency answers
+    /// and the runtime lifts its pool's hold-back by. What that opens is
+    /// backed when the runtime comes to take it (`Pools::back_whole`),
+    /// before the load returns.
+    pub(super) fn settle_fit(&mut self) -> Result<()> {
+        self.pools.pin();
+        let resident = footprint(self, self.card.0, self.card.1);
+        let before = (self.pools.declared_bytes(), self.pools.kept_back_bytes());
+        let fitted = self
+            .pools
+            .fit_the_card(0, self.held_for_fires, true, &resident)?;
+        if super::diag::on().arm_trace {
+            eprintln!(
+                "[arm-trace] settled at the starting weight residency: cache rows {} -> {} MiB \
+                 ({} sequences at the declared context) of the {} MiB the card hands out for \
+                 them ({resident}); {} -> {} MiB of the stated chunks held back",
+                before.0 >> 20,
+                self.pools.declared_bytes() >> 20,
+                fitted.fit / u64::from(self.pools.paging().pages_per_slot),
+                fitted.room >> 20,
+                before.1 >> 20,
+                self.pools.kept_back_bytes() >> 20,
+            );
+        }
+        Ok(())
     }
 }
 

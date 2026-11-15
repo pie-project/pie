@@ -1716,9 +1716,11 @@ impl SharedPool {
 
     /// The engine holds `bytes` of the range it stated back
     /// ([`::engine::chunk::ChunkFacts::held_bytes`], a load fact the pool
-    /// is seeded with once): no state chunk is opened in the top `bytes` of
-    /// the span below the activation, which the engine binds none of; all
-    /// of it where it holds none.
+    /// is seeded with, and what the engine answers the weight residency
+    /// the load starts with, where it settled its fit there; nothing says
+    /// it again once the load returned): no state chunk is opened in the
+    /// top `bytes` of the span below the activation, which the engine
+    /// binds none of; all of it where it holds none.
     /// Whether the ceiling rose: room opened that a planner waiter may be
     /// short of.
     pub fn hold_back(&mut self, bytes: u64) -> bool {
@@ -1752,14 +1754,24 @@ impl SharedPool {
     #[must_use]
     pub fn bound_bytes(&self) -> u64 {
         let total = self.pool.total_chunks();
-        let ceiling = self.pool.ceiling();
-        if ceiling >= total {
-            return u64::from(total) * self.pool.chunk_bytes();
-        }
         let seg = self.pool.segments().segment_chunks().max(1);
         let top_start = self.pool.top_segment() * seg;
-        let prefix_end = (ceiling / seg * seg).min(top_start);
+        let prefix_end = self.bound_prefix() * seg;
         u64::from(prefix_end + (total - top_start)) * self.pool.chunk_bytes()
+    }
+
+    /// The segments below the top span that lie wholly under what the
+    /// engine binds ([`Self::hold_back`]): every one of them where it holds
+    /// none back. What `commit_segments(n)` may back as a prefix.
+    #[must_use]
+    pub fn bound_prefix(&self) -> u32 {
+        let top = self.pool.top_segment();
+        let ceiling = self.pool.ceiling();
+        if ceiling >= self.pool.total_chunks() {
+            return top;
+        }
+        let seg = self.pool.segments().segment_chunks().max(1);
+        (ceiling / seg).min(top)
     }
 
     /// The smallest rung whose fires carry `rows`, the largest past every

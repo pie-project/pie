@@ -292,7 +292,15 @@ pub trait Engine: Send {
     /// next fire; the engine fills slots newly named (from its host copy)
     /// before a fire reads them. A use of an atom not named is the
     /// engine's: it streams through a staging slot and is not kept.
-    fn weight_residency(&mut self, residency: &WeightResidency) -> Result<()> {
+    ///
+    /// Answers the bytes the engine holds back of the chunks it stated
+    /// ([`crate::chunk::ChunkFacts::held_bytes`]) once it has taken the
+    /// set. An engine that armed nothing at load arms at the residency the
+    /// load starts with and settles its fit there, so it holds less from
+    /// then on than its load stated; the runtime lifts the pool's hold-back
+    /// by that answer before the load returns. Nothing moves what is held
+    /// after that: every later answer repeats it.
+    fn weight_residency(&mut self, residency: &WeightResidency) -> Result<u64> {
         let _ = residency;
         Err(self.unsupported("weight_residency"))
     }

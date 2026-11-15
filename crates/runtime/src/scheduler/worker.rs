@@ -353,7 +353,8 @@ pub(crate) enum HostKvOp {
     WriteTier(Vec<(::engine::chunk::ShapeId, Vec<u32>)>, Vec<u8>),
     /// The engine's tap groups (`Engine::tap_groups`), as JSON.
     TapGroups,
-    /// The weight cache's resident set (`Engine::weight_residency`), ahead
+    /// The weight cache's resident set (`Engine::weight_residency`),
+    /// answered with the bytes the engine holds back once it took it, ahead
     /// of every fire queued after it.
     WeightResidency(::engine::chunk::WeightResidency),
     /// The engine's weight use record since it last answered
@@ -3156,6 +3157,72 @@ mod tests {
              growing back"
         );
 
+        let (_engine, _channels) = lane.shutdown();
+    }
+
+    /// What [`HoldingEngine`] answers it holds back once it took a resident
+    /// set.
+    const HELD: u64 = 96 << 20;
+
+    struct HoldingEngine;
+
+    impl engine::Engine for HoldingEngine {
+        fn kind(&self) -> &'static str {
+            "holding"
+        }
+
+        fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
+            Err(engine::Error::Load("no model".into()))
+        }
+
+        fn submit(
+            &mut self,
+            _frame: &engine::FrameSubmission,
+        ) -> engine::Result<engine::FrameTicket> {
+            Err(engine::Error::Load("no model".into()))
+        }
+
+        fn weight_residency(
+            &mut self,
+            _residency: &::engine::chunk::WeightResidency,
+        ) -> engine::Result<u64> {
+            Ok(HELD)
+        }
+    }
+
+    fn within<T>(what: &str, wait: impl std::future::Future<Output = T>) -> T {
+        crate::rt::block_on(async { crate::rt::time::timeout(Duration::from_secs(10), wait).await })
+            .unwrap_or_else(|_| panic!("timed out: {what}"))
+    }
+
+    /// A resident set queued on the lane is answered with what the engine
+    /// holds back once it took it, and the weight port reads that answer back
+    /// as the bytes; an engine that does not stream answers the port nothing.
+    #[test]
+    fn a_resident_set_is_answered_with_what_the_engine_holds_back() {
+        use crate::store::weights::port::EnginePort;
+        const ENGINE: usize = 9309;
+        let mut lane = Lane::spawn(
+            ENGINE,
+            Some(Box::new(HoldingEngine)),
+            Arc::new(SchedulerStats::default()),
+        );
+        let (response, answer) = tokio::sync::oneshot::channel();
+        let done = lane.control(QueuedItem::HostKv {
+            op: HostKvOp::WeightResidency(::engine::chunk::WeightResidency::default()),
+            response,
+        });
+        within("the lane takes the resident set", done).expect("the lane answers");
+        let answer = within("the resident set is answered", answer).expect("answered, not dropped");
+        let mut port = EnginePort::new(ENGINE, false);
+        assert_eq!(port.answered(answer).expect("taken"), Some(HELD));
+        assert!(!port.idle());
+        let unsupported = ::engine::Error::unsupported("holding", "weight_residency");
+        assert_eq!(
+            port.answered(Err(unsupported.into())).expect("no error"),
+            None
+        );
+        assert!(port.idle(), "asked nothing more");
         let (_engine, _channels) = lane.shutdown();
     }
 }

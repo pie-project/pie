@@ -945,7 +945,7 @@ impl Lane {
                     }
                     HostKvOp::WeightResidency(residency) => engine
                         .weight_residency(&residency)
-                        .map(|()| Vec::new())
+                        .map(|held| serde_json::to_vec(&held).unwrap_or_default())
                         .map_err(Into::into),
                     HostKvOp::WeightUses => engine
                         .weight_uses()

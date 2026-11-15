@@ -211,12 +211,12 @@ impl<E: ::engine::Engine + ?Sized> WeightPort for E {
     }
 
     fn set_residency(&mut self, residency: &WeightResidency) -> ::engine::Result<()> {
-        self.weight_residency(residency)
+        self.weight_residency(residency).map(|_held| ())
     }
 
     fn propose(&mut self, residency: &WeightResidency) -> Proposal {
         match self.weight_residency(residency) {
-            Ok(()) => Proposal::Taken,
+            Ok(_held) => Proposal::Taken,
             Err(_) => Proposal::Refused,
         }
     }

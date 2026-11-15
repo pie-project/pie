@@ -61,6 +61,19 @@ impl EnginePool {
     pub const fn locus(&self) -> (usize, usize) {
         (self.model, self.engine)
     }
+
+    /// See [`SharedGrow::held_back`]; a pinned pool holds nothing back.
+    #[must_use]
+    pub fn held_back(&self, held: u64) -> Option<u32> {
+        self.shared.as_ref().and_then(|grow| grow.held_back(held))
+    }
+
+    /// See [`SharedGrow::backed`].
+    pub fn backed(&self, prefix: u32) {
+        if let Some(grow) = &self.shared {
+            grow.backed(prefix);
+        }
+    }
 }
 
 impl SlotAccess for EnginePool {
@@ -118,9 +131,10 @@ impl PoolTarget for EnginePool {
     /// under it and the top span
     /// ([`crate::store::shared::SharedPool::bound_bytes`]), the segments the
     /// walker commits ([`crate::store::slots::SlotPool::backs`]); never
-    /// under the floor. Fixed from the load on, as what is held back is. The
-    /// range stated at load already leaves out what the driver holds
-    /// (`outside`, a ledger term the policy reads).
+    /// under the floor. Fixed once the load returned, as what is held back
+    /// is ([`Shared::<Steered>::boot`] reads the last word on it). The range
+    /// stated at load already leaves out what the driver holds (`outside`,
+    /// a ledger term the policy reads).
     fn hard_limit(&self) -> u64 {
         self.shared.as_ref().map_or(0, |shared| {
             let bound = shared.shared().lock().unwrap().bound_bytes();
@@ -160,10 +174,18 @@ impl Shared<Steered> {
     /// took it: what the load does before a fire can be submitted, so none
     /// reads from the host a row the cache holds.
     ///
+    /// The engine answers what it holds back of its range from then on
+    /// (`Engine::weight_residency`): one that armed there settled its fit
+    /// and holds less than its load stated. The pool's hold-back takes the
+    /// answer, and the segments that opens are backed here, so the load
+    /// returns with the pool a load that armed before its last fit has.
+    /// No later answer is read: nothing arms or refits while serving.
+    ///
     /// # Errors
     ///
-    /// The engine refused it, or its lane closed first. An engine that does
-    /// not stream (it answers unsupported) is no error.
+    /// The engine refused it, would not back what it no longer holds, or
+    /// its lane closed first. An engine that does not stream (it answers
+    /// unsupported) is no error.
     pub async fn boot(&self) -> anyhow::Result<()> {
         // The segments the weights were committed into past the load's
         // own: the engine backs them before it is told where the weights
@@ -189,7 +211,28 @@ impl Shared<Steered> {
             let answer = answer
                 .await
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("the engine's lane closed")));
-            self.with(|pool| pool.port_mut().answered(answer))?;
+            let opened = self.with(|pool| -> anyhow::Result<_> {
+                let held = pool.port_mut().answered(answer)?;
+                Ok(held.and_then(|held| pool.inner().held_back(held)))
+            })?;
+            let Some(prefix) = opened else { continue };
+            crate::scheduler::pool(
+                engine,
+                crate::scheduler::worker::PoolOp::CommitSegments(prefix),
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "the engine did not back the {prefix} segments it holds back no more: \
+                     {error}"
+                )
+            })?;
+            self.with(|pool| pool.inner().backed(prefix));
+            tracing::debug!(
+                engine,
+                committed = prefix,
+                "the engine backs the segments it holds back no more"
+            );
         }
         Ok(())
     }

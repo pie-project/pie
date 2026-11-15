@@ -846,7 +846,10 @@ impl Engine for Cuda {
         self.loaded_mut()?.release_segments(segments).map_err(fault)
     }
 
-    fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
+    fn weight_residency(
+        &mut self,
+        residency: &engine::chunk::WeightResidency,
+    ) -> EngineResult<u64> {
         self.loaded_mut()?
             .weight_residency(residency)
             .map_err(fault)

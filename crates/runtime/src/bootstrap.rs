@@ -420,7 +420,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 let mut pool = pool;
                 // What the engine holds back of the range it stated is no
                 // sequence's from the first page on: a load fact, seeded
-                // here once.
+                // here. An engine that arms at the weight residency it
+                // starts with says there what it still holds
+                // (`Shared::<Steered>::boot`), before the load returns.
                 pool.hold_back(d.chunks.held_bytes);
                 // A rung of `r` tokens carries `min(r, max_lanes)` lanes, as
                 // the engine counts them: what a program's fire term takes.

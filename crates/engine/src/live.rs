@@ -10,8 +10,10 @@
 //! back of its range and what the driver holds beside its span are load
 //! facts ([`crate::chunk::ChunkFacts::eager_rungs`],
 //! [`crate::chunk::ChunkFacts::held_bytes`],
-//! [`crate::chunk::ChunkFacts::outside_bytes`]): every capture ends before
-//! the load returns, and nothing arms while the engine serves.
+//! [`crate::chunk::ChunkFacts::outside_bytes`]; what is held back settles
+//! with the residency the load starts with, [`crate::Engine::weight_residency`]):
+//! every capture ends before the load returns, and nothing arms while the
+//! engine serves.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

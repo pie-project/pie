@@ -159,8 +159,9 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
     }
     // Chunks are handed out of mapped segments only: a pool mapped past its
     // limit is what lets a sequence onto chunks the engine holds back. The
-    // limit is the load's and the pool is never moved past it, so it is
-    // read once.
+    // limit is the load's (this loop starts after the engine answered the
+    // residency it starts with) and the pool is never moved past it, so it
+    // is read once.
     // `mapped`: the bytes under the pool's mapped segments.
     let (mapped, hard_limit) = (pool.held(), steer.governor().limits().hard_limit);
     if shared && mapped > hard_limit {

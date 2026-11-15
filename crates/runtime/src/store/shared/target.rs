@@ -290,6 +290,31 @@ impl SharedGrow {
         self.target.fetch_max(mapped, Ordering::AcqRel);
     }
 
+    /// The engine answered the weight residency the load starts with: it
+    /// holds `held` bytes back from here on
+    /// ([`super::SharedPool::hold_back`]). Where that opens segments the
+    /// engine binds and the load did not back, the prefix for the engine
+    /// to back before the load returns ([`Self::backed`]): the pool then
+    /// starts as the one of a load that never held more, with nothing
+    /// left for the walk to commit ahead of a waiter once fires run.
+    #[must_use]
+    pub fn held_back(&self, held: u64) -> Option<u32> {
+        let mut pool = self.shared.lock().unwrap();
+        if !pool.hold_back(held) {
+            return None;
+        }
+        let prefix = pool.bound_prefix();
+        (prefix > pool.pool().prefix_segments()).then_some(prefix)
+    }
+
+    /// The engine backed segments `0..prefix` for [`Self::held_back`]:
+    /// their chunks go out, and they are held as the load's own are
+    /// ([`Self::hold_mapped`]).
+    pub fn backed(&self, prefix: u32) {
+        self.shared.lock().unwrap().committed(prefix);
+        self.hold_mapped();
+    }
+
     #[must_use]
     pub fn shared(&self) -> &Shared {
         &self.shared
@@ -556,6 +581,66 @@ mod tests {
         assert!(!grow.can_grow(), "the next segment straddles the ceiling");
         shared.lock().unwrap().hold_back(0);
         assert!(grow.can_grow(), "held back no more: it grows");
+    }
+
+    /// A pool seeded with what a load that had armed nothing held back,
+    /// told at the starting residency that the engine holds less, stands
+    /// once the opened segments are backed as the pool of a load that never
+    /// held more: the same chunks open, the same segments mapped and held
+    /// as its target, the same bound. An answer that repeats what is held
+    /// moves nothing.
+    #[test]
+    fn a_hold_back_lifted_at_the_starting_residency_is_a_pool_that_never_held_more() {
+        let chunk = super::super::tests::pool().pool().chunk_bytes();
+        // The load's fit held 28 chunks under the activation (the ceiling
+        // at chunk 24 of 52); settled, it holds 4 (the ceiling at 48).
+        let (unsettled, settled) = (28 * chunk, 4 * chunk);
+        // The load that never held more: it backed every segment wholly
+        // under what it binds before it returned.
+        let never = {
+            let mut pool = super::super::tests::pool();
+            pool.hold_back(settled);
+            let prefix = pool.bound_prefix();
+            pool.committed(prefix);
+            pool
+        };
+        let mut pool = super::super::tests::pool();
+        pool.hold_back(unsettled);
+        let loaded = pool.pool().prefix_segments();
+        assert!(pool.bound_bytes() < never.bound_bytes());
+        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+        let grow = SharedGrow::new(0, 49, shared.clone());
+        assert_eq!(grow.held_back(unsettled), None, "what the load stated");
+        let prefix = grow.held_back(settled).expect("the lift opens segments");
+        assert_eq!(prefix, never.pool().prefix_segments());
+        assert!(prefix > loaded);
+        {
+            let pool = shared.lock().unwrap();
+            assert_eq!(pool.pool().ceiling(), never.pool().ceiling());
+            assert_eq!(pool.bound_bytes(), never.bound_bytes());
+            assert_eq!(
+                pool.pool().prefix_segments(),
+                loaded,
+                "no chunk goes out of a segment before the engine backed it"
+            );
+        }
+        grow.backed(prefix);
+        {
+            let pool = shared.lock().unwrap();
+            assert_eq!(
+                pool.pool().prefix_segments(),
+                never.pool().prefix_segments()
+            );
+            assert_eq!(pool.mapped_segments(), never.mapped_segments());
+            assert_eq!(pool.held(), never.held());
+            assert_eq!(pool.pool().headroom(), never.pool().headroom());
+            assert_eq!(
+                grow.target.load(Ordering::Acquire),
+                never.mapped_segments(),
+                "held as the load's own segments are"
+            );
+        }
+        assert_eq!(grow.held_back(settled), None, "said again: nothing moves");
     }
 
     /// A pool that stands past what is asked comes down only once it has
