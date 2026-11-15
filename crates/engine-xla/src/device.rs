@@ -48,6 +48,9 @@ pub struct Device {
     /// Where each compiled module is also written, for inspection
     /// (`PIE_XLA_DUMP`).
     dump: Option<PathBuf>,
+    /// The cache files of every program this device compiled or loaded:
+    /// the load's set, never evicted to make room.
+    set: Mutex<std::collections::HashSet<PathBuf>>,
     /// Where compiled executables persist across runs (`PIE_XLA_CACHE`,
     /// default `$XDG_CACHE_HOME/pie/xla` or `~/.cache/pie/xla`; `0` turns it
     /// off), keyed by the module text and this plugin and device.
@@ -109,6 +112,7 @@ impl Device {
             sealed_temp: std::sync::atomic::AtomicU64::new(0),
             dump: std::env::var_os("PIE_XLA_DUMP").map(PathBuf::from),
             disk: disk_cache(),
+            set: Mutex::new(std::collections::HashSet::new()),
             _lock: lock,
         })
     }
@@ -148,6 +152,7 @@ impl Device {
             sealed_temp: std::sync::atomic::AtomicU64::new(0),
             dump: std::env::var_os("PIE_XLA_DUMP").map(PathBuf::from),
             disk: None,
+            set: Mutex::new(std::collections::HashSet::new()),
             _lock: lock,
         })
     }
@@ -354,6 +359,7 @@ impl Device {
             Some(exe) => {
                 if let Some(file) = &file {
                     touch(file);
+                    self.keep(file);
                 }
                 tracing::debug!(
                     ms = started.elapsed().as_millis() as u64,
@@ -372,14 +378,23 @@ impl Device {
                     "xla compiled a program"
                 );
                 if let (Some(file), Ok(bytes)) = (&file, exe.serialize()) {
-                    let _ = std::fs::create_dir_all(file.parent().unwrap_or(file));
+                    let bytes = packed(&bytes);
+                    let dir = file.parent().unwrap_or(file);
+                    let _ = std::fs::create_dir_all(dir);
+                    // Room for it, made only of programs this load holds no
+                    // claim on; the load's own set is never evicted.
+                    self.make_room(dir, bytes.len() as u64)?;
                     let tmp = file.with_extension("tmp");
-                    if std::fs::write(&tmp, packed(&bytes)).is_ok() {
-                        let _ = std::fs::rename(&tmp, file);
-                    }
-                    if let Some(dir) = file.parent() {
-                        trim(dir, cache_cap());
-                    }
+                    std::fs::write(&tmp, &bytes)
+                        .and_then(|()| std::fs::rename(&tmp, file))
+                        .map_err(|why| Fault::Unbound {
+                            what: format!(
+                                "the program cache at {}, which took no {}-byte program: {why}",
+                                dir.display(),
+                                bytes.len()
+                            ),
+                        })?;
+                    self.keep(file);
                 }
                 exe
             }
@@ -418,6 +433,67 @@ impl Device {
         Some(dir.join(format!("{}.pjrt", h.finalize().to_hex())))
     }
 
+    /// Holds `file` in the load's set.
+    fn keep(&self, file: &std::path::Path) {
+        self.set
+            .lock()
+            .expect("cache set lock poisoned")
+            .insert(file.to_path_buf());
+    }
+
+    /// The bytes the load's set takes in the program cache.
+    #[must_use]
+    pub fn set_bytes(&self) -> u64 {
+        let set = self.set.lock().expect("cache set lock poisoned");
+        set.iter()
+            .filter_map(|f| std::fs::metadata(f).ok())
+            .map(|m| m.len())
+            .sum()
+    }
+
+    /// Frees `need` bytes on the cache's filesystem by dropping the least
+    /// recently used programs outside the load's set; refuses by name when
+    /// those do not free enough (the set itself is never evicted).
+    fn make_room(&self, dir: &std::path::Path, need: u64) -> Result<()> {
+        let Some(mut free) = free_bytes(dir) else {
+            return Ok(());
+        };
+        if free >= need {
+            return Ok(());
+        }
+        let set = self.set.lock().expect("cache set lock poisoned").clone();
+        let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(std::result::Result::ok)
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "pjrt"))
+                    .filter(|e| !set.contains(&e.path()))
+                    .filter_map(|e| {
+                        let meta = e.metadata().ok()?;
+                        Some((meta.modified().ok()?, meta.len(), e.path()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort_by_key(|f| f.0);
+        for (_, len, path) in files {
+            if free >= need {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                free += len;
+            }
+        }
+        if free < need {
+            return Err(Fault::Ceiling {
+                what: "disk bytes the load's compiled programs take (the program cache)",
+                need: self.set_bytes() + need,
+                have: self.set_bytes() + free,
+            });
+        }
+        Ok(())
+    }
+
     /// Whether compiled programs go to a disk cache.
     #[must_use]
     pub fn parks(&self) -> bool {
@@ -444,6 +520,16 @@ impl Device {
     /// Marks the warm ladder done: every program wanted from now on is
     /// counted (and logged) as a miss.
     pub fn seal(&self) {
+        if let Some(dir) = &self.disk {
+            let held = self.set.lock().expect("cache set lock poisoned").len();
+            tracing::info!(
+                programs = held,
+                bytes = self.set_bytes(),
+                free = free_bytes(dir).unwrap_or(0),
+                dir = %dir.display(),
+                "xla program cache: the load's set, never evicted"
+            );
+        }
         self.sealed_temp.store(
             self.temp_max.load(std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
@@ -723,47 +809,24 @@ fn unpacked(bytes: Vec<u8>) -> Option<Vec<u8>> {
     }
 }
 
-/// The most bytes of serialized programs the disk cache keeps:
-/// `PIE_XLA_CACHE_GB`, default 4. A program is a few hundred MB at a large
-/// model's shapes, so an unbounded cache fills a small disk in a day.
-fn cache_cap() -> u64 {
-    std::env::var("PIE_XLA_CACHE_GB")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .map_or(32 << 30, |gb| (gb * f64::from(1u32 << 30)) as u64)
-}
-
-/// Marks a cached program as just used, so `trim` keeps it longest.
+/// Marks a cached program as just used, so `make_room` keeps it longest.
 fn touch(file: &std::path::Path) {
     if let Ok(f) = std::fs::File::options().append(true).open(file) {
         let _ = f.set_modified(std::time::SystemTime::now());
     }
 }
 
-/// Drops the least recently used programs until `dir` holds at most `cap`
-/// bytes of them.
-fn trim(dir: &std::path::Path, cap: u64) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
-        .filter_map(std::result::Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|x| x == "pjrt"))
-        .filter_map(|e| {
-            let meta = e.metadata().ok()?;
-            Some((meta.modified().ok()?, meta.len(), e.path()))
-        })
-        .collect();
-    let mut total: u64 = files.iter().map(|f| f.1).sum();
-    files.sort_by_key(|f| f.0);
-    for (_, len, path) in files {
-        if total <= cap {
-            break;
-        }
-        if std::fs::remove_file(&path).is_ok() {
-            total -= len;
-        }
+/// The bytes free on the filesystem holding `dir`, where it says.
+#[allow(unsafe_code)]
+fn free_bytes(dir: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a valid C string and `stat` a writable statvfs.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
     }
+    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
 /// The host memory free for new allocations (`MemAvailable`), where the host
