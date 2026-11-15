@@ -502,6 +502,13 @@ impl ProgramOpen {
     /// cuts fires to the widest rung that does
     /// ([`SharedPool::widest_fit`]).
     ///
+    /// Every bind is checked so, not only a pair's first: a later bind
+    /// whose extents give a term (with the pairs already open) that fits at
+    /// no rung is refused the same way, by name, the pool untouched (the
+    /// term, the count and the standing bytes as they were). A refused
+    /// bind is never retried at narrower extents here: that is the
+    /// binder's to ask.
+    ///
     /// The term grows with each bind, so each builds the table it would
     /// leave: here, on the binding task, outside the pool's lock, from the
     /// pairs read under it with this one counted. It is installed, with
