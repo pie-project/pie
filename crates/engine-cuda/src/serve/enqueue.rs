@@ -117,6 +117,7 @@ impl Shell {
         let tapping = self.tapping(p.lanes)?;
         let fire_lanes = self.fire_lanes();
         let mut fire = FireCtx {
+            live: &self.live,
             tapping: tapping.as_ref(),
             device: &self.device,
             trace: &self.trace,
@@ -180,6 +181,9 @@ impl Shell {
 }
 
 struct FireCtx<'a> {
+    /// What the runtime reads of this shell: how a serving fire was served
+    /// is counted on it.
+    live: &'a engine::live::Live,
     /// The fire's taps, when a lane asks for one.
     tapping: Option<&'a crate::tap::Tapping>,
     device: &'a Context,
@@ -881,9 +885,23 @@ impl FireCtx<'_> {
                     rs: p.rs.body,
                 };
 
-                self.cache.fire_body(&fire, &mut run, &place)
+                // A serving fire replays a body or is counted: one that
+                // captures its body as it serves waited on a build the load
+                // did not make, and one that walks ran with none.
+                let before = self.cache.tally();
+                let fired = self.cache.fire_body(&fire, &mut run, &place);
+                if !self.arming {
+                    let after = self.cache.tally();
+                    if after.captures > before.captures {
+                        self.live.tally(engine::live::Tally::Compiled, 1);
+                    } else if after.hits == before.hits {
+                        self.live.tally(engine::live::Tally::Unrecorded, 1);
+                    }
+                }
+                fired
             } else {
                 self.cache.eager_walk(p.rs.body.buffers());
+                self.live.tally(engine::live::Tally::Unrecorded, 1);
                 self.cache.eager_unbodied(
                     p.unbodied
                         .as_deref()

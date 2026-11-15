@@ -579,7 +579,16 @@ impl Chunks {
         if seating.refs.len() <= id as usize {
             seating.refs.resize(id as usize + 1, UNSEATED);
         }
-        seating.refs[id as usize] = chunk * per_chunk + index;
+        // A ref is a u32 the kernels read: past it a product would wrap onto
+        // another slot.
+        seating.refs[id as usize] = chunk
+            .checked_mul(per_chunk)
+            .and_then(|first| first.checked_add(index))
+            .ok_or(Fault::Ceiling {
+                what: "slot refs of the state pool",
+                need: u64::from(chunk) * u64::from(per_chunk) + u64::from(index) + 1,
+                have: u64::from(u32::MAX),
+            })?;
         Ok(self.at(self.table.physical(chunk).unwrap_or(chunk)))
     }
 

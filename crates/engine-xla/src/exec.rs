@@ -83,15 +83,25 @@ fn bind_and_run(
     if device.is_dry() {
         return Ok(Vec::new());
     }
-    let mut uploaded: Vec<(u32, Buffer)> = Vec::new();
-    let mut pack: Option<Buffer> = None;
+    // Bulk data, written into the bulk ring's next slot.
+    let mut bulk: Vec<(u32, usize)> = Vec::new();
     for source in &sig.params {
-        match *source {
-            Source::Input { input } => uploaded.push((input, inputs.upload(device, input)?)),
-            Source::Pack if pack.is_none() => pack = Some(inputs.upload_pack(device)?),
-            _ => {}
+        if let Source::Bulk { input } = *source {
+            let ring = pools.bulk().ok_or_else(|| Fault::Unbound {
+                what: "the bulk ring, which this load did not lay".into(),
+            })?;
+            bulk.push((input, ring.write_bytes(inputs.bulk_bytes(input))?));
         }
     }
+    // The fire's inputs, written into the staging ring's next slot.
+    let slot = if sig.params.contains(&Source::Stage) {
+        let ring = pools.ring().ok_or_else(|| Fault::Unbound {
+            what: "the staging ring, which this load did not lay".into(),
+        })?;
+        Some(ring.write(inputs.image())?)
+    } else {
+        None
+    };
     let donated: Vec<usize> = sig
         .results
         .iter()
@@ -117,9 +127,12 @@ fn bind_and_run(
             }
             Source::Pool { row, plane } => pools.get(row, plane),
             Source::HostBank { param } => pools.host_bank(param),
-            Source::Input { input } => uploaded.iter().find(|(i, _)| *i == input).map(|(_, b)| b),
-            Source::Pack => pack.as_ref(),
-            Source::Temp | Source::Packed { .. } | Source::Streamed { .. } => None,
+            Source::Stage => slot.and_then(|at| pools.ring_buffer(at)),
+            Source::Bulk { input } => bulk
+                .iter()
+                .find(|(i, _)| *i == input)
+                .and_then(|&(_, at)| pools.bulk_buffer(at)),
+            Source::Temp | Source::Staged { .. } | Source::Streamed { .. } => None,
         }
         .ok_or_else(|| Fault::Unbound {
             what: format!("parameter {at} ({source:?}), which nothing on this device holds"),
@@ -127,6 +140,20 @@ fn bind_and_run(
         args.push(Arg::Keep(buffer));
     }
     let outs = device.run(program, args, wait)?;
+    if let Some(at) = slot {
+        // The slot is free again once this fire has run: its pool (or any
+        // output) is ready.
+        let done = outs.first().map(Buffer::ready).transpose()?;
+        if let Some(ring) = pools.ring() {
+            ring.read_by(at, done);
+        }
+    }
+    for &(_, at) in &bulk {
+        let done = outs.first().map(Buffer::ready).transpose()?;
+        if let Some(ring) = pools.bulk() {
+            ring.read_by(at, done);
+        }
+    }
     let mut extra = Vec::new();
     for (out, result) in outs.into_iter().zip(&sig.results) {
         match result {

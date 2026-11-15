@@ -498,6 +498,32 @@ fn copy_ceiling(
 
 const COPY_ALIGN: u64 = 16;
 
+/// The decodes `trace` walks over a row's keys, whole or split: each one's
+/// head width and whether it lands its LSE, once.
+#[must_use]
+pub fn decodes(trace: &Trace) -> Vec<(u32, bool)> {
+    let mut out: Vec<(u32, bool)> = Vec::new();
+    for node in &trace.nodes {
+        let Operation::Attn(Attn::Decode {
+            head_dim,
+            lse,
+            selection: None,
+            bias: None,
+            selected: None,
+            rel: None,
+            ..
+        }) = &node.op
+        else {
+            continue;
+        };
+        let decode = (*head_dim, lse.is_some());
+        if !out.contains(&decode) {
+            out.push(decode);
+        }
+    }
+    out
+}
+
 /// Each route value's expert count, 0 for every other value.
 #[must_use]
 pub fn routers(trace: &Trace) -> Vec<u32> {

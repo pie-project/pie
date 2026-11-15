@@ -623,3 +623,32 @@ fn an_fp8_bank_on_the_matrix_core_folds_each_route() {
         }
     }
 }
+
+/// An FP8 weight past what one buffer descriptor reaches (just under
+/// 4 GiB) is refused by name before anything is launched: the tiles would
+/// read zeros past it, not fail. No memory backs the descriptors; nothing
+/// reads them.
+#[test]
+fn an_fp8_weight_past_a_descriptors_reach_is_refused() {
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let (m, n, k) = (16u32, 262_144u32, 16_384u32);
+    let at = 0x1000u64;
+    let mut y = Tensor::new(at, m, n, Dtype::Bf16);
+    let refused = act_quant::matmul_fp8_quantized(
+        &ctx,
+        "linear.matmul",
+        Tensor::new(at, m, k, Dtype::U8),
+        Tensor::new(at, m, k / 128, Dtype::F32),
+        Tensor::new(at, n, k, Dtype::E4m3),
+        Tensor::new(at, n / 128, k / 128, Dtype::F32),
+        &mut y,
+    )
+    .expect_err("a 4.3 GB FP8 weight is refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("an FP8 weight of 262144 x 16384 codes"),
+        "{refused}"
+    );
+}

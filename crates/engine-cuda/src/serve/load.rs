@@ -771,6 +771,21 @@ impl Shell {
             asked,
             stated_buckets,
         } = bake(&mut boot)?;
+        // What shapes this deployment's bodies, beside the engine build
+        // the record's key carries ([`super::measured`]).
+        let bodies_shape = format!(
+            "{}|{:?}|{}|{:?}|{}|{}|{}|{:?}",
+            boot.checkpoint.display(),
+            std::fs::metadata(boot.checkpoint)
+                .map(|meta| (meta.len(), meta.modified().ok()))
+                .ok(),
+            boot.trace.name,
+            profile,
+            boot.page_size,
+            boot.context,
+            boot.slots,
+            boot.kv_budget,
+        );
         // Every generated kernel compiled and loaded now, before a fire can
         // ask for one.
         let regions =
@@ -1228,11 +1243,12 @@ impl Shell {
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
-        let readout_rows = crate::device::Buffer::zeroed(
+        // A run of the activation's span, laid with the staged inputs.
+        let readout_rows = crate::device::Buffer::lent(
             (boot.budget.max_lanes as usize)
                 .saturating_mul(boot.budget.max_tokens as usize)
                 .saturating_mul(size_of::<u64>()),
-        )?;
+        );
         let adapter_seats = weights.adapter_seats();
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let compiled_towered = compiled.order_for(poem_ir::RowAxis::Patches).is_some();
@@ -1301,7 +1317,13 @@ impl Shell {
             golden_arm: Golden::Off,
             bodies: engine.recording.bodies(),
             bodies_mem: (engine.recording.bodies_mem() as usize).saturating_mul(1 << 20),
+            bodies_record: None,
+            bodies_from_record: false,
+            arming_at_load: false,
+            rearming: false,
+            bodies_took: 0,
             workspace: None,
+            inputs_at: 0,
             decoded_tiles: Vec::new(),
             arming: false,
             armed_body: None,
@@ -1333,6 +1355,9 @@ impl Shell {
             rs_ahead: std::collections::HashMap::new(),
             _released: Released,
         };
+        // The guests' fan streams open with the load, before the fit reads
+        // the card, so a serving fire never creates one.
+        shell.programs.open_fan()?;
         if !shell.graphs.records() {
             eprintln!(
                 "engine-cuda: engine.graphs is {}, a diagnostic mode — every fire \
@@ -1399,6 +1424,32 @@ impl Shell {
             );
         }
         let footprint = |shell: &Shell| footprint(shell, device_total, free_before);
+        // The bodies are held what they took when this deployment last
+        // armed whole, where it is recorded; the configured `bodies_mem` is
+        // the ceiling and what a first boot holds. One number: arming's
+        // allowance is the hold.
+        if shell.records_bodies()
+            && let Some(dir) = boot.cache_dir
+        {
+            let record = super::measured::path(dir, &format!("{bodies_shape}|{:?}", shell.budget));
+            if let Some(measured) = super::measured::read(&record) {
+                let held = usize::try_from(measured.hold()).unwrap_or(usize::MAX);
+                if boot.knobs.diagnostics.arm_trace {
+                    eprintln!(
+                        "[arm-trace] bodies held {} MiB: {} bodies took {} MiB, their captures {} \
+                         MiB, when this deployment last armed whole (bodies_mem {} MiB)",
+                        held.min(shell.bodies_mem) >> 20,
+                        measured.bodies,
+                        measured.bytes >> 20,
+                        measured.captured >> 20,
+                        shell.bodies_mem >> 20,
+                    );
+                }
+                shell.bodies_from_record = held < shell.bodies_mem;
+                shell.bodies_mem = shell.bodies_mem.min(held);
+            }
+            shell.bodies_record = Some(record);
+        }
         let bodies = if shell.records_bodies() {
             shell.bodies_mem as u64
         } else {
@@ -1411,36 +1462,47 @@ impl Shell {
         // arenas, at the size the walk asked of it. A take answers its
         // place, and nothing is allocated for it. The fit comes after, so
         // the cache rows take what the walk leaves.
-        if shell.pools.fresh()
-            && let Some(walked) = shell.size_arming()?
+        // The staged inputs' slab is a run of that span as well, past the
+        // workspaces: one address every body names, under no rung's carve.
+        let walked = if shell.pools.fresh() {
+            shell.size_arming()?
+        } else {
+            None
+        };
+        let placed = walked.as_ref().map(crate::sizing::Footprint::placed);
+        let workspace = placed.as_ref().map_or(0, |placed| {
+            kernels_cuda::jit::Slabs::placed_bytes(placed) as u64
+        });
+        if placed.is_some()
+            && let Some(buffers) = shell.buffers.as_mut()
         {
-            let placed = walked.placed();
-            let workspace = kernels_cuda::jit::Slabs::placed_bytes(&placed) as u64;
-            if let Some(buffers) = shell.buffers.as_mut() {
-                buffers.lay_reach(&mut shell.pools, true)?;
-            }
-            let at = shell.pools.widen_activation(workspace)?;
-            if boot.knobs.diagnostics.arm_trace {
-                eprintln!(
-                    "[arm-trace] size-only walk: {} slabs of {} MiB laid in the activation's \
-                     span: {}",
-                    placed.len(),
-                    workspace >> 20,
-                    walked
-                        .slabs
-                        .iter()
-                        .take(8)
-                        .map(|(name, bytes)| format!("{name}={}", bytes >> 20))
-                        .collect::<Vec<String>>()
-                        .join(" ")
-                );
-            }
-            shell.workspace = Some(Workspace {
-                at,
-                bytes: workspace,
-                slabs: placed,
-            });
+            buffers.lay_reach(&mut shell.pools, true)?;
         }
+        let staged = workspace.next_multiple_of(INPUTS_ALIGN);
+        let runs: u64 = shell.staged_runs().iter().sum();
+        let at = shell.pools.widen_activation(staged.saturating_add(runs))?;
+        shell.inputs_at = at + staged;
+        if boot.knobs.diagnostics.arm_trace {
+            eprintln!(
+                "[arm-trace] size-only walk: {} slabs of {} MiB and the staged inputs' {} MiB \
+                 laid in the activation's span: {}",
+                placed.as_ref().map_or(0, Vec::len),
+                workspace >> 20,
+                shell.inputs.bytes() >> 20,
+                walked.as_ref().map_or_else(String::new, |walked| walked
+                    .slabs
+                    .iter()
+                    .take(8)
+                    .map(|(name, bytes)| format!("{name}={}", bytes >> 20))
+                    .collect::<Vec<String>>()
+                    .join(" "))
+            );
+        }
+        shell.workspace = placed.map(|slabs| Workspace {
+            at,
+            bytes: workspace,
+            slabs,
+        });
         // A load that walked nothing lays the rs scratch for the most any
         // fire may ask.
         if shell.workspace.is_none()
@@ -1490,6 +1552,10 @@ impl Shell {
     }
 }
 
+/// What a buffer the device allocates is aligned to, kept for the staged
+/// inputs' slab in the span.
+const INPUTS_ALIGN: u64 = 4096;
+
 /// The kernels' workspaces, laid in the activation's span past its arenas:
 /// the slabs a size-only walk of the lattice asked for, each at the most it
 /// asked.
@@ -1502,12 +1568,39 @@ pub(crate) struct Workspace {
 }
 
 impl Shell {
+    /// The runs of the activation's span a fire stages into and reads out
+    /// of, in the order they lie from `inputs_at`: the staged inputs' slab,
+    /// the readout rows' table, the voxel store and the rs fold predicates,
+    /// each to
+    /// [`INPUTS_ALIGN`].
+    fn staged_runs(&self) -> [u64; 4] {
+        [
+            self.inputs.bytes(),
+            self.readout_rows.bytes() as u64,
+            self.voxels.as_ref().map_or(0, crate::voxels::Store::bytes),
+            self.predicate.bytes(),
+        ]
+        .map(|bytes| bytes.next_multiple_of(INPUTS_ALIGN))
+    }
+
     /// Backs the workspaces where the range now lies, zeroes them, and has
     /// every take of their slabs answer its place there.
     fn lay_workspace(&mut self) -> Result<()> {
         if let Some(buffers) = &self.buffers {
             buffers.lay_scratch(&mut self.pools)?;
         }
+        let [inputs, readouts, voxels, predicates] = self.staged_runs();
+        let staged = inputs + readouts + voxels + predicates;
+        self.pools
+            .hold_activation_at(self.inputs_at, staged, false)?;
+        let base = self.pools.activation_base() + self.inputs_at;
+        crate::device::zero_span(base, usize::try_from(staged).unwrap_or(0))?;
+        self.inputs.lay(base);
+        self.readout_rows.lay(base + inputs);
+        if let Some(store) = self.voxels.as_mut() {
+            store.lay(base + inputs + readouts);
+        }
+        self.predicate.lay(base + inputs + readouts + voxels)?;
         let Some(workspace) = &self.workspace else {
             return Ok(());
         };
@@ -1590,7 +1683,10 @@ impl Staged {
             // so not where a fire also names windowed pages.
             shell.arm_stepped =
                 shell.arm_stepped && shell.ep.is_none() && !shell.pools.has_windowed();
-            shell.arm_bodies()?;
+            shell.arming_at_load = true;
+            let armed = shell.arm_bodies();
+            shell.arming_at_load = false;
+            armed?;
         }
         let stepping = shell.stepping.is_some();
         let resident = footprint(&shell, device_total, free_before);
@@ -1794,7 +1890,9 @@ fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory:
         ledger.enter(
             Class::Fire,
             "activation span spare",
-            span.saturating_sub(held.arena + workspaces + rs_scratch),
+            span.saturating_sub(
+                held.arena + workspaces + rs_scratch + shell.staged_runs().iter().sum::<u64>(),
+            ),
         );
     }
     ledger.enter(Class::Fire, "inputs", held.inputs);

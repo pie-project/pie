@@ -1427,6 +1427,7 @@ impl KvStore {
     /// planner's: kv list slots of its host tier, whose bytes the engine
     /// reads and writes by those refs (`Engine::read_tier_slots`), not by
     /// `read_host_kv`. `None` off a shared pool, or if the host lacks them.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn alloc_tier_slots(&mut self, n: usize) -> Option<Vec<HostKvSlotId>> {
         self.shape?;
         self.host_pool.try_alloc_n(n)
@@ -1563,6 +1564,7 @@ impl KvStore {
 
     /// `ws` as a snapshot reads it, pinned where it stands until the pin is
     /// released.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn export(
         &mut self,
         ws: WorkingSetId,
@@ -1573,6 +1575,7 @@ impl KvStore {
     }
 
     /// A working set of its own from what `slots` hold.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn import(
         &mut self,
         set: page_table::ExportedSet,

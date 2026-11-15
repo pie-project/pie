@@ -1076,7 +1076,7 @@ pub fn skew(bytes: u64, align: u64) -> u64 {
         return aligned;
     }
     let stepped = align_up(aligned, step);
-    if (stepped / step) % 2 == 0 {
+    if (stepped / step).is_multiple_of(2) {
         stepped + step
     } else {
         stepped

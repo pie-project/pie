@@ -10,6 +10,7 @@
 //! too; one lane holding the rest otherwise). A padding lane reads and writes
 //! only the sink page and the sink slot.
 
+mod size;
 mod stream;
 mod warm;
 
@@ -253,6 +254,11 @@ pub struct Shell {
     /// The warm ladder's second pass: every fire traced as one that stages
     /// expert misses (`crate::store::streamed::Fire::stages`).
     pub(crate) stage_all: bool,
+    /// The stage-only pass (`size`): a fire stops once its inputs are
+    /// staged, before anything is traced, leaving their rows here.
+    sizing: Option<u32>,
+    /// What this load stages its fires' inputs in.
+    staging_facts: StagingFacts,
     /// The host tier (CONTRACT-BC 22): chunks of the pool's size.
     host: crate::store::tier::Host,
     /// The slot file below it, kv list slots.
@@ -387,7 +393,7 @@ impl Shell {
 
     pub fn load_with(boot: Boot<'_>, voxels: Option<poem_compiler::VoxelLadder>) -> Result<Shell> {
         let device = Device::open(boot.device.plugin.as_deref(), boot.device.ordinal as usize)?;
-        Shell::load_on(boot, voxels, device)
+        Shell::load_on(boot, voxels, device, true)
     }
 
     /// A shell over a dry device (`Device::dry`): it traces every fire and
@@ -402,14 +408,57 @@ impl Shell {
         let device = Device::dry(
             compile.then_some((boot.device.plugin.as_deref(), boot.device.ordinal as usize)),
         )?;
-        Shell::load_on(boot, voxels, device)
+        Shell::load_on(boot, voxels, device, true)
     }
 
+    /// What a load of `boot` stages: a stage-only pass over a dry shell of
+    /// the same boot (`size`), its sets as the slab, ring and rungs.
+    fn staging_of(
+        boot: &Boot<'_>,
+        voxels: Option<poem_compiler::VoxelLadder>,
+    ) -> Result<crate::store::Staging> {
+        let started = std::time::Instant::now();
+        let dry = Boot {
+            trace: boot.trace.clone(),
+            budget: boot.budget.clone(),
+            patches: boot.patches.clone(),
+            ..*boot
+        };
+        let mut shell = Shell::load_on(dry, voxels, Device::dry(None)?, false)?;
+        let rungs = shell.staged_sets()?;
+        let rows = rungs.iter().map(|&(_, rows)| rows).max().unwrap_or(0);
+        let staging = crate::store::Staging {
+            rows,
+            slots: boot.device.staging_slots.max(1),
+            rungs,
+        };
+        tracing::info!(
+            ms = started.elapsed().as_secs_f64() * 1e3,
+            slab_rows = staging.rows,
+            slab_bytes = u64::from(staging.rows) * crate::store::layout::ROW_BYTES,
+            ring_slots = staging.slots,
+            ring_bytes = u64::from(staging.rows) * crate::store::layout::ROW_BYTES * u64::from(staging.slots),
+            rungs = ?staging.rungs,
+            "xla staged inputs sized: a slab in the pool, a pinned ring on the host"
+        );
+        Ok(staging)
+    }
+
+    /// `sized`: the load stages its fires' inputs in a slab the stage-only
+    /// pass sized ([`Shell::staging_of`]); the pass's own shell is not.
     fn load_on(
         boot: Boot<'_>,
         voxels: Option<poem_compiler::VoxelLadder>,
         device: Device,
+        sized: bool,
     ) -> Result<Shell> {
+        let pass = std::time::Instant::now();
+        let staging = if sized {
+            Shell::staging_of(&boot, voxels.clone())?
+        } else {
+            crate::store::Staging::default()
+        };
+        let pass_ms = pass.elapsed().as_secs_f64() * 1e3;
         let (chip, chip_report) =
             crate::chip::resolve(device.kind(), boot.device.profiles.as_deref());
         if !device.kind().is_empty() {
@@ -585,6 +634,47 @@ impl Shell {
             rs_layout.as_deref(),
             target,
         )?;
+        // The staging slab is pool bytes past the pages, as the null and
+        // sink are: counted before the pages are fit. It holds a fire's
+        // inputs and a maintenance program's index list, a chunk's worth of
+        // entries and their count (`Pools::units`): a pair a one-row unit at
+        // most.
+        let fit_paging = paging_at(
+            u64::from(boot.context.div_ceil(boot.page_size.max(1))),
+            boot.slots,
+        )?;
+        let chunk_rows = crate::store::layout_of(&boot.trace, fit_paging, rs_layout.as_deref(), target)?
+            .chunk_bytes
+            / crate::store::layout::ROW_BYTES;
+        let listed_rows = u32::try_from(
+            (2 * chunk_rows + 1)
+                .div_ceil(crate::inputs::ROW_WORDS as u64)
+                .next_multiple_of(u64::from(crate::inputs::TILE_ROWS)),
+        )
+        .unwrap_or(u32::MAX);
+        let mut staging = staging;
+        staging.rows = staging.rows.max(listed_rows);
+        let slab = crate::store::slab_bytes(
+            &boot.trace,
+            fit_paging,
+            rs_layout.as_deref(),
+            target,
+            staging.rows,
+        )?;
+        let reserved = reserved + slab;
+        let staging_facts = StagingFacts {
+            pass_ms,
+            slab_rows: staging.rows,
+            slab_bytes: slab,
+            ring_slots: staging.slots,
+            ring_bytes: u64::from(staging.rows)
+                * crate::store::layout::ROW_BYTES
+                * u64::from(staging.slots),
+            rungs: staging.rungs.clone(),
+            // The bulk ring's pinned host bytes, once the pool lays it.
+            bulk_bytes: 0,
+            maintenance: (0, 0.0),
+        };
         // The pool buffers are program parameters, so the pages are fixed
         // before anything traces: what the budget buys, or with none what
         // the share leaves past what others held at open, the weights (at
@@ -733,8 +823,11 @@ impl Shell {
             target,
             Some(&mut streamed),
             boot.device.pool_extra_chunks,
+            &staging,
         )?;
         let mut pools = pools;
+        let mut staging_facts = staging_facts;
+        staging_facts.bulk_bytes = pools.bulk_ring().1;
         streamed.renumber(narrow(pools.layout().shapes.len() as u64) as u32);
         pools.view_weights(&handles, &streamed)?;
         pools.land_host_banks(&device, &handles, &streamed)?;
@@ -850,6 +943,8 @@ impl Shell {
             streamed,
             fire_streamed: None,
             stage_all: false,
+            sizing: None,
+            staging_facts: staging_facts.clone(),
             host: crate::store::tier::Host::default(),
             disk: None,
             exports,
@@ -886,6 +981,31 @@ impl Shell {
     #[must_use]
     pub fn trace(&self) -> &Trace {
         &self.trace
+    }
+
+    /// Compiles (and runs on the null chunk) every maintenance program:
+    /// the slot copy, write and zero at each slot size the pool states.
+    pub fn warm_maintenance(&mut self) -> Result<()> {
+        let started = std::time::Instant::now();
+        let before = self.device.compiled();
+        self.pools.warm_copies(&self.device, &self.handles)?;
+        self.staging_facts.maintenance = (
+            self.device.compiled() - before,
+            started.elapsed().as_secs_f64() * 1e3,
+        );
+        tracing::info!(
+            programs = self.staging_facts.maintenance.0,
+            ms = self.staging_facts.maintenance.1,
+            bulk_ring_bytes = self.staging_facts.bulk_bytes,
+            "xla maintenance programs warmed: one a slot size, any count"
+        );
+        Ok(())
+    }
+
+    /// What this load stages its fires' inputs in.
+    #[must_use]
+    pub fn staging_facts(&self) -> &StagingFacts {
+        &self.staging_facts
     }
 
     #[must_use]
@@ -2053,8 +2173,16 @@ impl Shell {
         let mask = inputs.raw(handles, Dtype::U8, rows, columns, mask_bytes);
         let mask_enabled = inputs.raw(handles, Dtype::U8, rows, 1, enabled_bytes);
 
-        let (readout_rows, readout_layout, readout_indptr) =
+        let (mut readout_rows, readout_layout, readout_indptr) =
             readout_table(&composition, lanes, real)?;
+        // The fire's readout count at a rung, so the program is keyed by the
+        // rung and not by how many rows its lanes read (prompt logprobs, a
+        // draft block): the rows past the count repeat the last, read by no
+        // lane.
+        let want = poem_exec::fire::rung_of(&self.budgets.tokens.buckets, readout_rows.len() as u32);
+        if let Some(&last) = readout_rows.last() {
+            readout_rows.resize((want as usize).max(readout_rows.len()), last);
+        }
         self.readouts.insert(readout_rows.len() as u32);
         let tokens_t = inputs.i32s(handles, &tokens, 1);
         // Tokens a guest pass put on the device: the pool row and lane the
@@ -2363,6 +2491,10 @@ impl Shell {
             dit: dit_bindings,
         };
 
+        if let Some(rows) = self.sizing.as_mut() {
+            *rows = inputs.rows();
+            return Ok(Fired::default());
+        }
         let t1 = std::time::Instant::now();
         // Everything the program text depends on: the walk's windows and
         // descriptor, every input's shape, the page bound and the readout.
@@ -2434,7 +2566,7 @@ impl Shell {
                 readout_rows.len() as i64,
                 &planes,
                 rs_seat,
-                inputs.pack_len(),
+                self.pools.stage_at(inputs.rows()),
                 &lands,
                 pixels_seat.as_ref(),
             )?;
@@ -2465,7 +2597,7 @@ impl Shell {
                     readout_rows.len() as i64,
                     &planes,
                     rs_seat.clone(),
-                    inputs.pack_len(),
+                    self.pools.stage_at(inputs.rows()),
                     &lands,
                     pixels_seat.as_ref(),
                 )?;
@@ -2894,12 +3026,12 @@ impl Shell {
         n: i64,
         planes: &[PlaneShape],
         rs: Option<std::rc::Rc<crate::rs::Seat>>,
-        pack_len: u32,
+        stage: crate::trace::StageAt,
         lands: &[crate::dit::Land],
         pixels: Option<&crate::dit::PixelsSeat>,
     ) -> Result<(std::sync::Arc<crate::device::Program>, Vec<ValueId>)> {
         let (text, sig, probed) = self.trace_text(
-            slots, caches, bindings, windows, descriptor, readout_t, n, planes, rs, pack_len,
+            slots, caches, bindings, windows, descriptor, readout_t, n, planes, rs, stage,
             lands, pixels,
         )?;
         Ok((self.device.program(&text, sig)?, probed))
@@ -2936,12 +3068,12 @@ impl Shell {
         n: i64,
         planes: &[PlaneShape],
         rs: Option<std::rc::Rc<crate::rs::Seat>>,
-        pack_len: u32,
+        stage: crate::trace::StageAt,
         lands: &[crate::dit::Land],
         pixels: Option<&crate::dit::PixelsSeat>,
     ) -> Result<(String, crate::trace::Signature, Vec<ValueId>)> {
         let tracer = Tracer::new(&self.handles)
-            .with_pack(pack_len)
+            .with_stage(stage)
             .with_tuning(self.tuning);
         let place = At::new();
         crate::dit::land(&tracer, &self.handles, slots, lands)?;
@@ -3337,6 +3469,27 @@ fn clips_by_lane<'a>(clips: &[Clips<'a>], lanes: &[Seated<'_>]) -> Result<Vec<Op
 
 fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+/// What a load stages its fires' inputs in, as its load line states it.
+#[derive(Debug, Clone, Default)]
+pub struct StagingFacts {
+    /// The stage-only pass's wall time.
+    pub pass_ms: f64,
+    /// The slab's rows and bytes in the pool (whole chunks).
+    pub slab_rows: u32,
+    pub slab_bytes: u64,
+    /// The ring's pinned host slots and their bytes.
+    pub ring_slots: u32,
+    pub ring_bytes: u64,
+    /// `(rung tokens, rows)` each rung's fires stage.
+    pub rungs: Vec<(u32, u32)>,
+    /// The bulk ring's pinned host bytes (slots of a chunk each): what a
+    /// maintenance program lands comes from there, nothing beside the
+    /// pool on the device.
+    pub bulk_bytes: u64,
+    /// The maintenance programs the load compiled, and the time it took.
+    pub maintenance: (usize, f64),
 }
 
 /// Lane `lane` of the next fire reads its tokens off the device

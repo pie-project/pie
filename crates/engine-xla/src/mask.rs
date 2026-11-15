@@ -10,7 +10,10 @@ pub struct LaneMask<'a> {
 
     pub rows: u32,
 
-    /// The class attends both ways: the enable flag is 2 and, with no stated mask, every bit is kept.
+    /// The class attends both ways: a stated mask's rows are unclipped and
+    /// flagged 2. With none, the lane stages nothing: its non-causal ops
+    /// read every key it holds (the plan's `kv_len`), its causal ops stay
+    /// causal.
     pub wide: bool,
 }
 
@@ -24,7 +27,7 @@ pub struct Staged {
 }
 
 pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
-    if lanes.iter().all(|lane| lane.mask.is_none() && !lane.wide) {
+    if lanes.iter().all(|lane| lane.mask.is_none()) {
         return Ok(None);
     }
 
@@ -32,9 +35,6 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
     for (at, lane) in lanes.iter().enumerate() {
         let kv = u64::from(lane.have) + u64::from(lane.rows);
         let Some(masking) = lane.mask else {
-            if lane.wide {
-                widest = widest.max(kv);
-            }
             continue;
         };
 
@@ -84,14 +84,6 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
         let kv = u64::from(lane.have) + u64::from(lane.rows);
         let flag = if lane.wide { 2 } else { 1 };
         let Some(masking) = lane.mask else {
-            if lane.wide {
-                for q in 0..u64::from(lane.rows) {
-                    out.enabled[row + q as usize] = flag;
-                    for key in 0..kv {
-                        keep(&mut out.bytes, stride, row as u64 + q, key);
-                    }
-                }
-            }
             row += lane.rows as usize;
             continue;
         };
@@ -156,5 +148,23 @@ fn keep(bytes: &mut [u8], stride: u32, row: u64, key: u64) {
     let cell = row * u64::from(stride) + key;
     if let Some(word) = bytes.get_mut(cell as usize) {
         *word = 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LaneMask, stage};
+
+    /// A wide lane that states no mask stages no plane: its non-causal ops
+    /// read to the plan's `kv_len`, its causal ops stay causal.
+    #[test]
+    fn a_wide_lane_with_no_mask_stages_nothing() {
+        let lane = |wide| LaneMask {
+            mask: None,
+            have: 40,
+            rows: 600,
+            wide,
+        };
+        assert_eq!(stage(&[lane(true), lane(false), lane(true)]).unwrap(), None);
     }
 }

@@ -234,6 +234,12 @@ impl Plane {
         }
     }
 
+    /// Opens the side streams a wave's groups fan out to, so no fire opens
+    /// one ([`fan::Fan::open`]).
+    pub fn open_fan(&mut self) -> Result<()> {
+        self.fan.open()
+    }
+
     /// The most lanes one flight of a program carries, whatever the fire's
     /// width: a wider group flies in several.
     pub fn set_flight(&mut self, lanes: u32) {

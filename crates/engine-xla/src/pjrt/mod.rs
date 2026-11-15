@@ -692,6 +692,15 @@ impl Buffer {
         Ok(out)
     }
 
+    /// The buffer's own memory, for a buffer in host memory: a host
+    /// address the program reads in place (pinned host memory written by
+    /// the host between runs).
+    pub fn host_pointer(&self) -> Result<*mut u8> {
+        let mut a = args!(PJRT_Buffer_UnsafePointer_Args { buffer: self.raw });
+        call!(&self.api, PJRT_Buffer_UnsafePointer, &mut a)?;
+        Ok(a.buffer_pointer as *mut u8)
+    }
+
     /// An event that fires once the buffer's defining computation is done.
     pub fn ready(&self) -> Result<Event> {
         let mut a = args!(PJRT_Buffer_ReadyEvent_Args { buffer: self.raw });

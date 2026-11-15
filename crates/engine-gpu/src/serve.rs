@@ -99,6 +99,21 @@ pub trait Serve: Backend {
     /// The highest tier the device runs.
     fn tier(device: &Self::Context) -> kernels_slang::Tier;
 
+    /// Holds the kernels the backend can name from `trace` before any
+    /// fire to what `device` binds, before the load reserves anything: one
+    /// the device cannot bind refuses the load by name here, not at the
+    /// fire that first builds it, and what `tuning` picks between two
+    /// forms of a fire is settled by what binds. A device that binds every
+    /// kernel its build carries holds nothing.
+    fn admit(
+        _device: &Self::Context,
+        _tuning: &mut Self::Tuning,
+        _tier: kernels_slang::Tier,
+        _trace: &Trace,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// The pipelines compiled so far.
     fn compiled(pipelines: &Self::Pipelines) -> u64;
 
@@ -609,7 +624,13 @@ pub struct Shell<B: Serve> {
 
     grafted: Option<B::Pending>,
 
+    /// The rows of the steps that landed and that a ticket can still ask
+    /// for, until they are taken ([`Shell::rows_of`]) or the next frame
+    /// opens ([`Shell::open_frame`]).
     landed: BTreeMap<u64, Vec<Vec<f32>>>,
+
+    /// The first step of the open frame: a step before it lands for nobody.
+    kept_from: u64,
 
     /// The backend's own state.
     pub shelf: B::Shelf,
@@ -663,16 +684,17 @@ pub struct Shell<B: Serve> {
 impl<B: Serve> Shell<B> {
     pub fn load(boot: Boot<'_, B>) -> Result<Shell<B>> {
         let mut boot = boot;
-        let (device, tuning) = B::open(boot.device, boot.residency.device, boot.handed.take())?;
+        let (device, mut tuning) = B::open(boot.device, boot.residency.device, boot.handed.take())?;
         let tier = B::tier(&device);
-        let chip = tuning.profile();
         let mut boot = Boot {
             trace: poem_compiler::fuse::fuse(
                 boot.trace,
-                poem_compiler::fuse::flags::on(chip, B::FUSIONS),
+                poem_compiler::fuse::flags::on(tuning.profile(), B::FUSIONS),
             ),
             ..boot
         };
+        B::admit(&device, &mut tuning, tier, &boot.trace)?;
+        let chip = tuning.profile();
         let weights_held = boot.residency.weights_held;
         let kv_budget = boot.residency.device_kv_budget;
         let host_kv_budget = boot.residency.host_kv_budget;
@@ -1275,6 +1297,7 @@ impl<B: Serve> Shell<B> {
             inflight: VecDeque::new(),
             grafted: None,
             landed: BTreeMap::new(),
+            kept_from: 0,
             shelf,
             patch_seat,
             patch_fold,
@@ -1876,6 +1899,8 @@ impl<B: Serve> Shell<B> {
             .filter(|flight| flight.pixels.values > 0)
             .map(|flight| (self.pixel_out[flight.arm].clone(), flight.pixels.values));
         self.harvest_through(landed.seq)?;
+        // The pixel plane is this fire's answer: nobody asks for its rows.
+        self.landed.remove(&landed.seq);
         let Some((seat, count)) = plane else {
             return Ok(Vec::new());
         };
@@ -2018,15 +2043,23 @@ impl<B: Serve> Shell<B> {
         self.pools.read_record(&units)
     }
 
+    /// Opens a frame: the steps fired from here are the ones a ticket can
+    /// ask for their rows. The rows kept for the frame before are let go,
+    /// and those its steps still in flight land are not kept.
+    pub fn open_frame(&mut self) {
+        self.kept_from = self.airborne.entered();
+        self.landed.clear();
+    }
+
     pub fn rows_of(&mut self, landed: &Landed) -> Result<Vec<Vec<f32>>> {
         self.harvest_through(landed.seq)?;
         self.landed
             .remove(&landed.seq)
             .ok_or_else(|| Fault::Unbound {
                 what: format!(
-                    "step {}'s rows, which have already been taken or have aged out of the \
-                 settled ring — a step's answer lives until the frames behind it have \
-                 pushed it out",
+                    "step {}'s rows, which have already been taken, or whose frame gave \
+                 way to a later one — a step's rows are kept until they are taken or \
+                 the next frame is submitted",
                     landed.seq
                 ),
             })
@@ -2408,10 +2441,10 @@ impl<B: Serve> Shell<B> {
     /// Takes step `seq`'s host `rows` and gives its arm back.
     pub fn land(&mut self, seq: u64, arm: usize, rows: Vec<Vec<f32>>) {
         self.arms.give(arm);
-        self.landed.insert(seq, rows);
-        while self.landed.len() > SETTLED_RING {
-            let oldest = *self.landed.keys().next().expect("non-empty");
-            self.landed.remove(&oldest);
+        // Kept for the frame that can still ask: every step of it, however
+        // many it fired.
+        if seq >= self.kept_from {
+            self.landed.insert(seq, rows);
         }
     }
 
@@ -3588,8 +3621,6 @@ impl<B: Serve> Shell<B> {
     }
 }
 
-const SETTLED_RING: usize = 2 * Runahead::STEPS_MAX as usize;
-
 struct Walked<B: Serve> {
     frame: Option<B::Frame>,
 
@@ -4082,9 +4113,7 @@ fn price_pipelines<B: Serve>(device: &B::Context, pipelines: &B::Pipelines) -> u
     if !B::measures_outside(device) {
         return 0;
     }
-    let _alone = PRICING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _alone = PRICING.lock().expect("pricing lock poisoned");
     let census: Vec<(&'static str, &'static str)> = kernels_slang::CENSUS
         .iter()
         .filter(|(key, _, tier, _)| B::builds(device, key, tier))

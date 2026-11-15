@@ -1,28 +1,34 @@
 //! A fire's inputs: host arrays the shell stages, each a root the program
-//! reads as a parameter. Only what the traced program names is uploaded.
+//! reads. Every input lies in one image of u32 words, each array from a
+//! whole word: the fire writes the image into a slot of the pool's staging
+//! ring (pinned host memory, laid at load) and copies it into the pool's
+//! slab at its start (`crate::store::Pools::stage`). Nothing is uploaded per
+//! fire.
 
 use crate::handle::Tensor;
 use dtype::Dtype;
 
-use crate::device::Device;
-use crate::error::Result;
-use crate::pjrt::Buffer;
 use crate::trace::{Handles, Root, Source};
 
-#[derive(Debug, Clone)]
-struct Array {
-    dtype: Dtype,
-    rows: u32,
-    width: u32,
-    bytes: Vec<u8>,
-}
+/// u32 words a pool row holds.
+pub const ROW_WORDS: usize = 128;
+
+/// Rows a u32 tile takes on the device (`T(8,128)`): a staged image is cut
+/// from its ring slot in whole tiles.
+pub const TILE_ROWS: u32 = 8;
 
 #[derive(Debug, Clone, Default)]
 pub struct Inputs {
-    arrays: Vec<Array>,
-    /// Every i32 input, back to back: one upload per fire instead of one per
-    /// table.
-    pack: Vec<i32>,
+    /// Every input, back to back, each from a whole word.
+    image: Vec<u32>,
+    /// Bulk data a maintenance program lands in the pool (a weight atom
+    /// run, a parked slot's bytes): written into the bulk ring's next slot
+    /// (pinned host memory) when the program runs, not staged, since the
+    /// slab is sized for fire inputs.
+    bulk: Vec<Vec<u8>>,
+    /// What each input is, in staging order: with the fire's windows, what
+    /// the traced program's text depends on.
+    shapes: Vec<(Dtype, u32, u32)>,
 }
 
 impl Inputs {
@@ -31,23 +37,10 @@ impl Inputs {
         Self::default()
     }
 
-    fn push(
-        &mut self,
-        handles: &Handles,
-        dtype: Dtype,
-        rows: u32,
-        width: u32,
-        bytes: Vec<u8>,
-    ) -> Tensor {
-        let input = self.arrays.len() as u32;
-        self.arrays.push(Array {
-            dtype,
-            rows,
-            width,
-            bytes,
-        });
+    fn root(&mut self, handles: &Handles, dtype: Dtype, rows: u32, width: u32, word: u32) -> Tensor {
+        self.shapes.push((dtype, rows, width));
         handles.root(Root {
-            source: Source::Input { input },
+            source: Source::Staged { word },
             dtype,
             rows,
             width,
@@ -55,56 +48,19 @@ impl Inputs {
     }
 
     /// `values` as an i32 `[rows, width]` input (`rows × width` must be its
-    /// length); an empty vector lands as one zero, so every input has a row.
-    /// It rides the fire's pack.
+    /// length); an empty vector lands as one zero row, so every input has a
+    /// row.
     pub fn i32s(&mut self, handles: &Handles, values: &[i32], width: u32) -> Tensor {
         let width = width.max(1);
-        let offset = self.pack.len() as u32;
-        self.pack.extend_from_slice(values);
+        let word = self.image.len() as u32;
+        self.image.extend(values.iter().map(|&v| v as u32));
         if values.is_empty() {
-            self.pack.extend(std::iter::repeat_n(0, width as usize));
+            self.image.extend(std::iter::repeat_n(0, width as usize));
         }
-        let len = self.pack.len() as u32 - offset;
+        let len = self.image.len() as u32 - word;
         let rows = len.div_ceil(width);
-        self.pack.resize((offset + rows * width) as usize, 0);
-        handles.root(Root {
-            source: Source::Packed { offset },
-            dtype: Dtype::I32,
-            rows,
-            width,
-        })
-    }
-
-    /// Where the next `i32s` input starts in the pack.
-    #[must_use]
-    pub fn pack_offset(&self) -> u32 {
-        self.pack.len() as u32
-    }
-
-    /// Elements in the pack.
-    #[must_use]
-    pub fn pack_len(&self) -> u32 {
-        self.pack.len().max(1) as u32
-    }
-
-    /// Uploads the pack.
-    pub fn upload_pack(&self, device: &Device) -> Result<Buffer> {
-        let mut pack = self.pack.clone();
-        if pack.is_empty() {
-            pack.push(0);
-        }
-        let bytes: Vec<u8> = pack.iter().flat_map(|x| x.to_le_bytes()).collect();
-        // `PIE_XLA_DUMP_PACK=<prefix>`: the pack (`<prefix>.i32`) and each
-        // input array (`<prefix>.in<n>`) of the latest fire, for replaying a
-        // `PIE_XLA_DUMP` program offline on real inputs.
-        if let Some(pre) = std::env::var_os("PIE_XLA_DUMP_PACK") {
-            let pre = pre.to_string_lossy().to_string();
-            let _ = std::fs::write(format!("{pre}.i32"), &bytes);
-            for (i, a) in self.arrays.iter().enumerate() {
-                let _ = std::fs::write(format!("{pre}.in{i}"), &a.bytes);
-            }
-        }
-        device.upload_flat(crate::pjrt::ElementType::S32, &bytes, pack.len() as i64)
+        self.image.resize((word + rows * width) as usize, 0);
+        self.root(handles, Dtype::I32, rows, width, word)
     }
 
     /// `values` as an f32 input.
@@ -116,11 +72,12 @@ impl Inputs {
         }
         let rows = (v.len() as u32).div_ceil(width);
         v.resize((rows * width) as usize, 0.0);
-        let bytes = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-        self.push(handles, Dtype::F32, rows, width, bytes)
+        let word = self.image.len() as u32;
+        self.image.extend(v.iter().map(|x| x.to_bits()));
+        self.root(handles, Dtype::F32, rows, width, word)
     }
 
-    /// Raw rows of `dtype`.
+    /// Raw rows of `dtype`, `bytes` as its storage form lays them.
     pub fn raw(
         &mut self,
         handles: &Handles,
@@ -129,40 +86,77 @@ impl Inputs {
         width: u32,
         bytes: Vec<u8>,
     ) -> Tensor {
-        self.push(handles, dtype, rows, width, bytes)
+        let word = self.image.len() as u32;
+        let (whole, tail) = bytes.as_chunks::<4>();
+        self.image.extend(whole.iter().map(|w| u32::from_le_bytes(*w)));
+        if !tail.is_empty() {
+            let mut last = [0u8; 4];
+            last[..tail.len()].copy_from_slice(tail);
+            self.image.push(u32::from_le_bytes(last));
+        }
+        self.root(handles, dtype, rows, width, word)
     }
 
-    /// Uploads input `input`.
-    pub fn upload(&self, device: &Device, input: u32) -> Result<Buffer> {
-        let a = &self.arrays[input as usize];
-        device.upload(a.dtype, a.rows, a.width, &a.bytes)
+    /// `bytes` as bulk data, read by its program as a bulk ring slot of
+    /// `rows` rows, u32 `[rows, 128]`, the bytes first (see [`Inputs`]'s
+    /// `bulk`).
+    pub fn bulk(&mut self, handles: &Handles, rows: u32, bytes: Vec<u8>) -> Tensor {
+        let input = self.bulk.len() as u32;
+        self.shapes.push((Dtype::U32, rows, ROW_WORDS as u32));
+        self.bulk.push(bytes);
+        handles.root(Root {
+            source: Source::Bulk { input },
+            dtype: Dtype::U32,
+            rows,
+            width: ROW_WORDS as u32,
+        })
+    }
+
+    /// Bulk input `input`'s bytes.
+    #[must_use]
+    pub fn bulk_bytes(&self, input: u32) -> &[u8] {
+        &self.bulk[input as usize]
+    }
+
+    /// The image, every input's words.
+    #[must_use]
+    pub fn image(&self) -> &[u32] {
+        &self.image
+    }
+
+    /// Pool rows the image takes, whole tiles of [`TILE_ROWS`] (a pinned
+    /// host slot is cut in whole tiles).
+    #[must_use]
+    pub fn rows(&self) -> u32 {
+        let rows = self.image.len().div_ceil(ROW_WORDS).max(1) as u32;
+        rows.next_multiple_of(TILE_ROWS)
     }
 
     /// Every input's element type and shape, in staging order: with the
     /// fire's windows, what the traced program's text depends on.
     #[must_use]
     pub fn shapes(&self) -> String {
-        let mut out = String::with_capacity(self.arrays.len() * 12);
-        out.push_str(&format!("pack{};", self.pack.len()));
-        for a in &self.arrays {
-            out.push_str(&format!("{:?}{}x{};", a.dtype, a.rows, a.width));
+        let mut out = String::with_capacity(self.shapes.len() * 12 + 8);
+        out.push_str(&format!("stage{};", self.rows()));
+        for (dtype, rows, width) in &self.shapes {
+            out.push_str(&format!("{dtype:?}{rows}x{width};"));
         }
         out
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.arrays.len()
+        self.shapes.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.arrays.is_empty()
+        self.shapes.is_empty()
     }
 
+    /// Bytes the image holds.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.arrays.iter().map(|a| a.bytes.len() as u64).sum()
+        self.image.len() as u64 * 4
     }
 }
-

@@ -112,7 +112,6 @@ impl DepartureWatch {
     }
 
     /// The next departure of a watched process: arm it before looking.
-    #[must_use]
     pub fn next() -> tokio::sync::futures::Notified<'static> {
         GONE.notified()
     }

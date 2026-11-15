@@ -9,6 +9,11 @@ pub struct Buffer {
     /// (`device::held::heap`).
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     carved: Option<(usize, i32)>,
+    /// Another owner's bytes ([`Buffer::over`]): never given back here.
+    lent: bool,
+    /// Whether a lent run lies where its owner laid it; one that does not
+    /// yet stands in ([`Buffer::lent`]).
+    laid: bool,
 }
 
 /// `bytes` of device memory for a [`Buffer`], given back once in its `Drop`,
@@ -119,6 +124,8 @@ impl Buffer {
                 ptr: 0,
                 bytes: 0,
                 carved: None,
+                lent: false,
+                laid: true,
             });
         }
         #[cfg(feature = "device")]
@@ -131,6 +138,8 @@ impl Buffer {
                 ptr: base as u64,
                 bytes,
                 carved,
+                lent: false,
+                laid: true,
             })
         }
         #[cfg(not(feature = "device"))]
@@ -145,6 +154,8 @@ impl Buffer {
                 ptr: 0,
                 bytes: 0,
                 carved: None,
+                lent: false,
+                laid: true,
             });
         }
         #[cfg(feature = "device")]
@@ -164,6 +175,8 @@ impl Buffer {
                 ptr: base as u64,
                 bytes,
                 carved,
+                lent: false,
+                laid: true,
             })
         }
         #[cfg(not(feature = "device"))]
@@ -171,6 +184,54 @@ impl Buffer {
             let _ = stream;
             Err(Fault::Runtimeless)
         }
+    }
+
+    /// `bytes` at `ptr` that another owner holds (a run of the pool's
+    /// activation span): staged into like a buffer, given back by no drop.
+    #[must_use]
+    pub fn over(ptr: u64, bytes: usize) -> Buffer {
+        Buffer {
+            ptr,
+            bytes,
+            carved: None,
+            lent: true,
+            laid: true,
+        }
+    }
+
+    /// Whether a copy into this buffer has nowhere to land: it stands in
+    /// for a run not laid yet, which only a size-only walk
+    /// (`crate::sizing`) may stage into.
+    fn stood_in(&self) -> Result<bool> {
+        // Never by its address: a range the driver places may lie anywhere,
+        // the stand-in span included.
+        if self.laid {
+            return Ok(false);
+        }
+        if crate::sizing::active() {
+            return Ok(true);
+        }
+        Err(Fault::program(
+            "device::alloc",
+            "a fire staged into a run of the activation's span before the load laid it",
+        ))
+    }
+
+    /// `bytes` of a run of the activation's span the load has yet to lay:
+    /// it stands in till [`Buffer::lay`].
+    #[must_use]
+    pub fn lent(bytes: usize) -> Buffer {
+        Buffer {
+            laid: false,
+            ..Buffer::over(crate::sizing::STAND_IN, bytes)
+        }
+    }
+
+    /// The lent run lies at `ptr` from here on.
+    pub fn lay(&mut self, ptr: u64) {
+        debug_assert!(self.lent, "only a lent run is laid");
+        self.ptr = ptr;
+        self.laid = true;
     }
 
     #[must_use]
@@ -249,7 +310,7 @@ impl Buffer {
         bytes: &[u8],
     ) -> Result<()> {
         self.span(offset, bytes.len())?;
-        if bytes.is_empty() {
+        if bytes.is_empty() || self.stood_in()? {
             return Ok(());
         }
         #[cfg(feature = "device")]
@@ -296,6 +357,9 @@ impl Buffer {
     ) -> Result<()> {
         for &(offset, _, len) in spans {
             self.span(offset, len)?;
+        }
+        if self.stood_in()? {
+            return Ok(());
         }
         #[cfg(feature = "device")]
         {
@@ -541,7 +605,7 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         #[cfg(feature = "device")]
-        if self.ptr != 0 {
+        if self.ptr != 0 && !self.lent {
             use crate::device::held::heap::{self, Cell, Kind};
             match self.carved {
                 Some((class, ordinal)) => heap::give(

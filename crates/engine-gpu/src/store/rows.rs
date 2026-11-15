@@ -199,6 +199,9 @@ impl RowsShape {
     }
 }
 
+/// An arm's stage and staged buffers, a table each.
+type Arm<B> = (Vec<<B as Backend>::Buffer>, Vec<<B as Backend>::Buffer>);
+
 /// One row shape's cache: which slot each block lies in, the device's view
 /// of that, the uses counted and the rows staged a fire.
 #[derive(Debug)]
@@ -216,7 +219,7 @@ struct Cache<B: Backend> {
     staged: Vec<B::Buffer>,
     /// The same an arm each, laid by the host before the arm's fire by the
     /// fire's own token ids ([`RowCaches::prestage`]): `[arm][table]`.
-    ring: Vec<(Vec<B::Buffer>, Vec<B::Buffer>)>,
+    ring: Vec<Arm<B>>,
     /// The set is the load's for life.
     held: bool,
     /// The bytes a pool unit of this shape counts: `gcd(chunk, slot)`.

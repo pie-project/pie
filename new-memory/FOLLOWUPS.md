@@ -47,3 +47,26 @@ net / fs; tokio can't replace web-std on wasm32). Cleanups possible on 49 alread
 (Pulley code is never made executable); optionally drop `custom-virtual-memory` and its ~60 lines of hooks (perf check
 first); align web-std's `wasmtime-internal-fiber = "=48.0.1"` pin with wasmtime's version (two fiber crate copies today).
 On a 51 upgrade: check the new default per-store active fiber limit (wasmtime #14971).
+
+## F8 — The SDK's input path refuses unknown keys by name
+An input key the inferlet does not declare is dropped silently today (text-completion-bench took `--copies` and ran
+one copy). Wrap the macro's deserialize so an unknown key is a named refusal.
+
+## F9 — Programs are released
+`engine::Engine` has no unregister (main neither): the runtime's program ids and the role store's programs grow by one
+per program hash for the life of the process. Contract line to add: the runtime tells the engine when a program's
+last instance is gone. With it, text-completion-bench feeds its prompt as data — today it bakes the prompt as a
+constant channel of shape [n], one program per prompt length.
+
+## F10 — GuestTerm at a thousand live pairs
+On an engine that lays lanes in powers of two, a bind that adds or removes a (program, extents) pair across a
+breakpoint rebuilds the table: 39-53 us at 30 pairs x 256 lanes, ~10 ms at 1000 x 1024 (release, thread CPU). `fit`
+skips the rebuild only between breakpoints. CUDA/ROCm rebuild on the lane thread inside the bind. If that size
+becomes real: prefix tables (an append in microseconds), or hand the engine the runtime's table; F9 keeps the size
+from arising.
+
+## F11 — CUDA states the wave's tables once per carried pair
+A fire lays one set of wave tables (a row of channels x 72 + 136 bytes per member, + 320) but each carried pair's
+`FireFacts.fixed` counts it, an upper bound by (pairs carried - 1) x that table: ~1.4 MB at 14 pairs x 256 lanes x 4
+channels. Kept (two more contract fields and a third GuestTerm term cost more than they return); reopened if the
+measured figures come out much larger than the arithmetic.

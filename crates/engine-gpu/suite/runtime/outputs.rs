@@ -49,6 +49,22 @@ impl ForwardHybrid for Outputs {
     }
 }
 
+/// The miniature's table read alone: a lane of it feeds no guest input, so
+/// it fires without an attachment and the host reads its rows.
+struct Rows;
+
+impl ForwardHybrid for Rows {
+    fn states(&self) -> StateRows {
+        StateRows::new()
+    }
+    fn forward(&self, inputs: Input) {
+        let table = Weight::sym("embed", [u64::from(VOCAB), u64::from(WIDTH)], Dtype::Bf16);
+        let x = ops::gather::embed(&inputs.tokens(), &table, VOCAB);
+        let x = ops::gather::gather_rows(&x, &inputs.readout_rows());
+        poem::output("logits", &x, None);
+    }
+}
+
 fn bf(x: f32) -> f32 {
     let bits = x.to_bits();
     f32::from_bits((bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) << 16)
@@ -147,15 +163,42 @@ fn epilogue() -> TraceContainer {
     }
 }
 
-#[test]
-fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
+/// The miniature loaded one frame in flight, an instance of the epilogue
+/// bound, and `t` published.
+struct Bound {
+    engine: backend::Engine,
+    instance: engine::InstanceId,
+    channels: Vec<ChannelId>,
+    t_input: u32,
+    /// The word of a pass of [`ROWS`] tokens.
+    word: u64,
+    planes: BTreeMap<String, (Vec<u64>, Vec<f32>)>,
+    dir: std::path::PathBuf,
+}
+
+const T: f32 = 0.375;
+
+/// The tokens of a pass.
+const ROWS: u32 = 3;
+
+/// A model loaded one frame in flight over the miniature's table.
+struct Loaded {
+    engine: backend::Engine,
+    caps: engine::load::Loaded,
+    trace: Trace,
+    planes: BTreeMap<String, (Vec<u64>, Vec<f32>)>,
+    dir: std::path::PathBuf,
+}
+
+/// `None` without a device. `tag` names the scratch directory.
+fn loaded(tag: &str, model: &impl ForwardHybrid) -> Option<Loaded> {
     let boot = backend::DeviceBoot::default();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
-        return;
+        return None;
     }
     let dir = std::env::temp_dir().join(format!(
-        "pie-{}-outputs-{}",
+        "pie-{}-{tag}-{}",
         backend::NAME,
         std::process::id()
     ));
@@ -165,17 +208,11 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
     let planes = planes();
     write(&path, &planes);
 
-    let trace = poem::trace_hybrid(NAME, &Outputs, backend::PLATFORM);
-    let facts = trace.facts.clone();
-    let t_input = trace
-        .inputs
-        .iter()
-        .position(|input| input.name == "t")
-        .expect("the plan reads `t`") as u32;
+    let trace = poem::trace_hybrid(NAME, model, backend::PLATFORM);
     let mut engine = backend::Engine::new(boot, contract_for);
-    let loaded = engine
+    let caps = engine
         .load(LoadRequest {
-            trace,
+            trace: trace.clone(),
             checkpoint: Checkpoint::Path(path),
             budgets: Budgets {
                 max_lanes: 4,
@@ -199,6 +236,30 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
             frames_in_flight: 1,
         })
         .expect("the miniature loads");
+    Some(Loaded {
+        engine,
+        caps,
+        trace,
+        planes,
+        dir,
+    })
+}
+
+/// `None` without a device. `tag` names the scratch directory.
+fn bound(tag: &str) -> Option<Bound> {
+    let Loaded {
+        mut engine,
+        caps: loaded,
+        trace,
+        planes,
+        dir,
+    } = loaded(tag, &Outputs)?;
+    let facts = trace.facts.clone();
+    let t_input = trace
+        .inputs
+        .iter()
+        .position(|input| input.name == "t")
+        .expect("the plan reads `t`") as u32;
 
     let mut decls: Vec<OutputDecl> = Vec::new();
     for decl in loaded.caps.classes.classes.iter().flat_map(|c| &c.outputs) {
@@ -260,7 +321,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
         id
     })
     .collect();
-    let rows = 3u32;
+    let rows = ROWS;
     let binding = slots.binding(
         &engine,
         InstanceBinding {
@@ -286,18 +347,42 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
         .bind_instance(&binding)
         .expect("the instance binds")
         .id;
-    let t = 0.375f32;
     assert!(
         engine
-            .publish_channel(instance, 2, &t.to_le_bytes())
+            .publish_channel(instance, 2, &T.to_le_bytes())
             .expect("the timestep publishes"),
         "the ring had room"
     );
+    Some(Bound {
+        engine,
+        instance,
+        channels,
+        t_input,
+        word: facts.word(&Request::new(rows, false)),
+        planes,
+        dir,
+    })
+}
 
+#[test]
+fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
+    let Some(Bound {
+        mut engine,
+        instance,
+        channels,
+        t_input,
+        word,
+        planes,
+        dir,
+    }) = bound("outputs")
+    else {
+        return;
+    };
+    let t = T;
     let tokens = vec![3u32, 11, 7];
     let lane = Lane {
         slot: 0,
-        word: facts.word(&Request::new(rows, false)),
+        word,
         tokens: tokens.clone(),
         readout: Readout::Last,
         kv_less: true,
@@ -356,6 +441,64 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
         }
     }
     eprintln!("ids {ids:?} and both stacked layers read back");
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A frame of as many steps as the table has rows, one frame in flight (the
+/// frame settles inside `submit`), every step's rows read by the host: each
+/// step's rows come back, the first ones among them.
+#[test]
+fn a_frame_of_many_steps_settles_every_step_one_frame_in_flight() {
+    let Some(Loaded {
+        mut engine,
+        trace,
+        planes,
+        dir,
+        ..
+    }) = loaded("many-steps", &Rows)
+    else {
+        return;
+    };
+    let word = trace.facts.word(&Request::new(ROWS, false));
+    let argmax = |values: &[f32]| {
+        (0..values.len())
+            .max_by(|&a, &b| values[a].total_cmp(&values[b]))
+            .expect("a row")
+    };
+    // Each step reads another token last: its row is its own.
+    let last: Vec<u32> = (0..VOCAB).collect();
+    let steps: Vec<Step> = last
+        .iter()
+        .map(|&token| Step {
+            lanes: vec![Lane {
+                slot: 0,
+                word,
+                tokens: vec![3, 11, token],
+                readout: Readout::Last,
+                kv_less: true,
+                ..Lane::default()
+            }],
+            attachments: Vec::new(),
+            media: Vec::new(),
+            voxels: Vec::new(),
+        })
+        .collect();
+    let mut ticket = engine
+        .submit(&FrameSubmission { steps })
+        .expect("a frame of many steps fires and settles");
+    engine.settle_frame(&mut ticket).expect("the frame settles");
+    assert_eq!(ticket.steps.len(), last.len());
+    for (step, &token) in ticket.steps.iter().zip(&last) {
+        let row = &planes["embed"].1[(token * WIDTH) as usize..][..WIDTH as usize];
+        let got = &step.readouts[0].values;
+        assert_eq!(got.len(), WIDTH as usize, "token {token}'s step read a row");
+        assert_eq!(
+            argmax(got),
+            argmax(row),
+            "token {token}'s step read its own row: {got:?} against {row:?}"
+        );
+    }
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
 }

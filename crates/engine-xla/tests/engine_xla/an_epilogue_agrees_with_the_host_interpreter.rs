@@ -1555,7 +1555,10 @@ fn a_guest_group_pass_is_timed() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(32768);
-    let lanes = 64u32;
+    let lanes: u32 = std::env::var("PIE_XLA_GUEST_BENCH_LANES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
     let (container, out) = carrying(vocab);
     let outs = [out];
     let plan = plan_of(container, vocab);

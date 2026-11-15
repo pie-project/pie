@@ -223,7 +223,6 @@ pub fn nothing_freed(tier: Tier) -> u64 {
 }
 
 /// The next [`answered_nothing`]: arm it before looking.
-#[must_use]
 pub fn answered() -> tokio::sync::futures::Notified<'static> {
     ANSWERED.notified()
 }

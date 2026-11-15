@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 pub use crate::boot::{Embedded, Engine, Loaded, Summary};
 use crate::config::removed::{self, Removed};
-use crate::config::{ByteSize, Config, EngineKind};
+use crate::config::{ByteSize, Config, EngineKind, Runahead};
 
 /// The knobs an app sets (`PieServer.Configuration` in Swift and Kotlin, the
 /// browser's boot config), laid onto a worker [`Config`] sized for a phone or
@@ -31,7 +31,11 @@ pub struct Settings {
     pub governor_release_idle: bool,
     pub sandbox_memory_mb: u64,
     pub max_concurrent_processes: Option<usize>,
+    /// See [`crate::config::RuntimeConfig::frame_size`]. An app serves few
+    /// lanes, so it defaults to the most waves a frame takes
+    /// ([`Runahead::STEPS_MAX`]), the bound the worker config checks it by.
     pub frame_size: u32,
+    /// See [`crate::config::RuntimeConfig::frame_dispatch_depth`].
     pub frame_dispatch_depth: u32,
     pub verbose: bool,
     #[serde(skip_serializing)]
@@ -64,7 +68,7 @@ impl Default for Settings {
             governor_release_idle: false,
             sandbox_memory_mb: 512,
             max_concurrent_processes: None,
-            frame_size: 8,
+            frame_size: u32::from(Runahead::STEPS_MAX),
             frame_dispatch_depth: 2,
             verbose: false,
             max_forward_tokens: Removed::default(),
@@ -143,15 +147,12 @@ impl Settings {
         let mut set = |key: &str, value: toml::Value| {
             options.insert(key.into(), value);
         };
-        match kind {
-            EngineKind::Vulkan => {
-                let cache = home.join("vulkan-pipelines.bin");
-                set(
-                    "pipeline_cache",
-                    cache.to_string_lossy().into_owned().into(),
-                );
-            }
-            _ => {}
+        if kind == EngineKind::Vulkan {
+            let cache = home.join("vulkan-pipelines.bin");
+            set(
+                "pipeline_cache",
+                cache.to_string_lossy().into_owned().into(),
+            );
         }
         options
     }
@@ -185,4 +186,19 @@ pub async fn recv_frames(session: u32, max_wait_ms: u64, max: usize) -> Result<V
         .iter()
         .map(|message| rmp_serde::to_vec_named(message).map_err(anyhow::Error::from))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What an app that states nothing boots with is a config the worker
+    /// takes: each default sits inside the bound `Config::validate` holds it to.
+    #[test]
+    fn the_default_settings_lay_a_valid_config() {
+        let config = Settings::default()
+            .config(Path::new("model.zt"), Path::new("home"))
+            .expect("the default settings validate");
+        assert_eq!(config.runtime.frame_size, u32::from(Runahead::STEPS_MAX));
+    }
 }

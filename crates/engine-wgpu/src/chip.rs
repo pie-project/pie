@@ -90,7 +90,7 @@ mod tests {
         };
         let (profile, report) = resolve(&d, None);
         assert_eq!(report.used, profile::Source::Defaults);
-        let t = crate::tuning::Tuning::new(profile, UNREPORTED_CORES, 0);
+        let t = crate::tuning::Tuning::new(profile, UNREPORTED_CORES);
         assert_eq!(
             (
                 t.sdpa_tile_rows_per_request(),

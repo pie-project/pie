@@ -5,6 +5,7 @@ pub mod diag;
 mod enqueue;
 mod lanes;
 mod load;
+mod measured;
 pub use load::Staged;
 mod prepare;
 mod segments;
@@ -127,9 +128,25 @@ pub struct Shell {
     pad: bool,
     bodies: bool,
     bodies_mem: usize,
+    /// Where this deployment's measured bodies are recorded
+    /// ([`measured`]), once every rung arms; none without a cache dir.
+    bodies_record: Option<std::path::PathBuf>,
+    /// The bodies' allowance is a record's figure, not the configured
+    /// ceiling: a load that then arms short of whole drops the record.
+    bodies_from_record: bool,
+    /// The load's own arming is under way: its pool is not backed yet.
+    arming_at_load: bool,
+    /// A re-arm within the load is under way, allowed what the load's own
+    /// arming took ([`Shell::rearm_bodies`]).
+    rearming: bool,
+    /// What the last arming's captures took, which a re-arm within the
+    /// same load is allowed.
+    bodies_took: u64,
     /// The kernels' workspaces in the activation's span, once a load has
     /// walked what its fires take.
     workspace: Option<load::Workspace>,
+    /// Where the staged inputs' slab starts in the activation's span.
+    inputs_at: u64,
     decoded_tiles: Vec<u64>,
     arming: bool,
     golden_arm: Golden,

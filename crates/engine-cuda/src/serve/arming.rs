@@ -95,6 +95,23 @@ pub(super) struct Arming {
     starved: Option<u64>,
     peer_stopped: bool,
     unit_margin: u64,
+    /// The bodies' allowance is a record's measurement
+    /// ([`super::measured`]): the lattice arms as recorded, unpriced, and
+    /// no headroom estimate stops it.
+    from_record: bool,
+    /// The allowance caps arming. Not at load on a record's figure: the
+    /// pool is not backed yet, so the figure is the fit's reservation, and
+    /// the finish fit accounts what the bodies took; only a device failure
+    /// stops arming there.
+    capped: bool,
+    /// A capture found no device room on a record's allowance while the
+    /// shell served: arming stopped there and the rest walk eagerly.
+    record_short: bool,
+    /// What the device's free memory fell by across each composition's
+    /// fires, less what the pool backed in that window, summed: what the
+    /// captures took, and nothing the pool, serving or the runtime took
+    /// between them. None where free memory cannot be read.
+    took: Option<u64>,
     /// The buckets of the profile's lattice, before arming coarsened any
     /// away.
     profiled: usize,
@@ -1123,6 +1140,24 @@ impl Shell {
         dropped
     }
 
+    /// Forgets the recorded bodies and arms the lattice again within the
+    /// same load, allowed what its last arming took: the pool is backed by
+    /// now and those bodies' memory is what the forgetting frees, whatever
+    /// the record said. Capped by that figure, as stepped arming is.
+    pub(super) fn rearm_bodies(&mut self) -> Result<()> {
+        self.cache.forget_bodies();
+        self.bodies_mem = self
+            .bodies_mem
+            .max(usize::try_from(self.bodies_took).unwrap_or(usize::MAX));
+        // A measured allowance, as a record's is: the estimates a load that
+        // knows nothing prices by are not consulted (on a flat range backed
+        // whole they read no spare at all).
+        self.rearming = true;
+        let armed = self.arm_bodies();
+        self.rearming = false;
+        armed
+    }
+
     pub(super) fn arm_bodies(&mut self) -> Result<()> {
         let armed = self.arm_lattice(false);
         self.pools.forget_weight_uses(self.device.stream())?;
@@ -1488,6 +1523,10 @@ impl Shell {
             starved: None,
             peer_stopped: false,
             unit_margin: self.pools.arming_margin_bytes(),
+            from_record: self.bodies_from_record || self.rearming,
+            capped: !(self.bodies_from_record && self.arming_at_load),
+            record_short: false,
+            took: Some(0),
             profiled: self.budget.buckets.len(),
             ballot: Ballot::open(&self.device),
         })
@@ -1604,7 +1643,9 @@ impl Shell {
                 // Every rung is stated armed only where every composition
                 // the lattice planned holds a body: a fire past that would
                 // walk eagerly.
-                let whole = st.whole();
+                // A record's allowance that fell short stopped arming on
+                // purpose: the line is said and the record dropped.
+                let whole = if st.record_short { Ok(()) } else { st.whole() };
                 self.arm_end(st)?;
                 whole?;
                 self.settle()?;
@@ -1635,7 +1676,8 @@ impl Shell {
         target: BodySynth,
         rs: record::RsBody,
     ) -> Result<()> {
-        if !st.priced && st.narrower(bucket, &target) {
+        // A record says the lattice fit whole: it arms as recorded.
+        if !st.priced && !st.from_record && st.narrower(bucket, &target) {
             st.priced = true;
             // What is still to arm: the narrower targets a coarser lattice
             // may drop, and the rest (the top bucket's, the decodes'), which
@@ -1669,10 +1711,12 @@ impl Shell {
         // allowance the fit held under the margin would otherwise stop
         // arming before its first body.
         let margin = price.max(st.unit_margin.min(self.bodies_mem as u64 / 4));
-        let headroom = spare < margin;
+        // Estimated where nothing is known; a record's allowance is a
+        // measurement, and the headroom estimate is not consulted.
+        let headroom = !st.from_record && spare < margin;
         let mine = !st.verify
             && (spent.census.bodies >= record::MAX_BODIES
-                || spent.census.bytes >= self.bodies_mem
+                || (st.capped && spent.census.bytes >= self.bodies_mem)
                 || headroom);
         let stop = match self.ep.as_ref() {
             // The group's ranks fire one sequence of steps: the allowance
@@ -1707,6 +1751,8 @@ impl Shell {
         }
         let owned = self.synthetic_lanes_with(&lanes, &media);
         self.armed_body = None;
+        let free_before = crate::device::free_bytes();
+        let backed_before = self.pools.backed_bytes();
         let idle = matches!(target, BodySynth::Idle);
         for _ in 0..record::WARM_FIRES {
             if idle {
@@ -1717,6 +1763,19 @@ impl Shell {
             if let Err(why) = fired.and(landed) {
                 if super::diag::on().arm_trace {
                     eprintln!("[arm-trace] refused bucket {bucket}, {target}: {why}");
+                }
+                // On a record's allowance a capture short of device room
+                // stops arming here, not the load: the rest walk eagerly,
+                // and arming's end drops the record and says so.
+                if self.lent.is_some() && st.from_record && why.out_of_room() {
+                    st.refused = Some(format!("bucket {bucket}, {target}: {why}"));
+                    if st.never == 0 {
+                        st.never_from = bucket;
+                    }
+                    st.never += st.targets.len();
+                    st.targets.clear();
+                    st.record_short = true;
+                    break;
                 }
                 // A lattice arming while the shell serves leaves no key to
                 // walk eagerly: a refusal there is the step's fault.
@@ -1739,6 +1798,17 @@ impl Shell {
             }
         }
         self.arm_cold = false;
+        // What the pool backed across the window (a mapped range backs the
+        // activation's holds and segments as the fires first touch them) is
+        // the pool's, not the capture's; a flat range, allocated, backs none.
+        let pool_grew = self.pools.backed_bytes().saturating_sub(backed_before);
+        st.took = st
+            .took
+            .zip(free_before)
+            .zip(crate::device::free_bytes())
+            .map(|((took, before), after)| {
+                took + before.saturating_sub(after).saturating_sub(pool_grew)
+            });
         let key = self.armed_body.take();
         let warmed_ms = began.elapsed().as_secs_f64() * 1000.0;
         let mut golden_ms = (0f64, 0f64);
@@ -1939,6 +2009,46 @@ impl Shell {
             self.budget.buckets.len(),
             st.profiled
         );
+        // The record: written where every rung armed, at what the bodies
+        // took and what their captures took; dropped, and said, where a record's
+        // allowance armed short of whole.
+        if let Some(record) = self.bodies_record.as_deref()
+            && !st.verify
+        {
+            let took = stats.census.bytes as u64;
+            let captured = st.took.unwrap_or(took);
+            // What this arming took, the allowance a re-arm within the same
+            // load starts from ([`Shell::rearm_bodies`]).
+            self.bodies_took = captured.max(took);
+            let measured = super::measured::Measured {
+                bytes: took,
+                bodies: stats.census.bodies as u64,
+                captured,
+            };
+            if super::diag::on().arm_trace {
+                eprintln!(
+                    "[arm-trace] arming's captures took {} MiB; {} bodies weigh {} MiB",
+                    captured >> 20,
+                    measured.bodies,
+                    took >> 20,
+                );
+            }
+            match super::measured::conclude(
+                record,
+                self.bodies_from_record,
+                matches!(seal, Seal::Complete),
+                measured,
+                st.armed,
+                st.wanted + st.never,
+            ) {
+                Ok(Some(line)) => eprintln!("{line}"),
+                Ok(None) => {}
+                Err(why) => eprintln!(
+                    "engine-cuda: WARNING: the bodies' record at {} is not kept: {why}",
+                    record.display()
+                ),
+            }
+        }
         // A load that records bodies serves every composition it fires from
         // one: one that armed none, or stopped arming for want of room, would
         // serve eagerly, which is never what a deployment asked for.
@@ -2257,6 +2367,10 @@ mod tests {
             starved: None,
             peer_stopped: false,
             unit_margin: 0,
+            from_record: false,
+            capped: true,
+            record_short: false,
+            took: None,
             profiled: 0,
             ballot: Ballot { slip: None },
         }

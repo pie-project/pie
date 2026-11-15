@@ -207,8 +207,10 @@ pub trait Tactics: std::fmt::Debug {
     /// Paged attention for `head_dim`-wide heads.
     fn sdpa(&self, tier: kernels_slang::Tier, head_dim: u32) -> kernels_slang::attn::sdpa::Tactic;
 
-    /// Whether the device binds a split decode's planes (and its LSE's).
-    fn binds_split(&self, _lse: bool) -> bool {
+    /// Whether the device binds the split walk of a decode of
+    /// `head_dim`-wide heads (`lse` where it lands its LSE), its planes
+    /// beside the whole walk's.
+    fn binds_split(&self, _head_dim: u32, _lse: bool) -> bool {
         true
     }
 

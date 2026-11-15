@@ -118,7 +118,6 @@ pub fn rung_changed(engine: usize) {
 /// The next [`rung_changed`] of `engine`, armed before the caller looks at
 /// what it waits on, so a change between the look and the wait is not
 /// lost: pin it, `enable` it, look, then await it.
-#[must_use]
 pub fn rung_watch(engine: usize) -> tokio::sync::futures::Notified<'static> {
     rung_gate(engine).event.notified()
 }

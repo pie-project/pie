@@ -69,7 +69,6 @@ pub struct PullLane {
     pub ticket_offset: u32,
     pub ticket_count: u32,
     pub initial_commit: u32,
-    pub diagnose: u32,
 }
 
 const _: () = assert!(
@@ -350,11 +349,13 @@ pub fn gather_bits(ctx: &Ctx, src: DevicePtr, dst: DevicePtr, bits: u32) -> Resu
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BitRun {
     pub src: DevicePtr,
-    pub dst_byte: u32,
+    /// Where the run lands in the fire's masks: 64-bit, as their offsets.
+    pub dst_byte: u64,
     pub bits: u32,
+    pub _pad: u32,
 }
 
-const _: () = assert!(size_of::<BitRun>() == 16);
+const _: () = assert!(size_of::<BitRun>() == 24);
 
 /// Packs each of `run_count` [`BitRun`]s at `runs` into `dst`, a block a run.
 pub fn gather_bit_runs(

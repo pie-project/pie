@@ -1610,7 +1610,6 @@ fn tables_agree<T: Stored>(
 }
 
 /// Validates the fire tables; the plan carries them into the attention.
-/// `kv_len` is not read: the pool's CSR and the positions carry the lengths.
 pub fn plan_decode<T: Stored>(
     kv_len: T,
     positions: T,
@@ -1619,7 +1618,6 @@ pub fn plan_decode<T: Stored>(
     mask_enabled: T,
     mask_stride: u32,
 ) -> Result<DecodePlan<T>, Error> {
-    let _ = kv_len;
     tables_agree(
         "attn.plan_decode",
         positions,
@@ -1628,6 +1626,7 @@ pub fn plan_decode<T: Stored>(
         mask_enabled,
     )?;
     Ok(DecodePlan {
+        kv_len,
         positions,
         request_of_token,
         mask,
@@ -1644,7 +1643,6 @@ pub fn plan_prefill<T: Stored>(
     mask_enabled: T,
     mask_stride: u32,
 ) -> Result<PrefillPlan<T>, Error> {
-    let _ = kv_len;
     tables_agree(
         "attn.plan_prefill",
         positions,
@@ -1653,6 +1651,7 @@ pub fn plan_prefill<T: Stored>(
         mask_enabled,
     )?;
     Ok(PrefillPlan {
+        kv_len,
         positions,
         request_of_token,
         mask,
@@ -1664,6 +1663,8 @@ pub fn plan_prefill<T: Stored>(
 /// The fire tables an attention reads, whichever plan carried them.
 #[derive(Clone, Copy, Debug)]
 pub struct Tables<T> {
+    /// Each lane's keys once the fire lands: a wide row reads to here.
+    pub kv_len: T,
     pub positions: T,
     pub request_of_token: T,
     pub mask: T,
@@ -1674,6 +1675,7 @@ pub struct Tables<T> {
 impl<T: Copy> Tables<T> {
     pub(crate) const fn decode(p: &DecodePlan<T>) -> Self {
         Self {
+            kv_len: p.kv_len,
             positions: p.positions,
             request_of_token: p.request_of_token,
             mask: p.mask,
@@ -1684,6 +1686,7 @@ impl<T: Copy> Tables<T> {
 
     pub(crate) const fn prefill(p: &PrefillPlan<T>) -> Self {
         Self {
+            kv_len: p.kv_len,
             positions: p.positions,
             request_of_token: p.request_of_token,
             mask: p.mask,
@@ -1890,11 +1893,17 @@ impl<T: Stored> Paged<T> {
             None => None,
         };
         let (mask, mask_enabled) = masks.unwrap_or((positions, positions));
+        let kv_len = if !self.causal {
+            read(self.tables.kv_len)?
+        } else {
+            positions
+        };
         Ok((
             Paged {
                 op: self.op,
                 q,
                 tables: Tables {
+                    kv_len,
                     positions,
                     request_of_token,
                     mask,
@@ -2109,12 +2118,18 @@ pub fn attend_fresh(
     } else {
         f.like_i(qpos, 0)
     };
-    // Causal end (exclusive), or the lane's whole capacity for a wide
-    // row (non-causal, or a row whose mask flag is 2).
+    // Causal end (exclusive); a non-causal row reads every key its lane
+    // holds once the fire lands (the plan's `kv_len`). A causal row whose
+    // mask flag is 2 (a wide lane's stated mask) reads to the lane's
+    // capacity, its plane bounding it at the lane's keys.
     let upto = with_i(f, qpos, 1, Func::add)?;
     let causal_hi = f.min(upto, cap)?;
     let hi = match (call.causal, enabled) {
-        (false, _) => cap,
+        (false, _) => {
+            let kv = flat_i32(f, t.kv_len.val)?;
+            let kv = take(f, kv, lane)?;
+            f.min(kv, cap)?
+        }
         (true, Some(en)) => {
             let wide = cmp_i(f, Cmp::Eq, en, 2)?;
             f.select(wide, cap, causal_hi)?
@@ -2234,11 +2249,11 @@ pub fn attend_fresh(
                 )
             };
             let cap_v = tuning.vmem_cap();
-            // Causal rows with no relative bias read nothing past themselves
-            // and nothing but their scaled scores; a fire of decodes beside
-            // a prompt (a few rows a lane) walks as it did.
-            let plain = call.causal
-                && rule.rel.is_none()
+            // Rows with no relative bias read their [lo, hi) and nothing but
+            // their scaled scores (causal, or wide to the lane's keys); a
+            // fire of decodes beside a prompt (a few rows a lane) walks as
+            // it did.
+            let plain = rule.rel.is_none()
                 && call.o.dtype == Dtype::Bf16
                 && r >= 4 * geom.lanes;
             // The flash read keeps the table's pages (the fresh rows are
@@ -2548,6 +2563,7 @@ pub fn window_sink<T: Stored>(
     lse: T,
 ) -> Result<Paged<T>, Error> {
     let tables = Tables {
+        kv_len: positions,
         positions,
         request_of_token,
         mask: positions,

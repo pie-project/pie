@@ -231,9 +231,48 @@ fn lse_plane(op: &'static str, lse: Tensor, shape: &Shape) -> Result<ArgValue, E
     Ok(lse.arg_mut())
 }
 
+/// The kind a decode's walk of a row's keys is instantiated under: whole or
+/// split into ranges, landing the row's LSE or not.
+fn walk_kind(split: bool, lse: bool) -> &'static str {
+    match (split, lse) {
+        (false, false) => "decode",
+        (false, true) => "decode_lse",
+        (true, false) => "split",
+        (true, true) => "split_lse",
+    }
+}
+
+/// The kernels a decode of `head_dim`-wide heads fires on `target` under
+/// `tactic` (`lse` where it lands its LSE): the walk of a row's keys whole,
+/// then the walk that splits them. A load holds them to its device before
+/// any fire names one.
+pub fn decode_kernels(
+    target: Target,
+    tactic: Tactic,
+    head_dim: u32,
+    lse: bool,
+) -> Result<[Fire; 2], Error> {
+    Ok([
+        decode_entry(
+            target,
+            "attn.decode",
+            tactic,
+            walk_kind(false, lse),
+            head_dim,
+        )?,
+        decode_entry(
+            target,
+            "attn.decode_split",
+            tactic,
+            walk_kind(true, lse),
+            head_dim,
+        )?,
+    ])
+}
+
 /// A decode workgroup's entry: `kind`, then its thread and lane variants.
 fn decode_entry(
-    ctx: &Ctx<'_>,
+    target: Target,
     op: &'static str,
     tactic: Tactic,
     kind: &str,
@@ -244,7 +283,7 @@ fn decode_entry(
     } else {
         128
     };
-    let subgroup = tactic.tier == Tier::Subgroup && ctx.target() == Target::Spirv;
+    let subgroup = tactic.tier == Tier::Subgroup && target == Target::Spirv;
     let name = format!(
         "attn_sdpa_{kind}{}{}_bf16_d_{head_dim}",
         if threads < 256 { "_t128" } else { "" },
@@ -304,14 +343,10 @@ pub fn decode(
         extra.push(lse_plane(OP, lse, &shape)?);
     }
     let fire = decode_entry(
-        ctx,
+        ctx.target(),
         OP,
         tactic,
-        if lse.is_some() {
-            "decode_lse"
-        } else {
-            "decode"
-        },
+        walk_kind(false, lse.is_some()),
         head_dim,
     )?;
     let args = args(OP, q, pool, tables, &shape, sm_scale, o, &extra)?;
@@ -370,10 +405,10 @@ fn decode_split(
         extra.push(lse_plane(OP, lse, shape)?);
     }
     let fire = decode_entry(
-        ctx,
+        ctx.target(),
         OP,
         tactic,
-        if lse.is_some() { "split_lse" } else { "split" },
+        walk_kind(true, lse.is_some()),
         head_dim,
     )?;
     let mut args = args(OP, q, pool, tables, shape, sm_scale, o, &extra)?;
@@ -442,7 +477,7 @@ pub fn selected(
             ),
         ));
     }
-    let fire = decode_entry(ctx, OP, tactic, "selected", head_dim)?;
+    let fire = decode_entry(ctx.target(), OP, tactic, "selected", head_dim)?;
     let mut args = args(OP, q, pool, tables, &shape, sm_scale, o, &[selection.arg()])?;
     args.extend([stated(OP, top_k)?.arg(), stated(OP, ratio)?.arg()]);
     ctx.fire(fire.groups([shape.q_heads, shape.rows, 1]), &args)
@@ -522,4 +557,49 @@ pub fn prefill(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A decode's kernels are named before any fire, as the fire names
+    /// them: the whole walk and the split one, their LSE forms, at the
+    /// tactic's threads; a head width no kernel is built at names none.
+    #[test]
+    fn a_decodes_kernels_are_named_without_a_fire() {
+        let tactic = Tactic {
+            tier: Tier::Baseline,
+            narrow: false,
+            decode_threads: 256,
+            tile_rows: 16,
+            tile_lanes: 16,
+            split_groups: 1,
+            split_min_keys: 1,
+            prefill_work: 0,
+        };
+        let names = |tactic, head_dim, lse| {
+            decode_kernels(Target::Wgsl, tactic, head_dim, lse)
+                .map(|fires| fires.map(|fire| (fire.file, fire.entrypoint, fire.tier)))
+        };
+        assert_eq!(
+            names(tactic, 64, false).unwrap(),
+            [
+                (SDPA, "attn_sdpa_decode_bf16_d_64", Tier::Baseline),
+                (SDPA, "attn_sdpa_split_bf16_d_64", Tier::Baseline),
+            ]
+        );
+        let narrow = Tactic {
+            decode_threads: 128,
+            ..tactic
+        };
+        assert_eq!(
+            names(narrow, 128, true).unwrap(),
+            [
+                (SDPA, "attn_sdpa_decode_lse_t128_bf16_d_128", Tier::Baseline),
+                (SDPA, "attn_sdpa_split_lse_t128_bf16_d_128", Tier::Baseline),
+            ]
+        );
+        assert!(names(tactic, 96, false).is_err());
+    }
 }

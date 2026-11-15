@@ -321,7 +321,7 @@ impl Lane {
     /// The next request, `idle` called while none waits for as long as it
     /// answers there is more to do (one bounded piece a call).
     fn next_request(
-        engine_idx: usize,
+        #[cfg_attr(target_arch = "wasm32", allow(unused_variables))] engine_idx: usize,
         launch_rx: &crate::rt::channel::Receiver<LaneRequest>,
         control_rx: &crate::rt::channel::Receiver<LaneRequest>,
         turn: &mut LaneTurn,
