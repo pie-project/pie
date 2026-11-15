@@ -302,13 +302,52 @@ fn load_alone(
         chunk_bytes: chunk,
         ..DeviceBoot::default()
     };
+    let residency = allowed(&device, residency)?;
+    Some(
+        Shell::load(boot(fixture, page, context, &device, residency))
+            .unwrap_or_else(|why| panic!("the shell loads: {why}")),
+    )
+}
+
+/// The boot of a suite load of `fixture` on `device`.
+fn boot<'a>(
+    fixture: &'a Fixture,
+    page: u32,
+    context: u32,
+    device: &'a DeviceBoot,
+    residency: engine::load::Residency,
+) -> Boot<'a> {
+    Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(SEATS, 256),
+        patches: None,
+        voxels: None,
+        profile: None,
+        page_size: page,
+        context,
+        slots: SEATS,
+        runahead: engine::runahead::Runahead::F1,
+        device,
+        residency,
+        handed: None,
+    }
+}
+
+/// `residency` with the device's budget a quarter of what it has where it
+/// states none; `None` where no device comes up.
+fn allowed(
+    device: &DeviceBoot,
+    residency: engine::load::Residency,
+) -> Option<engine::load::Residency> {
     // The device is shared: a driver that fails to come up is asked again
     // before the test is skipped. A load takes what the harness states a
     // test's load takes; where that is the whole device, at most a quarter of
     // what the device is measured to have, as tests load at once.
     let mut tries = 0;
     let quarter = loop {
-        match Context::bind(&device, backend::ALLOWANCE) {
+        match Context::bind(device, backend::ALLOWANCE) {
             Ok(bound) => break engine_gpu::backend::Context::capacity(&bound) / 4,
             Err(why) => {
                 tries += 1;
@@ -320,7 +359,7 @@ fn load_alone(
             }
         }
     };
-    let residency = engine::load::Residency {
+    Some(engine::load::Residency {
         device: engine::Allowance {
             budget: residency
                 .device
@@ -329,26 +368,7 @@ fn load_alone(
                 .or(Some(quarter)),
         },
         ..residency
-    };
-    Some(
-        Shell::load(Boot {
-            trace: fixture.trace.clone(),
-            contract: &fixture.contract,
-            checkpoint: &fixture.container,
-            budget: Budget::new(SEATS, 256),
-            patches: None,
-            voxels: None,
-            profile: None,
-            page_size: page,
-            context,
-            slots: SEATS,
-            runahead: engine::runahead::Runahead::F1,
-            device: &device,
-            residency,
-            handed: None,
-        })
-        .unwrap_or_else(|why| panic!("the shell loads: {why}")),
-    )
+    })
 }
 
 pub fn word(trace: &Trace, rows: u32) -> u64 {
@@ -516,6 +536,89 @@ fn every_rung_fires_what_the_load_built(model: &str) {
         reserved,
         shell.device().books().reserved()
     );
+}
+
+/// A load names its kernels and its dispatch bound from fires at its
+/// largest rung alone; the fires at each other rung alone name the same
+/// kernels, the same bound and the same classes the kernels refuse.
+fn every_rung_names_what_the_largest_names(model: &str) {
+    let fixture = fixture(model, None);
+    let device = DeviceBoot::default();
+    let _alone = loading();
+    let Some(residency) = allowed(&device, engine::load::Residency::default()) else {
+        return;
+    };
+    let at = |rung: Option<u32>| {
+        Shell::named_at(
+            boot(&fixture, PAGE, CONTEXT, &device, residency.clone()),
+            rung,
+        )
+    };
+    // A load this device refuses names nothing; it is refused in the words
+    // the load is, and said so.
+    let largest = match at(None) {
+        Ok(largest) => largest,
+        Err(why) => {
+            let load = Shell::load(boot(&fixture, PAGE, CONTEXT, &device, residency.clone()));
+            match load {
+                Err(refused) if refused.to_string() == why.to_string() => {
+                    eprintln!("{model}: not named, as the load is refused: {why}");
+                    return;
+                }
+                _ => panic!("{model} names nothing, and its load is not refused so: {why}"),
+            }
+        }
+    };
+    let named = |rung: Option<u32>| {
+        at(rung).unwrap_or_else(|why| panic!("{model} names at {rung:?}: {why}"))
+    };
+    assert!(!largest.rungs.is_empty(), "{model}: the load admits a rung");
+    let classes = |asks: &engine_gpu::serve::Asks| -> Vec<usize> {
+        asks.unservable.iter().map(|held| held.class).collect()
+    };
+    for &rung in &largest.rungs {
+        let at = named(Some(rung));
+        assert_eq!(
+            at.kernels, largest.kernels,
+            "{model}: the kernels at rung {rung}"
+        );
+        assert_eq!(
+            at.dispatches, largest.dispatches,
+            "{model}: the dispatch bound at rung {rung}"
+        );
+        assert_eq!(
+            classes(&at),
+            classes(&largest),
+            "{model}: the unservable classes at rung {rung}"
+        );
+    }
+    eprintln!(
+        "{model}: rungs {:?} each name {} kernels, {} dispatches a fire at most, unservable {:?}",
+        largest.rungs,
+        largest.kernels.len(),
+        largest.dispatches,
+        classes(&largest)
+    );
+}
+
+#[test]
+fn every_rung_of_a_dense_miniature_names_what_the_largest_names() {
+    every_rung_names_what_the_largest_names("qwen3-micro-text");
+}
+
+#[test]
+fn every_rung_of_a_hybrid_miniature_names_what_the_largest_names() {
+    every_rung_names_what_the_largest_names("qwen35-tiny");
+}
+
+#[test]
+fn every_rung_of_a_windowed_miniature_names_what_the_largest_names() {
+    every_rung_names_what_the_largest_names("gemma4-e4b-mini-l1");
+}
+
+#[test]
+fn every_rung_of_a_miniature_with_unservable_classes_names_what_the_largest_names() {
+    every_rung_names_what_the_largest_names("gemma4-e4b-mini-l6");
 }
 
 /// A fire whose lanes mix classes so that a region's mask comes in runs: a

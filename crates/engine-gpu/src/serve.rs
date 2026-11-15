@@ -722,6 +722,47 @@ pub struct Shell<B: Serve> {
 
 impl<B: Serve> Shell<B> {
     pub fn load(boot: Boot<'_, B>) -> Result<Shell<B>> {
+        let (boot, mut fitted) = Shell::fit(boot)?;
+        let asks = Shell::name(&boot, &fitted, None)?;
+        let device = &fitted.device;
+
+        // Each is held to what the device binds a stage, by name, and then
+        // built, before the load reserves anything: what the device has
+        // left is then past every pipeline a fire of this load asks for.
+        for kernel in &asks.kernels {
+            B::hold(device, kernel.unit, kernel.key)?;
+        }
+        let pipelines = B::Pipelines::default();
+        let held = device.outside();
+        for kernel in &asks.kernels {
+            B::build(device, &pipelines, kernel.unit, kernel.key)?;
+        }
+        tracing::info!(
+            kernels = asks.kernels.len(),
+            dispatches = asks.dispatches,
+            driver = device.outside().saturating_sub(held),
+            "every pipeline a fire of this load asks for is named by a walk that fires \
+             nothing, and built before the load reserves"
+        );
+        fitted.pipelines = pipelines;
+        fitted.asks = asks;
+        Shell::raise(boot, fitted)
+    }
+
+    /// What a load of `boot` names from its fires at `rung` alone, or at
+    /// its largest where `None`, as [`Shell::load`] names them: a fire of
+    /// each class and of every mix that cuts a region, staged and walked
+    /// into a sink that fires nothing. Nothing is reserved.
+    pub fn named_at(boot: Boot<'_, B>, rung: Option<u32>) -> Result<Asks> {
+        let (boot, fitted) = Shell::fit(boot)?;
+        Shell::name(&boot, &fitted, rung)
+    }
+
+    /// Opens the device `boot` names and fits the load to it: the trace
+    /// fused for the device, admitted, its budgets and slots fitted. Nothing
+    /// is compiled, built or reserved: each raise compiles at the top its
+    /// device binds.
+    fn fit(boot: Boot<'_, B>) -> Result<(Boot<'_, B>, Fitted<B>)> {
         let mut boot = boot;
         let (device, mut tuning) = B::open(boot.device, boot.residency.device, boot.handed.take())?;
         let tier = B::tier(&device);
@@ -761,10 +802,34 @@ impl<B: Serve> Shell<B> {
                 boot.runahead.frames_in_flight,
             );
         }
-        // The load's own code against a backend that reserves nothing: the
-        // shell it raises is walked for every kernel a fire of this load can
-        // ask for, before the device holds a byte of the model.
-        let asks = Shell::<Named<B>>::raise(
+        Ok((
+            boot,
+            Fitted {
+                device,
+                tuning,
+                tier,
+                budgets,
+                profile,
+                pipelines: B::Pipelines::default(),
+                asks: Asks::default(),
+            },
+        ))
+    }
+
+    /// The load's own code against a backend that reserves nothing: the
+    /// shell it raises is walked for every kernel a fire of this load can
+    /// ask for, at `rung` or the largest, before the device holds a byte of
+    /// the model.
+    fn name(boot: &Boot<'_, B>, fitted: &Fitted<B>, rung: Option<u32>) -> Result<Asks> {
+        let Fitted {
+            device,
+            tuning,
+            tier,
+            budgets,
+            profile,
+            ..
+        } = fitted;
+        let named = Shell::<Named<B>>::raise(
             Boot {
                 trace: boot.trace.clone(),
                 contract: boot.contract,
@@ -782,47 +847,16 @@ impl<B: Serve> Shell<B> {
                 handed: None,
             },
             Fitted {
-                device: crate::named::Facts::of::<B>(&device),
+                device: crate::named::Facts::of::<B>(device),
                 tuning: tuning.clone(),
-                tier,
+                tier: *tier,
                 budgets: budgets.clone(),
                 profile: profile.clone(),
                 pipelines: Default::default(),
                 asks: Asks::default(),
             },
         )?;
-        let asks = asks.asks()?;
-
-        // Each is held to what the device binds a stage, by name, and then
-        // built, before the load reserves anything: what the device has
-        // left is then past every pipeline a fire of this load asks for.
-        for kernel in &asks.kernels {
-            B::hold(&device, kernel.unit, kernel.key)?;
-        }
-        let pipelines = B::Pipelines::default();
-        let held = device.outside();
-        for kernel in &asks.kernels {
-            B::build(&device, &pipelines, kernel.unit, kernel.key)?;
-        }
-        tracing::info!(
-            kernels = asks.kernels.len(),
-            dispatches = asks.dispatches,
-            driver = device.outside().saturating_sub(held),
-            "every pipeline a fire of this load asks for is named by a walk that fires \
-             nothing, and built before the load reserves"
-        );
-        Shell::raise(
-            boot,
-            Fitted {
-                device,
-                tuning,
-                tier,
-                budgets,
-                profile,
-                pipelines,
-                asks,
-            },
-        )
+        named.asks(rung)
     }
 
     /// Raises the shell of a load fitted to its device: every reservation
@@ -4664,6 +4698,8 @@ pub struct Asks {
     pub kernels: Vec<crate::naming::Kernel>,
     pub dispatches: u32,
     pub unservable: Vec<crate::naming::Unservable>,
+    /// The rungs of the load's span, the one named from among them.
+    pub rungs: Vec<u32>,
 }
 
 /// What a rung's naming fires found of the regions: which ran, which a fire
@@ -5068,10 +5104,16 @@ impl<B: Serve> Shell<Named<B>> {
         Ok(None)
     }
 
-    /// Names what this load's fires ask for, a rung of the span at a time:
-    /// a fire of each class alone, and a fire for each way a mix of classes
-    /// cuts a mask into runs ([`Shell::cuts`]), staged and walked as a
-    /// serving fire is, into the sink that fires nothing. A fire makes at
+    /// Names what this load's fires ask for from fires at one rung of the
+    /// span, `rung` or the largest: a fire of each class alone, and a fire
+    /// for each way a mix of classes cuts a mask into runs
+    /// ([`Shell::cuts`]), staged and walked as a serving fire is, into the
+    /// sink that fires nothing. One rung names what every rung does: a host
+    /// that picks its kernel by a fire's rows names every kernel its widths
+    /// allow and the longest way it can take, so neither the kernels nor
+    /// the dispatches of a fire change with its rows (the suite holds every
+    /// rung to the largest's). The largest is where every mix runs, three
+    /// lanes of a row or more each. A fire makes at
     /// most what the rung's fires made outside their regions and of each
     /// region, a region the walk launches a run at a time counted at every
     /// run its mask can come in. A region no such fire runs, or one in runs
@@ -5082,9 +5124,13 @@ impl<B: Serve> Shell<Named<B>> {
     /// once, here, and the load stands; a bind that only such classes serve
     /// is refused at the bind ([`crate::naming::refuses`]). A mix the
     /// kernels refuse of classes they admit alone refuses the load.
-    fn asks(mut self) -> Result<Asks> {
+    fn asks(mut self, rung: Option<u32>) -> Result<Asks> {
         let regions = self.compiled.template().len();
-        let rungs: Vec<u32> = self.span.rungs().iter().map(|rung| rung.tokens).collect();
+        let span: Vec<u32> = self.span.rungs().iter().map(|rung| rung.tokens).collect();
+        let rungs: Vec<u32> = rung
+            .or_else(|| span.iter().copied().max())
+            .into_iter()
+            .collect();
         let classes = self.compiled.classes.classes.len();
         let mut unservable: Vec<crate::naming::Unservable> = Vec::new();
         let mut mixes: Vec<([usize; 3], poem_exec::KernelError)> = Vec::new();
@@ -5205,6 +5251,7 @@ impl<B: Serve> Shell<Named<B>> {
             kernels: self.pipelines.0.kernels(),
             dispatches,
             unservable,
+            rungs: span,
         })
     }
 }
