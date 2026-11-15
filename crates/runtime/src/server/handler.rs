@@ -24,6 +24,35 @@ impl Session {
         }
     }
 
+    pub(super) async fn handle_reload_weights(
+        &mut self,
+        corr_id: u32,
+        path: String,
+        version: Option<u64>,
+    ) {
+        if !self.state.allow_weight_reload {
+            self.send_response(
+                corr_id,
+                false,
+                "this server lets no client reload its weights, which every tenant is \
+                 served: `[server] allow_weight_reload = true` turns it on"
+                    .to_string(),
+            )
+            .await;
+            return;
+        }
+        match model::reload::reload(std::path::Path::new(&path), version).await {
+            Ok(reloaded) => {
+                let answer = serde_json::to_string(&reloaded).unwrap_or_default();
+                self.send_response(corr_id, true, answer).await;
+            }
+            Err(error) => {
+                self.send_response(corr_id, false, format!("reload_weights: {error:#}"))
+                    .await;
+            }
+        }
+    }
+
     pub(super) async fn handle_query(&mut self, corr_id: u32, subject: String, _record: String) {
         match subject.as_str() {
             client_api::message::QUERY_MODEL_STATUS => {
@@ -41,6 +70,10 @@ impl Session {
                         }
                         (u, t)
                     };
+                    stats.insert(
+                        format!("{}.weights_version", model_name),
+                        serde_json::Value::from(model::reload::version()),
+                    );
                     stats.insert(
                         format!("{}.kv_pages_used", model_name),
                         serde_json::Value::from(used),

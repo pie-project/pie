@@ -211,6 +211,26 @@ pub(crate) async fn write_host_kv(engine_id: usize, slots: Vec<u32>, bytes: Vec<
         .map(drop)
 }
 
+pub(crate) fn schedulers() -> Vec<SchedulerHandle> {
+    handle_registry()
+        .read()
+        .unwrap()
+        .iter()
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+pub(crate) async fn reload_weights(
+    scheduler: &SchedulerHandle,
+    path: &std::path::Path,
+) -> Result<::engine::Reloaded> {
+    let answer = scheduler
+        .host_kv(worker::HostKvOp::ReloadWeights(path.to_path_buf()))
+        .await?;
+    Ok(serde_json::from_slice(&answer)?)
+}
+
 pub(crate) async fn pool(engine_id: usize, op: worker::PoolOp) -> Result<()> {
     scheduler_handle(engine_id)?.pool(op).await
 }

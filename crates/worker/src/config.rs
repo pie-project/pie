@@ -255,6 +255,9 @@ pub struct ServerConfig {
     /// and what `pie inferlet install` put here.
     #[serde(default = "default_true")]
     pub allow_upload: bool,
+    /// Whether a client may write new weights over the served model's (`reload_weights`).
+    #[serde(default)]
+    pub allow_weight_reload: bool,
 }
 
 impl Default for ServerConfig {
@@ -265,6 +268,7 @@ impl Default for ServerConfig {
             worker_threads: default_worker_threads(),
             max_upload: default_max_upload(),
             allow_upload: true,
+            allow_weight_reload: false,
         }
     }
 }

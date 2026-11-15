@@ -223,6 +223,10 @@ impl KvPageTable {
         self.working_sets.insert(WorkingSetEntry::new(None, 0, 0))
     }
 
+    pub fn live_working_sets(&self) -> usize {
+        self.working_sets.iter().count()
+    }
+
     pub fn fork(&mut self, ws: WorkingSetId) -> Result<WorkingSetId, KvTableError> {
         let entry = self.entry(ws)?;
         let (terminal, page_len, mapped_len) = (entry.terminal, entry.page_len, entry.mapped_len);

@@ -153,6 +153,17 @@ pub struct Loaded {
     pub caps: Capabilities,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reload {
+    pub checkpoint: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reloaded {
+    pub planes: u32,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadFacts {
     pub trace_name: String,

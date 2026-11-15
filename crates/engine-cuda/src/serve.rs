@@ -661,6 +661,29 @@ impl Shell {
             .register_adapter(self.device.stream(), id, planes)
     }
 
+    pub fn reload_weights(
+        &mut self,
+        contract: &checkpoint::contract::ModelContract,
+        path: &std::path::Path,
+        target: checkpoint::plan::StorageTarget,
+        torn: &mut bool,
+    ) -> Result<(u32, u64)> {
+        crate::device::ctx::sync(self.device.stream())?;
+        let written = self.weights.reload(
+            &self.trace,
+            contract,
+            path,
+            target,
+            self.device.stream(),
+            torn,
+        )?;
+        *torn = true;
+        crate::voxels::relabel_conv_weights(&self.device, &self.trace, self.weights.table())?;
+        crate::device::ctx::sync(self.device.stream())?;
+        *torn = false;
+        Ok(written)
+    }
+
     pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {
         self.adapters.mount(root);
     }

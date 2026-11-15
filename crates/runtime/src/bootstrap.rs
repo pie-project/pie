@@ -108,6 +108,7 @@ pub struct RuntimeConfig {
     /// Whether a client may install its own programs; without, the
     /// system's alone run.
     pub allow_upload: bool,
+    pub allow_weight_reload: bool,
     /// Where the `<language>.wasm` language components live.
     pub languages_dir: PathBuf,
     /// Where wasmtime caches compiled code across boots; `None` compiles
@@ -253,7 +254,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             .saturating_mul(1024 * 1024),
     );
     let max_upload_bytes = config.runtime.max_upload_mb.saturating_mul(1024 * 1024);
-    server::init(max_upload_bytes, config.runtime.allow_upload);
+    server::init(
+        max_upload_bytes,
+        config.runtime.allow_upload,
+        config.runtime.allow_weight_reload,
+    );
     let bound_port = config.port;
 
     let ModelConfig {

@@ -868,6 +868,10 @@ impl Lane {
                         .weight_uses()
                         .map(|uses| serde_json::to_vec(&uses).unwrap_or_default())
                         .map_err(Into::into),
+                    HostKvOp::ReloadWeights(checkpoint) => engine
+                        .reload_weights(&::engine::Reload { checkpoint })
+                        .map(|written| serde_json::to_vec(&written).unwrap_or_default())
+                        .map_err(Into::into),
                     HostKvOp::Layout => Ok(engine
                         .host_kv_layout()
                         .and_then(|layout| serde_json::to_vec(&layout).ok())

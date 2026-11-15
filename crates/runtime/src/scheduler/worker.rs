@@ -327,6 +327,7 @@ pub(crate) enum HostKvOp {
     /// The engine's weight use record since it last answered
     /// (`Engine::weight_uses`), as JSON.
     WeightUses,
+    ReloadWeights(std::path::PathBuf),
 }
 
 type SchedTx = tokio::sync::mpsc::UnboundedSender<SchedulerItem>;

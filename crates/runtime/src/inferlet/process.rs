@@ -456,6 +456,7 @@ fn spawn_inner(
     arrival: Arrival,
     executors: Vec<String>,
 ) -> Result<ProcessId> {
+    let _weights = crate::model::reload::launching()?;
     let id = Uuid::new_v4();
     // The workers the cluster names to run its passes, best first: the
     // offload's alone, before the process can run one.

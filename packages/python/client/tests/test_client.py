@@ -80,6 +80,15 @@ class PythonClientTests(unittest.IsolatedAsyncioTestCase):
             {"type", "corr_id", "program_hash", "file", "chunk_index", "total_chunks", "chunk_data"},
         )
 
+    async def test_reload_weights_sends_an_absolute_path_and_returns_the_answer(self):
+        client = PieClient("ws://example.invalid")
+        client.ws = RespondingWebSocket(client, result='{"version": 3}')
+
+        self.assertEqual(await client.reload_weights("ckpt", version=3), {"version": 3})
+        [frame] = client.ws.sent
+        path = str(Path("ckpt").absolute())
+        self.assertEqual(frame, {"type": "reload_weights", "corr_id": 1, "path": path, "version": 3})
+
     def test_a_program_is_named_by_its_file_or_its_directory(self):
         self.assertEqual(program_file("/a/b/text_completion.wasm"), "text-completion.wasm")
         self.assertEqual(program_file("/a/beam_search_py/main.py"), "beam-search-py.py")

@@ -74,6 +74,7 @@ pub struct Cuda {
     before_arming: Option<BeforeArming>,
     refused_unlaunched: bool,
     enqueued: bool,
+    torn: bool,
 }
 
 pub(crate) type BeforeArming = Box<dyn FnMut(&mut Shell) -> std::result::Result<(), String> + Send>;
@@ -99,6 +100,7 @@ impl Cuda {
             before_arming: None,
             refused_unlaunched: false,
             enqueued: false,
+            torn: false,
         }
     }
 
@@ -785,6 +787,31 @@ impl Engine for Cuda {
         })
     }
 
+    fn reload_weights(&mut self, reload: &engine::Reload) -> EngineResult<engine::Reloaded> {
+        if self.expert.size > 1 {
+            return Err(Error::Unsupported {
+                verb: "reload_weights on a rank of an expert-parallel group",
+                engine: "cuda",
+            });
+        }
+        let target = self.target();
+        let path = reload.checkpoint.as_path();
+        let shell = self
+            .shell
+            .as_mut()
+            .ok_or_else(|| Error::Load("the cuda engine has no model loaded".into()))?;
+        refuse_an_artifact_for_another_deployment(
+            path,
+            shell.trace().platform.backend(),
+            width_free(&shell.trace().name),
+        )?;
+        let contract = (self.contract_for)(shell.trace(), path).map_err(Error::Load)?;
+        let (planes, bytes) = shell
+            .reload_weights(&contract, path, target, &mut self.torn)
+            .map_err(fault)?;
+        Ok(engine::Reloaded { planes, bytes })
+    }
+
     fn register_adapter(
         &mut self,
         registration: &engine::adapter::AdapterRegistration,
@@ -901,6 +928,13 @@ impl Engine for Cuda {
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         self.refused_unlaunched = true;
+        if self.torn {
+            return Err(Error::Load(
+                "a weight reload failed partway, so this engine's weights are part old and \
+                 part new; reload them again before anything fires"
+                    .into(),
+            ));
+        }
         frame.validate_for(
             self.caps
                 .as_ref()

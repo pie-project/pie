@@ -6,6 +6,7 @@ pub mod error;
 pub mod executor;
 pub mod extent;
 pub mod file;
+pub mod overwrite;
 pub mod plan;
 pub mod serving;
 mod term;

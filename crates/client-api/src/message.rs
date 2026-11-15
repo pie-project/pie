@@ -239,6 +239,14 @@ pub enum ClientMessage {
 
     #[serde(rename = "ping")]
     Ping { corr_id: u32 },
+
+    #[serde(rename = "reload_weights")]
+    ReloadWeights {
+        corr_id: u32,
+        path: String,
+        #[serde(default)]
+        version: Option<u64>,
+    },
 }
 
 impl ClientMessage {
@@ -280,7 +288,8 @@ impl ClientMessage {
             | ClientMessage::AttachProcess { corr_id, .. }
             | ClientMessage::TerminateProcess { corr_id, .. }
             | ClientMessage::ListProcesses { corr_id }
-            | ClientMessage::Ping { corr_id } => Some(*corr_id),
+            | ClientMessage::Ping { corr_id }
+            | ClientMessage::ReloadWeights { corr_id, .. } => Some(*corr_id),
             ClientMessage::SignalProcess { .. } | ClientMessage::TransferFile { .. } => None,
         }
     }
@@ -299,7 +308,8 @@ impl ClientMessage {
             | ClientMessage::AttachProcess { corr_id, .. }
             | ClientMessage::TerminateProcess { corr_id, .. }
             | ClientMessage::ListProcesses { corr_id }
-            | ClientMessage::Ping { corr_id } => Some(corr_id),
+            | ClientMessage::Ping { corr_id }
+            | ClientMessage::ReloadWeights { corr_id, .. } => Some(corr_id),
             ClientMessage::SignalProcess { .. } | ClientMessage::TransferFile { .. } => None,
         }
     }
