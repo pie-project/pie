@@ -3,6 +3,7 @@
 //! what the host driver needs to find on the wafer ([`host`]), and where a diagnostics build's
 //! phase stamps are read ([`stamps`]).
 
+pub mod grid;
 pub mod host;
 pub mod layout;
 pub mod params;

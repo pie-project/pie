@@ -91,7 +91,7 @@ fn bits16(x: f32, ieee: bool) -> u32 {
 }
 
 /// IEEE f16 bits of `x`, rounded to nearest even.
-fn half_bits(x: f32) -> u16 {
+pub(crate) fn half_bits(x: f32) -> u16 {
     let b = x.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;
     let exp = ((b >> 23) & 0xff) as i32;
@@ -126,6 +126,19 @@ fn half_bits(x: f32) -> u16 {
         h += 1;
     }
     sign | h as u16
+}
+
+/// The f32 of IEEE f16 bits `h`.
+pub(crate) fn half_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let e = i32::from((h >> 10) & 0x1f);
+    let m = f32::from(h & 0x3ff);
+    sign * match e {
+        0 => m * 2f32.powi(-24),
+        31 if m == 0.0 => f32::INFINITY,
+        31 => f32::NAN,
+        _ => (1.0 + m / 1024.0) * 2f32.powi(e - 15),
+    }
 }
 
 /// The trace row of a unit's own row `t`.
@@ -556,7 +569,7 @@ fn of_step(trace: &poem_ir::Trace, v: ValueId, memo: &mut BTreeMap<u32, bool>) -
 
 /// The arrays grouped into memcpy rectangles: each group one symbol and length, its PEs a
 /// rectangle (rows of consecutive PEs, stacked where they repeat).
-fn rects(arrays: &[&HostArray]) -> Vec<(u32, u32, u32, u32, Vec<usize>)> {
+pub(crate) fn rects(arrays: &[&HostArray]) -> Vec<(u32, u32, u32, u32, Vec<usize>)> {
     let mut by: BTreeMap<(String, u32), Vec<usize>> = BTreeMap::new();
     for (i, a) in arrays.iter().enumerate() {
         by.entry((a.sym.clone(), a.len)).or_default().push(i);

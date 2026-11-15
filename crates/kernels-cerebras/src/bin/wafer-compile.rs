@@ -45,7 +45,7 @@ const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <
      wafer-compile stream --model <deployment> [--reading R] [--rows N] [--ieee] --out <dir> \
      [--values <dir>] [--stages N] [--tap v,..] [--py N] [--tile W] [--spill] \
      [--cut THIN,SUB,WIDEN,HELP] [--class-rows context=512,latents=4096] \
-     [--price context=512,latents=4096 [--parts]]";
+     [--price context=512,latents=4096 [--parts]] [--clip t,h,w]";
 
 fn main() {
     if let Err(e) = run() {
@@ -245,6 +245,37 @@ fn stream(args: &[String]) -> Result<(), String> {
         .parse(&model)
         .ok_or_else(|| format!("no catalog model {model}"))?
         .trace(poem_ir::Platform::Cerebras);
+    if kernels_cerebras::stream::grid::is_grid(&trace, &reading) {
+        // a grid reading (a VAE's): its passes over one unit, on the clip `--clip t,h,w` (else
+        // the one `--rows` token rows make)
+        let clip = match get("--clip") {
+            Some(c) => {
+                let v: Vec<u32> = c.split(',').filter_map(|x| x.parse().ok()).collect();
+                let [t, h, w] = v[..] else {
+                    return Err(format!("--clip {c}: t,h,w"));
+                };
+                [t, h, w]
+            }
+            None => kernels_cerebras::stream::grid::clip_of(&trace, &reading, rows),
+        };
+        let g = kernels_cerebras::stream::grid::compile(
+            &trace,
+            &reading,
+            clip,
+            !ieee,
+            std::path::Path::new(&out),
+        )?;
+        println!(
+            "{model} {reading}: a grid reading on {clip:?}, {} passes over {} x {} roots, {} matvecs, {} x {} PEs",
+            g.passes.len(),
+            g.p,
+            g.p,
+            g.mvs.len(),
+            g.stream.w,
+            g.stream.h
+        );
+        return Ok(());
+    }
     let values = get("--values");
     let taps: Vec<u32> = get("--tap")
         .map(|t| t.split(',').filter_map(|v| v.parse().ok()).collect())

@@ -114,7 +114,7 @@ fn dirname(d: Dir) -> &'static str {
 }
 
 /// A route word as CSL's `.rx` / `.tx` sets.
-fn routes(w: RouteWord) -> String {
+pub(crate) fn routes(w: RouteWord) -> String {
     let rx = if w.from_ramp() {
         "RAMP".to_string()
     } else {
@@ -147,7 +147,7 @@ fn routes(w: RouteWord) -> String {
 }
 
 /// A buffer declaration and its DSD.
-fn buf(name: &str, n: u32) -> String {
+pub(crate) fn buf(name: &str, n: u32) -> String {
     let n = n.max(1);
     format!(
         "var {name}: [{n}]f32 align(16) = @zeros([{n}]f32);\nconst D_{name} = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{{n}}} -> {name}[i] }});\n"
@@ -156,14 +156,14 @@ fn buf(name: &str, n: u32) -> String {
 
 /// A drain of `n` words (a `u16` expression) off queue `q` through `D_drn`, 64 at a time, each
 /// piece then `then` (with `m` its length).
-fn drain(n: &str, q: &str, then: &str) -> String {
+pub(crate) fn drain(n: &str, q: &str, then: &str) -> String {
     format!(
         "  {{ const nd: u16 = {n}; var k: u16 = 0; while (k < nd) : (k += 64) {{ const m = if (nd - k > 64) 64 else nd - k; @fmovs(@set_dsd_length(D_drn, m), fab.fin({q}, m));{then} }} }}\n"
     )
 }
 
 /// The runtime config words' declaration and export (`pcfg`), empty where none.
-fn cfg_decl(cfg: &[u32]) -> String {
+pub(crate) fn cfg_decl(cfg: &[u32]) -> String {
     if cfg.is_empty() {
         return String::new();
     }
@@ -185,7 +185,7 @@ fn cfg_array(at: Coord, cfg: &[u32]) -> Option<HostArray> {
 }
 
 /// `n` words of DSD `d` from `off` (an expression).
-fn at(d: &str, off: &str, n: u32) -> String {
+pub(crate) fn at(d: &str, off: &str, n: u32) -> String {
     format!("@set_dsd_length(@increment_dsd_offset({d}, @as(i16, {off}), f32), {n})")
 }
 
@@ -528,7 +528,7 @@ pub fn emit(p: &Program) -> R<Emitted> {
 /// become the first of them, the regions first (the roots import them by name), then the PE
 /// kernels, every PE's code renamed. cslc builds an image a distinct (file, params), so this is
 /// what keeps a large program's image count to its kinds of PE, not its PEs.
-fn dedup(files: &mut Vec<(String, String)>, tiles: &mut Tiles) {
+pub(crate) fn dedup(files: &mut Vec<(String, String)>, tiles: &mut Tiles) {
     let key = |t: &str| -> String {
         t.lines()
             .filter(|l| !l.starts_with("//"))
@@ -678,7 +678,7 @@ type Tile = (usize, u32, u32);
 type RootFile = (String, String, Vec<HostArray>, Vec<(String, String)>);
 
 /// Every PE's kernel file and params.
-type Tiles = BTreeMap<Coord, (String, Vec<(String, u32)>)>;
+pub(crate) type Tiles = BTreeMap<Coord, (String, Vec<(String, u32)>)>;
 
 /// A weight column's file: its matvecs (step, tile rows, tile cols) in step order.
 /// The values a step makes that its row roots hold over the barrier (in the order the roots
@@ -973,7 +973,7 @@ fn weight_file(
 }
 
 /// Every kernel's opening: memcpy, the stamps, the fabric and math modules, the run task.
-const COMMON: &str = "const sys_mod = @import_module(\"<memcpy/memcpy>\", memcpy_params);
+pub(crate) const COMMON: &str = "const sys_mod = @import_module(\"<memcpy/memcpy>\", memcpy_params);
 const timestamp = @import_module(\"<time>\");
 const fab = @import_module(\"ops/fabric.csl\");
 const math = @import_module(\"ops/math.csl\");

@@ -17,6 +17,7 @@ use serde::Serialize;
 use crate::plan::Act;
 
 pub mod build;
+pub mod grid;
 pub mod host;
 pub mod place;
 pub mod unit;
@@ -346,6 +347,19 @@ pub fn compile_pinned(
     .map_err(|e| e.to_string())?;
     host::write(&p, &e.arrays, gold, out)?;
     Ok(p)
+}
+
+/// Compiles `trace`'s reading `o.reading` into `out` with no capture, whichever regime it reads
+/// in: a stream reading's units ([`compile`]), or a grid reading's passes ([`grid::compile`], on
+/// the clip `o.rows` token rows make: [`grid::clip_of`]). Returns its fabric's size.
+pub fn compile_reading(trace: &Trace, o: &Options, out: &std::path::Path) -> R<(u32, u32)> {
+    if grid::is_grid(trace, &o.reading) {
+        let clip = grid::clip_of(trace, &o.reading, o.rows);
+        let g = grid::compile(trace, &o.reading, clip, o.round16, out)?;
+        return Ok((g.stream.w, g.stream.h));
+    }
+    let p = compile(trace, o, out, None)?;
+    Ok((p.stream.w, p.stream.h))
 }
 
 /// `classes` with the rows of those `rows` names.
