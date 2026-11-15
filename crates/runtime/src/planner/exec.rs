@@ -223,7 +223,7 @@ pub(super) fn spawn_restore(
         planner.restore_failed(pid, "restore executor died")
     });
     if !spawned {
-        planner.requeue_restore(pid, Some("no tokio runtime for the restore executor"));
+        planner.restore_faulted(pid, "no tokio runtime for the restore executor");
     }
 }
 
@@ -551,7 +551,7 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     let mut guard = MoveGuard::new(model, engine, Move::Suspend { kv, rs, roles });
     if let Err(error) = guard.copy(&planner, pid).await {
         tracing::warn!(pid = %pid, %error, "planner: eviction copy failed");
-        planner.eviction_failed(pid);
+        planner.eviction_copy_failed(pid, &error);
         return;
     }
     let copied = began.elapsed();
@@ -686,14 +686,20 @@ async fn restore(
                 // Another move holds pages it shares: it waits for that move
                 // to end, the event, however long.
                 Err(KvStoreError::MoveInFlight) => notified.await,
-                // Its pages moved meanwhile: queue again, quoted anew,
-                // which is no failure of this restore.
+                // More of its pages were swapped out since the grant was
+                // quoted: queue again, quoted anew, which is no failure of
+                // this restore. It cannot loop on one quote: the serve
+                // quotes a restore at the pages swapped out then
+                // (`Step::ServeRestore`, its demand replaced when stale),
+                // so a second mismatch needs a second move of its pages
+                // after that quote, each one an event of its own, and the
+                // pages it holds bound how many there can be.
                 Err(KvStoreError::GrantMismatch { .. }) => {
-                    planner.requeue_restore(pid, None);
+                    planner.requeue_restore(pid);
                     return;
                 }
                 Err(error) => {
-                    planner.requeue_restore(pid, Some(&error.to_string()));
+                    planner.restore_faulted(pid, &format!("kv prepare: {error}"));
                     return;
                 }
             }
@@ -719,7 +725,7 @@ async fn restore(
                         roles: None,
                     },
                 );
-                planner.requeue_restore(pid, Some(&error.to_string()));
+                planner.restore_faulted(pid, &format!("rs prepare: {error}"));
                 return;
             }
         }
@@ -744,13 +750,16 @@ async fn restore(
                     roles: None,
                 },
             );
-            planner.requeue_restore(pid, Some(&error.to_string()));
+            planner.restore_faulted(pid, &format!("roles unpark: {error}"));
             return;
         }
     };
     let mut guard = MoveGuard::new(model, engine, Move::Restore { kv, rs, roles });
     if let Err(error) = guard.copy(&planner, pid).await {
-        planner.requeue_restore(pid, Some(&error));
+        planner.restore_faulted(
+            pid,
+            &format!("its state could not be copied back to the device: {error}"),
+        );
         return;
     }
     let Move::Restore { kv, rs, roles } = guard.take() else {
