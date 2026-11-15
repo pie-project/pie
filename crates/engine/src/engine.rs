@@ -36,10 +36,22 @@ pub struct KvWrites {
     pub positions: Vec<u32>,
     pub pages: Vec<u32>,
     pub offsets: Vec<u32>,
+    /// The slots this fire's fold froze for the lane: a count, this fire's
+    /// alone (not a running total, not a position), after the engine's
+    /// clamp to the fire's end; `Some(0)` where it froze none. The runtime
+    /// adds it to the set's frozen length when the fire settles, for its
+    /// kv and its recurrent state alike. An engine reports it for every
+    /// lane that asks a report on a fire whose fold length is the device's
+    /// ([`crate::fire::FoldLen::Device`]). `None` there freezes nothing:
+    /// the runtime fails the pass by name when the fire settles, since
+    /// every later fire of the set would carry all the lane wrote since.
     pub fold: Option<u32>,
     /// One past the last slot the lane's rows landed at, in the set's own
-    /// slot numbering; `None` where the engine does not tell it
-    /// ([`crate::fire::rung_rows`], device geometry).
+    /// slot numbering: a position. `None` where the engine does not tell
+    /// it; the set is then taken to have written as far as it reserved
+    /// ([`crate::fire::rung_rows`], device geometry). `end` and `fold` are
+    /// one report: an engine that reports `end` for a lane whose fire
+    /// folds on the device reports `fold` too.
     pub end: Option<u32>,
 }
 
@@ -313,6 +325,11 @@ pub trait Engine: Send {
         false
     }
 
+    /// Where a step's outcome goes. An engine that settles asynchronously
+    /// answers every step here. One that settles inside
+    /// [`Engine::submit`] answers through `submit`'s result: of what it
+    /// tells here only what a step's lanes wrote ([`StepOutcome::Wrote`])
+    /// is heard, and it is told before `submit` returns.
     fn on_complete(&mut self, sink: CompletionSink) {
         let _ = sink;
     }

@@ -3,6 +3,7 @@
 //! hands out translated to the physical slots kernels address, and the
 //! copies, spills and evacuations that move slots.
 pub mod experts;
+pub mod frozen;
 pub mod kv;
 pub mod layout;
 pub mod pool;
@@ -569,6 +570,9 @@ pub struct Pools<B: Backend> {
     /// `(rung tokens, chunks)` of each activation rung, ascending: the top
     /// chunks a fire of the rung takes ([`crate::arena`]).
     act_chunks: Vec<(u32, u32)>,
+    /// Where each record's own folds left it ([`frozen`]), carried by
+    /// every whole-slot copy of the fixed shape this pool makes.
+    frozen: frozen::Frozen,
 }
 
 /// A record's unit as a slot table's entry. Kernels read the entries as i32,
@@ -652,6 +656,7 @@ impl<B: Backend> Pools<B> {
             disk: None,
             watermark: engine::frame::Demand::ZERO,
             act_chunks,
+            frozen: frozen::Frozen::default(),
         })
     }
 
@@ -1186,15 +1191,48 @@ impl<B: Backend> Pools<B> {
         Ok(())
     }
 
+    /// The slot refs of the fixed shape a lane's record stands in, a piece
+    /// each ([`Self::record`]); `None` where the pool holds no state.
+    pub fn record_refs(&self, refs: Option<&[u32]>, seat: u32) -> Result<Option<Vec<u32>>> {
+        if !self.has_state() {
+            return Ok(None);
+        }
+        match refs {
+            Some(refs) => Ok(Some(refs.to_vec())),
+            None => {
+                let pieces = self.pieces();
+                let fixed = *self.shape(FIXED)?;
+                (0..pieces)
+                    .map(|p| fixed.seat_ref(seat * pieces + p))
+                    .collect::<Result<Vec<u32>>>()
+                    .map(Some)
+            }
+        }
+    }
+
+    /// The slot the last fold of the record in `pieces` left it at, where
+    /// the record keeps its own position ([`frozen`]).
+    #[must_use]
+    pub fn frozen_at(&self, pieces: &[u32]) -> Option<u32> {
+        self.frozen.held(pieces)
+    }
+
+    /// A fire left the record in `pieces` at `at`; `None` hands its
+    /// position back to the verb that states it.
+    pub fn leave_frozen(&mut self, pieces: &[u32], at: Option<u32>) {
+        self.frozen.leave(pieces, at);
+    }
+
     /// A kv page's bytes, as the slot file holds one: a list slot.
     #[must_use]
     pub fn page_bytes(&self) -> u64 {
         self.layout.list.map_or(0, |list| list.slot_bytes)
     }
 
-    /// Copies whole slots of `id` (slot refs) `(src, dst)` on the device.
+    /// Copies whole slots of `id` (slot refs) `(src, dst)` on the device;
+    /// a record's own frozen position goes with it ([`frozen`]).
     pub fn copy_shape(
-        &self,
+        &mut self,
         frame: &mut B::Frame,
         id: ShapeId,
         moves: &[(u32, u32)],
@@ -1206,6 +1244,10 @@ impl<B: Backend> Pools<B> {
             if from != to {
                 self.pool.copy(frame, from, to, bytes)?;
             }
+        }
+        if id == FIXED {
+            self.frozen
+                .copied(frozen::Tier::Device, frozen::Tier::Device, moves);
         }
         Ok(())
     }
@@ -1228,8 +1270,28 @@ impl<B: Backend> Pools<B> {
     /// Slots of one shape copied as [`engine::Engine::copy_slots`] states
     /// them: on the device (whole slots, and token runs of the list),
     /// between the device and the host chunks, or between the device and
-    /// the slot file. A host or disk copy waits out its frame.
+    /// the slot file. A host or disk copy waits out its frame. A record's
+    /// own frozen position goes where its slot does ([`frozen`]).
     pub fn copy_slots(
+        &mut self,
+        device: &B::Context,
+        frame: &mut B::Frame,
+        copy: &SlotCopy,
+    ) -> Result<()> {
+        self.copy_slot_bytes(device, frame, copy)?;
+        let (src, dst) = (B::is_device(copy.src), B::is_device(copy.dst));
+        // Within the device `copy_shape` carried it.
+        if copy.shape == FIXED && !(src && dst) {
+            self.frozen.copied(
+                frozen::Tier::of(copy.src, src),
+                frozen::Tier::of(copy.dst, dst),
+                &copy.slots,
+            );
+        }
+        Ok(())
+    }
+
+    fn copy_slot_bytes(
         &mut self,
         device: &B::Context,
         frame: &mut B::Frame,
@@ -1414,6 +1476,13 @@ impl<B: Backend> Pools<B> {
                 need,
                 have: bytes.len() as u64,
             });
+        }
+        // Bytes from outside the pool carry no position of a record's own:
+        // what they hold stands where its verb states.
+        for (shape, refs) in slots {
+            if *shape == FIXED {
+                self.frozen.written(frozen::Tier::Host, refs);
+            }
         }
         let host = match &mut self.host {
             HostChunks::Mapped(host) => host.as_mut().ok_or(Fault::Ceiling {

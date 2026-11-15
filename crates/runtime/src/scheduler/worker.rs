@@ -2889,6 +2889,7 @@ mod tests {
         a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying();
         a_launch_waits_for_the_copy_queued_ahead_of_it();
         a_pass_that_only_reorders_lets_the_worker_park();
+        what_a_frame_settled_inside_submit_wrote_is_kept_when_it_is_answered();
     }
 
     /// A browser's single thread lands the batch a close waits on only after
@@ -3098,6 +3099,105 @@ mod tests {
             "the frame is offered ONCE; a second offer is the sleep-retry loop \
              growing back"
         );
+
+        let (_engine, _channels) = lane.shutdown();
+    }
+
+    /// An engine that settles each frame inside `submit`: it tells the sink
+    /// it was given what each reporting lane wrote, before it returns.
+    struct InlineEngine {
+        sink: Option<::engine::CompletionSink>,
+    }
+
+    impl engine::Engine for InlineEngine {
+        fn kind(&self) -> &'static str {
+            "inline"
+        }
+
+        fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
+            Err(engine::Error::Load("no model".into()))
+        }
+
+        fn on_complete(&mut self, sink: ::engine::CompletionSink) {
+            self.sink = Some(sink);
+        }
+
+        fn submit(
+            &mut self,
+            frame: &engine::FrameSubmission,
+        ) -> engine::Result<engine::FrameTicket> {
+            let id = ::engine::FrameId(0);
+            let sink = self.sink.as_ref().ok_or_else(|| {
+                engine::Error::Invalid("no sink was installed before the first submit".into())
+            })?;
+            for (step, fired) in frame.steps.iter().enumerate() {
+                let wrote = fired
+                    .lanes
+                    .iter()
+                    .filter(|lane| lane.reports != 0)
+                    .map(|lane| ::engine::KvWrites {
+                        tag: lane.reports,
+                        fold: Some(4),
+                        ..Default::default()
+                    })
+                    .collect();
+                sink(
+                    ::engine::StepDone {
+                        frame: id,
+                        step: step as u32,
+                    },
+                    ::engine::StepOutcome::Wrote(wrote),
+                );
+            }
+            Ok(engine::FrameTicket {
+                id,
+                steps: frame.steps.iter().map(|_| Default::default()).collect(),
+            })
+        }
+    }
+
+    /// A synchronous engine has no landing to tell a report with: the lane
+    /// gives it a sink all the same, and what its lanes wrote is kept by
+    /// the time the fire is answered.
+    fn what_a_frame_settled_inside_submit_wrote_is_kept_when_it_is_answered() {
+        const TAG: u64 = u64::MAX - 0x5e77;
+        let mut lane = Lane::spawn(
+            0,
+            Some(Box::new(InlineEngine { sink: None })),
+            Arc::new(SchedulerStats::default()),
+        );
+
+        let answer_rx = lane.fire(
+            crate::engine::FrameFire {
+                steps: vec![crate::engine::StepFire {
+                    submission: ::engine::Step {
+                        lanes: vec![::engine::Lane {
+                            reports: TAG,
+                            ..::engine::Lane::decode(0, 0, 1, 0)
+                        }],
+                        attachments: Vec::new(),
+                        media: Vec::new(),
+                        voxels: Vec::new(),
+                    },
+                    terminal_cells: Vec::new(),
+                    completions: Vec::new(),
+                    instances: Vec::new(),
+                }],
+            },
+            false,
+        );
+
+        let result = crate::rt::block_on(async {
+            crate::rt::time::timeout(Duration::from_secs(10), answer_rx).await
+        })
+        .expect("the launch is answered")
+        .expect("the launch is answered");
+        if let Err(why) = &result {
+            panic!("the frame fires: {why}");
+        }
+        let kept = crate::pipeline::fire::kept_kv_writes(TAG)
+            .expect("what the lane wrote is kept before its fire is answered");
+        assert_eq!(kept.fold, Some(4), "the fold the engine told");
 
         let (_engine, _channels) = lane.shutdown();
     }

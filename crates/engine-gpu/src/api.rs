@@ -35,6 +35,12 @@ pub struct PendingStep {
     pub landed: Landed,
 
     pub rows: Option<Vec<Vec<f32>>>,
+
+    /// The fold reports of a forward whose own completion does not carry
+    /// them: fired with its completion deferred, the pass that reports the
+    /// step carries them; on an engine that settles inside `submit`, the
+    /// frame's settle there tells them.
+    pub wrote: Vec<engine::KvWrites>,
 }
 
 /// What a backend crate supplies beside its [`Serve`] to stand behind the
@@ -175,6 +181,27 @@ impl<B: Host> Gpu<B> {
 
     pub fn loaded_mut(&mut self) -> EngineResult<&mut Shell<B>> {
         self.shell.as_mut().ok_or_else(unloaded::<B>)
+    }
+
+    /// Tells the sink what the lanes of the frame just settled inside
+    /// `submit` wrote, step by step, before `submit` returns: a fold's
+    /// count is the host's from the fire's submit, so this waits on
+    /// nothing. A step that wrote nothing tells nothing; `submit`'s result
+    /// answers for it.
+    fn tell_wrote(&mut self) {
+        let (Some(sink), Some((frame, steps))) = (self.sink.as_ref(), self.pending.as_mut()) else {
+            return;
+        };
+        for (step, pending) in steps.iter_mut().enumerate() {
+            let wrote = std::mem::take(&mut pending.wrote);
+            if !wrote.is_empty() {
+                let at = engine::StepDone {
+                    frame: *frame,
+                    step: step as u32,
+                };
+                (sink)(at, engine::StepOutcome::Wrote(wrote));
+            }
+        }
     }
 }
 
@@ -685,6 +712,7 @@ where
 
         if !self.settles_asynchronously() {
             self.settle_frame(&mut ticket)?;
+            self.tell_wrote();
         }
         Ok(ticket)
     }
@@ -957,20 +985,25 @@ impl<B: Host> Gpu<B> {
             feeds,
         } = envelope;
 
-        let mut verbs: Vec<engine::fire::RsVerb> = submission
+        // A lane whose fold length is the device's takes the count its
+        // program's `fold` port holds at the fire; the lane stays stated as
+        // it came, so its record keeps its own frozen position and the
+        // lane reports what the fold froze (`store::frozen`).
+        let mut folds: Vec<crate::store::frozen::DeviceFold> = submission
             .lanes
             .iter()
-            .map(|lane| lane.rs.clone())
+            .map(|lane| crate::store::frozen::DeviceFold {
+                count: None,
+                reports: lane.reports,
+            })
             .collect();
         for attachment in &submission.attachments {
-            if let engine::fire::RsVerb::Buffer { fold, .. } = &mut verbs[attachment.lane as usize]
-                && *fold == engine::fire::FoldLen::Device
-                && let Some(n) = self
+            let lane = attachment.lane as usize;
+            if crate::store::frozen::counted_on_device(&submission.lanes[lane].rs) {
+                folds[lane].count = self
                     .programs
                     .envelope_fold(attachment.instance)
-                    .map_err(refusal)?
-            {
-                *fold = engine::fire::FoldLen::Host(n);
+                    .map_err(refusal)?;
             }
         }
 
@@ -1014,7 +1047,12 @@ impl<B: Host> Gpu<B> {
             }
         }
 
-        let sink = self.sink.clone();
+        // A frame settled inside `submit` answers there: its steps'
+        // completions tell the sink nothing.
+        let sink = self
+            .sink
+            .clone()
+            .filter(|_| B::settles_asynchronously(self));
 
         let mut lane_adapters: Vec<Option<u32>> = vec![None; submission.lanes.len()];
         if !self.adapters.is_empty() {
@@ -1118,7 +1156,7 @@ impl<B: Host> Gpu<B> {
 
                 translation: &lane.kv.translation,
 
-                rs: &verbs[at],
+                rs: &lane.rs,
                 rs_reset: lane.rs_reset,
                 rs_slot: lane.rs_slot,
                 rs_snapshots: &lane.rs_snapshots,
@@ -1132,22 +1170,29 @@ impl<B: Host> Gpu<B> {
             })
             .collect();
 
+        let wrote;
         let landed = {
             use engine::frame::Shell as FrameShell;
-            let done = sink.filter(|_| !defers).map(|sink| Done { at, sink });
-            let prepared = FrameShell::prepare(
+            let done = sink.filter(|_| !defers).map(|sink| Done {
+                at,
+                sink,
+                wrote: Vec::new(),
+            });
+            let mut prepared = FrameShell::prepare(
                 shell,
                 StepView {
                     lanes: &seated,
                     attachments: &[],
                     media: &media,
                     clips: &clips,
+                    folds: &folds,
                     done,
                     guests,
                 },
                 None,
             )
             .map_err(fault)?;
+            wrote = std::mem::take(&mut prepared.wrote);
             let enqueued = FrameShell::enqueue(shell, prepared).map_err(fault)?;
             FrameShell::settle(shell, enqueued).map_err(fault)?
         };
@@ -1165,6 +1210,7 @@ impl<B: Host> Gpu<B> {
                     .collect(),
                 landed,
                 rows: None,
+                wrote,
             },
         ))
     }
