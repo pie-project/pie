@@ -80,6 +80,19 @@ impl Ring {
         Ok(at)
     }
 
+    /// Writes `bytes` into the next slot (padded to whole words) once the
+    /// program that last read it has run; answers the slot.
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<usize> {
+        let (whole, tail) = bytes.as_chunks::<4>();
+        let mut words: Vec<u32> = whole.iter().map(|w| u32::from_le_bytes(*w)).collect();
+        if !tail.is_empty() {
+            let mut last = [0u8; 4];
+            last[..tail.len()].copy_from_slice(tail);
+            words.push(u32::from_le_bytes(last));
+        }
+        self.write(&words)
+    }
+
     /// Slot `at`'s buffer, a fire's host parameter.
     #[must_use]
     pub fn buffer(&self, at: usize) -> &Buffer {

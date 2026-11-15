@@ -83,10 +83,14 @@ fn bind_and_run(
     if device.is_dry() {
         return Ok(Vec::new());
     }
-    let mut bulk: Vec<(u32, Buffer)> = Vec::new();
+    // Bulk data, written into the bulk ring's next slot.
+    let mut bulk: Vec<(u32, usize)> = Vec::new();
     for source in &sig.params {
         if let Source::Bulk { input } = *source {
-            bulk.push((input, inputs.upload_bulk(device, input)?));
+            let ring = pools.bulk().ok_or_else(|| Fault::Unbound {
+                what: "the bulk ring, which this load did not lay".into(),
+            })?;
+            bulk.push((input, ring.write_bytes(inputs.bulk_bytes(input))?));
         }
     }
     // The fire's inputs, written into the staging ring's next slot.
@@ -124,7 +128,10 @@ fn bind_and_run(
             Source::Pool { row, plane } => pools.get(row, plane),
             Source::HostBank { param } => pools.host_bank(param),
             Source::Stage => slot.and_then(|at| pools.ring_buffer(at)),
-            Source::Bulk { input } => bulk.iter().find(|(i, _)| *i == input).map(|(_, b)| b),
+            Source::Bulk { input } => bulk
+                .iter()
+                .find(|(i, _)| *i == input)
+                .and_then(|&(_, at)| pools.bulk_buffer(at)),
             Source::Temp | Source::Staged { .. } | Source::Streamed { .. } => None,
         }
         .ok_or_else(|| Fault::Unbound {
@@ -138,6 +145,12 @@ fn bind_and_run(
         // output) is ready.
         let done = outs.first().map(Buffer::ready).transpose()?;
         if let Some(ring) = pools.ring() {
+            ring.read_by(at, done);
+        }
+    }
+    for &(_, at) in &bulk {
+        let done = outs.first().map(Buffer::ready).transpose()?;
+        if let Some(ring) = pools.bulk() {
             ring.read_by(at, done);
         }
     }

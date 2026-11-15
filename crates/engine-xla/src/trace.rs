@@ -43,8 +43,9 @@ pub enum Source {
     /// The staging ring's slot itself: u32 `[slab rows, 128]` in pinned
     /// host memory (`crate::store::Pools::stage_at`).
     Stage,
-    /// Bulk data a maintenance program lands, uploaded with it
-    /// (`crate::inputs::Inputs::bulk`).
+    /// Bulk data a maintenance program lands, in the bulk ring's slot
+    /// (pinned host memory, `crate::store::Pools::bulk`), read through
+    /// `to_device` of slices (`crate::inputs::Inputs::bulk`).
     Bulk { input: u32 },
     /// An activation computed by this fire; zeros until written.
     Temp,
@@ -478,7 +479,7 @@ fn root_value(
         } else {
             func.slice_axis(t, 0, 0, ty.dims[0])?
         }
-    } else if let Source::HostBank { .. } = r.source {
+    } else if let Source::HostBank { .. } | Source::Bulk { .. } = r.source {
         params.push((root, r.source));
         let p = func.param(ty, None);
         func.pin_host(p);

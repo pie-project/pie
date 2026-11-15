@@ -83,8 +83,6 @@ fn state_dtype(declared: Dtype) -> Dtype {
 const NULL_CHUNK: u32 = 0;
 const RESERVED_CHUNKS: u32 = 2;
 
-/// Lone weight slots one program lands at most.
-const LONE_SLOTS: usize = 64;
 
 /// A plane's affine map: page or slot id `p` is the plane's block
 /// `p · stride + offset` of its view.
@@ -177,7 +175,14 @@ pub struct Pools {
     act_chunks: Vec<(u32, u32)>,
     /// The staging ring's pinned host slots (none on a dry device).
     ring: Option<stage::Ring>,
+    /// The bulk ring: pinned host slots of a chunk each, the bytes a
+    /// maintenance program lands (none on a dry device).
+    bulk: Option<stage::Ring>,
 }
+
+/// The bulk ring's slots: one a write fills while the write before it,
+/// still in flight, reads the other.
+const BULK_SLOTS: u32 = 2;
 
 /// What a load stages a fire's inputs in: the slab's rows (the largest
 /// staged set any fire of the load can take), the ring's slots (frames in
@@ -448,28 +453,6 @@ pub fn slab_bytes(
     Ok((u64::from(rows) * ROW_BYTES).div_ceil(chunk) * chunk)
 }
 
-/// The most device memory one bulk write (`crate::inputs::Inputs::bulk`)
-/// takes beside the pool while it lands: the largest of a zeroed chunk
-/// (the load's warm copies), a batch of the largest slot (a tier move) and
-/// a run of streamed weight atoms (`STREAMED_RUN`, where weights stream).
-pub fn bulk_bytes(
-    trace: &Trace,
-    paging: Paging,
-    rs: Option<&crate::rs::Layout>,
-    target: u64,
-    streams: bool,
-) -> Result<u64> {
-    let layout = layout_of(trace, paging, rs, target)?;
-    let slot = layout.shapes.iter().map(|s| s.slot_bytes).max().unwrap_or(0);
-    let run = if streams { STREAMED_RUN } else { 0 };
-    Ok(layout
-        .chunk_bytes
-        .max(slot * SLOT_BATCH as u64)
-        .max(run))
-}
-
-/// The most bytes one bulk write lands of streamed weight atoms.
-pub const STREAMED_RUN: u64 = 256 << 20;
 
 /// The layout `trace` lays at `paging`, its chunk near `target` bytes.
 pub fn layout_of(
@@ -540,6 +523,11 @@ impl Pools {
             None
         } else {
             Some(stage::Ring::lay(device, staging.slots, staging.rows)?)
+        };
+        let bulk = if device.is_dry() {
+            None
+        } else {
+            Some(stage::Ring::lay(device, BULK_SLOTS, narrow(chunk_rows))?)
         };
         layout.check_reach(chunks)?;
         let pool_rows = u64::from(chunks) * layout.chunk_bytes / ROW_BYTES;
@@ -668,6 +656,7 @@ impl Pools {
             slab: (slab_row, staging.rows),
             act_chunks,
             ring,
+            bulk,
         })
     }
 
@@ -799,10 +788,9 @@ impl Pools {
             .collect::<Result<_>>()?;
         placed.sort_by_key(|&(at, _)| at);
         // Slots that lie back to back land as one block (the load seats a
-        // shape's atoms in a row), up to a few hundred MiB an upload; lone
-        // slots land a few dozen to a program (one update each), so the
-        // programs are few and small.
-        let most = i64::try_from((STREAMED_RUN / shape.slot_bytes.max(1)).max(1)).unwrap_or(1);
+        // shape's atoms in a row), a chunk's worth a run (the bulk ring's
+        // slot); lone slots land a chunk's worth a program run.
+        let most = i64::try_from(self.units(rows)).unwrap_or(1);
         let step = i64::try_from(rows).unwrap_or(i64::MAX);
         let mut runs: Vec<(i64, Vec<&[u8]>)> = Vec::new();
         for (at, bytes) in placed {
@@ -826,7 +814,7 @@ impl Pools {
                 &bytes,
             )?;
         }
-        for batch in lone.chunks(LONE_SLOTS) {
+        for batch in lone.chunks(self.units(rows)) {
             let at: Vec<i64> = batch.iter().map(|(at, _)| *at).collect();
             let bytes: Vec<u8> = batch
                 .iter()
@@ -1088,6 +1076,42 @@ impl Pools {
     pub fn staging(&self) -> (u32, u32, u32) {
         let slots = self.ring.as_ref().map_or(0, |r| r.shape().0);
         (self.slab.0, self.slab.1, slots)
+    }
+
+    /// The units of `rows` pool rows one maintenance program run moves: a
+    /// chunk's worth, what a bulk ring slot holds and a program's index
+    /// list.
+    #[must_use]
+    pub fn units(&self, rows: u64) -> usize {
+        usize::try_from(self.layout.chunk_bytes / ROW_BYTES / rows.max(1))
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// The rows a bulk ring slot holds: a chunk's.
+    #[must_use]
+    pub fn bulk_rows(&self) -> u32 {
+        narrow(self.layout.chunk_bytes / ROW_BYTES)
+    }
+
+    /// The bulk ring's slots and bytes.
+    #[must_use]
+    pub fn bulk_ring(&self) -> (u32, u64) {
+        self.bulk.as_ref().map_or((0, 0), |r| {
+            let (slots, rows) = r.shape();
+            (slots, u64::from(slots) * u64::from(rows) * ROW_BYTES)
+        })
+    }
+
+    /// The bulk ring, where the load laid one.
+    pub fn bulk(&mut self) -> Option<&mut stage::Ring> {
+        self.bulk.as_mut()
+    }
+
+    /// The bulk ring's slot `at`.
+    #[must_use]
+    pub fn bulk_buffer(&self, at: usize) -> Option<&Buffer> {
+        self.bulk.as_ref().map(|r| r.buffer(at))
     }
 
     /// The staging ring's slot `at`.
@@ -1365,24 +1389,25 @@ impl Pools {
         Ok(())
     }
 
-    /// Zeros blocks of `rows` pool rows from each of `all`, `SLOT_BATCH` a
-    /// program run.
+    /// Zeros blocks of `rows` pool rows from each of `all`, a chunk's worth
+    /// a program run ([`Pools::units`]).
     fn zero_rows(&mut self, device: &Device, handles: &Handles, rows: u64, all: &[i64]) -> Result<()> {
-        for chunk in all.chunks(SLOT_BATCH) {
-            let mut at = chunk.to_vec();
-            pad_batch(&mut at, 1);
-            let (inputs, list) = indices(handles, &at);
+        let cap = self.units(rows);
+        for chunk in all.chunks(cap) {
+            let (inputs, list, count) = listed(handles, chunk, cap);
             let tracer = Tracer::new(handles).with_stage(self.stage_at(inputs.rows()));
             let root = self.root;
-            let n = at.len() as i64;
             tracer.emit(&mut |cx| {
-                let mut whole = cx.read(root)?;
+                let whole = cx.read(root)?;
+                let list = cx.read(list)?;
+                let count = cx.read(count)?;
+                let count = cx.reshape(count, &[])?;
                 let zero = cx.const_i(Elem::U32, 0, &[rows as i64, 128]);
-                let col = cx.const_i(Elem::I32, 0, &[]);
-                for m in 0..n {
-                    let row = index_at(cx, list, m, 1)?;
-                    whole = cx.dynamic_update_slice(whole, zero, &[row, col])?;
-                }
+                let whole = each(cx, whole, count, |f, i, pool| {
+                    let row = entry(f, list, i, 0)?;
+                    let col = f.const_i(Elem::I32, 0, &[]);
+                    f.dynamic_update_slice(pool, zero, &[row, col])
+                })?;
                 cx.write(root, whole)
             })?;
             crate::exec::maintain(device, tracer, self, &inputs)?;
@@ -1412,8 +1437,8 @@ impl Pools {
     }
 
     /// Runs, at load, every maintenance program a fire, a snapshot or a
-    /// park lands later: the slot copy, write and zero, `SLOT_BATCH` slots
-    /// a run, at each slot size the pool states (its state shapes, the
+    /// park lands later: the slot copy, write and zero, one program a slot
+    /// size whatever the count, at each slot size the pool states (its state shapes, the
     /// `Channel` slots, a whole chunk for an evacuation). Each lands the
     /// null chunk's rows (zeros) onto themselves.
     pub fn warm_copies(&mut self, device: &Device, handles: &Handles) -> Result<()> {
@@ -1444,7 +1469,7 @@ impl Pools {
     }
 
     /// Copies `rows` pool rows from each span's first to its second, a
-    /// program a run of equal sizes, in order.
+    /// program a run of equal sizes (a chunk's worth a run), in order.
     fn copy_rows(
         &mut self,
         device: &Device,
@@ -1457,29 +1482,37 @@ impl Pools {
             let end = (at..spans.len())
                 .find(|&i| spans[i].0 != rows)
                 .unwrap_or(spans.len());
-          for chunk in spans[at..end].chunks(SLOT_BATCH) {
-            let mut flat: Vec<i64> = chunk
-                .iter()
-                .flat_map(|&(_, from, to)| [from, to])
-                .collect();
-            pad_batch(&mut flat, 2);
-            let (inputs, list) = indices(handles, &flat);
-            let tracer = Tracer::new(handles).with_stage(self.stage_at(inputs.rows()));
-            let root = self.root;
-            let n = flat.len() as i64 / 2;
-            tracer.emit(&mut |cx| {
-                let mut whole = cx.read(root)?;
-                let col = cx.const_i(Elem::I32, 0, &[]);
-                for m in 0..n {
-                    let from = index_at(cx, list, 2 * m, 1)?;
-                    let to = index_at(cx, list, 2 * m + 1, 1)?;
-                    let block = cx.dynamic_slice(whole, &[from, col], &[rows as i64, 128])?;
-                    whole = cx.dynamic_update_slice(whole, block, &[to, col])?;
-                }
-                cx.write(root, whole)
-            })?;
-            crate::exec::maintain(device, tracer, self, &inputs)?;
-          }
+            let cap = self.units(rows);
+            for chunk in spans[at..end].chunks(cap) {
+                let flat: Vec<i64> = chunk
+                    .iter()
+                    .flat_map(|&(_, from, to)| [from, to])
+                    .collect();
+                let (inputs, list, count) = listed(handles, &flat, 2 * cap);
+                let tracer = Tracer::new(handles).with_stage(self.stage_at(inputs.rows()));
+                let root = self.root;
+                tracer.emit(&mut |cx| {
+                    let whole = cx.read(root)?;
+                    let list = cx.read(list)?;
+                    let count = cx.read(count)?;
+                    let count = cx.reshape(count, &[])?;
+                    let two = cx.const_i(Elem::I32, 2, &[]);
+                    let pairs = cx.div(count, two)?;
+                    let whole = each(cx, whole, pairs, |f, i, pool| {
+                        let from = entry(f, list, i, 2)?;
+                        let two = f.const_i(Elem::I32, 2, &[]);
+                        let one = f.const_i(Elem::I32, 1, &[]);
+                        let at = f.mul(i, two)?;
+                        let at = f.add(at, one)?;
+                        let to = pick(f, list, at)?;
+                        let col = f.const_i(Elem::I32, 0, &[]);
+                        let block = f.dynamic_slice(pool, &[from, col], &[rows as i64, 128])?;
+                        f.dynamic_update_slice(pool, block, &[to, col])
+                    })?;
+                    cx.write(root, whole)
+                })?;
+                crate::exec::maintain(device, tracer, self, &inputs)?;
+            }
             at = end;
         }
         Ok(())
@@ -1645,57 +1678,50 @@ impl Pools {
     }
 
     /// Lands `bytes`, blocks of `rows` pool rows each, at pool rows `at`:
-    /// one upload, a `dynamic_update_slice` a block.
+    /// a chunk's worth a run, each written into the bulk ring's next slot
+    /// (pinned host memory, laid at load) and landed from it by the program
+    /// a block at a time. Nothing is uploaded and nothing allocated.
     fn write_rows(
         &mut self,
         device: &Device,
         handles: &Handles,
         rows: u64,
-        mut at: Vec<i64>,
+        at: Vec<i64>,
         bytes: &[u8],
     ) -> Result<()> {
         if at.is_empty() || device.is_dry() {
             return Ok(());
         }
-        if at.len() > SLOT_BATCH {
-            let per = (rows * ROW_BYTES) as usize;
-            for (k, chunk) in at.chunks(SLOT_BATCH).enumerate() {
-                let from = k * SLOT_BATCH * per;
-                let bytes = &bytes[from..from + chunk.len() * per];
-                self.write_rows(device, handles, rows, chunk.to_vec(), bytes)?;
-            }
-            return Ok(());
+        let cap = self.units(rows);
+        let per = (rows * ROW_BYTES) as usize;
+        let ring_rows = self.bulk_rows();
+        for (k, chunk) in at.chunks(cap).enumerate() {
+            let data = bytes[k * cap * per..(k * cap + chunk.len()) * per].to_vec();
+            let mut inputs = crate::inputs::Inputs::new();
+            let landed = inputs.bulk(handles, ring_rows, data);
+            let (list, count) = list_into(&mut inputs, handles, chunk, cap);
+            let tracer = Tracer::new(handles).with_stage(self.stage_at(inputs.rows()));
+            let root = self.root;
+            tracer.emit(&mut |cx| {
+                let whole = cx.read(root)?;
+                let all = cx.read(landed)?;
+                let list = cx.read(list)?;
+                let count = cx.read(count)?;
+                let count = cx.reshape(count, &[])?;
+                let whole = each(cx, whole, count, |f, i, pool| {
+                    let row = entry(f, list, i, 0)?;
+                    let col = f.const_i(Elem::I32, 0, &[]);
+                    let by = f.const_i(Elem::I32, rows as i64, &[]);
+                    let from = f.mul(i, by)?;
+                    let block = f.dynamic_slice(all, &[from, col], &[rows as i64, 128])?;
+                    let block = f.to_device(block);
+                    f.dynamic_update_slice(pool, block, &[row, col])
+                })?;
+                cx.write(root, whole)
+            })?;
+            crate::exec::maintain(device, tracer, self, &inputs)?;
         }
-        // Pads repeat the last slot with its own bytes.
-        let n = at.len();
-        pad_batch(&mut at, 1);
-        let mut data = bytes.to_vec();
-        let last = bytes[bytes.len() - (rows * ROW_BYTES) as usize..].to_vec();
-        for _ in n..at.len() {
-            data.extend_from_slice(&last);
-        }
-        let mut inputs = crate::inputs::Inputs::new();
-        let landed = inputs.bulk(handles, narrow(at.len() as u64 * rows), data);
-        let values: Vec<i32> = at
-            .iter()
-            .map(|&v| i32::try_from(v).unwrap_or(i32::MAX))
-            .collect();
-        let list = inputs.i32s(handles, &values, 1);
-        let tracer = Tracer::new(handles).with_stage(self.stage_at(inputs.rows()));
-        let root = self.root;
-        let count = at.len() as i64;
-        tracer.emit(&mut |cx| {
-            let mut whole = cx.read(root)?;
-            let all = cx.read(landed)?;
-            let col = cx.const_i(Elem::I32, 0, &[]);
-            for m in 0..count {
-                let row = index_at(cx, list, m, 1)?;
-                let block = cx.slice_axis(all, 0, m * rows as i64, (m + 1) * rows as i64)?;
-                whole = cx.dynamic_update_slice(whole, block, &[row, col])?;
-            }
-            cx.write(root, whole)
-        })?;
-        crate::exec::maintain(device, tracer, self, &inputs)
+        Ok(())
     }
 
     /// The bytes of each of `slots` (`(shape, slot ref)`), in order.
@@ -1715,20 +1741,80 @@ impl Pools {
     }
 }
 
-/// Pads `list` (pairs when `per` is 2) to a power of two by repeating its
-/// last entry, which lands again what it landed.
-/// Slots (or slot pairs) a maintenance program moves a run: every slot
-/// read, write, copy and zero runs over this many, so one program a slot
-/// size serves them all and the warm ladder builds it (`warm_copies`).
-pub const SLOT_BATCH: usize = 16;
+/// `values`, padded with zeros to `cap` entries, and how many there are:
+/// the inputs of a maintenance program, so its text names how many entries
+/// it can hold and not how many it moves, nor which: one program a size
+/// serves every count.
+fn listed(handles: &Handles, values: &[i64], cap: usize) -> (crate::inputs::Inputs, Tensor, Tensor) {
+    let mut inputs = crate::inputs::Inputs::new();
+    let (list, count) = list_into(&mut inputs, handles, values, cap);
+    (inputs, list, count)
+}
 
-/// Pads `list` (pairs when `per` is 2) to `SLOT_BATCH` entries by repeating
-/// its last, which lands again what it landed.
-fn pad_batch(list: &mut Vec<i64>, per: usize) {
-    let last: Vec<i64> = list[list.len() - per..].to_vec();
-    while list.len() < SLOT_BATCH * per {
-        list.extend_from_slice(&last);
-    }
+/// [`listed`] into `inputs`.
+fn list_into(
+    inputs: &mut crate::inputs::Inputs,
+    handles: &Handles,
+    values: &[i64],
+    cap: usize,
+) -> (Tensor, Tensor) {
+    let mut padded: Vec<i32> = values
+        .iter()
+        .map(|&v| i32::try_from(v).unwrap_or(i32::MAX))
+        .collect();
+    padded.resize(cap.max(values.len()), 0);
+    let list = inputs.i32s(handles, &padded, 1);
+    let count = inputs.i32s(handles, &[values.len() as i32], 1);
+    (list, count)
+}
+
+/// `body(i, pool)` for `i` in `0..count` (an i32 scalar), the pool carried:
+/// one loop, whatever the count.
+fn each(
+    cx: &mut crate::emit::Cx<'_>,
+    whole: kernels_xla::hlo::Val,
+    count: kernels_xla::hlo::Val,
+    body: impl FnOnce(&mut kernels_xla::hlo::Func, kernels_xla::hlo::Val, kernels_xla::hlo::Val) -> kernels_xla::hlo::Built<kernels_xla::hlo::Val>,
+) -> std::result::Result<kernels_xla::hlo::Val, kernels_xla::Error> {
+    let zero = cx.const_i(Elem::I32, 0, &[]);
+    let out = cx.while_loop(
+        &[zero, whole],
+        |f, a| f.compare(kernels_xla::hlo::Cmp::Lt, a[0], count),
+        |f, a| {
+            let one = f.const_i(Elem::I32, 1, &[]);
+            let next = f.add(a[0], one)?;
+            let pool = body(f, a[0], a[1])?;
+            Ok(vec![next, pool])
+        },
+    )?;
+    Ok(out[1])
+}
+
+/// Entry `i · stride` of the i32 list `list` (`stride` 0: entry `i`).
+fn entry(
+    f: &mut kernels_xla::hlo::Func,
+    list: kernels_xla::hlo::Val,
+    i: kernels_xla::hlo::Val,
+    stride: i64,
+) -> kernels_xla::hlo::Built<kernels_xla::hlo::Val> {
+    let at = if stride == 0 {
+        i
+    } else {
+        let by = f.const_i(Elem::I32, stride, &[]);
+        f.mul(i, by)?
+    };
+    pick(f, list, at)
+}
+
+/// Entry `at` (an i32 scalar) of the i32 list `list`.
+fn pick(
+    f: &mut kernels_xla::hlo::Func,
+    list: kernels_xla::hlo::Val,
+    at: kernels_xla::hlo::Val,
+) -> kernels_xla::hlo::Built<kernels_xla::hlo::Val> {
+    let flat = f.reshape(list, &[f.ty(list).elements()])?;
+    let one = f.dynamic_slice(flat, &[at], &[1])?;
+    f.reshape(one, &[])
 }
 
 /// `values` as the one i32 input of a maintenance program, so its text names
@@ -1742,23 +1828,6 @@ fn indices(handles: &Handles, values: &[i64]) -> (crate::inputs::Inputs, Tensor)
         .collect();
     let at = inputs.i32s(handles, &values, 1);
     (inputs, at)
-}
-
-/// Entry `i` of an `indices` input, times `scale`, as an i32 scalar.
-fn index_at(
-    cx: &mut crate::emit::Cx<'_>,
-    at: Tensor,
-    i: i64,
-    scale: i64,
-) -> std::result::Result<kernels_xla::hlo::Val, kernels_xla::Error> {
-    let all = cx.read(at)?;
-    let one = cx.slice_axis(all, 0, i, i + 1)?;
-    let one = cx.reshape(one, &[])?;
-    if scale == 1 {
-        return Ok(one);
-    }
-    let by = cx.const_i(Elem::I32, scale, &[]);
-    Ok(cx.mul(one, by)?)
 }
 
 /// Each cache row a `PoolGather` folds into, and the width of its
