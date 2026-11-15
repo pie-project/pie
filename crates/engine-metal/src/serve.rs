@@ -255,6 +255,9 @@ pub struct Attached {
 }
 
 pub struct Shell {
+    /// The load's pipeline walk is running ([`Shell::warm_pipelines`]): a
+    /// seat-addressed fire backs only what the walk backed for it.
+    warming: bool,
     tuning: kernels_metal::Tuning,
     device: Context,
     /// What the device held for this process before the load: the ledger's
@@ -1342,6 +1345,7 @@ impl PreparedLoad<'_> {
             ane,
             weights,
             rung: arena.floor_tokens(),
+            warming: false,
             batch_bottom: arena.rung_guest_top(arena.floor_tokens()),
             arena,
             pools,
@@ -1786,53 +1790,68 @@ impl Shell {
         // names chunks the pool does not hold. A fire's matmul tiles follow
         // its rows (the prefill fires walk every rung's), its attention one
         // row a lane (one decode lane reaches it).
-        let seats = {
-            let layout = self.pools.layout();
+        // One seat: a fire's matmul tiles follow its rows (the prefill fires
+        // walk every rung's), its attention one row a lane, its readout the
+        // rows it reads; no key turns on how many seats carry them, so the
+        // walk backs one seat run, not every seat's.
+        let seats = 1u32;
+        let context = self.paging().context().max(1);
+        let standing = self.rung;
+        let committed = self.pools.committed_segments();
+        // The walk's lanes lie in the first `seats` seat runs: those
+        // segments, not every seat's.
+        {
             let facts = self.pool_chunk_facts();
             let per = facts
                 .shape(crate::store::layout::LIST)
                 .map_or(1, |shape| shape.slots_per_chunk.max(1));
             let run = self.paging().pages_per_slot.div_ceil(per).max(1);
-            let below = facts.total_chunks.saturating_sub(layout.act_span()).saturating_sub(1);
-            layout.seats.min(below / run).max(1)
-        };
-        let context = self.paging().context().max(1);
-        let standing = self.rung;
-        let committed = self.pools.committed_segments();
-        let mut fires = 0u32;
-        for rung in self.arena.rung_tokens() {
-            self.set_rung(self.rung, rung)?;
-            let prompt = rung.min(self.budgets.tokens.max_tokens).min(context).max(1);
-            let lanes = rung.min(self.budgets.tokens.max_lanes).min(seats).max(1);
-            let prompt_tokens = vec![0u32; prompt as usize];
-            let one = [0u32];
-            let prefill = [Seated {
-                held: Some(0),
-                ..Seated::of(Lane {
-                    slot: 0,
-                    word: self.trace.facts.word(&poem::Request::new(prompt, false)),
-                    tokens: &prompt_tokens,
-                })
-            }];
-            let word = self.trace.facts.word(&poem::Request::new(1, false));
-            let decode: Vec<Seated<'_>> = (0..lanes)
-                .map(|slot| Seated {
-                    held: Some(0),
-                    ..Seated::of(Lane { slot, word, tokens: &one })
-                })
-                .collect();
-            for lanes in [&prefill[..], &decode[..]] {
-                let prepared = FrameShell::prepare(
-                    self,
-                    StepView { lanes, attachments: &[], media: &[], clips: &[], done: None },
-                    None,
-                )?;
-                drop(self.walk(&prepared, true)?);
-                fires += 1;
+            let chunks = 1 + seats.saturating_mul(run);
+            let segments = chunks.div_ceil(facts.segment_chunks.max(1));
+            if segments > committed {
+                self.commit_segments(segments)?;
             }
         }
-        // Seat-addressed fires back the seats' segments: what the walk
-        // backed goes back, and the rung stands where it stood.
+        self.warming = true;
+        let walked = (|| -> Result<u32> {
+            let mut fires = 0u32;
+            for rung in self.arena.rung_tokens() {
+                self.set_rung(self.rung, rung)?;
+                let prompt = rung.min(self.budgets.tokens.max_tokens).min(context).max(1);
+                let lanes = rung.min(self.budgets.tokens.max_lanes).min(seats).max(1);
+                let prompt_tokens = vec![0u32; prompt as usize];
+                let one = [0u32];
+                let prefill = [Seated {
+                    held: Some(0),
+                    ..Seated::of(Lane {
+                        slot: 0,
+                        word: self.trace.facts.word(&poem::Request::new(prompt, false)),
+                        tokens: &prompt_tokens,
+                    })
+                }];
+                let word = self.trace.facts.word(&poem::Request::new(1, false));
+                let decode: Vec<Seated<'_>> = (0..lanes)
+                    .map(|slot| Seated {
+                        held: Some(0),
+                        ..Seated::of(Lane { slot, word, tokens: &one })
+                    })
+                    .collect();
+                for lanes in [&prefill[..], &decode[..]] {
+                    let prepared = FrameShell::prepare(
+                        self,
+                        StepView { lanes, attachments: &[], media: &[], clips: &[], done: None },
+                        None,
+                    )?;
+                    drop(self.walk(&prepared, true)?);
+                    fires += 1;
+                }
+            }
+            Ok(fires)
+        })();
+        self.warming = false;
+        let fires = walked?;
+        // What the walk backed goes back, and the rung stands where it
+        // stood.
         if self.rung != standing {
             self.set_rung(self.rung, standing)?;
         }
@@ -3875,7 +3894,7 @@ impl Shell {
         };
         // A caller firing directly (every lane seat-addressed) has no
         // runtime to commit ahead of it: the segments its seats touch back now.
-        if lanes.iter().all(|seated| !seated.refs) {
+        if lanes.iter().all(|seated| !seated.refs) && !self.warming {
             self.pools.commit_seats()?;
         }
         // Every page and record piece the fire reads or writes is checked
