@@ -62,12 +62,7 @@ impl SharedGrow {
             rung_walk: Arc::new(std::sync::Mutex::new(RungWalk::default())),
             ticks: Arc::new(AtomicU64::new(0)),
             idle_since: Arc::new(std::sync::Mutex::new(None)),
-            live_lanes: Arc::new(move || {
-                let most = crate::engine::get_spec(engine)
-                    .map_or(usize::MAX, |spec| spec.limits.max_forward_requests);
-                let live = crate::inferlet::process::live_count().min(most);
-                u32::try_from(live).unwrap_or(u32::MAX)
-            }),
+            live_lanes: Arc::new(move || super::live_lanes(engine)),
             raise_blocked: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -78,7 +73,7 @@ impl SharedGrow {
         self.ticks.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// The lanes live now that may decode, as the walk's floor counts them;
+    /// The lanes live now, in place of the engine's ([`super::live_lanes`]);
     /// for a test.
     #[cfg(test)]
     #[must_use]
@@ -90,28 +85,29 @@ impl SharedGrow {
         self
     }
 
-    /// Steps the activation rung toward the rung the passes still to run
-    /// ask of a fire ([`super::want_rows`]), the smallest while none asks
-    /// past it, until there or until a step has to wait: caps fires, lowers
-    /// the pool's rung once no wider fire is in flight, or raises it, the
+    /// The rows the walk holds the rung to ([`super::asked_rows`]): what
+    /// queued and flying fires ask ([`super::wanted_rows`]), and never
+    /// fewer than the row each live lane stages at its next step
+    /// ([`super::live_lanes`]: the seats of working sets not waiting for
+    /// room). Lanes, not processes: one process decoding 64 sequences
+    /// holds the rung of 64 between its steps, so its decode fires never
+    /// wait on a raise; a process waiting for room holds none, so the span
+    /// its lanes would fire in can be lent to the state it waits for, and
+    /// its pass asks again once served. Not the engine's whole lane count:
+    /// a pool with one live lane rests at a small rung, and one with none
+    /// at the smallest.
+    pub(crate) fn walk_rows(&self) -> u32 {
+        super::wanted_rows(self.engine).max((self.live_lanes)())
+    }
+
+    /// Steps the activation rung toward the rung the rows asked take
+    /// ([`Self::walk_rows`]), the smallest while none is asked past it,
+    /// until there or until a step has to wait: caps fires, lowers the
+    /// pool's rung once no wider fire is in flight, or raises it, the
     /// engine first copying the state out of the larger span. A raise short
     /// of room waits on the room the asking pass has the planner free; one
     /// to a rung the engine has not armed waits on its capture
     /// ([`super::rung_goal`]), the walk looking again each poll.
-    /// The rows the walk holds the rung to: what passes and decode batches
-    /// ask ([`super::wanted_rows`]), and never fewer than the lanes live now
-    /// (a live process each, at most the engine's lane count), whose decode
-    /// frames the scheduler holds rather than cuts. The rung never lowers
-    /// under the decode fire the live lanes take, so their decodes never
-    /// wait on a raise nobody funds; a lane joins through its prompt's pass,
-    /// whose funded ask counts the live lanes beside it
-    /// (`pipeline::fire::prefill_want`), and a batch's ask raises at once
-    /// where nothing moves. Not the engine's whole lane count: a pool with
-    /// one live lane rests at a small rung.
-    fn walk_rows(&self) -> u32 {
-        super::wanted_rows(self.engine).max((self.live_lanes)())
-    }
-
     pub(crate) async fn walk_rung(&self) {
         loop {
             let (current, retired) = self.epochs();

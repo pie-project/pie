@@ -532,6 +532,109 @@ async fn a_small_pass_raises_to_the_rung_covering_it_and_an_idle_pool_lowers_aft
     assert_eq!(shared.lock().unwrap().pool().act_reserved(), 1);
 }
 
+/// One process decoding 64 sequences, at rest between its steps (nothing
+/// queued, no pass asking): its 64 lanes are live, each a seat its working
+/// set holds, so the walk's goal stays the rung of 64 however long, and the
+/// next step's fire is not cut. Once the set is released the lanes are gone
+/// and the idle pool comes down after the patience.
+#[tokio::test(flavor = "current_thread")]
+async fn one_process_of_64_lanes_at_rest_keeps_the_rung_of_64() {
+    use crate::store::chunks::Seats;
+    use crate::store::genmap::GenMap;
+    use crate::store::kv::page_table::WorkingSetId;
+    const ENGINE: usize = 64;
+    let (mut pool, mut engine) = fine_on_demand();
+    pool.set_max_lanes(512);
+    assert_eq!(
+        walk_segments(&mut pool, 6, 0, &mut engine),
+        Retarget::Reached
+    );
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    // The engine's own count: the seats, not a stand-in.
+    let grow = SharedGrow::new(0, ENGINE, shared.clone());
+    grant_rung(ENGINE, u32::MAX);
+    let seats = Arc::new(Mutex::new(Seats::new(256)));
+    seats.lock().unwrap().count_for(ENGINE);
+    let ws: WorkingSetId = GenMap::<_, ()>::new().insert(());
+
+    // The one process's wave: 64 lanes seated, the rung raised for them.
+    seats.lock().unwrap().seats(ws, 64).unwrap();
+    assert_eq!(live_lanes(ENGINE), 64);
+    let want = want_rows(ENGINE, 64);
+    let engine = Arc::new(Mutex::new(engine));
+    take_raise(
+        &shared,
+        |pool| rung_goal(pool, ENGINE, asked_rows(ENGINE)),
+        &Lane(engine.clone()),
+    )
+    .await
+    .unwrap();
+    raise_now(&shared, ENGINE, 64);
+    assert_eq!(shared.lock().unwrap().rung(), 64);
+    assert_eq!(fire_cap(ENGINE), 64);
+
+    // At rest: no ask stands, one process is all there is.
+    drop(want);
+    assert_eq!(wanted_rows(ENGINE), 0);
+    assert_eq!(grow.walk_rows(), 64, "its lanes, not its one process");
+    for _ in 0..PATIENCE + 2 {
+        grow.ticked_for_test();
+        grow.walk_rung().await;
+        assert_eq!(fire_cap(ENGINE), 64, "the next step is not cut");
+        assert_eq!(shared.lock().unwrap().rung(), 64);
+    }
+
+    // The sequences end: no lane is live, and the idle pool comes down.
+    seats.lock().unwrap().release(ws);
+    assert_eq!(grow.walk_rows(), 0);
+    for _ in 0..=PATIENCE {
+        grow.ticked_for_test();
+        grow.walk_rung().await;
+    }
+    assert_eq!(fire_cap(ENGINE), 1, "past the patience: fires cut back");
+    grant_rung(ENGINE, 1);
+    grow.walk_rung().await;
+    grow.walk_rung().await;
+    assert_eq!(shared.lock().unwrap().rung(), 1, "lowered back");
+}
+
+/// A process waiting for room contributes no rows to what the walk holds
+/// the rung for: 64 lanes decoding beside a pass of 32 lanes that waits on
+/// the planner's grant hold the rung of 64, not of 96, so the span past it
+/// can be lent to the state the waiter needs. Served, its lanes count
+/// again.
+#[test]
+fn a_process_waiting_for_room_holds_no_rows_of_the_rung() {
+    use crate::store::chunks::{Seats, WaitsForRoom};
+    use crate::store::genmap::GenMap;
+    use crate::store::kv::page_table::WorkingSetId;
+    const ENGINE: usize = 65;
+    let (mut pool, _) = fine_on_demand();
+    pool.set_max_lanes(512);
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let grow = SharedGrow::new(0, ENGINE, shared.clone());
+    let seats = Arc::new(Mutex::new(Seats::new(256)));
+    seats.lock().unwrap().count_for(ENGINE);
+    let mut sets = GenMap::<_, ()>::new();
+    let (decoding, waiter): (WorkingSetId, WorkingSetId) = (sets.insert(()), sets.insert(()));
+    seats.lock().unwrap().seats(decoding, 64).unwrap();
+    seats.lock().unwrap().seats(waiter, 32).unwrap();
+    let goal = || rung_goal(&shared.lock().unwrap(), ENGINE, grow.walk_rows());
+    assert_eq!(grow.walk_rows(), 96);
+    assert_eq!(goal(), 128, "both live: the rung covering 96");
+
+    let waits = WaitsForRoom::mark(&seats, [waiter]);
+    assert_eq!(live_lanes(ENGINE), 64);
+    assert_eq!(grow.walk_rows(), 64, "the waiter's 32 lanes stage no row");
+    assert_eq!(goal(), 64);
+    // The one count: the scheduler's ask and a pass's read the same lanes.
+    assert_eq!(asked_rows(ENGINE), 64);
+
+    drop(waits);
+    assert_eq!(grow.walk_rows(), 96, "served: its lanes stage rows again");
+    assert_eq!(goal(), 128);
+}
+
 /// A wave arriving at a pool resting at rung 1, the span backed on demand:
 /// the scheduler's ask for its 64 one-row launches cannot widen fires in
 /// the call (the engine backs the carve first), so it wakes the walk. The

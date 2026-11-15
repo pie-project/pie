@@ -519,6 +519,12 @@ pub struct Seats {
     held: HashMap<WorkingSetId, Vec<Slot>>,
     /// A working set let its seats go: a fire short of seats looks again.
     freed: Arc<tokio::sync::Notify>,
+    /// The working sets whose pass waits for room ([`WaitsForRoom`]), by
+    /// how many of its waits stand: their lanes stage no row until served.
+    waiting: HashMap<WorkingSetId, u32>,
+    /// The engine whose rung counts the lanes seated here
+    /// ([`crate::store::shared::live_lanes`]); none where no rung does.
+    engine: Option<usize>,
 }
 
 /// The seats a model without state slots holds at once at most.
@@ -584,6 +590,37 @@ impl Seats {
             of_state_slots: state_slots != 0,
             held: HashMap::new(),
             freed: Arc::new(tokio::sync::Notify::new()),
+            waiting: HashMap::new(),
+            engine: None,
+        }
+    }
+
+    /// The lanes seated here are `engine`'s live lanes: each change of
+    /// [`Seats::staging`] is told its rung.
+    pub fn count_for(&mut self, engine: usize) {
+        self.engine = Some(engine);
+        self.tell();
+    }
+
+    /// The lanes that stage a row at their next step: the seats held by
+    /// working sets whose pass does not wait for room. A working set holds
+    /// a seat for each lane it fires at once from its first fire until it
+    /// is released, so a lane counts from its prompt's first piece until
+    /// its sequence ends, between its steps too.
+    #[must_use]
+    pub fn staging(&self) -> u32 {
+        let lanes: usize = self
+            .held
+            .iter()
+            .filter(|(ws, _)| !self.waiting.contains_key(ws))
+            .map(|(_, held)| held.len())
+            .sum();
+        u32::try_from(lanes).unwrap_or(u32::MAX)
+    }
+
+    fn tell(&self) {
+        if let Some(engine) = self.engine {
+            crate::store::shared::set_live_lanes(engine, self.staging());
         }
     }
 
@@ -603,6 +640,7 @@ impl Seats {
                     of_state_slots: self.of_state_slots,
                 })?;
             self.held.entry(ws).or_default().extend(fresh);
+            self.tell();
         }
         Ok(self.held.get(&ws).map_or_else(Vec::new, |held| {
             held[..lanes as usize]
@@ -618,6 +656,7 @@ impl Seats {
             self.slots
                 .release(Holder::WorkingSet(ws.to_bits()), &held, 0);
             self.freed.notify_waiters();
+            self.tell();
         }
     }
 
@@ -634,6 +673,52 @@ impl Seats {
     #[cfg(test)]
     pub fn available(&self) -> u32 {
         self.slots.available(0) as u32
+    }
+}
+
+/// A pass waits for room (the planner's grant): until this is dropped the
+/// lanes of its working sets stage no row, so they are not among the lanes
+/// the rung is held for ([`Seats::staging`]) and the span they would fire
+/// in may be lent to state. Served, the pass asks the rung again as any
+/// pass does.
+#[derive(Debug)]
+pub struct WaitsForRoom {
+    seats: Arc<std::sync::Mutex<Seats>>,
+    sets: Vec<WorkingSetId>,
+}
+
+impl WaitsForRoom {
+    pub fn mark(
+        seats: &Arc<std::sync::Mutex<Seats>>,
+        sets: impl IntoIterator<Item = WorkingSetId>,
+    ) -> Self {
+        let sets: Vec<WorkingSetId> = sets.into_iter().collect();
+        {
+            let mut seats = seats.lock().unwrap();
+            for ws in &sets {
+                *seats.waiting.entry(*ws).or_insert(0) += 1;
+            }
+            seats.tell();
+        }
+        Self {
+            seats: Arc::clone(seats),
+            sets,
+        }
+    }
+}
+
+impl Drop for WaitsForRoom {
+    fn drop(&mut self) {
+        let mut seats = self.seats.lock().unwrap();
+        for ws in &self.sets {
+            if let Some(waits) = seats.waiting.get_mut(ws) {
+                *waits -= 1;
+                if *waits == 0 {
+                    seats.waiting.remove(ws);
+                }
+            }
+        }
+        seats.tell();
     }
 }
 
@@ -888,6 +973,42 @@ mod seats_tests {
 
     fn working_set() -> WorkingSetId {
         GenMap::<_, ()>::new().insert(())
+    }
+
+    /// The lanes that stage a row next step are the seats held by working
+    /// sets not waiting for room: a set's seats count from its first fire
+    /// until it is released, and not while its pass waits.
+    #[test]
+    fn the_lanes_staging_are_the_seats_of_sets_not_waiting_for_room() {
+        use super::WaitsForRoom;
+        use std::sync::{Arc, Mutex};
+        let mut sets = GenMap::<_, ()>::new();
+        let (a, b): (WorkingSetId, WorkingSetId) = (sets.insert(()), sets.insert(()));
+        let seats = Arc::new(Mutex::new(Seats::new(256)));
+        assert_eq!(seats.lock().unwrap().staging(), 0);
+        seats.lock().unwrap().seats(a, 64).unwrap();
+        seats.lock().unwrap().seats(b, 32).unwrap();
+        // A set fires the lanes it has again: no more seats.
+        seats.lock().unwrap().seats(a, 64).unwrap();
+        assert_eq!(seats.lock().unwrap().staging(), 96);
+
+        let waits = WaitsForRoom::mark(&seats, [b]);
+        assert_eq!(seats.lock().unwrap().staging(), 64, "b's 32 stage no row");
+        // Two of its waits stand (a promote inside a reserve): both end
+        // before its lanes count again.
+        let inner = WaitsForRoom::mark(&seats, [b]);
+        drop(waits);
+        assert_eq!(seats.lock().unwrap().staging(), 64);
+        drop(inner);
+        assert_eq!(seats.lock().unwrap().staging(), 96);
+
+        // Released while it waits: nothing of it counts after the wait.
+        let waits = WaitsForRoom::mark(&seats, [a]);
+        seats.lock().unwrap().release(a);
+        drop(waits);
+        assert_eq!(seats.lock().unwrap().staging(), 32);
+        seats.lock().unwrap().release(b);
+        assert_eq!(seats.lock().unwrap().staging(), 0);
     }
 
     /// A fire past a stateless model's seats is refused with the seats

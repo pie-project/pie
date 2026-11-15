@@ -90,6 +90,8 @@ struct RungGate {
     /// An ask the pool could not take in the call asks the walker to look
     /// now ([`ask_walk`]).
     walk: tokio::sync::Notify,
+    /// The lanes live now ([`live_lanes`]).
+    lanes: std::sync::atomic::AtomicU32,
 }
 
 /// Every engine's rung gate by its id: one for each engine named here,
@@ -110,6 +112,7 @@ fn rung_gate(engine: usize) -> &'static RungGate {
             grant: std::sync::atomic::AtomicU32::new(u32::MAX),
             event: tokio::sync::Notify::new(),
             walk: tokio::sync::Notify::new(),
+            lanes: std::sync::atomic::AtomicU32::new(0),
         }))
     })
 }
@@ -356,6 +359,42 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
         set_fire_cap(engine, cap);
     }
     drop(pool);
+}
+
+/// The lanes of `engine` live now: those that stage a row at their next
+/// step, each the seat a working set holds from its first fire until it is
+/// released, less the sets whose pass waits for room
+/// ([`crate::store::chunks::Seats::staging`]). Lanes, not processes: one
+/// process decoding 64 sequences is 64 rows a step, and a process waiting
+/// for room is none.
+///
+/// The one count of the lanes behind the rows an engine is asked for,
+/// read by all three that count them: the walk's goal ([`asked_rows`],
+/// which the lending walk's hold reads too), the scheduler's ask (queued
+/// and flying launches' lanes are among these; `scheduler::worker`) and a
+/// pass's ask (its prompt's rows beside the other lanes' decode rows;
+/// `pipeline::fire::prefill_want`).
+#[must_use]
+pub fn live_lanes(engine: usize) -> u32 {
+    rung_gate(engine)
+        .lanes
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The seats tell the lanes they hold ([`live_lanes`]).
+pub(crate) fn set_live_lanes(engine: usize, lanes: u32) {
+    rung_gate(engine)
+        .lanes
+        .store(lanes, std::sync::atomic::Ordering::Release);
+}
+
+/// The rows `engine` is being asked for: what queued and flying fires ask
+/// ([`wanted_rows`]: each pass's ask and the scheduler's for its launches)
+/// and never fewer than the row each live lane stages at its next step
+/// ([`live_lanes`]).
+#[must_use]
+pub fn asked_rows(engine: usize) -> u32 {
+    wanted_rows(engine).max(live_lanes(engine))
 }
 
 /// The most rows a pass still to run on `engine` asks of one fire; 0 where

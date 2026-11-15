@@ -145,15 +145,15 @@ pub struct EngineStores {
 pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -> usize {
     let stores: Vec<Option<Stores>> = engines
         .iter()
-        .map(|engine| {
+        .enumerate()
+        .map(|(index, engine)| {
             let pools = &engine.pools;
             if let Some(shared) = &engine.shared {
-                return Some(shared_stores(
-                    shared,
-                    &engine.tiers,
-                    kv_page_size,
-                    engine.max_context,
-                ));
+                let stores =
+                    shared_stores(shared, &engine.tiers, kv_page_size, engine.max_context);
+                // The pool's rung is held for the lanes seated here.
+                stores.seats.lock().unwrap().count_for(index);
+                return Some(stores);
             }
             let mut kv = KvStore::with_pages(
                 pools.kv,

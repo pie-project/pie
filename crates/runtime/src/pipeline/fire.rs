@@ -319,11 +319,18 @@ fn kv_demand(
 /// before this ask returns waited on a frame only this ask completes (Mac's
 /// gemma-4-e4b c64 stall). The lane is parked first, so the scheduler waits
 /// on none of its fires.
+///
+/// While the ask stands unserved the lanes of `sets` (the pass's working
+/// sets) stage no row, so the rung is not held for them
+/// ([`crate::store::chunks::WaitsForRoom`]); a grant made at the first look
+/// marks nothing.
 async fn acquire_grant<C: FireContext>(
     ctx: &mut C,
     pipeline_id: uuid::Uuid,
     demand: crate::planner::Demand,
     windowed: bool,
+    seats: &Arc<std::sync::Mutex<crate::store::chunks::Seats>>,
+    sets: impl IntoIterator<Item = crate::store::kv::page_table::WorkingSetId>,
 ) -> Result<Option<crate::planner::AllocationGrant>, String> {
     if demand.is_zero() {
         return Ok(Some(crate::planner::AllocationGrant::empty()));
@@ -341,15 +348,21 @@ async fn acquire_grant<C: FireContext>(
     }
     // A yield may have dropped snapshots the demand was quoted against, so
     // the caller quotes it again rather than asking for the same.
-    let acquire = crate::inferlet::process::said(
+    let mut acquire = std::pin::pin!(crate::inferlet::process::said(
         "plan: the planner's grant",
         pid,
         planner.acquire(pid, pipeline_id, demand),
-    );
-    let acquired = if windowed {
-        ask_while_tail_lands(ctx, acquire, || planner.pages_freed()).await?
-    } else {
-        acquire.await
+    ));
+    let acquired = match futures::poll!(acquire.as_mut()) {
+        std::task::Poll::Ready(acquired) => acquired,
+        std::task::Poll::Pending => {
+            let _waits = crate::store::chunks::WaitsForRoom::mark(seats, sets);
+            if windowed {
+                ask_while_tail_lands(ctx, acquire, || planner.pages_freed()).await?
+            } else {
+                acquire.await
+            }
+        }
     };
     match acquired.map_err(|error| format!("pipeline: KV capacity: {error}"))? {
         crate::planner::Acquired::Granted(grant) => Ok(Some(grant)),
@@ -708,17 +721,21 @@ fn prefill_share(page: u32, engine: usize) -> u32 {
     })
 }
 
-/// The rows a fire on `engine` takes to carry `rows` of a prompt whole
-/// beside the decode row each other live lane spends in it
-/// ([`crate::inferlet::host::model::prefill_share`]), up to what the
-/// largest activation rung holds: what a pass asks the rung for
-/// ([`crate::store::shared::want_rows`]).
-fn prefill_want(rows: usize, engine: usize) -> u32 {
+/// The rows a fire on `engine` takes to carry the `rows` of a pass's `own`
+/// lanes whole beside the decode row each other live lane stages
+/// ([`crate::store::shared::live_lanes`], the pass's own among them once
+/// seated), up to what the largest activation rung holds: what a pass asks
+/// the rung for ([`crate::store::shared::want_rows`]).
+///
+/// [`prefill_share`] is not this count and stays by process: it is the cut
+/// of one prompt's pieces among the prompts' owners, as on main, so fires
+/// compose as there.
+fn prefill_want(rows: usize, own: usize, engine: usize) -> u32 {
     if let Some(fire) = fire_rows() {
         return fire.min(u32::try_from(rows).unwrap_or(u32::MAX));
     }
-    let live = crate::inferlet::process::live_count();
-    let wide = rows.saturating_add(live.saturating_sub(1));
+    let live = crate::store::shared::live_lanes(engine) as usize;
+    let wide = rows.saturating_add(live.saturating_sub(own));
     let wide = u32::try_from(wide).unwrap_or(u32::MAX);
     crate::engine::get_spec(engine).map_or(wide, |spec| {
         let budget = crate::inferlet::host::model::prefill_budget(spec.limits).max(1);
@@ -1406,7 +1423,9 @@ async fn promote<C: FireContext>(
         kv_pages: u32::try_from(below).unwrap_or(u32::MAX),
         rs: Default::default(),
     };
-    let Some(mut grant) = acquire_grant(ctx, pipeline_id, demand, false).await? else {
+    let Some(mut grant) =
+        acquire_grant(ctx, pipeline_id, demand, false, &stores.seats, [ws.id]).await?
+    else {
         return Ok(None);
     };
     let Ok(lease) = ws.fire_lease() else {
@@ -1658,7 +1677,16 @@ async fn reserve<C: FireContext>(
                 .map_err(|_| "pipeline: KV demand exceeds the planner ABI".to_string())?,
             rs: rs_slot_demand(stores, rs_ids, &plan)?,
         };
-        let Some(mut grant) = acquire_grant(ctx, pipeline_id, demand, windowed).await? else {
+        let Some(mut grant) = acquire_grant(
+            ctx,
+            pipeline_id,
+            demand,
+            windowed,
+            &stores.seats,
+            sets.iter().map(|(set, _)| set.id),
+        )
+        .await?
+        else {
             continue;
         };
         let mut leases = Vec::with_capacity(sets.len());
@@ -3141,7 +3169,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // the pool raises toward it where room allows, and lowers once no
         // pass asks past its smallest rung, so no piece cut wider waits on a
         // lowered rung.
-        let wanted = prefill_want(rows_total, engine);
+        let wanted = prefill_want(rows_total, full.lanes.len(), engine);
         // A few rows ask too where the cap cuts them narrower (a pool
         // resting at a small rung): the smallest rung that covers them.
         let asks = crate::store::shared::pass_asks(

@@ -533,27 +533,49 @@ struct LaneCount {
 }
 
 impl LaneCount {
-    /// The rows the launches ask a fire to carry: their distinct lanes and
-    /// the rows past its first each prompt carries, summed. A wave of
-    /// prompts queued and in flight together asks for the fire that carries
-    /// them all; a lane's pipelined one-row decodes count once, as its lane.
+    /// The rows the launches ask a fire to carry: the engine's `live` lanes
+    /// ([`crate::store::shared::live_lanes`]: a seated lane queued or in
+    /// flight is one of them, and one between its steps stages its row at
+    /// the next), the seatless lanes, and the rows past its first each
+    /// prompt carries, summed. A wave of prompts queued and in flight
+    /// together asks for the fire that carries them all beside the lanes
+    /// decoding; a lane's pipelined one-row decodes count once, as its
+    /// lane. Nothing queued or in flight asks nothing: the walk's own floor
+    /// holds the rung for lanes at rest.
     fn rows<'a>(
         &mut self,
         fires: impl IntoIterator<Item = &'a crate::engine::FireRequest> + Clone,
+        live: usize,
     ) -> usize {
-        let lanes = self.count(fires.clone());
+        let (seated, seatless) = self.lanes(fires.clone());
+        if seated + seatless == 0 {
+            return 0;
+        }
         let prompts: usize = fires
             .into_iter()
             .flat_map(|fire| &fire.lanes)
             .map(|lane| lane.tokens.len().saturating_sub(1))
             .sum();
-        prompts.saturating_add(lanes)
+        prompts
+            .saturating_add(seated.max(live))
+            .saturating_add(seatless)
     }
 
+    #[cfg(test)]
     fn count<'a>(
         &mut self,
         fires: impl IntoIterator<Item = &'a crate::engine::FireRequest>,
     ) -> usize {
+        let (seated, seatless) = self.lanes(fires);
+        seated + seatless
+    }
+
+    /// The distinct seated lanes of `fires`, and the seatless lanes of the
+    /// launch carrying the most of them.
+    fn lanes<'a>(
+        &mut self,
+        fires: impl IntoIterator<Item = &'a crate::engine::FireRequest>,
+    ) -> (usize, usize) {
         self.seats.fill(0);
         let mut seated = 0usize;
         let mut seatless = 0usize;
@@ -575,7 +597,7 @@ impl LaneCount {
             }
             seatless = seatless.max(here);
         }
-        seated + seatless
+        (seated, seatless)
     }
 }
 
@@ -1288,7 +1310,10 @@ impl BatchScheduler {
                 .iter()
                 .flat_map(|batch: &PendingLaunchBatch| batch.requests.iter())
                 .map(|request| &request.request);
-            let rows = lane_count.rows(queued.chain(flying));
+            let rows = lane_count.rows(
+                queued.chain(flying),
+                crate::store::shared::live_lanes(engine_id) as usize,
+            );
             batch_want.ask(engine_id, rows.min(limits.max_forward_tokens));
             let cap = crate::store::shared::fire_cap(engine_id);
             let mut stepped = limits;
@@ -2913,7 +2938,15 @@ mod tests {
         let launches: Vec<_> = (0..16).map(|_| fire(0..64)).collect();
         let mut count = LaneCount::default();
         assert_eq!(count.count(&launches), 64);
-        assert_eq!(count.rows(&launches), 64, "one-row decodes: their lanes");
+        assert_eq!(count.rows(&launches, 0), 64, "one-row decodes: their lanes");
+        // The first of a step's launches, 64 lanes live: the step's 64 rows
+        // are asked, not the one queued so far; the lanes queued are among
+        // the live ones, not beside them.
+        assert_eq!(count.rows(&[fire(0..1)], 64), 64);
+        assert_eq!(count.rows(&launches, 64), 64);
+        assert_eq!(count.rows(&launches, 16), 64, "more queued than counted");
+        // Nothing queued or in flight asks nothing, whatever is live.
+        assert_eq!(count.rows(&[], 64), 0);
         // Two batches of 32 lanes each, each pipelined: 64 rows.
         let halves: Vec<_> = (0..8).flat_map(|_| [fire(0..32), fire(32..64)]).collect();
         assert_eq!(count.count(&halves), 64);
@@ -2950,7 +2983,11 @@ mod tests {
         }
         let mut count = LaneCount::default();
         assert_eq!(count.count(&launches), 256);
-        assert_eq!(count.rows(&launches), 32 * 128 + 224);
+        assert_eq!(count.rows(&launches, 0), 32 * 128 + 224);
+        assert_eq!(count.rows(&launches, 256), 32 * 128 + 224);
+        // 44 more lanes live between their steps: their rows beside the
+        // wave's.
+        assert_eq!(count.rows(&launches, 300), 32 * 127 + 300);
     }
 
     #[test]
