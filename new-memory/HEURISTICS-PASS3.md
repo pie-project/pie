@@ -170,10 +170,11 @@ at a fixed offset per dispatch.
 Figures used from the background: the arming note measures rungs 1, 6, 8 and dispatches
 54, 91, 43 on qwen3-micro-text, qwen35-tiny, gemma4-e4b-mini-l1, and infers 7, 90, 120
 recordings per arm when every class mix is its own recording
-(the arming session's recordings note, not in the repo). Those inferred counts were
-withdrawn after this pass was written: with the classes resolved the keyed-by-present count is
-56, 528, 112 recordings per arm and the superset form ruled since is one recording per (arm,
-rung); wherever 90 and 120 appear below, read them as a lower bound on the keyed form.
+(the arming session's recordings note, not in the repo). Those inferred counts (7, 90, 120)
+were withdrawn after this pass was written, once the mask classes were resolved from the
+programs; the form ruled since is the superset one, a single recording per (arm, rung) made at
+load, under which no cap on kept shapes has anything to evict. Where 90 and 120 appear below
+they are the withdrawn figures and carry no argument.
 The probe reads 759 built SPIR-V kernels: the largest push block is 92 bytes, a kernel has at
 most 12 buffers of its own, and with one u32 offset per own buffer the largest params block
 is 116 bytes, 144 with an offset and an extent (computed from
