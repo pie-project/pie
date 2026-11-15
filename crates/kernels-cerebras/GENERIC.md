@@ -3,7 +3,9 @@
 Status: M1a, M1b, M1c (the stream primitives on the simulator) and M1d (flux2-mini's denoise step
 compiled by the generic compiler, no hand layout, on the simulator) done (§4.1), M2a (klein-4B's
 stream program builds for the system fabric at 1024², §4.1) compile side done, M2b (it links:
-1,065 ELFs; 1.52 s a step predicted, §4.1), and M3 (the decode
+1,065 ELFs; 1.52 s a step predicted, §4.1), M1f / M1g (flux2-mini's denoise loop re-launched on
+the simulator, driven through the engine by a guest, its static arrays from a checkpoint, §4.1)
+and M3 (the decode
 layouts as points of the Floorplan, §2.5). ARCHITECTURE.md is what runs for decode.
 
 **Goal.** A `.poem` model the compiler has not seen runs on the wafer with no hand code. The
@@ -948,6 +950,58 @@ milestone's tail.
   - Left: a step's inputs from a guest's request (the inferlet's loop), not files; the static
     arrays cut from a checkpoint, not a capture; the 64-row and klein programs re-launched on
     the simulator (only 16 + 16 was).
+
+- **M1g** (flux2-mini through the engine as Pie drives it: a guest's denoise loop, the static
+  arrays from a checkpoint).
+  - **The static arrays from the checkpoint** (kernels-cerebras `stream::host`). Every array a
+    value fills that no step's inputs make (the weight tiles, the regions' shared residents) is
+    stated as spans over the trace's values (`statics/<k>.npy`, `[value, row, col, len, stride,
+    flags, count, step]`: runs of a value's elements cast to the array's words, a tile one span
+    where its rows are consecutive inputs). A program now compiles with no capture: its h2d files
+    are only the arrays no value fills (the regions' tables, the PEs' config words; flux2-mini at
+    16 + 16: 41 arrays of spans, 66 on file, 9 entries; 2.7 MB against the capture compile's
+    27 MB). Given a capture, each array's spans are held to its words at compile time. The engine
+    (`Reading::statics`) lands the checkpoint through the import contract (`prepare::land`),
+    makes the spans' values with an engine-cpu `Forward` over the landed planes, and writes the
+    arrays once a load, on the first step. `tools/wafer/stream/run.py` still needs a capture
+    compile (it reads every array's file).
+  - **The request path** (engine-cerebras `backend::stream`). A load whose program is a stream
+    reading's (`[cerebras.debug] program` = `wafer-compile stream`'s directory, `link` = its cslc
+    output) is a stream load: the facts and capabilities are the trace's (the voxel axis sized by
+    the budgets), the fabric is the SDK runtime on a thread of its own. A fire whose lanes are the
+    reading's classes (word and rows, a media lane's clip off `Step::voxels`, one group) is one
+    step: the prologues, each lane's inputs off the channels its `InputFeed`s name (the cell the
+    instance's own `take` would read, laid out a value a lane / a row a token / a row a voxel),
+    `Reading::entries`, the launch, `rows_back`, `Reading::finish` for the outputs the
+    attachments read, the epilogues over them (a lane's rows and the pass's later lanes', as for
+    decode), the lanes' readouts. The denoise loop is the guest's: its channels, the poem's flow
+    sigmas (`ScheduleFact::flow_sigmas`, as the runtime states them to an inferlet), its Euler
+    step in the epilogue. No scheduler or runtime change; `[cerebras.debug] stream_fabric =
+    "host"` runs the step's device part on engine-cpu (`reading::HostFabric`).
+  - **Host-only results** (engine-cerebras `a_stream_reading_runs_through_the_engine`, the
+    checkpoint a diffusers `Flux2Transformer2DModel` state dict written from the drawn weights):
+    every static array the engine makes from the checkpoint equals the capture compile's, word
+    for word; on the host fabric the guest's 2-step loop through `CerebrasEngine::submit` lands
+    bit for bit on the host's own loop and 3.48e-3 / 0.99999393 from diffusers at 64 rows.
+  - **Simulator** (16 + 16, the search's default, 77 x 28; the same CSL as M1f's, file for file;
+    the test binary in the SDK container, one load, `CerebrasEngine` driven by the guest):
+
+    | | vs engine-cpu (rel L2 / cosine) | vs diffusers | cycles | wall |
+    |---|---|---|---|---|
+    | step 0 (sigma 1), the first launch | | | 7.90M | 75 min |
+    | step 1 (sigma 0.7672), re-launched | | | 1.27M | 14 min |
+    | latent after step 1 | 1.20e-3 / 0.9999993 | | | |
+    | latent after step 2 | 3.86e-3 / 0.9999926 | 3.58e-3 / 0.9999936 | | |
+
+    The final latent is M1f's capture-fed `wafer-bench` run's bit for bit: the checkpoint's
+    static arrays are the capture's, and the guest's loop is the host's.
+  - Decode is unchanged: plan + build `diff -r` identical against 847c48a9d's wafer-compile for
+    qwen35-d0.8b, qwen35-d9b, llama31-8b, gptoss-20b, gemma4-e2b and tiny t08.
+  - Left: the stream program compiled and linked on load into the cache (it is given today, as
+    `build = "never"` would); `pie serve` with an inferlet: `text-to-media` needs a `text`
+    reading (flux2-mini has none) and the VAE readings, and the runtime's boot of a stream
+    deployment on the cerebras engine is untried; the 64-row and klein programs re-launched on the
+    simulator; the statics' host memory at klein (an f32 forward of the whole checkpoint).
 
 ## 5. Risks
 
