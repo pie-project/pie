@@ -1057,6 +1057,34 @@ impl Drop for RaiseFunding {
     }
 }
 
+/// The raise a scheduler's batch ask for `rows` lacks, funded as a pass's
+/// is ([`RaiseFunding`]) under process `pid` of one of the passes it
+/// carries: what the batch's wider launches wait on, so a wave arriving at a
+/// lowered rung is never cut narrower than the raise it asked for. Stops
+/// when dropped.
+pub(crate) struct BatchRaise(RaiseFunding);
+
+impl BatchRaise {
+    /// `None` where nothing can fund it: no shared pool on `engine`, or no
+    /// planner over `pid`.
+    pub(crate) fn start(
+        engine: usize,
+        pid: uuid::Uuid,
+        quorum: uuid::Uuid,
+        rows: u32,
+    ) -> Option<Self> {
+        let stores = crate::store::registry::try_get(0, engine)?;
+        let shared = stores.shared.clone()?;
+        crate::planner::planner_of(pid)?;
+        Some(Self(RaiseFunding::start(shared, engine, pid, quorum, rows)))
+    }
+
+    /// The planner refused the room (or the engine the raise's carve).
+    pub(crate) fn refused(&self) -> bool {
+        self.0.failed().is_some()
+    }
+}
+
 fn fire_rows() -> Option<u32> {
     static ROWS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     *ROWS.get_or_init(|| {
