@@ -2333,7 +2333,9 @@ impl BatchScheduler {
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "the worker loop's state, borrowed piece by piece as `post_frame` borrows it"
+        clippy::vec_box,
+        reason = "the worker loop's state, borrowed piece by piece as `post_frame` borrows it, \
+                  and the requests boxed as `batch::build_frame_submission` takes them"
     )]
     fn launch(
         waves: Vec<Vec<Box<PendingRequest>>>,
@@ -2376,7 +2378,9 @@ impl BatchScheduler {
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "the worker loop's state, borrowed piece by piece as `post_frame` borrows it"
+        clippy::vec_box,
+        reason = "the worker loop's state, borrowed piece by piece as `post_frame` borrows it, \
+                  and the requests boxed as `batch::build_frame_submission` takes them"
     )]
     fn launch_apart(
         refused: Vec<Box<PendingRequest>>,
@@ -2408,6 +2412,10 @@ impl BatchScheduler {
         launched
     }
 
+    #[allow(
+        clippy::vec_box,
+        reason = "the requests boxed as `batch::build_frame_submission` takes them"
+    )]
     fn retire_ready_launches(
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,

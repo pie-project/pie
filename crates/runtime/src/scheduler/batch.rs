@@ -738,7 +738,10 @@ mod tests {
                     .collect()
             })
             .collect();
-        assert_eq!(tokens, [vec![vec![11], vec![12]], vec![vec![22]], vec![vec![33]]]);
+        assert_eq!(
+            tokens,
+            [vec![vec![11], vec![12]], vec![vec![22]], vec![vec![33]]]
+        );
         let media: Vec<Vec<u32>> = flattened
             .iter()
             .map(|req| req.request.media.iter().map(|row| row.lane).collect())
