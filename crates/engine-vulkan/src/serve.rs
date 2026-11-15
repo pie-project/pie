@@ -183,7 +183,6 @@ impl Serve for Api {
             let key = key.expect("a recording was found under a key");
             let pixels = shell.pixel_spans(prepared)?;
             shell.shelf.generation = shell.shelf.generation.wrapping_add(1);
-            shell.advance(prepared);
             let seq = shell.airborne.enter();
             let counts = shell.airborne.clone();
             let done = prepared.done.take();
@@ -236,6 +235,7 @@ impl Serve for Api {
                     return Err(fault);
                 }
             };
+            shell.advance(prepared, &pending);
             shell.handles.rewind();
             return Ok(Plan::Replayed {
                 pending,

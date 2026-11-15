@@ -280,6 +280,47 @@ mod tests {
         assert_eq!(caught.left, None);
     }
 
+    /// A record stands where the last fold that went to the device left
+    /// it. A step that prepared and whose submit failed fired nothing and
+    /// leaves no position: the set's next fire, stating the same frozen
+    /// length, replays every slot behind it and not from a slot no fold
+    /// reached.
+    #[test]
+    fn a_step_that_never_fired_leaves_its_record_where_it_was() {
+        let pieces = [10, 11];
+        let mut frozen = Frozen::default();
+        let fold = |rows, first, count, held| {
+            LaneFold::of(
+                &buffer(0, FoldLen::Device),
+                rows,
+                first,
+                None,
+                Some(count),
+                held,
+            )
+            .unwrap()
+        };
+        // Nothing frozen, 4 rows at 0, the device folds 3: prepared, and
+        // its submit fails. The position it would leave is not left.
+        let failed = fold(4, 0, 3, frozen.held(&pieces));
+        assert_eq!(failed.left, Some(3));
+        assert_eq!(frozen.held(&pieces), None);
+
+        // The next fire still states 0 frozen, 2 rows at 4: it replays
+        // slots 0..4, all of them unfolded.
+        let next = fold(2, 4, 2, frozen.held(&pieces));
+        assert_eq!(next.plan.replay, 4);
+        // From the position of the step that never fired it would replay
+        // slot 3 alone, past three slots no fold reached.
+        assert_eq!(fold(2, 4, 2, failed.left).plan.replay, 1);
+
+        // This one goes to the device and leaves its position, and the
+        // fire after it replays from there.
+        frozen.leave(&pieces, next.left);
+        assert_eq!(frozen.held(&pieces), Some(2));
+        assert_eq!(fold(1, 6, 1, frozen.held(&pieces)).plan.replay, 4);
+    }
+
     /// The position travels with the record: a fork copy, a move to the
     /// host tier and back, and a copy over a slot that held another.
     #[test]

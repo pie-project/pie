@@ -3653,8 +3653,11 @@ impl<B: Serve> Shell<B> {
     }
 
     /// Moves each seat-addressed lane's held rows past `p`'s, and leaves
-    /// each record where `p`'s folds put it.
-    pub fn advance(&mut self, p: &Prepared<'_, B>) {
+    /// each record where `p`'s folds put it. Only a step that went to the
+    /// device does either, so this takes the submit's own `airborne`: a
+    /// step whose submit failed fired nothing, and its records and seats
+    /// stand where it found them.
+    pub fn advance(&mut self, p: &Prepared<'_, B>, _airborne: &B::Pending) {
         for (pieces, at) in &p.left {
             self.pools.leave_frozen(pieces, *at);
         }
@@ -4066,8 +4069,6 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
 
         let pixels = self.copy_pixels(&mut frame, &prepared)?;
 
-        self.advance(&prepared);
-
         let seq = self.airborne.enter();
         let launch = Launch {
             seq,
@@ -4087,6 +4088,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 return Err(fault);
             }
         };
+        self.advance(&prepared, &pending);
 
         self.handles.rewind();
 
