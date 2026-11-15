@@ -1757,6 +1757,16 @@ impl Shell {
             return Ok(());
         }
         self.drain()?;
+        // Every fold has landed and been told once drained: a record moved
+        // between tiers carries no length ahead of the runtime's, and the
+        // slot it lands in starts from what its verb states, never from
+        // a count its last occupant left.
+        if copy.shape == crate::store::layout::FIXED && copy.src != copy.dst {
+            for &(src, dst) in &copy.slots {
+                self.frozen_ahead.remove(&src);
+                self.frozen_ahead.remove(&dst);
+            }
+        }
         let mut frame = self.device.frame()?;
         self.pools.copy_slots(&mut frame, copy)?;
         self.grafted = Some(frame.commit_async(None)?);
