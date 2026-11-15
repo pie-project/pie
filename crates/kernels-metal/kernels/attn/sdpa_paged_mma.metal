@@ -408,7 +408,7 @@ METAL_FUNC void sdpa_wide_land(threadgroup bfloat* dst, const thread uint4* w, c
   }
 }
 
-// The simdgroup-matrix prompt read for wide heads (256 and 512). A threadgroup
+// The simdgroup-matrix prompt read for wide heads (128, 256 and 512). A threadgroup
 // owns 32 query rows of one head; its 4 x WN simdgroups split the rows in
 // eights and the head in 128-wide slices. Each simdgroup scores its slice of
 // the queries against a 16-key block staged in threadgroup memory, the
@@ -779,5 +779,6 @@ template <typename T, int D>
   [[kernel]] void sdpa_paged_mma_wide_lse<itype, d>(                         \
       sdpa_paged_mma_wide_types(itype), device float*, PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 
+instantiate_sdpa_paged_mma_wide(bfloat16, bfloat, 128)
 instantiate_sdpa_paged_mma_wide(bfloat16, bfloat, 256)
 instantiate_sdpa_paged_mma_wide(bfloat16, bfloat, 512)

@@ -275,7 +275,7 @@ pub enum SdpaPrefill {
 )]
 pub struct SdpaTileRowsPerRequest(pub u32);
 
-/// Whether 64-, 256- and 512-wide heads attend through the simdgroup-matrix kernels.
+/// Whether 64-, 128-, 256- and 512-wide heads attend through the simdgroup-matrix kernels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.mma", flag, default = true, tune = search)]
 pub struct SdpaMma;

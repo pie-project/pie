@@ -29,6 +29,7 @@ mod an_rs_page_past_the_first_buffer_holds_its_rows;
 mod each_checked_in_profile_runs_its_familys_old_tuning;
 mod every_catalog_deployment_dispatches;
 mod every_unit_compiles;
+mod mma_attention_at_128_matches_the_tiled_kernel_and_fp64;
 mod mma_attention_matches_fp64;
 mod mpp_attention_over_a_bf16_pool_matches_fp64;
 mod the_block_dyn_conv_matches_its_reference;

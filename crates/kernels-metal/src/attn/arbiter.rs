@@ -15,7 +15,12 @@ const MMA_LSE_ENTRY: &str = "sdpa_paged_mma_lse_bfloat16_d_64";
 
 /// The wide heads' simdgroup-matrix kernels, a 128-wide slice of the head a
 /// simdgroup and four row groups: as many threads as the head is wide.
-const MMA_WIDE: [(u32, &str, &str); 2] = [
+const MMA_WIDE: [(u32, &str, &str); 3] = [
+    (
+        128,
+        "sdpa_paged_mma_wide_bfloat16_d_128",
+        "sdpa_paged_mma_wide_lse_bfloat16_d_128",
+    ),
     (
         256,
         "sdpa_paged_mma_wide_bfloat16_d_256",
@@ -37,7 +42,7 @@ pub fn should_tile(rows: u32, requests: u32, tuning: &Tuning) -> bool {
 
 #[must_use]
 pub fn should_mma(head_dim: u32, tuning: &Tuning) -> bool {
-    // The plain and the lse kernels are stamped at 64, 256 and 512.
+    // The plain and the lse kernels are stamped at 64, 128, 256 and 512.
     tuning.sdpa_mma() && (head_dim == MMA_HEAD_DIM || MMA_WIDE.iter().any(|w| w.0 == head_dim))
 }
 
