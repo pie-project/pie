@@ -32,6 +32,10 @@ pub struct SharedGrow {
     ticks: Arc<AtomicU64>,
     /// The lanes live now that may decode ([`Self::walk_rows`]).
     live_lanes: Arc<dyn Fn() -> u32 + Send + Sync>,
+    /// The fire epochs a test stands in for the engine's stores' with
+    /// ([`Self::with_epochs`]); `None`: the stores' own ([`Self::epochs`]).
+    #[cfg(test)]
+    epochs_for_test: Option<Arc<dyn Fn() -> (u64, u64) + Send + Sync>>,
     /// The tick since which the rung has stood past what is asked: the
     /// lower that frees its chunks, and the cap down before it, wait the
     /// governor's patience from it.
@@ -79,6 +83,8 @@ impl SharedGrow {
             rung_walk: Arc::new(std::sync::Mutex::new(RungWalk::default())),
             ticks: Arc::new(AtomicU64::new(0)),
             idle_since: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            epochs_for_test: None,
             live_lanes: Arc::new(move || {
                 let most = crate::engine::get_spec(engine)
                     .map_or(usize::MAX, |spec| spec.limits.max_forward_requests);
@@ -108,6 +114,18 @@ impl SharedGrow {
     #[cfg(test)]
     pub(crate) fn ticked_for_test(&self) {
         self.ticks.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The fire epochs (the last handed out, the last retired) the walk
+    /// reads in place of the engine's stores'; for a test.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_epochs(
+        mut self,
+        epochs: impl Fn() -> (u64, u64) + Send + Sync + 'static,
+    ) -> Self {
+        self.epochs_for_test = Some(Arc::new(epochs));
+        self
     }
 
     /// The lanes live now that may decode, as the walk's floor counts them;
@@ -476,6 +494,10 @@ impl SharedGrow {
     /// The fire epochs of the engine's stores: the last handed out, and
     /// the last retired.
     fn epochs(&self) -> (u64, u64) {
+        #[cfg(test)]
+        if let Some(epochs) = &self.epochs_for_test {
+            return epochs();
+        }
         registry::try_get(self.model, self.engine).map_or((0, u64::MAX), |stores| {
             registry::with_kv_lock(&stores.kv, "shared-grow", |kv| {
                 (kv.current_epoch(), kv.retired_through())
