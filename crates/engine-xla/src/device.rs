@@ -157,6 +157,14 @@ impl Device {
         })
     }
 
+    /// A dry device that keeps nothing it traces anywhere but in itself:
+    /// no dump (`PIE_XLA_DUMP`), as a load's stage-only pass wants.
+    pub fn quiet() -> Result<Device> {
+        let mut device = Device::dry(None)?;
+        device.dump = None;
+        Ok(device)
+    }
+
     /// Whether this device only traces (see [`Device::dry`]).
     #[must_use]
     pub fn is_dry(&self) -> bool {
@@ -242,15 +250,16 @@ impl Device {
     /// Zeros of `dtype` over `[rows, width]`, or nothing on a dry device.
     pub fn zeros_or_dry(&self, dtype: Dtype, rows: u32, width: u32) -> Result<Option<Buffer>> {
         if self.is_dry() {
+            // Its program is the load's as on a device: traced (and compiled
+            // where a dry device compiles), never run.
+            self.zeros_program(dtype, rows, width)?;
             return Ok(None);
         }
         self.zeros(dtype, rows, width).map(Some)
     }
 
-    /// A pool plane of zeros, row-major as every program that reads a pool
-    /// lays it (`Func::pin_row_major`); an upload lands a narrow plane
-    /// column-major.
-    pub fn zeros(&self, dtype: Dtype, rows: u32, width: u32) -> Result<Buffer> {
+    /// The program that lays a `[rows, width]` plane of zeros.
+    fn zeros_program(&self, dtype: Dtype, rows: u32, width: u32) -> Result<Arc<Program>> {
         let ty = storage(dtype, rows, width).ok_or_else(|| Fault::Unbound {
             what: format!("a {dtype:?} plane, which has no storage form on this device"),
         })?;
@@ -261,13 +270,20 @@ impl Device {
             f.const_i(ty.elem, 0, &ty.dims)
         };
         f.pin_results_row_major();
-        let program = self.program(
+        self.prepare(
             &f.module("zeros", &[z]),
             Signature {
                 params: Vec::new(),
                 results: vec![None],
             },
-        )?;
+        )
+    }
+
+    /// A pool plane of zeros, row-major as every program that reads a pool
+    /// lays it (`Func::pin_row_major`); an upload lands a narrow plane
+    /// column-major.
+    pub fn zeros(&self, dtype: Dtype, rows: u32, width: u32) -> Result<Buffer> {
+        let program = self.zeros_program(dtype, rows, width)?;
         let mut outs = self.run(&program, Vec::new(), true)?;
         outs.pop().ok_or_else(|| Fault::Unbound {
             what: "the zeros program's plane".into(),
