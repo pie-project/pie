@@ -108,6 +108,8 @@ pub(crate) struct Stream {
     /// The static arrays' words, made from the checkpoint at the reading's first step and
     /// written each time its program is opened.
     statics: Option<Arc<Vec<Option<Vec<u32>>>>>,
+    /// Its static arrays are on the program open.
+    written: bool,
     steps: u64,
 }
 
@@ -123,8 +125,8 @@ pub(crate) struct Streams {
     /// thread of its own for the load.
     fabric: Remote,
     host_fabric: bool,
-    /// The reading whose program is open (the SDK's), its static arrays written.
-    open: Option<usize>,
+    /// The program open (the SDK's link): its readings' static arrays written as they run.
+    open: Option<std::path::PathBuf>,
 }
 
 impl Streams {
@@ -169,18 +171,24 @@ impl Streams {
             }
         }
         // the host fabric keeps each reading's arrays apart: a reading's are written on its first
-        // step; the SDK's program a reading at a time, its arrays written each time it opens
+        // step; the SDK's program a link at a time (co-resident readings share one), a reading's
+        // arrays written the first time it runs on the program open
+        let link = self.readings[ri].link.clone();
         let fresh = if self.host_fabric {
             self.readings[ri].steps == 0
-        } else if self.open == Some(ri) {
-            false
         } else {
-            self.open = None;
-            let link = self.readings[ri].link.clone();
-            self.fabric.call(move |f| f.switch(&link))?;
-            self.open = Some(ri);
-            true
+            if self.open.as_ref() != Some(&link) {
+                self.open = None;
+                for s in &mut self.readings {
+                    s.written = false;
+                }
+                let l = link.clone();
+                self.fabric.call(move |f| f.switch(&l))?;
+                self.open = Some(link);
+            }
+            !self.readings[ri].written
         };
+        self.readings[ri].written = true;
         if fresh {
             let words = Arc::clone(self.readings[ri].statics.as_ref().ok_or("no statics")?);
             let reading = Arc::clone(&self.readings[ri].reading);
@@ -673,6 +681,7 @@ impl CerebrasEngine {
                 host,
                 link: link.clone(),
                 statics: None,
+                written: false,
                 steps: 0,
             });
         }
@@ -699,7 +708,8 @@ impl CerebrasEngine {
                     host: Forward::host_for(trace.clone(), &of, &all).map_err(load)?,
                     link: std::path::PathBuf::new(),
                     statics: Some(Arc::new(Vec::new())),
-                        steps: 0,
+                    written: false,
+                    steps: 0,
                 });
             }
         }

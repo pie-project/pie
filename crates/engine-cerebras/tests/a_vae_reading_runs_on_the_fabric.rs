@@ -176,7 +176,10 @@ fn flux_2_minis_vae_on_the_fabric() {
     let trace = common::trace();
     let mut f = forward(&trace, &out.join("ckpt"));
     let (clip, lat, pipe) = latent();
-    let dir = out.join("vae");
+    // `READING_COMBINE`: co-resident with the text and denoise readings (16 rows a class), one
+    // program, the decode launched by its reading's id
+    let combine = std::env::var("READING_COMBINE").is_ok();
+    let dir = out.join(if combine { "vae.decode" } else { "vae" });
     let t0 = std::time::Instant::now();
     let upto = std::env::var("READING_PASSES")
         .ok()
@@ -193,24 +196,42 @@ fn flux_2_minis_vae_on_the_fabric() {
         t0.elapsed().as_secs_f64()
     );
     let cfg = engine_cerebras::Config::default();
-    let (root, (w, h)) = (dir.clone(), (g.stream.w, g.stream.h));
+    let (root, (w, h)) = if combine {
+        let mut names = Vec::new();
+        for r in ["text", "denoise"] {
+            let o = kernels_cerebras::stream::Options {
+                reading: r.into(),
+                rows: 16,
+                round16: true,
+                upto: None,
+                taps: Vec::new(),
+            };
+            kernels_cerebras::stream::compile_reading(&trace, &o, &out.join(r))
+                .unwrap_or_else(|e| panic!("{r}: {e}"));
+            names.push(r.to_string());
+        }
+        names.push("vae.decode".into());
+        let placed = kernels_cerebras::stream::coresident::combine(&out, &names)
+            .unwrap_or_else(|e| panic!("{e}"));
+        eprintln!("co-resident: {placed:?}");
+        let fab = std::fs::read_to_string(out.join("fabric.txt")).expect("fabric.txt");
+        let v: Vec<u32> = fab
+            .split_whitespace()
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        (out.clone(), (v[0], v[1]))
+    } else {
+        (dir.clone(), (g.stream.w, g.stream.h))
+    };
     let link = root.join("out");
     if !link.join("out.json").is_file() {
-        for d in std::fs::read_dir(&root)
-            .expect("the program")
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.join("layout.csl").is_file())
-            .chain([dir.clone()])
+        let ops = dir.join("ops");
+        std::fs::create_dir_all(&ops).expect("ops");
+        for (n, src) in kernels_cerebras::sources::OPS
+            .iter()
+            .chain(kernels_cerebras::sources::STREAM_OPS)
         {
-            let ops = d.join("ops");
-            std::fs::create_dir_all(&ops).expect("ops");
-            for (n, src) in kernels_cerebras::sources::OPS
-                .iter()
-                .chain(kernels_cerebras::sources::STREAM_OPS)
-            {
-                std::fs::write(ops.join(n), src).expect("an op");
-            }
+            std::fs::write(ops.join(n), src).expect("an op");
         }
         let cslc = kernels_cerebras::toolchain::Cslc::find(&cfg.toolchain).expect("cslc");
         let (fabric_dims, fabric_offsets) = kernels_cerebras::toolchain::memcpy_fabric(w, h);

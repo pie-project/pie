@@ -441,6 +441,7 @@ pub fn stream_programs(
         "simulator"
     };
     hasher.update(fabric.as_bytes());
+    hasher.update(b"coresident-v1");
     for (n, src) in kernels_cerebras::sources::OPS
         .iter()
         .chain(kernels_cerebras::sources::STREAM_OPS)
@@ -465,18 +466,18 @@ pub fn stream_programs(
                  \"never\": compile them first (wafer-compile stream + cslc)"
             ));
         }
+        let slugs: Vec<String> = names.iter().map(|r| slug(r)).collect();
         for reading in &names {
             let from = stage.path().join(slug(reading));
             let dir = tmp.join(slug(reading));
             std::fs::rename(&from, &dir).map_err(io(&dir))?;
-            let Some(cslc) = &cslc else {
-                continue;
-            };
-            let ops = dir.join("ops");
-            std::fs::create_dir_all(&ops).map_err(io(&ops))?;
-            for (n, src) in kernels_cerebras::sources::OPS.iter().chain(kernels_cerebras::sources::STREAM_OPS) {
-                std::fs::write(ops.join(n), src).map_err(io(&ops))?;
-            }
+        }
+        // the readings co-resident: one program, a reading's launch its PEs alone
+        let placed = kernels_cerebras::stream::coresident::combine(tmp, &slugs)?;
+        tracing::info!(readings = ?placed.iter().map(|p| (&p.name, p.x, p.w, p.h)).collect::<Vec<_>>(), "cerebras: the stream readings co-resident");
+        if let Some(cslc) = &cslc {
+            let reading = "the co-resident readings";
+            let dir = tmp.to_path_buf();
             let fab = std::fs::read_to_string(dir.join("fabric.txt")).map_err(io(&dir))?;
             let f: Vec<u32> = fab.split_whitespace().filter_map(|x| x.parse().ok()).collect();
             let (w, h, bf16) = match f[..] {
@@ -509,7 +510,7 @@ pub fn stream_programs(
     Ok(Some(
         names
             .iter()
-            .map(|r| (root.join(slug(r)), root.join(slug(r)).join("out")))
+            .map(|r| (root.join(slug(r)), root.join("out")))
             .collect(),
     ))
 }

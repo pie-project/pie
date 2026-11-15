@@ -159,6 +159,10 @@ pub struct Reading {
     pub causal: bool,
     /// No program runs it: the host's forward makes its outputs whole ([`Reading::host_only`]).
     pub host_only: bool,
+    /// Its PEs' first column and row in a program of co-resident readings (`stream::coresident`).
+    pub origin: (i32, i32),
+    /// The id its launch takes in a program of co-resident readings (`None`: a program its own).
+    pub rd: Option<u32>,
     /// The clip a grid reading's program is compiled for (its rows are the clip's voxels, not
     /// token rows).
     pub clip: Option<[u32; 3]>,
@@ -298,6 +302,11 @@ impl Reading {
             h: num(&host, "h")? as u32,
             causal: host["causal"].as_bool().unwrap_or(false),
             host_only: false,
+            origin: (
+                host["origin"][0].as_i64().unwrap_or(0) as i32,
+                host["origin"][1].as_i64().unwrap_or(0) as i32,
+            ),
+            rd: host["rd"].as_u64().map(|r| r as u32),
             clip: host["clip"].as_array().and_then(|c| {
                 let v: Vec<u32> = c.iter().filter_map(|x| x.as_u64()).map(|x| x as u32).collect();
                 <[u32; 3]>::try_from(v).ok()
@@ -334,6 +343,8 @@ impl Reading {
             h: 0,
             causal: false,
             host_only: true,
+            origin: (0, 0),
+            rd: None,
             clip: None,
         }
     }
@@ -669,7 +680,8 @@ impl Fabric for Runtime {
         _step: &StreamStep<'_>,
     ) -> R<(Vec<Vec<f32>>, Option<u64>)> {
         let e = |x: crate::sdk::Error| x.to_string();
-        self.launch("run", &[]).map_err(e)?;
+        let args: Vec<u32> = reading.rd.into_iter().collect();
+        self.launch("run", &args).map_err(e)?;
         let mut got = Vec::new();
         for b in &reading.d2h {
             let mut out = vec![0u32; b.len];
@@ -694,8 +706,8 @@ impl Fabric for Runtime {
             let (w, h) = (reading.w as usize, reading.h as usize);
             let mut ts = vec![0u32; w * h * 3];
             let rect = Rect {
-                x: 0,
-                y: 0,
+                x: reading.origin.0,
+                y: reading.origin.1,
                 w: w as i32,
                 h: h as i32,
             };

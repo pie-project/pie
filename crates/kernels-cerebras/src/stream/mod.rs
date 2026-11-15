@@ -17,6 +17,7 @@ use serde::Serialize;
 use crate::plan::Act;
 
 pub mod build;
+pub mod coresident;
 pub mod grid;
 pub mod host;
 pub mod place;
