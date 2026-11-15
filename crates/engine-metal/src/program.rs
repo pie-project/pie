@@ -321,6 +321,22 @@ impl Plane {
         Ok(())
     }
 
+    /// Test builds: the form each region of `id`'s stages compiled to.
+    #[cfg(test)]
+    pub(crate) fn region_forms(&self, id: ProgramId) -> Vec<compile::Form> {
+        self.programs
+            .get(&id)
+            .map(|program| {
+                program
+                    .compiled
+                    .stages
+                    .iter()
+                    .flat_map(|stage| stage.regions.iter().map(|region| region.form))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn register_channel(
         &mut self,
         id: ChannelId,
@@ -715,6 +731,12 @@ impl Plane {
         if refused {
             return Ok(results);
         }
+        debug_assert!(
+            ring_ends_moved_once(&self.instances, &self.programs, ids),
+            "two members of one stage move the same end of one shared ring; the runtime \
+             seats at most one fire moving a given end of a ring a step, so a stage \
+             holding two would put (or take) both at one cell"
+        );
         for (program_id, members) in by_program {
             let program = self.programs.get(&program_id).ok_or_else(|| {
                 Fault::program(
@@ -761,24 +783,16 @@ impl Plane {
                 }
                 for (key, mut group) in groups {
                     let Some(key) = key else {
-                        // Each member's scratch is taken one under another,
-                        // so one fill zeroes them all, not a blit a member.
+                        // Each member's scratch is taken one under another.
+                        // No value is read before its step writes it, so the
+                        // scratch goes unfilled; test builds poison it.
                         #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
                         let mark = room.mark();
                         for prepared in group.iter_mut() {
                             prepared.seat_scratch(room.take(prepared.scratch_bytes())?);
                         }
                         #[cfg(target_vendor = "apple")]
-                        {
-                            room.zero_since(mark, frame)?;
-                            #[cfg(feature = "test-slot-fill")]
-                            {
-                                for prepared in group.iter() {
-                                    prepared.poison_hollow(frame)?;
-                                }
-                                frame.next_pass()?;
-                            }
-                        }
+                        room.poison_since(mark, frame)?;
                         // Members are independent (each its own scratch and
                         // rings): a stage of streamed regions fires them in
                         // one concurrent pass, step k of every member, then a
@@ -1007,23 +1021,23 @@ impl GuestCarve {
         }
     }
 
-    /// Where the next take ends: what [`GuestCarve::zero_since`] zeroes
-    /// down from.
+    /// Where the next take ends: what [`GuestCarve::poison_since`]
+    /// poisons down from.
     #[must_use]
     pub fn mark(&self) -> u64 {
         self.next
     }
 
-    /// Zeroes everything taken since `mark` in `frame`, in one fill: the
-    /// scratch of every member a stage seated one after another.
+    /// Test builds (`test-slot-fill`): poisons everything taken since
+    /// `mark` in `frame`, the scratch of every member a stage seated one
+    /// after another, so a value read before it is written fails its test.
+    /// Elsewhere nothing: no guest value is read before it is written.
     #[cfg(target_vendor = "apple")]
-    pub fn zero_since(&self, mark: u64, frame: &mut crate::device::ctx::Frame) -> Result<()> {
-        if mark <= self.next || crate::diag::on().scratch_no_zero {
+    pub fn poison_since(&self, mark: u64, frame: &mut crate::device::ctx::Frame) -> Result<()> {
+        if mark <= self.next {
             return Ok(());
         }
-        frame.fill(self.buffer.slab(), self.next, mark - self.next)?;
-        frame.next_pass()?;
-        Ok(())
+        launch::poison_scratch(frame, self.buffer.slab(), self.next, mark - self.next)
     }
 
     /// `bytes` of the region, below what was taken.
@@ -1106,6 +1120,12 @@ mod tests {
     /// The registration, the number of channels it binds, its seeds, and
     /// the token channel's index.
     fn registration() -> (ProgramRegistration, usize, Vec<(u32, Vec<u8>)>, u32) {
+        registration_of(false)
+    }
+
+    /// [`registration`], or with `staged` the argmax over a value the
+    /// stage computes (the logits doubled) and holds in its scratch.
+    fn registration_of(staged: bool) -> (ProgramRegistration, usize, Vec<(u32, Vec<u8>)>, u32) {
         let indptr: &'static Channel = Box::leak(Box::new(Channel::from(vec![0u32, 1])));
         let token: &'static Channel =
             Box::leak(Box::new(Channel::new([1], dtype::i32).capacity(4)));
@@ -1122,7 +1142,12 @@ mod tests {
         b.bind_port(Port::EmbedIndptr, indptr);
         b.stage(Attach::Epilogue, move || {
             let logits = intrinsics::output(0, "logits");
-            token.put(reshape(reduce_argmax(&logits), [1]));
+            if staged {
+                let doubled = &logits + &logits;
+                token.put(reshape(reduce_argmax(&doubled), [1]));
+            } else {
+                token.put(reshape(reduce_argmax(&logits), [1]));
+            }
         });
         token.note_host_take();
         let traced = b.build().expect("the program traces");
@@ -1161,6 +1186,135 @@ mod tests {
             vec![(u32::try_from(at).expect("a channel index"), seed)],
             u32::try_from(taken).expect("a channel index"),
         )
+    }
+
+    /// The guest scratch is not filled: every value is written before it
+    /// is read. Under `test-slot-fill` it is poisoned with 0xFF (NaN in
+    /// every float width) instead, so this test fails if any form reads a
+    /// value before its step writes it. One program, the argmax of a value
+    /// held in scratch (the logits doubled) put into a channel, compiled to
+    /// each form (Streamed;
+    /// Grouped with no streamed kernel; Fused with neither) and fired alone
+    /// and as a batch, answers each lane's own peak.
+    #[test]
+    fn every_form_answers_through_an_unfilled_scratch() {
+        use crate::store::Pools;
+        use eta_compiler::codegen::program::KernelKind;
+        let context = Context::bind().expect("a Metal 4 device");
+        let (registration, count, seeds, token) = registration_of(true);
+        let mut wrong = Vec::new();
+        for (form, dropped) in [
+            (compile::Form::Streamed, &[][..]),
+            (compile::Form::Grouped, &[KernelKind::Streamed][..]),
+            (compile::Form::Fused, &[KernelKind::Streamed, KernelKind::Grouped][..]),
+        ] {
+            let pools = Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+            let mut plane = Plane::new();
+            let mut registration = registration.clone();
+            registration.emitted_kernels.retain(|kernel| !dropped.contains(&kernel.kind));
+            let program = plane
+                .register(&context, &registration)
+                .expect("the program registers");
+            assert_eq!(plane.region_forms(program), vec![form], "the program compiles to {form:?}");
+            let facts = plane.facts(program, &pools).expect("the program's facts");
+            let peaks = [321u32, 654];
+            let mut planes = Vec::new();
+            let lanes: Vec<InstanceId> = (0..LANES)
+                .zip(peaks)
+                .map(|(nth, at)| {
+                    let ids: Vec<ChannelId> = (1..=count as u64)
+                        .map(|c| ChannelId(c + 1000 * u64::from(nth)))
+                        .collect();
+                    let (instance, rings) = slots_for(&pools, &facts, nth);
+                    let id = plane
+                        .bind(
+                            &context,
+                            program,
+                            &seeds,
+                            Extents {
+                                row_count: 1,
+                                sampled_rows: 1,
+                                query_len: 1,
+                                ..Extents::default()
+                            },
+                            GeometryClass::Host,
+                            PortMask::NONE,
+                            &ids,
+                            session::Pooled {
+                                pools: &pools,
+                                instance: &instance,
+                                rings: &rings,
+                            },
+                        )
+                        .expect("the lane binds");
+                    let mut logits = crate::device::Buffer::zeroed(&context, u64::from(VOCAB) * 2)
+                        .expect("a logits plane");
+                    let mut bf16 = vec![0u8; VOCAB as usize * 2];
+                    bf16[at as usize * 2..at as usize * 2 + 2]
+                        .copy_from_slice(&0x3f80u16.to_le_bytes());
+                    logits.write(0, &bf16).expect("the logits write");
+                    plane
+                        .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
+                        .expect("the logits bind");
+                    planes.push(logits);
+                    id
+                })
+                .collect();
+            let take = |plane: &mut Plane, id: InstanceId| -> u32 {
+                let cell = plane
+                    .instance_mut(id)
+                    .expect("bound")
+                    .take(token)
+                    .expect("the take")
+                    .expect("a token");
+                let (channel, seed) = &seeds[0];
+                plane
+                    .instance_mut(id)
+                    .expect("bound")
+                    .publish(*channel, seed)
+                    .expect("the reseed");
+                i32::from_le_bytes(cell[..4].try_into().expect("an i32")) as u32
+            };
+            // Alone: each lane's stage in a frame of its own.
+            for (&id, &peak) in lanes.iter().zip(&peaks) {
+                let fired = plane
+                    .fire(&context, id, Attach::Epilogue, &guests(&context))
+                    .expect("the stage fires");
+                assert!(matches!(fired, Fired::Committed), "{form:?} {id} fires: {fired:?}");
+                let got = take(&mut plane, id);
+                if got != peak {
+                    wrong.push(format!("{form:?} {id} alone: {got}, not {peak}"));
+                }
+            }
+            // Together: one stage of both lanes.
+            let area = 1u64 << 24;
+            let tables = crate::device::Buffer::zeroed(&context, area).expect("a batch area");
+            let host = |at: u64, bytes: u64| -> crate::error::Result<_> {
+                Ok(vec![(0, bytes, tables.host_span(at, bytes)?)])
+            };
+            plane.lay_batches(&tables, area, &host).expect("the batches lay");
+            let mut frame = context.frame().expect("a frame");
+            let launched = plane
+                .stage_batched(&mut frame, &lanes, &guests(&context), 0)
+                .expect("the lanes stage");
+            assert!(
+                launched.iter().all(|(_, launched)| matches!(launched, Launched::Airborne)),
+                "{form:?}: every lane launches: {launched:?}"
+            );
+            frame.commit().expect("the frame lands");
+            for (&id, &peak) in lanes.iter().zip(&peaks) {
+                plane.settle_launched(id).expect("the lane settles");
+                let got = take(&mut plane, id);
+                if got != peak {
+                    wrong.push(format!("{form:?} {id} together: {got}, not {peak}"));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "a lane answered another index than its peak (poisoned scratch: {}): {wrong:#?}",
+            cfg!(feature = "test-slot-fill")
+        );
     }
 
     /// A program that launched its lanes together leaves no batch behind
@@ -1260,6 +1414,119 @@ mod tests {
             "the closed program's batches are dropped: {} left",
             plane.batches.len()
         );
+    }
+
+    /// Two lanes bound to one shared ring, both putting into it at the
+    /// epilogue: a stage of both would put both at one cell (each reads the
+    /// ring's cursor as it is encoded; the cursor moves at commit). The
+    /// runtime seats at most one fire moving a given end of a ring a step,
+    /// so such a stage is never asked for; a debug build refuses to build
+    /// one, by name.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "move the same end of one shared ring")]
+    fn a_stage_of_two_movers_of_one_ring_end_is_refused() {
+        let context = Context::bind().expect("a Metal 4 device");
+        let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+        let mut plane = Plane::new();
+        let (registration, count, seeds, token) = registration();
+        let program = plane
+            .register(&context, &registration)
+            .expect("the program registers");
+        let facts = plane.facts(program, &pools).expect("the program's facts");
+        // The token channel is registered once and both lanes bind it; the
+        // rest are each lane's own.
+        let shared = ChannelId(7);
+        let ring = facts
+            .rings
+            .iter()
+            .find(|ring| ring.channel == token)
+            .expect("the token ring");
+        let per_channel = pools
+            .slots_per_chunk(crate::store::layout::CHANNEL)
+            .expect("a channel shape");
+        let run: Vec<u32> = (3 * per_channel..3 * per_channel + ring.footprint.slots).collect();
+        plane
+            .register_channel(
+                shared,
+                ChannelShape {
+                    capacity: 4,
+                    numel: 1,
+                    dtype: eta_ir::Dtype::I32,
+                },
+                &pools,
+                &run,
+            )
+            .expect("the shared channel registers");
+        let peaks = [321u32, 654];
+        let lanes: Vec<(InstanceId, crate::device::Buffer)> = (0..2u32)
+            .zip(peaks)
+            .map(|(nth, at)| {
+                let (instance, rings) = slots_for(&pools, &facts, nth);
+                let instance = &instance;
+                let rings = &rings;
+                let ids: Vec<ChannelId> = (0..count as u32)
+                    .map(|c| {
+                        if c == token {
+                            shared
+                        } else {
+                            ChannelId(100 + u64::from(c) + 1000 * u64::from(nth))
+                        }
+                    })
+                    .collect();
+                let id = plane
+                    .bind(
+                        &context,
+                        program,
+                        &seeds,
+                        Extents {
+                            row_count: 1,
+                            sampled_rows: 1,
+                            query_len: 1,
+                            ..Extents::default()
+                        },
+                        GeometryClass::Host,
+                        PortMask::NONE,
+                        &ids,
+                        session::Pooled {
+                            pools: &pools,
+                            instance,
+                            rings,
+                        },
+                    )
+                    .expect("the lane binds");
+                let mut logits = crate::device::Buffer::zeroed(&context, u64::from(VOCAB) * 2)
+                    .expect("a logits plane");
+                let mut bf16 = vec![0u8; VOCAB as usize * 2];
+                bf16[at as usize * 2..at as usize * 2 + 2]
+                    .copy_from_slice(&0x3f80u16.to_le_bytes());
+                logits.write(0, &bf16).expect("the logits write");
+                plane
+                    .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
+                    .expect("the logits bind");
+                (id, logits)
+            })
+            .collect();
+        let first = lanes[0].0;
+        assert!(
+            plane.instances[&first]
+                .shared
+                .iter()
+                .flatten()
+                .any(|ring| ring.attachments() == 2),
+            "the two lanes share their rings"
+        );
+        let area = 1u64 << 24;
+        let tables = crate::device::Buffer::zeroed(&context, area).expect("a batch area");
+        let host = |at: u64, bytes: u64| -> crate::error::Result<_> {
+            Ok(vec![(0, bytes, tables.host_span(at, bytes)?)])
+        };
+        plane
+            .lay_batches(&tables, area, &host)
+            .expect("the batches lay");
+        let members: Vec<InstanceId> = lanes.iter().map(|(id, _)| *id).collect();
+        let mut frame = context.frame().expect("a frame");
+        let _ = plane.stage_batched(&mut frame, &members, &guests(&context), 0);
     }
 
     /// An instance's tables and rings in pool slots fire as another's in
@@ -1704,6 +1971,40 @@ mod tests {
         assert_eq!(gpu_reads(&ring), want(2), "the unparked run reads the same");
     }
 }
+/// Whether no two of `ids` move the same end of one shared ring at the
+/// epilogue: each member reads the ring's cursor as it is encoded and the
+/// cursor moves only at commit, so two would write (or read) one cell.
+fn ring_ends_moved_once(
+    instances: &BTreeMap<InstanceId, Bound>,
+    programs: &BTreeMap<ProgramId, Program>,
+    ids: &[InstanceId],
+) -> bool {
+    let mut moved = std::collections::BTreeSet::new();
+    for id in ids {
+        let Some(bound) = instances.get(id) else {
+            continue;
+        };
+        let Some(program) = programs.get(&bound.program_id) else {
+            continue;
+        };
+        for (channel, ring) in bound.shared.iter().enumerate() {
+            let Some(ring) = ring else {
+                continue;
+            };
+            let channel = u32::try_from(channel).unwrap_or(u32::MAX);
+            let ring = Arc::as_ptr(ring) as usize;
+            if program.plan.takes_channel(channel, Attach::Epilogue) && !moved.insert((ring, false))
+            {
+                return false;
+            }
+            if program.plan.puts_channel(channel, Attach::Epilogue) && !moved.insert((ring, true)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Whether no ring is two members': members that share one are ordered
 /// through its cursor, so they fire one after another.
 fn rings_disjoint(rings: &[Vec<usize>]) -> bool {

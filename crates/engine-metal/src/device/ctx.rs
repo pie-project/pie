@@ -661,14 +661,9 @@ impl Frame {
         Ok(())
     }
 
-    #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
-    #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
-    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-    pub(crate) fn fill(&mut self, slab: &super::alloc::Slab, at: u64, len: u64) -> Result<()> {
-        self.fill_with(slab, at, len, 0)
-    }
-
-    /// `len` bytes of `slab` from `at` set to `value`, in a blit pass.
+    /// `len` bytes of `slab` from `at` set to `value`, in a blit pass
+    /// (test builds: the guest scratch's poison).
+    #[cfg(feature = "test-slot-fill")]
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     pub(crate) fn fill_with(
