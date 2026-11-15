@@ -4143,8 +4143,15 @@ impl Shell {
         // backed, ref by ref: a page in an uncommitted chunk under the
         // highest one (two-ended growth backs a bottom run and the span's
         // top, not what lies between) is refused by name, not read.
+        // The load's pipeline walk (`warming`) stages fires it drops
+        // uncommitted: no kernel reads or writes what they name, so nothing
+        // is checked backed and no record is zeroed for them. Its lanes are
+        // seat 0's, and a recurrent model's seat-0 record lies past every
+        // seat's kv run (seat runs follow one another shape by shape): the
+        // walk refused such a load ("this fire wants 13113 committed chunks
+        // of the state pool and the load reserved 58").
         for ((seat, table), &free) in seats.iter().zip(&tables).zip(&kv_less) {
-            if free || table.is_empty() {
+            if free || table.is_empty() || self.warming {
                 continue;
             }
             let after = u64::from(seat.have).saturating_add(u64::from(seat.rows));
@@ -4153,18 +4160,18 @@ impl Shell {
                 self.pools.admit_list_page(page)?;
             }
         }
-        for &(page, _) in writes.iter().flatten() {
+        for &(page, _) in writes.iter().flatten().filter(|_| !self.warming) {
             self.pools.admit_list_page(page.max(0) as u32)?;
         }
-        for &id in &state_ids {
+        for &id in state_ids.iter().filter(|_| !self.warming) {
             self.pools.admit_state_slot(id)?;
         }
 
-        if !beginning.is_empty() && self.pools.has_state() {
+        if !beginning.is_empty() && self.pools.has_state() && !self.warming {
             self.drain()?;
         }
-        for record in beginning {
-            self.pools.clear(&record)?;
+        for record in beginning.iter().filter(|_| !self.warming) {
+            self.pools.clear(record)?;
         }
         let slot_ids: Vec<i32> = lane_bands.concat();
         let rs_snaps: Vec<i32> = snap_bands.concat();
