@@ -1,0 +1,20 @@
+[server]
+listen = "127.0.0.1:18722"
+verbose = false
+
+[model]
+name = "default"
+source = "Qwen/Qwen3-0.6B"
+
+[engine]
+type = "vulkan"
+device = ["vulkan:0"]
+activation_dtype = "bfloat16"
+
+[engine.memory]
+# The save stages the set's pages on the host tier: give it room.
+budget_host = "4GiB"
+
+[runtime]
+frame_dispatch_depth = 2
+frame_size = 2
