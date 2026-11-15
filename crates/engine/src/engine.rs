@@ -86,42 +86,12 @@ pub trait Engine: Send {
         None
     }
 
-    /// What it learns of itself while it serves, read by the runtime from
-    /// load on ([`crate::live`]): the rungs armed, the bytes outside its
-    /// span. An engine that captures every body before load returns states
-    /// every rung armed.
+    /// What it counts while it serves, read by the runtime from load on
+    /// ([`crate::live`]): the fires served other than by a captured body.
+    /// Nothing of arming: which rungs are armed and which eager is a load
+    /// fact ([`crate::chunk::ChunkFacts::eager_rungs`]).
     fn live(&self) -> crate::live::Live {
         crate::live::Live::armed()
-    }
-
-    /// The pool slots one [`Engine::arm_step`] writes, stated once at load
-    /// ([`crate::live::ArmingRoom`]). The default writes none.
-    fn arming_room(&self) -> crate::live::ArmingRoom {
-        crate::live::ArmingRoom::default()
-    }
-
-    /// Captures the graph bodies of at most one composition of the next
-    /// rung not armed (REDESIGN 2.5), on the lane's own thread, and says
-    /// whether any remain. Bounded: the runtime calls it while its lane is
-    /// idle, and between fires while a raise waits on a rung not armed, so
-    /// one call holds the lane for one composition's capture at most. When
-    /// a rung's last composition is captured the engine states it
-    /// ([`crate::live::Live::arm`], `u32::MAX` after the last rung).
-    ///
-    /// `lent` holds [`Engine::arming_room`]'s slots, free slots no sequence
-    /// holds, lent for this call only: the step's synthetic fires may write
-    /// them, and they are free again when it returns. The runtime calls
-    /// only when it can lend the whole room.
-    ///
-    /// Once it answers `false` the runtime never calls it again for the
-    /// life of the load. An error is a load fault: the runtime fails every
-    /// fire after it, as it fails a fire's own error. A call may fall
-    /// between an [`Engine::expect_fire`] and the fire it announced. The
-    /// default arms nothing: every rung is armed at load, or by the engine
-    /// on its own.
-    fn arm_step(&mut self, lent: &crate::live::ArmingLease) -> Result<bool> {
-        let _ = lent;
-        Ok(false)
     }
 
     fn bind_thread(&mut self) -> Result<()> {
@@ -346,7 +316,15 @@ pub trait Engine: Send {
     /// next fire; the engine fills slots newly named (from its host copy)
     /// before a fire reads them. A use of an atom not named is the
     /// engine's: it streams through a staging slot and is not kept.
-    fn weight_residency(&mut self, residency: &WeightResidency) -> Result<()> {
+    ///
+    /// Answers the bytes the engine holds back of the chunks it stated
+    /// ([`crate::chunk::ChunkFacts::held_bytes`]) once it has taken the
+    /// set. An engine that armed nothing at load arms at the residency the
+    /// load starts with and settles its fit there, so it holds less from
+    /// then on than its load stated; the runtime lifts the pool's hold-back
+    /// by that answer before the load returns. Nothing moves what is held
+    /// after that: every later answer repeats it.
+    fn weight_residency(&mut self, residency: &WeightResidency) -> Result<u64> {
         let _ = residency;
         Err(self.unsupported("weight_residency"))
     }

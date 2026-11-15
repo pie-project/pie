@@ -8,7 +8,8 @@
 //! tick. An engine that answers a verb unsupported is asked nothing more;
 //! one with no weight shapes is never asked at all. The load alone waits:
 //! on the resident set the engine starts with, before the first fire can be
-//! submitted.
+//! submitted, and it alone reads what the engine answers it holds back
+//! from then on ([`EnginePort::answered`]).
 
 use ::engine::chunk::{WeightResidency, WeightUses};
 use tokio::sync::oneshot::{Receiver, error::TryRecvError};
@@ -75,15 +76,23 @@ impl EnginePort {
         std::mem::take(&mut self.residencies)
     }
 
-    /// Reads an answer [`Self::take_queued`] handed out.
+    /// Reads an answer [`Self::take_queued`] handed out: the bytes the
+    /// engine holds back of the chunks it stated, now that it took the set
+    /// (`Engine::weight_residency`); `None` from an engine that does not
+    /// stream.
     ///
     /// # Errors
     ///
-    /// The engine refused the resident set. An unsupported answer is no
-    /// error: the port is asked nothing more.
-    pub fn answered(&mut self, answer: anyhow::Result<Vec<u8>>) -> anyhow::Result<()> {
+    /// The engine refused the resident set, or its answer does not read. An
+    /// unsupported answer is no error: the port is asked nothing more.
+    pub fn answered(&mut self, answer: anyhow::Result<Vec<u8>>) -> anyhow::Result<Option<u64>> {
         match answer {
-            Ok(_) => Ok(()),
+            Ok(held) => serde_json::from_slice(&held).map(Some).map_err(|error| {
+                anyhow::anyhow!(
+                    "the engine took its resident set and its answer does not say what it \
+                     holds back: {error}"
+                )
+            }),
             Err(error)
                 if matches!(
                     error.downcast_ref(),
@@ -91,7 +100,7 @@ impl EnginePort {
                 ) =>
             {
                 self.settle(Err(error));
-                Ok(())
+                Ok(None)
             }
             Err(error) => Err(error),
         }

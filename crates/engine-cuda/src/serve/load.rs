@@ -42,6 +42,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // SAFETY: the boot's communicator is held by the engine for the life of
     // the shell it loads.
     let mut device = Context::bind(boot.ordinal, unsafe { boot.comm.as_ref() })?;
+    // What the card may hold while this load runs, resolved here before the
+    // load takes anything: every later reading of its room is under it.
+    let ceiling = crate::store::load_ceiling(boot.allowance, true)?;
     let chip = match boot.knobs.chip.clone() {
         Some(chip) => chip,
         None => {
@@ -229,10 +232,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // bodies and the guests' programs have the other half; the token budget
     // halves toward its floor until they do, and the lattice follows.
     let (free, total) = crate::store::device_memory()?;
-    let after_weights =
-        crate::device::elastic::budget_bytes(free, total, boot.allowance).saturating_sub(
-            crate::store::weight_tier_bytes(&boot.trace, boot.residency.device_demand(), 0)?,
-        );
+    let after_weights = crate::device::elastic::room_under(ceiling, free, total).saturating_sub(
+        crate::store::weight_tier_bytes(&boot.trace, boot.residency.device_demand(), 0)?,
+    );
     let after_weights = held_beside(boot, after_weights)?;
     let facts = kv::probe(&boot.trace)?;
     let derive_voxels = boot
@@ -452,6 +454,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         anchored,
         asked,
         stated_buckets: !stated_buckets.is_empty(),
+        ceiling,
     })
 }
 
@@ -584,9 +587,10 @@ fn refit(
     table: &crate::run::WeightTable,
     engine: crate::chip::Engine,
     asked: &Budget,
+    ceiling: u64,
 ) -> Result<(CompiledModel, Budgets, Vec<u64>)> {
     let (free, total) = crate::store::device_memory()?;
-    let live = crate::device::elastic::budget_bytes(free, total, boot.allowance);
+    let live = crate::device::elastic::room_under(ceiling, free, total);
     let live = held_beside(boot, live)?;
     let facts = kv::probe(&boot.trace)?;
     let window = crate::store::window_of(&boot.trace)?;
@@ -767,6 +771,7 @@ impl Shell {
             anchored,
             asked,
             stated_buckets,
+            ceiling,
         } = bake(&mut boot)?;
         // What shapes this deployment's bodies, beside the engine build
         // the record's key carries ([`super::measured`]).
@@ -790,10 +795,10 @@ impl Shell {
         let (free_before, device_total) = crate::store::device_memory()?;
         crate::device::held::heap_mark();
         // The pool's address space is reserved for every page its bytes
-        // could hold, the stated budget or the share of the card before the
+        // could hold, the stated budget or the card's room before the
         // weights land; `Pools::fit_the_card` sizes it within that.
         let pool_bytes = boot.kv_budget.unwrap_or_else(|| {
-            crate::device::elastic::budget_bytes(free_before, device_total, boot.allowance)
+            crate::device::elastic::room_under(ceiling, free_before, device_total)
         });
         let paging = Paging::of(
             boot.page_size,
@@ -914,6 +919,7 @@ impl Shell {
             weights.table(),
             engine,
             &asked,
+            ceiling,
         )?;
         let paging = paging
             .windowed(
@@ -1023,9 +1029,35 @@ impl Shell {
             .as_ref()
             .map_or(0, |forked| forked.bytes);
         let arena_bytes = compiled.arena.bytes.max(forked_bytes);
+        // What allocates on the device beside the pools allocates before
+        // they read the card: the guests' fan streams, and on ROCm what the
+        // runtime and its libraries take at their first use. A flat range
+        // is sized to what the card then has free, and nothing allocates
+        // beside it after but arming, which the bodies record holds.
+        #[cfg(feature = "rocm")]
+        kernels_cuda::hip::open().map_err(|why| Fault::Unbound {
+            what: format!("the HIP runtime's first use: {why}"),
+        })?;
+        // The streams a serving load copies on: synchronous copies on the
+        // null stream (the weights' upload among them), fires and read-backs
+        // on the device's, taps on its tap stream, tier moves on its swap.
+        #[cfg(feature = "rocm")]
+        kernels_cuda::hip::warm_copies(&[
+            core::ptr::null_mut(),
+            device.stream().cast(),
+            device.tap_stream().cast(),
+            device.swap_stream().cast(),
+        ])
+        .map_err(|why| Fault::Unbound {
+            what: format!("a copying stream's first copy: {why}"),
+        })?;
+        let mut programs = ProgramPlane::new(crate::program::compile::Disk::rooted(
+            boot.cache_dir.map(|dir| dir.join(CODE_DIR)),
+        ));
+        programs.open_fan()?;
         let pools = Pools::reserve(
             device.ordinal(),
-            boot.allowance,
+            ceiling,
             &boot.trace,
             paging,
             boot.kv_budget,
@@ -1044,6 +1076,9 @@ impl Shell {
             );
         }
         let mut pools = pools;
+        if boot.context_declared {
+            pools.declare_context();
+        }
         let buffers = Buffers::reserve(&boot.trace, budgets.tokens.max_tokens, &pools)?;
         // Each row-streamed table's cache opens over its host copy.
         let hosts: Vec<(u32, u64)> = pools
@@ -1321,6 +1356,7 @@ impl Shell {
             arming_at_load: false,
             rearming: false,
             bodies_took: 0,
+            measuring: false,
             workspace: None,
             inputs_at: 0,
             decoded_tiles: Vec::new(),
@@ -1329,10 +1365,8 @@ impl Shell {
             arm_cold: false,
             arm_rs: crate::record::RsBody::Folds,
             arm_deferred: false,
-            arm_stepped: boot.knobs.arm_stepped,
-            stepping: None,
-            lent: None,
-            card: (0, 0, 0),
+            card: (0, 0),
+            held_for_fires: 0,
             live: engine::live::Live::armed(),
             segments: std::collections::HashMap::new(),
             windows_memo: Vec::new(),
@@ -1341,9 +1375,7 @@ impl Shell {
                 cache.watch(airborne.clone());
                 cache
             },
-            programs: ProgramPlane::new(crate::program::compile::Disk::rooted(
-                boot.cache_dir.map(|dir| dir.join(CODE_DIR)),
-            )),
+            programs,
             settlement: crate::settle::Settlement::open(boot.runahead.staging_depth())?,
             taps: Vec::new(),
             kv_taps,
@@ -1354,9 +1386,6 @@ impl Shell {
             rs_ahead: std::collections::HashMap::new(),
             _released: Released,
         };
-        // The guests' fan streams open with the load, before the fit reads
-        // the card, so a serving fire never creates one.
-        shell.programs.open_fan()?;
         if !shell.graphs.records() {
             eprintln!(
                 "engine-cuda: engine.graphs is {}, a diagnostic mode — every fire \
@@ -1410,7 +1439,7 @@ impl Shell {
             .iter()
             .map(|plane| crate::store::decoded_weight_reserve(*plane, 1))
             .collect();
-        let held_for_fires = programs;
+        shell.held_for_fires = programs;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] decoded-weight tiles over {} stream(s) ({})",
@@ -1427,11 +1456,22 @@ impl Shell {
         // armed whole, where it is recorded; the configured `bodies_mem` is
         // the ceiling and what a first boot holds. One number: arming's
         // allowance is the hold.
+        let mut recorded = false;
         if shell.records_bodies()
             && let Some(dir) = boot.cache_dir
         {
-            let record = super::measured::path(dir, &format!("{bodies_shape}|{:?}", shell.budget));
+            // A record measured with the device's copy queues is not this
+            // process's when they are off (each holds memory of its own).
+            #[cfg(feature = "rocm")]
+            let copies = format!("|{:?}", kernels_cuda::hip::sys::copy_queues());
+            #[cfg(not(feature = "rocm"))]
+            let copies = String::new();
+            let record = super::measured::path(
+                dir,
+                &format!("{bodies_shape}|{:?}{copies}", shell.budget),
+            );
             if let Some(measured) = super::measured::read(&record) {
+                recorded = true;
                 let held = usize::try_from(measured.hold()).unwrap_or(usize::MAX);
                 if boot.knobs.diagnostics.arm_trace {
                     eprintln!(
@@ -1449,7 +1489,15 @@ impl Shell {
             }
             shell.bodies_record = Some(record);
         }
-        let bodies = if shell.records_bodies() {
+        // A flat range cannot grow after its bodies name it, so a load that
+        // has no record of what they take measures it: no estimate stands
+        // in for the figure.
+        shell.measuring = shell.records_bodies()
+            && !crate::device::elastic::mapped_on_demand()
+            && !recorded;
+        let bodies = if shell.measuring {
+            crate::store::MEASURING
+        } else if shell.records_bodies() {
             shell.bodies_mem as u64
         } else {
             0
@@ -1511,10 +1559,10 @@ impl Shell {
         }
         let fitted = shell
             .pools
-            .fit_the_card(bodies, held_for_fires, false, &resident)?;
+            .fit_the_card(bodies, shell.held_for_fires, false, &resident)?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
-                "[arm-trace] fit before arming: {} pages, {} chunks, room {} MiB (fresh {})",
+                "[arm-trace] claim before arming: {} pages, {} chunks, room {} MiB (fresh {})",
                 fitted.fit,
                 fitted.chunks,
                 fitted.room >> 20,
@@ -1526,13 +1574,16 @@ impl Shell {
         shell.arena.ensure_rungs(&mut shell.pools)?;
         shell.lay_workspace()?;
         let afforded = fitted.bodies;
-        if afforded < bodies {
+        if shell.measuring {
+            // Arming is allowed all the card has past the least range.
+            shell.bodies_mem = usize::try_from(afforded).unwrap_or(usize::MAX);
+        } else if afforded < bodies {
             eprintln!(
                 "engine-cuda: [engine] bodies_mem {} MiB is held down to {} MiB on this card: \
                  with the weights, activations and inputs resident, one sequence at the declared \
                  context and the guests' programs seated, {} MiB is left for the graph bodies \
-                 and the cache rows together, and the bodies take at most a quarter of it. \
-                 State a smaller bodies_mem to choose it.",
+                 and the cache rows together; the rows take what the bodies leave of it once \
+                 they are captured.",
                 bodies >> 20,
                 afforded >> 20,
                 fitted.spare >> 20,
@@ -1541,7 +1592,6 @@ impl Shell {
         }
         Ok(Staged {
             shell,
-            held_for_fires,
             rank: boot.world.rank,
             arm_trace: boot.knobs.diagnostics.arm_trace,
             weights_held: boot.knobs.weights_held,
@@ -1620,7 +1670,6 @@ impl Shell {
 /// A shell whose load stopped short of arming its bodies ([`Shell::stage`]).
 pub struct Staged {
     pub shell: Shell,
-    held_for_fires: u64,
     rank: u32,
     arm_trace: bool,
     /// The load was told its weights are held (`Knobs::weights_held`).
@@ -1634,7 +1683,6 @@ impl Staged {
     pub fn finish(self) -> Result<Shell> {
         let Staged {
             mut shell,
-            held_for_fires,
             rank,
             arm_trace,
             weights_held,
@@ -1667,7 +1715,8 @@ impl Staged {
         // armed now, its bodies would read every expert from the host copy,
         // over the bus, fire after fire. It arms at the starting weight
         // residency instead, over the slots the cache then holds, and the
-        // fit keeps the bodies' allowance out of the cache rows till then.
+        // fit keeps the bodies' allowance out of the cache rows till then,
+        // when it settles ([`Shell::settle_fit`]).
         let deferred =
             shell.ep.is_none() && shell.records_bodies() && !shell.pools.weights_seated_whole();
         if deferred {
@@ -1677,52 +1726,60 @@ impl Staged {
                  weight residency, over the slots the cache holds then"
             );
         } else {
-            // The rungs past the smallest arm in the lane time the caller
-            // gives, over slots it lends: of the kv list and the records,
-            // so not where a fire also names windowed pages.
-            shell.arm_stepped =
-                shell.arm_stepped && shell.ep.is_none() && !shell.pools.has_windowed();
             shell.arming_at_load = true;
             let armed = shell.arm_bodies();
             shell.arming_at_load = false;
             armed?;
+            if shell.measuring {
+                shell.measured_refit(device_total, free_before)?;
+            }
         }
-        let stepping = shell.stepping.is_some();
         let resident = footprint(&shell, device_total, free_before);
-        // Arming fired every composition, so the activation is at its high
-        // water; a load that records no bodies, or arms at its starting
-        // weight residency, has fired none yet, and keeps the bodies'
-        // allowance out of the cache rows till it arms.
-        // One whose rungs past the smallest arm later keeps what is left of
-        // the allowance out likewise, and its range where the bodies armed
-        // name it.
         // Whatever armed a body, the range stays where it lies: the bodies
         // name addresses in it, and a fit that reserved it anew (a flat
         // range's does) would leave them naming the old one.
         if shell.cache.body_stats().census.bodies > 0 {
             shell.pools.pin();
         }
-        let settled = shell.records_bodies() && !deferred && !stepping;
-        let bodies = if deferred {
-            shell.bodies_mem as u64
-        } else if stepping {
-            (shell.bodies_mem as u64).saturating_sub(shell.cache.body_stats().census.bytes as u64)
-        } else {
-            0
-        };
-        let fitted = shell
-            .pools
-            .fit_the_card(bodies, held_for_fires, settled, &resident)?;
-        if stepping || shell.arena.has_rungs() {
-            // The runtime is stated the range whole, what a later fit may
-            // yet give the cache rows with it, and keeps the pool under it
-            // by what this fit holds back. The state's chunks then end
-            // where the activation starts, so what a rung lends and what
-            // lies under it are one span.
+        // No fire of the load's own is still in flight over the chunks the
+        // last fit lets go and lays again.
+        shell.device.synchronize()?;
+        let fitted = if deferred && shell.arena.has_rungs() {
+            // The bodies arm after the runtime has read the pool, so the
+            // fit that follows them cannot be the one it is stated: it is
+            // stated the range whole, what that fit may yet give the cache
+            // rows with it, and keeps the pool under it by what this fit
+            // holds back for the bodies' allowance and the activation no
+            // fire has backed yet (`Shell::settle_fit` lifts it). The
+            // state's chunks then end where the activation starts, so what
+            // a rung lends and what lies under it are one span.
+            let fitted = shell.pools.fit_the_card(
+                shell.bodies_mem as u64,
+                shell.held_for_fires,
+                false,
+                &resident,
+            )?;
+            // The fit may have reserved the range anew: the carves laid at
+            // the activation's end are backed where it now lies.
+            shell.arena.ensure_rungs(&mut shell.pools)?;
             shell.pools.state_whole();
-        }
+            fitted
+        } else {
+            // Everything the load puts on the device is there, its bodies
+            // among it: the pool is what the card has left, and the range
+            // is stated as exactly the chunks backed below. Arming fired
+            // every composition, so the activation is at its high water; a
+            // load that records no bodies has fired none, and keeps the
+            // whole span for its fires; one that arms later and lends no
+            // rung keeps the bodies' allowance out as well.
+            let bodies = if deferred { shell.bodies_mem as u64 } else { 0 };
+            let settled = shell.records_bodies() && !deferred;
+            shell
+                .pools
+                .fit_and_state(bodies, shell.held_for_fires, settled, &resident)?
+        };
         // A load that arms later may have had its range reserved anew by
-        // this fit: the workspaces are laid where it now lies.
+        // its fit: the workspaces are laid where it now lies.
         shell.lay_workspace()?;
         // The load's last fit backs what it took, here and not later: every
         // page the load serves is backed before anything else can take the
@@ -1754,8 +1811,7 @@ impl Staged {
                 kernels_cuda::jit::Slabs::unplaced_bytes() >> 20,
             );
         }
-        shell.card = (device_total, free_before, held_for_fires);
-        shell.state_live();
+        shell.card = (device_total, free_before);
         if rank != 0 {
             shell.programs.set_shadow(true);
         }
@@ -1819,35 +1875,92 @@ fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
     }
 }
 
-/// The device's memory as this load holds it ([`engine::memory`]): each
-/// owner under its class, over what the device has for this process (all of
-/// it but what others held before the load began).
 impl Shell {
-    /// States what the runtime reads of this shell ([`engine::live::Live`]):
-    /// what the fit holds back of the chunks it stated while rungs are left
-    /// to arm (none once it has settled), and the ledger's outside class.
-    pub(super) fn state_live(&self) {
-        self.live.set_held(self.pools.kept_back_bytes());
-        // What the driver holds outside the engine's span, as the ledger
-        // enters it: read by the policy, taken out of no range.
-        let ledger = ledger(self, self.card.0, self.card.1);
-        self.live
-            .set_outside(ledger.bytes(engine::memory::Class::Outside));
+    /// The device's memory as this load holds it now ([`ledger`]).
+    #[must_use]
+    pub fn ledger(&self) -> engine::memory::Ledger {
+        ledger(self, self.card.0, self.card.1)
     }
 
-    /// The fit once the last rung is armed: the activation at its high
-    /// water and the bodies at what they take, the rest the cache rows'.
-    pub(super) fn settle(&mut self) -> Result<()> {
+    /// A measuring load's second fit: the bodies armed over the least range
+    /// took `bodies_took`; they are forgotten, the range is fitted to what
+    /// the card has past that hold, and the lattice armed again over it.
+    /// Its record holds the figure, so a later boot fits once.
+    fn measured_refit(&mut self, device_total: u64, free_before: u64) -> Result<()> {
+        let started = std::time::Instant::now();
+        let hold = self.bodies_took;
+        self.cache.forget_bodies();
+        let resident = footprint(self, device_total, free_before);
+        let fitted = self
+            .pools
+            .fit_the_card(hold, self.held_for_fires, false, &resident)?;
+        self.arena.ensure_rungs(&mut self.pools)?;
+        self.lay_workspace()?;
+        self.bodies_mem = usize::try_from(hold).unwrap_or(usize::MAX);
+        self.rearming = true;
+        self.arming_at_load = true;
+        let armed = self.arm_bodies();
+        self.arming_at_load = false;
+        self.rearming = false;
+        armed?;
+        eprintln!(
+            "engine-cuda: a measuring boot: with no record of what this deployment's bodies \
+             take, they armed over the least range that serves and took {} MiB; the range was \
+             fitted again to the rest ({} chunks) and the lattice armed over it in {:.1} s. \
+             Later boots hold the measured figure and fit once",
+            hold >> 20,
+            fitted.chunks,
+            started.elapsed().as_secs_f64(),
+        );
+        Ok(())
+    }
+
+    /// Two load facts of this shell
+    /// ([`engine::chunk::ChunkFacts::held_bytes`] and `outside_bytes`):
+    /// what the fit holds back of the chunks it stated, and what the driver
+    /// holds outside the engine's span, as the ledger enters it (read by
+    /// the policy, taken out of no range).
+    #[must_use]
+    pub fn held_and_outside(&self) -> (u64, u64) {
+        (
+            self.pools.kept_back_bytes(),
+            self.ledger().bytes(engine::memory::Class::Outside),
+        )
+    }
+
+    /// Settles the fit of a load that armed at its starting weight
+    /// residency. Its last fit ran with nothing fired: it kept the bodies'
+    /// allowance and the activation's whole span out of the cache rows
+    /// ([`Staged::finish`]). The lattice has fired now, so the activation
+    /// is at its high water and the bodies hold what they take: the rest is
+    /// the cache rows', as on a load that armed before its last fit.
+    ///
+    /// The range stays where it lies (the bodies name it) and the chunks
+    /// stated to the runtime stand: what moves is how many of them the fit
+    /// holds back ([`Self::held_and_outside`]), which the residency answers
+    /// and the runtime lifts its pool's hold-back by. What that opens is
+    /// backed when the runtime comes to take it (`Pools::back_whole`),
+    /// before the load returns.
+    pub(super) fn settle_fit(&mut self) -> Result<()> {
+        self.pools.pin();
+        // A pool stated as the chunks it backs has nothing held back to
+        // lift: its load held the bodies' allowance out of it.
+        if !self.pools.stated_whole() {
+            return Ok(());
+        }
         let resident = footprint(self, self.card.0, self.card.1);
         let before = (self.pools.declared_bytes(), self.pools.kept_back_bytes());
-        let fitted = self.pools.fit_the_card(0, self.card.2, true, &resident)?;
-        self.state_live();
+        let fitted = self
+            .pools
+            .fit_the_card(0, self.held_for_fires, true, &resident)?;
         if super::diag::on().arm_trace {
             eprintln!(
-                "[arm-trace] settled after the last step: cache rows {} -> {} MiB of the {} MiB \
-                 the card hands out for them, {} -> {} MiB of the stated chunks held back",
+                "[arm-trace] settled at the starting weight residency: cache rows {} -> {} MiB \
+                 ({} sequences at the declared context) of the {} MiB the card hands out for \
+                 them ({resident}); {} -> {} MiB of the stated chunks held back",
                 before.0 >> 20,
                 self.pools.declared_bytes() >> 20,
+                fitted.fit / u64::from(self.pools.paging().pages_per_slot),
                 fitted.room >> 20,
                 before.1 >> 20,
                 self.pools.kept_back_bytes() >> 20,
@@ -1857,6 +1970,9 @@ impl Shell {
     }
 }
 
+/// The device's memory as this load holds it ([`engine::memory`]): each
+/// owner under its class, over what the device has for this process (all of
+/// it but what others held before the load began).
 fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engine::memory::Ledger {
     use engine::memory::{Class, Ledger};
     let held = footprint(shell, device_total, free_before);
@@ -2234,6 +2350,9 @@ pub(super) struct Baked {
     pub(super) asked: Budget,
     /// Whether the load stated its buckets (no default lattice to coarsen).
     pub(super) stated_buckets: bool,
+    /// What the card may hold in all under the load's allowance, resolved
+    /// before the load took anything (`elastic::ceiling_of`).
+    pub(super) ceiling: u64,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,

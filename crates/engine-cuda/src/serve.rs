@@ -145,6 +145,10 @@ pub struct Shell {
     /// What the last arming's captures took, which a re-arm within the
     /// same load is allowed.
     bodies_took: u64,
+    /// A load on a flat range with no record of what its bodies take: it
+    /// arms over the least range that serves, measures, and fits the range
+    /// again to what arming took ([`super::serve::Staged::finish`]).
+    measuring: bool,
     /// The kernels' workspaces in the activation's span, once a load has
     /// walked what its fires take.
     workspace: Option<load::Workspace>,
@@ -160,22 +164,25 @@ pub struct Shell {
     /// How the arming fire's lanes treat their recurrent rows: a buffering
     /// treatment is recorded with lanes that land and replay nothing.
     arm_rs: record::RsBody,
-    /// Whether this shell arms its rungs past the smallest while it serves
-    /// ([`Shell::arm_step`]), and the lattice left arming.
-    arm_stepped: bool,
-    stepping: Option<arming::Arming>,
-    /// The slots the step in hand was lent: what its synthetic lanes name.
-    lent: Option<engine::live::ArmingLease>,
-    /// The device's bytes, those in use before this load began, and those
-    /// the fit holds for the guests' programs: what a fit after the load
-    /// is read against ([`Shell::settle`]).
-    card: (u64, u64, u64),
-    /// What the runtime reads of this shell while it serves: the rungs
-    /// armed.
+    /// The device's bytes and those in use before this load began: what
+    /// the load's ledger is read against.
+    card: (u64, u64),
+    /// What every fit of this load holds for the guests' programs
+    /// (`Pools::fit_the_card`): the fit a load that arms at its starting
+    /// weight residency settles there holds what the load's fits held.
+    held_for_fires: u64,
+    /// What the runtime reads of this shell while it serves: the fires it
+    /// counts.
     live: engine::live::Live,
     /// The lattice waits for the starting weight residency: the load
     /// streams its weights, and bodies armed over the host copy would read
-    /// every expert over the bus (`Staged::finish`).
+    /// every expert over the bus (`Staged::finish`). It arms at the
+    /// starting residency the runtime sends at bootstrap, before ready,
+    /// and settles its fit there ([`Shell::settle_fit`]): what the load's
+    /// last fit held back for bodies still to arm is the cache rows' from
+    /// then on, and the residency answers what is still held. A later flip
+    /// never arms once lanes name slot refs (it is refused by name, or the
+    /// bodies stay as recorded).
     arm_deferred: bool,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
     windows_memo: Vec<prepare::WindowsMemo>,
@@ -474,6 +481,12 @@ impl Shell {
     /// what expert parallelism seats its buffers by.
     pub fn drop_rungs(&mut self) {
         self.arena.drop_rungs();
+    }
+
+    /// See [`crate::store::Pools::keep_contiguous`]: before the load's
+    /// last fit.
+    pub fn keep_contiguous(&mut self) {
+        self.pools.keep_contiguous();
     }
 
     /// Backs every page the pools declare ([`crate::store::Pools::back_whole`]).

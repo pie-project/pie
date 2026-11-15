@@ -191,6 +191,7 @@ fn load(fixture: &Fixture, leg: Leg) -> engine_cuda::Result<Shell> {
         slots: 2,
         kv_budget: Some(crate::POOL),
         allowance: engine::Allowance::WHOLE,
+        context_declared: false,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
             chip: Some(chip),

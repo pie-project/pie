@@ -201,6 +201,7 @@ fn fire(fixture: &Fixture, knobs: Knobs) -> engine_cuda::Result<(Vec<f32>, Vec<u
         slots: 1,
         kv_budget: Some(crate::POOL),
         allowance: engine::Allowance::WHOLE,
+        context_declared: false,
         ordinal: 0,
         // Eager: the fold is read off the walk, not a recorded body.
         knobs: Knobs {

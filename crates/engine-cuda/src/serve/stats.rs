@@ -154,7 +154,9 @@ impl Shell {
     pub fn chunk_facts(&mut self) -> crate::Result<engine::chunk::ChunkFacts> {
         let max_tokens = self.budget().max_tokens;
         let rungs = self.arena.rungs(self.compiled.arena_forked.as_ref());
-        self.pools.chunk_facts(max_tokens, &rungs)
+        let mut facts = self.pools.chunk_facts(max_tokens, &rungs)?;
+        (facts.held_bytes, facts.outside_bytes) = self.held_and_outside();
+        Ok(facts)
     }
 
     /// Names the recurrent record whose pieces lie in the slot refs
@@ -191,10 +193,12 @@ impl Shell {
     }
 
     /// See `Engine::weight_residency`: stream-ordered before the next fire.
+    /// Answers what the fit holds back of the chunks stated
+    /// ([`Self::held_and_outside`]) once the set is taken.
     pub fn weight_residency(
         &mut self,
         residency: &engine::chunk::WeightResidency,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<u64> {
         // The pages this shell seats for its lanes itself stay clear of the
         // chunks the runtime lays weights in. One already there is let go
         // with every other, which only a shell holding no lane's rows may.
@@ -234,6 +238,10 @@ impl Shell {
             self.device.synchronize()?;
             self.pools.stand_in(false)?;
             armed?;
+            // Every composition has fired and the bodies hold what they
+            // take: the fit the load left unsettled settles, once, and the
+            // answer below says what it still holds back.
+            self.settle_fit()?;
         } else if flipped {
             if self.pools.by_refs() {
                 // The lattice fires lanes this shell seats itself, which a
@@ -285,7 +293,7 @@ impl Shell {
                 );
             }
         }
-        Ok(())
+        Ok(self.pools.kept_back_bytes())
     }
 
     /// The row-streamed tables' blocks named a slot, and all of them: the

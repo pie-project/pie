@@ -110,6 +110,40 @@ fn registry() -> &'static Mutex<HashMap<c_int, Device>> {
     DEVICES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The current device's handle and plans, its handle created the first
+/// time.
+fn device_of<'a>(
+    lt: &sys::Hipblaslt,
+    devices: &'a mut HashMap<c_int, Device>,
+) -> Result<&'a mut Device, Refused> {
+    Ok(match devices.entry(current_device()) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            let mut handle: Lt = core::ptr::null_mut();
+            answered(
+                "hipblasLtCreate",
+                // SAFETY: writes the handle.
+                measured(|| unsafe { (lt.hipblasLtCreate)(&raw mut handle) }),
+            )?;
+            e.insert(Device {
+                handle,
+                plans: HashMap::new(),
+            })
+        }
+    })
+}
+
+/// Creates the current device's hipBLASLt handle now (its device memory,
+/// about 26 MiB, taken at create), so no product's first call takes it
+/// after the load sized its pools. A no-op where hipBLASLt is not offered.
+pub fn open() -> Result<(), Refused> {
+    let Ok(lt) = sys::hipblaslt() else {
+        return Ok(());
+    };
+    let mut devices = registry().lock().expect("lock poisoned");
+    device_of(lt, &mut devices).map(|_| ())
+}
+
 fn current_device() -> c_int {
     let mut device: c_int = 0;
     // SAFETY: writes one int.
@@ -272,24 +306,8 @@ pub unsafe fn matmul(
     let Ok(lt) = sys::hipblaslt() else {
         return Ok(false);
     };
-    let device = current_device();
     let mut devices = registry().lock().expect("lock poisoned");
-    let dev = match devices.entry(device) {
-        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-        std::collections::hash_map::Entry::Vacant(e) => {
-            let mut handle: Lt = core::ptr::null_mut();
-            // SAFETY: writes the handle.
-            answered(
-                "hipblasLtCreate",
-                // SAFETY: writes the handle.
-                measured(|| unsafe { (lt.hipblasLtCreate)(&raw mut handle) }),
-            )?;
-            e.insert(Device {
-                handle,
-                plans: HashMap::new(),
-            })
-        }
-    };
+    let dev = device_of(lt, &mut devices)?;
     let handle = dev.handle;
     let plan = match dev.plans.get(&s) {
         Some(plan) => plan,
