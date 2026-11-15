@@ -36,6 +36,13 @@ fn the_driver_holds_a_save_area_a_queue() {
             areas.queues, areas.rule
         );
         assert!(areas.area() > 0, "a queue holds a save area: {areas}");
+        // KFD counts every queue's save area as this process's.
+        let held = kfd::process_vram().expect("KFD's list for this process reads");
+        assert!(
+            held >= areas.bytes(),
+            "KFD counts {held} bytes for this process, under its queues' {} of save areas",
+            areas.bytes()
+        );
         eprintln!("{want} streams: {areas}");
     }
 }

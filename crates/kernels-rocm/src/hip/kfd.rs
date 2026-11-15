@@ -203,6 +203,20 @@ fn debug_bytes(gfx: u64, cus: u64, arrays: u64) -> Option<u64> {
     Some((waves * 32).next_multiple_of(64))
 }
 
+/// The device memory KFD counts as this process's on the current device
+/// (`/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>`): every allocation the
+/// process holds there, the driver's own for its queues among them. `None`
+/// where that list is not this process's (another PID namespace) or not
+/// readable.
+pub fn process_vram() -> Option<u64> {
+    let node = node_of_current_device().ok()?;
+    let gpu = fs::read_to_string(node.join("gpu_id")).ok()?;
+    let path = Path::new(PROCESSES)
+        .join(std::process::id().to_string())
+        .join(format!("vram_{}", gpu.trim()));
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 /// This process's queues on the GPU KFD names `gpu`, compute and copy
 /// alike (each holds a save area), where KFD's list under this PID is this
 /// process's: it holds a queue on that GPU.
