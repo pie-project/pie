@@ -181,6 +181,23 @@ pub struct Pools {
     /// An `Adapter` slot's bytes (whole pool rows): the largest plane of one
     /// adapter the model's registered banks hold; 0 where it has none.
     adapter_slot: u64,
+    /// Each readout output's ring of planes laid at load
+    /// ([`Pools::lay_readouts`]): a fire writes its readout rows into the
+    /// next one in place (`trace::Source::Readout`).
+    readouts: Vec<ReadoutRing>,
+}
+
+/// One readout output's planes: `[rows, width]` of `dtype` each, as many
+/// as fires can be outstanding (`Runahead::staging_depth`), so a fire never
+/// comes round to a plane a reader still holds.
+#[derive(Debug)]
+pub struct ReadoutRing {
+    pub root: Tensor,
+    pub dtype: Dtype,
+    pub rows: u32,
+    pub width: u32,
+    slots: Vec<Option<std::sync::Arc<Buffer>>>,
+    at: usize,
 }
 
 /// The bytes one adapter's largest plane takes in whole pool rows: a
@@ -678,6 +695,7 @@ impl Pools {
             ring,
             bulk,
             adapter_slot: adapter_slot_bytes(trace),
+            readouts: Vec::new(),
         })
     }
 
@@ -1326,6 +1344,128 @@ impl Pools {
         ((row, plane) == (0, 0))
             .then_some(self.buffer.as_ref())
             .flatten()
+    }
+
+    /// Lays each readout output's ring: `depth` planes of `(root, dtype,
+    /// rows, width)` each, zeros.
+    pub fn lay_readouts(
+        &mut self,
+        device: &Device,
+        rings: &[(Tensor, Dtype, u32, u32)],
+        depth: usize,
+    ) -> Result<()> {
+        for &(root, dtype, rows, width) in rings {
+            let mut slots = Vec::with_capacity(depth);
+            for _ in 0..depth.max(1) {
+                slots.push(device.zeros_or_dry(dtype, rows, width)?.map(std::sync::Arc::new));
+            }
+            self.readouts.push(ReadoutRing {
+                root,
+                dtype,
+                rows,
+                width,
+                slots,
+                at: 0,
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn readouts(&self) -> &[ReadoutRing] {
+        &self.readouts
+    }
+
+    /// The planes each readout ring holds.
+    #[must_use]
+    pub fn readout_depth(&self) -> usize {
+        self.readouts.first().map_or(0, |ring| ring.slots.len())
+    }
+
+    /// The bytes every readout ring takes on the device.
+    #[must_use]
+    pub fn readout_bytes(&self) -> u64 {
+        self.readouts
+            .iter()
+            .map(|r| r.slots.len() as u64 * u64::from(r.rows) * u64::from(r.width) * 4)
+            .sum()
+    }
+
+    /// The next plane of readout ring `index`, for a fire to write into and
+    /// return. Refused when a reader still holds it: a fire's readouts are
+    /// read before the ring comes round (the fires that can be outstanding,
+    /// `Runahead::staging_depth`), never past it.
+    pub fn readout_take(&mut self, device: &Device, index: u16) -> Result<Buffer> {
+        let _ = device;
+        let ring = self
+            .readouts
+            .get_mut(usize::from(index))
+            .ok_or_else(|| Fault::Unbound {
+                what: format!("readout ring {index}, which this load did not lay"),
+            })?;
+        let depth = ring.slots.len().max(1);
+        let next = (ring.at + 1) % depth;
+        let plane = ring.slots[next].take().ok_or_else(|| Fault::Unbound {
+            what: format!("readout ring {index}'s plane {next}, which a fire still holds"),
+        })?;
+        match std::sync::Arc::try_unwrap(plane) {
+            Ok(buffer) => {
+                ring.at = next;
+                Ok(buffer)
+            }
+            Err(held) => {
+                ring.slots[next] = Some(held);
+                Err(Fault::Program {
+                    at: "store::readout_take",
+                    why: format!(
+                        "readout ring {index}'s plane {next}, which a fire {depth} fires back is \
+                         still read from: a fire's readouts are read before {depth} more fires \
+                         run"
+                    ),
+                })
+            }
+        }
+    }
+
+    /// Refused when readout ring `index`'s next plane is still read: asked
+    /// before a fire takes anything, so a refused fire leaves every buffer
+    /// where it was.
+    pub fn readout_ready(&self, index: u16) -> Result<()> {
+        let ring = self
+            .readouts
+            .get(usize::from(index))
+            .ok_or_else(|| Fault::Unbound {
+                what: format!("readout ring {index}, which this load did not lay"),
+            })?;
+        let depth = ring.slots.len().max(1);
+        let next = (ring.at + 1) % depth;
+        match &ring.slots[next] {
+            Some(plane) if std::sync::Arc::strong_count(plane) == 1 => Ok(()),
+            Some(_) => Err(Fault::Program {
+                at: "store::readout_ready",
+                why: format!(
+                    "readout ring {index}'s plane {next}, which a fire {depth} fires back is still \
+                     read from: a fire's readouts are read before {depth} more fires run"
+                ),
+            }),
+            None => Err(Fault::Unbound {
+                what: format!("readout ring {index}'s plane {next}, which a fire still holds"),
+            }),
+        }
+    }
+
+    /// Puts back what a fire returned for readout ring `index`.
+    pub fn readout_put(&mut self, index: u16, buffer: Buffer) {
+        if let Some(ring) = self.readouts.get_mut(usize::from(index)) {
+            ring.slots[ring.at] = Some(std::sync::Arc::new(buffer));
+        }
+    }
+
+    /// The plane readout ring `index`'s last fire wrote.
+    #[must_use]
+    pub fn readout_current(&self, index: u16) -> Option<std::sync::Arc<Buffer>> {
+        let ring = self.readouts.get(usize::from(index))?;
+        ring.slots[ring.at].clone()
     }
 
     /// Puts back what a program returned for the pool.

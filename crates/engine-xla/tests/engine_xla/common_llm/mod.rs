@@ -242,7 +242,7 @@ impl Model {
                 },
                 residency,
                 ordinal: 0,
-                frames_in_flight: 1,
+                frames_in_flight: u8::try_from(knob("FRAMES", 1)).unwrap_or(1),
             })
             .unwrap_or_else(|why| {
                 // (the checkpoint goes with a load that fails too)
