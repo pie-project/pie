@@ -1,5 +1,4 @@
 #![allow(unsafe_code)]
-use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -126,6 +125,27 @@ pub fn rtc_version() -> Result<(i32, i32)> {
 #[cfg(feature = "rocm")]
 const HIPRTC_OPTIONS: [&str; 3] = ["-std=c++17", "-O3", "-ffp-contract=off"];
 
+/// The options a region compiles under on CUDA, but the architecture:
+/// contraction and the fast divide and square root off, so a region rounds
+/// as the host evaluator does.
+#[cfg(feature = "cuda")]
+const NVRTC_OPTIONS: [&std::ffi::CStr; 5] = [
+    c"--std=c++17",
+    c"--fmad=false",
+    c"--prec-div=true",
+    c"--prec-sqrt=true",
+    c"--maxrregcount=64",
+];
+
+/// The options [`compile`] passes the runtime compiler, as bytes.
+fn compile_options() -> impl Iterator<Item = &'static [u8]> {
+    #[cfg(feature = "rocm")]
+    let options = HIPRTC_OPTIONS.iter().map(|option| option.as_bytes());
+    #[cfg(feature = "cuda")]
+    let options = NVRTC_OPTIONS.iter().map(|option| option.to_bytes());
+    options
+}
+
 pub fn compile(source: &str, architecture: &str) -> std::result::Result<Vec<u8>, Failure> {
     #[cfg(feature = "rocm")]
     {
@@ -209,11 +229,11 @@ fn compile_into(
     };
     let options: [*const std::ffi::c_char; 6] = [
         arch.as_ptr(),
-        c"--std=c++17".as_ptr(),
-        c"--fmad=false".as_ptr(),
-        c"--prec-div=true".as_ptr(),
-        c"--prec-sqrt=true".as_ptr(),
-        c"--maxrregcount=64".as_ptr(),
+        NVRTC_OPTIONS[0].as_ptr(),
+        NVRTC_OPTIONS[1].as_ptr(),
+        NVRTC_OPTIONS[2].as_ptr(),
+        NVRTC_OPTIONS[3].as_ptr(),
+        NVRTC_OPTIONS[4].as_ptr(),
     ];
     // SAFETY: `program` is live; `options` is a six-element array of pointers
     // to C strings that outlive the call.
@@ -461,9 +481,9 @@ fn round_down_to_power_of_two(max_threads: i32) -> u32 {
     width
 }
 
-const MAGIC: &[u8; 8] = b"PTRCUB01";
+const MAGIC: &[u8; 8] = b"PTRCUB02";
 
-const HEADER_BYTES: usize = 8 + 4 + 4 + 4 + 8;
+const HEADER_BYTES: usize = 8 + 4 + 4 + 8;
 
 const MAX_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -500,19 +520,19 @@ impl Disk {
     }
 
     #[must_use]
-    pub fn load(&self, key: &str, region_index: u32, entry: &str) -> Option<Vec<u8>> {
-        let path = self.path(key, region_index)?;
+    pub fn load(&self, key: &str, entry: &str) -> Option<Vec<u8>> {
+        let path = self.path(key)?;
         let bytes = fs::read(&path).ok()?;
-        match parse(&bytes, key, region_index, entry) {
+        match parse(&bytes, key, entry) {
             Some(cubin) => Some(cubin),
             None => {
-                self.invalidate(key, region_index);
+                self.invalidate(key);
                 None
             }
         }
     }
 
-    pub fn store(&self, key: &str, region_index: u32, entry: &str, cubin: &[u8]) {
+    pub fn store(&self, key: &str, entry: &str, cubin: &[u8]) {
         let Some(directory) = self.directory.as_ref() else {
             return;
         };
@@ -522,13 +542,12 @@ impl Disk {
         if fs::create_dir_all(directory).is_err() {
             return;
         }
-        let Some(destination) = self.path(key, region_index) else {
+        let Some(destination) = self.path(key) else {
             return;
         };
 
         let mut bytes = Vec::with_capacity(HEADER_BYTES + key.len() + entry.len() + cubin.len());
         bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&region_index.to_le_bytes());
         bytes.extend_from_slice(&(key.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&(entry.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&(cubin.len() as u64).to_le_bytes());
@@ -548,45 +567,45 @@ impl Disk {
         }
     }
 
-    pub fn invalidate(&self, key: &str, region_index: u32) {
-        if let Some(path) = self.path(key, region_index) {
+    pub fn invalidate(&self, key: &str) {
+        if let Some(path) = self.path(key) {
             let _ = fs::remove_file(path);
         }
     }
 
-    fn path(&self, key: &str, region_index: u32) -> Option<PathBuf> {
+    fn path(&self, key: &str) -> Option<PathBuf> {
         let directory = self.directory.as_ref()?;
-        Some(directory.join(format!(
-            "{:016x}-{region_index}.cubin",
-            eta_ir::fnv1a64(key.as_bytes())
-        )))
+        Some(directory.join(format!("{:016x}.cubin", eta_ir::fnv1a64(key.as_bytes()))))
     }
 }
 
+/// What a region's code is keyed by, in memory and on disk: its text and
+/// what compiles it (the backend, the architecture, the runtime compiler's
+/// version and options), never the stage it sits in, so regions the same
+/// but for where they sit share one build.
 #[must_use]
-pub fn disk_key(identity: &str, source: &str) -> String {
-    let hash = eta_ir::fnv1a64(source.as_bytes());
-    let mut key = String::with_capacity(identity.len() + 16);
-    key.push_str(identity);
-    for byte in hash.to_le_bytes() {
-        let _ = write!(key, "{byte:02x}");
-    }
-    key
+pub fn region_key(target: &Target, source: &str) -> String {
+    let options: Vec<&[u8]> = compile_options().collect();
+    let hash = fnv1a64_with(source.as_bytes(), &options);
+    let (major, minor) = target.rtc;
+    format!(
+        "{BACKEND:?}-{}-rtc{major}.{minor}-{hash:016x}",
+        target.architecture()
+    )
 }
 
-fn parse(bytes: &[u8], key: &str, region_index: u32, entry: &str) -> Option<Vec<u8>> {
+fn parse(bytes: &[u8], key: &str, entry: &str) -> Option<Vec<u8>> {
     if bytes.len() < HEADER_BYTES || bytes.len() as u64 > MAX_ENTRY_BYTES {
         return None;
     }
     if &bytes[..8] != MAGIC {
         return None;
     }
-    let stored_region = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
-    let key_size = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
-    let entry_size = u32::from_le_bytes(bytes[16..20].try_into().ok()?) as usize;
-    let cubin_size = u64::from_le_bytes(bytes[20..28].try_into().ok()?);
+    let key_size = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
+    let entry_size = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
+    let cubin_size = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
 
-    if stored_region != region_index || key_size != key.len() || entry_size != entry.len() {
+    if key_size != key.len() || entry_size != entry.len() {
         return None;
     }
     let tail = bytes.len().checked_sub(HEADER_BYTES)?;
@@ -738,8 +757,6 @@ impl Cache {
                 duplicate.kind as u32, duplicate.stage, duplicate.region
             ),
         })?;
-        let architecture = target.architecture();
-
         let mut stages = Vec::with_capacity(plan.package.plans.len());
         for (stage_index, stage_plan) in plan.package.plans.iter().enumerate() {
             let stage_index = u32::try_from(stage_index).map_err(|_| Failure::Deterministic {
@@ -766,8 +783,7 @@ impl Cache {
                 Lookup::Collided | Lookup::Miss => {}
             }
 
-            let compiled =
-                self.build_stage(stage_index, stage_plan, &index, &identity, &architecture)?;
+            let compiled = self.build_stage(stage_index, stage_plan, &index, &target)?;
             if lookup == Lookup::Miss {
                 self.stages
                     .stage(key, stage_plan.identity, compiled.clone());
@@ -786,8 +802,7 @@ impl Cache {
         stage_index: u32,
         plan: &LaunchStagePlan,
         index: &Emitted<'_>,
-        identity: &str,
-        architecture: &str,
+        target: &Target,
     ) -> std::result::Result<Stage, Failure> {
         let mut regions = Vec::new();
         for region_index in 0..plan.fused.len() {
@@ -831,7 +846,7 @@ impl Cache {
                 }
             };
 
-            let module = self.region_module(identity, region_index, entry, source, architecture)?;
+            let module = self.region_module(target, region_index, entry, source)?;
             regions.push(Region {
                 region_index,
                 module,
@@ -845,17 +860,16 @@ impl Cache {
 
     fn region_module(
         &mut self,
-        identity: &str,
+        target: &Target,
         region_index: u32,
         entry: &str,
         source: &str,
-        architecture: &str,
     ) -> std::result::Result<Arc<Module>, Failure> {
         // The region is built under one symbol, so its code is keyed by
         // what it computes, never by the stage it sits in; the module keeps
         // the region's own name.
         let source = source.replace(entry, REGION_SYMBOL);
-        let key = disk_key(identity, &source);
+        let key = region_key(target, &source);
         // CUDA keeps the exact cut's state in dynamic shared memory; HIP's
         // text keeps it static.
         let dynamic = if !cfg!(feature = "rocm")
@@ -877,7 +891,7 @@ impl Cache {
             })?;
             return Ok(named(module));
         }
-        if let Some(cubin) = self.disk.load(&key, region_index, REGION_SYMBOL) {
+        if let Some(cubin) = self.disk.load(&key, REGION_SYMBOL) {
             // One that asks for late memory was compiled before that was
             // refused: compiled again, and refused below if it still asks.
             let loaded = late_memory(&cubin)
@@ -889,11 +903,11 @@ impl Cache {
                     self.built.insert(key, cubin.into());
                     return Ok(named(module));
                 }
-                None => self.disk.invalidate(&key, region_index),
+                None => self.disk.invalidate(&key),
             }
         }
 
-        let cubin = compile(&source, architecture)?;
+        let cubin = compile(&source, &target.architecture())?;
         self.stats.compilations += 1;
         late_memory(&cubin).map_err(|why| Failure::Deterministic {
             reason: format!("region {region_index} (`{entry}`): {why}"),
@@ -903,7 +917,7 @@ impl Cache {
                 reason: format!("loading `{entry}`: {error}"),
             }
         })?;
-        self.disk.store(&key, region_index, REGION_SYMBOL, &cubin);
+        self.disk.store(&key, REGION_SYMBOL, &cubin);
         self.built.insert(key, cubin.into());
         Ok(named(module))
     }
@@ -947,7 +961,7 @@ mod tests {
 
     #[test]
     fn compile_every_case() {
-        editing_the_source_changes_the_disk_key_with_no_version_bump();
+        the_region_key_is_its_text_and_what_compiles_it();
         a_corrupt_entry_is_a_miss_and_is_deleted();
         a_disabled_cache_is_a_miss_and_not_a_failure();
         #[cfg(feature = "rocm")]
@@ -958,8 +972,14 @@ mod tests {
     }
 
     #[cfg(feature = "rocm")]
-    fn device_arch() -> &'static str {
-        kernels_cuda::jit::cache::arch(0).expect("a gfx device")
+    fn device_target() -> Target {
+        Target {
+            major: 9,
+            minor: 4,
+            device: 0,
+            rtc: rtc_version().expect("hiprtc answers its version"),
+            arch: kernels_cuda::jit::cache::arch(0).expect("a gfx device"),
+        }
     }
 
     #[cfg(feature = "rocm")]
@@ -969,16 +989,27 @@ mod tests {
                 "extern \"C\" __global__ void {entry}(unsigned* out) {{ out[threadIdx.x] = 1u; }}"
             )
         };
-        let mut cache = Cache::new(Disk::disabled());
-        let (a, b) = ("ptir_fused_00000000000000aa_r0", "ptir_fused_00000000000000bb_r0");
-        let first = cache
-            .region_module("identity", 0, a, &region(a), device_arch())
-            .expect("builds");
-        let second = cache
-            .region_module("identity", 0, b, &region(b), device_arch())
-            .expect("builds");
+        let directory = scratch("shared");
+        let target = device_target();
+        // Two stages' regions: other names, other region indices.
+        let (a, b) = ("ptir_fused_00000000000000aa_r0", "ptir_fused_00000000000000bb_r3");
+        let mut cache = Cache::new(Disk::at(&directory));
+        let first = cache.region_module(&target, 0, a, &region(a)).expect("builds");
+        let second = cache.region_module(&target, 3, b, &region(b)).expect("builds");
         assert_eq!(cache.stats().compilations, 1, "the second stage's region is the first's code");
         assert_eq!((first.entry_name(), second.entry_name()), (a, b), "each keeps its name");
+
+        // A later boot finds it on disk under a third name and index.
+        let c = "ptir_fused_00000000000000cc_r5";
+        let mut later = Cache::new(Disk::at(&directory));
+        let third = later.region_module(&target, 5, c, &region(c)).expect("loads");
+        assert_eq!(
+            (later.stats().compilations, later.stats().persistent_hits),
+            (0, 1),
+            "the disk entry is the region's text's, not its stage's"
+        );
+        assert_eq!(third.entry_name(), c);
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[cfg(feature = "rocm")]
@@ -993,7 +1024,7 @@ mod tests {
              }}"
         );
         let mut cache = Cache::new(Disk::disabled());
-        match cache.region_module("identity", 1, entry, &source, device_arch()) {
+        match cache.region_module(&device_target(), 1, entry, &source) {
             Err(Failure::Deterministic { reason }) => assert!(
                 reason.contains(entry) && reason.contains("scratch"),
                 "the refusal names the region and what it asks: {reason}"
@@ -1003,16 +1034,35 @@ mod tests {
         }
     }
 
-    fn editing_the_source_changes_the_disk_key_with_no_version_bump() {
-        let identity = "0100000000000000000300000000000000000000-v0003000400000003 00000015";
-        let before = disk_key(identity, "__global__ void k() { a(); }");
-        let after = disk_key(identity, "__global__ void k() { b(); }");
+    fn the_region_key_is_its_text_and_what_compiles_it() {
+        let target = Target {
+            major: 8,
+            minor: 9,
+            device: 0,
+            rtc: (12, 4),
+            #[cfg(feature = "rocm")]
+            arch: "gfx942",
+        };
+        let before = region_key(&target, "__global__ void k() { a(); }");
+        let after = region_key(&target, "__global__ void k() { b(); }");
         assert_ne!(
             before, after,
             "a template edit bumps no version, so the source itself has to be \
              in the key — otherwise yesterday's cubin answers today's launch"
         );
-        assert!(before.starts_with(identity), "the identity stays readable");
+        let other_device = Target { device: 1, ..target };
+        assert_eq!(
+            before,
+            region_key(&other_device, "__global__ void k() { a(); }"),
+            "a second card of the same architecture shares the build"
+        );
+        let newer = Target { rtc: (12, 5), ..target };
+        assert_ne!(
+            before,
+            region_key(&newer, "__global__ void k() { a(); }"),
+            "another runtime compiler builds it again"
+        );
+        assert!(before.contains(&target.architecture()), "the target stays readable");
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -1025,26 +1075,26 @@ mod tests {
     fn a_corrupt_entry_is_a_miss_and_is_deleted() {
         let directory = scratch("corrupt");
         let disk = Disk::at(&directory);
-        disk.store("key-a", 0, "entry", b"cubin-bytes");
-        let path = disk.path("key-a", 0).expect("enabled");
+        disk.store("key-a", "entry", b"cubin-bytes");
+        let path = disk.path("key-a").expect("enabled");
         let good = fs::read(&path).expect("stored");
 
         fs::write(&path, &good[..good.len() - 3]).expect("truncate");
-        assert_eq!(disk.load("key-a", 0, "entry"), None, "a short tail misses");
+        assert_eq!(disk.load("key-a", "entry"), None, "a short tail misses");
         assert!(!path.exists(), "and the entry is removed");
 
-        disk.store("key-a", 0, "entry", b"cubin-bytes");
+        disk.store("key-a", "entry", b"cubin-bytes");
         let mut wrong_magic = fs::read(&path).expect("stored");
         wrong_magic[7] = b'9';
         fs::write(&path, &wrong_magic).expect("write");
-        assert_eq!(disk.load("key-a", 0, "entry"), None, "a format bump misses");
+        assert_eq!(disk.load("key-a", "entry"), None, "a format bump misses");
         assert!(!path.exists());
     }
 
     fn a_disabled_cache_is_a_miss_and_not_a_failure() {
         let disk = Disk::disabled();
         assert!(!disk.is_enabled());
-        disk.store("key", 0, "entry", b"cubin");
-        assert_eq!(disk.load("key", 0, "entry"), None);
+        disk.store("key", "entry", b"cubin");
+        assert_eq!(disk.load("key", "entry"), None);
     }
 }
