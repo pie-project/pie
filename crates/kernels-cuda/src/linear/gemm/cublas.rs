@@ -2742,4 +2742,18 @@ mod tactic_tables {
         let mut c = cache();
         assert_eq!(c.read(text), text.lines().count() - 1);
     }
+
+    #[test]
+    fn the_checked_in_rtx_pro_4500_table_reads_whole() {
+        let text = include_str!(
+            "../../../../engine-cuda/profiles/sm120/nvidia-rtx-pro-4500-blackwell.gemm"
+        );
+        let mut c = DiskCache {
+            signature: "# pie-dense-gemm v11 sm120 cublas=130000 dev=NVIDIA RTX PRO 4500 Blackwell"
+                .to_string(),
+            ..cache()
+        };
+        assert_eq!(c.read(text), text.lines().count() - 1);
+        assert!(c.found.stale.is_none());
+    }
 }

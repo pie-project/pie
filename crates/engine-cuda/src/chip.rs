@@ -261,10 +261,16 @@ shelved!(
 /// belong to (`sm89/nvidia-l40s.toml` has `sm89/nvidia-l40s.gemm`): what
 /// `pie tune` and loads on that device timed, read before the user's own.
 #[cfg(not(feature = "rocm"))]
-pub const GEMM_TABLES: &[(&str, &str)] = &[(
-    "sm89/nvidia-l40s.gemm",
-    include_str!("../profiles/sm89/nvidia-l40s.gemm"),
-)];
+pub const GEMM_TABLES: &[(&str, &str)] = &[
+    (
+        "sm89/nvidia-l40s.gemm",
+        include_str!("../profiles/sm89/nvidia-l40s.gemm"),
+    ),
+    (
+        "sm120/nvidia-rtx-pro-4500-blackwell.gemm",
+        include_str!("../profiles/sm120/nvidia-rtx-pro-4500-blackwell.gemm"),
+    ),
+];
 
 /// The checked-in tactic table of `device`'s profile, if it has one.
 #[cfg(not(feature = "rocm"))]
