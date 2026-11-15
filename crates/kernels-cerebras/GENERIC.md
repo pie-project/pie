@@ -667,8 +667,8 @@ milestone's tail.
       silence: a side's outputs were the values read outside it by nodes its *first* class runs,
       and the exit's nodes run for the image rows alone, so the text-first single block left
       nothing on the row stream and the exit waited for its 64 rows. A side is lowered over all
-      its classes' words now. (A 16 + 16-row build stalls even at `--stages 2`: an unrelated
-      gap at small row counts, open; bisect at 64 rows.)
+      its classes' words now. (A 16 + 16-row build was seen to stall at `--stages 2`; from
+      18ebbe86c on it does not, in either layout: M1f.)
   - Decode is unchanged: plan + build `diff -r` identical against a6de5047d's wafer-compile for
     q35_08b, q35_4b, q35_9b, q3_8b, llama31-8b, gemma_e2b, gemma_e4b, gemma_12b, gptoss_20b, tiny
     t08, tiny llama, tiny gemma, tiny gpt-oss. tiny_q35_t08 on the simulator (wafer-bench, 5
@@ -902,6 +902,52 @@ milestone's tail.
     with the config words, the carried scalars and helpers (M1f's runs use their own builds).
   - Decode is unchanged: plan + build `diff -r` identical against 18ebbe86c's wafer-compile for
     qwen35-d0.8b, qwen35-d9b, llama31-8b, gptoss-20b, gemma4-e2b and tiny t08.
+
+- **M1f** (flux2-mini at 16 + 16 rows on the simulator; the denoise loop from the engine's
+  inputs; the program re-launched a step). The goldens at 16 rows a lane (a 16-row text lane, an
+  8 x 8 latent): engine-cerebras' `flux_2_minis_reading_files` at `READING_ROWS=16` (capture,
+  program, inputs, engine-cpu's loop), `mk_tiny_flux2.py --rows 16` (diffusers' step and loop; the
+  host's 2-step loop lands 3.66e-3 / 0.9999933 from it, as 3.48e-3 at 64 rows).
+  - **The small-row stall does not reproduce** from 18ebbe86c on. `--stages 2` at 16 + 16 runs
+    to the end in the search's layout (39 x 28: 3.87M cycles simulated, 31 min; its rows were
+    not compared: host.json's capture path was relative, absolute now) and in M1d's pinned one
+    (`--py 16 --tile 12288`, 27 x 28: 1.63e-3 / 0.9999987 text, 1.57e-3 / 0.9999988 image,
+    3.92M cycles of stamps, 26 min). The
+    16-row programs differ from the 64-row ones only in counts and buffer sizes, the K / V PEs'
+    entries (4 a PE, not 16) and the entries' and exit's single weight column (their tiles fit
+    one at 16 rows); their routes, flow for flow (each sender's receivers), are the 64-row
+    program's. No 16-row artifact of M1d's stall was kept, so what moved it is not known (it
+    is none of M1f's changes: both programs are 18ebbe86c's emitter's).
+  - **The full step at 16 + 16** (`run.py`, 18ebbe86c's layout, 77 x 28, 8 K / V columns): the
+    velocity's patches against the capture rel L2 4.90e-3, cosine 0.999988; unpatchified against
+    diffusers 5.59e-3, 0.999984. 8.08M cycles of stamps (8.32M simulated), 2.1 h: a quarter of
+    the rows saves a quarter of the stamps, the first launch's start-up being most of them
+    (below).
+  - **The program re-launches** (`Reading::write_static` once, `Reading::launch` a step: the
+    step's entries, `run`, the rows back; wafer-bench `--reload 1` for M1e's load a step,
+    `--save` for each step's velocity and latent). Nothing in a stream kernel's `go` kept state
+    across launches but the K / V roots' pass count, which a launch now zeroes.
+  - **The 2-step loop from the engine's inputs, on the search's default** (114729f71's: pcfg
+    words, helpers; 77 x 28; `wafer-bench --reading --steps 2`, one load):
+
+    | | vs engine-cpu (rel L2 / cosine) | vs diffusers | cycles | wall |
+    |---|---|---|---|---|
+    | step 0 velocity (sigma 1), the first launch | 4.85e-3 / 0.9999882 | | 7.90M | 79 min |
+    | step 1 velocity (sigma 0.7672), re-launched | 6.36e-3 / 0.9999798 | | 1.27M | 15 min |
+    | latent after step 1 | 1.20e-3 / 0.9999993 | | | |
+    | latent after step 2 | 3.86e-3 / 0.9999925 | 3.58e-3 / 0.9999936 | | |
+
+    - The helpers' and config words' numerics hold (step 0 is as the 18ebbe86c build's single
+      step above); the host's own loop is 3.66e-3 from diffusers, the wafer's 3.58e-3.
+    - The re-launched step is 1.27M cycles of stamps, not 7.9M: the rest of the first launch is
+      start-up (the launch reaching the PEs, the lane bus's first words), paid once a load. A
+      step of the loop is that 1.27M (1.45 ms at 875 MHz), against the cost model's 1.21M for the
+      program (M2b's timeline): 5% off.
+  - Decode is unchanged: plan + build `diff -r` identical against 114729f71's wafer-compile for
+    qwen35-d0.8b, qwen35-d9b, llama31-8b, gptoss-20b, gemma4-e2b and tiny t08.
+  - Left: a step's inputs from a guest's request (the inferlet's loop), not files; the static
+    arrays cut from a checkpoint, not a capture; the 64-row and klein programs re-launched on
+    the simulator (only 16 + 16 was).
 
 ## 5. Risks
 
