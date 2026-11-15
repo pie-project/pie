@@ -200,6 +200,26 @@ fn tune_vulkan(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 tune_grid!(tune_metal, engine_metal, "metal");
 
+/// `pie tune wgpu`: the `[rates]` step alone.
+#[cfg(feature = "wgpu")]
+fn tune_wgpu(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
+    if !req.rates || req.fire_only {
+        return Err(
+            "`pie tune wgpu` measures the device's rates alone: pass --rates".to_string(),
+        );
+    }
+    let out = engine_wgpu::tune::rates(Some(req.profiles), say)?;
+    Ok(Tuned {
+        device: out.device,
+        file: out.file,
+        lines: Vec::new(),
+        wrong: Vec::new(),
+        checks: Vec::new(),
+        changed: true,
+        seconds: out.seconds,
+    })
+}
+
 #[cfg(feature = "engine-cuda")]
 fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     let models = pick_models("cuda", req)?;
@@ -230,6 +250,15 @@ pub fn backends() -> Vec<Backend> {
         probe: engine_vulkan::chip::probe,
         resolve: engine_vulkan::chip::resolve_facts,
         tune: Some(tune_vulkan),
+    });
+    #[cfg(feature = "wgpu")]
+    out.push(Backend {
+        name: "wgpu",
+        registry: engine_wgpu::chip::registry,
+        shelf: &engine_wgpu::chip::SHELF,
+        probe: engine_wgpu::tune::probe,
+        resolve: engine_wgpu::tune::resolve_facts,
+        tune: Some(tune_wgpu),
     });
     #[cfg(feature = "xla")]
     out.push(Backend {
