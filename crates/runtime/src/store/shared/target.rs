@@ -32,8 +32,12 @@ pub struct SharedGrow {
     ticks: Arc<AtomicU64>,
     /// The lanes live now that may decode ([`Self::walk_rows`]).
     live_lanes: Arc<dyn Fn() -> u32 + Send + Sync>,
-    /// The tick since which the rung has stood past what is asked: a cap
-    /// down or a lower waits the governor's patience from it.
+    /// The widest rung the engine has armed ([`::engine::live`]). Read only
+    /// while the engine arms rungs in lane time, and goes with that.
+    armed_through: Arc<dyn Fn() -> u32 + Send + Sync>,
+    /// The tick since which the rung has stood past what is asked: the
+    /// lower that frees its chunks, and the cap down before it, wait the
+    /// governor's patience from it.
     idle_since: Arc<std::sync::Mutex<Option<u64>>>,
     /// The last raise found no room: none is tried again until room is
     /// freed ([`Self::room_freed`]), the one event that can change that.
@@ -68,6 +72,7 @@ impl SharedGrow {
                 let live = crate::inferlet::process::live_count().min(most);
                 u32::try_from(live).unwrap_or(u32::MAX)
             }),
+            armed_through: Arc::new(move || crate::engine::live(engine).armed_through()),
             raise_blocked: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -90,6 +95,18 @@ impl SharedGrow {
         self
     }
 
+    /// The widest rung the engine has armed, as the walk reads it; for a
+    /// test.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_armed_through(
+        mut self,
+        armed: impl Fn() -> u32 + Send + Sync + 'static,
+    ) -> Self {
+        self.armed_through = Arc::new(armed);
+        self
+    }
+
     /// Steps the activation rung toward the rung the passes still to run
     /// ask of a fire ([`super::want_rows`]), the smallest while none asks
     /// past it, until there or until a step has to wait: caps fires, lowers
@@ -98,6 +115,12 @@ impl SharedGrow {
     /// of room waits on the room the asking pass has the planner free; one
     /// to a rung the engine has not armed waits on its capture
     /// ([`super::rung_goal`]), the walk looking again each poll.
+    ///
+    /// Fires are cut narrower only for what the cut is needed for: the
+    /// chunks a lower after it frees, the fit, or the armed bound. A cut
+    /// within a chunk class frees nothing, so none is taken there however
+    /// long nothing asks the width: the cap stays where the last pass left
+    /// it, and the pause between two passes of one process moves no cap.
     /// The rows the walk holds the rung to: what passes and decode batches
     /// ask ([`super::wanted_rows`]), and never fewer than the lanes live now
     /// (a live process each, at most the engine's lane count), whose decode
@@ -126,17 +149,34 @@ impl SharedGrow {
                 if pool.copying().is_some() {
                     return;
                 }
-                let goal = super::rung_goal(&pool, self.engine, self.walk_rows());
+                let armed = (self.armed_through)();
+                let goal = pool.armed_rung_for(self.walk_rows(), armed);
+                let cap = super::fire_cap(self.engine);
                 // The pool stands past what is asked: it comes down only
                 // once it has for the governor's patience, so a pause
                 // between batches moves no rung. On a span backed on
                 // demand an idle pool always comes down after it: the
                 // carve held costs resident memory there.
+                //
+                // Interim: the patience decides this lower, the one move
+                // down that frees chunks, only until the governor's `yield`
+                // does; it goes with the governor's other debounce
+                // constants then.
                 let past = pool.pool().act_chunks(goal) < pool.pool().act_reserved();
                 let tick = self.ticks.load(Ordering::Acquire);
                 // An engine holding a rung the terms no longer fit is
                 // brought down at once too: a bind waits on it.
-                let forced = super::fire_cap(self.engine) > pool.fit_cap() || pool.told_unfit();
+                let forced = cap > pool.fit_cap() || pool.told_unfit();
+                // Fires stand cut wider than the widest rung armed (a pool
+                // that starts at its largest rung, the engine still to arm
+                // the rest): no captured body is that wide, so they are cut
+                // at once in any class, as for the fit.
+                //
+                // Here only because the engine arms rungs while it serves:
+                // once every rung is armed before the load returns this
+                // never holds, and it is deleted with lane-time arming, not
+                // kept.
+                let unarmed = cap > pool.lifted(pool.armed_rung_for(u32::MAX, armed));
                 let waited = forced || {
                     let mut since = self.idle_since.lock().unwrap();
                     if past {
@@ -151,7 +191,7 @@ impl SharedGrow {
                 let step = self.rung_walk.lock().unwrap().step(
                     &pool,
                     goal,
-                    super::fire_cap(self.engine),
+                    cap,
                     super::rung_granted(self.engine),
                     current,
                     retired,
@@ -170,13 +210,17 @@ impl SharedGrow {
                             RungStep::Raise { rung, evacuation }
                         })
                     }
-                    // A cap down or a lower before the patience is out.
-                    // Fires wider than the widest rung that fits with the
-                    // programs' fire terms are cut at once: the span holds
-                    // no wider fire.
+                    // A lower before the patience is out.
                     Ok(RungStep::Lower(_)) if !waited => Ok(RungStep::Wait),
+                    // A cap down is taken for the chunks the lower after it
+                    // frees, once the patience is out, and at once for the
+                    // fit (the span holds no fire wider than the widest
+                    // rung that fits with the programs' fire terms) or the
+                    // armed bound. Within a class it frees nothing and is
+                    // not taken, however long the cap stands above what is
+                    // asked.
                     Ok(RungStep::Cap(tokens))
-                        if !waited && tokens < super::fire_cap(self.engine) =>
+                        if tokens < cap && !(forced || unarmed || (past && waited)) =>
                     {
                         Ok(RungStep::Wait)
                     }
@@ -210,15 +254,18 @@ impl SharedGrow {
                     {
                         // Under the pool's lock, as a pass's `raise_now`
                         // lifts it: a cap down past what a pass asks since
-                        // is not taken.
+                        // is not taken. What it asks as fires take it, no
+                        // wider than the widest rung armed: an ask past
+                        // that waits on the capture, and holds no cut off.
                         let pool = self.shared.lock().unwrap();
                         let now = super::fire_cap(self.engine);
-                        if tokens < now && self.walk_rows().min(pool.fit_cap()) > tokens {
+                        let asked = pool.armed_rung_for(self.walk_rows(), (self.armed_through)());
+                        if tokens < now && pool.lifted(asked).min(pool.fit_cap()) > tokens {
                             continue;
                         }
                         super::set_fire_cap(self.engine, tokens);
                     }
-                    tracing::info!(
+                    tracing::debug!(
                         engine = self.engine,
                         tokens,
                         "fires cut to the activation rung"
