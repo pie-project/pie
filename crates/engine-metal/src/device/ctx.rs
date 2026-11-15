@@ -568,6 +568,33 @@ impl Frame {
         Ok(self.encoder.get_mut().as_deref().expect("just opened"))
     }
 
+    /// Ends the pass here and opens a concurrent one: its dispatches may
+    /// run together, ordered only by [`Frame::level`] barriers between them.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn concurrent_pass(&mut self) -> Result<()> {
+        use objc2_metal::MTLDispatchType;
+        self.end_pass();
+        let encoder = self
+            .buffer
+            .get_mut()
+            .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+            .ok_or(Fault::Device {
+                call: "computeCommandEncoderWithDispatchType",
+                why: "the command buffer would not open a concurrent compute pass".to_string(),
+            })?;
+        declare(&encoder, &self.indirect);
+        *self.encoder.get_mut() = Some(encoder);
+        Ok(())
+    }
+
+    /// In a concurrent pass: every dispatch before this one is done with the
+    /// pass's buffers before any after it starts.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn level(&self) {
+        use objc2_metal::{MTLBarrierScope, MTLComputeCommandEncoder};
+        self.encoder().memoryBarrierWithScope(MTLBarrierScope::Buffers);
+    }
+
     /// Ends the pass here and opens the next once the GPU has done all the
     /// work before it: a pass that reads through an address, which Metal
     /// tracks no hazard by, sees what the passes before it wrote.
