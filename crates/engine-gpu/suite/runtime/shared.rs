@@ -1,7 +1,7 @@
 //! A guest whose stage launches a chain of whole-row ops, three of its
 //! values read by the host after the last: every cell is exact against the
-//! host's arithmetic over two passes of unlike ids, whichever values of the
-//! chain lie in one another's scratch bytes.
+//! host's arithmetic over three passes, the second's id unlike the others',
+//! whichever values of the chain lie in one another's scratch bytes.
 
 use engine::ChannelId;
 use engine::Engine;
@@ -257,13 +257,15 @@ fn a_chain_of_rows_answers_the_host_cell_for_cell() {
         .expect("the instance binds")
         .id;
 
+    // The timestep's one cell feeds every pass: a fire reads it where it
+    // lies and leaves it there.
+    assert!(
+        engine
+            .publish_channel(instance, 2, &0.375f32.to_le_bytes())
+            .expect("the timestep publishes"),
+        "the ring had room"
+    );
     for token in [first, second, first] {
-        assert!(
-            engine
-                .publish_channel(instance, 2, &0.375f32.to_le_bytes())
-                .expect("the timestep publishes"),
-            "the ring had room"
-        );
         let lane = Lane {
             slot: 0,
             word: facts.word(&Request::new(rows, false)),
