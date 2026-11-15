@@ -523,7 +523,7 @@ impl Plane {
         Ok(InputCell::Host { bytes, dtype })
     }
 
-    pub fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
+    pub fn envelope_fold(&self, instance: InstanceId) -> Result<Option<Vec<u32>>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
             id: instance.0,
@@ -543,9 +543,9 @@ impl Plane {
                 "instance {instance}: the `fold` ring is empty at the fire"
             )));
         }
-        let len = match ring.front() {
-            Value::U32(cells) => cells.first().copied(),
-            Value::I32(cells) => cells.first().map(|&n| n.max(0) as u32),
+        let cells: Vec<u32> = match ring.front() {
+            Value::U32(cells) => cells.to_vec(),
+            Value::I32(cells) => cells.iter().map(|&n| n.max(0) as u32).collect(),
             other => {
                 return Err(Refusal::Program(format!(
                     "instance {instance}: `fold` holds {:?}, not a count",
@@ -553,9 +553,12 @@ impl Plane {
                 )));
             }
         };
-        len.map(Some).ok_or_else(|| {
-            Refusal::Program(format!("instance {instance}: `fold` holds an empty cell"))
-        })
+        if cells.is_empty() {
+            return Err(Refusal::Program(format!(
+                "instance {instance}: `fold` holds an empty cell"
+            )));
+        }
+        Ok(Some(cells))
     }
 
     pub fn envelope_tokens(
@@ -1095,7 +1098,7 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         Plane::input_cell(self, instance, id)
     }
 
-    fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
+    fn envelope_fold(&self, instance: InstanceId) -> Result<Option<Vec<u32>>, Refusal> {
         Plane::envelope_fold(self, instance)
     }
 

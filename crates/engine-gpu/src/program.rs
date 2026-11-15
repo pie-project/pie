@@ -101,8 +101,10 @@ pub trait Programs<B: Serve>: Default {
     /// The oldest cell guest input channel `id` of `instance` holds.
     fn input_cell(&self, instance: InstanceId, id: ChannelId) -> Result<InputCell<B>, Refusal>;
 
-    /// The rows a lane of `instance` folds, where the instance states them.
-    fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal>;
+    /// The `fold` cell `instance` holds at the fire, where it states one:
+    /// what each of its lanes folds
+    /// ([`crate::store::frozen::fold_cell`]). Never an empty cell.
+    fn envelope_fold(&self, instance: InstanceId) -> Result<Option<Vec<u32>>, Refusal>;
 
     fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8])
     -> Result<bool, Refusal>;

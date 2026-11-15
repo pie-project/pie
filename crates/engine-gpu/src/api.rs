@@ -997,13 +997,29 @@ impl<B: Host> Gpu<B> {
                 reports: lane.reports,
             })
             .collect();
+        // The cell is read for the lanes of its program that ask, each its
+        // own entry of it.
         for attachment in &submission.attachments {
-            let lane = attachment.lane as usize;
-            if crate::store::frozen::counted_on_device(&submission.lanes[lane].rs) {
-                folds[lane].count = self
-                    .programs
-                    .envelope_fold(attachment.instance)
-                    .map_err(refusal)?;
+            let first = attachment.lane as usize;
+            let mut cell = None;
+            for at in 0..attachment.lanes.max(1) as usize {
+                let lane = first + at;
+                let Some(stated) = submission.lanes.get(lane) else {
+                    break;
+                };
+                if !crate::store::frozen::counted_on_device(&stated.rs) {
+                    continue;
+                }
+                if cell.is_none() {
+                    cell = Some(
+                        self.programs
+                            .envelope_fold(attachment.instance)
+                            .map_err(refusal)?,
+                    );
+                }
+                if let Some(Some(cells)) = &cell {
+                    folds[lane].count = Some(crate::store::frozen::fold_cell(cells, lane, at)?);
+                }
             }
         }
 

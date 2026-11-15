@@ -40,6 +40,25 @@ pub struct DeviceFold {
     pub reports: u64,
 }
 
+/// What lane `lane` of a fire folds by its program's `fold` cell, the
+/// program's lane `at` (counted from the first it is attached to): a cell
+/// of one entry states every lane's fold, a longer one a fold a lane. A
+/// lane past a cell of several entries takes no other lane's.
+pub fn fold_cell(cells: &[u32], lane: usize, at: usize) -> engine::Result<u32> {
+    let count = match cells {
+        [every] => Some(*every),
+        cells => cells.get(at).copied(),
+    };
+    count.ok_or_else(|| {
+        engine::Error::program(format!(
+            "lane {lane} states a device-resident fold length on a `fold` port whose cell \
+             carries {} entries, and it is lane {at} of the cell's program; a cell of one \
+             entry states every lane's fold and a longer one a fold a lane",
+            cells.len()
+        ))
+    })
+}
+
 /// One lane's fold of one fire.
 #[derive(Clone, Debug)]
 pub struct LaneFold {
@@ -184,7 +203,7 @@ pub fn merged(left: Vec<(Vec<u32>, Option<u32>)>) -> Vec<(Vec<u32>, Option<u32>)
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceFold, Frozen, LaneFold, Tier, counted_on_device, merged};
+    use super::{DeviceFold, Frozen, LaneFold, Tier, counted_on_device, fold_cell, merged};
     use engine::fire::{FoldLen, RsVerb};
 
     fn buffer(folded: u32, fold: FoldLen) -> RsVerb {
@@ -278,6 +297,29 @@ mod tests {
         assert_eq!((host.plan.replay, host.left), (1, Some(4)));
         let caught = LaneFold::of(&buffer(4, FoldLen::Host(1)), 2, 6, None, None, Some(4)).unwrap();
         assert_eq!(caught.left, None);
+    }
+
+    /// A `fold` cell of one entry is every lane's fold, a longer one a
+    /// fold a lane, and a lane past a cell of several is refused by what
+    /// the cell carries, not as a lane with no `fold` port.
+    #[test]
+    fn a_fold_cell_states_every_lanes_fold_or_a_fold_a_lane() {
+        assert_eq!(fold_cell(&[3], 0, 0).unwrap(), 3);
+        assert_eq!(fold_cell(&[3], 7, 5).unwrap(), 3);
+        assert_eq!(fold_cell(&[3, 4], 0, 0).unwrap(), 3);
+        // The entry is the lane's place in its program, wherever the
+        // program's lanes stand in the fire.
+        assert_eq!(fold_cell(&[3, 4], 6, 1).unwrap(), 4);
+        assert_eq!(fold_cell(&[3, 4, 9], 1, 1).unwrap(), 4);
+        for (cells, at) in [(&[3, 4][..], 2), (&[][..], 0)] {
+            let refused = fold_cell(cells, 4 + at, at).unwrap_err().to_string();
+            assert!(
+                refused.contains(&format!("lane {} states", 4 + at))
+                    && refused.contains(&format!("carries {} entries", cells.len()))
+                    && !refused.contains("resolved no `fold` port"),
+                "{refused}"
+            );
+        }
     }
 
     /// A record stands where the last fold that went to the device left
