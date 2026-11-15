@@ -423,7 +423,7 @@ impl Shell {
             patches: boot.patches.clone(),
             ..*boot
         };
-        let mut shell = Shell::load_on(dry, voxels, Device::dry(None)?, false)?;
+        let mut shell = Shell::load_on(dry, voxels, Device::quiet()?, false)?;
         let rungs = shell.staged_sets()?;
         let rows = rungs.iter().map(|&(_, rows)| rows).max().unwrap_or(0);
         let staging = crate::store::Staging {

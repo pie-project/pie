@@ -57,7 +57,7 @@ fn fnv(name: &str) -> u64 {
 
 /// A checkpoint of `trace`'s own planes seeded by name and `seed`: norms
 /// near one, the rest small (engine-metal's fixture writer).
-fn write_checkpoint(path: &std::path::Path, trace: &poem_ir::Trace, seed: u64) {
+pub fn write_checkpoint(path: &std::path::Path, trace: &poem_ir::Trace, seed: u64) {
     let mut writer = ztensor::Writer::create(path).expect("the fixture writes");
     let mut planes: Vec<_> = trace
         .params
