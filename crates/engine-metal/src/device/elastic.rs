@@ -458,6 +458,10 @@ pub struct Elastic {
     /// slot to the last, growing down ([`Elastic::map_top`]) and giving back
     /// from the lowest ([`Elastic::unmap_top`]).
     top: Vec<Option<Chunk>>,
+    /// The top's lowest heaps the bottom holds ([`Elastic::hold_low`]):
+    /// committed bottom chunks past `top_from` lie in them, so no unmap of
+    /// the top gives them back.
+    held_low: usize,
     owner: Weak<Mutex<State>>,
     /// The mapping side this buffer was created on: the device that makes
     /// its heaps, the queue that maps them, and the residency set they are
@@ -509,15 +513,51 @@ impl Elastic {
         self.top.iter().flatten().map(|chunk| chunk.bytes).sum()
     }
 
-    /// Where the top's mapped heaps start: its end where none is mapped.
+    /// Where the top's mapped run to its end starts: its end where none is
+    /// mapped. A low heap held for the bottom ([`Elastic::hold_low`]) below
+    /// an unmapped one is the bottom's, not the run's.
     #[must_use]
     pub fn top_mapped_from(&self) -> u64 {
-        self.top
-            .iter()
-            .position(Option::is_some)
-            .map_or(self.virtual_bytes, |slot| {
-                self.top_from + slot as u64 * CHUNK
-            })
+        let start = self.top_run_slot();
+        if start == self.top.len() {
+            return self.virtual_bytes;
+        }
+        self.top_from + start as u64 * CHUNK
+    }
+
+    /// Whether a heap is mapped under every byte of `[offset, offset + len)`:
+    /// the bottom's below the top's start, the top's slots past it. The one
+    /// truth of what has memory behind it, read from the state every map
+    /// and unmap writes. A read of a tile with none is silent on this
+    /// driver (no fault, no command-buffer error), so nothing may be handed
+    /// out as backed on any other account.
+    #[must_use]
+    pub fn mapped_over(&self, offset: u64, len: u64) -> bool {
+        let Some(end) = offset.checked_add(len) else {
+            return false;
+        };
+        if len == 0 || end > self.len {
+            return false;
+        }
+        if offset < self.top_from && end.min(self.top_from) > self.committed {
+            return false;
+        }
+        if end <= self.top_from {
+            return true;
+        }
+        let first = usize_of((offset.max(self.top_from) - self.top_from) / CHUNK);
+        let last = usize_of((end - 1 - self.top_from) / CHUNK);
+        (first..=last).all(|slot| self.top.get(slot).is_some_and(Option::is_some))
+    }
+
+    /// The first slot of the top's mapped run to its end; the top's length
+    /// where none is mapped.
+    fn top_run_slot(&self) -> usize {
+        let mut start = self.top.len();
+        while start > 0 && self.top[start - 1].is_some() {
+            start -= 1;
+        }
+        start
     }
 
     /// Where the bottom stops: the top's start, or the buffer's end.
@@ -580,9 +620,15 @@ impl Elastic {
             });
         }
         let first = usize_of((at - self.top_from) / CHUNK).min(self.top.len());
+        self.map_slots(first, self.top.len())
+    }
+
+    /// Maps the top's slots `first..last` that are not mapped, charged to
+    /// the arena like any growth; what is mapped already stands.
+    fn map_slots(&mut self, first: usize, last: usize) -> Result<()> {
         let size = |slot: usize, from: u64, end: u64| CHUNK.min(end - (from + slot as u64 * CHUNK));
         let (from, end) = (self.top_from, self.virtual_bytes);
-        let bytes: u64 = (first..self.top.len())
+        let bytes: u64 = (first..last)
             .filter(|&slot| self.top[slot].is_none())
             .map(|slot| size(slot, from, end))
             .sum();
@@ -609,7 +655,7 @@ impl Elastic {
         let target_buffer = self.buffer.clone();
         let mut mapped = 0;
         let mut fault = None;
-        for slot in (first..self.top.len()).rev() {
+        for slot in (first..last).rev() {
             if self.top[slot].is_some() {
                 continue;
             }
@@ -657,9 +703,61 @@ impl Elastic {
             return Ok(());
         }
         let keep = usize_of(at.saturating_sub(self.top_from) / CHUNK).min(self.top.len());
+        // SAFETY: the caller's contract above.
+        unsafe { self.unmap_slots(self.held_low, keep) }
+    }
+
+    /// Keeps the top's heaps under `end` (bytes from the buffer's start)
+    /// mapped for the bottom: a committed bottom chunk past the top's seam
+    /// lies in the top's lowest heap, which the bottom never maps itself
+    /// (it stops at `top_from`). Without this an unmap of the top took that
+    /// heap from under live state: the host's copy of it was refused, and a
+    /// fire reading it read a tile with no memory behind it. The bytes from
+    /// `fresh` to `end` are newly the bottom's and are zeroed, as a grown
+    /// bottom's are; a held heap the bottom no longer reaches is given back
+    /// unless the top's mapped run holds it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Elastic::map_top`] when a heap is refused.
+    ///
+    /// # Safety
+    ///
+    /// No frame reads the bytes zeroed or the heaps given back: the caller
+    /// commits or gives back bottom chunks no frame holds.
+    pub unsafe fn hold_low(&mut self, end: u64, fresh: u64) -> Result<()> {
+        if self.top.is_empty() {
+            return Ok(());
+        }
+        let slots = usize_of(end.saturating_sub(self.top_from).div_ceil(CHUNK)).min(self.top.len());
+        if slots > self.held_low {
+            self.map_slots(0, slots)?;
+        }
+        let run = self.top_run_slot();
+        let (before, after) = (self.held_low, slots);
+        self.held_low = slots;
+        if before > after {
+            // SAFETY: the caller's contract above.
+            unsafe { self.unmap_slots(after, before.min(run))? };
+        }
+        let from = fresh.max(self.top_from);
+        if end > from {
+            // SAFETY: mapped just above, and the caller's contract above.
+            unsafe { self.zero(from, end - from)? };
+        }
+        Ok(())
+    }
+
+    /// Gives back the top's mapped slots `first..last`, held until the
+    /// unmap has landed, and the accounting.
+    ///
+    /// # Safety
+    ///
+    /// As [`Elastic::unmap_top`].
+    unsafe fn unmap_slots(&mut self, first: usize, last: usize) -> Result<()> {
         let target_buffer = self.buffer.clone();
         let mut emptied = Vec::new();
-        for slot in 0..keep {
+        for slot in first..last.min(self.top.len()) {
             let Some(chunk) = self.top[slot].take() else {
                 continue;
             };
@@ -1132,6 +1230,7 @@ pub fn create(sparse: &Arc<Sparse>, arena: &Arena, len: u64) -> Result<Elastic> 
         chunks: Vec::new(),
         top_from: virtual_bytes,
         top: Vec::new(),
+        held_low: 0,
         owner: Arc::downgrade(&arena.state),
         sparse: sparse.clone(),
         fence: None,

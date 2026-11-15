@@ -43,6 +43,9 @@ pub struct ResidencyPlanner {
     /// A host -> disk spill failed: the engine moves no slots between
     /// tiers below the device, and none is tried again.
     spill_failed: AtomicBool,
+    /// The segment walk made no grow it promised: the next pass goes on
+    /// past its grow steps ([`Self::no_grow`]).
+    pub(super) no_grow: AtomicBool,
     pub(super) port: Arc<dyn PoolPort>,
     pub(super) stats: PlannerStats,
     /// `PoolFacts::seated_first`: a seated lane's growth before a prompt
@@ -100,6 +103,7 @@ impl ResidencyPlanner {
             sweep_exhausted: AtomicBool::new(false),
             demoting: AtomicBool::new(false),
             spill_failed: AtomicBool::new(false),
+            no_grow: AtomicBool::new(false),
             port,
             stats: PlannerStats::default(),
             seated_first: false,

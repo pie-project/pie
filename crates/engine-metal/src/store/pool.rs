@@ -494,9 +494,41 @@ impl Pool {
     /// number of segments, up to the span's backed segments.
     #[must_use]
     pub fn committed_chunks(&self) -> u32 {
-        self.committed
+        self.chunks_of(self.committed)
+    }
+
+    /// The bottom's chunks `segments` committed segments hold: up to the
+    /// span's first chunk ([`Pool::top_first`]), which may lie past the
+    /// top's heap seam ([`Pool::pinned_from`]). The bottom's own heaps stop
+    /// at the seam; what lies past it, in the top's lowest heap, is held
+    /// mapped for the bottom ([`Pool::hold_seam`]). The one statement of
+    /// where the bottom ends: commit, release and admission all read it.
+    fn chunks_of(&self, segments: u32) -> u32 {
+        segments
             .saturating_mul(self.segment_chunks)
             .min(self.top_first())
+    }
+
+    /// Holds the top's heaps under the bottom's first `chunks` chunks mapped
+    /// for it, zeroing those from `fresh` on (newly committed).
+    ///
+    /// # Safety
+    ///
+    /// No frame reads the chunks zeroed or given back.
+    #[cfg(target_vendor = "apple")]
+    unsafe fn hold_seam(&mut self, chunks: u32, fresh: u32) -> Result<()> {
+        if self.act == 0 {
+            return Ok(());
+        }
+        let start = self.last_start();
+        let end = (u64::from(chunks) * self.chunk_bytes).saturating_sub(start);
+        let fresh = (u64::from(fresh) * self.chunk_bytes).saturating_sub(start);
+        let part = self
+            .parts
+            .last_mut()
+            .expect("a pool has one buffer at least");
+        // SAFETY: the caller's contract above.
+        unsafe { part.store.hold_low(end, fresh) }
     }
 
     /// Where the backed top starts in bytes ([`pinned_from`]); the range's
@@ -684,19 +716,6 @@ impl Pool {
         self.bytes() - self.pinned_from()
     }
 
-    /// Where the top's backed bytes start in the range: its end where none
-    /// are.
-    fn top_mapped_from(&self) -> u64 {
-        #[cfg(target_vendor = "apple")]
-        {
-            self.last_start() + self.last().store.top_mapped_from()
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            self.pinned_from()
-        }
-    }
-
     /// The device bytes the span's backed segments hold.
     #[must_use]
     pub fn top_held_bytes(&self) -> u64 {
@@ -792,18 +811,17 @@ impl Pool {
         &self.table
     }
 
-    /// Refuses a physical chunk with no memory behind it: a kernel that
-    /// reads an unmapped tile faults the whole queue.
+    /// Refuses a physical chunk with no memory behind it: one the runtime
+    /// has not committed (the bottom's first chunks, or the span's), or one
+    /// a heap is not mapped under every byte of. The second is read from
+    /// the buffers' own mapping state ([`elastic::Elastic::mapped_over`]),
+    /// never inferred from where the seams should be: a kernel that reads
+    /// an unmapped tile is not faulted on this driver, it reads silently
+    /// wrong bytes.
     pub fn admit(&self, physical: u32) -> Result<()> {
-        // The bottom maps its committed chunks up to the heap seam the top
-        // is backed from, and the top every chunk from the span's segment
-        // on, which lies wholly past that seam.
         let have = self.committed_chunks();
-        let backed = physical < self.total_chunks
-            && (physical < have
-                || (physical >= self.top_first()
-                    && u64::from(physical) * self.chunk_bytes >= self.top_mapped_from()));
-        if !backed {
+        let owned = physical < self.total_chunks && (physical < have || physical >= self.top_first());
+        if !owned || !self.mapped_under(physical) {
             return Err(Fault::Ceiling {
                 what: "committed chunks of the state pool",
                 need: u64::from(physical) + 1,
@@ -811,6 +829,22 @@ impl Pool {
             });
         }
         Ok(())
+    }
+
+    /// Whether a heap is mapped under every byte of physical chunk
+    /// `physical`.
+    fn mapped_under(&self, physical: u32) -> bool {
+        #[cfg(target_vendor = "apple")]
+        {
+            let (at, local) = self.locate(u64::from(physical) * self.chunk_bytes);
+            self.parts[at].store.mapped_over(local, self.chunk_bytes)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            // No device off Apple: nothing is mapped.
+            let _ = physical;
+            false
+        }
     }
 
     /// Each buffer's share of the range's first `bytes`.
@@ -844,9 +878,7 @@ impl Pool {
         }
         #[cfg(target_vendor = "apple")]
         {
-            let chunks = segments
-                .saturating_mul(self.segment_chunks)
-                .min(self.top_first());
+            let chunks = self.chunks_of(segments);
             let bytes = (u64::from(chunks) * self.chunk_bytes).min(self.pinned_from());
             let shares = self.shares(bytes);
             let mut targets: Vec<elastic::Target<'_>> = self
@@ -859,6 +891,9 @@ impl Pool {
                 })
                 .collect();
             elastic::grow_all(&mut targets)?;
+            let fresh = self.committed_chunks();
+            // SAFETY: the chunks newly committed are no frame's yet.
+            unsafe { self.hold_seam(chunks, fresh)? };
         }
         self.committed = segments;
         Ok(())
@@ -876,9 +911,10 @@ impl Pool {
         }
         #[cfg(target_vendor = "apple")]
         {
-            let chunks = segments
-                .saturating_mul(self.segment_chunks)
-                .min(self.top_first());
+            let chunks = self.chunks_of(segments);
+            // SAFETY: the caller's contract below: the chunks given back are
+            // no frame's.
+            unsafe { self.hold_seam(chunks, u32::MAX)? };
             let bytes = (u64::from(chunks) * self.chunk_bytes).min(self.pinned_from());
             let shares = self.shares(bytes);
             let mut targets: Vec<elastic::Target<'_>> = self
@@ -1141,6 +1177,155 @@ mod tests {
         pool.read(5 * small + (4 << 20) - 32, &mut seen)
             .expect("a read");
         assert_eq!(seen, [6u8; 64]);
+    }
+
+    /// Committed bottom chunks past the top's heap seam lie in the top's
+    /// lowest heap, which the bottom never maps itself: that heap stays
+    /// mapped for them through any unmap of the top (a lowered rung, a
+    /// released span), so their bytes still read back, as the host tier's
+    /// copy reads them, and a chunk newly committed there reads zeros. An
+    /// unmap gave that heap back before, under live state: the copy was
+    /// refused ("mapped bytes of an elastic buffer's top") and a fire
+    /// reading it read a tile with no memory behind it.
+    #[test]
+    fn a_committed_chunk_past_the_seam_outlives_the_tops_unmap() {
+        let device = Context::bind().expect("a device");
+        // Chunks of 12 MiB, segments of 3, the top 2 the span: the span's
+        // segment starts at chunk 6 (72 MiB), the top's heap seam is at
+        // 64 MiB, so chunk 5 straddles it and its upper 8 MiB lie in the
+        // top's lowest heap.
+        let small = 12 << 20;
+        let mut pool = Pool::reserve(&device, small, 10, 3, 2, u64::MAX).expect("a pool");
+        assert_eq!(pool.top_first(), 6);
+        assert_eq!(pool.pinned_from(), 64 << 20);
+        // A carve of the whole span backs the top down to the seam.
+        let span = pool.bytes() - pool.pinned_from();
+        pool.cover(span).expect("the widest carve");
+        pool.commit_segments(2).expect("the bottom to the span");
+        assert_eq!(pool.committed_chunks(), 6);
+        let mut seen = [7u8; 64];
+        pool.read(5 * small + (6 << 20), &mut seen)
+            .expect("a chunk newly committed past the seam");
+        assert_eq!(seen, [0u8; 64], "reads zeros");
+        let (across, past) = (5 * small + (4 << 20) - 32, 5 * small + (6 << 20));
+        pool.write(across, &[6u8; 64]).expect("across the seam");
+        pool.write(past, &[8u8; 64]).expect("past the seam");
+        // The rung lowers: the carve's heaps go back, the bottom's stays.
+        // SAFETY: nothing ran on this pool.
+        unsafe { pool.narrow(small) }.expect("the rung lowers");
+        assert!(pool.admit(6).is_err(), "the span's own chunks went back");
+        pool.admit(5).expect("chunk 5 is the bottom's, still backed");
+        pool.read(across, &mut seen).expect("the host copy reads it");
+        assert_eq!(seen, [6u8; 64]);
+        pool.read(past, &mut seen).expect("the host copy reads it");
+        assert_eq!(seen, [8u8; 64]);
+        // SAFETY: nothing ran on this pool.
+        unsafe { pool.release_span(0) }.expect("no span for state");
+        pool.read(past, &mut seen).expect("still backed");
+        assert_eq!(seen, [8u8; 64]);
+        // The bottom shrinks under the seam: the held heap goes back with
+        // it, past what the carve keeps.
+        let held = pool.held_bytes();
+        // SAFETY: nothing ran on this pool.
+        unsafe { pool.release_segments(1) }.expect("the bottom shrinks");
+        assert!(pool.admit(5).is_err(), "chunk 5 is no one's now");
+        assert!(pool.held_bytes() < held, "and its heaps went back");
+        // Committed again: zeros, not what it held.
+        pool.commit_segments(2).expect("the bottom again");
+        pool.read(past, &mut seen).expect("backed again");
+        assert_eq!(seen, [0u8; 64], "a newly committed chunk reads zeros");
+    }
+
+    /// After any walk of commits, releases, carves, narrows and span lends,
+    /// every chunk `admit` passes reads back what was last written to it
+    /// while it stayed admitted: admission is the mapping state itself, so
+    /// no chunk is handed out over a heap an unmap took. 24 seeded walks of
+    /// 10 steps over a pool whose bottom runs past the top's heap seam.
+    #[test]
+    fn every_admitted_chunk_reads_back_what_was_written_after_any_walk() {
+        let device = Context::bind().expect("a device");
+        let small = 12 << 20;
+        let probes = |chunk: u32| {
+            let at = u64::from(chunk) * small;
+            [at, at + small / 2 - 32, at + small - 64]
+        };
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut checked = 0;
+        for walk in 0..24u32 {
+            let mut pool = Pool::reserve(&device, small, 10, 3, 2, u64::MAX).expect("a pool");
+            let span = pool.bytes() - pool.pinned_from();
+            let mut shadow: Vec<Option<u8>> = vec![None; 10];
+            for step in 0..10u32 {
+                rng = rng
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let pick = u32::try_from(rng >> 40).expect("24 bits");
+                let n = (pick >> 4) % 4;
+                // SAFETY: nothing ran on this pool.
+                let _ = unsafe {
+                    match pick % 6 {
+                        0 => pool.commit_segments(n),
+                        1 => pool.release_segments(n),
+                        2 => pool.cover((u64::from(n) * small).clamp(1, span)),
+                        3 => pool.narrow(u64::from(n) * small),
+                        4 => pool.commit_span(n % 2),
+                        _ => pool.release_span(n % 2),
+                    }
+                };
+                for chunk in 0..10u32 {
+                    let slot = chunk as usize;
+                    if pool.admit(chunk).is_err() {
+                        shadow[slot] = None;
+                        continue;
+                    }
+                    let mut seen = [0u8; 64];
+                    if let Some(value) = shadow[slot] {
+                        for at in probes(chunk) {
+                            pool.read(at, &mut seen).expect("an admitted chunk reads");
+                            assert_eq!(
+                                seen, [value; 64],
+                                "walk {walk} step {step}: chunk {chunk} lost its bytes"
+                            );
+                            checked += 1;
+                        }
+                    }
+                    let value = u8::try_from((walk * 10 + step + chunk) % 255 + 1).expect("a byte");
+                    for at in probes(chunk) {
+                        pool.write(at, &[value; 64]).expect("an admitted chunk writes");
+                    }
+                    shadow[slot] = Some(value);
+                }
+            }
+        }
+        assert!(checked > 100, "the walks held chunks across steps: {checked}");
+    }
+
+    /// The negative control: what a copy on the GPU reads out of a tile no
+    /// heap is mapped under. Its value is what a bug of this class looks
+    /// like: the copy lands, no error is raised.
+    #[test]
+    fn a_gpu_read_of_an_unmapped_tile_is_silent() {
+        let device = Context::bind().expect("a device");
+        let small = 12 << 20;
+        let mut pool = Pool::reserve(&device, small, 10, 3, 2, u64::MAX).expect("a pool");
+        let span = pool.bytes() - pool.pinned_from();
+        pool.cover(span).expect("the widest carve");
+        pool.write(7 * small, &[0x5c; 64]).expect("a span chunk under the carve");
+        // SAFETY: nothing ran on this pool.
+        unsafe { pool.narrow(small) }.expect("the rung lowers");
+        assert!(pool.admit(7).is_err(), "chunk 7's heap went back");
+        pool.commit_segments(1).expect("a bottom chunk to copy into");
+        pool.write(0, &[0xab; 64]).expect("the destination");
+        let mut frame = device.frame().expect("a frame");
+        pool.copy(&mut frame, 7 * small, 0, 64).expect("the copy encodes");
+        frame.commit().expect("and lands: no error for the unmapped source");
+        let mut seen = [0u8; 64];
+        pool.read(0, &mut seen).expect("the destination reads");
+        assert_eq!(
+            seen, [0u8; 64],
+            "the copy landed, and an unmapped tile reads as zeros, neither what \
+             it last held nor a fault"
+        );
     }
 
     /// Buffers whose chunks do not end on a tile each map past their share

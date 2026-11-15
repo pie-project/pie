@@ -55,16 +55,11 @@ pub trait PoolPort: Send + Sync + 'static {
     /// again.
     fn freed(&self) {}
     /// Asks for `need` more of each shape than stands free now; true when
-    /// memory is on its way, and `pages_freed` follows it.
+    /// memory is on its way: `pages_freed` follows it, or, where the walk
+    /// maps nothing after all, the planner's `no_grow`.
     fn grow(&self, need: super::Demand) -> bool {
         let _ = need;
         false
-    }
-    fn grow_pages(&self, count: u32) -> bool {
-        self.grow(super::Demand {
-            kv_pages: count,
-            rs: RsUnits::default(),
-        })
     }
     fn grow_rs(&self, need: RsUnits) -> bool {
         self.grow(super::Demand {
@@ -325,10 +320,9 @@ impl PoolPort for RegistryPool {
             if !need.rs.is_zero() {
                 self.with_rs(|rs| rs.note_short_shared(need.rs));
             }
-            return shared.can_grow() && {
-                shared.wake();
-                true
-            };
+            // Promised only where the walk's next step maps a segment;
+            // a walk that ends without one tells the planner no grow.
+            return shared.promise_grow();
         }
         false
     }

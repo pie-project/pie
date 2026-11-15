@@ -658,6 +658,36 @@ pub enum SegmentMove {
     Wait,
 }
 
+/// Whom the walk grows for: what decides whether the span a lowered rung
+/// lends is a step at all ([`SharedPool::grow_step`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrowFor {
+    /// A waiter short of room for live state. Live state never opens in
+    /// the top rung's span, so backing the span it lends funds no such
+    /// waiter: only the prefix grows for it.
+    Live,
+    /// No waiter: the governor's target alone (or its test pin).
+    Target,
+}
+
+/// A step of the walk that maps a segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrowStep {
+    /// Back segments `0..prefix` ([`SegmentMove::Commit`]).
+    Commit { prefix: u32 },
+    /// Back the top `n` span segments ([`SegmentMove::CommitSpan`]).
+    CommitSpan { n: u32 },
+}
+
+impl From<GrowStep> for SegmentMove {
+    fn from(step: GrowStep) -> Self {
+        match step {
+            GrowStep::Commit { prefix } => Self::Commit { prefix },
+            GrowStep::CommitSpan { n } => Self::CommitSpan { n },
+        }
+    }
+}
+
 /// See the module docs.
 #[derive(Debug)]
 pub struct SharedPool {
@@ -1890,19 +1920,10 @@ impl SharedPool {
             self.pool.release_span(n);
             return Some(SegmentMove::ReleaseSpan { n });
         }
+        if let Some(step) = self.grow_step(target, self.grow_for()) {
+            return Some(step.into());
+        }
         let mapped = self.mapped_segments();
-        if mapped < target && prefix < top && self.pool.backs(prefix) {
-            return Some(SegmentMove::Commit { prefix: prefix + 1 });
-        }
-        // The prefix is whole: the span a lowered rung lends is backed next,
-        // before state opens a chunk there.
-        // Not while a refused one waits for room to be freed.
-        if mapped < target
-            && !self.span_commit_blocked
-            && let Some(n) = self.pool.span_to_commit()
-        {
-            return Some(SegmentMove::CommitSpan { n });
-        }
         if mapped <= target || prefix == 0 {
             return None;
         }
@@ -1934,6 +1955,71 @@ impl SharedPool {
         }
     }
 
+    /// Whom a grow is for now: a live waiter while any is parked short of
+    /// a slot, else the target alone.
+    #[must_use]
+    pub fn grow_for(&self) -> GrowFor {
+        if self.pool.waiting() {
+            GrowFor::Live
+        } else {
+            GrowFor::Target
+        }
+    }
+
+    /// The walk's next grow step toward `goal` mapped segments for `who`,
+    /// `None` where none maps a segment: the one place a grow is decided.
+    /// [`Self::next_move`] takes it, and `SharedGrow::can_grow` tells a
+    /// waiter the pool grows exactly where it is `Some` for
+    /// [`GrowFor::Live`], so the planner never waits on a grow the walk
+    /// does not make.
+    ///
+    /// The lowest uncommitted prefix segment the engine binds first. The
+    /// prefix whole, the span a lowered rung lends is backed next, before
+    /// state opens a chunk there, but never for a live waiter (live state
+    /// never opens in the top rung's span), and not while a refused commit
+    /// waits for room to be freed.
+    #[must_use]
+    pub fn grow_step(&self, goal: u32, who: GrowFor) -> Option<GrowStep> {
+        if self.mapped_segments() >= goal {
+            return None;
+        }
+        let prefix = self.pool.prefix_segments();
+        if prefix < self.pool.top_segment() && self.pool.backs(prefix) {
+            return Some(GrowStep::Commit { prefix: prefix + 1 });
+        }
+        if who == GrowFor::Live || self.span_commit_blocked() {
+            return None;
+        }
+        let n = self.pool.span_to_commit()?;
+        Some(GrowStep::CommitSpan { n })
+    }
+
+    /// The segments the walk moves toward for the governor's `target`: on
+    /// the way up no further than what commits ahead of what the waiters
+    /// (and the cache) ask; at or under what is mapped, the target itself.
+    #[must_use]
+    pub fn walk_goal(&self, target: u32) -> u32 {
+        let mapped = self.mapped_segments();
+        if target <= mapped {
+            return target;
+        }
+        let short = self
+            .pool
+            .demand()
+            .wanted
+            .saturating_sub(self.pool.demand().live);
+        let ahead = self.ahead_target(short);
+        tracing::trace!(
+            target,
+            mapped,
+            short,
+            ahead,
+            headroom = self.pool.headroom(),
+            "segment goal"
+        );
+        target.min(ahead)
+    }
+
     /// The engine took the evacuation [`Self::next_move`] planned, with
     /// fires through `current` (the kv store's per-fire epoch, CONTRACT-BC
     /// 17) handed out by then. Any of those may run ahead of the copy and
@@ -1954,6 +2040,12 @@ impl SharedPool {
     /// answer.
     pub fn block_span_commit(&mut self, blocked: bool) {
         self.span_commit_blocked = blocked;
+    }
+
+    /// Whether a refused `commit_span` waits for room to be freed.
+    #[must_use]
+    pub fn span_commit_blocked(&self) -> bool {
+        self.span_commit_blocked
     }
 
     /// The engine backed the top `n` span segments: the chunks of theirs the
@@ -2045,7 +2137,7 @@ pub enum RungError {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub mod programs;
 mod target;

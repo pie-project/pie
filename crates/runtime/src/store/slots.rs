@@ -1203,6 +1203,11 @@ impl SlotPool {
         }
     }
 
+    /// Whether any waiter is parked short of a slot.
+    pub fn waiting(&self) -> bool {
+        self.shapes.iter().any(|state| state.waiting > 0)
+    }
+
     pub fn unwait(&mut self, waiter: u64) {
         if let Some((shape, slots)) = self.waiters.remove(&waiter) {
             self.shapes[shape as usize].waiting -= slots;

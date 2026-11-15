@@ -55,16 +55,49 @@ enum Board {
 
 impl ResidencyPlanner {
     pub fn plan(self: &Arc<Self>) {
-        self.plan_once();
+        let on_grow = self.plan_once();
+        // The waiters parked behind a grow the walk was promised, now.
+        let parked = if on_grow {
+            self.with_inner(|inner| inner.queue.values().filter(|w| w.is_unmet()).count())
+        } else {
+            0
+        };
+        self.stats
+            .grow_parked
+            .store(parked as u64, Ordering::Relaxed);
         // A waiter served or gone lacks nothing now.
         self.report_short();
     }
 
-    fn plan_once(self: &Arc<Self>) {
+    /// The segment walk made no grow it promised: the plan this wakes goes
+    /// on past the grow, to demote, sweep and evict, on this event alone.
+    pub fn no_grow(self: &Arc<Self>) {
+        self.stats.no_grows.fetch_add(1, Ordering::Relaxed);
+        ptrace!("no grow: the walk mapped nothing it promised");
+        self.no_grow.store(true, Ordering::Release);
+        self.poke();
+    }
+
+    /// Asks the pool to grow by `need`, unless the walk said this plan no
+    /// grow is coming (`skip`): true where the plan waits on the grow, which
+    /// `pages_freed` (a segment mapped) or [`Self::no_grow`] ends.
+    fn wait_on_grow(&self, skip: bool, need: Demand) -> bool {
+        if skip || !self.port.grow(need) {
+            return false;
+        }
+        self.stats.grow_waits.fetch_add(1, Ordering::Relaxed);
+        ptrace!("plan waits on a grow kv={} rs={:?}", need.kv_pages, need.rs);
+        true
+    }
+
+    /// One pass; true where it ends waiting on a grow.
+    fn plan_once(self: &Arc<Self>) -> bool {
         if self.pause_due.swap(false, Ordering::AcqRel) {
             self.pause_held();
         }
         self.reseat_released();
+        // Taken once a pass: every grow step of this pass goes on past it.
+        let no_grow = self.no_grow.swap(false, Ordering::AcqRel);
         loop {
             let (rs_free, rs_total) = self.port.rs_stats();
             let rs_growth = self.rs_growth();
@@ -126,10 +159,10 @@ impl ResidencyPlanner {
                 }
             });
             let fund_by_eviction = match step {
-                Step::Done => return,
+                Step::Done => return false,
                 Step::Release(stranded) => {
                     drop(stranded);
-                    return;
+                    return false;
                 }
                 Step::Absorb {
                     count,
@@ -138,19 +171,25 @@ impl ResidencyPlanner {
                     if self.absorb_free(count) {
                         continue;
                     }
-                    if self.port.grow_pages(count) {
-                        return;
+                    if self.wait_on_grow(
+                        no_grow,
+                        Demand {
+                            kv_pages: count,
+                            rs: RsUnits::default(),
+                        },
+                    ) {
+                        return true;
                     }
                     // Idle cache a policy keys above the floor moves down
                     // a tier before any is dropped; the rest is dropped.
                     if self.demote_idle(count) {
-                        return;
+                        return false;
                     }
                     if self.reclaim_idle_once() {
                         continue;
                     }
                     if self.sweep_stranded(count, false) {
-                        return;
+                        return false;
                     }
                     fund_by_eviction
                 }
@@ -176,15 +215,21 @@ impl ResidencyPlanner {
                             continue;
                         }
                     }
-                    if self.port.grow_rs(ask) {
-                        return;
+                    if self.wait_on_grow(
+                        no_grow,
+                        Demand {
+                            kv_pages: 0,
+                            rs: ask,
+                        },
+                    ) {
+                        return true;
                     }
                     // On a shared pool the chunks idle cache holds open for
                     // state too: what is keyed above the floor moves down a
                     // tier before any is dropped.
                     let as_pages = self.port.rs_as_pages(need);
                     if as_pages > 0 && self.demote_idle(as_pages) {
-                        return;
+                        return false;
                     }
                     if self.reclaim_idle_once() || self.reclaim_head_sharing() {
                         continue;
@@ -193,14 +238,20 @@ impl ResidencyPlanner {
                     // keep, lowest key first, before any set moves whole
                     // (its state with it).
                     if as_pages > 0 && self.sweep_stranded(as_pages, true) {
-                        return;
+                        return false;
                     }
                     fund_by_eviction
                 }
                 Step::ServeAllocation { key, demand } => {
                     let Some(rs) = self.reserve_rs_slots(demand.rs) else {
-                        if self.port.grow_rs(demand.rs) {
-                            return;
+                        if self.wait_on_grow(
+                            no_grow,
+                            Demand {
+                                kv_pages: 0,
+                                rs: demand.rs,
+                            },
+                        ) {
+                            return true;
                         }
                         continue;
                     };
@@ -272,8 +323,14 @@ impl ResidencyPlanner {
                         continue;
                     }
                     let Some(slots) = self.reserve_rs_slots(need.rs) else {
-                        if self.port.grow_rs(need.rs) {
-                            return;
+                        if self.wait_on_grow(
+                            no_grow,
+                            Demand {
+                                kv_pages: 0,
+                                rs: need.rs,
+                            },
+                        ) {
+                            return true;
                         }
                         continue;
                     };
@@ -315,7 +372,7 @@ impl ResidencyPlanner {
                     .restore_absorb_short
                     .fetch_add(1, Ordering::Relaxed);
             }
-            return;
+            return false;
         }
     }
 }
