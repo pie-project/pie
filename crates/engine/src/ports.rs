@@ -180,12 +180,15 @@ impl LanePorts<'_> {
         Ok(Some(stated))
     }
 
+    /// The fold length the `fold` port states for this lane: its own entry,
+    /// or none. Never another lane's, which would be a wrong count told as
+    /// this lane's own.
     #[must_use]
     pub fn fold(&self) -> Option<u32> {
         self.envelope
             .fold
             .as_ref()
-            .and_then(|lens| lens.get(self.at).or_else(|| lens.first()))
+            .and_then(|lens| lens.get(self.at))
             .copied()
     }
 
