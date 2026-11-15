@@ -120,10 +120,8 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
     let pid = ctx.process_id();
     let quorum_pipeline_id = pipeline_scope.scheduler_id();
     for ws in &kvs {
-        if let Err(owner) = ws.claim_pipeline_scope(&pipeline_scope) {
-            return Ok(Err(format!(
-                "pipeline: float lane's working set is already scoped to pipeline {owner:032x}"
-            )));
+        if let Err(refusal) = ws.claim_pipeline_scope(&pipeline_scope) {
+            return Ok(Err(format!("pipeline: float lane's working set {refusal}")));
         }
     }
     let mut leases = Vec::with_capacity(kvs.len());

@@ -212,7 +212,7 @@ impl KvWorkingSet {
     pub fn claim_pipeline_scope(
         &self,
         scope: &crate::store::PipelineScope,
-    ) -> Result<(), crate::store::PipelineScopeId> {
+    ) -> Result<(), crate::store::ScopeRefusal> {
         scope.claim(&self.lifecycle.pipeline_scope)
     }
 

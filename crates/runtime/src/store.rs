@@ -13,6 +13,35 @@ pub mod weights;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PipelineScopeId(u128);
 
+/// Why a pipeline did not take a working set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ScopeRefusal {
+    /// Another pipeline holds the set, or the one asking is closed.
+    Held(PipelineScopeId),
+    /// The pipeline that owns the set failed, for `reason`, its first
+    /// failure. A fire that fails, refused or faulted, ends its pipeline
+    /// and the sets it owns.
+    Failed {
+        owner: PipelineScopeId,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for ScopeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScopeRefusal::Held(owner) => {
+                write!(formatter, "is already scoped to pipeline {owner:032x}")
+            }
+            ScopeRefusal::Failed { owner, reason } => write!(
+                formatter,
+                "ended with its pipeline {owner:032x}, which failed ({reason}); no \
+                 pipeline takes it"
+            ),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct PipelineScope {
     state: std::sync::Arc<PipelineScopeState>,
@@ -87,19 +116,31 @@ impl PipelineScope {
         self.is_closed() && (self.state.drained)()
     }
 
+    /// Takes the set `owner` scopes: one no pipeline holds, or one whose
+    /// pipeline closed with every fire of it settled. Not one whose
+    /// pipeline failed. Its failed fire left the set's cursor past rows
+    /// that were never written, and its records wherever the step stopped,
+    /// whether the engine refused the step or the device faulted under it:
+    /// the set ends with its pipeline, and fires on no other.
     pub(crate) fn claim(
         &self,
         owner: &std::sync::Mutex<Option<PipelineScope>>,
-    ) -> Result<(), PipelineScopeId> {
+    ) -> Result<(), ScopeRefusal> {
         let mut owner = owner.lock().unwrap();
         match owner.as_ref() {
             Some(existing) if existing.id() == self.id() => Ok(()),
-            Some(existing) if !self.is_closed() && existing.is_releasable() => {
-                *owner = Some(self.clone());
-                Ok(())
-            }
-            Some(existing) => Err(existing.id()),
-            None if self.is_closed() => Err(self.id()),
+            Some(existing) => match existing.failure() {
+                Some(reason) => Err(ScopeRefusal::Failed {
+                    owner: existing.id(),
+                    reason,
+                }),
+                None if !self.is_closed() && existing.is_releasable() => {
+                    *owner = Some(self.clone());
+                    Ok(())
+                }
+                None => Err(ScopeRefusal::Held(existing.id())),
+            },
+            None if self.is_closed() => Err(ScopeRefusal::Held(self.id())),
             None => {
                 *owner = Some(self.clone());
                 Ok(())

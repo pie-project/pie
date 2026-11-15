@@ -289,11 +289,15 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
             Some(rs) => rs.claim_pipeline_scope(&scope),
             None => Ok(()),
         });
-        if let Err(owner) = claimed {
-            return Ok(Err(format!(
-                "working set is scoped to pipeline {owner:#x}, not supplied pipeline {:#x}",
-                scope.id()
-            )));
+        match claimed {
+            Ok(()) => {}
+            Err(crate::store::ScopeRefusal::Held(owner)) => {
+                return Ok(Err(format!(
+                    "working set is scoped to pipeline {owner:#x}, not supplied pipeline {:#x}",
+                    scope.id()
+                )));
+            }
+            Err(failed) => return Ok(Err(format!("working set {failed}"))),
         }
         // A fire on its way that folds the recurrent state by a count the
         // device computes leaves the frozen length behind the record until

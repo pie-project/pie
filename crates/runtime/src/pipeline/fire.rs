@@ -454,11 +454,8 @@ fn bound_rs_working_sets<C: FireContext>(
                 rs.model, rs.engine, ws.model, ws.engine
             )));
         }
-        if let Err(owner) = rs.claim_pipeline_scope(scope) {
-            return Ok(Err(format!(
-                "pipeline: lane {row}'s working set is already scoped to pipeline \
-                 {owner:#x}"
-            )));
+        if let Err(refusal) = rs.claim_pipeline_scope(scope) {
+            return Ok(Err(format!("pipeline: lane {row}'s working set {refusal}")));
         }
         ids.push(rs.id);
     }
@@ -3226,10 +3223,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let pid = ctx.process_id();
         let quorum_pipeline_id = pipeline_scope.scheduler_id();
         for set in &group_sets {
-            if let Err(owner) = set.claim_pipeline_scope(&pipeline_scope) {
-                return Ok(Err(format!(
-                    "pipeline: KV working set is already scoped to pipeline {owner:032x}"
-                )));
+            if let Err(refusal) = set.claim_pipeline_scope(&pipeline_scope) {
+                return Ok(Err(format!("pipeline: KV working set {refusal}")));
             }
         }
         let rs_ws_ids =
@@ -4644,10 +4639,8 @@ async fn fire_device_geometry<C: FireContext>(
     let pid = ctx.process_id();
     let quorum_pipeline_id = pipeline_scope.scheduler_id();
     for set in &group_sets {
-        if let Err(owner) = set.claim_pipeline_scope(&pipeline_scope) {
-            return Ok(Err(format!(
-                "pipeline: KV working set is already scoped to pipeline {owner:032x}"
-            )));
+        if let Err(refusal) = set.claim_pipeline_scope(&pipeline_scope) {
+            return Ok(Err(format!("pipeline: KV working set {refusal}")));
         }
     }
     {
@@ -6549,6 +6542,72 @@ mod fold_tests {
                 flight.frozen(),
                 (4, 4),
                 "a count from a failed pass is not taken"
+            );
+        }
+        Ok(())
+    }
+
+    /// A fire that fails ends its pipeline and the sets the pipeline owns:
+    /// closed and drained, it passes none of them to another pipeline, and
+    /// the refusal names it and its first failure. The cursor the failed
+    /// fire moved when it was staged is not moved back, which is why: here
+    /// its fold stays counted as on its way and its tail unknown. A set
+    /// whose pipeline's fires all served passes on as it did.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_set_of_a_failed_pipeline_fires_on_no_other() -> Anyhow<()> {
+        use crate::store::{PipelineScope, ScopeRefusal};
+        for failed in [true, false] {
+            let flight = in_flight(&geometry::Fold::Device, true, None);
+            let mut ctx = Flight::context();
+            let fires = Arc::downgrade(&flight.fires);
+            let own = PipelineScope::failing_as(flight.failure.clone(), move || {
+                fires
+                    .upgrade()
+                    .is_none_or(|fires| fires.lock().unwrap().is_empty())
+            });
+            let rs = RsWorkingSet::new(
+                flight.kv.model,
+                0,
+                flight.rs,
+                crate::store::rs::RsGeometry {
+                    state_size: 8,
+                    buffer_page_tokens: 4,
+                },
+            );
+            assert_eq!(flight.kv.claim_pipeline_scope(&own), Ok(()));
+            assert_eq!(rs.claim_pipeline_scope(&own), Ok(()));
+
+            // A fire that failed before it ran reports nothing.
+            if !failed {
+                record_kv_writes(vec![report(flight.tag, 3)]);
+            }
+            resolve_test_completion(&flight.completion, failed);
+            drain_pipeline_fires(&mut ctx, &flight.fires).await?;
+            own.close();
+
+            let staged = flight.cursor.lock().unwrap().clone();
+            let next = PipelineScope::new(|| true);
+            if !failed {
+                assert!(staged.folded_exact && staged.unsettled == 0 && staged.folded == 7);
+                assert_eq!(flight.kv.claim_pipeline_scope(&next), Ok(()));
+                assert_eq!(rs.claim_pipeline_scope(&next), Ok(()));
+                continue;
+            }
+            assert!(
+                !staged.folded_exact && staged.unsettled == 1 && staged.tail.is_none(),
+                "the cursor stands as the failed fire staged it: {staged:?}"
+            );
+            let reason = flight.failure.lock().unwrap().clone().expect("it failed");
+            let refused = ScopeRefusal::Failed {
+                owner: own.id(),
+                reason,
+            };
+            assert_eq!(flight.kv.claim_pipeline_scope(&next), Err(refused.clone()));
+            assert_eq!(rs.claim_pipeline_scope(&next), Err(refused.clone()));
+            let text = refused.to_string();
+            assert!(
+                text.contains("which failed (pipeline: forward failed") && text.contains("test"),
+                "{text}"
             );
         }
         Ok(())
