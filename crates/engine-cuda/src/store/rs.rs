@@ -6,7 +6,6 @@ use crate::device::Buffer;
 use crate::error::{Fault, Result};
 use crate::run::RsScratch;
 use crate::store::Pools;
-use crate::store::kv::Paging;
 
 pub const PLANE_DTYPE: Dtype = Dtype::Bf16;
 
@@ -39,23 +38,13 @@ impl Planes {
     }
 }
 
-/// The buffered rows a window of a body replays beside its own
-/// (`Run::rs_layout`), and a lane's share of a fire's replay tables
-/// (`inputs`).
-///
-/// Compile-only shim (owner: Pie Leader). `engine::fire::UNFOLDED_ROWS` is
-/// gone: the contract ([`::engine::fire::rung_rows`]) has a rung's replay
-/// scratch hold the rung's tokens of carried rows, and the runtime asks
-/// the rung for max(own, carried). This keeps the value the constant had
-/// until the scratch, body-or-walk and the per-window regions are sized by
-/// the rung's tokens; it goes with that change.
-pub const REPLAYED: u32 = 16;
-
 /// The extended run's scratch: a run of the activation's span, a fire's
-/// rows and the buffered slots its lanes replay ahead of them, a row each
-/// at the widest recurrence's width. Its reach is the most a fire asks
-/// ([`Buffers::lay_reach`]); a prefix of it is backed as fires reach
-/// further.
+/// rows and the buffered rows its lanes replay ahead of them, a row each
+/// at the widest recurrence's width. The contract's floor is a rung's
+/// tokens of each ([`::engine::fire::rung_rows`]); this engine lays the
+/// widest bucket's of each ([`Buffers::rows_ext`]), whatever the fire's
+/// bucket. Its reach is that ([`Buffers::lay_reach`]), backed when the
+/// first fire replays.
 #[derive(Debug, Clone, Copy)]
 struct Scratch {
     /// Where it starts in the activation's span.
@@ -87,18 +76,10 @@ impl Buffers {
     }
 
     /// The buffered planes of `trace`, laid as the pool's rs list lays its
-    /// pages, and the scratch in the activation's span, widened by the most
-    /// a fire of up to `max_rows` rows on `max_lanes` lanes asks: its rows
-    /// twice, and what its replay tables hold (`inputs`: every row once
-    /// more and [`REPLAYED`] a lane) beside [`REPLAYED`] a window, a window
-    /// a lane at most.
-    pub fn reserve(
-        trace: &Trace,
-        paging: Paging,
-        max_rows: u32,
-        max_lanes: u32,
-        pools: &Pools,
-    ) -> Result<Option<Buffers>> {
+    /// pages, and the scratch in the activation's span, widened by what a
+    /// fire asks: the widest bucket's `max_rows` rows and as many replayed
+    /// ([`Buffers::rows_ext`]).
+    pub fn reserve(trace: &Trace, max_rows: u32, pools: &Pools) -> Result<Option<Buffers>> {
         let layout = pools.rs_layout();
         let tokens = layout.as_ref().map_or(1, |(tokens, _)| (*tokens).max(1));
         let Some((planes, per_token, layers)) = read(trace, tokens)? else {
@@ -125,12 +106,7 @@ impl Buffers {
             ));
         }
         let ext_row_bytes = ext_row_bytes(trace)?;
-        let reach = RsScratch::need(
-            max_rows
-                .saturating_mul(3)
-                .saturating_add(max_lanes.min(paging.slots).saturating_mul(2 * REPLAYED)),
-            ext_row_bytes,
-        );
+        let reach = RsScratch::need(Self::rows_ext(max_rows), ext_row_bytes);
         Ok(Some(Buffers {
             scratch: Scratch {
                 at: 0,
@@ -462,6 +438,19 @@ impl Buffers {
         &self.planes
     }
 
+    /// The extended rows a fire's run holds, under a widest bucket of
+    /// `max_rows` tokens: `2 * max_rows`, its own rows and the buffered
+    /// rows it replays, that many of each at most, whatever its bucket. A
+    /// fire composes at the bucket of its own rows while it may carry up
+    /// to the largest rung's tokens, and the body recorded at that bucket
+    /// bakes where each plane of the run lies: so every body lays its
+    /// planes over the whole run, more than the contract's floor of the
+    /// rung's tokens of each.
+    #[must_use]
+    pub fn rows_ext(max_rows: u32) -> u32 {
+        max_rows.saturating_mul(2)
+    }
+
     /// Backs the scratch for an extended run of `rows_ext` rows, in place.
     pub fn ensure_scratch(&mut self, pools: &mut Pools, rows_ext: u32) -> Result<()> {
         let bytes = RsScratch::need(rows_ext, self.ext_row_bytes);
@@ -487,10 +476,8 @@ impl Buffers {
 
     /// Gives the scratch its run of the activation's span, widened by its
     /// reach: where a size-only walk fired the load's compositions
-    /// (`walked`), the most one of them asked, a recorded body's windows
-    /// being laid at their ceilings whatever its lanes replay; else the
-    /// most any fire may ask. A fire that walks its plan and replays past
-    /// that is refused.
+    /// (`walked`), what one of them asked, a fire's extended run being the
+    /// widest bucket's whatever its rows; else the same.
     pub fn lay_reach(&mut self, pools: &mut Pools, walked: bool) -> Result<()> {
         if walked {
             self.scratch.reach = self.scratch.held;

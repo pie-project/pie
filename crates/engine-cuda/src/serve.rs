@@ -1220,8 +1220,6 @@ struct RsFire<'a> {
     truncates: bool,
     /// How its lanes treat their recurrent rows.
     body: record::RsBody,
-    /// Each lane's replayed buffer rows.
-    replays: Vec<u32>,
     rows_ext: u32,
     snapshots: crate::store::rs::SnapTable,
 }

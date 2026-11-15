@@ -1046,13 +1046,7 @@ impl Shell {
             );
         }
         let mut pools = pools;
-        let buffers = Buffers::reserve(
-            &boot.trace,
-            paging,
-            budgets.tokens.max_tokens,
-            budgets.tokens.max_lanes,
-            &pools,
-        )?;
+        let buffers = Buffers::reserve(&boot.trace, budgets.tokens.max_tokens, &pools)?;
         // Each row-streamed table's cache opens over its host copy.
         let hosts: Vec<(u32, u64)> = pools
             .row_params()
