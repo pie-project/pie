@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, asyncio, json, random, sys, time
+import argparse, asyncio, json, random, sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -48,19 +48,19 @@ async def main():
     inp = dict(layers=L, rank=R, hidden=H, scale=args.scale, decode=args.decode, prompts=prompts)
 
     async def run(adapter):
-        t = time.perf_counter()
         out = await (await c.launch_process(prog, input=dict(inp, adapter=adapter))).result()
-        return time.perf_counter() - t, json.loads(out) if isinstance(out, str) else out
+        return json.loads(out) if isinstance(out, str) else out
 
-    took, outs = {}, {}
+    outs = {}
     for adapter in (False, True):
         await run(adapter)
-        took[adapter], outs[adapter] = await run(adapter)
+        outs[adapter] = await run(adapter)
     got = outs[True]
     moved = sum(x != y for x, y in zip(got["tokens"], outs[False]["tokens"]))
     gaps = [abs(x - y) for p, t, lp in zip(prompts, got["tokens"], got["logprobs"]) for x, y in zip(lp, ref(p, t))]
     bad = sum(g > 0.25 for g in gaps)
-    print(f"plain {took[False]:.2f}s adapter {took[True]:.2f}s ({args.groups} groups x {args.decode} steps)")
+    print(f"plain {outs[False]['step_ms']:.2f} ms/step, adapter {got['step_ms']:.2f} ms/step "
+          f"({args.groups} groups, rank {args.rank})")
     print(f"{'FAIL' if bad else 'PASS'} adapter vs reference: {bad}/{len(gaps)} draws off, max gap {max(gaps):.3f}, "
           f"{moved}/{args.groups} groups moved by the adapter")
     await c.close()

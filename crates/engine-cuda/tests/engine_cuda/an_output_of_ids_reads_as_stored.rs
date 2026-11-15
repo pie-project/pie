@@ -83,7 +83,7 @@ fn an_output_of_ids_reads_as_stored() {
     let instance = plane
         .bind(
             program,
-            &[],
+            &[] as &[(u32, Vec<u8>)],
             extents,
             GeometryClass::Host,
             eta_ir::registry::PortMask::NONE,

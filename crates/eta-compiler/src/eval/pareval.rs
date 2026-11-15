@@ -55,6 +55,7 @@ pub fn fold_stage(
     };
     let ops = &bound.container.stages[index].ops;
     let types = &bound.stage_types[index];
+    let feeds = feeds_puts(ops);
     let (demand, known_cache) = demand_set(ops, types.len(), known);
     let known = &mut |chan: u32| -> Option<Value> {
         known_cache
@@ -94,6 +95,7 @@ pub fn fold_stage(
             Op::ChanTake(chan) | Op::ChanRead(chan) => {
                 let slot = match fold.puts.get(chan) {
                     Some(pending) => pending.clone(),
+                    None if !feeds[next_id] => Ok(placeholder(types[next_id])),
                     None => known(*chan)
                         .map(Ok)
                         .unwrap_or(Err(EvalBlocker::UnknownChannel(*chan))),
@@ -181,6 +183,7 @@ fn demand_set(
     values: usize,
     known: &mut dyn FnMut(u32) -> Option<Value>,
 ) -> (Vec<bool>, BTreeMap<u32, Option<Value>>) {
+    let feeds = feeds_puts(ops);
     let mut cache: BTreeMap<u32, Option<Value>> = BTreeMap::new();
     let mut blocked: Vec<bool> = Vec::with_capacity(values);
     let mut pending: BTreeMap<u32, bool> = BTreeMap::new();
@@ -192,6 +195,7 @@ fn demand_set(
             Op::ChanTake(chan) | Op::ChanRead(chan) => {
                 let is_blocked = match pending.get(chan) {
                     Some(&pending_blocked) => pending_blocked,
+                    None if !feeds[blocked.len()] => false,
                     None => cache.entry(*chan).or_insert_with(|| known(*chan)).is_none(),
                 };
                 blocked.push(is_blocked);
@@ -224,6 +228,44 @@ fn demand_set(
         }
     }
     (demand, cache)
+}
+
+fn feeds_puts(ops: &[Op]) -> Vec<bool> {
+    let mut first = Vec::with_capacity(ops.len());
+    let mut values = 0usize;
+    for op in ops {
+        first.push(values);
+        values += op.result_count() as usize;
+    }
+    let mut feeds = alloc::vec![false; values];
+    for (op, &at) in ops.iter().zip(&first).rev() {
+        let wanted = match op {
+            Op::ChanPut { .. } => true,
+            Op::SinkCall { .. } => false,
+            _ => (0..op.result_count() as usize).any(|offset| feeds[at + offset]),
+        };
+        if wanted {
+            for arg in op.operands() {
+                feeds[arg as usize] = true;
+            }
+        }
+    }
+    feeds
+}
+
+pub fn put_reads(ops: &[Op]) -> BTreeSet<u32> {
+    let feeds = feeds_puts(ops);
+    let mut at = 0usize;
+    let mut reads = BTreeSet::new();
+    for op in ops {
+        if let Op::ChanTake(chan) | Op::ChanRead(chan) = op
+            && feeds[at]
+        {
+            reads.insert(*chan);
+        }
+        at += op.result_count() as usize;
+    }
+    reads
 }
 
 fn placeholder(ty: eta_ir::types::ValueType) -> Value {
@@ -600,5 +642,20 @@ mod tests {
         let taint = geometry_taint(&bound);
         assert!(taint.device_decided.is_empty());
         assert!(taint.host_derivable());
+    }
+
+    #[test]
+    fn a_read_only_a_sink_takes_is_never_asked_for() {
+        use Op::*;
+        let ops = [
+            ChanRead(0),
+            ChanRead(1),
+            SinkCall {
+                name: 0,
+                args: vec![1],
+            },
+            ChanPut { chan: 2, value: 0 },
+        ];
+        assert_eq!(put_reads(&ops), BTreeSet::from([0]));
     }
 }

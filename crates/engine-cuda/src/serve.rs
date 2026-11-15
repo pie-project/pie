@@ -704,6 +704,10 @@ impl Shell {
         self.adapters.release(binding);
     }
 
+    pub fn rebind_adapter(&mut self, key: &crate::blob::Key) -> Option<crate::blob::Binding> {
+        self.adapters.rebind(key)
+    }
+
     #[must_use]
     pub fn bank_seats(&self) -> Vec<crate::weights::BankSeat> {
         self.weights.seats()
@@ -771,7 +775,7 @@ impl Shell {
     pub fn bind_program(
         &mut self,
         program_id: engine::ProgramId,
-        seeds: &[(u32, Vec<u8>)],
+        seeds: &[(u32, impl AsRef<[u8]>)],
         extents: eta_exec::Extents,
         geometry: eta_ir::registry::GeometryClass,
         device: eta_ir::registry::PortMask,

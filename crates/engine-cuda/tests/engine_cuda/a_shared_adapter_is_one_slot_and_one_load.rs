@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use engine::InstanceId;
-use engine_cuda::blob::{Adapters, Blobs, Layout, Source};
+use engine_cuda::blob::{Adapters, Blobs, Key, Layout, Source};
 use engine_cuda::{AdapterPlane, BankSeat};
 
 const LAYERS: u64 = 3;
@@ -197,6 +197,18 @@ fn a_byte_seeded_instance_gets_a_slot_of_its_own() {
         .expect("re-binding one instance");
     assert_eq!(again.slot, own.slot);
     assert!(!again.landed);
+    let key = adapters
+        .key(&Source::Own {
+            instance: InstanceId(8),
+            planes: &planes,
+        })
+        .expect("its key");
+    let rebound = adapters
+        .rebind(&key)
+        .expect("a resident adapter rebinds by key");
+    assert_eq!((rebound.slot, rebound.landed), (own.slot, false));
+    assert!(adapters.rebind(&Key::Planes(0)).is_none());
+    assert_eq!(landings.calls(), 2);
 }
 
 fn a_released_slot_keeps_its_bytes_and_pressure_takes_the_oldest() {

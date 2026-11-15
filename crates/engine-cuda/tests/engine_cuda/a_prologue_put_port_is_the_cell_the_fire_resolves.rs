@@ -155,7 +155,7 @@ fn bind(shell: &mut Shell) -> engine::InstanceId {
     shell
         .bind_program(
             program,
-            &[],
+            &[] as &[(u32, Vec<u8>)],
             Extents {
                 row_count: ROWS,
                 token_count: ROWS,

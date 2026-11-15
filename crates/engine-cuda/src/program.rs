@@ -260,7 +260,7 @@ impl Plane {
     pub fn bind(
         &mut self,
         program_id: ProgramId,
-        seeds: &[(u32, Vec<u8>)],
+        seeds: &[(u32, impl AsRef<[u8]>)],
         extents: Extents,
         geometry: GeometryClass,
         device: PortMask,

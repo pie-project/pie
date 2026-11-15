@@ -1,3 +1,5 @@
+import time
+
 from inferlet import eta as E
 from inferlet import model as M
 
@@ -44,9 +46,11 @@ async def main(inp):
     sets = [E.WorkingSet() for _ in inp["prompts"]]
     toks, lps = [[] for _ in sets], [[] for _ in sets]
     t, lp = await read(pipe, sets, inp["prompts"], lora)
+    start = time.perf_counter()
     for _ in range(inp["decode"]):
         for i in range(len(sets)):
             toks[i].append(t[i]), lps[i].append(lp[i])
         t, lp = await read(pipe, sets, [[x] for x in t], lora)
+    step_ms = (time.perf_counter() - start) * 1e3 / max(inp["decode"], 1)
     pipe.close()
-    return {"tokens": toks, "logprobs": lps}
+    return {"tokens": toks, "logprobs": lps, "step_ms": step_ms}

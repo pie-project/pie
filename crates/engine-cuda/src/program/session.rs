@@ -89,7 +89,7 @@ impl Session {
     pub fn bind(
         compiled: &Compiled,
         plan: &ExecPlan,
-        seeds: &[(u32, Vec<u8>)],
+        seeds: &[(u32, impl AsRef<[u8]>)],
         extents: Extents,
         endpoints: Vec<Option<Arc<Endpoint>>>,
         shadow: bool,
@@ -152,7 +152,7 @@ impl Session {
             {
                 continue;
             }
-            if !session.publish(*channel, wire, stream)? {
+            if !session.publish(*channel, wire.as_ref(), stream)? {
                 return Err(Fault::program(
                     "program::session",
                     format!(
