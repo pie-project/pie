@@ -332,6 +332,8 @@ pub struct Shell {
     /// the plane's rows and width, and every such plane the ladder traced.
     gathers: std::collections::HashMap<(u32, u32), std::sync::Arc<crate::device::Program>>,
     gather_shapes: std::collections::BTreeSet<(u32, u32)>,
+    /// The readout rings the load laid (`fixed_readouts`), by ring index.
+    readout_specs: Vec<FixedReadout>,
     /// Token-declared values on a readout-rowed path (`crate::rows`), and
     /// a readout-rowed value that tells their rows.
     readout_rowed: (std::sync::Arc<Vec<bool>>, Option<ValueId>),
@@ -682,6 +684,30 @@ impl Shell {
             staging.rows,
         )?;
         let reserved = reserved + slab;
+        // Each readout output lands in a plane laid here for a readout row
+        // a lane at the most lanes a fire holds (at its rung), one a frame
+        // in flight and one: a fire writes its readout rows into the next
+        // in place, and every fire's plane has one shape, so the guest
+        // stages and host gathers reading it take one shape too. A fire
+        // reading more (a drafter's verify, up to `readouts_per_lane` rows
+        // a lane) returns its own plane, as before: laid for those, the
+        // rings would take 16 times the bytes (qwen3-0.6b c64: 2.2 GiB).
+        let readout_cap =
+            poem_exec::fire::rung_of(&budgets.tokens.buckets, budgets.tokens.max_lanes);
+        let readout_exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled)
+            .map_err(|why| Fault::Unbound { what: why })?;
+        let readout_specs = fixed_readouts(&readout_exports, readout_cap);
+        // A served frame's readouts are held only while it is the pending
+        // frame (`Xla::submit_frame` drops the last frame's before it fires
+        // the next), and a frame is at most `STEPS_MAX` fires: a ring that
+        // deep never comes round to a plane still held. The device orders a
+        // plane's reuse after its last reader by the donation itself.
+        let readout_depth = usize::from(engine::runahead::Runahead::STEPS_MAX);
+        let readout_bytes: u64 = readout_specs
+            .iter()
+            .map(|spec| readout_depth as u64 * u64::from(spec.rows) * u64::from(spec.width) * 4)
+            .sum();
+        let reserved = reserved + readout_bytes;
         let staging_facts = StagingFacts {
             pass_ms,
             slab_rows: staging.rows,
@@ -852,6 +878,29 @@ impl Shell {
         pools.view_weights(&handles, &streamed)?;
         pools.land_host_banks(&device, &handles, &streamed)?;
         streamed.release_expert_copies();
+        let rings: Vec<(Tensor, Dtype, u32, u32)> = readout_specs
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                let root = handles.root(Root {
+                    source: Source::Readout {
+                        index: u16::try_from(index).unwrap_or(u16::MAX),
+                    },
+                    dtype: spec.dtype,
+                    rows: spec.rows,
+                    width: spec.width,
+                });
+                (root, spec.dtype, spec.rows, spec.width)
+            })
+            .collect();
+        pools.lay_readouts(&device, &rings, readout_depth)?;
+        tracing::info!(
+            outputs = readout_specs.len(),
+            rows = readout_cap,
+            planes = readout_depth,
+            mib = readout_bytes >> 20,
+            "xla readout planes laid: one shape a fire, held outside the pool"
+        );
         handles.seal();
         if !streamed.is_empty() {
             for at in 0..streamed.shapes.len() {
@@ -993,6 +1042,7 @@ impl Shell {
             plane_reads: Vec::new(),
             gathers: std::collections::HashMap::new(),
             gather_shapes: std::collections::BTreeSet::new(),
+            readout_specs: readout_specs.clone(),
             readout_rowed,
         })
     }
@@ -2772,11 +2822,11 @@ impl Shell {
             }
             None => Vec::new(),
         };
-        if outs.len() != planes.len() {
+        let returned = planes.iter().filter(|plane| plane.fixed.is_none()).count();
+        if outs.len() != returned {
             return Err(Fault::Unbound {
                 what: format!(
-                    "{} output planes, of which the program returned {}",
-                    planes.len(),
+                    "{returned} output planes, of which the program returned {}",
                     outs.len()
                 ),
             });
@@ -2809,14 +2859,29 @@ impl Shell {
                 *slot = seat.have + seat.rows;
             }
         }
+        // Each plane's buffer: a ring's plane where the fire wrote one, else
+        // what it returned, in order.
+        let mut returned = outs.into_iter();
+        let mut buffers: Vec<std::sync::Arc<crate::pjrt::Buffer>> =
+            Vec::with_capacity(planes.len());
+        for plane in &planes {
+            buffers.push(match plane.fixed {
+                Some((ring, _)) => self.pools.readout_current(ring).ok_or_else(|| Fault::Unbound {
+                    what: format!("readout ring {ring}'s plane, which the fire did not return"),
+                })?,
+                None => std::sync::Arc::new(returned.next().ok_or_else(|| Fault::Unbound {
+                    what: "an output plane, which the program did not return".to_string(),
+                })?),
+            });
+        }
         let host = match host.filter(|table| table.at.iter().any(Option::is_some)) {
-            Some(table) => Some(self.host_rows(table, &planes, &outs)?),
+            Some(table) => Some(self.host_rows(table, &planes, &buffers)?),
             None => None,
         };
         let kept = self.kept(
             &composition,
             &planes,
-            outs,
+            buffers,
             (&readout_rows, &readout_layout),
             &pixels,
             real,
@@ -2873,12 +2938,20 @@ impl Shell {
                     })
                 })
                 .collect::<Result<Vec<Tensor>>>()?;
+            let fixed = (out.decl.readout)
+                .then(|| {
+                    (self.readout_specs.iter())
+                        .position(|spec| spec.exports.contains(&export) && readouts <= spec.cap)
+                })
+                .flatten()
+                .map(|ring| (u16::try_from(ring).unwrap_or(u16::MAX), readouts));
             planes.push(PlaneShape {
                 export,
-                rows: if out.decl.readout {
-                    readouts
-                } else {
-                    handles[0].rows
+                fixed,
+                rows: match fixed {
+                    Some((ring, _)) => self.readout_specs[usize::from(ring)].cap,
+                    None if out.decl.readout => readouts,
+                    None => handles[0].rows,
                 },
                 width: handles[0].width,
                 dtype: if out.decl.dtype == Dtype::I32 {
@@ -2987,7 +3060,7 @@ impl Shell {
         &mut self,
         table: HostTable,
         planes: &[PlaneShape],
-        outs: &[crate::pjrt::Buffer],
+        outs: &[std::sync::Arc<crate::pjrt::Buffer>],
     ) -> Result<(HostTable, crate::pjrt::Buffer)> {
         let shape = &planes[table.plane];
         let program = self.gather_program(shape.rows, shape.width)?;
@@ -3000,7 +3073,7 @@ impl Shell {
         })?;
         let mut got = self.device.run(
             &program,
-            vec![crate::pjrt::Arg::Keep(plane), crate::pjrt::Arg::Keep(&ids)],
+            vec![crate::pjrt::Arg::Keep(plane.as_ref()), crate::pjrt::Arg::Keep(&ids)],
             false,
         )?;
         let buffer = got.pop().ok_or_else(|| Fault::Unbound {
@@ -3015,7 +3088,7 @@ impl Shell {
         &self,
         composition: &poem_exec::fire::Composition,
         planes: &[PlaneShape],
-        buffers: Vec<crate::pjrt::Buffer>,
+        buffers: Vec<std::sync::Arc<crate::pjrt::Buffer>>,
         (readout_rows, readout_layout): (&[i32], &[(u32, u32)]),
         pixels: &[Pixels],
         real: usize,
@@ -3236,6 +3309,7 @@ impl Shell {
             Some(tracer.value(readout_t)?)
         };
         let mut extras = Vec::new();
+        let mut landed: Vec<u16> = Vec::new();
         for plane in planes {
             let readout = self.exports[plane.export].decl.readout;
             let elem = if plane.dtype == Dtype::I32 {
@@ -3259,6 +3333,28 @@ impl Shell {
                     // bf16 plane on its way to a row-major host buffer.
                     Ok(f.convert(picked, elem))
                 })?);
+            }
+            if let Some((ring, _)) = plane.fixed {
+                // Into the ring's next plane, in place: each layer's rows at
+                // the top of its `cap` rows (outputs of one value share a
+                // ring, written once).
+                if !landed.contains(&ring) {
+                    landed.push(ring);
+                    let root = self.pools.readouts()[usize::from(ring)].root;
+                    let cap = i64::from(self.readout_specs[usize::from(ring)].cap);
+                    crate::emit::Emit::emit(&tracer, &mut |cx| {
+                        let mut whole = cx.read(root)?;
+                        for (layer, &rows) in layers.iter().enumerate() {
+                            let f = cx.func();
+                            let row = layer as i64 * cap;
+                            let at = f.const_i(kernels_xla::hlo::Elem::I32, row, &[]);
+                            let col = f.const_i(kernels_xla::hlo::Elem::I32, 0, &[]);
+                            whole = f.dynamic_update_slice(whole, rows, &[at, col])?;
+                        }
+                        cx.write(root, whole)
+                    })?;
+                }
+                continue;
             }
             extras.push(match layers.as_slice() {
                 [one] => *one,
@@ -3463,6 +3559,54 @@ struct PlaneShape {
     rows: u32,
     width: u32,
     dtype: Dtype,
+    /// The readout ring this plane lands in, and the readout rows the fire
+    /// writes there (`rows` is then the ring's plane rows a layer).
+    fixed: Option<(u16, u32)>,
+}
+
+/// One readout ring: the exports landing in it (outputs of one value share
+/// one), `rows` a plane (`layers` of `cap` rows), `width` of `dtype`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FixedReadout {
+    pub exports: Vec<usize>,
+    pub dtype: Dtype,
+    pub cap: u32,
+    pub layers: u32,
+    pub rows: u32,
+    pub width: u32,
+}
+
+/// The readout rings a load lays: every readout output a fire returns as a
+/// plane (f32 or i32 on the device, no clips of its own), outputs of one
+/// value sharing a ring.
+fn fixed_readouts(exports: &[poem_exec::feeds::ClassOutput], cap: u32) -> Vec<FixedReadout> {
+    let mut out: Vec<FixedReadout> = Vec::new();
+    let mut values: Vec<Vec<ValueId>> = Vec::new();
+    for (at, export) in exports.iter().enumerate() {
+        let decl = &export.decl;
+        if !decl.readout
+            || export.grid.is_some()
+            || !matches!(decl.dtype, Dtype::Bf16 | Dtype::F32 | Dtype::I32)
+            || cap == 0
+        {
+            continue;
+        }
+        if let Some(k) = values.iter().position(|v| *v == export.values) {
+            out[k].exports.push(at);
+            continue;
+        }
+        let layers = decl.layers.max(1);
+        values.push(export.values.clone());
+        out.push(FixedReadout {
+            exports: vec![at],
+            dtype: if decl.dtype == Dtype::I32 { Dtype::I32 } else { Dtype::F32 },
+            cap,
+            layers,
+            rows: layers * cap,
+            width: decl.width,
+        });
+    }
+    out
 }
 
 type ReadoutTable = (Vec<i32>, Vec<(u32, u32)>, Vec<u32>);
