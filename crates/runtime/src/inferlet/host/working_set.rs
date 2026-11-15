@@ -262,16 +262,20 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
         on: Resource<Pipeline>,
     ) -> Result<Result<Resource<WorkingSet>, String>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        let (scope, failure) = {
+        let (scope, failure, fires) = {
             let pipeline = self.ctx().table.get(&on)?;
-            (pipeline.scope.clone(), pipeline.failure.clone())
+            (
+                pipeline.scope.clone(),
+                pipeline.failure.clone(),
+                pipeline.fires.clone(),
+            )
         };
         if scope.is_closed() {
             return Ok(Err("pipeline is closed".to_string()));
         }
-        let (kv_rep, rs_rep, cursor) = {
+        let (kv_rep, rs_rep) = {
             let ws = self.ctx().table.get(&this)?;
-            (ws.kv, ws.rs, ws.cursor())
+            (ws.kv, ws.rs)
         };
         let kv = kv_of(self, kv_rep)?;
         let rs = match rs_rep {
@@ -291,10 +295,28 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
                 scope.id()
             )));
         }
+        // A fire on its way that folds the recurrent state by a count the
+        // device computes leaves the frozen length behind the record until
+        // it settles, and a child takes both. Those fires are this
+        // pipeline's, and only this task settles them: the fork runs them
+        // to their end first, woken as each completes. One that fails ends
+        // the wait as the pipeline's failure. A fold still unsettled then
+        // is none this task can settle (a fire the planner is finalizing,
+        // or one dropped that the engine still holds): its end wakes the
+        // fork.
+        let stores = store_registry::get(kv.model, kv.engine);
+        let unsettled = |rs: &RsWorkingSet| {
+            stores.rs.lock().unwrap().device_fold_gate(rs.id)
+                == Err(crate::store::rs::RsError::DeviceFoldUnsettled)
+        };
+        if let Some(rs) = rs.as_ref().filter(|rs| unsettled(rs)) {
+            crate::pipeline::fire::drain_pipeline_fires(self, &fires).await?;
+            crate::store::rs::device_folds_settled(&stores.rs, &[rs.id]).await;
+        }
         if let Some(reason) = failure.lock().unwrap().clone() {
             return Ok(Err(format!("pipeline failed: {reason}")));
         }
-        let stores = store_registry::get(kv.model, kv.engine);
+        let cursor = self.ctx().table.get(&this)?.cursor();
         let kv_child =
             match store_registry::with_kv_lock(&stores.kv, "host-working-set", |s| s.fork(kv.id)) {
                 Ok(id) => kv.forked(id),

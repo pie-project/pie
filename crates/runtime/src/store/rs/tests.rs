@@ -350,3 +350,138 @@ fn a_snapshot_resumes_at_its_row() {
         "the checkpoint holds its slot"
     );
 }
+
+// A fold the device counts: from its fire's submit until it settles the
+// record stands ahead of the frozen length, and only the engine, and only
+// where the record stands, knows by how much.
+
+#[test]
+fn device_fold_gate_every_case() {
+    a_device_counted_fold_gates_every_copy_until_it_settles();
+    two_device_counted_folds_gate_until_the_last_settles();
+    a_device_counted_fold_that_failed_refuses_by_its_failure();
+    a_released_set_has_nothing_left_to_wait_for();
+}
+
+fn folded_at(s: &mut RsStore, frozen: u32) -> RsWorkingSetId {
+    let ws = s.create_working_set(geom());
+    write_state(s, ws);
+    s.fold(ws, frozen);
+    ws
+}
+
+fn a_device_counted_fold_gates_every_copy_until_it_settles() {
+    let mut s = store();
+    let ws = folded_at(&mut s, 4);
+    s.begin_device_fold(ws);
+    let unsettled = || RsError::DeviceFoldUnsettled;
+    assert_eq!(s.fork(ws), Err(unsettled()));
+    assert_eq!(s.export(ws).map(|set| set.frozen), Err(unsettled()));
+    assert_eq!(s.checkpoint(ws, [1; 32], None), Err(unsettled()));
+    assert_eq!(s.checkpoint_at(ws, [1; 32], None, 4), Err(unsettled()));
+    assert!(!s.has_checkpoint(&[1; 32]));
+
+    s.end_device_fold(ws, Some(3), None);
+    let child = s.fork(ws).expect("the fold settled");
+    assert_eq!(s.frozen(child), Ok(7), "the child takes what the fold left");
+    assert_eq!(s.export(ws).map(|set| set.frozen), Ok(7));
+    assert_eq!(s.checkpoint(ws, [1; 32], None), Ok(true));
+    let resumed = s.create_working_set(geom());
+    assert!(s.adopt_checkpoint(resumed, &[1; 32]).unwrap());
+    assert_eq!(s.frozen(resumed), Ok(7));
+}
+
+fn two_device_counted_folds_gate_until_the_last_settles() {
+    let mut s = store();
+    let ws = folded_at(&mut s, 4);
+    s.begin_device_fold(ws);
+    s.begin_device_fold(ws);
+    s.end_device_fold(ws, Some(1), None);
+    assert_eq!(
+        s.fork(ws),
+        Err(RsError::DeviceFoldUnsettled),
+        "another is on its way"
+    );
+    s.end_device_fold(ws, Some(2), None);
+    let child = s.fork(ws).unwrap();
+    assert_eq!(s.frozen(child), Ok(7));
+}
+
+fn a_device_counted_fold_that_failed_refuses_by_its_failure() {
+    let mut s = store();
+    let ws = folded_at(&mut s, 4);
+    s.begin_device_fold(ws);
+    s.end_device_fold(ws, None, Some("pipeline: forward failed: device lost"));
+    let failed = || RsError::DeviceFoldFailed("pipeline: forward failed: device lost".to_string());
+    assert_eq!(s.fork(ws), Err(failed()));
+    assert_eq!(s.export(ws).map(|set| set.frozen), Err(failed()));
+    assert_eq!(s.checkpoint(ws, [2; 32], None), Err(failed()));
+    assert!(
+        failed().to_string().contains("forward failed: device lost"),
+        "by the fire's own failure: {}",
+        failed()
+    );
+    assert_eq!(s.frozen(ws), Ok(4), "nothing was counted");
+
+    // A fold that settles after it does not make the length known again.
+    s.begin_device_fold(ws);
+    s.end_device_fold(ws, Some(1), None);
+    assert_eq!(s.fork(ws), Err(failed()));
+
+    // With the record gone there is nothing to be behind.
+    s.forget_state(ws).unwrap();
+    assert!(s.fork(ws).is_ok());
+}
+
+fn a_released_set_has_nothing_left_to_wait_for() {
+    use futures::FutureExt;
+    let store = std::sync::Mutex::new(store());
+    let ws = folded_at(&mut store.lock().unwrap(), 4);
+    store.lock().unwrap().begin_device_fold(ws);
+    let sets = [ws];
+    let mut waiting = Box::pin(super::device_folds_settled(&store, &sets));
+    assert!(waiting.as_mut().now_or_never().is_none());
+    store.lock().unwrap().release_working_set(ws);
+    assert!(waiting.as_mut().now_or_never().is_some());
+}
+
+#[test]
+fn a_wait_on_a_device_counted_fold_ends_when_it_settles_however_it_ended() {
+    use futures::FutureExt;
+    for failure in [None, Some("pipeline: forward failed: device lost")] {
+        let store = std::sync::Mutex::new(store());
+        let (ws, other) = {
+            let mut s = store.lock().unwrap();
+            (folded_at(&mut s, 4), folded_at(&mut s, 4))
+        };
+        assert!(
+            super::device_folds_settled(&store, &[ws, other])
+                .now_or_never()
+                .is_some(),
+            "no fold the device counts is on its way: nothing waits"
+        );
+        store.lock().unwrap().begin_device_fold(ws);
+        let sets = [other, ws];
+        let mut waiting = Box::pin(super::device_folds_settled(&store, &sets));
+        assert!(waiting.as_mut().now_or_never().is_none());
+        assert!(
+            super::device_folds_settled(&store, &[other])
+                .now_or_never()
+                .is_some(),
+            "another set's fold delays nothing"
+        );
+        store
+            .lock()
+            .unwrap()
+            .end_device_fold(ws, failure.is_none().then_some(3), failure);
+        assert!(waiting.as_mut().now_or_never().is_some());
+        let s = store.lock().unwrap();
+        match failure {
+            None => assert_eq!(s.frozen(ws), Ok(7), "the waiter reads what it left"),
+            Some(failure) => assert_eq!(
+                s.device_fold_gate(ws),
+                Err(RsError::DeviceFoldFailed(failure.to_string()))
+            ),
+        }
+    }
+}

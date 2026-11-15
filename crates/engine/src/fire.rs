@@ -555,12 +555,29 @@ pub enum RsVerb {
     #[default]
     Fold,
     /// Replays the buffered slots `folded..first` its mask admits, then freezes
-    /// `fold` slots past `folded` into the state.
+    /// `fold` slots past the row the record stands at into the state.
     Buffer {
         /// The buffer's pages: token `t` of page `p` holds slot
         /// `base + p * page + t`.
         pages: Vec<u32>,
         base: u32,
+        /// How far the record is folded, as the runtime knew it when it
+        /// staged the fire. Exact for a set whose folds are the host's
+        /// ([`FoldLen::Host`]): the runtime counts those as it stages them.
+        /// For a set whose fold length is the device's
+        /// ([`FoldLen::Device`]) it is a lower bound: such a fold's count
+        /// reaches the runtime only when its fire settles
+        /// ([`crate::KvWrites::fold`]), and the set's later fires are
+        /// staged before that. The record is the engine's: it replays from
+        /// where its record stands, `max(folded, the row its last fold left
+        /// the record at)`, and freezes `fold` slots past that row. The
+        /// engine keeps that row with the record across every copy of the
+        /// record's slot it makes on the runtime's behalf (a fork's copy);
+        /// it need not survive a move between tiers or an export of the
+        /// record's bytes: the runtime does not fork, checkpoint, export or
+        /// move between tiers a set with such a fire on its way until that
+        /// fire settles, so wherever the record leaves the engine's table
+        /// the stated number is exact again.
         folded: u32,
         fold: FoldLen,
     },

@@ -561,6 +561,10 @@ pub(super) async fn save(held: &Held, tenant: &str, name: &str) -> Result<Value,
     let wrote = async {
         let rs_set = match rs {
             Some(rs) => {
+                // What is kept states the frozen length a fold the device
+                // counts leaves: it settles first, and one that failed
+                // refuses the save by name.
+                crate::store::rs::device_folds_settled(&stores.rs, &[rs.id]).await;
                 let set = stores.rs.lock().unwrap().export(rs.id);
                 let set = set.map_err(|error| failed("reading recurrent state", error))?;
                 Some((rs, set))
@@ -1147,6 +1151,38 @@ mod tests {
         assert!(shared.join("theirs").exists(), "a snapshot links it");
         assert!(shared.join("unnamed").exists(), "not this save's");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// What a save keeps states the frozen length: it waits for a fold the
+    /// device counts, and one that failed refuses it by name, before any
+    /// byte of the record is read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_save_waits_for_a_fold_the_device_counts_and_is_refused_by_its_failure() {
+        use futures::FutureExt;
+
+        use crate::handle::held::tests::{DEVICE_LOST, folding};
+        configure(
+            std::env::temp_dir().join(format!("pie-snapshots-{}", Uuid::new_v4())),
+            u64::MAX,
+        );
+        let (held, stores, rs) = folding();
+        let mut saving = Box::pin(save(&held, "tenant", "kept"));
+        assert!(
+            saving.as_mut().now_or_never().is_none(),
+            "the frozen length is behind the record until the fold settles"
+        );
+        stores
+            .rs
+            .lock()
+            .unwrap()
+            .end_device_fold(rs, None, Some(DEVICE_LOST));
+        let refused = saving.await.expect_err("its length is not known");
+        assert!(
+            refused.message.contains("reading recurrent state")
+                && refused.message.contains(DEVICE_LOST),
+            "{}",
+            refused.message
+        );
     }
 
     #[test]
