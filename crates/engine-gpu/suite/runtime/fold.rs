@@ -6,8 +6,10 @@
 //! carries was heard. And a fork of that set, fired while its parent's
 //! device fold is unsettled, replays what the host fork replays. Each
 //! device-folding fire reports the slots its fold froze through the
-//! completion sink. qwen35-tiny (recurrent layers); the fold count rides a
-//! decode-envelope program's `fold` port.
+//! completion sink: as its step lands on an engine that settles off the
+//! submit, and before `submit` returns on one that settles inside it (one
+//! frame in flight, where the engine then does). qwen35-tiny (recurrent
+//! layers); the fold count rides a decode-envelope program's `fold` port.
 
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -322,13 +324,18 @@ struct Model {
     pieces: u32,
     rs_tokens: u32,
     rs_pages: u32,
+    /// Whether the engine settles off the submit: its sink then hears
+    /// every step. Else a frame settles inside `submit`, whose result
+    /// answers for it, and the sink hears only what a step's lanes wrote.
+    asynchronous: bool,
     heard: mpsc::Receiver<(StepDone, StepOutcome)>,
     seen: Vec<(StepDone, StepOutcome)>,
 }
 
 impl Model {
     fn submit(&mut self, lane: Lane, attach: Option<InstanceId>) -> FrameTicket {
-        self.engine
+        let ticket = self
+            .engine
             .submit(&FrameSubmission::of(Step {
                 lanes: vec![lane],
                 attachments: attach
@@ -343,7 +350,13 @@ impl Model {
                 media: Vec::new(),
                 voxels: Vec::new(),
             }))
-            .expect("the frame fires")
+            .expect("the frame fires");
+        if !self.asynchronous {
+            // What a frame settled inside `submit` tells, it has told by
+            // now: nothing heard later counts.
+            self.seen.extend(self.heard.try_iter());
+        }
+        ticket
     }
 
     /// The frame's last-row logits, as bits.
@@ -362,7 +375,7 @@ impl Model {
         let bits = self.settled(&mut ticket);
         assert_eq!(
             self.outcome(&ticket),
-            StepOutcome::Committed,
+            self.asynchronous.then_some(StepOutcome::Committed),
             "a fire whose fold lengths the host states reports no fold"
         );
         bits
@@ -382,11 +395,16 @@ impl Model {
         }
     }
 
-    /// What the completion sink heard of `ticket`'s step.
-    fn outcome(&mut self, ticket: &FrameTicket) -> StepOutcome {
+    /// What the completion sink heard of `ticket`'s step: once it lands,
+    /// on an engine that settles off the submit; else by the time its
+    /// `submit` returned, where a step that wrote nothing tells nothing.
+    fn outcome(&mut self, ticket: &FrameTicket) -> Option<StepOutcome> {
         loop {
             if let Some((_, outcome)) = self.seen.iter().find(|(at, _)| at.frame == ticket.id) {
-                return outcome.clone();
+                return Some(outcome.clone());
+            }
+            if !self.asynchronous {
+                return None;
             }
             let heard = self
                 .heard
@@ -400,7 +418,7 @@ impl Model {
     /// reported them under `tag`.
     fn reported(&mut self, ticket: &FrameTicket, tag: u64) -> Option<u32> {
         match self.outcome(ticket) {
-            StepOutcome::Wrote(writes) => {
+            Some(StepOutcome::Wrote(writes)) => {
                 assert_eq!(writes.len(), 1, "one lane reports: {writes:?}");
                 let report = &writes[0];
                 assert_eq!(report.tag, tag, "the report carries the lane's tag");
@@ -423,7 +441,8 @@ impl Model {
     }
 }
 
-fn load() -> Option<(Model, InstanceId)> {
+/// The miniature loaded with `frames` in flight.
+fn load(frames: u8) -> Option<(Model, InstanceId)> {
     let boot = backend::DeviceBoot::default();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
@@ -454,16 +473,10 @@ fn load() -> Option<(Model, InstanceId)> {
                 ..Residency::default()
             },
             ordinal: 0,
-            // Two frames in flight: the engine settles off the submit, so
-            // a sink stands to hear a step's report, and a fire is staged
-            // behind one still in flight.
-            frames_in_flight: 2,
+            frames_in_flight: frames,
         })
         .expect("the miniature loads");
-    assert!(
-        engine.settles_asynchronously(),
-        "a sink is installed only on an engine that settles off the submit"
-    );
+    let asynchronous = engine.settles_asynchronously();
     let (tx, heard) = mpsc::channel();
     let tx = Mutex::new(tx);
     engine.on_complete(Arc::new(move |at, outcome| {
@@ -515,15 +528,29 @@ fn load() -> Option<(Model, InstanceId)> {
         pieces,
         rs_tokens,
         rs_pages,
+        asynchronous,
         heard,
         seen: Vec::new(),
     };
     Some((model, instance))
 }
 
+/// Two frames in flight: the engine settles off the submit, and a fire is
+/// staged behind one still in flight.
 #[test]
 fn a_device_fold_replays_what_a_host_fold_replays() {
-    let Some((mut model, instance)) = load() else {
+    replays_what_a_host_fold_replays(2);
+}
+
+/// One frame in flight: an engine that then settles each frame inside
+/// `submit` has told a fold's report by the time `submit` returns.
+#[test]
+fn a_device_fold_settled_inside_submit_replays_what_a_host_fold_replays() {
+    replays_what_a_host_fold_replays(1);
+}
+
+fn replays_what_a_host_fold_replays(frames: u8) {
+    let Some((mut model, instance)) = load(frames) else {
         return;
     };
     let trace = model.trace.clone();
@@ -541,7 +568,9 @@ fn a_device_fold_replays_what_a_host_fold_replays() {
         "the reference reads finite logits"
     );
     // The device's ride the program's `fold` port: the second is submitted
-    // before the first settles, stating the `folded` the runtime held then.
+    // before the first's report is read (before the first settles, where
+    // the engine settles off the submit), stating the `folded` the runtime
+    // held then.
     let mut device = Set::new(&mut model, 1);
     let a = device.lane(&trace, 11, PROMPT, FoldLen::Device, 101);
     model.tell(instance, &a);
@@ -616,9 +645,14 @@ fn a_device_fold_replays_what_a_host_fold_replays() {
         "a fork of a set whose device fold is unsettled leaves what the host fork leaves"
     );
     eprintln!(
-        "{}: pipelined and forked device folds reported {N} a fire and left the host folds' \
-         state over {} logits",
+        "{}: {frames} frame(s) in flight, reports heard {}: pipelined and forked device folds \
+         reported {N} a fire and left the host folds' state over {} logits",
         backend::NAME,
+        if model.asynchronous {
+            "as each step landed"
+        } else {
+            "by the time each submit returned"
+        },
         want.len()
     );
 }

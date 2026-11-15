@@ -36,10 +36,10 @@ pub struct PendingStep {
 
     pub rows: Option<Vec<Vec<f32>>>,
 
-    /// The fold reports of a forward fired with its completion deferred:
-    /// the pass that reports the step carries them. The forward's own
-    /// completion carries them otherwise; with no sink installed they are
-    /// heard by no one.
+    /// The fold reports of a forward whose own completion does not carry
+    /// them: fired with its completion deferred, the pass that reports the
+    /// step carries them; on an engine that settles inside `submit`, the
+    /// frame's settle there tells them.
     pub wrote: Vec<engine::KvWrites>,
 }
 
@@ -181,6 +181,27 @@ impl<B: Host> Gpu<B> {
 
     pub fn loaded_mut(&mut self) -> EngineResult<&mut Shell<B>> {
         self.shell.as_mut().ok_or_else(unloaded::<B>)
+    }
+
+    /// Tells the sink what the lanes of the frame just settled inside
+    /// `submit` wrote, step by step, before `submit` returns: a fold's
+    /// count is the host's from the fire's submit, so this waits on
+    /// nothing. A step that wrote nothing tells nothing; `submit`'s result
+    /// answers for it.
+    fn tell_wrote(&mut self) {
+        let (Some(sink), Some((frame, steps))) = (self.sink.as_ref(), self.pending.as_mut()) else {
+            return;
+        };
+        for (step, pending) in steps.iter_mut().enumerate() {
+            let wrote = std::mem::take(&mut pending.wrote);
+            if !wrote.is_empty() {
+                let at = engine::StepDone {
+                    frame: *frame,
+                    step: step as u32,
+                };
+                (sink)(at, engine::StepOutcome::Wrote(wrote));
+            }
+        }
     }
 }
 
@@ -685,6 +706,7 @@ where
 
         if !self.settles_asynchronously() {
             self.settle_frame(&mut ticket)?;
+            self.tell_wrote();
         }
         Ok(ticket)
     }
@@ -1019,7 +1041,12 @@ impl<B: Host> Gpu<B> {
             }
         }
 
-        let sink = self.sink.clone();
+        // A frame settled inside `submit` answers there: its steps'
+        // completions tell the sink nothing.
+        let sink = self
+            .sink
+            .clone()
+            .filter(|_| B::settles_asynchronously(self));
 
         let mut lane_adapters: Vec<Option<u32>> = vec![None; submission.lanes.len()];
         if !self.adapters.is_empty() {

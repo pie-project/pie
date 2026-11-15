@@ -325,6 +325,11 @@ pub trait Engine: Send {
         false
     }
 
+    /// Where a step's outcome goes. An engine that settles asynchronously
+    /// answers every step here. One that settles inside
+    /// [`Engine::submit`] answers through `submit`'s result: of what it
+    /// tells here only what a step's lanes wrote ([`StepOutcome::Wrote`])
+    /// is heard, and it is told before `submit` returns.
     fn on_complete(&mut self, sink: CompletionSink) {
         let _ = sink;
     }
