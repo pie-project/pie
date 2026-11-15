@@ -63,6 +63,23 @@ struct Input {
     ckpt_sync: bool,
     #[serde(default)]
     rollback_mode: Option<String>,
+    /// Throughput-bench mode, named by the caller and never inferred: every
+    /// round accepts `k - 1` drafts unverified and stop tokens are ignored, so
+    /// the output is NOT the model's answer. Off unless the request says
+    /// `"bench_accept": true`; it takes no `trace`, `margin` or `pad`.
+    #[serde(default)]
+    bench_accept: bool,
+}
+
+/// Bench mode is the caller's explicit choice; a long request with drafts is
+/// an ordinary request and gets verified tokens.
+fn bench_mode(input: &Input, k: u32) -> bool {
+    input.bench_accept && !input.trace && !input.margin && input.pad == 0 && k > 0
+}
+
+/// The window drafts what the caller asked for, up to the model's draft width.
+fn working_k(asked: u32, depth: u32) -> u32 {
+    asked.min(depth)
 }
 
 fn default_prompt() -> String {
@@ -103,6 +120,9 @@ struct Output {
     /// many-row fire take different kernel paths and differ in the last
     /// bits) or a real gap (a mechanism fault).
     margin_trace: Vec<f32>,
+    /// Per round, row 0's top-1 logit beside its margin: what sets the bf16
+    /// step (`2^(exponent - 7)`) the margin is read against.
+    top_trace: Vec<f32>,
     /// Per round, how many tokens were committed (the accepted run plus the
     /// correction) — what maps a token index back to its round.
     commits_trace: Vec<u32>,
@@ -129,6 +149,7 @@ impl Output {
             depth,
             prompt_tokens: 0,
             margin_trace: Vec::new(),
+            top_trace: Vec::new(),
             commits_trace: Vec::new(),
             proposed_trace: Vec::new(),
             truth_trace: Vec::new(),
@@ -144,10 +165,9 @@ async fn main(input: Input) -> Result<Output> {
     let lane = model::lane_of(&[])?;
     let output = |name: &str| lane.outputs.iter().find(|output| output.name == name);
     let depth = output("mtp.drafts").map_or(0, |drafts| drafts.width);
-    let reported_k = input.k.min(depth);
-    let k = reported_k.min(1);
+    let k = working_k(input.k, depth);
     if input.max_tokens == 0 {
-        return Ok(Output::empty(reported_k, depth));
+        return Ok(Output::empty(k, depth));
     }
     let w = k + 1 + input.pad;
 
@@ -224,12 +244,13 @@ async fn main(input: Input) -> Result<Output> {
     generated.push(x);
     let (mut rounds, mut drafted, mut accepted) = (0usize, 0usize, 0usize);
     let mut margin_trace: Vec<f32> = Vec::new();
+    let mut top_trace: Vec<f32> = Vec::new();
     let mut commits_trace: Vec<u32> = Vec::new();
     let mut proposed_trace: Vec<Vec<u32>> = Vec::new();
     let mut truth_trace: Vec<Vec<u32>> = Vec::new();
     let tracing = input.trace;
     let margin = input.margin;
-    let bench_accept = !tracing && !margin && input.pad == 0 && input.max_tokens >= 128 && k > 0;
+    let bench_accept = bench_mode(&input, k);
     let mut stopped =
         (!bench_accept && stop_tokens.contains(&x)) || generated.len() >= input.max_tokens;
 
@@ -249,7 +270,7 @@ async fn main(input: Input) -> Result<Output> {
         // One diagnostic channel, the margin or the trace: a declared channel
         // takes a reader cell whether or not a stage touches it, and the pass
         // has room for twelve. f32 for both — a token id is exact in f32.
-        let aux = Channel::new([if tracing { 2 * w } else { 1 }], dtype::f32)
+        let aux = Channel::new([if tracing { 2 * w } else if margin { 2 } else { 1 }], dtype::f32)
             .capacity(channel_capacity() as u32);
 
         let fwd = ForwardPass::new();
@@ -282,10 +303,11 @@ async fn main(input: Input) -> Result<Output> {
                 let vocab = intrinsics::vocab();
                 let row0 = reshape(gather(reshape(&logits, [w, vocab]), iota(1)), [vocab]);
                 let (top, _) = top_k(&row0, 2);
-                aux.put(reshape(
-                    gather(&top, iota(1)) - gather(&top, iota(1) + Tensor::constant(1u32)),
-                    [1],
-                ));
+                // [top-1 - top-2, top-1]
+                let first = gather(&top, broadcast(Tensor::constant(0u32), [2]));
+                let second = gather(&top, broadcast(Tensor::constant(1u32), [2]));
+                let lead = eq(iota(2), Tensor::constant(0u32));
+                aux.put(select(&lead, &first - &second, &first));
             } else {
                 // A declared channel takes a reader cell every fire.
                 aux.put(broadcast(Tensor::constant(0f32), [1]));
@@ -376,9 +398,12 @@ async fn main(input: Input) -> Result<Output> {
                         truth_trace.push(answered.iter().map(|&t| t as u32).collect());
                     }
                 } else {
-                    let value = aux.take_host::<f32>().await?;
                     if margin {
-                        margin_trace.push(value);
+                        let value = aux.take_host::<Vec<f32>>().await?;
+                        margin_trace.push(value[0]);
+                        top_trace.push(value[1]);
+                    } else {
+                        let _ = aux.take_host::<f32>().await?;
                     }
                 }
                 rounds += 1;
@@ -502,9 +527,12 @@ async fn main(input: Input) -> Result<Output> {
                         truth_trace.push(answered.iter().map(|&t| t as u32).collect());
                     }
                 } else {
-                    let value = aux.take_host::<f32>().await?;
                     if margin {
-                        margin_trace.push(value);
+                        let value = aux.take_host::<Vec<f32>>().await?;
+                        margin_trace.push(value[0]);
+                        top_trace.push(value[1]);
+                    } else {
+                        let _ = aux.take_host::<f32>().await?;
                     }
                 }
                 rounds += 1;
@@ -559,12 +587,48 @@ async fn main(input: Input) -> Result<Output> {
         drafted,
         accepted,
         acceptance_rate,
-        k: reported_k,
+        k,
         depth,
         prompt_tokens: n,
         margin_trace,
+        top_trace,
         commits_trace,
         proposed_trace,
         truth_trace,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(json: &str) -> Input {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// A long request with drafts is an ordinary request: verified, stopping.
+    #[test]
+    fn a_long_request_with_drafts_is_not_a_bench() {
+        let input = request(r#"{"max_tokens": 128, "k": 4}"#);
+        assert!(!bench_mode(&input, working_k(input.k, 4)));
+        let input = request(r#"{"max_tokens": 4096, "k": 4}"#);
+        assert!(!bench_mode(&input, working_k(input.k, 4)));
+    }
+
+    #[test]
+    fn bench_mode_is_named_by_the_caller() {
+        let input = request(r#"{"max_tokens": 16, "k": 4, "bench_accept": true}"#);
+        assert!(bench_mode(&input, working_k(input.k, 4)));
+        let input = request(r#"{"max_tokens": 16, "k": 0, "bench_accept": true}"#);
+        assert!(!bench_mode(&input, working_k(input.k, 4)));
+    }
+
+    /// `k = 4` on a model that drafts four is a window of four drafts.
+    #[test]
+    fn the_window_drafts_what_was_asked_up_to_the_model() {
+        assert_eq!(working_k(4, 4), 4);
+        assert_eq!(working_k(2, 4), 2);
+        assert_eq!(working_k(8, 4), 4);
+        assert_eq!(working_k(4, 0), 0);
+    }
 }
