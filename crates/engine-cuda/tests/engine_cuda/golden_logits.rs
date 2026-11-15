@@ -482,13 +482,18 @@ fn knobs() -> engine_cuda::Knobs {
     knobs
 }
 
-/// The buffered probes' knobs: every class's compositions armed for lanes
-/// that buffer recurrent rows (`rs-bodies`), as a deployment whose
-/// inferlets draft for themselves states, so their fires replay bodies.
-/// `PIE_GOLDEN_RS_EAGER` leaves them unarmed: the buffering fires walk
-/// eagerly, the reference a body's logits match bit for bit.
+/// The buffered probes' knobs: a load that buffers recurrent rows arms
+/// every class's compositions for lanes that buffer or replay them, so these
+/// fires replay bodies. `PIE_GOLDEN_RS_EAGER` runs them with no body at all
+/// (as `PIE_GOLDEN_EAGER`): the eager walk, the reference a body's logits
+/// match bit for bit.
 fn buffering(mut knobs: engine_cuda::Knobs) -> engine_cuda::Knobs {
-    knobs.diagnostics.rs_bodies = std::env::var_os("PIE_GOLDEN_RS_EAGER").is_none();
+    if std::env::var_os("PIE_GOLDEN_RS_EAGER").is_some() {
+        knobs.chip = Some(engine_cuda::chip::pinned(
+            engine_cuda::Graphs::Off,
+            Some(engine_cuda::Recording::Off),
+        ));
+    }
     knobs
 }
 

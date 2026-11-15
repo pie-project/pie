@@ -1248,15 +1248,13 @@ impl Shell {
         }
         // A load that buffers recurrent rows serves a spec-decoding fire
         // from a body too: each one-class composition (a verify's lanes, the
-        // prompts beside them) is recorded once more for lanes that buffer
-        // rows, and once more for lanes that replay them (`record::RsBody`),
-        // right after its folding body.
-        // Only a load that buffers recurrent rows and serves a drafter's
-        // fires (classes that read the drafts) takes them, for the drafter's
-        // classes; `rs-bodies` takes them for every class.
+        // prompts beside them) at the rs rungs is recorded once more for
+        // lanes that buffer rows, and once more for lanes that replay them
+        // (`record::RsBody`), right after its folding body. Every class takes
+        // them, not only a drafter's: a guest that drafts for itself (MTP,
+        // with no drafts output the load can see) verifies on the plain
+        // classes, and it registers after the load arms.
         let buffering = self.buffers.is_some();
-        let every_class = super::diag::on().rs_bodies;
-        let drafting = deployment.drafting.clone();
         let rungs = self.rs_rungs();
         let targets: Vec<(u32, BodySynth, record::RsBody)> = targets
             .into_iter()
@@ -1267,9 +1265,7 @@ impl Shell {
                     }
                     _ => None,
                 };
-                let buffers = buffering
-                    && rungs.contains(&bucket)
-                    && class.is_some_and(|class| every_class || drafting.contains(&class));
+                let buffers = buffering && rungs.contains(&bucket) && class.is_some();
                 let treatments: &[record::RsBody] = if buffers {
                     &[
                         record::RsBody::Folds,

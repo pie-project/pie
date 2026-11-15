@@ -37,10 +37,6 @@ pub struct Diagnostics {
     /// ahead of every fire after them, not the swap stream beside those
     /// fires: to weigh the overlap.
     pub tier_inline: bool,
-    /// Arms every class's compositions for lanes that buffer recurrent rows,
-    /// not only a drafter's: speculative decoding an inferlet drafts itself
-    /// (no drafts output read) replays a body too.
-    pub rs_bodies: bool,
 }
 
 /// The sync guard's answer to a fire that waited for the device.
@@ -75,7 +71,6 @@ impl Default for Diagnostics {
             dense_experts: false,
             one_window: false,
             tier_inline: false,
-            rs_bodies: false,
         }
     }
 }
@@ -97,7 +92,6 @@ impl Diagnostics {
             ("reap-trace", self.reap_trace),
             ("trace-census", self.trace_census),
             ("nan-check", self.nan_check),
-            ("rs-bodies", self.rs_bodies),
         ] {
             if on {
                 words.push(word.to_string());
@@ -159,7 +153,7 @@ const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, \
      `sync-guard[=panic]`, `chunk-bytes=<bytes>`, `dense-weights`, \
-     `dense-experts`, `one-window`, `tier-inline`, `rs-bodies`";
+     `dense-experts`, `one-window`, `tier-inline`";
 
 impl std::str::FromStr for Diagnostics {
     type Err = String;
@@ -187,7 +181,6 @@ impl std::str::FromStr for Diagnostics {
                 "dense-experts" => diag.dense_experts = switch(word, value)?,
                 "one-window" => diag.one_window = switch(word, value)?,
                 "tier-inline" => diag.tier_inline = switch(word, value)?,
-                "rs-bodies" => diag.rs_bodies = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,
                 "sync-guard" => {
                     diag.sync_guard = match value {
