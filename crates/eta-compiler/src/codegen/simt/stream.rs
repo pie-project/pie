@@ -1219,10 +1219,13 @@ pub fn emitted_order(stage: &CompiledStage, region: &Region) -> Vec<u32> {
     streams.order.into_iter().map(|node| node as u32).collect()
 }
 
+/// The values of `region` its kernel neither reads nor writes in scratch,
+/// which so take no bytes there: what a generated region streams through
+/// registers, and what a sampler region's kernel leaves untouched.
 #[must_use]
 pub fn spent_values(stage: &CompiledStage, region: &Region) -> Vec<u32> {
     if region.kind != crate::plan::RegionKind::Generated {
-        return Vec::new();
+        return super::sampler::untouched_values(stage, region);
     }
     if super::validate::validate_generated_region(stage, region).is_err() {
         return Vec::new();

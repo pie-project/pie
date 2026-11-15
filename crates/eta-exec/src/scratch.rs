@@ -159,12 +159,13 @@ fn release(free: &mut Vec<Vacant>, vacant: Vacant) {
 
 /// `descriptors` laid by `lifetimes`: a value takes the bytes of one whose
 /// last reader ran before it is written. `reserve` bytes lie clear below
-/// the temporary area, which holds `temporary_floor` at the least.
+/// the temporary area, which holds `temporary` bytes: what the kernels keep
+/// there, as the engine that runs them states it.
 pub fn layout_reusing(
     descriptors: &[ValueDesc],
     lifetimes: &[Lifetime],
     reserve: u64,
-    temporary_floor: u64,
+    temporary: u64,
 ) -> Result<Layout, TooLarge> {
     if lifetimes.len() != descriptors.len() {
         return layout(descriptors);
@@ -186,7 +187,6 @@ pub fn layout_reusing(
     let mut values = vec![0u64; count];
     let mut spans = vec![0u64; count];
     let mut at = DUMMY_BYTES;
-    let mut widest: u64 = 1;
     let mut step: Option<u32> = None;
 
     for &i in &by_def {
@@ -214,9 +214,7 @@ pub fn layout_reusing(
             spans[i] = 0;
             continue;
         }
-        let descriptor = &descriptors[i];
-        widest = widest.max(u64::from(descriptor.last.max(1)));
-        let span = align_up(descriptor.device_bytes()).ok_or(TooLarge::Overflow)?;
+        let span = align_up(descriptors[i].device_bytes()).ok_or(TooLarge::Overflow)?;
         let taken = if life.reusable {
             take(&mut free, span, life.launch_def, life.class_def)
         } else {
@@ -235,14 +233,9 @@ pub fn layout_reusing(
         spans[i] = span;
     }
 
+    let temporary_bytes = align_up(temporary).ok_or(TooLarge::Overflow)?;
     let temporary = at
         .checked_add(reserve)
-        .and_then(align_up)
-        .ok_or(TooLarge::Overflow)?;
-    let temporary_bytes = widest
-        .checked_mul(size_of::<u32>() as u64)
-        .and_then(|bytes| bytes.checked_mul(TEMPORARIES_PER_ELEMENT))
-        .map(|bytes| bytes.max(temporary_floor))
         .and_then(align_up)
         .ok_or(TooLarge::Overflow)?;
     let total = temporary
@@ -311,8 +304,7 @@ mod tests {
         within_a_many_block_launch_only_one_class_shares();
         a_result_that_may_go_unwritten_keeps_a_fresh_slot();
         a_wider_taker_gets_a_coalesced_pair_of_slots();
-        the_temporary_arena_is_sized_by_the_widest_row();
-        the_temporary_floor_lifts_the_arena();
+        the_temporary_area_holds_what_is_stated();
         a_reserve_lies_below_the_temporary_arena();
         mismatched_lifetimes_fall_back_to_the_naive_layout();
         a_dead_value_takes_no_slot();
@@ -381,7 +373,7 @@ mod tests {
         assert_eq!(reused.values[2], reused.values[0].min(reused.values[1]));
     }
 
-    fn the_temporary_arena_is_sized_by_the_widest_row() {
+    fn the_temporary_area_holds_what_is_stated() {
         let wide = ValueDesc {
             len: 4 * 1024,
             rows: 4,
@@ -390,17 +382,22 @@ mod tests {
             dtype: 0,
             dims: [0; MAX_RANK],
         };
-        let reused = layout_reusing(&[wide], &[life(0, 0)], 0, 0).unwrap();
-        assert_eq!(reused.temporary_bytes, 1024 * 4 * TEMPORARIES_PER_ELEMENT);
+        let none = layout_reusing(&[wide], &[life(0, 0)], 0, 0).unwrap();
+        assert_eq!(none.temporary_bytes, 0, "nothing stated, nothing held");
+        assert_eq!(none.total, none.temporary);
+        let stated = layout_reusing(&[wide], &[life(0, 0)], 0, 1000).unwrap();
+        assert_eq!(stated.values, none.values);
+        assert_eq!(stated.temporary, none.temporary);
+        assert_eq!(stated.temporary_bytes, align_up(1000).unwrap());
         assert_eq!(
             layout(&[wide]).unwrap().temporary_bytes,
-            4 * 1024 * 4 * TEMPORARIES_PER_ELEMENT
+            4 * 1024 * 4 * TEMPORARIES_PER_ELEMENT,
+            "each value its own bytes holds the widest value's words"
         );
-    }
-
-    fn the_temporary_floor_lifts_the_arena() {
-        let reused = layout_reusing(&[desc(1024)], &[life(0, 0)], 0, 1 << 20).unwrap();
-        assert_eq!(reused.temporary_bytes, 1 << 20);
+        assert_eq!(
+            layout_reusing(&[wide], &[life(0, 0)], 0, u64::MAX),
+            Err(TooLarge::Overflow)
+        );
     }
 
     fn a_reserve_lies_below_the_temporary_arena() {

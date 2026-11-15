@@ -84,8 +84,9 @@ pub struct Launches<'a> {
     pub hollow: Vec<u32>,
     /// Bytes held clear below the temporary area.
     pub reserve: u64,
-    /// The least the temporary area holds.
-    pub temporary_floor: u64,
+    /// The bytes the temporary area holds: the most its launches' kernels
+    /// keep there.
+    pub temporary: u64,
 }
 
 /// Each value's lifetime under `run`, or `None` where a node is neither
@@ -275,9 +276,7 @@ pub fn lay_out(
     run: &Launches<'_>,
 ) -> Result<Layout, TooLarge> {
     match value_lifetimes(plan, run) {
-        Some(lifetimes) => {
-            layout_reusing(descriptors, &lifetimes, run.reserve, run.temporary_floor)
-        }
+        Some(lifetimes) => layout_reusing(descriptors, &lifetimes, run.reserve, run.temporary),
         None => layout(descriptors),
     }
 }
@@ -454,7 +453,7 @@ mod tests {
         a_kept_value_holds_to_the_end_through_its_reshapes();
         a_hollow_value_takes_no_bytes();
         a_node_neither_launched_nor_idle_lays_each_value_its_own();
-        the_reserve_and_the_floor_reach_the_layout();
+        the_reserve_and_the_temporary_bytes_reach_the_layout();
     }
 
     /// take, a + a, b + b, c + c, put: one launch an op.
@@ -599,7 +598,7 @@ mod tests {
         );
     }
 
-    fn the_reserve_and_the_floor_reach_the_layout() {
+    fn the_reserve_and_the_temporary_bytes_reach_the_layout() {
         let (plan, descriptors) = chain();
         let launched = [1, 2, 3];
         let bare = Launches {
@@ -608,19 +607,20 @@ mod tests {
             ..each_alone(&plan, &launched)
         };
         let laid = lay_out(&plan, &descriptors, &bare).expect("fits");
-        let floor = 1 << 20;
+        let stated = 1 << 20;
         let held = lay_out(
             &plan,
             &descriptors,
             &Launches {
                 reserve: SELECT_RESERVE,
-                temporary_floor: floor,
+                temporary: stated,
                 ..bare
             },
         )
         .expect("fits");
         assert_eq!(held.values, laid.values);
         assert!(held.temporary >= laid.temporary + SELECT_RESERVE);
-        assert_eq!(held.temporary_bytes, floor);
+        assert_eq!(laid.temporary_bytes, 0);
+        assert_eq!(held.temporary_bytes, stated);
     }
 }

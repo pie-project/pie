@@ -510,7 +510,11 @@ mod tests {
                 .expect("a stage's value has a global")
         };
         let mut read_back = package.clone();
-        for put in read_back.stages.iter_mut().flat_map(|stage| &mut stage.puts) {
+        for put in read_back
+            .stages
+            .iter_mut()
+            .flat_map(|stage| &mut stage.puts)
+        {
             put.value = global_of(unheld);
         }
         assert!(matches!(

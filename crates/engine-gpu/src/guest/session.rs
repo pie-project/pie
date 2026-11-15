@@ -119,7 +119,7 @@ impl Stepping {
             kept: self.kept.clone(),
             hollow: self.hollow.clone(),
             reserve: SELECT_RESERVE,
-            temporary_floor: whole_value_temporaries(descriptors).unwrap_or(u64::MAX),
+            temporary: whole_value_temporaries(descriptors).unwrap_or(u64::MAX),
         }
     }
 }
@@ -187,8 +187,12 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut scratch = lay_out(plan, &descriptors, &Stepping::of(plan).launches(&descriptors))
-        .map_err(|why| format!("a guest pass's scratch does not fit: {why:?}"))?;
+    let mut scratch = lay_out(
+        plan,
+        &descriptors,
+        &Stepping::of(plan).launches(&descriptors),
+    )
+    .map_err(|why| format!("a guest pass's scratch does not fit: {why:?}"))?;
     alias_reshapes(plan, &mut scratch.values);
 
     let sizes = table_sizes(plan);
