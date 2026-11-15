@@ -148,6 +148,7 @@ pub fn slot_pool(facts: &ChunkFacts) -> SlotPool {
         shapes: pool_shapes(&facts.weights),
         act_chunks: Vec::new(),
         span_on_demand: false,
+        act_span: None,
     })
 }
 

@@ -116,6 +116,16 @@ impl ProgramFires {
     }
 }
 
+/// A pair's own cap on the lanes a fire gives it, as a line shows it:
+/// `FireFacts::max_lanes` of 0 states none, not a cap of no lanes.
+fn own_cap(max_lanes: u32) -> String {
+    if max_lanes == 0 {
+        "no cap of its own".to_owned()
+    } else {
+        max_lanes.to_string()
+    }
+}
+
 impl std::fmt::Display for ProgramFires {
     /// Every open pair with the facts it counts, pair after pair in the
     /// keys' order: what a refused submission is read against
@@ -131,7 +141,10 @@ impl std::fmt::Display for ProgramFires {
                 Some(facts) => write!(
                     f,
                     "{key}: live {live}, a_lane {}, fixed {}, max_lanes {}, laid {:?}",
-                    facts.a_lane, facts.fixed, facts.max_lanes, facts.laid
+                    facts.a_lane,
+                    facts.fixed,
+                    own_cap(facts.max_lanes),
+                    facts.laid
                 )?,
                 None => write!(f, "{key}: live {live}, facts not learned")?,
             }
@@ -143,9 +156,11 @@ impl std::fmt::Display for ProgramFires {
 /// The engine called a submission impossible
 /// ([`::engine::Error::Impossible`]): a fire asked more of the span than
 /// the engine backs, which the rung arithmetic is there to rule out. One
-/// line with what that arithmetic held when it came back: the pool's rung,
-/// the cap fires are cut to, the activation reserved, the rung's own with
-/// the term, and every open pair's facts.
+/// line with what that arithmetic held when it came back: the pool's rung
+/// and the one the engine holds, the cap fires are cut to, the activation
+/// reserved, the rung's own with the term, the term's bytes at that rung,
+/// the span the engine states and the most a rung may take under it, and
+/// every open pair's facts.
 pub fn impossible_submission(engine: usize, error: &::engine::Error) {
     let Some(shared) = crate::store::registry::try_get(0, engine).and_then(|stores| stores.shared)
     else {
@@ -153,13 +168,21 @@ pub fn impossible_submission(engine: usize, error: &::engine::Error) {
     };
     let pool = shared.lock().unwrap();
     let rung = pool.pool().rung();
+    let span = pool
+        .pool()
+        .act_span()
+        .map_or_else(|| "none stated".to_owned(), |chunks| chunks.to_string());
     tracing::error!(
         engine,
         %error,
         rung,
+        told = pool.told(),
         cap = super::fire_cap(engine),
         act_reserved = pool.pool().act_reserved(),
         act_chunks = pool.pool().act_chunks(rung),
+        term_bytes = pool.pool().fire_bytes(rung),
+        act_span_chunks = %span,
+        act_most = pool.act_most(),
         max_lanes = pool.pool().max_lanes(),
         terms = %pool.programs,
         "the engine called a submission impossible"
@@ -203,16 +226,40 @@ impl SharedPool {
             .saturating_sub(room.weight_chunks)
     }
 
+    /// The chunks a rung's activation may take at most, its guest term
+    /// included: what the device has for it ([`Self::act_room`]), and no
+    /// more than the engine states its span covers as it stands
+    /// (`ChunkFacts::act_span_chunks`). Both read here, at each fit:
+    /// nothing is kept of either, so pinned weights that come or go and a
+    /// span the engine states anew ([`SlotPool::set_act_span`]) count from
+    /// the next.
+    #[must_use]
+    pub fn act_most(&self) -> u32 {
+        let room = self.act_room();
+        self.pool.act_span().map_or(room, |span| span.min(room))
+    }
+
+    /// Whether every rung fits unasked: no pair takes anything and the
+    /// engine states no span of its own, so a rung's activation is the
+    /// model's, which the pool was built to hold.
+    fn fits_unasked(&self) -> bool {
+        self.pool.fire().is_zero() && self.pool.act_span().is_none()
+    }
+
     /// The widest rung whose activation, the guest term of the programs
-    /// that can be in a fire included, fits on the device; `None` where
-    /// even the smallest does not. Without a term, the largest.
+    /// that can be in a fire included, is no more than a rung may take
+    /// ([`Self::act_most`]); `None` where even the smallest is. Without a
+    /// term or a stated span, the largest. No rung past it is set aside:
+    /// every goal a raise is planned for is cut to it
+    /// ([`Self::rung_for`], [`RungWalk::step`]), so no engine is asked for
+    /// a rung whose term was not held against its span here.
     #[must_use]
     pub fn widest_fit(&self) -> Option<u32> {
         let rungs = self.pool.rungs();
-        if self.pool.fire().is_zero() {
+        if self.fits_unasked() {
             return rungs.last().copied();
         }
-        let most = self.act_room();
+        let most = self.act_most();
         rungs
             .into_iter()
             .filter(|&rung| self.pool.act_chunks(rung) <= most)
@@ -230,7 +277,7 @@ impl SharedPool {
     /// The widest rung fires may take: [`Self::widest_fit`], the smallest
     /// where none fits (a bind is refused then), `u32::MAX` without rungs.
     pub(super) fn fit_rung(&self) -> u32 {
-        if self.pool.fire().is_zero() {
+        if self.fits_unasked() {
             return u32::MAX;
         }
         self.widest_fit()
@@ -325,13 +372,19 @@ impl SharedPool {
     /// Why a bind of `key` is refused: the smallest rung's activation with
     /// the term the bind would leave, read while the pool holds that term.
     fn refusal(&self, key: FireKey) -> String {
-        let most = self.act_room();
+        let most = self.act_most();
         let smallest = self.pool.act_chunks(0);
         let facts = self.programs.facts.get(&key).copied().unwrap_or_default();
+        let of = match self.pool.act_span() {
+            Some(span) if span <= most => {
+                format!("{span} chunks the engine's activation span covers")
+            }
+            _ => format!("{most} the device has for it"),
+        };
         format!(
             "{key}'s fires need {} bytes and {} bytes a lane beside the model's \
              activation, and the smallest rung would then take {smallest} chunks of the \
-             {most} the device has for it",
+             {of}",
             facts.fixed, facts.a_lane
         )
     }
@@ -388,9 +441,11 @@ pub struct ProgramOpen {
 impl ProgramOpen {
     /// One more bind of `key` can be in a fire: the pair counts from now.
     /// Refused where even the smallest rung's activation, the term
-    /// included, cannot fit on the device (past every chunk but the
-    /// reserved ones and the weights' pinned slots); a narrower fit cuts
-    /// fires to the widest rung that does ([`SharedPool::widest_fit`]).
+    /// included, is more than a rung may take ([`SharedPool::act_most`]:
+    /// every chunk but the reserved ones and the weights' pinned slots,
+    /// and no more than the engine states its span covers); a narrower fit
+    /// cuts fires to the widest rung that does
+    /// ([`SharedPool::widest_fit`]).
     ///
     /// The term grows with each bind, so each builds the table it would
     /// leave: here, on the binding task, outside the pool's lock, from the
@@ -430,7 +485,7 @@ impl ProgramOpen {
                     %key,
                     a_lane = facts.a_lane,
                     fixed = facts.fixed,
-                    max_lanes = facts.max_lanes,
+                    max_lanes = %own_cap(facts.max_lanes),
                     laid = ?facts.laid,
                     "a pair's first bind counts its fire facts"
                 );
@@ -483,7 +538,9 @@ pub trait Mover {
 }
 
 /// Raises `shared`'s activation to `goal`'s (a rung's tokens, given the
-/// pool) where it falls short and nothing else is raising it: planned and
+/// pool; the rung the engine holds where that is wider,
+/// [`SharedPool::raise_at`]) where it falls short and nothing else is
+/// raising it: planned and
 /// taken in one hold of the pool, so no slot is handed out between, and the
 /// engine's copy of what it moves follows before fires pass the rung held
 /// before. The raise taken, if any.
@@ -492,52 +549,74 @@ pub async fn take_raise(
     goal: impl FnOnce(&SharedPool) -> u32,
     mover: &impl Mover,
 ) -> Result<Option<RungEvacuation>, String> {
-    let evacuation = {
+    let taken = {
         let mut pool = shared.lock().unwrap();
         let goal = goal(&pool);
-        (pool.pool().act_chunks(goal) > pool.pool().act_reserved() && pool.copying().is_none())
-            .then(|| pool.plan_raise(goal))
-            .and_then(Result::ok)
-            .filter(|evacuation| pool.raise_applied(evacuation).is_ok())
+        // At the rung the engine holds where that is wider: a raise tells
+        // it no narrower one, and its activation is what falls short.
+        match pool.raise_at(goal) {
+            None => {
+                // The engine holds a rung the terms no longer fit: the
+                // walk brings it down first, behind the retire fence.
+                super::ask_walk(mover.engine());
+                None
+            }
+            Some(at)
+                if pool.pool().act_chunks(at) <= pool.pool().act_reserved()
+                    || pool.copying().is_some() =>
+            {
+                None
+            }
+            Some(at) => {
+                let stood = pool.stands_at(at);
+                pool.plan_raise(at).ok().and_then(|evacuation| {
+                    let notice = pool.raise_applied(&evacuation).ok()?;
+                    Some((evacuation, notice, stood))
+                })
+            }
+        }
     };
-    let Some(evacuation) = evacuation else {
+    let Some((evacuation, notice, stood)) = taken else {
         return Ok(None);
     };
-    if let Err(refused) = carry_raise(shared, &evacuation, mover).await {
+    if let Err(refused) = carry_raise(shared, &evacuation, notice, mover).await {
         // Refused and taken back: the rung's waiters look again, and the
         // caller is told; nothing tries it again on its own wake.
         super::rung_changed(mover.engine());
         return Err(refused);
     }
     super::rung_changed(mover.engine());
-    tracing::info!(
-        rung = evacuation.rung,
-        moved = evacuation.moves.len(),
-        "the activation rung is raised"
+    super::raise_said(
+        mover.engine(),
+        evacuation.rung,
+        evacuation.moves.len(),
+        stood,
     );
     Ok(Some(evacuation))
 }
 
-/// Carries a raise `shared` applied ([`SharedPool::raise_applied`]) to the
-/// engine: where the span is backed on demand, `set_rung` first (the engine
-/// backs its carve for the wider rung), then the copy of what it moves.
+/// Carries a raise `shared` applied to the engine, with the notice the
+/// apply said it owes ([`SharedPool::raise_applied`]): `set_rung` first
+/// where the raise leaves the engine another rung than it holds (it backs
+/// its carve for the wider rung), then the copy of what the raise moves, a
+/// message of its own. A raise at the rung the engine holds sends no
+/// notice, and none at all where it moves nothing: the engine covers a
+/// guest term that grew under its rung inside the bind that grew it.
 /// Either refused, the raise is taken back ([`SharedPool::raise_refused`]),
 /// fires stay at the rung in hand, and an engine that backed the carve is
 /// told the rung went back; the refusal answered. Nothing faults.
 pub async fn carry_raise(
     shared: &Shared,
     evacuation: &RungEvacuation,
+    notice: Option<(u32, u32)>,
     mover: &impl Mover,
 ) -> Result<(), String> {
-    let (waits, tells) = {
-        let pool = shared.lock().unwrap();
-        (pool.raise_waits(evacuation), pool.tells_rungs())
-    };
-    if !waits {
+    if notice.is_none() && evacuation.moves.is_empty() {
         return Ok(());
     }
-    let (from, to) = (evacuation.from, evacuation.rung);
-    if tells && let Err(error) = mover.set_rung(from, to).await {
+    if let Some((from, to)) = notice
+        && let Err(error) = mover.set_rung(from, to).await
+    {
         tracing::warn!(%error, from, to, "a raise's carve was refused; fires stay at the rung in hand");
         shared.lock().unwrap().raise_refused(evacuation);
         return Err(format!(
@@ -549,7 +628,9 @@ pub async fn carry_raise(
     {
         tracing::warn!(%error, "a raise's copy was refused; fires stay at the rung in hand");
         shared.lock().unwrap().raise_refused(evacuation);
-        if tells && let Err(error) = mover.set_rung(to, from).await {
+        if let Some((from, to)) = notice
+            && let Err(error) = mover.set_rung(to, from).await
+        {
             tracing::warn!(%error, from = to, to = from, "a rung notice was refused");
         }
         return Err(format!("the engine refused a raise's copy: {error}"));
@@ -566,9 +647,18 @@ pub async fn carry_raise(
 /// asked of `funder` as a rung raise's is, then the raise taken: every
 /// state chunk in the widened span moved below it and the engine's copy
 /// done before this returns. Where fires are cut wider than the widest
-/// rung that fits, it waits on the walk to cut them
-/// ([`super::SharedGrow`]). What a bind of a program whose term raised the
-/// span waits on before it is sent; an `Err` refuses the bind.
+/// rung that fits, or the engine holds a wider rung than that
+/// ([`SharedPool::told_unfit`]), it waits on the walk to cut them and
+/// bring the engine down ([`super::SharedGrow`], asked to look at once:
+/// [`super::ask_walk`]). The engine covers the bind's term at the rung it
+/// holds, so the room is set aside at that rung where it is wider than
+/// the fires' ([`SharedPool::raise_at`]), and the bind is sent only once
+/// that rung fits with the term. What a bind of a program whose term
+/// raised the span waits on before it is sent; an `Err` refuses the bind.
+///
+/// At a rung the engine holds, the raise the term asks sends the engine
+/// no notice ([`carry_raise`]); state it moves out of the span goes as its
+/// own message.
 pub async fn fund_span(
     shared: &Shared,
     cap: impl Fn() -> u32,
@@ -581,23 +671,41 @@ pub async fn fund_span(
         let watch = super::rung_watch(engine);
         tokio::pin!(watch);
         watch.as_mut().enable();
-        let (short, copying, goal, capped) = {
+        let (short, copying, goal, cut) = {
             let pool = shared.lock().unwrap();
             let rows = cap();
-            let goal = pool.rung_for(rows);
+            let fires = pool.rung_for(rows);
+            // Set aside at the rung the engine holds where that is wider:
+            // it covers the bind's term there.
+            let goal = pool.raise_at(fires);
+            let short = goal.map_or(0, |goal| {
+                pool.pool()
+                    .act_chunks(goal)
+                    .saturating_sub(pool.pool().act_reserved())
+            });
             (
-                pool.span_short(rows),
+                short,
                 pool.copying().is_some(),
                 goal,
-                rows <= pool.lifted(goal),
+                rows <= pool.lifted(fires),
             )
         };
-        if short == 0 && !copying && capped {
+        let Some(goal) = goal else {
+            // The engine holds a rung the terms no longer fit: the walk
+            // brings it down, and tells the rung.
+            super::ask_walk(engine);
+            watch.await;
+            continue;
+        };
+        if short == 0 && !copying && cut {
             return Ok(());
         }
         if copying || short == 0 {
             // A raise's copy is the engine's to take, or the walk is to cut
             // fires to the widest rung that fits: either tells the rung.
+            if !cut {
+                super::ask_walk(engine);
+            }
             watch.await;
             continue;
         }

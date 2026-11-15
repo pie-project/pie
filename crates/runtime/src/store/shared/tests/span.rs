@@ -55,7 +55,14 @@ fn loaded_on_demand() -> (SharedPool, FakeEngine) {
 /// takes it (the engine told), nothing held yet.
 fn on_demand_pool() -> (SharedPool, FakeEngine) {
     let (mut pool, engine) = loaded_on_demand();
-    pool.pool_mut().set_rung(2048).unwrap();
+    let evacuation = pool.plan_raise(2048).unwrap();
+    assert_eq!(
+        pool.raise_applied(&evacuation).unwrap(),
+        Some((16, 2048)),
+        "the engine is told the rung it did not hold"
+    );
+    pool.raise_copied(0);
+    assert_eq!(pool.told(), 2048);
     (pool, engine)
 }
 
