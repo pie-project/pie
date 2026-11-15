@@ -379,6 +379,7 @@ impl HostTier {
     /// `swap`, behind what it has enqueued. Returns the event the last copy
     /// lands at on the stream (a fire naming one of the device slots waits
     /// on it); the bytes reach the tier on the landing thread.
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_host(
         &mut self,
         swap: *mut core::ffi::c_void,
@@ -404,6 +405,7 @@ impl HostTier {
     /// Copies each `(tier offset, device address, bytes)` to the device on
     /// `swap`, once every batch writing those slots has landed. Returns the
     /// event the last copy lands at on the stream.
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_device(
         &mut self,
         swap: *mut core::ffi::c_void,
@@ -433,7 +435,7 @@ impl HostTier {
     }
 
     /// The tier's bytes at `offset`, once every batch writing them landed.
-    pub fn slice(&self, offset: u64, len: usize) -> Result<&mut [u8]> {
+    pub fn slice(&mut self, offset: u64, len: usize) -> Result<&mut [u8]> {
         let at = self.check(offset, len)?;
         self.wait_for([(offset / self.chunk_bytes.max(1)) as u32])?;
         // SAFETY: inside the mapping (checked), and no batch writes it now.

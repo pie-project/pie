@@ -356,7 +356,6 @@ fn check(model: &str) {
 }
 
 fn check_fixture(model: &str, fixture: &Fixture) {
-    let fixture = fixture;
     let (whole, _) = serve(fixture, Mode::Whole);
     for mode in [
         Mode::Host,
@@ -458,6 +457,7 @@ fn a_mixtures_dense_experts_serve_the_dense_logits_dsv4() {
 /// charges it, Metal heaps and wired pages included), in MiB.
 #[allow(unsafe_code)]
 fn memory_mib() -> (u64, u64) {
+    // SAFETY: `rusage_info_v2` is a plain C struct of integers; zero is a valid value.
     let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
     // SAFETY: a v2 record the call fills for this process.
     let ok = unsafe {

@@ -633,7 +633,7 @@ impl Shell {
             u64::from(tokens.div_ceil(boot.page_size.max(1))).clamp(1, least)
         });
         let fitted = |one_slot: u64| {
-            engine::fit::pool_for(boot.kv_budget, boot.slots, one_slot, room, &demand)
+            engine::fit::pool_for(boot.kv_budget, boot.slots, one_slot, room, demand)
         };
         let (fit, slots) = match fitted(seat) {
             Ok((fit, slots)) if fit >= least => (fit, slots),

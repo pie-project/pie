@@ -916,7 +916,7 @@ impl Cache {
         let built = ahead.remove(&(key.clone(), region_index)).or_else(|| {
             self.ahead
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("ahead lock poisoned")
                 .remove(&(key.clone(), region_index))
         });
         let cubin = match built {
@@ -979,7 +979,7 @@ fn side_by_side(jobs: &[(String, u32, &str, &str)], architecture: &str) -> Ahead
             if let Ok(cubin) = compile(source, architecture) {
                 built
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .expect("built lock poisoned")
                     .insert((key.clone(), *region_index), cubin);
             }
         }
@@ -993,9 +993,7 @@ fn side_by_side(jobs: &[(String, u32, &str, &str)], architecture: &str) -> Ahead
             }
         });
     }
-    built
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    built.into_inner().expect("built lock poisoned")
 }
 
 const MAX_AHEAD: usize = 4096;
@@ -1038,9 +1036,7 @@ pub fn compile_ahead(
         }
         return;
     }
-    let mut held = ahead
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut held = ahead.lock().expect("ahead lock poisoned");
     if held.len() + built.len() > MAX_AHEAD {
         held.clear();
     }

@@ -72,8 +72,8 @@ impl ResidencyPlanner {
         let inner = self.lock_inner();
         let queue = inner
             .queue
-            .iter()
-            .map(|(_, waiter)| PlannerQueueEntry {
+            .values()
+            .map(|waiter| PlannerQueueEntry {
                 rs: waiter.rs_need(),
             })
             .collect();

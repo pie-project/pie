@@ -314,7 +314,7 @@ pub(super) fn census(trace: &Trace, max_tokens: u32, tma: bool) -> Vec<Group> {
         // In the bank's order, as an engine lays a slot: back to back, or
         // each plane on its boundary where the profile maps windows.
         let (atom_bytes, boundary) = if tma {
-            let params: Vec<usize> = qs.iter().copied().collect();
+            let params: Vec<usize> = qs.to_vec();
             qs.iter().fold((0u64, 1u64), |(at, every), &q| {
                 let param = &trace.params[q];
                 let held = param.shape.first().copied().unwrap_or(1).max(1);
