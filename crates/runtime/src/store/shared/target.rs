@@ -117,7 +117,7 @@ impl SharedGrow {
     /// ask of a fire ([`super::want_rows`]), the smallest while none asks
     /// past it, until there or until a step has to wait: caps fires, lowers
     /// the pool's rung once no wider fire is in flight, or raises it, the
-    /// engine first copying the state out of the larger span. A raise short
+    /// idle cache in the larger span cleared first. A raise short
     /// of room waits on the room the asking pass has the planner free, the
     /// walk looking again each poll.
     ///
@@ -152,9 +152,9 @@ impl SharedGrow {
             let (step, goal) = {
                 let mut pool = self.shared.lock().unwrap();
                 pool.pool_mut().retire_through(retired);
-                // A raise's copy is still the engine's to take: nothing
-                // moves until it has.
-                if pool.copying().is_some() {
+                // A raise's carve is still the engine's to back: nothing
+                // moves on until it has.
+                if pool.raising().is_some() {
                     return;
                 }
                 let goal = pool.rung_for(self.walk_rows());
@@ -194,7 +194,7 @@ impl SharedGrow {
                     retired,
                 );
                 // A raise is taken in the hold it was planned in: no slot is
-                // handed out between, and the engine's copy follows.
+                // handed out between, and the engine's notice follows.
                 let blocked = self.raise_blocked.load(Ordering::Acquire);
                 // A raise that finds idle cache in its span asks it cleared:
                 // nothing opens there for cache from now, and its owner lets
@@ -213,11 +213,11 @@ impl SharedGrow {
                     // A raise refused for room is not tried again until
                     // room is freed.
                     Ok(RungStep::Raise { .. }) | Err(_) if blocked => Ok(RungStep::Wait),
-                    Ok(RungStep::Raise { rung, evacuation }) => {
+                    Ok(RungStep::Raise { rung, raise }) => {
                         let stood = pool.stands_at(rung);
-                        pool.raise_applied(&evacuation).map(|notice| {
+                        pool.raise_applied(&raise).map(|notice| {
                             owed = (notice, stood);
-                            RungStep::Raise { rung, evacuation }
+                            RungStep::Raise { rung, raise }
                         })
                     }
                     // A lower before the patience is out.
@@ -322,25 +322,23 @@ impl SharedGrow {
                         planner.pages_freed();
                     }
                 }
-                RungStep::Raise { rung, evacuation } => {
-                    // The engine backs its carve (on demand) and copies what
-                    // the raise moves; refused, the raise is taken back,
-                    // fires stay cut to the rung in hand, and no raise is
-                    // tried again until room is freed.
+                RungStep::Raise { rung, .. } => {
+                    // The engine backs its carve (on demand); refused, the
+                    // raise is taken back, fires stay cut to the rung in
+                    // hand, and no raise is tried again until room is
+                    // freed. Nothing moves.
                     let mover = super::programs::LaneMover {
                         engine: self.engine,
-                        epoch_now: || self.epochs().0,
                     };
                     if let Err(refused) =
-                        super::programs::carry_raise(&self.shared, &evacuation, owed.0, &mover)
-                            .await
+                        super::programs::carry_raise(&self.shared, owed.0, &mover).await
                     {
                         tracing::debug!(engine = self.engine, %refused, "the walk's raise waits for room");
                         self.raise_blocked.store(true, Ordering::Release);
                         super::rung_changed(self.engine);
                         return;
                     }
-                    super::raise_said(self.engine, rung, evacuation.moves.len(), owed.1);
+                    super::raise_said(self.engine, rung, owed.1);
                     super::rung_changed(self.engine);
                 }
             }
@@ -779,7 +777,9 @@ mod tests {
         pool.fire_facts_learned(
             key,
             &::engine::FireFacts {
-                fixed: 55 * pool.pool().chunk_bytes(),
+                // 2048's 12 and 8 are past the top rung's span of 12;
+                // 256's 4 and 8 fit it.
+                fixed: 8 * pool.pool().chunk_bytes(),
                 ..::engine::FireFacts::default()
             },
         );

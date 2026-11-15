@@ -17,14 +17,6 @@ use crate::store::shared::programs::{Mover, take_raise};
 struct Lane(Arc<Mutex<FakeEngine>>);
 
 impl Mover for Lane {
-    async fn evacuate(&self, evacuation: EngineEvacuation) -> Result<(), String> {
-        self.0
-            .lock()
-            .unwrap()
-            .evacuate(&evacuation)
-            .map_err(|error| error.to_string())
-    }
-
     async fn set_rung(&self, from: u32, to: u32) -> Result<(), String> {
         self.0
             .lock()
@@ -35,10 +27,6 @@ impl Mover for Lane {
 
     fn engine(&self) -> usize {
         49
-    }
-
-    fn epoch_now(&self) -> u64 {
-        0
     }
 }
 
@@ -56,13 +44,13 @@ fn loaded_on_demand() -> (SharedPool, FakeEngine) {
 /// takes it (the engine told), nothing held yet.
 pub(super) fn on_demand_pool() -> (SharedPool, FakeEngine) {
     let (mut pool, engine) = loaded_on_demand();
-    let evacuation = pool.plan_raise(2048).unwrap();
+    let raise = pool.plan_raise(2048).unwrap();
     assert_eq!(
-        pool.raise_applied(&evacuation).unwrap(),
+        pool.raise_applied(&raise).unwrap(),
         Some((16, 2048)),
         "the engine is told the rung it did not hold"
     );
-    pool.raise_copied(0);
+    pool.raise_carved();
     assert_eq!(pool.told(), 2048);
     (pool, engine)
 }
@@ -180,9 +168,8 @@ fn a_span_segment_goes_back_once_the_rung_is_raised_past_it() {
             .is_err_and(|error| error.span_cached())
     );
     clear_span_cache(&mut pool, &cached, 10);
-    let evacuation = pool.plan_raise(2048).unwrap();
-    assert!(evacuation.moves.is_empty(), "no state moves");
-    pool.apply_rung(&evacuation, 11).unwrap();
+    let raise = pool.plan_raise(2048).unwrap();
+    pool.apply_rung(&raise).unwrap();
     assert!(state_chunks(&pool, &all).iter().all(|&chunk| chunk < 52));
     // Nothing fenced: no copy reads the span.
     assert_eq!(pool.pool().span_to_release(), Some(0));
@@ -271,63 +258,6 @@ fn a_refused_commit_span_lends_nothing() {
     assert_eq!(pool.pool().span_committed(), 1);
 }
 
-/// A raise whose copy the engine refuses (the live state a guest term's
-/// activation takes below the top rung's span: the one raise that moves
-/// any) is taken back: the state where it lay (the engine's table
-/// unchanged), the activation the rung in hand's, no fence left, and a
-/// later raise succeeds.
-#[test]
-fn a_refused_raise_is_taken_back() {
-    let (mut pool, mut engine) = on_demand_pool();
-    assert_eq!(
-        walk_segments(&mut pool, 6, 0, &mut engine),
-        Retarget::Reached
-    );
-    // Six chunks the guests keep standing: the largest rung's activation
-    // reaches 46, past the span's base at 52 and into the prefix (the span
-    // segment under 52 is backed on demand, so no state lies in 48..52).
-    pool.pool_mut().set_standing(6 * CHUNK);
-    pool.lower_rung(256).unwrap();
-    assert_eq!(
-        walk_segments(&mut pool, 7, 0, &mut engine),
-        Retarget::Reached
-    );
-    let all = pool
-        .take_records(pool.records_available() as usize)
-        .unwrap();
-    pool.give_records(&all[..all.len() / 2]);
-    pool.pool_mut().retire_through(u64::MAX);
-    let kept = &all[all.len() / 2..];
-    let before = state_chunks(&pool, kept);
-    let evacuation = pool.plan_raise(2048).unwrap();
-    assert!(!evacuation.moves.is_empty());
-    pool.raise_applied(&evacuation).unwrap();
-    assert_eq!(pool.copying(), Some(256));
-    engine.refuse = true;
-    assert!(
-        engine
-            .evacuate(&SharedPool::rung_moves(&evacuation))
-            .is_err()
-    );
-    pool.raise_refused(&evacuation);
-    assert_eq!(pool.rung(), 256, "the rung in hand");
-    assert_eq!(pool.pool().act_reserved(), 4 + 6);
-    assert!(pool.copying().is_none());
-    assert_eq!(state_chunks(&pool, kept), before, "the state where it lay");
-    assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
-    pool.pool().check();
-    // Tried again with the engine willing: it lands.
-    engine.refuse = false;
-    let evacuation = pool.plan_raise(2048).unwrap();
-    pool.raise_applied(&evacuation).unwrap();
-    engine
-        .evacuate(&SharedPool::rung_moves(&evacuation))
-        .unwrap();
-    pool.raise_copied(1);
-    assert_eq!(pool.rung(), 2048);
-    assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
-}
-
 /// On an on-demand pool a raise that moves nothing still reaches the
 /// engine (`set_rung`), which backs its carve there; refused, the raise is
 /// taken back and fires stay at the rung in hand. With the span backed from
@@ -353,7 +283,7 @@ async fn a_move_free_raise_reaches_an_on_demand_engine_and_can_be_refused() {
         let pool = shared.lock().unwrap();
         assert_eq!(pool.rung(), 256, "the rung in hand");
         assert_eq!(pool.pool().act_reserved(), 4);
-        assert!(pool.copying().is_none());
+        assert!(pool.raising().is_none());
         pool.pool().check();
     }
     assert!(engine.lock().unwrap().calls.is_empty());
@@ -361,12 +291,11 @@ async fn a_move_free_raise_reaches_an_on_demand_engine_and_can_be_refused() {
     // Backed: the engine hears it before any fire of the wider rung.
     engine.lock().unwrap().refuse = false;
     let taken = take_raise(&shared, |_| 2048, &lane).await.unwrap();
-    let evacuation = taken.expect("raised");
-    assert!(evacuation.moves.is_empty(), "nothing to move");
+    taken.expect("raised");
     assert_eq!(engine.lock().unwrap().calls, [Call::Rung(256, 2048)]);
     let pool = shared.lock().unwrap();
     assert_eq!(pool.rung(), 2048);
-    assert!(pool.copying().is_none());
+    assert!(pool.raising().is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]
