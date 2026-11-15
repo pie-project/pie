@@ -626,6 +626,8 @@ impl Plane {
         carve: &GuestCarve,
         arm: usize,
     ) -> Result<Vec<(InstanceId, Launched)>> {
+        #[cfg(target_vendor = "apple")]
+        crate::device::ctx::gputs::label("guest");
         let mut results = Vec::with_capacity(ids.len());
         let mut by_program: BTreeMap<ProgramId, Vec<InstanceId>> = BTreeMap::new();
         let mut refused = false;
@@ -712,6 +714,8 @@ impl Plane {
                                 frame.next_pass()?;
                             }
                         }
+                        #[cfg(target_vendor = "apple")]
+                        crate::device::ctx::gputs::label("member");
                         for prepared in group {
                             // PROBE (M5): with `PIE_MEMBER_PASS` set, a pass
                             // boundary before each member's kernels, where
