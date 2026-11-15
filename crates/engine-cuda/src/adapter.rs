@@ -1,7 +1,7 @@
-use eta_compiler::codegen::launch::{LaunchPackage, ValueOrigin};
+use eta_compiler::codegen::launch::{LaunchOp, LaunchPackage, ValueOrigin};
 use eta_ir::op::tags;
 
-use crate::blob::Site;
+use crate::blob::{Site, role_of};
 use crate::error::{Fault, Result};
 use crate::weights::BankSeat;
 
@@ -53,9 +53,9 @@ impl Sink {
     }
 }
 
-pub fn sink_of(package: &LaunchPackage) -> Result<Option<Sink>> {
+pub fn sinks_of(package: &LaunchPackage) -> Result<Vec<Sink>> {
     let Some(stage) = package.plans.iter().position(|plan| plan.needs.lora) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let refuse = |why: String| Fault::Adapter {
         bank: LORA.to_string(),
@@ -69,10 +69,10 @@ pub fn sink_of(package: &LaunchPackage) -> Result<Option<Sink>> {
             package.stages.len()
         ))
     })?;
-    let call = body
+    let calls: Vec<_> = body
         .ops
         .iter()
-        .find(|op| {
+        .filter(|op| {
             op.tag == tags::SINK_CALL
                 && package
                     .names
@@ -80,12 +80,24 @@ pub fn sink_of(package: &LaunchPackage) -> Result<Option<Sink>> {
                     .map(String::as_str)
                     == Some(LORA)
         })
-        .ok_or_else(|| {
-            refuse(format!(
-                "is what stage {stage}'s plan declares it needs, and no `sink_call` in \
-                 that stage's body names it"
-            ))
-        })?;
+        .collect();
+    if calls.is_empty() {
+        return Err(refuse(format!(
+            "is what stage {stage}'s plan declares it needs, and no `sink_call` in \
+             that stage's body names it"
+        )));
+    }
+    calls
+        .into_iter()
+        .map(|call| sink_at(package, stage, call))
+        .collect()
+}
+
+fn sink_at(package: &LaunchPackage, stage: usize, call: &LaunchOp) -> Result<Sink> {
+    let refuse = |why: String| Fault::Adapter {
+        bank: LORA.to_string(),
+        why,
+    };
     let (weights, sites_arg) = match call.args.as_slice() {
         [a, b, sites] => (vec![(Role::A, *a), (Role::B, *b)], *sites),
         [_, _] => {
@@ -139,11 +151,20 @@ pub fn sink_of(package: &LaunchPackage) -> Result<Option<Sink>> {
         .find(|declared| declared.id == sites_arg)
         .filter(|declared| declared.source == ValueOrigin::Const)
         .map_or(0, |declared| declared.literal_bits);
-    Ok(Some(Sink {
+    Ok(Sink {
         stage,
         planes,
         sites,
-    }))
+    })
+}
+
+pub fn unseeded(seats: &[BankSeat], built: &[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> {
+    seats
+        .iter()
+        .filter(|seat| matches!(role_of(&seat.name), "lora_a" | "lora_b"))
+        .filter(|seat| built.iter().all(|(name, _)| *name != seat.name))
+        .map(|seat| (seat.name.clone(), vec![0; seat.slot as usize]))
+        .collect()
 }
 
 pub fn planes_of(
@@ -390,8 +411,9 @@ mod tests {
     }
 
     fn the_sink_answers_its_two_channels_in_role_order() {
-        let sink = sink_of(&package_with(vec![0, 1, 2]))
+        let sink = sinks_of(&package_with(vec![0, 1, 2]))
             .expect("a readable sink")
+            .pop()
             .expect("a package that declares one");
         assert_eq!(sink.stage, 0);
         assert_eq!(sink.planes, vec![(Role::A, 4), (Role::B, 5)]);

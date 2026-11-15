@@ -338,13 +338,17 @@ fn adapter_of<B: Host>(
     instance: InstanceId,
     seeds: &[(u32, Vec<u8>)],
 ) -> EngineResult<Option<crate::adapter::Binding>> {
-    let Some(sink) = crate::adapter::sink_of(package).map_err(fault)? else {
+    let sinks = crate::adapter::sinks_of(package).map_err(fault)?;
+    if sinks.is_empty() {
         return Ok(None);
-    };
+    }
     let seats = shell.bank_seats();
-    let site = sink.site().map_err(fault)?;
     let mut built: Vec<(String, Vec<u8>)> = Vec::new();
-    for (role, channel) in &sink.planes {
+    for (sink, (role, channel)) in sinks
+        .iter()
+        .flat_map(|sink| sink.planes.iter().map(move |plane| (sink, plane)))
+    {
+        let site = sink.site().map_err(fault)?;
         let wire = seeds
             .iter()
             .find(|(seeded, _)| seeded == channel)
@@ -361,6 +365,7 @@ fn adapter_of<B: Host>(
             })?;
         built.extend(crate::adapter::planes_of(*role, site, wire, &seats).map_err(fault)?);
     }
+    built.extend(crate::adapter::unseeded(&seats, &built));
     let planes: Vec<crate::weights::AdapterPlane<'_>> = built
         .iter()
         .map(|(bank, bytes)| crate::weights::AdapterPlane {

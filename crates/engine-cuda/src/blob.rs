@@ -204,10 +204,21 @@ pub enum Site {
     O,
     GateUp,
     Down,
+    Gate,
+    Up,
 }
 
 impl Site {
-    pub const ALL: [Site; 6] = [Site::Q, Site::K, Site::V, Site::O, Site::GateUp, Site::Down];
+    pub const ALL: [Site; 8] = [
+        Site::Q,
+        Site::K,
+        Site::V,
+        Site::O,
+        Site::GateUp,
+        Site::Down,
+        Site::Gate,
+        Site::Up,
+    ];
 
     #[must_use]
     pub const fn spelled(self) -> &'static str {
@@ -218,6 +229,8 @@ impl Site {
             Site::O => "o",
             Site::GateUp => "gate_up",
             Site::Down => "down",
+            Site::Gate => "gate",
+            Site::Up => "up",
         }
     }
 
@@ -230,6 +243,8 @@ impl Site {
             Site::O => 1 << 3,
             Site::GateUp => 1 << 4,
             Site::Down => 1 << 5,
+            Site::Gate => 1 << 6,
+            Site::Up => 1 << 7,
         }
     }
 
@@ -279,6 +294,7 @@ fn parsed(bank: &str) -> Option<(u64, Option<Site>, &str)> {
     }
     let site = Site::parse(last)?;
     let (rest, _) = head.rsplit_once('.')?;
+    let rest = rest.strip_suffix(".lora").unwrap_or(rest);
     let layer = numbered(rest.rsplit('.').next()?)?;
     Some((layer, Some(site), role))
 }

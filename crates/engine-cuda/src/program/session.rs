@@ -126,16 +126,11 @@ impl Session {
             shadow,
             device: PortMask::NONE,
             mask_on_device: false,
-            sink_planes: crate::adapter::sink_of(&plan.package)
-                .ok()
-                .flatten()
-                .map(|sink| {
-                    sink.planes
-                        .iter()
-                        .map(|&(_, channel)| channel as usize)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            sink_planes: crate::adapter::sinks_of(&plan.package)
+                .unwrap_or_default()
+                .iter()
+                .flat_map(|sink| sink.planes.iter().map(|&(_, channel)| channel as usize))
+                .collect(),
         };
         for (channel, wire) in seeds {
             if shadow

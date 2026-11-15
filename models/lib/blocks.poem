@@ -3,7 +3,7 @@
 # `kv_heads`, `head_dim`, `theta`, `sm_scale`, `eps`); `w` a layer's
 # weights under their usual names.
 
-def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_norm = None, biased = False):
+def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_norm = None, biased = False, adapt = None):
     """Grouped-query attention over `w.kv`, the layer's per-token keys and
     values state, out through `w.o`. `biased` adds `w.q_bias`,
     `w.k_bias` and `w.v_bias`; `qk_norm` norms q and k by `w.q_norm` and
@@ -12,6 +12,8 @@ def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_
     head."""
     d = m.head_dim
     q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
+    if adapt != None:
+        q, k, v = adapt("q", x, q), adapt("k", x, k), adapt("v", x, v)
     if biased:
         q, k, v = ops.elemwise.add_bias(w.q_bias, q), ops.elemwise.add_bias(w.k_bias, k), ops.elemwise.add_bias(w.v_bias, v)
     if qk_norm == "head":
@@ -27,9 +29,14 @@ def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_
     # Each lane by its kind; a lane may bring its own mask. A lane capturing
     # scores reads them out too.
     o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
-    return ops.linear.matmul(o, w.o)
+    out = ops.linear.matmul(o, w.o)
+    return out if adapt == None else adapt("o", o, out)
 
-def swiglu(x, w):
+def swiglu(x, w, adapt = None):
     """The SwiGLU MLP through `w.gate`, `w.up` and `w.down`."""
     gate, up = ops.linear.matmul(x, w.gate), ops.linear.matmul(x, w.up)
-    return ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.down)
+    if adapt != None:
+        gate, up = adapt("gate", x, gate), adapt("up", x, up)
+    h = ops.linear.glu(gate, gating.swiglu(), up = up)
+    out = ops.linear.matmul(h, w.down)
+    return out if adapt == None else adapt("down", h, out)

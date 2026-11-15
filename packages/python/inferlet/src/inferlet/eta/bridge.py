@@ -515,7 +515,7 @@ def _lane_outputs(switches: tuple[tuple[str, str], ...]) -> list[OutputDecl]:
 # ForwardPass
 # ---------------------------------------------------------------------------
 
-_SITE_BITS = {"q": 1, "k": 2, "v": 4, "o": 8, "gate_up": 16, "down": 32}
+_SITE_BITS = {"q": 1, "k": 2, "v": 4, "o": 8, "gate_up": 16, "down": 32, "gate": 64, "up": 128}
 
 
 class ForwardPass:
@@ -661,7 +661,7 @@ class ForwardPass:
     # -- adapters ------------------------------------------------------------
 
     def adapter(self, site: str, f: Callable[["AdapterExpr", "AdapterExpr"], "AdapterExpr"]) -> None:
-        """Attach a PEFT adapter at `site` (`"q"|"k"|"v"|"o"|"gate_up"|"down"`):
+        """Attach a PEFT adapter at `site` (`"q"|"k"|"v"|"o"|"gate"|"up"|"gate_up"|"down"`):
         `f(x, y)` returns the corrected expression. Lowers the LoRA
         (`y + mm(b, mm(a, x))`), IA3 (`scale(y, l)`) and DoRA forms."""
         from . import intrinsics as _intr
@@ -699,13 +699,13 @@ class ForwardPass:
                     _intr.kernel.lora(a.read(), b.read(), Tensor.constant(bit, Dtype.U32))
                     _intr.kernel.adapter_scale(l.read(), Tensor.constant(bit, Dtype.U32))
 
-                self.prologue(body)
+                self._chain_prologue(body)
                 return
             if inner.kind == "y":
                 if self._adapter_scale_sites & bit:
                     raise InferletError(f"adapter: site {site} already carries a scale on this pass")
                 self._adapter_scale_sites |= bit
-                self.prologue(lambda: _intr.kernel.adapter_scale(l.read(), Tensor.constant(bit, Dtype.U32)))
+                self._chain_prologue(lambda: _intr.kernel.adapter_scale(l.read(), Tensor.constant(bit, Dtype.U32)))
                 return
         lr = is_lowrank(expr)
         if lr is None:
@@ -714,7 +714,19 @@ class ForwardPass:
         if self._adapter_lowrank_sites & bit:
             raise InferletError(f"adapter: site {site} already carries an adapter on this pass")
         self._adapter_lowrank_sites |= bit
-        self.prologue(lambda: _intr.kernel.lora(a.read(), b.read(), Tensor.constant(bit, Dtype.U32)))
+        self._chain_prologue(lambda: _intr.kernel.lora(a.read(), b.read(), Tensor.constant(bit, Dtype.U32)))
+
+    def _chain_prologue(self, body: Callable[[], None]) -> None:
+        first = next((b for s, b in self._stages if s == Stage.PROLOGUE), None)
+        if first is None:
+            self.prologue(body)
+            return
+
+        def both() -> None:
+            first()
+            body()
+
+        self.prologue(both)
 
     # -- stages ---------------------------------------------------------------
 
