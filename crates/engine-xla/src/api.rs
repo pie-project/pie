@@ -596,13 +596,19 @@ impl Engine for Xla {
         Ok(())
     }
 
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+    fn register_program(
+        &mut self,
+        registration: &ProgramRegistration,
+        built: engine::ProgramBuilt,
+    ) -> EngineResult<ProgramId> {
         let device = self.shell.as_ref().map(|shell| shell.device());
         let registered = self
             .programs
             .register(registration, device)
             .map_err(refusal);
-        self.refused(registered)
+        let id = self.refused(registered)?;
+        built(Ok(()));
+        Ok(id)
     }
 
     /// The rings an instance keeps in the pool's `Channel` slots: its

@@ -225,11 +225,14 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
         .expect("the epilogue binds");
     let stages = eta_compiler::plan::compile_bound(&bound);
     let program = engine
-        .register_program(&ProgramRegistration {
-            program_hash: 0x0e7,
-            launch: eta_compiler::codegen::launch::build(&bound, &stages),
-            ..Default::default()
-        })
+        .register_program(
+            &ProgramRegistration {
+                program_hash: 0x0e7,
+                launch: eta_compiler::codegen::launch::build(&bound, &stages),
+                ..Default::default()
+            },
+            Box::new(|built| built.expect("the program builds")),
+        )
         .expect("the program registers");
     let chunks = &loaded.caps.chunks;
     let mut slots =

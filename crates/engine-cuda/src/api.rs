@@ -1028,11 +1028,14 @@ impl Engine for Cuda {
         self.refused(submitted)
     }
 
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        let registered = self
-            .loaded_mut()
-            .and_then(|shell| shell.register_program(registration).map_err(fault));
-        self.refused(registered)
+    fn register_program(
+        &mut self,
+        registration: &ProgramRegistration,
+        built: engine::ProgramBuilt,
+    ) -> EngineResult<ProgramId> {
+        let id = self.register(registration)?;
+        built(Ok(()));
+        Ok(id)
     }
 
     fn settles_asynchronously(&self) -> bool {
@@ -1305,6 +1308,17 @@ impl Cuda {
             engine::Engine::live(self).tally(engine::live::Tally::Refused, 1);
         }
         result
+    }
+
+    /// Registers `registration` and builds it, inside the call.
+    pub(crate) fn register(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<ProgramId> {
+        let registered = self
+            .loaded_mut()
+            .and_then(|shell| shell.register_program(registration).map_err(fault));
+        self.refused(registered)
     }
 
     fn submit_frame(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {

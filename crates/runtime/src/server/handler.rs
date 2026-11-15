@@ -66,6 +66,22 @@ impl Session {
                             serde_json::Value::from(each),
                         );
                     }
+                    // Where each engine met its unbuilt ones: a kernel of
+                    // the model, a guest program, or both.
+                    let sites: Vec<Vec<&str>> = lives
+                        .iter()
+                        .map(|live| {
+                            ::engine::live::Unbuilt::ALL
+                                .into_iter()
+                                .filter(|&site| live.unbuilt_at(site))
+                                .map(::engine::live::Unbuilt::name)
+                                .collect()
+                        })
+                        .collect();
+                    stats.insert(
+                        format!("{}.engine.unbuilt_at_by_engine", model_name),
+                        serde_json::Value::from(sites),
+                    );
 
                     let inf = crate::scheduler::get_stats().await;
                     stats.insert(

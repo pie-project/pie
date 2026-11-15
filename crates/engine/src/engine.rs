@@ -41,6 +41,10 @@ pub struct KvWrites {
 
 pub type CompletionSink = std::sync::Arc<dyn Fn(StepDone, StepOutcome) + Send + Sync>;
 
+/// Told once when a registration's build ends: `Ok(())` when the
+/// program can fire with nothing left to build, or why it cannot.
+pub type ProgramBuilt = Box<dyn FnOnce(Result<()>) + Send>;
+
 /// A group of a tapped lane's pages, read out: each page's spans of group
 /// `group` (of [`Engine::tap_groups`]), page after page; or why not. A tap
 /// that fails says so once, for its first group not told.
@@ -112,8 +116,46 @@ pub trait Engine: Send {
 
     fn load(&mut self, request: LoadRequest) -> Result<Loaded>;
 
-    fn register_program(&mut self, registration: &ProgramRegistration) -> Result<ProgramId> {
-        let _ = registration;
+    /// Registers a guest program. Registration is the program's own
+    /// ready: once `built` has been told `Ok`, every stage, module,
+    /// pipeline and layout a bind or a fire of this program can meet
+    /// exists, for every rung the engine stated at load. Nothing of the
+    /// program is built afterwards: a bind never compiles, a fire never
+    /// compiles and never waits on a build. What the program is — its
+    /// code — is made here; what an instance holds — its slots and the
+    /// bindings over them — is made at bind.
+    ///
+    /// The call is short. It checks and adopts the registration, starts
+    /// the build, and returns the id the program will have. The id names
+    /// nothing until `built` has been told `Ok`: the runtime gives it to
+    /// nobody before that, so no bind, prepare or fire ever sees a
+    /// program that is still building, and an engine keeps no such state
+    /// for them to ask about. An engine that can build off the lane's
+    /// thread does, and tells `built` from wherever the build ends; the
+    /// lane goes on firing meanwhile, and only the registering process
+    /// waits. An engine that cannot builds inside the call and tells
+    /// `built` before it returns.
+    ///
+    /// When the call returns an id, `built` is told exactly once, by an
+    /// event of the build, never by asking again. When the call returns
+    /// `Err`, `built` is dropped untold: the program was not registered
+    /// and holds nothing; the same holds when `built` is told `Err`. A
+    /// failed device build tells `built` `Err` and the engine keeps
+    /// nothing of it, so the same `program_hash` can be registered again.
+    /// A registration whose `program_hash` is one already built builds
+    /// nothing and is told `Ok` at once. One whose build is still running
+    /// is given the same id and told when that one build ends; no second
+    /// build is started. A bind or a fire that meets something of a
+    /// registered program unbuilt is an engine bug: it is refused by name
+    /// and counted ([`Tally::Unbuilt`]), never built on the spot.
+    ///
+    /// [`Tally::Unbuilt`]: crate::live::Tally::Unbuilt
+    fn register_program(
+        &mut self,
+        registration: &ProgramRegistration,
+        built: ProgramBuilt,
+    ) -> Result<ProgramId> {
+        let _ = (registration, built);
         Err(self.unsupported("register_program"))
     }
 

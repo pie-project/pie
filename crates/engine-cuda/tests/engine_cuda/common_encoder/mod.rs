@@ -366,7 +366,10 @@ impl Rig {
         };
         let id = self
             .engine
-            .register_program(&registration)
+            .register_program(
+                &registration,
+                Box::new(|built| built.expect("the program builds")),
+            )
             .expect("the program registers");
         self.programs.insert(rows, id);
         id

@@ -15,7 +15,7 @@
 //! a raise to a rung still being captured waits on [`Live::arm`].
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// See the module docs. Clones share one record.
 #[derive(Debug, Clone)]
@@ -32,6 +32,9 @@ struct Record {
     held: AtomicU64,
     /// Counts of [`Tally`] events since load, in its order.
     tallies: [AtomicU64; Tally::ALL.len()],
+    /// The sites [`Tally::Unbuilt`] was met at since load, a bit each
+    /// ([`Unbuilt`]).
+    unbuilt_at: AtomicU8,
 }
 
 /// What an engine counts while it serves, each a per-fire event: a way a
@@ -53,14 +56,49 @@ pub enum Tally {
     Unrecorded,
     /// A frame or registration the engine refused.
     Refused,
+    /// A bind or a fire met a pipeline, module or stage that should have
+    /// been built before it: an engine bug under the rule that a model's
+    /// kernels are built at load and a guest program's at its registration
+    /// ([`crate::Engine::register_program`]). It is refused by name, never
+    /// built on the spot, so it is no [`Tally::Compiled`]. One count for
+    /// both sites, told by [`Live::unbuilt`], which keeps which was met
+    /// ([`Unbuilt`]).
+    Unbuilt,
+}
+
+/// Where a [`Tally::Unbuilt`] was met: whose build missed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unbuilt {
+    /// A kernel of the model, built at load.
+    Kernel,
+    /// A guest program, built at its registration.
+    Program,
+}
+
+impl Unbuilt {
+    pub const ALL: [Unbuilt; 2] = [Unbuilt::Kernel, Unbuilt::Program];
+
+    /// Its name in the model status.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Unbuilt::Kernel => "kernel",
+            Unbuilt::Program => "program",
+        }
+    }
+
+    const fn bit(self) -> u8 {
+        1 << self as u8
+    }
 }
 
 impl Tally {
-    pub const ALL: [Tally; 4] = [
+    pub const ALL: [Tally; 5] = [
         Tally::Compiled,
         Tally::Fallback,
         Tally::Unrecorded,
         Tally::Refused,
+        Tally::Unbuilt,
     ];
 
     /// Its name in the model status.
@@ -71,6 +109,7 @@ impl Tally {
             Tally::Fallback => "fallback",
             Tally::Unrecorded => "unrecorded",
             Tally::Refused => "refused",
+            Tally::Unbuilt => "unbuilt",
         }
     }
 }
@@ -96,6 +135,7 @@ impl Live {
             outside: AtomicU64::new(0),
             held: AtomicU64::new(0),
             tallies: Default::default(),
+            unbuilt_at: AtomicU8::new(0),
         }))
     }
 
@@ -146,6 +186,20 @@ impl Live {
     pub fn tallied(&self, tally: Tally) -> u64 {
         self.0.tallies[tally as usize].load(Ordering::Acquire)
     }
+
+    /// One more [`Tally::Unbuilt`], met at `site`. The engine refuses the
+    /// bind or the fire by the name of what was unbuilt and logs that
+    /// name once; the record keeps the count and the sites.
+    pub fn unbuilt(&self, site: Unbuilt) {
+        self.0.unbuilt_at.fetch_or(site.bit(), Ordering::AcqRel);
+        self.tally(Tally::Unbuilt, 1);
+    }
+
+    /// Whether a [`Tally::Unbuilt`] was met at `site` since load.
+    #[must_use]
+    pub fn unbuilt_at(&self, site: Unbuilt) -> bool {
+        self.0.unbuilt_at.load(Ordering::Acquire) & site.bit() != 0
+    }
 }
 
 impl Default for Live {
@@ -177,7 +231,7 @@ pub struct ArmingLease {
 
 #[cfg(test)]
 mod tests {
-    use super::{Live, Tally};
+    use super::{Live, Tally, Unbuilt};
 
     #[test]
     fn a_tally_counts_on_every_clone() {
@@ -189,6 +243,28 @@ mod tests {
         assert_eq!(read.tallied(Tally::Fallback), 0);
         assert_eq!(read.tallied(Tally::Unrecorded), 0);
         assert_eq!(read.tallied(Tally::Refused), 1);
+    }
+
+    /// One counter for both sites: the count is every unbuilt thing met,
+    /// and the record says which sites met one.
+    #[test]
+    fn an_unbuilt_is_one_count_that_keeps_its_sites() {
+        let live = Live::armed();
+        let read = live.clone();
+        assert_eq!(Tally::Unbuilt.name(), "unbuilt");
+        assert!(Tally::ALL.contains(&Tally::Unbuilt));
+        assert_eq!(read.tallied(Tally::Unbuilt), 0);
+        assert!(Unbuilt::ALL.iter().all(|&site| !read.unbuilt_at(site)));
+        live.unbuilt(Unbuilt::Program);
+        assert_eq!(read.tallied(Tally::Unbuilt), 1);
+        assert!(read.unbuilt_at(Unbuilt::Program));
+        assert!(!read.unbuilt_at(Unbuilt::Kernel));
+        live.unbuilt(Unbuilt::Kernel);
+        live.unbuilt(Unbuilt::Kernel);
+        assert_eq!(read.tallied(Tally::Unbuilt), 3);
+        assert!(read.unbuilt_at(Unbuilt::Kernel));
+        assert!(read.unbuilt_at(Unbuilt::Program), "a later site hides none");
+        assert_eq!(read.tallied(Tally::Refused), 0, "its own count");
     }
 
     #[test]

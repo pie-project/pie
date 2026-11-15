@@ -817,10 +817,17 @@ impl Engine for Metal {
         }
     }
 
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        self.loaded_mut()?
+    fn register_program(
+        &mut self,
+        registration: &ProgramRegistration,
+        built: engine::ProgramBuilt,
+    ) -> EngineResult<ProgramId> {
+        let id = self
+            .loaded_mut()?
             .register_program(registration)
-            .map_err(fault)
+            .map_err(fault)?;
+        built(Ok(()));
+        Ok(id)
     }
 
     fn adapter_key(&self, binding: &engine::InstanceBinding) -> EngineResult<Option<u128>> {

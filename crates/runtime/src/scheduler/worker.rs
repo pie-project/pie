@@ -459,8 +459,9 @@ pub(super) enum QueuedItem {
         process_id: Option<ProcessId>,
         pipeline_id: Option<ProcessId>,
     },
-    /// Registers a program with the engine, and learns what an instance
-    /// of it holds in the pool and what its fires take.
+    /// Registers a program with the engine: the lane starts its build and
+    /// goes on, and `response` is answered when the build ends, with the
+    /// id once what an instance of it holds in the pool is learnt.
     RegisterProgram {
         program: Box<ProgramRegistration>,
         response: tokio::sync::oneshot::Sender<Result<::engine::ProgramId>>,

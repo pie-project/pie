@@ -716,8 +716,14 @@ impl Engine for Rank {
         loaded
     }
 
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        self.with(|cuda| cuda.register_program(registration))
+    fn register_program(
+        &mut self,
+        registration: &ProgramRegistration,
+        built: engine::ProgramBuilt,
+    ) -> EngineResult<ProgramId> {
+        let id = self.with(|cuda| cuda.register(registration))?;
+        built(Ok(()));
+        Ok(id)
     }
 
     fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {

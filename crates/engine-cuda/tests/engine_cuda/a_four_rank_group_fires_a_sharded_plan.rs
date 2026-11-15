@@ -272,16 +272,19 @@ fn four_ranks_land_what_one_rank_lands() {
         let backend =
             Backend::parse(engine_cuda::api::CODEGEN).expect("the engine's codegen backend");
         let program = group
-            .register_program(&ProgramRegistration {
-                program_hash: 0x4a4a ^ u64::from(n),
-                emitted_kernels: emit_program(backend, &stages, &bound),
-                emitter_version: backend.emitter_version(),
-                region_analysis: eta_compiler::codegen::cuda::region_analysis::analyze_program(
-                    &stages,
-                ),
-                launch,
-                ..Default::default()
-            })
+            .register_program(
+                &ProgramRegistration {
+                    program_hash: 0x4a4a ^ u64::from(n),
+                    emitted_kernels: emit_program(backend, &stages, &bound),
+                    emitter_version: backend.emitter_version(),
+                    region_analysis: eta_compiler::codegen::cuda::region_analysis::analyze_program(
+                        &stages,
+                    ),
+                    launch,
+                    ..Default::default()
+                },
+                Box::new(|built| built.expect("the program builds")),
+            )
             .expect("the program registers on every rank");
         let mut channel = |host_role: HostRole| {
             let id = ChannelId(next_channel);

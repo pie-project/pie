@@ -1809,10 +1809,13 @@ fn a_sampler_registers_on_a_served_model() {
     let t = std::time::Instant::now();
     model
         .engine
-        .register_program(&engine::program::ProgramRegistration {
-            launch: plan.package.clone(),
-            ..Default::default()
-        })
+        .register_program(
+            &engine::program::ProgramRegistration {
+                launch: plan.package.clone(),
+                ..Default::default()
+            },
+            Box::new(|built| built.expect("the program builds")),
+        )
         .expect("the sampler registers");
     let took = t.elapsed();
     let device = model.engine.shell().expect("loaded").device();

@@ -658,10 +658,13 @@ impl Rig {
         let bound = bind(container, lanes, self.caps()).expect("the program binds");
         let launch = eta_compiler::codegen::launch::build(&bound, &compile_bound(&bound));
         self.engine
-            .register_program(&ProgramRegistration {
-                launch,
-                ..Default::default()
-            })
+            .register_program(
+                &ProgramRegistration {
+                    launch,
+                    ..Default::default()
+                },
+                Box::new(|built| built.expect("the program builds")),
+            )
             .expect("the program registers")
     }
 

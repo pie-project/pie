@@ -407,9 +407,15 @@ impl Engine for Group {
         Ok(answers.swap_remove(0))
     }
 
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+    fn register_program(
+        &mut self,
+        registration: &ProgramRegistration,
+        built: engine::ProgramBuilt,
+    ) -> EngineResult<ProgramId> {
         let registration = registration.clone();
-        self.lead(move |rank| rank.register_program(&registration))
+        let id = self.lead(move |rank| rank.register(&registration))?;
+        built(Ok(()));
+        Ok(id)
     }
 
     fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {

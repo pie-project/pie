@@ -244,16 +244,19 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
         let backend =
             Backend::parse(engine_cuda::api::CODEGEN).expect("the engine's codegen backend");
         let program = engine
-            .register_program(&ProgramRegistration {
-                program_hash: 0xce11 ^ u64::from(rows),
-                emitted_kernels: emit_program(backend, &stages, &bound),
-                emitter_version: backend.emitter_version(),
-                region_analysis: eta_compiler::codegen::cuda::region_analysis::analyze_program(
-                    &stages,
-                ),
-                launch,
-                ..Default::default()
-            })
+            .register_program(
+                &ProgramRegistration {
+                    program_hash: 0xce11 ^ u64::from(rows),
+                    emitted_kernels: emit_program(backend, &stages, &bound),
+                    emitter_version: backend.emitter_version(),
+                    region_analysis: eta_compiler::codegen::cuda::region_analysis::analyze_program(
+                        &stages,
+                    ),
+                    launch,
+                    ..Default::default()
+                },
+                Box::new(|built| built.expect("the program builds")),
+            )
             .expect("the program registers");
         let channel = engine::ChannelId(at as u64 + 1);
         engine

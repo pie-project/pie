@@ -685,8 +685,14 @@ where
         Ok(ticket)
     }
 
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        self.programs.register(registration).map_err(refusal)
+    fn register_program(
+        &mut self,
+        registration: &ProgramRegistration,
+        built: engine::ProgramBuilt,
+    ) -> EngineResult<ProgramId> {
+        let id = self.programs.register(registration).map_err(refusal)?;
+        built(Ok(()));
+        Ok(id)
     }
 
     fn register_channel(

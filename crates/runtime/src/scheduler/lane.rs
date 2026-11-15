@@ -83,6 +83,12 @@ enum LaneRequest {
         step: u32,
         outcome: ::engine::StepOutcome,
     },
+    /// The build of registration `build` ended ([`Builds`]): posted by the
+    /// engine's `built`, from wherever it was told or dropped.
+    Built {
+        build: u64,
+        result: ::engine::Result<()>,
+    },
 }
 
 pub(super) enum LaneCommit {
@@ -105,6 +111,10 @@ pub(super) enum LaneCommit {
 
 const LANE_PANICKED: &str = "the engine lane panicked serving this request";
 const NO_BACKEND: &str = "engine has no backend installed";
+const BUILD_UNTOLD: &str = "the engine dropped the program's build without telling how it ended";
+const BUILD_ABANDONED: &str = "the engine lane ended while the program was still building";
+const BUILD_LANE_DOWN: &str =
+    "the engine lane went down after a panic while the program was still building";
 
 impl LaneCommit {
     fn refused(message: impl Into<String>) -> Self {
@@ -117,7 +127,151 @@ impl LaneCommit {
 /// The instance and channel slots of engine `engine_idx`'s pool, where it
 /// states their shapes (the serving model's stores, model 0).
 fn roles_of(engine_idx: usize) -> Option<crate::store::roles::RolesHandle> {
+    #[cfg(test)]
+    if let Some(roles) = tests::roles_of(engine_idx) {
+        return Some(roles);
+    }
     crate::store::registry::try_get(0, engine_idx).and_then(|stores| stores.roles)
+}
+
+type Registered = tokio::sync::oneshot::Sender<Result<::engine::ProgramId>>;
+
+/// What an engine's `built` is ([`::engine::Engine::register_program`]):
+/// told, or dropped untold, it posts the lane one [`LaneRequest::Built`],
+/// from whatever thread that happens on, and does nothing else: it holds
+/// the lane's queue and nothing of the engine or of the lane's state. A
+/// drop without a tell posts [`BUILD_UNTOLD`], which answers the process
+/// of a registration the call gave an id (an engine that lost its `built`,
+/// or was dropped while building); after a call that returned `Err` it
+/// finds no build and means nothing, the call's error being the answer.
+struct Tell {
+    build: u64,
+    lane: crate::rt::channel::Sender<LaneRequest>,
+    result: Option<::engine::Result<()>>,
+}
+
+impl Tell {
+    fn told(mut self, result: ::engine::Result<()>) {
+        self.result = Some(result);
+    }
+}
+
+impl Drop for Tell {
+    fn drop(&mut self) {
+        let result = self
+            .result
+            .take()
+            .unwrap_or_else(|| Err(::engine::Error::Program(BUILD_UNTOLD.to_string())));
+        let _ = self.lane.send(LaneRequest::Built {
+            build: self.build,
+            result,
+        });
+    }
+}
+
+/// The registrations whose build has not ended: for each, the process to
+/// answer and the id its program will have. The id is here and nowhere
+/// else in the runtime until the build is told `Ok`: the process is
+/// answered only then, and nothing can bind, prepare or fire a program it
+/// was not answered with.
+///
+/// The lane does not wait: it starts a build and goes back to its queue.
+/// The build's end reaches it as one [`LaneRequest::Built`] on that queue,
+/// whether `built` was told on another thread or inside the call (before
+/// the lane knew the id: the item is read after the call returns). A lane
+/// that ends with builds pending answers each by name.
+struct Builds {
+    lane: crate::rt::channel::Sender<LaneRequest>,
+    next: u64,
+    pending: HashMap<u64, (::engine::ProgramId, Registered)>,
+}
+
+impl Builds {
+    fn new(lane: crate::rt::channel::Sender<LaneRequest>) -> Self {
+        Self {
+            lane,
+            next: 0,
+            pending: HashMap::new(),
+        }
+    }
+
+    /// Registers `program` with `engine` and returns at once: `response`
+    /// is answered when the build ends ([`Self::built`]), or here with the
+    /// call's refusal.
+    fn register(
+        &mut self,
+        engine: &mut Option<EngineBox>,
+        program: &::engine::ProgramRegistration,
+        response: Registered,
+    ) {
+        let build = self.next;
+        self.next += 1;
+        let registered = backend(engine).and_then(|engine| {
+            let backend = crate::engine::verbs::codegen_backend(engine);
+            let plan = &crate::pipeline::program::with_host_codegen(program, backend);
+            let tell = Tell {
+                build,
+                lane: self.lane.clone(),
+                result: None,
+            };
+            Ok(engine.register_program(plan, Box::new(move |result| tell.told(result)))?)
+        });
+        match registered {
+            Ok(id) => {
+                self.pending.insert(build, (id, response));
+            }
+            // Not registered. Whatever its `built` posts finds no build
+            // here and is passed over.
+            Err(error) => {
+                let _ = response.send(Err(error));
+            }
+        }
+    }
+
+    /// The build of `build` ended with `result`. Built: what an instance
+    /// of the program holds in the pool is asked, once, and only then is
+    /// its process answered with the id. Not built: the process is
+    /// answered with why, and nothing of the program was kept.
+    fn built(
+        &mut self,
+        engine: &mut Option<EngineBox>,
+        roles: Option<&crate::store::roles::RolesHandle>,
+        build: u64,
+        result: ::engine::Result<()>,
+    ) {
+        let Some((id, response)) = self.pending.remove(&build) else {
+            // The call refused this registration and its process has the
+            // refusal; a build it told built all the same is the engine's
+            // bug.
+            if result.is_ok() {
+                tracing::error!(
+                    "an engine told a program built whose registration it refused; \
+                     the program stays unregistered"
+                );
+            }
+            return;
+        };
+        let registered = result.map_err(anyhow::Error::from).and_then(|()| {
+            if let Some(roles) = roles {
+                crate::store::roles::learn_program(roles, &**backend(engine)?, id)?;
+            }
+            Ok(id)
+        });
+        let _ = response.send(registered);
+    }
+
+    /// Answers every registration still building with `why`.
+    fn fail(&mut self, why: &str) {
+        for (_, (_, response)) in self.pending.drain() {
+            let _ = response.send(Err(anyhow!("{why}")));
+        }
+    }
+}
+
+impl Drop for Builds {
+    fn drop(&mut self) {
+        self.fail(BUILD_ABANDONED);
+    }
 }
 
 /// With `PIE_CHECK_SLOT_REFS` set, a fire whose lanes name a slot of the
@@ -191,7 +345,7 @@ fn fail_request(request: LaneRequest, why: &str) {
             }
             let _ = reply.send(commit);
         }
-        LaneRequest::Shutdown { .. } | LaneRequest::Landed { .. } => {}
+        LaneRequest::Shutdown { .. } | LaneRequest::Landed { .. } | LaneRequest::Built { .. } => {}
     }
 }
 
@@ -258,11 +412,12 @@ impl Lane {
         let (launch_tx, launch_rx) = crate::rt::channel::unbounded::<LaneRequest>();
         let (control_tx, control_rx) = crate::rt::channel::unbounded::<LaneRequest>();
         let landed_tx = control_tx.clone();
+        let builds = Builds::new(control_tx.clone());
         let thread = crate::rt::thread::Builder::new()
             .name(format!("pie-engine-{engine_idx}"))
             .spawn(move || {
                 Self::run(
-                    engine_idx, engine, launch_rx, control_rx, landed_tx, stats, lender,
+                    engine_idx, engine, launch_rx, control_rx, landed_tx, builds, stats, lender,
                 )
             })
             .expect("spawn pie-engine lane thread");
@@ -403,12 +558,17 @@ impl Lane {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the lane's queues and the state it starts with, each its own"
+    )]
     fn run(
         engine_idx: usize,
         mut engine: Option<EngineBox>,
         launch_rx: crate::rt::channel::Receiver<LaneRequest>,
         control_rx: crate::rt::channel::Receiver<LaneRequest>,
         landed_tx: crate::rt::channel::Sender<LaneRequest>,
+        mut builds: Builds,
         stats: Arc<SchedulerStats>,
         lender: Box<dyn super::arming::Lender>,
     ) {
@@ -495,7 +655,9 @@ impl Lane {
                 LaneRequest::Control { .. } => Some(LaneWork::Control),
                 LaneRequest::Launch { prefill: true, .. } => Some(LaneWork::Prefill),
                 LaneRequest::Launch { .. } => Some(LaneWork::Launch),
-                LaneRequest::Shutdown { .. } | LaneRequest::Landed { .. } => None,
+                LaneRequest::Shutdown { .. }
+                | LaneRequest::Landed { .. }
+                | LaneRequest::Built { .. } => None,
             };
             let _lane_charge = LaneCharge {
                 stats: &stats,
@@ -558,7 +720,13 @@ impl Lane {
                 LaneRequest::Control { item, reply } => {
                     let on_panic = Self::commit_on_failure(&item, LANE_PANICKED);
                     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        Self::execute_control(engine_idx, &mut engine, &mut channels, *item)
+                        Self::execute_control(
+                            engine_idx,
+                            &mut engine,
+                            &mut channels,
+                            &mut builds,
+                            *item,
+                        )
                     }));
                     let panicked = served.is_err();
                     let _ = reply.send(served.unwrap_or(on_panic));
@@ -603,6 +771,13 @@ impl Lane {
                     }
                 }))
                 .is_err(),
+                LaneRequest::Built { build, result } => {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let roles = roles.get_or_init(|| roles_of(engine_idx)).as_ref();
+                        builds.built(&mut engine, roles, build, result);
+                    }))
+                    .is_err()
+                }
             };
             if panicked {
                 tracing::error!(
@@ -610,6 +785,7 @@ impl Lane {
                      behind it rather than leaving them in flight"
                 );
                 settlements.close_all(&broker);
+                builds.fail(BUILD_LANE_DOWN);
                 if let Some(stashed) = stash.take() {
                     fail_request(stashed, "the engine lane is down after a panic");
                 }
@@ -775,6 +951,7 @@ impl Lane {
         engine_idx: usize,
         engine: &mut Option<EngineBox>,
         channels: &mut ChannelJoin,
+        builds: &mut Builds,
         item: QueuedItem,
     ) -> LaneCommit {
         match item {
@@ -820,18 +997,7 @@ impl Lane {
                 }
             }
             QueuedItem::RegisterProgram { program, response } => {
-                let registered = backend(engine).and_then(|engine| {
-                    let backend = crate::engine::verbs::codegen_backend(engine);
-                    let plan = &crate::pipeline::program::with_host_codegen(&program, backend);
-                    let program_id = engine.register_program(plan)?;
-                    // What an instance of it holds in the pool, asked once
-                    // at registration.
-                    if let Some(roles) = roles_of(engine_idx) {
-                        crate::store::roles::learn_program(&roles, &**engine, program_id)?;
-                    }
-                    Ok(program_id)
-                });
-                let _ = response.send(registered);
+                builds.register(engine, &program, response);
                 LaneCommit::None
             }
             QueuedItem::FireFacts { key, response } => {
@@ -1193,3 +1359,6 @@ impl Lane {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
