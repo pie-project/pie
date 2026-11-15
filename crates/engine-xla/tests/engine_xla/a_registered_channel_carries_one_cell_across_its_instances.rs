@@ -1,0 +1,233 @@
+//! A registered channel that instances of two programs carry on the device
+//! (a one-cell ring nobody else reads, as an inferlet's sampler state is
+//! between its prefill and decode programs) keeps one cell in the pool: the
+//! engine states its ring's `Channel` slots (`ring_facts`), every instance
+//! bound to it reads and writes its cell at the rows its registration names,
+//! and a pass of one instance sees what the last pass of any other left,
+//! after that one's cells went back to the ring, after the channel's slots
+//! moved (`Rebind::Channel`, the old slot overwritten) and after the instance that last held it
+//! closed. Each pass adds one to the cell's second word and puts the cell on
+//! a reader ring, so the counts read back are the order the passes ran in.
+//! Skipped without a PJRT plugin.
+
+use engine::Engine;
+use engine::channel::{ChannelId, ChannelRegistration, ChannelSeed};
+use engine::chunk::SlotCopy;
+use engine::program::{BindExtents, InstanceBinding, InstanceId, ProgramId, Rebind};
+use engine_xla::store::layout::CHANNEL;
+use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+use eta_ir::op::Op;
+use eta_ir::registry::{GeometryClass, Stage};
+use eta_ir::types::{Dtype, Shape};
+
+use crate::a_device_geometry_beam_answers_the_host_path::{host_lane, plan};
+use crate::common_dit::{self, Rig, Weights, attach};
+
+const COUNTER: ChannelId = ChannelId(900);
+const SEED: [u32; 2] = [7, 100];
+
+/// Takes the counter, adds `[0, 1]`, and puts the sum back and on the
+/// reader ring.
+fn counter() -> TraceContainer {
+    TraceContainer {
+        names: vec!["logits".to_string()],
+        channels: vec![
+            ChannelDecl {
+                shape: Shape::vector(2),
+                dtype: ChanDType::Concrete(Dtype::U32),
+                capacity: 1,
+                host_role: HostRole::None,
+                seeded: true,
+            },
+            ChannelDecl {
+                shape: Shape::vector(2),
+                dtype: ChanDType::Concrete(Dtype::U32),
+                capacity: 2,
+                host_role: HostRole::Reader,
+                seeded: false,
+            },
+        ],
+        ports: Vec::new(),
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: vec![
+                Op::ChanTake(0),
+                Op::Iota { len: 2 },
+                Op::Add(0, 1),
+                Op::ChanPut { chan: 0, value: 2 },
+                Op::ChanPut { chan: 1, value: 2 },
+            ],
+        }],
+        externs: Vec::new(),
+        inputs: Vec::new(),
+    }
+}
+
+fn words(values: &[u32]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+fn bind(rig: &mut Rig, program: ProgramId, seeded: bool) -> InstanceId {
+    let out = rig.channel_of(vec![2], Dtype::U32, HostRole::Reader);
+    rig.engine
+        .bind_instance(&InstanceBinding {
+            program,
+            channels: vec![COUNTER, out],
+            seeds: if seeded {
+                vec![ChannelSeed {
+                    channel: 0,
+                    bytes: words(&SEED),
+                }]
+            } else {
+                Vec::new()
+            },
+            geometry: GeometryClass::Host,
+            device_resolved: Default::default(),
+            instance_slots: Vec::new(),
+            // The counter's ring is the registered channel's: the runtime
+            // takes none for it here.
+            ring_slots: Vec::new(),
+            adapter_slots: Vec::new(),
+            extents: BindExtents::default(),
+        })
+        .expect("an instance bound to the registered counter binds")
+        .id
+}
+
+/// One pass of `instance` on a lane of one token: the count it put.
+fn pass(rig: &mut Rig, instance: InstanceId, page: u32) -> u32 {
+    rig.fire(
+        vec![host_lane(1, vec![3], vec![page], 0)],
+        vec![attach(0, instance)],
+        Vec::new(),
+    );
+    let bytes = rig
+        .engine
+        .take_channel(instance, 1)
+        .expect("the reader ring reads")
+        .expect("the pass put a cell");
+    let cell: Vec<u32> = (bytes.as_chunks::<4>().0.iter())
+        .map(|c| u32::from_le_bytes(*c))
+        .collect();
+    assert_eq!(cell[0], SEED[0], "the first word rides unchanged");
+    cell[1]
+}
+
+fn contiguous(refs: &mut crate::common_llm::Refs, n: u32) -> Vec<u32> {
+    let mut got: Vec<u32> = (0..n).map(|_| refs.take(CHANNEL)).collect();
+    got.sort_unstable();
+    assert!(
+        got.windows(2).all(|w| w[1] == w[0] + 1),
+        "one contiguous run: {got:?}"
+    );
+    got
+}
+
+#[test]
+fn a_registered_channel_carries_one_cell_across_its_instances() {
+    let Some(_device) = common_dit::device() else {
+        return;
+    };
+    let plan = plan();
+    let weights = Weights::random(&plan, 17);
+    let mut rig = Rig::load(plan, &weights, 64, vec![1, 2, 16, 32, 64], None);
+    let mut refs = crate::common_llm::Refs::of_facts(rig.loaded.caps.chunks.clone());
+    let kv = refs.shapes(|s| s.role == engine::chunk::SlotRole::State)[0].id;
+    let page = refs.take(kv);
+
+    let mut registration = ChannelRegistration {
+        id: COUNTER,
+        shape: vec![2],
+        dtype: ChanDType::Concrete(Dtype::U32),
+        host_role: HostRole::None,
+        seeded: true,
+        capacity: 1,
+        ..ChannelRegistration::default()
+    };
+    let ring = rig
+        .engine
+        .ring_facts(&registration)
+        .expect("the engine answers")
+        .expect("a channel an instance may carry keeps its ring in Channel slots");
+    assert_eq!(ring.footprint.slots, 1, "one 1 KiB slot holds the cell");
+    let reader = ChannelRegistration {
+        host_role: HostRole::Reader,
+        ..registration.clone()
+    };
+    assert_eq!(
+        rig.engine.ring_facts(&reader).expect("the engine answers"),
+        None,
+        "a channel the host reads keeps no ring in the pool"
+    );
+    registration.slots = contiguous(&mut refs, ring.footprint.slots);
+    rig.engine
+        .register_channel(&registration)
+        .expect("the counter registers over its slots");
+
+    // Two programs of one content, as an inferlet's prefill and decode
+    // programs share their sampler's channel.
+    let first = rig.register(counter());
+    let second = rig.register(counter());
+    let facts = rig.engine.program_facts(first).expect("the program's facts");
+    assert!(
+        facts.rings.iter().any(|r| r.channel == 0),
+        "the counter is carried on the device: {facts:?}"
+    );
+
+    let x = bind(&mut rig, first, true);
+    let y = bind(&mut rig, second, false);
+    let (device0, _) = rig.engine.guest_passes();
+    let mut counts = vec![pass(&mut rig, x, page), pass(&mut rig, x, page)];
+    counts.push(pass(&mut rig, y, page));
+
+    // The counter's slot moves while `y` holds its cell on the device.
+    let moved = contiguous(&mut refs, ring.footprint.slots);
+    let device = rig.loaded.caps.device.domain;
+    rig.engine
+        .copy_slots(&SlotCopy {
+            shape: CHANNEL,
+            src: device,
+            dst: device,
+            slots: registration.slots.iter().copied().zip(moved.iter().copied()).collect(),
+            runs: Vec::new(),
+        })
+        .expect("the counter's slot moves");
+    // What the old slot held is gone: a slot never written lands over it.
+    let junk = contiguous(&mut refs, ring.footprint.slots);
+    rig.engine
+        .copy_slots(&SlotCopy {
+            shape: CHANNEL,
+            src: device,
+            dst: device,
+            slots: junk.iter().copied().zip(registration.slots.iter().copied()).collect(),
+            runs: Vec::new(),
+        })
+        .expect("the old slot is overwritten");
+    rig.engine
+        .rebind_slots(Rebind::Channel {
+            id: COUNTER,
+            slots: moved,
+        })
+        .expect("the counter's instances follow it");
+    counts.push(pass(&mut rig, x, page));
+    counts.push(pass(&mut rig, y, page));
+
+    // `y` closes holding the cell; a fresh instance carries on from it.
+    rig.engine.close_instance(y).expect("y closes");
+    let z = bind(&mut rig, first, true);
+    counts.push(pass(&mut rig, z, page));
+    counts.push(pass(&mut rig, x, page));
+    let (device1, interpreted) = rig.engine.guest_passes();
+
+    let want: Vec<u32> = (1..=counts.len() as u32).map(|k| SEED[1] + k).collect();
+    assert_eq!(
+        counts, want,
+        "every pass sees the last pass of any instance bound to the counter"
+    );
+    assert_eq!(
+        device1 - device0,
+        counts.len() as u64,
+        "every pass ran on the device ({interpreted} interpreted)"
+    );
+    eprintln!("a registered counter carried on the device across three instances: {counts:?}");
+}
