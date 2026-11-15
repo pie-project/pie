@@ -41,6 +41,40 @@ pub const fn step_value(step: u32) -> u32 {
     step >> 8
 }
 
+/// The low byte of a step table word that opens a step's node list: after
+/// the dispatch words, each step's nodes follow a word `(step << 8) |
+/// STEP_NODES`, one word `(node << 8) | STEP_NODE` a node.
+pub const STEP_NODES: u32 = 0xF1;
+/// The low byte of a step table word naming one node of the step before it.
+pub const STEP_NODE: u32 = 0xF0;
+
+/// A streamed region's step table split into its dispatch words and, where
+/// the emitter published them, the nodes each step computes (`None` for a
+/// table with no node lists, or one that names a step out of order).
+#[must_use]
+pub fn step_node_table(table: &[u32]) -> (&[u32], Option<Vec<Vec<u32>>>) {
+    let split = table
+        .iter()
+        .position(|&word| matches!(word & 0xFF, STEP_NODES | STEP_NODE))
+        .unwrap_or(table.len());
+    let (steps, trailer) = table.split_at(split);
+    if trailer.is_empty() {
+        return (steps, None);
+    }
+    let mut nodes: Vec<Vec<u32>> = Vec::with_capacity(steps.len());
+    for &word in trailer {
+        match word & 0xFF {
+            STEP_NODES if (word >> 8) as usize == nodes.len() => nodes.push(Vec::new()),
+            STEP_NODE if !nodes.is_empty() => nodes.last_mut().expect("opened").push(word >> 8),
+            _ => return (steps, None),
+        }
+    }
+    if nodes.len() != steps.len() {
+        return (steps, None);
+    }
+    (steps, Some(nodes))
+}
+
 #[must_use]
 pub const fn step_kind(step: u32) -> Option<StepKind> {
     match step & 0xFF {
@@ -557,6 +591,8 @@ struct Open {
     prologue_writes: BTreeSet<u32>,
     loop_members: Vec<(u32, u32)>,
     loop_len: Option<Vec<Dimension>>,
+    /// The nodes this pass computes: what its step publishes.
+    nodes: Vec<u32>,
 }
 
 struct Scheduler<'a> {
@@ -570,9 +606,20 @@ struct Scheduler<'a> {
     pending_finals: Vec<PendingFinal>,
     pending_scalars: Vec<(u32, u32)>,
     open: Option<Open>,
+    /// The nodes of `pending_finals` and `pending_scalars`: the step that
+    /// inlines them computes them.
+    pending_nodes: Vec<u32>,
+    /// Each step's nodes, in step order (`step_node_table`).
+    step_nodes: Vec<Vec<u32>>,
 }
 
 impl Scheduler<'_> {
+    /// A step dispatching `word`, which computes `nodes`.
+    fn push_step(&mut self, word: u32, nodes: Vec<u32>) {
+        self.steps.push(word);
+        self.step_nodes.push(nodes);
+    }
+
     fn direct(&self, node: u32, base: u32) -> DirectCode {
         direct_wide(
             &self.ops[node as usize],
@@ -623,7 +670,7 @@ impl Scheduler<'_> {
             let _ = writeln!(self.cases, "  case {}u: {{", self.steps.len());
             self.cases.push_str(&o.passes);
             self.cases.push_str("    return;\n  }\n");
-            self.steps.push(streamed_step(o.value, o.kind));
+            self.push_step(streamed_step(o.value, o.kind), o.nodes);
         }
     }
 
@@ -676,6 +723,7 @@ impl Scheduler<'_> {
 
     fn begin(&mut self, value: u32, kind: StepKind, len: Option<Vec<Dimension>>) {
         let (passes, prologue_writes) = self.prologue();
+        let nodes = core::mem::take(&mut self.pending_nodes);
         self.open = Some(Open {
             value,
             kind,
@@ -685,6 +733,7 @@ impl Scheduler<'_> {
             prologue_writes,
             loop_members: Vec::new(),
             loop_len: None,
+            nodes,
         });
     }
 
@@ -700,11 +749,12 @@ impl Scheduler<'_> {
             .or_else(|| self.pending_scalars.first().map(|s| s.1))
             .unwrap_or(0);
         let (text, _) = self.prologue();
+        let nodes = core::mem::take(&mut self.pending_nodes);
         let _ = writeln!(self.cases, "  case {}u: {{", self.steps.len());
         self.cases.push_str("    if (m4_group.x != 0) return;\n");
         self.cases.push_str(&text);
         self.cases.push_str("    return;\n  }\n");
-        self.steps.push(streamed_step(value, StepKind::Single));
+        self.push_step(streamed_step(value, StepKind::Single), nodes);
     }
 
     fn reads_pending(&self, reads: &[u32]) -> bool {
@@ -1155,6 +1205,8 @@ pub fn emit_streamed_region(
         pending_finals: Vec::new(),
         pending_scalars: Vec::new(),
         open: None,
+        pending_nodes: Vec::new(),
+        step_nodes: Vec::new(),
     };
     let mut planes_used = 0usize;
     let mut select_used = 0usize;
@@ -1179,11 +1231,13 @@ pub fn emit_streamed_region(
                     let o = sched.open.as_mut().expect("open");
                     o.passes.push_str(&text);
                     o.prologue_writes.insert(*base);
+                    o.nodes.push(node);
                 } else {
                     if wrote {
                         sched.flush_open();
                     }
                     sched.pending_scalars.push((node, *base));
+                    sched.pending_nodes.push(node);
                 }
             }
             Plan::Direct {
@@ -1214,6 +1268,7 @@ pub fn emit_streamed_region(
                 }
                 o.loop_members.push((node, *base));
                 o.writes.insert(*base);
+                o.nodes.push(node);
             }
             Plan::Gather {
                 text,
@@ -1227,6 +1282,7 @@ pub fn emit_streamed_region(
                 sched.close_loop();
                 let o = sched.open.as_mut().expect("opened");
                 o.passes.push_str(text);
+                o.nodes.push(node);
                 if *single_row {
                     o.writes.insert(*writes);
                 } else {
@@ -1252,6 +1308,7 @@ pub fn emit_streamed_region(
                 let o = sched.open.as_mut().expect("opened");
                 o.passes.push_str(text);
                 o.writes.insert(*writes);
+                o.nodes.push(node);
             }
             Plan::Put { text, value, len } => {
                 sched.ensure_open(*value, StepKind::Wide, len, |o| {
@@ -1260,6 +1317,7 @@ pub fn emit_streamed_region(
                 sched.close_loop();
                 let o = sched.open.as_mut().expect("opened");
                 o.passes.push_str(text);
+                o.nodes.push(node);
             }
             Plan::Reduce {
                 tag,
@@ -1286,11 +1344,13 @@ pub fn emit_streamed_region(
                         (slots.a0.clone(), slots.o0.clone())
                     };
                     let o = sched.open.as_mut().expect("opened");
+                    o.nodes.push(node);
                     let _ = writeln!(
                         o.passes,
                         "    m4_reduce_partial({tag}u, {dtype}u, {input_ptr}, reinterpret_cast<device uint*>(m4_planes + {plane}u * m4_plane_bytes), descriptors[{input}].len, m4_gtid, m4_gthreads, m4_simd_lane);"
                     );
                     sched.flush_open();
+                    sched.pending_nodes.push(node);
                     sched.pending_finals.push(PendingFinal {
                         tag: *tag,
                         dtype: *dtype,
@@ -1305,7 +1365,7 @@ pub fn emit_streamed_region(
                     let _ = writeln!(sched.cases, "  case {}u: {{", sched.steps.len());
                     sched.cases.push_str(two_level);
                     sched.cases.push_str("    return;\n  }\n");
-                    sched.steps.push(streamed_step(*input, StepKind::Reduce));
+                    sched.push_step(streamed_step(*input, StepKind::Reduce), vec![node]);
                 }
             }
             Plan::Select {
@@ -1326,7 +1386,7 @@ pub fn emit_streamed_region(
                     let _ = writeln!(sched.cases, "  case {}u: {{", sched.steps.len());
                     sched.cases.push_str(&text);
                     sched.cases.push_str("    return;\n  }\n");
-                    sched.steps.push(streamed_step(*input, kind));
+                    sched.push_step(streamed_step(*input, kind), vec![*node]);
                 };
                 case(
                     format!(
@@ -1380,25 +1440,26 @@ pub fn emit_streamed_region(
                 let o = sched.open.as_mut().expect("opened");
                 o.passes.push_str(copy);
                 o.writes.insert(*result);
+                o.nodes.push(node);
                 sched.flush_open();
                 let _ = writeln!(sched.cases, "  case {}u: {{", sched.steps.len());
                 sched.cases.push_str(rmw);
                 sched.cases.push_str("    return;\n  }\n");
-                sched.steps.push(streamed_step(*result, StepKind::Single));
+                sched.push_step(streamed_step(*result, StepKind::Single), vec![node]);
             }
             Plan::Single(text) => {
                 sched.flush_pending();
                 let _ = writeln!(sched.cases, "  case {}u: {{", sched.steps.len());
                 sched.cases.push_str(text);
                 sched.cases.push_str("    return;\n  }\n");
-                sched.steps.push(streamed_step(0, StepKind::Single));
+                sched.push_step(streamed_step(0, StepKind::Single), vec![node]);
             }
             Plan::Argmax { text, input } => {
                 sched.flush_pending();
                 let _ = writeln!(sched.cases, "  case {}u: {{", sched.steps.len());
                 sched.cases.push_str(text);
                 sched.cases.push_str("    return;\n  }\n");
-                sched.steps.push(streamed_step(*input, StepKind::Argmax));
+                sched.push_step(streamed_step(*input, StepKind::Argmax), vec![node]);
             }
         }
     }
@@ -1407,7 +1468,12 @@ pub fn emit_streamed_region(
     source.push_str("  switch (step.index) {\n");
     source.push_str(&sched.cases);
     source.push_str("  default: return;\n  }\n}\n");
-    Ok((source, sched.steps))
+    let mut table = sched.steps;
+    for (step, nodes) in sched.step_nodes.iter().enumerate() {
+        table.push((u32::try_from(step).unwrap_or(u32::MAX) << 8) | STEP_NODES);
+        table.extend(nodes.iter().map(|&node| (node << 8) | STEP_NODE));
+    }
+    Ok((source, table))
 }
 
 #[cfg(test)]

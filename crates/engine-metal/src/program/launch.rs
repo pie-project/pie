@@ -3,10 +3,70 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use eta_compiler::codegen::launch::{LaunchChannel, LaunchStagePlan};
+use eta_exec::{Launch, Launches, Layout, TooLarge};
 use eta_exec::{
     Extents, LANE_ABI_VERSION, LaneChannelSlot, LaneHeader, LaneRecord, LaneShape, NO_TICKET,
-    OpParams, SCRATCH_ALIGN, Status, ValueDesc, describe, layout,
+    OpParams, SCRATCH_ALIGN, Status, ValueDesc, describe,
 };
+
+/// The stage as Metal runs it, region by region as each was compiled: a
+/// streamed region's launches are its runs of steps as the emitter
+/// published their nodes, so a value whose last reader has run gives its
+/// bytes to the next; any other form runs its region as one dispatch, one
+/// launch. Every value a region names takes bytes (Metal's streamed form
+/// writes them all), and the temporary area is as wide as the widest
+/// value's elements, below it the select's reserve as before.
+fn launches<'a>(
+    plan: &'a LaunchStagePlan,
+    regions: &'a [Region],
+    descriptors: &[ValueDesc],
+) -> Launches<'a> {
+    let mut each = Vec::new();
+    for (index, region) in plan.fused.iter().enumerate() {
+        let groups = regions
+            .iter()
+            .find(|compiled| compiled.region_index as usize == index)
+            .filter(|compiled| compiled.form == Form::Streamed && !compiled.launches.is_empty())
+            .map(|compiled| compiled.launches.as_slice());
+        if let Some(groups) = groups {
+            // The streamed form dispatches its steps one after another; a
+            // run of steps that shares a node is one launch.
+            each.extend(groups.iter().map(|nodes| Launch {
+                nodes,
+                stepwise: false,
+                blocks: 1,
+                row_value: None,
+                row_alias: None,
+                held: Vec::new(),
+            }));
+        } else {
+            each.push(Launch {
+                nodes: &region.nodes,
+                stepwise: false,
+                ..Launch::of_region(region, 1)
+            });
+        }
+    }
+    Launches {
+        each,
+        // Held clear below the temporary area as the whole-value layout held
+        // it: a one-row select keeps its state there.
+        reserve: eta_exec::SELECT_RESERVE,
+        temporary: eta_exec::whole_value_temporaries(descriptors).unwrap_or(u64::MAX),
+        ..Launches::default()
+    }
+}
+
+/// A stage's scratch as Metal lays it ([`launches`]): what the kernels'
+/// offsets, `FireFacts::a_lane` and the stride all read, the same at
+/// every call.
+fn layout_of(
+    plan: &LaunchStagePlan,
+    regions: &[Region],
+    descriptors: &[ValueDesc],
+) -> std::result::Result<Layout, TooLarge> {
+    eta_exec::lay_out(plan, descriptors, &launches(plan, regions, descriptors))
+}
 use eta_ir::Dtype;
 use eta_ir::op::tags;
 
@@ -416,6 +476,7 @@ impl Grouped {
     #[allow(clippy::too_many_arguments)]
     fn build(
         plan: &LaunchStagePlan,
+        regions: &[Region],
         descriptors: &[ValueDesc],
         shape: LaneShape,
         status: &Held,
@@ -494,7 +555,7 @@ impl Grouped {
         let row_meta = tables.take((GROUPED_LANES as u64) * size_of::<RowMeta>() as u64)?;
         let row_indices = tables.take(u64::from(rows_bound.max(1)) * size_of::<u32>() as u64)?;
 
-        let scratch_layout = layout(descriptors).map_err(|why| {
+        let scratch_layout = layout_of(plan, regions, descriptors).map_err(|why| {
             Fault::program(
                 "program::launch",
                 format!("this fire's scratch does not fit: {why:?}"),
@@ -673,7 +734,7 @@ pub struct Prepared {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-struct StepWord {
+pub(crate) struct StepWord {
     index: u32,
     level: u32,
     groups: u32,
@@ -938,7 +999,7 @@ impl Prepared {
 
     /// The value scratch one lane of a stage of `plan` takes in a fire at
     /// `extents`: its stride, aligned, as [`Prepared::build`] lays it.
-    pub fn scratch_for(plan: &LaunchStagePlan, extents: &Extents) -> Result<u64> {
+    pub fn scratch_for(plan: &LaunchStagePlan, regions: &[Region], extents: &Extents) -> Result<u64> {
         let descriptors: Vec<ValueDesc> = plan
             .value_types
             .iter()
@@ -951,7 +1012,7 @@ impl Prepared {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let total = layout(&descriptors)
+        let total = layout_of(plan, regions, &descriptors)
             .map_err(|why| {
                 Fault::program(
                     "program::launch",
@@ -999,6 +1060,7 @@ impl Prepared {
 
     pub fn build(
         plan: &LaunchStagePlan,
+        regions: &[Region],
         shapes: &[ChannelShape],
         extents: Extents,
         rows: u32,
@@ -1021,7 +1083,7 @@ impl Prepared {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let scratch_layout = layout(&descriptors).map_err(|why| {
+        let scratch_layout = layout_of(plan, regions, &descriptors).map_err(|why| {
             Fault::program(
                 "program::launch",
                 format!("this fire's scratch does not fit: {why:?}"),
@@ -1133,6 +1195,7 @@ impl Prepared {
         );
         let grouped = Grouped::build(
             plan,
+            regions,
             &descriptors,
             lanes,
             &status,
@@ -1223,7 +1286,21 @@ impl Prepared {
         }
         let scratch = self.scratch()?.clone();
         frame.fill(scratch.buffer.slab(), scratch.offset, self.scratch_bytes)?;
+        self.poison_hollow(frame)?;
         frame.next_pass()?;
+        Ok(())
+    }
+
+    /// Test builds (`test-slot-fill`): the bytes every hollow value points
+    /// at, the lane's dummy, poisoned after the zero fill.
+    #[cfg(target_vendor = "apple")]
+    pub fn poison_hollow(&self, frame: &mut Frame) -> Result<()> {
+        #[cfg(feature = "test-slot-fill")]
+        {
+            let scratch = self.scratch()?.clone();
+            frame.fill_with(scratch.buffer.slab(), scratch.offset, SCRATCH_ALIGN, 0xff)?;
+        }
+        let _ = frame;
         Ok(())
     }
 
@@ -1355,6 +1432,29 @@ impl Prepared {
     fn encode_streamed(&self, frame: &Frame, region: &Region) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
+            let encoder = frame.encoder();
+            let (dispatches, threads) = self.bind_streamed(&encoder, region)?;
+            dispatch_streamed(&encoder, &dispatches, threads, GROUPED_LANES as usize);
+            Ok(())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = (frame, region);
+            Err(Fault::Deviceless)
+        }
+    }
+
+    /// Binds this member's state for a streamed region on `encoder` and
+    /// returns its steps' dispatches (step word, threadgroups) and threads
+    /// a threadgroup, for the caller to dispatch: all at once, or one step
+    /// at a time interleaved with other members' ([`dispatch_streamed_step`]).
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn bind_streamed(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+        region: &Region,
+    ) -> Result<(Vec<(StepWord, u32)>, usize)> {
+        {
             use objc2::runtime::ProtocolObject;
             use objc2_metal::{
                 MTLComputeCommandEncoder, MTLComputePipelineState, MTLResource, MTLResourceUsage,
@@ -1375,7 +1475,6 @@ impl Prepared {
                         format!("region {} has no group layout", region.region_index),
                     )
                 })?;
-            let encoder = frame.encoder();
             encoder.setComputePipelineState(region.pipeline());
             // SAFETY: every reservation is retained by `self`; every offset lies inside its slot.
             unsafe {
@@ -1457,22 +1556,15 @@ impl Prepared {
             let threads = streamed_threads(region.pipeline().maxTotalThreadsPerThreadgroup());
             let temporary_bytes =
                 u64::from(self.scratch_stride.saturating_sub(self.temporary_offset));
-            dispatch_streamed(
-                &encoder,
-                &streamed_dispatches(
+            Ok((
+                streamed_dispatches(
                     &region.steps,
                     &self.descriptor_table,
                     u32::try_from(threads).unwrap_or(1),
                     temporary_bytes,
                 ),
                 threads,
-                GROUPED_LANES as usize,
-            );
-            Ok(())
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            Err(Fault::Deviceless)
+            ))
         }
     }
 
@@ -2098,6 +2190,10 @@ impl Batch {
                 scratch.offset,
                 u64::from(count) * stride,
             )?;
+            #[cfg(feature = "test-slot-fill")]
+            for lane in 0..u64::from(count) {
+                frame.fill_with(scratch.buffer.slab(), scratch.offset + lane * stride, SCRATCH_ALIGN, 0xff)?;
+            }
             frame.next_pass()?;
         }
         let frame: &Frame = frame;
@@ -2535,6 +2631,16 @@ impl Batch {
 }
 
 #[cfg(target_vendor = "apple")]
+/// One streamed step of a member bound on `encoder` ([`Prepared::bind_streamed`]).
+#[cfg(target_vendor = "apple")]
+pub(crate) fn dispatch_streamed_step(
+    encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    step: (StepWord, u32),
+    threads: usize,
+) {
+    dispatch_streamed(encoder, &[step], threads, GROUPED_LANES as usize);
+}
+
 fn dispatch_streamed(
     encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
     dispatches: &[(StepWord, u32)],

@@ -11,6 +11,11 @@ repository = "https://github.com/pie-project/pie"
 name = "engine_metal"
 path = "src/lib.rs"
 
+[features]
+# Test builds: the scratch a hollow value points at is poisoned after each
+# zero fill, so a kernel that reads one breaks a golden.
+test-slot-fill = []
+
 [dependencies]
 toml = "1.1"
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }

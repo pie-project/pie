@@ -732,6 +732,10 @@ impl Plane {
                 let mut room = carve.clone();
                 let mut groups: BTreeMap<Option<launch::BatchKey>, Vec<&mut launch::Prepared>> =
                     BTreeMap::new();
+                // Each member's rings, by identity: members that share one
+                // are ordered through its cursor and fire one after another.
+                let mut rings_of: BTreeMap<Option<launch::BatchKey>, Vec<Vec<usize>>> =
+                    BTreeMap::new();
                 for (id, bound) in self.instances.iter_mut() {
                     if !members.contains(id) {
                         continue;
@@ -745,6 +749,14 @@ impl Plane {
                         continue;
                     };
                     let key = if shares { None } else { prepared.batch_key() };
+                    rings_of.entry(key).or_default().push(
+                        bound
+                            .shared
+                            .iter()
+                            .flatten()
+                            .map(|ring| Arc::as_ptr(ring) as usize)
+                            .collect(),
+                    );
                     groups.entry(key).or_default().push(prepared);
                 }
                 for (key, mut group) in groups {
@@ -757,7 +769,48 @@ impl Plane {
                             prepared.seat_scratch(room.take(prepared.scratch_bytes())?);
                         }
                         #[cfg(target_vendor = "apple")]
-                        room.zero_since(mark, frame)?;
+                        {
+                            room.zero_since(mark, frame)?;
+                            #[cfg(feature = "test-slot-fill")]
+                            {
+                                for prepared in group.iter() {
+                                    prepared.poison_hollow(frame)?;
+                                }
+                                frame.next_pass()?;
+                            }
+                        }
+                        // Members are independent (each its own scratch and
+                        // rings): a stage of streamed regions fires them in
+                        // one concurrent pass, step k of every member, then a
+                        // barrier, then step k + 1, so the GPU may run them
+                        // together. Members sharing a ring keep their order.
+                        let rings = rings_of.get(&None).map(Vec::as_slice).unwrap_or(&[]);
+                        #[cfg(target_vendor = "apple")]
+                        if group.len() > 1
+                            && rings_disjoint(rings)
+                            && stage.regions.iter().all(|region| region.form == compile::Form::Streamed)
+                        {
+                            frame.concurrent_pass()?;
+                            let encoder = frame.encoder();
+                            for region in stage.regions.iter() {
+                                let mut steps = 0usize;
+                                for prepared in group.iter() {
+                                    steps = steps.max(prepared.bind_streamed(&encoder, region)?.0.len());
+                                }
+                                for step in 0..steps {
+                                    for prepared in group.iter() {
+                                        let (dispatches, threads) =
+                                            prepared.bind_streamed(&encoder, region)?;
+                                        if let Some(&word) = dispatches.get(step) {
+                                            launch::dispatch_streamed_step(&encoder, word, threads);
+                                        }
+                                    }
+                                    frame.level();
+                                }
+                            }
+                            frame.next_pass()?;
+                            continue;
+                        }
                         for prepared in group {
                             for region in stage.regions.iter() {
                                 prepared.encode_into(frame, region)?;
@@ -1651,3 +1704,23 @@ mod tests {
         assert_eq!(gpu_reads(&ring), want(2), "the unparked run reads the same");
     }
 }
+/// Whether no ring is two members': members that share one are ordered
+/// through its cursor, so they fire one after another.
+fn rings_disjoint(rings: &[Vec<usize>]) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    rings.iter().all(|member| {
+        let mine: std::collections::BTreeSet<usize> = member.iter().copied().collect();
+        mine.into_iter().all(|ring| seen.insert(ring))
+    })
+}
+
+#[cfg(test)]
+mod rings_tests {
+    #[test]
+    fn members_sharing_a_ring_are_not_disjoint() {
+        assert!(super::rings_disjoint(&[vec![1, 2], vec![3], vec![]]));
+        assert!(super::rings_disjoint(&[vec![1, 1], vec![2]]), "a member's own ring twice");
+        assert!(!super::rings_disjoint(&[vec![1, 2], vec![2, 3]]), "two members share ring 2");
+    }
+}
+
