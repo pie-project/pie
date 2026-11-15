@@ -36,9 +36,17 @@ pub struct SharedGrow {
     /// lower that frees its chunks, and the cap down before it, wait the
     /// governor's patience from it.
     idle_since: Arc<std::sync::Mutex<Option<u64>>>,
-    /// The last raise found no room: none is tried again until room is
-    /// freed ([`Self::room_freed`]), the one event that can change that.
+    /// The last raise waits on what a fire in flight still holds (the
+    /// span's idle cache let go behind it): none is tried again until room
+    /// is freed ([`Self::room_freed`]), that fire's retirement.
     raise_blocked: Arc<AtomicBool>,
+    /// The engine refused the last raise's carve: the device is short of
+    /// the span's memory, which yield gave back under pressure (its last
+    /// shed, the rung). No fire's retirement brings it back; none is tried
+    /// again until the governor grows the pool again
+    /// ([`PoolTarget::retarget`] above the target it had), the balloon
+    /// re-inflating.
+    carve_refused: Arc<AtomicBool>,
     /// The planner waits on a grow this walk was told to make
     /// ([`Self::promise_grow`]): a walk that ends with the promise standing
     /// tells it no grow is coming ([`Self::no_grow`]).
@@ -78,6 +86,7 @@ impl SharedGrow {
                 u32::try_from(live).unwrap_or(u32::MAX)
             }),
             raise_blocked: Arc::new(AtomicBool::new(false)),
+            carve_refused: Arc::new(AtomicBool::new(false)),
             grow_waiter: Arc::new(AtomicBool::new(false)),
             no_grow: Arc::new(move || {
                 if let Some(planner) = crate::planner::planner_for(model, engine) {
@@ -146,8 +155,8 @@ impl SharedGrow {
             // What a raise taken below owes the engine, and whether the
             // rung stood under it ([`SharedPool::raise_applied`]).
             let mut owed = (None, false);
-            // Where a raise found idle cache in its span: from which
-            // physical chunk on it asked it cleared.
+            // Where a raise found idle cache in its span: the rung, and from
+            // which physical chunk on it asked the span cleared.
             let mut clear = None;
             let (step, goal) = {
                 let mut pool = self.shared.lock().unwrap();
@@ -195,7 +204,8 @@ impl SharedGrow {
                 );
                 // A raise is taken in the hold it was planned in: no slot is
                 // handed out between, and the engine's notice follows.
-                let blocked = self.raise_blocked.load(Ordering::Acquire);
+                let blocked = self.raise_blocked.load(Ordering::Acquire)
+                    || self.carve_refused.load(Ordering::Acquire);
                 // A raise that finds idle cache in its span asks it cleared:
                 // nothing opens there for cache from now, and its owner lets
                 // go what lies there (below, outside the pool's lock). A
@@ -207,7 +217,7 @@ impl SharedGrow {
                 {
                     let from = pool.pool().total_chunks() - pool.pool().act_chunks(*rung);
                     pool.pool_mut().clear_span(from);
-                    clear = Some(from);
+                    clear = Some((*rung, from));
                 }
                 let step = match step {
                     // A raise refused for room is not tried again until
@@ -238,12 +248,14 @@ impl SharedGrow {
             let step = match step {
                 Ok(step) => step,
                 Err(error) => {
-                    // The pass asking funds the room as a planner waiter
-                    // (`pipeline::fire`'s raise funding); the walk tries
-                    // again once room is freed, not on its next wake. Idle
-                    // cache in the span is let go by its owner instead: the
-                    // fires reading it retire, and that frees the room.
-                    if let Some(from) = clear {
+                    // Idle cache in the span is let go by its owner, behind
+                    // the last fire that may read it. Where no such fire is
+                    // in flight the span is clear at once, and the raise is
+                    // planned again now: nothing would retire to wake it.
+                    // Only where a fire in flight still holds what was let
+                    // go does the walk wait, for that fire's retirement
+                    // (room freed).
+                    if let Some((rung, from)) = clear {
                         let cleared = super::clear_span(self.engine, from);
                         tracing::debug!(
                             engine = self.engine,
@@ -251,7 +263,15 @@ impl SharedGrow {
                             cleared,
                             "a raise asks the idle cache in its span cleared"
                         );
+                        let retired = self.epochs().1;
+                        let mut pool = self.shared.lock().unwrap();
+                        pool.pool_mut().retire_through(retired);
+                        if pool.pool().span_cached(rung) == 0 {
+                            continue;
+                        }
                     }
+                    // Otherwise the walk tries again once room is freed, not
+                    // on its next wake.
                     self.raise_blocked.store(true, Ordering::Release);
                     tracing::debug!(engine = self.engine, %error, goal, "the activation rung waits");
                     return;
@@ -325,16 +345,16 @@ impl SharedGrow {
                 RungStep::Raise { rung, .. } => {
                     // The engine backs its carve (on demand); refused, the
                     // raise is taken back, fires stay cut to the rung in
-                    // hand, and no raise is tried again until room is
-                    // freed. Nothing moves.
+                    // hand, and no raise is tried again until the governor
+                    // grows the pool. Nothing moves.
                     let mover = super::programs::LaneMover {
                         engine: self.engine,
                     };
                     if let Err(refused) =
                         super::programs::carry_raise(&self.shared, owed.0, &mover).await
                     {
-                        tracing::debug!(engine = self.engine, %refused, "the walk's raise waits for room");
-                        self.raise_blocked.store(true, Ordering::Release);
+                        tracing::debug!(engine = self.engine, %refused, "the walk's raise waits for the governor's grow");
+                        self.carve_refused.store(true, Ordering::Release);
                         super::rung_changed(self.engine);
                         return;
                     }
@@ -395,6 +415,12 @@ impl SharedGrow {
     #[cfg(test)]
     pub(crate) fn block_raise_for_test(&self) {
         self.raise_blocked.store(true, Ordering::Release);
+    }
+
+    /// The engine refused the walk's last raise's carve; for a test.
+    #[cfg(test)]
+    pub(crate) fn refuse_carve_for_test(&self) {
+        self.carve_refused.store(true, Ordering::Release);
     }
 
     /// Looks again now: a waiter is short.
@@ -623,7 +649,13 @@ impl PoolTarget for SharedGrow {
 
     fn retarget(&mut self, segments: u64) -> Retarget {
         let segments = u32::try_from(segments).unwrap_or(u32::MAX);
-        self.target.store(segments, Ordering::Release);
+        let was = self.target.swap(segments, Ordering::AcqRel);
+        // The governor grows the pool again (yield's pressure lifted): a
+        // raise whose carve the engine refused for want of the memory yield
+        // gave back may be tried now.
+        if segments > was {
+            self.carve_refused.store(false, Ordering::Release);
+        }
         self.wake.notify_one();
         let mapped = self.shared.lock().unwrap().mapped_segments();
         if self.no_room.load(Ordering::Acquire) && segments < mapped {
@@ -794,6 +826,48 @@ mod tests {
             "cut before any tick: {}",
             super::super::fire_cap(ENGINE)
         );
+    }
+
+    /// Yield's last shed gives the span's memory back under pressure (the
+    /// rung lowered, its carve given back): a raise asked then whose carve
+    /// the engine refuses for want of it re-arms on the governor's grow,
+    /// the pressure lifted, never on a fire's retirement (which brings no
+    /// device memory back). With nothing in flight it is applied after the
+    /// grow, no fire retiring.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_raise_whose_carve_yield_gave_back_re_arms_on_the_governor_s_grow() {
+        const ENGINE: usize = 51;
+        let pool = super::super::tests::pool();
+        let mapped = u64::from(pool.mapped_segments());
+        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+        let mut grow = SharedGrow::new(0, ENGINE, shared.clone());
+        let _ = grow.retarget(mapped);
+        // Under pressure: the governor's target falls, and yield sheds the
+        // rung last, the span's memory given back.
+        let _ = grow.retarget(mapped - 2);
+        shared.lock().unwrap().lower_rung(16).unwrap();
+        // A raise asked then: the engine refuses its carve.
+        let _want = super::super::want_rows(ENGINE, 2048);
+        grow.refuse_carve_for_test();
+        grow.walk_rung().await;
+        assert_eq!(
+            shared.lock().unwrap().rung(),
+            16,
+            "refused: the rung in hand"
+        );
+        // A fire retiring frees no device memory: nothing is tried again.
+        grow.room_freed();
+        grow.walk_rung().await;
+        assert_eq!(
+            shared.lock().unwrap().rung(),
+            16,
+            "retirement does not re-arm it"
+        );
+        // The pressure lifts: the governor grows the pool again, and the
+        // raise is applied, no fire retiring.
+        let _ = grow.retarget(mapped);
+        grow.walk_rung().await;
+        assert_eq!(shared.lock().unwrap().rung(), 2048, "raised after the grow");
     }
 
     /// A raise the walk found no room for is not tried again on its next

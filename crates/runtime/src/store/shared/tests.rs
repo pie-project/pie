@@ -914,12 +914,15 @@ fn a_raise_by_demand_lacks_nothing_live_state_fills_and_clears_the_span_s_cache(
     pool.pool().check();
 }
 
-/// The walk's raise over the span's cache: it asks the cache's owner (the
-/// weight cache, through the engine's [`SpanClear`]) to let go what lies
-/// there and waits for room freed, the fires reading it retired; then it
-/// raises, nothing moved.
+/// A raise asked with nothing in flight is applied without any fire
+/// retiring. Here the walk's raise finds the weight cache's atoms in its
+/// span: it asks their owner (through the engine's [`SpanClear`]) to let
+/// them go, behind the last fire handed out, which has retired already, so
+/// the span is clear at once; the walk plans again then and raises, nothing
+/// moved. Before, it waited for room freed, which no fire was left to
+/// bring: a wave held at the gate behind the raise stalled for good.
 #[tokio::test(flavor = "current_thread")]
-async fn the_walk_has_the_span_s_cache_cleared_and_then_raises_moving_nothing() {
+async fn a_raise_asked_with_nothing_in_flight_is_applied_without_any_fire_retiring() {
     const ENGINE: usize = 9304;
     let mut pool = pool();
     let mut engine = FakeEngine::new();
@@ -932,6 +935,8 @@ async fn the_walk_has_the_span_s_cache_cleared_and_then_raises_moving_nothing() 
         .take_records(pool.records_available() as usize)
         .unwrap();
     let cached = span_cache(&mut pool, 4);
+    // Every fire handed out has retired: nothing is in flight.
+    pool.pool_mut().retire_through(1);
     let table = pool.pool().chunk_table().to_vec();
     let shared: Shared = Arc::new(Mutex::new(pool));
     let asked = Arc::new(Mutex::new(Vec::new()));
@@ -941,7 +946,7 @@ async fn the_walk_has_the_span_s_cache_cleared_and_then_raises_moving_nothing() 
             asked.lock().unwrap().push(from);
             let mut pool = shared.lock().unwrap();
             assert_eq!(pool.pool().clearing(), from, "asked before the owner");
-            // The owner lets go behind the fire at epoch 1; not yet retired.
+            // The owner lets go behind the last fire handed out (1).
             let holder = Holder::Weights {
                 shape: pool.weights_first(),
                 pinned: false,
@@ -952,21 +957,16 @@ async fn the_walk_has_the_span_s_cache_cleared_and_then_raises_moving_nothing() 
     });
     let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
     let _want = want_rows(ENGINE, 2048);
+    // One walk, no fire retiring and no room freed between.
     grow.walk_rung().await;
     assert_eq!(
         *asked.lock().unwrap(),
         [TOTAL - 12],
         "the span from 52 asked clear"
     );
-    assert_eq!(shared.lock().unwrap().rung(), 256, "not raised over cache");
-    // The fire reading it retires and room is freed: the walk raises.
-    shared.lock().unwrap().pool_mut().retire_through(1);
-    grow.room_freed();
-    grow.walk_rung().await;
     let pool = shared.lock().unwrap();
-    assert_eq!(pool.rung(), 2048);
+    assert_eq!(pool.rung(), 2048, "raised in the same walk");
     assert_eq!(pool.pool().chunk_table(), table.as_slice(), "nothing moved");
-    assert_eq!(asked.lock().unwrap().len(), 1);
     assert!(
         records
             .iter()

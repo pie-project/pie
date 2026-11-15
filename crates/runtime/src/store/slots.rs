@@ -1189,7 +1189,10 @@ impl SlotPool {
     /// and at every rung. A lowered rung leaves the span below its own
     /// activation to idle cache alone (what may go: resident weights above
     /// their floor), so a raise only ever clears cache, and moves no live
-    /// state.
+    /// state. The span is reserved at load and given back only by yield,
+    /// as its last shed under pressure (the rung, after idle prefixes and
+    /// the weight cache); a raise the engine then refuses for want of it
+    /// waits on the governor's grow (`SharedGrow`), not on a fire.
     #[must_use]
     pub fn live_limit(&self) -> u32 {
         self.total - self.act_max
