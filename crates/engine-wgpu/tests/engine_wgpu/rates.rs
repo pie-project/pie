@@ -48,6 +48,7 @@ fn the_micro_fires_state_rates_and_the_ruling_picks_by_them() {
         flops_per_row: 1 << 30,
         attn_flops_per_row_key: 1 << 16,
         kv_bytes_per_key: 1 << 16,
+        width: 4096,
     };
     let (top, _) = choose(&rungs, 8 << 30, &profile, "adapter", &counts, 1 << 30).unwrap();
     let line = line_of(&top, top.tokens, top.span_bytes, 8 << 30, profile.tuned());

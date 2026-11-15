@@ -876,7 +876,9 @@ impl<B: Serve> Shell<B> {
         let device_profile = tuning.profile().clone();
         let device_name = device.name().to_owned();
         let gemm = tuning.gemm(B::tier(&device));
-        let padded = |rows: u32| kernels_slang::linear::gemm::padded_rows(B::TARGET, gemm, rows);
+        let padded = |rows: u32| {
+            kernels_slang::linear::gemm::padded_rows(B::TARGET, gemm, rows, counts.width)
+        };
         let mut chosen: Option<Option<engine::load::TopRung>> = None;
         let mut weighed: Option<Weighed> = None;
         let (compiled, mut span) = loop {

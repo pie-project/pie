@@ -34,6 +34,9 @@ pub struct Counts {
     /// The kv bytes a key read takes, summed over the kv rows attentions
     /// read: every plane of the row at its element's size.
     pub kv_bytes_per_key: u64,
+    /// The contraction of the largest dense plane: the width its matmul
+    /// kernel is picked at, which a fire's rows pad to the tile of.
+    pub width: u32,
 }
 
 impl Counts {
@@ -44,6 +47,7 @@ impl Counts {
         let banks = crate::store::experts::streamed(trace);
         let (mut weight_bytes, mut expert_bytes) = (0u64, 0u64);
         let (mut dense, mut routed) = (0u64, 0u64);
+        let (mut largest, mut width) = (0u64, 0u64);
         for (at, param) in trace.params.iter().enumerate() {
             if tables.contains(&at) {
                 continue;
@@ -60,6 +64,10 @@ impl Counts {
             } else {
                 weight_bytes = weight_bytes.saturating_add(planes[at]);
                 dense = dense.saturating_add(elements);
+                if elements > largest {
+                    largest = elements;
+                    width = crate::weights::rectangle(&param.shape).1;
+                }
             }
         }
         let experts = routing(trace);
@@ -99,6 +107,7 @@ impl Counts {
             flops_per_row: dense.saturating_add(routed_per_row).saturating_mul(2),
             attn_flops_per_row_key: query.values().sum::<u64>().saturating_mul(4),
             kv_bytes_per_key,
+            width: u32::try_from(width).unwrap_or(u32::MAX),
         })
     }
 }
@@ -263,6 +272,7 @@ mod tests {
             flops_per_row: 1 << 30,
             attn_flops_per_row_key: 1 << 10,
             kv_bytes_per_key: 1 << 10,
+            width: 4096,
         }
     }
 

@@ -39,21 +39,74 @@ pub struct Tactic {
     pub tier: Tier,
 }
 
-/// The rows a matmul of `rows` computes on `target` under `tactic`: `rows`
-/// padded to the row tile [`act_x_wt`] picks at that width (a vector
-/// kernel below [`VECTOR_MAX_ROWS`] pads nothing). What a fire's estimate
-/// counts a narrow fire's matmuls by, as it pays for the tile it under-fills.
+/// The kernel a bf16 matmul of `m` rows, `n` columns and depth `k` runs
+/// on `target` under `tactic`: the one pick [`act_x_wt`] dispatches by and
+/// [`padded_rows`] counts by, so the two cannot drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kernel {
+    /// SPIR-V's vector kernel, eight columns a group (`k` a multiple of 8).
+    GemvV,
+    /// SPIR-V's vector kernel.
+    Gemv,
+    /// SPIR-V's cooperative-matrix tile, 64 rows.
+    Coopmat,
+    /// SPIR-V's register tile: `cols` columns at `per` a lane, 256 lanes'
+    /// rows of 8 (`256 / (cols / per) · 8` rows a tile).
+    Register { cols: u32, per: u32 },
+    /// SPIR-V's 32 x 32 tile.
+    Tiled,
+    /// WGSL's vector kernel.
+    PairsGemv,
+    /// WGSL's 16-row tile.
+    Pairs16,
+    /// WGSL's 64-row tile.
+    Pairs64,
+}
+
+impl Kernel {
+    /// The rows one tile of it computes: what a matmul's rows pad to.
+    #[must_use]
+    pub fn row_tile(self) -> u32 {
+        match self {
+            Kernel::GemvV | Kernel::Gemv | Kernel::PairsGemv => 1,
+            Kernel::Coopmat | Kernel::Pairs64 => 64,
+            Kernel::Register { cols, per } => 256 / (cols / per) * 8,
+            Kernel::Tiled => 32,
+            Kernel::Pairs16 => 16,
+        }
+    }
+}
+
+/// The kernel a matmul of `m` x `n` x `k` runs ([`Kernel`]).
 #[must_use]
-pub fn padded_rows(target: Target, tactic: Tactic, rows: u32) -> u32 {
-    let tile = match target {
-        _ if rows < VECTOR_MAX_ROWS => 1,
-        Target::Spirv if tactic.tier == Tier::Coopmat => 64,
-        // The register kernel's tile: 256 / (64 / 8) lanes of 8 rows.
-        Target::Spirv if rows >= RT_MIN_ROWS => 256,
-        Target::Spirv => 32,
-        Target::Wgsl if rows < NARROW_MAX_ROWS => 16,
-        Target::Wgsl => 64,
-    };
+pub fn tile_for(target: Target, tactic: Tactic, m: u32, n: u32, k: u32) -> Kernel {
+    match target {
+        Target::Spirv if m < VECTOR_MAX_ROWS && k.is_multiple_of(8) => Kernel::GemvV,
+        Target::Spirv if m < VECTOR_MAX_ROWS => Kernel::Gemv,
+        Target::Spirv if tactic.tier == Tier::Coopmat => Kernel::Coopmat,
+        // Sixty-four columns a tile at eight a lane, or thirty-two at four
+        // when that leaves none idle.
+        Target::Spirv if m >= RT_MIN_ROWS && k.is_multiple_of(16) => {
+            if n.is_multiple_of(32) && !n.is_multiple_of(64) {
+                Kernel::Register { cols: 32, per: 4 }
+            } else {
+                Kernel::Register { cols: 64, per: 8 }
+            }
+        }
+        Target::Spirv => Kernel::Tiled,
+        Target::Wgsl if m < VECTOR_MAX_ROWS => Kernel::PairsGemv,
+        Target::Wgsl if m < NARROW_MAX_ROWS => Kernel::Pairs16,
+        Target::Wgsl => Kernel::Pairs64,
+    }
+}
+
+/// The rows a matmul of `rows` over a `width`-wide weight computes on
+/// `target` under `tactic`: `rows` padded to the row tile of the kernel
+/// [`tile_for`] picks. What a fire's estimate counts a narrow fire's
+/// matmuls by, as it pays for the tile it under-fills.
+#[must_use]
+pub fn padded_rows(target: Target, tactic: Tactic, rows: u32, width: u32) -> u32 {
+    let tile = tile_for(target, tactic, rows, width, width).row_tile();
     rows.div_ceil(tile).saturating_mul(tile)
 }
 
@@ -91,31 +144,35 @@ pub fn act_x_wt(
     if m == 0 {
         return Ok(());
     }
-    let fire = match ctx.target() {
-        Target::Spirv if m < VECTOR_MAX_ROWS && k.is_multiple_of(8) => {
-            Fire::at(GEMM, "linear_gemm_gemv_v_bf16")
-                .groups([n.div_ceil(8), 1, 1])
-                .group([32, 8, 1])
-        }
-        Target::Spirv if m < VECTOR_MAX_ROWS => Fire::at(GEMM, "linear_gemm_gemv_bf16")
+    let target = ctx.target();
+    if target == Target::Wgsl && !n.is_multiple_of(2) {
+        return Err(refuse(
+            op,
+            format!(
+                "the projection lands {n} columns, odd: on WGSL every output pair is one \
+                 bf16 word"
+            ),
+        ));
+    }
+    let fire = match tile_for(target, tactic, m, n, k) {
+        Kernel::GemvV => Fire::at(GEMM, "linear_gemm_gemv_v_bf16")
+            .groups([n.div_ceil(8), 1, 1])
+            .group([32, 8, 1]),
+        Kernel::Gemv => Fire::at(GEMM, "linear_gemm_gemv_bf16")
             .groups([1, n.div_ceil(8), m])
             .group([32, 8, 1]),
-        Target::Spirv if tactic.tier == Tier::Coopmat => {
-            Fire::at(GEMM, "linear_gemm_tiled_bm_64_bf16")
-                .tier(Tier::Coopmat)
-                .groups([n.div_ceil(64), m.div_ceil(64), 1])
-                .group([32, 4, 1])
-        }
-        // Sixty-four columns a tile at eight a lane, or thirty-two at four
-        // when that leaves none idle.
-        Target::Spirv if m >= RT_MIN_ROWS && k.is_multiple_of(16) => {
-            let (entry, cols, per) = if n.is_multiple_of(32) && !n.is_multiple_of(64) {
-                ("linear_gemm_register_bn_32_bf16", 32, 4)
+        Kernel::Coopmat => Fire::at(GEMM, "linear_gemm_tiled_bm_64_bf16")
+            .tier(Tier::Coopmat)
+            .groups([n.div_ceil(64), m.div_ceil(64), 1])
+            .group([32, 4, 1]),
+        kernel @ Kernel::Register { cols, per } => {
+            let entry = if cols == 32 {
+                "linear_gemm_register_bn_32_bf16"
             } else {
-                ("linear_gemm_register_bf16", 64, 8)
+                "linear_gemm_register_bf16"
             };
             let (tx, ty) = (cols / per, 256 / (cols / per));
-            let tiles = m.div_ceil(ty * 8);
+            let tiles = m.div_ceil(kernel.row_tile());
             if tiles > 65_535 {
                 return Err(refuse(op, format!("the grid will not launch: {m} rows")));
             }
@@ -123,38 +180,23 @@ pub fn act_x_wt(
                 .groups([n.div_ceil(cols) * tx, tiles * ty, 1])
                 .group([tx, ty, 1])
         }
-        Target::Spirv => Fire::at(GEMM, "linear_gemm_tiled_bf16")
+        Kernel::Tiled => Fire::at(GEMM, "linear_gemm_tiled_bf16")
             .groups([n.div_ceil(32), m.div_ceil(32), 1])
             .group([32, 2, 2]),
-        Target::Wgsl => {
-            if !n.is_multiple_of(2) {
-                return Err(refuse(
-                    op,
-                    format!(
-                        "the projection lands {n} columns, odd: on WGSL every output pair is one \
-                         bf16 word"
-                    ),
-                ));
-            }
-            if m < VECTOR_MAX_ROWS {
-                Fire::at(PAIRS, "linear_gemm_pairs_gemv_bf16")
-                    .tier(if tactic.tier == Tier::Subgroup {
-                        Tier::Subgroup
-                    } else {
-                        Tier::Baseline
-                    })
-                    .groups([1, n.div_ceil(8), m])
-                    .group([32, 8, 1])
-            } else if m < NARROW_MAX_ROWS {
-                Fire::at(PAIRS, "linear_gemm_pairs_tiled_bm_16_bf16")
-                    .groups([n.div_ceil(64), m.div_ceil(16), 1])
-                    .group([16, 16, 1])
+        Kernel::PairsGemv => Fire::at(PAIRS, "linear_gemm_pairs_gemv_bf16")
+            .tier(if tactic.tier == Tier::Subgroup {
+                Tier::Subgroup
             } else {
-                Fire::at(PAIRS, "linear_gemm_pairs_tiled_bf16")
-                    .groups([n.div_ceil(64), m.div_ceil(64), 1])
-                    .group([16, 16, 1])
-            }
-        }
+                Tier::Baseline
+            })
+            .groups([1, n.div_ceil(8), m])
+            .group([32, 8, 1]),
+        Kernel::Pairs16 => Fire::at(PAIRS, "linear_gemm_pairs_tiled_bm_16_bf16")
+            .groups([n.div_ceil(64), m.div_ceil(16), 1])
+            .group([16, 16, 1]),
+        Kernel::Pairs64 => Fire::at(PAIRS, "linear_gemm_pairs_tiled_bf16")
+            .groups([n.div_ceil(64), m.div_ceil(64), 1])
+            .group([16, 16, 1]),
     };
     ctx.fire(
         fire,
@@ -238,4 +280,28 @@ pub(crate) fn extent(
         "the activation's rows are the rows the result lands"
     );
     Ok((y.rows, y.width, act.width))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tactic(tier: Tier) -> Tactic {
+        Tactic { tier }
+    }
+
+    #[test]
+    fn a_matmul_pads_its_rows_to_the_tile_of_the_kernel_it_runs() {
+        let (spirv, wgsl) = (Target::Spirv, Target::Wgsl);
+        let base = tactic(Tier::Baseline);
+        let coop = tactic(Tier::Coopmat);
+        // A vector kernel pads nothing.
+        assert_eq!(padded_rows(spirv, coop, 3, 4096), 3);
+        assert_eq!(padded_rows(spirv, coop, 5, 4096), 64);
+        assert_eq!(tile_for(spirv, base, 40, 4096, 4096), Kernel::Tiled);
+        assert_eq!(padded_rows(spirv, base, 40, 4096), 64);
+        assert_eq!(padded_rows(spirv, base, 100, 4096), 256);
+        assert_eq!(padded_rows(wgsl, base, 20, 4096), 32);
+        assert_eq!(padded_rows(wgsl, base, 100, 4096), 128);
+    }
 }
