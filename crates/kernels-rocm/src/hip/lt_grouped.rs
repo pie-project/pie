@@ -135,6 +135,9 @@ pub fn library(dtype: Dtype) -> Result<&'static Library, String> {
         .expect("lock poisoned");
     let slot = *map.entry((device, dtype)).or_insert_with(|| {
         let opened = Library::open(device, dtype);
+        if opened.is_ok() {
+            crate::tally::built();
+        }
         match &opened {
             Ok(lib) => tracing::info!(
                 ?dtype,

@@ -1400,6 +1400,7 @@ impl Run<'_> {
 fn over_the_bus<T>(why: impl FnOnce() -> String) -> Option<T> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static READ: AtomicU64 = AtomicU64::new(0);
+    kernels_rocm::tally::declined();
     let read = READ.fetch_add(1, Ordering::Relaxed) + 1;
     if read.is_power_of_two() {
         eprintln!(

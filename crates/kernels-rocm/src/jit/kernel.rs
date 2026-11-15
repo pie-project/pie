@@ -130,6 +130,10 @@ impl Kernel {
         match cache::load(&root, self.name, ordinal) {
             Err(fault) if !matches!(fault, Fault::Compile { .. }) => Err(fault),
             outcome => {
+                match &outcome {
+                    Ok(_) => crate::tally::built(),
+                    Err(_) => crate::tally::refused(),
+                }
                 // Two threads may load at once; the first kept is every
                 // caller's.
                 let _ = slot.set(outcome);
