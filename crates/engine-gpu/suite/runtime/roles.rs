@@ -545,6 +545,14 @@ fn an_instance_in_pool_slots_fires_through_moves() {
     last = before;
     round(&mut bound, tokens[2], &mut last, "after a park and unpark");
     round(&mut bound, tokens[3], &mut last, "a pass later");
+    assert_eq!(
+        bound
+            .engine
+            .live()
+            .tallied(engine::live::Tally::Unrecorded),
+        0,
+        "a fire through pool slots and their moves built a pipeline the load did not"
+    );
 
     drop(bound);
     let _ = std::fs::remove_dir_all(&dir);

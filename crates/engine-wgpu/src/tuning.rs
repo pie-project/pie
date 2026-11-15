@@ -178,6 +178,27 @@ impl Tuning {
             .collect()
     }
 
+    /// Every rung a batch between the shapes `first` and `last` (one row
+    /// and the most a fire holds, the other widths the same) reaches: its
+    /// region meets the shapes between them and it fits one of the two,
+    /// since no rung tells rows apart ([`Qmm::fits_shape`]).
+    #[must_use]
+    pub fn qmm_between(&self, first: &QmmAt, last: &QmmAt) -> Vec<Qmm> {
+        use profile::Point as _;
+        let cell: Vec<profile::Set> = (0..Qmm::spec().vars.len())
+            .map(|var| match (first.coord(var), last.coord(var)) {
+                (Some(lo), Some(hi)) => profile::Set::span(lo, hi),
+                _ => unreachable!("a `kernel.qmm` point states every variable"),
+            })
+            .collect();
+        self.profile
+            .ladder::<Qmm>()
+            .meeting(&cell)
+            .filter(|rung| rung.fits(first) || rung.fits(last))
+            .copied()
+            .collect()
+    }
+
     #[must_use]
     pub fn sdpa_split_groups(&self) -> u32 {
         match *self.profile.get::<DecodeSplit>() {
@@ -201,6 +222,14 @@ const KQUANT: kernels_slang::linear::kquant::Tactic = kernels_slang::linear::kqu
 /// its adapter from wgpu, so every tab pays for them, about 3% of a prefill.
 const TAB_PREFILL_WORK: u64 = 1 << 19;
 
+fn qmm_rung(rung: Qmm) -> kernels_slang::linear::qmm::Qmm {
+    use kernels_slang::linear::qmm::Qmm as Rung;
+    match rung {
+        Qmm::Tiled { crossover_tg } => Rung::Tiled { crossover_tg },
+        Qmm::Qmv => Rung::Qmv { vecs: 2 },
+    }
+}
+
 impl engine_gpu::backend::Tactics for Tuning {
     fn profile(&self) -> &profile::Profile {
         Tuning::profile(self)
@@ -217,14 +246,21 @@ impl engine_gpu::backend::Tactics for Tuning {
         contraction: u32,
         bank: kernels_slang::Bank,
     ) -> Vec<kernels_slang::linear::qmm::Qmm> {
-        use kernels_slang::linear::qmm::Qmm as Rung;
         let at = self.qmm_at(rows, columns, contraction, bank.bits, bank.group);
-        self.qmm(&at)
-            .iter()
-            .map(|q| match *q {
-                Qmm::Tiled { crossover_tg } => Rung::Tiled { crossover_tg },
-                Qmm::Qmv => Rung::Qmv { vecs: 2 },
-            })
+        self.qmm(&at).into_iter().map(qmm_rung).collect()
+    }
+
+    fn qmm_rungs(
+        &self,
+        capacity: u32,
+        columns: u32,
+        contraction: u32,
+        bank: kernels_slang::Bank,
+    ) -> Vec<kernels_slang::linear::qmm::Qmm> {
+        let at = |rows| self.qmm_at(rows, columns, contraction, bank.bits, bank.group);
+        self.qmm_between(&at(1), &at(capacity.max(1)))
+            .into_iter()
+            .map(qmm_rung)
             .collect()
     }
 
@@ -314,6 +350,28 @@ mod tests {
         };
         let (profile, _) = crate::chip::resolve(&adapter, None);
         Tuning::new(profile, crate::chip::UNREPORTED_CORES)
+    }
+
+    /// The rungs between one row and a capacity hold the rungs of every
+    /// row count up to it.
+    #[test]
+    fn the_rungs_between_one_row_and_a_capacity_hold_every_row_counts_rungs() {
+        let t = tuning();
+        for (n, k) in [(4096, 4096), (1024, 4100), (64, 64)] {
+            let at = |rows| t.qmm_at(rows, n, k, 4, 64);
+            for capacity in [1, 11, 12, 64, 300] {
+                let between = t.qmm_between(&at(1), &at(capacity));
+                for rows in 1..=capacity {
+                    for rung in t.qmm(&at(rows)) {
+                        assert!(
+                            between.contains(&rung),
+                            "{rows} rows of {n} columns over {k} reach {rung:?}, which the \
+                             rungs up to {capacity} rows leave out"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// An adapter binding a stage 10 storage buffers (Chrome on macOS,

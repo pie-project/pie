@@ -450,6 +450,177 @@ fn a_windowed_miniature_serves_two_lanes() {
     seats("gemma4-e4b-mini-l1", None);
 }
 
+/// Fires `model` at every rung its load admits (one lane of the rung's
+/// rows, every seat sharing them, then a decode of those seats) and holds
+/// each fire to the pipelines the load built: its walks named every kernel
+/// a fire asks for, so none is built while serving.
+fn every_rung_fires_what_the_load_built(model: &str) {
+    let fixture = fixture(model, None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    let built = shell.compiled();
+    let named = shell.named().clone();
+    assert_eq!(
+        built,
+        named.kernels.len() as u64,
+        "the load built other pipelines than the ones its walks named"
+    );
+    let reserved = shell.device().books().reserved();
+    let rungs: Vec<u32> = shell
+        .pool_chunk_facts()
+        .act_chunks
+        .iter()
+        .map(|&(rung, _)| rung)
+        .collect();
+    assert!(!rungs.is_empty(), "the load admits a rung");
+    let tokens: Vec<u32> = (0..CONTEXT).map(|at| (at * 37 + 11) % 256).collect();
+    let mut fires = 0;
+    for &rung in &rungs {
+        let rung = rung.clamp(1, CONTEXT);
+        for lanes in [1, SEATS.min(rung)] {
+            let each = (rung / lanes) as usize;
+            for (held, rows) in [(0, each), (each as u32, 1)] {
+                if held + rows as u32 > CONTEXT {
+                    continue;
+                }
+                let seated: Vec<Seated<'_>> = (0..lanes)
+                    .map(|lane| Seated {
+                        held: Some(held),
+                        ..Seated::of(Lane {
+                            slot: lane,
+                            word: word(&fixture.trace, rows as u32),
+                            tokens: &tokens[..rows],
+                        })
+                    })
+                    .collect();
+                let got = shell.fire_seated(&seated).unwrap_or_else(|why| {
+                    panic!("{lanes} lane(s) of {rows} rows at rung {rung} fire: {why}")
+                });
+                assert!(got.iter().all(|row| row.iter().all(|v| v.is_finite())));
+                fires += 1;
+                assert_eq!(
+                    shell.compiled(),
+                    built,
+                    "{lanes} lane(s) of {rows} rows at rung {rung} built a pipeline the load's \
+                     walks did not name"
+                );
+            }
+        }
+    }
+    eprintln!(
+        "{model}: {} kernels named and built, {} dispatches a fire at most, rungs {rungs:?}, \
+         {fires} fires, {} bytes reserved at load and {} after",
+        named.kernels.len(),
+        named.dispatches,
+        reserved,
+        shell.device().books().reserved()
+    );
+}
+
+/// A fire whose lanes mix classes so that a region's mask comes in runs: a
+/// plain prompt and a prompt under an adapter, which run the prompt's
+/// attention, with a plain decode between them in the class order. The
+/// region launches a run at a time, and the fire still asks for no pipeline
+/// the load did not build and encodes no more dispatches than the load
+/// named.
+#[test]
+fn a_mixed_fire_that_cuts_a_region_fires_from_what_the_load_built() {
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    let built = shell.compiled();
+    let named = shell.named().clone();
+    let tokens: Vec<u32> = (0..CONTEXT).map(|at| (at * 37 + 11) % 256).collect();
+    const ROWS: usize = 8;
+    let plain = |rows: usize| word(&fixture.trace, rows as u32);
+    let adapted = fixture
+        .trace
+        .facts
+        .word(&Request::new(ROWS as u32, false).adapted(true));
+    assert_ne!(
+        adapted,
+        plain(ROWS),
+        "the fixture tells an adapted lane apart"
+    );
+
+    // Three plain prompts seat their rows: no region is cut.
+    let seated: Vec<Seated<'_>> = (0..3)
+        .map(|lane| Seated {
+            held: Some(0),
+            ..Seated::of(Lane {
+                slot: lane,
+                word: plain(ROWS),
+                tokens: &tokens[..ROWS],
+            })
+        })
+        .collect();
+    shell
+        .fire_seated(&seated)
+        .expect("three plain prompts fire");
+    let (_, whole) = shell.walked_serving();
+    shell.recorded_serving();
+
+    // A new plain prompt, a decode of the second seat, and a new prompt
+    // under an adapter.
+    let lane = |slot: u32, held: u32, word: u64, rows: usize| Seated {
+        held: Some(held),
+        ..Seated::of(Lane {
+            slot,
+            word,
+            tokens: &tokens[..rows],
+        })
+    };
+    let seated = [
+        lane(0, 0, plain(ROWS), ROWS),
+        lane(1, ROWS as u32, plain(1), 1),
+        Seated {
+            adapter: Some(0),
+            ..lane(2, 0, adapted, ROWS)
+        },
+    ];
+    let got = shell.fire_seated(&seated).expect("the mixed fire fires");
+    assert!(got[..2].iter().all(|row| row.iter().all(|v| v.is_finite())));
+    let (dispatches, launches) = shell.walked_serving();
+    assert!(
+        launches > whole,
+        "the mixed fire cut no region: {launches} launches, {whole} of the plain prompts"
+    );
+    assert_eq!(
+        shell.compiled(),
+        built,
+        "the mixed fire built a pipeline the load's walks did not name"
+    );
+    assert!(
+        dispatches <= u64::from(named.dispatches),
+        "the mixed fire encoded {dispatches} dispatches and the load named {} at most",
+        named.dispatches
+    );
+    eprintln!(
+        "mixed fire: {launches} launches ({whole} with no region cut), {dispatches} dispatches \
+         of {} named at most, {} pipelines built since the load, {} walked to be kept",
+        named.dispatches,
+        shell.compiled() - built,
+        shell.recorded_serving()
+    );
+}
+
+#[test]
+fn a_dense_miniature_fires_every_rung_from_what_the_load_built() {
+    every_rung_fires_what_the_load_built("qwen3-micro-text");
+}
+
+#[test]
+fn a_hybrid_miniature_fires_every_rung_from_what_the_load_built() {
+    every_rung_fires_what_the_load_built("qwen35-tiny");
+}
+
+#[test]
+fn a_windowed_miniature_fires_every_rung_from_what_the_load_built() {
+    every_rung_fires_what_the_load_built("gemma4-e4b-mini-l1");
+}
+
 /// Every byte a served miniature holds on the device is in the device's
 /// ledger under an owner, and the ledger holds within what the device has.
 #[test]
@@ -468,28 +639,30 @@ fn a_served_miniature_is_in_the_ledger_whole() {
         return;
     };
     let loaded = shell.device().outside();
-    let unbuilt = shell
-        .device()
-        .books()
-        .ledger()
-        .of(Class::Outside, "unbuilt pipelines");
+    let built = shell.compiled();
+    assert_eq!(
+        built,
+        shell.named().kernels.len() as u64,
+        "the load built other pipelines than the ones its walks named"
+    );
     serve_seats(&mut shell, &fixture.trace, 2);
     let books = shell.device().books();
     let ledger = books.ledger();
     assert_eq!(ledger.check(), Ok(()), "{ledger}");
     assert_eq!(books.audit().gap(), 0, "{ledger}");
-    // What serving made the driver allocate beside the reservations (the
-    // pipelines its fires built) is within what the load priced for it.
+    // Serving builds no pipeline: every one a fire asks for was named by
+    // the load's walks and built before it reserved.
     let served = shell.device().outside();
-    eprintln!(
-        "outside: {loaded} at load, {served} after serving, {unbuilt} priced for the \
-         pipelines unbuilt at load, {} built",
-        shell.compiled()
+    eprintln!("outside: {loaded} at load, {served} after serving, {built} pipelines built");
+    assert_eq!(
+        shell.compiled(),
+        built,
+        "a serving fire built a pipeline the load's walks did not name"
     );
     assert!(
-        served <= loaded + unbuilt,
-        "the driver holds {served} bytes beside the reservations after serving, {loaded} \
-         after the load, which priced {unbuilt} for the pipelines still to build: {ledger}"
+        served <= loaded,
+        "serving took {} bytes of the driver's own past what the load left it",
+        served - loaded
     );
     for class in [Class::Model, Class::State, Class::Fire] {
         assert!(
@@ -915,6 +1088,31 @@ fn trimmed_window_of(fixture: &Fixture, model: &str, page: u32, context: u32, pr
                 .map(|s| (s.id.0, s.kind, s.slot_bytes, s.slots_per_chunk))
                 .collect::<Vec<_>>()
         );
+        // What the load holds unservable, and what a bind that reads all
+        // such a class writes is answered.
+        let named = shell.named();
+        if let Some(held) = named.unservable.first() {
+            let classes = shell.classes();
+            let reads: Vec<(String, u32)> = classes.classes[held.class]
+                .outputs
+                .iter()
+                .map(|decl| (decl.name.clone(), 0))
+                .collect();
+            eprintln!(
+                "{model}: lane classes {:?} of {} held unservable; a bind reading {:?}: {:?}",
+                named
+                    .unservable
+                    .iter()
+                    .map(|held| held.class)
+                    .collect::<Vec<_>>(),
+                classes.classes.len(),
+                reads
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+                engine_gpu::naming::refuses(&named.unservable, &classes, &reads),
+            );
+        }
         // Each list the lane pages: its shape, tokens a slot, window,
         // slots a chunk.
         let lists: Vec<(ShapeId, u32, Option<u32>, u32)> = facts

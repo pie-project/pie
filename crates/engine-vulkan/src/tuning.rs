@@ -236,6 +236,27 @@ impl Tuning {
             .collect()
     }
 
+    /// Every rung a batch between the shapes `first` and `last` (one row
+    /// and the most a fire holds, the other widths the same) reaches: its
+    /// region meets the shapes between them and it fits one of the two,
+    /// since a rung tells rows apart only at one row ([`Qmm::fits_shape`]).
+    #[must_use]
+    pub fn qmm_between(&self, first: &QmmAt, last: &QmmAt) -> Vec<Qmm> {
+        use profile::Point as _;
+        let cell: Vec<profile::Set> = (0..Qmm::spec().vars.len())
+            .map(|var| match (first.coord(var), last.coord(var)) {
+                (Some(lo), Some(hi)) => profile::Set::span(lo, hi),
+                _ => unreachable!("a `kernel.qmm` point states every variable"),
+            })
+            .collect();
+        self.profile
+            .ladder::<Qmm>()
+            .meeting(&cell)
+            .filter(|rung| rung.fits(first) || rung.fits(last))
+            .copied()
+            .collect()
+    }
+
     #[must_use]
     pub fn gemm_coopmat(&self) -> bool {
         *self.profile.get::<GemmPath>() == GemmPath::Coopmat
@@ -301,6 +322,16 @@ impl engine_gpu::backend::Tactics for Tuning {
         bank: kernels_slang::Bank,
     ) -> Vec<kernels_slang::linear::qmm::Qmm> {
         crate::encode::qmm_ladder(self, rows, columns, contraction, bank)
+    }
+
+    fn qmm_rungs(
+        &self,
+        capacity: u32,
+        columns: u32,
+        contraction: u32,
+        bank: kernels_slang::Bank,
+    ) -> Vec<kernels_slang::linear::qmm::Qmm> {
+        crate::encode::qmm_rungs(self, capacity, columns, contraction, bank)
     }
 
     /// The subgroup tier where every subgroup holds a 32-lane strip; four
@@ -400,5 +431,29 @@ mod tests {
             t.qmm(&t.qmm_at(64, 4096, 4100, 4, 64))[0],
             Qmm::Qmv { vecs: 4 }
         );
+    }
+
+    /// The rungs between one row and a capacity hold the rungs of every
+    /// row count up to it.
+    #[test]
+    fn the_rungs_between_one_row_and_a_capacity_hold_every_row_counts_rungs() {
+        let mut r = Registry::new("vulkan-test", FACTS, AXES);
+        register(&mut r);
+        let t = Tuning::new(r.defaults(), Limits::ASSUMED);
+        for (n, k) in [(4096, 4096), (1024, 4100), (64, 64)] {
+            let at = |rows| t.qmm_at(rows, n, k, 4, 64);
+            for capacity in [1, 11, 12, 64, 300] {
+                let between = t.qmm_between(&at(1), &at(capacity));
+                for rows in 1..=capacity {
+                    for rung in t.qmm(&at(rows)) {
+                        assert!(
+                            between.contains(&rung),
+                            "{rows} rows of {n} columns over {k} reach {rung:?}, which the \
+                             rungs up to {capacity} rows leave out"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

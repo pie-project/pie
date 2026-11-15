@@ -99,6 +99,9 @@ pub struct Books {
     /// The bytes the device gave this process, as the backend counts them
     /// where it allocates.
     device: AtomicU64,
+    /// Whether these bytes are the process's: a device's are, and a naming
+    /// load's ([`Books::apart`]) reserve nothing.
+    process: bool,
 }
 
 impl Default for Books {
@@ -114,6 +117,17 @@ impl Books {
         Books {
             ledger: Mutex::new(Ledger::new(1, u64::MAX)),
             device: AtomicU64::new(0),
+            process: true,
+        }
+    }
+
+    /// Books apart from the process's tally: what a load would reserve,
+    /// entered while nothing is.
+    #[must_use]
+    pub fn apart() -> Books {
+        Books {
+            process: false,
+            ..Books::new()
         }
     }
 
@@ -124,7 +138,9 @@ impl Books {
     /// The device gave `bytes` to `owner`.
     pub fn take(&self, owner: Owner, bytes: u64) {
         self.device.fetch_add(bytes, Ordering::Relaxed);
-        PROCESS.fetch_add(bytes, Ordering::Relaxed);
+        if self.process {
+            PROCESS.fetch_add(bytes, Ordering::Relaxed);
+        }
         self.with(|ledger| {
             let held = ledger.of(owner.class, owner.name);
             ledger.enter(owner.class, owner.name, held.saturating_add(bytes));
@@ -134,7 +150,9 @@ impl Books {
     /// `owner` gave `bytes` back to the device.
     pub fn give(&self, owner: Owner, bytes: u64) {
         self.device.fetch_sub(bytes, Ordering::Relaxed);
-        PROCESS.fetch_sub(bytes, Ordering::Relaxed);
+        if self.process {
+            PROCESS.fetch_sub(bytes, Ordering::Relaxed);
+        }
         self.with(|ledger| {
             let held = ledger.of(owner.class, owner.name);
             ledger.enter(owner.class, owner.name, held.saturating_sub(bytes));

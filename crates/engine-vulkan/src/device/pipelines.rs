@@ -1,5 +1,5 @@
 #![allow(unsafe_code)]
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -41,14 +41,15 @@ impl Drop for Pipeline {
 #[derive(Default)]
 pub struct Pipelines {
     built: RefCell<HashMap<&'static str, Arc<Pipeline>>>,
-    compiles: Cell<u64>,
+    /// The kernels built, in the order their pipelines were.
+    order: RefCell<Vec<&'static str>>,
 }
 
 impl std::fmt::Debug for Pipelines {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pipelines")
             .field("pipelines", &self.built.borrow().len())
-            .field("compiles", &self.compiles.get())
+            .field("compiles", &self.order.borrow().len())
             .finish()
     }
 }
@@ -61,7 +62,15 @@ impl Pipelines {
 
     #[must_use]
     pub fn compiled(&self) -> u64 {
-        self.compiles.get()
+        self.order.borrow().len() as u64
+    }
+
+    /// The kernels whose pipelines were built after the first `from`, in
+    /// the order built.
+    #[must_use]
+    pub fn built_since(&self, from: u64) -> Vec<&'static str> {
+        let order = self.order.borrow();
+        order[(from as usize).min(order.len())..].to_vec()
     }
 
     /// The pipeline of kernels-slang's module `key` (an instantiation at a
@@ -85,9 +94,40 @@ impl Pipelines {
         let cache = device.pipeline_cache();
         let pipeline = Arc::new(build(device.core(), cache.handle(), file, key, code)?);
         cache.built();
-        self.compiles.set(self.compiles.get() + 1);
+        self.order.borrow_mut().push(key);
         self.built.borrow_mut().insert(key, Arc::clone(&pipeline));
         Ok(pipeline)
+    }
+
+    /// Holds kernel `key` of `file` to the storage buffers `device` binds a
+    /// shader stage: its layout declares every binding of its module one.
+    pub fn hold(device: &Context, file: &'static str, key: &'static str) -> Result<()> {
+        let shader = |why: String| Fault::Shader {
+            file,
+            entrypoint: key,
+            why,
+        };
+        let code = kernels_slang::spirv(key).ok_or_else(|| {
+            shader(
+                "kernels-slang holds no SPIR-V module by that key (built without \
+                 `kernels-slang/spirv`, or the instantiation is limited to WGSL)"
+                    .to_string(),
+            )
+        })?;
+        let words = spirv::words(code).map_err(|why| shader(why.to_string()))?;
+        let declared = spirv::declared(&words).map_err(|why| shader(why.to_string()))?;
+        let limit = device
+            .core()
+            .limits
+            .max_per_stage_descriptor_storage_buffers;
+        if declared.bindings > limit {
+            return Err(Fault::StageBuffers {
+                kernel: key.to_string(),
+                binds: declared.bindings,
+                limit,
+            });
+        }
+        Ok(())
     }
 }
 

@@ -124,6 +124,18 @@ pub trait Naming {
     /// One dispatch a host makes with whichever of `alternatives` its rows
     /// pick.
     fn either(&self, alternatives: &[Fire]) -> Result<(), Error>;
+
+    /// Opens the ways a host goes by a fire's rows, each a run of
+    /// dispatches: what is named until [`Naming::or`] or [`Naming::join`]
+    /// is the first way.
+    fn fork(&self);
+
+    /// Ends one way and opens the next.
+    fn or(&self);
+
+    /// Ends the last way: a fire makes the dispatches of one of them, so
+    /// the host counts as the longest and names the kernels of all.
+    fn join(&self);
 }
 
 /// Every kernel `pick` answers over `breaks`, the row counts its answer

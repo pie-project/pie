@@ -108,6 +108,10 @@ impl engine_gpu::backend::Frame<Api> for Frame {
         Frame::update(self, into, at, bytes)
     }
 
+    fn dispatches(&self) -> u64 {
+        Frame::dispatches(self)
+    }
+
     fn flush(&self) -> Result<()> {
         Frame::flush(self)
     }

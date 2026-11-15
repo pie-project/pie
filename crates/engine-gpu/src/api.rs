@@ -116,6 +116,9 @@ pub struct Gpu<B: Host> {
 
     /// A device the host handed over, adopted at the load.
     handed: Option<B::Handed>,
+
+    /// What the engine counts while it serves.
+    live: engine::live::Live,
 }
 
 impl<B: Host> Gpu<B> {
@@ -133,6 +136,32 @@ impl<B: Host> Gpu<B> {
             programs: B::Programs::default(),
             adapters: BTreeMap::new(),
             handed: None,
+            live: engine::live::Live::armed(),
+        }
+    }
+
+    /// Counts the pipelines the frame's fires built: the load built every
+    /// pipeline its walks named, so one built while serving is a fire that
+    /// ran what the load did not prepare ([`engine::live::Tally::Unrecorded`]).
+    /// And the steps a backend that keeps recordings walked to keep: a shape
+    /// recorded at its first serving fire ([`engine::live::Tally::Compiled`]).
+    fn count_built(&mut self) {
+        let built = self
+            .shell
+            .as_mut()
+            .map_or_else(Vec::new, Shell::built_serving);
+        // A kernel is built once, so each is named once.
+        for kernel in built {
+            self.live.tally(engine::live::Tally::Unrecorded, 1);
+            tracing::error!(
+                engine = B::KIND,
+                kernel,
+                "a serving fire asked for a pipeline no walk of the load named, and built it"
+            );
+        }
+        let recorded = self.shell.as_mut().map_or(0, Shell::recorded_serving);
+        if recorded > 0 {
+            self.live.tally(engine::live::Tally::Compiled, recorded);
         }
     }
 
@@ -287,9 +316,10 @@ pub fn fault(fault: Fault) -> Error {
         | Fault::Blocking { .. } => Error::Device(fault.to_string()),
         Fault::Fire(_) => Error::Invalid(fault.to_string()),
 
-        Fault::Residency(_) | Fault::Workgroups { .. } | Fault::StorageBuffers { .. } => {
-            Error::Impossible(fault.to_string())
-        }
+        Fault::Residency(_)
+        | Fault::Workgroups { .. }
+        | Fault::StorageBuffers { .. }
+        | Fault::StageBuffers { .. } => Error::Impossible(fault.to_string()),
     }
 }
 
@@ -424,6 +454,10 @@ where
         self.caps.as_ref().map(|caps| &caps.device)
     }
 
+    fn live(&self) -> engine::live::Live {
+        self.live.clone()
+    }
+
     fn bind_thread(&mut self) -> EngineResult<()> {
         match self.shell.as_ref() {
             Some(shell) => shell.bind_thread().map_err(fault),
@@ -493,6 +527,7 @@ where
             handed: self.handed.take(),
         })
         .map_err(fault)?;
+        self.programs.load(&place(&shell)).map_err(refusal)?;
         // The fire the shell took, which a binding may have bounded below
         // the one asked.
         let (max_lanes, max_tokens) = (shell.budget().max_lanes, shell.budget().max_tokens);
@@ -720,11 +755,13 @@ where
                 }
                 Err(error) => {
                     self.pending = None;
+                    self.count_built();
                     return Err(error);
                 }
             }
         }
         B::submitted(self);
+        self.count_built();
         let mut ticket = FrameTicket { id, steps };
         self.pending = Some((id, pending));
 
@@ -766,6 +803,20 @@ where
             .programs
             .bind(binding, place.as_ref())
             .map_err(refusal)?;
+
+        // A lane that only classes the kernels refuse serve is refused
+        // here, where its first fire would be.
+        let unserved = self.shell.as_ref().and_then(|shell| {
+            let unservable = &shell.named().unservable;
+            if unservable.is_empty() {
+                return None;
+            }
+            crate::naming::refuses(unservable, &shell.classes(), &self.programs.reads(bound.id))
+        });
+        if let Some(why) = unserved {
+            let _ = self.programs.close_instance(bound.id);
+            return Err(Error::Program(why));
+        }
 
         let seeds: Vec<(u32, Vec<u8>)> = binding
             .seeds

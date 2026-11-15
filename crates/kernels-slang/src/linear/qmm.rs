@@ -162,12 +162,12 @@ fn fire(
     capacity_rows: u32,
 ) -> Result<(), Error> {
     let b = bounds(op, act, w, y)?;
-    if b.m == 0 {
-        return Ok(());
-    }
     let target = ctx.target();
     if let Some(names) = ctx.naming() {
         return names.either(&kernels(target, op, ladder, &b, capacity_rows)?);
+    }
+    if b.m == 0 {
+        return Ok(());
     }
     for rung in ladder {
         if let Some(kernel) = kernel(target, op, *rung, &b, capacity_rows)? {

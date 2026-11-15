@@ -70,12 +70,12 @@ pub fn act_x_wt(
 ) -> Result<(), Error> {
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
     let (m, n, k) = extent(op, act, w, y)?;
-    if m == 0 {
-        return Ok(());
-    }
     let target = ctx.target();
     if let Some(names) = ctx.naming() {
         return names.either(&kernels(target, tactic, op, n, k)?);
+    }
+    if m == 0 {
+        return Ok(());
     }
     ctx.fire(
         kernel(target, tactic, op, m, n, k)?,
@@ -251,4 +251,36 @@ pub(crate) fn extent(
         "the activation's rows are the rows the result lands"
     );
     Ok((y.rows, y.width, act.width))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A projection's naming is every kernel its rows pick: the kernel of
+    /// each row count is one of [`kernels`]'.
+    #[test]
+    fn the_kernels_a_projection_names_hold_the_kernel_of_every_row_count() {
+        for target in [Target::Spirv, Target::Wgsl] {
+            for tier in [Tier::Baseline, Tier::Subgroup, Tier::Coopmat] {
+                let tactic = Tactic { tier };
+                for (n, k) in [(64, 64), (1024, 1024), (1030, 1001), (48, 16), (8, 24)] {
+                    let named: Vec<(&str, Tier)> = kernels(target, tactic, "linear.matmul", n, k)
+                        .unwrap()
+                        .iter()
+                        .map(|fire| (fire.entrypoint, fire.tier))
+                        .collect();
+                    for m in 1..=300 {
+                        let picked = kernel(target, tactic, "linear.matmul", m, n, k).unwrap();
+                        assert!(
+                            named.contains(&(picked.entrypoint, picked.tier)),
+                            "{target:?} {tier:?}: {m} rows of {n} columns over {k} pick {}, \
+                             which the projection does not name",
+                            picked.entrypoint
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
