@@ -200,30 +200,6 @@ pub fn sort_desc_order(row: &[f32]) -> Vec<u32> {
     idx
 }
 
-/// The top-k cut: `keep[i] = 1` iff `row[i]` is not NaN and fewer than `kk`
-/// non-NaN elements are strictly greater than it; NaN keeps 0. Ties at the
-/// cut are all kept. With `t` the `kk`-th largest non-NaN value, an element
-/// `v` has fewer than `kk` elements above it iff `v >= t`, so one selection
-/// (O(V) expected) decides the row instead of a count per element.
-fn rank_cut(row: &[f32], kk: usize, keep: &mut [u8]) {
-    if kk == 0 {
-        return;
-    }
-    let mut live: Vec<f32> = row.iter().copied().filter(|v| !v.is_nan()).collect();
-    if kk >= live.len() {
-        for (k, v) in keep.iter_mut().zip(row) {
-            *k = u8::from(!v.is_nan());
-        }
-        return;
-    }
-    let (_, &mut t, _) = live.select_nth_unstable_by(kk - 1, |a, b| {
-        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    for (k, &v) in keep.iter_mut().zip(row) {
-        *k = u8::from(v >= t);
-    }
-}
-
 fn nucleus_prefix(row: &[f32], p: f32, keep: &mut [u8]) -> bool {
     if p.is_nan() {
         return false;
@@ -860,7 +836,7 @@ pub fn eval_op(op: &LaunchOp, package: &LaunchPackage, vals: &mut [Value]) -> Re
                     0 => {
                         let kv = vals[payload].lanes_i64();
                         let kk = kv[pick(kv.len(), r)].clamp(0, len as i64);
-                        rank_cut(row, kk as usize, k);
+                        eta_ir::rank::rank_cut(row, kk as usize, |i| k[i] = 1);
                     }
 
                     1 => {
@@ -1066,7 +1042,7 @@ pub fn eval_op(op: &LaunchOp, package: &LaunchPackage, vals: &mut [Value]) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::{argmax_row, canonical_reduce_by, rank_cut};
+    use super::{argmax_row, canonical_reduce_by};
 
     /// The one-element scan `argmax_row` replaced, its reference.
     fn argmax_row_scan(row: &[f32]) -> i32 {
@@ -1150,72 +1126,6 @@ mod tests {
         same(&[0.0, -0.0]);
         same(&[f32::NAN, f32::NEG_INFINITY, f32::NAN]);
         same(&[f32::NAN, -0.0, f32::NAN, 0.0, 0.0]);
-    }
-
-    /// The per-element count `rank_cut` replaced, its reference.
-    fn rank_cut_count(row: &[f32], kk: usize) -> Vec<u8> {
-        let mut keep = vec![0u8; row.len()];
-        for i in 0..row.len() {
-            if row[i].is_nan() {
-                continue;
-            }
-            let greater = row.iter().filter(|&&y| !y.is_nan() && y > row[i]).count();
-            keep[i] = u8::from(greater < kk);
-        }
-        keep
-    }
-
-    /// The selected top-k cut keeps exactly what the per-element count did:
-    /// random rows with ties, NaN, ±inf and ±0 (a small value set, or every
-    /// special), k at 0, 1, mid, len-1, len and past len.
-    #[test]
-    fn the_selected_rank_cut_keeps_what_the_count_did() {
-        let mut state = 0xD1B5_4A32_D192_ED03u64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        let mut special_state = 0x9E37_79B9_7F4A_7C15u64;
-        let small = [
-            f32::NAN,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            0.0,
-            -0.0,
-            1.0,
-            2.0,
-            -1.0,
-        ];
-        let mut rows: Vec<Vec<f32>> = vec![
-            vec![],
-            vec![f32::NAN; 5],
-            vec![f32::INFINITY; 4],
-            vec![f32::NEG_INFINITY, f32::NAN, f32::NEG_INFINITY],
-            vec![-0.0, 0.0, -0.0, 0.0],
-        ];
-        for len in [1usize, 2, 3, 7, 16, 64, 129, 300] {
-            for _ in 0..60 {
-                rows.push(
-                    (0..len)
-                        .map(|_| small[(next() % small.len() as u64) as usize])
-                        .collect(),
-                );
-                rows.push((0..len).map(|_| special(&mut special_state)).collect());
-            }
-        }
-        for row in &rows {
-            let len = row.len();
-            let live = row.iter().filter(|v| !v.is_nan()).count();
-            let mut ks = vec![0, 1, len / 2, len.saturating_sub(1), len, len + 3];
-            ks.extend([live.saturating_sub(1), live, live + 1]);
-            for kk in ks {
-                let mut keep = vec![0u8; len];
-                rank_cut(row, kk, &mut keep);
-                assert_eq!(keep, rank_cut_count(row, kk), "k={kk} row={row:?}");
-            }
-        }
     }
 
     #[derive(Clone, Copy, Debug)]

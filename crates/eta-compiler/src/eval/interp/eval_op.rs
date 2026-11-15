@@ -385,14 +385,7 @@ pub(crate) fn eval_op(
                     Predicate::RankLe(kid) => {
                         let kv = lanes_i64(v(kid));
                         let kk = kv[pick(kv.len(), r)].clamp(0, len as i64);
-                        for (i, &xi) in row.iter().enumerate() {
-                            if xi.is_nan() {
-                                continue;
-                            }
-                            let greater =
-                                row.iter().filter(|&&y| !y.is_nan() && y > xi).count() as i64;
-                            k[i] = greater < kk;
-                        }
+                        eta_ir::rank::rank_cut(row, kk as usize, |i| k[i] = true);
                     }
                     Predicate::CummassLe(pid) => {
                         let pv = lanes_f32(v(pid));
