@@ -155,5 +155,7 @@ fn two_frames_of_four_fires_outstanding_fit_two_frames_in_flight() {
     let (narrow, refused) = outstanding(1);
     crate::common_llm::set_knob("FRAMES", 1);
     assert_eq!(refused, Some(narrow), "a ring {narrow} deep refuses fire {narrow}");
-    eprintln!("two frames of four fires outstanding: held at depth {depth}, refused at depth {narrow}");
+    eprintln!(
+        "two frames of four fires outstanding: held at depth {depth}, refused at depth {narrow}"
+    );
 }
