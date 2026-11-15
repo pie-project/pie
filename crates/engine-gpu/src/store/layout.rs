@@ -441,7 +441,9 @@ impl Layout {
         }
         ChunkFacts {
             span_backed_on_demand: false,
-            act_span_chunks: None,
+            // The span is laid once, at the load, as wide as its largest
+            // rung: what a fire takes beside its carve lies inside it.
+            act_span_chunks: act_chunks.last().map(|&(_, chunks)| chunks),
             chunk_bytes: self.chunk_bytes,
             total_chunks: self.total_chunks,
             segment_chunks: self.segment_chunks,
