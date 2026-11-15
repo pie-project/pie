@@ -272,14 +272,6 @@ pub fn cap_for(shared: &Shared, rows: u32) -> u32 {
     }
 }
 
-/// The cap a raise toward `rows` reaches: the rung that holds them, within
-/// the widest rung the programs' fire terms fit.
-#[must_use]
-pub fn reach_for(shared: &Shared, rows: u32) -> u32 {
-    let pool = shared.lock().unwrap();
-    pool.lifted(pool.rung_for(rows)).min(pool.fit_cap())
-}
-
 /// One line for a raise taken: at debug where the rung stood (a guest term
 /// that grew under it, once a bind), at info where the rung moved.
 pub(crate) fn raise_said(engine: usize, rung: u32, moved: usize, stood: bool) {
