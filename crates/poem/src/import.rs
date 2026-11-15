@@ -2674,11 +2674,15 @@ fn channel_axis(w: &Weight) -> u8 {
     u8::try_from(last).expect("an axis inside a shape")
 }
 
+/// The axis a weight's legs join along: a cut weight's cut (its legs are
+/// the bands its ranks hold), and a replicated one's first axis, as
+/// `read_concat` states it lands its parts (a checkpoint's row shards). A
+/// replicated weight panicked here, so every load of a package that reads a
+/// whole table from row shards (Qwen4's PLE n-gram table, from any layout
+/// but NVFP4) was refused at import.
 fn pack_axis(w: &Weight) -> u8 {
     match &w.shard {
-        Shard::Replicated | Shard::Inferred => {
-            panic!("`{}` is replicated and has no cut axis", w.name)
-        }
+        Shard::Replicated | Shard::Inferred => 0,
         Shard::Cut { axis, .. } => as_axis(*axis, &w.name),
     }
 }

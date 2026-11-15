@@ -106,6 +106,8 @@ fn ready() -> Option<Shell> {
         "a GDN plan reserved no buffered page slab, so nothing below can be true"
     );
     assert!(shell.serves_rs_verbs());
+    let per_page = shell.pool_layout().rs_tokens.max(1);
+    let _ = PAGES.set((3 * WINDOW as u32).div_ceil(per_page));
     Some(shell)
 }
 
@@ -115,8 +117,14 @@ fn window(seed: u32) -> Vec<u32> {
         .collect()
 }
 
+/// The buffer pages a lane names: as many as the most tokens a fire below
+/// buffers (a window replayed beside the next) takes at the load's tokens a
+/// page. One page was a fixed count, short once a page held fewer tokens
+/// than a window and a half.
+static PAGES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
 fn pages() -> Vec<u32> {
-    vec![0]
+    (0..*PAGES.get().expect("the shell's buffer pages, stated at its load")).collect()
 }
 
 /// A buffering verb whose state holds the slots below `folded`: a fire whose
