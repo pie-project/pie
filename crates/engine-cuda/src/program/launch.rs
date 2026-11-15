@@ -1252,6 +1252,7 @@ impl Prepared {
             .checked_add(self.output_slots.checked_mul(lane)?)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_intrinsic(
         &mut self,
         lane: u32,

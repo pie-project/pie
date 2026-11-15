@@ -678,6 +678,7 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         ));
         let more: Vec<&[u32]> = windows.iter().skip(1).map(Vec::as_slice).collect();
         let window = windows.first().map_or(&[][..], Vec::as_slice);
+        #[allow(clippy::type_complexity)]
         fn seat<'a>(
             (pages, window, more, record): (&'a [u32], &'a [u32], &'a [&'a [u32]], Option<u32>),
             word: u64,
@@ -708,7 +709,11 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             Some(replay) => {
                 let skipped = tokens.len() - replay.window as usize;
                 shell
-                    .fire_media(&[seated(word | replay.bit, &tokens[..skipped], fed)], &[], &[])
+                    .fire_media(
+                        &[seated(word | replay.bit, &tokens[..skipped], fed)],
+                        &[],
+                        &[],
+                    )
                     .expect("the encoder-only rows fire");
                 (skipped, fed + u32::try_from(skipped).expect("a count"))
             }
@@ -2277,6 +2282,7 @@ enum Serving {
 /// then, the first still holding its record and pages, the second the same
 /// prompt from a record and pages of its own. Each set's steps' hashes and
 /// top tokens.
+#[allow(clippy::type_complexity)]
 fn served_two_sets(
     fixture: &Fixture,
     cache: &Path,

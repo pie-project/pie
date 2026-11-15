@@ -1677,10 +1677,7 @@ impl Frame {
         })
     }
 
-    pub fn commit_async(
-        mut self,
-        on_done: Option<engine_gpu::backend::OnDone>,
-    ) -> Result<Pending> {
+    pub fn commit_async(mut self, on_done: Option<engine_gpu::backend::OnDone>) -> Result<Pending> {
         let at = crate::encode::profiling().then(std::time::Instant::now);
         self.submit()?;
         if let Some(at) = at {

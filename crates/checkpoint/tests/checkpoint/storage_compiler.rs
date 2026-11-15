@@ -2314,7 +2314,12 @@ fn an_affine_encode_lays_its_scales_by_the_group_it_states() {
         let cols = 256 / i64::from(group);
         for id in [Some(attach.scale_tensor), attach.zero_point_tensor] {
             let plane = &plan.tensors[id.expect("a zero point").0 as usize];
-            assert_eq!(plane.shape, vec![2, 8, cols], "u{bits} g{group}: {}", plane.name);
+            assert_eq!(
+                plane.shape,
+                vec![2, 8, cols],
+                "u{bits} g{group}: {}",
+                plane.name
+            );
         }
     }
     let spec = QuantSpec {

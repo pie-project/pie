@@ -216,7 +216,12 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
         if !evacuation.moves.is_empty() || pool.apply_rung(&evacuation, 0).is_err() {
             return;
         }
-        tracing::info!(engine, rung = goal, moved = 0, "the activation rung is raised");
+        tracing::info!(
+            engine,
+            rung = goal,
+            moved = 0,
+            "the activation rung is raised"
+        );
     }
     // The rung holds `goal` now: fires may take its width.
     let cap = lifted(goal);

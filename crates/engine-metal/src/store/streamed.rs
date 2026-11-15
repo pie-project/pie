@@ -214,11 +214,11 @@ pub fn streamed_experts(trace: &Trace) -> Vec<usize> {
         .filter(|&at| tabled_codes(trace.params[at].dtype))
         .collect();
     let lead = leads(trace);
-    for at in 0..trace.params.len() {
+    for (at, &plane) in lead.iter().enumerate() {
         if !expert(at) || banks.contains(&at) {
             continue;
         }
-        let companion = lead[at] != at && quantized.contains(&lead[at]);
+        let companion = plane != at && quantized.contains(&plane);
         let bias = trace.params[at].dtype == poem_ir::Dtype::Bf16
             && read_only_by(trace, at, |op| {
                 matches!(op, Operation::Linear(Linear::MoeSelect {

@@ -304,6 +304,7 @@ pub(crate) enum PoolOp {
 /// A read or write of host kv slots' bytes, behind every copy queued before
 /// it.
 #[derive(Debug)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) enum HostKvOp {
     Write(Vec<u32>, Vec<u8>),
     /// The engine's host-tier layout, as JSON; empty when it cannot say.

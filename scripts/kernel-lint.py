@@ -512,7 +512,8 @@ def slang_checks():
                     findings.append(f"{rel}:{line}: `{m.group(1)}` names no `pie:instantiate` entry")
     for unit, names in units.items():
         for name in names:
-            if not any(p.fullmatch(name) for p in patterns):
+            plain = re.sub(r"_(chunked|committed)_snap", r"_\1", name, count=1)
+            if not any(p.fullmatch(name) or p.fullmatch(plain) for p in patterns):
                 findings.append(f"{SLANG_TREE}/{unit}.slang: `{name}` is named by no host code")
     return findings
 

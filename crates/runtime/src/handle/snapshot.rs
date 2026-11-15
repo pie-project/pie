@@ -105,7 +105,9 @@ mod links {
 
     #[cfg(windows)]
     #[allow(unsafe_code)]
-    fn info(path: &Path) -> io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
+    fn info(
+        path: &Path,
+    ) -> io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
         let file = std::fs::File::open(path)?;

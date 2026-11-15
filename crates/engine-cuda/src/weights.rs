@@ -308,11 +308,10 @@ fn restore_from_checkpoint(
     }
     eprintln!(
         "engine-cuda: this boot read its whole image out of {:?} — {} device image(s) \
-         pumped and {} T1 plane(s) {}, so the executor never ran",
+         pumped and {} T1 plane(s) copied and verified, so the executor never ran",
         serving.path(),
         pumped,
         pinned,
-        "copied and verified",
     );
     Ok(())
 }
@@ -2097,9 +2096,9 @@ pub(crate) fn laid_planes(trace: &Trace) -> Vec<Laid> {
             Dtype::E4m3g128 => 1,
             _ => continue,
         };
-        let (rows, k, leads) = match param.shape.as_slice() {
-            &[n, k] => (n, k, 1),
-            &[e, n, k] => (n, k, e),
+        let (rows, k, leads) = match *param.shape.as_slice() {
+            [n, k] => (n, k, 1),
+            [e, n, k] => (n, k, e),
             _ => continue,
         };
         if rows == 0 || k == 0 || !rows.is_multiple_of(128) || !k.is_multiple_of(128) {

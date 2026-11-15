@@ -216,6 +216,7 @@ struct Cache<B: Backend> {
     staged: Vec<B::Buffer>,
     /// The same an arm each, laid by the host before the arm's fire by the
     /// fire's own token ids ([`RowCaches::prestage`]): `[arm][table]`.
+    #[allow(clippy::type_complexity)]
     ring: Vec<(Vec<B::Buffer>, Vec<B::Buffer>)>,
     /// The set is the load's for life.
     held: bool,

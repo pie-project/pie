@@ -551,7 +551,10 @@ impl Shell {
         // budget of kv pages and state slots does not pay for: off the room.
         let reserved = crate::store::reserved_bytes(
             &boot.trace,
-            paging_at(u64::from(boot.context.div_ceil(boot.page_size.max(1))), boot.slots)?,
+            paging_at(
+                u64::from(boot.context.div_ceil(boot.page_size.max(1))),
+                boot.slots,
+            )?,
             rs_layout.as_deref(),
             target,
         )?;
@@ -630,7 +633,7 @@ impl Shell {
             u64::from(tokens.div_ceil(boot.page_size.max(1))).clamp(1, least)
         });
         let fitted = |one_slot: u64| {
-            engine::fit::pool_for(boot.kv_budget, boot.slots, one_slot, room, &demand)
+            engine::fit::pool_for(boot.kv_budget, boot.slots, one_slot, room, demand)
         };
         let (fit, slots) = match fitted(seat) {
             Ok((fit, slots)) if fit >= least => (fit, slots),

@@ -12,8 +12,8 @@ mod posted;
 
 use engine::Engine;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
-use engine::chunk::{ChunkFacts, DegenerateBytes};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
+use engine::chunk::{ChunkFacts, DegenerateBytes};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout};
 use engine::load::{Checkpoint, LoadFacts, LoadRequest, Loaded};
@@ -134,9 +134,7 @@ impl Engine for Spatial {
             ));
         }
         if residency.host_kv_budget.is_some_and(|bytes| bytes > 0) {
-            tracing::warn!(
-                "the spatial engine states no host kv tier: host_kv_budget is not used"
-            );
+            tracing::warn!("the spatial engine states no host kv tier: host_kv_budget is not used");
         }
         let Checkpoint::Path(path) = checkpoint else {
             return Err(Error::Load(

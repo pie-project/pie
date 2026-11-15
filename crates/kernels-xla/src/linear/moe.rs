@@ -2514,7 +2514,7 @@ pub fn experts(
     };
     let glu_inside = tuning.moe_gmm_glu
         && up.tm >= 64
-        && (intermediate % 128 == 0 || up.tm >= 128)
+        && (intermediate.is_multiple_of(128) || up.tm >= 128)
         && up.stepping()
         && up.orient == crate::linear::moe_gmm::Orient::NMajor
         && inside.kernel().is_ok();

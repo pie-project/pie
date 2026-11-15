@@ -239,7 +239,7 @@ impl SharedGrow {
 
     async fn run(self) {
         loop {
-            let _ = tokio::time::timeout(POLL, self.wake.notified()).await;
+            let _ = crate::rt::time::timeout(POLL, self.wake.notified()).await;
             self.walk().await;
         }
     }
@@ -355,5 +355,4 @@ impl PoolTarget for SharedGrow {
     fn take_refused(&mut self) -> bool {
         self.refused.swap(false, Ordering::AcqRel)
     }
-
 }

@@ -233,6 +233,7 @@ pub struct RsCopyPlan {
 
 /// What a set holds, in its own numbering: see [`RsEntry`].
 #[derive(Debug, Clone)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub struct RsExport {
     pub folded: Option<RsSlotId>,
     pub buffer: Vec<Option<RsSlotId>>,
@@ -509,7 +510,8 @@ impl RsStore {
     /// nothing off, and a waiter's on top.
     pub fn demand(&self) -> (u32, u32) {
         let reach = self.slots.high_end().max(self.pages.high_end());
-        let out = |pool: &ShapePool<RsSlotId>| pool.capacity().saturating_sub(pool.available() as u32);
+        let out =
+            |pool: &ShapePool<RsSlotId>| pool.capacity().saturating_sub(pool.available() as u32);
         let wanted = out(&self.slots).max(out(&self.pages));
         let kept: HashSet<RsSlotId> = self
             .checkpoints
@@ -729,6 +731,7 @@ impl RsStore {
     }
 
     /// What a snapshot keeps of `ws`, on the rows it stands on now.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn export(&self, ws: RsWorkingSetId) -> Result<RsExport, RsError> {
         let entry = self.entry(ws)?;
         Ok(RsExport {
@@ -742,6 +745,7 @@ impl RsStore {
     }
 
     /// Whether `id` is a host row already.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn on_host(&self, id: RsSlotId) -> bool {
         self.is_host(id)
     }
@@ -753,6 +757,7 @@ impl RsStore {
     /// (a slot of each fixed shape a piece) and rs list or window slots,
     /// whose bytes the engine reads and writes by those refs
     /// ([`Self::tier_refs`], `Engine::read_tier_slots`).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn take_host(&mut self, slots: usize, pages: usize) -> Option<Vec<RsSlotId>> {
         let mut rows = self.host_slots.try_alloc_n(slots)?;
         let Some(buffer) = self.host_pages.try_alloc_n(pages) else {
@@ -763,6 +768,7 @@ impl RsStore {
         Some(rows)
     }
 
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn give_host(&mut self, rows: Vec<RsSlotId>) {
         self.release_host(rows);
     }
@@ -771,6 +777,7 @@ impl RsStore {
     /// row in order, the refs of each shape it spans (a record's pieces, a
     /// list slot), runs of one shape merged. The order the bytes of
     /// `Engine::read_tier_slots` lie in.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn tier_refs(&self, rows: &[RsSlotId]) -> Vec<(::engine::chunk::ShapeId, Vec<u32>)> {
         let mut out: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = Vec::new();
         for &row in rows {
@@ -786,6 +793,7 @@ impl RsStore {
 
     /// A shared pool's copy of device rows to host rows, `(device, host)`
     /// pairs, shape by shape: what `copy_slots` moves.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn tier_copies(
         &self,
         moves: &[(RsSlotId, RsSlotId)],
@@ -810,6 +818,7 @@ impl RsStore {
     }
 
     /// A set of its own on host rows, as `export` said one stood.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn import(&mut self, geom: RsGeometry, set: RsExport) -> RsWorkingSetId {
         self.working_sets.insert(RsEntry {
             geom,

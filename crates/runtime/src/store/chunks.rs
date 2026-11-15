@@ -360,9 +360,11 @@ impl<I: PoolId> ShapePool<I> {
     pub fn capacity(&self) -> u32 {
         match &self.slots {
             Backing::Own(_) => self.capacity,
-            Backing::Shape(shared, shape) => {
-                shared.lock().unwrap().shape_capacity(*shape).min(self.capacity)
-            }
+            Backing::Shape(shared, shape) => shared
+                .lock()
+                .unwrap()
+                .shape_capacity(*shape)
+                .min(self.capacity),
             Backing::Records(shared) => shared.lock().unwrap().records_capacity(),
         }
     }
