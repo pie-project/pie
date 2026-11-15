@@ -22,7 +22,7 @@ use crate::backend::{Backend, Buffer as _, Context as _, Frame as _, Pending as 
 use crate::error::{Fault, Result};
 use crate::handles::Handles;
 use crate::inputs::Inputs;
-use crate::run::{CacheGeometry, CacheTable, FireBindings, FireTables, Run, SlotTable};
+use crate::run::{CacheGeometry, CacheTable, FireBindings, FireTables, Run, Scored, SlotTable};
 use crate::settle::{Airborne, Arms, Done};
 use crate::store::Pools;
 use crate::store::frozen::{DeviceFold, LaneFold, counted_on_device, merged};
@@ -520,6 +520,9 @@ struct ReadoutPlane {
     width: u32,
     dtype: Dtype,
     voxels: bool,
+    /// Whether its values are capture planes, which hold a row for each of
+    /// a fire's capturing lanes and none for the others ([`Scored`]).
+    captured: bool,
 }
 
 impl ReadoutPlane {
@@ -726,61 +729,7 @@ impl<B: Serve> Shell<B> {
                 boot.runahead.frames_in_flight,
             );
         }
-        let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
-
         let facts = kv::probe(&boot.trace)?;
-
-        crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
-
-        let token_gridded = poem_exec::feeds::classes_reading(&boot.trace, &compiled, |def| {
-            matches!(def, poem_ir::Def::Input(RuntimeInput::TokenGrid { .. }))
-        });
-
-        let mut masked = poem_ir::ClassSet::default();
-        for region in compiled.template() {
-            let runs_masked = region.nodes.clone().any(|node| {
-                matches!(
-                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(poem_ir::Operation::Attn(
-                        poem_ir::Attn::Prefill {
-                            mask: Some(_),
-                            selection: None,
-                            bias: None,
-                            lse: None,
-                            ..
-                        } | poem_ir::Attn::Prefill {
-                            mask: Some(_),
-                            selection: None,
-                            bias: None,
-                            lse: Some(_),
-                            ..
-                        }
-                    ))
-                )
-            });
-            if runs_masked {
-                for class in region.mask.iter() {
-                    masked.insert(class);
-                }
-            }
-        }
-
-        let mut corrected = poem_ir::ClassSet::default();
-        for region in compiled.template() {
-            let runs_correction = region.nodes.clone().any(|node| {
-                matches!(
-                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(poem_ir::Operation::Linear(
-                        poem_ir::Linear::LoraCorrect { .. }
-                    ))
-                )
-            });
-            if runs_correction {
-                for class in region.mask.iter() {
-                    corrected.insert(class);
-                }
-            }
-        }
 
         let handles = Handles::new();
 
@@ -866,19 +815,108 @@ impl<B: Serve> Shell<B> {
         // a rung below the top lends the span under its carve to state and
         // a raise evacuates it (`Engine::evacuate`). A rung is a function of
         // the fire's rows: a recorded frame binds one rung's place only.
-        let top = budgets.tokens.max_tokens;
-        let mut rung_tokens = engine::memory::rungs(1, top);
-        if rung_tokens.last() != Some(&top) {
-            rung_tokens.push(top);
+        //
+        // A rung whose span cannot lie in one binding is no rung of this
+        // device: the span lies in the pool's last segment, and no segment
+        // is past a binding. The top is the widest rung that can; a fire
+        // wider than it has no carve, so the load's fires are cut to it and
+        // the model compiled again at it (its own carve is laid again, as
+        // it may differ from the rung's laid under the wider top).
+        let binding = device.max_buffer();
+        // The top asked and its rungs' `(tokens, span bytes)`, once bounded.
+        let mut unbounded: Option<(u32, Vec<(u32, u64)>)> = None;
+        let (compiled, mut span) = loop {
+            let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
+            let top = budgets.tokens.max_tokens;
+            let mut rung_tokens = engine::memory::rungs(1, top);
+            if rung_tokens.last() != Some(&top) {
+                rung_tokens.push(top);
+            }
+            let span = Span::plan(
+                &boot.trace,
+                &compiled,
+                &budgets,
+                &rung_tokens,
+                least,
+                &tuning,
+            )?;
+            let spans: Vec<(u32, u64)> = span
+                .rungs()
+                .iter()
+                .map(|rung| (rung.tokens, rung.bytes()))
+                .collect();
+            match crate::arena::bound_top(&spans, binding) {
+                Some(widest) if widest < top => {
+                    unbounded.get_or_insert((top, spans));
+                    budgets.tokens = crate::arena::bounded_budget(&budgets.tokens, widest);
+                    boot.budget = budgets.tokens.clone();
+                }
+                // None: not even the least rung lies in one binding, and
+                // the pool refuses the load below.
+                _ => break (compiled, span),
+            }
+        };
+        if let Some((asked, spans)) = unbounded {
+            tracing::info!(
+                asked,
+                top = budgets.tokens.max_tokens,
+                spans = ?spans,
+                "the top rung is bounded by this device's largest binding: {} MiB",
+                binding >> 20
+            );
         }
-        let mut span = Span::plan(
-            &boot.trace,
-            &compiled,
-            &budgets,
-            &rung_tokens,
-            least,
-            &tuning,
-        )?;
+
+        crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
+
+        let token_gridded = poem_exec::feeds::classes_reading(&boot.trace, &compiled, |def| {
+            matches!(def, poem_ir::Def::Input(RuntimeInput::TokenGrid { .. }))
+        });
+
+        let mut masked = poem_ir::ClassSet::default();
+        for region in compiled.template() {
+            let runs_masked = region.nodes.clone().any(|node| {
+                matches!(
+                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
+                    Some(poem_ir::Operation::Attn(
+                        poem_ir::Attn::Prefill {
+                            mask: Some(_),
+                            selection: None,
+                            bias: None,
+                            lse: None,
+                            ..
+                        } | poem_ir::Attn::Prefill {
+                            mask: Some(_),
+                            selection: None,
+                            bias: None,
+                            lse: Some(_),
+                            ..
+                        }
+                    ))
+                )
+            });
+            if runs_masked {
+                for class in region.mask.iter() {
+                    masked.insert(class);
+                }
+            }
+        }
+
+        let mut corrected = poem_ir::ClassSet::default();
+        for region in compiled.template() {
+            let runs_correction = region.nodes.clone().any(|node| {
+                matches!(
+                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
+                    Some(poem_ir::Operation::Linear(
+                        poem_ir::Linear::LoraCorrect { .. }
+                    ))
+                )
+            });
+            if runs_correction {
+                for class in region.mask.iter() {
+                    corrected.insert(class);
+                }
+            }
+        }
         let device_cap = device
             .left()
             .saturating_sub(u64::from(least_chunks) * chunk)
@@ -1092,6 +1130,7 @@ impl<B: Serve> Shell<B> {
                     width: rect.width,
                     dtype: rect.dtype,
                     voxels: output.decl.axis == poem_ir::InputAxis::Voxel,
+                    captured: span.captured(output.values[0]),
                 });
             }
             let out_width = match out {
@@ -1100,6 +1139,31 @@ impl<B: Serve> Shell<B> {
             };
             (out_width, pixels, readouts)
         };
+        // A fire is seated the capture planes' rows for its capturing lanes
+        // beside its carve, and cut to a rung they fit beside by the term
+        // its programs' reads state (`Shell::capture_term`): a class writes
+        // a capture plane only under the switch such a read sets.
+        for plane in readouts.iter().filter(|plane| plane.captured) {
+            for class in plane.classes.iter() {
+                let switched = compiled.classes.classes.get(class).is_some_and(|class| {
+                    class
+                        .words
+                        .iter()
+                        .all(|&word| boot.trace.facts.holds(word, poem_ir::Builtin::Scores))
+                });
+                if !switched {
+                    return Err(Fault::Program {
+                        at: "Shell::load",
+                        why: format!(
+                            "class {class} writes the capture planes of output `{}` in a word \
+                             that does not hold the scores switch, so no read states the \
+                             planes its lanes take",
+                            plane.output
+                        ),
+                    });
+                }
+            }
+        }
         let pixel_out = match pixels.iter().map(|plane| plane.4).max() {
             Some(bytes) => (0..arms)
                 .map(|_| B::Buffer::host(&device, bytes, crate::books::owners::READOUT))
@@ -1151,36 +1215,19 @@ impl<B: Serve> Shell<B> {
         // budget states for state.
         let act_chunks = span.act_chunks(chunk);
         let act = act_chunks.last().map_or(0, |&(_, chunks)| chunks);
-        let room = kv_budget.map_or(left, |budget| {
-            budget.saturating_add(u64::from(act) * chunk).min(left)
-        });
-        let total = engine::chunk::fit(room, chunk, act, least_chunks)
-            .map_err(|short| Fault::Residency(short.to_string()))?;
-        let binds = u32::try_from(
-            (device.max_buffer() / chunk).saturating_mul(kernels_slang::SEGMENTS as u64),
-        )
-        .unwrap_or(u32::MAX);
-        // Whole segments of a quarter of the pool, all four within the
-        // bf16-element index the kernels address the pool by.
-        let words = u32::try_from(2 * u64::from(u32::MAX) / chunk).unwrap_or(u32::MAX)
-            / kernels_slang::SEGMENTS as u32
-            * kernels_slang::SEGMENTS as u32;
-        // State lies within that index; the span past it is the fire's
-        // alone (bound by offset, never indexed), at every rung.
-        let total = total.min(binds).min(words.saturating_add(act));
-        let span_short = || {
-            Fault::Residency(format!(
-                "one working set takes {least_chunks} chunks of {chunk} bytes beside a fire's \
-                 {act}, and this device binds four segments of {} MiB",
-                device.max_buffer() >> 20
-            ))
-        };
-        let segment_chunks =
-            crate::store::pool::segment_chunks(chunk, total, device.max_buffer(), act)
-                .ok_or_else(span_short)?;
-        if total < least_chunks + act {
-            return Err(span_short());
-        }
+        let crate::store::pool::Sized {
+            room,
+            total,
+            segment_chunks,
+            words,
+        } = crate::store::pool::sized(
+            left,
+            kv_budget,
+            chunk,
+            act,
+            least_chunks,
+            device.max_buffer(),
+        )?;
         // No rung lends a chunk past the kernels' index to state.
         let unindexed = total.saturating_sub(words);
         // Rungs taking as many chunks are one: each class is stated once,
@@ -1781,6 +1828,58 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn voxel_element(&self) -> Option<Dtype> {
         self.voxel_seat.map(|seat| seat.dtype)
+    }
+
+    /// Whether lanes of `class` capture: the class writes a capture plane.
+    fn captures(&self, class: usize) -> bool {
+        self.readouts
+            .iter()
+            .any(|plane| plane.captured && plane.classes.contains(class))
+    }
+
+    /// What a fire takes beside its rung's carve for the lanes of one
+    /// instance of a program reading `reads` (`(output, lane)` each): a row
+    /// of every capture plane for each lane a read of which switches score
+    /// capture on, and the planes' alignment once. The switch is the
+    /// runtime's rule: a read sets it where every class writing the output
+    /// holds it in every word.
+    #[must_use]
+    pub fn capture_term<'a>(
+        &self,
+        reads: impl IntoIterator<Item = (&'a str, u32)>,
+    ) -> engine::FireFacts {
+        let (a_lane, aligned) = self.span.capture_term();
+        if a_lane == 0 {
+            return engine::FireFacts::default();
+        }
+        let classes = self.classes();
+        let switches = |name: &str| {
+            let mut writers = classes
+                .classes
+                .iter()
+                .filter(|class| class.outputs.iter().any(|decl| decl.name == name))
+                .peekable();
+            writers.peek().is_some()
+                && writers.all(|class| {
+                    class
+                        .words
+                        .iter()
+                        .all(|&word| self.trace.facts.holds(word, poem_ir::Builtin::Scores))
+                })
+        };
+        let lanes: std::collections::BTreeSet<u32> = reads
+            .into_iter()
+            .filter(|&(name, _)| switches(name))
+            .map(|(_, lane)| lane)
+            .collect();
+        if lanes.is_empty() {
+            return engine::FireFacts::default();
+        }
+        engine::FireFacts {
+            a_lane: lanes.len() as u64 * a_lane,
+            fixed: aligned,
+            ..engine::FireFacts::default()
+        }
     }
 
     /// Its class's readout rows, else its last float row output, else the `out` output's.
@@ -3325,8 +3424,16 @@ impl<B: Serve> Shell<B> {
             })
             .collect();
 
+        // The lanes whose class captures: a capture plane holds a row for
+        // each, in lane order.
+        let scored = Scored::of(
+            composition
+                .lanes()
+                .iter()
+                .map(|row| self.captures(row.class as usize)),
+        );
         let (readout_rows, readout_layout) =
-            readout_table(&composition, lanes, &self.readouts, |class| {
+            readout_table(&composition, lanes, &self.readouts, &scored, |class| {
                 self.readout_for(class)
             })?;
         let bound = self.inputs[arm].write(
@@ -3412,7 +3519,7 @@ impl<B: Serve> Shell<B> {
         // The narrowest rung that holds the fire: its carve at its fixed
         // place under the span's end.
         let rung = self.span.rung_of(fire_rows);
-        let slots = self.span.slots(&self.handles, rung, fire_rows)?;
+        let slots = self.span.slots(&self.handles, rung, fire_rows, scored)?;
         let caches = self.pools.table(
             &self.handles,
             &self.inputs[arm].seats(&self.handles, &bound, pages, rows, lane_count),
@@ -3787,6 +3894,7 @@ fn readout_table<B: Serve>(
     composition: &Composition,
     lanes: &[Seated<'_, B>],
     planes: &[ReadoutPlane],
+    scored: &Scored,
     host_of: impl Fn(usize) -> Option<usize>,
 ) -> Result<ReadoutTable> {
     let span_of = |plane: usize, first: u32, rows: u32, at: u64, direct: bool, lane: u32| {
@@ -3889,7 +3997,17 @@ fn readout_table<B: Serve>(
                     });
                 }
                 Kind::Readout => (host.first, host.rows, false),
-                Kind::Lane => (u32::try_from(lane_row).unwrap_or(u32::MAX), 1, true),
+                Kind::Lane => {
+                    let lane = u32::try_from(lane_row).unwrap_or(u32::MAX);
+                    // A capture plane's row is the lane's among the
+                    // capturing ones.
+                    let first = if plane.captured {
+                        scored.row(lane)
+                    } else {
+                        lane
+                    };
+                    (first, 1, true)
+                }
                 Kind::Rows if plane.voxels => (row.voxel_offset, row.voxels, true),
                 Kind::Rows => (row.row_offset, row.rows, true),
             };

@@ -23,8 +23,82 @@ pub enum WeightRow {
 #[derive(Clone, Debug, Default)]
 pub struct WeightTable(pub Vec<Option<WeightRow>>);
 
+/// A fire's carve: each value's rectangle, and the lanes its capture
+/// planes hold a row for.
 #[derive(Clone, Debug, Default, Hash)]
-pub struct SlotTable(pub Vec<Option<Tensor>>);
+pub struct SlotTable(pub Vec<Option<Tensor>>, pub Scored);
+
+impl SlotTable {
+    /// The row of `value`'s rectangle that lane `lane` of the fire starts
+    /// at: the lane itself, and for a capture plane the capturing lanes
+    /// before it.
+    #[must_use]
+    pub fn lane_row(&self, value: ValueId, lane: u32) -> u32 {
+        if self.1.planes.binary_search(&value.0).is_ok() {
+            self.1.row(lane)
+        } else {
+            lane
+        }
+    }
+}
+
+/// The lanes of a fire whose class captures into the planes the compiler
+/// lifted over every other slot (`ArenaMap::scores_from`): a plane holds a
+/// row for each of them, in lane order, and none for the fire's other
+/// lanes, so a fire is seated the planes its own capturing lanes write.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct Scored {
+    /// For each lane, the capturing lanes before it; empty where none
+    /// captures.
+    before: Vec<u32>,
+    rows: u32,
+    /// The values the planes back, ascending: the carve's to state.
+    planes: Vec<u32>,
+}
+
+impl Scored {
+    /// The fire's lanes in order, each capturing or not.
+    #[must_use]
+    pub fn of(capturing: impl IntoIterator<Item = bool>) -> Scored {
+        let mut rows = 0u32;
+        let before: Vec<u32> = capturing
+            .into_iter()
+            .map(|captures| {
+                let at = rows;
+                rows += u32::from(captures);
+                at
+            })
+            .collect();
+        if rows == 0 {
+            return Scored::default();
+        }
+        Scored {
+            before,
+            rows,
+            planes: Vec::new(),
+        }
+    }
+
+    /// The rows a plane holds: the fire's capturing lanes.
+    #[must_use]
+    pub fn rows(&self) -> u32 {
+        self.rows
+    }
+
+    /// The plane row lane `lane` writes, where it captures: the capturing
+    /// lanes before it.
+    #[must_use]
+    pub fn row(&self, lane: u32) -> u32 {
+        self.before.get(lane as usize).copied().unwrap_or(self.rows)
+    }
+
+    /// With `planes`, the values the planes back (ascending).
+    #[must_use]
+    pub fn backing(mut self, planes: Vec<u32>) -> Scored {
+        self.planes = planes;
+        self
+    }
+}
 
 #[derive(Clone, Copy, Debug, Hash)]
 pub enum CachePool {
@@ -448,7 +522,9 @@ impl<'c, B: Backend> Run<'c, B> {
         let (skip, keep) = match shape.first() {
             Some(Dim::Tokens) => (window.row_offset, window.rows),
             Some(Dim::TokensTimes(k)) => (window.row_offset * k, window.rows * k),
-            Some(Dim::Lanes) => (window.lane_offset, window.lanes),
+            // A capture plane holds a row a capturing lane: the window's
+            // lanes all capture, and start at the capturing lanes before.
+            Some(Dim::Lanes) => (self.arena.lane_row(id, window.lane_offset), window.lanes),
             Some(Dim::LanesPlus(k)) => (window.lane_offset, window.lanes + k),
             Some(Dim::Readouts) => return handle,
             Some(Dim::Const(_)) | None => return handle,
@@ -1087,5 +1163,41 @@ impl<'c, B: Backend> Run<'c, B> {
                 id.0
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use poem_ir::ValueId;
+
+    use super::{Scored, SlotTable};
+
+    /// A capture plane holds a row for each capturing lane, in lane order:
+    /// a lane's row in it is the capturing lanes before it, whatever lanes
+    /// lie between; every other rectangle keeps a row a lane.
+    #[test]
+    fn a_capture_plane_holds_a_row_a_capturing_lane() {
+        let scored = Scored::of([false, true, true, false, true]);
+        assert_eq!(scored.rows(), 3);
+        assert_eq!(
+            [1, 2, 4].map(|lane| scored.row(lane)),
+            [0, 1, 2],
+            "the capturing lanes take the plane's rows in order"
+        );
+        let slots = SlotTable(Vec::new(), scored.backing(vec![4, 9]));
+        assert_eq!(slots.lane_row(ValueId(9), 4), 2);
+        assert_eq!(slots.lane_row(ValueId(4), 1), 0);
+        assert_eq!(slots.lane_row(ValueId(5), 4), 4, "no plane: a row a lane");
+    }
+
+    /// A fire none of whose lanes captures holds no plane row, and its slot
+    /// table is the one a load without planes makes.
+    #[test]
+    fn a_fire_without_a_capturing_lane_holds_no_plane_row() {
+        let scored = Scored::of([false, false, false]);
+        assert_eq!(scored, Scored::default());
+        assert_eq!(scored.rows(), 0);
+        let slots = SlotTable(Vec::new(), scored.backing(vec![4]));
+        assert_eq!(slots.lane_row(ValueId(7), 2), 2);
     }
 }
