@@ -103,6 +103,10 @@ pub struct Pool {
     carve: u64,
     /// The span's segments from the top the runtime committed for state.
     span: u32,
+    /// The whole top is backed from the load ([`Pool::back_whole_span`]):
+    /// a raise, a lower, a lend and its release change what the span is
+    /// used for, never what memory is behind it.
+    whole: bool,
     table: ChunkTable,
     /// How a page id splits its slot ([`Pool::split_slots`]): `None` where
     /// every paged shape's slots tile a chunk, so an id is its slot in its
@@ -294,6 +298,7 @@ impl Pool {
                 act,
                 carve: 0,
                 span: 0,
+                whole: false,
                 table: ChunkTable::identity(total_chunks),
                 slot_shift: None,
                 part_shift: part_shift(parts),
@@ -627,6 +632,9 @@ impl Pool {
             return Ok(());
         }
         self.carve = bytes;
+        if self.whole {
+            return Ok(());
+        }
         #[cfg(target_vendor = "apple")]
         {
             let want = self.top_want() - self.last_start();
@@ -636,6 +644,30 @@ impl Pool {
                 .expect("a pool has one buffer at least");
             // SAFETY: the caller's contract above.
             unsafe { part.store.unmap_top(want)? };
+        }
+        Ok(())
+    }
+
+    /// Backs the whole top from here on: every heap of the activation span,
+    /// the top rung's carve and every segment a lowered rung lends, mapped
+    /// now, before ready. A raise (`cover`), a lend (`commit_span`) and
+    /// their undoing (`narrow`, `release_span`) then only change what the
+    /// backed span is used for: no device allocation is made after ready,
+    /// and none is given back under live state. The ledger holds the top
+    /// reserved from the load either way; what is mapped rises by it.
+    pub fn back_whole_span(&mut self) -> Result<()> {
+        if self.act == 0 {
+            return Ok(());
+        }
+        self.whole = true;
+        #[cfg(target_vendor = "apple")]
+        {
+            let from = self.pinned_from() - self.last_start();
+            let part = self
+                .parts
+                .last_mut()
+                .expect("a pool has one buffer at least");
+            part.store.map_top(from)?;
         }
         Ok(())
     }
@@ -669,6 +701,9 @@ impl Pool {
             return Ok(());
         }
         self.span = segments;
+        if self.whole {
+            return Ok(());
+        }
         #[cfg(target_vendor = "apple")]
         {
             let want = self.top_want() - self.last_start();
@@ -727,6 +762,19 @@ impl Pool {
         #[cfg(not(target_vendor = "apple"))]
         {
             self.bytes() - self.pinned_from()
+        }
+    }
+
+    /// Placement heaps made for the top since the load.
+    #[must_use]
+    pub fn top_heaps_made(&self) -> u64 {
+        #[cfg(target_vendor = "apple")]
+        {
+            self.last().store.top_heaps_made()
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            0
         }
     }
 

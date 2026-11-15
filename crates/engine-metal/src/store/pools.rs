@@ -1553,6 +1553,17 @@ impl Pools {
         unsafe { self.pool.narrow(bytes) }
     }
 
+    /// Placement heaps made for the activation span since the load.
+    #[must_use]
+    pub fn span_heaps_made(&self) -> u64 {
+        self.pool.top_heaps_made()
+    }
+
+    /// Backs the whole activation span from the load ([`Pool::back_whole_span`]).
+    pub fn back_whole_span(&mut self) -> Result<()> {
+        self.pool.back_whole_span()
+    }
+
     /// Backs the span's top `segments` for state ([`Pool::commit_span`]).
     pub fn commit_span(&mut self, segments: u32) -> Result<()> {
         self.pool.commit_span(segments)

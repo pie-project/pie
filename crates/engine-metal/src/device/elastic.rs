@@ -462,6 +462,8 @@ pub struct Elastic {
     /// committed bottom chunks past `top_from` lie in them, so no unmap of
     /// the top gives them back.
     held_low: usize,
+    /// Placement heaps made for the top since the buffer was made.
+    top_made: u64,
     owner: Weak<Mutex<State>>,
     /// The mapping side this buffer was created on: the device that makes
     /// its heaps, the queue that maps them, and the residency set they are
@@ -515,6 +517,13 @@ impl Elastic {
             return 0;
         }
         self.virtual_bytes - self.top_from
+    }
+
+    /// How many placement heaps were made for the top: a load that backs
+    /// its span whole makes them before ready and none after.
+    #[must_use]
+    pub fn top_heaps_made(&self) -> u64 {
+        self.top_made
     }
 
     /// The bytes of the top's mapped heaps.
@@ -682,6 +691,7 @@ impl Elastic {
                     );
                     chunk.mapped = bytes;
                     self.top[slot] = Some(chunk);
+                    self.top_made += 1;
                     mapped += bytes;
                 }
                 Err(error) => {
@@ -1241,6 +1251,7 @@ pub fn create(sparse: &Arc<Sparse>, arena: &Arena, len: u64) -> Result<Elastic> 
         top_from: virtual_bytes,
         top: Vec::new(),
         held_low: 0,
+        top_made: 0,
         owner: Arc::downgrade(&arena.state),
         sparse: sparse.clone(),
         fence: None,
