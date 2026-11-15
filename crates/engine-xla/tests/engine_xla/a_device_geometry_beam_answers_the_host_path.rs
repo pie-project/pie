@@ -322,9 +322,59 @@ fn device_fed_tokens_reach_the_next_fire() {
     );
     let (host_own, device_own) = (refs.take(kv), refs.take(kv));
 
+    let program = fed_program(&mut rig);
+    let first = 11u32;
+    let (instance, _) = bind_fed(&mut rig, &mut refs, program, first);
+
+    let argmax = |row: &[f32]| -> u32 {
+        (0..row.len())
+            .max_by(|&a, &b| row[a].total_cmp(&row[b]).then(b.cmp(&a)))
+            .map_or(0, |i| i as u32)
+    };
+    let mut host_token = first;
+    let mut wants = Vec::new();
+    for step in 0..2u32 {
+        let want = rig.fire(
+            vec![host_lane(
+                1,
+                vec![host_token],
+                vec![shared, host_own],
+                PAGE + step,
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+        host_token = argmax(&want[0].values);
+        wants.push(want);
+    }
+    // The device path: two frames submitted back to back, neither settled
+    // (their logits come back through the reader ring, not the frame's
+    // readouts), so the second's token is still the first pass's put on
+    // the device when it is resolved.
+    for step in 0..2u32 {
+        let _ = rig
+            .engine
+            .submit(&engine::fire::FrameSubmission::of(engine::fire::Step {
+                lanes: vec![host_lane(3, vec![0], vec![shared, device_own], PAGE + step)],
+                attachments: vec![attach(0, instance)],
+                media: Vec::new(),
+                voxels: Vec::new(),
+            }))
+            .expect("the frame fires");
+    }
+    let got: Vec<Vec<f32>> = (0..2).map(|_| rig.take(instance, 1)).collect();
+    for (step, (want, got)) in wants.iter().zip(&got).enumerate() {
+        assert_close(got, &want[0].values, &format!("step {step} logits"));
+    }
+}
+
+/// The device-fed greedy program: each pass's epilogue puts the logits'
+/// argmax in the instance's own `embed_tokens` ring (channel 0, kept in the
+/// pool's `Channel` slots) and the logits in a reader ring (channel 1).
+fn fed_program(rig: &mut Rig) -> engine::program::ProgramId {
     let mut tokens_ring = channel(Shape::vector(1), EtaDtype::I32, HostRole::None);
     tokens_ring.seeded = true;
-    let program = rig.register(TraceContainer {
+    rig.register(TraceContainer {
         names: vec!["logits".to_string()],
         channels: vec![
             tokens_ring,
@@ -354,10 +404,22 @@ fn device_fed_tokens_reach_the_next_fire() {
         }],
         externs: Vec::new(),
         inputs: Vec::new(),
-    });
-    // The rings the instance keeps itself: one contiguous run of Channel
-    // slots each, as the runtime takes them.
-    let facts = rig.engine.program_facts(program).expect("the program's facts");
+    })
+}
+
+/// An instance of [`fed_program`] seeded with token `first`, its rings in
+/// `Channel` slots the runtime takes (one contiguous run each): the
+/// instance and its fed ring's slots.
+fn bind_fed(
+    rig: &mut Rig,
+    refs: &mut crate::common_llm::Refs,
+    program: engine::program::ProgramId,
+    first: u32,
+) -> (engine::program::InstanceId, Vec<engine::program::RingSlots>) {
+    let facts = rig
+        .engine
+        .program_facts(program)
+        .expect("the program's facts");
     assert!(
         facts.rings.iter().any(|r| r.channel == 0),
         "the fed ring is kept in the pool"
@@ -384,7 +446,6 @@ fn device_fed_tokens_reach_the_next_fire() {
         engine::channel::ChannelId(u64::MAX),
         rig.channel_of(vec![1, VOCAB], EtaDtype::F32, HostRole::Reader),
     ];
-    let first = 11u32;
     let instance = rig
         .engine
         .bind_instance(&engine::program::InstanceBinding {
@@ -397,7 +458,7 @@ fn device_fed_tokens_reach_the_next_fire() {
             geometry: GeometryClass::DecodeEnvelope,
             device_resolved: Default::default(),
             instance_slots: Vec::new(),
-            ring_slots,
+            ring_slots: ring_slots.clone(),
             adapter_slots: Vec::new(),
             extents: engine::program::BindExtents {
                 row_count: 1,
@@ -409,28 +470,70 @@ fn device_fed_tokens_reach_the_next_fire() {
         })
         .expect("the instance binds")
         .id;
+    (instance, ring_slots)
+}
 
+/// A bound program's rings kept in the pool's `Channel` slots park and
+/// return whole, as a process yield moves them (CONTRACT-BC 22): after a
+/// pass settles, its fed ring's slots go to the host tier, the device slots
+/// are clobbered, and the bytes come back to other device slots the
+/// instance is rebound to; they read what they held, and the next passes
+/// answer what the host path answers, the second of them gathering the
+/// first's token off the moved slots while it is still in flight. A settled
+/// cell is also held on the host (`envelope_tokens` reads the slots only for
+/// a cell in flight), so a fire alone cannot tell clobbered slots from
+/// returned ones; the negative control is the compare itself: slots
+/// returned from zeros read otherwise.
+#[test]
+fn a_bound_programs_channel_slots_park_and_return() {
+    use engine::chunk::SlotCopy;
+    use engine::transfer::MemoryDomain;
+    use engine_xla::store::layout::CHANNEL;
+    let Some(_device) = common_dit::device() else {
+        return;
+    };
+    let plan = plan();
+    let weights = Weights::random(&plan, 17);
+    let mut rig = Rig::load(plan, &weights, 64, vec![1, 2, 16, 32, 64], None);
+    let device = rig.loaded.caps.device.domain;
+    assert!(rig.loaded.caps.chunks.host_chunks > 0, "a host tier");
+    let mut refs = crate::common_llm::Refs::of_facts(rig.loaded.caps.chunks.clone());
+    let kv = refs.shapes(|s| s.role == engine::chunk::SlotRole::State)[0].id;
+    let prompt: Vec<u32> = (0..PAGE).map(|i| (i * 7 + 3) % VOCAB).collect();
+    let shared = refs.take(kv);
+    rig.fire(
+        vec![host_lane(0, prompt, vec![shared], 0)],
+        Vec::new(),
+        Vec::new(),
+    );
+    let program = fed_program(&mut rig);
+    let first = 11u32;
+    let (instance, rings) = bind_fed(&mut rig, &mut refs, program, first);
+    let (host_own, device_own) = (refs.take(kv), refs.take(kv));
+
+    // What the host path answers at each step, fed the host's argmax.
     let argmax = |row: &[f32]| -> u32 {
         (0..row.len())
             .max_by(|&a, &b| row[a].total_cmp(&row[b]).then(b.cmp(&a)))
             .map_or(0, |i| i as u32)
     };
-    let mut host_token = first;
+    let mut token = first;
     let mut wants = Vec::new();
-    for step in 0..2u32 {
+    for step in 0..3u32 {
         let want = rig.fire(
-            vec![host_lane(1, vec![host_token], vec![shared, host_own], PAGE + step)],
+            vec![host_lane(
+                1,
+                vec![token],
+                vec![shared, host_own],
+                PAGE + step,
+            )],
             Vec::new(),
             Vec::new(),
         );
-        host_token = argmax(&want[0].values);
-        wants.push(want);
+        token = argmax(&want[0].values);
+        wants.push(want[0].values.clone());
     }
-    // The device path: two frames submitted back to back, neither settled
-    // (their logits come back through the reader ring, not the frame's
-    // readouts), so the second's token is still the first pass's put on
-    // the device when it is resolved.
-    for step in 0..2u32 {
+    let submit = |rig: &mut Rig, step: u32| {
         let _ = rig
             .engine
             .submit(&engine::fire::FrameSubmission::of(engine::fire::Step {
@@ -440,9 +543,114 @@ fn device_fed_tokens_reach_the_next_fire() {
                 voxels: Vec::new(),
             }))
             .expect("the frame fires");
-    }
-    let got: Vec<Vec<f32>> = (0..2).map(|_| rig.take(instance, 1)).collect();
-    for (step, (want, got)) in wants.iter().zip(&got).enumerate() {
-        assert_close(got, &want[0].values, &format!("step {step} logits"));
+    };
+    // Step 0, settled: the fed ring's slots hold the step's argmax.
+    submit(&mut rig, 0);
+    assert_close(&rig.take(instance, 1), &wants[0], "step 0 logits");
+
+    let copy = |rig: &mut Rig, src, dst, slots: Vec<(u32, u32)>| {
+        rig.engine
+            .copy_slots(&SlotCopy {
+                shape: CHANNEL,
+                src,
+                dst,
+                slots,
+                runs: Vec::new(),
+            })
+            .expect("the Channel slots move");
+    };
+    let read = |rig: &mut Rig, from: &[u32], at: &[u32]| -> Vec<u8> {
+        copy(
+            rig,
+            device,
+            MemoryDomain::HostPinned,
+            from.iter().copied().zip(at.iter().copied()).collect(),
+        );
+        rig.engine
+            .read_tier_slots(&[(CHANNEL, at.to_vec())])
+            .expect("the host slots read")
+    };
+    let slot_bytes = rig
+        .loaded
+        .caps
+        .chunks
+        .shape(CHANNEL)
+        .expect("Channel slots")
+        .slot_bytes;
+    let all: Vec<u32> = rings.iter().flat_map(|r| r.slots.clone()).collect();
+    let n = all.len() as u32;
+    let host = |k: u32| -> Vec<u32> { (k * n..(k + 1) * n).collect() };
+    // Park every ring slot of the instance on the host tier.
+    let held = read(&mut rig, &all, &host(0));
+    let words: Vec<u32> = held
+        .chunks(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert!(
+        words.contains(&argmax(&wants[0])),
+        "the fed ring's slots hold the step's token"
+    );
+    // Clobber the device slots with zeros.
+    rig.engine
+        .write_tier_slots(
+            &[(CHANNEL, host(1))],
+            &vec![0u8; (u64::from(n) * slot_bytes) as usize],
+        )
+        .expect("the zero slots write");
+    copy(
+        &mut rig,
+        MemoryDomain::HostPinned,
+        device,
+        host(1).into_iter().zip(all.iter().copied()).collect(),
+    );
+    // The negative control: slots returned from zeros read otherwise.
+    let zeroed = read(&mut rig, &all, &host(2));
+    assert_ne!(
+        zeroed, held,
+        "the compare tells clobbered slots from held ones"
+    );
+    // Return the parked bytes to other device slots and rebind there.
+    let moved: Vec<engine::program::RingSlots> = rings
+        .iter()
+        .map(|r| {
+            let mut got: Vec<u32> = (0..r.slots.len()).map(|_| refs.take(CHANNEL)).collect();
+            got.sort_unstable();
+            engine::program::RingSlots {
+                channel: r.channel,
+                slots: got,
+            }
+        })
+        .collect();
+    let to: Vec<u32> = moved.iter().flat_map(|r| r.slots.clone()).collect();
+    copy(
+        &mut rig,
+        MemoryDomain::HostPinned,
+        device,
+        host(0).into_iter().zip(to.iter().copied()).collect(),
+    );
+    rig.engine
+        .rebind_slots(engine::program::Rebind::Instance {
+            id: instance,
+            instance: Vec::new(),
+            rings: moved,
+            adapter: Vec::new(),
+        })
+        .expect("the instance is rebound to the moved slots");
+    assert_eq!(
+        read(&mut rig, &to, &host(3)),
+        held,
+        "the rings came back whole"
+    );
+
+    // Steps 1 and 2 back to back: step 2 gathers step 1's token off the
+    // moved slots while it is in flight.
+    submit(&mut rig, 1);
+    submit(&mut rig, 2);
+    for (step, want) in wants.iter().enumerate().skip(1) {
+        assert_close(
+            &rig.take(instance, 1),
+            want,
+            &format!("step {step} logits after the move"),
+        );
     }
 }
