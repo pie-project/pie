@@ -1,8 +1,8 @@
 api = 1
 
 # The RTX PRO 4500 Blackwell runs no checked-in profile on wgpu; this file
-# carries only what is its own: its rates, and the fire times `pie tune`
-# measured on it.
+# carries only what is its own: its rates, as `pie tune --rates` measured
+# them on it.
 [target]
 device = "NVIDIA RTX PRO 4500 Blackwell"
 
