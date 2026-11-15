@@ -3629,13 +3629,6 @@ impl Shell {
             let first = stated
                 .and_then(|slots| slots.first().copied())
                 .unwrap_or(have);
-            if placed && seated.reports != 0 {
-                ends.push(engine::KvWrites {
-                    tag: seated.reports,
-                    end: Some(first.saturating_add(row.rows)),
-                    ..engine::KvWrites::default()
-                });
-            }
             // The buffer's rows live in the rs list: the verb's pages, in
             // token order from its base (CONTRACT-BC 18).
             let rs = match seated.rs {
@@ -3662,6 +3655,27 @@ impl Shell {
                 ports.as_ref().and_then(engine::ports::LanePorts::fold),
             )
             .map_err(|error| Fault::program("serve::rs", format!("lane {source}: {error}")))?;
+            // A reporting lane that buffers tells, where the fire settles,
+            // how many slots past its state's frozen length this fire froze
+            // (as `LanePlan::of` reckons it) and, where a port places its
+            // rows, one past the last slot they landed at.
+            if seated.reports != 0
+                && let engine::fire::RsVerb::Buffer { folded, fold, .. } = &rs
+            {
+                let fold = match fold {
+                    engine::fire::FoldLen::Host(n) => Some(*n),
+                    engine::fire::FoldLen::Device => ports
+                        .as_ref()
+                        .and_then(engine::ports::LanePorts::fold),
+                };
+                let end = first.saturating_add(row.rows);
+                ends.push(engine::KvWrites {
+                    tag: seated.reports,
+                    fold: fold.map(|n| folded.saturating_add(n).min(end) - folded),
+                    end: placed.then_some(end),
+                    ..engine::KvWrites::default()
+                });
+            }
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) && crate::diag::on().rs_trace {
                 eprintln!(
                     "recurrent seat: lane {} rows {} replay {} commit {} gather {:?} scatter {:?}",
