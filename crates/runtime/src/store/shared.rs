@@ -322,7 +322,7 @@ pub fn rung_goal(pool: &SharedPool, engine: usize, rows: u32) -> u32 {
 pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
     let mut pool = shared.lock().unwrap();
     let rungs = pool.rungs();
-    let goal = rung_goal(&pool, engine, rows);
+    let goal = rung_seatable(&pool, engine, rows);
     let lifted = |rung: u32| {
         if rungs.last() == Some(&rung) {
             u32::MAX
@@ -359,6 +359,21 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
         set_fire_cap(engine, cap);
     }
     drop(pool);
+}
+
+/// The rung fires of `rows` take on `engine` now: the rung they ask
+/// ([`rung_goal`]) cut to the widest that can be seated
+/// ([`SharedPool::seatable`]: room only, what fits what is committed with
+/// the state in its span moved to free chunks under it). The one goal of
+/// the ask ([`raise_now`]), of every walk and of a funded raise: a rung
+/// that cannot be seated is never a goal, so nothing waits on it, and
+/// fires take the widest rung there is room for. The rows asked stand
+/// uncut, and the cut rises as room is freed or committed (each wakes the
+/// walk). What the rung asked still lacks is the asking pass's to move or
+/// free (`pipeline::fire`'s raise funding, which reads [`rung_goal`]).
+#[must_use]
+pub fn rung_seatable(pool: &SharedPool, engine: usize, rows: u32) -> u32 {
+    pool.seatable(rung_goal(pool, engine, rows))
 }
 
 /// The lanes of `engine` live now: those that stage a row at their next
@@ -1818,6 +1833,24 @@ impl SharedPool {
     #[must_use]
     pub fn rungs(&self) -> Vec<u32> {
         self.pool.rungs()
+    }
+
+    /// The widest rung at or under `asked` (a rung's tokens) that can be
+    /// seated now: one the activation set aside holds already, or one a
+    /// raise reaches with what is committed, the state in its span moved to
+    /// free chunks under it (no [`Self::plan_raise`] to it is refused for
+    /// room). The rung in hand is one, so an ask at or past it is never cut
+    /// under it; `asked` where the pool states no rung at or under it.
+    #[must_use]
+    pub fn seatable(&self, asked: u32) -> u32 {
+        let have = self.pool.act_reserved();
+        self.pool
+            .rungs()
+            .into_iter()
+            .rev()
+            .filter(|&rung| rung <= asked)
+            .find(|&rung| self.pool.act_chunks(rung) <= have || self.pool.rung_short(rung) == 0)
+            .unwrap_or(asked)
     }
 
     /// The rung the activation is set aside for now.

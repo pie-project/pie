@@ -799,6 +799,9 @@ impl RaiseFunding {
                 if crate::store::shared::fire_cap(engine) >= target {
                     return;
                 }
+                // What the rung asked lacks, past the widest rung seated
+                // meanwhile (`raise_now` took that one: its goal is cut to
+                // what fits).
                 let pages = {
                     let pool = shared.lock().unwrap();
                     pool.raise_short(crate::store::shared::rung_goal(&pool, engine, rows))
@@ -894,7 +897,7 @@ impl RaiseFunding {
                         };
                         let taken = crate::store::shared::programs::take_raise(
                             &shared,
-                            |pool| crate::store::shared::rung_goal(pool, engine, rows),
+                            |pool| crate::store::shared::rung_seatable(pool, engine, rows),
                             &mover,
                         )
                         .await;

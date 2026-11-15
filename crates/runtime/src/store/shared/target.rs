@@ -108,6 +108,11 @@ impl SharedGrow {
     /// of room waits on the room the asking pass has the planner free; one
     /// to a rung the engine has not armed waits on its capture
     /// ([`super::rung_goal`]), the walk looking again each poll.
+    ///
+    /// The walk's own goal is that rung cut to the widest that can be
+    /// seated now ([`super::rung_seatable`]): it raises as far as fits and
+    /// never waits on a raise that does not; freed or committed room wakes
+    /// it and the cut rises.
     pub(crate) async fn walk_rung(&self) {
         loop {
             let (current, retired) = self.epochs();
@@ -119,7 +124,7 @@ impl SharedGrow {
                 if pool.copying().is_some() {
                     return;
                 }
-                let goal = super::rung_goal(&pool, self.engine, self.walk_rows());
+                let goal = super::rung_seatable(&pool, self.engine, self.walk_rows());
                 // The pool stands past what is asked: it comes down only
                 // once it has for the governor's patience, so a pause
                 // between batches moves no rung. On a span backed on
@@ -174,8 +179,8 @@ impl SharedGrow {
             let step = match step {
                 Ok(step) => step,
                 Err(error) => {
-                    // The pass asking funds the room as a planner waiter
-                    // (`pipeline::fire`'s raise funding); the walk tries
+                    // Not for want of room (the goal is cut to what fits):
+                    // the pool refused the step itself. The walk tries
                     // again once room is freed, not on its next wake.
                     self.raise_blocked.store(true, Ordering::Release);
                     tracing::debug!(engine = self.engine, %error, goal, "the activation rung waits");
@@ -296,6 +301,13 @@ impl SharedGrow {
         self.raise_blocked.store(false, Ordering::Release);
         self.shared.lock().unwrap().block_span_commit(false);
         self.wake.notify_one();
+    }
+
+    /// Whether a raise was refused and none is tried until room is freed;
+    /// for a test.
+    #[cfg(test)]
+    pub(crate) fn raise_blocked_for_test(&self) -> bool {
+        self.raise_blocked.load(Ordering::Acquire)
     }
 
     /// The walk's last raise was refused for room; for a test.

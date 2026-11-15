@@ -635,6 +635,150 @@ fn a_process_waiting_for_room_holds_no_rows_of_the_rung() {
     assert_eq!(goal(), 128);
 }
 
+/// Metal's rungs (Qwen3-0.6B on an M1 Max) over a pool at rung 1 as a
+/// wave of 160 prompts found it: 2365 chunks committed against the 2927 a
+/// raise to rung 8192 needs, the state the lent span holds with no free
+/// chunk under it and no tier to move it to. The state's slot refs with it.
+fn second_wave_pool() -> (SharedPool, Vec<u32>) {
+    let mut facts = facts();
+    facts.span_backed_on_demand = true;
+    facts.total_chunks = 4096;
+    facts.segment_chunks = 1;
+    facts.segments = SegmentFacts {
+        committed: 670,
+        max: 4096,
+        growth: SegmentGrowth::TwoEnded,
+    };
+    facts.act_chunks = vec![
+        (1, 3),
+        (2, 5),
+        (4, 10),
+        (8, 20),
+        (16, 39),
+        (32, 78),
+        (64, 156),
+        (128, 311),
+        (256, 622),
+        (512, 1244),
+        (1024, 1334),
+        (2048, 1514),
+        (4096, 1629),
+        (8192, 1695),
+        (10240, 1729),
+    ];
+    facts.weights = Vec::new();
+    facts.host_chunks = 0;
+    facts.disk_chunks = 0;
+    facts.validate().unwrap();
+    let mut pool = SharedPool::new(&facts, 256).unwrap();
+    assert_eq!(pool.rung(), 1);
+    // The span's top 1000 chunks backed (lent at rung 1, committed as state
+    // took them); the state fills the prefix and 562 of them.
+    pool.pool_mut().commit_span(1000);
+    let list = pool.list().unwrap().pool;
+    let per_chunk = u64::from(pool.pool().shape(list).unwrap().slots_per_chunk);
+    let chunks = u64::from(1231 - pool.pool().state_chunks());
+    let refs = pool.take_refs(list, chunks * per_chunk).unwrap();
+    (pool, refs)
+}
+
+/// A wave's prompts summed ask a rung the pool cannot seat (Mac's wave of
+/// 160: rung 8192 for 7151 rows, 2927 chunks against 2365 committed,
+/// nothing movable). The goal is cut at the ask to the widest rung that
+/// fits: the raise to it is taken and fires are cut to it; the walk never
+/// takes the refused-raise path (the only one that logs "the activation
+/// rung waits" and holds raises until room is freed), however often it
+/// looks while the ask stands; and the cut rises once room is freed.
+#[tokio::test(flavor = "current_thread")]
+async fn an_ask_past_what_is_committed_takes_the_widest_rung_that_fits() {
+    use crate::scheduler::worker::{LaneStandIn, PoolOp};
+    const ENGINE: usize = 66;
+    let (pool, refs) = second_wave_pool();
+    assert_eq!(
+        pool.plan_raise(8192).err(),
+        Some(RungError::Pool(SlotError::Budget {
+            needed: 2927,
+            committed: 2365
+        }))
+    );
+    // Nothing movable: the 562 chunks of state in the lent span have no
+    // free chunk under them, and the pool has no tier under the device.
+    assert_eq!(pool.raise_short(8192).0, 562);
+    // 128 fits (its 311 chunks are committed and free); 256 does not.
+    assert_eq!(pool.seatable(8192), 128);
+    assert!(pool.plan_raise(128).is_ok());
+    assert!(pool.plan_raise(256).is_err());
+    assert_eq!(pool.seatable(64), 64, "an ask that fits is not cut");
+    assert_eq!(rung_goal(&pool, ENGINE, 7151), 8192, "the rung asked");
+    assert_eq!(rung_seatable(&pool, ENGINE, 7151), 128, "the goal");
+
+    let list = pool.list().unwrap().pool;
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let mut lane = LaneStandIn::install(ENGINE);
+    let grow = SharedGrow::new(0, ENGINE, shared.clone());
+    assert_eq!(fire_cap(ENGINE), 1);
+    grant_rung(ENGINE, u32::MAX);
+
+    // The wave's ask, as the scheduler makes it for its prompts summed.
+    let _want = want_rows(ENGINE, 7151);
+    raise_now(&shared, ENGINE, 7151);
+    {
+        let mut walk = std::pin::pin!(grow.walk_rung());
+        assert!(
+            futures::poll!(walk.as_mut()).is_pending(),
+            "the raise is the engine's to back"
+        );
+        let Some((PoolOp::Rung { from: 1, to: 128 }, answer)) = lane.pool_op() else {
+            panic!("the raise to the widest rung that fits is at the lane");
+        };
+        answer.send(Ok(())).unwrap();
+        walk.await;
+    }
+    assert_eq!(shared.lock().unwrap().rung(), 128);
+    assert_eq!(fire_cap(ENGINE), 128, "fires take the rung that fits");
+    assert!(!grow.raise_blocked_for_test(), "no wait state entered");
+
+    // The ask stands (7151 rows) through every later look: nothing is
+    // tried, nothing is refused, nothing waits.
+    for _ in 0..3 {
+        grow.ticked_for_test();
+        grow.walk_rung().await;
+        assert!(lane.pool_op().is_none());
+        assert!(!grow.raise_blocked_for_test());
+        assert_eq!(shared.lock().unwrap().rung(), 128);
+        assert_eq!(fire_cap(ENGINE), 128);
+    }
+
+    // Room is freed (the state goes): the cut rises at the walk's next
+    // look, to the rung asked.
+    {
+        let mut pool = shared.lock().unwrap();
+        pool.give_refs(list, &refs);
+        pool.pool_mut().retire_through(u64::MAX);
+        assert_eq!(rung_seatable(&pool, ENGINE, 7151), 8192);
+    }
+    grow.room_freed();
+    {
+        let mut walk = std::pin::pin!(grow.walk_rung());
+        assert!(futures::poll!(walk.as_mut()).is_pending());
+        let Some((
+            PoolOp::Rung {
+                from: 128,
+                to: 8192,
+            },
+            answer,
+        )) = lane.pool_op()
+        else {
+            panic!("the raise to the rung asked, once it fits");
+        };
+        answer.send(Ok(())).unwrap();
+        walk.await;
+    }
+    assert_eq!(shared.lock().unwrap().rung(), 8192);
+    assert_eq!(fire_cap(ENGINE), 8192);
+    assert!(!grow.raise_blocked_for_test());
+}
+
 /// A wave arriving at a pool resting at rung 1, the span backed on demand:
 /// the scheduler's ask for its 64 one-row launches cannot widen fires in
 /// the call (the engine backs the carve first), so it wakes the walk. The
