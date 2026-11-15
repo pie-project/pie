@@ -382,11 +382,15 @@ impl SharedGrow {
 
     /// Walks each time something it waits on happens: a retarget or a
     /// governor tick, a waiter short of room, room freed or a fire retired
-    /// (the planner's `pages_freed`: what drains and fences wait on), never
-    /// on a clock of its own.
+    /// (the planner's `pages_freed`: what drains and fences wait on), an ask
+    /// for a rung the call could not take ([`super::ask_walk`]), never on a
+    /// clock of its own.
     async fn run(self) {
         loop {
-            self.wake.notified().await;
+            tokio::select! {
+                () = self.wake.notified() => {}
+                () = super::walk_asked(self.engine) => {}
+            }
             self.walk().await;
         }
     }

@@ -87,6 +87,9 @@ struct RungGate {
     /// moved, a raise was applied, copied or refused, the rung was lowered,
     /// segments were committed, or room was freed (a fire retired).
     event: tokio::sync::Notify,
+    /// An ask the pool could not take in the call asks the walker to look
+    /// now ([`ask_walk`]).
+    walk: tokio::sync::Notify,
 }
 
 /// Every engine's rung gate by its id: one for each engine named here,
@@ -106,6 +109,7 @@ fn rung_gate(engine: usize) -> &'static RungGate {
             cap: std::sync::atomic::AtomicU32::new(u32::MAX),
             grant: std::sync::atomic::AtomicU32::new(u32::MAX),
             event: tokio::sync::Notify::new(),
+            walk: tokio::sync::Notify::new(),
         }))
     })
 }
@@ -113,6 +117,19 @@ fn rung_gate(engine: usize) -> &'static RungGate {
 /// Wakes every wait on `engine`'s rung: what it waits on may have changed.
 pub fn rung_changed(engine: usize) {
     rung_gate(engine).event.notify_waiters();
+}
+
+/// Asks `engine`'s walker to look now: an ask for a wider rung is the
+/// walker's to take (the engine carves or copies first). One ask since its
+/// last look is kept.
+pub fn ask_walk(engine: usize) {
+    rung_gate(engine).walk.notify_one();
+}
+
+/// The next [`ask_walk`] of `engine`; one that came since the last wait is
+/// kept.
+pub(crate) fn walk_asked(engine: usize) -> tokio::sync::futures::Notified<'static> {
+    rung_gate(engine).walk.notified()
 }
 
 /// The next [`rung_changed`] of `engine`, armed before the caller looks at
@@ -292,10 +309,13 @@ pub fn rung_goal(pool: &SharedPool, engine: usize, rows: u32) -> u32 {
 }
 
 /// Raises `shared`'s rung at once to the one fires of `rows` take, where
-/// nothing lies in the larger span and the room is there (a raise that must
-/// move state is the walker's, through the engine's copy): the pass asking
-/// is cut at the raised width from its first piece. A cap the walker
-/// lowered behind a rung still up is lifted back to it.
+/// nothing lies in the larger span and the room is there: the pass asking
+/// is cut at the raised width from its first piece. A raise that goes
+/// through the engine first (it moves state, or the span is backed on
+/// demand) is the walker's, which the ask wakes here ([`ask_walk`]): the
+/// raise starts at the ask, not at the walker's next wake for another
+/// reason. A cap the walker lowered behind a rung still up is lifted back
+/// to it.
 pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
     let mut pool = shared.lock().unwrap();
     let rungs = pool.rungs();
@@ -311,7 +331,11 @@ pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
         let Ok(evacuation) = pool.plan_raise(goal) else {
             return;
         };
-        if pool.raise_waits(&evacuation) || pool.apply_rung(&evacuation, 0).is_err() {
+        if pool.raise_waits(&evacuation) {
+            ask_walk(engine);
+            return;
+        }
+        if pool.apply_rung(&evacuation, 0).is_err() {
             return;
         }
         tracing::info!(

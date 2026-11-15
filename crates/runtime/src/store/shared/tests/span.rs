@@ -532,6 +532,55 @@ async fn a_small_pass_raises_to_the_rung_covering_it_and_an_idle_pool_lowers_aft
     assert_eq!(shared.lock().unwrap().pool().act_reserved(), 1);
 }
 
+/// A wave arriving at a pool resting at rung 1, the span backed on demand:
+/// the scheduler's ask for its 64 one-row launches cannot widen fires in
+/// the call (the engine backs the carve first), so it wakes the walk. The
+/// raise reaches the lane with no governor tick and no room freed between,
+/// and once the engine has it a step takes the 64 rows.
+#[tokio::test(flavor = "current_thread")]
+async fn an_ask_the_call_cannot_take_wakes_the_walk_at_the_ask() {
+    use crate::scheduler::worker::{LaneStandIn, PoolOp};
+    const ENGINE: usize = 58;
+    let (mut pool, mut engine) = fine_on_demand();
+    pool.set_max_lanes(512);
+    assert_eq!(
+        walk_segments(&mut pool, 6, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.rung(), 1);
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let mut lane = LaneStandIn::install(ENGINE);
+    let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+    assert_eq!(fire_cap(ENGINE), 1, "at rest: fires cut to the smallest rung");
+    grant_rung(ENGINE, 1);
+    grow.start();
+    let settle = || async {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    };
+    settle().await;
+    assert_eq!(shared.lock().unwrap().rung(), 1);
+    assert!(lane.pool_op().is_none(), "nothing asked: nothing sent");
+
+    // The batch's ask, as the scheduler makes it: its rows wanted, and the
+    // raise tried in the call.
+    let _want = want_rows(ENGINE, 64);
+    raise_now(&shared, ENGINE, 64);
+    assert_eq!(fire_cap(ENGINE), 1, "not in the call: the engine comes first");
+    // No tick and no room freed: the ask alone woke the walk.
+    settle().await;
+    let Some((PoolOp::Rung { from: 1, to: 64 }, answer)) = lane.pool_op() else {
+        panic!("the raise is at the lane, carried at the ask");
+    };
+    assert_eq!(fire_cap(ENGINE), 1, "cut until the engine has the carve");
+    answer.send(Ok(())).unwrap();
+    settle().await;
+    assert_eq!(shared.lock().unwrap().rung(), 64);
+    // A step's width is the cap's (`scheduler::worker`): 64 rows now.
+    assert_eq!(fire_cap(ENGINE), 64, "the next step takes the 64 rows");
+}
+
 /// The 8B c256 hang (decodes cut at a low cap, waiting on a raise nobody
 /// funds) cannot come back: the walk never lowers the rung under the
 /// decode fire the live lanes take, however long the pool idles, so a
