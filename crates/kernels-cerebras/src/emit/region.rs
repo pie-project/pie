@@ -1240,9 +1240,11 @@ mod tests {
                     _ => ParamAt::Row,
                 })
                 .collect();
+            // A row over the fewest roots of at most 128 columns (the text encoder's are 192).
+            let roots = reg.width.div_ceil(128);
             let place = Place {
-                chunk: 128,
-                roots: reg.width / 128,
+                chunk: reg.width / roots,
+                roots,
                 params,
                 round16: true,
                 rope_lv: 4,
