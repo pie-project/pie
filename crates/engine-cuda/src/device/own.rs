@@ -1,15 +1,15 @@
 //! What this process holds of the device its thread is bound to, as the
-//! driver's management library counts it. The runtime reports a card's free
-//! bytes only through a context, so a reading of the card already holds the
-//! context's own; the management library says whose they are.
+//! driver counts it: NVML on CUDA, KFD on ROCm. The runtime reports a card's
+//! free bytes only through a context, so a reading of the card already holds
+//! the context's own; the driver says whose they are.
 #![allow(unsafe_code)]
 
 /// What this process took of the bound device before a load of its own
 /// resolved a ceiling: the context and what binding it puts down, which the
 /// card counts held and no other process put there. `latch` keeps the
 /// reading for the loads after the first, whose process holds an earlier
-/// load's bytes too. Zero where the library does not answer for this
-/// process (none installed, another pid namespace, ROCm).
+/// load's bytes too. Zero where the driver does not answer for this process
+/// (no management library installed, another pid namespace).
 #[must_use]
 pub fn before_loads(latch: bool) -> u64 {
     static TAKEN: std::sync::Mutex<Vec<(i32, u64)>> = std::sync::Mutex::new(Vec::new());
@@ -31,7 +31,7 @@ pub fn before_loads(latch: bool) -> u64 {
 
 /// The device this thread is bound to.
 fn bound() -> Option<i32> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "device")]
     {
         use crate::device::rt;
 
@@ -40,7 +40,7 @@ fn bound() -> Option<i32> {
         let asked = unsafe { rt::cudaGetDevice(&raw mut device) };
         (asked == rt::cudaError::cudaSuccess).then_some(device)
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "device"))]
     {
         None
     }
@@ -121,7 +121,16 @@ fn held(device: i32) -> Option<u64> {
         .map(|process| process.used)
 }
 
-#[cfg(not(all(feature = "cuda", unix)))]
+/// The bytes of the bound device KFD counts as this process's: every
+/// allocation it holds there, the driver's own for its queues among them
+/// ([`kernels_cuda::hip::kfd::process_vram`] reads the device the thread is
+/// bound to, which [`bound`] named).
+#[cfg(feature = "rocm")]
+fn held(_device: i32) -> Option<u64> {
+    kernels_cuda::hip::kfd::process_vram()
+}
+
+#[cfg(not(any(all(feature = "cuda", unix), feature = "rocm")))]
 fn held(_device: i32) -> Option<u64> {
     None
 }
