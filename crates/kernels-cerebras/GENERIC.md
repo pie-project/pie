@@ -656,14 +656,18 @@ milestone's tail.
       (image); taps (`--tap`) inside it: layernorm + modulate 9.0e-5, attention + out proj
       2.9e-3, gated residual 6.2e-4, linear_out 3.4e-3. 6.18M cycles of PE stamps (that includes
       the launch's row-group skew); 1.7 h of simulator time; no redo pass in the K / V columns.
-    - The full step (60 x 28 PEs, 8 K / V columns, cost model 26.3M cycles) compiles, loads and
-      runs, but stalls: the simulator stops at 13.76M cycles with every PE waiting, and the read
-      of the exit's rows finds nothing. The first double block (both sides, its K / V columns,
-      the lane bus) is clean, so the stall lies past it: the second double block's store order
-      (its first unit's rows arrive image-first), the single blocks (one unit, both classes,
-      queries in its own order) or the exit (it drops the text rows). M1e's first item: bisect
-      with `--stages 3`, `4`, `5` and `--tap`, then the velocity against the capture and
-      diffusers.
+    - **The full step** (80 x 28 PEs at origin 169ab59ba's layout, vectorised regions, 8 K / V
+      columns): the velocity's patches against the capture rel L2 4.6e-3, cosine 0.99999;
+      unpatchified against diffusers' `Flux2Transformer2DModel` rel L2 5.5e-3, cosine
+      0.999985 (the host forward's own distance from diffusers is 5.4e-3: what is left is the
+      trunk's bf16). 10.7M cycles of PE stamps (11.3M simulated in all, with the loads;
+      cost model 6.5M), 3.0 h of simulator time; no redo pass in any K / V column.
+    - The stall it first hit (13.76M cycles, every PE waiting) was the last single block's
+      silence: a side's outputs were the values read outside it by nodes its *first* class runs,
+      and the exit's nodes run for the image rows alone, so the text-first single block left
+      nothing on the row stream and the exit waited for its 64 rows. A side is lowered over all
+      its classes' words now. (A 16 + 16-row build stalls even at `--stages 2`: an unrelated
+      gap at small row counts, open; bisect at 64 rows.)
   - Decode is unchanged: plan + build `diff -r` identical against a6de5047d's wafer-compile for
     q35_08b, q35_4b, q35_9b, q3_8b, llama31-8b, gemma_e2b, gemma_e4b, gemma_12b, gptoss_20b, tiny
     t08, tiny llama, tiny gemma, tiny gpt-oss. tiny_q35_t08 on the simulator (wafer-bench, 5
