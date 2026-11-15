@@ -613,6 +613,9 @@ struct PendingLaunchBatch {
     started: Instant,
     batch_size: u64,
     total_tokens: usize,
+    /// What the batch takes of its rung: its tokens, or the recurrent rows
+    /// its requests carry where they are more.
+    rung_rows: usize,
 }
 
 enum ControlSlotState {
@@ -1246,7 +1249,7 @@ impl BatchScheduler {
             // its rung.
             if in_flight_launches
                 .iter()
-                .all(|batch| batch.total_tokens <= cap as usize)
+                .all(|batch| batch.rung_rows <= cap as usize)
             {
                 crate::store::shared::grant_rung(engine_id, cap);
             }
@@ -2408,7 +2411,7 @@ impl BatchScheduler {
                 // Past the pool's activation rung (SPEC decision 6): it waits
                 // until the rung is back.
                 QueuedItem::Launch(launch)
-                    if launch.request.request.tokens() > limits.max_forward_tokens =>
+                    if launch.request.request.rung_rows() > limits.max_forward_tokens =>
                 {
                     kept.push_back(QueuedItem::Launch(launch));
                 }
@@ -2455,6 +2458,11 @@ impl BatchScheduler {
             .flatten()
             .map(|req| req.request.tokens())
             .sum::<usize>();
+        let carried = survivors
+            .iter()
+            .flatten()
+            .map(|req| req.request.carried as usize)
+            .sum::<usize>();
         let (submission, requests) =
             batch::build_frame_submission(survivors, limits, page_size, stats);
         let batch_size = requests.len() as u64;
@@ -2470,6 +2478,7 @@ impl BatchScheduler {
             started: Instant::now(),
             batch_size,
             total_tokens,
+            rung_rows: total_tokens.max(carried),
         });
         (true, true)
     }

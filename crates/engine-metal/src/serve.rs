@@ -59,6 +59,17 @@ pub struct Boot<'a> {
 
 const PATCH_ROUTE_DROP: i32 = -1;
 
+/// The rows a lane carries unfolded into a fire (its own rows not counted),
+/// by which a rung's rs scratch is sized and past which a lane is refused.
+///
+/// Compile-only shim (owner: Mac). `engine::fire::UNFOLDED_ROWS` is gone:
+/// the contract ([`engine::fire::rung_rows`]) has a rung's replay scratch
+/// hold the rung's tokens of carried rows, summed over a fire's lanes, and
+/// the runtime asks the rung for max(own, carried). This keeps the value
+/// the constant had until the rs scratch and the refusal follow the rung's
+/// tokens; it goes with that change.
+pub const UNFOLDED_ROWS: u32 = 16;
+
 /// Whether a lane can be read back on the host through `out`.
 fn read_back(out: &poem_exec::feeds::ClassOutput) -> bool {
     out.decl.axis != poem_ir::InputAxis::Lane && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32)
@@ -1054,13 +1065,13 @@ impl PreparedLoad<'_> {
         let model_bytes = weights.bytes() + ane_model + u64::from(tables_chunks) * rows.chunk_bytes;
         // Each rung's rs scratch: a fire of the rung's tokens and lanes
         // replays its own rows and, for each lane, the rows it carries
-        // unfolded into the fire (`engine::fire::UNFOLDED_ROWS`, the runtime's bound).
+        // unfolded into the fire ([`UNFOLDED_ROWS`]).
         let rs_room: Vec<u64> = rungs
             .iter()
             .map(|(tokens, _)| match (&rs_layout, &rows.rs) {
                 (Some(layout), Some(_)) => {
                     let lanes = (*tokens).min(boot.budget.max_lanes).max(1);
-                    let unfolded = lanes.saturating_mul(engine::fire::UNFOLDED_ROWS);
+                    let unfolded = lanes.saturating_mul(UNFOLDED_ROWS);
                     crate::rs::Seat::scratch_bytes(
                         layout,
                         (*tokens)
@@ -3651,15 +3662,15 @@ impl Shell {
             // (read on the host), so the runtime cannot bound them, and a
             // lane past the bound is refused by name rather than replayed
             // past the rung's rs region.
-            if plan.replay > engine::fire::UNFOLDED_ROWS {
+            if plan.replay > UNFOLDED_ROWS {
                 return Err(Fault::program(
                     "serve::rs",
                     format!(
                         "lane {source} carries {} recurrent rows unfolded into this fire, \
-                         past the {} a lane may carry (engine::fire::UNFOLDED_ROWS); the \
+                         past the {} a lane may carry (engine_metal::serve::UNFOLDED_ROWS); the \
                          fire is refused and writes nothing",
                         plan.replay,
-                        engine::fire::UNFOLDED_ROWS
+                        UNFOLDED_ROWS
                     ),
                 ));
             }

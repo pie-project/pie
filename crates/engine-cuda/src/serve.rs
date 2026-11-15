@@ -223,6 +223,9 @@ pub(crate) struct KvReport {
     pub(crate) offsets: Vec<u32>,
     pub(crate) fold: Option<u32>,
     pub(crate) fold_at: Option<u64>,
+    /// One past the last slot the lane's rows landed at, in the set's own
+    /// slot numbering, for a lane whose rows land where the device says.
+    pub(crate) end: Option<u32>,
 }
 
 impl Shell {
