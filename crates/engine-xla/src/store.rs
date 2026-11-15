@@ -1517,6 +1517,9 @@ impl Pools {
             self.copy_rows(device, handles, &[(rows, 0, 0)])?;
             let zeros = vec![0u8; (rows * ROW_BYTES) as usize];
             self.write_rows(device, handles, rows, vec![0], &zeros)?;
+            // A tier read's two programs: one block, and a batch.
+            self.read_rows(device, handles, rows, &[0])?;
+            self.read_rows(device, handles, rows, &vec![0; read_batch(rows)])?;
         }
         // The zero a fresh record starts from, at each fixed shape's size,
         // landed on the sink.
@@ -1694,17 +1697,78 @@ impl Pools {
         if slots.is_empty() || device.is_dry() {
             return Ok(Vec::new());
         }
-        // Each slot's rows straight off the pool (no program, no output
-        // buffer), ordered after every program that wrote it.
         let rows = self.slot_rows(id)?;
-        let whole = self.buffer.as_ref().ok_or_else(|| Fault::Unbound {
-            what: "the pool, which a program still holds".to_string(),
-        })?;
-        let len = i64::try_from(rows * ROW_BYTES).unwrap_or(i64::MAX);
-        let mut out = Vec::with_capacity(slots.len() * len as usize);
-        for &slot in slots {
-            let row = self.slot_row(id, slot)?;
-            out.extend(whole.read_raw(row * ROW_BYTES as i64, len)?);
+        let at: Vec<i64> = slots
+            .iter()
+            .map(|&slot| self.slot_row(id, slot))
+            .collect::<Result<_>>()?;
+        self.read_rows(device, _handles, rows, &at)
+    }
+
+    /// The bytes of blocks of `rows` pool rows each at pool rows `at`, in
+    /// order: a batch of blocks gathered on the device into one buffer and
+    /// copied to the host whole, [`READ_BATCH_BYTES`] a batch; a tail of
+    /// fewer than a quarter batch a block at a time. Two programs a block
+    /// size, whatever the count (warmed at load, [`Pools::warm_copies`]). A
+    /// copy a block straight off the pool (`PJRT_Buffer_CopyRawToHost`)
+    /// waits ~7 ms whatever its size (250 MB/s for a kv page on a v6e); a
+    /// whole buffer copies at the link's speed.
+    fn read_rows(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        rows: u64,
+        at: &[i64],
+    ) -> Result<Vec<u8>> {
+        let per = (rows * ROW_BYTES) as usize;
+        let batch = read_batch(rows);
+        let mut out = Vec::with_capacity(at.len() * per);
+        let whole = at.len() / batch * batch;
+        let tail = &at[whole..];
+        let mut runs: Vec<(&[i64], usize)> =
+            at[..whole].chunks(batch).map(|c| (c, batch)).collect();
+        if tail.len() * 4 >= batch {
+            runs.push((tail, batch));
+        } else {
+            runs.extend(tail.chunks(1).map(|c| (c, 1)));
+        }
+        for (chunk, cap) in runs {
+            let mut inputs = crate::inputs::Inputs::new();
+            let (list, _) = list_into(&mut inputs, handles, chunk, cap);
+            let tracer = Tracer::new(handles).with_stage(self.stage_at(inputs.rows()));
+            let root = self.root;
+            let mut block = None;
+            tracer.emit(&mut |cx| {
+                let whole = cx.read(root)?;
+                let list = cx.read(list)?;
+                let f = cx.func();
+                let got = f.gather(
+                    whole,
+                    list,
+                    &kernels_xla::hlo::GatherDims {
+                        offset_dims: vec![1, 2],
+                        start_index_map: vec![0],
+                        index_vector_dim: 1,
+                        ..kernels_xla::hlo::GatherDims::default()
+                    },
+                    &[rows as i64, 128],
+                )?;
+                block = Some(f.reshape(got, &[cap as i64 * rows as i64, 128])?);
+                cx.write(root, whole)
+            })?;
+            let block = block.ok_or_else(|| Fault::Unbound {
+                what: "the gathered blocks, which the read program did not trace".to_string(),
+            })?;
+            let outs = crate::exec::run(device, tracer, &[block], None, self, &inputs, false)?;
+            // A dry device traces the program and runs nothing.
+            if device.is_dry() {
+                continue;
+            }
+            let buffer = outs.into_iter().next().ok_or_else(|| Fault::Unbound {
+                what: "the gathered blocks, which the read program did not return".to_string(),
+            })?;
+            let bytes = buffer.download()?;
+            out.extend_from_slice(&bytes[..chunk.len() * per]);
         }
         Ok(out)
     }
@@ -1820,6 +1884,20 @@ impl Pools {
         }
         Ok(out)
     }
+}
+
+/// The bytes a tier read gathers on the device and copies out at once.
+const READ_BATCH_BYTES: u64 = 64 << 20;
+
+/// The most blocks a tier read's batch lists: its row list is a staged
+/// input, which a small load's slab holds a few hundred rows of.
+const READ_BATCH_BLOCKS: usize = 256;
+
+/// The blocks of `rows` pool rows a tier read's batch holds.
+fn read_batch(rows: u64) -> usize {
+    usize::try_from(READ_BATCH_BYTES / (rows * ROW_BYTES).max(1))
+        .unwrap_or(1)
+        .clamp(1, READ_BATCH_BLOCKS)
 }
 
 /// `values`, padded with zeros to `cap` entries, and how many there are:
