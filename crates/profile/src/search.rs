@@ -17,6 +17,51 @@ pub const LANES: [usize; 3] = [1, 4, 8];
 /// Tuned decisions as `(decision id, TOML value)`.
 pub type Entries = Vec<(String, String)>;
 
+/// The fires `pie tune` times at each rung width beside the one before
+/// them, which compiles or records: the median is kept.
+pub const FIRE_REPS: usize = 3;
+
+/// The `[fire_ns]` step every backend runs: a fire of each width in
+/// `widths` (the rungs its load lays, in tokens), `fire` timing one in
+/// nanoseconds; the median of [`FIRE_REPS`] after a first that is not kept.
+pub fn time_fires(
+    widths: &[u32],
+    mut fire: impl FnMut(u32) -> Result<u64, String>,
+    say: &mut dyn FnMut(&str),
+) -> Result<crate::fire::FireTable, String> {
+    let mut widths = widths.to_vec();
+    widths.sort_unstable();
+    widths.dedup();
+    let mut table = Vec::with_capacity(widths.len());
+    for width in widths {
+        fire(width)?;
+        let mut times = (0..FIRE_REPS)
+            .map(|_| fire(width))
+            .collect::<Result<Vec<u64>, String>>()?;
+        times.sort_unstable();
+        let ns = times[times.len() / 2].max(1);
+        say(&format!(
+            "  a fire of {width} tokens: {:.2} ms",
+            ns as f64 / 1e6
+        ));
+        table.push((width, ns));
+    }
+    Ok(table)
+}
+
+/// `table` of `model` as the `[fire_ns]` overrides a tuned file carries.
+#[must_use]
+pub fn render_fire_ns(tables: &[(String, crate::fire::FireTable)]) -> String {
+    if tables.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("[fire_ns]\n");
+    for (model, table) in tables {
+        let _ = writeln!(out, "{}", crate::fire::table_line(model, table));
+    }
+    out
+}
+
 #[derive(Clone, Debug)]
 pub struct Line {
     pub id: &'static str,

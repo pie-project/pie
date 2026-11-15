@@ -1,0 +1,15 @@
+api = 1
+
+# The RTX PRO 4500 Blackwell runs the derived profile on Vulkan; this file
+# carries only what is its own: its rates, and the fire times `pie tune`
+# measured on it.
+[target]
+device = "NVIDIA RTX PRO 4500 Blackwell"
+
+[rates]
+# Dense bf16: 1617 TFLOPS of FP4 with sparsity (Lenovo Press LP2443, the
+# Workstation Edition's specifications) is 808 dense, and Blackwell's fifth
+# generation tensor cores run bf16 at a quarter of FP4's rate: 202 TFLOPS.
+bf16_flops_per_ns = 202000.0
+# 896 GB/s of GDDR7 (nvidia.com, RTX PRO 4500 Blackwell specifications).
+bytes_per_ns = 896.0

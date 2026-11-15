@@ -279,6 +279,21 @@ pub struct Boot<'a, B: Serve> {
     pub residency: engine::load::Residency,
 
     pub handed: Option<B::Handed>,
+
+    /// How the top rung is chosen.
+    pub top: Top,
+}
+
+/// How a load chooses the top rung of its fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Top {
+    /// The ruling (`engine::load::top_rung`) over the profile's measured
+    /// fire times or its rates: every served load.
+    #[default]
+    Ruled,
+    /// Every rung one binding holds, up to the requested fire size: what
+    /// `pie tune` lays to time each rung.
+    EveryRung,
 }
 
 /// A load fitted to its device: the device, its tuning and tier, and the
@@ -846,6 +861,7 @@ impl<B: Serve> Shell<B> {
                 device: boot.device,
                 residency: boot.residency.clone(),
                 handed: None,
+                top: boot.top,
             },
             Fitted {
                 device: crate::named::Facts::of::<B>(device),
@@ -970,13 +986,15 @@ impl<B: Serve> Shell<B> {
         // is past a binding. Of the rungs the requested fire size offers,
         // the top is the one the ruling picks (`crate::top`), over the live
         // range kv and activation share at load: what the device leaves the
-        // weights it keeps, within what the pool's segments bind. A fire
-        // wider than it has no carve, so the load's fires are cut to it and
-        // the model compiled again at it (its own carve is laid again, as
-        // it may differ from the rung's laid under the wider top); past the
-        // pick, only one binding bounds the top again.
+        // weights it keeps, within the largest pool the kernels address (at
+        // most `kernels_slang::SEGMENTS` segments, none past one binding:
+        // `store::pool::sized`). A fire wider than it has no carve, so the
+        // load's fires are cut to it and the model compiled again at it (its
+        // own carve is laid again, as it may differ from the rung's laid
+        // under the wider top); past the pick, only one binding bounds the
+        // top again. `Top::EveryRung` (`pie tune`, timing each rung) keeps
+        // every rung one binding holds instead.
         let binding = device.max_buffer();
-        let asked_top = budgets.tokens.max_tokens;
         let counts = crate::top::Counts::of(&boot.trace)?;
         let live = {
             let room = device.left().saturating_sub(counts.weight_bytes);
@@ -984,9 +1002,10 @@ impl<B: Serve> Shell<B> {
                 .map_or(room, |budget| budget.min(room))
                 .min(binding.saturating_mul(kernels_slang::SEGMENTS as u64))
         };
-        let device_key = profile::id_of(device.name());
+        let device_profile = tuning.profile().clone();
+        let device_name = device.name().to_owned();
         let model_key = engine::load::model_class(&boot.trace).to_owned();
-        let mut chosen: Option<crate::top::Chosen> = None;
+        let mut chosen: Option<Option<engine::load::TopRung>> = None;
         let (compiled, mut span) = loop {
             let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
             let top = budgets.tokens.max_tokens;
@@ -1007,25 +1026,28 @@ impl<B: Serve> Shell<B> {
                 .iter()
                 .map(|rung| (rung.tokens, rung.bytes()))
                 .collect();
-            let pick = match &chosen {
-                None => {
+            let pick = match (&chosen, boot.top) {
+                (None, Top::Ruled) => {
                     let rungs = crate::top::rung_facts(&spans, budgets.tokens.max_lanes, binding);
                     let pick = crate::top::choose(
                         &rungs,
                         live,
-                        &device_key,
+                        &device_profile,
+                        &device_name,
                         &model_key,
                         &counts,
                         binding,
                     )?;
                     tracing::debug!(spans = ?spans, ?pick, live, "the rungs the top is chosen of");
-                    let tokens = pick.tokens();
-                    chosen = Some(pick);
-                    Some(tokens)
+                    chosen = Some(Some(pick));
+                    Some(pick.tokens)
                 }
                 // None: not even the least rung lies in one binding, and
                 // the pool refuses the load below.
-                Some(_) => crate::arena::bound_top(&spans, binding),
+                _ => {
+                    chosen.get_or_insert(None);
+                    crate::arena::bound_top(&spans, binding)
+                }
             };
             match pick {
                 Some(widest) if widest < top => {
@@ -1035,19 +1057,23 @@ impl<B: Serve> Shell<B> {
                 _ => break (compiled, span),
             }
         };
-        if let Some(chosen) = &chosen {
-            tracing::info!(
+        match chosen.flatten() {
+            Some(rung) => tracing::info!(
                 "{}",
                 crate::top::line(
-                    chosen,
+                    &rung,
                     budgets.tokens.max_tokens,
-                    asked_top,
                     span.bytes(),
                     live,
-                    &device_key,
+                    &device_name,
                     &model_key,
                 )
-            );
+            ),
+            None => tracing::info!(
+                "top rung {}: every rung one binding holds, to time each; span {} MiB",
+                budgets.tokens.max_tokens,
+                span.bytes() >> 20
+            ),
         }
 
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
@@ -1983,6 +2009,13 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn tuning(&self) -> &B::Tuning {
         &self.tuning
+    }
+
+    /// The widths, in tokens, of the rungs the load laid, narrowest first:
+    /// what `pie tune` times a fire at.
+    #[must_use]
+    pub fn rung_tokens(&self) -> Vec<u32> {
+        self.span.rungs().iter().map(|rung| rung.tokens).collect()
     }
 
     #[must_use]
