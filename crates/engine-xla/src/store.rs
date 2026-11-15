@@ -181,6 +181,25 @@ pub struct Pools {
     /// An `Adapter` slot's bytes (whole pool rows): the largest plane of one
     /// adapter the model's registered banks hold; 0 where it has none.
     adapter_slot: u64,
+    /// Each readout output's ring of planes laid at load
+    /// ([`Pools::lay_readouts`]): a fire writes its readout rows into the
+    /// next one in place (`trace::Source::Readout`).
+    readouts: Vec<ReadoutRing>,
+}
+
+/// One readout output's planes: `[rows, width]` of `dtype` each, as many
+/// as a fire's readouts can be held for (the frames in flight and one), so
+/// a fire never writes over a plane a frame before it still reads.
+#[derive(Debug)]
+pub struct ReadoutRing {
+    pub root: Tensor,
+    pub dtype: Dtype,
+    pub rows: u32,
+    pub width: u32,
+    slots: Vec<Option<std::sync::Arc<Buffer>>>,
+    at: usize,
+    /// Planes laid afresh because the ring's next one was still read.
+    pub fresh: u64,
 }
 
 /// The bytes one adapter's largest plane takes in whole pool rows: a
@@ -678,6 +697,7 @@ impl Pools {
             ring,
             bulk,
             adapter_slot: adapter_slot_bytes(trace),
+            readouts: Vec::new(),
         })
     }
 
@@ -1323,6 +1343,84 @@ impl Pools {
         ((row, plane) == (0, 0))
             .then_some(self.buffer.as_ref())
             .flatten()
+    }
+
+    /// Lays each readout output's ring: `depth` planes of `(root, dtype,
+    /// rows, width)` each, zeros.
+    pub fn lay_readouts(
+        &mut self,
+        device: &Device,
+        rings: &[(Tensor, Dtype, u32, u32)],
+        depth: usize,
+    ) -> Result<()> {
+        for &(root, dtype, rows, width) in rings {
+            let mut slots = Vec::with_capacity(depth);
+            for _ in 0..depth.max(1) {
+                slots.push(device.zeros_or_dry(dtype, rows, width)?.map(std::sync::Arc::new));
+            }
+            self.readouts.push(ReadoutRing {
+                root,
+                dtype,
+                rows,
+                width,
+                slots,
+                at: 0,
+                fresh: 0,
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn readouts(&self) -> &[ReadoutRing] {
+        &self.readouts
+    }
+
+    /// The bytes every readout ring takes on the device.
+    #[must_use]
+    pub fn readout_bytes(&self) -> u64 {
+        self.readouts
+            .iter()
+            .map(|r| r.slots.len() as u64 * u64::from(r.rows) * u64::from(r.width) * 4)
+            .sum()
+    }
+
+    /// The next plane of readout ring `index`, for a fire to write into and
+    /// return: the ring's own when nothing reads it any more, else a fresh
+    /// one of its shape.
+    pub fn readout_take(&mut self, device: &Device, index: u16) -> Result<Buffer> {
+        let ring = self
+            .readouts
+            .get_mut(usize::from(index))
+            .ok_or_else(|| Fault::Unbound {
+                what: format!("readout ring {index}, which this load did not lay"),
+            })?;
+        ring.at = (ring.at + 1) % ring.slots.len().max(1);
+        match ring.slots[ring.at].take().map(std::sync::Arc::try_unwrap) {
+            Some(Ok(buffer)) => Ok(buffer),
+            _ => {
+                ring.fresh += 1;
+                device
+                    .zeros_or_dry(ring.dtype, ring.rows, ring.width)?
+                    .ok_or_else(|| Fault::Unbound {
+                        what: "a readout plane, on a device that runs nothing".to_string(),
+                    })
+            }
+        }
+    }
+
+    /// Puts back what a fire returned for readout ring `index`.
+    pub fn readout_put(&mut self, index: u16, buffer: Buffer) {
+        if let Some(ring) = self.readouts.get_mut(usize::from(index)) {
+            ring.slots[ring.at] = Some(std::sync::Arc::new(buffer));
+        }
+    }
+
+    /// The plane readout ring `index`'s last fire wrote.
+    #[must_use]
+    pub fn readout_current(&self, index: u16) -> Option<std::sync::Arc<Buffer>> {
+        let ring = self.readouts.get(usize::from(index))?;
+        ring.slots[ring.at].clone()
     }
 
     /// Puts back what a program returned for the pool.

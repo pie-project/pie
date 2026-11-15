@@ -191,7 +191,7 @@ fn kept(device: &Device, plane: &[f32], rows: u32, layout: Vec<(u32, u32)>) -> K
         "logits".to_string(),
         poem_ir::InputAxis::Row,
         true,
-        buffer,
+        std::sync::Arc::new(buffer),
         rows,
         width,
         0,
