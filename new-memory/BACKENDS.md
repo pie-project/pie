@@ -122,6 +122,8 @@ re-encoded each fire. wgpu (no recording): 122.6 / 125.0 / 120.3, no gap. l36 Vu
 input), so misses keep recording.
 
 Pre-existing parity gaps (not memory, but in scope for parity): ROCm synth codegen, ROCm graph replay with >= 2 MoE layers (AMD d); (concat_cols, FP8 m33 fixed M43);
-sm_100 tcgen05 W4A16 arms read no expert table; Metal MLA prefill unsupported.
+sm_100 tcgen05 W4A16 arms read no expert table; Metal MLA prefill unsupported. Metal MPP prompt attention has never served:
+the kernel takes 32-token kv pages only and a served model's chunk plan builds 16, so apple10's `sdpa.prefill = "mpp"`
+fell through silently (to the scalar tiled kernel at 128 until sc/mac-sdpa-mma128; the load now says which form runs).
 
 Owners: L40S (CUDA), AMD (ROCm), BM agent (Metal, Mac Studio), VK agent (Vulkan + wgpu), TPU session (XLA/TPU, with hardware; took over sc/xla2), TIER agent (host/disk tiers), CB agent (Cerebras, sc/cb-chunk-pool; no hardware — lib tests + host simulation, rest unverified).

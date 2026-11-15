@@ -820,6 +820,32 @@ impl PreparedLoad<'_> {
             boot.page_size
         };
         let paging_at = |pages: u64, slots: u32| Paging::of(page_size, boot.context, slots, pages);
+        // A profile that asks for the MPP prompt kernel where this load's
+        // pages can never take it says so once, with the form that runs: a
+        // silent fall-through had the M5's prompts read as tensor-op ones.
+        if tuning.sdpa_mpp() {
+            let widths: std::collections::BTreeSet<u32> =
+                facts.rows.iter().flatten().map(|row| row.head_dim).collect();
+            for head_dim in widths {
+                let form = kernels_metal::attn::arbiter::prefill_form(
+                    head_dim,
+                    i32::try_from(page_size).unwrap_or(i32::MAX),
+                    &tuning,
+                );
+                if form != kernels_metal::attn::arbiter::PrefillForm::Mpp {
+                    tracing::info!(
+                        head_dim,
+                        page_size,
+                        mpp_page_size = kernels_metal::attn::arbiter::MPP_PAGE_SIZE,
+                        runs = ?form,
+                        "the profile asks sdpa.prefill = mpp; this load's kv pages are \
+                         {page_size} tokens and mpp serves {} (heads 64, 128 and 256): \
+                         {head_dim}-wide prompt attention runs {form:?}",
+                        kernels_metal::attn::arbiter::MPP_PAGE_SIZE
+                    );
+                }
+            }
+        }
         // The fire's buffers a load places beside the weights, reserved
         // before the pool so the pool is sized by what they leave: they read
         // a seat's pages, never the pool's whole count.

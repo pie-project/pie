@@ -35,6 +35,38 @@ const MMA_WIDE: [(u32, &str, &str); 3] = [
 
 const MMA_FILE: &str = "attn/sdpa_paged_mma.metal";
 
+/// The only kv page size the MPP prompt kernel serves.
+pub const MPP_PAGE_SIZE: i32 = 32;
+
+/// The kernel family a prompt (tiled rows, causal, no lse) of a
+/// `head_dim`-wide head attends through over a pool of `page_size`-token
+/// pages: what [`arbitrate`] picks past the q8 and the vector cases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefillForm {
+    /// The MPP tensor-op kernel (`sdpa.prefill = "mpp"`).
+    Mpp,
+    /// The simdgroup-matrix kernel ([`should_mma`]).
+    Mma,
+    /// The scalar tiled kernel.
+    Tiled,
+}
+
+/// [`PrefillForm`] for a head width and a pool's page size under `tuning`,
+/// by the arbiter's own tests, so a load can say once which form its
+/// prompts take, and why a profile's `sdpa.prefill = "mpp"` is not it:
+/// the MPP kernel serves 64-, 128- and 256-wide heads over 32-token pages
+/// only, and a pool of other pages falls through to the next form.
+#[must_use]
+pub fn prefill_form(head_dim: u32, page_size: i32, tuning: &Tuning) -> PrefillForm {
+    if tuning.sdpa_mpp() && super::q8::mpp_serves(head_dim, page_size) {
+        PrefillForm::Mpp
+    } else if should_mma(head_dim, tuning) {
+        PrefillForm::Mma
+    } else {
+        PrefillForm::Tiled
+    }
+}
+
 #[must_use]
 pub fn should_tile(rows: u32, requests: u32, tuning: &Tuning) -> bool {
     rows / requests.max(1) >= tuning.sdpa_tile_rows_per_request()
