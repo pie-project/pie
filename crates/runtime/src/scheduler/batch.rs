@@ -461,6 +461,7 @@ mod tests {
         fires_moving_one_ring_end_go_a_step_apart_in_the_order_they_stand();
         a_seal_that_dispatches_the_later_putter_first_gives_it_the_earlier_cell();
         a_step_carries_no_more_than_its_rungs_tokens();
+        a_wave_of_prompts_past_one_fire_is_cut_and_its_decode_wave_is_one_fire();
     }
 
     /// The fires of `dispatch`'s frames, each fire id standing for the
@@ -663,6 +664,91 @@ mod tests {
             assert!(plain.accepts(&carrying(at, 0), limits(), 16));
             assert!(!plain.push(&carrying(at, 0), limits(), 16));
         }
+    }
+
+    /// A frame's wave of prompts past what one fire carries is cut into
+    /// fires each within it; the lanes' first decode rows, the next wave,
+    /// are one fire. A prompt past one fire alone takes a fire of its own,
+    /// and no member is dropped.
+    fn a_wave_of_prompts_past_one_fire_is_cut_and_its_decode_wave_is_one_fire() {
+        let limits = limits();
+        let lanes = limits.max_forward_requests as u64;
+        // Two prompts pass one fire.
+        let prompt_tokens = limits.max_forward_tokens / 2 + 1;
+        let prompt = |instance: u64, tokens: usize| {
+            pending(
+                FireRequest::one(crate::engine::fire::lane_of(
+                    0,
+                    vec![7; tokens],
+                    0,
+                    vec![instance as u32],
+                )),
+                InstanceId(instance),
+            )
+        };
+        let step_tokens = |step: &StepFire| -> usize {
+            step.submission
+                .lanes
+                .iter()
+                .map(|lane| lane.tokens.len())
+                .sum()
+        };
+        let decodes = || -> Vec<Box<PendingRequest>> {
+            (1..=lanes)
+                .map(|at| pending(decode(9, at as u32), InstanceId(at)))
+                .collect()
+        };
+
+        let prompts = (1..=lanes).map(|at| prompt(at, prompt_tokens)).collect();
+        let (frame, flattened) = build_frame_submission(
+            vec![prompts, decodes()],
+            limits,
+            16,
+            &SchedulerStats::default(),
+        );
+        assert_eq!(flattened.len(), 2 * lanes as usize, "no member is dropped");
+        let (decode_fire, prompt_fires) = frame.steps.split_last().expect("steps");
+        assert_eq!(prompt_fires.len(), lanes as usize, "a fire a prompt");
+        for step in prompt_fires {
+            assert!(step_tokens(step) <= limits.max_forward_tokens);
+            assert_eq!(step_tokens(step), prompt_tokens);
+        }
+        assert_eq!(
+            decode_fire.submission.lanes.len(),
+            lanes as usize,
+            "the lanes' first decode rows are one fire"
+        );
+        assert!(
+            decode_fire
+                .submission
+                .lanes
+                .iter()
+                .all(|lane| lane.tokens.len() == 1)
+        );
+
+        // Short prompts share fires as they did: the cut is by what a fire
+        // carries, and the decode wave is one fire all the same.
+        let short = limits.max_forward_tokens / lanes as usize;
+        let prompts = (1..=lanes).map(|at| prompt(at, short)).collect();
+        let (frame, _) = build_frame_submission(
+            vec![prompts, decodes()],
+            limits,
+            16,
+            &SchedulerStats::default(),
+        );
+        assert_eq!(frame.steps.len(), 2, "one fire of prompts, one of decodes");
+        assert_eq!(step_tokens(&frame.steps[0]), short * lanes as usize);
+        assert_eq!(frame.steps[1].submission.lanes.len(), lanes as usize);
+
+        // A prompt past one fire alone still takes a fire of its own.
+        let wide = limits.max_forward_tokens + 1;
+        let prompts = vec![prompt(1, short), prompt(2, wide), prompt(3, short)];
+        let (frame, flattened) =
+            build_frame_submission(vec![prompts], limits, 16, &SchedulerStats::default());
+        assert_eq!(flattened.len(), 3, "no member is dropped");
+        let mut sizes: Vec<usize> = frame.steps.iter().map(step_tokens).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![2 * short, wide]);
     }
 
     /// The engine holds a body for no more than `prefill_lanes` lanes of

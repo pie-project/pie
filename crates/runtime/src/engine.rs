@@ -10,8 +10,8 @@ pub mod profiles;
 pub use waker;
 
 pub use backend::{
-    EngineBox, EngineSpec, SchedulerLimits, get_spec, open, register_engine_backend,
-    take_engine_backend, unregister_engine,
+    EngineBox, EngineSpec, SchedulerLimits, fire_limits, get_spec, open,
+    register_engine_backend, take_engine_backend, unregister_engine,
 };
 pub use channel::{
     ChannelBinding, ChannelCloser, ChannelEndpoint, ChannelJoin, ChannelValue, RegisteredChannel,

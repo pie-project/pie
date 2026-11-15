@@ -150,7 +150,7 @@ pub mod worker {
     use crate::{By, Change, Edge, Exit, Id, OffloadEvent};
 
     pub use crate::bindings::plex::policy::worker_writes::{
-        discard, install_offload, install_retention, install_schedule, publish,
+        discard, install_batch, install_offload, install_retention, install_schedule, publish,
     };
 
     /// One handler per edge kind, then [`Policy::plan`]; every method defaults
