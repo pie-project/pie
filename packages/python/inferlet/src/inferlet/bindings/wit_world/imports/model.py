@@ -167,6 +167,15 @@ def architecture() -> str:
     raise NotImplementedError
 def draft_block() -> Optional[BlockDrafter]:
     raise NotImplementedError
+def draft_depth() -> int:
+    """
+    How many tokens the model's own draft head proposes in one pass, each
+    fed the one before it: the leading entries of the `mtp.drafts` output
+    that are a chain, whatever width that output has. A guest drafting from
+    the head drafts at most this many a round. 0 for a model whose text
+    states no draft head. Static.
+    """
+    raise NotImplementedError
 def switches() -> List[SwitchDecl]:
     """
     Every switch the bound model declares; empty for a one-path model.

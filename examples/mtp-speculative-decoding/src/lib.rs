@@ -37,7 +37,8 @@ struct Input {
     prompt: String,
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
-    /// Draft tokens per round, capped at the width of the model's `mtp.drafts`. **`k = 0`
+    /// Draft tokens per round, capped at the model's draft depth
+    /// (`model::draft_depth`, the chain its head drafts). **`k = 0`
     /// IS THE CONTROLLED A/B**: the window is one row, nothing is drafted or
     /// verified, and the loop is sequential greedy decoding through the same
     /// geometry, fire and commit arithmetic.
@@ -77,6 +78,29 @@ fn bench_mode(input: &Input, k: u32) -> bool {
     input.bench_accept && !input.trace && !input.margin && input.pad == 0 && k > 0
 }
 
+/// The prompt's prefill spans: with drafts on, runs of at most `limit` rows
+/// each read out whole, so the head runs over every prompt row; without, the
+/// whole prompt as one span.
+fn prefill_spans(n: u32, drafting: bool, limit: u32) -> Vec<(u32, u32)> {
+    if !drafting {
+        return vec![(0, n)];
+    }
+    let limit = limit.max(1);
+    (0..n.div_ceil(limit))
+        .map(|at| (at * limit, ((at + 1) * limit).min(n)))
+        .collect()
+}
+
+/// The most rows one prefill fire may read out: what its pass may bind and
+/// what each output it reads holds a pass.
+fn readout_rows(lane: &model::LaneDecl) -> u32 {
+    lane.outputs
+        .iter()
+        .filter(|o| o.name == "logits" || o.name == "mtp.drafts")
+        .map(|o| o.max_rows)
+        .fold(model::max_pass_rows(), u32::min)
+}
+
 /// The window drafts what the caller asked for, up to the model's draft width.
 fn working_k(asked: u32, depth: u32) -> u32 {
     asked.min(depth)
@@ -110,9 +134,12 @@ struct Output {
     accepted: usize,
     /// `accepted / drafted`, or zero when nothing was drafted.
     acceptance_rate: f64,
-    /// The draft-window length this run used (the input's, capped at depth).
+    /// The draft-window length the request asked for.
+    asked: u32,
+    /// The draft-window length this run used: `asked`, capped at `depth`.
     k: u32,
-    /// The model's draft depth.
+    /// The model's draft depth, the chain its text states it drafts
+    /// (`model::draft_depth`), not the width of `mtp.drafts`.
     depth: u32,
     prompt_tokens: u32,
     /// Per round, row 0's top-1 minus top-2 logit — whether a divergence
@@ -135,7 +162,7 @@ struct Output {
 }
 
 impl Output {
-    fn empty(k: u32, depth: u32) -> Output {
+    fn empty(asked: u32, k: u32, depth: u32) -> Output {
         Output {
             sampler: "mtp-speculative-decoding",
             text: String::new(),
@@ -145,6 +172,7 @@ impl Output {
             drafted: 0,
             accepted: 0,
             acceptance_rate: 0.0,
+            asked,
             k,
             depth,
             prompt_tokens: 0,
@@ -164,10 +192,13 @@ const NONE: i32 = -1;
 async fn main(input: Input) -> Result<Output> {
     let lane = model::lane_of(&[])?;
     let output = |name: &str| lane.outputs.iter().find(|output| output.name == name);
-    let depth = output("mtp.drafts").map_or(0, |drafts| drafts.width);
+    // The output's width is how the chains lie in memory; the depth is how
+    // many of each chain's entries the head actually chained.
+    let width = output("mtp.drafts").map_or(0, |drafts| drafts.width);
+    let depth = model::draft_depth().min(width);
     let k = working_k(input.k, depth);
     if input.max_tokens == 0 {
-        return Ok(Output::empty(k, depth));
+        return Ok(Output::empty(input.k, k, depth));
     }
     let w = k + 1 + input.pad;
 
@@ -187,44 +218,46 @@ async fn main(input: Input) -> Result<Output> {
         .context("reserve the decode's slots")?;
     let pipe = Pipeline::new();
 
-    // The drafting pass is the last prompt token alone: a draft head attends
-    // as its readout rows, so every row of a drafting fire is read out.
+    // A drafting fire runs the head over its readout rows and writes the
+    // head's KV at their slots, so with drafts on the prompt is read out at
+    // EVERY row: a prompt row the head never ran over would leave a slot it
+    // later attends unwritten, read as whatever an earlier tenant left there.
+    // The spans are as long as a pass may read out; without drafts the prompt
+    // is one span and only its last row is read.
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let spans = if k > 0 && n > 1 {
-        vec![(0, n - 1), (n - 1, n)]
-    } else {
-        vec![(0, n)]
-    };
-    let last_span = spans.len() - 1;
+    let spans = prefill_spans(n, k > 0, readout_rows(&lane));
     let mut seed: Vec<i32> = Vec::new();
-    for (at, &(base, end)) in spans.iter().enumerate() {
+    for &(base, end) in &spans {
         let len = end - base;
         let toks_p = Channel::from(&prompt_i32[base as usize..end as usize]);
         let indptr_p = Channel::from([0u32, len]);
-        // The last row only: the first window is seeded off it.
-        let readout_p = Channel::from([len - 1]);
+        let drafting = k > 0;
+        let read = if drafting { 0 } else { len - 1 };
+        let rows = len - read;
+        let readout_p = Channel::from_iter(read..len);
         let seed_p = Channel::new([w], dtype::i32);
-        let drafting = at == last_span && k > 0;
 
         let fwd_p = ForwardPass::new();
         fwd_p.embed(&toks_p, &indptr_p)?;
         fwd_p.readout(&readout_p)?;
         fwd_p.state(&[&ws], StateGeometry::folding())?;
         fwd_p.epilogue(move || {
-            // One readout row: `logits()` is `[vocab]`, its argmax a scalar.
-            let t = reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]);
+            // The span's last readout row seeds the first window.
+            let last = broadcast(Tensor::constant(rows - 1), [1]);
+            let t = gather(&reshape(reduce_argmax(intrinsics::output(0, "logits")), [rows]), &last);
             let i = iota(w);
             let first = eq(&i, Tensor::constant(0u32));
             let window = if drafting {
-                // The head's chain at the readout row, `[depth]`; the window
-                // takes its first `k`, and any pad row carries `t` again.
-                let chain = intrinsics::output(0, "mtp.drafts");
+                // The head's chain at that row, `[width]`; the window takes
+                // its first `k`, and any pad row carries `t` again.
+                let chains = reshape(intrinsics::output(0, "mtp.drafts"), [rows * width]);
                 let j = min_elem(
                     max_elem(&i, Tensor::constant(1u32)) - Tensor::constant(1u32),
                     Tensor::constant(depth - 1),
                 );
+                let at = broadcast(Tensor::constant((rows - 1) * width), [w]) + &j;
                 let drafted = and(not(&first), le(&i, Tensor::constant(k)));
-                select(&drafted, gather(&chain, &j), broadcast(&t, [w]))
+                select(&drafted, gather(&chains, &at), broadcast(&t, [w]))
             } else {
                 broadcast(&t, [w])
             };
@@ -345,9 +378,9 @@ async fn main(input: Input) -> Result<Output> {
             // ── the next window: the correction, then row m's chain
             let first = eq(&i, Tensor::constant(0u32));
             let next = if k > 0 {
-                let chains = reshape(intrinsics::output(0, "mtp.drafts"), [w * depth]);
+                let chains = reshape(intrinsics::output(0, "mtp.drafts"), [w * width]);
                 let j = min_elem(max_elem(&i, &one) - &one, Tensor::constant(depth - 1));
-                let at = &mb * Tensor::constant(depth) + &j;
+                let at = &mb * Tensor::constant(width) + &j;
                 let drafted = and(not(&first), le(&i, Tensor::constant(k)));
                 select(&drafted, gather(&chains, &at), &correction)
             } else {
@@ -488,7 +521,7 @@ async fn main(input: Input) -> Result<Output> {
                 )?;
                 fwd_fast.epilogue(move || {
                     let truth = reshape(reduce_argmax(intrinsics::output(0, "logits")), [w]);
-                    let chains = reshape(intrinsics::output(0, "mtp.drafts"), [w * depth]);
+                    let chains = reshape(intrinsics::output(0, "mtp.drafts"), [w * width]);
                     let _ = gather(&chains, iota(w));
                     truth_out.put(&truth);
                 });
@@ -587,6 +620,7 @@ async fn main(input: Input) -> Result<Output> {
         drafted,
         accepted,
         acceptance_rate,
+        asked: input.k,
         k,
         depth,
         prompt_tokens: n,
@@ -623,9 +657,26 @@ mod tests {
         assert!(!bench_mode(&input, working_k(input.k, 4)));
     }
 
-    /// `k = 4` on a model that drafts four is a window of four drafts.
+    /// With drafts on, every prompt row is in a span the head runs over.
+    #[test]
+    fn a_drafting_prefill_covers_every_prompt_row() {
+        assert_eq!(prefill_spans(10, true, 4), [(0, 4), (4, 8), (8, 10)]);
+        assert_eq!(prefill_spans(3, true, 64), [(0, 3)]);
+        assert_eq!(prefill_spans(10, false, 4), [(0, 10)]);
+        for (n, limit) in [(1, 1), (37, 8), (512, 512), (513, 512)] {
+            let spans = prefill_spans(n, true, limit);
+            assert_eq!(spans.first().unwrap().0, 0);
+            assert_eq!(spans.last().unwrap().1, n);
+            assert!(spans.windows(2).all(|p| p[0].1 == p[1].0));
+            assert!(spans.iter().all(|&(a, b)| b > a && b - a <= limit));
+        }
+    }
+
+    /// `k = 4` on a head that chains four is a window of four drafts, and
+    /// on a head of one unchained layer a window of one.
     #[test]
     fn the_window_drafts_what_was_asked_up_to_the_model() {
+        assert_eq!(working_k(4, 1), 1);
         assert_eq!(working_k(4, 4), 4);
         assert_eq!(working_k(2, 4), 2);
         assert_eq!(working_k(8, 4), 4);

@@ -69,6 +69,10 @@ impl pie::inferlet::model::Host for ProcessCtx {
         )
     }
 
+    async fn draft_depth(&mut self) -> Result<u32> {
+        Ok(model::model().facts().draft_depth.unwrap_or(0))
+    }
+
     async fn switches(&mut self) -> Result<Vec<pie::inferlet::model::SwitchDecl>> {
         Ok(model::model()
             .facts()
