@@ -1774,16 +1774,64 @@ struct Reserved {
     kvtxns: Vec<KvTxnGuard>,
     rs: rs::PreparedRs,
     epoch: FireEpoch,
+    unfired: Unfired,
+}
+
+/// What a pipeline says of a fire prepared that did not follow, where no
+/// refusal said more.
+const UNFIRED: &str = "pipeline: a fire was prepared and never submitted";
+
+/// A fire prepared and still to be submitted. [`reserve`] ended by
+/// committing what it folds into its recurrent states, and each piece's
+/// prepare freezes what it folds by a count the host knows
+/// ([`begin_piece`]); neither is taken back. So a fire that does not follow
+/// fails its pipeline, and its sets with it, however the call that prepared
+/// it ends: by a refusal, by a trap, or dropped where it waits. Held from
+/// [`reserve`] to the submit, this leaves the failure when it is dropped
+/// unless the fire was submitted ([`Unfired::submitted`]); a refusal that
+/// left its own reason first keeps it.
+struct Unfired {
+    failure: Option<PipelineFailure>,
+}
+
+impl Unfired {
+    fn new(failure: &PipelineFailure) -> Self {
+        Self {
+            failure: Some(failure.clone()),
+        }
+    }
+
+    /// The engine took the fire.
+    fn submitted(mut self) {
+        self.failure = None;
+    }
+}
+
+impl Drop for Unfired {
+    fn drop(&mut self) {
+        let Some(failure) = self.failure.take() else {
+            return;
+        };
+        let mut pipeline = failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pipeline.is_none() {
+            *pipeline = Some(UNFIRED.to_string());
+        }
+    }
 }
 
 /// A demand that drifted from its grant is quoted again. What it binds
-/// opens the fire's epoch on engine `engine` of model `model`.
+/// opens the fire's epoch on engine `engine` of model `model`. What it
+/// returns holds the pipeline's `failure` to the fire's submit
+/// ([`Unfired`]); a reserve refused committed nothing, and leaves none.
 #[allow(clippy::too_many_arguments)]
 async fn reserve<C: FireContext>(
     ctx: &mut C,
     (model, engine): (usize, usize),
     stores: &crate::store::registry::Stores,
     pipeline_id: uuid::Uuid,
+    failure: &PipelineFailure,
     sets: &[(&KvWorkingSet, Written)],
     rs_ids: &[crate::store::rs::RsWorkingSetId],
     rs_plan: impl Fn() -> Result<rs::RsPlan, String>,
@@ -1825,6 +1873,7 @@ async fn reserve<C: FireContext>(
                     kvtxns,
                     rs,
                     epoch: FireEpoch::begin(model, engine, stores, ctx.process_id()),
+                    unfired: Unfired::new(failure),
                 });
             }
             Err(ReservedError::Stale) if requote_on_drift(&mut stale_at, demand) => {}
@@ -3982,6 +4031,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 (model, engine),
                 &stores,
                 quorum_pipeline_id,
+                &pipeline_failure,
                 &sets,
                 &rs_ws_ids,
                 rs_plan,
@@ -3994,6 +4044,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 kvtxns,
                 rs: rs_prepared,
                 epoch,
+                unfired,
             } = match reserved {
                 Ok(reserved) => reserved,
                 Err(error) => return Ok(Err(error)),
@@ -4026,7 +4077,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 // What the piece folds is frozen with its log begun, in the
                 // step `reserve` ended by committing the recurrent state's
                 // fold: nothing is awaited between them. A fire that does
-                // not follow fails the pipeline, and its sets with it.
+                // not follow fails the pipeline, and its sets with it,
+                // however this call ends (`unfired`).
                 let freeze = match &by {
                     Some(FoldBy::To(to)) => Some(*to),
                     _ => None,
@@ -4150,6 +4202,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
                 return Ok(Err(reason));
             }
+            unfired.submitted();
             epoch.retire_on(&completion);
             for part in &mut parts {
                 part.kvtxn.retire_on(&completion);
@@ -5131,6 +5184,7 @@ async fn fire_device_geometry<C: FireContext>(
         (ws.model, ws.engine),
         &stores,
         quorum_pipeline_id,
+        &pipeline_failure,
         &sets,
         &rs_ws_ids,
         rs_plan,
@@ -5143,6 +5197,7 @@ async fn fire_device_geometry<C: FireContext>(
         kvtxns,
         rs: mut rs_prepared,
         epoch,
+        unfired,
     } = match reserved {
         Ok(reserved) => reserved,
         Err(error) => return Ok(Err(error)),
@@ -5153,7 +5208,8 @@ async fn fire_device_geometry<C: FireContext>(
     // cut where it may start writing, its frozen length, unless the engine
     // reports what it wrote. A fold the host can place is frozen with it, in
     // the step `reserve` ended by committing the recurrent state's fold; a
-    // fire that does not follow fails the pipeline, and its sets with it.
+    // fire that does not follow fails the pipeline, and its sets with it,
+    // however this call ends (`unfired`).
     let mut logged = Vec::with_capacity(group_sets.len());
     for (((set, indexes), (_, lanes)), stated) in group_sets
         .iter()
@@ -5415,6 +5471,7 @@ async fn fire_device_geometry<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
     }
+    unfired.submitted();
     epoch.retire_on(&completion);
     for part in &mut parts {
         part.kvtxn.retire_on(&completion);
@@ -7329,6 +7386,112 @@ pub(crate) mod fold_tests {
         assert_eq!(set.claim_pipeline_scope(&next), refused);
         assert_eq!(forked.claim_pipeline_scope(&next), refused);
         assert_eq!(set.forked(child).claim_pipeline_scope(&next), refused);
+    }
+
+    /// What a fire froze as it was prepared stands when the fire does not
+    /// follow, so the pipeline fails however the call that prepared it
+    /// ends: here by a trap between the freeze and the submit, on a pass
+    /// gone, and dropped where it waits. What [`reserve`] returns says so
+    /// until the engine takes the fire.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fire_prepared_and_never_submitted_fails_its_pipeline() {
+        use crate::store::{PipelineScope, ScopeRefusal};
+
+        async fn prepared(
+            ctx: &mut TestContext,
+            model: usize,
+            stores: &Stores,
+            failure: &PipelineFailure,
+        ) -> Unfired {
+            let none = || Ok(rs::RsPlan::Groups(Vec::new()));
+            let id = uuid::Uuid::new_v4();
+            let reserved = reserve(ctx, (model, 0), stores, id, failure, &[], &[], none, false);
+            reserved.await.unwrap().unfired
+        }
+        /// A piece prepared as a pass prepares one, whose call then asks
+        /// for a pass gone, as each path does before its submit.
+        async fn trapped(
+            ctx: &mut TestContext,
+            model: usize,
+            stores: &Stores,
+            ws: WorkingSetId,
+            failure: &PipelineFailure,
+        ) -> Anyhow<()> {
+            let unfired = prepared(ctx, model, stores, failure).await;
+            begin_piece(&mut stores.kv.lock(), ws, 4, Some(7))?;
+            let gone: Resource<ForwardPass> = Resource::new_borrow(u32::MAX);
+            ctx.resources().get_mut(&gone)?;
+            unfired.submitted();
+            Ok(())
+        }
+
+        let (model, stores, ws) = frozen_at(4);
+        let mut ctx = Flight::context();
+        let failure = PipelineFailure::default();
+        let scope = PipelineScope::failing_as(failure.clone(), || true);
+        let set = KvWorkingSet::new(model, 0, ws, 4);
+        set.claim_pipeline_scope(&scope).unwrap();
+        assert!(
+            trapped(&mut ctx, model, &stores, ws, &failure)
+                .await
+                .is_err()
+        );
+        assert_eq!(folded(&stores, ws), (7, true), "the freeze stands");
+        assert_eq!(set.pipeline_failure().as_deref(), Some(UNFIRED));
+        let child = stores.kv.lock().fork(ws).unwrap();
+        scope.close();
+        let next = PipelineScope::failing_as(Default::default(), || true);
+        let refused = Err(ScopeRefusal::Failed {
+            owner: scope.id(),
+            reason: UNFIRED.to_string(),
+        });
+        assert_eq!(set.claim_pipeline_scope(&next), refused);
+        assert_eq!(set.forked(child).claim_pipeline_scope(&next), refused);
+
+        // A refusal that said why keeps its reason.
+        let failure = PipelineFailure::default();
+        let unfired = prepared(&mut ctx, model, &stores, &failure).await;
+        let gone: Resource<ForwardPass> = Resource::new_borrow(u32::MAX);
+        record_submit_failure(&mut ctx, &gone, &failure, "pipeline: submit failed");
+        drop(unfired);
+        assert_eq!(
+            failure.lock().unwrap().as_deref(),
+            Some("pipeline: submit failed")
+        );
+
+        // A call dropped where it waits, its fire prepared.
+        let failure = PipelineFailure::default();
+        let unfired = prepared(&mut ctx, model, &stores, &failure).await;
+        let mut waiting = Box::pin(async move {
+            let _unfired = unfired;
+            std::future::pending::<()>().await;
+        });
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(*failure.lock().unwrap(), None);
+        drop(waiting);
+        assert_eq!(failure.lock().unwrap().as_deref(), Some(UNFIRED));
+
+        // A fire the engine took leaves none, and a reserve refused none.
+        let failure = PipelineFailure::default();
+        prepared(&mut ctx, model, &stores, &failure)
+            .await
+            .submitted();
+        let refused = || Err("no mode".to_string());
+        let id = uuid::Uuid::new_v4();
+        let reserved = reserve(
+            &mut ctx,
+            (model, 0),
+            &stores,
+            id,
+            &failure,
+            &[],
+            &[],
+            refused,
+            false,
+        );
+        assert!(reserved.await.is_err());
+        assert_eq!(*failure.lock().unwrap(), None);
     }
 
     /// A prompt of `tokens` sealed in the cache of `stores` by a set since
