@@ -99,8 +99,8 @@ pub fn give_back(pool: &mut impl PoolTarget, short: u64) -> u64 {
     given
 }
 
-/// What `yield` can give back on this engine, said once at load where it
-/// cannot give back every kind.
+/// What `yield` can give back on this engine, and what it cannot, said once
+/// at load.
 fn say_what_yield_sheds(share: f64, fixed: bool, span_on_demand: bool, reading: bool) {
     if share <= 0.0 {
         return;
@@ -108,7 +108,8 @@ fn say_what_yield_sheds(share: f64, fixed: bool, span_on_demand: bool, reading: 
     if fixed {
         tracing::warn!(
             share,
-            "yield: this engine's pool is fixed from the load; yield sheds nothing here"
+            "yield: this engine's pool is fixed from the load; yield sheds nothing here \
+             (no idle cache, weight cache, demotion or rung)"
         );
     } else if !reading {
         tracing::warn!(
@@ -118,8 +119,16 @@ fn say_what_yield_sheds(share: f64, fixed: bool, span_on_demand: bool, reading: 
     } else if !span_on_demand {
         tracing::info!(
             share,
-            "yield: this engine backs its activation span from the load; yield sheds cache only \
-             (idle prefixes, checkpoints, the weight cache), never the rung"
+            "yield: this engine backs its activation span from the load; yield sheds idle \
+             cache (prefixes, checkpoints), the weight cache and demotes prefixes keyed \
+             above the floor, never the rung"
+        );
+    } else {
+        tracing::info!(
+            share,
+            "yield: this engine backs its activation span on demand; yield sheds idle cache \
+             (prefixes, checkpoints), the weight cache, demotes prefixes keyed above the \
+             floor, then narrows the rung"
         );
     }
 }
