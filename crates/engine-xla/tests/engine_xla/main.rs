@@ -16,6 +16,7 @@ mod a_fire_the_load_did_not_prepare_is_counted;
 mod a_pool_answers_what_the_base_build_answered;
 mod a_pool_view_reads_the_packed_rows_order;
 mod a_registered_channel_carries_one_cell_across_its_instances;
+mod a_tier_read_lands_every_slot_whole;
 mod a_prompt_length_reuses_its_programs;
 mod an_adapter_lies_in_its_slots;
 mod an_epilogue_agrees_with_the_host_interpreter;
