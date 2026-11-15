@@ -829,6 +829,13 @@ impl core::fmt::Display for BodyStats {
 }
 
 impl Bodies {
+    /// The counts alone, with no census taken: what a fire reads on either
+    /// side of itself to say how it was served.
+    #[must_use]
+    pub fn tally(&self) -> BodyTally {
+        self.recorder.bstats
+    }
+
     #[must_use]
     pub fn body_stats(&self) -> BodyStats {
         BodyStats {
