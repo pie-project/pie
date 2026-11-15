@@ -356,6 +356,178 @@ fn compile(cfg: &Config, cache: &Cache, trace: &Trace, plan: &Plan, levers: &str
     Ok(dir.join("out"))
 }
 
+/// A stream model's programs (GENERIC.md M1h), compiled on load into the cache unless it holds
+/// them: each reading of the trace's `reading` switch that the stream compiler lowers, at
+/// `[cerebras.wafer] stream_rows` rows a class, linked by cslc for the fabric the engine runs
+/// on (none for the host fabric, `host`: its steps are engine-cpu's). Returns each program's
+/// directory and its link, in the switch's order; `None` where no reading is a stream reading.
+/// A reading the compiler refuses is not served, and says why in the log.
+///
+/// ```text
+/// <cache_dir>/wafer/s-<model>-<key>/<reading>/   wafer-compile stream's files, ops/, out/
+/// ```
+///
+/// The key is a hash of every program's files and the link's target, so a compiler or kernel
+/// change compiles anew.
+pub fn stream_programs(
+    cfg: &Config,
+    trace: &Trace,
+    host: bool,
+) -> R<Option<Vec<(PathBuf, PathBuf)>>> {
+    use kernels_cerebras::stream;
+    let Some(switch) = trace.facts.declared("reading") else {
+        return Ok(None);
+    };
+    let rows = cfg
+        .wafer
+        .stream_rows
+        .unwrap_or(crate::config::DEFAULT_STREAM_ROWS);
+    let cache = Cache::open(cfg)?;
+    let stage = tempfile::Builder::new()
+        .prefix(".stream-")
+        .tempdir_in(&cache.root)
+        .map_err(io(&cache.root))?;
+    let mut names = Vec::new();
+    let mut hasher = blake3::Hasher::new();
+    for reading in &switch.values {
+        let o = stream::Options {
+            reading: reading.clone(),
+            rows,
+            round16: true,
+            upto: None,
+            taps: Vec::new(),
+        };
+        let dir = stage.path().join(slug(reading));
+        let t0 = std::time::Instant::now();
+        match stream::compile(trace, &o, &dir, None) {
+            Ok(p) => {
+                tracing::info!(
+                    reading = %reading,
+                    rows,
+                    w = p.stream.w,
+                    h = p.stream.h,
+                    s = t0.elapsed().as_secs_f64(),
+                    "cerebras: a stream reading compiled"
+                );
+                names.push(reading.clone());
+            }
+            Err(e) => {
+                tracing::warn!(reading = %reading, "cerebras: a reading the stream compiler refuses is not served: {e}");
+                let _ = std::fs::remove_dir_all(&dir);
+                continue;
+            }
+        }
+        let mut files: Vec<PathBuf> = walk(&dir)?;
+        files.sort();
+        hasher.update(reading.as_bytes());
+        for f in files {
+            hasher.update(
+                f.strip_prefix(&dir)
+                    .unwrap_or(&f)
+                    .to_string_lossy()
+                    .as_bytes(),
+            );
+            hasher.update(&std::fs::read(&f).map_err(io(&f))?);
+        }
+    }
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let fabric = if host {
+        "host"
+    } else if cfg.cmaddr.is_some() {
+        "system"
+    } else {
+        "simulator"
+    };
+    hasher.update(fabric.as_bytes());
+    for (n, src) in kernels_cerebras::sources::OPS
+        .iter()
+        .chain(kernels_cerebras::sources::STREAM_OPS)
+    {
+        hasher.update(n.as_bytes());
+        hasher.update(src.as_bytes());
+    }
+    let cslc = if host {
+        None
+    } else {
+        Some(Cslc::find(&cfg.toolchain).map_err(|e| e.to_string())?)
+    };
+    if let Some(c) = &cslc {
+        hasher.update(c.frontend().to_string_lossy().as_bytes());
+    }
+    let key = hasher.finalize().to_hex()[..16].to_string();
+    let parts = serde_json::json!({ "readings": names, "rows": rows, "fabric": fabric });
+    let (root, made) = cache.entry("s", &trace.name, &key, &parts, |tmp| {
+        if cfg.wafer.build == Build::Never && !host {
+            return Err(format!(
+                "no compiled stream programs {key} in the cache and [engine.wafer] build = \
+                 \"never\": compile them first (wafer-compile stream + cslc)"
+            ));
+        }
+        for reading in &names {
+            let from = stage.path().join(slug(reading));
+            let dir = tmp.join(slug(reading));
+            std::fs::rename(&from, &dir).map_err(io(&dir))?;
+            let Some(cslc) = &cslc else {
+                continue;
+            };
+            let ops = dir.join("ops");
+            std::fs::create_dir_all(&ops).map_err(io(&ops))?;
+            for (n, src) in kernels_cerebras::sources::OPS.iter().chain(kernels_cerebras::sources::STREAM_OPS) {
+                std::fs::write(ops.join(n), src).map_err(io(&ops))?;
+            }
+            let fab = std::fs::read_to_string(dir.join("fabric.txt")).map_err(io(&dir))?;
+            let f: Vec<u32> = fab.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            let (w, h, bf16) = match f[..] {
+                [w, h, b] => (w, h, b == 1),
+                _ => return Err(format!("{}: fabric.txt is not `w h bf16`", dir.display())),
+            };
+            let (mut fabric_dims, fabric_offsets) = kernels_cerebras::toolchain::memcpy_fabric(w, h);
+            if cfg.cmaddr.is_some() {
+                fabric_dims = arch(cfg.target).system_fabric();
+            }
+            let t0 = std::time::Instant::now();
+            cslc.compile(&kernels_cerebras::toolchain::Compile {
+                arch: arch(cfg.target),
+                layout: dir.join("layout.csl"),
+                fabric_dims,
+                fabric_offsets,
+                params: Vec::new(),
+                memcpy: true,
+                channels: 1,
+                import_paths: Vec::new(),
+                out: dir.join("out"),
+                bf16,
+            })
+            .map_err(|e| format!("{reading}: {e}"))?;
+            tracing::info!(reading = %reading, s = t0.elapsed().as_secs_f64(), "cerebras: a stream program linked");
+        }
+        Ok(())
+    })?;
+    tracing::info!(programs = %root.display(), compiled = made, "cerebras: the stream programs");
+    Ok(Some(
+        names
+            .iter()
+            .map(|r| (root.join(slug(r)), root.join(slug(r)).join("out")))
+            .collect(),
+    ))
+}
+
+/// Every file under `dir`.
+fn walk(dir: &Path) -> R<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).map_err(io(dir))?.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p)?);
+        } else {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
 /// What identifies a checkpoint's contents: every file's name, size and modification time.
 fn checkpoint_stamp(checkpoint: &Path) -> R<String> {
     let mut files: Vec<(String, u64, u64)> = Vec::new();

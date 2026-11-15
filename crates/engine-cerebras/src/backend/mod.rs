@@ -60,7 +60,7 @@ pub struct CerebrasEngine {
     /// Steps posted and not yet run (an asynchronous engine).
     posted: std::collections::VecDeque<posted::Posted>,
     /// A stream reading's program (a diffusion transformer's denoise), when the load is one.
-    stream: Option<stream::Stream>,
+    stream: Option<stream::Streams>,
 }
 
 impl CerebrasEngine {
@@ -145,14 +145,38 @@ impl Engine for CerebrasEngine {
             ));
         };
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
-        // a stream reading's program (`wafer-compile stream`'s: its host.json)
-        if let Some(dir) = (self.debug.program.clone()).filter(|d| d.join("host.json").is_file()) {
-            return self.load_stream(trace, &path, &contract, &budgets, &dir);
+        // a stream reading's program (`wafer-compile stream`'s: its host.json), or a directory
+        // of them, one a reading
+        if let Some(programs) = self
+            .debug
+            .program
+            .as_deref()
+            .and_then(|d| stream::programs_in(d, self.debug.link.as_deref()))
+        {
+            return self.load_stream(trace, &path, &contract, &budgets, &programs);
         }
         // the program serves the context the config states (else as many positions as it holds)
         let positions = budgets.context_declared.then_some(budgets.max_context);
-        let prepared = prepare::prepare(&self.cfg, &trace, &contract, &path, positions)
-            .map_err(|e| Error::Load(format!("the wafer program: {e}")))?;
+        let prepared = match prepare::prepare(&self.cfg, &trace, &contract, &path, positions) {
+            Ok(p) => p,
+            Err(e) => {
+                // a model the decode program does not run: its stream readings, compiled here
+                let host = self.debug.stream_fabric.as_deref() == Some("host");
+                let streamed = if self.debug.program.is_none() {
+                    prepare::stream_programs(&self.cfg, &trace, host).map_err(Error::Load)?
+                } else {
+                    None
+                };
+                if let Some(programs) = streamed {
+                    tracing::info!(
+                        decode = %e,
+                        "cerebras: no decode program; the model's stream readings are served"
+                    );
+                    return self.load_stream(trace, &path, &contract, &budgets, &programs);
+                }
+                return Err(Error::Load(format!("the wafer program: {e}")));
+            }
+        };
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
         let facts = Facts::of(trace, &budgets, slots).map_err(Error::Load)?;
         self.readout = facts.readout();

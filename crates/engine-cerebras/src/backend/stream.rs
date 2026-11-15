@@ -97,23 +97,105 @@ impl Drop for Remote {
     }
 }
 
-/// A loaded stream reading.
+/// A loaded stream reading: its program's host side and link.
 pub(crate) struct Stream {
     pub(crate) reading: Arc<Reading>,
-    pub(crate) trace: Trace,
-    /// The weightless host forward: the entries' and the exit's ops.
+    /// The host forward of the entries' and the exit's ops (it holds the weights those read
+    /// alone: an embedding's table).
     host: Forward,
-    /// The forward over the checkpoint's planes the static arrays are made from, until they
-    /// are written (the first step).
-    weights: Option<Forward>,
-    fabric: Remote,
+    /// cslc's output for the SDK runtime.
+    link: std::path::PathBuf,
+    /// The static arrays' words, made from the checkpoint at the reading's first step and
+    /// written each time its program is opened.
+    statics: Option<Arc<Vec<Option<Vec<u32>>>>>,
     steps: u64,
+}
+
+/// A load's stream readings (a diffusion poem's text encoder, denoiser, VAE), each its own
+/// program, and the fabric they run on.
+pub(crate) struct Streams {
+    pub(crate) trace: Trace,
+    pub(crate) readings: Vec<Stream>,
+    /// The forward over the checkpoint's planes the static arrays are made from, until every
+    /// reading's are.
+    weights: Option<Forward>,
+    /// The fabric (the host's, or the SDK runtime's programs, a reading's at a time), on a
+    /// thread of its own for the load.
+    fabric: Remote,
+    host_fabric: bool,
+    /// The reading whose program is open (the SDK's), its static arrays written.
+    open: Option<usize>,
+}
+
+impl Streams {
+    /// The reading whose classes run what `words` run, lane for lane (the trace's nodes their
+    /// guards hold for: a word may set a switch its reading does not read).
+    fn pick(&self, words: &[u64]) -> Option<usize> {
+        let same = |a: u64, b: u64| {
+            a == b
+                || self
+                    .trace
+                    .nodes
+                    .iter()
+                    .all(|n| n.guard.holds(a) == n.guard.holds(b))
+        };
+        self.readings.iter().position(|s| {
+            s.reading.classes.len() == words.len()
+                && s.reading
+                    .classes
+                    .iter()
+                    .zip(words)
+                    .all(|(c, w)| same(c.word, *w))
+        })
+    }
+
+    /// The fabric reading `ri` runs on, its program open and its static arrays written.
+    fn fabric_for(&mut self, ri: usize, step: &StreamStep<'_>) -> R<&Remote> {
+        if self.readings[ri].statics.is_none() {
+            let weights = self
+                .weights
+                .as_mut()
+                .ok_or("the checkpoint's forward is dropped")?;
+            let s0 = std::time::Instant::now();
+            let words = self.readings[ri].reading.statics(weights, step)?;
+            self.readings[ri].statics = Some(Arc::new(words));
+            tracing::info!(
+                s = s0.elapsed().as_secs_f64(),
+                reading = %self.readings[ri].reading.reading,
+                "spatial: a stream program's static arrays made from the checkpoint"
+            );
+            if self.readings.iter().all(|s| s.statics.is_some()) {
+                self.weights = None;
+            }
+        }
+        // the host fabric keeps each reading's arrays apart: a reading's are written on its first
+        // step; the SDK's program a reading at a time, its arrays written each time it opens
+        let fresh = if self.host_fabric {
+            self.readings[ri].steps == 0
+        } else if self.open == Some(ri) {
+            false
+        } else {
+            self.open = None;
+            let link = self.readings[ri].link.clone();
+            self.fabric.call(move |f| f.switch(&link))?;
+            self.open = Some(ri);
+            true
+        };
+        if fresh {
+            let words = Arc::clone(self.readings[ri].statics.as_ref().ok_or("no statics")?);
+            let reading = Arc::clone(&self.readings[ri].reading);
+            self.fabric
+                .call(move |f| reading.write_statics(f, &words))?;
+        }
+        Ok(&self.fabric)
+    }
 }
 
 /// A step's lanes and inputs, owned (sent to the fabric's thread).
 struct Owned {
     lanes: Vec<StreamLane>,
     inputs: Vec<(String, Vec<f32>)>,
+    tokens: Vec<u32>,
 }
 
 impl Owned {
@@ -125,22 +207,12 @@ impl Owned {
                 .iter()
                 .map(|(n, v)| (n.as_str(), v.clone()))
                 .collect(),
+            tokens: self.tokens.clone(),
         }
     }
 }
 
-impl Stream {
-    pub(crate) fn new(reading: Reading, trace: Trace, weights: Forward, fabric: Remote) -> Stream {
-        Stream {
-            reading: Arc::new(reading),
-            host: Forward::host(trace.clone()),
-            trace,
-            weights: Some(weights),
-            fabric,
-            steps: 0,
-        }
-    }
-
+impl Streams {
     /// Guest input `id`'s axis and width, as the trace reads it.
     fn input_shape(&self, id: u32) -> Option<(InputAxis, usize)> {
         self.trace.values.iter().find_map(|d| match d.def {
@@ -169,27 +241,41 @@ impl CerebrasEngine {
                     .map_err(refusal)?;
             }
         }
-        let Some(stream) = self.stream.as_mut() else {
+        let Some(streams) = self.stream.as_mut() else {
             return Err(Error::Load("no stream reading is loaded".into()));
         };
-        let classes = &stream.reading.classes;
         let invalid = |why: String| Error::Invalid(why);
-        if step.lanes.len() != classes.len() {
+        let words: Vec<u64> = step.lanes.iter().map(|l| l.word).collect();
+        let Some(ri) = streams.pick(&words) else {
             return Err(invalid(format!(
-                "the wafer's `{}` program runs {} lanes a step (its classes {:?}); this step has {}",
-                stream.reading.reading,
-                classes.len(),
-                classes.iter().map(|c| &c.name).collect::<Vec<_>>(),
-                step.lanes.len()
+                "no stream program runs lanes of words {words:x?}: the programs' are {:?}",
+                (streams.readings.iter())
+                    .map(|s| (
+                        &s.reading.reading,
+                        s.reading.classes.iter().map(|c| c.word).collect::<Vec<_>>()
+                    ))
+                    .collect::<Vec<_>>()
             )));
-        }
+        };
+        let reading = Arc::clone(&streams.readings[ri].reading);
+        let classes = &reading.classes;
         let mut clips: BTreeMap<usize, Vec<[u32; 3]>> = BTreeMap::new();
         for v in &step.voxels {
             clips.insert(v.lane as usize, v.clips.clone());
         }
         let mut lanes = Vec::with_capacity(classes.len());
+        // a lane's own rows (a causal reading's lane may bring fewer: the rest are padding)
+        let mut own: Vec<usize> = Vec::with_capacity(classes.len());
+        let mut tokens: Vec<u32> = Vec::new();
         for (at, (lane, class)) in step.lanes.iter().zip(classes).enumerate() {
-            if lane.word != class.word || lane.tokens.len() != class.rows as usize {
+            let short = reading.causal && lane.tokens.len() < class.rows as usize;
+            own.push(lane.tokens.len());
+            tokens.extend_from_slice(&lane.tokens);
+            if short {
+                let pad = lane.tokens.last().copied().unwrap_or(0);
+                tokens.resize(tokens.len() + class.rows as usize - lane.tokens.len(), pad);
+            }
+            if !reading.host_only && lane.tokens.len() != class.rows as usize && !short {
                 return Err(invalid(format!(
                     "lane {at} is word {:#x} of {} rows; the program's lane {at} is `{}` (word \
                      {:#x}) of {} rows",
@@ -217,7 +303,11 @@ impl CerebrasEngine {
             };
             lanes.push(StreamLane {
                 word: lane.word,
-                rows: lane.tokens.len(),
+                rows: if reading.host_only {
+                    lane.tokens.len()
+                } else {
+                    class.rows as usize
+                },
                 clip,
             });
         }
@@ -240,7 +330,7 @@ impl CerebrasEngine {
         let (mut row0, mut vox0) = (0usize, 0usize);
         for (at, lane) in step.lanes.iter().enumerate() {
             for feed in &lane.inputs {
-                let (axis, width) = stream.input_shape(feed.id).ok_or_else(|| {
+                let (axis, width) = streams.input_shape(feed.id).ok_or_else(|| {
                     invalid(format!(
                         "lane {at} feeds input {}, which the trace has not",
                         feed.id
@@ -274,7 +364,7 @@ impl CerebrasEngine {
                 if cell.len() < rows * width {
                     return Err(invalid(format!(
                         "lane {at}'s input `{}`: a cell of {} values for {rows} rows of {width}",
-                        stream.trace.inputs[feed.id as usize].name,
+                        streams.trace.inputs[feed.id as usize].name,
                         cell.len()
                     )));
                 }
@@ -288,43 +378,33 @@ impl CerebrasEngine {
         }
         let owned = Owned {
             lanes,
+            tokens,
             inputs: inputs
                 .into_iter()
-                .map(|(id, v)| (stream.trace.inputs[id as usize].name.clone(), v))
+                .map(|(id, v)| (streams.trace.inputs[id as usize].name.clone(), v))
                 .collect(),
         };
         let device = |e: String| Error::Device(e);
         let step_view = owned.step();
-        let entries = stream
-            .reading
-            .entries(&mut stream.host, &step_view)
-            .map_err(device)?;
-        if let Some(mut weights) = stream.weights.take() {
-            let s0 = std::time::Instant::now();
-            let words = stream
-                .reading
-                .statics(&mut weights, &step_view)
+        // a reading with no program (the host fabric's): its every op the host's, in `finish`
+        let (back, cycles) = if reading.host_only {
+            (Vec::new(), None)
+        } else {
+            let entries = reading
+                .entries(&mut streams.readings[ri].host, &step_view)
                 .map_err(device)?;
-            let reading = Arc::clone(&stream.reading);
-            stream
-                .fabric
-                .call(move |f| reading.write_statics(f, &words))
+            let fabric = streams.fabric_for(ri, &step_view).map_err(device)?;
+            let sent = Owned {
+                lanes: owned.lanes.clone(),
+                inputs: owned.inputs.clone(),
+                tokens: owned.tokens.clone(),
+            };
+            let run = Arc::clone(&reading);
+            let (got, cycles) = fabric
+                .call(move |f| run.launch_on(f, &sent.step(), &entries))
                 .map_err(device)?;
-            tracing::info!(
-                s = s0.elapsed().as_secs_f64(),
-                "spatial: a stream program's static arrays written from the checkpoint"
-            );
-        }
-        let reading = Arc::clone(&stream.reading);
-        let sent = Owned {
-            lanes: owned.lanes.clone(),
-            inputs: owned.inputs.clone(),
+            (reading.rows_back(&got).map_err(device)?, cycles)
         };
-        let (got, cycles) = stream
-            .fabric
-            .call(move |f| reading.launch_on(f, &sent.step(), &entries))
-            .map_err(device)?;
-        let back = stream.reading.rows_back(&got).map_err(device)?;
         // the outputs the attachments read, by name
         let mut names: Vec<String> = Vec::new();
         for a in step.attachments.iter().filter(|a| !a.adapter_only) {
@@ -334,50 +414,94 @@ impl CerebrasEngine {
                 }
             }
         }
-        let decls: Vec<(String, InputAxis, usize)> = stream
-            .trace
-            .outputs
-            .iter()
-            .filter(|o| names.contains(&o.name))
-            .map(|o| {
-                let (rows_axis, width) = output_shape(&stream.trace, o.value);
-                (o.name.clone(), rows_axis, width)
+        // each name's output the step's lanes write (two readings may each write one of a name)
+        let trace = &streams.trace;
+        let written = |v: poem_ir::ValueId| match &trace.values[v.0 as usize].def {
+            Def::Op(n) => words
+                .iter()
+                .any(|&w| trace.nodes[*n as usize].guard.holds(w)),
+            Def::Merge(arms) => arms.iter().any(|(_, g)| words.iter().any(|&w| g.holds(w))),
+            _ => false,
+        };
+        let mut decls: Vec<(String, InputAxis, usize)> = Vec::new();
+        let mut wanted: Vec<poem_ir::ValueId> = Vec::new();
+        for o in trace.outputs.iter().filter(|o| names.contains(&o.name)) {
+            if !written(o.value) || decls.iter().any(|d| d.0 == o.name) {
+                continue;
+            }
+            let (rows_axis, width) = output_shape(trace, o.value);
+            decls.push((o.name.clone(), rows_axis, width));
+            wanted.push(o.value);
+        }
+        let stream = &mut streams.readings[ri];
+        let made = reading
+            .finish_values(&mut stream.host, &step_view, &back, &wanted)
+            .map_err(device)?;
+        // a lane's own rows of a row output (a causal lane's padding dropped)
+        let made: Vec<Vec<f32>> = made
+            .into_iter()
+            .zip(&decls)
+            .map(|(v, (_, axis, width))| {
+                if *axis != InputAxis::Row
+                    || own.iter().zip(&owned.lanes).all(|(o, l)| *o == l.rows)
+                {
+                    return v;
+                }
+                let mut out = Vec::new();
+                let mut r0 = 0;
+                for (o, l) in own.iter().zip(&owned.lanes) {
+                    out.extend_from_slice(&v[r0 * width..(r0 + o) * width]);
+                    r0 += l.rows;
+                }
+                out
             })
             .collect();
-        let wanted: Vec<&str> = decls.iter().map(|d| d.0.as_str()).collect();
-        let made = stream
-            .reading
-            .finish(&mut stream.host, &stream.trace, &step_view, &back, &wanted)
-            .map_err(device)?;
         // a lane's rows of an output: its tokens', voxels' or own row
         let lanes = &owned.lanes;
-        let span = |axis: InputAxis, from: usize, to: usize| -> (usize, usize) {
-            let at = |k: usize| -> usize {
-                match axis {
-                    InputAxis::Lane => k,
-                    InputAxis::Row => lanes[..k].iter().map(|l| l.rows).sum(),
-                    InputAxis::Voxel => lanes[..k]
-                        .iter()
-                        .filter_map(|l| l.clip)
-                        .map(|[t, h, w]| (t * h * w) as usize)
-                        .sum(),
-                }
-            };
-            (at(from), at(to))
+        tracing::debug!(
+            reading = %reading.reading,
+            clips = ?lanes.iter().map(|l| l.clip).collect::<Vec<_>>(),
+            outputs = ?made.iter().map(Vec::len).collect::<Vec<_>>(),
+            decls = ?decls,
+            "spatial: a stream step's outputs"
+        );
+        let voxels_before = |k: usize| -> usize {
+            lanes[..k]
+                .iter()
+                .filter_map(|l| l.clip)
+                .map(|[t, h, w]| (t * h * w) as usize)
+                .sum()
         };
+        // an output on a voxel grid of its own (a decoder's pixels): each lane's share of it
+        // as of the step's input voxels
+        let span =
+            |axis: InputAxis, width: usize, i: usize, from: usize, to: usize| -> (usize, usize) {
+                let at = |k: usize| -> usize {
+                    match axis {
+                        InputAxis::Lane => k,
+                        InputAxis::Row => own[..k].iter().sum(),
+                        InputAxis::Voxel => {
+                            let (all, rows) =
+                                (voxels_before(lanes.len()), made[i].len() / width.max(1));
+                            (voxels_before(k) * rows).checked_div(all).unwrap_or(0)
+                        }
+                    }
+                };
+                (at(from), at(to))
+            };
         for a in step.attachments.iter().filter(|a| !a.adapter_only) {
             let mut outputs: Vec<(String, u32, Value)> = Vec::new();
             for (name, k) in self.programs.outputs_of(a.instance) {
                 let Some(i) = decls.iter().position(|d| d.0 == name) else {
                     return Err(invalid(format!(
                         "the program reads `{name}`, which the `{}` reading does not write",
-                        stream.reading.reading
+                        reading.reading
                     )));
                 };
                 let (_, axis, width) = decls[i];
                 let lane = a.lane as usize + k as usize;
                 let end = (a.lane + a.lanes.max(1)) as usize;
-                let (r0, r1) = span(axis, lane.min(lanes.len()), end.min(lanes.len()));
+                let (r0, r1) = span(axis, width, i, lane.min(lanes.len()), end.min(lanes.len()));
                 outputs.push((
                     name,
                     k,
@@ -409,7 +533,7 @@ impl CerebrasEngine {
                 if matches!(lane.readout, Readout::None) {
                     return LaneReadout::default();
                 }
-                let (r0, r1) = span(*axis, at, at + 1);
+                let (r0, r1) = span(*axis, *width, 0, at, at + 1);
                 if r1 == r0 {
                     return LaneReadout::default();
                 }
@@ -425,13 +549,35 @@ impl CerebrasEngine {
     }
 }
 
+/// The stream programs in `dir`: its own (`wafer-compile stream`'s output, its host.json), linked
+/// in `link` (else `<dir>/out`), or one a reading in its subdirectories, each linked in its
+/// `out`; `None` where it holds neither.
+pub(crate) fn programs_in(
+    dir: &std::path::Path,
+    link: Option<&std::path::Path>,
+) -> Option<Vec<(std::path::PathBuf, std::path::PathBuf)>> {
+    if dir.join("host.json").is_file() {
+        let link = link.map_or_else(|| dir.join("out"), std::path::Path::to_path_buf);
+        return Some(vec![(dir.to_path_buf(), link)]);
+    }
+    let mut out: Vec<_> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("host.json").is_file())
+        .map(|p| (p.clone(), p.join("out")))
+        .collect();
+    out.sort();
+    (!out.is_empty()).then_some(out)
+}
+
 /// The axis a value's rows run over and its width.
 fn output_shape(trace: &Trace, v: poem_ir::ValueId) -> (InputAxis, usize) {
     use poem_ir::{Dim, Ty};
     match &trace.values[v.0 as usize].ty {
         Ty::Tensor { shape, .. } => {
             let axis = match shape.first() {
-                Some(Dim::Voxels) => InputAxis::Voxel,
+                Some(Dim::Voxels | Dim::VoxelsScaled(..)) => InputAxis::Voxel,
                 Some(Dim::Lanes | Dim::LanesPlus(_)) => InputAxis::Lane,
                 _ => InputAxis::Row,
             };
@@ -472,30 +618,22 @@ pub(crate) fn plane(landed: &crate::prepare::Landed, name: &str, count: usize) -
 }
 
 impl CerebrasEngine {
-    /// Loads a stream reading's program (`dir`: `wafer-compile stream`'s output, its link in
-    /// `link`): the reading's host side, the checkpoint landed for its static arrays, the fabric
-    /// opened. The facts the runtime is told are the trace's, as for decode.
+    /// Loads a model's stream readings (`programs`: each `wafer-compile stream`'s output and
+    /// its link): each reading's host side, the checkpoint landed for their static arrays, the
+    /// fabric (the host's, or the SDK runtime a program at a time, opened at a reading's first
+    /// step). The facts the runtime is told are the trace's, as for decode.
     pub(super) fn load_stream(
         &mut self,
         trace: poem_ir::Trace,
         checkpoint: &std::path::Path,
         contract: &checkpoint::contract::ModelContract,
         budgets: &engine::load::Budgets,
-        dir: &std::path::Path,
+        programs: &[(std::path::PathBuf, std::path::PathBuf)],
     ) -> EngineResult<engine::load::Loaded> {
         use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
         use engine::transfer::MemoryDomain;
         use eta_ir::registry::{GeometryClass, PortMask};
         let load = |e: String| Error::Load(e);
-        let reading = Reading::open(dir).map_err(load)?;
-        if reading.model != trace.name {
-            return Err(load(format!(
-                "the stream program in {} is `{}`'s; this load is `{}`",
-                dir.display(),
-                reading.model,
-                trace.name
-            )));
-        }
         let t0 = std::time::Instant::now();
         let landed = crate::prepare::land(&trace, contract, checkpoint).map_err(load)?;
         let of = |name: &str, count: usize| plane(&landed, name, count);
@@ -504,26 +642,65 @@ impl CerebrasEngine {
             s = t0.elapsed().as_secs_f64(),
             "spatial: the checkpoint landed for a stream program"
         );
+        let mut readings = Vec::new();
+        for (dir, link) in programs {
+            let reading = Reading::open(dir).map_err(load)?;
+            if reading.model != trace.name {
+                return Err(load(format!(
+                    "the stream program in {} is `{}`'s; this load is `{}`",
+                    dir.display(),
+                    reading.model,
+                    trace.name
+                )));
+            }
+            let host =
+                Forward::host_for(trace.clone(), &of, &reading.entry_values()).map_err(load)?;
+            readings.push(Stream {
+                reading: Arc::new(reading),
+                host,
+                link: link.clone(),
+                statics: None,
+                steps: 0,
+            });
+        }
         let host_fabric = self.debug.stream_fabric.as_deref() == Some("host");
+        // On the host fabric, a reading no program runs (the stream compiler refuses it: a
+        // VAE's convolutions) is served whole by the host's forward: a debug fallback, never
+        // a wafer's.
+        if host_fabric {
+            let served: Vec<String> = readings.iter().map(|s| s.reading.reading.clone()).collect();
+            let all: Vec<poem_ir::ValueId> = trace.outputs.iter().map(|o| o.value).collect();
+            for r in trace
+                .facts
+                .declared("reading")
+                .map(|d| d.values.clone())
+                .unwrap_or_default()
+            {
+                if served.contains(&r) {
+                    continue;
+                }
+                let classes = poem_compiler::spatial::layer::stream::classes(&trace, &r, 0);
+                tracing::warn!(reading = %r, "spatial: a reading no stream program runs: the host fabric's forward serves it whole");
+                readings.push(Stream {
+                    reading: Arc::new(Reading::host_only(&trace.name, &r, &classes)),
+                    host: Forward::host_for(trace.clone(), &of, &all).map_err(load)?,
+                    link: std::path::PathBuf::new(),
+                    statics: Some(Arc::new(Vec::new())),
+                    steps: 0,
+                });
+            }
+        }
         let fabric = if host_fabric {
             let forward = Forward::new(trace.clone(), None, &of).map_err(load)?;
             Remote::open(move || Ok(Box::new(crate::reading::HostFabric::new(forward)) as _))
         } else {
-            let link = self.debug.link.clone().unwrap_or_else(|| dir.join("out"));
-            let platform = self.platform();
-            let sdk_lib = self.cfg.toolchain.sdk_lib();
+            let (sdk_lib, platform) = (self.cfg.toolchain.sdk_lib(), self.platform());
             Remote::open(move || {
-                let sdk = crate::sdk::Sdk::open_at(&sdk_lib).map_err(|e| e.to_string())?;
-                let mut rt = crate::sdk::Runtime::new(sdk, &link, platform, "WARNING")
-                    .map_err(|e| e.to_string())?;
-                let t0 = std::time::Instant::now();
-                rt.load();
-                rt.run();
-                tracing::info!(
-                    s = t0.elapsed().as_secs_f64(),
-                    "spatial: a stream program loaded"
-                );
-                Ok(Box::new(rt) as _)
+                Ok(Box::new(crate::reading::Programs {
+                    sdk_lib,
+                    platform,
+                    rt: None,
+                }) as _)
             })
         }
         .map_err(load)?;
@@ -576,15 +753,24 @@ impl CerebrasEngine {
             inputs: facts.input_decls(),
             classes: facts.classes(),
         };
-        tracing::info!(
-            program = %dir.display(),
-            reading = %reading.reading,
-            classes = ?reading.classes.iter().map(|c| (&c.name, c.rows)).collect::<Vec<_>>(),
-            host_fabric,
-            "spatial: a stream reading loaded"
-        );
+        for s in &readings {
+            tracing::info!(
+                program = %s.reading.dir.display(),
+                reading = %s.reading.reading,
+                classes = ?s.reading.classes.iter().map(|c| (&c.name, c.rows)).collect::<Vec<_>>(),
+                host_fabric,
+                "spatial: a stream reading loaded"
+            );
+        }
         let trace_name = trace.name.clone();
-        self.stream = Some(Stream::new(reading, trace, weights, fabric));
+        self.stream = Some(Streams {
+            trace,
+            readings,
+            weights: Some(weights),
+            fabric,
+            host_fabric,
+            open: None,
+        });
         self.facts = Some(facts);
         self.caps = Some(caps.clone());
         Ok(engine::load::Loaded {

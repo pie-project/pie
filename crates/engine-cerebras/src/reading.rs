@@ -82,6 +82,49 @@ pub trait Fabric {
     /// Runs `step` on the arrays written: the rows back (each [`Back`]'s words) and the step's
     /// cycles where the program stamps them.
     fn run(&mut self, reading: &Reading, step: &StreamStep<'_>) -> R<(Vec<Vec<f32>>, Option<u64>)>;
+    /// Opens the program linked in `link` in place of the one open (a fabric runs one
+    /// program at a time; the host's runs every reading's and opens nothing).
+    fn switch(&mut self, link: &Path) -> R<()> {
+        let _ = link;
+        Ok(())
+    }
+}
+
+/// The SDK runtime of one program at a time, each created on the thread that holds this (the
+/// SDK wants every runtime of a process made on one thread).
+pub struct Programs {
+    pub sdk_lib: PathBuf,
+    pub platform: crate::sdk::Platform,
+    pub rt: Option<Runtime>,
+}
+
+impl Fabric for Programs {
+    fn write(&mut self, a: &Array, words: &[u32]) -> R<()> {
+        Fabric::write(self.rt.as_mut().ok_or("no program is open")?, a, words)
+    }
+
+    fn run(&mut self, reading: &Reading, step: &StreamStep<'_>) -> R<(Vec<Vec<f32>>, Option<u64>)> {
+        Fabric::run(self.rt.as_mut().ok_or("no program is open")?, reading, step)
+    }
+
+    fn switch(&mut self, link: &Path) -> R<()> {
+        if let Some(mut old) = self.rt.take() {
+            old.stop();
+        }
+        let sdk = crate::sdk::Sdk::open_at(&self.sdk_lib).map_err(|e| e.to_string())?;
+        let mut rt =
+            Runtime::new(sdk, link, self.platform.clone(), "WARNING").map_err(|e| e.to_string())?;
+        let t0 = std::time::Instant::now();
+        rt.load();
+        rt.run();
+        tracing::info!(
+            s = t0.elapsed().as_secs_f64(),
+            link = %link.display(),
+            "spatial: a stream program loaded"
+        );
+        self.rt = Some(rt);
+        Ok(())
+    }
 }
 
 /// A root's rows read back: each of its own rows (the step's row `rows[i]`) the `parts`
@@ -111,6 +154,11 @@ pub struct Reading {
     pub refs: Vec<(u32, PathBuf)>,
     pub w: u32,
     pub h: u32,
+    /// A row attends the rows before it alone (a prefill's mask): a lane's rows past its own
+    /// tokens are padding no earlier row reads.
+    pub causal: bool,
+    /// No program runs it: the host's forward makes its outputs whole ([`Reading::host_only`]).
+    pub host_only: bool,
 }
 
 fn num(v: &Value, k: &str) -> R<u64> {
@@ -245,7 +293,41 @@ impl Reading {
             outs,
             w: num(&host, "w")? as u32,
             h: num(&host, "h")? as u32,
+            causal: host["causal"].as_bool().unwrap_or(false),
+            host_only: false,
         })
+    }
+
+    /// A reading of `model` no program runs (the host fabric's fallback for one the stream
+    /// compiler refuses): `classes` its lanes, no arrays; [`Reading::finish`] makes its outputs
+    /// from the step's inputs alone.
+    #[must_use]
+    pub fn host_only(
+        model: &str,
+        reading: &str,
+        classes: &[poem_compiler::spatial::layer::stream::RowClass],
+    ) -> Reading {
+        Reading {
+            dir: PathBuf::new(),
+            model: model.to_string(),
+            reading: reading.to_string(),
+            classes: classes
+                .iter()
+                .map(|c| Class {
+                    name: c.name.clone(),
+                    word: c.word,
+                    rows: c.rows,
+                })
+                .collect(),
+            h2d: Vec::new(),
+            d2h: Vec::new(),
+            outs: Vec::new(),
+            refs: Vec::new(),
+            w: 0,
+            h: 0,
+            causal: false,
+            host_only: true,
+        }
     }
 
     /// The reading's trace: the catalog model the program was compiled from.
@@ -297,12 +379,13 @@ impl Reading {
                 .iter()
                 .map(|(n, v)| (n.as_str(), v.clone()))
                 .collect(),
+            tokens: Vec::new(),
         }
     }
 
-    /// Each array's words for `step`, computed on the host forward `host` (no weights needed):
-    /// an entry's from the step's values, `None` for an array whose words are the file's.
-    pub fn entries(&self, host: &mut Forward, step: &StreamStep<'_>) -> R<Vec<Option<Vec<f32>>>> {
+    /// The values the entries gather from: what the host's forward makes of a step's inputs.
+    #[must_use]
+    pub fn entry_values(&self) -> Vec<ValueId> {
         let mut wanted: Vec<ValueId> = Vec::new();
         for a in &self.h2d {
             for w in a.entry.iter().flatten() {
@@ -312,6 +395,14 @@ impl Reading {
                 }
             }
         }
+        wanted
+    }
+
+    /// Each array's words for `step`, computed on the host forward `host` (holding no weights
+    /// but those the host's own ops read, [`Forward::host_for`]): an entry's from the step's
+    /// values, `None` for an array whose words are the file's.
+    pub fn entries(&self, host: &mut Forward, step: &StreamStep<'_>) -> R<Vec<Option<Vec<f32>>>> {
+        let wanted = self.entry_values();
         let held: BTreeMap<u32, (usize, usize, Rc<Vec<f32>>)> = host
             .stream_values(step, &[], &wanted)?
             .into_iter()
@@ -396,8 +487,19 @@ impl Reading {
                     .ok_or_else(|| format!("the trace has no output `{n}`"))
             })
             .collect::<R<_>>()?;
+        self.finish_values(host, step, given, &wanted)
+    }
+
+    /// The values `wanted` (trace outputs) from the rows read back (`given`): the exit's host ops.
+    pub fn finish_values(
+        &self,
+        host: &mut Forward,
+        step: &StreamStep<'_>,
+        given: &[Captured],
+        wanted: &[ValueId],
+    ) -> R<Vec<Vec<f32>>> {
         Ok(host
-            .stream_values(step, given, &wanted)?
+            .stream_values(step, given, wanted)?
             .into_iter()
             .map(|c| match c.values {
                 Values::F32(v) => v,
@@ -515,6 +617,7 @@ impl Reading {
         let step = StreamStep {
             lanes: Vec::new(),
             inputs: Vec::new(),
+            tokens: Vec::new(),
         };
         self.launch_on(rt, &step, entries)
     }

@@ -31,13 +31,15 @@ pub struct StreamLane {
     pub clip: Option<[u32; 3]>,
 }
 
-/// A stream step: its lanes, and the guest inputs by name (`trace.inputs`), f32 as the input's
+/// A stream step: its lanes, the guest inputs by name (`trace.inputs`), f32 as the input's
 /// axis lays them: a row a lane, a row a token (the step's rows, lane after lane; a lane that
-/// does not read it holds zeros), or a row a voxel (the clips' voxels, clip after clip).
+/// does not read it holds zeros), or a row a voxel (the clips' voxels, clip after clip); and the
+/// rows' token ids, lane after lane (none: no lane reads them, as a denoise step's).
 #[derive(Clone, Debug)]
 pub struct StreamStep<'a> {
     pub lanes: Vec<StreamLane>,
     pub inputs: Vec<(&'a str, Vec<f32>)>,
+    pub tokens: Vec<u32>,
 }
 
 /// Each row's lane, by the axis a value's rows run over.
@@ -184,6 +186,48 @@ impl Forward {
         Ok(caps)
     }
 
+    /// [`Forward::host`] holding the weights the values `wanted` need from the step's inputs
+    /// alone (a token embedding's table, which a host op looks the step's rows up in), from
+    /// `plane` as [`Forward::new`] reads them.
+    pub fn host_for(
+        trace: poem_ir::Trace,
+        plane: &dyn Fn(&str, usize) -> Vec<f32>,
+        wanted: &[ValueId],
+    ) -> Result<Forward, String> {
+        let mut f = Forward::host(trace);
+        let need = f.slice(&[], wanted);
+        let mut ins = Vec::new();
+        for (at, node) in f.trace.nodes.iter().enumerate() {
+            if !need[at] {
+                continue;
+            }
+            ins.clear();
+            node.op.inputs(&mut ins);
+            for &v in &ins {
+                let Def::Weight(p) = f.trace.values[v.0 as usize].def else {
+                    continue;
+                };
+                let param = &f.trace.params[p as usize];
+                let rows = *param.shape.first().unwrap_or(&1) as usize;
+                let each: usize = param.shape.iter().skip(1).product::<u64>() as usize;
+                let w = plane(&param.name, rows * each);
+                if w.len() != rows * each {
+                    return Err(format!(
+                        "`{}`: {} values for {rows} x {each}",
+                        param.name,
+                        w.len()
+                    ));
+                }
+                f.weights[v.0 as usize] = Some(Held::Floats {
+                    rows,
+                    width: each,
+                    v: super::laid(param.layout, w.into_iter().map(super::bf16).collect()),
+                });
+            }
+        }
+        Ok(f)
+    }
+
     /// The nodes `wanted` needs: each one's maker, back to the step's inputs, the weights and
     /// the values `given`.
     fn slice(&self, given: &[Captured], wanted: &[ValueId]) -> Vec<bool> {
@@ -210,6 +254,18 @@ impl Forward {
                     }
                 }
                 Def::Merge(arms) => work.extend(arms.iter().map(|&(a, _)| a)),
+                // a cache read: the step's appends into it make what it holds
+                Def::Cache(_) => {
+                    for (n, node) in self.trace.nodes.iter().enumerate() {
+                        if matches!(&node.op, poem_ir::Operation::Attn(Attn::KvAppend { cache, .. }) if *cache == v)
+                            && !std::mem::replace(&mut need[n], true)
+                        {
+                            ins.clear();
+                            node.op.inputs(&mut ins);
+                            work.extend(ins.iter().copied());
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -248,6 +304,11 @@ impl Forward {
         };
         let (n, lanes) = (rows.token.len(), step.lanes.len());
         let mut vals: Vec<Option<Held>> = self.weights.clone();
+        // a stream step holds no cache across steps: a prefill's pages are this step's rows
+        for lane in &mut self.lanes {
+            lane.k.clear();
+            lane.v.clear();
+        }
         for (id, decl) in self.trace.values.iter().enumerate() {
             let Def::Input(input) = &decl.def else {
                 continue;
@@ -255,6 +316,9 @@ impl Forward {
             let ints = |rows: usize, width: usize, v: Vec<i32>| Some(Held::Ints { rows, width, v });
             vals[id] = match *input {
                 RuntimeInput::Positions => ints(n, 1, positions.clone()),
+                RuntimeInput::Tokens if step.tokens.len() == n => {
+                    ints(n, 1, step.tokens.iter().map(|&t| t as i32).collect())
+                }
                 RuntimeInput::Geometry {
                     kind: GeomKind::RequestOfToken,
                     ..
@@ -566,6 +630,21 @@ impl Run<'_> {
 
     pub(super) fn elemwise_more(&mut self, op: &Elemwise) -> Result<(), String> {
         match *op {
+            // `(x - bias) · scale`, a column each: a batch norm's statistics applied
+            Elemwise::Standardize {
+                x,
+                bias,
+                scale,
+                x_out,
+            } => {
+                let (xs, b, sc) = (self.floats(x)?, self.floats(bias)?, self.floats(scale)?);
+                let w = xs.width;
+                let out: Vec<f32> = (xs.v.iter().enumerate())
+                    .map(|(i, &v)| (v - b.v[i % w]) * sc.v[i % w])
+                    .collect();
+                let rows = xs.rows;
+                self.put(x_out, rows, out)
+            }
             Elemwise::Layernorm {
                 x,
                 weight,
@@ -813,6 +892,50 @@ impl Run<'_> {
 
     pub(super) fn attn_more(&mut self, op: &Attn) -> Result<(), String> {
         match *op {
+            // each voxel row over its clip's (or its frames') rows: one head as wide as the row
+            Attn::Voxel {
+                q,
+                k,
+                v,
+                grid,
+                segment,
+                sm_scale,
+                o,
+            } => {
+                let (qs, ks, vs) = (self.floats(q)?, self.floats(k)?, self.floats(v)?);
+                let g = clips(self.ints(grid)?.v);
+                let (c, rows) = (qs.width, qs.rows);
+                let mut out = vec![0.0f32; rows * c];
+                for clip in &g {
+                    let plane = clip.h * clip.w;
+                    for r in clip.off..clip.off + clip.rows() {
+                        let (b, e) = segment
+                            .bounds(
+                                [clip.t as u32, clip.h as u32, clip.w as u32],
+                                (r - clip.off) as u32,
+                            )
+                            .ok_or("a voxel row outside its clip")?;
+                        let (b, e) = (clip.off + b as usize, clip.off + e as usize);
+                        let _ = plane;
+                        let scores: Vec<f32> = (b..e)
+                            .map(|j| dot(qs.row(r), ks.row(j)) * sm_scale)
+                            .collect();
+                        let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let wts: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+                        let den: f32 = wts.iter().sum();
+                        let o_row = &mut out[r * c..(r + 1) * c];
+                        for (wt, j) in wts.iter().zip(b..e) {
+                            for (acc, x) in o_row.iter_mut().zip(vs.row(j)) {
+                                *acc += wt * x;
+                            }
+                        }
+                        for x in o_row.iter_mut() {
+                            *x /= den;
+                        }
+                    }
+                }
+                self.put(o, rows, out)
+            }
             // each group's queries over its own keys and values, every one of them
             Attn::Ragged {
                 q,
@@ -862,11 +985,221 @@ impl Run<'_> {
         }
     }
 
-    /// The latent's patches and cells, over the step's clips.
+    /// The latent's patches and cells, over the step's clips; a VAE's grid ops (its
+    /// convolutions, group norms, resamplings) over each clip's voxel rows.
+    #[allow(clippy::too_many_lines)]
     pub(super) fn conv(&mut self, op: &Conv) -> Result<(), String> {
         let n = self.rows.map_or(0, |r| r.token.len());
         let voxels = self.rows.map_or(0, |r| r.voxel.len());
+        let total = |g: &[Clip]| g.iter().map(|c| c.rows()).sum::<usize>();
         match *op {
+            Conv::Grid { grid, rule, y } => {
+                let g = self.ints(grid)?;
+                let out = rule.apply(g.v).ok_or("a grid its rule does not map")?;
+                let clips_n = out.len() / 4;
+                self.put_ints(y, clips_n, 4, out);
+                Ok(())
+            }
+            Conv::Conv3d {
+                x,
+                grid,
+                w,
+                bias,
+                k,
+                stride,
+                pad,
+                causal_t: false,
+                dilation,
+                depthwise: false,
+                cache: None,
+                y_grid,
+                y,
+                ..
+            } => {
+                let (xs, ws) = (self.floats(x)?, self.floats(w)?);
+                let b = self.opt_floats(bias)?;
+                let (ig, og) = (clips(self.ints(grid)?.v), clips(self.ints(y_grid)?.v));
+                let (cin, cout) = (xs.width, ws.rows);
+                let taps = (k[0] * k[1] * k[2]) as usize;
+                if ws.width != taps * cin {
+                    return Err(format!(
+                        "conv.conv3d: a kernel of {} columns for {taps} taps of {cin}",
+                        ws.width
+                    ));
+                }
+                let rows = total(&og);
+                let mut out = vec![0.0f32; rows * cout];
+                let mut patch = vec![0.0f32; taps * cin];
+                for (l, o) in og.iter().enumerate() {
+                    let i = ig[l];
+                    for r in 0..o.rows() {
+                        let (t, h, wd) = o.unravel(r);
+                        patch.iter_mut().for_each(|p| *p = 0.0);
+                        for tap in 0..taps {
+                            let (kt, kh, kw) = (
+                                tap / (k[1] * k[2]) as usize,
+                                (tap / k[2] as usize) % k[1] as usize,
+                                tap % k[2] as usize,
+                            );
+                            let at = |o: usize, s: u32, kk: usize, d: u32, p: u32| {
+                                (o * s as usize + kk * d as usize) as i64 - i64::from(p)
+                            };
+                            let (it, ih, iw) = (
+                                at(t, stride[0], kt, dilation[0], pad[0]),
+                                at(h, stride[1], kh, dilation[1], pad[1]),
+                                at(wd, stride[2], kw, dilation[2], pad[2]),
+                            );
+                            if it < 0
+                                || ih < 0
+                                || iw < 0
+                                || it >= i.t as i64
+                                || ih >= i.h as i64
+                                || iw >= i.w as i64
+                            {
+                                continue;
+                            }
+                            let src = i.ravel(it as usize, ih as usize, iw as usize);
+                            patch[tap * cin..(tap + 1) * cin].copy_from_slice(xs.row(src));
+                        }
+                        let dst = &mut out[(o.off + r) * cout..(o.off + r + 1) * cout];
+                        for (nn, d) in dst.iter_mut().enumerate() {
+                            *d = dot(ws.row(nn), &patch) + b.as_ref().map_or(0.0, |b| b.v[nn]);
+                        }
+                    }
+                }
+                self.put(y, rows, out)
+            }
+            Conv::GroupNorm {
+                x,
+                grid,
+                groups,
+                weight,
+                bias,
+                eps,
+                silu,
+                y,
+            } => {
+                let (xs, ws, bs) = (self.floats(x)?, self.floats(weight)?, self.floats(bias)?);
+                let g = clips(self.ints(grid)?.v);
+                let c = xs.width;
+                let cg = c / groups.max(1) as usize;
+                let rows = xs.rows;
+                let mut out = vec![0.0f32; rows * c];
+                for clip in &g {
+                    for gi in 0..groups as usize {
+                        let cols = gi * cg..(gi + 1) * cg;
+                        let (mut sum, mut cnt) = (0.0f64, 0usize);
+                        for r in clip.off..clip.off + clip.rows() {
+                            sum += xs.row(r)[cols.clone()]
+                                .iter()
+                                .map(|&v| f64::from(v))
+                                .sum::<f64>();
+                            cnt += cg;
+                        }
+                        let mean = sum / cnt.max(1) as f64;
+                        let mut var = 0.0f64;
+                        for r in clip.off..clip.off + clip.rows() {
+                            var += xs.row(r)[cols.clone()]
+                                .iter()
+                                .map(|&v| (f64::from(v) - mean).powi(2))
+                                .sum::<f64>();
+                        }
+                        let rstd = 1.0 / (var / cnt.max(1) as f64 + f64::from(eps)).sqrt();
+                        for r in clip.off..clip.off + clip.rows() {
+                            for col in cols.clone() {
+                                let v = ((f64::from(xs.row(r)[col]) - mean) * rstd) as f32
+                                    * ws.v[col]
+                                    + bs.v[col];
+                                out[r * c + col] = if silu { v * sigmoid(v) } else { v };
+                            }
+                        }
+                    }
+                }
+                self.put(y, rows, out)
+            }
+            Conv::Upsample {
+                x,
+                grid,
+                factor,
+                keep_first_frame,
+                y_grid,
+                y,
+            } => {
+                let xs = self.floats(x)?;
+                let (ig, og) = (clips(self.ints(grid)?.v), clips(self.ints(y_grid)?.v));
+                let c = xs.width;
+                let rows = total(&og);
+                let mut out = vec![0.0f32; rows * c];
+                let f = factor.map(|f| f.max(1) as usize);
+                for (l, o) in og.iter().enumerate() {
+                    for r in 0..o.rows() {
+                        let (t, h, w) = o.unravel(r);
+                        let ti = if keep_first_frame {
+                            if t == 0 { 0 } else { (t - 1) / f[0] + 1 }
+                        } else {
+                            t / f[0]
+                        };
+                        let src = ig[l].ravel(ti, h / f[1], w / f[2]);
+                        out[(o.off + r) * c..(o.off + r + 1) * c].copy_from_slice(xs.row(src));
+                    }
+                }
+                self.put(y, rows, out)
+            }
+            Conv::PixelShuffle {
+                x,
+                grid,
+                r,
+                trim_t,
+                y_grid,
+                y,
+            } => {
+                let xs = self.floats(x)?;
+                let (ig, og) = (clips(self.ints(grid)?.v), clips(self.ints(y_grid)?.v));
+                let [r1, r2, r3] = r.map(|v| v as usize);
+                let rr = r1 * r2 * r3;
+                let c = xs.width / rr;
+                let rows = total(&og);
+                let mut out = vec![0.0f32; rows * c];
+                for (l, o) in og.iter().enumerate() {
+                    for row in 0..o.rows() {
+                        let (t, h, w) = o.unravel(row);
+                        let ot = t + trim_t as usize;
+                        let src = ig[l].ravel(ot / r1, h / r2, w / r3);
+                        let block = ((ot % r1) * r2 + (h % r2)) * r3 + (w % r3);
+                        for col in 0..c {
+                            out[(o.off + row) * c + col] = xs.v[src * c * rr + col * rr + block];
+                        }
+                    }
+                }
+                self.put(y, rows, out)
+            }
+            Conv::PixelUnshuffle {
+                x,
+                grid,
+                r,
+                y_grid,
+                y,
+            } => {
+                let xs = self.floats(x)?;
+                let (ig, og) = (clips(self.ints(grid)?.v), clips(self.ints(y_grid)?.v));
+                let [r1, r2, r3] = r.map(|v| v as usize);
+                let rr = r1 * r2 * r3;
+                let c = xs.width;
+                let rows = total(&og);
+                let mut out = vec![0.0f32; rows * c * rr];
+                for (l, o) in og.iter().enumerate() {
+                    for row in 0..o.rows() {
+                        let (t, h, w) = o.unravel(row);
+                        for col in 0..c * rr {
+                            let (cin, block) = (col / rr, col % rr);
+                            let (i1, i2, i3) = (block / (r2 * r3), (block / r3) % r2, block % r3);
+                            let src = ig[l].ravel(t * r1 + i1, h * r2 + i2, w * r3 + i3);
+                            out[(o.off + row) * c * rr + col] = xs.v[src * c + cin];
+                        }
+                    }
+                }
+                self.put(y, rows, out)
+            }
             Conv::Patchify {
                 x,
                 grid,

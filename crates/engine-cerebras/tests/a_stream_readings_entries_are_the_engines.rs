@@ -55,6 +55,7 @@ fn engine_cpu_step<'a>(trace: &Trace, inputs: &'a [(String, Vec<f32>)]) -> Strea
             .iter()
             .map(|(n, v)| (n.as_str(), v.clone()))
             .collect(),
+        tokens: Vec::new(),
     }
 }
 

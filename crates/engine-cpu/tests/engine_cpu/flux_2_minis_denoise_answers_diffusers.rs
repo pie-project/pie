@@ -124,6 +124,7 @@ fn setup(trace: &Trace) -> (Forward, StreamStep<'static>) {
             ("context", context),
             ("latents", latents),
         ],
+        tokens: Vec::new(),
     };
     let forward = Forward::new(trace.clone(), None, &plane).expect("flux2-mini loads");
     (forward, step)
@@ -181,7 +182,18 @@ fn a_stream_step_captures_a_nodes_values() {
             .map(|(i, _)| i)
             .expect("flux2-mini runs the op")
     };
-    let (last, unpatch) = (at("linear.matmul", 32), at("conv.unpatchify", 0));
+    // the exit projection: the matmul whose rows the unpatchify reads
+    let unpatch = at("conv.unpatchify", 0);
+    let last = match &trace.nodes[unpatch].op {
+        poem_ir::Operation::Conv(poem_ir::Conv::Unpatchify { x, .. }) => {
+            match trace.values[x.0 as usize].def {
+                poem_ir::Def::Op(n) => n as usize,
+                _ => panic!("the patches are a node's"),
+            }
+        }
+        _ => panic!("an unpatchify"),
+    };
+    assert_eq!(trace.nodes[last].op.name(), "linear.matmul");
     let (outs, caps) = forward
         .stream_capture(&step, &[last, unpatch])
         .expect("the denoise step runs");

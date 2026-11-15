@@ -1,8 +1,11 @@
-//! flux2-mini as engine-cpu's flux test and `mk_tiny_flux2.py` draw it: its weights and a step's
-//! inputs, by name, at `READING_ROWS` rows a lane (default 64; a square latent of 2 x 2
-//! patches), and its weights as a diffusers checkpoint.
+//! flux2-mini as engine-cpu's flux test and `mk_tiny_flux2.py` / `mk_tiny_flux2_pipe.py` draw it:
+//! its weights and a step's inputs, by name, at `READING_ROWS` rows a lane (default 64; a square
+//! latent of 2 x 2 patches), and its weights as a diffusers pipeline's checkpoint (the DiT, the
+//! text encoder and the VAE under `dit.`, `te.` and `vae.`).
 
 #![allow(dead_code)]
+
+pub mod guest;
 
 use std::path::Path;
 
@@ -108,6 +111,96 @@ pub fn latents() -> Vec<f32> {
 /// A plane's shape and values.
 type Plane = (Vec<usize>, Vec<f32>);
 
+/// A VAE plane by its checkpoint name, as `mk_tiny_flux2_pipe.py`'s `vae_plane` draws it.
+pub fn vae_plane(name: &str, shape: &[usize]) -> Vec<f32> {
+    let n: usize = shape.iter().product();
+    let u = units(name, n);
+    if name.ends_with("running_var") || ((name.contains("norm")) && name.ends_with(".weight")) {
+        return u.iter().map(|u| 1.0 + 0.5 * u).collect();
+    }
+    if name.ends_with("running_mean") {
+        return u.iter().map(|u| 0.5 * u).collect();
+    }
+    if name.ends_with(".bias") {
+        return u.iter().map(|u| 0.2 * u).collect();
+    }
+    let fan: usize = shape[1..].iter().product::<usize>().max(1);
+    let s = (12.0 / fan as f32).sqrt();
+    u.iter().map(|u| u * s).collect()
+}
+
+/// The VAE's planes as diffusers' `AutoencoderKLFlux2` names them (the poem's flux2-mini VAE:
+/// four 32-channel blocks, a resnet an encoder block, its mid-block attention), and whether
+/// each is held in f32 (norms, biases, the batch norm) rather than bf16.
+pub fn vae_names() -> Vec<(String, Vec<usize>, bool)> {
+    let c = 32usize;
+    let mut v: Vec<(String, Vec<usize>, bool)> = Vec::new();
+    let conv =
+        |v: &mut Vec<(String, Vec<usize>, bool)>, n: String, o: usize, i: usize, k: usize| {
+            v.push((format!("{n}.weight"), vec![o, i, k, k], false));
+            v.push((format!("{n}.bias"), vec![o], true));
+        };
+    let norm = |v: &mut Vec<(String, Vec<usize>, bool)>, n: String| {
+        v.push((format!("{n}.weight"), vec![c], true));
+        v.push((format!("{n}.bias"), vec![c], true));
+    };
+    let resnet = |v: &mut Vec<(String, Vec<usize>, bool)>, n: String| {
+        norm(v, format!("{n}.norm1"));
+        conv(v, format!("{n}.conv1"), c, c, 3);
+        norm(v, format!("{n}.norm2"));
+        conv(v, format!("{n}.conv2"), c, c, 3);
+    };
+    let mid = |v: &mut Vec<(String, Vec<usize>, bool)>, n: &str| {
+        resnet(v, format!("{n}.mid_block.resnets.0"));
+        resnet(v, format!("{n}.mid_block.resnets.1"));
+        let a = format!("{n}.mid_block.attentions.0");
+        norm(v, format!("{a}.group_norm"));
+        for p in ["to_q", "to_k", "to_v", "to_out.0"] {
+            v.push((format!("{a}.{p}.weight"), vec![c, c], false));
+            v.push((format!("{a}.{p}.bias"), vec![c], true));
+        }
+    };
+    conv(&mut v, "encoder.conv_in".into(), c, 3, 3);
+    for i in 0..4 {
+        resnet(&mut v, format!("encoder.down_blocks.{i}.resnets.0"));
+        if i < 3 {
+            conv(
+                &mut v,
+                format!("encoder.down_blocks.{i}.downsamplers.0.conv"),
+                c,
+                c,
+                3,
+            );
+        }
+    }
+    mid(&mut v, "encoder");
+    norm(&mut v, "encoder.conv_norm_out".into());
+    conv(&mut v, "encoder.conv_out".into(), 2 * c, c, 3);
+    conv(&mut v, "decoder.conv_in".into(), c, c, 3);
+    mid(&mut v, "decoder");
+    for i in 0..4 {
+        for r in 0..2 {
+            resnet(&mut v, format!("decoder.up_blocks.{i}.resnets.{r}"));
+        }
+        if i < 3 {
+            conv(
+                &mut v,
+                format!("decoder.up_blocks.{i}.upsamplers.0.conv"),
+                c,
+                c,
+                3,
+            );
+        }
+    }
+    norm(&mut v, "decoder.conv_norm_out".into());
+    conv(&mut v, "decoder.conv_out".into(), 3, c, 3);
+    conv(&mut v, "quant_conv".into(), 2 * c, 2 * c, 1);
+    conv(&mut v, "post_quant_conv".into(), c, c, 1);
+    v.push(("bn.running_mean".into(), vec![4 * c], true));
+    v.push(("bn.running_var".into(), vec![4 * c], true));
+    v
+}
+
 fn bf16_bytes(v: &[f32]) -> Vec<u8> {
     v.iter()
         .map(|x| (bf16(*x).to_bits() >> 16) as u16)
@@ -115,10 +208,12 @@ fn bf16_bytes(v: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-/// flux2-mini's weights as diffusers' `Flux2Transformer2DModel` state dict names and lays them
-/// (`mk_tiny_flux2.py`'s `state_dict`: the poem's read rules inverted: q / k / v split, the adaLN
-/// projections' (shift, scale) pairs swapped, a single block's two output projections side by
-/// side), bf16, in `dir/diffusion_pytorch_model.safetensors`.
+/// flux2-mini's weights as a diffusers pipeline's checkpoint lays them, in
+/// `dir/model.safetensors`: the DiT as `Flux2Transformer2DModel`'s state dict names them under
+/// `dit.` (`mk_tiny_flux2.py`'s `state_dict`: the poem's read rules inverted: q / k / v split,
+/// the adaLN projections' (shift, scale) pairs swapped, a single block's two output projections
+/// side by side), the text encoder as `Qwen3ForCausalLM`'s under `te.` (q / k / v and gate / up
+/// split), bf16; the VAE as `AutoencoderKLFlux2`'s under `vae.` ([`vae_names`], [`vae_plane`]).
 pub fn checkpoint(trace: &Trace, dir: &Path) {
     let shape = |n: &str| -> Vec<usize> {
         let p = (trace.params.iter())
@@ -251,13 +346,67 @@ pub fn checkpoint(trace: &Trace, dir: &Path) {
         }
         sd.push((format!("{b}.to_out.weight"), (vec![a.0[0], wa + wm], v)));
     }
+    let mut all: Vec<(String, Plane, bool)> = sd
+        .into_iter()
+        .map(|(n, p)| (format!("dit.{n}"), p, false))
+        .collect();
+    // the text encoder: Qwen3's names, the poem's fused planes split
+    let q = 256usize;
+    let mut te = vec![("te.model.embed_tokens.weight".to_string(), p("te.embed"))];
+    for l in 0..2 {
+        let (s, d) = (format!("te.layers.{l}"), format!("te.model.layers.{l}"));
+        let qkv = p(&format!("{s}.qkv"));
+        for (j, n) in ["q_proj", "k_proj", "v_proj"].iter().enumerate() {
+            te.push((
+                format!("{d}.self_attn.{n}.weight"),
+                rows_of(&qkv, j * q, (j + 1) * q),
+            ));
+        }
+        te.push((
+            format!("{d}.self_attn.q_norm.weight"),
+            p(&format!("{s}.q_norm")),
+        ));
+        te.push((
+            format!("{d}.self_attn.k_norm.weight"),
+            p(&format!("{s}.k_norm")),
+        ));
+        te.push((format!("{d}.self_attn.o_proj.weight"), p(&format!("{s}.o"))));
+        te.push((
+            format!("{d}.input_layernorm.weight"),
+            p(&format!("{s}.attn_norm")),
+        ));
+        te.push((
+            format!("{d}.post_attention_layernorm.weight"),
+            p(&format!("{s}.mlp_norm")),
+        ));
+        let gu = p(&format!("{s}.gate_up"));
+        let half = gu.0[0] / 2;
+        te.push((format!("{d}.mlp.gate_proj.weight"), rows_of(&gu, 0, half)));
+        te.push((
+            format!("{d}.mlp.up_proj.weight"),
+            rows_of(&gu, half, 2 * half),
+        ));
+        te.push((format!("{d}.mlp.down_proj.weight"), p(&format!("{s}.down"))));
+    }
+    all.extend(te.into_iter().map(|(n, p)| (n, p, false)));
+    for (n, shape, f32) in vae_names() {
+        let v = vae_plane(&format!("vae.{n}"), &shape);
+        all.push((format!("vae.{n}"), (shape, v), f32));
+    }
     let mut entries = Vec::new();
     let mut data = Vec::new();
-    for (name, (s, v)) in &sd {
-        let bytes = bf16_bytes(v);
+    for (name, (s, v), f32) in &all {
+        let (dtype, bytes) = if *f32 {
+            (
+                "F32",
+                v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
+            )
+        } else {
+            ("BF16", bf16_bytes(v))
+        };
         let dims: Vec<String> = s.iter().map(usize::to_string).collect();
         entries.push(format!(
-            "\"{name}\":{{\"dtype\":\"BF16\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
+            "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
             dims.join(","),
             data.len(),
             data.len() + bytes.len()
@@ -269,8 +418,7 @@ pub fn checkpoint(trace: &Trace, dir: &Path) {
     out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(&data);
     std::fs::create_dir_all(dir).expect("a checkpoint directory");
-    std::fs::write(dir.join("diffusion_pytorch_model.safetensors"), out)
-        .expect("the checkpoint is written");
+    std::fs::write(dir.join("model.safetensors"), out).expect("the checkpoint is written");
 }
 
 /// The import contract the runtime's `contract_for` makes of a catalog model's checkpoint.

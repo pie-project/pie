@@ -67,7 +67,14 @@ pub struct Wafer {
     pub preset: Option<String>,
     pub build: Build,
     pub tiles: Tiles,
+    /// A stream reading's rows a class a step (a diffusion poem's text, context and latent
+    /// rows), its programs compiled for: [`DEFAULT_STREAM_ROWS`] unless stated.
+    pub stream_rows: Option<u32>,
 }
+
+/// The rows a class a stream program is compiled for when `[cerebras.wafer] stream_rows` is
+/// not stated.
+pub const DEFAULT_STREAM_ROWS: u32 = 64;
 
 /// Whether a load compiles a program it has not cached.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

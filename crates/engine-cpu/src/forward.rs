@@ -166,6 +166,29 @@ fn bf16(x: f32) -> f32 {
     f32::from_bits(rounded & 0xffff_0000)
 }
 
+/// A plane as the ops read it: a convolution's kernel, read `c_in` channels a tap of each
+/// output row (the checkpoint's `[C_out, c_in, taps]` relabelled taps major, as every engine
+/// lays it at load).
+pub(crate) fn laid(layout: poem_ir::ParamLayout, v: Vec<f32>) -> Vec<f32> {
+    let poem_ir::ParamLayout::ConvTapsMajor { c_in, taps } = layout else {
+        return v;
+    };
+    let (c_in, taps) = (c_in as usize, taps as usize);
+    let pitch = c_in * taps;
+    if pitch == 0 || !v.len().is_multiple_of(pitch) {
+        return v;
+    }
+    let mut out = vec![0.0; v.len()];
+    for (row, o) in v.chunks(pitch).zip(out.chunks_mut(pitch)) {
+        for c in 0..c_in {
+            for t in 0..taps {
+                o[t * c_in + c] = row[c * taps + t];
+            }
+        }
+    }
+    out
+}
+
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -271,7 +294,7 @@ impl Forward {
             weights[id] = Some(Held::Floats {
                 rows,
                 width: each,
-                v: v.into_iter().map(bf16).collect(),
+                v: laid(param.layout, v.into_iter().map(bf16).collect()),
             });
         }
         let lanes = (0..trace.caches.len()).map(|_| Lane::default()).collect();
