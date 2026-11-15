@@ -450,6 +450,101 @@ mod tests {
         a_device_resolved_lane_counts_against_the_token_cap();
         a_step_of_prompts_only_stops_at_the_engines_prefill_lanes();
         fires_moving_one_ring_end_go_a_step_apart_in_the_order_they_stand();
+        a_seal_that_dispatches_the_later_putter_first_gives_it_the_earlier_cell();
+    }
+
+    /// The fires of `dispatch`'s frames, each fire id standing for the
+    /// fire `fire_of` makes, stepped as the engine would build them: the
+    /// cell each put of ring 7 takes from the engine's cursor, by fire id.
+    fn minted_puts(
+        frames: Vec<Vec<Vec<u64>>>,
+        fire_of: impl Fn(u64) -> Box<PendingRequest>,
+    ) -> Vec<(u64, u64)> {
+        let mut cursor = 0u64;
+        let mut minted = Vec::new();
+        for waves in frames {
+            let waves = waves
+                .iter()
+                .map(|wave| wave.iter().map(|&id| fire_of(id)).collect())
+                .collect();
+            let (frame, _) = build_frame_submission(waves, limits(), 16, &SchedulerStats::default());
+            for step in &frame.steps {
+                let puts: Vec<u64> = step
+                    .instances
+                    .iter()
+                    .map(|id| id.0)
+                    .filter(|&id| fire_of(id).request.ring_moves.iter().any(|ring| ring.puts))
+                    .collect();
+                assert!(puts.len() <= 1, "one put of ring 7 a step: {puts:?}");
+                for id in puts {
+                    minted.push((id, cursor));
+                    cursor += 1;
+                }
+            }
+        }
+        minted
+    }
+
+    /// Two lanes each put ring 7, lane `a`'s fire (1) reserved first and
+    /// lane `b`'s (2) after it. The seal sends 2 first in two ways: `a`'s
+    /// frame does not fit the wave `b`'s does, or `a`'s put is its lane's
+    /// second frame. Each put takes the cell the engine's cursor stands at
+    /// when its step is built, so 2 has the earlier cell: no order the fires
+    /// reserved in reaches the engine, and none is needed.
+    fn a_seal_that_dispatches_the_later_putter_first_gives_it_the_earlier_cell() {
+        use crate::scheduler::frame::{FramePlan, FramePolicy, FrameStamp, QueuedFireIds};
+        let stamp = |lane: ProcessId, seq: u64| FrameStamp {
+            lane,
+            seq,
+            slot: 0,
+            fires: 1,
+        };
+        let dispatch = |policy: &mut FramePolicy, queued: &[u64]| -> Vec<Vec<u64>> {
+            let queued: QueuedFireIds = queued.iter().copied().collect();
+            match policy.plan_dispatch(&queued, &HashSet::new(), false, std::time::Instant::now()) {
+                FramePlan::Dispatch(waves) => waves,
+                plan => panic!("expected a frame dispatch, got {plan:?}"),
+            }
+        };
+        let fire_of = |id: u64| {
+            let mut fire = ring_fire(id, if id < 3 { &[(7, false, true)] } else { &[] });
+            fire.logical_fire_id = id;
+            fire
+        };
+        // Lanes stand in id order: `c` (filling the wave), `b`, then `a`.
+        let (c, b, a) = (
+            ProcessId::from_u128(1),
+            ProcessId::from_u128(2),
+            ProcessId::from_u128(3),
+        );
+
+        let mut policy = FramePolicy::new(1, 64, 4, None);
+        policy.on_fire_enqueued(stamp(a, 0), Some(a), 1, 2, 1);
+        policy.on_fire_enqueued(stamp(b, 0), Some(b), 2, 2, 1);
+        policy.on_fire_enqueued(stamp(c, 0), Some(c), 3, 2, 1);
+        let first = dispatch(&mut policy, &[1, 2, 3]);
+        assert_eq!(first, [vec![3, 2]], "a's frame does not fit the wave");
+        policy.on_frame_retired([b, c]);
+        let second = dispatch(&mut policy, &[1]);
+        assert_eq!(second, [vec![1]]);
+        assert_eq!(minted_puts(vec![first, second], fire_of), [(2, 0), (1, 1)]);
+
+        let mut policy = FramePolicy::new(1, 64, 4096, None);
+        policy.on_fire_enqueued(stamp(a, 0), Some(a), 3, 1, 1);
+        policy.on_fire_enqueued(stamp(a, 1), Some(a), 1, 1, 1);
+        policy.on_fire_enqueued(stamp(b, 0), Some(b), 2, 1, 1);
+        let first = dispatch(&mut policy, &[1, 2, 3]);
+        let mut sorted = first.clone();
+        sorted[0].sort_unstable();
+        assert_eq!(sorted, [vec![2, 3]], "only a's front frame seals");
+        policy.on_frame_retired([a, b]);
+        // a's second frame waits for every awaited lane's next one.
+        policy.on_fire_enqueued(stamp(b, 1), Some(b), 4, 1, 1);
+        let second = dispatch(&mut policy, &[1, 4]);
+        let mut sorted = second.clone();
+        sorted[0].sort_unstable();
+        assert_eq!(sorted, [vec![1, 4]]);
+        assert_eq!(minted_puts(vec![first, second], fire_of), [(2, 0), (1, 1)]);
     }
 
     /// A fire of instance `instance`, a pipeline of its own, moving the
