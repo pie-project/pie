@@ -124,6 +124,10 @@ pub struct Debug {
     pub posted: Option<bool>,
     /// `false`: a loop runs the lookahead alone, not bounded by the lane's pages.
     pub loop_room: Option<bool>,
+    /// The command of a `wafer-fabric` (whitespace-split): a load's stream readings each linked
+    /// on its own and run in a child process of its own (the simulator holds one program a
+    /// process; else one co-resident program).
+    pub stream_processes: Option<String>,
 }
 
 impl Config {

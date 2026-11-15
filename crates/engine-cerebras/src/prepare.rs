@@ -441,7 +441,12 @@ pub fn stream_programs(
         "simulator"
     };
     hasher.update(fabric.as_bytes());
-    hasher.update(b"coresident-v1");
+    let apart = cfg.debug().stream_processes.is_some();
+    hasher.update(if apart {
+        b"apart-v1".as_slice()
+    } else {
+        b"coresident-v1".as_slice()
+    });
     for (n, src) in kernels_cerebras::sources::OPS
         .iter()
         .chain(kernels_cerebras::sources::STREAM_OPS)
@@ -472,37 +477,45 @@ pub fn stream_programs(
             let dir = tmp.join(slug(reading));
             std::fs::rename(&from, &dir).map_err(io(&dir))?;
         }
-        // the readings co-resident: one program, a reading's launch its PEs alone
-        let placed = kernels_cerebras::stream::coresident::combine(tmp, &slugs)?;
-        tracing::info!(readings = ?placed.iter().map(|p| (&p.name, p.x, p.w, p.h)).collect::<Vec<_>>(), "cerebras: the stream readings co-resident");
+        // the readings co-resident: one program, a reading's launch its PEs alone; or (debug
+        // `stream_processes`) each its own program, linked on its own
+        let progs: Vec<PathBuf> = if apart {
+            kernels_cerebras::stream::coresident::ops(tmp, &slugs)?;
+            slugs.iter().map(|s| tmp.join(s)).collect()
+        } else {
+            let placed = kernels_cerebras::stream::coresident::combine(tmp, &slugs)?;
+            tracing::info!(readings = ?placed.iter().map(|p| (&p.name, p.x, p.w, p.h)).collect::<Vec<_>>(), "cerebras: the stream readings co-resident");
+            vec![tmp.to_path_buf()]
+        };
         if let Some(cslc) = &cslc {
-            let reading = "the co-resident readings";
-            let dir = tmp.to_path_buf();
-            let fab = std::fs::read_to_string(dir.join("fabric.txt")).map_err(io(&dir))?;
-            let f: Vec<u32> = fab.split_whitespace().filter_map(|x| x.parse().ok()).collect();
-            let (w, h, bf16) = match f[..] {
-                [w, h, b] => (w, h, b == 1),
-                _ => return Err(format!("{}: fabric.txt is not `w h bf16`", dir.display())),
-            };
-            let (mut fabric_dims, fabric_offsets) = kernels_cerebras::toolchain::memcpy_fabric(w, h);
-            if cfg.cmaddr.is_some() {
-                fabric_dims = arch(cfg.target).system_fabric();
+            for dir in &progs {
+                let reading = dir.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+                let fab = std::fs::read_to_string(dir.join("fabric.txt")).map_err(io(dir))?;
+                let f: Vec<u32> = fab.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+                let (w, h, bf16) = match f[..] {
+                    [w, h, b] => (w, h, b == 1),
+                    _ => return Err(format!("{}: fabric.txt is not `w h bf16`", dir.display())),
+                };
+                let (mut fabric_dims, fabric_offsets) = kernels_cerebras::toolchain::memcpy_fabric(w, h);
+                if cfg.cmaddr.is_some() {
+                    fabric_dims = arch(cfg.target).system_fabric();
+                }
+                let t0 = std::time::Instant::now();
+                cslc.compile(&kernels_cerebras::toolchain::Compile {
+                    arch: arch(cfg.target),
+                    layout: dir.join("layout.csl"),
+                    fabric_dims,
+                    fabric_offsets,
+                    params: Vec::new(),
+                    memcpy: true,
+                    channels: 1,
+                    import_paths: Vec::new(),
+                    out: dir.join("out"),
+                    bf16,
+                })
+                .map_err(|e| format!("{reading}: {e}"))?;
+                tracing::info!(reading = %reading, s = t0.elapsed().as_secs_f64(), "cerebras: a stream program linked");
             }
-            let t0 = std::time::Instant::now();
-            cslc.compile(&kernels_cerebras::toolchain::Compile {
-                arch: arch(cfg.target),
-                layout: dir.join("layout.csl"),
-                fabric_dims,
-                fabric_offsets,
-                params: Vec::new(),
-                memcpy: true,
-                channels: 1,
-                import_paths: Vec::new(),
-                out: dir.join("out"),
-                bf16,
-            })
-            .map_err(|e| format!("{reading}: {e}"))?;
-            tracing::info!(reading = %reading, s = t0.elapsed().as_secs_f64(), "cerebras: a stream program linked");
         }
         Ok(())
     })?;
@@ -510,7 +523,14 @@ pub fn stream_programs(
     Ok(Some(
         names
             .iter()
-            .map(|r| (root.join(slug(r)), root.join("out")))
+            .map(|r| {
+                let link = if apart {
+                    root.join(slug(r)).join("out")
+                } else {
+                    root.join("out")
+                };
+                (root.join(slug(r)), link)
+            })
             .collect(),
     ))
 }

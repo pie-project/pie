@@ -179,11 +179,13 @@ impl Streams {
         } else {
             if self.open.as_ref() != Some(&link) {
                 self.open = None;
-                for s in &mut self.readings {
-                    s.written = false;
-                }
                 let l = link.clone();
-                self.fabric.call(move |f| f.switch(&l))?;
+                // a program loaded afresh holds none of its readings' arrays
+                if self.fabric.call(move |f| f.switch(&l))? {
+                    for s in self.readings.iter_mut().filter(|s| s.link == link) {
+                        s.written = false;
+                    }
+                }
                 self.open = Some(link);
             }
             !self.readings[ri].written
@@ -716,6 +718,10 @@ impl CerebrasEngine {
         let fabric = if host_fabric {
             let forward = Forward::new(trace.clone(), None, &of).map_err(load)?;
             Remote::open(move || Ok(Box::new(crate::reading::HostFabric::new(forward)) as _))
+        } else if let Some(cmd) = self.debug.stream_processes.clone() {
+            // each reading's program in a child process of its own
+            let cmd: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+            Remote::open(move || Ok(Box::new(crate::reading::Children::new(cmd)) as _))
         } else {
             let (sdk_lib, platform) = (self.cfg.toolchain.sdk_lib(), self.platform());
             Remote::open(move || {

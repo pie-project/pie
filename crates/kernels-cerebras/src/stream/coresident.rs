@@ -164,13 +164,7 @@ pub fn combine(root: &Path, names: &[String]) -> R<Vec<Placed>> {
     }
     // the op modules beside every kernel that imports them (cslc reads a file's imports from
     // its own directory)
-    for d in std::iter::once(root.to_path_buf()).chain(placed.iter().map(|p| root.join(&p.name))) {
-        let ops = d.join("ops");
-        std::fs::create_dir_all(&ops).map_err(io(&ops))?;
-        for (n, src) in crate::sources::OPS.iter().chain(crate::sources::STREAM_OPS) {
-            std::fs::write(ops.join(n), src).map_err(io(&ops))?;
-        }
-    }
+    ops(root, names)?;
     // the PEs no reading takes: idle
     let filler = format!(
         "// An idle PE of a co-resident program (kernels-cerebras stream::coresident).\nparam memcpy_params;\nparam RD: u16;\n{}task go() void {{ sys_mod.unblock_cmd_stream(); }}\ncomptime {{\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n}}\n",
@@ -203,6 +197,18 @@ pub fn combine(root: &Path, names: &[String]) -> R<Vec<Placed>> {
     )
     .map_err(io(root))?;
     Ok(placed)
+}
+
+/// The op modules (`ops/`) in `root` and in each reading's directory `root/<name>`.
+pub fn ops(root: &Path, names: &[String]) -> R<()> {
+    for d in std::iter::once(root.to_path_buf()).chain(names.iter().map(|n| root.join(n))) {
+        let ops = d.join("ops");
+        std::fs::create_dir_all(&ops).map_err(io(&ops))?;
+        for (n, src) in crate::sources::OPS.iter().chain(crate::sources::STREAM_OPS) {
+            std::fs::write(ops.join(n), src).map_err(io(&ops))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

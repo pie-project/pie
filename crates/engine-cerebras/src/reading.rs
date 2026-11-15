@@ -83,10 +83,11 @@ pub trait Fabric {
     /// cycles where the program stamps them.
     fn run(&mut self, reading: &Reading, step: &StreamStep<'_>) -> R<(Vec<Vec<f32>>, Option<u64>)>;
     /// Opens the program linked in `link` in place of the one open (a fabric runs one
-    /// program at a time; the host's runs every reading's and opens nothing).
-    fn switch(&mut self, link: &Path) -> R<()> {
+    /// program at a time; the host's runs every reading's and opens nothing). Returns whether
+    /// it was loaded afresh (its arrays to be written again).
+    fn switch(&mut self, link: &Path) -> R<bool> {
         let _ = link;
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -107,7 +108,7 @@ impl Fabric for Programs {
         Fabric::run(self.rt.as_mut().ok_or("no program is open")?, reading, step)
     }
 
-    fn switch(&mut self, link: &Path) -> R<()> {
+    fn switch(&mut self, link: &Path) -> R<bool> {
         if let Some(mut old) = self.rt.take() {
             old.stop();
         }
@@ -123,7 +124,131 @@ impl Fabric for Programs {
             "spatial: a stream program loaded"
         );
         self.rt = Some(rt);
-        Ok(())
+        Ok(true)
+    }
+}
+
+/// Each stream program in a process of its own (`wafer-fabric`, the command `cmd`), the one
+/// open at a time: the simulator holds one program a process, so readings each linked on their
+/// own (`[cerebras.debug] stream_processes`) run in a child each, one engine process driving
+/// them.
+pub struct Children {
+    pub cmd: Vec<String>,
+    kids: BTreeMap<PathBuf, Child>,
+    cur: Option<PathBuf>,
+}
+
+struct Child {
+    proc: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl Children {
+    #[must_use]
+    pub fn new(cmd: Vec<String>) -> Children {
+        Children {
+            cmd,
+            kids: BTreeMap::new(),
+            cur: None,
+        }
+    }
+
+    /// `req` (a JSON line) and `words` to the child open; its reply and its f32 words after.
+    fn call(&mut self, req: &Value, words: &[u32]) -> R<(Value, Vec<f32>)> {
+        use std::io::{BufRead, Read, Write};
+        let cur = self.cur.clone().ok_or("no program is open")?;
+        let kid = self.kids.get_mut(&cur).ok_or("no program is open")?;
+        let io = |e: std::io::Error| format!("wafer-fabric: {e}");
+        writeln!(kid.stdin, "{req}").map_err(io)?;
+        let bytes: Vec<u8> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
+        kid.stdin.write_all(&bytes).map_err(io)?;
+        kid.stdin.flush().map_err(io)?;
+        let mut line = String::new();
+        if kid.stdout.read_line(&mut line).map_err(io)? == 0 {
+            return Err("wafer-fabric: the child ended".into());
+        }
+        let head: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+        if head["ok"].as_bool() != Some(true) {
+            return Err(format!("wafer-fabric: {}", head["err"]));
+        }
+        let n: usize = (head["lens"].as_array().into_iter().flatten())
+            .filter_map(Value::as_u64)
+            .sum::<u64>() as usize;
+        let mut data = vec![0u8; 4 * n];
+        kid.stdout.read_exact(&mut data).map_err(io)?;
+        Ok((
+            head,
+            data.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect(),
+        ))
+    }
+}
+
+impl Drop for Children {
+    fn drop(&mut self) {
+        for (_, mut k) in std::mem::take(&mut self.kids) {
+            drop(k.stdin);
+            let _ = k.proc.wait();
+        }
+    }
+}
+
+impl Fabric for Children {
+    fn write(&mut self, a: &Array, words: &[u32]) -> R<()> {
+        let req = serde_json::json!({"op": "write", "sym": a.sym, "x": a.rect.x, "y": a.rect.y,
+            "w": a.rect.w, "h": a.rect.h, "len": a.len, "u16": a.u16, "n": words.len()});
+        self.call(&req, words).map(|_| ())
+    }
+
+    fn run(
+        &mut self,
+        reading: &Reading,
+        _step: &StreamStep<'_>,
+    ) -> R<(Vec<Vec<f32>>, Option<u64>)> {
+        let req = serde_json::json!({"op": "run", "dir": reading.dir});
+        let (head, data) = self.call(&req, &[])?;
+        let mut got = Vec::new();
+        let mut at = 0;
+        for l in (head["lens"].as_array().into_iter().flatten()).filter_map(Value::as_u64) {
+            got.push(data[at..at + l as usize].to_vec());
+            at += l as usize;
+        }
+        Ok((got, head["cycles"].as_u64()))
+    }
+
+    fn switch(&mut self, link: &Path) -> R<bool> {
+        if self.cur.as_deref() == Some(link) && self.kids.contains_key(link) {
+            return Ok(false);
+        }
+        // one child at a time (one simulator machine-wide): the one open ends
+        for (_, mut k) in std::mem::take(&mut self.kids) {
+            drop(k.stdin);
+            let _ = k.proc.wait();
+        }
+        self.cur = Some(link.to_path_buf());
+        let (bin, args) = self.cmd.split_first().ok_or("no wafer-fabric command")?;
+        let mut proc = std::process::Command::new(bin)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("{bin}: {e}"))?;
+        let stdin = proc.stdin.take().ok_or("no child stdin")?;
+        let stdout = std::io::BufReader::new(proc.stdout.take().ok_or("no child stdout")?);
+        self.kids.insert(
+            link.to_path_buf(),
+            Child {
+                proc,
+                stdin,
+                stdout,
+            },
+        );
+        self.call(&serde_json::json!({"op": "open", "link": link}), &[])?;
+        Ok(true)
     }
 }
 
