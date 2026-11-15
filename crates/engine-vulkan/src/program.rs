@@ -878,7 +878,7 @@ impl Plane {
         } = deferral;
         let Some(frame) = frame else {
             if let Some(done) = done {
-                (done.sink)(done.at, engine::StepOutcome::Committed);
+                (done.sink)(done.at, done.settled());
             }
             return Ok(());
         };
@@ -943,7 +943,7 @@ impl Plane {
             }
             if let Some(done) = done.as_ref() {
                 let outcome = match fault {
-                    None => engine::StepOutcome::Committed,
+                    None => done.settled(),
                     Some(why) => engine::StepOutcome::Faulted(why),
                 };
                 (done.sink)(done.at, outcome);

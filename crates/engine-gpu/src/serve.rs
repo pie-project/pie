@@ -25,6 +25,7 @@ use crate::inputs::Inputs;
 use crate::run::{CacheGeometry, CacheTable, FireBindings, FireTables, Run, SlotTable};
 use crate::settle::{Airborne, Arms, Done};
 use crate::store::Pools;
+use crate::store::frozen::{DeviceFold, LaneFold, counted_on_device, merged};
 use crate::store::kv::{self, Paging, Seat};
 use crate::weights::Weights;
 use crate::window::Windows;
@@ -1836,6 +1837,7 @@ impl<B: Serve> Shell<B> {
 
                 media: &[],
                 clips: &[],
+                folds: &[],
                 done: None,
                 guests: None,
             },
@@ -1862,6 +1864,7 @@ impl<B: Serve> Shell<B> {
                 attachments: &[],
                 media: &[],
                 clips,
+                folds: &[],
                 done: None,
                 guests: None,
             },
@@ -2421,9 +2424,15 @@ impl<B: Serve> Shell<B> {
             attachments: _,
             media,
             clips,
-            done,
+            folds,
+            mut done,
             guests,
         } = step;
+        // A fire whose fold length is the device's: its lanes report what
+        // their folds froze.
+        let device_fire = lanes.iter().any(|seated| counted_on_device(seated.rs));
+        let mut wrote: Vec<engine::KvWrites> = Vec::new();
+        let mut left: Vec<(Vec<u32>, Option<u32>)> = Vec::new();
 
         while self.inflight.len() >= self.arms.depth() {
             self.harvest_one()?;
@@ -2674,6 +2683,22 @@ impl<B: Serve> Shell<B> {
             } else {
                 self.pools.record(None, seat_slot)?
             };
+            // The slots the record stands in: where its own frozen position
+            // is kept.
+            let record_refs = match (seated.record, seated.rs_slot) {
+                (Some(record), _) if seated.refs => {
+                    self.pools.record_refs(Some(record), seat_slot)?
+                }
+                (None, Some(slot)) if seated.refs => {
+                    self.pools.record_refs(Some(&[slot]), seat_slot)?
+                }
+                _ => self.pools.record_refs(None, seat_slot)?,
+            };
+            let fresh = match seated.rs_reset {
+                engine::fire::RsReset::Inferred => have == 0,
+                engine::fire::RsReset::Fresh => true,
+                engine::fire::RsReset::Held => false,
+            };
             // The buffered rows' rs-list pages, as units of the pool.
             let verb = match seated.rs {
                 engine::fire::RsVerb::Buffer {
@@ -2691,14 +2716,31 @@ impl<B: Serve> Shell<B> {
                 },
                 other => other.clone(),
             };
-            let plan = engine::rs::LanePlan::of(
+            // The stated frozen length is a lower bound where the device
+            // counts the fold: the lane replays from the further of it and
+            // where the record's last fold left it. A record begun afresh
+            // holds nothing.
+            let device = folds.get(source).copied().unwrap_or_default();
+            let held = record_refs
+                .as_deref()
+                .filter(|_| !fresh)
+                .and_then(|pieces| self.pools.frozen_at(pieces));
+            let fold = LaneFold::of(
                 &verb,
                 row.rows,
                 have,
                 seated.mask.filter(|_| !seated.kv_less),
-                None,
+                device.count,
+                held,
             )
             .map_err(|error| program("serve::rs", format!("lane {}: {error}", row.source)))?;
+            if device_fire && let Some(report) = fold.report(device.reports) {
+                wrote.push(report);
+            }
+            if let Some(pieces) = record_refs {
+                left.push((pieces, fold.left));
+            }
+            let plan = fold.plan;
             // A lane of a copy-on-write group that folds nothing reads the
             // run side, which no lane writes this fire (CONTRACT-BC 15).
             let state = match seated.record_run {
@@ -2707,11 +2749,6 @@ impl<B: Serve> Shell<B> {
             };
             // The record as the slot tables state it, once a lane.
             let state = crate::store::slot_entries(&state)?;
-            let fresh = match seated.rs_reset {
-                engine::fire::RsReset::Inferred => have == 0,
-                engine::fire::RsReset::Fresh => true,
-                engine::fire::RsReset::Held => false,
-            };
             if fresh {
                 beginning.push(record);
             }
@@ -3481,9 +3518,16 @@ impl<B: Serve> Shell<B> {
             },
         };
 
+        // The step's own completion carries its reports; a step another
+        // pass reports leaves them for that pass.
+        if let Some(done) = done.as_mut() {
+            done.wrote = std::mem::take(&mut wrote);
+        }
         Ok(Prepared {
             lanes,
             done,
+            wrote,
+            left: merged(left),
             feeds,
             input_copies,
             merge_lands,
@@ -3575,8 +3619,12 @@ impl<B: Serve> Shell<B> {
         })
     }
 
-    /// Moves each seat-addressed lane's held rows past `p`'s.
+    /// Moves each seat-addressed lane's held rows past `p`'s, and leaves
+    /// each record where `p`'s folds put it.
     pub fn advance(&mut self, p: &Prepared<'_, B>) {
+        for (pieces, at) in &p.left {
+            self.pools.leave_frozen(pieces, *at);
+        }
         for ((seat, table), kv_less) in p.seats.iter().zip(&p.tables).zip(&p.kv_less) {
             if table.is_empty()
                 && !kv_less
@@ -3616,6 +3664,10 @@ pub struct StepView<'a, B: Serve> {
 
     pub clips: &'a [Clips<'a>],
 
+    /// Each lane's fold as the device counts it, at the lane's index; a
+    /// lane past the end has none.
+    pub folds: &'a [DeviceFold],
+
     pub done: Option<Done>,
 
     pub guests: Option<B::Guests>,
@@ -3624,6 +3676,12 @@ pub struct StepView<'a, B: Serve> {
 pub struct Prepared<'a, B: Serve> {
     pub lanes: &'a [Seated<'a, B>],
     pub done: Option<Done>,
+    /// The fold reports of a step whose completion another pass reports
+    /// (`done` is `None`): its lanes' reports, for that pass to carry.
+    pub wrote: Vec<engine::KvWrites>,
+    /// Where the fire leaves each record it folds
+    /// ([`crate::store::frozen`]), kept once the fire is on its way.
+    left: Vec<(Vec<u32>, Option<u32>)>,
     feeds: Vec<(u32, &'a DeviceCell<B>)>,
     input_copies: Vec<InputCopy<'a, B>>,
     merge_lands: Vec<MergeLand>,

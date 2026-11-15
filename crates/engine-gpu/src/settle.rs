@@ -48,6 +48,23 @@ pub struct Done {
     pub at: engine::StepDone,
 
     pub sink: engine::CompletionSink,
+
+    /// What the step's lanes report when it settles: the slots each fold
+    /// froze, on a fire whose fold length is the device's.
+    pub wrote: Vec<engine::KvWrites>,
+}
+
+impl Done {
+    /// The outcome of a step that settled whole: what its lanes report,
+    /// or plainly committed where none does.
+    #[must_use]
+    pub fn settled(&self) -> engine::StepOutcome {
+        if self.wrote.is_empty() {
+            engine::StepOutcome::Committed
+        } else {
+            engine::StepOutcome::Wrote(self.wrote.clone())
+        }
+    }
 }
 
 impl std::fmt::Debug for Done {

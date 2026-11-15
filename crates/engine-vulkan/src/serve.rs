@@ -218,7 +218,7 @@ impl Serve for Api {
                         counts.leave();
                         if let Some(done) = done.as_ref() {
                             let outcome = match &refused {
-                                None => engine::StepOutcome::Committed,
+                                None => done.settled(),
                                 Some(why) => engine::StepOutcome::Faulted(format!(
                                     "vulkan replay for frame {} step {}: {why}",
                                     done.at.frame, done.at.step
@@ -281,7 +281,7 @@ impl Serve for Api {
                 counts.leave();
                 if let Some(done) = done.as_ref() {
                     let outcome = match &refused {
-                        None => engine::StepOutcome::Committed,
+                        None => done.settled(),
                         Some(why) => engine::StepOutcome::Faulted(format!(
                             "vulkan command buffer for frame {} step {}: {why}",
                             done.at.frame, done.at.step
