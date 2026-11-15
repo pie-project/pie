@@ -247,10 +247,9 @@ pub struct Span<B: Backend> {
     /// For each rung, the carve its fires take ([`Span::widen`]).
     widest: Vec<usize>,
     routers: Vec<u32>,
-    /// The bytes a fire's carve and its capture planes may take together:
-    /// the chunks the pool states for the largest rung ([`Span::widen`]).
-    room: u64,
-    /// The pool's last segment and the byte in it the span ends at.
+    /// The pool's last segment and the byte in it the span ends at: the
+    /// segment is the span a fire's carve and its capture planes may take
+    /// together, and the pool states it so (`ChunkFacts::act_span_chunks`).
     place: Option<(B::Buffer, u64)>,
 }
 
@@ -271,12 +270,10 @@ impl<B: Backend> Span<B> {
             .iter()
             .map(|&tokens| Rung::lay(trace, compiled, budgets, tokens, paging, tuning, &routers))
             .collect::<Result<Vec<_>>>()?;
-        let room = rungs.iter().map(Rung::bytes).max().unwrap_or(0);
         Ok(Span {
             widest: (0..rungs.len()).collect(),
             rungs,
             routers,
-            room,
             place: None,
         })
     }
@@ -396,9 +393,6 @@ impl<B: Backend> Span<B> {
                     .unwrap_or(at)
             })
             .collect();
-        self.room = stated
-            .last()
-            .map_or(self.bytes(), |&(_, chunks)| u64::from(chunks) * chunk_bytes);
     }
 
     /// Where rung `rung`'s carve starts in the span's buffer: the span's
@@ -425,7 +419,7 @@ impl<B: Backend> Span<B> {
         let planes_at = if captured == 0 {
             base
         } else {
-            end - planes_under(at.bytes, at.lifted.bytes(captured), self.room.min(end))?
+            end - planes_under(at.bytes, at.lifted.bytes(captured), end)?
         };
         let mut slots: Vec<Option<Tensor>> = Vec::with_capacity(at.map.placements.len());
         let mut backed: Vec<u32> = Vec::new();
