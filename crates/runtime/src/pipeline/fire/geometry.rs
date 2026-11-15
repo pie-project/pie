@@ -338,11 +338,40 @@ pub enum Fold {
 }
 
 impl Fold {
+    /// Lane `lane`'s fold as the host states it, `None` where the device
+    /// counts it. A list of one entry states every lane's fold, a longer
+    /// one a fold a lane: a lane never takes another lane's count, and a
+    /// list that leaves a lane without one never comes this far
+    /// ([`Fold::states`]).
     pub fn of(&self, lane: usize) -> Option<u32> {
         match self {
             Fold::None => Some(0),
-            Fold::Host(counts) => counts.get(lane).or(counts.first()).copied(),
+            Fold::Host(counts) => match counts.as_slice() {
+                [every] => Some(*every),
+                counts => counts.get(lane).copied(),
+            },
             Fold::Device => None,
+        }
+    }
+
+    /// Refuses the list the host states that leaves one of `lanes` lanes
+    /// without a fold: one of several entries and fewer than the lanes, or
+    /// of none. Such a lane has no count of its own, and a lane with none
+    /// reads as one the device counts.
+    pub fn states(&self, lanes: usize) -> Result<(), EvaluatedGeometryError> {
+        match self {
+            Fold::Host(counts) if counts.len() != 1 && counts.len() < lanes => {
+                Err(EvaluatedGeometryError::BadValue {
+                    port: Port::Fold,
+                    reason: format!(
+                        "it states {} fold(s) for {lanes} lanes; a list of one entry states \
+                         every lane's fold and a longer one a fold a lane, and a lane past it \
+                         takes no other lane's",
+                        counts.len()
+                    ),
+                })
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -742,6 +771,7 @@ pub fn map_geometry_evaluated_with(
             });
         }
     }
+    g.fold.states(lanes)?;
     if let Some(kv_len) = &g.kv_len
         && kv_len.len() != lanes
     {
@@ -940,6 +970,87 @@ mod tests {
         a_decode_whose_slots_the_host_states_keeps_the_envelope_path();
         a_decode_stating_no_slots_is_not_pooled();
         a_decode_another_pass_lays_out_is_pooled_device_geometry();
+        a_fold_list_states_every_lanes_fold_or_a_fold_a_lane();
+    }
+
+    /// A fold list of one entry is every lane's fold and a longer one a
+    /// fold a lane. One that leaves a lane without a count is refused by
+    /// name where the fire's geometry is evaluated: the lane takes neither
+    /// the first lane's count nor the device's.
+    fn a_fold_list_states_every_lanes_fold_or_a_fold_a_lane() {
+        use eta_compiler::eval::interp::Value;
+        use eta_ir::registry::EngineCaps;
+
+        let every = Fold::Host(vec![3]);
+        assert_eq!((every.of(0), every.of(5)), (Some(3), Some(3)));
+        assert!(every.states(6).is_ok());
+        let each = Fold::Host(vec![3, 4, 5]);
+        assert_eq!(
+            (each.of(0), each.of(2), each.of(3)),
+            (Some(3), Some(5), None),
+            "a lane past the list takes no other lane's count"
+        );
+        assert!(each.states(3).is_ok());
+        assert!(
+            each.states(2).is_ok(),
+            "a list past the lanes is left alone"
+        );
+        for (short, lanes) in [(vec![3, 4], 3), (Vec::new(), 1)] {
+            let stated = short.len();
+            let refused = Fold::Host(short).states(lanes).unwrap_err().to_string();
+            assert!(
+                refused.contains(&format!("it states {stated} fold(s) for {lanes} lanes")),
+                "{refused}"
+            );
+        }
+        assert!(Fold::Host(Vec::new()).states(0).is_ok());
+        assert!(Fold::None.states(3).is_ok() && Fold::Device.states(3).is_ok());
+
+        // Three lanes of a row each, their fold a list the host evaluates.
+        let mut container = decode(
+            3,
+            &[
+                (Port::EmbedIndptr, Shape::vector(4), Dtype::U32),
+                (Port::Fold, Shape::vector(3), Dtype::U32),
+            ],
+        );
+        container.stages[0].ops = vec![Op::ChanTake(0), Op::ChanPut { chan: 0, value: 0 }];
+        let logits = eta_ir::registry::OutputDecl {
+            name: "logits".into(),
+            axis: eta_ir::registry::Axis::Row,
+            width: 16,
+            dtype: Dtype::F32,
+            layers: 0,
+            readout: true,
+        };
+        let bound = eta_ir::validate::bind(container, vec![vec![logits]], EngineCaps::default())
+            .expect("the decode binds");
+        let mapped = |fold: Vec<u32>| {
+            let mut known = |channel: u32| {
+                Some(match channel {
+                    0 => Value::I32(vec![7, 8, 9]),
+                    1 => Value::U32(vec![0, 1, 2, 3]),
+                    _ => Value::U32(fold.clone()),
+                })
+            };
+            map_geometry_evaluated_with(&bound, &mut known, PortMask::NONE)
+                .map(|(geometry, _)| geometry.fold)
+        };
+        assert_eq!(mapped(vec![2]).ok(), Some(Fold::Host(vec![2])));
+        assert_eq!(mapped(vec![2, 0, 1]).ok(), Some(Fold::Host(vec![2, 0, 1])));
+        for short in [vec![2, 1], Vec::new()] {
+            let stated = short.len();
+            match mapped(short) {
+                Err(EvaluatedGeometryError::BadValue {
+                    port: Port::Fold,
+                    reason,
+                }) => assert!(
+                    reason.contains(&format!("it states {stated} fold(s) for 3 lanes")),
+                    "{reason}"
+                ),
+                other => panic!("a fold list short of its lanes maps: {other:?}"),
+            }
+        }
     }
 
     fn a_decode_another_pass_lays_out_is_pooled_device_geometry() {

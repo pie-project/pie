@@ -123,6 +123,14 @@ pub struct Xla {
     sink: Option<engine::CompletionSink>,
     /// The adapter each instance bound: its id (first `Adapter` slot).
     adapters: BTreeMap<InstanceId, u32>,
+    /// Per state record (its first piece's slot ref, [`record_key`]), how
+    /// far a device-counted fold this engine resolved has frozen it: the
+    /// runtime's `RsVerb::Buffer::folded` lags such a fold until its fire
+    /// settles, so a fire staged before then replays from here, not from
+    /// the stale count. A fork reads the record its parent wrote, so it
+    /// finds the parent's; a device slot copy carries it; leaving the
+    /// device with one unsettled is the runtime's to wait out.
+    rs_ahead: BTreeMap<u64, u32>,
     /// What the engine counts while it serves, read by the runtime: a
     /// program a fire waited on (Compiled), a guest pass the host
     /// interprets (Fallback), a frame or registration refused (Refused).
@@ -158,6 +166,7 @@ impl Xla {
             sink: None,
             programs: crate::program::Plane::default(),
             adapters: BTreeMap::new(),
+            rs_ahead: BTreeMap::new(),
             pending: None,
             latches: Vec::new(),
             live: engine::live::Live::armed(),
@@ -363,11 +372,16 @@ impl Xla {
                 step: index as u32,
             };
             let latch = crate::program::Latch::new(at, self.sink.clone());
-            let (ticket, settle) = if step.lanes.iter().any(|l| !l.rs_snapshots.is_empty()) {
-                self.fire_snapshotting(step, &latch)?
+            // A step refused before it fires leaves no device fold's
+            // position behind: what it noted of where its folds would leave
+            // their states goes with it (its latched report is never told).
+            let ahead = self.rs_ahead.clone();
+            let fired = if step.lanes.iter().any(|l| !l.rs_snapshots.is_empty()) {
+                self.fire_snapshotting(step, &latch)
             } else {
-                self.fire_step(step, &latch)?
+                self.fire_step(step, &latch)
             };
+            let (ticket, settle) = fired.inspect_err(|_| self.rs_ahead = ahead)?;
             // The submitter's hold: the step is done once its passes land.
             latch.release(Ok(()));
             steps.push(ticket);
@@ -907,6 +921,16 @@ impl Engine for Xla {
                 engine: "xla",
             });
         };
+        // A state record copied carries where a device fold left it, keyed
+        // by its tier too: each tier numbers its slot refs from 0, so a
+        // host ref is not the device ref of the same number.
+        for &(src, dst) in &copy.slots {
+            let (src, dst) = (tier_key(from, copy.shape, src), tier_key(to, copy.shape, dst));
+            match self.rs_ahead.get(&src).copied() {
+                Some(at) => self.rs_ahead.insert(dst, at),
+                None => self.rs_ahead.remove(&dst),
+            };
+        }
         let shell = self.loaded_mut()?;
         if from != Tier::Device || to != Tier::Device {
             // Between tiers (CONTRACT-BC 22): whole slots, laid alike.
@@ -989,6 +1013,10 @@ struct DeviceLane {
     mask: Option<engine::fire::Masking>,
     /// The lane's windowed ids for `pages`, when the runtime handed any.
     window: Option<Vec<u32>>,
+    /// One past the last slot the lane's rows land at, in its set's own
+    /// slot numbering: its stated slots' highest, else what it held and its
+    /// rows (`engine::KvWrites::end`).
+    end: Option<u32>,
 }
 
 impl Xla {
@@ -1144,6 +1172,10 @@ impl Xla {
                         .map(<[u32]>::to_vec),
                     None => None,
                 };
+                let end = match slots {
+                    Some(slots) => slots.iter().max().map(|&slot| slot + 1),
+                    None => have.map(|have| have + rows as u32),
+                };
                 out[source] = Some(DeviceLane {
                     tokens,
                     positions,
@@ -1153,6 +1185,7 @@ impl Xla {
                     first,
                     mask,
                     window,
+                    end,
                 });
             }
         }
@@ -1416,6 +1449,34 @@ impl Xla {
             .iter()
             .map(|lane| lane.rs.clone())
             .collect();
+        // The lanes whose fold length was the device's, resolved here.
+        let mut device_folds = vec![false; submission.lanes.len()];
+        // A state a device-counted fold froze past what the runtime counts
+        // replays from where the fold left it.
+        for (lane, verb) in submission.lanes.iter().zip(verbs.iter_mut()) {
+            let Some((read, write)) = record_key(lane) else {
+                continue;
+            };
+            // A state starting afresh holds nothing an earlier fold froze.
+            let fresh = match lane.rs_reset {
+                engine::fire::RsReset::Fresh => true,
+                engine::fire::RsReset::Inferred => lane.kv.held == 0,
+                engine::fire::RsReset::Held => false,
+            };
+            if fresh {
+                self.rs_ahead.remove(&write);
+                continue;
+            }
+            if let engine::fire::RsVerb::Buffer { folded, .. } = verb {
+                match self.rs_ahead.get(&read).copied() {
+                    Some(ahead) if ahead > *folded => *folded = ahead,
+                    Some(_) if read == write => {
+                        self.rs_ahead.remove(&read);
+                    }
+                    _ => {}
+                }
+            }
+        }
         for attachment in &submission.attachments {
             if let engine::fire::RsVerb::Buffer { fold, .. } = &mut verbs[attachment.lane as usize]
                 && *fold == engine::fire::FoldLen::Device
@@ -1425,8 +1486,75 @@ impl Xla {
                     .map_err(refusal)?
             {
                 *fold = engine::fire::FoldLen::Host(n);
+                device_folds[attachment.lane as usize] = true;
             }
         }
+        // Where each device-counted fold leaves its state, for the fires
+        // staged before this one settles.
+        for (at, lane) in submission.lanes.iter().enumerate() {
+            if let (
+                engine::fire::RsVerb::Buffer {
+                    folded,
+                    fold: engine::fire::FoldLen::Host(n),
+                    ..
+                },
+                Some((_, slot)),
+                true,
+            ) = (&verbs[at], record_key(lane), device_folds[at])
+            {
+                let first = device
+                    .get(at)
+                    .and_then(Option::as_ref)
+                    .and_then(|p| p.first.or(p.have))
+                    .unwrap_or(lane.kv.held);
+                let to = folded
+                    .saturating_add(*n)
+                    .min(first + lane.tokens.len() as u32);
+                self.rs_ahead.insert(slot, to);
+            }
+        }
+        // What each reported lane wrote, told when the step lands: one past
+        // the last slot its rows landed at (the runtime bounds what a
+        // device-placed lane carries by it, `engine::fire::rung_rows`), and
+        // where its fold length was the device's, the slots this fire's fold
+        // froze, clamped to its rows' end as the plan clamps it
+        // (`engine::rs::LanePlan::of`).
+        latch.report(
+            submission
+                .lanes
+                .iter()
+                .enumerate()
+                .filter(|(_, lane)| lane.reports != 0)
+                .map(|(at, lane)| {
+                    let rows = lane.tokens.len() as u32;
+                    let placed = device.get(at).and_then(Option::as_ref);
+                    let first = placed
+                        .and_then(|p| p.first.or(p.have))
+                        .unwrap_or(lane.kv.held);
+                    let end = match placed {
+                        Some(placed) => placed.end,
+                        None => (!lane.kv_less).then_some(first + rows),
+                    };
+                    let fold = match &verbs[at] {
+                        engine::fire::RsVerb::Buffer {
+                            folded,
+                            fold: engine::fire::FoldLen::Host(n),
+                            ..
+                        } if device_folds[at] => {
+                            let to = folded.saturating_add(*n).min(first + rows);
+                            Some(to.saturating_sub(*folded))
+                        }
+                        _ => None,
+                    };
+                    engine::KvWrites {
+                        tag: lane.reports,
+                        fold,
+                        end,
+                        ..engine::KvWrites::default()
+                    }
+                })
+                .collect(),
+        );
 
         let mut lane_adapters: Vec<Option<u32>> = vec![None; submission.lanes.len()];
         for attachment in &submission.attachments {
@@ -1672,4 +1800,48 @@ fn table_of(lane: &engine::fire::Lane, id: engine::chunk::ShapeId) -> Option<&[u
         .iter()
         .find(|(held, _)| *held == id)
         .map(|(_, table)| table.as_slice())
+}
+
+/// A device slot ref of shape `shape` as one key.
+fn ref_key(shape: engine::chunk::ShapeId, slot: u32) -> u64 {
+    (u64::from(shape.0) << 32) | u64::from(slot)
+}
+
+/// A slot ref of shape `shape` on `tier` as one key: a device ref's is its
+/// [`ref_key`], what a lane's record reads; the host tier's and the slot
+/// file's stand apart from it.
+fn tier_key(tier: crate::serve::Tier, shape: engine::chunk::ShapeId, slot: u32) -> u64 {
+    let tag: u64 = match tier {
+        crate::serve::Tier::Device => 0,
+        crate::serve::Tier::Host => 1,
+        crate::serve::Tier::Disk => 2,
+    };
+    (tag << 62) | ref_key(shape, slot)
+}
+
+/// The state record a lane reads and the one it writes: its first fixed
+/// shape's first piece, `[run, cow]` (a fork's `cow` differs), else the
+/// recurrent-state row the runtime assigned it.
+fn record_key(lane: &engine::fire::Lane) -> Option<(u64, u64)> {
+    match lane.fixed.first().and_then(|(id, pieces)| Some((*id, pieces.first()?))) {
+        Some((id, &[run, cow])) => Some((ref_key(id, run), ref_key(id, cow))),
+        None => lane.rs_slot.map(|slot| (u64::from(slot), u64::from(slot))),
+    }
+}
+
+#[cfg(test)]
+mod tier_key_tests {
+    use super::{ref_key, tier_key};
+    use crate::serve::Tier;
+
+    /// A host or slot-file ref never keys as the device ref of the same
+    /// number, and a device ref keys as what a lane's record reads.
+    #[test]
+    fn a_tier_keys_its_refs_apart() {
+        let shape = engine::chunk::ShapeId((1 << 17) + 2);
+        assert_eq!(tier_key(Tier::Device, shape, 3), ref_key(shape, 3));
+        assert_ne!(tier_key(Tier::Host, shape, 3), ref_key(shape, 3));
+        assert_ne!(tier_key(Tier::Disk, shape, 3), ref_key(shape, 3));
+        assert_ne!(tier_key(Tier::Host, shape, 3), tier_key(Tier::Disk, shape, 3));
+    }
 }

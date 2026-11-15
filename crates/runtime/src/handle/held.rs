@@ -112,6 +112,11 @@ impl Held {
         let Parts { kv, rs, cursor } = self.parts();
         let rs_child = match rs {
             Some(rs) => {
+                // A fold the device counts settles first: the child takes
+                // the frozen length it leaves, or the fork is refused as the
+                // fire's failure.
+                let stores = store_registry::get(rs.model, rs.engine);
+                crate::store::rs::device_folds_settled(&stores.rs, &[rs.id]).await;
                 let id = rs_settled(rs, |store| store.fork(rs.id))
                     .await?
                     .map_err(|error| error.to_string())?;
@@ -119,6 +124,14 @@ impl Held {
             }
             None => None,
         };
+        // Parked, the set has no fire on its way: a frozen length a fold
+        // left unknown stays so, and the child would state the bound.
+        if let Err(why) = cursor.at_rest() {
+            if let Some(rs) = rs_child {
+                rs.release();
+            }
+            return Err(why.to_string());
+        }
         let child = settled(kv, "handle-fork", |store| store.fork(kv.id)).await;
         match child {
             Ok(child) => Ok(Held::park(
@@ -283,4 +296,119 @@ fn demand(kv_pages: u32, rs: Option<&RsWorkingSet>) -> Option<Demand> {
         rs: rs.map(rs_units).unwrap_or_default(),
     };
     (!demand.is_zero()).then_some(demand)
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use futures::FutureExt;
+
+    use super::*;
+    use crate::store::rs::{RsGeometry, RsWorkingSetId};
+
+    pub(in crate::handle) const DEVICE_LOST: &str = "pipeline: forward failed: device lost";
+
+    /// A parked set whose recurrent state is frozen at 4, a fire that folds
+    /// it by a count the device computes still on its way.
+    pub(in crate::handle) fn folding() -> (Held, store_registry::Stores, RsWorkingSetId) {
+        let model = store_registry::register_model(4, &[8], &[2]);
+        let stores = store_registry::get(model, 0);
+        let kv = stores.kv.lock().create_working_set();
+        let geom = RsGeometry {
+            state_size: 8,
+            buffer_page_tokens: 4,
+        };
+        let rs = {
+            let mut store = stores.rs.lock().unwrap();
+            let ws = store.create_working_set(geom);
+            let written = store
+                .prepare_group(ws, true, false, None, None, None)
+                .unwrap();
+            let published = store.publish_prepared(written).unwrap();
+            store.settle(published);
+            store.fold(ws, 4);
+            store.begin_device_fold(ws);
+            ws
+        };
+        let held = Held::park(
+            ProcessId::new_v4(),
+            KvWorkingSet::new(model, 0, kv, 4),
+            Some(RsWorkingSet::new(model, 0, rs, geom)),
+            Cursor::default(),
+        );
+        (held, stores, rs)
+    }
+
+    /// A parked set that keeps no recurrent state, its cursor as `cursor`.
+    pub(in crate::handle) fn parked(cursor: Cursor) -> Held {
+        let model = store_registry::register_model(4, &[8], &[2]);
+        let stores = store_registry::get(model, 0);
+        let kv = stores.kv.lock().create_working_set();
+        Held::park(
+            ProcessId::new_v4(),
+            KvWorkingSet::new(model, 0, kv, 4),
+            None,
+            cursor,
+        )
+    }
+
+    /// A cursor whose frozen length a fold left unknown: the fire that was
+    /// to place it never did.
+    pub(in crate::handle) fn unplaced() -> Cursor {
+        Cursor {
+            folded_exact: false,
+            unsettled: 1,
+            ..Cursor::default()
+        }
+    }
+
+    /// A parked set has no fire on its way, so a frozen length a fold left
+    /// unknown stays unknown: its fork is refused by name, never handed the
+    /// bound. One at rest forks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fork_of_a_set_whose_frozen_length_is_not_known_is_refused_by_name() {
+        let bound = parked(unplaced());
+        let refused = bound
+            .fork(ProcessId::new_v4())
+            .now_or_never()
+            .expect("there is nothing to wait for")
+            .expect_err("the child would state a bound");
+        assert_eq!(refused, Cursor::UNPLACED);
+        let child = parked(Cursor::default()).fork(ProcessId::new_v4()).await;
+        let child = child.expect("its frozen length is known");
+        assert!(child.parts().cursor.at_rest().is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fork_waits_for_a_fold_the_device_counts() {
+        let (held, stores, rs) = folding();
+        let mut fork = Box::pin(held.fork(ProcessId::new_v4()));
+        assert!(
+            fork.as_mut().now_or_never().is_none(),
+            "the frozen length is behind the record until the fold settles"
+        );
+        stores.rs.lock().unwrap().end_device_fold(rs, Some(3), None);
+        let child = fork.await.expect("the fold settled");
+        let child = child.parts().rs.as_ref().expect("its state forks").id;
+        assert_eq!(
+            stores.rs.lock().unwrap().frozen(child),
+            Ok(7),
+            "the child takes what the fold left"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fork_is_refused_by_the_failure_of_the_fold_it_waited_for() {
+        let (held, stores, rs) = folding();
+        let mut fork = Box::pin(held.fork(ProcessId::new_v4()));
+        assert!(fork.as_mut().now_or_never().is_none());
+        stores
+            .rs
+            .lock()
+            .unwrap()
+            .end_device_fold(rs, None, Some(DEVICE_LOST));
+        let refused = fork
+            .await
+            .expect_err("how far its record is folded is not known");
+        assert!(refused.contains(DEVICE_LOST), "{refused}");
+    }
 }

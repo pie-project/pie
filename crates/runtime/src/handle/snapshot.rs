@@ -123,6 +123,10 @@ struct SavedCursor {
     folded: u32,
     tail: Option<u32>,
     reserved: u32,
+    /// One past the highest slot written ([`Cursor::written`]); a manifest
+    /// that states none wrote inside what it reserved.
+    #[serde(default)]
+    written: Option<u32>,
     spans: Vec<(u32, u32, u32)>,
 }
 
@@ -557,12 +561,21 @@ pub(super) async fn save(held: &Held, tenant: &str, name: &str) -> Result<Value,
     let wrote = async {
         let rs_set = match rs {
             Some(rs) => {
+                // What is kept states the frozen length a fold the device
+                // counts leaves: it settles first, and one that failed
+                // refuses the save by name.
+                crate::store::rs::device_folds_settled(&stores.rs, &[rs.id]).await;
                 let set = stores.rs.lock().unwrap().export(rs.id);
                 let set = set.map_err(|error| failed("reading recurrent state", error))?;
                 Some((rs, set))
             }
             None => None,
         };
+        // What is kept states the cursor's frozen length too, and a load
+        // takes it as exact: a bound is not kept.
+        cursor
+            .at_rest()
+            .map_err(|why| failed("reading the frozen length", why))?;
         let state = match &rs_set {
             Some((rs, set)) => Some(read_state(kv.engine, rs, set).await?),
             None => None,
@@ -791,6 +804,7 @@ async fn finish(
             folded: cursor.folded,
             tail: cursor.tail,
             reserved: cursor.reserved,
+            written: Some(cursor.written_end()),
             spans: cursor.spans.clone(),
         },
         page_len: set.page_len,
@@ -948,6 +962,8 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
         unsettled: 0,
         tail: cursor.tail,
         reserved: cursor.reserved,
+        written: cursor.written.unwrap_or(cursor.reserved),
+        staged: Vec::new(),
         spans: cursor.spans,
     };
     Ok(Held::park(holder, kv, rs, cursor))
@@ -1140,6 +1156,60 @@ mod tests {
         assert!(shared.join("theirs").exists(), "a snapshot links it");
         assert!(shared.join("unnamed").exists(), "not this save's");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// What a save keeps states the frozen length: it waits for a fold the
+    /// device counts, and one that failed refuses it by name, before any
+    /// byte of the record is read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_save_waits_for_a_fold_the_device_counts_and_is_refused_by_its_failure() {
+        use futures::FutureExt;
+
+        use crate::handle::held::tests::{DEVICE_LOST, folding};
+        configure(
+            std::env::temp_dir().join(format!("pie-snapshots-{}", Uuid::new_v4())),
+            u64::MAX,
+        );
+        let (held, stores, rs) = folding();
+        let mut saving = Box::pin(save(&held, "tenant", "kept"));
+        assert!(
+            saving.as_mut().now_or_never().is_none(),
+            "the frozen length is behind the record until the fold settles"
+        );
+        stores
+            .rs
+            .lock()
+            .unwrap()
+            .end_device_fold(rs, None, Some(DEVICE_LOST));
+        let refused = saving.await.expect_err("its length is not known");
+        assert!(
+            refused.message.contains("reading recurrent state")
+                && refused.message.contains(DEVICE_LOST),
+            "{}",
+            refused.message
+        );
+    }
+
+    /// What a save keeps states the cursor's frozen length, and a load
+    /// takes it as exact: a set whose length a fold left unknown is refused
+    /// by name, before any byte of it is read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_save_of_a_set_whose_frozen_length_is_not_known_is_refused_by_name() {
+        use crate::handle::held::tests::{parked, unplaced};
+        use crate::inferlet::host::working_set::Cursor;
+        configure(
+            std::env::temp_dir().join(format!("pie-snapshots-{}", Uuid::new_v4())),
+            u64::MAX,
+        );
+        let held = parked(unplaced());
+        let refused = save(&held, "tenant", "bound").await;
+        let refused = refused.expect_err("a bound is not kept");
+        assert!(
+            refused.message.contains("reading the frozen length")
+                && refused.message.contains(Cursor::UNPLACED),
+            "{}",
+            refused.message
+        );
     }
 
     #[test]

@@ -335,6 +335,21 @@ impl Shell {
         to: crate::store::Tier,
         pairs: &[(u32, u32)],
     ) -> crate::Result<()> {
+        // A record that leaves the device, or arrives on it, moves when the
+        // runtime's count of its folds has caught up (it moves no set with
+        // a device-counted fold unsettled): what a fold left ahead of that
+        // count belongs to neither the slot it left nor the one it lands
+        // in, and a later record seated there must not inherit it.
+        if shape == crate::store::layout::FIXED {
+            for &(src, dst) in pairs {
+                if from == crate::store::Tier::Device {
+                    self.rs_ahead.remove(&src);
+                }
+                if to == crate::store::Tier::Device {
+                    self.rs_ahead.remove(&dst);
+                }
+            }
+        }
         let swap = (!super::diag::on().tier_inline).then(|| self.device.swap_stream());
         self.pools
             .copy_tier_slots(self.device.stream(), swap, shape, from, to, pairs)

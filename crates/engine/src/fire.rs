@@ -544,39 +544,75 @@ pub enum RsVerb {
     #[default]
     Fold,
     /// Replays the buffered slots `folded..first` its mask admits, then freezes
-    /// `fold` slots past `folded` into the state.
+    /// `fold` slots past the row the record stands at into the state.
     Buffer {
         /// The buffer's pages: token `t` of page `p` holds slot
         /// `base + p * page + t`.
         pages: Vec<u32>,
         base: u32,
+        /// How far the record is folded, as the runtime knew it when it
+        /// staged the fire. Exact for a set whose folds are the host's
+        /// ([`FoldLen::Host`]): the runtime counts those as it stages them.
+        /// For a set whose fold length is the device's
+        /// ([`FoldLen::Device`]) it is a lower bound: such a fold's count
+        /// reaches the runtime only when its fire settles
+        /// ([`crate::KvWrites::fold`]), and the set's later fires are
+        /// staged before that. The record is the engine's: it replays from
+        /// where its record stands, `max(folded, the row its last fold left
+        /// the record at)`, and freezes `fold` slots past that row. The
+        /// engine keeps that row with the record across every copy of the
+        /// record's slot it makes on the runtime's behalf (a fork's copy);
+        /// it need not survive a move between tiers or an export of the
+        /// record's bytes: the runtime does not fork, checkpoint, export or
+        /// move between tiers a set with such a fire on its way until that
+        /// fire settles, so wherever the record leaves the engine's table
+        /// the stated number is exact again.
         folded: u32,
         fold: FoldLen,
     },
 }
 
-/// The most recurrent rows a lane carries unfolded into a fire: rows
-/// earlier fires wrote and nothing has folded yet, which the fire replays
-/// ahead of its own. The fire's own rows never count against it.
+/// The rows a fire asks its activation rung for: `own` rows of its lanes,
+/// and `carried` recurrent rows, those earlier fires wrote and nothing has
+/// folded yet, which the fire replays ahead of its own.
 ///
-/// The runtime refuses, before anything is submitted, a host-placed pass
-/// whose lane carries more in, or whose host fold leaves more unfolded
-/// behind it; an engine sizes a lane's rs replay scratch as the fire's own
-/// rows plus this.
+/// The contract on carried rows, with no stated limit: a rung's replay
+/// scratch holds at least the rung's tokens of carried rows; a fire carries
+/// at most its rung's tokens; the runtime asks the rung for max(own,
+/// carried) and refuses past the largest rung.
 ///
-/// A device-geometry fire picks where its rows land on the device, so the
-/// host cannot bound what it carries in. Its engine must: a lane replaying
-/// more than this many carried rows never writes past its scratch; the
-/// kernel clamps and the engine reports the fire failed, never a silent
-/// overrun. CUDA's walked path already sizes its scratch for what its lanes
-/// replay (`replayed` beside `REPLAYED` in `Run::rs_layout` and
-/// `serve::prepare`).
-///
-/// A stated limit, not a derived value: 16 covers the deepest speculative
-/// draft served today (15 drafts and the row they follow). It could be
-/// derived instead, from the model's MTP head count or from a draft depth
-/// the inferlet declares in its manifest; that is a possible follow-up.
-pub const UNFOLDED_ROWS: u32 = 16;
+/// - The engine: at rung `r` a fire's replay scratch holds at least `r` own
+///   rows and `r` carried rows, in extended rows (the recurrent layers' rows
+///   only). It is a floor, what the runtime relies on (a fire granted rung
+///   `r` may carry `r`); an engine may lay more.
+/// - The runtime: a fire carrying more than its rung's tokens raises the
+///   rung as a wider fire does; one carrying more than the largest rung's
+///   tokens is refused by name, before anything is submitted. The counts
+///   are a fire's, summed over its lanes.
+/// - Device geometry: a lane's carried rows are the buffered slots between
+///   its state and its first row that its mask admits (`folded..first`,
+///   [`buffered_reads`]). Where the device says where a lane's rows land,
+///   both ends are its program's (`fold` and `slots`), resolved at the
+///   engine's prepare, after the lane's earlier fires have run: no count
+///   exists when the runtime asks. The runtime states a bound in its place,
+///   the rows that can stand unfolded in the lane's working set when the
+///   fire runs: those between the state's frozen length and the set's
+///   written end (one past the highest slot a settled fire wrote; a lane
+///   that rewinds leaves the rows past it buffered, so the end only
+///   rises), and every row of the set's device-placed fires staged and not
+///   yet settled. It asks the rung for max(own, that bound) summed over the
+///   fire's lanes, and refuses past the largest rung as for any fire. An
+///   engine that takes such fires reports where each lane's rows ended
+///   when the fire settles ([`crate::KvWrites::end`]); a fire that reports
+///   none is taken to have written as far as its set reserved. The
+///   engine's check where the count resolves is a fault for a wrong count
+///   only (a mask admitting slots nobody wrote): a fire whose lanes replay
+///   more than the tokens of the rung it runs at, summed over them, is
+///   refused by name at prepare and writes nothing.
+#[must_use]
+pub fn rung_rows(own: u32, carried: u32) -> u32 {
+    own.max(carried)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FoldLen {

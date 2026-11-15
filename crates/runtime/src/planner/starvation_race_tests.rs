@@ -992,6 +992,86 @@ async fn a_lane_holding_the_whole_state_pool_is_told_so() {
     );
 }
 
+/// An eviction moves its victim's recurrent state off the device, where
+/// the engine's own count of how far a record is folded does not follow:
+/// it waits for a fold the device counts to settle, as it waits for the
+/// fires, and goes on when it has, whichever way the fire ended. One whose
+/// folds the host counted waits for nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn an_eviction_waits_for_a_fold_the_device_counts() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    use crate::inferlet::process::residency::{ProcessResidency, register_residency};
+    use crate::store::rs::RsGeometry;
+    use futures::FutureExt;
+
+    for (device_counted, failure) in [
+        (false, None),
+        (true, None),
+        (true, Some("pipeline: forward failed: device lost")),
+    ] {
+        // No host rows: an eviction that gets as far as asking the store
+        // finds the host short and ends there, with no engine to copy.
+        let model = crate::store::registry::register_model(16, &[4], &[2]);
+        let stores = crate::store::registry::get(model, 0);
+        let ws = {
+            let mut rs = stores.rs.lock().unwrap();
+            let ws = rs.create_working_set(RsGeometry {
+                state_size: 64,
+                buffer_page_tokens: 4,
+            });
+            let folded = rs.prepare_group(ws, true, false, None, None, None).unwrap();
+            let published = rs.publish_prepared(folded).unwrap();
+            rs.settle(published);
+            rs.fold(ws, 4);
+            if device_counted {
+                rs.begin_device_fold(ws);
+            }
+            ws
+        };
+        let pid = ProcessId::new_v4();
+        let residency = Arc::new(std::sync::Mutex::new(ProcessResidency::default()));
+        residency
+            .lock()
+            .unwrap()
+            .rs_working_sets
+            .insert((model, 0, ws));
+        register_residency(pid, Arc::downgrade(&residency));
+        let pool = RacePool {
+            rs_model: Some(model),
+            ..RacePool::new(0)
+        };
+        let planner = Arc::new(ResidencyPlanner::new(Arc::new(pool)));
+        planner.register(pid);
+        planner.note_admitted(pid);
+
+        let mut evicting = Box::pin(super::exec::evict(planner.clone(), pid));
+        let asked = evicting.as_mut().now_or_never().is_some();
+        assert_eq!(
+            asked, !device_counted,
+            "only a fold the device counts keeps the suspend waiting"
+        );
+        if device_counted {
+            stores
+                .rs
+                .lock()
+                .unwrap()
+                .end_device_fold(ws, failure.is_none().then_some(3), failure);
+            assert!(
+                evicting.as_mut().now_or_never().is_some(),
+                "the fold's end is what it waited for"
+            );
+        }
+        assert_eq!(
+            stores.rs.lock().unwrap().frozen(ws),
+            Ok(if device_counted && failure.is_none() {
+                7
+            } else {
+                4
+            })
+        );
+    }
+}
+
 /// A windowed model's store: a shared pool whose one window list keeps 32
 /// tokens over 16-token slots, a slot a chunk, 7 slots beside the null
 /// chunk.

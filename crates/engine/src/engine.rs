@@ -36,7 +36,25 @@ pub struct KvWrites {
     pub positions: Vec<u32>,
     pub pages: Vec<u32>,
     pub offsets: Vec<u32>,
+    /// The slots this fire's fold froze for the lane: a count, this fire's
+    /// alone (not a running total, not a position), after the engine's
+    /// clamp to the fire's end; `Some(0)` where it froze none. The runtime
+    /// adds it to the set's frozen length when the fire settles, for its
+    /// kv and its recurrent state alike. An engine reports it for every
+    /// lane that asks a report on a fire whose fold length is the device's
+    /// ([`crate::fire::FoldLen::Device`]). `None` there freezes nothing,
+    /// and the runtime fails the set by name when the fire settles: the
+    /// engine's record went on by a count the runtime never takes, so the
+    /// set is not forked, checkpointed, exported or moved from then on, and
+    /// every later fire of it carries all the lane wrote since.
     pub fold: Option<u32>,
+    /// One past the last slot the lane's rows landed at, in the set's own
+    /// slot numbering: a position. `None` where the engine does not tell
+    /// it; the set is then taken to have written as far as it reserved
+    /// ([`crate::fire::rung_rows`], device geometry). `end` and `fold` are
+    /// one report: an engine that reports `end` for a lane whose fire
+    /// folds on the device reports `fold` too.
+    pub end: Option<u32>,
 }
 
 pub type CompletionSink = std::sync::Arc<dyn Fn(StepDone, StepOutcome) + Send + Sync>;
@@ -223,6 +241,12 @@ pub trait Engine: Send {
         Err(self.unsupported("register_adapter"))
     }
 
+    /// Submits a frame's steps. A submit that returns `Err`, or a step
+    /// that settles [`StepOutcome::Faulted`], fails its pipeline; the sets
+    /// that pipeline owns cannot be claimed by another. Nothing replays
+    /// from what such a step left. A position an engine keeps by slot
+    /// still goes back where a refused step found it: the slot outlives
+    /// the set, and its next tenant must not meet it.
     fn submit(&mut self, frame: &FrameSubmission) -> Result<FrameTicket>;
 
     /// Backs the pool's first `segments` segments
@@ -340,6 +364,11 @@ pub trait Engine: Send {
         false
     }
 
+    /// Where a step's outcome goes. An engine that settles asynchronously
+    /// answers every step here. One that settles inside
+    /// [`Engine::submit`] answers through `submit`'s result: of what it
+    /// tells here only what a step's lanes wrote ([`StepOutcome::Wrote`])
+    /// is heard, and it is told before `submit` returns.
     fn on_complete(&mut self, sink: CompletionSink) {
         let _ = sink;
     }

@@ -168,7 +168,7 @@ fn fault(fault: Fault) -> Error {
             Error::Program(fault.to_string())
         }
         Fault::Fire(_) => Error::Invalid(fault.to_string()),
-        Fault::Residency(_) => Error::Impossible(fault.to_string()),
+        Fault::Residency(_) | Fault::FitShort(_) => Error::Impossible(fault.to_string()),
     }
 }
 
@@ -477,74 +477,102 @@ impl Engine for Metal {
         // the width halves until it fits: a narrower prefill fire is slower,
         // a refused load serves nothing.
         let mut budgets = budgets;
-        let mut prepared = loop {
-            let room = accounting(weights, 0).pool.saturating_sub(kv_pool) / 2;
-            let mut fitted = poem_compiler::fit_voxels(
-                &trace,
-                poem_compiler::Budgets {
-                    tokens: bake_budgets(&budgets, &trace),
-                    patches: patch_ladder(&trace, &budgets),
-                    voxels: poem_compiler::VoxelLadder::of(
-                        &trace,
-                        budgets.max_voxels,
-                        budgets.max_clips,
-                        budgets.max_lanes,
-                    ),
-                },
-                &DeviceProfile::default(),
-                room,
-            );
-            let slots = match slots {
-                0 => poem_compiler::fit_frame_slots(
+        // The widest fire's activation (its carve, its rs scratch, its
+        // staged rows) beside one working set past the allowance: the fit
+        // refuses, and the widest fire halves until it fits, once at load
+        // (nothing narrows while serving). What was cut and why is told once.
+        let asked = budgets.max_tokens;
+        let mut cut: Option<engine::chunk::FitShort> = None;
+        let mut shell = loop {
+            let mut prepared = loop {
+                let room = accounting(weights, 0).pool.saturating_sub(kv_pool) / 2;
+                let mut fitted = poem_compiler::fit_voxels(
                     &trace,
-                    fitted.voxels.as_mut(),
+                    poem_compiler::Budgets {
+                        tokens: bake_budgets(&budgets, &trace),
+                        patches: patch_ladder(&trace, &budgets),
+                        voxels: poem_compiler::VoxelLadder::of(
+                            &trace,
+                            budgets.max_voxels,
+                            budgets.max_clips,
+                            budgets.max_lanes,
+                        ),
+                    },
+                    &DeviceProfile::default(),
                     room,
-                    engine::fit::least_state_slots(1),
-                    frames_in_flight,
-                ),
-                slots => slots,
-            };
-            let voxels = fitted.voxels;
-            let prepared = Shell::prepare(Boot {
-                trace: trace.clone(),
-                contract: &contract,
-                checkpoint: &path,
-                budget: bake_budgets(&budgets, &trace),
-                patches: patch_ladder(&trace, &budgets),
-                voxels,
-                profile: None::<DeviceProfile>,
-                page_size: budgets.page_size,
-                context: budgets.max_context,
-                slots,
-                kv_budget: residency.device_kv_budget,
-                allowance: residency.device,
-                runahead: engine::runahead::Runahead::of(frames_in_flight),
-                residency: experts::Plan::default(),
-                profiles: self.boot.profiles.clone(),
-            })
-            .map_err(fault)?;
-            let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
-            if narrower >= budgets.max_tokens
-                || accounting(weights, prepared.arena_bytes()).admit().is_ok()
-                || accounting(weights, 0).admit().is_err()
-            {
-                break prepared;
-            }
-            eprintln!(
-                "the arena scratch for {} forward tokens ({} bytes) does not fit beside the \
+                );
+                let slots = match slots {
+                    0 => poem_compiler::fit_frame_slots(
+                        &trace,
+                        fitted.voxels.as_mut(),
+                        room,
+                        engine::fit::least_state_slots(1),
+                        frames_in_flight,
+                    ),
+                    slots => slots,
+                };
+                let voxels = fitted.voxels;
+                let prepared = Shell::prepare(Boot {
+                    trace: trace.clone(),
+                    contract: &contract,
+                    checkpoint: &path,
+                    budget: bake_budgets(&budgets, &trace),
+                    patches: patch_ladder(&trace, &budgets),
+                    voxels,
+                    profile: None::<DeviceProfile>,
+                    page_size: budgets.page_size,
+                    context: budgets.max_context,
+                    slots,
+                    kv_budget: residency.device_kv_budget,
+                    allowance: residency.device,
+                    runahead: engine::runahead::Runahead::of(frames_in_flight),
+                    residency: experts::Plan::default(),
+                    profiles: self.boot.profiles.clone(),
+                })
+                .map_err(fault)?;
+                let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
+                if narrower >= budgets.max_tokens
+                    || accounting(weights, prepared.arena_bytes()).admit().is_ok()
+                    || accounting(weights, 0).admit().is_err()
+                {
+                    break prepared;
+                }
+                eprintln!(
+                    "the arena scratch for {} forward tokens ({} bytes) does not fit beside the \
                  resident weights on this device: fires narrowed to {narrower} tokens",
-                budgets.max_tokens,
-                prepared.arena_bytes(),
-            );
-            budgets.max_tokens = narrower;
-            budgets.buckets.retain(|&rows| rows <= narrower);
+                    budgets.max_tokens,
+                    prepared.arena_bytes(),
+                );
+                budgets.max_tokens = narrower;
+                budgets.buckets.retain(|&rows| rows <= narrower);
+            };
+            let scratch = prepared.arena_bytes();
+
+            accounting(weights, scratch).admit().map_err(fault)?;
+
+            prepared
+                .set_residency(experts::Plan::default().with_weights_held(residency.weights_held));
+            match prepared.load() {
+                Ok(shell) => break shell,
+                Err(Fault::FitShort(short)) => {
+                    let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
+                    if narrower >= budgets.max_tokens {
+                        return Err(fault(Fault::FitShort(short)));
+                    }
+                    cut = Some(short);
+                    budgets.max_tokens = narrower;
+                    budgets.buckets.retain(|&rows| rows <= narrower);
+                }
+                Err(other) => return Err(fault(other)),
+            }
         };
-        let scratch = prepared.arena_bytes();
-
-        accounting(weights, scratch).admit().map_err(fault)?;
-
-        prepared.set_residency(experts::Plan::default().with_weights_held(residency.weights_held));
-        let mut shell = prepared.load().map_err(fault)?;
+        if let Some(short) = cut {
+            eprintln!(
+                "the widest fire narrowed from {asked} to {} forward tokens at load: at the \
+                 wider fire, {short}",
+                budgets.max_tokens
+            );
+        }
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
         // The device pool already is host memory, so a host tier would only
@@ -1231,6 +1259,7 @@ impl Metal {
                     record: record_of[at].as_deref(),
                     record_run: run_of[at].as_deref(),
                     windows: &window_of[at],
+                    reports: lane.reports,
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

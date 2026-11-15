@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::program::{
@@ -35,13 +35,94 @@ struct Instance {
     #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     own_cells: Vec<ChannelId>,
 
-    /// Ring cells a pass on the queue has yet to land, as (channel, sequence).
-    landing: Arc<Mutex<Vec<(u32, u64)>>>,
+    /// Ring cells a pass on the queue has yet to land.
+    landing: Arc<Owed>,
     /// Set by a pass that faulted after its fire returned.
     faulted: Arc<AtomicBool>,
 }
 
 use engine_gpu::serve::InputCell;
+
+/// Ring cells a pass on the queue has yet to land, as (channel, sequence):
+/// the ring holds a cell for each from the pass's submit, and its value only
+/// once the pass's frame lands. Each landing wakes whoever waits on one.
+#[derive(Debug, Default)]
+struct Owed {
+    cells: Mutex<Vec<(u32, u64)>>,
+    landed: Condvar,
+}
+
+impl Owed {
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+    fn owe(&self, cells: &[(u32, u64)]) {
+        self.cells
+            .lock()
+            .expect("landing lock poisoned")
+            .extend(cells.iter().copied());
+    }
+
+    fn owes(&self, cell: (u32, u64)) -> bool {
+        self.cells
+            .lock()
+            .expect("landing lock poisoned")
+            .contains(&cell)
+    }
+
+    /// The pass that owed `cells` landed them (or faulted).
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+    fn land(&self, cells: &[(u32, u64)]) {
+        self.cells
+            .lock()
+            .expect("landing lock poisoned")
+            .retain(|cell| !cells.contains(cell));
+        self.landed.notify_all();
+    }
+
+    /// Waits, woken by each landing, until `cell` holds its value or the
+    /// instance faulted.
+    fn wait(&self, cell: (u32, u64), faulted: &AtomicBool) {
+        let mut cells = self.cells.lock().expect("landing lock poisoned");
+        while cells.contains(&cell) && !faulted.load(Ordering::Acquire) {
+            cells = self.landed.wait(cells).expect("landing lock poisoned");
+        }
+    }
+}
+
+/// The count `ring`, channel `channel` of `instance`'s `fold` port, holds at
+/// the fire. The next fire's count is what this one's pass puts, so a fire
+/// staged while that pass is on the queue finds its cell in the ring before
+/// the value is: it waits for the landing, which keeps the fold exact at the
+/// cost of running such fires one after another. A fire whose count is
+/// already in the ring reads it at once.
+fn fold_count(
+    instance: InstanceId,
+    channel: u32,
+    ring: &ChannelState,
+    owed: &Owed,
+    faulted: &AtomicBool,
+) -> Result<Option<u32>, Refusal> {
+    owed.wait((channel, ring.head()), faulted);
+    if faulted.load(Ordering::Acquire) {
+        return Err(Refusal::Program(format!("instance {instance} is poisoned")));
+    }
+    if ring.is_empty() {
+        return Err(Refusal::Program(format!(
+            "instance {instance}: the `fold` ring is empty at the fire"
+        )));
+    }
+    let len = match ring.front() {
+        Value::U32(cells) => cells.first().copied(),
+        Value::I32(cells) => cells.first().map(|&n| n.max(0) as u32),
+        other => {
+            return Err(Refusal::Program(format!(
+                "instance {instance}: `fold` holds {:?}, not a count",
+                other.dtype()
+            )));
+        }
+    };
+    len.map(Some)
+        .ok_or_else(|| Refusal::Program(format!("instance {instance}: `fold` holds an empty cell")))
+}
 
 #[derive(Default)]
 pub struct Plane {
@@ -538,25 +619,13 @@ impl Plane {
         else {
             return Ok(None);
         };
-        let ring = &seat.inst.channels[binding.channel as usize];
-        if ring.is_empty() {
-            return Err(Refusal::Program(format!(
-                "instance {instance}: the `fold` ring is empty at the fire"
-            )));
-        }
-        let len = match ring.front() {
-            Value::U32(cells) => cells.first().copied(),
-            Value::I32(cells) => cells.first().map(|&n| n.max(0) as u32),
-            other => {
-                return Err(Refusal::Program(format!(
-                    "instance {instance}: `fold` holds {:?}, not a count",
-                    other.dtype()
-                )));
-            }
-        };
-        len.map(Some).ok_or_else(|| {
-            Refusal::Program(format!("instance {instance}: `fold` holds an empty cell"))
-        })
+        fold_count(
+            instance,
+            binding.channel,
+            &seat.inst.channels[binding.channel as usize],
+            &seat.landing,
+            &seat.faulted,
+        )
     }
 
     pub fn envelope_tokens(
@@ -660,12 +729,7 @@ impl Plane {
             return Err(Refusal::Program(format!("instance {instance} is poisoned")));
         }
         let head = seat.inst.channels[channel as usize].head();
-        if seat
-            .landing
-            .lock()
-            .expect("landing lock poisoned")
-            .contains(&(channel, head))
-        {
+        if seat.landing.owes((channel, head)) {
             return Ok(None);
         }
         match eta_exec::host_take(&seat.inst, &seat.plan, channel) {
@@ -879,7 +943,7 @@ impl Plane {
         } = deferral;
         let Some(frame) = frame else {
             if let Some(done) = done {
-                (done.sink)(done.at, engine::StepOutcome::Committed);
+                (done.sink)(done.at, done.settled());
             }
             return Ok(());
         };
@@ -895,11 +959,15 @@ impl Plane {
             .iter()
             .map(|(_, sequence, landing)| (landing.channel, *sequence))
             .collect();
-        seat.landing
-            .lock()
-            .expect("landing lock poisoned")
-            .extend(owed.iter().copied());
+        seat.landing.owe(&owed);
 
+        // A frame that never went to the queue lands nothing: what waits on
+        // its cells finds the instance poisoned rather than waiting on.
+        let (unowed, poisoned, never) = (
+            Arc::clone(&seat.landing),
+            Arc::clone(&seat.faulted),
+            owed.clone(),
+        );
         let status = seat.session.status_cell();
         let spare = seat.session.landings();
         let landing = Mutex::new(landing);
@@ -935,16 +1003,13 @@ impl Plane {
             if fault.is_some() {
                 faulted.store(true, Ordering::Release);
             }
-            owing
-                .lock()
-                .expect("owing lock poisoned")
-                .retain(|cell| !owed.contains(cell));
+            owing.land(&owed);
             if let Some(lent) = lent {
                 spare.lock().expect("spare lock poisoned").push(lent);
             }
             if let Some(done) = done.as_ref() {
                 let outcome = match fault {
-                    None => engine::StepOutcome::Committed,
+                    None => done.settled(),
                     Some(why) => engine::StepOutcome::Faulted(why),
                 };
                 (done.sink)(done.at, outcome);
@@ -952,7 +1017,11 @@ impl Plane {
         };
         let pending = frame
             .commit_async(Some(Box::new(on_done)))
-            .map_err(|fault| Refusal::Program(format!("instance {instance}: {fault}")))?;
+            .map_err(|fault| {
+                poisoned.store(true, Ordering::Release);
+                unowed.land(&never);
+                Refusal::Program(format!("instance {instance}: {fault}"))
+            })?;
         seat.session.depart(pending);
         Ok(())
     }
@@ -1186,4 +1255,86 @@ fn cell_facts(
             },
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AtomicBool, ChannelState, InstanceId, Ordering, Owed, Value, fold_count};
+    use std::sync::Arc;
+
+    /// Two fires in flight, each folding by the count the pass before it
+    /// puts: the pass's cell is in the `fold` ring from its submit, its
+    /// value only once its frame lands. A fire staged behind a pass on the
+    /// queue reads the count that pass lands, not the cell's placeholder,
+    /// and a fire whose count is in the ring reads it at once.
+    #[test]
+    fn a_fire_staged_behind_a_pass_in_flight_reads_the_count_it_lands() {
+        const FOLD: u32 = 3;
+        let instance = InstanceId(1);
+        let ring = Arc::new(ChannelState::host(eta_ir::Dtype::U32, 1, 4));
+        let owed = Arc::new(Owed::default());
+        let faulted = Arc::new(AtomicBool::new(false));
+
+        // The seeded count: the first fire reads it at once.
+        assert!(ring.push(&Value::U32(vec![4])));
+        assert_eq!(
+            fold_count(instance, FOLD, &ring, &owed, &faulted).unwrap(),
+            Some(4)
+        );
+        assert!(ring.pop().is_some());
+        // Its pass and the next fire's go to the queue: each puts a cell
+        // whose value lands later.
+        for _ in 0..2 {
+            let sequence = ring.tail();
+            assert!(ring.push(&Value::U32(vec![0])));
+            owed.owe(&[(FOLD, sequence)]);
+        }
+        let lands = {
+            let (ring, owed) = (Arc::clone(&ring), Arc::clone(&owed));
+            std::thread::spawn(move || {
+                for (sequence, count) in [(1, 4), (2, 4)] {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    ring.encode_sequence(sequence, &Value::U32(vec![count]));
+                    owed.land(&[(FOLD, sequence)]);
+                }
+            })
+        };
+        // The second fire, staged while the first's pass is on the queue.
+        assert_eq!(
+            fold_count(instance, FOLD, &ring, &owed, &faulted).unwrap(),
+            Some(4)
+        );
+        assert!(ring.pop().is_some());
+        // The third, staged while the second's is.
+        assert_eq!(
+            fold_count(instance, FOLD, &ring, &owed, &faulted).unwrap(),
+            Some(4)
+        );
+        lands.join().unwrap();
+    }
+
+    /// A pass that faults lands nothing; the fire waiting on its cell is
+    /// refused, not left waiting.
+    #[test]
+    fn a_fire_behind_a_pass_that_faulted_is_refused() {
+        let ring = ChannelState::host(eta_ir::Dtype::U32, 1, 4);
+        let owed = Arc::new(Owed::default());
+        let faulted = Arc::new(AtomicBool::new(false));
+        assert!(ring.push(&Value::U32(vec![0])));
+        owed.owe(&[(3, 0)]);
+        let faults = {
+            let (owed, faulted) = (Arc::clone(&owed), Arc::clone(&faulted));
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                faulted.store(true, Ordering::Release);
+                owed.land(&[(3, 0)]);
+            })
+        };
+        let refused = fold_count(InstanceId(1), 3, &ring, &owed, &faulted);
+        assert!(
+            matches!(refused, Err(ref why) if why.to_string().contains("poisoned")),
+            "{refused:?}"
+        );
+        faults.join().unwrap();
+    }
 }
