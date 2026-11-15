@@ -2,7 +2,12 @@
 //! config, and how wide it dispatches.
 
 use eta_compiler::codegen::launch::LaunchStagePlan;
-use eta_exec::{Extents, OpParams, ValueDesc, describe, layout};
+use eta_compiler::codegen::{wgsl, wgsl_analysis};
+use eta_exec::{
+    Extents, Launch, Launches, OpParams, SELECT_RESERVE, ValueDesc, describe, lay_out,
+    whole_value_temporaries,
+};
+use eta_ir::op::tags;
 
 pub const DESC_WORDS: usize = 9;
 
@@ -49,8 +54,78 @@ impl Cfg {
     }
 }
 
+/// How a stage runs here, which its scratch is laid over: the emitted
+/// WGSL launches one op after another in the stage's order, each alone in
+/// its launch; the host writes a root's bytes before the first and reads
+/// a put's after the last.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Stepping {
+    /// The nodes the WGSL launches ([`wgsl::launched_nodes`]).
+    pub launched: Vec<u32>,
+    /// The other nodes: boundary ops and reshapes their source covers.
+    pub idle: Vec<u32>,
+    /// What the host may write before the first launch: an output's, a
+    /// channel read's, a take's and a constant's result.
+    pub staged: Vec<u32>,
+    /// What is read after the last launch: every value a boundary op reads.
+    pub kept: Vec<u32>,
+    /// The results of the reshapes not launched: their source's bytes
+    /// ([`alias_reshapes`]).
+    pub hollow: Vec<u32>,
+}
+
+impl Stepping {
+    #[must_use]
+    pub fn of(plan: &LaunchStagePlan) -> Stepping {
+        let launched = wgsl::launched_nodes(plan);
+        let mut stepping = Stepping::default();
+        let mut result_base = 0u32;
+        for (node, op) in plan.ops.iter().enumerate() {
+            let results = result_base..result_base.saturating_add(u32::from(op.result_count));
+            result_base = results.end;
+            if matches!(
+                op.tag,
+                tags::OUTPUT | tags::CHAN_READ | tags::CHAN_TAKE | tags::CONST
+            ) {
+                stepping.staged.extend(results);
+            }
+            let node = node as u32;
+            if launched.binary_search(&node).is_ok() {
+                continue;
+            }
+            stepping.idle.push(node);
+            if wgsl::is_boundary(op.tag) {
+                stepping.kept.extend(op.reads());
+            }
+        }
+        stepping.hollow = wgsl_analysis::analyze_stage(plan)
+            .aliases
+            .into_iter()
+            .map(|(result, _)| result)
+            .collect();
+        stepping.launched = launched;
+        stepping
+    }
+
+    /// The launches `descriptors` are laid over: below the temporary area
+    /// the one-row select's state, in it what a launch that sorts or
+    /// reduces a whole value takes.
+    #[must_use]
+    pub fn launches(&self, descriptors: &[ValueDesc]) -> Launches<'_> {
+        Launches {
+            each: self.launched.iter().map(Launch::of_node).collect(),
+            idle: self.idle.clone(),
+            staged: self.staged.clone(),
+            kept: self.kept.clone(),
+            hollow: self.hollow.clone(),
+            reserve: SELECT_RESERVE,
+            temporary_floor: whole_value_temporaries(descriptors).unwrap_or(u64::MAX),
+        }
+    }
+}
+
 pub fn alias_reshapes(plan: &LaunchStagePlan, values: &mut [u64]) {
-    for (result, source) in eta_compiler::codegen::wgsl_analysis::analyze_stage(plan).aliases {
+    for (result, source) in wgsl_analysis::analyze_stage(plan).aliases {
         let Some(&at) = values.get(source as usize) else {
             continue;
         };
@@ -112,7 +187,7 @@ pub fn stage_tables(plan: &LaunchStagePlan, extents: &Extents) -> Result<StageTa
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut scratch = layout(&descriptors)
+    let mut scratch = lay_out(plan, &descriptors, &Stepping::of(plan).launches(&descriptors))
         .map_err(|why| format!("a guest pass's scratch does not fit: {why:?}"))?;
     alias_reshapes(plan, &mut scratch.values);
 

@@ -130,6 +130,20 @@ pub fn is_boundary(tag: u8) -> bool {
     eta_ir::op::spec(tag).is_some_and(|row| row.family == eta_ir::op::Family::Channel)
 }
 
+/// The nodes of `plan` its WGSL launches, in the order it runs them: every
+/// op but a boundary one (the host stages or reads its value) and a
+/// reshape its source covers (its result is its source's bytes).
+#[must_use]
+pub fn launched_nodes(plan: &crate::codegen::launch::LaunchStagePlan) -> Vec<u32> {
+    let fusion = crate::codegen::wgsl_analysis::analyze_stage(plan);
+    plan.ops
+        .iter()
+        .enumerate()
+        .filter(|&(at, op)| !is_boundary(op.tag) && fusion.emits_node(at))
+        .map(|(at, _)| at as u32)
+        .collect()
+}
+
 fn sort_rounds(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> u32 {
     let Some(op) = plan.ops.get(at) else {
         return SORT_ROUNDS;
@@ -365,12 +379,10 @@ pub fn emit_launch_stage(
     if !valid_identifier(entry_name) {
         return Err(Refused::EntryName(entry_name.to_string()));
     }
-    let fusion = crate::codegen::wgsl_analysis::analyze_stage(plan);
     let mut body = String::new();
-    for (at, op) in plan.ops.iter().enumerate() {
-        if is_boundary(op.tag) || !fusion.emits_node(at) {
-            continue;
-        }
+    for at in launched_nodes(plan) {
+        let at = at as usize;
+        let op = &plan.ops[at];
         if !emits(op.tag) {
             return Err(Refused::Op {
                 tag: op.tag,
@@ -502,16 +514,14 @@ pub fn emit_launch_steps(
     if !valid_identifier(prefix) {
         return Err(Refused::EntryName(prefix.to_string()));
     }
-    let fusion = crate::codegen::wgsl_analysis::analyze_stage(plan);
     let mut source = String::from(RUNTIME);
     source.push('\n');
     source.push_str(ENTRY_MARKER);
     source.push('\n');
     let mut steps = Vec::new();
-    for (at, op) in plan.ops.iter().enumerate() {
-        if is_boundary(op.tag) || !fusion.emits_node(at) {
-            continue;
-        }
+    for at in launched_nodes(plan) {
+        let at = at as usize;
+        let op = &plan.ops[at];
         if !emits(op.tag) {
             return Err(Refused::Op {
                 tag: op.tag,

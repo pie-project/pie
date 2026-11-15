@@ -1816,6 +1816,7 @@ dependencies = [
  "kernels-slang",
  "libc",
  "memmap2",
+ "pie-eta-dsl",
  "pie-eta-ir",
  "pie-poem-compiler",
  "pie-poem-exec",

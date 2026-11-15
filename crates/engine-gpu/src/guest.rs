@@ -7,7 +7,7 @@ use engine::program::ProgramId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use eta_compiler::codegen::launch::{LaunchPackage, LaunchStagePlan};
+use eta_compiler::codegen::launch::{LaunchPackage, LaunchStagePlan, ValueOrigin};
 use eta_compiler::codegen::wgsl;
 
 pub mod held;
@@ -34,6 +34,16 @@ pub enum Refused {
 
         why: String,
     },
+
+    /// A value the host writes before the stage's launches or reads after
+    /// them that the stage's scratch is not laid to hold for it.
+    Scratch {
+        stage: usize,
+
+        value: u32,
+
+        why: &'static str,
+    },
 }
 
 impl std::fmt::Display for Refused {
@@ -56,6 +66,12 @@ impl std::fmt::Display for Refused {
             }
             Self::Lowering { stage, why } => {
                 write!(f, "stage {stage}'s emitted WGSL did not lower: {why}")
+            }
+            Self::Scratch { stage, value, why } => {
+                write!(
+                    f,
+                    "stage {stage}'s scratch does not hold value {value} for the host: {why}"
+                )
             }
         }
     }
@@ -85,6 +101,55 @@ fn every_op_emits(stage: usize, plan: &LaunchStagePlan) -> Result<(), Refused> {
     } else {
         Err(Refused::Ops { stage, missing })
     }
+}
+
+/// Holds the scratch's lifetimes ([`session::Stepping`]) to what the host
+/// does with `package`'s values: every root it writes before a stage's
+/// launches is one the stage holds from its first, and every put it reads
+/// after them is one the stage holds to its last.
+fn scratch_holds_the_hosts_values(package: &LaunchPackage) -> Result<(), Refused> {
+    let steppings: Vec<session::Stepping> =
+        package.plans.iter().map(session::Stepping::of).collect();
+    let local = |global: u32| match package.plan_local(global) {
+        Some((stage, Some(local))) => Some((stage, local)),
+        _ => None,
+    };
+    for (global, value) in package.values.iter().enumerate() {
+        if value.source == ValueOrigin::OpResult {
+            continue;
+        }
+        let Some((stage, value)) = local(global as u32) else {
+            continue;
+        };
+        if !steppings
+            .get(stage)
+            .is_some_and(|stepping| stepping.staged.contains(&value))
+        {
+            return Err(Refused::Scratch {
+                stage,
+                value,
+                why: "the host writes it before the stage runs and no output, channel read, \
+                      take or constant of the stage's plan yields it",
+            });
+        }
+    }
+    for put in package.stages.iter().flat_map(|stage| &stage.puts) {
+        let Some((stage, value)) = local(put.value) else {
+            continue;
+        };
+        if !steppings
+            .get(stage)
+            .is_some_and(|stepping| stepping.kept.contains(&value))
+        {
+            return Err(Refused::Scratch {
+                stage,
+                value,
+                why: "the host reads it after the stage runs and no put of the stage's plan \
+                      reads it",
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn step_source(stage: usize, plan: &LaunchStagePlan) -> Result<wgsl::Stepwise, Refused> {
@@ -121,6 +186,7 @@ impl<L: Lower> std::fmt::Debug for Compiled<L> {
 
 impl<L: Lower> Compiled<L> {
     pub fn of(package: &LaunchPackage) -> Result<Compiled<L>, Refused> {
+        scratch_holds_the_hosts_values(package)?;
         let mut stages = Vec::with_capacity(package.plans.len());
         for (at, plan) in package.plans.iter().enumerate() {
             let stepwise = step_source(at, plan)?;
@@ -201,5 +267,261 @@ impl<L: Lower> Forms<L> {
     #[must_use]
     pub fn tally(&self) -> (usize, usize) {
         (self.compiled.len(), self.refused.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eta_exec::Extents;
+
+    mod shipped {
+        use eta_compiler::codegen::launch::LaunchPackage;
+        use eta_compiler::plan::compile_bound;
+        use eta_dsl::Traced;
+        use eta_dsl::prelude::*;
+        use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port};
+
+        pub const QWEN_VOCAB: u32 = 151_936;
+
+        fn leak(channel: Channel) -> &'static Channel {
+            Box::leak(Box::new(channel))
+        }
+
+        fn logits(vocab: u32) -> Vec<Vec<OutputDecl>> {
+            vec![vec![OutputDecl {
+                name: "logits".into(),
+                axis: Axis::Row,
+                width: vocab,
+                dtype: eta_ir::Dtype::F32,
+                layers: 0,
+                readout: true,
+            }]]
+        }
+
+        fn builder(vocab: u32) -> (Builder<'static>, &'static Channel) {
+            let tok_in = leak(Channel::from([42i32]));
+            let mut b = Builder::new(vocab, 16);
+            b.outputs(logits(vocab));
+            b.bind_port(Port::EmbedTokens, tok_in);
+            b.bind_port(Port::EmbedIndptr, leak(Channel::from([0u32, 1])));
+            b.bind_port(Port::Fold, leak(Channel::from([u32::MAX])));
+            (b, tok_in)
+        }
+
+        /// `text-completion-bench`'s decode epilogue: a temperature-scaled
+        /// top-p Gumbel-max draw.
+        pub fn top_p(vocab: u32) -> Traced {
+            let (temperature, top_p) = (0.6f32, 0.95f32);
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = intrinsics::output(0, "logits");
+                let scaled = logits / temperature;
+                let probs = softmax(&scaled);
+                let keep = pivot_threshold(probs, cummass_le(top_p));
+                let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
+                let masked = select(&keep, &scaled, &neg_inf);
+                let r = rng.take();
+                let g = gumbel(&r, [vocab]);
+                let r_next = &r + iota(2);
+                rng.put(&r_next);
+                let t = reshape(reduce_argmax(masked + g), [1]);
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            out.note_host_take();
+            b.build().expect("the top-p epilogue traces")
+        }
+
+        /// The `compat` generate step's sampler with a top-k and a top-p
+        /// cut: both pivots, their `and`, the mask and a Gumbel-max draw.
+        pub fn top_k_top_p(vocab: u32) -> Traced {
+            let temperature = 0.8f32;
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let r = rng.take();
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let scaled = &logits / temperature;
+                let probs = softmax(&scaled);
+                let ranked = pivot_threshold(&probs, rank_le(40u32));
+                let nucleus = pivot_threshold(&probs, cummass_le(0.9f32));
+                let keep = and(&ranked, &nucleus);
+                let token = reshape(gumbel_max(mask_apply(&scaled, keep), &r), [1]);
+                rng.put(&r + iota(2));
+                tok_in.put(&token);
+                out.put(&token);
+            });
+            out.note_host_take();
+            b.build().expect("the top-k top-p epilogue traces")
+        }
+
+        /// A temperature Gumbel-max draw with no cut.
+        pub fn gumbel_max_only(vocab: u32) -> Traced {
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let r = rng.take();
+                let scaled = intrinsics::output(0, "logits") / 0.7f32;
+                let token = reshape(gumbel_max(scaled, &r), [1]);
+                rng.put(&r + iota(2));
+                tok_in.put(&token);
+                out.put(&token);
+            });
+            out.note_host_take();
+            b.build().expect("the gumbel-max epilogue traces")
+        }
+
+        /// The greedy decode epilogue.
+        pub fn greedy(vocab: u32) -> Traced {
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let t = reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]);
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            out.note_host_take();
+            b.build().expect("the greedy epilogue traces")
+        }
+
+        /// A greedy step that lands its top logprobs: a top-k region.
+        pub fn top_logprobs(vocab: u32) -> Traced {
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let values_out = leak(Channel::new([5], dtype::f32).capacity(8));
+            let ids_out = leak(Channel::new([5], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let t = reshape(reduce_argmax(&logits), [1]);
+                let (values, ids) = top_k(log_softmax(&logits), 5);
+                values_out.put(&values);
+                ids_out.put(cast(&ids, dtype::i32));
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            values_out.note_host_take();
+            ids_out.note_host_take();
+            out.note_host_take();
+            b.build().expect("the top-logprobs epilogue traces")
+        }
+
+        /// A greedy step that lands the whole row in order: a sort region.
+        pub fn sorted(vocab: u32) -> Traced {
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let ids_out = leak(Channel::new([vocab], dtype::i32).capacity(2));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let t = reshape(reduce_argmax(&logits), [1]);
+                let (_, ids) = sort_desc(softmax(&logits));
+                ids_out.put(cast(&ids, dtype::i32));
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            ids_out.note_host_take();
+            out.note_host_take();
+            b.build().expect("the sorted epilogue traces")
+        }
+
+        /// Every program here, by name.
+        pub fn all(vocab: u32) -> Vec<(&'static str, Traced)> {
+            vec![
+                ("top-p", top_p(vocab)),
+                ("top-k + top-p", top_k_top_p(vocab)),
+                ("gumbel-max", gumbel_max_only(vocab)),
+                ("greedy", greedy(vocab)),
+                ("top logprobs", top_logprobs(vocab)),
+                ("sorted", sorted(vocab)),
+            ]
+        }
+
+        pub fn package(traced: &Traced, vocab: u32) -> LaunchPackage {
+            let caps = EngineCaps {
+                lora: true,
+                attn_page_mask: true,
+            };
+            let bound = eta_ir::validate::bind(traced.container().clone(), logits(vocab), caps)
+                .expect("the program binds");
+            let stages = compile_bound(&bound);
+            eta_compiler::codegen::launch::build(&bound, &stages)
+        }
+    }
+
+    /// What a stage's scratch is for the programs inferlets ship, at a
+    /// vocabulary of 151,936: each value its own bytes, and as laid here.
+    #[test]
+    fn a_shipped_programs_stage_scratch() {
+        let vocab = shipped::QWEN_VOCAB;
+        let totals: Vec<(&str, u64, u64)> = shipped::all(vocab)
+            .iter()
+            .map(|(name, traced)| {
+                let package = shipped::package(traced, vocab);
+                let [plan] = &package.plans[..] else {
+                    panic!("{name}: one stage");
+                };
+                step_source(0, plan).unwrap_or_else(|why| panic!("{name}: {why}"));
+                scratch_holds_the_hosts_values(&package)
+                    .unwrap_or_else(|why| panic!("{name}: {why}"));
+                let tables =
+                    session::stage_tables(plan, &Extents::default()).expect("static shapes");
+                let own = eta_exec::layout(&tables.descriptors).expect("fits").total;
+                (*name, own, tables.scratch)
+            })
+            .collect();
+        assert_eq!(
+            totals,
+            [
+                ("top-p", 9_312_512, 5_056_768),
+                ("top-k + top-p", 9_616_896, 5_209_088),
+                ("gumbel-max", 5_512_960, 4_296_448),
+                ("greedy", 3_688_704, 3_688_448),
+                ("top logprobs", 6_728_960, 4_904_448),
+                ("sorted", 8_551_168, 4_904_192),
+            ]
+        );
+    }
+
+    /// A value the host stages or reads back that the stage's plan does not
+    /// hold for it is refused by name, never laid over.
+    #[test]
+    fn a_value_the_plan_does_not_hold_for_the_host_is_refused() {
+        let vocab = 64;
+        let package = shipped::package(&shipped::greedy(vocab), vocab);
+        assert!(scratch_holds_the_hosts_values(&package).is_ok());
+        let put = package.stages.iter().flat_map(|stage| &stage.puts).next();
+        let put = put.expect("greedy puts its token").value;
+        let (stage, Some(held)) = package.plan_local(put).expect("a stage's value") else {
+            panic!("the put's value is a stage's");
+        };
+        let stepping = session::Stepping::of(&package.plans[stage]);
+        assert!(stepping.kept.contains(&held));
+        let unheld = (0..package.plans[stage].value_types.len() as u32)
+            .find(|value| !stepping.kept.contains(value) && !stepping.staged.contains(value))
+            .expect("greedy's argmax is neither staged nor kept");
+
+        let global_of = |local: u32| {
+            (0..package.values.len() as u32)
+                .find(|&global| package.plan_local(global) == Some((stage, Some(local))))
+                .expect("a stage's value has a global")
+        };
+        let mut read_back = package.clone();
+        for put in read_back.stages.iter_mut().flat_map(|stage| &mut stage.puts) {
+            put.value = global_of(unheld);
+        }
+        assert!(matches!(
+            scratch_holds_the_hosts_values(&read_back),
+            Err(Refused::Scratch { value, .. }) if value == unheld
+        ));
+        let mut staged = package.clone();
+        staged.values[global_of(unheld) as usize].source = ValueOrigin::Const;
+        assert!(matches!(
+            scratch_holds_the_hosts_values(&staged),
+            Err(Refused::Scratch { value, .. }) if value == unheld
+        ));
     }
 }
