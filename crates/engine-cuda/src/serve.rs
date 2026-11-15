@@ -157,16 +157,9 @@ pub struct Shell {
     /// How the arming fire's lanes treat their recurrent rows: a buffering
     /// treatment is recorded with lanes that land and replay nothing.
     arm_rs: record::RsBody,
-    /// Whether this shell arms its rungs past the smallest while it serves
-    /// ([`Shell::arm_step`]), and the lattice left arming.
-    arm_stepped: bool,
-    stepping: Option<arming::Arming>,
-    /// The slots the step in hand was lent: what its synthetic lanes name.
-    lent: Option<engine::live::ArmingLease>,
-    /// The device's bytes, those in use before this load began, and those
-    /// the fit holds for the guests' programs: what a fit after the load
-    /// is read against ([`Shell::settle`]).
-    card: (u64, u64, u64),
+    /// The device's bytes and those in use before this load began: what
+    /// the load's ledger is read against.
+    card: (u64, u64),
     /// What the runtime reads of this shell while it serves: the rungs
     /// armed.
     live: engine::live::Live,
