@@ -3,6 +3,7 @@
 //! ranks partitions by these; a model is calibrated against what the chip and the linker
 //! measured, and says how far off it was there (`ARCHITECTURE.md`, "Cost").
 
+pub mod grid;
 pub mod memory;
 pub mod stream;
 pub mod time;

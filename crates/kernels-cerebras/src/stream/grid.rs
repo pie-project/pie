@@ -1381,6 +1381,29 @@ pub fn program_upto(
     round16: bool,
     upto: Option<usize>,
 ) -> R<GridProgram> {
+    build(trace, reading, clip, round16, upto, true)
+}
+
+/// [`program`] whether or not its tiles and stores fit a weight PE (what the cost model prices
+/// a reading at before its placement is chosen).
+pub fn program_unfit(
+    trace: &Trace,
+    reading: &str,
+    clip: [u32; 3],
+    round16: bool,
+) -> R<GridProgram> {
+    build(trace, reading, clip, round16, None, false)
+}
+
+#[allow(clippy::too_many_lines)]
+fn build(
+    trace: &Trace,
+    reading: &str,
+    clip: [u32; 3],
+    round16: bool,
+    upto: Option<usize>,
+    fit: bool,
+) -> R<GridProgram> {
     let name = &trace.name;
     let classes = poem_compiler::spatial::layer::stream::classes(trace, reading, 0);
     let [class] = &classes[..] else {
@@ -1586,7 +1609,8 @@ pub fn program_upto(
     if let Some(why) = fits(p) {
         return Err(format!("{name}: no roots cut the reading's values: {why}"));
     }
-    let (stream, palette, fabric) = floorplan(p, b.attn.as_ref(), reading)?;
+    // (priced unplaced: the unit's fabric without its K / V column)
+    let (stream, palette, fabric) = floorplan(p, b.attn.as_ref().filter(|_| fit), reading)?;
     let mut prog = GridProgram {
         trace: trace.clone(),
         reading: reading.to_string(),
@@ -1616,7 +1640,7 @@ pub fn program_upto(
         round16,
     };
     print_regions(&mut prog)?;
-    place(&mut prog)?;
+    place(&mut prog, fit)?;
     Ok(prog)
 }
 
@@ -1664,7 +1688,7 @@ fn print_regions(g: &mut GridProgram) -> R<()> {
 }
 
 /// The tiles' and stores' places in a weight PE.
-fn place(g: &mut GridProgram) -> R<()> {
+fn place(g: &mut GridProgram, fit: bool) -> R<()> {
     let p = g.p;
     let mut off = 1u32;
     let mut tiles = Vec::new();
@@ -1736,7 +1760,7 @@ fn place(g: &mut GridProgram) -> R<()> {
     }
     g.slots.hout_words = at;
     let used = off + g.slots.store_words + 2 * (g.slots.hin_words + g.slots.hout_words);
-    if used > WEIGHT_WORDS {
+    if fit && used > WEIGHT_WORDS {
         return Err(format!(
             "{}: a weight PE's tiles and stores are {used} 16-bit words (at most {WEIGHT_WORDS}): \
              {} of tiles, {} held, {} + {} the host's",

@@ -258,6 +258,34 @@ fn stream(args: &[String]) -> Result<(), String> {
             }
             None => kernels_cerebras::stream::grid::clip_of(&trace, &reading, rows),
         };
+        if args.iter().any(|a| a == "--price") {
+            // the cost model's time for the reading on `clip`, its placement aside
+            let g = kernels_cerebras::stream::grid::program_unfit(&trace, &reading, clip, !ieee)?;
+            let c = kernels_cerebras::cost::grid::time(&g);
+            println!(
+                "{model} {reading} on {clip:?}: {} passes over {} x {} roots, {:.1}M cycles ({:.1} ms at 875 MHz)",
+                g.passes.len(),
+                g.p,
+                g.p,
+                c.cycles / 1e6,
+                c.cycles / 875e3
+            );
+            if args.iter().any(|a| a == "--parts") {
+                for q in &c.passes {
+                    println!(
+                        "  pass {} rows {} head {} matvec {:.0} roots {:.0} head row {:.0}: {:.1}M",
+                        q.pass,
+                        q.rows,
+                        q.head_rows,
+                        q.matvec_row,
+                        q.root_row,
+                        q.head_row,
+                        q.cycles / 1e6
+                    );
+                }
+            }
+            return Ok(());
+        }
         let g = kernels_cerebras::stream::grid::compile(
             &trace,
             &reading,
