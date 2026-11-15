@@ -1145,7 +1145,11 @@ impl Shell {
                 })
                 .collect(),
             drafting: (0..classes)
-                .filter(|class| !self.landing[*class].iter().any(poem_ir::Request::plain))
+                .filter(|class| {
+                    !self.landing[*class]
+                        .iter()
+                        .any(crate::exports::plain_or_adapted)
+                })
                 .collect(),
             rs_rungs: self.rs_rungs(),
             decoding: self.decoding.clone(),

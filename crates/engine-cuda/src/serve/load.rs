@@ -980,7 +980,8 @@ impl Shell {
             .iter()
             .enumerate()
             .filter(|(class, _)| {
-                tiers.plain.contains(*class) && !landing[*class].iter().any(poem_ir::Request::plain)
+                tiers.plain.contains(*class)
+                    && !landing[*class].iter().any(crate::exports::plain_or_adapted)
             })
             .flat_map(|(_, class)| class.words.iter().copied())
             .collect();
