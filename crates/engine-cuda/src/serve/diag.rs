@@ -16,7 +16,6 @@ pub struct Diagnostics {
     pub trace_census: bool,
     pub nan_check: bool,
     pub fuse_chains: bool,
-    pub gumbel_direct: bool,
     /// What a fire that waits for the device does (`crate::device::guard`).
     pub sync_guard: Option<SyncGuard>,
     /// The chunk size the state pool's recipe aims near, in place of the
@@ -70,7 +69,6 @@ impl Default for Diagnostics {
             trace_census: false,
             nan_check: false,
             fuse_chains: true,
-            gumbel_direct: true,
             sync_guard: None,
             chunk_bytes: None,
             dense_weights: false,
@@ -122,9 +120,6 @@ impl Diagnostics {
         if !self.fuse_chains {
             words.push("fuse-chains=off".to_string());
         }
-        if !self.gumbel_direct {
-            words.push("gumbel-direct=off".to_string());
-        }
         match self.sync_guard {
             Some(SyncGuard::Report) => words.push("sync-guard".to_string()),
             Some(SyncGuard::Panic) => words.push("sync-guard=panic".to_string()),
@@ -162,7 +157,7 @@ fn switch(word: &str, value: &str) -> std::result::Result<bool, String> {
 const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `ptr-trace=<key substring>`, `graph-dot=<dir>`, `grid-trace=<key substring>`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
-     `trace-census`, `nan-check`, `fuse-chains=off`, `gumbel-direct=off`, \
+     `trace-census`, `nan-check`, `fuse-chains=off`, \
      `sync-guard[=panic]`, `chunk-bytes=<bytes>`, `dense-weights`, \
      `dense-experts`, `one-window`, `tier-inline`, `rs-bodies`";
 
@@ -194,7 +189,6 @@ impl std::str::FromStr for Diagnostics {
                 "tier-inline" => diag.tier_inline = switch(word, value)?,
                 "rs-bodies" => diag.rs_bodies = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,
-                "gumbel-direct" => diag.gumbel_direct = switch(word, value)?,
                 "sync-guard" => {
                     diag.sync_guard = match value {
                         "panic" => Some(SyncGuard::Panic),
@@ -312,7 +306,6 @@ mod tests {
         assert!(diag.golden_probe);
         assert_eq!(diag.ptr_trace.as_deref(), Some("decode:c0"));
         assert!(!diag.fuse_chains);
-        assert!(diag.gumbel_direct, "an unnamed arm keeps its default");
         assert_eq!(diag.sync_guard, None);
         let guarded: Diagnostics = "sync-guard".parse().expect("the guard parses");
         assert_eq!(guarded.sync_guard, Some(SyncGuard::Report));
@@ -333,7 +326,7 @@ mod tests {
     }
 
     fn the_words_round_trip() {
-        let list = "arm-trace,capture-serial,plan-trace=all,gumbel-direct=off,sync-guard=panic";
+        let list = "arm-trace,capture-serial,plan-trace=all,fuse-chains=off,sync-guard=panic";
         let diag: Diagnostics = list.parse().expect("parses");
         let again: Diagnostics = diag
             .words()

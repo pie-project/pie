@@ -139,13 +139,6 @@ pub(crate) struct GumbelChain {
     pub(crate) noise: u32,
 }
 
-pub static GUMBEL_DIRECT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(true);
-
-fn gumbel_direct_enabled() -> bool {
-    GUMBEL_DIRECT.load(core::sync::atomic::Ordering::Relaxed)
-}
-
 pub(crate) fn analyze_direct_argmax(
     stage: &CompiledStage,
     region: &Region,
@@ -198,8 +191,7 @@ pub(crate) fn analyze_direct_argmax(
         let mut expected_consumer = node as u32;
         let mut chain: Vec<u32> = Vec::new();
         let mut gumbel: Option<(u32, Option<u32>, u32)> = None;
-        if gumbel_direct_enabled()
-            && single_consumer(value, node as u32)
+        if single_consumer(value, node as u32)
             && ops[producers[value as usize] as usize].tag == tags::ADD
         {
             let add = producers[value as usize];
