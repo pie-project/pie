@@ -858,13 +858,6 @@ impl Engine for Xla {
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         use crate::serve::Tier;
-        // A state record copied carries where a device fold left it.
-        for &(src, dst) in &copy.slots {
-            match self.rs_ahead.get(&ref_key(copy.shape, src)).copied() {
-                Some(at) => self.rs_ahead.insert(ref_key(copy.shape, dst), at),
-                None => self.rs_ahead.remove(&ref_key(copy.shape, dst)),
-            };
-        }
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
         let tier = |domain| match domain {
             MemoryDomain::HostPinned => Some(Tier::Host),
@@ -879,6 +872,16 @@ impl Engine for Xla {
                 engine: "xla",
             });
         };
+        // A state record copied carries where a device fold left it, keyed
+        // by its tier too: each tier numbers its slot refs from 0, so a
+        // host ref is not the device ref of the same number.
+        for &(src, dst) in &copy.slots {
+            let (src, dst) = (tier_key(from, copy.shape, src), tier_key(to, copy.shape, dst));
+            match self.rs_ahead.get(&src).copied() {
+                Some(at) => self.rs_ahead.insert(dst, at),
+                None => self.rs_ahead.remove(&dst),
+            };
+        }
         let shell = self.loaded_mut()?;
         if from != Tier::Device || to != Tier::Device {
             // Between tiers (CONTRACT-BC 22): whole slots, laid alike.
@@ -1763,9 +1766,21 @@ fn table_of(lane: &engine::fire::Lane, id: engine::chunk::ShapeId) -> Option<&[u
         .map(|(_, table)| table.as_slice())
 }
 
-/// A slot ref of shape `shape` as one key.
+/// A device slot ref of shape `shape` as one key.
 fn ref_key(shape: engine::chunk::ShapeId, slot: u32) -> u64 {
     (u64::from(shape.0) << 32) | u64::from(slot)
+}
+
+/// A slot ref of shape `shape` on `tier` as one key: a device ref's is its
+/// [`ref_key`], what a lane's record reads; the host tier's and the slot
+/// file's stand apart from it.
+fn tier_key(tier: crate::serve::Tier, shape: engine::chunk::ShapeId, slot: u32) -> u64 {
+    let tag: u64 = match tier {
+        crate::serve::Tier::Device => 0,
+        crate::serve::Tier::Host => 1,
+        crate::serve::Tier::Disk => 2,
+    };
+    (tag << 62) | ref_key(shape, slot)
 }
 
 /// The state record a lane reads and the one it writes: its first fixed
@@ -1775,5 +1790,22 @@ fn record_key(lane: &engine::fire::Lane) -> Option<(u64, u64)> {
     match lane.fixed.first().and_then(|(id, pieces)| Some((*id, pieces.first()?))) {
         Some((id, &[run, cow])) => Some((ref_key(id, run), ref_key(id, cow))),
         None => lane.rs_slot.map(|slot| (u64::from(slot), u64::from(slot))),
+    }
+}
+
+#[cfg(test)]
+mod tier_key_tests {
+    use super::{ref_key, tier_key};
+    use crate::serve::Tier;
+
+    /// A host or slot-file ref never keys as the device ref of the same
+    /// number, and a device ref keys as what a lane's record reads.
+    #[test]
+    fn a_tier_keys_its_refs_apart() {
+        let shape = engine::chunk::ShapeId((1 << 17) + 2);
+        assert_eq!(tier_key(Tier::Device, shape, 3), ref_key(shape, 3));
+        assert_ne!(tier_key(Tier::Host, shape, 3), ref_key(shape, 3));
+        assert_ne!(tier_key(Tier::Disk, shape, 3), ref_key(shape, 3));
+        assert_ne!(tier_key(Tier::Host, shape, 3), tier_key(Tier::Disk, shape, 3));
     }
 }
