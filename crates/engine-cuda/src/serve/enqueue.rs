@@ -837,6 +837,11 @@ impl FireCtx<'_> {
         // walks across the side streams where the capture would, so each
         // scratch slab is asked for under the stream and lane the body's
         // regions take it on.
+        #[cfg(feature = "rocm")]
+        let (rocm_before, compiled_before) = (
+            kernels_rocm::tally::counts(),
+            self.live.tallied(engine::live::Tally::Compiled),
+        );
         let walked = if records && crate::sizing::active() {
             if self.arming && !p.bodied {
                 Ok(())
@@ -931,6 +936,10 @@ impl FireCtx<'_> {
             .map_err(Fault::from)
         };
         drop(run);
+        #[cfg(feature = "rocm")]
+        if !self.arming {
+            self.tally_rocm(rocm_before, compiled_before, walked.is_ok());
+        }
         if let Some(tapping) = self.tapping {
             match &walked {
                 Ok(()) => tapping.finish(),
@@ -951,6 +960,27 @@ impl FireCtx<'_> {
         }
         walked?;
         Ok(())
+    }
+
+    /// What kernels-rocm did on this thread across a serving fire, counted
+    /// as the fire's: a code object built or loaded is Compiled (once a
+    /// fire, with a body it captured as it served), a faster route that
+    /// declined is Fallback, and a code object refused is Refused when the
+    /// fire still served (a fire that failed is counted where its frame is
+    /// refused).
+    #[cfg(feature = "rocm")]
+    fn tally_rocm(&self, before: kernels_rocm::tally::Counts, compiled_before: u64, served: bool) {
+        use engine::live::Tally;
+        let after = kernels_rocm::tally::counts();
+        if after.built > before.built && self.live.tallied(Tally::Compiled) == compiled_before {
+            self.live.tally(Tally::Compiled, 1);
+        }
+        if after.declined > before.declined {
+            self.live.tally(Tally::Fallback, 1);
+        }
+        if served && after.refused > before.refused {
+            self.live.tally(Tally::Refused, 1);
+        }
     }
 
     fn readback(&mut self, p: &Prepared<'_>, staged: &Staged) -> Result<Option<Readback>> {

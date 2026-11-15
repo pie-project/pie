@@ -303,8 +303,9 @@ fn load_alone(
         ..DeviceBoot::default()
     };
     // The device is shared: a driver that fails to come up is asked again
-    // before the test is skipped, and a load takes at most a quarter of what
-    // the device has, as tests load at once.
+    // before the test is skipped. A load takes what the harness states a
+    // test's load takes; where that is the whole device, at most a quarter of
+    // what the device is measured to have, as tests load at once.
     let mut tries = 0;
     let quarter = loop {
         match Context::bind(&device, backend::ALLOWANCE) {
@@ -321,7 +322,11 @@ fn load_alone(
     };
     let residency = engine::load::Residency {
         device: engine::Allowance {
-            budget: residency.device.budget.or(Some(quarter)),
+            budget: residency
+                .device
+                .budget
+                .or(backend::ALLOWANCE.budget)
+                .or(Some(quarter)),
         },
         ..residency
     };
