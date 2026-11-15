@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import sys
 import time
 import urllib.error
@@ -694,6 +695,282 @@ def test_completions_streaming(http: Http):
     assert chunks[-1]["choices"] == [] and chunks[-1]["usage"]["completion_tokens"] == 8
 
 
+def tool_call_markup(city: str) -> str:
+    return '<tool_call>\n{"name": "get_weather", "arguments": {"city": "%s"}}\n</tool_call>' % city
+
+
+TOOL_CALL_SHOTS = f"Q: What is the weather in Rome?\nA: {tool_call_markup('Rome')}\nQ: What is the weather in Paris?\nA:"
+
+
+def test_completions_verbatim(http: Http):
+    for prompt in (
+        TOOL_CALL_SHOTS,
+        "<|im_start|>user\nWhat is 2 + 2?<|im_end|>\n<|im_start|>assistant\n",
+    ):
+        status, _, text = http.post(
+            "/v1/completions",
+            {"prompt": prompt, "max_tokens": 24, "temperature": 0, "logprobs": 0},
+        )
+        assert status == 200, text
+        choice = json.loads(text)["choices"][0]
+        tokens = choice["logprobs"]["tokens"]
+        if choice["finish_reason"] == "stop":
+            tokens = tokens[:-1]  # the stop token that ended the turn spells no text
+        assert choice["text"] and "".join(tokens) == choice["text"], choice
+
+    status, _, text = http.post(
+        "/v1/completions", {"prompt": TOOL_CALL_SHOTS, "max_tokens": 32, "temperature": 0}
+    )
+    assert status == 200, text
+    out = json.loads(text)["choices"][0]["text"]
+    assert "<tool_call>" in out and "get_weather" in out and "Paris" in out, out
+
+
+def test_completions_stop_strings(http: Http):
+    base = {"prompt": TOOL_CALL_SHOTS, "max_tokens": 48, "temperature": 0, "stop": ["</tool_call>"]}
+    status, _, text = http.post("/v1/completions", base)
+    assert status == 200, text
+    choice = json.loads(text)["choices"][0]
+    assert "<tool_call>" in choice["text"] and "</tool_call>" not in choice["text"], choice
+    assert choice["finish_reason"] == "stop" and choice["stop_reason"] == "</tool_call>", choice
+
+    status, _, text = http.post("/v1/completions", {**base, "include_stop_str_in_output": True})
+    assert status == 200, text
+    included = json.loads(text)["choices"][0]
+    assert included["text"] == choice["text"] + "</tool_call>", (included, choice)
+    assert included["stop_reason"] == "</tool_call>", included
+
+    status, _, resp = http.post(
+        "/v1/completions", {**base, "include_stop_str_in_output": True, "stream": True}, stream=True
+    )
+    assert status == 200
+    chunks = [json.loads(d) for _, d in sse_frames(resp) if d != "[DONE]"]
+    assert "".join(c["choices"][0]["text"] for c in chunks) == included["text"], chunks
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop", chunks[-1]
+    assert chunks[-1]["choices"][0]["stop_reason"] == "</tool_call>", chunks[-1]
+
+    status, _, text = http.post(
+        "/v1/completions",
+        {"prompt": "<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", "max_tokens": 32, "temperature": 0},
+    )
+    choice = json.loads(text)["choices"][0]
+    if choice["finish_reason"] == "stop":
+        assert choice["stop_reason"] is None, choice
+
+
+def test_chat_stop_reason(http: Http):
+    body = {
+        "messages": [{"role": "user", "content": "Write the alphabet, letters separated by spaces."}],
+        "max_tokens": 64,
+        "stop": ["F"],
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    status, _, text = chat(http, **body, include_stop_str_in_output=True)
+    assert status == 200, text
+    choice = json.loads(text)["choices"][0]
+    assert choice["message"]["content"].endswith("F"), choice
+    assert choice["finish_reason"] == "stop" and choice["stop_reason"] == "F", choice
+    status, _, resp = chat(http, stream=True, **body)
+    chunks = [json.loads(d) for _, d in sse_frames(resp) if d != "[DONE]"]
+    content = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks)
+    assert content == choice["message"]["content"][:-1], (content, choice)
+    assert chunks[-1]["choices"][0]["stop_reason"] == "F", chunks[-1]
+
+
+def stream_chunks(http: Http, path: str, body: dict) -> list[dict]:
+    status, _, resp = http.post(path, {**body, "stream": True}, stream=True)
+    assert status == 200, status
+    return [json.loads(d) for _, d in sse_frames(resp) if d != "[DONE]"]
+
+
+def test_completions_token_ids(http: Http):
+    body = {"prompt": "The capital of France is", "max_tokens": 8, "temperature": 0, "return_token_ids": True}
+    status, _, text = http.post(
+        "/v1/completions", {**body, "logprobs": 1, "return_tokens_as_token_ids": True}
+    )
+    assert status == 200, text
+    whole = json.loads(text)
+    choice = whole["choices"][0]
+    prompt_ids, ids = choice["prompt_token_ids"], choice["token_ids"]
+    assert prompt_ids and all(isinstance(t, int) for t in prompt_ids + ids), choice
+    assert len(ids) == whole["usage"]["completion_tokens"] == 8, whole
+    assert len(prompt_ids) == whole["usage"]["prompt_tokens"], whole
+    lp = choice["logprobs"]
+    assert lp["tokens"] == [f"token_id:{t}" for t in ids], lp["tokens"]
+    assert all(key.startswith("token_id:") for top in lp["top_logprobs"] for key in top), lp
+    assert lp["text_offset"][-1] < len(choice["text"]), lp
+
+    chunks = stream_chunks(http, "/v1/completions", body)
+    streamed = [t for c in chunks if c["choices"] for t in c["choices"][0]["token_ids"]]
+    assert streamed == ids, (streamed, ids)
+    prompts = [c["choices"][0]["prompt_token_ids"] for c in chunks if c["choices"] and "prompt_token_ids" in c["choices"][0]]
+    assert prompts == [prompt_ids], prompts
+
+    status, _, text = http.post("/v1/completions", {k: v for k, v in body.items() if k != "return_token_ids"})
+    assert "token_ids" not in json.loads(text)["choices"][0], text
+
+    stop = ids[2]
+    at = ids.index(stop)
+    for include in (False, True):
+        status, _, text = http.post(
+            "/v1/completions",
+            {**body, "stop_token_ids": [stop], "include_stop_str_in_output": include, "logprobs": 0},
+        )
+        assert status == 200, text
+        stopped = json.loads(text)["choices"][0]
+        assert stopped["token_ids"] == ids[: at + 1], (stopped, ids)
+        assert stopped["finish_reason"] == "stop" and stopped["stop_reason"] == stop, stopped
+        spelled = stopped["logprobs"]["tokens"][: at + 1 if include else at]
+        assert stopped["text"] == "".join(spelled), stopped
+
+
+def test_chat_token_ids(http: Http):
+    body = {
+        "model": "pie",
+        "messages": [{"role": "user", "content": "Say hello in one word."}],
+        "max_tokens": 16,
+        "temperature": 0,
+        "return_token_ids": True,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    status, _, text = http.post("/v1/chat/completions", {**body, "logprobs": True, "return_tokens_as_token_ids": True})
+    assert status == 200, text
+    whole = json.loads(text)
+    ids = whole["choices"][0]["token_ids"]
+    assert len(ids) == whole["usage"]["completion_tokens"], whole
+    assert len(whole["prompt_token_ids"]) == whole["usage"]["prompt_tokens"], whole
+    entries = whole["choices"][0]["logprobs"]["content"]
+    assert [e["token"] for e in entries] == [f"token_id:{t}" for t in ids], entries
+
+    chunks = stream_chunks(http, "/v1/chat/completions", body)
+    assert [t for c in chunks if c["choices"] for t in c["choices"][0]["token_ids"]] == ids, chunks
+    assert [c["prompt_token_ids"] for c in chunks if "prompt_token_ids" in c] == [whole["prompt_token_ids"]], chunks
+
+
+def test_logprobs_mode(http: Http):
+    body = {
+        "prompt": "Once upon a time",
+        "max_tokens": 12,
+        "seed": 3,
+        "logprobs": 3,
+        "return_token_ids": True,
+        "return_tokens_as_token_ids": True,
+    }
+
+    def draw(**knobs):
+        status, _, text = http.post("/v1/completions", {**body, **knobs})
+        assert status == 200, text
+        choice = json.loads(text)["choices"][0]
+        return choice["token_ids"], choice["logprobs"]["top_logprobs"]
+
+    def gaps(tops):
+        return [{(a, b): row[a] - row[b] for a in row for b in row if a < b} for row in tops]
+
+    def close(x, y):
+        return abs(x - y) <= 1e-2 + 1e-2 * abs(y)
+
+    t = 0.5
+    draw(temperature=t)
+    ids, raw = draw(temperature=t)
+    for mode, scale in [("processed_logprobs", 1 / t), ("raw_logits", 1.0), ("processed_logits", 1 / t)]:
+        drawn, tops = draw(temperature=t, logprobs_mode=mode)
+        assert drawn == ids, f"{mode} changed the draw"
+        for got, want in zip(gaps(tops), gaps(raw)):
+            assert got.keys() == want.keys(), (mode, got, want)
+            assert all(close(got[k], want[k] * scale) for k in got), (mode, got, want)
+
+    _, tops = draw(temperature=1.0, top_k=2, logprobs_mode="processed_logprobs")
+    for row in tops:
+        values = sorted(row.values(), reverse=True)
+        assert abs(math.exp(values[0]) + math.exp(values[1]) - 1.0) < 1e-3, row
+        assert values[2] == -9999.0, row
+
+    _, greedy = draw(temperature=0)
+    _, processed = draw(temperature=0, logprobs_mode="processed_logprobs")
+    assert all(close(p[k], g[k]) for g, p in zip(greedy, processed) for k in g), (greedy, processed)
+
+    for path, extra in [("/v1/completions", {"prompt": "Hi"}), ("/v1/chat/completions", {"messages": [{"role": "user", "content": "Hi"}]})]:
+        status, _, text = http.post(path, {**extra, "logprobs_mode": "processed"})
+        assert status == 400 and json.loads(text)["error"]["param"] == "logprobs_mode", text
+
+    chat_body = {
+        "model": "pie",
+        "messages": [{"role": "user", "content": "Tell me a story."}],
+        "max_tokens": 8,
+        "temperature": t,
+        "seed": 3,
+        "logprobs": True,
+        "top_logprobs": 2,
+        "return_tokens_as_token_ids": True,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    rows = {}
+    for mode in ("raw_logprobs", "raw_logprobs", "processed_logprobs"):
+        status, _, text = http.post("/v1/chat/completions", {**chat_body, "logprobs_mode": mode})
+        assert status == 200, text
+        rows[mode] = [{e["token"]: e["logprob"] for e in entry["top_logprobs"]} for entry in json.loads(text)["choices"][0]["logprobs"]["content"]]
+    for got, want in zip(gaps(rows["processed_logprobs"]), gaps(rows["raw_logprobs"])):
+        assert got.keys() == want.keys() and all(close(got[k], want[k] / t) for k in got), (got, want)
+
+
+def test_official_openai_client_vllm_fields(http: Http):
+    client = official("openai").OpenAI(base_url=http.base_url + "/v1", api_key="unused")
+    extra = {"include_stop_str_in_output": True, "return_token_ids": True}
+    completion = client.completions.create(
+        model="pie", prompt=TOOL_CALL_SHOTS, max_tokens=48, temperature=0, stop=["</tool_call>"], extra_body=extra
+    )
+    choice = completion.choices[0]
+    assert choice.text.lstrip().startswith("<tool_call>") and choice.text.endswith("</tool_call>"), choice
+    assert choice.finish_reason == "stop" and choice.model_extra["stop_reason"] == "</tool_call>", choice
+    ids = choice.model_extra["token_ids"]
+    assert len(ids) == completion.usage.completion_tokens, completion
+
+    pieces, streamed = [], []
+    for chunk in client.completions.create(
+        model="pie", prompt=TOOL_CALL_SHOTS, max_tokens=48, temperature=0, stop=["</tool_call>"], extra_body=extra, stream=True
+    ):
+        pieces.append(chunk.choices[0].text)
+        streamed.extend(chunk.choices[0].model_extra.get("token_ids") or [])
+    assert "".join(pieces) == choice.text and streamed == ids, (pieces, streamed, ids)
+
+    calls, streamed = [], []
+    for chunk in client.chat.completions.create(
+        model="pie",
+        messages=[{"role": "user", "content": "What is the weather in Paris?"}],
+        tools=[WEATHER_TOOL],
+        max_tokens=128,
+        temperature=0,
+        stream=True,
+        extra_body={"return_token_ids": True, "chat_template_kwargs": {"enable_thinking": False}},
+    ):
+        if chunk.choices:
+            calls.extend(chunk.choices[0].delta.tool_calls or [])
+            streamed.extend(chunk.choices[0].model_extra.get("token_ids") or [])
+    assert calls and calls[0].function.name == "get_weather", calls
+    assert "city" in json.loads(calls[0].function.arguments), calls
+    assert streamed, "the streamed tool call carried no token ids"
+
+
+def test_tool_markup_is_content_without_callable_tools(http: Http):
+    shots = [
+        {"role": "user", "content": "What is the weather in Rome?"},
+        {"role": "assistant", "content": tool_call_markup("Rome")},
+        {"role": "user", "content": "What is the weather in Paris?"},
+    ]
+    status, _, text = chat(
+        http,
+        messages=shots,
+        tools=[WEATHER_TOOL],
+        tool_choice="none",
+        max_tokens=64,
+        chat_template_kwargs={"enable_thinking": False},
+    )
+    assert status == 200, text
+    choice = json.loads(text)["choices"][0]
+    assert choice["finish_reason"] != "tool_calls" and not choice["message"].get("tool_calls"), choice
+    assert choice["message"]["content"], choice
+
+
 # ---------------------------------------------------------------------------
 # OpenAI Responses
 # ---------------------------------------------------------------------------
@@ -959,6 +1236,14 @@ TESTS = [
     test_sampling_arms,
     test_completions_prompt_logprobs,
     test_completions_streaming,
+    test_completions_verbatim,
+    test_completions_stop_strings,
+    test_chat_stop_reason,
+    test_completions_token_ids,
+    test_chat_token_ids,
+    test_logprobs_mode,
+    test_official_openai_client_vllm_fields,
+    test_tool_markup_is_content_without_callable_tools,
     test_responses_non_streaming,
     test_responses_streaming,
     test_responses_function_call,

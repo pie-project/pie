@@ -8,8 +8,6 @@
 //! histogram carried on the device, an optional grammar mask, temperature,
 //! then min-p, top-k and top-p truncation and a Gumbel-max draw. Temperature
 //! zero is exact greedy. Asked for logprobs, the epilogue also lands the
-//! sampled token's log-probability under the model's raw logits and the
-//! `top_logprobs` likeliest tokens', as vLLM's `raw_logprobs` reports them.
 //!
 //! Asked for prompt logprobs, the prefill reads out every prompt row but the
 //! last and scores row `i` against token `i + 1`: its logprob, its rank and
@@ -61,17 +59,45 @@ pub struct Sampling {
     /// Land each sampled token's logprob and this many likeliest
     /// alternatives' (`Some(0)`: the sampled token's alone).
     pub logprobs: Option<u32>,
+    pub logprobs_mode: LogprobsMode,
     /// Score every prompt token after the first under the rows before it,
     /// with its rank and this many likeliest alternatives (vLLM's
     /// `prompt_logprobs`); a text prompt only.
     pub prompt_logprobs: Option<u32>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogprobsMode {
+    #[default]
+    RawLogprobs,
+    RawLogits,
+    ProcessedLogprobs,
+    ProcessedLogits,
+}
+
+impl LogprobsMode {
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "raw_logprobs" => Self::RawLogprobs,
+            "raw_logits" => Self::RawLogits,
+            "processed_logprobs" => Self::ProcessedLogprobs,
+            "processed_logits" => Self::ProcessedLogits,
+            _ => return None,
+        })
+    }
+
+    fn processed(self) -> bool {
+        matches!(self, Self::ProcessedLogprobs | Self::ProcessedLogits)
+    }
+
+    fn logits(self) -> bool {
+        matches!(self, Self::RawLogits | Self::ProcessedLogits)
+    }
+}
+
 /// The most alternatives a step reports, as OpenAI caps `top_logprobs`.
 pub const MAX_TOP_LOGPROBS: u32 = 20;
 
-/// A sampled token's log-probability under the model's raw logits, and the
-/// likeliest tokens' with theirs, most likely first.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Logprob {
     pub logprob: f32,
@@ -129,6 +155,7 @@ impl Default for Sampling {
             repetition_penalty: 1.0,
             min_p: 0.0,
             logprobs: None,
+            logprobs_mode: LogprobsMode::RawLogprobs,
             prompt_logprobs: None,
         }
     }
@@ -194,6 +221,7 @@ struct Knobs {
     presence: Option<Tensor>,
     /// A program constant: how many alternatives a step lands, if any.
     logprobs: Option<u32>,
+    logprobs_mode: LogprobsMode,
 }
 
 /// The channels a pass's knobs are seeded in.
@@ -206,6 +234,7 @@ struct KnobChannels {
     frequency: Option<Channel>,
     presence: Option<Channel>,
     logprobs: Option<u32>,
+    logprobs_mode: LogprobsMode,
 }
 
 impl KnobChannels {
@@ -225,6 +254,7 @@ impl KnobChannels {
             frequency: f(penalized && s.frequency_penalty != 0.0, s.frequency_penalty),
             presence: f(penalized && s.presence_penalty != 0.0, s.presence_penalty),
             logprobs: s.logprobs,
+            logprobs_mode: s.logprobs_mode,
         }
     }
 
@@ -240,6 +270,7 @@ impl KnobChannels {
             frequency: t(&self.frequency),
             presence: t(&self.presence),
             logprobs: self.logprobs,
+            logprobs_mode: self.logprobs_mode,
         }
     }
 }
@@ -264,7 +295,11 @@ fn sample(
     mask: Option<&Tensor>,
 ) -> (Tensor, Option<Tensor>, Option<Landed>) {
     let mut logits = reshape(intrinsics::output(0, "logits"), [vocab]);
-    let raw = k.logprobs.map(|_| logits.clone());
+    let processed = k.logprobs.is_some() && k.logprobs_mode.processed();
+    let raw = k
+        .logprobs
+        .filter(|_| !k.logprobs_mode.processed())
+        .map(|_| logits.clone());
     if let Some((counts, present)) = histogram {
         let zero = broadcast(0.0f32, [vocab]);
         let seen_out = gt(counts, &zero);
@@ -286,8 +321,8 @@ fn sample(
     if let Some(mask) = mask {
         logits = mask_apply(&logits, mask);
     }
-    let token = match k.temperature {
-        None => reduce_argmax(&logits),
+    let (token, drawn_from) = match k.temperature {
+        None => (reduce_argmax(&logits), processed.then(|| logits.clone())),
         Some(temperature) => {
             let scaled = &logits / temperature;
             let mut keep: Option<Tensor> = None;
@@ -316,12 +351,19 @@ fn sample(
                 Some(keep) => mask_apply(&scaled, keep),
                 None => scaled,
             };
-            gumbel_max(&truncated, r)
+            (
+                gumbel_max(&truncated, r),
+                processed.then(|| truncated.clone()),
+            )
         }
     };
     let next = histogram.map(|(counts, _)| scatter_add(counts, &token, 1.0f32));
-    let landed = raw.zip(k.logprobs).map(|(raw, top)| {
-        let lp = log_softmax(&raw);
+    let landed = raw.or(drawn_from).zip(k.logprobs).map(|(scored, top)| {
+        let lp = if k.logprobs_mode.logits() {
+            scored
+        } else {
+            log_softmax(&scored)
+        };
         let chosen = reshape(scalar_gather(&lp, reshape(&token, [1])), [1]);
         if top == 0 {
             return Landed {
@@ -824,6 +866,25 @@ mod tests {
         let rows = prompt_rows(&[-1.0], &[3.0], &[], &[], 0);
         assert_eq!(rows[0].top, Vec::new());
         assert_eq!(rows[0].rank, Some(3));
+    }
+
+    #[test]
+    fn logprobs_modes_go_by_vllms_names() {
+        assert_eq!(LogprobsMode::default(), LogprobsMode::RawLogprobs);
+        for (name, processed, logits) in [
+            ("raw_logprobs", false, false),
+            ("raw_logits", false, true),
+            ("processed_logprobs", true, false),
+            ("processed_logits", true, true),
+        ] {
+            let mode = LogprobsMode::from_name(name).unwrap();
+            assert_eq!(
+                (mode.processed(), mode.logits()),
+                (processed, logits),
+                "{name}"
+            );
+        }
+        assert_eq!(LogprobsMode::from_name("processed"), None);
     }
 
     #[test]
