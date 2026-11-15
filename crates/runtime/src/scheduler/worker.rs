@@ -518,24 +518,37 @@ pub(super) enum QueuedItem {
 /// The rows the scheduler's queued and in-flight launches ask a fire to
 /// carry, held as a rung want: the most they asked since the scheduler
 /// last slept with nothing to do, so a batch that breathes between its
-/// steps does not move the rung back and forth each step.
+/// steps does not move the rung back and forth each step. A raise the ask
+/// cannot take at once is funded under one of the batch's passes, and the
+/// batch's launches wider than a row wait for it ([`Self::waits`]).
 #[derive(Default)]
-struct BatchWant(Option<(usize, crate::store::shared::RungWant)>);
+struct BatchWant {
+    /// The rows asked, the ask, and the cap the raise toward them reaches.
+    held: Option<(usize, crate::store::shared::RungWant, u32)>,
+    funding: Option<crate::pipeline::fire::BatchRaise>,
+}
 
 impl BatchWant {
     fn ask(&mut self, engine: usize, rows: usize) {
-        if rows == 0 || self.0.as_ref().is_some_and(|(held, _)| *held >= rows) {
+        if rows == 0 || self.held.as_ref().is_some_and(|(held, ..)| *held >= rows) {
             return;
         }
         let rows32 = u32::try_from(rows).unwrap_or(u32::MAX);
         let want = crate::store::shared::want_rows(engine, rows32);
-        self.0 = Some((rows, want));
+        // A funding for a narrower ask is started again at this one.
+        self.funding = None;
         // As a pass's ask does: the rung is raised at once where nothing
         // moves, and a cap the walker lowered behind a rung still up is
         // lifted back, so the batch is not cut while the walk catches up.
-        if let Some(shared) = crate::store::registry::try_get(0, engine).and_then(|s| s.shared) {
-            crate::store::shared::raise_now(&shared, engine, rows32);
-        }
+        let reach = match crate::store::registry::try_get(0, engine).and_then(|s| s.shared) {
+            Some(shared) => {
+                crate::store::shared::raise_now(&shared, engine, rows32);
+                crate::store::shared::reach_for(&shared, rows32)
+            }
+            // No shared pool: the cap never moves.
+            None => 0,
+        };
+        self.held = Some((rows, want, reach));
     }
 
     /// Asks the rows one fire of `fires` (the queued and in-flight
@@ -550,8 +563,58 @@ impl BatchWant {
         self.ask(engine, count.count(fires).min(max_forward_tokens));
     }
 
+    /// Whether the rung is short of the held ask.
+    fn short(&self, engine: usize) -> bool {
+        self.held
+            .as_ref()
+            .is_some_and(|&(.., reach)| crate::store::shared::fire_cap(engine) < reach)
+    }
+
+    /// Funds the raise the held ask lacks under `funder` (a queued pass's
+    /// process and its quorum), as a pass funds its own: the room is asked
+    /// of the planner, and the walker moves the span's state out. Once the
+    /// cap reaches the ask, the funding goes.
+    fn fund(&mut self, engine: usize, funder: impl FnOnce() -> Option<(uuid::Uuid, uuid::Uuid)>) {
+        if !self.short(engine) {
+            self.funding = None;
+            return;
+        }
+        if self.funding.is_some() {
+            return;
+        }
+        // The reach again, before a raise is funded toward it: the
+        // programs' fire terms may have moved the widest rung that fits.
+        let Some(shared) = crate::store::registry::try_get(0, engine).and_then(|s| s.shared) else {
+            return;
+        };
+        let Some((rows, _, reach)) = self.held.as_mut() else {
+            return;
+        };
+        let rows = u32::try_from(*rows).unwrap_or(u32::MAX);
+        *reach = crate::store::shared::reach_for(&shared, rows);
+        if crate::store::shared::fire_cap(engine) >= *reach {
+            return;
+        }
+        if let Some((pid, quorum)) = funder() {
+            self.funding = crate::pipeline::fire::BatchRaise::start(engine, pid, quorum, rows);
+        }
+    }
+
+    /// Whether the batch's launches wider than a row wait for the raise its
+    /// ask is funded for: a wave arriving at a lowered rung is cut at the
+    /// rung it asked, never at the narrower one standing, as a pass waits
+    /// for its own raise. A raise whose room is refused holds nothing (the
+    /// passes' own asks say so by name).
+    fn waits(&self, engine: usize) -> bool {
+        self.funding
+            .as_ref()
+            .is_some_and(|funding| !funding.refused())
+            && self.short(engine)
+    }
+
     fn release(&mut self) {
-        self.0 = None;
+        self.held = None;
+        self.funding = None;
     }
 }
 
@@ -1312,6 +1375,19 @@ impl BatchScheduler {
                 queued.chain(flying),
                 limits.max_forward_tokens,
             );
+            // A raise the ask cannot take at once is funded under a queued
+            // pass's process, and the wave's launches wider than a row wait
+            // for it rather than be cut at the rung standing; decodes go on.
+            batch_want.fund(engine_id, || {
+                pending.items.iter().find_map(|item| match item {
+                    QueuedItem::Launch(launch) if launch.request.request.rung_rows() > 1 => {
+                        launch.request.process_id.zip(launch.request.pipeline_id)
+                    }
+                    _ => None,
+                })
+            });
+            let raise_waits = batch_want.waits(engine_id);
+            let held_past = if raise_waits { 1 } else { usize::MAX };
             let cap = crate::store::shared::fire_cap(engine_id);
             let mut stepped = limits;
             stepped.max_forward_tokens = stepped.max_forward_tokens.min(cap as usize).max(1);
@@ -1338,6 +1414,7 @@ impl BatchScheduler {
                 &mut scan_cache,
                 &mut slot_buffer,
                 stopping,
+                held_past,
             );
             progress |= dispatched;
             if stopping
@@ -1442,6 +1519,11 @@ impl BatchScheduler {
                         }
                         settled = control_settle_wait, if have_control_settles => {
                             let _ = settled;
+                            Ok(Some(SchedulerItem::Nudge))
+                        }
+                        // The launches the batch's raise holds go once the
+                        // rung moves.
+                        () = crate::store::shared::rung_watch(engine_id), if raise_waits => {
                             Ok(Some(SchedulerItem::Nudge))
                         }
                     }
@@ -2047,6 +2129,7 @@ impl BatchScheduler {
         scan_cache: &mut ScanCache,
         slot_buffer: &mut SlotBuffer,
         stopping: bool,
+        held_past: usize,
     ) -> (bool, Option<Duration>) {
         let (mut progress, wait_hint) = Self::dispatch_frame_work(
             scan_cache,
@@ -2062,6 +2145,7 @@ impl BatchScheduler {
             limits,
             stats,
             stopping,
+            held_past,
         );
         let mut close_rotations = 0usize;
         let mut rotated = false;
@@ -2297,6 +2381,7 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
         stopping: bool,
+        held_past: usize,
     ) -> (bool, Option<Duration>) {
         let mut progress = false;
         let mut wait_hint: Option<Duration> = None;
@@ -2411,6 +2496,7 @@ impl BatchScheduler {
                 limits,
                 stats,
                 &waves,
+                held_past,
             );
             progress |= frame_progress;
             if !posted {
@@ -2467,6 +2553,7 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
         waves: &[Vec<u64>],
+        held_past: usize,
     ) -> (bool, bool) {
         let mut progress = false;
         let mut slot_of: HashMap<u64, (usize, usize)> =
@@ -2488,9 +2575,11 @@ impl BatchScheduler {
         while let Some(item) = pending.pop_front() {
             match item {
                 // Past the pool's activation rung (SPEC decision 6): it waits
-                // until the rung is back.
+                // until the rung is back; wider than `held_past` (a row while
+                // the batch's funded raise is pending), until the raise lands.
                 QueuedItem::Launch(launch)
-                    if launch.request.request.rung_rows() > limits.max_forward_tokens =>
+                    if launch.request.request.rung_rows()
+                        > limits.max_forward_tokens.min(held_past) =>
                 {
                     kept.push_back(QueuedItem::Launch(launch));
                 }
@@ -3016,6 +3105,23 @@ mod tests {
         assert_eq!(count.count(&[carrying, fire_of(2..6, 1)]), 6 + 38);
     }
 
+    /// Where nothing moves the rung (no shared pool) the batch's ask is
+    /// never short, funds nothing and holds nothing back.
+    #[test]
+    fn an_ask_no_pool_moves_holds_nothing() {
+        const ENGINE: usize = 9204;
+        let wave: Vec<_> = (0..40).map(|seat| fire_of(seat..seat + 1, 125)).collect();
+        let mut count = RowCount::default();
+        let mut want = BatchWant::default();
+        want.ask_for(ENGINE, &mut count, &wave, 5120);
+        want.fund(ENGINE, || {
+            Some((uuid::Uuid::new_v4(), uuid::Uuid::new_v4()))
+        });
+        assert!(!want.short(ENGINE));
+        assert!(want.funding.is_none());
+        assert!(!want.waits(ENGINE));
+    }
+
     /// Decode-only lanes still ask their lane count.
     #[test]
     fn a_decode_batch_asks_its_lane_count() {
@@ -3093,6 +3199,7 @@ mod tests {
             &mut ScanCache::default(),
             &mut SlotBuffer::new(),
             false,
+            usize::MAX,
         );
         assert!(!progress, "nothing left the queue");
         assert_eq!(pending.len(), 2);
