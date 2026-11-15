@@ -274,6 +274,7 @@ pub struct Shell {
     scratch: Scratch,
     inputs: Vec<Inputs>,
     readout: Vec<Buffer>,
+    readout_runs: Vec<Option<Buffer>>,
     /// The widest row a lane reads back, in bytes.
     readout_row_bytes: u64,
     outputs: Vec<poem_exec::feeds::ClassOutput>,
@@ -1094,6 +1095,7 @@ impl PreparedLoad<'_> {
             scratch,
             inputs,
             readout,
+            readout_runs: (0..arms).map(|_| None).collect(),
             readout_row_bytes,
             outputs,
             grid_chains,
@@ -2184,9 +2186,48 @@ impl Shell {
                 }
             }
         };
+        let runs: Vec<Option<Vec<u32>>> = prepared
+            .attachments
+            .iter()
+            .map(|attached| {
+                let from = attached.lane as usize;
+                let end = from + attached.lanes.max(1) as usize;
+                let run =
+                    pass_readouts(&prepared.readout_first, &prepared.readout_count, from, end);
+                let apart = run.windows(2).any(|pair| pair[1] != pair[0] + 1);
+                (self.gathers_readout && !attached.adapter_only && apart).then_some(run)
+            })
+            .collect();
+        let row_bytes: u64 = self
+            .outputs
+            .iter()
+            .filter(|out| out.decl.readout)
+            .map(|out| {
+                u64::from(out.decl.width)
+                    * poem_compiler::arena::elem_bytes(out.decl.dtype).unwrap_or(0)
+            })
+            .sum();
+        let need: u64 = runs
+            .iter()
+            .flatten()
+            .map(|run| (2 * run.len() as u64 - 1) * row_bytes)
+            .sum();
+        if need > 0
+            && self.readout_runs[prepared.arm]
+                .as_ref()
+                .is_none_or(|held| held.bytes() < need)
+        {
+            self.readout_runs[prepared.arm] = Some(Buffer::zeroed(&self.device, need)?);
+        }
+        let into = self.readout_runs[prepared.arm].clone();
+        let mut runs_at = 0u64;
         let mut staged = Vec::with_capacity(prepared.attachments.len());
-        for attached in prepared.attachments.iter().filter(|a| !a.adapter_only) {
+        for (attached, run) in prepared.attachments.iter().zip(&runs) {
+            if attached.adapter_only {
+                continue;
+            }
             let reads = self.programs.reads(attached.instance)?;
+            let mut placed: Vec<(usize, u64)> = Vec::new();
             for k in 0..attached.lanes.max(1) {
                 let at = attached.lane as usize + k as usize;
                 let Some((fire_lane, row)) = prepared
@@ -2207,14 +2248,54 @@ impl Shell {
                     {
                         continue;
                     }
-                    let (offset, width, dtype, stride) =
+                    let (mut offset, width, dtype, stride) =
                         self.output_seat(prepared, out, at, fire_lane, &row_of)?;
                     let name = self.outputs[out].decl.name.clone();
+                    let base = match (run, &into) {
+                        (Some(run), Some(into)) if self.outputs[out].decl.readout => {
+                            let row_bytes = u64::from(width)
+                                * poem_compiler::arena::elem_bytes(dtype).unwrap_or(0);
+                            let start = match placed.iter().find(|(held, _)| *held == out) {
+                                Some(&(_, start)) => start,
+                                None => {
+                                    let (plane, _, _) =
+                                        self.plane_row(prepared, self.outputs[out].values[0])?;
+                                    let last = *run.last().expect("a readout run holds a row");
+                                    let padded = run
+                                        .iter()
+                                        .copied()
+                                        .chain(std::iter::repeat_n(last, run.len() - 1));
+                                    let start = runs_at;
+                                    for row in padded {
+                                        frame.copy_span(
+                                            self.arena.store(),
+                                            plane + u64::from(row) * row_bytes,
+                                            into,
+                                            runs_at,
+                                            row_bytes,
+                                        )?;
+                                        runs_at += row_bytes;
+                                    }
+                                    placed.push((out, start));
+                                    start
+                                }
+                            };
+                            let before = pass_readouts(
+                                &prepared.readout_first,
+                                &prepared.readout_count,
+                                attached.lane as usize,
+                                at,
+                            );
+                            offset = start + before.len() as u64 * row_bytes;
+                            into
+                        }
+                        _ => self.arena.store(),
+                    };
                     self.programs.bind_output(
                         attached.instance,
                         &name,
                         k,
-                        self.arena.store(),
+                        base,
                         offset,
                         dtype,
                         width,
@@ -2223,6 +2304,10 @@ impl Shell {
                 }
             }
             staged.push(attached.instance);
+        }
+        #[cfg(target_vendor = "apple")]
+        if need > 0 {
+            frame.barrier(&self.device)?;
         }
         let mut refusal = None;
         for (instance, launched) in self.programs.stage_batched(&self.device, frame, &staged)? {
@@ -4247,6 +4332,15 @@ fn token_cell(grid: &mut Vec<i32>, boxed: [u32; 3], p: [u32; 3], row: u32) -> Op
     row.checked_add(t.checked_mul(h)?.checked_mul(w)?)
 }
 
+fn pass_readouts(first: &[u32], count: &[u32], from: usize, end: usize) -> Vec<u32> {
+    (from..end.min(first.len()))
+        .flat_map(|lane| {
+            let at = first[lane];
+            at..at + count.get(lane).copied().unwrap_or(0)
+        })
+        .collect()
+}
+
 fn token_refusal(lane: u32) -> Fault {
     Fault::Program {
         at: "serve::prepare",
@@ -4353,4 +4447,18 @@ fn covers(ceiling: &FireRows, fire: &FireRows) -> bool {
         && fire.voxels <= ceiling.voxels
         && fire.clips <= ceiling.clips
         && fire.readouts <= ceiling.readouts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pass_readouts;
+
+    #[test]
+    fn a_mixed_pass_reads_its_lanes_in_its_own_order() {
+        let (first, count) = ([1, 0, 2, 3], [1, 1, 1, 1]);
+        assert_eq!(pass_readouts(&first, &count, 0, 4), [1, 0, 2, 3]);
+        assert_eq!(pass_readouts(&first, &count, 2, 4), [2, 3]);
+        assert_eq!(pass_readouts(&[0, 1, 3], &[1, 2, 1], 0, 3), [0, 1, 2, 3]);
+        assert_eq!(pass_readouts(&[4, 0], &[2, 3], 0, 2), [4, 5, 0, 1, 2]);
+    }
 }
