@@ -749,31 +749,6 @@ fn group_fold(fold: &geometry::Fold, first: usize, frozen: u32, end: u32) -> rs:
     }
 }
 
-/// Before a recurrent fire: its working sets' frozen lengths are known, so
-/// a fire that folded one by a count the device computed has settled.
-async fn settle_device_folds<C: FireContext>(
-    ctx: &mut C,
-    fwd: &Resource<ForwardPass>,
-    fires: &PendingFires,
-    lanes: &mut PassLanes,
-) -> Anyhow<Result<(), String>> {
-    if lanes.places.iter().all(|place| place.folded_exact) {
-        return Ok(Ok(()));
-    }
-    drain_pipeline_fires(ctx, fires).await?;
-    *lanes = pass_lanes(ctx, fwd)?;
-    Ok(
-        match lanes.places.iter().position(|place| !place.folded_exact) {
-            Some(lane) => Err(format!(
-                "pipeline: lane {lane}'s working set was folded by a count the device computed \
-                 and the engine did not report; its recurrent state cannot go on from a frozen \
-                 length the host does not know"
-            )),
-            None => Ok(()),
-        },
-    )
-}
-
 /// Whether the pass's program adapts the KV it writes beyond its tokens.
 fn lora_program_of<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyhow<bool> {
     let p = ctx.resources().get(fwd)?;
@@ -3121,12 +3096,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 p.decode_envelope,
             )
         };
-        let mut pass_lanes = pass_lanes(ctx, &fwd)?;
-        if !rs_reps.is_empty()
-            && let Err(error) = settle_device_folds(ctx, &fwd, &pipe_fires, &mut pass_lanes).await?
-        {
-            return Ok(Err(error));
-        }
+        // A recurrent state a device-counted fold left unsettled is staged
+        // on the frozen length as a lower bound, and the engine replays
+        // from where its record stands: the fire goes ahead of the settle.
+        // It could not wait for it: a frame's fires are dispatched once all
+        // of them have arrived, this one among them.
+        let pass_lanes = pass_lanes(ctx, &fwd)?;
         let ws = pass_lanes.kv[0].clone();
         let stores = crate::store::registry::get(ws.model, ws.engine);
         let page_size = stores.kv_page_size;
@@ -6301,11 +6276,27 @@ mod fold_tests {
         failure: PipelineFailure,
         kv: KvWorkingSet,
         rs: RsWorkingSetId,
+        /// Where the pass's fires are staged from.
+        cursor: CursorCell,
         /// What its first lane reports under, where the device counts.
         tag: u64,
     }
 
     impl Flight {
+        /// The pass's next fire, submitted behind the one in flight: its
+        /// completion, and what its first lane reports under.
+        fn next(&self, fold: &geometry::Fold) -> (crate::engine::WorkItemCompletion, u64) {
+            submit(
+                &self.kv,
+                self.rs,
+                &self.cursor,
+                &self.fires,
+                &self.failure,
+                fold,
+                None,
+            )
+        }
+
         fn fork(&self) -> Result<u32, RsError> {
             let mut rs = self.stores.rs.lock().unwrap();
             let child = rs.fork(self.rs)?;
@@ -6355,7 +6346,37 @@ mod fold_tests {
         };
         let cell = cursor(4, 12);
         cell.lock().unwrap().folded_exact = exact;
-        let pass = lanes(&[&cell]);
+        let kv = KvWorkingSet::new(model, 0, id, 8);
+        let failure: PipelineFailure = Arc::new(Mutex::new(None));
+        let fires = Arc::new(PendingFireQueue::new());
+        let (completion, tag) = submit(&kv, rs, &cell, &fires, &failure, fold, reach);
+        Flight {
+            stores,
+            fires,
+            completion,
+            failure,
+            kv,
+            rs,
+            cursor: cell,
+            tag,
+        }
+    }
+
+    /// A fire of a pass on `kv` and `rs`, submitted: staged on what
+    /// `cursor` states now, its set marked, queued on `fires` behind the
+    /// pass's fires in flight, the cursor moved on. Its completion, and
+    /// what its first lane reports under, where the device counts.
+    fn submit(
+        kv: &KvWorkingSet,
+        rs: RsWorkingSetId,
+        cursor: &CursorCell,
+        fires: &PendingFires,
+        failure: &PipelineFailure,
+        fold: &geometry::Fold,
+        reach: Option<u64>,
+    ) -> (crate::engine::WorkItemCompletion, u64) {
+        let stores = crate::store::registry::get(kv.model, kv.engine);
+        let pass = lanes(&[cursor]);
         let mut req = request(1);
         let mut tags = Vec::new();
         let by = fold_at(
@@ -6370,21 +6391,18 @@ mod fold_tests {
             &mut tags,
         )
         .expect("the fire folds");
-        let kv = KvWorkingSet::new(model, 0, id, 8);
         let completion = crate::engine::WorkItemCompletion::deferred_with_guard(None);
         let mut parts = vec![FireWs {
-            ws: id,
-            kvtxn: KvTxnGuard::new(model, 0, None),
+            ws: kv.id,
+            kvtxn: KvTxnGuard::new(kv.model, kv.engine, None),
             log: None,
             lease: kv.fire_lease().expect("lease the submitted working set"),
             fold: Some(FoldAt { by, decoded: false }),
             reports: tags,
             staged: None,
         }];
-        // The submit.
         mark_device_folds(&stores, &completion, &mut parts);
-        let failure: PipelineFailure = Arc::new(Mutex::new(None));
-        let fires = Arc::new(PendingFireQueue::new());
+        let settles = settling(&parts);
         fires
             .lock()
             .unwrap()
@@ -6393,23 +6411,16 @@ mod fold_tests {
                 checkpoints: Vec::new(),
                 kv: parts,
                 device_geometry: true,
-                rstxn: RsTxnsGuard::new(model, 0, None),
-                model,
-                engine: 0,
+                rstxn: RsTxnsGuard::new(kv.model, kv.engine, None),
+                model: kv.model,
+                engine: kv.engine,
                 fwd_rep: u32::MAX,
                 cells: Vec::new(),
                 failure: failure.clone(),
                 retired: None,
             }));
-        Flight {
-            stores,
-            fires,
-            completion,
-            failure,
-            kv,
-            rs,
-            tag: req.lanes[0].reports,
-        }
+        advance_cursors(&pass, None, &[], fold, &settles);
+        (completion, req.lanes[0].reports)
     }
 
     /// The in-pass fork: the guest forks a set between its own pipelined
@@ -6557,6 +6568,137 @@ mod fold_tests {
                 Err(dropped())
             );
         }
+    }
+
+    // A pass that runs ahead submits a frame's fires one after another, and
+    // the scheduler dispatches none of them before the frame's last has
+    // arrived. A fire behind one that folds by a count the device computes
+    // is therefore staged before that count exists.
+
+    use crate::scheduler::frame::{FramePlan, FramePolicy, FrameStamp, QueuedFireIds};
+
+    /// The scheduler's frames, two fires each, as one lane fills them.
+    struct Frames {
+        policy: FramePolicy,
+        lane: uuid::Uuid,
+        arrived: Vec<u64>,
+    }
+
+    impl Frames {
+        fn of_two(lane: uuid::Uuid) -> Self {
+            Self {
+                policy: FramePolicy::new(2, 64, 4096, None),
+                lane,
+                arrived: Vec::new(),
+            }
+        }
+
+        /// The fire in `slot` of the lane's first frame reaches the
+        /// scheduler, under its slot as its id.
+        fn arrive(&mut self, slot: u32) {
+            let stamp = FrameStamp {
+                lane: self.lane,
+                seq: 0,
+                slot,
+                fires: 2,
+            };
+            let fire = u64::from(slot);
+            self.policy
+                .on_fire_enqueued(stamp, Some(self.lane), fire, 1, 1);
+            self.arrived.push(fire);
+        }
+
+        /// The fires the scheduler dispatches now, wave by wave: none while
+        /// it holds the frame for a fire still to arrive.
+        fn dispatched(&mut self) -> Vec<Vec<u64>> {
+            let queued: QueuedFireIds = self.arrived.iter().copied().collect();
+            let none_blocked = std::collections::HashSet::new();
+            match self.policy.plan_dispatch(
+                &queued,
+                &none_blocked,
+                false,
+                crate::rt::Instant::now(),
+            ) {
+                FramePlan::Dispatch(waves) => waves,
+                FramePlan::Hold(_) | FramePlan::Park => Vec::new(),
+                FramePlan::Terminate(lanes) => panic!("the scheduler gave up on {lanes:?}"),
+            }
+        }
+    }
+
+    /// The first fire of a frame of two is submitted, folding by a count
+    /// the device computes: the scheduler holds it for the second, and the
+    /// host no longer knows where the set is frozen.
+    fn first_of_a_frame() -> (Flight, Frames, TestContext) {
+        let ctx = Flight::context();
+        let mut frames = Frames::of_two(ctx.id);
+        let flight = in_flight(&geometry::Fold::Device, true, None);
+        frames.arrive(0);
+        assert!(
+            frames.dispatched().is_empty(),
+            "a frame is dispatched whole"
+        );
+        let cursor = flight.cursor.lock().unwrap().clone();
+        assert!(!cursor.folded_exact && cursor.unsettled == 1 && cursor.folded == 4);
+        (flight, frames, ctx)
+    }
+
+    /// The second fire is staged on the frozen length as a lower bound,
+    /// behind the first: the frame seals and dispatches both, and the
+    /// counts they report, taken in order, leave the set frozen where the
+    /// device left it, in both stores and on the cursor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_of_fires_that_fold_by_a_device_count_seals_and_dispatches() -> Anyhow<()> {
+        let device = geometry::Fold::Device;
+        let (flight, mut frames, mut ctx) = first_of_a_frame();
+        let (second, tag) = flight.next(&device);
+        assert!(tag != 0 && tag != flight.tag, "each fire reports its own");
+        let cursor = flight.cursor.lock().unwrap().clone();
+        assert!(!cursor.folded_exact && cursor.unsettled == 2 && cursor.folded == 4);
+        frames.arrive(1);
+        assert_eq!(
+            frames.dispatched(),
+            [[0], [1]],
+            "the frame is whole: both fires go, in slot order"
+        );
+        assert_eq!(flight.fork(), Err(RsError::DeviceFoldUnsettled));
+        for (completion, tag) in [(&flight.completion, flight.tag), (&second, tag)] {
+            record_kv_writes(vec![report(tag, 3)]);
+            resolve_test_completion(completion, false);
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drain_pipeline_fires(&mut ctx, &flight.fires),
+        )
+        .await
+        .expect("both fires settle")?;
+        assert_eq!(flight.frozen(), (10, 10), "the first fold, then the second");
+        let cursor = flight.cursor.lock().unwrap().clone();
+        assert!(cursor.folded_exact && cursor.unsettled == 0 && cursor.folded == 10);
+        assert_eq!(flight.fork(), Ok(10));
+        assert!(flight.failure.lock().unwrap().is_none());
+        Ok(())
+    }
+
+    /// The control. Until the second fire was staged on a lower bound, the
+    /// submit of a recurrent fire first ran the pass's fires in flight to
+    /// their end wherever a frozen length was not exact. In a frame that
+    /// wait is for a fire the scheduler dispatches only once the fire that
+    /// waits has arrived: it does not end, and the frame never fills.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fire_that_waited_for_the_fold_before_it_would_hold_its_own_frame() {
+        let (flight, mut frames, mut ctx) = first_of_a_frame();
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            drain_pipeline_fires(&mut ctx, &flight.fires),
+        )
+        .await;
+        assert!(waited.is_err(), "nothing ends the wait");
+        assert!(
+            frames.dispatched().is_empty(),
+            "the fire it waits for is held for the fire that waits"
+        );
+        assert_eq!(flight.frozen(), (4, 4));
     }
 }
 
