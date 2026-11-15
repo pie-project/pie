@@ -1,4 +1,3 @@
-pub(crate) mod arming;
 pub(crate) mod batch;
 pub(crate) mod dispatch;
 pub(crate) mod fire_plan;

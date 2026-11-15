@@ -50,9 +50,9 @@ impl Session {
                         serde_json::Value::from(total),
                     );
 
-                    // Every way a fire was served other than the load
-                    // prepared, or refused, as the engines serving the
-                    // model counted it: summed, and each engine's.
+                    // Every way a fire was served other than by a body
+                    // the load captured, or refused, as the engines serving
+                    // the model counted it: summed, and each engine's.
                     let lives = crate::engine::backend::lives();
                     for tally in ::engine::live::Tally::ALL {
                         let each: Vec<u64> =
@@ -66,6 +66,12 @@ impl Session {
                             serde_json::Value::from(each),
                         );
                     }
+                    // The rungs each engine stated eager at load: where an
+                    // `engine.eager` fire is as stated, and no bug.
+                    stats.insert(
+                        format!("{}.engine.eager_rungs_by_engine", model_name),
+                        serde_json::Value::from(crate::engine::backend::eager_rungs()),
+                    );
 
                     let inf = crate::scheduler::get_stats().await;
                     stats.insert(

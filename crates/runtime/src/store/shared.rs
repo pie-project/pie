@@ -272,16 +272,6 @@ pub fn cap_for(shared: &Shared, rows: u32) -> u32 {
     }
 }
 
-/// The rung fires of `rows` take on `engine` now: the narrowest that holds
-/// them, and no wider than the widest rung the engine has armed
-/// ([`::engine::live`]). Every serving fire replays a captured body, so a
-/// raise to a rung whose bodies are still being captured waits on them,
-/// and fires serve at the rungs armed meanwhile.
-#[must_use]
-pub fn rung_goal(pool: &SharedPool, engine: usize, rows: u32) -> u32 {
-    pool.armed_rung_for(rows, crate::engine::live(engine).armed_through())
-}
-
 /// One line for a raise taken: at debug where the rung stood (a guest term
 /// that grew under it, once a bind), at info where the rung moved.
 pub(crate) fn raise_said(engine: usize, rung: u32, moved: usize, stood: bool) {
@@ -305,7 +295,7 @@ pub(crate) fn raise_said(engine: usize, rung: u32, moved: usize, stood: bool) {
 pub fn raise_now(shared: &Shared, engine: usize, rows: u32) {
     let mut pool = shared.lock().unwrap();
     let rungs = pool.rungs();
-    let goal = rung_goal(&pool, engine, rows);
+    let goal = pool.rung_for(rows);
     let lifted = |rung: u32| {
         if rungs.last() == Some(&rung) {
             u32::MAX
@@ -817,6 +807,9 @@ impl SharedPool {
             },
             reserved: Vec::new(),
             act_chunks: Vec::new(),
+            eager_rungs: Vec::new(),
+            held_bytes: 0,
+            outside_bytes: 0,
             host_chunks: 0,
             disk_chunks: 0,
             weights: Vec::new(),
@@ -1721,34 +1714,13 @@ impl SharedPool {
             })
     }
 
-    /// Whether every slot of a lease lies below the activation span: kv
-    /// list refs `pages`, then a record's pieces `records` (fixed shapes
-    /// in order). A lowered rung lends the span's chunks to state, and a
-    /// raise takes them back while a step's capture may run on them.
-    #[must_use]
-    pub fn below_span(&self, pages: &[u32], records: &[u32]) -> bool {
-        let span = self.pool.total_chunks() - self.pool.act_max();
-        let under = |shape: ShapeId, slot_ref: u32| {
-            let chunk = self.slot(shape, slot_ref).chunk;
-            self.pool
-                .physical(chunk)
-                .is_some_and(|physical| physical < span)
-        };
-        let list = self.list.map(|list| list.pool);
-        let pages_under = list.is_none_or(|list| pages.iter().all(|&r| under(list, r)));
-        let mut pieces = records.iter();
-        let records_under = self.fixed.iter().all(|shape| {
-            (0..shape.pieces).all(|_| pieces.next().is_none_or(|&r| under(shape.pool, r)))
-        });
-        pages_under && records_under
-    }
-
     /// The engine holds `bytes` of the range it stated back
-    /// ([`::engine::live::Live::held`]): no state chunk is opened in the
-    /// top `bytes` of the span below the activation, which the engine binds
-    /// none of yet; all of it again once it holds none.
+    /// ([`::engine::chunk::ChunkFacts::held_bytes`], a load fact the pool
+    /// is seeded with once): no state chunk is opened in the top `bytes` of
+    /// the span below the activation, which the engine binds none of; all
+    /// of it where it holds none.
     /// Whether the ceiling rose: room opened that a planner waiter may be
-    /// short of, so the caller wakes them.
+    /// short of.
     pub fn hold_back(&mut self, bytes: u64) -> bool {
         let ceiling = self.ceiling_for(bytes);
         let rose = ceiling > self.pool.ceiling();
@@ -1773,38 +1745,21 @@ impl SharedPool {
             .max(self.pool.reserved_chunks())
     }
 
-    /// The most the pool may map while the engine holds `bytes` back: the
-    /// prefix segments wholly under what it binds
-    /// ([`crate::store::slots::SlotPool::backs`]) and the top span,
-    /// committed from the load; the whole range when it holds none.
+    /// The most the pool may map under what the engine holds back
+    /// ([`Self::hold_back`]): the prefix segments wholly under what it
+    /// binds ([`crate::store::slots::SlotPool::backs`]) and the top span,
+    /// committed from the load; the whole range where it holds none.
     #[must_use]
-    pub fn bound_bytes(&self, bytes: u64) -> u64 {
+    pub fn bound_bytes(&self) -> u64 {
         let total = self.pool.total_chunks();
-        if bytes == 0 {
+        let ceiling = self.pool.ceiling();
+        if ceiling >= total {
             return u64::from(total) * self.pool.chunk_bytes();
         }
         let seg = self.pool.segments().segment_chunks().max(1);
         let top_start = self.pool.top_segment() * seg;
-        let prefix_end = (self.ceiling_for(bytes) / seg * seg).min(top_start);
+        let prefix_end = (ceiling / seg * seg).min(top_start);
         u64::from(prefix_end + (total - top_start)) * self.pool.chunk_bytes()
-    }
-
-    /// [`Self::rung_for`], no wider than `armed` (a rung's tokens): the
-    /// widest rung armed at or under it, else the smallest.
-    #[must_use]
-    pub fn armed_rung_for(&self, rows: u32, armed: u32) -> u32 {
-        let goal = self.rung_for(rows);
-        if goal <= armed {
-            return goal;
-        }
-        let rungs = self.pool.rungs();
-        rungs
-            .iter()
-            .copied()
-            .filter(|&rung| rung <= armed)
-            .max()
-            .or_else(|| rungs.first().copied())
-            .unwrap_or(goal)
     }
 
     /// The smallest rung whose fires carry `rows`, the largest past every
