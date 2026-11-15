@@ -50,6 +50,13 @@ struct Input {
     /// answer. Off unless the request says `"bench_accept": true`.
     #[serde(default)]
     bench_accept: bool,
+    /// DIAGNOSTIC: report, for every generated token, the top-1 and top-2
+    /// logits of the row that produced it (`top_trace`, `margin_trace`), so a
+    /// parting between two runs reads as a near-tie or a real gap, and two
+    /// runs' logits can be compared row by row. A `top_k` over the vocabulary
+    /// in every fire's epilogue.
+    #[serde(default)]
+    margin: bool,
 }
 
 fn default_prompt() -> String {
@@ -99,6 +106,10 @@ struct Output {
     drafted: usize,
     accepted: usize,
     acceptance_rate: f64,
+    /// With `margin`: per token, the top-1 logit of the row that chose it.
+    top_trace: Vec<f32>,
+    /// With `margin`: per token, top-1 minus top-2 of that row.
+    margin_trace: Vec<f32>,
 }
 
 fn draft_from_cache(tokens: &[u32], draft_length: usize, max_ngram: usize) -> Vec<u32> {
@@ -135,7 +146,8 @@ async fn fire(
     base: u32,
     fold: Option<u32>,
     last_only: bool,
-) -> Result<Vec<u32>> {
+    margin: bool,
+) -> Result<(Vec<u32>, Vec<[f32; 2]>)> {
     let rows = tokens.len() as u32;
     let total = base + rows;
 
@@ -145,6 +157,8 @@ async fn fire(
     let read = if last_only { rows - 1 } else { 0 };
     let readout = Channel::from_iter(read..rows);
     let truth_out = Channel::new([rows - read], dtype::i32);
+    let read_rows = rows - read;
+    let top_out = margin.then(|| Channel::new([read_rows * 2], dtype::f32));
     let fold_len = fold.map(|n| Channel::from([n]));
     let fold = match &fold_len {
         Some(count) => Fold::Count(count),
@@ -163,16 +177,31 @@ async fn fire(
         },
     )?;
     fwd.epilogue(move || {
-        truth_out.put(reduce_argmax(intrinsics::output(0, "logits")));
+        let logits = intrinsics::output(0, "logits");
+        truth_out.put(reduce_argmax(&logits));
+        if let Some(top_out) = &top_out {
+            let (top, _) = top_k(&logits, 2);
+            top_out.put(reshape(top, [read_rows * 2]));
+        }
     });
     fwd.submit(pipeline).context("verify-and-extend")?;
 
-    Ok(truth_out
+    let truth = truth_out
         .take_host::<Vec<i32>>()
         .await?
         .into_iter()
         .map(|t| t as u32)
-        .collect())
+        .collect();
+    let tops = match top_out {
+        Some(top_out) => top_out
+            .take_host::<Vec<f32>>()
+            .await?
+            .chunks_exact(2)
+            .map(|pair| [pair[0], pair[1]])
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok((truth, tops))
 }
 
 /// What the decode loop needs from the target model: one greedy verify fire,
@@ -191,12 +220,18 @@ trait Target {
     fn checkpoint(&mut self) -> Result<()>;
     /// Returns to the last checkpoint; `false` when none was taken.
     fn restore(&mut self) -> bool;
+    /// The last fire's rows' top-1 and top-2 logits, when it reports them.
+    fn tops(&mut self) -> Vec<[f32; 2]> {
+        Vec::new()
+    }
 }
 
 struct Live {
     ws: WorkingSet,
     pipeline: Pipeline,
     ckpt: Option<WorkingSet>,
+    margin: bool,
+    tops: Vec<[f32; 2]>,
 }
 
 impl Target for Live {
@@ -207,7 +242,22 @@ impl Target for Live {
         fold: Option<u32>,
         last_only: bool,
     ) -> Result<Vec<u32>> {
-        fire(&self.ws, &self.pipeline, tokens, base, fold, last_only).await
+        let (truth, tops) = fire(
+            &self.ws,
+            &self.pipeline,
+            tokens,
+            base,
+            fold,
+            last_only,
+            self.margin,
+        )
+        .await?;
+        self.tops = tops;
+        Ok(truth)
+    }
+
+    fn tops(&mut self) -> Vec<[f32; 2]> {
+        std::mem::take(&mut self.tops)
     }
 
     fn checkpoint(&mut self) -> Result<()> {
@@ -232,6 +282,9 @@ impl Target for Live {
 
 struct Decoded {
     generated: Vec<u32>,
+    /// Per generated token, its row's top-1 and top-2 logits, when the
+    /// target reports them.
+    tops: Vec<[f32; 2]>,
     verification_steps: usize,
     stopped: bool,
     drafted: usize,
@@ -252,6 +305,8 @@ async fn decode<T: Target>(
 
     let truth = target.fire(prompt, 0, None, true).await?;
     let first = *truth.last().expect("a prefill answers its last row");
+    let seed_top = target.tops().last().copied();
+    let mut tops: Vec<[f32; 2]> = Vec::new();
 
     let mut committed: Vec<u32> = prompt.to_vec();
     let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
@@ -267,6 +322,7 @@ async fn decode<T: Target>(
     if !stopped {
         committed.push(x);
         generated.push(x);
+        tops.extend(seed_top);
         emit(1);
     }
     let mut base = n;
@@ -299,6 +355,8 @@ async fn decode<T: Target>(
         let proposed = window.len() - 1;
         drafted += proposed;
 
+        // Each window row's top-1/top-2, row `i` the one choosing window[i + 1].
+        let mut row_tops: Vec<[f32; 2]> = Vec::new();
         let (m, correction) = if is_stop_wait {
             let mut m = 0usize;
             let mut corr = 0u32;
@@ -312,6 +370,7 @@ async fn decode<T: Target>(
                     )
                     .await?;
                 verification_steps += 1;
+                row_tops.extend(target.tops().first().copied());
                 let pred = step_truth[0];
                 if idx < proposed
                     && (window[idx + 1] == pred
@@ -331,6 +390,7 @@ async fn decode<T: Target>(
             let fold = if is_ckpt_sync { None } else { Some(survivors) };
             let truth = target.fire(&window, base, fold, false).await?;
             verification_steps += 1;
+            row_tops = target.tops();
 
             // ── Verify: the longest matching prefix, and nothing after it.
             let mut m = 0usize;
@@ -351,13 +411,14 @@ async fn decode<T: Target>(
 
         // ── Commit `window[1 ..= m]` — `window[0]` was committed last round as
         //    the correction that produced it — then the new correction.
-        for &token in &window[1..=m] {
+        for (row, &token) in window[1..=m].iter().enumerate() {
             if !bench_accept && stop_tokens.contains(&token) {
                 stopped = true;
                 break;
             }
             committed.push(token);
             generated.push(token);
+            tops.extend(row_tops.get(row).copied());
             if generated.len() == input.max_tokens {
                 break;
             }
@@ -379,6 +440,7 @@ async fn decode<T: Target>(
         }
         committed.push(correction);
         generated.push(correction);
+        tops.extend(row_tops.get(m).copied());
         emit(generated.len() - prev_len);
 
         // Only the accepted run advances the sequence and survives in the
@@ -390,6 +452,7 @@ async fn decode<T: Target>(
 
     Ok(Decoded {
         generated,
+        tops,
         verification_steps,
         stopped,
         drafted,
@@ -411,6 +474,8 @@ async fn main(input: Input) -> Result<Output> {
         drafted: 0,
         accepted: 0,
         acceptance_rate: 0.0,
+        top_trace: Vec::new(),
+        margin_trace: Vec::new(),
     };
     if input.max_tokens == 0 {
         return Ok(empty());
@@ -437,9 +502,12 @@ async fn main(input: Input) -> Result<Output> {
         ws: WorkingSet::new(),
         pipeline: Pipeline::new(),
         ckpt: None,
+        margin: input.margin,
+        tops: Vec::new(),
     };
     let Decoded {
         generated,
+        tops,
         verification_steps,
         stopped,
         drafted,
@@ -468,6 +536,8 @@ async fn main(input: Input) -> Result<Output> {
         drafted,
         accepted,
         acceptance_rate,
+        top_trace: tops.iter().map(|t| t[0]).collect(),
+        margin_trace: tops.iter().map(|t| t[0] - t[1]).collect(),
     })
 }
 
@@ -485,6 +555,8 @@ mod tests {
     struct Toy {
         slots: Vec<u32>,
         saved: Option<Vec<u32>>,
+        /// The last fire's rows, top-1 standing for the token each chose.
+        tops: Vec<[f32; 2]>,
     }
 
     fn next(context: &[u32]) -> u32 {
@@ -507,9 +579,15 @@ mod tests {
             self.slots.extend_from_slice(tokens);
             let rows = tokens.len();
             let from = if last_only { rows - 1 } else { 0 };
-            Ok((from..rows)
+            let truth: Vec<u32> = (from..rows)
                 .map(|row| next(&self.slots[..=base + row]))
-                .collect())
+                .collect();
+            self.tops = truth.iter().map(|&t| [t as f32, 0.0]).collect();
+            Ok(truth)
+        }
+
+        fn tops(&mut self) -> Vec<[f32; 2]> {
+            std::mem::take(&mut self.tops)
         }
 
         fn checkpoint(&mut self) -> Result<()> {
@@ -548,6 +626,7 @@ mod tests {
             ckpt_sync: false,
             rollback_mode: Some(mode.into()),
             bench_accept: false,
+            margin: false,
         }
     }
 
@@ -555,6 +634,7 @@ mod tests {
         let mut toy = Toy {
             slots: Vec::new(),
             saved: None,
+            tops: Vec::new(),
         };
         ready(decode(&mut toy, input, &[100, 101, 102], stop_tokens, |_| {})).unwrap()
     }
@@ -588,6 +668,18 @@ mod tests {
         assert!(greedy.stopped && greedy.generated.len() == end);
         assert!(drafted.stopped);
         assert_eq!(drafted.generated, greedy.generated);
+    }
+
+    /// Every generated token's margin is that of the row which chose it.
+    #[test]
+    fn each_tokens_margin_is_its_own_rows() {
+        for mode in ["flush_free", "ckpt_sync", "stop_wait"] {
+            for draft_length in [0, 4] {
+                let out = run(&request(128, draft_length, mode), &[]);
+                let chose: Vec<u32> = out.tops.iter().map(|t| t[0] as u32).collect();
+                assert_eq!(chose, out.generated, "{mode} at draft {draft_length}");
+            }
+        }
     }
 
     /// Bench mode is there only when named, and then it runs full windows.
