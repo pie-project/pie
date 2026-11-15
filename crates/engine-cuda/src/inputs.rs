@@ -396,6 +396,15 @@ pub struct Staged {
     rs: Option<(u32, u32)>,
 }
 
+impl Staged {
+    /// The lanes the fire's lane tables run to, its packing's group bounds
+    /// among them.
+    #[must_use]
+    pub fn table_lanes(&self) -> u32 {
+        self.table_lanes
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct TokenInject {
     pub dst_off: u64,
@@ -1484,6 +1493,11 @@ impl Inputs {
         })
     }
 
+    /// Stages a fire's group masks: per mask its byte offsets a group, then
+    /// its bits. The offsets run to `table_lanes + 1` entries, as the
+    /// fire's group bounds do (`Staged::table_lanes`): the groups past the
+    /// fire's last are empty and repeat its last offset, so the kernel's
+    /// table is one entry a staged group.
     pub fn stage_group_masks(
         &mut self,
         stream: *mut core::ffi::c_void,
@@ -1492,6 +1506,7 @@ impl Inputs {
             poem_ir::Selection,
             poem_exec::fire::GroupMask,
         )],
+        table_lanes: u32,
     ) -> Result<Vec<GroupMaskHandles>> {
         if masks.is_empty() {
             return Ok(Vec::new());
@@ -1501,7 +1516,9 @@ impl Inputs {
         for (_, _, mask) in masks {
             // The kernels read a mask's offsets as 64-bit.
             let indptr = image.len();
-            let wide: Vec<i64> = mask.indptr.iter().map(|&at| i64::from(at)).collect();
+            let mut wide: Vec<i64> = mask.indptr.iter().map(|&at| i64::from(at)).collect();
+            let last = wide.last().copied().unwrap_or(0);
+            wide.resize(wide.len().max(table_lanes as usize + 1), last);
             image.extend_from_slice(i64_bytes_of(&wide));
             image.resize(image.len().next_multiple_of(ALIGN as usize), 0);
             let bits = image.len();
@@ -1539,7 +1556,8 @@ impl Inputs {
                 ),
                 indptr: i64s(
                     base + indptr as u64,
-                    u32::try_from(mask.indptr.len()).unwrap_or(u32::MAX),
+                    u32::try_from(mask.indptr.len().max(table_lanes as usize + 1))
+                        .unwrap_or(u32::MAX),
                 ),
             })
             .collect())

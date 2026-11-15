@@ -18,7 +18,8 @@ use eta_ir::op::Op;
 use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::{
-    Dtype, ForwardHybrid, Input, Platform, Request, StateRows, Trace, Weight, ops, trace_hybrid,
+    Dtype, ForwardHybrid, Input, Platform, RaggedMask, Request, StateRows, Trace, Weight, ops,
+    trace_hybrid,
 };
 use poem_ir::InputAxis;
 
@@ -31,7 +32,12 @@ pub const MAX_DISTANCE: f32 = 128.0;
 pub const SM_SCALE: f32 = 0.125;
 pub const NAME: &str = "encoder-mini";
 
-pub struct EncoderLayer;
+/// One bidirectional layer over each lane's rows: with a relative bias, or
+/// with none, where a lane may state which of its group's rows each row
+/// attends (a group mask, the ragged kernel's custom arm).
+pub struct EncoderLayer {
+    pub biased: bool,
+}
 
 impl ForwardHybrid for EncoderLayer {
     fn states(&self) -> StateRows {
@@ -42,23 +48,31 @@ impl ForwardHybrid for EncoderLayer {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
         let x = inputs.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
-        let table = ops::elemwise::relative_bucket_bias(
-            inputs.recorder(),
-            &Weight::sym(
-                "rel_bias",
-                [u64::from(NUM_BUCKETS), u64::from(HEADS)],
-                Dtype::Bf16,
-            ),
-            MAX_LEN,
-            NUM_BUCKETS,
-            MAX_DISTANCE,
-            true,
-        );
+        let table = self.biased.then(|| {
+            ops::elemwise::relative_bucket_bias(
+                inputs.recorder(),
+                &Weight::sym(
+                    "rel_bias",
+                    [u64::from(NUM_BUCKETS), u64::from(HEADS)],
+                    Dtype::Bf16,
+                ),
+                MAX_LEN,
+                NUM_BUCKETS,
+                MAX_DISTANCE,
+                true,
+            )
+        });
         let q = ops::linear::matmul(&x, &w("q", HEADS * HEAD_DIM, WIDTH));
         let k = ops::linear::matmul(&x, &w("k", HEADS * HEAD_DIM, WIDTH));
         let v = ops::linear::matmul(&x, &w("v", HEADS * HEAD_DIM, WIDTH));
         let perm = inputs.row_permutation();
-        let indptr = inputs.lane_indptr();
+        // Unbiased, the rows pack by attention group: a lane's stated mask
+        // is its group's.
+        let indptr = if self.biased {
+            inputs.lane_indptr()
+        } else {
+            inputs.group_indptr()
+        };
         let o = ops::attn::ragged(
             &ops::gather::pack_rows(&q, &perm),
             &ops::gather::pack_rows(&k, &perm),
@@ -67,7 +81,9 @@ impl ForwardHybrid for EncoderLayer {
             &indptr,
             HEAD_DIM,
             SM_SCALE,
-            ops::attn::relative_bias(&table, MAX_LEN),
+            table.map_or(RaggedMask::GroupBlockDiagonal, |table| {
+                ops::attn::relative_bias(&table, MAX_LEN)
+            }),
         );
         let o = ops::gather::unpack_rows(&o, &perm);
         let y = ops::linear::matmul(&o, &w("o", WIDTH, HEADS * HEAD_DIM));
@@ -77,7 +93,12 @@ impl ForwardHybrid for EncoderLayer {
 }
 
 pub fn trace() -> Trace {
-    trace_hybrid(NAME, &EncoderLayer, Platform::Cuda)
+    trace_hybrid(NAME, &EncoderLayer { biased: true }, Platform::Cuda)
+}
+
+/// The layer with no bias: its lanes may state group masks.
+pub fn unbiased_trace() -> Trace {
+    trace_hybrid(NAME, &EncoderLayer { biased: false }, Platform::Cuda)
 }
 
 pub fn to_bf16(x: f32) -> u16 {
@@ -217,7 +238,14 @@ fn bias(embedding: &[f32], h: usize, d: i64) -> f32 {
     embedding[b * HEADS as usize + h]
 }
 
-fn attention(q: &[f32], k: &[f32], v: &[f32], rows: usize, embedding: &[f32]) -> Vec<f32> {
+fn attention(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    rows: usize,
+    embedding: Option<&[f32]>,
+    admits: &dyn Fn(usize, usize) -> bool,
+) -> Vec<f32> {
     let hd = HEAD_DIM as usize;
     let heads = HEADS as usize;
     let width = heads * hd;
@@ -227,9 +255,12 @@ fn attention(q: &[f32], k: &[f32], v: &[f32], rows: usize, embedding: &[f32]) ->
             let qi = &q[i * width + h * hd..][..hd];
             let scores: Vec<f32> = (0..rows)
                 .map(|j| {
+                    if !admits(i, j) {
+                        return f32::NEG_INFINITY;
+                    }
                     let kj = &k[j * width + h * hd..][..hd];
                     let dot = qi.iter().zip(kj).map(|(a, b)| a * b).sum::<f32>();
-                    dot * SM_SCALE + bias(embedding, h, j as i64 - i as i64)
+                    dot * SM_SCALE + embedding.map_or(0.0, |e| bias(e, h, j as i64 - i as i64))
                 })
                 .collect();
             let peak = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -248,12 +279,24 @@ fn attention(q: &[f32], k: &[f32], v: &[f32], rows: usize, embedding: &[f32]) ->
 }
 
 pub fn reference(weights: &Weights, x: &[f32], rows: usize) -> Vec<f32> {
+    reference_with(weights, x, rows, Some("rel_bias"), &|_, _| true)
+}
+
+/// The layer on the host, `bias` naming its relative-bias plane where it
+/// has one, row `i` attending key row `j` where `admits(i, j)`.
+pub fn reference_with(
+    weights: &Weights,
+    x: &[f32],
+    rows: usize,
+    bias: Option<&str>,
+    admits: &dyn Fn(usize, usize) -> bool,
+) -> Vec<f32> {
     let w = WIDTH as usize;
     let width = (HEADS * HEAD_DIM) as usize;
     let q = matmul_bf16(x, rows, w, weights.get("q"), width);
     let k = matmul_bf16(x, rows, w, weights.get("k"), width);
     let v = matmul_bf16(x, rows, w, weights.get("v"), width);
-    let o = attention(&q, &k, &v, rows, weights.get("rel_bias"));
+    let o = attention(&q, &k, &v, rows, bias.map(|name| weights.get(name)), admits);
     let y = matmul_bf16(&o, rows, width, weights.get("o"), w);
     y.iter().zip(x).map(|(a, b)| bf(a + b)).collect()
 }
@@ -297,6 +340,16 @@ pub struct Rig {
 
 impl Rig {
     pub fn load(weights: &Weights, max_tokens: u32, buckets: Vec<u32>, graphs: Graphs) -> Rig {
+        Rig::load_trace(trace(), weights, max_tokens, buckets, graphs)
+    }
+
+    pub fn load_trace(
+        trace: Trace,
+        weights: &Weights,
+        max_tokens: u32,
+        buckets: Vec<u32>,
+        graphs: Graphs,
+    ) -> Rig {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = weights.write(dir.path());
         let boot = engine_cuda::DeviceBoot {
@@ -307,7 +360,6 @@ impl Rig {
             ..engine_cuda::DeviceBoot::default()
         };
         let mut engine = engine_cuda::open(boot, contract_for).expect("the engine opens");
-        let trace = trace();
         let facts = trace.facts.clone();
         let loaded = engine
             .load(LoadRequest {

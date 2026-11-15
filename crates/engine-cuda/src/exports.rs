@@ -73,6 +73,24 @@ pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir
     })
 }
 
+/// The classes a lane's stated mask reaches over its group's rows: a
+/// ragged attention, unbiased or block-diagonal by group, reads a lane's
+/// mask as its group's (the custom arm). There a mask is the lane's to
+/// state or not (stating none, a row attends every row of its group), so a
+/// plan whose only attention is kv-less takes one too.
+#[must_use]
+pub(crate) fn group_masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
+    classes_running(trace, compiled, |op| {
+        matches!(
+            op,
+            poem_ir::Operation::Attn(poem_ir::Attn::Ragged {
+                mask: poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal,
+                ..
+            })
+        )
+    })
+}
+
 #[must_use]
 pub(crate) fn wide_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
     classes_running(trace, compiled, |op| {

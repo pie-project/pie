@@ -87,6 +87,9 @@ pub struct Shell {
     facts: kv::Facts,
     page_tables: usize,
     masked: poem_ir::ClassSet,
+    /// The classes a stated mask reaches as a group's (a ragged attention):
+    /// a lane there states one or none.
+    group_masked: poem_ir::ClassSet,
     wide: poem_ir::ClassSet,
     feeds: crate::exports::Feeds,
     corrected: poem_ir::ClassSet,
