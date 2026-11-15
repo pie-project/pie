@@ -23,7 +23,7 @@ constexpr int RAGGED_BIAS = 2;     // logit · scale + bias[head][clamp(kv − q
 // An arm reads only its own operands; group g's `bits` start at byte `mask_indptr[g]`.
 struct RaggedMaskArgs {
     const unsigned char* bits;
-    const i32* mask_indptr;
+    const long long* mask_indptr;
     const float* bias;
     int max_len;
 };
@@ -59,7 +59,7 @@ __global__ __launch_bounds__(WAVES * 64) void ragged(
     const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
     bf16* __restrict__ o, const i32* __restrict__ q_indptr, const i32* __restrict__ kv_indptr,
     int groups, int num_q_heads, int num_kv_heads, int head_dim, float sm_scale, int rows,
-    const unsigned char* __restrict__ bits, const i32* __restrict__ mask_indptr,
+    const unsigned char* __restrict__ bits, const long long* __restrict__ mask_indptr,
     const float* __restrict__ bias, int max_len) {
     static_assert(D % 16 == 0, "the stamp is whole 16-wide MFMA steps");
     constexpr int BC = 32, KT = BC / 16, KS = D / 16;

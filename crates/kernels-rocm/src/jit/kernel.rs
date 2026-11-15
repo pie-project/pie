@@ -21,6 +21,11 @@ pub struct Kernel {
     /// The unit `file` names; `None` when the crate carries no such unit.
     pub root: Option<Root>,
     #[cfg(feature = "rocm")]
+    /// The load's outcome, memoized once it succeeds or its unit does not
+    /// compile (the unit's verdict). A device's refusal at module load (no
+    /// room for the module, say) is returned to the fire that met it and
+    /// not memoized: the next fire that needs the kernel loads it as a
+    /// first load does.
     loaded: [OnceLock<Result<Resolved, Fault>>; MAX_DEVICES],
 }
 
@@ -112,14 +117,28 @@ impl Kernel {
             .ok()
             .and_then(|at| self.loaded.get(at))
         else {
-            return Err(Fault::Device {
-                call: "hipGetDevice",
-                code: ordinal,
+            return Err(Fault::Compile {
+                unit: self.file,
+                log: format!(
+                    "device {ordinal} is past the {MAX_DEVICES} devices a process loads kernels on"
+                ),
             });
         };
-        slot.get_or_init(|| cache::load(&root, self.name, ordinal))
-            .as_ref()
-            .map_err(Clone::clone)
+        if let Some(kept) = slot.get() {
+            return kept.as_ref().map_err(Clone::clone);
+        }
+        match cache::load(&root, self.name, ordinal) {
+            Err(fault) if !matches!(fault, Fault::Compile { .. }) => Err(fault),
+            outcome => {
+                // Two threads may load at once; the first kept is every
+                // caller's.
+                let _ = slot.set(outcome);
+                slot.get()
+                    .expect("set just above")
+                    .as_ref()
+                    .map_err(Clone::clone)
+            }
+        }
     }
 }
 

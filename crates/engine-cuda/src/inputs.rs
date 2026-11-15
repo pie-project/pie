@@ -502,8 +502,9 @@ fn inject_masks(
         .iter()
         .map(|inject| kernels_cuda::runtime::channel::BitRun {
             src: inject.src,
-            dst_byte: u32::try_from(inject.dst_off).unwrap_or(u32::MAX),
+            dst_byte: inject.dst_off,
             bits: inject.bits,
+            _pad: 0,
         })
         .collect();
     let bytes = table.len() * size_of::<kernels_cuda::runtime::channel::BitRun>();
@@ -637,7 +638,7 @@ impl Inputs {
         // A lane feeds its tokens, and its mask, from the device in one run.
         let inject_runs = take(lanes * size_of::<kernels_cuda::runtime::channel::WordRun>() as u64);
         let mask_runs = take(lanes * size_of::<kernels_cuda::runtime::channel::BitRun>() as u64);
-        let mask_indptr = take((lanes + 1) * 4);
+        let mask_indptr = take((lanes + 1) * 8);
         let page_tables: Vec<TableAt> = (0..page_tables)
             .map(|_| TableAt {
                 indptr: take((lanes + 1) * 4),
@@ -1030,7 +1031,7 @@ impl Inputs {
                 put(self.mask_bits, &staged.bits, "staged mask bits")?;
                 put(
                     self.mask_indptr,
-                    bytes_of(&staged.indptr),
+                    i64_bytes_of(&staged.indptr),
                     "staged mask indptr",
                 )?;
                 Some(u32::try_from(staged.bits.len()).unwrap_or(u32::MAX))
@@ -1390,7 +1391,7 @@ impl Inputs {
         }
         if let Some(bytes) = mask_bytes {
             copy(at_mask, *bytes as usize)?;
-            copy(at_mask_indptr, (lanes as usize + 1) * 4)?;
+            copy(at_mask_indptr, (lanes as usize + 1) * 8)?;
         }
         let mut packings = Vec::with_capacity(packing_places.len());
         if packed {
@@ -1475,7 +1476,7 @@ impl Inputs {
             readout_live: base + at_readout_live,
             row_valid: Tensor::new(base + at_row_valid, rows, 1, Dtype::U8),
             mask: mask_bytes.map(|bytes| Tensor::new(base + at_mask, bytes, 1, Dtype::U8)),
-            mask_indptr: mask_bytes.map(|_| i32s(base + at_mask_indptr, lanes + 1)),
+            mask_indptr: mask_bytes.map(|_| i64s(base + at_mask_indptr, lanes + 1)),
             group_of_lane: packed.then(|| i32s(base + at_group_of_lane, table_lanes)),
             packings,
             lane_of_row: i32s(base + at_lane_of_row, rows),
@@ -1498,8 +1499,10 @@ impl Inputs {
         let mut image: Vec<u8> = Vec::new();
         let mut placed = Vec::with_capacity(masks.len());
         for (_, _, mask) in masks {
+            // The kernels read a mask's offsets as 64-bit.
             let indptr = image.len();
-            image.extend_from_slice(bytes_of(&mask.indptr));
+            let wide: Vec<i64> = mask.indptr.iter().map(|&at| i64::from(at)).collect();
+            image.extend_from_slice(i64_bytes_of(&wide));
             image.resize(image.len().next_multiple_of(ALIGN as usize), 0);
             let bits = image.len();
             image.extend_from_slice(&mask.bits);
@@ -1534,7 +1537,7 @@ impl Inputs {
                     1,
                     Dtype::U8,
                 ),
-                indptr: i32s(
+                indptr: i64s(
                     base + indptr as u64,
                     u32::try_from(mask.indptr.len()).unwrap_or(u32::MAX),
                 ),
@@ -1576,6 +1579,17 @@ impl Inputs {
 
 fn i32s(ptr: u64, rows: u32) -> Tensor {
     Tensor::new(ptr, rows, 1, Dtype::I32)
+}
+
+fn i64s(ptr: u64, rows: u32) -> Tensor {
+    Tensor::new(ptr, rows, 1, Dtype::I64)
+}
+
+fn i64_bytes_of(values: &[i64]) -> &[u8] {
+    // SAFETY: as [`bytes_of`] — `i64` is `Copy`, no padding or niche.
+    unsafe {
+        core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+    }
 }
 
 fn bytes_of(values: &[i32]) -> &[u8] {

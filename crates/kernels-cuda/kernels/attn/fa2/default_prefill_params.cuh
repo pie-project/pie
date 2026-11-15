@@ -37,7 +37,7 @@ struct BatchPrefillRaggedParams {
   uint8_t* maybe_custom_mask;
   IdType* q_indptr;
   IdType* kv_indptr;
-  IdType* maybe_mask_indptr;
+  int64_t* maybe_mask_indptr;
   IdType* maybe_q_rope_offset;
   IdType* maybe_k_rope_offset;
   DTypeO* o;
@@ -100,7 +100,7 @@ struct BatchPrefillPagedParams {
   paged_kv_t<DTypeKV, IdType> paged_kv;
   uint8_t* maybe_custom_mask;
   IdType* q_indptr;
-  IdType* maybe_mask_indptr;
+  int64_t* maybe_mask_indptr;
   IdType* maybe_q_rope_offset;
   DTypeO* o;
   float* lse;

@@ -95,14 +95,20 @@ pub(crate) fn act_x_wt(
     let way = route(ctx, m, n, k);
     if bias == 0
         && way == Route::Turn
-        && skinnyt(ctx, w, act, y, m, n, k, SkinnyEpilogue::Store).is_ok()
+        && took(
+            "skinnyt",
+            skinnyt(ctx, w, act, y, m, n, k, SkinnyEpilogue::Store),
+        )
     {
         return Ok(false);
     }
-    if bias == 0 && way == Route::Skinny && skinny_bf16(ctx, w, act, y, m, n, k).is_ok() {
+    if bias == 0
+        && way == Route::Skinny
+        && took("skinny_bf16", skinny_bf16(ctx, w, act, y, m, n, k))
+    {
         return Ok(false);
     }
-    if m == 1 && gemv_bf16(ctx, w, act, bias, y, n, k).is_ok() {
+    if m == 1 && took("gemv_bf16", gemv_bf16(ctx, w, act, bias, y, n, k)) {
         return Ok(bias != 0);
     }
     if bias == 0 && way == Route::Batch && dense_batch_bf16(ctx, w, act, y, m, n, k, false)? {
@@ -163,10 +169,15 @@ pub(crate) fn act_x_wt_f32(
     k: i32,
 ) -> Result<(), Error> {
     let way = route(ctx, m, n, k);
-    if way == Route::Turn && skinnyt(ctx, w, act, y, m, n, k, SkinnyEpilogue::F32).is_ok() {
+    if way == Route::Turn
+        && took(
+            "skinnyt",
+            skinnyt(ctx, w, act, y, m, n, k, SkinnyEpilogue::F32),
+        )
+    {
         return Ok(());
     }
-    if way == Route::Skinny && skinny_f32(ctx, w, act, y, m, n, k).is_ok() {
+    if way == Route::Skinny && took("skinny_f32", skinny_f32(ctx, w, act, y, m, n, k)) {
         return Ok(());
     }
     let shape = lt::Shape {
@@ -222,21 +233,27 @@ pub(crate) fn act_x_wt_swiglu(
     }
     let way = route(ctx, m, 2 * intermediate, k);
     if way == Route::Turn
-        && skinnyt(
-            ctx,
-            gate_up,
-            act,
-            h,
-            m,
-            intermediate,
-            k,
-            SkinnyEpilogue::Swiglu,
+        && took(
+            "skinnyt",
+            skinnyt(
+                ctx,
+                gate_up,
+                act,
+                h,
+                m,
+                intermediate,
+                k,
+                SkinnyEpilogue::Swiglu,
+            ),
         )
-        .is_ok()
     {
         return Ok(true);
     }
-    if way == Route::Skinny && skinny_swiglu_bf16(ctx, gate_up, act, h, m, intermediate, k).is_ok()
+    if way == Route::Skinny
+        && took(
+            "skinny_swiglu_bf16",
+            skinny_swiglu_bf16(ctx, gate_up, act, h, m, intermediate, k),
+        )
     {
         return Ok(true);
     }
@@ -323,4 +340,30 @@ pub(crate) fn act_x_wt_live(
             .map_err(|why| refuse(op, why))?;
     }
     Ok(true)
+}
+
+/// Whether a faster route took a product: a route that declines (a shape it
+/// does not serve, a slab no walk laid, a launch it could not make) hands
+/// it to the next, slower one, which is counted and said, route by route,
+/// at the first and at every doubling, with why.
+fn took(route: &'static str, fired: Result<(), Error>) -> bool {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    let Err(why) = fired else {
+        return true;
+    };
+    static DECLINED: Mutex<Option<HashMap<&'static str, u64>>> = Mutex::new(None);
+    let mut declined = DECLINED.lock().expect("declined lock poisoned");
+    let count = declined
+        .get_or_insert_with(HashMap::new)
+        .entry(route)
+        .or_insert(0);
+    *count += 1;
+    if count.is_power_of_two() {
+        eprintln!(
+            "kernels-rocm: the `{route}` route declined a product, which a slower route took: \
+             {why}; {count} such product(s) so far"
+        );
+    }
+    false
 }
