@@ -84,6 +84,10 @@ pub struct ProgramFires {
     /// held by its [`ProgramOpen`].
     standing_booked: u64,
     standing_pending: u64,
+    /// The rows the engine's fixed readout store holds
+    /// ([`::engine::ReadoutFacts::store_rows`]): a bind whose lane alone
+    /// reads out more is refused ([`SharedPool::readouts_refused`]).
+    readout_store: Option<u32>,
 }
 
 impl ProgramFires {
@@ -202,6 +206,7 @@ pub fn impossible_submission(engine: usize, error: &::engine::Error) {
         act_reserved = pool.pool().act_reserved(),
         act_chunks = pool.pool().act_chunks(rung),
         term_bytes = pool.pool().fire_bytes(rung),
+        readout_bytes = pool.pool().readout_bytes(pool.pool().rung_of(rung)),
         standing_bytes = pool.pool().standing(),
         act_span_chunks = %span,
         act_most = pool.act_most(),
@@ -219,6 +224,35 @@ impl SharedPool {
         self.pool.set_max_lanes(lanes);
         self.programs.generation += 1;
         self.refit();
+    }
+
+    /// The engine's readout facts ([`::engine::Engine::readout_facts`]),
+    /// with its own ceiling on the rows a fire reads out
+    /// (`FireLimits::max_readouts`, 0: none): every rung counts the rows a
+    /// fire of it reads out beside the guest term where they land beside
+    /// the activation, so fires are cut to the widest rung that holds
+    /// them; and a fixed store's rows bound every fire's and refuse a lane
+    /// that alone reads more ([`Self::readouts_refused`]).
+    pub fn set_readouts(&mut self, facts: &::engine::ReadoutFacts, ceiling: u32) {
+        self.pool
+            .set_readouts(facts.row_bytes(), facts.fire_rows(ceiling));
+        self.programs.readout_store = facts.store_rows;
+    }
+
+    /// Why a bind of `key` is refused for its readouts: one lane of it
+    /// reads out `extents.sampled_rows` rows, more than the engine's fixed
+    /// readout store holds, so no fire, however narrow, seats it. `None`
+    /// where it fits, or no store bounds them.
+    #[must_use]
+    pub fn readouts_refused(&self, key: &FireKey) -> Option<String> {
+        let rows = self.programs.readout_store?.max(1);
+        (key.extents.sampled_rows > rows).then(|| {
+            format!(
+                "{key}'s lanes read out {} rows each, more than the {rows} rows the \
+                 engine's readout store holds for a fire",
+                key.extents.sampled_rows
+            )
+        })
     }
 
     /// The engine said fires of `key` need `facts`
@@ -517,6 +551,11 @@ impl ProgramOpen {
     /// built from changed since; a bind refused leaves the pool as it
     /// found it, its term never seen by a fire.
     pub fn new(shared: &Shared, key: FireKey, standing: u64) -> Result<Self, String> {
+        // A lane that alone reads out more than the readout store holds:
+        // no fire seats it, whatever the rung.
+        if let Some(why) = shared.lock().unwrap().readouts_refused(&key) {
+            return Err(why);
+        }
         loop {
             let (pairs, most, generation, mut term) = {
                 let pool = shared.lock().unwrap();

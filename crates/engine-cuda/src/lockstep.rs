@@ -729,6 +729,10 @@ impl Engine for Rank {
         }
     }
 
+    fn readout_facts(&self) -> EngineResult<engine::ReadoutFacts> {
+        Ok(crate::api::readout_facts())
+    }
+
     fn fire_facts(
         &self,
         program: ProgramId,

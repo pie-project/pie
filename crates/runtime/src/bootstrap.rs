@@ -255,9 +255,25 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         kv_page_size,
         tokenizer_path,
         metadata,
-        engines: engine_configs,
+        engines: mut engine_configs,
         scheduler,
     } = config.model;
+
+    // Each engine's readouts, a fire bound (`Engine::readout_facts`): a
+    // fixed store's rows bound the rows one fire reads out, which the
+    // scheduler cuts its fires to; rows that land beside the activation
+    // are counted at every rung of a shared pool, below.
+    let readouts = engine_configs
+        .iter_mut()
+        .map(|d| {
+            let facts = d
+                .engine_backend
+                .readout_facts()
+                .map_err(|error| anyhow::anyhow!("engine readout facts: {error}"))?;
+            d.limits = d.limits.read_out_by(&facts);
+            Ok(facts)
+        })
+        .collect::<Result<Vec<::engine::ReadoutFacts>>>()?;
 
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
     // A model with fixed recurrent state is admitted by its planner, which
@@ -396,7 +412,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // the degenerate mode's pinned shapes.
     let arena_stores = engine_configs
         .iter()
-        .map(|d| {
+        .zip(&readouts)
+        .map(|(d, readouts)| {
             let mut pools = crate::store::chunks::StorePools::of(&d.chunks)
                 .map_err(|error| anyhow::anyhow!("engine pools: {error}"))?;
             // A window the engine holds no pages for is still a window.
@@ -424,6 +441,13 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 // A rung of `r` tokens carries `min(r, max_lanes)` lanes, as
                 // the engine counts them: what a program's fire term takes.
                 pool.set_max_lanes(u32::try_from(d.limits.max_forward_requests).unwrap_or(u32::MAX));
+                // The rows a fire reads out: counted beside the guest term
+                // where they land beside the activation, a lane reading
+                // more than a fixed store holds refused at its bind.
+                pool.set_readouts(
+                    readouts,
+                    u32::try_from(d.limits.max_readouts).unwrap_or(u32::MAX),
+                );
                 Some(std::sync::Arc::new(std::sync::Mutex::new(pool)))
             } else {
                 None
