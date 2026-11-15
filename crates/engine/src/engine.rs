@@ -219,6 +219,12 @@ pub trait Engine: Send {
         Err(self.unsupported("register_adapter"))
     }
 
+    /// Submits a frame's steps. A submit that returns `Err`, or a step
+    /// that settles [`StepOutcome::Faulted`], fails its pipeline; the sets
+    /// that pipeline owns cannot be claimed by another. Nothing replays
+    /// from what such a step left. A position an engine keeps by slot
+    /// still goes back where a refused step found it: the slot outlives
+    /// the set, and its next tenant must not meet it.
     fn submit(&mut self, frame: &FrameSubmission) -> Result<FrameTicket>;
 
     /// Backs the pool's first `segments` segments
