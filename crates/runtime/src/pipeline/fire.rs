@@ -4285,19 +4285,24 @@ pub(crate) fn pop_settled(fires: Option<&PendingFires>) -> Option<PendingOp> {
 }
 
 pub async fn finalize_op<C: FireContext>(ctx: &mut C, op: PendingOp) -> Anyhow<()> {
-    let finalized = finalize_op_await(op).await?;
+    let finalized = finalize_op_await(op).await;
     complete_finalize(ctx, finalized);
     Ok(())
 }
 
-pub(crate) async fn finalize_op_await(op: PendingOp) -> Anyhow<FinalizeOutcome> {
+/// What a fire off the queue leaves: its fold written, and its failure to
+/// latch ([`complete_finalize`]). It has no error to return. A finalizer
+/// holds the gate from the fire leaving the queue to that latch, and an
+/// exit between the two would lift the gate over a set whose cursor the
+/// fire moved and whose pipeline nothing had failed.
+pub(crate) async fn finalize_op_await(op: PendingOp) -> FinalizeOutcome {
     match op {
         PendingOp::Fire(fire) => finalize_fire_await(fire).await,
         #[cfg(test)]
-        PendingOp::TestStub => Ok(FinalizeOutcome {
+        PendingOp::TestStub => FinalizeOutcome {
             action: FinalizeAction::None,
             ws_guard: Vec::new(),
-        }),
+        },
     }
 }
 
@@ -4324,7 +4329,7 @@ pub(crate) fn complete_finalize<C: FireContext>(ctx: &mut C, finalized: Finalize
 
 pub(crate) async fn finalize_op_detached(op: PendingOp) -> Anyhow<()> {
     debug_assert!(op.is_preemption_detachable());
-    let FinalizeOutcome { action, ws_guard } = finalize_op_await(op).await?;
+    let FinalizeOutcome { action, ws_guard } = finalize_op_await(op).await;
     match action {
         FinalizeAction::None => {}
         FinalizeAction::Fail {
@@ -4431,7 +4436,7 @@ fn settle_fold(
     }
 }
 
-async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
+async fn finalize_fire_await(fire: PendingFire) -> FinalizeOutcome {
     let PendingFire {
         completion,
         checkpoints,
@@ -4544,10 +4549,10 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
     } else {
         FinalizeAction::None
     };
-    Ok(FinalizeOutcome {
+    FinalizeOutcome {
         action,
         ws_guard: leases,
-    })
+    }
 }
 
 fn fail_pass<C: FireContext>(ctx: &mut C, fwd_rep: u32, reason: &str) {
@@ -6601,7 +6606,7 @@ mod fold_tests {
             {
                 let _gate = flight.fires.finalize_guard().await;
                 let op = pop_settled(Some(&flight.fires)).expect("the fire settled");
-                let finalized = finalize_op_await(op).await?;
+                let finalized = finalize_op_await(op).await;
                 assert!(flight.fires.lock().unwrap().is_empty());
                 assert_eq!(flight.failure.lock().unwrap().as_ref(), None);
                 let held = Err(ScopeRefusal::Held(own.id()));
