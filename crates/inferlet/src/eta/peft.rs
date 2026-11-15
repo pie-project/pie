@@ -20,6 +20,7 @@ impl Peft {
 }
 
 type Planes = Vec<(Site, Vec<f32>, Vec<f32>)>;
+type Found = BTreeMap<u32, (Site, BTreeMap<usize, [Option<Tensor>; 2]>)>;
 
 pub(crate) fn planes(config: &[u8], weights: &[u8]) -> Result<Planes, String> {
     let config: Value =
@@ -32,7 +33,7 @@ pub(crate) fn planes(config: &[u8], weights: &[u8]) -> Result<Planes, String> {
         alpha / rank
     } as f32;
 
-    let mut found: BTreeMap<u32, (Site, BTreeMap<usize, [Option<Tensor>; 2]>)> = BTreeMap::new();
+    let mut found: Found = BTreeMap::new();
     let mut layers = 0;
     for (name, tensor) in safetensors(weights)? {
         let Some((layer, site, role)) = locate(&name) else {
@@ -138,16 +139,22 @@ fn safetensors(bytes: &[u8]) -> Result<Vec<(String, Tensor)>, String> {
         let raw = data.get(span[0]..span[1]).ok_or_else(bad)?;
         let data: Vec<f32> = match info["dtype"].as_str() {
             Some("F32") => raw
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect(),
             Some("BF16") => raw
-                .chunks_exact(2)
-                .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16))
                 .collect(),
             Some("F16") => raw
-                .chunks_exact(2)
-                .map(|c| f16(u16::from_le_bytes([c[0], c[1]])))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| f16(u16::from_le_bytes(*c)))
                 .collect(),
             other => {
                 return Err(format!(
