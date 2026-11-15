@@ -191,23 +191,13 @@ impl Layout {
                 Ok(())
             };
 
-        // A conv is buffered only where its output feeds a recurrence whose
-        // commit is deferred (a gated-delta scan's `qkv`, a KDA scan's
-        // `mixed`), as the compiler's rs rows read it: any other conv (a
-        // Mamba2 layer's) commits its state as it runs.
-        let deferred: std::collections::HashSet<u32> = trace
-            .nodes
-            .iter()
-            .filter_map(|node| match &node.op {
-                Operation::Ssm(
-                    Ssm::GatedDelta { qkv, .. } | Ssm::GatedDeltaChunked { qkv, .. },
-                ) => Some(qkv.0),
-                Operation::Ssm(Ssm::Kda { mixed, .. } | Ssm::KdaChunked { mixed, .. }) => {
-                    Some(mixed.0)
-                }
-                _ => None,
-            })
-            .collect();
+        // The convs the rs buffer covers, by their output: the chunk plan's
+        // rule (`poem_compiler::rs::buffered_convs`), not a mirror of it. This
+        // engine replays no Mamba-2 layer, so a Mamba-2 conv commits with it.
+        let deferred: std::collections::HashSet<u32> =
+            poem_compiler::rs::buffered_convs(trace, false)
+                .map(|conv| conv.y.0)
+                .collect();
         for node in &trace.nodes {
             match &node.op {
                 Operation::Ssm(
