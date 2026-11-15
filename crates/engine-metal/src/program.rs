@@ -1075,6 +1075,293 @@ mod tests {
     use eta_dsl::prelude::*;
     use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port, PortMask};
 
+    /// The select's mode: top-p at a threshold, or top-k.
+    #[derive(Clone, Copy, Debug)]
+    enum Cut {
+        P(f32),
+        K(i32),
+    }
+
+    /// A program whose epilogue cuts the logits row by `cut` and puts the
+    /// mask (as i32) in a ring the host reads.
+    fn select_registration(
+        vocab: u32,
+        cut: Cut,
+    ) -> (ProgramRegistration, usize, Vec<(u32, Vec<u8>)>, u32) {
+        let indptr: &'static Channel = Box::leak(Box::new(Channel::from(vec![0u32, 1])));
+        let mask: &'static Channel =
+            Box::leak(Box::new(Channel::new([vocab], dtype::i32).capacity(1)));
+        let mut b = Builder::new(vocab, 16);
+        let logits = OutputDecl {
+            name: "logits".into(),
+            axis: Axis::Row,
+            width: vocab,
+            dtype: eta_ir::Dtype::F32,
+            layers: 0,
+            readout: true,
+        };
+        b.outputs(vec![vec![logits.clone()]]);
+        b.bind_port(Port::EmbedIndptr, indptr);
+        b.stage(Attach::Epilogue, move || {
+            let x = reshape(intrinsics::output(0, "logits"), [vocab]);
+            let keep = match cut {
+                Cut::P(p) => pivot_threshold(&x, cummass_le(Tensor::constant(p))),
+                Cut::K(k) => pivot_threshold(&x, rank_le(Tensor::constant(k))),
+            };
+            mask.put(cast(keep, dtype::i32));
+        });
+        mask.note_host_take();
+        let traced = b.build().expect("the program traces");
+        let bound = eta_ir::validate::bind(
+            traced.container().clone(),
+            vec![vec![logits]],
+            EngineCaps {
+                lora: true,
+                attn_page_mask: true,
+            },
+        )
+        .expect("the program binds");
+        let stages = compile_bound(&bound);
+        let backend = Backend::parse("metal").expect("the metal codegen backend");
+        let count = bound.container.channels.len();
+        let order = traced.channel_order();
+        let at = order.iter().position(|&gid| gid == indptr.gid()).expect("indptr");
+        let taken = order.iter().position(|&gid| gid == mask.gid()).expect("mask");
+        let seed = [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+        (
+            ProgramRegistration {
+                program_hash: bound.hash,
+                emitted_kernels: emit_program(backend, &stages, &bound),
+                emitter_version: backend.emitter_version(),
+                launch: eta_compiler::codegen::launch::build(&bound, &stages),
+                ..Default::default()
+            },
+            count,
+            vec![(u32::try_from(at).expect("a channel index"), seed)],
+            u32::try_from(taken).expect("a channel index"),
+        )
+    }
+
+    fn bf16_of(value: f32) -> u16 {
+        (value.to_bits() >> 16) as u16
+    }
+
+    fn f32_of(bits: u16) -> f32 {
+        f32::from_bits(u32::from(bits) << 16)
+    }
+
+    /// The tokens in the order a cut takes them: descending value, ties in
+    /// ascending index.
+    fn taken_order(values: &[f32]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..values.len()).collect();
+        order.sort_by(|&a, &b| values[b].total_cmp(&values[a]).then(a.cmp(&b)));
+        order
+    }
+
+    /// The cut's mask by its rule: top-k the first k; top-p every token
+    /// whose exclusive mass, each probability as floor(p * 2^32), is below
+    /// the threshold's.
+    fn reference(values: &[f32], cut: Cut) -> Vec<bool> {
+        let fixed = |p: f32| if p > 0.0 { (f64::from(p) * 4_294_967_296.0) as u64 } else { 0 };
+        let mut mask = vec![false; values.len()];
+        match cut {
+            Cut::K(k) => {
+                for &i in taken_order(values).iter().take(k.max(0) as usize) {
+                    mask[i] = true;
+                }
+            }
+            Cut::P(p) => {
+                let target = fixed(p);
+                let mut exclusive = 0u64;
+                for &i in &taken_order(values) {
+                    if exclusive >= target {
+                        break;
+                    }
+                    mask[i] = true;
+                    exclusive += fixed(values[i]);
+                }
+            }
+        }
+        mask
+    }
+
+    /// The same cut by the f32 running sum the select kept before.
+    fn running_sum_reference(values: &[f32], p: f32) -> Vec<bool> {
+        let mut mask = vec![false; values.len()];
+        let mut exclusive = 0.0f32;
+        for &i in &taken_order(values) {
+            // The f32 rule as it stood: stop at the first exclusive mass
+            // not below p (NaN included).
+            if exclusive.partial_cmp(&p) != Some(std::cmp::Ordering::Less) {
+                break;
+            }
+            mask[i] = true;
+            exclusive += values[i];
+        }
+        mask
+    }
+
+    /// Fires the cut over `values` (stored as bf16), with the registration's
+    /// kernels of `dropped` kinds left out (so a region takes a later form:
+    /// grouped without its streamed kernel, fused without either), returning
+    /// the mask and the fire's wall time.
+    fn fire_cut(
+        values: &[f32],
+        cut: Cut,
+        dropped: &[eta_compiler::codegen::program::KernelKind],
+    ) -> (Vec<bool>, std::time::Duration) {
+        use crate::store::Pools;
+        let vocab = u32::try_from(values.len()).expect("a vocabulary");
+        let context = Context::bind().expect("a Metal 4 device");
+        let pools = Pools::guests_only(&context, 64 << 20, 4).expect("a pool");
+        let mut plane = Plane::new();
+        let (mut registration, count, seeds, mask) = select_registration(vocab, cut);
+        registration.emitted_kernels.retain(|kernel| !dropped.contains(&kernel.kind));
+        let program = plane.register(&context, &registration).expect("registers");
+        let facts = plane.facts(program, &pools).expect("the program's facts");
+        let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+        let (instance, rings) = slots_for(&pools, &facts, 0);
+        let id = plane
+            .bind(
+                &context,
+                program,
+                &seeds,
+                Extents {
+                    row_count: 1,
+                    sampled_rows: 1,
+                    query_len: 1,
+                    ..Extents::default()
+                },
+                GeometryClass::Host,
+                PortMask::NONE,
+                &ids,
+                session::Pooled {
+                    pools: &pools,
+                    instance: &instance,
+                    rings: &rings,
+                },
+            )
+            .expect("the instance binds");
+        let mut logits =
+            crate::device::Buffer::zeroed(&context, u64::from(vocab) * 2).expect("a logits plane");
+        let bytes: Vec<u8> = values.iter().flat_map(|&v| bf16_of(v).to_le_bytes()).collect();
+        logits.write(0, &bytes).expect("the logits write");
+        plane
+            .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, vocab, vocab)
+            .expect("the logits bind");
+        let carve = GuestCarve::new(
+            crate::device::Buffer::zeroed(&context, 256 << 20).expect("a guest region"),
+            256 << 20,
+            0,
+        );
+        // One fire to build the pipelines, one timed.
+        let _ = plane.fire(&context, id, Attach::Epilogue, &carve).expect("the stage fires");
+        let _ = plane.instance_mut(id).expect("bound").take(mask).expect("the take");
+        let (channel, seed) = &seeds[0];
+        plane.instance_mut(id).expect("bound").publish(*channel, seed).expect("the reseed");
+        let began = std::time::Instant::now();
+        let fired = plane.fire(&context, id, Attach::Epilogue, &carve).expect("the stage fires");
+        let took = began.elapsed();
+        assert!(matches!(fired, Fired::Committed), "the cut fires: {fired:?}");
+        let cell = plane
+            .instance_mut(id)
+            .expect("bound")
+            .take(mask)
+            .expect("the take")
+            .expect("a mask");
+        let mask = cell
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| i32::from_le_bytes(*word) != 0)
+            .collect();
+        (mask, took)
+    }
+
+    /// Probabilities from a seeded generator, `spread` deciding how flat:
+    /// value i is exp(-i * spread) shuffled and normalized, then rounded to
+    /// bf16 (as the logits plane holds them).
+    fn distribution(vocab: usize, spread: f64, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut weights: Vec<f64> = (0..vocab).map(|i| (-(i as f64) * spread).exp()).collect();
+        for i in (1..vocab).rev() {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            weights.swap(i, (state >> 33) as usize % (i + 1));
+        }
+        let total: f64 = weights.iter().sum();
+        weights.iter().map(|w| f32_of(bf16_of((w / total) as f32))).collect()
+    }
+
+    /// A top-k / top-p cut takes, by its rule, exactly the tokens a host
+    /// reckons: over peaked and flat distributions, ties (bf16 rounds many
+    /// probabilities alike), thresholds of nothing and past the whole mass,
+    /// and top-k from 0 past the vocabulary. Top-p differs from the f32
+    /// running sum it replaced only where that sum lay within f32 rounding of
+    /// the threshold; how often is printed.
+    #[test]
+    fn a_cut_takes_the_tokens_its_rule_names() {
+        let vocab = 1024usize;
+        let mut cases: Vec<(Vec<f32>, Cut)> = Vec::new();
+        for (seed, spread) in [(1u64, 0.05f64), (2, 0.005), (3, 0.0005), (4, 0.0)] {
+            let values = distribution(vocab, spread, seed);
+            for p in [0.0f32, 0.3, 0.5, 0.9, 0.95, 0.99, 1.0, 2.0] {
+                cases.push((values.clone(), Cut::P(p)));
+            }
+            for k in [0i32, 1, 7, 100, 1023, 1024, 5000] {
+                cases.push((values.clone(), Cut::K(k)));
+            }
+        }
+        use eta_compiler::codegen::program::KernelKind;
+        let mut near = 0usize;
+        for (form, dropped) in [
+            ("streamed", &[][..]),
+            ("grouped", &[KernelKind::Streamed][..]),
+            ("fused", &[KernelKind::Streamed, KernelKind::Grouped][..]),
+        ] {
+            for (values, cut) in &cases {
+                let (got, _) = fire_cut(values, *cut, dropped);
+                let want = reference(values, *cut);
+                assert_eq!(
+                    got.iter().filter(|&&t| t).count(),
+                    want.iter().filter(|&&t| t).count(),
+                    "{form} {cut:?}: the count taken"
+                );
+                assert_eq!(&got, &want, "{form} {cut:?}: the tokens taken");
+                if form == "streamed"
+                    && let Cut::P(p) = cut
+                    && running_sum_reference(values, *p) != want
+                {
+                    near += 1;
+                }
+            }
+        }
+        eprintln!(
+            "{} cuts in each of three forms match their rule; {near} top-p cut(s) differ from the \
+             f32 running sum",
+            cases.len()
+        );
+    }
+
+    /// A flat distribution's nucleus of ~10^4 and ~10^5 tokens over a
+    /// 151,936-token vocabulary: the cut's time, printed (the select once
+    /// walked a token at a time past 3 x 1024 candidates).
+    #[test]
+    fn a_wide_nucleus_cuts_in_bounded_time() {
+        let vocab = 151_936usize;
+        for (spread, label) in [(1.0e-4f64, "~10^4"), (1.0e-6, "~10^5")] {
+            let values = distribution(vocab, spread, 9);
+            let want = reference(&values, Cut::P(0.95));
+            let (got, took) = fire_cut(&values, Cut::P(0.95), &[]);
+            let taken = got.iter().filter(|&&t| t).count();
+            let running = running_sum_reference(&values, 0.95).iter().filter(|&&t| t).count();
+            eprintln!(
+                "nucleus {label}: {taken} tokens cut in {:.2} ms (the f32 running sum takes {running})",
+                took.as_secs_f64() * 1e3
+            );
+            assert_eq!(got, want, "the nucleus taken");
+        }
+    }
+
     const VOCAB: u32 = 1024;
     const LANES: u32 = 2;
     const CHUNK: u64 = 16 << 20;
