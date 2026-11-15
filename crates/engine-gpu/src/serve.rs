@@ -818,13 +818,26 @@ impl<B: Serve> Shell<B> {
         //
         // A rung whose span cannot lie in one binding is no rung of this
         // device: the span lies in the pool's last segment, and no segment
-        // is past a binding. The top is the widest rung that can; a fire
+        // is past a binding. Of the rungs the requested fire size offers,
+        // the top is the one the ruling picks (`crate::top`), over the live
+        // range kv and activation share at load: what the device leaves the
+        // weights it keeps, within what the pool's segments bind. A fire
         // wider than it has no carve, so the load's fires are cut to it and
         // the model compiled again at it (its own carve is laid again, as
-        // it may differ from the rung's laid under the wider top).
+        // it may differ from the rung's laid under the wider top); past the
+        // pick, only one binding bounds the top again.
         let binding = device.max_buffer();
-        // The top asked and its rungs' `(tokens, span bytes)`, once bounded.
-        let mut unbounded: Option<(u32, Vec<(u32, u64)>)> = None;
+        let asked_top = budgets.tokens.max_tokens;
+        let counts = crate::top::Counts::of(&boot.trace)?;
+        let live = {
+            let room = device.left().saturating_sub(counts.weight_bytes);
+            kv_budget
+                .map_or(room, |budget| budget.min(room))
+                .min(binding.saturating_mul(kernels_slang::SEGMENTS as u64))
+        };
+        let device_key = profile::id_of(device.name());
+        let model_key = engine::load::model_class(&boot.trace).to_owned();
+        let mut chosen: Option<crate::top::Chosen> = None;
         let (compiled, mut span) = loop {
             let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
             let top = budgets.tokens.max_tokens;
@@ -845,24 +858,46 @@ impl<B: Serve> Shell<B> {
                 .iter()
                 .map(|rung| (rung.tokens, rung.bytes()))
                 .collect();
-            match crate::arena::bound_top(&spans, binding) {
-                Some(widest) if widest < top => {
-                    unbounded.get_or_insert((top, spans));
-                    budgets.tokens = crate::arena::bounded_budget(&budgets.tokens, widest);
-                    boot.budget = budgets.tokens.clone();
+            let pick = match &chosen {
+                None => {
+                    let rungs = crate::top::rung_facts(&spans, budgets.tokens.max_lanes, binding);
+                    let pick = crate::top::choose(
+                        &rungs,
+                        live,
+                        &device_key,
+                        &model_key,
+                        &counts,
+                        binding,
+                    )?;
+                    tracing::debug!(spans = ?spans, ?pick, live, "the rungs the top is chosen of");
+                    let tokens = pick.tokens();
+                    chosen = Some(pick);
+                    Some(tokens)
                 }
                 // None: not even the least rung lies in one binding, and
                 // the pool refuses the load below.
+                Some(_) => crate::arena::bound_top(&spans, binding),
+            };
+            match pick {
+                Some(widest) if widest < top => {
+                    budgets.tokens = crate::arena::bounded_budget(&budgets.tokens, widest);
+                    boot.budget = budgets.tokens.clone();
+                }
                 _ => break (compiled, span),
             }
         };
-        if let Some((asked, spans)) = unbounded {
+        if let Some(chosen) = &chosen {
             tracing::info!(
-                asked,
-                top = budgets.tokens.max_tokens,
-                spans = ?spans,
-                "the top rung is bounded by this device's largest binding: {} MiB",
-                binding >> 20
+                "{}",
+                crate::top::line(
+                    chosen,
+                    budgets.tokens.max_tokens,
+                    asked_top,
+                    span.bytes(),
+                    live,
+                    &device_key,
+                    &model_key,
+                )
             );
         }
 
