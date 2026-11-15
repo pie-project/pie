@@ -1430,6 +1430,11 @@ impl PreparedLoad<'_> {
         }
         // The null chunk and the floor stand from the load on.
         pools.commit_segments(1)?;
+        // The activation span is backed whole now, before ready: the top
+        // rung's carve and every segment a lower lends to state, so a raise
+        // or a lend mid-serve maps nothing (a placement heap made after
+        // ready is a device allocation after ready).
+        pools.back_whole_span()?;
         // A load whose weights the runtime holds seats every atom in pool
         // slots itself, from the serving file where it reads them there,
         // and states where (`WeightShape::seated`); the runtime adopts it.
@@ -1471,7 +1476,7 @@ impl PreparedLoad<'_> {
             )?),
             false => None,
         };
-        let shell = Shell {
+        let mut shell = Shell {
             tuning,
             device,
             outside,
@@ -1542,6 +1547,15 @@ impl PreparedLoad<'_> {
                 "metal: the widest rung's recurrent scratch"
             );
         }
+        // The span is backed whole, so the shell stands at the largest rung
+        // from the load, as the runtime's pool starts (a span not backed on
+        // demand is not raised through `set_rung`).
+        shell.raise_whole()?;
+        tracing::info!(
+            span_mib = shell.pools.span_held_bytes() >> 20,
+            heaps = shell.pools.span_heaps_made(),
+            "metal: the activation span is backed whole at the load"
+        );
         Ok(shell)
     }
 }
@@ -1854,6 +1868,14 @@ impl Shell {
         );
         self.batch_bottom = bottom;
         Ok(())
+    }
+
+    /// Placement heaps made for the activation span since the load: the
+    /// load backs it whole before ready, so a rung raise or a span lend
+    /// after makes none.
+    #[must_use]
+    pub fn span_heaps_made(&self) -> u64 {
+        self.pools.span_heaps_made()
     }
 
     /// Raises the rung to the widest, backing its carve: what a caller that
