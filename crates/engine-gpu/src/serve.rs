@@ -70,6 +70,9 @@ pub trait Serve: Backend {
     /// The fusions the backend implements.
     const FUSIONS: &'static [poem_compiler::fuse::Rule];
 
+    /// What the backend's kernels compile to.
+    const TARGET: kernels_slang::Target;
+
     /// Whether a step's frames are recorded to replay: a recorded fire binds
     /// buffers that stand across fires, so the rows a gather of its token ids
     /// reads are prestaged in the arm's ring rather than handed from the host.
@@ -288,6 +291,15 @@ pub struct Boot<'a, B: Serve> {
 
     /// How the top rung is chosen.
     pub top: Top,
+}
+
+/// The rungs a load weighed its top by, and the estimate it weighed them
+/// with, over its live range: what a check of the estimate reads.
+#[derive(Debug, Clone)]
+pub struct Weighed {
+    pub rungs: Vec<engine::load::RungFacts>,
+    pub estimate: engine::load::FireEstimate,
+    pub live: u64,
 }
 
 /// How a load chooses the top rung of its fires.
@@ -664,6 +676,9 @@ pub struct Shell<B: Serve> {
     pub weights: Weights<B>,
     /// A fire's arena and kernel scratch, at the top of the pool.
     span: Span<B>,
+    /// The rungs the load weighed its top by, and the estimate, where the
+    /// profile states rates.
+    weighed: Option<Weighed>,
     pools: Pools<B>,
     /// The weight cache's row tables (PLE), streamed through pool slots.
     pub row_caches: crate::store::rows::RowCaches<B>,
@@ -1010,8 +1025,10 @@ impl<B: Serve> Shell<B> {
         };
         let device_profile = tuning.profile().clone();
         let device_name = device.name().to_owned();
-        let model_key = engine::load::model_class(&boot.trace).to_owned();
+        let gemm = tuning.gemm(B::tier(&device));
+        let padded = |rows: u32| kernels_slang::linear::gemm::padded_rows(B::TARGET, gemm, rows);
         let mut chosen: Option<Option<engine::load::TopRung>> = None;
+        let mut weighed: Option<Weighed> = None;
         let (compiled, mut span) = loop {
             let compiled = compile_axes(&boot.trace, &budgets, &profile)?;
             let top = budgets.tokens.max_tokens;
@@ -1032,15 +1049,31 @@ impl<B: Serve> Shell<B> {
                 .iter()
                 .map(|rung| (rung.tokens, rung.bytes()))
                 .collect();
+            // The kernels a fire issues: the compiled plan's launches.
+            let launches = u32::try_from(compiled.template().len()).unwrap_or(u32::MAX);
+            let rungs = crate::top::rung_facts(
+                &spans,
+                budgets.tokens.max_lanes,
+                binding,
+                launches,
+                &padded,
+            );
+            if weighed.is_none() {
+                weighed = crate::top::estimate(&counts, &device_profile.rates()).map(|estimate| {
+                    Weighed {
+                        rungs: rungs.clone(),
+                        estimate,
+                        live,
+                    }
+                });
+            }
             let pick = match (&chosen, boot.top) {
                 (None, Top::Ruled) => {
-                    let rungs = crate::top::rung_facts(&spans, budgets.tokens.max_lanes, binding);
-                    let pick = crate::top::choose(
+                    let (pick, _) = crate::top::choose(
                         &rungs,
                         live,
                         &device_profile,
                         &device_name,
-                        &model_key,
                         &counts,
                         binding,
                     )?;
@@ -1071,8 +1104,6 @@ impl<B: Serve> Shell<B> {
                     budgets.tokens.max_tokens,
                     span.bytes(),
                     live,
-                    &device_name,
-                    &model_key,
                     device_profile.tuned(),
                 )
             ),
@@ -1552,6 +1583,7 @@ impl<B: Serve> Shell<B> {
             budgets,
             weights,
             span,
+            weighed,
             pools,
             row_caches,
             expert_caches,
@@ -2022,6 +2054,13 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn recordings(&self) -> Option<(u64, u64)> {
         B::recordings(&self.shelf)
+    }
+
+    /// The rungs the load weighed its top by and the estimate it weighed
+    /// them with, where its profile states rates.
+    #[must_use]
+    pub fn weighed(&self) -> Option<&Weighed> {
+        self.weighed.as_ref()
     }
 
     /// The widths, in tokens, of the rungs the load laid, narrowest first:

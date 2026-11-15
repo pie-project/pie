@@ -171,20 +171,27 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
     })
 }
 
-/// The `[fire_ns]` step: `artifact` loaded under `file` as a served load
-/// is asked ([`crate::FIRE`]), every rung one binding holds laid, and a
-/// fire of each rung's width timed, one lane on a fresh slot. Returns the
-/// model class it is filed under and its table.
-fn fire_ns(
+/// How far the estimate's pick may fall short of the measured-best rung:
+/// its score, under the measured times, within this share of the best's.
+pub const CHECK_BOUND: f64 = 0.05;
+
+/// `--check-estimate`: `artifact` loaded under `file` as a served load is
+/// asked ([`crate::FIRE`]), every rung one binding holds laid; a fire of
+/// each rung's width timed through the serving path (one lane on a fresh
+/// slot, replayed as served fires are), against the estimate the load
+/// weighs its top by. Prints both a rung and the two picks; refuses where
+/// the estimate's pick scores, under the measured times, more than
+/// [`CHECK_BOUND`] below the measured best.
+fn check_estimate(
     artifact: &Path,
     deployment: &str,
     device: &str,
     file: &str,
     say: &mut dyn FnMut(&str),
-) -> Result<(String, profile::fire::FireTable), String> {
+) -> Result<String, String> {
     use poem::{Platform, Request};
     let (lanes, tokens) = crate::FIRE;
-    let dir = std::env::temp_dir().join(format!("pie-tune-vulkan-fire-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("pie-tune-vulkan-check-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let path = crate::chip::SHELF.user_path(&dir, device);
     std::fs::create_dir_all(path.parent().expect("a parent")).map_err(|e| e.to_string())?;
@@ -222,15 +229,25 @@ fn fire_ns(
         top: engine_gpu::serve::Top::EveryRung,
     })
     .map_err(|e| e.to_string())?;
-    let widths = shell.rung_tokens();
+    let weighed = shell.weighed().cloned().ok_or_else(|| {
+        format!(
+            "{device} has no rates in its profile to estimate by: run `pie tune vulkan --rates`"
+        )
+    })?;
+    let widths: Vec<u32> = weighed
+        .rungs
+        .iter()
+        .filter(|r| r.infeasible.is_none())
+        .map(|r| r.tokens)
+        .collect();
     say(&format!(
         "timing a fire at each of {} rung widths of {model}",
         widths.len()
     ));
     let token = |i: u32| 100 + (i * 7919) % 5000;
-    let table = search::time_fires(
+    let measured = search::time_fires(
         &widths,
-        |width| {
+        |width, timed| {
             let prompt: Vec<u32> = (0..width).map(token).collect();
             shell.open(0).map_err(|e| e.to_string())?;
             let lane = engine_gpu::serve::Lane {
@@ -248,10 +265,10 @@ fn fire_ns(
             // times the host's encoding beside the device's work, and is no
             // fire time of this model.
             let replayed = |c: Option<(u64, u64)>| c.map_or(0, |(replayed, _)| replayed);
-            if replayed(shell.recordings()) <= replayed(before) {
+            if timed && replayed(shell.recordings()) <= replayed(before) {
                 return Err(format!(
-                    "a fire of {width} tokens of {model} was walked, not replayed (it records {:?}): \
-                     its time is not what serving runs, so no [fire_ns] entry is written",
+                    "a fire of {width} tokens of {model} was walked, not replayed (recordings \
+                     {:?}): its time is not what serving runs, so it is no measurement",
                     shell.recordings()
                 ));
             }
@@ -261,7 +278,63 @@ fn fire_ns(
     )?;
     drop(shell);
     let _ = std::fs::remove_dir_all(&dir);
-    Ok((model, table))
+
+    let rungs: Vec<engine::load::RungFacts> = weighed
+        .rungs
+        .iter()
+        .filter(|r| r.infeasible.is_none())
+        .copied()
+        .collect();
+    let est: Vec<f64> = rungs.iter().map(|r| weighed.estimate.ns(r)).collect();
+    let meas: Vec<f64> = rungs
+        .iter()
+        .map(|r| {
+            measured
+                .iter()
+                .find(|&&(t, _)| t == r.tokens)
+                .map_or(f64::NAN, |&(_, ns)| ns as f64)
+        })
+        .collect();
+    let by_est = engine::load::pick(&rungs, &est, weighed.live).map_err(|e| e.to_string())?;
+    let by_meas = engine::load::pick(&rungs, &meas, weighed.live).map_err(|e| e.to_string())?;
+    let scores = engine::load::scored(&rungs, &meas, weighed.live);
+    let score = |tokens: u32| {
+        scores
+            .iter()
+            .find(|&&(t, _)| t == tokens)
+            .map_or(0.0, |&(_, s)| s)
+    };
+    let (at_est, best) = (score(by_est.tokens), score(by_meas.tokens));
+    let mut out = format!("{model} on {device}: rung, measured ms, estimated ms\n");
+    for (k, r) in rungs.iter().enumerate() {
+        out.push_str(&format!(
+            "  {:>6} {:>10.2} {:>10.2}\n",
+            r.tokens,
+            meas[k] / 1e6,
+            est[k] / 1e6
+        ));
+    }
+    let short = if best > 0.0 { 1.0 - at_est / best } else { 0.0 };
+    out.push_str(&format!(
+        "  pick by the estimate {}, by the measured times {}; the estimate's scores {:.1}% below \
+         the best (bound {:.0}%)\n",
+        by_est.tokens,
+        by_meas.tokens,
+        100.0 * short,
+        100.0 * CHECK_BOUND
+    ));
+    say(&out);
+    if short > CHECK_BOUND {
+        return Err(format!(
+            "the estimate picks rung {} for {model}, {:.1}% below the measured best {}: past \
+             the {:.0}% bound\n{out}",
+            by_est.tokens,
+            100.0 * short,
+            by_meas.tokens,
+            100.0 * CHECK_BOUND
+        ));
+    }
+    Ok(out)
 }
 
 /// A fingerprint of the fused trace and plan a load under `text` runs, as
@@ -386,23 +459,23 @@ fn measure(_: &Profile, _: &qmm::Grid, _: &mut dyn FnMut(&str)) -> Result<qmm::M
     Err("this build carries no Vulkan device code".to_string())
 }
 
-/// The steps a `pie tune` run takes: every decision's search, then the
-/// `[fire_ns]` step, by default; one step alone, or the two named, else.
+/// The steps a `pie tune` run takes: every decision's search by default;
+/// the `[rates]` step, the check of the estimate, or both, else.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Steps {
     /// The `[rates]` step alone ([`crate::rates::measure`]).
     pub rates: bool,
-    /// The `[fire_ns]` step alone.
-    pub fire_ns: bool,
+    /// The check of the estimate alone (`--check-estimate`).
+    pub check_estimate: bool,
 }
 
 impl Steps {
     fn search(self) -> bool {
-        !self.rates && !self.fire_ns
+        !self.rates && !self.check_estimate
     }
 
-    fn fires(self) -> bool {
-        self.fire_ns || !self.rates
+    fn checks(self) -> bool {
+        self.check_estimate
     }
 }
 
@@ -510,13 +583,12 @@ pub fn run(
     }
     let today = bench.file(&[])?;
     let draft = bench.file(&chosen)?;
-    // The fire times of each model under the file this writes.
-    let mut fires = Vec::new();
-    for (artifact, deployment) in models.iter().filter(|_| steps.fires()) {
-        say(&format!("[fire_ns]: {deployment}"));
-        fires.push(fire_ns(artifact, deployment, &name, &draft, say)?);
+    // The estimate each model's load weighs its top by, against its fires
+    // measured, under the file this writes.
+    for (artifact, deployment) in models.iter().filter(|_| steps.checks()) {
+        say(&format!("check of the estimate: {deployment}"));
+        check_estimate(artifact, deployment, &name, &draft, say)?;
     }
-    tuned.push_str(&search::render_fire_ns(&fires));
     let mut checks = Vec::new();
     let unchanged = draft == today;
     if unchanged && !models.is_empty() {
@@ -567,17 +639,6 @@ pub fn run(
         ("pie", format!("\"{}\"", env!("CARGO_PKG_VERSION"))),
         ("seconds", format!("{seconds:.0}")),
         ("checked", format!("\"{}\"", checked.replace('"', "'"))),
-        (
-            "fire_ns",
-            format!(
-                "[{}]",
-                fires
-                    .iter()
-                    .map(|(model, _)| format!("\"{model}\""))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        ),
     ];
     let file = search::assemble(
         crate::chip::registry(),

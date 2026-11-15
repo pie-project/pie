@@ -38,22 +38,19 @@ fn the_micro_fires_state_rates_and_the_ruling_picks_by_them() {
         &[(1024, 100 * MIB), (2048, 200 * MIB), (4096, 400 * MIB)],
         512,
         1 << 30,
+        300,
+        &|rows| rows.div_ceil(64) * 64,
     );
     let counts = Counts {
         weight_bytes: 1 << 30,
-        flops_per_token: 1 << 30,
+        expert_bytes: 0,
+        experts: None,
+        flops_per_row: 1 << 30,
         attn_flops_per_row_key: 1 << 16,
+        kv_bytes_per_key: 1 << 16,
     };
-    let top = choose(&rungs, 8 << 30, &profile, "adapter", "m", &counts, 1 << 30).unwrap();
-    let line = line_of(
-        &top,
-        top.tokens,
-        top.span_bytes,
-        8 << 30,
-        "adapter",
-        "m",
-        profile.tuned(),
-    );
+    let (top, _) = choose(&rungs, 8 << 30, &profile, "adapter", &counts, 1 << 30).unwrap();
+    let line = line_of(&top, top.tokens, top.span_bytes, 8 << 30, profile.tuned());
     assert!(line.contains("by the estimate"), "{line}");
     assert!(line.contains("rates measured this load"), "{line}");
     // Never written: a dump of the profile states no rates.

@@ -41,9 +41,9 @@ pub struct TuneRequest<'a> {
     pub cache: &'a Path,
     /// Fit the kept measurements again instead of measuring.
     pub refit: bool,
-    /// Run the `[fire_ns]` step alone: time the check models' fires at each
-    /// rung width, every decision left as it is.
-    pub fire_only: bool,
+    /// Check the estimate alone: time the check models' fires at each rung
+    /// width and hold the estimate's pick to the measured best.
+    pub check_estimate: bool,
     /// Run the `[rates]` step alone: the device's rates measured on it.
     pub rates: bool,
 }
@@ -189,7 +189,7 @@ fn tune_vulkan(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned
         req.refit,
         Steps {
             rates: req.rates,
-            fire_ns: req.fire_only,
+            check_estimate: req.check_estimate,
         },
         &models,
         say,
@@ -203,7 +203,7 @@ tune_grid!(tune_metal, engine_metal, "metal");
 /// `pie tune wgpu`: the `[rates]` step alone.
 #[cfg(feature = "wgpu")]
 fn tune_wgpu(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
-    if !req.rates || req.fire_only {
+    if !req.rates || req.check_estimate {
         return Err(
             "`pie tune wgpu` measures the device's rates alone: pass --rates".to_string(),
         );

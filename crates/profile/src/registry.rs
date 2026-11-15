@@ -17,7 +17,7 @@ use crate::when::When;
 pub const API: i64 = 1;
 
 /// Top-level keys that are not decisions.
-const RESERVED: [&str; 5] = ["api", "target", "provenance", "rates", "fire_ns"];
+const RESERVED: [&str; 4] = ["api", "target", "provenance", "rates"];
 
 /// A typed ladder, and the flag it raises when evaluated at a point.
 type Build = fn(
@@ -109,7 +109,7 @@ pub struct File {
     pub measured: Vec<&'static str>,
     /// Decisions the file spells, by id.
     pub entries: BTreeMap<&'static str, Vec<Rung>>,
-    /// `[rates]` and `[fire_ns]` ([`crate::fire`]).
+    /// `[rates]` ([`crate::fire`]).
     pub tuned: crate::fire::Tuned,
 }
 
@@ -362,7 +362,6 @@ impl Registry {
                 }
                 "target" => file.target = walk.target(value),
                 "rates" => file.tuned.rates = walk.rates(value),
-                "fire_ns" => file.tuned.fire_ns = walk.fire_ns(value),
                 "provenance" => match value.get_ref() {
                     DeValue::Table(t) => {
                         for (k, v) in t.iter() {
@@ -1017,44 +1016,6 @@ impl<'a> Walk<'a> {
             }
         }
         rates
-    }
-
-    fn fire_ns(
-        &mut self,
-        value: &Spanned<DeValue<'_>>,
-    ) -> BTreeMap<String, crate::fire::FireTable> {
-        let mut out = BTreeMap::new();
-        let DeValue::Table(t) = value.get_ref() else {
-            self.err(value.span().start, "`fire_ns` is a table of model classes");
-            return out;
-        };
-        let shape = "a list of `[tokens, ns]` pairs, ascending in tokens";
-        for (k, v) in t.iter() {
-            let model = k.get_ref().to_string();
-            let DeValue::Array(rows) = v.get_ref() else {
-                self.err(v.span().start, format!("`fire_ns.{model}` is {shape}"));
-                continue;
-            };
-            let mut table: crate::fire::FireTable = Vec::new();
-            for row in rows.iter() {
-                let pair = match row.get_ref() {
-                    DeValue::Array(pair) if pair.len() == 2 => {
-                        let tokens = int(pair[0].get_ref()).and_then(|i| u32::try_from(i).ok());
-                        let ns = int(pair[1].get_ref()).and_then(|i| u64::try_from(i).ok());
-                        tokens.zip(ns).filter(|&(tokens, ns)| tokens > 0 && ns > 0)
-                    }
-                    _ => None,
-                };
-                match pair {
-                    Some(pair) if table.last().is_none_or(|last| last.0 < pair.0) => {
-                        table.push(pair);
-                    }
-                    _ => self.err(row.span().start, format!("`fire_ns.{model}` is {shape}")),
-                }
-            }
-            out.insert(model, table);
-        }
-        out
     }
 
     fn target(&mut self, value: &Spanned<DeValue<'_>>) -> Target {
