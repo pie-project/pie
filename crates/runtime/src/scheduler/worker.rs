@@ -1050,17 +1050,40 @@ impl SchedulerHandle {
             }
             None => None,
         };
-        let (registered, _, bound) = crate::inferlet::process::said(
-            "bind: the lane's bind",
-            pipeline_id.unwrap_or_default(),
-            self.request(|response| SchedulerItem::RegisterChannelsBind {
-                pipeline_id,
-                plans,
-                bind,
-                response,
-            }),
-        )
-        .await??;
+        let pid = pipeline_id.unwrap_or_default();
+        let lane_bind = || {
+            let (plans, bind) = (plans.clone(), bind.clone());
+            async move {
+                crate::inferlet::process::said(
+                    "bind: the lane's bind",
+                    pid,
+                    self.request(|response| SchedulerItem::RegisterChannelsBind {
+                        pipeline_id,
+                        plans,
+                        bind,
+                        response,
+                    }),
+                )
+                .await?
+            }
+        };
+        // Suspended meanwhile, its channels parked with it: the bind waits
+        // for it to be resident again, as a fire does, never refused.
+        let resident = || async move {
+            match crate::planner::planner_of(pid) {
+                Some(planner) => {
+                    crate::inferlet::process::said(
+                        "bind: resident again",
+                        pid,
+                        planner.wait_resident(pid),
+                    )
+                    .await
+                }
+                None => Err(crate::planner::PlannerError::Cancelled),
+            }
+        };
+        let (registered, _, bound) =
+            crate::store::roles::bind_when_resident(pid, lane_bind, resident).await?;
         Ok((registered, bound))
     }
 
