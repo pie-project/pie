@@ -6,7 +6,9 @@ stream program builds for the system fabric at 1024², §4.1) compile side done,
 1,065 ELFs; 1.52 s a step predicted, §4.1), M1f / M1g (flux2-mini's denoise loop re-launched on
 the simulator, driven through the engine by a guest, its static arrays from a checkpoint, §4.1)
 M1h (flux2-mini's text encoder on the simulator through the engine, compiled on load; `pie run
-text-to-media` making an image on the host fabric, §4.1) and M3 (the decode
+text-to-media` making an image on the host fabric, §4.1), M1i (the VAE decode on the simulator
+by the grid regime; the readings co-resident; `pie run text-to-media` fully on the simulator,
+48.3 dB from diffusers, §4.1) and M3 (the decode
 layouts as points of the Floorplan, §2.5). ARCHITECTURE.md is what runs for decode.
 
 **Goal.** A `.poem` model the compiler has not seen runs on the wafer with no hand code. The
@@ -1096,6 +1098,139 @@ milestone's tail.
     - GQA in the stream attention (the mini's encoder is MHA; klein's Qwen3-4B is GQA 32 / 8:
       a head root's q heads a kv head), and more than one tap (klein's three: a second value
       on the row stream).
+
+- **M1i** (flux2-mini's VAE decode on the wafer, generic over the grid family; its readings
+  co-resident in one program).
+  - **The grid regime** (kernels-cerebras `stream::grid`, `emit::grid`; `wafer-compile stream
+    --reading vae.decode [--clip t,h,w]`, compiled on load as the stream readings are). A reading
+    whose nodes run no layer and hold a convolution or a group norm is read off its trace into
+    **passes over one unit**: `P` CX roots, `P` CY roots, `P x P` weight PEs, every matvec of the
+    reading tiled over all of them. No op is named: each lowers by its family.
+    - `conv.conv3d` is a **gather** (its im2col: an output row's `k x k` taps from a line buffer
+      of its input's rows at the roots, zeros outside the grid; stride and front padding as the
+      op states) feeding the P1 tile matvec (`mv.csl`'s `tile32`, its tile the conv kernel's
+      taps-major columns of the root's channels), the bias a printed region. A 1 x 1 conv and a
+      `linear.matmul` are the matvec alone.
+    - `conv.upsample`, `conv.pixel_shuffle`, `conv.pixel_unshuffle` are gathers too (one tap a
+      row, a channel of every `r²`, or `r²` taps interleaved); an upsampling read by one conv
+      folds into its taps (the conv's grid the source's at twice its coordinates).
+    - `conv.group_norm` is a **reduction over its input's every row** (P2 over a clip's rows):
+      the input's chunk summed a channel as its rows are made (shifted by its first row's
+      value), its scale and shift (`rstd · gamma`, `beta - mean · rstd · gamma` a channel) made
+      at that pass's end, the apply (and its SiLU) a printed region (`x a + b`, then
+      `t / (1 + e^-t)`) a row in a later pass. A root holds whole groups (`P` is the most roots
+      that cut every norm's groups evenly), so no all-reduce.
+    - `attn.voxel` (one head as wide as the row) is the joint attention's P7 (`satt.csl`): its
+      q / k / v (and what makes them after their matvecs) whole at CY root 0, a K / V column
+      under it, the stores one pass and the queries the next.
+    - Every other elementwise run is a printed root region (`fuse::chain::lower_run`; the
+      latent's `elemwise.standardize` added to its explicit arm, so no CUDA chain changes).
+    - The host's nodes are the host's (`conv.grid`'s rules at compile time from the clip; the
+      latents' `pixel_unshuffle`, an entry).
+  - **Passes.** A group norm reads its input's every row and a gather reads rows ahead of the one
+    it makes, so the reading is cut where one starts: a pass's *head* makes the rows its gather
+    reads (a held value fetched, a norm applied) into the line buffer, its *tail* the rows the
+    gather makes (the matvec, the bias, the residual); the head is pulled to each tail row's
+    need (every kernel computes it from the row's position, so every PE interleaves alike). A
+    value read by a later pass is **held in the weight PEs** (M2a's row store on both sides: a
+    row-side value's row `t` by column `t % P` of its root's row, a column-side value's by row
+    `t % P` of its root's column, 16-bit, slots shared by lifetime) and fetched back up the chain
+    it was cast down; the host's rows enter the same way, and the outputs leave from them.
+    flux2-mini at 64 x 64 pixels: **28 passes** (8 x 8 to 64 x 64), 30 matvecs, 22 norms, one
+    attention; `P = 8` (a norm's 4 channels a group); a weight PE's store 7,168 16-bit words.
+  - **Kernels as programs.** Each kernel is a small interpreter over its pass program (16-bit
+    words a PE: each pass's header, its head's and tail's ops, its finals; `emit::grid`'s
+    `SWEEP`, `ROOT_OPS`, `WEIGHT_OPS`): unrolled a pass, the weight PE's code alone was 34 KB and
+    a root's descriptors overflowed `data.lo`; as programs a weight PE is 35 KB with its tiles and
+    store, a root 24 KB. Every root of a side shares a file (CY root 0 holds the attention).
+  - **Host emulation** (`grid::emulate`: the passes, each weight PE's tile from the compile's own
+    spans, the gathers' taps, the norms, the attention). The engine-cerebras test
+    `flux_2_minis_vae_program_is_the_reference` (pipeline latent, 8 x 8):
+    | | rel L2 / cosine | PSNR |
+    |---|---|---|
+    | the grid program on the host vs engine-cpu | 2.70e-3 / 0.99999636 | 63.4 dB |
+    | the grid program on the host vs diffusers' `AutoencoderKLFlux2` | 1.09e-2 / 0.99994127 | 50.4 dB (engine-cpu's own: 50.4) |
+  - **Simulator** (`flux_2_minis_vae_on_the_fabric`, the test binary in the SDK container, the
+    static arrays from the checkpoint, the entries from the engine; `READING_PASSES=N` runs a
+    prefix and holds its last value to the host program). Every pass prefix of the decode ran
+    and matched the host program (4 passes bit for bit; after the attention 2.7e-3, its 16-bit
+    probabilities at 4 keys; 1.4e-2 by pass 27, the norms after it amplifying them). The whole
+    decode:
+    | latent (pixels) | vs engine-cpu (rel L2 / cosine) | PSNR vs engine-cpu | cycles | wall |
+    |---|---|---|---|---|
+    | 2 x 2 drawn (16 x 16) | 1.42e-2 / 0.99990192 | 48.2 dB | 4.84M (4.72M with the gather's coordinates hoisted) | 9.6 min |
+    | 8 x 8, the pipeline's (64 x 64) | 1.03e-2 / 0.99994750 | 51.0 dB | 73.5M | 2.4 h |
+
+    Against diffusers' `AutoencoderKLFlux2` decode of the same latent: **1.16e-2 / 0.99993318,
+    PSNR 49.8 dB** (engine-cpu's own: 1.09e-2, 50.4 dB).
+
+    A row costs about 2.4k cycles (a 4-wide chunk: the norm's SiLU is ~45 DSD ops, the 9-tap
+    gather's index math, the fetch round trip up a chain a row), so flux2-mini's 64 x 64 decode is
+    73.5M cycles (31,744 tail rows, 84 ms at 875 MHz). Footprint: 9 x 19 PEs (8 + 8 roots,
+    64 weight PEs, the K / V column's root and 8 PEs).
+  - **Co-resident readings** (kernels-cerebras `stream::coresident`). The load's readings,
+    each compiled on its own, are laid side by side in one program (`layout.csl` at the cache
+    entry's root placing reading `i` at its column offset, each PE's code its reading's own file:
+    cslc resolves a kernel's imports from its directory). Every kernel's `run` takes the reading
+    launched and starts only where it is its reading's (`RD`), the rest unblocking at once; each
+    reading's `host.json` gains its `origin` and `rd`, so its host side is as it was (every
+    array's PEs moved by the origin, the stamps read over its own rectangle, `run` launched
+    with its id). The engine opens the one link once (`Streams` keep the link open, a reading's
+    static arrays written the first time it runs) and a step launches its reading. flux2-mini:
+    text (10 x 36), denoise (77 x 28), VAE decode (9 x 19) in one 96 x 36 program, linked once
+    (20 s). **On the simulator** (`flux_2_minis_vae_on_the_fabric`, `READING_COMBINE=1`): the
+    2 x 2 decode launched by its id in the combined program is the standalone run's (1.42e-2,
+    48.2 dB), 4.72M cycles, but 66 min of simulator against 9.6: the simulator's rate is about
+    2.3M tile-cycles a second, so a program of 3,644 simulated tiles runs a reading at ~630
+    cycles a second however few of them it uses. An end-to-end through it (~88M cycles, mostly
+    the decode) would take ~40 h.
+  - **A reading a child process** (`[cerebras.debug] stream_processes = "<wafer-fabric command>"`,
+    engine-cerebras `reading::Children`, `bin/wafer-fabric`): each reading linked on its own and
+    run in a child process holding its SDK runtime (JSON lines and words over its stdin and
+    stdout), one child open at a time (one simulator machine-wide), its static arrays written
+    again when it reopens. The engine process drives text, denoise and decode; each simulator
+    simulates its own fabric. Co-residence stays the default (a system loads one program).
+  - **The grid reading through the engine.** Its class has no token rows (its rows are its clip's
+    voxels): a lane's tokens are not held to them; its clip must be the compiled one
+    (`host.json`'s `clip`; the compile's clip is the square the trace's patchify of the same
+    voxel input makes `stream_rows` token rows of, 8 x 8 at 16). On the host fabric `pie run
+    text-to-media` (`--guidance 4`, seed 7) now serves its VAE through the program's host side:
+    the image is M1h's bit for bit, 48.2 dB from diffusers' pipeline. (Without `--guidance 4`
+    the inferlet runs at guidance 1, diffusers' golden at 4: 17.9 dB, not a regression.)
+  - **`pie run text-to-media` fully on the simulator** (`--prompt "a red fox sleeping" --width
+    64 --height 64 --steps 2 --seed 7 --guidance 4`; the `pie` binary in the SDK container,
+    `stream_processes` the `wafer-fabric` command, `[runtime] silence_timeout` past a simulated
+    step's hours): one engine process compiles, links and serves the three readings, the
+    inferlet's text pass, 2 denoise steps and the VAE decode each on the simulator, a 64 x 64
+    PNG. **48.3 dB against diffusers' pipeline** (max |diff| 4/255; the host fabric's image, M1h's,
+    48.2 dB), 47.0 dB against the host fabric's run of the same request.
+    | step | cycles | simulator |
+    |---|---|---|
+    | text (16 tokens) | 1.38M | 4.7 min |
+    | denoise step 0 (the first launch, start-up included) | 7.90M | 78 min |
+    | denoise step 1 | 1.27M | 15 min |
+    | VAE decode (8 x 8 latent, 64 x 64 pixels) | 73.5M | 2.4 h |
+  - Decode is unchanged: plan + build `diff -r` identical against ac04a9f52's wafer-compile for
+    qwen35-d0.8b, qwen35-d9b, llama31-8b, gptoss-20b, gemma4-e2b and tiny t08.
+  - **klein-4B's VAE** lowers into the same passes (its resnets' shortcut convolutions leave the
+    skip on the other side of the unit from the main branch: the region over both moves one
+    across, an identity matvec, its tile the constant one on the diagonal, `stream::host::UNIT`)
+    and is refused by the memory check: one unit holds its ~50M weights, 255k 16-bit words a
+    weight PE (budget 15k).
+  - `vae.encode` lowers too (`--clip 1,64,64`: 21 passes, its stride-2 convolutions' back
+    padding as the grid rule states); compile on load derives its clip from token rows (4 x 4
+    pixels) and refuses it.
+  - Left:
+    - Speed: the passes are overhead-bound (above). Rows a step batched into one op's vectors
+      (a chunk times B rows), the store's fetch issued a row ahead (the weight PEs' heads are
+      fetches alone), and a unit a resolution (pipelined between norms) are the levers; the
+      cost model does not price grid programs yet.
+    - klein's VAE: its passes over several units (a unit a block or a resolution), the images'
+      store spread over many PEs (a 1024² image of 128 channels is ~256 MB) or the norms'
+      statistics made in a pass of their own so fewer images are held.
+    - The encoder's compile-on-load clip (the clip whose output is the denoiser's latent).
+    - Co-residence on the simulator costs every reading the whole program's tiles: a load
+      simulated end to end runs its readings apart (`stream_processes`).
 
 ## 5. Risks
 
