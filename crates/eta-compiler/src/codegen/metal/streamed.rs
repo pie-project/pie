@@ -513,9 +513,9 @@ inline uint m4_broadcast_index(const M1ValueDesc bd0, const M1ValueDesc bo0, uin
 
 const MAX_SPLIT_REDUCTIONS: usize = 64;
 
-const SELECT_BYTES: usize = 16384;
-
-const SELECT_ROUNDS: usize = 3;
+/// A select's state and histograms in the region's temporaries: the
+/// runtime's `M4_SEL_BYTES` (16 rows of 3200 bytes).
+const SELECT_BYTES: usize = 16 * 3200;
 
 enum Plan {
     Direct {
@@ -926,7 +926,7 @@ pub fn emit_streamed_region(
             )
     });
     let extra = if has_select {
-        "  threadgroup atomic_uint m4_sel_tg_hist[256];\n  threadgroup uint m4_sel_key[1024];\n  threadgroup uint m4_sel_idx[1024];\n  threadgroup uint m4_sel_scan[1024];\n"
+        "  threadgroup atomic_uint m4_sel_tg_hist[768];\n  threadgroup uint m4_sel_scan[1024];\n"
     } else {
         ""
     };
@@ -1388,41 +1388,37 @@ pub fn emit_streamed_region(
                     sched.cases.push_str("    return;\n  }\n");
                     sched.push_step(streamed_step(*input, kind), vec![*node]);
                 };
+                // A radix select of the cut: four passes over the row, 8 bits
+                // of the descending key each, whatever the nucleus's size
+                // (the runtime's m4_sel_*); then every token's mask, and the
+                // cut key's ties in index order where only some are taken.
                 case(
                     format!(
-                        "    m4_sel_init({base}, {o0}, {d0}, {d1}, {a1}, {mode}u, m4_gtid, m4_gthreads);\n"
+                        "    m4_sel_init({base}, {o0}, {d0}, {d1}, {a1}, {mode}u, m4_gtid, m4_gthreads, status, lane_params[{node}]);\n"
                     ),
                     StepKind::Wide,
                 );
-                for _ in 0..SELECT_ROUNDS {
-                    for pass in 0..4u32 {
-                        case(
-                            format!(
-                                "    m4_sel_hist_pass({base}, {a0}, {d0}, {pass}u, m4_gtid, m4_gthreads, m3_tid, m3_threads, m4_sel_tg_hist);\n"
-                            ),
-                            StepKind::Wide,
-                        );
-                        case(
-                            format!(
-                                "    if (m4_group.x != 0) return;\n    m4_sel_pick({base}, {pass}u, m3_tid, m3_threads);\n"
-                            ),
-                            StepKind::Single,
-                        );
-                    }
+                for pass in 0..4u32 {
                     case(
-                        format!("    m4_sel_compact({base}, {a0}, {d0}, m4_gtid, m4_gthreads);\n"),
+                        format!(
+                            "    m4_sel_hist_pass({base}, {a0}, {d0}, {pass}u, m4_gtid, m4_gthreads, m3_tid, m3_threads, m4_sel_tg_hist);\n"
+                        ),
                         StepKind::Wide,
                     );
                     case(
                         format!(
-                            "    if (m4_group.x != 0) return;\n    m4_sel_finish({base}, {a0}, {a1}, {o0}, {d0}, {d1}, {mode}u, m3_tid, m3_threads, m4_sel_key, m4_sel_idx, m4_sel_scan);\n"
+                            "    if (m4_group.x != 0) return;\n    m4_sel_pick({base}, {d0}, {mode}u, {pass}u, m3_tid, m3_threads);\n"
                         ),
                         StepKind::Single,
                     );
                 }
                 case(
+                    format!("    m4_sel_mark({base}, {a0}, {o0}, {d0}, m4_gtid, m4_gthreads);\n"),
+                    StepKind::Wide,
+                );
+                case(
                     format!(
-                        "    if (m4_group.x != 0) return;\n    m4_sel_fallback({base}, {a0}, {a1}, {o0}, {d0}, {d1}, {mode}u, m3_tid, m3_threads, m3_tgbuf);\n"
+                        "    if (m4_group.x != 0) return;\n    m4_sel_ties({base}, {a0}, {o0}, {d0}, m3_tid, m3_threads, m4_sel_scan);\n"
                     ),
                     StepKind::Single,
                 );
