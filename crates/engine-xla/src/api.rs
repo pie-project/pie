@@ -110,6 +110,9 @@ pub struct Xla {
     /// readouts from. Its kept readouts are device buffers, so it drops
     /// before the shell that owns the client.
     pending: Option<(FrameId, Vec<StepSettle>)>,
+    /// The pending frame's step latches: under `PIE_XLA_SYNC` its settle
+    /// waits on each and fails by name on a fault one reports.
+    latches: Vec<std::sync::Arc<crate::program::Latch>>,
     programs: crate::program::Plane,
     boot: DeviceBoot,
     contract_for: ContractFor,
@@ -155,6 +158,7 @@ impl Xla {
             programs: crate::program::Plane::default(),
             adapters: BTreeMap::new(),
             pending: None,
+            latches: Vec::new(),
             live: engine::live::Live::armed(),
         }
     }
@@ -362,6 +366,7 @@ impl Xla {
         );
         let mut steps = Vec::with_capacity(frame.steps.len());
         let mut settles = Vec::with_capacity(frame.steps.len());
+        let mut latches = Vec::with_capacity(frame.steps.len());
         for (index, step) in frame.steps.iter().enumerate() {
             let at = engine::StepDone {
                 frame: id,
@@ -377,7 +382,9 @@ impl Xla {
             latch.release(Ok(()));
             steps.push(ticket);
             settles.push(settle);
+            latches.push(latch);
         }
+        self.latches = latches;
         let mut ticket = FrameTicket { id, steps };
         self.pending = Some((id, settles));
         tracing::debug!(frame = id.0, "xla submitted");
@@ -593,6 +600,19 @@ impl Engine for Xla {
         }
         // Every guest pass lands its cells before the frame answers.
         self.programs.settle();
+        // A settle in the submit (`PIE_XLA_SYNC`) waits on every step's
+        // device events too: a fault one reports (a fire's ready event, a
+        // guest pass's download) fails the frame by name, never dropped.
+        if synchronous() {
+            for (at, latch) in self.latches.iter().enumerate() {
+                if let Some(why) = latch.wait() {
+                    return Err(Error::Device(format!(
+                        "frame {}'s step {at} faulted on the device: {why}",
+                        ticket.id
+                    )));
+                }
+            }
+        }
         let (_, settles) = self.pending.as_ref().expect("checked just above");
         for (receipt, settle) in ticket.steps.iter_mut().zip(settles) {
             receipt.readouts = readouts_of(settle)?;
