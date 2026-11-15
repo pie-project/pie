@@ -121,6 +121,28 @@ pub struct PatchSeat {
 
 const PATCH_ROUTE_DROP: i32 = -1;
 
+/// The share of a device's memory an XLA load takes for itself; the rest is
+/// left to what XLA allocates beside it (compiled programs, scratch it
+/// plans none of). XLA's own, and provisional: it stands until that term
+/// is measured. No other engine reads it.
+const XLA_DEVICE_SHARE: f64 = 0.9;
+
+/// What an XLA load may take of a device of `total` bytes, `held` of which
+/// are taken already: [`XLA_DEVICE_SHARE`] of it less those, and no more
+/// than the `allowance`'s stated budget.
+fn share_room(allowance: engine::Allowance, total: u64, held: u64) -> u64 {
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a device's byte count is far inside f64's exact integer range, and \
+                  the product is floored back into u64 deliberately"
+    )]
+    let share = (total as f64 * XLA_DEVICE_SHARE) as u64;
+    let room = share.saturating_sub(held);
+    allowance.budget.map_or(room, |budget| room.min(budget))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Seated<'a> {
     pub lane: Lane<'a>,
@@ -524,8 +546,7 @@ impl Shell {
             weight_floor
         };
         let room = device.memory().map_or(u64::MAX, |bytes| {
-            boot.allowance
-                .room(bytes, device.held())
+            share_room(boot.allowance, bytes, device.held())
                 .saturating_sub(weight_floor)
                 .saturating_sub(headroom)
                 / 2
@@ -681,7 +702,7 @@ impl Shell {
         // since it plans none of its own.
         let working = device
             .memory()
-            .map(|bytes| boot.allowance.room(bytes, device.held()));
+            .map(|bytes| share_room(boot.allowance, bytes, device.held()));
         let weight_floor = boot.trace.params.iter().try_fold(0u64, |sum, p| {
             crate::weights::plane_bytes(&p.name, p.dtype, &p.shape).map(|b| sum + b)
         })?;

@@ -51,7 +51,7 @@ pub trait PoolPort: Send + Sync + 'static {
         RsUnits::default()
     }
     /// Room was freed or a fire retired: what waits on it beside the
-    /// planner's own waiters (the rung, the segment walk, arming) looks
+    /// planner's own waiters (the rung, the segment walk) looks
     /// again.
     fn freed(&self) {}
     /// Asks for `need` more of each shape than stands free now; true when
@@ -304,7 +304,6 @@ impl PoolPort for RegistryPool {
 
     fn freed(&self) {
         crate::store::shared::rung_changed(self.engine);
-        crate::scheduler::arming::room_freed(self.engine);
         if let Some(shared) = &self.shared {
             shared.room_freed();
         }

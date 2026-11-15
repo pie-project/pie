@@ -68,10 +68,6 @@ pub struct Knobs {
     /// its life (`engine::load::Residency::weights_held`): no host copy of
     /// them is kept, and the lattice is armed at the first weight residency.
     pub weights_held: bool,
-    /// Whether the caller gives the shell lane time after the load
-    /// (`Shell::arm_step`): a load then arms its smallest rung's bodies and
-    /// leaves the rest to those steps.
-    pub arm_stepped: bool,
     pub nccl_transport: crate::comm::Transport,
     /// The user's profile directory; `None` reads only the checked-in ones.
     pub profiles: Option<std::path::PathBuf>,
@@ -113,6 +109,10 @@ pub struct Boot<'a> {
     pub voxels: Option<poem_compiler::VoxelLadder>,
     pub page_size: u32,
     pub context: u32,
+    /// `context` is the model's declared one, which the operator did not
+    /// state: the fit shortens it to what the card seats
+    /// (`Pools::declare_context`).
+    pub context_declared: bool,
     pub slots: u32,
     /// The bytes the cache rows take, as a test or bench states them
     /// (`Residency::device_kv_budget`); `None` fills what `allowance` leaves.

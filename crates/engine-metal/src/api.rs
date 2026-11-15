@@ -783,9 +783,15 @@ impl Engine for Metal {
             .map_err(fault)
     }
 
-    fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
+    fn weight_residency(
+        &mut self,
+        residency: &engine::chunk::WeightResidency,
+    ) -> EngineResult<u64> {
+        // This engine holds back none of the chunks it states
+        // (`ChunkFacts::held_bytes` is 0 at load): the answer repeats it.
         self.loaded_mut()?
             .weight_residency(residency)
+            .map(|()| 0)
             .map_err(fault)
     }
 

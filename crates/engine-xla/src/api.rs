@@ -927,9 +927,15 @@ impl Engine for Xla {
     /// source or destination is a host or disk chunk (`SlotCopy`'s tier,
     /// from sc/tier-shared's contract) lands here; until that contract is
     /// merged only device-to-device copies are served.
-    fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
+    fn weight_residency(
+        &mut self,
+        residency: &engine::chunk::WeightResidency,
+    ) -> EngineResult<u64> {
+        // This engine holds back none of the chunks it states
+        // (`ChunkFacts::held_bytes` is 0 at load): the answer repeats it.
         self.loaded_mut()?
             .weight_residency(residency)
+            .map(|()| 0)
             .map_err(fault)
     }
 

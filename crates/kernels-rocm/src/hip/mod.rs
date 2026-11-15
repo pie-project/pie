@@ -5,6 +5,7 @@
 
 pub mod blas;
 pub mod code_object;
+pub mod kfd;
 pub mod lt;
 pub mod lt_grouped;
 mod msgpack;
@@ -15,6 +16,59 @@ use core::ffi::{c_char, c_int, c_void};
 use std::ffi::{CStr, CString};
 
 use crate::error::Error;
+
+/// Takes now, on the current device, what the HIP runtime and the libraries
+/// this crate calls take of the device on their first use: the blit kernels
+/// HIP loads at its first device memset (with their buffers, about 146 MiB
+/// on gfx942) and the hipBLASLt handle (about 26 MiB). A load calls it
+/// before its pools read the card, so what the process holds beside them
+/// is held when they are sized, and no later first call takes device
+/// memory the pools were promised.
+pub fn open() -> Result<(), Error> {
+    const OP: &str = "hip.open";
+    let mut probe: *mut c_void = core::ptr::null_mut();
+    // SAFETY: a live out-parameter.
+    let code = unsafe { rt::hipMalloc(&raw mut probe, 4) };
+    if code != sys::HIP_SUCCESS {
+        return Err(hip_fault(OP, "hipMalloc", code));
+    }
+    // SAFETY: `probe` is the four device bytes just allocated, freed once
+    // below after the memset has run.
+    let memset = unsafe { rt::hipMemset(probe, 0, 4) };
+    // SAFETY: as above.
+    let freed = unsafe { rt::hipFree(probe) };
+    if memset != sys::HIP_SUCCESS {
+        return Err(hip_fault(OP, "hipMemset", memset));
+    }
+    if freed != sys::HIP_SUCCESS {
+        return Err(hip_fault(OP, "hipFree", freed));
+    }
+    lt::open().map_err(|refused| Error::Backend {
+        op: OP,
+        detail: refused.to_string(),
+    })
+}
+
+/// Makes each of `streams`' copy queue now ([`kfd::warm_copies`]): the
+/// streams a load copies on while serving, so no first copy makes a queue,
+/// and the device memory its save area holds, after the load.
+pub fn warm_copies(streams: &[sys::Stream]) -> Result<(), Error> {
+    const OP: &str = "hip.warm_copies";
+    if sys::copy_queues() == sys::CopyQueues::Off {
+        return Ok(());
+    }
+    let bytes = kfd::blit_threshold() + 1;
+    let mut scratch: *mut c_void = core::ptr::null_mut();
+    // SAFETY: a live out-parameter; freed below.
+    let code = unsafe { rt::hipMalloc(&raw mut scratch, bytes) };
+    if code != sys::HIP_SUCCESS {
+        return Err(hip_fault(OP, "hipMalloc", code));
+    }
+    let warmed = kfd::warm_copies(streams, scratch);
+    // SAFETY: allocated above, freed once, after every copy synchronized.
+    unsafe { rt::hipFree(scratch) };
+    warmed.map_err(|detail| Error::Backend { op: OP, detail })
+}
 
 fn hip_fault(op: &'static str, call: &'static str, code: sys::HipError) -> Error {
     let text = sys::api()

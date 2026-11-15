@@ -136,17 +136,24 @@ pub struct Ledger {
     /// demand may take before any state gives way.
     pub model: u64,
     /// What the driver holds beside the engine's span (graph bodies,
-    /// modules, library workspaces), as the engine states it
-    /// ([`::engine::live::Live::outside`]).
+    /// modules, library workspaces), as the engine stated it at load
+    /// ([`::engine::chunk::ChunkFacts::outside_bytes`]).
     pub outside: u64,
 }
 
-/// Per engine, its [`Ledger`] as its governor last read it.
+/// Per engine, its [`Ledger`]: `outside` as its load stated it, `model` as
+/// its governor last read it.
 static LEDGERS: RwLock<BTreeMap<usize, Ledger>> = RwLock::new(BTreeMap::new());
 
-/// `engine`'s ledger terms now: what its governor reads each tick.
-pub fn set_ledger(engine: usize, ledger: Ledger) {
-    LEDGERS.write().unwrap().insert(engine, ledger);
+/// `engine`'s model cache bytes now: what its governor reads each tick.
+pub fn set_model(engine: usize, model: u64) {
+    LEDGERS.write().unwrap().entry(engine).or_default().model = model;
+}
+
+/// What `engine`'s driver holds outside its span: a load fact, set once
+/// when the engine is registered.
+pub fn set_outside(engine: usize, outside: u64) {
+    LEDGERS.write().unwrap().entry(engine).or_default().outside = outside;
 }
 
 /// Every engine's ledger terms on `tier`, summed; none off the device.

@@ -297,10 +297,36 @@ pub mod rt {
         // the enum's ids, which are HIP's.
         cudaError::of(unsafe { hip::hipDeviceGetP2PAttribute(value, attr as c_int, src, dst) })
     }
+    /// The device's free bytes as one allocation can take them: HIP's
+    /// figure less the wave save areas of this process's queues, which the
+    /// driver holds and HIP's figure counts as free
+    /// ([`kernels_cuda::hip::kfd::save_areas`]). Read live, so a queue made
+    /// inside a capture window falls inside the window's measure.
     pub unsafe fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> cudaError {
         // SAFETY: `hipMemGetInfo` takes the same arguments with the same
         // contract, which the caller of this fn upholds.
-        cudaError::of(unsafe { hip::hipMemGetInfo(free, total) })
+        let asked = cudaError::of(unsafe { hip::hipMemGetInfo(free, total) });
+        if asked != cudaError::cudaSuccess {
+            return asked;
+        }
+        // The load opens every stream it fires on before its pools.
+        match kernels_cuda::hip::kfd::save_areas(u32::MAX) {
+            Ok(areas) => {
+                // SAFETY: the caller's live out-parameter, just written.
+                unsafe { *free = (*free).saturating_sub(areas.bytes() as usize) };
+                cudaError::cudaSuccess
+            }
+            Err(why) => {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    eprintln!(
+                        "engine-cuda: the driver's queue save areas are not readable ({why}); \
+                         the device's free figure cannot be stated"
+                    );
+                });
+                cudaError::cudaErrorInitializationError
+            }
+        }
     }
     pub unsafe fn cudaMalloc(ptr: *mut *mut c_void, bytes: usize) -> cudaError {
         // SAFETY: `hipMalloc` takes the same arguments with the same contract,
