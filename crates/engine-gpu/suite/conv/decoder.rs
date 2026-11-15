@@ -423,6 +423,7 @@ fn a_conv_decoder_fires_over_a_voxel_input() {
         handed: None,
     })
     .expect("the decoder loads");
+    let built = shell.compiled();
     assert_eq!(
         shell.pixels_width(),
         Some(4),
@@ -495,6 +496,11 @@ fn a_conv_decoder_fires_over_a_voxel_input() {
             "lane {lane} drifts from the reference: max {worst}, mean {mean}"
         );
     }
+    assert_eq!(
+        shell.compiled(),
+        built,
+        "a fire of the decoder and its pixels built a pipeline the load did not"
+    );
     drop(shell);
     let _ = std::fs::remove_dir_all(&dir);
 }

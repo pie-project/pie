@@ -7,7 +7,7 @@ use checkpoint::executor::{Execution, sink::TensorSink};
 use checkpoint::file::read::parse_metadata;
 use checkpoint::file::serve;
 use checkpoint::file::zt;
-use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
+use checkpoint::plan::{LoadPlan, StorageInstr, StorageTarget, compile, compile_streaming};
 use checkpoint::serving::Stamp;
 use checkpoint::types::{ScaleForm, TensorId};
 use engine::load::Tiers;
@@ -284,18 +284,22 @@ impl<B: Backend> Weights<B> {
             }
         }
 
-        let mut sink = Landing {
-            store: &mut store,
-            host: host_map.as_ref().map(|map| (map, &host_planes)),
-            places: &places,
-            index: &index,
-            landed: vec![false; places.len()],
+        let landed = if B::LANDS {
+            let mut sink = Landing {
+                store: &mut store,
+                host: host_map.as_ref().map(|map| (map, &host_planes)),
+                places: &places,
+                index: &index,
+                landed: vec![false; places.len()],
+            };
+            Execution::new(&streaming, snapshot)
+                .streaming()
+                .sink(&mut sink)
+                .run()?;
+            sink.landed
+        } else {
+            published(&streaming, &index, places.len())?
         };
-        Execution::new(&streaming, snapshot)
-            .streaming()
-            .sink(&mut sink)
-            .run()?;
-        let landed = sink.landed;
 
         let mut phantom: BTreeMap<usize, u32> = BTreeMap::new();
         let host = match host_map {
@@ -866,6 +870,30 @@ struct Landing<'a, B: Backend> {
     places: &'a [Place],
     index: &'a BTreeMap<&'a str, usize>,
     landed: Vec<bool>,
+}
+
+/// The planes `plan` publishes, each the one its scheduled `Finalize` names,
+/// as an execution of it lands them; a name the plan does not hold is
+/// refused in the words a landing refuses it.
+fn published(plan: &LoadPlan, index: &BTreeMap<&str, usize>, planes: usize) -> Result<Vec<bool>> {
+    let mut landed = vec![false; planes];
+    let scheduled: std::collections::HashSet<_> = plan.schedule.iter().collect();
+    for instr in &plan.instrs {
+        let StorageInstr::Finalize { id, name, .. } = instr else {
+            continue;
+        };
+        if !scheduled.contains(id) {
+            continue;
+        }
+        let at = *index.get(name.as_str()).ok_or_else(|| {
+            Fault::Load(LoadError::Contract(format!(
+                "the load contract publishes `{name}`, which this plan does not \
+                 name — the two were not written from each other"
+            )))
+        })?;
+        landed[at] = true;
+    }
+    Ok(landed)
 }
 
 impl<B: Backend> TensorSink for Landing<'_, B> {

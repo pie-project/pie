@@ -1066,6 +1066,66 @@ impl Context {
         }
     }
 
+    /// What the physical device answers of sparse binding and of indexing
+    /// an array of storage buffers, each under its Vulkan name; this device
+    /// enables none of them. With them the sparse address space, and
+    /// whether the queue family the engine fires on, or any family at all,
+    /// binds sparse memory.
+    #[must_use]
+    pub fn stated(&self) -> Vec<(&'static str, String)> {
+        let core = &self.core;
+        let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
+        let features = {
+            let mut query = vk::PhysicalDeviceFeatures2::default().push_next(&mut f12);
+            // SAFETY: `physical` was enumerated from the live `instance`, and
+            // the one chained struct is a local that outlives the call.
+            unsafe {
+                core.instance
+                    .get_physical_device_features2(core.physical, &mut query);
+            }
+            query.features
+        };
+        // SAFETY: as above.
+        let families = unsafe {
+            core.instance
+                .get_physical_device_queue_family_properties(core.physical)
+        };
+        let sparse = |family: &vk::QueueFamilyProperties| {
+            family.queue_flags.contains(vk::QueueFlags::SPARSE_BINDING)
+        };
+        let granted = |feature: vk::Bool32| (feature == vk::TRUE).to_string();
+        vec![
+            ("sparseBinding", granted(features.sparse_binding)),
+            (
+                "sparseResidencyBuffer",
+                granted(features.sparse_residency_buffer),
+            ),
+            (
+                "sparseAddressSpaceSize",
+                core.limits.sparse_address_space_size.to_string(),
+            ),
+            (
+                "shaderStorageBufferArrayDynamicIndexing",
+                granted(features.shader_storage_buffer_array_dynamic_indexing),
+            ),
+            (
+                "shaderStorageBufferArrayNonUniformIndexing",
+                granted(f12.shader_storage_buffer_array_non_uniform_indexing),
+            ),
+            (
+                "the engine's queue family binds sparse memory",
+                families
+                    .get(core.family as usize)
+                    .is_some_and(sparse)
+                    .to_string(),
+            ),
+            (
+                "a queue family binds sparse memory",
+                families.iter().any(sparse).to_string(),
+            ),
+        ]
+    }
+
     /// What the capacity has left now, past every reservation and the
     /// driver's own.
     #[must_use]

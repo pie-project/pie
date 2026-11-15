@@ -78,15 +78,30 @@ impl<B: Backend> Run<'_, B> {
         let tactic = self.tuning().sdpa(self.tier(), head_dim);
         let tables = self.prefill_tables(plan, mask);
         let (q, pool, o) = (q, *pool, o);
-        let tiles = q.rows / self.requests().max(1) >= self.tuning().sdpa_tile_rows_per_request();
-        if tiles {
+        let tiled = || {
             sdpa::prefill(
                 self.ctx, tactic, q, &tables, &pool, window, head_dim, sm_scale, o, lse,
             )
-        } else {
+        };
+        let walked = || {
             sdpa::decode(
                 self.ctx, tactic, q, &tables, &pool, window, head_dim, sm_scale, o, lse, None,
             )
+        };
+        // Which of the two a fire takes is its rows a request; a naming
+        // sink is told both.
+        if let Some(names) = self.ctx.naming() {
+            names.fork();
+            tiled()?;
+            names.or();
+            walked()?;
+            names.join();
+            return Ok(());
+        }
+        if q.rows / self.requests().max(1) >= self.tuning().sdpa_tile_rows_per_request() {
+            tiled()
+        } else {
+            walked()
         }
     }
 

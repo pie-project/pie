@@ -415,4 +415,8 @@ impl Pipelines {
     ) -> Result<std::sync::Arc<Pipeline>> {
         Err(Fault::Deviceless)
     }
+
+    pub fn hold(_device: &Context, _file: &'static str, _key: &'static str) -> Result<()> {
+        Err(Fault::Deviceless)
+    }
 }

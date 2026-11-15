@@ -177,7 +177,8 @@ const UNIFORM_ARENA_CHUNK: u64 = 1 << 20;
 #[derive(Default)]
 pub struct Pipelines {
     built: RefCell<HashMap<&'static str, Arc<Pipeline>>>,
-    compiles: Cell<u64>,
+    /// The kernels built, in the order their pipelines were.
+    order: RefCell<Vec<&'static str>>,
     binds: RefCell<BindCache>,
     bind_hits: Cell<u64>,
     bind_misses: Cell<u64>,
@@ -205,7 +206,7 @@ impl std::fmt::Debug for Pipelines {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pipelines")
             .field("pipelines", &self.built.borrow().len())
-            .field("compiles", &self.compiles.get())
+            .field("compiles", &self.order.borrow().len())
             .finish()
     }
 }
@@ -218,7 +219,22 @@ impl Pipelines {
 
     #[must_use]
     pub fn compiled(&self) -> u64 {
-        self.compiles.get()
+        self.order.borrow().len() as u64
+    }
+
+    /// The kernels whose pipelines were built after the first `from`, in
+    /// the order built.
+    #[must_use]
+    pub fn built_since(&self, from: u64) -> Vec<&'static str> {
+        let order = self.order.borrow();
+        order[(from as usize).min(order.len())..].to_vec()
+    }
+
+    /// Holds kernel `key` of `file` to the storage buffers `device` binds a
+    /// shader stage, both counts read from the module it is compiled from.
+    pub fn hold(device: &Context, file: &'static str, key: &'static str) -> Result<()> {
+        let (own, pool) = storage(file, key)?;
+        engine_gpu::storage_buffers(key, own, pool, device.storage_buffers())
     }
 
     #[must_use]
@@ -324,7 +340,7 @@ impl Pipelines {
         }
         let wgsl = module(file, key)?;
         let pipeline = Arc::new(build(device.core(), file, key, &wgsl)?);
-        self.compiles.set(self.compiles.get() + 1);
+        self.order.borrow_mut().push(key);
         self.built.borrow_mut().insert(key, Arc::clone(&pipeline));
         Ok(pipeline)
     }
