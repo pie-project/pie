@@ -4,6 +4,7 @@ mod a_bank_past_2_gib_reads_its_last_rows;
 mod a_buffered_fold_is_the_fold_it_replaces;
 mod a_column_cut_of_a_bank_multiplies_as_its_copy;
 mod a_copied_window_is_one_encode_over_the_same_rows;
+mod a_device_fold_lane_states_its_own_fold;
 mod a_device_placed_kv_write_lands_in_its_buffer;
 mod a_fenced_frame_lands_both_sides;
 mod a_fire_carrying_past_its_rungs_tokens_is_refused;
