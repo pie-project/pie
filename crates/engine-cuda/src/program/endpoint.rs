@@ -112,7 +112,7 @@ impl Endpoint {
     pub fn detach(&self) {
         let _ = self
             .attachments
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 Some(held.saturating_sub(1))
             });
     }
@@ -226,7 +226,7 @@ impl Endpoint {
     pub fn unpredict_head(&self, by: u64) {
         let _ = self
             .predicted_head
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |at| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |at| {
                 Some(at.saturating_sub(by))
             });
     }
@@ -234,7 +234,7 @@ impl Endpoint {
     pub fn unpredict_tail(&self, by: u64) {
         let _ = self
             .predicted_tail
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |at| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |at| {
                 Some(at.saturating_sub(by))
             });
     }

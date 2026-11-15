@@ -121,7 +121,7 @@ impl Counters {
     fn detach(&self) {
         let _ = self
             .attachments
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 Some(held.saturating_sub(1))
             });
     }

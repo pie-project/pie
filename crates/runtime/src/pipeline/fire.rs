@@ -1759,9 +1759,9 @@ fn reported_rows(
         (offset < page).then_some(index * page + offset)
     };
     let first = slot(0)?;
-    for row in 0..rows {
+    for (row, &position) in written.positions.iter().enumerate() {
         let at = first + row as u64;
-        if slot(row)? != at || u64::from(written.positions[row]) != at {
+        if slot(row)? != at || u64::from(position) != at {
             return None;
         }
     }

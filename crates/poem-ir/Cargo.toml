@@ -1,6 +1,7 @@
 [package]
 name = "pie-poem-ir"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The typed IR of a traced forward pass: op enums per family, the Operands def-use trait, ValueDecl (Def x Ty), Cond, the Plan container, and the post-trace validator. A leaf crate — pure data plus serde, no backend edges."

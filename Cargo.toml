@@ -127,6 +127,7 @@ exclude = [
 [package]
 name = "pie"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The pie standalone: multi-call CLI (local/serve + ops) composing the bootstrap skeleton and the controller/gateway/worker role libs in-proc, plus the three role daemons."
@@ -213,11 +214,9 @@ libc = "0.2"
 [workspace.package]
 version = "0.6.0"
 
-rust-version = "1.96"
+rust-version = "1.100"
 
 [workspace.dependencies]
-linkme = "0.3"
-inventory = "0.3"
 ztensor = { path = "crates/ztensor" }
 ztensor-compat = { path = "crates/ztensor-compat" }
 

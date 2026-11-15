@@ -192,8 +192,8 @@ jobs:
             examples/target
           key: ${{ runner.os }}-examples-${{ hashFiles('examples/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-examples-
-      # From the workspace, so its rust-toolchain.toml (nightly) applies.
-      - run: cargo check --target wasm32-wasip3
+      # The workspace's cargo config targets wasm32-wasip3.
+      - run: cargo check
         working-directory: examples
         env:
           RUSTFLAGS: -D warnings

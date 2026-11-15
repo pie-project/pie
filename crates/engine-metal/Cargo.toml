@@ -1,6 +1,7 @@
 [package]
 name = "engine-metal"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The menlo Metal engine's dispatch layer: a Run that resolves plan ids to device handles and answers every Dispatch* trait by calling kernels-metal entries through dyn Encode. Merges into engine-metal when the old stack is deleted."

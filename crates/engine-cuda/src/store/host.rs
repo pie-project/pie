@@ -515,6 +515,7 @@ fn land(jobs: &Receiver<Job>, shared: &Shared, ordinal: i32, ring_bytes: usize, 
 }
 
 /// The threads that fault the ring's pages in before it is locked.
+#[cfg(target_os = "linux")]
 const RING_FAULTERS: usize = 8;
 
 /// The staging ring, page-locked: faulted in first, in huge pages where the

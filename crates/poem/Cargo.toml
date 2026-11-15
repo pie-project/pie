@@ -1,6 +1,7 @@
 [package]
 name = "pie-poem"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The language a model is written in: weight declarations, the forward pass recorded over the typed IR, the import contract reading a checkpoint onto the weights, and the Starlark packages a model is written as. It names no backend and reaches no device."

@@ -1,6 +1,7 @@
 [package]
 name = "policy"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "Writing a PLEX serving policy for pie: the plex:policy contract and the support library a policy builds against"
