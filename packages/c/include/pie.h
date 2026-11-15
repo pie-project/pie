@@ -55,7 +55,7 @@ const char *pie_version(void);
      {"budget_device": "2GiB", "max_context": 4096, "governor_backoff": 1.0,
       "governor_release_idle": false,
       "sandbox_memory_mb": 512, "max_concurrent_processes": null, "engine": true,
-      "frame_size": 8, "frame_dispatch_depth": 2, "verbose": false}
+      "frame_size": 4, "frame_dispatch_depth": 2, "verbose": false}
 
    `home` is a writable directory the runtime keeps its files under;
    `listen` (`"host:port"`, or NULL) also serves pie's gateway there. One
