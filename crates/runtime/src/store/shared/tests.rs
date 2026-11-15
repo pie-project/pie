@@ -976,6 +976,80 @@ async fn a_raise_asked_with_nothing_in_flight_is_applied_without_any_fire_retiri
     pool.pool().check();
 }
 
+/// The third re-arm: a raise whose span the weight cache let go behind a
+/// fire still in flight waits for that fire, and is applied once it
+/// retires, not before. Until then the span's chunks may still be read
+/// (the released slots wait on the fire's epoch), so neither the walk's
+/// own re-plan nor a wake with nothing retired may take them; the fire's
+/// retirement (the planner's room freed) does.
+#[tokio::test(flavor = "current_thread")]
+async fn a_raise_behind_a_fire_in_flight_is_applied_when_it_retires_and_not_before() {
+    const ENGINE: usize = 9305;
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    pool.lower_rung(256).unwrap();
+    let cached = span_cache(&mut pool, 4);
+    // Fire 1 is handed out and reads the cache; none has retired.
+    pool.pool_mut().touch(&cached, 1);
+    let table = pool.pool().chunk_table().to_vec();
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let retired = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let asked = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let held = Arc::new(Mutex::new(Some(cached)));
+    crate::store::shared::set_span_clear(ENGINE, {
+        let (shared, asked, held) = (shared.clone(), asked.clone(), held.clone());
+        Arc::new(move |_from| {
+            asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The owner lets go once, behind fire 1, the last handed out.
+            let Some(cached) = held.lock().unwrap().take() else {
+                return 0;
+            };
+            let mut pool = shared.lock().unwrap();
+            let holder = Holder::Weights {
+                shape: pool.weights_first(),
+                pinned: false,
+            };
+            pool.pool_mut().release(holder, &cached, 1);
+            cached.len() as u64
+        })
+    });
+    let grow = SharedGrow::new(0, ENGINE, shared.clone())
+        .with_live_lanes(|| 1)
+        .with_epochs({
+            let retired = retired.clone();
+            move || (1, retired.load(std::sync::atomic::Ordering::Acquire))
+        });
+    let _want = want_rows(ENGINE, 2048);
+    grow.walk_rung().await;
+    assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        shared.lock().unwrap().rung(),
+        256,
+        "fire 1 still reads the span"
+    );
+    // Woken with nothing retired, even with room said freed: it stays.
+    grow.room_freed();
+    grow.walk_rung().await;
+    assert_eq!(
+        shared.lock().unwrap().rung(),
+        256,
+        "not before the fire retires"
+    );
+    // Fire 1 retires: the planner's room freed, and the raise is applied.
+    retired.store(1, std::sync::atomic::Ordering::Release);
+    grow.room_freed();
+    grow.walk_rung().await;
+    let pool = shared.lock().unwrap();
+    assert_eq!(pool.rung(), 2048, "applied once fire 1 retired");
+    assert_eq!(pool.pool().chunk_table(), table.as_slice(), "nothing moved");
+    assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
+    pool.pool().check();
+}
+
 /// Twelve rungs, every power of two from 1, the small ones sharing their
 /// activation's chunk count (1 to 16 one class of one chunk).
 fn classed() -> SharedPool {
