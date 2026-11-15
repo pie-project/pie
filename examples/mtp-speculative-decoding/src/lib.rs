@@ -59,6 +59,29 @@ struct Input {
     /// vocabulary in the epilogue.
     #[serde(default)]
     margin: bool,
+    /// DIAGNOSTIC: every draft is rejected whatever the trunk said, so a run
+    /// has a drafting run's fires (its rows, its head) and the commits of
+    /// `k = 0` — one token a round, row 0's answer.
+    #[serde(default)]
+    reject: bool,
+    /// DIAGNOSTIC: record every row's logits by what identifies them
+    /// (`logit_trace`: a round's answers, then each row's top-1 and top-2
+    /// logit and the sum of its logits) — so two runs can be compared row by
+    /// row, bit for bit, at the positions they share.
+    #[serde(default)]
+    logits: bool,
+    /// DIAGNOSTIC: keep only the prompt's last `prompt_rows` tokens, so a
+    /// run's prompt is a few rows.
+    #[serde(default)]
+    prompt_rows: Option<usize>,
+    /// DIAGNOSTIC: per prefill pass, its readout row's top two logits, their
+    /// sum over the vocabulary, and (the drafting pass) the head's chain.
+    #[serde(default)]
+    seed_probe: bool,
+    /// DIAGNOSTIC: the whole prompt is one drafting pass, every row read
+    /// out, so the head writes its keys at every prompt row.
+    #[serde(default)]
+    draft_all: bool,
     #[serde(default)]
     ckpt_sync: bool,
     #[serde(default)]
@@ -98,6 +121,12 @@ struct Output {
     /// The model's draft depth.
     depth: u32,
     prompt_tokens: u32,
+    /// DIAGNOSTIC: the prompt's token ids.
+    prompt_ids: Vec<u32>,
+    /// DIAGNOSTIC: the decode's wall, from the prefill's answer to the last
+    /// commit, in microseconds.
+    decode_us: u64,
+    seed_probe: Vec<Vec<f32>>,
     /// Per round, row 0's top-1 minus top-2 logit — whether a divergence
     /// between two widths is a near-tie (the bf16 floor: a one-row and a
     /// many-row fire take different kernel paths and differ in the last
@@ -112,6 +141,9 @@ struct Output {
     /// wrong rows.
     proposed_trace: Vec<Vec<u32>>,
     truth_trace: Vec<Vec<u32>>,
+    /// DIAGNOSTIC (`logits`), a round a row: the `w` answers, the `w` top-1
+    /// logits, the `w` top-2 logits, the `w` sums of a row's logits.
+    logit_trace: Vec<Vec<f32>>,
 }
 
 impl Output {
@@ -128,10 +160,14 @@ impl Output {
             k,
             depth,
             prompt_tokens: 0,
+            prompt_ids: Vec::new(),
+            decode_us: 0,
+            seed_probe: Vec::new(),
             margin_trace: Vec::new(),
             commits_trace: Vec::new(),
             proposed_trace: Vec::new(),
             truth_trace: Vec::new(),
+            logit_trace: Vec::new(),
         }
     }
 }
@@ -153,6 +189,10 @@ async fn main(input: Input) -> Result<Output> {
 
     let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
     prompt.extend(chat::cue_without_thinking());
+    if let Some(rows) = input.prompt_rows {
+        let cut = prompt.len().saturating_sub(rows);
+        prompt.drain(..cut);
+    }
     if prompt.is_empty() {
         prompt.push(0);
     }
@@ -170,21 +210,28 @@ async fn main(input: Input) -> Result<Output> {
     // The drafting pass is the last prompt token alone: a draft head attends
     // as its readout rows, so every row of a drafting fire is read out.
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let spans = if k > 0 && n > 1 {
+    let draft_all = input.draft_all && k > 0;
+    let spans = if k > 0 && n > 1 && !draft_all {
         vec![(0, n - 1), (n - 1, n)]
     } else {
         vec![(0, n)]
     };
     let last_span = spans.len() - 1;
     let mut seed: Vec<i32> = Vec::new();
+    let mut seed_probe: Vec<Vec<f32>> = Vec::new();
+    let probe_len = 3 + depth.max(1) + 7;
     for (at, &(base, end)) in spans.iter().enumerate() {
         let len = end - base;
         let toks_p = Channel::from(&prompt_i32[base as usize..end as usize]);
         let indptr_p = Channel::from([0u32, len]);
         // The last row only: the first window is seeded off it.
-        let readout_p = Channel::from([len - 1]);
+        let rows = if draft_all { len } else { 1 };
+        let readout_p = Channel::from_iter(len - rows..len);
         let seed_p = Channel::new([w], dtype::i32);
         let drafting = at == last_span && k > 0;
+        let probe_p = input
+            .seed_probe
+            .then(|| Channel::new([probe_len], dtype::f32));
 
         let fwd_p = ForwardPass::new();
         fwd_p.embed(&toks_p, &indptr_p)?;
@@ -192,23 +239,94 @@ async fn main(input: Input) -> Result<Output> {
         fwd_p.state(&[&ws], StateGeometry::folding())?;
         fwd_p.epilogue(move || {
             // One readout row: `logits()` is `[vocab]`, its argmax a scalar.
-            let t = reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]);
+            let vocab = intrinsics::vocab();
+            // The last readout row of a `[rows, vocab]` output.
+            let last = |name: &str| {
+                reshape(
+                    gather(
+                        reshape(intrinsics::output(0, name), [rows, vocab]),
+                        iota(1) + Tensor::constant(rows - 1),
+                    ),
+                    [vocab],
+                )
+            };
+            let t = reshape(reduce_argmax(last("logits")), [1]);
             let i = iota(w);
             let first = eq(&i, Tensor::constant(0u32));
             let window = if drafting {
                 // The head's chain at the readout row, `[depth]`; the window
                 // takes its first `k`, and any pad row carries `t` again.
-                let chain = intrinsics::output(0, "mtp.drafts");
+                let chain = reshape(intrinsics::output(0, "mtp.drafts"), [rows * depth]);
                 let j = min_elem(
                     max_elem(&i, Tensor::constant(1u32)) - Tensor::constant(1u32),
                     Tensor::constant(depth - 1),
-                );
+                ) + Tensor::constant((rows - 1) * depth);
                 let drafted = and(not(&first), le(&i, Tensor::constant(k)));
                 select(&drafted, gather(&chain, &j), broadcast(&t, [w]))
             } else {
                 broadcast(&t, [w])
             };
             seed_p.put(&window);
+            if let Some(probe_p) = &probe_p {
+                let logits = last("logits");
+                let (top, _) = top_k(&logits, 2);
+                let j = iota(probe_len);
+                let mut probe = broadcast(reshape(reduce_sum(&logits), [1]), [probe_len]);
+                for at in 0..2u32 {
+                    let value = reshape(gather(&top, iota(1) + Tensor::constant(at)), [1]);
+                    probe = select(
+                        eq(&j, Tensor::constant(at)),
+                        broadcast(&value, [probe_len]),
+                        &probe,
+                    );
+                }
+                if drafting {
+                    // The last row's chain, an element at a time.
+                    let chain = reshape(
+                        cast(intrinsics::output(0, "mtp.drafts"), dtype::f32),
+                        [rows * depth],
+                    );
+                    for step in 0..depth {
+                        let value = reshape(
+                            gather(
+                                &chain,
+                                iota(1) + Tensor::constant((rows - 1) * depth + step),
+                            ),
+                            [1],
+                        );
+                        probe = select(
+                            eq(&j, Tensor::constant(3 + step)),
+                            broadcast(&value, [probe_len]),
+                            &probe,
+                        );
+                    }
+                    // Past the chain: the head's first logits' top two, their sum,
+                    // the two ids; then the trunk's two ids.
+                    let head = last("mtp.logits");
+                    let (head_top, head_ids) = top_k(&head, 2);
+                    let (_, trunk_ids) = top_k(&logits, 2);
+                    let one = |values: &Tensor, at: u32| {
+                        reshape(gather(values, iota(1) + Tensor::constant(at)), [1])
+                    };
+                    let tail = [
+                        one(&head_top, 0),
+                        one(&head_top, 1),
+                        reshape(reduce_sum(&head), [1]),
+                        cast(one(&head_ids, 0), dtype::f32),
+                        cast(one(&head_ids, 1), dtype::f32),
+                        cast(one(&trunk_ids, 0), dtype::f32),
+                        cast(one(&trunk_ids, 1), dtype::f32),
+                    ];
+                    for (at, value) in tail.iter().enumerate() {
+                        probe = select(
+                            eq(&j, Tensor::constant(3 + depth.max(1) + at as u32)),
+                            broadcast(value, [probe_len]),
+                            &probe,
+                        );
+                    }
+                }
+                probe_p.put(probe);
+            }
         });
         fwd_p
             .submit(&pipe)
@@ -217,8 +335,17 @@ async fn main(input: Input) -> Result<Output> {
             .take_host::<Vec<i32>>()
             .await
             .with_context(|| format!("@{base}"))?;
+        if let Some(probe_p) = probe_p {
+            seed_probe.push(
+                probe_p
+                    .take_host::<Vec<f32>>()
+                    .await
+                    .with_context(|| format!("probe @{base}"))?,
+            );
+        }
     }
 
+    let decode_from = inferlet::monotonic_now_ns();
     let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
     let x = seed[0] as u32;
     generated.push(x);
@@ -227,9 +354,18 @@ async fn main(input: Input) -> Result<Output> {
     let mut commits_trace: Vec<u32> = Vec::new();
     let mut proposed_trace: Vec<Vec<u32>> = Vec::new();
     let mut truth_trace: Vec<Vec<u32>> = Vec::new();
+    let mut logit_trace: Vec<Vec<f32>> = Vec::new();
     let tracing = input.trace;
     let margin = input.margin;
-    let bench_accept = !tracing && !margin && input.pad == 0 && input.max_tokens >= 128 && k > 0;
+    let reject = input.reject;
+    let probing = input.logits && !tracing;
+    let bench_accept = !tracing
+        && !margin
+        && !reject
+        && !probing
+        && input.pad == 0
+        && input.max_tokens >= 128
+        && k > 0;
     let mut stopped =
         (!bench_accept && stop_tokens.contains(&x)) || generated.len() >= input.max_tokens;
 
@@ -249,7 +385,14 @@ async fn main(input: Input) -> Result<Output> {
         // One diagnostic channel, the margin or the trace: a declared channel
         // takes a reader cell whether or not a stage touches it, and the pass
         // has room for twelve. f32 for both — a token id is exact in f32.
-        let aux = Channel::new([if tracing { 2 * w } else { 1 }], dtype::f32)
+        let aux_len = if tracing {
+            2 * w
+        } else if probing {
+            4 * w
+        } else {
+            1
+        };
+        let aux = Channel::new([aux_len], dtype::f32)
             .capacity(channel_capacity() as u32);
 
         let fwd = ForwardPass::new();
@@ -278,6 +421,39 @@ async fn main(input: Input) -> Result<Output> {
                     select(&lower, gather(&window, &at), gather(&truth, &at)),
                     dtype::f32,
                 ));
+            } else if probing {
+                // The answers, then each row's top two logits and their sum,
+                // laid a row at a time into `[4w]`.
+                let vocab = intrinsics::vocab();
+                let j = iota(4 * w);
+                let mut probe = select(
+                    lt(&j, Tensor::constant(w)),
+                    cast(gather(&truth, &j % Tensor::constant(w)), dtype::f32),
+                    broadcast(Tensor::constant(0f32), [4 * w]),
+                );
+                for row in 0..w {
+                    let logits_row = reshape(
+                        gather(
+                            reshape(&logits, [w, vocab]),
+                            iota(1) + Tensor::constant(row),
+                        ),
+                        [vocab],
+                    );
+                    let (top, _) = top_k(&logits_row, 2);
+                    let sum = reshape(reduce_sum(&logits_row), [1]);
+                    for (part, value) in [
+                        (1, reshape(gather(&top, iota(1)), [1])),
+                        (
+                            2,
+                            reshape(gather(&top, iota(1) + Tensor::constant(1u32)), [1]),
+                        ),
+                        (3, sum),
+                    ] {
+                        let here = eq(&j, Tensor::constant(part * w + row));
+                        probe = select(&here, broadcast(&value, [4 * w]), &probe);
+                    }
+                }
+                aux.put(probe);
             } else if margin {
                 let vocab = intrinsics::vocab();
                 let row0 = reshape(gather(reshape(&logits, [w, vocab]), iota(1)), [vocab]);
@@ -302,6 +478,8 @@ async fn main(input: Input) -> Result<Output> {
                 let exact = reshape(reduce_sum(cumprod(&hit)), [1]);
                 if bench_accept {
                     broadcast(Tensor::constant(k.saturating_sub(1)), [1])
+                } else if reject {
+                    broadcast(Tensor::constant(0u32), [1])
                 } else {
                     exact
                 }
@@ -368,7 +546,9 @@ async fn main(input: Input) -> Result<Output> {
             for _ in 0..budget {
                 fwd.submit(&pipe)?;
                 let committed = out.take_host::<Vec<i32>>().await?;
-                if tracing {
+                if probing {
+                    logit_trace.push(aux.take_host::<Vec<f32>>().await?);
+                } else if tracing {
                     let traced = aux.take_host::<Vec<f32>>().await?;
                     if proposed_trace.len() < 12 {
                         let (fired, answered) = traced.split_at(w as usize);
@@ -494,7 +674,9 @@ async fn main(input: Input) -> Result<Output> {
         } else {
             run_ahead(&pipe, &fwd, budget, async || {
                 let committed = out.take_host::<Vec<i32>>().await?;
-                if tracing {
+                if probing {
+                    logit_trace.push(aux.take_host::<Vec<f32>>().await?);
+                } else if tracing {
                     let traced = aux.take_host::<Vec<f32>>().await?;
                     if proposed_trace.len() < 12 {
                         let (fired, answered) = traced.split_at(w as usize);
@@ -535,6 +717,7 @@ async fn main(input: Input) -> Result<Output> {
             .await?;
         }
     }
+    let decode_us = (inferlet::monotonic_now_ns() - decode_from) / 1000;
     pipe.close();
 
     // A stop token ends the text; anything the last window committed past
@@ -562,9 +745,13 @@ async fn main(input: Input) -> Result<Output> {
         k: reported_k,
         depth,
         prompt_tokens: n,
+        prompt_ids: prompt.iter().map(|&t| t as u32).collect(),
+        decode_us,
+        seed_probe,
         margin_trace,
         commits_trace,
         proposed_trace,
         truth_trace,
+        logit_trace,
     })
 }
