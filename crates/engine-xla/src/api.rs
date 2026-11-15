@@ -382,11 +382,16 @@ impl Xla {
                 step: index as u32,
             };
             let latch = crate::program::Latch::new(at, self.sink.clone());
-            let (ticket, settle) = if step.lanes.iter().any(|l| !l.rs_snapshots.is_empty()) {
-                self.fire_snapshotting(step, &latch)?
+            // A step refused before it fires leaves no device fold's
+            // position behind: what it noted of where its folds would leave
+            // their states goes with it (its latched report is never told).
+            let ahead = self.rs_ahead.clone();
+            let fired = if step.lanes.iter().any(|l| !l.rs_snapshots.is_empty()) {
+                self.fire_snapshotting(step, &latch)
             } else {
-                self.fire_step(step, &latch)?
+                self.fire_step(step, &latch)
             };
+            let (ticket, settle) = fired.inspect_err(|_| self.rs_ahead = ahead)?;
             // The submitter's hold: the step is done once its passes land.
             latch.release(Ok(()));
             steps.push(ticket);

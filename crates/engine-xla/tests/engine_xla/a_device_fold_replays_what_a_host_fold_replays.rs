@@ -358,4 +358,44 @@ fn a_device_fold_replays_what_a_host_fold_replays() {
         want,
         "a fork of a set whose device fold is unsettled leaves what the host fork leaves"
     );
+
+    // A step refused for a lane whose fold nothing resolved (no program is
+    // attached to it) leaves no position behind for its first lane's fold,
+    // resolved but never run: that set replays next from what the runtime
+    // states.
+    let mut host = Set::new(&mut model, &mut refs, 6, rs_tokens, rs_shape);
+    let a = host.lane(&model, &mut refs, 31, PROMPT, FoldLen::Host(N));
+    model.fire(vec![a]);
+    let want = probe(&mut model, &mut refs, &mut host, PROMPT + N);
+    let mut device = Set::new(&mut model, &mut refs, 7, rs_tokens, rs_shape);
+    let mut other = Set::new(&mut model, &mut refs, 8, rs_tokens, rs_shape);
+    let a = device.lane(&model, &mut refs, 31, PROMPT, FoldLen::Device);
+    let b = other.lane(&model, &mut refs, 32, PROMPT, FoldLen::Device);
+    tell(&mut model, instance, &a);
+    let refused = model
+        .engine
+        .submit(&FrameSubmission::of(Step {
+            lanes: vec![a, b],
+            attachments: vec![Attachment {
+                lane: 0,
+                lanes: 1,
+                instance,
+                adapter_only: false,
+            }],
+            media: Vec::new(),
+            voxels: Vec::new(),
+        }))
+        .expect_err("a device-fold lane no program is attached to resolves no fold");
+    assert!(
+        refused.to_string().contains("device-resident fold length"),
+        "refused for the unresolved fold: {refused}"
+    );
+    device.seq.held -= ROWS;
+    let a = device.lane(&model, &mut refs, 31, PROMPT, FoldLen::Host(N));
+    model.fire(vec![a]);
+    assert_eq!(
+        probe(&mut model, &mut refs, &mut device, PROMPT + N),
+        want,
+        "a refused step's fold, which never ran, moved no state's position"
+    );
 }
