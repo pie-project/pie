@@ -527,7 +527,7 @@ impl Chunks {
             return Ok(0);
         }
         let per_chunk = self.shape(kind)?.per_chunk;
-        if self.refs {
+        if self.refs || kind.is_guest() {
             // A slot ref: its chunk is one the runtime opened, in a segment
             // it had backed ahead of this fire.
             let chunk = id / per_chunk;
@@ -594,7 +594,7 @@ impl Chunks {
 
     /// The slot ref page `id` is seated on.
     pub fn slot_ref(&self, kind: Kind, id: u32) -> Result<u32> {
-        if (matches!(kind, Kind::Window(_)) && id == 0) || self.refs {
+        if (matches!(kind, Kind::Window(_)) && id == 0) || self.refs || kind.is_guest() {
             return Ok(id);
         }
         self.seated[kind.index()]
@@ -667,10 +667,11 @@ impl Chunks {
         refs: &[u32],
         bytes: u64,
     ) -> Result<u64> {
-        let shape = self.layout.guest(role).ok_or_else(|| {
+        let kind = Kind::guest(role).ok_or_else(|| {
             Fault::program("store::chunks", format!("{role:?} is not a guest role"))
         })?;
-        let want = shape.footprint(bytes).slots as usize;
+        let shape = self.shape(kind)?;
+        let want = usize::try_from(bytes.div_ceil(shape.slot_bytes)).unwrap_or(usize::MAX);
         let run = refs.windows(2).all(|pair| pair[1] == pair[0] + 1)
             && refs.first().map(|first| first / shape.per_chunk)
                 == refs.last().map(|last| last / shape.per_chunk);
@@ -684,18 +685,7 @@ impl Chunks {
                 ),
             ));
         }
-        let first = refs[0];
-        let logical = first / shape.per_chunk;
-        let physical = self.table.physical(logical).ok_or(Fault::Ceiling {
-            what: "chunks of the state pool",
-            need: u64::from(logical) + 1,
-            have: u64::from(self.total),
-        })?;
-        self.range.span(
-            u64::from(self.at(physical)) * self.layout.chunk_bytes
-                + u64::from(first % shape.per_chunk) * shape.slot_bytes,
-            bytes,
-        )
+        self.span(kind, refs[0], 0, bytes)
     }
 
     /// The id a paged kernel reads page `id`'s slot by.

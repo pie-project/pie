@@ -3666,6 +3666,8 @@ impl Pools {
             }
             layout::FIXED => Kind::Fixed,
             layout::RS => Kind::Rs,
+            layout::INSTANCE => Kind::Instance,
+            layout::CHANNEL => Kind::Channel,
             other => {
                 return Err(Fault::program(
                     "store::chunks",
@@ -3684,8 +3686,7 @@ impl Pools {
                 format!("a host slot of a {} in a load that lays none", kind.name()),
             )
         })?;
-        let (per_chunk, bytes) = (shape.per_chunk.max(1), shape.slot_bytes);
-        let chunk = slot / per_chunk;
+        let (chunk, offset) = shape.tier_place(slot);
         let have = self.tier_chunks();
         if chunk >= have {
             return Err(Fault::Ceiling {
@@ -3694,8 +3695,7 @@ impl Pools {
                 have: u64::from(have),
             });
         }
-        Ok(u64::from(chunk) * self.chunks.layout().chunk_bytes
-            + u64::from(slot % per_chunk) * bytes)
+        Ok(u64::from(chunk) * self.chunks.layout().chunk_bytes + offset)
     }
 
     /// Where each of `refs`, host tier slots of `shape`, lies: its chunk of
@@ -3713,7 +3713,8 @@ impl Pools {
                 format!("a host slot of a {} in a load that lays none", kind.name()),
             )
         })?;
-        let (per_chunk, bytes) = (facts.per_chunk.max(1), facts.slot_bytes);
+        let bytes = facts.slot_bytes;
+        let places: Vec<(u32, u64)> = refs.iter().map(|&slot| facts.tier_place(slot)).collect();
         let Some(tier) = self.tier.as_mut() else {
             return Err(Fault::Ceiling {
                 what: "chunks of the host tier",
@@ -3721,19 +3722,14 @@ impl Pools {
                 have: 0,
             });
         };
-        if let Some(&slot) = refs.iter().find(|&&slot| slot / per_chunk >= tier.chunks()) {
+        if let Some(&(chunk, _)) = places.iter().find(|&&(chunk, _)| chunk >= tier.chunks()) {
             return Err(Fault::Ceiling {
                 what: "chunks of the host tier",
-                need: u64::from(slot / per_chunk) + 1,
+                need: u64::from(chunk) + 1,
                 have: u64::from(tier.chunks()),
             });
         }
-        Ok((
-            bytes,
-            refs.iter()
-                .map(|&slot| (slot / per_chunk, u64::from(slot % per_chunk) * bytes))
-                .collect(),
-        ))
+        Ok((bytes, places))
     }
 
     /// See `Engine::read_tier_slots`: the bytes of host tier slots, shape
@@ -4779,6 +4775,18 @@ mod tests {
     #[test]
     fn store_every_case() {
         a_seat_past_the_slot_count_is_a_row_only_a_slab_can_refuse();
+        a_slot_copy_names_the_guest_shapes();
+    }
+
+    // A process that had bound a guest program could not be suspended: its
+    // role slots' copy to the host tier named a shape the load "did not
+    // state".
+    fn a_slot_copy_names_the_guest_shapes() {
+        assert_eq!(Pools::kind_of(layout::INSTANCE).ok(), Some(Kind::Instance));
+        assert_eq!(Pools::kind_of(layout::CHANNEL).ok(), Some(Kind::Channel));
+        // The id after the guests' is no shape of a load.
+        let past = engine::chunk::ShapeId(layout::CHANNEL.0 + 1);
+        assert!(Pools::kind_of(past).is_err());
     }
 
     // gemma-4 (no slab) with 256 slots reserved seated a lane at 312.
