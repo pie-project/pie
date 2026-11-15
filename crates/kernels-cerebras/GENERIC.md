@@ -2,7 +2,8 @@
 
 Status: M1a, M1b, M1c (the stream primitives on the simulator) and M1d (flux2-mini's denoise step
 compiled by the generic compiler, no hand layout, on the simulator) done (§4.1), M2a (klein-4B's
-stream program builds for the system fabric at 1024², §4.1) compile side done, and M3 (the decode
+stream program builds for the system fabric at 1024², §4.1) compile side done, M2b (it links:
+1,065 ELFs; 1.52 s a step predicted, §4.1), and M3 (the decode
 layouts as points of the Floorplan, §2.5). ARCHITECTURE.md is what runs for decode.
 
 **Goal.** A `.poem` model the compiler has not seen runs on the wafer with no hand code. The
@@ -831,6 +832,75 @@ milestone's tail.
     klein-4B's denoise links for the system fabric. The 1024² build is 619 MB of CSL and was
     not linked (about the same image count; cslc's memory and time scale with it).
   - Decode is unchanged: plan + build `diff -r` identical against 33ab39681's wafer-compile for
+    qwen35-d0.8b, qwen35-d9b, llama31-8b, gptoss-20b, gemma4-e2b and tiny t08.
+- **M2b** (klein-4B's 1024² program links; the cost model's levers chosen by the search). The
+  survey's line for `flux2-klein-4b-bf16-kv-bf16` at `ROWS=context=512,latents=4096`:
+  `STREAM-BUILD-OK fabric=741x1143 py=256 kv-columns=600x99`, now **linked for the system
+  fabric** (`cslc --fabric-dims=762,1172`).
+  - **One image a kind of PE.** cslc builds an ELF a distinct (file, params); M2a's emitter wrote
+    a file a PE where PEs differed only in a few numbers. What differed is now each PE's runtime
+    config words (`pcfg`, a host array, `Fill::Words`, as decode's rcfg): a root's lane drains
+    (the bus offsets of its lane words, a zero-length drain where none), the row store's keeper
+    column and fetch role, a column-side matvec's leaf role, a weight PE's column-chain role, a
+    K / V PE's index and chain role. Files that differ only in their comments are one file
+    (`emit::stream::dedup`: the regions first, the roots' imports renamed, then the kernels).
+    Colours stay `@set_tile_code` params (a few distinct sets a kind).
+
+    | program | distinct (file, params) before | after | ELFs (cslc) before | after | link |
+    |---|---|---|---|---|---|
+    | flux2-mini, the search's 80 x 28 | 514 | 108 | 526 | 161 | 51 s -> 20 s |
+    | klein-4B, 64 + 64 rows (715 x 904) | 22,826 | 553 | 23,007 | 1,215 | 55 min / 58 GB -> 13.6 min / ~36 GB |
+    | klein-4B, 1024² (741 x 1143) | 76,450 | 381 | not linked | 1,065 | 14.1 min / ~37 GB, rc 0 |
+    | klein-4B, 1024², the search's choice (helpers) | | 401 | | 1,101 | 14.1 min / ~35 GB, rc 0 |
+
+    Every flux2-mini PE's code with its config words put in is M1d's (bar the zero-length drain
+    a farthest lane root now declares), every host array as before (`scratch/.../equiv.py`
+    over the `--values` build).
+  - **What stopped the 1024² link** (once it was a thousand images): `ld.lld: ran out of PE
+    memory` at the roots holding every row's per-row scalars: a single block's head roots 4,608
+    rows x 4 rope positions (73 KB), the CX roots 4,096 x 3 (49 KB). A scalar a region's row
+    never reads (the lane id that picked a lane vector) is not held now; past `SCAL_WORDS`
+    (2,048) a unit's CY roots' scalars come down their column chains with the phase's first
+    row-side matvec: the weight PE of row `t % py` adds row `t`'s (`Fill::RowScalars`, 72 words a
+    PE) into the chain, the rest add zeros. The largest root is then 30 KB.
+  - **The cost model** (`cost::stream`): the step's timeline is row by row through each unit's
+    schedule (`timeline`: a unit's CX roots run their segments in order, a row no sooner than it
+    arrives nor faster than the unit's pace, a late segment once its block has stored), so a
+    double block's late rows pace the next block (the phase sum did not); a query is priced at
+    the program's own K / V PEs a head. `wafer-compile stream --price .. --parts` prints each
+    root-side step a row. klein at 1024²: 2,116M (M2a's phase sum) -> 2,297M cycles, 2.62 s.
+    Against M1d's simulator stamps (flux2-mini, 80 x 28): every unit's CX roots 12-15 end 4.47M
+    cycles after roots 0-11 (and the lane prologue's CY roots at 4.85M): a fixed lane-bus
+    start-up, not a row cost; less it the step is about 6.2M against 6.0-6.7M predicted.
+  - **Levers, each a search dimension** (`build::KvSplit`, `--cut THIN,SUB,WIDEN,HELP`; py and
+    tile both pinned keep the plain cut, so M1d's flux2-mini is as before):
+
+    | lever | klein 1024² predicted | note |
+    |---|---|---|
+    | none (M2b's timeline) | 2,297M cycles, 2.62 s | |
+    | rest roots widened a quarter / a half | does not fit (730 x 1524: a fourth band) | flux2-mini 5.9M -> 5.3M |
+    | K / V column folded over 2-3 columns (snake), thinner PEs | refused: a head root's link to a column two wide meets 21+ K / V chains, more than the palette's colours | builds for flux2-mini (80 x 24) |
+    | **helpers: a rest-root column region over up to 15 PEs below each root** | **1,326M cycles, 1.52 s** | the search's choice; flux2-mini 5.0M |
+    | row replicas | not tried: the fabric is full (847k of 883k PEs) | |
+
+    Helpers (`Built::helper`, `emit::stream::helper_file`): the unit's costliest column region
+    on its rest roots that cuts evenly and reads only rows and scalars (klein's SwiGLU, 288
+    columns a root) runs over the root and `h` helper PEs straight below it in the band's K / V
+    rows (their own chain: the cast down, a sum chain back). The root stages its chunk, casts
+    the helpers' parts, runs its own `q = chunk / (h + 1)` columns and takes the helpers' results
+    as a sum (each helper's in its place of a zero vector). The first unit of a block whose
+    later units' links pass west below it takes none (their colours would meet). A single
+    block's pre-barrier row: 20.2k -> 11.2k cycles (SwiGLU 10.9k -> 1.9k); the head roots' norms
+    and four P5 axes (8.8k) set the pace now. `tools/wafer/prims/help` runs the emitted helper
+    kernel (flux2-mini's SwiGLU, 6 roots x 7 helpers, q 16) against `kernels_ir::interp` on the
+    simulator (`prims/help/run.py`; queued behind M1f's runs when M2b closed: its result is
+    not in yet, so the helpers' numerics are cslc-checked only).
+  - What is left: the head roots' 8.8k (the P5 tables a row at every head root: a position's
+    cos / sin are the same for the row's 24 heads; zero positions skip nothing yet); the
+    K / V fold needs links that do not cross the folded columns (head roots at a pitch of the
+    fold); the lane bus start-up (4.5M cycles at flux2-mini); the full step on the simulator
+    with the config words, the carried scalars and helpers (M1f's runs use their own builds).
+  - Decode is unchanged: plan + build `diff -r` identical against 18ebbe86c's wafer-compile for
     qwen35-d0.8b, qwen35-d9b, llama31-8b, gptoss-20b, gemma4-e2b and tiny t08.
 
 ## 5. Risks
