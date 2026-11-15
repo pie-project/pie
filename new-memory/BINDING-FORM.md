@@ -278,6 +278,68 @@ b. The 8-storage-buffer limit moves up: piece 5, right after views are bound who
    a buffer: not read). The set wgpu itself names for 0.6B: not read (the naming pass
    has not run that load on wgpu).
 
+c. The form on the decode kernels, counted (15 Nov, later). Three local commits on
+   863587d55 (branch sc/gpu-pool-segments, not on origin, held until the probe's
+   figures; no GPU run of the form at a serving fire): the stub fix, a wasm32 lint fix,
+   and the form on attn/sdpa (decode, split, tiled, selected, fold) and attn/kv_append.
+   The fact to keep: a kernel in the form binds N pool buffers plus the distinct OTHER
+   buffers its tensors lie in, and a decode's other tensors lie in one buffer (the
+   fire's inputs: positions, page tables, masks), the split walk's in two (inputs and
+   the load's scratch for its partials). Rows in and out are in the activation span,
+   which is in the pool.
+
+   Storage buffers a kernel binds in its stage, WGSL:
+
+   | kernel | today, 4 fixed segments | per-tensor views at 1 / 2 / 4 segments | in the form at 1 / 2 / 4 |
+   |---|---|---|---|
+   | sdpa decode | 12 (8 own + 4) | 9 / 10 / 12 | 2 / 3 / 5 |
+   | sdpa decode, lse or selected | 13 (9 + 4) | 10 / 11 / 13 | 2 / 3 / 5 |
+   | sdpa tiled (lse) | 12 (13) | 9 / 10 / 12 (10 / 11 / 13) | 2 / 3 / 5 |
+   | sdpa split | 14 (10 + 4) | 11 / 12 / 14 | 3 / 4 / 6 |
+   | sdpa split, lse | 15 (11 + 4) | 12 / 13 / 15 | 3 / 4 / 6 |
+   | sdpa fold (lse) | 3 (4), no pool | 3 (4) | 2, whatever the cut |
+   | kv_append | 8 (4 + 4) | 5 / 6 / 8 | 2 / 3 / 5 |
+   | score capture | 10 (6 + 4) | 7 / 8 / 10 | not moved (attn/score.slang) |
+
+   What each column rests on:
+   - "Today": reflection of the compiled WGSL modules (every `var<storage>` of each
+     module), from a dump of the per-tensor form made before 863587d55.
+   - "Per-tensor views at 1 / 2": arithmetic, the reflected own count plus N. No module
+     was compiled at those counts.
+   - "In the form": COUNTED BY READING engine-gpu dispatch/attn.rs and scratch.rs, not
+     observed at a serving fire. Not traced to their buffer: lse_out, `selection` and the
+     tiled walk's tables; their rows are given the decode's count and are the least
+     certain. What reflection does show: every form module reflects with all its tensors
+     and its pool in one buffer, and with a pool of three plus each tensor in its own
+     buffer, so a module sets no floor above 1 and the count is the fire's distinct
+     buffers. The six GPU runs of that branch bound the suite's own buffers, not the
+     serving layout; the miniatures, which would confirm it, never ran.
+   - If the reading is wrong a fire is refused, not miscounted: the wgpu pipeline build
+     holds the buffers a fire reaches to the adapter's limit by name. The load-time hold
+     uses a stated `DECODE_HOMES` (1 whole, 2 split), a layout fact written by hand, not
+     derived: to be derived in the re-cut.
+
+   Against WebGPU's 8, by these counts: the split fits up to a cut of 6 segments, the
+   whole walk up to 7. The branch's tuning tests state adapters of 4 (refused by name),
+   5, 6 and 8.
+
+   What the re-cut owes against the rulings (after the probe): N a load fact, not a
+   per-fire one; the cut derived from pool bytes / max binding size, not capped at a
+   constant 4; pipelines built at load for the load's real N; segments standing from
+   load; a gate. The array form on Vulkan needs shaderStorageBufferArrayDynamicIndexing
+   and shaderStorageBufferArrayNonUniformIndexing.
+
+d. Device features, read (15 Nov), one device only: "NVIDIA RTX PRO 4500 Blackwell",
+   through the engine's own physical-device query (a filtered test, no model, no kernel):
+   sparseBinding true; sparseResidencyBuffer true; sparseAddressSpaceSize 1 TiB;
+   shaderStorageBufferArrayDynamicIndexing true;
+   shaderStorageBufferArrayNonUniformIndexing true; the engine's queue family binds
+   sparse memory. Not read: the sparse bind granularity (it needs the feature enabled at
+   device creation; the probe prints it), and the cost of a sparse bind, which decides
+   9.3. No AMD device was read: the MI300X host has no Vulkan stack (no ICD), so AMD
+   hardware under Vulkan is untested. Chrome's maxStorageBuffersPerShaderStage: still
+   not read.
+
 Still open (filled when read):
 - Exact sum of run bounds for 0.6B, and the number of distinct mixes: not read. Both are
   one print in the naming pass; the probe build prints them.
