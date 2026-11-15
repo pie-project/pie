@@ -2342,61 +2342,40 @@ fn poison_readers(cells: &BoundCells, reason: &str) {
     }
 }
 
+/// The moves a fire counted on its rings, given back if the fire never
+/// reaches the engine.
 struct TicketReservation {
     cells: BoundCells,
-    heads: Vec<u64>,
-    tails: Vec<u64>,
+    accesses: Vec<(bool, bool)>,
     committed: bool,
 }
 
 impl TicketReservation {
     fn new(cells: &BoundCells, accesses: &[(bool, bool)]) -> Self {
-        let (heads, tails) = cells
-            .iter()
-            .zip(accesses)
-            .map(|(cell, &(consume, publish))| {
-                cell.lock().unwrap().reserve_device_ticket(consume, publish)
-            })
-            .unzip();
+        for (cell, &(consume, publish)) in cells.iter().zip(accesses) {
+            cell.lock().unwrap().reserve_device_moves(consume, publish);
+        }
         Self {
             cells: cells.clone(),
-            heads,
-            tails,
+            accesses: accesses[..cells.len().min(accesses.len())].to_vec(),
             committed: false,
         }
     }
 
+    /// The fire carries which ends of which rings it moves, so the step
+    /// builder keeps two movers of one end in different steps.
     fn apply_to(&self, request: &mut crate::engine::FireRequest) {
-        if self.cells.is_empty() {
-            return;
-        }
-        let mut adopted = true;
-        let tickets: Vec<engine::Ticket> = self
+        request.ring_moves = self
             .cells
             .iter()
-            .zip(&self.heads)
-            .zip(&self.tails)
-            .map(|((cell, &head), &tail)| {
-                let cell = cell.lock().unwrap();
-                adopted &= cell
-                    .endpoint()
-                    .is_some_and(|endpoint| endpoint.registered().adopted());
-                engine::Ticket {
-                    channel: cell.global_id,
-                    expected_head: head,
-                    expected_tail: tail,
-                }
+            .zip(&self.accesses)
+            .filter(|(_, (consume, publish))| *consume || *publish)
+            .map(|(cell, &(takes, puts))| crate::engine::fire::RingMove {
+                channel: cell.lock().unwrap().global_id,
+                takes,
+                puts,
             })
             .collect();
-        // The step builder orders the fire by its reservation whatever the
-        // engine hears; the engine hears it where it published the ring the
-        // runtime reads.
-        request.ring_moves.clone_from(&tickets);
-        if let Some(lane) = request.lanes.first_mut()
-            && adopted
-        {
-            lane.channels = tickets;
-        }
     }
 
     fn commit(mut self) {
@@ -2409,12 +2388,8 @@ impl Drop for TicketReservation {
         if self.committed {
             return;
         }
-        for ((cell, &head), &tail) in self.cells.iter().zip(&self.heads).zip(&self.tails).rev() {
-            if !cell.lock().unwrap().rollback_device_ticket(head, tail) {
-                tracing::error!(
-                    "channel ticket rollback lost LIFO ownership; preserving newer reservations"
-                );
-            }
+        for (cell, &(consume, publish)) in self.cells.iter().zip(&self.accesses) {
+            cell.lock().unwrap().release_device_moves(consume, publish);
         }
     }
 }
@@ -5127,47 +5102,46 @@ mod static_admission_tests {
         a_latest_value_word_with_no_committed_cell_is_refused();
         a_reader_ring_too_small_for_the_frames_writes_is_refused();
         a_slot_that_consumes_what_an_earlier_slot_published_is_admitted();
-        two_pipelines_putting_one_ring_are_stepped_as_they_reserved();
+        a_dropped_reservation_gives_its_count_back_while_a_later_one_stands();
+        two_passes_putting_one_ring_get_distinct_cells_in_dispatch_order();
     }
 
-    /// A channel is its process's: two pipelines of the process put one
-    /// device ring, each a fire of its own lane. The fires go a step apart
-    /// in the order they reserved, whichever lane the wave stands first, and
-    /// the same where the engine hears no ticket (a ring the runtime does
-    /// not read from what the engine published).
-    fn two_pipelines_putting_one_ring_are_stepped_as_they_reserved() {
-        use crate::scheduler::worker::PendingRequest;
+    fn a_dropped_reservation_gives_its_count_back_while_a_later_one_stands() {
         let ring = channel(HostRole::None, 4, false);
         let cells: BoundCells = vec![Arc::clone(&ring)];
         let earlier = TicketReservation::new(&cells, &[(false, true)]);
         let later = TicketReservation::new(&cells, &[(false, true)]);
-        let fire = |reservation: &TicketReservation, instance: u64| {
-            let mut request = crate::engine::FireRequest::one(crate::engine::fire::lane_of(
-                0,
-                vec![instance as u32],
-                0,
-                vec![instance as u32],
-            ));
-            request.single_token_mode = true;
-            reservation.apply_to(&mut request);
-            assert!(
-                request.lanes[0].channels.is_empty(),
-                "no ticket reaches the engine for a ring it published no mirror of"
-            );
-            assert_eq!(request.ring_moves.len(), 1, "the reservation is carried");
-            Box::new(PendingRequest {
-                lora_program: false,
-                logical_fire_id: instance,
-                request,
-                instance_id: ::engine::InstanceId(instance),
-                completion: crate::engine::WorkItemCompletion::new(instance, 0),
-                process_id: Some(uuid::Uuid::from_u128(1)),
-                pipeline_id: Some(uuid::Uuid::from_u128(u128::from(instance))),
-                prelaunch_copy: None,
-                prelaunch_state_copy: None,
-                frame: None,
-            })
-        };
+        assert_eq!(ring.lock().unwrap().device_ring_backlog(), 2);
+        drop(earlier);
+        assert_eq!(
+            ring.lock().unwrap().device_ring_backlog(),
+            1,
+            "the earlier fire never reached the engine"
+        );
+        later.commit();
+        assert_eq!(ring.lock().unwrap().device_ring_backlog(), 1);
+    }
+
+    /// A channel is its process's: two passes of the process put one device
+    /// ring, each a fire of its own lane, and the engine picks each put's
+    /// cell from the ring's cursor as it builds the step. In each way the
+    /// fire that reserved later can reach the engine first, the two get
+    /// distinct cells, in the order they are dispatched, with no rule about
+    /// the order they reserved in.
+    fn two_passes_putting_one_ring_get_distinct_cells_in_dispatch_order() {
+        use crate::scheduler::worker::PendingRequest;
+        type Submissions = Vec<Vec<Vec<u64>>>;
+        // Each case as the submissions it dispatches, each a list of waves of
+        // the fires' instances: 1 reserved first, 2 second.
+        let cases: [(&str, Submissions); 7] = [
+            ("in reservation order", vec![vec![vec![1, 2]]]),
+            ("the seal leaves the earlier frame for later", vec![vec![vec![2]], vec![vec![1]]]),
+            ("a held prompt waits a wave", vec![vec![vec![2], vec![1]]]),
+            ("the earlier lane stands later in the wave", vec![vec![vec![2, 1]]]),
+            ("a boundary falls between them", vec![vec![vec![2]], vec![vec![1]]]),
+            ("the later is a rider ahead of the framed", vec![vec![vec![2]], vec![vec![1]]]),
+            ("the later is framed ahead of a rider", vec![vec![vec![2]], vec![vec![1]]]),
+        ];
         let limits = crate::engine::SchedulerLimits {
             max_forward_requests: 8,
             max_forward_tokens: 64,
@@ -5177,30 +5151,78 @@ mod static_admission_tests {
             prefill_lanes: 0,
             max_readouts: 0,
         };
-        for reversed in [false, true] {
-            let mut wave = vec![fire(&earlier, 1), fire(&later, 2)];
-            if reversed {
-                wave.reverse();
+        for (case, submissions) in cases {
+            let ring = channel(HostRole::None, 4, false);
+            let cells: BoundCells = vec![Arc::clone(&ring)];
+            let id = ring.lock().unwrap().global_id;
+            let reservations = [
+                TicketReservation::new(&cells, &[(false, true)]),
+                TicketReservation::new(&cells, &[(false, true)]),
+            ];
+            let fire = |instance: u64| {
+                let mut request = crate::engine::FireRequest::one(crate::engine::fire::lane_of(
+                    0,
+                    vec![instance as u32],
+                    0,
+                    vec![instance as u32],
+                ));
+                request.single_token_mode = true;
+                reservations[instance as usize - 1].apply_to(&mut request);
+                assert!(request.lanes[0].channels.is_empty(), "no ticket reaches the engine");
+                assert_eq!(
+                    request.ring_moves,
+                    [crate::engine::fire::RingMove {
+                        channel: id,
+                        takes: false,
+                        puts: true,
+                    }],
+                    "the fire carries the end it moves and no place"
+                );
+                Box::new(PendingRequest {
+                    lora_program: false,
+                    logical_fire_id: instance,
+                    request,
+                    instance_id: ::engine::InstanceId(instance),
+                    completion: crate::engine::WorkItemCompletion::new(instance, 0),
+                    process_id: Some(uuid::Uuid::from_u128(1)),
+                    pipeline_id: Some(uuid::Uuid::from_u128(u128::from(instance))),
+                    prelaunch_copy: None,
+                    prelaunch_state_copy: None,
+                    frame: None,
+                })
+            };
+            // The engine's ring cursor, moved by each put as it builds a step.
+            let mut cursor = 0u64;
+            let mut cells_of = std::collections::BTreeMap::new();
+            let mut dispatched = Vec::new();
+            for waves in submissions {
+                let waves = waves
+                    .into_iter()
+                    .map(|wave| wave.into_iter().map(fire).collect())
+                    .collect();
+                let (frame, _) = crate::scheduler::batch::build_frame_submission(
+                    waves,
+                    limits,
+                    16,
+                    &crate::scheduler::stats::SchedulerStats::default(),
+                );
+                for step in &frame.steps {
+                    let before = cursor;
+                    for instance in &step.instances {
+                        cells_of.insert(instance.0, cursor);
+                        cursor += 1;
+                        dispatched.push(instance.0);
+                    }
+                    assert!(cursor - before <= 1, "{case}: one put of the ring a step");
+                }
             }
-            let (frame, _) = crate::scheduler::batch::build_frame_submission(
-                vec![wave],
-                limits,
-                16,
-                &crate::scheduler::stats::SchedulerStats::default(),
-            );
-            let steps: Vec<Vec<u64>> = frame
-                .steps
-                .iter()
-                .map(|step| step.instances.iter().map(|id| id.0).collect())
-                .collect();
-            assert_eq!(
-                steps,
-                [vec![1], vec![2]],
-                "the earlier reservation's fire is a step ahead (wave reversed: {reversed})"
-            );
+            let cells: Vec<u64> = dispatched.iter().map(|fire| cells_of[fire]).collect();
+            assert_eq!(cells, [0, 1], "{case}: distinct cells in dispatch order");
+            assert_eq!(ring.lock().unwrap().device_ring_backlog(), 2, "{case}");
+            for reservation in reservations {
+                reservation.commit();
+            }
         }
-        later.commit();
-        earlier.commit();
     }
 
     fn a_device_ring_frame_that_overflows_is_refused_by_name() {
