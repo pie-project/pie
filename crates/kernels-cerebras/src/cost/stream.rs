@@ -163,10 +163,10 @@ fn region_cycles(p: &Program, u: usize, step: usize) -> f64 {
     RegionFeatures::of(&printed.csl, at.chunk).cycles(at.chunk)
 }
 
-/// A query's cycles over a K / V column of `rows` stored rows.
+/// A query's cycles over a K / V column of `rows` stored rows at `pya` attention PEs.
 #[must_use]
-pub fn query_cycles(rows: u32, q_heads: u32, head_dim: u32) -> f64 {
-    let ne = rows.div_ceil(kv_pya(rows, q_heads, head_dim));
+pub fn query_cycles(rows: u32, pya: u32, q_heads: u32) -> f64 {
+    let ne = rows.div_ceil(pya.max(1));
     QUERY + QUERY_ENTRY * f64::from(ne * q_heads)
 }
 
@@ -253,7 +253,12 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
                                     .map(|&v| rows_of(&p.units[v].unit.classes, class_rows))
                                     .sum()
                             });
-                        let c = query_cycles(block, qh, a.head_dim);
+                        let pya = p
+                            .stream
+                            .kv
+                            .first()
+                            .map_or_else(|| kv_pya(block, qh, a.head_dim), |k| k.pya);
+                        let c = query_cycles(block, pya, qh);
                         col_side += c;
                         parts.push(part("query", c));
                     }
@@ -291,28 +296,145 @@ pub fn time_at(p: &Program, class_rows: &[u32]) -> StreamCost {
             parts,
         });
     }
-    // along the stream: a unit starts its rows once the unit before it has started its own
-    // (rows pipeline), its late phase once its block has stored every row
-    let mut t = 0.0f64;
-    let mut done = 0.0f64;
-    for u in &units {
-        let early = f64::from(u.rows) * u.early_row;
-        let late = f64::from(u.rows) * u.late_row;
-        let start = t;
-        let end_early = start + early;
-        let end = end_early + late;
-        done = done.max(end);
-        // the next unit's rows arrive as this one's leave: after its barrier where it has one
-        t = if late > 0.0 {
-            end_early
-        } else {
-            start + u.early_row
-        };
-    }
+    let done = timeline(p, &units, class_rows);
     StreamCost {
         cycles: done,
         units,
     }
+}
+
+/// A forwarded (or dropped) row's word at a CX root: in off the stream, out again.
+pub const FORWARD_WORD: f64 = 1.0;
+
+/// The step's end along the stream, row by row: each unit's CX roots run their schedule's
+/// segments in order ([`place::Seg`]: own rows before the barrier, others' rows on, own rows
+/// after it), a row no sooner than it reaches the unit and no faster than the unit's pace a row
+/// ([`UnitCost`]), a late segment no sooner than every unit of its block has stored, and the
+/// rows a unit sends on are the next unit's input in that order. At `class_rows` other than the
+/// build's, each segment's rows scale with its class's.
+#[must_use]
+pub fn timeline(p: &Program, units: &[UnitCost], class_rows: &[u32]) -> f64 {
+    let built: Vec<u32> = p.class_rows.iter().map(|r| r.0).collect();
+    let fwd = f64::from(p.stream_hidden() / p.stream.py.max(1)) * FORWARD_WORD;
+    // each path unit's segments with their classes (read off the stream at the build's rows)
+    #[derive(Clone, Copy)]
+    enum K {
+        Early(bool),
+        Late,
+        Fwd,
+        Drop,
+    }
+    let mut floor = 0.0f64;
+    let mut done = 0.0f64;
+    let mut plan: Vec<(usize, Vec<(K, u32)>)> = Vec::new();
+    let mut labels: Vec<usize> = Vec::new();
+    for (ui, b) in p.units.iter().enumerate() {
+        let Some(sc) = b.sched.as_ref().filter(|_| !b.unit.classes.is_empty()) else {
+            // the lane prologue: the rest start once its first row is out
+            floor = floor.max(units[ui].early_row);
+            done = done.max(f64::from(units[ui].rows) * units[ui].early_row);
+            continue;
+        };
+        let late = sc.segs.iter().any(|g| matches!(g, place::Seg::Late { .. }));
+        let class_of = |t0: u32| sc.rows.get(t0 as usize).map_or(0, |r| r.0);
+        let scale = |c: usize, n: u32| -> u32 {
+            match (built.get(c), class_rows.get(c)) {
+                (Some(&b0), Some(&r)) if b0 > 0 => {
+                    (u64::from(n) * u64::from(r)).div_ceil(u64::from(b0)) as u32
+                }
+                _ => n,
+            }
+        };
+        let (mut idx, mut out, mut segs) = (0usize, Vec::new(), Vec::new());
+        for g in &sc.segs {
+            match *g {
+                place::Seg::Early { t0, n, host } => {
+                    let c = class_of(t0);
+                    if !host {
+                        idx += n as usize;
+                    }
+                    if !late {
+                        out.extend(std::iter::repeat_n(c, n as usize));
+                    }
+                    segs.push((K::Early(host), scale(c, n)));
+                }
+                place::Seg::Late { t0, n } => {
+                    let c = class_of(t0);
+                    out.extend(std::iter::repeat_n(c, n as usize));
+                    segs.push((K::Late, scale(c, n)));
+                }
+                place::Seg::Fwd { n } | place::Seg::Drop { n } => {
+                    let c = labels.get(idx).copied().unwrap_or(0);
+                    if matches!(g, place::Seg::Fwd { .. }) {
+                        out.extend(labels.iter().skip(idx).take(n as usize));
+                        segs.push((K::Fwd, scale(c, n)));
+                    } else {
+                        segs.push((K::Drop, scale(c, n)));
+                    }
+                    idx += n as usize;
+                }
+            }
+        }
+        labels = out;
+        plan.push((ui, segs));
+    }
+    let block_of = |u: usize| p.kv.iter().position(|k| k.units.contains(&u));
+    let mut barrier = vec![0.0f64; p.kv.len()];
+    for _ in 0..16 {
+        let mut stored = vec![0.0f64; p.kv.len()];
+        let mut inp: Vec<f64> = Vec::new();
+        let mut end = done;
+        for (ui, segs) in &plan {
+            let c = &units[*ui];
+            let (mut clock, mut idx, mut out) = (floor, 0usize, Vec::new());
+            let arrive = |idx: &mut usize| -> f64 {
+                let t = inp.get(*idx).or(inp.last()).copied().unwrap_or(floor);
+                *idx += 1;
+                t
+            };
+            let mut early_end = floor;
+            let late = segs.iter().any(|s| matches!(s.0, K::Late));
+            for &(k, n) in segs {
+                for _ in 0..n {
+                    match k {
+                        K::Early(host) => {
+                            if !host {
+                                clock = clock.max(arrive(&mut idx));
+                            }
+                            clock += c.early_row;
+                            if !late {
+                                out.push(clock);
+                            }
+                        }
+                        K::Late => {
+                            clock = clock.max(block_of(*ui).map_or(0.0, |b| barrier[b]));
+                            clock += c.late_row;
+                            out.push(clock);
+                        }
+                        K::Fwd => {
+                            clock = clock.max(arrive(&mut idx)) + fwd;
+                            out.push(clock);
+                        }
+                        K::Drop => clock = clock.max(arrive(&mut idx)) + fwd,
+                    }
+                }
+                if matches!(k, K::Early(_)) {
+                    early_end = clock;
+                }
+            }
+            if let Some(b) = block_of(*ui) {
+                stored[b] = stored[b].max(early_end);
+            }
+            end = end.max(clock);
+            inp = out;
+        }
+        let settled = stored == barrier;
+        barrier = stored;
+        if settled {
+            return end;
+        }
+    }
+    done
 }
 
 #[cfg(test)]
