@@ -741,8 +741,27 @@ pub(crate) struct StepWord {
     reserved: u32,
 }
 
-fn scratch_zeroing_skipped() -> bool {
-    crate::diag::on().scratch_no_zero
+/// Test builds (`test-slot-fill`): `len` bytes of guest scratch from `at`
+/// set to 0xFF (NaN in every float width) in `frame`, so a value read
+/// before its step writes it fails the test that reads it. Elsewhere
+/// nothing: every guest value is written before it is read (a streamed
+/// step writes each node it publishes, the lay_out gives a value's bytes on
+/// only after its last reader, and the kernels that accumulate clear their
+/// own buffers), so the scratch goes unfilled.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn poison_scratch(
+    frame: &mut Frame,
+    slab: &crate::device::alloc::Slab,
+    at: u64,
+    len: u64,
+) -> Result<()> {
+    #[cfg(feature = "test-slot-fill")]
+    {
+        frame.fill_with(slab, at, len, 0xff)?;
+        frame.next_pass()?;
+    }
+    let _ = (frame, slab, at, len);
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1277,31 +1296,12 @@ impl Prepared {
         })
     }
 
-    /// Zeroes the seated scratch on the GPU, in `frame`, ahead of the
-    /// stage's passes.
+    /// Test builds: poisons the seated scratch ([`poison_scratch`]) ahead
+    /// of the stage's passes.
     #[cfg(target_vendor = "apple")]
-    pub fn zero_scratch_on(&mut self, frame: &mut Frame) -> Result<()> {
-        if scratch_zeroing_skipped() {
-            return Ok(());
-        }
+    pub fn poison_scratch_on(&mut self, frame: &mut Frame) -> Result<()> {
         let scratch = self.scratch()?.clone();
-        frame.fill(scratch.buffer.slab(), scratch.offset, self.scratch_bytes)?;
-        self.poison_hollow(frame)?;
-        frame.next_pass()?;
-        Ok(())
-    }
-
-    /// Test builds (`test-slot-fill`): the bytes every hollow value points
-    /// at, the lane's dummy, poisoned after the zero fill.
-    #[cfg(target_vendor = "apple")]
-    pub fn poison_hollow(&self, frame: &mut Frame) -> Result<()> {
-        #[cfg(feature = "test-slot-fill")]
-        {
-            let scratch = self.scratch()?.clone();
-            frame.fill_with(scratch.buffer.slab(), scratch.offset, SCRATCH_ALIGN, 0xff)?;
-        }
-        let _ = frame;
-        Ok(())
+        poison_scratch(frame, scratch.buffer.slab(), scratch.offset, self.scratch_bytes)
     }
 
     pub fn refresh_cells(&mut self, rings: &Rings, cursors: &[Cursor]) -> Result<()> {
@@ -1811,9 +1811,8 @@ impl Prepared {
         }
     }
 
-    /// Fires `region` in a frame of its own; `zero` first zeroes the seated
-    /// scratch in that same frame (a stage's first region), so the zeroing
-    /// costs no submission and no wait of its own.
+    /// Fires `region` in a frame of its own; `zero` (a stage's first
+    /// region) first poisons the seated scratch in test builds.
     pub fn launch_region(
         &mut self,
         device: &Context,
@@ -1827,7 +1826,7 @@ impl Prepared {
             let _ = (pipelines, rings);
             let mut frame = device.frame()?;
             if zero {
-                self.zero_scratch_on(&mut frame)?;
+                self.poison_scratch_on(&mut frame)?;
             }
             self.encode_into(&frame, region)?;
             frame.commit()
@@ -2184,18 +2183,7 @@ impl Batch {
             u64::from(count) * u64::from(self.shape.channel_slots_per_lane),
         )?;
         let scratch = self.scratch()?.clone();
-        if !scratch_zeroing_skipped() {
-            frame.fill(
-                scratch.buffer.slab(),
-                scratch.offset,
-                u64::from(count) * stride,
-            )?;
-            #[cfg(feature = "test-slot-fill")]
-            for lane in 0..u64::from(count) {
-                frame.fill_with(scratch.buffer.slab(), scratch.offset + lane * stride, SCRATCH_ALIGN, 0xff)?;
-            }
-            frame.next_pass()?;
-        }
+        poison_scratch(frame, scratch.buffer.slab(), scratch.offset, u64::from(count) * stride)?;
         let frame: &Frame = frame;
         let vocab = members[0]
             .grouped
