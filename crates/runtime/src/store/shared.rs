@@ -771,6 +771,9 @@ impl SharedPool {
             },
             reserved: Vec::new(),
             act_chunks: Vec::new(),
+            eager_rungs: Vec::new(),
+            held_bytes: 0,
+            outside_bytes: 0,
             host_chunks: 0,
             disk_chunks: 0,
             weights: Vec::new(),
@@ -1556,11 +1559,12 @@ impl SharedPool {
     }
 
     /// The engine holds `bytes` of the range it stated back
-    /// ([`::engine::live::Live::held`]): no state chunk is opened in the
-    /// top `bytes` of the span below the activation, which the engine binds
-    /// none of yet; all of it again once it holds none.
+    /// ([`::engine::chunk::ChunkFacts::held_bytes`], a load fact the pool
+    /// is seeded with once): no state chunk is opened in the top `bytes` of
+    /// the span below the activation, which the engine binds none of; all
+    /// of it where it holds none.
     /// Whether the ceiling rose: room opened that a planner waiter may be
-    /// short of, so the caller wakes them.
+    /// short of.
     pub fn hold_back(&mut self, bytes: u64) -> bool {
         let ceiling = self.ceiling_for(bytes);
         let rose = ceiling > self.pool.ceiling();
@@ -1585,19 +1589,20 @@ impl SharedPool {
             .max(self.pool.reserved_chunks())
     }
 
-    /// The most the pool may map while the engine holds `bytes` back: the
-    /// prefix segments wholly under what it binds
-    /// ([`crate::store::slots::SlotPool::backs`]) and the top span,
-    /// committed from the load; the whole range when it holds none.
+    /// The most the pool may map under what the engine holds back
+    /// ([`Self::hold_back`]): the prefix segments wholly under what it
+    /// binds ([`crate::store::slots::SlotPool::backs`]) and the top span,
+    /// committed from the load; the whole range where it holds none.
     #[must_use]
-    pub fn bound_bytes(&self, bytes: u64) -> u64 {
+    pub fn bound_bytes(&self) -> u64 {
         let total = self.pool.total_chunks();
-        if bytes == 0 {
+        let ceiling = self.pool.ceiling();
+        if ceiling >= total {
             return u64::from(total) * self.pool.chunk_bytes();
         }
         let seg = self.pool.segments().segment_chunks().max(1);
         let top_start = self.pool.top_segment() * seg;
-        let prefix_end = (self.ceiling_for(bytes) / seg * seg).min(top_start);
+        let prefix_end = (ceiling / seg * seg).min(top_start);
         u64::from(prefix_end + (total - top_start)) * self.pool.chunk_bytes()
     }
 

@@ -870,6 +870,9 @@ impl Chunks {
                 .copied()
                 .chain(std::iter::once((max_tokens, self.act)))
                 .collect(),
+            eager_rungs: Vec::new(),
+            held_bytes: 0,
+            outside_bytes: 0,
             host_chunks: 0,
             disk_chunks: 0,
             disk_persistent: false,

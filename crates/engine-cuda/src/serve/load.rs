@@ -1744,7 +1744,6 @@ impl Staged {
             );
         }
         shell.card = (device_total, free_before);
-        shell.state_live();
         if rank != 0 {
             shell.programs.set_shadow(true);
         }
@@ -1812,16 +1811,17 @@ fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
 /// owner under its class, over what the device has for this process (all of
 /// it but what others held before the load began).
 impl Shell {
-    /// States what the runtime reads of this shell ([`engine::live::Live`]):
-    /// what the fit holds back of the chunks it stated, and the ledger's
-    /// outside class.
-    pub(super) fn state_live(&self) {
-        self.live.set_held(self.pools.kept_back_bytes());
-        // What the driver holds outside the engine's span, as the ledger
-        // enters it: read by the policy, taken out of no range.
+    /// Two load facts of this shell
+    /// ([`engine::chunk::ChunkFacts::held_bytes`] and `outside_bytes`):
+    /// what the fit holds back of the chunks it stated, and what the driver
+    /// holds outside the engine's span, as the ledger enters it (read by
+    /// the policy, taken out of no range).
+    pub(super) fn held_and_outside(&self) -> (u64, u64) {
         let ledger = ledger(self, self.card.0, self.card.1);
-        self.live
-            .set_outside(ledger.bytes(engine::memory::Class::Outside));
+        (
+            self.pools.kept_back_bytes(),
+            ledger.bytes(engine::memory::Class::Outside),
+        )
     }
 }
 

@@ -141,8 +141,12 @@ pub use engine_cuda::{DeviceBoot, Diagnostics, Knobs, World, ordinal_of};
 struct EngineRegistration {
     spec: EngineSpec,
     backend: Option<EngineBox>,
-    /// What the engine learns of itself while it serves, held from load on.
+    /// What the engine counts while it serves, held from load on.
     live: ::engine::live::Live,
+    /// The rungs it stated eager at load
+    /// ([`::engine::chunk::ChunkFacts::eager_rungs`]): read by the model
+    /// status, and by nothing that cuts a pass.
+    eager_rungs: Vec<u32>,
 }
 
 fn registry() -> &'static Mutex<Vec<Option<EngineRegistration>>> {
@@ -150,7 +154,11 @@ fn registry() -> &'static Mutex<Vec<Option<EngineRegistration>>> {
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-pub fn register_engine_backend(mut spec: EngineSpec, backend: EngineBox) -> usize {
+pub fn register_engine_backend(
+    mut spec: EngineSpec,
+    backend: EngineBox,
+    eager_rungs: Vec<u32>,
+) -> usize {
     let mut engines = registry().lock().unwrap();
     let id = engines.len();
     spec.device_domain = backend
@@ -161,12 +169,26 @@ pub fn register_engine_backend(mut spec: EngineSpec, backend: EngineBox) -> usiz
         spec,
         backend: Some(backend),
         live,
+        eager_rungs,
     }));
     id
 }
 
-/// What each registered engine learns of itself while it serves, in
-/// engine order: every engine serves the one model the worker loads.
+/// The rungs each registered engine stated eager at load, in engine order:
+/// a fire there runs uncaptured, as stated.
+#[must_use]
+pub fn eager_rungs() -> Vec<Vec<u32>> {
+    registry()
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .map(|r| r.eager_rungs.clone())
+        .collect()
+}
+
+/// What each registered engine counts while it serves, in engine order:
+/// every engine serves the one model the worker loads.
 #[must_use]
 pub fn lives() -> Vec<::engine::live::Live> {
     registry()
@@ -176,19 +198,6 @@ pub fn lives() -> Vec<::engine::live::Live> {
         .flatten()
         .map(|r| r.live.clone())
         .collect()
-}
-
-/// What engine `engine_id` learns of itself while it serves
-/// ([`::engine::Engine::live`]); nothing measured for an engine not
-/// registered.
-#[must_use]
-pub fn live(engine_id: usize) -> ::engine::live::Live {
-    registry()
-        .lock()
-        .unwrap()
-        .get(engine_id)
-        .and_then(|d| d.as_ref().map(|r| r.live.clone()))
-        .unwrap_or_default()
 }
 
 pub fn get_spec(engine_id: usize) -> Result<EngineSpec> {

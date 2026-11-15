@@ -160,8 +160,8 @@ pub struct Shell {
     /// The device's bytes and those in use before this load began: what
     /// the load's ledger is read against.
     card: (u64, u64),
-    /// What the runtime reads of this shell while it serves: the rungs
-    /// armed.
+    /// What the runtime reads of this shell while it serves: the fires it
+    /// counts.
     live: engine::live::Live,
     /// The lattice waits for the starting weight residency: the load
     /// streams its weights, and bodies armed over the host copy would read

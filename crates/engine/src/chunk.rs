@@ -67,6 +67,31 @@ pub struct ChunkFacts {
     /// Empty where activation lives in a buffer of its own.
     #[serde(default)]
     pub act_chunks: Vec<(u32, u32)>,
+    /// The rungs of [`ChunkFacts::act_chunks`] the engine states eager, by
+    /// their tokens, ascending; every other rung stated is armed, its
+    /// bodies captured before the load returned. Fixed at load: nothing
+    /// arms and no rung turns eager once the engine is ready. An engine
+    /// that cannot arm a rung within its allowance states it eager — the
+    /// rung still fires, uncaptured ([`crate::live::Tally::Eager`] counts
+    /// each such fire, which is no bug); a rung is left unstated only when
+    /// it cannot be seated at all. Empty, the default: every rung armed.
+    /// The runtime reads it for the model status only; it changes no cut.
+    #[serde(default)]
+    pub eager_rungs: Vec<u32>,
+    /// Bytes of the chunks stated here that the engine holds back for its
+    /// fires and bodies: the runtime's pool takes no more than the range
+    /// less this. Fixed at load, as the rungs are; the runtime seeds the
+    /// pool's hold-back from it once. Zero, the default: the pool may take
+    /// every chunk stated.
+    #[serde(default)]
+    pub held_bytes: u64,
+    /// Bytes the driver holds on the device beside the engine's span when
+    /// the load returns (graph bodies instantiated, modules, library
+    /// workspaces): read by the policy's ledger, taken out of no range.
+    /// Fixed at load: every capture has ended by then. Zero, the default:
+    /// nothing measured.
+    #[serde(default)]
+    pub outside_bytes: u64,
     /// The span under the largest rung's activation is backed on demand,
     /// not from the load: the engine backs its own activation carve before
     /// a fire, and the runtime backs a span segment
@@ -479,6 +504,9 @@ impl ChunkFacts {
             }],
             shapes,
             act_chunks: Vec::new(),
+            eager_rungs: Vec::new(),
+            held_bytes: 0,
+            outside_bytes: 0,
             span_backed_on_demand: false,
             host_chunks: host,
             disk_chunks,
@@ -490,7 +518,8 @@ impl ChunkFacts {
 
     /// Checks the facts hang together: chunk 0 null, reserved and pinned
     /// runs inside the pool and apart, shapes distinct and fitting a chunk,
-    /// every slot ref a `u32`, rungs ascending, segments that cover the
+    /// every slot ref a `u32`, rungs ascending, every eager rung a rung
+    /// stated, no more held back than the pool, segments that cover the
     /// pool.
     pub fn validate(&self) -> Result<()> {
         let invalid = |what: String| Err(Error::Invalid(format!("chunk facts: {what}")));
@@ -626,6 +655,22 @@ impl ChunkFacts {
             .any(|pair| pair[0].0 >= pair[1].0 || pair[0].1 > pair[1].1)
         {
             return invalid("activation rungs are not ascending".into());
+        }
+        if self.eager_rungs.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return invalid("eager rungs are not ascending".into());
+        }
+        if let Some(rung) = self
+            .eager_rungs
+            .iter()
+            .find(|rung| !self.act_chunks.iter().any(|(tokens, _)| tokens == *rung))
+        {
+            return invalid(format!("eager rung {rung} is not a rung stated"));
+        }
+        if self.held_bytes > total.saturating_mul(self.chunk_bytes) {
+            return invalid(format!(
+                "{} bytes held back are past the pool's {total} chunks",
+                self.held_bytes
+            ));
         }
         if u64::from(self.reserved_chunks()) + u64::from(self.act_chunks_max()) > total {
             return invalid("reserved and activation chunks pass the pool".into());
@@ -839,5 +884,56 @@ mod role_tests {
         assert!(SlotRole::RsBuffer.replayable());
         assert!(!SlotRole::Instance.replayable());
         assert!(!SlotRole::Channel.replayable());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChunkFacts, DegenerateBytes};
+    use crate::caps::PoolFacts;
+
+    fn facts() -> ChunkFacts {
+        let pools = PoolFacts {
+            kv_pages: 8,
+            kv_page_size: 16,
+            ..PoolFacts::default()
+        };
+        let bytes = DegenerateBytes {
+            kv_page: 4096,
+            buffer_page: 0,
+        };
+        let mut facts = ChunkFacts::degenerate(&pools, &bytes);
+        facts.total_chunks += 2;
+        facts.segment_chunks += 2;
+        facts.act_chunks = vec![(64, 1), (256, 2)];
+        facts
+    }
+
+    #[test]
+    fn an_eager_rung_is_a_rung_stated() {
+        let mut facts = facts();
+        assert!(facts.validate().is_ok(), "{:?}", facts.validate());
+        assert!(facts.eager_rungs.is_empty(), "unsaid, every rung is armed");
+        facts.eager_rungs = vec![256];
+        assert!(facts.validate().is_ok(), "{:?}", facts.validate());
+        facts.eager_rungs = vec![64, 256];
+        assert!(facts.validate().is_ok(), "{:?}", facts.validate());
+        facts.eager_rungs = vec![128];
+        let why = facts.validate().unwrap_err().to_string();
+        assert!(why.contains("eager rung 128 is not a rung stated"), "{why}");
+        facts.eager_rungs = vec![256, 64];
+        let why = facts.validate().unwrap_err().to_string();
+        assert!(why.contains("eager rungs are not ascending"), "{why}");
+    }
+
+    #[test]
+    fn no_more_is_held_back_than_the_pool() {
+        let mut facts = facts();
+        let pool = u64::from(facts.total_chunks) * facts.chunk_bytes;
+        facts.held_bytes = pool;
+        assert!(facts.validate().is_ok(), "{:?}", facts.validate());
+        facts.held_bytes = pool + 1;
+        let why = facts.validate().unwrap_err().to_string();
+        assert!(why.contains("held back are past the pool"), "{why}");
     }
 }

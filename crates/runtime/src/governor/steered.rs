@@ -61,20 +61,6 @@ impl EnginePool {
     pub const fn locus(&self) -> (usize, usize) {
         (self.model, self.engine)
     }
-
-    /// Keeps the shared pool's state chunks out of what the engine holds
-    /// back now ([`crate::store::shared::SharedPool::hold_back`]).
-    /// Room it opens wakes the planner's waiters: no slot is let go for
-    /// it, so nothing else would.
-    pub fn hold_back(&self) {
-        if let Some(shared) = &self.shared {
-            let held = crate::engine::live(self.engine).held();
-            let rose = shared.shared().lock().unwrap().hold_back(held);
-            if rose && let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
-                planner.pages_freed();
-            }
-        }
-    }
 }
 
 impl SlotAccess for EnginePool {
@@ -126,17 +112,18 @@ impl PoolTarget for EnginePool {
         self.target().map_or(0, PoolTarget::floor)
     }
 
-    /// What the pool may map while the engine holds part of its range back
-    /// for fires and bodies ([`::engine::live::Live::held`], the span
-    /// directly under the activation): the prefix segments wholly under it
-    /// and the top span ([`crate::store::shared::SharedPool::bound_bytes`]),
-    /// the segments the walker commits ([`crate::store::slots::SlotPool::backs`]);
-    /// never under the floor. The range stated at load already leaves out
-    /// what the driver holds (`outside`, a ledger term the policy reads).
+    /// What the pool may map where the engine holds part of its range back
+    /// for fires and bodies ([`::engine::chunk::ChunkFacts::held_bytes`],
+    /// the span directly under the activation): the prefix segments wholly
+    /// under it and the top span
+    /// ([`crate::store::shared::SharedPool::bound_bytes`]), the segments the
+    /// walker commits ([`crate::store::slots::SlotPool::backs`]); never
+    /// under the floor. Fixed from the load on, as what is held back is. The
+    /// range stated at load already leaves out what the driver holds
+    /// (`outside`, a ledger term the policy reads).
     fn hard_limit(&self) -> u64 {
         self.shared.as_ref().map_or(0, |shared| {
-            let held = crate::engine::live(self.engine).held();
-            let bound = shared.shared().lock().unwrap().bound_bytes(held);
+            let bound = shared.shared().lock().unwrap().bound_bytes();
             bound.max(shared.floor())
         })
     }

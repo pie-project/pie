@@ -1063,7 +1063,7 @@ fn a_segment_straddling_the_ceiling_is_never_mapped() {
         grows += 1;
         assert!(grows < 16, "the walk keeps committing");
     }
-    let bound = pool.bound_bytes(u64::from(held) * CHUNK);
+    let bound = pool.bound_bytes();
     assert!(
         pool.held() <= bound,
         "mapped {} past what the engine binds {bound}",
