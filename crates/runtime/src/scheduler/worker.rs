@@ -538,47 +538,64 @@ impl BatchWant {
         }
     }
 
+    /// Asks the rows one fire of `fires` (the queued and in-flight
+    /// launches) takes, no more than a step carries.
+    fn ask_for<'a>(
+        &mut self,
+        engine: usize,
+        count: &mut RowCount,
+        fires: impl IntoIterator<Item = &'a crate::engine::FireRequest>,
+        max_forward_tokens: usize,
+    ) {
+        self.ask(engine, count.count(fires).min(max_forward_tokens));
+    }
+
     fn release(&mut self) {
         self.0 = None;
     }
 }
 
-/// The distinct lanes a set of launches carries: the rows a fire of them
-/// takes. A lane rides its seat in every launch it is queued or in flight
-/// in, so a lane's pipelined launches count once; a seatless lane counts
-/// in the launch that carries the most of them.
+/// The rows one fire of a set of launches takes: each lane's rows (a
+/// prompt's tokens, a verify's drafted rows, one a decode), summed over the
+/// lanes. A lane rides its seat in every launch it is queued or in flight
+/// in, and a fire carries one of them, so a lane counts the widest of its
+/// pipelined launches once; a seatless lane counts in the launch whose
+/// seatless lanes take the most rows. The rows a launch carries past its
+/// own ([`crate::engine::FireRequest::rung_rows`]) count as the widest such
+/// launch's.
 #[derive(Default)]
-struct LaneCount {
-    seats: Vec<u64>,
+struct RowCount {
+    seats: Vec<u32>,
 }
 
-impl LaneCount {
+impl RowCount {
     fn count<'a>(
         &mut self,
         fires: impl IntoIterator<Item = &'a crate::engine::FireRequest>,
     ) -> usize {
         self.seats.fill(0);
-        let mut seated = 0usize;
         let mut seatless = 0usize;
+        let mut carried = 0usize;
         for fire in fires {
             let mut here = 0usize;
             for lane in &fire.lanes {
+                let rows = lane.tokens.len().max(1);
                 if lane.kv_less {
-                    here += 1;
+                    here += rows;
                     continue;
                 }
-                let (word, bit) = ((lane.slot / 64) as usize, lane.slot % 64);
-                if word >= self.seats.len() {
-                    self.seats.resize(word + 1, 0);
+                let seat = lane.slot as usize;
+                if seat >= self.seats.len() {
+                    self.seats.resize(seat + 1, 0);
                 }
-                if self.seats[word] & (1 << bit) == 0 {
-                    self.seats[word] |= 1 << bit;
-                    seated += 1;
-                }
+                let rows32 = u32::try_from(rows).unwrap_or(u32::MAX);
+                self.seats[seat] = self.seats[seat].max(rows32);
             }
             seatless = seatless.max(here);
+            carried = carried.max(fire.rung_rows().saturating_sub(fire.tokens()));
         }
-        seated + seatless
+        let seated: usize = self.seats.iter().map(|&rows| rows as usize).sum();
+        seated + seatless + carried
     }
 }
 
@@ -1223,7 +1240,7 @@ impl BatchScheduler {
         let mut terminated_processes: HashSet<ProcessId> = HashSet::new();
         let mut in_flight_launches = VecDeque::new();
         let mut batch_want = BatchWant::default();
-        let mut lane_count = LaneCount::default();
+        let mut row_count = RowCount::default();
         let mut in_flight_control = InFlightControls::default();
         let mut stopping = false;
         let mut frame_policy = FramePolicy::new(
@@ -1276,10 +1293,11 @@ impl BatchScheduler {
             progress |= Self::retire_ready_control(&mut in_flight_control);
             // A step's tokens stay within the pool's activation rung (SPEC
             // decision 6): smaller while the system is critical.
-            // What is queued and in flight asks the rung of its lanes, a
-            // decode batch's lane count (REDESIGN 2.5): it is never cut to a
-            // narrower rung for want of asking. A prompt's rows ask through
-            // its pass ([`crate::store::shared::want_rows`]), not here.
+            // What is queued and in flight asks the rung of the rows one
+            // fire of it takes (REDESIGN 2.5): a decode batch's lane count,
+            // a prompt wave's tokens summed over its lanes, so a frame is
+            // never cut to a narrower rung for want of asking. A pass asks
+            // for its own rows besides ([`crate::store::shared::want_rows`]).
             let queued = pending.items.iter().filter_map(|item| match item {
                 QueuedItem::Launch(launch) => Some(&launch.request.request),
                 _ => None,
@@ -1288,8 +1306,12 @@ impl BatchScheduler {
                 .iter()
                 .flat_map(|batch: &PendingLaunchBatch| batch.requests.iter())
                 .map(|request| &request.request);
-            let lanes = lane_count.count(queued.chain(flying));
-            batch_want.ask(engine_id, lanes.min(limits.max_forward_tokens));
+            batch_want.ask_for(
+                engine_id,
+                &mut row_count,
+                queued.chain(flying),
+                limits.max_forward_tokens,
+            );
             let cap = crate::store::shared::fire_cap(engine_id);
             let mut stepped = limits;
             stepped.max_forward_tokens = stepped.max_forward_tokens.min(cap as usize).max(1);
@@ -2921,21 +2943,26 @@ mod tests {
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
     }
 
-    /// A batch asks the rows its fire carries: a lane queued in several
-    /// pipelined launches, and in flight in another, counts once.
-    #[test]
-    fn a_lane_s_pipelined_launches_ask_its_one_row() {
-        let fire = |seats: std::ops::Range<u32>| crate::engine::FireRequest {
+    fn fire_of(seats: std::ops::Range<u32>, rows: usize) -> crate::engine::FireRequest {
+        crate::engine::FireRequest {
             lanes: seats
                 .map(|slot| ::engine::Lane {
                     slot,
+                    tokens: vec![7; rows],
                     ..Default::default()
                 })
                 .collect(),
             ..Default::default()
-        };
+        }
+    }
+
+    /// A batch asks the rows its fire carries: a lane queued in several
+    /// pipelined launches, and in flight in another, counts once.
+    #[test]
+    fn a_lane_s_pipelined_launches_ask_its_one_row() {
+        let fire = |seats: std::ops::Range<u32>| fire_of(seats, 1);
         let launches: Vec<_> = (0..16).map(|_| fire(0..64)).collect();
-        let mut count = LaneCount::default();
+        let mut count = RowCount::default();
         assert_eq!(count.count(&launches), 64);
         // Two batches of 32 lanes each, each pipelined: 64 rows.
         let halves: Vec<_> = (0..8).flat_map(|_| [fire(0..32), fire(32..64)]).collect();
@@ -2948,6 +2975,61 @@ mod tests {
             lane.kv_less = true;
         }
         assert_eq!(count.count(&[seatless.clone(), seatless, fire(0..8)]), 12);
+        // A decode whose token the device resolves carries none and still
+        // takes its row.
+        let mut resolved = fire(0..4);
+        for lane in &mut resolved.lanes {
+            lane.tokens.clear();
+        }
+        assert_eq!(count.count(&[resolved]), 4);
+    }
+
+    /// A wave of prompts asks the rung for the rows one fire of it takes,
+    /// its tokens summed over its lanes, not its lane count: 40 prompts of
+    /// 125 rows ask 5000, no more than a step carries.
+    #[test]
+    fn a_prompt_wave_asks_the_rows_of_its_lanes_not_their_count() {
+        const ENGINE: usize = 9202;
+        let wave: Vec<_> = (0..40).map(|seat| fire_of(seat..seat + 1, 125)).collect();
+        let mut count = RowCount::default();
+        assert_eq!(count.count(&wave), 5000);
+        for max_forward_tokens in [1024, 8192] {
+            let mut want = BatchWant::default();
+            want.ask_for(ENGINE, &mut count, &wave, max_forward_tokens);
+            assert_eq!(
+                crate::store::shared::wanted_rows(ENGINE) as usize,
+                5000usize.min(max_forward_tokens),
+            );
+            // Nothing queued or in flight, the scheduler sleeps: the ask goes.
+            want.release();
+            assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
+        }
+        // A lane's prompt and the decodes pipelined behind it take the
+        // prompt's rows in a fire, once; a verify its drafted rows.
+        let lane = [fire_of(0..1, 125), fire_of(0..1, 1), fire_of(0..1, 1)];
+        assert_eq!(count.count(&lane), 125);
+        let verify = [fire_of(0..8, 4), fire_of(0..8, 1)];
+        assert_eq!(count.count(&verify), 32);
+        // Rows a launch carries past its own count as the widest such.
+        let mut carrying = fire_of(0..2, 1);
+        carrying.carried = 40;
+        assert_eq!(count.count(&[carrying, fire_of(2..6, 1)]), 6 + 38);
+    }
+
+    /// Decode-only lanes still ask their lane count.
+    #[test]
+    fn a_decode_batch_asks_its_lane_count() {
+        const ENGINE: usize = 9203;
+        let decodes: Vec<_> = (0..4).map(|_| fire_of(0..48, 1)).collect();
+        let mut count = RowCount::default();
+        let mut want = BatchWant::default();
+        want.ask_for(ENGINE, &mut count, &decodes, 1024);
+        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 48);
+        // An empty queue asks nothing new; the scheduler's sleep releases.
+        want.ask_for(ENGINE, &mut count, &[], 1024);
+        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 48);
+        want.release();
+        assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
     }
 
     #[test]
