@@ -14,6 +14,14 @@
 //! those values from its own inputs ([`apply`]) writes the array as the capture does, a step at
 //! a time. `host.json` names the reading's classes (their request words and rows), the entries
 //! and the values the host reads back, so a runner needs nothing else of the compile.
+//!
+//! The static arrays (M1g): every other array a value fills (a weight tile, a region's shared
+//! resident) is stated as [`Span`]s over the trace's values (`statics/<k>.npy`): runs of a value's
+//! elements, cast to the array's words. An engine computes those values from the checkpoint's
+//! weights ([`apply_spans`]) and writes the arrays itself, so a program compiled with no capture
+//! (`gold` none) runs on any checkpoint: its h2d files are then only the arrays no value fills
+//! (the regions' tables, the PEs' config words). Given a capture, each array's spans are held to
+//! its file at compile time, word for word.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -131,8 +139,66 @@ fn trace_row(p: &Program, unit: usize, t: u32) -> usize {
     }
 }
 
+/// A tile's cells: its rows (the weight's input columns), its columns (the weight's output
+/// rows), the weight's width and the weight.
+fn tile_cells(
+    p: &Program,
+    unit: usize,
+    step: usize,
+    col: u32,
+    row: u32,
+) -> R<(Vec<usize>, Vec<usize>, usize, ValueId)> {
+    let b = &p.units[unit];
+    let l = &b.layout;
+    let Step::Matvec {
+        from,
+        input,
+        weight,
+        output,
+        k,
+        n,
+        ..
+    } = &b.unit.steps[step]
+    else {
+        return Err("a tile of no matvec".into());
+    };
+    let (rows, cols): (Vec<usize>, Vec<usize>) = match from {
+        Side::Row => {
+            let a = k / l.py;
+            let outs = l.parts(
+                col,
+                Cols {
+                    base: *output,
+                    from: 0,
+                    width: *n,
+                },
+            );
+            (
+                (row * a..(row + 1) * a).map(|x| x as usize).collect(),
+                outs.iter()
+                    .flat_map(|(_, s)| (s.from..s.from + s.len).map(|x| x as usize))
+                    .collect(),
+            )
+        }
+        Side::Col => {
+            let b2 = n / l.py;
+            let ins = l.parts(col, *input);
+            (
+                ins.iter()
+                    .flat_map(|(_, s)| {
+                        (s.from - input.from..s.from - input.from + s.len).map(|x| x as usize)
+                    })
+                    .collect(),
+                (row * b2..(row + 1) * b2).map(|x| x as usize).collect(),
+            )
+        }
+    };
+    Ok((rows, cols, *k as usize, *weight))
+}
+
 /// One array's words (f32, or 16-bit words in u32).
-fn fill(p: &Program, vals: &Values, a: &HostArray) -> R<Vec<f32>> {
+fn fill(p: &Program, vals: Option<&Values>, a: &HostArray) -> R<Vec<f32>> {
+    let held = || vals.ok_or_else(|| format!("`{}`: a value's array, and no capture", a.sym));
     let mut out = vec![0f32; a.len as usize];
     let ieee = !p.round16;
     match &a.fill {
@@ -142,54 +208,8 @@ fn fill(p: &Program, vals: &Values, a: &HostArray) -> R<Vec<f32>> {
             col,
             row,
         } => {
-            let b = &p.units[*unit];
-            let l = &b.layout;
-            let Step::Matvec {
-                from,
-                input,
-                weight,
-                output,
-                k,
-                n,
-                ..
-            } = &b.unit.steps[*step]
-            else {
-                return Err("a tile of no matvec".into());
-            };
-            let (_, w) = vals.get(*weight)?;
-            let kk = *k as usize;
-            let (rows, cols): (Vec<usize>, Vec<usize>) = match from {
-                Side::Row => {
-                    let a = k / l.py;
-                    let outs = l.parts(
-                        *col,
-                        Cols {
-                            base: *output,
-                            from: 0,
-                            width: *n,
-                        },
-                    );
-                    (
-                        (row * a..(row + 1) * a).map(|x| x as usize).collect(),
-                        outs.iter()
-                            .flat_map(|(_, s)| (s.from..s.from + s.len).map(|x| x as usize))
-                            .collect(),
-                    )
-                }
-                Side::Col => {
-                    let b2 = n / l.py;
-                    let ins = l.parts(*col, *input);
-                    (
-                        ins.iter()
-                            .flat_map(|(_, s)| {
-                                (s.from - input.from..s.from - input.from + s.len)
-                                    .map(|x| x as usize)
-                            })
-                            .collect(),
-                        (row * b2..(row + 1) * b2).map(|x| x as usize).collect(),
-                    )
-                }
-            };
+            let (rows, cols, kk, weight) = tile_cells(p, *unit, *step, *col, *row)?;
+            let (_, w) = held()?.get(weight)?;
             // tile[r][c] = W[out c, in r]
             for (ri, &xr) in rows.iter().enumerate() {
                 for (ci, &oc) in cols.iter().enumerate() {
@@ -214,6 +234,7 @@ fn fill(p: &Program, vals: &Values, a: &HostArray) -> R<Vec<f32>> {
         | Fill::RowScalars { .. }
         | Fill::HostIn { .. } => {
             let g = gather(p, a)?.ok_or("an array of no gather")?;
+            let vals = held()?;
             out = apply(&g, &|v| {
                 let (s, d) = vals.get(ValueId(v))?;
                 let w = *s.last().unwrap_or(&1);
@@ -244,6 +265,153 @@ pub const FLAT: u32 = 4;
 
 /// A value as [`apply`] reads it: its rows, width and elements.
 pub type Rows = (usize, usize, std::rc::Rc<Vec<f32>>);
+
+/// A run of an array's words: `count` times (the `j`-th from `step · j` elements on), `len`
+/// elements of `value` from (`row`, `col`), `stride` apart along the row ([`FLAT`]: `col`
+/// indexes the value's elements over every row), each cast as `flags` say ([`ONE`], [`CLAMP`],
+/// [`FLAT`], [`HALF`], [`BF16`]); `len · count` zeros where `value` is [`NONE`].
+/// `[value, row, col, len, stride, flags, count, step]`.
+pub type Span = [u32; 8];
+
+/// The word is the element's IEEE f16 bits (a tile of an IEEE build).
+pub const HALF: u32 = 8;
+/// The word is the element's bf16 bits, rounded to nearest even (a tile of a bf16 build).
+pub const BF16: u32 = 16;
+
+/// `s`'s words (each an f32's bits, or a 16-bit word) from the values `get` holds, by value id.
+pub fn apply_spans(s: &[Span], get: &dyn Fn(u32) -> R<Rows>) -> R<Vec<u32>> {
+    let mut held: BTreeMap<u32, Rows> = BTreeMap::new();
+    let mut out = Vec::new();
+    for &[v, row, col, len, stride, flags, count, step] in s {
+        if v == NONE {
+            out.extend(std::iter::repeat_n(0, len as usize * count as usize));
+            continue;
+        }
+        let (rows, width, d) = match held.entry(v) {
+            std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::btree_map::Entry::Vacant(e) => e.insert(get(v)?),
+        };
+        let base = if flags & FLAT != 0 {
+            col as usize
+        } else {
+            let r = if flags & ONE != 0 && *rows == 1 {
+                0
+            } else {
+                row as usize
+            };
+            r * *width + col as usize
+        };
+        for i in (0..count as usize).flat_map(|j| (0..len as usize).map(move |i| (j, i))) {
+            let mut at = base + i.0 * step as usize + i.1 * stride as usize;
+            if flags & FLAT != 0 {
+                at %= d.len().max(1);
+            }
+            let mut x = *d
+                .get(at)
+                .ok_or_else(|| format!("value %{v}: element {at} of {}", d.len()))?;
+            if flags & CLAMP != 0 {
+                x = x.clamp(-65504.0, 65504.0);
+            }
+            out.push(if flags & HALF != 0 {
+                u32::from(half_bits(x))
+            } else if flags & BF16 != 0 {
+                bits16(x, false)
+            } else {
+                x.to_bits()
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// `g` as spans: each run of words of one value, row and flags at consecutive columns one.
+fn spans_of(g: &[Word]) -> Vec<Span> {
+    let mut out: Vec<Span> = Vec::new();
+    for &[v, row, col, flags] in g {
+        if let Some(last) = out.last_mut() {
+            let [lv, lr, lc, ln, _, lf, _, _] = *last;
+            if lv == v && v == NONE {
+                last[3] += 1;
+                continue;
+            }
+            if lv == v && lr == row && lf == flags && lc + ln == col {
+                last[3] += 1;
+                continue;
+            }
+        }
+        out.push(if v == NONE {
+            [NONE, 0, 0, 1, 0, 0, 1, 0]
+        } else {
+            [v, row, col, 1, 1, flags, 1, 0]
+        });
+    }
+    out
+}
+
+/// The words of `a` as runs of values' elements, for an array a value fills (a weight tile, a
+/// resident, a row's scalars, a root's host rows); `None` for the rest (a region's table, a PE's
+/// config words: the program's own).
+pub fn spans(p: &Program, a: &HostArray) -> R<Option<Vec<Span>>> {
+    if let Some(g) = gather(p, a)? {
+        return Ok(Some(spans_of(&g)));
+    }
+    let Fill::Tile {
+        unit,
+        step,
+        col,
+        row,
+    } = &a.fill
+    else {
+        return Ok(None);
+    };
+    let (rows, cols, kk, weight) = tile_cells(p, *unit, *step, *col, *row)?;
+    let cast = if p.round16 { BF16 } else { HALF };
+    // word 0 is none; then tile[r][c] = W[out c, in r]: each row of the tile a run a stretch
+    // of consecutive output columns, the rows one span where they are consecutive inputs and
+    // the row is one stretch
+    let mut stretches: Vec<(usize, usize)> = Vec::new();
+    for &c in &cols {
+        match stretches.last_mut() {
+            Some((from, n)) if *from + *n == c => *n += 1,
+            _ => stretches.push((c, 1)),
+        }
+    }
+    let flags = FLAT | cast;
+    let mut s: Vec<Span> = vec![[NONE, 0, 0, 1, 0, 0, 1, 0]];
+    let consecutive = rows.windows(2).all(|r| r[1] == r[0] + 1);
+    if let ([(c, n)], true, Some(&r0)) = (&stretches[..], consecutive, rows.first()) {
+        s.push([
+            weight.0,
+            0,
+            (c * kk + r0) as u32,
+            *n as u32,
+            kk as u32,
+            flags,
+            rows.len() as u32,
+            1,
+        ]);
+    } else {
+        for &xr in &rows {
+            for &(c, n) in &stretches {
+                s.push([
+                    weight.0,
+                    0,
+                    (c * kk + xr) as u32,
+                    n as u32,
+                    kk as u32,
+                    flags,
+                    1,
+                    0,
+                ]);
+            }
+        }
+    }
+    let used = 1 + rows.len() * cols.len();
+    if used < a.len as usize {
+        s.push([NONE, 0, 0, (a.len as usize - used) as u32, 0, 0, 1, 0]);
+    }
+    Ok(Some(s))
+}
 
 /// `g`'s words from the values `get` holds, by value id.
 pub fn apply(g: &[Word], get: &dyn Fn(u32) -> R<Rows>) -> R<Vec<f32>> {
@@ -430,40 +598,35 @@ fn rects(arrays: &[&HostArray]) -> Vec<(u32, u32, u32, u32, Vec<usize>)> {
     out
 }
 
-/// Writes the host's files for `p`'s `arrays` into `out` from the step's values in `gold`:
-/// `h2d/<k>.npy` and `host.json`.
-pub fn write(p: &Program, arrays: &[HostArray], gold: &Path, out: &Path) -> R<()> {
-    let vals = Values::open(gold)?;
-    std::fs::create_dir_all(out.join("h2d")).map_err(|e| e.to_string())?;
+/// Writes the host's files for `p`'s `arrays` into `out`: `host.json`, each array's spans over
+/// the trace's values (`statics/<k>.npy`) or its entry's gather (`entries/<k>.npy`), and the
+/// words of `h2d/<k>.npy`: every array's from the step's values in `gold`, else only those no
+/// value fills (the program's tables and config words). Given `gold`, each array's spans are
+/// held to its words.
+pub fn write(p: &Program, arrays: &[HostArray], gold: Option<&Path>, out: &Path) -> R<()> {
+    let vals = gold.map(Values::open).transpose()?;
+    for d in ["h2d", "entries", "statics"] {
+        std::fs::create_dir_all(out.join(d)).map_err(|e| e.to_string())?;
+    }
     let ins: Vec<&HostArray> = arrays
         .iter()
         .filter(|a| !matches!(a.fill, Fill::HostOut { .. } | Fill::Stamps))
         .collect();
-    std::fs::create_dir_all(out.join("entries")).map_err(|e| e.to_string())?;
     let mut memo = BTreeMap::new();
     let mut h2d = Vec::new();
     for (k, (x, y, w, h, members)) in rects(&ins).into_iter().enumerate() {
         let a0 = ins[members[0]];
-        let mut data: Vec<f32> = Vec::with_capacity(members.len() * a0.len as usize);
+        let shape = [h as usize, w as usize, a0.len as usize];
+        let mut item =
+            json!({"sym": a0.sym, "x": x, "y": y, "w": w, "h": h, "len": a0.len, "u16": a0.u16});
+        // the array's words as runs of values' elements, where a value fills every member
+        let mut runs: Option<Vec<Span>> = Some(Vec::new());
         for &m in &members {
-            data.extend(fill(p, &vals, ins[m])?);
+            match (spans(p, ins[m])?, runs.as_mut()) {
+                (Some(s), Some(all)) => all.extend(s),
+                _ => runs = None,
+            }
         }
-        let file = format!("h2d/{k}.npy");
-        if a0.u16 {
-            let words: Vec<u32> = data.iter().map(|x| x.to_bits()).collect();
-            crate::npy::write_u32(
-                &out.join(&file),
-                &[h as usize, w as usize, a0.len as usize],
-                &words,
-            )?;
-        } else {
-            crate::npy::write_f32(
-                &out.join(&file),
-                &[h as usize, w as usize, a0.len as usize],
-                &data,
-            )?;
-        }
-        let mut item = json!({"sym": a0.sym, "x": x, "y": y, "w": w, "h": h, "len": a0.len, "u16": a0.u16, "file": file});
         // an entry: its words gathered from the step's values, a step at a time
         let mut words: Vec<u32> = Vec::new();
         let mut step = false;
@@ -478,7 +641,39 @@ pub fn write(p: &Program, arrays: &[HostArray], gold: &Path, out: &Path) -> R<()
                 None => words.clear(),
             }
         }
-        if step && words.len() == members.len() * a0.len as usize * 4 {
+        let entry = step && words.len() == members.len() * a0.len as usize * 4;
+        let constant = members
+            .iter()
+            .all(|&m| matches!(ins[m].fill, Fill::Table { .. } | Fill::Words(_)));
+        if vals.is_some() || constant {
+            let mut data: Vec<f32> = Vec::with_capacity(members.len() * a0.len as usize);
+            for &m in &members {
+                data.extend(fill(p, vals.as_ref(), ins[m])?);
+            }
+            if let (Some(v), Some(r), false) = (&vals, &runs, constant) {
+                let got = apply_spans(r, &|id| {
+                    let (s, d) = v.get(ValueId(id))?;
+                    let w = *s.last().unwrap_or(&1);
+                    Ok((d.len() / w.max(1), w, d))
+                })?;
+                if got.len() != data.len() || got.iter().zip(&data).any(|(g, d)| *g != d.to_bits())
+                {
+                    return Err(format!(
+                        "`{}` at ({x}, {y}): its spans are not its words",
+                        a0.sym
+                    ));
+                }
+            }
+            let file = format!("h2d/{k}.npy");
+            if a0.u16 {
+                let words: Vec<u32> = data.iter().map(|x| x.to_bits()).collect();
+                crate::npy::write_u32(&out.join(&file), &shape, &words)?;
+            } else {
+                crate::npy::write_f32(&out.join(&file), &shape, &data)?;
+            }
+            item["file"] = json!(file);
+        }
+        if entry {
             let gfile = format!("entries/{k}.npy");
             crate::npy::write_u32(
                 &out.join(&gfile),
@@ -486,6 +681,16 @@ pub fn write(p: &Program, arrays: &[HostArray], gold: &Path, out: &Path) -> R<()
                 &words,
             )?;
             item["entry"] = json!(gfile);
+        } else if let (Some(r), false) = (&runs, constant) {
+            let sfile = format!("statics/{k}.npy");
+            let flat: Vec<u32> = r.iter().flatten().copied().collect();
+            crate::npy::write_u32(&out.join(&sfile), &[r.len(), 8], &flat)?;
+            item["static"] = json!(sfile);
+        } else if !constant && vals.is_none() {
+            return Err(format!(
+                "`{}` at ({x}, {y}): its words follow from no value and no capture",
+                a0.sym
+            ));
         }
         h2d.push(item);
     }
@@ -510,10 +715,13 @@ pub fn write(p: &Program, arrays: &[HostArray], gold: &Path, out: &Path) -> R<()
             }
         }
     }
-    let ref_files: Vec<serde_json::Value> = refs
-        .iter()
-        .map(|&b| json!({"value": b, "file": vals.files.get(&b)}))
-        .collect();
+    let ref_files: Vec<serde_json::Value> = match &vals {
+        Some(v) => refs
+            .iter()
+            .map(|&b| json!({"value": b, "file": v.files.get(&b)}))
+            .collect(),
+        None => Vec::new(),
+    };
     // the values read back, whole: the step's rows of each, its columns the parts read
     let step_rows: u32 = p.class_rows.iter().map(|c| c.0).sum();
     let mut outs: BTreeMap<u32, u32> = BTreeMap::new();
@@ -536,16 +744,19 @@ pub fn write(p: &Program, arrays: &[HostArray], gold: &Path, out: &Path) -> R<()
         .iter()
         .map(|c| json!({"name": c.name, "word": c.word.to_string(), "rows": c.rows}))
         .collect();
-    // (absolute: the runners read it from another directory)
-    let gold = std::fs::canonicalize(gold).unwrap_or_else(|_| gold.to_path_buf());
-    let host = json!({
+    let mut host = json!({
         "model": p.trace.name, "reading": p.shape.reading, "classes": classes, "outs": outs,
         "w": p.stream.w, "h": p.stream.h, "h2d": h2d, "d2h": d2h, "refs": ref_files,
-        "gold": gold.display().to_string(), "round16": p.round16,
+        "round16": p.round16,
         "units": p.units.iter().zip(&p.stream.units).map(|(b, su)| json!({
             "name": b.unit.name, "x": su.x, "cols": su.cols(), "rows": p.stream.py,
         })).collect::<Vec<_>>(),
     });
+    if let Some(gold) = gold {
+        // (absolute: the runners read it from another directory)
+        let gold = std::fs::canonicalize(gold).unwrap_or_else(|_| gold.to_path_buf());
+        host["gold"] = json!(gold.display().to_string());
+    }
     std::fs::write(
         out.join("host.json"),
         serde_json::to_string_pretty(&host).map_err(|e| e.to_string())?,

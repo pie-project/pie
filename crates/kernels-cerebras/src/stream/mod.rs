@@ -247,8 +247,9 @@ pub struct Pins {
 }
 
 /// Compiles `trace`'s stream reading (`o`) into `out`: the program's CSL (`layout.csl`, the
-/// kernels, the printed regions) and, given a step's captured values `gold`, the host's files
-/// (`host.json`, `h2d/`). Returns the program.
+/// kernels, the printed regions) and the host's files (`host.json`, the arrays' spans and
+/// gathers, `h2d/`: every array's words given a step's captured values `gold`, else only the
+/// program's own). Returns the program.
 pub fn compile(
     trace: &Trace,
     o: &Options,
@@ -304,9 +305,7 @@ pub fn compile_pinned(
         serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    if let Some(g) = gold {
-        host::write(&p, &e.arrays, g, out)?;
-    }
+    host::write(&p, &e.arrays, gold, out)?;
     Ok(p)
 }
 
