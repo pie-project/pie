@@ -318,6 +318,10 @@ pub struct GridProgram {
     pub slots: Slots,
     /// Each matvec's tile in a weight PE: (16-bit offset, rows, columns).
     pub tiles: Vec<(u32, u32, u32)>,
+    /// The passes' weight groups, where every pass's tiles do not fit a weight PE at once: each
+    /// a run of passes `(first, count)` whose tiles the host writes before a launch of them
+    /// alone (their offsets the group's own); empty: one launch of every pass.
+    pub groups: Vec<(usize, usize)>,
     pub stream: Stream,
     pub palette: Palette,
     pub fabric: Fabric,
@@ -1381,7 +1385,7 @@ pub fn program_upto(
     round16: bool,
     upto: Option<usize>,
 ) -> R<GridProgram> {
-    build(trace, reading, clip, round16, upto, true)
+    build(trace, reading, clip, round16, upto, true, WEIGHT_WORDS)
 }
 
 /// [`program`] whether or not its tiles and stores fit a weight PE (what the cost model prices
@@ -1392,10 +1396,12 @@ pub fn program_unfit(
     clip: [u32; 3],
     round16: bool,
 ) -> R<GridProgram> {
-    build(trace, reading, clip, round16, None, false)
+    build(trace, reading, clip, round16, None, false, WEIGHT_WORDS)
 }
 
 #[allow(clippy::too_many_lines)]
+/// `budget`: the 16-bit words a weight PE gives its tiles and stores ([`WEIGHT_WORDS`]; less
+/// to put a reading that fits in weight groups all the same).
 fn build(
     trace: &Trace,
     reading: &str,
@@ -1403,6 +1409,7 @@ fn build(
     round16: bool,
     upto: Option<usize>,
     fit: bool,
+    budget: u32,
 ) -> R<GridProgram> {
     let name = &trace.name;
     let classes = poem_compiler::spatial::layer::stream::classes(trace, reading, 0);
@@ -1634,13 +1641,14 @@ fn build(
             hout_words: 0,
         },
         tiles: Vec::new(),
+        groups: Vec::new(),
         stream,
         palette,
         fabric,
         round16,
     };
     print_regions(&mut prog)?;
-    place(&mut prog, fit)?;
+    place(&mut prog, fit, budget)?;
     Ok(prog)
 }
 
@@ -1688,7 +1696,7 @@ fn print_regions(g: &mut GridProgram) -> R<()> {
 }
 
 /// The tiles' and stores' places in a weight PE.
-fn place(g: &mut GridProgram, fit: bool) -> R<()> {
+fn place(g: &mut GridProgram, fit: bool, budget: u32) -> R<()> {
     let p = g.p;
     let mut off = 1u32;
     let mut tiles = Vec::new();
@@ -1759,15 +1767,95 @@ fn place(g: &mut GridProgram, fit: bool) -> R<()> {
         at += words(g, v);
     }
     g.slots.hout_words = at;
-    let used = off + g.slots.store_words + 2 * (g.slots.hin_words + g.slots.hout_words);
-    if fit && used > WEIGHT_WORDS {
+    let mut used = off + g.slots.store_words + 2 * (g.slots.hin_words + g.slots.hout_words);
+    if used > budget {
+        // every pass's tiles at once do not fit: the passes in weight groups, each run of
+        // passes a launch whose tiles the host writes before it (the stores stay)
+        let room = budget
+            .saturating_sub(g.slots.store_words + 2 * (g.slots.hin_words + g.slots.hout_words));
+        if let Some((groups, top)) = weight_groups(g, room) {
+            g.groups = groups;
+            used = top + g.slots.store_words + 2 * (g.slots.hin_words + g.slots.hout_words);
+        }
+    }
+    if fit && used > budget {
         return Err(format!(
-            "{}: a weight PE's tiles and stores are {used} 16-bit words (at most {WEIGHT_WORDS}): \
+            "{}: a weight PE's tiles and stores are {used} 16-bit words (at most {budget}): \
              {} of tiles, {} held, {} + {} the host's",
             g.trace.name, off, g.slots.store_words, g.slots.hin_words, g.slots.hout_words
         ));
     }
     Ok(())
+}
+
+/// The passes cut into runs whose tiles each fit `room` words of a weight PE (an attention's
+/// stores and queries in one run), every matvec's tile placed from its run's first word on:
+/// the runs (`(first, count)`) and the most words a run's tiles take; `None` where a pass's
+/// own tiles do not fit.
+fn weight_groups(g: &mut GridProgram, room: u32) -> Option<(Vec<(usize, usize)>, u32)> {
+    let words = |g: &GridProgram, pi: usize| -> u32 {
+        let pass = &g.passes[pi];
+        pass.head
+            .iter()
+            .chain(&pass.tail)
+            .filter_map(|s| match s {
+                Step::Matvec(m) => Some(g.tiles[*m].1 * g.tiles[*m].2),
+                _ => None,
+            })
+            .sum()
+    };
+    let attends = |g: &GridProgram, pi: usize| {
+        g.passes[pi]
+            .tail
+            .iter()
+            .chain(&g.passes[pi].head)
+            .any(|s| matches!(s, Step::Attend(_)))
+    };
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    let (mut first, mut held) = (0usize, 1u32);
+    for pi in 0..g.passes.len() {
+        let w = words(g, pi);
+        if 1 + w > room {
+            return None;
+        }
+        // a pass that attends stays with the pass before it (its stores)
+        if held + w > room && pi > first && !attends(g, pi) {
+            groups.push((first, pi - first));
+            (first, held) = (pi, 1);
+        }
+        held += w;
+    }
+    groups.push((first, g.passes.len() - first));
+    if groups.iter().any(|&(f, n)| {
+        let mut h = 1;
+        for pi in f..f + n {
+            h += words(g, pi);
+        }
+        h > room
+    }) {
+        return None;
+    }
+    // each run's tiles from its first word, in matvec order
+    let mut top = 1;
+    for &(f, n) in &groups {
+        let mut off = 1;
+        for m in 0..g.mvs.len() {
+            let in_run = (f..f + n).any(|pi| {
+                g.passes[pi]
+                    .head
+                    .iter()
+                    .chain(&g.passes[pi].tail)
+                    .any(|s| *s == Step::Matvec(m))
+            });
+            if in_run {
+                let (_, kc, nc) = g.tiles[m];
+                g.tiles[m].0 = off;
+                off += kc * nc;
+            }
+        }
+        top = top.max(off);
+    }
+    Some((groups, top))
 }
 
 /// The unit (`p` roots a side) and the K / V column of its attention on the fabric.
@@ -1823,7 +1911,21 @@ pub fn compile_upto(
     upto: Option<usize>,
     out: &std::path::Path,
 ) -> R<GridProgram> {
-    let g = program_upto(trace, reading, clip, round16, upto)?;
+    compile_within(trace, reading, clip, round16, upto, WEIGHT_WORDS, out)
+}
+
+/// [`compile_upto`] at `budget` words a weight PE for tiles and stores (below
+/// [`WEIGHT_WORDS`]: a reading that fits in weight groups all the same, as a larger one is).
+pub fn compile_within(
+    trace: &Trace,
+    reading: &str,
+    clip: [u32; 3],
+    round16: bool,
+    upto: Option<usize>,
+    budget: u32,
+    out: &std::path::Path,
+) -> R<GridProgram> {
+    let g = build(trace, reading, clip, round16, upto, true, budget)?;
     let e = crate::emit::grid::emit(&g)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     for (name, text) in &e.files {
@@ -1844,6 +1946,10 @@ pub fn compile_upto(
         "attn": g.attn,
         "clip": g.clip,
     });
+    let mut meta = meta;
+    if !g.groups.is_empty() {
+        meta["groups"] = serde_json::json!(g.groups);
+    }
     std::fs::write(
         out.join("stream.json"),
         serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
@@ -1868,11 +1974,15 @@ fn write_host(g: &GridProgram, e: &crate::emit::grid::Emitted, out: &std::path::
         .iter()
         .filter(|a| !matches!(a.fill, GridFill::Back { .. }))
         .collect();
+    // (a group's arrays a rectangle apart from another group's at the same PEs)
     let proxies: Vec<HostArray> = ins
         .iter()
         .map(|a| HostArray {
             at: a.at,
-            sym: a.sym.clone(),
+            sym: match a.group {
+                Some(k) => format!("{}@{k}", a.sym),
+                None => a.sym.clone(),
+            },
             u16: a.u16,
             len: a.len,
             fill: Fill::Stamps,
@@ -1884,6 +1994,9 @@ fn write_host(g: &GridProgram, e: &crate::emit::grid::Emitted, out: &std::path::
         let a0 = ins[members[0]];
         let mut item =
             json!({"sym": a0.sym, "x": x, "y": y, "w": w, "h": h, "len": a0.len, "u16": a0.u16});
+        if let Some(k) = a0.group {
+            item["group"] = json!(k);
+        }
         let shape = [h as usize, w as usize, a0.len as usize];
         match &a0.fill {
             GridFill::Words(_) => {
@@ -1959,6 +2072,11 @@ fn write_host(g: &GridProgram, e: &crate::emit::grid::Emitted, out: &std::path::
         "round16": g.round16, "causal": false,
         "units": [{"name": g.stream.units[0].name, "x": 0, "cols": g.p, "rows": g.p}],
     });
+    let mut host = host;
+    if !g.groups.is_empty() {
+        // a launch a group, its arrays written before it
+        host["groups"] = json!(g.groups.len());
+    }
     std::fs::write(
         out.join("host.json"),
         serde_json::to_string_pretty(&host).map_err(|e| e.to_string())?,
@@ -2236,6 +2354,54 @@ mod tests {
             .parse("flux2-mini-bf16-kv-bf16")
             .expect("flux2-mini parses")
             .trace(poem_ir::Platform::Cerebras)
+    }
+
+    /// A weight budget below the passes' tiles puts them in weight groups: runs of passes in
+    /// order, each run's tiles from its first word and within the budget beside the stores, the
+    /// attention's queries with its stores; at the whole budget, one launch as before.
+    #[test]
+    fn passes_whose_tiles_do_not_fit_run_in_weight_groups() {
+        let t = trace();
+        let whole = build(&t, "vae.decode", [1, 2, 2], true, None, true, WEIGHT_WORDS).unwrap();
+        assert!(whole.groups.is_empty());
+        let g = build(&t, "vae.decode", [1, 2, 2], true, None, true, 2_000).unwrap();
+        assert!(g.groups.len() > 1, "{:?}", g.groups);
+        let mut next = 0;
+        for &(f, n) in &g.groups {
+            assert_eq!(f, next);
+            next = f + n;
+            let mut top = 1;
+            for m in 0..g.mvs.len() {
+                let mine = (f..f + n).any(|pi| {
+                    let p = &g.passes[pi];
+                    p.head.iter().chain(&p.tail).any(|s| *s == Step::Matvec(m))
+                });
+                if mine {
+                    let (off, kc, nc) = g.tiles[m];
+                    assert_eq!(off, top, "matvec {m}'s tile from its run's word {top}");
+                    top += kc * nc;
+                }
+            }
+            let rest = g.slots.store_words + 2 * (g.slots.hin_words + g.slots.hout_words);
+            assert!(top + rest <= 2_000);
+            let attends = (f..f + n).any(|pi| {
+                g.passes[pi]
+                    .tail
+                    .iter()
+                    .any(|s| matches!(s, Step::Attend(_)))
+            });
+            let stores = (f..f + n).any(|pi| {
+                g.passes[pi]
+                    .tail
+                    .iter()
+                    .any(|s| matches!(s, Step::Store { .. }))
+            });
+            assert_eq!(
+                attends, stores,
+                "a run holds an attention's stores and queries both"
+            );
+        }
+        assert_eq!(next, g.passes.len());
     }
 
     /// The gathers' taps are the reference's: a 3 x 3 convolution over an upsampled grid reads

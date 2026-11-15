@@ -49,6 +49,9 @@ pub struct GridArray {
     pub u16: bool,
     pub len: u32,
     pub fill: GridFill,
+    /// The weight group whose launch it is written before (a group's tiles, its pass range);
+    /// `None`: once a load, or each step's.
+    pub group: Option<usize>,
 }
 
 /// The program's files and arrays.
@@ -687,6 +690,41 @@ fn go_all() void {
 }
 ";
 
+/// [`SWEEP`] of a program in weight groups: a launch runs the passes `grp` names (first,
+/// count), the host having written their tiles; `grp` exported for it.
+fn sweep_of(g: &GridProgram) -> String {
+    if g.groups.is_empty() {
+        return SWEEP.to_string();
+    }
+    let all = "fn go_all() void {\n  var a: u16 = 0; var p: u16 = 0;\n  while (p < NPASS) : (p += 1) { sweep(a); a = prog[a + 22]; }\n}\n";
+    let some = "var grp = @zeros([2]f32);\nvar grp_p: [*]f32 = &grp;\nfn go_all() void {\n  var a: u16 = 0; var p: u16 = 0;\n  const p0 = @as(u16, grp[0]); const pn = @as(u16, grp[1]);\n  while (p < p0) : (p += 1) { a = prog[a + 22]; }\n  p = 0;\n  while (p < pn) : (p += 1) { sweep(a); a = prog[a + 22]; }\n}\n";
+    SWEEP.replace(all, some)
+}
+
+/// A grouped program's pass range at `c`, a group's before its launch (none in one group).
+fn grp_arrays(g: &GridProgram, c: Coord, arrays: &mut Vec<GridArray>) {
+    for (k, &(f, n)) in g.groups.iter().enumerate() {
+        arrays.push(GridArray {
+            at: c,
+            sym: "grp".into(),
+            u16: false,
+            len: 2,
+            // (as f32s: every exported array a root or weight PE takes is a word of one)
+            fill: GridFill::Words(vec![(f as f32).to_bits(), (n as f32).to_bits()]),
+            group: Some(k),
+        });
+    }
+}
+
+/// The export of a grouped program's pass range.
+fn grp_export(g: &GridProgram) -> &'static str {
+    if g.groups.is_empty() {
+        ""
+    } else {
+        "  @export_symbol(grp_p, \"grp\");\n"
+    }
+}
+
 /// A root's ops over `mem` (`M(o, n)`: n words from o), the line buffer and the gather.
 const ROOT_OPS: &str = "fn rnd(o: u16, n: u16) void {
   const d = @set_dsd_length(@increment_dsd_offset(D_mem, @as(i16, o), f32), n);
@@ -1022,7 +1060,7 @@ fn root_file(g: &GridProgram, mods: &Mods, side: Side, k: u32) -> R<(String, Str
         "var h16 = @zeros([{0}]@fp16());\nconst H16 = @get_dsd(mem1d_dsd, .{{ .tensor_access = |i|{{{0}}} -> h16[i] }});",
         kg.h16
     );
-    t.push_str(SWEEP);
+    t.push_str(&sweep_of(g));
     t.push_str(ROOT_OPS);
     t.push_str(&reg_fn(g, mods, &kg.used_mods));
     t.push_str(&root_ops(&kg));
@@ -1033,6 +1071,7 @@ fn root_file(g: &GridProgram, mods: &Mods, side: Side, k: u32) -> R<(String, Str
     body.push_str("  go_all();\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n");
     let _ = write!(t, "task go() void {{\n{body}}}\n");
     t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(mem_p, \"res\");\n");
+    t.push_str(grp_export(g));
     t.push_str("  @initialize_queue(q_ci, .{ .color = @get_color(C_CI) });\n  @initialize_queue(q_x, .{ .color = @get_color(C_X) });\n");
     if kg.kv {
         t.push_str("  @initialize_queue(q_kr, .{ .color = @get_color(C_KR) });\n  @initialize_queue(q_ks, .{ .color = @get_color(C_KS) });\n");
@@ -1107,7 +1146,7 @@ fn weight_file(g: &GridProgram, mods: &Mods) -> R<(String, String, u32)> {
         "var ci: u16 = 0;\nvar rj: u16 = 0;\nvar rrole: u16 = 0;\nvar crole: u16 = 0;\nvar ro = @zeros([{}]u16);",
         nout.max(1)
     );
-    t.push_str(SWEEP);
+    t.push_str(&sweep_of(g));
     t.push_str(WEIGHT_OPS);
     let mut body = String::from(
         "  stamp(0);\n  ci = @as(u16, pcfg[0]);\n  rj = @as(u16, pcfg[1]);\n  rrole = @as(u16, pcfg[2]);\n  crole = @as(u16, pcfg[3]);\n",
@@ -1118,6 +1157,7 @@ fn weight_file(g: &GridProgram, mods: &Mods) -> R<(String, String, u32)> {
     body.push_str("  go_all();\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n");
     let _ = write!(t, "task go() void {{\n{body}}}\n");
     t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @export_symbol(w_p, \"w\");\n  @export_symbol(hin_p, \"hin\");\n  @export_symbol(hout_p, \"hout\");\n");
+    t.push_str(grp_export(g));
     t.push_str("  @initialize_queue(q_xr, .{ .color = @get_color(C_XR) });\n  @initialize_queue(q_xc, .{ .color = @get_color(C_XC) });\n  @initialize_queue(q_cr, .{ .color = @get_color(C_CR) });\n  @initialize_queue(q_rr, .{ .color = @get_color(C_RR) });\n  @initialize_queue(q_cs, .{ .color = @get_color(C_CS) });\n  @initialize_queue(q_rs, .{ .color = @get_color(C_RS) });\n}\n");
     Ok((name, t, wlen))
 }
@@ -1145,12 +1185,16 @@ fn kv_root_file(g: &GridProgram) -> (String, String) {
     t.push_str(&buf("sx", sw));
     t.push_str(&buf("ob", qd));
     let rows = a.rows;
+    let (gate, grp) = kv_gate(g);
+    t.push_str(grp);
     let _ = write!(
         t,
-        "task go() void {{\n  stamp(0);\n  cy.passes = 0;\n  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ @fmovs(D_sx, fab.fin(q_i0, {sw})); @fmovs(fab.fout(q_am, {sw}), D_sx); }} }}\n  \
+        "task go() void {{\n{gate}  stamp(0);\n  cy.passes = 0;\n  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ @fmovs(D_sx, fab.fin(q_i0, {sw})); @fmovs(fab.fout(q_am, {sw}), D_sx); }} }}\n  \
          {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ cy.query_q(D_ob); @fmovs(fab.fout(q_o0, {qd}), D_ob); }} }}\n  stamp(1);\n  tsc[2] = cy.passes;\n  sys_mod.unblock_cmd_stream();\n}}\n"
     );
-    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @initialize_queue(q_i0, .{ .color = @get_color(C_I0) });\n  @initialize_queue(q_o0, .{ .color = @get_color(C_O0) });\n  @initialize_queue(q_ar, .{ .color = @get_color(C_AR) });\n  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n}\n");
+    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n");
+    t.push_str(grp_export(g));
+    t.push_str("  @initialize_queue(q_i0, .{ .color = @get_color(C_I0) });\n  @initialize_queue(q_o0, .{ .color = @get_color(C_O0) });\n  @initialize_queue(q_ar, .{ .color = @get_color(C_AR) });\n  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n}\n");
     ("gkr.csl".into(), t)
 }
 
@@ -1173,13 +1217,40 @@ fn kv_pe_file(g: &GridProgram) -> (String, String) {
         a.width, a.scale
     );
     let rows = a.rows;
+    let (gate, grp) = kv_gate(g);
+    t.push_str(grp);
     let _ = write!(
         t,
-        "task go() void {{\n  stamp(0);\n  att.init(@as(u16, pcfg[0]));\n  red.role = @as(u16, pcfg[1]);\n  \
+        "task go() void {{\n{gate}  stamp(0);\n  att.init(@as(u16, pcfg[0]));\n  red.role = @as(u16, pcfg[1]);\n  \
          {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ att.store_q(t); }} }}\n  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ att.query_q(t); }} }}\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n}}\n"
     );
-    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n  @initialize_queue(q_r, .{ .color = @get_color(C_R) });\n  @initialize_queue(q_s, .{ .color = @get_color(C_S) });\n}\n");
+    t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n");
+    t.push_str(grp_export(g));
+    t.push_str("  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n  @initialize_queue(q_r, .{ .color = @get_color(C_R) });\n  @initialize_queue(q_s, .{ .color = @get_color(C_S) });\n}\n");
     ("gkp.csl".into(), t)
+}
+
+/// A K / V kernel's gate in a grouped program (it runs in the launch of the group holding the
+/// attention's stores alone) and its `grp`; empty in one.
+fn kv_gate(g: &GridProgram) -> (String, &'static str) {
+    let Some(&(f, n)) = g.groups.iter().find(|&&(f, n)| {
+        (f..f + n).any(|pi| {
+            g.passes[pi]
+                .tail
+                .iter()
+                .chain(&g.passes[pi].head)
+                .any(|s| matches!(s, Step::Store { .. }))
+        })
+    }) else {
+        return (String::new(), "");
+    };
+    let _ = n;
+    (
+        format!(
+            "  if (@as(u16, grp[0]) != {f}) {{ stamp(0); stamp(1); sys_mod.unblock_cmd_stream(); return; }}\n"
+        ),
+        "var grp = @zeros([2]f32);\nvar grp_p: [*]f32 = &grp;\n",
+    )
 }
 
 fn filler_file() -> String {
@@ -1316,29 +1387,57 @@ pub fn emit(g: &GridProgram) -> R<Emitted> {
                 u16: false,
                 len: words.len() as u32,
                 fill: GridFill::Words(words),
+                group: None,
             });
-            // the tiles
-            let mut sp: Vec<Span> = vec![zeros(1)];
-            for (m, (off, kc, nc)) in g.tiles.iter().enumerate() {
+            // the tiles (in a grouped program, each group's its own, written before its launch)
+            let runs: Vec<(Option<usize>, (usize, usize))> = if g.groups.is_empty() {
+                vec![(None, (0, g.passes.len()))]
+            } else {
+                g.groups
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(k, r)| (Some(k), r))
+                    .collect()
+            };
+            for (group, (f, n)) in runs {
+                let in_run = |m: usize| {
+                    group.is_none()
+                        || (f..f + n).any(|pi| {
+                            g.passes[pi]
+                                .head
+                                .iter()
+                                .chain(&g.passes[pi].tail)
+                                .any(|s| *s == Step::Matvec(m))
+                        })
+                };
+                let mut sp: Vec<Span> = vec![zeros(1)];
+                for (m, (off, kc, nc)) in g.tiles.iter().enumerate() {
+                    if !in_run(m) {
+                        continue;
+                    }
+                    let used: u32 = sp.iter().map(|x| x[3] * x[6]).sum();
+                    if used < *off {
+                        sp.push(zeros(off - used));
+                    }
+                    if kc * nc > 0 {
+                        sp.extend(tile_spans(g, m, i, j));
+                    }
+                }
                 let used: u32 = sp.iter().map(|x| x[3] * x[6]).sum();
-                if used < *off {
-                    sp.push(zeros(off - used));
+                if used < wlen {
+                    sp.push(zeros(wlen - used));
                 }
-                if kc * nc > 0 {
-                    sp.extend(tile_spans(g, m, i, j));
-                }
+                arrays.push(GridArray {
+                    at: c,
+                    sym: "w".into(),
+                    u16: true,
+                    len: wlen,
+                    fill: GridFill::Spans(merged(sp)),
+                    group,
+                });
             }
-            let used: u32 = sp.iter().map(|x| x[3] * x[6]).sum();
-            if used < wlen {
-                sp.push(zeros(wlen - used));
-            }
-            arrays.push(GridArray {
-                at: c,
-                sym: "w".into(),
-                u16: true,
-                len: wlen,
-                fill: GridFill::Spans(merged(sp)),
-            });
+            grp_arrays(g, c, &mut arrays);
             // the host's rows: rows t = i (mod P) of the root's chunk j
             let hin = g.slots.hin_words.max(1);
             let mut ent: Vec<Word> = vec![[NONE, 0, 0, 0]; hin as usize];
@@ -1366,6 +1465,7 @@ pub fn emit(g: &GridProgram) -> R<Emitted> {
                     u16: false,
                     len: hin,
                     fill: GridFill::Entry(ent),
+                    group: None,
                 });
             }
             // the outputs, read back
@@ -1391,6 +1491,7 @@ pub fn emit(g: &GridProgram) -> R<Emitted> {
                         rows: kept,
                         parts: vec![(v.0, chunk_of * g.chunk(v), real)],
                     },
+                    group: None,
                 });
                 if slot != 0 {
                     return Err("two outputs a weight PE: read back one at a time".into());
@@ -1430,6 +1531,7 @@ pub fn emit(g: &GridProgram) -> R<Emitted> {
                 params.push(("C_KR".into(), recv));
             }
             tiles.insert(c, (name, parked(g, c, params)));
+            grp_arrays(g, c, &mut arrays);
             // its residents: each region parameter's chunk, each group norm's gamma and beta
             let mut sp: Vec<(u32, Span)> = Vec::new();
             for (&(ri, pk), &off) in &res.reg {
@@ -1473,6 +1575,7 @@ pub fn emit(g: &GridProgram) -> R<Emitted> {
                 u16: false,
                 len: resw,
                 fill: GridFill::Spans(merged(spans)),
+                group: None,
             });
         }
     }
@@ -1492,6 +1595,7 @@ pub fn emit(g: &GridProgram) -> R<Emitted> {
         };
         let (_, ar, _) = chain_cols(g, root, KV_CHAIN);
         let am = colour_of(g, &format!("AM{}_{}", kc.block, kc.head));
+        grp_arrays(g, root, &mut arrays);
         tiles.insert(
             root,
             (
@@ -1530,7 +1634,9 @@ pub fn emit(g: &GridProgram) -> R<Emitted> {
                 u16: false,
                 len: 2,
                 fill: GridFill::Words(vec![i, role]),
+                group: None,
             });
+            grp_arrays(g, c, &mut arrays);
         }
     }
     files.push(("filler.csl".into(), filler_file()));

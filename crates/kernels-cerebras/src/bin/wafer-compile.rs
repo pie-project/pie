@@ -286,21 +286,29 @@ fn stream(args: &[String]) -> Result<(), String> {
             }
             return Ok(());
         }
-        let g = kernels_cerebras::stream::grid::compile(
+        // `--weight-words N`: a weight PE's words for tiles and stores (fewer: weight groups)
+        let budget = get("--weight-words")
+            .map(|w| w.parse::<u32>().map_err(|e| format!("--weight-words: {e}")))
+            .transpose()?
+            .unwrap_or(kernels_cerebras::stream::grid::WEIGHT_WORDS);
+        let g = kernels_cerebras::stream::grid::compile_within(
             &trace,
             &reading,
             clip,
             !ieee,
+            None,
+            budget,
             std::path::Path::new(&out),
         )?;
         println!(
-            "{model} {reading}: a grid reading on {clip:?}, {} passes over {} x {} roots, {} matvecs, {} x {} PEs",
+            "{model} {reading}: a grid reading on {clip:?}, {} passes over {} x {} roots, {} matvecs, {} x {} PEs, {} weight groups",
             g.passes.len(),
             g.p,
             g.p,
             g.mvs.len(),
             g.stream.w,
-            g.stream.h
+            g.stream.h,
+            g.groups.len().max(1)
         );
         return Ok(());
     }

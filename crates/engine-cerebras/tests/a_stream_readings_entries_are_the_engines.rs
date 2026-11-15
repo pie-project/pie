@@ -12,7 +12,7 @@ use std::path::Path;
 use engine_cerebras::reading::{Denoise, Reading};
 use engine_cpu::Forward;
 use engine_cpu::forward::{Captured, Output, StreamStep, Values};
-use poem_ir::{Operands, Request, Trace};
+use poem_ir::{Request, Trace};
 
 mod common;
 

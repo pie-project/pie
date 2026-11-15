@@ -984,7 +984,7 @@ pub fn lower_run_parts(trace: &Trace, run: &[u32]) -> Option<Vec<Chain>> {
             positions,
             head_dim,
             theta,
-            turn: turn.clone(),
+            turn,
             freqs: freqs.clone(),
             q_out: out,
             k_out: None,

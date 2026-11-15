@@ -184,15 +184,22 @@ fn flux_2_minis_vae_on_the_fabric() {
     let upto = std::env::var("READING_PASSES")
         .ok()
         .and_then(|n| n.parse().ok());
-    let g = grid::compile_upto(&trace, "vae.decode", clip, true, upto, &dir)
+    // `READING_WEIGHT_WORDS`: a weight PE's words for tiles and stores, fewer than it holds (the
+    // decode in weight groups, a launch each, as a reading too large for one is)
+    let budget = std::env::var("READING_WEIGHT_WORDS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(grid::WEIGHT_WORDS);
+    let g = grid::compile_within(&trace, "vae.decode", clip, true, upto, budget, &dir)
         .unwrap_or_else(|e| panic!("{e}"));
     eprintln!(
-        "compiled: {} passes over {} x {} roots, {} x {} PEs ({:.1} s)",
+        "compiled: {} passes over {} x {} roots, {} x {} PEs, weight groups {:?} ({:.1} s)",
         g.passes.len(),
         g.p,
         g.p,
         g.stream.w,
         g.stream.h,
+        g.groups,
         t0.elapsed().as_secs_f64()
     );
     let cfg = engine_cerebras::Config::default();
@@ -279,7 +286,7 @@ fn flux_2_minis_vae_on_the_fabric() {
         .expect("the static arrays written");
     let t0 = std::time::Instant::now();
     let (got, cycles) = reading
-        .launch_on(&mut fab, &st, &entries)
+        .launch_with(&mut fab, &st, &entries, &statics)
         .expect("the decode runs");
     eprintln!(
         "the decode: {cycles:?} cycles, {:.0} s",

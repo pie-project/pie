@@ -30,7 +30,8 @@ pub const KV_WORDS: u32 = 18_432;
 pub fn kv_entries(q_heads: u32, head_dim: u32) -> u32 {
     let per = head_dim + (head_dim + 1) + q_heads * head_dim + q_heads * 6;
     // 16-bit words of satt's per-query buffers (xh, y, sx, qf) at `q` q heads a kv head
-    let rows = |q: u32| q * head_dim + 2 * q * (head_dim + 1) + 2 * (q + 2) * head_dim + 2 * q * head_dim;
+    let rows =
+        |q: u32| q * head_dim + 2 * q * (head_dim + 1) + 2 * (q + 2) * head_dim + 2 * q * head_dim;
     let extra = rows(q_heads.max(1)) - rows(1);
     (KV_WORDS.saturating_sub(extra) / per).max(1)
 }

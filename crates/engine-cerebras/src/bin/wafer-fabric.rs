@@ -10,7 +10,8 @@
 //! A request is a JSON line, a write's words after it (`n` little-endian u32); every reply is a
 //! JSON line (`{"ok": ..}`), a run's rows after it (each back's `lens[i]` f32):
 //! `{"op": "open", "link": ..}`, `{"op": "write", "sym", "x", "y", "w", "h", "len", "u16", "n"}`,
-//! `{"op": "run", "dir": <the reading's program directory>}`.
+//! `{"op": "run", "dir": <the reading's program directory>}`, `{"op": "launch", "dir": ..}` (a
+//! launch reading nothing back: a weight group's before the last).
 
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
@@ -60,6 +61,7 @@ fn serve(
                 file: None,
                 entry: None,
                 statics: None,
+                group: None,
             };
             fab.write(&a, words)?;
             Ok((json!({"ok": true}), Vec::new()))
@@ -79,6 +81,17 @@ fn serve(
             Ok((
                 json!({"ok": true, "cycles": cycles, "lens": lens}),
                 got.into_iter().flatten().collect(),
+            ))
+        }
+        Some("launch") => {
+            let dir = PathBuf::from(req["dir"].as_str().ok_or("`dir`?")?);
+            if !readings.contains_key(&dir) {
+                readings.insert(dir.clone(), Reading::open(&dir)?);
+            }
+            let cycles = fab.launch(&readings[&dir])?;
+            Ok((
+                json!({"ok": true, "cycles": cycles, "lens": []}),
+                Vec::new(),
             ))
         }
         other => Err(format!("an op {other:?}")),

@@ -395,8 +395,8 @@ pub fn lower_through(
         };
 
     for &v in through {
-        if !sides.contains_key(&v) {
-            sides.insert(v, Side::Row);
+        if let std::collections::btree_map::Entry::Vacant(e) = sides.entry(v) {
+            e.insert(Side::Row);
             steps.push(Step::In {
                 value: v,
                 side: Side::Row,

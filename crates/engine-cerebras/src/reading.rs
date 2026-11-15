@@ -62,6 +62,9 @@ pub struct Array {
     pub file: Option<PathBuf>,
     pub entry: Option<Vec<Word>>,
     pub statics: Option<Vec<Span>>,
+    /// The weight group whose launch it is written before (a grid program in groups: a run of
+    /// passes' tiles and their range), every step.
+    pub group: Option<usize>,
 }
 
 impl Array {
@@ -89,6 +92,13 @@ pub trait Fabric {
         let _ = link;
         Ok(false)
     }
+    /// Launches `run` on the arrays written and waits, reading no rows back (a weight group's
+    /// launch before the reading's last): its cycles where the program stamps them. The host's
+    /// runs a step whole in [`Fabric::run`].
+    fn launch(&mut self, reading: &Reading) -> R<Option<u64>> {
+        let _ = reading;
+        Ok(None)
+    }
 }
 
 /// The SDK runtime of one program at a time, each created on the thread that holds this (the
@@ -106,6 +116,10 @@ impl Fabric for Programs {
 
     fn run(&mut self, reading: &Reading, step: &StreamStep<'_>) -> R<(Vec<Vec<f32>>, Option<u64>)> {
         Fabric::run(self.rt.as_mut().ok_or("no program is open")?, reading, step)
+    }
+
+    fn launch(&mut self, reading: &Reading) -> R<Option<u64>> {
+        Fabric::launch(self.rt.as_mut().ok_or("no program is open")?, reading)
     }
 
     fn switch(&mut self, link: &Path) -> R<bool> {
@@ -220,6 +234,12 @@ impl Fabric for Children {
         Ok((got, head["cycles"].as_u64()))
     }
 
+    fn launch(&mut self, reading: &Reading) -> R<Option<u64>> {
+        let req = serde_json::json!({"op": "launch", "dir": reading.dir});
+        self.call(&req, &[])
+            .map(|(head, _)| head["cycles"].as_u64())
+    }
+
     fn switch(&mut self, link: &Path) -> R<bool> {
         if self.cur.as_deref() == Some(link) && self.kids.contains_key(link) {
             return Ok(false);
@@ -291,6 +311,9 @@ pub struct Reading {
     /// The clip a grid reading's program is compiled for (its rows are the clip's voxels, not
     /// token rows).
     pub clip: Option<[u32; 3]>,
+    /// A grid program's weight groups: a step is a launch a group, each group's arrays written
+    /// before it (the stores kept between); 0: one launch.
+    pub groups: usize,
 }
 
 fn num(v: &Value, k: &str) -> R<u64> {
@@ -364,6 +387,7 @@ impl Reading {
                 file: a["file"].as_str().map(|f| dir.join(f)),
                 entry,
                 statics,
+                group: a["group"].as_u64().map(|g| g as usize),
             });
         }
         let mut d2h = Vec::new();
@@ -440,6 +464,7 @@ impl Reading {
                     .collect();
                 <[u32; 3]>::try_from(v).ok()
             }),
+            groups: host["groups"].as_u64().unwrap_or(0) as usize,
         })
     }
 
@@ -475,6 +500,7 @@ impl Reading {
             origin: (0, 0),
             rd: None,
             clip: None,
+            groups: 0,
         }
     }
 
@@ -666,7 +692,11 @@ impl Reading {
     /// from its file (a program compiled from a capture): written once on a loaded program,
     /// before its first [`Reading::launch`].
     pub fn write_static(&self, rt: &mut dyn Fabric) -> R<()> {
-        for a in self.h2d.iter().filter(|a| a.entry.is_none()) {
+        for a in self
+            .h2d
+            .iter()
+            .filter(|a| a.entry.is_none() && a.group.is_none())
+        {
             rt.write(a, &npy_words(a.file()?)?.1)?;
         }
         Ok(())
@@ -737,6 +767,9 @@ impl Reading {
     /// The static arrays' words ([`Reading::statics`]) written, once a load.
     pub fn write_statics(&self, rt: &mut dyn Fabric, words: &[Option<Vec<u32>>]) -> R<()> {
         for (a, w) in self.h2d.iter().zip(words) {
+            if a.group.is_some() {
+                continue;
+            }
             if let Some(w) = w {
                 rt.write(a, w)?;
             }
@@ -780,6 +813,19 @@ impl Reading {
         step: &StreamStep<'_>,
         entries: &[Option<Vec<f32>>],
     ) -> R<(Vec<Vec<f32>>, Option<u64>)> {
+        self.launch_with(rt, step, entries, &[])
+    }
+
+    /// [`Reading::launch_on`], a grid program in weight groups a launch a group: each group's
+    /// arrays written before its launch (a static's words from `statics`, as
+    /// [`Reading::statics`] made them, else its file's), the rows read back after the last.
+    pub fn launch_with(
+        &self,
+        rt: &mut dyn Fabric,
+        step: &StreamStep<'_>,
+        entries: &[Option<Vec<f32>>],
+        statics: &[Option<Vec<u32>>],
+    ) -> R<(Vec<Vec<f32>>, Option<u64>)> {
         for (a, words) in self.h2d.iter().zip(entries) {
             if a.entry.is_none() {
                 continue;
@@ -790,11 +836,61 @@ impl Reading {
             };
             rt.write(a, &data)?;
         }
-        rt.run(self, step)
+        // the groups' launches' cycles, summed
+        let mut before: Option<u64> = None;
+        for k in 0..self.groups {
+            for (i, a) in self.h2d.iter().enumerate() {
+                if a.group != Some(k) {
+                    continue;
+                }
+                match statics.get(i).and_then(Option::as_ref) {
+                    Some(w) => rt.write(a, w)?,
+                    None => rt.write(a, &npy_words(a.file()?)?.1)?,
+                }
+            }
+            if k + 1 < self.groups
+                && let Some(c) = rt.launch(self)?
+            {
+                before = Some(before.unwrap_or(0) + c);
+            }
+        }
+        let (got, cycles) = rt.run(self, step)?;
+        Ok((got, cycles.map(|c| c + before.unwrap_or(0))))
+    }
+}
+
+impl Runtime {
+    /// The launch's cycles off its PEs' stamps (`tsc`: start, end, passes a PE) over the
+    /// reading's rectangle, where the program stamps them.
+    fn stamps(&mut self, reading: &Reading) -> R<Option<u64>> {
+        if !self.rpc().symbols().contains_key("tsc") {
+            return Ok(None);
+        }
+        let (w, h) = (reading.w as usize, reading.h as usize);
+        let mut ts = vec![0u32; w * h * 3];
+        let rect = Rect {
+            x: reading.origin.0,
+            y: reading.origin.1,
+            w: w as i32,
+            h: h as i32,
+        };
+        self.memcpy_d2h("tsc", &mut ts, rect, 3, Order::RowMajor, DataType::Bits32)
+            .map_err(|x| x.to_string())?;
+        let live = ts.chunks(3).filter(|s| s[0] != 0 || s[1] != 0);
+        let (lo, hi) = live.fold((u64::MAX, 0u64), |(lo, hi), s| {
+            (lo.min(u64::from(s[0])), hi.max(u64::from(s[1])))
+        });
+        Ok((hi >= lo).then(|| hi - lo))
     }
 }
 
 impl Fabric for Runtime {
+    fn launch(&mut self, reading: &Reading) -> R<Option<u64>> {
+        let args: Vec<u32> = reading.rd.into_iter().collect();
+        self.launch("run", &args).map_err(|x| x.to_string())?;
+        self.stamps(reading)
+    }
+
     fn write(&mut self, a: &Array, words: &[u32]) -> R<()> {
         let dt = if a.u16 {
             DataType::Bits16
@@ -833,25 +929,7 @@ impl Fabric for Runtime {
             .map_err(e)?;
             got.push(out.into_iter().map(f32::from_bits).collect());
         }
-        let cycles = if self.rpc().symbols().contains_key("tsc") {
-            let (w, h) = (reading.w as usize, reading.h as usize);
-            let mut ts = vec![0u32; w * h * 3];
-            let rect = Rect {
-                x: reading.origin.0,
-                y: reading.origin.1,
-                w: w as i32,
-                h: h as i32,
-            };
-            self.memcpy_d2h("tsc", &mut ts, rect, 3, Order::RowMajor, DataType::Bits32)
-                .map_err(e)?;
-            let live = ts.chunks(3).filter(|s| s[0] != 0 || s[1] != 0);
-            let (lo, hi) = live.fold((u64::MAX, 0u64), |(lo, hi), s| {
-                (lo.min(u64::from(s[0])), hi.max(u64::from(s[1])))
-            });
-            (hi >= lo).then(|| hi - lo)
-        } else {
-            None
-        };
+        let cycles = self.stamps(reading)?;
         Ok((got, cycles))
     }
 }

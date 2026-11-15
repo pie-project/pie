@@ -416,6 +416,12 @@ impl CerebrasEngine {
             let entries = reading
                 .entries(&mut streams.readings[ri].host, &step_view)
                 .map_err(device)?;
+            // (a grid program in weight groups writes its groups' tiles a launch each)
+            let words = if reading.groups > 0 {
+                streams.readings[ri].statics.clone()
+            } else {
+                None
+            };
             let fabric = streams.fabric_for(ri, &step_view).map_err(device)?;
             let sent = Owned {
                 lanes: owned.lanes.clone(),
@@ -424,7 +430,14 @@ impl CerebrasEngine {
             };
             let run = Arc::clone(&reading);
             let (got, cycles) = fabric
-                .call(move |f| run.launch_on(f, &sent.step(), &entries))
+                .call(move |f| {
+                    run.launch_with(
+                        f,
+                        &sent.step(),
+                        &entries,
+                        words.as_deref().map_or(&[], |w| &w[..]),
+                    )
+                })
                 .map_err(device)?;
             (reading.rows_back(&got).map_err(device)?, cycles)
         };
