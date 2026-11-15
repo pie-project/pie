@@ -558,7 +558,7 @@ async fn one_process_of_64_lanes_at_rest_keeps_the_rung_of_64() {
     let ws: WorkingSetId = GenMap::<_, ()>::new().insert(());
 
     // The one process's wave: 64 lanes seated, the rung raised for them.
-    seats.lock().unwrap().seats(ws, 64).unwrap();
+    seats.lock().unwrap().seats(ws, 64, 0).unwrap();
     assert_eq!(live_lanes(ENGINE), 64);
     let want = want_rows(ENGINE, 64);
     let engine = Arc::new(Mutex::new(engine));
@@ -598,6 +598,93 @@ async fn one_process_of_64_lanes_at_rest_keeps_the_rung_of_64() {
     assert_eq!(shared.lock().unwrap().rung(), 1, "lowered back");
 }
 
+/// One lane decoding by fires of 2 rows the device places (never cut), back
+/// to back with a settle between, the pool resting at its prompt's rung of
+/// 32, on a ladder where the rungs of 1 and 2 rows take different chunks.
+/// Each fire's own ask goes when it settles, but the lane counts at the 2
+/// rows it stages next step, so the walk's goal stays the rung of 2 between
+/// fires: the cap is cut once, from the prompt's rung to the lane's, never
+/// under the lane's fire, and the lowering to the lane's rung completes.
+#[tokio::test(flavor = "current_thread")]
+async fn a_lane_decoding_two_rows_a_fire_keeps_its_rung_between_fires() {
+    use crate::store::chunks::Seats;
+    use crate::store::genmap::GenMap;
+    use crate::store::kv::page_table::WorkingSetId;
+    const ENGINE: usize = 67;
+    let (mut pool, mut engine) = fine_on_demand();
+    pool.set_max_lanes(512);
+    assert_eq!(
+        walk_segments(&mut pool, 6, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_ne!(
+        pool.pool().act_chunks(1),
+        pool.pool().act_chunks(2),
+        "no chunk class hides a goal of 1 behind a rung of 2"
+    );
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let grow = SharedGrow::new(0, ENGINE, shared.clone());
+    grant_rung(ENGINE, u32::MAX);
+    let seats = Arc::new(Mutex::new(Seats::new(256)));
+    seats.lock().unwrap().count_for(ENGINE);
+    let ws: WorkingSetId = GenMap::<_, ()>::new().insert(());
+
+    // The prompt: the lane seated, its pass asking 32 rows a fire.
+    seats.lock().unwrap().seats(ws, 1, 0).unwrap();
+    let want = want_rows(ENGINE, 32);
+    let engine = Arc::new(Mutex::new(engine));
+    take_raise(
+        &shared,
+        |pool| rung_seatable(pool, ENGINE, asked_rows(ENGINE)),
+        &Lane(engine.clone()),
+    )
+    .await
+    .unwrap();
+    raise_now(&shared, ENGINE, 32);
+    assert_eq!(shared.lock().unwrap().rung(), 32);
+    assert_eq!(fire_cap(ENGINE), 32);
+    drop(want);
+
+    // The decode. Every change of the cap is kept.
+    let mut caps = vec![fire_cap(ENGINE)];
+    let note = |caps: &mut Vec<u32>| {
+        let cap = fire_cap(ENGINE);
+        if caps.last() != Some(&cap) {
+            caps.push(cap);
+        }
+    };
+    for _ in 0..4 * PATIENCE {
+        // A fire: its seat stamped with the rows it stages whole, and its
+        // own ask, held until it settles.
+        seats.lock().unwrap().seats(ws, 1, 2).unwrap();
+        let want = want_rows(ENGINE, 2);
+        raise_now(&shared, ENGINE, 2);
+        note(&mut caps);
+        assert!(fire_cap(ENGINE) >= 2, "the fire is not held for a raise");
+        grow.walk_rung().await;
+        note(&mut caps);
+        // It settles: its ask goes, the lane's rows stand.
+        drop(want);
+        assert_eq!(wanted_rows(ENGINE), 0);
+        assert_eq!(grow.walk_rows(), 2, "the rows the lane stages next step");
+        grow.walk_rung().await;
+        note(&mut caps);
+        // The scheduler's turn publishes what it has in flight; a tick.
+        grant_rung(ENGINE, fire_cap(ENGINE));
+        grow.ticked_for_test();
+    }
+    assert_eq!(caps, [32, 2], "one cut, to the lane's rung, and no flip");
+    assert_eq!(
+        shared.lock().unwrap().rung(),
+        2,
+        "the lowering to the lane's rung completes"
+    );
+
+    // The sequence ends: nothing of it counts.
+    seats.lock().unwrap().release(ws);
+    assert_eq!(grow.walk_rows(), 0);
+}
+
 /// A process waiting for room contributes no rows to what the walk holds
 /// the rung for: 64 lanes decoding beside a pass of 32 lanes that waits on
 /// the planner's grant hold the rung of 64, not of 96, so the span past it
@@ -617,8 +704,8 @@ fn a_process_waiting_for_room_holds_no_rows_of_the_rung() {
     seats.lock().unwrap().count_for(ENGINE);
     let mut sets = GenMap::<_, ()>::new();
     let (decoding, waiter): (WorkingSetId, WorkingSetId) = (sets.insert(()), sets.insert(()));
-    seats.lock().unwrap().seats(decoding, 64).unwrap();
-    seats.lock().unwrap().seats(waiter, 32).unwrap();
+    seats.lock().unwrap().seats(decoding, 64, 0).unwrap();
+    seats.lock().unwrap().seats(waiter, 32, 0).unwrap();
     let goal = || rung_goal(&shared.lock().unwrap(), ENGINE, grow.walk_rows());
     assert_eq!(grow.walk_rows(), 96);
     assert_eq!(goal(), 128, "both live: the rung covering 96");

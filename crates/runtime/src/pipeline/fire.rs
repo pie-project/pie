@@ -2221,14 +2221,29 @@ pub(crate) fn lane_groups(ids: &[crate::store::kv::page_table::WorkingSetId]) ->
 }
 
 /// Each lane rides a seat its working set holds: lane `i` of a group its
-/// working set's `i`th.
+/// working set's `i`th. `whole` is each lane's rows where the fire stages
+/// them whole (the device places them: it is never cut), `None` for a fire
+/// of a row a lane or one cut to the rung: a working set's lanes count at
+/// the rows its last fire staged whole
+/// ([`crate::store::chunks::Seats::staging`]).
 pub(crate) fn stamp_lane_slots(
     req: &mut crate::engine::FireRequest,
     stores: &crate::store::registry::Stores,
     groups: &LaneGroups,
+    whole: Option<&[u32]>,
 ) -> Result<(), crate::store::chunks::SeatsShort> {
     for (ws, lanes) in groups {
-        let seats = stores.seats.lock().unwrap().seats(*ws, lanes.len())?;
+        let rows = whole.map_or(0, |whole| {
+            lanes
+                .iter()
+                .filter_map(|&lane| whole.get(lane))
+                .fold(0u32, |rows, &lane| rows.saturating_add(lane))
+        });
+        let seats = stores
+            .seats
+            .lock()
+            .unwrap()
+            .seats(*ws, lanes.len(), rows)?;
         for (&lane, &seat) in lanes.iter().zip(&seats) {
             if let Some(lane) = req.lanes.get_mut(lane) {
                 lane.slot = seat;
@@ -2246,6 +2261,7 @@ pub(crate) async fn seat_lane_slots(
     req: &mut crate::engine::FireRequest,
     stores: &crate::store::registry::Stores,
     groups: &LaneGroups,
+    whole: Option<&[u32]>,
 ) -> Result<(), String> {
     let freed = stores.seats.lock().unwrap().freed();
     // A working set letting its seats go is the event: it waits for it,
@@ -2254,7 +2270,7 @@ pub(crate) async fn seat_lane_slots(
     loop {
         let mut freed = Box::pin(freed.notified());
         freed.as_mut().enable();
-        let refusal = match stamp_lane_slots(req, stores, groups) {
+        let refusal = match stamp_lane_slots(req, stores, groups, whole) {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
@@ -2954,7 +2970,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if let Err(refusal) = crate::inferlet::process::said(
             "seat the lanes",
             ctx.process_id(),
-            seat_lane_slots(&mut req, &stores, &groups),
+            seat_lane_slots(&mut req, &stores, &groups, None),
         )
         .await
         {
@@ -4591,10 +4607,14 @@ async fn fire_device_geometry<C: FireContext>(
         device_rows.as_deref(),
     );
     let reads_each_other = reads_each_other(&req);
+    // Each lane's rows, staged whole: what its working set's lanes count
+    // for until its next fire stages fewer, between fires too, so the rung
+    // is not lowered under the lane's next fire once this one settles.
+    let whole_rows: Vec<u32> = split.windows(2).map(|lane| lane[1] - lane[0]).collect();
     if let Err(refusal) = crate::inferlet::process::said(
         "seat the lanes",
         ctx.process_id(),
-        seat_lane_slots(&mut req, &stores, &groups),
+        seat_lane_slots(&mut req, &stores, &groups, Some(&whole_rows)),
     )
     .await
     {

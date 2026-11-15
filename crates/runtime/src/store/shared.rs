@@ -396,7 +396,7 @@ pub fn live_lanes(engine: usize) -> u32 {
         .load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// The seats tell the lanes they hold ([`live_lanes`]).
+/// The seats tell the rows their lanes stage next step ([`live_lanes`]).
 pub(crate) fn set_live_lanes(engine: usize, lanes: u32) {
     rung_gate(engine)
         .lanes

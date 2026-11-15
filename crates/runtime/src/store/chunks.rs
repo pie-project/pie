@@ -522,6 +522,11 @@ pub struct Seats {
     /// The working sets whose pass waits for room ([`WaitsForRoom`]), by
     /// how many of its waits stand: their lanes stage no row until served.
     waiting: HashMap<WorkingSetId, u32>,
+    /// The rows a working set's last fire staged whole, where more than a
+    /// row a lane (a fire the device places is never cut): what its lanes
+    /// stage at their next step, until a fire of it stages fewer or it is
+    /// released.
+    whole: HashMap<WorkingSetId, u32>,
     /// The engine whose rung counts the lanes seated here
     /// ([`crate::store::shared::live_lanes`]); none where no rung does.
     engine: Option<usize>,
@@ -591,6 +596,7 @@ impl Seats {
             held: HashMap::new(),
             freed: Arc::new(tokio::sync::Notify::new()),
             waiting: HashMap::new(),
+            whole: HashMap::new(),
             engine: None,
         }
     }
@@ -602,20 +608,24 @@ impl Seats {
         self.tell();
     }
 
-    /// The lanes that stage a row at their next step: the seats held by
-    /// working sets whose pass does not wait for room. A working set holds
-    /// a seat for each lane it fires at once from its first fire until it
-    /// is released, so a lane counts from its prompt's first piece until
-    /// its sequence ends, between its steps too.
+    /// The rows the live lanes stage at their next step: for each working
+    /// set whose pass does not wait for room, its seats (a row a lane), or
+    /// the rows its last fire staged whole where that is more (a lane
+    /// decoding by fires of several rows stages as many next step). A
+    /// working set holds a seat for each lane it fires at once from its
+    /// first fire until it is released, so a lane counts from its prompt's
+    /// first piece until its sequence ends, between its steps too.
     #[must_use]
     pub fn staging(&self) -> u32 {
-        let lanes: usize = self
+        let rows: u64 = self
             .held
             .iter()
             .filter(|(ws, _)| !self.waiting.contains_key(ws))
-            .map(|(_, held)| held.len())
+            .map(|(ws, held)| {
+                (held.len() as u64).max(u64::from(self.whole.get(ws).copied().unwrap_or(0)))
+            })
             .sum();
-        u32::try_from(lanes).unwrap_or(u32::MAX)
+        u32::try_from(rows).unwrap_or(u32::MAX)
     }
 
     fn tell(&self) {
@@ -624,8 +634,17 @@ impl Seats {
         }
     }
 
-    /// The seats of `ws`'s first `lanes` lanes, taking what it lacks.
-    pub fn seats(&mut self, ws: WorkingSetId, lanes: usize) -> Result<Vec<u32>, SeatsShort> {
+    /// The seats of `ws`'s first `lanes` lanes, taking what it lacks, for
+    /// a fire staging `rows` rows of it whole (0 for a fire of a row a
+    /// lane, or one cut to the rung: a prompt's piece). Past a row a lane,
+    /// `rows` is what its lanes count for from here ([`Self::staging`]);
+    /// a fire staging fewer takes the count down again.
+    pub fn seats(
+        &mut self,
+        ws: WorkingSetId,
+        lanes: usize,
+        rows: u32,
+    ) -> Result<Vec<u32>, SeatsShort> {
         let lanes = u32::try_from(lanes).unwrap_or(u32::MAX);
         let have = self.held.get(&ws).map_or(0, |held| held.len() as u32);
         if have < lanes {
@@ -640,8 +659,13 @@ impl Seats {
                     of_state_slots: self.of_state_slots,
                 })?;
             self.held.entry(ws).or_default().extend(fresh);
-            self.tell();
         }
+        if rows > lanes {
+            self.whole.insert(ws, rows);
+        } else {
+            self.whole.remove(&ws);
+        }
+        self.tell();
         Ok(self.held.get(&ws).map_or_else(Vec::new, |held| {
             held[..lanes as usize]
                 .iter()
@@ -652,6 +676,7 @@ impl Seats {
 
     /// `ws` lets its seats go.
     pub fn release(&mut self, ws: WorkingSetId) {
+        self.whole.remove(&ws);
         if let Some(held) = self.held.remove(&ws) {
             self.slots
                 .release(Holder::WorkingSet(ws.to_bits()), &held, 0);
@@ -986,10 +1011,10 @@ mod seats_tests {
         let (a, b): (WorkingSetId, WorkingSetId) = (sets.insert(()), sets.insert(()));
         let seats = Arc::new(Mutex::new(Seats::new(256)));
         assert_eq!(seats.lock().unwrap().staging(), 0);
-        seats.lock().unwrap().seats(a, 64).unwrap();
-        seats.lock().unwrap().seats(b, 32).unwrap();
+        seats.lock().unwrap().seats(a, 64, 0).unwrap();
+        seats.lock().unwrap().seats(b, 32, 0).unwrap();
         // A set fires the lanes it has again: no more seats.
-        seats.lock().unwrap().seats(a, 64).unwrap();
+        seats.lock().unwrap().seats(a, 64, 0).unwrap();
         assert_eq!(seats.lock().unwrap().staging(), 96);
 
         let waits = WaitsForRoom::mark(&seats, [b]);
@@ -1011,13 +1036,55 @@ mod seats_tests {
         assert_eq!(seats.lock().unwrap().staging(), 0);
     }
 
+    /// A lane decoding by fires of several rows counts at the rows its last
+    /// fire staged whole, between its fires too, until a fire of it stages
+    /// fewer or its set is released; never while its pass waits for room.
+    #[test]
+    fn a_lane_counts_at_the_rows_its_last_fire_staged_whole() {
+        use super::WaitsForRoom;
+        use std::sync::{Arc, Mutex};
+        let mut sets = GenMap::<_, ()>::new();
+        let (a, b): (WorkingSetId, WorkingSetId) = (sets.insert(()), sets.insert(()));
+        let seats = Arc::new(Mutex::new(Seats::new(256)));
+        let staging = || seats.lock().unwrap().staging();
+        let fire = |ws, lanes, rows| {
+            seats.lock().unwrap().seats(ws, lanes, rows).unwrap();
+        };
+        // Its prompt's pieces, cut to the rung: a row a lane.
+        fire(a, 1, 0);
+        assert_eq!(staging(), 1);
+        // Decoding two rows a fire: two rows, the fire settled or not.
+        fire(a, 1, 2);
+        assert_eq!(staging(), 2);
+        fire(a, 1, 5);
+        assert_eq!(staging(), 5);
+        fire(a, 1, 2);
+        assert_eq!(staging(), 2, "its next fire stages fewer");
+        // Beside 64 lanes of a row each.
+        fire(b, 64, 0);
+        assert_eq!(staging(), 66);
+        fire(b, 64, 64);
+        assert_eq!(staging(), 66, "a row a lane is its seats");
+        let waits = WaitsForRoom::mark(&seats, [a]);
+        assert_eq!(staging(), 64, "waiting for room: no row");
+        drop(waits);
+        assert_eq!(staging(), 66);
+        fire(a, 1, 0);
+        assert_eq!(staging(), 65, "a fire of a row a lane");
+        fire(a, 1, 2);
+        seats.lock().unwrap().release(a);
+        assert_eq!(staging(), 64, "released: nothing of it counts");
+        fire(a, 1, 0);
+        assert_eq!(staging(), 65, "seated again: a row a lane");
+    }
+
     /// A fire past a stateless model's seats is refused with the seats
     /// there are and why, not "0 of the 0 the state slots give".
     #[test]
     fn a_stateless_model_short_of_seats_names_its_real_count() {
         let mut seats = Seats::new(0);
         let short = seats
-            .seats(working_set(), SEATS_UNBOUNDED as usize + 1)
+            .seats(working_set(), SEATS_UNBOUNDED as usize + 1, 0)
             .unwrap_err();
         assert_eq!(short.capacity, SEATS_UNBOUNDED);
         assert_eq!(short.have, SEATS_UNBOUNDED);
@@ -1034,7 +1101,7 @@ mod seats_tests {
     #[test]
     fn a_stateful_model_short_of_seats_names_its_state_slots() {
         let mut seats = Seats::new(4);
-        let short = seats.seats(working_set(), 5).unwrap_err();
+        let short = seats.seats(working_set(), 5, 0).unwrap_err();
         assert_eq!((short.need, short.have, short.capacity), (5, 4, 4));
         assert!(
             short

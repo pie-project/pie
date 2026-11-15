@@ -598,9 +598,9 @@ mod tests {
             (0, 0),
             "both fires arrive at the seat stamp unseated — this is the defect's shape"
         );
-        crate::pipeline::fire::stamp_lane_slots(&mut first, &stores, &vec![(first_ws, vec![0])])
+        crate::pipeline::fire::stamp_lane_slots(&mut first, &stores, &vec![(first_ws, vec![0])], None)
             .expect("a two-slot pool seats one sequence");
-        crate::pipeline::fire::stamp_lane_slots(&mut second, &stores, &vec![(second_ws, vec![0])])
+        crate::pipeline::fire::stamp_lane_slots(&mut second, &stores, &vec![(second_ws, vec![0])], None)
             .expect("and its peer");
 
         let (frame, _) = build_frame_submission(
