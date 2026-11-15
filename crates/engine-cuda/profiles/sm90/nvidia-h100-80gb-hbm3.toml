@@ -77,6 +77,12 @@ branches = true
 dag_streams = true
 dag_streams_until = 256
 
+[rates]
+# 989.4 TFLOPS dense bf16 (NVIDIA H100 datasheet, SXM; 1979 with sparsity).
+bf16_flops_per_ns = 989400.0
+# 3.35 TB/s of HBM3 (H100 datasheet, SXM).
+bytes_per_ns = 3350.0
+
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 26.9 -> 27.0 ms, 1-lane step 3.56 -> 3.48 ms, 4-lane step 5.79 -> 5.73 ms, 8-lane step 7.19 -> 7.16 ms, readout cosine 1.0000"
 measured = [
