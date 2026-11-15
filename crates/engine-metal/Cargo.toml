@@ -42,6 +42,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSError",
     "NSRange",
     "NSProcessInfo",
+    "NSURL",
+    "NSArray",
 ] }
 objc2-metal = { version = "0.3", default-features = false, features = [
     "std",
@@ -56,6 +58,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLComputePipeline",
     "MTLLibrary",
     "MTLBlitCommandEncoder",
+    "MTLBinaryArchive",
     "MTLTypes",
     "block2",
     "MTLIndirectCommandBuffer",

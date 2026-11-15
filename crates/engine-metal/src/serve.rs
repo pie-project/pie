@@ -1773,6 +1773,89 @@ impl Shell {
     /// so nothing runs and no seat, slot or rung changes. Returns the fires
     /// walked and
     /// the pipelines built.
+    /// What decides the pipelines this load builds: the device, its OS
+    /// build, this binary, the model's graph, the rungs, the token and lane
+    /// budgets, the paging and the kernels' tuning. A later boot with the
+    /// same key builds the same keys; any change and it walks again.
+    #[must_use]
+    pub fn pipeline_cache_key(&self) -> String {
+        let fnv = |bytes: &[u8]| {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+        };
+        #[cfg(target_vendor = "apple")]
+        let os = objc2_foundation::NSProcessInfo::processInfo()
+            .operatingSystemVersionString()
+            .to_string();
+        #[cfg(not(target_vendor = "apple"))]
+        let os = String::new();
+        let binary = std::env::current_exe()
+            .and_then(std::fs::metadata)
+            .map(|meta| {
+                let at = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_nanos());
+                format!("{}:{at}", meta.len())
+            })
+            .unwrap_or_default();
+        let trace = fnv(format!("{:?}", self.trace).as_bytes());
+        let paging = self.paging();
+        let shape = format!(
+            "{:?}|{:?}|{}:{}:{}|{:?}",
+            self.arena.rung_tokens(),
+            self.budgets.tokens,
+            paging.page_size,
+            paging.pages_per_slot,
+            paging.context(),
+            self.tuning
+        );
+        format!(
+            "metal-pipelines-1|{}|{os}|{binary}|{trace:016x}|{:016x}",
+            self.device.name(),
+            fnv(shape.as_bytes())
+        )
+    }
+
+    /// The keys of every pipeline built: file, entrypoint, stamp and page
+    /// strides.
+    #[must_use]
+    pub fn pipeline_keys(&self) -> Vec<(String, String, String, Option<[u64; 2]>)> {
+        self.pipelines
+            .keys()
+            .into_iter()
+            .map(|(file, entry, stamp, strides)| (file.into(), entry.into(), stamp.into(), strides))
+            .collect()
+    }
+
+    /// Builds `keys` (a list an earlier boot of the same load wrote): the
+    /// pipelines, before ready, without walking. Returns how many it built.
+    pub fn build_pipelines(&self, keys: &[(String, String, String, Option<[u64; 2]>)]) -> Result<u64> {
+        let before = self.pipelines.compiled();
+        for (file, entry, stamp, strides) in keys {
+            let leak = |text: &str| -> &'static str { Box::leak(text.to_owned().into_boxed_str()) };
+            let fire = kernels_metal::Fire {
+                stamp: leak(stamp),
+                page_strides: *strides,
+                ..kernels_metal::Fire::at(leak(file), leak(entry))
+            };
+            self.pipelines.warm(&self.device, fire)?;
+        }
+        Ok(self.pipelines.compiled() - before)
+    }
+
+    /// Builds against (or records into) the binary archive at `path`.
+    #[cfg(target_vendor = "apple")]
+    pub fn use_pipeline_archive(&self, path: &std::path::Path) {
+        self.pipelines.use_archive(self.device.device(), path);
+    }
+
+    /// Writes the binary archive to `path`.
+    #[cfg(target_vendor = "apple")]
+    pub fn save_pipeline_archive(&self, path: &std::path::Path) -> bool {
+        self.pipelines.save_archive(path)
+    }
+
     /// Seals the pipelines built ([`Shell::warm_pipelines`]).
     pub fn seal_pipelines(&self) {
         self.pipelines.seal();

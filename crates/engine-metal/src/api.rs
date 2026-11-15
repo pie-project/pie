@@ -647,11 +647,39 @@ impl Engine for Metal {
         // Every pipeline the load's rungs dispatch is built now, before
         // ready; a key met after is refused by name and tallied.
         let began = std::time::Instant::now();
-        let (fires, built) = shell.warm_pipelines().map_err(fault)?;
+        // A later boot of the same load (the same key) builds the keys an
+        // earlier boot listed, from its binary archive, without walking; a
+        // missing, stale or unreadable cache only costs the walk.
+        let cache = self.boot.profiles.as_ref().and_then(|profiles| profiles.parent()).map(|home| {
+            let key = shell.pipeline_cache_key();
+            let name = key
+                .bytes()
+                .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
+            let dir = home.join("cache").join("metal");
+            (key, dir.join(format!("{name:016x}.keys")), dir.join(format!("{name:016x}.metalarchive")))
+        });
+        #[cfg(target_vendor = "apple")]
+        if let Some((_, _, archive)) = cache.as_ref() {
+            shell.use_pipeline_archive(archive);
+        }
+        let listed = cache.as_ref().and_then(|(key, keys, _)| read_pipeline_keys(keys, key));
+        let (fires, built) = match listed {
+            Some(keys) => (0, shell.build_pipelines(&keys).map_err(fault)?),
+            None => {
+                let walked = shell.warm_pipelines().map_err(fault)?;
+                if let Some((key, keys, _archive)) = cache.as_ref() {
+                    write_pipeline_keys(keys, key, &shell.pipeline_keys());
+                    #[cfg(target_vendor = "apple")]
+                    let _ = shell.save_pipeline_archive(_archive);
+                }
+                walked
+            }
+        };
         shell.seal_pipelines();
         tracing::info!(
             fires,
             built,
+            listed = fires == 0,
             ms = began.elapsed().as_millis() as u64,
             "metal: every pipeline the load dispatches is built before ready"
         );
@@ -1316,4 +1344,46 @@ fn channel_shape(registration: &ChannelRegistration) -> crate::program::ChannelS
             .max(1),
         dtype: registration.dtype.program_dtype(),
     }
+}
+
+type PipelineKeyText = (String, String, String, Option<[u64; 2]>);
+
+/// The keys a boot of the load `key` listed at `path`: `None` where there
+/// is no list, it was written for another key, or a line does not parse.
+fn read_pipeline_keys(path: &std::path::Path, key: &str) -> Option<Vec<PipelineKeyText>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != key {
+        return None;
+    }
+    lines
+        .map(|line| {
+            let mut parts = line.split('\t');
+            let file = parts.next()?.to_string();
+            let entry = parts.next()?.to_string();
+            let stamp = parts.next()?.to_string();
+            let strides = match parts.next()? {
+                "-" => None,
+                pair => {
+                    let (k, v) = pair.split_once(',')?;
+                    Some([k.parse().ok()?, v.parse().ok()?])
+                }
+            };
+            Some((file, entry, stamp, strides))
+        })
+        .collect()
+}
+
+/// Writes the load `key`'s pipeline keys to `path`; a failed write only
+/// costs the next boot a walk.
+fn write_pipeline_keys(path: &std::path::Path, key: &str, keys: &[PipelineKeyText]) {
+    let mut text = format!("{key}\n");
+    for (file, entry, stamp, strides) in keys {
+        let strides = strides.map_or_else(|| "-".to_string(), |[k, v]| format!("{k},{v}"));
+        text.push_str(&format!("{file}\t{entry}\t{stamp}\t{strides}\n"));
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, text);
 }
