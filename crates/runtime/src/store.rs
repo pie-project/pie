@@ -129,17 +129,22 @@ impl PipelineScope {
         let mut owner = owner.lock().unwrap();
         match owner.as_ref() {
             Some(existing) if existing.id() == self.id() => Ok(()),
-            Some(existing) => match existing.failure() {
-                Some(reason) => Err(ScopeRefusal::Failed {
-                    owner: existing.id(),
-                    reason,
-                }),
-                None if !self.is_closed() && existing.is_releasable() => {
-                    *owner = Some(self.clone());
-                    Ok(())
+            Some(existing) => {
+                // Read ahead of the failure: a pipeline that is drained has
+                // written every failure of its fires.
+                let released = existing.is_releasable();
+                match existing.failure() {
+                    Some(reason) => Err(ScopeRefusal::Failed {
+                        owner: existing.id(),
+                        reason,
+                    }),
+                    None if !self.is_closed() && released => {
+                        *owner = Some(self.clone());
+                        Ok(())
+                    }
+                    None => Err(ScopeRefusal::Held(existing.id())),
                 }
-                None => Err(ScopeRefusal::Held(existing.id())),
-            },
+            }
             None if self.is_closed() => Err(ScopeRefusal::Held(self.id())),
             None => {
                 *owner = Some(self.clone());

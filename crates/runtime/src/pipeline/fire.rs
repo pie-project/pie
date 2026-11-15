@@ -111,6 +111,15 @@ impl PendingFireQueue {
     pub(crate) fn try_finalize_guard(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         Arc::clone(&self.finalizer).try_lock_owned().ok()
     }
+
+    /// No fire is in it and none is being finalized. A fire leaves the
+    /// queue under the finalizer gate, ahead of its fold and its failure
+    /// being written, and its finalizer holds the gate until they are: an
+    /// empty queue whose gate is held still has a fire to settle.
+    pub(crate) fn drained(&self) -> bool {
+        self.try_finalize_guard()
+            .is_some_and(|_gate| self.lock().unwrap().is_empty())
+    }
 }
 
 pub type PendingFires = Arc<PendingFireQueue>;
@@ -6552,7 +6561,9 @@ mod fold_tests {
     /// the refusal names it and its first failure. The cursor the failed
     /// fire moved when it was staged is not moved back, which is why: here
     /// its fold stays counted as on its way and its tail unknown. A set
-    /// whose pipeline's fires all served passes on as it did.
+    /// whose pipeline's fires all served passes on as it did. Neither
+    /// passes on while its fire, out of the queue, is still being
+    /// finalized.
     #[tokio::test(flavor = "current_thread")]
     async fn a_set_of_a_failed_pipeline_fires_on_no_other() -> Anyhow<()> {
         use crate::store::{PipelineScope, ScopeRefusal};
@@ -6561,9 +6572,7 @@ mod fold_tests {
             let mut ctx = Flight::context();
             let fires = Arc::downgrade(&flight.fires);
             let own = PipelineScope::failing_as(flight.failure.clone(), move || {
-                fires
-                    .upgrade()
-                    .is_none_or(|fires| fires.lock().unwrap().is_empty())
+                fires.upgrade().is_none_or(|fires| fires.drained())
             });
             let rs = RsWorkingSet::new(
                 flight.kv.model,
@@ -6582,11 +6591,26 @@ mod fold_tests {
                 record_kv_writes(vec![report(flight.tag, 3)]);
             }
             resolve_test_completion(&flight.completion, failed);
-            drain_pipeline_fires(&mut ctx, &flight.fires).await?;
             own.close();
+            let next = PipelineScope::new(|| true);
+
+            // The fire leaves its pipeline's queue ahead of its failure
+            // being written, as every finalizer takes it: under the gate.
+            // Until the gate lifts the set is still its pipeline's, however
+            // the fire ended.
+            {
+                let _gate = flight.fires.finalize_guard().await;
+                let op = pop_settled(Some(&flight.fires)).expect("the fire settled");
+                let finalized = finalize_op_await(op).await?;
+                assert!(flight.fires.lock().unwrap().is_empty());
+                assert_eq!(flight.failure.lock().unwrap().as_ref(), None);
+                let held = Err(ScopeRefusal::Held(own.id()));
+                assert_eq!(flight.kv.claim_pipeline_scope(&next), held);
+                assert_eq!(rs.claim_pipeline_scope(&next), held);
+                complete_finalize(&mut ctx, finalized);
+            }
 
             let staged = flight.cursor.lock().unwrap().clone();
-            let next = PipelineScope::new(|| true);
             if !failed {
                 assert!(staged.folded_exact && staged.unsettled == 0 && staged.folded == 7);
                 assert_eq!(flight.kv.claim_pipeline_scope(&next), Ok(()));
