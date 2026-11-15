@@ -2026,3 +2026,99 @@ fn a_restore_that_fails_a_step_is_failed_once_not_queued_again() {
         );
     }
 }
+
+/// A process suspended between its prefill bind and its decode bind, its
+/// channel parked with it (a registered channel holds `Channel` slots):
+/// the decode bind waits for it to be resident again, by the wait a fire
+/// takes, and lands once it is restored. Negative control: the bind
+/// alone, without the wait, is refused, `RolesError::Parked`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_by_a_suspended_process_waits_for_its_restore() {
+    use crate::store::roles::tests::{FakeEngine, PROGRAM, Pools, holder, pools, registered};
+    use crate::store::roles::{Owner, RolesError, bind_instance, bind_when_resident};
+    use std::cell::{Cell, RefCell};
+
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::new(8)) as Arc<dyn PoolPort>
+    ));
+    let pid = holder(1);
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let Pools { roles, .. } = pools();
+    let engine = RefCell::new(FakeEngine::default());
+    let channel = registered(&roles, &mut engine.borrow_mut(), 1137, 1);
+    let binding = ::engine::InstanceBinding {
+        program: PROGRAM,
+        channels: vec![channel],
+        ..::engine::InstanceBinding::default()
+    };
+    let attempts = Cell::new(0);
+    let bind = || {
+        attempts.set(attempts.get() + 1);
+        bind_instance(
+            Some(&roles),
+            &mut *engine.borrow_mut(),
+            &binding,
+            Some(pid),
+            |id| id == channel,
+        )
+    };
+
+    bind().expect("resident, the prefill binds");
+
+    // Suspended: its items, the channel's ring among them, park with it.
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().state = Residency::Evicting);
+    let park = roles
+        .lock()
+        .unwrap()
+        .prepare_park(pid)
+        .expect("its items park");
+    roles.lock().unwrap().commit(park);
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted);
+
+    // Negative control: the bind alone is refused while it is parked.
+    let refused = bind().expect_err("a parked channel refuses the bind");
+    assert_eq!(
+        refused.downcast_ref::<RolesError>(),
+        Some(&RolesError::Parked {
+            channel,
+            holder: Some(pid),
+        })
+    );
+    assert_eq!(engine.borrow().bindings.len(), 1, "nothing bound");
+
+    // The decode bind waits for the restore, not refused.
+    attempts.set(0);
+    let decode = bind_when_resident(
+        pid,
+        || std::future::ready(bind()),
+        || planner.wait_resident(pid),
+    );
+    tokio::pin!(decode);
+    assert!(futures::poll!(decode.as_mut()).is_pending(), "it waits");
+    assert_eq!(attempts.get(), 1, "one bind, refused, then the wait");
+    assert_eq!(engine.borrow().bindings.len(), 1);
+
+    // Restored: its items come back to the device, rebound, and it is
+    // resident again.
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).unwrap().state = Residency::Restoring);
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(pid)
+        .unwrap()
+        .expect("its items unpark");
+    roles.lock().unwrap().commit(unpark);
+    let stale = roles.lock().unwrap().stale(pid);
+    for rebind in stale {
+        roles.lock().unwrap().rebound(Owner::of(&rebind));
+    }
+    planner.report_restored(pid);
+
+    decode
+        .await
+        .expect("the decode bind lands once it is restored");
+    assert_eq!(attempts.get(), 2, "bound again once, after the restore");
+    assert_eq!(engine.borrow().bindings.len(), 2);
+}
