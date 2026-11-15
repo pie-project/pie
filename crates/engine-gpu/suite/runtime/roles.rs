@@ -19,7 +19,7 @@ use poem::Request;
 use poem_ir::InputAxis;
 
 use super::outputs::{LAYERS, NAME, Outputs, VOCAB, WIDTH, contract_for, planes, write};
-use super::slots::Slots;
+use super::slots::{Shape as RoleShape, Slots};
 use crate::backend;
 
 /// Channels: `ids` (doubled) and `stack` the host reads, `t` it writes,
@@ -165,15 +165,65 @@ impl Bound {
     }
 }
 
-#[test]
-fn an_instance_in_pool_slots_fires_through_moves() {
+/// The miniature loaded with a host tier and the program's instance bound
+/// over `Instance` slots in chunk `top - 1` and, where the device keeps
+/// cells, `Channel` slots in `top - 2`; two passes fired so both hold the
+/// bytes a served guest's do.
+struct Rig {
+    bound: Bound,
+    binding: InstanceBinding,
+    instance_shape: RoleShape,
+    channel_shape: Option<RoleShape>,
+    /// The committed segment's chunks; the guests' lie near its top.
+    top: u32,
+    /// Tokens whose argmax differ from each other and from zero.
+    tokens: Vec<u32>,
+    /// What `last` holds now.
+    last: i32,
+    dir: std::path::PathBuf,
+}
+
+impl Rig {
+    fn want(&self, token: u32) -> i32 {
+        self.bound.argmax[token as usize]
+    }
+
+    /// One pass of `token`, checked against what `last` held.
+    fn round(&mut self, token: u32, what: &str) {
+        let got = self
+            .bound
+            .pass(token)
+            .unwrap_or_else(|why| panic!("{what}: the pass fires: {why}"));
+        assert_eq!(
+            got,
+            (2 * self.want(token), 2 * self.last),
+            "{what}: (ids, seen), each doubled"
+        );
+        self.last = self.want(token);
+    }
+
+    /// Every slot the instance holds: its tables', then its own kept cell's.
+    fn held(&self) -> Vec<(RoleShape, Vec<u32>)> {
+        std::iter::once((self.instance_shape, self.binding.instance_slots.clone()))
+            .chain(self.binding.ring_slots.iter().map(|ring| {
+                (
+                    self.channel_shape.expect("a channel shape"),
+                    ring.slots.clone(),
+                )
+            }))
+            .collect()
+    }
+}
+
+/// [`Rig`], or `None` without a device.
+fn rig(what: &str) -> Option<Rig> {
     let boot = backend::DeviceBoot::default();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
-        return;
+        return None;
     }
     let dir = std::env::temp_dir().join(format!(
-        "pie-{}-roles-{}",
+        "pie-{}-{what}-{}",
         backend::NAME,
         std::process::id()
     ));
@@ -234,20 +284,8 @@ fn an_instance_in_pool_slots_fires_through_moves() {
         "host chunks: {}",
         chunks.host_chunks
     );
-    // The guests' chunks, near the top of the committed segment: tables,
-    // cells, two blank ones, two the first evacuation moves onto, and the
-    // two the second evacuation and an unpark land in.
-    let [
-        tables,
-        cells,
-        blank,
-        blank_cells,
-        onto,
-        onto_cells,
-        fresh_tables,
-        fresh_cells,
-    ] = [1, 2, 3, 4, 5, 6, 7, 8].map(|k| top - k);
-    let mut slots = Slots::of(&chunks, tables, cells);
+    // The guests' tables and cells, near the top of the committed segment.
+    let mut slots = Slots::of(&chunks, top - 1, top - 2);
     let instance_shape = slots.instance.expect("an Instance shape");
     let channel_shape = slots.channel;
     assert_eq!(
@@ -355,7 +393,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             .expect("the timestep publishes"),
         "the ring had room"
     );
-    let mut bound = Bound {
+    let bound = Bound {
         engine,
         instance,
         channels,
@@ -376,10 +414,53 @@ fn an_instance_in_pool_slots_fires_through_moves() {
         picked
     };
     assert!(tokens.len() >= 4, "enough distinct rows: {tokens:?}");
-    let want = |bound: &Bound, token: u32| bound.argmax[token as usize];
     // `last` carries the previous pass's ids: on the device where it keeps
     // cells, else through the host ring.
-    let mut last = SEED;
+    let mut rig = Rig {
+        bound,
+        binding,
+        instance_shape,
+        channel_shape,
+        top,
+        tokens,
+        last: SEED,
+        dir,
+    };
+    rig.round(rig.tokens[0], "first pass");
+    rig.round(rig.tokens[1], "second pass");
+    Some(rig)
+}
+
+#[test]
+fn an_instance_in_pool_slots_fires_through_moves() {
+    let Some(mut rig) = rig("roles") else {
+        return;
+    };
+    let top = rig.top;
+    // The guests' chunks: tables, cells, two blank ones, two the first
+    // evacuation moves onto, and the two the second evacuation and an
+    // unpark land in.
+    let [
+        tables,
+        cells,
+        blank,
+        blank_cells,
+        onto,
+        onto_cells,
+        fresh_tables,
+        fresh_cells,
+    ] = [1, 2, 3, 4, 5, 6, 7, 8].map(|k| top - k);
+    let (instance_shape, channel_shape) = (rig.instance_shape, rig.channel_shape);
+    let binding = rig.binding.clone();
+    let tokens = rig.tokens.clone();
+    let held: Vec<(ShapeId, Vec<u32>)> = rig
+        .held()
+        .into_iter()
+        .map(|(shape, refs)| (shape.id, refs))
+        .collect();
+    let cells_held = channel_shape.is_some();
+    let want = |bound: &Bound, token: u32| bound.argmax[token as usize];
+    let mut last = rig.last;
     let round = |bound: &mut Bound, token: u32, last: &mut i32, what: &str| {
         let got = bound
             .pass(token)
@@ -391,20 +472,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
         );
         *last = want(bound, token);
     };
-    round(&mut bound, tokens[0], &mut last, "first pass");
-    round(&mut bound, tokens[1], &mut last, "second pass");
-
-    // Every slot the instance holds: its tables', then its own kept cell's.
-    let held: Vec<(ShapeId, Vec<u32>)> =
-        std::iter::once((instance_shape.id, binding.instance_slots.clone()))
-            .chain(binding.ring_slots.iter().map(|ring| {
-                (
-                    channel_shape.expect("a channel shape").id,
-                    ring.slots.clone(),
-                )
-            }))
-            .collect();
-    let cells_held = channel_shape.is_some();
+    let bound = &mut rig.bound;
 
     // Each guest chunk onto another, and a blank chunk onto the place each
     // left: what the guest bound there is gone. The engine rebinds as it
@@ -426,7 +494,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             (blank_cells, cells),
         ]))
         .expect("the evacuation");
-    round(&mut bound, tokens[2], &mut last, "after an evacuation");
+    round(bound, tokens[2], &mut last, "after an evacuation");
 
     // The same again on the shell alone, which moves the chunks and leaves
     // the guests bound where they were: the pass reads blank tables. (The
@@ -461,7 +529,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
     // The stale pass kept its ids where the cell no longer is: `seen` reads
     // the pass before it.
     last = before;
-    round(&mut bound, tokens[1], &mut last, "after the rebind");
+    round(bound, tokens[1], &mut last, "after the rebind");
 
     // Park and unpark: each slot copied to the host tier, its device place
     // blanked, copied back into fresh refs.
@@ -543,9 +611,196 @@ fn an_instance_in_pool_slots_fires_through_moves() {
         })
         .expect("the unparked slots rebind");
     last = before;
-    round(&mut bound, tokens[2], &mut last, "after a park and unpark");
-    round(&mut bound, tokens[3], &mut last, "a pass later");
+    round(bound, tokens[2], &mut last, "after a park and unpark");
+    round(bound, tokens[3], &mut last, "a pass later");
 
-    drop(bound);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&rig.dir);
+}
+
+/// The bytes of `refs` of `shape` read off the device where they lie, one
+/// slot after another, once every frame and copy has landed.
+fn device_bytes(engine: &mut backend::Engine, shape: &RoleShape, refs: &[u32]) -> Vec<u8> {
+    let shell = engine.shell_mut().expect("loaded");
+    shell.drain().expect("the frames land");
+    let pools = shell.pools();
+    let bytes = pools.slot_bytes(shape.id).expect("the slot's bytes") as usize;
+    let mut out = vec![0u8; refs.len() * bytes];
+    for (k, &slot) in refs.iter().enumerate() {
+        let (buffer, at) = pools.slot_place(shape.id, slot).expect("the slot's place");
+        engine_gpu::backend::Buffer::<backend::Api>::read(
+            buffer,
+            at,
+            &mut out[k * bytes..][..bytes],
+        )
+        .expect("the slot reads");
+    }
+    out
+}
+
+/// A pattern no guest writes, seeded by `seed`, over `refs` of `shape` on
+/// the device; returns it.
+fn clobber(engine: &mut backend::Engine, shape: &RoleShape, refs: &[u32], seed: u8) -> Vec<u8> {
+    let shell = engine.shell_mut().expect("loaded");
+    shell.drain().expect("the frames land");
+    let pools = shell.pools();
+    let bytes = pools.slot_bytes(shape.id).expect("the slot's bytes") as usize;
+    let pattern: Vec<u8> = (0..refs.len() * bytes)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect();
+    for (k, &slot) in refs.iter().enumerate() {
+        let (buffer, at) = pools.slot_place(shape.id, slot).expect("the slot's place");
+        engine_gpu::backend::Buffer::<backend::Api>::write_shared(
+            buffer,
+            at,
+            &pattern[k * bytes..][..bytes],
+        )
+        .expect("the slot writes");
+    }
+    pattern
+}
+
+/// A suspend and restore as the runtime's role store moves one
+/// (`prepare_park`, then `prepare_unpark` into fresh device refs and a
+/// rebind): each `Instance` and `Channel` slot the instance holds reaches
+/// the host tier byte for byte, comes back byte for byte after its device
+/// place was clobbered, and the instance fires as before. Without the copy
+/// back the fresh refs hold other bytes.
+#[test]
+fn a_role_slot_round_trips_through_the_host_tier() {
+    let Some(mut rig) = rig("role-tier") else {
+        return;
+    };
+    let token = rig.tokens[2];
+    // To a fixed point: `last` holds `token`'s ids, so every pass of it
+    // reads (and leaves) the same.
+    rig.round(token, "a pass to the fixed point");
+    let fired = rig
+        .bound
+        .pass(token)
+        .expect("the pass before the suspend fires");
+    assert_eq!(
+        fired,
+        (2 * rig.want(token), 2 * rig.want(token)),
+        "the pass before the suspend"
+    );
+
+    let held = rig.held();
+    assert_eq!(
+        held.len(),
+        1 + usize::from(rig.channel_shape.is_some()),
+        "the tables' slots, and the kept cell's where the device keeps cells"
+    );
+    let device = <backend::Api as engine_gpu::api::Host>::domain(rig.bound.engine.boot());
+    let pairs = |from: &[u32], to: &[u32]| -> Vec<(u32, u32)> {
+        from.iter().copied().zip(to.iter().copied()).collect()
+    };
+    let mut fresh: Vec<Vec<u32>> = Vec::new();
+    for (k, (shape, refs)) in held.iter().enumerate() {
+        let what = if k == 0 { "Instance" } else { "Channel" };
+        let engine = &mut rig.bound.engine;
+        let copy = |engine: &mut backend::Engine, src, dst, slots: Vec<(u32, u32)>| {
+            engine
+                .copy_slots(&SlotCopy {
+                    shape: shape.id,
+                    src,
+                    dst,
+                    slots,
+                    runs: Vec::new(),
+                })
+                .unwrap_or_else(|why| panic!("{what}: the slots copy: {why}"));
+        };
+        let per = shape.per_chunk;
+        // Host chunk 0 holds the tables, 1 the cell; device chunks
+        // `top - 5` and `top - 6` the fresh refs an unpark takes.
+        let host: Vec<u32> = (0..refs.len() as u32).map(|i| k as u32 * per + i).collect();
+        let back: Vec<u32> = (0..refs.len() as u32)
+            .map(|i| (rig.top - 5 - k as u32) * per + i)
+            .collect();
+
+        // The slots' bytes as the guest left them.
+        let original = device_bytes(engine, shape, refs);
+        assert!(
+            original.iter().any(|&b| b != 0),
+            "{what}: the slots hold the guest's bytes"
+        );
+
+        // Park: device to the host tier, which then holds the same bytes.
+        copy(engine, device, MemoryDomain::HostPinned, pairs(refs, &host));
+        let tier = engine
+            .read_tier_slots(&[(shape.id, host.clone())])
+            .unwrap_or_else(|why| panic!("{what}: the host tier reads: {why}"));
+        assert!(
+            tier == original,
+            "{what}: the host tier holds the slots' bytes"
+        );
+
+        // The device places the park gave up, clobbered; the fresh refs
+        // the unpark takes hold another guest's leavings.
+        let clobbered = clobber(engine, shape, refs, 0xa5);
+        assert!(
+            device_bytes(engine, shape, refs) == clobbered && clobbered != original,
+            "{what}: the clobber landed"
+        );
+        let leavings = clobber(engine, shape, &back, 0x5a);
+        // The negative control: restored without the copy back, the fresh
+        // refs do not hold the slots' bytes.
+        let skipped = device_bytes(engine, shape, &back);
+        assert!(
+            skipped == leavings && skipped != original,
+            "{what}: without the copy back the fresh refs hold other bytes"
+        );
+
+        // Unpark: the host tier into the fresh refs, byte for byte.
+        copy(
+            engine,
+            MemoryDomain::HostPinned,
+            device,
+            pairs(&host, &back),
+        );
+        let restored = device_bytes(engine, shape, &back);
+        assert!(
+            restored == original,
+            "{what}: the fresh refs hold the slots' bytes ({} of {} differ)",
+            restored
+                .iter()
+                .zip(&original)
+                .filter(|(a, b)| a != b)
+                .count(),
+            original.len()
+        );
+        eprintln!(
+            "{}: {what}: {} slots, {} bytes, round trip through the host tier",
+            backend::NAME,
+            refs.len(),
+            original.len()
+        );
+        fresh.push(back);
+    }
+
+    // The rebind an unpark ends with, then the same pass as before.
+    rig.bound
+        .engine
+        .rebind_slots(Rebind::Instance {
+            id: rig.bound.instance,
+            instance: fresh[0].clone(),
+            rings: rig
+                .binding
+                .ring_slots
+                .iter()
+                .zip(&fresh[1..])
+                .map(|(ring, slots)| RingSlots {
+                    channel: ring.channel,
+                    slots: slots.clone(),
+                })
+                .collect(),
+            adapter: Vec::new(),
+        })
+        .expect("the restored slots rebind");
+    let after = rig
+        .bound
+        .pass(token)
+        .expect("the pass after the restore fires");
+    assert_eq!(after, fired, "the pass after the restore reads as before");
+
+    let _ = std::fs::remove_dir_all(&rig.dir);
 }
