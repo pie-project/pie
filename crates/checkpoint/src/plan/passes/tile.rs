@@ -29,7 +29,10 @@ pub const WGPU_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_SCALE | TILE_MAP_DE
 
 pub const XLA_TILE_MAP_MASK: u32 = WGPU_TILE_MAP_MASK;
 
-pub const CEREBRAS_TILE_MAP_MASK: u32 = WGPU_TILE_MAP_MASK;
+/// The cerebras engine lands a checkpoint on the host (its tiles are cut from the landed
+/// planes), so it takes what the host executor runs: a VAE's batch norm statistics (a bias and
+/// a root of its variance) as well.
+pub const CEREBRAS_TILE_MAP_MASK: u32 = WGPU_TILE_MAP_MASK | TILE_MAP_BIAS | TILE_MAP_UNARY;
 
 pub const HOST_TILE_MAP_MASK: u32 = TILE_MAP_CAST
     | TILE_MAP_REBLOCK
