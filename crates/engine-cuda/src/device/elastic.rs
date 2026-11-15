@@ -45,16 +45,17 @@ pub fn budget_bytes(free: u64, total: u64, allowance: engine::Allowance) -> u64 
 
 /// What a card of `total` bytes may hold in all while a load under
 /// `allowance` runs, resolved once against the `held` bytes it had when the
-/// load began: the device's share, and no more than a stated budget past
-/// what was held then. A later reading's room is this less what the card
-/// then holds ([`room_under`]), so a stated budget counts everything the
-/// load has taken since, its weights among it.
+/// load began: the card itself, and no more than a stated budget past what
+/// was held then. A later reading's room is this less what the card then
+/// holds ([`room_under`]), so a stated budget counts everything the load
+/// has taken since, its weights and what the driver holds for its graph
+/// bodies among it. No share of the card is left aside for those: the
+/// load's last fit reads the card once they are on it.
 #[must_use]
 pub fn ceiling_of(total: u64, held: u64, allowance: engine::Allowance) -> u64 {
-    let share = engine::Allowance::WHOLE.ceiling(total);
     allowance
         .budget
-        .map_or(share, |budget| share.min(held.saturating_add(budget)))
+        .map_or(total, |budget| total.min(held.saturating_add(budget)))
 }
 
 /// What may still be taken under `ceiling` of a card with `free` of

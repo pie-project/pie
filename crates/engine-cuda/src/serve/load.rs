@@ -795,7 +795,7 @@ impl Shell {
         let (free_before, device_total) = crate::store::device_memory()?;
         crate::device::held::heap_mark();
         // The pool's address space is reserved for every page its bytes
-        // could hold, the stated budget or the share of the card before the
+        // could hold, the stated budget or the card's room before the
         // weights land; `Pools::fit_the_card` sizes it within that.
         let pool_bytes = boot.kv_budget.unwrap_or_else(|| {
             crate::device::elastic::room_under(ceiling, free_before, device_total)
