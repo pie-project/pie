@@ -1136,7 +1136,7 @@ impl PreparedLoad<'_> {
             // weights until a held set gives them back.
             let room = boot.kv_budget.unwrap_or_else(|| accounting(0).pool);
             let total = engine::chunk::fit(room, chunk, 0, least)
-                .map_err(|short| Fault::Residency(short.to_string()))?
+                .map_err(Fault::FitShort)?
                 .saturating_add(span)
                 .saturating_add(tables_chunks);
             // The range spans as many buffers as it takes, each as many
