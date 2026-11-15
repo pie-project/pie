@@ -676,6 +676,12 @@ impl Plane {
         if refused {
             return Ok(results);
         }
+        debug_assert!(
+            ring_ends_moved_once(&self.instances, &self.programs, ids),
+            "two members of one stage move the same end of one shared ring; the runtime \
+             seats at most one fire moving a given end of a ring a step, so a stage \
+             holding two would put (or take) both at one cell"
+        );
         for (program_id, members) in by_program {
             let program = self.programs.get(&program_id).ok_or_else(|| {
                 Fault::program(
@@ -1355,6 +1361,119 @@ mod tests {
         );
     }
 
+    /// Two lanes bound to one shared ring, both putting into it at the
+    /// epilogue: a stage of both would put both at one cell (each reads the
+    /// ring's cursor as it is encoded; the cursor moves at commit). The
+    /// runtime seats at most one fire moving a given end of a ring a step,
+    /// so such a stage is never asked for; a debug build refuses to build
+    /// one, by name.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "move the same end of one shared ring")]
+    fn a_stage_of_two_movers_of_one_ring_end_is_refused() {
+        let context = Context::bind().expect("a Metal 4 device");
+        let pools = crate::store::Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+        let mut plane = Plane::new();
+        let (registration, count, seeds, token) = registration();
+        let program = plane
+            .register(&context, &registration)
+            .expect("the program registers");
+        let facts = plane.facts(program, &pools).expect("the program's facts");
+        // The token channel is registered once and both lanes bind it; the
+        // rest are each lane's own.
+        let shared = ChannelId(7);
+        let ring = facts
+            .rings
+            .iter()
+            .find(|ring| ring.channel == token)
+            .expect("the token ring");
+        let per_channel = pools
+            .slots_per_chunk(crate::store::layout::CHANNEL)
+            .expect("a channel shape");
+        let run: Vec<u32> = (3 * per_channel..3 * per_channel + ring.footprint.slots).collect();
+        plane
+            .register_channel(
+                shared,
+                ChannelShape {
+                    capacity: 4,
+                    numel: 1,
+                    dtype: eta_ir::Dtype::I32,
+                },
+                &pools,
+                &run,
+            )
+            .expect("the shared channel registers");
+        let peaks = [321u32, 654];
+        let lanes: Vec<(InstanceId, crate::device::Buffer)> = (0..2u32)
+            .zip(peaks)
+            .map(|(nth, at)| {
+                let (instance, rings) = slots_for(&pools, &facts, nth);
+                let instance = &instance;
+                let rings = &rings;
+                let ids: Vec<ChannelId> = (0..count as u32)
+                    .map(|c| {
+                        if c == token {
+                            shared
+                        } else {
+                            ChannelId(100 + u64::from(c) + 1000 * u64::from(nth))
+                        }
+                    })
+                    .collect();
+                let id = plane
+                    .bind(
+                        &context,
+                        program,
+                        &seeds,
+                        Extents {
+                            row_count: 1,
+                            sampled_rows: 1,
+                            query_len: 1,
+                            ..Extents::default()
+                        },
+                        GeometryClass::Host,
+                        PortMask::NONE,
+                        &ids,
+                        session::Pooled {
+                            pools: &pools,
+                            instance,
+                            rings,
+                        },
+                    )
+                    .expect("the lane binds");
+                let mut logits = crate::device::Buffer::zeroed(&context, u64::from(VOCAB) * 2)
+                    .expect("a logits plane");
+                let mut bf16 = vec![0u8; VOCAB as usize * 2];
+                bf16[at as usize * 2..at as usize * 2 + 2]
+                    .copy_from_slice(&0x3f80u16.to_le_bytes());
+                logits.write(0, &bf16).expect("the logits write");
+                plane
+                    .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
+                    .expect("the logits bind");
+                (id, logits)
+            })
+            .collect();
+        let first = lanes[0].0;
+        assert!(
+            plane.instances[&first]
+                .shared
+                .iter()
+                .flatten()
+                .any(|ring| ring.attachments() == 2),
+            "the two lanes share their rings"
+        );
+        let area = 1u64 << 24;
+        let tables = crate::device::Buffer::zeroed(&context, area).expect("a batch area");
+        let host = |at: u64, bytes: u64| -> crate::error::Result<_> {
+            Ok(vec![(0, bytes, tables.host_span(at, bytes)?)])
+        };
+        plane
+            .lay_batches(&tables, area, &host)
+            .expect("the batches lay");
+        let members: Vec<InstanceId> = lanes.iter().map(|(id, _)| *id).collect();
+        let mut frame = context.frame().expect("a frame");
+        let _ = plane.stage_batched(&mut frame, &members, &guests(&context), 0);
+    }
+
     /// An instance's tables and rings in pool slots fire as another's in
     /// other slots, after an evacuation moved their chunks and after a park
     /// moved them to other refs.
@@ -1797,6 +1916,40 @@ mod tests {
         assert_eq!(gpu_reads(&ring), want(2), "the unparked run reads the same");
     }
 }
+/// Whether no two of `ids` move the same end of one shared ring at the
+/// epilogue: each member reads the ring's cursor as it is encoded and the
+/// cursor moves only at commit, so two would write (or read) one cell.
+fn ring_ends_moved_once(
+    instances: &BTreeMap<InstanceId, Bound>,
+    programs: &BTreeMap<ProgramId, Program>,
+    ids: &[InstanceId],
+) -> bool {
+    let mut moved = std::collections::BTreeSet::new();
+    for id in ids {
+        let Some(bound) = instances.get(id) else {
+            continue;
+        };
+        let Some(program) = programs.get(&bound.program_id) else {
+            continue;
+        };
+        for (channel, ring) in bound.shared.iter().enumerate() {
+            let Some(ring) = ring else {
+                continue;
+            };
+            let channel = u32::try_from(channel).unwrap_or(u32::MAX);
+            let ring = Arc::as_ptr(ring) as usize;
+            if program.plan.takes_channel(channel, Attach::Epilogue) && !moved.insert((ring, false))
+            {
+                return false;
+            }
+            if program.plan.puts_channel(channel, Attach::Epilogue) && !moved.insert((ring, true)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Whether no ring is two members': members that share one are ordered
 /// through its cursor, so they fire one after another.
 fn rings_disjoint(rings: &[Vec<usize>]) -> bool {
