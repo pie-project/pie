@@ -257,7 +257,16 @@ b. The 8-storage-buffer limit moves up: piece 5, right after views are bound who
      (packages/javascript/server-web/rust/engine.rs:49). No file in the tree records a
      figure read from a real browser; the gate of c06b5a7a1 states adapters of 10 and 16
      of its own making.
-   - Chrome on Mac and Chrome on Windows, the adapter's limit requested: not verified.
+   - Read from adapters, the adapter's own limits requested (15 Nov):
+     - WebKit, Safari 27.0 on an M1 Max: 44 storage buffers per stage;
+       maxStorageBufferBindingSize and maxBufferSize 2147483644.
+     - Dawn, headless Chromium on the sm_120 host: 10 storage buffers per stage;
+       maxStorageBufferBindingSize and maxBufferSize 1073741824; maxBindGroups 4,
+       maxBindingsPerBindGroup 1000, maxDynamicStorageBuffersPerPipelineLayout 4. That
+       adapter is SwiftShader: the headless build took no hardware adapter, with the
+       native-Vulkan flags or without, so this is Dawn's software figure, not a card's.
+   - Chrome on a hardware adapter (Mac, Windows, Linux): not read. The form's bound
+     stays 8 until it is.
 
    Counts (compiled WGSL modules; a pool's segments are the `pie_seg0..3` bindings; 174
    of the 530 modules bind a pool, none more than one):
@@ -337,8 +346,8 @@ d. Device features, read (15 Nov), one device only: "NVIDIA RTX PRO 4500 Blackwe
    sparse memory. Not read: the sparse bind granularity (it needs the feature enabled at
    device creation; the probe prints it), and the cost of a sparse bind, which decides
    9.3. No AMD device was read: the MI300X host has no Vulkan stack (no ICD), so AMD
-   hardware under Vulkan is untested. Chrome's maxStorageBuffersPerShaderStage: still
-   not read.
+   hardware under Vulkan is untested. Chrome's maxStorageBuffersPerShaderStage on a
+   hardware adapter: still not read (10 on SwiftShader; the figures are under b).
 
 Still open (filled when read):
 - Exact sum of run bounds for 0.6B, and the number of distinct mixes: not read. Both are
