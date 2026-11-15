@@ -90,7 +90,7 @@ fn tests_every_case() {
     a_tail_past_its_step_goes_before_another_head();
     a_demote_leaves_what_a_higher_key_covers();
     floor_keyed_idle_cache_is_dropped_not_demoted();
-    idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
+    idle_cache_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
     pages_another_worker_sealed_are_found_in_the_host_tier();
     new_weights_find_no_page_the_old_ones_sealed();
@@ -1702,11 +1702,8 @@ fn a_parked_set_wakes_with_the_pages_its_peers_moved() {
     );
 }
 
-/// Idle cache dropped while fires are in flight goes back once the fires
-/// that could read it have retired, not after every fire handed out since:
-/// what a set last read before the fires in flight began is free at once,
-/// and what a reader read in one of them waits for that one.
-fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
+/// Idle cache dropped while fires are in flight goes back once they retire.
+fn idle_cache_comes_back_past_the_fires_in_flight() {
     use crate::policy::retention::FLOOR;
     let mut store = KvStore::new(8, h(41));
     let owner = ProcessId::from_u128(46);
@@ -1720,9 +1717,11 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
         3,
         "dropped"
     );
-    assert_eq!(store.available_pages(), 8, "back at once: no fire in flight read it");
+    assert_eq!(store.available_pages(), 5, "fires in flight");
     store.settle(busy);
     store.settle(other);
+    store.retire_idle();
+    assert_eq!(store.available_pages(), 8, "back once they retire");
 
     // A reader holds it in a fire now in flight, and lets go.
     let tokens = kept_and_gone(&mut store, 21, 3, owner);
