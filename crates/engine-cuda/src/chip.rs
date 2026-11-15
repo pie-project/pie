@@ -254,7 +254,7 @@ shelved!(
         "sm120/nvidia-rtx-pro-6000-blackwell-server-edition.toml",
         "sm121.toml",
     ],
-    rocm: ["gfx94.toml"],
+    rocm: ["gfx94.toml", "gfx94/amd-instinct-mi300x.toml"],
 );
 
 pub static SHELF: Shelf = Shelf {
@@ -1200,13 +1200,19 @@ mod hip {
 
     #[test]
     fn a_cdna3_gpu_takes_its_family() {
-        for gpu in ["AMD Instinct MI300X", "AMD Instinct MI325X"] {
+        // The MI300X (the card and a cloud VF of it) reads its rates from its
+        // device file; the MI325X has none yet.
+        for (gpu, device) in [
+            ("AMD Instinct MI300X", true),
+            ("AMD Instinct MI300X VF", true),
+            ("AMD Instinct MI325X", false),
+        ] {
             let (profile, report) = resolve(gpu, &facts(9, 4, 304), None);
-            assert_eq!(
-                report.layers,
-                [profile::Source::Seeded("gfx94.toml".into())],
-                "{gpu}"
-            );
+            let mut layers = vec![profile::Source::Seeded("gfx94.toml".into())];
+            if device {
+                layers.push(profile::Source::Seeded("gfx94/amd-instinct-mi300x.toml".into()));
+            }
+            assert_eq!(report.layers, layers, "{gpu}");
             assert!(report.untuned(), "{gpu}");
             assert_eq!(
                 Engine::of(&profile),
