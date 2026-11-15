@@ -1448,6 +1448,186 @@ mod tests {
         assert_eq!(peak(&mut plane, 789), vec![789, 789]);
     }
 
+    /// A bound program's role slots (its Instance tables and its Channel
+    /// rings) round-trip through the host tier whole, as a suspended
+    /// process's are: read on the device, parked to the host, the device
+    /// slots clobbered, copied back, the same bytes, and the instance fires
+    /// as it did. Negative control: the clobber really changes the device
+    /// slots, so equal bytes after the copy back are the copy's doing.
+    #[test]
+    fn a_role_slot_round_trips_through_the_host_tier() {
+        use crate::store::Pools;
+        use crate::store::layout::{CHANNEL, INSTANCE};
+        let context = Context::bind().expect("a Metal 4 device");
+        let mut pools = Pools::guests_only(&context, CHUNK, 4).expect("a pool");
+        let mut plane = Plane::new();
+        let (registration, _, seeds, token) = registration();
+        let program = plane
+            .register(&context, &registration)
+            .expect("the program registers");
+        let facts = plane.facts(program, &pools).expect("the program's facts");
+        assert!(facts.instance.slots > 0, "the tables take slots: {facts:?}");
+        assert!(!facts.rings.is_empty(), "the rings take slots: {facts:?}");
+        let (instance, rings) = slots_for(&pools, &facts, 0);
+        let mut logits =
+            crate::device::Buffer::zeroed(&context, u64::from(VOCAB) * 2).expect("a logits plane");
+        let id = plane
+            .bind(
+                &context,
+                program,
+                &seeds,
+                Extents {
+                    row_count: 1,
+                    sampled_rows: 1,
+                    query_len: 1,
+                    ..Extents::default()
+                },
+                GeometryClass::Host,
+                PortMask::NONE,
+                &[],
+                session::Pooled {
+                    pools: &pools,
+                    instance: &instance,
+                    rings: &rings,
+                },
+            )
+            .expect("the instance binds");
+        plane
+            .bind_output(id, "logits", 0, &logits, 0, eta_ir::Dtype::Bf16, VOCAB, VOCAB)
+            .expect("the logits bind");
+        let fire = |plane: &mut Plane, logits: &mut crate::device::Buffer, at: u32| -> i32 {
+            let mut bf16 = vec![0u8; VOCAB as usize * 2];
+            bf16[at as usize * 2..at as usize * 2 + 2].copy_from_slice(&0x3f80u16.to_le_bytes());
+            logits.write(0, &bf16).expect("the logits write");
+            let fired = plane
+                .fire(&context, id, Attach::Epilogue, &guests(&context))
+                .expect("the stage fires");
+            assert!(matches!(fired, Fired::Committed), "the instance fires: {fired:?}");
+            let cell = plane
+                .instance_mut(id)
+                .expect("bound")
+                .take(token)
+                .expect("the take")
+                .expect("a token");
+            let (channel, seed) = &seeds[0];
+            plane
+                .instance_mut(id)
+                .expect("bound")
+                .publish(*channel, seed)
+                .expect("the reseed");
+            i32::from_le_bytes(cell[..4].try_into().expect("an i32"))
+        };
+        assert_eq!(fire(&mut plane, &mut logits, 321), 321, "before the round trip");
+
+        // The role slots, shape by shape, and their bytes on the device.
+        let mut roles: Vec<(engine::chunk::ShapeId, Vec<u32>)> = vec![(INSTANCE, instance.clone())];
+        for ring in &rings {
+            roles.push((CHANNEL, ring.slots.clone()));
+        }
+        let read = |pools: &Pools| -> Vec<u8> {
+            roles
+                .iter()
+                .flat_map(|(shape, slots)| {
+                    slots
+                        .iter()
+                        .flat_map(|&slot| pools.read_slot_bytes(*shape, slot).expect("a slot read"))
+                        .collect::<Vec<u8>>()
+                })
+                .collect()
+        };
+        let before = read(&pools);
+        assert!(before.iter().any(|&b| b != 0), "the bound tables hold something");
+
+        // Device -> host tier, each role slot to its own host slot.
+        pools.seat_tier(2 * CHUNK);
+        let mut host_of: Vec<(engine::chunk::ShapeId, Vec<u32>)> = Vec::new();
+        // The host tier holds a shape a chunk, as the pool does: the tables
+        // in chunk 0's Instance refs, the rings in chunk 1's Channel refs.
+        let per_channel = pools.slots_per_chunk(CHANNEL).expect("a channel shape");
+        let mut next_instance = 0u32;
+        let mut next_channel = per_channel;
+        let mut frame = context.frame().expect("a frame");
+        for (shape, slots) in &roles {
+            let next = if *shape == INSTANCE { &mut next_instance } else { &mut next_channel };
+            let first = *next;
+            *next += slots.len() as u32;
+            let host: Vec<u32> = (first..first + slots.len() as u32).collect();
+            pools
+                .copy_slots(
+                    &mut frame,
+                    &engine::chunk::SlotCopy {
+                        shape: *shape,
+                        src: engine::MemoryDomain::MetalShared,
+                        dst: engine::MemoryDomain::HostPinned,
+                        slots: slots.iter().copied().zip(host.iter().copied()).collect(),
+                        runs: Vec::new(),
+                    },
+                )
+                .expect("the role slots park");
+            host_of.push((*shape, host));
+        }
+        frame.commit().expect("the park lands");
+        assert_eq!(
+            pools.read_tier_slots(&host_of).expect("the tier read"),
+            before,
+            "the host tier holds the device slots' bytes"
+        );
+
+        // Clobber the device slots with an unused (zero) slot of each shape.
+        let blank_instance = 2 * pools.slots_per_chunk(INSTANCE).expect("an instance shape") - 1;
+        let blank_channel = 3 * pools.slots_per_chunk(CHANNEL).expect("a channel shape") - 1;
+        let mut frame = context.frame().expect("a frame");
+        for (shape, slots) in &roles {
+            let blank = if *shape == INSTANCE { blank_instance } else { blank_channel };
+            let moves: Vec<(u32, u32)> = slots.iter().map(|&slot| (blank, slot)).collect();
+            pools.copy_shape(&mut frame, *shape, &moves).expect("the clobber");
+        }
+        frame.commit().expect("the clobber lands");
+        assert_ne!(read(&pools), before, "the clobber changed the device slots");
+
+        // Host tier -> the same device slots.
+        let mut frame = context.frame().expect("a frame");
+        for ((shape, slots), (_, host)) in roles.iter().zip(&host_of) {
+            pools
+                .copy_slots(
+                    &mut frame,
+                    &engine::chunk::SlotCopy {
+                        shape: *shape,
+                        src: engine::MemoryDomain::HostPinned,
+                        dst: engine::MemoryDomain::MetalShared,
+                        slots: host.iter().copied().zip(slots.iter().copied()).collect(),
+                        runs: Vec::new(),
+                    },
+                )
+                .expect("the role slots unpark");
+        }
+        frame.commit().expect("the unpark lands");
+        assert_eq!(read(&pools), before, "the device slots hold their bytes again");
+        assert_eq!(fire(&mut plane, &mut logits, 654), 654, "after the round trip");
+
+        // A role slot asked to the disk tier is refused by name: only kv
+        // pages and rs rows have slot files.
+        let standing = read(&pools);
+        let mut frame = context.frame().expect("a frame");
+        let refused = pools
+            .copy_slots(
+                &mut frame,
+                &engine::chunk::SlotCopy {
+                    shape: INSTANCE,
+                    src: engine::MemoryDomain::MetalShared,
+                    dst: engine::MemoryDomain::LocalDisk,
+                    slots: vec![(instance[0], 0)],
+                    runs: Vec::new(),
+                },
+            )
+            .expect_err("a role slot has no slot file");
+        assert!(
+            format!("{refused}").contains("only kv pages (list) and parked rs rows (fixed) go to disk"),
+            "the refusal names why: {refused}"
+        );
+        assert_eq!(read(&pools), standing, "the refusal touched nothing");
+    }
+
     /// A ring whose cell is past a Channel slot lies in one run of adjacent
     /// slots: what the host writes, the GPU reads at the cells' addresses,
     /// after an evacuation moves the run's chunk and after a park moves it

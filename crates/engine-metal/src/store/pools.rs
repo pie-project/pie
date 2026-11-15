@@ -1927,7 +1927,10 @@ impl Pools {
             FIXED => ("parked rs rows", self.shape(FIXED)?.slot_bytes),
             other => {
                 return Err(Fault::Unbound {
-                    what: format!("slot shape {other}, which this pool does not hold"),
+                    what: format!(
+                        "a slot file for slot shape {other}: only kv pages (list) and parked rs \
+                         rows (fixed) go to disk, and a role slot moves to the host tier"
+                    ),
                 });
             }
         };
