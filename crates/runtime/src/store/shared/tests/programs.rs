@@ -1952,3 +1952,105 @@ fn tables_stated_as_a_fires_fixed_back_one_set_where_two_lie() {
     pool.standing_stated(2 * SET);
     assert_eq!(pool.pool().act_chunks(16), 1 + 4, "both sets");
 }
+
+/// `program` bound with lanes that read out `rows` rows each.
+fn reading(program: ProgramId, rows: u32) -> FireKey {
+    FireKey {
+        program,
+        extents: ::engine::BindExtents {
+            sampled_rows: rows,
+            ..::engine::BindExtents::default()
+        },
+    }
+}
+
+/// A lane that alone reads out more rows than the engine's fixed readout
+/// store holds is refused at its bind, by name, before anything counts; a
+/// lane the store holds binds.
+#[test]
+fn a_lane_past_the_readout_store_is_refused_at_bind_by_name() {
+    let (mut pool, _) = pool_at_256();
+    pool.set_readouts(
+        &::engine::ReadoutFacts {
+            store_rows: Some(128),
+            ..::engine::ReadoutFacts::default()
+        },
+        0,
+        false,
+    );
+    for rows in [16, 128, 129, 4096] {
+        pool.fire_facts_learned(reading(PROGRAM, rows), &FireFacts::default());
+    }
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    for rows in [129, 4096] {
+        let refused = ProgramOpen::new(&shared, reading(PROGRAM, rows), 0)
+            .err()
+            .expect("a lane past the store is refused");
+        assert!(
+            refused.contains(&reading(PROGRAM, rows).to_string())
+                && refused.contains(&format!("{rows} rows each"))
+                && refused.contains("128 rows the engine's readout store holds"),
+            "refused by name: {refused}"
+        );
+    }
+    let _sixteen = ProgramOpen::new(&shared, reading(PROGRAM, 16), 0)
+        .expect("sixteen rows a lane the store holds");
+    let _whole = ProgramOpen::new(&shared, reading(PROGRAM, 128), 0)
+        .expect("a lane of the store's own rows");
+    // A float pass's bind: its rows land through the readout landing, not
+    // the store, so its extents refuse nothing.
+    let _float = ProgramOpen::float(&shared, reading(PROGRAM, 4096), 0)
+        .expect("a float pass's bind is not held to the store");
+}
+
+/// Readout rows that land beside the activation are counted at every rung
+/// beside the guest term, as many as a fire of the rung reads out (its
+/// tokens, under the store's rows); rows inside the span, or stated by no
+/// one, leave every rung as it was.
+#[test]
+fn readout_rows_beside_the_activation_are_counted_at_every_rung() {
+    let rungs = [0, 16, 17, 256, 2048, u32::MAX];
+    let chunks = |pool: &SharedPool| -> Vec<u32> {
+        rungs
+            .iter()
+            .map(|&rung| pool.pool().act_chunks(rung))
+            .collect()
+    };
+    let (mut pool, _) = pool_at_256();
+    let before = chunks(&pool);
+    assert_eq!(before, [1, 1, 4, 4, 12, 12]);
+    let widest = pool.widest_fit();
+    for unchanged in [
+        ::engine::ReadoutFacts::default(),
+        ::engine::ReadoutFacts {
+            landing: ::engine::ReadoutLanding::InSpan,
+            store_rows: Some(128),
+        },
+    ] {
+        pool.set_readouts(&unchanged, 2048, false);
+        assert_eq!(chunks(&pool), before, "{unchanged:?}");
+        assert_eq!(pool.widest_fit(), widest, "{unchanged:?}");
+    }
+    // A MiB a row, at most 128 a fire: the 16 rung's 16 rows one chunk,
+    // the wider rungs' 128 rows eight.
+    pool.set_readouts(
+        &::engine::ReadoutFacts {
+            landing: ::engine::ReadoutLanding::Beside { row_bytes: MIB },
+            store_rows: Some(128),
+        },
+        2048,
+        false,
+    );
+    assert_eq!(chunks(&pool), [2, 2, 12, 12, 20, 20]);
+    // With float lanes a fire may read out every token through the
+    // landing, past the store: the term counts the rung's tokens.
+    pool.set_readouts(
+        &::engine::ReadoutFacts {
+            landing: ::engine::ReadoutLanding::Beside { row_bytes: MIB },
+            store_rows: Some(128),
+        },
+        2048,
+        true,
+    );
+    assert_eq!(chunks(&pool), [2, 2, 20, 20, 140, 140]);
+}

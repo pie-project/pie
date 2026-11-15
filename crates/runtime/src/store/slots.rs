@@ -456,6 +456,11 @@ pub struct SlotPool {
     /// The engine's standing guest bytes, beside the fire term below every
     /// rung's carve ([`Self::set_standing`]).
     standing: u64,
+    /// The readout term ([`Self::set_readouts`]): the bytes a row a fire
+    /// reads out takes beside the model's activation (0: inside the span),
+    /// and the most rows one fire reads out.
+    readout_row_bytes: u64,
+    readout_rows: u32,
     /// The most lanes a fire carries (the engine's `FireLimits::max_lanes`):
     /// a rung of `r` tokens allows `min(r, max_lanes)`.
     max_lanes: u32,
@@ -534,6 +539,8 @@ impl SlotPool {
             act: 0,
             fire: ::engine::GuestTerm::default(),
             standing: 0,
+            readout_row_bytes: 0,
+            readout_rows: u32::MAX,
             max_lanes: u32::MAX,
             act_max,
             top_segment,
@@ -668,14 +675,43 @@ impl SlotPool {
 
     /// The chunks the guests take at a rung of `tokens`: what the worst
     /// fire of `min(tokens, max_lanes)` lanes lays for the pairs open
-    /// ([`::engine::GuestTerm::bytes`]), and beside it what the engine
-    /// keeps standing for every live instance whatever the fire.
+    /// ([`::engine::GuestTerm::bytes`]), beside it what the engine keeps
+    /// standing for every live instance whatever the fire, and the rows
+    /// such a fire reads out where they land beside the activation
+    /// ([`Self::readout_bytes`]).
     fn fire_chunks(&self, tokens: u32) -> u32 {
         let bytes = self
             .fire
             .bytes(tokens.min(self.max_lanes))
-            .saturating_add(self.standing);
+            .saturating_add(self.standing)
+            .saturating_add(self.readout_bytes(tokens));
         u32::try_from(bytes.div_ceil(self.chunk_bytes.max(1))).unwrap_or(u32::MAX)
+    }
+
+    /// The readout term at a rung of `tokens`: a fire there reads out no
+    /// more rows than its tokens, nor than the most one fire reads
+    /// ([`Self::set_readouts`]), each taking the bytes a row the engine
+    /// states beside the activation; 0 where they land inside the span.
+    #[must_use]
+    pub fn readout_bytes(&self, tokens: u32) -> u64 {
+        u64::from(tokens.min(self.readout_rows)).saturating_mul(self.readout_row_bytes)
+    }
+
+    /// The readout term from now on, of the engine's
+    /// [`::engine::ReadoutFacts`]: `row_bytes` a row beside the activation
+    /// (0: inside the span, no term) for up to `rows` rows a fire (0: no
+    /// bound but the fire's tokens). Nothing moves here, as with
+    /// [`Self::set_fire`].
+    pub fn set_readouts(&mut self, row_bytes: u64, rows: u32) {
+        self.readout_row_bytes = row_bytes;
+        self.readout_rows = if rows == 0 { u32::MAX } else { rows };
+    }
+
+    /// The most rows one fire reads out ([`Self::set_readouts`]):
+    /// `u32::MAX` where nothing but its tokens bounds them.
+    #[must_use]
+    pub fn readout_rows(&self) -> u32 {
+        self.readout_rows
     }
 
     /// The bytes the guest term takes at the rung fires of `rung` tokens
@@ -723,10 +759,10 @@ impl SlotPool {
     }
 
     /// Whether the guests take nothing of the span at any rung: no fire
-    /// term and nothing standing.
+    /// term, nothing standing, and no readout row beside the activation.
     #[must_use]
     pub fn guests_zero(&self) -> bool {
-        self.fire.is_zero() && self.standing == 0
+        self.fire.is_zero() && self.standing == 0 && self.readout_row_bytes == 0
     }
 
     /// The most lanes a fire carries: the engine's `FireLimits::max_lanes`.

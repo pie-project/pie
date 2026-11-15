@@ -1029,8 +1029,12 @@ impl SchedulerHandle {
                         response,
                     })
                     .await??;
-                let open = crate::store::shared::programs::ProgramOpen::new(&shared, key, standing)
-                    .map_err(|why| anyhow!("pipeline: {why}"))?;
+                let open = if bind.float {
+                    crate::store::shared::programs::ProgramOpen::float(&shared, key, standing)
+                } else {
+                    crate::store::shared::programs::ProgramOpen::new(&shared, key, standing)
+                }
+                .map_err(|why| anyhow!("pipeline: {why}"))?;
                 let engine = bind.engine_id;
                 let pid = pipeline_id.unwrap_or_default();
                 crate::inferlet::process::said(
@@ -1775,7 +1779,7 @@ impl BatchScheduler {
                             launch.logical_fire_id,
                             launch.request.tokens(),
                             launch.wire_row_count(),
-                            launch.request.readouts(),
+                            launch.request.sequence_readouts(),
                         );
                     }
                     Self::queue_attempt(pending, launch);
@@ -3006,6 +3010,7 @@ mod tests {
                 prefill_rows: 0,
                 prefill_lanes: 0,
                 max_readouts: 0,
+                readout_store: 0,
             },
             &stats,
             &mut FramePolicy::new(1, 64, 4096, None),

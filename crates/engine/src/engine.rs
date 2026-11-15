@@ -9,7 +9,7 @@ use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
 use crate::program::{
     BindExtents, BoundInstance, FireFacts, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
-    ProgramRegistration, Rebind, RingFacts,
+    ProgramRegistration, ReadoutFacts, Rebind, RingFacts,
 };
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
 
@@ -133,6 +133,18 @@ pub trait Engine: Send {
     fn fire_facts(&self, program: ProgramId, extents: &BindExtents) -> Result<FireFacts> {
         let _ = (program, extents);
         Ok(FireFacts::default())
+    }
+
+    /// What the rows a fire reads out take ([`ReadoutFacts`]): the bytes a
+    /// row beside the model's activation, or none where they land inside
+    /// the span already, and the rows a fixed store holds, if any. Asked
+    /// once, after load. A sibling of [`Engine::fire_facts`], not a field
+    /// of it: every fire reads out, programs or none, so the facts are the
+    /// engine's, not a (program, extents) pair's. The default states the
+    /// rows inside the span and no store: no term, no bound, nothing
+    /// changes.
+    fn readout_facts(&self) -> Result<ReadoutFacts> {
+        Ok(ReadoutFacts::default())
     }
 
     /// The standing guest bytes the engine would hold once `binding` is

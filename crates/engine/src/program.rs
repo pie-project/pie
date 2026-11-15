@@ -205,6 +205,74 @@ impl FireFacts {
     }
 }
 
+/// Where the rows a fire reads out land ([`ReadoutFacts::landing`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReadoutLanding {
+    /// Inside the activation the rungs state already (CUDA: a slot of the
+    /// compiled arena, carved with its rung): the runtime counts nothing
+    /// for them. What an engine that states nothing is taken to say.
+    #[default]
+    InSpan,
+    /// In the span beside the model's activation, `row_bytes` for each row
+    /// a fire reads out: the fire's readout term, counted beside its guest
+    /// term at every rung.
+    Beside { row_bytes: u64 },
+}
+
+/// What the rows a fire reads out take, as the engine states them
+/// ([`crate::Engine::readout_facts`]): a fire bound, never a load
+/// allocation sized at a ceiling. The facts are the engine's, whatever
+/// programs a fire carries: every fire reads out (a plain decode its last
+/// row), so they are no (program, extents) pair's [`FireFacts`].
+///
+/// The rows one fire's sequence lanes read out (sampled rows: a decode's
+/// last, a verify's block) are at most its tokens, at most the engine's
+/// `FireLimits::max_readouts` where it states one, and at most
+/// [`Self::store_rows`] where a fixed store holds them
+/// ([`Self::fire_rows`]): the runtime cuts fires to that many. A float
+/// lane's rows (a kv-less lane: an encoder's, an embedding's, every row it
+/// embeds) are no sequence readouts: they land through [`Self::landing`]
+/// whatever the store holds, at most the fire's tokens, and are never cut
+/// or refused against the store (a cacheless encoder attends over all its
+/// rows in one fire). The term counts, for a fire of a rung, the rows it
+/// may read out of either kind ([`Self::row_bytes`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadoutFacts {
+    #[serde(default)]
+    pub landing: ReadoutLanding,
+    /// The rows a fixed readout store holds (XLA: its ring): no fire's
+    /// sequence lanes read out more, and a sequence lane that alone reads
+    /// more is refused at its bind. Float lanes' rows are not held here.
+    /// `None`: no store of the engine's bounds them.
+    #[serde(default)]
+    pub store_rows: Option<u32>,
+}
+
+impl ReadoutFacts {
+    /// The bytes a readout row takes beside the model's activation: 0 where
+    /// the rows land inside the span already.
+    #[must_use]
+    pub fn row_bytes(&self) -> u64 {
+        match self.landing {
+            ReadoutLanding::InSpan => 0,
+            ReadoutLanding::Beside { row_bytes } => row_bytes,
+        }
+    }
+
+    /// The most rows one fire reads out, beside the engine's own ceiling
+    /// `ceiling` (`FireLimits::max_readouts`, 0: none stated): the two's
+    /// least, 0 where neither bounds them.
+    #[must_use]
+    pub fn fire_rows(&self, ceiling: u32) -> u32 {
+        match (ceiling, self.store_rows) {
+            (0, None) => 0,
+            (0, Some(rows)) => rows.max(1),
+            (ceiling, None) => ceiling,
+            (ceiling, Some(rows)) => ceiling.min(rows.max(1)),
+        }
+    }
+}
+
 /// An item's bytes and the slots of its role that hold them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Footprint {

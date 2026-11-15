@@ -19,8 +19,31 @@ pub struct SchedulerLimits {
     /// (0: as many as `max_forward_requests`), what the engine holds a body
     /// for ([`::engine::FireLimits::prefill_lanes`]).
     pub prefill_lanes: usize,
-    /// 0: up to `max_forward_tokens`.
+    /// The most rows one fire reads out: the engine's ceiling under the
+    /// rows its fixed readout store holds ([`Self::read_out_by`]). 0: up to
+    /// `max_forward_tokens`.
     pub max_readouts: usize,
+    /// The rows the engine's fixed readout store holds
+    /// ([`::engine::ReadoutFacts::store_rows`]; 0: no store). A request whose
+    /// sequence lanes alone read out more is refused at admission, by name
+    /// (`scheduler::batch::AdmissionLimits`); a float lane's rows are not
+    /// held to the store (`FireRequest::sequence_readouts`).
+    pub readout_store: usize,
+}
+
+impl SchedulerLimits {
+    /// The limits with the rows one fire reads out bounded as the engine
+    /// states its readouts ([`::engine::ReadoutFacts::fire_rows`]): a fixed
+    /// store's rows under the engine's ceiling, which fires are cut to
+    /// ([`crate::scheduler::batch`], the frame's waves). An engine that
+    /// states no store leaves them as they are.
+    #[must_use]
+    pub fn read_out_by(mut self, readouts: &::engine::ReadoutFacts) -> Self {
+        let ceiling = u32::try_from(self.max_readouts).unwrap_or(u32::MAX);
+        self.max_readouts = readouts.fire_rows(ceiling) as usize;
+        self.readout_store = readouts.store_rows.map_or(0, |rows| rows.max(1) as usize);
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +281,7 @@ mod tests {
             prefill_rows: 0,
             prefill_lanes: 0,
             max_readouts: 0,
+            readout_store: 0,
         };
         assert_eq!(smallest_fire(std::iter::empty()), None, "no engine yet");
         assert_eq!(

@@ -72,6 +72,24 @@ impl FireRequest {
             .sum()
     }
 
+    /// The rows the fire's sequence lanes read out: [`Self::readouts`]
+    /// without its float lanes' (`kv_less`, an encoder's or an embedding's
+    /// every row), which land through the engine's readout landing whatever
+    /// its fixed store holds (`::engine::ReadoutFacts::store_rows`). What
+    /// fires are cut to and refused against the store by.
+    #[must_use]
+    pub fn sequence_readouts(&self) -> usize {
+        self.lanes
+            .iter()
+            .filter(|lane| !lane.kv_less)
+            .map(|lane| match &lane.readout {
+                engine::fire::Readout::Last => 1,
+                engine::fire::Readout::Rows(rows) => rows.len(),
+                engine::fire::Readout::None => 0,
+            })
+            .sum()
+    }
+
     pub fn pages(&self) -> impl Iterator<Item = u32> + '_ {
         self.lanes
             .iter()

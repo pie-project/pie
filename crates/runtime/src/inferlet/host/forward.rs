@@ -1381,6 +1381,9 @@ impl ProcessCtx {
                     // The ports the program computes on the device: the
                     // engine's to resolve, and no others.
                     decode_envelope.unwrap_or(PortMask::NONE),
+                    // A float pass reads out every row it embeds, through the
+                    // engine's readout landing: no store bounds its bind.
+                    float.is_some(),
                 ),
             )
             .await

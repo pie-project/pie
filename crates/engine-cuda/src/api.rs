@@ -877,6 +877,10 @@ impl Engine for Cuda {
         }
     }
 
+    fn readout_facts(&self) -> EngineResult<engine::ReadoutFacts> {
+        Ok(readout_facts())
+    }
+
     fn fire_facts(
         &self,
         program: ProgramId,
@@ -1890,5 +1894,17 @@ mod serving_stamp_tests {
         refuse(&artifact(&dir, "cuda", "qwen_3"), "cuda", "qwen_3")
             .expect("a cuda artifact serves on cuda");
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// CUDA's readouts ([`engine::Engine::readout_facts`]): the rows a fire
+/// reads out land in a slot of the compiled activation arena, carved with
+/// the rung (`serve::prepare`, `arena.readout_ceiling_of`), inside the span
+/// the rungs state already: no term beside it, and no store of its own
+/// bounds them.
+pub(crate) fn readout_facts() -> engine::ReadoutFacts {
+    engine::ReadoutFacts {
+        landing: engine::ReadoutLanding::InSpan,
+        store_rows: None,
     }
 }

@@ -28,6 +28,12 @@ pub(crate) struct RequestCapacityUsage {
     /// rows ([`::engine::fire::rung_rows`]).
     pub(crate) carried_rows: usize,
     pub(crate) page_refs: usize,
+    /// The rows the request's sequence lanes read out
+    /// ([`crate::engine::FireRequest::sequence_readouts`]): a step reads out
+    /// no more than the engine's `max_readouts` of them, a fire bound. A
+    /// float lane's rows land through the engine's readout landing and are
+    /// not counted.
+    pub(crate) readouts: usize,
 }
 
 pub(crate) fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapacityUsage {
@@ -39,6 +45,7 @@ pub(crate) fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> Re
         forward_tokens: req.request.tokens(),
         carried_rows: req.request.carried as usize,
         page_refs: req.request.pages().count(),
+        readouts: req.request.sequence_readouts(),
     }
 }
 
@@ -64,6 +71,19 @@ impl AdmissionLimits {
             return Some(format!(
                 "forward request has {} forward tokens, exceeding engine limit {}",
                 usage.forward_tokens, self.limits.max_forward_tokens
+            ));
+        }
+        // Sequence lanes reading out more than the readout store holds: no
+        // fire, however narrow, seats them. Their bind refuses them first
+        // (`SharedPool::readouts_refused`); this names a request that came
+        // past it. A float lane's rows (an encoder's, an embedding's every
+        // row) are not counted: they land through the engine's readout
+        // landing whatever the store holds.
+        if self.limits.readout_store > 0 && usage.readouts > self.limits.readout_store {
+            return Some(format!(
+                "forward request of instance {} reads out {} rows, more than the {} rows \
+                 the engine's readout store holds for a fire",
+                req.instance_id.0, usage.readouts, self.limits.readout_store
             ));
         }
         if usage.page_refs > self.limits.max_page_refs {
@@ -106,6 +126,10 @@ pub(crate) struct StepGroup {
     forward_tokens: usize,
     carried_rows: usize,
     page_refs: usize,
+    /// The rows its members read out: no more than the engine's
+    /// `max_readouts`, its fixed readout store's rows under its ceiling
+    /// ([`SchedulerLimits::read_out_by`]).
+    readouts: usize,
     /// Lanes taken, and whether any decodes: a step of prompts only holds
     /// no more than `prefill_lanes`.
     lanes: usize,
@@ -182,6 +206,8 @@ impl StepGroup {
             && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
             && self.carried_rows.saturating_add(usage.carried_rows) <= limits.max_forward_tokens
             && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs
+            && (limits.max_readouts == 0
+                || self.readouts.saturating_add(usage.readouts) <= limits.max_readouts)
     }
 
     pub(crate) fn push(
@@ -203,6 +229,7 @@ impl StepGroup {
         self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
         self.carried_rows = self.carried_rows.saturating_add(usage.carried_rows);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
+        self.readouts = self.readouts.saturating_add(usage.readouts);
         self.lanes = self.lanes.saturating_add(request.request.lanes.len());
         self.decoding |= decodes(request);
         (limits.prefill_lanes > 0 && !self.decoding && self.lanes >= limits.prefill_lanes)
@@ -210,6 +237,7 @@ impl StepGroup {
             || self.forward_tokens >= limits.max_forward_tokens
             || self.carried_rows >= limits.max_forward_tokens
             || self.page_refs >= limits.max_page_refs
+            || (limits.max_readouts > 0 && self.readouts >= limits.max_readouts)
     }
 }
 
@@ -443,6 +471,7 @@ mod tests {
             prefill_rows: 0,
             prefill_lanes: 0,
             max_readouts: 0,
+            readout_store: 0,
         }
     }
 
@@ -462,6 +491,187 @@ mod tests {
         a_seal_that_dispatches_the_later_putter_first_gives_it_the_earlier_cell();
         a_step_carries_no_more_than_its_rungs_tokens();
         a_wave_of_prompts_past_one_fire_is_cut_and_its_decode_wave_is_one_fire();
+    }
+
+    /// A verify lane of `instance`: a block of 16 tokens, each row read out.
+    fn verifying(instance: u64) -> Box<PendingRequest> {
+        let mut lane = crate::engine::fire::lane_of(0, (0..16).collect(), 0, vec![1]);
+        lane.readout = ::engine::Readout::Rows((0..16).collect());
+        pending(FireRequest::one(lane), InstanceId(instance))
+    }
+
+    /// The limits of an engine whose fires carry up to 128 lanes, its
+    /// readout ceiling sixteen a lane, with its readouts as `readouts`
+    /// states them.
+    fn reading(readouts: &::engine::ReadoutFacts) -> SchedulerLimits {
+        SchedulerLimits {
+            max_forward_requests: 128,
+            max_forward_tokens: 4096,
+            max_page_refs: 4096,
+            max_readouts: 128 * 16,
+            ..limits()
+        }
+        .read_out_by(readouts)
+    }
+
+    /// The readouts of each step of the one wave `requests` make, and the
+    /// lanes the steps carry in all.
+    fn read_out(
+        requests: Vec<Box<PendingRequest>>,
+        limits: SchedulerLimits,
+    ) -> (Vec<usize>, usize) {
+        let (frame, _) =
+            build_frame_submission(vec![requests], limits, 16, &SchedulerStats::default());
+        let readouts = frame
+            .steps
+            .iter()
+            .map(|step| {
+                step.submission
+                    .lanes
+                    .iter()
+                    .map(|lane| match &lane.readout {
+                        ::engine::Readout::Last => 1,
+                        ::engine::Readout::Rows(rows) => rows.len(),
+                        ::engine::Readout::None => 0,
+                    })
+                    .sum()
+            })
+            .collect();
+        let lanes = frame
+            .steps
+            .iter()
+            .map(|step| step.submission.lanes.len())
+            .sum();
+        (readouts, lanes)
+    }
+
+    /// A drafter's verify, 80 lanes of 16 readouts each, on an engine whose
+    /// fixed readout store holds 128 rows: cut into fires of no more than
+    /// 128 readout rows, every lane served.
+    #[test]
+    fn a_verify_past_the_readout_store_is_cut_into_fires_it_holds() {
+        let store = ::engine::ReadoutFacts {
+            store_rows: Some(128),
+            ..::engine::ReadoutFacts::default()
+        };
+        let limits = reading(&store);
+        assert_eq!(limits.max_readouts, 128, "the store bounds a fire");
+        let (readouts, lanes) = read_out((0..80).map(verifying).collect(), limits);
+        assert!(
+            readouts.iter().all(|&rows| rows <= 128),
+            "every fire reads out no more than the store holds: {readouts:?}"
+        );
+        assert_eq!(readouts.len(), 10, "eight lanes a fire: {readouts:?}");
+        assert_eq!(lanes, 80, "every lane is served");
+        assert_eq!(readouts.iter().sum::<usize>(), 80 * 16);
+    }
+
+    /// An engine that states nothing of its readouts, or states them inside
+    /// the span (or beside it, unbounded), leaves the fires as wide as they
+    /// were: the 80 lanes one fire.
+    #[test]
+    fn readouts_inside_the_span_leave_the_fires_as_they_were() {
+        let stated = [
+            ::engine::ReadoutFacts::default(),
+            ::engine::ReadoutFacts {
+                landing: ::engine::ReadoutLanding::InSpan,
+                store_rows: None,
+            },
+            ::engine::ReadoutFacts {
+                landing: ::engine::ReadoutLanding::Beside { row_bytes: 4096 },
+                store_rows: None,
+            },
+        ];
+        for readouts in stated {
+            let limits = reading(&readouts);
+            assert_eq!(limits.max_readouts, 128 * 16, "{readouts:?}");
+            let (steps, lanes) = read_out((0..80).map(verifying).collect(), limits);
+            assert_eq!(steps, vec![80 * 16], "{readouts:?}: one fire, as before");
+            assert_eq!(lanes, 80);
+        }
+        // With no ceiling stated either, none comes of the facts.
+        let open = SchedulerLimits {
+            max_readouts: 0,
+            ..limits()
+        }
+        .read_out_by(&::engine::ReadoutFacts::default());
+        assert_eq!(open.max_readouts, 0);
+    }
+
+    /// A float lane (an embedding's, a cacheless encoder's) of `rows`
+    /// rows, every one read out.
+    fn embedding(instance: u64, rows: u32) -> Box<PendingRequest> {
+        let lane = ::engine::Lane {
+            tokens: vec![0; rows as usize],
+            readout: ::engine::Readout::Rows((0..rows).collect()),
+            kv_less: true,
+            ..::engine::Lane::default()
+        };
+        pending(FireRequest::one(lane), InstanceId(instance))
+    }
+
+    /// A float pass reads out every row it embeds through the engine's
+    /// readout landing, not its fixed store: a 512-row embedding against a
+    /// 128-row store is admitted and fires whole, one lane in one fire (a
+    /// cacheless encoder attends over all its rows). A sequence request
+    /// reading out more than the store holds is still refused, by name.
+    #[test]
+    fn a_float_pass_past_the_readout_store_fires_whole() {
+        let store = ::engine::ReadoutFacts {
+            store_rows: Some(128),
+            ..::engine::ReadoutFacts::default()
+        };
+        let limits = reading(&store);
+        let admission = AdmissionLimits::new(limits, 16);
+        assert_eq!(
+            admission.single_request_limit_error(&embedding(42, 512)),
+            None,
+            "a float pass is not held to the store"
+        );
+        let (readouts, lanes) = read_out(vec![embedding(42, 512)], limits);
+        assert_eq!(readouts, vec![512], "one fire, every row read out");
+        assert_eq!(lanes, 1);
+
+        let mut lane = crate::engine::fire::lane_of(0, (0..200).collect(), 0, vec![1]);
+        lane.readout = ::engine::Readout::Rows((0..200).collect());
+        let refused = admission
+            .single_request_limit_error(&pending(FireRequest::one(lane), InstanceId(43)))
+            .expect("200 sequence readouts past a store of 128 are refused");
+        assert!(
+            refused.contains("instance 43")
+                && refused.contains("200 rows")
+                && refused.contains("128 rows the engine's readout store holds"),
+            "refused by name: {refused}"
+        );
+    }
+
+    /// Two unframed float requests whose rows together pass the readout
+    /// bound share a step, as before the step counted readouts: their rows
+    /// are no sequence readouts, whether the bound is the engine's ceiling
+    /// or a fixed store's.
+    #[test]
+    fn two_unframed_float_requests_share_a_step_again() {
+        let ceiling = SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 4096,
+            max_page_refs: 4096,
+            max_readouts: 8 * 16,
+            ..limits()
+        };
+        let store = reading(&::engine::ReadoutFacts {
+            store_rows: Some(128),
+            ..::engine::ReadoutFacts::default()
+        });
+        for limits in [ceiling, store] {
+            assert_eq!(limits.max_readouts, 128);
+            let (readouts, lanes) = read_out(vec![embedding(1, 100), embedding(2, 100)], limits);
+            assert_eq!(readouts, vec![200], "one step of both: {readouts:?}");
+            assert_eq!(lanes, 2);
+        }
+        // Sequence lanes past the same bound are cut, as they were.
+        let (readouts, _) = read_out((0..10).map(verifying).collect(), ceiling);
+        assert!(readouts.iter().all(|&rows| rows <= 128), "{readouts:?}");
+        assert!(readouts.len() > 1);
     }
 
     /// The fires of `dispatch`'s frames, each fire id standing for the

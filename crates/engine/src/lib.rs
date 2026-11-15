@@ -49,8 +49,8 @@ pub use fire::{
 pub use load::{Allowance, Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
 pub use program::{
     BindExtents, BoundInstance, FireFacts, FirePair, Footprint, GuestTerm, InstanceBinding,
-    InstanceId, LaidLanes, ProgramFacts, ProgramId, ProgramRegistration, Rebind, RingFacts,
-    RingSlots,
+    InstanceId, LaidLanes, ProgramFacts, ProgramId, ProgramRegistration, ReadoutFacts,
+    ReadoutLanding, Rebind, RingFacts, RingSlots,
 };
 pub use transfer::{
     KvCopy, KvHandle, KvLayout, KvLayoutKind, KvMove, KvRegion, MemoryDomain, StateCopy, StateMove,
